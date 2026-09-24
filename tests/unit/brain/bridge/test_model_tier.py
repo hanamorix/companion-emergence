@@ -113,6 +113,34 @@ def test_embedding_tier_is_n_model_extensible_like_every_other_tier(monkeypatch)
     assert model_for_tier(TIER_BACKGROUND_CLASSIFIER) == "haiku"
 
 
+# ---------------------------------------------------------------------------
+# TIER_RELEVANCE_JUDGE — F2a #250 inc6: same non-Claude-tier registration
+# pattern as TIER_EMBEDDING/TIER_RERANKER above, but loaded via torch/
+# sentence-transformers (brain/memory/relevance_judge.py), not fastembed.
+# ---------------------------------------------------------------------------
+
+
+def test_relevance_judge_tier_resolves_to_the_pinned_local_model():
+    from brain.bridge.model_tier import MODEL_RELEVANCE_JUDGE, TIER_RELEVANCE_JUDGE
+
+    assert model_for_tier(TIER_RELEVANCE_JUDGE) == MODEL_RELEVANCE_JUDGE == "BAAI/bge-reranker-v2-m3"
+
+
+def test_relevance_judge_tier_is_n_model_extensible_like_every_other_tier(monkeypatch):
+    """Repointing TIER_MODEL[TIER_RELEVANCE_JUDGE] is a model_tier.py-only
+    edit — mirrors test_embedding_tier_is_n_model_extensible_like_every_
+    other_tier above. Unlike the ONNX-loaded embedder/reranker tiers, the
+    judge's torch load path can swap to ANY cross-encoder id (PyTorch-only
+    or ONNX) — this test only proves the registration mechanism is uniform,
+    not the load-mechanism difference (that's relevance_judge.py's own
+    concern, covered in test_relevance_judge.py)."""
+    from brain.bridge.model_tier import TIER_RELEVANCE_JUDGE
+
+    monkeypatch.setitem(TIER_MODEL, TIER_RELEVANCE_JUDGE, "some/other-judge-model")
+    assert model_for_tier(TIER_RELEVANCE_JUDGE) == "some/other-judge-model"
+    assert model_for_tier(TIER_BACKGROUND_CLASSIFIER) == "haiku"
+
+
 def test_model_for_tier_unknown_tier_raises_keyerror():
     """Fail loud on a typo'd tier name — never silently default (ST design)."""
     with pytest.raises(KeyError):

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import pytest
 
-from brain.memory.store import _SCHEMA, Memory, MemoryStore
+from brain.memory.store import _SCHEMA, CALIBRATION_SCORE_SCALE, Memory, MemoryStore
 
 
 def test_memory_create_new_generates_uuid() -> None:
@@ -2267,3 +2268,848 @@ def test_set_cluster_memberships_is_atomic_a_failed_write_leaves_prior_state_int
     # The prior committed pass survives untouched — the failed pass never
     # landed (not even the membership half, despite it running first).
     assert store.get_cluster_id(m.id) == (0, "m")
+
+
+# ---------------------------------------------------------------------------
+# F2a (#250 inc4): calibration_log table + log_calibration_sample — the
+# real-query calibration store (spec Section 4).
+# ---------------------------------------------------------------------------
+
+
+def test_fresh_store_has_calibration_log_table() -> None:
+    """A brand-new store creates `calibration_log` with the columns the
+    daily calibration tick (spec Section 5/7, not yet built) will need:
+    the query, candidate ids + reranker scores (already-computed, per-turn),
+    the reranker's model_id (so a floor derivation never mixes score scales
+    across a reranker swap), a day_bucket for the daily sampling pass, and
+    nullable tie-break label columns logged from day one (Out-of-scope,
+    F2c)."""
+    store = MemoryStore(":memory:")
+    tables = {
+        row[0]
+        for row in store._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    assert "calibration_log" in tables
+    cols = {row[1] for row in store._conn.execute("PRAGMA table_info(calibration_log)").fetchall()}
+    assert cols == {
+        "id",
+        "logged_at",
+        "day_bucket",
+        "query",
+        "candidate_ids",
+        "reranker_scores",
+        "reranker_model_id",
+        "local_judge_label",
+        "haiku_label",
+        "score_scale",  # F2b (#276 §5): raw-vs-normalized score scale marker
+    }
+    store.close()
+
+
+def test_calibration_log_table_creation_is_idempotent(tmp_path) -> None:
+    """Opening the same on-disk store a second time must not raise — CREATE
+    TABLE IF NOT EXISTS, mirroring the cluster_centroids precedent (F1)."""
+    db_path = tmp_path / "memories.db"
+    store1 = MemoryStore(db_path)
+    store1.close()
+    store2 = MemoryStore(db_path)  # must not raise
+    store2.close()
+
+
+def test_existing_store_migrates_in_score_scale_column(tmp_path) -> None:
+    """F2b (#276 §5): simulate a pre-F2b persona — manually create the OLD
+    `calibration_log` schema (no `score_scale` column) with a pre-existing
+    row already in it, then open `MemoryStore`: the column must be added
+    without error, default to 'raw' for the pre-existing row (I9 — legacy
+    rows survive and read as the honest pre-F2b scale, never dropped/
+    rewritten), and new writes through `log_calibration_sample` must land
+    on the current ('normalized') scale from that point on."""
+    db_path = tmp_path / "memories.db"
+    old_schema = """
+    CREATE TABLE calibration_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        logged_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        day_bucket TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d', 'now')),
+        query TEXT NOT NULL,
+        candidate_ids TEXT NOT NULL,
+        reranker_scores TEXT NOT NULL,
+        reranker_model_id TEXT NOT NULL,
+        local_judge_label TEXT,
+        haiku_label TEXT
+    );
+    """
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(old_schema)
+    conn.execute(
+        "INSERT INTO calibration_log (query, candidate_ids, reranker_scores, reranker_model_id) "
+        "VALUES (?, ?, ?, ?)",
+        ("a pre-F2b logged query", json.dumps(["old-id"]), json.dumps([1.23]), "old-model"),
+    )
+    conn.commit()
+    conn.close()
+
+    store = MemoryStore(db_path)  # must not raise
+    cols = {row[1] for row in store._conn.execute("PRAGMA table_info(calibration_log)").fetchall()}
+    assert "score_scale" in cols
+
+    legacy_row = store._conn.execute(
+        "SELECT query, score_scale FROM calibration_log WHERE query = ?",
+        ("a pre-F2b logged query",),
+    ).fetchone()
+    assert legacy_row is not None, "the pre-existing row must survive the migration"
+    assert legacy_row["score_scale"] == "raw", "a migrated-in legacy row must default to the raw scale"
+
+    store.log_calibration_sample(
+        query="a post-F2b query", candidate_ids=["new-id"], reranker_scores=[4.56],
+        reranker_model_id="new-model",
+    )
+    new_row = store._conn.execute(
+        "SELECT score_scale FROM calibration_log WHERE query = ?", ("a post-F2b query",)
+    ).fetchone()
+    assert new_row["score_scale"] == "normalized", "a fresh write must always stamp the current scale"
+
+
+def test_log_calibration_sample_writes_row(store: MemoryStore) -> None:
+    store.log_calibration_sample(
+        query="how do I calm down",
+        candidate_ids=["a", "b"],
+        reranker_scores=[1.5, -2.0],
+        reranker_model_id="jinaai/jina-reranker-v2-base-multilingual",
+    )
+    row = store._conn.execute(
+        "SELECT query, candidate_ids, reranker_scores, reranker_model_id, "
+        "day_bucket, local_judge_label, haiku_label FROM calibration_log"
+    ).fetchone()
+    assert row["query"] == "how do I calm down"
+    assert json.loads(row["candidate_ids"]) == ["a", "b"]
+    assert json.loads(row["reranker_scores"]) == [1.5, -2.0]
+    assert row["reranker_model_id"] == "jinaai/jina-reranker-v2-base-multilingual"
+    assert row["day_bucket"]  # populated, non-empty
+    assert row["local_judge_label"] is None, "tie-break labels default null on day one (Out-of-scope, F2c)"
+    assert row["haiku_label"] is None
+
+
+def test_log_calibration_sample_query_is_byte_identical(store: MemoryStore) -> None:
+    """No normalization/trimming/reconstruction of the logged query — the
+    raw string goes straight into the row (acceptance #5)."""
+    odd_query = "  weird\twhitespace\nand Ünicode  "
+    store.log_calibration_sample(
+        query=odd_query, candidate_ids=[], reranker_scores=[], reranker_model_id="m"
+    )
+    row = store._conn.execute("SELECT query FROM calibration_log").fetchone()
+    assert row["query"] == odd_query
+
+
+def test_log_calibration_sample_writes_multiple_rows_independently(store: MemoryStore) -> None:
+    store.log_calibration_sample(
+        query="first turn", candidate_ids=["a"], reranker_scores=[1.0], reranker_model_id="m"
+    )
+    store.log_calibration_sample(
+        query="second turn", candidate_ids=["b"], reranker_scores=[2.0], reranker_model_id="m"
+    )
+    rows = store._conn.execute("SELECT query FROM calibration_log ORDER BY id").fetchall()
+    assert [r["query"] for r in rows] == ["first turn", "second turn"]
+
+
+def test_log_calibration_sample_stamps_current_score_scale(store: MemoryStore) -> None:
+    """F2b (#276 §5): every row `log_calibration_sample` writes is stamped
+    `score_scale = 'normalized'` (`CALIBRATION_SCORE_SCALE`) — the scores it
+    logs are always the caller's already-normalized per-query value from
+    here on, never the pre-F2b raw one."""
+    store.log_calibration_sample(
+        query="q", candidate_ids=["a"], reranker_scores=[1.0], reranker_model_id="m"
+    )
+    row = store._conn.execute("SELECT score_scale FROM calibration_log").fetchone()
+    assert row["score_scale"] == "normalized"
+
+
+# ---------------------------------------------------------------------------
+# F2a (#250 inc5): prune_calibration_log — retention pruning (spec Section 5 /
+# acceptance 5b). Window derivation itself is provisional (see
+# CALIBRATION_LOG_RETENTION_WINDOW_DAYS's own comment) — finalized in inc7.
+# ---------------------------------------------------------------------------
+
+
+def _seed_calibration_row(store: MemoryStore, day_bucket: str, query: str) -> None:
+    store._conn.execute(
+        "INSERT INTO calibration_log "
+        "(day_bucket, query, candidate_ids, reranker_scores, reranker_model_id) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (day_bucket, query, json.dumps([]), json.dumps([]), "test-model"),
+    )
+    store._conn.commit()
+
+
+def test_prune_calibration_log_deletes_rows_older_than_window_days(store: MemoryStore) -> None:
+    now = datetime(2026, 6, 29, 12, tzinfo=UTC)
+    old_bucket = (now - timedelta(days=10)).strftime("%Y-%m-%d")
+    recent_bucket = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    _seed_calibration_row(store, old_bucket, "old")
+    _seed_calibration_row(store, recent_bucket, "recent")
+
+    deleted = store.prune_calibration_log(window_days=5.0, now=now)
+
+    assert deleted == 1
+    remaining = {
+        r["query"] for r in store._conn.execute("SELECT query FROM calibration_log").fetchall()
+    }
+    assert remaining == {"recent"}
+
+
+def test_prune_calibration_log_retains_row_exactly_at_the_cutoff_boundary(
+    store: MemoryStore,
+) -> None:
+    """Boundary case for the prune predicate itself: a row whose day_bucket
+    is EXACTLY the cutoff bucket (`ref - window_days`, same computation as
+    `prune_calibration_log`) must SURVIVE, because the delete is a strict
+    `<` against the cutoff (`DELETE ... WHERE day_bucket < ?`) — the cutoff
+    day itself is still inside the retention window. A regression to `<=`
+    would incorrectly delete this row, and none of the other prune tests
+    seed a row at exactly this boundary to catch that."""
+    now = datetime(2026, 6, 29, 12, tzinfo=UTC)
+    window_days = 5.0
+    cutoff_bucket = (now - timedelta(days=window_days)).strftime("%Y-%m-%d")
+    _seed_calibration_row(store, cutoff_bucket, "at_cutoff")
+
+    deleted = store.prune_calibration_log(window_days=window_days, now=now)
+
+    assert deleted == 0
+    remaining = {
+        r["query"] for r in store._conn.execute("SELECT query FROM calibration_log").fetchall()
+    }
+    assert remaining == {"at_cutoff"}
+
+
+def test_prune_calibration_log_returns_zero_when_nothing_is_due(store: MemoryStore) -> None:
+    now = datetime(2026, 6, 29, 12, tzinfo=UTC)
+    _seed_calibration_row(store, now.strftime("%Y-%m-%d"), "today")
+
+    deleted = store.prune_calibration_log(window_days=14.0, now=now)
+
+    assert deleted == 0
+    assert store._conn.execute("SELECT COUNT(*) FROM calibration_log").fetchone()[0] == 1
+
+
+def test_prune_calibration_log_defaults_to_the_live_tunable_window(store: MemoryStore) -> None:
+    """No window_days passed -> reads the live `calibration.retention_window_days`
+    tunable (default CALIBRATION_LOG_RETENTION_WINDOW_DAYS), mirroring
+    reranker.py's LATENCY_BUDGET_SECONDS override pattern."""
+    from brain.memory.store import CALIBRATION_LOG_RETENTION_WINDOW_DAYS
+
+    now = datetime(2026, 6, 29, 12, tzinfo=UTC)
+    just_outside = now - timedelta(days=CALIBRATION_LOG_RETENTION_WINDOW_DAYS + 1)
+    just_inside = now - timedelta(days=1)
+    _seed_calibration_row(store, just_outside.strftime("%Y-%m-%d"), "outside")
+    _seed_calibration_row(store, just_inside.strftime("%Y-%m-%d"), "inside")
+
+    deleted = store.prune_calibration_log(now=now)
+
+    assert deleted == 1
+    remaining = {
+        r["query"] for r in store._conn.execute("SELECT query FROM calibration_log").fetchall()
+    }
+    assert remaining == {"inside"}
+
+
+# ---------------------------------------------------------------------------
+# F2a (#250 inc6): sample_unlabeled_calibration_rows + write_calibration_labels
+# — the daily judge pass's read/write surface on calibration_log (spec
+# Section 6/7). The judge-labeling LOGIC itself (label_for_score, the
+# ambiguous band, the Haiku tie-break) is covered in test_relevance_judge.py;
+# this section covers only the store's own read/write contract.
+# ---------------------------------------------------------------------------
+
+
+def test_sample_unlabeled_calibration_rows_returns_only_unlabeled(store: MemoryStore) -> None:
+    store.log_calibration_sample(
+        query="unlabeled turn", candidate_ids=["a"], reranker_scores=[1.0], reranker_model_id="m"
+    )
+    store.log_calibration_sample(
+        query="labeled turn", candidate_ids=["b"], reranker_scores=[2.0], reranker_model_id="m"
+    )
+    labeled_row = store._conn.execute(
+        "SELECT id FROM calibration_log WHERE query = 'labeled turn'"
+    ).fetchone()
+    store.write_calibration_labels(labeled_row["id"], ["relevant"], [None])
+
+    rows = store.sample_unlabeled_calibration_rows(limit=10)
+
+    assert [r["query"] for r in rows] == ["unlabeled turn"], (
+        "a row with a non-NULL local_judge_label must not be re-sampled"
+    )
+
+
+def test_sample_unlabeled_calibration_rows_decodes_json_columns(store: MemoryStore) -> None:
+    store.log_calibration_sample(
+        query="q", candidate_ids=["a", "b"], reranker_scores=[1.5, -2.0], reranker_model_id="m"
+    )
+    (row,) = store.sample_unlabeled_calibration_rows(limit=10)
+    assert row["candidate_ids"] == ["a", "b"], "candidate_ids must come back as a plain list, not a JSON string"
+    assert row["reranker_scores"] == [1.5, -2.0]
+    assert row["query"] == "q"
+    assert row["reranker_model_id"] == "m"
+    assert isinstance(row["id"], int)
+
+
+def test_sample_unlabeled_calibration_rows_respects_limit(store: MemoryStore) -> None:
+    for i in range(5):
+        store.log_calibration_sample(
+            query=f"turn {i}", candidate_ids=[], reranker_scores=[], reranker_model_id="m"
+        )
+    rows = store.sample_unlabeled_calibration_rows(limit=2)
+    assert len(rows) == 2
+
+
+def test_sample_unlabeled_calibration_rows_empty_when_nothing_logged(store: MemoryStore) -> None:
+    assert store.sample_unlabeled_calibration_rows(limit=10) == []
+
+
+def test_write_calibration_labels_round_trips_positional_lists(store: MemoryStore) -> None:
+    store.log_calibration_sample(
+        query="q", candidate_ids=["a", "b", "c"], reranker_scores=[1.0, 2.0, 3.0],
+        reranker_model_id="m",
+    )
+    (row,) = store.sample_unlabeled_calibration_rows(limit=10)
+
+    store.write_calibration_labels(
+        row["id"],
+        ["relevant", "irrelevant", "relevant"],
+        [None, "irrelevant", None],
+    )
+
+    written = store._conn.execute(
+        "SELECT local_judge_label, haiku_label FROM calibration_log WHERE id = ?", (row["id"],)
+    ).fetchone()
+    assert json.loads(written["local_judge_label"]) == ["relevant", "irrelevant", "relevant"]
+    assert json.loads(written["haiku_label"]) == [None, "irrelevant", None]
+
+
+def test_write_calibration_labels_removes_row_from_the_unlabeled_sample(store: MemoryStore) -> None:
+    store.log_calibration_sample(
+        query="q", candidate_ids=["a"], reranker_scores=[1.0], reranker_model_id="m"
+    )
+    (row,) = store.sample_unlabeled_calibration_rows(limit=10)
+
+    store.write_calibration_labels(row["id"], ["relevant"], [None])
+
+    assert store.sample_unlabeled_calibration_rows(limit=10) == []
+
+
+# ---------------------------------------------------------------------------
+# F2a (#250 inc7): labeled_calibration_pairs — the floor-derivation fit's
+# input (spec Section 7).
+# ---------------------------------------------------------------------------
+
+
+def test_labeled_calibration_pairs_uses_local_label_when_no_haiku_override(
+    store: MemoryStore,
+) -> None:
+    store.log_calibration_sample(
+        query="q", candidate_ids=["a", "b"], reranker_scores=[1.0, 2.0], reranker_model_id="m"
+    )
+    (row,) = store.sample_unlabeled_calibration_rows(limit=10)
+    store.write_calibration_labels(row["id"], ["relevant", "irrelevant"], [None, None])
+
+    pairs = store.labeled_calibration_pairs("m")
+    assert sorted(pairs) == sorted([(1.0, "relevant"), (2.0, "irrelevant")])
+
+
+def test_labeled_calibration_pairs_haiku_label_overrides_local_label(store: MemoryStore) -> None:
+    """Spec Section 6/7 precedence: the Haiku tie-break OVERRIDES the local
+    judge's own provisional label at the position it resolved."""
+    store.log_calibration_sample(
+        query="q", candidate_ids=["a"], reranker_scores=[1.0], reranker_model_id="m"
+    )
+    (row,) = store.sample_unlabeled_calibration_rows(limit=10)
+    # Local judge said "relevant" (ambiguous-band, hence a Haiku call);
+    # Haiku overrode it to "irrelevant".
+    store.write_calibration_labels(row["id"], ["relevant"], ["irrelevant"])
+
+    assert store.labeled_calibration_pairs("m") == [(1.0, "irrelevant")]
+
+
+def test_labeled_calibration_pairs_skips_unknown_and_error_sentinels(store: MemoryStore) -> None:
+    store.log_calibration_sample(
+        query="q", candidate_ids=["a", "b", "c"], reranker_scores=[1.0, 2.0, 3.0],
+        reranker_model_id="m",
+    )
+    (row,) = store.sample_unlabeled_calibration_rows(limit=10)
+    store.write_calibration_labels(row["id"], ["relevant", "unknown", "error"], [None, None, None])
+
+    assert store.labeled_calibration_pairs("m") == [(1.0, "relevant")]
+
+
+def test_labeled_calibration_pairs_filters_by_reranker_model_id(store: MemoryStore) -> None:
+    store.log_calibration_sample(
+        query="q", candidate_ids=["a"], reranker_scores=[1.0], reranker_model_id="model-x"
+    )
+    store.log_calibration_sample(
+        query="q", candidate_ids=["b"], reranker_scores=[2.0], reranker_model_id="model-y"
+    )
+    for row in store.sample_unlabeled_calibration_rows(limit=10):
+        store.write_calibration_labels(row["id"], ["relevant"], [None])
+
+    assert store.labeled_calibration_pairs("model-x") == [(1.0, "relevant")]
+    assert store.labeled_calibration_pairs("model-y") == [(2.0, "relevant")]
+
+
+def test_labeled_calibration_pairs_excludes_unlabeled_rows(store: MemoryStore) -> None:
+    store.log_calibration_sample(
+        query="q", candidate_ids=["a"], reranker_scores=[1.0], reranker_model_id="m"
+    )
+    assert store.labeled_calibration_pairs("m") == []
+
+
+def test_labeled_calibration_pairs_empty_when_nothing_logged(store: MemoryStore) -> None:
+    assert store.labeled_calibration_pairs("never-logged-model") == []
+
+
+def test_labeled_calibration_pairs_excludes_stale_raw_scale_rows(store: MemoryStore) -> None:
+    """AC9 (F2b, #276 §5): a pre-F2b ('raw') row and a post-F2b
+    ('normalized') row for the SAME model_id, both labeled — the fit
+    sampler must return ONLY the normalized-scale row. Mixing a raw-scale
+    score into a fit trained against normalized-scale scores would silently
+    corrupt the derived floor (the two scales are not comparable), so this
+    must genuinely exclude the raw row, not merely happen not to include it
+    by coincidence of value."""
+    # Pre-F2b row: inserted directly on the raw scale (score_scale='raw'),
+    # mirroring how a migrated-in legacy row lands (see
+    # test_existing_store_migrates_in_score_scale_column above) — NOT via
+    # log_calibration_sample, which always stamps 'normalized' now.
+    store._conn.execute(
+        "INSERT INTO calibration_log "
+        "(query, candidate_ids, reranker_scores, reranker_model_id, score_scale) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("a pre-F2b query", json.dumps(["raw-id"]), json.dumps([99.0]), "m", "raw"),
+    )
+    store._conn.commit()
+    # Post-F2b row: the normal, current-scale write path.
+    store.log_calibration_sample(
+        query="a post-F2b query", candidate_ids=["norm-id"], reranker_scores=[1.0],
+        reranker_model_id="m",
+    )
+    for row in store.sample_unlabeled_calibration_rows(limit=10):
+        store.write_calibration_labels(row["id"], ["relevant"], [None])
+    # The raw row's own local_judge_label write above (if it landed via
+    # sample_unlabeled_calibration_rows) is irrelevant to this assertion —
+    # what matters is that ONLY the normalized-scale pair ever reaches the
+    # fit sampler's output, regardless of label state on the raw row.
+    pairs = store.labeled_calibration_pairs("m")
+    assert pairs == [(1.0, "relevant")], (
+        "the raw-scale row's score (99.0) must never appear in the fit sample — "
+        f"got {pairs!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pre-flip revision Change 1 ("nimble floor"): `labeled_calibration_pairs`
+# is now day-scoped to the MOST RECENTLY COMPLETED DAY (MAX `day_bucket`
+# among this model_id's own usable labeled rows), not the full retention
+# window pooled. See that method's own docstring for the exact boundary.
+# ---------------------------------------------------------------------------
+
+
+def _seed_and_label_row(
+    store: MemoryStore, *, query: str, score: float, label: str, model_id: str, day_bucket: str
+) -> None:
+    """Seed one already-labeled calibration_log row directly on a SPECIFIC
+    `day_bucket` (bypassing log_calibration_sample, which always stamps
+    the column's own `strftime('%Y-%m-%d','now')` default — these tests
+    need to control which day a row lands on)."""
+    store._conn.execute(
+        "INSERT INTO calibration_log "
+        "(day_bucket, query, candidate_ids, reranker_scores, reranker_model_id, "
+        "local_judge_label, haiku_label, score_scale) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            day_bucket, query, json.dumps(["c"]), json.dumps([score]), model_id,
+            json.dumps([label]), json.dumps([None]), CALIBRATION_SCORE_SCALE,
+        ),
+    )
+    store._conn.commit()
+
+
+def test_labeled_calibration_pairs_reads_only_the_most_recent_day(store: MemoryStore) -> None:
+    """Acceptance #2 ("Day-only read"): with rows on three distinct days
+    for the same model_id, only the LATEST day_bucket's pairs are
+    returned — an earlier day's clearly-distinguishable score must never
+    leak into the result."""
+    _seed_and_label_row(store, query="q1", score=1.0, label="relevant", model_id="m", day_bucket="2026-01-01")
+    _seed_and_label_row(store, query="q2", score=2.0, label="relevant", model_id="m", day_bucket="2026-01-02")
+    _seed_and_label_row(store, query="q3", score=3.0, label="relevant", model_id="m", day_bucket="2026-01-03")
+
+    pairs = store.labeled_calibration_pairs("m")
+
+    assert pairs == [(3.0, "relevant")], (
+        "must read ONLY the latest day_bucket's row — the two earlier days' scores must not appear"
+    )
+
+
+def test_labeled_calibration_pairs_day_scope_is_independent_of_insertion_order(
+    store: MemoryStore,
+) -> None:
+    """The day boundary is the MAX day_bucket VALUE, not insertion order —
+    inserting the later-dated row FIRST must not change which day wins."""
+    _seed_and_label_row(store, query="q-late", score=9.0, label="relevant", model_id="m", day_bucket="2026-02-05")
+    _seed_and_label_row(store, query="q-early", score=1.0, label="irrelevant", model_id="m", day_bucket="2026-02-01")
+
+    pairs = store.labeled_calibration_pairs("m")
+
+    assert pairs == [(9.0, "relevant")]
+
+
+def test_labeled_calibration_pairs_day_scope_is_per_reranker_model_id(store: MemoryStore) -> None:
+    """Two different model_ids each have their OWN "most recent day" —
+    model-x's latest day must not be influenced by model-y's rows, even
+    when model-y's own latest day is chronologically later."""
+    _seed_and_label_row(store, query="qx1", score=1.0, label="relevant", model_id="model-x", day_bucket="2026-03-01")
+    _seed_and_label_row(store, query="qx2", score=2.0, label="relevant", model_id="model-x", day_bucket="2026-03-02")
+    _seed_and_label_row(store, query="qy", score=99.0, label="relevant", model_id="model-y", day_bucket="2026-03-10")
+
+    assert store.labeled_calibration_pairs("model-x") == [(2.0, "relevant")]
+    assert store.labeled_calibration_pairs("model-y") == [(99.0, "relevant")]
+
+
+def test_labeled_calibration_pairs_day_scope_ignores_unlabeled_rows_on_a_later_day(
+    store: MemoryStore,
+) -> None:
+    """A later day_bucket that has ROWS but none of them LABELED yet
+    (judge-labeling lags behind logging) must not shadow the latest day
+    that DOES have usable labeled pairs — the MAX is taken over usable
+    (labeled, correctly-scaled) rows, not over every logged row."""
+    _seed_and_label_row(store, query="q-labeled", score=5.0, label="relevant", model_id="m", day_bucket="2026-04-01")
+    # A later day's row exists but is UNLABELED (local_judge_label IS NULL).
+    store.log_calibration_sample(
+        query="q-unlabeled", candidate_ids=["c2"], reranker_scores=[7.0], reranker_model_id="m"
+    )
+    store._conn.execute(
+        "UPDATE calibration_log SET day_bucket = ? WHERE query = ?", ("2026-04-09", "q-unlabeled")
+    )
+    store._conn.commit()
+
+    pairs = store.labeled_calibration_pairs("m")
+
+    assert pairs == [(5.0, "relevant")], (
+        "the unlabeled later-day row must not shadow the latest day that actually has usable pairs"
+    )
+
+
+def test_labeled_calibration_pairs_day_scope_excludes_a_raw_scale_row_from_winning_max_day(
+    store: MemoryStore,
+) -> None:
+    """A later day_bucket whose only row is still RAW-scale (a legacy row,
+    or a pre-F2b write) must not win the MAX-day lookup either — the
+    day-scope query is filtered by score_scale the same way the pair read
+    itself is (F2b §5, unaffected by Change 1)."""
+    _seed_and_label_row(store, query="q-normalized", score=4.0, label="relevant", model_id="m", day_bucket="2026-05-01")
+    store._conn.execute(
+        "INSERT INTO calibration_log "
+        "(day_bucket, query, candidate_ids, reranker_scores, reranker_model_id, "
+        "local_judge_label, haiku_label, score_scale) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("2026-05-09", "q-raw", json.dumps(["c"]), json.dumps([999.0]), "m",
+         json.dumps(["relevant"]), json.dumps([None]), "raw"),
+    )
+    store._conn.commit()
+
+    pairs = store.labeled_calibration_pairs("m")
+
+    assert pairs == [(4.0, "relevant")], (
+        "a later day whose only labeled row is raw-scale must not win the MAX-day lookup"
+    )
+
+
+# ---------------------------------------------------------------------------
+# F2a (#250 inc7): reranker_floor_calibration table + get/write_reranker_floor
+# (spec Section 7 — the calibrated abstention floor's persistence, I1).
+# ---------------------------------------------------------------------------
+
+
+def test_fresh_store_has_reranker_floor_calibration_table() -> None:
+    store = MemoryStore(":memory:")
+    tables = {
+        row[0]
+        for row in store._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    assert "reranker_floor_calibration" in tables
+    cols = {
+        row[1] for row in store._conn.execute("PRAGMA table_info(reranker_floor_calibration)").fetchall()
+    }
+    assert cols == {
+        "reranker_model_id", "floor", "raw_fit_floor", "sample_pairs", "is_cold_start", "updated_at",
+        "score_scale",  # F2b (#276 §6): raw-vs-normalized scale marker on the PERSISTED floor row
+    }
+    store.close()
+
+
+def test_get_reranker_floor_returns_a_bootstrap_when_never_derived(store: MemoryStore) -> None:
+    """F2a inc8 (#250 §7 UPDATED, Roy 2026-09-18): no persisted row is no
+    longer a `None` result — `get_reranker_floor` now serves a derived,
+    transient BOOTSTRAP floor instead (this REPLACES the pre-ruling
+    `test_get_reranker_floor_returns_none_when_never_derived` behavior).
+    Nothing is written to the table by merely reading it."""
+    result = store.get_reranker_floor("never-calibrated-model")
+    assert result is not None
+    assert result["reranker_model_id"] == "never-calibrated-model"
+    assert result["is_cold_start"] is True
+    assert result["updated_at"] is None, "a bootstrap floor is transient — never persisted"
+    count = store._conn.execute(  # noqa: SLF001
+        "SELECT COUNT(*) AS n FROM reranker_floor_calibration WHERE reranker_model_id = ?",
+        ("never-calibrated-model",),
+    ).fetchone()["n"]
+    assert count == 0, "reading a bootstrap floor must never write a row"
+
+
+def test_get_reranker_floor_persisted_row_supersedes_a_warm_bootstrap_cache(
+    monkeypatch: pytest.MonkeyPatch, store: MemoryStore
+) -> None:
+    """A persisted row must always win over the bootstrap — even when the
+    bootstrap was already computed and cached for this exact model_id by an
+    earlier call. No stale in-memory bootstrap may ever shadow a real
+    corpus-derived floor once the daily tick writes one."""
+    from brain.memory import floor_calibration
+    from brain.memory.reranker import _FP16_GATE_PAIRS, FakeRerankerProvider
+
+    floor_calibration._reset_bootstrap_floor_cache()
+    model_id = "supersession-test-model"
+    scores_by_doc = {doc: (5.0 if i < 3 else -5.0) for i, (_q, doc) in enumerate(_FP16_GATE_PAIRS[:6])}
+    monkeypatch.setattr(
+        "brain.memory.reranker._bootstrap_reranker_provider",
+        lambda model_id: FakeRerankerProvider(scores=scores_by_doc),
+    )
+
+    bootstrap = store.get_reranker_floor(model_id)
+    assert bootstrap is not None
+    assert bootstrap["is_cold_start"] is True
+
+    store.write_reranker_floor(
+        model_id, floor=123.456, raw_fit_floor=123.456, sample_pairs=999, is_cold_start=False
+    )
+
+    persisted = store.get_reranker_floor(model_id)
+    assert persisted["floor"] == pytest.approx(123.456), (
+        "a persisted row must supersede an already-cached bootstrap, not be shadowed by it"
+    )
+    assert persisted["is_cold_start"] is False
+    assert persisted["sample_pairs"] == 999
+
+
+def test_get_persisted_reranker_floor_returns_none_on_a_miss_never_the_bootstrap(
+    monkeypatch: pytest.MonkeyPatch, store: MemoryStore
+) -> None:
+    """Pre-flip revision Change 1: `get_persisted_reranker_floor` is the
+    persisted-ONLY half `get_reranker_floor` was refactored to share with
+    `derive_and_persist_floor`'s data-starvation backstop — it must return
+    `None` on a miss, even when a bootstrap floor IS servable (and gets
+    cached) for the same model_id via the ordinary `get_reranker_floor`."""
+    from brain.memory import floor_calibration
+    from brain.memory.reranker import _FP16_GATE_PAIRS, FakeRerankerProvider
+
+    floor_calibration._reset_bootstrap_floor_cache()
+    scores_by_doc = {doc: (5.0 if i < 3 else -5.0) for i, (_q, doc) in enumerate(_FP16_GATE_PAIRS[:6])}
+    monkeypatch.setattr(
+        "brain.memory.reranker._bootstrap_reranker_provider",
+        lambda model_id: FakeRerankerProvider(scores=scores_by_doc),
+    )
+
+    assert store.get_persisted_reranker_floor("no-row-model") is None
+
+    # Confirm the bootstrap IS servable for this same model_id via the
+    # ordinary get_reranker_floor — proving the None above is specifically
+    # about "no PERSISTED row", not "no floor at all".
+    bootstrap = store.get_reranker_floor("no-row-model")
+    assert bootstrap is not None
+    assert store.get_persisted_reranker_floor("no-row-model") is None, (
+        "a warm bootstrap cache for this model_id must not leak into the persisted-only read"
+    )
+
+
+def test_get_persisted_reranker_floor_returns_the_row_when_one_exists(store: MemoryStore) -> None:
+    store.write_reranker_floor(
+        "model-a", floor=1.5, raw_fit_floor=1.25, sample_pairs=250, is_cold_start=False
+    )
+    result = store.get_persisted_reranker_floor("model-a")
+    assert result is not None
+    assert result["floor"] == 1.5
+    assert result["raw_fit_floor"] == 1.25
+    assert result["sample_pairs"] == 250
+    assert result["is_cold_start"] is False
+
+
+def test_get_reranker_floor_delegates_persisted_case_to_get_persisted_reranker_floor(
+    store: MemoryStore,
+) -> None:
+    """The refactor (Change 1) must not change `get_reranker_floor`'s own
+    persisted-row behavior — it now just reads through `get_persisted_
+    reranker_floor` first, same values either way."""
+    store.write_reranker_floor(
+        "model-a", floor=1.5, raw_fit_floor=1.25, sample_pairs=250, is_cold_start=False
+    )
+    assert store.get_reranker_floor("model-a") == store.get_persisted_reranker_floor("model-a")
+
+
+def test_write_reranker_floor_round_trips(store: MemoryStore) -> None:
+    store.write_reranker_floor(
+        "model-a", floor=1.5, raw_fit_floor=1.25, sample_pairs=250, is_cold_start=False
+    )
+    row = store.get_reranker_floor("model-a")
+    assert row == {
+        "reranker_model_id": "model-a",
+        "floor": 1.5,
+        "raw_fit_floor": 1.25,
+        "sample_pairs": 250,
+        "is_cold_start": False,
+        "updated_at": row["updated_at"],  # not asserting an exact timestamp
+        # F2b (#276 §6): write_reranker_floor's default stamps the CURRENT
+        # scale — every production caller (derive_and_persist_floor, both
+        # branches, post-§5b) writes normalized-scale floors.
+        "score_scale": "normalized",
+    }
+
+
+def test_write_reranker_floor_upserts_by_model_id(store: MemoryStore) -> None:
+    """A model_id's row is REPLACED wholesale, not accumulated (one current
+    floor per model_id, not a history table)."""
+    store.write_reranker_floor(
+        "model-a", floor=1.0, raw_fit_floor=1.0, sample_pairs=200, is_cold_start=True
+    )
+    store.write_reranker_floor(
+        "model-a", floor=2.0, raw_fit_floor=2.0, sample_pairs=300, is_cold_start=False
+    )
+    row = store.get_reranker_floor("model-a")
+    assert row["floor"] == 2.0
+    assert row["sample_pairs"] == 300
+    assert row["is_cold_start"] is False
+    count = store._conn.execute(
+        "SELECT COUNT(*) AS n FROM reranker_floor_calibration WHERE reranker_model_id = ?",
+        ("model-a",),
+    ).fetchone()["n"]
+    assert count == 1
+
+
+def test_write_reranker_floor_is_scoped_per_model_id(store: MemoryStore) -> None:
+    store.write_reranker_floor("model-a", floor=1.0, raw_fit_floor=1.0, sample_pairs=1, is_cold_start=True)
+    store.write_reranker_floor("model-b", floor=2.0, raw_fit_floor=2.0, sample_pairs=1, is_cold_start=True)
+    assert store.get_reranker_floor("model-a")["floor"] == 1.0
+    assert store.get_reranker_floor("model-b")["floor"] == 2.0
+
+
+# ---------------------------------------------------------------------------
+# F2b (#276 §6, inc3): `reranker_floor_calibration.score_scale` + the
+# `reranker_floor_is_stale` staleness check the deploy-time one-time
+# recalibration trigger reads (`supervisor._run_deploy_recalibration_check`).
+# ---------------------------------------------------------------------------
+
+
+def test_write_reranker_floor_defaults_to_normalized_scale(store: MemoryStore) -> None:
+    """Every production write path (`derive_and_persist_floor`'s real-fit
+    and cold-start branches, both normalized post-§5b) relies on
+    `write_reranker_floor`'s default rather than passing `score_scale`
+    explicitly — confirm that default is the CURRENT scale constant, not a
+    bare string literal that could drift from `CALIBRATION_SCORE_SCALE`."""
+    store.write_reranker_floor(
+        "model-a", floor=1.0, raw_fit_floor=1.0, sample_pairs=1, is_cold_start=True
+    )
+    row = store._conn.execute(
+        "SELECT score_scale FROM reranker_floor_calibration WHERE reranker_model_id = ?",
+        ("model-a",),
+    ).fetchone()
+    assert row["score_scale"] == CALIBRATION_SCORE_SCALE == "normalized"
+
+
+def test_write_reranker_floor_can_stamp_a_legacy_raw_scale(store: MemoryStore) -> None:
+    """`score_scale` is an overridable keyword (not hardcoded in the SQL) so
+    a test can seed a legacy pre-F2b row without reaching around the public
+    write path — exercised by the staleness tests below."""
+    store.write_reranker_floor(
+        "legacy-model", floor=-1.0, raw_fit_floor=-1.0, sample_pairs=6,
+        is_cold_start=True, score_scale="raw",
+    )
+    row = store._conn.execute(
+        "SELECT score_scale FROM reranker_floor_calibration WHERE reranker_model_id = ?",
+        ("legacy-model",),
+    ).fetchone()
+    assert row["score_scale"] == "raw"
+
+
+def test_reranker_floor_is_stale_true_when_no_row_exists(store: MemoryStore) -> None:
+    """A model_id with NO persisted row (fresh install, or a never-
+    calibrated model) reads as stale — the deploy-recalibration check must
+    not be fooled by `get_reranker_floor`'s transient bootstrap fallback
+    into thinking a real floor already exists on disk."""
+    assert store.reranker_floor_is_stale("never-seen-model") is True
+
+
+def test_reranker_floor_is_stale_true_for_a_legacy_raw_row(store: MemoryStore) -> None:
+    """A persisted row still on the pre-F2b raw scale (a legacy write, or a
+    migrated-in row defaulted to 'raw') must be flagged stale."""
+    store.write_reranker_floor(
+        "legacy-model", floor=-1.0, raw_fit_floor=-1.0, sample_pairs=6,
+        is_cold_start=True, score_scale="raw",
+    )
+    assert store.reranker_floor_is_stale("legacy-model") is True
+
+
+def test_reranker_floor_is_stale_false_after_a_normalized_write(store: MemoryStore) -> None:
+    """Once a row is stamped with the current scale (the default every
+    production write uses), the same model_id must read as NOT stale —
+    this is the mechanism that makes the deploy-recalibration check
+    idempotent (fires once, never again for that model_id)."""
+    store.write_reranker_floor(
+        "fresh-model", floor=0.5, raw_fit_floor=0.5, sample_pairs=6, is_cold_start=True
+    )
+    assert store.reranker_floor_is_stale("fresh-model") is False
+
+
+def test_existing_reranker_floor_calibration_migrates_in_score_scale_column(tmp_path) -> None:
+    """F2b (#276 §6): simulate a pre-F2b persona whose `reranker_floor_
+    calibration` table predates the `score_scale` column, with a real
+    persisted floor row already in it (written by F2a before F2b ever
+    shipped). Opening `MemoryStore` must add the column without error,
+    default the pre-existing row to 'raw' (I9 — legacy rows survive,
+    labeled honestly, never dropped/rewritten), and
+    `reranker_floor_is_stale` must correctly flag that migrated-in row as
+    stale (it is exactly the pre-F2b raw floor §6 exists to catch)."""
+    db_path = tmp_path / "memories.db"
+    old_schema = """
+    CREATE TABLE reranker_floor_calibration (
+        reranker_model_id TEXT PRIMARY KEY,
+        floor REAL NOT NULL,
+        raw_fit_floor REAL NOT NULL,
+        sample_pairs INTEGER NOT NULL,
+        is_cold_start INTEGER NOT NULL DEFAULT 1,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    """
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(old_schema)
+    conn.execute(
+        "INSERT INTO reranker_floor_calibration "
+        "(reranker_model_id, floor, raw_fit_floor, sample_pairs, is_cold_start) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("pre-f2b-model", -1.0, -1.0, 250, 0),
+    )
+    conn.commit()
+    conn.close()
+
+    store = MemoryStore(db_path)  # must not raise
+    cols = {
+        row[1] for row in store._conn.execute("PRAGMA table_info(reranker_floor_calibration)").fetchall()
+    }
+    assert "score_scale" in cols
+
+    legacy_row = store._conn.execute(
+        "SELECT reranker_model_id, score_scale FROM reranker_floor_calibration "
+        "WHERE reranker_model_id = ?",
+        ("pre-f2b-model",),
+    ).fetchone()
+    assert legacy_row is not None, "the pre-existing row must survive the migration"
+    assert legacy_row["score_scale"] == "raw", "a migrated-in legacy row must default to the raw scale"
+    assert store.reranker_floor_is_stale("pre-f2b-model") is True, (
+        "a migrated-in raw-scale row must be detected as stale"
+    )
+    store.close()

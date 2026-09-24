@@ -276,8 +276,11 @@ def maybe_weekly_rollover(
     # decision 5's "Calibration" bullet, brain/memory/semantic_calibration.py)
     # is REMOVED — the cold red-team proved deriving a cosine floor/gap from
     # the corpus's own inter-memory spread doesn't generalize. Replaced by a
-    # cross-encoder reranker + a FIXED floor (brain/memory/semantic_recall.
-    # RERANK_FLOOR), which needs no per-persona recalibration pass at all.
+    # cross-encoder reranker + a floor gate (brain/memory/semantic_recall.py's
+    # `select_standouts`) — originally a fixed module constant, cut over by
+    # F2a inc8 (#250 §7/§8) to a floor the DAILY calibration tick derives and
+    # persists (brain/memory/floor_calibration.py), so this rollover path
+    # still needs no per-persona recalibration pass of its own here.
 
     return new_sid
 
