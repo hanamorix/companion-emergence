@@ -12,7 +12,7 @@ from brain.memory.embedding_matrix import build_embedding_matrix
 from brain.memory.embeddings import cosine_similarity
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.relevance import CANDIDATE_POOL, rank_memories, snippet_length
-from brain.memory.semantic_recall import RERANK_FLOOR, build_semantic_candidate_pool
+from brain.memory.semantic_recall import build_semantic_candidate_pool
 from brain.memory.store import Memory, MemoryStore
 from brain.tools.impls._common import _mem_to_result
 
@@ -102,10 +102,20 @@ def _semantic_top_k(
     the cross-encoder (``reranker.build_reranker_provider`` + ``reranker.
     get_rerank_width``, same auto-scaling ``run_semantic_recall`` uses).
 
-    The reranker here improves ORDERING; ``RERANK_FLOOR`` decides
-    semantic-vs-lexical: if NOTHING clears the floor, this returns ``None``
-    (the tool's EXISTING empty-semantic→lexical fallback — never returns
-    nothing, never hands back semantic junk that never cleared the floor).
+    F2b (#276 §2/§4): the score compared against the floor is the
+    per-query anchor-median NORMALIZED score (``reranker.normalize_
+    against_anchors``), not the raw cross-encoder score — same mechanism
+    and ordering (normalize THEN gate) as ``run_semantic_recall``'s
+    identical composition. This site has no calibration-log write.
+
+    The reranker here improves ORDERING; the CALIBRATED reranker floor
+    (F2a inc8, #250 §7/§8 cutover — read live via
+    ``store.get_reranker_floor(reranker_provider.model_id())``, replacing
+    the deleted ``RERANK_FLOOR`` module constant) decides semantic-vs-
+    lexical: if NOTHING clears the floor — or no calibrated floor row exists
+    yet for the runtime model_id — this returns ``None`` (the tool's
+    EXISTING empty-semantic→lexical fallback — never returns nothing, never
+    hands back semantic junk that never cleared the floor).
     Otherwise returns the top ``limit`` floor-clearing memories in
     reranker-descending order.
 
@@ -153,7 +163,7 @@ def _semantic_top_k(
         cosine_scored.sort(key=lambda pair: -pair[1])
         coarse = cosine_scored[:CANDIDATE_POOL]
 
-        reranker_provider = reranker_mod.build_reranker_provider()
+        reranker_provider = reranker_mod.build_reranker_provider(store=store)
         # #231-fix: calibrate on REAL candidate-pool documents (a small
         # sample off the front of the already cosine-sorted `coarse`
         # list) rather than a synthetic placeholder — see
@@ -165,12 +175,52 @@ def _semantic_top_k(
         width = reranker_mod.get_rerank_width(len(coarse), reranker_provider, calibration_sample)
         to_rerank = coarse[:width]
         rerank_ids = [mid for mid, _ in to_rerank]
-        documents = [pool[mid][0].content for mid in rerank_ids]
-        rerank_scores = list(reranker_provider.rerank(query, documents))
+        real_documents = [pool[mid][0].content for mid in rerank_ids]
+        # F2b (#276 §2/§4): normalize against the anchor median BEFORE the
+        # floor gate below — mirrors `run_semantic_recall`'s identical
+        # wiring (inc1's `normalize_against_anchors` is reused unchanged,
+        # not reimplemented here). `scored_ids` is the PREFIX of
+        # `rerank_ids` actually scored this call (`result.real_width` <=
+        # `width`); `result.scores` is positionally aligned with it 1:1.
+        # This site has no calibration-log write to re-point (confirmed —
+        # only `run_semantic_recall` logs). Anchors never leave the helper,
+        # so they can never enter `scored_ids`/the gate/the returned list.
+        normalization = reranker_mod.normalize_against_anchors(
+            reranker_provider, query, real_documents, width
+        )
+        scored_ids = rerank_ids[: normalization.real_width]
+        rerank_scores = normalization.scores
+
+        # F2a inc8 (#250 §7 UPDATED): read the operative floor live, keyed
+        # by the RUNTIME reranker model_id — mirrors `run_semantic_recall`'s
+        # identical lookup. No persisted row yet (daily tick has never
+        # fired for this model_id) no longer means "nothing to read" —
+        # `get_reranker_floor` serves a derived bootstrap instead. `None`
+        # now fires ONLY on the bootstrap's own fail-soft path (a reranker
+        # load/fit failure), which still falls back to lexical here, never
+        # a guessed floor value.
+        floor_row = store.get_reranker_floor(reranker_provider.model_id())
+        if floor_row is None:
+            logger.info(
+                "search_memories(semantic): no floor available (bootstrap computation failed) "
+                "for %s — falling back to lexical",
+                reranker_provider.model_id(),
+            )
+            return None
+        logger.debug(
+            "search_memories(semantic): floor=%.4f model=%s cold_start=%s "
+            "sample_pairs=%d updated_at=%s",
+            floor_row["floor"],
+            reranker_provider.model_id(),
+            floor_row["is_cold_start"],
+            floor_row["sample_pairs"],
+            floor_row["updated_at"],
+        )
+
         reranked = [
             (mid, score)
-            for mid, score in zip(rerank_ids, rerank_scores, strict=True)
-            if score >= RERANK_FLOOR
+            for mid, score in zip(scored_ids, rerank_scores, strict=True)
+            if score >= floor_row["floor"]
         ]
         if not reranked:
             return None
@@ -223,8 +273,8 @@ def search_memories(
       - ``"age"``: WIDENS the internal fetch to ``CANDIDATE_POOL`` (today 50)
         for BOTH modes — lexical calls ``rank_memories(..., limit=
         CANDIDATE_POOL)``; semantic reranks up to ``CANDIDATE_POOL``
-        floor-clearing candidates in ``_semantic_top_k`` (#231's
-        ``RERANK_FLOOR`` gate still applies — "age" only widens the fetch,
+        floor-clearing candidates in ``_semantic_top_k`` (#231's calibrated
+        reranker-floor gate still applies — "age" only widens the fetch,
         it never skips the floor) — THEN sorts that wider matched set by
         ``created_at`` DESC, THEN slices to
         the caller's real ``limit``. A naive re-sort of an already-``limit``-

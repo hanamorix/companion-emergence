@@ -24,7 +24,40 @@ from typing import Any
 
 import numpy as np
 
+from brain import tunables
+from brain.memory.floor_calibration import RETENTION_WINDOW_DAYS_DEFAULT
+
 logger = logging.getLogger(__name__)
+
+# F2a (#250 inc5, FINALIZED inc7, SHRUNK pre-flip revision Change 1):
+# calibration_log retention window (spec Section 5 / acceptance 5b). inc5
+# shipped this as a PROVISIONAL flat 14.0 placeholder; inc7 replaced it with
+# a derived max(sample-drawable-days, drift-responsiveness) formula sized to
+# cover the (then-pooled) multi-day fit. Change 1 re-points the fit to read
+# only the MOST RECENTLY COMPLETED DAY (`MemoryStore.labeled_calibration_
+# pairs`, day-scoped), so retention no longer needs to cover a multi-day
+# accumulation window — only today's in-progress bucket, yesterday's (the
+# day actually read), and a small safety buffer. See
+# `floor_calibration.derive_retention_window_days` for the current
+# derivation, imported here as `RETENTION_WINDOW_DAYS_DEFAULT`. The
+# derivation's one home stays in floor_calibration.py; this module keeps
+# owning the tunable KEY (`calibration.retention_window_days`) and `prune_
+# calibration_log`'s contract, unchanged from inc5. An operator override via
+# tunables.json is unaffected by this swap from a flat default to a derived
+# one.
+CALIBRATION_LOG_RETENTION_WINDOW_DAYS: float = tunables.register(
+    "calibration.retention_window_days", RETENTION_WINDOW_DAYS_DEFAULT
+)
+
+# F2b (#276 §5): the score scale every `calibration_log` row `log_
+# calibration_sample` writes FROM HERE ON is stamped with — a single named
+# constant (never a bare string literal at either the write site or the
+# fit-sample filter site) so the two stay in lockstep by construction. Once
+# F2b ships, `reranker_scores` is always the per-query anchor-normalized
+# value (`brain.memory.reranker.normalize_against_anchors`), never the raw
+# cross-encoder score — see the `calibration_log` schema comment above for
+# why the two scales must never be mixed into one floor fit.
+CALIBRATION_SCORE_SCALE = "normalized"
 
 
 def _coerce_utc(ts: str) -> datetime:
@@ -245,6 +278,107 @@ CREATE TABLE IF NOT EXISTS cluster_centroids (
     PRIMARY KEY (model_id, cluster_id)
 );
 
+-- F2a (#250 inc4): real-query calibration log — one row per recall turn,
+-- logging the REAL (never synthetic) query, the retrieved candidate ids, and
+-- the reranker scores ALREADY computed that turn, so a later idle-gated
+-- daily tick (spec Section 5/7, not yet built) can judge-label a SAMPLE of
+-- these rows and re-derive RERANK_FLOOR against the actual corpus and the
+-- actual reranker model in use. Lives in memories.db per I1 — same posture
+-- as `cluster_centroids` above (a per-persona artifact, not per-memory; no
+-- separate .db file). `reranker_model_id` is logged per row so a later floor
+-- derivation can filter to one model's score scale and never mixes scores
+-- across a reranker swap (F2a's own jina swap, or any future one).
+-- `day_bucket` mirrors `logged_at`'s date so the daily tick can select one
+-- day's rows cheaply without parsing timestamps. `local_judge_label` /
+-- `haiku_label` are nullable and start empty on day one — populated by the
+-- offline judge pass (Section 6, not yet built) and read by F2c's later
+-- fine-tuning (Out-of-scope) — logged from day one per spec so F2c has data
+-- to start from once it exists.
+--
+-- Retention/pruning (F2a #250 inc5, spec Section 5 / acceptance 5b): the
+-- daily calibration tick (`_run_calibration_tick` in brain/bridge/
+-- supervisor.py) calls `MemoryStore.prune_calibration_log` every firing, so
+-- this table stays bounded to a rolling `day_bucket` window instead of
+-- growing unbounded — see CALIBRATION_LOG_RETENTION_WINDOW_DAYS above for
+-- the window's FINALIZED (inc7) value and derivation.
+-- `score_scale` (F2b, #276 §5): marks whether `reranker_scores` on this row
+-- is on the PRE-F2b raw reranker-score scale or the POST-F2b per-query
+-- anchor-normalized scale (`brain.memory.reranker.normalize_against_
+-- anchors`) — the two are not comparable (a constant per-query offset
+-- separates them) and must never be mixed into one floor fit. DEFAULT
+-- 'raw' so every row written before this column existed (and every legacy
+-- row picked up by the migration below) reads as raw without a backfill;
+-- `log_calibration_sample` (F2b) always stamps the CURRENT scale
+-- (`CALIBRATION_SCORE_SCALE` = 'normalized') explicitly on every row it
+-- writes from here on, never relying on the column default. Read by
+-- `labeled_calibration_pairs`'s fit-sample filter (F2b §5) so a post-deploy
+-- floor fit draws only from normalized-scale rows. This same marker is a
+-- candidate for F2c/inc3's deploy-time one-time-recalibration trigger
+-- (spec §6) — "has a normalized-scale row ever been logged" is exactly a
+-- deploy-detection signal, though wiring that trigger is out of scope here.
+CREATE TABLE IF NOT EXISTS calibration_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    logged_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    day_bucket TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d', 'now')),
+    query TEXT NOT NULL,
+    candidate_ids TEXT NOT NULL,
+    reranker_scores TEXT NOT NULL,
+    reranker_model_id TEXT NOT NULL,
+    local_judge_label TEXT,
+    haiku_label TEXT,
+    score_scale TEXT NOT NULL DEFAULT 'raw'
+);
+CREATE INDEX IF NOT EXISTS idx_calibration_log_day_bucket ON calibration_log(day_bucket);
+
+-- F2a (#250 inc7): the DB-adaptive abstention floor itself (spec Section 7)
+-- — the per-persona replacement for the hardcoded
+-- `semantic_recall.RERANK_FLOOR` constant. Lives in memories.db per I1, same
+-- posture as `cluster_centroids`/`calibration_log` above (a per-persona
+-- artifact, never a side file). Keyed by `reranker_model_id`, mirroring
+-- `cluster_centroids`' model_id keying, so a reranker precision flip
+-- (fp32<->fp16, #250 §2) or any future model_tier swap never mixes a floor
+-- fit against one score scale with scores from another — each model_id
+-- tracks its own independently-derived, independently-EMA-smoothed floor.
+-- `floor` is the value actually in effect (EMA-smoothed once past cold
+-- start); `raw_fit_floor` is that cycle's pre-EMA fit, kept for
+-- diagnostics/tests. `is_cold_start` distinguishes a bootstrap-pairs fit
+-- (not yet enough real labeled data — spec's outcome-based cold-start exit)
+-- from a real corpus-derived fit. WRITTEN by
+-- `brain.memory.floor_calibration.derive_and_persist_floor` (inc7, called
+-- from the daily calibration tick); READ live by `select_standouts`
+-- (`brain/memory/semantic_recall.py`) and the reranker precision self-check
+-- (`brain/memory/reranker.py`) as of inc8's cutover — the bare
+-- `RERANK_FLOOR` constant this table replaces no longer exists. A model_id
+-- with NO row here yet is a fresh-install/early-days state: `MemoryStore.
+-- get_reranker_floor` serves a derived, transient BOOTSTRAP floor instead of
+-- None in that case (F2a inc8, #250 §7 UPDATED, Roy 2026-09-18) — never
+-- written to this table; the first accepted daily-tick write always
+-- supersedes it.
+-- `score_scale` (F2b, #276 §6): mirrors `calibration_log.score_scale`
+-- (same rationale, same DEFAULT 'raw' — see that column's comment above)
+-- but marks the SCALE OF THE PERSISTED FLOOR ITSELF rather than a logged
+-- score row. A pre-F2b row (written before this column existed) reads as
+-- 'raw' via the column default without a backfill; every write FROM HERE
+-- ON (`MemoryStore.write_reranker_floor`, called only by
+-- `floor_calibration.derive_and_persist_floor`) stamps the CURRENT scale
+-- (`CALIBRATION_SCORE_SCALE` = 'normalized', post-§5b true for BOTH the
+-- real-fit and cold-start branches) explicitly, never relying on the
+-- default. Read by `MemoryStore.reranker_floor_is_stale` — the deploy-time
+-- one-time-recalibration trigger (spec §6, #276 inc3,
+-- `brain.bridge.supervisor._run_deploy_recalibration_check`): an ABSENT
+-- row or a row still reading 'raw' means the persisted floor predates
+-- F2b's normalized-scale gate and needs one out-of-cycle recalibration
+-- pass, rather than waiting for the next scheduled daily tick.
+CREATE TABLE IF NOT EXISTS reranker_floor_calibration (
+    reranker_model_id TEXT PRIMARY KEY,
+    floor REAL NOT NULL,
+    raw_fit_floor REAL NOT NULL,
+    sample_pairs INTEGER NOT NULL,
+    is_cold_start INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    score_scale TEXT NOT NULL DEFAULT 'raw'
+);
+
 -- External-content FTS5 shadow index (P2 relevance overhaul). `memories` is a
 -- rowid table (id TEXT PRIMARY KEY → implicit integer rowid), so external
 -- content with content_rowid='rowid' indexes only `content` (no duplication).
@@ -430,6 +564,38 @@ class MemoryStore:
             self._conn.execute("ALTER TABLE memories ADD COLUMN cluster_id INTEGER")
         if "cluster_model_id" not in existing:
             self._conn.execute("ALTER TABLE memories ADD COLUMN cluster_model_id TEXT")
+        # F2b (#276 §5): score_scale migration for a `calibration_log` table
+        # that pre-dates this column (I9 — legacy DBs keep working; never
+        # drop/rewrite). Same idempotent existing-columns-check pattern as
+        # the `memories` migrations above, scoped to `calibration_log`.
+        # DEFAULT 'raw' matches the CREATE TABLE default: every row that
+        # existed before this migration ran was logged on the pre-F2b raw
+        # scale, so backfilling them as 'raw' (rather than leaving them
+        # NULL) is the honest label, not a guess.
+        existing_calibration_log = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(calibration_log)").fetchall()
+        }
+        if "score_scale" not in existing_calibration_log:
+            self._conn.execute(
+                "ALTER TABLE calibration_log ADD COLUMN score_scale TEXT NOT NULL DEFAULT 'raw'"
+            )
+        # F2b (#276 §6): same migration shape, scoped to
+        # `reranker_floor_calibration` — a legacy DB's persisted floor row
+        # predates the scale marker and must read as 'raw' (never a guess)
+        # so `reranker_floor_is_stale` correctly flags it for the deploy-time
+        # one-time recalibration (§6) rather than silently trusting a
+        # raw-scale floor under the normalized gate.
+        existing_floor_calibration = {
+            row[1]
+            for row in self._conn.execute(
+                "PRAGMA table_info(reranker_floor_calibration)"
+            ).fetchall()
+        }
+        if "score_scale" not in existing_floor_calibration:
+            self._conn.execute(
+                "ALTER TABLE reranker_floor_calibration ADD COLUMN score_scale "
+                "TEXT NOT NULL DEFAULT 'raw'"
+            )
         # Index on state — used by forgetting pass to find fading rows fast.
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_state ON memories(state)")
         self._conn.commit()
@@ -774,6 +940,408 @@ class MemoryStore:
         if row is None or row["cluster_id"] is None:
             return None
         return int(row["cluster_id"]), row["cluster_model_id"]
+
+    def log_calibration_sample(
+        self,
+        query: str,
+        candidate_ids: list[str],
+        reranker_scores: list[float],
+        reranker_model_id: str,
+    ) -> None:
+        """Log one recall turn's (query, candidate ids, reranker scores) row
+        to `calibration_log` (F2a #250 inc4).
+
+        `query` must be the literal raw `user_input` string the caller
+        embedded/reranked this turn — byte-identical, never a synthesized
+        or reconstructed query (spec Section 4 / acceptance #5). `candidate_
+        ids` and `reranker_scores` are the ALREADY-COMPUTED per-turn rerank
+        output (same order, 1:1) — this method does no scoring of its own.
+        `reranker_model_id` is stamped per row so a later floor-derivation
+        pass can filter to one reranker's score scale.
+
+        F2b (#276 §5): `reranker_scores` must be the caller's already-
+        NORMALIZED per-query anchor-corrected value (`brain.memory.
+        reranker.normalize_against_anchors`'s output), not the raw
+        cross-encoder score — this method stamps every row it writes with
+        `score_scale = CALIBRATION_SCORE_SCALE` ('normalized') accordingly.
+        This method does no normalization itself; it trusts the caller the
+        same way it already trusts `candidate_ids`/`reranker_scores` to be
+        the already-computed per-turn output.
+
+        ONE bounded INSERT — no embedding, no model call, off the hot path
+        in every sense except this single cheap write (I6). Fail-soft is
+        the CALLER's job (`semantic_recall.run_semantic_recall` wraps this
+        call in its own try/except so a logging failure here can never
+        break recall) — this method itself does not swallow errors, so a
+        caller that forgets to guard it fails loudly instead of silently
+        losing calibration data.
+        """
+        self._conn.execute(
+            "INSERT INTO calibration_log "
+            "(query, candidate_ids, reranker_scores, reranker_model_id, score_scale) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                query,
+                json.dumps(list(candidate_ids)),
+                json.dumps([float(s) for s in reranker_scores]),
+                reranker_model_id,
+                CALIBRATION_SCORE_SCALE,
+            ),
+        )
+        self._conn.commit()
+
+    def prune_calibration_log(
+        self, *, window_days: float | None = None, now: datetime | None = None
+    ) -> int:
+        """Delete `calibration_log` rows whose `day_bucket` falls outside the
+        rolling retention window (F2a #250 inc5, spec Section 5 / acceptance
+        5b), keeping the table bounded instead of growing forever.
+
+        `window_days` defaults to the live `calibration.retention_window_days`
+        tunable (see `CALIBRATION_LOG_RETENTION_WINDOW_DAYS` above) when not
+        passed explicitly — read at call time via `tunables.get_tunable` so an
+        operator override applies with no restart, mirroring
+        `brain/memory/reranker.py`'s `LATENCY_BUDGET_SECONDS` pattern. The
+        window itself is PROVISIONAL (see the tunable's own comment) — its
+        full derivation is finalized in F2a inc7 once the calibration sample
+        size exists.
+
+        `day_bucket` is a `YYYY-MM-DD` string (see the CREATE TABLE default
+        above), so a lexicographic string comparison against the cutoff date
+        is a correct date comparison with no parsing needed.
+
+        Called from the daily calibration tick (`_run_calibration_tick` in
+        `brain/bridge/supervisor.py`), off the hot path (I6) — never from a
+        per-turn recall path. Returns the number of rows deleted (0 if none
+        were due).
+        """
+        if window_days is None:
+            window_days = tunables.get_tunable(
+                "calibration.retention_window_days", CALIBRATION_LOG_RETENTION_WINDOW_DAYS
+            )
+        ref = now if now is not None else datetime.now(UTC)
+        cutoff_bucket = (ref - timedelta(days=window_days)).strftime("%Y-%m-%d")
+        cur = self._conn.execute(
+            "DELETE FROM calibration_log WHERE day_bucket < ?", (cutoff_bucket,)
+        )
+        self._conn.commit()
+        return cur.rowcount
+
+    def sample_unlabeled_calibration_rows(self, limit: int) -> list[dict[str, Any]]:
+        """Return up to `limit` `calibration_log` rows with no
+        `local_judge_label` yet (F2a #250 inc6, spec Section 6/7) — the daily
+        judge pass's SAMPLE, not every logged row (the spec's explicit
+        "sampling IS the design"). `limit` bounds the local judge's daily
+        compute on the no-AVX2 potato baseline — see
+        `relevance_judge.CALIBRATION_SAMPLE_ROWS` for that value's
+        derivation.
+
+        Randomized via SQL `RANDOM()` rather than oldest/newest-N, so an
+        unlabeled backlog doesn't systematically bias the sample toward one
+        time-of-day's query mix. `candidate_ids` / `reranker_scores` are
+        decoded from their stored JSON here so callers work with plain
+        Python lists, not raw JSON strings — mirrors how `get()` decodes
+        `metadata_json` before returning a `Memory`.
+
+        Read-only: does not bump `recall_count` (reads `calibration_log`,
+        not `memories`) and does not label anything itself — labeling +
+        writeback is the caller's job (`relevance_judge.
+        label_calibration_sample` + `write_calibration_labels` below).
+        """
+        rows = self._conn.execute(
+            "SELECT id, query, candidate_ids, reranker_scores, reranker_model_id "
+            "FROM calibration_log WHERE local_judge_label IS NULL "
+            "ORDER BY RANDOM() LIMIT ?",
+            (int(limit),),
+        ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "query": row["query"],
+                "candidate_ids": json.loads(row["candidate_ids"]),
+                "reranker_scores": json.loads(row["reranker_scores"]),
+                "reranker_model_id": row["reranker_model_id"],
+            }
+            for row in rows
+        ]
+
+    def write_calibration_labels(
+        self, row_id: int, local_judge_label: list[str], haiku_label: list[str | None]
+    ) -> None:
+        """Write back the local judge's + Haiku tie-break's per-candidate
+        labels for one `calibration_log` row (F2a #250 inc6, spec Section 6).
+
+        Both lists are POSITIONALLY aligned with that row's `candidate_ids`
+        (same convention `candidate_ids`/`reranker_scores` already use),
+        stored as JSON in their respective TEXT columns. `haiku_label`
+        entries are `None` except at the ambiguous-band positions the local
+        judge routed to Haiku (non-ambiguous positions never call Haiku, per
+        acceptance #7) — a `None` means "no override; the local judge's own
+        provisional label at that position stands."
+
+        Once `local_judge_label` is non-NULL the row no longer matches
+        `sample_unlabeled_calibration_rows`'s `WHERE` clause, so a row is
+        never re-sampled or re-labeled on a later tick.
+        """
+        self._conn.execute(
+            "UPDATE calibration_log SET local_judge_label = ?, haiku_label = ? WHERE id = ?",
+            (json.dumps(local_judge_label), json.dumps(haiku_label), row_id),
+        )
+        self._conn.commit()
+
+    def labeled_calibration_pairs(self, reranker_model_id: str) -> list[tuple[float, str]]:
+        """`(reranker_score, effective_label)` pairs for the MOST RECENTLY
+        COMPLETED DAY's LABELED `calibration_log` rows matching
+        `reranker_model_id` (F2a #250 inc7, spec Section 7; pre-flip
+        revision Change 1, "nimble floor") — the floor-derivation fit's
+        ONLY caller/input (`floor_calibration.derive_and_persist_floor`).
+
+        Pre-flip revision Change 1 DAY-SCOPES this read: before Change 1,
+        this method drew from EVERY currently-retained labeled row for this
+        model_id (the full multi-day retention window, pooled). That pooled
+        read let one severely-stale day keep outvoting a genuine, fast
+        corpus shift for as long as the retention window stayed wide — the
+        confirmed root cause of a permanent floor lock (spec's T7 Part A).
+        Change 1's fix: scope to the MOST RECENTLY COMPLETED DAY only —
+        this method's own `day_bucket` boundary (Change 1's Open
+        Reconfirmation "the single-day fit window's exact bound"), resolved
+        here as: the MAX `day_bucket` among this model_id's own USABLE
+        labeled rows (same WHERE clause as the pair read itself, below) —
+        reusing the EXISTING `day_bucket` column (the same one `prune_
+        calibration_log`'s retention window already keys on) rather than
+        introducing a second, rolling-24h time-anchoring scheme. This
+        naturally tracks whichever day a caller's own seeded/logged data
+        actually lands on, with no dependency on wall-clock `now` at call
+        time — a day is "the most recently completed one" once no later
+        day's rows have been judge-labeled yet for this model_id.
+
+        Each row's `candidate_ids` / `reranker_scores` / `local_judge_label`
+        / `haiku_label` are all POSITIONALLY aligned (the convention every
+        calibration_log writer/reader in this module already follows); this
+        method zips them per-row and, per candidate position, takes the
+        EFFECTIVE label as `haiku_label[i]` when non-null (the Haiku
+        tie-break OVERRIDES the local judge at ambiguous-band positions),
+        else `local_judge_label[i]` (spec Section 6/7's stated precedence).
+        Positions labeled `"unknown"` (candidate no longer exists) or
+        `"error"` (judge failure on that candidate) are SKIPPED — neither
+        is a usable relevant/irrelevant ground-truth label for a threshold
+        fit.
+
+        F2b (#276 §5): additionally filters to `score_scale =
+        CALIBRATION_SCORE_SCALE` ('normalized') — this is the floor-fit's
+        ONLY sampler (see `floor_calibration.py`), so this is the one place
+        the raw/normalized scale split actually matters. A pre-F2b row
+        logged on the raw scale is excluded outright, never mixed into a
+        fit trained against normalized-scale scores (mixing scales would
+        silently corrupt the derived floor — the two are not comparable, a
+        constant per-query offset separates them). The MAX-`day_bucket`
+        lookup below is scoped by this same score_scale filter, so a
+        raw-scale row can never be picked as "the most recent day" either.
+
+        Read-only: does not bump `recall_count` and does not label or
+        write anything (mirrors `sample_unlabeled_calibration_rows`'s own
+        read-only posture).
+        """
+        max_day_row = self._conn.execute(
+            "SELECT MAX(day_bucket) AS max_day FROM calibration_log "
+            "WHERE reranker_model_id = ? AND local_judge_label IS NOT NULL AND score_scale = ?",
+            (reranker_model_id, CALIBRATION_SCORE_SCALE),
+        ).fetchone()
+        most_recent_day = max_day_row["max_day"] if max_day_row is not None else None
+        if most_recent_day is None:
+            return []
+        rows = self._conn.execute(
+            "SELECT reranker_scores, local_judge_label, haiku_label FROM calibration_log "
+            "WHERE reranker_model_id = ? AND local_judge_label IS NOT NULL "
+            "AND score_scale = ? AND day_bucket = ?",
+            (reranker_model_id, CALIBRATION_SCORE_SCALE, most_recent_day),
+        ).fetchall()
+        pairs: list[tuple[float, str]] = []
+        for row in rows:
+            scores = json.loads(row["reranker_scores"])
+            local_labels = json.loads(row["local_judge_label"])
+            haiku_labels = (
+                json.loads(row["haiku_label"]) if row["haiku_label"] is not None else [None] * len(scores)
+            )
+            for score, local_label, haiku_label in zip(scores, local_labels, haiku_labels, strict=False):
+                effective = haiku_label if haiku_label is not None else local_label
+                if effective in ("relevant", "irrelevant"):
+                    pairs.append((float(score), effective))
+        return pairs
+
+    def get_persisted_reranker_floor(self, reranker_model_id: str) -> dict[str, Any] | None:
+        """Return ONLY the PERSISTED `reranker_floor_calibration` row for
+        `reranker_model_id`, or `None` if none exists — never the transient
+        bootstrap fallback `get_reranker_floor` serves on a miss (F2a
+        inc8). Read-only: does not write or bump anything.
+
+        Pre-flip revision Change 1: this is the persisted-only half
+        `get_reranker_floor` below was refactored to share with
+        `floor_calibration.derive_and_persist_floor`'s own data-starvation
+        backstop, which needs to tell "a real prior row exists to hold"
+        apart from "no row exists, and the caller would otherwise be
+        looking at the transient bootstrap" — `get_reranker_floor` itself
+        conflates the two (by design, for its OWN callers, which want
+        SOME floor, persisted or not); the backstop must not.
+        """
+        row = self._conn.execute(
+            "SELECT reranker_model_id, floor, raw_fit_floor, sample_pairs, is_cold_start, "
+            "updated_at, score_scale "
+            "FROM reranker_floor_calibration WHERE reranker_model_id = ?",
+            (reranker_model_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "reranker_model_id": row["reranker_model_id"],
+            "floor": float(row["floor"]),
+            "raw_fit_floor": float(row["raw_fit_floor"]),
+            "sample_pairs": int(row["sample_pairs"]),
+            "is_cold_start": bool(row["is_cold_start"]),
+            "updated_at": row["updated_at"],
+            "score_scale": row["score_scale"],
+        }
+
+    def get_reranker_floor(self, reranker_model_id: str) -> dict[str, Any] | None:
+        """Return the operative reranker floor for `reranker_model_id`
+        (F2a #250 inc7/inc8, spec Section 7).
+
+        Checks the PERSISTED `reranker_floor_calibration` row first (written
+        by the daily calibration tick, `floor_calibration.derive_and_
+        persist_floor`, via `get_persisted_reranker_floor` above) — if one
+        exists, it is returned and this method does no further work.
+
+        If no row exists yet (fresh install / early days / a brand-new
+        reranker model_id that has never been calibrated — including, as of
+        the pre-flip revision's Change 1, a deploy still inside the
+        data-starvation backstop's ramp, since that backstop's no-prior-row
+        edge case intentionally writes nothing), F2a inc8 (#250 §7 UPDATED,
+        Roy 2026-09-18's bootstrap-floor ruling) serves a derived,
+        process-wide-cached BOOTSTRAP floor instead of `None` —
+        `floor_calibration.get_bootstrap_floor`, computed once (jina-only,
+        torch-free) from the bundled `_FP16_GATE_PAIRS` and cached, never
+        persisted to this table. This decouples semantic recall's EXISTENCE
+        from the daily tick ever having fired: the old "no row -> None ->
+        every caller falls back to lexical" contract permanently coupled
+        recall to the tick (disable calibration, or recall running before
+        the tick's first idle moment, silently and permanently demoted to
+        lexical-only even with embeddings present).
+
+        A persisted row, once the tick writes one, is read FIRST on every
+        subsequent call and supersedes the bootstrap for good — the
+        bootstrap cache is never consulted again for that model_id, so a
+        stale bootstrap value can never shadow a real corpus-derived floor.
+
+        Only returns `None` now on the bootstrap's OWN fail-soft path (the
+        bootstrap computation itself raised — a reranker load/fit failure)
+        — the pre-ruling contract, preserved as the last resort so a broken
+        bootstrap still degrades this turn to lexical rather than crashing.
+
+        Read-only: does not write or bump anything.
+        """
+        persisted = self.get_persisted_reranker_floor(reranker_model_id)
+        if persisted is not None:
+            return persisted
+        from brain.memory.floor_calibration import get_bootstrap_floor
+
+        return get_bootstrap_floor(reranker_model_id)
+
+    def reranker_floor_is_stale(self, reranker_model_id: str) -> bool:
+        """True iff `reranker_model_id`'s PERSISTED `reranker_floor_
+        calibration` row is either ABSENT or still on the pre-F2b RAW score
+        scale (F2b #276 §6, inc3's deploy-time one-time-recalibration
+        trigger).
+
+        Reads the persisted row DIRECTLY (not through `get_reranker_floor`,
+        which serves a transient, never-persisted bootstrap floor on a miss
+        — that in-memory fallback is irrelevant here: this check exists
+        purely to decide whether the ON-DISK row needs one out-of-cycle
+        `floor_calibration.derive_and_persist_floor` pass, so an ABSENT row
+        must read as stale exactly like a present-but-'raw' one, not be
+        masked by the bootstrap's existence).
+
+        Called ONLY by the bridge-startup deploy-recalibration check
+        (`brain.bridge.supervisor._run_deploy_recalibration_check`) — never
+        by the per-recall floor gate itself, which always goes through
+        `get_reranker_floor` (persisted-or-bootstrap) unconditionally and
+        does not care about staleness on a per-turn basis.
+
+        A model_id that has never had ANY row written (fresh install, or a
+        newly-registered reranker model_id) reads as stale too — the
+        out-of-cycle pass then runs F2a's own cold-start path (now
+        normalized-scale per §5b), landing a scale-correct floor
+        immediately instead of waiting on the bootstrap's transient,
+        never-persisted default.
+
+        Read-only: does not write or bump anything.
+        """
+        row = self._conn.execute(
+            "SELECT score_scale FROM reranker_floor_calibration WHERE reranker_model_id = ?",
+            (reranker_model_id,),
+        ).fetchone()
+        if row is None:
+            return True
+        return row["score_scale"] != CALIBRATION_SCORE_SCALE
+
+    def write_reranker_floor(
+        self,
+        reranker_model_id: str,
+        *,
+        floor: float,
+        raw_fit_floor: float,
+        sample_pairs: int,
+        is_cold_start: bool,
+        score_scale: str = CALIBRATION_SCORE_SCALE,
+    ) -> None:
+        """Upsert this cycle's derived floor for `reranker_model_id` (F2a
+        #250 inc7, spec Section 7) — the ONLY write path into
+        `reranker_floor_calibration` (I1: a table in memories.db, never a
+        side file). `INSERT ... ON CONFLICT DO UPDATE` keyed on
+        `reranker_model_id` (its PRIMARY KEY): a model_id's row is replaced
+        wholesale each accepted cycle, never accumulated — this table
+        tracks the CURRENT floor per model_id, not a history of past ones.
+        Pre-flip revision Change 1 removed the EMA smoothing this docstring
+        used to cite here as the reason no history is kept — post-Change-1
+        there is no smoothing left to carry history forward AT ALL: `floor`
+        is simply THIS cycle's raw fit, and the prior value is either held
+        untouched (never reaching this method — see below) or fully
+        replaced, never blended.
+
+        Called only when a cycle's derivation is ACCEPTED (the most
+        recently completed day's raw fit, per Change 1 — no more cold-start
+        branch) — a held/rejected cycle (`FloorDerivationOutcome.accepted
+        is False`, Change 1's data-starvation backstop) must NOT call this,
+        leaving the previously persisted row (or its absence) untouched.
+
+        `score_scale` (F2b #276 §6): defaults to the CURRENT scale
+        (`CALIBRATION_SCORE_SCALE` = 'normalized') — post-§5b, the only
+        remaining caller (`floor_calibration.derive_and_persist_floor`'s
+        real-fit branch; Change 1 removed its cold-start branch, which used
+        to be this method's other caller) always scores/fits on the
+        anchor-normalized scale, so it never needs to override this. The
+        parameter exists (rather than a bare hardcoded value in the SQL) so
+        a test can exercise a legacy 'raw' row without reaching around this
+        method's public contract.
+        """
+        self._conn.execute(
+            "INSERT INTO reranker_floor_calibration "
+            "(reranker_model_id, floor, raw_fit_floor, sample_pairs, is_cold_start, "
+            "updated_at, score_scale) "
+            "VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?) "
+            "ON CONFLICT(reranker_model_id) DO UPDATE SET "
+            "floor = excluded.floor, raw_fit_floor = excluded.raw_fit_floor, "
+            "sample_pairs = excluded.sample_pairs, is_cold_start = excluded.is_cold_start, "
+            "updated_at = excluded.updated_at, score_scale = excluded.score_scale",
+            (
+                reranker_model_id,
+                float(floor),
+                float(raw_fit_floor),
+                int(sample_pairs),
+                int(is_cold_start),
+                str(score_scale),
+            ),
+        )
+        self._conn.commit()
 
     def get(self, memory_id: str, *, bump: bool | float = True) -> Memory | None:
         """Return the Memory with the given id, or None. Bumps

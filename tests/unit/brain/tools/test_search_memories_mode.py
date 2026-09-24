@@ -21,11 +21,16 @@ from brain.bridge import model_tier
 from brain.memory.embeddings import EmbeddingProvider
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.reranker import FakeRerankerProvider
-from brain.memory.semantic_recall import RERANK_FLOOR
 from brain.memory.store import Memory, MemoryStore
 from brain.tools.dispatch import dispatch
 
 _SCRIPTED_MODEL_ID = "scripted-test"
+# F2a inc8 cutover: no more module-level `RERANK_FLOOR` — `_semantic_top_k`
+# reads the floor live from `store.get_reranker_floor`. This suite seeds it
+# directly via `_seed_floor`; the numeric value has no production
+# significance (an arbitrary reference point for test data).
+_TEST_FLOOR = -9.25
+_FAKE_RERANKER_MODEL_ID = "fake-reranker"
 # Row vectors now flow through EmbeddingMatrix. As of #259 inc7 red-team F1,
 # EmbeddingMatrix no longer enforces any fixed expected-dim at decode time
 # (each row decodes to its own stored byte-length) — a 2-dim test vector
@@ -127,13 +132,23 @@ def _patch_reranker(monkeypatch: pytest.MonkeyPatch, scores: dict[str, float]) -
     """#231: `_semantic_top_k` floor-gates on the RERANKER score, not cosine
     — conftest.py's autouse fixture already forces `build_reranker_provider`
     to a `FakeRerankerProvider()` with no scripted scores (every unscripted
-    document defaults far below `RERANK_FLOOR`), so a test that wants a
-    CONCLUSIVE (floor-clearing) semantic result must script the specific
+    document defaults far below the calibrated floor), so a test that wants
+    a CONCLUSIVE (floor-clearing) semantic result must script the specific
     memory contents it expects to surface, same pattern as `_patch_provider`
     above for the embedding side."""
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
-        lambda: FakeRerankerProvider(scores=scores),
+        lambda **kwargs: FakeRerankerProvider(scores=scores),
+    )
+
+
+def _seed_floor(
+    store: MemoryStore, floor: float = _TEST_FLOOR, *, model_id: str = _FAKE_RERANKER_MODEL_ID
+) -> None:
+    """F2a inc8: write a calibrated floor row directly so `_semantic_top_k`
+    has something to read via `store.get_reranker_floor`."""
+    store.write_reranker_floor(
+        model_id, floor=floor, raw_fit_floor=floor, sample_pairs=10, is_cold_start=False
     )
 
 
@@ -163,7 +178,8 @@ def test_default_mode_is_semantic(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
 
     _seed_vectors(ctx["store"], vectors, contents_by_id={m_target.id: target})
     _patch_provider(monkeypatch, vectors, dim=dim)
-    _patch_reranker(monkeypatch, scores={target: RERANK_FLOOR + 5.0})
+    _seed_floor(ctx["store"])
+    _patch_reranker(monkeypatch, scores={target: _TEST_FLOOR + 5.0})
 
     res = dispatch("search_memories", {"query": query}, **ctx)
 
@@ -240,13 +256,14 @@ def test_mode_semantic_paraphrase_beats_keyword_overlap_decoy(
 
     _seed_vectors(ctx["store"], vectors, contents_by_id={m_target.id: target, m_decoy.id: decoy})
     _patch_provider(monkeypatch, vectors, dim=dim)
-    # Both clear RERANK_FLOOR (so the assertion actually exercises the
-    # reranker's ORDERING, not just floor-based exclusion of the decoy) —
-    # target scored clearly higher, matching the cosine-era hand-chosen
+    _seed_floor(ctx["store"])
+    # Both clear the calibrated floor (so the assertion actually exercises
+    # the reranker's ORDERING, not just floor-based exclusion of the decoy)
+    # — target scored clearly higher, matching the cosine-era hand-chosen
     # relationship (0.95 vs 0.10) this test's docstring describes.
     _patch_reranker(
         monkeypatch,
-        scores={target: RERANK_FLOOR + 5.0, decoy: RERANK_FLOOR + 0.5},
+        scores={target: _TEST_FLOOR + 5.0, decoy: _TEST_FLOOR + 0.5},
     )
 
     semantic_res = dispatch("search_memories", {"query": query, "mode": "semantic"}, **ctx)

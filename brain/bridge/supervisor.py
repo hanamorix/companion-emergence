@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from brain.engines.heartbeat import HeartbeatResult
+    from brain.memory.relevance_judge import RelevanceJudgeProvider
 
 from brain import prompt_strings
 from brain.attunement.backfill import (
@@ -156,6 +157,7 @@ def run_folded(
     notes_enabled: bool = True,
     kindled_link_enabled: bool = True,
     compaction_interval_s: float | None = 86400.0,
+    calibration_interval_s: float | None = 86400.0,
     interest_sweep_interval_s: float | None = interest_sweep.SWEEP_INTERVAL_HOURS * 3600.0,
     clustering_interval_s: float | None = 6 * 3600.0,
     vocab_repair_interval_s: float | None = 6 * 3600.0,
@@ -197,6 +199,17 @@ def run_folded(
     chips a small per-row batch every base tick — clustering instead
     recomputes over the WHOLE cached vector set each firing, so it doesn't
     need or want that tight a cadence).
+
+    ``calibration_interval_s=None`` disables the autonomous daily calibration
+    cadence (F2a #250, spec Section 5) — a 4th sibling to
+    ``compaction_interval_s``, mirroring its idle-gate + restart-safety shape
+    (own persisted ``calibration_cadence.json``, startup catch-up + periodic
+    daily fire). Default 86400s (daily), matching compaction — same
+    rationale: rides existing, already-idle-gated infra. This increment
+    (inc5) scopes the tick to retention pruning of ``calibration_log`` only
+    (acceptance 5b); the judge-labeling pass (Section 6) and floor derivation
+    (Section 7) are later increments — see ``_run_calibration_tick``'s
+    docstring for the full scope note.
     """
     logger.info(
         "supervisor folded persona=%s tick=%.2fs heartbeat=%s soul_review=%s finalize=%s",
@@ -258,6 +271,15 @@ def run_folded(
         if compaction_interval_s is not None
         else None
     )
+    # Daily calibration cadence (F2a #250 inc5, spec Section 5) — own
+    # persisted `calibration_cadence.json`, independent of compaction's file
+    # even though the default interval matches (mirrors compaction's own
+    # independent-file rationale vs voice reflection above).
+    calibration_cadence_state = (
+        persisted_cadence.load_cadence(persona_dir, "calibration_cadence.json")
+        if calibration_interval_s is not None
+        else None
+    )
     # Memory-vector clustering (Stage 5, #157) — own persisted wall-clock
     # cadence, decoupled from every other cadence (see clustering_interval_s
     # docstring above).
@@ -306,6 +328,39 @@ def run_folded(
             )
     except Exception as exc:  # noqa: BLE001
         logger.warning("startup catch-up compaction failed: %s", exc)
+
+    # One-shot startup: catch-up calibration tick (F2a #250 inc5, spec Section
+    # 5). Mirrors compaction's startup-catch-up-or-idle posture immediately
+    # above (owner ruling 2026-08-13, carried into this sibling cadence): a
+    # retention prune that was due while the app was off runs promptly now,
+    # rather than waiting up to a full day for the periodic cadence below.
+    # Startup is idle by nature (no in-flight requests yet), so it fires
+    # cleanly. Fault-isolated (recipe item 3). Skipped when the calibration
+    # cadence is disabled (tests/dev), mirroring the periodic gate.
+    try:
+        if calibration_interval_s is not None:
+            _run_calibration_tick(persona_dir, is_session_busy=is_session_busy)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("startup catch-up calibration tick failed: %s", exc)
+
+    # One-shot startup: F2b deploy-time one-time floor recalibration (spec
+    # §6, #276 inc3) — DISTINCT from the daily-cadence catch-up immediately
+    # above. That catch-up only fires the derivation when the persisted
+    # `calibration_cadence.json` says a daily firing is DUE; this check
+    # fires on the raw->normalized SCALE TRANSITION itself, regardless of
+    # cadence timing, so an existing deployment never rides a stale
+    # raw-scale floor under F2b's normalized gate for a full cadence
+    # window. Gated on the same `calibration_interval_s is not None` flag
+    # as the calibration subsystem generally (tests/dev disable knob) —
+    # when calibration itself is off, there is no floor-gated recall path
+    # for this check to protect. Idempotent by construction (see
+    # `_run_deploy_recalibration_check`'s docstring) and fault-isolated
+    # here, mirroring every other one-shot startup step in this function.
+    try:
+        if calibration_interval_s is not None:
+            _run_deploy_recalibration_check(persona_dir)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("startup deploy recalibration check failed: %s", exc)
 
     # One-shot startup: re-tag emotion-less memories so existing personas
     # benefit from the A2 forward-only emotion seeding.  Independent of the
@@ -897,6 +952,30 @@ def run_folded(
                 )
                 persisted_cadence.save_cadence(
                     persona_dir, "compaction_cadence.json", compaction_cadence_state
+                )
+
+        # Daily calibration cadence (F2a #250 inc5, spec Section 5) — 4th
+        # sibling cadence to compaction/clustering/vocab-repair. PERSISTED via
+        # its own `calibration_cadence.json` (mirrors compaction: independent
+        # file even though the default interval matches, so its advance is
+        # always unconditional and independent). INC5 scope: retention
+        # pruning of `calibration_log` only (acceptance 5b) — see
+        # `_run_calibration_tick`'s docstring for the full scope note; the
+        # judge-labeling pass (Section 6) and floor derivation (Section 7)
+        # land in later increments.
+        if calibration_cadence_state is not None and persisted_cadence.is_due(
+            calibration_cadence_state, now=datetime.now(UTC)
+        ):
+            try:
+                _run_calibration_tick(persona_dir, is_session_busy=is_session_busy)
+            except Exception:
+                logger.exception("supervisor calibration tick raised")
+            finally:
+                calibration_cadence_state = persisted_cadence.advance(
+                    now=datetime.now(UTC), interval_s=calibration_interval_s
+                )
+                persisted_cadence.save_cadence(
+                    persona_dir, "calibration_cadence.json", calibration_cadence_state
                 )
 
         # Wait for the next tick or for stop_event, whichever comes first.
@@ -1996,6 +2075,296 @@ def _run_compaction_tick(
                 )
             except Exception:
                 logger.exception("weekly rollover: session=%s raised", session_id)
+
+
+def _run_calibration_tick(
+    persona_dir: Path,
+    *,
+    is_session_busy: Callable[[str], bool] | None = None,
+    provider: LLMProvider | None = None,
+    judge: RelevanceJudgeProvider | None = None,
+) -> None:
+    """F2a daily calibration tick (#250, spec Section 5) — 4th sibling cadence
+    to compaction/clustering/vocab-repair, mirroring ``_run_compaction_tick``'s
+    idle-gate + restart-safety shape: own persisted ``calibration_cadence.json``,
+    startup catch-up + periodic daily fire in ``run_folded``.
+
+    **INC5 SCOPE:** retention pruning — deletes ``calibration_log`` rows
+    outside the rolling ``day_bucket`` window via ``MemoryStore.
+    prune_calibration_log`` (spec Section 5's "MUST before ship" pruning
+    responsibility, acceptance 5b).
+
+    **INC6 SCOPE:** the local-judge first pass + Haiku tie-break
+    (``bge-reranker-v2-m3``, spec Section 6) — labels a SAMPLE of the rows
+    pruning just left behind, via ``relevance_judge.label_calibration_
+    sample``.
+
+    **INC7 SCOPE:** floor derivation + persistence (spec Section 7), via
+    ``floor_calibration.derive_and_persist_floor`` — runs against the
+    CURRENT production reranker's model_id
+    (``reranker.build_reranker_provider().model_id()``), reading whatever
+    labeled ``calibration_log`` pairs the judge pass above has accumulated
+    for the MOST RECENTLY COMPLETED DAY for that model_id (pre-flip
+    revision Change 1 re-points this from a pooled multi-day read to a
+    day-scoped one — see ``floor_calibration``'s module docstring and
+    ``MemoryStore.labeled_calibration_pairs``; the EMA smoothing and
+    bootstrap-CI stability gate this docstring used to describe here are
+    REMOVED by that same revision, not merely superseded). F2a inc8 (#250
+    §7/§8, this cutover) wired the derived floor into
+    ``select_standouts`` (``brain/memory/semantic_recall.py``) — read via
+    ``store.get_reranker_floor`` live rather than the deleted
+    ``semantic_recall.RERANK_FLOOR`` constant. This tick's own job stays
+    unchanged: derive and WRITE the floor to ``memories.db`` (I1).
+
+    Pre-flip revision Change 2 removed the cross-increment step this
+    docstring used to describe here: an ACCEPTED floor write no longer
+    invalidates a cached fp16-vs-fp32 precision decision, because that
+    self-check (and its cache) no longer exist — fp16 is now a pinned
+    config default (``brain/memory/reranker.py``), not a runtime probe the
+    floor could ever need to re-trigger. Wrapped in its OWN try/except
+    (mirrors the judge-labeling step immediately above it) — a
+    floor-derivation failure must not crash the tick or undo the
+    prune/labeling steps that already completed.
+
+    ``provider``: the Haiku tie-break's generation provider. ``None`` (the
+    ``run_folded`` call sites' default) builds one via ``build_tier_provider
+    (persona_dir, TIER_BACKGROUND_CLASSIFIER)`` inside this function —
+    mirrors ``consolidation.run_consolidation``'s per-call construction
+    (never the ambient chat provider) so Haiku classification always runs
+    on the cheap tier regardless of what model the persona's own chat uses.
+
+    ``judge``: test-injection point for ``relevance_judge.
+    RelevanceJudgeProvider`` — production leaves this ``None`` so
+    ``label_calibration_sample`` lazily builds the real torch-backed judge
+    only when this tick actually has unlabeled rows to label (never at
+    import time, never on the hot path).
+
+    **Idle-gate:** unlike compaction (which skips only the BUSY session's own
+    cascade/rollover, letting idle sessions' work proceed), this tick's work
+    is corpus-global, not scoped to any one session — it reads/writes across
+    the whole ``calibration_log`` table rather than per-session data. So the
+    gate here is a single all-or-nothing check: if ANY active session
+    currently has an in-flight request, the WHOLE tick defers to the next
+    firing, rather than partially running while a live turn may still be
+    calling ``store.log_calibration_sample`` (#250 inc4) against the same
+    table. At startup ``is_session_busy`` is None / no session has an
+    in-flight request yet, so the startup catch-up fires cleanly (mirrors
+    compaction).
+
+    Fault-isolated by the caller (``run_folded``'s ``try/except
+    logger.exception`` around both the startup catch-up and periodic-fire
+    call sites, mirroring ``_run_clustering_tick``) — this function itself
+    does not swallow the PRUNE step's errors, so those are still visible in
+    that wrapping try/except. The JUDGE-LABELING step is different: spec
+    Section 6 requires a judge/torch/Haiku failure to never crash the tick
+    or the bridge, so that step is wrapped in its OWN try/except HERE (not
+    left to the caller) — a labeling failure must not undo or block the
+    prune step that already completed successfully above it.
+    """
+    if is_session_busy is not None:
+        from brain.ingest.buffer import list_active_sessions
+
+        if any(is_session_busy(sid) for sid in list_active_sessions(persona_dir)):
+            logger.info("calibration tick: deferred, a session is busy")
+            return
+
+    with ExitStack() as stack:
+        # integrity_check=False mirrors the sweep/maker/notes/vocab-repair/
+        # clustering ticks in this file — a full PRAGMA integrity_check on
+        # every construction is unwarranted for a background cadence tick.
+        store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+        stack.callback(store.close)
+
+        pruned = store.prune_calibration_log()
+        logger.info("calibration tick: pruned=%d calibration_log rows outside retention window", pruned)
+
+        try:
+            from brain.memory.relevance_judge import label_calibration_sample
+
+            tiebreak_provider = (
+                provider
+                if provider is not None
+                else build_tier_provider(persona_dir, TIER_BACKGROUND_CLASSIFIER)
+            )
+            labeled = label_calibration_sample(store, provider=tiebreak_provider, judge=judge)
+            logger.info("calibration tick: labeled=%d calibration_log rows this pass", labeled)
+        except Exception:  # noqa: BLE001 — judge/torch/Haiku failure must not crash the tick
+            logger.exception("calibration tick: judge-labeling pass raised; continuing")
+
+        try:
+            from brain.memory import floor_calibration
+            from brain.memory.reranker import build_reranker_provider
+
+            current_reranker_model_id = build_reranker_provider(store=store).model_id()
+            outcome = floor_calibration.derive_and_persist_floor(store, current_reranker_model_id)
+            logger.info(
+                "calibration tick: floor derivation for %s -> accepted=%s floor=%s "
+                "cold_start=%s held_for_data_starvation=%s sample_pairs=%d",
+                current_reranker_model_id,
+                outcome.accepted,
+                outcome.floor,
+                outcome.is_cold_start,
+                outcome.held_for_data_starvation,
+                outcome.sample_pairs,
+            )
+        except Exception:  # noqa: BLE001 — floor-derivation failure must not crash the tick
+            logger.exception("calibration tick: floor-derivation pass raised; continuing")
+
+
+# Pre-flip revision Change 1's §6 retry gate (see `_run_deploy_
+# recalibration_check` below): a persisted-cadence file (mirrors every
+# other `*_cadence.json` in this module), gating ONLY the no-persisted-row
+# ramp case — a genuine raw-scale-row migration always fires immediately,
+# ungated. 86400.0s (one day) mirrors the grain every other cadence in this
+# file already uses, and reuses Change 1's own day-boundary rather than
+# inventing a second one (spec's F2b §6 interaction note: "gate §6's retry
+# on the same day-boundary the backstop uses").
+_DEPLOY_RECAL_RETRY_CADENCE_FILE = "deploy_recalibration_retry_cadence.json"
+_DEPLOY_RECAL_RETRY_INTERVAL_SECONDS = 86400.0
+
+
+def _run_deploy_recalibration_check(persona_dir: Path) -> None:
+    """F2b deploy-time ONE-TIME floor recalibration (spec §6, #276 inc3).
+
+    F2b (§5) re-points F2a's daily calibration fit to compare NORMALIZED
+    (anchor-corrected) scores; §5b additionally normalizes F2a's cold-start
+    and bootstrap floor sources. But a floor row PERSISTED before F2b
+    started producing normalized scores is still on the RAW scale — left
+    alone, that stale row stays in effect until the next scheduled daily
+    calibration tick happens to re-derive it, which can be a full day (or
+    longer, on a corpus still in cold-start) after the deploy that flipped
+    the score scale. This is a DIFFERENT trigger than that daily cadence
+    (`_run_calibration_tick`, gated on `calibration_cadence.json`'s
+    wall-clock `is_due`): this check fires on the SCALE TRANSITION itself,
+    at startup, regardless of when the last daily tick ran or is next due.
+
+    Mechanism: `MemoryStore.reranker_floor_is_stale` reads the PERSISTED
+    `reranker_floor_calibration` row directly — stale means ABSENT or still
+    stamped `score_scale != 'normalized'`. When stale, this runs F2a's
+    already-built `floor_calibration.derive_and_persist_floor` ONCE,
+    out-of-cycle (the SAME function the daily tick calls — no new
+    calibration algorithm).
+
+    PRE-FLIP REVISION CHANGE 1's §6 INTERACTION (build-time gate, spec's
+    "F2b §6 interaction" note): Change 1 removes `derive_and_persist_
+    floor`'s old cold-start branch, which used to unconditionally persist
+    SOME row (bundled-pair fit) on every call — that write was what made
+    `reranker_floor_is_stale` false again after the FIRST out-of-cycle
+    pass, regardless of how little real data existed yet. Change 1's
+    replacement backstop can instead write NOTHING (the no-prior-row edge
+    case — a fresh deploy still short of `FLOOR_FIT_MIN_LABELED_PAIRS` on
+    its most recent day), which leaves the row ABSENT — and an absent row
+    reads as stale FOREVER until real data clears the threshold. Without a
+    gate, THIS function would re-attempt `derive_and_persist_floor` (itself
+    now a cheap no-op in that state) on every single bridge restart during
+    the ramp, which is wasteful and noisy.
+
+    The fix distinguishes the two genuinely different reasons a row can
+    read stale, per the two properties this gate must satisfy simultaneously:
+      - a row EXISTS but is still raw-scale (`get_persisted_reranker_floor`
+        returns a row with `score_scale != 'normalized'`) — this IS the §6
+        migration case and fires UNCONDITIONALLY on this restart, exactly
+        as originally spec'd; it is never gated.
+      - NO row exists at all (`get_persisted_reranker_floor` returns
+        `None`) — this is either a true pre-Change-1 fresh install (no
+        change in behavior: the very first attempt still fires
+        immediately, so a genuinely fresh corpus that already has enough
+        data gets its floor right away) OR Change 1's own ramp state
+        (not enough data yet — this attempt will just no-op again). Only
+        THIS no-row case is rate-limited, via `persisted_cadence` (the SAME
+        module every other cadence in this file already uses): at most one
+        attempt per `_DEPLOY_RECAL_RETRY_INTERVAL_SECONDS` (one day,
+        mirroring the backstop's own day-boundary rather than inventing a
+        second time-windowing scheme), tracked in its own small JSON side
+        file — NOT in `memories.db` (no schema/table addition; this is
+        cadence bookkeeping, not calibration data, exactly what `persisted_
+        cadence.py` exists for). Once real data clears the threshold on
+        some day, `derive_and_persist_floor` writes a real row and
+        `reranker_floor_is_stale` goes False on the very next check
+        regardless of this gate's state — self-healing, per the spec.
+
+    Idempotent BY CONSTRUCTION once a row exists, not by a separate one-shot
+    flag: an accepted `derive_and_persist_floor` call always stamps the
+    fresh row `score_scale = CALIBRATION_SCORE_SCALE` (`MemoryStore.
+    write_reranker_floor`'s default), so the very next call to this
+    function — another startup, or interleaved with a normal daily tick —
+    reads `reranker_floor_is_stale() == False` and returns immediately
+    without re-deriving. This survives a real process restart (the marker
+    lives in `memories.db`, not in-process state), unlike a boot-time flag
+    — and the no-row gate above survives a real restart the same way (a
+    JSON file under `persona_dir`, not in-process state).
+
+    Placed at the bridge-startup seam in `run_folded`, immediately after
+    the existing F2a startup catch-up calibration tick — but unlike that
+    catch-up (which reuses `_run_calibration_tick`'s prune + judge-label +
+    cadence-scoped floor derivation), this is deliberately its OWN,
+    narrower function: no pruning, no judge-labeling, no cadence-due check
+    on the migration path — only the one scale-transition floor derivation,
+    so a deploy recovers a scale-correct floor even when the daily cadence
+    itself is disabled for a long window or has not yet come due.
+
+    Fault-isolated by the CALLER (`run_folded`'s `try/except
+    logger.warning`, mirroring every other one-shot startup step in this
+    function) — a failure constructing the store, the reranker provider, or
+    running the derivation must never crash bridge startup; the stale row
+    (or absence of one) is simply picked up again on the next startup.
+    """
+    with ExitStack() as stack:
+        # integrity_check=False mirrors every other background-tick store
+        # open in this file (compaction/calibration/clustering ticks) — a
+        # full PRAGMA integrity_check on a one-shot startup check is
+        # unwarranted.
+        store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+        stack.callback(store.close)
+
+        from brain.memory.reranker import build_reranker_provider
+
+        current_reranker_model_id = build_reranker_provider(store=store).model_id()
+
+        if not store.reranker_floor_is_stale(current_reranker_model_id):
+            logger.info(
+                "deploy recalibration check: %s already normalized-scale, skipping",
+                current_reranker_model_id,
+            )
+            return
+
+        # Change 1's §6 gate (see docstring above): only the no-row case is
+        # rate-limited — an existing raw-scale row always migrates now.
+        if store.get_persisted_reranker_floor(current_reranker_model_id) is None:
+            now = datetime.now(UTC)
+            retry_cadence = persisted_cadence.load_cadence(
+                persona_dir, _DEPLOY_RECAL_RETRY_CADENCE_FILE
+            )
+            if not persisted_cadence.is_due(retry_cadence, now=now):
+                logger.info(
+                    "deploy recalibration check: %s has no persisted floor yet (Change 1's "
+                    "data-starvation ramp, or a genuinely fresh install) and was already "
+                    "retried within the last %.0fs — skipping this restart to avoid "
+                    "re-spinning; the daily calibration tick stays the authoritative path "
+                    "once enough data accumulates",
+                    current_reranker_model_id,
+                    _DEPLOY_RECAL_RETRY_INTERVAL_SECONDS,
+                )
+                return
+            persisted_cadence.save_cadence(
+                persona_dir,
+                _DEPLOY_RECAL_RETRY_CADENCE_FILE,
+                persisted_cadence.advance(now=now, interval_s=_DEPLOY_RECAL_RETRY_INTERVAL_SECONDS),
+            )
+
+        from brain.memory import floor_calibration
+
+        outcome = floor_calibration.derive_and_persist_floor(store, current_reranker_model_id)
+        logger.info(
+            "deploy recalibration check: out-of-cycle floor derivation for %s -> "
+            "accepted=%s floor=%s cold_start=%s held_for_data_starvation=%s sample_pairs=%d",
+            current_reranker_model_id,
+            outcome.accepted,
+            outcome.floor,
+            outcome.is_cold_start,
+            outcome.held_for_data_starvation,
+            outcome.sample_pairs,
+        )
 
 
 def _run_finalize_tick(
