@@ -1711,6 +1711,121 @@ class MemoryStore:
                     pairs.append((float(raw_score), effective))
         return pairs
 
+    def judge_lora_training_triples(self, row_ids: list[int]) -> list[tuple[str, str, str]]:
+        """`(query, doc, label)` triples for F2c inc5b's LoRA/full-FT
+        weight-retrain tiers (`judge_lora.build_lora_retrain_fn` +
+        `judge_eval.split_train_test`) — the Haiku-ONLY extraction
+        `judge_eval.py`'s own module docstring flags as owed before those
+        tiers can be wired for real.
+
+        NARROWER than `judge_knob_refit_pairs` above: a position qualifies
+        here ONLY when `haiku_label[i]` is non-None — the SAME pinned
+        counting unit spec §2 pins for the weekly gate and
+        `count_new_haiku_decisions` counts ("the accumulated Haiku
+        decisions", individual Haiku-labeled (query, doc) pairs) — never a
+        position where only the local judge labeled. `judge_knob_refit_
+        pairs` intentionally includes those local-only positions too (more
+        training signal, no guard needed for a knob refit); reusing it
+        unchanged here would leak non-oracle-backed positions into the
+        LoRA/full-FT champion/challenger eval split, per `judge_eval.py`'s
+        own "Production NOTE for inc5/6" docstring.
+
+        `label` is `haiku_label[i]` itself, with no local-label precedence
+        to apply — unlike `labeled_calibration_pairs`/`judge_knob_refit_
+        pairs`'s "Haiku overrides local" logic (which only matters when a
+        position might NOT have a Haiku label), every position this method
+        emits already IS a Haiku position, so Haiku's label is simply the
+        effective label. `doc` is `candidate_docs[i]` — the RECALL-TIME
+        doc-text snapshot (`log_calibration_sample`'s `candidate_docs`
+        param, F2c inc1), never a re-fetch from `memories` at train time (a
+        candidate can be edited/forgotten between being logged and being
+        trained on — see that method's own docstring for why a re-fetch
+        would silently drift).
+
+        A position is emitted only when ALL of: `haiku_label[i]` is not
+        None; `haiku_label[i]` is `"relevant"`/`"irrelevant"` (defensive —
+        in production a `haiku_label` entry is never the `"unknown"`/
+        `"error"` sentinel, those only ever land in `local_judge_label`;
+        see `relevance_judge.label_calibration_sample`'s per-candidate
+        loop, which always pairs an `"unknown"`/`"error"` local label with
+        a `None` haiku_label at that same position); and `candidate_docs[i]`
+        is present and non-empty. That last check also SKIPS a LEGACY row:
+        `candidate_docs` was added in F2c inc1 with no migration-time
+        backfill (see the `CREATE TABLE calibration_log` comment above) and
+        `log_calibration_sample`'s `candidate_docs` parameter is optional,
+        so a row logged before inc1 — or by any caller that never passed
+        doc text — can have a non-None `haiku_label` list but a NULL
+        `candidate_docs` column entirely. No doc text means no triple,
+        however good the label is.
+
+        `row_ids` is the exact scoping contract every F2c weekly-tick
+        data-assembly method on this class shares (`judge_knob_refit_pairs`
+        above): the caller passes the SAME row_ids `count_new_haiku_
+        decisions` returned for a firing tick, so the triples a tier trains
+        on and the rows that tick is allowed to mark consumed are always
+        the identical set.
+
+        Returns `list[(query, doc, label)]`, ordered by row id then
+        candidate position — deterministic and stable across repeated
+        calls with the same `row_ids`, which matters because `judge_eval.
+        split_train_test` partitions PURELY by position and documents that
+        a caller wanting a reproducible split across re-fetches should sort
+        by a stable key first; ordering by row id here does exactly that
+        without asking the caller to re-sort. The tuple shape is the exact
+        one `judge_lora.LabeledTriple` names (`tuple[str, str, str]`) — this
+        method does not import that alias itself, since `store.py` sits
+        below `judge_lora.py` in the dependency graph and this return type
+        needs no torch-adjacent import to express — and slots straight into
+        `judge_eval.split_train_test`'s generic `Sequence[T]` for the
+        2/3-1/3 train/test split, and from there into `judge_lora.
+        build_lora_retrain_fn`'s `Sequence[LabeledTriple]` training input.
+
+        Defensively skips a malformed row — unparseable `haiku_label`/
+        `candidate_docs` JSON — fail-soft, never raising into the caller
+        (this method's own posture; `judge_knob_refit_pairs` above has no
+        such guard and would raise `json.JSONDecodeError` into its own
+        caller on malformed JSON, so this is not a mirror of it). A row
+        whose `haiku_label`/`candidate_docs` lists come back mismatched in
+        length is not treated as malformed: `zip(..., strict=False)` just
+        truncates to the shorter list, so the aligned prefix still emits
+        triples and the extra positions are silently dropped. Empty
+        `row_ids` or no usable positions returns `[]`.
+
+        Read-only: does not write or bump anything.
+        """
+        if not row_ids:
+            return []
+        placeholders = ",".join("?" for _ in row_ids)
+        rows = self._conn.execute(
+            "SELECT id, query, candidate_docs, haiku_label FROM calibration_log "
+            f"WHERE id IN ({placeholders}) ORDER BY id",
+            row_ids,
+        ).fetchall()
+        triples: list[tuple[str, str, str]] = []
+        for row in rows:
+            if row["haiku_label"] is None or row["candidate_docs"] is None:
+                continue
+            try:
+                haiku_labels = json.loads(row["haiku_label"])
+                docs = json.loads(row["candidate_docs"])
+                query = row["query"]
+                # `zip()` eagerly calls `iter()` on both arguments at
+                # construction time, so a well-formed-but-wrong-type decode
+                # (e.g. a bare JSON number/null instead of a list) raises
+                # `TypeError` right here, not lazily inside the loop below —
+                # this call must stay INSIDE the try block (not after it)
+                # so that failure is caught by the same fail-soft skip as a
+                # `json.JSONDecodeError`, never escaping to the caller.
+                for haiku_label, doc in zip(haiku_labels, docs, strict=False):
+                    if haiku_label not in ("relevant", "irrelevant"):
+                        continue
+                    if not doc:
+                        continue
+                    triples.append((query, doc, haiku_label))
+            except (TypeError, ValueError):
+                continue
+        return triples
+
     def get_judge_knob_calibration(self, judge_model_id: str) -> dict[str, Any] | None:
         """Return the PERSISTED `judge_knob_calibration` row for
         `judge_model_id`, or `None` if this persona's judge has never had a

@@ -35,18 +35,21 @@ carries — if a relevance-quality problem shows up downstream later, the
 champion/challenger accept/revert decision built here is one of the places
 to look, alongside the knob-refit's training data.
 
-Production NOTE for inc5/6 (recon finding, not built here): the unit this
-module's `split_train_test`/`run_champion_challenger` must be fed is
-STRICTLY the non-None `haiku_label` POSITIONS from `calibration_log` — the
-SAME counting unit spec §2 pins for the weekly gate ("the accumulated
-Haiku decisions" = individual Haiku-labeled (query, doc) pairs). This is
-NARROWER than `MemoryStore.judge_knob_refit_pairs`'s pairs, which also
-include positions where only the LOCAL judge labeled (Haiku never
-adjudicated) — that broader effective-label set is correct for the
-knob-refit (more training signal, no guard needed) but would leak
-non-oracle-backed positions into the eval split if reused here unchanged.
-inc5/6 owes a new `judge_knob_refit_pairs`-shaped-but-Haiku-only extraction
-(or an equivalent filter) before calling `split_train_test` for real.
+Production NOTE for inc5/6: the unit this module's `split_train_test`/
+`run_champion_challenger` must be fed is STRICTLY the non-None
+`haiku_label` POSITIONS from `calibration_log` — the SAME counting unit
+spec §2 pins for the weekly gate ("the accumulated Haiku decisions" =
+individual Haiku-labeled (query, doc) pairs). This is NARROWER than
+`MemoryStore.judge_knob_refit_pairs`'s pairs, which also include positions
+where only the LOCAL judge labeled (Haiku never adjudicated) — that
+broader effective-label set is correct for the knob-refit (more training
+signal, no guard needed) but would leak non-oracle-backed positions into
+the eval split if reused here unchanged. F2c inc5b-1 built exactly this
+extraction — `MemoryStore.judge_lora_training_triples(row_ids)` in
+`brain/memory/store.py`, `judge_knob_refit_pairs`-shaped but Haiku-only,
+returning `(query, doc, label)` triples straight off `candidate_docs` (no
+re-fetch) — for `judge_lora.build_lora_retrain_fn` to train on; inc5b-2
+still owes wiring `split_train_test`/`run_champion_challenger` to call it.
 """
 
 from __future__ import annotations

@@ -608,6 +608,223 @@ def test_judge_knob_refit_pairs_empty_row_ids_returns_empty(store: MemoryStore) 
 
 
 # ---------------------------------------------------------------------------
+# MemoryStore.judge_lora_training_triples — F2c inc5b-1's data-assembly
+# step (spec §4/§5, judge_eval.py's "Production NOTE for inc5/6"): the
+# Haiku-ONLY narrowing of judge_knob_refit_pairs, returning (query, doc,
+# label) triples off candidate_docs rather than (raw_score, label) pairs.
+# ---------------------------------------------------------------------------
+
+
+def test_lora_training_triples_only_haiku_positions_are_emitted(store: MemoryStore) -> None:
+    """A row with haiku_label=[None, "relevant", None] yields exactly ONE
+    triple, for position 1, using that row's candidate_docs[1]."""
+    store.log_calibration_sample(
+        query="q",
+        candidate_ids=["a", "b", "c"],
+        reranker_scores=[9.0, 9.0, 9.0],
+        reranker_model_id="m",
+        candidate_docs=["doc-a", "doc-b", "doc-c"],
+    )
+    row_id = store._conn.execute("SELECT id FROM calibration_log ORDER BY id DESC LIMIT 1").fetchone()["id"]
+    store.write_calibration_labels(
+        row_id,
+        ["irrelevant", "relevant", "irrelevant"],
+        [None, "relevant", None],
+    )
+    assert store.judge_lora_training_triples([row_id]) == [("q", "doc-b", "relevant")]
+
+
+def test_lora_training_triples_doc_comes_from_candidate_docs_not_ids(store: MemoryStore) -> None:
+    store.log_calibration_sample(
+        query="what is x",
+        candidate_ids=["mem-1"],
+        reranker_scores=[9.0],
+        reranker_model_id="m",
+        candidate_docs=["the actual recalled text"],
+    )
+    row_id = store._conn.execute("SELECT id FROM calibration_log ORDER BY id DESC LIMIT 1").fetchone()["id"]
+    store.write_calibration_labels(row_id, ["relevant"], ["irrelevant"])
+    triples = store.judge_lora_training_triples([row_id])
+    assert triples == [("what is x", "the actual recalled text", "irrelevant")]
+    # the label is the Haiku label, not the local judge's "relevant".
+    assert triples[0][2] == "irrelevant"
+
+
+def test_lora_training_triples_skips_unknown_and_error_haiku_sentinels(store: MemoryStore) -> None:
+    """Defensive: production never writes "unknown"/"error" into
+    haiku_label (only local_judge_label carries those), but a position
+    carrying one must still not be emitted as a triple."""
+    store.log_calibration_sample(
+        query="q",
+        candidate_ids=["a", "b", "c"],
+        reranker_scores=[9.0, 9.0, 9.0],
+        reranker_model_id="m",
+        candidate_docs=["doc-a", "doc-b", "doc-c"],
+    )
+    row_id = store._conn.execute("SELECT id FROM calibration_log ORDER BY id DESC LIMIT 1").fetchone()["id"]
+    store.write_calibration_labels(
+        row_id,
+        ["relevant", "unknown", "error"],
+        ["relevant", "unknown", "error"],
+    )
+    assert store.judge_lora_training_triples([row_id]) == [("q", "doc-a", "relevant")]
+
+
+def test_lora_training_triples_skips_legacy_row_with_null_candidate_docs(store: MemoryStore) -> None:
+    """A pre-inc1 row (or any caller that never passed candidate_docs) has
+    haiku_label non-None but candidate_docs NULL -- no doc text means no
+    triple, however good the label is."""
+    store.log_calibration_sample(
+        query="q", candidate_ids=["a"], reranker_scores=[9.0], reranker_model_id="m"
+    )  # no candidate_docs passed -> column stays NULL
+    row_id = store._conn.execute("SELECT id FROM calibration_log ORDER BY id DESC LIMIT 1").fetchone()["id"]
+    store.write_calibration_labels(row_id, ["relevant"], ["relevant"])
+    assert store.judge_lora_training_triples([row_id]) == []
+
+
+def test_lora_training_triples_scoped_to_the_given_row_ids_only(store: MemoryStore) -> None:
+    store.log_calibration_sample(
+        query="in-scope", candidate_ids=["a"], reranker_scores=[9.0], reranker_model_id="m",
+        candidate_docs=["in-scope-doc"],
+    )
+    in_scope_id = store._conn.execute("SELECT id FROM calibration_log ORDER BY id DESC LIMIT 1").fetchone()["id"]
+    store.write_calibration_labels(in_scope_id, ["relevant"], ["relevant"])
+
+    store.log_calibration_sample(
+        query="out-of-scope", candidate_ids=["b"], reranker_scores=[9.0], reranker_model_id="m",
+        candidate_docs=["out-of-scope-doc"],
+    )
+    out_of_scope_id = store._conn.execute("SELECT id FROM calibration_log ORDER BY id DESC LIMIT 1").fetchone()["id"]
+    store.write_calibration_labels(out_of_scope_id, ["relevant"], ["relevant"])
+
+    triples = store.judge_lora_training_triples([in_scope_id])
+    assert triples == [("in-scope", "in-scope-doc", "relevant")]
+
+
+def test_lora_training_triples_positional_alignment_across_multiple_rows(store: MemoryStore) -> None:
+    """Two rows, each with one Haiku position -- query/doc/label must be
+    correct PER ROW, not cross-contaminated, and returned in row-id order
+    (judge_eval.split_train_test's stable-key ordering)."""
+    store.log_calibration_sample(
+        query="q1", candidate_ids=["a1", "a2"], reranker_scores=[9.0, 9.0], reranker_model_id="m",
+        candidate_docs=["doc1a", "doc1b"],
+    )
+    row1 = store._conn.execute("SELECT id FROM calibration_log ORDER BY id DESC LIMIT 1").fetchone()["id"]
+    store.write_calibration_labels(row1, ["relevant", "irrelevant"], [None, "irrelevant"])
+
+    store.log_calibration_sample(
+        query="q2", candidate_ids=["b1", "b2"], reranker_scores=[9.0, 9.0], reranker_model_id="m",
+        candidate_docs=["doc2a", "doc2b"],
+    )
+    row2 = store._conn.execute("SELECT id FROM calibration_log ORDER BY id DESC LIMIT 1").fetchone()["id"]
+    store.write_calibration_labels(row2, ["relevant", "relevant"], ["relevant", None])
+
+    assert store.judge_lora_training_triples([row1, row2]) == [
+        ("q1", "doc1b", "irrelevant"),
+        ("q2", "doc2a", "relevant"),
+    ]
+
+
+def test_lora_training_triples_deterministic_across_repeated_calls(store: MemoryStore) -> None:
+    store.log_calibration_sample(
+        query="q", candidate_ids=["a", "b"], reranker_scores=[9.0, 9.0], reranker_model_id="m",
+        candidate_docs=["doc-a", "doc-b"],
+    )
+    row_id = store._conn.execute("SELECT id FROM calibration_log ORDER BY id DESC LIMIT 1").fetchone()["id"]
+    store.write_calibration_labels(row_id, ["relevant", "relevant"], ["relevant", "irrelevant"])
+    first = store.judge_lora_training_triples([row_id])
+    second = store.judge_lora_training_triples([row_id])
+    assert first == second == [("q", "doc-a", "relevant"), ("q", "doc-b", "irrelevant")]
+
+
+def test_lora_training_triples_empty_row_ids_returns_empty(store: MemoryStore) -> None:
+    assert store.judge_lora_training_triples([]) == []
+
+
+def test_lora_training_triples_no_row_haiku_labeled_yet_returns_empty(store: MemoryStore) -> None:
+    """A row that's never been through write_calibration_labels at all
+    (haiku_label column still NULL) contributes no triples."""
+    store.log_calibration_sample(
+        query="q", candidate_ids=["a"], reranker_scores=[9.0], reranker_model_id="m",
+        candidate_docs=["doc-a"],
+    )
+    row_id = store._conn.execute("SELECT id FROM calibration_log ORDER BY id DESC LIMIT 1").fetchone()["id"]
+    assert store.judge_lora_training_triples([row_id]) == []
+
+
+def test_lora_training_triples_skips_non_decodable_json_other_rows_still_returned(
+    store: MemoryStore,
+) -> None:
+    """A row whose haiku_label column holds non-decodable JSON text is
+    skipped fail-soft -- no raise -- and a separate valid row is still
+    returned (the except (TypeError, ValueError): continue path,
+    store.py's json.JSONDecodeError-is-a-ValueError branch)."""
+    store.log_calibration_sample(
+        query="good", candidate_ids=["a"], reranker_scores=[9.0], reranker_model_id="m",
+        candidate_docs=["good-doc"],
+    )
+    good_id = store._conn.execute("SELECT id FROM calibration_log ORDER BY id DESC LIMIT 1").fetchone()["id"]
+    store.write_calibration_labels(good_id, ["relevant"], ["relevant"])
+
+    store.log_calibration_sample(
+        query="bad", candidate_ids=["b"], reranker_scores=[9.0], reranker_model_id="m",
+        candidate_docs=["bad-doc"],
+    )
+    bad_id = store._conn.execute("SELECT id FROM calibration_log ORDER BY id DESC LIMIT 1").fetchone()["id"]
+    store.write_calibration_labels(bad_id, ["relevant"], ["relevant"])
+    # Corrupt the already-labeled row's haiku_label column with text that
+    # is not valid JSON at all.
+    store._conn.execute(
+        "UPDATE calibration_log SET haiku_label = ? WHERE id = ?", ("{not valid json", bad_id)
+    )
+    store._conn.commit()
+
+    triples = store.judge_lora_training_triples([good_id, bad_id])
+    assert triples == [("good", "good-doc", "relevant")]
+
+
+def test_lora_training_triples_skips_wrong_type_json_no_raise(store: MemoryStore) -> None:
+    """A row whose candidate_docs column decodes to VALID JSON of the
+    WRONG type (a bare number, not a list) must still be skipped
+    fail-soft. json.loads("42") succeeds, so this only bites if zip()'s
+    TypeError-at-construction-time (a bare int isn't iterable) is also
+    caught -- the coverage gap this test targets."""
+    store.log_calibration_sample(
+        query="q", candidate_ids=["a"], reranker_scores=[9.0], reranker_model_id="m",
+        candidate_docs=["doc-a"],
+    )
+    row_id = store._conn.execute("SELECT id FROM calibration_log ORDER BY id DESC LIMIT 1").fetchone()["id"]
+    store.write_calibration_labels(row_id, ["relevant"], ["relevant"])
+    store._conn.execute(
+        "UPDATE calibration_log SET candidate_docs = ? WHERE id = ?", ("42", row_id)
+    )
+    store._conn.commit()
+
+    # Must not raise -- a broken row degrades to "contributes nothing",
+    # never crashes the caller.
+    assert store.judge_lora_training_triples([row_id]) == []
+
+
+def test_lora_training_triples_mismatched_length_truncates_to_aligned_prefix(
+    store: MemoryStore,
+) -> None:
+    """haiku_label has THREE positions but candidate_docs only has ONE
+    (a caller that logged fewer docs than candidates) -- zip(...,
+    strict=False) truncates to the shorter list: no raise, and the
+    aligned prefix still emits a correct triple; the un-aligned tail
+    positions simply never emit."""
+    store.log_calibration_sample(
+        query="q", candidate_ids=["a", "b", "c"], reranker_scores=[9.0, 9.0, 9.0], reranker_model_id="m",
+        candidate_docs=["doc-a"],
+    )
+    row_id = store._conn.execute("SELECT id FROM calibration_log ORDER BY id DESC LIMIT 1").fetchone()["id"]
+    store.write_calibration_labels(
+        row_id, ["relevant", "relevant", "relevant"], ["relevant", "irrelevant", "relevant"]
+    )
+    assert store.judge_lora_training_triples([row_id]) == [("q", "doc-a", "relevant")]
+
+
+# ---------------------------------------------------------------------------
 # MemoryStore.get_judge_knob_calibration / write_judge_knob_calibration —
 # marker round-trip (I1: table in memories.db), mirrors
 # get_judge_selftune_state / write_judge_selftune_state's own tests above.
