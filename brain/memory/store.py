@@ -29,19 +29,22 @@ from brain.memory.floor_calibration import RETENTION_WINDOW_DAYS_DEFAULT
 
 logger = logging.getLogger(__name__)
 
-# F2a (#250 inc5, FINALIZED inc7): calibration_log retention window (spec
-# Section 5 / acceptance 5b). inc5 shipped this as a PROVISIONAL flat 14.0
-# placeholder because the derivation's other input (the daily calibration
-# SAMPLE SIZE) didn't exist yet. inc7 (spec Section 7) adds that input
-# (`relevance_judge.CALIBRATION_SAMPLE_ROWS`) and the floor-derivation's own
-# EMA window, so the window is now the spec's actual formula — max(sample-
-# drawable-days, drift-responsiveness) — computed by
-# `floor_calibration.derive_retention_window_days` and imported here as
-# `RETENTION_WINDOW_DAYS_DEFAULT`. The derivation's one home stays in
-# floor_calibration.py; this module keeps owning the tunable KEY
-# (`calibration.retention_window_days`) and `prune_calibration_log`'s
-# contract, unchanged from inc5. An operator override via tunables.json is
-# unaffected by this swap from a flat default to a derived one.
+# F2a (#250 inc5, FINALIZED inc7, SHRUNK pre-flip revision Change 1):
+# calibration_log retention window (spec Section 5 / acceptance 5b). inc5
+# shipped this as a PROVISIONAL flat 14.0 placeholder; inc7 replaced it with
+# a derived max(sample-drawable-days, drift-responsiveness) formula sized to
+# cover the (then-pooled) multi-day fit. Change 1 re-points the fit to read
+# only the MOST RECENTLY COMPLETED DAY (`MemoryStore.labeled_calibration_
+# pairs`, day-scoped), so retention no longer needs to cover a multi-day
+# accumulation window — only today's in-progress bucket, yesterday's (the
+# day actually read), and a small safety buffer. See
+# `floor_calibration.derive_retention_window_days` for the current
+# derivation, imported here as `RETENTION_WINDOW_DAYS_DEFAULT`. The
+# derivation's one home stays in floor_calibration.py; this module keeps
+# owning the tunable KEY (`calibration.retention_window_days`) and `prune_
+# calibration_log`'s contract, unchanged from inc5. An operator override via
+# tunables.json is unaffected by this swap from a flat default to a derived
+# one.
 CALIBRATION_LOG_RETENTION_WINDOW_DAYS: float = tunables.register(
     "calibration.retention_window_days", RETENTION_WINDOW_DAYS_DEFAULT
 )
@@ -1003,9 +1006,30 @@ class MemoryStore:
         self._conn.commit()
 
     def labeled_calibration_pairs(self, reranker_model_id: str) -> list[tuple[float, str]]:
-        """`(reranker_score, effective_label)` pairs for every LABELED
-        `calibration_log` row matching `reranker_model_id` (F2a #250 inc7,
-        spec Section 7) — the floor-derivation fit's input.
+        """`(reranker_score, effective_label)` pairs for the MOST RECENTLY
+        COMPLETED DAY's LABELED `calibration_log` rows matching
+        `reranker_model_id` (F2a #250 inc7, spec Section 7; pre-flip
+        revision Change 1, "nimble floor") — the floor-derivation fit's
+        ONLY caller/input (`floor_calibration.derive_and_persist_floor`).
+
+        Pre-flip revision Change 1 DAY-SCOPES this read: before Change 1,
+        this method drew from EVERY currently-retained labeled row for this
+        model_id (the full multi-day retention window, pooled). That pooled
+        read let one severely-stale day keep outvoting a genuine, fast
+        corpus shift for as long as the retention window stayed wide — the
+        confirmed root cause of a permanent floor lock (spec's T7 Part A).
+        Change 1's fix: scope to the MOST RECENTLY COMPLETED DAY only —
+        this method's own `day_bucket` boundary (Change 1's Open
+        Reconfirmation "the single-day fit window's exact bound"), resolved
+        here as: the MAX `day_bucket` among this model_id's own USABLE
+        labeled rows (same WHERE clause as the pair read itself, below) —
+        reusing the EXISTING `day_bucket` column (the same one `prune_
+        calibration_log`'s retention window already keys on) rather than
+        introducing a second, rolling-24h time-anchoring scheme. This
+        naturally tracks whichever day a caller's own seeded/logged data
+        actually lands on, with no dependency on wall-clock `now` at call
+        time — a day is "the most recently completed one" once no later
+        day's rows have been judge-labeled yet for this model_id.
 
         Each row's `candidate_ids` / `reranker_scores` / `local_judge_label`
         / `haiku_label` are all POSITIONALLY aligned (the convention every
@@ -1019,20 +1043,23 @@ class MemoryStore:
         is a usable relevant/irrelevant ground-truth label for a threshold
         fit.
 
-        Draws from EVERY currently-retained labeled row for this model_id
-        (not just the day's sample) — the fit accumulates across the
-        retention window, per store.py's own `calibration_log` schema
-        comment ("the fit itself draws from accumulated labeled rows across
-        the retention window, not one day in isolation").
-
         Read-only: does not bump `recall_count` and does not label or
         write anything (mirrors `sample_unlabeled_calibration_rows`'s own
         read-only posture).
         """
-        rows = self._conn.execute(
-            "SELECT reranker_scores, local_judge_label, haiku_label FROM calibration_log "
+        max_day_row = self._conn.execute(
+            "SELECT MAX(day_bucket) AS max_day FROM calibration_log "
             "WHERE reranker_model_id = ? AND local_judge_label IS NOT NULL",
             (reranker_model_id,),
+        ).fetchone()
+        most_recent_day = max_day_row["max_day"] if max_day_row is not None else None
+        if most_recent_day is None:
+            return []
+        rows = self._conn.execute(
+            "SELECT reranker_scores, local_judge_label, haiku_label FROM calibration_log "
+            "WHERE reranker_model_id = ? AND local_judge_label IS NOT NULL "
+            "AND day_bucket = ?",
+            (reranker_model_id, most_recent_day),
         ).fetchall()
         pairs: list[tuple[float, str]] = []
         for row in rows:
@@ -1047,18 +1074,53 @@ class MemoryStore:
                     pairs.append((float(score), effective))
         return pairs
 
+    def get_persisted_reranker_floor(self, reranker_model_id: str) -> dict[str, Any] | None:
+        """Return ONLY the PERSISTED `reranker_floor_calibration` row for
+        `reranker_model_id`, or `None` if none exists — never the transient
+        bootstrap fallback `get_reranker_floor` serves on a miss (F2a
+        inc8). Read-only: does not write or bump anything.
+
+        Pre-flip revision Change 1: this is the persisted-only half
+        `get_reranker_floor` below was refactored to share with
+        `floor_calibration.derive_and_persist_floor`'s own data-starvation
+        backstop, which needs to tell "a real prior row exists to hold"
+        apart from "no row exists, and the caller would otherwise be
+        looking at the transient bootstrap" — `get_reranker_floor` itself
+        conflates the two (by design, for its OWN callers, which want
+        SOME floor, persisted or not); the backstop must not.
+        """
+        row = self._conn.execute(
+            "SELECT reranker_model_id, floor, raw_fit_floor, sample_pairs, is_cold_start, "
+            "updated_at "
+            "FROM reranker_floor_calibration WHERE reranker_model_id = ?",
+            (reranker_model_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "reranker_model_id": row["reranker_model_id"],
+            "floor": float(row["floor"]),
+            "raw_fit_floor": float(row["raw_fit_floor"]),
+            "sample_pairs": int(row["sample_pairs"]),
+            "is_cold_start": bool(row["is_cold_start"]),
+            "updated_at": row["updated_at"],
+        }
+
     def get_reranker_floor(self, reranker_model_id: str) -> dict[str, Any] | None:
         """Return the operative reranker floor for `reranker_model_id`
         (F2a #250 inc7/inc8, spec Section 7).
 
         Checks the PERSISTED `reranker_floor_calibration` row first (written
         by the daily calibration tick, `floor_calibration.derive_and_
-        persist_floor`) — if one exists, it is returned and this method does
-        no further work.
+        persist_floor`, via `get_persisted_reranker_floor` above) — if one
+        exists, it is returned and this method does no further work.
 
         If no row exists yet (fresh install / early days / a brand-new
-        reranker model_id that has never been calibrated), F2a inc8 (#250 §7
-        UPDATED, Roy 2026-09-18's bootstrap-floor ruling) serves a derived,
+        reranker model_id that has never been calibrated — including, as of
+        the pre-flip revision's Change 1, a deploy still inside the
+        data-starvation backstop's ramp, since that backstop's no-prior-row
+        edge case intentionally writes nothing), F2a inc8 (#250 §7 UPDATED,
+        Roy 2026-09-18's bootstrap-floor ruling) serves a derived,
         process-wide-cached BOOTSTRAP floor instead of `None` —
         `floor_calibration.get_bootstrap_floor`, computed once (jina-only,
         torch-free) from the bundled `_FP16_GATE_PAIRS` and cached, never
@@ -1081,20 +1143,9 @@ class MemoryStore:
 
         Read-only: does not write or bump anything.
         """
-        row = self._conn.execute(
-            "SELECT reranker_model_id, floor, raw_fit_floor, sample_pairs, is_cold_start, updated_at "
-            "FROM reranker_floor_calibration WHERE reranker_model_id = ?",
-            (reranker_model_id,),
-        ).fetchone()
-        if row is not None:
-            return {
-                "reranker_model_id": row["reranker_model_id"],
-                "floor": float(row["floor"]),
-                "raw_fit_floor": float(row["raw_fit_floor"]),
-                "sample_pairs": int(row["sample_pairs"]),
-                "is_cold_start": bool(row["is_cold_start"]),
-                "updated_at": row["updated_at"],
-            }
+        persisted = self.get_persisted_reranker_floor(reranker_model_id)
+        if persisted is not None:
+            return persisted
         from brain.memory.floor_calibration import get_bootstrap_floor
 
         return get_bootstrap_floor(reranker_model_id)
@@ -1114,14 +1165,19 @@ class MemoryStore:
         side file). `INSERT ... ON CONFLICT DO UPDATE` keyed on
         `reranker_model_id` (its PRIMARY KEY): a model_id's row is replaced
         wholesale each accepted cycle, never accumulated — this table
-        tracks the CURRENT floor per model_id, not a history of past ones
-        (the EMA smoothing already carries forward the relevant history
-        inside `floor` itself).
+        tracks the CURRENT floor per model_id, not a history of past ones.
+        Pre-flip revision Change 1 removed the EMA smoothing this docstring
+        used to cite here as the reason no history is kept — post-Change-1
+        there is no smoothing left to carry history forward AT ALL: `floor`
+        is simply THIS cycle's raw fit, and the prior value is either held
+        untouched (never reaching this method — see below) or fully
+        replaced, never blended.
 
-        Called only when a cycle's derivation is ACCEPTED (a cold-start fit,
-        or a real fit that cleared the stability gate) — a held/rejected
-        cycle (`FloorDerivationOutcome.accepted is False`) must NOT call
-        this, leaving the previously persisted row untouched.
+        Called only when a cycle's derivation is ACCEPTED (the most
+        recently completed day's raw fit, per Change 1 — no more cold-start
+        branch) — a held/rejected cycle (`FloorDerivationOutcome.accepted
+        is False`, Change 1's data-starvation backstop) must NOT call this,
+        leaving the previously persisted row (or its absence) untouched.
         """
         self._conn.execute(
             "INSERT INTO reranker_floor_calibration "

@@ -109,26 +109,31 @@ def real_provider():
     fixture would raise (an onnxruntime "external data path escapes"
     error) instead of returning a working provider.
 
-    F2a inc2 (#250 §2): ``build_reranker_provider()`` now runs the cached
-    first-use fp16-vs-fp32 accuracy self-check before returning a provider,
-    so which of the two exports actually comes back is a REAL, box-
-    dependent verdict (not pinned to fp32 anymore) — the assertion below
-    accepts either id rather than hard-pinning fp32, since inc2 legitimately
-    makes that choice non-deterministic across hosts. The self-check's OWN
-    correctness (agreement/disagreement/speed-win logic) is covered
-    offline, by stub, in test_reranker.py; this file stays a real-model
-    load+score shape/sanity guard, not a calibration suite, per its module
-    docstring above.
+    Pre-flip revision Change 2 (2026-09-23) REMOVED the cached first-use
+    fp16-vs-fp32 accuracy self-check this docstring used to describe here:
+    ``build_reranker_provider()`` no longer probes anything at call time —
+    it resolves the precision DETERMINISTICALLY from the `reranker.
+    precision` tunable/config default (pinned to fp16 unless an operator
+    override sets it to fp32, mirroring the AVX2-override shape;
+    `reranker.py`'s own `build_reranker_provider` docstring is current).
+    The assertion below still accepts EITHER id — not because the choice
+    is host-dependent (it no longer is), but because this file doesn't
+    force a specific `reranker.precision` tunable state, so whichever the
+    ambient config resolves to (fp16 by default, or fp32 under a local
+    override) is what loads; a real per-repo run is expected to see fp16.
+    The fp16 export's OWN real-load correctness has its dedicated proof
+    below (`test_real_fp16_reranker_loads_and_scores`); this file stays a
+    real-model load+score shape/sanity guard, not a calibration suite, per
+    its module docstring above.
 
-    F2a inc8 (#250 §7/§8): the self-check needs a calibrated floor to
-    compare fp16/fp32 agreement against (`store.get_reranker_floor`) — with
-    no store at all it short-circuits straight to fp32 (see
-    `reranker._run_precision_selfcheck`'s docstring), which would make this
-    fixture's "real, box-dependent verdict" claim false. Seeds a small
-    in-memory store with a calibrated floor for the fp32 id so the real
-    self-check genuinely runs (this is still a load/score sanity guard, not
-    a calibration suite — the floor value itself is arbitrary, chosen only
-    to be a plausible jina-scale logit)."""
+    The `store`/`write_reranker_floor` setup below is now VESTIGIAL:
+    `build_reranker_provider`'s `store` keyword exists only for call-site
+    compatibility with the removed self-check that used to read it
+    (`store.get_reranker_floor`, to decide fp16-vs-fp32 agreement) — it is
+    no longer read by that function at all (see its own docstring). Left
+    in place here as a docstring-only fix (pre-flip revision Change 1's
+    dead-code/doc-cleanup item), not trimmed, since removing dead test
+    SETUP code is a separate, code-level change out of this item's scope."""
     store = MemoryStore(db_path=":memory:")
     store.write_reranker_floor(
         _MODEL_ID, floor=0.0, raw_fit_floor=0.0, sample_pairs=10, is_cold_start=True
@@ -217,20 +222,25 @@ def test_real_reranker_orders_genuine_above_decoy_across_sample(real_provider) -
 
 
 def test_real_fp16_reranker_loads_and_scores() -> None:
-    """F2a inc2 (#250 §2) acceptance criterion #2's REAL-load proof (the
-    "AC#2 proof" the fp16-vs-fp32 self-check itself depends on): the fp16
-    onnx export (``onnx/model_fp16.onnx`` on the SAME jina HF repo, ~557MB)
-    registers via ``TextCrossEncoder.add_custom_model()`` and loads/scores
-    cleanly through the SAME ``CrossEncoderProvider`` construction
-    production code uses (``_run_precision_selfcheck`` /
-    ``build_reranker_provider`` both build it exactly this way).
+    """F2a inc2 (#250 §2) acceptance criterion #2's REAL-load proof: the
+    fp16 onnx export (``onnx/model_fp16.onnx`` on the SAME jina HF repo,
+    ~557MB) registers via ``TextCrossEncoder.add_custom_model()`` and
+    loads/scores cleanly through the SAME ``CrossEncoderProvider``
+    construction production code uses. Pre-flip revision Change 2
+    (2026-09-23) REMOVED the cached first-use fp16-vs-fp32 accuracy
+    self-check this docstring used to cite here as the thing this proof
+    "itself depends on" (``_run_precision_selfcheck`` no longer exists) —
+    fp16 is now `build_reranker_provider`'s PINNED default (the
+    `reranker.precision` tunable/config, not a runtime probe), so this
+    real-load proof now backs that default path directly rather than one
+    branch of a self-check's decision.
 
     Deliberately constructs the fp16 provider DIRECTLY (not via
-    ``build_reranker_provider()``) so this test is independent of the
-    self-check's own DECISION (a separate, offline-tested concern in
-    test_reranker.py) — this is purely "does the fp16 export load and
-    score cleanly," the same shape as ``test_real_reranker_loads_and_
-    scores`` above but for the fp16 candidate specifically."""
+    ``build_reranker_provider()``) so this test is independent of
+    `reranker.precision`'s live tunable state (whatever it happens to be
+    set to locally) — this is purely "does the fp16 export load and score
+    cleanly," the same shape as ``test_real_reranker_loads_and_scores``
+    above but for the fp16 candidate specifically."""
     from brain.paths import get_cache_dir
 
     _register_fp16_reranker_model(_FP16_MODEL_ID, _MODEL_ID)

@@ -31,18 +31,24 @@ Also owns the AUTO-SCALING rerank-width calculation (spec point 3): the
 number of candidates reranked self-derives from a MEASURED warm per-doc
 rerank latency on the actual host vs a fixed latency budget — no per-corpus,
 no per-persona, no operator tuning; only the budget itself
-(``LATENCY_BUDGET_SECONDS``) is an ops tunable.
+(``LATENCY_BUDGET_SECONDS``) is an ops tunable. Pre-flip revision Change 3
+adds a second, MEMORY bound alongside the time one: a measured-once-warm-
+and-cached per-doc memory cost vs a cheap per-call, cgroup-aware RAM-
+headroom read — see ``get_rerank_width`` and the "Memory bound" section
+above it.
 
-F2a inc2 (#250 §2) additionally owns the fp16-vs-fp32 accuracy SELF-CHECK: a
-cached, first-use, on-box check (mirroring the warm-latency auto-calibration
-pattern above — measured once, cached, not per-recall) that registers the
-jina reranker's fp16 onnx export via ``TextCrossEncoder.add_custom_model()``,
-tests it against the fp32 export on a small bundled representative set of
-(query, doc) pairs for surface/abstain DECISION agreement against the
-CALIBRATED floor (F2a inc8), and — only if that agreement holds AND fp16
-measures faster on this host — ships fp16; otherwise fp32 (the safe
-default). See ``_choose_reranker_model_id`` / ``_run_precision_selfcheck``
-near the bottom of this module.
+F2a inc2 (#250 §2) originally owned a cached, first-use, on-box fp16-vs-fp32
+accuracy SELF-CHECK here (dual-loading both ONNX exports at first use to
+decide which to ship). The pre-flip revision's Change 2 REMOVES that
+self-check entirely (a confirmed ~1.16 GiB one-time startup memory spike —
+the leading suspect in two live VM crashes) and PINS fp16 as the shipped
+default instead: Testing's matched-width fp16-vs-fp32 A/B reproduced fp32's
+surface/abstain decisions on all 40 bundled queries, so fp16-vs-fp32
+agreement is treated as a property of the bundled model weights (identical
+on every box), not something a per-box runtime probe needs to establish.
+See ``RERANKER_PRECISION`` (the tunable default, mirroring
+``LATENCY_BUDGET_SECONDS``'s override shape above) and
+``build_reranker_provider`` below.
 """
 
 from __future__ import annotations
@@ -114,20 +120,35 @@ _AVX2_PRESENT = _detect_avx2()
 
 # Latency budget for one rerank call (#250 §3): AVX2-aware default — 2s if
 # this process's startup check found AVX2, 4s if not (see
-# `_default_latency_budget_seconds`). The ONLY operator-tunable knob in this
-# module — ops-clean (a latency/throughput knob), unlike the reranker
-# abstention floor (physiology, fenced into semantic_recall.py/the DB-backed
-# calibration table per tunables.py's own "physiology fenced out" rule, NOT
-# a tunables.py entry). Registered here (the owning module) as the
-# DEFAULT only; a manual override in tunables.json wins over this
-# auto-detected value via tunables.get_tunable's existing override-
-# precedence mechanism (see `get_rerank_width` below) — this AVX2-awareness
-# only changes what the default resolves to, never the override behavior
-# itself. Read at call time via tunables.get_tunable so a live override
-# applies with no restart.
+# `_default_latency_budget_seconds`). An ops-clean knob (a latency/
+# throughput setting), unlike the reranker abstention floor (physiology,
+# fenced into semantic_recall.py/the DB-backed calibration table per
+# tunables.py's own "physiology fenced out" rule, NOT a tunables.py entry).
+# Registered here (the owning module) as the DEFAULT only; a manual
+# override in tunables.json wins over this auto-detected value via
+# tunables.get_tunable's existing override-precedence mechanism (see
+# `get_rerank_width` below) — this AVX2-awareness only changes what the
+# default resolves to, never the override behavior itself. Read at call
+# time via tunables.get_tunable so a live override applies with no restart.
 LATENCY_BUDGET_SECONDS: float = tunables.register(
     "reranker.latency_budget_seconds", _default_latency_budget_seconds(_AVX2_PRESENT)
 )
+
+# fp16-vs-fp32 reranker precision (pre-flip revision Change 2 — supersedes
+# F2a inc2's runtime self-check, F2a spec §2, in full). fp16 is PINNED as
+# the shipped default: Testing's matched-width A/B (2026-09-23) reproduced
+# fp32's surface/abstain decisions on all 40 bundled queries (zero
+# recoveries, zero regressions, zero rank-1 disagreements, deltas ~0.005
+# mean / 0.023 max), so fp16-vs-fp32 agreement is treated as a property of
+# the bundled model weights — identical on every box, unlike latency — that
+# no longer needs a per-box runtime probe to establish. Registered here as
+# a tunable DEFAULT, mirroring `LATENCY_BUDGET_SECONDS`'s override shape
+# immediately above (I7: never hardcoded inline in `build_reranker_
+# provider`) — an operator can still force fp32 by setting
+# "reranker.precision" in tunables.json's "overrides" to "fp32".
+RERANKER_PRECISION_FP16 = "fp16"
+RERANKER_PRECISION_FP32 = "fp32"
+RERANKER_PRECISION: str = tunables.register("reranker.precision", RERANKER_PRECISION_FP16)
 
 
 class RerankerProvider(ABC):
@@ -228,29 +249,22 @@ _provider_cache_lock = threading.Lock()
 
 
 def build_reranker_provider(*, store: MemoryStore | None = None) -> RerankerProvider:
-    """The production reranker provider: CrossEncoderProvider pinned to
-    whichever model id the fp16-vs-fp32 self-check (F2a inc2, #250 §2)
-    decides to serve — `model_tier.TIER_RERANKER`'s fp32 model id, or its
-    fp16 export (`model_tier.MODEL_RERANKER_FP16`) if that self-check's
-    cached decision picked it — caching the model file in the shared
-    `get_cache_dir()` (one download across every persona on the box — the
-    model isn't persona-specific data, same reasoning as the embedding
-    model).
+    """The production reranker provider: a `CrossEncoderProvider` pinned to
+    `RERANKER_PRECISION`'s resolved id — `model_tier.MODEL_RERANKER_FP16`
+    (the pinned default) or `model_tier.TIER_RERANKER`'s fp32 id (only when
+    an operator override sets `reranker.precision` to `"fp32"` in
+    tunables.json) — caching the model file in the shared `get_cache_dir()`
+    (one download across every persona on the box — the model isn't
+    persona-specific data, same reasoning as the embedding model).
 
-    `store` (F2a inc8, #250 §7/§8 cutover): the caller's `MemoryStore`,
-    threaded through to the precision self-check ONLY (never used for
-    anything else here) so it can read the CALIBRATED reranker floor
-    (`store.get_reranker_floor`) as the comparison bar for the fp16-vs-fp32
-    surface/abstain agreement check, replacing the deleted
-    `semantic_recall.RERANK_FLOOR` constant it used to import. Optional and
-    keyword-only: on a cache HIT (the overwhelmingly common case —
-    `_choose_reranker_model_id` short-circuits before ever touching `store`)
-    it is never even looked at; every production call site
-    (`semantic_recall.run_semantic_recall`, `search_memories._semantic_
-    top_k`, `supervisor._run_calibration_tick`) has a store in scope and
-    passes it. `None` (test/legacy call sites that don't) degrades the
-    precision self-check to its existing safe default — see
-    `_run_precision_selfcheck`'s docstring.
+    Pre-flip revision Change 2 removed the fp16-vs-fp32 first-use precision
+    SELF-CHECK this function used to run (F2a spec §2, a confirmed ~1.16
+    GiB one-time dual-load memory spike): exactly ONE ONNX export is ever
+    constructed per resolved model_id now, never both. `store` is kept as a
+    keyword-only parameter purely for call-site compatibility with every
+    existing production caller (`semantic_recall.run_semantic_recall`,
+    `search_memories._semantic_top_k`, `supervisor._run_calibration_tick`,
+    `floor_calibration.py`) — it is no longer read by this function at all.
 
     PROCESS-WIDE CACHING, same rationale as `embeddings.build_embedding_
     provider`: constructing a CrossEncoderProvider builds a real ONNX
@@ -258,12 +272,7 @@ def build_reranker_provider(*, store: MemoryStore | None = None) -> RerankerProv
     (double-checked locking: unlocked fast-path read for the common
     already-cached case; the lock is only taken — then re-checked — the
     first time a given model_id needs constructing) for the same reasons
-    documented on that function. `_choose_reranker_model_id` below may
-    already have populated this cache for the winning model_id (it warms
-    both candidates to run the self-check, so it stashes whichever provider
-    it already built for the DECIDED model_id here to avoid a second ONNX
-    session load on this very first call) — the block below is then a
-    fast-path cache hit, not a redundant construction.
+    documented on that function.
 
     TEST ISOLATION: `tests/conftest.py`'s autouse fixture clears this
     process-global dict before and after every test, mirroring the embedding
@@ -274,7 +283,19 @@ def build_reranker_provider(*, store: MemoryStore | None = None) -> RerankerProv
 
     fp32_model_id = model_for_tier(TIER_RERANKER)
     cache_dir = get_cache_dir()
-    model_id = _choose_reranker_model_id(fp32_model_id, MODEL_RERANKER_FP16, cache_dir, store=store)
+    precision = tunables.get_tunable("reranker.precision", RERANKER_PRECISION)
+    if precision == RERANKER_PRECISION_FP32:
+        model_id = fp32_model_id
+    else:
+        if precision != RERANKER_PRECISION_FP16:
+            log.warning(
+                "reranker: unrecognized reranker.precision override %r — falling back to "
+                "the pinned default %r",
+                precision,
+                RERANKER_PRECISION,
+            )
+        _register_fp16_reranker_model(MODEL_RERANKER_FP16, fp32_model_id)
+        model_id = MODEL_RERANKER_FP16
 
     provider = _provider_cache.get(model_id)
     if provider is not None:
@@ -296,19 +317,15 @@ def _bootstrap_reranker_provider(model_id: str) -> RerankerProvider:
     pairs for a floor the caller already knows it needs, for a model_id it
     already knows it needs it for.
 
-    Deliberately bypasses `build_reranker_provider` — that function's
-    fp16-vs-fp32 precision self-check reads `store.get_reranker_floor(
-    fp32_model_id)`, which is exactly `get_bootstrap_floor`'s OWN caller
-    whenever no persisted floor row exists yet. Routing through
-    `build_reranker_provider` here would recurse:
-    `MemoryStore.get_reranker_floor` -> `floor_calibration.
-    get_bootstrap_floor` -> (this function, if it called
-    `build_reranker_provider`) -> `_choose_reranker_model_id` ->
-    `_run_precision_selfcheck` -> `store.get_reranker_floor(fp32_model_id)`
-    -> back to the start, with the cache not yet populated to break the
-    loop. This function never chooses a precision and never touches
-    `store` — it only constructs (or reuses) a plain `CrossEncoderProvider`
-    for the exact `model_id` it was asked about.
+    Deliberately bypasses `build_reranker_provider` — that function resolves
+    its OWN model_id from `RERANKER_PRECISION`'s tunable (ignoring any
+    caller-specified id), whereas this function must construct a provider
+    for the EXACT `model_id` it was handed (the specific id
+    `get_bootstrap_floor`'s caller already knows it needs a floor for, which
+    is not necessarily whatever `build_reranker_provider` would currently
+    resolve to). This function never reads precision configuration and
+    never touches `store` — it only constructs (or reuses) a plain
+    `CrossEncoderProvider` for the exact `model_id` it was asked about.
 
     Reuses the shared `_provider_cache` (the SAME cache
     `build_reranker_provider` reads/writes, double-checked locking to
@@ -316,10 +333,9 @@ def _bootstrap_reranker_provider(model_id: str) -> RerankerProvider:
     the process reuses the already-loaded ONNX session instead of paying
     for a second one. In practice this is very often a cache HIT: every
     production call site that ends up asking `get_reranker_floor` a
-    question (`run_semantic_recall`, `_semantic_top_k`, the precision
-    self-check itself) has ALREADY resolved/cached a provider for the exact
-    model_id in question via `build_reranker_provider` by the time it does
-    so.
+    question (`run_semantic_recall`, `_semantic_top_k`) has ALREADY
+    resolved/cached a provider for the exact model_id in question via
+    `build_reranker_provider` by the time it does so.
     """
     cached = _provider_cache.get(model_id)
     if cached is not None:
@@ -333,17 +349,6 @@ def _bootstrap_reranker_provider(model_id: str) -> RerankerProvider:
         provider = CrossEncoderProvider(model_id=model_id, cache_dir=get_cache_dir())
         _provider_cache[model_id] = provider
         return provider
-
-
-def _cache_provider(model_id: str, provider: RerankerProvider) -> None:
-    """Stash an already-constructed provider into the process-wide cache
-    under `model_id`, WITHOUT clobbering one a concurrent caller already
-    cached (`setdefault`) — used by `_run_precision_selfcheck` so a provider
-    it already warmed (and paid the real ONNX-session-load cost for) while
-    running the self-check is reused by `build_reranker_provider`'s own
-    cache lookup rather than being constructed a second time."""
-    with _provider_cache_lock:
-        _provider_cache.setdefault(model_id, provider)
 
 
 def _reset_reranker_provider_cache() -> None:
@@ -516,6 +521,381 @@ def _reset_latency_cache() -> None:
         _latency_cache.clear()
 
 
+# ---------------------------------------------------------------------------
+# Memory bound for auto-scaling rerank width (pre-flip revision, Change 3).
+# ---------------------------------------------------------------------------
+#
+# `get_rerank_width` was latency-derived only, memory-blind: fp16's extra
+# speed, with no memory bound to check against, was poured entirely into a
+# wider width and OOM'd at 5.36 GiB under a 5.5G cgroup cap (the fp16
+# natural-width run, Testing 2026-09-23). This section adds a MEASURED
+# memory term as an additional `min()` bound, mirroring the existing
+# measure-once-warm-and-cache `_warm_per_doc_latency` pattern exactly:
+# `per_doc_MEMORY` is measured once per model_id (RSS delta around a warm
+# rerank batch of known size, divided by batch size) and cached, recomputed
+# on the same cadence as the latency figure; `available_RAM_headroom` is a
+# cheap per-call read (cgroup-limit-aware, falling back to host free memory),
+# mirroring the `_detect_avx2` /proc-read shape: cheap, dependency-free,
+# safely degrades on any read/parse error or unsupported platform, never
+# crashes. On any failure to determine either figure, the memory term is
+# SKIPPED entirely (never assume unlimited headroom) — `get_rerank_width`
+# degrades to exactly the pre-Change-3 time-only bound.
+
+# Batch size for the one-time warm RSS-delta memory measurement. Reuses
+# `_MEASURE_RERANKS`'s value (rather than inventing a second, differently-
+# derived integer): the same magnitude reasoning applies — large enough that
+# the RSS delta from reranking the batch clears ordinary allocator/GC noise,
+# small enough that the one-time measurement stays cheap.
+_MEMORY_MEASURE_BATCH_SIZE = _MEASURE_RERANKS
+
+# Recompute the cached per-doc memory figure on the SAME cadence as the
+# per-doc latency figure above (`_LATENCY_RECOMPUTE_INTERVAL_SECONDS`) — a
+# long-lived process's per-doc memory cost can drift for the same class of
+# reasons the latency figure can (allocator fragmentation, a noisy
+# neighbor's memory pressure), so this reuses that cadence rather than
+# introducing a second, arbitrarily-different one.
+_MEMORY_RECOMPUTE_INTERVAL_SECONDS = _LATENCY_RECOMPUTE_INTERVAL_SECONDS
+
+# model_id -> (per_doc_bytes, measured_at_monotonic). Process-wide, mirrors
+# `_latency_cache` above exactly — one measurement per model_id, shared
+# across every recall in the process.
+_memory_cache: dict[str, tuple[float, float]] = {}
+_memory_cache_lock = threading.Lock()
+
+
+def _current_rss_bytes() -> float | None:
+    """This process's current resident set size, in bytes, via
+    `/proc/self/status`'s `VmRSS` line — the same shape as `_detect_avx2`'s
+    `/proc` read (Linux-only; fail-soft to `None` on any read/parse error or
+    an unsupported platform, since there is no `/proc` on macOS/Windows).
+    Never raises."""
+    if sys.platform != "linux":
+        return None
+    try:
+        with open("/proc/self/status", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    # e.g. "VmRSS:\t   12345 kB\n" -> kB -> bytes.
+                    return float(line.split()[1]) * 1024.0
+        return None
+    except Exception:  # noqa: BLE001 — fail-soft: an RSS probe must never break a recall
+        log.exception("reranker: RSS read failed — per-doc memory measurement will be skipped")
+        return None
+
+
+def _measure_warm_per_doc_memory(
+    provider: RerankerProvider, sample_docs: list[str] | None = None
+) -> float:
+    """RSS delta bracketing `_MEMORY_MEASURE_BATCH_SIZE` warm rerank() calls,
+    divided by that batch size — the per-candidate memory cost `get_rerank_
+    width`'s memory bound divides headroom by.
+
+    Each bracketed call is SINGLE-document — one document per `rerank()`
+    call, cycling through `sample_docs` exactly like `_measure_warm_per_doc_
+    latency`'s `_doc_for` helper — rather than one N-document batch call.
+    This mirrors that function's per-doc isolation shape (reusing it, not
+    inventing a second one, per this change's own requirement), the same way
+    the existing latency measurement's single-document calls already do.
+
+    `_WARMUP_RERANKS` warmup calls are run first and discarded before the
+    measured sequence, matching `_measure_warm_per_doc_latency`'s
+    cold-cache-trap avoidance ([[single-shot-timing-cold-cache-trap]]) —
+    a cold ONNX session's first calls do real allocation work
+    (session/tensor buffers) unrelated to steady-state per-doc memory cost.
+
+    A negative delta (RSS can legitimately drop between the two reads — a
+    GC pass, another thread freeing memory) or an unreadable RSS clamps to
+    0.0 — the same "no signal" sentinel `_warm_per_doc_latency` uses for a
+    measurement failure, which `get_rerank_width` already treats as "skip
+    this term".
+    """
+    docs = list(sample_docs) if sample_docs else [_MEASURE_DOCUMENT]
+
+    def _doc_for(i: int) -> list[str]:
+        return [docs[i % len(docs)]]
+
+    for i in range(_WARMUP_RERANKS):
+        list(provider.rerank(_MEASURE_QUERY, _doc_for(i)))  # warmup, discarded
+
+    before = _current_rss_bytes()
+    for i in range(_MEMORY_MEASURE_BATCH_SIZE):
+        list(provider.rerank(_MEASURE_QUERY, _doc_for(i)))
+    after = _current_rss_bytes()
+
+    if before is None or after is None:
+        return 0.0
+    delta = after - before
+    if delta <= 0.0:
+        return 0.0
+    return delta / _MEMORY_MEASURE_BATCH_SIZE
+
+
+def _warm_per_doc_memory(
+    provider: RerankerProvider, sample_docs: list[str] | None = None
+) -> float:
+    """Cached warm per-doc memory cost for `provider`'s model_id — mirrors
+    `_warm_per_doc_latency` exactly: measured (and cached) on first use or
+    once `_MEMORY_RECOMPUTE_INTERVAL_SECONDS` has elapsed since the last
+    measurement, measured OUTSIDE the lock (a real rerank batch takes real
+    time, and holding the lock across it would serialize every concurrent
+    recall behind this one measurement), fail-soft to 0.0 (`get_rerank_
+    width` treats 0.0 as "no memory signal, don't throttle by it") on any
+    measurement failure. Never raises into a recall."""
+    model_id = provider.model_id()
+    now = time.monotonic()
+    with _memory_cache_lock:
+        cached = _memory_cache.get(model_id)
+        if cached is not None and (now - cached[1]) < _MEMORY_RECOMPUTE_INTERVAL_SECONDS:
+            return cached[0]
+
+    try:
+        measured = _measure_warm_per_doc_memory(provider, sample_docs)
+    except Exception:  # noqa: BLE001 — fail-soft: never break recall over a calibration failure
+        log.exception("reranker: warm-memory measurement failed — width will not be memory-throttled")
+        measured = 0.0
+
+    with _memory_cache_lock:
+        _memory_cache[model_id] = (measured, now)
+    return measured
+
+
+def _reset_memory_cache() -> None:
+    """Test-only: clear the measured-memory cache."""
+    with _memory_cache_lock:
+        _memory_cache.clear()
+
+
+_CGROUP_V2_ROOT = "/sys/fs/cgroup"
+
+# The kernel's own "no limit" sentinel for cgroup v1's memory.limit_in_bytes
+# (there is no explicit "unbounded" marker like v2's "max" string) — derived
+# from PAGE_COUNTER_MAX on a 4KiB-page 64-bit kernel. A limit at or above
+# this value is unbounded, never a real cap.
+_CGROUP_V1_UNBOUNDED_SENTINEL = 0x7FFFFFFFFFFFF000
+
+
+def _read_proc_self_cgroup_v2_path() -> str | None:
+    """The CALLING PROCESS's own cgroup v2 path (the unified hierarchy,
+    hierarchy id 0) from `/proc/self/cgroup`'s single `0::/<path>` line —
+    this is what lets the v2 reader resolve the process's OWN cgroup
+    directory instead of the fixed cgroup2 root (the root exposes no
+    `memory.max`/`memory.current` of its own, so reading it directly can
+    never see a real per-process cap). Returns the path with leading/
+    trailing slashes stripped (empty string for the v2 root itself), or
+    `None` on any read/parse failure or if no `0::` line is present —
+    same fail-soft posture as every other reader here."""
+    try:
+        with open("/proc/self/cgroup", encoding="utf-8") as f:
+            content = f.read()
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if line.startswith("0::"):
+                return line[len("0::") :].strip("/")
+        return None  # no unified (v2) hierarchy line present
+    except FileNotFoundError:
+        return None
+    except Exception:  # noqa: BLE001 — fail-soft: a headroom probe must never break a recall
+        log.exception("reranker: /proc/self/cgroup (v2) read failed")
+        return None
+
+
+def _cgroup_v2_ancestor_dirs(cgroup_path: str) -> list[str]:
+    """Every cgroup v2 directory from the process's own cgroup UP TO the
+    root, deepest first. Used to find the EFFECTIVE memory limit: a
+    cgroup's own `memory.max` may read "max" (unbounded) while an
+    ANCESTOR still caps it, so the effective limit is the MIN of every
+    numeric `memory.max` along this chain, not just the process's own
+    level."""
+    segments = [s for s in cgroup_path.split("/") if s]
+    dirs = []
+    for depth in range(len(segments), -1, -1):
+        sub = "/".join(segments[:depth])
+        dirs.append(f"{_CGROUP_V2_ROOT}/{sub}" if sub else _CGROUP_V2_ROOT)
+    return dirs
+
+
+def _cgroup_v2_memory_headroom_bytes() -> float | None:
+    """cgroup v2 memory headroom for the CALLING PROCESS's own cgroup
+    (`effective_memory.max - memory.current`), resolved via `/proc/self/
+    cgroup` (see `_read_proc_self_cgroup_v2_path`) rather than the fixed
+    cgroup2 root — the root has no `memory.max`/`memory.current` of its
+    own, so a root-only read can never see a real per-process cap.
+
+    The effective limit WALKS UP the chain from the process's own cgroup
+    to the root (`_cgroup_v2_ancestor_dirs`), taking the MIN of every
+    numeric `memory.max` seen (skipping "max" and any level whose file is
+    absent — an ancestor may not expose the controller file at all),
+    since an ancestor can cap memory even when the process's own cgroup
+    reads "max". Usage is read from the process's OWN cgroup only.
+
+    Returns `None` (never a fabricated headroom) when: not Linux,
+    `/proc/self/cgroup` is missing/unparsable, every `memory.max` on the
+    chain is "max"/absent (no cap anywhere -> no need to even read
+    usage), the process's own `memory.current` is missing/unparsable, or
+    any other read/parse error (logged, then degrades to `None`) — every
+    `None` case means "caller falls back to the next source", never
+    "unlimited"."""
+    if sys.platform != "linux":
+        return None
+
+    cgroup_path = _read_proc_self_cgroup_v2_path()
+    if cgroup_path is None:
+        return None
+    dirs = _cgroup_v2_ancestor_dirs(cgroup_path)
+
+    effective_limit: float | None = None
+    for cgroup_dir in dirs:
+        try:
+            with open(f"{cgroup_dir}/memory.max", encoding="utf-8") as f:
+                max_raw = f.read().strip()
+        except FileNotFoundError:
+            continue  # this level exposes no memory controller -> no cap here, keep walking
+        except Exception:  # noqa: BLE001 — fail-soft
+            log.exception("reranker: cgroup v2 memory.max read failed")
+            return None
+
+        if max_raw == "max":
+            continue  # explicitly unbounded at this level -> keep walking up
+
+        try:
+            level_limit = float(max_raw)
+        except Exception:  # noqa: BLE001 — fail-soft
+            log.exception("reranker: cgroup v2 memory.max parse failed")
+            return None
+        effective_limit = level_limit if effective_limit is None else min(effective_limit, level_limit)
+
+    if effective_limit is None:
+        return None  # no numeric cap anywhere on the chain -> caller falls back
+
+    try:
+        with open(f"{dirs[0]}/memory.current", encoding="utf-8") as f:
+            usage = float(f.read().strip())
+    except FileNotFoundError:
+        return None  # process's own cgroup exposes no memory controller
+    except Exception:  # noqa: BLE001 — fail-soft
+        log.exception("reranker: cgroup v2 memory.current read/parse failed")
+        return None
+    return max(0.0, effective_limit - usage)
+
+
+def _read_proc_self_cgroup_v1_memory_path() -> str | None:
+    """The CALLING PROCESS's own cgroup v1 path for the `memory`
+    controller, from `/proc/self/cgroup`'s `N:<controllers>:/<path>`
+    lines (`controllers` is a comma-separated list on a combined
+    hierarchy, e.g. `cpu,memory`). Returns the path with leading/
+    trailing slashes stripped (empty string for the v1 memory root), or
+    `None` on any read/parse failure or if no line lists `memory`."""
+    try:
+        with open("/proc/self/cgroup", encoding="utf-8") as f:
+            content = f.read()
+        for raw_line in content.splitlines():
+            parts = raw_line.strip().split(":", 2)
+            if len(parts) != 3:
+                continue
+            _hierarchy_id, controllers, path = parts
+            if "memory" in controllers.split(","):
+                return path.strip("/")
+        return None  # no v1 memory controller line present
+    except FileNotFoundError:
+        return None
+    except Exception:  # noqa: BLE001 — fail-soft: a headroom probe must never break a recall
+        log.exception("reranker: /proc/self/cgroup (v1) read failed")
+        return None
+
+
+def _cgroup_v1_memory_headroom_bytes() -> float | None:
+    """cgroup v1 fallback for `_cgroup_v2_memory_headroom_bytes` (older
+    kernels/distros without the unified v2 hierarchy): `memory.limit_in_
+    bytes - memory.usage_in_bytes` read from the CALLING PROCESS's own
+    cgroup path, resolved via `/proc/self/cgroup`'s `memory` controller
+    line (`_read_proc_self_cgroup_v1_memory_path`) rather than the fixed
+    `/sys/fs/cgroup/memory/` root. v1's limit is already hierarchical (a
+    child's own `memory.limit_in_bytes` reflects any ancestor cap), so —
+    unlike v2 — no walk-up is needed here; the process's own path is
+    always the right one to read.
+
+    An unbounded v1 limit reads back as the kernel's own huge sentinel
+    value (there is no explicit "unbounded" marker like v2's `"max"`); a
+    limit at or above `_CGROUP_V1_UNBOUNDED_SENTINEL` is treated as
+    unbounded -> `None`, the same "caller falls back" signal as every
+    other case here. Same fail-soft posture as the v2 reader: `None` on
+    no v1 controller, unreadable, or unparsable — never a fabricated
+    headroom."""
+    if sys.platform != "linux":
+        return None
+
+    cgroup_path = _read_proc_self_cgroup_v1_memory_path()
+    if cgroup_path is None:
+        return None
+    cgroup_dir = f"/sys/fs/cgroup/memory/{cgroup_path}" if cgroup_path else "/sys/fs/cgroup/memory"
+
+    try:
+        with open(f"{cgroup_dir}/memory.limit_in_bytes", encoding="utf-8") as f:
+            limit = float(f.read().strip())
+    except FileNotFoundError:
+        return None  # no v1 memory controller for this process's cgroup
+    except Exception:  # noqa: BLE001 — fail-soft
+        log.exception("reranker: cgroup v1 memory.limit_in_bytes read failed")
+        return None
+
+    if limit >= _CGROUP_V1_UNBOUNDED_SENTINEL:
+        return None  # kernel's "no limit" sentinel -> caller falls back, never treated as unlimited
+
+    try:
+        with open(f"{cgroup_dir}/memory.usage_in_bytes", encoding="utf-8") as f:
+            usage = float(f.read().strip())
+    except Exception:  # noqa: BLE001 — fail-soft
+        log.exception("reranker: cgroup v1 memory.usage_in_bytes read failed")
+        return None
+    return max(0.0, limit - usage)
+
+
+def _proc_meminfo_available_bytes() -> float | None:
+    """Plain host free-memory fallback: `/proc/meminfo`'s `MemAvailable`
+    line (kernel-computed "usable without swapping" estimate) — used only
+    when no cgroup memory limit applies (see `_available_ram_headroom_
+    bytes`). Same `_detect_avx2`-shaped fail-soft posture: `None` on
+    non-Linux or any read/parse error, never a fabricated figure."""
+    if sys.platform != "linux":
+        return None
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return float(line.split()[1]) * 1024.0
+        return None
+    except Exception:  # noqa: BLE001 — fail-soft: a headroom probe must never break a recall
+        log.exception("reranker: /proc/meminfo read failed")
+        return None
+
+
+def _available_ram_headroom_bytes() -> float | None:
+    """Cheap, per-call RAM-headroom read for `get_rerank_width`'s memory
+    bound — cadence is a fresh read on every call (not cached like the
+    per-doc TIME/MEMORY figures above), since this is inexpensive (a
+    handful of small `/proc`-or-`/sys` reads) and lets width react to
+    headroom changes mid-session (another process on the box growing), the
+    same trade-off the spec's own Open Reconfirmation favors absent a
+    concrete reason not to.
+
+    cgroup-limit-aware, per the pre-flip revision's Change-3 requirement:
+    Testing's own OOM reproduction ran under an explicit cgroup cap that
+    the host's plain `/proc/meminfo` free-memory reading does NOT reflect,
+    so a host-only read would fail to prevent the exact OOM this change
+    fixes. Tries cgroup v2 first, then v1, then falls back to the host-wide
+    `/proc/meminfo` reading only when no cgroup limit applies (or it's
+    explicitly unbounded). Returns `None` — never a fabricated number —
+    when every source is unavailable/unsupported/errors; `get_rerank_width`
+    treats `None` as "skip the memory term", never as "unlimited
+    headroom"."""
+    headroom = _cgroup_v2_memory_headroom_bytes()
+    if headroom is None:
+        headroom = _cgroup_v1_memory_headroom_bytes()
+    if headroom is None:
+        headroom = _proc_meminfo_available_bytes()
+    return headroom
+
+
 def get_rerank_width(
     pool_size: int,
     provider: RerankerProvider,
@@ -524,12 +904,26 @@ def get_rerank_width(
     """How many of the (cosine-coarse-cut) candidate pool to actually rerank.
 
     `= max(1, min(pool_size, CANDIDATE_POOL, floor(LATENCY_BUDGET_SECONDS /
-    warm_per_doc)))` — the spec's formula exactly. On fast (AVX2) hardware
-    the measured per-doc latency is small, so the budget allows a wide
-    rerank; on slow (no-AVX2) hardware it narrows automatically, staying
-    within budget. An auto-scaler computing a width under 50 on a slow host
-    is intended (not a violation) — the whole point is that the count
-    adapts to the host, not to a fixed target.
+    per_doc_TIME), floor(available_RAM_headroom / per_doc_MEMORY)))` — the
+    pre-flip revision's Change 3 formula: the original time-only bound plus
+    a MEMORY bound as an additional `min()` term. On fast (AVX2), spacious
+    hardware the measured per-doc latency and memory cost are both small
+    relative to budget/headroom, so both bounds allow a wide rerank; on slow
+    and/or RAM-tight hardware either (or both) narrows automatically,
+    staying within budget AND within a safe memory ceiling — the fp16
+    natural-width OOM (extra speed poured into a wider width with no memory
+    check) is exactly the case a time-only bound could never catch. An
+    auto-scaler computing a width under 50 on a constrained host is intended
+    (not a violation) — the whole point is that the count adapts to the
+    host, not to a fixed target.
+
+    The memory bound is SKIPPED (formula degrades to exactly the pre-
+    Change-3 time-only bound) whenever either input is unavailable: `per_doc
+    _MEMORY <= 0.0` (no measured signal — mirrors `per_doc_TIME`'s identical
+    0.0-means-"don't throttle by it" contract) or `available_RAM_headroom is
+    None` (the cheap per-call read found no usable source — see
+    `_available_ram_headroom_bytes`). This never assumes unlimited headroom;
+    it only ever narrows width when it has a genuine measured reason to.
 
     `sample_documents` (#231-fix): a small sample of REAL candidate-pool
     document content (see `CALIBRATION_SAMPLE_SIZE`), used to calibrate
@@ -539,7 +933,8 @@ def get_rerank_width(
     always computed a budget far in excess of `CANDIDATE_POOL`, so the min()
     always picked `CANDIDATE_POOL` regardless of true per-doc cost). Optional
     and purely additive: omitting it (or an empty list) falls back to the
-    original fixed-placeholder calibration, unchanged.
+    original fixed-placeholder calibration, unchanged. The same sample feeds
+    BOTH the time and memory measurements.
 
     `pool_size <= 0` returns 0 (nothing to rerank — the caller's empty-pool
     case never reaches here in practice, but this stays well-defined).
@@ -547,55 +942,47 @@ def get_rerank_width(
     if pool_size <= 0:
         return 0
     budget = tunables.get_tunable("reranker.latency_budget_seconds", LATENCY_BUDGET_SECONDS)
-    per_doc = _warm_per_doc_latency(provider, sample_documents)
-    if per_doc <= 0.0:
-        width = pool_size
+    per_doc_time = _warm_per_doc_latency(provider, sample_documents)
+    if per_doc_time <= 0.0:
+        time_width = pool_size
     else:
-        width = math.floor(budget / per_doc)
-    return max(1, min(pool_size, CANDIDATE_POOL, width))
+        time_width = math.floor(budget / per_doc_time)
+
+    bounds = [pool_size, CANDIDATE_POOL, time_width]
+
+    per_doc_memory = _warm_per_doc_memory(provider, sample_documents)
+    headroom = _available_ram_headroom_bytes()
+    if per_doc_memory > 0.0 and headroom is not None:
+        bounds.append(math.floor(headroom / per_doc_memory))
+
+    return max(1, min(bounds))
 
 
 # ---------------------------------------------------------------------------
-# fp16-vs-fp32 accuracy self-check (F2a inc2, #250 §2): a cached, first-use,
-# on-box check that decides whether production serves the jina reranker's
-# fp16 export or stays on fp32 — mirrors the warm-latency auto-calibration
-# above (measured once, cached, not per-recall), not a GH-Actions
-# release-pipeline step (see the ledger's FORK 2 resolution: fp16-vs-fp32
-# agreement is a property of the BUNDLED model, computable anywhere, so
-# first-use is as valid as a release-time gate, and first-use additionally
-# covers `uv run` source installs the release pipeline never touches, and
-# lets the check confirm fp16 is genuinely faster on THIS box before
-# preferring it — a no-AVX2 potato CPU may not accelerate fp16).
+# Bundled representative (query, doc) pairs (F2a inc2, #250 §2 origin).
+#
+# Originally fed a cached first-use fp16-vs-fp32 accuracy self-check that
+# lived in this module — REMOVED by the pre-flip revision's Change 2 (a
+# confirmed ~1.16 GiB one-time dual-load memory spike; fp16-vs-fp32
+# agreement is a property of the bundled model weights, proven by Testing's
+# matched-width A/B, so no per-box runtime probe is needed to establish it
+# — see `RERANKER_PRECISION` above). `_FP16_GATE_PAIRS` itself SURVIVES:
+# `floor_calibration.py`'s cold-start and bootstrap floor derivation
+# (`_cold_start_pairs` / `get_bootstrap_floor`) still score this same
+# bundled set when no real corpus-derived pairs are available yet — that
+# consumer is untouched by Change 2.
 # ---------------------------------------------------------------------------
 
-# Small BUNDLED representative (query, doc) pairs for the self-check below
-# (bundled because a fresh install has no corpus yet to draw pairs from —
-# fp16-vs-fp32 agreement is a property of the MODEL, not of any one corpus,
-# per §2). The first 3 + next 3 pairs are the genuine/decoy set
-# tests/unit/brain/memory/test_reranker_real_model.py already carries
-# (itself reused from #88/test_search_memories_mode.py) — the closest
-# existing checked-in "representative pair set" the spec's open
-# reconfirmation says to reuse if one exists. The last 4 are additional
-# borderline/weakly-related pairs (topically adjacent but not a direct
-# match) added for the diversity that same reconfirmation calls for
-# ("diverse relevant/irrelevant/borderline cases, not an arbitrary
-# handful"). This set is NOT used to derive a relevance floor itself (that
-# is `floor_calibration.py`'s job, F2a §7) — only to compare fp16 against
-# fp32 on the SAME comparison bar: `fp32_model_id`'s CALIBRATED floor
-# (`store.get_reranker_floor`, read live inside `_run_precision_selfcheck`,
-# never copied/pinned here — F2a inc8, #250 §7/§8 cutover, replacing the
-# old MiniLM-scaled `semantic_recall.RERANK_FLOOR` constant this comment
-# used to reference). The decision itself is cached in
-# `_precision_decision_cache` keyed ONLY on `(fp32_model_id, fp16_model_id)`,
-# not on the floor value, so once a decision is cached it does NOT
-# re-evaluate when the calibrated floor changes later in the same process.
-# The daily calibration tick, after it writes a new floor, calls
-# `reranker.reset_precision_decision_for_floor_change()` (F2a inc7) so the
-# next `build_reranker_provider()` call re-runs this self-check under the
-# sharpened floor (bounded to once a day, off the hot path). Do not key the
-# cache on the floor float itself: EMA drift would then force a costly
-# re-run, a second real ONNX load of both exports, on most days, defeating
-# the one-time-cost design.
+# Small BUNDLED representative (query, doc) pairs (bundled because a fresh
+# install has no corpus yet to draw pairs from). The first 3 + next 3 pairs
+# are the genuine/decoy set tests/unit/brain/memory/test_reranker_real_
+# model.py already carries (itself reused from #88/test_search_memories_
+# mode.py) — the closest existing checked-in "representative pair set" the
+# original F2a §2 spec's open reconfirmation said to reuse if one exists.
+# The last 4 are additional borderline/weakly-related pairs (topically
+# adjacent but not a direct match) added for the diversity that same
+# reconfirmation called for ("diverse relevant/irrelevant/borderline cases,
+# not an arbitrary handful").
 _FP16_GATE_PAIRS: list[tuple[str, str]] = [
     # genuine (clearly relevant)
     (
@@ -631,17 +1018,6 @@ _FP16_GATE_PAIRS: list[tuple[str, str]] = [
     ("quiet evening", "the kitchen sink has been leaking for a week"),
 ]
 
-# model_id -> chosen model_id ("fp32" or "fp16" candidate id, whichever the
-# self-check decided). Keyed by the (fp32_model_id, fp16_model_id) PAIR, not
-# a single id, so a model swap on EITHER side (a mini-model registration
-# change per model_tier.py's own caveat comment) invalidates the cached
-# decision automatically rather than serving a stale one. Process-wide,
-# mirrors `_latency_cache` above — but unlike that cache this one is NOT
-# periodically recomputed: the spec frames this as a one-time first-use
-# cost for the life of the process, not a recurring measurement.
-_precision_decision_cache: dict[tuple[str, str], str] = {}
-_precision_decision_cache_lock = threading.Lock()
-
 
 def _register_fp16_reranker_model(fp16_model_id: str, hf_repo: str) -> None:
     """Idempotently register the jina fp16 onnx export with fastembed's
@@ -655,8 +1031,10 @@ def _register_fp16_reranker_model(fp16_model_id: str, hf_repo: str) -> None:
     Registration is metadata-only (no network, no download — the download
     happens lazily on the registered model's first real `rerank()` call,
     same as the fp32 model). Guarded against `add_custom_model`'s own
-    "already registered" `ValueError` so a second self-check in the same
-    process (or a test re-running this) is a no-op, not a crash.
+    "already registered" `ValueError` so a second call in the same process
+    (e.g. `build_reranker_provider`'s pinned-fp16 default resolving again
+    after a provider-cache reset, or a test re-running this) is a no-op,
+    not a crash.
     """
     from fastembed.common.model_description import ModelSource
     from fastembed.rerank.cross_encoder.text_cross_encoder import TextCrossEncoder
@@ -668,214 +1046,7 @@ def _register_fp16_reranker_model(fp16_model_id: str, hf_repo: str) -> None:
         model=fp16_model_id,
         sources=ModelSource(hf=hf_repo),
         model_file="onnx/model_fp16.onnx",
-        description="fp16 export of jina-reranker-v2-base-multilingual, for the F2a fp16/fp32 accuracy self-check (#250)",
+        description="fp16 export of jina-reranker-v2-base-multilingual, the pinned default reranker precision (#250, pre-flip revision Change 2)",
         license="cc-by-nc-4.0",
         size_in_gb=0.56,
     )
-
-
-def _run_precision_selfcheck(
-    fp32_model_id: str, fp16_model_id: str, cache_dir: str | Path, *, store: MemoryStore | None = None
-) -> str:
-    """The actual (uncached — see `_choose_reranker_model_id`) fp16-vs-fp32
-    self-check: registers the fp16 export, loads both it and fp32, tests
-    surface/abstain DECISION agreement on `_FP16_GATE_PAIRS` against the
-    live CALIBRATED floor for `fp32_model_id` (F2a inc8, #250 §7/§8 cutover
-    — replaces the deleted `semantic_recall.RERANK_FLOOR` constant this
-    used to import), and — only on full agreement AND a measured fp16 speed
-    win on this host — returns `fp16_model_id`. Returns `fp32_model_id` in
-    every other case, INCLUDING any failure along the way (fail-soft: fp32
-    is always the safe default; this must never raise into a recall).
-
-    The comparison bar is `fp32_model_id`'s calibrated floor specifically —
-    fp32 is the spec's designated REFERENCE precision (§2: "fp32 is the
-    reference, no external labels needed"), so its floor is the one stable
-    scale to judge fp16's agreement against, independent of which precision
-    this very check ends up shipping. `store is None` means there is no way
-    to read ANY floor at all -> short-circuits straight to the existing
-    "insufficient information -> ship the safe default" branch (same
-    posture as every other fail-soft branch below: a registration failure,
-    a load failure, ANY exception), skipping the fp16 registration/
-    construction entirely (no ONNX load wasted on a comparison that would
-    be meaningless anyway). `calibrated_floor is None` with a real `store`
-    given is now the RARE case (F2a inc8, #250 §7 UPDATED): `store.
-    get_reranker_floor(fp32_model_id)` serves a derived bootstrap floor even
-    when the daily tick has never fired for `fp32_model_id`, so the day-0
-    self-check now runs its REAL comparison against that bootstrap instead
-    of short-circuiting here — this branch fires only if the bootstrap
-    computation itself failed (a reranker load/fit error), the bootstrap's
-    own fail-soft path.
-
-    ANY single flipped keep/drop decision fails the gate (mechanical bar,
-    not an arbitrary loss percentage — per §2's "principled,
-    behavior-preserving" bar and its open reconfirmation that the number
-    must not be picked ad hoc).
-
-    Whichever provider(s) this function actually constructs get stashed
-    into the process-wide provider cache (`_cache_provider`) under their
-    own model_id, so the ONE that wins is already warm (its ONNX session
-    already loaded via the `.rerank()` calls below) by the time
-    `build_reranker_provider` goes to construct it — the real, non-trivial
-    load cost is paid exactly once, not twice, for the winning model.
-    """
-    if store is None:
-        log.info(
-            "reranker fp16/fp32 gate: no store to read a calibrated floor from -> shipping fp32"
-        )
-        return fp32_model_id
-    calibrated_floor = store.get_reranker_floor(fp32_model_id)
-    if calibrated_floor is None:
-        log.info(
-            "reranker fp16/fp32 gate: no calibrated floor yet for %s (daily tick has not "
-            "derived one) -> shipping fp32 pending the first calibration",
-            fp32_model_id,
-        )
-        return fp32_model_id
-
-    try:
-        _register_fp16_reranker_model(fp16_model_id, fp32_model_id)
-    except Exception:  # noqa: BLE001 — fail-soft: registration failure must not break recall
-        log.exception("reranker fp16/fp32 gate: failed to register the fp16 export -> shipping fp32")
-        return fp32_model_id
-
-    fp32_provider: CrossEncoderProvider | None = None
-    try:
-        fp32_provider = CrossEncoderProvider(model_id=fp32_model_id, cache_dir=cache_dir)
-        fp16_provider = CrossEncoderProvider(model_id=fp16_model_id, cache_dir=cache_dir)
-    except Exception:  # noqa: BLE001 — fail-soft: fp16 (or even fp32) construction failure must not break recall
-        log.exception("reranker fp16/fp32 gate: failed to construct a provider -> shipping fp32")
-        if fp32_provider is not None:
-            # fp32 built fine and only the fp16 construction failed below it;
-            # stash the already-built fp32 provider so build_reranker_provider()
-            # reuses it instead of paying for a redundant ONNX load.
-            _cache_provider(fp32_model_id, fp32_provider)
-        return fp32_model_id
-
-    try:
-        floor = calibrated_floor["floor"]
-        for query, doc in _FP16_GATE_PAIRS:
-            (fp32_score,) = fp32_provider.rerank(query, [doc])
-            (fp16_score,) = fp16_provider.rerank(query, [doc])
-            if (fp32_score >= floor) != (fp16_score >= floor):
-                log.info(
-                    "reranker fp16/fp32 gate: surface/abstain decision disagreement "
-                    "(fp32=%.4f fp16=%.4f floor=%.4f) on pair %r -> shipping fp32",
-                    fp32_score,
-                    fp16_score,
-                    floor,
-                    (query, doc),
-                )
-                _cache_provider(fp32_model_id, fp32_provider)
-                return fp32_model_id
-
-        # Agreement holds on every bundled pair. Before preferring fp16,
-        # confirm it is genuinely FASTER on THIS box (rationale iii, §2's
-        # FORK 2 resolution) — a no-AVX2 potato CPU may not accelerate fp16,
-        # and shipping it anyway would be a pure downside (same accuracy
-        # bar, no latency win). Reuses the SAME warm per-doc measurement the
-        # auto-scaling width calculation uses above, sampled against the
-        # bundled pairs' own documents (already-loaded content, no extra
-        # network).
-        sample_docs = [doc for _, doc in _FP16_GATE_PAIRS]
-        fp32_per_doc = _measure_warm_per_doc_latency(fp32_provider, sample_docs)
-        fp16_per_doc = _measure_warm_per_doc_latency(fp16_provider, sample_docs)
-
-        if fp16_per_doc < fp32_per_doc:
-            log.info(
-                "reranker fp16/fp32 gate: fp16 agrees with fp32 on every bundled decision and "
-                "measured faster on this host (%.4fs vs %.4fs/doc) -> shipping fp16",
-                fp16_per_doc,
-                fp32_per_doc,
-            )
-            _cache_provider(fp16_model_id, fp16_provider)
-            return fp16_model_id
-
-        log.info(
-            "reranker fp16/fp32 gate: decisions agree but fp16 was not faster on this host "
-            "(%.4fs vs %.4fs/doc) -> shipping fp32",
-            fp16_per_doc,
-            fp32_per_doc,
-        )
-        _cache_provider(fp32_model_id, fp32_provider)
-        return fp32_model_id
-    except Exception:  # noqa: BLE001 — fail-soft: any self-check failure must not break recall
-        log.exception("reranker fp16/fp32 gate: self-check failed -> shipping fp32")
-        return fp32_model_id
-
-
-def _choose_reranker_model_id(
-    fp32_model_id: str, fp16_model_id: str, cache_dir: str | Path, *, store: MemoryStore | None = None
-) -> str:
-    """Cached entry point for the fp16-vs-fp32 self-check: a cache HIT
-    returns instantly (`store` is never touched — the whole point of the
-    cache is to avoid a store round-trip on every recall); a cache MISS
-    runs `_run_precision_selfcheck` (real, potentially slow — first-use
-    ONNX loads of BOTH exports plus scoring — which is why it runs OUTSIDE
-    the lock, mirroring `_warm_per_doc_latency`'s identical reasoning: a
-    concurrent caller must not block behind this one-time cost) and caches
-    the result keyed by the `(fp32_model_id, fp16_model_id)` pair so either
-    model changing invalidates it. A rare race where two callers both miss
-    and both run the self-check pays the one-time cost twice in the worst
-    case, never more — `setdefault` on write means whichever finishes first
-    is the decision every later caller (and the other racer) actually gets.
-
-    `store`: F2a inc8 — passed through to `_run_precision_selfcheck` so it
-    can read the calibrated floor; see `build_reranker_provider`'s
-    docstring for the full rationale.
-    """
-    cache_key = (fp32_model_id, fp16_model_id)
-    with _precision_decision_cache_lock:
-        cached = _precision_decision_cache.get(cache_key)
-    if cached is not None:
-        return cached
-
-    decision = _run_precision_selfcheck(fp32_model_id, fp16_model_id, cache_dir, store=store)
-
-    with _precision_decision_cache_lock:
-        _precision_decision_cache.setdefault(cache_key, decision)
-        return _precision_decision_cache[cache_key]
-
-
-def _reset_precision_decision_cache() -> None:
-    """Test-only: clear the cached fp16-vs-fp32 decision."""
-    with _precision_decision_cache_lock:
-        _precision_decision_cache.clear()
-
-
-def reset_precision_decision_for_floor_change() -> None:
-    """PRODUCTION entry point (F2a inc7, #250 §7): call once, immediately
-    after the daily calibration tick (re-)derives and WRITES a new floor
-    (`floor_calibration.derive_and_persist_floor` returning an ACCEPTED
-    outcome) — from `brain.bridge.supervisor._run_calibration_tick`.
-
-    Clears BOTH the cached fp16-vs-fp32 precision decision
-    (`_precision_decision_cache`) AND the process-wide reranker provider
-    cache (`_provider_cache`). Clearing the decision cache alone is not
-    enough to GUARANTEE a genuine rebuild: `_run_precision_selfcheck`
-    caches its winning provider via `_cache_provider`'s `setdefault`, which
-    silently keeps whatever provider ALREADY sits under that model_id's key
-    — so if today's re-run's winning model_id was ALSO the winner at some
-    EARLIER point in this process's life (e.g. day-0's vacuous agreement
-    picked fp16, a later floor picks fp32, and a LATER-STILL floor picks
-    fp16 again), `build_reranker_provider()` would silently hand back the
-    STALE day-0 provider instance instead of the one the just-rerun
-    self-check actually built — same model_id, so functionally identical
-    for a real ONNX model, but not what "re-run the self-check" is supposed
-    to guarantee, and not something to rely on staying harmless. Clearing
-    `_provider_cache` too forces a genuine fresh construction for whichever
-    model_id wins this re-run, no matter its history.
-
-    Reuses the existing test-only reset hooks (`_reset_precision_decision_
-    cache` / `_reset_reranker_provider_cache`) rather than duplicating their
-    logic — those stay test-only in their own right (conftest.py's autouse
-    fixture calls them directly around every test); this function is the
-    one PRODUCTION call site, bounded to fire at most once per daily
-    calibration tick (I6), never on the per-turn hot path. Do NOT call this
-    from anywhere that keys off the floor FLOAT value itself (e.g. on every
-    EMA-smoothed update) — only on an ACCEPTED floor WRITE — or EMA drift
-    would force a costly re-run (a second real ONNX load of both exports)
-    on most days, defeating §2's one-time-cost design (spec Section 7's own
-    implementation constraint).
-    """
-    _reset_precision_decision_cache()
-    _reset_reranker_provider_cache()

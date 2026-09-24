@@ -132,10 +132,11 @@ MODEL_EMBEDDING_DIM = 1024
 # fp32 .onnx file (additional_files: []), ~1.11GB, so it needs NO
 # materialize-files workaround (unlike F1's multilingual-e5-large, which
 # hits the onnxruntime external-data-path bug because it ships sharded
-# external weights). fp16 export (~2x faster) is a LATER increment, gated
-# on a build-time fp16-vs-fp32 accuracy check — this fp32 default is
-# increment 1 only. Score type: raw, unbounded logit (same shape as the
-# outgoing ms-marco score, but a DIFFERENT SCALE) — AS OF THIS commit (inc1)
+# external weights). fp16 export (~2x faster) is a LATER increment — see
+# MODEL_RERANKER_FP16 below, now the PINNED default per the pre-flip
+# revision's Change 2 (this constant, MODEL_RERANKER, is the fp32 fallback
+# an operator override can still select). Score type: raw, unbounded logit
+# (same shape as the outgoing ms-marco score, but a DIFFERENT SCALE) — AS OF THIS commit (inc1)
 # the abstention floor was still the old hardcoded MiniLM-scaled constant, a
 # known/expected scale mismatch; F2a's later increments replace it with a
 # floor derived daily against jina's own scale (§7) and cut every consumer
@@ -144,25 +145,30 @@ MODEL_EMBEDDING_DIM = 1024
 # non-commercial project.
 MODEL_RERANKER = "jinaai/jina-reranker-v2-base-multilingual"  # ONNX cross-encoder, ~1.11GB fp32, via fastembed
 
-# fp16 export of the SAME model (F2a inc2, #250 §2) — the HF repo above also
-# ships onnx/model_fp16.onnx (~557MB, confirmed present on the repo), but it
-# is NOT pre-registered in fastembed's built-in TextCrossEncoder registry
-# (only the fp32 onnx/model.onnx export above is). brain/memory/reranker.py
-# registers this id via TextCrossEncoder.add_custom_model() pointing at that
-# file, then uses it ONLY as the fp16 candidate in a cached first-use
-# fp16-vs-fp32 accuracy self-check (mirrors reranker.py's existing warm
-# per-doc latency auto-calibration: measured once, cached, not
-# per-recall) — never read directly via model_for_tier/TIER_MODEL, so it
-# stays a plain companion constant here rather than its own tier (same
-# non-tier treatment MODEL_EMBEDDING_DIM gets above). The self-check
-# decides, per box, whether production actually serves this fp16 export or
-# falls back to MODEL_RERANKER's fp32 export — either the fp16 export fails
-# to preserve fp32's surface/abstain decisions on the bundled representative
-# pairs, or it does but isn't measurably faster on this host (a no-AVX2
-# potato CPU may not accelerate fp16), and fp32 stays the safe default in
-# both cases. 8-bit quantization was explicitly ruled out (a 278M model has
-# less redundancy to absorb an 8-bit accuracy hit than a larger model
-# would); fp16 is the one quantization lever here.
+# fp16 export of the SAME model (F2a inc2, #250 §2 origin) — the HF repo
+# above also ships onnx/model_fp16.onnx (~557MB, confirmed present on the
+# repo), but it is NOT pre-registered in fastembed's built-in
+# TextCrossEncoder registry (only the fp32 onnx/model.onnx export above
+# is). brain/memory/reranker.py registers this id via TextCrossEncoder.
+# add_custom_model() pointing at that file — never read directly via
+# model_for_tier/TIER_MODEL, so it stays a plain companion constant here
+# rather than its own tier (same non-tier treatment MODEL_EMBEDDING_DIM
+# gets above).
+#
+# ORIGINALLY (F2a inc2) gated behind a cached first-use fp16-vs-fp32
+# accuracy self-check in reranker.py. The pre-flip revision's Change 2
+# REMOVED that self-check entirely (a confirmed ~1.16 GiB one-time
+# dual-load startup memory spike) and made this id the PINNED default
+# instead: Testing's matched-width A/B reproduced fp32's surface/abstain
+# decisions on all 40 bundled queries, so fp16-vs-fp32 agreement is a
+# property of the bundled model weights (identical on every box), not
+# something a per-box runtime probe needs to establish. `reranker.
+# RERANKER_PRECISION`'s tunable default resolves to this id;
+# `reranker.build_reranker_provider()` resolves back to MODEL_RERANKER
+# (fp32) only on an explicit "reranker.precision"="fp32" operator override.
+# 8-bit quantization was explicitly ruled out (a 278M model has less
+# redundancy to absorb an 8-bit accuracy hit than a larger model would);
+# fp16 is the one quantization lever here.
 MODEL_RERANKER_FP16 = "jinaai/jina-reranker-v2-base-multilingual-fp16"
 
 # MODEL_RELEVANCE_JUDGE is also not a Claude model — it's the offline local

@@ -2601,6 +2601,99 @@ def test_labeled_calibration_pairs_empty_when_nothing_logged(store: MemoryStore)
 
 
 # ---------------------------------------------------------------------------
+# Pre-flip revision Change 1 ("nimble floor"): `labeled_calibration_pairs`
+# is now day-scoped to the MOST RECENTLY COMPLETED DAY (MAX `day_bucket`
+# among this model_id's own usable labeled rows), not the full retention
+# window pooled. See that method's own docstring for the exact boundary.
+# ---------------------------------------------------------------------------
+
+
+def _seed_and_label_row(
+    store: MemoryStore, *, query: str, score: float, label: str, model_id: str, day_bucket: str
+) -> None:
+    """Seed one already-labeled calibration_log row directly on a SPECIFIC
+    `day_bucket` (bypassing log_calibration_sample, which always stamps
+    the column's own `strftime('%Y-%m-%d','now')` default — these tests
+    need to control which day a row lands on)."""
+    store._conn.execute(
+        "INSERT INTO calibration_log "
+        "(day_bucket, query, candidate_ids, reranker_scores, reranker_model_id, "
+        "local_judge_label, haiku_label) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            day_bucket, query, json.dumps(["c"]), json.dumps([score]), model_id,
+            json.dumps([label]), json.dumps([None]),
+        ),
+    )
+    store._conn.commit()
+
+
+def test_labeled_calibration_pairs_reads_only_the_most_recent_day(store: MemoryStore) -> None:
+    """Acceptance #2 ("Day-only read"): with rows on three distinct days
+    for the same model_id, only the LATEST day_bucket's pairs are
+    returned — an earlier day's clearly-distinguishable score must never
+    leak into the result."""
+    _seed_and_label_row(store, query="q1", score=1.0, label="relevant", model_id="m", day_bucket="2026-01-01")
+    _seed_and_label_row(store, query="q2", score=2.0, label="relevant", model_id="m", day_bucket="2026-01-02")
+    _seed_and_label_row(store, query="q3", score=3.0, label="relevant", model_id="m", day_bucket="2026-01-03")
+
+    pairs = store.labeled_calibration_pairs("m")
+
+    assert pairs == [(3.0, "relevant")], (
+        "must read ONLY the latest day_bucket's row — the two earlier days' scores must not appear"
+    )
+
+
+def test_labeled_calibration_pairs_day_scope_is_independent_of_insertion_order(
+    store: MemoryStore,
+) -> None:
+    """The day boundary is the MAX day_bucket VALUE, not insertion order —
+    inserting the later-dated row FIRST must not change which day wins."""
+    _seed_and_label_row(store, query="q-late", score=9.0, label="relevant", model_id="m", day_bucket="2026-02-05")
+    _seed_and_label_row(store, query="q-early", score=1.0, label="irrelevant", model_id="m", day_bucket="2026-02-01")
+
+    pairs = store.labeled_calibration_pairs("m")
+
+    assert pairs == [(9.0, "relevant")]
+
+
+def test_labeled_calibration_pairs_day_scope_is_per_reranker_model_id(store: MemoryStore) -> None:
+    """Two different model_ids each have their OWN "most recent day" —
+    model-x's latest day must not be influenced by model-y's rows, even
+    when model-y's own latest day is chronologically later."""
+    _seed_and_label_row(store, query="qx1", score=1.0, label="relevant", model_id="model-x", day_bucket="2026-03-01")
+    _seed_and_label_row(store, query="qx2", score=2.0, label="relevant", model_id="model-x", day_bucket="2026-03-02")
+    _seed_and_label_row(store, query="qy", score=99.0, label="relevant", model_id="model-y", day_bucket="2026-03-10")
+
+    assert store.labeled_calibration_pairs("model-x") == [(2.0, "relevant")]
+    assert store.labeled_calibration_pairs("model-y") == [(99.0, "relevant")]
+
+
+def test_labeled_calibration_pairs_day_scope_ignores_unlabeled_rows_on_a_later_day(
+    store: MemoryStore,
+) -> None:
+    """A later day_bucket that has ROWS but none of them LABELED yet
+    (judge-labeling lags behind logging) must not shadow the latest day
+    that DOES have usable labeled pairs — the MAX is taken over usable
+    (labeled, correctly-scaled) rows, not over every logged row."""
+    _seed_and_label_row(store, query="q-labeled", score=5.0, label="relevant", model_id="m", day_bucket="2026-04-01")
+    # A later day's row exists but is UNLABELED (local_judge_label IS NULL).
+    store.log_calibration_sample(
+        query="q-unlabeled", candidate_ids=["c2"], reranker_scores=[7.0], reranker_model_id="m"
+    )
+    store._conn.execute(
+        "UPDATE calibration_log SET day_bucket = ? WHERE query = ?", ("2026-04-09", "q-unlabeled")
+    )
+    store._conn.commit()
+
+    pairs = store.labeled_calibration_pairs("m")
+
+    assert pairs == [(5.0, "relevant")], (
+        "the unlabeled later-day row must not shadow the latest day that actually has usable pairs"
+    )
+
+
+# ---------------------------------------------------------------------------
 # F2a (#250 inc7): reranker_floor_calibration table + get/write_reranker_floor
 # (spec Section 7 — the calibrated abstention floor's persistence, I1).
 # ---------------------------------------------------------------------------
@@ -2674,6 +2767,60 @@ def test_get_reranker_floor_persisted_row_supersedes_a_warm_bootstrap_cache(
     )
     assert persisted["is_cold_start"] is False
     assert persisted["sample_pairs"] == 999
+
+
+def test_get_persisted_reranker_floor_returns_none_on_a_miss_never_the_bootstrap(
+    monkeypatch: pytest.MonkeyPatch, store: MemoryStore
+) -> None:
+    """Pre-flip revision Change 1: `get_persisted_reranker_floor` is the
+    persisted-ONLY half `get_reranker_floor` was refactored to share with
+    `derive_and_persist_floor`'s data-starvation backstop — it must return
+    `None` on a miss, even when a bootstrap floor IS servable (and gets
+    cached) for the same model_id via the ordinary `get_reranker_floor`."""
+    from brain.memory import floor_calibration
+    from brain.memory.reranker import _FP16_GATE_PAIRS, FakeRerankerProvider
+
+    floor_calibration._reset_bootstrap_floor_cache()
+    scores_by_doc = {doc: (5.0 if i < 3 else -5.0) for i, (_q, doc) in enumerate(_FP16_GATE_PAIRS[:6])}
+    monkeypatch.setattr(
+        "brain.memory.reranker._bootstrap_reranker_provider",
+        lambda model_id: FakeRerankerProvider(scores=scores_by_doc),
+    )
+
+    assert store.get_persisted_reranker_floor("no-row-model") is None
+
+    # Confirm the bootstrap IS servable for this same model_id via the
+    # ordinary get_reranker_floor — proving the None above is specifically
+    # about "no PERSISTED row", not "no floor at all".
+    bootstrap = store.get_reranker_floor("no-row-model")
+    assert bootstrap is not None
+    assert store.get_persisted_reranker_floor("no-row-model") is None, (
+        "a warm bootstrap cache for this model_id must not leak into the persisted-only read"
+    )
+
+
+def test_get_persisted_reranker_floor_returns_the_row_when_one_exists(store: MemoryStore) -> None:
+    store.write_reranker_floor(
+        "model-a", floor=1.5, raw_fit_floor=1.25, sample_pairs=250, is_cold_start=False
+    )
+    result = store.get_persisted_reranker_floor("model-a")
+    assert result is not None
+    assert result["floor"] == 1.5
+    assert result["raw_fit_floor"] == 1.25
+    assert result["sample_pairs"] == 250
+    assert result["is_cold_start"] is False
+
+
+def test_get_reranker_floor_delegates_persisted_case_to_get_persisted_reranker_floor(
+    store: MemoryStore,
+) -> None:
+    """The refactor (Change 1) must not change `get_reranker_floor`'s own
+    persisted-row behavior — it now just reads through `get_persisted_
+    reranker_floor` first, same values either way."""
+    store.write_reranker_floor(
+        "model-a", floor=1.5, raw_fit_floor=1.25, sample_pairs=250, is_cold_start=False
+    )
+    assert store.get_reranker_floor("model-a") == store.get_persisted_reranker_floor("model-a")
 
 
 def test_write_reranker_floor_round_trips(store: MemoryStore) -> None:

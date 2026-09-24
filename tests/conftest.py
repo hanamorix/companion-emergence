@@ -260,23 +260,24 @@ def _fake_reranker_provider_by_default(
 @pytest.fixture(autouse=True)
 def _reset_reranker_provider_cache() -> Iterator[None]:
     """Reset reranker.build_reranker_provider()'s process-level provider
-    cache, its warm-latency cache, its fp16-vs-fp32 precision-decision
-    cache (F2a inc2, #250 §2), and floor_calibration's bootstrap-floor cache
-    (F2a inc8, #250 §7 UPDATED) before and after each test — mirrors
-    `_reset_embedding_provider_cache` above for the same reason (a test that
-    calls the REAL `build_reranker_provider()` / `get_reranker_floor()`
-    directly must not read or leak a provider/decision/bootstrap a
-    prior/later test's call happened to cache)."""
+    cache, its warm-latency cache, its warm-memory cache (pre-flip revision
+    Change 3 — mirrors the warm-latency cache, same rationale), and
+    floor_calibration's bootstrap-floor cache (F2a inc8, #250 §7 UPDATED)
+    before and after each test — mirrors `_reset_embedding_provider_cache`
+    above for the same reason (a test that calls the REAL `build_reranker_
+    provider()` / `get_reranker_floor()` directly must not read or leak a
+    provider/bootstrap/measurement a prior/later test's call happened to
+    cache)."""
     from brain.memory import floor_calibration, reranker
 
     reranker._reset_reranker_provider_cache()
     reranker._reset_latency_cache()
-    reranker._reset_precision_decision_cache()
+    reranker._reset_memory_cache()
     floor_calibration._reset_bootstrap_floor_cache()
     yield
     reranker._reset_reranker_provider_cache()
     reranker._reset_latency_cache()
-    reranker._reset_precision_decision_cache()
+    reranker._reset_memory_cache()
     floor_calibration._reset_bootstrap_floor_cache()
 
 

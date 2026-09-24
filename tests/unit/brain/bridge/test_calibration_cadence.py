@@ -232,24 +232,23 @@ def test_calibration_tick_judge_failure_does_not_crash_and_prune_already_committ
 
 
 # ---------------------------------------------------------------------------
-# F2a #250 inc7 (spec Section 7): floor derivation + the acceptance-2b
-# precision-cache invalidation, as wired into the tick itself. The fit/EMA/
-# stability-gate/cold-start MECHANISM has its own dedicated coverage in
-# test_floor_calibration.py; these tests are scoped to the TICK's
+# F2a #250 inc7 (spec Section 7): floor derivation, as wired into the tick
+# itself. The fit/data-starvation-backstop MECHANISM (pre-flip revision
+# Change 1 removed the EMA/stability-gate/cold-start-branch this comment
+# used to cite here) has its own dedicated coverage in
+# test_floor_calibration.py; this test is scoped to the TICK's
 # orchestration — does it call derive_and_persist_floor for the right
-# model_id, and does it invalidate the reranker precision cache ONLY on an
-# ACCEPTED write, never on a held cycle or a derivation failure.
+# model_id. (Pre-flip revision Change 2 removed this section's sibling
+# coverage of the fp16/fp32 precision-cache invalidation the tick used to
+# fire on an accepted write — that mechanism, and the cache it protected,
+# no longer exist.)
 # ---------------------------------------------------------------------------
 
 
-def test_calibration_tick_resets_precision_cache_on_an_accepted_floor_write(
-    monkeypatch,
-):
-    """Acceptance 2b's integration half: when the tick's floor derivation
-    is ACCEPTED (a floor was actually written this cycle), the tick must
-    call reranker.reset_precision_decision_for_floor_change() exactly
-    once, so the next build_reranker_provider() call re-runs the
-    fp16/fp32 self-check under the freshly written floor."""
+def test_calibration_tick_derives_floor_for_the_current_reranker_model_id(monkeypatch):
+    """The tick must derive a floor for the CURRENT production reranker's
+    model_id (`build_reranker_provider().model_id()`), not a stale or
+    hardcoded one."""
     from brain.bridge.supervisor import _run_calibration_tick
     from brain.memory import floor_calibration as fc_mod
     from brain.memory import reranker as reranker_mod
@@ -263,60 +262,20 @@ def test_calibration_tick_resets_precision_cache_on_an_accepted_floor_write(
         monkeypatch.setattr(reranker_mod, "build_reranker_provider", lambda **kwargs: FakeRerankerProvider())
         scripted = FloorDerivationOutcome(
             accepted=True, floor=1.0, raw_fit_floor=1.0, sample_pairs=200,
-            is_cold_start=False, held_for_stability=False,
+            is_cold_start=False, held_for_data_starvation=False,
         )
-        calls: dict[str, list] = {"derive": [], "reset": []}
+        calls: list = []
         monkeypatch.setattr(
             fc_mod,
             "derive_and_persist_floor",
-            lambda store, model_id, **kw: (calls["derive"].append(model_id), scripted)[1],
-        )
-        monkeypatch.setattr(
-            reranker_mod, "reset_precision_decision_for_floor_change",
-            lambda: calls["reset"].append(True),
+            lambda store, model_id, **kw: (calls.append(model_id), scripted)[1],
         )
 
         _run_calibration_tick(pd, judge=FakeRelevanceJudgeProvider())
 
-        assert calls["derive"] == ["fake-reranker"], (
+        assert calls == ["fake-reranker"], (
             "the tick must derive a floor for the CURRENT production reranker's model_id"
         )
-        assert len(calls["reset"]) == 1, (
-            "an ACCEPTED floor write must reset the precision cache exactly once"
-        )
-
-
-def test_calibration_tick_does_not_reset_precision_cache_on_a_held_cycle(monkeypatch):
-    """The other half of acceptance 2b's integration: a HELD cycle (the
-    stability gate tripped — nothing was written) must NOT reset the
-    precision cache. Nothing changed, so there is nothing to re-evaluate
-    the fp16/fp32 decision against — resetting anyway would defeat §2's
-    one-time-cost design on every held cycle too."""
-    from brain.bridge.supervisor import _run_calibration_tick
-    from brain.memory import floor_calibration as fc_mod
-    from brain.memory import reranker as reranker_mod
-    from brain.memory.floor_calibration import FloorDerivationOutcome
-    from brain.memory.relevance_judge import FakeRelevanceJudgeProvider
-    from brain.memory.reranker import FakeRerankerProvider
-
-    with tempfile.TemporaryDirectory() as d:
-        pd = Path(d)
-
-        monkeypatch.setattr(reranker_mod, "build_reranker_provider", lambda **kwargs: FakeRerankerProvider())
-        held = FloorDerivationOutcome(
-            accepted=False, floor=1.0, raw_fit_floor=2.0, sample_pairs=200,
-            is_cold_start=False, held_for_stability=True,
-        )
-        reset_calls: list = []
-        monkeypatch.setattr(fc_mod, "derive_and_persist_floor", lambda store, model_id, **kw: held)
-        monkeypatch.setattr(
-            reranker_mod, "reset_precision_decision_for_floor_change",
-            lambda: reset_calls.append(True),
-        )
-
-        _run_calibration_tick(pd, judge=FakeRelevanceJudgeProvider())
-
-        assert reset_calls == [], "a HELD (unaccepted) cycle must never reset the precision cache"
 
 
 def test_calibration_tick_floor_derivation_failure_does_not_crash_the_tick(monkeypatch):

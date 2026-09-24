@@ -1,31 +1,55 @@
 """Tests for brain.memory.floor_calibration — the F2a #250 inc7 reranker
-abstention-floor derivation (spec Section 7): threshold fit, EMA smoothing,
-the bootstrap stability gate, cold-start entry/exit, and per-persona
-persistence via MemoryStore.
+abstention-floor derivation (spec Section 7): threshold fit, cold-start
+bootstrap, and per-persona persistence via MemoryStore.
 
-All OFFLINE — no real model download, no network. Cold-start tests inject a
-FakeRerankerProvider (mirrors reranker.py's own test convention) rather than
-constructing the real jina provider.
+Pre-flip revision Change 1 ("nimble floor", 2026-09-23) drops the EMA
+smoothing and bootstrap-CI stability gate that used to sit on top of the
+raw fit, and re-points the daily fit from the full multi-day retention pool
+to a single day (the most recently completed one). This file's coverage
+was rewritten accordingly: `ema_update`/`stability_gate_accepts`/
+`_bootstrap_ci` no longer exist (see the dead-code test below), and
+`derive_and_persist_floor`'s own cold-start branch (bundled-pair fit,
+unconditionally persisted) is gone, replaced by a data-starvation backstop.
+`get_bootstrap_floor` (the SEPARATE, still-standing hot-path bootstrap) and
+`fit_threshold_fbeta` (the raw fit itself) are UNCHANGED by Change 1 and
+keep their existing coverage below.
+
+All OFFLINE — no real model download, no network. Cold-start/bootstrap
+tests inject a FakeRerankerProvider (mirrors reranker.py's own test
+convention) rather than constructing the real jina provider.
 """
 
 from __future__ import annotations
+
+import json
 
 import numpy as np
 import pytest
 
 from brain.memory.floor_calibration import (
+    FLOOR_FIT_BETA,
     FLOOR_FIT_MIN_LABELED_PAIRS,
+    FLOOR_RETENTION_SAFETY_BUFFER_DAYS,
     RETENTION_WINDOW_DAYS_DEFAULT,
     derive_and_persist_floor,
     derive_retention_window_days,
-    ema_update,
     fit_threshold_fbeta,
-    stability_gate_accepts,
 )
 from brain.memory.reranker import FakeRerankerProvider
 from brain.memory.store import MemoryStore
 
 MODEL_ID = "fake-reranker-for-floor-tests"
+
+def _bundled_scores(relevant_score: float, irrelevant_score: float) -> dict[str, float]:
+    """`reranker._FP16_GATE_PAIRS[:6]`'s 3 relevant / 3 irrelevant docs
+    scored at the given values — the shared fixture every cold-start/bootstrap
+    test in this file builds its `FakeRerankerProvider` from."""
+    from brain.memory.reranker import _FP16_GATE_PAIRS
+
+    return {
+        doc: (relevant_score if i < 3 else irrelevant_score)
+        for i, (_query, doc) in enumerate(_FP16_GATE_PAIRS[:6])
+    }
 
 
 @pytest.fixture
@@ -40,32 +64,59 @@ def _seed_labeled_row(
     *,
     reranker_model_id: str = MODEL_ID,
     haiku_labels: list[str | None] | None = None,
+    day_bucket: str | None = None,
 ) -> None:
     """Insert one already-labeled calibration_log row directly (bypassing
     log_calibration_sample + write_calibration_labels' two-step API, since
-    these tests want the row fully labeled in one shot)."""
+    these tests want the row fully labeled in one shot).
+
+    `day_bucket` (pre-flip revision Change 1): `None` (the default) leaves
+    the column's own `strftime('%Y-%m-%d','now')` default in place — every
+    row in a test that never passes this lands on the SAME (today's) day,
+    so Change 1's new day-scoping is a no-op for any test that doesn't
+    care about it. Tests that DO exercise the day filter pass an explicit
+    value.
+    """
     import json
 
     if haiku_labels is None:
         haiku_labels = [None] * len(labels)
-    store._conn.execute(
-        "INSERT INTO calibration_log "
-        "(query, candidate_ids, reranker_scores, reranker_model_id, local_judge_label, haiku_label) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (
-            "some query",
-            json.dumps([f"m{i}" for i in range(len(scores))]),
-            json.dumps(scores),
-            reranker_model_id,
-            json.dumps(labels),
-            json.dumps(haiku_labels),
-        ),
-    )
+    if day_bucket is None:
+        store._conn.execute(
+            "INSERT INTO calibration_log "
+            "(query, candidate_ids, reranker_scores, reranker_model_id, local_judge_label, "
+            "haiku_label) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "some query",
+                json.dumps([f"m{i}" for i in range(len(scores))]),
+                json.dumps(scores),
+                reranker_model_id,
+                json.dumps(labels),
+                json.dumps(haiku_labels),
+            ),
+        )
+    else:
+        store._conn.execute(
+            "INSERT INTO calibration_log "
+            "(day_bucket, query, candidate_ids, reranker_scores, reranker_model_id, "
+            "local_judge_label, haiku_label) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                day_bucket,
+                "some query",
+                json.dumps([f"m{i}" for i in range(len(scores))]),
+                json.dumps(scores),
+                reranker_model_id,
+                json.dumps(labels),
+                json.dumps(haiku_labels),
+            ),
+        )
     store._conn.commit()
 
 
 # ---------------------------------------------------------------------------
-# fit_threshold_fbeta — Youden's-J / F-beta cutoff fit.
+# fit_threshold_fbeta — Youden's-J / F-beta cutoff fit. UNCHANGED by Change 1.
 # ---------------------------------------------------------------------------
 
 
@@ -120,304 +171,498 @@ def test_fit_threshold_requires_at_least_one_pair() -> None:
 
 
 # ---------------------------------------------------------------------------
-# ema_update
+# derive_retention_window_days — Change 1's SHRUNK derivation: today +
+# yesterday (structural) + a safety buffer (tunable), decoupled from the
+# removed EMA window and from FLOOR_FIT_MIN_LABELED_PAIRS' worst-case
+# multi-day accumulation (neither input applies anymore — the fit reads
+# only one day, never pools).
 # ---------------------------------------------------------------------------
 
 
-def test_ema_update_with_no_prior_returns_raw_floor_unchanged() -> None:
-    assert ema_update(None, 5.0, window_days=7.0) == 5.0
+def test_derive_retention_window_days_is_today_yesterday_plus_buffer() -> None:
+    assert derive_retention_window_days(safety_buffer_days=1.0) == 3.0
+    assert derive_retention_window_days(safety_buffer_days=0.0) == 2.0, (
+        "even a zero buffer must never collapse below the structural today+yesterday minimum"
+    )
+    assert derive_retention_window_days(safety_buffer_days=5.0) == 7.0
 
 
-def test_ema_update_moves_partway_toward_the_new_raw_floor() -> None:
-    updated = ema_update(0.0, 10.0, window_days=7.0)
-    alpha = 2.0 / 8.0
-    assert updated == pytest.approx(alpha * 10.0)
-    assert 0.0 < updated < 10.0, "EMA must move PARTWAY, never jump straight to the raw value"
+def test_derive_retention_window_days_never_collapses_below_two_days() -> None:
+    """Hard rule (Change 1's Open Reconfirmation): retention must retain at
+    least today+yesterday+buffer, NOT collapse to <2 days — proven here
+    against the registered tunable's own (non-negative) default, not just
+    a hand-picked safe input."""
+    assert derive_retention_window_days() >= 2.0
 
 
-def test_ema_update_with_matching_prior_and_raw_is_a_no_op() -> None:
-    assert ema_update(5.0, 5.0, window_days=7.0) == pytest.approx(5.0)
-
-
-# ---------------------------------------------------------------------------
-# stability_gate_accepts — bootstrap-CI vs previous EMA, both directions.
-# ---------------------------------------------------------------------------
-
-
-def test_stability_gate_accepts_when_no_prior_floor_exists() -> None:
-    pairs = [(1.0, "relevant"), (-1.0, "irrelevant")]
-    rng = np.random.default_rng(0)
-    assert stability_gate_accepts(None, pairs, beta=2.0, ci=0.95, iterations=50, rng=rng) is True
-
-
-def test_stability_gate_accepts_when_prior_floor_is_consistent_with_todays_data() -> None:
-    """A day whose labeled sample is CONSISTENT with the established floor
-    must clear the gate (accept direction)."""
-    rng = np.random.default_rng(1)
-    relevant = [4.0 + i * 0.1 for i in range(30)]
-    irrelevant = [-4.0 - i * 0.1 for i in range(30)]
-    pairs = [(s, "relevant") for s in relevant] + [(s, "irrelevant") for s in irrelevant]
-    prior_floor = fit_threshold_fbeta(pairs, beta=2.0)  # squarely inside this sample's own CI
-
-    accepted = stability_gate_accepts(prior_floor, pairs, beta=2.0, ci=0.95, iterations=200, rng=rng)
-    assert accepted is True
-
-
-def test_stability_gate_trips_on_a_wildly_inconsistent_noisy_day() -> None:
-    """Acceptance #9 (reject direction): a prior floor established far away
-    from today's tiny, tightly-clustered, wildly different distribution
-    must NOT fall inside today's bootstrap CI -> the gate trips (holds)."""
-    rng = np.random.default_rng(2)
-    # Today's noisy day: a small, tightly clustered sample far from the
-    # established prior.
-    pairs = [(100.0, "relevant"), (100.1, "relevant"), (99.9, "irrelevant"), (100.05, "irrelevant")]
-    prior_floor = -50.0  # nowhere near today's tightly-clustered ~100 range
-
-    accepted = stability_gate_accepts(prior_floor, pairs, beta=2.0, ci=0.95, iterations=200, rng=rng)
-    assert accepted is False, "a wildly inconsistent noisy day must trip the gate, not swing the floor"
-
-
-# ---------------------------------------------------------------------------
-# derive_retention_window_days — Part C finalization (acceptance 5b's
-# formula, not the pruning mechanics themselves — see test_store.py /
-# test_calibration_cadence.py for the prune behavior).
-# ---------------------------------------------------------------------------
-
-
-def test_derive_retention_window_days_is_max_of_the_two_bounds() -> None:
-    assert derive_retention_window_days(
-        min_labeled_pairs=200, ema_window_days=7.0, worst_case_daily_yield=100
-    ) == 7.0  # ceil(200/100)=2 < 7.0
-    assert derive_retention_window_days(
-        min_labeled_pairs=1000, ema_window_days=7.0, worst_case_daily_yield=50
-    ) == 20.0  # ceil(1000/50)=20 > 7.0
-
-
-def test_derive_retention_window_days_not_hardcoded_14() -> None:
-    """The whole point of inc7's Part C: this must be a computed value tied
-    to the registered tunables (traceable back to `derive_retention_window_
-    days()`'s own formula), not a re-typed 14.0 magic number. Changing
-    EITHER input changes the output — proof it is a live derivation, not a
-    constant that merely happens to be computed once at import time."""
+def test_derive_retention_window_days_default_is_live_not_a_re_hardcoded_14() -> None:
+    """This must be a computed value tied to the registered tunables
+    (traceable back to `derive_retention_window_days()`'s own formula), not
+    a re-typed magic number (neither the old 14.0 placeholder nor a new
+    hardcoded replacement). Changing the buffer input changes the output —
+    proof it is a live derivation."""
     assert RETENTION_WINDOW_DAYS_DEFAULT == derive_retention_window_days()
-    changed = derive_retention_window_days(
-        min_labeled_pairs=FLOOR_FIT_MIN_LABELED_PAIRS * 100, ema_window_days=7.0, worst_case_daily_yield=100
-    )
+    changed = derive_retention_window_days(safety_buffer_days=FLOOR_RETENTION_SAFETY_BUFFER_DAYS + 10.0)
     assert changed != RETENTION_WINDOW_DAYS_DEFAULT
+    assert RETENTION_WINDOW_DAYS_DEFAULT != 14.0
+
+
+def test_retention_window_derivation_decoupled_from_removed_ema_symbols() -> None:
+    """I3/I7 coupling note (Change 1's Open Reconfirmation G): the old
+    formula's inputs (`FLOOR_FIT_MIN_LABELED_PAIRS`'s worst-case daily
+    yield, `FLOOR_EMA_WINDOW_DAYS`) no longer feed this derivation at all —
+    `derive_retention_window_days` takes only `safety_buffer_days` now."""
+    import inspect
+
+    sig = inspect.signature(derive_retention_window_days)
+    assert list(sig.parameters) == ["safety_buffer_days"]
 
 
 # ---------------------------------------------------------------------------
-# derive_and_persist_floor — full orchestration: cold-start, real fit,
-# EMA, stability gate, persistence round-trip.
+# Dead code (acceptance criterion 6): the EMA layer, the bootstrap-CI
+# stability gate, and their now-unused constants must be genuinely GONE
+# from the module, not merely unused.
 # ---------------------------------------------------------------------------
 
 
-def test_cold_start_when_no_real_labeled_data_exists(store: MemoryStore) -> None:
-    # First 3 pairs of reranker._FP16_GATE_PAIRS are "genuine" (labeled
-    # relevant), next 3 are "decoy" (labeled irrelevant) —
-    # FakeRerankerProvider scores by DOCUMENT text only, so key on the doc
-    # half of each bundled (query, doc) pair.
-    from brain.memory.reranker import _FP16_GATE_PAIRS
+def test_ema_and_stability_gate_symbols_no_longer_exist() -> None:
+    from brain.memory import floor_calibration as fc_mod
 
-    scores_by_doc = {doc: (10.0 if i < 3 else -10.0) for i, (_query, doc) in enumerate(_FP16_GATE_PAIRS[:6])}
-    provider = FakeRerankerProvider(scores=scores_by_doc)
-
-    outcome = derive_and_persist_floor(store, MODEL_ID, reranker_provider=provider)
-
-    assert outcome.accepted is True
-    assert outcome.is_cold_start is True
-    assert outcome.sample_pairs == 6
-    assert -10.0 < outcome.floor < 10.0
-
-    persisted = store.get_reranker_floor(MODEL_ID)
-    assert persisted is not None
-    assert persisted["is_cold_start"] is True
-    assert persisted["floor"] == pytest.approx(outcome.floor)
+    for removed_symbol in (
+        "ema_update",
+        "stability_gate_accepts",
+        "_bootstrap_ci",
+        "FLOOR_EMA_WINDOW_DAYS",
+        "FLOOR_STABILITY_CI",
+        "FLOOR_STABILITY_BOOTSTRAP_ITERATIONS",
+        "_worst_case_daily_labeled_pairs",
+    ):
+        assert not hasattr(fc_mod, removed_symbol), (
+            f"{removed_symbol} must be removed entirely (Change 1), not just unused"
+        )
 
 
-def test_cold_start_persists_even_with_zero_calibration_log_rows(store: MemoryStore) -> None:
-    """Acceptance #10's inc7-scoped slice: a totally fresh install (zero
-    calibration_log rows at all) must still get a servable bootstrap floor,
-    never a crash or an unset floor."""
-    from brain.memory.reranker import _FP16_GATE_PAIRS
+def test_derive_and_persist_floor_no_longer_takes_provider_or_rng() -> None:
+    """The removed cold-start branch was the only thing here that ever
+    needed a live reranker provider; the removed stability gate was the
+    only thing that ever needed a bootstrap RNG. Neither parameter should
+    exist on the signature anymore."""
+    import inspect
 
-    scores_by_doc = {doc: (5.0 if i < 3 else -5.0) for i, (_q, doc) in enumerate(_FP16_GATE_PAIRS[:6])}
-    provider = FakeRerankerProvider(scores=scores_by_doc)
-
-    assert store.labeled_calibration_pairs(MODEL_ID) == []
-    outcome = derive_and_persist_floor(store, MODEL_ID, reranker_provider=provider)
-    assert outcome.accepted is True
-    assert store.get_reranker_floor(MODEL_ID) is not None
+    sig = inspect.signature(derive_and_persist_floor)
+    assert list(sig.parameters) == ["store", "reranker_model_id"]
 
 
-def test_cold_start_exit_is_outcome_based_not_day_counted(store: MemoryStore) -> None:
-    """Feed exactly (min_labeled_pairs - 1) usable real pairs -> still cold
-    start; feed exactly min_labeled_pairs -> a REAL fit runs. No dates or
-    day counts are involved anywhere in this test — purely a row-count
-    outcome, proving the exit condition is NOT day-based."""
-    min_pairs = FLOOR_FIT_MIN_LABELED_PAIRS
-    from brain.memory.reranker import _FP16_GATE_PAIRS
-
-    scores_by_doc = {doc: (5.0 if i < 3 else -5.0) for i, (_q, doc) in enumerate(_FP16_GATE_PAIRS[:6])}
-    provider = FakeRerankerProvider(scores=scores_by_doc)
-
-    # One short of the threshold — every row is a single-candidate row so
-    # row count == pair count.
-    for i in range(min_pairs - 1):
-        label = "relevant" if i % 2 == 0 else "irrelevant"
-        _seed_labeled_row(store, [float(i)], [label])
-    outcome = derive_and_persist_floor(store, MODEL_ID, reranker_provider=provider)
-    assert outcome.is_cold_start is True, "one pair short of the threshold must still be cold-start"
-
-    # Cross the threshold with one more labeled pair.
-    _seed_labeled_row(store, [999.0], ["relevant"])
-    outcome2 = derive_and_persist_floor(store, MODEL_ID, reranker_provider=provider)
-    assert outcome2.is_cold_start is False, "crossing the threshold must exit cold-start immediately"
-    assert outcome2.sample_pairs == min_pairs
+# ---------------------------------------------------------------------------
+# derive_and_persist_floor — Change 1's nimble fit + data-starvation
+# backstop. Acceptance criteria 3, 4, 5(a)(b)(c) below.
+# ---------------------------------------------------------------------------
 
 
-def test_real_fit_first_derivation_has_no_prior_history_and_trivially_accepts(
-    store: MemoryStore,
-) -> None:
-    min_pairs = FLOOR_FIT_MIN_LABELED_PAIRS
-    for i in range(min_pairs):
-        if i < min_pairs // 2:
-            _seed_labeled_row(store, [10.0 + i * 0.01], ["relevant"])
-        else:
-            _seed_labeled_row(store, [-10.0 - i * 0.01], ["irrelevant"])
-
-    outcome = derive_and_persist_floor(store, MODEL_ID, rng=np.random.default_rng(3))
-    assert outcome.accepted is True
-    assert outcome.is_cold_start is False
-    assert outcome.held_for_stability is False
-    assert outcome.floor == pytest.approx(outcome.raw_fit_floor), (
-        "first-ever real derivation has no EMA history -> raw fit applied unchanged"
-    )
-
-    persisted = store.get_reranker_floor(MODEL_ID)
-    assert persisted is not None
-    assert persisted["is_cold_start"] is False
-    assert persisted["floor"] == pytest.approx(outcome.floor)
-
-
-def _seed_noisy_labeled_pairs(
-    store: MemoryStore, rng: np.random.Generator, *, n: int, relevant_loc: float, irrelevant_loc: float
-) -> None:
-    """Seed `n` labeled rows drawn from two OVERLAPPING gaussian clusters
-    (real within-class variance, not a razor-thin perfectly-separated gap)
-    so the bootstrap gate has genuine width to work with, mirroring a real
-    day's noisy score distribution rather than a synthetic single-candidate
-    boundary."""
+def _seed_min_pairs(store: MemoryStore, *, n: int, relevant_loc: float, irrelevant_loc: float,
+                     scale: float = 1.5, rng: np.random.Generator, day_bucket: str | None = None,
+                     reranker_model_id: str = MODEL_ID) -> None:
+    """Seed `n` labeled rows drawn from two overlapping gaussian clusters
+    (real within-class variance, mirroring a genuine day's noisy score
+    distribution) for `reranker_model_id`, optionally on a specific
+    `day_bucket`."""
     half = n // 2
-    relevant_scores = rng.normal(loc=relevant_loc, scale=1.5, size=half)
-    irrelevant_scores = rng.normal(loc=irrelevant_loc, scale=1.5, size=n - half)
+    relevant_scores = rng.normal(loc=relevant_loc, scale=scale, size=half)
+    irrelevant_scores = rng.normal(loc=irrelevant_loc, scale=scale, size=n - half)
     for s in relevant_scores:
-        _seed_labeled_row(store, [float(s)], ["relevant"])
+        _seed_labeled_row(
+            store, [float(s)], ["relevant"], day_bucket=day_bucket, reranker_model_id=reranker_model_id
+        )
     for s in irrelevant_scores:
-        _seed_labeled_row(store, [float(s)], ["irrelevant"])
+        _seed_labeled_row(
+            store, [float(s)], ["irrelevant"], day_bucket=day_bucket, reranker_model_id=reranker_model_id
+        )
 
 
-def test_real_fit_second_consistent_day_ema_smooths_partway(store: MemoryStore) -> None:
-    """Accept direction of acceptance #9: given a SEEDED prior floor that a
-    fresh day's noisy-but-consistent labeled sample's bootstrap CI comfortably
-    contains, the update is accepted and EMA-BLENDED — never equal to either
-    the untouched prior or the day's own raw fit outright."""
+def test_real_fit_lands_exactly_at_the_raw_value_no_ema(store: MemoryStore) -> None:
+    """Acceptance #3 ("No EMA"): a fresh day's fit, when it refits, lands
+    EXACTLY at the raw Youden's-J/F-beta value for that day's distribution
+    — float-identical, not partway between old and new. Seeds a PRIOR
+    persisted floor far away first, so a pre-Change-1 EMA blend would have
+    visibly landed somewhere between the two; the fix must land exactly on
+    the raw fit regardless."""
     min_pairs = FLOOR_FIT_MIN_LABELED_PAIRS
-    rng_seed = np.random.default_rng(42)
-    _seed_noisy_labeled_pairs(store, rng_seed, n=min_pairs, relevant_loc=5.0, irrelevant_loc=-5.0)
+    rng = np.random.default_rng(1)
 
-    # Seed a prior EMA floor squarely inside where this data's own fit lands
-    # (both clusters centered +/-5 with scale 1.5 -> a threshold near 0.0 is
-    # well inside a 95% bootstrap CI of the resulting fit).
     store.write_reranker_floor(
-        MODEL_ID, floor=0.0, raw_fit_floor=0.0, sample_pairs=min_pairs, is_cold_start=False
+        MODEL_ID, floor=-500.0, raw_fit_floor=-500.0, sample_pairs=min_pairs, is_cold_start=False
     )
+    _seed_min_pairs(store, n=min_pairs, relevant_loc=5.0, irrelevant_loc=-5.0, rng=rng)
 
-    outcome = derive_and_persist_floor(store, MODEL_ID, rng=np.random.default_rng(43))
+    real_pairs = store.labeled_calibration_pairs(MODEL_ID)
+    expected_raw = fit_threshold_fbeta(real_pairs, beta=FLOOR_FIT_BETA)
+
+    outcome = derive_and_persist_floor(store, MODEL_ID)
 
     assert outcome.accepted is True
-    assert outcome.held_for_stability is False
-    assert outcome.floor != pytest.approx(outcome.raw_fit_floor), (
-        "an accepted update against an existing prior must be EMA-blended, not equal to its own raw fit"
+    assert outcome.held_for_data_starvation is False
+    assert outcome.floor == pytest.approx(expected_raw)
+    assert outcome.raw_fit_floor == pytest.approx(expected_raw)
+    assert outcome.floor == outcome.raw_fit_floor, "an accepted cycle's floor IS its raw fit, always"
+    assert outcome.floor != pytest.approx(-500.0), (
+        "must NOT be anywhere near the seeded prior — no EMA blend toward it"
     )
-    assert outcome.floor != pytest.approx(0.0), (
-        "an accepted update must actually MOVE from the untouched prior, not leave it exactly in place"
-    )
-    lo, hi = sorted([0.0, outcome.raw_fit_floor])
-    assert lo <= outcome.floor <= hi, "EMA must land strictly between the prior and the raw fit"
 
-    persisted = store.get_reranker_floor(MODEL_ID)
-    assert persisted["floor"] == pytest.approx(outcome.floor)
+    persisted = store.get_persisted_reranker_floor(MODEL_ID)
+    assert persisted["floor"] == pytest.approx(expected_raw)
 
 
-def test_real_fit_noisy_day_holds_and_leaves_persisted_floor_unchanged(store: MemoryStore) -> None:
-    """Reject direction of acceptance #9: a SEEDED prior floor that sits
-    WAY outside a fresh day's own bootstrap CI (the noisy/outlier-day
-    scenario) must HOLD — the persisted floor stays byte-for-byte what was
-    seeded, and `accepted` is False."""
+def test_noisy_but_sufficient_day_still_refits_directly_no_gate(store: MemoryStore) -> None:
+    """Acceptance #4 ("No gate"): a single deliberately noisy day (a
+    synthetic outlier distribution, >= FLOOR_FIT_MIN_LABELED_PAIRS pairs)
+    still refits DIRECTLY to that day's raw fit — no held/blocked case,
+    even against a wildly distant seeded prior that the OLD stability gate
+    would have refused to accept (see
+    test_real_fit_noisy_day_holds_and_leaves_persisted_floor_unchanged in
+    this file's git history for the pre-Change-1 reject-direction test this
+    replaces)."""
     min_pairs = FLOOR_FIT_MIN_LABELED_PAIRS
-    rng_seed = np.random.default_rng(44)
-    # Today's data fits tightly around 0.0 (clusters at +/-5, scale 1.5).
-    _seed_noisy_labeled_pairs(store, rng_seed, n=min_pairs, relevant_loc=5.0, irrelevant_loc=-5.0)
 
-    # A prior floor established WAY outside where today's data could
-    # plausibly land — the "one wildly different day" scenario, just
-    # expressed as "the established history is now wildly far from today."
+    # A prior floor established WAY outside where today's tightly-clustered
+    # noisy data could plausibly land — exactly the scenario the removed
+    # stability gate existed to hold against.
     store.write_reranker_floor(
         MODEL_ID, floor=500.0, raw_fit_floor=500.0, sample_pairs=min_pairs, is_cold_start=False
     )
-    persisted_before = store.get_reranker_floor(MODEL_ID)
+    # Today's noisy day: small tight cluster far from the seeded prior.
+    pairs = (
+        [(100.0 + i * 0.01, "relevant") for i in range(min_pairs // 2)]
+        + [(99.0 - i * 0.01, "irrelevant") for i in range(min_pairs - min_pairs // 2)]
+    )
+    for score, label in pairs:
+        _seed_labeled_row(store, [score], [label])
 
-    outcome = derive_and_persist_floor(store, MODEL_ID, rng=np.random.default_rng(45))
+    real_pairs = store.labeled_calibration_pairs(MODEL_ID)
+    expected_raw = fit_threshold_fbeta(real_pairs, beta=FLOOR_FIT_BETA)
+
+    outcome = derive_and_persist_floor(store, MODEL_ID)
+
+    assert outcome.accepted is True, "a noisy-but-sufficient day must NOT be held — no gate anymore"
+    assert outcome.held_for_data_starvation is False
+    assert outcome.floor == pytest.approx(expected_raw)
+    assert outcome.floor != pytest.approx(500.0), "must have actually moved off the stale seeded prior"
+
+    persisted = store.get_persisted_reranker_floor(MODEL_ID)
+    assert persisted["floor"] == pytest.approx(expected_raw)
+
+
+def test_backstop_holds_prior_byte_identical_when_starved(store: MemoryStore) -> None:
+    """Acceptance #5(a): a day with < FLOOR_FIT_MIN_LABELED_PAIRS pairs AND
+    an existing prior persisted floor leaves the persisted floor
+    byte-identical to the prior value — no refit attempted at all."""
+    min_pairs = FLOOR_FIT_MIN_LABELED_PAIRS
+    store.write_reranker_floor(
+        MODEL_ID, floor=1.2345, raw_fit_floor=1.2345, sample_pairs=min_pairs, is_cold_start=False
+    )
+    persisted_before = store.get_persisted_reranker_floor(MODEL_ID)
+
+    # Starved: only a handful of labeled pairs, nowhere near the threshold.
+    for i in range(min_pairs - 1):
+        label = "relevant" if i % 2 == 0 else "irrelevant"
+        _seed_labeled_row(store, [float(i)], [label])
+
+    outcome = derive_and_persist_floor(store, MODEL_ID)
 
     assert outcome.accepted is False
-    assert outcome.held_for_stability is True
-    assert outcome.floor == pytest.approx(500.0), "a held cycle reports the still-standing prior floor"
-    persisted_after = store.get_reranker_floor(MODEL_ID)
+    assert outcome.held_for_data_starvation is True
+    assert outcome.floor == pytest.approx(1.2345)
+    assert outcome.raw_fit_floor == pytest.approx(1.2345)
+
+    persisted_after = store.get_persisted_reranker_floor(MODEL_ID)
     assert persisted_after == persisted_before, (
         "a held cycle must leave the persisted floor row byte-for-byte unchanged"
     )
 
 
-def test_floor_derivation_per_persona_scoped_by_being_a_fresh_store(store: MemoryStore) -> None:
-    """'Per-persona' persistence (I1) means: lives in THIS persona's own
-    memories.db, keyed by reranker_model_id within it — not a lookup across
-    personas. A second, independent MemoryStore never sees the first's
-    PERSISTED floor (F2a inc8: it still gets a floor — the transient
-    bootstrap, computed fresh for itself — but never the first store's
-    ACTUAL persisted/derived value; this is the distinction that still
-    proves per-persona scoping under the bootstrap ruling)."""
-    from brain.memory.reranker import _FP16_GATE_PAIRS
+def test_backstop_holds_carry_no_memory_across_multiple_starved_days(store: MemoryStore) -> None:
+    """Acceptance #5(b): several consecutive starved (<200-pair) days
+    followed by one sufficient (>=200-pair) day — the floor on that day
+    refits to THAT day's raw fit, with NO damping or partial-move from
+    however many holds preceded it. Proves holds carry no memory, unlike
+    the removed stability gate (which compared every later day against the
+    same never-updated stale anchor once it first held)."""
+    min_pairs = FLOOR_FIT_MIN_LABELED_PAIRS
+    rng = np.random.default_rng(3)
 
-    scores_by_doc = {doc: (5.0 if i < 3 else -5.0) for i, (_q, doc) in enumerate(_FP16_GATE_PAIRS[:6])}
-    provider = FakeRerankerProvider(scores=scores_by_doc)
-    derive_and_persist_floor(store, MODEL_ID, reranker_provider=provider)
-    first_persisted = store.get_reranker_floor(MODEL_ID)
-    assert first_persisted is not None
-    assert first_persisted["is_cold_start"] is True
-
-    other_persona_store = MemoryStore(db_path=":memory:")
-    other_result = other_persona_store.get_reranker_floor(MODEL_ID)
-    assert other_result is not None, "F2a inc8: a fresh store still gets a bootstrap floor, not None"
-    assert other_result["updated_at"] is None, (
-        "the second store must get the TRANSIENT bootstrap, never a persisted row — proving it "
-        "never read the first persona's actual persisted/derived floor"
+    store.write_reranker_floor(
+        MODEL_ID, floor=-77.0, raw_fit_floor=-77.0, sample_pairs=min_pairs, is_cold_start=False
     )
-    count = other_persona_store._conn.execute(  # noqa: SLF001
-        "SELECT COUNT(*) AS n FROM reranker_floor_calibration WHERE reranker_model_id = ?",
+
+    # Three consecutive starved days, each on its own day_bucket, each held.
+    for day_index in range(3):
+        day_bucket = f"2026-03-{day_index + 1:02d}"
+        for i in range(5):
+            label = "relevant" if i % 2 == 0 else "irrelevant"
+            _seed_labeled_row(store, [float(i)], [label], day_bucket=day_bucket)
+        held_outcome = derive_and_persist_floor(store, MODEL_ID)
+        assert held_outcome.accepted is False
+        assert held_outcome.held_for_data_starvation is True
+        assert held_outcome.floor == pytest.approx(-77.0), "every hold must still report the untouched prior"
+
+    # A fourth, sufficient day — must fit FRESH from just this day's data,
+    # with no trace of the -77.0 prior or the three holds that preceded it.
+    sufficient_day = "2026-03-04"
+    _seed_min_pairs(
+        store, n=min_pairs, relevant_loc=20.0, irrelevant_loc=10.0, rng=rng, day_bucket=sufficient_day,
+    )
+    fresh_pairs = store.labeled_calibration_pairs(MODEL_ID)
+    expected_raw = fit_threshold_fbeta(fresh_pairs, beta=FLOOR_FIT_BETA)
+
+    outcome = derive_and_persist_floor(store, MODEL_ID)
+    assert outcome.accepted is True
+    assert outcome.floor == pytest.approx(expected_raw)
+    assert outcome.floor != pytest.approx(-77.0)
+    assert not (-77.0 < outcome.floor < -70.0), "must not be damped toward the old prior in any way"
+
+
+def test_no_prior_row_and_starved_writes_nothing_no_crash(store: MemoryStore) -> None:
+    """Acceptance #5(c), first half: a fresh-deploy state (no persisted
+    floor row at all) with < FLOOR_FIT_MIN_LABELED_PAIRS pairs writes
+    NOTHING — no row is created, no crash on a None prior — and a read
+    through the hot-path get_bootstrap_floor in the SAME state still
+    returns a served floor (recall stays served through the bootstrap
+    while the tick stays silent)."""
+    from brain.memory import reranker as reranker_mod
+
+    reranker_mod._bootstrap_reranker_provider = lambda model_id: FakeRerankerProvider(
+        scores=_bundled_scores(5.0, -5.0)
+    )
+    try:
+        assert store.get_persisted_reranker_floor(MODEL_ID) is None
+
+        for i in range(FLOOR_FIT_MIN_LABELED_PAIRS - 1):
+            label = "relevant" if i % 2 == 0 else "irrelevant"
+            _seed_labeled_row(store, [float(i)], [label])
+
+        outcome = derive_and_persist_floor(store, MODEL_ID)
+
+        assert outcome.accepted is False
+        assert outcome.held_for_data_starvation is True
+        assert outcome.floor is None, "nothing is in effect from this call — no floor to report"
+        assert outcome.raw_fit_floor is None
+        assert store.get_persisted_reranker_floor(MODEL_ID) is None, "must write NOTHING, not a placeholder row"
+
+        bootstrap_served = store.get_reranker_floor(MODEL_ID)
+        assert bootstrap_served is not None, "recall must still get a served floor via the bootstrap hot path"
+        assert bootstrap_served["is_cold_start"] is True
+    finally:
+        del reranker_mod._bootstrap_reranker_provider
+
+
+def test_no_prior_row_then_a_sufficient_day_fits_and_persists_normally(store: MemoryStore) -> None:
+    """Acceptance #5(c), second half: once a day accumulates >=
+    FLOOR_FIT_MIN_LABELED_PAIRS real pairs, the tick fits and persists
+    normally from that point on — exactly as (a)/(b) describe once a prior
+    row exists."""
+    min_pairs = FLOOR_FIT_MIN_LABELED_PAIRS
+    rng = np.random.default_rng(4)
+    assert store.get_persisted_reranker_floor(MODEL_ID) is None
+
+    _seed_min_pairs(store, n=min_pairs, relevant_loc=3.0, irrelevant_loc=-3.0, rng=rng)
+    real_pairs = store.labeled_calibration_pairs(MODEL_ID)
+    expected_raw = fit_threshold_fbeta(real_pairs, beta=FLOOR_FIT_BETA)
+
+    outcome = derive_and_persist_floor(store, MODEL_ID)
+
+    assert outcome.accepted is True
+    assert outcome.floor == pytest.approx(expected_raw)
+    persisted = store.get_persisted_reranker_floor(MODEL_ID)
+    assert persisted is not None
+    assert persisted["floor"] == pytest.approx(expected_raw)
+    assert persisted["is_cold_start"] is False
+
+
+def test_day_only_read_fit_matches_day_alone_not_the_full_pool(store: MemoryStore) -> None:
+    """Acceptance #2 ("Day-only read"): 7 days of accumulated labeled pairs
+    where only the most recent day's pairs are distinguishable (days 1-6
+    all cluster around 0.0 with high noise/overlap, day 7 is CLEANLY
+    separated far away) — the fitted floor must match a fit computed on
+    day-7-alone and must NOT match a fit computed on the full 7-day pool,
+    proving the day filter actually replaced the pooled read."""
+    rng = np.random.default_rng(5)
+    per_day = FLOOR_FIT_MIN_LABELED_PAIRS  # each day clears the threshold on its own
+
+    for day_index in range(6):
+        day_bucket = f"2026-04-{day_index + 1:02d}"
+        _seed_min_pairs(
+            store, n=per_day, relevant_loc=0.5, irrelevant_loc=-0.5, scale=2.0, rng=rng, day_bucket=day_bucket,
+        )
+    day7_bucket = "2026-04-07"
+    _seed_min_pairs(
+        store, n=per_day, relevant_loc=50.0, irrelevant_loc=40.0, scale=1.0, rng=rng, day_bucket=day7_bucket,
+    )
+
+    day7_only_pairs = [
+        (score, label)
+        for score, label in store._conn.execute(  # noqa: SLF001
+            "SELECT reranker_scores, local_judge_label FROM calibration_log "
+            "WHERE day_bucket = ? AND reranker_model_id = ?",
+            (day7_bucket, MODEL_ID),
+        ).fetchall()
+        for score, label in zip(json.loads(score), json.loads(label), strict=True)
+    ]
+    expected_day7_floor = fit_threshold_fbeta(day7_only_pairs, beta=FLOOR_FIT_BETA)
+
+    all_rows = store._conn.execute(  # noqa: SLF001
+        "SELECT reranker_scores, local_judge_label FROM calibration_log WHERE reranker_model_id = ?",
         (MODEL_ID,),
-    ).fetchone()["n"]
-    assert count == 0, "the second persona's OWN table must never gain a row just from reading the bootstrap"
+    ).fetchall()
+    pooled_pairs = [
+        (score, label)
+        for raw_scores, raw_labels in all_rows
+        for score, label in zip(json.loads(raw_scores), json.loads(raw_labels), strict=True)
+    ]
+    pooled_floor = fit_threshold_fbeta(pooled_pairs, beta=FLOOR_FIT_BETA)
+
+    outcome = derive_and_persist_floor(store, MODEL_ID)
+
+    assert outcome.accepted is True
+    assert outcome.sample_pairs == per_day, "must read ONLY day 7's pairs, not all 7 days pooled"
+    assert outcome.floor == pytest.approx(expected_day7_floor)
+    assert outcome.floor != pytest.approx(pooled_floor), (
+        "must NOT match the full 7-day pooled fit — the day filter actually replaced the pooled read"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Acceptance #1: lock repro, REVERSED. Seeds the T7 Part A scenario (>=200
+# pairs/day x 10 sim days, a shift=3.0 clean series and a shift=3.0 noisy
+# series) through the real nimble fit; asserts the floor TRACKS the shift
+# within 1-2 days on BOTH series — the same repro that proved the OLD
+# mechanism's permanent lock (an independent code verify confirmed the
+# removed stability gate had no recovery path: once it held, every later
+# day was compared against the same never-updated stale anchor) must now
+# prove that lock's absence.
+# ---------------------------------------------------------------------------
+
+
+def _run_sim_days(
+    store: MemoryStore,
+    model_id: str,
+    *,
+    n_days: int,
+    shift_at_day: int,
+    shift: float,
+    scale: float,
+    seed: int,
+) -> list[float | None]:
+    """Simulate `n_days` daily ticks for `model_id`: days before
+    `shift_at_day` (0-indexed) draw from a baseline distribution
+    (relevant~+5, irrelevant~-5); `shift_at_day` onward draw from the SAME
+    shape with BOTH clusters shifted up by `shift` together (relevant~
+    +5+shift, irrelevant~-5+shift — separation preserved, only the
+    position moves) — a sustained corpus/precision/model-swap-style shift,
+    per the spec's own framing. `scale` controls noise (clean vs noisy
+    series). Returns the
+    persisted floor after each day's tick (>= FLOOR_FIT_MIN_LABELED_PAIRS
+    every day, so the backstop never fires and every entry is a real,
+    accepted fit)."""
+    rng = np.random.default_rng(seed)
+    floors: list[float | None] = []
+    for day_index in range(n_days):
+        day_bucket = f"2026-05-{day_index + 1:02d}"
+        # A "shift" moves the WHOLE score distribution up by a constant
+        # (both clusters together, preserving their separation) — a model
+        # swap / precision flip / corpus change moves where scores sit on
+        # the number line, it does not change how well-separated the two
+        # classes are. relevant/irrelevant each start 5.0 apart from 0.0
+        # and both add `shift` once the shift hits, so the fitted
+        # threshold (which tracks the midpoint-ish region between the two
+        # clusters) should move by roughly `shift` too, not stay put.
+        offset = 0.0 if day_index < shift_at_day else shift
+        _seed_min_pairs(
+            store,
+            n=FLOOR_FIT_MIN_LABELED_PAIRS,
+            relevant_loc=5.0 + offset,
+            irrelevant_loc=-5.0 + offset,
+            scale=scale,
+            rng=rng,
+            day_bucket=day_bucket,
+            reranker_model_id=model_id,
+        )
+        outcome = derive_and_persist_floor(store, model_id)
+        assert outcome.accepted is True, f"day {day_index} must be a real accepted fit, not a hold"
+        floors.append(outcome.floor)
+    return floors
+
+
+@pytest.mark.parametrize(
+    "scale,label,seed",
+    [(1.0, "clean", 101), (3.0, "noisy", 202)],
+    # Fixed, literal seeds — NOT `hash(label)`: Python's string hash is
+    # randomized per-process (PEP 456) unless PYTHONHASHSEED is pinned, so
+    # a seed derived from `hash(...)` would make this test's outcome
+    # non-reproducible run to run, exactly the kind of hidden nondeterminism
+    # that would make a real failure look like flakiness instead of a bug.
+)
+def test_lock_repro_reversed_floor_tracks_a_sustained_shift_within_two_days(
+    scale: float, label: str, seed: int
+) -> None:
+    """Acceptance #1. Runs BOTH the clean (tight clusters) and noisy
+    (wide, overlapping clusters) series via pytest parametrization — both
+    must show the SAME qualitative behavior: stable pre-shift, then
+    tracking the shift within 1-2 days post-shift, never locked."""
+    store = MemoryStore(db_path=":memory:")
+    model_id = f"lock-repro-{label}"
+    n_days = 10
+    shift_at_day = 6  # 0-indexed: days 0-5 baseline, days 6-9 shifted
+    shift = 3.0
+
+    floors = _run_sim_days(
+        store, model_id, n_days=n_days, shift_at_day=shift_at_day, shift=shift, scale=scale, seed=seed,
+    )
+
+    pre_shift_floors = floors[:shift_at_day]
+    post_shift_floors = floors[shift_at_day:]
+
+    # Pre-shift: the floor should stay in a stable, tight band around the
+    # baseline's own natural fit (same distribution every day) — it must
+    # NOT already be drifting toward the post-shift value before the shift
+    # even happens.
+    pre_shift_spread = max(pre_shift_floors) - min(pre_shift_floors)
+    assert pre_shift_spread < shift, (
+        f"[{label}] pre-shift floor must stay stable (spread={pre_shift_spread}), not already moving"
+    )
+
+    # Post-shift: within 1-2 days of the shift's onset (index 0 or 1 of
+    # post_shift_floors), the floor must have moved to track the shift —
+    # i.e. sit closer to the NEW baseline's own natural fit than to the
+    # OLD (pre-shift) floor level. Using the shift amount itself as the
+    # yardstick: the floor must have moved by at least half the shift
+    # within that window, which a genuinely LOCKED floor (frozen at its
+    # pre-shift value, the defect this reverses) would never do.
+    pre_shift_level = pre_shift_floors[-1]
+    tracked_within_two_days = any(
+        abs(post_shift_floors[i] - pre_shift_level) >= (shift / 2.0) for i in range(min(2, len(post_shift_floors)))
+    )
+    assert tracked_within_two_days, (
+        f"[{label}] floor must track the shift within 1-2 days — got pre-shift={pre_shift_level}, "
+        f"first two post-shift days={post_shift_floors[:2]}"
+    )
+
+    # Never locked: by the LAST simulated day, the floor must sit near the
+    # NEW distribution's own raw fit (immediate tracking, since Change 1
+    # has zero smoothing) — not anywhere near the stale pre-shift level,
+    # which is exactly what the removed stability gate would have produced
+    # forever once it first held.
+    assert abs(floors[-1] - pre_shift_level) >= (shift / 2.0), (
+        f"[{label}] the final day's floor must not still be anchored near the pre-shift level "
+        f"(permanent-lock defect) — pre_shift={pre_shift_level}, final={floors[-1]}"
+    )
+    store.close()
 
 
 # ---------------------------------------------------------------------------
 # get_bootstrap_floor — F2a inc8 (#250 §7 UPDATED, Roy 2026-09-18): the
 # hot-path DEFAULT `get_reranker_floor` serves instead of None when no
-# persisted row exists yet. All offline via a scripted FakeRerankerProvider
-# monkeypatched onto `reranker._bootstrap_reranker_provider` directly (the
-# autouse conftest fixture already defaults this to an UNSCRIPTED
-# FakeRerankerProvider for the rest of the suite — these tests override it
-# per-test to control the exact scores the fit sees).
+# persisted row exists yet. UNCHANGED by Change 1. All offline via a
+# scripted FakeRerankerProvider monkeypatched onto
+# `reranker._bootstrap_reranker_provider` directly.
 # ---------------------------------------------------------------------------
 
 
