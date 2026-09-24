@@ -12,6 +12,10 @@ from __future__ import annotations
 
 import json
 import math
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
 
 import pytest
 
@@ -689,3 +693,147 @@ def test_haiku_oracle_note_is_present_in_relevance_judge_source() -> None:
     assert "oracle" in note.lower()
     assert "haiku" in note.lower()
     assert "—" not in note, "no em-dashes in this durable note (plain code comment, no LLM-tells)"
+
+
+# ---------------------------------------------------------------------------
+# F2c inc4a (spec §5 "where the tuned judge loads from") — the LOAD side:
+# `label_calibration_sample` now reads THIS PERSONA's persisted
+# `judge_knob_calibration` row (via `store.get_judge_knob_calibration`) and
+# threads it into every `label_for_score` call the pass makes.
+# ---------------------------------------------------------------------------
+
+
+def test_label_calibration_sample_applies_this_personas_persisted_knob(store: MemoryStore) -> None:
+    """BITE: raw_score=-0.5 is "irrelevant" under the fixed sigmoid-0.5
+    default (same sanity fact `test_label_for_score_fitted_intercept_
+    shifts_the_decision_boundary` establishes directly against
+    `label_for_score`), but flips to "relevant" once this persona's
+    persisted knob (slope=1.0, intercept=1.0) shifts the boundary past it
+    — proving the LOAD path actually reaches the live judge-labeling call,
+    not just that `label_for_score` is capable of applying params (inc3)."""
+    mem = _mem("borderline content")
+    store.create(mem)
+    store.log_calibration_sample(
+        query="q", candidate_ids=[mem.id], reranker_scores=[1.0], reranker_model_id="m"
+    )
+    judge = FakeRelevanceJudgeProvider(scores={("q", mem.content): -0.5})
+    store.write_judge_knob_calibration(judge.model_id(), slope=1.0, intercept=1.0)
+
+    labeled = label_calibration_sample(store, judge=judge)
+
+    assert labeled == 1
+    row = store._conn.execute("SELECT local_judge_label FROM calibration_log").fetchone()
+    assert json.loads(row["local_judge_label"]) == ["relevant"], (
+        "the persona's fitted knob (slope=1.0, intercept=1.0) must shift the boundary past "
+        "raw_score=-0.5, which is 'irrelevant' under the fixed sigmoid-0.5 default"
+    )
+
+
+def test_label_calibration_sample_absent_knob_is_byte_identical_to_fixed_default(
+    store: MemoryStore,
+) -> None:
+    """ABSENT-SAFE: no persisted `judge_knob_calibration` row for this
+    judge's model id -> labeling of the same borderline raw_score=-0.5
+    stays "irrelevant" (the fixed sigmoid-0.5 default), byte-identical to
+    pre-inc4a behavior — not silently "relevant" from some fabricated
+    default."""
+    mem = _mem("borderline content")
+    store.create(mem)
+    store.log_calibration_sample(
+        query="q", candidate_ids=[mem.id], reranker_scores=[1.0], reranker_model_id="m"
+    )
+    judge = FakeRelevanceJudgeProvider(scores={("q", mem.content): -0.5})
+    assert store.get_judge_knob_calibration(judge.model_id()) is None, "sanity: no persisted knob"
+
+    labeled = label_calibration_sample(store, judge=judge)
+
+    assert labeled == 1
+    row = store._conn.execute("SELECT local_judge_label FROM calibration_log").fetchone()
+    assert json.loads(row["local_judge_label"]) == ["irrelevant"], (
+        "an absent knob must fall back to the fixed sigmoid-0.5 default, unchanged from pre-inc4a"
+    )
+
+
+def test_label_calibration_sample_persona_isolation_no_cross_persona_bleed() -> None:
+    """AC11 (load side): persona A's persisted knob must never affect
+    persona B's judge labeling. Both personas' judges share the SAME
+    `model_id()` string ("fake-relevance-judge") — deliberately, so the
+    isolation this proves comes from each persona's own `MemoryStore`/db
+    file (I1), not from any persona-scoping column keying the row."""
+    store_a = MemoryStore(db_path=":memory:")
+    store_b = MemoryStore(db_path=":memory:")
+
+    mem_a = _mem("borderline content a")
+    store_a.create(mem_a)
+    store_a.log_calibration_sample(
+        query="q", candidate_ids=[mem_a.id], reranker_scores=[1.0], reranker_model_id="m"
+    )
+    judge_a = FakeRelevanceJudgeProvider(scores={("q", mem_a.content): -0.5})
+    store_a.write_judge_knob_calibration(judge_a.model_id(), slope=1.0, intercept=1.0)
+
+    mem_b = _mem("borderline content b")
+    store_b.create(mem_b)
+    store_b.log_calibration_sample(
+        query="q", candidate_ids=[mem_b.id], reranker_scores=[1.0], reranker_model_id="m"
+    )
+    judge_b = FakeRelevanceJudgeProvider(scores={("q", mem_b.content): -0.5})
+    # store_b (persona B) never gets write_judge_knob_calibration called on it.
+
+    assert label_calibration_sample(store_a, judge=judge_a) == 1
+    assert label_calibration_sample(store_b, judge=judge_b) == 1
+
+    row_a = store_a._conn.execute("SELECT local_judge_label FROM calibration_log").fetchone()
+    row_b = store_b._conn.execute("SELECT local_judge_label FROM calibration_log").fetchone()
+    assert json.loads(row_a["local_judge_label"]) == ["relevant"], "persona A's own fitted knob applies"
+    assert json.loads(row_b["local_judge_label"]) == ["irrelevant"], (
+        "persona B has no persisted knob of its own and must not inherit persona A's, "
+        "even though both judges share the same model_id() string"
+    )
+
+
+def test_label_calibration_sample_with_persona_knob_does_not_import_torch() -> None:
+    """AC8 / I6: loading a persona's persisted knob (F2c inc4a) at the
+    judge-label call site is a plain SQLite read (`MemoryStore.get_judge_
+    knob_calibration`) — it must not pull torch/sentence_transformers into
+    `sys.modules`. Fresh subprocess (mirrors test_judge_selftune.py's
+    `test_tick_does_not_import_torch_or_sentence_transformers`) so an
+    earlier test's own torch import in this same process can't make an
+    in-process `sys.modules` check meaningless.
+    """
+    script = textwrap.dedent(
+        """
+        import json
+        import sys
+
+        from brain.memory.relevance_judge import FakeRelevanceJudgeProvider, label_calibration_sample
+        from brain.memory.store import Memory, MemoryStore
+
+        store = MemoryStore(db_path=":memory:")
+        mem = Memory.create_new(content="borderline content", memory_type="conversation", domain="us")
+        store.create(mem)
+        store.log_calibration_sample(
+            query="q", candidate_ids=[mem.id], reranker_scores=[1.0], reranker_model_id="m"
+        )
+        judge = FakeRelevanceJudgeProvider(scores={("q", mem.content): -0.5})
+        store.write_judge_knob_calibration(judge.model_id(), slope=1.0, intercept=1.0)
+
+        labeled = label_calibration_sample(store, judge=judge)
+        assert labeled == 1
+        row = store._conn.execute("SELECT local_judge_label FROM calibration_log").fetchone()
+        assert json.loads(row["local_judge_label"]) == ["relevant"], "the fitted knob must still apply"
+
+        assert "torch" not in sys.modules, sorted(sys.modules)
+        assert "sentence_transformers" not in sys.modules, sorted(sys.modules)
+        print("SUBPROCESS_OK")
+        """
+    )
+    repo_root = Path(__file__).resolve().parents[4]
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    assert "SUBPROCESS_OK" in proc.stdout, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"

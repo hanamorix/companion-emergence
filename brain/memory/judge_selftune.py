@@ -398,12 +398,12 @@ def _run_judge_selftune_tick(*, store, now: datetime) -> dict:
     next week's gate recounts them rather than silently losing that Haiku
     signal.
 
-    ⚠ F2c INC4, NOT built here: loading a persona's fitted knob params
-    INTO the live judge pass (threading them through
-    `relevance_judge.build_judge_provider`'s call site, so
-    `label_calibration_sample` actually applies what this tick persists)
-    — this tick only WRITES `judge_knob_calibration`; nothing on the live
-    per-turn or daily-calibration-tick path reads it yet.
+    F2c INC4a (built, elsewhere): loading a persona's fitted knob params
+    INTO the live judge pass — `relevance_judge.label_calibration_sample`
+    now reads what this tick persists (via `store.get_judge_knob_
+    calibration`) and applies it to every `label_for_score` call in its
+    pass, so a completed refit here takes effect on this persona's very
+    next daily calibration tick.
     ⚠ F2c INC5/6, NOT built here: the LoRA (mid) / full fine-tune (beefy)
     weight-retrain tiers, the 2/3-train/1/3-test champion/challenger split
     + rollback (spec §4) — `tune_grade` below is computed and returned so

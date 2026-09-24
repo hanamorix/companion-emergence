@@ -165,13 +165,13 @@ def label_for_score(
     sits, which is the intended effect (the band should track wherever
     the judge's OWN cutoff currently is).
 
-    ⚠ Loading a persona's fitted params INTO this call — threading them
-    through `build_judge_provider`'s call site in
-    `label_calibration_sample` below, so the LIVE judge pass actually uses
-    a persona's own fitted knob — is F2c INC4, NOT built here (inc3 only
-    makes this function CAPABLE of applying fitted params; nothing in the
-    live per-tick call path passes them yet, so today's labeling behavior
-    is byte-for-byte unchanged until inc4 wires that through).
+    F2c INC4a wires the LOAD side: `label_calibration_sample` below now
+    reads this persona's persisted knob via `store.get_judge_knob_
+    calibration(judge.model_id())` once per call and passes it through to
+    every `label_for_score` call in that pass — so the LIVE judge pass
+    genuinely uses a persona's own fitted knob once inc3's weekly tick has
+    written one, and stays byte-for-byte unchanged (both args `None`) for
+    any persona that hasn't had a knob-refit complete yet.
     """
     if band_half_width is None:
         band_half_width = tunables.get_tunable(
@@ -406,6 +406,22 @@ def label_calibration_sample(
     Returns the number of ROWS labeled this call (0 if there was nothing
     to label, or if judge construction itself failed).
 
+    F2c INC4a (spec §5 "where the tuned judge loads from"): before scoring,
+    reads THIS PERSONA's persisted knob-refit params for the judge's model
+    id via `store.get_judge_knob_calibration` — `store` is always the
+    persona-scoped `MemoryStore` the caller (`_run_calibration_tick`)
+    constructed from that persona's OWN `memories.db` (I1: one store per
+    persona is the isolation boundary, no persona-scoping column needed,
+    same as the table itself), so this is a per-persona load by
+    construction (AC11) — no cross-persona bleed is possible without
+    passing another persona's store in. ABSENT-SAFE: no persisted row for
+    this judge model id (fresh install, or a persona whose weekly tick has
+    never completed a knob-refit) -> `slope`/`intercept` both stay `None`,
+    and `label_for_score` below falls back to its fixed sigmoid-0.5/
+    band-0.05 behavior, byte-identical to pre-inc4a labeling. Read ONCE per
+    call (the mapping is constant for the whole sampled batch), not
+    per-candidate.
+
     FAULT ISOLATION (spec: "must not crash the tick or the bridge"):
       - judge construction failure -> logged, returns 0, no rows touched.
       - one row's failure -> logged, that row is skipped (stays unlabeled,
@@ -433,6 +449,12 @@ def label_calibration_sample(
                 "calibration judge: failed to construct the local judge provider — skipping this pass"
             )
             return 0
+
+    # F2c inc4a: this persona's fitted Platt knob for THIS judge's model id,
+    # or (None, None) if absent — see the docstring above.
+    knob = store.get_judge_knob_calibration(judge.model_id())
+    knob_slope: float | None = knob["slope"] if knob is not None else None
+    knob_intercept: float | None = knob["intercept"] if knob is not None else None
 
     haiku_tiebreak = _make_haiku_tiebreak(provider) if provider is not None else None
 
@@ -466,7 +488,9 @@ def label_calibration_sample(
                         raw_scores.append(None)
                         continue
                     raw_score = judge.score(query, mem.content)
-                    provisional, is_ambiguous = label_for_score(raw_score)
+                    provisional, is_ambiguous = label_for_score(
+                        raw_score, slope=knob_slope, intercept=knob_intercept
+                    )
                     local_labels.append(provisional)
                     raw_scores.append(float(raw_score))
                     if is_ambiguous and haiku_tiebreak is not None:

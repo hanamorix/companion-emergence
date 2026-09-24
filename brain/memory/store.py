@@ -468,11 +468,12 @@ CREATE TABLE IF NOT EXISTS judge_selftune_state (
 -- memories.db (I1), so this table can never bleed across personas — the
 -- DATABASE FILE itself is the isolation boundary, same as every other
 -- per-persona table here, no persona-scoping column needed.
--- ⚠ Loading these params AT JUDGE TIME — threading them through
--- `relevance_judge.build_judge_provider`'s call site so the live judge
--- pass actually applies a persona's own fitted knob — is F2c INC4, NOT
--- built here: inc3 only writes and reads this table; nothing in the live
--- per-turn or daily-calibration-tick path consults it yet.
+-- F2c INC4a wires the LOAD side: `relevance_judge.label_calibration_
+-- sample` reads this table (via `get_judge_knob_calibration`, keyed by
+-- the live judge's own `model_id()`) once per daily-calibration-tick pass
+-- and threads the result into every `label_for_score` call that pass
+-- makes, so the live judge pass now genuinely applies a persona's own
+-- fitted knob once inc3's weekly tick has written one.
 CREATE TABLE IF NOT EXISTS judge_knob_calibration (
     judge_model_id TEXT PRIMARY KEY,
     slope REAL NOT NULL,
@@ -1714,11 +1715,10 @@ class MemoryStore:
         """Return the PERSISTED `judge_knob_calibration` row for
         `judge_model_id`, or `None` if this persona's judge has never had a
         knob-refit complete yet (F2c inc3, spec §5). ABSENT-SAFE reader —
-        `None` is the honest "use the fixed sigmoid-0.5 default" signal a
-        caller (eventually `relevance_judge.build_judge_provider`'s
-        call site, F2c inc4) checks for before applying `label_for_score`'s
-        `slope`/`intercept` params. Read-only: does not write or bump
-        anything.
+        `None` is the honest "use the fixed sigmoid-0.5 default" signal
+        the caller (`relevance_judge.label_calibration_sample`, F2c inc4a)
+        checks for before applying `label_for_score`'s `slope`/`intercept`
+        params. Read-only: does not write or bump anything.
         """
         row = self._conn.execute(
             "SELECT judge_model_id, slope, intercept, updated_at "
