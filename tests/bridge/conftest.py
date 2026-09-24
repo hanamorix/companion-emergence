@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-from brain.memory.embeddings import EmbeddingCache, FakeEmbeddingProvider
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 
@@ -87,12 +86,3 @@ def hebbian(persona_dir: Path) -> Iterator[HebbianMatrix]:
         h.close()
 
 
-@pytest.fixture
-def embeddings(persona_dir: Path) -> Iterator[EmbeddingCache]:
-    """An open in-memory EmbeddingCache with FakeEmbeddingProvider."""
-    provider = FakeEmbeddingProvider(dim=256)
-    e = EmbeddingCache(persona_dir / "embeddings.db", provider)
-    try:
-        yield e
-    finally:
-        e.close()

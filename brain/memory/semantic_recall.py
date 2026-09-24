@@ -60,8 +60,10 @@ from pathlib import Path
 
 import numpy as np
 
+from brain.memory import embeddings as embeddings_mod
 from brain.memory import reranker as reranker_mod
-from brain.memory.embeddings import build_embedding_cache, cosine_similarity, hash_content
+from brain.memory.embedding_matrix import EmbeddingMatrix, build_embedding_matrix
+from brain.memory.embeddings import cosine_similarity
 from brain.memory.relevance import CANDIDATE_POOL
 from brain.memory.store import Memory, MemoryStore
 
@@ -173,19 +175,25 @@ def select_standouts(reranked_desc: list[tuple[str, float]]) -> SemanticSurfacin
 
 
 def build_semantic_candidate_pool(
-    store: MemoryStore, embeddings_cache
+    store: MemoryStore, matrix: EmbeddingMatrix
 ) -> dict[str, tuple[Memory, np.ndarray]]:
-    """Active-STATE memories that already have a cached vector under THIS
-    cache's model_id, paired with that vector.
+    """Active-STATE memories that already have a vector on their row under
+    the warm matrix's model_id, paired with that vector.
 
-    Deliberately NEVER computes a new embedding for an uncached memory —
+    Deliberately NEVER computes a new embedding for an unembedded memory —
     that would be exactly the forbidden hot-path bulk embed. An active
-    memory with no cached vector yet (the idle backfill hasn't reached it)
-    simply isn't a semantic candidate this turn. This IS the "graceful
-    warm-up" contract from the spec: semantic coverage grows as the corpus
-    embeds; a cold/sparse persona degrades to the lexical fallback (empty
-    pool here -> `run_semantic_recall` returns None) until backfill catches
-    up.
+    memory with no row vector yet (embed-on-write hasn't reached it, or the
+    later idle backfill hasn't caught it up) simply isn't a semantic
+    candidate this turn. This IS the "graceful warm-up" contract from the
+    spec: semantic coverage grows as the corpus embeds; a cold/sparse
+    persona degrades to the lexical fallback (empty pool here ->
+    `run_semantic_recall` returns None) until backfill catches up.
+
+    Sources vectors from `matrix.snapshot()` (F1 increment 2) — a
+    `{memory_id: vector}` map keyed identically to the row's own id, so
+    joining against `store.list_active()` is a direct id lookup, no
+    content-hash join needed (the old `embeddings_cache.all_hashes_and_
+    vectors()` + `hash_content(mem.content)` join this replaces).
 
     Fold-in fix (b), #231 (2026-09-10): filters to ``mem.state == "active"``.
     ``store.list_active()`` filters only the ``active`` deactivation flag,
@@ -203,14 +211,14 @@ def build_semantic_candidate_pool(
     scoring must never tick the counter (only actual surfacing does, via the
     caller's `bump_recall` calls on the final selected set).
     """
-    hash_to_vector = dict(embeddings_cache.all_hashes_and_vectors())
-    if not hash_to_vector:
+    vectors = matrix.snapshot()
+    if not vectors:
         return {}
     pool: dict[str, tuple[Memory, np.ndarray]] = {}
     for mem in store.list_active():
         if mem.state != "active":
             continue
-        vec = hash_to_vector.get(hash_content(mem.content))
+        vec = vectors.get(mem.id)
         if vec is not None:
             pool[mem.id] = (mem, vec)
     return pool
@@ -241,7 +249,10 @@ def run_semantic_recall(
     """Attempt semantic-PRIMARY recall for one turn.
 
     Embeds `user_input` (~34ms, synchronous — the ONE allowed in-turn embed,
-    spec decision 4) via this persona's embedding cache/provider, cosines it
+    spec decision 4) via the shared process-cached embedding provider
+    (`build_embedding_provider()` — F1 #259 increment 8: the per-recall
+    query embed is transient and is never cached/persisted, so it goes
+    straight through the provider with no cache row to write), cosines it
     against the model_id-scoped candidate pool as a CHEAP COARSE CUT (top-
     `relevance.CANDIDATE_POOL`), reranks an auto-scaled-width slice of that
     coarse cut with a cross-encoder (`reranker.build_reranker_provider` +
@@ -257,8 +268,8 @@ def run_semantic_recall(
       - an empty or sparse candidate pool (cold-start / idle backfill not
         caught up — "graceful warm-up"),
       - ANY failure ANYWHERE in this function — constructing the local
-        embedding/reranker provider/cache, embedding the query, building
-        the candidate pool, cosine scoring, reranking, or floor-gating
+        embedding/reranker provider, embedding the query, building the
+        candidate pool, cosine scoring, reranking, or floor-gating
         (fail-soft: a broken/missing local model, or a transient store
         error such as a locked sqlite db during the background backfill,
         must never break recall — it only demotes this turn to
@@ -275,67 +286,56 @@ def run_semantic_recall(
     unchanged.
     """
     try:
-        embeddings_cache = build_embedding_cache(persona_dir)
-    except Exception:  # noqa: BLE001 — fail-soft: never break recall
-        log.exception("run_semantic_recall: failed to open embedding cache — falling back to lexical")
-        return None
-    try:
-        try:
-            pool = build_semantic_candidate_pool(store, embeddings_cache)
-            if not pool:
-                return None
-            try:
-                query_vec = embeddings_cache.embed_query(user_input)
-            except Exception:  # noqa: BLE001 — fail-soft
-                log.exception("run_semantic_recall: query embed failed — falling back to lexical")
-                return None
-
-            cosine_scored = [
-                (mid, cosine_similarity(query_vec, vec)) for mid, (_, vec) in pool.items()
-            ]
-            cosine_scored.sort(key=lambda pair: -pair[1])
-            coarse = cosine_scored[:CANDIDATE_POOL]
-
-            reranker_provider = reranker_mod.build_reranker_provider()
-            # #231-fix: calibrate on REAL candidate-pool documents (a small
-            # sample off the front of the already cosine-sorted `coarse`
-            # list) rather than a synthetic placeholder — see
-            # reranker.get_rerank_width's docstring.
-            calibration_sample = [
-                pool[mid][0].content
-                for mid, _ in coarse[: reranker_mod.CALIBRATION_SAMPLE_SIZE]
-            ]
-            width = reranker_mod.get_rerank_width(len(coarse), reranker_provider, calibration_sample)
-            to_rerank = coarse[:width]
-            rerank_ids = [mid for mid, _ in to_rerank]
-            documents = [pool[mid][0].content for mid in rerank_ids]
-            rerank_scores = list(reranker_provider.rerank(user_input, documents))
-            reranked = list(zip(rerank_ids, rerank_scores, strict=True))
-            reranked.sort(key=lambda pair: -pair[1])
-
-            tiers = select_standouts(reranked)
-            if tiers is None:
-                return None
-
-            full = [pool[mid][0] for mid in tiers.full_ids]
-            snippet = [pool[mid][0] for mid in tiers.snippet_ids]
-            return SemanticRecallResult(full=full, snippet=snippet, scores=dict(reranked))
-        except Exception:  # noqa: BLE001 — fail-soft: ANY failure demotes to lexical, never raises
-            log.warning(
-                "run_semantic_recall: semantic path failed after opening the embedding cache "
-                "— falling back to lexical",
-                exc_info=True,
-            )
+        matrix = build_embedding_matrix(store.db_path)
+        pool = build_semantic_candidate_pool(store, matrix)
+        if not pool:
             return None
-    finally:
-        # #231 Fix 4: this `finally` sat outside the inner `except Exception`
-        # above, so a pathological `close()` error could escape this
-        # function's documented "never raises" contract (previously caught
-        # only by the caller-side wrap in `_build_recall_block`). Make
-        # cleanup self-contained: a close error is caught/logged here and
-        # never propagates, matching the "ANY failure ... never raises"
-        # contract this function's own docstring states.
         try:
-            embeddings_cache.close()
-        except Exception:  # noqa: BLE001 — fail-soft: close() must never break the contract
-            log.warning("run_semantic_recall: embeddings_cache.close() failed", exc_info=True)
+            # Looked up via the MODULE (not a bare imported name) so a
+            # test's monkeypatch on `embeddings.build_embedding_provider` is
+            # honored — mirrors `is_duplicate`'s/`MemoryStore.embed_row`'s
+            # identical dynamic lookup. F1 #259 increment 8: the per-recall
+            # query embed is transient (never persisted), so it goes
+            # straight through the process-cached provider — no cache row
+            # to write or evict.
+            query_vec = embeddings_mod.build_embedding_provider().embed(user_input).astype("float32")
+        except Exception:  # noqa: BLE001 — fail-soft
+            log.exception("run_semantic_recall: query embed failed — falling back to lexical")
+            return None
+
+        cosine_scored = [
+            (mid, cosine_similarity(query_vec, vec)) for mid, (_, vec) in pool.items()
+        ]
+        cosine_scored.sort(key=lambda pair: -pair[1])
+        coarse = cosine_scored[:CANDIDATE_POOL]
+
+        reranker_provider = reranker_mod.build_reranker_provider()
+        # #231-fix: calibrate on REAL candidate-pool documents (a small
+        # sample off the front of the already cosine-sorted `coarse`
+        # list) rather than a synthetic placeholder — see
+        # reranker.get_rerank_width's docstring.
+        calibration_sample = [
+            pool[mid][0].content
+            for mid, _ in coarse[: reranker_mod.CALIBRATION_SAMPLE_SIZE]
+        ]
+        width = reranker_mod.get_rerank_width(len(coarse), reranker_provider, calibration_sample)
+        to_rerank = coarse[:width]
+        rerank_ids = [mid for mid, _ in to_rerank]
+        documents = [pool[mid][0].content for mid in rerank_ids]
+        rerank_scores = list(reranker_provider.rerank(user_input, documents))
+        reranked = list(zip(rerank_ids, rerank_scores, strict=True))
+        reranked.sort(key=lambda pair: -pair[1])
+
+        tiers = select_standouts(reranked)
+        if tiers is None:
+            return None
+
+        full = [pool[mid][0] for mid in tiers.full_ids]
+        snippet = [pool[mid][0] for mid in tiers.snippet_ids]
+        return SemanticRecallResult(full=full, snippet=snippet, scores=dict(reranked))
+    except Exception:  # noqa: BLE001 — fail-soft: ANY failure demotes to lexical, never raises
+        log.warning(
+            "run_semantic_recall: semantic path failed — falling back to lexical",
+            exc_info=True,
+        )
+        return None

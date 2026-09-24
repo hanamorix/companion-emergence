@@ -12,7 +12,7 @@ Chat endpoints added in Task 5:
   POST /sessions/close     — explicit ingest trigger
 
 Singletons are constructed once at lifespan startup and held on app.state.bridge:
-  - MemoryStore, HebbianMatrix, EmbeddingCache, LLMProvider
+  - MemoryStore, HebbianMatrix, LLMProvider
   - EventBus
   - in_flight_locks: dict[session_id, asyncio.Lock]
 """
@@ -73,7 +73,6 @@ from brain.health.alarm import compute_pending_alarms
 from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
 from brain.health.walker import walk_persona
 from brain.ingest.buffer import _SESSION_ID_RE as _BUFFER_SESSION_ID_RE
-from brain.memory.embeddings import build_embedding_cache
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.persona_config import PersonaConfig
@@ -476,8 +475,7 @@ def _close_session_blocking(
 ) -> Any:
     """Wrap brain.ingest.pipeline.close_session — blocks; called via asyncio.to_thread.
 
-    Same per-call store pattern as _respond_blocking; close_session needs
-    embeddings too for dedupe.
+    Same per-call store pattern as _respond_blocking.
     """
     from contextlib import ExitStack
 
@@ -488,15 +486,12 @@ def _close_session_blocking(
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
-        embeddings = build_embedding_cache(persona_dir)
-        stack.callback(embeddings.close)
         return close_session(
             persona_dir,
             session_id,
             store=store,
             hebbian=hebbian,
             provider=provider,
-            embeddings=embeddings,
         )
 
 
@@ -520,15 +515,12 @@ def _snapshot_session_blocking(
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
-        embeddings = build_embedding_cache(persona_dir)
-        stack.callback(embeddings.close)
         return extract_session_snapshot(
             persona_dir,
             session_id,
             store=store,
             hebbian=hebbian,
             provider=provider,
-            embeddings=embeddings,
         )
 
 
@@ -677,15 +669,12 @@ def _drain_sessions_blocking(
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
-        embeddings = build_embedding_cache(persona_dir)
-        stack.callback(embeddings.close)
         return snapshot_stale_sessions(
             persona_dir,
             silence_minutes=silence_minutes,
             store=store,
             hebbian=hebbian,
             provider=provider,
-            embeddings=embeddings,
         )
 
 
@@ -803,8 +792,8 @@ class ChatHistoryResponse(BaseModel):
 class BridgeAppState:
     """Bridge runtime state held on app.state.bridge.
 
-    Note: SQLite-backed stores (MemoryStore, HebbianMatrix, EmbeddingCache)
-    are NOT held here. Each worker thread / handler that needs them opens
+    Note: SQLite-backed stores (MemoryStore, HebbianMatrix) are NOT held
+    here. Each worker thread / handler that needs them opens
     its own per-call instances against `persona_dir`. The `provider` is
     safe to share — it's stateless (Claude CLI invokes a subprocess per
     call; no long-lived resource).
@@ -1360,12 +1349,10 @@ def build_app(
                     stack.callback(store.close)
                     hebbian = HebbianMatrix(s.persona_dir / "hebbian.db")
                     stack.callback(hebbian.close)
-                    embeddings = build_embedding_cache(s.persona_dir)
-                    stack.callback(embeddings.close)
                     new_sid = perform_rollover(
                         s.persona_dir, stale_sid, s.persona,
                         seed_mode="summary_only", now=now, provider=s.provider,
-                        store=store, hebbian=hebbian, embeddings=embeddings,
+                        store=store, hebbian=hebbian,
                     )
                 return {"session_id": new_sid}
             except Exception:

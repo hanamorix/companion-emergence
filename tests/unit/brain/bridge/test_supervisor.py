@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 
 from brain.bridge import persisted_cadence
@@ -16,6 +17,7 @@ from brain.bridge.events import EventBus
 from brain.bridge.provider import FakeProvider
 from brain.bridge.supervisor import (
     _ROLLING_LOG_POLICIES,
+    _run_clustering_tick,
     _run_heartbeat_tick,
     _run_initiate_review_tick,  # noqa: F401 — imported to assert symbol exists
     _run_log_rotation_tick,
@@ -314,12 +316,15 @@ def test_supervisor_snapshot_sweep_keeps_session_alive(tmp_path: Path) -> None:
 
 
 def test_supervisor_tick_embeds_backlogged_memory(tmp_path: Path) -> None:
-    """Live-path proof for the Stage 2 embedding backfill wiring: a memory
+    """Live-path proof for the embedding backfill wiring (F1 #259 increment
+    3: writes land on the ROW, not the old embeddings.db cache): a memory
     committed straight via MemoryStore.create() (bypassing the ingest
     pipeline's own embed-on-write, like ~11 real write sites do) gets
-    embedded by the supervisor's own per-tick block — not a mock-call
-    assertion, an actual vector landing in embeddings.db."""
-    from brain.memory.embeddings import build_embedding_cache
+    embedded by the supervisor's own idle-gated per-tick block — not a
+    mock-call assertion, an actual vector landing in the row's `embedding`
+    column. Chat is idle throughout (the suite-wide cli_throttle reset
+    leaves it idle by default — see the busy-defers test below for the
+    other half of the idle gate)."""
     from brain.memory.store import Memory, MemoryStore
 
     persona_dir = _persona_dir(tmp_path)
@@ -353,11 +358,224 @@ def test_supervisor_tick_embeds_backlogged_memory(tmp_path: Path) -> None:
     stop.set()
     t.join(timeout=30.0)
 
-    cache = build_embedding_cache(persona_dir)
+    store2 = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
     try:
-        assert cache.has(memory.content) is True
+        row = store2._conn.execute(
+            "SELECT embedding FROM memories WHERE id = ?", (memory.id,)
+        ).fetchone()
+        assert row is not None
+        assert row["embedding"] is not None
     finally:
-        cache.close()
+        store2.close()
+
+
+def test_supervisor_embedding_backfill_defers_while_chat_active(tmp_path: Path) -> None:
+    """Idle-gate proof (F1 #259 increment 3): before this increment the
+    backfill ran on EVERY base tick unconditionally, unlike every other
+    background maintenance cadence in this file. With chat marked
+    interactive-active throughout, `cli_throttle.background_slot()` must
+    deny the backfill's slot on every tick, so a backlogged memory stays
+    un-embedded across several ticks — mirrors
+    tests/unit/brain/bridge/test_background_yields.py's
+    mark_interactive_active() pattern for the other idle-gated engines."""
+    from brain.bridge import cli_throttle
+    from brain.memory.store import Memory, MemoryStore
+
+    persona_dir = _persona_dir(tmp_path)
+    store = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
+    memory = Memory.create_new(
+        content="a memory long enough to clear the embed min-chars floor",
+        memory_type="conversation",
+        domain="us",
+    )
+    store.create(memory)
+    store.close()
+
+    cli_throttle.mark_interactive_active()
+
+    bus = _CapturingBus()
+    stop = threading.Event()
+    t = threading.Thread(
+        target=run_folded,
+        args=(stop,),
+        kwargs={
+            "persona_dir": persona_dir,
+            "provider": FakeProvider(),
+            "event_bus": bus,
+            "tick_interval_s": 0.1,
+            "silence_minutes": 5.0,
+            "heartbeat_interval_s": None,
+            "soul_review_interval_s": None,
+            "finalize_interval_s": None,
+        },
+    )
+    t.start()
+    _wait_until(
+        lambda: len([e for e in bus.events if e.get("type") == "supervisor_tick"]) >= 3
+    )
+    stop.set()
+    t.join(timeout=30.0)
+
+    store2 = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
+    try:
+        row = store2._conn.execute(
+            "SELECT embedding FROM memories WHERE id = ?", (memory.id,)
+        ).fetchone()
+        assert row is not None
+        assert row["embedding"] is None, (
+            "backfill must be idle-gated: deferred on every tick while chat is active"
+        )
+    finally:
+        store2.close()
+
+
+def test_supervisor_clustering_tick_writes_row_and_centroids_not_embeddings_db(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live-path proof for F1 #259 increment 4's clustering rewire:
+    `_run_clustering_tick` sources vectors from the warm matrix over
+    `memories.db` (via `run_clustering_pass`) and writes `cluster_id`/
+    `cluster_model_id` onto the row plus the `cluster_centroids` table —
+    not the old `MemoryClusterStore`/`embeddings.db` side file this tick
+    used to open unconditionally on every firing. Seeds rows directly
+    (bypassing the real embed provider, same convention as
+    `brain/memory/clustering.py`'s own tests) and aligns the active
+    embedding tier to the seeded model_id so the matrix's lazy build
+    actually finds them."""
+    from brain.bridge import model_tier
+    from brain.memory.clustering import MIN_VECTORS_TO_CLUSTER
+    from brain.memory.store import Memory, MemoryStore
+
+    test_model_id = "fake-clustering-tick-model"
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, test_model_id)
+
+    persona_dir = _persona_dir(tmp_path)
+    store = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
+    ids: list[str] = []
+    for i in range(MIN_VECTORS_TO_CLUSTER):
+        m = Memory.create_new(
+            content=f"clustering tick memory number {i}",
+            memory_type="conversation",
+            domain="us",
+        )
+        store.create(m)
+        vec = np.full(384, float(i), dtype=np.float32)
+        store._conn.execute(
+            "UPDATE memories SET embedding = ?, embedding_model_id = ? WHERE id = ?",
+            (vec.tobytes(), test_model_id, m.id),
+        )
+        ids.append(m.id)
+    store._conn.commit()
+    store.close()
+
+    _run_clustering_tick(persona_dir)
+
+    store2 = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
+    try:
+        for mid in ids:
+            row = store2._conn.execute(
+                "SELECT cluster_id, cluster_model_id FROM memories WHERE id = ?", (mid,)
+            ).fetchone()
+            assert row is not None
+            assert row["cluster_id"] is not None
+            assert row["cluster_model_id"] == test_model_id
+        n_centroids = store2._conn.execute(
+            "SELECT COUNT(*) FROM cluster_centroids WHERE model_id = ?", (test_model_id,)
+        ).fetchone()[0]
+        assert n_centroids > 0
+    finally:
+        store2.close()
+
+    # The old side file must never have been created — this tick no longer
+    # opens embeddings.db at all.
+    assert not (persona_dir / "embeddings.db").exists()
+
+
+def test_supervisor_startup_deletes_legacy_embeddings_db_when_fully_embedded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live-path proof for the F1 #259 increment 9 startup hook: run_folded's
+    one-shot, run-once fail-safe deletion of the legacy embeddings.db file
+    (spec §5 / S9, invariant I9) actually runs during startup — even with
+    stop_event already set, so the main tick loop body never executes at
+    all, proving the hook lives before that loop, not inside it — and
+    actually deletes the stale file once every active row already carries a
+    current-model embedding."""
+    from brain.memory import embeddings as embeddings_mod
+    from brain.memory.store import Memory, MemoryStore
+
+    provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+
+    persona_dir = _persona_dir(tmp_path)
+    store = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
+    memory = Memory.create_new(
+        content="a memory long enough to clear the embed min-chars floor",
+        memory_type="conversation",
+        domain="us",
+    )
+    store.create(memory)
+    store.embed_row(memory.id, memory.content)
+    store.close()
+
+    db_path = persona_dir / "embeddings.db"
+    db_path.write_bytes(b"legacy sqlite content, never actually read")
+
+    bus = EventBus()
+    stop = threading.Event()
+    stop.set()  # already set — the main tick loop body must never run
+
+    run_folded(
+        stop,
+        persona_dir=persona_dir,
+        provider=FakeProvider(),
+        event_bus=bus,
+        tick_interval_s=0.1,
+        heartbeat_interval_s=None,
+    )
+
+    assert not db_path.exists()
+
+
+def test_supervisor_startup_defers_legacy_embeddings_db_deletion_with_backlog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same startup hook, other half: a still-un-embedded active row means
+    the backlog gate is non-empty, so the legacy file must be left in place
+    for the next startup rather than deleted early."""
+    from brain.memory import embeddings as embeddings_mod
+    from brain.memory.store import Memory, MemoryStore
+
+    provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+
+    persona_dir = _persona_dir(tmp_path)
+    store = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
+    memory = Memory.create_new(
+        content="a memory long enough to clear the embed min-chars floor, left unembedded",
+        memory_type="conversation",
+        domain="us",
+    )
+    store.create(memory)  # deliberately NOT embedded
+    store.close()
+
+    db_path = persona_dir / "embeddings.db"
+    db_path.write_bytes(b"legacy sqlite content, never actually read")
+
+    bus = EventBus()
+    stop = threading.Event()
+    stop.set()
+
+    run_folded(
+        stop,
+        persona_dir=persona_dir,
+        provider=FakeProvider(),
+        event_bus=bus,
+        tick_interval_s=0.1,
+        heartbeat_interval_s=None,
+    )
+
+    assert db_path.exists()
 
 
 def test_supervisor_finalize_cadence_drops_old_sessions(tmp_path: Path) -> None:

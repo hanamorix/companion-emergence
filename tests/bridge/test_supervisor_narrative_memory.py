@@ -20,9 +20,11 @@ import threading
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 
-from brain.bridge.supervisor import run_folded
+from brain.bridge.supervisor import _run_narrative_memory_pass, run_folded
+from brain.memory.store import Memory, MemoryStore
 
 
 def test_supervisor_runs_arc_update_after_forgetting_on_soul_review_tick(
@@ -152,3 +154,49 @@ def test_supervisor_arc_update_failure_is_isolated(
 
     # Soul-review kept running even though arc-update raised each tick.
     assert soul_review_calls[0] >= 2
+
+
+def test_embeddings_adapter_reads_the_warm_matrix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F1 #259 step 3: the narrative_memory `EmbeddingsView` adapter
+    (`_EmbeddingsByMemoryId`, nested inside `_run_narrative_memory_pass`)
+    must be a PURE read off the warm matrix, keyed by memory_id directly —
+    no more `store.get()` (which bumps recall_count) + `embeddings_cache.
+    get_or_compute()` compute-on-miss. Verifies both halves of that
+    contract directly against the real `_run_narrative_memory_pass`: an
+    embedded row's vector comes back, and an unembedded (or wholly unknown)
+    memory id returns None rather than triggering a compute."""
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+
+    store = MemoryStore(persona_dir / "memories.db")
+    embedded = Memory.create_new(content="has a vector", memory_type="event", domain="d")
+    unembedded = Memory.create_new(content="no vector yet", memory_type="event", domain="d")
+    store.create(embedded)
+    store.create(unembedded)
+    vec = np.full(384, 0.25, dtype=np.float32)
+    store._conn.execute(  # noqa: SLF001
+        "UPDATE memories SET embedding = ?, embedding_model_id = ? WHERE id = ?",
+        (vec.tobytes(), "test-model", embedded.id),
+    )
+    store._conn.commit()  # noqa: SLF001
+    store.close()
+
+    from brain.bridge import model_tier
+
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, "test-model")
+
+    captured: dict[str, object] = {}
+
+    def _capture_run_pass(*args, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("brain.bridge.supervisor.narrative_memory_run_pass", _capture_run_pass)
+
+    _run_narrative_memory_pass(persona_dir, provider=MagicMock(), event_bus=MagicMock())
+
+    embeddings_view = captured["embeddings"]
+    np.testing.assert_array_equal(embeddings_view.get(embedded.id), vec)
+    assert embeddings_view.get(unembedded.id) is None, "an unembedded memory must return None, not compute one"
+    assert embeddings_view.get("unknown-memory-id") is None

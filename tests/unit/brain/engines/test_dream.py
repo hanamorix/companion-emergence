@@ -64,7 +64,6 @@ def engine(store: MemoryStore, hebbian: HebbianMatrix, tmp_path: Path) -> DreamE
     return DreamEngine(
         store=store,
         hebbian=hebbian,
-        embeddings=None,
         provider=FakeProvider(),
         log_path=tmp_path / "dreams.log.jsonl",
         persona_name="Nell",
@@ -307,7 +306,6 @@ def test_run_cycle_respects_neighbour_limit(
     capped_engine = DreamEngine(
         store=store,
         hebbian=hebbian,
-        embeddings=None,
         provider=FakeProvider(),
         log_path=tmp_path / "dreams.log.jsonl",
         persona_name="Nell",
@@ -346,7 +344,6 @@ def test_run_cycle_auto_prefixes_when_llm_omits_dream_prefix(
     engine = DreamEngine(
         store=store,
         hebbian=hebbian,
-        embeddings=None,
         provider=_UnprefixedFakeProvider(),
         log_path=tmp_path / "dreams.log.jsonl",
         persona_name="Nell",
@@ -367,7 +364,6 @@ def test_run_cycle_does_not_double_prefix_when_llm_already_prefixed(
     engine = DreamEngine(
         store=store,
         hebbian=hebbian,
-        embeddings=None,
         provider=_PrefixedFakeProvider(),
         log_path=tmp_path / "dreams.log.jsonl",
         persona_name="Nell",
@@ -426,7 +422,6 @@ def test_dream_system_prompt_uses_persona_name(tmp_path: Path) -> None:
         engine = DreamEngine(
             store=store,
             hebbian=hm,
-            embeddings=None,
             provider=CapturingProvider(),
             persona_name="Iris",
             persona_system_prompt="You are Iris. Reflect in first person, 2-3 sentences, starting with 'DREAM: '.",
@@ -469,7 +464,6 @@ def test_dream_completion_emits_initiate_candidate(tmp_path: Path) -> None:
         engine = DreamEngine(
             store=store,
             hebbian=hm,
-            embeddings=None,
             provider=FakeProvider(),
             log_path=persona_dir / "dreams.log.jsonl",
             persona_dir=persona_dir,
@@ -509,7 +503,6 @@ def test_dream_initiate_candidate_carries_real_emotion_vector(tmp_path: Path) ->
         engine = DreamEngine(
             store=store,
             hebbian=hm,
-            embeddings=None,
             provider=FakeProvider(),
             log_path=persona_dir / "dreams.log.jsonl",
             persona_dir=persona_dir,
@@ -549,7 +542,6 @@ def test_dream_engine_empty_persona_raises() -> None:
             DreamEngine(
                 store=store,
                 hebbian=hm,
-                embeddings=None,
                 provider=FakeProvider(),
                 # persona_name omitted → should raise
             )

@@ -73,7 +73,6 @@ def perform_rollover(
     provider: LLMProvider | None = None,
     store=None,
     hebbian=None,
-    embeddings=None,
     config: dict | None = None,
 ) -> str | None:
     """Roll ``old_sid`` over into a fresh session. Returns the new session id, or
@@ -96,7 +95,7 @@ def perform_rollover(
             extract_session_snapshot(
                 persona_dir, old_sid,
                 store=store, hebbian=hebbian, provider=provider,
-                embeddings=embeddings, config=config,
+                config=config,
             )
         except Exception:
             logger.exception("rollover: extraction failed session=%s (continuing)", old_sid)
@@ -222,7 +221,6 @@ def maybe_weekly_rollover(
     provider: LLMProvider | None = None,
     store=None,
     hebbian=None,
-    embeddings=None,
     config: dict | None = None,
     is_session_busy: Callable[[str], bool] | None = None,
 ) -> str | None:
@@ -270,7 +268,7 @@ def maybe_weekly_rollover(
     new_sid = perform_rollover(
         persona_dir, session_id, persona_name,
         seed_mode="tiers_plus_tail", now=now, provider=provider,
-        store=store, hebbian=hebbian, embeddings=embeddings, config=config,
+        store=store, hebbian=hebbian, config=config,
     )
 
     # #231 RERANKER RE-ARCHITECTURE (2026-09-10): the Stage-4 per-persona

@@ -101,10 +101,11 @@ def _fake_embedding_provider_by_default(
 
     build_embedding_provider() is the PRODUCTION default (FastEmbedProvider —
     a real local ONNX model, downloaded once over the network into a shared
-    cache dir). Every brain/bridge/{server,supervisor,daemon}.py call site
-    that used to hardcode FakeEmbeddingProvider(dim=256) directly now goes
-    through build_embedding_cache()/build_embedding_provider() (Stage 1 of
-    the local semantic-retrieval build), so ANY test that exercises those
+    cache dir). Every production call site that embeds anything (recall's
+    query embed, dedupe's candidate embed, embed-on-write) goes through this
+    one function (Stage 1 of the local semantic-retrieval build; the old
+    build_embedding_cache()/EmbeddingCache layer in front of it is gone as
+    of F1 #259 increment 8), so ANY test that exercises those
     code paths — even indirectly, via a background thread the test itself
     never awaits — would otherwise attempt a real model download: slow,
     network-dependent, and (seen while landing this fixture) capable of
@@ -145,6 +146,37 @@ def _reset_embedding_provider_cache() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _reset_embedding_matrix_cache() -> Iterator[None]:
+    """Reset embedding_matrix.build_embedding_matrix()'s process-level matrix
+    cache before and after each test — mirrors `_reset_embedding_provider_cache`
+    above for the same reason: the cache is process-global and keyed by
+    `str(db_path)`, so without a reset a matrix built (and possibly warmed)
+    by one test against a given path could leak into a later test that
+    happens to reuse that path, or hold a stale reference across tests that
+    each expect a fresh singleton for their own tmp_path db."""
+    from brain.memory import embedding_matrix
+
+    embedding_matrix._reset_embedding_matrix_cache()
+    yield
+    embedding_matrix._reset_embedding_matrix_cache()
+
+
+@pytest.fixture(autouse=True)
+def _reset_embedding_backfill_batch_cache() -> Iterator[None]:
+    """Reset embedding_backfill's measured/derived batch-size cache before
+    and after each test — mirrors `_reset_embedding_provider_cache` above:
+    the cache is process-global and keyed by model_id, measured once per
+    process (F1 #259 increment 3), so without a reset a batch size measured
+    (and possibly deliberately controlled/monkeypatched) by one test could
+    leak into a later test expecting its own fresh measurement."""
+    from brain.memory import embedding_backfill
+
+    embedding_backfill._reset_batch_size_cache()
+    yield
+    embedding_backfill._reset_batch_size_cache()
+
+
+@pytest.fixture(autouse=True)
 def _fake_reranker_provider_by_default(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -180,9 +212,10 @@ def _fake_reranker_provider_by_default(
     # brain.tools.impls.search_memories) import the module itself
     # (`from brain.memory import reranker as reranker_mod`) and call
     # `reranker_mod.build_reranker_provider()` — a dynamic attribute lookup
-    # at call time, exactly like embeddings.build_embedding_cache's
-    # same-module call to build_embedding_provider() — so patching this ONE
-    # module attribute is sufficient to intercept every call site.
+    # at call time, exactly like every embedding-provider call site's
+    # identical dynamic lookup on `embeddings.build_embedding_provider` — so
+    # patching this ONE module attribute is sufficient to intercept every
+    # call site.
     monkeypatch.setattr(
         reranker, "build_reranker_provider", lambda: reranker.FakeRerankerProvider()
     )

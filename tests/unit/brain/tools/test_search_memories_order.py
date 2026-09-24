@@ -26,11 +26,23 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from brain.memory.embeddings import EmbeddingCache, EmbeddingProvider
+from brain.bridge import model_tier
+from brain.memory.embeddings import EmbeddingProvider
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.semantic_recall import RERANK_FLOOR
 from brain.memory.store import Memory, MemoryStore
 from brain.tools.dispatch import dispatch
+
+_SCRIPTED_MODEL_ID = "scripted-test"
+# Row vectors now flow through EmbeddingMatrix. As of #259 inc7 red-team F1,
+# EmbeddingMatrix no longer enforces any fixed expected-dim at decode time
+# (each row decodes to its own stored byte-length) — a 2-dim test vector
+# WOULD now appear in a `matrix.snapshot()` just fine. This suite still pads
+# every scripted vector to 384 dims (see `_unit_vec_with_cosine` /
+# `_query_unit_vec`) purely to look production-realistic and to keep every
+# row in one matrix sharing a uniform shape (needed elsewhere, e.g.
+# clustering's `np.stack`), not because a shorter vector would be dropped.
+_EMBED_DIM = 384
 
 
 class _ScriptedProvider(EmbeddingProvider):
@@ -50,13 +62,27 @@ class _ScriptedProvider(EmbeddingProvider):
         return self._dim
 
     def model_id(self) -> str:
-        return "scripted-test"
+        return _SCRIPTED_MODEL_ID
 
 
 def _unit_vec_with_cosine(score: float) -> np.ndarray:
-    """A 2-D unit vector whose cosine similarity against [1.0, 0.0] is
-    exactly `score` (for |score| <= 1)."""
-    return np.array([score, math.sqrt(max(0.0, 1.0 - score * score))], dtype=np.float32)
+    """A `_EMBED_DIM`-wide vector whose cosine similarity against
+    `_query_unit_vec()` is exactly `score` (for |score| <= 1) — only the
+    first two components are non-zero; the zero padding contributes nothing
+    to either the dot product or the norm, so it never perturbs the
+    hand-chosen cosine relationship."""
+    vec = np.zeros(_EMBED_DIM, dtype=np.float32)
+    vec[0] = score
+    vec[1] = math.sqrt(max(0.0, 1.0 - score * score))
+    return vec
+
+
+def _query_unit_vec() -> np.ndarray:
+    """The `_EMBED_DIM`-wide vector `_unit_vec_with_cosine`'s cosine scores
+    are measured against — the scripted "query" vector."""
+    vec = np.zeros(_EMBED_DIM, dtype=np.float32)
+    vec[0] = 1.0
+    return vec
 
 
 def _seed(
@@ -75,19 +101,26 @@ def _seed(
 
 def _ctx(tmp_path: Path) -> dict:
     return {
-        "store": MemoryStore(":memory:"),
+        "store": MemoryStore(tmp_path / "memories.db"),
         "hebbian": HebbianMatrix(":memory:"),
         "persona_dir": tmp_path,
     }
 
 
-def _seed_vectors(persona_dir: Path, vectors: dict[str, np.ndarray], *, dim: int, contents: list[str]) -> None:
-    cache = EmbeddingCache(persona_dir / "embeddings.db", _ScriptedProvider(vectors, dim=dim))
-    try:
-        for content in contents:
-            cache.get_or_compute(content)
-    finally:
-        cache.close()
+def _seed_vectors(store: MemoryStore, vectors: dict[str, np.ndarray], *, contents_by_id: dict[str, str]) -> None:
+    """Write a vector directly onto each memory row's `embedding` /
+    `embedding_model_id` columns (F1 #259: `_semantic_top_k` now sources the
+    candidate pool from the warm matrix over these row columns, not the old
+    content-hash `embeddings.db` cache). `contents_by_id` maps memory id ->
+    its content, used to look the right vector up in `vectors` (keyed by
+    content, matching `_patch_provider`'s scripting)."""
+    for memory_id, content in contents_by_id.items():
+        vec = vectors[content]
+        store._conn.execute(  # noqa: SLF001
+            "UPDATE memories SET embedding = ?, embedding_model_id = ? WHERE id = ?",
+            (np.asarray(vec, dtype=np.float32).tobytes(), _SCRIPTED_MODEL_ID, memory_id),
+        )
+    store._conn.commit()  # noqa: SLF001
 
 
 def _patch_provider(monkeypatch: pytest.MonkeyPatch, vectors: dict[str, np.ndarray], *, dim: int) -> None:
@@ -95,6 +128,15 @@ def _patch_provider(monkeypatch: pytest.MonkeyPatch, vectors: dict[str, np.ndarr
         "brain.memory.embeddings.build_embedding_provider",
         lambda: _ScriptedProvider(vectors, dim=dim),
     )
+    # `_semantic_top_k` sources its candidate pool via `build_embedding_matrix`,
+    # which derives the matrix's filter model id from
+    # `model_tier.model_for_tier(TIER_EMBEDDING)` (F1 #259 step 0) — NOT from
+    # whichever provider `build_embedding_provider` is patched to above. Align
+    # the two so the matrix's lazy-build filter matches what `_seed_vectors`
+    # stamped on the rows; otherwise the first matrix read reloads from disk
+    # filtered to the real production model id, finds nothing, and silently
+    # discards the seeded vectors.
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, _SCRIPTED_MODEL_ID)
 
 
 def _patch_reranker(monkeypatch: pytest.MonkeyPatch, scores: dict[str, float]) -> None:
@@ -207,9 +249,9 @@ def test_order_age_semantic_widens_and_age_sorts_over_top_k_cosine(
     strong_old_text = "slow controlled breathing eases panic and racing thoughts"
     weak_recent_text = "a loosely related note about feeling overwhelmed sometimes"
 
-    dim = 2
+    dim = _EMBED_DIM
     vectors = {
-        query: np.array([1.0, 0.0], dtype=np.float32),
+        query: _query_unit_vec(),
         strong_old_text: _unit_vec_with_cosine(0.95),
         weak_recent_text: _unit_vec_with_cosine(0.4),
     }
@@ -218,7 +260,11 @@ def test_order_age_semantic_widens_and_age_sorts_over_top_k_cosine(
     strong_old = _seed(ctx["store"], strong_old_text, created_at=_OLD)
     weak_recent = _seed(ctx["store"], weak_recent_text, created_at=_RECENT)
 
-    _seed_vectors(tmp_path, vectors, dim=dim, contents=[strong_old_text, weak_recent_text])
+    _seed_vectors(
+        ctx["store"],
+        vectors,
+        contents_by_id={strong_old.id: strong_old_text, weak_recent.id: weak_recent_text},
+    )
     _patch_provider(monkeypatch, vectors, dim=dim)
     # Both clear RERANK_FLOOR (order="age" widens the fetch, it does not
     # skip the floor gate — see _patch_reranker's docstring) — scored to

@@ -11,7 +11,7 @@ Stage flow:
   CLOSE   → guard: if no turns, unlink buffer and return empty report
   EXTRACT → format transcript, call LLM, get ExtractedItems
   SCORE   → normalize each item (label coercion, importance clamp, text strip)
-  DEDUPE  → cosine similarity against EmbeddingCache (opt-in; None = skip)
+  DEDUPE  → cosine similarity against row/warm-matrix vectors (always attempted, fail-soft)
   COMMIT  → direct write to MemoryStore + auto-Hebbian
   SOUL    → queue high-importance items to soul_candidates.jsonl
   LOG     → emit structured log event with counts
@@ -42,7 +42,6 @@ from brain.ingest.dedupe import DEFAULT_DEDUP_THRESHOLD, is_duplicate
 from brain.ingest.extract import extract_items_with_status, format_transcript
 from brain.ingest.soul_queue import DEFAULT_SOUL_THRESHOLD, queue_soul_candidate
 from brain.ingest.types import IngestReport
-from brain.memory.embeddings import EmbeddingCache
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.pending import GATE_BYPASS_TYPES
 from brain.memory.store import MemoryStore
@@ -111,7 +110,6 @@ def close_session(
     store: MemoryStore,
     hebbian: HebbianMatrix,
     provider: LLMProvider,
-    embeddings: EmbeddingCache | None = None,
     config: dict | None = None,
 ) -> IngestReport:
     """Run the full 8-stage ingest pipeline on one session and delete its buffer.
@@ -128,8 +126,6 @@ def close_session(
         HebbianMatrix to strengthen connections between related memories.
     provider:
         LLMProvider used for EXTRACT stage (generate() surface).
-    embeddings:
-        Optional EmbeddingCache for DEDUPE. When None, dedupe is skipped.
     config:
         Optional dict of pipeline knobs:
           extraction_max_retries: int = 1
@@ -200,7 +196,7 @@ def close_session(
 
     for item in items:
         # DEDUPE
-        if is_duplicate(item.text, store=store, threshold=dedup_threshold, embeddings=embeddings):
+        if is_duplicate(item.text, store=store, threshold=dedup_threshold):
             report.deduped += 1
             continue
 
@@ -209,12 +205,6 @@ def close_session(
         if mem_id is None:
             report.errors += 1
             report.commit_failures += 1
-            # Evict the candidate's vector from the embedding cache so the
-            # retry pass doesn't self-match at cosine 1.0 and discard it as a
-            # duplicate. (is_duplicate persists the vector via get_or_compute
-            # before we know whether the commit will succeed.)
-            if embeddings is not None:
-                embeddings.evict(item.text)
             continue
 
         # #167: route_write() (called inside commit_item) returns a non-None id
@@ -233,32 +223,6 @@ def close_session(
         else:
             report.enqueued += 1
         report.memory_ids.append(mem_id)
-
-        # Back-fill the committed memory's vector into the dedupe cache so that
-        # a held-buffer retry (and any future pass) recognises it as a duplicate
-        # and skips it — closes the retry-double-commit gap (A1).
-        #
-        # FAIL SOFT (Stage 2 hardening): now that `embeddings` is backed by a
-        # real local model (FastEmbedProvider), a no-network / retries-
-        # exhausted / corrupt-model-cache box can raise here. This call is
-        # off the message hot path (this function runs via asyncio.to_thread),
-        # but a raise here would still crash the whole ingest pipeline mid-
-        # commit — the memory is already durably written by commit_item()
-        # above, only its vector would be missing. The embedding backfill
-        # (brain/memory/embedding_backfill.py) picks up any row left without
-        # a current-model vector on its next idle tick, so a swallowed error
-        # here is a deferred retry, not a lost embedding. Mirrors is_duplicate's
-        # own fail-soft posture (brain/ingest/dedupe.py).
-        if embeddings is not None:
-            try:
-                embeddings.get_or_compute(item.text)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "embeddings.get_or_compute failed for committed memory %s "
-                    "(embedding backfill will retry): %s",
-                    mem_id,
-                    exc,
-                )
 
         # SOUL
         if item.importance >= crystallize_threshold:
@@ -313,7 +277,6 @@ def extract_session_snapshot(
     store: MemoryStore,
     hebbian: HebbianMatrix,
     provider: LLMProvider,
-    embeddings: EmbeddingCache | None = None,
     config: dict | None = None,
 ) -> IngestReport:
     """Run BUFFER → EXTRACT → SCORE → DEDUPE → COMMIT → SOUL → LOG without
@@ -421,16 +384,13 @@ def extract_session_snapshot(
     crystallize_threshold = int(cfg.get("crystallize_threshold", DEFAULT_SOUL_THRESHOLD))
 
     for item in items:
-        if is_duplicate(item.text, store=store, threshold=dedup_threshold, embeddings=embeddings):
+        if is_duplicate(item.text, store=store, threshold=dedup_threshold):
             report.deduped += 1
             continue
         mem_id = commit_item(item, session_id=session_id, store=store, hebbian=hebbian)
         if mem_id is None:
             report.errors += 1
             report.commit_failures += 1
-            # Evict so retry doesn't self-dedup (mirrors close_session logic above).
-            if embeddings is not None:
-                embeddings.evict(item.text)
             continue
         # #167: see the identical comment in close_session above.
         if item.label in GATE_BYPASS_TYPES:
@@ -438,32 +398,6 @@ def extract_session_snapshot(
         else:
             report.enqueued += 1
         report.memory_ids.append(mem_id)
-
-        # Back-fill the committed memory's vector into the dedupe cache so that
-        # a held-buffer retry (and any future pass) recognises it as a duplicate
-        # and skips it — closes the retry-double-commit gap (A1).
-        #
-        # FAIL SOFT (Stage 2 hardening): now that `embeddings` is backed by a
-        # real local model (FastEmbedProvider), a no-network / retries-
-        # exhausted / corrupt-model-cache box can raise here. This call is
-        # off the message hot path (this function runs via asyncio.to_thread),
-        # but a raise here would still crash the whole ingest pipeline mid-
-        # commit — the memory is already durably written by commit_item()
-        # above, only its vector would be missing. The embedding backfill
-        # (brain/memory/embedding_backfill.py) picks up any row left without
-        # a current-model vector on its next idle tick, so a swallowed error
-        # here is a deferred retry, not a lost embedding. Mirrors is_duplicate's
-        # own fail-soft posture (brain/ingest/dedupe.py).
-        if embeddings is not None:
-            try:
-                embeddings.get_or_compute(item.text)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "embeddings.get_or_compute failed for committed memory %s "
-                    "(embedding backfill will retry): %s",
-                    mem_id,
-                    exc,
-                )
 
         if item.importance >= crystallize_threshold:
             queued = queue_soul_candidate(
@@ -540,7 +474,6 @@ def snapshot_stale_sessions(
     store: MemoryStore,
     hebbian: HebbianMatrix,
     provider: LLMProvider,
-    embeddings: EmbeddingCache | None = None,
     config: dict | None = None,
 ) -> list[IngestReport]:
     """Iterate active sessions; snapshot any whose last turn is past silence_minutes.
@@ -574,7 +507,6 @@ def snapshot_stale_sessions(
                     store=store,
                     hebbian=hebbian,
                     provider=provider,
-                    embeddings=embeddings,
                     config=config,
                 )
                 reports.append(report)
@@ -594,7 +526,6 @@ def finalize_stale_sessions(
     store: MemoryStore,
     hebbian: HebbianMatrix,
     provider: LLMProvider,
-    embeddings: EmbeddingCache | None = None,
     config: dict | None = None,
 ) -> list[IngestReport]:
     """Iterate active sessions; finalize any whose last turn is past
@@ -631,7 +562,6 @@ def finalize_stale_sessions(
                 store=store,
                 hebbian=hebbian,
                 provider=provider,
-                embeddings=embeddings,
                 config=config,
             )
         except Exception:
@@ -685,7 +615,6 @@ def close_stale_sessions(
     store: MemoryStore,
     hebbian: HebbianMatrix,
     provider: LLMProvider,
-    embeddings: EmbeddingCache | None = None,
     config: dict | None = None,
 ) -> list[IngestReport]:
     """Iterate active sessions; close any whose last turn is older than silence_minutes.
@@ -719,7 +648,6 @@ def close_stale_sessions(
                 store=store,
                 hebbian=hebbian,
                 provider=provider,
-                embeddings=embeddings,
                 config=config,
             )
             reports.append(report)

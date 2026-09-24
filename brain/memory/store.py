@@ -22,6 +22,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 
@@ -214,13 +216,34 @@ CREATE TABLE IF NOT EXISTS memories (
     state TEXT NOT NULL DEFAULT 'active',
     content_snapshot TEXT,
     recall_count REAL NOT NULL DEFAULT 0,
-    peak_emotion_intensity REAL NOT NULL DEFAULT 0.0
+    peak_emotion_intensity REAL NOT NULL DEFAULT 0.0,
+    embedding BLOB,
+    embedding_model_id TEXT,
+    cluster_id INTEGER,
+    cluster_model_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_domain ON memories(domain);
 CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type);
 CREATE INDEX IF NOT EXISTS idx_memories_active ON memories(active);
 CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
+
+-- F1 (#259): per-cluster centroid vectors, relocated into memories.db so
+-- every per-persona vector artifact lives in the one DB (I1) instead of the
+-- old content-hash-keyed side file (embeddings.db's MemoryClusterStore).
+-- Keyed by (model_id, cluster_id) — centroids are per-cluster, not
+-- per-memory, so they have no row on `memories` to live on. Shape mirrors
+-- `MemoryClusterStore.memory_cluster_centroids`
+-- (brain/memory/clustering.py) column-for-column so the later read/write
+-- swap-over is a straight port, not a reshape.
+CREATE TABLE IF NOT EXISTS cluster_centroids (
+    model_id TEXT NOT NULL,
+    cluster_id INTEGER NOT NULL,
+    centroid BLOB NOT NULL,
+    dim INTEGER NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (model_id, cluster_id)
+);
 
 -- External-content FTS5 shadow index (P2 relevance overhaul). `memories` is a
 -- rowid table (id TEXT PRIMARY KEY → implicit integer rowid), so external
@@ -396,6 +419,17 @@ class MemoryStore:
                             )
                 except sqlite3.OperationalError as exc:
                     logger.warning("peak seeding skipped: %s", exc)
+        # F1 (#259): embedding/cluster columns. Nullable, no default — existing
+        # rows land NULL and are picked up by the embedding backfill (a later
+        # increment); this migration step only guarantees the columns exist.
+        if "embedding" not in existing:
+            self._conn.execute("ALTER TABLE memories ADD COLUMN embedding BLOB")
+        if "embedding_model_id" not in existing:
+            self._conn.execute("ALTER TABLE memories ADD COLUMN embedding_model_id TEXT")
+        if "cluster_id" not in existing:
+            self._conn.execute("ALTER TABLE memories ADD COLUMN cluster_id INTEGER")
+        if "cluster_model_id" not in existing:
+            self._conn.execute("ALTER TABLE memories ADD COLUMN cluster_model_id TEXT")
         # Index on state — used by forgetting pass to find fading rows fast.
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_state ON memories(state)")
         self._conn.commit()
@@ -473,23 +507,33 @@ class MemoryStore:
     def create(self, memory: Memory) -> str:
         """Insert a memory. Returns the id. Raises on duplicate id.
 
-        Deliberately does NOT touch embeddings/EmbeddingCache — MemoryStore
-        has no dependency on the embeddings subsystem (~11 call sites use
-        `create()` directly: brain/tools/impls/add_memory.py,
-        crystallize_soul.py, brain/memory/pending.py, etc.). Embedding a
-        memory on write, everywhere, would mean either threading an
-        EmbeddingCache dependency through every one of those call sites, or
-        this method spawning off-thread work itself (its own new sqlite
-        connection per call, on a hot synchronous path some of those sites
-        sit on) — both more invasive and riskier than the alternative that
-        was chosen instead: the idle-chipped embedding backfill
-        (brain/memory/embedding_backfill.py), which scans `memories` every
-        supervisor tick and catches whatever `create()` didn't embed,
-        regardless of which call site wrote it. New memories are lexically
-        recallable immediately either way; they become semantically
-        recallable within one backfill tick. See that module's docstring
-        and hunts/semantic-retrieval/plan.md Part A #7 for the full
-        reasoning (Stage 2 of the local semantic-retrieval build).
+        Deliberately does NOT itself touch embeddings — MemoryStore has no
+        embeddings dependency baked into `create()` (~11 call sites use it
+        directly: brain/tools/impls/add_memory.py, crystallize_soul.py,
+        brain/memory/pending.py, etc.). Embedding a memory on write,
+        everywhere, would mean either threading an embeddings dependency
+        through every one of those call sites, or this method spawning
+        off-thread work itself (its own new sqlite connection per call, on a
+        hot synchronous path some of those sites sit on) — both more
+        invasive and riskier than the alternative that was chosen instead:
+        the idle-chipped embedding backfill (brain/memory/embedding_backfill.py),
+        which scans `memories` every supervisor tick and catches whatever a
+        `create()` call didn't embed, regardless of which call site wrote it.
+        New memories are lexically recallable immediately either way; an
+        un-embedded one becomes semantically recallable within one backfill
+        tick at the latest.
+
+        ONE caller is the deliberate exception: `brain.engines.consolidation.
+        _dispatch`'s promote branch calls this method, then immediately
+        calls `embed_row(cand.id, cand.content)` on the freshly-inserted id
+        (F1 #259 step 4, embed-on-write at pending-queue -> committed-memory
+        promotion) — the steady-state path a promoted memory takes, so it is
+        recallable semantically on the very next turn rather than waiting
+        for backfill. This method itself stays embedding-agnostic; the two
+        calls are simply sequenced at that one call site. See that module's
+        docstring and hunts/semantic-retrieval/plan.md Part A #7 for the
+        full backfill reasoning (Stage 2 of the local semantic-retrieval
+        build).
         """
         try:
             metadata_json = json.dumps(memory.metadata)
@@ -527,6 +571,209 @@ class MemoryStore:
         )
         self._conn.commit()
         return memory.id
+
+    def embed_row(self, memory_id: str, content: str) -> None:
+        """Compute + persist the retrieval embedding for one existing row
+        (F1 #259 step 4: embed-on-write).
+
+        Embeds `content` via the process-cached production provider
+        (`brain.memory.embeddings.build_embedding_provider()`, looked up
+        through the module so a test's monkeypatch on the module attribute
+        is honored, mirroring every other dynamic-lookup call site in this
+        codebase), writes
+        `embedding` + `embedding_model_id` straight onto the row (no
+        content-hash side table involved), and pushes the vector into this
+        db's warm `EmbeddingMatrix` (`brain.memory.embedding_matrix.
+        build_embedding_matrix(self.db_path)`) so it is immediately
+        recall-visible in this process without waiting for a lazy rebuild.
+
+        Raises on any failure computing/persisting the embedding itself
+        (provider/model error, sqlite error) — deliberately NOT fail-soft
+        there. The caller decides how to handle a failed embed; e.g.
+        `brain.engines.consolidation._dispatch` wraps its call in a local
+        try/except and leaves the row's embedding NULL for the later idle
+        backfill to pick up, rather than aborting the whole drain tick over
+        one bad embed. `MemoryStore._reembed_or_clear` below is the other
+        caller, with its own failure handling (clear + evict).
+
+        The warm-matrix `put` AFTER the row commit is different: by that
+        point the row is already durably embedded (the DB is the source of
+        truth; the matrix is a cache that self-heals on rebuild — see
+        `build_embedding_matrix`), so a `put` failure must NOT be reported
+        as an embed failure (F1 #259 increment-3 red-team fix, F3) — it is
+        logged and swallowed, never raised out of this method, so a caller
+        counting embed successes/failures (the backfill's `errors` field)
+        doesn't misclassify an already-committed row as failed.
+
+        Computes, then delegates the persist step to `write_embedding` (F1
+        #259 F3) — see that method for the row-UPDATE + matrix-`put` details.
+        `write_embedding` exists as its own method so a caller that has
+        ALREADY computed a vector elsewhere (consolidation's Pass-2 judge,
+        F3 below) can persist it directly without a second, redundant
+        provider call.
+        """
+        from brain.memory import embeddings as embeddings_mod
+
+        provider = embeddings_mod.build_embedding_provider()
+        vec = provider.embed(content).astype("float32")
+        self.write_embedding(memory_id, vec, provider.model_id())
+
+    def write_embedding(self, memory_id: str, vector: np.ndarray, model_id: str) -> None:
+        """Persist a PRECOMPUTED embedding vector directly onto a row + the
+        warm matrix, without calling the embedding provider (F1 #259 F3:
+        consolidation's Pass-2 now embeds a candidate ONCE, before the Haiku
+        judge runs — so the vector is available for the cosine
+        `_related_existing` retrieval — and reuses that SAME vector here at
+        promotion instead of a second, redundant `embed_row` compute; see
+        `brain.engines.consolidation._dispatch`'s promote branch).
+
+        Mirrors `embed_row`'s persist step exactly (row UPDATE + matrix
+        `put`, with the identical matrix-put-failure-is-swallowed contract
+        below) but skips the compute step — `embed_row` itself now computes
+        the vector, then calls this method to do the actual persisting, so
+        the two never drift apart.
+        """
+        from brain.memory.embedding_matrix import build_embedding_matrix
+
+        vec = np.asarray(vector, dtype=np.float32)
+        self._conn.execute(
+            "UPDATE memories SET embedding = ?, embedding_model_id = ? WHERE id = ?",
+            (vec.tobytes(), model_id, memory_id),
+        )
+        self._conn.commit()
+        try:
+            build_embedding_matrix(self.db_path).put(memory_id, vec)
+        except Exception:  # noqa: BLE001 — row is already committed-embedded; a
+            # matrix-cache write failure must not surface as an embed failure.
+            logger.warning(
+                "MemoryStore.write_embedding: warm-matrix put failed for id=%s after "
+                "the row's embedding was already committed — the matrix "
+                "self-heals on rebuild, so this is logged, not raised",
+                memory_id,
+                exc_info=True,
+            )
+
+    def _reembed_or_clear(self, memory_id: str, content: str) -> None:
+        """Keep a row's embedding coherent with its content after ANY
+        content-mutating path (F1 #259 step 5, flag-2 resolved: SYNCHRONOUS
+        re-embed, mirroring `fade()`'s existing synchronous-rewrite
+        behavior). Called AFTER the row's content UPDATE has already
+        committed, from `fade()`, `update(memory_id, content=...)`, and
+        `unfade()`.
+
+        Row-id keying is NOT self-healing the way the old content-hash cache
+        was: new content under the SAME id has no `embedding IS NULL` signal
+        for the idle backfill to catch, so every content-changing path must
+        re-embed synchronously or explicitly clear the now-stale vector —
+        never leave a vector on the row that no longer matches its content.
+
+        On success: re-embeds via `embed_row` (row + warm matrix updated
+        together). On failure (provider/model error): CLEARS the row's
+        `embedding`/`embedding_model_id` columns and evicts the matrix
+        entry — a NULL row (picked up by the later idle backfill) is always
+        safer than a vector silently describing stale content. Best-effort:
+        an error clearing/evicting is logged, never raised — a content
+        mutation must not fail because embedding bookkeeping failed.
+        """
+        try:
+            self.embed_row(memory_id, content)
+            return
+        except Exception:  # noqa: BLE001 — degrade to clear, never raise
+            logger.warning(
+                "MemoryStore._reembed_or_clear: embed failed for id=%s — "
+                "clearing the now-stale embedding instead",
+                memory_id,
+                exc_info=True,
+            )
+        try:
+            self._conn.execute(
+                "UPDATE memories SET embedding = NULL, embedding_model_id = NULL WHERE id = ?",
+                (memory_id,),
+            )
+            self._conn.commit()
+            from brain.memory.embedding_matrix import build_embedding_matrix
+
+            build_embedding_matrix(self.db_path).evict(memory_id)
+        except Exception:  # noqa: BLE001 — best-effort cleanup, never raise
+            logger.warning(
+                "MemoryStore._reembed_or_clear: failed to clear/evict stale embedding for id=%s",
+                memory_id,
+                exc_info=True,
+            )
+
+    def set_cluster_memberships(
+        self,
+        memberships: dict[str, int],
+        centroids: np.ndarray,
+        *,
+        model_id: str,
+    ) -> None:
+        """Atomically replace `model_id`'s cluster memberships (on the
+        `memories` row's `cluster_id`/`cluster_model_id` columns) + its
+        centroids (`cluster_centroids` table) with the result of one
+        clustering pass (F1 #259 increment 4).
+
+        This is the row/table-based successor to the old
+        `MemoryClusterStore.replace_pass` (`brain/memory/clustering.py`) —
+        it ports that method's two load-bearing properties onto the new
+        storage rather than reinventing them:
+
+        WHOLESALE-REPLACE, scoped to `model_id`: every row currently
+        tagged `cluster_model_id = model_id` is cleared FIRST (`cluster_id`
+        / `cluster_model_id` -> NULL), then every memory id present in
+        `memberships` gets its `cluster_id`/`cluster_model_id` (re)stamped.
+        A memory id clustered by a PRIOR pass but absent from THIS pass's
+        `memberships` (its embedding was evicted/faded/dropped out of the
+        warm-matrix snapshot since) ends up NULL, not a stale `cluster_id`
+        pointing at a centroid this pass may have deleted — mirroring
+        `replace_pass`'s own delete-then-reinsert symmetry, just keyed by
+        memory id instead of content_hash (I2: two byte-identical memories
+        no longer share one tag, each gets its own — the intended identity
+        change per spec §1).
+
+        ONE transaction, ONE commit: the membership clear, the membership
+        (re)stamps, AND the centroid replace below all share one
+        uncommitted SQLite transaction, committed once at the end — a
+        crash mid-write leaves this at exactly the LAST successfully
+        committed pass's state (never a mix of old/new memberships, and
+        never memberships without their matching centroids). This is what
+        makes `run_clustering_pass` idempotent/resumable, same guarantee
+        `replace_pass` provided for the old side table.
+        """
+        self._conn.execute(
+            "UPDATE memories SET cluster_id = NULL, cluster_model_id = NULL "
+            "WHERE cluster_model_id = ?",
+            (model_id,),
+        )
+        self._conn.executemany(
+            "UPDATE memories SET cluster_id = ?, cluster_model_id = ? WHERE id = ?",
+            [(cluster_id, model_id, mem_id) for mem_id, cluster_id in memberships.items()],
+        )
+        self._conn.execute("DELETE FROM cluster_centroids WHERE model_id = ?", (model_id,))
+        self._conn.executemany(
+            "INSERT INTO cluster_centroids (model_id, cluster_id, centroid, dim) "
+            "VALUES (?, ?, ?, ?)",
+            [
+                (model_id, i, centroid.astype(np.float32).tobytes(), centroid.shape[0])
+                for i, centroid in enumerate(centroids)
+            ],
+        )
+        self._conn.commit()
+
+    def get_cluster_id(self, memory_id: str) -> tuple[int, str] | None:
+        """`(cluster_id, cluster_model_id)` for `memory_id`'s row, or
+        `None` when the row doesn't exist or hasn't been clustered
+        (`cluster_id IS NULL`) — the raw row read `cluster_tag_for_memory`
+        (`brain/memory/clustering.py`) layers its model_id-scoping check on
+        top of (never bumps recall — this is a metadata read, not a
+        surfacing event)."""
+        row = self._conn.execute(
+            "SELECT cluster_id, cluster_model_id FROM memories WHERE id = ?",
+            (memory_id,),
+        ).fetchone()
+        if row is None or row["cluster_id"] is None:
+            return None
+        return int(row["cluster_id"]), row["cluster_model_id"]
 
     def get(self, memory_id: str, *, bump: bool | float = True) -> Memory | None:
         """Return the Memory with the given id, or None. Bumps
@@ -655,6 +902,20 @@ class MemoryStore:
             else:
                 raise ValueError(f"Unknown update field: {key!r}")
 
+        # F1 #259 increment-2 red-team fix (crash-window data integrity): NULL
+        # the embedding/embedding_model_id columns IN THE SAME UPDATE/commit
+        # as the content change, not in the separate re-embed commit below.
+        # A crash between "content committed" and "re-embed committed" used
+        # to leave the row durably {new content, OLD embedding} — a stale
+        # vector with no `embedding IS NULL` signal for the idle backfill to
+        # catch, so recall could keep surfacing the memory on its
+        # pre-mutation content indefinitely. Folding the NULL into this same
+        # UPDATE makes the durable intermediate state {new content, NULL
+        # embedding}: backfill-eligible and crash-safe.
+        if "content" in fields:
+            column_map["embedding"] = ("embedding", None)
+            column_map["embedding_model_id"] = ("embedding_model_id", None)
+
         # Empty `fields` kwargs — existence already verified above, nothing to write.
         if not column_map and not extra_clauses:
             return
@@ -665,6 +926,31 @@ class MemoryStore:
         values.append(memory_id)
         self._conn.execute(f"UPDATE memories SET {set_clause} WHERE id = ?", values)
         self._conn.commit()
+
+        # F1 #259 step 5 (increment-2 red-team fix): a content mutation
+        # invalidates the row's embedding — row-id keying has no
+        # `embedding IS NULL` signal for the backfill to catch new content
+        # under the SAME id, so re-embed synchronously (or clear on
+        # failure) right here, only when `content` was actually one of the
+        # updated fields.
+        if "content" in fields:
+            # Evict the in-memory matrix entry at the same point the row's
+            # embedding went NULL (above), so a concurrent recall in the
+            # brief re-embed window below degrades to lexical rather than
+            # serving the stale in-memory vector.
+            try:
+                from brain.memory.embedding_matrix import build_embedding_matrix
+
+                build_embedding_matrix(self.db_path).evict(memory_id)
+            except Exception:  # noqa: BLE001 — best-effort, must not block the write
+                logger.warning(
+                    "MemoryStore.update: matrix evict failed for id=%s", memory_id, exc_info=True
+                )
+            # Happy-path synchronous re-embed repopulates embedding + matrix;
+            # on failure the row is already NULL (self-healing) — the
+            # clear-on-failure branch in `_reembed_or_clear` is now
+            # belt-and-suspenders, since the row is already NULL going in.
+            self._reembed_or_clear(memory_id, fields["content"])
 
     def deactivate(self, memory_id: str) -> None:
         """Mark a memory inactive (F22 semantics). Raises KeyError if unknown."""
@@ -686,11 +972,36 @@ class MemoryStore:
                 memory_id,
             )
             return
+        # F1 #259 increment-2 red-team fix: embedding/embedding_model_id are
+        # NULLed IN THE SAME UPDATE/commit as the content change, so the
+        # durable intermediate state after a crash right here is {summary
+        # content, NULL embedding} — backfill-eligible, never a stale vector
+        # against the pre-fade content. See `update()`'s matching comment.
         self._conn.execute(
-            "UPDATE memories SET content_snapshot = content, content = ?, state = 'fading' WHERE id = ?",
+            "UPDATE memories SET content_snapshot = content, content = ?, "
+            "state = 'fading', embedding = NULL, embedding_model_id = NULL "
+            "WHERE id = ?",
             (summary, memory_id),
         )
         self._conn.commit()
+        # Evict the in-memory matrix entry at the same point, so a
+        # concurrent recall in the brief re-embed window below degrades to
+        # lexical rather than serving the stale in-memory vector.
+        try:
+            from brain.memory.embedding_matrix import build_embedding_matrix
+
+            build_embedding_matrix(self.db_path).evict(memory_id)
+        except Exception:  # noqa: BLE001 — best-effort, must not block fade()
+            logger.warning(
+                "MemoryStore.fade: matrix evict failed for id=%s", memory_id, exc_info=True
+            )
+        # F1 #259 step 5: content changed (full body -> summary) — re-embed
+        # synchronously so the row's vector reflects the faded summary, not
+        # the pre-fade content (or clear on failure; see
+        # `_reembed_or_clear`'s docstring). On failure the row is already
+        # NULL (self-healing) — that clear-on-failure branch is now
+        # belt-and-suspenders.
+        self._reembed_or_clear(memory_id, summary)
 
     def unfade(self, memory_id: str) -> None:
         """Unfade a memory: restore content from content_snapshot, clear
@@ -708,11 +1019,37 @@ class MemoryStore:
                 memory_id,
             )
             return
+        restored_content = row["content_snapshot"]
+        # F1 #259 increment-2 red-team fix: embedding/embedding_model_id are
+        # NULLed IN THE SAME UPDATE/commit as the content change, so the
+        # durable intermediate state after a crash right here is {restored
+        # content, NULL embedding} — backfill-eligible, never a stale vector
+        # against the pre-unfade (summary) content. See `update()`'s
+        # matching comment.
         self._conn.execute(
-            "UPDATE memories SET content = content_snapshot, content_snapshot = NULL, state = 'active' WHERE id = ?",
+            "UPDATE memories SET content = content_snapshot, content_snapshot = NULL, "
+            "state = 'active', embedding = NULL, embedding_model_id = NULL "
+            "WHERE id = ?",
             (memory_id,),
         )
         self._conn.commit()
+        # Evict the in-memory matrix entry at the same point, so a
+        # concurrent recall in the brief re-embed window below degrades to
+        # lexical rather than serving the stale in-memory vector.
+        try:
+            from brain.memory.embedding_matrix import build_embedding_matrix
+
+            build_embedding_matrix(self.db_path).evict(memory_id)
+        except Exception:  # noqa: BLE001 — best-effort, must not block unfade()
+            logger.warning(
+                "MemoryStore.unfade: matrix evict failed for id=%s", memory_id, exc_info=True
+            )
+        # F1 #259 step 5: content changed back (summary -> restored full
+        # body) — re-embed synchronously so the row's vector reflects the
+        # restored content (or clear on failure; see `_reembed_or_clear`'s
+        # docstring). On failure the row is already NULL (self-healing) —
+        # that clear-on-failure branch is now belt-and-suspenders.
+        self._reembed_or_clear(memory_id, restored_content)
 
     def hard_delete(self, memory_id: str) -> None:
         """Drop the row. Caller MUST write the graveyard entry first.
@@ -722,6 +1059,19 @@ class MemoryStore:
             raise KeyError(f"Unknown memory id: {memory_id!r}")
         self._conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
         self._conn.commit()
+        # F1 #259 step 5: the row (and its embedding) is gone — evict the
+        # warm-matrix entry too, best-effort, so a deleted memory's vector
+        # cannot linger in the matrix (the resurrection hazard `EmbeddingMatrix`
+        # itself guards against on the BUILD side; this is the delete-side
+        # half of "never orphan a vector on hard_delete", I2/spec §2).
+        try:
+            from brain.memory.embedding_matrix import build_embedding_matrix
+
+            build_embedding_matrix(self.db_path).evict(memory_id)
+        except Exception:  # noqa: BLE001 — best-effort, hard_delete must not fail over this
+            logger.warning(
+                "MemoryStore.hard_delete: matrix evict failed for id=%s", memory_id, exc_info=True
+            )
 
     def count(self, active_only: bool = True) -> int:
         """Return the total count of memories."""
@@ -914,9 +1264,11 @@ class MemoryStore:
         lexicographic tiebreak, not creation order — it only needs to be a
         stable TOTAL order so no row at a shared timestamp is skipped or
         revisited, not a meaningful one. A bounded, cursor-paged sibling of
-        `list_active()` for callers (the embedding backfill) that walk the
-        WHOLE corpus a little at a time across many calls rather than
-        loading it all at once — same `active = 1` filter as `list_active()`.
+        `list_active()` for a caller that walks the WHOLE corpus a little at
+        a time across many calls rather than loading it all at once — same
+        `active = 1` filter as `list_active()`. See `list_unembedded_since`
+        below for the sibling scoped to the embedding backlog predicate (the
+        embedding backfill's own backlog query, F1 #259 increment 3).
         """
         if cursor is None:
             sql = (
@@ -934,6 +1286,119 @@ class MemoryStore:
             params = [cursor_ts, cursor_ts, cursor_id, limit]
         rows = self._conn.execute(sql, params).fetchall()
         return [_row_to_memory(row) for row in rows]
+
+    def list_unembedded_since(
+        self,
+        cursor: tuple[str, str] | None,
+        *,
+        limit: int,
+        current_model_id: str,
+        min_chars: int,
+    ) -> list[Memory]:
+        """Return up to `limit` ACTIVE memories that are backlog for the
+        embedding backfill, strictly after `cursor`, ordered ASCENDING by
+        (created_at, id) — the embedding backfill's own backlog query (F1
+        #259 increment 3; model-mismatch clause + SQL-level short-row
+        exclusion folded in on Fixing's inc3 spec-gap, Planning-ruled
+        2026-09-16).
+
+        Backlog membership is `embedding IS NULL OR embedding_model_id !=
+        current_model_id` — determined directly off the row's OWN columns,
+        not a content-hash side-table lookup: unlike the old `embeddings.db`
+        cache, a row's presence here is purely a function of its current
+        `embedding`/`embedding_model_id` values, so a row that gets (re-)
+        embedded under the current model (by this backfill, by embed-on-
+        write at promotion, or by a synchronous re-embed in
+        `fade`/`update`/`unfade`) simply stops appearing in this query's
+        results — no separate bookkeeping needed.
+
+        The `embedding_model_id != current_model_id` half restores the
+        model-scoped self-healing the old content-hash cache had: after a
+        `MODEL_EMBEDDING` swap, old-model rows stay non-NULL (so an
+        IS-NULL-only backlog would never re-embed them) but the warm matrix
+        filters them out by model_id, so without this clause they'd fall to
+        lexical recall forever with no re-embed path. It's a no-op in
+        steady state (every row already matches `current_model_id`) and
+        only fires on a swap.
+
+        `min_chars` excludes rows too short to ever be embed-worthy
+        (`MIN_CHARS_TO_EMBED` — the caller's constant, passed through rather
+        than duplicated here) directly in SQL rather than filtering them out
+        Python-side after the fact: this is what keeps the cursor-reset
+        no-op cheap in steady state (see `run_embedding_backfill_tick`) —
+        once every EMBEDDABLE row is embedded, this query returns empty
+        without ever re-scanning the permanently-short rows on every tick.
+        `length()` on a SQLite TEXT column counts characters, matching
+        Python's `len()`; `content` is `NOT NULL` per schema so no NULL
+        handling is needed here.
+
+        Same composite keyset cursor semantics as `list_active_since` (see
+        that method's docstring for the tied-created_at rationale) — this is
+        its sibling scoped to the backlog predicate above. The caller
+        (embedding backfill) decides whether to persist a forward cursor
+        after a tick, and — as of F1 #259 increment 7 — that decision is
+        `hit_batch_limit`-aware, not simply "got back fewer than `limit`
+        rows": a tick that stops early because it hit its own `batch_size`
+        cap (rows still remain in the fetched window) DOES persist a forward
+        cursor even though it saw fewer than `limit` candidates, so a
+        long-lived persona's no-sleep drain keeps making forward progress
+        instead of re-scanning full history every tick. A cursor is only
+        reset to `None` when a tick both (a) did NOT stop early on its batch
+        cap and (b) fetched fewer than `limit` rows — i.e. it genuinely
+        EXHAUSTED the whole currently-backlogged set in one scan. See
+        `run_embedding_backfill_tick`'s closing comment in
+        `brain/memory/embedding_backfill.py` for the exact condition.
+        Backlog membership is not append-only per id regardless — a row can
+        re-enter it a SECOND time (a later content edit whose synchronous
+        re-embed attempt fails — see `_reembed_or_clear` — or a model swap)
+        at a `created_at` position the cursor may have already passed — so a
+        persisted forward position is only ever a safe scan-cost
+        optimization, never a correctness mechanism (a missing/stale cursor
+        just means more re-scanning, never a skipped row).
+        """
+        if cursor is None:
+            sql = (
+                "SELECT * FROM memories WHERE active = 1 "
+                "AND (embedding IS NULL OR embedding_model_id != ?) "
+                "AND length(content) >= ? "
+                "ORDER BY created_at ASC, id ASC LIMIT ?"
+            )
+            params: list[Any] = [current_model_id, min_chars, limit]
+        else:
+            cursor_ts, cursor_id = cursor
+            sql = (
+                "SELECT * FROM memories WHERE active = 1 "
+                "AND (embedding IS NULL OR embedding_model_id != ?) "
+                "AND length(content) >= ? AND "
+                "(created_at > ? OR (created_at = ? AND id > ?)) "
+                "ORDER BY created_at ASC, id ASC LIMIT ?"
+            )
+            params = [current_model_id, min_chars, cursor_ts, cursor_ts, cursor_id, limit]
+        rows = self._conn.execute(sql, params).fetchall()
+        return [_row_to_memory(row) for row in rows]
+
+    def count_unembedded(self, *, current_model_id: str, min_chars: int) -> int:
+        """Return a plain, cursor-free COUNT of `list_unembedded_since`'s own
+        backlog predicate (F1 #259 increment 6): active, long-enough rows
+        with `embedding IS NULL OR embedding_model_id != current_model_id`.
+
+        Unlike `list_unembedded_since`, this ignores any persisted backfill
+        cursor entirely — it is a full-table count from the top, used by the
+        one-go backfill CLI (`nell embed backfill`) to size its progress
+        ticker's denominator before the drain starts, and by
+        `run_embedding_backfill_to_completion` to report the TRUE remaining
+        backlog after the drain stops (a scattered permanently-failing row
+        can sit BEHIND a persisted forward cursor and so never reappear in a
+        cursor-bounded `list_unembedded_since` call again within the same
+        run, even though it is still un-embedded — this method still counts
+        it, because it does not consult the cursor at all).
+        """
+        sql = (
+            "SELECT COUNT(*) FROM memories WHERE active = 1 "
+            "AND (embedding IS NULL OR embedding_model_id != ?) "
+            "AND length(content) >= ?"
+        )
+        return int(self._conn.execute(sql, (current_model_id, min_chars)).fetchone()[0])
 
     def exists_recent_grief_touch(self, referent_id: str, *, hours: float) -> bool:
         """Return True if a grief_event memory with grief_referent_id == referent_id

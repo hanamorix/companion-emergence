@@ -71,14 +71,48 @@ MODEL_MEDIUM = "sonnet"  # persona-quality generation: chat, background-generati
 # No call-site changes are required for that tier (or any tier EXCEPT
 # TIER_INTERACTIVE_CHAT — see that constant's own TIER_MODEL comment below).
 
+# Mini-model swaps (embedder, reranker, relevance-judge): model ids can be
+# swapped by changing the constant here, but ONLY as a same-interface drop-in.
+# A replacement with a different task-shape or I/O contract (for example, an
+# NLI-style relevance judge instead of the cross-encoder judge, which needs a
+# query-to-hypothesis reformulation) requires integration code changes, not just
+# this config swap. Exception: the embedder's vector DIMENSION is handled
+# dynamically (the one-touch embedding-dimension work), so a different-dimension
+# embedder IS a clean swap. The caveat applies to task-SHAPE, not dimension.
+# For the F2a relevance judge specifically: the retrieval floor auto-re-derives
+# on the next daily calibration after a same-shape judge swap, so no manual
+# recalibration is needed.
+
 # MODEL_EMBEDDING is NOT a Claude model — it's a local ONNX embedding model id
 # (fastembed/HuggingFace naming), the standing convention (per the local
 # semantic-retrieval spec) for embeddings AND any future minimodel (#228):
 # minimodel selection lives here alongside the Claude tiers, one constant to
 # repoint every embedding call site. See TIER_EMBEDDING below for why it
 # resolves via a dedicated accessor rather than build_tier_provider.
-MODEL_EMBEDDING = "BAAI/bge-small-en-v1.5"  # 384-dim int8, via fastembed (ONNX, no torch)
-MODEL_EMBEDDING_DIM = 384  # output dim of MODEL_EMBEDDING; change together if the model changes
+MODEL_EMBEDDING = "intfloat/multilingual-e5-large"  # 1024-dim, multilingual, via fastembed
+# #259 F1 model-swap (2026-09-17, Roy): swapped from BAAI/bge-small-en-v1.5
+# (384-dim, English-only) to this multilingual model per the F1 spec's F4
+# forward-compat item — fastembed-native, mit-licensed per fastembed's own
+# model registry (`TextEmbedding.list_supported_models()`), confirmed
+# supported there directly (checked against the installed fastembed). Ships
+# sharded "external data" ONNX weights (model.onnx + model.onnx_data), which
+# need the onnxruntime symlink workaround in brain/memory/embeddings.py
+# (FastEmbedProvider.__init__ / _materialize_symlinked_files) to load under
+# our pinned onnxruntime==1.29.0 — see that module for the full story.
+#
+# DOCUMENTED SANITY VALUE ONLY (#259 inc7 red-team F1) — NOT the load-bearing
+# source of the dimension actually used to embed/decode/cluster. That comes
+# from the REAL model's own output (`FastEmbedProvider.embedding_dim()`,
+# probed via a one-time embed call — see brain/memory/embeddings.py), so a
+# MODEL_EMBEDDING swap to a different-dim model (this one included) is
+# genuinely one-touch: this constant does NOT need to change together for the
+# system to keep working. It still matters for one thing: a loud startup/
+# first-use health-check log (in FastEmbedProvider.embed(), see that class)
+# compares the real probed dim against this constant and logs an error on a
+# mismatch, so a desync (this constant going stale after a model swap) is
+# caught LOUDLY rather than silently. Update it to match MODEL_EMBEDDING when
+# you change that constant, but nothing breaks if you forget.
+MODEL_EMBEDDING_DIM = 1024
 
 # MODEL_RERANKER is also not a Claude model — it's a local ONNX cross-encoder
 # reranker id (fastembed's TextCrossEncoder), the #231 reranker re-architecture
