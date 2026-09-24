@@ -2721,11 +2721,11 @@ def _seed_and_label_row(
     store._conn.execute(
         "INSERT INTO calibration_log "
         "(day_bucket, query, candidate_ids, reranker_scores, reranker_model_id, "
-        "local_judge_label, haiku_label) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "local_judge_label, haiku_label, score_scale) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             day_bucket, query, json.dumps(["c"]), json.dumps([score]), model_id,
-            json.dumps([label]), json.dumps([None]),
+            json.dumps([label]), json.dumps([None]), CALIBRATION_SCORE_SCALE,
         ),
     )
     store._conn.commit()
@@ -2793,6 +2793,31 @@ def test_labeled_calibration_pairs_day_scope_ignores_unlabeled_rows_on_a_later_d
 
     assert pairs == [(5.0, "relevant")], (
         "the unlabeled later-day row must not shadow the latest day that actually has usable pairs"
+    )
+
+
+def test_labeled_calibration_pairs_day_scope_excludes_a_raw_scale_row_from_winning_max_day(
+    store: MemoryStore,
+) -> None:
+    """A later day_bucket whose only row is still RAW-scale (a legacy row,
+    or a pre-F2b write) must not win the MAX-day lookup either — the
+    day-scope query is filtered by score_scale the same way the pair read
+    itself is (F2b §5, unaffected by Change 1)."""
+    _seed_and_label_row(store, query="q-normalized", score=4.0, label="relevant", model_id="m", day_bucket="2026-05-01")
+    store._conn.execute(
+        "INSERT INTO calibration_log "
+        "(day_bucket, query, candidate_ids, reranker_scores, reranker_model_id, "
+        "local_judge_label, haiku_label, score_scale) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("2026-05-09", "q-raw", json.dumps(["c"]), json.dumps([999.0]), "m",
+         json.dumps(["relevant"]), json.dumps([None]), "raw"),
+    )
+    store._conn.commit()
+
+    pairs = store.labeled_calibration_pairs("m")
+
+    assert pairs == [(4.0, "relevant")], (
+        "a later day whose only labeled row is raw-scale must not win the MAX-day lookup"
     )
 
 
