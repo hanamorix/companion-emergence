@@ -128,7 +128,11 @@ def _sigmoid(x: float) -> float:
 
 
 def label_for_score(
-    raw_score: float, *, band_half_width: float | None = None
+    raw_score: float,
+    *,
+    band_half_width: float | None = None,
+    slope: float | None = None,
+    intercept: float | None = None,
 ) -> tuple[str, bool]:
     """Return `(provisional_label, is_ambiguous)` for one judge score.
 
@@ -143,12 +147,39 @@ def label_for_score(
     `AMBIGUOUS_BAND_HALF_WIDTH` of the 0.5 decision boundary — those, and
     only those, positions get a Haiku tie-break call (acceptance #7: "no
     Haiku call on clear cases").
+
+    `slope`/`intercept` (F2c inc3, spec §5 "knob-refit"): an ABSENT-SAFE
+    way to apply a persona's FITTED Platt calibration
+    (`judge_selftune.fit_platt_knob`, persisted via
+    `MemoryStore.write_judge_knob_calibration`) in place of the fixed
+    sigmoid-0.5 default this function has always used. `p` becomes
+    `sigmoid(slope * raw_score + intercept)` instead of `sigmoid(raw_score)`
+    — passing `slope=1.0, intercept=0.0` (or leaving both `None`, the
+    default) reproduces today's exact fixed behavior bit-for-bit. Either
+    argument being `None` falls back to that default for just the missing
+    one, rather than raising — a caller is never required to supply both.
+    The band comparison (`abs(p - 0.5) < band_half_width`) is unchanged:
+    the ambiguous band is defined on the (possibly recalibrated)
+    probability, not on the raw score directly, so a fitted mapping that
+    shifts the decision boundary also shifts where the ambiguous band
+    sits, which is the intended effect (the band should track wherever
+    the judge's OWN cutoff currently is).
+
+    ⚠ Loading a persona's fitted params INTO this call — threading them
+    through `build_judge_provider`'s call site in
+    `label_calibration_sample` below, so the LIVE judge pass actually uses
+    a persona's own fitted knob — is F2c INC4, NOT built here (inc3 only
+    makes this function CAPABLE of applying fitted params; nothing in the
+    live per-tick call path passes them yet, so today's labeling behavior
+    is byte-for-byte unchanged until inc4 wires that through).
     """
     if band_half_width is None:
         band_half_width = tunables.get_tunable(
             "calibration.judge_ambiguous_band_half_width", AMBIGUOUS_BAND_HALF_WIDTH
         )
-    p = _sigmoid(raw_score)
+    effective_slope = slope if slope is not None else 1.0
+    effective_intercept = intercept if intercept is not None else 0.0
+    p = _sigmoid(effective_slope * raw_score + effective_intercept)
     provisional = "relevant" if p >= 0.5 else "irrelevant"
     is_ambiguous = abs(p - 0.5) < band_half_width
     return provisional, is_ambiguous

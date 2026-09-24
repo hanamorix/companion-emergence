@@ -47,11 +47,24 @@ def store() -> MemoryStore:
     return MemoryStore(db_path=":memory:")
 
 
-def _seed_labeled_rows(store: MemoryStore, n: int) -> list[int]:
+def _seed_labeled_rows(
+    store: MemoryStore, n: int, *, raw_score: float | None = 2.0
+) -> list[int]:
     """Insert `n` already judge-labeled `calibration_log` rows (`haiku_label`
     non-null, mirrors `write_calibration_labels`'s always-write contract —
     see that method's own docstring) and return their ids in insertion
-    order."""
+    order.
+
+    `raw_score` (F2c inc3): each row's single candidate position also gets
+    `local_judge_raw_score=[raw_score]` written by default, so a tick that
+    fires against these seeded rows has real (score, label) pairs for the
+    knob-refit to train on — without it, `fit_platt_knob` would see zero
+    usable pairs and raise (AC3's "no train" fault case, see
+    `test_tick_fires_above_the_handful_threshold` and friends below).
+    Pass `raw_score=None` to reproduce a legacy/pre-inc1 row that has no
+    raw score logged at all (used by the dedicated "no usable pairs"
+    bite test).
+    """
     ids: list[int] = []
     for i in range(n):
         store.log_calibration_sample(
@@ -60,7 +73,10 @@ def _seed_labeled_rows(store: MemoryStore, n: int) -> list[int]:
         row_id = store._conn.execute(
             "SELECT id FROM calibration_log ORDER BY id DESC LIMIT 1"
         ).fetchone()["id"]
-        store.write_calibration_labels(row_id, ["relevant"], ["relevant"])
+        local_judge_raw_score = [raw_score] if raw_score is not None else None
+        store.write_calibration_labels(
+            row_id, ["relevant"], ["relevant"], local_judge_raw_score=local_judge_raw_score
+        )
         ids.append(row_id)
     return ids
 
@@ -438,6 +454,123 @@ def test_judge_selftune_state_scoped_per_judge_model_id(store: MemoryStore) -> N
 
 
 # ---------------------------------------------------------------------------
+# MemoryStore.judge_knob_refit_pairs — F2c inc3's data-assembly step (spec
+# §3-5, AC4): reuses labeled_calibration_pairs's exact effective-label
+# precedence + unknown/error skip, but reads local_judge_raw_score (the bge
+# JUDGE's own score) rather than reranker_scores (jina's).
+# ---------------------------------------------------------------------------
+
+
+def test_judge_knob_refit_pairs_uses_local_label_when_no_haiku_override(store: MemoryStore) -> None:
+    ids = _seed_labeled_rows(store, 1, raw_score=3.0)
+    # _seed_labeled_rows writes haiku_label == local_judge_label ("relevant"
+    # on both) -- exercise the "no override" path with an explicit local-
+    # only row instead.
+    store.log_calibration_sample(
+        query="q", candidate_ids=["a", "b"], reranker_scores=[9.0, 9.0], reranker_model_id="m"
+    )
+    row_id = store._conn.execute("SELECT id FROM calibration_log ORDER BY id DESC LIMIT 1").fetchone()["id"]
+    store.write_calibration_labels(
+        row_id, ["relevant", "irrelevant"], [None, None], local_judge_raw_score=[1.0, 2.0]
+    )
+    pairs = store.judge_knob_refit_pairs([row_id])
+    assert sorted(pairs) == sorted([(1.0, "relevant"), (2.0, "irrelevant")])
+    assert ids  # sanity: the unrelated seeded row exists and is NOT in this scan
+
+
+def test_judge_knob_refit_pairs_haiku_label_overrides_local_label(store: MemoryStore) -> None:
+    store.log_calibration_sample(
+        query="q", candidate_ids=["a"], reranker_scores=[9.0], reranker_model_id="m"
+    )
+    row_id = store._conn.execute("SELECT id FROM calibration_log ORDER BY id DESC LIMIT 1").fetchone()["id"]
+    # Local judge said "relevant" (ambiguous-band); Haiku overrode to "irrelevant".
+    store.write_calibration_labels(row_id, ["relevant"], ["irrelevant"], local_judge_raw_score=[1.0])
+    assert store.judge_knob_refit_pairs([row_id]) == [(1.0, "irrelevant")]
+
+
+def test_judge_knob_refit_pairs_skips_unknown_and_error_sentinels(store: MemoryStore) -> None:
+    store.log_calibration_sample(
+        query="q", candidate_ids=["a", "b", "c"], reranker_scores=[9.0, 9.0, 9.0], reranker_model_id="m"
+    )
+    row_id = store._conn.execute("SELECT id FROM calibration_log ORDER BY id DESC LIMIT 1").fetchone()["id"]
+    store.write_calibration_labels(
+        row_id, ["relevant", "unknown", "error"], [None, None, None],
+        local_judge_raw_score=[1.0, None, None],
+    )
+    assert store.judge_knob_refit_pairs([row_id]) == [(1.0, "relevant")]
+
+
+def test_judge_knob_refit_pairs_skips_legacy_rows_with_no_raw_score_at_all(store: MemoryStore) -> None:
+    """A pre-F2c-inc1 row (never had local_judge_raw_score written) must be
+    skipped outright, not treated as a 0.0 score."""
+    ids = _seed_labeled_rows(store, 1, raw_score=None)
+    assert store.judge_knob_refit_pairs(ids) == []
+
+
+def test_judge_knob_refit_pairs_scoped_to_the_given_row_ids_only(store: MemoryStore) -> None:
+    """Only the passed-in row_ids are read -- an unrelated labeled row with
+    a real raw score must NOT leak in, mirroring the "exact set the gate
+    considered" contract (spec §2)."""
+    in_scope = _seed_labeled_rows(store, 1, raw_score=5.0)
+    _seed_labeled_rows(store, 1, raw_score=9.0)  # NOT passed to judge_knob_refit_pairs
+    pairs = store.judge_knob_refit_pairs(in_scope)
+    assert pairs == [(5.0, "relevant")]
+
+
+def test_judge_knob_refit_pairs_empty_row_ids_returns_empty(store: MemoryStore) -> None:
+    assert store.judge_knob_refit_pairs([]) == []
+
+
+# ---------------------------------------------------------------------------
+# MemoryStore.get_judge_knob_calibration / write_judge_knob_calibration —
+# marker round-trip (I1: table in memories.db), mirrors
+# get_judge_selftune_state / write_judge_selftune_state's own tests above.
+# ---------------------------------------------------------------------------
+
+
+def test_judge_knob_calibration_absent_reads_as_none(store: MemoryStore) -> None:
+    assert store.get_judge_knob_calibration("some-model") is None
+
+
+def test_judge_knob_calibration_round_trip(store: MemoryStore) -> None:
+    store.write_judge_knob_calibration("model-a", slope=1.7, intercept=-0.3)
+    knob = store.get_judge_knob_calibration("model-a")
+    assert knob is not None
+    assert knob["judge_model_id"] == "model-a"
+    assert knob["slope"] == pytest.approx(1.7)
+    assert knob["intercept"] == pytest.approx(-0.3)
+
+
+def test_judge_knob_calibration_upsert_replaces_not_accumulates(store: MemoryStore) -> None:
+    store.write_judge_knob_calibration("model-a", slope=1.0, intercept=0.0)
+    store.write_judge_knob_calibration("model-a", slope=2.0, intercept=0.5)
+    knob = store.get_judge_knob_calibration("model-a")
+    assert knob["slope"] == pytest.approx(2.0)
+    assert knob["intercept"] == pytest.approx(0.5)
+    n_rows = store._conn.execute("SELECT COUNT(*) AS n FROM judge_knob_calibration").fetchone()["n"]
+    assert n_rows == 1, "upsert must replace, never accumulate a history row"
+
+
+def test_judge_knob_calibration_scoped_per_judge_model_id(store: MemoryStore) -> None:
+    """No cross-model bleed within one persona's own db, mirroring
+    judge_selftune_state's own model_id keying."""
+    store.write_judge_knob_calibration("model-a", slope=1.0, intercept=0.0)
+    assert store.get_judge_knob_calibration("model-b") is None
+
+
+def test_judge_knob_calibration_per_persona_store_isolation() -> None:
+    """AC11 (per-persona weight isolation): two DIFFERENT personas' stores
+    (each its own memories.db, I1) must never read or overwrite each
+    other's fitted knob -- the database FILE is the isolation boundary."""
+    store_a = MemoryStore(db_path=":memory:")
+    store_b = MemoryStore(db_path=":memory:")
+    store_a.write_judge_knob_calibration("shared-model-id", slope=9.0, intercept=9.0)
+    assert store_b.get_judge_knob_calibration("shared-model-id") is None, (
+        "persona B must not see persona A's fitted knob, even under the same judge_model_id"
+    )
+
+
+# ---------------------------------------------------------------------------
 # _run_judge_selftune_tick — the full scaffold: gate + tier-select +
 # OOM-downgrade + marker write, and fault isolation.
 # ---------------------------------------------------------------------------
@@ -482,6 +615,9 @@ def test_tick_fires_above_the_handful_threshold(store: MemoryStore, monkeypatch:
     marker = store.get_judge_selftune_state(MODEL_RELEVANCE_JUDGE)
     assert marker is not None
     assert marker["last_trained_at"] == now.isoformat()
+    # F2c inc3: a completed knob-refit must have persisted fitted params.
+    knob = store.get_judge_knob_calibration(MODEL_RELEVANCE_JUDGE)
+    assert knob is not None
     # every row this tick scanned must now be consumed — a second count sees nothing.
     post_count, post_row_ids = store.count_new_haiku_decisions()
     assert post_count == 0
@@ -549,16 +685,77 @@ def test_tick_is_fault_isolated_never_raises(store: MemoryStore, monkeypatch: py
     assert result["fired"] is False
 
 
-def test_tick_does_not_import_torch_or_sentence_transformers() -> None:
-    """I6 / AC8 (off hot path): the scaffold, including a FIRING tick, must
-    never pull torch/sentence_transformers into `sys.modules` — that stays
-    scoped to the future TODO(F2c inc3+) tuning code, never to the
-    cadence/gate/tier-detect machinery this increment ships.
+# ---------------------------------------------------------------------------
+# AC3 new bite (F2c inc3, spec §2 "consume = trained-on, never fired-on"):
+# a tick that fires the >handful GATE but does NOT complete a tune must
+# leave the consume marker UNADVANCED, so those rows are still countable
+# next week -- the actual behavior change inc3 makes over inc2's
+# "consume unconditionally on every fire" scaffold.
+# ---------------------------------------------------------------------------
 
-    Red-team fix F-3: the prior version of this test grepped
-    `judge_selftune`'s own source TEXT for the literal strings "import
-    torch" / "import sentence_transformers". That only proves this one
-    module has no such import statement in it — it would NOT catch a
+
+def test_tick_gate_fires_but_no_usable_pairs_leaves_rows_unconsumed(store: MemoryStore) -> None:
+    """Scripted 'no-train' case: every seeded row is judge-labeled and has
+    a non-None haiku_label position (the gate fires, `new_decisions` is
+    correctly counted), but NONE carries a `local_judge_raw_score` (as a
+    week of purely legacy/pre-inc1 rows would look) -- `judge_knob_refit_
+    pairs` returns `[]`, `fit_platt_knob` raises, and the tick's own
+    try/except must catch that and leave every row unconsumed rather than
+    silently losing the Haiku signal these rows carry."""
+    handful = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
+    ids = _seed_labeled_rows(store, handful + 1, raw_score=None)
+
+    result = judge_selftune._run_judge_selftune_tick(store=store, now=datetime.now(UTC))
+
+    assert result["fired"] is False, "the gate fired but the tune never completed -- must not report fired"
+    assert result["error"] is not None
+    assert result["new_decisions"] == handful + 1, "the gate DID see enough decisions to have fired"
+    assert store.get_judge_selftune_state(MODEL_RELEVANCE_JUDGE) is None, "marker must stay untouched"
+    assert store.get_judge_knob_calibration(MODEL_RELEVANCE_JUDGE) is None, "no knob was ever fitted"
+
+    # the rows must still be there, UNCONSUMED, for next week's gate to recount.
+    post_count, post_row_ids = store.count_new_haiku_decisions()
+    assert post_count == handful + 1
+    assert sorted(post_row_ids) == sorted(ids)
+
+
+def test_tick_fault_during_fit_leaves_rows_unconsumed(
+    store: MemoryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half of the same contract: real usable pairs exist (the
+    fault is injected directly into the fit step itself, mirroring
+    `test_tick_is_fault_isolated_never_raises`'s injection style), and the
+    fault must still leave the rows unconsumed -- not just the "zero pairs"
+    degenerate path above."""
+    handful = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
+    ids = _seed_labeled_rows(store, handful + 1, raw_score=2.0)
+
+    def _boom(pairs):
+        raise RuntimeError("simulated fault mid-fit")
+
+    monkeypatch.setattr(judge_selftune, "fit_platt_knob", _boom)
+    result = judge_selftune._run_judge_selftune_tick(store=store, now=datetime.now(UTC))
+
+    assert result["fired"] is False
+    assert "simulated fault mid-fit" in result["error"]
+    assert store.get_judge_selftune_state(MODEL_RELEVANCE_JUDGE) is None
+    assert store.get_judge_knob_calibration(MODEL_RELEVANCE_JUDGE) is None
+    post_count, post_row_ids = store.count_new_haiku_decisions()
+    assert post_count == handful + 1
+    assert sorted(post_row_ids) == sorted(ids)
+
+
+def test_tick_does_not_import_torch_or_sentence_transformers() -> None:
+    """I6 / AC8 (off hot path): the scaffold, INCLUDING a FIRING tick that
+    actually runs F2c inc3's real knob-refit training code (assembly +
+    `fit_platt_knob` + persist), must never pull torch/sentence_transformers
+    into `sys.modules` — that stays scoped to the future LoRA/full-FT
+    tiers (inc5/6), never to the knob-refit this increment ships.
+
+    Red-team fix F-3 (inc2, still honored here): the prior version of this
+    test grepped `judge_selftune`'s own source TEXT for the literal strings
+    "import torch" / "import sentence_transformers". That only proves this
+    one module has no such import statement in it — it would NOT catch a
     TRANSITIVE pull via some other module `judge_selftune` imports (e.g. a
     future change to `brain.memory.reranker` or `brain.memory.store`
     growing a module-scope torch import). This runs a FRESH subprocess —
@@ -566,9 +763,11 @@ def test_tick_does_not_import_torch_or_sentence_transformers() -> None:
     already have imported into `sys.modules`, which would make an
     in-process `sys.modules` check meaningless (the same caveat
     `test_relevance_judge.py`'s sibling import-scope test documents) — that
-    imports `judge_selftune`, seeds enough `calibration_log` rows to FIRE
-    the >handful gate, actually runs `_run_judge_selftune_tick` end to end,
-    and only THEN asserts neither package landed in `sys.modules`.
+    imports `judge_selftune`, seeds enough `calibration_log` rows (WITH raw
+    judge scores, so the knob-refit has real pairs to fit — inc3's fire
+    path now actually trains, not just consumes) to FIRE the >handful
+    gate, actually runs `_run_judge_selftune_tick` end to end, and only
+    THEN asserts neither package landed in `sys.modules`.
     """
     script = textwrap.dedent(
         """
@@ -590,10 +789,13 @@ def test_tick_does_not_import_torch_or_sentence_transformers() -> None:
             row_id = store._conn.execute(
                 "SELECT id FROM calibration_log ORDER BY id DESC LIMIT 1"
             ).fetchone()["id"]
-            store.write_calibration_labels(row_id, ["relevant"], ["relevant"])
+            store.write_calibration_labels(
+                row_id, ["relevant"], ["relevant"], local_judge_raw_score=[2.0]
+            )
 
         result = judge_selftune._run_judge_selftune_tick(store=store, now=datetime.now(UTC))
         assert result["fired"] is True, result
+        assert store.get_judge_knob_calibration(judge_selftune.MODEL_RELEVANCE_JUDGE) is not None
 
         assert "torch" not in sys.modules, sorted(sys.modules)
         assert "sentence_transformers" not in sys.modules, sorted(sys.modules)
@@ -690,3 +892,146 @@ def test_run_folded_accepts_judge_selftune_interval_s() -> None:
     assert "judge_selftune_interval_s" in sig.parameters
     param = sig.parameters["judge_selftune_interval_s"]
     assert param.default == judge_selftune.JUDGE_TUNE_INTERVAL_HOURS * 3600.0
+
+
+# ---------------------------------------------------------------------------
+# fit_platt_knob — F2c inc3's knob-refit fit itself (spec §5, AC2/AC8): a
+# deterministic, torch-free, best-separating Platt slope+intercept fit.
+# ---------------------------------------------------------------------------
+
+
+def test_fit_platt_knob_empty_pairs_raises() -> None:
+    with pytest.raises(ValueError, match="at least one labeled pair"):
+        judge_selftune.fit_platt_knob([])
+
+
+def test_fit_platt_knob_single_class_returns_identity_mapping() -> None:
+    """No separation exists to fit -- falls back to the identity mapping
+    (slope=1.0, intercept=0.0), `label_for_score`'s own fixed default,
+    mirroring `fit_threshold_fbeta`'s degenerate-input posture rather than
+    fitting a meaningless direction from zero contrast."""
+    pairs = [(1.0, "relevant"), (2.0, "relevant"), (3.0, "relevant")]
+    slope, intercept = judge_selftune.fit_platt_knob(pairs)
+    assert slope == pytest.approx(1.0)
+    assert intercept == pytest.approx(0.0)
+
+
+def test_fit_platt_knob_is_deterministic() -> None:
+    """AC2/AC8: the SAME pairs must always produce the SAME fitted
+    params -- no randomness anywhere in the fit."""
+    pairs = [
+        (-5.0, "irrelevant"), (-4.0, "irrelevant"), (-3.0, "irrelevant"),
+        (3.0, "relevant"), (4.0, "relevant"), (5.0, "relevant"),
+    ]
+    first = judge_selftune.fit_platt_knob(pairs)
+    second = judge_selftune.fit_platt_knob(list(pairs))  # fresh list, same contents
+    assert first == second
+
+
+def test_fit_platt_knob_order_invariant() -> None:
+    """The fit is a sum over pairs (order-invariant) -- shuffling the
+    input must not change the result."""
+    pairs = [
+        (-5.0, "irrelevant"), (-4.0, "irrelevant"), (-3.0, "irrelevant"),
+        (3.0, "relevant"), (4.0, "relevant"), (5.0, "relevant"),
+    ]
+    forward = judge_selftune.fit_platt_knob(pairs)
+    reversed_order = judge_selftune.fit_platt_knob(list(reversed(pairs)))
+    assert forward[0] == pytest.approx(reversed_order[0], abs=1e-9)
+    assert forward[1] == pytest.approx(reversed_order[1], abs=1e-9)
+
+
+def test_fit_platt_knob_best_separates_and_bites_on_label_for_score() -> None:
+    """AC2's actual bite: the fitted mapping separates a lopsided sample
+    (relevant scores clustered near 1.0, irrelevant scores clustered near
+    -3.0 -- an asymmetric split, unlike the fixed sigmoid's boundary at
+    raw_score=0.0) and, once applied through `label_for_score`, CHANGES
+    the label on a case whose score crossed the new cutoff versus the
+    fixed default."""
+    pairs = (
+        [(1.0, "relevant")] * 5
+        + [(-3.0, "irrelevant")] * 5
+    )
+    slope, intercept = judge_selftune.fit_platt_knob(pairs)
+
+    # The two clusters must separate correctly under the fitted mapping.
+    from brain.memory.relevance_judge import label_for_score
+
+    for score, expected in pairs:
+        label, _ = label_for_score(score, slope=slope, intercept=intercept)
+        assert label == expected, f"fitted mapping must correctly classify its own training pair {score}"
+
+    # BITE: a probe score between the two clusters, closer to the
+    # irrelevant cluster, is "irrelevant" under the fixed default
+    # (raw_score=-0.5 < 0) but "relevant" under the fitted (shifted
+    # toward the lopsided data's true midpoint near -1.0) mapping.
+    probe = -0.5
+    fixed_label, _ = label_for_score(probe)
+    fitted_label, _ = label_for_score(probe, slope=slope, intercept=intercept)
+    assert fixed_label == "irrelevant", "sanity: the fixed default puts -0.5 on the irrelevant side"
+    assert fitted_label != fixed_label, "the fitted knob must have shifted the cutoff past this probe score"
+
+
+def test_fit_platt_knob_symmetric_balanced_data_stays_near_identity() -> None:
+    """A dataset already well-separated by the EXISTING fixed boundary
+    (symmetric around raw_score=0, balanced classes) should fit params
+    close to the identity mapping -- the refit generalizes the existing
+    knob, it should not gratuitously distort a sample the fixed default
+    already handles well."""
+    pairs = (
+        [(-5.0, "irrelevant"), (-4.0, "irrelevant"), (-3.0, "irrelevant")]
+        + [(3.0, "relevant"), (4.0, "relevant"), (5.0, "relevant")]
+    )
+    slope, intercept = judge_selftune.fit_platt_knob(pairs)
+    assert slope > 0.0, "higher raw score must still mean more likely relevant"
+    assert abs(intercept) < 1.0, "a symmetric/balanced sample should not push the boundary far off zero"
+
+
+def test_fit_platt_knob_anti_correlated_data_falls_back_to_identity_not_negative_slope() -> None:
+    """Monotonicity guard (Opus cold-review, LOW) BITE: on ANTI-correlated
+    (raw_score, effective_label) pairs -- the exact mirror image of
+    `test_fit_platt_knob_symmetric_balanced_data_stays_near_identity`'s
+    data, with the two labels swapped, so HIGH raw scores are labeled
+    "irrelevant" and LOW raw scores "relevant" -- unconstrained
+    Newton-Raphson fits a NEGATIVE slope here (confirmed by running this
+    exact algorithm without the guard: ~-0.338, the sign-flipped mirror of
+    the symmetric test's ~+0.338). The judge's raw score is
+    positively-correlated-with-relevance BY CONSTRUCTION, so a negative
+    slope would INVERT the judge's relevance direction -- never a valid
+    refit. The guard must catch this and return the identity mapping
+    instead."""
+    pairs = (
+        [(-5.0, "relevant"), (-4.0, "relevant"), (-3.0, "relevant")]
+        + [(3.0, "irrelevant"), (4.0, "irrelevant"), (5.0, "irrelevant")]
+    )
+    slope, intercept = judge_selftune.fit_platt_knob(pairs)
+    assert slope == pytest.approx(1.0), "must fall back to the identity slope, never a negative one"
+    assert intercept == pytest.approx(0.0)
+
+
+def test_fit_platt_knob_does_not_import_torch() -> None:
+    """AC8: the fit function itself, exercised directly (not only via the
+    tick), must never import torch -- pure numpy only."""
+    script = textwrap.dedent(
+        """
+        import sys
+        from brain.memory import judge_selftune
+
+        pairs = [(-3.0, "irrelevant"), (3.0, "relevant")]
+        slope, intercept = judge_selftune.fit_platt_knob(pairs)
+        assert isinstance(slope, float) and isinstance(intercept, float)
+        assert "torch" not in sys.modules, sorted(sys.modules)
+        assert "sentence_transformers" not in sys.modules, sorted(sys.modules)
+        print("SUBPROCESS_OK")
+        """
+    )
+    repo_root = Path(__file__).resolve().parents[4]
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    assert "SUBPROCESS_OK" in proc.stdout, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"

@@ -28,6 +28,8 @@ import logging
 import sys
 from datetime import datetime
 
+import numpy as np
+
 from brain import tunables
 from brain.bridge.model_tier import MODEL_RELEVANCE_JUDGE
 from brain.memory.reranker import _available_ram_headroom_bytes
@@ -201,6 +203,155 @@ def _downgrade_for_oom_safety(tune_grade: str, effective_headroom_bytes: float |
 
 
 # ---------------------------------------------------------------------------
+# F2c inc3 — the knob-refit fit itself (spec §5: "fit the threshold/Platt
+# slope+intercept on the (judge-raw-score, effective-label) pairs"). Weak-
+# tier training code: deterministic, NO torch, NO randomness — mirrors
+# `floor_calibration.fit_threshold_fbeta`'s posture (pure numpy, exact/
+# reproducible, fails toward a safe degenerate answer rather than raising
+# on a single-class sample) but fits TWO parameters (slope + intercept)
+# instead of one (a bare threshold), because §5 explicitly steers toward
+# Platt scaling as the DERIVED generalization of the existing fixed knob:
+# `relevance_judge.label_for_score` already applies a sigmoid centered at
+# 0.5 (equivalent to slope=1.0, intercept=0.0) — Platt scaling is exactly
+# that same sigmoid family, re-centered and re-scaled by a proper
+# maximum-likelihood fit instead of hand-picked at (1.0, 0.0). A bare
+# threshold would have discarded the existing knob's shape rather than
+# generalizing it (I3: derived, not hand-picked).
+# ---------------------------------------------------------------------------
+
+
+def _platt_targets(labels: list[str]) -> np.ndarray:
+    """Lin-Lin-Weng (2007) regularized target probabilities for Platt
+    scaling — the standard, published fix for Platt's original method's
+    known divergence failure mode on perfectly separable data (a real
+    possibility with a small weekly batch: e.g. every "relevant" pair
+    scoring higher than every "irrelevant" one). Bounds each target
+    strictly inside (0, 1) instead of at the raw 0/1 label, so the
+    maximum-likelihood fit below cannot chase an unreachable exact
+    boundary out to +/-infinity. A published, well-known recipe (not a
+    hand-picked heuristic): `t_relevant = (n_pos + 1) / (n_pos + 2)`,
+    `t_irrelevant = 1 / (n_neg + 2)`.
+    """
+    n_pos = sum(1 for label in labels if label == "relevant")
+    n_neg = len(labels) - n_pos
+    t_pos = (n_pos + 1.0) / (n_pos + 2.0)
+    t_neg = 1.0 / (n_neg + 2.0)
+    return np.array([t_pos if label == "relevant" else t_neg for label in labels], dtype=np.float64)
+
+
+def fit_platt_knob(pairs: list[tuple[float, str]]) -> tuple[float, float]:
+    """Fit `(slope, intercept)` such that `sigmoid(slope * raw_score +
+    intercept)` best separates `pairs` into their `"relevant"`/
+    `"irrelevant"` effective labels (spec §5, AC2) — the knob-refit's core
+    fit, consumed by `relevance_judge.label_for_score`'s `slope`/
+    `intercept` params.
+
+    DETERMINISTIC (AC2/AC8): Newton-Raphson with backtracking line search
+    on the (Lin-Lin-Weng regularized-target) binary cross-entropy loss —
+    always the SAME fixed starting point `(slope=0.0, intercept=0.0)`, a
+    fixed iteration cap, no random initialization and no randomness
+    anywhere in the loop, so the SAME `pairs` (in any order — the loss is a
+    sum, order-invariant) always produces the SAME output. Pure numpy, no
+    torch/sentence_transformers import anywhere in this module (AC8) — a
+    couple of interpretable scalar parameters, the "always-safe floor"
+    tier's whole point (spec §1).
+
+    BEST-SEPARATING (AC2): Newton-Raphson on a strictly concave
+    log-likelihood (the regularized targets above keep it strictly concave
+    even for separable data) converges to the actual maximum-likelihood
+    (slope, intercept) for this 1-D logistic-regression family — the
+    best-separating member of the sigmoid family the existing fixed knob
+    already belongs to, not an arbitrary or hand-tuned pick.
+
+    Degenerate input (mirrors `fit_threshold_fbeta`'s posture): a
+    single-class sample (every pair the SAME label — no separation to fit)
+    returns the IDENTITY mapping `(1.0, 0.0)` — `label_for_score`'s exact
+    fixed-default behavior — rather than fitting a meaningless direction
+    from zero contrast. An EMPTY `pairs` raises `ValueError` (no data
+    exists to train on at all) — `_run_judge_selftune_tick` treats that as
+    a "no train" fault (spec AC3's consume=trained-on-never-fired-on
+    contract): the calling tick's own try/except catches it, and the rows
+    that would have fed this fit stay unconsumed for next week.
+
+    MONOTONICITY GUARD (Opus cold-review, LOW): the judge's raw score is
+    positively-correlated-with-relevance BY CONSTRUCTION (the existing
+    fixed knob is `sigmoid(raw_score) >= 0.5` = `"relevant"` — higher
+    score always means more relevant). A fitted `slope <= 0.0` would
+    INVERT that direction (higher score -> `"irrelevant"`), which is never
+    a valid refit of this judge — it only arises from bad/insufficient/
+    anti-correlated weekly data. Such a fit falls back to the IDENTITY
+    mapping `(1.0, 0.0)` too, same posture as the single-class case above,
+    rather than applying an inverting knob.
+    """
+    if not pairs:
+        raise ValueError("fit_platt_knob requires at least one labeled pair")
+    scores = np.array([score for score, _ in pairs], dtype=np.float64)
+    labels = [label for _, label in pairs]
+    if not any(label == "relevant" for label in labels) or not any(
+        label == "irrelevant" for label in labels
+    ):
+        # Single-class sample: no separation to fit — identity mapping,
+        # same posture as fit_threshold_fbeta's degenerate-input fallback.
+        return 1.0, 0.0
+
+    targets = _platt_targets(labels)
+    slope, intercept = 0.0, 0.0
+
+    def _loss(s: float, i: float) -> float:
+        z = s * scores + i
+        p = np.clip(1.0 / (1.0 + np.exp(-z)), 1e-12, 1.0 - 1e-12)
+        return float(-np.sum(targets * np.log(p) + (1.0 - targets) * np.log(1.0 - p)))
+
+    prev_loss = _loss(slope, intercept)
+    for _ in range(100):
+        z = slope * scores + intercept
+        p = np.clip(1.0 / (1.0 + np.exp(-z)), 1e-12, 1.0 - 1e-12)
+        grad_slope = float(np.sum((p - targets) * scores))
+        grad_intercept = float(np.sum(p - targets))
+        w = p * (1.0 - p)
+        h_ss = float(np.sum(w * scores * scores)) + 1e-12
+        h_si = float(np.sum(w * scores))
+        h_ii = float(np.sum(w)) + 1e-12
+        det = h_ss * h_ii - h_si * h_si
+        if abs(det) < 1e-12:
+            break
+        d_slope = (h_ii * grad_slope - h_si * grad_intercept) / det
+        d_intercept = (h_ss * grad_intercept - h_si * grad_slope) / det
+        if abs(d_slope) < 1e-10 and abs(d_intercept) < 1e-10:
+            break
+
+        step = 1.0
+        new_slope, new_intercept, new_loss = slope, intercept, prev_loss
+        for _ in range(30):  # backtracking line search, fixed cap, deterministic
+            new_slope = slope - step * d_slope
+            new_intercept = intercept - step * d_intercept
+            new_loss = _loss(new_slope, new_intercept)
+            if new_loss <= prev_loss + 1e-12:
+                break
+            step *= 0.5
+
+        if abs(prev_loss - new_loss) < 1e-12:
+            slope, intercept = new_slope, new_intercept
+            break
+        slope, intercept, prev_loss = new_slope, new_intercept, new_loss
+
+    if slope <= 0.0:
+        # Monotonicity guard (Opus cold-review, LOW): the judge's raw score
+        # is positively-correlated-with-relevance BY CONSTRUCTION (the
+        # existing fixed knob is sigmoid(raw_score) >= 0.5 = "relevant" —
+        # higher score always means more relevant). A non-positive fitted
+        # slope would INVERT that direction (higher score -> "irrelevant"),
+        # which is never a valid refit of this judge — it only happens on
+        # bad/insufficient/contradictory data (e.g. anti-correlated pairs
+        # from a noisy or too-small weekly batch). Fail toward the identity
+        # mapping instead of applying an inverting knob, mirroring the
+        # single-class fallback immediately above this fit loop.
+        return 1.0, 0.0
+
+    return float(slope), float(intercept)
+
+
+# ---------------------------------------------------------------------------
 # F2c (durable note, spec §6): Haiku is the effective relevance ORACLE this
 # module's future training code converges the local judge toward. The
 # TODO(F2c inc3+) placeholder below is where that training will run: it
@@ -219,23 +370,45 @@ def _downgrade_for_oom_safety(tune_grade: str, effective_headroom_bytes: float |
 
 
 def _run_judge_selftune_tick(*, store, now: datetime) -> dict:
-    """One weekly judge self-tune tick (F2c inc2 scaffold). Caller owns
-    cadence + throttle — mirrors `interest_sweep.run_sweep_tick`'s contract
-    exactly (a leaf engine call, not a supervisor `_run_X_tick` wrapper by
-    naming convention alone; this function's own docstring states the same
-    "caller owns cadence + throttle" contract the BUILD instructions name
-    it by). Never raises.
+    """One weekly judge self-tune tick (F2c inc2 cadence/gate scaffold +
+    inc3 knob-refit). Caller owns cadence + throttle — mirrors
+    `interest_sweep.run_sweep_tick`'s contract exactly (a leaf engine call,
+    not a supervisor `_run_X_tick` wrapper by naming convention alone; this
+    function's own docstring states the same "caller owns cadence +
+    throttle" contract the BUILD instructions name it by). Never raises.
 
-    Scaffold-only (inc2): counts UNCONSUMED non-None `haiku_label`
-    positions across `calibration_log` (the >handful gate, spec §2/§3,
-    pinned counting unit — `MemoryStore.count_new_haiku_decisions`) and —
-    ONLY when the gate fires — runtime-detects the RAM tune-grade, applies
-    the cgroup-aware OOM-safety downgrade, and marks every row this tick
-    scanned as consumed (`MemoryStore.mark_selftune_consumed`). The actual
-    tuning (knob-refit / LoRA / full-FT, the eval split, champion/
-    challenger + rollback) is NOT invoked here — see the TODO(F2c inc3+)
-    marker below for what inc3 must change about consumption once training
-    actually exists.
+    Counts UNCONSUMED non-None `haiku_label` positions across
+    `calibration_log` (the >handful gate, spec §2/§3, pinned counting unit
+    — `MemoryStore.count_new_haiku_decisions`) and, ONLY when the gate
+    fires: runtime-detects the RAM tune-grade, applies the cgroup-aware
+    OOM-safety downgrade, then runs the knob-refit (spec §5 — ALWAYS runs
+    on every tier, weak/mid/beefy alike; `tune_grade` selects only whether
+    a LoRA/full-FT weight-retrain ALSO runs, not built here — TODO(F2c
+    inc5/6) below) — assembling `(judge_raw_score, effective_label)` pairs
+    from `row_ids`'s rows (`MemoryStore.judge_knob_refit_pairs`), fitting
+    `fit_platt_knob`, and persisting the result
+    (`MemoryStore.write_judge_knob_calibration`) — and ONLY once that
+    fit has completed successfully marks every row this tick scanned as
+    consumed (`MemoryStore.mark_selftune_consumed`). Spec §2's "consume =
+    trained-on, never fired-on" pinned contract: if the assembly or fit
+    raises (e.g. `fit_platt_knob`'s `ValueError` on zero usable pairs — a
+    real possibility for legacy rows logged before F2c inc1 added the raw-
+    score column), this function's own try/except below catches it,
+    `result["fired"]` stays `False`, and `row_ids` are left UNCONSUMED —
+    next week's gate recounts them rather than silently losing that Haiku
+    signal.
+
+    ⚠ F2c INC4, NOT built here: loading a persona's fitted knob params
+    INTO the live judge pass (threading them through
+    `relevance_judge.build_judge_provider`'s call site, so
+    `label_calibration_sample` actually applies what this tick persists)
+    — this tick only WRITES `judge_knob_calibration`; nothing on the live
+    per-turn or daily-calibration-tick path reads it yet.
+    ⚠ F2c INC5/6, NOT built here: the LoRA (mid) / full fine-tune (beefy)
+    weight-retrain tiers, the 2/3-train/1/3-test champion/challenger split
+    + rollback (spec §4) — `tune_grade` below is computed and returned so
+    a caller can see which grade WOULD run once those increments land, but
+    only the knob-refit executes regardless of `tune_grade`'s value.
 
     Returns a caller-facing result dict (ignored by the current
     `supervisor.run_folded` wiring below, mirrors `run_sweep_tick`'s own
@@ -258,22 +431,21 @@ def _run_judge_selftune_tick(*, store, now: datetime) -> dict:
         effective_headroom = _available_ram_headroom_bytes()
         tune_grade = _downgrade_for_oom_safety(tune_grade, effective_headroom)
 
-        # TODO(F2c inc3+): run the selected tier's tuning HERE, BEFORE the
-        # consume below — assemble (query, doc, label) triples from
-        # `row_ids`'s calibration_log rows (spec §3-5, the effective
-        # Haiku-over-local label, skipping "unknown"/"error" rows), fit the
-        # knob-refit threshold/Platt mapping (always) plus the `tune_grade`
-        # weight-retrain (LoRA/full-FT) when the grade calls for one, then
-        # run the 2/3-train/1/3-test champion/challenger eval + rollback
-        # (spec §4) before this becomes next week's deployed judge.
-        # `tune_grade` computed just above is what that future work selects
-        # between. ⚠ inc2 has no training yet, so this scaffold consumes
-        # `row_ids` unconditionally below on every fire — inc3 MUST NOT
-        # keep that: once training exists, only mark_selftune_consumed the
-        # rows actually used in that week's train+test split (a row
-        # skipped/failed mid-training must NOT be marked consumed, or its
-        # Haiku decision is silently lost rather than retried next week).
+        # Knob-refit ALWAYS runs on the weak tier (spec §5) and is the
+        # natural finishing step after any weight-retrain on mid/beefy
+        # tiers too — inc5/6 will re-run it after their own weight update,
+        # not built here. Any exception here (assembly or fit) propagates
+        # to this function's own except block below, which is exactly
+        # spec AC3's "fault before training completes" case: `row_ids`
+        # stays unconsumed.
+        pairs = store.judge_knob_refit_pairs(row_ids)
+        slope, intercept = fit_platt_knob(pairs)
+        store.write_judge_knob_calibration(MODEL_RELEVANCE_JUDGE, slope=slope, intercept=intercept)
 
+        # Consume = trained-on, never fired-on (spec §2 pinned contract):
+        # reaching this line means the knob-refit above ran to completion,
+        # so `row_ids` — the exact set `judge_knob_refit_pairs` was built
+        # from — is now safe to retire.
         store.mark_selftune_consumed(row_ids, consumed_at=now)
         store.write_judge_selftune_state(MODEL_RELEVANCE_JUDGE, last_trained_at=now)
         result["fired"] = True

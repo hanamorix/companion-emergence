@@ -439,7 +439,15 @@ def _seed_labeled_calibration_rows(persona_dir: Path, n: int) -> None:
     non-null, mirrors `write_calibration_labels`'s always-write contract)
     directly into `<persona_dir>/memories.db`, closed before returning so
     `run_folded`'s own per-tick `MemoryStore` can open the same file fresh
-    (mirrors the judge self-tune tick's own store-ownership contract)."""
+    (mirrors the judge self-tune tick's own store-ownership contract).
+
+    F2c inc3: also writes `local_judge_raw_score` on each row so the real
+    tick's knob-refit (`judge_selftune.fit_platt_knob`, run BEFORE consume
+    now — spec §2 "consume = trained-on") has real pairs to train on;
+    without it, `fit_platt_knob` raises on zero usable pairs and the tick
+    correctly does NOT fire or consume (see
+    `test_judge_selftune.py::test_tick_gate_fires_but_no_usable_pairs_
+    leaves_rows_unconsumed` for that dedicated bite test)."""
     store = MemoryStore(persona_dir / "memories.db")
     try:
         for i in range(n):
@@ -449,7 +457,9 @@ def _seed_labeled_calibration_rows(persona_dir: Path, n: int) -> None:
             row_id = store._conn.execute(
                 "SELECT id FROM calibration_log ORDER BY id DESC LIMIT 1"
             ).fetchone()["id"]
-            store.write_calibration_labels(row_id, ["relevant"], ["relevant"])
+            store.write_calibration_labels(
+                row_id, ["relevant"], ["relevant"], local_judge_raw_score=[2.0]
+            )
     finally:
         store.close()
 

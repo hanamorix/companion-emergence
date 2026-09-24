@@ -128,6 +128,65 @@ def test_label_for_score_defaults_to_the_live_tunable_band_width() -> None:
 
 
 # ---------------------------------------------------------------------------
+# label_for_score — slope/intercept (F2c inc3, spec §5): ABSENT-SAFE Platt
+# calibration params. Both None (the default, and every live call site
+# until F2c inc4) must reproduce today's exact fixed behavior.
+# ---------------------------------------------------------------------------
+
+
+def test_label_for_score_slope_intercept_absent_matches_fixed_default() -> None:
+    """No slope/intercept passed -> byte-for-byte the pre-inc3 fixed
+    sigmoid-0.5 behavior (absent-safe fallback, spec §5)."""
+    for raw_score in (-10.0, -0.3, 0.0, 0.3, 10.0):
+        assert label_for_score(raw_score) == label_for_score(raw_score, slope=None, intercept=None)
+
+
+def test_label_for_score_slope_1_intercept_0_is_identical_to_fixed_default() -> None:
+    """Explicit identity params (slope=1.0, intercept=0.0) must reproduce
+    the fixed default exactly — this is the mapping absent params are
+    documented as equivalent to."""
+    for raw_score in (-10.0, -0.3, 0.0, 0.3, 10.0):
+        assert label_for_score(raw_score, slope=1.0, intercept=0.0) == label_for_score(raw_score)
+
+
+def test_label_for_score_only_slope_given_intercept_falls_back_to_zero() -> None:
+    """Either argument being None uses the default for just the missing
+    one, not an all-or-nothing requirement."""
+    assert label_for_score(0.0, slope=2.0) == label_for_score(0.0, slope=2.0, intercept=0.0)
+
+
+def test_label_for_score_only_intercept_given_slope_falls_back_to_one() -> None:
+    assert label_for_score(0.0, intercept=1.0) == label_for_score(0.0, slope=1.0, intercept=1.0)
+
+
+def test_label_for_score_fitted_intercept_shifts_the_decision_boundary() -> None:
+    """BITE: a raw score that is "irrelevant" under the fixed default (its
+    sigmoid sits below 0.5) flips to "relevant" once a fitted intercept
+    shifts the boundary past it — proving the params path actually changes
+    the label, not merely accepted and ignored."""
+    raw_score = -0.5
+    fixed_label, _ = label_for_score(raw_score)
+    assert fixed_label == "irrelevant", "sanity: -0.5 is below the fixed 0.5 boundary"
+
+    fitted_label, _ = label_for_score(raw_score, slope=1.0, intercept=1.0)
+    assert fitted_label == "relevant", "shifted boundary (z = -0.5 + 1.0 = 0.5 > 0) now covers this score"
+
+
+def test_label_for_score_fitted_params_also_shift_the_ambiguous_band() -> None:
+    """The ambiguous band is defined on the (possibly recalibrated)
+    probability, so a fitted mapping shifts where the band sits too, not
+    just the pass/fail label."""
+    # Under the fixed default, raw_score=1.0 is comfortably clear
+    # (sigmoid(1.0) ~= 0.73, outside the default 0.05 half-width band).
+    _, fixed_ambiguous = label_for_score(1.0)
+    assert fixed_ambiguous is False
+    # A fitted slope that compresses the score toward 0 moves it back
+    # inside the band around the new boundary.
+    _, fitted_ambiguous = label_for_score(1.0, slope=0.01, intercept=0.0)
+    assert fitted_ambiguous is True
+
+
+# ---------------------------------------------------------------------------
 # build_judge_provider — process-wide cache (mirrors test_reranker.py's
 # coverage of build_reranker_provider's own cache).
 # ---------------------------------------------------------------------------

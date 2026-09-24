@@ -451,6 +451,35 @@ CREATE TABLE IF NOT EXISTS judge_selftune_state (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- F2c (inc3, spec §5): per-persona JUDGE KNOB-REFIT calibration — the
+-- fitted Platt slope+intercept `judge_selftune.fit_platt_knob` derives from
+-- this persona's accumulated (judge-raw-score, effective-label) pairs on a
+-- firing weekly tick, which `relevance_judge.label_for_score` can apply
+-- instead of its fixed sigmoid-0.5 default. Mirrors `judge_selftune_state`
+-- immediately above in every respect (a tiny per-persona artifact table in
+-- memories.db, never a side file, I1; keyed by `judge_model_id` so a
+-- future local-judge model swap never mixes one model's fitted knob with
+-- another's; `CREATE TABLE IF NOT EXISTS`, legacy-safe, I9). An absent row
+-- (fresh install, or any persona that has never had a weekly tick complete
+-- a knob-refit) reads as `None` via `MemoryStore.get_judge_knob_calibration`
+-- — ABSENT-SAFE per spec §5 ("absent params -> unchanged fixed behavior"),
+-- never an error and never a silently-fabricated default.
+-- Per-persona-by-construction (AC11): each persona keeps its own
+-- memories.db (I1), so this table can never bleed across personas — the
+-- DATABASE FILE itself is the isolation boundary, same as every other
+-- per-persona table here, no persona-scoping column needed.
+-- ⚠ Loading these params AT JUDGE TIME — threading them through
+-- `relevance_judge.build_judge_provider`'s call site so the live judge
+-- pass actually applies a persona's own fitted knob — is F2c INC4, NOT
+-- built here: inc3 only writes and reads this table; nothing in the live
+-- per-turn or daily-calibration-tick path consults it yet.
+CREATE TABLE IF NOT EXISTS judge_knob_calibration (
+    judge_model_id TEXT PRIMARY KEY,
+    slope REAL NOT NULL,
+    intercept REAL NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 -- External-content FTS5 shadow index (P2 relevance overhaul). `memories` is a
 -- rowid table (id TEXT PRIMARY KEY → implicit integer rowid), so external
 -- content with content_rowid='rowid' indexes only `content` (no duplication).
@@ -1619,6 +1648,117 @@ class MemoryStore:
         self._conn.executemany(
             "UPDATE calibration_log SET selftune_consumed_at = ? WHERE id = ?",
             [(now_iso, row_id) for row_id in row_ids],
+        )
+        self._conn.commit()
+
+    def judge_knob_refit_pairs(self, row_ids: list[int]) -> list[tuple[float, str]]:
+        """`(judge_raw_score, effective_label)` pairs for F2c inc3's
+        knob-refit, built from the EXACT `calibration_log` row set a firing
+        weekly tick's gate considered (`count_new_haiku_decisions`'s
+        `row_ids` return) — never a fresh independent scan, so the pairs
+        the fit is built from and the rows a completed refit is allowed to
+        mark consumed are always the identical set (spec §2's "consume =
+        trained-on" contract).
+
+        REUSES `labeled_calibration_pairs`'s exact effective-label
+        precedence (the Haiku tie-break OVERRIDES the local judge at the
+        ambiguous-band position it resolved; else the local judge's own
+        label stands) and its `"unknown"`/`"error"` skip — the same
+        pattern, not reimplemented, per that method's own docstring — but
+        reads `local_judge_raw_score` (F2c inc1, the bge JUDGE's own raw
+        score) instead of `reranker_scores` (jina's, F2a's floor-fit
+        input): the knob-refit recalibrates the JUDGE's own
+        score-to-label mapping, so it must fit on the JUDGE's score, never
+        the reranker's. A `None` raw-score position (the
+        `"unknown"`/`"error"` write sentinel in `write_calibration_labels`,
+        or any row logged before F2c inc1 added this column) is skipped —
+        no score to fit against. Not day-scoped (unlike
+        `labeled_calibration_pairs`): the weekly tick accumulates across
+        however many days elapsed since the last consume, not one day.
+
+        Read-only: does not write or bump anything. Empty `row_ids` or no
+        usable positions returns `[]` — `fit_platt_knob` raises on empty
+        input, which `_run_judge_selftune_tick` treats as "no train" (spec
+        AC3's pinned consume-only-on-a-completed-tune contract).
+        """
+        if not row_ids:
+            return []
+        placeholders = ",".join("?" for _ in row_ids)
+        rows = self._conn.execute(
+            "SELECT local_judge_raw_score, local_judge_label, haiku_label "
+            f"FROM calibration_log WHERE id IN ({placeholders})",
+            row_ids,
+        ).fetchall()
+        pairs: list[tuple[float, str]] = []
+        for row in rows:
+            if row["local_judge_raw_score"] is None or row["local_judge_label"] is None:
+                continue
+            raw_scores = json.loads(row["local_judge_raw_score"])
+            local_labels = json.loads(row["local_judge_label"])
+            haiku_labels = (
+                json.loads(row["haiku_label"])
+                if row["haiku_label"] is not None
+                else [None] * len(local_labels)
+            )
+            for raw_score, local_label, haiku_label in zip(
+                raw_scores, local_labels, haiku_labels, strict=False
+            ):
+                if raw_score is None:
+                    continue
+                effective = haiku_label if haiku_label is not None else local_label
+                if effective in ("relevant", "irrelevant"):
+                    pairs.append((float(raw_score), effective))
+        return pairs
+
+    def get_judge_knob_calibration(self, judge_model_id: str) -> dict[str, Any] | None:
+        """Return the PERSISTED `judge_knob_calibration` row for
+        `judge_model_id`, or `None` if this persona's judge has never had a
+        knob-refit complete yet (F2c inc3, spec §5). ABSENT-SAFE reader —
+        `None` is the honest "use the fixed sigmoid-0.5 default" signal a
+        caller (eventually `relevance_judge.build_judge_provider`'s
+        call site, F2c inc4) checks for before applying `label_for_score`'s
+        `slope`/`intercept` params. Read-only: does not write or bump
+        anything.
+        """
+        row = self._conn.execute(
+            "SELECT judge_model_id, slope, intercept, updated_at "
+            "FROM judge_knob_calibration WHERE judge_model_id = ?",
+            (judge_model_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "judge_model_id": row["judge_model_id"],
+            "slope": row["slope"],
+            "intercept": row["intercept"],
+            "updated_at": row["updated_at"],
+        }
+
+    def write_judge_knob_calibration(
+        self, judge_model_id: str, *, slope: float, intercept: float
+    ) -> None:
+        """Upsert this persona's fitted knob-refit params for
+        `judge_model_id` (F2c inc3, spec §5) — the ONLY write path into
+        `judge_knob_calibration` (I1: a table in memories.db, never a side
+        file). `INSERT ... ON CONFLICT DO UPDATE` keyed on `judge_model_id`
+        (its PRIMARY KEY), mirroring `write_judge_selftune_state`'s upsert
+        shape: the row is replaced wholesale on each COMPLETED weekly
+        refit, never accumulated as a history.
+
+        Called only after `judge_selftune.fit_platt_knob` has returned
+        successfully — a tick that fails before reaching this call (no
+        usable pairs, or any other fault) must NOT call this, mirroring
+        `write_judge_selftune_state`'s own "only on a completed firing"
+        contract.
+        """
+        self._conn.execute(
+            "INSERT INTO judge_knob_calibration "
+            "(judge_model_id, slope, intercept, updated_at) "
+            "VALUES (?, ?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(judge_model_id) DO UPDATE SET "
+            "slope = excluded.slope, intercept = excluded.intercept, "
+            "updated_at = excluded.updated_at",
+            (judge_model_id, float(slope), float(intercept)),
         )
         self._conn.commit()
 
