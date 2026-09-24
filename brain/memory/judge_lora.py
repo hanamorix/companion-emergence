@@ -178,6 +178,21 @@ def lora_available() -> bool:
 LORA_RANK_DEFAULT: int = tunables.register("judge_selftune.lora_rank", 8)
 LORA_EPOCHS_DEFAULT: int = tunables.register("judge_selftune.lora_epochs", 1)
 
+# Max sequence length for BOTH training (`build_lora_retrain_fn`'s
+# `CrossEncoder`) and serving (`load_lora_scorer`'s tokenizer) — the SINGLE
+# source both sides read, so the train-time and serve-time tokenizations
+# cannot skew (F2c inc5b, task item 5). A LoRA adapter trained on inputs
+# truncated at length L must be SERVED on inputs truncated the same way, or
+# the trained head sees a differently-tokenized input than it learned on —
+# a silent scores-differ failure, the same CLASS the #3980 guard prevents on
+# a different axis. Before this, `load_lora_scorer` applied no truncation at
+# all while training used the CrossEncoder's own (unset -> tokenizer
+# `model_max_length`, ~8194 for bge) default: a real divergence on any doc
+# long enough to truncate at one and not the other. PROVISIONAL 512 (the
+# practical bge-reranker sequence length); the real value is the deferred
+# inc5 timed dry-run's job, overridable meanwhile.
+LORA_MAX_LENGTH_DEFAULT: int = tunables.register("judge_selftune.lora_max_length", 512)
+
 # `(query, doc, label)` triple — label is "relevant" or "irrelevant", the
 # EFFECTIVE (Haiku-over-local) label per judge_eval.py's docstring / spec
 # AC4. This module never sees "unknown"/"error" rows — the caller (inc5b's
@@ -185,6 +200,33 @@ LORA_EPOCHS_DEFAULT: int = tunables.register("judge_selftune.lora_epochs", 1)
 # building `train_items`, mirroring `judge_eval.split_train_test`'s own
 # content-agnostic, caller-filters-first posture.
 LabeledTriple = tuple[str, str, str]
+
+# Real bge-reranker-v2-m3 LoRA module names (F2c inc5b, task item 6 — the
+# recon inc5a's own docstring flagged as owed). CONFIG-ONLY recon of the
+# local cached checkpoint (the real model is NEVER loaded — deferred to real
+# HW): `BAAI/bge-reranker-v2-m3`'s config.json declares
+# `architectures=["XLMRobertaForSequenceClassification"]`,
+# `model_type="xlm-roberta"`. For that architecture:
+#   - LoRA attention targets = peft 0.21.0's own
+#     `TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING["xlm-roberta"]`
+#     == `["query", "value"]` (matched by name suffix, so they resolve
+#     under sbert's CrossEncoder wrapper prefix regardless of the wrapper);
+#   - the sequence-classification head kept fully trainable
+#     (`modules_to_save`) = transformers 5.17.0's
+#     `XLMRobertaForSequenceClassification.classifier`
+#     (an `XLMRobertaClassificationHead`) == `"classifier"` (NOT `"score"`;
+#     the tiny GPT2 test model's `.score` head, which reproduces bug #3980,
+#     is a DIFFERENT architecture used only to exercise the mechanism — the
+#     #3980 peft-reload mitigation is head-name-agnostic, so it holds for
+#     `classifier` too).
+# These are architecture facts tied to `model_tier.MODEL_RELEVANCE_JUDGE`:
+# swapping the judge to a NON-xlm-roberta model requires updating them here
+# (a deliberate code change, not a silent tunable override that could
+# misconfigure the LoRA target modules invisibly). The inc5b tick-lifecycle
+# wiring passes these as `build_lora_retrain_fn`'s required
+# `target_modules`/`modules_to_save` args.
+BGE_RERANKER_LORA_TARGET_MODULES: tuple[str, ...] = ("query", "value")
+BGE_RERANKER_LORA_MODULES_TO_SAVE: tuple[str, ...] = ("classifier",)
 
 
 def _label_to_float(label: str) -> float:
@@ -233,6 +275,7 @@ def build_lora_retrain_fn(
     lora_rank: int | None = None,
     lora_alpha: int | None = None,
     epochs: int | None = None,
+    max_length: int | None = None,
     activation_fn: Callable[[Any], Any] | None = None,
 ) -> Callable[[Sequence[LabeledTriple]], Callable[[tuple[str, str]], str]]:
     """Build a `retrain_fn` matching `judge_eval.run_champion_challenger`'s
@@ -294,11 +337,20 @@ def build_lora_retrain_fn(
             if epochs is not None
             else tunables.get_tunable("judge_selftune.lora_epochs", LORA_EPOCHS_DEFAULT)
         )
+        # Train/serve tokenization parity (task item 5): the CrossEncoder
+        # truncates training inputs at this length; `load_lora_scorer`
+        # reads the SAME tunable to truncate serve inputs identically.
+        resolved_max_length = (
+            max_length
+            if max_length is not None
+            else tunables.get_tunable("judge_selftune.lora_max_length", LORA_MAX_LENGTH_DEFAULT)
+        )
 
         model = CrossEncoder(
             str(base_model_path),
             cache_folder=str(cache_dir) if cache_dir is not None else None,
             config_kwargs={"num_labels": 1},
+            max_length=resolved_max_length,
             activation_fn=activation_fn if activation_fn is not None else (lambda x: x),
         )
         lora_config = LoraConfig(
@@ -361,6 +413,7 @@ def load_lora_scorer(
     adapter_dir: str | Path,
     *,
     cache_dir: str | Path | None = None,
+    max_length: int | None = None,
 ) -> Callable[[tuple[str, str]], float]:
     """Reload a saved LoRA adapter and return a raw-score callable
     `(query, document) -> float`, via the bug-#3980-SAFE path (this
@@ -374,12 +427,25 @@ def load_lora_scorer(
     score`'s convention in `relevance_judge.py` — a future load-side caller
     applies `relevance_judge.label_for_score` on top, exactly as the live
     daily-tick judge already does for the base (non-tuned) judge.
+
+    TRAIN/SERVE TOKENIZATION PARITY (task item 5): `max_length` (None ->
+    the `judge_selftune.lora_max_length` tunable) truncates serve inputs at
+    the SAME length `build_lora_retrain_fn` truncated training inputs at, so
+    the adapter is scored on inputs tokenized the way it was trained. Before
+    this, the serve tokenizer applied no truncation while training did (via
+    the CrossEncoder's own max_length) — a silent skew on long inputs.
     """
     try:
         from peft import PeftModel
         from transformers import AutoModelForSequenceClassification, AutoTokenizer
     except ImportError as exc:
         raise ImportError(f"load_lora_scorer {_F2C_TRAINING_EXTRA_HINT}") from exc
+
+    resolved_max_length = (
+        max_length
+        if max_length is not None
+        else tunables.get_tunable("judge_selftune.lora_max_length", LORA_MAX_LENGTH_DEFAULT)
+    )
 
     base_model = AutoModelForSequenceClassification.from_pretrained(
         str(base_model_path),
@@ -395,7 +461,14 @@ def load_lora_scorer(
         import torch
 
         query, document = item[0], item[1]
-        encoded = tokenizer([query], [document], padding=True, return_tensors="pt")
+        encoded = tokenizer(
+            [query],
+            [document],
+            padding=True,
+            truncation=True,
+            max_length=resolved_max_length,
+            return_tensors="pt",
+        )
         with torch.no_grad():
             output = peft_model(**encoded)
         return float(output.logits.squeeze(-1)[0])

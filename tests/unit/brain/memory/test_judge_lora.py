@@ -32,8 +32,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import brain.memory.judge_lora as judge_lora
 from brain.memory.judge_eval import run_champion_challenger
 from brain.memory.judge_lora import (
+    BGE_RERANKER_LORA_MODULES_TO_SAVE,
+    BGE_RERANKER_LORA_TARGET_MODULES,
     LoraRollbackHandle,
     build_lora_retrain_fn,
     load_lora_scorer,
@@ -552,3 +555,121 @@ def test_module_import_does_not_import_torch_or_sentence_transformers() -> None:
     )
     assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
     assert "SUBPROCESS_OK" in proc.stdout, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+
+
+# ---------------------------------------------------------------------------
+# F2c inc5b (task items 5 + 6): real-bge LoRA config grounding — the module
+# names + train/serve tokenization the tick-lifecycle wiring will rely on.
+# These NEVER load the real bge model (deferred to real HW): item 6 is a
+# value assertion against the config-recon ground truth, item 5 is a
+# behavioral parity check on the tiny model.
+# ---------------------------------------------------------------------------
+
+
+def test_bge_lora_module_names_are_grounded_xlm_roberta_values() -> None:
+    """Item 6: bge-reranker-v2-m3 is XLMRobertaForSequenceClassification
+    (config recon), so the LoRA target modules are peft's own
+    `xlm-roberta` mapping (`query`/`value`) and the trainable head is
+    transformers' `XLMRobertaForSequenceClassification.classifier`. Guards
+    against a placeholder/wrong value (e.g. the tiny GPT2 test model's
+    `c_attn`/`score`) being left in these constants."""
+    assert BGE_RERANKER_LORA_TARGET_MODULES == ("query", "value")
+    assert BGE_RERANKER_LORA_MODULES_TO_SAVE == ("classifier",)
+
+
+def test_train_and_serve_read_one_lora_max_length_tunable_and_serve_truncates(
+    tiny_model_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Items 5 + C2/C3: with `judge_selftune.lora_max_length` overridden to a
+    small M (below the tiny model's `n_positions=64`), BOTH the training
+    CrossEncoder and the serve tokenizer read that ONE tunable (neither is
+    passed an explicit `max_length`), so a LoRA adapter trained on — and then
+    scored on — a doc whose UNTRUNCATED token count exceeds the model's
+    position capacity succeeds instead of overflowing the position
+    embeddings.
+
+    Able-to-fail (ST1.5f, demonstrated at stage 8): under the pre-change
+    `load_lora_scorer` (no truncation/max_length), the long serve input
+    overflows the tiny GPT2's 64-slot `wpe` and RAISES."""
+    m = 16  # < tiny model n_positions (64); < the long doc's token count below
+    original_get_tunable = judge_lora.tunables.get_tunable
+
+    def _override(key, default):
+        if key == "judge_selftune.lora_max_length":
+            return m
+        return original_get_tunable(key, default)
+
+    monkeypatch.setattr(judge_lora.tunables, "get_tunable", _override)
+
+    # ~80 whitespace-separated words -> ~80 WordLevel tokens, comfortably
+    # over the 64-slot position table when untruncated.
+    long_doc = " ".join(["relevant document science weather music"] * 16)
+    train_triples = [
+        ("query", long_doc, "relevant"),
+        ("query", "irrelevant", "irrelevant"),
+        ("tiny query", long_doc, "relevant"),
+        ("test document", "irrelevant loud", "irrelevant"),
+    ]
+
+    # No explicit max_length on EITHER call -> both must resolve the tunable.
+    retrain_fn = build_lora_retrain_fn(
+        tiny_model_dir,
+        target_modules=_TARGET_MODULES,
+        modules_to_save=_MODULES_TO_SAVE,
+        lora_rank=4,
+        epochs=1,
+    )
+    # Train (would overflow at train time too if the CrossEncoder ignored the
+    # tunable) then persist the adapter for a cross-process reload.
+    from peft import LoraConfig
+    from sentence_transformers import CrossEncoder
+    from sentence_transformers.cross_encoder.losses import BinaryCrossEntropyLoss
+    from sentence_transformers.cross_encoder.trainer import CrossEncoderTrainer
+    from sentence_transformers.cross_encoder.training_args import CrossEncoderTrainingArguments
+
+    # Sanity-drive the retrain_fn itself (proves the train path is bounded).
+    label_fn = retrain_fn(train_triples)
+    assert label_fn(("query", long_doc)) in ("relevant", "irrelevant")
+
+    # Build + save a real adapter to reload through load_lora_scorer (the
+    # serve path under test), mirroring the #3980 test's save shape.
+    from datasets import Dataset
+
+    ce = CrossEncoder(
+        str(tiny_model_dir),
+        config_kwargs={"num_labels": 1},
+        max_length=m,
+        activation_fn=lambda x: x,
+    )
+    ce.add_adapter(
+        LoraConfig(
+            r=4, lora_alpha=8, target_modules=_TARGET_MODULES,
+            modules_to_save=_MODULES_TO_SAVE, task_type="SEQ_CLS",
+        )
+    )
+    dataset = Dataset.from_dict(
+        {
+            "sentence1": [q for q, _d, _l in train_triples],
+            "sentence2": [d for _q, d, _l in train_triples],
+            "label": [1.0 if lbl == "relevant" else 0.0 for _q, _d, lbl in train_triples],
+        }
+    )
+    args = CrossEncoderTrainingArguments(
+        output_dir=str(tmp_path / "train_out"),
+        num_train_epochs=1,
+        per_device_train_batch_size=2,
+        report_to=[],
+        logging_steps=1_000_000,
+        save_strategy="no",
+        disable_tqdm=True,
+    )
+    CrossEncoderTrainer(model=ce, args=args, train_dataset=dataset, loss=BinaryCrossEntropyLoss(ce)).train()
+    save_dir = tmp_path / "saved_adapter"
+    ce.save_pretrained(str(save_dir))
+
+    # Serve path: no explicit max_length -> must read the same tunable and
+    # truncate the long input at M, so scoring succeeds (no position overflow).
+    scorer = load_lora_scorer(tiny_model_dir, save_dir)
+    result = scorer(("query", long_doc))
+    assert isinstance(result, float)
+    assert result == result  # finite (not NaN)
