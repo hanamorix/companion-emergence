@@ -1,11 +1,13 @@
-"""F2c inc5b-2 (C8/C9) — the daily calibration tick serves a persona's TUNED
-judge adapter when its weekly self-tune has accepted one, else the base judge,
-with no cross-persona bleed.
+"""F2c inc5b-2 (C8/C9) + inc6 — the daily calibration tick serves a persona's
+TUNED judge when its weekly self-tune has accepted one (a LoRA adapter OR, on
+the beefy tier, a FULL fine-tune), else the base judge, with no cross-persona
+bleed.
 
-Exercises `supervisor._run_calibration_tick`'s adapter resolution + the
-`adapter_dir` threading into `label_calibration_sample.build_judge_provider`.
-No real model: `build_judge_provider` is monkeypatched to capture the
-`adapter_dir` it is asked for.
+Exercises `supervisor._run_calibration_tick`'s tuned-judge resolution
+(`judge_lora.resolve_serving_tuned_judge`, full>lora>base) + the
+`adapter_dir`/`full_model_dir` threading into
+`label_calibration_sample.build_judge_provider`. No real model:
+`build_judge_provider` is monkeypatched to capture the dirs it is asked for.
 """
 
 from __future__ import annotations
@@ -36,11 +38,23 @@ def _place_champion_adapter(pd: Path) -> Path:
     return staged
 
 
+def _place_champion_full_model(pd: Path) -> Path:
+    root = judge_lora.full_champion_dir(pd)
+    staged = judge_lora.staged_adapter_path(root)
+    staged.mkdir(parents=True)
+    (staged / "model.safetensors.txt").write_text("x", encoding="utf-8")
+    judge_lora.swap_champion_pointer(root, staged)
+    return staged
+
+
 def _capture_adapter_dir(monkeypatch) -> list[str | None]:
     seen: list[str | None] = []
 
-    def fake(adapter_dir=None):
-        seen.append(adapter_dir)
+    # inc6: build_judge_provider now takes full_model_dir too (additive). The
+    # tick passes exactly one of adapter_dir / full_model_dir (or neither);
+    # capture whichever is non-None (else None = base).
+    def fake(adapter_dir=None, full_model_dir=None):
+        seen.append(full_model_dir if full_model_dir is not None else adapter_dir)
         return FakeRelevanceJudgeProvider()
 
     monkeypatch.setattr(relevance_judge, "build_judge_provider", fake)
@@ -68,6 +82,43 @@ def test_tick_serves_base_judge_when_no_adapter(monkeypatch) -> None:
         _seed_unlabeled_row(pd)
         _run_calibration_tick(pd)
         assert seen == [None], f"expected base judge (adapter_dir=None), got {seen}"
+
+
+def test_tick_serves_the_full_model_when_present(monkeypatch) -> None:
+    # inc6 (C11/C12): a beefy-tier FULL champion → the tick labels via
+    # build_judge_provider(full_model_dir=<the resolved full dir>), NOT adapter_dir.
+    seen: list[tuple[str | None, str | None]] = []
+
+    def fake(adapter_dir=None, full_model_dir=None):
+        seen.append((adapter_dir, full_model_dir))
+        return FakeRelevanceJudgeProvider()
+
+    monkeypatch.setattr(relevance_judge, "build_judge_provider", fake)
+    with tempfile.TemporaryDirectory() as d:
+        pd = Path(d)
+        _seed_unlabeled_row(pd)
+        full = _place_champion_full_model(pd)
+        _run_calibration_tick(pd)
+        assert seen == [(None, str(full))], f"expected full_model_dir set, adapter_dir None: {seen}"
+
+
+def test_tick_full_model_takes_precedence_over_a_stale_lora_adapter(monkeypatch) -> None:
+    # inc6 (C12 precedence): if BOTH stores are populated (a cross-tier window),
+    # the tick serves the FULL model (full>lora).
+    seen: list[tuple[str | None, str | None]] = []
+
+    def fake(adapter_dir=None, full_model_dir=None):
+        seen.append((adapter_dir, full_model_dir))
+        return FakeRelevanceJudgeProvider()
+
+    monkeypatch.setattr(relevance_judge, "build_judge_provider", fake)
+    with tempfile.TemporaryDirectory() as d:
+        pd = Path(d)
+        _seed_unlabeled_row(pd)
+        _place_champion_adapter(pd)
+        full = _place_champion_full_model(pd)
+        _run_calibration_tick(pd)
+        assert seen == [(None, str(full))], f"full must win over a stale lora adapter: {seen}"
 
 
 def test_no_cross_persona_adapter_bleed(monkeypatch) -> None:

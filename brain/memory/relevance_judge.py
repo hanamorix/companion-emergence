@@ -310,6 +310,44 @@ class LoraAdapterJudge(RelevanceJudgeProvider):
         return self._model_id
 
 
+class FullModelJudge(RelevanceJudgeProvider):
+    """A per-persona TUNED judge backed by a saved FULL fine-tune (F2c inc6,
+    spec §5 "where the tuned judge loads from" — the BEEFY tier). Wraps
+    `judge_full_ft.load_full_scorer`'s `(query, doc) -> raw float` callable
+    (a PLAIN `sentence_transformers.CrossEncoder` reload, NOT the peft path —
+    a full fine-tune saves a complete model, so #3980 does not apply) as a
+    `RelevanceJudgeProvider`, so the daily calibration tick serves a persona's
+    tuned full model exactly where it would otherwise serve the base judge,
+    and `label_for_score` applies the persona's knob on top exactly as for the
+    base judge.
+
+    The beefy-tier SIBLING of `LoraAdapterJudge`: same shape, same
+    base-model-id contract (see below), only a different reload mechanism.
+
+    `model_id()` returns the BASE model id, deliberately — identical rationale
+    to `LoraAdapterJudge`: the per-persona knob (`judge_knob_calibration`) is
+    keyed by the base judge model id (inc4a), and the tuned full model is
+    scoped per-persona by its DIRECTORY, not by model id — so keeping model_id
+    stable keeps `label_calibration_sample`'s `get_judge_knob_calibration(
+    judge.model_id())` lookup correct for the base and both tuned tiers. Torch
+    is imported lazily inside `load_full_scorer` (I6), never at import time.
+    """
+
+    def __init__(
+        self, base_model_id: str, full_dir: str, *, cache_dir: str | None = None
+    ) -> None:
+        from brain.memory.judge_full_ft import load_full_scorer
+
+        self._model_id = base_model_id
+        self._scorer = load_full_scorer(full_dir, cache_dir=cache_dir)
+
+    def score(self, query: str, document: str) -> float:
+        return float(self._scorer((query, document)))
+
+    def model_id(self) -> str:
+        return self._model_id
+
+
 # Process-wide provider cache keyed by model_id (mirrors reranker.py's
 # _provider_cache). Kept at module scope so `_reset_judge_provider_cache`
 # (test-only) can reach it and so monkeypatching the *function* fully
@@ -322,20 +360,32 @@ _provider_cache: dict[str, RelevanceJudgeProvider] = {}
 _provider_cache_lock = threading.Lock()
 
 
-def build_judge_provider(adapter_dir: str | None = None) -> RelevanceJudgeProvider:
-    """The production judge provider. With NO `adapter_dir`: the shared base
-    `TorchCrossEncoderJudge` pinned to `model_tier.TIER_RELEVANCE_JUDGE`'s
-    model id, caching the model file in the shared `get_cache_dir()` (one
-    download across every persona on the box) and PROCESS-WIDE cached by
-    model_id (double-checked locking) — unchanged from f2a-inc6.
+def build_judge_provider(
+    adapter_dir: str | None = None, full_model_dir: str | None = None
+) -> RelevanceJudgeProvider:
+    """The production judge provider. With NO `adapter_dir`/`full_model_dir`:
+    the shared base `TorchCrossEncoderJudge` pinned to
+    `model_tier.TIER_RELEVANCE_JUDGE`'s model id, caching the model file in
+    the shared `get_cache_dir()` (one download across every persona on the
+    box) and PROCESS-WIDE cached by model_id (double-checked locking) —
+    unchanged from f2a-inc6.
 
-    With `adapter_dir` (F2c inc5b-2): a per-persona `LoraAdapterJudge`
-    serving that persona's tuned LoRA adapter (the #3980-safe peft reload),
-    built FRESH and NOT cached (see the `_provider_cache` note above). The
-    caller (`supervisor._run_calibration_tick`) resolves the persona's
-    champion-adapter pointer and passes the resolved dir here; an absent /
-    unresolvable pointer means the caller passes no `adapter_dir` and gets
-    the base judge (I9, absent → base, byte-identical to pre-inc5b2).
+    With `full_model_dir` (F2c inc6, BEEFY tier): a per-persona
+    `FullModelJudge` serving that persona's tuned FULL fine-tune (a plain
+    `CrossEncoder` reload, NOT peft), built FRESH and NOT cached. Takes
+    precedence over `adapter_dir` if both are somehow passed (they should
+    not be — the tick keeps exactly one tuned judge live per persona).
+
+    With `adapter_dir` (F2c inc5b-2, MID tier): a per-persona
+    `LoraAdapterJudge` serving that persona's tuned LoRA adapter (the
+    #3980-safe peft reload), built FRESH and NOT cached (see the
+    `_provider_cache` note above).
+
+    The caller (`supervisor._run_calibration_tick`) resolves the persona's
+    single serving tuned judge (`judge_lora.resolve_serving_tuned_judge`) and
+    passes the resolved dir in the matching argument; an absent / unresolvable
+    pointer means the caller passes neither and gets the base judge (I9,
+    absent → base, byte-identical to pre-inc5b2).
 
     TEST ISOLATION: tests must monkeypatch this function directly (mirrors
     `reranker.build_reranker_provider`'s test-fixture convention) rather
@@ -346,6 +396,9 @@ def build_judge_provider(adapter_dir: str | None = None) -> RelevanceJudgeProvid
     from brain.paths import get_cache_dir
 
     model_id = model_for_tier(TIER_RELEVANCE_JUDGE)
+
+    if full_model_dir is not None:
+        return FullModelJudge(model_id, full_model_dir, cache_dir=str(get_cache_dir()))
 
     if adapter_dir is not None:
         return LoraAdapterJudge(model_id, adapter_dir, cache_dir=str(get_cache_dir()))
@@ -439,6 +492,7 @@ def label_calibration_sample(
     judge: RelevanceJudgeProvider | None = None,
     sample_rows: int | None = None,
     adapter_dir: str | None = None,
+    full_model_dir: str | None = None,
 ) -> int:
     """Label a SAMPLE of unlabeled `calibration_log` rows: the local judge
     (`judge`, or the real `build_judge_provider()` if not injected) scores
@@ -488,12 +542,13 @@ def label_calibration_sample(
 
     if judge is None:
         try:
-            # F2c inc5b-2: `adapter_dir` (this persona's resolved champion LoRA
-            # adapter, from `_run_calibration_tick`) serves the TUNED judge;
+            # F2c inc5b-2/inc6: the persona's resolved serving tuned judge from
+            # `_run_calibration_tick` — `full_model_dir` (beefy full-FT, plain
+            # CrossEncoder) OR `adapter_dir` (mid LoRA, #3980-safe peft); both
             # None → the base judge (I9, byte-identical to pre-inc5b2). Built
             # LAZILY here — only when there are actually rows to label — so a
             # tick with nothing to do never loads a torch model.
-            judge = build_judge_provider(adapter_dir=adapter_dir)
+            judge = build_judge_provider(adapter_dir=adapter_dir, full_model_dir=full_model_dir)
         except Exception:  # noqa: BLE001 — torch missing, download failed, etc.
             logger.exception(
                 "calibration judge: failed to construct the local judge provider — skipping this pass"

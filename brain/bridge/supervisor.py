@@ -2257,22 +2257,34 @@ def _run_calibration_tick(
                 if provider is not None
                 else build_tier_provider(persona_dir, TIER_BACKGROUND_CLASSIFIER)
             )
-            # F2c inc5b-2: serve this persona's TUNED judge adapter when its
-            # weekly self-tune has accepted one. Only when the caller injected
-            # no explicit `judge` (an injected test judge is never clobbered).
-            # Resolving the pointer is a cheap filesystem read; the (torch)
-            # judge itself is built LAZILY inside label_calibration_sample, and
-            # only when there are rows to label. Absent / unresolvable pointer
-            # → adapter_dir=None → base judge (I9), byte-identical to pre-inc5b2.
+            # F2c inc5b-2/inc6: serve this persona's TUNED judge when its weekly
+            # self-tune has accepted one — the FULL fine-tune (beefy) or the
+            # LoRA adapter (mid), resolved with full>lora>base precedence by
+            # `resolve_serving_tuned_judge` (the tick keeps exactly one live per
+            # persona). Only when the caller injected no explicit `judge` (an
+            # injected test judge is never clobbered). Resolving the pointer is a
+            # cheap filesystem read; the (torch) judge itself is built LAZILY
+            # inside label_calibration_sample, and only when there are rows to
+            # label. Absent / unresolvable → base judge (I9), byte-identical to
+            # pre-inc5b2.
             adapter_dir: str | None = None
+            full_model_dir: str | None = None
             if judge is None:
                 from brain.memory import judge_lora
 
-                adapter = judge_lora.resolve_champion_adapter(judge_lora.champion_dir(persona_dir))
-                if adapter is not None:
-                    adapter_dir = str(adapter)
+                tuned = judge_lora.resolve_serving_tuned_judge(persona_dir)
+                if tuned is not None:
+                    kind, tuned_dir = tuned
+                    if kind == "full":
+                        full_model_dir = str(tuned_dir)
+                    else:
+                        adapter_dir = str(tuned_dir)
             labeled = label_calibration_sample(
-                store, provider=tiebreak_provider, judge=judge, adapter_dir=adapter_dir
+                store,
+                provider=tiebreak_provider,
+                judge=judge,
+                adapter_dir=adapter_dir,
+                full_model_dir=full_model_dir,
             )
             logger.info("calibration tick: labeled=%d calibration_log rows this pass", labeled)
         except Exception:  # noqa: BLE001 — judge/torch/Haiku failure must not crash the tick

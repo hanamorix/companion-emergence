@@ -500,9 +500,44 @@ _ADAPTER_PREFIX = "adapter-"
 
 
 def champion_dir(persona_dir: str | Path) -> Path:
-    """The per-persona champion-adapter root: `persona_dir/models/relevance_judge/`
+    """The per-persona LoRA champion-adapter root: `persona_dir/models/relevance_judge/`
     (spec §5, handoff PINNED CONTRACTS). Does not create it."""
     return Path(persona_dir) / "models" / "relevance_judge"
+
+
+def full_champion_dir(persona_dir: str | Path) -> Path:
+    """The per-persona FULL-FT champion root: `persona_dir/models/relevance_judge/full/`
+    (spec §5, "a full-FT persona keeps a FULL judge copy at .../full/", F2c inc6). A
+    SUB-root of the LoRA `champion_dir` — the two stores never collide because
+    `cleanup_stale_adapters` only ever touches `adapter-*` entries, so the LoRA
+    root's cleanup skips this `full/` subtree and vice-versa. Reuses all the same
+    torch-free store helpers (`staged_adapter_path`/`swap_champion_pointer`/
+    `resolve_champion_adapter`/`cleanup_stale_adapters`) with this root. Does not
+    create it."""
+    return champion_dir(persona_dir) / "full"
+
+
+def resolve_serving_tuned_judge(persona_dir: str | Path) -> tuple[str, Path] | None:
+    """Resolve the ONE tuned judge that should serve this persona, across both
+    weight-retrain tiers (F2c inc6). Precedence: the FULL-FT store first
+    (`("full", dir)`), else the LoRA store (`("lora", dir)`), else `None` (the
+    base judge — absent-safe, I9).
+
+    Single source of truth for "what tuned judge serves this persona," used by
+    `supervisor._run_calibration_tick`'s serve path. In steady state a persona
+    has at most one live tuned pointer (the tick clears the sibling tier's pointer
+    on ACCEPT — spec §1 "alternatives, never both"), so this precedence only acts
+    as a deterministic tiebreak in the brief cross-tier / crash window; the full
+    tier is preferred because a full fine-tune subsumes a LoRA adapter (spec §1).
+    Fail-soft: any resolve error degrades to the lower-precedence store, then to
+    the base judge — never crashes the serve/tick path."""
+    full = resolve_champion_adapter(full_champion_dir(persona_dir))
+    if full is not None:
+        return ("full", full)
+    lora = resolve_champion_adapter(champion_dir(persona_dir))
+    if lora is not None:
+        return ("lora", lora)
+    return None
 
 
 def staged_adapter_path(champion_root: str | Path) -> Path:

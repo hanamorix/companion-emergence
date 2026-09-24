@@ -837,3 +837,91 @@ def test_label_calibration_sample_with_persona_knob_does_not_import_torch() -> N
     )
     assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
     assert "SUBPROCESS_OK" in proc.stdout, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+
+
+# ---------------------------------------------------------------------------
+# F2c inc6 — FullModelJudge (beefy tier serve) + resolve_serving_tuned_judge
+# precedence. FullModelJudge's real load is torch; tests monkeypatch
+# judge_full_ft.load_full_scorer so no model is built (mirrors the LoRA
+# adapter-judge no-cache test in test_judge_selftune_lifecycle.py).
+# ---------------------------------------------------------------------------
+
+
+def test_build_judge_provider_full_model_dir_returns_full_model_judge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # C11: full_model_dir -> FullModelJudge; model_id is the BASE id (so the
+    # per-persona knob lookup stays correct); a plain scorer produces a score.
+    from brain.memory import judge_full_ft
+    from brain.memory.relevance_judge import FullModelJudge
+
+    _reset_judge_provider_cache()
+    monkeypatch.setattr("brain.bridge.model_tier.model_for_tier", lambda tier: "BASE-JUDGE-ID")
+    monkeypatch.setattr("brain.paths.get_cache_dir", lambda: "/tmp/fake-cache-dir")
+    monkeypatch.setattr(judge_full_ft, "load_full_scorer", lambda d, **kw: (lambda item: 2.5))
+
+    judge = build_judge_provider(full_model_dir="/tmp/full-x")
+    assert isinstance(judge, FullModelJudge)
+    assert judge.model_id() == "BASE-JUDGE-ID"
+    assert judge.score("q", "d") == pytest.approx(2.5)
+
+
+def test_build_judge_provider_full_takes_precedence_over_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # If both are somehow passed, the full model wins (the tick keeps one live,
+    # but the provider is deterministic regardless).
+    from brain.memory import judge_full_ft
+    from brain.memory.relevance_judge import FullModelJudge
+
+    _reset_judge_provider_cache()
+    monkeypatch.setattr("brain.bridge.model_tier.model_for_tier", lambda tier: "BASE-JUDGE-ID")
+    monkeypatch.setattr("brain.paths.get_cache_dir", lambda: "/tmp/fake-cache-dir")
+    monkeypatch.setattr(judge_full_ft, "load_full_scorer", lambda d, **kw: (lambda item: 1.0))
+
+    judge = build_judge_provider(adapter_dir="/tmp/adapter", full_model_dir="/tmp/full")
+    assert isinstance(judge, FullModelJudge)
+
+
+def test_full_model_judge_is_not_cached(monkeypatch: pytest.MonkeyPatch) -> None:
+    # C13: full-model judges (a new accepted model each week) must not
+    # accumulate in the process-wide provider cache.
+    from brain.memory import judge_full_ft
+    from brain.memory.relevance_judge import FullModelJudge, _provider_cache
+
+    _reset_judge_provider_cache()
+    monkeypatch.setattr("brain.bridge.model_tier.model_for_tier", lambda tier: "BASE-JUDGE-ID")
+    monkeypatch.setattr("brain.paths.get_cache_dir", lambda: "/tmp/fake-cache-dir")
+    monkeypatch.setattr(judge_full_ft, "load_full_scorer", lambda d, **kw: (lambda item: 0.0))
+
+    for i in range(5):
+        judge = build_judge_provider(full_model_dir=f"/tmp/full-{i}")
+        assert isinstance(judge, FullModelJudge)
+    assert len(_provider_cache) == 0, "full-model judges must not be cached"
+    _reset_judge_provider_cache()
+
+
+def test_resolve_serving_tuned_judge_precedence_full_over_lora_over_base(tmp_path) -> None:
+    # C12: full store wins over lora, else lora, else None (base). Executed on
+    # the both-populated case (the position-sensitive precedence bite).
+    from brain.memory import judge_lora
+
+    # (a) neither -> None (base).
+    assert judge_lora.resolve_serving_tuned_judge(tmp_path) is None
+
+    # (b) only LoRA -> ("lora", dir).
+    lora_root = judge_lora.champion_dir(tmp_path)
+    lora_dir = judge_lora.staged_adapter_path(lora_root)
+    lora_dir.mkdir(parents=True)
+    judge_lora.swap_champion_pointer(lora_root, lora_dir)
+    kind, resolved = judge_lora.resolve_serving_tuned_judge(tmp_path)
+    assert kind == "lora" and resolved == lora_dir
+
+    # (c) both -> ("full", dir): full precedence bites (a lora-only resolver
+    # would still return lora here).
+    full_root = judge_lora.full_champion_dir(tmp_path)
+    full_dir = judge_lora.staged_adapter_path(full_root)
+    full_dir.mkdir(parents=True)
+    judge_lora.swap_champion_pointer(full_root, full_dir)
+    kind, resolved = judge_lora.resolve_serving_tuned_judge(tmp_path)
+    assert kind == "full" and resolved == full_dir
