@@ -359,18 +359,20 @@ def fit_platt_knob(pairs: list[tuple[float, str]]) -> tuple[float, float]:
     return float(slope), float(intercept)
 
 
-def _weak_knob_refit_and_consume(store, now: datetime, row_ids: list[int]) -> None:
-    """The weak-tier / degenerate-floor knob-refit (spec §5, inc3 path,
-    UNCHANGED): fit the Platt knob on the FULL LOGGED `(raw_score,
+def _weak_knob_refit_and_consume(store, now: datetime, row_ids: list[int], knob_key: str) -> None:
+    """The weak-tier / degenerate-floor / revert knob-refit (spec §5, inc3
+    path): fit the Platt knob on the FULL LOGGED `(raw_score,
     effective_label)` set (`judge_knob_refit_pairs`, doc-AGNOSTIC — trains on
-    every row incl. legacy doc-absent ones), persist it, then consume the
+    every row incl. legacy doc-absent ones), persist it under `knob_key` (the
+    key of the model SERVING this tick, `relevance_judge.judge_knob_key`;
+    F2c inc9 — the logged scores came from that model), then consume the
     FULL firing `row_ids` (every row was trained on by this doc-agnostic fit,
     so all are retired — Planning consume-semantics 2B). Any fault (e.g.
     `fit_platt_knob`'s `ValueError` on zero usable pairs) propagates to the
     caller's try/except, leaving `row_ids` UNCONSUMED (fail-safe)."""
     pairs = store.judge_knob_refit_pairs(row_ids)
     slope, intercept = fit_platt_knob(pairs)
-    store.write_judge_knob_calibration(MODEL_RELEVANCE_JUDGE, slope=slope, intercept=intercept)
+    store.write_judge_knob_calibration(knob_key, slope=slope, intercept=intercept)
     store.write_judge_selftune_state(MODEL_RELEVANCE_JUDGE, last_trained_at=now)
     store.mark_selftune_consumed(row_ids, consumed_at=now)
 
@@ -385,15 +387,50 @@ def _training_start(current: Path | None) -> str:
     return str(current) if current is not None else MODEL_RELEVANCE_JUDGE
 
 
-def _keep_after_accept(new_name: str, prior_name: str | None) -> list[str]:  # noqa: ARG001
-    """Which stored checkpoint dirs survive an ACCEPTED swap (F2c inc7, ruling
-    Q1, spec §5 "the previous checkpoint is DELETED right after the swap"):
-    only the new one. The previous checkpoint is deleted in the same tick; if
-    the OS refuses (files still open/memory-mapped, Windows — I13), the
-    failure is logged, not raised, and `judge_lora.reap_unreferenced` retries
-    at the start of a later tick. `prior_name` is accepted so the policy is
-    visible at its one call site."""
+def _keep_after_accept(new_name: str) -> list[str]:
+    """Which stored checkpoint dirs survive an ACCEPTED swap (F2c inc7 ruling
+    Q1; spec §5 knob-first order, inc9): only the new one. The previous
+    checkpoint (and, separately, its knob row) is deleted right after the
+    swap that commits the new one; if the OS refuses (files still
+    open/memory-mapped, Windows — I13), the failure is logged, not raised,
+    and `judge_lora.reap_unreferenced` retries at the start of the next tick."""
     return [new_name]
+
+
+def _reap_orphan_knob_rows(store, persona_dir: Path) -> int:
+    """Delete every tuned-checkpoint knob row (`<base id>@<name>`) except the
+    one for the checkpoint the persona's `current` pointer names (F2c inc9,
+    spec §5: "a knob row left by a staged checkpoint that never got swapped in
+    ... is orphaned and cleaned up on the next tick"; also a superseded
+    checkpoint's row whose post-swap delete faulted). Runs at the start of
+    every weekly tick, beside `judge_lora.reap_unreferenced`.
+
+    Never deletes the plain base-id row (the base judge's own knob) or a row
+    of any other model id. SAFETY, mirroring `reap_unreferenced`: the pointer
+    is read raw; if it exists but cannot be read, or is empty, nothing is
+    reaped this tick. An absent pointer means no tuned checkpoint serves, so
+    every `<base id>@...` row is an orphan. Returns the rows deleted."""
+    from brain.memory import judge_lora
+    from brain.memory.relevance_judge import judge_knob_key
+
+    pointer = judge_lora.pointer_file(judge_lora.champion_dir(persona_dir))
+    keep: str | None = None
+    try:
+        if pointer.exists():
+            name = pointer.read_text(encoding="utf-8").strip()
+            if not name:
+                logger.warning("judge self-tune: %s is empty; skipping the knob-row reap", pointer)
+                return 0
+            keep = judge_knob_key(MODEL_RELEVANCE_JUDGE, name)
+    except OSError:
+        logger.warning("judge self-tune: cannot read %s; skipping the knob-row reap", pointer, exc_info=True)
+        return 0
+    prefix = f"{MODEL_RELEVANCE_JUDGE}@"
+    deleted = 0
+    for key in store.list_judge_knob_keys():
+        if key.startswith(prefix) and key != keep:
+            deleted += store.delete_judge_knob_calibration(key)
+    return deleted
 
 
 def _select_retrain(tune_grade: str, start: str, staged: Path) -> Callable[..., Callable[[tuple[str, str]], str]]:
@@ -439,18 +476,26 @@ def _run_weight_retrain(
     up downstream, this dispatch is one of the two places to look (alongside
     the knob-refit's training data).
 
-    ORDER + crash-safety (spec §4, §5 storage; plan rev. 3):
-      - ACCEPT: re-score the knob on the STAGED model → swap the pointer →
-        persist the knob (COMMIT) → delete the previous checkpoint
-        (`_keep_after_accept`, best-effort) → persist state → CONSUME the
-        doc-HAVING subset (2B) LAST. A fault after the swap but BEFORE the
-        commit rolls the pointer back to the previous checkpoint (still on
-        disk); a fault AFTER the commit leaves the new checkpoint serving with
-        its matching knob (rows unconsumed, re-eligible).
-      - REVERT: the pointer is never swapped; reap the discarded staged dir;
-        knob from LOGGED scores (inc3 path); CONSUME the FULL `row_ids` LAST.
+    ORDER + crash-safety (spec §4; §5 knob-first order, F2c inc9): every knob
+    row is keyed to the model it was fit on (`relevance_judge.judge_knob_key`),
+    and the serve path reads only the served model's key, so the pointer and
+    the knob cannot diverge.
+      - ACCEPT: re-score the knob on the STAGED model → write it under the
+        STAGED checkpoint's key → swap the pointer (the single COMMIT) →
+        delete the previous checkpoint and its knob row (best-effort) →
+        persist state → CONSUME the doc-HAVING subset (2B) LAST. No rollback
+        step exists: a fault before the swap leaves the previous checkpoint
+        serving with its own knob (the staged dir is discarded; its knob row,
+        if written, is an orphan reaped next tick by `_reap_orphan_knob_rows`);
+        a fault after the swap leaves the new checkpoint serving with its own
+        knob (rows unconsumed, re-eligible; leftovers reaped next tick).
+      - REVERT: the pointer is never swapped and no knob row is written for
+        the rejected staged checkpoint; reap the discarded staged dir; knob
+        from LOGGED scores (inc3 path) under the SERVING model's key; CONSUME
+        the FULL `row_ids` LAST.
     """
     from brain.memory import judge_eval, judge_full_ft, judge_lora, relevance_judge
+    from brain.memory.relevance_judge import judge_knob_key
 
     resolved_min_n = tunables.get_tunable(
         "judge_selftune.eval_min_test_n", judge_eval.JUDGE_EVAL_MIN_TEST_N_DEFAULT
@@ -460,6 +505,8 @@ def _run_weight_retrain(
     start = _training_start(current)
     info["current"] = current.name if current is not None else "base"
     info["start"] = current.name if current is not None else "base"
+    # The knob key of the model serving this tick (floor / revert write here).
+    served_key = judge_knob_key(MODEL_RELEVANCE_JUDGE, current)
 
     triples = store.judge_lora_training_triples(row_ids)
     # DEGENERATE FLOOR (spec §4, finding 7 — reuse the pinned `eval_min_test_n`
@@ -467,12 +514,12 @@ def _run_weight_retrain(
     # to split + evaluate → keep the champion, run the always-on weak knob-refit
     # on the logged pairs, consume the full set. No champion/challenger.
     if len(triples) < resolved_min_n:
-        _weak_knob_refit_and_consume(store, now, row_ids)
+        _weak_knob_refit_and_consume(store, now, row_ids, served_key)
         return (None, False)
 
     root = judge_lora.champion_dir(persona_dir)
-    # The pointer's raw name (even an unusable legacy one), so a pre-commit
-    # rollback restores it exactly; `current` above is what it resolves to.
+    # The pointer's raw name (even an unusable legacy one): after the swap its
+    # knob row is deleted; `current` above is what it resolves to.
     prior_name = judge_lora.read_pointer_name(root)
 
     # Champion = the model currently SERVING this persona (spec §1: serving is
@@ -499,7 +546,6 @@ def _run_weight_retrain(
     staged = judge_lora.staged_adapter_path(root)
     retrain_fn = _select_retrain(tune_grade, start, staged)
 
-    swapped = False
     committed = False
     try:
         cc = judge_eval.run_champion_challenger(
@@ -509,7 +555,7 @@ def _run_weight_retrain(
             test_items=test_items,
             # No-op rollback: the champion is never mutated during eval
             # (retrain writes to the fresh staged subdir); crash-safety is
-            # owned here via the atomic pointer swap.
+            # owned here via the knob-first order + atomic pointer swap.
             rollback=judge_eval.RollbackHandle(),
         )
         if cc.accepted:
@@ -522,14 +568,23 @@ def _run_weight_retrain(
             pairs = [(float(scorer((q, d))), label) for (q, d, label) in rescore]
             slope, intercept = fit_platt_knob(pairs)
 
+            # Knob FIRST, keyed to the staged checkpoint (spec §5, inc9): it
+            # exists before the pointer can name that checkpoint.
+            store.write_judge_knob_calibration(
+                judge_knob_key(MODEL_RELEVANCE_JUDGE, staged), slope=slope, intercept=intercept
+            )
             judge_lora.swap_champion_pointer(root, staged)
-            swapped = True
-            store.write_judge_knob_calibration(MODEL_RELEVANCE_JUDGE, slope=slope, intercept=intercept)
-            committed = True  # new checkpoint + its knob are both in place
-            # Delete the previous checkpoint now (ruling Q1). Best-effort:
-            # cleanup_stale_adapters logs and swallows a refused delete, and
-            # reap_unreferenced retries it at the start of a later tick.
-            judge_lora.cleanup_stale_adapters(root, keep_names=_keep_after_accept(staged.name, prior_name))
+            committed = True  # the single commit point: new checkpoint + its own knob serve
+            # Q1: the previous checkpoint and its knob row are deleted right
+            # after the swap; both deletes are best-effort, and a refused or
+            # faulted one is retried next tick (reap_unreferenced /
+            # _reap_orphan_knob_rows).
+            judge_lora.cleanup_stale_adapters(root, keep_names=_keep_after_accept(staged.name))
+            if prior_name is not None:
+                try:
+                    store.delete_judge_knob_calibration(judge_knob_key(MODEL_RELEVANCE_JUDGE, prior_name))
+                except Exception:  # noqa: BLE001 — best-effort; the next tick's reap retries
+                    logger.warning("judge self-tune: deleting the previous checkpoint's knob row faulted", exc_info=True)
             store.write_judge_selftune_state(MODEL_RELEVANCE_JUDGE, last_trained_at=now)
             # ACCEPT consume = doc-HAVING subset only (2B): a legacy
             # doc-absent row was NOT trained here (excluded from both the
@@ -538,33 +593,25 @@ def _run_weight_retrain(
             store.mark_selftune_consumed(doc_having, consumed_at=now)
             return (True, True)
 
-        # REVERT: pointer untouched; discard the rejected staged dir. Knob
-        # from LOGGED scores (resulting model == champion == logged-score model
-        # → no re-score, inc3 path). Consume the FULL row_ids (2B).
+        # REVERT: pointer untouched; discard the rejected staged dir (no knob
+        # row was ever written for it). Knob from LOGGED scores (resulting
+        # model == champion == logged-score model → no re-score, inc3 path),
+        # under the serving model's key. Consume the FULL row_ids (2B).
         judge_lora.discard_stored_dir(staged)
-        _weak_knob_refit_and_consume(store, now, row_ids)
+        _weak_knob_refit_and_consume(store, now, row_ids, served_key)
         return (False, False)
     except Exception:
-        # Crash-safe handling. Wrapped in its own guard so a secondary fault
-        # never MASKS the original, which propagates to the tick's handler
-        # (rows stay UNCONSUMED — fail-safe, re-eligible).
-        try:
-            if swapped and not committed:
-                # Swapped but the new knob is not written: roll the pointer
-                # back to the previous checkpoint (still on disk — it is only
-                # deleted after the commit), or clear it for a first-ever tune.
-                if prior_name is not None:
-                    judge_lora.swap_champion_pointer(root, root / prior_name)
-                else:
-                    judge_lora.clear_champion_pointer(root)
+        # No rollback step (knob-first): before the commit the previous
+        # checkpoint still serves with its own knob, so only the staged dir is
+        # discarded (a staged knob row, if written, is reaped next tick); after
+        # the commit the new checkpoint serves with its own knob and the
+        # leftovers are reaped next tick. The original fault propagates to the
+        # tick's handler (rows stay UNCONSUMED — fail-safe, re-eligible).
+        if not committed:
+            try:
                 judge_lora.discard_stored_dir(staged)
-            elif not swapped:
-                # Nothing was swapped: discard the staged dir, keep the champion.
-                judge_lora.discard_stored_dir(staged)
-            # committed: the new checkpoint + its knob serve; leave the pointer.
-            # Any leftover previous checkpoint is reaped by a later tick.
-        except Exception:  # noqa: BLE001 — rollback is best-effort; never mask the original
-            logger.warning("judge self-tune: crash-safe rollback itself faulted", exc_info=True)
+            except Exception:  # noqa: BLE001 — cleanup is best-effort; never mask the original
+                logger.warning("judge self-tune: discarding the staged checkpoint faulted", exc_info=True)
         raise
 
 
@@ -595,7 +642,9 @@ def _run_judge_selftune_tick(*, store, now: datetime, persona_dir: Path | None =
     checkpoint dirs the pointer does not name (`judge_lora.reap_unreferenced`):
     the retry path for a previous checkpoint whose post-swap delete the OS
     refused, and the cleanup for a crash-orphaned staged dir (F2c inc7, ruling
-    Q1). Fault-isolated; it never blocks the tick.
+    Q1). Then it reaps knob rows of checkpoints the pointer does not name
+    (`_reap_orphan_knob_rows`, F2c inc9). Each is fault-isolated; neither ever
+    blocks the tick.
 
     Then it counts UNCONSUMED non-None `haiku_label` positions across
     `calibration_log` (the >handful gate, spec §2/§3,
@@ -653,6 +702,10 @@ def _run_judge_selftune_tick(*, store, now: datetime, persona_dir: Path | None =
             judge_lora.reap_unreferenced(judge_lora.champion_dir(persona_dir))
         except Exception:  # noqa: BLE001 — reaping is best-effort; never blocks the tick
             logger.warning("judge self-tune: leftover-checkpoint reap faulted", exc_info=True)
+        try:
+            _reap_orphan_knob_rows(store, persona_dir)
+        except Exception:  # noqa: BLE001 — reaping is best-effort; never blocks the tick
+            logger.warning("judge self-tune: orphan knob-row reap faulted", exc_info=True)
     try:
         gate_handful = tunables.get_tunable(
             "judge_selftune.gate_handful_decisions", JUDGE_TUNE_GATE_HANDFUL_DECISIONS
@@ -685,6 +738,9 @@ def _run_judge_selftune_tick(*, store, now: datetime, persona_dir: Path | None =
                     tune_grade,
                 )
             result["method"] = TUNE_GRADE_KNOB_REFIT
+            from brain.memory.relevance_judge import judge_knob_key
+
+            cur = None
             if persona_dir is not None:
                 from brain.memory import judge_lora
 
@@ -692,7 +748,9 @@ def _run_judge_selftune_tick(*, store, now: datetime, persona_dir: Path | None =
                 result["current"] = cur.name if cur is not None else "base"
                 # A knob week tunes (only the knob of) the serving model itself.
                 result["start"] = result["current"]
-            _weak_knob_refit_and_consume(store, now, row_ids)
+            # F2c inc9: the knob is keyed to the model serving (the persona's
+            # current checkpoint, else the plain base id).
+            _weak_knob_refit_and_consume(store, now, row_ids, judge_knob_key(MODEL_RELEVANCE_JUDGE, cur))
         else:
             result["method"] = tune_grade
             info: dict = {}

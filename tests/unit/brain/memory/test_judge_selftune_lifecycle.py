@@ -211,6 +211,11 @@ def _current(persona_dir: Path) -> Path | None:
     return judge_lora.resolve_current_checkpoint(persona_dir)
 
 
+def _knob(store: MemoryStore, checkpoint: Path | None) -> dict | None:
+    """The knob row bound to `checkpoint` (F2c inc9 key), or the base judge's."""
+    return store.get_judge_knob_calibration(relevance_judge.judge_knob_key(MODEL_RELEVANCE_JUDGE, checkpoint))
+
+
 def _place_checkpoint(persona_dir: Path) -> Path:
     root = _root(persona_dir)
     d = judge_lora.staged_adapter_path(root)
@@ -262,7 +267,7 @@ def test_accept_swaps_in_plain_checkpoint_rescores_knob_and_consumes_doc_having_
     # L7: the knob is fit on scores re-scored through the NEW checkpoint (the
     # serve loader), not the logged scores.
     assert env.scorer_dirs[-1] == str(cur)
-    knob = store.get_judge_knob_calibration(MODEL_RELEVANCE_JUDGE)
+    knob = _knob(store, cur)
     fresh = [(3.14, label) for (_q, _d, label) in store.judge_knob_refit_rescore_items(_all_ids(ids))]
     assert (knob["slope"], knob["intercept"]) == pytest.approx(judge_selftune.fit_platt_knob(fresh))
     logged = judge_selftune.fit_platt_knob(store.judge_knob_refit_pairs(_all_ids(ids)))
@@ -299,7 +304,7 @@ def test_revert_keeps_champion_uses_logged_knob_and_consumes_full_set(
     # Re-score never ran: the only load was the champion (the current model).
     assert env.scorer_dirs == [str(prior)]
     logged = judge_selftune.fit_platt_knob(store.judge_knob_refit_pairs(_all_ids(ids)))
-    knob = store.get_judge_knob_calibration(MODEL_RELEVANCE_JUDGE)
+    knob = _knob(store, prior)
     assert (knob["slope"], knob["intercept"]) == pytest.approx(logged)
     assert all(_consumed(store, rid) for rid in _all_ids(ids))
     # H4 on a revert: current and start both name the unchanged champion.
@@ -323,6 +328,7 @@ def test_thin_haiku_data_falls_through_to_weak_knob_refit(
     assert result["fired"] is True and result["accepted"] is None
     assert all(_consumed(store, rid) for rid in _all_ids(ids))
     assert _pointer_bytes(tmp_path) == before and _stored_dirs(tmp_path) == {prior.name}
+    assert _knob(store, prior) is not None, "the floor's knob is bound to the serving checkpoint"
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +358,7 @@ def test_fault_before_swap_leaves_pointer_reaps_staged_and_rows_unconsumed(
 
 
 @pytest.mark.parametrize("grade", GRADES)
-def test_fault_after_swap_before_commit_rolls_back_to_prior(
+def test_knob_write_fault_leaves_prior_serving(
     grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     prior = _place_checkpoint(tmp_path)
@@ -366,13 +372,15 @@ def test_fault_after_swap_before_commit_rolls_back_to_prior(
     )
     result = _tick(store, tmp_path)
     assert result["error"] is not None
-    assert _current(tmp_path) == prior, "rolled back to the prior checkpoint (still on disk)"
+    # F2c inc9 knob-first: the knob write precedes the swap, so the pointer
+    # is never moved (no rollback step exists).
+    assert _current(tmp_path) == prior, "the prior checkpoint keeps serving"
     assert _stored_dirs(tmp_path) == {prior.name}
     assert not any(_consumed(store, rid) for rid in _all_ids(ids))
 
 
 @pytest.mark.parametrize("grade", GRADES)
-def test_first_ever_tune_fault_before_commit_clears_pointer(
+def test_first_ever_tune_knob_write_fault_leaves_base_serving(
     grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     ids = _seed_scenario(store)
@@ -385,7 +393,7 @@ def test_first_ever_tune_fault_before_commit_clears_pointer(
     )
     result = _tick(store, tmp_path)
     assert result["fired"] is False and result["error"] is not None
-    assert _current(tmp_path) is None, "first-ever tune: pointer cleared -> base (I9)"
+    assert _current(tmp_path) is None, "first-ever tune: no pointer was ever written -> base (I9)"
     assert not any(_consumed(store, rid) for rid in _all_ids(ids))
 
 
@@ -393,8 +401,9 @@ def test_first_ever_tune_fault_before_commit_clears_pointer(
 def test_fault_after_commit_keeps_new_checkpoint_with_its_knob(
     grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """S4 window 3 (bite: as built, any post-swap fault rolled the pointer back
-    even after the new knob was written)."""
+    """S4: a fault after the commit (the swap) keeps the new checkpoint with
+    its own knob (inc7 bite: the as-built code rolled the pointer back even
+    after the new knob was written)."""
     _place_checkpoint(tmp_path)
     ids = _seed_scenario(store)
     _set_tier(monkeypatch, grade)
@@ -408,7 +417,7 @@ def test_fault_after_commit_keeps_new_checkpoint_with_its_knob(
     assert result["error"] is not None
     new = Path(env.builds[0]["staged"])
     assert _current(tmp_path) == new, "committed: the new checkpoint keeps serving"
-    knob = store.get_judge_knob_calibration(MODEL_RELEVANCE_JUDGE)
+    knob = _knob(store, new)
     fresh = [(3.14, label) for (_q, _d, label) in store.judge_knob_refit_rescore_items(_all_ids(ids))]
     assert (knob["slope"], knob["intercept"]) == pytest.approx(judge_selftune.fit_platt_knob(fresh))
     assert not any(_consumed(store, rid) for rid in _all_ids(ids))
@@ -538,7 +547,7 @@ def test_drop_to_weak_tier_only_refits_the_knob_on_the_same_model(
     assert _pointer_bytes(tmp_path) == before_ptr and _stored_dirs(tmp_path) == before_dirs
     assert len(env.builds) == 1, "no weight training on the weak week"
     logged = judge_selftune.fit_platt_knob(store.judge_knob_refit_pairs(tick_rows))
-    knob = store.get_judge_knob_calibration(MODEL_RELEVANCE_JUDGE)
+    knob = _knob(store, _current(tmp_path))
     assert (knob["slope"], knob["intercept"]) == pytest.approx(logged)
     assert all(_consumed(store, rid) for rid in tick_rows) and set(_all_ids(ids)) <= set(tick_rows)
 

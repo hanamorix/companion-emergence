@@ -336,8 +336,8 @@ def resolve_current_checkpoint(persona_dir: str | Path) -> Path | None:
 def read_pointer_name(champion_root: str | Path) -> str | None:
     """The raw name the `current` pointer holds (no existence or form check),
     or `None` if there is no pointer / it is empty / it cannot be read. Used
-    to restore the pointer byte-for-byte on a pre-commit rollback and to keep
-    the pointer-named dir when discarding a staged one. Never raises."""
+    by the weekly tick to name the previous checkpoint whose knob row it
+    deletes after an accepted swap (F2c inc9). Never raises."""
     pointer = Path(champion_root) / _CHAMPION_POINTER
     try:
         if not pointer.is_file():
@@ -420,16 +420,11 @@ def swap_champion_pointer(champion_root: str | Path, staged_subdir: str | Path) 
     os.replace(tmp, root / _CHAMPION_POINTER)
 
 
-def clear_champion_pointer(champion_root: str | Path) -> None:
-    """Remove the `current` pointer (best-effort, never raises) so the persona
-    resolves to the BASE judge again — used by the tick's post-swap-fault
-    rollback when there was no prior champion to roll back to (a first-ever
-    tune that faulted after its swap)."""
-    pointer = Path(champion_root) / _CHAMPION_POINTER
-    try:
-        pointer.unlink(missing_ok=True)
-    except OSError:
-        logger.warning("clear_champion_pointer: failed to remove %s", pointer, exc_info=True)
+def pointer_file(champion_root: str | Path) -> Path:
+    """The persona's `current` pointer file under `champion_root` (it may not
+    exist). Used by `judge_selftune._reap_orphan_knob_rows` (F2c inc9) to read
+    the pointer raw with `reap_unreferenced`'s safety."""
+    return Path(champion_root) / _CHAMPION_POINTER
 
 
 def resolve_champion_adapter(champion_root: str | Path) -> Path | None:
@@ -456,9 +451,9 @@ def cleanup_stale_adapters(champion_root: str | Path, keep_names: Sequence[str])
     """Best-effort removal of `adapter-*` subdirs whose basename is NOT in
     `keep_names` (never raises; a refused delete, e.g. an open file on
     Windows, is logged and left for `reap_unreferenced` on a later tick). The
-    tick passes `judge_selftune._keep_after_accept(...)` after an accepted
-    swap (F2c inc7 ruling Q1: only the new checkpoint; the previous one is
-    deleted in the same tick), or {current} on a revert/fault to reap a
+    tick passes `judge_selftune._keep_after_accept(new_name)` after an
+    accepted swap (F2c inc7 ruling Q1: only the new checkpoint; the previous
+    one is deleted right after the swap, in the same tick), or {current} on a revert/fault to reap a
     discarded staged subdir (C21). A `None`/empty name in `keep_names` is
     ignored (first-ever tune has no prior)."""
     root = Path(champion_root)

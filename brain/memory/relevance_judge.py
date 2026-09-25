@@ -205,6 +205,25 @@ class RelevanceJudgeProvider(ABC):
     def model_id(self) -> str:
         """Stable identifier for the model producing these scores."""
 
+    def knob_key(self) -> str:
+        """The `judge_knob_calibration` key of the knob fit on THIS judge's
+        scores (F2c inc9). The base judge (and every test fake) uses its
+        `model_id()`; `FullModelJudge` adds its checkpoint, so a knob is only
+        ever read for the one model object that produces the scores."""
+        return self.model_id()
+
+
+def judge_knob_key(model_id: str, checkpoint: str | Path | None) -> str:
+    """The single definition of a knob key (F2c inc9, spec §5): the plain
+    `model_id` when no tuned checkpoint serves, else
+    `"<model_id>@<checkpoint dir name>"`. Checkpoint dir names are one-use
+    uuids (`judge_lora.staged_adapter_path`) and `@` cannot occur in a Hugging
+    Face repo id, so a key matches only the checkpoint its knob was fit on.
+    Pure string work: no filesystem access, no torch."""
+    if checkpoint is None:
+        return model_id
+    return f"{model_id}@{Path(checkpoint).name}"
+
 
 class TorchCrossEncoderJudge(RelevanceJudgeProvider):
     """Real local judge via `sentence_transformers.CrossEncoder` (torch
@@ -289,13 +308,13 @@ class FullModelJudge(RelevanceJudgeProvider):
     `label_for_score` applies the persona's knob on top exactly as for the
     base judge.
 
-    `model_id()` returns the BASE model id, deliberately: the per-persona knob
-    (`judge_knob_calibration`) is keyed by the base judge model id (inc4a), and
-    the tuned checkpoint is scoped per-persona by its DIRECTORY, not by model
-    id — so keeping model_id stable keeps `label_calibration_sample`'s
-    `get_judge_knob_calibration(judge.model_id())` lookup correct for the base
-    and the tuned judge. Torch is imported lazily inside `load_full_scorer`
-    (I6), never at import time.
+    `model_id()` returns the BASE model id (the model family). The knob,
+    though, is bound to THIS checkpoint (F2c inc9, spec §5): `knob_key()` is
+    `judge_knob_key(base id, checkpoint dir)`, the key the weekly tick writes
+    this checkpoint's knob under before swapping it in, so
+    `label_calibration_sample` can never apply a knob fit on a different
+    checkpoint. Torch is imported lazily inside `load_full_scorer` (I6), never
+    at import time.
     """
 
     def __init__(
@@ -304,6 +323,7 @@ class FullModelJudge(RelevanceJudgeProvider):
         from brain.memory.judge_full_ft import load_full_scorer
 
         self._model_id = base_model_id
+        self._full_dir = full_dir
         self._scorer = load_full_scorer(full_dir, cache_dir=cache_dir)
 
     def score(self, query: str, document: str) -> float:
@@ -311,6 +331,9 @@ class FullModelJudge(RelevanceJudgeProvider):
 
     def model_id(self) -> str:
         return self._model_id
+
+    def knob_key(self) -> str:
+        return judge_knob_key(self._model_id, self._full_dir)
 
 
 # Process-wide provider cache keyed by model_id (mirrors reranker.py's
@@ -458,8 +481,9 @@ def label_calibration_sample(
     to label, or if judge construction itself failed).
 
     F2c INC4a (spec §5 "where the tuned judge loads from"): before scoring,
-    reads THIS PERSONA's persisted knob-refit params for the judge's model
-    id via `store.get_judge_knob_calibration` — `store` is always the
+    reads THIS PERSONA's persisted knob-refit params for the judge's knob
+    key (`judge.knob_key()`: its model id, plus its checkpoint for a tuned
+    judge, F2c inc9) via `store.get_judge_knob_calibration` — `store` is always the
     persona-scoped `MemoryStore` the caller (`_run_calibration_tick`)
     constructed from that persona's OWN `memories.db` (I1: one store per
     persona is the isolation boundary, no persona-scoping column needed,
@@ -506,9 +530,11 @@ def label_calibration_sample(
             )
             return 0
 
-    # F2c inc4a: this persona's fitted Platt knob for THIS judge's model id,
-    # or (None, None) if absent — see the docstring above.
-    knob = store.get_judge_knob_calibration(judge.model_id())
+    # F2c inc4a: this persona's fitted Platt knob for THIS judge, or
+    # (None, None) if absent — see the docstring above. inc9: keyed by
+    # `judge.knob_key()` (the base id, or base id @ the served checkpoint), so
+    # the knob read is always the one fit on the model object scoring here.
+    knob = store.get_judge_knob_calibration(judge.knob_key())
     knob_slope: float | None = knob["slope"] if knob is not None else None
     knob_intercept: float | None = knob["intercept"] if knob is not None else None
 

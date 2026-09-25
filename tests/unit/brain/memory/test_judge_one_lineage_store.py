@@ -154,8 +154,18 @@ def test_read_pointer_name_and_discard(tmp_path: Path) -> None:
 
 def test_keep_after_accept_keeps_only_the_new_checkpoint() -> None:
     """Ruling Q1: the previous checkpoint is deleted in the same tick."""
-    assert judge_selftune._keep_after_accept("adapter-new", "adapter-old") == ["adapter-new"]
-    assert judge_selftune._keep_after_accept("adapter-new", None) == ["adapter-new"]
+    assert judge_selftune._keep_after_accept("adapter-new") == ["adapter-new"]
+
+
+def test_keep_after_accept_has_no_unused_parameter_and_q1_stays_visible() -> None:
+    """F2c inc9 (register item 2 / criterion P1): one parameter, no unused-arg
+    suppression, and the Q1 policy named at the delete call site."""
+    assert list(inspect.signature(judge_selftune._keep_after_accept).parameters) == ["new_name"]
+    module_src = inspect.getsource(judge_selftune)
+    assert "noqa: ARG001" not in module_src
+    src = inspect.getsource(judge_selftune._run_weight_retrain)
+    between = src[src.index("swap_champion_pointer(root, staged)"):src.index("cleanup_stale_adapters")]
+    assert "Q1" in between and "next tick" in between
 
 
 def test_training_start_is_the_current_model_else_base(tmp_path: Path) -> None:

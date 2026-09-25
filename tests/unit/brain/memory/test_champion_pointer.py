@@ -122,16 +122,12 @@ def test_cleanup_ignores_none_and_never_raises(tmp_path: Path) -> None:
     judge_lora.cleanup_stale_adapters(tmp_path / "does-not-exist", keep_names=["x"])
 
 
-def test_clear_champion_pointer_falls_back_to_base(tmp_path: Path) -> None:
-    # Post-swap-fault rollback for a first-ever tune: clearing the pointer
-    # makes resolve return None → the caller serves the base judge (I9).
+def test_pointer_file_names_the_current_pointer(tmp_path: Path) -> None:
+    # F2c inc9: the path the orphan knob-row reap reads raw.
     root = judge_lora.champion_dir(tmp_path)
     staged = _make_adapter(root)
     judge_lora.swap_champion_pointer(root, staged)
-    assert judge_lora.resolve_champion_adapter(root) == staged
-    judge_lora.clear_champion_pointer(root)
-    assert judge_lora.resolve_champion_adapter(root) is None
-    judge_lora.clear_champion_pointer(root)  # idempotent, never raises
+    assert judge_lora.pointer_file(root).read_text(encoding="utf-8") == staged.name
 
 
 def test_resolve_dangling_pointer_is_none(tmp_path: Path) -> None:

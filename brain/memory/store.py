@@ -531,6 +531,12 @@ CREATE TABLE IF NOT EXISTS judge_selftune_state (
 -- and threads the result into every `label_for_score` call that pass
 -- makes, so the live judge pass now genuinely applies a persona's own
 -- fitted knob once inc3's weekly tick has written one.
+-- F2c INC9 (spec §5 knob-first order): the key names the exact model the knob
+-- was fit on: the plain base model id for the base judge, or
+-- `<base id>@<checkpoint dir name>` for a persona's tuned checkpoint
+-- (`relevance_judge.judge_knob_key`). The weekly tick writes a new
+-- checkpoint's row BEFORE swapping it in and deletes the previous one's
+-- after; rows of checkpoints the pointer does not name are reaped next tick.
 CREATE TABLE IF NOT EXISTS judge_knob_calibration (
     judge_model_id TEXT PRIMARY KEY,
     slope REAL NOT NULL,
@@ -1230,6 +1236,10 @@ class MemoryStore:
                 "calibration.retention_window_days", CALIBRATION_LOG_RETENTION_WINDOW_DAYS
             )
         ref = now if now is not None else datetime.now(UTC)
+        if ref.tzinfo is not None:
+            # F2c inc9: same normalization as `_selftune_week_cutoff`, so a
+            # tz-aware non-UTC `now` cuts on its UTC date (identity for UTC).
+            ref = ref.astimezone(UTC)
         cutoff_bucket = (ref - timedelta(days=window_days)).strftime("%Y-%m-%d")
         stored = self._f2a_view_cutoff_bucket()
         view = cutoff_bucket if stored is None else max(stored, cutoff_bucket)
@@ -2105,6 +2115,24 @@ class MemoryStore:
             (judge_model_id, float(slope), float(intercept)),
         )
         self._conn.commit()
+
+    def list_judge_knob_keys(self) -> list[str]:
+        """Every `judge_knob_calibration` key (F2c inc9) — read by the weekly
+        tick's orphan knob-row reap (`judge_selftune._reap_orphan_knob_rows`).
+        Read-only."""
+        rows = self._conn.execute("SELECT judge_model_id FROM judge_knob_calibration").fetchall()
+        return [row["judge_model_id"] for row in rows]
+
+    def delete_judge_knob_calibration(self, judge_model_id: str) -> int:
+        """Delete the knob row keyed `judge_model_id` (F2c inc9: a superseded
+        checkpoint's knob after the swap, or an orphan left by a staged
+        checkpoint that was never swapped in). A missing row is a no-op.
+        Returns the number of rows deleted."""
+        cur = self._conn.execute(
+            "DELETE FROM judge_knob_calibration WHERE judge_model_id = ?", (judge_model_id,)
+        )
+        self._conn.commit()
+        return cur.rowcount
 
     def get(self, memory_id: str, *, bump: bool | float = True) -> Memory | None:
         """Return the Memory with the given id, or None. Bumps

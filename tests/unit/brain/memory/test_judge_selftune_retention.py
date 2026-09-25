@@ -11,14 +11,15 @@ F2a's 3-day window; F2a's own calibration inputs are unchanged.
 All rows are synthetic and written with explicit `logged_at` / `day_bucket`
 ages relative to a fixed `NOW`; no real model, never a live persona (I11).
 Criteria ids (R1..R15) refer to
-`changes/f2c-inc8-rolling-week-retention/1.5-criteria.md`.
+`changes/f2c-inc8-rolling-week-retention/1.5-criteria.md`; B1..B4 (added in
+F2c inc9) to `changes/f2c-inc9-open-findings/1.5-criteria.md`.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -460,3 +461,145 @@ def test_r15_view_cutoff_is_high_water_across_window_changes(store) -> None:
 
     store.prune_calibration_log(now=NOW, window_days=2.0)  # operator narrows it
     assert _view(store) == (NOW - timedelta(days=2)).strftime("%Y-%m-%d")
+
+
+# ---------------------------------------------------------------------------
+# F2c inc9 — closing the inc8 review's open items (criteria B1-B4 in
+# changes/f2c-inc9-open-findings/1.5-criteria.md).
+# ---------------------------------------------------------------------------
+
+BACK = NOW - timedelta(days=5)  # the clock after it goes backwards
+
+
+def test_b1i_backward_clock_only_keeps_rows_longer(store) -> None:
+    """inc8 claim, part (i): a backward `now` keeps and counts a Haiku row the
+    true clock has already rolled past a week; the true clock then drops it."""
+    rolled = _seed(store, _week() + timedelta(hours=1))
+
+    assert store.count_new_haiku_decisions(now=BACK) == (1, [rolled])
+    store.prune_calibration_log(now=BACK)
+    assert rolled in _ids(store)
+
+    assert store.count_new_haiku_decisions(now=NOW) == (0, [])
+    store.prune_calibration_log(now=NOW)
+    assert rolled not in _ids(store)
+
+
+def test_b1ii_backward_clock_loses_nothing(store) -> None:
+    """Part (ii): after a prune at the true `now`, a prune with the clock moved
+    back deletes nothing the forward prune kept, and does not delete a row
+    logged during the skew whose day is below the stored high-water view."""
+    held = _seed(store, timedelta(days=6))
+    fresh = _seed(store, timedelta(days=1), haiku="unlabeled")
+    _seed(store, timedelta(days=4), haiku="unlabeled")  # outside the window: deleted at NOW
+
+    store.prune_calibration_log(now=NOW)
+    kept_forward = _ids(store)
+    assert kept_forward == {held, fresh}
+
+    during_skew = _seed(store, timedelta(hours=1), haiku="unlabeled", now=BACK)
+    assert (BACK - timedelta(hours=1)).strftime("%Y-%m-%d") < _view(store), "precondition: below the view"
+    store.prune_calibration_log(now=BACK)
+    assert _ids(store) == kept_forward | {during_skew}
+
+
+def test_b1iii_backward_clock_never_double_counts(store) -> None:
+    """Part (iii): rows a tick at the true `now` consumed (including rows
+    logged after the backward `now`, i.e. "in the future" to it) are neither
+    counted, trained on nor re-stamped by a tick with the clock moved back."""
+    ids = _seed_many(store, HANDFUL + 5, timedelta(days=2))
+    ids += _seed_many(store, 3, timedelta(hours=1))
+    first = _tick(store, NOW)
+    assert first["fired"] is True and first["error"] is None
+    stamps = {
+        rid: store._conn.execute(
+            "SELECT selftune_consumed_at FROM calibration_log WHERE id = ?", (rid,)
+        ).fetchone()[0]
+        for rid in ids
+    }
+    assert all(stamps.values())
+    knob_before = store.get_judge_knob_calibration(MODEL_RELEVANCE_JUDGE)
+
+    assert store.count_new_haiku_decisions(now=BACK) == (0, [])
+    again = _tick(store, BACK)
+    assert again["fired"] is False and again["new_decisions"] == 0
+    for rid, stamp in stamps.items():
+        now_stamp = store._conn.execute(
+            "SELECT selftune_consumed_at FROM calibration_log WHERE id = ?", (rid,)
+        ).fetchone()[0]
+        assert now_stamp == stamp
+    assert store.get_judge_knob_calibration(MODEL_RELEVANCE_JUDGE) == knob_before
+
+
+def test_b2_legacy_db_then_narrow_then_wider_prune(tmp_path: Path) -> None:
+    """inc8 round-3 gap: R14 (legacy pre-inc8 DB) and R15 (high-water view)
+    combined — open a legacy DB, prune at a narrow window, then a wider one."""
+    db = tmp_path / "memories.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(_PRE_INC8_CALIBRATION_LOG_DDL)
+    for day, scores, labels in (
+        ("2026-03-01", [0.1, 0.2], ["irrelevant", "relevant"]),
+        ("2026-03-02", [0.7, 0.3], ["relevant", "irrelevant"]),
+    ):
+        conn.execute(
+            "INSERT INTO calibration_log (logged_at, day_bucket, query, candidate_ids, reranker_scores, "
+            "reranker_model_id, local_judge_label, haiku_label, score_scale) "
+            "VALUES (?, ?, 'q', '[\"a\",\"b\"]', ?, 'm', ?, '[null, null]', 'normalized')",
+            (f"{day} 10:00:00", day, json.dumps(scores), json.dumps(labels)),
+        )
+    held_logged = NOW - timedelta(days=5)
+    conn.execute(
+        "INSERT INTO calibration_log (logged_at, day_bucket, query, candidate_ids, reranker_scores, "
+        "reranker_model_id, local_judge_label, haiku_label, score_scale) "
+        "VALUES (?, ?, 'h', '[\"x\"]', '[0.5]', 'other', '[\"relevant\"]', '[\"relevant\"]', 'normalized')",
+        (held_logged.strftime("%Y-%m-%d %H:%M:%S"), held_logged.strftime("%Y-%m-%d")),
+    )
+    conn.commit()
+    conn.close()
+
+    store = MemoryStore(db)
+    assert _view(store) is None
+    assert store.labeled_calibration_pairs("m") == [(0.7, "relevant"), (0.3, "irrelevant")]
+
+    store.prune_calibration_log(now=NOW, window_days=2.0)
+    narrow = (NOW - timedelta(days=2)).strftime("%Y-%m-%d")
+    assert _view(store) == narrow
+    assert {r["query"] for r in store._conn.execute("SELECT query FROM calibration_log")} == {"h"}
+
+    store.prune_calibration_log(now=NOW, window_days=10.0)
+    assert _view(store) == narrow, "a wider window never lowers the view"
+    assert store.labeled_calibration_pairs("other") == [], "the held row stays invisible to F2a"
+    store.close()
+
+    reopened = MemoryStore(db)
+    assert _view(reopened) == narrow
+    assert reopened.labeled_calibration_pairs("other") == []
+    reopened.close()
+
+
+def test_b3_prune_normalizes_a_non_utc_now() -> None:
+    """inc8 soft note: a tz-aware non-UTC `now` cuts on its UTC date, like
+    `_selftune_week_cutoff`; UTC and naive `now` are unchanged."""
+    local = datetime(2026, 9, 20, 22, 0, 0, tzinfo=timezone(timedelta(hours=-5)))  # = 2026-09-21 03:00 UTC
+    utc = local.astimezone(UTC)
+
+    def run(now: datetime) -> tuple[set[str], str | None]:
+        s = MemoryStore(db_path=":memory:")
+        _seed(s, timedelta(0), haiku="unlabeled", now=datetime(2026, 9, 17, 12, 0, 0, tzinfo=UTC))
+        _seed(s, timedelta(0), haiku="unlabeled", now=datetime(2026, 9, 18, 12, 0, 0, tzinfo=UTC))
+        s.prune_calibration_log(now=now, window_days=3.0)
+        days = {r["day_bucket"] for r in s._conn.execute("SELECT day_bucket FROM calibration_log")}
+        return days, _view(s)
+
+    assert run(local) == ({"2026-09-18"}, "2026-09-18"), "the 09-17 row is outside the UTC window"
+    assert run(local) == run(utc)
+    assert run(utc.replace(tzinfo=None)) == ({"2026-09-18"}, "2026-09-18"), "naive = UTC, unchanged"
+
+
+def test_b4_row_at_exactly_one_week_is_counted_and_held(store) -> None:
+    """inc8 soft note: the gate (`>=`) and the hold (deletes only `<`) are both
+    inclusive of a row logged at exactly `now - WEEK`."""
+    edge = _seed(store, _week())
+    assert store.count_new_haiku_decisions(now=NOW) == (1, [edge])
+    store.prune_calibration_log(now=NOW)
+    assert edge in _ids(store)
