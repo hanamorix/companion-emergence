@@ -14,7 +14,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from brain.bridge.model_tier import MODEL_RELEVANCE_JUDGE
 from brain.bridge.supervisor import run_folded
+from brain.memory import judge_selftune
+from brain.memory.store import MemoryStore
 
 # #210: every test below stops the loop from inside its counted callback, so this is only a
 # ceiling for the failure path. 2 s was too tight for the windows-latest runner under load.
@@ -418,3 +421,255 @@ def test_vocab_repair_fires_from_persisted_due_time_on_fresh_process(
     assert calls[0] >= 2, "persisted past-due vocab repair must fire beyond the startup pass"
     saved = json.loads((_cadence_dir(persona_dir) / "vocab_repair_cadence.json").read_text())
     assert datetime.fromisoformat(saved["next_at"]) > datetime.now(UTC) + timedelta(hours=5)
+
+
+# ---------------------------------------------------------------------------
+# Judge self-tune (F2c inc2, spec Section 2) — weekly cadence wired
+# structurally identically to interest sweep (own cadence file, own
+# fault-isolated tick, NO startup catch-up). Unlike interest sweep and
+# voice-reflection, `_run_judge_selftune_tick` never builds a real provider
+# or touches an LLM (pure DB read + a /proc read), so it is safe to let run
+# for real in these tests (no neutralisation needed beyond `_neutralise`'s
+# existing stubs for the OTHER cadences sharing a base tick).
+# ---------------------------------------------------------------------------
+
+
+def _seed_labeled_calibration_rows(persona_dir: Path, n: int) -> None:
+    """Seed `n` already judge-labeled `calibration_log` rows (`haiku_label`
+    non-null, mirrors `write_calibration_labels`'s always-write contract)
+    directly into `<persona_dir>/memories.db`, closed before returning so
+    `run_folded`'s own per-tick `MemoryStore` can open the same file fresh
+    (mirrors the judge self-tune tick's own store-ownership contract).
+
+    F2c inc3: also writes `local_judge_raw_score` on each row so the real
+    tick's knob-refit (`judge_selftune.fit_platt_knob`, run BEFORE consume
+    now — spec §2 "consume = trained-on") has real pairs to train on;
+    without it, `fit_platt_knob` raises on zero usable pairs and the tick
+    correctly does NOT fire or consume (see
+    `test_judge_selftune.py::test_tick_gate_fires_but_no_usable_pairs_
+    leaves_rows_unconsumed` for that dedicated bite test)."""
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        for i in range(n):
+            store.log_calibration_sample(
+                query=f"q{i}", candidate_ids=["m"], reranker_scores=[1.0], reranker_model_id="m"
+            )
+            row_id = store._conn.execute(
+                "SELECT id FROM calibration_log ORDER BY id DESC LIMIT 1"
+            ).fetchone()["id"]
+            store.write_calibration_labels(
+                row_id, ["relevant"], ["relevant"], local_judge_raw_score=[2.0]
+            )
+    finally:
+        store.close()
+
+
+def test_judge_selftune_fires_from_persisted_due_time_on_fresh_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A due (>handful new Haiku-labeled decisions, past-due cadence) judge
+    self-tune tick fires on a fresh process, selects a tune-grade, and
+    advances BOTH its own cadence file and its per-persona marker's
+    consumed cursor (F2c inc2, spec Section 2/3). Wraps the REAL tick (not
+    a stub) so this genuinely bites: without the gate firing, the marker
+    would stay absent."""
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    (_cadence_dir(persona_dir) / judge_selftune.JUDGE_TUNE_CADENCE_FILE).write_text(
+        json.dumps({"next_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat()})
+    )
+    handful = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
+    _seed_labeled_calibration_rows(persona_dir, handful + 1)
+    _neutralise(monkeypatch)
+    stop = threading.Event()
+    calls = [0]
+    original_tick = judge_selftune._run_judge_selftune_tick
+
+    def _counting_tick(*a, **k):
+        calls[0] += 1
+        result = original_tick(*a, **k)
+        stop.set()
+        return result
+
+    monkeypatch.setattr("brain.bridge.supervisor._run_judge_selftune_tick", _counting_tick)
+
+    watchdog = threading.Timer(_WATCHDOG_S, stop.set)
+    watchdog.start()
+    run_folded(
+        stop,
+        persona_dir=persona_dir,
+        provider=MagicMock(),
+        event_bus=MagicMock(),
+        tick_interval_s=0.05,
+        heartbeat_interval_s=None,
+        soul_review_interval_s=None,
+        finalize_interval_s=None,
+        judge_selftune_interval_s=3600.0,  # 1h: monotonic alone would not fire on a fresh proc
+    )
+    watchdog.cancel()
+
+    assert calls[0] >= 1, "persisted past-due judge self-tune must fire on a fresh process"
+    saved = json.loads(
+        (_cadence_dir(persona_dir) / judge_selftune.JUDGE_TUNE_CADENCE_FILE).read_text()
+    )
+    assert datetime.fromisoformat(saved["next_at"]) > datetime.now(UTC) + timedelta(minutes=50)
+
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        marker = store.get_judge_selftune_state(MODEL_RELEVANCE_JUDGE)
+        # Red-team fix F-1: the consumed marker moved to per-row
+        # `calibration_log.selftune_consumed_at` (see that column's
+        # comment in store.py) — the persisted `judge_selftune_state` row
+        # no longer carries a `consumed_through_id` cursor, only the
+        # last-trained timestamp. Verify consumption at its new home: every
+        # seeded row must now be marked consumed, and a fresh gate count
+        # must see nothing left to count.
+        consumed_rows = store._conn.execute(
+            "SELECT COUNT(*) AS n FROM calibration_log WHERE selftune_consumed_at IS NOT NULL"
+        ).fetchone()["n"]
+        post_count, post_row_ids = store.count_new_haiku_decisions()
+    finally:
+        store.close()
+    assert marker is not None, "the >handful gate must have fired and written the marker"
+    assert marker["last_trained_at"] is not None
+    assert consumed_rows == handful + 1
+    assert post_count == 0
+    assert post_row_ids == []
+
+
+def test_judge_selftune_gate_does_not_fire_below_handful_but_cadence_still_advances(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The >handful gate (spec Section 2/3): a due tick with NO new
+    Haiku-labeled decisions yet (fresh persona, empty calibration_log) must
+    NOT write a marker, but the cadence itself still advances (end-of-block
+    unconditional advance+save, mirroring interest sweep's own contract) —
+    the tick re-checks next week, not on the very next base tick."""
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    (_cadence_dir(persona_dir) / judge_selftune.JUDGE_TUNE_CADENCE_FILE).write_text(
+        json.dumps({"next_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat()})
+    )
+    _neutralise(monkeypatch)
+    stop = threading.Event()
+    calls = [0]
+    original_tick = judge_selftune._run_judge_selftune_tick
+
+    def _counting_tick(*a, **k):
+        calls[0] += 1
+        result = original_tick(*a, **k)
+        stop.set()
+        return result
+
+    monkeypatch.setattr("brain.bridge.supervisor._run_judge_selftune_tick", _counting_tick)
+
+    watchdog = threading.Timer(_WATCHDOG_S, stop.set)
+    watchdog.start()
+    run_folded(
+        stop,
+        persona_dir=persona_dir,
+        provider=MagicMock(),
+        event_bus=MagicMock(),
+        tick_interval_s=0.05,
+        heartbeat_interval_s=None,
+        soul_review_interval_s=None,
+        finalize_interval_s=None,
+        judge_selftune_interval_s=3600.0,
+    )
+    watchdog.cancel()
+
+    assert calls[0] >= 1
+    saved = json.loads(
+        (_cadence_dir(persona_dir) / judge_selftune.JUDGE_TUNE_CADENCE_FILE).read_text()
+    )
+    assert datetime.fromisoformat(saved["next_at"]) > datetime.now(UTC) + timedelta(minutes=50), (
+        "cadence must advance even when the gate does not fire"
+    )
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        marker = store.get_judge_selftune_state(MODEL_RELEVANCE_JUDGE)
+    finally:
+        store.close()
+    assert marker is None, "gate did not fire -> marker must stay unwritten"
+
+
+def test_judge_selftune_cadence_advances_even_when_tick_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same always-advance-on-exception contract as finalize's own test
+    above, pinned separately for judge self-tune's own block."""
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    (_cadence_dir(persona_dir) / judge_selftune.JUDGE_TUNE_CADENCE_FILE).write_text(
+        json.dumps({"next_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat()})
+    )
+    _neutralise(monkeypatch)
+    stop = threading.Event()
+    raised = [0]
+
+    def _raiser(*a, **k):
+        raised[0] += 1
+        stop.set()
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("brain.bridge.supervisor._run_judge_selftune_tick", _raiser)
+
+    watchdog = threading.Timer(_WATCHDOG_S, stop.set)
+    watchdog.start()
+    run_folded(
+        stop,
+        persona_dir=persona_dir,
+        provider=MagicMock(),
+        event_bus=MagicMock(),
+        tick_interval_s=0.05,
+        heartbeat_interval_s=None,
+        soul_review_interval_s=None,
+        finalize_interval_s=None,
+        judge_selftune_interval_s=3600.0,
+    )
+    watchdog.cancel()
+
+    assert raised[0] >= 1, "the raising tick must have fired"
+    saved = json.loads(
+        (_cadence_dir(persona_dir) / judge_selftune.JUDGE_TUNE_CADENCE_FILE).read_text()
+    )
+    assert datetime.fromisoformat(saved["next_at"]) > datetime.now(UTC) + timedelta(minutes=50), (
+        "advance+save must run in finally even when the tick raises"
+    )
+
+
+def test_judge_selftune_disabled_cadence_writes_no_state_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`judge_selftune_interval_s=None` disables the cadence — it must
+    never load or write its state file (mirrors the generic disabled-cadence
+    contract `test_disabled_cadence_writes_no_state_file` pins for the other
+    three)."""
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    _neutralise(monkeypatch)
+    stop = threading.Event()
+    monkeypatch.setattr(
+        "brain.bridge.supervisor._run_heartbeat_tick",
+        lambda *a, **k: stop.set(),
+    )
+
+    watchdog = threading.Timer(_WATCHDOG_S, stop.set)
+    watchdog.start()
+    run_folded(
+        stop,
+        persona_dir=persona_dir,
+        provider=MagicMock(),
+        event_bus=MagicMock(),
+        tick_interval_s=0.05,
+        heartbeat_interval_s=0.01,
+        soul_review_interval_s=None,
+        finalize_interval_s=None,
+        voice_reflection_interval_s=None,
+        judge_selftune_interval_s=None,
+    )
+    watchdog.cancel()
+
+    assert not (_cadence_dir(persona_dir) / judge_selftune.JUDGE_TUNE_CADENCE_FILE).exists(), (
+        "judge_selftune_interval_s=None must never write its cadence state file"
+    )

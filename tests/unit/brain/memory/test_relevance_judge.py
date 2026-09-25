@@ -12,6 +12,10 @@ from __future__ import annotations
 
 import json
 import math
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
 
 import pytest
 
@@ -125,6 +129,65 @@ def test_label_for_score_defaults_to_the_live_tunable_band_width() -> None:
     x_outside = math.log(p_outside / (1 - p_outside))
     _, ambiguous = label_for_score(x_outside)
     assert ambiguous is False
+
+
+# ---------------------------------------------------------------------------
+# label_for_score — slope/intercept (F2c inc3, spec §5): ABSENT-SAFE Platt
+# calibration params. Both None (the default, and every live call site
+# until F2c inc4) must reproduce today's exact fixed behavior.
+# ---------------------------------------------------------------------------
+
+
+def test_label_for_score_slope_intercept_absent_matches_fixed_default() -> None:
+    """No slope/intercept passed -> byte-for-byte the pre-inc3 fixed
+    sigmoid-0.5 behavior (absent-safe fallback, spec §5)."""
+    for raw_score in (-10.0, -0.3, 0.0, 0.3, 10.0):
+        assert label_for_score(raw_score) == label_for_score(raw_score, slope=None, intercept=None)
+
+
+def test_label_for_score_slope_1_intercept_0_is_identical_to_fixed_default() -> None:
+    """Explicit identity params (slope=1.0, intercept=0.0) must reproduce
+    the fixed default exactly — this is the mapping absent params are
+    documented as equivalent to."""
+    for raw_score in (-10.0, -0.3, 0.0, 0.3, 10.0):
+        assert label_for_score(raw_score, slope=1.0, intercept=0.0) == label_for_score(raw_score)
+
+
+def test_label_for_score_only_slope_given_intercept_falls_back_to_zero() -> None:
+    """Either argument being None uses the default for just the missing
+    one, not an all-or-nothing requirement."""
+    assert label_for_score(0.0, slope=2.0) == label_for_score(0.0, slope=2.0, intercept=0.0)
+
+
+def test_label_for_score_only_intercept_given_slope_falls_back_to_one() -> None:
+    assert label_for_score(0.0, intercept=1.0) == label_for_score(0.0, slope=1.0, intercept=1.0)
+
+
+def test_label_for_score_fitted_intercept_shifts_the_decision_boundary() -> None:
+    """BITE: a raw score that is "irrelevant" under the fixed default (its
+    sigmoid sits below 0.5) flips to "relevant" once a fitted intercept
+    shifts the boundary past it — proving the params path actually changes
+    the label, not merely accepted and ignored."""
+    raw_score = -0.5
+    fixed_label, _ = label_for_score(raw_score)
+    assert fixed_label == "irrelevant", "sanity: -0.5 is below the fixed 0.5 boundary"
+
+    fitted_label, _ = label_for_score(raw_score, slope=1.0, intercept=1.0)
+    assert fitted_label == "relevant", "shifted boundary (z = -0.5 + 1.0 = 0.5 > 0) now covers this score"
+
+
+def test_label_for_score_fitted_params_also_shift_the_ambiguous_band() -> None:
+    """The ambiguous band is defined on the (possibly recalibrated)
+    probability, so a fitted mapping shifts where the band sits too, not
+    just the pass/fail label."""
+    # Under the fixed default, raw_score=1.0 is comfortably clear
+    # (sigmoid(1.0) ~= 0.73, outside the default 0.05 half-width band).
+    _, fixed_ambiguous = label_for_score(1.0)
+    assert fixed_ambiguous is False
+    # A fitted slope that compresses the score toward 0 moves it back
+    # inside the band around the new boundary.
+    _, fitted_ambiguous = label_for_score(1.0, slope=0.01, intercept=0.0)
+    assert fitted_ambiguous is True
 
 
 # ---------------------------------------------------------------------------
@@ -493,11 +556,13 @@ def test_label_calibration_sample_one_row_failure_does_not_sink_other_rows(
     original_write = store.write_calibration_labels
     calls = {"n": 0}
 
-    def _flaky_write(row_id, local_labels, haiku_labels):
+    def _flaky_write(row_id, local_labels, haiku_labels, local_judge_raw_score=None):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("disk full")
-        return original_write(row_id, local_labels, haiku_labels)
+        return original_write(
+            row_id, local_labels, haiku_labels, local_judge_raw_score=local_judge_raw_score
+        )
 
     monkeypatch.setattr(store, "write_calibration_labels", _flaky_write)
 
@@ -513,3 +578,391 @@ def test_label_calibration_sample_respects_sample_rows_limit(store: MemoryStore)
         )
     labeled = label_calibration_sample(store, judge=FakeRelevanceJudgeProvider(), sample_rows=2)
     assert labeled == 2
+
+
+# ---------------------------------------------------------------------------
+# F2c inc1 (data foundation only, spec §3 Addition A): the judge's RAW
+# score/logit is accumulated alongside the derived label and persisted via
+# `write_calibration_labels`.
+# ---------------------------------------------------------------------------
+
+
+def test_label_calibration_sample_persists_raw_scores_not_derived_labels(
+    store: MemoryStore,
+) -> None:
+    """BITE: `local_judge_raw_score` holds the RAW logit the judge actually
+    returned (e.g. 12.5, far outside [0,1]) — not the sigmoid-derived
+    relevant/irrelevant label, and positionally aligned with
+    `candidate_ids`/`local_judge_label`."""
+    mem_a = _mem("clearly relevant content")
+    mem_b = _mem("clearly irrelevant content")
+    store.create(mem_a)
+    store.create(mem_b)
+    store.log_calibration_sample(
+        query="q", candidate_ids=[mem_a.id, mem_b.id], reranker_scores=[1.0, 2.0],
+        reranker_model_id="m",
+    )
+    judge = FakeRelevanceJudgeProvider(
+        scores={("q", mem_a.content): 12.5, ("q", mem_b.content): -8.25}
+    )
+
+    labeled = label_calibration_sample(store, judge=judge)
+
+    assert labeled == 1
+    row = store._conn.execute(
+        "SELECT local_judge_label, local_judge_raw_score FROM calibration_log"
+    ).fetchone()
+    labels = json.loads(row["local_judge_label"])
+    raw_scores = json.loads(row["local_judge_raw_score"])
+    assert labels == ["relevant", "irrelevant"]
+    assert raw_scores == [12.5, -8.25], "the RAW logits, not the derived labels"
+    assert raw_scores != labels
+
+
+def test_label_calibration_sample_raw_score_is_null_for_unknown_candidate(
+    store: MemoryStore,
+) -> None:
+    """A candidate the judge never scored (deleted since logging -> the
+    "unknown" label sentinel) gets `None` at that position in
+    `local_judge_raw_score`, never a fabricated 0.0 that could be mistaken
+    for a real score."""
+    store.log_calibration_sample(
+        query="q", candidate_ids=["does-not-exist"], reranker_scores=[1.0], reranker_model_id="m"
+    )
+    judge = FakeRelevanceJudgeProvider()
+
+    labeled = label_calibration_sample(store, judge=judge)
+
+    assert labeled == 1
+    row = store._conn.execute(
+        "SELECT local_judge_label, local_judge_raw_score FROM calibration_log"
+    ).fetchone()
+    assert json.loads(row["local_judge_label"]) == ["unknown"]
+    assert json.loads(row["local_judge_raw_score"]) == [None]
+
+
+def test_label_calibration_sample_raw_score_is_null_for_error_candidate(
+    store: MemoryStore,
+) -> None:
+    """A candidate whose judge.score() call raises (the "error" label
+    sentinel) also gets `None` at that position, not a fabricated score."""
+    mem_bad = _mem("bad content")
+    store.create(mem_bad)
+    store.log_calibration_sample(
+        query="q", candidate_ids=[mem_bad.id], reranker_scores=[1.0], reranker_model_id="m"
+    )
+
+    class _FlakyJudge(FakeRelevanceJudgeProvider):
+        def score(self, query: str, document: str) -> float:
+            raise RuntimeError("boom")
+
+    labeled = label_calibration_sample(store, judge=_FlakyJudge())
+
+    assert labeled == 1
+    row = store._conn.execute(
+        "SELECT local_judge_label, local_judge_raw_score FROM calibration_log"
+    ).fetchone()
+    assert json.loads(row["local_judge_label"]) == ["error"]
+    assert json.loads(row["local_judge_raw_score"]) == [None]
+
+
+# ---------------------------------------------------------------------------
+# F2c inc1 (spec §6): the durable in-code Haiku-oracle note must actually be
+# present at the F2a judge/label site — grep/lint check (acceptance #9).
+# ---------------------------------------------------------------------------
+
+
+def test_haiku_oracle_note_is_present_in_relevance_judge_source() -> None:
+    """A plain code-comment presence check — not a behavior test — proving
+    the required durable note (spec §6: Haiku is the effective relevance
+    ORACLE the judge converges toward) actually exists at this module,
+    immediately above `label_calibration_sample` (the F2a judge/label
+    site), so a later relevance-quality problem has a documented place to
+    look. Scoped to just that note block (not the whole module, which uses
+    em-dashes freely elsewhere in ordinary docstrings) since the "no
+    em-dash" requirement applies to this specific durable note, not to
+    every comment in the file."""
+    import inspect
+
+    source = inspect.getsource(rj_mod)
+    marker = "# F2c (durable note, spec"
+    assert marker in source, "the durable Haiku-oracle note must precede label_calibration_sample"
+    note_start = source.index(marker)
+    note_end = source.index("def label_calibration_sample", note_start)
+    note = source[note_start:note_end]
+    assert "oracle" in note.lower()
+    assert "haiku" in note.lower()
+    assert "—" not in note, "no em-dashes in this durable note (plain code comment, no LLM-tells)"
+
+
+# ---------------------------------------------------------------------------
+# F2c inc4a (spec §5 "where the tuned judge loads from") — the LOAD side:
+# `label_calibration_sample` now reads THIS PERSONA's persisted
+# `judge_knob_calibration` row (via `store.get_judge_knob_calibration`) and
+# threads it into every `label_for_score` call the pass makes.
+# ---------------------------------------------------------------------------
+
+
+def test_label_calibration_sample_applies_this_personas_persisted_knob(store: MemoryStore) -> None:
+    """BITE: raw_score=-0.5 is "irrelevant" under the fixed sigmoid-0.5
+    default (same sanity fact `test_label_for_score_fitted_intercept_
+    shifts_the_decision_boundary` establishes directly against
+    `label_for_score`), but flips to "relevant" once this persona's
+    persisted knob (slope=1.0, intercept=1.0) shifts the boundary past it
+    — proving the LOAD path actually reaches the live judge-labeling call,
+    not just that `label_for_score` is capable of applying params (inc3)."""
+    mem = _mem("borderline content")
+    store.create(mem)
+    store.log_calibration_sample(
+        query="q", candidate_ids=[mem.id], reranker_scores=[1.0], reranker_model_id="m"
+    )
+    judge = FakeRelevanceJudgeProvider(scores={("q", mem.content): -0.5})
+    store.write_judge_knob_calibration(judge.model_id(), slope=1.0, intercept=1.0)
+
+    labeled = label_calibration_sample(store, judge=judge)
+
+    assert labeled == 1
+    row = store._conn.execute("SELECT local_judge_label FROM calibration_log").fetchone()
+    assert json.loads(row["local_judge_label"]) == ["relevant"], (
+        "the persona's fitted knob (slope=1.0, intercept=1.0) must shift the boundary past "
+        "raw_score=-0.5, which is 'irrelevant' under the fixed sigmoid-0.5 default"
+    )
+
+
+def test_label_calibration_sample_absent_knob_is_byte_identical_to_fixed_default(
+    store: MemoryStore,
+) -> None:
+    """ABSENT-SAFE: no persisted `judge_knob_calibration` row for this
+    judge's model id -> labeling of the same borderline raw_score=-0.5
+    stays "irrelevant" (the fixed sigmoid-0.5 default), byte-identical to
+    pre-inc4a behavior — not silently "relevant" from some fabricated
+    default."""
+    mem = _mem("borderline content")
+    store.create(mem)
+    store.log_calibration_sample(
+        query="q", candidate_ids=[mem.id], reranker_scores=[1.0], reranker_model_id="m"
+    )
+    judge = FakeRelevanceJudgeProvider(scores={("q", mem.content): -0.5})
+    assert store.get_judge_knob_calibration(judge.model_id()) is None, "sanity: no persisted knob"
+
+    labeled = label_calibration_sample(store, judge=judge)
+
+    assert labeled == 1
+    row = store._conn.execute("SELECT local_judge_label FROM calibration_log").fetchone()
+    assert json.loads(row["local_judge_label"]) == ["irrelevant"], (
+        "an absent knob must fall back to the fixed sigmoid-0.5 default, unchanged from pre-inc4a"
+    )
+
+
+def test_label_calibration_sample_persona_isolation_no_cross_persona_bleed() -> None:
+    """AC11 (load side): persona A's persisted knob must never affect
+    persona B's judge labeling. Both personas' judges share the SAME
+    `model_id()` string ("fake-relevance-judge") — deliberately, so the
+    isolation this proves comes from each persona's own `MemoryStore`/db
+    file (I1), not from any persona-scoping column keying the row."""
+    store_a = MemoryStore(db_path=":memory:")
+    store_b = MemoryStore(db_path=":memory:")
+
+    mem_a = _mem("borderline content a")
+    store_a.create(mem_a)
+    store_a.log_calibration_sample(
+        query="q", candidate_ids=[mem_a.id], reranker_scores=[1.0], reranker_model_id="m"
+    )
+    judge_a = FakeRelevanceJudgeProvider(scores={("q", mem_a.content): -0.5})
+    store_a.write_judge_knob_calibration(judge_a.model_id(), slope=1.0, intercept=1.0)
+
+    mem_b = _mem("borderline content b")
+    store_b.create(mem_b)
+    store_b.log_calibration_sample(
+        query="q", candidate_ids=[mem_b.id], reranker_scores=[1.0], reranker_model_id="m"
+    )
+    judge_b = FakeRelevanceJudgeProvider(scores={("q", mem_b.content): -0.5})
+    # store_b (persona B) never gets write_judge_knob_calibration called on it.
+
+    assert label_calibration_sample(store_a, judge=judge_a) == 1
+    assert label_calibration_sample(store_b, judge=judge_b) == 1
+
+    row_a = store_a._conn.execute("SELECT local_judge_label FROM calibration_log").fetchone()
+    row_b = store_b._conn.execute("SELECT local_judge_label FROM calibration_log").fetchone()
+    assert json.loads(row_a["local_judge_label"]) == ["relevant"], "persona A's own fitted knob applies"
+    assert json.loads(row_b["local_judge_label"]) == ["irrelevant"], (
+        "persona B has no persisted knob of its own and must not inherit persona A's, "
+        "even though both judges share the same model_id() string"
+    )
+
+
+def test_label_calibration_sample_with_persona_knob_does_not_import_torch() -> None:
+    """AC8 / I6: loading a persona's persisted knob (F2c inc4a) at the
+    judge-label call site is a plain SQLite read (`MemoryStore.get_judge_
+    knob_calibration`) — it must not pull torch/sentence_transformers into
+    `sys.modules`. Fresh subprocess (mirrors test_judge_selftune.py's
+    `test_tick_does_not_import_torch_or_sentence_transformers`) so an
+    earlier test's own torch import in this same process can't make an
+    in-process `sys.modules` check meaningless.
+    """
+    script = textwrap.dedent(
+        """
+        import json
+        import sys
+
+        from brain.memory.relevance_judge import FakeRelevanceJudgeProvider, label_calibration_sample
+        from brain.memory.store import Memory, MemoryStore
+
+        store = MemoryStore(db_path=":memory:")
+        mem = Memory.create_new(content="borderline content", memory_type="conversation", domain="us")
+        store.create(mem)
+        store.log_calibration_sample(
+            query="q", candidate_ids=[mem.id], reranker_scores=[1.0], reranker_model_id="m"
+        )
+        judge = FakeRelevanceJudgeProvider(scores={("q", mem.content): -0.5})
+        store.write_judge_knob_calibration(judge.model_id(), slope=1.0, intercept=1.0)
+
+        labeled = label_calibration_sample(store, judge=judge)
+        assert labeled == 1
+        row = store._conn.execute("SELECT local_judge_label FROM calibration_log").fetchone()
+        assert json.loads(row["local_judge_label"]) == ["relevant"], "the fitted knob must still apply"
+
+        assert "torch" not in sys.modules, sorted(sys.modules)
+        assert "sentence_transformers" not in sys.modules, sorted(sys.modules)
+        print("SUBPROCESS_OK")
+        """
+    )
+    repo_root = Path(__file__).resolve().parents[4]
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    assert "SUBPROCESS_OK" in proc.stdout, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+
+
+# ---------------------------------------------------------------------------
+# F2c inc6/inc7 — FullModelJudge serves the persona's ONE tuned plain
+# checkpoint. FullModelJudge's real load is torch; tests monkeypatch
+# judge_full_ft.load_full_scorer so no model is built.
+# ---------------------------------------------------------------------------
+
+
+def test_build_judge_provider_full_model_dir_returns_full_model_judge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # C11: full_model_dir -> FullModelJudge; model_id is the BASE id (so the
+    # per-persona knob lookup stays correct); a plain scorer produces a score.
+    from brain.memory import judge_full_ft
+    from brain.memory.relevance_judge import FullModelJudge
+
+    _reset_judge_provider_cache()
+    monkeypatch.setattr("brain.bridge.model_tier.model_for_tier", lambda tier: "BASE-JUDGE-ID")
+    monkeypatch.setattr("brain.paths.get_cache_dir", lambda: "/tmp/fake-cache-dir")
+    monkeypatch.setattr(judge_full_ft, "load_full_scorer", lambda d, **kw: (lambda item: 2.5))
+
+    judge = build_judge_provider(full_model_dir="/tmp/full-x")
+    assert isinstance(judge, FullModelJudge)
+    assert judge.model_id() == "BASE-JUDGE-ID"
+    assert judge.score("q", "d") == pytest.approx(2.5)
+
+
+def test_build_judge_provider_has_no_adapter_argument_and_no_adapter_judge() -> None:
+    # V1 (F2c inc7, ruling Q3): serving never loads an adapter — the provider
+    # takes only `full_model_dir`, and the adapter judge class is gone.
+    # Bite: at d25e1002 the signature is (adapter_dir, full_model_dir) and
+    # LoraAdapterJudge exists.
+    import inspect
+
+    assert list(inspect.signature(build_judge_provider).parameters) == ["full_model_dir"]
+    assert not hasattr(rj_mod, "LoraAdapterJudge")
+    assert list(inspect.signature(label_calibration_sample).parameters)[-1] == "full_model_dir"
+    assert "adapter_dir" not in inspect.signature(label_calibration_sample).parameters
+
+
+def test_full_model_judge_is_not_cached(monkeypatch: pytest.MonkeyPatch) -> None:
+    # C13: full-model judges (a new accepted model each week) must not
+    # accumulate in the process-wide provider cache.
+    from brain.memory import judge_full_ft
+    from brain.memory.relevance_judge import FullModelJudge, _provider_cache
+
+    _reset_judge_provider_cache()
+    monkeypatch.setattr("brain.bridge.model_tier.model_for_tier", lambda tier: "BASE-JUDGE-ID")
+    monkeypatch.setattr("brain.paths.get_cache_dir", lambda: "/tmp/fake-cache-dir")
+    monkeypatch.setattr(judge_full_ft, "load_full_scorer", lambda d, **kw: (lambda item: 0.0))
+
+    for i in range(5):
+        judge = build_judge_provider(full_model_dir=f"/tmp/full-{i}")
+        assert isinstance(judge, FullModelJudge)
+    assert len(_provider_cache) == 0, "full-model judges must not be cached"
+    _reset_judge_provider_cache()
+
+
+def test_default_suite_judge_stub_matches_the_real_signature(
+    request: pytest.FixtureRequest,
+) -> None:
+    # V3 (F2c inc7): the autouse conftest stub must accept exactly what the
+    # real provider accepts; a mismatch raises inside the stub and is
+    # swallowed by label_calibration_sample's fault isolation (bite: at
+    # d25e1002 the stub was `lambda adapter_dir=None` while the real call
+    # passed full_model_dir).
+    import inspect
+
+    stub = rj_mod.build_judge_provider  # patched per-test by the autouse fixture
+    assert stub is not build_judge_provider, "autouse stub must be active in this test"
+    assert list(inspect.signature(stub).parameters) == list(inspect.signature(build_judge_provider).parameters)
+
+
+def test_labeling_pass_on_the_default_stub_labels_rows(store: MemoryStore) -> None:
+    # V3: no injected judge -> the default stub is built and rows get labeled.
+    mem = _mem("x")
+    store.create(mem)
+    store.log_calibration_sample(
+        query="q", candidate_ids=[mem.id], reranker_scores=[1.0], reranker_model_id="m"
+    )
+    assert label_calibration_sample(store, judge=None) == 1
+
+
+def test_judge_construction_failure_is_logged_at_warning_or_above(
+    store: MemoryStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # V4: a judge-construction failure returns 0 AND is logged at >= WARNING
+    # (relevance_judge.label_calibration_sample's except branch), never silent.
+    mem = _mem("x")
+    store.create(mem)
+    store.log_calibration_sample(
+        query="q", candidate_ids=[mem.id], reranker_scores=[1.0], reranker_model_id="m"
+    )
+
+    def _raise(full_model_dir=None):
+        raise TypeError("unexpected keyword argument")
+
+    monkeypatch.setattr(rj_mod, "build_judge_provider", _raise)
+    with caplog.at_level("DEBUG", logger="brain.memory.relevance_judge"):
+        assert label_calibration_sample(store, judge=None) == 0
+    assert any(
+        r.levelno >= 30 and "failed to construct the local judge provider" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_judge_construction_failure_oracle_can_fail(
+    store: MemoryStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # V4 self-test (ST1.5f): with the module logger's `exception` silenced, the
+    # same observation finds no >= WARNING record — so the V4 check can fail.
+    mem = _mem("x")
+    store.create(mem)
+    store.log_calibration_sample(
+        query="q", candidate_ids=[mem.id], reranker_scores=[1.0], reranker_model_id="m"
+    )
+
+    def _raise(full_model_dir=None):
+        raise TypeError("unexpected keyword argument")
+
+    monkeypatch.setattr(rj_mod, "build_judge_provider", _raise)
+    monkeypatch.setattr(rj_mod.logger, "exception", lambda *a, **k: None)
+    with caplog.at_level("DEBUG", logger="brain.memory.relevance_judge"):
+        assert label_calibration_sample(store, judge=None) == 0
+    assert not any(
+        r.levelno >= 30 and "failed to construct the local judge provider" in r.getMessage()
+        for r in caplog.records
+    )

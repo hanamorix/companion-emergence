@@ -2304,6 +2304,9 @@ def test_fresh_store_has_calibration_log_table() -> None:
         "local_judge_label",
         "haiku_label",
         "score_scale",  # F2b (#276 §5): raw-vs-normalized score scale marker
+        "local_judge_raw_score",  # F2c inc1 (spec §3 Addition A): raw judge score/logit
+        "candidate_docs",  # F2c inc1 (spec §3 Addition B): recall-time doc-text snapshot
+        "selftune_consumed_at",  # F2c inc2 red-team fix F-1: per-row weekly-selftune consumed marker
     }
     store.close()
 
@@ -2595,6 +2598,172 @@ def test_write_calibration_labels_removes_row_from_the_unlabeled_sample(store: M
     store.write_calibration_labels(row["id"], ["relevant"], [None])
 
     assert store.sample_unlabeled_calibration_rows(limit=10) == []
+
+
+# ---------------------------------------------------------------------------
+# F2c inc1 (data foundation only, spec §3): the two additive columns —
+# `candidate_docs` (Addition B, via `log_calibration_sample`) and
+# `local_judge_raw_score` (Addition A, via `write_calibration_labels`).
+# ---------------------------------------------------------------------------
+
+
+def test_log_calibration_sample_persists_candidate_docs_aligned_with_ids(
+    store: MemoryStore,
+) -> None:
+    """BITE: `candidate_docs` round-trips as JSON, positionally 1:1 with
+    `candidate_ids` — not merely present, but the RIGHT string at the RIGHT
+    position."""
+    store.log_calibration_sample(
+        query="q",
+        candidate_ids=["a", "b", "c"],
+        reranker_scores=[1.0, 2.0, 3.0],
+        reranker_model_id="m",
+        candidate_docs=["doc for a", "doc for b", "doc for c"],
+    )
+    row = store._conn.execute(
+        "SELECT candidate_ids, candidate_docs FROM calibration_log"
+    ).fetchone()
+    ids = json.loads(row["candidate_ids"])
+    docs = json.loads(row["candidate_docs"])
+    assert docs == ["doc for a", "doc for b", "doc for c"]
+    assert dict(zip(ids, docs, strict=True)) == {
+        "a": "doc for a", "b": "doc for b", "c": "doc for c",
+    }
+
+
+def test_log_calibration_sample_leaves_candidate_docs_null_when_not_passed(
+    store: MemoryStore,
+) -> None:
+    """A caller with no doc text in hand (every existing call site before
+    this increment) keeps working unchanged — `candidate_docs` defaults to
+    SQL NULL, never an empty-list placeholder that could be mistaken for
+    'zero candidates had text'."""
+    store.log_calibration_sample(
+        query="q", candidate_ids=["a"], reranker_scores=[1.0], reranker_model_id="m"
+    )
+    row = store._conn.execute("SELECT candidate_docs FROM calibration_log").fetchone()
+    assert row["candidate_docs"] is None
+
+
+def test_write_calibration_labels_persists_raw_scores_aligned_with_ids(
+    store: MemoryStore,
+) -> None:
+    """BITE: `local_judge_raw_score` round-trips the RAW judge logits (not
+    the derived relevant/irrelevant labels), positionally 1:1 with
+    `candidate_ids`/`local_judge_label`."""
+    store.log_calibration_sample(
+        query="q", candidate_ids=["a", "b", "c"], reranker_scores=[1.0, 2.0, 3.0],
+        reranker_model_id="m",
+    )
+    (row,) = store.sample_unlabeled_calibration_rows(limit=10)
+
+    store.write_calibration_labels(
+        row["id"],
+        ["relevant", "irrelevant", "relevant"],
+        [None, "irrelevant", None],
+        local_judge_raw_score=[3.14159, -2.71828, 0.0],
+    )
+
+    written = store._conn.execute(
+        "SELECT local_judge_label, local_judge_raw_score FROM calibration_log WHERE id = ?",
+        (row["id"],),
+    ).fetchone()
+    labels = json.loads(written["local_judge_label"])
+    raw_scores = json.loads(written["local_judge_raw_score"])
+    assert raw_scores == [3.14159, -2.71828, 0.0], "raw logits, not the derived labels"
+    assert raw_scores != labels
+    assert len(raw_scores) == len(labels)
+
+
+def test_write_calibration_labels_leaves_raw_score_null_when_not_passed(
+    store: MemoryStore,
+) -> None:
+    """Existing callers that don't pass `local_judge_raw_score` (every
+    write_calibration_labels call site/test that pre-dates this increment)
+    keep working unchanged."""
+    store.log_calibration_sample(
+        query="q", candidate_ids=["a"], reranker_scores=[1.0], reranker_model_id="m"
+    )
+    (row,) = store.sample_unlabeled_calibration_rows(limit=10)
+    store.write_calibration_labels(row["id"], ["relevant"], [None])
+    written = store._conn.execute(
+        "SELECT local_judge_raw_score FROM calibration_log WHERE id = ?", (row["id"],)
+    ).fetchone()
+    assert written["local_judge_raw_score"] is None
+
+
+def test_existing_store_migrates_in_f2c_data_foundation_columns(tmp_path) -> None:
+    """F2c inc1 (spec §3, I9): simulate a pre-F2c persona — manually create
+    the OLD `calibration_log` schema (no `local_judge_raw_score`/
+    `candidate_docs` columns, but WITH `score_scale`, i.e. a post-F2b
+    pre-F2c persona) with a pre-existing row already in it, then open
+    `MemoryStore`: both columns must be added without error, a legacy row
+    must read back with NULL in both (no honest backfill value exists for
+    data that was never captured — I9), and the migration must be a no-op
+    on a SECOND open (idempotent, mirrors the score_scale precedent)."""
+    db_path = tmp_path / "memories.db"
+    old_schema = """
+    CREATE TABLE calibration_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        logged_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        day_bucket TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d', 'now')),
+        query TEXT NOT NULL,
+        candidate_ids TEXT NOT NULL,
+        reranker_scores TEXT NOT NULL,
+        reranker_model_id TEXT NOT NULL,
+        local_judge_label TEXT,
+        haiku_label TEXT,
+        score_scale TEXT NOT NULL DEFAULT 'raw'
+    );
+    """
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(old_schema)
+    conn.execute(
+        "INSERT INTO calibration_log "
+        "(query, candidate_ids, reranker_scores, reranker_model_id, score_scale) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (
+            "a pre-F2c logged query", json.dumps(["old-id"]), json.dumps([1.23]),
+            "old-model", "normalized",
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    store = MemoryStore(db_path)  # must not raise
+    cols = {row[1] for row in store._conn.execute("PRAGMA table_info(calibration_log)").fetchall()}
+    assert "local_judge_raw_score" in cols
+    assert "candidate_docs" in cols
+
+    legacy_row = store._conn.execute(
+        "SELECT query, local_judge_raw_score, candidate_docs FROM calibration_log WHERE query = ?",
+        ("a pre-F2c logged query",),
+    ).fetchone()
+    assert legacy_row is not None, "the pre-existing row must survive the migration"
+    assert legacy_row["local_judge_raw_score"] is None
+    assert legacy_row["candidate_docs"] is None
+    store.close()
+
+    # Idempotent: opening a SECOND time (columns already present) must not
+    # raise and must not disturb the legacy row.
+    store2 = MemoryStore(db_path)
+    legacy_row2 = store2._conn.execute(
+        "SELECT local_judge_raw_score, candidate_docs FROM calibration_log WHERE query = ?",
+        ("a pre-F2c logged query",),
+    ).fetchone()
+    assert legacy_row2["local_judge_raw_score"] is None
+    assert legacy_row2["candidate_docs"] is None
+    store2.close()
+
+
+def test_fresh_store_calibration_log_columns_include_f2c_data_foundation(
+    store: MemoryStore,
+) -> None:
+    """A brand-new store's `calibration_log` already has both F2c inc1
+    columns from CREATE TABLE (not just via migration)."""
+    cols = {row[1] for row in store._conn.execute("PRAGMA table_info(calibration_log)").fetchall()}
+    assert "local_judge_raw_score" in cols
+    assert "candidate_docs" in cols
 
 
 # ---------------------------------------------------------------------------

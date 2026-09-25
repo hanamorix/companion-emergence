@@ -71,6 +71,7 @@ def _isolating_kwargs(**overrides):
         "compaction_interval_s": None,
         "calibration_interval_s": None,
         "interest_sweep_interval_s": None,
+        "judge_selftune_interval_s": None,
         "kindled_link_enabled": False,
     }
     kwargs.update(overrides)

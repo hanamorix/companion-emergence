@@ -60,6 +60,42 @@ CALIBRATION_LOG_RETENTION_WINDOW_DAYS: float = tunables.register(
 CALIBRATION_SCORE_SCALE = "normalized"
 
 
+def _haiku_decision_count(haiku_label_json: str | None) -> int:
+    """Number of Haiku decisions a `calibration_log` row carries: its non-None
+    `haiku_label` POSITIONS (F2c spec §2's pinned counting unit — NOT "the
+    column is non-NULL", since `write_calibration_labels` writes an all-None
+    list on every judge-labeled row). The ONE definition shared by the weekly
+    gate (`count_new_haiku_decisions`) and the one-week retention hold
+    (`_delete_unheld_before`, F2c inc8), so the two can never drift."""
+    if haiku_label_json is None:
+        return 0
+    return sum(1 for label in json.loads(haiku_label_json) if label is not None)
+
+
+def _selftune_week_cutoff(now: datetime | None) -> str:
+    """The rolling one-week cutoff (F2c inc8, spec §3/AC14): `now` minus ONE
+    weekly self-tune cadence (`judge_selftune.JUDGE_TUNE_INTERVAL_HOURS`, read
+    at call time — derived from the weekly cadence, not a second hand-typed
+    "7 days"), rendered in the exact text format SQLite's `CURRENT_TIMESTAMP`
+    writes into `calibration_log.logged_at` (`YYYY-MM-DD HH:MM:SS`, UTC), so a
+    plain string compare against `logged_at` is a correct time compare.
+
+    Rolling on `logged_at` (a timestamp), not `day_bucket` (a date): a date
+    compare would keep a row up to ~8 days, and the owner's rule is that
+    nothing is kept past a week. Note: this follows the weekly-cadence
+    CONSTANT; `supervisor.run_folded`'s `judge_selftune_interval_s` defaults
+    to that same constant and differs from it only in tests.
+
+    Imported lazily so this module gains no import-time dependency on
+    `judge_selftune` (which imports this module's siblings)."""
+    from brain.memory import judge_selftune
+
+    ref = now if now is not None else datetime.now(UTC)
+    if ref.tzinfo is not None:
+        ref = ref.astimezone(UTC)
+    return (ref - timedelta(hours=judge_selftune.JUDGE_TUNE_INTERVAL_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _coerce_utc(ts: str) -> datetime:
     """Parse ISO-8601 timestamp; coerce tz-naive values to UTC.
 
@@ -300,7 +336,11 @@ CREATE TABLE IF NOT EXISTS cluster_centroids (
 -- supervisor.py) calls `MemoryStore.prune_calibration_log` every firing, so
 -- this table stays bounded to a rolling `day_bucket` window instead of
 -- growing unbounded — see CALIBRATION_LOG_RETENTION_WINDOW_DAYS above for
--- the window's FINALIZED (inc7) value and derivation.
+-- the window's FINALIZED (inc7) value and derivation. F2c inc8: a row that
+-- carries an untrained Haiku decision is HELD past that window for up to one
+-- weekly self-tune cadence (see `prune_calibration_log`,
+-- `clear_selftune_held_rows` and the `calibration_log_retention_state` table
+-- below); F2a's own reads never see a held row.
 -- `score_scale` (F2b, #276 §5): marks whether `reranker_scores` on this row
 -- is on the PRE-F2b raw reranker-score scale or the POST-F2b per-query
 -- anchor-normalized scale (`brain.memory.reranker.normalize_against_
@@ -316,6 +356,46 @@ CREATE TABLE IF NOT EXISTS cluster_centroids (
 -- candidate for F2c/inc3's deploy-time one-time-recalibration trigger
 -- (spec §6) — "has a normalized-scale row ever been logged" is exactly a
 -- deploy-detection signal, though wiring that trigger is out of scope here.
+-- `local_judge_raw_score` (F2c inc1, data foundation only — spec §3
+-- Addition A): the bge judge's RAW per-candidate score/logit, JSON-encoded
+-- and positionally aligned with `candidate_ids` (same convention as
+-- `reranker_scores`/`local_judge_label`). Today `relevance_judge.
+-- label_calibration_sample` computes this score (`judge.score(query,
+-- mem.content)`) and discards it after deriving the label — F2c's
+-- knob-refit (later increment) needs the raw score itself to fit a
+-- threshold/Platt mapping, not just the derived label. Nullable: NULL on
+-- every legacy row and on any position this judge pass never scored
+-- (`"unknown"`/`"error"` sentinels — see `write_calibration_labels`).
+-- `candidate_docs` (F2c inc1, data foundation only — spec §3 Addition B):
+-- a JSON list of candidate DOC-TEXT strings, positionally aligned with
+-- `candidate_ids`, snapshotted at RECALL time (`log_calibration_sample`'s
+-- caller, `semantic_recall.run_semantic_recall`, already holds this text
+-- as `real_documents` that turn) rather than re-fetched from `memories` at
+-- label time — a memory can be edited/pruned/forgotten in the days between
+-- being logged and being labeled, so a label-time re-fetch would drift
+-- from what the judge/reranker actually scored. F2c's later LoRA/full-FT
+-- tiers need `(query, doc, label)` triples built from this exact snapshot.
+-- Nullable: NULL on every legacy row (I9 — legacy import stays working).
+-- `selftune_consumed_at` (F2c inc2, red-team fix F-1, spec §2 consume-once
+-- contract): per-ROW consumed marker for F2c's weekly judge self-tune gate,
+-- replacing the `judge_selftune_state.consumed_through_id` MAX(id)
+-- watermark that F-1 found could strand an out-of-order low-id label (see
+-- that table's comment above for the mechanism). NULL means "not yet
+-- consumed by a firing weekly tick"; `MemoryStore.mark_selftune_consumed`
+-- is the only writer, stamping the tick's wall-clock time on every row it
+-- scanned this firing. Per-ROW (not per-position) granularity suffices:
+-- `write_calibration_labels` is the ONLY writer of `local_judge_label`/
+-- `haiku_label`, and it writes a row's COMPLETE `haiku_label` list in one
+-- atomic UPDATE — `sample_unlabeled_calibration_rows`'s `WHERE
+-- local_judge_label IS NULL` clause then permanently excludes that row from
+-- ever being sampled/labeled again (see that method's own docstring), so a
+-- labeled row's `haiku_label` list never gains or loses non-None positions
+-- after the fact. `MemoryStore.count_new_haiku_decisions` reads unconsumed
+-- rows (`selftune_consumed_at IS NULL`) and sums non-None `haiku_label`
+-- positions across them — the gate's pinned counting unit (spec §2/AC3).
+-- Nullable, no migration-time backfill: every pre-existing row reads as
+-- unconsumed, which is the honest/safe default (never silently "already
+-- counted").
 CREATE TABLE IF NOT EXISTS calibration_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     logged_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -326,9 +406,29 @@ CREATE TABLE IF NOT EXISTS calibration_log (
     reranker_model_id TEXT NOT NULL,
     local_judge_label TEXT,
     haiku_label TEXT,
-    score_scale TEXT NOT NULL DEFAULT 'raw'
+    score_scale TEXT NOT NULL DEFAULT 'raw',
+    local_judge_raw_score TEXT,
+    candidate_docs TEXT,
+    selftune_consumed_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_calibration_log_day_bucket ON calibration_log(day_bucket);
+
+-- F2c inc8 (spec §3 "Retention vs the weekly tick", AC14/AC10): the F2a VIEW
+-- CUTOFF — the latest (high-water) `day_bucket` cutoff F2a's own 3-day
+-- retention rule has applied (`prune_calibration_log`). Rows that carry an
+-- untrained Haiku decision are HELD past that cutoff for up to one weekly
+-- cadence so the weekly judge self-tune can count and train on them; every
+-- row with `day_bucket` below this cutoff therefore exists ONLY because of
+-- that hold (before inc8 the same prune deleted all of them), and F2a's floor
+-- fit reader (`labeled_calibration_pairs`) ignores it, so F2a sees exactly
+-- the rows it saw before inc8. Single row (`id = 1`), no seed: an absent row
+-- means "no prune has run since inc8" ⇒ no row is held ⇒ no filter. A
+-- separate table, not a column, so `calibration_log`'s shape is unchanged
+-- (CREATE TABLE IF NOT EXISTS: legacy-safe, I9).
+CREATE TABLE IF NOT EXISTS calibration_log_retention_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    f2a_view_cutoff_bucket TEXT NOT NULL
+);
 
 -- F2a (#250 inc7): the DB-adaptive abstention floor itself (spec Section 7)
 -- — the per-persona replacement for the hardcoded
@@ -377,6 +477,71 @@ CREATE TABLE IF NOT EXISTS reranker_floor_calibration (
     is_cold_start INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     score_scale TEXT NOT NULL DEFAULT 'raw'
+);
+
+-- F2c (inc2, red-team fix F-1, spec §2): per-persona weekly judge self-tune
+-- MARKER — mirrors `reranker_floor_calibration`'s posture immediately above
+-- (a small per-persona artifact table in memories.db, never a side file,
+-- I1). `last_trained_at` is the wall-clock timestamp of the most recent
+-- ACCEPTED weekly firing (NULL before the first one). Keyed by
+-- `judge_model_id` (mirrors `reranker_floor_calibration`'s
+-- `reranker_model_id` keying) so a future local-judge model swap never
+-- mixes one model's progress with another's. `CREATE TABLE IF NOT EXISTS`
+-- (legacy-safe, I9): a fresh table needs no ALTER/migration path, and an
+-- absent row (fresh install/pre-F2c persona) reads as "never trained" via
+-- `MemoryStore.get_judge_selftune_state` returning `None`, not an error.
+--
+-- inc2 ORIGINALLY also carried a `consumed_through_id` MAX(id) watermark
+-- column here. Red-team F-1 found that watermark VIOLATES the pinned
+-- consume-once contract (spec §2): `sample_unlabeled_calibration_rows`
+-- samples unlabeled rows via `ORDER BY RANDOM() LIMIT`, so a LOW-id row can
+-- be judge-labeled (and get its `haiku_label` written) in a LATER week than
+-- a higher-id row — a monotonic `MAX(id)` cursor would then permanently
+-- strand that low-id row's Haiku decision below the watermark, uncounted
+-- forever. The fix moves the consumed marker to PER-ROW granularity, on
+-- `calibration_log.selftune_consumed_at` itself (see that column's comment
+-- below) — this table no longer needs a cursor column, only the cadence
+-- timestamp.
+CREATE TABLE IF NOT EXISTS judge_selftune_state (
+    judge_model_id TEXT PRIMARY KEY,
+    last_trained_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- F2c (inc3, spec §5): per-persona JUDGE KNOB-REFIT calibration — the
+-- fitted Platt slope+intercept `judge_selftune.fit_platt_knob` derives from
+-- this persona's accumulated (judge-raw-score, effective-label) pairs on a
+-- firing weekly tick, which `relevance_judge.label_for_score` can apply
+-- instead of its fixed sigmoid-0.5 default. Mirrors `judge_selftune_state`
+-- immediately above in every respect (a tiny per-persona artifact table in
+-- memories.db, never a side file, I1; keyed by `judge_model_id` so a
+-- future local-judge model swap never mixes one model's fitted knob with
+-- another's; `CREATE TABLE IF NOT EXISTS`, legacy-safe, I9). An absent row
+-- (fresh install, or any persona that has never had a weekly tick complete
+-- a knob-refit) reads as `None` via `MemoryStore.get_judge_knob_calibration`
+-- — ABSENT-SAFE per spec §5 ("absent params -> unchanged fixed behavior"),
+-- never an error and never a silently-fabricated default.
+-- Per-persona-by-construction (AC11): each persona keeps its own
+-- memories.db (I1), so this table can never bleed across personas — the
+-- DATABASE FILE itself is the isolation boundary, same as every other
+-- per-persona table here, no persona-scoping column needed.
+-- F2c INC4a wires the LOAD side: `relevance_judge.label_calibration_
+-- sample` reads this table (via `get_judge_knob_calibration`, keyed by
+-- the live judge's own `model_id()`) once per daily-calibration-tick pass
+-- and threads the result into every `label_for_score` call that pass
+-- makes, so the live judge pass now genuinely applies a persona's own
+-- fitted knob once inc3's weekly tick has written one.
+-- F2c INC9 (spec §5 knob-first order): the key names the exact model the knob
+-- was fit on: the plain base model id for the base judge, or
+-- `<base id>@<checkpoint dir name>` for a persona's tuned checkpoint
+-- (`relevance_judge.judge_knob_key`). The weekly tick writes a new
+-- checkpoint's row BEFORE swapping it in and deletes the previous one's
+-- after; rows of checkpoints the pointer does not name are reaped next tick.
+CREATE TABLE IF NOT EXISTS judge_knob_calibration (
+    judge_model_id TEXT PRIMARY KEY,
+    slope REAL NOT NULL,
+    intercept REAL NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 -- External-content FTS5 shadow index (P2 relevance overhaul). `memories` is a
@@ -578,6 +743,29 @@ class MemoryStore:
         if "score_scale" not in existing_calibration_log:
             self._conn.execute(
                 "ALTER TABLE calibration_log ADD COLUMN score_scale TEXT NOT NULL DEFAULT 'raw'"
+            )
+        # F2c inc1 (data foundation only, spec §3): same idempotent
+        # existing-columns-check pattern, scoped to `calibration_log`'s two
+        # new additive columns. Both are nullable with NO default (unlike
+        # `score_scale`'s 'raw' default) — there is no honest backfill
+        # value for a pre-F2c row's raw judge score or doc-text snapshot
+        # (unlike `score_scale`, where "every prior row was on the raw
+        # scale" is a true fact); NULL correctly means "not captured for
+        # this legacy row" (I9 — legacy rows keep reading, just without
+        # this data).
+        if "local_judge_raw_score" not in existing_calibration_log:
+            self._conn.execute(
+                "ALTER TABLE calibration_log ADD COLUMN local_judge_raw_score TEXT"
+            )
+        if "candidate_docs" not in existing_calibration_log:
+            self._conn.execute("ALTER TABLE calibration_log ADD COLUMN candidate_docs TEXT")
+        # F2c inc2 red-team fix F-1: per-row consumed marker for the weekly
+        # judge self-tune gate (see the column's own comment on the CREATE
+        # TABLE above). Same idempotent pattern; NULL/unconsumed for every
+        # pre-existing row is the honest default.
+        if "selftune_consumed_at" not in existing_calibration_log:
+            self._conn.execute(
+                "ALTER TABLE calibration_log ADD COLUMN selftune_consumed_at TEXT"
             )
         # F2b (#276 §6): same migration shape, scoped to
         # `reranker_floor_calibration` — a legacy DB's persisted floor row
@@ -947,6 +1135,7 @@ class MemoryStore:
         candidate_ids: list[str],
         reranker_scores: list[float],
         reranker_model_id: str,
+        candidate_docs: list[str] | None = None,
     ) -> None:
         """Log one recall turn's (query, candidate ids, reranker scores) row
         to `calibration_log` (F2a #250 inc4).
@@ -958,6 +1147,19 @@ class MemoryStore:
         output (same order, 1:1) — this method does no scoring of its own.
         `reranker_model_id` is stamped per row so a later floor-derivation
         pass can filter to one reranker's score scale.
+
+        `candidate_docs` (F2c inc1, data foundation only — spec §3 Addition
+        B): the RECALL-TIME candidate doc-text snapshot, positionally
+        aligned with `candidate_ids` 1:1 — the caller's already-in-hand
+        content strings for this turn's candidates (e.g. `semantic_recall.
+        run_semantic_recall`'s `real_documents`, sliced the same way
+        `candidate_ids` itself is), never a re-fetch from `memories` at some
+        later time (a memory can be edited/pruned/forgotten between being
+        logged and being labeled/trained on, so a later re-fetch would
+        silently drift from what was actually scored this turn). Optional
+        and defaults to `None` (stored as SQL NULL) so callers that don't
+        have doc text in hand keep working unchanged — this method does no
+        fetching of its own.
 
         F2b (#276 §5): `reranker_scores` must be the caller's already-
         NORMALIZED per-query anchor-corrected value (`brain.memory.
@@ -978,14 +1180,16 @@ class MemoryStore:
         """
         self._conn.execute(
             "INSERT INTO calibration_log "
-            "(query, candidate_ids, reranker_scores, reranker_model_id, score_scale) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "(query, candidate_ids, reranker_scores, reranker_model_id, score_scale, "
+            "candidate_docs) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
             (
                 query,
                 json.dumps(list(candidate_ids)),
                 json.dumps([float(s) for s in reranker_scores]),
                 reranker_model_id,
                 CALIBRATION_SCORE_SCALE,
+                json.dumps(list(candidate_docs)) if candidate_docs is not None else None,
             ),
         )
         self._conn.commit()
@@ -1010,6 +1214,18 @@ class MemoryStore:
         above), so a lexicographic string comparison against the cutoff date
         is a correct date comparison with no parsing needed.
 
+        F2c inc8 — the one-week Haiku HOLD (spec §3 "Retention vs the weekly
+        tick", AC14): a row outside this window is still KEPT when it carries
+        a Haiku decision (≥1 non-None `haiku_label` position) that the weekly
+        judge self-tune has not yet trained on (`selftune_consumed_at IS
+        NULL`) and it was logged less than one weekly cadence ago
+        (`_selftune_week_cutoff`). Every other row outside the window is
+        deleted exactly as before; this method never deletes a row the
+        window keeps. It also records the window's cutoff as the F2a VIEW
+        CUTOFF (high-water, `calibration_log_retention_state`) so F2a's floor
+        fit ignores held rows and sees exactly what it saw before inc8
+        (AC10; see `labeled_calibration_pairs`).
+
         Called from the daily calibration tick (`_run_calibration_tick` in
         `brain/bridge/supervisor.py`), off the hot path (I6) — never from a
         per-turn recall path. Returns the number of rows deleted (0 if none
@@ -1020,12 +1236,78 @@ class MemoryStore:
                 "calibration.retention_window_days", CALIBRATION_LOG_RETENTION_WINDOW_DAYS
             )
         ref = now if now is not None else datetime.now(UTC)
+        if ref.tzinfo is not None:
+            # F2c inc9: same normalization as `_selftune_week_cutoff`, so a
+            # tz-aware non-UTC `now` cuts on its UTC date (identity for UTC).
+            ref = ref.astimezone(UTC)
         cutoff_bucket = (ref - timedelta(days=window_days)).strftime("%Y-%m-%d")
-        cur = self._conn.execute(
-            "DELETE FROM calibration_log WHERE day_bucket < ?", (cutoff_bucket,)
+        stored = self._f2a_view_cutoff_bucket()
+        view = cutoff_bucket if stored is None else max(stored, cutoff_bucket)
+        self._conn.execute(
+            "INSERT INTO calibration_log_retention_state (id, f2a_view_cutoff_bucket) VALUES (1, ?) "
+            "ON CONFLICT(id) DO UPDATE SET f2a_view_cutoff_bucket = excluded.f2a_view_cutoff_bucket",
+            (view,),
         )
+        deleted = self._delete_unheld_before(cutoff_bucket, now=ref)
         self._conn.commit()
-        return cur.rowcount
+        return deleted
+
+    def _f2a_view_cutoff_bucket(self) -> str | None:
+        """The stored F2a view cutoff (F2c inc8), or `None` when no prune has
+        run since inc8 (then no row is held and F2a reads are unfiltered)."""
+        row = self._conn.execute(
+            "SELECT f2a_view_cutoff_bucket FROM calibration_log_retention_state WHERE id = 1"
+        ).fetchone()
+        return row["f2a_view_cutoff_bucket"] if row is not None else None
+
+    def _delete_unheld_before(self, cutoff_bucket: str, *, now: datetime | None) -> int:
+        """Delete every `calibration_log` row with `day_bucket < cutoff_bucket`
+        that the one-week Haiku hold does NOT keep (F2c inc8). Held = carries
+        ≥1 Haiku decision (`_haiku_decision_count`, the gate's own unit) AND is
+        unconsumed AND `logged_at >= _selftune_week_cutoff(now)`. Does not
+        commit (callers do). Returns the number of rows deleted."""
+        week_cutoff = _selftune_week_cutoff(now)
+        cur = self._conn.execute(
+            "DELETE FROM calibration_log WHERE day_bucket < ? AND ("
+            "haiku_label IS NULL OR selftune_consumed_at IS NOT NULL OR logged_at < ?)",
+            (cutoff_bucket, week_cutoff),
+        )
+        deleted = cur.rowcount
+        # The rows left below the cutoff all have a non-NULL `haiku_label`, are
+        # unconsumed and are inside the week; drop the ones whose list carries
+        # no Haiku decision at all (all-None — judge-labeled with no tie-break).
+        remaining = self._conn.execute(
+            "SELECT id, haiku_label FROM calibration_log WHERE day_bucket < ?", (cutoff_bucket,)
+        ).fetchall()
+        no_decision = [(int(r["id"]),) for r in remaining if _haiku_decision_count(r["haiku_label"]) == 0]
+        if no_decision:
+            self._conn.executemany("DELETE FROM calibration_log WHERE id = ?", no_decision)
+            deleted += len(no_decision)
+        return deleted
+
+    def clear_selftune_held_rows(self, *, now: datetime | None = None) -> int:
+        """Clear the weekly self-tune's accumulated rows once it has trained on
+        them (F2c inc8, spec §3: "the accumulated rows are cleared once the
+        weekly self-tune has trained on them"). Deletes every row that exists
+        ONLY because of the one-week hold (`day_bucket` below the stored F2a
+        view cutoff) and no longer qualifies for it — consumed (= trained on,
+        spec §2) or past a week. Never touches a row inside F2a's own window
+        (F2a's daily fit may still read it, AC10): a consumed in-window row is
+        already out of the self-tune's accumulated list via its consumed
+        marker and is pruned later by F2a's own 3-day rule. An UNCONSUMED held
+        row (e.g. spec §5 2B's legacy doc-absent row on an ACCEPT week) stays
+        held and counted until it passes a week.
+
+        No-op (returns 0) when no view cutoff is stored: no prune has run
+        since inc8, so no row is held. Called only at the end of a FIRED
+        weekly self-tune tick (`judge_selftune._run_judge_selftune_tick`),
+        offline (I6). Returns the number of rows deleted."""
+        view = self._f2a_view_cutoff_bucket()
+        if view is None:
+            return 0
+        deleted = self._delete_unheld_before(view, now=now)
+        self._conn.commit()
+        return deleted
 
     def sample_unlabeled_calibration_rows(self, limit: int) -> list[dict[str, Any]]:
         """Return up to `limit` `calibration_log` rows with no
@@ -1066,7 +1348,11 @@ class MemoryStore:
         ]
 
     def write_calibration_labels(
-        self, row_id: int, local_judge_label: list[str], haiku_label: list[str | None]
+        self,
+        row_id: int,
+        local_judge_label: list[str],
+        haiku_label: list[str | None],
+        local_judge_raw_score: list[float | None] | None = None,
     ) -> None:
         """Write back the local judge's + Haiku tie-break's per-candidate
         labels for one `calibration_log` row (F2a #250 inc6, spec Section 6).
@@ -1079,13 +1365,31 @@ class MemoryStore:
         acceptance #7) — a `None` means "no override; the local judge's own
         provisional label at that position stands."
 
+        `local_judge_raw_score` (F2c inc1, data foundation only — spec §3
+        Addition A): the bge judge's RAW per-candidate score/logit, also
+        POSITIONALLY aligned with `candidate_ids`, stored as JSON in
+        `local_judge_raw_score`. A `None` entry means this position was
+        never scored (the `"unknown"`/`"error"` label sentinels — a deleted
+        candidate or a judge failure on that candidate, see
+        `relevance_judge.label_calibration_sample`), distinct from a real
+        score of 0.0. Optional and defaults to `None` (the whole column
+        stays NULL for this row) so a caller that doesn't have raw scores
+        in hand — e.g. any test exercising only the label-writing path —
+        keeps working unchanged.
+
         Once `local_judge_label` is non-NULL the row no longer matches
         `sample_unlabeled_calibration_rows`'s `WHERE` clause, so a row is
         never re-sampled or re-labeled on a later tick.
         """
         self._conn.execute(
-            "UPDATE calibration_log SET local_judge_label = ?, haiku_label = ? WHERE id = ?",
-            (json.dumps(local_judge_label), json.dumps(haiku_label), row_id),
+            "UPDATE calibration_log SET local_judge_label = ?, haiku_label = ?, "
+            "local_judge_raw_score = ? WHERE id = ?",
+            (
+                json.dumps(local_judge_label),
+                json.dumps(haiku_label),
+                json.dumps(local_judge_raw_score) if local_judge_raw_score is not None else None,
+                row_id,
+            ),
         )
         self._conn.commit()
 
@@ -1142,10 +1446,18 @@ class MemoryStore:
         write anything (mirrors `sample_unlabeled_calibration_rows`'s own
         read-only posture).
         """
+        # F2c inc8 (AC10): a row whose `day_bucket` is below the stored F2a view
+        # cutoff exists only because the weekly self-tune's one-week Haiku hold
+        # kept it (before inc8 the prune that set the cutoff deleted it), so
+        # this fit must not see it — otherwise, after a few idle days, a held
+        # Haiku-only day would become "the most recently completed day". No
+        # stored cutoff (no prune since inc8) ⇒ no row is held ⇒ no filter.
+        view = self._f2a_view_cutoff_bucket() or ""
         max_day_row = self._conn.execute(
             "SELECT MAX(day_bucket) AS max_day FROM calibration_log "
-            "WHERE reranker_model_id = ? AND local_judge_label IS NOT NULL AND score_scale = ?",
-            (reranker_model_id, CALIBRATION_SCORE_SCALE),
+            "WHERE reranker_model_id = ? AND local_judge_label IS NOT NULL AND score_scale = ? "
+            "AND day_bucket >= ?",
+            (reranker_model_id, CALIBRATION_SCORE_SCALE, view),
         ).fetchone()
         most_recent_day = max_day_row["max_day"] if max_day_row is not None else None
         if most_recent_day is None:
@@ -1153,8 +1465,8 @@ class MemoryStore:
         rows = self._conn.execute(
             "SELECT reranker_scores, local_judge_label, haiku_label FROM calibration_log "
             "WHERE reranker_model_id = ? AND local_judge_label IS NOT NULL "
-            "AND score_scale = ? AND day_bucket = ?",
-            (reranker_model_id, CALIBRATION_SCORE_SCALE, most_recent_day),
+            "AND score_scale = ? AND day_bucket = ? AND day_bucket >= ?",
+            (reranker_model_id, CALIBRATION_SCORE_SCALE, most_recent_day, view),
         ).fetchall()
         pairs: list[tuple[float, str]] = []
         for row in rows:
@@ -1342,6 +1654,485 @@ class MemoryStore:
             ),
         )
         self._conn.commit()
+
+    def get_judge_selftune_state(self, judge_model_id: str) -> dict[str, Any] | None:
+        """Return the PERSISTED `judge_selftune_state` marker row for
+        `judge_model_id`, or `None` if this persona's judge has never been
+        self-tuned yet (F2c inc2, spec §2). Persisted-only reader — mirrors
+        `get_persisted_reranker_floor`'s posture exactly: no derived/
+        bootstrap fallback here.
+
+        Red-team fix F-1: this row no longer carries a `consumed_through_id`
+        cursor — the consumed marker lives per-row on
+        `calibration_log.selftune_consumed_at` now (see that column's
+        comment). This table is purely the cadence-adjacent "last trained"
+        record; `MemoryStore.count_new_haiku_decisions` needs no state from
+        here to compute the gate's count.
+
+        Read-only: does not write or bump anything.
+        """
+        row = self._conn.execute(
+            "SELECT judge_model_id, last_trained_at, updated_at "
+            "FROM judge_selftune_state WHERE judge_model_id = ?",
+            (judge_model_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "judge_model_id": row["judge_model_id"],
+            "last_trained_at": row["last_trained_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def write_judge_selftune_state(
+        self,
+        judge_model_id: str,
+        *,
+        last_trained_at: datetime,
+    ) -> None:
+        """Upsert this persona's judge self-tune marker for `judge_model_id`
+        (F2c inc2, spec §2) — the ONLY write path into
+        `judge_selftune_state` (I1: a table in memories.db, never a side
+        file). `INSERT ... ON CONFLICT DO UPDATE` keyed on `judge_model_id`
+        (its PRIMARY KEY), mirroring `write_reranker_floor`'s upsert shape:
+        the row is replaced wholesale on each accepted weekly firing, never
+        accumulated (a current-state row, not a history of past firings).
+
+        Red-team fix F-1: no longer takes a `consumed_through_id` — the
+        per-row consumed marker (`calibration_log.selftune_consumed_at`,
+        written by `mark_selftune_consumed`) is the consume-once mechanism
+        now; this call is purely "stamp the last-trained timestamp."
+
+        Called only when the weekly tick's >handful gate FIRES (spec §2/§3)
+        — a tick that does not fire (not enough new Haiku-labeled decisions
+        yet) must NOT call this.
+        """
+        self._conn.execute(
+            "INSERT INTO judge_selftune_state "
+            "(judge_model_id, last_trained_at, updated_at) "
+            "VALUES (?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(judge_model_id) DO UPDATE SET "
+            "last_trained_at = excluded.last_trained_at, "
+            "updated_at = excluded.updated_at",
+            (judge_model_id, last_trained_at.isoformat()),
+        )
+        self._conn.commit()
+
+    def count_new_haiku_decisions(self, *, now: datetime | None = None) -> tuple[int, list[int]]:
+        """Count UNCONSUMED non-None `haiku_label` POSITIONS across
+        `calibration_log` (F2c inc2's >handful gate, spec §2/§3, pinned
+        counting unit) — the weekly judge self-tune tick's ONLY signal for
+        whether new Haiku tie-break decisions have accumulated.
+
+        Red-team fixes F-1 + F-2, both folded into this one method:
+
+        F-2 (counting unit): `haiku_label` is written (as a JSON list,
+        possibly all-`None` entries) by `write_calibration_labels` for
+        EVERY judge-labeled row, whether or not any individual candidate
+        position actually triggered a Haiku tie-break call that turn. A
+        `haiku_label IS NOT NULL` ROW count (inc2's original query) counts
+        newly JUDGE-LABELED rows, not oracle Haiku decisions — a week of
+        many judge-labeled rows whose lists are all-`None` would wrongly
+        fire the gate on zero new signal. This method instead parses each
+        candidate row's `haiku_label` JSON list and sums the non-`None`
+        POSITIONS across all of them — one Haiku decision = one non-`None`
+        position (spec §2's pinned unit, the SAME unit §4's 2/3-1/3 split
+        rations against).
+
+        F-1 (consume-once): the SQL scans `WHERE haiku_label IS NOT NULL
+        AND selftune_consumed_at IS NULL` — unconsumed rows, per-row,
+        rather than an `id > since_id` MAX(id) watermark. A watermark
+        strands a low-id row whose `haiku_label` is written OUT OF ORDER in
+        a later week (`sample_unlabeled_calibration_rows` samples via
+        `ORDER BY RANDOM() LIMIT`, so this is reachable); a per-row
+        unconsumed marker cannot strand it — the row simply stays in this
+        scan until some firing tick consumes it, however out of order its
+        label arrived.
+
+        Returns `(count, row_ids)`. `row_ids` is EVERY unconsumed
+        judge-labeled row this scan considered (including any whose
+        `haiku_label` list is all-`None` and so contributes 0 to `count`) —
+        the caller passes this full list to `mark_selftune_consumed` on a
+        firing tick, so an all-`None` row is marked consumed too (it has
+        already contributed everything it ever will: nothing) rather than
+        being re-scanned forever. `count == 0` implies `row_ids` may still
+        be non-empty (the all-`None`-rows case, AC3's bite); the caller
+        must not consume anything when the gate does not fire regardless of
+        `row_ids`'s contents (a non-firing tick leaves everything
+        untouched, spec §2).
+
+        F2c inc8 (spec §3 "Retention vs the weekly tick", AC14): only rows
+        logged within ONE weekly cadence of `now` (`_selftune_week_cutoff`,
+        rolling on `logged_at`; `now=None` = wall-clock) are scanned — "only
+        entries that are within a week are calibrated against". A decision
+        that rolled past a week before a slightly late run is intentionally
+        dropped: it is neither counted nor returned in `row_ids`, so nothing
+        trains on it (every training read is scoped to `row_ids`), and the
+        next prune deletes it.
+
+        Read-only: does not write or bump anything.
+        """
+        rows = self._conn.execute(
+            "SELECT id, haiku_label FROM calibration_log "
+            "WHERE haiku_label IS NOT NULL AND selftune_consumed_at IS NULL AND logged_at >= ?",
+            (_selftune_week_cutoff(now),),
+        ).fetchall()
+        count = 0
+        row_ids: list[int] = []
+        for row in rows:
+            count += _haiku_decision_count(row["haiku_label"])
+            row_ids.append(int(row["id"]))
+        return count, row_ids
+
+    def mark_selftune_consumed(self, row_ids: list[int], *, consumed_at: datetime) -> None:
+        """Stamp `calibration_log.selftune_consumed_at` for every id in
+        `row_ids` (F2c inc2, red-team fix F-1) — the consume-once
+        mechanism's ONLY writer. Called only on a firing weekly tick, with
+        the exact `row_ids` `count_new_haiku_decisions` returned for that
+        same tick (every unconsumed judge-labeled row it scanned), so a row
+        is marked consumed precisely once it has been accounted for in a
+        gate count — never before, never twice (once stamped, the row no
+        longer matches `count_new_haiku_decisions`'s `selftune_consumed_at
+        IS NULL` filter, so it can never contribute to a later gate count
+        again).
+
+        No-op on an empty list (nothing to stamp). Read the module-level
+        note above `_run_judge_selftune_tick` in `brain.memory.
+        judge_selftune` for why inc2 consumes without training yet, and
+        what inc3 must change about when this is called.
+        """
+        if not row_ids:
+            return
+        now_iso = consumed_at.isoformat()
+        self._conn.executemany(
+            "UPDATE calibration_log SET selftune_consumed_at = ? WHERE id = ?",
+            [(now_iso, row_id) for row_id in row_ids],
+        )
+        self._conn.commit()
+
+    def judge_knob_refit_pairs(self, row_ids: list[int]) -> list[tuple[float, str]]:
+        """`(judge_raw_score, effective_label)` pairs for F2c inc3's
+        knob-refit, built from the EXACT `calibration_log` row set a firing
+        weekly tick's gate considered (`count_new_haiku_decisions`'s
+        `row_ids` return) — never a fresh independent scan, so the pairs
+        the fit is built from and the rows a completed refit is allowed to
+        mark consumed are always the identical set (spec §2's "consume =
+        trained-on" contract).
+
+        REUSES `labeled_calibration_pairs`'s exact effective-label
+        precedence (the Haiku tie-break OVERRIDES the local judge at the
+        ambiguous-band position it resolved; else the local judge's own
+        label stands) and its `"unknown"`/`"error"` skip — the same
+        pattern, not reimplemented, per that method's own docstring — but
+        reads `local_judge_raw_score` (F2c inc1, the bge JUDGE's own raw
+        score) instead of `reranker_scores` (jina's, F2a's floor-fit
+        input): the knob-refit recalibrates the JUDGE's own
+        score-to-label mapping, so it must fit on the JUDGE's score, never
+        the reranker's. A `None` raw-score position (the
+        `"unknown"`/`"error"` write sentinel in `write_calibration_labels`,
+        or any row logged before F2c inc1 added this column) is skipped —
+        no score to fit against. Not day-scoped (unlike
+        `labeled_calibration_pairs`): the weekly tick accumulates across
+        however many days elapsed since the last consume, not one day.
+
+        Read-only: does not write or bump anything. Empty `row_ids` or no
+        usable positions returns `[]` — `fit_platt_knob` raises on empty
+        input, which `_run_judge_selftune_tick` treats as "no train" (spec
+        AC3's pinned consume-only-on-a-completed-tune contract).
+        """
+        if not row_ids:
+            return []
+        placeholders = ",".join("?" for _ in row_ids)
+        rows = self._conn.execute(
+            "SELECT local_judge_raw_score, local_judge_label, haiku_label "
+            f"FROM calibration_log WHERE id IN ({placeholders})",
+            row_ids,
+        ).fetchall()
+        pairs: list[tuple[float, str]] = []
+        for row in rows:
+            if row["local_judge_raw_score"] is None or row["local_judge_label"] is None:
+                continue
+            raw_scores = json.loads(row["local_judge_raw_score"])
+            local_labels = json.loads(row["local_judge_label"])
+            haiku_labels = (
+                json.loads(row["haiku_label"])
+                if row["haiku_label"] is not None
+                else [None] * len(local_labels)
+            )
+            for raw_score, local_label, haiku_label in zip(
+                raw_scores, local_labels, haiku_labels, strict=False
+            ):
+                if raw_score is None:
+                    continue
+                effective = haiku_label if haiku_label is not None else local_label
+                if effective in ("relevant", "irrelevant"):
+                    pairs.append((float(raw_score), effective))
+        return pairs
+
+    def judge_lora_training_triples(self, row_ids: list[int]) -> list[tuple[str, str, str]]:
+        """`(query, doc, label)` triples for F2c inc5b's LoRA/full-FT
+        weight-retrain tiers (`judge_lora.build_lora_retrain_fn` +
+        `judge_eval.split_train_test`) — the Haiku-ONLY extraction
+        `judge_eval.py`'s own module docstring flags as owed before those
+        tiers can be wired for real.
+
+        NARROWER than `judge_knob_refit_pairs` above: a position qualifies
+        here ONLY when `haiku_label[i]` is non-None — the SAME pinned
+        counting unit spec §2 pins for the weekly gate and
+        `count_new_haiku_decisions` counts ("the accumulated Haiku
+        decisions", individual Haiku-labeled (query, doc) pairs) — never a
+        position where only the local judge labeled. `judge_knob_refit_
+        pairs` intentionally includes those local-only positions too (more
+        training signal, no guard needed for a knob refit); reusing it
+        unchanged here would leak non-oracle-backed positions into the
+        LoRA/full-FT champion/challenger eval split, per `judge_eval.py`'s
+        own "Production NOTE for inc5/6" docstring.
+
+        `label` is `haiku_label[i]` itself, with no local-label precedence
+        to apply — unlike `labeled_calibration_pairs`/`judge_knob_refit_
+        pairs`'s "Haiku overrides local" logic (which only matters when a
+        position might NOT have a Haiku label), every position this method
+        emits already IS a Haiku position, so Haiku's label is simply the
+        effective label. `doc` is `candidate_docs[i]` — the RECALL-TIME
+        doc-text snapshot (`log_calibration_sample`'s `candidate_docs`
+        param, F2c inc1), never a re-fetch from `memories` at train time (a
+        candidate can be edited/forgotten between being logged and being
+        trained on — see that method's own docstring for why a re-fetch
+        would silently drift).
+
+        A position is emitted only when ALL of: `haiku_label[i]` is not
+        None; `haiku_label[i]` is `"relevant"`/`"irrelevant"` (defensive —
+        in production a `haiku_label` entry is never the `"unknown"`/
+        `"error"` sentinel, those only ever land in `local_judge_label`;
+        see `relevance_judge.label_calibration_sample`'s per-candidate
+        loop, which always pairs an `"unknown"`/`"error"` local label with
+        a `None` haiku_label at that same position); and `candidate_docs[i]`
+        is present and non-empty. That last check also SKIPS a LEGACY row:
+        `candidate_docs` was added in F2c inc1 with no migration-time
+        backfill (see the `CREATE TABLE calibration_log` comment above) and
+        `log_calibration_sample`'s `candidate_docs` parameter is optional,
+        so a row logged before inc1 — or by any caller that never passed
+        doc text — can have a non-None `haiku_label` list but a NULL
+        `candidate_docs` column entirely. No doc text means no triple,
+        however good the label is.
+
+        `row_ids` is the exact scoping contract every F2c weekly-tick
+        data-assembly method on this class shares (`judge_knob_refit_pairs`
+        above): the caller passes the SAME row_ids `count_new_haiku_
+        decisions` returned for a firing tick, so the triples a tier trains
+        on and the rows that tick is allowed to mark consumed are always
+        the identical set.
+
+        Returns `list[(query, doc, label)]`, ordered by row id then
+        candidate position — deterministic and stable across repeated
+        calls with the same `row_ids`, which matters because `judge_eval.
+        split_train_test` partitions PURELY by position and documents that
+        a caller wanting a reproducible split across re-fetches should sort
+        by a stable key first; ordering by row id here does exactly that
+        without asking the caller to re-sort. The tuple shape is the exact
+        one `judge_lora.LabeledTriple` names (`tuple[str, str, str]`) — this
+        method does not import that alias itself, since `store.py` sits
+        below `judge_lora.py` in the dependency graph and this return type
+        needs no torch-adjacent import to express — and slots straight into
+        `judge_eval.split_train_test`'s generic `Sequence[T]` for the
+        2/3-1/3 train/test split, and from there into `judge_lora.
+        build_lora_retrain_fn`'s `Sequence[LabeledTriple]` training input.
+
+        Defensively skips a malformed row — unparseable `haiku_label`/
+        `candidate_docs` JSON — fail-soft, never raising into the caller
+        (this method's own posture; `judge_knob_refit_pairs` above has no
+        such guard and would raise `json.JSONDecodeError` into its own
+        caller on malformed JSON, so this is not a mirror of it). A row
+        whose `haiku_label`/`candidate_docs` lists come back mismatched in
+        length is not treated as malformed: `zip(..., strict=False)` just
+        truncates to the shorter list, so the aligned prefix still emits
+        triples and the extra positions are silently dropped. Empty
+        `row_ids` or no usable positions returns `[]`.
+
+        Read-only: does not write or bump anything.
+        """
+        if not row_ids:
+            return []
+        placeholders = ",".join("?" for _ in row_ids)
+        rows = self._conn.execute(
+            "SELECT id, query, candidate_docs, haiku_label FROM calibration_log "
+            f"WHERE id IN ({placeholders}) ORDER BY id",
+            row_ids,
+        ).fetchall()
+        triples: list[tuple[str, str, str]] = []
+        for row in rows:
+            if row["haiku_label"] is None or row["candidate_docs"] is None:
+                continue
+            try:
+                haiku_labels = json.loads(row["haiku_label"])
+                docs = json.loads(row["candidate_docs"])
+                query = row["query"]
+                # `zip()` eagerly calls `iter()` on both arguments at
+                # construction time, so a well-formed-but-wrong-type decode
+                # (e.g. a bare JSON number/null instead of a list) raises
+                # `TypeError` right here, not lazily inside the loop below —
+                # this call must stay INSIDE the try block (not after it)
+                # so that failure is caught by the same fail-soft skip as a
+                # `json.JSONDecodeError`, never escaping to the caller.
+                for haiku_label, doc in zip(haiku_labels, docs, strict=False):
+                    if haiku_label not in ("relevant", "irrelevant"):
+                        continue
+                    if not doc:
+                        continue
+                    triples.append((query, doc, haiku_label))
+            except (TypeError, ValueError):
+                continue
+        return triples
+
+    def judge_knob_refit_rescore_items(self, row_ids: list[int]) -> list[tuple[str, str, str]]:
+        """`(query, doc, effective_label)` items for F2c inc5b-2's ACCEPT-path
+        knob RE-SCORE (spec §5 "On the updated model = RE-SCORE"). Same BROAD
+        effective-label population `judge_knob_refit_pairs` fits the knob on
+        (Haiku-over-local precedence; skip `unknown`/`error`), but carries the
+        `(query, doc)` needed to forward-pass each position through the UPDATED
+        (tuned) model to get a FRESH raw score — which `judge_knob_refit_pairs`
+        (raw-score-only, no text) cannot supply.
+
+        DOC-REQUIRED (Planning OPTION A, 2026-09-24): a position is emitted
+        only when `candidate_docs[i]` is present and non-empty — a position
+        with no doc snapshot CANNOT be forward-passed, so it cannot be
+        re-scored. This is why the ACCEPT-path knob fits the doc-HAVING rows
+        while the WEAK/REVERT-path knob (`judge_knob_refit_pairs`, logged
+        scores) fits the FULL logged set: on the accept path there is no valid
+        way to include a doc-absent position (mixing its stale logged score
+        into a tuned-model fit would misplace the cutoff). `doc` is
+        `candidate_docs[i]` — the recall-time snapshot, never a re-fetch.
+
+        `effective_label` = `haiku_label[i]` where present, else
+        `local_judge_label[i]` — the SAME precedence as `judge_knob_refit_pairs`
+        / `labeled_calibration_pairs`, so the accept knob and the weak/revert
+        knob calibrate over the same effective-label semantics (only the score
+        SOURCE differs: fresh tuned vs logged). Ordered by row id then position
+        (stable), fail-soft on malformed JSON (mirrors `judge_lora_training_
+        triples`). Read-only. Empty `row_ids` / no usable positions → `[]`.
+        """
+        if not row_ids:
+            return []
+        placeholders = ",".join("?" for _ in row_ids)
+        rows = self._conn.execute(
+            "SELECT id, query, candidate_docs, local_judge_label, haiku_label "
+            f"FROM calibration_log WHERE id IN ({placeholders}) ORDER BY id",
+            row_ids,
+        ).fetchall()
+        items: list[tuple[str, str, str]] = []
+        for row in rows:
+            if row["candidate_docs"] is None or row["local_judge_label"] is None:
+                continue
+            try:
+                docs = json.loads(row["candidate_docs"])
+                local_labels = json.loads(row["local_judge_label"])
+                haiku_labels = (
+                    json.loads(row["haiku_label"])
+                    if row["haiku_label"] is not None
+                    else [None] * len(local_labels)
+                )
+                query = row["query"]
+                for doc, local_label, haiku_label in zip(
+                    docs, local_labels, haiku_labels, strict=False
+                ):
+                    effective = haiku_label if haiku_label is not None else local_label
+                    if effective not in ("relevant", "irrelevant"):
+                        continue
+                    if not doc:
+                        continue
+                    items.append((query, doc, effective))
+            except (TypeError, ValueError):
+                continue
+        return items
+
+    def rows_with_doc_snapshot(self, row_ids: list[int]) -> list[int]:
+        """The subset of `row_ids` whose `candidate_docs` column is NON-NULL —
+        the DOC-HAVING rows (F2c inc5b-2, Planning consume-semantics 2B). On an
+        ACCEPT tick the accept-path knob + LoRA train set both train ONLY on
+        doc-having rows, so consume retires ONLY these (a legacy
+        score-present/doc-absent row, `candidate_docs IS NULL`, is left
+        UNCONSUMED — it is still trainable by the doc-agnostic logged-knob fit
+        on a future weak/revert week; §2 forbids retiring a still-trainable row
+        untrained). Weak/revert ticks consume the full `row_ids` instead (their
+        logged-knob fit trains on every row). Read-only. Empty → `[]`."""
+        if not row_ids:
+            return []
+        placeholders = ",".join("?" for _ in row_ids)
+        rows = self._conn.execute(
+            f"SELECT id FROM calibration_log WHERE id IN ({placeholders}) "
+            "AND candidate_docs IS NOT NULL",
+            row_ids,
+        ).fetchall()
+        return [int(row["id"]) for row in rows]
+
+    def get_judge_knob_calibration(self, judge_model_id: str) -> dict[str, Any] | None:
+        """Return the PERSISTED `judge_knob_calibration` row for
+        `judge_model_id`, or `None` if this persona's judge has never had a
+        knob-refit complete yet (F2c inc3, spec §5). ABSENT-SAFE reader —
+        `None` is the honest "use the fixed sigmoid-0.5 default" signal
+        the caller (`relevance_judge.label_calibration_sample`, F2c inc4a)
+        checks for before applying `label_for_score`'s `slope`/`intercept`
+        params. Read-only: does not write or bump anything.
+        """
+        row = self._conn.execute(
+            "SELECT judge_model_id, slope, intercept, updated_at "
+            "FROM judge_knob_calibration WHERE judge_model_id = ?",
+            (judge_model_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "judge_model_id": row["judge_model_id"],
+            "slope": row["slope"],
+            "intercept": row["intercept"],
+            "updated_at": row["updated_at"],
+        }
+
+    def write_judge_knob_calibration(
+        self, judge_model_id: str, *, slope: float, intercept: float
+    ) -> None:
+        """Upsert this persona's fitted knob-refit params for
+        `judge_model_id` (F2c inc3, spec §5) — the ONLY write path into
+        `judge_knob_calibration` (I1: a table in memories.db, never a side
+        file). `INSERT ... ON CONFLICT DO UPDATE` keyed on `judge_model_id`
+        (its PRIMARY KEY), mirroring `write_judge_selftune_state`'s upsert
+        shape: the row is replaced wholesale on each COMPLETED weekly
+        refit, never accumulated as a history.
+
+        Called only after `judge_selftune.fit_platt_knob` has returned
+        successfully — a tick that fails before reaching this call (no
+        usable pairs, or any other fault) must NOT call this, mirroring
+        `write_judge_selftune_state`'s own "only on a completed firing"
+        contract.
+        """
+        self._conn.execute(
+            "INSERT INTO judge_knob_calibration "
+            "(judge_model_id, slope, intercept, updated_at) "
+            "VALUES (?, ?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(judge_model_id) DO UPDATE SET "
+            "slope = excluded.slope, intercept = excluded.intercept, "
+            "updated_at = excluded.updated_at",
+            (judge_model_id, float(slope), float(intercept)),
+        )
+        self._conn.commit()
+
+    def list_judge_knob_keys(self) -> list[str]:
+        """Every `judge_knob_calibration` key (F2c inc9) — read by the weekly
+        tick's orphan knob-row reap (`judge_selftune._reap_orphan_knob_rows`).
+        Read-only."""
+        rows = self._conn.execute("SELECT judge_model_id FROM judge_knob_calibration").fetchall()
+        return [row["judge_model_id"] for row in rows]
+
+    def delete_judge_knob_calibration(self, judge_model_id: str) -> int:
+        """Delete the knob row keyed `judge_model_id` (F2c inc9: a superseded
+        checkpoint's knob after the swap, or an orphan left by a staged
+        checkpoint that was never swapped in). A missing row is a no-op.
+        Returns the number of rows deleted."""
+        cur = self._conn.execute(
+            "DELETE FROM judge_knob_calibration WHERE judge_model_id = ?", (judge_model_id,)
+        )
+        self._conn.commit()
+        return cur.rowcount
 
     def get(self, memory_id: str, *, bump: bool | float = True) -> Memory | None:
         """Return the Memory with the given id, or None. Bumps

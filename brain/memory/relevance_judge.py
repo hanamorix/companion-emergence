@@ -128,7 +128,11 @@ def _sigmoid(x: float) -> float:
 
 
 def label_for_score(
-    raw_score: float, *, band_half_width: float | None = None
+    raw_score: float,
+    *,
+    band_half_width: float | None = None,
+    slope: float | None = None,
+    intercept: float | None = None,
 ) -> tuple[str, bool]:
     """Return `(provisional_label, is_ambiguous)` for one judge score.
 
@@ -143,12 +147,39 @@ def label_for_score(
     `AMBIGUOUS_BAND_HALF_WIDTH` of the 0.5 decision boundary — those, and
     only those, positions get a Haiku tie-break call (acceptance #7: "no
     Haiku call on clear cases").
+
+    `slope`/`intercept` (F2c inc3, spec §5 "knob-refit"): an ABSENT-SAFE
+    way to apply a persona's FITTED Platt calibration
+    (`judge_selftune.fit_platt_knob`, persisted via
+    `MemoryStore.write_judge_knob_calibration`) in place of the fixed
+    sigmoid-0.5 default this function has always used. `p` becomes
+    `sigmoid(slope * raw_score + intercept)` instead of `sigmoid(raw_score)`
+    — passing `slope=1.0, intercept=0.0` (or leaving both `None`, the
+    default) reproduces today's exact fixed behavior bit-for-bit. Either
+    argument being `None` falls back to that default for just the missing
+    one, rather than raising — a caller is never required to supply both.
+    The band comparison (`abs(p - 0.5) < band_half_width`) is unchanged:
+    the ambiguous band is defined on the (possibly recalibrated)
+    probability, not on the raw score directly, so a fitted mapping that
+    shifts the decision boundary also shifts where the ambiguous band
+    sits, which is the intended effect (the band should track wherever
+    the judge's OWN cutoff currently is).
+
+    F2c INC4a wires the LOAD side: `label_calibration_sample` below now
+    reads this persona's persisted knob via `store.get_judge_knob_
+    calibration(judge.model_id())` once per call and passes it through to
+    every `label_for_score` call in that pass — so the LIVE judge pass
+    genuinely uses a persona's own fitted knob once inc3's weekly tick has
+    written one, and stays byte-for-byte unchanged (both args `None`) for
+    any persona that hasn't had a knob-refit complete yet.
     """
     if band_half_width is None:
         band_half_width = tunables.get_tunable(
             "calibration.judge_ambiguous_band_half_width", AMBIGUOUS_BAND_HALF_WIDTH
         )
-    p = _sigmoid(raw_score)
+    effective_slope = slope if slope is not None else 1.0
+    effective_intercept = intercept if intercept is not None else 0.0
+    p = _sigmoid(effective_slope * raw_score + effective_intercept)
     provisional = "relevant" if p >= 0.5 else "irrelevant"
     is_ambiguous = abs(p - 0.5) < band_half_width
     return provisional, is_ambiguous
@@ -173,6 +204,25 @@ class RelevanceJudgeProvider(ABC):
     @abstractmethod
     def model_id(self) -> str:
         """Stable identifier for the model producing these scores."""
+
+    def knob_key(self) -> str:
+        """The `judge_knob_calibration` key of the knob fit on THIS judge's
+        scores (F2c inc9). The base judge (and every test fake) uses its
+        `model_id()`; `FullModelJudge` adds its checkpoint, so a knob is only
+        ever read for the one model object that produces the scores."""
+        return self.model_id()
+
+
+def judge_knob_key(model_id: str, checkpoint: str | Path | None) -> str:
+    """The single definition of a knob key (F2c inc9, spec §5): the plain
+    `model_id` when no tuned checkpoint serves, else
+    `"<model_id>@<checkpoint dir name>"`. Checkpoint dir names are one-use
+    uuids (`judge_lora.staged_adapter_path`) and `@` cannot occur in a Hugging
+    Face repo id, so a key matches only the checkpoint its knob was fit on.
+    Pure string work: no filesystem access, no torch."""
+    if checkpoint is None:
+        return model_id
+    return f"{model_id}@{Path(checkpoint).name}"
 
 
 class TorchCrossEncoderJudge(RelevanceJudgeProvider):
@@ -246,24 +296,75 @@ class FakeRelevanceJudgeProvider(RelevanceJudgeProvider):
         return "fake-relevance-judge"
 
 
+class FullModelJudge(RelevanceJudgeProvider):
+    """A per-persona TUNED judge backed by the persona's saved plain
+    checkpoint (F2c inc6; since inc7 the ONLY tuned-judge form, spec §5 "One
+    stored tuned model per persona": a full fine-tune or a LoRA week merged in
+    memory — never an adapter). Wraps `judge_full_ft.load_full_scorer`'s
+    `(query, doc) -> raw float` callable (a PLAIN
+    `sentence_transformers.CrossEncoder` reload) as a
+    `RelevanceJudgeProvider`, so the daily calibration tick serves a persona's
+    tuned judge exactly where it would otherwise serve the base judge, and
+    `label_for_score` applies the persona's knob on top exactly as for the
+    base judge.
+
+    `model_id()` returns the BASE model id (the model family). The knob,
+    though, is bound to THIS checkpoint (F2c inc9, spec §5): `knob_key()` is
+    `judge_knob_key(base id, checkpoint dir)`, the key the weekly tick writes
+    this checkpoint's knob under before swapping it in, so
+    `label_calibration_sample` can never apply a knob fit on a different
+    checkpoint. Torch is imported lazily inside `load_full_scorer` (I6), never
+    at import time.
+    """
+
+    def __init__(
+        self, base_model_id: str, full_dir: str, *, cache_dir: str | None = None
+    ) -> None:
+        from brain.memory.judge_full_ft import load_full_scorer
+
+        self._model_id = base_model_id
+        self._full_dir = full_dir
+        self._scorer = load_full_scorer(full_dir, cache_dir=cache_dir)
+
+    def score(self, query: str, document: str) -> float:
+        return float(self._scorer((query, document)))
+
+    def model_id(self) -> str:
+        return self._model_id
+
+    def knob_key(self) -> str:
+        return judge_knob_key(self._model_id, self._full_dir)
+
+
 # Process-wide provider cache keyed by model_id (mirrors reranker.py's
 # _provider_cache). Kept at module scope so `_reset_judge_provider_cache`
 # (test-only) can reach it and so monkeypatching the *function* fully
-# controls behavior.
+# controls behavior. ONLY the shared BASE judge is cached here — a
+# per-persona tuned checkpoint judge is built fresh per call and never cached
+# (F2c inc5b-2/inc7: a newly-accepted checkpoint every week would otherwise
+# grow the cache unbounded; it is built at most once per daily calibration
+# tick, offline, so the once/day load cost is acceptable).
 _provider_cache: dict[str, RelevanceJudgeProvider] = {}
 _provider_cache_lock = threading.Lock()
 
 
-def build_judge_provider() -> RelevanceJudgeProvider:
-    """The production judge provider: `TorchCrossEncoderJudge` pinned to
-    `model_tier.TIER_RELEVANCE_JUDGE`'s model id, caching the model file in
-    the shared `get_cache_dir()` (one download across every persona on the
-    box, same reasoning as the embedder/reranker).
+def build_judge_provider(full_model_dir: str | None = None) -> RelevanceJudgeProvider:
+    """The production judge provider. With NO `full_model_dir`: the shared
+    base `TorchCrossEncoderJudge` pinned to `model_tier.TIER_RELEVANCE_JUDGE`'s
+    model id, caching the model file in the shared `get_cache_dir()` (one
+    download across every persona on the box) and PROCESS-WIDE cached by
+    model_id (double-checked locking) — unchanged from f2a-inc6.
 
-    PROCESS-WIDE CACHING, same rationale as `reranker.build_reranker_
-    provider`: constructing a `TorchCrossEncoderJudge` loads a real torch
-    model — expensive to redo every tick. Keyed by model_id (double-checked
-    locking: unlocked fast-path read for the common already-cached case).
+    With `full_model_dir` (F2c inc6/inc7): a per-persona `FullModelJudge`
+    serving that persona's tuned plain checkpoint, built FRESH and NOT cached
+    (see the `_provider_cache` note above). Since inc7 a persona has exactly one
+    tuned judge and it is always a plain checkpoint, so there is no adapter
+    argument and no precedence between stores.
+
+    The caller (`supervisor._run_calibration_tick`) resolves the persona's
+    current checkpoint (`judge_lora.resolve_current_checkpoint`) and passes it
+    here; an absent / unresolvable pointer means `None` and the base judge
+    (I9, absent → base).
 
     TEST ISOLATION: tests must monkeypatch this function directly (mirrors
     `reranker.build_reranker_provider`'s test-fixture convention) rather
@@ -274,6 +375,9 @@ def build_judge_provider() -> RelevanceJudgeProvider:
     from brain.paths import get_cache_dir
 
     model_id = model_for_tier(TIER_RELEVANCE_JUDGE)
+
+    if full_model_dir is not None:
+        return FullModelJudge(model_id, full_model_dir, cache_dir=str(get_cache_dir()))
 
     provider = _provider_cache.get(model_id)
     if provider is not None:
@@ -342,6 +446,18 @@ def _make_haiku_tiebreak(provider: LLMProvider) -> Callable[[str, str], str | No
 
 # ---------------------------------------------------------------------------
 # Orchestration — the ONE entry point the daily calibration tick calls.
+#
+# F2c (durable note, spec §6): Haiku is the effective relevance ORACLE this
+# judge is being converged toward. The tie-break below already treats a
+# Haiku verdict as ground truth over the local judge's own provisional
+# label at ambiguous positions, and F2c's later weekly self-tune (knob-refit
+# / LoRA / full fine-tune, not built in this increment) trains the local
+# judge's score-to-label mapping toward the accumulated Haiku decisions
+# logged here. If a relevance-quality problem shows up downstream later,
+# this is the place to look first: what the judge converges toward is
+# Haiku's own labeling behavior, not some independently-verified ground
+# truth, so a systematic Haiku bias would propagate into the judge rather
+# than being caught by it.
 # ---------------------------------------------------------------------------
 
 
@@ -351,6 +467,7 @@ def label_calibration_sample(
     provider: LLMProvider | None = None,
     judge: RelevanceJudgeProvider | None = None,
     sample_rows: int | None = None,
+    full_model_dir: str | None = None,
 ) -> int:
     """Label a SAMPLE of unlabeled `calibration_log` rows: the local judge
     (`judge`, or the real `build_judge_provider()` if not injected) scores
@@ -362,6 +479,23 @@ def label_calibration_sample(
 
     Returns the number of ROWS labeled this call (0 if there was nothing
     to label, or if judge construction itself failed).
+
+    F2c INC4a (spec §5 "where the tuned judge loads from"): before scoring,
+    reads THIS PERSONA's persisted knob-refit params for the judge's knob
+    key (`judge.knob_key()`: its model id, plus its checkpoint for a tuned
+    judge, F2c inc9) via `store.get_judge_knob_calibration` — `store` is always the
+    persona-scoped `MemoryStore` the caller (`_run_calibration_tick`)
+    constructed from that persona's OWN `memories.db` (I1: one store per
+    persona is the isolation boundary, no persona-scoping column needed,
+    same as the table itself), so this is a per-persona load by
+    construction (AC11) — no cross-persona bleed is possible without
+    passing another persona's store in. ABSENT-SAFE: no persisted row for
+    this judge model id (fresh install, or a persona whose weekly tick has
+    never completed a knob-refit) -> `slope`/`intercept` both stay `None`,
+    and `label_for_score` below falls back to its fixed sigmoid-0.5/
+    band-0.05 behavior, byte-identical to pre-inc4a labeling. Read ONCE per
+    call (the mapping is constant for the whole sampled batch), not
+    per-candidate.
 
     FAULT ISOLATION (spec: "must not crash the tick or the bridge"):
       - judge construction failure -> logged, returns 0, no rows touched.
@@ -384,12 +518,25 @@ def label_calibration_sample(
 
     if judge is None:
         try:
-            judge = build_judge_provider()
+            # F2c inc7: the persona's current tuned checkpoint resolved by
+            # `_run_calibration_tick` (`full_model_dir`, a plain CrossEncoder
+            # checkpoint), or None → the base judge (I9). Built LAZILY here —
+            # only when there are actually rows to label — so a tick with
+            # nothing to do never loads a torch model.
+            judge = build_judge_provider(full_model_dir=full_model_dir)
         except Exception:  # noqa: BLE001 — torch missing, download failed, etc.
             logger.exception(
                 "calibration judge: failed to construct the local judge provider — skipping this pass"
             )
             return 0
+
+    # F2c inc4a: this persona's fitted Platt knob for THIS judge, or
+    # (None, None) if absent — see the docstring above. inc9: keyed by
+    # `judge.knob_key()` (the base id, or base id @ the served checkpoint), so
+    # the knob read is always the one fit on the model object scoring here.
+    knob = store.get_judge_knob_calibration(judge.knob_key())
+    knob_slope: float | None = knob["slope"] if knob is not None else None
+    knob_intercept: float | None = knob["intercept"] if knob is not None else None
 
     haiku_tiebreak = _make_haiku_tiebreak(provider) if provider is not None else None
 
@@ -400,6 +547,17 @@ def label_calibration_sample(
             candidate_ids: list[str] = row["candidate_ids"]
             local_labels: list[str] = []
             haiku_labels: list[str | None] = []
+            # F2c inc1 (data foundation only, spec §3 Addition A): the raw
+            # judge score/logit, accumulated alongside the derived labels in
+            # this same loop and positionally aligned with `candidate_ids`
+            # (same convention as `local_labels`/`haiku_labels`) — a `None`
+            # entry marks a position this pass never scored (the
+            # "unknown"/"error" sentinels below), distinct from a real 0.0
+            # score. Persisted via `write_calibration_labels` so F2c's later
+            # knob-refit (not built here) has the raw score to fit a
+            # threshold/Platt mapping over, instead of only the label the
+            # score was already collapsed into.
+            raw_scores: list[float | None] = []
             for cid in candidate_ids:
                 try:
                     mem = store.get(cid, bump=False)
@@ -409,10 +567,14 @@ def label_calibration_sample(
                         # never silently coerced into relevant/irrelevant.
                         local_labels.append("unknown")
                         haiku_labels.append(None)
+                        raw_scores.append(None)
                         continue
                     raw_score = judge.score(query, mem.content)
-                    provisional, is_ambiguous = label_for_score(raw_score)
+                    provisional, is_ambiguous = label_for_score(
+                        raw_score, slope=knob_slope, intercept=knob_intercept
+                    )
                     local_labels.append(provisional)
+                    raw_scores.append(float(raw_score))
                     if is_ambiguous and haiku_tiebreak is not None:
                         haiku_labels.append(haiku_tiebreak(query, mem.content))
                     else:
@@ -424,7 +586,10 @@ def label_calibration_sample(
                     )
                     local_labels.append("error")
                     haiku_labels.append(None)
-            store.write_calibration_labels(row["id"], local_labels, haiku_labels)
+                    raw_scores.append(None)
+            store.write_calibration_labels(
+                row["id"], local_labels, haiku_labels, local_judge_raw_score=raw_scores
+            )
             labeled += 1
         except Exception:  # noqa: BLE001 — one row must not sink the whole pass
             logger.exception(

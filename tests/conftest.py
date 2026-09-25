@@ -345,7 +345,12 @@ def _fake_relevance_judge_provider_by_default(
     from brain.memory import relevance_judge
 
     monkeypatch.setattr(
-        relevance_judge, "build_judge_provider", lambda: relevance_judge.FakeRelevanceJudgeProvider()
+        relevance_judge,
+        "build_judge_provider",
+        # Same parameters as the real `build_judge_provider(full_model_dir=None)`
+        # (F2c inc7; a signature mismatch would raise inside the stub and be
+        # swallowed by label_calibration_sample's fault isolation — V3 pins it).
+        lambda full_model_dir=None: relevance_judge.FakeRelevanceJudgeProvider(),
     )
 
 
