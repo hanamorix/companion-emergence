@@ -2257,33 +2257,26 @@ def _run_calibration_tick(
                 if provider is not None
                 else build_tier_provider(persona_dir, TIER_BACKGROUND_CLASSIFIER)
             )
-            # F2c inc5b-2/inc6: serve this persona's TUNED judge when its weekly
-            # self-tune has accepted one — the FULL fine-tune (beefy) or the
-            # LoRA adapter (mid), resolved with full>lora>base precedence by
-            # `resolve_serving_tuned_judge` (the tick keeps exactly one live per
-            # persona). Only when the caller injected no explicit `judge` (an
-            # injected test judge is never clobbered). Resolving the pointer is a
-            # cheap filesystem read; the (torch) judge itself is built LAZILY
-            # inside label_calibration_sample, and only when there are rows to
-            # label. Absent / unresolvable → base judge (I9), byte-identical to
-            # pre-inc5b2.
-            adapter_dir: str | None = None
+            # F2c inc7: serve this persona's ONE tuned judge when its weekly
+            # self-tune has accepted one — always a plain checkpoint (a full
+            # fine-tune or a merged LoRA week), named by the persona's single
+            # `current` pointer (`resolve_current_checkpoint`). Only when the
+            # caller injected no explicit `judge` (an injected test judge is
+            # never clobbered). Resolving the pointer is a cheap filesystem
+            # read; the (torch) judge itself is built LAZILY inside
+            # label_calibration_sample, and only when there are rows to label.
+            # Absent / unresolvable → base judge (I9).
             full_model_dir: str | None = None
             if judge is None:
                 from brain.memory import judge_lora
 
-                tuned = judge_lora.resolve_serving_tuned_judge(persona_dir)
-                if tuned is not None:
-                    kind, tuned_dir = tuned
-                    if kind == "full":
-                        full_model_dir = str(tuned_dir)
-                    else:
-                        adapter_dir = str(tuned_dir)
+                current = judge_lora.resolve_current_checkpoint(persona_dir)
+                if current is not None:
+                    full_model_dir = str(current)
             labeled = label_calibration_sample(
                 store,
                 provider=tiebreak_provider,
                 judge=judge,
-                adapter_dir=adapter_dir,
                 full_model_dir=full_model_dir,
             )
             logger.info("calibration tick: labeled=%d calibration_log rows this pass", labeled)

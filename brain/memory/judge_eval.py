@@ -257,10 +257,12 @@ def challenger_not_worse(
 
 
 class RollbackHandle:
-    """Rollback abstraction `run_champion_challenger` calls against —
-    inc5/6 supplies the REAL implementation (e.g. a saved LoRA adapter
-    checkpoint path / a copied full-FT weight file); this module only
-    defines the shape and a scripted/testing default.
+    """Rollback abstraction `run_champion_challenger` calls against; this
+    module only defines the shape and a scripted/testing default. The
+    production tick (`judge_selftune._run_weight_retrain`) passes this no-op
+    default: its challenger is written to a fresh staged checkpoint and the
+    persona's one pointer is swapped only on ACCEPT (F2c inc7), so a revert
+    has nothing to restore.
 
     `record()` is called UNCONDITIONALLY, before `retrain_fn` runs, and
     must capture whatever is needed to put the CURRENT (pre-retrain,
@@ -276,8 +278,7 @@ class RollbackHandle:
     challenger`'s functional contract in THIS increment (where
     `retrain_fn` returns a brand-new challenger label fn rather than
     mutating the champion in place, so there is nothing in-process to
-    restore); inc5/6's real weight-carrying handle overrides both methods.
-    Tests use a scripted subclass that RECORDS calls, to prove `restore`
+    restore). Tests use a scripted subclass that RECORDS calls, to prove `restore`
     fires on revert and never on accept.
     """
 

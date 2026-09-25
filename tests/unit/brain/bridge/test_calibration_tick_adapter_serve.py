@@ -1,13 +1,12 @@
-"""F2c inc5b-2 (C8/C9) + inc6 — the daily calibration tick serves a persona's
-TUNED judge when its weekly self-tune has accepted one (a LoRA adapter OR, on
-the beefy tier, a FULL fine-tune), else the base judge, with no cross-persona
-bleed.
+"""F2c inc5b-2/inc6, reworked in inc7 — the daily calibration tick serves a
+persona's ONE tuned judge (always a plain checkpoint since inc7: a full
+fine-tune or a merged LoRA week) when its weekly self-tune has accepted one,
+else the base judge, with no cross-persona bleed (AC11, criterion V2).
 
-Exercises `supervisor._run_calibration_tick`'s tuned-judge resolution
-(`judge_lora.resolve_serving_tuned_judge`, full>lora>base) + the
-`adapter_dir`/`full_model_dir` threading into
+Exercises `supervisor._run_calibration_tick`'s resolution
+(`judge_lora.resolve_current_checkpoint`) + the `full_model_dir` threading into
 `label_calibration_sample.build_judge_provider`. No real model:
-`build_judge_provider` is monkeypatched to capture the dirs it is asked for.
+`build_judge_provider` is monkeypatched to capture the dir it is asked for.
 """
 
 from __future__ import annotations
@@ -29,125 +28,98 @@ def _seed_unlabeled_row(pd: Path) -> None:
     store.close()
 
 
-def _place_champion_adapter(pd: Path) -> Path:
+def _place_checkpoint(pd: Path, *, adapter_layout: bool = False) -> Path:
+    """Place a stored dir and point the persona's one pointer at it. With
+    `adapter_layout` the dir holds an inc5/inc6-style `adapter_config.json`."""
     root = judge_lora.champion_dir(pd)
     staged = judge_lora.staged_adapter_path(root)
     staged.mkdir(parents=True)
-    (staged / "adapter_model.txt").write_text("x", encoding="utf-8")
+    if adapter_layout:
+        (staged / "adapter_config.json").write_text("{}", encoding="utf-8")
+    else:
+        (staged / "model.safetensors.txt").write_text("x", encoding="utf-8")
     judge_lora.swap_champion_pointer(root, staged)
     return staged
 
 
-def _place_champion_full_model(pd: Path) -> Path:
-    root = judge_lora.full_champion_dir(pd)
-    staged = judge_lora.staged_adapter_path(root)
-    staged.mkdir(parents=True)
-    (staged / "model.safetensors.txt").write_text("x", encoding="utf-8")
-    judge_lora.swap_champion_pointer(root, staged)
-    return staged
-
-
-def _capture_adapter_dir(monkeypatch) -> list[str | None]:
+def _capture_full_model_dir(monkeypatch) -> list[str | None]:
     seen: list[str | None] = []
 
-    # inc6: build_judge_provider now takes full_model_dir too (additive). The
-    # tick passes exactly one of adapter_dir / full_model_dir (or neither);
-    # capture whichever is non-None (else None = base).
-    def fake(adapter_dir=None, full_model_dir=None):
-        seen.append(full_model_dir if full_model_dir is not None else adapter_dir)
+    def fake(full_model_dir=None):
+        seen.append(full_model_dir)
         return FakeRelevanceJudgeProvider()
 
     monkeypatch.setattr(relevance_judge, "build_judge_provider", fake)
     return seen
 
 
-def test_tick_serves_the_persona_tuned_adapter_when_present(monkeypatch) -> None:
-    # C8: an accepted champion adapter → the tick labels via
-    # build_judge_provider(adapter_dir=<the resolved adapter>).
-    seen = _capture_adapter_dir(monkeypatch)
+def test_tick_serves_the_persona_checkpoint_when_present(monkeypatch) -> None:
+    seen = _capture_full_model_dir(monkeypatch)
     with tempfile.TemporaryDirectory() as d:
         pd = Path(d)
         _seed_unlabeled_row(pd)
-        staged = _place_champion_adapter(pd)
+        ckpt = _place_checkpoint(pd)
         _run_calibration_tick(pd)
-        assert seen == [str(staged)], f"expected the resolved adapter dir, got {seen}"
+        assert seen == [str(ckpt)], f"expected the pointer's checkpoint dir, got {seen}"
 
 
-def test_tick_serves_base_judge_when_no_adapter(monkeypatch) -> None:
-    # C8: absent champion adapter → base judge (adapter_dir=None), byte-identical
-    # to pre-inc5b2.
-    seen = _capture_adapter_dir(monkeypatch)
+def test_tick_serves_base_judge_when_no_checkpoint(monkeypatch) -> None:
+    seen = _capture_full_model_dir(monkeypatch)
     with tempfile.TemporaryDirectory() as d:
         pd = Path(d)
         _seed_unlabeled_row(pd)
         _run_calibration_tick(pd)
-        assert seen == [None], f"expected base judge (adapter_dir=None), got {seen}"
+        assert seen == [None], f"expected base judge (full_model_dir=None), got {seen}"
 
 
-def test_tick_serves_the_full_model_when_present(monkeypatch) -> None:
-    # inc6 (C11/C12): a beefy-tier FULL champion → the tick labels via
-    # build_judge_provider(full_model_dir=<the resolved full dir>), NOT adapter_dir.
-    seen: list[tuple[str | None, str | None]] = []
-
-    def fake(adapter_dir=None, full_model_dir=None):
-        seen.append((adapter_dir, full_model_dir))
-        return FakeRelevanceJudgeProvider()
-
-    monkeypatch.setattr(relevance_judge, "build_judge_provider", fake)
+def test_tick_serves_base_judge_for_a_legacy_adapter_dir(monkeypatch) -> None:
+    # S5: a pointer naming an inc5/inc6 adapter dir is not a plain checkpoint;
+    # the plain loader is never handed it.
+    seen = _capture_full_model_dir(monkeypatch)
     with tempfile.TemporaryDirectory() as d:
         pd = Path(d)
         _seed_unlabeled_row(pd)
-        full = _place_champion_full_model(pd)
+        _place_checkpoint(pd, adapter_layout=True)
         _run_calibration_tick(pd)
-        assert seen == [(None, str(full))], f"expected full_model_dir set, adapter_dir None: {seen}"
+        assert seen == [None], f"adapter dir must resolve to the base judge, got {seen}"
 
 
-def test_tick_full_model_takes_precedence_over_a_stale_lora_adapter(monkeypatch) -> None:
-    # inc6 (C12 precedence): if BOTH stores are populated (a cross-tier window),
-    # the tick serves the FULL model (full>lora).
-    seen: list[tuple[str | None, str | None]] = []
-
-    def fake(adapter_dir=None, full_model_dir=None):
-        seen.append((adapter_dir, full_model_dir))
-        return FakeRelevanceJudgeProvider()
-
-    monkeypatch.setattr(relevance_judge, "build_judge_provider", fake)
+def test_tick_ignores_a_legacy_full_sub_store(monkeypatch) -> None:
+    # S1/S5: the removed per-tier `full/` sub-store is never consulted.
+    seen = _capture_full_model_dir(monkeypatch)
     with tempfile.TemporaryDirectory() as d:
         pd = Path(d)
         _seed_unlabeled_row(pd)
-        _place_champion_adapter(pd)
-        full = _place_champion_full_model(pd)
+        old_full = judge_lora.champion_dir(pd) / "full"
+        staged = judge_lora.staged_adapter_path(old_full)
+        staged.mkdir(parents=True)
+        judge_lora.swap_champion_pointer(old_full, staged)
         _run_calibration_tick(pd)
-        assert seen == [(None, str(full))], f"full must win over a stale lora adapter: {seen}"
+        assert seen == [None], f"a legacy full/ sub-store must not be served, got {seen}"
 
 
-def test_no_cross_persona_adapter_bleed(monkeypatch) -> None:
-    # C9: persona A has an adapter, B has none. A's tick resolves A's adapter
-    # (under A's dir); B's tick resolves nothing — no bleed.
-    seen = _capture_adapter_dir(monkeypatch)
+def test_no_cross_persona_bleed(monkeypatch) -> None:
+    seen = _capture_full_model_dir(monkeypatch)
     with tempfile.TemporaryDirectory() as da, tempfile.TemporaryDirectory() as db:
         pd_a, pd_b = Path(da), Path(db)
         _seed_unlabeled_row(pd_a)
         _seed_unlabeled_row(pd_b)
-        staged_a = _place_champion_adapter(pd_a)
+        ckpt_a = _place_checkpoint(pd_a)
 
         _run_calibration_tick(pd_a)
         _run_calibration_tick(pd_b)
 
-        assert seen[0] == str(staged_a)
+        assert seen[0] == str(ckpt_a)
         assert str(pd_a) in seen[0] and str(pd_b) not in seen[0]
-        assert seen[1] is None, "persona B must not see A's adapter"
+        assert seen[1] is None, "persona B must not see A's checkpoint"
 
 
-def test_injected_judge_is_not_clobbered_by_a_disk_adapter(monkeypatch) -> None:
-    # Finding 6: an explicitly injected judge takes precedence; the tick does
-    # NOT resolve/serve a disk adapter over it.
-    seen = _capture_adapter_dir(monkeypatch)
+def test_injected_judge_is_not_clobbered_by_a_disk_checkpoint(monkeypatch) -> None:
+    seen = _capture_full_model_dir(monkeypatch)
     with tempfile.TemporaryDirectory() as d:
         pd = Path(d)
         _seed_unlabeled_row(pd)
-        _place_champion_adapter(pd)
+        _place_checkpoint(pd)
         injected = FakeRelevanceJudgeProvider()
         _run_calibration_tick(pd, judge=injected)
-        # build_judge_provider is never called (the injected judge is used).
         assert seen == [], f"injected judge must be used, build_judge_provider not called: {seen}"

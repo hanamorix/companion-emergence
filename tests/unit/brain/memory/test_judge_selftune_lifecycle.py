@@ -1,20 +1,25 @@
-"""F2c inc5b-2 SLICE 2 — the tick LoRA/full-FT weight-retrain lifecycle.
+"""F2c weekly self-tune tick — the LoRA/full-FT weight-retrain lifecycle, ONE
+model lineage per persona (inc5b-2 slice 2, inc6, reworked in inc7).
 
 Drives `_run_judge_selftune_tick`'s mid/beefy dispatch with SCRIPTED, no-model
-fakes (monkeypatched `build_lora_retrain_fn` / `run_champion_challenger` /
-`load_lora_scorer` / `build_judge_provider`) + a real in-memory `MemoryStore`
-and the real filesystem champion-pointer helpers. NEVER loads a real model
-(the real persist->reload is proven with a tiny model in test_judge_lora.py).
+fakes (monkeypatched `build_lora_retrain_fn` / `build_full_ft_retrain_fn` /
+`run_champion_challenger` / `load_full_scorer` / `build_judge_provider`) + a
+real in-memory `MemoryStore` and the real filesystem store helpers. NEVER
+loads a real model (the real train/merge/save/reload is proven with a tiny
+model in test_judge_lora.py / test_judge_full_ft.py).
 
-Covers criteria: C1 (accept/revert dispatch), C2 (Haiku-only triples fed +
-split), C4 (accept knob = fresh tuned scores, not logged), C5 (revert reuses
-logged scores), C7 (consume-at-end once + fault leaves re-eligible), C13
-(ordering + post-swap-fault pointer rollback), C16 (2B consume semantics),
-C17 (no provider-cache growth).
+inc7 criteria covered here (changes/f2c-inc7-one-lineage/1.5-criteria.md):
+L1-L7 (each week's update applied to the persisting model; revert; dispatch
+matrix; champion = serving model; AC13 tier drops; knob follows the served
+model), S2-S5 (pointer only on accept; delete-after-swap with retry; commit
+point; fail-soft resolve), H4 (observability), plus the carried inc5b-2/inc6
+lifecycle contracts (Haiku-only triples, no leakage, re-score on accept, logged
+knob on revert, 2B consume, degenerate floor, consume-last).
 """
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -25,14 +30,15 @@ from brain.memory import judge_eval, judge_full_ft, judge_lora, judge_selftune, 
 from brain.memory.relevance_judge import FakeRelevanceJudgeProvider
 from brain.memory.store import MemoryStore
 
-# Captured at import (before the autouse `build_judge_provider` stub patches
-# it per-test) so C17 can exercise the REAL provider-cache behavior.
-_REAL_BUILD_JUDGE_PROVIDER = relevance_judge.build_judge_provider
-
 
 @pytest.fixture
 def store() -> MemoryStore:
     return MemoryStore(db_path=":memory:")
+
+
+# ---------------------------------------------------------------------------
+# Seeding + scripted environment
+# ---------------------------------------------------------------------------
 
 
 def _seed_row(
@@ -52,36 +58,39 @@ def _seed_row(
         reranker_model_id="jina",
         candidate_docs=docs,
     )
-    row_id = store._conn.execute(
-        "SELECT id FROM calibration_log ORDER BY id DESC LIMIT 1"
-    ).fetchone()["id"]
+    row_id = store._conn.execute("SELECT id FROM calibration_log ORDER BY id DESC LIMIT 1").fetchone()["id"]
     store.write_calibration_labels(row_id, local_labels, haiku_labels, raw_scores)
     return row_id
 
 
-def _seed_scenario(store: MemoryStore) -> dict[str, int]:
+def _seed_scenario(store: MemoryStore, tag: str = "w1") -> dict[str, int]:
     """3 doc-having rows (contribute Haiku triples) + 1 legacy doc-absent row
-    (candidate_docs NULL, a Haiku position but no doc)."""
+    (candidate_docs NULL, a Haiku position but no doc). Queries carry `tag`
+    so a later week's rows are distinguishable from an earlier week's."""
     r1 = _seed_row(
-        store, query="q1", docs=["da", "db"],
+        store, query=f"{tag}q1", docs=[f"{tag}da", f"{tag}db"],
         local_labels=["relevant", "irrelevant"], haiku_labels=[None, "relevant"],
         raw_scores=[0.5, -0.5],
     )
     r2 = _seed_row(
-        store, query="q2", docs=["dc", "dd"],
+        store, query=f"{tag}q2", docs=[f"{tag}dc", f"{tag}dd"],
         local_labels=["irrelevant", "relevant"], haiku_labels=["irrelevant", None],
         raw_scores=[-0.3, 0.7],
     )
     r3 = _seed_row(
-        store, query="q3", docs=["de"],
+        store, query=f"{tag}q3", docs=[f"{tag}de"],
         local_labels=["relevant"], haiku_labels=["relevant"], raw_scores=[0.9],
     )
     r4_docabsent = _seed_row(
-        store, query="q4", docs=None,
+        store, query=f"{tag}q4", docs=None,
         local_labels=["relevant", "irrelevant"], haiku_labels=[None, "relevant"],
         raw_scores=[0.4, -0.6],
     )
     return {"r1": r1, "r2": r2, "r3": r3, "r4_docabsent": r4_docabsent}
+
+
+def _all_ids(ids: dict[str, int]) -> list[int]:
+    return [ids["r1"], ids["r2"], ids["r3"], ids["r4_docabsent"]]
 
 
 def _consumed(store: MemoryStore, row_id: int) -> bool:
@@ -91,17 +100,19 @@ def _consumed(store: MemoryStore, row_id: int) -> bool:
     return row["selftune_consumed_at"] is not None
 
 
-def _force_midbeefy(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Scripted RAM so tier-detect selects a weight-retrain tier with generous
-    OOM headroom (no downgrade)."""
-    monkeypatch.setattr(
-        judge_selftune, "_read_total_ram_bytes",
-        lambda: judge_selftune.JUDGE_TUNE_RAM_TIER_LORA_MIN_BYTES + 1.0,
-    )
-    monkeypatch.setattr(
-        judge_selftune, "_available_ram_headroom_bytes",
-        lambda: judge_selftune.JUDGE_TUNE_FOOTPRINT_LORA_BYTES + 1.0,
-    )
+def _set_tier(monkeypatch: pytest.MonkeyPatch, grade: str) -> None:
+    """Scripted RAM + headroom so tier-detect selects `grade` (no downgrade)."""
+    if grade == judge_selftune.TUNE_GRADE_FULL_FT:
+        ram = judge_selftune.JUDGE_TUNE_RAM_TIER_FULL_FT_MIN_BYTES + 1.0
+        head = judge_selftune.JUDGE_TUNE_FOOTPRINT_FULL_FT_BYTES + 1.0
+    elif grade == judge_selftune.TUNE_GRADE_LORA:
+        ram = judge_selftune.JUDGE_TUNE_RAM_TIER_LORA_MIN_BYTES + 1.0
+        head = judge_selftune.JUDGE_TUNE_FOOTPRINT_LORA_BYTES + 1.0
+    else:
+        ram = 1.0
+        head = judge_selftune.JUDGE_TUNE_FOOTPRINT_FULL_FT_BYTES + 1.0
+    monkeypatch.setattr(judge_selftune, "_read_total_ram_bytes", lambda: ram)
+    monkeypatch.setattr(judge_selftune, "_available_ram_headroom_bytes", lambda: head)
 
 
 def _small_tunables(monkeypatch: pytest.MonkeyPatch, *, gate: int = 2, min_n: int = 2) -> None:
@@ -117,573 +128,555 @@ def _small_tunables(monkeypatch: pytest.MonkeyPatch, *, gate: int = 2, min_n: in
     monkeypatch.setattr(judge_selftune.tunables, "get_tunable", fake)
 
 
-def _fake_retrain_factory(monkeypatch: pytest.MonkeyPatch, captured: dict) -> None:
-    """`build_lora_retrain_fn(..., save_adapter_dir=X)` -> a retrain_fn that
-    writes a dummy adapter to X (so the staged dir exists) and returns a fake
-    label fn. Captures the staged dir + train items."""
-
-    def fake_build(base, *, target_modules, modules_to_save, save_adapter_dir=None, **kw):
-        captured["save_adapter_dir"] = save_adapter_dir
-
-        def retrain_fn(train_items):
-            captured["train_items"] = list(train_items)
-            Path(save_adapter_dir).mkdir(parents=True, exist_ok=True)
-            (Path(save_adapter_dir) / "adapter_model.txt").write_text("x", encoding="utf-8")
-            return lambda item: "relevant"
-
-        return retrain_fn
-
-    monkeypatch.setattr(judge_lora, "build_lora_retrain_fn", fake_build)
+def _write_plain_checkpoint(d: Path, marker: str = "x") -> None:
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "model.safetensors.txt").write_text(marker, encoding="utf-8")
 
 
-def _fake_cc(monkeypatch: pytest.MonkeyPatch, *, accepted: bool, captured: dict) -> None:
-    """Scripted `run_champion_challenger`: calls retrain_fn (to write the
-    staged dir, matching the real contract), captures train/test, returns the
-    scripted accept/revert decision."""
+class Env:
+    """Scripted builders/eval/scorers; records every call the tick makes."""
 
-    def fake(*, champion, retrain_fn, train_items, test_items, rollback, **kw):
-        captured["cc_train"] = list(train_items)
-        captured["cc_test"] = list(test_items)
-        challenger = retrain_fn(train_items)
-        return judge_eval.ChampionChallengerResult(
-            accepted=accepted,
-            judge=challenger if accepted else champion,
-            b=0, c=0, p_value=1.0, n_test=len(test_items),
-            champion_correct=[], challenger_correct=[],
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.mp = monkeypatch
+        self.builds: list[dict] = []  # one per week: method, start, staged, train_items
+        self.scorer_dirs: list[str] = []  # every load_full_scorer(dir) call, in order
+        self.champion_labels: list[str] = []
+        self.accept: bool = True
+
+        def fake_lora(start, *, target_modules, modules_to_save, save_dir=None, **kw):
+            return self._retrain("lora", start, save_dir)
+
+        def fake_full(start, *, save_full_dir=None, **kw):
+            return self._retrain("full_ft", start, save_full_dir)
+
+        def fake_cc(*, champion, retrain_fn, train_items, test_items, rollback, **kw):
+            self.cc_train = list(train_items)
+            self.cc_test = list(test_items)
+            for item, _label in test_items:
+                self.champion_labels.append(champion(item))
+            challenger = retrain_fn(train_items)
+            return judge_eval.ChampionChallengerResult(
+                accepted=self.accept,
+                judge=challenger if self.accept else champion,
+                b=0, c=0, p_value=1.0, n_test=len(test_items),
+                champion_correct=[], challenger_correct=[],
+            )
+
+        def fake_scorer(d, **kw):
+            self.scorer_dirs.append(str(d))
+            return lambda item: 3.14
+
+        monkeypatch.setattr(judge_lora, "build_lora_retrain_fn", fake_lora)
+        monkeypatch.setattr(judge_full_ft, "build_full_ft_retrain_fn", fake_full)
+        monkeypatch.setattr(judge_eval, "run_champion_challenger", fake_cc)
+        monkeypatch.setattr(judge_full_ft, "load_full_scorer", fake_scorer)
+        monkeypatch.setattr(
+            relevance_judge, "build_judge_provider",
+            lambda full_model_dir=None: FakeRelevanceJudgeProvider(default=0.0),
         )
 
-    monkeypatch.setattr(judge_eval, "run_champion_challenger", fake)
-
-
-def _fake_base_judge(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        relevance_judge, "build_judge_provider",
-        lambda adapter_dir=None: FakeRelevanceJudgeProvider(default=0.0),
-    )
-
-
-def _fresh_scorer(monkeypatch: pytest.MonkeyPatch, score_map: dict[tuple[str, str], float]) -> None:
-    """`load_lora_scorer(base, adapter)` -> a scorer returning FRESH scores
-    (distinct from the logged raw scores) so C4 can prove the knob is fit on
-    fresh, not logged."""
-    monkeypatch.setattr(
-        judge_lora, "load_lora_scorer",
-        lambda base, adapter, **kw: (lambda item: score_map.get((item[0], item[1]), 3.14)),
-    )
-
-
-# ---------------------------------------------------------------------------
-# C1 / C2 / C4 / C16 — ACCEPT path.
-# ---------------------------------------------------------------------------
-
-
-def test_accept_persists_adapter_rescore_knob_and_consumes_doc_having_only(
-    store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    ids = _seed_scenario(store)
-    _force_midbeefy(monkeypatch)
-    _small_tunables(monkeypatch)
-    captured: dict = {}
-    _fake_retrain_factory(monkeypatch, captured)
-    _fake_cc(monkeypatch, accepted=True, captured=captured)
-    _fake_base_judge(monkeypatch)
-    # Fresh tuned scores DISTINCT from the logged raw scores.
-    _fresh_scorer(monkeypatch, {})  # default 3.14 for every (q,d) -> a constant fresh score
-
-    now = datetime.now(UTC)
-    result = judge_selftune._run_judge_selftune_tick(
-        store=store, now=now, persona_dir=tmp_path
-    )
-
-    assert result["fired"] is True and result["accepted"] is True
-    assert result["adapter_persisted"] is True
-    assert result["error"] is None
-
-    # C3: the champion pointer resolves to the persisted adapter.
-    champ = judge_lora.resolve_champion_adapter(judge_lora.champion_dir(tmp_path))
-    assert champ is not None and (champ / "adapter_model.txt").exists()
-
-    # C2: only Haiku triples were fed. train items are (query, doc, label)
-    # 3-tuples; test items are run_champion_challenger's ((query, doc), label)
-    # shape. Split is disjoint (no leakage), and the doc-absent row q4 never
-    # appears (no doc snapshot to forward-pass / train on).
-    assert all(len(item) == 3 for item in captured["cc_train"]), "(query, doc, label) triples"
-    train_qd = {(q, d) for (q, d, _l) in captured["cc_train"]}
-    test_qd = {(qd[0], qd[1]) for (qd, _l) in captured["cc_test"]}
-    assert all(q != "q4" for (q, _d) in train_qd | test_qd), "doc-absent row excluded"
-    assert train_qd.isdisjoint(test_qd), "no train/test leakage"
-
-    # C4: the persisted knob equals fit on FRESH scores (all 3.14 -> single
-    # score value -> fit_platt_knob returns the identity for a degenerate
-    # single-score fit, i.e. NOT the logged-score fit which would separate).
-    knob = store.get_judge_knob_calibration(MODEL_RELEVANCE_JUDGE)
-    assert knob is not None
-    rescore_items = store.judge_knob_refit_rescore_items(
-        [ids["r1"], ids["r2"], ids["r3"], ids["r4_docabsent"]]
-    )
-    fresh_pairs = [(3.14, label) for (_q, _d, label) in rescore_items]
-    expected_slope, expected_intercept = judge_selftune.fit_platt_knob(fresh_pairs)
-    assert knob["slope"] == pytest.approx(expected_slope)
-    assert knob["intercept"] == pytest.approx(expected_intercept)
-    logged_pairs = store.judge_knob_refit_pairs(
-        [ids["r1"], ids["r2"], ids["r3"], ids["r4_docabsent"]]
-    )
-    logged_slope, logged_intercept = judge_selftune.fit_platt_knob(logged_pairs)
-    assert (knob["slope"], knob["intercept"]) != (logged_slope, logged_intercept), (
-        "knob must be fit on fresh tuned scores, NOT the logged scores"
-    )
-
-    # C16 (accept): doc-having rows consumed; the legacy doc-absent row is NOT
-    # (it was not trained here — 2B).
-    assert _consumed(store, ids["r1"]) and _consumed(store, ids["r2"]) and _consumed(store, ids["r3"])
-    assert not _consumed(store, ids["r4_docabsent"]), "doc-absent row stays re-eligible (2B)"
-
-
-# ---------------------------------------------------------------------------
-# C1 / C5 / C16 — REVERT path.
-# ---------------------------------------------------------------------------
-
-
-def test_revert_keeps_champion_uses_logged_knob_and_consumes_full_set(
-    store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    ids = _seed_scenario(store)
-    _force_midbeefy(monkeypatch)
-    _small_tunables(monkeypatch)
-    captured: dict = {}
-    _fake_retrain_factory(monkeypatch, captured)
-    _fake_cc(monkeypatch, accepted=False, captured=captured)
-    _fake_base_judge(monkeypatch)
-    # If load_lora_scorer were called on revert this would blow up (it must
-    # NOT be — revert reuses logged scores).
-    monkeypatch.setattr(
-        judge_lora, "load_lora_scorer",
-        lambda *a, **k: pytest.fail("load_lora_scorer must not run on REVERT (C5)"),
-    )
-
-    now = datetime.now(UTC)
-    result = judge_selftune._run_judge_selftune_tick(store=store, now=now, persona_dir=tmp_path)
-
-    assert result["fired"] is True and result["accepted"] is False
-    assert result["adapter_persisted"] is False
-    # C5: champion pointer never swapped (no adapter live).
-    assert judge_lora.resolve_champion_adapter(judge_lora.champion_dir(tmp_path)) is None
-    # knob fit on the LOGGED pairs (inc3 path).
-    all_ids = [ids["r1"], ids["r2"], ids["r3"], ids["r4_docabsent"]]
-    logged_slope, logged_intercept = judge_selftune.fit_platt_knob(
-        store.judge_knob_refit_pairs(all_ids)
-    )
-    knob = store.get_judge_knob_calibration(MODEL_RELEVANCE_JUDGE)
-    assert (knob["slope"], knob["intercept"]) == pytest.approx((logged_slope, logged_intercept))
-    # C16 (revert): the doc-agnostic logged fit trained on every row -> consume
-    # the FULL set incl. the doc-absent row.
-    assert all(_consumed(store, rid) for rid in all_ids)
-
-
-# ---------------------------------------------------------------------------
-# C1 (degenerate floor) — too few Haiku triples -> weak knob-refit, keep champ.
-# ---------------------------------------------------------------------------
-
-
-def test_thin_haiku_data_falls_through_to_weak_knob_refit(
-    store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    ids = _seed_scenario(store)
-    _force_midbeefy(monkeypatch)
-    _small_tunables(monkeypatch, min_n=99)  # min_n far above available triples
-    monkeypatch.setattr(
-        judge_eval, "run_champion_challenger",
-        lambda **k: pytest.fail("champion/challenger must not run below min_n (degenerate floor)"),
-    )
-    now = datetime.now(UTC)
-    result = judge_selftune._run_judge_selftune_tick(store=store, now=now, persona_dir=tmp_path)
-    assert result["fired"] is True and result["accepted"] is None
-    # weak floor consumes the FULL set (logged knob trained on all).
-    assert all(
-        _consumed(store, rid) for rid in [ids["r1"], ids["r2"], ids["r3"], ids["r4_docabsent"]]
-    )
-    assert judge_lora.resolve_champion_adapter(judge_lora.champion_dir(tmp_path)) is None
-
-
-# ---------------------------------------------------------------------------
-# C7 / C13 — fault before end-consume leaves rows unconsumed; post-swap fault
-# rolls the pointer back.
-# ---------------------------------------------------------------------------
-
-
-def test_fault_before_consume_leaves_rows_unconsumed(
-    store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    ids = _seed_scenario(store)
-    _force_midbeefy(monkeypatch)
-    _small_tunables(monkeypatch)
-    captured: dict = {}
-    _fake_retrain_factory(monkeypatch, captured)
-    _fake_cc(monkeypatch, accepted=True, captured=captured)
-    _fake_base_judge(monkeypatch)
-    _fresh_scorer(monkeypatch, {})
-    # Inject a fault at the knob-write step (AFTER the pointer swap).
-    orig_write = store.write_judge_knob_calibration
-
-    def boom(*a, **k):
-        raise RuntimeError("injected knob-write fault")
-
-    monkeypatch.setattr(store, "write_judge_knob_calibration", boom)
-
-    now = datetime.now(UTC)
-    result = judge_selftune._run_judge_selftune_tick(store=store, now=now, persona_dir=tmp_path)
-
-    assert result["fired"] is False and result["error"] is not None
-    # C7: nothing consumed (consume is LAST, after the failed knob-write).
-    assert not any(
-        _consumed(store, rid) for rid in [ids["r1"], ids["r2"], ids["r3"], ids["r4_docabsent"]]
-    )
-    # C13: this was a FIRST-EVER tune, so the post-swap-fault rollback CLEARS
-    # the pointer -> resolves to base (I9), never a half-committed champion.
-    assert judge_lora.resolve_champion_adapter(judge_lora.champion_dir(tmp_path)) is None
-    del orig_write
-
-
-def test_post_swap_fault_rolls_pointer_back_to_prior_champion(
-    store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    # Pre-existing champion adapter for this persona.
-    root = judge_lora.champion_dir(tmp_path)
-    prior = judge_lora.staged_adapter_path(root)
-    prior.mkdir(parents=True)
-    (prior / "adapter_model.txt").write_text("prior", encoding="utf-8")
-    judge_lora.swap_champion_pointer(root, prior)
-
-    _seed_scenario(store)
-    _force_midbeefy(monkeypatch)
-    _small_tunables(monkeypatch)
-    captured: dict = {}
-    _fake_retrain_factory(monkeypatch, captured)
-    _fake_cc(monkeypatch, accepted=True, captured=captured)
-    # champion here is the tuned (prior) adapter -> load_lora_scorer is called
-    # for BOTH the champion and the re-score; return a scorer either way.
-    monkeypatch.setattr(judge_lora, "load_lora_scorer", lambda *a, **k: (lambda item: 1.0))
-    monkeypatch.setattr(store, "write_judge_knob_calibration", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
-
-    result = judge_selftune._run_judge_selftune_tick(
-        store=store, now=datetime.now(UTC), persona_dir=tmp_path
-    )
-    assert result["error"] is not None
-    # C13: pointer rolled back to the PRIOR champion (last-known-good).
-    assert judge_lora.resolve_champion_adapter(root) == prior
-
-
-# ---------------------------------------------------------------------------
-# C11 — the weak-tier path imports no torch (extends the existing AC8 guard to
-# the new dispatch). C17 — adapter judges are not cached.
-# ---------------------------------------------------------------------------
-
-
-def test_provider_cache_does_not_grow_across_adapter_builds(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    # C17: build_judge_provider(adapter_dir=...) never caches the adapter judge.
-    # Restore the REAL build_judge_provider (the autouse fixture stubs it).
-    monkeypatch.setattr(relevance_judge, "build_judge_provider", _REAL_BUILD_JUDGE_PROVIDER)
-    relevance_judge._reset_judge_provider_cache()
-    monkeypatch.setattr(judge_lora, "load_lora_scorer", lambda *a, **k: (lambda item: 0.0))
-    for i in range(5):
-        judge = relevance_judge.build_judge_provider(adapter_dir=f"/tmp/adapter-{i}")
-        assert isinstance(judge, relevance_judge.LoraAdapterJudge)
-    assert len(relevance_judge._provider_cache) == 0, "adapter judges must not be cached"
-
-
-# ===========================================================================
-# F2c inc6 — the BEEFY (full-FT) tier dispatch, mirroring the LoRA lifecycle
-# above on the FULL store (`judge_lora.full_champion_dir`). Scripted RAM forces
-# FULL_FT; the full-FT mechanism is monkeypatched (no real model), exactly as
-# the LoRA tests monkeypatch the LoRA mechanism.
-# ===========================================================================
-
-
-def _force_beefy(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Scripted RAM so tier-detect selects the BEEFY (full-FT) tier with
-    generous OOM headroom (no downgrade)."""
-    monkeypatch.setattr(
-        judge_selftune, "_read_total_ram_bytes",
-        lambda: judge_selftune.JUDGE_TUNE_RAM_TIER_FULL_FT_MIN_BYTES + 1.0,
-    )
-    monkeypatch.setattr(
-        judge_selftune, "_available_ram_headroom_bytes",
-        lambda: judge_selftune.JUDGE_TUNE_FOOTPRINT_FULL_FT_BYTES + 1.0,
-    )
-
-
-def _fake_full_retrain_factory(monkeypatch: pytest.MonkeyPatch, captured: dict) -> None:
-    """`build_full_ft_retrain_fn(..., save_full_dir=X)` -> a retrain_fn that
-    writes a dummy full model to X and returns a fake label fn."""
-
-    def fake_build(base, *, save_full_dir=None, **kw):
-        captured["save_full_dir"] = save_full_dir
+    def _retrain(self, method: str, start, staged):
+        rec = {"method": method, "start": str(start), "staged": staged}
+        self.builds.append(rec)
 
         def retrain_fn(train_items):
-            captured["full_train_items"] = list(train_items)
-            Path(save_full_dir).mkdir(parents=True, exist_ok=True)
-            (Path(save_full_dir) / "model.safetensors.txt").write_text("x", encoding="utf-8")
+            rec["train_items"] = list(train_items)
+            _write_plain_checkpoint(Path(staged), marker=f"{method}-{len(self.builds)}")
             return lambda item: "relevant"
 
         return retrain_fn
 
-    monkeypatch.setattr(judge_full_ft, "build_full_ft_retrain_fn", fake_build)
+
+def _tick(store: MemoryStore, persona_dir: Path) -> dict:
+    return judge_selftune._run_judge_selftune_tick(store=store, now=datetime.now(UTC), persona_dir=persona_dir)
 
 
-def _fresh_full_scorer(monkeypatch: pytest.MonkeyPatch, score_map: dict[tuple[str, str], float]) -> None:
-    monkeypatch.setattr(
-        judge_full_ft, "load_full_scorer",
-        lambda d, **kw: (lambda item: score_map.get((item[0], item[1]), 3.14)),
-    )
+def _root(persona_dir: Path) -> Path:
+    return judge_lora.champion_dir(persona_dir)
 
 
-def _full_root(tmp_path: Path) -> Path:
-    return judge_lora.full_champion_dir(tmp_path)
+def _pointer_bytes(persona_dir: Path) -> bytes | None:
+    p = _root(persona_dir) / "current"
+    return p.read_bytes() if p.exists() else None
 
 
-# --- C7: BEEFY dispatches to the full-FT mechanism + writes the FULL store ---
+def _stored_dirs(persona_dir: Path) -> set[str]:
+    root = _root(persona_dir)
+    if not root.is_dir():
+        return set()
+    return {e.name for e in root.iterdir() if e.is_dir() and e.name.startswith("adapter-")}
 
 
-def test_beefy_tier_dispatches_full_ft_and_writes_full_store(
-    store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    _seed_scenario(store)
-    _force_beefy(monkeypatch)
-    _small_tunables(monkeypatch)
-    captured: dict = {}
-    _fake_full_retrain_factory(monkeypatch, captured)
-    _fake_cc(monkeypatch, accepted=True, captured=captured)
-    _fake_base_judge(monkeypatch)
-    _fresh_full_scorer(monkeypatch, {})
-    # The LoRA mechanism must NOT be used for the FULL_FT tier (bite against the
-    # pre-inc6 placeholder, which routed FULL_FT through build_lora_retrain_fn).
-    monkeypatch.setattr(
-        judge_lora, "build_lora_retrain_fn",
-        lambda *a, **k: pytest.fail("FULL_FT tier must use build_full_ft_retrain_fn, not LoRA"),
-    )
-
-    result = judge_selftune._run_judge_selftune_tick(
-        store=store, now=datetime.now(UTC), persona_dir=tmp_path
-    )
-    assert result["fired"] is True and result["accepted"] is True
-    assert result["tune_grade"] == judge_selftune.TUNE_GRADE_FULL_FT
-    # The FULL store's champion pointer resolves; the LoRA store is untouched.
-    assert judge_lora.resolve_champion_adapter(_full_root(tmp_path)) is not None
-    assert judge_lora.resolve_champion_adapter(judge_lora.champion_dir(tmp_path)) is None
-    assert captured["save_full_dir"] is not None
+def _current(persona_dir: Path) -> Path | None:
+    return judge_lora.resolve_current_checkpoint(persona_dir)
 
 
-# --- C8: full-FT ACCEPT reuses the slice-2 lifecycle (re-score on tuned model,
-#         2B consume) on the FULL store ---
+def _place_checkpoint(persona_dir: Path) -> Path:
+    root = _root(persona_dir)
+    d = judge_lora.staged_adapter_path(root)
+    _write_plain_checkpoint(d, "prior")
+    judge_lora.swap_champion_pointer(root, d)
+    return d
 
 
-def test_full_ft_accept_rescore_knob_and_consumes_doc_having_only(
-    store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+GRADES = [judge_selftune.TUNE_GRADE_LORA, judge_selftune.TUNE_GRADE_FULL_FT]
+
+
+# ---------------------------------------------------------------------------
+# ACCEPT path (carried C1/C2/C4/C16; L7; S1 plain checkpoint; H4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("grade", GRADES)
+def test_accept_swaps_in_plain_checkpoint_rescores_knob_and_consumes_doc_having_only(
+    grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     ids = _seed_scenario(store)
-    _force_beefy(monkeypatch)
+    _set_tier(monkeypatch, grade)
     _small_tunables(monkeypatch)
-    captured: dict = {}
-    _fake_full_retrain_factory(monkeypatch, captured)
-    _fake_cc(monkeypatch, accepted=True, captured=captured)
-    _fake_base_judge(monkeypatch)
-    _fresh_full_scorer(monkeypatch, {})  # constant fresh 3.14
+    env = Env(monkeypatch)
+    real_replace = os.replace
+    replaced: list[tuple[str, str]] = []
 
-    now = datetime.now(UTC)
-    result = judge_selftune._run_judge_selftune_tick(store=store, now=now, persona_dir=tmp_path)
-    assert result["accepted"] is True and result["adapter_persisted"] is True
+    def spy_replace(src, dst):
+        replaced.append((str(src), str(dst)))
+        return real_replace(src, dst)
 
-    champ = judge_lora.resolve_champion_adapter(_full_root(tmp_path))
-    assert champ is not None and (champ / "model.safetensors.txt").exists()
+    monkeypatch.setattr(judge_lora.os, "replace", spy_replace)
 
-    # only Haiku triples fed; doc-absent row q4 excluded; no leakage.
-    train_qd = {(q, d) for (q, d, _l) in captured["cc_train"]}
-    test_qd = {(qd[0], qd[1]) for (qd, _l) in captured["cc_test"]}
-    assert all(q != "q4" for (q, _d) in train_qd | test_qd)
+    result = _tick(store, tmp_path)
+
+    assert result["fired"] is True and result["accepted"] is True and result["error"] is None
+    assert result["adapter_persisted"] is True and result["method"] == grade
+    # One store, one pointer, naming the staged plain checkpoint (S1, S2).
+    cur = _current(tmp_path)
+    assert cur is not None and cur == Path(env.builds[0]["staged"])
+    assert not (cur / "adapter_config.json").exists()
+    assert not (_root(tmp_path) / "full").exists(), "no per-tier sub-store"
+    assert any(dst.endswith(os.sep + "current") for (_s, dst) in replaced), "pointer swapped via os.replace"
+    # Haiku-only triples, doc-absent row excluded, no leakage (carried C2).
+    train_qd = {(q, d) for (q, d, _l) in env.cc_train}
+    test_qd = {(qd[0], qd[1]) for (qd, _l) in env.cc_test}
+    assert all(not q.endswith("q4") for (q, _d) in train_qd | test_qd)
     assert train_qd.isdisjoint(test_qd)
-
-    # knob = fit on FRESH tuned scores (all 3.14), NOT the logged scores.
+    # L7: the knob is fit on scores re-scored through the NEW checkpoint (the
+    # serve loader), not the logged scores.
+    assert env.scorer_dirs[-1] == str(cur)
     knob = store.get_judge_knob_calibration(MODEL_RELEVANCE_JUDGE)
-    all_ids = [ids["r1"], ids["r2"], ids["r3"], ids["r4_docabsent"]]
-    rescore_items = store.judge_knob_refit_rescore_items(all_ids)
-    fresh_pairs = [(3.14, label) for (_q, _d, label) in rescore_items]
-    exp_slope, exp_intercept = judge_selftune.fit_platt_knob(fresh_pairs)
-    assert knob["slope"] == pytest.approx(exp_slope) and knob["intercept"] == pytest.approx(exp_intercept)
-    logged_slope, logged_intercept = judge_selftune.fit_platt_knob(store.judge_knob_refit_pairs(all_ids))
-    assert (knob["slope"], knob["intercept"]) != (logged_slope, logged_intercept)
-
-    # 2B consume: doc-having consumed, doc-absent stays re-eligible.
+    fresh = [(3.14, label) for (_q, _d, label) in store.judge_knob_refit_rescore_items(_all_ids(ids))]
+    assert (knob["slope"], knob["intercept"]) == pytest.approx(judge_selftune.fit_platt_knob(fresh))
+    logged = judge_selftune.fit_platt_knob(store.judge_knob_refit_pairs(_all_ids(ids)))
+    assert (knob["slope"], knob["intercept"]) != pytest.approx(logged)
+    # 2B consume.
     assert _consumed(store, ids["r1"]) and _consumed(store, ids["r2"]) and _consumed(store, ids["r3"])
     assert not _consumed(store, ids["r4_docabsent"])
+    # H4: observability.
+    assert result["current"] == "base" and result["start"] == "base"
 
 
-# --- C9: full-FT REVERT keeps champ + logged knob + full-set consume; and the
-#         degenerate floor falls through to the weak knob-refit ---
+# ---------------------------------------------------------------------------
+# REVERT path (carried C5/C16; S2; H4)
+# ---------------------------------------------------------------------------
 
 
-def test_full_ft_revert_keeps_champion_and_consumes_full_set(
-    store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("grade", GRADES)
+def test_revert_keeps_champion_uses_logged_knob_and_consumes_full_set(
+    grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    prior = _place_checkpoint(tmp_path)
     ids = _seed_scenario(store)
-    _force_beefy(monkeypatch)
+    _set_tier(monkeypatch, grade)
     _small_tunables(monkeypatch)
-    captured: dict = {}
-    _fake_full_retrain_factory(monkeypatch, captured)
-    _fake_cc(monkeypatch, accepted=False, captured=captured)
-    _fake_base_judge(monkeypatch)
-    monkeypatch.setattr(
-        judge_full_ft, "load_full_scorer",
-        lambda *a, **k: pytest.fail("load_full_scorer must not run on REVERT (logged knob)"),
-    )
+    env = Env(monkeypatch)
+    env.accept = False
+    before = _pointer_bytes(tmp_path)
 
-    now = datetime.now(UTC)
-    result = judge_selftune._run_judge_selftune_tick(store=store, now=now, persona_dir=tmp_path)
-    assert result["accepted"] is False and result["adapter_persisted"] is False
-    assert judge_lora.resolve_champion_adapter(_full_root(tmp_path)) is None
-    all_ids = [ids["r1"], ids["r2"], ids["r3"], ids["r4_docabsent"]]
-    logged = judge_selftune.fit_platt_knob(store.judge_knob_refit_pairs(all_ids))
+    result = _tick(store, tmp_path)
+
+    assert result["fired"] is True and result["accepted"] is False and result["adapter_persisted"] is False
+    assert _pointer_bytes(tmp_path) == before, "pointer untouched on revert (S2)"
+    assert _stored_dirs(tmp_path) == {prior.name}, "rejected staged dir reaped; champion kept (S3b)"
+    # Re-score never ran: the only load was the champion (the current model).
+    assert env.scorer_dirs == [str(prior)]
+    logged = judge_selftune.fit_platt_knob(store.judge_knob_refit_pairs(_all_ids(ids)))
     knob = store.get_judge_knob_calibration(MODEL_RELEVANCE_JUDGE)
     assert (knob["slope"], knob["intercept"]) == pytest.approx(logged)
-    assert all(_consumed(store, rid) for rid in all_ids)
+    assert all(_consumed(store, rid) for rid in _all_ids(ids))
+    # H4 on a revert: current and start both name the unchanged champion.
+    assert result["current"] == prior.name and result["start"] == prior.name
 
 
-def test_full_ft_thin_haiku_data_falls_through_to_weak_knob_refit(
-    store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("grade", GRADES)
+def test_thin_haiku_data_falls_through_to_weak_knob_refit(
+    grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    prior = _place_checkpoint(tmp_path)
     ids = _seed_scenario(store)
-    _force_beefy(monkeypatch)
+    _set_tier(monkeypatch, grade)
     _small_tunables(monkeypatch, min_n=99)
     monkeypatch.setattr(
         judge_eval, "run_champion_challenger",
         lambda **k: pytest.fail("champion/challenger must not run below min_n (degenerate floor)"),
     )
-    result = judge_selftune._run_judge_selftune_tick(
-        store=store, now=datetime.now(UTC), persona_dir=tmp_path
-    )
+    before = _pointer_bytes(tmp_path)
+    result = _tick(store, tmp_path)
     assert result["fired"] is True and result["accepted"] is None
-    assert all(_consumed(store, rid) for rid in [ids["r1"], ids["r2"], ids["r3"], ids["r4_docabsent"]])
-    assert judge_lora.resolve_champion_adapter(_full_root(tmp_path)) is None
+    assert all(_consumed(store, rid) for rid in _all_ids(ids))
+    assert _pointer_bytes(tmp_path) == before and _stored_dirs(tmp_path) == {prior.name}
 
 
-# --- C10: consume-at-end / crash-safety preserved for the full tier ---
+# ---------------------------------------------------------------------------
+# S4 — crash-safety with a commit point
+# ---------------------------------------------------------------------------
 
 
-def test_full_ft_fault_before_consume_leaves_rows_unconsumed(
-    store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("grade", GRADES)
+def test_fault_before_swap_leaves_pointer_reaps_staged_and_rows_unconsumed(
+    grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    prior = _place_checkpoint(tmp_path)
     ids = _seed_scenario(store)
-    _force_beefy(monkeypatch)
+    _set_tier(monkeypatch, grade)
     _small_tunables(monkeypatch)
-    captured: dict = {}
-    _fake_full_retrain_factory(monkeypatch, captured)
-    _fake_cc(monkeypatch, accepted=True, captured=captured)
-    _fake_base_judge(monkeypatch)
-    _fresh_full_scorer(monkeypatch, {})
+    Env(monkeypatch)
+    monkeypatch.setattr(
+        store, "judge_knob_refit_rescore_items",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("injected re-score fault")),
+    )
+    before = _pointer_bytes(tmp_path)
+    result = _tick(store, tmp_path)
+    assert result["fired"] is False and result["error"] is not None
+    assert _pointer_bytes(tmp_path) == before
+    assert _stored_dirs(tmp_path) == {prior.name}, "staged dir reaped"
+    assert not any(_consumed(store, rid) for rid in _all_ids(ids))
+
+
+@pytest.mark.parametrize("grade", GRADES)
+def test_fault_after_swap_before_commit_rolls_back_to_prior(
+    grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prior = _place_checkpoint(tmp_path)
+    ids = _seed_scenario(store)
+    _set_tier(monkeypatch, grade)
+    _small_tunables(monkeypatch)
+    Env(monkeypatch)
     monkeypatch.setattr(
         store, "write_judge_knob_calibration",
         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("injected knob-write fault")),
     )
-
-    result = judge_selftune._run_judge_selftune_tick(
-        store=store, now=datetime.now(UTC), persona_dir=tmp_path
-    )
-    assert result["fired"] is False and result["error"] is not None
-    assert not any(
-        _consumed(store, rid) for rid in [ids["r1"], ids["r2"], ids["r3"], ids["r4_docabsent"]]
-    )
-    # first-ever tune -> post-swap-fault rollback CLEARS the full pointer.
-    assert judge_lora.resolve_champion_adapter(_full_root(tmp_path)) is None
+    result = _tick(store, tmp_path)
+    assert result["error"] is not None
+    assert _current(tmp_path) == prior, "rolled back to the prior checkpoint (still on disk)"
+    assert _stored_dirs(tmp_path) == {prior.name}
+    assert not any(_consumed(store, rid) for rid in _all_ids(ids))
 
 
-def test_full_ft_post_swap_fault_rolls_pointer_back_to_prior_full_champion(
-    store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("grade", GRADES)
+def test_first_ever_tune_fault_before_commit_clears_pointer(
+    grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    root = _full_root(tmp_path)
-    prior = judge_lora.staged_adapter_path(root)
-    prior.mkdir(parents=True)
-    (prior / "model.safetensors.txt").write_text("prior", encoding="utf-8")
-    judge_lora.swap_champion_pointer(root, prior)
-
-    _seed_scenario(store)
-    _force_beefy(monkeypatch)
+    ids = _seed_scenario(store)
+    _set_tier(monkeypatch, grade)
     _small_tunables(monkeypatch)
-    captured: dict = {}
-    _fake_full_retrain_factory(monkeypatch, captured)
-    _fake_cc(monkeypatch, accepted=True, captured=captured)
-    # champion here is the prior full model -> load_full_scorer called for both
-    # champion and re-score; return a scorer either way.
-    monkeypatch.setattr(judge_full_ft, "load_full_scorer", lambda *a, **k: (lambda item: 1.0))
+    Env(monkeypatch)
     monkeypatch.setattr(
         store, "write_judge_knob_calibration",
-        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("injected knob-write fault")),
     )
+    result = _tick(store, tmp_path)
+    assert result["fired"] is False and result["error"] is not None
+    assert _current(tmp_path) is None, "first-ever tune: pointer cleared -> base (I9)"
+    assert not any(_consumed(store, rid) for rid in _all_ids(ids))
 
-    result = judge_selftune._run_judge_selftune_tick(
-        store=store, now=datetime.now(UTC), persona_dir=tmp_path
+
+@pytest.mark.parametrize("grade", GRADES)
+def test_fault_after_commit_keeps_new_checkpoint_with_its_knob(
+    grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """S4 window 3 (bite: as built, any post-swap fault rolled the pointer back
+    even after the new knob was written)."""
+    _place_checkpoint(tmp_path)
+    ids = _seed_scenario(store)
+    _set_tier(monkeypatch, grade)
+    _small_tunables(monkeypatch)
+    env = Env(monkeypatch)
+    monkeypatch.setattr(
+        store, "mark_selftune_consumed",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("injected consume fault")),
     )
+    result = _tick(store, tmp_path)
     assert result["error"] is not None
-    assert judge_lora.resolve_champion_adapter(root) == prior
+    new = Path(env.builds[0]["staged"])
+    assert _current(tmp_path) == new, "committed: the new checkpoint keeps serving"
+    knob = store.get_judge_knob_calibration(MODEL_RELEVANCE_JUDGE)
+    fresh = [(3.14, label) for (_q, _d, label) in store.judge_knob_refit_rescore_items(_all_ids(ids))]
+    assert (knob["slope"], knob["intercept"]) == pytest.approx(judge_selftune.fit_platt_knob(fresh))
+    assert not any(_consumed(store, rid) for rid in _all_ids(ids))
 
 
-# --- C17: sibling-clear on ACCEPT keeps exactly one tuned judge live ---
+# ---------------------------------------------------------------------------
+# L1 / L2 — each week's update is applied to the persisting model (AC12)
+# ---------------------------------------------------------------------------
 
 
-def test_full_ft_accept_clears_a_pre_existing_lora_champion(
+@pytest.mark.parametrize(
+    ("week1", "week2"),
+    [
+        (judge_selftune.TUNE_GRADE_LORA, judge_selftune.TUNE_GRADE_LORA),
+        (judge_selftune.TUNE_GRADE_FULL_FT, judge_selftune.TUNE_GRADE_FULL_FT),
+        (judge_selftune.TUNE_GRADE_LORA, judge_selftune.TUNE_GRADE_FULL_FT),
+        (judge_selftune.TUNE_GRADE_FULL_FT, judge_selftune.TUNE_GRADE_LORA),
+    ],
+)
+def test_week_two_starts_from_week_one_champion_and_trains_on_its_own_rows(
+    week1: str, week2: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _small_tunables(monkeypatch)
+    env = Env(monkeypatch)
+    _seed_scenario(store, "w1")
+    _set_tier(monkeypatch, week1)
+    r1 = _tick(store, tmp_path)
+    assert r1["accepted"] is True
+    c1 = _current(tmp_path)
+    assert env.builds[0]["start"] == MODEL_RELEVANCE_JUDGE, "a never-tuned persona starts from base"
+
+    _seed_scenario(store, "w2")
+    _set_tier(monkeypatch, week2)
+    r2 = _tick(store, tmp_path)
+    assert r2["accepted"] is True
+    assert env.builds[1]["method"] == week2
+    assert env.builds[1]["start"] == str(c1), "week 2 is applied ON TOP OF week 1's champion"
+    queries = {q for (q, _d, _l) in env.builds[1]["train_items"]}
+    assert queries and all(q.startswith("w2") for q in queries), "trains on this tick's labels only"
+    assert r2["start"] == c1.name and r2["current"] == c1.name
+    assert _current(tmp_path) == Path(env.builds[1]["staged"])
+
+
+@pytest.mark.parametrize("grade", GRADES)
+def test_week_after_a_revert_starts_from_the_unchanged_champion(
+    grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prior = _place_checkpoint(tmp_path)
+    _small_tunables(monkeypatch)
+    _set_tier(monkeypatch, grade)
+    env = Env(monkeypatch)
+    env.accept = False
+    _seed_scenario(store, "w1")
+    assert _tick(store, tmp_path)["accepted"] is False
+    rejected = Path(env.builds[0]["staged"])
+    assert not rejected.exists(), "the rejected attempt is gone"
+
+    env.accept = True
+    _seed_scenario(store, "w2")
+    assert _tick(store, tmp_path)["accepted"] is True
+    assert env.builds[1]["start"] == str(prior), "trains the model that never got the rejected adjustment"
+
+
+# ---------------------------------------------------------------------------
+# L3 — dispatch matrix (6 cells) / L4 — champion is the serving model
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("has_checkpoint", [False, True])
+@pytest.mark.parametrize(
+    "grade",
+    [judge_selftune.TUNE_GRADE_KNOB_REFIT, judge_selftune.TUNE_GRADE_LORA, judge_selftune.TUNE_GRADE_FULL_FT],
+)
+def test_dispatch_matrix(
+    grade: str, has_checkpoint: bool, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prior = _place_checkpoint(tmp_path) if has_checkpoint else None
+    _seed_scenario(store)
+    _set_tier(monkeypatch, grade)
+    _small_tunables(monkeypatch)
+    env = Env(monkeypatch)
+    before = _pointer_bytes(tmp_path)
+    result = _tick(store, tmp_path)
+    assert result["fired"] is True and result["method"] == grade
+    if grade == judge_selftune.TUNE_GRADE_KNOB_REFIT:
+        assert env.builds == [], "knob week trains no weights"
+        assert _pointer_bytes(tmp_path) == before
+        # H4 on a knob week: current and start both name the serving model.
+        expected = prior.name if prior is not None else "base"
+        assert result["current"] == expected and result["start"] == expected
+        return
+    expected_start = str(prior) if prior is not None else MODEL_RELEVANCE_JUDGE
+    assert [b["method"] for b in env.builds] == [grade]
+    assert env.builds[0]["start"] == expected_start
+    assert _current(tmp_path) == Path(env.builds[0]["staged"])
+    # L4: the champion evaluated was the serving model.
+    if prior is not None:
+        assert env.scorer_dirs[0] == str(prior), "champion loaded from the current checkpoint"
+    else:
+        assert env.scorer_dirs == [str(_current(tmp_path))], "base champion: only the re-score loaded"
+
+
+# ---------------------------------------------------------------------------
+# L5 / L6 — a RAM tier change never swaps in a different model (AC13)
+# ---------------------------------------------------------------------------
+
+
+def test_drop_to_weak_tier_only_refits_the_knob_on_the_same_model(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # Pre-existing LoRA champion (from an earlier mid-tier week).
-    lora_root = judge_lora.champion_dir(tmp_path)
-    lora_prior = judge_lora.staged_adapter_path(lora_root)
-    lora_prior.mkdir(parents=True)
-    (lora_prior / "adapter_model.txt").write_text("lora", encoding="utf-8")
-    judge_lora.swap_champion_pointer(lora_root, lora_prior)
-    assert judge_lora.resolve_champion_adapter(lora_root) is not None
-
-    _seed_scenario(store)
-    _force_beefy(monkeypatch)
     _small_tunables(monkeypatch)
-    captured: dict = {}
-    _fake_full_retrain_factory(monkeypatch, captured)
-    _fake_cc(monkeypatch, accepted=True, captured=captured)
-    _fake_base_judge(monkeypatch)
-    _fresh_full_scorer(monkeypatch, {})
+    env = Env(monkeypatch)
+    _seed_scenario(store, "w1")
+    _set_tier(monkeypatch, judge_selftune.TUNE_GRADE_FULL_FT)
+    assert _tick(store, tmp_path)["accepted"] is True
+    before_ptr, before_dirs = _pointer_bytes(tmp_path), _stored_dirs(tmp_path)
 
-    result = judge_selftune._run_judge_selftune_tick(
-        store=store, now=datetime.now(UTC), persona_dir=tmp_path
-    )
-    assert result["accepted"] is True
-    # The FULL champion is live; the sibling LoRA pointer was CLEARED (spec §1
-    # "alternatives, never both"), so resolve_serving_tuned_judge -> ("full", …).
-    assert judge_lora.resolve_champion_adapter(_full_root(tmp_path)) is not None
-    assert judge_lora.resolve_champion_adapter(lora_root) is None
-    kind, _dir = judge_lora.resolve_serving_tuned_judge(tmp_path)
-    assert kind == "full"
+    ids = _seed_scenario(store, "w2")
+    # The week-1 doc-absent row stays unconsumed after an accept (2B), so the
+    # weak week's logged fit covers every row the gate scanned this tick.
+    _count, tick_rows = store.count_new_haiku_decisions()
+    _set_tier(monkeypatch, judge_selftune.TUNE_GRADE_KNOB_REFIT)
+    result = _tick(store, tmp_path)
+    assert result["fired"] is True and result["method"] == judge_selftune.TUNE_GRADE_KNOB_REFIT
+    served = _current(tmp_path).name
+    assert result["current"] == served and result["start"] == served
+    assert _pointer_bytes(tmp_path) == before_ptr and _stored_dirs(tmp_path) == before_dirs
+    assert len(env.builds) == 1, "no weight training on the weak week"
+    logged = judge_selftune.fit_platt_knob(store.judge_knob_refit_pairs(tick_rows))
+    knob = store.get_judge_knob_calibration(MODEL_RELEVANCE_JUDGE)
+    assert (knob["slope"], knob["intercept"]) == pytest.approx(logged)
+    assert all(_consumed(store, rid) for rid in tick_rows) and set(_all_ids(ids)) <= set(tick_rows)
 
 
-def test_lora_accept_clears_a_pre_existing_full_champion(
+@pytest.mark.parametrize("accept_week2", [True, False])
+def test_beefy_to_mid_drop_runs_lora_on_the_same_model(
+    accept_week2: bool, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _small_tunables(monkeypatch)
+    env = Env(monkeypatch)
+    _seed_scenario(store, "w1")
+    _set_tier(monkeypatch, judge_selftune.TUNE_GRADE_FULL_FT)
+    assert _tick(store, tmp_path)["accepted"] is True
+    c1 = _current(tmp_path)
+    before_ptr = _pointer_bytes(tmp_path)
+
+    env.accept = accept_week2
+    _seed_scenario(store, "w2")
+    _set_tier(monkeypatch, judge_selftune.TUNE_GRADE_LORA)
+    result = _tick(store, tmp_path)
+    assert env.builds[1]["method"] == judge_selftune.TUNE_GRADE_LORA
+    assert env.builds[1]["start"] == str(c1), "the LoRA trains on the fine-tuned model, not the base"
+    if accept_week2:
+        assert result["accepted"] is True
+        assert _current(tmp_path) == Path(env.builds[1]["staged"])
+        assert _stored_dirs(tmp_path) == {Path(env.builds[1]["staged"]).name}, "previous deleted (Q1)"
+    else:
+        assert result["accepted"] is False
+        assert _pointer_bytes(tmp_path) == before_ptr and c1.exists()
+
+
+# ---------------------------------------------------------------------------
+# S3 — delete-after-swap (ruling Q1), with retry on a later tick
+# ---------------------------------------------------------------------------
+
+
+def test_stored_dir_set_across_a_week_sequence(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # Symmetric: a mid-tier LoRA accept clears a pre-existing FULL champion.
-    full_root = _full_root(tmp_path)
-    full_prior = judge_lora.staged_adapter_path(full_root)
-    full_prior.mkdir(parents=True)
-    (full_prior / "model.safetensors.txt").write_text("full", encoding="utf-8")
-    judge_lora.swap_champion_pointer(full_root, full_prior)
-
-    _seed_scenario(store)
-    _force_midbeefy(monkeypatch)  # LoRA tier
     _small_tunables(monkeypatch)
-    captured: dict = {}
-    _fake_retrain_factory(monkeypatch, captured)  # LoRA retrain fake
-    _fake_cc(monkeypatch, accepted=True, captured=captured)
-    _fake_base_judge(monkeypatch)
-    _fresh_scorer(monkeypatch, {})
+    env = Env(monkeypatch)
 
-    result = judge_selftune._run_judge_selftune_tick(
-        store=store, now=datetime.now(UTC), persona_dir=tmp_path
-    )
-    assert result["accepted"] is True
-    assert judge_lora.resolve_champion_adapter(judge_lora.champion_dir(tmp_path)) is not None
-    assert judge_lora.resolve_champion_adapter(full_root) is None
+    def week(tag: str, grade: str, accept: bool) -> dict:
+        env.accept = accept
+        _seed_scenario(store, tag)
+        _set_tier(monkeypatch, grade)
+        return _tick(store, tmp_path)
+
+    assert week("a", judge_selftune.TUNE_GRADE_FULL_FT, True)["accepted"] is True
+    c1 = Path(env.builds[-1]["staged"]).name
+    assert _stored_dirs(tmp_path) == {c1}
+
+    assert week("b", judge_selftune.TUNE_GRADE_LORA, True)["accepted"] is True
+    c2 = Path(env.builds[-1]["staged"]).name
+    assert _stored_dirs(tmp_path) == {c2}, "C1 deleted in the same tick as the swap"
+
+    assert week("c", judge_selftune.TUNE_GRADE_KNOB_REFIT, True)["method"] == judge_selftune.TUNE_GRADE_KNOB_REFIT
+    assert _stored_dirs(tmp_path) == {c2}
+
+    assert week("d", judge_selftune.TUNE_GRADE_LORA, False)["accepted"] is False
+    assert _stored_dirs(tmp_path) == {c2}
+
+    assert week("e", judge_selftune.TUNE_GRADE_FULL_FT, True)["accepted"] is True
+    c3 = Path(env.builds[-1]["staged"]).name
+    assert _stored_dirs(tmp_path) == {c3}
+    assert _current(tmp_path).name == c3
+
+
+def test_refused_delete_is_not_raised_and_a_later_tick_reaps_it(
+    store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prior = _place_checkpoint(tmp_path)
+    ids = _seed_scenario(store)
+    _set_tier(monkeypatch, judge_selftune.TUNE_GRADE_LORA)
+    _small_tunables(monkeypatch)
+    env = Env(monkeypatch)
+    real_rmtree = judge_lora.shutil.rmtree
+    refuse = {"on": True}
+
+    def rmtree(path, *a, **k):
+        if refuse["on"] and Path(path) == prior:
+            raise PermissionError("[WinError 32] The process cannot access the file")
+        return real_rmtree(path, *a, **k)
+
+    monkeypatch.setattr(judge_lora.shutil, "rmtree", rmtree)
+
+    result = _tick(store, tmp_path)
+    assert result["accepted"] is True and result["error"] is None, "a refused delete is not raised"
+    new = Path(env.builds[0]["staged"])
+    assert _current(tmp_path) == new
+    assert all(_consumed(store, rid) for rid in [ids["r1"], ids["r2"], ids["r3"]])
+    assert prior.exists(), "leftover stays until a later tick"
+
+    # Next tick: nothing new to train on (gate does not fire), the OS now
+    # allows the delete, and the leftover is reaped; the served one is kept.
+    refuse["on"] = False
+    r2 = _tick(store, tmp_path)
+    assert r2["fired"] is False
+    assert not prior.exists()
+    assert _current(tmp_path) == new and _stored_dirs(tmp_path) == {new.name}
+
+
+def test_pointer_to_a_legacy_adapter_dir_trains_from_base_and_is_not_reaped_early(
+    store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """S5 at tick level: an inc5/inc6 adapter dir named by the pointer is not a
+    plain checkpoint -> the week trains from base; the reap never deletes the
+    dir the pointer names before the swap."""
+    root = _root(tmp_path)
+    legacy = judge_lora.staged_adapter_path(root)
+    legacy.mkdir(parents=True)
+    (legacy / "adapter_config.json").write_text("{}", encoding="utf-8")
+    judge_lora.swap_champion_pointer(root, legacy)
+    _seed_scenario(store)
+    _set_tier(monkeypatch, judge_selftune.TUNE_GRADE_LORA)
+    _small_tunables(monkeypatch)
+    env = Env(monkeypatch)
+    env.accept = False
+    result = _tick(store, tmp_path)
+    assert result["accepted"] is False
+    assert env.builds[0]["start"] == MODEL_RELEVANCE_JUDGE
+    assert legacy.exists(), "the pointer-named dir is never reaped while the pointer names it"
+
+
+# ---------------------------------------------------------------------------
+# AC11 — per-persona isolation at the tick
+# ---------------------------------------------------------------------------
+
+
+def test_one_personas_accept_does_not_touch_another_personas_store(
+    store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    a, b = tmp_path / "A", tmp_path / "B"
+    b_ckpt = _place_checkpoint(b)
+    b_before = (_pointer_bytes(b), _stored_dirs(b))
+    _seed_scenario(store)
+    _set_tier(monkeypatch, judge_selftune.TUNE_GRADE_FULL_FT)
+    _small_tunables(monkeypatch)
+    Env(monkeypatch)
+    assert _tick(store, a)["accepted"] is True
+    assert (_pointer_bytes(b), _stored_dirs(b)) == b_before and b_ckpt.exists()

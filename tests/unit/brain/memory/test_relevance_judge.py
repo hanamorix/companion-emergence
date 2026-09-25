@@ -840,10 +840,9 @@ def test_label_calibration_sample_with_persona_knob_does_not_import_torch() -> N
 
 
 # ---------------------------------------------------------------------------
-# F2c inc6 — FullModelJudge (beefy tier serve) + resolve_serving_tuned_judge
-# precedence. FullModelJudge's real load is torch; tests monkeypatch
-# judge_full_ft.load_full_scorer so no model is built (mirrors the LoRA
-# adapter-judge no-cache test in test_judge_selftune_lifecycle.py).
+# F2c inc6/inc7 — FullModelJudge serves the persona's ONE tuned plain
+# checkpoint. FullModelJudge's real load is torch; tests monkeypatch
+# judge_full_ft.load_full_scorer so no model is built.
 # ---------------------------------------------------------------------------
 
 
@@ -866,21 +865,17 @@ def test_build_judge_provider_full_model_dir_returns_full_model_judge(
     assert judge.score("q", "d") == pytest.approx(2.5)
 
 
-def test_build_judge_provider_full_takes_precedence_over_adapter(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # If both are somehow passed, the full model wins (the tick keeps one live,
-    # but the provider is deterministic regardless).
-    from brain.memory import judge_full_ft
-    from brain.memory.relevance_judge import FullModelJudge
+def test_build_judge_provider_has_no_adapter_argument_and_no_adapter_judge() -> None:
+    # V1 (F2c inc7, ruling Q3): serving never loads an adapter — the provider
+    # takes only `full_model_dir`, and the adapter judge class is gone.
+    # Bite: at d25e1002 the signature is (adapter_dir, full_model_dir) and
+    # LoraAdapterJudge exists.
+    import inspect
 
-    _reset_judge_provider_cache()
-    monkeypatch.setattr("brain.bridge.model_tier.model_for_tier", lambda tier: "BASE-JUDGE-ID")
-    monkeypatch.setattr("brain.paths.get_cache_dir", lambda: "/tmp/fake-cache-dir")
-    monkeypatch.setattr(judge_full_ft, "load_full_scorer", lambda d, **kw: (lambda item: 1.0))
-
-    judge = build_judge_provider(adapter_dir="/tmp/adapter", full_model_dir="/tmp/full")
-    assert isinstance(judge, FullModelJudge)
+    assert list(inspect.signature(build_judge_provider).parameters) == ["full_model_dir"]
+    assert not hasattr(rj_mod, "LoraAdapterJudge")
+    assert list(inspect.signature(label_calibration_sample).parameters)[-1] == "full_model_dir"
+    assert "adapter_dir" not in inspect.signature(label_calibration_sample).parameters
 
 
 def test_full_model_judge_is_not_cached(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -901,27 +896,73 @@ def test_full_model_judge_is_not_cached(monkeypatch: pytest.MonkeyPatch) -> None
     _reset_judge_provider_cache()
 
 
-def test_resolve_serving_tuned_judge_precedence_full_over_lora_over_base(tmp_path) -> None:
-    # C12: full store wins over lora, else lora, else None (base). Executed on
-    # the both-populated case (the position-sensitive precedence bite).
-    from brain.memory import judge_lora
+def test_default_suite_judge_stub_matches_the_real_signature(
+    request: pytest.FixtureRequest,
+) -> None:
+    # V3 (F2c inc7): the autouse conftest stub must accept exactly what the
+    # real provider accepts; a mismatch raises inside the stub and is
+    # swallowed by label_calibration_sample's fault isolation (bite: at
+    # d25e1002 the stub was `lambda adapter_dir=None` while the real call
+    # passed full_model_dir).
+    import inspect
 
-    # (a) neither -> None (base).
-    assert judge_lora.resolve_serving_tuned_judge(tmp_path) is None
+    stub = rj_mod.build_judge_provider  # patched per-test by the autouse fixture
+    assert stub is not build_judge_provider, "autouse stub must be active in this test"
+    assert list(inspect.signature(stub).parameters) == list(inspect.signature(build_judge_provider).parameters)
 
-    # (b) only LoRA -> ("lora", dir).
-    lora_root = judge_lora.champion_dir(tmp_path)
-    lora_dir = judge_lora.staged_adapter_path(lora_root)
-    lora_dir.mkdir(parents=True)
-    judge_lora.swap_champion_pointer(lora_root, lora_dir)
-    kind, resolved = judge_lora.resolve_serving_tuned_judge(tmp_path)
-    assert kind == "lora" and resolved == lora_dir
 
-    # (c) both -> ("full", dir): full precedence bites (a lora-only resolver
-    # would still return lora here).
-    full_root = judge_lora.full_champion_dir(tmp_path)
-    full_dir = judge_lora.staged_adapter_path(full_root)
-    full_dir.mkdir(parents=True)
-    judge_lora.swap_champion_pointer(full_root, full_dir)
-    kind, resolved = judge_lora.resolve_serving_tuned_judge(tmp_path)
-    assert kind == "full" and resolved == full_dir
+def test_labeling_pass_on_the_default_stub_labels_rows(store: MemoryStore) -> None:
+    # V3: no injected judge -> the default stub is built and rows get labeled.
+    mem = _mem("x")
+    store.create(mem)
+    store.log_calibration_sample(
+        query="q", candidate_ids=[mem.id], reranker_scores=[1.0], reranker_model_id="m"
+    )
+    assert label_calibration_sample(store, judge=None) == 1
+
+
+def test_judge_construction_failure_is_logged_at_warning_or_above(
+    store: MemoryStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # V4: a judge-construction failure returns 0 AND is logged at >= WARNING
+    # (relevance_judge.label_calibration_sample's except branch), never silent.
+    mem = _mem("x")
+    store.create(mem)
+    store.log_calibration_sample(
+        query="q", candidate_ids=[mem.id], reranker_scores=[1.0], reranker_model_id="m"
+    )
+
+    def _raise(full_model_dir=None):
+        raise TypeError("unexpected keyword argument")
+
+    monkeypatch.setattr(rj_mod, "build_judge_provider", _raise)
+    with caplog.at_level("DEBUG", logger="brain.memory.relevance_judge"):
+        assert label_calibration_sample(store, judge=None) == 0
+    assert any(
+        r.levelno >= 30 and "failed to construct the local judge provider" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_judge_construction_failure_oracle_can_fail(
+    store: MemoryStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # V4 self-test (ST1.5f): with the module logger's `exception` silenced, the
+    # same observation finds no >= WARNING record — so the V4 check can fail.
+    mem = _mem("x")
+    store.create(mem)
+    store.log_calibration_sample(
+        query="q", candidate_ids=[mem.id], reranker_scores=[1.0], reranker_model_id="m"
+    )
+
+    def _raise(full_model_dir=None):
+        raise TypeError("unexpected keyword argument")
+
+    monkeypatch.setattr(rj_mod, "build_judge_provider", _raise)
+    monkeypatch.setattr(rj_mod.logger, "exception", lambda *a, **k: None)
+    with caplog.at_level("DEBUG", logger="brain.memory.relevance_judge"):
+        assert label_calibration_sample(store, judge=None) == 0
+    assert not any(
+        r.levelno >= 30 and "failed to construct the local judge provider" in r.getMessage()
+        for r in caplog.records
+    )

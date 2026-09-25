@@ -1,6 +1,7 @@
-"""Tests for `brain.memory.judge_lora` — F2c inc5a's LoRA weight-retrain
-MECHANISM (spec `f2c-judge-selftune-spec.md` §5 [LoRA (mid)], AC6
-[champion/challenger + rollback], AC7 [LoRA reload / bug #3980 guard]).
+"""Tests for `brain.memory.judge_lora` — the LoRA weight-retrain MECHANISM
+(F2c inc5a; LoRA-then-merge since inc7) (spec `f2c-judge-selftune-spec.md` §5
+[LoRA (mid), merge each week], AC6 [champion/challenger + rollback], AC7 as
+the merge→save→reload round trip).
 
 OFFLINE, TINY MODEL ONLY (never the real bge-reranker-v2-m3 — see
 `build-for-potato-computers-baseline` / the BUILD instructions this
@@ -10,10 +11,9 @@ layers, hidden=32) with a minimal from-scratch tokenizer, entirely on
 disk, and loads everything with `local_files_only=True` — no network
 access, no hub download, ever. GPT2 is the chosen architecture because its
 `*ForSequenceClassification` head is a plain `nn.Linear` literally named
-`.score` (see `transformers/models/gpt2/modeling_gpt2.py`), matching sbert
-bug #3980's own `modules_to_save=["score"]` example exactly, so the
-tiny-model smoke test below exercises the SAME module name the real bug
-report names, not a same-shape-but-differently-named stand-in.
+`.score` (see `transformers/models/gpt2/modeling_gpt2.py`), so the tests
+below exercise a `modules_to_save` head that must be carried into the merged
+weights.
 
 Slow-ish but not heavy: each test that trains does 1-2 epochs over 4
 scripted (query, doc, label) triples on a 2-layer/32-hidden model — sub-
@@ -34,12 +34,12 @@ import pytest
 
 import brain.memory.judge_lora as judge_lora
 from brain.memory.judge_eval import run_champion_challenger
+from brain.memory.judge_full_ft import build_full_ft_retrain_fn, load_full_scorer
 from brain.memory.judge_lora import (
     BGE_RERANKER_LORA_MODULES_TO_SAVE,
     BGE_RERANKER_LORA_TARGET_MODULES,
     LoraRollbackHandle,
     build_lora_retrain_fn,
-    load_lora_scorer,
 )
 
 # ---------------------------------------------------------------------------
@@ -106,8 +106,7 @@ def tiny_model_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 # GPT2's LoRA target module (peft's documented example target for GPT2 —
-# the fused qkv `Conv1D` layer) + the classification head name that
-# actually reproduces #3980 (see module docstring above).
+# the fused qkv `Conv1D` layer) + its classification head name.
 _TARGET_MODULES = ["c_attn"]
 _MODULES_TO_SAVE = ["score"]
 
@@ -121,206 +120,191 @@ _FIXED_EVAL_ITEMS = [("query", "relevant"), ("tiny query", "irrelevant document"
 
 
 # ---------------------------------------------------------------------------
-# AC7 / bug #3980 — the headline verdict (see judge_lora.py's module
-# docstring for the full traced root cause + mitigation).
+# F2c inc7 — LoRA-then-merge (route ii): M1 / M2 / M4 / M6 (1.5-criteria).
+# The LoRA is built with peft `get_peft_model`, trained, merged in memory, and
+# ONLY the merged plain checkpoint is saved; nothing saves or reloads an
+# adapter (spec §5 merge ruling; the adapter-reload tripwire was removed with
+# the reload path it guarded).
 # ---------------------------------------------------------------------------
 
+_EVAL_PAIRS = [
+    ("query", "relevant"), ("tiny query", "irrelevant document"), ("dog", "the dog is great"),
+    ("cat", "red apple banana"), ("music", "loud music"), ("science", "the science test"),
+]
+_TRAIN2 = [
+    ("music", "loud music", "relevant"),
+    ("music", "quiet weather", "irrelevant"),
+    ("science", "science is great", "relevant"),
+    ("weather", "blue banana", "irrelevant"),
+]
 
-def test_bug_3980_reload_via_crossencoder_autoload_reproduces_the_bug(tiny_model_dir: Path, tmp_path: Path) -> None:
-    """REGRESSION TRIPWIRE, expected to fail on this stack (sentence-
-    transformers==6.1.0, transformers==5.17.0, peft==0.21.0): reloading a
-    trained LoRA adapter (`modules_to_save=["score"]`) via `sentence_
-    transformers.CrossEncoder(adapter_dir, ...)`'s own adapter auto-
-    detection reproduces sbert bug #3980 — the reloaded classification
-    head does NOT match the trained one, so reloaded scores differ from
-    trained scores on a fixed input.
 
-    XFAIL(strict=True), not skip/deleted (BUILD instructions: "leave the
-    failing test in place"): if a future sbert/transformers/peft bump
-    fixes the native reload path, this test starts unexpectedly PASSING,
-    and strict xfail turns that into a hard failure — a deliberate
-    tripwire forcing a conscious look at whether `judge_lora.py`'s
-    peft-native-only reload workaround can then be simplified.
-    """
-    import torch
-    from peft import LoraConfig
+def _logits(model_or_dir) -> np.ndarray:
     from sentence_transformers import CrossEncoder
-    from sentence_transformers.cross_encoder.losses import BinaryCrossEntropyLoss
 
-    torch.manual_seed(0)
-    ce = CrossEncoder(
-        str(tiny_model_dir),
-        local_files_only=True,
-        config_kwargs={"num_labels": 1},
-        activation_fn=lambda x: x,
-    )
-    lora_config = LoraConfig(
-        r=4, lora_alpha=8, target_modules=_TARGET_MODULES,
-        modules_to_save=_MODULES_TO_SAVE, task_type="SEQ_CLS",
-    )
-    ce.add_adapter(lora_config)
-
-    from datasets import Dataset
-    from sentence_transformers.cross_encoder.trainer import CrossEncoderTrainer
-    from sentence_transformers.cross_encoder.training_args import CrossEncoderTrainingArguments
-
-    dataset = Dataset.from_dict(
-        {
-            "sentence1": [q for q, _d, _l in _TRAIN_TRIPLES],
-            "sentence2": [d for _q, d, _l in _TRAIN_TRIPLES],
-            "label": [1.0 if lbl == "relevant" else 0.0 for _q, _d, lbl in _TRAIN_TRIPLES],
-        }
-    )
-    loss_fn = BinaryCrossEntropyLoss(ce)
-    args = CrossEncoderTrainingArguments(
-        output_dir=str(tmp_path / "train_out"),
-        num_train_epochs=2,
-        per_device_train_batch_size=2,
-        report_to=[],
-        logging_steps=1_000_000,
-        save_strategy="no",
-        disable_tqdm=True,
-    )
-    CrossEncoderTrainer(model=ce, args=args, train_dataset=dataset, loss=loss_fn).train()
-
-    trained_scores = ce.predict(_FIXED_EVAL_ITEMS)
-
-    save_dir = tmp_path / "saved_adapter"
-    ce.save_pretrained(str(save_dir))
-
-    reloaded = CrossEncoder(
-        str(save_dir),
-        local_files_only=True,
-        config_kwargs={"num_labels": 1},
-        activation_fn=lambda x: x,
-    )
-    reloaded_scores = reloaded.predict(_FIXED_EVAL_ITEMS)
-
-    if np.allclose(trained_scores, reloaded_scores, atol=1e-5):
-        pytest.fail("XPASS: CrossEncoder auto-reload no longer reproduces #3980 -- see judge_lora.py docstring")
-    else:
-        pytest.xfail(
-            "sbert #3980 reproduces: CrossEncoder(adapter_dir) auto-reload drops the trained "
-            "modules_to_save head (transformers' native load_adapter does not restore the "
-            "modules_to_save.<adapter>. prefix) -- see judge_lora.py module docstring for the "
-            "traced root cause and the peft-native mitigation this module actually uses."
-        )
+    ce = model_or_dir if not isinstance(model_or_dir, (str, Path)) else CrossEncoder(str(model_or_dir))
+    return np.array([float(ce.predict([p], activation_fn=lambda x: x)[0]) for p in _EVAL_PAIRS])
 
 
-def test_bug_3980_reload_via_peft_native_reproduces_exact_scores(tiny_model_dir: Path, tmp_path: Path) -> None:
-    """The AC7 REQUIRED smoke test, in its PASSING form: training via
-    `build_lora_retrain_fn`, saving, then reloading via `judge_lora.
-    load_lora_scorer` (peft's own native `PeftModel.from_pretrained` reload
-    path, this module's confirmed #3980 mitigation) reproduces the trained
-    model's scores exactly (the head IS restored).
-    """
-    retrain_fn = build_lora_retrain_fn(
-        tiny_model_dir,
-        target_modules=_TARGET_MODULES,
-        modules_to_save=_MODULES_TO_SAVE,
-        lora_rank=4,
-        epochs=2,
-    )
-    label_fn = retrain_fn(_TRAIN_TRIPLES)
-    assert label_fn(_FIXED_EVAL_ITEMS[0]) in ("relevant", "irrelevant")
-
-    # Re-run training deterministically (seeded) to get a model whose exact
-    # raw scores we can compare against a save+peft-native-reload round trip.
-    import torch
-    from peft import LoraConfig
-    from sentence_transformers import CrossEncoder
-    from sentence_transformers.cross_encoder.losses import BinaryCrossEntropyLoss
-
-    torch.manual_seed(0)
-    ce = CrossEncoder(
-        str(tiny_model_dir), local_files_only=True,
-        config_kwargs={"num_labels": 1}, activation_fn=lambda x: x,
-    )
-    lora_config = LoraConfig(
-        r=4, lora_alpha=8, target_modules=_TARGET_MODULES,
-        modules_to_save=_MODULES_TO_SAVE, task_type="SEQ_CLS",
-    )
-    ce.add_adapter(lora_config)
-
-    from datasets import Dataset
-    from sentence_transformers.cross_encoder.trainer import CrossEncoderTrainer
-    from sentence_transformers.cross_encoder.training_args import CrossEncoderTrainingArguments
-
-    dataset = Dataset.from_dict(
-        {
-            "sentence1": [q for q, _d, _l in _TRAIN_TRIPLES],
-            "sentence2": [d for _q, d, _l in _TRAIN_TRIPLES],
-            "label": [1.0 if lbl == "relevant" else 0.0 for _q, _d, lbl in _TRAIN_TRIPLES],
-        }
-    )
-    loss_fn = BinaryCrossEntropyLoss(ce)
-    args = CrossEncoderTrainingArguments(
-        output_dir=str(tmp_path / "train_out"),
-        num_train_epochs=2,
-        per_device_train_batch_size=2,
-        report_to=[],
-        logging_steps=1_000_000,
-        save_strategy="no",
-        disable_tqdm=True,
-    )
-    CrossEncoderTrainer(model=ce, args=args, train_dataset=dataset, loss=loss_fn).train()
-    trained_scores = np.array(ce.predict(_FIXED_EVAL_ITEMS))
-
-    save_dir = tmp_path / "saved_adapter_for_safe_reload"
-    ce.save_pretrained(str(save_dir))
-
-    scorer = load_lora_scorer(tiny_model_dir, save_dir)
-    reloaded_scores = np.array([scorer(item) for item in _FIXED_EVAL_ITEMS])
-
-    assert np.allclose(trained_scores, reloaded_scores, atol=1e-5), (
-        f"trained={trained_scores} reloaded={reloaded_scores}"
-    )
+def _head(hf_model) -> np.ndarray:
+    """The GPT2 `.score` head as the model will use it (for a PeftModel: the
+    active modules_to_save copy)."""
+    m = hf_model
+    if hasattr(m, "base_model") and hasattr(m.base_model, "model"):
+        m = m.base_model.model
+    head = m.score
+    if hasattr(head, "modules_to_save"):
+        head = head.modules_to_save["default"]
+    return head.weight.detach().cpu().numpy().copy()
 
 
-def test_save_adapter_dir_persists_a_reloadable_adapter(tiny_model_dir: Path, tmp_path: Path) -> None:
-    """F2c inc5b-2 (C10): `build_lora_retrain_fn(save_adapter_dir=X)` persists
-    the trained adapter to X (the STAGED dir the tick swaps into the champion
-    pointer on ACCEPT), and `load_lora_scorer` reloads it via the #3980-safe
-    peft path so the reloaded model reproduces the trained model's labels —
-    the WIRED persist->reload path, distinct from the manual save in
-    `test_bug_3980_reload_via_peft_native_reproduces_exact_scores`."""
-    import torch
+def _file_hashes(d: Path) -> dict[str, str]:
+    import hashlib
 
+    return {
+        str(p.relative_to(d)): hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in sorted(d.rglob("*")) if p.is_file()
+    }
+
+
+class _TrainSpy:
+    """Wraps CrossEncoderTrainer.train to record the model's logits (and the
+    trained head) immediately BEFORE and AFTER training, i.e. the start-from
+    model and the trained pre-merge LoRA model."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from sentence_transformers.cross_encoder.trainer import CrossEncoderTrainer
+
+        self.before: list[np.ndarray] = []
+        self.after: list[np.ndarray] = []
+        self.heads: list[np.ndarray] = []
+        real_train = CrossEncoderTrainer.train
+        spy = self
+
+        def train(trainer_self, *a, **k):
+            spy.before.append(_logits(trainer_self.model))
+            out = real_train(trainer_self, *a, **k)
+            spy.after.append(_logits(trainer_self.model))
+            spy.heads.append(_head(trainer_self.model[0].model))
+            return out
+
+        monkeypatch.setattr(CrossEncoderTrainer, "train", train)
+
+
+def _forbid_adapter_io(monkeypatch: pytest.MonkeyPatch) -> None:
+    from peft import PeftModel
+    from transformers import PreTrainedModel
+
+    def boom(*a, **k):
+        raise AssertionError("no adapter may be saved or reloaded (spec §5 merge ruling)")
+
+    monkeypatch.setattr(PeftModel, "from_pretrained", classmethod(lambda cls, *a, **k: boom()))
+    monkeypatch.setattr(PeftModel, "save_pretrained", boom)
+    monkeypatch.setattr(PreTrainedModel, "load_adapter", boom, raising=False)
+
+
+def _no_adapter_files(d: Path) -> bool:
+    return not any(d.rglob("adapter_config.json")) and not any(d.rglob("adapter_model*"))
+
+
+def test_lora_then_merge_on_base_saves_a_plain_checkpoint_that_reproduces(
+    tiny_model_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M1. Bite: at d25e1002 the builder saved an adapter (adapter_config.json)."""
+    from transformers import AutoModelForSequenceClassification
+
+    spy = _TrainSpy(monkeypatch)
+    _forbid_adapter_io(monkeypatch)
+    torch = pytest.importorskip("torch")
+    torch.manual_seed(11)
+    save = tmp_path / "merged"
+    label_fn = build_lora_retrain_fn(
+        tiny_model_dir, target_modules=_TARGET_MODULES, modules_to_save=_MODULES_TO_SAVE,
+        lora_rank=4, epochs=3, save_dir=save,
+    )(_TRAIN_TRIPLES)
+
+    assert _no_adapter_files(save), sorted(p.name for p in save.rglob("*"))
+    trained = spy.after[0]
+    assert np.max(np.abs(trained - spy.before[0])) > 1e-4, "training moved the model"
+    np.testing.assert_allclose(_logits(save), trained, atol=1e-5)
+    scorer = load_full_scorer(save)
+    np.testing.assert_allclose(np.array([scorer(p) for p in _EVAL_PAIRS]), trained, atol=1e-5)
+    merged_head = _head(AutoModelForSequenceClassification.from_pretrained(str(save), local_files_only=True))
+    np.testing.assert_allclose(merged_head, spy.heads[0], atol=1e-6)
+    # The eval label-fn scores the MERGED model: its labels agree with the
+    # reloaded checkpoint's scores through the same label mapping.
     from brain.memory.relevance_judge import label_for_score
 
-    torch.manual_seed(0)
-    staged = tmp_path / "staged_adapter"
-    retrain_fn = build_lora_retrain_fn(
-        tiny_model_dir,
-        target_modules=_TARGET_MODULES,
-        modules_to_save=_MODULES_TO_SAVE,
-        lora_rank=4,
-        epochs=2,
-        save_adapter_dir=staged,
-    )
-    label_fn = retrain_fn(_TRAIN_TRIPLES)
-
-    # The adapter was persisted to the staged dir (not left in the deleted
-    # training scratch dir).
-    assert staged.is_dir() and any(staged.iterdir()), "adapter not persisted to save_adapter_dir"
-
-    # Reload via load_lora_scorer (peft PeftModel.from_pretrained) and confirm
-    # the reloaded model's labels match the in-memory trained label fn's.
-    scorer = load_lora_scorer(tiny_model_dir, staged)
-    for item in _FIXED_EVAL_ITEMS:
-        reloaded_label, _amb = label_for_score(scorer(item))
-        assert reloaded_label == label_fn(item), item
+    assert [label_fn(p) for p in _EVAL_PAIRS] == [label_for_score(float(x))[0] for x in _logits(save)]
 
 
-def test_save_adapter_dir_none_leaves_no_save(tiny_model_dir: Path, tmp_path: Path) -> None:
-    """Default `save_adapter_dir=None` is the inc5a in-memory-only behavior —
-    no directory is written."""
-    retrain_fn = build_lora_retrain_fn(
+def test_save_dir_none_writes_nothing(tiny_model_dir: Path, tmp_path: Path) -> None:
+    label_fn = build_lora_retrain_fn(
         tiny_model_dir, target_modules=_TARGET_MODULES, modules_to_save=_MODULES_TO_SAVE,
         lora_rank=4, epochs=1,
-    )
-    retrain_fn(_TRAIN_TRIPLES)
-    assert not (tmp_path / "staged_adapter").exists()
+    )(_TRAIN_TRIPLES)
+    assert label_fn(_FIXED_EVAL_ITEMS[0]) in ("relevant", "irrelevant")
+    assert not any(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("start_kind", ["merged", "full_ft"])
+def test_lora_then_merge_on_a_plain_checkpoint_starts_from_it(
+    start_kind: str, tiny_model_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M2 (week 2+). Bite: at d25e1002 the tick always passed the base."""
+    import torch
+
+    torch.manual_seed(21)
+    c = tmp_path / "C"
+    if start_kind == "merged":
+        build_lora_retrain_fn(
+            tiny_model_dir, target_modules=_TARGET_MODULES, modules_to_save=_MODULES_TO_SAVE,
+            lora_rank=4, epochs=3, save_dir=c,
+        )(_TRAIN_TRIPLES)
+    else:
+        build_full_ft_retrain_fn(tiny_model_dir, epochs=2, save_full_dir=c)(_TRAIN_TRIPLES)
+    c_logits = _logits(c)
+    base_logits = _logits(tiny_model_dir)
+    assert np.max(np.abs(c_logits - base_logits)) > 1e-4, "C differs from base (so start-from can bite)"
+    c_hashes = _file_hashes(c)
+
+    spy = _TrainSpy(monkeypatch)
+    _forbid_adapter_io(monkeypatch)
+    torch.manual_seed(22)
+    d = tmp_path / "D"
+    build_lora_retrain_fn(
+        c, target_modules=_TARGET_MODULES, modules_to_save=_MODULES_TO_SAVE,
+        lora_rank=4, epochs=3, save_dir=d,
+    )(_TRAIN2)
+
+    np.testing.assert_allclose(spy.before[0], c_logits, atol=1e-5)  # started FROM C, not the base
+    assert np.max(np.abs(spy.after[0] - c_logits)) > 1e-4
+    np.testing.assert_allclose(_logits(d), spy.after[0], atol=1e-5)
+    assert _no_adapter_files(d)
+    assert _file_hashes(c) == c_hashes, "the start checkpoint is not rewritten"
+
+
+def test_training_wraps_the_loaded_model_once(
+    tiny_model_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M6 (ADVISORY, memory peak): one CrossEncoder load of the start weights
+    per retrain; the LoRA wraps and merges that same model in place."""
+    import sentence_transformers
+
+    real = sentence_transformers.CrossEncoder
+    loads: list[str] = []
+
+    class Counting(real):  # type: ignore[misc, valid-type]
+        def __init__(self, *a, **k):
+            loads.append(str(a[0]) if a else "")
+            super().__init__(*a, **k)
+
+    monkeypatch.setattr(sentence_transformers, "CrossEncoder", Counting)
+    build_lora_retrain_fn(
+        tiny_model_dir, target_modules=_TARGET_MODULES, modules_to_save=_MODULES_TO_SAVE,
+        lora_rank=4, epochs=1,
+    )(_TRAIN_TRIPLES)
+    assert loads == [str(tiny_model_dir)]
 
 
 # ---------------------------------------------------------------------------
@@ -537,21 +521,23 @@ def test_bge_lora_module_names_are_grounded_xlm_roberta_values() -> None:
     assert BGE_RERANKER_LORA_MODULES_TO_SAVE == ("classifier",)
 
 
-def test_train_and_serve_read_one_lora_max_length_tunable_and_serve_truncates(
+def test_merged_checkpoint_carries_the_lora_max_length_to_the_serve_loader(
     tiny_model_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Items 5 + C2/C3: with `judge_selftune.lora_max_length` overridden to a
-    small M (below the tiny model's `n_positions=64`), BOTH the training
-    CrossEncoder and the serve tokenizer read that ONE tunable (neither is
-    passed an explicit `max_length`), so a LoRA adapter trained on — and then
-    scored on — a doc whose UNTRUNCATED token count exceeds the model's
-    position capacity succeeds instead of overflowing the position
-    embeddings.
+    """M5: with `judge_selftune.lora_max_length` overridden to a small M (below
+    the tiny model's 64 positions) and no explicit max_length, a LoRA week's
+    merged checkpoint reloads with max length M (the truncation length travels
+    with the saved checkpoint), and `load_full_scorer` scores a doc longer than
+    64 tokens. Oracle self-test: the same reload with the saved truncation
+    stripped comes back with a different max length (sbert then clamps to the
+    model's 64 positions rather than overflowing on this stack), so the
+    equality check can fail."""
+    import json
+    import shutil
 
-    Able-to-fail (ST1.5f, demonstrated at stage 8): under the pre-change
-    `load_lora_scorer` (no truncation/max_length), the long serve input
-    overflows the tiny GPT2's 64-slot `wpe` and RAISES."""
-    m = 16  # < tiny model n_positions (64); < the long doc's token count below
+    from sentence_transformers import CrossEncoder
+
+    m = 16
     original_get_tunable = judge_lora.tunables.get_tunable
 
     def _override(key, default):
@@ -560,76 +546,32 @@ def test_train_and_serve_read_one_lora_max_length_tunable_and_serve_truncates(
         return original_get_tunable(key, default)
 
     monkeypatch.setattr(judge_lora.tunables, "get_tunable", _override)
-
-    # ~80 whitespace-separated words -> ~80 WordLevel tokens, comfortably
-    # over the 64-slot position table when untruncated.
-    long_doc = " ".join(["relevant document science weather music"] * 16)
-    train_triples = [
+    long_doc = " ".join(["relevant document science weather music"] * 16)  # ~80 tokens
+    train = [
         ("query", long_doc, "relevant"),
         ("query", "irrelevant", "irrelevant"),
         ("tiny query", long_doc, "relevant"),
         ("test document", "irrelevant loud", "irrelevant"),
     ]
+    save = tmp_path / "merged"
+    build_lora_retrain_fn(
+        tiny_model_dir, target_modules=_TARGET_MODULES, modules_to_save=_MODULES_TO_SAVE,
+        lora_rank=4, epochs=1, save_dir=save,
+    )(train)
+    assert CrossEncoder(str(save)).max_length == m
+    score = load_full_scorer(save)(("query", long_doc))
+    assert isinstance(score, float) and score == score
 
-    # No explicit max_length on EITHER call -> both must resolve the tunable.
-    retrain_fn = build_lora_retrain_fn(
-        tiny_model_dir,
-        target_modules=_TARGET_MODULES,
-        modules_to_save=_MODULES_TO_SAVE,
-        lora_rank=4,
-        epochs=1,
-    )
-    # Train (would overflow at train time too if the CrossEncoder ignored the
-    # tunable) then persist the adapter for a cross-process reload.
-    from peft import LoraConfig
-    from sentence_transformers import CrossEncoder
-    from sentence_transformers.cross_encoder.losses import BinaryCrossEntropyLoss
-    from sentence_transformers.cross_encoder.trainer import CrossEncoderTrainer
-    from sentence_transformers.cross_encoder.training_args import CrossEncoderTrainingArguments
-
-    # Sanity-drive the retrain_fn itself (proves the train path is bounded).
-    label_fn = retrain_fn(train_triples)
-    assert label_fn(("query", long_doc)) in ("relevant", "irrelevant")
-
-    # Build + save a real adapter to reload through load_lora_scorer (the
-    # serve path under test), mirroring the #3980 test's save shape.
-    from datasets import Dataset
-
-    ce = CrossEncoder(
-        str(tiny_model_dir),
-        config_kwargs={"num_labels": 1},
-        max_length=m,
-        activation_fn=lambda x: x,
-    )
-    ce.add_adapter(
-        LoraConfig(
-            r=4, lora_alpha=8, target_modules=_TARGET_MODULES,
-            modules_to_save=_MODULES_TO_SAVE, task_type="SEQ_CLS",
-        )
-    )
-    dataset = Dataset.from_dict(
-        {
-            "sentence1": [q for q, _d, _l in train_triples],
-            "sentence2": [d for _q, d, _l in train_triples],
-            "label": [1.0 if lbl == "relevant" else 0.0 for _q, _d, lbl in train_triples],
-        }
-    )
-    args = CrossEncoderTrainingArguments(
-        output_dir=str(tmp_path / "train_out"),
-        num_train_epochs=1,
-        per_device_train_batch_size=2,
-        report_to=[],
-        logging_steps=1_000_000,
-        save_strategy="no",
-        disable_tqdm=True,
-    )
-    CrossEncoderTrainer(model=ce, args=args, train_dataset=dataset, loss=BinaryCrossEntropyLoss(ce)).train()
-    save_dir = tmp_path / "saved_adapter"
-    ce.save_pretrained(str(save_dir))
-
-    # Serve path: no explicit max_length -> must read the same tunable and
-    # truncate the long input at M, so scoring succeeds (no position overflow).
-    scorer = load_lora_scorer(tiny_model_dir, save_dir)
-    result = scorer(("query", long_doc))
-    assert isinstance(result, float)
-    assert result == result  # finite (not NaN)
+    # Self-test: strip the saved truncation -> the reloaded max length is no
+    # longer M.
+    broken = tmp_path / "broken"
+    shutil.copytree(save, broken)
+    cfg = broken / "tokenizer_config.json"
+    data = json.loads(cfg.read_text())
+    data["model_max_length"] = 1_000_000
+    cfg.write_text(json.dumps(data))
+    tok = broken / "tokenizer.json"
+    tdata = json.loads(tok.read_text())
+    tdata["truncation"] = None
+    tok.write_text(json.dumps(tdata))
+    assert CrossEncoder(str(broken)).max_length != m

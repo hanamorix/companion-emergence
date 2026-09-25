@@ -8,28 +8,21 @@ contract], AC7-analogue [full-model reload round-trip]).
 This is the beefy-tier SIBLING of `judge_lora.py`: same `(query, doc,
 label)` triples, same `BinaryCrossEntropyLoss` via sbert 6.1.0's
 `CrossEncoderTrainer`, same `retrain_fn` shape that plugs straight into
-`judge_eval.run_champion_challenger`. The ONE difference from the LoRA tier
-is the mechanism itself — a FULL fine-tune (ALL parameters trainable, NO
-LoRA adapter, NO `peft`) instead of a low-rank adapter over a frozen base:
+`judge_eval.run_champion_challenger`. The difference is the update itself: a
+FULL fine-tune (ALL parameters trainable, no LoRA, no `peft`).
 
-  - **Training** builds a plain `sentence_transformers.CrossEncoder` and
-    trains it directly — there is no `add_adapter`/`LoraConfig` call, so
-    every weight is updated. A full FT subsumes what a LoRA adapter would do
-    (spec §1: "a full FT subsumes what a LoRA adapter would do; stacking is
-    pointless"), which is why the tiers are alternatives, never combined.
-  - **Persistence + reload is the ORDINARY sbert path, NOT peft.** sbert bug
-    #3980 (the reason `judge_lora.load_lora_scorer` must reload via
-    `peft.PeftModel.from_pretrained`) is LoRA-adapter-SPECIFIC: it is a
-    dropped `modules_to_save.<adapter>.` prefix on transformers' native
-    `load_adapter`. A full fine-tune writes a COMPLETE model via
-    `CrossEncoder.save_pretrained` (no `adapter_config.json`, no adapter
-    state dict), so it reloads correctly with a plain
-    `CrossEncoder(saved_dir)` / `AutoModelForSequenceClassification.
-    from_pretrained` — and MUST NOT go through `PeftModel.from_pretrained`
-    (there is no adapter to load). `load_full_scorer` below reloads via the
-    plain path exclusively; the AC7-analogue round-trip test
-    (`test_judge_full_ft.py`) proves a full-model train->save->reload
-    reproduces the trained scores AND writes no `adapter_config.json`.
+  - **One evolving model (F2c inc7, spec §1/§5):** training starts from the
+    persona's CURRENT model — its own plain checkpoint, or the base judge if
+    it has never been weight-tuned — never from the base by default. Because
+    every LoRA week is merged in (`judge_lora.build_lora_retrain_fn`), the
+    current model is always a plain checkpoint, so a full week simply
+    continues from it.
+  - **Persistence + reload is the ORDINARY sbert path.** A full fine-tune
+    writes a COMPLETE model via `CrossEncoder.save_pretrained` (no
+    `adapter_config.json`, no adapter state dict), so it reloads with a plain
+    `CrossEncoder(saved_dir)`. `load_full_scorer` below is the single loader
+    for every tuned checkpoint (LoRA-merged or fully fine-tuned): champion
+    eval, accept-path re-score, and serving.
 
 TORCH-SCOPED, LAZY (I6): `torch`/`sentence_transformers`/`datasets` are
 imported LAZILY, function-scoped inside `build_full_ft_retrain_fn`'s and
@@ -41,13 +34,12 @@ CALLING one of those two functions does. `datasets` is a BASE dependency
 torch-scoping, not because it is optional.
 
 Scope: this module builds the full-FT train/save/reload MECHANISM only. The
-per-persona champion-store helpers (`champion_dir`/`full_champion_dir`/
-`staged_adapter_path`/`swap_champion_pointer`/`resolve_champion_adapter`/
-`cleanup_stale_adapters`) live in `judge_lora.py` and are torch-free +
-root-parameterized, so `judge_selftune._run_weight_retrain` reuses them for
-the full store's `.../models/relevance_judge/full/` root exactly as for the
-LoRA store. It proves everything against a FROM-SCRATCH TINY model in its
-tests, never the real bge-reranker-v2-m3 (deferred to real HW).
+per-persona store helpers (`champion_dir`/`staged_adapter_path`/
+`swap_champion_pointer`/`resolve_current_checkpoint`/`cleanup_stale_adapters`)
+live in `judge_lora.py` and are torch-free; `judge_selftune._run_weight_retrain`
+uses the ONE per-persona store for both tiers. It proves everything against a
+FROM-SCRATCH TINY model in its tests, never the real bge-reranker-v2-m3
+(deferred to real HW).
 
 DURABLE HAIKU-ORACLE NOTE (spec §6, mirrors the notes in `judge_lora.py`,
 `judge_eval.py`, `judge_selftune.py`, and F2a's `relevance_judge.py`
@@ -126,7 +118,7 @@ def _dataset_from_triples(triples: Sequence[LabeledTriple]) -> Any:
 
 
 def build_full_ft_retrain_fn(
-    base_model_path: str | Path,
+    start_model_path: str | Path,
     *,
     cache_dir: str | Path | None = None,
     epochs: int | None = None,
@@ -139,23 +131,24 @@ def build_full_ft_retrain_fn(
     — the beefy-tier analogue of `judge_lora.build_lora_retrain_fn`, with the
     SAME shape but a FULL fine-tune (no LoRA adapter).
 
-    `save_full_dir` (mirrors LoRA's `save_adapter_dir`): when set,
+    `save_full_dir` (mirrors LoRA's `save_dir`): when set,
     `retrain_fn` ALSO saves the trained FULL model to this STAGED directory
     (via `CrossEncoder.save_pretrained` — a complete model, no
     `adapter_config.json`) before returning the label-fn, so the tick can,
-    ONLY on an AC6 ACCEPT, atomically swap it into the persona's full
-    champion pointer and `load_full_scorer` it (both to re-score the knob on
+    ONLY on an AC6 ACCEPT, atomically swap it into the persona's
+    pointer and `load_full_scorer` it (both to re-score the knob on
     the tuned model and to serve it). The label-fn still binds the trained
     IN-MEMORY model for the forward-only eval regardless. `None` (default) =
     no save (in-memory-only).
 
-    `base_model_path`: a local path or hub id `sentence_transformers.
-    CrossEncoder` can load (TESTS always pass a from-scratch tiny local
-    model dir — never the real bge; the tick wires the real
-    bge-reranker-v2-m3 model_tier id here in production).
+    `start_model_path` (F2c inc7): the model this week's fine-tune continues
+    from (spec §1) — the persona's own plain checkpoint dir, or the base
+    judge's model_tier id for a never-weight-tuned persona (the tick's
+    `_training_start` decides). TESTS pass a from-scratch tiny local model dir,
+    never the real bge.
 
     Returns `retrain_fn(train_items) -> label_fn`: calling `retrain_fn`
-    loads a FRESH `CrossEncoder` from `base_model_path` (ALL params
+    loads a FRESH `CrossEncoder` from `start_model_path` (ALL params
     trainable — no `add_adapter`), trains it on `train_items` via
     `BinaryCrossEntropyLoss` (`epochs` resolved from the shared tunable when
     not passed), and returns a plain callable `(query, document) ->
@@ -199,7 +192,7 @@ def build_full_ft_retrain_fn(
         )
 
         model = CrossEncoder(
-            str(base_model_path),
+            str(start_model_path),
             cache_folder=str(cache_dir) if cache_dir is not None else None,
             config_kwargs={"num_labels": 1},
             max_length=resolved_max_length,
@@ -247,9 +240,9 @@ def build_full_ft_retrain_fn(
 
 
 # ---------------------------------------------------------------------------
-# Reload — the ORDINARY sbert path (NOT peft). A full fine-tune saves a
-# complete model, so it reloads with a plain CrossEncoder; #3980 (the LoRA
-# reload bug) does not apply because there is no adapter to load.
+# Reload — the ORDINARY sbert path. Every stored tuned judge is a complete
+# plain checkpoint (full fine-tune, or a LoRA week merged in memory), so it
+# reloads with a plain CrossEncoder; there is no adapter to load.
 # ---------------------------------------------------------------------------
 
 
@@ -259,14 +252,13 @@ def load_full_scorer(
     cache_dir: str | Path | None = None,
     max_length: int | None = None,
 ) -> Callable[[tuple[str, str]], float]:
-    """Reload a saved FULL fine-tuned judge and return a raw-score callable
-    `(query, document) -> float`, via the ORDINARY
-    `sentence_transformers.CrossEncoder(full_dir)` path — NEVER
-    `peft.PeftModel.from_pretrained` (there is no adapter; #3980 is
-    LoRA-specific — see this module's docstring).
+    """Reload a saved tuned judge checkpoint (a full fine-tune or a merged
+    LoRA week — both are plain checkpoints since F2c inc7) and return a
+    raw-score callable `(query, document) -> float`, via the ORDINARY
+    `sentence_transformers.CrossEncoder(full_dir)` path (there is no adapter).
 
     Returns RAW scores (no sigmoid), matching `RelevanceJudgeProvider.score`'s
-    convention in `relevance_judge.py` and `judge_lora.load_lora_scorer` — a
+    convention in `relevance_judge.py` — a
     load-side caller applies `relevance_judge.label_for_score` on top, exactly
     as the live daily-tick judge does for the base judge. `activation_fn` is
     forced to identity in `predict` so a `num_labels=1` model's default

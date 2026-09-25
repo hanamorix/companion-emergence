@@ -1,102 +1,39 @@
 """LoRA weight-retrain MECHANISM for the judge self-tune's mid-RAM-tier
-grade (F2c inc5a; spec `f2c-judge-selftune-spec.md` §5 [tiered
-weight-retrain build detail, "LoRA (mid)"], §4 [eval + guardrail, via
-`judge_eval.run_champion_challenger`'s `retrain_fn`/`RollbackHandle`
-contract], AC6 [champion/challenger + rollback], AC7 [LoRA reload / bug
-#3980 guard]).
+grade (F2c inc5a, reworked in inc7; spec `f2c-judge-selftune-spec.md` §5
+["LoRA (mid)", merge-each-week], §4 [eval + guardrail, via
+`judge_eval.run_champion_challenger`'s `retrain_fn` contract], AC6 [champion/
+challenger + rollback]), plus the per-persona tuned-judge STORE helpers.
+
+ONE EVOLVING MODEL, MERGED EACH WEEK (F2c inc7, OWNER 2026-09-25 "go with
+merging each week"): a LoRA week starts from the persona's CURRENT model (its
+own plain checkpoint, or the base judge if it has never been weight-tuned),
+wraps it with `peft.get_peft_model`, trains, and merges the adapter back into
+the weights IN MEMORY (`merge_and_unload`). Only the merged PLAIN checkpoint
+is ever saved; no adapter is kept between weeks, and nothing in this codebase
+saves or reloads an adapter. Serving and re-scoring load plain checkpoints
+through `judge_full_ft.load_full_scorer`.
 
 TORCH-SCOPED, LAZY (I6): `torch`/`sentence_transformers`/`peft`/`datasets`
-are imported LAZILY, function-scoped inside `build_lora_retrain_fn`'s and
-`load_lora_scorer`'s bodies — never at this module's top level — mirroring
-`relevance_judge.TorchCrossEncoderJudge`'s exact convention (see that
-module's docstring for the full rationale). Importing this module never
-pulls torch into `sys.modules`; only actually CALLING one of those two
-functions does. `LoraRollbackHandle.record`/`restore` are plain filesystem
-copies (`shutil.copytree`/`rmtree`) — genuinely torch-free, not merely
-scoped: they never load a model at all, by construction, which is also why
-a rollback is cheap enough to call on every champion/challenger cycle.
+are imported LAZILY, function-scoped inside `build_lora_retrain_fn`'s body,
+never at this module's top level, mirroring
+`relevance_judge.TorchCrossEncoderJudge`'s convention. Importing this module
+never pulls torch into `sys.modules`. The store helpers at the bottom are
+plain filesystem code and never load a model. `peft` and `datasets` are base
+dependencies (Roy 2026-09-24); they are imported lazily only for
+torch-scoping, so a missing one is a broken install, surfaced plainly.
 
-BASE DEPENDENCIES (F2c inc5b-2, Roy 2026-09-24 — reverses the inc5a
-optional-extras plan): `peft` and `datasets` are now part of this project's
-always-installed baseline (`[project.dependencies]` in `pyproject.toml`),
-no longer an optional training extra. The feature must never require a user
-to run pip/python to enable it, so a capable box can train with no manual
-install step. They are still imported LAZILY here (torch-scoping, I6), but a
-missing one is now a broken-install error, not a "you forgot the extra"
-condition — so the lazy-import sites raise plainly and `judge_selftune.py`'s
-tier-detect no longer carries a missing-extra downgrade (RAM + cgroup-OOM
-only). A low-RAM / cgroup-capped potato still downgrades to the knob-refit
-floor and never RUNS the training path, even though it now CARRIES the deps.
-
-Scope: this module builds the LoRA train/save/reload MECHANISM +, as of F2c
-inc5b-2, the per-persona champion-adapter store (the `champion_dir` /
-`staged_adapter_path` / `swap_champion_pointer` / `resolve_champion_adapter`
-/ `cleanup_stale_adapters` helpers at the bottom). It proves everything
-against a FROM-SCRATCH TINY model in its tests, never the real
-bge-reranker-v2-m3. `judge_selftune._run_judge_selftune_tick` (inc5b-2)
-drives it: on an AC6 ACCEPT it saves the challenger via `build_lora_retrain_fn`'s
-`save_adapter_dir` and atomically swaps the champion pointer.
-`target_modules` and
-`modules_to_save` are REQUIRED, caller-supplied arguments here, not
-hardcoded defaults: bge-reranker-v2-m3's actual attention/head module
-names are inc5b's job to confirm against the real checkpoint, and guessing
-at them here would be exactly the kind of unverified magic-number/model-
-specific assumption this codebase avoids (`roy-dislikes-magic-numbers`).
-
-=== AC7 / bug #3980 — VERDICT (inc5a's primary deliverable) ===
-
-sbert #3980 (a LoRA `CrossEncoder` trained with `modules_to_save=["score"]`
-can fail to reload the trained classification head) REPRODUCES cleanly in
-this stack (sentence-transformers==6.1.0, transformers==5.17.0,
-peft==0.21.0), confirmed against a from-scratch tiny GPT2-for-sequence-
-classification model (GPT2 was chosen because its `ForSequenceClassification`
-head is a `nn.Linear` literally named `.score`, matching the bug report's
-own `modules_to_save=["score"]` naming exactly):
-
-  - ROOT CAUSE (traced, not guessed): `peft.utils.save_and_load.
-    get_peft_model_state_dict` (what `CrossEncoder.save_pretrained` /
-    `PreTrainedModel.save_pretrained` call under the hood) saves a
-    `modules_to_save` head's weights under the adapter-name-STRIPPED key
-    (`base_model.model.score.weight` on disk) — this is documented,
-    intentional peft behavior (the adapter name is meant to be
-    re-insertable under a DIFFERENT name at load time). Reloading via
-    `sentence_transformers.CrossEncoder(saved_dir)` (which auto-detects
-    `adapter_config.json` and defers to `transformers.integrations.peft.
-    PreTrainedModel.load_adapter`, transformers' OWN native adapter-load
-    path — NOT peft's) does NOT restore the `modules_to_save.default.`
-    prefix before matching checkpoint keys against the freshly-injected
-    model structure: it expects `score.modules_to_save.default.weight` but
-    finds only `score.weight` in the checkpoint, so the trained head is
-    silently newly-initialized (RANDOM) instead of loaded — reproduced
-    scores differ from trained scores. Calling `model.load_adapter(...)`
-    directly (bypassing `CrossEncoder`'s own wrapper) reproduces the exact
-    same failure — the gap is in transformers' native PEFT integration
-    path, not sbert's plumbing around it.
-  - MITIGATION CONFIRMED (inc5a, empirically verified — see
-    `tests/unit/brain/memory/test_judge_lora.py::
-    test_bug_3980_reload_via_peft_native_reproduces_exact_scores`):
-    reloading via peft's OWN native path —
-    `peft.PeftModel.from_pretrained(base_model, saved_dir)` — instead of
-    transformers' built-in adapter auto-load, DOES correctly restore the
-    trained head: `peft.utils.save_and_load.set_peft_model_state_dict`
-    (which `PeftModel.from_pretrained`/`PeftModel.load_adapter` call, and
-    which `transformers.integrations.peft.PreTrainedModel.load_adapter`
-    does NOT) explicitly re-inserts the `modules_to_save.{adapter_name}.`
-    prefix via each `ModulesToSaveWrapper`'s own `adapter_state_dict_load_
-    map`. Reloaded scores then match trained scores bit-for-bit.
-  - CONSEQUENCE FOR THIS MODULE: every reload path in this module
-    (`load_lora_scorer` below, and `LoraRollbackHandle.restore`'s
-    verification) goes through `peft.PeftModel.from_pretrained`, never
-    through `sentence_transformers.CrossEncoder(adapter_dir, ...)`'s own
-    auto-detection or a bare `model.load_adapter(...)` call — so the LoRA
-    path IS shippable, but only via this specific reload mechanism. A
-    regression test
-    (`test_bug_3980_reload_via_crossencoder_autoload_reproduces_the_bug`)
-    is kept in place, XFAIL(strict) with this reasoning, as a tripwire: if
-    a future sbert/transformers/peft upgrade fixes the native path, that
-    test starts unexpectedly passing (XPASS) and the strict xfail fails
-    the suite, forcing a conscious decision about whether to simplify this
-    module's reload path at that point.
+HISTORY, sbert bug #3980 (inc5a verdict, superseded in inc7): a LoRA
+`CrossEncoder` trained with `modules_to_save` could not be reloaded through
+transformers' native `load_adapter` on this stack (sentence-transformers
+6.1.0, transformers 5.17.0, peft 0.21.0): the adapter-name prefix of the
+trained head is dropped and the head is silently re-initialized, while
+`peft.PeftModel.from_pretrained` restored it. inc5-6 therefore reloaded
+adapters only through peft and kept a strict-xfail tripwire on the native
+path. Since inc7 merges every LoRA week in memory and saves only the merged
+plain checkpoint, no adapter is ever saved or reloaded, the reload bug has no
+path left to bite, and the adapter reload code and its tripwire were removed
+(spec §5 "SUPERSEDED 2026-09-25 by the merge ruling"). The merged head is
+the trained head (verified by the inc7 merge round-trip tests).
 """
 
 from __future__ import annotations
@@ -127,19 +64,16 @@ logger = logging.getLogger(__name__)
 LORA_RANK_DEFAULT: int = tunables.register("judge_selftune.lora_rank", 8)
 LORA_EPOCHS_DEFAULT: int = tunables.register("judge_selftune.lora_epochs", 1)
 
-# Max sequence length for BOTH training (`build_lora_retrain_fn`'s
-# `CrossEncoder`) and serving (`load_lora_scorer`'s tokenizer) — the SINGLE
-# source both sides read, so the train-time and serve-time tokenizations
-# cannot skew (F2c inc5b, task item 5). A LoRA adapter trained on inputs
-# truncated at length L must be SERVED on inputs truncated the same way, or
-# the trained head sees a differently-tokenized input than it learned on —
-# a silent scores-differ failure, the same CLASS the #3980 guard prevents on
-# a different axis. Before this, `load_lora_scorer` applied no truncation at
-# all while training used the CrossEncoder's own (unset -> tokenizer
-# `model_max_length`, ~8194 for bge) default: a real divergence on any doc
-# long enough to truncate at one and not the other. PROVISIONAL 512 (the
-# practical bge-reranker sequence length); the real value is the deferred
-# inc5 timed dry-run's job, overridable meanwhile.
+# Max sequence length for training (`build_lora_retrain_fn`'s `CrossEncoder`)
+# — and, because the merged checkpoint is saved through
+# `CrossEncoder.save_pretrained`, which persists `max_length` in the saved
+# config, also for serving/re-scoring through `judge_full_ft.load_full_scorer`.
+# One source for both sides, so the train-time and serve-time tokenizations
+# cannot skew (F2c inc5b, task item 5; inc7 moved the serve side from the
+# removed adapter scorer to the saved checkpoint's own config). The full-FT
+# tier reads the same tunable. PROVISIONAL 512 (the practical bge-reranker
+# sequence length); the real value is the deferred timed dry-run's job,
+# overridable meanwhile.
 LORA_MAX_LENGTH_DEFAULT: int = tunables.register("judge_selftune.lora_max_length", 512)
 
 # `(query, doc, label)` triple — label is "relevant" or "irrelevant", the
@@ -164,10 +98,10 @@ LabeledTriple = tuple[str, str, str]
 #     (`modules_to_save`) = transformers 5.17.0's
 #     `XLMRobertaForSequenceClassification.classifier`
 #     (an `XLMRobertaClassificationHead`) == `"classifier"` (NOT `"score"`;
-#     the tiny GPT2 test model's `.score` head, which reproduces bug #3980,
-#     is a DIFFERENT architecture used only to exercise the mechanism — the
-#     #3980 peft-reload mitigation is head-name-agnostic, so it holds for
-#     `classifier` too).
+#     the tiny GPT2 test model's `.score` head is a DIFFERENT architecture
+#     used only to exercise the mechanism; `get_peft_model` +
+#     `merge_and_unload` carry any `modules_to_save` head into the merged
+#     weights regardless of its name).
 # These are architecture facts tied to `model_tier.MODEL_RELEVANCE_JUDGE`:
 # swapping the judge to a NON-xlm-roberta model requires updating them here
 # (a deliberate code change, not a silent tunable override that could
@@ -203,17 +137,16 @@ def _dataset_from_triples(triples: Sequence[LabeledTriple]) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Training entrypoint (spec §5 "LoRA (mid)"): CrossEncoder + LoraConfig +
-# BinaryCrossEntropyLoss via the sbert 6.1.0 CrossEncoderTrainer (the
-# CURRENT training entrypoint for this installed version — CrossEncoder's
-# older `.fit()` is a deprecated thin wrapper OVER this same trainer, per
-# sbert 6.1.0's own `fit_mixin.py` docstring, so there is no lighter
-# training API to use instead).
+# Training entrypoint (spec §5 "LoRA (mid)"): CrossEncoder + peft
+# `get_peft_model(LoraConfig)` + BinaryCrossEntropyLoss via the sbert 6.1.0
+# CrossEncoderTrainer (the CURRENT training entrypoint for this installed
+# version — CrossEncoder's older `.fit()` is a deprecated thin wrapper OVER
+# this same trainer), then an in-memory `merge_and_unload` (F2c inc7).
 # ---------------------------------------------------------------------------
 
 
 def build_lora_retrain_fn(
-    base_model_path: str | Path,
+    start_model_path: str | Path,
     *,
     target_modules: Sequence[str],
     modules_to_save: Sequence[str],
@@ -223,53 +156,43 @@ def build_lora_retrain_fn(
     epochs: int | None = None,
     max_length: int | None = None,
     activation_fn: Callable[[Any], Any] | None = None,
-    save_adapter_dir: str | Path | None = None,
+    save_dir: str | Path | None = None,
 ) -> Callable[[Sequence[LabeledTriple]], Callable[[tuple[str, str]], str]]:
     """Build a `retrain_fn` matching `judge_eval.run_champion_challenger`'s
     `Callable[[Sequence[Any]], Callable[[Any], str]]` contract.
 
-    `save_adapter_dir` (F2c inc5b-2): when set, `retrain_fn` ALSO saves the
-    trained adapter to this STAGED directory (via `CrossEncoder.
-    save_pretrained`) before returning the label-fn — so the tick can, ONLY
-    on an AC6 ACCEPT, atomically swap it into the persona's champion pointer
-    and `load_lora_scorer` it (both to re-score the knob on the tuned model
-    and to serve it). The label-fn still binds the trained IN-MEMORY model
-    for the forward-only eval regardless. `None` (default) = no save, the
-    inc5a in-memory-only behavior.
+    `start_model_path` (F2c inc7): the model this week's update is applied ON
+    TOP OF (spec §1) — the persona's own plain checkpoint dir, or the base
+    judge's model id when the persona has never been weight-tuned. Never the
+    base by default: the caller (`judge_selftune._training_start`) decides.
 
-    `base_model_path`: a local path or hub id `sentence_transformers.
-    CrossEncoder` can load (inc5a's TESTS always pass a from-scratch tiny
-    local model dir — see this module's docstring; inc5b wires the real
-    bge-reranker-v2-m3 model_tier id here).
+    Calling `retrain_fn(train_items)` loads a FRESH `CrossEncoder` from
+    `start_model_path`, wraps its underlying transformers model with
+    `peft.get_peft_model(LoraConfig(...))` (`lora_rank`/`lora_alpha`/`epochs`
+    resolved from tunables when not passed), trains it on `train_items` via
+    `BinaryCrossEntropyLoss`, then MERGES the adapter into the weights in
+    memory (`merge_and_unload`) — spec §5, OWNER 2026-09-25 "go with merging
+    each week". The returned label-fn scores the MERGED model, i.e. exactly
+    the model that is saved and would serve.
 
-    `target_modules`/`modules_to_save`: REQUIRED, no defaults (see module
-    docstring) — the LoRA adapter's target attention modules and the
-    classification head module name(s) to keep fully trainable
-    (`modules_to_save`), passed straight through to `peft.LoraConfig`.
+    `save_dir`: when set, the merged model is saved there as a PLAIN
+    checkpoint via `CrossEncoder.save_pretrained` (no adapter files; it
+    reloads with a plain `CrossEncoder(save_dir)` / `load_full_scorer`), so the
+    tick can, only on an AC6 ACCEPT, swap it into the persona's pointer.
+    `None` = no save. No adapter is written anywhere at any point.
 
-    Returns `retrain_fn(train_items) -> label_fn`: calling `retrain_fn`
-    loads a FRESH `CrossEncoder` from `base_model_path`, adds a LoRA
-    adapter (`lora_rank`/`lora_alpha`/`epochs` resolved from tunables when
-    not passed explicitly), trains it on `train_items` via
-    `BinaryCrossEntropyLoss`, and returns a plain callable
-    `(query, document) -> "relevant" | "irrelevant"` bound to the trained
-    IN-MEMORY model — no save/reload round-trip in this path (AC6's
-    champion/challenger eval is forward-only against the just-trained
-    model; save/reload is `LoraRollbackHandle`'s concern, for
-    cross-process persistence, not this function's).
+    `target_modules`/`modules_to_save`: REQUIRED, no defaults — the LoRA
+    target attention modules and the classification head module name(s) kept
+    fully trainable, passed straight through to `peft.LoraConfig`.
 
-    Never called with `test_items` (AC5 no-leakage contract, enforced by
-    the caller — `judge_eval.run_champion_challenger` — not by this
-    function, which has no way to distinguish train from test items on its
-    own).
+    Never called with `test_items` (AC5 no-leakage contract, enforced by the
+    caller — `judge_eval.run_champion_challenger`).
     """
 
     def retrain_fn(train_items: Sequence[LabeledTriple]) -> Callable[[tuple[str, str]], str]:
         # Lazy imports (module docstring: never at this module's top level,
-        # to keep torch scoped to actually RUNNING training — I6). peft +
-        # datasets + sentence-transformers are all BASE deps (F2c inc5b-2),
-        # so a missing one is a broken install, surfaced plainly.
-        from peft import LoraConfig
+        # to keep torch scoped to actually RUNNING training — I6).
+        from peft import LoraConfig, get_peft_model
         from sentence_transformers import CrossEncoder
         from sentence_transformers.cross_encoder.losses import BinaryCrossEntropyLoss
         from sentence_transformers.cross_encoder.trainer import CrossEncoderTrainer
@@ -288,9 +211,9 @@ def build_lora_retrain_fn(
             if epochs is not None
             else tunables.get_tunable("judge_selftune.lora_epochs", LORA_EPOCHS_DEFAULT)
         )
-        # Train/serve tokenization parity (task item 5): the CrossEncoder
-        # truncates training inputs at this length; `load_lora_scorer`
-        # reads the SAME tunable to truncate serve inputs identically.
+        # Train/serve tokenization parity: the CrossEncoder truncates training
+        # inputs at this length, and `save_pretrained` persists it in the
+        # merged checkpoint's config, which `load_full_scorer` reloads.
         resolved_max_length = (
             max_length
             if max_length is not None
@@ -298,7 +221,7 @@ def build_lora_retrain_fn(
         )
 
         model = CrossEncoder(
-            str(base_model_path),
+            str(start_model_path),
             cache_folder=str(cache_dir) if cache_dir is not None else None,
             config_kwargs={"num_labels": 1},
             max_length=resolved_max_length,
@@ -311,7 +234,10 @@ def build_lora_retrain_fn(
             modules_to_save=list(modules_to_save),
             task_type="SEQ_CLS",
         )
-        model.add_adapter(lora_config)
+        # Wrap the CrossEncoder's own loaded transformers model in place
+        # (`model[0]` is sbert's Transformer module; `.model` is the HF
+        # model it runs) — one load of the start weights, no second copy.
+        model[0].model = get_peft_model(model[0].model, lora_config)
 
         dataset = _dataset_from_triples(train_items)
         loss_fn = BinaryCrossEntropyLoss(model)
@@ -331,12 +257,13 @@ def build_lora_retrain_fn(
             trainer = CrossEncoderTrainer(model=model, args=args, train_dataset=dataset, loss=loss_fn)
             trainer.train()
 
-        # F2c inc5b-2: persist the trained adapter to the caller's STAGED
-        # dir (outside the deleted scratch dir) so the tick can atomically
-        # swap it into the champion pointer + reload it (#3980-safe, via
-        # `load_lora_scorer`) on an AC6 ACCEPT. Only when requested.
-        if save_adapter_dir is not None:
-            model.save_pretrained(str(save_adapter_dir))
+        # Merge the trained adapter (incl. the `modules_to_save` head) into the
+        # weights IN MEMORY; from here on the model is a plain transformers
+        # model and nothing adapter-shaped exists (spec §5 merge ruling).
+        model[0].model = model[0].model.merge_and_unload()
+
+        if save_dir is not None:
+            model.save_pretrained(str(save_dir))
 
         def label_fn(item: tuple[str, str]) -> str:
             query, document = item[0], item[1]
@@ -344,91 +271,14 @@ def build_lora_retrain_fn(
             # Route through relevance_judge.label_for_score — the single
             # source of truth for turning a raw judge logit into a label
             # (default slope=1.0/intercept=0.0: relevant iff sigmoid(raw)
-            # >= 0.5, i.e. raw >= 0.0 — NOT raw >= 0.5). A local re-
-            # implementation here previously thresholded the RAW logit at
-            # 0.5 directly, which is wrong (biases against "relevant" for
-            # raw in [0.0, 0.5)) and Platt-inconsistent with inc3's fitted
-            # knob. `is_ambiguous` is discarded: the champion/challenger
-            # eval (AC6) wants a single hard label per item, not an
-            # ambiguous-band routing decision (that's relevance_judge's
-            # own live-tick concern, not training/eval here).
+            # >= 0.5, i.e. raw >= 0.0). `is_ambiguous` is discarded: the
+            # champion/challenger eval (AC6) wants a single hard label.
             provisional_label, _is_ambiguous = label_for_score(raw_score)
             return provisional_label
 
         return label_fn
 
     return retrain_fn
-
-
-# ---------------------------------------------------------------------------
-# AC7-SAFE reload — the fix this module's docstring verdict identifies:
-# peft's OWN native reload path, never sbert's/transformers' auto-detect.
-# ---------------------------------------------------------------------------
-
-
-def load_lora_scorer(
-    base_model_path: str | Path,
-    adapter_dir: str | Path,
-    *,
-    cache_dir: str | Path | None = None,
-    max_length: int | None = None,
-) -> Callable[[tuple[str, str]], float]:
-    """Reload a saved LoRA adapter and return a raw-score callable
-    `(query, document) -> float`, via the bug-#3980-SAFE path (this
-    module's docstring verdict): `peft.PeftModel.from_pretrained` against a
-    freshly-loaded plain base model, NEVER `sentence_transformers.
-    CrossEncoder(adapter_dir)`'s own auto-detection (which reproduces
-    #3980 — see `test_bug_3980_reload_via_crossencoder_autoload_
-    reproduces_the_bug`).
-
-    Returns RAW scores (no sigmoid), matching `RelevanceJudgeProvider.
-    score`'s convention in `relevance_judge.py` — a future load-side caller
-    applies `relevance_judge.label_for_score` on top, exactly as the live
-    daily-tick judge already does for the base (non-tuned) judge.
-
-    TRAIN/SERVE TOKENIZATION PARITY (task item 5): `max_length` (None ->
-    the `judge_selftune.lora_max_length` tunable) truncates serve inputs at
-    the SAME length `build_lora_retrain_fn` truncated training inputs at, so
-    the adapter is scored on inputs tokenized the way it was trained. Before
-    this, the serve tokenizer applied no truncation while training did (via
-    the CrossEncoder's own max_length) — a silent skew on long inputs.
-    """
-    from peft import PeftModel  # base dep (F2c inc5b-2); lazy for torch-scoping only
-    from transformers import AutoModelForSequenceClassification, AutoTokenizer
-
-    resolved_max_length = (
-        max_length
-        if max_length is not None
-        else tunables.get_tunable("judge_selftune.lora_max_length", LORA_MAX_LENGTH_DEFAULT)
-    )
-
-    base_model = AutoModelForSequenceClassification.from_pretrained(
-        str(base_model_path),
-        local_files_only=True,
-        num_labels=1,
-        cache_dir=str(cache_dir) if cache_dir is not None else None,
-    )
-    peft_model = PeftModel.from_pretrained(base_model, str(adapter_dir))
-    peft_model.eval()
-    tokenizer = AutoTokenizer.from_pretrained(str(base_model_path), local_files_only=True)
-
-    def score(item: tuple[str, str]) -> float:
-        import torch
-
-        query, document = item[0], item[1]
-        encoded = tokenizer(
-            [query],
-            [document],
-            padding=True,
-            truncation=True,
-            max_length=resolved_max_length,
-            return_tensors="pt",
-        )
-        with torch.no_grad():
-            output = peft_model(**encoded)
-        return float(output.logits.squeeze(-1)[0])
-
-    return score
 
 
 # ---------------------------------------------------------------------------
@@ -482,67 +332,123 @@ class LoraRollbackHandle(RollbackHandle):
 
 
 # ---------------------------------------------------------------------------
-# Per-persona champion-adapter store (F2c inc5b-2, spec §4/§5 "where the
-# tuned judge loads from" + crash-safety). TORCH-FREE, filesystem-only —
-# these never load a model. The persona's tuned judge lives under
-# `champion_dir(persona_dir)` as versioned `adapter-<uuid>` subdirs plus a
-# `current` POINTER FILE naming the active subdir. Persist = write a fresh
-# staged subdir, then atomically repoint `current` (write-temp + os.replace
-# on the same filesystem). A mid-tick crash resolves `current` to the
-# last-known-good adapter; an incomplete staged subdir is orphaned scratch,
-# never served. This supersedes inc5a's `LoraRollbackHandle` (a
-# copytree/rmtree mutate-in-place model) for the wiring: the atomic pointer
-# swap is strictly more crash-safe and needs no copy to roll back.
+# Per-persona tuned-judge store (F2c inc5b-2; ONE lineage since inc7, spec
+# §5 "One stored tuned model per persona"). TORCH-FREE, filesystem-only —
+# these never load a model. The persona's single tuned judge lives under
+# `champion_dir(persona_dir)` as a PLAIN merged/fine-tuned checkpoint in a
+# versioned subdir (the `adapter-` name prefix is historical: since inc7 no
+# adapter is ever stored) plus a `current` POINTER FILE naming the active
+# subdir. Persist = write a fresh staged subdir, then atomically repoint
+# `current` (write-temp + os.replace on the same filesystem). A mid-tick crash
+# resolves `current` to the last-known-good checkpoint; an incomplete staged
+# subdir is orphaned scratch, never served, and is reaped by the next tick
+# (`reap_unreferenced`). No per-tier stores, no sibling pointers.
 # ---------------------------------------------------------------------------
 
 _CHAMPION_POINTER = "current"
 _ADAPTER_PREFIX = "adapter-"
+_ADAPTER_CONFIG_FILE = "adapter_config.json"
 
 
 def champion_dir(persona_dir: str | Path) -> Path:
-    """The per-persona LoRA champion-adapter root: `persona_dir/models/relevance_judge/`
-    (spec §5, handoff PINNED CONTRACTS). Does not create it."""
+    """The per-persona tuned-judge root: `persona_dir/models/relevance_judge/`
+    (spec §5). Does not create it."""
     return Path(persona_dir) / "models" / "relevance_judge"
 
 
-def full_champion_dir(persona_dir: str | Path) -> Path:
-    """The per-persona FULL-FT champion root: `persona_dir/models/relevance_judge/full/`
-    (spec §5, "a full-FT persona keeps a FULL judge copy at .../full/", F2c inc6). A
-    SUB-root of the LoRA `champion_dir` — the two stores never collide because
-    `cleanup_stale_adapters` only ever touches `adapter-*` entries, so the LoRA
-    root's cleanup skips this `full/` subtree and vice-versa. Reuses all the same
-    torch-free store helpers (`staged_adapter_path`/`swap_champion_pointer`/
-    `resolve_champion_adapter`/`cleanup_stale_adapters`) with this root. Does not
-    create it."""
-    return champion_dir(persona_dir) / "full"
+def resolve_current_checkpoint(persona_dir: str | Path) -> Path | None:
+    """The persona's CURRENT tuned judge (F2c inc7): the plain checkpoint dir
+    its `current` pointer names, or `None` = the shared base judge (never
+    weight-tuned, or the pointer is absent/unreadable/dangling — absent-safe,
+    I9). The single source of truth for BOTH the weekly tick (what this week
+    trains from and what the champion is) and the daily calibration tick's
+    serve path.
+
+    A dir holding `adapter_config.json` (the never-shipped inc5/inc6 LoRA
+    adapter layout) is NOT a plain checkpoint and is treated as unresolvable
+    (→ base), so it is never handed to the plain-checkpoint loader. Fail-soft:
+    never raises."""
+    target = resolve_champion_adapter(champion_dir(persona_dir))
+    if target is None:
+        return None
+    try:
+        if (target / _ADAPTER_CONFIG_FILE).exists():
+            logger.warning(
+                "resolve_current_checkpoint: %s holds an adapter (pre-inc7 layout); serving the base judge",
+                target,
+            )
+            return None
+    except OSError:
+        logger.warning("resolve_current_checkpoint: failed to inspect %s", target, exc_info=True)
+        return None
+    return target
 
 
-def resolve_serving_tuned_judge(persona_dir: str | Path) -> tuple[str, Path] | None:
-    """Resolve the ONE tuned judge that should serve this persona, across both
-    weight-retrain tiers (F2c inc6). Precedence: the FULL-FT store first
-    (`("full", dir)`), else the LoRA store (`("lora", dir)`), else `None` (the
-    base judge — absent-safe, I9).
+def read_pointer_name(champion_root: str | Path) -> str | None:
+    """The raw name the `current` pointer holds (no existence or form check),
+    or `None` if there is no pointer / it is empty / it cannot be read. Used
+    to restore the pointer byte-for-byte on a pre-commit rollback and to keep
+    the pointer-named dir when discarding a staged one. Never raises."""
+    pointer = Path(champion_root) / _CHAMPION_POINTER
+    try:
+        if not pointer.is_file():
+            return None
+        name = pointer.read_text(encoding="utf-8").strip()
+        return name or None
+    except OSError:
+        logger.warning("read_pointer_name: failed to read %s", pointer, exc_info=True)
+        return None
 
-    Single source of truth for "what tuned judge serves this persona," used by
-    `supervisor._run_calibration_tick`'s serve path. In steady state a persona
-    has at most one live tuned pointer (the tick clears the sibling tier's pointer
-    on ACCEPT — spec §1 "alternatives, never both"), so this precedence only acts
-    as a deterministic tiebreak in the brief cross-tier / crash window; the full
-    tier is preferred because a full fine-tune subsumes a LoRA adapter (spec §1).
-    Fail-soft: any resolve error degrades to the lower-precedence store, then to
-    the base judge — never crashes the serve/tick path."""
-    full = resolve_champion_adapter(full_champion_dir(persona_dir))
-    if full is not None:
-        return ("full", full)
-    lora = resolve_champion_adapter(champion_dir(persona_dir))
-    if lora is not None:
-        return ("lora", lora)
-    return None
+
+def discard_stored_dir(path: str | Path) -> None:
+    """Best-effort delete of ONE stored dir (a rejected or faulted staged
+    checkpoint). Never raises; a refused delete is logged and left for
+    `reap_unreferenced` on a later tick."""
+    p = Path(path)
+    if not p.exists():
+        return
+    try:
+        shutil.rmtree(p)
+    except OSError:
+        logger.warning("discard_stored_dir: failed to remove %s", p, exc_info=True)
+
+
+def reap_unreferenced(champion_root: str | Path) -> None:
+    """Delete every stored `adapter-*` checkpoint dir except the one the
+    `current` pointer names (F2c inc7, ruling Q1 retry path). Never raises.
+
+    Runs at the start of every weekly tick, so a previous checkpoint whose
+    post-swap delete the OS refused (e.g. files still open or memory-mapped on
+    Windows, I13) is retried on the next tick, and a staged dir orphaned by a
+    crash is cleaned up. SAFETY: the pointer file is read raw; if it cannot be
+    read (`OSError`) nothing is reaped this tick. The name the pointer holds is
+    always kept, even if that dir is missing or holds an adapter; an empty
+    pointer also skips reaping. An absent pointer means no tuned model, so
+    every `adapter-*` dir is a leftover."""
+    root = Path(champion_root)
+    pointer = root / _CHAMPION_POINTER
+    try:
+        if not root.is_dir():
+            return
+        keep: list[str] = []
+        if pointer.exists():
+            name = pointer.read_text(encoding="utf-8").strip()
+            if not name:
+                # An empty pointer names nothing we could safely keep; do not
+                # guess, leave everything for a later tick.
+                logger.warning("reap_unreferenced: %s is empty; skipping this tick", pointer)
+                return
+            keep.append(name)
+    except OSError:
+        logger.warning("reap_unreferenced: cannot read %s; skipping this tick", pointer, exc_info=True)
+        return
+    cleanup_stale_adapters(root, keep_names=keep)
 
 
 def staged_adapter_path(champion_root: str | Path) -> Path:
     """A fresh, unique `adapter-<uuid>` subdir under `champion_root` for a
-    staged write (NOT yet the champion). Same filesystem as the `current`
+    staged write of a plain checkpoint (NOT yet the champion; the prefix is
+    historical). Same filesystem as the `current`
     pointer (both under `champion_root`), so the later `os.replace` swap is
     atomic (C22). Creates `champion_root` (parents) but not the subdir
     itself — `CrossEncoder.save_pretrained` creates it."""
@@ -578,7 +484,7 @@ def clear_champion_pointer(champion_root: str | Path) -> None:
 
 
 def resolve_champion_adapter(champion_root: str | Path) -> Path | None:
-    """Read `current` and return the adapter subdir it names, or `None`
+    """Read `current` and return the stored subdir it names, or `None`
     (absent pointer, dangling target, or any read error). Fail-soft — a
     resolve failure must degrade to the base judge (I9), never crash the
     serve/tick path."""
@@ -599,9 +505,11 @@ def resolve_champion_adapter(champion_root: str | Path) -> Path | None:
 
 def cleanup_stale_adapters(champion_root: str | Path, keep_names: Sequence[str]) -> None:
     """Best-effort removal of `adapter-*` subdirs whose basename is NOT in
-    `keep_names` (never raises). The tick passes {new, old} on an accept
-    swap (keep N=2, so an in-flight reader that resolved the prior pointer
-    still finds its subdir — C18), or {current} on a revert/fault to reap a
+    `keep_names` (never raises; a refused delete, e.g. an open file on
+    Windows, is logged and left for `reap_unreferenced` on a later tick). The
+    tick passes `judge_selftune._keep_after_accept(...)` after an accepted
+    swap (F2c inc7 ruling Q1: only the new checkpoint; the previous one is
+    deleted in the same tick), or {current} on a revert/fault to reap a
     discarded staged subdir (C21). A `None`/empty name in `keep_names` is
     ignored (first-ever tune has no prior)."""
     root = Path(champion_root)

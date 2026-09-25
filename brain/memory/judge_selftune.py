@@ -7,11 +7,13 @@ the >handful gate, runtime RAM tier-detection, and the cgroup-aware
 OOM-safety downgrade — plus the tune dispatch: the weak-tier Platt knob-refit
 (inc3, `fit_platt_knob`/`_weak_knob_refit_and_consume`, deterministic, no
 torch) and the mid/beefy weight-retrain lifecycle (inc5b-2 LoRA + inc6 full
-fine-tune, `_run_weight_retrain`, dispatched by `tune_grade` via
-`_weight_retrain_mechanism`; the 2/3-1/3 split + champion/challenger + rollback
-live in the torch-scoped sibling modules `judge_eval`/`judge_lora`/
-`judge_full_ft`). Entirely offline (I6): this tick runs only from
-`supervisor.run_folded`'s weekly cadence block, never on the per-turn recall
+fine-tune, `_run_weight_retrain`; since inc7 ONE model lineage per persona:
+every update is applied on top of the persona's current model, the tier picks
+only this week's method via `_select_retrain`, and the persona keeps one plain
+checkpoint behind one pointer; the 2/3-1/3 split + champion/challenger live in
+the torch-scoped sibling modules `judge_eval`/`judge_lora`/`judge_full_ft`).
+Entirely offline (I6): this tick runs only from `supervisor.run_folded`'s
+weekly cadence block, never on the per-turn recall
 path — no top-level torch/sentence_transformers import here (the weight-retrain
 tiers import them LAZILY inside the sibling modules).
 
@@ -31,7 +33,6 @@ from __future__ import annotations
 import logging
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -374,77 +375,59 @@ def _weak_knob_refit_and_consume(store, now: datetime, row_ids: list[int]) -> No
     store.mark_selftune_consumed(row_ids, consumed_at=now)
 
 
-@dataclass(frozen=True)
-class _WeightRetrainMechanism:
-    """The tier-specific pieces `_run_weight_retrain` plugs into the ONE
-    shared LoRA/full-FT lifecycle (F2c inc6). Selected by `tune_grade`
-    (`_weight_retrain_mechanism` below); everything ELSE in the lifecycle
-    (degenerate floor, champion/challenger, re-score-on-accept, 2B consume,
-    crash-safety) is identical across tiers.
-
-    - `champion_root`: this tier's per-persona champion store root (LoRA =
-      `champion_dir`; full-FT = `full_champion_dir`, the `.../full/` sub-root).
-    - `sibling_root`: the OTHER tier's store root, whose champion pointer is
-      cleared on ACCEPT so a persona keeps exactly one tuned judge live (spec
-      §1 "alternatives, never both").
-    - `build_retrain_fn(staged_dir)`: builds the tier's `retrain_fn` that
-      trains + stages a save to `staged_dir` (LoRA adapter / full model).
-    - `load_scorer(dir)`: reloads a saved tuned model from `dir` as a
-      `(query, doc) -> raw float` scorer (LoRA = #3980-safe peft path; full =
-      plain CrossEncoder).
-    """
-
-    champion_root: Path
-    sibling_root: Path
-    build_retrain_fn: Callable[[Path], Callable[..., Callable[[tuple[str, str]], str]]]
-    load_scorer: Callable[[Path], Callable[[tuple[str, str]], float]]
+def _training_start(current: Path | None) -> str:
+    """What this week's weight update is applied ON TOP OF (spec §1, AC12;
+    F2c inc7): the persona's CURRENT model — its own plain checkpoint, or the
+    base judge's model id when it has never been weight-tuned. The single home
+    of this rule. A REVERTED week never moves the pointer, so the week after a
+    rejected challenger starts from the model that never got the rejected
+    adjustment [OWNER 2026-09-25]."""
+    return str(current) if current is not None else MODEL_RELEVANCE_JUDGE
 
 
-def _weight_retrain_mechanism(tune_grade: str, persona_dir: Path) -> _WeightRetrainMechanism:
-    """Select the tier mechanism for `tune_grade` (spec §1 table, F2c inc6):
-    LORA → the LoRA adapter store + `judge_lora` train/reload; FULL_FT → the
-    full-model store + `judge_full_ft` train/reload. Both attribute-reference
-    the module functions at CALL time so a test's monkeypatch of
-    `build_lora_retrain_fn`/`load_lora_scorer`/`build_full_ft_retrain_fn`/
-    `load_full_scorer` is honored."""
+def _keep_after_accept(new_name: str, prior_name: str | None) -> list[str]:  # noqa: ARG001
+    """Which stored checkpoint dirs survive an ACCEPTED swap (F2c inc7, ruling
+    Q1, spec §5 "the previous checkpoint is DELETED right after the swap"):
+    only the new one. The previous checkpoint is deleted in the same tick; if
+    the OS refuses (files still open/memory-mapped, Windows — I13), the
+    failure is logged, not raised, and `judge_lora.reap_unreferenced` retries
+    at the start of a later tick. `prior_name` is accepted so the policy is
+    visible at its one call site."""
+    return [new_name]
+
+
+def _select_retrain(tune_grade: str, start: str, staged: Path) -> Callable[..., Callable[[tuple[str, str]], str]]:
+    """This week's update METHOD (spec §1 table): LORA → a LoRA trained on
+    `start` and merged in memory (`judge_lora.build_lora_retrain_fn`); FULL_FT
+    → a full fine-tune continued from `start` (`judge_full_ft.
+    build_full_ft_retrain_fn`). Both save a PLAIN checkpoint to `staged`.
+    Module functions are attribute-referenced at CALL time so a test's
+    monkeypatch is honored."""
     from brain.memory import judge_full_ft, judge_lora
 
-    lora_root = judge_lora.champion_dir(persona_dir)
-    full_root = judge_lora.full_champion_dir(persona_dir)
     if tune_grade == TUNE_GRADE_FULL_FT:
-        return _WeightRetrainMechanism(
-            champion_root=full_root,
-            sibling_root=lora_root,
-            build_retrain_fn=lambda staged: judge_full_ft.build_full_ft_retrain_fn(
-                MODEL_RELEVANCE_JUDGE, save_full_dir=staged
-            ),
-            load_scorer=lambda d: judge_full_ft.load_full_scorer(d),
-        )
-    # TUNE_GRADE_LORA (mid) — unchanged from inc5b-2.
-    return _WeightRetrainMechanism(
-        champion_root=lora_root,
-        sibling_root=full_root,
-        build_retrain_fn=lambda staged: judge_lora.build_lora_retrain_fn(
-            MODEL_RELEVANCE_JUDGE,
-            target_modules=judge_lora.BGE_RERANKER_LORA_TARGET_MODULES,
-            modules_to_save=judge_lora.BGE_RERANKER_LORA_MODULES_TO_SAVE,
-            save_adapter_dir=staged,
-        ),
-        load_scorer=lambda d: judge_lora.load_lora_scorer(MODEL_RELEVANCE_JUDGE, d),
+        return judge_full_ft.build_full_ft_retrain_fn(start, save_full_dir=staged)
+    return judge_lora.build_lora_retrain_fn(
+        start,
+        target_modules=judge_lora.BGE_RERANKER_LORA_TARGET_MODULES,
+        modules_to_save=judge_lora.BGE_RERANKER_LORA_MODULES_TO_SAVE,
+        save_dir=staged,
     )
 
 
 def _run_weight_retrain(
-    store, now: datetime, persona_dir: Path, row_ids: list[int], tune_grade: str
+    store, now: datetime, persona_dir: Path, row_ids: list[int], tune_grade: str, info: dict
 ) -> tuple[bool | None, bool]:
-    """The LoRA/full-FT weight-retrain lifecycle (spec §4/§5, AC5/6/7/11) for
-    a mid/beefy ACCEPT-or-REVERT tick, tier-parameterized by `tune_grade`
-    (F2c inc6: LORA → LoRA adapter, FULL_FT → full fine-tune; the lifecycle
-    body is identical, only the mechanism — store root + train/reload — is
-    swapped, via `_weight_retrain_mechanism`). Returns `(accepted,
-    adapter_persisted)` — `accepted` is `None` when the DEGENERATE FLOOR fell
-    through to a plain knob-refit (too few Haiku triples to evaluate). Raises
-    on any fault (the caller leaves `row_ids` unconsumed).
+    """The LoRA/full-FT weight-retrain lifecycle (spec §4/§5, AC5/6/12/13) for
+    a mid/beefy ACCEPT-or-REVERT tick. ONE model lineage per persona (F2c
+    inc7): the challenger is trained ON TOP OF the persona's current model
+    (`_training_start`), the champion it must beat is that same current model,
+    and an accepted challenger replaces it in the ONE per-persona store. The
+    tier (`tune_grade`) only picks this week's method (`_select_retrain`).
+    Returns `(accepted, checkpoint_persisted)` — `accepted` is `None` when the
+    DEGENERATE FLOOR fell through to a plain knob-refit. `info` receives the
+    H4 observability fields (`current`, `start`). Raises on any fault (the
+    caller leaves `row_ids` unconsumed).
 
     DURABLE HAIKU-ORACLE NOTE (spec §6): the champion/challenger below scores
     both judges against the accumulated HAIKU tie-break labels as the oracle,
@@ -456,25 +439,27 @@ def _run_weight_retrain(
     up downstream, this dispatch is one of the two places to look (alongside
     the knob-refit's training data).
 
-    Full ORDER + crash-safety per spec §4 and the plan REVISION 2:
-      - ACCEPT: re-score the knob on the TUNED (staged) model → capture the
-        prior champion pointer (o1) → atomically swap the pointer → clear the
-        SIBLING tier's pointer (F2c inc6: exactly one tuned judge, spec §1) →
-        persist the knob → cleanup (keep N=2) → persist state → CONSUME the
-        doc-HAVING subset only (2B) LAST. A post-swap fault rolls the pointer
-        back (o2).
-      - REVERT: the champion pointer is never swapped (nothing to restore);
-        reap the discarded staged adapter (o3); knob from LOGGED scores (inc3
-        path); CONSUME the FULL `row_ids` (all trained by the doc-agnostic
-        logged fit) LAST.
+    ORDER + crash-safety (spec §4, §5 storage; plan rev. 3):
+      - ACCEPT: re-score the knob on the STAGED model → swap the pointer →
+        persist the knob (COMMIT) → delete the previous checkpoint
+        (`_keep_after_accept`, best-effort) → persist state → CONSUME the
+        doc-HAVING subset (2B) LAST. A fault after the swap but BEFORE the
+        commit rolls the pointer back to the previous checkpoint (still on
+        disk); a fault AFTER the commit leaves the new checkpoint serving with
+        its matching knob (rows unconsumed, re-eligible).
+      - REVERT: the pointer is never swapped; reap the discarded staged dir;
+        knob from LOGGED scores (inc3 path); CONSUME the FULL `row_ids` LAST.
     """
-    from brain.memory import judge_eval, judge_lora, relevance_judge
-
-    mech = _weight_retrain_mechanism(tune_grade, persona_dir)
+    from brain.memory import judge_eval, judge_full_ft, judge_lora, relevance_judge
 
     resolved_min_n = tunables.get_tunable(
         "judge_selftune.eval_min_test_n", judge_eval.JUDGE_EVAL_MIN_TEST_N_DEFAULT
     )
+
+    current = judge_lora.resolve_current_checkpoint(persona_dir)
+    start = _training_start(current)
+    info["current"] = current.name if current is not None else "base"
+    info["start"] = current.name if current is not None else "base"
 
     triples = store.judge_lora_training_triples(row_ids)
     # DEGENERATE FLOOR (spec §4, finding 7 — reuse the pinned `eval_min_test_n`
@@ -485,16 +470,15 @@ def _run_weight_retrain(
         _weak_knob_refit_and_consume(store, now, row_ids)
         return (None, False)
 
-    champion_root = mech.champion_root
-    old_target_dir = judge_lora.resolve_champion_adapter(champion_root)
-    old_target_name = old_target_dir.name if old_target_dir is not None else None
+    root = judge_lora.champion_dir(persona_dir)
+    # The pointer's raw name (even an unusable legacy one), so a pre-commit
+    # rollback restores it exactly; `current` above is what it resolves to.
+    prior_name = judge_lora.read_pointer_name(root)
 
-    # Champion = the CURRENT serving judge (of THIS tier) as an (item)->label
-    # fn: the live tuned model if this persona already has one for this tier,
-    # else the base judge — so champion and challenger are compared
-    # like-for-like within the tier.
-    if old_target_dir is not None:
-        champ_scorer = mech.load_scorer(old_target_dir)
+    # Champion = the model currently SERVING this persona (spec §1: serving is
+    # tier-independent): its own checkpoint, else the base judge.
+    if current is not None:
+        champ_scorer = judge_full_ft.load_full_scorer(current)
 
         def champion(item):
             label, _amb = relevance_judge.label_for_score(float(champ_scorer(item)))
@@ -512,10 +496,11 @@ def _run_weight_retrain(
     train_items = [(q, d, label) for (q, d, label) in train]
     test_items = [((q, d), label) for (q, d, label) in test]
 
-    staged = judge_lora.staged_adapter_path(champion_root)
-    retrain_fn = mech.build_retrain_fn(staged)
+    staged = judge_lora.staged_adapter_path(root)
+    retrain_fn = _select_retrain(tune_grade, start, staged)
 
     swapped = False
+    committed = False
     try:
         cc = judge_eval.run_champion_challenger(
             champion=champion,
@@ -523,40 +508,28 @@ def _run_weight_retrain(
             train_items=train_items,
             test_items=test_items,
             # No-op rollback: the champion is never mutated during eval
-            # (retrain writes to the fresh staged subdir), so there is nothing
-            # for run_champion_challenger to restore. Crash-safety is owned
-            # here via the atomic pointer swap + pointer-snapshot (plan R2.4).
+            # (retrain writes to the fresh staged subdir); crash-safety is
+            # owned here via the atomic pointer swap.
             rollback=judge_eval.RollbackHandle(),
         )
         if cc.accepted:
             # RE-SCORE the knob on the TUNED model (§5 pin): forward-pass the
-            # doc-HAVING re-score set through the persisted/reloaded challenger
-            # model (LoRA #3980-safe peft path / full plain CrossEncoder) →
-            # fresh raw scores → fit the Platt knob on those. Computed from the
-            # STAGED model BEFORE the swap — its scores match what will serve
-            # after the swap (same reload path). Raises if empty → outer
-            # handler, rows unconsumed.
-            scorer = mech.load_scorer(staged)
+            # doc-HAVING re-score set through the staged checkpoint, loaded by
+            # the same loader that will serve it. Raises if empty → handler,
+            # rows unconsumed.
+            scorer = judge_full_ft.load_full_scorer(staged)
             rescore = store.judge_knob_refit_rescore_items(row_ids)
             pairs = [(float(scorer((q, d))), label) for (q, d, label) in rescore]
             slope, intercept = fit_platt_knob(pairs)
 
-            judge_lora.swap_champion_pointer(champion_root, staged)
+            judge_lora.swap_champion_pointer(root, staged)
             swapped = True
-            # F2c inc6: clear the SIBLING tier's champion pointer so this
-            # persona keeps exactly one tuned judge live (spec §1
-            # "alternatives, never both"). Best-effort (never raises); placed
-            # AFTER the swap so a crash before it leaves both pointers, which
-            # `resolve_serving_tuned_judge`'s full>lora precedence resolves
-            # deterministically and the next accept re-clears. This keeps the
-            # served tuned judge matched to the just-re-fit knob across a tier
-            # change (stage-3 F1/C17). NOT wrapped into the post-swap-fault
-            # rollback below — it is fail-open, unlike this tier's own pointer.
-            judge_lora.clear_champion_pointer(mech.sibling_root)
             store.write_judge_knob_calibration(MODEL_RELEVANCE_JUDGE, slope=slope, intercept=intercept)
-            # keep N=2 (new + immediately-prior) so an in-flight reader that
-            # resolved the prior pointer still finds its subdir (C18).
-            judge_lora.cleanup_stale_adapters(champion_root, keep_names=[staged.name, old_target_name])
+            committed = True  # new checkpoint + its knob are both in place
+            # Delete the previous checkpoint now (ruling Q1). Best-effort:
+            # cleanup_stale_adapters logs and swallows a refused delete, and
+            # reap_unreferenced retries it at the start of a later tick.
+            judge_lora.cleanup_stale_adapters(root, keep_names=_keep_after_accept(staged.name, prior_name))
             store.write_judge_selftune_state(MODEL_RELEVANCE_JUDGE, last_trained_at=now)
             # ACCEPT consume = doc-HAVING subset only (2B): a legacy
             # doc-absent row was NOT trained here (excluded from both the
@@ -565,38 +538,34 @@ def _run_weight_retrain(
             store.mark_selftune_consumed(doc_having, consumed_at=now)
             return (True, True)
 
-        # REVERT: champion pointer untouched; reap the discarded staged
-        # adapter (o3). Knob from LOGGED scores (resulting model == champion
-        # == logged-score model → no re-score, inc3 path). Consume the FULL
-        # row_ids (the doc-agnostic logged fit trained on every row — 2B).
-        judge_lora.cleanup_stale_adapters(champion_root, keep_names=[old_target_name])
+        # REVERT: pointer untouched; discard the rejected staged dir. Knob
+        # from LOGGED scores (resulting model == champion == logged-score model
+        # → no re-score, inc3 path). Consume the FULL row_ids (2B).
+        judge_lora.discard_stored_dir(staged)
         _weak_knob_refit_and_consume(store, now, row_ids)
         return (False, False)
     except Exception:
-        # o2/o3/o4: crash-safe rollback. Wrapped in its own guard so a
-        # secondary fault here never MASKS the original fault (stage-6
-        # finding 4) — the original propagates to the tick's handler, which
-        # leaves rows unconsumed (fail-safe, re-eligible).
+        # Crash-safe handling. Wrapped in its own guard so a secondary fault
+        # never MASKS the original, which propagates to the tick's handler
+        # (rows stay UNCONSUMED — fail-safe, re-eligible).
         try:
-            # A POST-swap fault → roll the champion pointer back to the prior
-            # last-known-good adapter (or clear it if this was the first-ever
-            # tune), so the persona never resolves to a knob/adapter mismatch
-            # beyond the self-healing window.
-            if swapped:
-                if old_target_name is not None:
-                    judge_lora.swap_champion_pointer(champion_root, champion_root / old_target_name)
+            if swapped and not committed:
+                # Swapped but the new knob is not written: roll the pointer
+                # back to the previous checkpoint (still on disk — it is only
+                # deleted after the commit), or clear it for a first-ever tune.
+                if prior_name is not None:
+                    judge_lora.swap_champion_pointer(root, root / prior_name)
                 else:
-                    judge_lora.clear_champion_pointer(champion_root)
-            # Reap the discarded staged adapter but keep N=2 ({prior, staged})
-            # on the swapped path (stage-6 finding 1): an in-flight reader that
-            # resolved `staged` during the brief post-swap window is protected
-            # for one cycle, the same guarantee C12/C18 give the success path;
-            # the orphaned staged subdir is reaped by the next tick's cleanup.
-            keep = [old_target_name, staged.name] if swapped else [old_target_name]
-            judge_lora.cleanup_stale_adapters(champion_root, keep_names=keep)
+                    judge_lora.clear_champion_pointer(root)
+                judge_lora.discard_stored_dir(staged)
+            elif not swapped:
+                # Nothing was swapped: discard the staged dir, keep the champion.
+                judge_lora.discard_stored_dir(staged)
+            # committed: the new checkpoint + its knob serve; leave the pointer.
+            # Any leftover previous checkpoint is reaped by a later tick.
         except Exception:  # noqa: BLE001 — rollback is best-effort; never mask the original
             logger.warning("judge self-tune: crash-safe rollback itself faulted", exc_info=True)
-        raise  # rows stay UNCONSUMED (caller's handler) — fail-safe, re-eligible
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -618,45 +587,62 @@ def _run_weight_retrain(
 
 def _run_judge_selftune_tick(*, store, now: datetime, persona_dir: Path | None = None) -> dict:
     """One weekly judge self-tune tick (F2c inc2 cadence/gate + inc3 knob-refit
-    + inc5b-2 LoRA/full-FT weight-retrain lifecycle). Caller owns cadence +
+    + inc5b-2/inc6/inc7 weight-retrain lifecycle). Caller owns cadence +
     throttle — mirrors `interest_sweep.run_sweep_tick`'s contract exactly.
     Never raises.
 
-    Counts UNCONSUMED non-None `haiku_label` positions across `calibration_log`
-    (the >handful gate, spec §2/§3, `count_new_haiku_decisions`) and, ONLY when
-    the gate fires: runtime-detects the RAM tune-grade + applies the
-    cgroup-aware OOM-safety downgrade (RAM + cgroup only — the inc5a
-    missing-extra downgrade is gone now peft/datasets are base deps), then:
+    First (before the gate, when `persona_dir` is given) it reaps stored
+    checkpoint dirs the pointer does not name (`judge_lora.reap_unreferenced`):
+    the retry path for a previous checkpoint whose post-swap delete the OS
+    refused, and the cleanup for a crash-orphaned staged dir (F2c inc7, ruling
+    Q1). Fault-isolated; it never blocks the tick.
+
+    Then it counts UNCONSUMED non-None `haiku_label` positions across
+    `calibration_log` (the >handful gate, spec §2/§3,
+    `count_new_haiku_decisions`) and, ONLY when the gate fires: runtime-detects
+    the RAM tune-grade + applies the cgroup-aware OOM-safety downgrade. The
+    tier picks only this week's update METHOD (spec §1):
 
     - **WEAK tier** (`knob_refit`): the inc3 path unchanged —
       `_weak_knob_refit_and_consume` fits the Platt knob on the FULL logged
-      set and consumes the full `row_ids`.
-    - **LoRA / full-FT tiers** (mid/beefy): `_run_weight_retrain` runs the
-      2/3-1/3 split + champion/challenger (McNemar, AC6). On ACCEPT it persists
-      the challenger adapter (staged write + atomic champion-pointer swap),
-      re-scores the knob on the tuned model (§5 pin), and consumes only the
-      doc-HAVING rows (2B). On REVERT it keeps the champion and consumes the
-      full `row_ids` via the logged knob. A DEGENERATE-FLOOR (too few Haiku
-      triples) falls through to the weak knob-refit.
+      set and consumes the full `row_ids`. The served model is untouched.
+    - **LoRA / full-FT tiers** (mid/beefy): `_run_weight_retrain` trains this
+      week's update ON TOP OF the persona's current model, runs the 2/3-1/3
+      champion/challenger (McNemar, AC6) against that same current model, and
+      on ACCEPT swaps the new plain checkpoint into the persona's one pointer
+      (re-scored knob, previous checkpoint deleted). A DEGENERATE FLOOR (too
+      few Haiku triples) falls through to the weak knob-refit.
 
     Spec §2's "consume = trained-on, never fired-on": consume is the LAST
     durable step on every path, so any fault before it (caught here) leaves
-    `row_ids` UNCONSUMED and re-eligible next week. `persona_dir` locates the
-    per-persona champion-adapter store (`get_persona_dir(name)/models/
-    relevance_judge/`, spec §5).
+    `row_ids` UNCONSUMED and re-eligible next week.
 
-    Returns ``{"fired": bool, "tune_grade": str | None, "new_decisions": int,
-    "accepted": bool | None, "adapter_persisted": bool, "error": str | None}``
-    (caller-facing; the `supervisor.run_folded` wiring ignores it).
+    Returns ``{"fired", "tune_grade", "method", "new_decisions", "current",
+    "start", "accepted", "adapter_persisted", "error"}`` (caller-facing; the
+    `supervisor.run_folded` wiring ignores it). `method` = the update method
+    that ran (`knob_refit` / `lora` / `full_ft`); `current` / `start` = the
+    checkpoint name serving before the tick and the one this week trained
+    from (`"base"` = the shared base judge); `adapter_persisted` (historical
+    key name) = a new checkpoint was swapped in.
     """
     result: dict = {
         "fired": False,
         "tune_grade": None,
+        "method": None,
         "new_decisions": 0,
+        "current": None,
+        "start": None,
         "accepted": None,
         "adapter_persisted": False,
         "error": None,
     }
+    if persona_dir is not None:
+        try:
+            from brain.memory import judge_lora
+
+            judge_lora.reap_unreferenced(judge_lora.champion_dir(persona_dir))
+        except Exception:  # noqa: BLE001 — reaping is best-effort; never blocks the tick
+            logger.warning("judge self-tune: leftover-checkpoint reap faulted", exc_info=True)
     try:
         gate_handful = tunables.get_tunable(
             "judge_selftune.gate_handful_decisions", JUDGE_TUNE_GATE_HANDFUL_DECISIONS
@@ -674,28 +660,47 @@ def _run_judge_selftune_tick(*, store, now: datetime, persona_dir: Path | None =
 
         if tune_grade == TUNE_GRADE_KNOB_REFIT or persona_dir is None:
             # Weak tier: knob-refit only (spec §5), inc3 behavior unchanged.
-            # `persona_dir is None` (no per-persona adapter store available)
-            # is a safe floor: without a place to persist a champion adapter,
-            # a mid/beefy box cannot run the weight-retrain, so it degrades to
-            # the always-safe knob-refit (the supervisor always passes
-            # persona_dir; None only arises in unit tests exercising the weak
-            # path or the gate/tier logic).
+            # `persona_dir is None` (no per-persona store available) is a safe
+            # floor: without a place to persist a checkpoint, a mid/beefy box
+            # cannot run the weight-retrain, so it degrades to the always-safe
+            # knob-refit (the supervisor always passes persona_dir; None only
+            # arises in unit tests exercising the weak path or the gate/tier
+            # logic).
             if tune_grade != TUNE_GRADE_KNOB_REFIT and persona_dir is None:
                 logger.info(
                     "judge self-tune: tune_grade=%s but no persona_dir — floor to knob-refit",
                     tune_grade,
                 )
+            result["method"] = TUNE_GRADE_KNOB_REFIT
+            if persona_dir is not None:
+                from brain.memory import judge_lora
+
+                cur = judge_lora.resolve_current_checkpoint(persona_dir)
+                result["current"] = cur.name if cur is not None else "base"
+                # A knob week tunes (only the knob of) the serving model itself.
+                result["start"] = result["current"]
             _weak_knob_refit_and_consume(store, now, row_ids)
         else:
-            # Mid/beefy: LoRA/full-FT weight-retrain + champion/challenger.
-            # `tune_grade` selects the mechanism (LORA adapter vs full FT) —
-            # F2c inc6 replaced inc5b-2's LoRA-only placeholder for FULL_FT.
-            accepted, adapter_persisted = _run_weight_retrain(
-                store, now, persona_dir, row_ids, tune_grade
-            )
+            result["method"] = tune_grade
+            info: dict = {}
+            try:
+                accepted, persisted = _run_weight_retrain(
+                    store, now, persona_dir, row_ids, tune_grade, info
+                )
+            finally:
+                result["current"] = info.get("current")
+                result["start"] = info.get("start")
             result["accepted"] = accepted
-            result["adapter_persisted"] = adapter_persisted
+            result["adapter_persisted"] = persisted
         result["fired"] = True
+        logger.info(
+            "judge self-tune: fired method=%s current=%s start=%s accepted=%s new_decisions=%d",
+            result["method"],
+            result["current"],
+            result["start"],
+            result["accepted"],
+            count,
+        )
     except Exception as exc:  # noqa: BLE001 — fault-isolated, mirrors run_sweep_tick
         logger.warning("judge self-tune tick failed: %s", exc)
         result["error"] = f"{type(exc).__name__}: {exc}"

@@ -293,3 +293,52 @@ def test_module_import_does_not_import_torch_or_sentence_transformers() -> None:
 def test_haiku_oracle_note_present_in_full_ft_module() -> None:
     src = (Path(__file__).resolve().parents[4] / "brain" / "memory" / "judge_full_ft.py").read_text()
     assert "Haiku" in src and "ORACLE" in src, "missing the durable Haiku-oracle note (spec §6/AC9)"
+
+
+# ---------------------------------------------------------------------------
+# F2c inc7 — M3: a full fine-tune continues from the persona's own checkpoint
+# (one evolving model), never silently from the base.
+# ---------------------------------------------------------------------------
+
+_M3_EVAL = [("query", "relevant"), ("tiny query", "irrelevant document"), ("test document", "relevant test")]
+
+
+def _m3_logits(d: Path) -> np.ndarray:
+    from sentence_transformers import CrossEncoder
+
+    ce = CrossEncoder(str(d))
+    return np.array([float(ce.predict([p], activation_fn=lambda x: x)[0]) for p in _M3_EVAL])
+
+
+def test_full_ft_continues_from_a_checkpoint(
+    tiny_model_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M3. Bite: at d25e1002 the tick always passed the base as the start."""
+    import torch
+    from sentence_transformers.cross_encoder.trainer import CrossEncoderTrainer
+
+    torch.manual_seed(31)
+    c = tmp_path / "C"
+    build_full_ft_retrain_fn(tiny_model_dir, epochs=2, save_full_dir=c)(_TRAIN_TRIPLES)
+    c_logits = _m3_logits(c)
+    assert np.max(np.abs(c_logits - _m3_logits(tiny_model_dir))) > 1e-4
+
+    before: list[np.ndarray] = []
+    real_train = CrossEncoderTrainer.train
+
+    def train(self, *a, **k):
+        before.append(
+            np.array([float(self.model.predict([p], activation_fn=lambda x: x)[0]) for p in _M3_EVAL])
+        )
+        return real_train(self, *a, **k)
+
+    monkeypatch.setattr(CrossEncoderTrainer, "train", train)
+    torch.manual_seed(32)
+    d = tmp_path / "D"
+    build_full_ft_retrain_fn(c, epochs=2, save_full_dir=d)(_TRAIN_TRIPLES)
+    np.testing.assert_allclose(before[0], c_logits, atol=1e-5)  # started FROM C
+    d_logits = _m3_logits(d)
+    assert np.max(np.abs(d_logits - c_logits)) > 1e-5, "weights moved"
+    scorer = load_full_scorer(d)
+    np.testing.assert_allclose(np.array([scorer(p) for p in _M3_EVAL]), d_logits, atol=1e-5)
+    assert not any(d.rglob("adapter_config.json"))
