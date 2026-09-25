@@ -60,6 +60,42 @@ CALIBRATION_LOG_RETENTION_WINDOW_DAYS: float = tunables.register(
 CALIBRATION_SCORE_SCALE = "normalized"
 
 
+def _haiku_decision_count(haiku_label_json: str | None) -> int:
+    """Number of Haiku decisions a `calibration_log` row carries: its non-None
+    `haiku_label` POSITIONS (F2c spec §2's pinned counting unit — NOT "the
+    column is non-NULL", since `write_calibration_labels` writes an all-None
+    list on every judge-labeled row). The ONE definition shared by the weekly
+    gate (`count_new_haiku_decisions`) and the one-week retention hold
+    (`_delete_unheld_before`, F2c inc8), so the two can never drift."""
+    if haiku_label_json is None:
+        return 0
+    return sum(1 for label in json.loads(haiku_label_json) if label is not None)
+
+
+def _selftune_week_cutoff(now: datetime | None) -> str:
+    """The rolling one-week cutoff (F2c inc8, spec §3/AC14): `now` minus ONE
+    weekly self-tune cadence (`judge_selftune.JUDGE_TUNE_INTERVAL_HOURS`, read
+    at call time — derived from the weekly cadence, not a second hand-typed
+    "7 days"), rendered in the exact text format SQLite's `CURRENT_TIMESTAMP`
+    writes into `calibration_log.logged_at` (`YYYY-MM-DD HH:MM:SS`, UTC), so a
+    plain string compare against `logged_at` is a correct time compare.
+
+    Rolling on `logged_at` (a timestamp), not `day_bucket` (a date): a date
+    compare would keep a row up to ~8 days, and the owner's rule is that
+    nothing is kept past a week. Note: this follows the weekly-cadence
+    CONSTANT; `supervisor.run_folded`'s `judge_selftune_interval_s` defaults
+    to that same constant and differs from it only in tests.
+
+    Imported lazily so this module gains no import-time dependency on
+    `judge_selftune` (which imports this module's siblings)."""
+    from brain.memory import judge_selftune
+
+    ref = now if now is not None else datetime.now(UTC)
+    if ref.tzinfo is not None:
+        ref = ref.astimezone(UTC)
+    return (ref - timedelta(hours=judge_selftune.JUDGE_TUNE_INTERVAL_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _coerce_utc(ts: str) -> datetime:
     """Parse ISO-8601 timestamp; coerce tz-naive values to UTC.
 
@@ -300,7 +336,11 @@ CREATE TABLE IF NOT EXISTS cluster_centroids (
 -- supervisor.py) calls `MemoryStore.prune_calibration_log` every firing, so
 -- this table stays bounded to a rolling `day_bucket` window instead of
 -- growing unbounded — see CALIBRATION_LOG_RETENTION_WINDOW_DAYS above for
--- the window's FINALIZED (inc7) value and derivation.
+-- the window's FINALIZED (inc7) value and derivation. F2c inc8: a row that
+-- carries an untrained Haiku decision is HELD past that window for up to one
+-- weekly self-tune cadence (see `prune_calibration_log`,
+-- `clear_selftune_held_rows` and the `calibration_log_retention_state` table
+-- below); F2a's own reads never see a held row.
 -- `score_scale` (F2b, #276 §5): marks whether `reranker_scores` on this row
 -- is on the PRE-F2b raw reranker-score scale or the POST-F2b per-query
 -- anchor-normalized scale (`brain.memory.reranker.normalize_against_
@@ -372,6 +412,23 @@ CREATE TABLE IF NOT EXISTS calibration_log (
     selftune_consumed_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_calibration_log_day_bucket ON calibration_log(day_bucket);
+
+-- F2c inc8 (spec §3 "Retention vs the weekly tick", AC14/AC10): the F2a VIEW
+-- CUTOFF — the latest (high-water) `day_bucket` cutoff F2a's own 3-day
+-- retention rule has applied (`prune_calibration_log`). Rows that carry an
+-- untrained Haiku decision are HELD past that cutoff for up to one weekly
+-- cadence so the weekly judge self-tune can count and train on them; every
+-- row with `day_bucket` below this cutoff therefore exists ONLY because of
+-- that hold (before inc8 the same prune deleted all of them), and F2a's floor
+-- fit reader (`labeled_calibration_pairs`) ignores it, so F2a sees exactly
+-- the rows it saw before inc8. Single row (`id = 1`), no seed: an absent row
+-- means "no prune has run since inc8" ⇒ no row is held ⇒ no filter. A
+-- separate table, not a column, so `calibration_log`'s shape is unchanged
+-- (CREATE TABLE IF NOT EXISTS: legacy-safe, I9).
+CREATE TABLE IF NOT EXISTS calibration_log_retention_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    f2a_view_cutoff_bucket TEXT NOT NULL
+);
 
 -- F2a (#250 inc7): the DB-adaptive abstention floor itself (spec Section 7)
 -- — the per-persona replacement for the hardcoded
@@ -1151,6 +1208,18 @@ class MemoryStore:
         above), so a lexicographic string comparison against the cutoff date
         is a correct date comparison with no parsing needed.
 
+        F2c inc8 — the one-week Haiku HOLD (spec §3 "Retention vs the weekly
+        tick", AC14): a row outside this window is still KEPT when it carries
+        a Haiku decision (≥1 non-None `haiku_label` position) that the weekly
+        judge self-tune has not yet trained on (`selftune_consumed_at IS
+        NULL`) and it was logged less than one weekly cadence ago
+        (`_selftune_week_cutoff`). Every other row outside the window is
+        deleted exactly as before; this method never deletes a row the
+        window keeps. It also records the window's cutoff as the F2a VIEW
+        CUTOFF (high-water, `calibration_log_retention_state`) so F2a's floor
+        fit ignores held rows and sees exactly what it saw before inc8
+        (AC10; see `labeled_calibration_pairs`).
+
         Called from the daily calibration tick (`_run_calibration_tick` in
         `brain/bridge/supervisor.py`), off the hot path (I6) — never from a
         per-turn recall path. Returns the number of rows deleted (0 if none
@@ -1162,11 +1231,73 @@ class MemoryStore:
             )
         ref = now if now is not None else datetime.now(UTC)
         cutoff_bucket = (ref - timedelta(days=window_days)).strftime("%Y-%m-%d")
-        cur = self._conn.execute(
-            "DELETE FROM calibration_log WHERE day_bucket < ?", (cutoff_bucket,)
+        stored = self._f2a_view_cutoff_bucket()
+        view = cutoff_bucket if stored is None else max(stored, cutoff_bucket)
+        self._conn.execute(
+            "INSERT INTO calibration_log_retention_state (id, f2a_view_cutoff_bucket) VALUES (1, ?) "
+            "ON CONFLICT(id) DO UPDATE SET f2a_view_cutoff_bucket = excluded.f2a_view_cutoff_bucket",
+            (view,),
         )
+        deleted = self._delete_unheld_before(cutoff_bucket, now=ref)
         self._conn.commit()
-        return cur.rowcount
+        return deleted
+
+    def _f2a_view_cutoff_bucket(self) -> str | None:
+        """The stored F2a view cutoff (F2c inc8), or `None` when no prune has
+        run since inc8 (then no row is held and F2a reads are unfiltered)."""
+        row = self._conn.execute(
+            "SELECT f2a_view_cutoff_bucket FROM calibration_log_retention_state WHERE id = 1"
+        ).fetchone()
+        return row["f2a_view_cutoff_bucket"] if row is not None else None
+
+    def _delete_unheld_before(self, cutoff_bucket: str, *, now: datetime | None) -> int:
+        """Delete every `calibration_log` row with `day_bucket < cutoff_bucket`
+        that the one-week Haiku hold does NOT keep (F2c inc8). Held = carries
+        ≥1 Haiku decision (`_haiku_decision_count`, the gate's own unit) AND is
+        unconsumed AND `logged_at >= _selftune_week_cutoff(now)`. Does not
+        commit (callers do). Returns the number of rows deleted."""
+        week_cutoff = _selftune_week_cutoff(now)
+        cur = self._conn.execute(
+            "DELETE FROM calibration_log WHERE day_bucket < ? AND ("
+            "haiku_label IS NULL OR selftune_consumed_at IS NOT NULL OR logged_at < ?)",
+            (cutoff_bucket, week_cutoff),
+        )
+        deleted = cur.rowcount
+        # The rows left below the cutoff all have a non-NULL `haiku_label`, are
+        # unconsumed and are inside the week; drop the ones whose list carries
+        # no Haiku decision at all (all-None — judge-labeled with no tie-break).
+        remaining = self._conn.execute(
+            "SELECT id, haiku_label FROM calibration_log WHERE day_bucket < ?", (cutoff_bucket,)
+        ).fetchall()
+        no_decision = [(int(r["id"]),) for r in remaining if _haiku_decision_count(r["haiku_label"]) == 0]
+        if no_decision:
+            self._conn.executemany("DELETE FROM calibration_log WHERE id = ?", no_decision)
+            deleted += len(no_decision)
+        return deleted
+
+    def clear_selftune_held_rows(self, *, now: datetime | None = None) -> int:
+        """Clear the weekly self-tune's accumulated rows once it has trained on
+        them (F2c inc8, spec §3: "the accumulated rows are cleared once the
+        weekly self-tune has trained on them"). Deletes every row that exists
+        ONLY because of the one-week hold (`day_bucket` below the stored F2a
+        view cutoff) and no longer qualifies for it — consumed (= trained on,
+        spec §2) or past a week. Never touches a row inside F2a's own window
+        (F2a's daily fit may still read it, AC10): a consumed in-window row is
+        already out of the self-tune's accumulated list via its consumed
+        marker and is pruned later by F2a's own 3-day rule. An UNCONSUMED held
+        row (e.g. spec §5 2B's legacy doc-absent row on an ACCEPT week) stays
+        held and counted until it passes a week.
+
+        No-op (returns 0) when no view cutoff is stored: no prune has run
+        since inc8, so no row is held. Called only at the end of a FIRED
+        weekly self-tune tick (`judge_selftune._run_judge_selftune_tick`),
+        offline (I6). Returns the number of rows deleted."""
+        view = self._f2a_view_cutoff_bucket()
+        if view is None:
+            return 0
+        deleted = self._delete_unheld_before(view, now=now)
+        self._conn.commit()
+        return deleted
 
     def sample_unlabeled_calibration_rows(self, limit: int) -> list[dict[str, Any]]:
         """Return up to `limit` `calibration_log` rows with no
@@ -1305,10 +1436,18 @@ class MemoryStore:
         write anything (mirrors `sample_unlabeled_calibration_rows`'s own
         read-only posture).
         """
+        # F2c inc8 (AC10): a row whose `day_bucket` is below the stored F2a view
+        # cutoff exists only because the weekly self-tune's one-week Haiku hold
+        # kept it (before inc8 the prune that set the cutoff deleted it), so
+        # this fit must not see it — otherwise, after a few idle days, a held
+        # Haiku-only day would become "the most recently completed day". No
+        # stored cutoff (no prune since inc8) ⇒ no row is held ⇒ no filter.
+        view = self._f2a_view_cutoff_bucket() or ""
         max_day_row = self._conn.execute(
             "SELECT MAX(day_bucket) AS max_day FROM calibration_log "
-            "WHERE reranker_model_id = ? AND local_judge_label IS NOT NULL AND score_scale = ?",
-            (reranker_model_id, CALIBRATION_SCORE_SCALE),
+            "WHERE reranker_model_id = ? AND local_judge_label IS NOT NULL AND score_scale = ? "
+            "AND day_bucket >= ?",
+            (reranker_model_id, CALIBRATION_SCORE_SCALE, view),
         ).fetchone()
         most_recent_day = max_day_row["max_day"] if max_day_row is not None else None
         if most_recent_day is None:
@@ -1316,8 +1455,8 @@ class MemoryStore:
         rows = self._conn.execute(
             "SELECT reranker_scores, local_judge_label, haiku_label FROM calibration_log "
             "WHERE reranker_model_id = ? AND local_judge_label IS NOT NULL "
-            "AND score_scale = ? AND day_bucket = ?",
-            (reranker_model_id, CALIBRATION_SCORE_SCALE, most_recent_day),
+            "AND score_scale = ? AND day_bucket = ? AND day_bucket >= ?",
+            (reranker_model_id, CALIBRATION_SCORE_SCALE, most_recent_day, view),
         ).fetchall()
         pairs: list[tuple[float, str]] = []
         for row in rows:
@@ -1569,7 +1708,7 @@ class MemoryStore:
         )
         self._conn.commit()
 
-    def count_new_haiku_decisions(self) -> tuple[int, list[int]]:
+    def count_new_haiku_decisions(self, *, now: datetime | None = None) -> tuple[int, list[int]]:
         """Count UNCONSUMED non-None `haiku_label` POSITIONS across
         `calibration_log` (F2c inc2's >handful gate, spec §2/§3, pinned
         counting unit) — the weekly judge self-tune tick's ONLY signal for
@@ -1612,17 +1751,26 @@ class MemoryStore:
         `row_ids`'s contents (a non-firing tick leaves everything
         untouched, spec §2).
 
+        F2c inc8 (spec §3 "Retention vs the weekly tick", AC14): only rows
+        logged within ONE weekly cadence of `now` (`_selftune_week_cutoff`,
+        rolling on `logged_at`; `now=None` = wall-clock) are scanned — "only
+        entries that are within a week are calibrated against". A decision
+        that rolled past a week before a slightly late run is intentionally
+        dropped: it is neither counted nor returned in `row_ids`, so nothing
+        trains on it (every training read is scoped to `row_ids`), and the
+        next prune deletes it.
+
         Read-only: does not write or bump anything.
         """
         rows = self._conn.execute(
             "SELECT id, haiku_label FROM calibration_log "
-            "WHERE haiku_label IS NOT NULL AND selftune_consumed_at IS NULL"
+            "WHERE haiku_label IS NOT NULL AND selftune_consumed_at IS NULL AND logged_at >= ?",
+            (_selftune_week_cutoff(now),),
         ).fetchall()
         count = 0
         row_ids: list[int] = []
         for row in rows:
-            haiku_labels = json.loads(row["haiku_label"])
-            count += sum(1 for label in haiku_labels if label is not None)
+            count += _haiku_decision_count(row["haiku_label"])
             row_ids.append(int(row["id"]))
         return count, row_ids
 

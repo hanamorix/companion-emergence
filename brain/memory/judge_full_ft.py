@@ -41,12 +41,12 @@ uses the ONE per-persona store for both tiers. It proves everything against a
 FROM-SCRATCH TINY model in its tests, never the real bge-reranker-v2-m3
 (deferred to real HW).
 
-DURABLE HAIKU-ORACLE NOTE (spec §6, mirrors the notes in `judge_lora.py`,
-`judge_eval.py`, `judge_selftune.py`, and F2a's `relevance_judge.py`
-judge/label site): the `(query, doc, label)` triples this module trains on
-carry the EFFECTIVE (Haiku-over-local) label, and the champion/challenger
-step that gates this retrain scores both judges against the accumulated
-HAIKU tie-break decisions as the oracle. Haiku is the effective relevance
+DURABLE HAIKU-ORACLE NOTE (spec §6, mirrors the notes in `judge_eval.py`,
+`judge_selftune.py`, and F2a's `relevance_judge.py` judge/label site): the
+`(query, doc, label)` triples this module trains on carry the EFFECTIVE
+(Haiku-over-local) label, and the champion/challenger step that gates this
+retrain scores both judges against the accumulated HAIKU tie-break decisions
+as the oracle. Haiku is the effective relevance
 ORACLE this full fine-tune converges the local judge toward, NOT an
 independently verified ground truth. A systematic Haiku bias would propagate
 into the fine-tuned weights; if a relevance-quality problem shows up

@@ -617,8 +617,16 @@ def _run_judge_selftune_tick(*, store, now: datetime, persona_dir: Path | None =
     durable step on every path, so any fault before it (caught here) leaves
     `row_ids` UNCONSUMED and re-eligible next week.
 
+    F2c inc8 (spec §3 "Retention vs the weekly tick", AC14): the gate counts,
+    and so the tune trains on, only Haiku decisions logged within one weekly
+    cadence of `now`; after a FIRED tick, `MemoryStore.clear_selftune_held_rows`
+    deletes the rows kept only by the one-week hold that this tick trained on
+    (or that rolled past a week), in its own fault guard (`cleared` /
+    `clear_error`).
+
     Returns ``{"fired", "tune_grade", "method", "new_decisions", "current",
-    "start", "accepted", "adapter_persisted", "error"}`` (caller-facing; the
+    "start", "accepted", "adapter_persisted", "error", "cleared",
+    "clear_error"}`` (caller-facing; the
     `supervisor.run_folded` wiring ignores it). `method` = the update method
     that ran (`knob_refit` / `lora` / `full_ft`); `current` / `start` = the
     checkpoint name serving before the tick and the one this week trained
@@ -635,6 +643,8 @@ def _run_judge_selftune_tick(*, store, now: datetime, persona_dir: Path | None =
         "accepted": None,
         "adapter_persisted": False,
         "error": None,
+        "cleared": 0,
+        "clear_error": None,
     }
     if persona_dir is not None:
         try:
@@ -647,7 +657,10 @@ def _run_judge_selftune_tick(*, store, now: datetime, persona_dir: Path | None =
         gate_handful = tunables.get_tunable(
             "judge_selftune.gate_handful_decisions", JUDGE_TUNE_GATE_HANDFUL_DECISIONS
         )
-        count, row_ids = store.count_new_haiku_decisions()
+        # F2c inc8: only Haiku decisions logged within one weekly cadence of
+        # `now` are counted (and so trained on — every training read is scoped
+        # to `row_ids`).
+        count, row_ids = store.count_new_haiku_decisions(now=now)
         result["new_decisions"] = count
         if count <= gate_handful:
             return result  # not yet MORE than a handful — no fire, nothing consumed
@@ -704,4 +717,16 @@ def _run_judge_selftune_tick(*, store, now: datetime, persona_dir: Path | None =
     except Exception as exc:  # noqa: BLE001 — fault-isolated, mirrors run_sweep_tick
         logger.warning("judge self-tune tick failed: %s", exc)
         result["error"] = f"{type(exc).__name__}: {exc}"
+    if result["fired"]:
+        # F2c inc8 (spec §3): the accumulated rows are cleared once the weekly
+        # self-tune has trained on them. Runs AFTER the tune's own end-of-tick
+        # consume and OUTSIDE the handler above, in its own guard: the rows are
+        # already trained on, so a clear fault must never mark the tune as
+        # failed (`error`/`fired` untouched) — the next daily prune deletes
+        # consumed held rows anyway.
+        try:
+            result["cleared"] = store.clear_selftune_held_rows(now=now)
+        except Exception as exc:  # noqa: BLE001 — cleanup is best-effort
+            logger.warning("judge self-tune: clearing trained-on held rows faulted: %s", exc)
+            result["clear_error"] = f"{type(exc).__name__}: {exc}"
     return result

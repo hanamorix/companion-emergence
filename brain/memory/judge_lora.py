@@ -47,7 +47,6 @@ from pathlib import Path
 from typing import Any
 
 from brain import tunables
-from brain.memory.judge_eval import RollbackHandle
 from brain.memory.relevance_judge import label_for_score
 
 logger = logging.getLogger(__name__)
@@ -279,56 +278,6 @@ def build_lora_retrain_fn(
         return label_fn
 
     return retrain_fn
-
-
-# ---------------------------------------------------------------------------
-# Rollback handle (judge_eval.RollbackHandle contract) — a DURABLE on-disk
-# copy, restorable even in a fresh process (BUILD instructions), never an
-# in-memory-only snapshot: `judge_eval.run_champion_challenger` calls
-# `record()` UNCONDITIONALLY before `retrain_fn` runs and `restore()` only
-# on an AC6 revert, so this handle must be able to put the pre-retrain
-# adapter directory back regardless of what happened to the in-memory model
-# in between.
-# ---------------------------------------------------------------------------
-
-
-class LoraRollbackHandle(RollbackHandle):
-    """`judge_eval.RollbackHandle` for the LoRA tier: `record()` copies the
-    CURRENT `adapter_dir` (the deployed champion's saved adapter, if any)
-    to a fresh, uniquely-named snapshot directory under `snapshot_root`;
-    `restore(snapshot)` replaces `adapter_dir`'s contents with that
-    snapshot's.
-
-    `adapter_dir` not existing at `record()` time (no prior tuned adapter —
-    e.g. the very first weekly tune for this persona) is a valid, ABSENT-
-    SAFE state: the snapshot token is `None`, and `restore(None)` means
-    "there was no prior adapter" — it removes `adapter_dir` if a
-    (rejected) challenger wrote one, rather than restoring nonexistent
-    content. This mirrors `relevance_judge`'s absent-is-safe convention for
-    a persona that has never had a knob-refit complete.
-    """
-
-    def __init__(self, adapter_dir: str | Path, snapshot_root: str | Path | None = None) -> None:
-        self._adapter_dir = Path(adapter_dir)
-        self._snapshot_root = (
-            Path(snapshot_root)
-            if snapshot_root is not None
-            else self._adapter_dir.parent / f"{self._adapter_dir.name}.snapshots"
-        )
-
-    def record(self) -> Path | None:
-        if not self._adapter_dir.exists():
-            return None
-        self._snapshot_root.mkdir(parents=True, exist_ok=True)
-        snapshot_dir = self._snapshot_root / f"snapshot-{uuid.uuid4().hex}"
-        shutil.copytree(self._adapter_dir, snapshot_dir)
-        return snapshot_dir
-
-    def restore(self, snapshot: Path | None) -> None:
-        if self._adapter_dir.exists():
-            shutil.rmtree(self._adapter_dir)
-        if snapshot is not None:
-            shutil.copytree(snapshot, self._adapter_dir)
 
 
 # ---------------------------------------------------------------------------

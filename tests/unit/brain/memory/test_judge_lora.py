@@ -33,12 +33,11 @@ import numpy as np
 import pytest
 
 import brain.memory.judge_lora as judge_lora
-from brain.memory.judge_eval import run_champion_challenger
+from brain.memory.judge_eval import RollbackHandle, run_champion_challenger
 from brain.memory.judge_full_ft import build_full_ft_retrain_fn, load_full_scorer
 from brain.memory.judge_lora import (
     BGE_RERANKER_LORA_MODULES_TO_SAVE,
     BGE_RERANKER_LORA_TARGET_MODULES,
-    LoraRollbackHandle,
     build_lora_retrain_fn,
 )
 
@@ -356,9 +355,7 @@ def test_label_fn_boundary_matches_relevance_judge_label_for_score(
     assert label_fn(_FIXED_EVAL_ITEMS[0]) == "relevant"
 
 
-def test_retrain_fn_matches_judge_eval_champion_challenger_contract(
-    tiny_model_dir: Path, tmp_path: Path
-) -> None:
+def test_retrain_fn_matches_judge_eval_champion_challenger_contract(tiny_model_dir: Path) -> None:
     """`build_lora_retrain_fn`'s output plugs directly into `judge_eval.
     run_champion_challenger`'s `retrain_fn` parameter (AC6's orchestration
     contract) without any adapter shim."""
@@ -380,58 +377,12 @@ def test_retrain_fn_matches_judge_eval_champion_challenger_contract(
         retrain_fn=retrain_fn,
         train_items=_TRAIN_TRIPLES,
         test_items=test_items,
-        rollback=LoraRollbackHandle(adapter_dir=tmp_path / "unused-not-written-this-test"),
+        rollback=RollbackHandle(),
         alpha=0.05,
         min_n=1,
     )
     assert result.n_test == len(test_items)
     assert isinstance(result.accepted, bool)
-
-
-# ---------------------------------------------------------------------------
-# LoraRollbackHandle: record -> mutate -> restore round-trips.
-# ---------------------------------------------------------------------------
-
-
-def test_rollback_handle_record_mutate_restore_round_trips(tmp_path: Path) -> None:
-    adapter_dir = tmp_path / "adapter"
-    adapter_dir.mkdir()
-    (adapter_dir / "adapter_config.json").write_text('{"marker": "champion-v1"}')
-    (adapter_dir / "adapter_model.safetensors").write_bytes(b"champion-weights")
-
-    handle = LoraRollbackHandle(adapter_dir=adapter_dir, snapshot_root=tmp_path / "snapshots")
-    snapshot = handle.record()
-    assert snapshot is not None
-    assert (snapshot / "adapter_config.json").read_text() == '{"marker": "champion-v1"}'
-
-    # Mutate in place, as a (soon-to-be-rejected) challenger's save would.
-    (adapter_dir / "adapter_config.json").write_text('{"marker": "challenger-v2"}')
-    (adapter_dir / "adapter_model.safetensors").write_bytes(b"challenger-weights")
-
-    handle.restore(snapshot)
-
-    assert (adapter_dir / "adapter_config.json").read_text() == '{"marker": "champion-v1"}'
-    assert (adapter_dir / "adapter_model.safetensors").read_bytes() == b"champion-weights"
-
-
-def test_rollback_handle_record_with_no_prior_adapter_is_absent_safe(tmp_path: Path) -> None:
-    """No adapter has ever been deployed for this persona yet (first-ever
-    weekly tune) -- `record()` on a nonexistent `adapter_dir` returns
-    `None`, and `restore(None)` correctly leaves/returns to "no adapter"
-    rather than crashing on a missing snapshot path."""
-    adapter_dir = tmp_path / "adapter"
-    handle = LoraRollbackHandle(adapter_dir=adapter_dir, snapshot_root=tmp_path / "snapshots")
-
-    snapshot = handle.record()
-    assert snapshot is None
-
-    # A (rejected) challenger wrote something anyway; restore(None) must
-    # clean it back up to "no adapter", not error out on a None snapshot.
-    adapter_dir.mkdir()
-    (adapter_dir / "adapter_config.json").write_text("{}")
-
-    handle.restore(snapshot)
-    assert not adapter_dir.exists()
 
 
 # ---------------------------------------------------------------------------
