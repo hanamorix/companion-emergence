@@ -184,6 +184,7 @@ def spawn_detached(
     log_fh = open(log_path, "ab")  # noqa: SIM115
     cmd = [
         sys.executable,
+        "-P",  # -m would put the caller's cwd (maybe a checkout's brain/) on sys.path
         "-m",
         "brain.bridge.runner",
         "--persona-dir",
