@@ -69,3 +69,31 @@ def test_attunement_backfill_state(tmp_path):
     backfill._save_state(tmp_path, bs)
     _add_future_field(backfill._state_path(tmp_path))
     assert backfill._load_state(tmp_path) == bs
+
+
+def test_felt_time_anchors_and_pressure(tmp_path):
+    from brain.felt_time.state import (STATE_FILENAME, Anchor, FeltTimeState,
+                                       PressureCounters, load_or_recover, persist)
+
+    persist(FeltTimeState.cold_start(), tmp_path)
+    path = tmp_path / STATE_FILENAME
+    data = json.loads(path.read_text(encoding="utf-8"))
+    anchor = Anchor(type="dream", ts="2026-09-26T00:00:00+00:00", label="a dream",
+                    source_ref="dreams.log.jsonl:1")
+    arc = Anchor(type="arc", ts="2026-09-25T00:00:00+00:00", label="an arc",
+                 source_ref="growth.log.jsonl:2", event_type="arc_opened")
+    counters = PressureCounters(heartbeats=2, chat_turns=3, reflex_firings=1, wall_clock_s=9.0)
+    data["anchors"] = {"dream": {**asdict(anchor), **FUTURE}}
+    data["arc_anchors"] = [{**asdict(arc), **FUTURE}]
+    data["pressure"] = {**asdict(counters), **FUTURE}
+    data["horizon_pressure"] = {"day": {"counters": {**asdict(counters), **FUTURE},
+                                        "prev_counters": {**asdict(counters), **FUTURE},
+                                        "period_start_ts": "2026-09-26T00:00:00+00:00"}}
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    state, _ = load_or_recover(tmp_path)
+    assert state.anchors["dream"] == anchor
+    assert state.arc_anchors == [arc]
+    assert state.pressure == counters
+    assert state.horizon_pressure["day"].counters == counters
+    assert state.horizon_pressure["day"].prev_counters == counters
