@@ -1,0 +1,48 @@
+name: runtime-build
+
+# Builds the bundled Python runtime (app/build_python_runtime.sh) on the three
+# release runners BEFORE a tag exists. release.yml is the only other place this
+# script runs, and it runs after the tag — so an install failure (#287) or a
+# size-budget miss used to surface only as a release with no platform assets.
+# Runs on PRs that change what goes into the runtime, and on demand.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - app/build_python_runtime.sh
+      - pyproject.toml
+      - uv.lock
+      - .github/workflows/runtime-build.yml
+  workflow_dispatch:
+
+jobs:
+  runtime:
+    name: runtime ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-22.04, windows-2022]  # the release.yml build runners
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Install Python 3.13 (for `uv build`)
+        run: uv python install 3.13
+
+      - name: Build bundled runtime (install + verify + size budget)
+        run: bash app/build_python_runtime.sh
+        shell: bash
+
+      - name: Smoke the judge's torch stack from the runtime
+        working-directory: app/src-tauri
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then PY="python-runtime/python.exe"; else PY="python-runtime/bin/python3"; fi
+          "$PY" -P -c "import torch, sentence_transformers, peft, datasets, brain; print('torch', torch.__version__, torch.ones(2).sum().item())"
+        shell: bash
