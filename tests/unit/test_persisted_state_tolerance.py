@@ -140,7 +140,7 @@ def test_kindled_evidence(tmp_path):
     kstore = KindledLinkStore(tmp_path / "kindled.db")
     ev = Evidence(quote="q", turn_id="t1", supports="trust")
     kstore.upsert_relationship_row(
-        peer_id="peer", stage="acquainted", trust_score=0.5, affinity_tags_json="[]",
+        peer_id="peer", stage="acquaintance", trust_score=0.5, affinity_tags_json="[]",
         boundaries_json="[]", repair_history_json="[]",
         evidence_json=json.dumps([{**asdict(ev), **FUTURE}]), now=datetime.now(UTC),
     )
