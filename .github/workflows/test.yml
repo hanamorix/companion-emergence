@@ -94,3 +94,26 @@ jobs:
       - name: cargo test
         working-directory: app/src-tauri
         run: cargo test
+
+  # #290: the built wheel was only exercised in release.yml, after the tag, so
+  # a packaging break (missing package data or module, broken entry point)
+  # surfaced as a release with no assets. The wheel is pure Python, so one OS
+  # catches those; macOS because the smoke's unlocked install stays CPU-torch-
+  # sized there even on a uv without UV_TORCH_BACKEND.
+  wheel-smoke:
+    name: wheel smoke (build + clean install)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Wheel/sdist smoke
+        run: bash scripts/smoke_test_wheel.sh

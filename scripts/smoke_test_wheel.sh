@@ -59,7 +59,11 @@ VENV_PY="$TMP_DIR/venv/bin/python"
 VENV_NELL="$TMP_DIR/venv/bin/nell"
 
 echo "[smoke] uv pip install <wheel>"
-VIRTUAL_ENV="$TMP_DIR/venv" uv pip install --quiet "$WHEEL"
+# Unlocked, so on Linux PyPI would hand us CUDA torch (~15 nvidia-* packages,
+# gigabytes). The project ships CPU torch only (pyproject's pytorch-cpu pin);
+# UV_TORCH_BACKEND=cpu routes just the PyTorch-ecosystem packages to that index.
+# uv versions without the option ignore the variable (#290).
+UV_TORCH_BACKEND=cpu VIRTUAL_ENV="$TMP_DIR/venv" uv pip install --quiet "$WHEEL"
 
 # The nell entry point should land on PATH inside the venv.
 [ -x "$VENV_NELL" ] || { echo "[smoke] FAIL: nell script missing at $VENV_NELL"; exit 1; }
