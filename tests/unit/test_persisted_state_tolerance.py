@@ -97,3 +97,36 @@ def test_felt_time_anchors_and_pressure(tmp_path):
     assert state.pressure == counters
     assert state.horizon_pressure["day"].counters == counters
     assert state.horizon_pressure["day"].prev_counters == counters
+
+
+def test_emotion_backfill_state(tmp_path):
+    from brain.ingest import emotion_backfill as eb
+
+    es = eb.EmotionBackfillState(started_at="2026-09-26T00:00:00Z", total_memories=10,
+                                 tagged_memories=4, last_cursor="m4", status="running",
+                                 schema_version="1")
+    eb._save_state(tmp_path, es)
+    _add_future_field(eb._state_path(tmp_path))
+    assert eb._load_state(tmp_path) == es
+
+
+def test_emotional_snapshot():
+    from brain.initiate.schemas import EmotionalSnapshot
+
+    snap = EmotionalSnapshot(vector={"joy": 5.0}, rolling_baseline_mean=4.0,
+                             rolling_baseline_stdev=1.0, current_resonance=0.5, delta_sigma=1.0)
+    assert EmotionalSnapshot.from_dict({**snap.to_dict(), **FUTURE}) == snap
+
+
+def test_kindled_evidence(tmp_path):
+    from brain.kindled_link.relationship import Evidence, get_relationship_state
+    from brain.kindled_link.store import KindledLinkStore
+
+    kstore = KindledLinkStore(tmp_path / "kindled.db")
+    ev = Evidence(quote="q", turn_id="t1", supports="trust")
+    kstore.upsert_relationship_row(
+        peer_id="peer", stage="acquainted", trust_score=0.5, affinity_tags_json="[]",
+        boundaries_json="[]", repair_history_json="[]",
+        evidence_json=json.dumps([{**asdict(ev), **FUTURE}]), now=datetime.now(UTC),
+    )
+    assert get_relationship_state(kstore, "peer").evidence == [ev]
