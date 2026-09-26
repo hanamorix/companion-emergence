@@ -399,17 +399,17 @@ fi
 SIZE_KB="$(du -sk "$RUNTIME_DIR" | cut -f1)"
 SIZE="$(du -sh "$RUNTIME_DIR" | cut -f1)"
 # Per-OS budget. Before torch (F2a #250) and the judge-training deps (F2c #280)
-# every target sat at 125-390 MB under one 450 MB cap. Measured 2026-09-26 after
-# those landed: macOS arm64 1133 MB before the torch/include prune; locked
-# site-packages alone 1436 MB Linux x86_64, 1062 MB Windows (torch 709 / 484 MB).
+# every target sat at 125-390 MB under one 450 MB cap. Measured 2026-09-26 by the
+# runtime-build workflow on the release runners, after pruning: macos-14 1046 MB,
+# ubuntu-22.04 1490 MB, windows-2022 1039 MB (torch alone: 527 / 709 / 484 MB).
 # Each budget is that size plus ~25% headroom, so it still trips if an unrelated
 # dep drags hundreds of MB in. Making the training deps opt-in (#284) would trim
 # ~150-210 MB. The runtime-build workflow runs this on PRs that touch deps, so a
 # budget miss shows up there, not after a release tag.
 case "$(uname -s)" in
-  Darwin) DEFAULT_RUNTIME_MB=1350;;
-  Linux)  DEFAULT_RUNTIME_MB=2100;;
-  *)      DEFAULT_RUNTIME_MB=1450;;   # Windows (Git Bash: MINGW*/MSYS*)
+  Darwin) DEFAULT_RUNTIME_MB=1300;;
+  Linux)  DEFAULT_RUNTIME_MB=1850;;
+  *)      DEFAULT_RUNTIME_MB=1300;;   # Windows (Git Bash: MINGW*/MSYS*)
 esac
 MAX_RUNTIME_MB="${MAX_RUNTIME_MB:-$DEFAULT_RUNTIME_MB}"
 MAX_RUNTIME_KB=$((MAX_RUNTIME_MB * 1024))
