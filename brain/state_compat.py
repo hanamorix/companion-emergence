@@ -7,8 +7,10 @@ reader of persisted state builds its dataclass through `from_known_fields`,
 which keeps the fields the class declares and ignores the rest, so a rollback
 never crashes a reader or silently drops a record.
 
-The matching rule for writers: persisted-state changes are additive only —
-add fields; never rename or remove one, or change what an existing one means,
+The matching rule for writers: persisted-state changes are additive only,
+and every new field has a default — an older brain drops an unknown field
+when it rewrites the file, so a newer brain later reads records without it.
+Never rename or remove a field, or change what an existing one means,
 without a migration spec. tests/unit/test_no_strict_state_constructors.py
 fails if a `Cls(**record)` construction comes back.
 """
