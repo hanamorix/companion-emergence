@@ -181,9 +181,16 @@ The release brain is the floor; nothing leaves the user with no brain.
 Code rolls back; persona data does not. Whatever a `main` brain writes, the release brain must
 still read after a revert or rollback.
 
-- **Rule:** persisted-state changes are **additive only** (new fields / columns). Renames,
-  removals and changed meanings need their own migration spec and are not rollback-safe. The
-  rule goes into CLAUDE.local.md Gotchas.
+- **Rule:** persisted-state changes are **additive only, and every new field has a default**
+  (new fields / columns). The default matters because an older brain drops an unknown field
+  when it rewrites the file, so a newer brain later reads records without it (found in slice 1's
+  final review). Renames, removals and changed meanings need their own migration spec and are
+  not rollback-safe. The rule goes into CLAUDE.local.md Gotchas.
+- **Slice 1 delivered (PR #298):** an AST sweep found **12** strict call sites in 8 files (the
+  five below plus felt-time `Anchor`/`PressureCounters`, initiate `EmotionalSnapshot`, kindled
+  `Evidence`), all converted; one through-path canary per reader; an AST guard. A related
+  rollback hazard outside this class — the attunement backfill comparing schema versions with
+  `!=` — is #295 (PR #299).
 - **Root fix (slice 1):** readers that build objects with `Cls(**record)` reject unknown keys.
   Found by `git grep` (2026-09-26): `attunement/backfill.py:138` (`BackfillState`),
   `attunement/store.py:53` (`CurrentRead`), `attunement/store.py:129` (`LearnedPattern` — also
@@ -236,10 +243,10 @@ slice.
 | **#256** `nell update` wrapping `update.sh` | Its premise ("a Python subcommand runs from the runtime it replaces") does not hold for an overlay, which never replaces the running runtime. `nell update` becomes the bundled overlay installer and, on a source install, execs `scripts/update.sh` — which is what #256 asked for. | Closed by slice 2. |
 | **#255** Windows updater (PowerShell twin) | #255 is about bundled Windows installs. The overlay path covers them (in-app and via `nell update`; pip from `ensurepip`, no bash). The build prunes nothing from `ensurepip` on Windows (verified by reading the prune list); slice 2's Windows CI run proves it. | Superseded; close when slice 4 ships. `docs/releases/cross-platform-validation.md`'s Windows-updater row is updated in slice 4. |
 | **#284** opt-in training dependencies | The overlay provides the install mechanism (install the training extras into the overlay on enable). It is *not* a drop-in: today a missing `peft`/`datasets` is "a broken install, surfaced plainly" (`judge_lora.py`), so #284 must also make the self-tune tier fall back to knob-refit when those packages are absent, and move them out of the base dependencies. | Separate spec after slice 4. |
-| **#289** `.deb` pip-over-dpkg mixing | The app path never writes to the bundle, so app users are unaffected. `scripts/update.sh`'s `.deb` branch still mixes files. | Stays open for the script path. |
+| **#289** `.deb` pip-over-dpkg mixing | The app path never writes to the bundle, so app users are unaffected. Decision (Hana, 2026-09-27): `scripts/update.sh`'s bundled branch also moves onto the overlay in slice 2, so it never writes dpkg-owned files either. Interim warning in `--help`/README: PR #300. | Closed by slice 2. |
 | **#179** update-script spec | `update.sh` stays the source/dev updater; `nell update` delegates to it on source installs. | Cross-reference only. |
 | **#288** (merged 2026-09-26) | Provides the `-P` wrapper and bridge spawn, the torch index fix, and the `runtime-build` workflow slice 2 extends. | Dependency met. |
-| **#291** wheel smoke on PRs (open) | `brain-main.yml` reuses `scripts/smoke_test_wheel.sh`, including its `UV_TORCH_BACKEND=cpu` change. | Slice 3 depends on #291 merging. |
+| **#291** wheel smoke on PRs (merged 2026-09-26) | `brain-main.yml` reuses `scripts/smoke_test_wheel.sh`, including its `UV_TORCH_BACKEND=cpu` change. | Dependency met. |
 
 ## 11. Wiring
 
@@ -283,8 +290,9 @@ Not yet verified (proved in the named slice):
 
 1. Tolerant readers + canary + the additive-only rule. Ships in a release before any overlay is
    offered.
-2. `brain/update/` + activation hook + `nell update` + the overlay end-to-end in `runtime-build`.
-   Closes #256.
+2. `brain/update/` + activation hook + `nell update` + the overlay end-to-end in `runtime-build`,
+   and `scripts/update.sh`'s bundled branch moved onto the overlay (via `nell update`) so it no
+   longer rewrites the runtime. Closes #256 and #289.
 3. `brain-main.yml` (build, smoke, sign, self-verify, publish). Needs #291.
 4. Rust commands + ConnectionPanel + version-handshake change. Closes #286 (and #255).
 
@@ -296,7 +304,7 @@ Not yet verified (proved in the named slice):
 | Automatic / background brain updates | Decision: button-driven. | If users forget to check |
 | Update channels (release vs `main`, betas) | One channel is enough; a picker would be a knob. | If `main` proves too unstable |
 | Nell's awareness of running a `main` build | Unrequested; avoid a half-wired organ. | A self-model / feed brainstorm |
-| Moving `update.sh`'s bundled branch onto `nell update` | Cleanup, not need. | After slice 2 is stable |
+| ~~Moving `update.sh`'s bundled branch onto `nell update`~~ | **Moved into slice 2** (Hana, 2026-09-27): it is #289's root fix. | — |
 | Offline or delta updates; keeping more than two versions | Unneeded at ~8 MB overlays. | If overlays grow |
 | Linux real-machine run (Kubuntu validator) of Check → Update → Revert | No Linux host here. | Before promoting slice 4 out of EXPERIMENTAL |
 
