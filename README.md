@@ -219,7 +219,7 @@ bash scripts/update.sh --persona <name>              # from a source checkout
 bash scripts/update.sh --persona <name> --dry-run    # print the plan first
 ```
 
-Needs `git` and `uv` on `PATH`. It stops the supervisor, applies the update wherever `nell paths install_root` points (a source checkout or the desktop app's bundled runtime), checks `nell --version`, and starts the supervisor again. Linux `.deb` installs re-run under `sudo`; macOS `.app` installs need `--allow-app-rewrite` (rewriting the bundle invalidates its signature). Windows is not supported yet (#255).
+Needs `git` and `uv` on `PATH`. It stops the supervisor, applies the update to the install behind `nell` (a source checkout or the desktop app's bundled runtime, found via `nell paths install_root` or, on older installs, the `python3` beside `nell`), checks `nell --version`, and starts the supervisor again. Linux `.deb` installs ask for `sudo` before anything stops, and use it for the install steps only (AppImages are read-only: download the new one); macOS `.app` installs need `--allow-app-rewrite` (rewriting the bundle invalidates its signature). Windows is not supported yet (#255).
 
 ## Where things live
 
