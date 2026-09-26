@@ -72,8 +72,14 @@ def test_attunement_backfill_state(tmp_path):
 
 
 def test_felt_time_anchors_and_pressure(tmp_path):
-    from brain.felt_time.state import (STATE_FILENAME, Anchor, FeltTimeState,
-                                       PressureCounters, load_or_recover, persist)
+    from brain.felt_time.state import (
+        STATE_FILENAME,
+        Anchor,
+        FeltTimeState,
+        PressureCounters,
+        load_or_recover,
+        persist,
+    )
 
     persist(FeltTimeState.cold_start(), tmp_path)
     path = tmp_path / STATE_FILENAME
