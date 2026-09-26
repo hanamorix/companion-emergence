@@ -2,6 +2,17 @@
 
 **Date:** 2026-09-13 · **Status:** approved (Hana, 2026-09-13) · **Issue:** #179
 
+**Amended 2026-09-26 (#285, #287):** stop/start/status use `nell supervisor` (no `nell service`
+version has those actions); `--persona` is required unless `--no-restart`; installs older
+than the #179 keys are found by asking the `python3` beside `nell`; the hashed install names
+the `pytorch-cpu` index; every `nell`/`python3` call runs from `/` (the bundled wrapper's
+`python3 -c` puts the cwd on `sys.path`, so from a checkout it imported the checkout's
+`brain/`); an unknown `--persona` is refused before stopping (`supervisor stop` exits 0 for
+one); the restart trap is armed *before* the stop call (a timed-out stop may still take the
+bridge down); `supervisor start` exit 2 (already running — the app relaunched it mid-update)
+triggers `supervisor restart` onto the new code; sudo is per-command, not a re-exec. Steps below are
+updated in place.
+
 ## Problem
 
 No updater exists. A user on a bundled install (`.deb`, `.app`, `.msi`) who wants a fix
@@ -44,26 +55,40 @@ update.sh [--persona NAME] [--ref REF] [--source DIR] [--nell PATH]
 
 1. **Preflight.** `git` and `uv` on `PATH`, else one clear message and exit 2. Resolve
    `nell`: `--nell`, then `PATH`, then `~/.local/bin/nell`. Read
-   `nell paths --json --persona P` → `install_root`, `brain_package`, `install_kind`.
+   `nell paths install_root|install_kind --persona P`. A nell older than those keys (every
+   release up to v0.0.42) rejects them; then follow `nell`'s symlinks to its `bin/`, and ask
+   the `python3` there for `sys.prefix` and whether `brain/` sits beside a `pyproject.toml`
+   (the same two facts `brain/cli.py` derives). `--persona` is required unless `--no-restart`.
 2. **Source.** `--source DIR` (must contain `pyproject.toml`) or
    `git clone --depth 1 --branch REF <origin-url> <tmp>`. The origin URL is the repo's
    canonical `https://github.com/hanamorix/companion-emergence`.
-3. **Stop.** `nell service stop --persona P` unless `--no-restart`.
+3. **Stop.** `nell supervisor stop --persona P` unless `--no-restart`.
 4. **Apply.**
    - *source:* `git -C <repo> pull --ff-only` (only when no `--source`, i.e. the install
      IS the checkout) then `uv sync --all-extras` in `<repo>`.
    - *bundled:* in the source tree `uv build --wheel`; `uv export --format requirements-txt
      --no-dev --no-emit-project --locked`; `uv pip install --python <install_root>/bin/python3
-     --require-hashes -r req.txt`; `uv pip install --python ... --no-deps <wheel>`; restore
+     --require-hashes -r req.txt --index <pytorch-cpu url> --index-strategy unsafe-best-match`
+     (the export drops index URLs; `--emit-index-url` would need uv >= 0.12 on the user's box);
+     `uv pip install --python ... --no-deps <wheel>`; restore
      `<install_root>/bin/nell` from the copy taken before the install (pip regenerates the
      entry point with a baked shebang; the shipped file is a relocatable wrapper).
-   - `install_root` not writable → re-exec under `sudo` (Linux `.deb`). On macOS when
+   - `install_root` not writable (Linux `.deb`) → `sudo -v` up front, before the stop; then
+     only the four writes into the runtime (cp, both installs, mv) run as `sudo -H` with an
+     absolute `uv` (secure_path drops `~/.local/bin`; `-H` keeps root's uv cache out of the
+     user's), passing through proxy/CA/`UV_*` variables that `env_reset` drops. `umask 022`
+     (sudo unions a hardened umask in). Build and export stay unprivileged. (Was a
+     whole-script re-exec until #285.) A runtime inside an AppImage mount (`*/.mount_*/*`,
+     read-only squashfs) is refused.
+     This check and the `.app` one below run before the stop. On macOS when
      `install_root` is inside a `.app` bundle, refuse unless `--allow-app-rewrite`
      (rewriting Resources invalidates the ad-hoc signature; Gatekeeper may re-prompt).
 5. **Verify.** `nell --version` from the same binary must equal `version` in the source
    tree's `pyproject.toml`, else fail.
-6. **Start.** `nell service start --persona P`, then `nell service status --persona P`.
-7. **Never leave the brain down.** Any failure after step 3 runs `service start` before
+6. **Start.** `nell supervisor start --persona P`, then `nell supervisor status --persona P`.
+   Exit 2 (already running — the app relaunched it mid-update) → `nell supervisor restart`, so
+   it runs the new code; restart's own exit 2 (the app is starting it right now) is success.
+7. **Never leave the brain down.** Any failure after step 3 runs `supervisor start` before
    exiting non-zero.
 
 `--dry-run` prints the command plan (one command per line, prefixed `plan:`) and executes
@@ -88,7 +113,7 @@ nothing past preflight. This is the testing seam.
 
 ## Wiring
 
-Consumes: `nell paths`, `nell service stop/start/status`, `app/build_python_runtime.sh`'s
+Consumes: `nell paths`, `nell supervisor stop/start/status`, `app/build_python_runtime.sh`'s
 install recipe (copied, not shared — bash cannot import bash safely across those scripts'
 `set -e` contexts; drift risk accepted and named in the script header).
 Feeds: nothing in the brain. Ops surface only; no organ.

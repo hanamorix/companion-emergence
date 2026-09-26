@@ -78,7 +78,8 @@ def test_bat_wrapper_launches_the_relative_python(tmp_path: Path) -> None:
     text = _generate(tmp_path).decode("ascii")
     assert text.startswith("@echo off\r\n")
     assert (
-        '"%~dp0..\\python.exe" -c "import sys; from brain.cli import main; sys.exit(main())" %*'
+        # -P: `-c` would put the cwd on sys.path; a brain/ there must not shadow the runtime's.
+        '"%~dp0..\\python.exe" -P -c "import sys; from brain.cli import main; sys.exit(main())" %*'
         in text
     )
     for line in text.split("\r\n"):

@@ -829,6 +829,29 @@ def test_spawn_detached_invokes_popen_with_detach_flags(
     assert log_path.parent.exists()
 
 
+def test_spawn_detached_isolates_the_bridge_from_the_callers_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`-m` puts the cwd on sys.path, and the bridge inherits the caller's cwd: run
+    `nell supervisor start` from a checkout and the runtime's python would import
+    the checkout's brain/. -P, like the MCP server spawn in provider.py (#285)."""
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    captured: dict[str, object] = {}
+
+    class FakeProc:
+        pid = 1
+
+    def fake_popen(cmd, **kw):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    daemon.spawn_detached(persona_dir, None, "cli", tmp_path / "bridge.log")
+    assert captured["cmd"][:4] == [sys.executable, "-P", "-m", "brain.bridge.runner"]
+
+
 def test_spawn_detached_omits_idle_arg_when_none(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

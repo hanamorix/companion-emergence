@@ -192,3 +192,27 @@ def test_wrapper_works_with_relative_symlink_target():
         )
         assert result.returncode == 0
         assert "BUNDLED_PYTHON_INVOKED" in result.stdout
+
+
+def test_wrapper_ignores_a_brain_package_in_the_cwd(tmp_path: Path):
+    """`python3 -c` puts the cwd on sys.path, so run from a checkout (or any dir
+    holding a brain/ package) the wrapper imported THAT brain instead of the
+    runtime's. It must launch python with -P."""
+    bundled_bin = tmp_path / "python-runtime" / "bin"
+    bundled_bin.mkdir(parents=True)
+    python3 = bundled_bin / "python3"
+    python3.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
+    python3.chmod(0o755)
+    nell = bundled_bin / "nell"
+    nell.write_text(_extract_unix_wrapper_template(), encoding="utf-8")
+    nell.chmod(0o755)
+    decoy = tmp_path / "checkout" / "brain"
+    decoy.mkdir(parents=True)
+    (decoy / "__init__.py").write_text("", encoding="utf-8")
+    (decoy / "cli.py").write_text("def main():\n    print('DECOY_BRAIN')\n    return 0\n", encoding="utf-8")
+    result = subprocess.run(
+        [str(nell), "--version"], capture_output=True, text=True, encoding="utf-8",
+        cwd=decoy.parent, timeout=60,
+    )
+    assert "DECOY_BRAIN" not in result.stdout
+    assert result.returncode == 0 and "companion-emergence" in result.stdout, result.stderr
