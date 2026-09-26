@@ -44,6 +44,15 @@ def test_current_read(tmp_path):
     assert store.read_current_read(tmp_path) == cr
 
 
+def test_current_read_non_mapping_record_is_treated_as_missing(tmp_path):
+    from brain.attunement import store
+
+    path = store._current_read_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("null", encoding="utf-8")
+    assert store.read_current_read(tmp_path) is None
+
+
 def test_learned_pattern(tmp_path):
     from brain.attunement import store
     from brain.attunement.schemas import LearnedPattern

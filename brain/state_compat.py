@@ -25,5 +25,7 @@ def from_known_fields[T](cls: type[T], data: Mapping[str, Any]) -> T:
 
     A missing required field still raises TypeError, as `cls(**data)` would.
     """
-    names = {f.name for f in dataclasses.fields(cls)}  # TypeError if not a dataclass
+    if not isinstance(data, Mapping):
+        raise TypeError(f"{cls.__name__} record must be a mapping, not {type(data).__name__}")
+    names = {f.name for f in dataclasses.fields(cls) if f.init}  # TypeError if not a dataclass
     return cls(**{k: v for k, v in data.items() if k in names})
