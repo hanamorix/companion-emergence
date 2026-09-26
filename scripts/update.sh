@@ -13,6 +13,9 @@
 #             in sync by hand; bash cannot share the recipe safely.
 #
 # Windows: not supported (the bundled runtime ships no bash) — see #255.
+# Linux .deb: this rewrites files dpkg owns; before the next `apt install` of a
+# different version, reinstall cleanly (`apt purge` + install) — #289. The in-app
+# brain update (#286) installs into a separate overlay and avoids this.
 #
 # Usage:
 #   scripts/update.sh [--persona NAME] [--ref REF] [--source DIR] [--nell PATH]

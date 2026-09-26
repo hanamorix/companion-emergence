@@ -453,3 +453,10 @@ def test_restart_racing_the_apps_own_start_is_success(tmp_path):
               env_extra={"PATH": f"{fakebin}{os.pathsep}{os.environ['PATH']}"})
     assert cp.returncode == 0, cp.stderr
     assert log.read_text(encoding="utf-8").split() == ["stop", "start", "restart"]
+
+
+def test_help_warns_deb_users_about_dpkg_mixing():
+    """#289: on a .deb install this rewrites dpkg-owned files; until the #286
+    overlay replaces that path, --help must say how to recover."""
+    out = _run("--help").stdout
+    assert "#289" in out and "apt" in out
