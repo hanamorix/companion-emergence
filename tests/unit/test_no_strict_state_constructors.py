@@ -1,7 +1,13 @@
 """Guard for the rollback invariant (#286 §7, brain/state_compat.py): a dataclass
 built from a persisted record must go through from_known_fields, never
 `Cls(**record)`, which rejects fields a newer brain added. Scans brain/ with ast
-so multi-line calls are caught."""
+so multi-line calls are caught.
+
+Limits: this is a name heuristic, not a type check. A record passed under a
+name in `_KWARG_NAMES` (e.g. `BridgeState(**kwargs)`) is not caught. The real
+protection is the per-reader canaries in
+tests/unit/test_persisted_state_tolerance.py — a new persisted-state reader
+needs its own canary there, not just a clean run of this guard."""
 
 from __future__ import annotations
 
@@ -14,6 +20,8 @@ REPO = Path(__file__).resolve().parents[2]
 _KWARG_NAMES = {"kwargs", "kw", "opts", "options", "params", "overrides", "defaults",
                 "extra", "engine_kwargs"}
 # Reviewed exceptions (file, callee): not persisted records, or already filtered.
+# NOTE: an entry exempts that callee name for the WHOLE file, not one call site —
+# a second, unfiltered `cls(**record)` elsewhere in the same file would also pass.
 _ALLOWED = {
     ("brain/memory/judge_full_ft.py", "CrossEncoder"),  # model keyword options
     ("brain/pronouns.py", "PronounSet"),  # filters to known fields itself
