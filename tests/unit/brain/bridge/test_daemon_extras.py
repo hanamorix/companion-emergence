@@ -1901,8 +1901,21 @@ def test_kill_if_alive_posix_unrelated_oserror_still_raises(monkeypatch: pytest.
     """On POSIX (_IS_WINDOWS False), an OSError that happens to carry a
     winerror-87-shaped attribute (which would never occur for real on
     POSIX) must NOT be swallowed — the Windows-specific tolerance is gated
-    on platform, not merely on the attribute's value."""
-    assert daemon._IS_WINDOWS is False
+    on platform, not merely on the attribute's value.
+
+    _IS_WINDOWS is explicitly forced False here (not read off the real
+    host) so this exercises the POSIX branch of `_kill_if_alive` on every
+    CI runner, including a real Windows one — the real host's own OS is a
+    separate, host-specific fact this test isn't about (see the sibling
+    `test_kill_if_alive_windows_*` tests for the Windows branch, forced
+    True the same way). An earlier version of this test asserted the real
+    `daemon._IS_WINDOWS` instead of forcing it, which correctly failed the
+    assertion itself when actually run on windows-latest CI (2026-09-27) —
+    not a wrong result, but the wrong thing to assert: the test's own
+    purpose (POSIX-branch behavior) is independent of the host it happens
+    to run on.
+    """
+    monkeypatch.setattr(daemon, "_IS_WINDOWS", False)
 
     def fake_kill(pid, sig):
         err = OSError("some other real POSIX error")

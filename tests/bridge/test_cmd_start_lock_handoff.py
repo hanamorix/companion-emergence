@@ -60,7 +60,7 @@ _WORKER_SCRIPT = str(Path(__file__).parent / "_runner_lock_worker.py")
 def test_c19a_two_cmd_starts_forced_into_handoff_window(tmp_path, monkeypatch):
     """C19(a): two `cmd_start` runs forced into the handoff window — the
     second launched after the first parent released its own pre-flight lock
-    and before its (deliberately delayed) child acquires the real one.
+    and before its (deliberately held-back) child acquires the real one.
     Exactly one bridge ends up running and holding the lock, with one
     bridge.json-equivalent state write and one bound "port"; the loser's
     real child process exits 2 (the runner.main-level exclusion S57 names)
@@ -76,21 +76,29 @@ def test_c19a_two_cmd_starts_forced_into_handoff_window(tmp_path, monkeypatch):
     not be corrupted) — bounded by a generous thread-join timeout below, so
     nothing is left running past this test.
 
-    Timing constants below are deliberately generous (real Windows CI, 2026-
-    09-26: this test's original 0.3s/2.0s margins were tight enough that
-    role-b's `cmd_start` sometimes hadn't resolved within 15s — Windows
-    process creation plus importing brain.bridge.runner's own dependency
-    chain in a fresh interpreter is meaningfully slower there than on
-    Linux/macOS). The delay differential (role-a's child sleeps far longer
-    than the inter-thread-start gap) is what actually proves the race, not
-    the absolute values, so widening both is free: it costs real wall time
-    only on the slow platform that needs it, and this test already pays a
-    genuine ~50s floor regardless (role-a's own `cmd_start` readiness
-    timeout), so a few more seconds of slack elsewhere is negligible by
-    comparison.
+    Sequencing (2026-09-27 rewrite — see history below): role-a's child is
+    held at a `--wait-file` gate BEFORE it imports anything or attempts the
+    lock, so it is released ONLY once role-b's child has already proven it
+    holds the lock (its marker file has appeared). This makes "role-a's
+    child attempts strictly after role-b's child already won" a DETERMINISTIC
+    fact this test controls, not a wall-clock guess about whose subprocess
+    starts up faster — see the history note for why that guess failed.
+
+    History: an earlier version used a fixed `--startup-delay` on role-a's
+    child plus generous join/wait timeouts, betting that the delay was
+    always bigger than however long role-b's child took to start up and win.
+    That bet failed on real windows-latest CI (`role-b's cmd_start should
+    have returned quickly` — role-b's thread was still alive after 30s):
+    Windows subprocess creation plus importing brain.bridge.runner's
+    dependency chain in a fresh interpreter is itself slow and
+    CI-load-variable enough there that role-b's own child could plausibly
+    still be starting up when role-a's fixed delay expired, letting role-a's
+    child compete (and possibly win) before role-b's child ever got there —
+    a genuine test-design flaw (an unbounded race dressed as a bounded one),
+    not a cmd_start production bug: nothing here suggested cmd_start itself
+    ever blocks or fails to observe a losing child's refusal past its own
+    readiness poll. The `--wait-file` gate removes the guess entirely.
     """
-    handoff_gap_s = 1.5  # gap between starting role-a's and role-b's cmd_start
-    role_a_child_delay_s = 8.0  # role-a's child's startup-delay before it even tries the lock
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
     monkeypatch.setattr("brain.paths.get_persona_dir", lambda name: persona_dir)
@@ -107,6 +115,9 @@ def test_c19a_two_cmd_starts_forced_into_handoff_window(tmp_path, monkeypatch):
     monkeypatch.setattr(daemon.httpx, "get", lambda *a, **kw: _HealthyResp())
 
     stop_file = tmp_path / "stop"
+    wait_gate_a = tmp_path / "wait-gate-role-a"  # role-a's child blocks until this exists
+    winner_marker = tmp_path / "marker-role-b.txt"
+    loser_marker = tmp_path / "marker-role-a.txt"
     launched: dict[str, subprocess.Popen] = {}
     launch_lock = threading.Lock()
 
@@ -115,24 +126,22 @@ def test_c19a_two_cmd_starts_forced_into_handoff_window(tmp_path, monkeypatch):
         # in-test signal of which role (see _run below) is spawning —
         # cmd_start itself only reads client_origin for the (irrelevant
         # here) launchd log-truncation branch.
-        delayed = origin == "role-a"
         marker = tmp_path / f"marker-{origin}.txt"
-        proc = subprocess.Popen(
-            [
-                sys.executable,
-                _WORKER_SCRIPT,
-                "--persona-dir",
-                str(pd),
-                "--marker",
-                str(marker),
-                "--stop-file",
-                str(stop_file),
-                "--startup-delay",
-                str(role_a_child_delay_s) if delayed else "0.0",
-                "--write-state-port",
-                "51900" if origin == "role-a" else "51901",
-            ]
-        )
+        cmd = [
+            sys.executable,
+            _WORKER_SCRIPT,
+            "--persona-dir",
+            str(pd),
+            "--marker",
+            str(marker),
+            "--stop-file",
+            str(stop_file),
+            "--write-state-port",
+            "51900" if origin == "role-a" else "51901",
+        ]
+        if origin == "role-a":
+            cmd += ["--wait-file", str(wait_gate_a)]
+        proc = subprocess.Popen(cmd)
         with launch_lock:
             launched[origin] = proc
         return proc.pid
@@ -145,45 +154,63 @@ def test_c19a_two_cmd_starts_forced_into_handoff_window(tmp_path, monkeypatch):
         args = SimpleNamespace(persona="persona", idle_shutdown=0, client_origin=role)
         results[role] = daemon.cmd_start(args)
 
+    def _poll_until(predicate, *, timeout: float, message: str) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return
+            time.sleep(0.02)
+        raise AssertionError(message)
+
     lock_path = persona_dir / daemon.LOCKFILE
     t_a = threading.Thread(target=_run, args=("role-a",))
     t_b = threading.Thread(target=_run, args=("role-b",))
 
     try:
-        # Force the handoff window: role-a's cmd_start runs first (its own
-        # pre-flight acquire+release completes near-instantly, well before
-        # its DELAYED child ever tries the real lock); role-b's cmd_start
-        # starts an instant later, sees the OS lock free (role-a already
-        # released its own pre-flight hold before spawning), and its
-        # non-delayed child reaches the real lock first and wins.
+        # Force the handoff window: role-a's cmd_start runs first — its own
+        # pre-flight acquire+release completes near-instantly (CPU-only, no
+        # subprocess involved), releasing the OS lock BEFORE it spawns its
+        # (gated) child. Wait for that spawn to be recorded (a fast, in-
+        # process signal — not a subprocess-timing guess) before starting
+        # role-b, so role-b's own pre-flight genuinely runs after role-a's
+        # has already released the lock, matching S57's handoff scenario.
         t_a.start()
-        time.sleep(handoff_gap_s)
+        _poll_until(
+            lambda: "role-a" in launched,
+            timeout=10.0,
+            message="role-a's cmd_start never reached spawn_detached",
+        )
         t_b.start()
 
-        # role-b's cmd_start should resolve fast (its child wins the race
-        # and writes a matching state_file almost immediately) — generous
-        # bound for slow Windows process/import startup, not because this
-        # side is expected to actually take that long.
+        # role-b's child is never gated, so with role-a's child still
+        # blocked at wait_gate_a, role-b's child is the only one competing
+        # for the lock — it wins as soon as it gets there. Generous bound
+        # for slow Windows subprocess/import startup; this is the one place
+        # that genuinely waits on it, not a race against role-a.
+        _poll_until(
+            lambda: winner_marker.exists(),
+            timeout=60.0,
+            message="role-b's child never reached the stub (never won the lock)",
+        )
+        assert not loser_marker.exists(), "role-a's child must still be blocked at its wait-gate"
+
+        # role-b's cmd_start should resolve very shortly after its child's
+        # marker appears (the child writes the matching state_file right
+        # after the marker, in the same stub call) — generous bound for
+        # slow Windows scheduling, not because this side is expected to
+        # actually take that long.
         t_b.join(timeout=30.0)
         assert not t_b.is_alive(), "role-b's cmd_start should have returned quickly"
         assert results["role-b"] == 0
 
-        winner_marker = tmp_path / "marker-role-b.txt"
-        loser_marker = tmp_path / "marker-role-a.txt"
-        assert winner_marker.exists()
-        assert not loser_marker.exists(), "the losing child must never reach run_bridge_foreground"
-
         inode_while_held = lock_path.stat().st_ino
 
-        # Wait for role-a's DELAYED child to finish its own attempt (its
-        # role_a_child_delay_s startup delay, then a real acquire_lock
-        # against the winner STILL holding the lock at this point —
-        # stop_file is not written until after this) before releasing the
-        # winner. If the winner were released first, role-a's late child
-        # would find the lock free and win trivially, proving nothing about
-        # the actual race.
-        assert launched["role-a"].wait(timeout=role_a_child_delay_s + 20.0) == 2
-        assert not loser_marker.exists()
+        # NOW release role-a's child. The lock is guaranteed held by role-b's
+        # child at this point (just proven above), so role-a's child is
+        # GUARANTEED to lose when it attempts — no timing assumption left.
+        wait_gate_a.write_text("go", encoding="utf-8")
+        assert launched["role-a"].wait(timeout=60.0) == 2
+        assert not loser_marker.exists(), "the losing child must never reach run_bridge_foreground"
 
         # Now release the winner so its cmd_start's spawned child (still
         # parked in the stub) can exit cleanly.
@@ -203,6 +230,7 @@ def test_c19a_two_cmd_starts_forced_into_handoff_window(tmp_path, monkeypatch):
         assert lock_path.stat().st_ino == inode_while_held
     finally:
         stop_file.write_text("go", encoding="utf-8")
+        wait_gate_a.write_text("go", encoding="utf-8")
         for proc in launched.values():
             if proc.poll() is None:
                 proc.kill()

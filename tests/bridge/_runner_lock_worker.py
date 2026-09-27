@@ -24,7 +24,19 @@ process actually wins the OS lock (that is what "won" means here), so:
   releasing it.
 
 ``--startup-delay`` sleeps before calling ``runner.main`` at all, so a test
-can force one sibling to arrive at ``acquire_lock`` well after another.
+can force one sibling to arrive at ``acquire_lock`` well after another. This
+is a WALL-CLOCK guess and was found to be unreliable on Windows CI (subprocess
+creation + importing brain.bridge.runner's dependency chain in a fresh
+interpreter can itself take longer than a fixed delay assumed it wouldn't) —
+prefer ``--wait-file`` for anything that needs a guaranteed ordering.
+
+``--wait-file PATH`` blocks BEFORE importing anything (before even
+``brain.bridge.runner``) until that file exists, polling every 20ms with no
+deadline — deterministic ordering instead of a wall-clock guess: a test can
+let one sibling actually win the race first (observed via its ``--marker``
+appearing) before ever creating the wait-file, so the delayed sibling is
+GUARANTEED to attempt its lock only after the other one already holds it,
+regardless of how slow either process's own startup is on any given host.
 
 ``--write-state-port PORT`` additionally makes the winner write a REAL
 ``brain.bridge.state_file.BridgeState`` (this process's own pid, that port)
@@ -50,11 +62,17 @@ def main() -> int:
     p.add_argument("--marker", required=True)
     p.add_argument("--stop-file", required=True)
     p.add_argument("--startup-delay", type=float, default=0.0)
+    p.add_argument("--wait-file", default=None)
     p.add_argument("--write-state-port", type=int, default=None)
     args = p.parse_args()
 
     if args.startup_delay > 0:
         time.sleep(args.startup_delay)
+
+    if args.wait_file is not None:
+        wait_path = Path(args.wait_file)
+        while not wait_path.exists():
+            time.sleep(0.02)
 
     from brain.bridge import runner
 
