@@ -428,6 +428,20 @@ def run_folded(
                 _last_intensity_drivers = _heartbeat_attempt_result
                 last_heartbeat_at = time.monotonic()
 
+    def _between_items() -> bool:
+        """INC-10 between-items hook (spec §4, S14/S31/S41/S65): a pausable
+        gated job's own loop calls this between items. It runs the SAME
+        heartbeat hook `between_jobs` uses (so a heartbeat that falls due
+        mid-job still runs only between items, never during one, S41/S65),
+        then reports whether the job should pause (chat active again,
+        S14/S43) — True means "stop here, save progress, return
+        JobOutcome.PAUSED"; the caller does not advance its cadence."""
+        try:
+            _maybe_run_heartbeat()
+        except Exception:
+            logger.exception("supervisor between-items heartbeat hook raised")
+        return not cli_throttle.is_chat_idle()
+
     # The gated jobs, in the S55 order (see brain/bridge/central_cadence.py).
     tick_stats = {"closed_sessions": 0, "pruned_empty_sessions": 0}
     # The per-tick shared MemoryStore (#132: one memories.db open per tick,
@@ -454,6 +468,7 @@ def run_folded(
         tick_stats=tick_stats,
         tick_ctx=tick_ctx,
         bridge_started_at=bridge_started_at,
+        between_items=_between_items,
     )
 
     while not stop_event.is_set():
@@ -726,6 +741,7 @@ def _build_gated_jobs(
     tick_stats: dict[str, int],
     tick_ctx: dict[str, MemoryStore | None] | None = None,
     bridge_started_at: datetime | None = None,
+    between_items: Callable[[], bool] | None = None,
 ) -> list[GatedJob]:
     """The job table of the central cadence function (INC-9, S16/S55/S70).
 
@@ -745,6 +761,13 @@ def _build_gated_jobs(
     jobs: list[GatedJob] = []
     started_at = bridge_started_at if bridge_started_at is not None else datetime.now(UTC)
     ctx: dict[str, MemoryStore | None] = tick_ctx if tick_ctx is not None else {"store": None}
+    # INC-10 (S14/S41/S65): the between-items hook every pausable job's own
+    # loop asks. Callers that don't wire one (older tests, direct unit
+    # calls) get the bare idle check with no heartbeat hook — same
+    # behavior pass2's should_pause had before this increment.
+    _between_items: Callable[[], bool] = (
+        between_items if between_items is not None else (lambda: not cli_throttle.is_chat_idle())
+    )
 
     @contextmanager
     def _tick_store() -> Iterator[MemoryStore]:
@@ -767,13 +790,21 @@ def _build_gated_jobs(
                 return JobOutcome.SKIPPED
             # S14 (per item): a message arriving mid-drain stops it at the next
             # item boundary; what's left stays saved for the next lull (S64).
-            drained = pass2_queue.drain_all_locked(
-                persona_dir, should_pause=lambda: not cli_throttle.is_chat_idle()
-            )
+            # INC-10: should_pause is the between-items hook (heartbeat + idle),
+            # not a bare idle check, so a heartbeat due mid-drain still runs
+            # between items rather than waiting for the whole drain (S41/S65).
+            drained = pass2_queue.drain_all_locked(persona_dir, should_pause=_between_items)
         logger.info("pass-2 job: drained=%d", drained)
         # 0 drained with work queued = another process holds pass2_drain.lock
         # (S77): nothing ran, so report a skip (pass 2 has no cadence either way).
-        return JobOutcome.COMPLETED if drained else JobOutcome.SKIPPED
+        if drained == 0:
+            return JobOutcome.SKIPPED
+        # INC-10 (C8): drained something but the saved queue (S64, the queue
+        # file itself IS pass 2's saved progress) still has items — the
+        # between-items hook stopped the drain for chat, not an empty queue.
+        if pass2_queue.queue_length(persona_dir) > 0:
+            return JobOutcome.PAUSED
+        return JobOutcome.COMPLETED
 
     jobs.append(
         GatedJob(
@@ -807,7 +838,8 @@ def _build_gated_jobs(
             older_than_seconds=_prune_age(now), now=now, persona_name=persona_dir.name
         )
 
-    def _snapshot_prune_run() -> None:
+    def _snapshot_prune_run() -> JobOutcome:
+        snapshot_paused_out: list[bool] = []
         with ExitStack() as stack:
             store = stack.enter_context(_tick_store())
             hebbian = HebbianMatrix(persona_dir / "hebbian.db", integrity_check=False)
@@ -821,7 +853,11 @@ def _build_gated_jobs(
                 store=store,
                 hebbian=hebbian,
                 provider=build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING),
+                should_pause=_between_items,
+                paused_out=snapshot_paused_out,
             )
+        # Prune is indivisible (§4.4) — it always runs once per pass
+        # regardless of whether the snapshot half paused above.
         prune_now = datetime.now(UTC)
         pruned = prune_empty_sessions(
             older_than_seconds=_prune_age(prune_now), now=prune_now, persona_name=persona_dir.name
@@ -842,6 +878,7 @@ def _build_gated_jobs(
                     "at": _now_iso(),
                 }
             )
+        return JobOutcome.PAUSED if snapshot_paused_out else JobOutcome.COMPLETED
 
     jobs.append(
         GatedJob("session_snapshot_prune", run=_snapshot_prune_run, has_work=_snapshot_prune_has_work)
@@ -852,14 +889,24 @@ def _build_gated_jobs(
         with _tick_store() as store:
             return _emotion_backfill_has_work(persona_dir, store=store)
 
-    def _emotion_backfill_job() -> None:
+    def _emotion_backfill_job() -> JobOutcome:
         # The per-tick shared store (#132): one memories.db connection per tick.
+        emotion_paused_out: list[bool] = []
         with _tick_store() as store:
             _emotion_backfill_run(
                 persona_dir,
                 provider=build_tier_provider(persona_dir, TIER_BACKGROUND_CLASSIFIER),
                 store=store,
+                should_pause=_between_items,
+                paused_out=emotion_paused_out,
             )
+        # INC-10 (C8): PAUSED only when the between-items hook itself stopped
+        # the pass (emotion_paused_out, set at that exact return site) — NOT
+        # merely whenever status=="running", which ALSO covers the unrelated
+        # zero-tagged-guard case (a systematic tagger failure leaves status
+        # "running" too, but that is not a chat-idle pause and must not stop
+        # the S55 sequence for the jobs after this one).
+        return JobOutcome.PAUSED if emotion_paused_out else JobOutcome.COMPLETED
 
     jobs.append(
         GatedJob(
@@ -905,14 +952,25 @@ def _build_gated_jobs(
             with cli_throttle.background_slot() as slot:
                 if not slot:
                     return JobOutcome.SKIPPED
+                forgetting_progress: dict[str, bool] = {}
                 try:
                     forgetting_run_pass(
                         persona_dir,
                         event_bus=event_bus,
                         intensity_drivers=intensity_drivers(),
+                        should_pause=_between_items,
+                        progress_out=forgetting_progress,
                     )
                 except Exception:
                     logger.exception("supervisor forgetting pass raised")
+                if forgetting_progress.get("paused"):
+                    # INC-10 (C8): forgetting stopped between memories for
+                    # chat — its own cursor (job_progress) already saved the
+                    # resume point; skip narrative/the sweeps this pass so
+                    # the whole maintenance job reports PAUSED (no cadence
+                    # advance, S36) rather than silently completing them out
+                    # of order relative to a still-mid-pass forgetting.
+                    return JobOutcome.PAUSED
                 # Narrative-memory arc-update runs AFTER forgetting so a memory
                 # forgetting just dropped doesn't enter an arc born this tick.
                 try:
@@ -1001,14 +1059,16 @@ def _build_gated_jobs(
     # 8. compaction — daily.
     if compaction_interval_s is not None:
 
-        def _compaction_run() -> None:
+        def _compaction_run() -> JobOutcome:
             from brain.chat.compaction import build_compaction_provider
 
-            _run_compaction_tick(
+            paused = _run_compaction_tick(
                 persona_dir,
                 build_compaction_provider(persona_dir),
                 is_session_busy=is_session_busy,
+                should_pause=_between_items,
             )
+            return JobOutcome.PAUSED if paused else JobOutcome.COMPLETED
 
         jobs.append(
             GatedJob(
@@ -1043,7 +1103,11 @@ def _build_gated_jobs(
 
         # 11. daily calibration — calibration before self-tune (S43).
         def _calibration_run() -> JobOutcome:
-            ran = _run_calibration_tick(persona_dir, is_session_busy=is_session_busy)
+            ran = _run_calibration_tick(
+                persona_dir, is_session_busy=is_session_busy, should_pause=_between_items
+            )
+            if ran is None:
+                return JobOutcome.PAUSED
             return JobOutcome.SKIPPED if ran is False else JobOutcome.COMPLETED
 
         jobs.append(
@@ -1082,15 +1146,21 @@ def _build_gated_jobs(
 
     # 13. finalize — hourly sweep, 24h silence threshold.
     if finalize_interval_s is not None:
+
+        def _finalize_run() -> JobOutcome:
+            paused = _run_finalize_tick(
+                persona_dir,
+                build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING),
+                event_bus,
+                finalize_after_hours=finalize_after_hours,
+                should_pause=_between_items,
+            )
+            return JobOutcome.PAUSED if paused else JobOutcome.COMPLETED
+
         jobs.append(
             GatedJob(
                 "finalize",
-                run=lambda: _run_finalize_tick(
-                    persona_dir,
-                    build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING),
-                    event_bus,
-                    finalize_after_hours=finalize_after_hours,
-                ),
+                run=_finalize_run,
                 cadence_file="finalize_cadence.json",
                 interval_s=finalize_interval_s,
             )
@@ -1098,10 +1168,17 @@ def _build_gated_jobs(
 
     # 14. initiate review — 15 min.
     if initiate_review_interval_s is not None:
+
+        def _initiate_review_run() -> JobOutcome:
+            paused = _run_initiate_review_tick(
+                persona_dir, provider, event_bus, should_pause=_between_items
+            )
+            return JobOutcome.PAUSED if paused else JobOutcome.COMPLETED
+
         jobs.append(
             GatedJob(
                 "initiate_review",
-                run=lambda: _run_initiate_review_tick(persona_dir, provider, event_bus),
+                run=_initiate_review_run,
                 cadence_file="initiate_review_cadence.json",
                 interval_s=initiate_review_interval_s,
             )
@@ -2169,7 +2246,8 @@ def _run_compaction_tick(
     provider: LLMProvider,
     *,
     is_session_busy: Callable[[str], bool] | None = None,
-) -> None:
+    should_pause: Callable[[], bool] | None = None,
+) -> bool:
     """Run the age-gated cascade on each active conversation, then check the weekly
     session-rollover (1c-B) — cascade-fold FIRST, then rollover, so a swap seeds from
     the just-updated tiers (M2). Per-session failures are logged and do not stop the
@@ -2191,6 +2269,16 @@ def _run_compaction_tick(
     compaction job (daily default, persisted cadence per #21; ram-spike-fix
     INC-9 removed the startup catch-up call — an overdue cascade runs at the
     first lull, the bridge-start lull included).
+
+    ``should_pause`` (INC-10, S14/S32/S41/S65): checked BETWEEN sessions —
+    the S32 table's item unit for compaction is "one session"
+    (supervisor.py:2125 historically; per-session buffer state is already
+    persisted per fold, so stopping here loses no progress). Returns True
+    when it stopped early for chat with sessions still unvisited this pass
+    (C8: the caller must not advance ``compaction_cadence.json`` and must
+    report ``JobOutcome.PAUSED``); resuming just re-lists active sessions and
+    re-applies the same age-gated cascade, which is a no-op for a session
+    this pass already cascaded (nothing new is old enough yet).
     """
     from brain.chat.compaction import (
         _ROLLOVER_QUIET_GAP,
@@ -2201,13 +2289,14 @@ def _run_compaction_tick(
     from brain.ingest.buffer import list_active_sessions
 
     persona_name = persona_dir.name
+    session_ids = list(list_active_sessions(persona_dir))
     with ExitStack() as stack:
         store = MemoryStore(persona_dir / "memories.db")
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
 
-        for session_id in list_active_sessions(persona_dir):
+        for i, session_id in enumerate(session_ids):
             now = datetime.now(UTC)
             # Idle-gate: skip a session with an in-flight request (owner ruling) —
             # its cascade AND its rollover defer to the next idle tick. Compaction
@@ -2232,6 +2321,15 @@ def _run_compaction_tick(
             except Exception:
                 logger.exception("weekly rollover: session=%s raised", session_id)
 
+            if (
+                should_pause is not None
+                and i < len(session_ids) - 1
+                and should_pause()
+            ):
+                logger.info("compaction tick: pausing between sessions for chat (INC-10)")
+                return True
+    return False
+
 
 def _run_calibration_tick(
     persona_dir: Path,
@@ -2239,7 +2337,8 @@ def _run_calibration_tick(
     is_session_busy: Callable[[str], bool] | None = None,
     provider: LLMProvider | None = None,
     judge: RelevanceJudgeProvider | None = None,
-) -> bool:
+    should_pause: Callable[[], bool] | None = None,
+) -> bool | None:
     """F2a daily calibration tick (#250, spec Section 5) — 4th sibling cadence
     to compaction/clustering/vocab-repair, mirroring ``_run_compaction_tick``'s
     idle-gate + restart-safety shape: own persisted ``calibration_cadence.json``,
@@ -2359,26 +2458,43 @@ def _run_calibration_tick(
                 current = judge_lora.resolve_current_checkpoint(persona_dir)
                 if current is not None:
                     full_model_dir = str(current)
+            label_progress: dict[str, bool] = {}
             labeled = label_calibration_sample(
                 store,
                 provider=tiebreak_provider,
                 judge=judge,
                 full_model_dir=full_model_dir,
+                should_pause=should_pause,
+                progress_out=label_progress,
             )
             logger.info("calibration tick: labeled=%d calibration_log rows this pass", labeled)
         except Exception:  # noqa: BLE001 — judge/torch/Haiku failure must not crash the tick
             logger.exception("calibration tick: judge-labeling pass raised; continuing")
+            label_progress = {}
         finally:
-            # S11/S27 (inc5): the judge is built for this tick alone (label_
-            # calibration_sample above, lazily and only if there were rows to
-            # label) and never kept beyond it — release its RAM whether or
-            # not the pass actually built one, and whether it succeeded or
-            # raised (release_judge() is a cheap no-op when nothing was
-            # loaded). The PAUSE arm (a mid-tick idle-loss) is INC-10; this
-            # tick has no pause point yet, so every path here is a FINISH.
+            # S11/S27 (inc5), S31 (inc10): the judge is built for this tick
+            # alone (label_calibration_sample above, lazily and only if there
+            # were rows to label) and never kept beyond it — release its RAM
+            # whether or not the pass actually built one, whether it
+            # succeeded/raised/PAUSED (release_judge() is a cheap no-op when
+            # nothing was loaded). This covers BOTH the finish arm and the
+            # INC-10 pause arm (C2): a between-items pause mid-labeling still
+            # reaches this `finally` on the very next loop iteration's break.
             from brain.memory.relevance_judge import release_judge
 
             release_judge()
+
+        if label_progress.get("paused"):
+            # INC-10 (C8): the between-items hook stopped labeling with rows
+            # still unlabeled — skip floor derivation (it reads the SAME
+            # day's labeled pairs; run it once labeling actually finishes)
+            # and report PAUSED so the central cadence function does not
+            # advance calibration_cadence.json (S36) and stops the S55
+            # sequence here (S43). The next lull re-fires this tick; already-
+            # labeled rows are never re-sampled (label_calibration_sample's
+            # own docstring), so no item 1..k is redone.
+            logger.info("calibration tick: paused mid-labeling; floor derivation deferred")
+            return None
 
         try:
             from brain.memory import floor_calibration
@@ -2606,7 +2722,8 @@ def _run_finalize_tick(
     event_bus: EventBus,
     *,
     finalize_after_hours: float,
-) -> None:
+    should_pause: Callable[[], bool] | None = None,
+) -> bool:
     """Run one finalize pass — per-tick stores, then drop registry entries
     for every session that was finalized.
 
@@ -2615,7 +2732,12 @@ def _run_finalize_tick(
     ExitStack. The supervisor follows up by calling remove_session() for
     each finalized session — finalize itself doesn't touch the in-memory
     registry.
+
+    ``should_pause`` (INC-10): forwarded to ``finalize_stale_sessions``,
+    which checks it between finalized sessions (S32: item = one stale
+    session). Returns True when it stopped early for chat.
     """
+    paused_out: list[bool] = []
     with ExitStack() as stack:
         store = MemoryStore(persona_dir / "memories.db")
         stack.callback(store.close)
@@ -2628,6 +2750,8 @@ def _run_finalize_tick(
             store=store,
             hebbian=hebbian,
             provider=provider,
+            should_pause=should_pause,
+            paused_out=paused_out,
         )
 
     for r in reports:
@@ -2643,13 +2767,16 @@ def _run_finalize_tick(
                 "at": _now_iso(),
             }
         )
+    return bool(paused_out)
 
 
 def _run_initiate_review_tick(
     persona_dir: Path,
     provider: LLMProvider,
     event_bus: EventBus | object,
-) -> None:
+    *,
+    should_pause: Callable[[], bool] | None = None,
+) -> bool:
     """Build voice template + invoke run_initiate_review_tick.
 
     Mirrors _run_soul_review_tick's per-tick store-ownership pattern.
@@ -2708,6 +2835,7 @@ def _run_initiate_review_tick(
             exc_info=True,
         )
         is_rest_state = False  # fail-open: a body bug must never silence her permanently
+    _paused_out: list[bool] = []
     run_initiate_review_tick(
         persona_dir,
         provider=provider,
@@ -2715,6 +2843,8 @@ def _run_initiate_review_tick(
         cap_per_tick=cap_per_tick,
         user_presence=_user_presence,
         is_rest_state=is_rest_state,
+        should_pause=should_pause,
+        paused_out=_paused_out,
     )
     event_bus.publish(
         {
@@ -2722,6 +2852,7 @@ def _run_initiate_review_tick(
             "at": _now_iso(),
         }
     )
+    return bool(_paused_out)
 
 
 def _run_voice_reflection_tick(

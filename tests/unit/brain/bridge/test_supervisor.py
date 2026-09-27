@@ -1275,7 +1275,7 @@ def test_supervisor_initiate_review_tick_passes_rest_state_low_energy(tmp_path: 
 
     captured: dict[str, object] = {}
 
-    def fake_review_tick(persona_dir, *, provider, voice_template, cap_per_tick, user_presence, is_rest_state=False):
+    def fake_review_tick(persona_dir, *, provider, voice_template, cap_per_tick, user_presence, is_rest_state=False, should_pause=None, paused_out=None):
         captured["is_rest_state"] = is_rest_state
 
     low_energy_body = BodyState(
@@ -1312,7 +1312,7 @@ def test_supervisor_initiate_review_tick_passes_rest_state_active_energy(tmp_pat
 
     captured: dict[str, object] = {}
 
-    def fake_review_tick(persona_dir, *, provider, voice_template, cap_per_tick, user_presence, is_rest_state=False):
+    def fake_review_tick(persona_dir, *, provider, voice_template, cap_per_tick, user_presence, is_rest_state=False, should_pause=None, paused_out=None):
         captured["is_rest_state"] = is_rest_state
 
     active_energy_body = BodyState(
@@ -1346,7 +1346,7 @@ def test_supervisor_initiate_review_tick_rest_state_fail_open(tmp_path: Path) ->
 
     captured: dict[str, object] = {}
 
-    def fake_review_tick(persona_dir, *, provider, voice_template, cap_per_tick, user_presence, is_rest_state=False):
+    def fake_review_tick(persona_dir, *, provider, voice_template, cap_per_tick, user_presence, is_rest_state=False, should_pause=None, paused_out=None):
         captured["is_rest_state"] = is_rest_state
 
     with (

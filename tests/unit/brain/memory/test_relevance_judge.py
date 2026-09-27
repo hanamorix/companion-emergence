@@ -1118,7 +1118,10 @@ def test_build_judge_provider_has_no_adapter_argument_and_no_adapter_judge() -> 
 
     assert list(inspect.signature(build_judge_provider).parameters) == ["full_model_dir"]
     assert not hasattr(rj_mod, "LoraAdapterJudge")
-    assert list(inspect.signature(label_calibration_sample).parameters)[-1] == "full_model_dir"
+    # INC-10 (ram-spike-fix) appends `should_pause`/`progress_out` after
+    # `full_model_dir` — check the param is present and adapter_dir is still
+    # gone, rather than pinning it as the literal last parameter.
+    assert "full_model_dir" in inspect.signature(label_calibration_sample).parameters
     assert "adapter_dir" not in inspect.signature(label_calibration_sample).parameters
 
 

@@ -34,8 +34,11 @@ def test_run_calibration_tick_importable_and_callable():
     # lazily"). Both keyword-only, both defaulted, so every existing
     # zero-arg call site (run_folded's startup catch-up + periodic fire)
     # keeps working unmodified.
-    assert params == ["persona_dir", "is_session_busy", "provider", "judge"], (
-        f"expected (persona_dir, *, is_session_busy, provider, judge), got {params}"
+    # INC-10 (ram-spike-fix): adds keyword-only `should_pause` (the
+    # between-items pause hook, default None => never pauses — every
+    # existing zero-arg call site keeps working unmodified).
+    assert params == ["persona_dir", "is_session_busy", "provider", "judge", "should_pause"], (
+        f"expected (persona_dir, *, is_session_busy, provider, judge, should_pause), got {params}"
     )
     busy = sig.parameters["is_session_busy"]
     assert busy.kind is inspect.Parameter.KEYWORD_ONLY

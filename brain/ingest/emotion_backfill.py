@@ -302,6 +302,8 @@ def run_emotion_backfill(
     now_dt: _datetime | None = None,
     delay_s: float = _INTER_CALL_DELAY_S,
     store: MemoryStore | None = None,
+    should_pause: Callable[[], bool] | None = None,
+    paused_out: list[bool] | None = None,
 ) -> EmotionBackfillState:
     """Run (or resume) the one-time emotion backfill.
 
@@ -329,6 +331,14 @@ def run_emotion_backfill(
     ``tagger_fn`` takes priority over ``provider``.  When ``tagger_fn`` is None
     the default Haiku tagger is used; ``provider`` (if given) is passed to it so
     tests can inject a stub without shelling out to the Claude CLI.
+
+    ``should_pause`` (ram-spike-fix INC-10, S14/S41/S65): checked between
+    memories, same as the yield-gate always was; defaults to a bare
+    ``not is_chat_idle()`` check (this function's pre-INC-10 behavior) when
+    omitted, so existing callers are unaffected. The supervisor passes its
+    between-items hook (heartbeat + idle) instead, so a heartbeat due
+    mid-backfill runs between memories rather than waiting for the whole
+    candidate list.
 
     Mirrors ``brain.attunement.backfill.run_backfill``.
     """
@@ -395,16 +405,28 @@ def run_emotion_backfill(
         # Import once before loop — local import is circular-safe.
         from brain.bridge import cli_throttle as _cli_throttle  # noqa: PLC0415
 
+        if should_pause is None:
+            should_pause = lambda: not _cli_throttle.is_chat_idle()  # noqa: E731
+
         for memory in candidates:
-            # Yield gate: stop if chat is not idle (a reply in flight, or the
-            # shared lull hasn't elapsed) so the CLI is free.  The cursor is
-            # preserved — the next supervisor pass resumes from here.
-            if not _cli_throttle.is_chat_idle():
+            # Yield gate (INC-10 between-items hook): stop if the caller says
+            # pause (chat active again, or — via the supervisor's hook — a
+            # heartbeat just ran) so the CLI is free.  The cursor is already
+            # saved as of the last completed memory (state below is the last
+            # `_save_state` write) — RETURN here, not `break`: falling through
+            # to the post-loop "mark complete" code below would wrongly stamp
+            # status="complete" while candidates this run never reached are
+            # still untagged (the exact bug INC-10's crash/pause-resume proof
+            # would catch — a paused run must stay status="running" so the
+            # next pass resumes it, never silently skip the rest forever).
+            if should_pause():
                 logger.info(
-                    "emotion_backfill: yielding — chat not idle; "
+                    "emotion_backfill: yielding — should_pause; "
                     "will resume when idle"
                 )
-                break
+                if paused_out is not None:
+                    paused_out.append(True)
+                return state
 
             # Global concurrency cap: only one background CLI consumer at a time.
             # Wraps budget-check + Haiku call + write-back so the slot is held for

@@ -719,6 +719,8 @@ def label_calibration_sample(
     judge: RelevanceJudgeProvider | None = None,
     sample_rows: int | None = None,
     full_model_dir: str | None = None,
+    should_pause: Callable[[], bool] | None = None,
+    progress_out: dict[str, bool] | None = None,
 ) -> int:
     """Label a SAMPLE of unlabeled `calibration_log` rows: the local judge
     (`judge`, or the real `build_judge_provider()` if not injected) scores
@@ -759,6 +761,16 @@ def label_calibration_sample(
       - a Haiku failure -> handled inside `_make_haiku_tiebreak` itself
         (returns None, not an exception) — never reaches this function's
         try/except at all.
+
+    ``should_pause`` (ram-spike-fix INC-10, S14/S31/S41/S65): checked after
+    each row is written, before the next one starts — the S32 table's item
+    unit for daily calibration is "one calibration_log row". When it fires
+    with rows still remaining, the loop stops there; `progress_out["paused"]`
+    (if a dict was passed) is set True so the caller can skip floor
+    derivation and report the tick as paused rather than completed. The
+    "already-labeled rows not re-labeled" resume guarantee (C8) needs no new
+    cursor: `store.sample_unlabeled_calibration_rows` only ever samples
+    `local_judge_label IS NULL` rows, so a labeled row is never re-sampled.
     """
     if sample_rows is None:
         sample_rows = tunables.get_tunable("calibration.judge_sample_rows", CALIBRATION_SAMPLE_ROWS)
@@ -847,4 +859,9 @@ def label_calibration_sample(
                 "calibration judge: row id=%s failed; leaving unlabeled for a later tick",
                 row.get("id"),
             )
+        if should_pause is not None and row is not rows[-1] and should_pause():
+            logger.info("calibration judge: pausing between rows for chat (INC-10)")
+            if progress_out is not None:
+                progress_out["paused"] = True
+            break
     return labeled

@@ -22,8 +22,10 @@ def test_run_compaction_tick_importable_and_callable():
     # Positional contract: (persona_dir, provider). The idle-gate added an optional
     # keyword-only ``is_session_busy`` (defaulted, so the tick stays importable and
     # callable without it — startup catch-up passes None).
-    assert params == ["persona_dir", "provider", "is_session_busy"], (
-        f"expected (persona_dir, provider, *, is_session_busy), got {params}"
+    # INC-10 (ram-spike-fix) adds keyword-only `should_pause` (between-items
+    # pause hook, default None => never pauses).
+    assert params == ["persona_dir", "provider", "is_session_busy", "should_pause"], (
+        f"expected (persona_dir, provider, *, is_session_busy, should_pause), got {params}"
     )
     busy = sig.parameters["is_session_busy"]
     assert busy.kind is inspect.Parameter.KEYWORD_ONLY

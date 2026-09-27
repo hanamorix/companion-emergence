@@ -20,6 +20,7 @@ Stage flow:
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -475,6 +476,8 @@ def snapshot_stale_sessions(
     hebbian: HebbianMatrix,
     provider: LLMProvider,
     config: dict | None = None,
+    should_pause: Callable[[], bool] | None = None,
+    paused_out: list[bool] | None = None,
 ) -> list[IngestReport]:
     """Iterate active sessions; snapshot any whose last turn is past silence_minutes.
 
@@ -490,6 +493,13 @@ def snapshot_stale_sessions(
     Per-session try/except so a single bad session (corrupt buffer,
     transient FS error) can't abort the whole sweep — mirrors the
     isolation in finalize_stale_sessions.
+
+    ``should_pause`` (INC-10, S14/S32/S41/S65): checked only after a session
+    was actually snapshotted (a skipped/fresh/ghost session isn't the S32
+    table's "one session" item). Progress is each session's own extraction
+    cursor (already persisted by ``extract_session_snapshot``), so resuming
+    just re-lists active sessions — a session already snapshotted this pass
+    is a no-op (nothing new past its cursor yet).
     """
     reports: list[IngestReport] = []
     for sid in list_active_sessions(persona_dir):
@@ -510,6 +520,13 @@ def snapshot_stale_sessions(
                     config=config,
                 )
                 reports.append(report)
+                if should_pause is not None and should_pause():
+                    logger.info(
+                        "snapshot_stale_sessions: pausing between sessions for chat (INC-10)"
+                    )
+                    if paused_out is not None:
+                        paused_out.append(True)
+                    return reports
         except Exception:
             logger.exception(
                 "snapshot_stale_sessions: per-session failure session=%s; "
@@ -527,6 +544,8 @@ def finalize_stale_sessions(
     hebbian: HebbianMatrix,
     provider: LLMProvider,
     config: dict | None = None,
+    should_pause: Callable[[], bool] | None = None,
+    paused_out: list[bool] | None = None,
 ) -> list[IngestReport]:
     """Iterate active sessions; finalize any whose last turn is past
     ``finalize_after_hours``.
@@ -605,6 +624,16 @@ def finalize_stale_sessions(
             report.deduped,
             report.errors,
         )
+        # INC-10 (S14/S32/S41/S65): item unit = one finalized session; checked
+        # only after a session was actually finalized (a skipped/too-fresh
+        # session isn't an "item"). Resuming re-lists active sessions and
+        # re-applies the same age gate, which is a no-op for a session this
+        # pass already finalized (its buffer's cursor already advanced).
+        if should_pause is not None and should_pause():
+            logger.info("finalize_stale_sessions: pausing between sessions for chat (INC-10)")
+            if paused_out is not None:
+                paused_out.append(True)
+            return reports
     return reports
 
 

@@ -144,13 +144,27 @@ def stubs(monkeypatch):
     monkeypatch.setattr(supervisor.cli_throttle, "background_slot", _granting_slot)
     monkeypatch.setattr(supervisor, "build_tier_provider", lambda *a, **k: FakeProvider())
     monkeypatch.setattr(pass2_queue, "queue_length", lambda _pd: 1 if work["pass2"] else 0)
-    monkeypatch.setattr(pass2_queue, "drain_all_locked", rec("pass2", 1))
+
+    def _pass2_drain(*_a, **_k):
+        # INC-10: _pass2_run now checks queue_length() AFTER draining to tell
+        # a real pause (items remain) from a full drain — simulate the queue
+        # actually emptying (one item, fully drained) so this stub's job
+        # reports COMPLETED like every other stubbed job here, not PAUSED.
+        order.append("pass2")
+        work["pass2"] = False
+        return 1
+
+    monkeypatch.setattr(pass2_queue, "drain_all_locked", _pass2_drain)
     monkeypatch.setattr(supervisor, "_snapshot_has_work", lambda _pd: work["session_snapshot_prune"])
     monkeypatch.setattr(supervisor, "snapshot_stale_sessions", rec("session_snapshot_prune", []))
     monkeypatch.setattr(
         supervisor, "_emotion_backfill_has_work", lambda _pd, **_k: work["emotion_backfill"]
     )
-    monkeypatch.setattr(supervisor, "_emotion_backfill_run", rec("emotion_backfill"))
+    # INC-10: _emotion_backfill_job reads .status off the return value to
+    # tell a real between-items pause ("running") from a finish.
+    monkeypatch.setattr(
+        supervisor, "_emotion_backfill_run", rec("emotion_backfill", SimpleNamespace(status="complete"))
+    )
     monkeypatch.setattr(
         supervisor, "_embedding_backfill_has_work_probe", lambda _s: work["embedding_backfill"]
     )
@@ -941,6 +955,14 @@ def test_c39_no_interval_job_runs_every_idle_pass_while_it_has_work(tmp_path, st
     assert stubs.order == [], "no work → does not run"
     stubs.work[name] = True
     _pass(persona_dir, jobs)
+    # INC-10: pass2's stub drain consumes its one simulated item (work[name]
+    # flips False, mirroring queue_length() actually reflecting the drain —
+    # see the `stubs` fixture's `_pass2_drain`), so a second pass needs a
+    # freshly "enqueued" item the same way production would have one queued
+    # again by the next idle lull. Every other no-interval job's has_work
+    # probe is untouched by its run stub, so re-arming here is a no-op for
+    # them (this line is required for pass2, harmless for the rest).
+    stubs.work[name] = True
     _pass(persona_dir, jobs)
     assert stubs.order == [name, name], "has work → runs at every idle pass"
     assert not (persona_dir / "cadence").exists(), "no cadence file (S53/S66)"
