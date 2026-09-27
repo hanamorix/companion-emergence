@@ -447,15 +447,53 @@ _FAKE_REPO_ID = "fake-org/fake-tiny-judge"
 _FAKE_REVISION = "0" * 40  # a real cache uses a 40-char commit sha; shape matters, value doesn't
 
 
-def _build_fake_hf_cache(base: Path, files: dict[str, bytes]) -> Path:
+def _build_fake_hf_cache(
+    base: Path,
+    files: dict[str, bytes],
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    symlinks_supported: bool = True,
+) -> Path:
     """Builds `<base>/models--fake-org--fake-tiny-judge/` with `files`
-    (name -> content) each written as a real blob + a real symlink into it
-    from the snapshot dir, plus the `trees/<rev>.json` manifest recording
-    each file's true size -- mirrors a real, complete huggingface_hub cache
-    entry for `_FAKE_REPO_ID`@`_FAKE_REVISION`. Returns `base` (the
-    `cache_dir` to pass to `_hf_cached`)."""
+    (name -> content), plus the `trees/<rev>.json` manifest recording each
+    file's true size -- mirrors a real, complete huggingface_hub cache entry
+    for `_FAKE_REPO_ID`@`_FAKE_REVISION`. Returns `base` (the `cache_dir` to
+    pass to `_hf_cached`).
+
+    Round-4 CI follow-up: a Windows CI run (`test_hf_cached_true_for_a_
+    genuinely_complete_cache`, run 36338443433) failed on this fixture when
+    it hand-built symlinks via a bare `Path.symlink_to(f"../../blobs/
+    {hash}")` -- a hardcoded POSIX-style relative target string, unlike
+    real huggingface_hub downloads, which compute the target via `os.path.
+    relpath` (OS-native separators) through its own `_create_symlink`.
+
+    Diagnosis (this round; round-4 cold code red-team, agentId
+    a11a9db91b4e12a93, correction on overclaiming): production `_hf_cached`
+    /`_snapshot_complete` were confirmed CORRECT against a REAL no-symlink
+    layout (forced via monkeypatching `are_symlinks_supported` on this
+    Linux dev machine and building it through huggingface_hub's own
+    `_create_symlink`, which moves the blob directly into the snapshot dir
+    and leaves `blobs/` empty for that file when symlinks aren't supported
+    -- confirmed by reading `file_download.py`'s `_create_symlink`,
+    `new_blob=True` branch). Given that, this was very likely a FIXTURE bug
+    rather than a production one -- but this is a THEORY, not a confirmed
+    root cause: no Windows machine was available to reproduce the exact
+    failure mechanism directly, so the hardcoded-POSIX-target explanation
+    is the most plausible account given what's readable from here, not a
+    verified fact. Fix regardless of the precise mechanism: build the
+    fixture through huggingface_hub's own `_create_symlink` instead of a
+    hand-rolled symlink, so its on-disk shape can never diverge from what a
+    real download produces on whatever platform is actually running --
+    including Windows CI, without needing a Windows machine to verify it
+    here. `symlinks_supported` forces which of `_create_symlink`'s two
+    branches (real symlink vs. move-the-blob-into-place) runs, via
+    monkeypatching `are_symlinks_supported`, so both real on-disk layouts
+    are exercised from any host, per the round-4 instruction to cover both
+    on Linux too."""
     import hashlib
     import json as _json
+
+    import huggingface_hub.file_download as _fd
 
     repo_dir = base / f"models--{_FAKE_REPO_ID.replace('/', '--')}"
     (repo_dir / "blobs").mkdir(parents=True)
@@ -464,11 +502,26 @@ def _build_fake_hf_cache(base: Path, files: dict[str, bytes]) -> Path:
     (repo_dir / "refs").mkdir(parents=True)
     (repo_dir / "refs" / "main").write_text(_FAKE_REVISION)
 
+    # round-4 red-team (nitpick, agentId a11a9db91b4e12a93): replacing
+    # `are_symlinks_supported` itself with a fixed-return lambda makes it
+    # never consult `_are_symlinks_supported_in_dir` at all, so there is no
+    # memoization dict left to clear -- test isolation here comes entirely
+    # from `monkeypatch`'s own automatic per-test teardown of the function
+    # replacement, not from touching that dict.
+    monkeypatch.setattr(_fd, "are_symlinks_supported", lambda cache_dir=None: symlinks_supported)
+
     manifest: dict[str, object] = {"format_version": 1, "files": {}}
     for name, content in files.items():
         blob_hash = hashlib.sha1(content).hexdigest()
-        (repo_dir / "blobs" / blob_hash).write_bytes(content)
-        (repo_dir / "snapshots" / _FAKE_REVISION / name).symlink_to(f"../../blobs/{blob_hash}")
+        blob_path = repo_dir / "blobs" / blob_hash
+        blob_path.write_bytes(content)
+        pointer_path = repo_dir / "snapshots" / _FAKE_REVISION / name
+        # new_blob=True matches every real first-time download (file_
+        # download.py:1264) -- on a symlink-supporting host this creates a
+        # real symlink (blob stays in blobs/); on a non-supporting host
+        # (the real Windows-without-Developer-Mode case) it MOVES the blob
+        # directly to `pointer_path`, leaving `blobs/` without that entry.
+        _fd._create_symlink(str(blob_path), str(pointer_path), new_blob=True)
         manifest["files"][name] = {"size": len(content), "blob_id": blob_hash}  # type: ignore[index]
 
     (repo_dir / "trees" / f"{_FAKE_REVISION}.json").write_text(_json.dumps(manifest))
@@ -478,15 +531,15 @@ def _build_fake_hf_cache(base: Path, files: dict[str, bytes]) -> Path:
 _FAKE_FILES = {"config.json": b'{"a": 1}', "model.safetensors": b"W" * 1000}
 
 
-def test_hf_cached_true_for_a_genuinely_complete_cache(tmp_path: Path) -> None:
+def test_hf_cached_true_for_a_genuinely_complete_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Sanity baseline: a real, complete fixture (every file present at its
     correct recorded size) must report cached — proves the completeness
     check doesn't just always say False."""
-    cache_dir = _build_fake_hf_cache(tmp_path, _FAKE_FILES)
+    cache_dir = _build_fake_hf_cache(tmp_path, _FAKE_FILES, monkeypatch)
     assert _hf_cached(_FAKE_REPO_ID, cache_dir) is True
 
 
-def test_hf_cached_false_for_a_missing_weights_file(tmp_path: Path) -> None:
+def test_hf_cached_false_for_a_missing_weights_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A fixture missing the weights file entirely (the symlink's target
     blob absent — what an interrupted download that never got past its
     first, smaller files leaves behind) must be reported NOT cached.
@@ -501,7 +554,7 @@ def test_hf_cached_false_for_a_missing_weights_file(tmp_path: Path) -> None:
     pass), not this round's fail-first — that's
     `test_hf_cached_false_for_a_truncated_weights_blob` below, the one shape
     `snapshot_download` itself does NOT detect."""
-    cache_dir = _build_fake_hf_cache(tmp_path, _FAKE_FILES)
+    cache_dir = _build_fake_hf_cache(tmp_path, _FAKE_FILES, monkeypatch)
     repo_dir = cache_dir / f"models--{_FAKE_REPO_ID.replace('/', '--')}"
     weights_blob = (repo_dir / "snapshots" / _FAKE_REVISION / "model.safetensors").resolve()
     weights_blob.unlink()  # leaves the snapshot symlink dangling — the missing-file case
@@ -509,7 +562,7 @@ def test_hf_cached_false_for_a_missing_weights_file(tmp_path: Path) -> None:
     assert _hf_cached(_FAKE_REPO_ID, cache_dir) is False
 
 
-def test_hf_cached_false_for_a_leftover_incomplete_blob(tmp_path: Path) -> None:
+def test_hf_cached_false_for_a_leftover_incomplete_blob(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The diagnosed CI failure shape: a process killed mid-download (the
     RSS test's 300s subprocess timeout) leaves a partial transfer as a
     `<hash>.incomplete` temp file in `blobs/`, WITHOUT ever creating the
@@ -523,7 +576,7 @@ def test_hf_cached_false_for_a_leftover_incomplete_blob(tmp_path: Path) -> None:
     — `snapshot_download` itself already detects the missing symlink target
     regardless of the stray `.incomplete` file's presence, so this is also
     a regression guard, not this round's fail-first."""
-    cache_dir = _build_fake_hf_cache(tmp_path, _FAKE_FILES)
+    cache_dir = _build_fake_hf_cache(tmp_path, _FAKE_FILES, monkeypatch)
     repo_dir = cache_dir / f"models--{_FAKE_REPO_ID.replace('/', '--')}"
     weights_blob = (repo_dir / "snapshots" / _FAKE_REVISION / "model.safetensors").resolve()
     weights_blob.unlink()
@@ -532,7 +585,7 @@ def test_hf_cached_false_for_a_leftover_incomplete_blob(tmp_path: Path) -> None:
     assert _hf_cached(_FAKE_REPO_ID, cache_dir) is False
 
 
-def test_hf_cached_false_for_a_truncated_weights_blob(tmp_path: Path) -> None:
+def test_hf_cached_false_for_a_truncated_weights_blob(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Round-3 CI follow-up (S19), the ROOT CAUSE this fix targets directly,
     and the ONE fixture `snapshot_download(local_files_only=True)` does NOT
     detect on its own (confirmed by direct execution — it resolves without
@@ -544,7 +597,7 @@ def test_hf_cached_false_for_a_truncated_weights_blob(tmp_path: Path) -> None:
     reported "cached" for a real `model.safetensors` truncated to 10MB —
     THIS is the failure this whole round-3 fix exists to close, and the one
     genuine fail-first among these five tests."""
-    cache_dir = _build_fake_hf_cache(tmp_path, _FAKE_FILES)
+    cache_dir = _build_fake_hf_cache(tmp_path, _FAKE_FILES, monkeypatch)
     repo_dir = cache_dir / f"models--{_FAKE_REPO_ID.replace('/', '--')}"
     weights_blob = (repo_dir / "snapshots" / _FAKE_REVISION / "model.safetensors").resolve()
     weights_blob.write_bytes(b"W" * 10)  # truncated: 10 bytes instead of the manifest's 1000
@@ -552,7 +605,7 @@ def test_hf_cached_false_for_a_truncated_weights_blob(tmp_path: Path) -> None:
     assert _hf_cached(_FAKE_REPO_ID, cache_dir) is False
 
 
-def test_hf_cached_true_when_manifest_missing_falls_back_to_existence_check(tmp_path: Path) -> None:
+def test_hf_cached_true_when_manifest_missing_falls_back_to_existence_check(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """If the `trees/<rev>.json` manifest is missing, size-completeness
     can't be proven -- falls back to trusting `snapshot_download`'s own
     resolution (True), NOT False.
@@ -568,11 +621,93 @@ def test_hf_cached_true_when_manifest_missing_falls_back_to_existence_check(tmp_
     for it) while every FRESH download still gets a manifest and the full
     size check (confirmed: every model this project currently caches has
     one)."""
-    cache_dir = _build_fake_hf_cache(tmp_path, _FAKE_FILES)
+    cache_dir = _build_fake_hf_cache(tmp_path, _FAKE_FILES, monkeypatch)
     repo_dir = cache_dir / f"models--{_FAKE_REPO_ID.replace('/', '--')}"
     (repo_dir / "trees" / f"{_FAKE_REVISION}.json").unlink()
 
     assert _hf_cached(_FAKE_REPO_ID, cache_dir) is True
+
+
+# ---------------------------------------------------------------------------
+# Round-4 CI follow-up: the SAME completeness checks, but forcing the
+# no-symlink cache layout (`symlinks_supported=False`) -- the real shape
+# `huggingface_hub` produces on a host without symlink privilege (most
+# commonly Windows without Developer Mode, per `are_symlinks_supported`'s
+# own docstring). Exercised here from Linux via monkeypatching, so this
+# doesn't depend on a Windows runner to catch a regression.
+# ---------------------------------------------------------------------------
+
+
+def test_hf_cached_true_for_a_complete_cache_without_symlink_support(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A genuinely complete cache built the way a real no-symlink-support
+    host lays it out (real files directly under `snapshots/<rev>/`,
+    `blobs/` left empty for those files — confirmed by reading
+    `huggingface_hub.file_download._create_symlink`'s `new_blob=True`
+    fallback branch, which `shutil.move`s the blob into the snapshot
+    pointer path) must still report cached. `_snapshot_complete` stats
+    `snapshot_dir / rel_path` directly, which works identically whether
+    that path is a symlink or a real file, so this is expected to pass —
+    this test exists to PROVE that, not merely assert it from reading the
+    code (the round-4 diagnosis this test backs: the earlier Windows CI
+    failure was the test fixture's own POSIX-hardcoded symlink target, not
+    this underlying mechanism)."""
+    cache_dir = _build_fake_hf_cache(tmp_path, _FAKE_FILES, monkeypatch, symlinks_supported=False)
+    repo_dir = cache_dir / f"models--{_FAKE_REPO_ID.replace('/', '--')}"
+    weights_path = repo_dir / "snapshots" / _FAKE_REVISION / "model.safetensors"
+    assert not weights_path.is_symlink(), "sanity: no-symlink layout must place a REAL file here"
+    assert list((repo_dir / "blobs").iterdir()) == [], (
+        "sanity: no-symlink layout moves the blob into the snapshot dir, leaving blobs/ empty"
+    )
+
+    assert _hf_cached(_FAKE_REPO_ID, cache_dir) is True
+
+
+def test_hf_cached_false_for_a_truncated_weights_blob_without_symlink_support(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The truncated-blob bite (`test_hf_cached_false_for_a_truncated_
+    weights_blob`), re-run against the no-symlink layout: since there is no
+    `blobs/` indirection to truncate, this truncates the REAL file sitting
+    directly at the snapshot pointer path instead. Must still be reported
+    NOT cached — the size check must not silently rely on the symlink-based
+    layout to work."""
+    cache_dir = _build_fake_hf_cache(tmp_path, _FAKE_FILES, monkeypatch, symlinks_supported=False)
+    repo_dir = cache_dir / f"models--{_FAKE_REPO_ID.replace('/', '--')}"
+    weights_path = repo_dir / "snapshots" / _FAKE_REVISION / "model.safetensors"
+    assert not weights_path.is_symlink()
+    weights_path.write_bytes(b"W" * 10)  # truncated: 10 bytes instead of the manifest's 1000
+
+    assert _hf_cached(_FAKE_REPO_ID, cache_dir) is False
+
+
+def test_hf_cached_false_for_a_missing_weights_file_without_symlink_support(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The missing-file case, re-run against the no-symlink layout: delete
+    the real file directly (there is no separate blob to unlink and leave a
+    dangling pointer — the pointer IS the file). Must be reported NOT
+    cached.
+
+    CORRECTION (round-4 cold code red-team, agentId a11a9db91b4e12a93,
+    MINOR): like its symlink-layout sibling
+    (`test_hf_cached_false_for_a_missing_weights_file`), this is a
+    REGRESSION GUARD, not a test of the new `_snapshot_complete` size-check
+    path — confirmed by direct execution that `snapshot_download(local_
+    files_only=True)` itself already raises `LocalEntryNotFoundError` for a
+    missing file under the no-symlink layout too, before `_snapshot_
+    complete` is ever reached. The no-symlink layout's genuine `_snapshot_
+    complete` coverage is `test_hf_cached_false_for_a_truncated_weights_
+    blob_without_symlink_support` below (the one shape `snapshot_download`
+    does not detect on its own, in either layout)."""
+    cache_dir = _build_fake_hf_cache(tmp_path, _FAKE_FILES, monkeypatch, symlinks_supported=False)
+    repo_dir = cache_dir / f"models--{_FAKE_REPO_ID.replace('/', '--')}"
+    weights_path = repo_dir / "snapshots" / _FAKE_REVISION / "model.safetensors"
+    assert not weights_path.is_symlink()
+    weights_path.unlink()
+
+    assert _hf_cached(_FAKE_REPO_ID, cache_dir) is False
 
 
 # ---------------------------------------------------------------------------
