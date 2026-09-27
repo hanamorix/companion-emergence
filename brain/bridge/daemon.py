@@ -52,6 +52,21 @@ if _IS_WINDOWS:
 else:
     import fcntl
 
+# Windows only: the byte range msvcrt.locking() locks/unlocks. Windows
+# mandatory byte-range locking blocks ANY overlapping I/O from another
+# handle — including a plain read — not just writes (unlike POSIX flock,
+# which is advisory and never blocks a read). A far, fixed offset well
+# beyond the file's real (tiny) content means a normal whole-file read of
+# that real content (which ends long before this offset) never overlaps
+# the locked range, so the pid at offset 0 stays plainly readable while
+# the lock is held (C18c) — no special "read only this sub-region" contract
+# for readers, and the pid sits at the SAME offset on both platforms.
+# msvcrt.locking locks a real byte range via LockFileEx even when nothing
+# has ever been written there; it does not require file content to exist
+# at that offset, and an os.ftruncate() to a smaller size afterward does
+# not release or move the lock (the lock is independent of current EOF).
+_WINDOWS_LOCK_OFFSET = 1 << 20  # 1 MiB
+
 
 def run_recovery_if_needed(persona_dir: Path) -> int | None:
     """If previous bridge exited dirty, drain orphan buffers.
@@ -100,19 +115,18 @@ def acquire_lock(persona_dir: Path) -> int | None:
     live process holds the lock.
 
     The pid is written into the file for information only (S50) — never
-    read back to make a decision here. On Windows the single locked byte
-    sits at offset 0 (msvcrt.locking locks `nbytes` from the current file
-    position, and a locked region can't be read by another process — see
-    brain.utils.file_lock), so the pid is written starting at offset 1;
-    other processes can still read it there while the lock is held (C18c).
-    On POSIX flock is advisory over the whole file, so the pid goes at
-    offset 0 and stays readable throughout.
+    read back to make a decision here. It sits at offset 0 on BOTH
+    platforms: on Windows the locked byte range is at a far fixed offset
+    (`_WINDOWS_LOCK_OFFSET`, see its own comment) well past the file's real
+    content, so a plain whole-file read never overlaps it; on POSIX flock
+    is advisory over the whole file regardless, so a reader was never
+    blocked there either way.
     """
     path = persona_dir / LOCKFILE
     fd = os.open(str(path), os.O_CREAT | os.O_RDWR)
     try:
         if _IS_WINDOWS:
-            os.lseek(fd, 0, os.SEEK_SET)
+            os.lseek(fd, _WINDOWS_LOCK_OFFSET, os.SEEK_SET)
             msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
         else:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -121,15 +135,8 @@ def acquire_lock(persona_dir: Path) -> int | None:
         return None
 
     os.ftruncate(fd, 0)
-    pid_bytes = str(os.getpid()).encode()
-    if _IS_WINDOWS:
-        os.lseek(fd, 0, os.SEEK_SET)
-        os.write(fd, b"\x00")  # occupies the locked byte; unreadable while held
-        os.lseek(fd, 1, os.SEEK_SET)
-        os.write(fd, pid_bytes)
-    else:
-        os.lseek(fd, 0, os.SEEK_SET)
-        os.write(fd, pid_bytes)
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.write(fd, str(os.getpid()).encode())
     return fd
 
 
@@ -141,7 +148,7 @@ def release_lock(persona_dir: Path, fd: int) -> None:
     bridge lock on two different inodes."""
     try:
         if _IS_WINDOWS:
-            os.lseek(fd, 0, os.SEEK_SET)
+            os.lseek(fd, _WINDOWS_LOCK_OFFSET, os.SEEK_SET)
             msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
         else:
             fcntl.flock(fd, fcntl.LOCK_UN)
@@ -151,6 +158,31 @@ def release_lock(persona_dir: Path, fd: int) -> None:
         os.close(fd)
     except OSError:
         pass
+
+
+def _kill_if_alive(pid: int, sig: int) -> bool:
+    """``os.kill(pid, sig)``, tolerating "already dead" identically on both
+    platforms. Returns True if the pid was alive and got signaled, False if
+    it was already dead.
+
+    POSIX: a dead pid raises ``ProcessLookupError``. Windows: ``os.kill``'s
+    ``TerminateProcess``-based implementation instead raises a plain
+    ``OSError`` with ``winerror == 87`` (ERROR_INVALID_PARAMETER) for an
+    already-exited pid — a documented CPython-on-Windows quirk, NOT
+    ``ProcessLookupError`` — so it must be checked for explicitly rather
+    than assumed covered by the POSIX exception type. (CI 2026-09-26:
+    windows-latest hit exactly this, unhandled, inside cmd_start's
+    readiness-timeout orphan-kill path.)
+    """
+    try:
+        os.kill(pid, sig)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError as exc:
+        if _IS_WINDOWS and getattr(exc, "winerror", None) == 87:
+            return False
+        raise
 
 
 def spawn_detached(
@@ -287,10 +319,7 @@ def cmd_start(args, *, out: dict | None = None) -> int:
             except httpx.HTTPError:
                 continue
     # Readiness failed — kill the orphan child and tell the user where to look.
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass  # already dead
+    _kill_if_alive(pid, signal.SIGTERM)  # already-dead is fine either way
     print(
         f"bridge spawned (pid {pid}) but /health did not respond in 50s — "
         f"killed orphan child. Inspect log at {log_path}",
@@ -383,9 +412,7 @@ def cmd_stop(args) -> int:
                     "Recovery will snapshot active sessions non-destructively on next start.",
                     file=sys.stderr,
                 )
-                try:
-                    os.kill(s.pid, signal.SIGTERM)  # TerminateProcess on Windows — explicit, logged, dirty by design
-                except ProcessLookupError:
+                if not _kill_if_alive(s.pid, signal.SIGTERM):  # TerminateProcess on Windows — explicit, logged, dirty by design
                     print("bridge not running")
                     return 0
             else:
@@ -397,9 +424,7 @@ def cmd_stop(args) -> int:
                 return 1
         else:
             logger.warning("shutdown endpoint failed; falling back to SIGTERM on POSIX", exc_info=True)
-            try:
-                os.kill(s.pid, signal.SIGTERM)
-            except ProcessLookupError:
+            if not _kill_if_alive(s.pid, signal.SIGTERM):
                 print("bridge not running")
                 return 0
 

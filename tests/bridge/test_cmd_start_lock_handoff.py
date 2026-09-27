@@ -75,7 +75,22 @@ def test_c19a_two_cmd_starts_forced_into_handoff_window(tmp_path, monkeypatch):
     winning side's poll loop shares that same module-level clock and must
     not be corrupted) — bounded by a generous thread-join timeout below, so
     nothing is left running past this test.
+
+    Timing constants below are deliberately generous (real Windows CI, 2026-
+    09-26: this test's original 0.3s/2.0s margins were tight enough that
+    role-b's `cmd_start` sometimes hadn't resolved within 15s — Windows
+    process creation plus importing brain.bridge.runner's own dependency
+    chain in a fresh interpreter is meaningfully slower there than on
+    Linux/macOS). The delay differential (role-a's child sleeps far longer
+    than the inter-thread-start gap) is what actually proves the race, not
+    the absolute values, so widening both is free: it costs real wall time
+    only on the slow platform that needs it, and this test already pays a
+    genuine ~50s floor regardless (role-a's own `cmd_start` readiness
+    timeout), so a few more seconds of slack elsewhere is negligible by
+    comparison.
     """
+    handoff_gap_s = 1.5  # gap between starting role-a's and role-b's cmd_start
+    role_a_child_delay_s = 8.0  # role-a's child's startup-delay before it even tries the lock
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
     monkeypatch.setattr("brain.paths.get_persona_dir", lambda name: persona_dir)
@@ -113,7 +128,7 @@ def test_c19a_two_cmd_starts_forced_into_handoff_window(tmp_path, monkeypatch):
                 "--stop-file",
                 str(stop_file),
                 "--startup-delay",
-                "2.0" if delayed else "0.0",
+                str(role_a_child_delay_s) if delayed else "0.0",
                 "--write-state-port",
                 "51900" if origin == "role-a" else "51901",
             ]
@@ -142,12 +157,14 @@ def test_c19a_two_cmd_starts_forced_into_handoff_window(tmp_path, monkeypatch):
         # released its own pre-flight hold before spawning), and its
         # non-delayed child reaches the real lock first and wins.
         t_a.start()
-        time.sleep(0.3)
+        time.sleep(handoff_gap_s)
         t_b.start()
 
         # role-b's cmd_start should resolve fast (its child wins the race
-        # and writes a matching state_file almost immediately).
-        t_b.join(timeout=15.0)
+        # and writes a matching state_file almost immediately) — generous
+        # bound for slow Windows process/import startup, not because this
+        # side is expected to actually take that long.
+        t_b.join(timeout=30.0)
         assert not t_b.is_alive(), "role-b's cmd_start should have returned quickly"
         assert results["role-b"] == 0
 
@@ -159,24 +176,26 @@ def test_c19a_two_cmd_starts_forced_into_handoff_window(tmp_path, monkeypatch):
         inode_while_held = lock_path.stat().st_ino
 
         # Wait for role-a's DELAYED child to finish its own attempt (its
-        # 2.0s startup delay, then a real acquire_lock against the winner
-        # STILL holding the lock at this point — stop_file is not written
-        # until after this) before releasing the winner. If the winner were
-        # released first, role-a's late child would find the lock free and
-        # win trivially, proving nothing about the actual race.
-        assert launched["role-a"].wait(timeout=10.0) == 2
+        # role_a_child_delay_s startup delay, then a real acquire_lock
+        # against the winner STILL holding the lock at this point —
+        # stop_file is not written until after this) before releasing the
+        # winner. If the winner were released first, role-a's late child
+        # would find the lock free and win trivially, proving nothing about
+        # the actual race.
+        assert launched["role-a"].wait(timeout=role_a_child_delay_s + 20.0) == 2
         assert not loser_marker.exists()
 
         # Now release the winner so its cmd_start's spawned child (still
         # parked in the stub) can exit cleanly.
         stop_file.write_text("go", encoding="utf-8")
-        assert launched["role-b"].wait(timeout=15.0) == 0
+        assert launched["role-b"].wait(timeout=30.0) == 0
 
         # role-a's cmd_start is still spinning its genuine ~50s readiness
         # poll waiting for a state_file match that will never come (its own
         # child already lost and exited above) — bounded here rather than
-        # mocked (see docstring).
-        t_a.join(timeout=65.0)
+        # mocked (see docstring). Generous margin above the fixed ~50s floor
+        # for slow-Windows overhead on top of it.
+        t_a.join(timeout=90.0)
         assert not t_a.is_alive(), "role-a's cmd_start must give up within its own ~50s deadline"
         assert results["role-a"] == 1  # readiness timeout -> orphan-kill path
 

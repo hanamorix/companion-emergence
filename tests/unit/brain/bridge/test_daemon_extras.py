@@ -792,11 +792,14 @@ def test_acquire_lock_c18c_pid_readable_by_another_reader_while_held(
 ) -> None:
     """C18(c): while a bridge holds the lock, a second process can still read
     the pid from the lock file. On POSIX the pid sits at offset 0 (flock is
-    advisory; reads are never blocked). On Windows the locked byte is at
-    offset 0 and the pid is written starting at offset 1 specifically so it
-    stays readable — this assertion is offset-agnostic (it just looks for
-    the pid's digits anywhere in the file) so it holds unmodified on a real
-    Windows CI runner too."""
+    advisory; reads are never blocked). On Windows the pid ALSO sits at
+    offset 0 — the locked byte is at a far offset instead (see
+    `_WINDOWS_LOCK_OFFSET`'s own comment: an earlier layout locked byte 0
+    and pushed the pid to offset 1, which windows-latest CI caught as a
+    real `PermissionError` here, since a whole-file read still overlaps a
+    locked byte 0 even though the pid itself sat past it) — this assertion
+    is offset-agnostic (it just looks for the pid's digits anywhere in the
+    file) so it holds unmodified on a real Windows CI runner too."""
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
     fd = daemon.acquire_lock(persona_dir)
@@ -1751,6 +1754,223 @@ def test_c14_fcntl_and_msvcrt_imports_are_platform_gated() -> None:
     all_hits = touched_module_names([tree])
     assert all_hits.count("fcntl") == 1, "fcntl must be imported at exactly one (gated) site"
     assert all_hits.count("msvcrt") == 1, "msvcrt must be imported at exactly one (gated) site"
+
+
+# ---------- Windows CI regression, 2026-09-26: pid readability + os.kill quirk ----------
+#
+# windows-latest CI (run 36285257761 @ ff16de6c) failed on:
+#  1/2. test_acquire_lock_c18c_pid_readable_by_another_reader_while_held and
+#       test_acquire_lock_content_is_irrelevant_only_the_os_lock_matters:
+#       PermissionError [Errno 13] reading the lock file while held. Windows
+#       byte-range locking blocks ANY overlapping I/O from another handle —
+#       including reads — unlike POSIX flock (advisory, never blocks a
+#       read). The old layout locked byte 0 and put the pid at offset 1; a
+#       whole-file read from offset 0 overlaps the locked byte and fails as
+#       a whole, even though the pid itself (offset 1+) was never actually
+#       locked. Fixed by locking a FAR, fixed offset (_WINDOWS_LOCK_OFFSET,
+#       1 MiB) instead — the file's real (tiny) content never reaches that
+#       far, so a plain whole-file read no longer overlaps the lock at all,
+#       and the pid can go back to offset 0 on both platforms symmetrically.
+#  3.   test_c19a_two_cmd_starts_forced_into_handoff_window: an unhandled
+#       thread exception from cmd_start's readiness-timeout orphan-kill path
+#       — os.kill(pid, SIGTERM) on an already-exited pid raises a plain
+#       OSError with winerror 87 on Windows (not ProcessLookupError, which
+#       is what the code only caught). Fixed with the shared
+#       _kill_if_alive() helper above cmd_start/cmd_stop.
+#
+# No Windows host is available here; the tests below exercise the Windows
+# code paths structurally by monkeypatching `daemon._IS_WINDOWS` and a fake
+# msvcrt module standing in for the real one (which only exists on real
+# Windows) — real CI verification is still required and is out of this
+# run's reach.
+
+
+class _FakeMsvcrt:
+    """Stands in for the real (Windows-only) msvcrt module so the Windows
+    branch of acquire_lock/release_lock can be exercised on any platform.
+    Records the REAL fd position (queried via a real os.lseek(fd, 0,
+    SEEK_CUR), which does not move it) at the moment `locking()` is called
+    — this is the actual position the production code's own real
+    `os.lseek(fd, _WINDOWS_LOCK_OFFSET, ...)` call left the fd at, so this
+    genuinely proves which offset the lock call targeted, not merely what
+    the fake was told to expect."""
+
+    LK_NBLCK = 2
+    LK_UNLCK = 0
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, int, int]] = []  # (mode, fd_position_at_call, nbytes)
+
+    def locking(self, fd: int, mode: int, nbytes: int) -> None:
+        pos = os.lseek(fd, 0, os.SEEK_CUR)
+        self.calls.append((mode, pos, nbytes))
+
+
+def test_acquire_lock_windows_path_locks_far_offset_pid_stays_at_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows-path structural regression test for CI failures 1/2 above:
+    the lock call must target `_WINDOWS_LOCK_OFFSET`, NOT offset 0 — and the
+    pid must land at real offset 0 in the file regardless, so a plain
+    whole-file read (what the failing tests do) never overlaps the lock."""
+    fake = _FakeMsvcrt()
+    monkeypatch.setattr(daemon, "_IS_WINDOWS", True)
+    monkeypatch.setattr(daemon, "msvcrt", fake, raising=False)
+
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    lock_path = persona_dir / daemon.LOCKFILE
+
+    fd = daemon.acquire_lock(persona_dir)
+    assert fd is not None
+    try:
+        assert len(fake.calls) == 1
+        mode, pos, nbytes = fake.calls[0]
+        assert mode == fake.LK_NBLCK
+        assert nbytes == 1
+        assert pos == daemon._WINDOWS_LOCK_OFFSET, (
+            "the lock call must target the far offset, not offset 0 — "
+            "locking offset 0 is exactly what made a plain read fail on "
+            "real Windows CI"
+        )
+        # The pid itself must be readable via a plain whole-file read —
+        # this is what PermissionError'd on real Windows before the fix.
+        raw = lock_path.read_bytes()
+        assert raw == str(os.getpid()).encode()
+    finally:
+        daemon.release_lock(persona_dir, fd)
+
+    assert len(fake.calls) == 2
+    unlock_mode, unlock_pos, unlock_nbytes = fake.calls[1]
+    assert unlock_mode == fake.LK_UNLCK
+    assert unlock_nbytes == 1
+    assert unlock_pos == daemon._WINDOWS_LOCK_OFFSET
+
+
+def test_kill_if_alive_signals_a_live_pid(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(daemon.os, "kill", lambda pid, sig: calls.append((pid, sig)))
+    assert daemon._kill_if_alive(4242, 15) is True
+    assert calls == [(4242, 15)]
+
+
+def test_kill_if_alive_posix_dead_pid_returns_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    """POSIX: ProcessLookupError -> False, swallowed, no raise."""
+
+    def fake_kill(pid, sig):
+        raise ProcessLookupError()
+
+    monkeypatch.setattr(daemon.os, "kill", fake_kill)
+    assert daemon._kill_if_alive(12345, 15) is False
+
+
+def test_kill_if_alive_windows_already_dead_pid_returns_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression test for CI failure 3 above: on Windows, os.kill on an
+    already-exited pid raises a plain OSError with winerror 87 — NOT
+    ProcessLookupError. Must be swallowed (return False), not left to crash
+    the caller (which is what happened, unhandled, inside a background
+    thread in test_c19a_two_cmd_starts_forced_into_handoff_window on real
+    windows-latest CI)."""
+    monkeypatch.setattr(daemon, "_IS_WINDOWS", True)
+
+    def fake_kill(pid, sig):
+        err = OSError("The parameter is incorrect")
+        err.winerror = 87
+        raise err
+
+    monkeypatch.setattr(daemon.os, "kill", fake_kill)
+    assert daemon._kill_if_alive(99999, 15) is False
+
+
+def test_kill_if_alive_windows_other_oserror_still_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only winerror 87 (already-dead) is swallowed on Windows — any other
+    OSError from os.kill is a real failure and must propagate."""
+    monkeypatch.setattr(daemon, "_IS_WINDOWS", True)
+
+    def fake_kill(pid, sig):
+        err = OSError("access is denied")
+        err.winerror = 5
+        raise err
+
+    monkeypatch.setattr(daemon.os, "kill", fake_kill)
+    with pytest.raises(OSError):
+        daemon._kill_if_alive(99999, 15)
+
+
+def test_kill_if_alive_posix_unrelated_oserror_still_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On POSIX (_IS_WINDOWS False), an OSError that happens to carry a
+    winerror-87-shaped attribute (which would never occur for real on
+    POSIX) must NOT be swallowed — the Windows-specific tolerance is gated
+    on platform, not merely on the attribute's value."""
+    assert daemon._IS_WINDOWS is False
+
+    def fake_kill(pid, sig):
+        err = OSError("some other real POSIX error")
+        err.winerror = 87  # contrived: would never happen for real on POSIX
+        raise err
+
+    monkeypatch.setattr(daemon.os, "kill", fake_kill)
+    with pytest.raises(OSError):
+        daemon._kill_if_alive(99999, 15)
+
+
+def test_cmd_start_kills_orphan_via_shared_helper_tolerating_windows_already_dead(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """End-to-end regression for CI failure 3: cmd_start's own readiness-
+    timeout orphan-kill path must not crash even when the orphan pid has
+    already exited AND we're on the Windows os.kill-quirk path."""
+    import httpx
+
+    from brain.bridge import state_file
+
+    _patch_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(state_file, "is_running", lambda _p: False)
+    monkeypatch.setattr(daemon, "run_recovery_if_needed", lambda _p: None)
+    monkeypatch.setattr(daemon, "_IS_WINDOWS", True)
+    # cmd_start's own pre-flight acquire_lock also takes the (now Windows-
+    # shaped) branch; stand in for the real (POSIX-only-here) msvcrt module
+    # so that real call succeeds structurally, same as the dedicated lock
+    # test above — this test is specifically about the os.kill quirk, not
+    # the lock mechanism itself.
+    monkeypatch.setattr(daemon, "msvcrt", _FakeMsvcrt(), raising=False)
+
+    orphan_pid = 424242
+
+    def fake_spawn(persona_dir_arg, idle, client_origin, log_path):
+        state_file.write(
+            persona_dir_arg,
+            state_file.BridgeState(
+                persona="nell", pid=orphan_pid, port=51999,
+                started_at="2026-05-08T00:00:00+00:00", stopped_at=None,
+                shutdown_clean=False, client_origin=client_origin,
+            ),
+        )
+        return orphan_pid
+
+    monkeypatch.setattr(daemon, "spawn_detached", fake_spawn)
+
+    def fake_get(*a, **kw):
+        raise httpx.ConnectError("refused")
+
+    monkeypatch.setattr("httpx.get", fake_get)
+    monkeypatch.setattr("brain.bridge.daemon.time.sleep", lambda _s: None)
+    fake_now = iter([0.0, 1.0, 2.0, 51.0])
+    monkeypatch.setattr("brain.bridge.daemon.time.time", lambda: next(fake_now))
+
+    def fake_kill(pid, sig):
+        err = OSError("The parameter is incorrect")
+        err.winerror = 87
+        raise err
+
+    monkeypatch.setattr(daemon.os, "kill", fake_kill)
+
+    rc = daemon.cmd_start(_args("nell"))  # must not raise
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "killed orphan child" in err
 
 
 def test_cmd_stop_on_windows_with_force_terminates(
