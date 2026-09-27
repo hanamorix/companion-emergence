@@ -294,7 +294,9 @@ Not yet verified (proved in the named slice):
    and `scripts/update.sh`'s bundled branch moved onto the overlay (via `nell update`) so it no
    longer rewrites the runtime. Closes #256 and #289.
 3. `brain-main.yml` (build, smoke, sign, self-verify, publish). Needs #291.
-4. Rust commands + ConnectionPanel + version-handshake change. Closes #286 (and #255).
+4. Rust commands + ConnectionPanel + version-handshake change, plus `nell paths overlay_dir` /
+   `overlay_active` and `/health.overlay` (deferred here from slice 2, where `nell update --status`
+   reports the same state). Closes #286 (and #255).
 
 **Deferred** (also recorded in `project_companion_emergence_deferred.md` and the next brainstorm):
 
@@ -307,6 +309,12 @@ Not yet verified (proved in the named slice):
 | ~~Moving `update.sh`'s bundled branch onto `nell update`~~ | **Moved into slice 2** (Hana, 2026-09-27): it is #289's root fix. | — |
 | Offline or delta updates; keeping more than two versions | Unneeded at ~8 MB overlays. | If overlays grow |
 | Linux real-machine run (Kubuntu validator) of Check → Update → Revert | No Linux host here. | Before promoting slice 4 out of EXPERIMENTAL |
+
+**Slice 2 additions (2026-09-27, from its final review):** the hook honours `KINDLED_NO_OVERLAY=1`
+(skip any overlay — the escape hatch for a main brain that starts but can't run `nell update
+--revert`; the hook is frozen per bundle, so it had to ship before the first release); overlay
+folders are `<commit[:12]>-<bundle_id[:8]>` and an install never renames or deletes a folder
+`current.json` names.
 
 **Out of scope:** updating the app shell (the signed Tauri updater keeps doing that); persona
 data changes beyond the tolerant-reader fix.
