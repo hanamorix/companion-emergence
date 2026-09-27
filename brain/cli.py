@@ -1770,13 +1770,14 @@ def _install_kind() -> str:
 
 def _update_handler(args: argparse.Namespace) -> int:
     from brain.update import install, overlay
+    from brain.update.overlay_hook import BUNDLE_ID_FILE
 
     root = overlay.overlay_root()
     kind = _install_kind()
     site = install.bundle_site_dir()
     if args.status:
         state = overlay.read_state(root)
-        print(json.dumps({"supported": kind == "bundled" and (site / "_ce_bundle_id").is_file(),
+        print(json.dumps({"supported": kind == "bundled" and (site / BUNDLE_ID_FILE).is_file(),
                           "install_kind": kind, **state}, indent=2))
         return 0
     try:

@@ -322,3 +322,16 @@ def test_unsafe_commit_labels_are_refused(tmp_path):
         with pytest.raises(install.UpdateError, match="unsafe commit"):
             install.apply_update(wheel=tmp_path / "x.whl", requirements=tmp_path / "r.txt", commit=bad,
                                  site_dir=tmp_path, root=tmp_path / "brain-overlay")
+
+
+def test_missing_requirements_file_is_an_update_error(tmp_path):
+    finds = tmp_path / "finds"
+    finds.mkdir()
+    brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
+    site = _fake_bundle(tmp_path, {})
+    root = tmp_path / "brain-overlay"
+    with pytest.raises(install.UpdateError, match="update failed"):
+        install.apply_update(wheel=brain_whl, requirements=tmp_path / "missing.txt", commit="a" * 40,
+                             site_dir=site, root=root, pip_extra=["--no-index", "--find-links", str(finds)])
+    assert overlay.read_state(root)["active"] is None
+    assert not [p for p in root.iterdir() if p.name.startswith(".staging-")]

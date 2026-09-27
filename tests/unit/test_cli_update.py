@@ -54,3 +54,19 @@ def test_bundled_update_failure_exits_1_and_says_why(tmp_path, monkeypatch, caps
     rc = cli.main(["update", "--wheel", str(tmp_path / "x.whl"),
                    "--requirements", str(tmp_path / "r.txt"), "--commit", "a" * 40])
     assert rc == 1 and "predates" in capsys.readouterr().err  # the dev venv has no _ce_bundle_id
+
+
+def test_cli_reports_a_missing_requirements_file_cleanly(tmp_path, monkeypatch, capsys):
+    from brain.update import install
+    from tests.unit.brain.update.test_install import BRAIN_OK, _fake_bundle, _wheel
+
+    monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "_install_kind", lambda: "bundled")
+    site = _fake_bundle(tmp_path, {})
+    monkeypatch.setattr(install, "bundle_site_dir", lambda: site)
+    brain_whl = _wheel(tmp_path, "companion-emergence", "9.9.9", BRAIN_OK)
+
+    rc = cli.main(["update", "--wheel", str(brain_whl),
+                   "--requirements", str(tmp_path / "missing.txt"), "--commit", "a" * 40])
+    assert rc == 1
+    assert "update failed" in capsys.readouterr().err
