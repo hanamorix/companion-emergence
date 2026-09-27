@@ -12,11 +12,15 @@
 #     overlay (bundles that support it) — build a wheel, then `nell update`
 #             installs it into the user-writable overlay next to the runtime.
 #             No runtime rewrite, no sudo, regardless of who owns the runtime.
-#     legacy  (older bundles, no overlay support — #289) — build a wheel from
-#             the source tree and install it (plus locked deps) straight into
-#             the runtime, mirroring app/build_python_runtime.sh steps 3-5.
-#             Keep the two in sync by hand; bash cannot share the recipe
-#             safely. May need sudo if the runtime isn't user-writable.
+#             The updater's own nell calls run on the release brain
+#             (KINDLED_NO_OVERLAY=1), so a broken overlay can still be replaced.
+#     legacy  (older bundles whose nell has no `update` command) — build a
+#             wheel from the source tree and install it (plus locked deps)
+#             straight into the runtime, mirroring app/build_python_runtime.sh
+#             steps 3-5. Keep the two in sync by hand; bash cannot share the
+#             recipe safely. May need sudo if the runtime isn't user-writable.
+#             Refused on a .deb's runtime (dpkg owns it — #289) and inside an
+#             AppImage: install the newer package instead.
 #
 # Windows: not supported (the bundled runtime ships no bash) — see #255.
 #
@@ -86,7 +90,10 @@ cd /
 PERSONA_ARGS=()
 [ -n "$PERSONA" ] && PERSONA_ARGS=(--persona "$PERSONA")
 
-nell_path() { "$NELL" paths "$1" "${PERSONA_ARGS[@]+"${PERSONA_ARGS[@]}"}"; }
+# The updater itself runs on the release brain (the floor): a broken overlay brain
+# must not break the tool that replaces it. Never for `supervisor start/restart`:
+# the bridge inherits the env and must come up on the new overlay.
+nell_path() { KINDLED_NO_OVERLAY=1 "$NELL" paths "$1" "${PERSONA_ARGS[@]+"${PERSONA_ARGS[@]}"}"; }
 
 # Ask the python that lives beside nell (both install kinds put python3 in the
 # same bin/) for the same two facts brain/cli.py derives: sys.prefix, and
@@ -98,7 +105,7 @@ probe_install() {
     src="$(readlink "$src")"
     case "$src" in /*) ;; *) src="$dir/$src";; esac
   done
-  "$(cd "$(dirname "$src")" && pwd)/python3" -c '
+  KINDLED_NO_OVERLAY=1 "$(cd "$(dirname "$src")" && pwd)/python3" -c '
 import pathlib, sys, brain
 pkg = pathlib.Path(brain.__file__).resolve().parent
 print(sys.prefix)
@@ -124,10 +131,21 @@ fi
 
 # Bundles with the overlay hook (#286 slice 2) update into the user-writable
 # overlay; older nells have no `update` command and keep the legacy path (#289).
+# Only a nell that has no `update` command at all takes the legacy path: any other
+# failure (a broken brain) must never fall back to rewriting the runtime.
 OVERLAY=0
 if [ "$INSTALL_KIND" = "bundled" ]; then
-  STATUS="$("$NELL" update --status 2>/dev/null || true)"
-  case "$STATUS" in *'"supported": true'*) OVERLAY=1;; esac
+  STATUS_RC=0
+  STATUS="$(KINDLED_NO_OVERLAY=1 "$NELL" update --status 2>&1)" || STATUS_RC=$?
+  case "$STATUS" in
+    *'"supported": true'*) OVERLAY=1;;
+    *"invalid choice: 'update'"*) ;;
+    *) if [ "$STATUS_RC" -ne 0 ]; then
+         echo "update.sh: \`nell update --status\` failed (exit $STATUS_RC); not falling back to rewriting the runtime:" >&2
+         echo "$STATUS" >&2
+         exit 1
+       fi;;
+  esac
 fi
 
 run() {
@@ -191,6 +209,10 @@ if [ "$OVERLAY" = 0 ]; then
         echo "update.sh: $INSTALL_ROOT is inside a running AppImage (a read-only mount); download the new AppImage instead." >&2
         exit 2;;
     esac
+    if command -v dpkg >/dev/null 2>&1 && dpkg -S "$INSTALL_ROOT" >/dev/null 2>&1; then
+      echo "update.sh: $INSTALL_ROOT belongs to a .deb package; rewriting it would mix files with dpkg (#289). Install the newer .deb instead — releases with overlay updates never write there." >&2
+      exit 2
+    fi
     if [ ! -w "$INSTALL_ROOT" ]; then
       # Only the writes into the runtime run as root (build + export stay the user's).
       # Absolute uv: sudo's secure_path drops ~/.local/bin, uv's default home. -H:
@@ -215,7 +237,7 @@ fi
 # ---- stop -------------------------------------------------------------------
 if [ "$RESTART" = 1 ]; then
   BRAIN_STOPPED=1   # before the call: a stop that times out (exit 1) may still take the bridge down
-  run "$NELL" supervisor stop "${PERSONA_ARGS[@]+"${PERSONA_ARGS[@]}"}"
+  run env KINDLED_NO_OVERLAY=1 "$NELL" supervisor stop "${PERSONA_ARGS[@]+"${PERSONA_ARGS[@]}"}"
 fi
 
 # ---- apply ------------------------------------------------------------------
@@ -232,7 +254,7 @@ else
     if [ -n "$(git -C "$SRC_TREE" status --porcelain 2>/dev/null)" ]; then
       COMMIT="$COMMIT-dirty-$(date +%Y%m%d%H%M%S)"
     fi
-    run sh -c "'$NELL' update --wheel \"\$(ls '$SRC_TREE'/dist/*.whl | head -n1)\" --requirements '$SRC_TREE/dist/requirements.txt' --commit '$COMMIT'"
+    run env KINDLED_NO_OVERLAY=1 sh -c "'$NELL' update --wheel \"\$(ls '$SRC_TREE'/dist/*.whl | head -n1)\" --requirements '$SRC_TREE/dist/requirements.txt' --commit '$COMMIT'"
   else
     PY_BIN="$INSTALL_ROOT/bin/python3"
     NELL_BIN="$INSTALL_ROOT/bin/nell"
