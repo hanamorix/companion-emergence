@@ -793,56 +793,12 @@ class MemoryStore:
         # Index on state — used by forgetting pass to find fading rows fast.
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_state ON memories(state)")
         self._conn.commit()
-        self._boot_fts_backstop()
-
-    def _boot_fts_backstop(self) -> None:
-        """FTS5 boot integrity-check → rebuild backstop.
-
-        Runs on EVERY constructor, including ``integrity_check=False`` ones
-        (the hot/feed paths): this FTS check is separate from the ``memories.db``
-        ``PRAGMA integrity_check`` gated by that flag — it is a cheap
-        FTS-internal consistency probe, not a full-DB scan, and must run so a
-        feed-path writer never operates against a stale/absent FTS index.
-
-        Rebuilds when the shadow index is corrupt (integrity-check raises) OR
-        empty against a pre-populated ``memories`` table — which covers both a
-        persona whose ``memories.db`` predates FTS (the table was just created
-        against existing rows) and a cleared/corrupted index (C2 self-heal).
-        Fail-soft: a rebuild failure logs and leaves the LIKE fallback usable.
-        """
-        try:
-            self._conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('integrity-check')")
-            healthy = True
-        except sqlite3.DatabaseError:
-            healthy = False
-        needs_rebuild = not healthy
-        if healthy:
-            try:
-                mem_rows = self._conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
-                # COUNT(*) on the FTS table itself reads the external CONTENT
-                # table, not the index — use the `_docsize` shadow table for the
-                # true count of INDEXED rows so an empty index against a
-                # populated `memories` (predates-FTS, or a cleared index) is
-                # detected.
-                fts_rows = self._conn.execute(
-                    "SELECT COUNT(*) FROM memories_fts_docsize"
-                ).fetchone()[0]
-                # mem_rows != fts_rows catches BOTH the empty-index case
-                # (predates-FTS / cleared → fts_rows==0) AND partial staleness
-                # (0 < fts_rows < mem_rows) at no extra cost (stage-6 minor).
-                needs_rebuild = mem_rows != fts_rows
-            except sqlite3.DatabaseError:
-                needs_rebuild = True
-        if needs_rebuild:
-            try:
-                self._conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
-            except sqlite3.DatabaseError as exc:
-                logger.warning("memories_fts rebuild failed; LIKE fallback in use: %s", exc)
-        # The 'integrity-check'/'rebuild' commands are INSERT statements, so
-        # sqlite3 opens an implicit write transaction. Commit it unconditionally
-        # (even the read-only integrity-check path) so no boot leaves a lock held
-        # against the other ~15 concurrent MemoryStore connections to this file.
-        self._conn.commit()
+        # FTS5 integrity-check/rebuild backstop (formerly `_boot_fts_backstop`,
+        # run unconditionally on EVERY open) has moved to a once-per-process
+        # check in `brain.memory.db_health.run_fts_health_check_once`, called
+        # explicitly by the bridge lifespan before the first store open
+        # (spec §6c, S60/S61/S74) — not from this constructor, so a per-turn
+        # `MemoryStore()` open never takes the write lock this check needs.
 
     def close(self) -> None:
         """Close the underlying connection. Safe to call multiple times."""

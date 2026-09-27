@@ -73,6 +73,7 @@ from brain.health.alarm import compute_pending_alarms
 from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
 from brain.health.walker import walk_persona
 from brain.ingest.buffer import _SESSION_ID_RE as _BUFFER_SESSION_ID_RE
+from brain.memory.db_health import run_fts_health_check_once
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.persona_config import PersonaConfig
@@ -931,6 +932,21 @@ def build_app(
             maybe_write_pronoun_nudge(persona_dir, companion_name=persona_dir.name)
         except Exception as _exc:  # noqa: BLE001 — startup must not break on the nudge
             logger.warning("pronoun nudge check failed: %s", _exc)
+
+        # FTS5 health check (spec §6c, S60/S61/S62/S74): the bridge's first
+        # memories.db action, before any MemoryStore is opened for this
+        # persona — runs at most once per process per resolved db path, logs
+        # any non-healthy result, and rebuilds only on real corruption (never
+        # on a lock timeout). The per-turn MCP child, CLI commands,
+        # `nell chat --no-bridge` and cmd_start's recovery never call this.
+        # Fail-soft like every other non-essential step in this function
+        # (write_defaults_section, the last_opened_at touch, the pronoun
+        # nudge above/below): a bug in this brand-new module must never be
+        # the reason a bridge fails to start (code-red-team pass 1, M1).
+        try:
+            run_fts_health_check_once(persona_dir / "memories.db")
+        except Exception as _exc:  # noqa: BLE001
+            logger.warning("FTS health check skipped: %s", _exc)
 
         # Load the persona emotion vocabulary before any chat request can arrive.
         # Without this, aggregate_state silently drops all persona-extension
