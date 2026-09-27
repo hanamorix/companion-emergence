@@ -132,6 +132,20 @@ def test_failed_smoke_leaves_the_active_overlay_untouched(tmp_path):
     assert not [p for p in root.iterdir() if p.name.startswith(".staging-")]
 
 
+def test_smoke_runs_the_new_folder_on_the_bundle_alone(tmp_path, monkeypatch):
+    """#303: the smoke interpreter must see what the new overlay will see once active —
+    the new folder, then the bundle — not the new folder stacked on the currently
+    active overlay (which the hook would load at interpreter start)."""
+    monkeypatch.delenv("KINDLED_NO_OVERLAY", raising=False)
+    folder = tmp_path / "new"
+    (folder / "brain").mkdir(parents=True)
+    (folder / "brain" / "__init__.py").write_text("", encoding="utf-8")
+    (folder / "hook_off.py").write_text(
+        "import os\nassert os.environ.get('KINDLED_NO_OVERLAY') == '1', 'the active overlay would load'\n",
+        encoding="utf-8")
+    install._smoke(folder, ["hook_off"])
+
+
 def test_hash_mismatch_fails_before_activation(tmp_path):
     finds = tmp_path / "finds"
     finds.mkdir()

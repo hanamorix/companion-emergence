@@ -114,8 +114,11 @@ def _smoke(folder: Path, modules: Sequence[str]) -> None:
         "for m in sys.argv[2:]: importlib.import_module(m)\n"
         "import os; assert os.path.realpath(brain.__file__).startswith(os.path.realpath(sys.argv[1])), brain.__file__\n"
     )
+    # KINDLED_NO_OVERLAY: new folder + bundle only, as it will run once active — not
+    # stacked on the currently active overlay the hook would load (#303).
     r = subprocess.run([sys.executable, "-P", "-c", code, str(folder), *modules],
-                       capture_output=True, text=True, encoding="utf-8")
+                       capture_output=True, text=True, encoding="utf-8",
+                       env={**os.environ, "KINDLED_NO_OVERLAY": "1"})
     if r.returncode != 0:
         raise UpdateError(f"the new brain does not load on this machine: {(r.stderr or r.stdout)[-2000:]}")
 
