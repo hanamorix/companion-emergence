@@ -1,0 +1,164 @@
+"""Install a newer brain into the overlay (#286 §3.3).
+
+Only packages whose locked version differs from the bundle's own dist-info
+records are installed (the rest come from the bundle), plus the brain wheel.
+pip runs straight from ensurepip's bundled wheel — the bundle has no pip and is
+never written to. Staging → import smoke → atomic swap; any failure leaves
+current.json untouched.
+"""
+
+from __future__ import annotations
+
+import importlib.metadata as md
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import sysconfig
+from collections.abc import Sequence
+from pathlib import Path
+from typing import NamedTuple
+
+from brain.update import overlay
+from brain.update.overlay_hook import BUNDLE_ID_FILE
+
+TORCH_CPU_INDEX = "https://download.pytorch.org/whl/cpu"  # == pyproject's pytorch-cpu index (drift test)
+NEVER_INSTALL = frozenset({"pip", "setuptools", "wheel"})  # the build strips them on purpose
+SMOKE_MODULES = ("brain.cli", "brain.bridge.server", "brain.chat.engine")
+
+_PIN = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;\\]+)")
+_SAFE_COMMIT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+class UpdateError(RuntimeError):
+    """The update did not install; the active overlay is unchanged."""
+
+
+class Requirement(NamedTuple):
+    name: str
+    version: str
+    block: str
+
+
+def _norm(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def parse_requirements(text: str) -> tuple[list[str], list[Requirement]]:
+    options: list[str] = []
+    reqs: list[Requirement] = []
+    current: list[str] | None = None
+    head: re.Match | None = None
+
+    def close():
+        if current is not None and head is not None:
+            reqs.append(Requirement(_norm(head.group(1)), head.group(2), "\n".join(current) + "\n"))
+
+    for line in text.splitlines():
+        if line[:1].isspace() and current is not None:
+            current.append(line)
+            continue
+        close()
+        current, head = None, None
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("-"):
+            options.append(stripped)
+            continue
+        m = _PIN.match(stripped)
+        if m:
+            current, head = [line], m
+    close()
+    return options, reqs
+
+
+def installed_versions(site_dir: Path) -> dict[str, str]:
+    return {_norm(d.metadata["Name"]): d.version for d in md.distributions(path=[str(site_dir)])}
+
+
+def diff_requirements(reqs: list[Requirement], installed: dict[str, str]) -> list[Requirement]:
+    return [r for r in reqs if r.name not in NEVER_INSTALL and installed.get(r.name) != r.version]
+
+
+def bundle_site_dir() -> Path:
+    return Path(sysconfig.get_paths()["purelib"])
+
+
+def _pip() -> list[str]:
+    import ensurepip
+
+    wheel = next(Path(ensurepip.__file__).parent.glob("_bundled/pip-*.whl"), None)
+    if wheel is None:
+        raise UpdateError("this Python has no ensurepip pip wheel")
+    return [sys.executable, "-P", str(wheel / "pip"), "install", "--quiet",
+            "--disable-pip-version-check", "--no-input", "--no-deps"]
+
+
+def _run(cmd: list[str]) -> None:
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+    if r.returncode != 0:
+        raise UpdateError(f"pip failed ({r.returncode}): {(r.stderr or r.stdout)[-2000:]}")
+
+
+def _smoke(folder: Path, modules: Sequence[str]) -> None:
+    code = (
+        "import sys; sys.path.insert(0, sys.argv[1]); import importlib, brain\n"
+        "for m in sys.argv[2:]: importlib.import_module(m)\n"
+        "import os; assert os.path.realpath(brain.__file__).startswith(os.path.realpath(sys.argv[1])), brain.__file__\n"
+    )
+    r = subprocess.run([sys.executable, "-P", "-c", code, str(folder), *modules],
+                       capture_output=True, text=True, encoding="utf-8")
+    if r.returncode != 0:
+        raise UpdateError(f"the new brain does not load on this machine: {(r.stderr or r.stdout)[-2000:]}")
+
+
+def apply_update(*, wheel: Path, requirements: Path, commit: str, site_dir: Path, root: Path,
+                 pip_extra: Sequence[str] = (), smoke_modules: Sequence[str] = SMOKE_MODULES) -> dict:
+    if not _SAFE_COMMIT.fullmatch(commit or ""):
+        raise UpdateError(f"refusing unsafe commit label {commit!r}")
+    wheel, requirements, site_dir = Path(wheel), Path(requirements), Path(site_dir)
+    try:
+        bundle_id = (site_dir / BUNDLE_ID_FILE).read_text(encoding="utf-8").strip()
+    except OSError:
+        raise UpdateError("this install predates overlay updates; update the app first") from None
+    parts = wheel.name.split("-")
+    if len(parts) < 2 or not wheel.is_file():
+        raise UpdateError(f"not a wheel: {wheel}")
+    entry = {"dir": commit[:12], "commit": commit, "brain_version": parts[1], "bundle_id": bundle_id}
+    with overlay.overlay_lock(root):
+        target = root / entry["dir"]
+        try:
+            stamp = json.loads((target / "stamp.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            stamp = {}
+        if not (isinstance(stamp, dict) and stamp.get("commit") == commit
+                and stamp.get("bundle_id") == bundle_id):
+            staging = root / f".staging-{entry['dir']}-{os.getpid()}"
+            shutil.rmtree(staging, ignore_errors=True)
+            staging.mkdir(parents=True)
+            try:
+                options, reqs = parse_requirements(requirements.read_text(encoding="utf-8"))
+                todo = diff_requirements(reqs, installed_versions(site_dir))
+                if todo:
+                    diff_file = staging.parent / f"{staging.name}.req.txt"
+                    diff_file.write_text("\n".join(options) + "\n" + "".join(r.block for r in todo),
+                                         encoding="utf-8")
+                    try:
+                        _run([*_pip(), "--require-hashes", "--extra-index-url", TORCH_CPU_INDEX,
+                              "--target", str(staging), *pip_extra, "-r", str(diff_file)])
+                    finally:
+                        diff_file.unlink(missing_ok=True)
+                _run([*_pip(), "--target", str(staging), *pip_extra, str(wheel)])
+                _smoke(staging, smoke_modules)
+                (staging / "stamp.json").write_text(json.dumps(entry, indent=2), encoding="utf-8")
+                shutil.rmtree(target, ignore_errors=True)
+                os.replace(staging, target)
+            except BaseException:
+                shutil.rmtree(staging, ignore_errors=True)
+                raise
+        overlay.activate(root, entry)
+        overlay.prune(root)
+    return entry

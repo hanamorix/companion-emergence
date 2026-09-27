@@ -39,3 +39,9 @@ def test_hashed_install_names_the_torch_index(script):
         # PyTorch's index also lists common packages (certifi) at older versions;
         # first-index would pin those to it and fail. Safe: every file is hash-pinned.
         assert "--index-strategy unsafe-best-match" in line, line
+
+
+def test_overlay_installer_names_the_torch_index():
+    from brain.update.install import TORCH_CPU_INDEX
+
+    assert TORCH_CPU_INDEX == _torch_index_url()

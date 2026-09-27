@@ -1,0 +1,167 @@
+"""brain.update.install — diff + pip-from-ensurepip + smoke + swap (#286 §3.3).
+No network: pip runs with --no-index --find-links <tmp>."""
+
+from __future__ import annotations
+
+import hashlib
+import zipfile
+from pathlib import Path
+
+import pytest
+
+from brain.update import install, overlay
+
+
+def _wheel(dirpath: Path, dist: str, version: str, files: dict[str, str]) -> Path:
+    """Write a minimal installable wheel; return its path."""
+    tag = dist.replace("-", "_")
+    whl = dirpath / f"{tag}-{version}-py3-none-any.whl"
+    info = f"{tag}-{version}.dist-info"
+    meta = {
+        f"{info}/METADATA": f"Metadata-Version: 2.1\nName: {dist}\nVersion: {version}\n",
+        f"{info}/WHEEL": "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+    }
+    allf = {**files, **meta}
+    with zipfile.ZipFile(whl, "w") as z:
+        for name, body in allf.items():
+            z.writestr(name, body)
+        z.writestr(f"{info}/RECORD", "".join(f"{n},,\n" for n in allf) + f"{info}/RECORD,,\n")
+    return whl
+
+
+def _pin(whl: Path, name: str, version: str) -> str:
+    sha = hashlib.sha256(whl.read_bytes()).hexdigest()
+    return f"{name}=={version} \\\n    --hash=sha256:{sha}\n"
+
+
+def _fake_bundle(tmp_path: Path, installed: dict[str, str], bundle_id: str = "bundle-1") -> Path:
+    site = tmp_path / "bundle-site"
+    site.mkdir()
+    for name, version in installed.items():
+        info = site / f"{name.replace('-', '_')}-{version}.dist-info"
+        info.mkdir()
+        (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n",
+                                       encoding="utf-8")
+    (site / "_ce_bundle_id").write_text(bundle_id + "\n", encoding="utf-8")
+    return site
+
+
+BRAIN_OK = {
+    "brain/__init__.py": "",
+    "brain/cli.py": "",
+    "brain/bridge/__init__.py": "",
+    "brain/bridge/server.py": "",
+    "brain/chat/__init__.py": "",
+    "brain/chat/engine.py": "",
+}
+
+
+def test_parse_requirements_splits_options_and_pins():
+    text = ("--index-url https://pypi.org/simple\n"
+            "--extra-index-url https://download.pytorch.org/whl/cpu\n"
+            "Certifi==2026.4.22 \\\n    --hash=sha256:aa \\\n    --hash=sha256:bb\n"
+            "torch==2.14.0+cpu ; sys_platform != 'darwin' \\\n    --hash=sha256:cc\n")
+    options, reqs = install.parse_requirements(text)
+    assert options == ["--index-url https://pypi.org/simple",
+                       "--extra-index-url https://download.pytorch.org/whl/cpu"]
+    assert [(r.name, r.version) for r in reqs] == [("certifi", "2026.4.22"), ("torch", "2.14.0+cpu")]
+    assert "--hash=sha256:bb" in reqs[0].block and "sys_platform" in reqs[1].block
+
+
+def test_diff_keeps_only_changed_pins_and_never_package_managers():
+    _, reqs = install.parse_requirements(
+        "certifi==2026.4.22 \\\n    --hash=sha256:aa\n"
+        "idna==3.10 \\\n    --hash=sha256:bb\n"
+        "setuptools==84.0.0 \\\n    --hash=sha256:cc\n")
+    todo = install.diff_requirements(reqs, {"certifi": "2026.4.22", "idna": "3.9"})
+    assert [r.name for r in todo] == ["idna"]
+
+
+def test_installed_versions_reads_only_the_given_site_dir(tmp_path):
+    site = _fake_bundle(tmp_path, {"Certifi": "2026.4.22", "idna": "3.9"})
+    assert install.installed_versions(site) == {"certifi": "2026.4.22", "idna": "3.9"}
+
+
+def test_apply_installs_only_the_diff_and_the_brain_then_activates(tmp_path):
+    finds = tmp_path / "finds"
+    finds.mkdir()
+    changed = _wheel(finds, "demo-changed", "2.0", {"demo_changed/__init__.py": ""})
+    same = _wheel(finds, "demo-same", "1.0", {"demo_same/__init__.py": ""})
+    brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
+    req = tmp_path / "requirements.txt"
+    req.write_text(_pin(changed, "demo-changed", "2.0") + _pin(same, "demo-same", "1.0"), encoding="utf-8")
+    site = _fake_bundle(tmp_path, {"demo-changed": "1.0", "demo-same": "1.0"})
+    root = tmp_path / "brain-overlay"
+    entry = install.apply_update(wheel=brain_whl, requirements=req, commit="c" * 40, site_dir=site,
+                                 root=root, pip_extra=["--no-index", "--find-links", str(finds)])
+    folder = root / entry["dir"]
+    names = sorted(p.name for p in folder.iterdir())
+    assert "demo_changed" in names and "brain" in names and "demo_same" not in names
+    assert overlay.read_state(root)["active"] == entry
+    assert entry["brain_version"] == "9.9.9" and entry["bundle_id"] == "bundle-1"
+
+
+def test_failed_smoke_leaves_the_active_overlay_untouched(tmp_path):
+    finds = tmp_path / "finds"
+    finds.mkdir()
+    broken = _wheel(finds, "companion-emergence", "9.9.9", {**BRAIN_OK, "brain/cli.py": "raise ImportError('boom')\n"})
+    req = tmp_path / "requirements.txt"
+    req.write_text("", encoding="utf-8")
+    site = _fake_bundle(tmp_path, {})
+    root = tmp_path / "brain-overlay"
+    overlay.activate(root, {"dir": "old", "commit": "o" * 40, "brain_version": "0.0.42", "bundle_id": "bundle-1"})
+    before = (root / "current.json").read_bytes()
+    with pytest.raises(install.UpdateError, match="does not load"):
+        install.apply_update(wheel=broken, requirements=req, commit="d" * 40, site_dir=site, root=root,
+                             pip_extra=["--no-index", "--find-links", str(finds)])
+    assert (root / "current.json").read_bytes() == before
+    assert not [p for p in root.iterdir() if p.name.startswith(".staging-")]
+
+
+def test_hash_mismatch_fails_before_activation(tmp_path):
+    finds = tmp_path / "finds"
+    finds.mkdir()
+    dep = _wheel(finds, "demo-changed", "2.0", {"demo_changed/__init__.py": ""})
+    brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
+    req = tmp_path / "requirements.txt"
+    req.write_text("demo-changed==2.0 \\\n    --hash=sha256:" + "0" * 64 + "\n", encoding="utf-8")
+    site = _fake_bundle(tmp_path, {"demo-changed": "1.0"})
+    root = tmp_path / "brain-overlay"
+    with pytest.raises(install.UpdateError, match="pip failed"):
+        install.apply_update(wheel=brain_whl, requirements=req, commit="e" * 40, site_dir=site, root=root,
+                             pip_extra=["--no-index", "--find-links", str(finds)])
+    assert overlay.read_state(root)["active"] is None
+    assert dep.exists()
+
+
+def test_a_bundle_without_the_hook_is_refused(tmp_path):
+    site = tmp_path / "old-bundle-site"
+    site.mkdir()
+    with pytest.raises(install.UpdateError, match="predates"):
+        install.apply_update(wheel=tmp_path / "x.whl", requirements=tmp_path / "r.txt", commit="f" * 40,
+                             site_dir=site, root=tmp_path / "brain-overlay")
+
+
+def test_reapplying_the_same_commit_reuses_the_folder(tmp_path):
+    finds = tmp_path / "finds"
+    finds.mkdir()
+    brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
+    req = tmp_path / "requirements.txt"
+    req.write_text("", encoding="utf-8")
+    site = _fake_bundle(tmp_path, {})
+    root = tmp_path / "brain-overlay"
+    kw = {"wheel": brain_whl, "requirements": req, "commit": "a" * 40, "site_dir": site, "root": root,
+          "pip_extra": ["--no-index", "--find-links", str(finds)]}
+    install.apply_update(**kw)
+    marker = root / ("a" * 12) / "marker"
+    marker.write_text("kept", encoding="utf-8")
+    overlay.revert(root)
+    install.apply_update(**kw)
+    assert marker.exists() and overlay.read_state(root)["active"]["commit"] == "a" * 40
+
+
+def test_unsafe_commit_labels_are_refused(tmp_path):
+    for bad in ("../x", "/abs", "", ".hidden", "a/b"):
+        with pytest.raises(install.UpdateError, match="unsafe commit"):
+            install.apply_update(wheel=tmp_path / "x.whl", requirements=tmp_path / "r.txt", commit=bad,
+                                 site_dir=tmp_path, root=tmp_path / "brain-overlay")
