@@ -272,16 +272,29 @@ def test_self_model_articulate_defers_when_not_idle(monkeypatch, tmp_path: Path)
 
 
 def test_pass2_queue_defers_when_not_idle(monkeypatch, tmp_path: Path) -> None:
+    """C4 evidence: pass 2 defers (does not run) while chat is not idle.
+
+    Exercises the REAL production gate `cli_throttle.acquire_background()` —
+    the exact pre-flight check `pass2_queue._worker_loop` calls before ever
+    invoking `drain_all_locked` (see that function's own docstring) — rather
+    than re-deriving the gating decision inside the test itself. See
+    `test_pass2_queue.py::TestWorkerLoop` for an end-to-end test that starts
+    the real worker thread and confirms this composition end-to-end."""
     from brain.bridge import cli_throttle
     from brain.chat import pass2_queue
 
     monkeypatch.setattr(cli_throttle, "is_chat_idle", lambda **_: False)
     pass2_queue.reset()
     ran = {"n": 0}
-    pass2_queue.enqueue(lambda: ran.__setitem__("n", ran["n"] + 1), label="test")
-    n = pass2_queue.drain_pending()
-    assert n == 0
+    record_id = pass2_queue.new_record_id()
+    pass2_queue.register_test_side_effect(record_id, lambda: ran.__setitem__("n", ran["n"] + 1))
+    pass2_queue.enqueue({"id": record_id, "kind": "test_probe"}, persona_dir=tmp_path)
+
+    # The real pre-flight gate denies a background slot while not idle, so
+    # a worker-style caller never even calls drain_all_locked.
+    assert cli_throttle.acquire_background() is False
     assert ran["n"] == 0
+    assert pass2_queue._queue_size(tmp_path) == 1  # left queued, not dropped
     pass2_queue.reset()
 
 

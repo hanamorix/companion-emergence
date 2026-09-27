@@ -54,6 +54,20 @@ JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS: int = 200
 # also end earlier if the rows run out.
 HEARTBEAT_DECAY_BATCH_BUDGET_S: float = 1.0
 
+# --- pass-2 `--no-bridge` exit-drain time budget (S80) ---------------------
+# Caps how long `nell chat --no-bridge`'s exit-drain (pass2_queue.py's
+# `drain_all_locked`, called with no `should_pause` — there is no later lull
+# in that process to wait for, S78) may run before it stops and leaves
+# whatever's left in the durable, persisted queue for the next bridge (S64:
+# lossless, nothing new needed for that half). Owner ruling (S80,
+# "Time-limited + progress"): without a bound, a near-cap backlog (up to 200
+# items x up to ~137s each, 2-plan.md §4.1) could hang a user's terminal for
+# hours with zero feedback, against this project's low-end-hardware baseline
+# (round-6 red-team MAJOR). Checked only between items (never mid-item), so
+# the real worst case is this value plus one item's own duration, not this
+# value alone (round-7 minor, 2-plan.md §3.5a).
+PASS2_NOBRIDGE_DRAIN_BUDGET_S: float = 20.0
+
 # --- search_memories-via-bridge call timeout (S67) -------------------------
 # The MCP child's httpx call to the bridge's POST /tools/search_memories
 # (brain/mcp_server/tools.py). Sized below the claude CLI's 60 s tool-silence

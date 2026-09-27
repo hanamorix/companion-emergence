@@ -15,7 +15,7 @@ def test_spawn_pass2_attunement_enqueues(tmp_path):
         "her reply",
         slice_,
     )
-    assert pass2_queue._queue_size() == 1
+    assert pass2_queue._queue_size(tmp_path) == 1
 
 
 def test_spawn_pass2_enqueues_instead_of_threading(tmp_path):
@@ -26,11 +26,11 @@ def test_spawn_pass2_enqueues_instead_of_threading(tmp_path):
         recent_user_msgs=("how are you?",),
         persona_dir=tmp_path,
     )
-    assert pass2_queue._queue_size() == 1
+    assert pass2_queue._queue_size(tmp_path) == 1
 
 
 def test_spawn_pass2_attunement_skips_trivial_turn(tmp_path):
     # should_run_detector gate: a too-short user message enqueues nothing
     slice_ = [BufferTurn(id="msg-0", content="ok")]
     tool_loop._spawn_pass2_attunement(tmp_path, "turn-1", "ok", "reply", slice_)
-    assert pass2_queue._queue_size() == 0
+    assert pass2_queue._queue_size(tmp_path) == 0

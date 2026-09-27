@@ -119,7 +119,7 @@ def test_pass2_fires_after_record_monologue(tmp_path: Path, monkeypatch):
         from brain.chat import pass2_queue
 
         cli_throttle.reset()
-        pass2_queue.drain_pending()
+        pass2_queue.drain_pending(persona_dir)
     finally:
         store.close()
         hebbian.close()

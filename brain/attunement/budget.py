@@ -79,6 +79,12 @@ def consume_call(
     persona_dir: Path, *, now: datetime, cap: int = DAILY_BUDGET_DEFAULT
 ) -> bool:
     """Return True if call permitted (and decrements counter); False if cap reached."""
+    # PASS2-AT-LEAST-ONCE: a pass-2 crash/restart repeat (see
+    # pass2_queue.py's drain_all_locked pop-after-process step) can call
+    # this twice for one logical item, consuming one extra daily-budget
+    # count. Owner-accepted 2026-09-26: "the odds of it happening are tiny,
+    # the consequence if it happens are small." See #240 (emotion-system
+    # untangle) for the durable fix.
     try:
         state = _load(persona_dir)
     except _BudgetCorruptError:

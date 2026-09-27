@@ -102,7 +102,7 @@ def test_full_turn_updates_all_surfaces(tmp_path: Path, monkeypatch):
         from brain.chat import pass2_queue
 
         cli_throttle.reset()
-        pass2_queue.drain_pending()
+        pass2_queue.drain_pending(persona_dir)
 
         # memory-consolidation migration: the pass-2 "monologue" write is a gated
         # type → enqueued as a pending candidate, not a memories.db row. Promote
