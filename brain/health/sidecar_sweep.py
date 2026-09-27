@@ -3,8 +3,13 @@
 Two families accumulate at the persona root and nothing reaped them:
 
 * ``<file>.lock.stale-<stamp>`` — a dead bridge lock archived as evidence by
-  ``brain.bridge.daemon._archive_stale_lock`` (never deleted at the time, on
-  purpose: it is the record of a crash).
+  the pid/age/health-probe staleness logic that used to live in
+  ``brain.bridge.daemon.acquire_lock``. That mechanism was removed (RAM-spike
+  fix INC-2, S50): the lock is now a real OS-level lock (flock/msvcrt) held
+  for the bridge's whole process life and released by the OS itself on crash
+  or reboot, so no stale-archive files are created anymore. Any archives from
+  before that change are still forensic residue with a shelf life and are
+  still reaped here.
 * ``<file>.corrupt-<stamp>`` / ``<file>.bakN.corrupt-<stamp>`` — a corrupt
   state file quarantined by ``brain.health.attempt_heal`` before the heal.
 

@@ -30,5 +30,10 @@ def test_runner_acquires_lock_runs_then_releases(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "run_bridge_foreground", _fake_run)
     rc = runner.main(["--persona-dir", str(tmp_path)])
     assert rc == 0
-    assert seen["lock_held_during_run"] is True       # lock held while binding
-    assert not (tmp_path / daemon.LOCKFILE).exists()  # released after
+    assert seen["lock_held_during_run"] is True   # lock held while binding
+    # S56: release_lock never unlinks — the file persists, but the OS lock on
+    # it must be free again (a fresh acquire succeeds).
+    assert (tmp_path / daemon.LOCKFILE).exists()
+    fd = daemon.acquire_lock(tmp_path)
+    assert fd is not None
+    daemon.release_lock(tmp_path, fd)

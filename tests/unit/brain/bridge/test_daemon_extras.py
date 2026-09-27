@@ -150,25 +150,6 @@ def _patch_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, persona: str =
     return log_dir
 
 
-def test_acquire_lock_does_not_unlink_new_lock_after_stale_read(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    persona_dir = tmp_path / "persona"
-    persona_dir.mkdir()
-    lock_path = persona_dir / daemon.LOCKFILE
-    lock_path.write_text("999999", encoding="utf-8")
-
-    def fake_pid_is_alive(_pid: int) -> bool:
-        lock_path.write_text("123456", encoding="utf-8")
-        return False
-
-    monkeypatch.setattr(daemon.state_file, "pid_is_alive", fake_pid_is_alive)
-
-    assert daemon.acquire_lock(persona_dir) is None
-    assert lock_path.read_text(encoding="utf-8") == "123456"
-
-
 # ---------- cmd_run ----------
 
 
@@ -202,7 +183,12 @@ def test_cmd_run_calls_foreground_runner_without_detaching(
         "client_origin": "launchd",
         "idle_shutdown_seconds": None,
     }
-    assert not (persona_dir / daemon.LOCKFILE).exists()
+    # S56: release_lock never unlinks — the lock file persists after release,
+    # only the OS-level lock on it is dropped (a fresh acquire must succeed).
+    assert (persona_dir / daemon.LOCKFILE).exists()
+    fd = daemon.acquire_lock(persona_dir)
+    assert fd is not None
+    daemon.release_lock(persona_dir, fd)
 
 
 def test_cmd_run_converts_idle_shutdown_minutes(
@@ -721,46 +707,164 @@ def test_acquire_lock_succeeds_on_fresh_persona_dir(tmp_path: Path) -> None:
     assert fd is not None
     assert (persona_dir / daemon.LOCKFILE).exists()
     daemon.release_lock(persona_dir, fd)
-    assert not (persona_dir / daemon.LOCKFILE).exists()
+    # S56: release_lock NEVER unlinks — the file persists, only the OS lock
+    # on it is dropped.
+    assert (persona_dir / daemon.LOCKFILE).exists()
 
 
-def test_acquire_lock_returns_none_when_existing_pid_alive(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    persona_dir = tmp_path / "persona"
-    persona_dir.mkdir()
-    (persona_dir / daemon.LOCKFILE).write_text("12345", encoding="utf-8")
-    monkeypatch.setattr(daemon.state_file, "pid_is_alive", lambda _pid: True)
-    assert daemon.acquire_lock(persona_dir) is None
-    # Lock untouched.
-    assert (persona_dir / daemon.LOCKFILE).read_text(encoding="utf-8") == "12345"
-
-
-def test_acquire_lock_recovers_stale_lockfile(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Existing lock holds a dead pid → unlink + re-acquire."""
-    persona_dir = tmp_path / "persona"
-    persona_dir.mkdir()
-    (persona_dir / daemon.LOCKFILE).write_text("99999", encoding="utf-8")
-    monkeypatch.setattr(daemon.state_file, "pid_is_alive", lambda _pid: False)
-    fd = daemon.acquire_lock(persona_dir)
-    assert fd is not None
-    # New lockfile holds our pid.
-    assert (persona_dir / daemon.LOCKFILE).read_text(encoding="utf-8") == str(os.getpid())
-    daemon.release_lock(persona_dir, fd)
-
-
-def test_acquire_lock_returns_none_on_garbage_pid(
+def test_acquire_lock_content_is_irrelevant_only_the_os_lock_matters(
     tmp_path: Path,
 ) -> None:
-    """Lockfile contains non-integer text → ValueError caught, return None."""
+    """A pre-existing lockfile with arbitrary/garbage content (a leftover pid,
+    non-integer garbage, or nothing at all) does not itself block a fresh
+    acquire — S50 removed all pid/content-based staleness guessing. The ONLY
+    thing that can refuse an acquire is another process actually holding the
+    OS-level lock right now (covered by the contention tests below)."""
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
     (persona_dir / daemon.LOCKFILE).write_text("not-a-pid", encoding="utf-8")
-    assert daemon.acquire_lock(persona_dir) is None
+
+    fd = daemon.acquire_lock(persona_dir)
+    assert fd is not None
+    # Content is truncated and replaced with our own pid on success.
+    assert (persona_dir / daemon.LOCKFILE).read_bytes().count(str(os.getpid()).encode()) == 1
+    daemon.release_lock(persona_dir, fd)
+
+
+def test_acquire_lock_c18a_kill_then_restart_acquires_immediately_no_archive(
+    tmp_path: Path,
+) -> None:
+    """C18(a): kill -9 the bridge (simulated: the OS drops the flock/msvcrt
+    lock the instant the holding fd is closed, exactly what happens when a
+    process is SIGKILLed — no cleanup code runs either way); the next start
+    acquires the lock immediately (< 1s), with no 120s wait and no
+    `.stale-*` archive file created (that whole mechanism, and the file it
+    used to write, no longer exists)."""
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+
+    fd1 = daemon.acquire_lock(persona_dir)
+    assert fd1 is not None
+    # Simulate a SIGKILL: the process dies without running release_lock, but
+    # the kernel still releases the OS-level lock on fd close. Closing the
+    # bare fd (bypassing release_lock's unlock+close) reproduces exactly that.
+    os.close(fd1)
+
+    started = time.time()
+    fd2 = daemon.acquire_lock(persona_dir)
+    elapsed = time.time() - started
+
+    assert fd2 is not None
+    assert elapsed < 1.0
+    assert list(persona_dir.glob("bridge.json.lock.stale-*")) == []
+    daemon.release_lock(persona_dir, fd2)
+
+
+def test_acquire_lock_c18b_reboot_with_pid_reuse_acquires_immediately(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C18(b): simulated reboot with pid reuse — the lock file's leftover
+    content names the pid of a live, unrelated process (a reboot clears all
+    OS locks but the lock FILE itself, being on disk, survives with its old
+    content). No process holds the OS lock. A start must still acquire
+    immediately: pid liveness is never consulted."""
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    # Leftover content names a pid that IS alive (this test process itself)
+    # but is unrelated to any bridge — the reboot dropped the real lock.
+    (persona_dir / daemon.LOCKFILE).write_text(str(os.getpid()), encoding="utf-8")
+    # Even if something still consulted liveness, it would say "alive" here —
+    # proving the acquire below does NOT consult it at all.
+    monkeypatch.setattr(daemon.state_file, "pid_is_alive", lambda _pid: True)
+
+    started = time.time()
+    fd = daemon.acquire_lock(persona_dir)
+    elapsed = time.time() - started
+
+    assert fd is not None
+    assert elapsed < 1.0
+    daemon.release_lock(persona_dir, fd)
+
+
+def test_acquire_lock_c18c_pid_readable_by_another_reader_while_held(
+    tmp_path: Path,
+) -> None:
+    """C18(c): while a bridge holds the lock, a second process can still read
+    the pid from the lock file. On POSIX the pid sits at offset 0 (flock is
+    advisory; reads are never blocked). On Windows the locked byte is at
+    offset 0 and the pid is written starting at offset 1 specifically so it
+    stays readable — this assertion is offset-agnostic (it just looks for
+    the pid's digits anywhere in the file) so it holds unmodified on a real
+    Windows CI runner too."""
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    fd = daemon.acquire_lock(persona_dir)
+    assert fd is not None
+    try:
+        raw = (persona_dir / daemon.LOCKFILE).read_bytes()
+        assert str(os.getpid()).encode() in raw
+    finally:
+        daemon.release_lock(persona_dir, fd)
+
+
+def test_acquire_lock_c19_two_racing_acquires_exactly_one_wins(tmp_path: Path) -> None:
+    """C19(b)-equivalent at the acquire_lock layer (the exclusive point
+    runner.main relies on, S57): two threads racing acquire_lock on the same
+    persona dir at once — exactly one gets a live fd, the other gets None.
+    A real two-child-process race (tests/bridge/test_runner_mutual_exclusion.py)
+    exercises the same guarantee through runner.main end to end; this proves
+    the exclusion itself, at the primitive the plan names as the one
+    exclusive point."""
+    import threading
+
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    barrier = threading.Barrier(2)
+    results: list[int | None] = [None, None]
+
+    def _race(i: int) -> None:
+        barrier.wait()
+        results[i] = daemon.acquire_lock(persona_dir)
+
+    threads = [threading.Thread(target=_race, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5.0)
+
+    winners = [fd for fd in results if fd is not None]
+    losers = [fd for fd in results if fd is None]
+    assert len(winners) == 1
+    assert len(losers) == 1
+    daemon.release_lock(persona_dir, winners[0])
+
+
+def test_release_lock_never_unlinks_and_inode_is_stable(tmp_path: Path) -> None:
+    """C19(c): the lock file's inode is the same before and after acquire +
+    release, and release never unlinks it — spied via os.unlink."""
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    fd = daemon.acquire_lock(persona_dir)
+    assert fd is not None
+    lock_path = persona_dir / daemon.LOCKFILE
+    inode_before = lock_path.stat().st_ino
+
+    unlink_calls: list[Path] = []
+    real_unlink = os.unlink
+
+    def spy_unlink(path, *a, **kw):
+        unlink_calls.append(Path(str(path)))
+        return real_unlink(path, *a, **kw)
+
+    import unittest.mock
+
+    with unittest.mock.patch("os.unlink", side_effect=spy_unlink):
+        daemon.release_lock(persona_dir, fd)
+
+    assert unlink_calls == []
+    assert lock_path.exists()
+    assert lock_path.stat().st_ino == inode_before
 
 
 def test_release_lock_is_idempotent_after_external_unlink(
@@ -1567,97 +1671,38 @@ def test_cmd_stop_on_windows_does_not_fallback_to_sigterm_when_http_fails(
     assert "shutdown endpoint unreachable" in capsys.readouterr().err
 
 
-def test_acquire_lock_recovers_old_garbage_lockfile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    persona_dir = tmp_path / "persona"
-    persona_dir.mkdir()
-    lock_path = persona_dir / daemon.LOCKFILE
-    lock_path.write_text("not-a-pid", encoding="utf-8")
-    old = time.time() - 600
-    os.utime(lock_path, (old, old))
+def test_cmd_start_refusal_wording_is_byte_identical(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    """C28: both refusal strings are byte-identical to today's wording — the
+    state-file pre-check ("bridge already running on port … (pid …)") and
+    the lock branch ("bridge already starting (lockfile held)"). Neither
+    changed shape when the lock mechanism underneath them did."""
+    from brain.bridge import state_file
 
-    fd = daemon.acquire_lock(persona_dir)
+    _patch_paths(monkeypatch, tmp_path)
+    persona_dir = tmp_path / "home" / "personas" / "nell"
+    state_file.write(
+        persona_dir,
+        state_file.BridgeState(
+            persona="nell", pid=555, port=51500, started_at="2026-05-08T00:00:00+00:00",
+            stopped_at=None, shutdown_clean=False, client_origin="cli",
+        ),
+    )
+    monkeypatch.setattr(state_file, "is_running", lambda _p: True)
+    rc = daemon.cmd_start(_args("nell"))
+    assert rc == 2
+    assert "bridge already running on port 51500 (pid 555)" in capsys.readouterr().err
 
-    assert fd is not None
-    assert lock_path.read_text(encoding="utf-8") == str(os.getpid())
-    stale_files = list(persona_dir.glob("bridge.json.lock.stale-*"))
-    assert stale_files, "old corrupt lock should be preserved as stale evidence"
-    daemon.release_lock(persona_dir, fd)
-
-
-def test_acquire_lock_blocks_recent_garbage_lockfile(tmp_path: Path) -> None:
-    persona_dir = tmp_path / "persona"
-    persona_dir.mkdir()
-    lock_path = persona_dir / daemon.LOCKFILE
-    lock_path.write_text("not-a-pid", encoding="utf-8")
-
-    assert daemon.acquire_lock(persona_dir) is None
-    assert lock_path.read_text(encoding="utf-8") == "not-a-pid"
-
-
-def test_acquire_lock_corrupt_branch_bails_if_lock_changed_under_race(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Double-read guard on the corrupt-lock branch: if a concurrent starter replaced
-    the corrupt lock with a valid one between our first read and the guard's re-read,
-    acquire_lock must return None without archiving the live lock.
-
-    Simulation: patch pathlib.Path.read_text so that the second call (the guard
-    re-read) returns a different value than the first call (which seeded
-    existing_text).  The first call returns the original corrupt content; the
-    second returns a valid pid string, mimicking a concurrent write.
-    """
-    persona_dir = tmp_path / "persona"
-    persona_dir.mkdir()
-    lock_path = persona_dir / daemon.LOCKFILE
-    lock_path.write_text("not-a-pid", encoding="utf-8")
-    old = time.time() - 600
-    os.utime(lock_path, (old, old))
-
-    original_read_text = Path.read_text
-    read_count = {"n": 0}
-
-    def patched_read_text(self, **kwargs):
-        result = original_read_text(self, **kwargs)
-        if self == lock_path:
-            read_count["n"] += 1
-            if read_count["n"] >= 2:
-                # Second read (the guard re-read): simulate concurrent replacement.
-                return "77777"
-        return result
-
-    monkeypatch.setattr(Path, "read_text", patched_read_text)
-
-    archived: list[object] = []
-    monkeypatch.setattr(daemon, "_archive_stale_lock", lambda p: archived.append(p))
-
-    result = daemon.acquire_lock(persona_dir)
-
-    # Guard fired: content changed → bail without archiving.
-    assert result is None
-    assert not archived, "archive must not be called when guard detects lock changed under race"
-
-
-def test_acquire_lock_recovers_old_alive_pid_when_bridge_health_is_dead(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    persona_dir = tmp_path / "persona"
-    persona_dir.mkdir()
-    lock_path = persona_dir / daemon.LOCKFILE
-    lock_path.write_text("12345", encoding="utf-8")
-    old = time.time() - 600
-    os.utime(lock_path, (old, old))
-
-    monkeypatch.setattr(daemon.state_file, "pid_is_alive", lambda _pid: True)
-    monkeypatch.setattr(daemon, "_recorded_bridge_health", lambda _persona_dir: False)
-
-    fd = daemon.acquire_lock(persona_dir)
-
-    assert fd is not None
-    stale_files = list(persona_dir.glob("bridge.json.lock.stale-*"))
-    assert stale_files, "recovered alive-pid-dead-health lock should be archived as evidence"
-    daemon.release_lock(persona_dir, fd)
+    # Second refusal path: is_running False but the OS lock is already held.
+    monkeypatch.setattr(state_file, "is_running", lambda _p: False)
+    held_fd = daemon.acquire_lock(persona_dir)
+    assert held_fd is not None
+    try:
+        monkeypatch.setattr(daemon, "acquire_lock", lambda _p: None)
+        rc = daemon.cmd_start(_args("nell"))
+        assert rc == 2
+        assert "bridge already starting (lockfile held)" in capsys.readouterr().err
+    finally:
+        daemon.release_lock(persona_dir, held_fd)
 
 
 def test_cmd_stop_on_windows_with_force_terminates(

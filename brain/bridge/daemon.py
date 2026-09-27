@@ -40,46 +40,17 @@ logger = logging.getLogger(__name__)
 
 LOCKFILE = "bridge.json.lock"
 
-_LOCK_STALE_SECONDS = 120.0
-# Known UX edge (accepted): a crash followed by a relaunch within
-# _LOCK_STALE_SECONDS of the lock's mtime blocks startup until the window
-# passes. Single-user desktop app — acceptable; documented here.
+# S50/S56: real OS-level lock (like brain.utils.file_lock's sidecar pattern),
+# held for the bridge's whole process life and released by the OS itself on
+# crash or reboot — no pid-alive / age / health-probe staleness guessing.
+_IS_WINDOWS = sys.platform.startswith("win")
 
-
-def _lock_age_seconds(path: Path) -> float:
-    try:
-        return max(0.0, time.time() - path.stat().st_mtime)
-    except OSError:
-        return 0.0
-
-
-def _archive_stale_lock(path: Path) -> None:
-    """Rename a stale lock to a timestamped .stale-* sibling as evidence —
-    never silently delete it."""
-    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    target = path.with_name(f"{path.name}.stale-{stamp}")
-    try:
-        path.replace(target)
-    except FileNotFoundError:
-        return
-
-
-def _recorded_bridge_health(persona_dir: Path) -> bool:
-    """True iff the recorded bridge port answers /health 200.
-
-    Safe against PID/port reuse BECAUSE /health requires bearer auth
-    (server.py — Depends(require_http_auth)): a stray process squatting the
-    recorded port fails the token check → non-200 → lock recovers. If /health
-    auth is ever relaxed, this recovery path silently breaks."""
-    s = state_file.read(persona_dir)
-    if s is None or s.port is None:
-        return False
-    headers = {"Authorization": f"Bearer {s.auth_token}"} if s.auth_token else {}
-    try:
-        r = httpx.get(f"http://127.0.0.1:{s.port}/health", headers=headers, timeout=0.5)
-        return r.status_code == 200
-    except httpx.HTTPError:
-        return False
+if _IS_WINDOWS:
+    # msvcrt is a Windows-only stdlib module; importing on POSIX would fail
+    # at module load (mirrors brain.utils.file_lock's guard).
+    import msvcrt
+else:
+    import fcntl
 
 
 def run_recovery_if_needed(persona_dir: Path) -> int | None:
@@ -115,61 +86,70 @@ def run_recovery_if_needed(persona_dir: Path) -> int | None:
 
 
 def acquire_lock(persona_dir: Path) -> int | None:
-    """Create the lockfile atomically. Returns fd on success, None on conflict."""
+    """Take the bridge's OS-level lock for the whole process life.
+
+    Same pattern as brain.utils.file_lock: open with O_CREAT (never O_EXCL —
+    the file itself is never recreated, only its lock contended for) and take
+    a non-blocking flock/msvcrt lock on that fd. A crash or reboot releases
+    the OS lock instantly, so there is no pid-alive / age / health-probe
+    staleness logic left to guess with (S50) — the lock IS the liveness
+    signal.
+
+    Returns the open fd (the caller must keep it open for the lock's
+    duration and pass it to release_lock) on success, or None if another
+    live process holds the lock.
+
+    The pid is written into the file for information only (S50) — never
+    read back to make a decision here. On Windows the single locked byte
+    sits at offset 0 (msvcrt.locking locks `nbytes` from the current file
+    position, and a locked region can't be read by another process — see
+    brain.utils.file_lock), so the pid is written starting at offset 1;
+    other processes can still read it there while the lock is held (C18c).
+    On POSIX flock is advisory over the whole file, so the pid goes at
+    offset 0 and stays readable throughout.
+    """
     path = persona_dir / LOCKFILE
+    fd = os.open(str(path), os.O_CREAT | os.O_RDWR)
     try:
-        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
-        os.write(fd, str(os.getpid()).encode())
-        return fd
-    except FileExistsError:
-        age = _lock_age_seconds(path)
-        try:
-            existing_text = path.read_text().strip()
-            existing_pid = int(existing_text)
-            if not state_file.pid_is_alive(existing_pid):
-                # Double-read guard: best-effort, NOT atomic (TOCTOU race between
-                # read and replace). Acceptable for a single-user desktop app; the
-                # stale lock is archived as evidence, never silently deleted.
-                if path.read_text().strip() != existing_text:
-                    return None
-                _archive_stale_lock(path)
-                return acquire_lock(persona_dir)
-            if age > _LOCK_STALE_SECONDS and not _recorded_bridge_health(persona_dir):
-                logger.warning(
-                    "recovering stale bridge lockfile with alive pid but dead health pid=%s age=%.1fs",
-                    existing_pid,
-                    age,
-                )
-                if path.read_text().strip() != existing_text:
-                    return None
-                _archive_stale_lock(path)
-                return acquire_lock(persona_dir)
-        except FileNotFoundError:
-            return acquire_lock(persona_dir)
-        except ValueError:
-            if age > _LOCK_STALE_SECONDS:
-                # Double-read guard (best-effort, not atomic — same TOCTOU caveat
-                # as the dead/alive-pid branches): if a concurrent starter replaced
-                # the corrupt lock with a valid one between our first read and now,
-                # bail rather than archive their live lock.
-                if path.read_text().strip() != existing_text:
-                    return None
-                logger.warning("recovering stale corrupt bridge lockfile age=%.1fs", age)
-                _archive_stale_lock(path)
-                return acquire_lock(persona_dir)
-        except OSError:
-            pass
+        if _IS_WINDOWS:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        os.close(fd)
         return None
+
+    os.ftruncate(fd, 0)
+    pid_bytes = str(os.getpid()).encode()
+    if _IS_WINDOWS:
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, b"\x00")  # occupies the locked byte; unreadable while held
+        os.lseek(fd, 1, os.SEEK_SET)
+        os.write(fd, pid_bytes)
+    else:
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, pid_bytes)
+    return fd
 
 
 def release_lock(persona_dir: Path, fd: int) -> None:
+    """Unlock and close the fd. Never unlinks the file (S56) — unlinking
+
+    would let a second process create a NEW file under the same name and
+    lock THAT one, so two processes could each believe they hold "the"
+    bridge lock on two different inodes."""
     try:
-        os.close(fd)
+        if _IS_WINDOWS:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
     except OSError:
         pass
     try:
-        (persona_dir / LOCKFILE).unlink()
-    except FileNotFoundError:
+        os.close(fd)
+    except OSError:
         pass
 
 

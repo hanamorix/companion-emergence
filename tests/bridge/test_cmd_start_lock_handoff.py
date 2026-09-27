@@ -21,8 +21,14 @@ def test_cmd_start_leaves_lock_free_for_child_runner(tmp_path, monkeypatch):
 
     def _fake_spawn(pd, idle, origin, log):
         # The bridge process (child) is about to start and will acquire the lock.
-        # cmd_start must NOT be holding it, or the child can never bind.
-        seen["lock_free_at_spawn"] = not (pd / daemon.LOCKFILE).exists()
+        # cmd_start must NOT be holding it, or the child can never bind. The
+        # lock FILE itself now persists across acquire/release (S56 — never
+        # unlinked), so "free" means "not OS-locked", checked by taking it
+        # ourselves and releasing again, not by the file's mere existence.
+        probe_fd = daemon.acquire_lock(pd)
+        seen["lock_free_at_spawn"] = probe_fd is not None
+        if probe_fd is not None:
+            daemon.release_lock(pd, probe_fd)
         return 4242
 
     monkeypatch.setattr(daemon, "spawn_detached", _fake_spawn)
