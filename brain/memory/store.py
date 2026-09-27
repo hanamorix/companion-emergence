@@ -24,7 +24,7 @@ from typing import Any
 
 import numpy as np
 
-from brain import tunables
+from brain import dev_constants, tunables
 from brain.memory.floor_calibration import RETENTION_WINDOW_DAYS_DEFAULT
 
 logger = logging.getLogger(__name__)
@@ -640,7 +640,9 @@ class MemoryStore:
 
     def __init__(self, db_path: str | Path, *, integrity_check: bool = True) -> None:
         self._db_path = Path(db_path)
-        self._conn = sqlite3.connect(str(db_path))
+        self._conn = sqlite3.connect(
+            str(db_path), timeout=dev_constants.MEMORIES_DB_BUSY_TIMEOUT_S
+        )
         # Run integrity check BEFORE setting row_factory so result rows are
         # plain tuples — the comparison [("ok",)] is unambiguous. Hot request
         # paths may pass integrity_check=False and leave deep checks to health.
@@ -658,18 +660,22 @@ class MemoryStore:
                 from brain.health.anomaly import BrainIntegrityError
 
                 raise BrainIntegrityError(str(db_path), detail)
-        # WAL + 5s busy_timeout — the bridge runs concurrent writers
-        # (chat tool calls, supervisor stale-close sweep, heartbeat,
-        # growth). Without WAL these can surface as `database is
-        # locked` under realistic desktop timing. In-memory dbs reject
-        # WAL; the fallback keeps tests using `:memory:` working. We
-        # set these AFTER the integrity check so a corrupt-file probe
-        # still surfaces BrainIntegrityError instead of a pragma crash.
+        # WAL + a busy_timeout well above the longest single memories.db
+        # write transaction (dev_constants.MEMORIES_DB_BUSY_TIMEOUT_S; see
+        # that module for the sizing basis, S48/S58) — the bridge runs
+        # concurrent writers (chat tool calls, supervisor stale-close
+        # sweep, heartbeat, growth). Without WAL these can surface as
+        # `database is locked` under realistic desktop timing. In-memory
+        # dbs reject WAL; the fallback keeps tests using `:memory:`
+        # working. We set these AFTER the integrity check so a corrupt-file
+        # probe still surfaces BrainIntegrityError instead of a pragma crash.
         try:
             self._conn.execute("PRAGMA journal_mode = WAL")
         except sqlite3.OperationalError:
             pass
-        self._conn.execute("PRAGMA busy_timeout = 5000")
+        self._conn.execute(
+            f"PRAGMA busy_timeout = {int(dev_constants.MEMORIES_DB_BUSY_TIMEOUT_S * 1000)}"
+        )
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         # Idempotent column migration for upgraded personas — _SCHEMA's
