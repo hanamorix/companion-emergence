@@ -18,6 +18,7 @@ WF = yaml.safe_load(WF_PATH.read_text(encoding="utf-8"))
 ON = WF[True]  # YAML 1.1 parses bare `on:` as boolean True
 BUILD = WF["jobs"]["build"]
 SIGN = WF["jobs"]["sign"]
+PUBLISH = WF["jobs"]["publish"]
 
 
 def _step(job, name_prefix):
@@ -40,7 +41,7 @@ def test_publishes_only_after_test_passes_on_a_push_to_main():
 
 
 def test_builds_the_commit_ci_tested_not_the_branch_tip():
-    for job in (BUILD, SIGN):
+    for job in (BUILD, SIGN, PUBLISH):
         assert _step(job, "Checkout")["with"]["ref"] == "${{ github.event.workflow_run.head_sha || github.sha }}"
 
 
@@ -53,13 +54,17 @@ def test_lock_export_flags_match_the_runtime_build():
     assert flags(_step(BUILD, "Export the lock")["run"]) == flags(block)
 
 
-def test_write_permission_and_secrets_only_on_the_signing_step():
+def test_write_permission_is_confined_to_the_publish_job():
     assert WF["permissions"] == {"contents": "read"}
     assert "permissions" not in BUILD
-    assert SIGN["permissions"] == {"contents": "write"}
-    with_secrets = [s["name"] for job in (BUILD, SIGN) for s in job["steps"]
+    assert "permissions" not in SIGN
+    assert PUBLISH["permissions"] == {"contents": "write"}
+    with_secrets = [s["name"] for job in (BUILD, SIGN, PUBLISH) for s in job["steps"]
                     if "secrets." in yaml.safe_dump(s)]
     assert with_secrets == ["Sign (updater key)"]
+    assert "github.token" in yaml.safe_dump(PUBLISH)
+    assert "github.token" not in yaml.safe_dump(BUILD)
+    assert "github.token" not in yaml.safe_dump(SIGN)
 
 
 def test_pull_requests_use_a_throwaway_key_and_prove_a_tamper_fails():
@@ -76,27 +81,36 @@ def test_verifies_against_the_pubkey_the_app_ships():
     assert "verify_update_signature.sh" in _step(SIGN, "Verify the signature")["run"]
 
 
-def test_verification_and_guard_run_before_anything_is_published():
-    names = _names(SIGN)
+def test_verification_happens_in_sign_and_guard_runs_before_publish():
+    assert _step(SIGN, "Verify the signature against the app's pubkey")
+    assert "sign" in PUBLISH["needs"]
+    assert PUBLISH["if"] == "github.event_name != 'pull_request'"
+    names = _names(PUBLISH)
     publish = next(i for i, n in enumerate(names) if n.startswith("Publish"))
-    assert names.index("Verify the signature against the app's pubkey") < publish
-    guard = _step(SIGN, "Newer than what is published")
+    guard = _step(PUBLISH, "Newer than what is published")
     assert names.index(guard["name"]) < publish
-    assert guard["if"] == "github.event_name != 'pull_request'"
     assert "should-publish" in guard["run"]
-    assert SIGN["steps"][publish]["if"] == "steps.guard.outputs.publish == 'true'"
+    assert PUBLISH["steps"][publish]["if"] == "steps.guard.outputs.publish == 'true'"
 
 
-def test_uploads_data_before_the_manifest():
-    run = _step(SIGN, "Publish")["run"]
+def test_publish_uploads_data_before_the_manifest():
+    run = _step(PUBLISH, "Publish")["run"]
     assert run.index("requirements.txt --clobber") < run.index("manifest.json.sig --clobber")
     assert "--prerelease" in run and "delete-asset" in run
 
 
-def test_dispatch_cannot_publish_onto_the_user_channel():
+def test_workflow_dispatch_cannot_publish_onto_the_user_channel():
     assert "inputs.tag == 'brain-main'" in _step(SIGN, "Refuse")["if"]
-    assert SIGN["env"]["TAG"] == "${{ github.event_name == 'workflow_dispatch' && inputs.tag || 'brain-main' }}"
+    assert PUBLISH["env"]["TAG"] == "${{ github.event_name == 'workflow_dispatch' && inputs.tag || 'brain-main' }}"
     assert ON["workflow_dispatch"]["inputs"]["tag"]["default"] != "brain-main"
+
+
+def test_sign_uploads_and_publish_downloads_the_signed_build():
+    upload = _step(SIGN, "Upload signed build")
+    assert upload["if"] == "github.event_name != 'pull_request'"
+    assert "dist/manifest.json.sig" in upload["with"]["path"]
+    download = _step(PUBLISH, "Download signed build")
+    assert download["with"]["name"] == "brain-main-signed"
 
 
 def test_pr_trigger_covers_the_pipeline():

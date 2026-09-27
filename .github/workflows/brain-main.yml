@@ -94,15 +94,9 @@ jobs:
           if-no-files-found: error
 
   sign:
-    name: sign + verify (+ publish off PRs)
+    name: sign + verify
     needs: build
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    env:
-      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || 'brain-main' }}
-      SHA: ${{ needs.build.outputs.commit }}
-      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Refuse a manual publish onto the user channel
         if: github.event_name == 'workflow_dispatch' && inputs.tag == 'brain-main'
@@ -172,9 +166,46 @@ jobs:
             exit 1
           fi
 
+      - name: Upload signed build
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v7
+        with:
+          name: brain-main-signed
+          path: |
+            dist/companion_emergence-*.whl
+            dist/requirements.txt
+            dist/manifest.json
+            dist/manifest.json.sig
+          if-no-files-found: error
+
+  # Least privilege: this is the only job that holds a write token, and no
+  # third-party install code (pnpm/tauri CLI) runs in it.
+  publish:
+    name: publish
+    needs: [build, sign]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || 'brain-main' }}
+      SHA: ${{ needs.build.outputs.commit }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0  # should-publish walks history
+
+      - name: Download signed build
+        uses: actions/download-artifact@v7
+        with:
+          name: brain-main-signed
+          path: dist
+
       - name: Newer than what is published?
         id: guard
-        if: github.event_name != 'pull_request'
         run: |
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
             echo "publish=true" >> "$GITHUB_OUTPUT"
