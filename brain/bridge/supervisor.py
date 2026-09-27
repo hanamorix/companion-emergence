@@ -33,6 +33,7 @@ OG reference: NellBrain/nell_supervisor.py:368-407 (run_folded).
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -177,6 +178,7 @@ def run_folded(
     clustering_interval_s: float | None = 6 * 3600.0,
     vocab_repair_interval_s: float | None = 6 * 3600.0,
     is_session_busy: Callable[[str], bool] | None = None,
+    bridge_started_at: datetime | None = None,
 ) -> None:
     """Run supervisor + heartbeat + soul-review + finalize cadences until stop_event is set.
 
@@ -248,6 +250,15 @@ def run_folded(
         f"{soul_review_interval_s:.0f}s" if soul_review_interval_s is not None else "disabled",
         f"{finalize_interval_s:.0f}s" if finalize_interval_s is not None else "disabled",
     )
+    # S84: "bridge start" for the empty-session prune's idle window when no
+    # message has been seen in this process (see _build_gated_jobs). The
+    # bridge passes the moment it captured BEFORE starting this thread (and
+    # so before it serves /session/new): capturing it here, inside the
+    # thread, would race the app-mount session (stage-6 S84 MAJOR). Every
+    # production caller must pass it (today: server.py's lifespan only);
+    # callers that pass nothing (tests, direct calls) get "now".
+    if bridge_started_at is None:
+        bridge_started_at = datetime.now(UTC)
     last_heartbeat_at = time.monotonic() if heartbeat_interval_s is not None else None
     # Non-gated cadences keep their own timing (S16): soul review (own
     # self-pacing cadence), log rotation, vocab repair, voice reflection.
@@ -442,6 +453,7 @@ def run_folded(
         intensity_drivers=lambda: _last_intensity_drivers,
         tick_stats=tick_stats,
         tick_ctx=tick_ctx,
+        bridge_started_at=bridge_started_at,
     )
 
     while not stop_event.is_set():
@@ -713,6 +725,7 @@ def _build_gated_jobs(
     intensity_drivers: Callable[[], IntensityDrivers | None],
     tick_stats: dict[str, int],
     tick_ctx: dict[str, MemoryStore | None] | None = None,
+    bridge_started_at: datetime | None = None,
 ) -> list[GatedJob]:
     """The job table of the central cadence function (INC-9, S16/S55/S70).
 
@@ -730,6 +743,7 @@ def _build_gated_jobs(
     without doing the job's work (S20: no cadence advance).
     """
     jobs: list[GatedJob] = []
+    started_at = bridge_started_at if bridge_started_at is not None else datetime.now(UTC)
     ctx: dict[str, MemoryStore | None] = tick_ctx if tick_ctx is not None else {"store": None}
 
     @contextmanager
@@ -770,15 +784,27 @@ def _build_gated_jobs(
     )
 
     # 2. session snapshot / empty-session prune — S66/S72/S83.
-    def _prune_age() -> float:
+    def _prune_age(now: datetime) -> float:
         # S72 / 2-plan §3.3a: prune only sessions that predate the CURRENT idle
-        # window — never the lull value. A session opened during this idle
-        # window (incl. at the bridge-start lull, before any message) is kept.
-        return cli_throttle.time_since_last_message()
+        # window — never the lull value, never a constant. The window opens at
+        # the last message. S84: when no message has been seen in this process
+        # (S82 seeded nothing and none arrived, so time_since_last_message() is
+        # +inf), the window is anchored at bridge start instead — an empty
+        # session created before this bridge started is prunable, one created
+        # after it (e.g. the app-mount session) is kept until a later start.
+        # time_since_last_message() itself is left untouched (it is also
+        # is_chat_idle's anchor, S82): the fallback lives only here.
+        since = cli_throttle.time_since_last_message()
+        if math.isinf(since):
+            return max(0.0, (now - started_at).total_seconds())
+        return since
 
     def _snapshot_prune_has_work() -> bool:
-        return _snapshot_has_work(persona_dir) or has_prunable_empty_sessions(
-            older_than_seconds=_prune_age(), persona_name=persona_dir.name
+        if _snapshot_has_work(persona_dir):
+            return True
+        now = datetime.now(UTC)
+        return has_prunable_empty_sessions(
+            older_than_seconds=_prune_age(now), now=now, persona_name=persona_dir.name
         )
 
     def _snapshot_prune_run() -> None:
@@ -796,8 +822,9 @@ def _build_gated_jobs(
                 hebbian=hebbian,
                 provider=build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING),
             )
+        prune_now = datetime.now(UTC)
         pruned = prune_empty_sessions(
-            older_than_seconds=_prune_age(), persona_name=persona_dir.name
+            older_than_seconds=_prune_age(prune_now), now=prune_now, persona_name=persona_dir.name
         )
         tick_stats["closed_sessions"] += len(reports)
         tick_stats["pruned_empty_sessions"] += len(pruned)

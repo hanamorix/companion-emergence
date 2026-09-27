@@ -965,8 +965,10 @@ def test_c39_snapshot_has_work_probe(tmp_path):
     assert supervisor._snapshot_has_work(persona_dir) is True  # a ghost buffer to clean
 
 
-def _prune_job(persona_dir):
-    return [j for j in _real_jobs(persona_dir) if j.name == "session_snapshot_prune"]
+def _prune_job(persona_dir, **overrides):
+    return [
+        j for j in _real_jobs(persona_dir, **overrides) if j.name == "session_snapshot_prune"
+    ]
 
 
 def test_c39_prune_removes_a_session_that_predates_the_idle_window(tmp_path, monkeypatch):
@@ -995,10 +997,12 @@ def test_c39_prune_keeps_a_session_opened_during_the_idle_window(tmp_path, monke
     monkeypatch.setattr(supervisor, "snapshot_stale_sessions", lambda *a, **k: [])
     reset_registry()
     try:
-        # (ii-a) bridge start, no message ever: opened during the open window.
+        # (ii-a) bridge start, no message ever: opened AFTER this bridge
+        # started, i.e. during the open window (S84).
         cli_throttle.reset()
+        jobs = _prune_job(persona_dir, bridge_started_at=datetime.now(UTC) - timedelta(seconds=1))
         create_session(persona_dir.name)
-        decisions = _pass(persona_dir, _prune_job(persona_dir))
+        decisions = _pass(persona_dir, jobs)
         assert len(all_sessions()) == 1
         assert decisions[-1].action == "skip-not-due"  # nothing to prune → no run
         # (ii-b) a message a lull+ ago, session opened after it.
@@ -1152,3 +1156,177 @@ def test_pass2_reports_skipped_when_another_process_holds_the_drain_lock(tmp_pat
     monkeypatch.setattr(pass2_queue, "drain_all_locked", lambda *a, **k: 0)
     decisions = _pass(persona_dir, [j for j in _real_jobs(persona_dir) if j.name == "pass2"])
     assert ("pass2", "skipped") in [(d.job, d.action) for d in decisions]
+
+
+# ---------------------------------------------------------------------------
+# S84 (INC-9 follow-up) — no message seen in this process: the prune's idle
+# window is anchored at bridge start
+# ---------------------------------------------------------------------------
+
+
+def _prune_setup(tmp_path, monkeypatch):
+    persona_dir = _persona(tmp_path)
+    monkeypatch.setattr(supervisor, "_snapshot_has_work", lambda _pd: False)
+    monkeypatch.setattr(supervisor, "snapshot_stale_sessions", lambda *a, **k: [])
+    return persona_dir
+
+
+def test_s84_no_message_seen_prunes_an_empty_session_older_than_bridge_start(
+    tmp_path, monkeypatch
+):
+    """(i) No message seen (anchor -inf, nothing seeded) + an empty session
+    created before this bridge started → pruned at an idle pass."""
+    from brain.chat.session import all_sessions, create_session, reset_registry
+
+    persona_dir = _prune_setup(tmp_path, monkeypatch)
+    reset_registry()
+    try:
+        cli_throttle.reset()
+        started = datetime.now(UTC)
+        sess = create_session(persona_dir.name)
+        sess.created_at = started - timedelta(hours=1)  # from before this bridge started
+        decisions = _pass(persona_dir, _prune_job(persona_dir, bridge_started_at=started))
+        assert ("session_snapshot_prune", "run") in [(d.job, d.action) for d in decisions]
+        assert all_sessions() == []
+    finally:
+        reset_registry()
+
+
+def test_s84_no_message_seen_keeps_an_empty_session_created_after_bridge_start(
+    tmp_path, monkeypatch
+):
+    """(ii) No message seen + an empty session created after bridge start (the
+    app-mount session) → kept, on this pass and on later ones (until a later
+    bridge start)."""
+    from brain.chat.session import all_sessions, create_session, reset_registry
+
+    persona_dir = _prune_setup(tmp_path, monkeypatch)
+    reset_registry()
+    try:
+        cli_throttle.reset()
+        started = datetime.now(UTC) - timedelta(hours=3)
+        sess = create_session(persona_dir.name)
+        sess.created_at = started + timedelta(minutes=1)  # 2h59m old, but after start
+        jobs = _prune_job(persona_dir, bridge_started_at=started)
+        for _ in range(3):
+            decisions = _pass(persona_dir, jobs)
+            assert decisions[-1].action == "skip-not-due"
+        assert len(all_sessions()) == 1
+    finally:
+        reset_registry()
+
+
+def test_s84_message_seen_ignores_bridge_start(tmp_path, monkeypatch):
+    """(iii) Once a message has been seen, the window opens at the last message
+    as before: a session created before bridge start but AFTER the last message
+    is kept; one created before the last message is pruned."""
+    import time as _time
+
+    from brain.chat.session import all_sessions, create_session, reset_registry
+
+    persona_dir = _prune_setup(tmp_path, monkeypatch)
+    reset_registry()
+    try:
+        started = datetime.now(UTC) - timedelta(hours=5)
+        cli_throttle.mark_interactive_active(at=_time.monotonic() - 3600.0)  # 1 h ago
+        keep = create_session(persona_dir.name)
+        keep.created_at = datetime.now(UTC) - timedelta(minutes=30)  # after the message
+        drop = create_session(persona_dir.name)
+        drop.created_at = datetime.now(UTC) - timedelta(hours=2)  # before the message
+        _pass(persona_dir, _prune_job(persona_dir, bridge_started_at=started))
+        assert [s.session_id for s in all_sessions()] == [keep.session_id]
+    finally:
+        reset_registry()
+
+
+def test_s84_leaves_time_since_last_message_and_is_chat_idle_untouched(tmp_path, monkeypatch):
+    """The S84 fallback lives only in the prune's age: with no message seen,
+    time_since_last_message() is still +inf and is_chat_idle still True (the
+    S82 anchor semantics), before and after a pruning pass."""
+    import math
+
+    from brain.chat.session import create_session, reset_registry
+
+    persona_dir = _prune_setup(tmp_path, monkeypatch)
+    reset_registry()
+    try:
+        cli_throttle.reset()
+        started = datetime.now(UTC)
+        create_session(persona_dir.name).created_at = started - timedelta(hours=1)
+        assert math.isinf(cli_throttle.time_since_last_message())
+        _pass(persona_dir, _prune_job(persona_dir, bridge_started_at=started))
+        assert math.isinf(cli_throttle.time_since_last_message())
+        assert cli_throttle.is_chat_idle() is True
+    finally:
+        reset_registry()
+
+
+def test_s84_run_folded_captures_bridge_start_before_the_loop():
+    """Live wiring: run_folded records bridge start once, at entry, and hands
+    it to the job table."""
+    src = inspect.getsource(supervisor.run_folded)
+    assert "bridge_started_at = datetime.now(UTC)" in src
+    assert src.index("bridge_started_at = datetime.now(UTC)") < src.index(
+        "while not stop_event.is_set():"
+    )
+    assert "bridge_started_at=bridge_started_at" in src
+
+
+def test_s84_run_folded_live_prunes_pre_start_session_keeps_post_start_one(tmp_path):
+    """Live path through a real run_folded, no message ever seen: an empty
+    session that predates the supervisor's start is pruned at an idle pass; one
+    opened after the start is kept."""
+    import threading
+    import time as _time
+
+    from brain.chat.session import all_sessions, create_session, reset_registry
+
+    persona_dir = _persona(tmp_path)
+    reset_registry()
+    cli_throttle.reset()
+    old = create_session(persona_dir.name)
+    old.created_at = datetime.now(UTC) - timedelta(hours=1)
+    stop = threading.Event()
+    t = threading.Thread(
+        target=supervisor.run_folded,
+        args=(stop,),
+        kwargs={
+            "persona_dir": persona_dir,
+            "provider": FakeProvider(),
+            "event_bus": EventBus(),
+            "tick_interval_s": 0.05,
+            "heartbeat_interval_s": None,
+            "soul_review_interval_s": None,
+            "finalize_interval_s": None,
+            "log_rotation_interval_s": None,
+            "initiate_review_interval_s": None,
+            "voice_reflection_interval_s": None,
+            "self_model_interval_s": None,
+            "compaction_interval_s": None,
+            "calibration_interval_s": None,
+            "interest_sweep_interval_s": None,
+            "judge_selftune_interval_s": None,
+            "clustering_interval_s": None,
+            "vocab_repair_interval_s": None,
+            "maker_enabled": False,
+            "notes_enabled": False,
+            "kindled_link_enabled": False,
+        },
+        daemon=True,
+    )
+    try:
+        t.start()
+        deadline = _time.monotonic() + 10.0
+        while _time.monotonic() < deadline and any(
+            s.session_id == old.session_id for s in all_sessions()
+        ):
+            _time.sleep(0.02)
+        assert all(s.session_id != old.session_id for s in all_sessions()), "pre-start session kept"
+        new = create_session(persona_dir.name)  # opened after bridge start
+        _time.sleep(0.3)  # several 0.05 s passes
+        assert any(s.session_id == new.session_id for s in all_sessions()), "post-start session pruned"
+    finally:
+        stop.set()
+        t.join(timeout=10.0)
+        reset_registry()
+    assert not t.is_alive()

@@ -1074,6 +1074,12 @@ def build_app(
         except Exception as _exc:  # noqa: BLE001 — startup must not break; already fails closed internally
             logger.warning("is-chat-idle seed from active_conversations failed: %s", _exc)
 
+        # S84: "bridge start" for the empty-session prune (no message seen yet
+        # in this process). Captured here, on this thread, BEFORE the supervisor
+        # thread starts and before `yield` lets any /session/new in, so every
+        # session this bridge creates is provably after it.
+        bridge_started_at = datetime.now(UTC)
+
         # Spawn supervisor thread (non-daemon — joins on shutdown)
         from brain.bridge.supervisor import run_folded
 
@@ -1110,6 +1116,7 @@ def build_app(
                     "event_bus": bus,
                     "tick_interval_s": tick_interval_s,
                     "is_session_busy": _is_session_busy,
+                    "bridge_started_at": bridge_started_at,
                 },
                 name="sp7-supervisor",
                 daemon=False,

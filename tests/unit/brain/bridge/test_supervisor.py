@@ -388,6 +388,11 @@ def test_supervisor_snapshot_sweep_keeps_session_alive(
     reset_registry()
     persona_dir = _persona_dir(tmp_path)
     sess = create_session(persona_dir.name)
+    # The registry entry reflects the buffered turn (as the chat path would):
+    # it is created before this supervisor starts and no message is seen in
+    # the process, so an EMPTY one would be prunable under S84 — this test is
+    # about the snapshot not evicting a session that has turns.
+    sess.turns = 1
     sid = sess.session_id
     old_ts = (datetime.now(UTC) - timedelta(minutes=6)).isoformat()
     ingest_turn(
