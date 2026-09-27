@@ -68,9 +68,40 @@ def _where(site, home):
     return out.stdout.split()
 
 
+def test_unload_platformdirs_drops_it_from_sys_modules():
+    """After activation, an overlay's own (possibly newer) platformdirs must be able
+    to load — so this helper drops what the hook imported. Direct unit test on the
+    helper (subprocess env control for the full through-path is awkward: it needs
+    HOME/XDG pointed at a temp dir with KINDLED_HOME/NELLBRAIN_HOME both unset, which
+    the other tests in this file deliberately avoid)."""
+    sys.modules["platformdirs"] = object()
+    sys.modules["platformdirs.macos"] = object()
+    sys.modules["platformdirs_unrelated"] = object()  # must survive: prefix trap
+    try:
+        overlay_hook._unload_platformdirs()
+        assert "platformdirs" not in sys.modules
+        assert "platformdirs.macos" not in sys.modules
+        assert "platformdirs_unrelated" in sys.modules
+    finally:
+        for k in ("platformdirs", "platformdirs.macos", "platformdirs_unrelated"):
+            sys.modules.pop(k, None)
+
+
 def test_active_overlay_wins_and_brain_is_not_imported(tmp_path):
     site, home = _world(tmp_path)
     assert _where(site, home) == ["overlay", "False"]
+
+
+def test_kindled_no_overlay_env_var_disables_an_active_overlay(tmp_path):
+    site, home = _world(tmp_path)
+    code = ("import site, sys; site.addsitedir(%r); import demo_pkg; "  # noqa: UP031
+            "print(demo_pkg.WHERE, 'brain' in sys.modules)") % str(site)
+    env = {**os.environ, "KINDLED_HOME": str(home), "KINDLED_NO_OVERLAY": "1"}
+    env.pop("NELLBRAIN_HOME", None)
+    out = subprocess.run([sys.executable, "-P", "-c", code], capture_output=True, text=True,
+                         encoding="utf-8", env=env, cwd=str(site.parent))
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split() == ["bundle", "False"]
 
 
 def test_overlay_for_another_bundle_is_ignored(tmp_path):
@@ -88,6 +119,21 @@ def test_corrupt_state_is_ignored(tmp_path):
     assert _where(site, home) == ["bundle", "False"]
 
 
+def test_activation_does_not_load_hashlib_or_shutil(tmp_path):
+    """hashlib/shutil load OpenSSL etc. at every interpreter start; activate() itself
+    never needs them (only compute_bundle_id/install_hook, run during an update, do).
+    """
+    site, home = _world(tmp_path)
+    code = ("import site, sys; site.addsitedir(%r); "  # noqa: UP031
+            "print('hashlib' in sys.modules, 'shutil' in sys.modules)") % str(site)
+    env = {**os.environ, "KINDLED_HOME": str(home)}
+    env.pop("NELLBRAIN_HOME", None)
+    out = subprocess.run([sys.executable, "-P", "-c", code], capture_output=True, text=True,
+                         encoding="utf-8", env=env, cwd=str(site.parent))
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split() == ["False", "False"], out.stdout
+
+
 def test_activation_imports_only_stdlib_and_platformdirs(tmp_path):
     """Start-up cost (spec §9): the hook runs in every interpreter start."""
     site, home = _world(tmp_path)
@@ -101,6 +147,10 @@ def test_activation_imports_only_stdlib_and_platformdirs(tmp_path):
                          encoding="utf-8", env=env, cwd=str(site.parent))
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "[]", out.stdout
+
+
+def test_module_docstring_documents_the_escape_hatch():
+    assert "KINDLED_NO_OVERLAY" in overlay_hook.__doc__
 
 
 def test_install_hook_writes_the_three_files(tmp_path):

@@ -317,6 +317,81 @@ def test_leftover_unnamed_folder_is_replaced(tmp_path):
     assert stamp["commit"] == "c" * 40 and stamp["bundle_id"] == "bundle-1"
 
 
+def test_stamp_only_unnamed_folder_is_reinstalled_not_reused(tmp_path):
+    """A half-pruned folder (e.g. Windows .pyd locked during prune's rmtree) can keep
+    a matching stamp.json with no brain/ under it. Reuse must require the folder be
+    named by current.json — else a re-apply activates a folder with no brain
+    (final-review finding 1)."""
+    finds = tmp_path / "finds"
+    finds.mkdir()
+    brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
+    req = tmp_path / "requirements.txt"
+    req.write_text("", encoding="utf-8")
+    site = _fake_bundle(tmp_path, {})
+    root = tmp_path / "brain-overlay"
+    kw = {"wheel": brain_whl, "requirements": req, "commit": "a" * 40, "site_dir": site, "root": root,
+          "pip_extra": ["--no-index", "--find-links", str(finds)]}
+    base = f"{kw['commit'][:12]}-bundle-1"
+    target = root / base
+    target.mkdir(parents=True)
+    stamp = {"dir": base, "commit": kw["commit"], "brain_version": "9.9.9", "bundle_id": "bundle-1"}
+    (target / "stamp.json").write_text(json.dumps(stamp), encoding="utf-8")
+    # no brain/ under target: simulates a half-pruned folder that kept only its stamp
+
+    entry = install.apply_update(**kw)
+
+    assert entry["dir"] == base
+    assert (target / "brain").is_dir()  # reinstalled, not silently reused as-is
+    assert overlay.read_state(root)["active"] == entry
+
+
+def test_redirected_name_that_exists_on_disk_unnamed_is_replaced(tmp_path):
+    """Deferred T3: when the canonical name is already named by current.json and the
+    counter picks an `-r<n>` name that happens to already exist on disk but isn't
+    itself named (a stray leftover), the leftover is replaced, not reused."""
+    finds = tmp_path / "finds"
+    finds.mkdir()
+    brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
+    req = tmp_path / "requirements.txt"
+    req.write_text("", encoding="utf-8")
+    site = _fake_bundle(tmp_path, {})
+    root = tmp_path / "brain-overlay"
+    kw = {"wheel": brain_whl, "requirements": req, "commit": "a" * 40, "site_dir": site, "root": root,
+          "pip_extra": ["--no-index", "--find-links", str(finds)]}
+    entry1 = install.apply_update(**kw)  # names `base` as active
+    canonical = root / entry1["dir"]
+    (canonical / "stamp.json").write_text("not json", encoding="utf-8")  # forces a redirect
+
+    stray = root / f"{entry1['dir']}-r1"
+    stray.mkdir(parents=True)
+    (stray / "junk").write_text("garbage", encoding="utf-8")
+
+    entry2 = install.apply_update(**kw)  # base is named -> redirects to the -r1 stray on disk
+
+    assert entry2["dir"] == f"{entry1['dir']}-r1"
+    assert (stray / "brain").is_dir()
+    assert not (stray / "junk").exists()
+
+
+def test_stamp_carries_installed_at_but_current_json_entry_does_not(tmp_path):
+    """Spec gap: stamp.json gets an installed_at timestamp (diagnostic only); the
+    entry stored in current.json stays exactly {dir, commit, brain_version,
+    bundle_id} so it round-trips through equality checks unchanged."""
+    finds = tmp_path / "finds"
+    finds.mkdir()
+    brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
+    req = tmp_path / "requirements.txt"
+    req.write_text("", encoding="utf-8")
+    site = _fake_bundle(tmp_path, {})
+    root = tmp_path / "brain-overlay"
+    entry = install.apply_update(wheel=brain_whl, requirements=req, commit="a" * 40, site_dir=site,
+                                 root=root, pip_extra=["--no-index", "--find-links", str(finds)])
+    stamp = json.loads((root / entry["dir"] / "stamp.json").read_text(encoding="utf-8"))
+    assert "installed_at" in stamp and stamp["installed_at"].endswith("Z")
+    assert set(entry) == {"dir", "commit", "brain_version", "bundle_id"}
+    assert overlay.read_state(root)["active"] == entry
+
+
 def test_unsafe_commit_labels_are_refused(tmp_path):
     for bad in ("../x", "/abs", "", ".hidden", "a/b"):
         with pytest.raises(install.UpdateError, match="unsafe commit"):

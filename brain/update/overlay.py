@@ -55,7 +55,10 @@ def activate(root: Path, entry: dict) -> None:
 
 
 def revert(root: Path) -> None:
-    _write_state(root, None, read_state(root)["active"])
+    state = read_state(root)
+    if state["active"] is None:
+        return  # already reverted: don't clobber `previous` with the None it left behind
+    _write_state(root, None, state["active"])
 
 
 def rollback(root: Path) -> None:
@@ -93,7 +96,7 @@ def overlay_lock(root: Path) -> Iterator[None]:
                 except (OSError, ValueError):
                     holder = 0
                 if holder and pid_is_alive(holder):
-                    raise OverlayBusy(f"an update is already running (pid {holder})") from None
+                    raise OverlayBusy(f"an update is already running (pid {holder}; lock {path})") from None
                 # ponytail: best-effort stale takeover, like bridge.daemon.acquire_lock —
                 # two takers racing on the same dead lock at the same instant can still collide.
                 path.unlink(missing_ok=True)

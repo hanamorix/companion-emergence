@@ -36,6 +36,13 @@ def test_revert_clears_active_and_remembers_it(tmp_path):
     assert overlay.read_state(tmp_path) == {"active": None, "previous": ENTRY_A}
 
 
+def test_second_revert_does_not_lose_the_rollback_target(tmp_path):
+    overlay.activate(tmp_path, ENTRY_A)
+    overlay.revert(tmp_path)
+    overlay.revert(tmp_path)
+    assert overlay.read_state(tmp_path) == {"active": None, "previous": ENTRY_A}
+
+
 def test_rollback_restores_previous(tmp_path):
     overlay.activate(tmp_path, ENTRY_A)
     overlay.activate(tmp_path, ENTRY_B)
@@ -71,6 +78,15 @@ def test_lock_refuses_a_second_live_holder(tmp_path):
             with overlay.overlay_lock(tmp_path):
                 pass
     assert not (tmp_path / ".lock").exists()
+
+
+def test_busy_message_names_the_holder_and_the_lock_path(tmp_path):
+    with overlay.overlay_lock(tmp_path):
+        with pytest.raises(overlay.OverlayBusy) as exc_info:
+            with overlay.overlay_lock(tmp_path):
+                pass
+        assert str(os.getpid()) in str(exc_info.value)
+        assert str(tmp_path / ".lock") in str(exc_info.value)
 
 
 def test_lock_takes_over_from_a_dead_holder(tmp_path):

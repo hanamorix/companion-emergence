@@ -18,11 +18,13 @@ import subprocess
 import sys
 import sysconfig
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import NamedTuple
 
 from brain.update import overlay
 from brain.update.overlay_hook import BUNDLE_ID_FILE
+from brain.utils.time import iso_utc
 
 TORCH_CPU_INDEX = "https://download.pytorch.org/whl/cpu"  # == pyproject's pytorch-cpu index (drift test)
 NEVER_INSTALL = frozenset({"pip", "setuptools", "wheel"})  # the build strips them on purpose
@@ -144,7 +146,7 @@ def apply_update(*, wheel: Path, requirements: Path, commit: str, site_dir: Path
         except (OSError, ValueError):
             stamp = {}
         matches = (isinstance(stamp, dict) and stamp.get("commit") == commit
-                   and stamp.get("bundle_id") == bundle_id)
+                   and stamp.get("bundle_id") == bundle_id and target.name in named)
         if not matches:
             if target.exists() and target.name in named:
                 # `target` is current.json's active or previous folder, just with a
@@ -177,7 +179,8 @@ def apply_update(*, wheel: Path, requirements: Path, commit: str, site_dir: Path
                 # against the signed manifest by the app in slice 4.
                 _run([*_pip(), "--target", str(staging), *pip_extra, str(wheel)])
                 _smoke(staging, smoke_modules)
-                (staging / "stamp.json").write_text(json.dumps(entry, indent=2), encoding="utf-8")
+                stamp = {**entry, "installed_at": iso_utc(datetime.now(UTC))}
+                (staging / "stamp.json").write_text(json.dumps(stamp, indent=2), encoding="utf-8")
                 # Checked, not assumed: the named case above should already have
                 # redirected `target` away from anything current.json names. This is
                 # unreachable in the happy path; it's the guard.

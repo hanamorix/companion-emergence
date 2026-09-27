@@ -8,17 +8,22 @@ bundle's site-packages, so its packages (and `brain`) win.
 
 MUST NOT import `brain` (the bundle's copy would be pinned in sys.modules before
 the overlay is on the path) and MUST NOT raise: any problem means "no overlay",
-i.e. the release brain runs. Imports: stdlib (hashlib, json, os, re, shutil, sys,
-pathlib), plus platformdirs lazily.
+i.e. the release brain runs. Imports: stdlib (json, os, re, sys, pathlib) at module
+level; hashlib, shutil and platformdirs are all imported lazily (inside the
+functions that need them), so activate() — which runs at every interpreter
+start — never pays for OpenSSL/etc. that only an update actually needs.
+
+Escape hatch: if the overlay brain can't start, set `KINDLED_NO_OVERLAY=1` in the
+environment before launching — activate() then returns immediately and the
+release brain runs, no matter what current.json says. Run `nell update --revert`
+in that same environment to clear the active overlay for good.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
-import shutil
 import sys
 from pathlib import Path
 
@@ -41,6 +46,8 @@ def home() -> Path:
 
 def activate(site_dir: Path) -> str | None:
     try:
+        if os.environ.get("KINDLED_NO_OVERLAY"):
+            return None
         root = home() / "brain-overlay"
         state = json.loads((root / "current.json").read_text(encoding="utf-8"))
         active = state.get("active") if isinstance(state, dict) else None
@@ -60,18 +67,31 @@ def activate(site_dir: Path) -> str | None:
         if index is None:
             return None  # can't place it before the bundle; running the release brain is safe
         sys.path.insert(index, str(folder))
+        _unload_platformdirs()
         return str(folder)
     except Exception:
         return None
 
 
+def _unload_platformdirs() -> None:
+    """Drop any platformdirs module(s) the hook imported. Called after the overlay
+    folder goes on sys.path so an overlay's own (possibly newer) platformdirs can
+    load fresh instead of reusing the bundle's cached copy."""
+    for name in [m for m in sys.modules if m == "platformdirs" or m.startswith("platformdirs.")]:
+        del sys.modules[name]
+
+
 def compute_bundle_id(requirements: Path, wheel_name: str) -> str:
+    import hashlib
+
     digest = hashlib.sha256(Path(requirements).read_bytes())
     digest.update(b"\0" + wheel_name.encode("utf-8"))
     return digest.hexdigest()
 
 
 def install_hook(site_dir: Path, bundle_id: str) -> None:
+    import shutil
+
     site_dir = Path(site_dir)
     shutil.copyfile(Path(__file__), site_dir / f"{HOOK_MODULE}.py")
     (site_dir / f"{HOOK_MODULE}.pth").write_text(PTH_LINE, encoding="utf-8")
