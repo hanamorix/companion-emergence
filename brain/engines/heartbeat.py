@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import time
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -25,6 +26,7 @@ from brain.bridge.model_tier import (
     build_tier_provider,
 )
 from brain.bridge.provider import LLMProvider
+from brain.dev_constants import HEARTBEAT_DECAY_BATCH_BUDGET_S
 from brain.engines.daemon_state import update_daemon_state
 from brain.health.alarm import compute_pending_alarms
 from brain.health.anomaly import BrainAnomaly
@@ -32,7 +34,15 @@ from brain.health.walker import walk_persona
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.search.base import NoopWebSearcher, WebSearcher
+from brain.utils.file_lock import file_lock
 from brain.utils.time import iso_utc, parse_iso_utc
+
+# Rows fetched per `list_active_since` page inside one decay batch (S17/S45).
+# Not a dev_constants entry: unlike HEARTBEAT_DECAY_BATCH_BUDGET_S, this value
+# has no behavioural effect (it only bounds how many rows are fetched ahead of
+# the per-row time-budget check) — a smaller/larger page changes SQL round
+# trips, not what gets decayed or when a batch commits.
+_DECAY_PAGE_SIZE = 1000
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +234,19 @@ class HeartbeatConfig:
                 shutil.copy2(bak1, path)
 
 
+@dataclass(frozen=True)
+class DecayCursor:
+    """Keyset resume point for an in-progress/interrupted heartbeat decay
+    pass (S1/S17/S33/C30). ``tick_at`` pins the elapsed-time basis a resumed
+    pass must reuse (S17): recomputing elapsed from ``now`` instead would
+    re-decay already-committed rows by a second delta. ``(created_at, id)``
+    is the same keyset shape ``MemoryStore.list_active_since`` uses (S33)."""
+
+    tick_at: datetime
+    created_at: str
+    id: str
+
+
 @dataclass
 class HeartbeatState:
     """Per-persona heartbeat state. Loaded from heartbeat_state.json."""
@@ -234,6 +257,42 @@ class HeartbeatState:
     last_growth_at: datetime  # tz-aware UTC; defaults to now on first save
     tick_count: int
     last_trigger: str
+    # Non-None only while a decay pass is mid-flight/interrupted (S1/S17):
+    # set after every batch commit, cleared when the pass's rows run out.
+    # `last_tick_at` only advances when this is None again (pass complete).
+    decay_cursor: DecayCursor | None = None
+
+    @classmethod
+    def _parse_decay_cursor(cls, data: object) -> DecayCursor | None:
+        """Parse the persisted `decay_cursor` sub-object.
+
+        Deliberately does NOT independently swallow a malformed-but-present
+        cursor into a bare `None` — stage-6 red-team BLOCKER: doing so let a
+        cursor corrupted in isolation (the rest of the state file intact)
+        silently fall back to "no cursor" while `last_tick_at` stayed at its
+        OLD (pre-interrupted-pass) value, so the next tick started a FRESH
+        pass with the SAME elapsed time a completed batch had already
+        applied — a reproducible silent double-decay, contradicting S1's
+        "no row decayed twice" outright. `None` here is returned ONLY for the
+        genuinely-absent case (key missing, or explicit JSON `null`); a
+        PRESENT-but-malformed cursor instead raises, which the caller
+        (`_parse_state_data`'s own try/except) turns into the WHOLE state
+        being treated as corrupt — the SAME `attempt_heal`/backup-rotation
+        recovery every other malformed field on this dataclass already gets
+        (see `load_with_anomaly`'s docstring: reinitializing on corruption is
+        this class's existing, accepted recovery philosophy). Reinitializing
+        resets `last_tick_at` too, so the next tick's elapsed time is 0 for
+        already-decayed rows — safe, unlike silently keeping the stale
+        `last_tick_at` with a dropped cursor."""
+        if data is None:
+            return None
+        if not isinstance(data, dict):
+            raise ValueError("decay_cursor present but not an object")
+        return DecayCursor(
+            tick_at=parse_iso_utc(data["tick_at"]),
+            created_at=str(data["created_at"]),
+            id=str(data["id"]),
+        )
 
     @classmethod
     def _parse_state_data(cls, data: object) -> HeartbeatState | None:
@@ -249,6 +308,7 @@ class HeartbeatState:
                 last_growth_at=parse_iso_utc(data.get("last_growth_at") or data["last_tick_at"]),
                 tick_count=int(data["tick_count"]),
                 last_trigger=str(data["last_trigger"]),
+                decay_cursor=cls._parse_decay_cursor(data.get("decay_cursor")),
             )
         except (KeyError, TypeError, ValueError):
             return None
@@ -315,6 +375,15 @@ class HeartbeatState:
             "last_growth_at": iso_utc(self.last_growth_at),
             "tick_count": self.tick_count,
             "last_trigger": self.last_trigger,
+            "decay_cursor": (
+                {
+                    "tick_at": iso_utc(self.decay_cursor.tick_at),
+                    "created_at": self.decay_cursor.created_at,
+                    "id": self.decay_cursor.id,
+                }
+                if self.decay_cursor is not None
+                else None
+            ),
         }
         treatment = compute_treatment(path.parent, path.name)
         save_with_backup(path, payload, backup_count=treatment.backup_count)
@@ -359,6 +428,10 @@ class HeartbeatResult:
     growth_error: str | None = None
     anomalies: tuple[BrainAnomaly, ...] = ()
     pending_alarms_count: int = 0
+    # Non-None only when this call did no work at all because another
+    # process/thread already holds the heartbeat's cross-process guard
+    # (C30) — the pass was skipped, not run and found nothing to do.
+    skipped_reason: str | None = None
 
 
 @dataclass
@@ -426,74 +499,213 @@ class HeartbeatEngine:
         """
         now = datetime.now(UTC)
 
-        # Collect per-tick anomalies from direct heartbeat-engine loads (config + state).
-        tick_anomalies: list[BrainAnomaly] = []
-
         config, config_anomaly = HeartbeatConfig.load_with_anomaly(self.config_path)
-        if config_anomaly is not None:
-            tick_anomalies.append(config_anomaly)
 
-        state, state_anomaly = HeartbeatState.load_with_anomaly(self.state_path)
-        if state_anomaly is not None:
-            tick_anomalies.append(state_anomaly)
+        # Cross-process guard (C30): only one heartbeat pass — bridge
+        # supervisor, `nell heartbeat` CLI, or the shutdown close tick —
+        # reads/decays/writes `heartbeat_state.json` at a time. This lives
+        # INSIDE run_tick itself (not a caller-side check) so every caller
+        # goes through it (all of cli.py's/server.py's/supervisor.py's
+        # run_tick call sites). A losing pass skips entirely (logged)
+        # rather than racing the winner.
+        #
+        # Stage-6 red-team MAJOR, fixed: `state` is loaded from disk ONLY
+        # AFTER the lock is held (never before), and this whole function
+        # body — including the first-ever-tick init branch, which also
+        # WRITES `heartbeat_state.json` — runs under that same lock. Loading
+        # state before attempting the lock (the original shape) let a caller
+        # that read a stale snapshot, then acquired the lock only after a
+        # DIFFERENT process's pass had already completed and released it,
+        # overwrite that process's freshly-completed state with its own
+        # stale one (a TOCTOU clobber) — reading under the lock closes it.
+        with file_lock(self.state_path, blocking=False) as acquired:
+            if not acquired:
+                logger.info(
+                    "heartbeat pass skipped: another process/thread holds "
+                    "the heartbeat lock (C30); will retry next tick"
+                )
+                return HeartbeatResult(
+                    trigger=trigger,
+                    elapsed_seconds=0.0,
+                    memories_decayed=0,
+                    edges_pruned=0,
+                    dream_id=None,
+                    dream_gated_reason=None,
+                    research_deferred=False,
+                    heartbeat_memory_id=None,
+                    initialized=False,
+                    anomalies=(),
+                    pending_alarms_count=0,
+                    skipped_reason="heartbeat_locked",
+                )
 
-        # Cross-file walk gate: >=2 anomalies triggers a full persona scan.
-        # Deduplicate by (file, kind) so files already caught in direct loads
-        # are not double-counted.
-        if len(tick_anomalies) >= 2:
-            _walk_persona_dir = (
+            tick_anomalies: list[BrainAnomaly] = []
+            if config_anomaly is not None:
+                tick_anomalies.append(config_anomaly)
+
+            state, state_anomaly = HeartbeatState.load_with_anomaly(self.state_path)
+            if state_anomaly is not None:
+                tick_anomalies.append(state_anomaly)
+
+            # Cross-file walk gate: >=2 anomalies triggers a full persona scan.
+            # Deduplicate by (file, kind) so files already caught in direct
+            # loads are not double-counted.
+            if len(tick_anomalies) >= 2:
+                _walk_persona_dir = (
+                    self.interests_path.parent
+                    if self.interests_path is not None
+                    else self.state_path.parent
+                )
+                seen: set[tuple[str, str]] = {(a.file, a.kind) for a in tick_anomalies}
+                for walk_anomaly in walk_persona(_walk_persona_dir):
+                    key = (walk_anomaly.file, walk_anomaly.kind)
+                    if key not in seen:
+                        tick_anomalies.append(walk_anomaly)
+                        seen.add(key)
+
+            # First-ever tick: defer all work
+            if state is None:
+                # Compute pending alarms even on init tick (anomalies may
+                # exist from corrupt state)
+                if self.interests_path is not None:
+                    persona_dir = self.interests_path.parent
+                else:
+                    persona_dir = self.state_path.parent
+                pending_alarms_count = len(compute_pending_alarms(persona_dir))
+
+                if not dry_run:
+                    fresh = HeartbeatState.fresh(trigger=trigger)
+                    fresh.save(self.state_path)
+                    self._append_log(
+                        {
+                            "timestamp": iso_utc(now),
+                            "trigger": trigger,
+                            "initialized": True,
+                            "note": "first-ever tick, work deferred",
+                            "tick_count": 0,
+                            "anomalies": [a.to_dict() for a in tick_anomalies],
+                            "pending_alarms_count": pending_alarms_count,
+                        }
+                    )
+                return HeartbeatResult(
+                    trigger=trigger,
+                    elapsed_seconds=0.0,
+                    memories_decayed=0,
+                    edges_pruned=0,
+                    dream_id=None,
+                    dream_gated_reason="first_tick",
+                    research_deferred=False,
+                    heartbeat_memory_id=None,
+                    initialized=True,
+                    anomalies=tuple(tick_anomalies),
+                    pending_alarms_count=pending_alarms_count,
+                )
+
+            # Resume check (S1/S17/S46): a saved decay cursor means the
+            # PREVIOUS pass didn't finish (interrupted by a failure or a
+            # crash) — this tick does ONLY the resumed decay, at the SAME
+            # tick_at the interrupted pass used (S17), then stops: "then
+            # (same tick) nothing else — a resumed pass completes the SAME
+            # tick's work; the next fresh pass happens on the following
+            # timer tick" (spec §5). Dream/research/hebbian/growth for
+            # *this* invocation are simply not run; they run on the next
+            # (fresh) tick instead.
+            if state.decay_cursor is not None:
+                return self._resume_decay_only(trigger, dry_run, state, tick_anomalies)
+
+            return self._run_tick_body(
+                now, trigger, dry_run, forced_resonance, config, state, tick_anomalies
+            )
+
+    def _resume_decay_only(
+        self,
+        trigger: str,
+        dry_run: bool,
+        state: HeartbeatState,
+        tick_anomalies: list[BrainAnomaly],
+    ) -> HeartbeatResult:
+        """Finish an interrupted decay pass, and nothing else this tick.
+
+        Called only when `state.decay_cursor` is already set on entry
+        (a prior pass committed at least one batch, then failed/crashed
+        before the pass as a whole completed). Reuses that cursor's own
+        `tick_at` for elapsed-time math (S17) rather than `now`, so the
+        resumed rows decay by the SAME delta an uninterrupted pass would
+        have applied — never a second, additional delta.
+        """
+        assert state.decay_cursor is not None
+        tick_at = state.decay_cursor.tick_at
+        elapsed_seconds = (tick_at - state.last_tick_at).total_seconds()
+        memories_decayed = self._apply_emotion_decay(
+            elapsed_seconds, tick_at=tick_at, state=state, dry_run=dry_run
+        )
+
+        pending_alarms_count = 0
+        if not dry_run:
+            persona_dir = (
                 self.interests_path.parent
                 if self.interests_path is not None
                 else self.state_path.parent
             )
-            seen: set[tuple[str, str]] = {(a.file, a.kind) for a in tick_anomalies}
-            for walk_anomaly in walk_persona(_walk_persona_dir):
-                key = (walk_anomaly.file, walk_anomaly.kind)
-                if key not in seen:
-                    tick_anomalies.append(walk_anomaly)
-                    seen.add(key)
-
-        # First-ever tick: defer all work
-        if state is None:
-            # Compute pending alarms even on init tick (anomalies may exist from corrupt state)
-            if self.interests_path is not None:
-                persona_dir = self.interests_path.parent
-            else:
-                persona_dir = self.state_path.parent
             pending_alarms_count = len(compute_pending_alarms(persona_dir))
-
-            if not dry_run:
-                fresh = HeartbeatState.fresh(trigger=trigger)
-                fresh.save(self.state_path)
-                self._append_log(
-                    {
-                        "timestamp": iso_utc(now),
-                        "trigger": trigger,
-                        "initialized": True,
-                        "note": "first-ever tick, work deferred",
-                        "tick_count": 0,
-                        "anomalies": [a.to_dict() for a in tick_anomalies],
-                        "pending_alarms_count": pending_alarms_count,
-                    }
-                )
-            return HeartbeatResult(
-                trigger=trigger,
-                elapsed_seconds=0.0,
-                memories_decayed=0,
-                edges_pruned=0,
-                dream_id=None,
-                dream_gated_reason="first_tick",
-                research_deferred=False,
-                heartbeat_memory_id=None,
-                initialized=True,
-                anomalies=tuple(tick_anomalies),
-                pending_alarms_count=pending_alarms_count,
+            # `_apply_emotion_decay` above always either raises (propagating
+            # out of this call, leaving `state.decay_cursor` set from the
+            # last successful batch) or returns with the pass fully
+            # complete (`state.decay_cursor is None`) — a normal return
+            # here always means "done", so `last_tick_at` advances to the
+            # cursor's own tick_at (S17), not to a fresh `now`.
+            state.last_tick_at = tick_at
+            state.tick_count += 1
+            state.last_trigger = trigger
+            state.save(self.state_path)
+            self._append_log(
+                {
+                    "timestamp": iso_utc(datetime.now(UTC)),
+                    "trigger": trigger,
+                    "initialized": False,
+                    "resumed_decay_only": True,
+                    "elapsed_seconds": elapsed_seconds,
+                    "memories_decayed": memories_decayed,
+                    "tick_count": state.tick_count,
+                    "anomalies": [a.to_dict() for a in tick_anomalies],
+                    "pending_alarms_count": pending_alarms_count,
+                }
             )
 
+        return HeartbeatResult(
+            trigger=trigger,
+            elapsed_seconds=elapsed_seconds,
+            memories_decayed=memories_decayed,
+            edges_pruned=0,
+            dream_id=None,
+            dream_gated_reason="resumed_decay_only",
+            research_deferred=False,
+            heartbeat_memory_id=None,
+            initialized=False,
+            anomalies=tuple(tick_anomalies),
+            pending_alarms_count=pending_alarms_count,
+        )
+
+    def _run_tick_body(
+        self,
+        now: datetime,
+        trigger: str,
+        dry_run: bool,
+        forced_resonance: float | None,
+        config: HeartbeatConfig,
+        state: HeartbeatState,
+        tick_anomalies: list[BrainAnomaly],
+    ) -> HeartbeatResult:
+        """A fresh (non-resumed) tick: decay, then everything else, as before
+        this increment — only the decay call itself changed (batched,
+        cursor'd, S17/S24/S45). Entered only when `state.decay_cursor` was
+        None on entry, i.e. no earlier pass is mid-flight."""
         elapsed_seconds = (now - state.last_tick_at).total_seconds()
 
         # Emotion decay
-        memories_decayed = self._apply_emotion_decay(elapsed_seconds, dry_run=dry_run)
+        memories_decayed = self._apply_emotion_decay(
+            elapsed_seconds, tick_at=now, state=state, dry_run=dry_run
+        )
 
         # Hebbian decay + GC
         edges_pruned = self._apply_hebbian_decay_and_gc(config, elapsed_seconds, dry_run=dry_run)
@@ -675,33 +887,104 @@ class HeartbeatEngine:
 
     # --- private helpers ---
 
-    def _apply_emotion_decay(self, elapsed_seconds: float, *, dry_run: bool) -> int:
-        """Apply per-memory emotion decay. Returns count of memories mutated."""
+    def _apply_emotion_decay(
+        self,
+        elapsed_seconds: float,
+        *,
+        tick_at: datetime,
+        state: HeartbeatState,
+        dry_run: bool,
+    ) -> int:
+        """Apply per-memory emotion decay in time-budgeted batches (S17/S24/
+        S45), resuming from `state.decay_cursor` if one is already set on
+        entry. Returns the total count of memories mutated across every
+        batch run by THIS call.
+
+        One `MemoryStore.update_emotions_batch` transaction per batch
+        (C10(b)); `state.decay_cursor` is persisted to disk after every
+        batch commit (S17/S33) so a mid-pass crash or a write failure (e.g.
+        "database is locked") leaves a cursor the next tick resumes from —
+        no row already committed this pass is ever decayed a second time.
+
+        A batch ending because the time budget tripped or a page ran short
+        is normal — the loop below simply starts the next batch — it does
+        NOT end the pass; only rows genuinely running out (`list_active_since`
+        returns fewer than `limit` and every one of them was examined) ends
+        it, at which point `state.decay_cursor` is cleared. The only way this
+        call returns WITHOUT clearing the cursor is by raising (propagating
+        to the caller, which does not catch it — see C9(a)'s "database is
+        locked" fail-first): the pass is then genuinely interrupted, and
+        `state.last_tick_at` is left untouched by the caller.
+        """
         from brain.emotion.decay import apply_decay
         from brain.emotion.state import EmotionalState
 
-        if elapsed_seconds <= 0.0 or dry_run:
+        if dry_run or elapsed_seconds <= 0.0:
             return 0
 
-        count = 0
-        all_memories = self.store.list_active()
-        for mem in all_memories:
-            if mem.protected:
-                continue
-            if not mem.emotions:
-                continue
-            emo_state = EmotionalState()
-            for name, intensity in mem.emotions.items():
-                try:
-                    emo_state.set(name, float(intensity))
-                except (KeyError, ValueError):
-                    continue
-            apply_decay(emo_state, elapsed_seconds)
-            new_emotions = {name: val for name, val in emo_state.emotions.items() if val > 0.0}
-            if new_emotions != mem.emotions:
-                self.store.update(mem.id, emotions=new_emotions)
-                count += 1
-        return count
+        total = 0
+        cursor: tuple[str, str] | None = (
+            (state.decay_cursor.created_at, state.decay_cursor.id)
+            if state.decay_cursor is not None
+            else None
+        )
+
+        while True:
+            rows = self.store.list_active_since(cursor, limit=_DECAY_PAGE_SIZE)
+            if not rows:
+                # Nothing left after the cursor: the pass is complete.
+                state.decay_cursor = None
+                state.save(self.state_path)
+                break
+
+            batch_start = time.monotonic()
+            changed: list[tuple[str, dict[str, float]]] = []
+            examined_all_fetched = True
+            for mem in rows:
+                cursor = (mem.created_at.isoformat(), mem.id)
+                if not mem.protected and mem.emotions:
+                    emo_state = EmotionalState()
+                    for name, intensity in mem.emotions.items():
+                        try:
+                            emo_state.set(name, float(intensity))
+                        except (KeyError, ValueError):
+                            continue
+                    apply_decay(emo_state, elapsed_seconds)
+                    new_emotions = {
+                        name: val for name, val in emo_state.emotions.items() if val > 0.0
+                    }
+                    # Write only rows whose values actually change (S18);
+                    # unchanged/no-emotion/protected rows advance the
+                    # cursor above without joining this batch's UPDATEs.
+                    if new_emotions != mem.emotions:
+                        changed.append((mem.id, new_emotions))
+                # Budget checked after each row (S45), not each batch.
+                if time.monotonic() - batch_start >= HEARTBEAT_DECAY_BATCH_BUDGET_S:
+                    examined_all_fetched = mem is rows[-1]
+                    break
+
+            if changed:
+                self.store.update_emotions_batch(changed)
+                total += len(changed)
+
+            # Persist the resume point after every batch commit (S17/S33),
+            # even if this pass turns out to finish immediately after —
+            # a crash between here and the next iteration's fetch still
+            # resumes correctly (cursor already reflects everything just
+            # written).
+            state.decay_cursor = DecayCursor(
+                tick_at=tick_at, created_at=cursor[0], id=cursor[1]
+            )
+            state.save(self.state_path)
+
+            if len(rows) < _DECAY_PAGE_SIZE and examined_all_fetched:
+                # Fewer rows than a full page came back AND we reached the
+                # last one — no more work exists after this cursor.
+                state.decay_cursor = None
+                state.save(self.state_path)
+                break
+
+        return total
 
     def _apply_hebbian_decay_and_gc(
         self, config: HeartbeatConfig, elapsed_seconds: float, *, dry_run: bool

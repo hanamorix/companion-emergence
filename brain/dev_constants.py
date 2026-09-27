@@ -43,6 +43,17 @@ MEMORIES_DB_BUSY_TIMEOUT_S: float = 30.0
 # JUDGE_TUNE_GATE_HANDFUL_DECISIONS`, which re-exports this value.
 JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS: int = 200
 
+# --- heartbeat decay batch time budget (S24, S45, S47) ---------------------
+# Caps how long a single heartbeat decay batch (one `memories.db` write
+# transaction, `HeartbeatEngine._apply_emotion_decay`) may run before it
+# commits and the heartbeat saves its resume cursor, so a decay pass over a
+# large corpus never holds the write lock for longer than about this many
+# seconds at a stretch (S48/S58's busy-timeout sizing assumes this bound).
+# Checked after each row, not each batch (S45). ~2,500 rows/batch at the
+# measured 0.4 ms/row in-txn rate (2-plan.md §5.2, F-bob20k). A batch may
+# also end earlier if the rows run out.
+HEARTBEAT_DECAY_BATCH_BUDGET_S: float = 1.0
+
 # --- search_memories-via-bridge call timeout (S67) -------------------------
 # The MCP child's httpx call to the bridge's POST /tools/search_memories
 # (brain/mcp_server/tools.py). Sized below the claude CLI's 60 s tool-silence

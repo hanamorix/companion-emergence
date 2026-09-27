@@ -17,6 +17,7 @@ import math
 import re
 import sqlite3
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -2272,6 +2273,40 @@ class MemoryStore:
             # clear-on-failure branch in `_reembed_or_clear` is now
             # belt-and-suspenders, since the row is already NULL going in.
             self._reembed_or_clear(memory_id, fields["content"])
+
+    def update_emotions_batch(self, rows: Sequence[tuple[str, dict[str, float]]]) -> None:
+        """Write a batch of emotions-only updates in ONE transaction (C10(b),
+        S17/S45): the heartbeat's batched decay pass, not the per-row
+        ``update(emotions=...)`` path (which commits per call).
+
+        Same column semantics as ``update(emotions=...)``: ``emotions_json``
+        replaced, ``peak_emotion_intensity`` raised via ``MAX(...)`` — never
+        lowered by decay (store.py:2197-2203). No embedding/content column is
+        touched (that branch of ``update`` only fires when ``content`` is
+        among the updated fields, which is never true here) — nothing new is
+        added to the row (I2/I8), and ``PRAGMA table_info(memories)`` is
+        unaffected (no schema change).
+
+        Every ``execute`` below runs before the single trailing ``commit()``,
+        so the whole batch is exactly one transaction (sqlite3's default
+        deferred-transaction behavior: an implicit BEGIN on the first write,
+        held open until this commit) — never one transaction per row. Callers
+        are responsible for pre-filtering to rows whose emotions actually
+        changed (S18); this method does not re-check and will happily rewrite
+        an unchanged row if asked to.
+
+        No-op (no transaction opened, no commit) when ``rows`` is empty.
+        """
+        if not rows:
+            return
+        for memory_id, emotions in rows:
+            new_max = max((float(v) for v in emotions.values()), default=0.0)
+            self._conn.execute(
+                "UPDATE memories SET emotions_json = ?, "
+                "peak_emotion_intensity = MAX(peak_emotion_intensity, ?) WHERE id = ?",
+                (json.dumps(emotions), new_max, memory_id),
+            )
+        self._conn.commit()
 
     def deactivate(self, memory_id: str) -> None:
         """Mark a memory inactive (F22 semantics). Raises KeyError if unknown."""

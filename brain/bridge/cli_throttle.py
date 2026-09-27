@@ -112,6 +112,19 @@ def note_reply_end(at: float | None = None) -> None:
         _inflight_replies = max(0, _inflight_replies - 1)
 
 
+def reply_in_flight() -> bool:
+    """True iff a chat reply is currently being generated in this process
+    (``_inflight_replies > 0``, the same counter ``is_chat_idle`` reads).
+
+    Distinct from ``is_chat_idle`` (which ALSO requires the lull to have
+    elapsed): the heartbeat's own start check (S21) cares only about "is a
+    reply in flight right now", not the lull — once started, a heartbeat
+    pass runs to completion even if a reply starts mid-pass, so this is
+    checked once, at the very start of a pass, never again during it."""
+    with _lock:
+        return _inflight_replies > 0
+
+
 def time_since_last_message(*, now: float | None = None) -> float:
     """Seconds since the last user message / reply-end, whichever is later.
 

@@ -607,10 +607,25 @@ def run_folded(
                 and last_heartbeat_at is not None
                 and time.monotonic() - last_heartbeat_at >= heartbeat_interval_s
             ):
-                _last_intensity_drivers = _heartbeat_and_felt_time(
+                _heartbeat_attempt_result = _heartbeat_and_felt_time(
                     persona_dir, provider, event_bus, last_heartbeat_at
                 )
-                last_heartbeat_at = time.monotonic()
+                # Stage-6 red-team MAJOR, fixed (ram-spike-fix INC-7, S21):
+                # `_heartbeat_and_felt_time` now returns None WITHOUT doing
+                # anything when a chat reply is in flight (the new start
+                # check) — advancing `last_heartbeat_at` unconditionally in
+                # that case would restart this whole 15-min countdown on a
+                # tick that did no work, so a chat session busy enough to
+                # almost always have a reply in flight near the 15-min mark
+                # could defer the heartbeat far past its own interval,
+                # indefinitely. Only advance on an ACTUAL attempt (non-None
+                # return) — a skipped tick leaves `last_heartbeat_at`
+                # untouched, so the very next supervisor loop pass (seconds
+                # away, not 15 minutes) re-checks immediately instead of
+                # waiting out a full fresh interval.
+                if _heartbeat_attempt_result is not None:
+                    _last_intensity_drivers = _heartbeat_attempt_result
+                    last_heartbeat_at = time.monotonic()
 
             # Soul-review cadence — slowest of the three. Each pass is up to
             # 5 LLM calls (one per candidate). Fault-isolated so a model
@@ -1236,7 +1251,22 @@ def _heartbeat_and_felt_time(
     without driving the full run_folded loop. Fault-isolated: heartbeat
     errors are caught and reflex_n defaults to 0; felt-time errors are
     caught and None is returned. The caller updates last_heartbeat_at.
+
+    Start check (S21, C9(b)): does not start a pass — heartbeat OR
+    felt-time — while a chat reply is being generated, checked once here;
+    once a pass has started (this check passed) it always runs to
+    completion even if a reply starts mid-pass (the heartbeat engine
+    itself never re-checks this once inside `run_tick`). This is the ONLY
+    caller of `run_tick` that carries this check — `nell heartbeat` (a
+    separate process, cli.py) and the shutdown close tick (server.py) are
+    not gated on it.
     """
+    if cli_throttle.reply_in_flight():
+        logger.debug(
+            "supervisor heartbeat tick deferred: a chat reply is in flight (S21)"
+        )
+        return None
+
     from brain.felt_time.chat_log import count_chat_turns_since
 
     heartbeat_result = None
