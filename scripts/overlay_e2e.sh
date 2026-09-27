@@ -7,20 +7,22 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RT="$REPO/app/src-tauri/python-runtime"
 WORK="$(mktemp -d)"
-export KINDLED_HOME="$WORK/home"
+trap 'rm -rf "$WORK"' EXIT
 unset NELLBRAIN_HOME
 case "$(uname -s)" in
+  # Windows: call the bundled python.exe the way nell.bat does (Git Bash can't exec the .bat cleanly — see app/build_python_runtime.sh step 6a). What this proves is that the bundled python.exe and pythonw.exe process the overlay .pth; nell.bat itself is covered by tests/integration/test_nell_bat_wrapper.py and the build's verify step.
   MINGW*|MSYS*|CYGWIN*)
     PY="$RT/python.exe"; PYW="$RT/pythonw.exe"
+    export KINDLED_HOME="$(cygpath -w "$WORK/home")"
     nell() { "$PY" -P -c "import sys; from brain.cli import main; sys.exit(main())" "$@"; };;
   *)
     PY="$RT/bin/python3"; PYW=""
+    export KINDLED_HOME="$WORK/home"
     nell() { "$RT/bin/nell" "$@"; };;
 esac
 where_brain() { "$1" -P -c "import brain, sys; sys.stdout.write(brain.__file__)"; }
 
 cd "$REPO"
-rm -rf "$WORK/dist"
 uv build --wheel --out-dir "$WORK/dist" >/dev/null
 uv export --format requirements-txt --no-dev --no-emit-project --locked --quiet --output-file "$WORK/req.txt"
 WHL="$(ls "$WORK"/dist/*.whl | head -n1)"
