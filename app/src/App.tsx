@@ -578,6 +578,7 @@ function PresenceIdentity({
   isSpeaking: boolean;
 }) {
   const statusLine = isSpeaking ? "thinking…" : humanizeEmotionStatus(state?.emotions ?? null);
+  const backgroundJobsLine = humanizeBackgroundJobs(state?.background_jobs ?? null);
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 18, marginTop: 18 }}>
       <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
@@ -599,6 +600,9 @@ function PresenceIdentity({
         </div>
         {statusLine && (
           <div style={{ fontSize: 12, color: "var(--text-mute)" }}>{statusLine}</div>
+        )}
+        {backgroundJobsLine && (
+          <div style={{ fontSize: 12, color: "var(--text-mute)" }}>{backgroundJobsLine}</div>
         )}
       </div>
       <div
@@ -653,6 +657,44 @@ function humanizeEmotionStatus(emotions: Record<string, number> | null): string 
   if (top.length === 0) return null;
   if (top.length === 1) return `${top[0]} climbing`;
   return `${top[0]} climbing · ${top[1]} underneath`;
+}
+
+/** ram-spike-fix INC-11 (spec §6, S15/S23/S38): the background-work line's
+ *  exact wording is Roy's call, set at the end of the build (I10) — this is
+ *  a PLACEHOLDER. "{jobs}" is replaced with the joined display names below.
+ *  Kept as one named constant so the real copy drops in at one place. */
+const BACKGROUND_JOBS_LINE_PLACEHOLDER = "PLACEHOLDER background work: {jobs}";
+
+/** PLACEHOLDER per-job display names (ram-spike-fix INC-11, I10) — Roy's
+ *  call, set at the end of the build. Keys are the bridge's job/heartbeat
+ *  names (brain/bridge/central_cadence.py GATED_JOB_ORDER, plus
+ *  "heartbeat"); an unrecognized name (e.g. a newer bridge) falls back to
+ *  the raw name so the line still renders something. */
+const JOB_DISPLAY_NAMES_PLACEHOLDER: Record<string, string> = {
+  pass2: "PLACEHOLDER pass2",
+  session_snapshot_prune: "PLACEHOLDER session snapshot prune",
+  emotion_backfill: "PLACEHOLDER emotion backfill",
+  embedding_backfill: "PLACEHOLDER embedding backfill",
+  maintenance: "PLACEHOLDER maintenance",
+  interest_sweep: "PLACEHOLDER interest sweep",
+  self_model_articulation: "PLACEHOLDER self model articulation",
+  compaction: "PLACEHOLDER compaction",
+  clustering: "PLACEHOLDER clustering",
+  deploy_recalibration: "PLACEHOLDER deploy recalibration",
+  daily_calibration: "PLACEHOLDER daily calibration",
+  weekly_selftune: "PLACEHOLDER weekly selftune",
+  finalize: "PLACEHOLDER finalize",
+  initiate_review: "PLACEHOLDER initiate review",
+  heartbeat: "PLACEHOLDER heartbeat",
+};
+
+/** Renders the background-work line, or null when nothing is running
+ *  (ram-spike-fix INC-11). Wording is a placeholder throughout — see the
+ *  two constants above. */
+function humanizeBackgroundJobs(jobs: string[] | null): string | null {
+  if (!jobs || jobs.length === 0) return null;
+  const names = jobs.map((j) => JOB_DISPLAY_NAMES_PLACEHOLDER[j] ?? j);
+  return BACKGROUND_JOBS_LINE_PLACEHOLDER.replace("{jobs}", names.join(", "));
 }
 
 function capitalize(s: string): string {

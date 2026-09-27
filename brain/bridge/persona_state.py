@@ -37,7 +37,7 @@ from brain.body.session_hours import (
 # function moved to brain.body.session_hours so brain.tools.dispatch can
 # import it without crossing into the bridge layer. See the new module's
 # docstring for the migration context.
-from brain.bridge import provider_auth
+from brain.bridge import background_jobs, provider_auth
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +53,8 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
         most recent on tie)
       - mode: "live" | "offline" — derived from data availability
       - persona: str — persona name (from persona_dir.name)
+      - background_jobs: list[str] — currently-running gated job/heartbeat
+        names (ram-spike-fix INC-11); [] when none are running
 
     Never raises. Each subsystem failure contributes None / {} rather
     than propagating.
@@ -75,6 +77,11 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
         "provider_auth_expired": provider_auth.state()["status"] == "expired",
         "felt_time_recovered": _felt_time_recovered(persona_dir),
         "narrative_memory_recovered": _narrative_memory_replayed(persona_dir),
+        # ram-spike-fix INC-11 (spec §6, S15/S23/S38): names of gated jobs
+        # and/or the heartbeat currently running in this bridge process;
+        # [] when none are. A paused job is not a member (background_jobs
+        # module docstring).
+        "background_jobs": background_jobs.snapshot(),
     }
 
 

@@ -289,4 +289,56 @@ describe("App presence column (glass redesign)", () => {
     );
     expect(screen.getByText(/rest need/)).toBeInTheDocument();
   });
+
+  it("shows a background-work line naming running jobs, cleared when none run", async () => {
+    // ram-spike-fix INC-11 (spec §6, S15/S23/S38). Wording is a placeholder
+    // (Roy's call, I10) — this test asserts presence/clearing, not text.
+    const runningState = (jobs: string[]) => ({
+      persona: "nell",
+      emotions: {},
+      body: null,
+      interior: { dream: null, research: null, heartbeat: null, reflex: null },
+      soul_highlight: null,
+      connection: { provider: "claude-cli", model: null, last_heartbeat_at: null },
+      mode: "live" as const,
+      recovering: false,
+      felt_time_recovered: false,
+      background_jobs: jobs,
+    });
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      fetchPersonaState
+        .mockReset()
+        .mockResolvedValueOnce(runningState(["compaction", "heartbeat"])) // poll 1: running
+        .mockResolvedValue(runningState([])); // poll 2+: cleared
+
+      render(<App />);
+      await waitFor(() => expect(screen.getByText(/PLACEHOLDER/)).toBeInTheDocument());
+
+      await vi.advanceTimersByTimeAsync(5000); // poll 2
+      await waitFor(() => expect(screen.queryByText(/PLACEHOLDER/)).not.toBeInTheDocument());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("renders no background-work line when the field is absent (older bridge)", async () => {
+    fetchPersonaState.mockReset().mockResolvedValue({
+      persona: "nell",
+      emotions: {},
+      body: null,
+      interior: { dream: null, research: null, heartbeat: null, reflex: null },
+      soul_highlight: null,
+      connection: { provider: "claude-cli", model: null, last_heartbeat_at: null },
+      mode: "live",
+      recovering: false,
+      felt_time_recovered: false,
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText(/Nell/)).toBeInTheDocument());
+    expect(screen.queryByText(/PLACEHOLDER/)).not.toBeInTheDocument();
+  });
 });

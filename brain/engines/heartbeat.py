@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Literal, get_args
 
 from brain import prompt_strings
+from brain.bridge import background_jobs
 from brain.bridge.cli_throttle import ThrottleDeferred
 from brain.bridge.model_tier import (
     TIER_BACKGROUND_CLASSIFIER,
@@ -615,12 +616,17 @@ class HeartbeatEngine:
             # timer tick" (spec §5). Dream/research/hebbian/growth for
             # *this* invocation are simply not run; they run on the next
             # (fresh) tick instead.
+            # INC-11 (S15/S23/S38): publish "heartbeat" as running only around
+            # actual work — never around the lock-skip or first-ever-tick
+            # (deferred, no decay) returns above, both already returned by now.
             if state.decay_cursor is not None:
-                return self._resume_decay_only(trigger, dry_run, state, tick_anomalies)
+                with background_jobs.running("heartbeat"):
+                    return self._resume_decay_only(trigger, dry_run, state, tick_anomalies)
 
-            return self._run_tick_body(
-                now, trigger, dry_run, forced_resonance, config, state, tick_anomalies
-            )
+            with background_jobs.running("heartbeat"):
+                return self._run_tick_body(
+                    now, trigger, dry_run, forced_resonance, config, state, tick_anomalies
+                )
 
     def _resume_decay_only(
         self,

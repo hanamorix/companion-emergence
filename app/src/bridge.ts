@@ -155,6 +155,11 @@ export interface PersonaState {
    *  Optional so older bridge builds without the field parse — falls through
    *  to undefined and the UI treats it as an empty list. */
   pending_writes?: PendingWrite[];
+  /** Names of gated background jobs and/or the heartbeat currently running
+   *  in the bridge process (ram-spike-fix INC-11); [] when none are.
+   *  Optional so older bridge builds without the field degrade to no line
+   *  shown. A paused job is not included. */
+  background_jobs?: string[];
 }
 
 export interface PendingWrite {

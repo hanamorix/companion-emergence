@@ -54,7 +54,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from brain.bridge import cli_throttle, persisted_cadence
+from brain.bridge import background_jobs, cli_throttle, persisted_cadence
 
 logger = logging.getLogger(__name__)
 
@@ -226,7 +226,11 @@ def run_central_pass(
 
         _decide(job.name, "run")
         try:
-            outcome = job.run()
+            # INC-11 (S15/S23/S38): publish this job as running for the
+            # duration of `run()` only — a paused job has already returned
+            # (JobOutcome.PAUSED below) and so is no longer a member.
+            with background_jobs.running(job.name):
+                outcome = job.run()
         except Exception:  # noqa: BLE001 — S44: a job that raises still advances
             logger.exception("central cadence: job=%s raised", job.name)
             outcome = JobOutcome.COMPLETED
