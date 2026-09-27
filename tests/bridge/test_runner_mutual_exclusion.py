@@ -5,6 +5,11 @@ spawned a live bridge (two supervisors, parallel soul review). The runner now
 holds the same is_running + lockfile guard cmd_run does."""
 from __future__ import annotations
 
+import subprocess
+import sys
+import time
+from pathlib import Path
+
 import brain.bridge.runner as runner
 from brain.bridge import daemon, state_file
 
@@ -37,3 +42,80 @@ def test_runner_acquires_lock_runs_then_releases(tmp_path, monkeypatch):
     fd = daemon.acquire_lock(tmp_path)
     assert fd is not None
     daemon.release_lock(tmp_path, fd)
+
+
+_WORKER_SCRIPT = str(Path(__file__).parent / "_runner_lock_worker.py")
+
+
+def test_c19b_two_runner_children_started_at_once_exactly_one_wins(tmp_path):
+    """C19(b): two `runner.main` children started directly at once (real OS
+    processes, real `brain.bridge.daemon.acquire_lock`/msvcrt-or-flock lock —
+    see `_runner_lock_worker.py`'s docstring for exactly what's stubbed and
+    why it still exercises the real exclusion). Exactly one ends up holding
+    the lock; the other exits 2 having never reached `run_bridge_foreground`
+    (never "wrote bridge.json or bound a port"); the lock file's inode is
+    unchanged across the whole race, and it is never unlinked.
+
+    Uses `sys.executable` + a real subprocess (no fork-only API), so this
+    runs unmodified on the Windows/macOS CI runners too.
+    """
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    lock_path = persona_dir / daemon.LOCKFILE
+    stop_file = tmp_path / "stop"
+    marker_a = tmp_path / "marker-a.txt"
+    marker_b = tmp_path / "marker-b.txt"
+
+    procs = [
+        subprocess.Popen(
+            [
+                sys.executable,
+                _WORKER_SCRIPT,
+                "--persona-dir",
+                str(persona_dir),
+                "--marker",
+                str(marker),
+                "--stop-file",
+                str(stop_file),
+            ]
+        )
+        for marker in (marker_a, marker_b)
+    ]
+
+    try:
+        # Wait for the race to settle: one sibling exits quickly (the loser,
+        # rc=2, no marker); the other blocks in the stub (the winner).
+        deadline = time.time() + 20.0
+        loser_idx = None
+        while time.time() < deadline:
+            for i, proc in enumerate(procs):
+                if proc.poll() is not None:
+                    loser_idx = i
+                    break
+            if loser_idx is not None:
+                break
+            time.sleep(0.05)
+        assert loser_idx is not None, "one sibling should have exited quickly as the loser"
+        winner_idx = 1 - loser_idx
+        loser, winner = procs[loser_idx], procs[winner_idx]
+
+        assert loser.returncode == 2
+        assert winner.poll() is None  # still holding the lock, blocked in the stub
+
+        existing_markers = [m for m in (marker_a, marker_b) if m.exists()]
+        assert len(existing_markers) == 1, "only the winner may have reached run_bridge_foreground"
+
+        inode_while_held = lock_path.stat().st_ino
+
+        # Release the winner.
+        stop_file.write_text("go", encoding="utf-8")
+        assert winner.wait(timeout=15.0) == 0
+
+        assert lock_path.exists()  # S56: never unlinked
+        assert lock_path.stat().st_ino == inode_while_held
+    finally:
+        stop_file.write_text("go", encoding="utf-8")
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=10.0)

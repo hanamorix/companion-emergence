@@ -1705,6 +1705,54 @@ def test_cmd_start_refusal_wording_is_byte_identical(tmp_path: Path, monkeypatch
         daemon.release_lock(persona_dir, held_fd)
 
 
+def test_c14_fcntl_and_msvcrt_imports_are_platform_gated() -> None:
+    """C14 (lock part): no Linux/POSIX-only or Windows-only mechanism is
+    reachable on the required path regardless of platform — `fcntl` must
+    only ever be imported under the non-Windows branch of the `_IS_WINDOWS`
+    guard, `msvcrt` only under the Windows branch, and neither name may be
+    imported anywhere else in the module — via ANY import form (`import X`,
+    `import X as y`, or `from X import ...`), not just a plain `import X`
+    (a red-team pass on an earlier draft of this test found it only checked
+    `ast.Import`, so an ungated `from fcntl import flock` elsewhere in the
+    module would have slipped past every assertion undetected)."""
+    import ast
+    import inspect
+
+    source = inspect.getsource(daemon)
+    tree = ast.parse(source)
+
+    def touched_module_names(nodes: list[ast.AST]) -> list[str]:
+        """Every module name touched by an Import or ImportFrom anywhere in
+        the given subtrees, regardless of import form or nesting depth."""
+        hits: list[str] = []
+        for top in nodes:
+            for sub in ast.walk(top):
+                if isinstance(sub, ast.Import):
+                    hits.extend(alias.name for alias in sub.names)
+                elif isinstance(sub, ast.ImportFrom) and sub.module:
+                    hits.append(sub.module)
+        return hits
+
+    guard = next(
+        (
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.If) and "_IS_WINDOWS" in ast.unparse(node.test)
+        ),
+        None,
+    )
+    assert guard is not None, "expected a top-level `if ... _IS_WINDOWS` guard"
+    assert "msvcrt" in touched_module_names(guard.body)
+    assert "fcntl" in touched_module_names(guard.orelse)
+
+    # Whole-module count: each name must appear as an import target EXACTLY
+    # once — i.e. only at its one gated site above, never anywhere else
+    # (module level, inside a function, via any import form).
+    all_hits = touched_module_names([tree])
+    assert all_hits.count("fcntl") == 1, "fcntl must be imported at exactly one (gated) site"
+    assert all_hits.count("msvcrt") == 1, "msvcrt must be imported at exactly one (gated) site"
+
+
 def test_cmd_stop_on_windows_with_force_terminates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
