@@ -92,6 +92,77 @@ def test_two_overlapping_holders_of_the_same_name_both_have_to_exit(
 
 
 # ---------------------------------------------------------------------------
+# INC-11 follow-up — longest-running-first ordering with elapsed seconds
+# (owner-set NellFace layout: one job per line, longest-running at the top).
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_with_elapsed_is_empty_with_nothing_running() -> None:
+    assert background_jobs.snapshot_with_elapsed() == []
+
+
+def test_snapshot_with_elapsed_orders_longest_running_first() -> None:
+    t0 = 100.0
+    with background_jobs.running("a"):  # started first -> longest-running
+        with background_jobs.running("b"):  # started second
+            with background_jobs.running("c"):  # started last -> most recent
+                names = [n for n, _ in background_jobs.snapshot_with_elapsed(now=t0 + 10)]
+    # entry order isn't meaningful once everything's exited; check the
+    # ordering DURING the overlap instead, captured above via closure:
+    assert names == ["a", "b", "c"]
+
+
+def test_snapshot_with_elapsed_orders_by_actual_start_time_injected() -> None:
+    """Deterministic (ST1.5e-style) construction: fabricate distinct start
+    times directly rather than relying on real elapsed wall time between
+    `with` statements, so the ordering assertion doesn't depend on how fast
+    the test body executes."""
+    with background_jobs.running("first"):
+        with background_jobs.running("second"):
+            with background_jobs.running("third"):
+                # Rewrite the recorded start times to enforce a known order
+                # deterministically (first < second < third, all in the past).
+                background_jobs._started_at["first"] = 1000.0
+                background_jobs._started_at["second"] = 1005.0
+                background_jobs._started_at["third"] = 1009.0
+                result = background_jobs.snapshot_with_elapsed(now=1010.0)
+    assert [n for n, _ in result] == ["first", "second", "third"]
+    elapsed = dict(result)
+    assert elapsed["first"] == pytest.approx(10.0)
+    assert elapsed["second"] == pytest.approx(5.0)
+    assert elapsed["third"] == pytest.approx(1.0)
+
+
+def test_snapshot_with_elapsed_ties_break_alphabetically() -> None:
+    with background_jobs.running("zeta"), background_jobs.running("alpha"):
+        background_jobs._started_at["zeta"] = 500.0
+        background_jobs._started_at["alpha"] = 500.0
+        result = background_jobs.snapshot_with_elapsed(now=600.0)
+    assert [n for n, _ in result] == ["alpha", "zeta"]
+
+
+def test_nested_running_of_the_same_name_does_not_reset_its_start_time() -> None:
+    """A second, overlapping `running(name)` call for a name already
+    running must NOT reset the streak's start time — the elapsed duration
+    reported is for the unbroken streak, not the most recent holder."""
+    with background_jobs.running("heartbeat"):
+        background_jobs._started_at["heartbeat"] = 200.0
+        with background_jobs.running("heartbeat"):  # nested, same name
+            [(_, elapsed)] = background_jobs.snapshot_with_elapsed(now=210.0)
+            assert elapsed == pytest.approx(10.0), "nested entry must not reset the start time"
+
+
+def test_started_at_is_cleared_once_the_name_fully_exits() -> None:
+    with background_jobs.running("compaction"):
+        pass
+    assert "compaction" not in background_jobs._started_at
+    # a later, fresh run gets its OWN start time, not a stale leftover.
+    with background_jobs.running("compaction"):
+        entries = background_jobs.snapshot_with_elapsed()
+    assert entries[0][1] >= 0.0
+
+
+# ---------------------------------------------------------------------------
 # C31(c) — new shared-state accessor: no-lost-update under a hammer test.
 # Deterministic-enough per ST1.5e's "stated number of runs with a pass-rate
 # floor" allowance for a live-race check: a fixed duration, tight-loop hammer

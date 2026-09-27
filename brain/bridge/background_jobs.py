@@ -37,12 +37,19 @@ registry mutate mid-iteration.
 from __future__ import annotations
 
 import threading
+import time
 from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
 
 _lock = threading.Lock()
 _running: Counter[str] = Counter()
+# INC-11 follow-up (owner-set layout, longest-running-first ordering): the
+# monotonic time.monotonic() at which each name's count went 0->1. A NESTED
+# `running(name)` call (the count going 2, 3, ...) does NOT reset this — the
+# elapsed time reported is for the name's current unbroken running streak,
+# not any one holder's own duration.
+_started_at: dict[str, float] = {}
 
 
 @contextmanager
@@ -56,6 +63,8 @@ def running(name: str) -> Iterator[None]:
     name both have to exit before the name clears.
     """
     with _lock:
+        if _running[name] == 0:
+            _started_at[name] = time.monotonic()
         _running[name] += 1
     try:
         yield
@@ -64,17 +73,41 @@ def running(name: str) -> Iterator[None]:
             _running[name] -= 1
             if _running[name] <= 0:
                 del _running[name]
+                _started_at.pop(name, None)
 
 
 def snapshot() -> list[str]:
-    """Sorted list of currently-running job/heartbeat names.
+    """Sorted (alphabetical) list of currently-running job/heartbeat names.
 
     Sorted (not insertion- or completion-order) so two snapshots taken
-    with the same membership always compare equal, and so the app's poll
-    doesn't reorder the line on every tick for no reason.
+    with the same membership always compare equal. Callers that need
+    longest-running-first ordering (the NellFace line) want
+    ``snapshot_with_elapsed`` instead — this one is kept for callers that
+    only need membership.
     """
     with _lock:
         return sorted(_running)
+
+
+def snapshot_with_elapsed(*, now: float | None = None) -> list[tuple[str, float]]:
+    """``[(name, elapsed_seconds), ...]`` for every currently-running name,
+    ordered LONGEST-RUNNING FIRST (ties broken alphabetically, for a
+    deterministic order when two names started in the same clock tick).
+
+    ``elapsed_seconds`` is measured from the ``time.monotonic()`` recorded
+    when the name's refcount went 0->1 — a nested/duplicate ``running(name)``
+    call does not reset it, so the reported duration is always "how long has
+    ANYONE been marking this name running, unbroken" (see the module-level
+    ``_started_at`` note), which is the quantity that's actually meaningful
+    to show a human ("this has been going for N seconds"), not any single
+    holder's own slice of it.
+    """
+    if now is None:
+        now = time.monotonic()
+    with _lock:
+        items = [(name, now - _started_at[name]) for name in _running]
+    items.sort(key=lambda pair: (-pair[1], pair[0]))
+    return items
 
 
 def _reset_for_tests() -> None:
@@ -83,3 +116,4 @@ def _reset_for_tests() -> None:
     elsewhere in this codebase, e.g. ``tunables``)."""
     with _lock:
         _running.clear()
+        _started_at.clear()
