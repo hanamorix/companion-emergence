@@ -904,7 +904,8 @@ def test_spawn_detached_invokes_popen_with_detach_flags(
     class FakeProc:
         pid = 4242
 
-    def fake_popen(cmd, *, stdout, stderr, stdin, start_new_session):
+    def fake_popen(cmd, *, stdout, stderr, stdin, start_new_session, **_kw):
+        # **_kw: `env` is passed on a Windows venv (see bridge_python).
         captured["cmd"] = cmd
         captured["start_new_session"] = start_new_session
         captured["stderr"] = stderr
@@ -927,7 +928,7 @@ def test_spawn_detached_invokes_popen_with_detach_flags(
     assert captured["stdin"] is subprocess.DEVNULL
     assert captured["stdout_is_file"] is True
     cmd = captured["cmd"]
-    assert sys.executable in cmd
+    assert cmd[0] == daemon.bridge_python()[0]
     assert "-m" in cmd and "brain.bridge.runner" in cmd
     assert "--persona-dir" in cmd
     assert "--client-origin" in cmd and "cli" in cmd
@@ -956,7 +957,79 @@ def test_spawn_detached_isolates_the_bridge_from_the_callers_cwd(
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
     daemon.spawn_detached(persona_dir, None, "cli", tmp_path / "bridge.log")
-    assert captured["cmd"][:4] == [sys.executable, "-P", "-m", "brain.bridge.runner"]
+    assert captured["cmd"][:4] == [daemon.bridge_python()[0], "-P", "-m", "brain.bridge.runner"]
+
+
+def _capture_spawn(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    captured: dict[str, object] = {}
+
+    class FakeProc:
+        pid = 7
+
+    def fake_popen(cmd, **kw):
+        captured["cmd"] = cmd
+        captured["kw"] = kw
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    daemon.spawn_detached(persona_dir, None, "cli", tmp_path / "bridge.log")
+    return captured
+
+
+def test_spawn_detached_windows_venv_launches_base_interpreter_not_the_redirector(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows venv: sys.executable is the venv redirector, which runs the real
+    interpreter as a SECOND process, so Popen.pid != the runner's os.getpid()
+    and cmd_start's `s.pid == pid` readiness match could never succeed (the
+    C19(a) windows-latest failure). Spawn the base interpreter directly with
+    __PYVENV_LAUNCHER__, like multiprocessing.popen_spawn_win32 does."""
+    venv_py = str(tmp_path / "venv" / "Scripts" / "python.exe")
+    base_py = str(tmp_path / "base" / "python.exe")
+    monkeypatch.setattr(daemon, "_IS_WINDOWS", True)
+    monkeypatch.setattr(sys, "executable", venv_py)
+    monkeypatch.setattr(sys, "_base_executable", base_py, raising=False)
+    monkeypatch.setenv("KEEP_ME", "1")
+
+    captured = _capture_spawn(tmp_path, monkeypatch)
+    assert captured["cmd"][:4] == [base_py, "-P", "-m", "brain.bridge.runner"]
+    env = captured["kw"]["env"]
+    assert env["__PYVENV_LAUNCHER__"] == venv_py
+    assert env["KEEP_ME"] == "1"  # rest of the environment still inherited
+
+
+def test_spawn_detached_windows_non_venv_uses_sys_executable_and_inherits_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bundled python-build-standalone runtime (no venv): no redirector, so
+    nothing changes — sys.executable, env inherited."""
+    py = str(tmp_path / "python-runtime" / "python.exe")
+    monkeypatch.setattr(daemon, "_IS_WINDOWS", True)
+    monkeypatch.setattr(sys, "executable", py)
+    monkeypatch.setattr(sys, "_base_executable", py, raising=False)
+
+    captured = _capture_spawn(tmp_path, monkeypatch)
+    assert captured["cmd"][0] == py
+    assert "env" not in captured["kw"]
+
+
+def test_spawn_detached_posix_venv_uses_sys_executable_and_inherits_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POSIX venv python is a symlink/copy, not a redirector: spawning
+    sys._base_executable there would LOSE the venv, so it must not."""
+    monkeypatch.setattr(daemon, "_IS_WINDOWS", False)
+    monkeypatch.setattr(sys, "executable", "/v/bin/python")
+    monkeypatch.setattr(sys, "_base_executable", "/usr/bin/python3", raising=False)
+
+    captured = _capture_spawn(tmp_path, monkeypatch)
+    assert captured["cmd"][0] == "/v/bin/python"
+    assert "env" not in captured["kw"]
 
 
 def test_spawn_detached_omits_idle_arg_when_none(

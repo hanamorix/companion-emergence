@@ -6,7 +6,6 @@ only the cheap is_running pre-check."""
 from __future__ import annotations
 
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
@@ -67,7 +66,7 @@ def test_c19a_two_cmd_starts_forced_into_handoff_window(tmp_path, monkeypatch):
     having never reached that point; the lock file is never unlinked and its
     inode is unchanged across the whole race.
 
-    Real OS processes throughout (sys.executable + subprocess, no fork-only
+    Real OS processes throughout (a real interpreter + subprocess, no fork-only
     API — see `_runner_lock_worker.py`), so this runs unmodified on the
     Windows/macOS CI runners too. One intentional real-time cost: the LOSING
     side's own `cmd_start` call runs its genuine ~50s /health readiness poll
@@ -85,19 +84,21 @@ def test_c19a_two_cmd_starts_forced_into_handoff_window(tmp_path, monkeypatch):
     starts up faster — see the history note for why that guess failed.
 
     History: an earlier version used a fixed `--startup-delay` on role-a's
-    child plus generous join/wait timeouts, betting that the delay was
-    always bigger than however long role-b's child took to start up and win.
-    That bet failed on real windows-latest CI (`role-b's cmd_start should
-    have returned quickly` — role-b's thread was still alive after 30s):
-    Windows subprocess creation plus importing brain.bridge.runner's
-    dependency chain in a fresh interpreter is itself slow and
-    CI-load-variable enough there that role-b's own child could plausibly
-    still be starting up when role-a's fixed delay expired, letting role-a's
-    child compete (and possibly win) before role-b's child ever got there —
-    a genuine test-design flaw (an unbounded race dressed as a bounded one),
-    not a cmd_start production bug: nothing here suggested cmd_start itself
-    ever blocks or fails to observe a losing child's refusal past its own
-    readiness poll. The `--wait-file` gate removes the guess entirely.
+    child; it was replaced by the `--wait-file` gate on the theory that the
+    windows-latest failure (`role-b's cmd_start should have returned
+    quickly`) was a startup-timing race. It was not: the gated version failed
+    identically, AFTER role-b's child had provably won (its marker existed).
+    Root cause (a production bug, not test timing): on Windows a venv's
+    `python.exe` is a redirector that runs the real interpreter as a second
+    process, so `Popen(...).pid` (what `spawn_detached` returns and
+    `cmd_start` waits for) was the redirector's pid while the winning child
+    wrote its own `os.getpid()` into state_file. `cmd_start`'s `s.pid == pid`
+    readiness match therefore never succeeded on a Windows venv, and a
+    healthy bridge was reported failed after 50s. Fixed in
+    `daemon.bridge_python()` (spawn the base interpreter with
+    `__PYVENV_LAUNCHER__`, as multiprocessing does); the fake spawn below
+    goes through that same production helper, so on windows-latest this
+    test fails without the fix.
     """
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
@@ -127,8 +128,12 @@ def test_c19a_two_cmd_starts_forced_into_handoff_window(tmp_path, monkeypatch):
         # cmd_start itself only reads client_origin for the (irrelevant
         # here) launchd log-truncation branch.
         marker = tmp_path / f"marker-{origin}.txt"
+        # The PRODUCTION interpreter resolution (not bare sys.executable), so
+        # the returned pid is the worker's own os.getpid() on a Windows venv
+        # exactly as it must be for the real runner — see bridge_python().
+        python, env = daemon.bridge_python()
         cmd = [
-            sys.executable,
+            python,
             _WORKER_SCRIPT,
             "--persona-dir",
             str(pd),
@@ -141,7 +146,7 @@ def test_c19a_two_cmd_starts_forced_into_handoff_window(tmp_path, monkeypatch):
         ]
         if origin == "role-a":
             cmd += ["--wait-file", str(wait_gate_a)]
-        proc = subprocess.Popen(cmd)
+        proc = subprocess.Popen(cmd, env=env)
         with launch_lock:
             launched[origin] = proc
         return proc.pid

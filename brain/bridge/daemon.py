@@ -185,17 +185,53 @@ def _kill_if_alive(pid: int, sig: int) -> bool:
         raise
 
 
+def _path_eq(p1: str, p2: str) -> bool:
+    return p1 == p2 or os.path.normcase(p1) == os.path.normcase(p2)
+
+
+def bridge_python() -> tuple[str, dict[str, str] | None]:
+    """The interpreter (and env, or None to inherit) to spawn a bridge child with,
+    such that the spawned process's pid IS the runner's own ``os.getpid()``.
+
+    Windows venv: ``sys.executable`` (``.venv\\Scripts\\python.exe``) is the
+    venv *redirector* (``venvlauncher.exe``, used by both ``python -m venv``
+    and uv), which starts the real base interpreter as a SECOND process. So
+    ``Popen(...).pid`` is the redirector's pid, while the runner writes its
+    own (different) ``os.getpid()`` into bridge.json. ``cmd_start``'s
+    readiness check (``s.pid == pid``) could then never match: a healthy
+    bridge was reported as failed after the full 50s wait and its
+    redirector killed. Same fix as the stdlib's own
+    ``multiprocessing.popen_spawn_win32``: launch ``sys._base_executable``
+    directly and pass the venv via ``__PYVENV_LAUNCHER__``, exactly what the
+    redirector itself would have done, minus the extra process.
+
+    Everywhere else (POSIX, where a venv python is a symlink/copy with no
+    redirector; or a non-venv Windows runtime such as the bundled
+    python-build-standalone one) this is plain ``sys.executable``, env
+    inherited.
+    """
+    base = getattr(sys, "_base_executable", None)
+    if _IS_WINDOWS and base and not _path_eq(sys.executable, base):
+        env = os.environ.copy()
+        env["__PYVENV_LAUNCHER__"] = sys.executable
+        return base, env
+    return sys.executable, None
+
+
 def spawn_detached(
     persona_dir: Path,
     idle_shutdown_seconds: float | None,
     client_origin: str,
     log_path: Path,
 ) -> int:
-    """Spawn the bridge server in a detached process. Returns child pid."""
+    """Spawn the bridge server in a detached process. Returns child pid —
+    the runner's own pid on every OS (see ``bridge_python``)."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_fh = open(log_path, "ab")  # noqa: SIM115
+    python, env = bridge_python()
+    popen_extra: dict[str, object] = {} if env is None else {"env": env}
     cmd = [
-        sys.executable,
+        python,
         "-P",  # -m would put the caller's cwd (maybe a checkout's brain/) on sys.path
         "-m",
         "brain.bridge.runner",
@@ -214,6 +250,7 @@ def spawn_detached(
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
+            **popen_extra,
         )
         return proc.pid
     finally:
