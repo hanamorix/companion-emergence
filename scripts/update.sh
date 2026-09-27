@@ -116,6 +116,13 @@ if [ "$RESTART" = 1 ] && [ ! -d "$(nell_path persona_dir)" ]; then
   exit 2
 fi
 
+# Bundles with the overlay hook (#286 slice 2) update into the user-writable
+# overlay; older nells have no `update` command and keep the legacy path (#289).
+OVERLAY=0
+if [ "$INSTALL_KIND" = "bundled" ] && "$NELL" update --status 2>/dev/null | grep -q '"supported": true'; then
+  OVERLAY=1
+fi
+
 run() {
   if [ "$DRY" = 1 ]; then echo "plan: $*"; else echo "+ $*" >&2; "$@"; fi
 }
@@ -165,34 +172,36 @@ fi
 # ---- privileges (bundled) -------------------------------------------------------
 UV="$(command -v uv)"
 AS_ROOT=()
-if [ "$INSTALL_KIND" = "bundled" ]; then
-  case "$INSTALL_ROOT" in
-    *.app/*)
-      if [ "$ALLOW_APP" != 1 ]; then
-        echo "update.sh: $INSTALL_ROOT is inside a .app bundle; rewriting it invalidates the bundle signature (Gatekeeper may re-prompt on next launch). Re-run with --allow-app-rewrite to proceed." >&2
-        exit 2
-      fi;;
-    */.mount_*/*)
-      echo "update.sh: $INSTALL_ROOT is inside a running AppImage (a read-only mount); download the new AppImage instead." >&2
-      exit 2;;
-  esac
-  if [ ! -w "$INSTALL_ROOT" ]; then
-    # Only the writes into the runtime run as root (build + export stay the user's).
-    # Absolute uv: sudo's secure_path drops ~/.local/bin, uv's default home. -H:
-    # root's own HOME, so uv's cache never leaves root-owned files in the user's.
-    # sudo's env_reset drops the proxy/CA/UV_* settings the unprivileged steps just
-    # used; hand them to root explicitly through `env`.
-    ROOT_ENV=()
-    for k in $(compgen -e); do
-      case "$k" in
-        HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|http_proxy|https_proxy|all_proxy|no_proxy|SSL_CERT_FILE|SSL_CERT_DIR|UV_*)
-          ROOT_ENV+=("$k=${!k}");;
-      esac
-    done
-    AS_ROOT=(sudo -H env "${ROOT_ENV[@]+"${ROOT_ENV[@]}"}")
-    echo "update.sh: $INSTALL_ROOT is not writable; the install steps run under sudo" >&2
-    # Ask for the password now, before anything is stopped.
-    run sudo -v || { echo "update.sh: sudo failed; the update was NOT applied" >&2; exit 1; }
+if [ "$OVERLAY" = 0 ]; then
+  if [ "$INSTALL_KIND" = "bundled" ]; then
+    case "$INSTALL_ROOT" in
+      *.app/*)
+        if [ "$ALLOW_APP" != 1 ]; then
+          echo "update.sh: $INSTALL_ROOT is inside a .app bundle; rewriting it invalidates the bundle signature (Gatekeeper may re-prompt on next launch). Re-run with --allow-app-rewrite to proceed." >&2
+          exit 2
+        fi;;
+      */.mount_*/*)
+        echo "update.sh: $INSTALL_ROOT is inside a running AppImage (a read-only mount); download the new AppImage instead." >&2
+        exit 2;;
+    esac
+    if [ ! -w "$INSTALL_ROOT" ]; then
+      # Only the writes into the runtime run as root (build + export stay the user's).
+      # Absolute uv: sudo's secure_path drops ~/.local/bin, uv's default home. -H:
+      # root's own HOME, so uv's cache never leaves root-owned files in the user's.
+      # sudo's env_reset drops the proxy/CA/UV_* settings the unprivileged steps just
+      # used; hand them to root explicitly through `env`.
+      ROOT_ENV=()
+      for k in $(compgen -e); do
+        case "$k" in
+          HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|http_proxy|https_proxy|all_proxy|no_proxy|SSL_CERT_FILE|SSL_CERT_DIR|UV_*)
+            ROOT_ENV+=("$k=${!k}");;
+        esac
+      done
+      AS_ROOT=(sudo -H env "${ROOT_ENV[@]+"${ROOT_ENV[@]}"}")
+      echo "update.sh: $INSTALL_ROOT is not writable; the install steps run under sudo" >&2
+      # Ask for the password now, before anything is stopped.
+      run sudo -v || { echo "update.sh: sudo failed; the update was NOT applied" >&2; exit 1; }
+    fi
   fi
 fi
 
@@ -207,19 +216,24 @@ if [ "$INSTALL_KIND" = "source" ]; then
   [ -z "$SOURCE" ] && run git -C "$SRC_TREE" pull --ff-only
   run sh -c "cd '$SRC_TREE' && uv sync --all-extras"
 else
-  PY_BIN="$INSTALL_ROOT/bin/python3"
-  NELL_BIN="$INSTALL_ROOT/bin/nell"
   run sh -c "cd '$SRC_TREE' && rm -rf dist && uv build --wheel"
   run sh -c "cd '$SRC_TREE' && uv export --format requirements-txt --no-dev --no-emit-project --locked --quiet --output-file dist/requirements.txt"
-  # pip regenerates bin/nell with a baked shebang; the shipped file is a
-  # relocatable wrapper (app/build_python_runtime.sh step 5). Save and restore it.
-  run "${AS_ROOT[@]+"${AS_ROOT[@]}"}" cp "$NELL_BIN" "$NELL_BIN.orig"
-  # Index flags: see app/build_python_runtime.sh step 4 (#287). Not --emit-index-url:
-  # that needs uv >= 0.12, and this runs on the user's uv.
-  run "${AS_ROOT[@]+"${AS_ROOT[@]}"}" "$UV" pip install --python "$PY_BIN" --require-hashes --requirements "$SRC_TREE/dist/requirements.txt" --quiet \
-    --index https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
-  run "${AS_ROOT[@]+"${AS_ROOT[@]}"}" sh -c "'$UV' pip install --python '$PY_BIN' --no-deps --quiet '$SRC_TREE'/dist/*.whl"
-  run "${AS_ROOT[@]+"${AS_ROOT[@]}"}" mv "$NELL_BIN.orig" "$NELL_BIN"
+  if [ "$OVERLAY" = 1 ]; then
+    COMMIT="$(git -C "$SRC_TREE" rev-parse HEAD 2>/dev/null || echo "local-$(date +%Y%m%d%H%M%S)")"
+    run sh -c "'$NELL' update --wheel \"\$(ls '$SRC_TREE'/dist/*.whl | head -n1)\" --requirements '$SRC_TREE/dist/requirements.txt' --commit '$COMMIT'"
+  else
+    PY_BIN="$INSTALL_ROOT/bin/python3"
+    NELL_BIN="$INSTALL_ROOT/bin/nell"
+    # pip regenerates bin/nell with a baked shebang; the shipped file is a
+    # relocatable wrapper (app/build_python_runtime.sh step 5). Save and restore it.
+    run "${AS_ROOT[@]+"${AS_ROOT[@]}"}" cp "$NELL_BIN" "$NELL_BIN.orig"
+    # Index flags: see app/build_python_runtime.sh step 4 (#287). Not --emit-index-url:
+    # that needs uv >= 0.12, and this runs on the user's uv.
+    run "${AS_ROOT[@]+"${AS_ROOT[@]}"}" "$UV" pip install --python "$PY_BIN" --require-hashes --requirements "$SRC_TREE/dist/requirements.txt" --quiet \
+      --index https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
+    run "${AS_ROOT[@]+"${AS_ROOT[@]}"}" sh -c "'$UV' pip install --python '$PY_BIN' --no-deps --quiet '$SRC_TREE'/dist/*.whl"
+    run "${AS_ROOT[@]+"${AS_ROOT[@]}"}" mv "$NELL_BIN.orig" "$NELL_BIN"
+  fi
 fi
 
 # ---- verify -----------------------------------------------------------------

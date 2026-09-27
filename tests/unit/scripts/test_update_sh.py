@@ -171,6 +171,53 @@ def test_unknown_install_kind_is_rejected(tmp_path):
     assert cp.returncode == 2 and "install_kind" in cp.stderr
 
 
+def _overlay_shim(tmp_path: Path, root: Path, supported: bool) -> Path:
+    shim = tmp_path / "bin" / "nell"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    flag = "true" if supported else "false"
+    shim.write_text(
+        "#!/bin/sh\n"
+        'case "$1 $2" in\n'
+        f"  'paths install_root') echo '{root}';;\n"
+        "  'paths install_kind') echo bundled;;\n"
+        f"  'paths persona_dir') echo '{tmp_path}';;\n"
+        f"  'update --status') printf '{{\"supported\": {flag}, \"install_kind\": \"bundled\"}}\\n';;\n"
+        "  '--version ') echo 'companion-emergence 0.0.42';;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    shim.chmod(shim.stat().st_mode | stat.S_IEXEC)
+    return shim
+
+
+@pytest.mark.skipif(getattr(os, "geteuid", lambda: -1)() == 0, reason="root can write anything")
+def test_overlay_capable_bundle_updates_the_overlay_without_sudo(tmp_path):
+    """#289: the overlay lives in the user's home, so an unwritable (dpkg-owned)
+    runtime is never touched and no sudo is needed."""
+    root = _bundled_root(tmp_path / "python-runtime")
+    src = _src(tmp_path)
+    root.chmod(0o555)
+    try:
+        shim = _overlay_shim(tmp_path, root, supported=True)
+        cp = _run("--nell", str(shim), "--persona", "p", "--dry-run", "--source", str(src))
+    finally:
+        root.chmod(0o755)
+    assert cp.returncode == 0, cp.stderr
+    joined = "\n".join(_plan(cp))
+    assert " update --wheel" in joined and "--requirements" in joined and "--commit" in joined
+    assert "sudo" not in joined and "nell.orig" not in joined
+
+
+def test_bundle_without_overlay_support_keeps_the_legacy_path(tmp_path):
+    root = _bundled_root(tmp_path / "python-runtime")
+    src = _src(tmp_path)
+    shim = _overlay_shim(tmp_path, root, supported=False)
+    cp = _run("--nell", str(shim), "--persona", "p", "--dry-run", "--source", str(src))
+    assert cp.returncode == 0, cp.stderr
+    joined = "\n".join(_plan(cp))
+    assert "nell.orig" in joined and " update --wheel" not in joined
+
+
 def test_every_nell_command_the_script_calls_exists_in_the_real_cli():
     """The shim answers anything, so check each `"$NELL" <cmd> <action>` call site
     (plan steps AND the failure trap) against the real parser (#285: the script
