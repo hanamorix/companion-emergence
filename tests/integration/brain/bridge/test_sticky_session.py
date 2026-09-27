@@ -79,19 +79,20 @@ def _persona_dir(tmp_path: Path) -> Path:
     return p
 
 
-def test_sticky_session_survives_snapshot_sweep(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from brain.bridge import supervisor as supervisor_mod
-
-    # Lower the per-session staleness threshold (module default 10 min) so
-    # the 6-min-old seeded turns below count as stale — same intent as the
-    # old silence_minutes=5.0 kwarg this test used before run_folded's
-    # externally-passed idle proxy was retired (ram-spike-fix INC-6, C4(a)).
-    # Chat is idle by default (no cli_throttle activity in this test), so
-    # the new is_chat_idle() gate around the snapshot block is open
-    # throughout.
-    monkeypatch.setattr(supervisor_mod, "_SESSION_STALE_MINUTES", 5.0)
+def test_sticky_session_survives_snapshot_sweep(tmp_path: Path) -> None:
+    # No staleness knob to set anymore: ram-spike-fix INC-9 retired the
+    # interim `_SESSION_STALE_MINUTES` constant (itself an INC-6 stopgap)
+    # in favor of the central-cadence session_snapshot_prune job, which
+    # calls snapshot_stale_sessions(silence_minutes=0.0, ...) unconditionally
+    # — the age check is gone because the job only ever runs on an idle
+    # pass (cli_throttle.is_chat_idle()), so by construction every
+    # session's last turn already predates the idle window. Chat is idle
+    # by default here (no cli_throttle activity in this test, and the
+    # process-local anchor starts at -inf), so the central pass's
+    # is_chat_idle() gate is open from the very first tick and the seeded
+    # turns' 6-minutes-ago timestamps no longer need to be "aged into"
+    # staleness by a monkeypatched threshold — the sweep runs as soon as
+    # it has work.
 
     persona_dir = _persona_dir(tmp_path)
     provider = _RecordingProvider()
@@ -102,7 +103,10 @@ def test_sticky_session_survives_snapshot_sweep(
     sid = sess.session_id
 
     # Pre-seed 50 prior turns (25 user + 25 assistant pairs), each stamped
-    # 6 minutes in the past so they trip the silence threshold.
+    # 6 minutes in the past (a realistic "the user stepped away" gap; no
+    # longer needed to trip a specific silence threshold now that the
+    # snapshot/prune job's eligibility is purely "did this idle pass run",
+    # but kept to match a real resumed-session's timestamps).
     base = datetime.now(UTC) - timedelta(minutes=6)
     for i in range(25):
         ingest_turn(
@@ -123,6 +127,25 @@ def test_sticky_session_survives_snapshot_sweep(
                 "ts": (base + timedelta(seconds=i * 2 + 1)).isoformat(),
             },
         )
+
+    # Reflect the seeded turns on the in-memory SessionState too. In
+    # production a session with real history is either (a) never turns=0
+    # to begin with (every real turn goes through respond() ->
+    # session.append_turn(), which increments session.turns) or (b), across
+    # a bridge restart, reconstructed via get_or_hydrate_session(), which
+    # recomputes turns from the buffer file. This test instead pre-seeds
+    # the buffer directly via ingest_turn() (simulating history that
+    # predates this process) while the SessionState still comes from a
+    # fresh create_session() above, so without this line session.turns
+    # stays 0 — indistinguishable, to prune_empty_sessions's `session.turns
+    # != 0 or session.history` check, from a genuinely empty session. That
+    # check is unconditional (it `continue`s before any age comparison),
+    # so it was never actually exercised by the old fixed 300s
+    # (_SESSION_STALE_MINUTES) threshold in this test's ~0.5s runtime —
+    # this line closes that latent fixture gap now that INC-9's much
+    # smaller effective staleness window (time_since_last_message(),
+    # bridge-start-anchored) would otherwise make the sweep race the test.
+    sess.turns = 25
 
     bus = _CapturingBus()
     stop = threading.Event()
