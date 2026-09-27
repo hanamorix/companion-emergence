@@ -1,0 +1,203 @@
+name: brain-main
+
+# Publishes the brain from `main` for in-app updates (#286 slice 3, spec §3.1).
+# After `test` passes on a push to main: smoke the wheel, export the lock with the
+# same flags as app/build_python_runtime.sh, write manifest.json, sign it with the
+# updater key, verify that signature with the reference minisign against the pubkey
+# the app ships, then replace the assets on the rolling `brain-main` pre-release.
+#
+# pull_request: the same pipeline signed with a throwaway key — no secrets, no
+# publish — plus a tampered-manifest check that must FAIL verification.
+# workflow_dispatch: the real key, published to a test tag, never to `brain-main`
+# (only CI-gated main commits reach users).
+
+on:
+  workflow_run:
+    workflows: [test]
+    types: [completed]
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/brain-main.yml
+      - scripts/brain_main_manifest.py
+      - scripts/verify_update_signature.sh
+      - scripts/smoke_test_wheel.sh
+      - brain/update/install.py
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Test release tag to publish to (never brain-main)'
+        required: true
+        default: brain-main-dryrun
+
+permissions:
+  contents: read
+
+concurrency:
+  group: brain-main-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build + smoke + manifest
+    if: github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    runs-on: macos-latest  # the wheel smoke's unlocked install stays CPU-torch-sized here (test.yml)
+    outputs:
+      commit: ${{ steps.commit.outputs.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Resolve commit
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Wheel smoke (builds dist/)
+        run: bash scripts/smoke_test_wheel.sh
+
+      - name: Export the lock (same flags as app/build_python_runtime.sh)
+        run: |
+          uv export \
+            --format requirements-txt \
+            --no-dev \
+            --no-emit-project \
+            --locked \
+            --output-file dist/requirements.txt >/dev/null
+
+      - name: Write manifest.json
+        run: |
+          uv run python scripts/brain_main_manifest.py write \
+            --wheel "$(ls dist/companion_emergence-*.whl)" \
+            --requirements dist/requirements.txt \
+            --commit "${{ steps.commit.outputs.sha }}" \
+            --out dist/manifest.json
+
+      - name: Upload build
+        uses: actions/upload-artifact@v7
+        with:
+          name: brain-main-dist
+          path: |
+            dist/companion_emergence-*.whl
+            dist/requirements.txt
+            dist/manifest.json
+          if-no-files-found: error
+
+  sign:
+    name: sign + verify (+ publish off PRs)
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || 'brain-main' }}
+      SHA: ${{ needs.build.outputs.commit }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Refuse a manual publish onto the user channel
+        if: github.event_name == 'workflow_dispatch' && inputs.tag == 'brain-main'
+        run: |
+          echo "::error::workflow_dispatch publishes to a test tag; brain-main only takes CI-gated main commits"
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}  # same commit as build
+          fetch-depth: 0  # should-publish walks history
+
+      - name: Download build
+        uses: actions/download-artifact@v7
+        with:
+          name: brain-main-dist
+          path: dist
+
+      - name: Install minisign
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9
+
+      - name: Install Node 22
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+
+      - name: Tauri CLI (for `tauri signer`)
+        working-directory: app
+        run: pnpm install --frozen-lockfile
+
+      - name: Sign (throwaway key — pull_request)
+        if: github.event_name == 'pull_request'
+        working-directory: app
+        run: |
+          pnpm -s tauri signer generate --ci -p throwaway -w "$RUNNER_TEMP/pr.key" >/dev/null
+          pnpm -s tauri signer sign -k "$(cat "$RUNNER_TEMP/pr.key")" -p throwaway ../dist/manifest.json >/dev/null
+          echo "PUBKEY=$(tr -d '\n' < "$RUNNER_TEMP/pr.key.pub")" >> "$GITHUB_ENV"
+
+      - name: Sign (updater key)
+        if: github.event_name != 'pull_request'
+        working-directory: app
+        env:
+          SIGN_KEY: ${{ secrets.TAURI_UPDATER_PRIVATE_KEY }}
+          SIGN_PASSWORD: ${{ secrets.TAURI_UPDATER_KEY_PASSWORD }}
+        run: |
+          pnpm -s tauri signer sign -k "$SIGN_KEY" -p "$SIGN_PASSWORD" ../dist/manifest.json >/dev/null
+          echo "PUBKEY=$(jq -r .plugins.updater.pubkey src-tauri/tauri.conf.json)" >> "$GITHUB_ENV"
+
+      - name: Verify the signature against the app's pubkey
+        run: bash scripts/verify_update_signature.sh dist/manifest.json dist/manifest.json.sig "$PUBKEY"
+
+      - name: A tampered manifest must fail verification (pull_request)
+        if: github.event_name == 'pull_request'
+        run: |
+          cp dist/manifest.json "$RUNNER_TEMP/tampered.json"
+          echo ' ' >> "$RUNNER_TEMP/tampered.json"
+          if bash scripts/verify_update_signature.sh "$RUNNER_TEMP/tampered.json" dist/manifest.json.sig "$PUBKEY"; then
+            echo "::error::a tampered manifest verified"
+            exit 1
+          fi
+
+      - name: Newer than what is published?
+        id: guard
+        if: github.event_name != 'pull_request'
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh release download "$TAG" -p manifest.json -O "$RUNNER_TEMP/published.json" 2>/dev/null || true
+          python3 scripts/brain_main_manifest.py should-publish --ours "$SHA" \
+            --published "$RUNNER_TEMP/published.json" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to the release tag
+        if: steps.guard.outputs.publish == 'true'
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --prerelease --latest=false --target "$SHA" \
+              --title "Brain ($TAG)" \
+              --notes "Signed brain build from main for in-app brain updates (#286). Not an app release."
+          fi
+          # data first, manifest last: an app reading the old manifest mid-upload
+          # gets a sha256 mismatch and stops (spec §6), never a mixed install
+          gh release upload "$TAG" dist/companion_emergence-*.whl dist/requirements.txt --clobber
+          gh release upload "$TAG" dist/manifest.json dist/manifest.json.sig --clobber
+          keep="$(cd dist && ls companion_emergence-*.whl requirements.txt manifest.json manifest.json.sig)"
+          gh release view "$TAG" --json assets -q '.assets[].name' | while read -r name; do
+            grep -qxF "$name" <<<"$keep" || gh release delete-asset "$TAG" "$name" -y
+          done
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" -f sha="$SHA" -F force=true >/dev/null
