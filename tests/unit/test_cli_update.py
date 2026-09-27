@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
 
 import pytest
 
 from brain import cli
 from brain.update import overlay
+
+# The bash handoff is POSIX-only: Windows has no updater yet (#255), so there
+# the handler refuses instead of exec'ing bash.
+posix_only = pytest.mark.skipif(sys.platform == "win32", reason="no bash updater on Windows (#255)")
 
 
 def test_status_reports_no_overlay(tmp_path, monkeypatch, capsys):
@@ -59,6 +64,7 @@ def test_bundled_without_wheel_args_is_a_usage_error(tmp_path, monkeypatch, caps
     assert "--wheel" in capsys.readouterr().err
 
 
+@posix_only
 def test_source_install_execs_update_sh_with_passthrough_args(tmp_path, monkeypatch):
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
     calls = []
@@ -69,6 +75,7 @@ def test_source_install_execs_update_sh_with_passthrough_args(tmp_path, monkeypa
     assert calls[0][1][2:] == ["--persona", "nell", "--dry-run"]
 
 
+@posix_only
 def test_source_install_falls_back_to_bin_bash_when_bash_is_not_on_path(tmp_path, monkeypatch):
     """NixOS has no /bin/bash; shutil.which must be tried first (T4)."""
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
@@ -77,6 +84,16 @@ def test_source_install_falls_back_to_bin_bash_when_bash_is_not_on_path(tmp_path
     monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/bin/bash" if name == "bash" else None)
     cli.main(["update", "--", "--dry-run"])
     assert calls and calls[0][0] == "/usr/bin/bash"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only refusal (#255)")
+def test_source_install_on_windows_refuses_instead_of_exec(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
+    calls = []
+    monkeypatch.setattr(cli.os, "execv", lambda path, argv: calls.append((path, argv)) or 0)
+    assert cli.main(["update", "--", "--dry-run"]) == 2
+    assert not calls
+    assert "no bash updater" in capsys.readouterr().err
 
 
 def test_oserror_from_the_overlay_lock_is_reported_not_a_traceback(tmp_path, monkeypatch, capsys):
