@@ -18,6 +18,13 @@ import pytest
 from brain.bridge import daemon
 
 
+@pytest.fixture(autouse=True)
+def _isolated_spawned_children(monkeypatch: pytest.MonkeyPatch) -> None:
+    """spawn_detached records each Popen in a module dict; keep fakes from
+    leaking across tests."""
+    monkeypatch.setattr(daemon, "_spawned_children", {})
+
+
 def _args(persona: str, **kw) -> argparse.Namespace:
     ns = argparse.Namespace(persona=persona, idle_shutdown=30, client_origin="cli", timeout=180.0)
     for k, v in kw.items():
@@ -2085,3 +2092,153 @@ def test_cmd_stop_on_windows_with_force_terminates(
     assert rc == 0
     assert killed == [44444]
     assert "forcing Windows termination" in capsys.readouterr().err
+
+
+# ---------- cmd_start: early exit when its own child already exited ----------
+
+
+class _FakeChild:
+    """A spawned child whose poll() returns None for `alive_polls` calls, then rc."""
+
+    def __init__(self, pid: int, rc: int | None, alive_polls: int = 0) -> None:
+        self.pid = pid
+        self._rc = rc
+        self._alive_polls = alive_polls
+        self.polls = 0
+
+    def poll(self) -> int | None:
+        self.polls += 1
+        if self.polls <= self._alive_polls:
+            return None
+        return self._rc
+
+
+def _early_exit_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, child: _FakeChild, *, on_spawn=None
+) -> dict[str, float]:
+    """cmd_start with a fake registered child and a fake clock; returns a dict
+    whose "now" is the fake time cmd_start ended at."""
+    from brain.bridge import state_file
+
+    _patch_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(daemon, "run_recovery_if_needed", lambda _p: None)
+
+    def fake_spawn(pd, idle, origin, log_path):
+        daemon._spawned_children[child.pid] = child
+        if on_spawn is not None:
+            on_spawn(pd)
+        return child.pid
+
+    monkeypatch.setattr(daemon, "spawn_detached", fake_spawn)
+    monkeypatch.setattr(state_file, "is_running", lambda _p: False)
+    clock = {"now": 0.0}
+
+    def fake_sleep(dt: float) -> None:
+        clock["now"] += dt
+
+    monkeypatch.setattr("brain.bridge.daemon.time.sleep", fake_sleep)
+    monkeypatch.setattr("brain.bridge.daemon.time.time", lambda: clock["now"])
+
+    def no_health(*a, **kw):
+        raise AssertionError("no state_file matches this child, /health must not be probed")
+
+    monkeypatch.setattr("httpx.get", no_health)
+    monkeypatch.setattr(
+        daemon, "_kill_if_alive", lambda *a: pytest.fail("early exit must not take the orphan-kill path")
+    )
+    return clock
+
+
+def test_cmd_start_child_lost_lock_returns_2_promptly_with_lock_wording(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """The child exits 2 (runner.main's refusal) and no live bridge is
+    recorded: report at once with the S57 lock wording, byte-identical, and
+    return 2, instead of waiting out the 50s readiness window."""
+    child = _FakeChild(pid=7001, rc=2, alive_polls=3)
+    clock = _early_exit_setup(tmp_path, monkeypatch, child)
+    rc = daemon.cmd_start(_args("nell"))
+    assert rc == 2
+    assert capsys.readouterr().err == "bridge already starting (lockfile held)\n"
+    assert clock["now"] < 1.0  # 4 poll ticks, not the 50s deadline
+    assert daemon._spawned_children == {}  # handle dropped
+
+
+def test_cmd_start_child_refused_live_bridge_reports_already_running_and_readiness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """The child exits 2 because another bridge is live: the S57 'already
+    running' wording (byte-identical) and the live bridge's readiness in
+    `out`, exactly as cmd_start's own pre-check reports it."""
+    from brain.bridge import state_file
+
+    child = _FakeChild(pid=7002, rc=2, alive_polls=1)
+    live = {"on": False}
+
+    def winner_appears(pd):
+        state_file.write(
+            pd,
+            state_file.BridgeState(
+                persona="nell", pid=8123, port=51777, started_at="2026-09-27T00:00:00+00:00",
+                stopped_at=None, shutdown_clean=False, client_origin="cli", auth_token="tok",
+            ),
+        )
+        live["on"] = True
+
+    clock = _early_exit_setup(tmp_path, monkeypatch, child, on_spawn=winner_appears)
+    # is_running False at the pre-check (before spawn), True once the winner wrote state.
+    monkeypatch.setattr(state_file, "is_running", lambda _p: live["on"])
+    out: dict = {}
+    rc = daemon.cmd_start(_args("nell"), out=out)
+    assert rc == 2
+    assert capsys.readouterr().err == "bridge already running on port 51777 (pid 8123)\n"
+    r = out["readiness"]
+    assert (r.pid, r.port, r.auth_token) == (8123, 51777, "tok")
+    assert clock["now"] < 1.0
+
+
+def test_cmd_start_child_crashed_returns_1_promptly_pointing_at_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    child = _FakeChild(pid=7003, rc=1, alive_polls=0)
+    clock = _early_exit_setup(tmp_path, monkeypatch, child)
+    rc = daemon.cmd_start(_args("nell"))
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "bridge process (pid 7003) exited with code 1 before becoming ready" in err
+    assert "bridge-nell.log" in err
+    assert clock["now"] < 1.0
+
+
+def test_cmd_start_slow_starting_child_is_not_mistaken_for_exited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """No misfire: a child that is still starting (poll() None) for most of
+    the window and then becomes ready is reported started, rc 0."""
+    from brain.bridge import state_file
+
+    child = _FakeChild(pid=7004, rc=None)  # never exits
+    clock = _early_exit_setup(tmp_path, monkeypatch, child)
+    persona_dir = tmp_path / "home" / "personas" / "nell"
+    real_read = state_file.read
+
+    def read_ready_after_40s(pd):
+        if clock["now"] < 40.0:
+            return None
+        return state_file.BridgeState(
+            persona="nell", pid=7004, port=51888, started_at="2026-09-27T00:00:00+00:00",
+            stopped_at=None, shutdown_clean=False, client_origin="cli",
+        )
+
+    monkeypatch.setattr(state_file, "read", read_ready_after_40s)
+
+    class _Ok:
+        status_code = 200
+
+    monkeypatch.setattr("httpx.get", lambda *a, **kw: _Ok())
+    rc = daemon.cmd_start(_args("nell"))
+    assert rc == 0
+    assert "bridge started on port 51888 (pid 7004)" in capsys.readouterr().out
+    assert child.polls > 300  # it really was polled throughout, never read as exited
+    assert real_read(persona_dir) is None  # nothing else wrote state
+

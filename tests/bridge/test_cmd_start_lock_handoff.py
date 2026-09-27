@@ -56,7 +56,7 @@ def test_cmd_start_leaves_lock_free_for_child_runner(tmp_path, monkeypatch):
 _WORKER_SCRIPT = str(Path(__file__).parent / "_runner_lock_worker.py")
 
 
-def test_c19a_two_cmd_starts_forced_into_handoff_window(tmp_path, monkeypatch):
+def test_c19a_two_cmd_starts_forced_into_handoff_window(tmp_path, monkeypatch, capsys):
     """C19(a): two `cmd_start` runs forced into the handoff window — the
     second launched after the first parent released its own pre-flight lock
     and before its (deliberately held-back) child acquires the real one.
@@ -66,14 +66,16 @@ def test_c19a_two_cmd_starts_forced_into_handoff_window(tmp_path, monkeypatch):
     having never reached that point; the lock file is never unlinked and its
     inode is unchanged across the whole race.
 
-    Real OS processes throughout (a real interpreter + subprocess, no fork-only
-    API — see `_runner_lock_worker.py`), so this runs unmodified on the
-    Windows/macOS CI runners too. One intentional real-time cost: the LOSING
-    side's own `cmd_start` call runs its genuine ~50s /health readiness poll
-    to its natural timeout (nothing here mocks `time.time()`, since the
-    winning side's poll loop shares that same module-level clock and must
-    not be corrupted) — bounded by a generous thread-join timeout below, so
-    nothing is left running past this test.
+    Real OS processes throughout, spawned by the REAL `spawn_detached`
+    (interpreter resolution, detach flags, Popen bookkeeping); only the
+    child's argv is swapped for `_runner_lock_worker.py` (no fork-only API),
+    so this runs unmodified on the Windows/macOS CI runners too.
+
+    The LOSING side's `cmd_start` must report promptly with the S57
+    wording and return 2, not wait out its ~50s readiness window: it
+    notices its own child already exited (Popen.poll()). Before that fix it
+    returned 1 via the 50s timeout/orphan-kill path, which the rc==2 and
+    wording asserts below catch.
 
     Sequencing (2026-09-27 rewrite — see history below): role-a's child is
     held at a `--wait-file` gate BEFORE it imports anything or attempts the
@@ -96,15 +98,18 @@ def test_c19a_two_cmd_starts_forced_into_handoff_window(tmp_path, monkeypatch):
     readiness match therefore never succeeded on a Windows venv, and a
     healthy bridge was reported failed after 50s. Fixed in
     `daemon.bridge_python()` (spawn the base interpreter with
-    `__PYVENV_LAUNCHER__`, as multiprocessing does); the fake spawn below
-    goes through that same production helper, so on windows-latest this
-    test fails without the fix.
+    `__PYVENV_LAUNCHER__`, as multiprocessing does); the children below are
+    spawned by the real `spawn_detached`, so on windows-latest this test
+    fails without the fix.
     """
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
     monkeypatch.setattr("brain.paths.get_persona_dir", lambda name: persona_dir)
-    monkeypatch.setattr(state_file, "is_running", lambda pd: False)
+    # state_file.is_running is REAL here (no persona has a bridge.json until
+    # role-b's child writes one), so the loser's report picks the applicable
+    # S57 wording from real state.
     monkeypatch.setattr(daemon, "run_recovery_if_needed", lambda pd: None)
+    monkeypatch.setattr("brain.paths.get_log_dir", lambda: tmp_path / "logs")
 
     # No real uvicorn server ever runs; only the HTTP hop of cmd_start's
     # readiness probe is faked. The winner's real child still has to write a
@@ -122,36 +127,38 @@ def test_c19a_two_cmd_starts_forced_into_handoff_window(tmp_path, monkeypatch):
     launched: dict[str, subprocess.Popen] = {}
     launch_lock = threading.Lock()
 
-    def fake_spawn_detached(pd, idle, origin, log_path):
+    def worker_argv(pd, idle, origin):
         # `origin` == this call's client_origin, abused purely as an
         # in-test signal of which role (see _run below) is spawning —
         # cmd_start itself only reads client_origin for the (irrelevant
         # here) launchd log-truncation branch.
-        marker = tmp_path / f"marker-{origin}.txt"
-        # The PRODUCTION interpreter resolution (not bare sys.executable), so
-        # the returned pid is the worker's own os.getpid() on a Windows venv
-        # exactly as it must be for the real runner — see bridge_python().
-        python, env = daemon.bridge_python()
-        cmd = [
-            python,
+        argv = [
             _WORKER_SCRIPT,
             "--persona-dir",
             str(pd),
             "--marker",
-            str(marker),
+            str(tmp_path / f"marker-{origin}.txt"),
             "--stop-file",
             str(stop_file),
             "--write-state-port",
             "51900" if origin == "role-a" else "51901",
         ]
         if origin == "role-a":
-            cmd += ["--wait-file", str(wait_gate_a)]
-        proc = subprocess.Popen(cmd, env=env)
-        with launch_lock:
-            launched[origin] = proc
-        return proc.pid
+            argv += ["--wait-file", str(wait_gate_a)]
+        return argv
 
-    monkeypatch.setattr(daemon, "spawn_detached", fake_spawn_detached)
+    monkeypatch.setattr(daemon, "_runner_argv", worker_argv)
+    real_spawn_detached = daemon.spawn_detached
+
+    def spying_spawn_detached(pd, idle, origin, log_path):
+        # The real spawn; only records its Popen (the same object cmd_start
+        # polls) so the test can check exit codes and clean up.
+        pid = real_spawn_detached(pd, idle, origin, log_path)
+        with launch_lock:
+            launched[origin] = daemon._spawned_children[pid]
+        return pid
+
+    monkeypatch.setattr(daemon, "spawn_detached", spying_spawn_detached)
 
     results: dict[str, int] = {}
 
@@ -217,19 +224,25 @@ def test_c19a_two_cmd_starts_forced_into_handoff_window(tmp_path, monkeypatch):
         assert launched["role-a"].wait(timeout=60.0) == 2
         assert not loser_marker.exists(), "the losing child must never reach run_bridge_foreground"
 
+        # role-a's cmd_start must notice its child exited and report now,
+        # while the winner is STILL running (stop_file not yet written), not
+        # at its 50s deadline. Generous bound for slow Windows scheduling;
+        # the rc == 2 below is the part only the early-exit path can produce
+        # (the deadline path returns 1).
+        t_a.join(timeout=30.0)
+        assert not t_a.is_alive(), "role-a's cmd_start must return promptly once its child lost"
+        assert results["role-a"] == 2
+        winner_pid = launched["role-b"].pid
+        assert (
+            f"bridge already running on port 51901 (pid {winner_pid})" in capsys.readouterr().err
+        ), "loser must report with the existing S57 'already running' wording"
+
         # Now release the winner so its cmd_start's spawned child (still
         # parked in the stub) can exit cleanly.
         stop_file.write_text("go", encoding="utf-8")
         assert launched["role-b"].wait(timeout=30.0) == 0
-
-        # role-a's cmd_start is still spinning its genuine ~50s readiness
-        # poll waiting for a state_file match that will never come (its own
-        # child already lost and exited above) — bounded here rather than
-        # mocked (see docstring). Generous margin above the fixed ~50s floor
-        # for slow-Windows overhead on top of it.
-        t_a.join(timeout=90.0)
-        assert not t_a.is_alive(), "role-a's cmd_start must give up within its own ~50s deadline"
-        assert results["role-a"] == 1  # readiness timeout -> orphan-kill path
+        # cmd_start dropped both handles once done waiting (no leak).
+        assert not {p.pid for p in launched.values()} & set(daemon._spawned_children)
 
         assert lock_path.exists()  # S56: never unlinked
         assert lock_path.stat().st_ino == inode_while_held

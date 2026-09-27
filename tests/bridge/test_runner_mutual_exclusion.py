@@ -119,3 +119,11 @@ def test_c19b_two_runner_children_started_at_once_exactly_one_wins(tmp_path):
             if proc.poll() is None:
                 proc.kill()
             proc.wait(timeout=10.0)
+
+
+def test_runner_usage_error_does_not_exit_with_the_refusal_code(tmp_path):
+    """Exit 2 means only the S57 refusal (cmd_start reports it with the
+    refusal wording); argparse's own usage-error 2 must not look like one."""
+    assert runner.main(["--no-such-flag"]) == 1
+    assert runner.main([]) == 1  # --persona-dir missing
+

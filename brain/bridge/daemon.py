@@ -225,23 +225,20 @@ def spawn_detached(
     log_path: Path,
 ) -> int:
     """Spawn the bridge server in a detached process. Returns child pid —
-    the runner's own pid on every OS (see ``bridge_python``)."""
+    the runner's own pid on every OS (see ``bridge_python``).
+
+    The Popen handle is kept in ``_spawned_children`` (keyed by that pid) so
+    ``cmd_start`` can notice promptly, via ``Popen.poll()``, that the child
+    already exited (e.g. lost the bridge lock) instead of waiting out its
+    whole readiness window. ``poll()`` and not a pid-alive probe: on POSIX an
+    exited-but-unreaped child is a zombie that ``os.kill(pid, 0)`` still
+    reports alive, and ``poll()`` is also what reaps it.
+    """
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_fh = open(log_path, "ab")  # noqa: SIM115
     python, env = bridge_python()
     popen_extra: dict[str, object] = {} if env is None else {"env": env}
-    cmd = [
-        python,
-        "-P",  # -m would put the caller's cwd (maybe a checkout's brain/) on sys.path
-        "-m",
-        "brain.bridge.runner",
-        "--persona-dir",
-        str(persona_dir),
-        "--client-origin",
-        client_origin,
-    ]
-    if idle_shutdown_seconds is not None:
-        cmd += ["--idle-shutdown-seconds", str(idle_shutdown_seconds)]
+    cmd = [python, *_runner_argv(persona_dir, idle_shutdown_seconds, client_origin)]
 
     try:
         proc = subprocess.Popen(
@@ -252,9 +249,46 @@ def spawn_detached(
             start_new_session=True,
             **popen_extra,
         )
+        _spawned_children[proc.pid] = proc
         return proc.pid
     finally:
         log_fh.close()
+
+
+# pid -> Popen for children spawn_detached started and cmd_start has not yet
+# finished waiting on (cmd_start pops its own entry). See spawn_detached.
+_spawned_children: dict[int, subprocess.Popen] = {}
+
+
+def _runner_argv(
+    persona_dir: Path, idle_shutdown_seconds: float | None, client_origin: str
+) -> list[str]:
+    """The bridge child's argv after the interpreter (see spawn_detached)."""
+    argv = [
+        "-P",  # -m would put the caller's cwd (maybe a checkout's brain/) on sys.path
+        "-m",
+        "brain.bridge.runner",
+        "--persona-dir",
+        str(persona_dir),
+        "--client-origin",
+        client_origin,
+    ]
+    if idle_shutdown_seconds is not None:
+        argv += ["--idle-shutdown-seconds", str(idle_shutdown_seconds)]
+    return argv
+
+
+# S57: cmd_start's refusal paths keep their existing wording, byte-identical.
+_LOCK_HELD_MSG = "bridge already starting (lockfile held)"
+
+
+def _refuse_already_running(persona_dir: Path, out: dict | None) -> int:
+    """cmd_start's state-file "already running" refusal (S57 wording). Returns 2."""
+    cur = state_file.read(persona_dir)
+    print(f"bridge already running on port {cur.port} (pid {cur.pid})", file=sys.stderr)
+    if out is not None and cur is not None and cur.pid is not None and cur.port is not None:
+        out["readiness"] = BridgeReadiness(pid=cur.pid, port=cur.port, auth_token=cur.auth_token)
+    return 2
 
 
 @dataclass
@@ -291,13 +325,7 @@ def cmd_start(args, *, out: dict | None = None) -> int:
         return 1
 
     if state_file.is_running(persona_dir):
-        cur = state_file.read(persona_dir)
-        print(f"bridge already running on port {cur.port} (pid {cur.pid})", file=sys.stderr)
-        if out is not None and cur is not None and cur.pid is not None and cur.port is not None:
-            out["readiness"] = BridgeReadiness(
-                pid=cur.pid, port=cur.port, auth_token=cur.auth_token
-            )
-        return 2
+        return _refuse_already_running(persona_dir, out)
 
     # Hold the lock through recovery (so two concurrent starters can't both
     # recover), then RELEASE it right before spawning. The bridge PROCESS — the
@@ -307,7 +335,7 @@ def cmd_start(args, *, out: dict | None = None) -> int:
     # v0.0.36). The runner's lifetime lock is the real guard against two bridges.
     fd = acquire_lock(persona_dir)
     if fd is None:
-        print("bridge already starting (lockfile held)", file=sys.stderr)
+        print(_LOCK_HELD_MSG, file=sys.stderr)
         return 2
 
     client_origin = getattr(args, "client_origin", "cli")
@@ -330,6 +358,15 @@ def cmd_start(args, *, out: dict | None = None) -> int:
     idle = float(args.idle_shutdown) * 60 if args.idle_shutdown > 0 else None
     release_lock(persona_dir, fd)  # hand the lock to the child runner
     pid = spawn_detached(persona_dir, idle, client_origin, log_path)
+    try:
+        return _await_readiness(persona_dir, pid, log_path, out)
+    finally:
+        _spawned_children.pop(pid, None)
+
+
+def _await_readiness(persona_dir: Path, pid: int, log_path: Path, out: dict | None) -> int:
+    """cmd_start's readiness wait for the child it just spawned (see cmd_start)."""
+    proc = _spawned_children.get(pid)
 
     # Readiness window: Windows cold-boot (recovery + persona load + soul review)
     # routinely exceeds 5s; the old 5s deadline killed a healthy-but-slow bridge.
@@ -354,7 +391,28 @@ def cmd_start(args, *, out: dict | None = None) -> int:
                         )
                     return 0
             except httpx.HTTPError:
-                continue
+                pass
+        # The child already exited without becoming ready: stop waiting now,
+        # not at the deadline. poll() is None for a child still starting up,
+        # so a slow start never trips this; with bridge_python() the Popen is
+        # the runner itself (and a Windows venv redirector, were one in
+        # between, stays alive exactly as long as the runner it wraps).
+        rc = proc.poll() if proc is not None else None
+        if rc is not None:
+            if rc == 2:
+                # runner.main's own refusal (S57): a live bridge is recorded,
+                # or another starter's child holds the lock. Same wording as
+                # cmd_start's own two refusal paths.
+                if state_file.is_running(persona_dir):
+                    return _refuse_already_running(persona_dir, out)
+                print(_LOCK_HELD_MSG, file=sys.stderr)
+                return 2
+            print(
+                f"bridge process (pid {pid}) exited with code {rc} before becoming ready. "
+                f"Inspect log at {log_path}",
+                file=sys.stderr,
+            )
+            return 1
     # Readiness failed — kill the orphan child and tell the user where to look.
     _kill_if_alive(pid, signal.SIGTERM)  # already-dead is fine either way
     print(
