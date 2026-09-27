@@ -17,17 +17,16 @@ from inside a patched, slow salience.score gives a real, observable
 per-item sync point for exactly when to kill, rather than a sleep-based
 race.
 
-Windows-safe note: `os.kill(pid, signal.SIGKILL)` is POSIX-only; this dev
-host is Linux, so the POSIX path is exercised directly here (matching the
-project's own convention in test_daemon_extras.py's C18 tests — the
-Windows equivalent is `TerminateProcess`/`proc.terminate()`, structurally
-the same "the OS ends the process with no interpreter cleanup" kill, not
-re-implemented per-OS in this file).
+Windows-safe note: `signal.SIGKILL` does not exist on Windows (`os.kill`
+there only supports a handful of signals plus CTRL_C/CTRL_BREAK events).
+`Popen.kill()` is the portable hard-kill: on POSIX it sends SIGKILL, on
+Windows it calls `TerminateProcess` — structurally the same "the OS ends
+the process with no interpreter cleanup" kill, not re-implemented per-OS
+in this file (matching the project's own convention in
+test_daemon_extras.py's C18 tests).
 """
 from __future__ import annotations
 
-import os
-import signal
 import subprocess
 import sys
 import textwrap
@@ -117,7 +116,7 @@ def test_c16_forgetting_sigkill_mid_item_resumes_without_redoing_done(tmp_path: 
             proc.kill()
             raise AssertionError("subprocess never reached item 2 within 20s")
 
-        os.kill(proc.pid, signal.SIGKILL)
+        proc.kill()
         proc.wait(timeout=10)
     finally:
         if proc.poll() is None:

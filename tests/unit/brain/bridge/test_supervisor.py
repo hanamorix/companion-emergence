@@ -221,24 +221,31 @@ def test_run_folded_retries_heartbeat_soon_after_a_skip_not_a_full_interval(
     reset the full `heartbeat_interval_s` countdown, and a busy chat
     session could defer the heartbeat indefinitely. Proven here by making
     `_heartbeat_and_felt_time` return None for its first two calls, then a
-    real (non-None) sentinel: the None-returning calls must be spaced
-    ~`tick_interval_s` apart (the outer loop's own pacing), not
-    ~`heartbeat_interval_s` apart, and only the FIRST non-None call resets
-    the full interval before the next attempt."""
+    real (non-None) sentinel, and recording the `last_heartbeat_at` VALUE
+    the supervisor hands to each call (its 4th positional arg) rather than
+    the wall-clock gap between calls: two skip calls must see the exact
+    same `last_heartbeat_at` (proving a skip left it untouched), and the
+    call after the first success must see an ADVANCED value relative to
+    what the success itself saw (proving a real run does advance it).
+    This is deterministic — no real-time margin — because it inspects the
+    value the code under test computed, not how long the test took to
+    observe it (a wall-clock-gap version of this assertion flaked on a
+    loaded macOS CI runner: an outer-loop pass was delayed long enough to
+    make a real skip's gap look like a full-interval gap by coincidence)."""
     persona_dir = _persona_dir(tmp_path)
     bus = EventBus()
     stop = threading.Event()
-    call_times: list[float] = []
+    seen_last_heartbeat_at: list[float] = []
     call_results: list[bool] = []  # True once a call is allowed to "succeed"
 
     heartbeat_interval_s = 0.3
     tick_interval_s = 0.05
 
     def fake_heartbeat_and_felt_time(persona_dir, provider, event_bus, last_heartbeat_at):
-        call_times.append(time.monotonic())
+        seen_last_heartbeat_at.append(last_heartbeat_at)
         # First 2 calls simulate a reply-in-flight skip (S21): return None,
         # doing nothing. From the 3rd call on, simulate a real pass.
-        succeeded = len(call_times) >= 3
+        succeeded = len(seen_last_heartbeat_at) >= 3
         call_results.append(succeeded)
         return object() if succeeded else None
 
@@ -260,34 +267,34 @@ def test_run_folded_retries_heartbeat_soon_after_a_skip_not_a_full_interval(
     t.start()
     try:
         deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline and len(call_times) < 4:
+        while time.monotonic() < deadline and len(seen_last_heartbeat_at) < 4:
             time.sleep(0.02)
-        assert len(call_times) >= 4, "did not observe enough heartbeat attempts"
+        assert len(seen_last_heartbeat_at) >= 4, "did not observe enough heartbeat attempts"
     finally:
         stop.set()
         t.join(timeout=5.0)
     assert not t.is_alive()
 
-    # Gaps between the two SKIPPED calls (both None): must track the outer
-    # loop's own tick pacing, not the full heartbeat interval — proving a
-    # skip does not push the next attempt a full interval away.
-    gap_after_first_skip = call_times[1] - call_times[0]
-    assert gap_after_first_skip < heartbeat_interval_s / 2, (
-        f"a skipped attempt deferred the retry by {gap_after_first_skip:.3f}s — "
-        f"close to the full {heartbeat_interval_s}s interval, not the "
-        f"~{tick_interval_s}s outer-loop pacing expected after a no-op skip"
+    # The two SKIPPED calls (both None) must have been handed the exact
+    # SAME `last_heartbeat_at` value — proving the skip left it untouched
+    # instead of restarting the full heartbeat_interval_s countdown.
+    first_success_idx = call_results.index(True)
+    assert first_success_idx >= 2, "expected at least 2 skips before the first success"
+    assert seen_last_heartbeat_at[1] == seen_last_heartbeat_at[0], (
+        f"a skipped attempt was handed a different last_heartbeat_at "
+        f"({seen_last_heartbeat_at[1]!r} vs {seen_last_heartbeat_at[0]!r}) — "
+        f"a skip must not advance it, or a busy session could defer the "
+        f"heartbeat indefinitely"
     )
 
-    # The gap AFTER the first call that actually succeeded (index 2, the
-    # 3rd call, call_results[2] is True) must be close to the FULL
-    # heartbeat interval — a real run still paces normally afterward.
-    first_success_idx = call_results.index(True)
-    assert first_success_idx + 1 < len(call_times), "no call observed after the first success"
-    gap_after_success = call_times[first_success_idx + 1] - call_times[first_success_idx]
-    assert gap_after_success >= heartbeat_interval_s * 0.6, (
-        f"the attempt right after a REAL (non-skipped) heartbeat run fired after "
-        f"only {gap_after_success:.3f}s — cadence was broken; expected roughly "
-        f"the full {heartbeat_interval_s}s interval"
+    # The call AFTER the first success must be handed an ADVANCED
+    # last_heartbeat_at relative to the value the success itself saw —
+    # proving a real (non-skipped) run DOES advance it.
+    assert first_success_idx + 1 < len(seen_last_heartbeat_at), (
+        "no call observed after the first success"
+    )
+    assert seen_last_heartbeat_at[first_success_idx + 1] > seen_last_heartbeat_at[first_success_idx], (
+        "last_heartbeat_at was not advanced after a real (non-skipped) heartbeat run"
     )
 
 
