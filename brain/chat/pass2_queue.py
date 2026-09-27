@@ -1,4 +1,4 @@
-"""Persisted FIFO queue + single daemon worker for pass-2 extraction work.
+"""Persisted FIFO queue for pass-2 extraction work.
 
 ram-spike-fix INC-8 (S64, S76-S80): the queue used to be purely in-memory
 (un-drained items were lost on restart). It is now persisted to
@@ -38,25 +38,30 @@ new_record_id() -> str
     A fresh record id (uuid4 hex) for callers building a queue record.
 enqueue(record, *, persona_dir)
     Append a serializable record; persist; drop-oldest + WARN at
-    ``_MAX_QUEUE``; lazily starts the single daemon worker for this
-    persona (unless inhibited — tests).
+    ``_MAX_QUEUE``. Nothing is started: the queue is drained by its callers
+    below (ram-spike-fix INC-9 removed the daemon worker thread).
+queue_length(persona_dir) -> int
+    Items currently saved in the queue (the central cadence function's
+    "pass 2 has work" probe, S53).
 drain_all_locked(persona_dir, *, should_pause=None, on_progress=None,
                  time_budget_s=None) -> int
     Take ``pass2_drain.lock`` (non-blocking); drain queued items serially,
     peek -> dispatch -> pop-and-persist, until the queue is empty or
     ``should_pause``/``time_budget_s`` says stop (checked AFTER every item,
     including the first — never before/during one). Returns the count run.
-    Two callers in this codebase: the bridge's worker thread (below, INC-8;
-    INC-9 makes this the central-cadence pass-2 job instead) and
-    ``nell chat --no-bridge``'s exit drain (cli.py, S78/S80 — no
-    ``should_pause`` at all, a bounded ``time_budget_s`` instead).
+    Two callers in this codebase: the bridge supervisor's central cadence
+    function (the pass-2 gated job, ram-spike-fix INC-9 — first in the S55
+    order, run at every idle pass while the queue is non-empty, with
+    ``should_pause`` = "chat is not idle") and ``nell chat --no-bridge``'s
+    exit drain (cli.py, S78/S80 — no ``should_pause`` at all, a bounded
+    ``time_budget_s`` instead).
 drain_pending(persona_dir, max_items=None) -> int
     Synchronous drain (test helper / on-demand): thin wrapper that calls
     ``drain_all_locked`` with a ``should_pause`` that stops after
     ``max_items`` (if given).
 reset(persona_dir=None) -> None
-    Test helper: stop the worker, and if ``persona_dir`` is given, empty its
-    persisted queue.
+    Test helper: clear test side effects, and if ``persona_dir`` is given,
+    empty its persisted queue.
 """
 from __future__ import annotations
 
@@ -69,22 +74,13 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from brain.bridge import cli_throttle
 from brain.utils.file_lock import file_lock
 
 log = logging.getLogger(__name__)
 
 _MAX_QUEUE: int = 200
-_POLL_SECONDS: float = 0.5
 
 _lock = threading.Lock()
-_worker_thread: threading.Thread | None = None
-_worker_persona_dir: Path | None = None
-_shutdown = threading.Event()
-# Set True by the test conftest so enqueue() doesn't spawn the worker thread —
-# tests drive drain_all_locked()/drain_pending() synchronously. Production
-# leaves it False.
-_worker_inhibited: bool = False
 
 # Test-only: an in-memory side-effect registry keyed by record id, NOT
 # persisted and NOT used by production code. Low-level tests that only care
@@ -133,7 +129,7 @@ def _save_queue_unlocked(persona_dir: Path, items: list[dict[str, Any]]) -> None
 
 
 def enqueue(record: dict[str, Any], *, persona_dir: Path) -> None:
-    """Append a serializable pass-2 work record; persist; start the worker.
+    """Append a serializable pass-2 work record and persist it.
 
     ``record`` must be JSON-serializable and carry ``"id"`` (see
     ``new_record_id()``) and ``"kind"`` (``"monologue"`` or ``"attunement"``
@@ -155,8 +151,6 @@ def enqueue(record: dict[str, Any], *, persona_dir: Path) -> None:
             )
         items.append(record)
         _save_queue_unlocked(persona_dir, items)
-    if not _worker_inhibited:
-        _ensure_worker(persona_dir)
 
 
 def _peek_head_locked(persona_dir: Path) -> dict[str, Any] | None:
@@ -180,6 +174,13 @@ def _pop_by_id_locked(persona_dir: Path, item_id: str) -> None:
 def _queue_len_locked(persona_dir: Path) -> int:
     with _lock, file_lock(_queue_path(persona_dir)):
         return len(_load_queue_unlocked(persona_dir))
+
+
+def queue_length(persona_dir: Path) -> int:
+    """Number of items currently saved in the queue (fresh read under the
+    queue-file lock). The central cadence function's "pass 2 has work"
+    probe (ram-spike-fix INC-9, S53)."""
+    return _queue_len_locked(Path(persona_dir))
 
 
 def _dispatch(record: dict[str, Any], *, persona_dir: Path) -> None:
@@ -319,17 +320,8 @@ def drain_pending(persona_dir: Path, max_items: int | None = None) -> int:
 
 
 def reset(persona_dir: Path | None = None) -> None:
-    """Test helper: stop the worker; if ``persona_dir`` is given, empty its
-    persisted queue file too."""
-    global _worker_thread, _worker_persona_dir
-    _shutdown.set()
-    thread = _worker_thread
-    if thread is not None and thread.is_alive() and thread is not threading.current_thread():
-        thread.join(timeout=2.0)
-    with _lock:
-        _worker_thread = None
-        _worker_persona_dir = None
-    _shutdown.clear()
+    """Test helper: clear test side effects; if ``persona_dir`` is given,
+    empty its persisted queue file too."""
     _test_side_effects.clear()
     if persona_dir is not None:
         persona_dir = Path(persona_dir)
@@ -340,46 +332,3 @@ def reset(persona_dir: Path | None = None) -> None:
 def _queue_size(persona_dir: Path) -> int:
     """Test helper: current number of items in the persisted queue."""
     return _queue_len_locked(Path(persona_dir))
-
-
-def _ensure_worker(persona_dir: Path) -> None:
-    """Lazily start the single daemon worker thread for this persona if not
-    already running."""
-    global _worker_thread, _worker_persona_dir
-    with _lock:
-        if _worker_thread is not None and _worker_thread.is_alive():
-            return
-        _worker_persona_dir = Path(persona_dir)
-        _worker_thread = threading.Thread(
-            target=_worker_loop, args=(_worker_persona_dir,), name="pass2-queue-worker", daemon=True
-        )
-        _worker_thread.start()
-
-
-def _worker_loop(persona_dir: Path) -> None:
-    """Drain forever via drain_all_locked; sleep when there's nothing to do,
-    the throttle denies a slot, or another process/thread already holds
-    ``pass2_drain.lock``.
-
-    The pre-flight ``cli_throttle.acquire_background()`` gate below is the
-    "outer per-call throttle gate" of 2-plan.md §3.5a — it decides WHETHER
-    to start draining at all (today's existing S32-table behaviour: pass 2
-    yields to interactive chat and respects the concurrency cap). The
-    ``should_pause`` passed into ``drain_all_locked`` is the SEPARATE,
-    per-item pause check (S14): once draining has started, a returning user
-    stops it at the next item boundary rather than only at the next
-    worker-loop tick.
-    """
-    while not _shutdown.is_set():
-        if not cli_throttle.acquire_background():
-            time.sleep(_POLL_SECONDS)
-            continue
-        try:
-            drained = drain_all_locked(
-                persona_dir,
-                should_pause=lambda: not cli_throttle.is_chat_idle(),
-            )
-        finally:
-            cli_throttle.release_background()
-        if drained == 0:
-            time.sleep(_POLL_SECONDS)

@@ -275,11 +275,11 @@ def test_pass2_queue_defers_when_not_idle(monkeypatch, tmp_path: Path) -> None:
     """C4 evidence: pass 2 defers (does not run) while chat is not idle.
 
     Exercises the REAL production gate `cli_throttle.acquire_background()` —
-    the exact pre-flight check `pass2_queue._worker_loop` calls before ever
-    invoking `drain_all_locked` (see that function's own docstring) — rather
-    than re-deriving the gating decision inside the test itself. See
-    `test_pass2_queue.py::TestWorkerLoop` for an end-to-end test that starts
-    the real worker thread and confirms this composition end-to-end."""
+    the slot the pass-2 job (supervisor `_build_gated_jobs`, ram-spike-fix
+    INC-9; it replaced the old worker thread) takes before ever invoking
+    `drain_all_locked` — rather than re-deriving the gating decision inside
+    the test itself. The central cadence function additionally asks
+    is_chat_idle before the job at all (test_central_cadence.py)."""
     from brain.bridge import cli_throttle
     from brain.chat import pass2_queue
 
@@ -291,7 +291,7 @@ def test_pass2_queue_defers_when_not_idle(monkeypatch, tmp_path: Path) -> None:
     pass2_queue.enqueue({"id": record_id, "kind": "test_probe"}, persona_dir=tmp_path)
 
     # The real pre-flight gate denies a background slot while not idle, so
-    # a worker-style caller never even calls drain_all_locked.
+    # the pass-2 job never even calls drain_all_locked.
     assert cli_throttle.acquire_background() is False
     assert ran["n"] == 0
     assert pass2_queue._queue_size(tmp_path) == 1  # left queued, not dropped
@@ -388,12 +388,22 @@ def test_enumerated_caller_still_routes_through_cli_throttle_no_min_idle(relpath
 
 
 def test_supervisor_snapshot_prune_block_gated_by_is_chat_idle(monkeypatch) -> None:
-    """Static confirmation that supervisor.py's session-snapshot/prune block
-    itself calls is_chat_idle (the executable per-caller test lives in
-    test_supervisor.py; this is the C4(c) grep-style companion for THIS
-    specific caller, since it doesn't go through a cli_throttle wrapper
-    function like the others above)."""
+    """Static confirmation that supervisor.py's session-snapshot/prune work is
+    idle-gated (the executable per-caller test lives in test_supervisor.py /
+    test_central_cadence.py; this is the C4(c) grep-style companion for THIS
+    specific caller). Since ram-spike-fix INC-9 the snapshot/prune is a gated
+    job of the central cadence function: its only call site is inside
+    ``_build_gated_jobs`` (never in run_folded's own body), and the central
+    function asks ``cli_throttle.is_chat_idle`` before every job."""
+    import inspect
+
+    from brain.bridge import central_cadence, cli_throttle, supervisor
+
     src = (BRAIN_DIR / "bridge" / "supervisor.py").read_text(encoding="utf-8")
+    assert src.count("reports = snapshot_stale_sessions(") == 1
     idx = src.index("reports = snapshot_stale_sessions(")
-    preceding = src[:idx][-400:]
-    assert "cli_throttle.is_chat_idle()" in preceding
+    assert src.rfind("def _build_gated_jobs(", 0, idx) > src.rfind("def run_folded(", 0, idx)
+    default_is_idle = inspect.signature(central_cadence.run_central_pass).parameters["is_idle"].default
+    assert default_is_idle is cli_throttle.is_chat_idle
+    assert "session_snapshot_prune" in central_cadence.GATED_JOB_ORDER
+    assert "central_cadence.run_central_pass(" in inspect.getsource(supervisor.run_folded)

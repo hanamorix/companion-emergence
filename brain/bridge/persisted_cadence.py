@@ -57,6 +57,33 @@ def load_cadence(persona_dir: Path, filename: str) -> CadenceState:
     return CadenceState(next_at=_parse_ts(data.get("next_at")))
 
 
+def load_or_init_cadence(
+    persona_dir: Path, filename: str, *, now: datetime, interval_s: float
+) -> tuple[CadenceState, bool]:
+    """Load a GATED job's cadence (ram-spike-fix INC-9, S22/S34/S69).
+
+    Unlike ``load_cadence`` (kept for the non-gated cadences, which still fail
+    toward running), a missing OR corrupt file — unreadable, not JSON, not an
+    object, or no parseable ``next_at`` — is written as "last ran now"
+    (``next_at = now + interval_s``) and returned with ``created=True``: the
+    job first runs one full interval later, so a fresh install or a damaged
+    file never causes a burst of jobs. A present file with a past ``next_at``
+    is returned as-is (an ordinary overdue job, S34).
+
+    Returns ``(state, created)``.
+    """
+    try:
+        data = json.loads(_state_path(persona_dir, filename).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = None
+    next_at = _parse_ts(data.get("next_at")) if isinstance(data, dict) else None
+    if next_at is not None:
+        return CadenceState(next_at=next_at), False
+    state = advance(now=now, interval_s=interval_s)
+    save_cadence(persona_dir, filename, state)
+    return state, True
+
+
 def save_cadence(persona_dir: Path, filename: str, state: CadenceState) -> None:
     """Atomically persist the cadence (temp file + rename).
 

@@ -1,6 +1,7 @@
 """Tests for F2b's deploy-time one-time floor recalibration (spec §6, #276
 inc3) — `brain.bridge.supervisor._run_deploy_recalibration_check` and its
-wiring into `run_folded`'s startup one-shot sequence.
+wiring into `run_folded` (since ram-spike-fix INC-9 a gated job of the
+central cadence function, no longer a startup one-shot).
 
 §5/§5b re-point F2a's daily calibration fit AND its cold-start/bootstrap
 floor sources to the per-query anchor-normalized score scale. §6 covers the
@@ -466,105 +467,154 @@ def test_deploy_recalibration_gate_retries_after_the_retry_window_elapses(monkey
 
 
 # ---------------------------------------------------------------------------
-# Wiring into `run_folded`'s startup one-shot sequence.
+# Wiring into `run_folded` — ram-spike-fix INC-9 (S70/S73, C38, C26): no
+# longer a startup one-shot; a gated job of the central cadence function
+# (due half `_deploy_recalibration_due`, run half `_run_deploy_recalibration`).
 # ---------------------------------------------------------------------------
 
 
-def test_run_folded_calls_deploy_recalibration_check_once_at_startup(tmp_path: Path) -> None:
-    """The startup one-shot sequence must call
-    `_run_deploy_recalibration_check` exactly once, distinct from (and in
-    addition to) the daily-cadence catch-up calibration tick."""
+def _run_folded_in_thread(persona_dir: Path, stop: threading.Event, **overrides):
+    from brain.bridge.supervisor import run_folded
+
+    kwargs = {
+        "persona_dir": persona_dir,
+        "provider": FakeProvider(),
+        "event_bus": EventBus(),
+        "tick_interval_s": 0.05,
+        "heartbeat_interval_s": None,
+        "maker_enabled": False,
+        "notes_enabled": False,
+        "kindled_link_enabled": False,
+    }
+    kwargs.update(overrides)
+    t = threading.Thread(target=run_folded, args=(stop,), kwargs=kwargs, daemon=True)
+    t.start()
+    return t
+
+
+def _wait_for(pred, timeout: float = 5.0) -> bool:
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        if pred():
+            return True
+        _time.sleep(0.02)
+    return pred()
+
+
+def test_run_folded_never_runs_deploy_recalibration_at_startup(tmp_path: Path) -> None:
+    """C26/C38: a supervisor that stops before its first loop pass neither
+    probes nor runs the deploy recalibration, even when the floor is stale."""
     persona_dir = _persona_dir(tmp_path)
-    bus = EventBus()
     stop = threading.Event()
-    stop.set()  # already set — run the startup one-shots once, then exit
+    stop.set()
 
-    calls: list[Path] = []
-
-    def fake_check(pd):
-        calls.append(pd)
-
-    with patch("brain.bridge.supervisor._run_deploy_recalibration_check", side_effect=fake_check):
+    with (
+        patch("brain.bridge.supervisor._deploy_recalibration_due", return_value=True) as due,
+        patch("brain.bridge.supervisor._run_deploy_recalibration") as run,
+    ):
         from brain.bridge.supervisor import run_folded
 
         run_folded(
             stop,
             persona_dir=persona_dir,
             provider=FakeProvider(),
-            event_bus=bus,
+            event_bus=EventBus(),
             tick_interval_s=0.1,
             heartbeat_interval_s=None,
         )
 
-    assert calls == [persona_dir], "must fire exactly once at startup, for the right persona_dir"
+    due.assert_not_called()
+    run.assert_not_called()
+
+
+def test_run_folded_runs_deploy_recalibration_at_the_first_idle_pass_when_due(
+    tmp_path: Path,
+) -> None:
+    """C38: with the floor stale, the job runs at the first lull — the
+    bridge-start lull included (chat is idle: no message this test)."""
+    persona_dir = _persona_dir(tmp_path)
+    stop = threading.Event()
+    runs: list[Path] = []
+
+    with (
+        patch("brain.bridge.supervisor._deploy_recalibration_due", return_value=True),
+        patch(
+            "brain.bridge.supervisor._run_deploy_recalibration",
+            side_effect=lambda pd: runs.append(pd),
+        ),
+    ):
+        t = _run_folded_in_thread(persona_dir, stop)
+        try:
+            assert _wait_for(lambda: len(runs) >= 1), "deploy recalibration never ran"
+        finally:
+            stop.set()
+            t.join(timeout=5.0)
+    assert not t.is_alive()
+    assert runs[0] == persona_dir
+
+
+def test_run_folded_does_not_run_deploy_recalibration_when_floor_fresh(tmp_path: Path) -> None:
+    """C38: with the floor fresh the job is not due — probed, never run."""
+    persona_dir = _persona_dir(tmp_path)
+    stop = threading.Event()
+    probes: list[int] = []
+
+    def _not_due(_pd):
+        probes.append(1)
+        return False
+
+    with (
+        patch("brain.bridge.supervisor._deploy_recalibration_due", side_effect=_not_due),
+        patch("brain.bridge.supervisor._run_deploy_recalibration") as run,
+    ):
+        t = _run_folded_in_thread(persona_dir, stop)
+        try:
+            assert _wait_for(lambda: len(probes) >= 2), "due probe never asked"
+        finally:
+            stop.set()
+            t.join(timeout=5.0)
+    assert not t.is_alive()
+    run.assert_not_called()
 
 
 def test_run_folded_skips_deploy_recalibration_when_calibration_disabled(tmp_path: Path) -> None:
     """`calibration_interval_s=None` (the tests/dev disable knob for the
-    whole calibration subsystem) must also skip this check — there is no
-    floor-gated recall path for it to protect when calibration is off."""
-    persona_dir = _persona_dir(tmp_path)
-    bus = EventBus()
-    stop = threading.Event()
-    stop.set()
+    whole calibration subsystem) must also leave this job out of the table —
+    there is no floor-gated recall path for it to protect when calibration is
+    off."""
+    from brain.bridge import supervisor as sup
 
-    calls: list[Path] = []
-
-    def fake_check(pd):
-        calls.append(pd)
-
-    with patch("brain.bridge.supervisor._run_deploy_recalibration_check", side_effect=fake_check):
-        from brain.bridge.supervisor import run_folded
-
-        run_folded(
-            stop,
-            persona_dir=persona_dir,
-            provider=FakeProvider(),
-            event_bus=bus,
-            tick_interval_s=0.1,
-            heartbeat_interval_s=None,
-            calibration_interval_s=None,
-        )
-
-    assert calls == [], "must be skipped when the calibration subsystem is disabled"
-
-
-def test_run_folded_deploy_recalibration_failure_does_not_crash_the_bridge(tmp_path: Path) -> None:
-    """A failure inside `_run_deploy_recalibration_check` must be caught at
-    the `run_folded` call site (mirroring every other one-shot startup
-    step) and must not crash bridge startup."""
-    persona_dir = _persona_dir(tmp_path)
-    bus = EventBus()
-    stop = threading.Event()
-    stop.set()
-
-    def boom(pd):
-        raise RuntimeError("simulated deploy recalibration failure")
-
-    with patch("brain.bridge.supervisor._run_deploy_recalibration_check", side_effect=boom):
-        from brain.bridge.supervisor import run_folded
-
-        # Must not raise.
-        run_folded(
-            stop,
-            persona_dir=persona_dir,
-            provider=FakeProvider(),
-            event_bus=bus,
-            tick_interval_s=0.1,
-            heartbeat_interval_s=None,
-        )
+    jobs = sup._build_gated_jobs(
+        persona_dir=_persona_dir(tmp_path),
+        provider=FakeProvider(),
+        event_bus=EventBus(),
+        is_session_busy=None,
+        finalize_after_hours=24.0,
+        finalize_interval_s=None,
+        initiate_review_interval_s=None,
+        maintenance_interval_s=None,
+        self_model_interval_s=None,
+        compaction_interval_s=None,
+        calibration_interval_s=None,
+        interest_sweep_interval_s=None,
+        judge_selftune_interval_s=None,
+        clustering_interval_s=None,
+        intensity_drivers=lambda: None,
+        tick_stats={"closed_sessions": 0, "pruned_empty_sessions": 0},
+    )
+    names = [j.name for j in jobs]
+    assert "deploy_recalibration" not in names
+    assert "daily_calibration" not in names
 
 
 def test_run_folded_deploy_recalibration_failure_does_not_block_periodic_loop(
     tmp_path: Path,
 ) -> None:
-    """Belt-and-suspenders on the fault-isolation claim: with the check
-    raising on every call, run the loop for a couple of periodic ticks (not
-    just the startup one-shot) and confirm the supervisor thread stays
-    alive and exits cleanly on stop — a leaked exception in this one-shot
-    must never wedge the whole supervisor thread."""
+    """Fault isolation: with the job raising on every run, the supervisor
+    thread keeps looping (it retries at later passes: a raise is a completed
+    run for cadence purposes, S44, but this job has no cadence of its own —
+    its staleness predicate stays true) and exits cleanly on stop."""
     persona_dir = _persona_dir(tmp_path)
-    bus = EventBus()
     stop = threading.Event()
     attempts: list[int] = []
 
@@ -572,27 +622,14 @@ def test_run_folded_deploy_recalibration_failure_does_not_block_periodic_loop(
         attempts.append(1)
         raise RuntimeError("simulated deploy recalibration failure")
 
-    def runner():
-        with patch("brain.bridge.supervisor._run_deploy_recalibration_check", side_effect=boom):
-            from brain.bridge.supervisor import run_folded
-
-            run_folded(
-                stop,
-                persona_dir=persona_dir,
-                provider=FakeProvider(),
-                event_bus=bus,
-                tick_interval_s=0.05,
-                heartbeat_interval_s=None,
-            )
-
-    t = threading.Thread(target=runner, daemon=True)
-    t.start()
-    try:
-        deadline = _time.monotonic() + 5.0
-        while _time.monotonic() < deadline and len(attempts) < 1:
-            _time.sleep(0.02)
-        assert len(attempts) >= 1, "the startup one-shot never fired"
-    finally:
-        stop.set()
-        t.join(timeout=5.0)
+    with (
+        patch("brain.bridge.supervisor._deploy_recalibration_due", return_value=True),
+        patch("brain.bridge.supervisor._run_deploy_recalibration", side_effect=boom),
+    ):
+        t = _run_folded_in_thread(persona_dir, stop)
+        try:
+            assert _wait_for(lambda: len(attempts) >= 2), "loop died after a failing run"
+        finally:
+            stop.set()
+            t.join(timeout=5.0)
     assert not t.is_alive(), "supervisor loop did not exit after stop_event"

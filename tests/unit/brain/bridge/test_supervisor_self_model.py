@@ -207,8 +207,8 @@ def test_self_model_tick_fail_isolated_on_articulate_error(tmp_path: Path) -> No
 
 def test_preflight_peek_denial_is_zero_side_effect(tmp_path: Path) -> None:
     """C9: when the pre-flight throttle peek denies (the common case during a
-    sustained-chat spell), NOTHING except the cadence advance and the C1
-    error-sink log happens - no gap computation, no self_model_state.json
+    sustained-chat spell), NOTHING except the C1 error-sink log happens (since
+    ram-spike-fix INC-9 not even a cadence advance, S20/C22) - no gap computation, no self_model_state.json
     write, no daily-budget consumption, no gaps_surfaced change, no feed
     event. Seeds a gap that WOULD be computed/consumed if a granted attempt
     ran, so this test can actually detect a regression rather than merely
@@ -249,11 +249,14 @@ def test_preflight_peek_denial_is_zero_side_effect(tmp_path: Path) -> None:
     assert len(rows) == 1
     assert rows[0]["kind"] == "self_model_articulate_deferred"
 
-    advanced = sm_cadence.load(persona_dir)
-    assert advanced.next_reflection_at is not None
-    delta = (advanced.next_reflection_at - datetime.now(UTC)).total_seconds()
-    assert 0 < delta <= 65, "cadence must advance to the short ~60s deferred retry, not ~6h"
-    assert advanced.consecutive_failures == 0, "a deferral must not trigger the failure backoff"
+    # ram-spike-fix INC-9 (S20, C22): a no-lull / slot-denied skip leaves the
+    # cadence UNCHANGED (it used to write a short "deferred" retry) — here no
+    # cadence file existed, so none may be created; the reflection is simply
+    # still due at the next idle pass.
+    assert not sm_cadence._state_path(persona_dir).exists(), (  # noqa: SLF001
+        "a denied attempt must not write or advance the self-model cadence"
+    )
+    assert sm_cadence.is_due(sm_cadence.load(persona_dir), now=datetime.now(UTC))
 
 
 def test_rare_race_throttle_deferred_still_persists_state_but_defers_cadence(

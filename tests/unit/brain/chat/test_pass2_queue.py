@@ -3,8 +3,9 @@
 ram-spike-fix INC-8: the queue is now backed by `<persona_dir>/pass2_queue.json`
 (S64) instead of a pure in-memory deque. These tests drive the synchronous
 `drain_pending()`/`drain_all_locked()` entry-points against a `tmp_path`
-persona_dir; the daemon worker thread is never spawned here (conftest
-inhibits it). Mechanism-level tests (FIFO order, overflow, throttle-yield,
+persona_dir (ram-spike-fix INC-9 removed the daemon worker thread: the bridge
+drains through the supervisor's central cadence function, see
+tests/unit/brain/bridge/test_central_cadence.py). Mechanism-level tests (FIFO order, overflow, throttle-yield,
 error isolation) use the test-only `kind="test_probe"` record
 (`pass2_queue.register_test_side_effect`) instead of a real "monologue"/
 "attunement" record — those two kinds are covered by
@@ -120,10 +121,8 @@ class TestThrottleYield:
         """The OUTER per-call throttle gate (2-plan.md §3.5a) is the
         CALLER's job, not drain_all_locked's own. This test calls the same
         `cli_throttle.acquire_background()` / `drain_all_locked` primitives
-        `pass2_queue._worker_loop` composes, directly, so the assertions
-        below are legible on their own; it does NOT start the real worker
-        thread — see `TestWorkerLoop` below for an end-to-end test that
-        does, starting the actual daemon thread via `_ensure_worker`."""
+        the supervisor's pass-2 gated job composes (ram-spike-fix INC-9),
+        directly, so the assertions below are legible on their own."""
         records, make = _make_recorder()
         pass2_queue.enqueue(make("x"), persona_dir=tmp_path)
 
@@ -164,51 +163,31 @@ class TestThrottleYield:
         assert pass2_queue._queue_size(tmp_path) == 1
 
 
-class TestWorkerLoop:
-    """End-to-end: the REAL daemon worker thread (`_ensure_worker`/
-    `_worker_loop`), started for real, composing `cli_throttle.
-    acquire_background()` + `drain_all_locked` + `release_background()` —
-    not a hand-simulated stand-in. The autouse `_reset_pass2_queue` fixture
-    (tests/conftest.py) sets `_worker_inhibited = True` for every other
-    test in the suite specifically so enqueue() never starts this thread;
-    this test opts back in deliberately and restores the inhibition after."""
+class TestNoWorkerThread:
+    """ram-spike-fix INC-9 (C23): no pass-2 worker thread remains — the
+    bridge drains the saved queue from the supervisor's central cadence
+    function (the first gated job), and `nell chat --no-bridge` drains at
+    exit. enqueue() starts nothing."""
 
-    def _poll_until(self, predicate, *, timeout: float = 3.0, interval: float = 0.02) -> bool:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if predicate():
-                return True
-            time.sleep(interval)
-        return predicate()
+    def test_enqueue_starts_no_thread(self, tmp_path, monkeypatch):
+        import threading
 
-    def test_worker_thread_drains_once_idle_but_not_while_chat_active(self, tmp_path):
-        records, make = _make_recorder()
-        pass2_queue._worker_inhibited = False
-        try:
-            cli_throttle.mark_interactive_active()  # not idle
-            pass2_queue.enqueue(make("x"), persona_dir=tmp_path)  # starts the real worker thread
+        # Un-inhibit any worker a regressed module might still carry (the old
+        # conftest inhibited it), so this test can actually fail against it.
+        monkeypatch.setattr(pass2_queue, "_worker_inhibited", False, raising=False)
+        before = {t.ident for t in threading.enumerate()}
+        _records, make = _make_recorder()
+        for label in ("a", "b", "c"):
+            pass2_queue.enqueue(make(label), persona_dir=tmp_path)
+        time.sleep(0.05)
+        after = threading.enumerate()
+        assert {t.ident for t in after} <= before, "enqueue() started a thread"
+        assert not any(t.name == "pass2-queue-worker" for t in after)
+        assert pass2_queue._queue_size(tmp_path) == 3  # saved, waiting for a drainer
 
-            # Give the real worker thread several poll cycles; it must NOT
-            # drain while cli_throttle denies the background slot.
-            # Several multiples of the worker's own _POLL_SECONDS (0.5s), so
-            # this actually observes more than one denied poll cycle rather
-            # than just the worker's very first attempt (re-review nitpick).
-            drained_too_early = self._poll_until(
-                lambda: pass2_queue._queue_size(tmp_path) == 0,
-                timeout=pass2_queue._POLL_SECONDS * 2.5,
-            )
-            assert not drained_too_early, "worker thread drained while chat was active"
-            assert records == []
-
-            # Once idle, the same running thread must drain it without any
-            # further enqueue.
-            cli_throttle.reset()
-            drained = self._poll_until(lambda: pass2_queue._queue_size(tmp_path) == 0, timeout=3.0)
-            assert drained, "worker thread never drained the item once idle"
-            assert records == ["x"]
-        finally:
-            pass2_queue._worker_inhibited = True
-            pass2_queue.reset()
+    def test_module_has_no_worker_machinery(self):
+        for name in ("_ensure_worker", "_worker_loop", "_worker_thread", "_worker_inhibited"):
+            assert not hasattr(pass2_queue, name), name
 
 
 # ---------------------------------------------------------------------------

@@ -37,23 +37,31 @@ def test_supervisor_tick_emits_event(persona_dir: Path):
 def test_supervisor_prunes_old_empty_sessions(
     persona_dir: Path, monkeypatch
 ) -> None:
-    """Empty app-created sessions have no buffer file, so supervisor must prune registry."""
-    from brain.bridge import supervisor
-    from brain.chat.session import all_sessions, reset_registry
+    """Empty app-created sessions have no buffer file, so supervisor must prune registry.
 
-    # Lower the per-session staleness threshold (module default 10 min) so an
-    # empty session is stale almost immediately — same intent as the old
-    # silence_minutes=0.001 kwarg this test used before build_app/run_folded's
-    # externally-passed idle proxy was retired (ram-spike-fix INC-6, C4(a)).
-    # Chat is idle by default (no message sent this test), so the new
-    # is_chat_idle() gate around the snapshot/prune block is open throughout.
-    monkeypatch.setattr(supervisor, "_SESSION_STALE_MINUTES", 0.001)
+    ram-spike-fix INC-9 (C39, S72, 2-plan §3.3a): the prune is a gated job of
+    the central cadence function and prunes only empty sessions that PREDATE
+    the current idle window (``created_at`` at or before the last message) —
+    never one opened during it (fbdd3acc: the app opens a session on mount).
+    So: a session opened before any message is kept; once a message lands
+    AFTER it and the lull has passed, the next idle pass prunes it.
+    """
+    from brain.bridge import cli_throttle
+    from brain.chat.session import all_sessions, reset_registry
 
     reset_registry()
     try:
         with _client(persona_dir, tick_interval_s=0.1) as c:
             c.post("/session/new", json={"client": "tests"})
             assert len(all_sessions()) == 1
+            # No message yet: the session was opened during the current idle
+            # window, so idle passes must NOT prune it (C39(ii)).
+            time.sleep(0.5)
+            assert len(all_sessions()) == 1
+            # Backdate the session and put the last message after its creation
+            # but more than a lull ago: it now predates the idle window.
+            all_sessions()[0].created_at = datetime.now(UTC) - timedelta(hours=2)
+            cli_throttle.mark_interactive_active(at=time.monotonic() - 3600.0)
             deadline = time.time() + 3
             while time.time() < deadline and all_sessions():
                 time.sleep(0.05)

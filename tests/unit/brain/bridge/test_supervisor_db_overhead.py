@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import inspect
 import threading
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -78,6 +78,21 @@ def _isolating_kwargs(**overrides):
     return kwargs
 
 
+def _seed_overdue_cadence(persona_dir: Path, filename: str) -> None:
+    """ram-spike-fix INC-9 (S22/S34): a MISSING gated-job cadence file is now
+    created as "last ran now" (the job waits one full interval), so a test
+    that wants a gated job to fire on its first pass seeds an OVERDUE file."""
+    from datetime import UTC, datetime, timedelta
+
+    supervisor.persisted_cadence.save_cadence(
+        persona_dir,
+        filename,
+        supervisor.persisted_cadence.CadenceState(
+            next_at=datetime.now(UTC) - timedelta(hours=1)
+        ),
+    )
+
+
 def _drive_ticks(
     persona_dir: Path,
     *,
@@ -85,6 +100,8 @@ def _drive_ticks(
     bus=None,
     memstore_raises_on_tick=None,
     on_notes_call=None,
+    central_pass: bool = False,
+    extra_patches=(),
     **extra,
 ):
     """Run run_folded synchronously, single-threaded, terminating deterministically
@@ -94,6 +111,13 @@ def _drive_ticks(
     unconditional; tick_interval_s=0.05 keeps the one intentional stop_event.wait()
     between ticks fast (not a correctness dependency — termination is by the
     counter, not the timer).
+
+    ram-spike-fix INC-9: the session sweep is now a gated job of the central
+    cadence function (it runs only when it has work) and the per-tick store is
+    opened at the top of each iteration. ``central_pass=False`` (the Part-A
+    default: "every cadence other than the per-tick store's consumers
+    disabled") stubs the central pass out so only the per-tick store is
+    constructed; tests that exercise a gated job pass ``central_pass=True``.
     """
     stop_event = threading.Event()
     bus = bus or _CapturingBus()
@@ -147,14 +171,21 @@ def _drive_ticks(
         patch.object(supervisor, "_maybe_run_notes_tick", side_effect=_spy_notes),
         patch.object(supervisor, "_attunement_should_run_backfill", return_value=False),
         patch.object(supervisor, "_attunement_should_run_supplementary_backfill", return_value=False),
-        patch.object(supervisor, "_emotion_backfill_should_run", return_value=False),
+        patch.object(supervisor, "_emotion_backfill_has_work", return_value=False),
         patch.object(supervisor, "_vocab_repair_should_run", return_value=False),
         patch.object(supervisor, "_soul_candidate_repair_should_run", return_value=False),
         patch(
             "brain.health.self_model_repair.should_run_self_model_repair",
             return_value=False,
         ),
+        ExitStack() as stack,
     ):
+        if not central_pass:
+            stack.enter_context(
+                patch.object(supervisor.central_cadence, "run_central_pass", return_value=[])
+            )
+        for extra_patch in extra_patches:
+            stack.enter_context(extra_patch)
         kwargs = _isolating_kwargs(**extra)
         supervisor.run_folded(
             stop_event,
@@ -186,21 +217,79 @@ def test_run_folded_opens_memories_db_once_per_tick_sweep_maker_notes(tmp_path):
     assert len(_mem_constructions(result)) == 1
 
 
+def _drive_one_snapshot_tick(persona_dir: Path):
+    """One tick with the central pass on and the snapshot/prune job forced to
+    have work (its extraction stubbed out: no LLM), recording the store the
+    snapshot was handed."""
+    seen: dict = {}
+
+    def _fake_snapshot(persona_dir, *, silence_minutes, store, hebbian, provider, **_kw):
+        seen["store"] = store
+        seen["silence_minutes"] = silence_minutes
+        return []
+
+    result = _drive_ticks(
+        persona_dir,
+        num_ticks=1,
+        central_pass=True,
+        extra_patches=(
+            patch.object(supervisor, "_snapshot_has_work", return_value=True),
+            patch.object(supervisor, "snapshot_stale_sessions", side_effect=_fake_snapshot),
+        ),
+    )
+    return result, seen
+
+
 def test_run_folded_opens_hebbian_db_once_per_tick(tmp_path):
-    """C2 (regression guard): hebbian.db opened at most once per tick."""
+    """C2 (regression guard): hebbian.db opened at most once per tick — since
+    ram-spike-fix INC-9 only by the snapshot/prune job, and only on a tick
+    where that job has work (zero opens otherwise)."""
     persona_dir = _persona_dir(tmp_path)
-    result = _drive_ticks(persona_dir, num_ticks=1)
+    idle = _drive_ticks(persona_dir, num_ticks=1)
+    assert len(_hebbian_constructions(idle)) == 0
+    (tmp_path / "b").mkdir()
+    result, _seen = _drive_one_snapshot_tick(_persona_dir(tmp_path / "b"))
     assert len(_hebbian_constructions(result)) == 1
 
 
 def test_run_folded_per_tick_opens_skip_integrity_check(tmp_path):
-    """C3: the per-tick memories.db/hebbian.db opens pass integrity_check=False."""
+    """C3: the per-tick memories.db/hebbian.db opens pass integrity_check=False,
+    and the snapshot job reuses the per-tick store (#132) instead of opening
+    its own."""
     persona_dir = _persona_dir(tmp_path)
-    result = _drive_ticks(persona_dir, num_ticks=1)
+    result, seen = _drive_one_snapshot_tick(persona_dir)
     mem = _mem_constructions(result)
     heb = _hebbian_constructions(result)
     assert len(mem) == 1 and mem[0]["kwargs"].get("integrity_check") is False
     assert len(heb) == 1 and heb[0]["kwargs"].get("integrity_check") is False
+    assert seen["store"] is mem[0]["obj"]
+    # No per-session age threshold on an idle pass (S66/S72/S83).
+    assert seen["silence_minutes"] == 0.0
+
+
+def test_emotion_backfill_job_reuses_the_per_tick_store(tmp_path):
+    """#132 invariant under ram-spike-fix INC-9 (stage-6 red-team MAJOR, fixed):
+    a tick on which the emotion-backfill gated job runs still opens exactly ONE
+    memories.db connection — the job is handed the per-tick shared store
+    instead of opening its own."""
+    persona_dir = _persona_dir(tmp_path)
+    seen: dict = {}
+
+    def _fake_run(persona_dir, *, provider, store=None, **_kw):
+        seen["store"] = store
+
+    result = _drive_ticks(
+        persona_dir,
+        num_ticks=1,
+        central_pass=True,
+        extra_patches=(
+            patch.object(supervisor, "_emotion_backfill_has_work", return_value=True),
+            patch.object(supervisor, "_emotion_backfill_run", side_effect=_fake_run),
+        ),
+    )
+    mem = _mem_constructions(result)
+    assert len(mem) == 1
+    assert seen["store"] is mem[0]["obj"]
 
 
 def test_maker_and_notes_reuse_the_sweeps_live_store_object(tmp_path):
@@ -335,7 +424,7 @@ def test_store_closed_before_uncaught_exception_propagates(tmp_path):
         ),
         patch.object(supervisor, "_attunement_should_run_backfill", return_value=False),
         patch.object(supervisor, "_attunement_should_run_supplementary_backfill", return_value=False),
-        patch.object(supervisor, "_emotion_backfill_should_run", return_value=False),
+        patch.object(supervisor, "_emotion_backfill_has_work", return_value=False),
         patch.object(supervisor, "_vocab_repair_should_run", return_value=False),
         patch.object(supervisor, "_soul_candidate_repair_should_run", return_value=False),
         patch(
@@ -373,8 +462,8 @@ def test_store_closed_before_uncaught_exception_propagates(tmp_path):
 
 
 def test_shared_store_coexists_with_finalize_on_same_tick(tmp_path):
-    """C16: finalize fires on the same tick (its own cadence state also treats a
-    missing next_at as due), opening its OWN independent MemoryStore to the same
+    """C16: finalize fires on the same tick (its cadence file is seeded overdue:
+    since ram-spike-fix INC-9 a MISSING file means "last ran now"), opening its OWN independent MemoryStore to the same
     file WHILE the shared store from the sweep is still held open — nothing
     deadlocks or raises, and the shared connection survives the encounter usable.
 
@@ -401,8 +490,13 @@ def test_shared_store_coexists_with_finalize_on_same_tick(tmp_path):
             row = store_obj._conn.execute("SELECT 1").fetchone()  # noqa: SLF001
             live_probe_results.append(tuple(row))
 
+    _seed_overdue_cadence(persona_dir, "finalize_cadence.json")
     result = _drive_ticks(
-        persona_dir, num_ticks=1, finalize_interval_s=0.0, on_notes_call=_probe
+        persona_dir,
+        num_ticks=1,
+        central_pass=True,
+        finalize_interval_s=0.0,
+        on_notes_call=_probe,
     )
     mem = _mem_constructions(result)
     # Two independent MemoryStore connections open on this tick: the sweep's shared
@@ -495,6 +589,7 @@ def test_build_app_kwargs_to_run_folded_carry_no_silence_minutes_key():
 
 
 def _drive_one_maintenance_tick(persona_dir: Path, *, throttle_grants: bool):
+    _seed_overdue_cadence(persona_dir, "maintenance_cadence.json")
     stop_event = threading.Event()
     real_memory_store = brain.memory.store.MemoryStore
 
@@ -528,7 +623,7 @@ def _drive_one_maintenance_tick(persona_dir: Path, *, throttle_grants: bool):
         patch("brain.health.sidecar_sweep.sweep_stale_sidecars", sidecar_spy),
         patch.object(supervisor, "_attunement_should_run_backfill", return_value=False),
         patch.object(supervisor, "_attunement_should_run_supplementary_backfill", return_value=False),
-        patch.object(supervisor, "_emotion_backfill_should_run", return_value=False),
+        patch.object(supervisor, "_emotion_backfill_has_work", return_value=False),
         patch.object(supervisor, "_vocab_repair_should_run", return_value=False),
         patch.object(supervisor, "_soul_candidate_repair_should_run", return_value=False),
         patch(
@@ -560,18 +655,24 @@ def _drive_one_maintenance_tick(persona_dir: Path, *, throttle_grants: bool):
 
 
 def test_maintenance_pass_defers_expensive_work_when_throttle_denies(tmp_path):
+    """ram-spike-fix INC-9 (S20, C6): a denied slot is a SKIP — nothing in the
+    maintenance job runs and its seeded-overdue cadence file is not advanced,
+    so the job is still due at the next pass (it used to advance regardless)."""
+    from datetime import UTC, datetime
+
     persona_dir = _persona_dir(tmp_path)
     forgetting_spy, narrative_spy, pending_spy, sidecar_spy, _order = _drive_one_maintenance_tick(
         persona_dir, throttle_grants=False
     )
     forgetting_spy.assert_not_called()
     narrative_spy.assert_not_called()
-    pending_spy.assert_called_once()
-    sidecar_spy.assert_called_once()
+    pending_spy.assert_not_called()
+    sidecar_spy.assert_not_called()
     cadence_state = supervisor.persisted_cadence.load_cadence(
         persona_dir, "maintenance_cadence.json"
     )
     assert cadence_state.next_at is not None
+    assert supervisor.persisted_cadence.is_due(cadence_state, now=datetime.now(UTC))
 
 
 def test_maintenance_pass_runs_expensive_work_when_throttle_grants(tmp_path):
@@ -593,6 +694,7 @@ def test_forgetting_failure_does_not_skip_narrative_pass(tmp_path):
     earlier draft merged them into one handler, which this test would have caught).
     """
     persona_dir = _persona_dir(tmp_path)
+    _seed_overdue_cadence(persona_dir, "maintenance_cadence.json")
     stop_event = threading.Event()
     real_memory_store = brain.memory.store.MemoryStore
 
@@ -617,7 +719,7 @@ def test_forgetting_failure_does_not_skip_narrative_pass(tmp_path):
         patch("brain.health.sidecar_sweep.sweep_stale_sidecars"),
         patch.object(supervisor, "_attunement_should_run_backfill", return_value=False),
         patch.object(supervisor, "_attunement_should_run_supplementary_backfill", return_value=False),
-        patch.object(supervisor, "_emotion_backfill_should_run", return_value=False),
+        patch.object(supervisor, "_emotion_backfill_has_work", return_value=False),
         patch.object(supervisor, "_vocab_repair_should_run", return_value=False),
         patch.object(supervisor, "_soul_candidate_repair_should_run", return_value=False),
         patch(

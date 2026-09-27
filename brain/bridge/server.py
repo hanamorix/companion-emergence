@@ -870,9 +870,9 @@ class BridgeAppState:
 
 
 # Test-only inhibit for the lifespan's background threads (the supervisor and the
-# compaction-backlog-migration thread). Mirrors ``pass2_queue._worker_inhibited``:
-# the root ``tests/conftest.py`` sets it True so endpoint tests do not race a live
-# supervisor over the session they just seeded (hunts/bridge-order-pollution-flakes).
+# compaction-backlog-migration thread). The root ``tests/conftest.py`` sets it
+# True so endpoint tests do not race a live supervisor over the session they just
+# seeded (hunts/bridge-order-pollution-flakes).
 # NOT an ops/user knob — no env var, no config; production never sets it. An
 # explicit ``build_app(background_threads=...)`` always wins over this flag.
 _background_threads_inhibited: bool = False

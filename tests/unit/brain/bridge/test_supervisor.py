@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from brain.bridge import persisted_cadence, supervisor
+from brain.bridge import persisted_cadence
 from brain.bridge.events import EventBus
 from brain.bridge.provider import FakeProvider
 from brain.bridge.supervisor import (
@@ -87,6 +87,29 @@ def _persona_dir(tmp_path: Path) -> Path:
     (p / "active_conversations").mkdir()
     (p / "persona_config.json").write_text('{"provider": "fake", "searcher": "noop"}')
     return p
+
+
+def _seed_overdue(persona_dir: Path, filename: str) -> None:
+    """ram-spike-fix INC-9 (S22/S34): a MISSING gated-job cadence file is
+    created as "last ran now" (the job waits one full interval), so a test
+    that wants a gated job to fire on its first pass seeds an OVERDUE file."""
+    persisted_cadence.save_cadence(
+        persona_dir,
+        filename,
+        persisted_cadence.CadenceState(next_at=datetime.now(UTC) - timedelta(hours=1)),
+    )
+
+
+def _seed_self_model_overdue(persona_dir: Path) -> None:
+    """Same, for self-model articulation's own cadence module (S29)."""
+    from brain.self_model import cadence as self_model_cadence
+
+    self_model_cadence.save(
+        persona_dir,
+        self_model_cadence.SelfModelCadenceState(
+            next_reflection_at=datetime.now(UTC) - timedelta(hours=1), consecutive_failures=0
+        ),
+    )
 
 
 class _CapturingBus:
@@ -357,13 +380,10 @@ def test_supervisor_snapshot_sweep_keeps_session_alive(
     from brain.chat.session import create_session, get_session, reset_registry
     from brain.ingest.buffer import ingest_turn
 
-    # Lower the per-session staleness threshold (module default 10 min) so a
-    # 6-min-old turn counts as stale here, same as the old silence_minutes=5.0
-    # kwarg this test used before run_folded's externally-passed idle proxy
-    # was retired (ram-spike-fix INC-6, C4(a)). Chat is idle by default
-    # (conftest's autouse cli_throttle reset), so the new is_chat_idle() gate
-    # around this block is open throughout.
-    monkeypatch.setattr(supervisor, "_SESSION_STALE_MINUTES", 5.0)
+    # ram-spike-fix INC-9 (S66/S72/S83): the snapshot/prune is a gated job of
+    # the central cadence function with NO per-session age threshold — it
+    # runs at any idle pass while a buffer has un-extracted turns. Chat is
+    # idle by default (conftest's autouse cli_throttle reset).
 
     reset_registry()
     persona_dir = _persona_dir(tmp_path)
@@ -416,7 +436,6 @@ def test_supervisor_snapshot_sweep_defers_while_chat_active(
     from brain.chat.session import create_session, reset_registry
     from brain.ingest.buffer import ingest_turn
 
-    monkeypatch.setattr(supervisor, "_SESSION_STALE_MINUTES", 5.0)
     cli_throttle.mark_interactive_active()
 
     reset_registry()
@@ -933,8 +952,10 @@ def test_run_folded_fires_log_rotation_after_interval(tmp_path: Path) -> None:
 def test_run_folded_fires_self_model_tick_when_due(tmp_path: Path) -> None:
     """run_folded wires the self-model reflection into its own cadence block,
     fault-isolated. The tick is persisted-cadence-gated internally (mirrors
-    soul review), so a fresh persona is due on the first iteration."""
+    soul review); its cadence is seeded overdue so it is due on the first
+    iteration (ram-spike-fix INC-9: a missing file means "last ran now")."""
     persona_dir = _persona_dir(tmp_path)
+    _seed_self_model_overdue(persona_dir)
     bus = EventBus()
     stop = threading.Event()
     fired = threading.Event()
@@ -1012,6 +1033,7 @@ def test_run_folded_skips_self_model_when_disabled(tmp_path: Path) -> None:
 def test_run_folded_self_model_fault_isolated(tmp_path: Path) -> None:
     """A self-model tick that raises must not take down the supervisor loop."""
     persona_dir = _persona_dir(tmp_path)
+    _seed_self_model_overdue(persona_dir)
     bus = EventBus()
     stop = threading.Event()
     fired = threading.Event()
@@ -1342,10 +1364,12 @@ def test_supervisor_initiate_review_tick_rest_state_fail_open(tmp_path: Path) ->
 
 
 def test_run_folded_fires_interest_sweep_when_due(tmp_path: Path) -> None:
-    """A fresh persona has no interest_sweep_cadence.json yet, so it's due-now
-    on the very first tick: run_folded must call run_sweep_tick and advance
+    """An overdue interest_sweep_cadence.json (seeded; ram-spike-fix INC-9: a
+    MISSING file now means "last ran now") is due on the very first tick:
+    run_folded must call run_sweep_tick and advance
     the persisted cadence past now, even though the tick was a no-op."""
     persona_dir = _persona_dir(tmp_path)
+    _seed_overdue(persona_dir, interest_sweep.SWEEP_CADENCE_FILE)
     bus = EventBus()
     stop = threading.Event()
     fired = threading.Event()
@@ -1390,6 +1414,7 @@ def test_run_folded_interest_sweep_advances_cadence_even_when_tick_raises(tmp_pa
     wrap around it must hold anyway: a raised exception must not stop the
     end-of-block advance+save, and must not kill the supervisor loop."""
     persona_dir = _persona_dir(tmp_path)
+    _seed_overdue(persona_dir, interest_sweep.SWEEP_CADENCE_FILE)
     bus = EventBus()
     stop = threading.Event()
     fired = threading.Event()

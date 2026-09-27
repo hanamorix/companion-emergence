@@ -26,6 +26,7 @@ from brain import prompt_strings
 
 if TYPE_CHECKING:
     from brain.bridge.provider import LLMProvider
+    from brain.memory.store import MemoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +227,72 @@ def should_run_emotion_backfill(persona_dir: Path) -> bool:
         store.close()
 
 
+def has_emotion_backfill_work(
+    persona_dir: Path,
+    *,
+    store: MemoryStore | None = None,
+    now: _datetime | None = None,
+) -> bool:
+    """The central cadence function's "emotion backfill has work" probe
+    (ram-spike-fix INC-9, S53/S66): the backfill runs at every idle pass while
+    this is True.
+
+    Same answer as ``should_run_emotion_backfill`` (not complete, and some
+    active memory has an empty emotion vector), with two differences made for
+    a probe asked every idle pass:
+
+    * A backfill that hit its daily cap today (state ``deferred_to_next_day``
+      and the budget file dated today — the budget's own day boundary, the
+      one the cap resets on) has no work until that day is over, so the cap
+      is not re-hit on every pass.
+    * It streams only the ``emotions_json`` column and stops at the first
+      empty vector, instead of loading every active memory row (with its
+      embedding) into memory the way ``list_active`` does.
+
+    ``store``: an already-open ``MemoryStore`` on this persona's
+    ``memories.db`` to read through (the supervisor's per-tick store); when
+    None, a short-lived one is opened and closed here.
+    """
+    existing = _load_state(persona_dir)
+    if existing is not None and existing.status == "complete":
+        return False
+    if existing is not None and existing.status == "deferred_to_next_day":
+        now = now or _datetime.now(UTC)
+        try:
+            raw = json.loads(_budget_path(persona_dir).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raw = {}
+        if isinstance(raw, dict) and raw.get("date") == _today_str(now):
+            return False
+
+    def _scan(s: MemoryStore) -> bool:
+        cur = s._conn.execute(  # noqa: SLF001 — one-column streaming read
+            "SELECT emotions_json FROM memories WHERE active = 1"
+        )
+        try:
+            for (emotions_json,) in cur:
+                if not json.loads(emotions_json):
+                    return True
+            return False
+        finally:
+            cur.close()
+
+    if store is not None:
+        return _scan(store)
+
+    db_path = persona_dir / "memories.db"
+    if not db_path.exists():
+        return False
+
+    from brain.memory.store import MemoryStore as _MemoryStore
+
+    own = _MemoryStore(str(db_path), integrity_check=False)
+    try:
+        return _scan(own)
+    finally:
+        own.close()
+
+
 def run_emotion_backfill(
     persona_dir: Path,
     *,
@@ -234,8 +301,14 @@ def run_emotion_backfill(
     cap: int = 200,
     now_dt: _datetime | None = None,
     delay_s: float = _INTER_CALL_DELAY_S,
+    store: MemoryStore | None = None,
 ) -> EmotionBackfillState:
     """Run (or resume) the one-time emotion backfill.
+
+    ``store``: an already-open ``MemoryStore`` on this persona's
+    ``memories.db`` to use (and NOT close) — the supervisor passes its
+    per-tick shared store so a tick keeps one memories.db connection (#132,
+    ram-spike-fix INC-9). When None, the run opens and closes its own.
 
     - Selects ALL active memories with ``emotions == {}`` ordered by ``m.id``
       (stable, deterministic cursor — no sampling).
@@ -273,13 +346,16 @@ def run_emotion_backfill(
     vocab = _load_vocab()
 
     db_path = persona_dir / "memories.db"
-    from brain.memory.store import MemoryStore
+    from brain.memory.store import MemoryStore as _MemoryStore
 
     # Single store handle for the whole run — avoids opening a fresh connection
     # per write-back (mirrors the attunement backfill's single-handle pattern).
-    # MemoryStore uses WAL + 5s busy_timeout so a long-running backfill does
-    # not block the main chat path.
-    store = MemoryStore(str(db_path), integrity_check=False)
+    # MemoryStore uses WAL + a busy timeout so a long-running backfill does
+    # not block the main chat path. A caller-supplied store is used as is and
+    # left open (the caller owns it).
+    own_store = store is None
+    if own_store:
+        store = _MemoryStore(str(db_path), integrity_check=False)
     try:
         all_active = store.list_active()
 
@@ -411,4 +487,5 @@ def run_emotion_backfill(
         return state
 
     finally:
-        store.close()
+        if own_store:
+            store.close()
