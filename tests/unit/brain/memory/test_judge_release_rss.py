@@ -305,6 +305,98 @@ def test_c2a_calibration_tick_finish_releases_judge_rss() -> None:
     )
 
 
+def test_c2c_calibration_tick_pause_releases_judge_rss() -> None:
+    """C2 (calibration PAUSE arm, ram-spike-fix INC-10): two unlabeled
+    calibration_log rows, a `should_pause` that fires True right after the
+    FIRST row is labeled (before the second) — `_run_calibration_tick`
+    returns None (paused) and its `finally` releases the judge exactly the
+    same way the finish arm does, per the SAME <= 25% retained-fraction
+    bound. The second row stays unlabeled (proves the pause actually
+    stopped mid-labeling, not that the tick silently finished both rows).
+
+    Fail-first (pre-INC-10): `label_calibration_sample` had no
+    `should_pause` parameter at all, so a mid-tick idle-loss could not stop
+    labeling early — this exact pause path did not exist.
+    """
+    script = _RSS_TRACE_PRELUDE + textwrap.dedent(
+        """
+        import tempfile
+        from pathlib import Path
+
+        from brain.bridge.provider import FakeProvider
+        from brain.bridge.supervisor import _run_calibration_tick
+        from brain.memory.store import Memory, MemoryStore
+        import brain.memory.relevance_judge as rj
+        import brain.memory.reranker as reranker_mod
+
+        def _no_reranker(*a, **kw):
+            raise RuntimeError("reranker load disabled for this RSS-isolation test")
+
+        reranker_mod.build_reranker_provider = _no_reranker
+
+        persona_dir = Path(tempfile.mkdtemp())
+        store = MemoryStore(persona_dir / "memories.db")
+        pairs = [
+            ("deep breathing helps when you are feeling anxious", "how do I calm down when everything feels like too much"),
+            ("a second, different memory so there are two rows to label", "an unrelated second query"),
+        ]
+        for content, q in pairs:
+            mem = Memory.create_new(content=content, memory_type="conversation", domain="us")
+            store.create(mem)
+            store.log_calibration_sample(
+                query=q, candidate_ids=[mem.id], reranker_scores=[5.0], reranker_model_id="m",
+            )
+        store.close()
+
+        _pause_after = {"n": 0}
+        def _should_pause():
+            _pause_after["n"] += 1
+            return _pause_after["n"] >= 1  # pause right after the first row
+
+        _warm_libs()
+        rss_before = _proc.memory_info().rss
+        _poll_thread.start()
+        ran = _run_calibration_tick(persona_dir, provider=FakeProvider(), should_pause=_should_pause)
+        _stop.set()
+        _poll_thread.join(timeout=5)
+        rss_after = _settled_rss()
+        peak = max(_trace) if _trace else rss_after
+
+        store2 = MemoryStore(persona_dir / "memories.db")
+        unlabeled = store2._conn.execute(
+            "SELECT COUNT(*) FROM calibration_log WHERE local_judge_label IS NULL"
+        ).fetchone()[0]
+
+        print(json.dumps({
+            "rss_before": rss_before,
+            "peak": peak,
+            "rss_after": rss_after,
+            "provider_cache_empty": rj._provider_cache == {},
+            "ran": ran,
+            "unlabeled_remaining": unlabeled,
+        }))
+        """
+    )
+    result = _run_subprocess_script(script)
+    rss_before, peak, rss_after = result["rss_before"], result["peak"], result["rss_after"]
+    load_delta = peak - rss_before
+    bound = rss_before + _C2_RETAINED_FRACTION_BOUND * load_delta
+    assert result["ran"] is None, "a mid-tick pause must report None (paused), not True/False"
+    assert result["unlabeled_remaining"] == 1, (
+        "exactly one row must stay unlabeled -- proves the pause stopped between "
+        "rows rather than silently finishing both"
+    )
+    assert load_delta > 200_000_000, (
+        f"the judge doesn't look like it actually loaded (load_delta={load_delta / 1e6:.1f}MB) "
+        "-- this test would pass vacuously if label_calibration_sample never built the real judge"
+    )
+    assert result["provider_cache_empty"], "release_judge() must clear the shared base-judge cache on pause too"
+    assert rss_after <= bound, (
+        f"rss_after={rss_after / 1e6:.1f}MB exceeds the C2 pause-arm bound {bound / 1e6:.1f}MB "
+        f"(rss_before={rss_before / 1e6:.1f}MB + {_C2_RETAINED_FRACTION_BOUND:.0%} of load_delta={load_delta / 1e6:.1f}MB)"
+    )
+
+
 def test_c2b_weight_retrain_finish_releases_judge_rss() -> None:
     """C2 (self-tune finish arm, scoped per this file's module docstring): a
     real champion build (`build_judge_provider()`) + a real, tiny LoRA
