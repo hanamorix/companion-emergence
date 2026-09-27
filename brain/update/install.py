@@ -28,8 +28,9 @@ TORCH_CPU_INDEX = "https://download.pytorch.org/whl/cpu"  # == pyproject's pytor
 NEVER_INSTALL = frozenset({"pip", "setuptools", "wheel"})  # the build strips them on purpose
 SMOKE_MODULES = ("brain.cli", "brain.bridge.server", "brain.chat.engine")
 
-_PIN = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;\\]+)")
+_PIN = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)(\[[^]]*\])?==([^\s;\\]+)")
 _SAFE_COMMIT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+_OPTION_PREFIXES = ("--index-url", "--extra-index-url", "-i", "--find-links", "-f")
 
 
 class UpdateError(RuntimeError):
@@ -54,7 +55,7 @@ def parse_requirements(text: str) -> tuple[list[str], list[Requirement]]:
 
     def close():
         if current is not None and head is not None:
-            reqs.append(Requirement(_norm(head.group(1)), head.group(2), "\n".join(current) + "\n"))
+            reqs.append(Requirement(_norm(head.group(1)), head.group(3), "\n".join(current) + "\n"))
 
     for line in text.splitlines():
         if line[:1].isspace() and current is not None:
@@ -65,12 +66,14 @@ def parse_requirements(text: str) -> tuple[list[str], list[Requirement]]:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        if stripped.startswith("-"):
-            options.append(stripped)
-            continue
         m = _PIN.match(stripped)
         if m:
             current, head = [line], m
+            continue
+        if stripped.startswith(_OPTION_PREFIXES):
+            options.append(stripped)
+            continue
+        raise UpdateError(f"unrecognised requirement line: {line!r}")
     close()
     return options, reqs
 
@@ -127,7 +130,11 @@ def apply_update(*, wheel: Path, requirements: Path, commit: str, site_dir: Path
     parts = wheel.name.split("-")
     if len(parts) < 2 or not wheel.is_file():
         raise UpdateError(f"not a wheel: {wheel}")
-    entry = {"dir": commit[:12], "commit": commit, "brain_version": parts[1], "bundle_id": bundle_id}
+    # bundle_id is folded into the folder name: an app upgrade that changes it (same
+    # commit re-applied against a new bundle) installs into a NEW folder rather than
+    # colliding with one built for the old bundle.
+    entry = {"dir": f"{commit[:12]}-{bundle_id[:8]}", "commit": commit, "brain_version": parts[1],
+             "bundle_id": bundle_id}
     with overlay.overlay_lock(root):
         target = root / entry["dir"]
         try:
@@ -151,11 +158,29 @@ def apply_update(*, wheel: Path, requirements: Path, commit: str, site_dir: Path
                               "--target", str(staging), *pip_extra, "-r", str(diff_file)])
                     finally:
                         diff_file.unlink(missing_ok=True)
+                # the brain wheel is installed without a hash: its integrity is the
+                # caller's — built locally by scripts/update.sh, or sha256-checked
+                # against the signed manifest by the app in slice 4.
                 _run([*_pip(), "--target", str(staging), *pip_extra, str(wheel)])
                 _smoke(staging, smoke_modules)
                 (staging / "stamp.json").write_text(json.dumps(entry, indent=2), encoding="utf-8")
-                shutil.rmtree(target, ignore_errors=True)
-                os.replace(staging, target)
+                # Never rmtree `target`: it may be the ACTIVE overlay (e.g. this same
+                # commit+bundle re-applied over a corrupt stamp). Rename it aside first
+                # so a failed replace can restore it; only delete the old copy once the
+                # new one is safely in place.
+                old_aside = root / f"{entry['dir']}.old-{os.getpid()}"
+                renamed_old = target.exists()
+                if renamed_old:
+                    shutil.rmtree(old_aside, ignore_errors=True)
+                    os.replace(target, old_aside)
+                try:
+                    os.replace(staging, target)
+                except BaseException:
+                    if renamed_old:
+                        os.replace(old_aside, target)
+                    raise
+                if renamed_old:
+                    shutil.rmtree(old_aside, ignore_errors=True)
             except BaseException:
                 shutil.rmtree(staging, ignore_errors=True)
                 raise

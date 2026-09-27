@@ -68,6 +68,19 @@ def test_parse_requirements_splits_options_and_pins():
     assert "--hash=sha256:bb" in reqs[0].block and "sys_platform" in reqs[1].block
 
 
+def test_parse_requirements_accepts_pep508_extras():
+    text = "requests[socks]==2.31.0 \\\n    --hash=sha256:" + "1" * 64 + "\n"
+    options, reqs = install.parse_requirements(text)
+    assert options == []
+    assert [(r.name, r.version) for r in reqs] == [("requests", "2.31.0")]
+    assert "--hash=sha256:" in reqs[0].block
+
+
+def test_parse_requirements_rejects_editable_lines():
+    with pytest.raises(install.UpdateError, match="unrecognised requirement line"):
+        install.parse_requirements("-e .\n")
+
+
 def test_diff_keeps_only_changed_pins_and_never_package_managers():
     _, reqs = install.parse_requirements(
         "certifi==2026.4.22 \\\n    --hash=sha256:aa\n"
@@ -152,12 +165,67 @@ def test_reapplying_the_same_commit_reuses_the_folder(tmp_path):
     root = tmp_path / "brain-overlay"
     kw = {"wheel": brain_whl, "requirements": req, "commit": "a" * 40, "site_dir": site, "root": root,
           "pip_extra": ["--no-index", "--find-links", str(finds)]}
-    install.apply_update(**kw)
-    marker = root / ("a" * 12) / "marker"
+    entry = install.apply_update(**kw)
+    marker = root / entry["dir"] / "marker"
     marker.write_text("kept", encoding="utf-8")
     overlay.revert(root)
     install.apply_update(**kw)
     assert marker.exists() and overlay.read_state(root)["active"]["commit"] == "a" * 40
+
+
+def test_failed_swap_keeps_the_active_overlay(tmp_path, monkeypatch):
+    finds = tmp_path / "finds"
+    finds.mkdir()
+    brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
+    req = tmp_path / "requirements.txt"
+    req.write_text("", encoding="utf-8")
+    site = _fake_bundle(tmp_path, {})
+    root = tmp_path / "brain-overlay"
+    kw = {"wheel": brain_whl, "requirements": req, "commit": "a" * 40, "site_dir": site, "root": root,
+          "pip_extra": ["--no-index", "--find-links", str(finds)]}
+    entry = install.apply_update(**kw)
+    folder = root / entry["dir"]
+    # corrupt the stamp so a re-apply of the SAME commit + bundle targets this same folder
+    (folder / "stamp.json").write_text("not json", encoding="utf-8")
+
+    real_replace = install.os.replace
+
+    def fake_replace(src, dst, *a, **kw2):
+        if Path(src).name.startswith(".staging-"):
+            raise OSError("boom")
+        return real_replace(src, dst, *a, **kw2)
+
+    monkeypatch.setattr(install.os, "replace", fake_replace)
+
+    with pytest.raises((install.UpdateError, OSError)):
+        install.apply_update(**kw)
+
+    active = overlay.read_state(root)["active"]
+    assert active == entry
+    assert (root / active["dir"]).is_dir()
+    assert (root / active["dir"] / "brain").is_dir()
+
+
+def test_new_bundle_id_installs_into_a_new_folder(tmp_path):
+    finds = tmp_path / "finds"
+    finds.mkdir()
+    brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
+    req = tmp_path / "requirements.txt"
+    req.write_text("", encoding="utf-8")
+    (tmp_path / "s1").mkdir()
+    (tmp_path / "s2").mkdir()
+    site1 = _fake_bundle(tmp_path / "s1", {}, bundle_id="bundle-1")
+    site2 = _fake_bundle(tmp_path / "s2", {}, bundle_id="bundle-2")
+    root = tmp_path / "brain-overlay"
+    entry1 = install.apply_update(wheel=brain_whl, requirements=req, commit="b" * 40, site_dir=site1,
+                                  root=root, pip_extra=["--no-index", "--find-links", str(finds)])
+    entry2 = install.apply_update(wheel=brain_whl, requirements=req, commit="b" * 40, site_dir=site2,
+                                  root=root, pip_extra=["--no-index", "--find-links", str(finds)])
+    assert entry1["dir"] != entry2["dir"]
+    assert (root / entry1["dir"]).is_dir()
+    assert (root / entry2["dir"]).is_dir()
+    assert overlay.read_state(root)["active"] == entry2
+    assert overlay.read_state(root)["previous"] == entry1
 
 
 def test_unsafe_commit_labels_are_refused(tmp_path):
