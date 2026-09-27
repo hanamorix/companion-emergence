@@ -14,6 +14,8 @@ on:
       - pyproject.toml
       - uv.lock
       - .github/workflows/runtime-build.yml
+      - brain/update/**
+      - scripts/overlay_e2e.sh
   workflow_dispatch:
 
 jobs:
@@ -45,4 +47,8 @@ jobs:
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then PY="python-runtime/python.exe"; else PY="python-runtime/bin/python3"; fi
           "$PY" -P -c "import torch, sentence_transformers, peft, datasets, brain; print('torch', torch.__version__, torch.ones(2).sum().item())"
+        shell: bash
+
+      - name: Overlay end-to-end (install into overlay, activate, revert)
+        run: bash scripts/overlay_e2e.sh
         shell: bash
