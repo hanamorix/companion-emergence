@@ -2282,6 +2282,17 @@ def _run_calibration_tick(
             logger.info("calibration tick: labeled=%d calibration_log rows this pass", labeled)
         except Exception:  # noqa: BLE001 — judge/torch/Haiku failure must not crash the tick
             logger.exception("calibration tick: judge-labeling pass raised; continuing")
+        finally:
+            # S11/S27 (inc5): the judge is built for this tick alone (label_
+            # calibration_sample above, lazily and only if there were rows to
+            # label) and never kept beyond it — release its RAM whether or
+            # not the pass actually built one, and whether it succeeded or
+            # raised (release_judge() is a cheap no-op when nothing was
+            # loaded). The PAUSE arm (a mid-tick idle-loss) is INC-10; this
+            # tick has no pause point yet, so every path here is a FINISH.
+            from brain.memory.relevance_judge import release_judge
+
+            release_judge()
 
         try:
             from brain.memory import floor_calibration

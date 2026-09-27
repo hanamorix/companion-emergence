@@ -776,6 +776,21 @@ def _run_judge_selftune_tick(*, store, now: datetime, persona_dir: Path | None =
     except Exception as exc:  # noqa: BLE001 — fault-isolated, mirrors run_sweep_tick
         logger.warning("judge self-tune tick failed: %s", exc)
         result["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        # S11/S27 (inc5): release the judge's RAM once this tick FINISHES,
+        # whichever path it took — the weak knob-refit path builds no judge
+        # at all (release_judge() is then a cheap no-op); the weight-retrain
+        # path (`_run_weight_retrain`) may build the shared cached base judge
+        # (`build_judge_provider()`) and/or per-persona `FullModelJudge`/
+        # LoRA/full-FT scratch models that are never cached (module docstring
+        # above `relevance_judge._provider_cache`) — `release_judge()` drops
+        # the cache AND gc.collect()s (+ malloc_trim(0) on Linux) so those
+        # uncached, now-unreferenced models are actually reclaimed too. The
+        # PAUSE arm (a mid-tick idle-loss) is INC-10; this tick has no pause
+        # point yet, so every path here is a FINISH.
+        from brain.memory.relevance_judge import release_judge
+
+        release_judge()
     if result["fired"]:
         # F2c inc8 (spec §3): the accumulated rows are cleared once the weekly
         # self-tune has trained on them. Runs AFTER the tune's own end-of-tick

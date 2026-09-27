@@ -199,6 +199,8 @@ def build_lora_retrain_fn(
             CrossEncoderTrainingArguments,
         )
 
+        from brain.memory.relevance_judge import offline_load_kwargs
+
         resolved_rank = (
             lora_rank
             if lora_rank is not None
@@ -225,6 +227,7 @@ def build_lora_retrain_fn(
             config_kwargs={"num_labels": 1},
             max_length=resolved_max_length,
             activation_fn=activation_fn if activation_fn is not None else (lambda x: x),
+            **offline_load_kwargs(str(start_model_path), cache_dir),
         )
         lora_config = LoraConfig(
             r=resolved_rank,

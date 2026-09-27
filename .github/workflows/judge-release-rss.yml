@@ -1,0 +1,91 @@
+name: judge-release-rss
+
+# INC-5 (RAM-spike fix, spec §2; 1.5-criteria.md C2/C3/C14): a dedicated 3-OS
+# job proving the judge's RAM is ACTUALLY released after a calibration/
+# self-tune job finishes -- not merely that `release_judge()` was called.
+# `gc.collect()` + Linux's `malloc_trim(0)` is an OS-specific mechanism (O7:
+# Linux RSS only drops after gc+trim; macOS/Windows have no equivalent call
+# and are expected to reclaim via the allocator on `free()` alone) -- a
+# platform where RSS does NOT drop back down is a ship blocker per S27 and
+# is reported here, never waived by the guarded-change loop.
+#
+# Kept SEPARATE from test.yml's default matrix: test.yml's own job does not
+# warm/cache the ~2.2GB real judge model, and this job's tests
+# (tests/unit/brain/memory/test_judge_release_rss.py) are heavy/real-model,
+# marked `requires_models` + `integration` so every OTHER job's default run
+# (and every plain local `uv run pytest`) skips them.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - brain/memory/relevance_judge.py
+      - brain/memory/judge_full_ft.py
+      - brain/memory/judge_lora.py
+      - brain/memory/judge_selftune.py
+      - brain/bridge/supervisor.py
+      - tests/unit/brain/memory/test_judge_release_rss.py
+      - .github/workflows/judge-release-rss.yml
+      # Red-team finding (round-1 code review, minor): the zero-network
+      # offline-load trick (offline_load_kwargs) was empirically confirmed
+      # only against the currently-pinned huggingface-hub/sentence-
+      # transformers versions (see relevance_judge.py's offline_load_kwargs
+      # docstring) — a dependency bump that doesn't touch the files above
+      # would otherwise not re-run this job, letting that guarantee regress
+      # silently until caught by an unrelated network-in-CI failure.
+      - pyproject.toml
+      - uv.lock
+  workflow_dispatch:
+
+jobs:
+  judge-release-rss:
+    name: judge release RSS ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-22.04, windows-2022]  # the release.yml build runners (runtime-build.yml's matrix)
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install dependencies (CPU torch via pyproject's pytorch-cpu index)
+        run: uv sync --all-extras
+
+      - name: Resolve this repo's HF cache dir
+        id: cache_dir
+        shell: bash
+        run: |
+          echo "path=$(uv run python -c 'from brain.paths import get_cache_dir; print(get_cache_dir())')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache the judge model (~2.2GB; repo actions/cache quota is 10GB)
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.cache_dir.outputs.path }}
+          key: judge-model-BAAI-bge-reranker-v2-m3-${{ matrix.os }}
+
+      - name: Warm the judge's local cache if missing (one-time real download; network only used here)
+        shell: bash
+        run: |
+          uv run python -c "
+          from brain.paths import get_cache_dir
+          import brain.memory.relevance_judge as rj
+          cache_dir = get_cache_dir()
+          if rj._hf_cached('BAAI/bge-reranker-v2-m3', cache_dir):
+              print('judge model cache: HIT (restored from actions/cache)')
+          else:
+              print('judge model cache: MISS -- downloading once to warm it')
+              rj.build_judge_provider()
+              rj.release_judge()
+          "
+
+      - name: Judge release RSS tests (C2 finish arms, C3 offline load, C14 3-OS)
+        run: uv run pytest -m requires_models tests/unit/brain/memory/test_judge_release_rss.py -v -s

@@ -172,6 +172,8 @@ def build_full_ft_retrain_fn(
             CrossEncoderTrainingArguments,
         )
 
+        from brain.memory.relevance_judge import offline_load_kwargs
+
         resolved_epochs = (
             epochs
             if epochs is not None
@@ -197,6 +199,7 @@ def build_full_ft_retrain_fn(
             config_kwargs={"num_labels": 1},
             max_length=resolved_max_length,
             activation_fn=activation_fn if activation_fn is not None else (lambda x: x),
+            **offline_load_kwargs(str(start_model_path), cache_dir),
         )
         # NOTE: no model.add_adapter(...) — every parameter is trainable.
 
@@ -271,10 +274,13 @@ def load_full_scorer(
     """
     from sentence_transformers import CrossEncoder  # lazy for torch-scoping (I6)
 
+    from brain.memory.relevance_judge import offline_load_kwargs
+
     model = CrossEncoder(
         str(full_dir),
         cache_folder=str(cache_dir) if cache_dir is not None else None,
         **({"max_length": max_length} if max_length is not None else {}),
+        **offline_load_kwargs(str(full_dir), cache_dir),
     )
 
     def score(item: tuple[str, str]) -> float:

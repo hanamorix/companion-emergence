@@ -46,7 +46,7 @@ import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from brain import prompt_strings, tunables
 from brain.bridge.provider import LLMProvider
@@ -225,6 +225,82 @@ def judge_knob_key(model_id: str, checkpoint: str | Path | None) -> str:
     return f"{model_id}@{Path(checkpoint).name}"
 
 
+def _hf_cached(model_id: str, cache_dir: str | Path | None) -> bool:
+    """True iff `model_id` is fully present in the local Hugging Face cache
+    at `cache_dir`, checked WITHOUT ever touching the network (S2/S19,
+    inc5). Uses `huggingface_hub.snapshot_download(..., local_files_only=
+    True)` — the same resolver `CrossEncoder` itself uses internally — so
+    "cached" here means exactly what a real offline load would need, not an
+    approximation of it (e.g. a bare directory-listing guess). A repo
+    missing (or incomplete: `LocalEntryNotFoundError` covers both "never
+    downloaded" and "download interrupted mid-way") -> False, never raises.
+    `HFValidationError` (`model_id` isn't shaped like `namespace/repo_name`
+    — a non-existent local path reaching here, since `offline_load_kwargs`
+    routes any REAL local directory around this function entirely) is
+    treated the same as "not cached": False, so the caller falls back to
+    today's online-load attempt rather than crashing the tick on a
+    malformed id.
+    """
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import HFValidationError, LocalEntryNotFoundError
+
+    try:
+        snapshot_download(
+            repo_id=model_id,
+            cache_dir=str(cache_dir) if cache_dir is not None else None,
+            local_files_only=True,
+        )
+    except (LocalEntryNotFoundError, HFValidationError):
+        return False
+    return True
+
+
+def offline_load_kwargs(model_id_or_path: str, cache_dir: str | Path | None) -> dict[str, Any]:
+    """The kwargs to splat into a `CrossEncoder(...)` construction at a judge
+    load site (S2/S19, inc5) so a cached model makes ZERO Hugging Face
+    requests — not merely "no full download", but no HEAD/GET at all (C3a).
+
+    A LOCAL checkpoint directory (a persona's own tuned judge,
+    `judge_full_ft.load_full_scorer` / `judge_full_ft.build_full_ft_retrain_
+    fn` / `judge_lora.build_lora_retrain_fn`'s `start_model_path` when it
+    names a prior week's saved checkpoint) is already on disk — no Hub
+    resolution is possible or needed, so it goes straight to offline mode
+    with no network round-trip to decide. A Hugging Face repo id (the BASE
+    judge, or a weight-retrain's `start_model_path` before any checkpoint
+    exists yet) is checked via `_hf_cached`: present -> offline mode (no HF
+    request at all); absent -> `{}` (today's online load, C3b) — never a
+    process-global `HF_HUB_OFFLINE` mutation, which is read at import time
+    and would leak to other threads' unrelated loads (2-plan §2).
+
+    "Offline mode" is two kwargs, not one — empirically confirmed (this
+    module, manual trace) against the installed transformers/sentence-
+    transformers/huggingface_hub versions:
+      - `local_files_only=True`: covers the base config/tokenizer/weights
+        resolution (`AutoConfig`/`AutoModel.from_pretrained`'s own `hub_
+        kwargs`).
+      - `model_kwargs={"adapter_kwargs": {"local_files_only": True}}`:
+        covers a SEPARATE, independent check `transformers.models.auto.
+        auto_factory._BaseAutoModelClass.from_pretrained` runs before that —
+        `find_adapter_config_file(...)` probing for a PEFT `adapter_config.
+        json` — which reads its own `local_files_only` from `adapter_kwargs`
+        ONLY, not from the top-level `local_files_only` param at all (a
+        transformers library quirk, not a bge-reranker-v2-m3 specifics):
+        without this second kwarg, a fully-cached, `local_files_only=True`
+        load still issues a real HEAD request for `adapter_config.json` and
+        falls back to the cache only after that request errors/times out —
+        exactly the residual network touch C3a forbids. Confirmed by socket-
+        level connect-call counting: 0 with both kwargs, 1+ (with retries)
+        with `local_files_only=True` alone.
+    """
+    if Path(model_id_or_path).is_dir():
+        offline = True
+    else:
+        offline = _hf_cached(model_id_or_path, cache_dir)
+    if not offline:
+        return {}
+    return {"local_files_only": True, "model_kwargs": {"adapter_kwargs": {"local_files_only": True}}}
+
+
 class TorchCrossEncoderJudge(RelevanceJudgeProvider):
     """Real local judge via `sentence_transformers.CrossEncoder` (torch
     backend, CPU-only install — see pyproject.toml). Production default.
@@ -245,7 +321,9 @@ class TorchCrossEncoderJudge(RelevanceJudgeProvider):
         from sentence_transformers import CrossEncoder
 
         self._model_id = model_id
-        self._model = CrossEncoder(model_id, cache_folder=str(cache_dir))
+        self._model = CrossEncoder(
+            model_id, cache_folder=str(cache_dir), **offline_load_kwargs(model_id, cache_dir)
+        )
         # Same rationale as CrossEncoderProvider._rerank_lock: a shared
         # instance of this provider (the process-wide cache below) could in
         # principle have .score() called concurrently; serialize inference
@@ -396,6 +474,57 @@ def _reset_judge_provider_cache() -> None:
     """Test-only: clear the process-wide judge provider cache."""
     with _provider_cache_lock:
         _provider_cache.clear()
+
+
+def release_judge() -> None:
+    """Release the judge's RAM after a calibration or self-tune job FINISHES
+    (S11/S27, inc5; the PAUSE arm is INC-10). Called in the `finally` of
+    `supervisor._run_calibration_tick`'s judge-labeling step and of
+    `judge_selftune._run_judge_selftune_tick` — unconditionally, whether or
+    not that tick actually built a judge this time (a no-op is cheap; a
+    missed release is a RAM leak, so every finish path calls this rather
+    than only the ones known to have built something).
+
+    Drops BOTH kinds of judge reference this module can hold at the end of a
+    tick:
+      - the cached shared BASE judge (`_provider_cache`, `TorchCrossEncoder
+        Judge`) — popped under `_provider_cache_lock` so a concurrent
+        `build_judge_provider()` call never observes a half-cleared cache;
+      - any per-persona `FullModelJudge` / weight-retrain scratch model the
+        caller built and returned from this call — those are NEVER cached
+        (module docstring above `_provider_cache`), so ordinary CPython
+        refcounting already drops them once the caller's own local
+        variables go out of scope; `gc.collect()` below is what reclaims
+        them if a reference cycle (torch's autograd graph, a bound closure)
+        kept one alive past that point.
+
+    Then, on every platform, `gc.collect()` (reclaims any of the above still
+    alive only via a cycle); on Linux only, `ctypes.CDLL("libc.so.6").
+    malloc_trim(0)` — glibc's allocator does not always return freed pages
+    to the OS on `free()` alone (O7: Linux RSS only drops after gc+trim),
+    so this is the step that actually shows up in `psutil`'s RSS reading.
+    Guarded both by `sys.platform.startswith("linux")` (never attempted on
+    macOS/Windows, which have no `libc.so.6` and no `malloc_trim` — I13) and
+    by a try/except around the `CDLL`/symbol lookup itself (a musl-based
+    Linux, or a hardened glibc build missing the symbol, would otherwise
+    raise here; logged once, not re-raised, since a failed trim only means
+    RSS drops less promptly, not that anything is wrong).
+    """
+    import gc
+    import sys
+
+    with _provider_cache_lock:
+        _provider_cache.clear()
+
+    gc.collect()
+
+    if sys.platform.startswith("linux"):
+        try:
+            import ctypes
+
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except (OSError, AttributeError):
+            logger.warning("release_judge: malloc_trim(0) unavailable on this libc — RSS may drop later")
 
 
 # ---------------------------------------------------------------------------
