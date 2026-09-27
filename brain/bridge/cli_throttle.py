@@ -16,13 +16,21 @@ The slot-cap half of this module (``_max_concurrent_background`` /
 ``_inflight_background``) keeps its own FAIL-OPEN posture on internal error —
 it is not the idle check, and a malfunction there must not itself become a
 second reason for background work to starve.
+
+At bridge start, ``seed_last_message_from_active_conversations`` seeds the
+idle anchor from the newest message timestamp already SAVED on disk (S82) —
+narrowing "a fresh process is idle" to "idle once the lull has passed since
+the last saved message"; see that function's docstring.
 """
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import threading
 import time
+from datetime import UTC, datetime
+from pathlib import Path
 
 from brain import tunables
 
@@ -123,6 +131,147 @@ def reply_in_flight() -> bool:
     checked once, at the very start of a pass, never again during it."""
     with _lock:
         return _inflight_replies > 0
+
+
+def _parse_saved_ts(raw: object) -> datetime:
+    """Parse a saved active-conversation turn's ``ts`` field (ISO-8601 UTC,
+    written by ``brain.ingest.buffer._now_iso``) into an aware datetime.
+
+    Same tolerant shape already used elsewhere for this exact on-disk field
+    (``brain/chat/session.py``'s hydration, ``brain/ingest/buffer.py``'s
+    ``session_silence_minutes``): accepts a trailing ``Z`` as well as an
+    explicit offset, and treats a naive result as UTC. Raises
+    ValueError/TypeError on anything unparseable or missing — the caller
+    (``seed_last_message_from_active_conversations``) treats that as an
+    is_chat_idle fault (S63) rather than silently guessing.
+    """
+    if raw is None:
+        raise ValueError("turn has no ts field")
+    parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def _last_nonempty_raw_line(path: Path, *, chunk_size: int = 8192) -> str | None:
+    """Return the LAST non-empty raw line of a jsonl file, or None if the
+    file has no lines (missing, empty, or blank-only).
+
+    Deliberately does NOT go through ``read_jsonl_skipping_corrupt``
+    (``brain/health/jsonl_reader.py``): that reader silently drops a
+    syntactically corrupt line (e.g. one truncated by a crash/OOM
+    mid-append — exactly the kind of event this project's RAM-spike fix
+    targets) and logs only a warning, which would make the seed silently
+    fall back to an OLDER, previously-good turn as "newest". A malformed
+    trailing line must surface as a parse failure here instead, so the
+    caller's fail-closed handling (S63) covers it, rather than silently
+    understating how recent the chat actually was.
+
+    Bounded I/O via a backward seek (same growing-chunk algorithm as this
+    module's sibling ``read_last_n_jsonl_lines``, round-2 red-team MINOR):
+    cost scales with the last line's own length, not the whole file's size —
+    reading the whole buffer just to get its last line would itself be an
+    unbounded read, on a branch whose entire point is fixing exactly that
+    class of RAM spike. NOT reused directly: that helper decodes with
+    ``errors="replace"``, which would silently paper over an invalid-
+    encoding fault instead of raising it into this function's caller's
+    fail-closed handling — this needs a STRICT decode instead.
+    """
+    if not path.exists():
+        return None
+    with path.open("rb") as f:
+        f.seek(0, 2)  # SEEK_END
+        remaining = f.tell()
+        if remaining == 0:
+            return None
+        block = b""
+        while True:
+            read_size = min(chunk_size, remaining)
+            remaining -= read_size
+            f.seek(remaining)
+            block = f.read(read_size) + block
+            if remaining <= 0 or block.count(b"\n") >= 2:
+                break
+    text = block.decode("utf-8")  # strict: a bad byte must fail closed, never be papered over
+    for line in reversed(text.splitlines()):
+        if line.strip():
+            return line
+    return None
+
+
+def seed_last_message_from_active_conversations(
+    persona_dir: Path,
+    *,
+    now_wall: datetime | None = None,
+    now_mono: float | None = None,
+) -> None:
+    """S82: seed the is_chat_idle anchor from the newest message timestamp
+    already SAVED on disk in ``<persona_dir>/active_conversations/*.jsonl``
+    (wall clock) — narrows S23/S35's "a fresh bridge counts as idle" to "idle
+    once the lull has passed since the last SAVED message", not merely "the
+    process just started". No new persisted file: the timestamps already on
+    each turn are the only source of truth.
+
+    Call once, synchronously, at bridge start — BEFORE anything can call
+    ``is_chat_idle``/``time_since_last_message`` (same ordering rationale as
+    ``tunables_migration.migrate_idle_keys``): both functions read the SAME
+    ``_last_message_mono`` anchor this seeds, so seeding it once here keeps
+    them consistent with each other for free — there is no separate anchor
+    for the S72 prune accessor to fall out of step with.
+
+    - **No saved messages** (no ``active_conversations`` dir, no ``.jsonl``
+      files, or every buffer has zero turns): the anchor is left at its
+      module default (``-inf``) — a fresh install still counts as idle
+      immediately, matching S35's untouched semantics.
+    - **A malformed/unparseable saved ``ts``** (missing field, corrupt
+      value) — INCLUDING a syntactically corrupt/truncated trailing JSONL
+      line (e.g. a crash/OOM mid-append; deliberately NOT silently skipped
+      the way ``read_jsonl_skipping_corrupt`` skips a corrupt line elsewhere
+      — see ``_last_nonempty_raw_line``, because silently falling back to an
+      OLDER good line here would understate how recent the chat really was,
+      the wrong direction for a fail-closed idle gate): treated as an
+      is_chat_idle FAULT per S63's fail-closed rule — logged once at ERROR
+      and the anchor is seeded to "right now" (not idle), rather than
+      crashing bridge startup or silently guessing which timestamp to trust.
+    - **A saved ``ts`` in the future** (clock skew): clamped to elapsed=0
+      (seeded to "right now") rather than pinning the anchor ahead of the
+      real monotonic clock, which would otherwise hold the bridge non-idle
+      indefinitely (until real time caught up to the bad timestamp) instead
+      of for at most one lull.
+    """
+    wall_now = now_wall if now_wall is not None else datetime.now(UTC)
+    mono_now = now_mono if now_mono is not None else time.monotonic()
+
+    global _last_message_mono
+    try:
+        from brain.ingest.buffer import list_active_sessions
+
+        newest: datetime | None = None
+        for session_id in list_active_sessions(persona_dir):
+            path = persona_dir / "active_conversations" / f"{session_id}.jsonl"
+            raw_line = _last_nonempty_raw_line(path)
+            if raw_line is None:
+                continue
+            record = json.loads(raw_line)  # raises on a corrupt/truncated trailing line -> fail closed
+            parsed = _parse_saved_ts(record.get("ts"))
+            if newest is None or parsed > newest:
+                newest = parsed
+    except Exception as exc:  # noqa: BLE001 — malformed ts or any read fault: fail CLOSED (S63)
+        log.error(
+            "cli_throttle.seed_last_message_from_active_conversations failed; "
+            "seeding as NOT IDLE (fail-closed)",
+            exc_info=exc,
+        )
+        with _lock:
+            _last_message_mono = mono_now
+        return
+
+    if newest is None:
+        return  # no saved messages anywhere -> leave the -inf default (idle)
+
+    elapsed = max(0.0, (wall_now - newest).total_seconds())
+    with _lock:
+        _last_message_mono = mono_now - elapsed
 
 
 def time_since_last_message(*, now: float | None = None) -> float:

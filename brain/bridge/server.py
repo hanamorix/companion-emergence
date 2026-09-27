@@ -1060,6 +1060,20 @@ def build_app(
         except Exception as _exc:  # noqa: BLE001 — startup must not break on the migration
             logger.warning("tunables idle-key migration failed: %s", _exc)
 
+        # S82: seed is_chat_idle's anchor from the newest message timestamp
+        # already saved in THIS persona's active_conversations/ buffers —
+        # BEFORE the supervisor thread starts (same ordering rationale as the
+        # tunables migration above: no reader of the anchor may run first).
+        # No new persisted file; the function itself fails closed internally
+        # on a malformed saved timestamp (S63), so this try/except is
+        # belt-and-suspenders matching every other non-essential startup step.
+        try:
+            from brain.bridge.cli_throttle import seed_last_message_from_active_conversations
+
+            seed_last_message_from_active_conversations(persona_dir)
+        except Exception as _exc:  # noqa: BLE001 — startup must not break; already fails closed internally
+            logger.warning("is-chat-idle seed from active_conversations failed: %s", _exc)
+
         # Spawn supervisor thread (non-daemon — joins on shutdown)
         from brain.bridge.supervisor import run_folded
 
