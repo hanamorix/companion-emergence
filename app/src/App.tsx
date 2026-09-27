@@ -728,11 +728,12 @@ const JOB_DESCRIPTORS: Record<string, string> = {
  *  exists for IS blending toward the background. This line already reused
  *  --text-mute at the same size on the same background before this
  *  follow-up (the pre-existing statusLine div right above it), so this is
- *  extending an already-shipped pattern, not a new regression — but it has
- *  NOT been explicitly owner-accepted as an AA exception the way the
- *  placeholder trade-off was. Needs an explicit owner sign-off, not a
- *  unilateral swap to a more-legible-but-less-"closest" token, since the
- *  owner's instruction was specifically "closest to background." */
+ *  extending an already-shipped pattern, not a new regression.
+ *
+ *  OWNER ACCEPTED this trade-off, 2026-09-27: "I've no trouble reading the
+ *  status line as it is, and this isn't meant to be a highly visible
+ *  thing, more an indicator if you're looking for one and just a little
+ *  thing that's there if you're not. So --text-mute." */
 const BACKGROUND_JOBS_LINE_COLOR = "var(--text-mute)";
 
 /** "<name><space?>(<descriptor>)" for one running job, e.g.
