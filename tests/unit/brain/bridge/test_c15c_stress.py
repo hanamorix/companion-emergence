@@ -78,7 +78,11 @@ class _LockErrorCapture(logging.Handler):
             haystacks.append(self.format(record))
         text = " ".join(haystacks).lower()
         if "database is locked" in text or ("locked" in text and "database" in text):
-            self.hits.append(record.getMessage() or (record.exc_text or str(record.exc_info)))
+            # Round-3 red-team MINOR, fixed: record the actual matched text
+            # (including the exception's own "database is locked" message
+            # when that's what fired), not just the generic log label --
+            # a future failure message should be debuggable at a glance.
+            self.hits.append(text if len(haystacks) > 1 else record.getMessage())
 
 
 @pytest.mark.skipif(not _FIXTURE.exists(), reason=f"F-bob20k fixture not present at {_FIXTURE}")
