@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from brain.bridge import persisted_cadence
+from brain.bridge import persisted_cadence, supervisor
 from brain.bridge.events import EventBus
 from brain.bridge.provider import FakeProvider
 from brain.bridge.supervisor import (
@@ -269,11 +269,21 @@ def test_run_heartbeat_tick_publishes_result_event(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_supervisor_snapshot_sweep_keeps_session_alive(tmp_path: Path) -> None:
+def test_supervisor_snapshot_sweep_keeps_session_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """After a snapshot sweep, the session must remain in _SESSIONS and its
     buffer file on disk."""
     from brain.chat.session import create_session, get_session, reset_registry
     from brain.ingest.buffer import ingest_turn
+
+    # Lower the per-session staleness threshold (module default 10 min) so a
+    # 6-min-old turn counts as stale here, same as the old silence_minutes=5.0
+    # kwarg this test used before run_folded's externally-passed idle proxy
+    # was retired (ram-spike-fix INC-6, C4(a)). Chat is idle by default
+    # (conftest's autouse cli_throttle reset), so the new is_chat_idle() gate
+    # around this block is open throughout.
+    monkeypatch.setattr(supervisor, "_SESSION_STALE_MINUTES", 5.0)
 
     reset_registry()
     persona_dir = _persona_dir(tmp_path)
@@ -295,7 +305,6 @@ def test_supervisor_snapshot_sweep_keeps_session_alive(tmp_path: Path) -> None:
             "provider": FakeProvider(),
             "event_bus": bus,
             "tick_interval_s": 0.1,
-            "silence_minutes": 5.0,
             "heartbeat_interval_s": None,
             "soul_review_interval_s": None,
             "finalize_interval_s": None,
@@ -312,6 +321,60 @@ def test_supervisor_snapshot_sweep_keeps_session_alive(tmp_path: Path) -> None:
     types = [e.get("type") for e in bus.events]
     assert "session_snapshot" in types
     assert "session_closed" not in types
+    reset_registry()
+
+
+def test_supervisor_snapshot_sweep_defers_while_chat_active(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ram-spike-fix INC-6, C4(c) runtime coverage for the session-snapshot/
+    prune caller specifically (closes a stage-6 code red-team label-audit gap
+    — the prior test for this caller was static text-presence, not a runtime
+    "flip not-idle, assert it defers" test): a session old enough to be
+    snapshotted, but chat marked recently active, must NOT be swept."""
+    from brain.bridge import cli_throttle
+    from brain.chat.session import create_session, reset_registry
+    from brain.ingest.buffer import ingest_turn
+
+    monkeypatch.setattr(supervisor, "_SESSION_STALE_MINUTES", 5.0)
+    cli_throttle.mark_interactive_active()
+
+    reset_registry()
+    persona_dir = _persona_dir(tmp_path)
+    sess = create_session(persona_dir.name)
+    sid = sess.session_id
+    old_ts = (datetime.now(UTC) - timedelta(minutes=6)).isoformat()
+    ingest_turn(
+        persona_dir, {"session_id": sid, "speaker": "user", "text": "earlier", "ts": old_ts}
+    )
+
+    bus = _CapturingBus()
+    stop = threading.Event()
+    t = threading.Thread(
+        target=run_folded,
+        args=(stop,),
+        kwargs={
+            "persona_dir": persona_dir,
+            "provider": FakeProvider(),
+            "event_bus": bus,
+            "tick_interval_s": 0.1,
+            "heartbeat_interval_s": None,
+            "soul_review_interval_s": None,
+            "finalize_interval_s": None,
+        },
+    )
+    t.start()
+    # Give it several ticks to prove the deferral is not just timing luck.
+    _wait_until(
+        lambda: len([e for e in bus.events if e.get("type") == "supervisor_tick"]) >= 3
+    )
+    stop.set()
+    t.join(timeout=30.0)
+
+    types = [e.get("type") for e in bus.events]
+    assert "session_snapshot" not in types, (
+        "snapshot must defer while chat is not idle, even for a stale-enough session"
+    )
     reset_registry()
 
 
@@ -347,7 +410,6 @@ def test_supervisor_tick_embeds_backlogged_memory(tmp_path: Path) -> None:
             "provider": FakeProvider(),
             "event_bus": bus,
             "tick_interval_s": 0.1,
-            "silence_minutes": 5.0,
             "heartbeat_interval_s": None,
             "soul_review_interval_s": None,
             "finalize_interval_s": None,
@@ -403,7 +465,6 @@ def test_supervisor_embedding_backfill_defers_while_chat_active(tmp_path: Path) 
             "provider": FakeProvider(),
             "event_bus": bus,
             "tick_interval_s": 0.1,
-            "silence_minutes": 5.0,
             "heartbeat_interval_s": None,
             "soul_review_interval_s": None,
             "finalize_interval_s": None,
@@ -604,7 +665,6 @@ def test_supervisor_finalize_cadence_drops_old_sessions(tmp_path: Path) -> None:
             "provider": FakeProvider(),
             "event_bus": bus,
             "tick_interval_s": 0.1,
-            "silence_minutes": 5.0,
             "heartbeat_interval_s": None,
             "soul_review_interval_s": None,
             "finalize_after_hours": 24.0,

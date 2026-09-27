@@ -120,7 +120,7 @@ from brain.self_model import cadence as self_model_cadence
 from brain.self_model import reconcile as sm_reconcile
 from brain.self_model import state as self_model_state
 from brain.self_model.articulate import articulate as sm_articulate
-from brain.self_model.articulate import articulate_min_idle_seconds, log_self_model_deferred
+from brain.self_model.articulate import log_self_model_deferred
 from brain.self_model.derived import compute_baseline, compute_derived
 from brain.self_model.gap import compute_gap
 from brain.self_model.resolve import (
@@ -141,6 +141,18 @@ _HEARTBEAT_TICK_SYSTEM_PROMPT_SEGMENTS = prompt_strings.register_segments(
 # so a backlog clears in a couple of ticks rather than days.
 _SOUL_BACKLOG_DRAIN_CAP = 25
 
+# Per-session staleness threshold for the session-snapshot / empty-session-
+# prune tick below. ram-spike-fix INC-6 (C4(a)/S28/S29/S40) retires the
+# externally-passed `silence_minutes` idle proxy (previously threaded through
+# `run_folded`/`build_app`) — this block is now gated on the single shared
+# `cli_throttle.is_chat_idle()` lull like every other background/cadence
+# caller, and this constant (unchanged default: 10 minutes) is the plain,
+# non-tunable per-session age threshold used once that gate is open. The
+# fuller redesign (dropping this per-session age check entirely in favor of
+# `cli_throttle.time_since_last_message()`, S72/2-plan §3.3a) is a LATER
+# increment (INC-9, C39) — not built here.
+_SESSION_STALE_MINUTES: float = 10.0
+
 
 def run_folded(
     stop_event: threading.Event,
@@ -149,7 +161,6 @@ def run_folded(
     provider: LLMProvider,
     event_bus: EventBus,
     tick_interval_s: float = 60.0,
-    silence_minutes: float = 10.0,
     heartbeat_interval_s: float | None = 900.0,
     soul_review_interval_s: float | None = 6 * 3600.0,
     finalize_after_hours: float = 24.0,
@@ -491,20 +502,30 @@ def run_folded(
                 hebbian = HebbianMatrix(persona_dir / "hebbian.db", integrity_check=False)
                 stack.callback(hebbian.close)
 
-                reports = snapshot_stale_sessions(
-                    persona_dir,
-                    silence_minutes=silence_minutes,
-                    store=store,
-                    hebbian=hebbian,
-                    provider=build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING),
-                )
-                # Snapshot is NON-destructive — do NOT call remove_session
-                # here. Session lifecycle is owned by finalize_stale_sessions
-                # below and the explicit /sessions/close path.
-                pruned_empty_sessions = prune_empty_sessions(
-                    older_than_seconds=silence_minutes * 60.0,
-                    persona_name=persona_dir.name,
-                )
+                # Idle-gated (ram-spike-fix INC-6, C4(c)/S28/S29/S40): every
+                # former idle-check caller now asks the single shared
+                # cli_throttle.is_chat_idle() lull instead of an externally
+                # passed silence_minutes value. A denied pass just skips this
+                # tick's snapshot/prune (reports empty) — same "defer, don't
+                # fail" posture as every other background caller.
+                if cli_throttle.is_chat_idle():
+                    reports = snapshot_stale_sessions(
+                        persona_dir,
+                        silence_minutes=_SESSION_STALE_MINUTES,
+                        store=store,
+                        hebbian=hebbian,
+                        provider=build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING),
+                    )
+                    # Snapshot is NON-destructive — do NOT call remove_session
+                    # here. Session lifecycle is owned by finalize_stale_sessions
+                    # below and the explicit /sessions/close path.
+                    pruned_empty_sessions = prune_empty_sessions(
+                        older_than_seconds=_SESSION_STALE_MINUTES * 60.0,
+                        persona_name=persona_dir.name,
+                    )
+                else:
+                    reports = []
+                    pruned_empty_sessions = []
 
                 # Idle-chipped embedding backfill (Stage 2, semantic-retrieval
                 # build; F1 #259 increment 3 rewires backlog + rate) — reuses
@@ -1686,7 +1707,7 @@ def _run_self_model_tick(
         return
 
     # ── 0a: pre-flight throttle peek (a defer must cost NOTHING) ────────────
-    if not cli_throttle.slot_available(min_idle=articulate_min_idle_seconds()):
+    if not cli_throttle.slot_available():
         log_self_model_deferred(persona_dir)
         cadence_state = self_model_cadence.compute_next_state(
             cadence_state, outcome="deferred", now=now

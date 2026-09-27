@@ -34,21 +34,14 @@ _STATE_FILE = "emotion_backfill_state.json"
 # ---------------------------------------------------------------------------
 # Yield-to-chat helpers
 # ---------------------------------------------------------------------------
-
-_ACTIVE_CHAT_IDLE_MINUTES = 5.0  # if the user chatted within this window, yield
-
-
-def _user_recently_active(persona_dir: Path, *, now: _datetime | None = None) -> bool:
-    """True if the user has an active chat session (a turn in the last 5 min).
-
-    The backfill yields to active chat so it never saturates the Claude CLI
-    subscription out from under an interactive turn.
-    """
-    from brain.body.session_hours import compute_active_session_hours
-
-    _now = now or _datetime.now(UTC)
-    return compute_active_session_hours(persona_dir, now=_now) > 0.0
-
+#
+# ram-spike-fix INC-6 (S28/S29/S40/C4): the disk-based, wall-clock
+# _user_recently_active/_ACTIVE_CHAT_IDLE_MINUTES mechanism is retired — it
+# was ALSO dead code (it read compute_active_session_hours, never the
+# _ACTIVE_CHAT_IDLE_MINUTES constant it was named after; found during
+# 2-plan's re-verification, see 2-plan.md §V). The loop now asks the single
+# shared cli_throttle.is_chat_idle() gate, same as every other background
+# caller.
 
 # Inter-call pacing: pause between successful tag+write operations so the
 # backfill never bursts all its budget in one sitting and starves interactive
@@ -327,12 +320,12 @@ def run_emotion_backfill(
         from brain.bridge import cli_throttle as _cli_throttle  # noqa: PLC0415
 
         for memory in candidates:
-            # Yield gate (disk-based, restart-robust): stop if the user is
-            # actively chatting so the CLI is free.  The cursor is preserved —
-            # the next supervisor pass resumes from here.
-            if _user_recently_active(persona_dir, now=now_dt):
+            # Yield gate: stop if chat is not idle (a reply in flight, or the
+            # shared lull hasn't elapsed) so the CLI is free.  The cursor is
+            # preserved — the next supervisor pass resumes from here.
+            if not _cli_throttle.is_chat_idle():
                 logger.info(
-                    "emotion_backfill: yielding — user actively chatting; "
+                    "emotion_backfill: yielding — chat not idle; "
                     "will resume when idle"
                 )
                 break
@@ -342,8 +335,6 @@ def run_emotion_backfill(
             # the full per-memory unit of work and released before the pacing sleep.
             # Per-iteration acquire/release is safe because the 1.5s inter-call
             # delay means there is no tight-loop gap concern.
-            # Belt-and-suspenders: _user_recently_active (disk, restart-robust) and
-            # cli_throttle (monotonic clock, resets on restart) both guard the call.
             with _cli_throttle.background_slot() as _slot:
                 if not _slot:
                     logger.info(

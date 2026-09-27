@@ -428,32 +428,32 @@ def test_shared_store_coexists_with_finalize_on_same_tick(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_silence_minutes_defaults_are_ten_minutes():
-    """C14 test 1 (claim-bearing)."""
-    assert inspect.signature(supervisor.run_folded).parameters["silence_minutes"].default == 10.0
-    assert inspect.signature(server.build_app).parameters["silence_minutes"].default == 10.0
+def test_run_folded_and_build_app_no_longer_take_silence_minutes():
+    """ram-spike-fix INC-6 (C4(a)): run_folded/build_app no longer thread an
+    externally-passed silence_minutes idle proxy — every former idle-check
+    caller now asks the single shared cli_throttle.is_chat_idle() lull
+    instead. Supersedes the old test_silence_minutes_defaults_are_ten_minutes
+    (a prior increment's C14 claim), which asserted the opposite of this.
+
+    pipeline.snapshot_stale_sessions's OWN silence_minutes parameter is
+    untouched (a lower-level function's per-session age argument, not an
+    idle-check caller itself) — its default staying 10.0 is a separate,
+    unrelated fact this test also pins so a future edit doesn't silently
+    drift it.
+    """
+    assert "silence_minutes" not in inspect.signature(supervisor.run_folded).parameters
+    assert "silence_minutes" not in inspect.signature(server.build_app).parameters
     assert (
         inspect.signature(pipeline.snapshot_stale_sessions).parameters["silence_minutes"].default
         == 10.0
     )
 
 
-def test_build_app_default_reaches_run_folded():
-    """C14 test 3: build_app's own silence_minutes PARAMETER is what actually gets
-    threaded into run_folded's kwargs dict (not a separately-hardcoded value) —
-    proves the composed production path, not just three independently-agreeing
-    signatures.
-
-    Corrected (stage-6 round 1, BLOCKER-1): the original version walked the WHOLE
-    module for any ast.keyword named silence_minutes, which spuriously matched
-    _drain_sessions_blocking's unrelated keyword argument at server.py — a
-    different function this change explicitly does NOT touch — and could never
-    have matched the real target, the sp7-supervisor kwargs={...} DICT LITERAL
-    inside build_app, which is an ast.Dict, not an ast.keyword. That made the
-    test vacuous: it would pass even if the dict literal were hardcoded to 5.0.
-    This version scopes the walk to build_app's own FunctionDef body and looks
-    for the actual dict entry.
-    """
+def test_build_app_kwargs_to_run_folded_carry_no_silence_minutes_key():
+    """AST check: build_app's sp7-supervisor kwargs dict (threaded into
+    run_folded) must not carry a "silence_minutes" key at all — the
+    positive-control half of C4(a)'s grep/AST scan (a planted
+    ``"silence_minutes": 5.0`` entry in this same dict must be caught)."""
     import ast
 
     source = Path(server.__file__).read_text(encoding="utf-8")
@@ -465,26 +465,28 @@ def test_build_app_default_reaches_run_folded():
         if isinstance(node, ast.FunctionDef) and node.name == "build_app"
     )
 
-    found = False
-    for node in ast.walk(build_app_node):
-        if not isinstance(node, ast.Dict):
-            continue
-        for key, value in zip(node.keys, node.values, strict=False):
-            if (
-                isinstance(key, ast.Constant)
-                and key.value == "silence_minutes"
-                and isinstance(value, ast.Name)
-                and value.id == "silence_minutes"
-            ):
-                found = True
-                break
-        if found:
-            break
+    def _has_silence_minutes_key(node: ast.AST) -> bool:
+        for n in ast.walk(node):
+            if not isinstance(n, ast.Dict):
+                continue
+            for key in n.keys:
+                if isinstance(key, ast.Constant) and key.value == "silence_minutes":
+                    return True
+        return False
 
-    assert found, (
-        "build_app's own sp7-supervisor kwargs dict must forward its own "
-        "silence_minutes parameter, not a separately hardcoded value"
+    assert not _has_silence_minutes_key(build_app_node), (
+        "build_app must not forward a silence_minutes key into run_folded's "
+        "kwargs dict (C4(a)) — the idle proxy is retired"
     )
+
+    # Positive control: the same scanner logic DOES find a planted key.
+    planted = ast.parse(
+        "def f():\n    d = {'silence_minutes': 5.0, 'other': 1}\n"
+    )
+    planted_fn = next(
+        n for n in ast.walk(planted) if isinstance(n, ast.FunctionDef) and n.name == "f"
+    )
+    assert _has_silence_minutes_key(planted_fn), "scanner must find a planted positive control"
 
 
 # ---------------------------------------------------------------------------

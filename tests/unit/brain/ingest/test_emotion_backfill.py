@@ -5,7 +5,6 @@ TDD — one test at a time per tdd-guard.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 
@@ -477,52 +476,21 @@ def test_supervisor_passes_provider_to_emotion_backfill(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Step YIELD.1 — _user_recently_active helper
+# Step YIELD.2 — run_emotion_backfill yields when chat is not idle
 # ---------------------------------------------------------------------------
-
-def _seed_buffer_turn(persona_dir: Path, *, minutes_ago: float) -> None:
-    """Write a single turn into an active_conversations buffer timestamped N minutes ago."""
-    from brain.ingest.buffer import ingest_turn
-
-    ts = (datetime.now(UTC) - timedelta(minutes=minutes_ago)).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
-    )
-    (persona_dir / "active_conversations").mkdir(parents=True, exist_ok=True)
-    ingest_turn(persona_dir, {"speaker": "user", "text": "hello", "ts": ts})
-
-
-def test_user_recently_active_true_when_recent_turn(tmp_path):
-    """_user_recently_active returns True when the last buffer turn is < 5 min ago."""
-    from brain.ingest.emotion_backfill import _user_recently_active
-
-    _seed_buffer_turn(tmp_path, minutes_ago=1.0)
-    assert _user_recently_active(tmp_path) is True
-
-
-def test_user_recently_active_false_when_stale_turn(tmp_path):
-    """_user_recently_active returns False when the last buffer turn is > 5 min ago."""
-    from brain.ingest.emotion_backfill import _user_recently_active
-
-    _seed_buffer_turn(tmp_path, minutes_ago=10.0)
-    assert _user_recently_active(tmp_path) is False
-
-
-def test_user_recently_active_false_when_no_buffer(tmp_path):
-    """_user_recently_active returns False when there is no active_conversations buffer."""
-    from brain.ingest.emotion_backfill import _user_recently_active
-
-    # No active_conversations dir at all — tmp_path is bare
-    assert _user_recently_active(tmp_path) is False
-
-
-# ---------------------------------------------------------------------------
-# Step YIELD.2 — run_emotion_backfill yields when user is actively chatting
-# ---------------------------------------------------------------------------
+#
+# ram-spike-fix INC-6: the old disk-based _user_recently_active mechanism
+# (buffer-turn-age, 5-min window) is retired — dead code (it actually read
+# compute_active_session_hours, never _ACTIVE_CHAT_IDLE_MINUTES) replaced by
+# the single shared cli_throttle.is_chat_idle() gate. These tests now drive
+# that gate directly via cli_throttle.mark_interactive_active() (the same
+# helper test_run_defers_when_throttle_slot_unavailable below already uses).
 
 def test_run_yields_when_user_active_and_does_not_call_tagger(tmp_path):
-    """When user is actively chatting, run_emotion_backfill must not call tagger
+    """When chat is not idle, run_emotion_backfill must not call tagger
     and must leave status as resumable (not 'complete').
     """
+    from brain.bridge import cli_throttle
     from brain.ingest.emotion_backfill import run_emotion_backfill
     from brain.memory.store import MemoryStore
 
@@ -531,8 +499,8 @@ def test_run_yields_when_user_active_and_does_not_call_tagger(tmp_path):
     m = _create_memory(store, has_emotions=False)
     store.close()
 
-    # Seed an active buffer turn (< 5 min ago) → _user_recently_active returns True
-    _seed_buffer_turn(tmp_path, minutes_ago=1.0)
+    # Mark chat as recently active → is_chat_idle() is False.
+    cli_throttle.mark_interactive_active()
 
     tagger_calls = {"n": 0}
 
@@ -560,12 +528,14 @@ def test_run_yields_when_user_active_and_does_not_call_tagger(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_run_defers_when_throttle_slot_unavailable(tmp_path):
-    """When the cli_throttle concurrency cap is exhausted (slot unavailable),
-    run_emotion_backfill must NOT call the tagger and must leave state resumable.
+    """When the cli_throttle concurrency cap is exhausted (slot unavailable)
+    while chat itself IS idle, run_emotion_backfill must NOT call the tagger
+    and must leave state resumable.
 
-    This test is independent of the disk-based _user_recently_active yield: the
-    buffer dir is absent so that check passes — only the throttle slot is blocked.
-    Belt-and-suspenders: both checks must independently gate the Haiku call.
+    Distinct from test_run_yields_when_user_active_and_does_not_call_tagger
+    above: here is_chat_idle() is True (nothing marks chat active) — only the
+    concurrency cap (max_concurrent_background=1) is exhausted, by holding the
+    one background slot open for the duration of the call.
     """
     from unittest.mock import MagicMock
 
@@ -573,19 +543,23 @@ def test_run_defers_when_throttle_slot_unavailable(tmp_path):
     from brain.ingest.emotion_backfill import run_emotion_backfill
     from brain.memory.store import MemoryStore
 
-    # Seed one emotion-less memory (no buffer dir → _user_recently_active False)
+    # Seed one emotion-less memory
     store = _make_store(tmp_path)
     m = _create_memory(store, has_emotions=False)
     store.close()
 
-    # Mark interactive active so the slot is denied (same mechanism used by
-    # other background-engine tests in test_background_yields.py).
-    cli_throttle.mark_interactive_active()
+    # Hold the single background slot open (chat idle throughout) so the
+    # backfill's own acquire_background() call is denied by the concurrency
+    # cap, not by the idle check.
+    assert cli_throttle.acquire_background()
 
     # Spy on the tagger — must never be called
     spy_tagger = MagicMock(return_value={"loneliness": 7.0})
 
-    state = run_emotion_backfill(tmp_path, tagger_fn=spy_tagger, cap=50, delay_s=0)
+    try:
+        state = run_emotion_backfill(tmp_path, tagger_fn=spy_tagger, cap=50, delay_s=0)
+    finally:
+        cli_throttle.release_background()
 
     # Tagger must NOT have been called — slot was unavailable
     assert spy_tagger.call_count == 0, (

@@ -117,6 +117,47 @@ def respond(
     shared_files: list[dict] | None = None,
     reply_to_audit_id: str | None = None,
 ) -> ChatResult:
+    """One chat turn end-to-end. Thin wrapper around ``_respond_inner`` that
+    provides exception-safe cli_throttle bookkeeping (C24/S35/S42):
+    ``note_user_message()`` before the turn, ``note_reply_end()`` in a
+    ``finally`` so a raised exception never leaves the in-flight counter
+    stuck — the end-of-turn re-stamp rationale of 3376b2c1 (a long call
+    can't let the idle window expire mid-flight), now exception-safe. See
+    ``_respond_inner`` for the full turn flow doc.
+    """
+    from brain.bridge import (
+        cli_throttle,  # local to avoid circular-import risk; testable via module patch
+    )
+
+    cli_throttle.note_user_message()
+    try:
+        return _respond_inner(
+            persona_dir,
+            user_input,
+            store=store,
+            hebbian=hebbian,
+            provider=provider,
+            session=session,
+            voice_md_override=voice_md_override,
+            shared_files=shared_files,
+            reply_to_audit_id=reply_to_audit_id,
+        )
+    finally:
+        cli_throttle.note_reply_end()
+
+
+def _respond_inner(
+    persona_dir: Path,
+    user_input: str,
+    *,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    provider: LLMProvider,
+    session: SessionState | None = None,
+    voice_md_override: str | None = None,
+    shared_files: list[dict] | None = None,
+    reply_to_audit_id: str | None = None,
+) -> ChatResult:
     """One chat turn end-to-end.
 
     Flow
@@ -168,11 +209,6 @@ def respond(
     and wall-clock duration.
     """
     t0 = time.monotonic()
-    from brain.bridge import (
-        cli_throttle,  # local to avoid circular-import risk; testable via module patch
-    )
-
-    cli_throttle.mark_interactive_active()
 
     # 1. Session
     if session is None:
@@ -341,10 +377,9 @@ def respond(
 
     duration_ms = int((time.monotonic() - t0) * 1000)
 
-    # Re-stamp at turn-END so the idle window is measured from completion,
-    # not from when the turn started. A long LLM call can exhaust the idle
-    # window mid-flight and let a background job fire concurrently otherwise.
-    cli_throttle.mark_interactive_active()
+    # Re-stamp at turn-END: handled by the ``respond`` wrapper's
+    # ``note_reply_end()`` finally, so the idle window is measured from
+    # completion (not from when the turn started) even on an exception here.
 
     # #78: flag a reply that claims a staged write no tool call backs. Pure
     # telemetry — it gates nothing and never raises. A candidate surfacer, not

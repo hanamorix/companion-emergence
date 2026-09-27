@@ -882,7 +882,6 @@ def build_app(
     persona_dir: Path,
     client_origin: str = "cli",
     tick_interval_s: float = 60.0,
-    silence_minutes: float = 10.0,
     idle_shutdown_seconds: float | None = None,
     auth_token: str | None = None,
     shutdown_controller: BridgeShutdownController | None = None,
@@ -1042,6 +1041,25 @@ def build_app(
             mig_thread.start()
             app.state.bridge.migration_thread = mig_thread
 
+        # One-time tunables migration (ram-spike-fix INC-6, S25/S30/S37/S52/S71):
+        # retires the pre-lull idle-tuning keys into the single
+        # chat.idle_lull_seconds key. Synchronous, BEFORE the supervisor thread
+        # starts (C12: ordering asserted here) so no code — including the
+        # supervisor's first loop pass — can ever read a stale key. Fail-safe
+        # internally (never raises); the try/except here is belt-and-suspenders
+        # matching every other non-essential startup step in this function.
+        try:
+            from brain import paths
+            from brain.tunables_migration import migrate_idle_keys
+
+            # tunables.json lives at KINDLED_HOME (paths.get_home()), NOT under
+            # this persona's own directory (get_home()/"personas"/<name>) —
+            # passing persona_dir here would silently migrate a file that
+            # doesn't exist (stage-6 code red-team BLOCKER, caught before ship).
+            migrate_idle_keys(paths.get_home())
+        except Exception as _exc:  # noqa: BLE001 — startup must not break on the migration
+            logger.warning("tunables idle-key migration failed: %s", _exc)
+
         # Spawn supervisor thread (non-daemon — joins on shutdown)
         from brain.bridge.supervisor import run_folded
 
@@ -1077,7 +1095,6 @@ def build_app(
                     "provider": provider,
                     "event_bus": bus,
                     "tick_interval_s": tick_interval_s,
-                    "silence_minutes": silence_minutes,
                     "is_session_busy": _is_session_busy,
                 },
                 name="sp7-supervisor",

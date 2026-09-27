@@ -12,13 +12,16 @@ Routing: build_self_model_provider forces SELF_MODEL_MODEL (haiku) regardless of
 
 Throttle-denial fix (self-model-note-null-fix): the note went silently null on
 every tick since PR #151 because cli_throttle.background_slot()'s 300s idle bar
-was essentially never met on a chatty persona. articulate() now requests a
-short (30s, tunable) idle window and raises cli_throttle.ThrottleDeferred on
-denial instead of silently returning None — see C1/C2/C3/C5 below. The
-zero-side-effects invariant (C9: a denied attempt must cost nothing) lives in
-brain/bridge/supervisor.py's pre-flight peek, tested in
-test_supervisor_self_model.py, not here — this file only covers articulate()'s
-own contract (the authoritative real-acquire fallback).
+was essentially never met on a chatty persona. articulate() raises
+cli_throttle.ThrottleDeferred on denial instead of silently returning None —
+see C1/C2/C3/C5 below. ram-spike-fix INC-6 (C4) later retired the short
+(30s, tunable) per-caller idle window this module originally requested —
+articulate() now shares the single registered chat.idle_lull_seconds lull
+(default 600s) with every other background/cadence caller, same as every
+other former min_idle override. The zero-side-effects invariant (C9: a denied
+attempt must cost nothing) lives in brain/bridge/supervisor.py's pre-flight
+peek, tested in test_supervisor_self_model.py, not here — this file only
+covers articulate()'s own contract (the authoritative real-acquire fallback).
 """
 from __future__ import annotations
 
@@ -36,7 +39,6 @@ from brain.self_model.articulate import (
     _GAP_THRESHOLD,
     SELF_MODEL_MODEL,
     articulate,
-    articulate_min_idle_seconds,
     build_self_model_provider,
 )
 from brain.self_model.gap import Gap
@@ -229,7 +231,7 @@ def _read_error_rows(persona_dir: Path) -> list[dict]:
 
 def test_throttle_denied_raises_threedeferred_and_logs(tmp_path):
     """C1: when the throttle denies the slot (chat too recently active for the
-    short min_idle window), articulate() raises cli_throttle.ThrottleDeferred
+    shared lull), articulate() raises cli_throttle.ThrottleDeferred
     — NOT a silent None, the pre-fix behavior that made this bug invisible —
     and logs a self_model_articulate_deferred record. Oracle (H6): pre-fix
     code (background_slot() + `return None`) would return None here and write
@@ -340,7 +342,13 @@ def test_grant_calls_release_background_exactly_once(tmp_path, monkeypatch):
     assert len(released) == 1
 
 
-def test_articulate_min_idle_seconds_is_public_and_matches_tunable_default(tmp_path):
-    """The min_idle getter is public (brain/bridge/supervisor.py's pre-flight
-    peek calls it too) and returns the documented 30.0s default."""
-    assert articulate_min_idle_seconds() == 30.0
+def test_articulate_shares_the_one_lull_not_its_own_min_idle(tmp_path):
+    """ram-spike-fix INC-6 (C4): articulate() no longer has its own shorter
+    min_idle window — it shares the single registered chat.idle_lull_seconds
+    lull with every other background/cadence caller. Superseded test:
+    test_articulate_min_idle_seconds_is_public_and_matches_tunable_default
+    (asserted the now-removed 30.0s override existed)."""
+    assert not hasattr(
+        __import__("brain.self_model.articulate", fromlist=["articulate_min_idle_seconds"]),
+        "articulate_min_idle_seconds",
+    )

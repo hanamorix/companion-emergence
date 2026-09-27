@@ -14,7 +14,11 @@ The "defaults" section is documentation, rewritten at bridge boot
 frozen-defaults trap where a seeded value shadows a later code change.
 
 Ops tier ONLY. Physiology (forgetting, emotion, salience, cadences) is
-fenced by the user-surface principle and must not gain keys here.
+fenced by the user-surface principle and must not gain keys here — with
+ONE named exception: ``chat.idle_lull_seconds`` (below, ``CHAT_IDLE_LULL_SECONDS``),
+the single ops-timing key that gates every background/cadence caller via
+``is_chat_idle`` (brain/bridge/cli_throttle.py). No other ops-timing key
+may be registered here (S51/I7/C27).
 Fail-open throughout: this module never raises into a turn.
 """
 
@@ -50,6 +54,13 @@ def register(key: str, default: Any) -> Any:
     with _lock:
         _registry[key] = default
     return default
+
+
+# The ONE ops-timing key this module's docstring fence allows (S47/S51/S68/C27):
+# the chat-idle lull duration. Read in exactly one place —
+# brain/bridge/cli_throttle.py's private `_lull_seconds()`, called only from
+# `is_chat_idle` (C4(b)) — never re-exported or read elsewhere.
+CHAT_IDLE_LULL_SECONDS: float = register("chat.idle_lull_seconds", 600.0)
 
 
 def get_tunable(key: str, default: Any) -> Any:

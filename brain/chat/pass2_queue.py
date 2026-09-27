@@ -38,22 +38,22 @@ import time
 from collections import deque
 from collections.abc import Callable
 
-from brain import tunables
 from brain.bridge import cli_throttle
 
 log = logging.getLogger(__name__)
 
 _MAX_QUEUE: int = 200
 _POLL_SECONDS: float = 0.5
-# Pass-2 is turn-coupled (feeds the next turn's attunement/interior), so it uses a
-# SHORTER chat-idle window than the cadence engines' cli_throttle default (300s):
-# it waits out the in-flight turn (a reply takes ~15-20s) then drains ~30s after
-# the last turn, keeping attunement/traces fresh without contending mid-turn.
-_PASS2_IDLE_SECONDS: float = tunables.register("chat.pass2_min_idle_seconds", 30.0)
-
-
-def _pass2_idle_seconds() -> float:
-    return tunables.get_tunable("chat.pass2_min_idle_seconds", _PASS2_IDLE_SECONDS)
+# Pass-2 previously used a SHORTER chat-idle window (chat.pass2_min_idle_seconds,
+# 30s) than the cadence engines' cli_throttle default — draining soon after a
+# turn rather than waiting the full lull. ram-spike-fix INC-6 (S28/S29/S40/C4)
+# retires every caller-specific idle override in favor of the single registered
+# chat.idle_lull_seconds lull that cli_throttle.is_chat_idle() alone reads;
+# pass 2 now waits the same lull as every other background/cadence caller
+# (owner-accepted latency change, 2-plan §CH: "Pass-2 extraction latency 30s ->
+# 10-min lull (S53) -> C23 (behaviour), not a bound"). The persisted-queue +
+# no-lull `--no-bridge` exit-drain redesign is a LATER increment (INC-8/9),
+# not built here.
 
 _lock = threading.Lock()
 _queue: deque[tuple[Callable[[], None], str]] = deque()  # (fn, label)
@@ -90,7 +90,7 @@ def _drain_one() -> bool:
     with _lock:
         if not _queue:
             return False
-    if not cli_throttle.acquire_background(min_idle=_pass2_idle_seconds()):
+    if not cli_throttle.acquire_background():
         return False  # yield to chat / cap — leave the item queued for later
     try:
         with _lock:

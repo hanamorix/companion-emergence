@@ -79,7 +79,20 @@ def _persona_dir(tmp_path: Path) -> Path:
     return p
 
 
-def test_sticky_session_survives_snapshot_sweep(tmp_path: Path) -> None:
+def test_sticky_session_survives_snapshot_sweep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from brain.bridge import supervisor as supervisor_mod
+
+    # Lower the per-session staleness threshold (module default 10 min) so
+    # the 6-min-old seeded turns below count as stale — same intent as the
+    # old silence_minutes=5.0 kwarg this test used before run_folded's
+    # externally-passed idle proxy was retired (ram-spike-fix INC-6, C4(a)).
+    # Chat is idle by default (no cli_throttle activity in this test), so
+    # the new is_chat_idle() gate around the snapshot block is open
+    # throughout.
+    monkeypatch.setattr(supervisor_mod, "_SESSION_STALE_MINUTES", 5.0)
+
     persona_dir = _persona_dir(tmp_path)
     provider = _RecordingProvider()
     store = MemoryStore(db_path=":memory:")
@@ -121,7 +134,6 @@ def test_sticky_session_survives_snapshot_sweep(tmp_path: Path) -> None:
             "provider": provider,
             "event_bus": bus,
             "tick_interval_s": 0.1,
-            "silence_minutes": 5.0,
             "heartbeat_interval_s": None,
             "soul_review_interval_s": None,
             "finalize_interval_s": None,

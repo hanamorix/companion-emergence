@@ -123,7 +123,7 @@ class BridgeServer:
         from brain.bridge.server import build_app
 
         app = build_app(
-            self.persona_dir, tick_interval_s=1e9, silence_minutes=1e9,
+            self.persona_dir, tick_interval_s=1e9,
             auth_token=None, allowed_origins=("null",),
         )
         config = uvicorn.Config(app, host=self.host, port=self.port, log_level="warning")
