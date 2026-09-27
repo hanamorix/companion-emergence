@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -75,4 +76,24 @@ def test_lock_refuses_a_second_live_holder(tmp_path):
 def test_lock_takes_over_from_a_dead_holder(tmp_path):
     (tmp_path / ".lock").write_text("999999999", encoding="utf-8")  # no such pid
     with overlay.overlay_lock(tmp_path):
-        assert (tmp_path / ".lock").read_text(encoding="utf-8") == str(__import__("os").getpid())
+        assert (tmp_path / ".lock").read_text(encoding="utf-8") == str(os.getpid())
+
+
+def test_lock_is_never_published_empty(tmp_path, monkeypatch):
+    sizes = []
+    real_link = os.link
+
+    def spy(src, dst, *a, **kw):
+        sizes.append(os.path.getsize(src))
+        return real_link(src, dst, *a, **kw)
+
+    monkeypatch.setattr(overlay.os, "link", spy)
+    with overlay.overlay_lock(tmp_path):
+        assert (tmp_path / ".lock").read_text(encoding="utf-8") == str(os.getpid())
+    assert sizes and all(s > 0 for s in sizes)
+
+
+def test_release_leaves_a_lock_another_process_now_owns(tmp_path):
+    with overlay.overlay_lock(tmp_path):
+        (tmp_path / ".lock").write_text("424242", encoding="utf-8")  # someone else took it over
+    assert (tmp_path / ".lock").read_text(encoding="utf-8") == "424242"

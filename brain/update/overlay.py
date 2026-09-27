@@ -74,25 +74,38 @@ def prune(root: Path) -> None:
 
 @contextlib.contextmanager
 def overlay_lock(root: Path) -> Iterator[None]:
+    """Hold `<root>/.lock` for the duration. The lock file is published atomically
+    (pid written to a private temp file, then os.link into place), so it is never
+    observable empty; release removes it only if it still names this process."""
     root.mkdir(parents=True, exist_ok=True)
     path = root / LOCK_FILE
-    for _ in range(2):
-        try:
-            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            break
-        except FileExistsError:
-            try:
-                holder = int(path.read_text(encoding="utf-8").strip() or "0")
-            except (OSError, ValueError):
-                holder = 0
-            if holder and pid_is_alive(holder):
-                raise OverlayBusy(f"an update is already running (pid {holder})") from None
-            path.unlink(missing_ok=True)  # stale: its process is gone
-    else:
-        raise OverlayBusy("could not take the overlay lock")
+    me = str(os.getpid())
+    tmp = root / f".lock.{me}.tmp"
+    tmp.write_text(me, encoding="utf-8")
     try:
-        os.write(fd, str(os.getpid()).encode())
-        os.close(fd)
+        for _ in range(2):
+            try:
+                os.link(tmp, path)  # atomic; FileExistsError while someone holds it
+                break
+            except FileExistsError:
+                try:
+                    holder = int(path.read_text(encoding="utf-8").strip())
+                except (OSError, ValueError):
+                    holder = 0
+                if holder and pid_is_alive(holder):
+                    raise OverlayBusy(f"an update is already running (pid {holder})") from None
+                # ponytail: best-effort stale takeover, like bridge.daemon.acquire_lock —
+                # two takers racing on the same dead lock at the same instant can still collide.
+                path.unlink(missing_ok=True)
+        else:
+            raise OverlayBusy("could not take the overlay lock")
+    finally:
+        tmp.unlink(missing_ok=True)
+    try:
         yield
     finally:
-        path.unlink(missing_ok=True)
+        try:
+            if path.read_text(encoding="utf-8").strip() == me:
+                path.unlink()
+        except OSError:
+            pass
