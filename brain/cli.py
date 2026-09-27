@@ -1768,6 +1768,46 @@ def _install_kind() -> str:
     return "source" if (pkg.parent / "pyproject.toml").exists() else "bundled"
 
 
+def _update_handler(args: argparse.Namespace) -> int:
+    from brain.update import install, overlay
+
+    root = overlay.overlay_root()
+    kind = _install_kind()
+    site = install.bundle_site_dir()
+    if args.status:
+        state = overlay.read_state(root)
+        print(json.dumps({"supported": kind == "bundled" and (site / "_ce_bundle_id").is_file(),
+                          "install_kind": kind, **state}, indent=2))
+        return 0
+    try:
+        if args.revert or args.rollback:
+            with overlay.overlay_lock(root):
+                (overlay.revert if args.revert else overlay.rollback)(root)
+            print(json.dumps(overlay.read_state(root), indent=2))
+            return 0
+        if kind == "source" and args.wheel is None:
+            import brain
+
+            script = Path(brain.__file__).resolve().parent.parent / "scripts" / "update.sh"
+            if os.name == "nt" or not script.is_file():
+                print(f"nell update: no bash updater for this install ({script})", file=sys.stderr)
+                return 2
+            rest = [a for a in args.script_args if a != "--"]
+            os.execv("/bin/bash", ["bash", str(script), *rest])
+            return 0
+        if not (args.wheel and args.requirements and args.commit):
+            print("nell update: pass --wheel, --requirements and --commit "
+                  "(the app or scripts/update.sh supplies them)", file=sys.stderr)
+            return 2
+        entry = install.apply_update(wheel=args.wheel, requirements=args.requirements,
+                                     commit=args.commit, site_dir=site, root=root)
+    except (install.UpdateError, overlay.OverlayBusy) as exc:
+        print(f"nell update: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(entry, indent=2))
+    return 0
+
+
 def _paths_for_persona(persona: str) -> dict[str, Path]:
     """Build the key → path map for the given persona."""
     from brain.paths import get_cache_dir, get_log_dir
@@ -3181,6 +3221,23 @@ def _build_parser() -> argparse.ArgumentParser:
         help="(developer override) LLM provider — claude-cli, fake, ollama.",
     )
     sl_review.set_defaults(func=_soul_review_handler)
+
+    # nell update — brain updates into the overlay (#286 slice 2, closes #256)
+    update_sub = subparsers.add_parser(
+        "update",
+        help="Update the brain: bundled installs from a built wheel into the overlay; "
+        "source installs via scripts/update.sh.",
+    )
+    update_sub.add_argument("--wheel", type=Path, help="Built companion_emergence wheel (bundled).")
+    update_sub.add_argument("--requirements", type=Path, help="Locked requirements export (bundled).")
+    update_sub.add_argument("--commit", help="Commit the wheel was built from (names the overlay folder).")
+    update_mode = update_sub.add_mutually_exclusive_group()
+    update_mode.add_argument("--status", action="store_true", help="Print the overlay state as JSON.")
+    update_mode.add_argument("--revert", action="store_true", help="Use the release brain again.")
+    update_mode.add_argument("--rollback", action="store_true", help="Go back to the previous overlay.")
+    update_sub.add_argument("script_args", nargs=argparse.REMAINDER,
+                            help="Source installs: arguments passed to scripts/update.sh (after --).")
+    update_sub.set_defaults(func=_update_handler)
 
     # nell paths — filesystem introspection (alpha.4)
     paths_sub = subparsers.add_parser(
