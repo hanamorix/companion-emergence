@@ -24,6 +24,7 @@ from brain.memory.relevance_judge import (
     AMBIGUOUS_BAND_HALF_WIDTH,
     FakeRelevanceJudgeProvider,
     RelevanceJudgeProvider,
+    _hf_cached,
     _make_haiku_tiebreak,
     _reset_judge_provider_cache,
     build_judge_provider,
@@ -288,9 +289,12 @@ class _FakeSentenceTransformersCrossEncoder:
 
     RAW_LOGIT = 2.7
 
-    def __init__(self, model_id: str, cache_folder: str | None = None) -> None:
+    def __init__(
+        self, model_id: str, cache_folder: str | None = None, device: str | None = None, **kwargs: object
+    ) -> None:
         self.model_id = model_id
         self.cache_folder = cache_folder
+        self.device_kwarg = device
         self.predict_calls: list[object] = []
 
     def predict(self, pairs, activation_fn=None):
@@ -329,6 +333,246 @@ def test_torch_cross_encoder_judge_score_forces_identity_activation_fn(
         "Sigmoid for a num_labels=1 model, double-sigmoiding against label_for_score's own sigmoid"
     )
     assert received_activation_fn(2.7) == 2.7, "activation_fn must be an identity pass-through"
+
+
+def test_torch_cross_encoder_judge_constructs_with_device_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S81 owner ruling (RAM-spike-fix ledger, "CPU everywhere
+    (Recommended)"): `TorchCrossEncoderJudge.__init__`'s CrossEncoder
+    construction passes `device="cpu"` explicitly, never leaving device
+    selection to sentence-transformers' own MPS-preferring default. Bites
+    against the pre-S81 code, which passed no `device=` kwarg at all (this
+    fake would then record `device_kwarg=None`). Kept OFFLINE (this file's
+    own convention): the fake stands in for the real CrossEncoder rather
+    than simulating `torch.backends.mps.is_available()` for real, since the
+    call site's `device="cpu"` is an unconditional literal, not itself
+    branching on MPS availability."""
+    import sentence_transformers
+
+    monkeypatch.setattr(sentence_transformers, "CrossEncoder", _FakeSentenceTransformersCrossEncoder)
+
+    judge = rj_mod.TorchCrossEncoderJudge(model_id="fake-judge-model", cache_dir="/tmp/fake-cache-dir")
+
+    fake_model = judge._model  # noqa: SLF001 — test-only reach into the fake we just installed
+    assert fake_model.device_kwarg == "cpu", (
+        f"expected TorchCrossEncoderJudge to construct CrossEncoder with device='cpu', "
+        f"got {fake_model.device_kwarg!r}"
+    )
+
+
+class _FlakyThenSucceedsCrossEncoder(_FakeSentenceTransformersCrossEncoder):
+    """Raises on an OFFLINE construction attempt (`local_files_only` kwarg
+    present), succeeds otherwise — stands in for a cache `_hf_cached`
+    reported complete but whose offline load still fails for some other
+    reason (round-3 S19: the same-size-wrong-bytes corruption gap
+    `_snapshot_complete`'s size check cannot catch)."""
+
+    call_count = 0
+
+    def __init__(self, model_id: str, cache_folder: str | None = None, device: str | None = None, **kwargs: object) -> None:
+        type(self).call_count += 1
+        if kwargs.get("local_files_only"):
+            raise OSError("simulated corrupted offline load")
+        super().__init__(model_id, cache_folder=cache_folder, device=device, **kwargs)
+
+
+def test_torch_cross_encoder_judge_retries_online_once_when_offline_load_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-3 CI follow-up (S19): if the offline construction raises
+    despite `offline_load_kwargs` having decided the model IS cached
+    (non-empty kwargs — an offline attempt was genuinely made), retry
+    ONCE without those kwargs so huggingface_hub's real, hash-verifying
+    downloader gets a chance to detect and refetch whatever is actually
+    bad. Bites against a version of `__init__` with no try/except at all
+    (would raise immediately with call_count==1 and no judge constructed)."""
+    import sentence_transformers
+
+    monkeypatch.setattr(rj_mod, "offline_load_kwargs", lambda *a, **kw: {"local_files_only": True})
+    monkeypatch.setattr(sentence_transformers, "CrossEncoder", _FlakyThenSucceedsCrossEncoder)
+    _FlakyThenSucceedsCrossEncoder.call_count = 0
+
+    judge = rj_mod.TorchCrossEncoderJudge(model_id="fake-judge-model", cache_dir="/tmp/fake-cache-dir")
+
+    assert _FlakyThenSucceedsCrossEncoder.call_count == 2, (
+        "expected exactly one failed offline attempt + one successful online retry, "
+        f"got {_FlakyThenSucceedsCrossEncoder.call_count} construction attempts"
+    )
+    fake_model = judge._model  # noqa: SLF001
+    assert fake_model.device_kwarg == "cpu", "the online retry must still pass device='cpu' (S81)"
+
+
+def test_torch_cross_encoder_judge_does_not_retry_when_already_online(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The retry-once guard (`if not load_kwargs: raise`) must not fire a
+    second, identical online attempt when the FIRST attempt was already
+    online (`offline_load_kwargs` returned `{}` — `_hf_cached` decided the
+    model is NOT cached at all). Bites against a version of the retry logic
+    that unconditionally retries on any exception, which would silently
+    double every genuine "model not cached, network unreachable" failure
+    instead of propagating it once."""
+    import sentence_transformers
+
+    monkeypatch.setattr(rj_mod, "offline_load_kwargs", lambda *a, **kw: {})
+
+    call_count = 0
+
+    class _AlwaysRaises:
+        def __init__(self, *a: object, **kw: object) -> None:
+            nonlocal call_count
+            call_count += 1
+            raise OSError("network unreachable")
+
+    monkeypatch.setattr(sentence_transformers, "CrossEncoder", _AlwaysRaises)
+
+    with pytest.raises(OSError, match="network unreachable"):
+        rj_mod.TorchCrossEncoderJudge(model_id="fake-judge-model", cache_dir="/tmp/fake-cache-dir")
+
+    assert call_count == 1, f"expected exactly one construction attempt (no retry), got {call_count}"
+
+
+# ---------------------------------------------------------------------------
+# _hf_cached — round-3 CI follow-up (S19): an interrupted/corrupted download
+# must never be reported as "cached". Builds a real, tiny, on-disk HF cache
+# directory in the exact shape huggingface_hub 1.30.0 uses (blobs/ +
+# snapshots/<rev>/ symlinks + refs/main + trees/<rev>.json, the same
+# locally-cached git-tree manifest `_snapshot_complete` reads) -- entirely
+# offline, no huggingface_hub API calls used to BUILD the fixture, only to
+# read it back via the real `_hf_cached`.
+# ---------------------------------------------------------------------------
+
+_FAKE_REPO_ID = "fake-org/fake-tiny-judge"
+_FAKE_REVISION = "0" * 40  # a real cache uses a 40-char commit sha; shape matters, value doesn't
+
+
+def _build_fake_hf_cache(base: Path, files: dict[str, bytes]) -> Path:
+    """Builds `<base>/models--fake-org--fake-tiny-judge/` with `files`
+    (name -> content) each written as a real blob + a real symlink into it
+    from the snapshot dir, plus the `trees/<rev>.json` manifest recording
+    each file's true size -- mirrors a real, complete huggingface_hub cache
+    entry for `_FAKE_REPO_ID`@`_FAKE_REVISION`. Returns `base` (the
+    `cache_dir` to pass to `_hf_cached`)."""
+    import hashlib
+    import json as _json
+
+    repo_dir = base / f"models--{_FAKE_REPO_ID.replace('/', '--')}"
+    (repo_dir / "blobs").mkdir(parents=True)
+    (repo_dir / "snapshots" / _FAKE_REVISION).mkdir(parents=True)
+    (repo_dir / "trees").mkdir(parents=True)
+    (repo_dir / "refs").mkdir(parents=True)
+    (repo_dir / "refs" / "main").write_text(_FAKE_REVISION)
+
+    manifest: dict[str, object] = {"format_version": 1, "files": {}}
+    for name, content in files.items():
+        blob_hash = hashlib.sha1(content).hexdigest()
+        (repo_dir / "blobs" / blob_hash).write_bytes(content)
+        (repo_dir / "snapshots" / _FAKE_REVISION / name).symlink_to(f"../../blobs/{blob_hash}")
+        manifest["files"][name] = {"size": len(content), "blob_id": blob_hash}  # type: ignore[index]
+
+    (repo_dir / "trees" / f"{_FAKE_REVISION}.json").write_text(_json.dumps(manifest))
+    return base
+
+
+_FAKE_FILES = {"config.json": b'{"a": 1}', "model.safetensors": b"W" * 1000}
+
+
+def test_hf_cached_true_for_a_genuinely_complete_cache(tmp_path: Path) -> None:
+    """Sanity baseline: a real, complete fixture (every file present at its
+    correct recorded size) must report cached — proves the completeness
+    check doesn't just always say False."""
+    cache_dir = _build_fake_hf_cache(tmp_path, _FAKE_FILES)
+    assert _hf_cached(_FAKE_REPO_ID, cache_dir) is True
+
+
+def test_hf_cached_false_for_a_missing_weights_file(tmp_path: Path) -> None:
+    """A fixture missing the weights file entirely (the symlink's target
+    blob absent — what an interrupted download that never got past its
+    first, smaller files leaves behind) must be reported NOT cached.
+
+    CORRECTION (round-3 cold code red-team, agentId a1aba2a010dee57f6,
+    MAJOR): this does NOT bite against the pre-round-3 `_hf_cached` — direct
+    execution confirms `huggingface_hub.snapshot_download(local_files_only=
+    True)` itself already raises `IncompleteSnapshotError` (a
+    `LocalEntryNotFoundError` subclass) for exactly this fixture, which the
+    PRE-round-3 code already caught. This test is a regression guard (the
+    new `_snapshot_complete` path must not accidentally make this scenario
+    pass), not this round's fail-first — that's
+    `test_hf_cached_false_for_a_truncated_weights_blob` below, the one shape
+    `snapshot_download` itself does NOT detect."""
+    cache_dir = _build_fake_hf_cache(tmp_path, _FAKE_FILES)
+    repo_dir = cache_dir / f"models--{_FAKE_REPO_ID.replace('/', '--')}"
+    weights_blob = (repo_dir / "snapshots" / _FAKE_REVISION / "model.safetensors").resolve()
+    weights_blob.unlink()  # leaves the snapshot symlink dangling — the missing-file case
+
+    assert _hf_cached(_FAKE_REPO_ID, cache_dir) is False
+
+
+def test_hf_cached_false_for_a_leftover_incomplete_blob(tmp_path: Path) -> None:
+    """The diagnosed CI failure shape: a process killed mid-download (the
+    RSS test's 300s subprocess timeout) leaves a partial transfer as a
+    `<hash>.incomplete` temp file in `blobs/`, WITHOUT ever creating the
+    final blob or the snapshot symlink for the file still in flight — the
+    weights file is therefore both missing from the snapshot AND has a
+    stray `.incomplete` blob sitting alongside the genuinely-finished
+    files. Must be reported NOT cached.
+
+    CORRECTION (round-3 cold code red-team, agentId a1aba2a010dee57f6,
+    MAJOR): same as `test_hf_cached_false_for_a_missing_weights_file` above
+    — `snapshot_download` itself already detects the missing symlink target
+    regardless of the stray `.incomplete` file's presence, so this is also
+    a regression guard, not this round's fail-first."""
+    cache_dir = _build_fake_hf_cache(tmp_path, _FAKE_FILES)
+    repo_dir = cache_dir / f"models--{_FAKE_REPO_ID.replace('/', '--')}"
+    weights_blob = (repo_dir / "snapshots" / _FAKE_REVISION / "model.safetensors").resolve()
+    weights_blob.unlink()
+    (repo_dir / "blobs" / "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef.incomplete").write_bytes(b"partial")
+
+    assert _hf_cached(_FAKE_REPO_ID, cache_dir) is False
+
+
+def test_hf_cached_false_for_a_truncated_weights_blob(tmp_path: Path) -> None:
+    """Round-3 CI follow-up (S19), the ROOT CAUSE this fix targets directly,
+    and the ONE fixture `snapshot_download(local_files_only=True)` does NOT
+    detect on its own (confirmed by direct execution — it resolves without
+    raising): the weights blob exists at the correct symlinked path but is
+    truncated (present, wrong size) — the exact shape a kill-mid-transfer
+    leaves when the download got far enough to have started writing the
+    final file. Confirmed manually against a copy of this repo's real
+    ~2.2GB judge cache before writing this fixture: the pre-fix `_hf_cached`
+    reported "cached" for a real `model.safetensors` truncated to 10MB —
+    THIS is the failure this whole round-3 fix exists to close, and the one
+    genuine fail-first among these five tests."""
+    cache_dir = _build_fake_hf_cache(tmp_path, _FAKE_FILES)
+    repo_dir = cache_dir / f"models--{_FAKE_REPO_ID.replace('/', '--')}"
+    weights_blob = (repo_dir / "snapshots" / _FAKE_REVISION / "model.safetensors").resolve()
+    weights_blob.write_bytes(b"W" * 10)  # truncated: 10 bytes instead of the manifest's 1000
+
+    assert _hf_cached(_FAKE_REPO_ID, cache_dir) is False
+
+
+def test_hf_cached_true_when_manifest_missing_falls_back_to_existence_check(tmp_path: Path) -> None:
+    """If the `trees/<rev>.json` manifest is missing, size-completeness
+    can't be proven -- falls back to trusting `snapshot_download`'s own
+    resolution (True), NOT False.
+
+    CORRECTION (round-3 cold code red-team, agentId a1aba2a010dee57f6,
+    MAJOR): an earlier version of this test asserted False here, but that
+    would silently reclassify an already-good cache that predates this
+    project's tree-cache-writing `huggingface-hub` pin (or one populated
+    via `local_dir` mode, which keeps its tree cache elsewhere) as "not
+    cached" on every upgrade, forcing an unwanted ~2.2GB re-download with no
+    user-visible signal. Falling back to True for a missing manifest is
+    exactly the PRE-round-3 behavior for that one case (no new regression
+    for it) while every FRESH download still gets a manifest and the full
+    size check (confirmed: every model this project currently caches has
+    one)."""
+    cache_dir = _build_fake_hf_cache(tmp_path, _FAKE_FILES)
+    repo_dir = cache_dir / f"models--{_FAKE_REPO_ID.replace('/', '--')}"
+    (repo_dir / "trees" / f"{_FAKE_REVISION}.json").unlink()
+
+    assert _hf_cached(_FAKE_REPO_ID, cache_dir) is True
 
 
 # ---------------------------------------------------------------------------

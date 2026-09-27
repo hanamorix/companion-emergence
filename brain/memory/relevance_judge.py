@@ -232,26 +232,112 @@ def _hf_cached(model_id: str, cache_dir: str | Path | None) -> bool:
     True)` — the same resolver `CrossEncoder` itself uses internally — so
     "cached" here means exactly what a real offline load would need, not an
     approximation of it (e.g. a bare directory-listing guess). A repo
-    missing (or incomplete: `LocalEntryNotFoundError` covers both "never
-    downloaded" and "download interrupted mid-way") -> False, never raises.
+    missing entirely -> `LocalEntryNotFoundError` -> False, never raises.
     `HFValidationError` (`model_id` isn't shaped like `namespace/repo_name`
     — a non-existent local path reaching here, since `offline_load_kwargs`
     routes any REAL local directory around this function entirely) is
     treated the same as "not cached": False, so the caller falls back to
     today's online-load attempt rather than crashing the tick on a
     malformed id.
+
+    Round-3 CI follow-up: `snapshot_download(local_files_only=True)`
+    succeeding only proves every needed file's symlink EXISTS locally, not
+    that it finished downloading — a process killed mid-transfer (the CI
+    diagnosis: a 300s-timeout-killed subprocess mid-download) can leave a
+    genuinely truncated blob at the correct symlinked path, which this
+    resolver call alone does NOT detect (confirmed empirically: a copy of
+    this repo's real cache with `model.safetensors` truncated to 10MB still
+    resolves as "cached" here without the check below). Per spec S19, a
+    partially downloaded model is NOT "in the cache" -- so `_snapshot_
+    complete` additionally verifies every file the load needs is present at
+    its FULL recorded size, offline, before this returns True.
     """
     from huggingface_hub import snapshot_download
     from huggingface_hub.errors import HFValidationError, LocalEntryNotFoundError
 
     try:
-        snapshot_download(
+        snapshot_path = snapshot_download(
             repo_id=model_id,
             cache_dir=str(cache_dir) if cache_dir is not None else None,
             local_files_only=True,
         )
     except (LocalEntryNotFoundError, HFValidationError):
         return False
+    return _snapshot_complete(Path(snapshot_path))
+
+
+def _snapshot_complete(snapshot_dir: Path) -> bool:
+    """Offline completeness check for an already-resolved HF cache snapshot
+    directory (round-3 CI follow-up, S19): every file the resolved revision
+    lists must exist (through the snapshot dir's symlinks into `blobs/`)
+    at exactly its recorded byte size.
+
+    Ground truth is `<repo_root>/trees/<revision>.json` -- huggingface_hub's
+    OWN locally-cached git-tree manifest for this exact revision (present
+    for every repo this project's pinned `huggingface-hub==1.30.0` downloads;
+    confirmed by inspecting all three models this project currently caches).
+    This is the same manifest `snapshot_download` itself consults to resolve
+    the snapshot in the first place, so checking against it re-verifies
+    EXACTLY the file set `_hf_cached`'s caller already expects, never a
+    stricter or looser scope (no risk of flagging a file the real load never
+    needed, since the manifest lists exactly what a full, unrestricted
+    `snapshot_download` — what this module calls — resolves).
+
+    Deliberately SIZE, not a full re-hash: a truncated/killed transfer is
+    caught by size alone (this follow-up's diagnosed failure mode), and
+    re-hashing a ~2.2GB weights file on every judge build (called once per
+    calibration/self-tune tick, so not hot-path, but still non-trivial CPU)
+    is a real cost for a failure mode size already catches. A file whose
+    bytes are wrong but whose LENGTH happens to match (e.g. this project's
+    documented VM block-corruption failure mode) is NOT caught here --
+    `TorchCrossEncoderJudge.__init__`'s offline-load-raises retry is the
+    second, independent layer of defense for that residual case (round-3
+    S19 note there).
+
+    If the manifest itself is missing or unreadable, this falls back to
+    trusting `snapshot_download`'s own resolution (True) rather than
+    forcing an online re-fetch. Round-3 cold code red-team (agentId
+    a1aba2a010dee57f6, MAJOR): a `trees/<revision>.json` manifest is written
+    only as a side effect of an online download by a tree-cache-aware
+    huggingface_hub client -- a cache populated before this project pinned
+    `huggingface-hub==1.30.0` (or via `local_dir` mode, which keeps its own
+    tree cache at a different path) would never have one, and returning
+    False there would silently reclassify an already-good, already-accepted
+    cache as "not cached" on every persona that upgrades into this fix,
+    forcing an unwanted ~2.2GB re-download (or a silent tick no-op if
+    offline) with no user-visible signal. Falling back to True for a
+    missing manifest is exactly today's PRE-round-3 behavior for that case
+    (no new regression introduced for it) while still gaining the size
+    check for every fresh download going forward, which always gets one
+    (confirmed: every model this project currently caches has a `trees/`
+    entry). Logged once per occurrence so a persona silently missing this
+    verification is still observable.
+    """
+    revision = snapshot_dir.name
+    repo_root = snapshot_dir.parent.parent
+    tree_path = repo_root / "trees" / f"{revision}.json"
+    try:
+        manifest = json.loads(tree_path.read_text())
+        files: dict[str, dict[str, Any]] = manifest["files"]
+    except (OSError, ValueError, KeyError):
+        logger.warning(
+            "no readable trees/%s.json manifest under %s -- cannot size-verify this "
+            "snapshot's completeness, falling back to trusting it (pre-round-3 behavior)",
+            revision,
+            repo_root,
+        )
+        return True
+
+    for rel_path, meta in files.items():
+        expected_size = meta.get("lfs_size", meta.get("size"))
+        if expected_size is None:
+            return False
+        try:
+            actual_size = (snapshot_dir / rel_path).stat().st_size
+        except OSError:
+            return False  # missing file, or a broken symlink (blob deleted)
+        if actual_size != expected_size:
+            return False  # truncated/corrupted-length blob
     return True
 
 
@@ -321,9 +407,45 @@ class TorchCrossEncoderJudge(RelevanceJudgeProvider):
         from sentence_transformers import CrossEncoder
 
         self._model_id = model_id
-        self._model = CrossEncoder(
-            model_id, cache_folder=str(cache_dir), **offline_load_kwargs(model_id, cache_dir)
-        )
+        # S81 owner ruling (Roy, RAM-spike-fix ledger, "CPU everywhere
+        # (Recommended)"): every judge construction site runs on CPU on
+        # every platform, never MPS. Without an explicit `device=`,
+        # sentence_transformers.util.get_device_name() picks 'mps' whenever
+        # torch.backends.mps.is_available() is true -- which a real macOS
+        # install's torch build reports, and release_judge() has no
+        # MPS-specific release call, so an MPS-resident judge risked a
+        # low-memory Mac hitting the same OOM CI saw under MPS's smaller
+        # memory budget.
+        load_kwargs = offline_load_kwargs(model_id, cache_dir)
+        try:
+            self._model = CrossEncoder(
+                model_id, cache_folder=str(cache_dir), device="cpu", **load_kwargs
+            )
+        except Exception:
+            # Round-3 CI follow-up (S19): `_hf_cached`'s size check (see its
+            # docstring) catches a truncated/killed-mid-download blob, but
+            # NOT a same-size-wrong-bytes corruption (this project's
+            # documented VM block-corruption failure mode) or any other way
+            # an offline load can fail despite passing that check. `load_
+            # kwargs` non-empty means we DID attempt the offline path (S2/
+            # S19: only reached when `_hf_cached` said "cached"); retry
+            # ONCE without it so huggingface_hub's real network downloader
+            # (which DOES hash-verify on transfer, unlike a local_files_
+            # only resolution) can detect and re-fetch whatever is actually
+            # bad. If `load_kwargs` was already empty, we were already on
+            # the online path — no second online attempt to make; let the
+            # original exception propagate rather than silently retrying
+            # the identical call.
+            if not load_kwargs:
+                raise
+            logger.warning(
+                "offline load of judge %r failed despite _hf_cached reporting it complete "
+                "-- retrying online once (S19: an offline load that raises is treated as "
+                "not really cached)",
+                model_id,
+                exc_info=True,
+            )
+            self._model = CrossEncoder(model_id, cache_folder=str(cache_dir), device="cpu")
         # Same rationale as CrossEncoderProvider._rerank_lock: a shared
         # instance of this provider (the process-wide cache below) could in
         # principle have .score() called concurrently; serialize inference

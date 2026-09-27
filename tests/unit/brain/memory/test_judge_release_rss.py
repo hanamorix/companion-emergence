@@ -148,42 +148,23 @@ _RSS_TRACE_PRELUDE = textwrap.dedent(
             readings.append(_proc.memory_info().rss)
         return min(readings)
 
-    def _warm_libs_and_force_cpu() -> None:
-        # Follow-up fix (2026-09-27, CI round). Two independent purposes:
+    def _warm_libs() -> None:
+        # S81 owner ruling (RAM-spike-fix ledger, "CPU everywhere
+        # (Recommended)"): every judge construction site now passes
+        # `device="cpu"` explicitly (relevance_judge.py, judge_full_ft.py,
+        # judge_lora.py) -- production never runs the judge on MPS, on any
+        # platform. This test file previously monkeypatched
+        # `torch.backends.mps.is_available` to force CPU here (GitHub's
+        # macos-14 runners advertise MPS but only guarantee a small
+        # unified-memory budget under it, which OOM'd loading this ~2.1GB
+        # judge) -- that patch is no longer needed now that CPU is the
+        # shipped path itself: this test now measures the real code, and
+        # the macOS CI leg exercises the SAME device production actually
+        # uses, closing the coverage gap an earlier round of this file
+        # flagged as an open question (see relevance_judge.py's S81 comment
+        # for the full mechanism/rationale).
         #
-        # (1) Force CPU. GitHub's macos-14 runners advertise `mps` as
-        # available but only guarantee a small unified-memory budget under
-        # it -- observed CI failure: "MPS backend out of memory (MPS
-        # allocated: 0 bytes ... max allowed: 7.93 GiB)" loading this
-        # ~2.1GB judge. `sentence_transformers.util.get_device_name()` (the
-        # ONLY device-selection call reached, since no CrossEncoder
-        # construction site in this repo ever passes a `device=` kwarg)
-        # picks 'mps' purely because `torch.backends.mps.is_available()`
-        # returns True -- so patching that one function forces CPU for
-        # THIS TEST PROCESS only. This does not touch production's own
-        # device selection (relevance_judge.py/judge_full_ft.py/
-        # judge_lora.py never call this test file, and this patch lives
-        # entirely in a throwaway subprocess).
-        #
-        # KNOWN, DELIBERATE SCOPE NARROWING (cold code red-team, agentId
-        # a604186324bde4711, MAJOR): torch is pinned to the `pytorch-cpu`
-        # index for every OS (pyproject.toml), but that index has no
-        # macOS-specific "no-MPS" build -- a real macOS install gets the
-        # same MPS-capable torch this CI runner has. `release_judge()`
-        # (relevance_judge.py) only does `gc.collect()` + a Linux-only
-        # `malloc_trim(0)`; it never calls an MPS-specific release such as
-        # `torch.mps.empty_cache()`. So forcing CPU here means C14's macOS
-        # CI leg now exercises the SAME CPU-resident release path Linux
-        # already covers, NOT the MPS-resident release path a real Mac
-        # user's default install would hit -- that path is currently
-        # UNVERIFIED by any test in this suite. This is flagged to the
-        # owner as an open question (does production actually run the
-        # judge on MPS by default on Apple Silicon, and is that a real
-        # low-memory-Mac risk?), not resolved here: changing production's
-        # device selection is out of this fix's scope absent a plan/spec
-        # decision to do so.
-        #
-        # (2) Warm the baseline. Round-2 CI red-team (C2 MAJOR): capturing
+        # Warm the baseline. Round-2 CI red-team (C2 MAJOR): capturing
         # `rss_before` before `torch`/`sentence_transformers` are ever
         # imported means the libraries' own non-unloadable C-extension/
         # allocator-arena footprint (present for the rest of the process's
@@ -196,10 +177,7 @@ _RSS_TRACE_PRELUDE = textwrap.dedent(
         # captured by each test, moves that library overhead into the
         # measurement's baseline, so `load_delta`/`rss_after` isolate the
         # MODEL's own weights -- what C2/S27 are actually about.
-        import torch
         from sentence_transformers import CrossEncoder  # noqa: F401 (import-only warm-up)
-
-        torch.backends.mps.is_available = lambda: False
     """
 )
 
@@ -210,7 +188,7 @@ _RSS_TRACE_PRELUDE = textwrap.dedent(
 # Round-2 CI follow-up (2026-09-27): kept at 1.5-criteria.md C2's own,
 # already owner-ratified 25% -- NOT tightened to a new number. The root
 # cause of the ~26-27% CI failures was the baseline placement (see
-# `_warm_libs_and_force_cpu` above), not the bound: after that fix, local
+# `_warm_libs` above), not the bound: after that fix, local
 # re-measurement on this machine (Linux, model cached) shows `test_c2a`
 # load_delta=1603.2MB / retained=28.6MB (1.78%) and `test_c2b`
 # load_delta=3380.3MB / retained=56.2MB (1.66%) -- both far under 25%, with
@@ -294,7 +272,7 @@ def test_c2a_calibration_tick_finish_releases_judge_rss() -> None:
         )
         store.close()
 
-        _warm_libs_and_force_cpu()
+        _warm_libs()
         rss_before = _proc.memory_info().rss
         _poll_thread.start()
         _run_calibration_tick(persona_dir, provider=FakeProvider())
@@ -343,7 +321,7 @@ def test_c2b_weight_retrain_finish_releases_judge_rss() -> None:
         from brain.memory import judge_lora
         import brain.memory.relevance_judge as rj
 
-        _warm_libs_and_force_cpu()
+        _warm_libs()
         rss_before = _proc.memory_info().rss
         _poll_thread.start()
 
@@ -466,21 +444,6 @@ def test_c3a_cached_judge_load_makes_zero_network_requests() -> None:
 
         hf_http.get_session = _counting_get_session
 
-        # Force CPU (see test_c2a/_warm_libs_and_force_cpu's comment): a
-        # macOS CI runner advertising `mps` can OOM loading this judge under
-        # MPS's memory budget even for a single score() call. Import BEFORE
-        # patching, same order as `_warm_libs_and_force_cpu`: `torch._dynamo`
-        # imports `torch.backends.mps.is_available.__wrapped__` as part of
-        # `transformers`' own import chain, so patching `is_available` to a
-        # bare lambda before that chain has run raises
-        # `AttributeError: 'function' object has no attribute '__wrapped__'`
-        # deep inside `import sentence_transformers` -- observed locally
-        # when this patch was (wrongly) placed before the warm-up import.
-        import torch
-        from sentence_transformers import CrossEncoder as _WarmCE  # noqa: F401 (import-only warm-up)
-
-        torch.backends.mps.is_available = lambda: False
-
         import brain.memory.relevance_judge as rj
 
         provider = rj.build_judge_provider()
@@ -491,12 +454,14 @@ def test_c3a_cached_judge_load_makes_zero_network_requests() -> None:
             "hf_session_calls": _hf_session_calls[0],
             "model_id": provider.model_id(),
             "score_is_float": isinstance(score, float),
-            # Round-2 CI red-team (finding 4, minor): the CPU-forcing patch
-            # above could be silently defeated if something populates
-            # transformers' own separate `lru_cache`d `is_torch_mps_
-            # available()` before the patch runs (a version bump, an added
-            # diagnostic call). Assert the actual device the model landed on
-            # rather than trusting the patch took effect.
+            # S81 (owner ruling, "CPU everywhere (Recommended)"): every
+            # judge construction site passes device="cpu" explicitly now
+            # (relevance_judge.py), so this assertion measures the actual
+            # shipped path rather than a test-only monkeypatch -- keep it
+            # so a regression back to no device= (which would leave
+            # sentence-transformers' own MPS-preferring default in force)
+            # fails loudly here too, not just in the unit-level S81 bite
+            # tests in test_relevance_judge.py.
             "device": str(provider._model.device),
         }))
         """
@@ -505,8 +470,8 @@ def test_c3a_cached_judge_load_makes_zero_network_requests() -> None:
     assert result["model_id"] == "BAAI/bge-reranker-v2-m3"
     assert result["score_is_float"]
     assert result["device"] == "cpu", (
-        f"expected the CPU-forcing patch to land the judge on cpu, got {result['device']!r} "
-        "-- the torch.backends.mps.is_available patch may have been defeated"
+        f"expected the S81 device='cpu' construction to land the judge on cpu, "
+        f"got {result['device']!r}"
     )
     assert result["hf_session_calls"] == 0, (
         f"expected zero huggingface_hub HTTP-session calls for a cached judge load, "
@@ -540,19 +505,6 @@ def test_c3b_uncached_judge_id_attempts_network_load() -> None:
             raise OSError("network blocked in this test (C3b: expecting >=1 attempt)")
 
         socket.socket.connect = _counting_connect
-
-        # Force CPU (see test_c2a/_warm_libs_and_force_cpu's comment) --
-        # belt-and-suspenders here since the blocked-network exception is
-        # expected to fire before device placement, but keeps this test
-        # deterministic regardless of that ordering on any given platform.
-        # Import BEFORE patching (same reasoning/observed failure as C3a):
-        # patching `torch.backends.mps.is_available` before `sentence_
-        # transformers`/`transformers` have been imported once breaks
-        # `torch._dynamo`'s own import chain.
-        import torch
-        from sentence_transformers import CrossEncoder as _WarmCE  # noqa: F401 (import-only warm-up)
-
-        torch.backends.mps.is_available = lambda: False
 
         import brain.memory.relevance_judge as rj
 

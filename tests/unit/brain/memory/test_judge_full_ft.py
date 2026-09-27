@@ -154,6 +154,49 @@ def test_load_full_scorer_does_not_use_peft_reload(
     assert isinstance(result, float) and result == result  # finite, no peft path taken
 
 
+def test_full_ft_construction_sites_force_cpu_even_if_mps_reported_available(
+    tiny_model_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S81 owner ruling (RAM-spike-fix ledger, "CPU everywhere
+    (Recommended)"): both CrossEncoder construction sites in this module
+    (`build_full_ft_retrain_fn`'s training model, `load_full_scorer`'s
+    reload) pass `device="cpu"` explicitly, so the judge never lands on MPS
+    even on a machine that reports it available. Bites against the pre-S81
+    code, which passed no `device=` kwarg at all -- sentence_transformers'
+    own `get_device_name()` auto-selects 'mps' whenever
+    `torch.backends.mps.is_available()` is True (relevance_judge.py's
+    module docstring / S81 comment; confirmed by reading `sentence_
+    transformers.util.get_device_name`)."""
+    import torch
+    from sentence_transformers import CrossEncoder
+
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+
+    real_init = CrossEncoder.__init__
+    captured: list[dict[str, object]] = []
+
+    def capturing_init(self, *a, **kw):
+        real_init(self, *a, **kw)
+        captured.append({"device_kwarg": kw.get("device"), "device_actual": str(self.device)})
+
+    monkeypatch.setattr(CrossEncoder, "__init__", capturing_init)
+
+    staged = tmp_path / "staged_full_cpu_check"
+    build_full_ft_retrain_fn(tiny_model_dir, epochs=1, save_full_dir=staged)(_TRAIN_TRIPLES)
+    load_full_scorer(staged)(_FIXED_EVAL_ITEMS[0])
+
+    assert len(captured) == 2, f"expected exactly 2 CrossEncoder constructions, got {len(captured)}"
+    for i, call in enumerate(captured):
+        assert call["device_kwarg"] == "cpu", (
+            f"construction #{i}: expected device='cpu' passed even with MPS reported "
+            f"available, got {call['device_kwarg']!r}"
+        )
+        assert call["device_actual"] == "cpu", (
+            f"construction #{i}: expected the resulting model to actually be on cpu, "
+            f"got {call['device_actual']!r}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # C3 — AC7 analogue: full-model train -> save -> reload reproduces scores.
 # ---------------------------------------------------------------------------

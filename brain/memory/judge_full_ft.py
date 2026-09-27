@@ -193,12 +193,17 @@ def build_full_ft_retrain_fn(
             else tunables.get_tunable("judge_selftune.lora_max_length", LORA_MAX_LENGTH_DEFAULT)
         )
 
+        # S81 owner ruling (Roy, RAM-spike-fix ledger, "CPU everywhere
+        # (Recommended)"): CPU on every platform, never MPS — see
+        # relevance_judge.TorchCrossEncoderJudge.__init__ for the full
+        # rationale (no MPS-specific release call, low-memory-Mac OOM risk).
         model = CrossEncoder(
             str(start_model_path),
             cache_folder=str(cache_dir) if cache_dir is not None else None,
             config_kwargs={"num_labels": 1},
             max_length=resolved_max_length,
             activation_fn=activation_fn if activation_fn is not None else (lambda x: x),
+            device="cpu",
             **offline_load_kwargs(str(start_model_path), cache_dir),
         )
         # NOTE: no model.add_adapter(...) — every parameter is trainable.
@@ -215,6 +220,11 @@ def build_full_ft_retrain_fn(
                 logging_steps=1_000_000,  # effectively silent
                 save_strategy="no",
                 disable_tqdm=True,
+                # S81: Trainer._setup_devices resolves its OWN device
+                # independently of the model's constructed device and would
+                # otherwise move it to MPS if available — use_cpu=True keeps
+                # training on CPU too.
+                use_cpu=True,
             )
             trainer = CrossEncoderTrainer(model=model, args=args, train_dataset=dataset, loss=loss_fn)
             trainer.train()
@@ -279,6 +289,7 @@ def load_full_scorer(
     model = CrossEncoder(
         str(full_dir),
         cache_folder=str(cache_dir) if cache_dir is not None else None,
+        device="cpu",  # S81: CPU everywhere, never MPS
         **({"max_length": max_length} if max_length is not None else {}),
         **offline_load_kwargs(str(full_dir), cache_dir),
     )
