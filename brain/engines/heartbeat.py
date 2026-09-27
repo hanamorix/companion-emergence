@@ -277,13 +277,18 @@ class HeartbeatState:
         genuinely-absent case (key missing, or explicit JSON `null`); a
         PRESENT-but-malformed cursor instead raises, which the caller
         (`_parse_state_data`'s own try/except) turns into the WHOLE state
-        being treated as corrupt — the SAME `attempt_heal`/backup-rotation
-        recovery every other malformed field on this dataclass already gets
-        (see `load_with_anomaly`'s docstring: reinitializing on corruption is
-        this class's existing, accepted recovery philosophy). Reinitializing
-        resets `last_tick_at` too, so the next tick's elapsed time is 0 for
-        already-decayed rows — safe, unlike silently keeping the stale
-        `last_tick_at` with a dropped cursor."""
+        being treated as corrupt (`load_with_anomaly` then returns `(None,
+        None)` for this case — the outer JSON is structurally valid, so
+        `attempt_heal`'s own quarantine/`.bak` machinery never engages and no
+        anomaly is logged; round-2 red-team confirmed this by repro). `state
+        is None` then hits `run_tick`'s existing first-ever-tick branch,
+        which reinitializes via `HeartbeatState.fresh()` — this class's
+        existing, pre-INC-7 behavior for EVERY OTHER malformed field here
+        (bad `tick_count`, unparseable `last_tick_at`, etc. all take this
+        SAME silent-reset path today; nothing about that recovery mechanism
+        itself is new here). Reinitializing resets `last_tick_at` too, so the
+        next tick's elapsed time is 0 for already-decayed rows — safe, unlike
+        silently keeping the stale `last_tick_at` with a dropped cursor."""
         if data is None:
             return None
         if not isinstance(data, dict):

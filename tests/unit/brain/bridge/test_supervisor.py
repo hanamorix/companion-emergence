@@ -188,6 +188,86 @@ def test_run_folded_fires_heartbeat_after_interval(tmp_path: Path) -> None:
     assert not t.is_alive(), "supervisor loop did not exit after stop_event"
 
 
+def test_run_folded_retries_heartbeat_soon_after_a_skip_not_a_full_interval(
+    tmp_path: Path,
+) -> None:
+    """Round-2 red-team MINOR (INC-7, self-acknowledged gap in
+    8-harness.md): `last_heartbeat_at` must advance ONLY when
+    `_heartbeat_and_felt_time` actually does something (returns non-None),
+    not on a skip (e.g. a reply in flight, S21) — otherwise a skip would
+    reset the full `heartbeat_interval_s` countdown, and a busy chat
+    session could defer the heartbeat indefinitely. Proven here by making
+    `_heartbeat_and_felt_time` return None for its first two calls, then a
+    real (non-None) sentinel: the None-returning calls must be spaced
+    ~`tick_interval_s` apart (the outer loop's own pacing), not
+    ~`heartbeat_interval_s` apart, and only the FIRST non-None call resets
+    the full interval before the next attempt."""
+    persona_dir = _persona_dir(tmp_path)
+    bus = EventBus()
+    stop = threading.Event()
+    call_times: list[float] = []
+    call_results: list[bool] = []  # True once a call is allowed to "succeed"
+
+    heartbeat_interval_s = 0.3
+    tick_interval_s = 0.05
+
+    def fake_heartbeat_and_felt_time(persona_dir, provider, event_bus, last_heartbeat_at):
+        call_times.append(time.monotonic())
+        # First 2 calls simulate a reply-in-flight skip (S21): return None,
+        # doing nothing. From the 3rd call on, simulate a real pass.
+        succeeded = len(call_times) >= 3
+        call_results.append(succeeded)
+        return object() if succeeded else None
+
+    def runner():
+        with patch(
+            "brain.bridge.supervisor._heartbeat_and_felt_time",
+            side_effect=fake_heartbeat_and_felt_time,
+        ):
+            run_folded(
+                stop,
+                persona_dir=persona_dir,
+                provider=FakeProvider(),
+                event_bus=bus,
+                tick_interval_s=tick_interval_s,
+                heartbeat_interval_s=heartbeat_interval_s,
+            )
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    try:
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and len(call_times) < 4:
+            time.sleep(0.02)
+        assert len(call_times) >= 4, "did not observe enough heartbeat attempts"
+    finally:
+        stop.set()
+        t.join(timeout=5.0)
+    assert not t.is_alive()
+
+    # Gaps between the two SKIPPED calls (both None): must track the outer
+    # loop's own tick pacing, not the full heartbeat interval — proving a
+    # skip does not push the next attempt a full interval away.
+    gap_after_first_skip = call_times[1] - call_times[0]
+    assert gap_after_first_skip < heartbeat_interval_s / 2, (
+        f"a skipped attempt deferred the retry by {gap_after_first_skip:.3f}s — "
+        f"close to the full {heartbeat_interval_s}s interval, not the "
+        f"~{tick_interval_s}s outer-loop pacing expected after a no-op skip"
+    )
+
+    # The gap AFTER the first call that actually succeeded (index 2, the
+    # 3rd call, call_results[2] is True) must be close to the FULL
+    # heartbeat interval — a real run still paces normally afterward.
+    first_success_idx = call_results.index(True)
+    assert first_success_idx + 1 < len(call_times), "no call observed after the first success"
+    gap_after_success = call_times[first_success_idx + 1] - call_times[first_success_idx]
+    assert gap_after_success >= heartbeat_interval_s * 0.6, (
+        f"the attempt right after a REAL (non-skipped) heartbeat run fired after "
+        f"only {gap_after_success:.3f}s — cadence was broken; expected roughly "
+        f"the full {heartbeat_interval_s}s interval"
+    )
+
+
 def test_heartbeat_failure_does_not_break_supervisor_loop(tmp_path: Path) -> None:
     """A heartbeat exception is fault-isolated; supervisor keeps ticking.
 
