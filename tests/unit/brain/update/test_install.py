@@ -4,6 +4,7 @@ No network: pip runs with --no-index --find-links <tmp>."""
 from __future__ import annotations
 
 import hashlib
+import json
 import zipfile
 from pathlib import Path
 
@@ -206,6 +207,32 @@ def test_failed_swap_keeps_the_active_overlay(tmp_path, monkeypatch):
     assert (root / active["dir"] / "brain").is_dir()
 
 
+def test_a_named_folder_with_a_bad_stamp_is_never_touched(tmp_path):
+    finds = tmp_path / "finds"
+    finds.mkdir()
+    brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
+    req = tmp_path / "requirements.txt"
+    req.write_text("", encoding="utf-8")
+    site = _fake_bundle(tmp_path, {})
+    root = tmp_path / "brain-overlay"
+    kw = {"wheel": brain_whl, "requirements": req, "commit": "a" * 40, "site_dir": site, "root": root,
+          "pip_extra": ["--no-index", "--find-links", str(finds)]}
+    entry1 = install.apply_update(**kw)
+    old_folder = root / entry1["dir"]
+    (old_folder / "stamp.json").write_text("not json", encoding="utf-8")
+    (old_folder / "sentinel").write_text("keep-me", encoding="utf-8")
+
+    entry2 = install.apply_update(**kw)
+
+    assert entry2["dir"] != entry1["dir"]
+    assert old_folder.is_dir()
+    assert (old_folder / "sentinel").read_text(encoding="utf-8") == "keep-me"
+    assert (root / entry2["dir"]).is_dir()
+    state = overlay.read_state(root)
+    assert state["active"] == entry2
+    assert state["previous"] == entry1
+
+
 def test_new_bundle_id_installs_into_a_new_folder(tmp_path):
     finds = tmp_path / "finds"
     finds.mkdir()
@@ -226,6 +253,29 @@ def test_new_bundle_id_installs_into_a_new_folder(tmp_path):
     assert (root / entry2["dir"]).is_dir()
     assert overlay.read_state(root)["active"] == entry2
     assert overlay.read_state(root)["previous"] == entry1
+
+
+def test_leftover_unnamed_folder_is_replaced(tmp_path):
+    finds = tmp_path / "finds"
+    finds.mkdir()
+    brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
+    req = tmp_path / "requirements.txt"
+    req.write_text("", encoding="utf-8")
+    site = _fake_bundle(tmp_path, {})
+    root = tmp_path / "brain-overlay"
+    leftover = root / f"{'c' * 12}-{'bundle-1'[:8]}"
+    leftover.mkdir(parents=True)
+    (leftover / "junk").write_text("garbage", encoding="utf-8")
+
+    entry = install.apply_update(wheel=brain_whl, requirements=req, commit="c" * 40, site_dir=site,
+                                 root=root, pip_extra=["--no-index", "--find-links", str(finds)])
+
+    folder = root / entry["dir"]
+    assert folder == leftover
+    assert (folder / "brain").is_dir()
+    assert not (folder / "junk").exists()
+    stamp = json.loads((folder / "stamp.json").read_text(encoding="utf-8"))
+    assert stamp["commit"] == "c" * 40 and stamp["bundle_id"] == "bundle-1"
 
 
 def test_unsafe_commit_labels_are_refused(tmp_path):

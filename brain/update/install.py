@@ -133,16 +133,25 @@ def apply_update(*, wheel: Path, requirements: Path, commit: str, site_dir: Path
     # bundle_id is folded into the folder name: an app upgrade that changes it (same
     # commit re-applied against a new bundle) installs into a NEW folder rather than
     # colliding with one built for the old bundle.
-    entry = {"dir": f"{commit[:12]}-{bundle_id[:8]}", "commit": commit, "brain_version": parts[1],
-             "bundle_id": bundle_id}
+    base = f"{commit[:12]}-{bundle_id[:8]}"
+    entry = {"dir": base, "commit": commit, "brain_version": parts[1], "bundle_id": bundle_id}
     with overlay.overlay_lock(root):
+        state = overlay.read_state(root)
+        named = {e["dir"] for e in (state["active"], state["previous"]) if e}
         target = root / entry["dir"]
         try:
             stamp = json.loads((target / "stamp.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             stamp = {}
-        if not (isinstance(stamp, dict) and stamp.get("commit") == commit
-                and stamp.get("bundle_id") == bundle_id):
+        matches = (isinstance(stamp, dict) and stamp.get("commit") == commit
+                   and stamp.get("bundle_id") == bundle_id)
+        if not matches:
+            if target.exists() and target.name in named:
+                # `target` is current.json's active or previous folder, just with a
+                # stamp that doesn't match (e.g. corrupted) — never rename or delete
+                # a folder current.json names; install into a fresh one instead.
+                entry["dir"] = f"{base}-r{os.getpid()}"
+                target = root / entry["dir"]
             staging = root / f".staging-{entry['dir']}-{os.getpid()}"
             shutil.rmtree(staging, ignore_errors=True)
             staging.mkdir(parents=True)
@@ -164,23 +173,17 @@ def apply_update(*, wheel: Path, requirements: Path, commit: str, site_dir: Path
                 _run([*_pip(), "--target", str(staging), *pip_extra, str(wheel)])
                 _smoke(staging, smoke_modules)
                 (staging / "stamp.json").write_text(json.dumps(entry, indent=2), encoding="utf-8")
-                # Never rmtree `target`: it may be the ACTIVE overlay (e.g. this same
-                # commit+bundle re-applied over a corrupt stamp). Rename it aside first
-                # so a failed replace can restore it; only delete the old copy once the
-                # new one is safely in place.
-                old_aside = root / f"{entry['dir']}.old-{os.getpid()}"
-                renamed_old = target.exists()
-                if renamed_old:
-                    shutil.rmtree(old_aside, ignore_errors=True)
-                    os.replace(target, old_aside)
-                try:
-                    os.replace(staging, target)
-                except BaseException:
-                    if renamed_old:
-                        os.replace(old_aside, target)
-                    raise
-                if renamed_old:
-                    shutil.rmtree(old_aside, ignore_errors=True)
+                if target.exists():
+                    # Reaching here means `target` is NOT named by current.json (the
+                    # named case above already redirected to a fresh folder) — it's
+                    # leftover garbage from an earlier crashed/partial install. Safe to
+                    # remove outright; if it can't be removed, fail loudly rather than
+                    # silently swallowing it (current.json is still untouched).
+                    try:
+                        shutil.rmtree(target)
+                    except OSError as e:
+                        raise UpdateError(f"could not remove leftover overlay folder {target}: {e}") from e
+                os.replace(staging, target)
             except BaseException:
                 shutil.rmtree(staging, ignore_errors=True)
                 raise
