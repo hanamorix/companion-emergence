@@ -15,6 +15,9 @@ on:
       - uv.lock
       - .github/workflows/runtime-build.yml
       - brain/update/**
+      - brain/cli.py
+      - brain/paths.py
+      - brain/bridge/state_file.py
       - scripts/overlay_e2e.sh
   workflow_dispatch:
 
