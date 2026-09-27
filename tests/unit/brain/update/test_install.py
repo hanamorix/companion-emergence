@@ -233,6 +233,45 @@ def test_a_named_folder_with_a_bad_stamp_is_never_touched(tmp_path):
     assert state["previous"] == entry1
 
 
+def test_fresh_name_never_reuses_a_named_folder(tmp_path, monkeypatch):
+    finds = tmp_path / "finds"
+    finds.mkdir()
+    brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
+    req = tmp_path / "requirements.txt"
+    req.write_text("", encoding="utf-8")
+    site = _fake_bundle(tmp_path, {})
+    root = tmp_path / "brain-overlay"
+    kw = {"wheel": brain_whl, "requirements": req, "commit": "a" * 40, "site_dir": site, "root": root,
+          "pip_extra": ["--no-index", "--find-links", str(finds)]}
+
+    entry1 = install.apply_update(**kw)
+    canonical = root / entry1["dir"]
+    (canonical / "stamp.json").write_text("not json", encoding="utf-8")
+    (canonical / "sentinel").write_text("keep-canonical", encoding="utf-8")
+
+    entry2 = install.apply_update(**kw)
+    r1_folder = root / entry2["dir"]
+    (r1_folder / "stamp.json").write_text("not json", encoding="utf-8")
+    (r1_folder / "sentinel").write_text("keep-r1", encoding="utf-8")
+
+    # prune keeps only active+previous (a single-generation history, by existing
+    # design, unrelated to this fix) — disable it so this test can isolate what the
+    # SWAP itself does to the two folders that are named at the moment of the third
+    # apply, instead of conflating that with the separately-tested prune behaviour.
+    monkeypatch.setattr(install.overlay, "prune", lambda root: None)
+
+    entry3 = install.apply_update(**kw)
+
+    assert entry3["dir"] == f"{entry1['dir']}-r2"
+    assert entry3["dir"] not in (entry1["dir"], entry2["dir"])
+    assert canonical.is_dir() and (canonical / "sentinel").read_text(encoding="utf-8") == "keep-canonical"
+    assert r1_folder.is_dir() and (r1_folder / "sentinel").read_text(encoding="utf-8") == "keep-r1"
+    assert (root / entry3["dir"]).is_dir()
+    state = overlay.read_state(root)
+    assert state["active"] == entry3
+    assert state["previous"] == entry2
+
+
 def test_new_bundle_id_installs_into_a_new_folder(tmp_path):
     finds = tmp_path / "finds"
     finds.mkdir()

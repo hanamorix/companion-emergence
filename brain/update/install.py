@@ -149,8 +149,13 @@ def apply_update(*, wheel: Path, requirements: Path, commit: str, site_dir: Path
             if target.exists() and target.name in named:
                 # `target` is current.json's active or previous folder, just with a
                 # stamp that doesn't match (e.g. corrupted) — never rename or delete
-                # a folder current.json names; install into a fresh one instead.
-                entry["dir"] = f"{base}-r{os.getpid()}"
+                # a folder current.json names; install into a fresh one instead. Pick
+                # the first counter not already named (not pid-based: a prior run's
+                # `-r<pid>` folder could still be named when the OS reuses that pid).
+                n = 1
+                while f"{base}-r{n}" in named:
+                    n += 1
+                entry["dir"] = f"{base}-r{n}"
                 target = root / entry["dir"]
             staging = root / f".staging-{entry['dir']}-{os.getpid()}"
             shutil.rmtree(staging, ignore_errors=True)
@@ -173,12 +178,16 @@ def apply_update(*, wheel: Path, requirements: Path, commit: str, site_dir: Path
                 _run([*_pip(), "--target", str(staging), *pip_extra, str(wheel)])
                 _smoke(staging, smoke_modules)
                 (staging / "stamp.json").write_text(json.dumps(entry, indent=2), encoding="utf-8")
+                # Checked, not assumed: the named case above should already have
+                # redirected `target` away from anything current.json names. This is
+                # unreachable in the happy path; it's the guard.
+                if target.name in named:
+                    raise UpdateError(f"refusing to replace {target.name}: current.json names it")
                 if target.exists():
-                    # Reaching here means `target` is NOT named by current.json (the
-                    # named case above already redirected to a fresh folder) — it's
-                    # leftover garbage from an earlier crashed/partial install. Safe to
-                    # remove outright; if it can't be removed, fail loudly rather than
-                    # silently swallowing it (current.json is still untouched).
+                    # `target` is NOT named by current.json — it's leftover garbage
+                    # from an earlier crashed/partial install. Safe to remove outright;
+                    # if it can't be removed, fail loudly rather than silently
+                    # swallowing it (current.json is still untouched).
                     try:
                         shutil.rmtree(target)
                     except OSError as e:
