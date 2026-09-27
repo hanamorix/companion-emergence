@@ -47,19 +47,38 @@ _STRESS_DURATION_S = 60.0
 
 
 class _LockErrorCapture(logging.Handler):
-    """Captures any log record whose message mentions a database lock —
-    the observable signature of the O16 starvation pattern this fix
-    removes, across every logger in the process (heartbeat, forgetting,
-    store, supervisor)."""
+    """Captures any log record whose message OR attached exception mentions
+    a database lock — the observable signature of the O16 starvation
+    pattern this fix removes, across every logger in the process
+    (heartbeat, forgetting, store, supervisor).
+
+    Round-2 red-team MAJOR, fixed: `record.getMessage()` alone is NOT
+    enough — `brain/bridge/supervisor.py`'s heartbeat/forgetting call sites
+    catch with a bare `except Exception: logger.exception("<generic
+    label>")`, which never interpolates the caught exception's own text
+    into the message (verified: `LogRecord.getMessage()` returns only the
+    literal format string, never `exc_info`/`exc_text`). A real "database
+    is locked" raised on either of those paths would previously go
+    completely undetected by this oracle. `logger.exception(...)` attaches
+    `exc_info` to the record; format it (via `self.format`, which renders
+    the traceback + `repr(exception)` through the handler's own formatter)
+    and scan THAT too, not just the bare message.
+    """
 
     def __init__(self) -> None:
         super().__init__(level=logging.WARNING)
         self.hits: list[str] = []
 
     def emit(self, record: logging.LogRecord) -> None:
-        msg = record.getMessage()
-        if "database is locked" in msg or "locked" in msg.lower() and "database" in msg.lower():
-            self.hits.append(msg)
+        haystacks = [record.getMessage()]
+        if record.exc_info is not None:
+            # self.format() renders the message + the formatted traceback
+            # (which includes str(exception), e.g. "OperationalError:
+            # database is locked") through this handler's own formatter.
+            haystacks.append(self.format(record))
+        text = " ".join(haystacks).lower()
+        if "database is locked" in text or ("locked" in text and "database" in text):
+            self.hits.append(record.getMessage() or (record.exc_text or str(record.exc_info)))
 
 
 @pytest.mark.skipif(not _FIXTURE.exists(), reason=f"F-bob20k fixture not present at {_FIXTURE}")
