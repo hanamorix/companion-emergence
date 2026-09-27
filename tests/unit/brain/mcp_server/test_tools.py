@@ -48,7 +48,14 @@ def test_register_tools_advertises_all_dispatched(persona_dir: Path, fake_stores
 def test_register_tools_dispatches_and_logs_success(
     persona_dir: Path, fake_stores, monkeypatch
 ) -> None:
-    """call_tool() must call dispatch() and write an audit log line."""
+    """call_tool() must call dispatch() and write an audit log line.
+
+    Uses get_soul as the generic dispatch-routed example — search_memories
+    is bridge-routed (INC-4, _BRIDGE_ROUTED_TOOLS) and no longer reaches
+    dispatch() from this handler; its bridge-transport path has its own
+    coverage in tests/bridge/test_search_via_bridge.py + this file's
+    test_register_tools_search_memories_routes_via_bridge below.
+    """
     from mcp.server import Server
 
     from brain.mcp_server.tools import register_tools
@@ -60,14 +67,14 @@ def test_register_tools_dispatches_and_logs_success(
     with patch("brain.mcp_server.tools.dispatch", return_value={"ok": True}) as mock_dispatch:
         register_tools(server, persona_dir=persona_dir, store=store, hebbian=hebbian)
         call_handler = _get_call_handler(server)
-        result = asyncio.run(call_handler(_call_request("search_memories", {"query": "x"})))
+        result = asyncio.run(call_handler(_call_request("get_soul", {})))
 
     # Dispatch was invoked with the right args + injections. #80: session_id is
     # now always passed (None here — no NELL_MCP_SESSION_ID in the environment)
     # — harmless for every tool outside dispatch()'s _PROVIDER_TOOLS set.
     mock_dispatch.assert_called_once_with(
-        "search_memories",
-        {"query": "x"},
+        "get_soul",
+        {},
         store=store,
         hebbian=hebbian,
         persona_dir=persona_dir,
@@ -79,9 +86,8 @@ def test_register_tools_dispatches_and_logs_success(
     # Audit log was written
     log_path = persona_dir / "tool_invocations.log.jsonl"
     rec = json.loads(log_path.read_text(encoding="utf-8"))
-    assert rec["name"] == "search_memories"
-    # Audit 2026-05-07 P3-3: 'query' is now redacted in default mode.
-    assert rec["arguments"] == {"query": "[REDACTED]"}
+    assert rec["name"] == "get_soul"
+    assert rec["arguments"] == {}
     assert rec["error"] is None
     # #96/#102: a normal return is outcome="ok".
     assert rec["outcome"] == "ok"
@@ -99,14 +105,14 @@ def test_register_tools_dispatches_and_logs_error(persona_dir: Path, fake_stores
     with patch("brain.mcp_server.tools.dispatch", side_effect=RuntimeError("boom")):
         register_tools(server, persona_dir=persona_dir, store=store, hebbian=hebbian)
         call_handler = _get_call_handler(server)
-        # Use search_memories with valid args so SDK input validation passes;
-        # dispatch is mocked to raise regardless of which tool is called.
-        result = asyncio.run(call_handler(_call_request("search_memories", {"query": "test"})))
+        # Use get_soul (dispatch-routed; search_memories is bridge-routed as
+        # of INC-4 and would never reach this mocked dispatch).
+        result = asyncio.run(call_handler(_call_request("get_soul", {})))
 
     text = result.root.content[0].text
     assert json.loads(text) == {"error": "boom"}
     rec = json.loads((persona_dir / "tool_invocations.log.jsonl").read_text(encoding="utf-8"))
-    assert rec["name"] == "search_memories"
+    assert rec["name"] == "get_soul"
     assert rec["error"] == "boom"
     # #96/#102: a raised exception is outcome="error".
     assert rec["outcome"] == "error"
@@ -147,7 +153,8 @@ def test_register_tools_summary_truncated(persona_dir: Path, fake_stores) -> Non
     with patch("brain.mcp_server.tools.dispatch", return_value=big_result):
         register_tools(server, persona_dir=persona_dir, store=store, hebbian=hebbian)
         call_handler = _get_call_handler(server)
-        asyncio.run(call_handler(_call_request("search_memories", {"query": "x"})))
+        # get_soul (dispatch-routed); search_memories is bridge-routed (INC-4).
+        asyncio.run(call_handler(_call_request("get_soul", {})))
 
     rec = json.loads((persona_dir / "tool_invocations.log.jsonl").read_text(encoding="utf-8"))
     assert len(rec["result_summary"]) <= 141  # 140 + "…"
@@ -355,3 +362,207 @@ def test_register_tools_logs_deduped_outcome_for_duplicate_monologue(
     assert rec["name"] == "record_monologue"
     assert rec["outcome"] == "deduped"
     assert not rec.get("monologue_text")
+
+
+# ── INC-4 — search_memories routes to the bridge, not dispatch() ─────────────
+#
+# The MCP child never builds the embedder/reranker/vector matrix for
+# search_memories (S9/S10): _search_via_bridge forwards over HTTP to the
+# bridge's POST /tools/search_memories using bridge.json's port + bearer
+# token. Fail-first: pre-change, search_memories went through the same
+# dispatch() path as every other tool — these tests would have failed
+# against that code (dispatch mocked, never called; _search_via_bridge
+# didn't exist).
+
+
+def _fake_bridge_state(port: int | None = 4321, auth_token: str | None = "tok-123"):
+    from brain.bridge import state_file
+
+    return state_file.BridgeState(
+        persona="test-persona",
+        pid=1234,
+        port=port,
+        started_at="2026-01-01T00:00:00+00:00",
+        stopped_at=None,
+        shutdown_clean=True,
+        client_origin="cli",
+        auth_token=auth_token,
+    )
+
+
+def test_search_via_bridge_success_posts_and_returns_body(
+    persona_dir: Path, monkeypatch
+) -> None:
+    """Happy path: bridge.json read, correct URL/headers/timeout, body returned unchanged."""
+    from brain import dev_constants
+    from brain.mcp_server import tools as tools_mod
+
+    monkeypatch.setattr(tools_mod.state_file, "read", lambda _pd: _fake_bridge_state())
+
+    captured: dict = {}
+
+    class _FakeResp:
+        status_code = 200
+
+        def json(self):
+            return {"memories": [{"id": "m1"}], "mode": "semantic"}
+
+    def _fake_post(url, *, json, headers, timeout):
+        captured["url"] = url
+        captured["json"] = json
+        captured["headers"] = headers
+        captured["timeout"] = timeout
+        return _FakeResp()
+
+    monkeypatch.setattr(tools_mod.httpx, "post", _fake_post)
+
+    result = tools_mod._search_via_bridge(persona_dir, {"query": "x", "limit": 5})
+
+    assert result == {"memories": [{"id": "m1"}], "mode": "semantic"}
+    assert captured["url"] == "http://127.0.0.1:4321/tools/search_memories"
+    assert captured["json"] == {"query": "x", "limit": 5}
+    assert captured["headers"] == {"Authorization": "Bearer tok-123"}
+    assert captured["timeout"] == dev_constants.SEARCH_BRIDGE_TIMEOUT_S
+
+
+def test_search_via_bridge_no_state_file_is_unreachable(persona_dir: Path, monkeypatch) -> None:
+    from brain.mcp_server import tools as tools_mod
+
+    monkeypatch.setattr(tools_mod.state_file, "read", lambda _pd: None)
+    result = tools_mod._search_via_bridge(persona_dir, {"query": "x"})
+    assert result == {"error": "bridge unreachable"}
+
+
+def test_search_via_bridge_no_port_is_unreachable(persona_dir: Path, monkeypatch) -> None:
+    from brain.mcp_server import tools as tools_mod
+
+    monkeypatch.setattr(tools_mod.state_file, "read", lambda _pd: _fake_bridge_state(port=None))
+    result = tools_mod._search_via_bridge(persona_dir, {"query": "x"})
+    assert result == {"error": "bridge unreachable"}
+
+
+def test_search_via_bridge_connect_error_is_unreachable(persona_dir: Path, monkeypatch) -> None:
+    from brain.mcp_server import tools as tools_mod
+
+    monkeypatch.setattr(tools_mod.state_file, "read", lambda _pd: _fake_bridge_state())
+
+    def _raise_connect(*_a, **_kw):
+        raise tools_mod.httpx.ConnectError("refused")
+
+    monkeypatch.setattr(tools_mod.httpx, "post", _raise_connect)
+    result = tools_mod._search_via_bridge(persona_dir, {"query": "x"})
+    assert result == {"error": "bridge unreachable"}
+
+
+def test_search_via_bridge_timeout_is_distinct_error(persona_dir: Path, monkeypatch) -> None:
+    """S39: timeout must be a DIFFERENT error string from unreachable."""
+    from brain.mcp_server import tools as tools_mod
+
+    monkeypatch.setattr(tools_mod.state_file, "read", lambda _pd: _fake_bridge_state())
+
+    def _raise_timeout(*_a, **_kw):
+        raise tools_mod.httpx.TimeoutException("too slow")
+
+    monkeypatch.setattr(tools_mod.httpx, "post", _raise_timeout)
+    result = tools_mod._search_via_bridge(persona_dir, {"query": "x"})
+    assert result == {"error": "bridge timeout"}
+    assert result != {"error": "bridge unreachable"}
+
+
+def test_search_via_bridge_non_200_reports_status(persona_dir: Path, monkeypatch) -> None:
+    from brain.mcp_server import tools as tools_mod
+
+    monkeypatch.setattr(tools_mod.state_file, "read", lambda _pd: _fake_bridge_state())
+
+    class _FakeResp:
+        status_code = 401
+
+        def json(self):  # pragma: no cover — not reached on non-200
+            raise AssertionError("json() must not be called on a non-200 response")
+
+    monkeypatch.setattr(tools_mod.httpx, "post", lambda *a, **kw: _FakeResp())
+    result = tools_mod._search_via_bridge(persona_dir, {"query": "x"})
+    assert result == {"error": "bridge error 401"}
+
+
+def test_register_tools_search_memories_routes_via_bridge_not_dispatch(
+    persona_dir: Path, fake_stores, monkeypatch
+) -> None:
+    """search_memories must NOT reach dispatch() — it's bridge-routed (INC-4).
+
+    Fail-first: before this increment, search_memories went through the same
+    dispatch() call every other tool does; this test asserts dispatch is
+    never invoked and the bridge helper is used instead, with the audit log
+    still written the same way as any other tool.
+    """
+    from mcp.server import Server
+
+    from brain.mcp_server import tools as tools_mod
+    from brain.mcp_server.tools import register_tools
+
+    store, hebbian = fake_stores
+    server = Server("brain-tools")
+
+    with (
+        patch.object(
+            tools_mod, "_search_via_bridge", return_value={"memories": [], "mode": "lexical"}
+        ) as mock_bridge,
+        patch.object(tools_mod, "dispatch") as mock_dispatch,
+    ):
+        register_tools(server, persona_dir=persona_dir, store=store, hebbian=hebbian)
+        call_handler = _get_call_handler(server)
+        result = asyncio.run(call_handler(_call_request("search_memories", {"query": "x"})))
+
+    mock_dispatch.assert_not_called()
+    mock_bridge.assert_called_once_with(persona_dir, {"query": "x"})
+    text = result.root.content[0].text
+    assert json.loads(text) == {"memories": [], "mode": "lexical"}
+    rec = json.loads((persona_dir / "tool_invocations.log.jsonl").read_text(encoding="utf-8"))
+    assert rec["name"] == "search_memories"
+    assert rec["outcome"] == "ok"
+
+
+def test_register_tools_search_memories_bridge_error_is_refused_outcome(
+    persona_dir: Path, fake_stores
+) -> None:
+    """A bridge error result ({"error": ...}) is a refusal, same as any other
+    tool's {"error": ...} return (#96/#102 semantics apply uniformly)."""
+    from mcp.server import Server
+
+    from brain.mcp_server import tools as tools_mod
+    from brain.mcp_server.tools import register_tools
+
+    store, hebbian = fake_stores
+    server = Server("brain-tools")
+
+    with patch.object(
+        tools_mod, "_search_via_bridge", return_value={"error": "bridge unreachable"}
+    ):
+        register_tools(server, persona_dir=persona_dir, store=store, hebbian=hebbian)
+        call_handler = _get_call_handler(server)
+        result = asyncio.run(call_handler(_call_request("search_memories", {"query": "x"})))
+
+    text = result.root.content[0].text
+    assert json.loads(text) == {"error": "bridge unreachable"}
+    rec = json.loads((persona_dir / "tool_invocations.log.jsonl").read_text(encoding="utf-8"))
+    assert rec["name"] == "search_memories"
+    assert rec["outcome"] == "refused"
+    assert rec["error"] == "bridge unreachable"
+
+
+def test_mcp_server_tools_module_never_imports_model_building_modules() -> None:
+    """Structural half of C1c ("no provider constructed"): the MCP child's own
+    module source never imports the modules that build the embedder,
+    reranker, or vector matrix — those symbols are simply unreachable from
+    this process for search_memories's bridge-routed path. This is a
+    stronger guarantee than an RSS proxy (tests/bridge/test_search_via_bridge.py
+    measures the empirical RSS bound on a real process; this pins the causal
+    mechanism a real-process test can only observe indirectly)."""
+    import brain.mcp_server.tools as tools_mod
+
+    src = Path(tools_mod.__file__).read_text(encoding="utf-8")
+    for forbidden in ("brain.memory.embeddings", "brain.memory.reranker", "brain.memory.embedding_matrix"):
+        assert forbidden not in src, (
+            f"brain/mcp_server/tools.py must never import {forbidden!r} — that would let the "
+            "MCP child build a model in-process for a bridge-routed tool"
+        )

@@ -42,3 +42,12 @@ MEMORIES_DB_BUSY_TIMEOUT_S: float = 30.0
 # own result, not this gate. See `brain.memory.judge_selftune.
 # JUDGE_TUNE_GATE_HANDFUL_DECISIONS`, which re-exports this value.
 JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS: int = 200
+
+# --- search_memories-via-bridge call timeout (S67) -------------------------
+# The MCP child's httpx call to the bridge's POST /tools/search_memories
+# (brain/mcp_server/tools.py). Sized below the claude CLI's 60 s tool-silence
+# kill (O18) so a slow bridge call returns a distinct "bridge timeout" error
+# result instead of the whole turn being killed out from under it. A cold
+# first search on a slow CPU can legitimately take 44-60 s+ (O7/O15) — that is
+# a known, accepted consequence of this bound, not a defect.
+SEARCH_BRIDGE_TIMEOUT_S: float = 45.0

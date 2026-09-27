@@ -77,6 +77,7 @@ from brain.memory.db_health import run_fts_health_check_once
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.persona_config import PersonaConfig
+from brain.tools.dispatch import dispatch
 
 logger = logging.getLogger(__name__)
 
@@ -281,6 +282,35 @@ def _respond_blocking(
             session=sess,
             shared_files=shared_files,
             reply_to_audit_id=reply_to_audit_id,
+        )
+
+
+def _search_memories_blocking(persona_dir: Path, req: SearchMemoriesReq) -> dict:
+    """Wrap brain.tools.dispatch.dispatch("search_memories", ...) — blocks;
+    called via asyncio.to_thread.
+
+    Opens fresh per-call MemoryStore + HebbianMatrix INSIDE the worker thread
+    (H-A thread-ownership rule), same as _respond_blocking. Uses the SAME
+    dispatch() entry-point the in-process chat-engine tool loop uses, so the
+    returned dict (incl. `mode`) is byte-identical to an in-process call for
+    the same args (C1b) — this endpoint is a transport, not a second
+    implementation. The bridge's own embedder/reranker/vector-matrix
+    singletons (built once at bridge startup, S11) are what `search_memories`
+    reaches for internally; nothing model-related is built here.
+    """
+    from contextlib import ExitStack
+
+    with ExitStack() as stack:
+        store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+        stack.callback(store.close)
+        hebbian = HebbianMatrix(persona_dir / "hebbian.db")
+        stack.callback(hebbian.close)
+        return dispatch(
+            "search_memories",
+            req.model_dump(),
+            store=store,
+            hebbian=hebbian,
+            persona_dir=persona_dir,
         )
 
 
@@ -744,6 +774,22 @@ class ChatReq(BaseModel):
 
 class CloseReq(BaseModel):
     session_id: str = Field(..., min_length=36, max_length=36, pattern=r"^[0-9a-fA-F-]{36}$")
+
+
+class SearchMemoriesReq(BaseModel):
+    """Wire body for POST /tools/search_memories (INC-4, S9/S10).
+
+    Mirrors brain.tools.impls.search_memories's own LLM-facing args
+    (build_schemas) exactly — the MCP child forwards the tool call's
+    arguments dict straight into this model, unchanged.
+    """
+
+    query: str
+    emotion: str | None = None
+    limit: int = 5
+    exclude_ids: list[str] | None = None
+    mode: Literal["semantic", "lexical"] = "semantic"
+    order: Literal["relevance", "age"] = "relevance"
 
 
 class ChatHistoryEntry(BaseModel):
@@ -2559,6 +2605,12 @@ def build_app(
         return ChatHistoryResponse(
             messages=trimmed, next_before_turn=next_cursor, session_id=resolved
         )
+
+    # ── POST /tools/search_memories — bridge-resident search (INC-4, S9/S10) ──
+    @app.post("/tools/search_memories", dependencies=[Depends(require_http_auth)])
+    async def search_memories_endpoint(req: SearchMemoriesReq) -> dict[str, Any]:
+        s: BridgeAppState = app.state.bridge
+        return await asyncio.to_thread(_search_memories_blocking, s.persona_dir, req)
 
     # ── POST /chat — JSON one-shot fallback ────────────────────────────────
     @app.post("/chat", dependencies=[Depends(require_http_auth)])
