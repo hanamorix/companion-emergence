@@ -161,10 +161,19 @@ def run_pass(
         resume_cursor = job_progress.load_progress(persona_dir, _FORGETTING_PROGRESS_JOB)
         last_id = resume_cursor.get("last_id") if isinstance(resume_cursor, dict) else None
         if isinstance(last_id, str):
-            resume_idx = 0
+            # Stage-6 red-team MAJOR, fixed: the cursor's anchor row may no
+            # longer be IN `memories` on resume -- a LOSE transition
+            # hard-deletes the row (store.hard_delete, below), so an exact
+            # `m.id == last_id` search would never match and resume_idx
+            # would silently stay 0, reprocessing the WHOLE backlog. Since
+            # `memories` is a deterministic `ORDER BY id` scan, the correct
+            # resume point is keyset-style: the first row whose id sorts
+            # AFTER last_id — this is correct whether or not that exact row
+            # still exists (deleted, or merely absent for any other reason).
+            resume_idx = len(memories)
             for i, m in enumerate(memories):
-                if m.id == last_id:
-                    resume_idx = i + 1
+                if m.id > last_id:
+                    resume_idx = i
                     break
             memories = memories[resume_idx:]
 
@@ -261,10 +270,21 @@ def run_pass(
             # counters used to be saved only at pass end (module docstring's
             # own note) — so a between-items pause or a crash mid-pass loses
             # nothing and never re-applies a counter update on resume.
-            _persist_forgetting_state(persona_dir, counters)
+            # Stage-6 red-team MINOR, addressed: these are two separate
+            # atomic writes, not one atomic pair — a crash in the narrow
+            # window between them is possible. Cursor is saved FIRST so that
+            # window's failure mode is "this item's counter update is lost"
+            # (self-healing: consecutive_low_passes just takes one extra
+            # pass to reach LOST_THRESHOLD, a soft heuristic already
+            # tolerant of resets), never "double-applied" (which the
+            # opposite order would risk: an already-saved cursor is what a
+            # resume trusts to skip the item, so counters must not be
+            # written to look "not yet done" behind a cursor that already
+            # says it's done).
             job_progress.save_progress(
                 persona_dir, _FORGETTING_PROGRESS_JOB, {"last_id": memory_id}
             )
+            _persist_forgetting_state(persona_dir, counters)
             if should_pause is not None and memory is not memories[-1] and should_pause():
                 log.info("forgetting pass: pausing between memories for chat (INC-10)")
                 summary["duration_ms"] = int((time.monotonic() - start) * 1000)

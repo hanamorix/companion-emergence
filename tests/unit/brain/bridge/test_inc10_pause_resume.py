@@ -372,6 +372,81 @@ def test_c8_forgetting_pauses_between_memories_new_cursor_resumes(tmp_path: Path
     assert job_progress.load_progress(persona_dir, "forgetting") == {}
 
 
+def test_c8_forgetting_resume_cursor_survives_the_anchor_item_being_lost(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Stage-6 red-team MAJOR, regression guard: when the item the cursor
+    names underwent a LOSE transition (hard_delete -- the memory row is
+    GONE from the next pass's re-queried set), an exact `m.id == last_id`
+    search would never match, silently leaving resume_idx at 0 and
+    reprocessing the WHOLE backlog. The fix makes the cursor a keyset
+    position (first remaining id > last_id), correct whether or not that
+    exact row still exists."""
+    from brain.bridge.events import EventBus
+    from brain.forgetting import run_pass
+    from brain.memory.store import Memory, MemoryStore
+
+    # 4 memories: item 0 survives untouched (processed BEFORE the pause);
+    # item 1 is the one that gets LOST (also processed before the pause --
+    # it IS the cursor anchor); items 2/3 are only reached on resume. This
+    # shape is what actually distinguishes the fix from the bug: an
+    # exact-match cursor search that fails to find the (now-deleted) anchor
+    # falls back to resume_idx=0, which would WRONGLY re-score the
+    # already-done item 0 too -- not merely "process the same set either
+    # way", which a 2-memory version of this test can't tell apart (both
+    # the buggy and fixed logic happen to process the same remaining set
+    # when there's nothing processed before the lost anchor).
+    persona_dir = _persona(tmp_path)
+    store = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
+    ids = []
+    for i in range(4):
+        m = Memory.create_new(content=f"lose content {i}", memory_type="conversation", domain="us")
+        store.create(m)
+        ids.append(m.id)
+    ids.sort()
+    # Seed memory 1 as already "fading" with one prior low-salience pass
+    # (LOST_PASS_COUNT=2, brain/forgetting/policy.py) so THIS pass's
+    # low score pushes it straight to LOSE (hard_delete).
+    store._conn.execute("UPDATE memories SET state='fading' WHERE id=?", (ids[1],))
+    store._conn.commit()
+    store.close()
+    (persona_dir / "forgetting_state.json").write_text(json.dumps({ids[1]: 1}))
+
+    monkeypatch.setattr("brain.forgetting.policy.is_exempt", lambda *a, **kw: False)
+    monkeypatch.setattr("brain.forgetting.policy.is_within_import_grace", lambda *a, **kw: False)
+
+    scored: list[str] = []
+    import brain.forgetting.salience as salience_mod
+
+    def _score(memory, **kw):
+        scored.append(memory.id)
+        # Below LOST_THRESHOLD (0.10) for memory 1 -> LOSE this pass;
+        # comfortably above it (no transition) for the others.
+        return 0.0 if memory.id == ids[1] else 5.0
+
+    monkeypatch.setattr(salience_mod, "score", _score)
+
+    pause = _pause_on_call(2)  # pause right after item 1 (the one that gets LOST)
+    bus = EventBus()
+    run_pass(persona_dir, event_bus=bus, should_pause=pause)
+    assert scored == [ids[0], ids[1]]
+
+    store2 = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
+    remaining = {r["id"] for r in store2._conn.execute("SELECT id FROM memories").fetchall()}
+    store2.close()
+    assert ids[1] not in remaining, "item 1 must have been hard-deleted (LOSE) before the pause"
+
+    # Resume: item 1 (the cursor's own anchor) is GONE from the re-queried
+    # set -- the keyset cursor must still correctly skip past BOTH item 0
+    # (already done) and item 1 (deleted), processing only items 2/3.
+    run_pass(persona_dir, event_bus=bus)
+    assert scored == [ids[0], ids[1], ids[2], ids[3]], (
+        "resume must process exactly items 2 and 3 once each -- item 0 must "
+        "NOT be re-scored (the bug this guards: an unresolvable exact-match "
+        "cursor silently restarts the whole backlog from index 0)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # C8 — compaction (S32 row 8): pause between sessions.
 # ---------------------------------------------------------------------------
