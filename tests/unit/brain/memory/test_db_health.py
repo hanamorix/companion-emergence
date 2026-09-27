@@ -14,7 +14,6 @@ treated a lock timeout the same as real corruption).
 from __future__ import annotations
 
 import json
-import shutil
 import sqlite3
 import threading
 import time
@@ -24,11 +23,6 @@ import pytest
 
 from brain.memory import db_health
 from brain.memory.store import Memory, MemoryStore
-
-F_BOB20K = Path(
-    "/home/zero/Desktop/companion-emergence/.claude/worktrees/dragonfly-ram-spike/"
-    "changes/dragonfly-ram-spike/persona/Bob/memories.db"
-)
 
 
 def _mem(content: str) -> Memory:
@@ -293,6 +287,91 @@ def test_c37d_malformed_disk_image_logs_and_reports_rebuild_failure(tmp_home):
 
 
 # ---------------------------------------------------------------------------
+# 2026-09-27 orchestrator ruling: spec §6c/S60/S62 outranks 2-plan.md's own
+# looser "any other DatabaseError → damaged" wording. Only a genuine
+# corruption signal (the integrity-check itself reporting damage/corruption,
+# or "database disk image is malformed") may trigger a rebuild; a
+# non-corruption DatabaseError this check didn't anticipate (I/O, "unable to
+# open", permissions, ...) must be `could_not_check` — logged, no rebuild —
+# same as a lock timeout, never treated as corruption.
+# ---------------------------------------------------------------------------
+
+
+class _FakeConnRaisingOnIntegrityCheck:
+    """A minimal stand-in for `sqlite3.Connection` that raises a controlled,
+    non-corruption `DatabaseError` on the integrity-check statement, and
+    records every `execute` call so a test can assert a rebuild was never
+    attempted."""
+
+    def __init__(self, message: str) -> None:
+        self._message = message
+        self.executed: list[str] = []
+        self.in_transaction = False
+        self.closed = False
+
+    def execute(self, sql, *args):
+        self.executed.append(sql)
+        if "busy_timeout" in sql:
+            return None
+        if "integrity-check" in sql:
+            raise sqlite3.OperationalError(self._message)
+        raise AssertionError(f"unexpected execute after the integrity-check failure: {sql!r}")
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+def test_non_corruption_database_error_is_could_not_check_not_damaged():
+    """Fail-first against ef565b49 (this increment's first commit): that
+    version's catch-all `else: result, error = "damaged", msg` classified
+    ANY non-lock, non-malformed `DatabaseError` as corruption and attempted a
+    rebuild for it — this asserts the corrected behavior directly against
+    `_classify_and_run`, independent of any real OS-level error
+    reproduction (deterministic, cross-platform)."""
+    fake = _FakeConnRaisingOnIntegrityCheck("unable to open database file")
+    result, error = db_health._classify_and_run(fake)
+    assert result == "could_not_check"
+    assert error == "unable to open database file"
+    # Exactly one execute call (the integrity-check itself) — no rebuild
+    # statement was ever issued for this non-corruption error.
+    assert fake.executed == ["INSERT INTO memories_fts(memories_fts) VALUES('integrity-check')"]
+
+
+def test_non_corruption_database_error_end_to_end_logs_but_does_not_rebuild(
+    tmp_home, monkeypatch
+):
+    """Same property through the full `run_fts_health_check_once` pipeline:
+    logs `could_not_check` (not `damaged`), and the outer rebuild step in
+    `run_fts_health_check_once` is never reached (only one `execute` call:
+    the failing integrity-check itself — a `rebuild` INSERT would be a
+    second call)."""
+    persona = tmp_home.name
+    fake = _FakeConnRaisingOnIntegrityCheck("disk I/O error")
+    monkeypatch.setattr(db_health.sqlite3, "connect", lambda *a, **kw: fake)
+
+    db_health.run_fts_health_check_once(tmp_home / "memories.db")
+
+    lines = _health_log_lines(tmp_home, persona)
+    assert len(lines) == 1
+    assert lines[0]["result"] == "could_not_check"
+    assert lines[0]["error"] == "disk I/O error"
+    expected_pragma = (
+        f"PRAGMA busy_timeout = {int(db_health.dev_constants.MEMORIES_DB_BUSY_TIMEOUT_S * 1000)}"
+    )
+    assert fake.executed == [
+        expected_pragma,
+        "INSERT INTO memories_fts(memories_fts) VALUES('integrity-check')",
+    ]
+    assert fake.closed
+
+
+# ---------------------------------------------------------------------------
 # no_schema vs. legacy-persona-missing-FTS-table (code-red-team pass 1, M2):
 # a brand-new persona (no `memories` table either) is a true no-op; a legacy
 # persona whose `memories` table already has rows but predates the FTS table
@@ -399,50 +478,89 @@ def test_c34_per_turn_open_takes_no_transaction_while_a_writer_holds_one(tmp_hom
     assert elapsed <= 1.0
 
 
-@pytest.mark.skipif(not F_BOB20K.exists(), reason="F-bob20k fixture not present (local Linux only)")
-def test_c34_per_turn_open_fast_during_a_real_clustering_write(tmp_path):
-    """Same property as above, proven against a real (not synthetic-tiny)
-    long write transaction: clustering's `set_cluster_memberships` on the
-    Phoebe-sized F-bob20k fixture (2-plan §4.3 measured 6.7 s locally)."""
-    db = tmp_path / "memories.db"
-    shutil.copy(F_BOB20K, db)
-    db_health.run_fts_health_check_once(db)  # "already done" precondition
+def test_c34_per_turn_open_fast_during_a_real_clustering_write(tmp_path, monkeypatch):
+    """Same property as the synthetic-holder test above, proven against the
+    REAL, unmodified `set_cluster_memberships` write path instead of a
+    hand-rolled `BEGIN IMMEDIATE` stand-in.
 
-    probe = MemoryStore(db, integrity_check=False)
-    try:
-        ids = [row[0] for row in probe._conn.execute("SELECT id FROM memories LIMIT 20000").fetchall()]
-    finally:
-        probe.close()
+    Builds its own small fixture in `tmp_path` — no sibling-worktree fixture,
+    no fixed row count needed for timing, so this never depends on anything
+    outside the repo and never skips in CI (2026-09-27 orchestrator ruling:
+    the earlier version of this test depended on an absolute path into a
+    sibling `dragonfly-ram-spike` worktree that CI does not have). Instead of
+    racing a wall-clock sleep against however long a real write happens to
+    take on a given machine, this brackets the writer's OWN transaction via a
+    `sqlite3.Connection` subclass that blocks in `commit()` — every real
+    UPDATE/DELETE/INSERT `set_cluster_memberships` issues has already
+    executed and the write lock is genuinely held — until the reader has had
+    its chance to open, independent of row count or CPU speed.
+    (`sqlite3.Connection` is an immutable builtin type — its `commit` method
+    can't be monkeypatched directly, hence the subclass + `factory=` seam.)
+    """
     import numpy as np
 
-    memberships = {mid: i % 8 for i, mid in enumerate(ids)}
-    centroids = np.random.default_rng(0).random((8, 1024)).astype(np.float32)
+    db = tmp_path / "memories.db"
+    store = MemoryStore(db)
+    ids = []
+    for i in range(200):
+        m = _mem(f"synthetic memory {i}")
+        store.create(m)
+        ids.append(m.id)
+    store.close()
+    db_health.run_fts_health_check_once(db)  # "already done" precondition
 
-    done = threading.Event()
+    memberships = {mid: i % 4 for i, mid in enumerate(ids)}
+    centroids = np.random.default_rng(0).random((4, 8)).astype(np.float32)
+
     started = threading.Event()
+    proceed = threading.Event()
+    done = threading.Event()
+    target_conn: list[sqlite3.Connection] = []
+
+    class _BlockingConnection(sqlite3.Connection):
+        def commit(self):
+            # Only the WRITER's own connection blocks here — the reader's
+            # (and the writer's own constructor-time schema-DDL) commits
+            # must pass through untouched, or this test would
+            # deadlock/misattribute.
+            if target_conn and target_conn[0] is self:
+                started.set()
+                proceed.wait(timeout=5)
+            return super().commit()
+
+    real_connect = sqlite3.connect
+
+    def connect_with_blocking_factory(*args, **kwargs):
+        kwargs.setdefault("factory", _BlockingConnection)
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", connect_with_blocking_factory)
 
     def _run_clustering():
         # A fresh MemoryStore/connection — sqlite3 connections cannot cross
         # threads, so the writer opens its own inside the thread it runs on.
         writer_store = MemoryStore(db, integrity_check=False)
+        target_conn.append(writer_store._conn)
         try:
-            started.set()
             writer_store.set_cluster_memberships(memberships, centroids, model_id="test-model")
         finally:
+            target_conn.clear()
             writer_store.close()
         done.set()
 
     t = threading.Thread(target=_run_clustering)
     t.start()
-    started.wait(timeout=5)
-    time.sleep(0.05)  # let the write actually begin
+    assert started.wait(timeout=5), (
+        "the writer's real commit should have been reached (and blocked) within 5s"
+    )
 
     t0 = time.time()
     reader = MemoryStore(db, integrity_check=False)
     elapsed = time.time() - t0
     reader.close()
 
-    t.join(timeout=30)
+    proceed.set()
+    t.join(timeout=5)
 
     assert done.is_set(), "clustering write should have completed within the join timeout"
     assert elapsed <= 1.0

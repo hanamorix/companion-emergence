@@ -50,6 +50,32 @@ _checked_paths: set[Path] = set()
 _REBUILD_ON = {"damaged", "malformed", "count_mismatch"}
 
 
+def _classify_error_message(msg: str) -> str:
+    """Map a `DatabaseError` message to a health-check outcome.
+
+    Spec §6c / S60 (the spec, which outranks 2-plan.md's own looser "any
+    other DatabaseError" wording — orchestrator ruling 2026-09-27): only a
+    genuine corruption signal may trigger a rebuild — the FTS5
+    integrity-check itself reporting damage/corruption, or a "database disk
+    image is malformed" error. A lock timeout ("database is locked"/"busy")
+    is `could_not_check` per S60. Anything ELSE — an environmental or
+    unexpected error this check didn't anticipate (permissions, I/O, "unable
+    to open database file", a future SQLite error string not seen here) —
+    is ALSO `could_not_check`, never corruption: rebuilding the FTS index in
+    response to an error that has nothing to do with the FTS index's own
+    integrity is the exact over-broad-`except sqlite3.DatabaseError`
+    conflation this increment exists to fix, just for a different error
+    family than the lock-timeout one S60 names explicitly. `could_not_check`
+    is always safe to fall back to: it changes nothing and is retried at the
+    next process start (S60)."""
+    low = msg.lower()
+    if "malformed" in low:
+        return "malformed"
+    if "corrupt" in low:
+        return "damaged"
+    return "could_not_check"
+
+
 def _log_health_event(persona: str, result: str, error: str | None) -> None:
     """Append one JSON line to the persona's db-health log (S62). Append-only,
     never rotated by this change; a failure to write is logged, not raised —
@@ -102,7 +128,8 @@ def _create_and_backfill_fts(conn: sqlite3.Connection) -> tuple[str, str | None]
         conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
     except sqlite3.DatabaseError as exc:
         _end_txn(conn)
-        return "damaged", str(exc)
+        msg = str(exc)
+        return _classify_error_message(msg), msg
     _end_txn(conn)
     return "fts_missing_backfilled", None
 
@@ -141,14 +168,12 @@ def _classify_and_run(conn: sqlite3.Connection) -> tuple[str, str | None]:
                 result, error = "no_schema", None
             else:
                 result, error = _create_and_backfill_fts(conn)
-        elif "locked" in low or "busy" in low:
-            # A lock timeout means "could not check this time" — never
-            # corruption (the bug this increment fixes, S60).
-            result, error = "could_not_check", msg
-        elif "malformed" in low:
-            result, error = "malformed", msg
         else:
-            result, error = "damaged", msg
+            # A lock timeout, or any other non-corruption error, is
+            # `could_not_check` — never corruption (S60; see
+            # `_classify_error_message`'s docstring for why the catch-all
+            # case is could_not_check, not "damaged").
+            result, error = _classify_error_message(msg), msg
         _end_txn(conn)
         return result, error
 
@@ -160,7 +185,8 @@ def _classify_and_run(conn: sqlite3.Connection) -> tuple[str, str | None]:
         fts_rows = conn.execute("SELECT COUNT(*) FROM memories_fts_docsize").fetchone()[0]
     except sqlite3.DatabaseError as exc:
         _end_txn(conn)
-        return "damaged", str(exc)
+        msg = str(exc)
+        return _classify_error_message(msg), msg
 
     _end_txn(conn)
     if mem_rows != fts_rows:
