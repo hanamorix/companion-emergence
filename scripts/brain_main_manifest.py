@@ -10,7 +10,8 @@ build with an older commit.
 Raising MIN_BUNDLE_VERSION is how a future non-additive persisted-state change
 stops older apps from taking `main` builds (spec §7).
 
-Stdlib only at module level: CI's signing job runs this with a bare python3.
+Stdlib only at module level: CI's publish job runs this with a bare python3
+(needs Python >= 3.11 for datetime.UTC; ubuntu-latest ships 3.12).
 """
 
 from __future__ import annotations

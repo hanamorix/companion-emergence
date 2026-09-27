@@ -17,13 +17,17 @@ on:
     types: [completed]
     branches: [main]
   pull_request:
-    branches: [main]
     paths:
       - .github/workflows/brain-main.yml
       - scripts/brain_main_manifest.py
       - scripts/verify_update_signature.sh
       - scripts/smoke_test_wheel.sh
       - brain/update/install.py
+      - app/package.json
+      - app/pnpm-lock.yaml
+      - uv.lock
+      - pyproject.toml
+      - brain/update/**
   workflow_dispatch:
     inputs:
       tag:
@@ -33,10 +37,6 @@ on:
 
 permissions:
   contents: read
-
-concurrency:
-  group: brain-main-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
-  cancel-in-progress: false
 
 jobs:
   build:
@@ -98,17 +98,20 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - name: Refuse a manual publish onto the user channel
-        if: github.event_name == 'workflow_dispatch' && inputs.tag == 'brain-main'
+      - name: Refuse a dispatch outside brain-main-* test tags or off main
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          TAG_IN: ${{ inputs.tag }}
         run: |
-          echo "::error::workflow_dispatch publishes to a test tag; brain-main only takes CI-gated main commits"
-          exit 1
+          if [ "$GITHUB_REF" != "refs/heads/main" ] || ! [[ "$TAG_IN" =~ ^brain-main-[a-z0-9-]+$ ]]; then
+            echo "::error::workflow_dispatch requires main and a tag matching ^brain-main-[a-z0-9-]+\$, got ref=$GITHUB_REF tag=$TAG_IN"
+            exit 1
+          fi
 
       - name: Checkout
         uses: actions/checkout@v6
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}  # same commit as build
-          fetch-depth: 0  # should-publish walks history
 
       - name: Download build
         uses: actions/download-artifact@v7
@@ -133,24 +136,24 @@ jobs:
 
       - name: Tauri CLI (for `tauri signer`)
         working-directory: app
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile --ignore-scripts
 
       - name: Sign (throwaway key — pull_request)
         if: github.event_name == 'pull_request'
         working-directory: app
         run: |
           pnpm -s tauri signer generate --ci -p throwaway -w "$RUNNER_TEMP/pr.key" >/dev/null
-          pnpm -s tauri signer sign -k "$(cat "$RUNNER_TEMP/pr.key")" -p throwaway ../dist/manifest.json >/dev/null
+          TAURI_SIGNING_PRIVATE_KEY="$(cat "$RUNNER_TEMP/pr.key")" TAURI_SIGNING_PRIVATE_KEY_PASSWORD=throwaway pnpm -s tauri signer sign ../dist/manifest.json >/dev/null
           echo "PUBKEY=$(tr -d '\n' < "$RUNNER_TEMP/pr.key.pub")" >> "$GITHUB_ENV"
 
       - name: Sign (updater key)
         if: github.event_name != 'pull_request'
         working-directory: app
         env:
-          SIGN_KEY: ${{ secrets.TAURI_UPDATER_PRIVATE_KEY }}
-          SIGN_PASSWORD: ${{ secrets.TAURI_UPDATER_KEY_PASSWORD }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_UPDATER_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_UPDATER_KEY_PASSWORD }}
         run: |
-          pnpm -s tauri signer sign -k "$SIGN_KEY" -p "$SIGN_PASSWORD" ../dist/manifest.json >/dev/null
+          pnpm -s tauri signer sign ../dist/manifest.json >/dev/null
           echo "PUBKEY=$(jq -r .plugins.updater.pubkey src-tauri/tauri.conf.json)" >> "$GITHUB_ENV"
 
       - name: Verify the signature against the app's pubkey
@@ -187,11 +190,26 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    concurrency:
+      group: brain-main-publish-${{ github.event_name == 'workflow_dispatch' && inputs.tag || 'brain-main' }}
+      cancel-in-progress: false
     env:
       TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || 'brain-main' }}
       SHA: ${{ needs.build.outputs.commit }}
       GH_TOKEN: ${{ github.token }}
     steps:
+      - name: Re-check the target tag
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ "$TAG" = "brain-main" ] || ! [[ "$TAG" =~ ^brain-main-[a-z0-9-]+$ ]]; then
+              echo "::error::dispatch tag $TAG is not on the brain-main-* allow-list"
+              exit 1
+            fi
+          elif [ "$TAG" != "brain-main" ]; then
+            echo "::error::non-dispatch publish target must be exactly brain-main, got $TAG"
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v6
         with:
@@ -231,4 +249,4 @@ jobs:
           gh release view "$TAG" --json assets -q '.assets[].name' | while read -r name; do
             grep -qxF "$name" <<<"$keep" || gh release delete-asset "$TAG" "$name" -y
           done
-          gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" -f sha="$SHA" -F force=true >/dev/null
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" -f sha="$SHA" -F force=true >/dev/null || echo "::warning::could not move tag $TAG to $SHA (assets are published; only the tag position is stale)"
