@@ -118,3 +118,16 @@ def test_bundle_id_changes_with_requirements_or_wheel(tmp_path):
     assert one != overlay_hook.compute_bundle_id(req, "companion_emergence-0.0.43-py3-none-any.whl")
     req.write_text("a==2\n", encoding="utf-8")
     assert one != overlay_hook.compute_bundle_id(req, "companion_emergence-0.0.42-py3-none-any.whl")
+
+
+def test_dir_that_is_not_a_plain_name_is_ignored(tmp_path):
+    outside = tmp_path / "outside"
+    (outside / "demo_pkg").mkdir(parents=True)
+    (outside / "demo_pkg" / "__init__.py").write_text("WHERE = 'outside'\n", encoding="utf-8")
+    for bad in (str(outside), "../outside", "..", ".", "a/b", "a\\b", ""):
+        world = tmp_path / f"w{abs(hash(bad))}"
+        world.mkdir()
+        state = json.dumps({"active": {"dir": bad, "commit": "c", "brain_version": "0.0.42",
+                                       "bundle_id": "bundle-1"}, "previous": None})
+        site, home = _world(world, state=state)
+        assert _where(site, home)[0] == "bundle", bad

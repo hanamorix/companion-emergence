@@ -8,7 +8,8 @@ bundle's site-packages, so its packages (and `brain`) win.
 
 MUST NOT import `brain` (the bundle's copy would be pinned in sys.modules before
 the overlay is on the path) and MUST NOT raise: any problem means "no overlay",
-i.e. the release brain runs. Imports: stdlib, plus platformdirs lazily.
+i.e. the release brain runs. Imports: stdlib (hashlib, json, os, re, shutil, sys,
+pathlib), plus platformdirs lazily.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -24,6 +26,7 @@ HOOK_MODULE = "_ce_overlay"
 BUNDLE_ID_FILE = "_ce_bundle_id"
 PTH_LINE = "import _ce_overlay; _ce_overlay.activate(_ce_overlay.SITE)\n"
 SITE = Path(__file__).parent
+_PLAIN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 def home() -> Path:
@@ -46,8 +49,11 @@ def activate(site_dir: Path) -> str | None:
         bundle_id = (Path(site_dir) / BUNDLE_ID_FILE).read_text(encoding="utf-8").strip()
         if not bundle_id or active.get("bundle_id") != bundle_id:
             return None
-        folder = root / str(active.get("dir", ""))
-        if not active.get("dir") or not folder.is_dir():
+        name = active.get("dir")
+        if not isinstance(name, str) or not _PLAIN_NAME.fullmatch(name) or name in (".", ".."):
+            return None
+        folder = root / name
+        if not folder.is_dir():
             return None
         site_real = os.path.realpath(site_dir)
         index = next((i for i, p in enumerate(sys.path) if os.path.realpath(p) == site_real), None)
