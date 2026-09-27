@@ -7,10 +7,16 @@
 # Works for both install kinds reported by `nell paths install_kind` (or, on a
 # nell older than that key, by the python3 beside it — #285):
 #   source  — the install IS a git checkout: git pull --ff-only + uv sync.
-#   bundled — a desktop-app python-runtime: build a wheel from the source
-#             tree and install it (plus locked deps) into that runtime,
-#             mirroring app/build_python_runtime.sh steps 3-5. Keep the two
-#             in sync by hand; bash cannot share the recipe safely.
+#   bundled — a desktop-app python-runtime. Two paths, picked by `nell update
+#             --status` (#286):
+#     overlay (bundles that support it) — build a wheel, then `nell update`
+#             installs it into the user-writable overlay next to the runtime.
+#             No runtime rewrite, no sudo, regardless of who owns the runtime.
+#     legacy  (older bundles, no overlay support — #289) — build a wheel from
+#             the source tree and install it (plus locked deps) straight into
+#             the runtime, mirroring app/build_python_runtime.sh steps 3-5.
+#             Keep the two in sync by hand; bash cannot share the recipe
+#             safely. May need sudo if the runtime isn't user-writable.
 #
 # Windows: not supported (the bundled runtime ships no bash) — see #255.
 #
@@ -119,8 +125,9 @@ fi
 # Bundles with the overlay hook (#286 slice 2) update into the user-writable
 # overlay; older nells have no `update` command and keep the legacy path (#289).
 OVERLAY=0
-if [ "$INSTALL_KIND" = "bundled" ] && "$NELL" update --status 2>/dev/null | grep -q '"supported": true'; then
-  OVERLAY=1
+if [ "$INSTALL_KIND" = "bundled" ]; then
+  STATUS="$("$NELL" update --status 2>/dev/null || true)"
+  case "$STATUS" in *'"supported": true'*) OVERLAY=1;; esac
 fi
 
 run() {
@@ -220,6 +227,11 @@ else
   run sh -c "cd '$SRC_TREE' && uv export --format requirements-txt --no-dev --no-emit-project --locked --quiet --output-file dist/requirements.txt"
   if [ "$OVERLAY" = 1 ]; then
     COMMIT="$(git -C "$SRC_TREE" rev-parse HEAD 2>/dev/null || echo "local-$(date +%Y%m%d%H%M%S)")"
+    # An uncommitted edit in $SRC_TREE must not reuse the last clean build's label
+    # (the overlay installer stamp-matches on it and would skip reinstalling).
+    if [ -n "$(git -C "$SRC_TREE" status --porcelain 2>/dev/null)" ]; then
+      COMMIT="$COMMIT-dirty-$(date +%Y%m%d%H%M%S)"
+    fi
     run sh -c "'$NELL' update --wheel \"\$(ls '$SRC_TREE'/dist/*.whl | head -n1)\" --requirements '$SRC_TREE/dist/requirements.txt' --commit '$COMMIT'"
   else
     PY_BIN="$INSTALL_ROOT/bin/python3"

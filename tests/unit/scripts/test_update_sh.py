@@ -208,6 +208,69 @@ def test_overlay_capable_bundle_updates_the_overlay_without_sudo(tmp_path):
     assert "sudo" not in joined and "nell.orig" not in joined
 
 
+def test_clean_non_git_source_gets_a_local_commit_label(tmp_path):
+    """The non-git-tree fallback label's shape (also covers deferred minor T6b)."""
+    root = _bundled_root(tmp_path / "python-runtime")
+    src = _src(tmp_path)
+    shim = _overlay_shim(tmp_path, root, supported=True)
+    cp = _run("--nell", str(shim), "--persona", "p", "--dry-run", "--source", str(src))
+    assert cp.returncode == 0, cp.stderr
+    joined = "\n".join(_plan(cp))
+    m = re.search(r"--commit '([^']+)'", joined)
+    assert m, joined
+    assert re.fullmatch(r"local-\d{14}", m.group(1)), m.group(1)
+
+
+def test_dirty_source_tree_gets_a_dirty_commit_label(tmp_path):
+    """A --source tree with uncommitted edits must NOT be labelled with plain
+    `git rev-parse HEAD` — that label would match a prior clean-tree install's stamp
+    and the overlay installer would skip reinstalling (final-review finding 2)."""
+    root = _bundled_root(tmp_path / "python-runtime")
+    src = _src(tmp_path)
+    subprocess.run(["git", "init", "-q"], cwd=src, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t.test", "-c", "user.name=t", "add", "."], cwd=src, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t.test", "-c", "user.name=t", "commit", "-q", "-m", "init"],
+                   cwd=src, check=True)
+    (src / "pyproject.toml").write_text('version = "0.0.43"\n', encoding="utf-8")  # uncommitted edit
+
+    shim = _overlay_shim(tmp_path, root, supported=True)
+    cp = _run("--nell", str(shim), "--persona", "p", "--dry-run", "--source", str(src))
+    assert cp.returncode == 0, cp.stderr
+    joined = "\n".join(_plan(cp))
+    m = re.search(r"--commit '([^']+)'", joined)
+    assert m, joined
+    assert re.fullmatch(r"[0-9a-f]{40}-dirty-\d{14}", m.group(1)), m.group(1)
+
+
+def test_status_nonzero_exit_with_supported_true_still_uses_the_overlay(tmp_path):
+    """T6: under `set -o pipefail`, `nell update --status | grep -q ...` reports the
+    pipeline's exit status as nell's own (nonzero) even when grep found a match — so
+    a `--status` call that both prints supported:true AND exits nonzero (e.g. some
+    unrelated warning path) would wrongly fall back to the legacy sudo path. Capture
+    stdout first, then match on the captured string, so nell's own exit code can't
+    flip the decision."""
+    root = _bundled_root(tmp_path / "python-runtime")
+    src = _src(tmp_path)
+    shim = tmp_path / "bin" / "nell"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_text(
+        "#!/bin/sh\n"
+        'case "$1 $2" in\n'
+        f"  'paths install_root') echo '{root}';;\n"
+        "  'paths install_kind') echo bundled;;\n"
+        f"  'paths persona_dir') echo '{tmp_path}';;\n"
+        "  'update --status') printf '{\"supported\": true, \"install_kind\": \"bundled\"}\\n'; exit 1;;\n"
+        "  '--version ') echo 'companion-emergence 0.0.42';;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    shim.chmod(shim.stat().st_mode | stat.S_IEXEC)
+    cp = _run("--nell", str(shim), "--persona", "p", "--dry-run", "--source", str(src))
+    assert cp.returncode == 0, cp.stderr
+    joined = "\n".join(_plan(cp))
+    assert " update --wheel" in joined and "nell.orig" not in joined
+
+
 def test_bundle_without_overlay_support_keeps_the_legacy_path(tmp_path):
     root = _bundled_root(tmp_path / "python-runtime")
     src = _src(tmp_path)
@@ -324,6 +387,17 @@ def test_help_prints_the_whole_header():
     assert cp.returncode == 0
     assert cp.stdout.rstrip().endswith("executes nothing past preflight.")
     assert "set -euo" not in cp.stdout
+
+
+def test_help_describes_the_overlay_path_and_the_legacy_fallback():
+    cp = _run("--help")
+    assert cp.returncode == 0
+    out = cp.stdout
+    assert "overlay" in out.lower()
+    assert "no sudo" in out.lower() or "no runtime rewrite" in out.lower()
+    assert "#286" in out or "#289" in out  # overlay path reference
+    assert "#289" in out  # older bundles keep the legacy path
+    assert "#255" in out  # Windows still unsupported
 
 
 def test_nell_runs_from_a_neutral_cwd_even_from_a_checkout(tmp_path):
