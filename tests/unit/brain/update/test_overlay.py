@@ -50,6 +50,18 @@ def test_rollback_restores_previous(tmp_path):
     assert overlay.read_state(tmp_path) == {"active": ENTRY_A, "previous": None}
 
 
+def test_rollback_without_previous_reverts_and_keeps_the_overlay(tmp_path):
+    """ToT's #305 review: rolling back from the only overlay must land on the release
+    brain (spec §6: the app's first-update recovery) without dropping that overlay —
+    otherwise the next prune deletes it."""
+    (tmp_path / ENTRY_A["dir"]).mkdir()
+    overlay.activate(tmp_path, ENTRY_A)
+    overlay.rollback(tmp_path)
+    assert overlay.read_state(tmp_path) == {"active": None, "previous": ENTRY_A}
+    overlay.prune(tmp_path)
+    assert (tmp_path / ENTRY_A["dir"]).is_dir()
+
+
 def test_corrupt_or_non_object_state_reads_as_no_overlay(tmp_path):
     (tmp_path / "current.json").write_text("[1, 2]", encoding="utf-8")
     assert overlay.read_state(tmp_path) == {"active": None, "previous": None}

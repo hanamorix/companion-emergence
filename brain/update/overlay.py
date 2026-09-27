@@ -62,7 +62,13 @@ def revert(root: Path) -> None:
 
 
 def rollback(root: Path) -> None:
-    _write_state(root, read_state(root)["previous"], None)
+    state = read_state(root)
+    if state["previous"] is None:
+        # nothing older to go back to: the release brain, keeping this overlay as the
+        # rollback target so prune doesn't delete it
+        revert(root)
+        return
+    _write_state(root, state["previous"], None)
 
 
 def prune(root: Path) -> None:
