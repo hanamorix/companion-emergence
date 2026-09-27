@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -1794,7 +1795,8 @@ def _update_handler(args: argparse.Namespace) -> int:
                 print(f"nell update: no bash updater for this install ({script})", file=sys.stderr)
                 return 2
             rest = [a for a in args.script_args if a != "--"]
-            os.execv("/bin/bash", ["bash", str(script), *rest])
+            bash = shutil.which("bash") or "/bin/bash"  # NixOS has no /bin/bash
+            os.execv(bash, ["bash", str(script), *rest])
             return 0
         if not (args.wheel and args.requirements and args.commit):
             print("nell update: pass --wheel, --requirements and --commit "
@@ -1802,7 +1804,7 @@ def _update_handler(args: argparse.Namespace) -> int:
             return 2
         entry = install.apply_update(wheel=args.wheel, requirements=args.requirements,
                                      commit=args.commit, site_dir=site, root=root)
-    except (install.UpdateError, overlay.OverlayBusy) as exc:
+    except (install.UpdateError, overlay.OverlayBusy, OSError) as exc:
         print(f"nell update: {exc}", file=sys.stderr)
         return 1
     print(json.dumps(entry, indent=2))
@@ -3234,7 +3236,11 @@ def _build_parser() -> argparse.ArgumentParser:
     update_sub.add_argument("--commit", help="Commit the wheel was built from (names the overlay folder).")
     update_mode = update_sub.add_mutually_exclusive_group()
     update_mode.add_argument("--status", action="store_true", help="Print the overlay state as JSON.")
-    update_mode.add_argument("--revert", action="store_true", help="Use the release brain again.")
+    update_mode.add_argument(
+        "--revert", action="store_true",
+        help="Use the release brain again. If the overlay brain can't start, run with "
+        "KINDLED_NO_OVERLAY=1 first.",
+    )
     update_mode.add_argument("--rollback", action="store_true", help="Go back to the previous overlay.")
     update_sub.add_argument("script_args", nargs=argparse.REMAINDER,
                             help="Source installs: arguments passed to scripts/update.sh (after --).")

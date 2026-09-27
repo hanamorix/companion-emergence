@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import shutil
+
+import pytest
 
 from brain import cli
 from brain.update import overlay
@@ -31,6 +34,24 @@ def test_revert_and_rollback(tmp_path, monkeypatch, capsys):
     assert overlay.read_state(root) == {"active": None, "previous": _entry("aaaa")}
 
 
+def test_revert_help_mentions_the_no_overlay_escape_hatch(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["update", "--help"])
+    assert "KINDLED_NO_OVERLAY" in capsys.readouterr().out
+
+
+def test_revert_works_with_kindled_no_overlay_set(tmp_path, monkeypatch, capsys):
+    """KINDLED_NO_OVERLAY is a hook-activation escape hatch, not a CLI gate: --revert
+    must still clear the active overlay when it's set (the documented recovery path
+    for a bundle whose overlay brain can't start)."""
+    monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
+    monkeypatch.setenv("KINDLED_NO_OVERLAY", "1")
+    root = overlay.overlay_root()
+    overlay.activate(root, _entry("aaaa"))
+    assert cli.main(["update", "--revert"]) == 0
+    assert overlay.read_state(root) == {"active": None, "previous": _entry("aaaa")}
+
+
 def test_bundled_without_wheel_args_is_a_usage_error(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
     monkeypatch.setattr(cli, "_install_kind", lambda: "bundled")
@@ -43,9 +64,31 @@ def test_source_install_execs_update_sh_with_passthrough_args(tmp_path, monkeypa
     calls = []
     monkeypatch.setattr(cli.os, "execv", lambda path, argv: calls.append((path, argv)) or 0)
     cli.main(["update", "--", "--persona", "nell", "--dry-run"])
-    assert calls and calls[0][0] == "/bin/bash"
+    assert calls and calls[0][0] == (shutil.which("bash") or "/bin/bash")
     assert calls[0][1][1].endswith("scripts/update.sh") or calls[0][1][1].endswith("scripts\\update.sh")
     assert calls[0][1][2:] == ["--persona", "nell", "--dry-run"]
+
+
+def test_source_install_falls_back_to_bin_bash_when_bash_is_not_on_path(tmp_path, monkeypatch):
+    """NixOS has no /bin/bash; shutil.which must be tried first (T4)."""
+    monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
+    calls = []
+    monkeypatch.setattr(cli.os, "execv", lambda path, argv: calls.append((path, argv)) or 0)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/bin/bash" if name == "bash" else None)
+    cli.main(["update", "--", "--dry-run"])
+    assert calls and calls[0][0] == "/usr/bin/bash"
+
+
+def test_oserror_from_the_overlay_lock_is_reported_not_a_traceback(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
+
+    def boom(src, dst, *a, **kw):
+        raise OSError("no hard links on this filesystem")
+
+    monkeypatch.setattr(overlay.os, "link", boom)
+    rc = cli.main(["update", "--revert"])
+    assert rc == 1
+    assert "nell update:" in capsys.readouterr().err
 
 
 def test_bundled_update_failure_exits_1_and_says_why(tmp_path, monkeypatch, capsys):
