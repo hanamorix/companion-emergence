@@ -112,3 +112,50 @@ def test_write_cli_exits_1_with_a_reason(tmp_path, capsys):
     assert rc == 1
     assert "brain_main_manifest: unrecognised requirement line" in capsys.readouterr().err
     assert not (tmp_path / "m.json").exists()
+
+
+OLD, NEW = "1" * 40, "2" * 40
+
+
+@pytest.mark.parametrize(("ours", "published", "ancestor", "expected"), [
+    (NEW, None, False, True),   # nothing published yet
+    (NEW, NEW, False, False),   # same commit
+    (OLD, NEW, True, False),    # ours is older than what is published
+    (NEW, OLD, False, True),    # ours supersedes it, or history was rewritten
+])
+def test_should_publish_decision(ours, published, ancestor, expected):
+    ok, why = bm.should_publish(ours, published, lambda a, b: ancestor)
+    assert ok is expected and why
+
+
+def _git(repo, *args):
+    import subprocess
+    return subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
+                          cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
+
+
+def test_should_publish_cli_walks_real_history(tmp_path, monkeypatch, capsys):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "one")
+    older = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "two")
+    newer = _git(repo, "rev-parse", "HEAD")
+    monkeypatch.chdir(repo)
+    published = tmp_path / "published.json"
+
+    def run(ours, content):
+        if content is None:
+            published.unlink(missing_ok=True)
+        else:
+            published.write_text(content, encoding="utf-8")
+        assert bm.main(["should-publish", "--ours", ours, "--published", str(published)]) == 0
+        return capsys.readouterr().out.strip()
+
+    assert run(older, json.dumps({"commit": newer})) == "publish=false"  # CI finished out of order
+    assert run(newer, json.dumps({"commit": newer})) == "publish=false"
+    assert run(newer, json.dumps({"commit": older})) == "publish=true"
+    assert run(newer, json.dumps({"commit": "f" * 40})) == "publish=true"  # history rewritten
+    assert run(newer, "{not json") == "publish=true"
+    assert run(newer, None) == "publish=true"

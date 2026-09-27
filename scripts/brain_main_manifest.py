@@ -4,6 +4,9 @@
 `write`: the manifest the app verifies (signature → manifest → file hashes)
 before it downloads anything.
 
+`should-publish`: CI runs can finish out of order — never replace a published
+build with an older commit.
+
 Raising MIN_BUNDLE_VERSION is how a future non-additive persisted-state change
 stops older apps from taking `main` builds (spec §7).
 
@@ -16,7 +19,9 @@ import argparse
 import hashlib
 import json
 import re
+import subprocess
 import sys
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -60,6 +65,30 @@ def build_manifest(*, wheel: Path, requirements: Path, commit: str, built_at: da
     }
 
 
+def should_publish(ours: str, published: str | None,
+                   is_ancestor: Callable[[str, str], bool]) -> tuple[bool, str]:
+    if not published:
+        return True, "nothing published yet"
+    if ours == published:
+        return False, f"{ours[:12]} is already published"
+    if is_ancestor(ours, published):
+        return False, f"{ours[:12]} is older than the published {published[:12]}"
+    return True, f"{ours[:12]} supersedes {published[:12]}"
+
+
+def git_is_ancestor(a: str, b: str) -> bool:
+    # 0 = ancestor, 1 = not; 128 (a commit unknown after a history rewrite) → not, so we publish
+    return subprocess.run(["git", "merge-base", "--is-ancestor", a, b],
+                          capture_output=True).returncode == 0
+
+
+def _published_commit(path: Path | None) -> str | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8")).get("commit") or None
+    except (AttributeError, OSError, ValueError):  # none, unreadable, or corrupt → republish
+        return None
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="brain-main manifest (#286 slice 3)")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -68,7 +97,16 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--requirements", type=Path, required=True)
     w.add_argument("--commit", required=True)
     w.add_argument("--out", type=Path, required=True)
+    s = sub.add_parser("should-publish", help="is --ours newer than the published manifest?")
+    s.add_argument("--ours", required=True)
+    s.add_argument("--published", type=Path)
     args = p.parse_args(argv)
+
+    if args.cmd == "should-publish":
+        ok, why = should_publish(args.ours, _published_commit(args.published), git_is_ancestor)
+        print(f"publish={'true' if ok else 'false'}")
+        print(f"brain_main_manifest: {why}", file=sys.stderr)
+        return 0
 
     try:
         manifest = build_manifest(wheel=args.wheel, requirements=args.requirements,
