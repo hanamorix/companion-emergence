@@ -76,6 +76,7 @@ from brain.ingest.buffer import _SESSION_ID_RE as _BUFFER_SESSION_ID_RE
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.persona_config import PersonaConfig
+from brain.update.overlay import loaded_overlay
 
 logger = logging.getLogger(__name__)
 
@@ -1244,6 +1245,10 @@ def build_app(
         else:
             sup_status = "dead"
 
+        # #286: which brain-main overlay THIS process runs (None = the release
+        # brain). The app's version handshake accepts a newer overlay brain.
+        running = loaded_overlay()
+
         return {
             "liveness": "ok",
             "version": _brain_version,
@@ -1260,6 +1265,8 @@ def build_app(
             # #246: the brain's CLI login state — "expired" means background LLM
             # calls are backed off and the app should offer re-authorisation.
             "provider_auth": provider_auth.state(),
+            "overlay": None if running is None else {
+                "commit": running["commit"], "brain_version": running["brain_version"]},
         }
 
     @app.post(

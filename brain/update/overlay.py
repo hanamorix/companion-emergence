@@ -41,6 +41,27 @@ def read_state(root: Path) -> dict:
     return {"active": data.get("active") or None, "previous": data.get("previous") or None}
 
 
+def loaded_overlay() -> dict | None:
+    """The overlay THIS interpreter loaded `brain` from — read from that folder's
+    stamp, not current.json, because an install swapped in after start is not what
+    is running. None when `brain` comes from the bundle (or a checkout)."""
+    import brain
+
+    root = overlay_root().resolve()
+    try:
+        rel = Path(brain.__file__).resolve().relative_to(root)
+    except ValueError:
+        return None
+    folder = rel.parts[0]
+    try:
+        stamp = json.loads((root / folder / "stamp.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        stamp = None
+    if not isinstance(stamp, dict):
+        stamp = {}
+    return {"dir": folder, "commit": stamp.get("commit"), "brain_version": stamp.get("brain_version")}
+
+
 def _write_state(root: Path, active: dict | None, previous: dict | None) -> None:
     root.mkdir(parents=True, exist_ok=True)
     tmp = root / f"{STATE_FILE}.tmp"

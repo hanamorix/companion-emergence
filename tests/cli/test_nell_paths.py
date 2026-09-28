@@ -145,3 +145,24 @@ def test_install_kind_detects_bundled(monkeypatch, tmp_path):
     assert _install_kind() == "bundled"
     (tmp_path / "site-packages" / "pyproject.toml").write_text("", encoding="utf-8")
     assert _install_kind() == "source"
+
+
+def test_paths_overlay_keys(tmp_path):
+    _setup_persona(tmp_path)
+    result = _nell(tmp_path, "paths", "--json")
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert Path(payload["overlay_dir"]["path"]).name == "brain-overlay"
+    assert payload["overlay_active"]["path"] == "none"  # no overlay installed
+
+
+def test_paths_overlay_active_names_the_current_folder(monkeypatch, tmp_path):
+    from brain.cli import _paths_for_persona
+    from brain.update import overlay
+
+    monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
+    overlay.activate(overlay.overlay_root(), {"dir": "abc123def456-0123abcd", "commit": "a" * 40,
+                                             "brain_version": "0.0.43", "bundle_id": "b"})
+    _setup_persona(tmp_path)
+    paths = _paths_for_persona("testpersona")
+    assert paths["overlay_active"] == overlay.overlay_root() / "abc123def456-0123abcd"

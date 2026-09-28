@@ -125,3 +125,40 @@ def test_release_leaves_a_lock_another_process_now_owns(tmp_path):
     with overlay.overlay_lock(tmp_path):
         (tmp_path / ".lock").write_text("424242", encoding="utf-8")  # someone else took it over
     assert (tmp_path / ".lock").read_text(encoding="utf-8") == "424242"
+
+
+def test_loaded_overlay_is_none_for_the_bundle_brain(tmp_path, monkeypatch):
+    import brain
+
+    monkeypatch.setenv("KINDLED_HOME", str(tmp_path / "home"))
+    pkg = tmp_path / "site-packages" / "brain"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    monkeypatch.setattr(brain, "__file__", str(pkg / "__init__.py"))
+    assert overlay.loaded_overlay() is None
+
+
+def _brain_in_overlay(tmp_path, monkeypatch, stamp):
+    import brain
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("KINDLED_HOME", str(home))
+    folder = overlay.overlay_root() / "abc123def456-0123abcd"
+    (folder / "brain").mkdir(parents=True)
+    (folder / "brain" / "__init__.py").write_text("", encoding="utf-8")
+    if stamp is not None:
+        (folder / "stamp.json").write_text(stamp, encoding="utf-8")
+    monkeypatch.setattr(brain, "__file__", str(folder / "brain" / "__init__.py"))
+
+
+def test_loaded_overlay_reads_the_running_folders_stamp(tmp_path, monkeypatch):
+    _brain_in_overlay(tmp_path, monkeypatch, json.dumps(
+        {"dir": "abc123def456-0123abcd", "commit": "a" * 40, "brain_version": "0.0.43"}))
+    assert overlay.loaded_overlay() == {
+        "dir": "abc123def456-0123abcd", "commit": "a" * 40, "brain_version": "0.0.43"}
+
+
+def test_loaded_overlay_without_a_readable_stamp_still_names_the_folder(tmp_path, monkeypatch):
+    _brain_in_overlay(tmp_path, monkeypatch, "{not json")
+    assert overlay.loaded_overlay() == {
+        "dir": "abc123def456-0123abcd", "commit": None, "brain_version": None}

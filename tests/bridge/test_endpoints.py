@@ -1030,3 +1030,21 @@ def test_health_reports_brain_version(persona_dir: Path):
         r = c.get("/health")
     assert r.status_code == 200
     assert r.json()["version"] == brain.__version__
+
+
+def test_health_reports_no_overlay_for_the_release_brain(persona_dir: Path):
+    """#286: the version handshake reads this — null means the release brain."""
+    with _make_client(persona_dir) as c:
+        r = c.get("/health")
+    assert r.status_code == 200
+    assert r.json()["overlay"] is None
+
+
+def test_health_reports_the_running_overlay(persona_dir: Path, monkeypatch):
+    import brain.bridge.server as server
+
+    monkeypatch.setattr(server, "loaded_overlay", lambda: {
+        "dir": "abc123def456-0123abcd", "commit": "a" * 40, "brain_version": "0.0.43"})
+    with _make_client(persona_dir) as c:
+        r = c.get("/health")
+    assert r.json()["overlay"] == {"commit": "a" * 40, "brain_version": "0.0.43"}
