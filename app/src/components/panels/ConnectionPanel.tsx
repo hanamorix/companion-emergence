@@ -13,8 +13,10 @@ import { KindledLinkToggle } from "./KindledLinkToggle";
 import { CleanConnectionSection } from "./CleanConnectionSection";
 import { RecoverLauncher } from "./RecoverLauncher";
 import { check } from "@tauri-apps/plugin-updater";
+import { getVersion } from "@tauri-apps/api/app";
 import { errString } from "../../lib/errString";
 import type { Update } from "@tauri-apps/plugin-updater";
+import { BrainUpdateRow } from "./BrainUpdateRow";
 
 const RELEASES_URL = "https://github.com/hanamorix/companion-emergence/releases";
 
@@ -68,6 +70,11 @@ export function ConnectionPanel({
   const [cliInstall, setCliInstall] = useState<InstallState>({ kind: "idle" });
   const [upd, setUpd] = useState<UpdateStatus>({ kind: "idle" });
   const [shape, setShape] = useState<InstallShape | null>(null);
+  const [brainCheck, setBrainCheck] = useState(0);
+  const [appVersion, setAppVersion] = useState<string | null>(null);
+  useEffect(() => {
+    void getVersion().then(setAppVersion).catch(() => {});
+  }, []);
   const [showModelPicker, setShowModelPicker] = useState(false);
   // Local model override — updated optimistically after a successful apply
   // so the panel reflects the change without waiting for the next /state poll.
@@ -92,6 +99,7 @@ export function ConnectionPanel({
   }, []);
 
   async function checkForUpdates() {
+    setBrainCheck((n) => n + 1);
     setUpd({ kind: "checking" });
     try {
       const update = await check();
@@ -362,7 +370,8 @@ export function ConnectionPanel({
 
       <Divider />
       <SectionLabel>Updates</SectionLabel>
-      <UpdateSection upd={upd} shape={shape} onCheck={checkForUpdates} onDownload={onDownloadUpdate} />
+      <UpdateSection upd={upd} shape={shape} appVersion={appVersion} onCheck={checkForUpdates} onDownload={onDownloadUpdate} />
+      <BrainUpdateRow persona={persona} mode={mode} checkToken={brainCheck} />
 
       <Divider />
       <div
@@ -389,11 +398,13 @@ export function ConnectionPanel({
 function UpdateSection({
   upd,
   shape,
+  appVersion,
   onCheck,
   onDownload,
 }: {
   upd: UpdateStatus;
   shape: InstallShape | null;
+  appVersion: string | null;
   onCheck: () => void;
   onDownload: (update: Update) => void;
 }) {
@@ -479,7 +490,7 @@ function UpdateSection({
             lineHeight: 1.45,
           }}
         >
-          v{upd.update.version} available. Current: v0.0.11.
+          v{upd.update.version} available.{appVersion ? ` Current: v${appVersion}.` : ""}
         </div>
         {shape === "deb" ? (
           <>
