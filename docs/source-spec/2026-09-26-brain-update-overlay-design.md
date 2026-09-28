@@ -359,5 +359,14 @@ writers only). Also recorded in the deferred memory.
 folders are `<commit[:12]>-<bundle_id[:8]>` and an install never renames or deletes a folder
 `current.json` names.
 
+**Follow-ups (#302, #304, 2026-09-28):** a bridge running from an overlay writes
+`<folder>/.in-use/<pid>` at start, and prune skips any folder with a live pid there, so a bridge
+left on an older overlay (a second persona, `update.sh --no-restart`) never has its folder deleted
+under it. Both `os.replace` calls (the staging rename and the `current.json` write) retry a
+transient `PermissionError` for ~1.5 s (Windows AV, a hook reading the file at start-up). The
+overlay e2e now does a real `--require-hashes` download of a changed pin, a third install
+(rotation + prune), `--rollback`, and fails on any `.pth` inside an overlay (the hook puts the
+folder on `sys.path` directly, so a `.pth` there would be silently ignored).
+
 **Out of scope:** updating the app shell (the signed Tauri updater keeps doing that); persona
 data changes beyond the tolerant-reader fix.

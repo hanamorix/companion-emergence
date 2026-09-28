@@ -31,7 +31,7 @@ if [ "${PY%.exe}" != "$PY" ]; then WHL="$(cygpath -w "$WHL")"; REQ="$(cygpath -w
 cd /
 nell update --status | tee "$WORK/status.json"
 grep -q '"supported": true' "$WORK/status.json" || { echo "e2e: runtime has no overlay hook" >&2; exit 1; }
-nell update --wheel "$WHL" --requirements "$REQ" --commit e2e0000000000000000000000000000000000000
+nell update --wheel "$WHL" --requirements "$REQ" --commit e2e0000000000000000000000000000000000000  # = $A below
 case "$(where_brain "$PY")" in *brain-overlay*) echo "e2e: python sees the overlay brain";; *) echo "e2e: FAIL overlay not active" >&2; exit 1;; esac
 nell --version
 if [ -n "$PYW" ]; then
@@ -39,6 +39,43 @@ if [ -n "$PYW" ]; then
   grep -q brain-overlay "$WORK/pyw.txt" || { echo "e2e: FAIL pythonw does not see the overlay" >&2; exit 1; }
   echo "e2e: pythonw sees the overlay brain"
 fi
+
+# #304: a second install whose requirements really differ from the bundle — one small
+# pure-Python pin swapped for an older release, hashed by `uv pip compile` — so pip does
+# a real --require-hashes download; a third install (rotation + prune); then --rollback.
+A=e2e0000000000000000000000000000000000000
+B=e2e1111111111111111111111111111111111111
+C=e2e2222222222222222222222222222222222222
+OV="$WORK/home/brain-overlay"
+status_is() {  # <active commit> <previous commit | None>
+  nell update --status | "$PY" -P -c "import json, sys
+s = json.load(sys.stdin)
+got = ((s['active'] or {}).get('commit'), (s['previous'] or {}).get('commit'))
+assert got == (sys.argv[1], None if sys.argv[2] == 'None' else sys.argv[2]), got" "$1" "$2"
+}
+certifi_is() { "$PY" -P -c "import importlib.metadata as m, sys; v = m.version('certifi'); assert v == sys.argv[1], v" "$1"; }
+status_is $A None
+CERT_BUNDLE="$(sed -n -E 's/^certifi==([^ ;\\]+).*/\1/p' "$WORK/req.txt")"
+[ -n "$CERT_BUNDLE" ] || { echo "e2e: FAIL no certifi pin to swap" >&2; exit 1; }
+echo "certifi<$CERT_BUNDLE" | uv pip compile - --quiet --no-header --no-annotate --generate-hashes -o "$WORK/certifi.txt"
+CERT_OLD="$(sed -n -E 's/^certifi==([^ ;\\]+).*/\1/p' "$WORK/certifi.txt")"
+awk '/^certifi==/{skip=1} skip{if(!/\\$/)skip=0; next} 1' "$WORK/req.txt" > "$WORK/req2.txt"
+cat "$WORK/certifi.txt" >> "$WORK/req2.txt"
+if [ "${PY%.exe}" != "$PY" ]; then REQ2="$(cygpath -w "$WORK/req2.txt")"; else REQ2="$WORK/req2.txt"; fi
+nell update --wheel "$WHL" --requirements "$REQ2" --commit $B
+certifi_is "$CERT_OLD"
+status_is $B $A
+echo "e2e: hashed download of certifi $CERT_OLD (bundle has $CERT_BUNDLE) is live"
+nell update --wheel "$WHL" --requirements "$REQ" --commit $C
+status_is $C $B
+if ls -d "$OV"/e2e000000000-* >/dev/null 2>&1; then echo "e2e: FAIL prune kept the oldest overlay" >&2; exit 1; fi
+echo "e2e: rotation keeps two, prune removed the oldest"
+nell update --rollback >/dev/null
+status_is $B None
+certifi_is "$CERT_OLD"
+echo "e2e: rollback runs the previous overlay again"
+PTH="$(find "$OV" -name '*.pth' | head -n1)"
+[ -z "$PTH" ] || { echo "e2e: FAIL $PTH — the hook doesn't process .pth files inside an overlay (#302)" >&2; exit 1; }
 nell update --revert
 case "$(where_brain "$PY")" in *brain-overlay*) echo "e2e: FAIL still on the overlay after revert" >&2; exit 1;; *) echo "e2e: reverted to the bundle brain";; esac
 echo "e2e: PASS"

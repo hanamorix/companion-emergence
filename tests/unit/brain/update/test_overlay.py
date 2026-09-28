@@ -125,3 +125,60 @@ def test_release_leaves_a_lock_another_process_now_owns(tmp_path):
     with overlay.overlay_lock(tmp_path):
         (tmp_path / ".lock").write_text("424242", encoding="utf-8")  # someone else took it over
     assert (tmp_path / ".lock").read_text(encoding="utf-8") == "424242"
+
+
+def test_prune_skips_a_folder_a_live_process_still_uses(tmp_path):
+    """#302: a bridge left running on an older overlay (a second persona, or
+    update.sh --no-restart) must not have its folder deleted under it."""
+    for name in ("aaaa", "bbbb"):
+        (tmp_path / name).mkdir()
+    overlay.activate(tmp_path, ENTRY_A)
+    overlay.activate(tmp_path, ENTRY_B)
+    for name, pid in (("cccc", os.getpid()), ("dddd", 999999999)):  # live / no such pid
+        (tmp_path / name / overlay.IN_USE_DIR).mkdir(parents=True)
+        (tmp_path / name / overlay.IN_USE_DIR / str(pid)).write_text("", encoding="utf-8")
+    overlay.prune(tmp_path)
+    assert sorted(p.name for p in tmp_path.iterdir() if p.is_dir()) == ["aaaa", "bbbb", "cccc"]
+
+
+def test_mark_in_use_records_the_overlay_brain_was_loaded_from(tmp_path, monkeypatch):
+    import brain
+
+    folder = tmp_path / "aaaa"
+    (folder / "brain").mkdir(parents=True)
+    monkeypatch.setattr(brain, "__file__", str(folder / "brain" / "__init__.py"))
+    overlay.mark_in_use(tmp_path)
+    assert (folder / overlay.IN_USE_DIR / str(os.getpid())).is_file()
+
+
+def test_mark_in_use_does_nothing_for_the_release_brain(tmp_path):
+    overlay.mark_in_use(tmp_path)  # this checkout's brain is not under tmp_path
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_replace_retries_a_transient_permission_error(tmp_path, monkeypatch):
+    """#302: Windows AV (or another interpreter's hook reading current.json) can hold
+    the file briefly; a short bounded retry rides it out."""
+    real, calls = os.replace, []
+
+    def flaky(src, dst):
+        calls.append(dst)
+        if len(calls) < 3:
+            raise PermissionError("in use")
+        real(src, dst)
+
+    monkeypatch.setattr(os, "replace", flaky)
+    monkeypatch.setattr(overlay, "_RETRY_DELAY_S", 0)
+    overlay.activate(tmp_path, ENTRY_A)
+    assert len(calls) == 3
+    assert overlay.read_state(tmp_path)["active"] == ENTRY_A
+
+
+def test_replace_gives_up_after_the_bounded_retries(tmp_path, monkeypatch):
+    def always(src, dst):
+        raise PermissionError("in use")
+
+    monkeypatch.setattr(os, "replace", always)
+    monkeypatch.setattr(overlay, "_RETRY_DELAY_S", 0)
+    with pytest.raises(PermissionError):
+        overlay.activate(tmp_path, ENTRY_A)

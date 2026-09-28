@@ -205,7 +205,7 @@ def apply_update(*, wheel: Path, requirements: Path, commit: str, site_dir: Path
                         shutil.rmtree(target)
                     except OSError as e:
                         raise UpdateError(f"could not remove leftover overlay folder {target}: {e}") from e
-                os.replace(staging, target)
+                overlay.replace_retrying(staging, target)
             except OSError as exc:
                 shutil.rmtree(staging, ignore_errors=True)
                 raise UpdateError(f"update failed: {exc}") from exc
