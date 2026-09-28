@@ -16,7 +16,6 @@ import logging
 import math
 import re
 import sqlite3
-import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -633,36 +632,6 @@ def _bump_amount(bump: bool | float) -> float | None:
     return amount if amount != 0.0 else None
 
 
-# Known-transient (never corruption) SQLite error-message substrings for
-# PRAGMA integrity_check, matched lower-cased. Deliberately a SMALL, POSITIVE
-# allowlist (retry only what's independently confirmed safe), not a negative
-# list of known-bad patterns to exclude from retry: a message NOT in this
-# tuple is NOT assumed transient and raises immediately, exactly as before
-# this retry mechanism existed. This matters because `PRAGMA integrity_check`
-# has a much wider error vocabulary than the FTS-table-scoped check in
-# db_health.py (whose "anything else -> transient" default is safe only for
-# ITS narrow call sites) -- a from-scratch garbled memories.db raises
-# "file is not a database", which must NOT retry (that's real corruption in
-# disguise, not a transient I/O hiccup). Each entry below was independently
-# verified against real SQLite output (CPython sqlite3 + libsqlite3), not
-# copied from another module's docstring:
-#   - "disk i/o error": the observed root cause (C16 Windows CI flake) --
-#     Popen.kill() -> TerminateProcess on Windows can leave the killed
-#     process's WAL/-shm memory-mapped section released slightly after
-#     proc.wait() returns; the next MemoryStore open against the same file
-#     sees this transient error, which clears within milliseconds.
-#   - "database is locked": SQLITE_BUSY's actual message text (verified via
-#     a live two-connection repro) -- a concurrent writer, not corruption.
-#   - "unable to open database file": a transient can't-open condition
-#     (permissions race, antivirus scan, file not yet flushed to disk).
-# "database disk image is malformed" is DELIBERATELY excluded: genuine
-# corruption, must never retry.
-_TRANSIENT_INTEGRITY_ERROR_SUBSTRINGS = (
-    "disk i/o error",
-    "database is locked",
-    "unable to open database file",
-)
-
 
 class MemoryStore:
     """SQLite-backed store for Memory records.
@@ -680,7 +649,11 @@ class MemoryStore:
         # plain tuples — the comparison [("ok",)] is unambiguous. Hot request
         # paths may pass integrity_check=False and leave deep checks to health.
         if integrity_check:
-            result = self._run_integrity_check_with_retry(db_path)
+            from brain.health.integrity_retry import run_integrity_check_with_retry
+
+            result = run_integrity_check_with_retry(
+                self._conn, db_path, caller="MemoryStore"
+            )
             if result != [("ok",)]:
                 detail = "; ".join(str(row[0]) for row in result)
                 self._conn.close()
@@ -826,69 +799,6 @@ class MemoryStore:
         # explicitly by the bridge lifespan before the first store open
         # (spec §6c, S60/S61/S74) — not from this constructor, so a per-turn
         # `MemoryStore()` open never takes the write lock this check needs.
-
-    def _run_integrity_check_with_retry(self, db_path: str | Path) -> list:
-        """Run `PRAGMA integrity_check`, retrying a bounded number of times if
-        (and only if) the failure is a known-transient condition (C16 Windows
-        CI flake, ram-spike-fix INC-10 follow-up).
-
-        `MemoryStore.__init__` used to convert ANY `sqlite3.DatabaseError` from
-        this pragma straight into `BrainIntegrityError` — a "the brain is
-        corrupted, unrecoverable" Layer-3 alarm (`brain.health.anomaly.
-        BrainIntegrityError`). That conflated genuine corruption with a
-        transient OS-level condition: on Windows, `Popen.kill()` ->
-        `TerminateProcess` can leave the killed process's WAL/-shm
-        memory-mapped section released slightly after `proc.wait()` returns,
-        so the very next `MemoryStore` open against the same file (e.g. a
-        gated job resuming after a hard-kill, or a bridge's dirty-restart
-        recovery) can see a `disk I/O error` that clears within milliseconds
-        and has nothing to do with the database's actual health.
-
-        Retries ONLY when the exception message matches
-        `_TRANSIENT_INTEGRITY_ERROR_SUBSTRINGS` (a small, independently-
-        verified, positive allowlist) — any other message, including an
-        unrecognized one, raises `BrainIntegrityError` immediately, byte-for-
-        byte the same as before this method existed. This is a deliberately
-        safe default: it would be unsafe to assume every unrecognized
-        `DatabaseError` message is transient (a garbled/overwritten file
-        raises `"file is not a database"`, which must never retry), so only
-        known-safe messages get the retry; real or unrecognized corruption
-        still fails on the first attempt.
-
-        Retries re-run the pragma on the SAME `self._conn` — the condition
-        being waited out is external OS/filesystem state, not anything cached
-        in the Python-level connection object, and `PRAGMA integrity_check` is
-        a read-only probe with no retained transaction state across attempts.
-        """
-        attempts = dev_constants.MEMORY_STORE_INTEGRITY_RETRY_ATTEMPTS
-        for attempt in range(1, attempts + 1):
-            try:
-                result = self._conn.execute("PRAGMA integrity_check").fetchall()
-            except sqlite3.DatabaseError as exc:
-                msg = str(exc).lower()
-                is_transient = any(
-                    substr in msg for substr in _TRANSIENT_INTEGRITY_ERROR_SUBSTRINGS
-                )
-                if not is_transient or attempt == attempts:
-                    self._conn.close()
-                    from brain.health.anomaly import BrainIntegrityError
-
-                    raise BrainIntegrityError(str(db_path), str(exc)) from exc
-                time.sleep(dev_constants.MEMORY_STORE_INTEGRITY_RETRY_DELAY_S)
-                continue
-            if attempt > 1:
-                logger.warning(
-                    "MemoryStore integrity check for %s succeeded after retry "
-                    "(attempt %d/%d) — a transient condition cleared, not a "
-                    "corruption alarm.",
-                    db_path,
-                    attempt,
-                    attempts,
-                )
-            return result
-        # Unreachable (the loop always returns or raises), but keeps type
-        # checkers happy about a guaranteed return.
-        raise AssertionError("unreachable")
 
     def close(self) -> None:
         """Close the underlying connection. Safe to call multiple times."""
