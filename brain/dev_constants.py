@@ -30,6 +30,26 @@ from __future__ import annotations
 # constant is memories.db-specific, not a global sqlite default.
 MEMORIES_DB_BUSY_TIMEOUT_S: float = 30.0
 
+# --- MemoryStore integrity-check transient-error retry (C16 Windows CI flake,
+# INC-10 follow-up, ram-spike-fix) -----------------------------------------
+# A PRAGMA integrity_check failure whose message matches a KNOWN-transient
+# SQLite error class (see store.py's _TRANSIENT_INTEGRITY_ERROR_SUBSTRINGS) is
+# retried this many times total, this many seconds apart between attempts,
+# before MemoryStore.__init__ gives up and raises BrainIntegrityError. Observed
+# cause: Popen.kill() -> TerminateProcess on Windows can leave the killed
+# process's WAL/-shm memory-mapped section released slightly after
+# proc.wait() returns; the next MemoryStore open against the same file can see
+# a transient "disk I/O error" that clears within milliseconds. ATTEMPTS=3
+# means at most 2 inter-attempt sleeps of DELAY_S=0.1s each = <=0.2s added
+# latency, and ONLY on a path that already doesn't match today's fast success
+# case (a message not on the allowlist -- i.e. probably real corruption, or
+# unrecognized -- is never retried; see the classifier). Short enough not to
+# be felt at a bridge start, long enough to clear the observed race; NOT
+# meant to absorb a genuinely broken disk (an error that never clears still
+# raises after the budget, same as today).
+MEMORY_STORE_INTEGRITY_RETRY_ATTEMPTS: int = 3
+MEMORY_STORE_INTEGRITY_RETRY_DELAY_S: float = 0.1
+
 # --- F2c self-tune gate (S7, S26) ------------------------------------------
 # ">a handful" gate for `judge_selftune._run_judge_selftune_tick`: the
 # weekly tick only fires once MORE than this many new Haiku decisions have
