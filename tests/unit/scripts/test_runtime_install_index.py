@@ -39,3 +39,15 @@ def test_hashed_install_names_the_torch_index(script):
         # PyTorch's index also lists common packages (certifi) at older versions;
         # first-index would pin those to it and fail. Safe: every file is hash-pinned.
         assert "--index-strategy unsafe-best-match" in line, line
+
+
+def test_overlay_installer_names_the_torch_index():
+    from brain.update.install import TORCH_CPU_INDEX
+
+    assert TORCH_CPU_INDEX == _torch_index_url()
+
+
+def test_runtime_build_installs_the_overlay_hook():
+    text = (REPO / "app" / "build_python_runtime.sh").read_text(encoding="utf-8")
+    assert "install_hook(" in text and "compute_bundle_id(" in text
+    assert "import _ce_overlay" in text  # verified in step 6a
