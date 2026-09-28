@@ -11,6 +11,7 @@ from pathlib import Path
 
 from brain.health.attempt_heal import save_with_backup
 from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
+from brain.state_compat import from_known_fields
 
 ANCHOR_TYPES = ("dream", "growth", "soul", "weather_shift", "arc")
 
@@ -136,8 +137,8 @@ def load_or_recover(persona_dir: Path) -> tuple[FeltTimeState, bool]:
     raw_hp = data.get("horizon_pressure") or {}
     horizon_pressure = {
         k: HorizonBucket(
-            counters=PressureCounters(**(v.get("counters") or {})),
-            prev_counters=PressureCounters(**(v.get("prev_counters") or {})),
+            counters=from_known_fields(PressureCounters, v.get("counters") or {}),
+            prev_counters=from_known_fields(PressureCounters, v.get("prev_counters") or {}),
             period_start_ts=v.get("period_start_ts"),
         )
         for k, v in raw_hp.items()
@@ -145,9 +146,9 @@ def load_or_recover(persona_dir: Path) -> tuple[FeltTimeState, bool]:
 
     # Deserialise arc_anchors
     raw_arcs = data.get("arc_anchors") or []
-    arc_anchors = [Anchor(**a) for a in raw_arcs]
+    arc_anchors = [from_known_fields(Anchor, a) for a in raw_arcs]
 
-    anchors = {k: Anchor(**v) for k, v in (data.get("anchors") or {}).items()}
+    anchors = {k: from_known_fields(Anchor, v) for k, v in (data.get("anchors") or {}).items()}
 
     # Seed arc_anchors from anchors["arc"] when upgrading from old state format.
     if not arc_anchors and "arc" in anchors:
@@ -156,7 +157,7 @@ def load_or_recover(persona_dir: Path) -> tuple[FeltTimeState, bool]:
     return FeltTimeState(
         lived_age_hours=float(data.get("lived_age_hours", 0.0)),
         anchors=anchors,
-        pressure=PressureCounters(**(data.get("pressure") or {})),
+        pressure=from_known_fields(PressureCounters, data.get("pressure") or {}),
         last_tick_ts=data.get("last_tick_ts"),
         first_tick_ts=data.get("first_tick_ts"),
         weather_baselines=data.get("weather_baselines") or {},

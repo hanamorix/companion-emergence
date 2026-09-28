@@ -21,6 +21,7 @@ from pathlib import Path
 from brain import prompt_strings
 from brain.bridge import cli_throttle as _default_throttle
 from brain.kindled_link import limits
+from brain.state_compat import from_known_fields
 
 log = logging.getLogger(__name__)
 
@@ -88,7 +89,7 @@ def get_relationship_state(store, peer_id: str) -> PeerRelationshipState:
         affinity_tags=json.loads(row["affinity_tags_json"]),
         boundaries_seen=json.loads(row["boundaries_json"]),
         repair_history=json.loads(row["repair_history_json"]),
-        evidence=[Evidence(**e) for e in json.loads(row["evidence_json"])],
+        evidence=[from_known_fields(Evidence, e) for e in json.loads(row["evidence_json"])],
         last_reflected_at=row["last_reflected_at"],
     )
 

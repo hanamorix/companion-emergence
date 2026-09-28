@@ -108,15 +108,22 @@ def _run(cmd: list[str]) -> None:
         raise UpdateError(f"pip failed ({r.returncode}): {(r.stderr or r.stdout)[-2000:]}")
 
 
-def _smoke(folder: Path, modules: Sequence[str]) -> None:
+def _smoke(folder: Path, modules: Sequence[str], site_dir: Path | None = None) -> None:
+    # The new folder goes where the hook will put it: just before the bundle's
+    # site-packages, after the stdlib (#303). A test interpreter doesn't have the
+    # (fake) bundle on its path, so its own site-packages stands in.
     code = (
-        "import sys; sys.path.insert(0, sys.argv[1]); import importlib, brain\n"
-        "for m in sys.argv[2:]: importlib.import_module(m)\n"
-        "import os; assert os.path.realpath(brain.__file__).startswith(os.path.realpath(sys.argv[1])), brain.__file__\n"
+        "import os, site, sys\n"
+        "real = [os.path.realpath(p) for p in sys.path]\n"
+        "anchors = [os.path.realpath(a) for a in [sys.argv[2]] if a] + [os.path.realpath(p) for p in site.getsitepackages()]\n"
+        "sys.path.insert(next((real.index(a) for a in anchors if a in real), len(sys.path)), sys.argv[1])\n"
+        "import importlib, brain\n"
+        "for m in sys.argv[3:]: importlib.import_module(m)\n"
+        "assert os.path.realpath(brain.__file__).startswith(os.path.realpath(sys.argv[1])), brain.__file__\n"
     )
     # KINDLED_NO_OVERLAY: new folder + bundle only, as it will run once active — not
     # stacked on the currently active overlay the hook would load (#303).
-    r = subprocess.run([sys.executable, "-P", "-c", code, str(folder), *modules],
+    r = subprocess.run([sys.executable, "-P", "-c", code, str(folder), str(site_dir or ""), *modules],
                        capture_output=True, text=True, encoding="utf-8",
                        env={**os.environ, "KINDLED_NO_OVERLAY": "1"})
     if r.returncode != 0:
@@ -181,7 +188,7 @@ def apply_update(*, wheel: Path, requirements: Path, commit: str, site_dir: Path
                 # caller's — built locally by scripts/update.sh, or sha256-checked
                 # against the signed manifest by the app in slice 4.
                 _run([*_pip(), "--target", str(staging), *pip_extra, str(wheel)])
-                _smoke(staging, smoke_modules)
+                _smoke(staging, smoke_modules, site_dir)
                 stamp = {**entry, "installed_at": iso_utc(datetime.now(UTC))}
                 (staging / "stamp.json").write_text(json.dumps(stamp, indent=2), encoding="utf-8")
                 # Checked, not assumed: the named case above should already have
