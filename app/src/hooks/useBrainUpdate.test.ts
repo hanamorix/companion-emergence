@@ -305,4 +305,114 @@ describe("useBrainUpdate", () => {
 
     expect(result.current.state.kind).toBe("error");
   });
+
+  it("apply() called twice without awaiting the first is guarded — single applyBrainUpdate/restart call", async () => {
+    const commit = "c".repeat(40);
+    vi.mocked(appConfig.checkBrainUpdate).mockResolvedValue(
+      checkResult({ available: true, commit, brain_version: "0.0.44", reason: "available" }),
+    );
+    vi.mocked(appConfig.applyBrainUpdate).mockResolvedValue({ commit, brain_version: "0.0.44" });
+    const restart = mockRestart(true);
+
+    const { result } = renderHook(() => useBrainUpdate(PERSONA, "live"));
+    await act(async () => {
+      await result.current.check();
+    });
+
+    await act(async () => {
+      const p1 = result.current.apply();
+      const p2 = result.current.apply();
+      await Promise.all([p1, p2]);
+    });
+
+    expect(appConfig.applyBrainUpdate).toHaveBeenCalledTimes(1);
+    expect(restart).toHaveBeenCalledTimes(1);
+  });
+
+  it("check() while an apply() is in flight is ignored", async () => {
+    const commit = "c".repeat(40);
+    vi.mocked(appConfig.checkBrainUpdate).mockResolvedValue(
+      checkResult({ available: true, commit, brain_version: "0.0.44", reason: "available" }),
+    );
+    vi.mocked(appConfig.applyBrainUpdate).mockResolvedValue({ commit, brain_version: "0.0.44" });
+    mockRestart(true);
+
+    const { result } = renderHook(() => useBrainUpdate(PERSONA, "live"));
+    await act(async () => {
+      await result.current.check();
+    });
+    vi.mocked(appConfig.checkBrainUpdate).mockClear();
+
+    await act(async () => {
+      const p1 = result.current.apply();
+      const p2 = result.current.check();
+      await Promise.all([p1, p2]);
+    });
+
+    expect(appConfig.checkBrainUpdate).not.toHaveBeenCalled();
+  });
+
+  it("rollbackBrain rejecting skips the post-rollback restart and falls straight to the release brain", async () => {
+    const commit = "c".repeat(40);
+    vi.mocked(appConfig.checkBrainUpdate).mockResolvedValue(
+      checkResult({ available: true, commit, brain_version: "0.0.44", reason: "available" }),
+    );
+    vi.mocked(appConfig.applyBrainUpdate).mockResolvedValue({ commit, brain_version: "0.0.44" });
+    vi.mocked(appConfig.rollbackBrain).mockRejectedValue(new Error("rollback failed"));
+    vi.mocked(appConfig.revertBrain).mockResolvedValue(undefined);
+    const restart = mockRestart(false, true);
+
+    const { result } = renderHook(() => useBrainUpdate(PERSONA, "live"));
+    await act(async () => {
+      await result.current.check();
+    });
+    await act(async () => {
+      await result.current.apply();
+    });
+
+    expect(appConfig.rollbackBrain).toHaveBeenCalledTimes(1);
+    expect(appConfig.revertBrain).toHaveBeenCalledTimes(1);
+    expect(restart).toHaveBeenCalledTimes(2);
+    expect(result.current.state).toEqual({ kind: "rolled_back" });
+  });
+
+  it("revertBrain rejecting after a failed rollback-restart ends in an error naming the release brain", async () => {
+    const commit = "c".repeat(40);
+    vi.mocked(appConfig.checkBrainUpdate).mockResolvedValue(
+      checkResult({ available: true, commit, brain_version: "0.0.44", reason: "available" }),
+    );
+    vi.mocked(appConfig.applyBrainUpdate).mockResolvedValue({ commit, brain_version: "0.0.44" });
+    vi.mocked(appConfig.rollbackBrain).mockResolvedValue(undefined);
+    vi.mocked(appConfig.revertBrain).mockRejectedValue(new Error("revert failed"));
+    const restart = mockRestart(false, false, true);
+
+    const { result } = renderHook(() => useBrainUpdate(PERSONA, "live"));
+    await act(async () => {
+      await result.current.check();
+    });
+    await act(async () => {
+      await result.current.apply();
+    });
+
+    expect(restart).toHaveBeenCalledTimes(3);
+    expect(result.current.state.kind).toBe("error");
+    expect((result.current.state as { detail: string }).detail).toMatch(
+      /^Couldn't switch back to the release brain/,
+    );
+  });
+
+  it("useReleaseBrain() called twice without awaiting the first is guarded — single revertBrain call", async () => {
+    vi.mocked(appConfig.revertBrain).mockResolvedValue(undefined);
+    const restart = mockRestart(true);
+
+    const { result } = renderHook(() => useBrainUpdate(PERSONA, "live"));
+    await act(async () => {
+      const p1 = result.current.useReleaseBrain();
+      const p2 = result.current.useReleaseBrain();
+      await Promise.all([p1, p2]);
+    });
+
+    expect(appConfig.revertBrain).toHaveBeenCalledTimes(1);
+    expect(restart).toHaveBeenCalledTimes(1);
+  });
 });
