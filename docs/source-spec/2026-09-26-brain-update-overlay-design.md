@@ -37,12 +37,13 @@ Five units. Each can be understood and tested alone.
 
 ### 3.1 CI publisher — `.github/workflows/brain-main.yml`
 
-- Trigger: `workflow_run` of `test` completing successfully on a push to `main` (plus
-  `workflow_dispatch` for a dry run to a test tag).
-- Builds the wheel (`uv build --wheel`), exports the lock
-  (`uv export --format requirements-txt --no-dev --no-emit-project --locked --emit-index-url`;
-  CI's uv is new enough for `--emit-index-url`, so the file carries the pytorch-cpu index line
-  itself), and runs `scripts/smoke_test_wheel.sh`.
+- Trigger: `workflow_run` of `test` completing successfully on a push to `main`, building that
+  run's `head_sha` (plus `workflow_dispatch` for a dry run to a `brain-main-*` test tag, from
+  `main` only — never onto `brain-main` itself).
+- Builds the wheel (`uv build --wheel`), exports the lock with **the same flags as
+  `app/build_python_runtime.sh`** (`uv export --format requirements-txt --no-dev
+  --no-emit-project --locked`; no `--emit-index-url` — `nell update` supplies the pytorch-cpu
+  index itself; a drift test pins the two), and runs `scripts/smoke_test_wheel.sh`.
 - Writes `manifest.json`:
 
   ```json
@@ -58,15 +59,21 @@ Five units. Each can be understood and tested alone.
   }
   ```
 
-  `min_bundle_version` is a constant in the workflow, set in slice 3 to the first tagged
-  release containing slice 1 (0.0.43 above is illustrative). Raising it is how a future
+  `min_bundle_version` is `MIN_BUNDLE_VERSION` in `scripts/brain_main_manifest.py` (so it is
+  tested), set in slice 3 to 0.0.43 — the first release that can carry slices 1 and 2. Raising it is how a future
   non-additive data change would stop older apps from taking `main` builds.
 - Signs it with the existing updater key (`pnpm tauri signer sign`, secrets
   `TAURI_UPDATER_PRIVATE_KEY` / `TAURI_UPDATER_KEY_PASSWORD`, as `release.yml` already does), then
   **verifies its own signature** against the public key embedded in `tauri.conf.json`
   (`minisign -V`) before publishing.
 - Replaces the four assets (`manifest.json`, `manifest.json.sig`, the wheel,
-  `requirements.txt`) on a rolling pre-release tag `brain-main`.
+  `requirements.txt`) on a rolling pre-release tag `brain-main` — data first, manifest + `.sig`
+  last (an app reading mid-upload gets a sha256 mismatch and stops, §6) — and never replaces a
+  published build with an older commit (CI runs can finish out of order).
+- Jobs (least privilege): `build` (macOS, read-only), `sign` (read-only; the only step with the
+  signing secret; pull requests sign with a throwaway key and must reject a tampered manifest;
+  nothing published), `publish` (the only job with `contents: write`; no third-party install
+  code).
 
 ### 3.2 App commands (Rust, `app/src-tauri`)
 
@@ -279,10 +286,14 @@ Spiked against a real `build_python_runtime.sh` runtime (macOS, python-build-sta
 - Readers: `sqlite3.Row` stores read by name; the five strict `Cls(**record)` readers are listed
   in §7.
 
-Not yet verified (proved in the named slice):
+Verified since (2026-09-27/28):
 
-- `ensurepip` present and pip-from-wheel working in the Windows and Linux runtimes (slice 2 CI).
-- `minisign -V` accepting a `tauri signer` signature with the app's pubkey format (slice 3).
+- `ensurepip` present and pip-from-wheel working in the Windows and Linux runtimes — slice 2's
+  overlay end-to-end printed `e2e: PASS` on macOS, Linux and Windows (#305's runtime-build run).
+- `minisign -V` accepting a `tauri signer` signature with the app's pubkey format — slice 3's
+  pull-request run on ubuntu-latest (apt minisign 0.11): "Signature and comment signature
+  verified", and a tampered manifest failed (#307, run 36354195223). Both `.sig` and pubkey are
+  standard minisign files wrapped in one line of base64 (prehashed `ED`).
 
 ## 13. Delivery and deferred
 
@@ -309,6 +320,14 @@ Not yet verified (proved in the named slice):
 | ~~Moving `update.sh`'s bundled branch onto `nell update`~~ | **Moved into slice 2** (Hana, 2026-09-27): it is #289's root fix. | — |
 | Offline or delta updates; keeping more than two versions | Unneeded at ~8 MB overlays. | If overlays grow |
 | Linux real-machine run (Kubuntu validator) of Check → Update → Revert | No Linux host here. | Before promoting slice 4 out of EXPERIMENTAL |
+
+**Slice 3 additions (2026-09-28, from its reviews):** see §3.1 (export flags, the
+`MIN_BUNDLE_VERSION` location, the dispatch allow-list, the job split). For slice 4's design: the
+app must base64-decode `manifest.json.sig` before `minisign-verify`; retry once before logging a
+bad signature as a security event (manifest and `.sig` upload in parallel, so they can briefly
+disagree); optionally check the trusted comment's `file:manifest.json`; consider a signed
+`"channel": "brain-main"` field so a dry-run manifest cannot be replayed onto `brain-main` (repo
+writers only). Also recorded in the deferred memory.
 
 **Slice 2 additions (2026-09-27, from its final review):** the hook honours `KINDLED_NO_OVERLAY=1`
 (skip any overlay — the escape hatch for a main brain that starts but can't run `nell update
