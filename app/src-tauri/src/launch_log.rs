@@ -74,9 +74,14 @@ mod tests {
     use super::*;
 
     fn tmp_home() -> PathBuf {
+        // pid keeps concurrent `cargo test` runs apart, the counter keeps parallel
+        // tests apart (the clock alone ties at µs resolution on macOS — #308), and the
+        // time keeps a re-run from reusing a dir a crashed run left behind.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "ce-launchlog-test-{}-{}",
+            "ce-launchlog-test-{}-{}-{}",
             std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -98,6 +103,22 @@ mod tests {
             runtime_path_exists: true,
             duration_ms: 42,
         }
+    }
+
+    #[test]
+    fn tmp_home_is_unique_across_parallel_tests() {
+        // #308: parallel tests used to share a dir when SystemTime (µs on macOS) tied.
+        let dirs: Vec<PathBuf> = (0..8)
+            .map(|_| std::thread::spawn(|| (0..50).map(|_| tmp_home()).collect::<Vec<_>>()))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+        let unique: std::collections::HashSet<&PathBuf> = dirs.iter().collect();
+        for d in &dirs {
+            fs::remove_dir_all(d).ok();
+        }
+        assert_eq!(unique.len(), dirs.len());
     }
 
     #[test]
