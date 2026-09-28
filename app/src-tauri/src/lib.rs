@@ -16,6 +16,7 @@ use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 
+mod brain_update;
 mod install_shape;
 pub mod launch_log;
 
