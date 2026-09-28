@@ -281,20 +281,53 @@ fn log_event(app: &tauri::AppHandle, command: &str, detail: &str) {
     );
 }
 
+/// The downloaded bytes must match the verified manifest's sha256. A mismatch is
+/// usually a publish in progress (new manifest, old file for a moment), so the
+/// message says to check again; nothing is written or installed either way.
+fn check_digest(name: &str, expected: &str, bytes: &[u8]) -> Result<(), String> {
+    let got = sha256_hex(bytes);
+    if got != expected {
+        return Err(format!(
+            "{name} didn't match its checksum (expected {expected}, got {got}) — if a new build was just published, check for updates again"
+        ));
+    }
+    Ok(())
+}
+
+/// A declared Content-Length over the cap is refused before any body is read.
+fn declared_too_big(content_length: Option<u64>, max: usize) -> bool {
+    content_length.is_some_and(|n| n > max as u64)
+}
+
+/// Append `chunk` unless that would take `body` past `max` (then leave it as is).
+fn append_capped(body: &mut Vec<u8>, chunk: &[u8], max: usize) -> bool {
+    if body.len() + chunk.len() > max {
+        return false;
+    }
+    body.extend_from_slice(chunk);
+    true
+}
+
+/// GET `url` into memory, never holding more than `max` bytes: the declared
+/// length is checked first, then the body is streamed with the cap enforced.
 async fn fetch(client: &reqwest::Client, url: &str, max: usize) -> Result<Vec<u8>, String> {
-    let bytes = client
+    let too_big = || format!("{url}: larger than {max} bytes");
+    let mut resp = client
         .get(url)
         .send()
         .await
         .and_then(|r| r.error_for_status())
-        .map_err(|e| format!("{url}: {e}"))?
-        .bytes()
-        .await
         .map_err(|e| format!("{url}: {e}"))?;
-    if bytes.len() > max {
-        return Err(format!("{url}: larger than {max} bytes"));
+    if declared_too_big(resp.content_length(), max) {
+        return Err(too_big());
     }
-    Ok(bytes.to_vec())
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| format!("{url}: {e}"))? {
+        if !append_capped(&mut body, &chunk, max) {
+            return Err(too_big());
+        }
+    }
+    Ok(body)
 }
 
 enum FetchError {
@@ -419,10 +452,7 @@ pub(crate) async fn apply_brain_update(app: tauri::AppHandle) -> Result<BrainUpd
     std::fs::create_dir_all(&dir.0).map_err(|e| format!("temp dir: {e}"))?;
     for (asset, max) in [(&m.wheel, WHEEL_MAX), (&m.requirements, REQUIREMENTS_MAX)] {
         let bytes = fetch(&client, &asset_url(&tag, &asset.name), max).await?;
-        let got = sha256_hex(&bytes);
-        if got != asset.sha256 {
-            return Err(format!("{} failed its checksum (expected {}, got {got})", asset.name, asset.sha256));
-        }
+        check_digest(&asset.name, &asset.sha256, &bytes)?;
         std::fs::write(dir.0.join(&asset.name), &bytes).map_err(|e| format!("write {}: {e}", asset.name))?;
     }
     let wheel = dir.0.join(&m.wheel.name).to_string_lossy().into_owned();
@@ -623,5 +653,29 @@ mod tests {
         assert!(envs.contains(&(std::ffi::OsStr::new("KINDLED_NO_OVERLAY"), Some(std::ffi::OsStr::new("1")))));
         let args: Vec<_> = std_cmd.get_args().collect();
         assert_eq!(args, ["update", "--status"]);
+    }
+
+    #[test]
+    fn a_declared_oversize_body_is_refused_before_reading() {
+        assert!(declared_too_big(Some(11), 10));
+        assert!(!declared_too_big(Some(10), 10));
+        assert!(!declared_too_big(None, 10)); // no Content-Length: the streamed cap applies
+    }
+
+    #[test]
+    fn the_streamed_cap_stops_at_max() {
+        let mut body = Vec::new();
+        assert!(append_capped(&mut body, b"12345", 10));
+        assert!(append_capped(&mut body, b"67890", 10));
+        assert!(!append_capped(&mut body, b"x", 10));
+        assert_eq!(body, b"1234567890"); // the chunk that would overflow is not appended
+    }
+
+    #[test]
+    fn a_checksum_mismatch_says_to_check_again() {
+        let good = sha256_hex(b"wheel");
+        assert!(check_digest("w.whl", &good, b"wheel").is_ok());
+        let err = check_digest("w.whl", &good, b"other").unwrap_err();
+        assert!(err.contains("w.whl") && err.contains("check for updates again"), "{err}");
     }
 }

@@ -129,7 +129,9 @@ describe("useBrainUpdate", () => {
     });
   });
 
-  it("check() with reason bad_signature sets an error state", async () => {
+  it("check() with reason bad_signature says it couldn't be verified, not the crypto detail", async () => {
+    // A publish in progress can briefly pair a new manifest with an old .sig; the
+    // raw verifier message goes to the security log, the user gets a calm retry hint.
     vi.mocked(appConfig.checkBrainUpdate).mockResolvedValue(
       checkResult({ available: false, reason: "bad_signature", detail: "sig mismatch" }),
     );
@@ -139,7 +141,11 @@ describe("useBrainUpdate", () => {
       await result.current.check();
     });
 
-    expect(result.current.state.kind).toBe("error");
+    expect(result.current.state).toEqual({
+      kind: "error",
+      detail:
+        "The brain update couldn't be verified. If a new build is being published right now, check again in a minute.",
+    });
   });
 
   it("check() when checkBrainUpdate rejects sets an error state", async () => {

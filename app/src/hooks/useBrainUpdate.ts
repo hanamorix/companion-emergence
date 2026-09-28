@@ -40,6 +40,9 @@ export interface UseBrainUpdate {
   useReleaseBrain: () => Promise<void>;
 }
 
+const NOT_VERIFIED =
+  "The brain update couldn't be verified. If a new build is being published right now, check again in a minute.";
+
 const NOT_LOADED =
   "The update installed, but the brain didn't load it. Use the release brain below, or restart Companion Emergence.";
 
@@ -105,7 +108,11 @@ export function useBrainUpdate(
         await refreshOverlay();
         if (res.available && res.commit && res.brain_version) {
           setShared({ kind: "available", commit: res.commit, brainVersion: res.brain_version });
-        } else if (res.reason === "unreachable" || res.reason === "bad_signature") {
+        } else if (res.reason === "bad_signature") {
+          // Usually a publish in progress (new manifest beside the old .sig); the raw
+          // verifier message is already in launch-failures.log as a security event.
+          setShared({ kind: "error", detail: NOT_VERIFIED });
+        } else if (res.reason === "unreachable") {
           setShared({ kind: "error", detail: `Couldn't check for a brain update: ${res.detail || res.reason}` });
         } else {
           setShared({ kind: "none", reason: res.reason });
