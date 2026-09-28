@@ -213,4 +213,42 @@ describe("ensureBridgeCurrent", () => {
     // fetchHealth should not be called again — no recheck after failed force-restart
     expect(fetchHealth).toHaveBeenCalledTimes(1);
   });
+
+  // ── New tests: overlay-aware version handshake (#286) ────────────────────
+
+  it('app "0.0.43", overlay brain equal to overlay.brain_version → "ok", no restart', async () => {
+    getVersion.mockResolvedValue("0.0.43");
+    fetchHealth.mockResolvedValue({
+      liveness: "ok",
+      version: "0.0.44",
+      overlay: { commit: "a", brain_version: "0.0.44" },
+    });
+
+    const result = await ensureBridgeCurrent("nell");
+
+    expect(result).toBe("ok");
+    expect(invokeForceRestart).not.toHaveBeenCalled();
+  });
+
+  it('app "0.0.43", overlay present but health.version OLDER than app → force-restart path', async () => {
+    getVersion.mockResolvedValue("0.0.43");
+    fetchHealth.mockResolvedValue({
+      liveness: "ok",
+      version: "0.0.42",
+      overlay: { commit: "a", brain_version: "0.0.42" },
+    });
+
+    await ensureBridgeCurrent("nell");
+
+    expect(invokeForceRestart).toHaveBeenCalledTimes(1);
+  });
+
+  it('app "0.0.43", NEWER health.version but no overlay → force-restart path (unchanged rule)', async () => {
+    getVersion.mockResolvedValue("0.0.43");
+    fetchHealth.mockResolvedValue({ liveness: "ok", version: "0.0.44" });
+
+    await ensureBridgeCurrent("nell");
+
+    expect(invokeForceRestart).toHaveBeenCalledTimes(1);
+  });
 });
