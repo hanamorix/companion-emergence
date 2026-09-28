@@ -251,4 +251,42 @@ describe("ensureBridgeCurrent", () => {
 
     expect(invokeForceRestart).toHaveBeenCalledTimes(1);
   });
+
+  it('app "0.0.43", EQUAL version but overlay built for another bundle → force-restart path', async () => {
+    getVersion.mockResolvedValue("0.0.43");
+    fetchHealth.mockResolvedValue({
+      liveness: "ok",
+      version: "0.0.43",
+      overlay: { commit: "a", brain_version: "0.0.43", bundle_match: false },
+    });
+
+    await ensureBridgeCurrent("nell");
+
+    expect(invokeForceRestart).toHaveBeenCalledTimes(1);
+  });
+
+  it('app "0.0.43", NEWER overlay built for another bundle → force-restart path', async () => {
+    getVersion.mockResolvedValue("0.0.43");
+    fetchHealth.mockResolvedValue({
+      liveness: "ok",
+      version: "0.0.44",
+      overlay: { commit: "a", brain_version: "0.0.44", bundle_match: false },
+    });
+
+    await ensureBridgeCurrent("nell");
+
+    expect(invokeForceRestart).toHaveBeenCalledTimes(1);
+  });
+
+  it('app "0.0.43", NEWER overlay built for this bundle → "ok", no restart', async () => {
+    getVersion.mockResolvedValue("0.0.43");
+    fetchHealth.mockResolvedValue({
+      liveness: "ok",
+      version: "0.0.44",
+      overlay: { commit: "a", brain_version: "0.0.44", bundle_match: true },
+    });
+
+    expect(await ensureBridgeCurrent("nell")).toBe("ok");
+    expect(invokeForceRestart).not.toHaveBeenCalled();
+  });
 });

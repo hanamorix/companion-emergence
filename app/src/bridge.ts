@@ -576,6 +576,9 @@ export async function fetchChatHistory(
 export interface BridgeOverlay {
   commit: string | null;
   brain_version: string | null;
+  /** false: the overlay was built for another bundle (the app was reinstalled
+   *  under a running bridge) — treat the bridge as stale. */
+  bundle_match?: boolean;
 }
 
 export interface BridgeHealth {

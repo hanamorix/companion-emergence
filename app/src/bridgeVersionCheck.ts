@@ -18,7 +18,12 @@
  */
 
 import { getVersion } from "@tauri-apps/api/app";
-import { fetchHealth, invokeForceRestart, type BridgeHealth } from "./bridge";
+import {
+  fetchHealth,
+  invokeForceRestart,
+  type BridgeHealth,
+  type BridgeOverlay,
+} from "./bridge";
 
 export type BridgeVersionResult =
   | "ok"
@@ -56,8 +61,10 @@ export function _parseSemver(
 function _isCurrent(
   bridgeV: [number, number, number],
   appV: [number, number, number],
-  overlay: unknown,
+  overlay: BridgeOverlay | null | undefined,
 ): boolean {
+  // an overlay built for another bundle means the app changed under this bridge
+  if (overlay && overlay.bundle_match === false) return false;
   const cmp =
     bridgeV[0] - appV[0] || bridgeV[1] - appV[1] || bridgeV[2] - appV[2];
   return cmp === 0 || (cmp > 0 && overlay != null);

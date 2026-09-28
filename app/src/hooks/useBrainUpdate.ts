@@ -7,12 +7,13 @@
  * restart. The release brain is the floor.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import {
   applyBrainUpdate,
   checkBrainUpdate,
   revertBrain,
   rollbackBrain,
+  type BrainUpdateApplied,
 } from "../appConfig";
 import { fetchHealth } from "../bridge";
 import type { BridgeOverlay, PersonaState } from "../bridge";
@@ -39,28 +40,55 @@ export interface UseBrainUpdate {
   useReleaseBrain: () => Promise<void>;
 }
 
+const NOT_LOADED =
+  "The update installed, but the brain didn't load it. Use the release brain below, or restart Companion Emergence.";
+
 const RESTART_FAILED =
   "The brain didn't come back after the update. Try Restart, or restart Companion Emergence.";
+
+// Module scope, not per-instance: an update outlives the panel that started it,
+// so a remount mid-update shows the in-flight state and `busy` keeps its
+// actions no-ops. `busy` guards check/apply/useReleaseBrain against re-entry
+// from a double-click before the next render lands, and stops check() from
+// clobbering state mid-apply.
+// ponytail: one app-wide update at a time — the overlay is app-wide too.
+let shared: { state: BrainUpdateState; busy: boolean } = { state: { kind: "idle" }, busy: false };
+const listeners = new Set<() => void>();
+
+function setShared(state: BrainUpdateState): void {
+  shared = { ...shared, state };
+  listeners.forEach((l) => l());
+}
+
+function subscribe(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
+
+/** Reset for test isolation — never call in production code. */
+export function _resetBrainUpdateForTests(): void {
+  shared = { state: { kind: "idle" }, busy: false };
+}
 
 export function useBrainUpdate(
   persona: string,
   mode: PersonaState["mode"],
 ): UseBrainUpdate {
-  const [state, setState] = useState<BrainUpdateState>({ kind: "idle" });
+  const state = useSyncExternalStore(subscribe, () => shared.state);
   const [overlay, setOverlay] = useState<BridgeOverlay | null>(null);
+  const overlayRef = useRef<BridgeOverlay | null>(null);
   const { restart } = useRestartBridge(persona, mode);
-  // Mirrors useRestartBridge's inFlightRef — guards check/apply/useReleaseBrain
-  // against re-entry from a double-click before the next render lands, and
-  // stops check() from clobbering state mid-apply.
-  const busyRef = useRef(false);
 
-  const refreshOverlay = useCallback(async () => {
+  /** Re-read /health.overlay; returns what it read (the previous one on error). */
+  const refreshOverlay = useCallback(async (): Promise<BridgeOverlay | null> => {
     try {
       const health = await fetchHealth(persona);
-      setOverlay(health.overlay ?? null);
+      overlayRef.current = health.overlay ?? null;
+      setOverlay(overlayRef.current);
     } catch {
       // Bridge not reachable right now — keep what we had.
     }
+    return overlayRef.current;
   }, [persona]);
 
   useEffect(() => {
@@ -68,105 +96,110 @@ export function useBrainUpdate(
   }, [refreshOverlay]);
 
   const check = useCallback(async () => {
-    if (busyRef.current) return;
-    busyRef.current = true;
+    if (shared.busy) return;
+    shared.busy = true;
     try {
-      setState({ kind: "checking" });
+      setShared({ kind: "checking" });
       try {
         const res = await checkBrainUpdate();
         await refreshOverlay();
         if (res.available && res.commit && res.brain_version) {
-          setState({ kind: "available", commit: res.commit, brainVersion: res.brain_version });
+          setShared({ kind: "available", commit: res.commit, brainVersion: res.brain_version });
         } else if (res.reason === "unreachable" || res.reason === "bad_signature") {
-          setState({ kind: "error", detail: `Couldn't check for a brain update: ${res.detail || res.reason}` });
+          setShared({ kind: "error", detail: `Couldn't check for a brain update: ${res.detail || res.reason}` });
         } else {
-          setState({ kind: "none", reason: res.reason });
+          setShared({ kind: "none", reason: res.reason });
         }
       } catch (e) {
-        setState({ kind: "error", detail: `Couldn't check for a brain update: ${errString(e) || "unknown error"}` });
+        setShared({ kind: "error", detail: `Couldn't check for a brain update: ${errString(e) || "unknown error"}` });
       }
     } finally {
-      busyRef.current = false;
+      shared.busy = false;
     }
   }, [refreshOverlay]);
 
   const apply = useCallback(async () => {
-    if (state.kind !== "available") return;
-    if (busyRef.current) return;
-    busyRef.current = true;
+    const current = shared.state;
+    if (current.kind !== "available") return;
+    if (shared.busy) return;
+    shared.busy = true;
     try {
-      setState({ kind: "applying", commit: state.commit });
+      setShared({ kind: "applying", commit: current.commit });
+      let applied: BrainUpdateApplied;
       try {
-        await applyBrainUpdate();
+        applied = await applyBrainUpdate();
       } catch (e) {
-        setState({ kind: "error", detail: `Couldn't update the brain: ${errString(e) || "unknown error"}` });
+        setShared({ kind: "error", detail: `Couldn't update the brain: ${errString(e) || "unknown error"}` });
         return;
       }
-      setState({ kind: "restarting" });
+      setShared({ kind: "restarting" });
       if (await restart()) {
-        await refreshOverlay();
-        setState({ kind: "none", reason: "already_active" });
+        // healthy isn't enough: the running bridge must be on the new build
+        const running = await refreshOverlay();
+        setShared(running?.commit !== applied.commit
+          ? { kind: "error", detail: NOT_LOADED }
+          : { kind: "none", reason: "already_active" });
         return;
       }
-      // §6: the updated bridge is unhealthy → roll back and restart; if that is
-      // unhealthy too, the release brain and restart.
-      let rollbackError: string | null = null;
+      // §6: the updated bridge is unhealthy → undo and restart; if that is
+      // unhealthy too, the release brain and restart. Undo = roll back to the
+      // overlay that was active before, or — when there was none — the release
+      // brain itself (a rollback there would keep this broken build as the
+      // rollback target).
+      let undoError: string | null = null;
       try {
-        await rollbackBrain("bridge unhealthy after a brain update");
+        if (applied.had_active) await rollbackBrain("bridge unhealthy after a brain update");
+        else await revertBrain();
       } catch (e) {
-        rollbackError = errString(e) || "unknown error";
+        undoError = errString(e) || "unknown error";
       }
-      // A rollback that itself failed leaves the still-broken build in place —
-      // restarting onto it would just repeat the failure, so skip straight to
-      // the release brain instead of spending a restart attempt on it.
-      if (rollbackError === null) {
-        if (await restart()) {
-          await refreshOverlay();
-          setState({ kind: "rolled_back" });
-          return;
+      // A failed undo leaves the still-broken build in place — restarting onto
+      // it would just repeat the failure, so skip that restart.
+      if (undoError === null && (await restart())) {
+        await refreshOverlay();
+        setShared({ kind: "rolled_back" });
+        return;
+      }
+      // had_active false: the revert WAS the undo, so don't revert twice.
+      let revertError: string | null = applied.had_active ? null : undoError;
+      if (applied.had_active) {
+        try {
+          await revertBrain();
+        } catch (e) {
+          revertError = errString(e) || "unknown error";
         }
-      }
-      let revertError: string | null = null;
-      try {
-        await revertBrain();
-      } catch (e) {
-        revertError = errString(e) || "unknown error";
       }
       // The release brain is the floor — always try the restart, even after a
       // failed revert, so a still-good overlay/release brain gets one more shot.
       const ok = await restart();
       await refreshOverlay();
-      if (revertError !== null) {
-        setState({
-          kind: "error",
-          detail: `Couldn't switch back to the release brain: ${revertError}. Try Restart, or restart Companion Emergence.`,
-        });
-      } else if (ok) {
-        setState({ kind: "rolled_back" });
-      } else {
-        setState({ kind: "error", detail: RESTART_FAILED });
-      }
+      setShared(revertError !== null
+        ? {
+            kind: "error",
+            detail: `Couldn't switch back to the release brain: ${revertError}. Try Restart, or restart Companion Emergence.`,
+          }
+        : ok ? { kind: "rolled_back" } : { kind: "error", detail: RESTART_FAILED });
     } finally {
-      busyRef.current = false;
+      shared.busy = false;
     }
-  }, [state, restart, refreshOverlay]);
+  }, [restart, refreshOverlay]);
 
   const useReleaseBrain = useCallback(async () => {
-    if (busyRef.current) return;
-    busyRef.current = true;
+    if (shared.busy) return;
+    shared.busy = true;
     try {
-      setState({ kind: "reverting" });
+      setShared({ kind: "reverting" });
       try {
         await revertBrain();
       } catch (e) {
-        setState({ kind: "error", detail: `Couldn't switch to the release brain: ${errString(e) || "unknown error"}` });
+        setShared({ kind: "error", detail: `Couldn't switch to the release brain: ${errString(e) || "unknown error"}` });
         return;
       }
       const ok = await restart();
       await refreshOverlay();
-      setState(ok ? { kind: "idle" } : { kind: "error", detail: RESTART_FAILED });
+      setShared(ok ? { kind: "idle" } : { kind: "error", detail: RESTART_FAILED });
     } finally {
-      busyRef.current = false;
+      shared.busy = false;
     }
   }, [restart, refreshOverlay]);
 

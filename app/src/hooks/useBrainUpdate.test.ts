@@ -10,7 +10,7 @@ import { renderHook, act, waitFor, cleanup } from "@testing-library/react";
 import * as appConfig from "../appConfig";
 import * as bridge from "../bridge";
 import * as useRestartBridgeModule from "./useRestartBridge";
-import { useBrainUpdate } from "./useBrainUpdate";
+import { _resetBrainUpdateForTests, useBrainUpdate } from "./useBrainUpdate";
 import type { BrainUpdateCheck } from "../appConfig";
 import type { BridgeHealth } from "../bridge";
 
@@ -60,6 +60,7 @@ function mockRestart(...results: boolean[]): ReturnType<typeof vi.fn> {
 }
 
 beforeEach(() => {
+  _resetBrainUpdateForTests();
   vi.clearAllMocks();
   vi.mocked(bridge.fetchHealth).mockResolvedValue(health());
   mockRestart(true);
@@ -157,13 +158,15 @@ describe("useBrainUpdate", () => {
     vi.mocked(appConfig.checkBrainUpdate).mockResolvedValue(
       checkResult({ available: true, commit, brain_version: "0.0.44", reason: "available" }),
     );
-    vi.mocked(appConfig.applyBrainUpdate).mockResolvedValue({ commit, brain_version: "0.0.44" });
+    vi.mocked(appConfig.applyBrainUpdate).mockResolvedValue({ commit, brain_version: "0.0.44", had_active: true });
     const restart = mockRestart(true);
 
     const { result } = renderHook(() => useBrainUpdate(PERSONA, "live"));
     await act(async () => {
       await result.current.check();
     });
+    // the restarted bridge runs the new build
+    vi.mocked(bridge.fetchHealth).mockResolvedValue(health({ commit, brain_version: "0.0.44" }));
     await act(async () => {
       await result.current.apply();
     });
@@ -175,12 +178,35 @@ describe("useBrainUpdate", () => {
     expect(result.current.state).toEqual({ kind: "none", reason: "already_active" });
   });
 
+  it("apply() reports an error when the restarted brain isn't the update", async () => {
+    const commit = "c".repeat(40);
+    vi.mocked(appConfig.checkBrainUpdate).mockResolvedValue(
+      checkResult({ available: true, commit, brain_version: "0.0.44", reason: "available" }),
+    );
+    vi.mocked(appConfig.applyBrainUpdate).mockResolvedValue({ commit, brain_version: "0.0.44", had_active: false });
+    mockRestart(true);
+
+    const { result } = renderHook(() => useBrainUpdate(PERSONA, "live"));
+    await act(async () => {
+      await result.current.check();
+    });
+    vi.mocked(bridge.fetchHealth).mockResolvedValue(health({ commit: "d".repeat(40), brain_version: "0.0.43" }));
+    await act(async () => {
+      await result.current.apply();
+    });
+
+    expect(result.current.state).toEqual({
+      kind: "error",
+      detail: "The update installed, but the brain didn't load it. Use the release brain below, or restart Companion Emergence.",
+    });
+  });
+
   it("apply() rolls back and restarts once when the first restart is unhealthy", async () => {
     const commit = "c".repeat(40);
     vi.mocked(appConfig.checkBrainUpdate).mockResolvedValue(
       checkResult({ available: true, commit, brain_version: "0.0.44", reason: "available" }),
     );
-    vi.mocked(appConfig.applyBrainUpdate).mockResolvedValue({ commit, brain_version: "0.0.44" });
+    vi.mocked(appConfig.applyBrainUpdate).mockResolvedValue({ commit, brain_version: "0.0.44", had_active: true });
     vi.mocked(appConfig.rollbackBrain).mockResolvedValue(undefined);
     const restart = mockRestart(false, true);
 
@@ -198,12 +224,35 @@ describe("useBrainUpdate", () => {
     expect(result.current.state).toEqual({ kind: "rolled_back" });
   });
 
+  it("apply() with no earlier overlay undoes to the release brain, not a rollback", async () => {
+    const commit = "c".repeat(40);
+    vi.mocked(appConfig.checkBrainUpdate).mockResolvedValue(
+      checkResult({ available: true, commit, brain_version: "0.0.44", reason: "available" }),
+    );
+    vi.mocked(appConfig.applyBrainUpdate).mockResolvedValue({ commit, brain_version: "0.0.44", had_active: false });
+    vi.mocked(appConfig.revertBrain).mockResolvedValue(undefined);
+    const restart = mockRestart(false, true);
+
+    const { result } = renderHook(() => useBrainUpdate(PERSONA, "live"));
+    await act(async () => {
+      await result.current.check();
+    });
+    await act(async () => {
+      await result.current.apply();
+    });
+
+    expect(appConfig.rollbackBrain).not.toHaveBeenCalled();
+    expect(appConfig.revertBrain).toHaveBeenCalledTimes(1);
+    expect(restart).toHaveBeenCalledTimes(2);
+    expect(result.current.state).toEqual({ kind: "rolled_back" });
+  });
+
   it("apply() falls through to the release brain when the rollback restart is also unhealthy", async () => {
     const commit = "c".repeat(40);
     vi.mocked(appConfig.checkBrainUpdate).mockResolvedValue(
       checkResult({ available: true, commit, brain_version: "0.0.44", reason: "available" }),
     );
-    vi.mocked(appConfig.applyBrainUpdate).mockResolvedValue({ commit, brain_version: "0.0.44" });
+    vi.mocked(appConfig.applyBrainUpdate).mockResolvedValue({ commit, brain_version: "0.0.44", had_active: true });
     vi.mocked(appConfig.rollbackBrain).mockResolvedValue(undefined);
     vi.mocked(appConfig.revertBrain).mockResolvedValue(undefined);
     const restart = mockRestart(false, false, true);
@@ -227,7 +276,7 @@ describe("useBrainUpdate", () => {
     vi.mocked(appConfig.checkBrainUpdate).mockResolvedValue(
       checkResult({ available: true, commit, brain_version: "0.0.44", reason: "available" }),
     );
-    vi.mocked(appConfig.applyBrainUpdate).mockResolvedValue({ commit, brain_version: "0.0.44" });
+    vi.mocked(appConfig.applyBrainUpdate).mockResolvedValue({ commit, brain_version: "0.0.44", had_active: true });
     vi.mocked(appConfig.rollbackBrain).mockResolvedValue(undefined);
     vi.mocked(appConfig.revertBrain).mockResolvedValue(undefined);
     mockRestart(false, false, false);
@@ -311,7 +360,7 @@ describe("useBrainUpdate", () => {
     vi.mocked(appConfig.checkBrainUpdate).mockResolvedValue(
       checkResult({ available: true, commit, brain_version: "0.0.44", reason: "available" }),
     );
-    vi.mocked(appConfig.applyBrainUpdate).mockResolvedValue({ commit, brain_version: "0.0.44" });
+    vi.mocked(appConfig.applyBrainUpdate).mockResolvedValue({ commit, brain_version: "0.0.44", had_active: true });
     const restart = mockRestart(true);
 
     const { result } = renderHook(() => useBrainUpdate(PERSONA, "live"));
@@ -334,7 +383,7 @@ describe("useBrainUpdate", () => {
     vi.mocked(appConfig.checkBrainUpdate).mockResolvedValue(
       checkResult({ available: true, commit, brain_version: "0.0.44", reason: "available" }),
     );
-    vi.mocked(appConfig.applyBrainUpdate).mockResolvedValue({ commit, brain_version: "0.0.44" });
+    vi.mocked(appConfig.applyBrainUpdate).mockResolvedValue({ commit, brain_version: "0.0.44", had_active: true });
     mockRestart(true);
 
     const { result } = renderHook(() => useBrainUpdate(PERSONA, "live"));
@@ -357,7 +406,7 @@ describe("useBrainUpdate", () => {
     vi.mocked(appConfig.checkBrainUpdate).mockResolvedValue(
       checkResult({ available: true, commit, brain_version: "0.0.44", reason: "available" }),
     );
-    vi.mocked(appConfig.applyBrainUpdate).mockResolvedValue({ commit, brain_version: "0.0.44" });
+    vi.mocked(appConfig.applyBrainUpdate).mockResolvedValue({ commit, brain_version: "0.0.44", had_active: true });
     vi.mocked(appConfig.rollbackBrain).mockRejectedValue(new Error("rollback failed"));
     vi.mocked(appConfig.revertBrain).mockResolvedValue(undefined);
     const restart = mockRestart(false, true);
@@ -381,7 +430,7 @@ describe("useBrainUpdate", () => {
     vi.mocked(appConfig.checkBrainUpdate).mockResolvedValue(
       checkResult({ available: true, commit, brain_version: "0.0.44", reason: "available" }),
     );
-    vi.mocked(appConfig.applyBrainUpdate).mockResolvedValue({ commit, brain_version: "0.0.44" });
+    vi.mocked(appConfig.applyBrainUpdate).mockResolvedValue({ commit, brain_version: "0.0.44", had_active: true });
     vi.mocked(appConfig.rollbackBrain).mockResolvedValue(undefined);
     vi.mocked(appConfig.revertBrain).mockRejectedValue(new Error("revert failed"));
     const restart = mockRestart(false, false, true);
@@ -414,5 +463,43 @@ describe("useBrainUpdate", () => {
 
     expect(appConfig.revertBrain).toHaveBeenCalledTimes(1);
     expect(restart).toHaveBeenCalledTimes(1);
+  });
+
+  it("a remount mid-apply shows the in-flight state and keeps actions no-ops", async () => {
+    const commit = "c".repeat(40);
+    vi.mocked(appConfig.checkBrainUpdate).mockResolvedValue(
+      checkResult({ available: true, commit, brain_version: "0.0.44", reason: "available" }),
+    );
+    let finishApply: (v: appConfig.BrainUpdateApplied) => void = () => {};
+    vi.mocked(appConfig.applyBrainUpdate).mockReturnValue(
+      new Promise((resolve) => {
+        finishApply = resolve;
+      }),
+    );
+    mockRestart(true);
+
+    const first = renderHook(() => useBrainUpdate(PERSONA, "live"));
+    await act(async () => {
+      await first.result.current.check();
+    });
+    let applying: Promise<void> = Promise.resolve();
+    await act(async () => {
+      applying = first.result.current.apply();
+    });
+    first.unmount();
+
+    const second = renderHook(() => useBrainUpdate(PERSONA, "live"));
+    expect(second.result.current.state).toEqual({ kind: "applying", commit });
+    vi.mocked(appConfig.checkBrainUpdate).mockClear();
+    await act(async () => {
+      await second.result.current.check();
+    });
+    expect(appConfig.checkBrainUpdate).not.toHaveBeenCalled();
+    expect(second.result.current.state).toEqual({ kind: "applying", commit });
+
+    await act(async () => {
+      finishApply({ commit, brain_version: "0.0.44", had_active: false });
+      await applying;
+    });
   });
 });

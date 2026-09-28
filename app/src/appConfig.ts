@@ -316,6 +316,9 @@ export interface BrainUpdateCheck {
 export interface BrainUpdateApplied {
   commit: string;
   brain_version: string;
+  /** An overlay was active before the install: undo = roll back to it;
+   *  otherwise undo = the release brain. */
+  had_active: boolean;
 }
 
 export async function checkBrainUpdate(): Promise<BrainUpdateCheck> {

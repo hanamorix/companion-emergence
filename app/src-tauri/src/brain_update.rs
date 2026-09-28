@@ -58,6 +58,24 @@ pub(crate) struct Manifest {
     pub requirements: Asset,
 }
 
+#[derive(Debug)]
+pub(crate) enum ManifestError {
+    /// A schema this app doesn't know: a newer app is needed, whatever the rest says.
+    Unsupported,
+    Invalid(String),
+}
+
+/// Read the schema before the struct, so a future manifest whose fields changed
+/// shape reads as "needs a newer app", not as a broken download.
+pub(crate) fn parse_manifest(bytes: &[u8]) -> Result<Manifest, ManifestError> {
+    let v: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| ManifestError::Invalid(format!("manifest.json: {e}")))?;
+    if v.get("schema").and_then(|s| s.as_u64()) != Some(u64::from(MANIFEST_SCHEMA)) {
+        return Err(ManifestError::Unsupported);
+    }
+    serde_json::from_value(v).map_err(|e| ManifestError::Invalid(format!("manifest.json: {e}")))
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct BrainUpdateCheck {
     pub available: bool,
@@ -161,9 +179,17 @@ pub(crate) fn status_supported(status: &str) -> bool {
     status_json(status).and_then(|v| v.get("supported")?.as_bool()).unwrap_or(false)
 }
 
-/// `nell update --status` → the active overlay's commit, if any.
+/// `nell update --status` → the active overlay's commit, if any. An overlay built
+/// for another bundle (the app was reinstalled under it) never loads, so it
+/// doesn't count as active.
 pub(crate) fn active_commit_from_status(status: &str) -> Option<String> {
-    status_json(status)?.get("active")?.get("commit")?.as_str().map(str::to_string)
+    let v = status_json(status)?;
+    let active = v.get("active")?;
+    let bundle = v.get("bundle_id")?.as_str()?;
+    if active.get("bundle_id")?.as_str()? != bundle {
+        return None;
+    }
+    active.get("commit")?.as_str().map(str::to_string)
 }
 
 /// The base64-wrapped minisign public key from tauri.conf.json's updater plugin.
@@ -274,6 +300,7 @@ async fn fetch(client: &reqwest::Client, url: &str, max: usize) -> Result<Vec<u8
 enum FetchError {
     Unreachable(String),
     BadSignature(String),
+    Unsupported,
 }
 
 /// Fetch + verify manifest.json. A bad signature is retried once after 3 s —
@@ -299,8 +326,10 @@ async fn fetch_verified_manifest(
         let sig = String::from_utf8_lossy(&sig).into_owned();
         match verify_manifest(&manifest, &sig, &pubkey) {
             Ok(()) => {
-                return serde_json::from_slice(&manifest)
-                    .map_err(|e| FetchError::Unreachable(format!("manifest.json: {e}")));
+                return parse_manifest(&manifest).map_err(|e| match e {
+                    ManifestError::Unsupported => FetchError::Unsupported,
+                    ManifestError::Invalid(e) => FetchError::Unreachable(e),
+                });
             }
             Err(e) => last = e,
         }
@@ -330,6 +359,7 @@ pub(crate) async fn check_brain_update(app: tauri::AppHandle) -> Result<BrainUpd
         Ok(m) => m,
         Err(FetchError::Unreachable(e)) => return Ok(BrainUpdateCheck::none("unreachable", Some(e))),
         Err(FetchError::BadSignature(e)) => return Ok(BrainUpdateCheck::none("bad_signature", Some(e))),
+        Err(FetchError::Unsupported) => return Ok(BrainUpdateCheck::none("unsupported_manifest", None)),
     };
     let status = run_nell(&app, &["update", "--status"], STATUS_TIMEOUT_S).await?;
     if !status_supported(&status) {
@@ -343,6 +373,9 @@ pub(crate) async fn check_brain_update(app: tauri::AppHandle) -> Result<BrainUpd
 pub(crate) struct BrainUpdateApplied {
     pub commit: String,
     pub brain_version: String,
+    /// An overlay was active before this install: undo = rollback to it;
+    /// otherwise undo = the release brain.
+    pub had_active: bool,
 }
 
 /// Removed on drop, success or failure.
@@ -369,9 +402,11 @@ pub(crate) async fn apply_brain_update(app: tauri::AppHandle) -> Result<BrainUpd
         Ok(m) => m,
         Err(FetchError::Unreachable(e)) => return Err(format!("couldn't reach the brain update: {e}")),
         Err(FetchError::BadSignature(_)) => return Err("the brain update's signature didn't verify".into()),
+        Err(FetchError::Unsupported) => return Err("this brain update needs a newer app".into()),
     };
     let status = run_nell(&app, &["update", "--status"], STATUS_TIMEOUT_S).await?;
-    let verdict = decide(&m, active_commit_from_status(&status).as_deref(), &app.package_info().version.to_string());
+    let active = active_commit_from_status(&status);
+    let verdict = decide(&m, active.as_deref(), &app.package_info().version.to_string());
     if !verdict.available {
         return Err(format!("no brain update to apply ({})", verdict.reason));
     }
@@ -398,7 +433,7 @@ pub(crate) async fn apply_brain_update(app: tauri::AppHandle) -> Result<BrainUpd
         INSTALL_TIMEOUT_S,
     )
     .await?;
-    Ok(BrainUpdateApplied { commit: m.commit, brain_version: m.brain_version })
+    Ok(BrainUpdateApplied { commit: m.commit, brain_version: m.brain_version, had_active: active.is_some() })
 }
 
 /// The updated bridge was unhealthy (spec §6): make the previous overlay current
@@ -412,6 +447,7 @@ pub(crate) async fn rollback_brain(app: tauri::AppHandle, reason: String) -> Res
 /// "Use the release brain": clear the active overlay. The frontend restarts afterwards.
 #[tauri::command]
 pub(crate) async fn revert_brain(app: tauri::AppHandle) -> Result<(), String> {
+    log_event(&app, "brain update: switched to the release brain", "");
     run_nell(&app, &["update", "--revert"], FLIP_TIMEOUT_S).await.map(|_| ())
 }
 
@@ -441,6 +477,27 @@ mod tests {
             serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
         let real = conf["plugins"]["updater"]["pubkey"].as_str().unwrap();
         assert!(verify_manifest(MANIFEST, SIG, real).is_err());
+    }
+
+    const OTHER: &[u8] = include_bytes!("brain_update_fixtures/other.json");
+    const OTHER_SIG: &str = include_str!("brain_update_fixtures/other.json.sig");
+
+    #[test]
+    fn rejects_a_signature_for_another_file() {
+        let err = verify_manifest(OTHER, OTHER_SIG, PUB).unwrap_err();
+        assert!(err.contains("another file"), "{err}");
+        assert!(verify_manifest(MANIFEST, OTHER_SIG, PUB).is_err());
+    }
+
+    #[test]
+    fn parse_manifest_checks_the_schema_first() {
+        assert_eq!(parse_manifest(MANIFEST).unwrap().brain_version, "0.0.43");
+        assert!(matches!(parse_manifest(br#"{"schema": 2, "commit": 7, "wheel": "x"}"#),
+                         Err(ManifestError::Unsupported)));
+        assert!(matches!(parse_manifest(br#"{"commit": "c"}"#), Err(ManifestError::Unsupported)));
+        assert!(matches!(parse_manifest(br#"{"schema": "1"}"#), Err(ManifestError::Unsupported)));
+        assert!(matches!(parse_manifest(br#"{"schema": 1, "commit": "c"}"#), Err(ManifestError::Invalid(_))));
+        assert!(matches!(parse_manifest(b"not json"), Err(ManifestError::Invalid(_))));
     }
 
     #[test]
@@ -531,11 +588,16 @@ mod tests {
 
     #[test]
     fn reads_nell_update_status() {
-        let s = r#"{"supported": true, "install_kind": "bundled",
+        let s = r#"{"supported": true, "install_kind": "bundled", "bundle_id": "b",
                     "active": {"dir": "d", "commit": "abc", "brain_version": "0.0.43", "bundle_id": "b"},
                     "previous": null}"#;
         assert!(status_supported(s));
         assert_eq!(active_commit_from_status(s).as_deref(), Some("abc"));
+        // an overlay built for another bundle never loads, so it isn't active
+        let other = s.replace(r#""bundle_id": "b","#, r#""bundle_id": "other","#);
+        assert_eq!(active_commit_from_status(&other), None);
+        let no_top = s.replace(r#""bundle_id": "b","#, "");
+        assert_eq!(active_commit_from_status(&no_top), None);
         let none = r#"{"supported": false, "install_kind": "source", "active": null, "previous": null}"#;
         assert!(!status_supported(none));
         assert_eq!(active_commit_from_status(none), None);
