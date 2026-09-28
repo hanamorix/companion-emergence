@@ -32,6 +32,26 @@ def test_no_supplementary_when_no_prior_backfill(tmp_path: Path):
     assert should_run_supplementary_backfill(tmp_path) is False
 
 
+def test_no_supplementary_when_prior_is_newer(tmp_path: Path):
+    """#295: after a rollback the state file holds a NEWER brain's version; re-running
+    would re-pay the backfill and write the older version back (ping-pong)."""
+    _state(tmp_path, version="99.0.0", status="complete")
+    assert should_run_supplementary_backfill(tmp_path) is False
+
+
+def test_schema_versions_order_pre_releases_before_their_release():
+    from brain.attunement.backfill import _schema_key
+
+    ordered = ["0.0.28-alpha.1", "0.0.28-alpha.2", "0.0.28", "0.0.29", "0.1.0"]
+    assert sorted(ordered, key=_schema_key) == ordered
+
+
+def test_unparseable_prior_version_still_reruns(tmp_path: Path):
+    """No ordering to trust: keep the old behaviour (re-run on any difference)."""
+    _state(tmp_path, version="garbled", status="complete")
+    assert should_run_supplementary_backfill(tmp_path) is True
+
+
 # ---------------------------------------------------------------------------
 # Part 3 — run_supplementary_backfill
 # ---------------------------------------------------------------------------

@@ -72,7 +72,7 @@ def test_source_kind_plan(tmp_path):
     cp = _run("--nell", str(shim), "--persona", "p", "--dry-run")
     assert cp.returncode == 0, cp.stderr
     plan = _plan(cp)
-    stop, start = f"{shim} supervisor stop --persona p", f"{shim} supervisor start --persona p"
+    stop, start = f"env KINDLED_NO_OVERLAY=1 {shim} supervisor stop --persona p", f"{shim} supervisor start --persona p"
     pull = f"git -C {repo} pull --ff-only"
     assert stop in plan and start in plan and pull in plan
     assert any("uv sync --all-extras" in line for line in plan)
@@ -147,7 +147,7 @@ def test_unwritable_root_plans_sudo(tmp_path):
     assert root_uv and root_uv[0].startswith("sudo -H env ") and "HTTPS_PROXY=http://proxy.test:3128" in root_uv[0]
     wheel = [line for line in plan if "--no-deps" in line]
     assert wheel and wheel[0].startswith("sudo -H env ") and f"sh -c '{uv}' pip install" in wheel[0]
-    assert plan.index("sudo -v") < plan.index(f"{shim} supervisor stop --persona p")
+    assert plan.index("sudo -v") < plan.index(f"env KINDLED_NO_OVERLAY=1 {shim} supervisor stop --persona p")
     assert any(line.startswith("sudo -H ") and line.endswith(f"cp {root}/bin/nell {root}/bin/nell.orig") for line in plan)
     assert any(line.startswith("sudo -H ") and line.endswith(f"mv {root}/bin/nell.orig {root}/bin/nell") for line in plan)
     assert not [line for line in plan if "uv build" in line and line.startswith("sudo")]
@@ -169,6 +169,184 @@ def test_unknown_install_kind_is_rejected(tmp_path):
     shim = _shim(tmp_path, tmp_path / "x", "weird")
     cp = _run("--nell", str(shim), "--persona", "p", "--dry-run")
     assert cp.returncode == 2 and "install_kind" in cp.stderr
+
+
+def _overlay_shim(tmp_path: Path, root: Path, supported: bool) -> Path:
+    shim = tmp_path / "bin" / "nell"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    flag = "true" if supported else "false"
+    shim.write_text(
+        "#!/bin/sh\n"
+        'case "$1 $2" in\n'
+        f"  'paths install_root') echo '{root}';;\n"
+        "  'paths install_kind') echo bundled;;\n"
+        f"  'paths persona_dir') echo '{tmp_path}';;\n"
+        f"  'update --status') printf '{{\"supported\": {flag}, \"install_kind\": \"bundled\"}}\\n';;\n"
+        "  '--version ') echo 'companion-emergence 0.0.42';;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    shim.chmod(shim.stat().st_mode | stat.S_IEXEC)
+    return shim
+
+
+@pytest.mark.skipif(getattr(os, "geteuid", lambda: -1)() == 0, reason="root can write anything")
+def test_overlay_capable_bundle_updates_the_overlay_without_sudo(tmp_path):
+    """#289: the overlay lives in the user's home, so an unwritable (dpkg-owned)
+    runtime is never touched and no sudo is needed."""
+    root = _bundled_root(tmp_path / "python-runtime")
+    src = _src(tmp_path)
+    root.chmod(0o555)
+    try:
+        shim = _overlay_shim(tmp_path, root, supported=True)
+        cp = _run("--nell", str(shim), "--persona", "p", "--dry-run", "--source", str(src))
+    finally:
+        root.chmod(0o755)
+    assert cp.returncode == 0, cp.stderr
+    joined = "\n".join(_plan(cp))
+    assert " update --wheel" in joined and "--requirements" in joined and "--commit" in joined
+    assert "sudo" not in joined and "nell.orig" not in joined
+
+
+def test_clean_non_git_source_gets_a_local_commit_label(tmp_path):
+    """The non-git-tree fallback label's shape (also covers deferred minor T6b)."""
+    root = _bundled_root(tmp_path / "python-runtime")
+    src = _src(tmp_path)
+    shim = _overlay_shim(tmp_path, root, supported=True)
+    cp = _run("--nell", str(shim), "--persona", "p", "--dry-run", "--source", str(src))
+    assert cp.returncode == 0, cp.stderr
+    joined = "\n".join(_plan(cp))
+    m = re.search(r"--commit '([^']+)'", joined)
+    assert m, joined
+    assert re.fullmatch(r"local-\d{14}", m.group(1)), m.group(1)
+
+
+def test_dirty_source_tree_gets_a_dirty_commit_label(tmp_path):
+    """A --source tree with uncommitted edits must NOT be labelled with plain
+    `git rev-parse HEAD` — that label would match a prior clean-tree install's stamp
+    and the overlay installer would skip reinstalling (final-review finding 2)."""
+    root = _bundled_root(tmp_path / "python-runtime")
+    src = _src(tmp_path)
+    subprocess.run(["git", "init", "-q"], cwd=src, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t.test", "-c", "user.name=t", "add", "."], cwd=src, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t.test", "-c", "user.name=t", "commit", "-q", "-m", "init"],
+                   cwd=src, check=True)
+    (src / "pyproject.toml").write_text('version = "0.0.43"\n', encoding="utf-8")  # uncommitted edit
+
+    shim = _overlay_shim(tmp_path, root, supported=True)
+    cp = _run("--nell", str(shim), "--persona", "p", "--dry-run", "--source", str(src))
+    assert cp.returncode == 0, cp.stderr
+    joined = "\n".join(_plan(cp))
+    m = re.search(r"--commit '([^']+)'", joined)
+    assert m, joined
+    assert re.fullmatch(r"[0-9a-f]{40}-dirty-\d{14}", m.group(1)), m.group(1)
+
+
+def test_status_nonzero_exit_with_supported_true_still_uses_the_overlay(tmp_path):
+    """T6: under `set -o pipefail`, `nell update --status | grep -q ...` reports the
+    pipeline's exit status as nell's own (nonzero) even when grep found a match — so
+    a `--status` call that both prints supported:true AND exits nonzero (e.g. some
+    unrelated warning path) would wrongly fall back to the legacy sudo path. Capture
+    stdout first, then match on the captured string, so nell's own exit code can't
+    flip the decision."""
+    root = _bundled_root(tmp_path / "python-runtime")
+    src = _src(tmp_path)
+    shim = tmp_path / "bin" / "nell"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_text(
+        "#!/bin/sh\n"
+        'case "$1 $2" in\n'
+        f"  'paths install_root') echo '{root}';;\n"
+        "  'paths install_kind') echo bundled;;\n"
+        f"  'paths persona_dir') echo '{tmp_path}';;\n"
+        "  'update --status') printf '{\"supported\": true, \"install_kind\": \"bundled\"}\\n'; exit 1;;\n"
+        "  '--version ') echo 'companion-emergence 0.0.42';;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    shim.chmod(shim.stat().st_mode | stat.S_IEXEC)
+    cp = _run("--nell", str(shim), "--persona", "p", "--dry-run", "--source", str(src))
+    assert cp.returncode == 0, cp.stderr
+    joined = "\n".join(_plan(cp))
+    assert " update --wheel" in joined and "nell.orig" not in joined
+
+
+def test_bundle_without_overlay_support_keeps_the_legacy_path(tmp_path):
+    root = _bundled_root(tmp_path / "python-runtime")
+    src = _src(tmp_path)
+    shim = _overlay_shim(tmp_path, root, supported=False)
+    cp = _run("--nell", str(shim), "--persona", "p", "--dry-run", "--source", str(src))
+    assert cp.returncode == 0, cp.stderr
+    joined = "\n".join(_plan(cp))
+    assert "nell.orig" in joined and " update --wheel" not in joined
+
+
+def _status_shim(tmp_path: Path, root: Path, status_body: str) -> Path:
+    """A bundled nell whose `update --status` runs `status_body`; every call logs
+    its argv and $KINDLED_NO_OVERLAY to calls.log."""
+    shim = tmp_path / "bin" / "nell"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_text(
+        "#!/bin/sh\n"
+        f"echo \"$1 $2 NO_OVERLAY=${{KINDLED_NO_OVERLAY:-}}\" >> '{tmp_path}/calls.log'\n"
+        'case "$1 $2" in\n'
+        f"  'paths install_root') echo '{root}';;\n"
+        "  'paths install_kind') echo bundled;;\n"
+        f"  'paths persona_dir') echo '{tmp_path}';;\n"
+        f"  'update --status') {status_body};;\n"
+        "  '--version ') echo 'companion-emergence 0.0.42';;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    shim.chmod(shim.stat().st_mode | stat.S_IEXEC)
+    return shim
+
+
+def test_failing_status_never_falls_back_to_rewriting_the_runtime(tmp_path):
+    """ToT's #305 review: an overlay-capable bundle whose `--status` fails (e.g. a
+    broken brain) must not take the legacy pip-into-the-bundle path — that is #289's
+    write, and the hook would keep loading the overlay anyway."""
+    root = _bundled_root(tmp_path / "python-runtime")
+    src = _src(tmp_path)
+    shim = _status_shim(tmp_path, root, "echo 'ImportError: boom' >&2; exit 1")
+    cp = _run("--nell", str(shim), "--persona", "p", "--dry-run", "--source", str(src))
+    assert cp.returncode == 1, cp.stdout
+    assert "ImportError: boom" in cp.stderr
+    assert not _plan(cp)
+
+
+def test_nell_without_an_update_command_keeps_the_legacy_path(tmp_path):
+    """Releases up to v0.0.42 have no `update` command: argparse's own rejection
+    is the one failure that means "no overlay support"."""
+    root = _bundled_root(tmp_path / "python-runtime")
+    src = _src(tmp_path)
+    shim = _status_shim(tmp_path, root, (
+        "echo \"nell: error: argument command: invalid choice: 'update' "
+        "(choose from 'init', 'status')\" >&2; exit 2"))
+    cp = _run("--nell", str(shim), "--persona", "p", "--dry-run", "--source", str(src))
+    assert cp.returncode == 0, cp.stderr
+    assert "nell.orig" in "\n".join(_plan(cp))
+
+
+def test_the_updater_itself_runs_on_the_release_brain(tmp_path):
+    """A broken overlay brain must not break the tool that replaces it: probes,
+    stop and install run with KINDLED_NO_OVERLAY=1; the restart does not (the
+    bridge inherits the env and must come up on the new overlay)."""
+    root = _bundled_root(tmp_path / "python-runtime")
+    src = _src(tmp_path)
+    shim = _status_shim(tmp_path, root,
+                        "printf '{\"supported\": true, \"install_kind\": \"bundled\"}\\n'")
+    cp = _run("--nell", str(shim), "--persona", "p", "--dry-run", "--source", str(src))
+    assert cp.returncode == 0, cp.stderr
+    calls = (tmp_path / "calls.log").read_text(encoding="utf-8").splitlines()
+    for probe in ("paths install_root", "paths install_kind", "update --status"):
+        assert f"{probe} NO_OVERLAY=1" in calls, calls
+    plan = _plan(cp)
+    stop = next(p for p in plan if "supervisor stop" in p)
+    wheel = next(p for p in plan if " update --wheel" in p)
+    start = next(p for p in plan if "supervisor start" in p)
+    assert stop.startswith("env KINDLED_NO_OVERLAY=1 ") and wheel.startswith("env KINDLED_NO_OVERLAY=1 ")
+    assert "KINDLED_NO_OVERLAY" not in start
 
 
 def test_every_nell_command_the_script_calls_exists_in_the_real_cli():
@@ -277,6 +455,17 @@ def test_help_prints_the_whole_header():
     assert cp.returncode == 0
     assert cp.stdout.rstrip().endswith("executes nothing past preflight.")
     assert "set -euo" not in cp.stdout
+
+
+def test_help_describes_the_overlay_path_and_the_legacy_fallback():
+    cp = _run("--help")
+    assert cp.returncode == 0
+    out = cp.stdout
+    assert "overlay" in out.lower()
+    assert "no sudo" in out.lower() or "no runtime rewrite" in out.lower()
+    assert "#286" in out or "#289" in out  # overlay path reference
+    assert "#289" in out  # older bundles keep the legacy path
+    assert "#255" in out  # Windows still unsupported
 
 
 def test_nell_runs_from_a_neutral_cwd_even_from_a_checkout(tmp_path):
@@ -391,7 +580,7 @@ def test_bare_nell_name_is_looked_up_on_path(tmp_path):
     cp = _run("--nell", "nell", "--persona", "p", "--dry-run",
               env_extra={"PATH": f"{shim.parent}{os.pathsep}{os.environ['PATH']}"})
     assert cp.returncode == 0, cp.stderr
-    assert f"{shim} supervisor stop --persona p" in _plan(cp)
+    assert f"env KINDLED_NO_OVERLAY=1 {shim} supervisor stop --persona p" in _plan(cp)
 
 
 def test_exported_cdpath_does_not_redirect_relative_source(tmp_path):
@@ -434,6 +623,27 @@ def test_appimage_runtime_is_refused_before_stopping(tmp_path):
     cp = _run("--nell", str(shim), "--persona", "p", "--dry-run", "--source", str(src))
     assert cp.returncode == 2 and "AppImage" in cp.stderr
     assert not _plan(cp)
+
+
+def test_dpkg_owned_runtime_is_refused_on_the_legacy_path(tmp_path):
+    """#289: pip over a .deb's runtime mixes files with dpkg. A bundle too old for
+    the overlay is updated by installing the newer .deb, never rewritten in place."""
+    root = _bundled_root(tmp_path / "python-runtime")
+    src = _src(tmp_path)
+    fakebin = _fakebin(tmp_path, dpkg="exit 0")  # `dpkg -S <root>`: owned by a package
+    path = f"{fakebin}{os.pathsep}{os.environ['PATH']}"
+    legacy = _overlay_shim(tmp_path, root, supported=False)
+    cp = _run("--nell", str(legacy), "--persona", "p", "--dry-run", "--source", str(src),
+              env_extra={"PATH": path})
+    assert cp.returncode == 2 and "dpkg" in cp.stderr and "#289" in cp.stderr
+    assert not _plan(cp)
+    assert f"dpkg -S {root}" in (tmp_path / "tools.log").read_text(encoding="utf-8")
+
+    overlay = _overlay_shim(tmp_path, root, supported=True)  # the overlay never writes there
+    cp = _run("--nell", str(overlay), "--persona", "p", "--dry-run", "--source", str(src),
+              env_extra={"PATH": path})
+    assert cp.returncode == 0, cp.stderr
+    assert " update --wheel" in "\n".join(_plan(cp))
 
 
 def test_restart_racing_the_apps_own_start_is_success(tmp_path):

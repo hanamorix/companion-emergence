@@ -15,6 +15,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
+from brain.state_compat import from_known_fields
+
 CandidateKind = Literal["message", "voice_edit_proposal"]
 CandidateSource = Literal[
     "dream",
@@ -77,7 +79,7 @@ class EmotionalSnapshot:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> EmotionalSnapshot:
-        return cls(**d)
+        return from_known_fields(cls, d)
 
 
 @dataclass

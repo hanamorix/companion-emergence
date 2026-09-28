@@ -277,6 +277,22 @@ else
   rm -f "$RUNTIME_DIR/Scripts/nell.exe"
 fi
 
+# 5b. Brain-overlay activation hook (#286 slice 2): _ce_overlay.py/.pth + _ce_bundle_id
+# in site-packages. The bundle is never written after this; updates go to the
+# user-writable overlay under KINDLED_HOME.
+echo "[build] installing brain-overlay hook"
+if [ "$HOST_OS" = "windows" ]; then
+  CE_SITE="$(cygpath -w "$SITE_PACKAGES")"; CE_REQ="$(cygpath -w "$TMP_REQ")"
+else
+  CE_SITE="$SITE_PACKAGES"; CE_REQ="$TMP_REQ"
+fi
+CE_SITE="$CE_SITE" CE_REQ="$CE_REQ" CE_WHEEL="$(basename "$WHEEL")" "$PY_BIN" -P -c "
+import os
+from pathlib import Path
+from brain.update.overlay_hook import compute_bundle_id, install_hook
+install_hook(Path(os.environ['CE_SITE']), compute_bundle_id(Path(os.environ['CE_REQ']), os.environ['CE_WHEEL']))
+"
+
 # 6a. Verify the brain entry point + import work in the bundled python
 echo "[build] verify brain import + entry point"
 # On MSYS / Git Bash $RUNTIME_DIR is in /c/Users/... form, but Python on
@@ -321,6 +337,7 @@ from importlib.resources import files
 content = files('brain.voice_templates').joinpath('nell-voice.md').read_text(encoding='utf-8')
 print('  nell-voice.md:', len(content), 'bytes')
 "
+  "$PY_BIN" -P -c "import _ce_overlay, sys; assert _ce_overlay.SITE.name == 'site-packages', _ce_overlay.SITE; print('  overlay hook:', _ce_overlay.SITE)"
 )
 
 # 6b. Strip everything we don't need at runtime to shrink the bundle.

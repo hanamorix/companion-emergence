@@ -7,10 +7,20 @@
 # Works for both install kinds reported by `nell paths install_kind` (or, on a
 # nell older than that key, by the python3 beside it — #285):
 #   source  — the install IS a git checkout: git pull --ff-only + uv sync.
-#   bundled — a desktop-app python-runtime: build a wheel from the source
-#             tree and install it (plus locked deps) into that runtime,
-#             mirroring app/build_python_runtime.sh steps 3-5. Keep the two
-#             in sync by hand; bash cannot share the recipe safely.
+#   bundled — a desktop-app python-runtime. Two paths, picked by `nell update
+#             --status` (#286):
+#     overlay (bundles that support it) — build a wheel, then `nell update`
+#             installs it into the user-writable overlay next to the runtime.
+#             No runtime rewrite, no sudo, regardless of who owns the runtime.
+#             The updater's own nell calls run on the release brain
+#             (KINDLED_NO_OVERLAY=1), so a broken overlay can still be replaced.
+#     legacy  (older bundles whose nell has no `update` command) — build a
+#             wheel from the source tree and install it (plus locked deps)
+#             straight into the runtime, mirroring app/build_python_runtime.sh
+#             steps 3-5. Keep the two in sync by hand; bash cannot share the
+#             recipe safely. May need sudo if the runtime isn't user-writable.
+#             Refused on a .deb's runtime (dpkg owns it — #289) and inside an
+#             AppImage: install the newer package instead.
 #
 # Windows: not supported (the bundled runtime ships no bash) — see #255.
 #
@@ -80,7 +90,10 @@ cd /
 PERSONA_ARGS=()
 [ -n "$PERSONA" ] && PERSONA_ARGS=(--persona "$PERSONA")
 
-nell_path() { "$NELL" paths "$1" "${PERSONA_ARGS[@]+"${PERSONA_ARGS[@]}"}"; }
+# The updater itself runs on the release brain (the floor): a broken overlay brain
+# must not break the tool that replaces it. Never for `supervisor start/restart`:
+# the bridge inherits the env and must come up on the new overlay.
+nell_path() { KINDLED_NO_OVERLAY=1 "$NELL" paths "$1" "${PERSONA_ARGS[@]+"${PERSONA_ARGS[@]}"}"; }
 
 # Ask the python that lives beside nell (both install kinds put python3 in the
 # same bin/) for the same two facts brain/cli.py derives: sys.prefix, and
@@ -92,7 +105,7 @@ probe_install() {
     src="$(readlink "$src")"
     case "$src" in /*) ;; *) src="$dir/$src";; esac
   done
-  "$(cd "$(dirname "$src")" && pwd)/python3" -c '
+  KINDLED_NO_OVERLAY=1 "$(cd "$(dirname "$src")" && pwd)/python3" -c '
 import pathlib, sys, brain
 pkg = pathlib.Path(brain.__file__).resolve().parent
 print(sys.prefix)
@@ -114,6 +127,25 @@ esac
 if [ "$RESTART" = 1 ] && [ ! -d "$(nell_path persona_dir)" ]; then
   echo "update.sh: no persona '$PERSONA' (see \`nell personas\`)" >&2
   exit 2
+fi
+
+# Bundles with the overlay hook (#286 slice 2) update into the user-writable
+# overlay; older nells have no `update` command and keep the legacy path (#289).
+# Only a nell that has no `update` command at all takes the legacy path: any other
+# failure (a broken brain) must never fall back to rewriting the runtime.
+OVERLAY=0
+if [ "$INSTALL_KIND" = "bundled" ]; then
+  STATUS_RC=0
+  STATUS="$(KINDLED_NO_OVERLAY=1 "$NELL" update --status 2>&1)" || STATUS_RC=$?
+  case "$STATUS" in
+    *'"supported": true'*) OVERLAY=1;;
+    *"invalid choice: 'update'"*) ;;
+    *) if [ "$STATUS_RC" -ne 0 ]; then
+         echo "update.sh: \`nell update --status\` failed (exit $STATUS_RC); not falling back to rewriting the runtime:" >&2
+         echo "$STATUS" >&2
+         exit 1
+       fi;;
+  esac
 fi
 
 run() {
@@ -165,41 +197,47 @@ fi
 # ---- privileges (bundled) -------------------------------------------------------
 UV="$(command -v uv)"
 AS_ROOT=()
-if [ "$INSTALL_KIND" = "bundled" ]; then
-  case "$INSTALL_ROOT" in
-    *.app/*)
-      if [ "$ALLOW_APP" != 1 ]; then
-        echo "update.sh: $INSTALL_ROOT is inside a .app bundle; rewriting it invalidates the bundle signature (Gatekeeper may re-prompt on next launch). Re-run with --allow-app-rewrite to proceed." >&2
-        exit 2
-      fi;;
-    */.mount_*/*)
-      echo "update.sh: $INSTALL_ROOT is inside a running AppImage (a read-only mount); download the new AppImage instead." >&2
-      exit 2;;
-  esac
-  if [ ! -w "$INSTALL_ROOT" ]; then
-    # Only the writes into the runtime run as root (build + export stay the user's).
-    # Absolute uv: sudo's secure_path drops ~/.local/bin, uv's default home. -H:
-    # root's own HOME, so uv's cache never leaves root-owned files in the user's.
-    # sudo's env_reset drops the proxy/CA/UV_* settings the unprivileged steps just
-    # used; hand them to root explicitly through `env`.
-    ROOT_ENV=()
-    for k in $(compgen -e); do
-      case "$k" in
-        HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|http_proxy|https_proxy|all_proxy|no_proxy|SSL_CERT_FILE|SSL_CERT_DIR|UV_*)
-          ROOT_ENV+=("$k=${!k}");;
-      esac
-    done
-    AS_ROOT=(sudo -H env "${ROOT_ENV[@]+"${ROOT_ENV[@]}"}")
-    echo "update.sh: $INSTALL_ROOT is not writable; the install steps run under sudo" >&2
-    # Ask for the password now, before anything is stopped.
-    run sudo -v || { echo "update.sh: sudo failed; the update was NOT applied" >&2; exit 1; }
+if [ "$OVERLAY" = 0 ]; then
+  if [ "$INSTALL_KIND" = "bundled" ]; then
+    case "$INSTALL_ROOT" in
+      *.app/*)
+        if [ "$ALLOW_APP" != 1 ]; then
+          echo "update.sh: $INSTALL_ROOT is inside a .app bundle; rewriting it invalidates the bundle signature (Gatekeeper may re-prompt on next launch). Re-run with --allow-app-rewrite to proceed." >&2
+          exit 2
+        fi;;
+      */.mount_*/*)
+        echo "update.sh: $INSTALL_ROOT is inside a running AppImage (a read-only mount); download the new AppImage instead." >&2
+        exit 2;;
+    esac
+    if command -v dpkg >/dev/null 2>&1 && dpkg -S "$INSTALL_ROOT" >/dev/null 2>&1; then
+      echo "update.sh: $INSTALL_ROOT belongs to a .deb package; rewriting it would mix files with dpkg (#289). Install the newer .deb instead — releases with overlay updates never write there." >&2
+      exit 2
+    fi
+    if [ ! -w "$INSTALL_ROOT" ]; then
+      # Only the writes into the runtime run as root (build + export stay the user's).
+      # Absolute uv: sudo's secure_path drops ~/.local/bin, uv's default home. -H:
+      # root's own HOME, so uv's cache never leaves root-owned files in the user's.
+      # sudo's env_reset drops the proxy/CA/UV_* settings the unprivileged steps just
+      # used; hand them to root explicitly through `env`.
+      ROOT_ENV=()
+      for k in $(compgen -e); do
+        case "$k" in
+          HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|http_proxy|https_proxy|all_proxy|no_proxy|SSL_CERT_FILE|SSL_CERT_DIR|UV_*)
+            ROOT_ENV+=("$k=${!k}");;
+        esac
+      done
+      AS_ROOT=(sudo -H env "${ROOT_ENV[@]+"${ROOT_ENV[@]}"}")
+      echo "update.sh: $INSTALL_ROOT is not writable; the install steps run under sudo" >&2
+      # Ask for the password now, before anything is stopped.
+      run sudo -v || { echo "update.sh: sudo failed; the update was NOT applied" >&2; exit 1; }
+    fi
   fi
 fi
 
 # ---- stop -------------------------------------------------------------------
 if [ "$RESTART" = 1 ]; then
   BRAIN_STOPPED=1   # before the call: a stop that times out (exit 1) may still take the bridge down
-  run "$NELL" supervisor stop "${PERSONA_ARGS[@]+"${PERSONA_ARGS[@]}"}"
+  run env KINDLED_NO_OVERLAY=1 "$NELL" supervisor stop "${PERSONA_ARGS[@]+"${PERSONA_ARGS[@]}"}"
 fi
 
 # ---- apply ------------------------------------------------------------------
@@ -207,19 +245,29 @@ if [ "$INSTALL_KIND" = "source" ]; then
   [ -z "$SOURCE" ] && run git -C "$SRC_TREE" pull --ff-only
   run sh -c "cd '$SRC_TREE' && uv sync --all-extras"
 else
-  PY_BIN="$INSTALL_ROOT/bin/python3"
-  NELL_BIN="$INSTALL_ROOT/bin/nell"
   run sh -c "cd '$SRC_TREE' && rm -rf dist && uv build --wheel"
   run sh -c "cd '$SRC_TREE' && uv export --format requirements-txt --no-dev --no-emit-project --locked --quiet --output-file dist/requirements.txt"
-  # pip regenerates bin/nell with a baked shebang; the shipped file is a
-  # relocatable wrapper (app/build_python_runtime.sh step 5). Save and restore it.
-  run "${AS_ROOT[@]+"${AS_ROOT[@]}"}" cp "$NELL_BIN" "$NELL_BIN.orig"
-  # Index flags: see app/build_python_runtime.sh step 4 (#287). Not --emit-index-url:
-  # that needs uv >= 0.12, and this runs on the user's uv.
-  run "${AS_ROOT[@]+"${AS_ROOT[@]}"}" "$UV" pip install --python "$PY_BIN" --require-hashes --requirements "$SRC_TREE/dist/requirements.txt" --quiet \
-    --index https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
-  run "${AS_ROOT[@]+"${AS_ROOT[@]}"}" sh -c "'$UV' pip install --python '$PY_BIN' --no-deps --quiet '$SRC_TREE'/dist/*.whl"
-  run "${AS_ROOT[@]+"${AS_ROOT[@]}"}" mv "$NELL_BIN.orig" "$NELL_BIN"
+  if [ "$OVERLAY" = 1 ]; then
+    COMMIT="$(git -C "$SRC_TREE" rev-parse HEAD 2>/dev/null || echo "local-$(date +%Y%m%d%H%M%S)")"
+    # An uncommitted edit in $SRC_TREE must not reuse the last clean build's label
+    # (the overlay installer stamp-matches on it and would skip reinstalling).
+    if [ -n "$(git -C "$SRC_TREE" status --porcelain 2>/dev/null)" ]; then
+      COMMIT="$COMMIT-dirty-$(date +%Y%m%d%H%M%S)"
+    fi
+    run env KINDLED_NO_OVERLAY=1 sh -c "'$NELL' update --wheel \"\$(ls '$SRC_TREE'/dist/*.whl | head -n1)\" --requirements '$SRC_TREE/dist/requirements.txt' --commit '$COMMIT'"
+  else
+    PY_BIN="$INSTALL_ROOT/bin/python3"
+    NELL_BIN="$INSTALL_ROOT/bin/nell"
+    # pip regenerates bin/nell with a baked shebang; the shipped file is a
+    # relocatable wrapper (app/build_python_runtime.sh step 5). Save and restore it.
+    run "${AS_ROOT[@]+"${AS_ROOT[@]}"}" cp "$NELL_BIN" "$NELL_BIN.orig"
+    # Index flags: see app/build_python_runtime.sh step 4 (#287). Not --emit-index-url:
+    # that needs uv >= 0.12, and this runs on the user's uv.
+    run "${AS_ROOT[@]+"${AS_ROOT[@]}"}" "$UV" pip install --python "$PY_BIN" --require-hashes --requirements "$SRC_TREE/dist/requirements.txt" --quiet \
+      --index https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
+    run "${AS_ROOT[@]+"${AS_ROOT[@]}"}" sh -c "'$UV' pip install --python '$PY_BIN' --no-deps --quiet '$SRC_TREE'/dist/*.whl"
+    run "${AS_ROOT[@]+"${AS_ROOT[@]}"}" mv "$NELL_BIN.orig" "$NELL_BIN"
+  fi
 fi
 
 # ---- verify -----------------------------------------------------------------

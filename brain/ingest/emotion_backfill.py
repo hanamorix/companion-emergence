@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from brain import prompt_strings
+from brain.state_compat import from_known_fields
 
 if TYPE_CHECKING:
     from brain.bridge.provider import LLMProvider
@@ -82,7 +83,7 @@ def _load_state(persona_dir: Path) -> EmotionBackfillState | None:
         return None
     try:
         raw = json.loads(p.read_text(encoding="utf-8"))
-        return EmotionBackfillState(**raw)
+        return from_known_fields(EmotionBackfillState, raw)
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
         logger.warning("emotion_backfill: corrupt state file: %s", exc)
         return None

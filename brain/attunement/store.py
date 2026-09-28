@@ -19,6 +19,7 @@ from brain.attunement.schemas import (
     pattern_id,
 )
 from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+from brain.state_compat import from_known_fields
 
 log = logging.getLogger(__name__)
 
@@ -50,7 +51,7 @@ def read_current_read(persona_dir: Path) -> CurrentRead | None:
         return None
     try:
         payload = json.loads(target.read_text())
-        return CurrentRead(**payload)
+        return from_known_fields(CurrentRead, payload)
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
         log.warning("attunement: corrupt current_read.json — treating as missing: %s", exc)
         return None
@@ -126,7 +127,7 @@ def read_learned_patterns(persona_dir: Path) -> list[LearnedPattern]:
     by_id: dict[str, LearnedPattern] = {}
     for row in read_jsonl_skipping_corrupt(path):
         try:
-            pattern = LearnedPattern(**row)
+            pattern = from_known_fields(LearnedPattern, row)
         except (TypeError, ValueError):
             continue
         by_id[pattern.id] = pattern
