@@ -26,6 +26,10 @@
  * button and watches `state`. Parent must call `onModeChanged(mode)`
  * (or pass the current mode as the second arg) so reconnecting → success
  * lands when /state poll flips back to "live".
+ *
+ * `restart()` resolves true when the bridge is healthy again (graceful or
+ * forced path); false when the flow ends in `failed` or a restart is
+ * already in flight.
  */
 
 import { useState, useCallback, useEffect, useRef } from "react";
@@ -52,7 +56,7 @@ export type RestartState =
 export interface UseRestartBridge {
   state: RestartState;
   errorDetail: string | null;
-  restart: () => void;
+  restart: () => Promise<boolean>;
   onModeChanged: (mode: PersonaState["mode"]) => void;
 }
 
@@ -115,12 +119,12 @@ export function useRestartBridge(
     setState(next);
   }, []);
 
-  const restart = useCallback(() => {
-    if (inFlightRef.current) return;
+  const restart = useCallback((): Promise<boolean> => {
+    if (inFlightRef.current) return Promise.resolve(false);
     inFlightRef.current = true;
     setErrorDetail(null);
 
-    const run = async () => {
+    const run = async (): Promise<boolean> => {
       try {
         // Try graceful snapshot → shutdown → ensureBridgeRunning → health.
         // Any timeout on snapshot escalates to SIGKILL fallback.
@@ -194,7 +198,7 @@ export function useRestartBridge(
         const ok = gracefulOk || (await tryForced());
         if (!ok) {
           transition("failed");
-          return;
+          return false;
         }
         // Graceful path ends in reconnecting (after ensureBridgeRunning +
         // pollHealth — the final reconnecting is the handoff to the parent's
@@ -204,12 +208,13 @@ export function useRestartBridge(
         if (!gracefulOk) {
           transition("reconnecting");
         }
+        return true;
       } finally {
         inFlightRef.current = false;
       }
     };
 
-    void run();
+    return run();
   }, [persona, transition]);
 
   const onModeChanged = useCallback(
