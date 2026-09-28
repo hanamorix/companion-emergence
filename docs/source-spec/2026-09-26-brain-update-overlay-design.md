@@ -139,10 +139,16 @@ changing any caller.
 
 ### 3.5 Version handshake and UI
 
-- `/health` gains `overlay: {commit, brain_version} | null` (and `nell paths` gains
-  `overlay_dir` / `overlay_active`).
-- `bridgeVersionCheck.ts`: when `/health.overlay` is non-null and the bridge version ≥ the app
-  version, the result is `ok`. Without an overlay the existing exact-match rule is unchanged.
+- `/health` gains `overlay: {commit, brain_version, bundle_match} | null` — the overlay THIS
+  bridge process loaded (read from its folder's stamp, not `current.json`); `bundle_match` is
+  whether that overlay was built for the bundle now on disk (stamp `bundle_id` == the bundle's
+  `_ce_bundle_id`, read per request, fails closed). `nell paths` gains `overlay_dir` /
+  `overlay_active`; `nell update --status` also reports the bundle's `bundle_id`.
+- `bridgeVersionCheck.ts`: an overlay with `bundle_match: false` is stale (the app was updated
+  under a running bridge) whatever its version; otherwise, with an overlay, a bridge version ≥
+  the app version is `ok`. Without an overlay the existing exact-match rule is unchanged.
+  *(Amended in slice 4: the original "overlay + ≥ → ok" rule hid a stale bridge after every app
+  release for `main` users.)*
 - ConnectionPanel: a brain row under the app-update row — "Brain update available:
   `main @abc1234` (0.0.42)" + **Update**; while an overlay is active, "Brain: `main @abc1234`"
   + **Use the release brain**. Also fix the stale hard-coded "Current: v0.0.11" to
@@ -320,6 +326,24 @@ Verified since (2026-09-27/28):
 | ~~Moving `update.sh`'s bundled branch onto `nell update`~~ | **Moved into slice 2** (Hana, 2026-09-27): it is #289's root fix. | — |
 | Offline or delta updates; keeping more than two versions | Unneeded at ~8 MB overlays. | If overlays grow |
 | Linux real-machine run (Kubuntu validator) of Check → Update → Revert | No Linux host here. | Before promoting slice 4 out of EXPERIMENTAL |
+| First live Check → Update → Use the release brain on any machine (#309) | Needs #305 + #307 merged and a build passing `min_bundle_version` 0.0.43 | 0.0.43 release review |
+| Coordinating the three `useRestartBridge` instances (#310) | Pre-existing; out of slice 4's scope | Next time the restart flow is touched |
+
+**Slice 4 additions (2026-09-28, from its reviews; PR stacked on #307):** the frontend owns
+the restart/rollback chain (`useBrainUpdate`: apply → graceful restart → undo → restart →
+release brain → restart), Rust exposes the primitives; `restart()` resolves whether the bridge
+came back; the updater's own `nell` runs with `KINDLED_NO_OVERLAY=1`, the restart doesn't;
+`apply` re-fetches and re-verifies, checks asset names, streams downloads under a size cap and
+returns `had_active` — with no active overlay before the update the undo is the release brain,
+not a rollback; after a healthy restart the running commit must equal the installed one or the
+row says it didn't load; brain-update state and its busy guard live at module scope (a tab
+switch doesn't lose them); the signature's trusted comment must name `manifest.json`; a bad
+signature is retried once, logged as a security event, and shown as "couldn't be verified —
+check again in a minute"; `KINDLED_BRAIN_UPDATE_TAG` (env only) may select a `brain-main-*`
+dry-run tag. **Not yet run live:** Check → Update → Use the release brain in the real app —
+blocked until #305 + #307 merge and a build passes `min_bundle_version` 0.0.43; tracked in
+#309 and the cross-platform validation list for the 0.0.43 release review. The three
+`useRestartBridge` instances don't coordinate (pre-existing) → #310.
 
 **Slice 3 additions (2026-09-28, from its reviews):** see §3.1 (export flags, the
 `MIN_BUNDLE_VERSION` location, the dispatch allow-list, the job split). For slice 4's design: the
