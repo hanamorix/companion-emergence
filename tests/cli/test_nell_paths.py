@@ -166,3 +166,16 @@ def test_paths_overlay_active_names_the_current_folder(monkeypatch, tmp_path):
     _setup_persona(tmp_path)
     paths = _paths_for_persona("testpersona")
     assert paths["overlay_active"] == overlay.overlay_root() / "abc123def456-0123abcd"
+
+
+def test_paths_overlay_active_ignores_a_malformed_active_entry(monkeypatch, tmp_path):
+    from brain.cli import _paths_for_persona
+    from brain.update import overlay
+
+    monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
+    root = overlay.overlay_root()
+    root.mkdir(parents=True)
+    (root / "current.json").write_text(json.dumps({"active": "garbage", "previous": None}),
+                                       encoding="utf-8")
+    _setup_persona(tmp_path)
+    assert _paths_for_persona("testpersona")["overlay_active"] == Path("none")

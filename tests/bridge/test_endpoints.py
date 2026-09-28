@@ -1044,7 +1044,22 @@ def test_health_reports_the_running_overlay(persona_dir: Path, monkeypatch):
     import brain.bridge.server as server
 
     monkeypatch.setattr(server, "loaded_overlay", lambda: {
-        "dir": "abc123def456-0123abcd", "commit": "a" * 40, "brain_version": "0.0.43"})
+        "dir": "abc123def456-0123abcd", "commit": "a" * 40, "brain_version": "0.0.43",
+        "bundle_match": True})
     with _make_client(persona_dir) as c:
         r = c.get("/health")
-    assert r.json()["overlay"] == {"commit": "a" * 40, "brain_version": "0.0.43"}
+    assert r.json()["overlay"] == {"commit": "a" * 40, "brain_version": "0.0.43", "bundle_match": True}
+
+
+def test_health_survives_a_failing_overlay_probe(persona_dir: Path, monkeypatch):
+    """/health is the restart poll: an overlay probe error must never 500 it."""
+    import brain.bridge.server as server
+
+    def boom():
+        raise RuntimeError("probe exploded")
+
+    monkeypatch.setattr(server, "loaded_overlay", boom)
+    with _make_client(persona_dir) as c:
+        r = c.get("/health")
+    assert r.status_code == 200
+    assert r.json()["overlay"] is None

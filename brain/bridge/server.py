@@ -1247,7 +1247,11 @@ def build_app(
 
         # #286: which brain-main overlay THIS process runs (None = the release
         # brain). The app's version handshake accepts a newer overlay brain.
-        running = loaded_overlay()
+        try:
+            running = loaded_overlay()
+        except Exception:  # the restart health-poll path: must never 500
+            logger.warning("overlay probe failed", exc_info=True)
+            running = None
 
         return {
             "liveness": "ok",
@@ -1266,7 +1270,8 @@ def build_app(
             # calls are backed off and the app should offer re-authorisation.
             "provider_auth": provider_auth.state(),
             "overlay": None if running is None else {
-                "commit": running["commit"], "brain_version": running["brain_version"]},
+                "commit": running["commit"], "brain_version": running["brain_version"],
+                "bundle_match": running["bundle_match"]},
         }
 
     @app.post(

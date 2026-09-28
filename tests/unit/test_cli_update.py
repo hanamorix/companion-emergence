@@ -24,6 +24,13 @@ def test_status_reports_no_overlay(tmp_path, monkeypatch, capsys):
     assert out["install_kind"] == "source" and out["supported"] is False
 
 
+def test_status_reports_the_running_bundle_id(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
+    monkeypatch.setattr(overlay, "current_bundle_id", lambda: "bundle-1")
+    assert cli.main(["update", "--status"]) == 0
+    assert json.loads(capsys.readouterr().out)["bundle_id"] == "bundle-1"
+
+
 def _entry(d):
     return {"dir": d, "commit": d * 10, "brain_version": "0.0.42", "bundle_id": "b"}
 

@@ -1779,7 +1779,8 @@ def _update_handler(args: argparse.Namespace) -> int:
     if args.status:
         state = overlay.read_state(root)
         print(json.dumps({"supported": kind == "bundled" and (site / BUNDLE_ID_FILE).is_file(),
-                          "install_kind": kind, **state}, indent=2))
+                          "install_kind": kind, "bundle_id": overlay.current_bundle_id(),
+                          **state}, indent=2))
         return 0
     try:
         if args.revert or args.rollback:
@@ -1853,7 +1854,8 @@ def _paths_for_persona(persona: str) -> dict[str, Path]:
         # #286: the user-writable overlay; overlay_active is the folder current.json
         # names (what the next start loads) or the bare word "none".
         "overlay_dir": _overlay_root,
-        "overlay_active": _overlay_root / _active["dir"] if _active else Path("none"),
+        "overlay_active": _overlay_root / _active["dir"]
+        if isinstance(_active, dict) and isinstance(_active.get("dir"), str) else Path("none"),
     }
 
 
