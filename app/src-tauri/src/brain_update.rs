@@ -176,6 +176,245 @@ pub(crate) fn updater_pubkey(plugins: &HashMap<String, serde_json::Value>) -> Re
         .ok_or_else(|| "no updater pubkey in tauri.conf.json".to_string())
 }
 
+use std::process::Stdio;
+use std::time::{Duration, Instant};
+// tauri::AppHandle::config()/package_info() are inherent methods in tauri
+// 2.11 — no `tauri::Manager` import needed (unlike bundled_nell_path's
+// resource_dir(), which does require it; see lib.rs).
+
+const MANIFEST_MAX: usize = 64 * 1024;
+const SIG_MAX: usize = 4 * 1024;
+const WHEEL_MAX: usize = 64 * 1024 * 1024;
+const REQUIREMENTS_MAX: usize = 1024 * 1024;
+const STATUS_TIMEOUT_S: u64 = 30;
+const INSTALL_TIMEOUT_S: u64 = 900; // pip may fetch a changed wheel or two
+const FLIP_TIMEOUT_S: u64 = 60;
+
+/// The updater's own nell runs on the release brain (KINDLED_NO_OVERLAY=1): a
+/// broken overlay must not break the tool that replaces it. Never used for the
+/// bridge restart, which must load the new overlay.
+fn floor(std_cmd: std::process::Command, args: &[&str]) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::from(std_cmd);
+    cmd.args(args)
+        .env("KINDLED_NO_OVERLAY", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+/// Run `nell <args>` on the release brain; a spawn error, timeout or non-zero
+/// exit is logged to launch-failures.log and returned as Err(stderr tail).
+async fn run_nell(app: &tauri::AppHandle, args: &[&str], timeout_s: u64) -> Result<String, String> {
+    let label = format!("nell {}", args.join(" "));
+    let started = Instant::now();
+    let mut cmd = floor(crate::nell_command(app)?, args);
+    let out = match tokio::time::timeout(Duration::from_secs(timeout_s), cmd.output()).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            let msg = format!("spawn {label}: {e}");
+            crate::record_spawn_failure(app, &label, None, Some(&msg), started);
+            return Err(msg);
+        }
+        Err(_) => {
+            crate::record_spawn_failure(app, &label, None, Some("timeout"), started);
+            return Err(format!("{label} timed out"));
+        }
+    };
+    if !out.status.success() {
+        crate::record_spawn_failure(app, &label, Some(&out), None, started);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(crate::tail(stderr.trim(), 1000));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Append a non-spawn event (bad signature, rollback) to launch-failures.log.
+fn log_event(app: &tauri::AppHandle, command: &str, detail: &str) {
+    let Ok(home) = crate::nellbrain_home() else { return };
+    let runtime = crate::bundled_nell_path(app).ok().flatten();
+    let _ = crate::launch_log::append_failure(
+        &home,
+        &crate::launch_log::LaunchFailure {
+            command: command.to_string(),
+            exit_code: None,
+            stdout_tail: String::new(),
+            stderr_tail: detail.to_string(),
+            platform: std::env::consts::OS.to_string(),
+            platform_version: std::env::consts::ARCH.to_string(),
+            runtime_path_exists: runtime.as_ref().is_some_and(|p| p.exists()),
+            bundled_runtime_path: runtime.map(|p| p.to_string_lossy().into_owned()),
+            duration_ms: 0,
+        },
+    );
+}
+
+async fn fetch(client: &reqwest::Client, url: &str, max: usize) -> Result<Vec<u8>, String> {
+    let bytes = client
+        .get(url)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| format!("{url}: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| format!("{url}: {e}"))?;
+    if bytes.len() > max {
+        return Err(format!("{url}: larger than {max} bytes"));
+    }
+    Ok(bytes.to_vec())
+}
+
+enum FetchError {
+    Unreachable(String),
+    BadSignature(String),
+}
+
+/// Fetch + verify manifest.json. A bad signature is retried once after 3 s —
+/// manifest and .sig upload in parallel, so they can briefly disagree — then
+/// logged as a security event. Never falls back to installing.
+async fn fetch_verified_manifest(
+    app: &tauri::AppHandle,
+    client: &reqwest::Client,
+    tag: &str,
+) -> Result<Manifest, FetchError> {
+    let pubkey = updater_pubkey(&app.config().plugins.0).map_err(FetchError::Unreachable)?;
+    let mut last = String::new();
+    for attempt in 0..2 {
+        if attempt == 1 {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+        let manifest = fetch(client, &asset_url(tag, "manifest.json"), MANIFEST_MAX)
+            .await
+            .map_err(FetchError::Unreachable)?;
+        let sig = fetch(client, &asset_url(tag, "manifest.json.sig"), SIG_MAX)
+            .await
+            .map_err(FetchError::Unreachable)?;
+        let sig = String::from_utf8_lossy(&sig).into_owned();
+        match verify_manifest(&manifest, &sig, &pubkey) {
+            Ok(()) => {
+                return serde_json::from_slice(&manifest)
+                    .map_err(|e| FetchError::Unreachable(format!("manifest.json: {e}")));
+            }
+            Err(e) => last = e,
+        }
+    }
+    log_event(app, "brain update: manifest signature rejected (security)", &last);
+    Err(FetchError::BadSignature(last))
+}
+
+fn http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|e| format!("http client: {e}"))
+}
+
+fn tag() -> String {
+    resolve_tag(std::env::var(TAG_ENV).ok().as_deref())
+}
+
+#[tauri::command]
+pub(crate) async fn check_brain_update(app: tauri::AppHandle) -> Result<BrainUpdateCheck, String> {
+    if crate::bundled_nell_path(&app)?.is_none() {
+        return Ok(BrainUpdateCheck::none("dev_build", None));
+    }
+    let client = http_client()?;
+    let manifest = match fetch_verified_manifest(&app, &client, &tag()).await {
+        Ok(m) => m,
+        Err(FetchError::Unreachable(e)) => return Ok(BrainUpdateCheck::none("unreachable", Some(e))),
+        Err(FetchError::BadSignature(e)) => return Ok(BrainUpdateCheck::none("bad_signature", Some(e))),
+    };
+    let status = run_nell(&app, &["update", "--status"], STATUS_TIMEOUT_S).await?;
+    if !status_supported(&status) {
+        return Ok(BrainUpdateCheck::none("unsupported_install", None));
+    }
+    let bundle_version = app.package_info().version.to_string();
+    Ok(decide(&manifest, active_commit_from_status(&status).as_deref(), &bundle_version))
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub(crate) struct BrainUpdateApplied {
+    pub commit: String,
+    pub brain_version: String,
+}
+
+/// Removed on drop, success or failure.
+struct TempDir(std::path::PathBuf);
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Re-fetch and re-verify (never trust the earlier check), download both assets,
+/// check their sha256 against the verified manifest, then `nell update` installs
+/// them into the overlay. The running bridge keeps its code until the frontend
+/// restarts it.
+#[tauri::command]
+pub(crate) async fn apply_brain_update(app: tauri::AppHandle) -> Result<BrainUpdateApplied, String> {
+    if crate::bundled_nell_path(&app)?.is_none() {
+        return Err("brain updates need the installed app (this is a dev build)".into());
+    }
+    let client = http_client()?;
+    let tag = tag();
+    let m = match fetch_verified_manifest(&app, &client, &tag).await {
+        Ok(m) => m,
+        Err(FetchError::Unreachable(e)) => return Err(format!("couldn't reach the brain update: {e}")),
+        Err(FetchError::BadSignature(_)) => return Err("the brain update's signature didn't verify".into()),
+    };
+    let status = run_nell(&app, &["update", "--status"], STATUS_TIMEOUT_S).await?;
+    let verdict = decide(&m, active_commit_from_status(&status).as_deref(), &app.package_info().version.to_string());
+    if !verdict.available {
+        return Err(format!("no brain update to apply ({})", verdict.reason));
+    }
+    check_asset_names(&m)?;
+    let dir = TempDir(std::env::temp_dir().join(format!(
+        "ce-brain-update-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+    )));
+    std::fs::create_dir_all(&dir.0).map_err(|e| format!("temp dir: {e}"))?;
+    for (asset, max) in [(&m.wheel, WHEEL_MAX), (&m.requirements, REQUIREMENTS_MAX)] {
+        let bytes = fetch(&client, &asset_url(&tag, &asset.name), max).await?;
+        let got = sha256_hex(&bytes);
+        if got != asset.sha256 {
+            return Err(format!("{} failed its checksum (expected {}, got {got})", asset.name, asset.sha256));
+        }
+        std::fs::write(dir.0.join(&asset.name), &bytes).map_err(|e| format!("write {}: {e}", asset.name))?;
+    }
+    let wheel = dir.0.join(&m.wheel.name).to_string_lossy().into_owned();
+    let req = dir.0.join(&m.requirements.name).to_string_lossy().into_owned();
+    run_nell(
+        &app,
+        &["update", "--wheel", &wheel, "--requirements", &req, "--commit", &m.commit],
+        INSTALL_TIMEOUT_S,
+    )
+    .await?;
+    Ok(BrainUpdateApplied { commit: m.commit, brain_version: m.brain_version })
+}
+
+/// The updated bridge was unhealthy (spec §6): make the previous overlay current
+/// (or the release brain when there is none). The frontend restarts afterwards.
+#[tauri::command]
+pub(crate) async fn rollback_brain(app: tauri::AppHandle, reason: String) -> Result<(), String> {
+    log_event(&app, "brain update: rolled back", &reason);
+    run_nell(&app, &["update", "--rollback"], FLIP_TIMEOUT_S).await.map(|_| ())
+}
+
+/// "Use the release brain": clear the active overlay. The frontend restarts afterwards.
+#[tauri::command]
+pub(crate) async fn revert_brain(app: tauri::AppHandle) -> Result<(), String> {
+    run_nell(&app, &["update", "--revert"], FLIP_TIMEOUT_S).await.map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,5 +551,15 @@ mod tests {
         let key = updater_pubkey(&plugins).unwrap();
         assert!(minisign_verify::PublicKey::decode(&b64_text(&key, "k").unwrap()).is_ok());
         assert!(updater_pubkey(&HashMap::new()).is_err());
+    }
+
+    #[test]
+    fn floor_command_disables_the_overlay() {
+        let cmd = floor(std::process::Command::new("nell"), &["update", "--status"]);
+        let std_cmd = cmd.as_std();
+        let envs: Vec<_> = std_cmd.get_envs().collect();
+        assert!(envs.contains(&(std::ffi::OsStr::new("KINDLED_NO_OVERLAY"), Some(std::ffi::OsStr::new("1")))));
+        let args: Vec<_> = std_cmd.get_args().collect();
+        assert_eq!(args, ["update", "--status"]);
     }
 }

@@ -65,7 +65,7 @@ pub struct InitResult {
 ///   2. NELLBRAIN_HOME — backwards-compat fallback through v0.0.13 series;
 ///      will be removed in v0.0.14
 ///   3. platformdirs default
-fn nellbrain_home() -> Result<PathBuf, String> {
+pub(crate) fn nellbrain_home() -> Result<PathBuf, String> {
     // KINDLED_HOME is canonical as of v0.0.13. NELLBRAIN_HOME stays as
     // backwards-compat fallback through v0.0.13 series; removed in v0.0.14.
     // Matches brain/paths.py priority order — Python and Rust must agree on
@@ -327,7 +327,7 @@ fn strip_verbatim_prefix(p: std::path::PathBuf) -> std::path::PathBuf {
 }
 
 /// Return the bundled production `nell` entry point when it exists.
-fn bundled_nell_path(app: &tauri::AppHandle) -> Result<Option<PathBuf>, String> {
+pub(crate) fn bundled_nell_path(app: &tauri::AppHandle) -> Result<Option<PathBuf>, String> {
     use tauri::Manager;
     let resource_dir = app
         .path()
@@ -388,7 +388,7 @@ fn path_with_claude_cli_dirs(existing: Option<&str>, home: Option<&str>) -> Stri
 /// those calls fail with "couldn't reach Claude" even though `claude` is
 /// installed (the wizard's `check_claude_cli` probe finds it fine, but that
 /// check never fixed the PATH the daemon itself runs with).
-fn nell_command(app: &tauri::AppHandle) -> Result<Command, String> {
+pub(crate) fn nell_command(app: &tauri::AppHandle) -> Result<Command, String> {
     let mut cmd = if let Some(bundled) = bundled_nell_path(app)? {
         Command::new(bundled)
     } else {
@@ -406,7 +406,7 @@ fn nell_command(app: &tauri::AppHandle) -> Result<Command, String> {
 }
 
 /// Last `n` bytes of a string (UTF-8-safe at the char boundary).
-fn tail(s: &str, n: usize) -> String {
+pub(crate) fn tail(s: &str, n: usize) -> String {
     if s.len() <= n {
         return s.to_string();
     }
@@ -421,7 +421,7 @@ fn tail(s: &str, n: usize) -> String {
 /// Append a structured entry to `$KINDLED_HOME/launch-failures.log` for a
 /// failed CLI spawn. Best-effort: any error here is swallowed so a logging
 /// problem never masks the real spawn failure the caller is reporting.
-fn record_spawn_failure(
+pub(crate) fn record_spawn_failure(
     app: &tauri::AppHandle,
     command: &str,
     output: Option<&std::process::Output>,
@@ -1888,6 +1888,10 @@ pub fn run() {
             detect_install_shape,
             set_always_on_top,
             show_initiate_notification,
+            brain_update::check_brain_update,
+            brain_update::apply_brain_update,
+            brain_update::rollback_brain,
+            brain_update::revert_brain,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
