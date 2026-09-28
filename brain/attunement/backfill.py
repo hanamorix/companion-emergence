@@ -130,12 +130,13 @@ def _now_iso_str(now: _datetime) -> str:
 
 def _load_state(persona_dir: Path):  # -> BackfillState | None
     from brain.attunement.schemas import BackfillState
+    from brain.state_compat import from_known_fields
 
     p = _state_path(persona_dir)
     if not p.exists():
         return None
     try:
-        return BackfillState(**json.loads(p.read_text()))
+        return from_known_fields(BackfillState, json.loads(p.read_text()))
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
         _log.warning("attunement backfill: corrupt state file: %s", exc)
         return None
