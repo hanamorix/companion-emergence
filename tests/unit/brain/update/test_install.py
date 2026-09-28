@@ -146,6 +146,17 @@ def test_smoke_runs_the_new_folder_on_the_bundle_alone(tmp_path, monkeypatch):
     install._smoke(folder, ["hook_off"])
 
 
+def test_smoke_places_the_new_folder_after_the_stdlib(tmp_path):
+    """#303: the hook puts an overlay just before the bundle's site-packages, after the
+    stdlib — so a stdlib name inside the new folder must not shadow the stdlib in the
+    smoke either (it won't at runtime)."""
+    folder = tmp_path / "new"
+    (folder / "brain").mkdir(parents=True)
+    (folder / "brain" / "__init__.py").write_text("", encoding="utf-8")
+    (folder / "json.py").write_text("raise ImportError('shadowed the stdlib')\n", encoding="utf-8")
+    install._smoke(folder, ["json"])
+
+
 def test_hash_mismatch_fails_before_activation(tmp_path):
     finds = tmp_path / "finds"
     finds.mkdir()

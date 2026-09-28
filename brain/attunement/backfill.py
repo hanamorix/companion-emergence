@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC
@@ -130,12 +131,13 @@ def _now_iso_str(now: _datetime) -> str:
 
 def _load_state(persona_dir: Path):  # -> BackfillState | None
     from brain.attunement.schemas import BackfillState
+    from brain.state_compat import from_known_fields
 
     p = _state_path(persona_dir)
     if not p.exists():
         return None
     try:
-        return BackfillState(**json.loads(p.read_text()))
+        return from_known_fields(BackfillState, json.loads(p.read_text()))
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
         _log.warning("attunement backfill: corrupt state file: %s", exc)
         return None
@@ -220,7 +222,25 @@ def should_run_supplementary_backfill(persona_dir: Path) -> bool:
     existing = _load_state(persona_dir)
     if existing is None or existing.status != "complete":
         return False
-    return existing.schema_version != SCHEMA_VERSION
+    old, new = _schema_key(existing.schema_version), _schema_key(SCHEMA_VERSION)
+    if old is None or new is None:  # unparseable: re-run on any difference, as before
+        return existing.schema_version != SCHEMA_VERSION
+    # Only OLDER: a newer version is what a rolled-back brain finds (#295).
+    return old < new
+
+
+_SCHEMA_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-([A-Za-z]+)\.?(\d*))?$")
+
+
+def _schema_key(version: str) -> tuple[int, int, int, int, int] | None:
+    """Sort key: 0.0.28-alpha.1 < 0.0.28-alpha.2 < 0.0.28 < 0.0.29. None if unparseable."""
+    # ponytail: pre-release labels aren't ranked against each other (alpha.1 == beta.1);
+    # only alpha has ever been used — rank labels if beta/rc ever appear.
+    m = _SCHEMA_RE.match(version or "")
+    if m is None:
+        return None
+    major, minor, patch, label, num = m.groups()
+    return (int(major), int(minor), int(patch), 0 if label else 1, int(num or 0))
 
 
 def run_backfill(

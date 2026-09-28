@@ -22,6 +22,7 @@ from pathlib import Path
 
 from brain.health.adaptive import compute_treatment
 from brain.health.attempt_heal import attempt_heal, save_with_backup
+from brain.state_compat import from_known_fields
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +129,7 @@ def read(persona_dir: Path) -> BridgeState | None:
         )
     # Backward-compat: legacy files written before drain_errors existed.
     data.setdefault("drain_errors", 0)
-    return BridgeState(**data)
+    return from_known_fields(BridgeState, data)
 
 
 def _windows_pid_is_alive(pid: int) -> bool:
