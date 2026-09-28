@@ -53,6 +53,19 @@ describe("BrainUpdateRow — running overlay", () => {
     expect(useReleaseBrain).toHaveBeenCalledTimes(1);
   });
 
+  it("shows an overlay whose build is unknown, with the release-brain button", () => {
+    setHook({ kind: "idle" }, { commit: null, brain_version: null });
+    render(<BrainUpdateRow persona="nell" mode="live" checkToken={0} />);
+    expect(screen.getByText("Brain: main (unknown build)")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /use the release brain/i })).toBeEnabled();
+  });
+
+  it("disables 'Use the release brain' while checking", () => {
+    setHook({ kind: "checking" }, { commit: "abc1234def5678", brain_version: "0.0.44" });
+    render(<BrainUpdateRow persona="nell" mode="live" checkToken={0} />);
+    expect(screen.getByRole("button", { name: /use the release brain/i })).toBeDisabled();
+  });
+
   it("renders nothing visible when there is no overlay and state is idle", () => {
     setHook({ kind: "idle" }, null);
     const { container } = render(<BrainUpdateRow persona="nell" mode="live" checkToken={0} />);
@@ -108,6 +121,20 @@ describe("BrainUpdateRow — none", () => {
     ).toBeInTheDocument();
   });
 
+  it("unsupported_manifest asks for a newer app", () => {
+    setHook({ kind: "none", reason: "unsupported_manifest" });
+    render(<BrainUpdateRow persona="nell" mode="live" checkToken={0} />);
+    expect(
+      screen.getByText("A brain update needs a newer app — update Companion Emergence first."),
+    ).toBeInTheDocument();
+  });
+
+  it.each(["unsupported_install", "unparseable_version"])("%s says no updates for this install", (reason) => {
+    setHook({ kind: "none", reason });
+    render(<BrainUpdateRow persona="nell" mode="live" checkToken={0} />);
+    expect(screen.getByText("No brain updates for this install.")).toBeInTheDocument();
+  });
+
   it("already_active", () => {
     setHook({ kind: "none", reason: "already_active" });
     render(<BrainUpdateRow persona="nell" mode="live" checkToken={0} />);
@@ -124,6 +151,14 @@ describe("BrainUpdateRow — none", () => {
     setHook({ kind: "none", reason: "dev_build" });
     const { container } = render(<BrainUpdateRow persona="nell" mode="live" checkToken={0} />);
     expect(container).toBeEmptyDOMElement();
+  });
+});
+
+describe("BrainUpdateRow — live status", () => {
+  it("announces the status line politely", () => {
+    setHook({ kind: "checking" });
+    render(<BrainUpdateRow persona="nell" mode="live" checkToken={0} />);
+    expect(screen.getByText("Checking for a brain update…").closest('[aria-live="polite"]')).not.toBeNull();
   });
 });
 

@@ -22,6 +22,19 @@ const buttonStyle = {
 
 const short = (commit: string | null | undefined) => (commit ?? "").slice(0, 7);
 
+function noneCopy(reason: string): string {
+  switch (reason) {
+    case "app_too_old":
+    case "unsupported_manifest":
+      return "A brain update needs a newer app — update Companion Emergence first.";
+    case "unsupported_install":
+    case "unparseable_version":
+      return "No brain updates for this install.";
+    default:
+      return "The brain is up to date ✓";
+  }
+}
+
 export function BrainUpdateRow({
   persona,
   mode,
@@ -39,15 +52,16 @@ export function BrainUpdateRow({
   }, [checkToken]);
 
   const running =
-    overlay && overlay.commit ? (
+    overlay ? (
       <div style={{ marginTop: 8 }}>
         <div style={{ ...muted, color: "var(--text)" }}>
-          Brain: main @{short(overlay.commit)}
-          {overlay.brain_version ? ` (${overlay.brain_version})` : ""}
+          {overlay.commit
+            ? `Brain: main @${short(overlay.commit)}${overlay.brain_version ? ` (${overlay.brain_version})` : ""}`
+            : "Brain: main (unknown build)"}
         </div>
         <button
           onClick={() => void useReleaseBrain()}
-          disabled={state.kind === "applying" || state.kind === "restarting" || state.kind === "reverting"}
+          disabled={["checking", "applying", "restarting", "reverting"].includes(state.kind)}
           style={{
             ...buttonStyle,
             background: "transparent",
@@ -96,9 +110,7 @@ export function BrainUpdateRow({
       if (state.reason === "dev_build") break;
       status = (
         <div style={muted}>
-          {state.reason === "app_too_old"
-            ? "A brain update needs a newer app — update Companion Emergence first."
-            : "The brain is up to date ✓"}
+          {noneCopy(state.reason)}
         </div>
       );
       break;
@@ -121,7 +133,7 @@ export function BrainUpdateRow({
   if (!running && !status) return null;
   return (
     <div>
-      {status}
+      <div aria-live="polite">{status}</div>
       {running}
     </div>
   );
