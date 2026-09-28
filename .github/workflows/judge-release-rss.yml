@@ -3,9 +3,10 @@ name: judge-release-rss
 # INC-5 (RAM-spike fix, spec §2; 1.5-criteria.md C2/C3/C14): a dedicated 3-OS
 # job proving the judge's RAM is ACTUALLY released after a calibration/
 # self-tune job finishes -- not merely that `release_judge()` was called.
-# `gc.collect()` + Linux's `malloc_trim(0)` is an OS-specific mechanism (O7:
-# Linux RSS only drops after gc+trim; macOS/Windows have no equivalent call
-# and are expected to reclaim via the allocator on `free()` alone) -- a
+# `gc.collect()` + an OS-specific allocator call is the mechanism (O7: Linux
+# RSS only drops after gc+`malloc_trim(0)`; macOS needs
+# `malloc_zone_pressure_relief(NULL, 0)` -- its allocator keeps freed pages
+# otherwise; Windows is expected to reclaim on `free()` alone) -- a
 # platform where RSS does NOT drop back down is a ship blocker per S27 and
 # is reported here, never waived by the guarded-change loop.
 #

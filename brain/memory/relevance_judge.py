@@ -621,13 +621,17 @@ def release_judge() -> None:
         kept one alive past that point.
 
     Then, on every platform, `gc.collect()` (reclaims any of the above still
-    alive only via a cycle); on Linux only, `ctypes.CDLL("libc.so.6").
+    alive only via a cycle); on Linux, `ctypes.CDLL("libc.so.6").
     malloc_trim(0)` — glibc's allocator does not always return freed pages
     to the OS on `free()` alone (O7: Linux RSS only drops after gc+trim),
     so this is the step that actually shows up in `psutil`'s RSS reading.
-    Guarded both by `sys.platform.startswith("linux")` (never attempted on
-    macOS/Windows, which have no `libc.so.6` and no `malloc_trim` — I13) and
-    by a try/except around the `CDLL`/symbol lookup itself (a musl-based
+    macOS gets its analogue, `malloc_zone_pressure_relief(NULL, 0)` from
+    libSystem (guarded by `sys.platform == "darwin"`, fail-soft the same
+    way); Windows needs none (its heap returns freed pages on its own — the
+    C2 RSS test passes there without one).
+    The Linux call is guarded both by `sys.platform.startswith("linux")`
+    (never attempted on macOS/Windows, which have no `libc.so.6` and no
+    `malloc_trim` — I13) and by a try/except around the `CDLL`/symbol lookup itself (a musl-based
     Linux, or a hardened glibc build missing the symbol, would otherwise
     raise here; logged once, not re-raised, since a failed trim only means
     RSS drops less promptly, not that anything is wrong).
@@ -647,6 +651,24 @@ def release_judge() -> None:
             ctypes.CDLL("libc.so.6").malloc_trim(0)
         except (OSError, AttributeError):
             logger.warning("release_judge: malloc_trim(0) unavailable on this libc — RSS may drop later")
+    elif sys.platform == "darwin":
+        # macOS analogue of the Linux malloc_trim(0) above: libSystem's
+        # malloc zones keep freed pages resident after free(), so after the
+        # judge's tensors are dropped RSS can sit well above the pre-load
+        # level (CI measured 26.3% retained vs the 25% C2 bound on macos-14;
+        # the calibration arm retained ~20%). `malloc_zone_pressure_relief(
+        # NULL, 0)` asks every zone to return whatever it can to the OS.
+        # Fail-soft like the Linux branch: any failure to find or call it is
+        # logged and swallowed, since it only affects how promptly RSS drops.
+        try:
+            import ctypes
+
+            relief = ctypes.CDLL("/usr/lib/libSystem.B.dylib").malloc_zone_pressure_relief
+            relief.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            relief.restype = ctypes.c_size_t
+            relief(None, 0)
+        except Exception:  # ctypes can raise OSError / AttributeError / ArgumentError
+            logger.warning("release_judge: malloc_zone_pressure_relief unavailable on this macOS — RSS may drop later")
 
 
 # ---------------------------------------------------------------------------

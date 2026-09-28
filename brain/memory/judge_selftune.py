@@ -784,7 +784,7 @@ def _run_judge_selftune_tick(*, store, now: datetime, persona_dir: Path | None =
         # (`build_judge_provider()`) and/or per-persona `FullModelJudge`/
         # LoRA/full-FT scratch models that are never cached (module docstring
         # above `relevance_judge._provider_cache`) — `release_judge()` drops
-        # the cache AND gc.collect()s (+ malloc_trim(0) on Linux) so those
+        # the cache AND gc.collect()s (+ malloc_trim(0) on Linux / malloc_zone_pressure_relief on macOS) so those
         # uncached, now-unreferenced models are actually reclaimed too. The
         # PAUSE arm (a mid-tick idle-loss) is INC-10; this tick has no pause
         # point yet, so every path here is a FINISH.

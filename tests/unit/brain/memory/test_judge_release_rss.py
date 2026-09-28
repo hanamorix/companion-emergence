@@ -197,8 +197,9 @@ _RSS_TRACE_PRELUDE = textwrap.dedent(
 # (agentId a604186324bde4711) correctly flagged that as generalizing a
 # single-platform sample to macOS/Windows CI legs whose reclaim mechanism is
 # explicitly documented (`judge-release-rss.yml`'s own header, S27) to
-# differ from Linux's (`malloc_trim(0)` is Linux-only; macOS/Windows rely on
-# the allocator's own free()-time reclaim) -- an assumption of cross-OS
+# differ from Linux's (`malloc_trim(0)` is Linux-only; macOS uses
+# `malloc_zone_pressure_relief`, Windows relies on the allocator's own
+# free()-time reclaim) -- an assumption of cross-OS
 # equivalence this criterion exists to test, not one to bake into its own
 # gate. Restoring the criteria's original, already-negotiated 25% avoids
 # that risk entirely while keeping the bite: it still fails at ~100%
@@ -215,7 +216,7 @@ def test_c2a_calibration_tick_finish_releases_judge_rss() -> None:
     injected anyway, purely so the tick never attempts `build_tier_provider`'s
     real Claude-CLI construction) ends with bridge-process RSS back down to
     <= (RSS before judge load) + 25% * (judge load delta) — S11/S27's
-    release step (drop refs, gc.collect(), Linux malloc_trim(0)) actually
+    release step (drop refs, gc.collect(), per-OS allocator relief) actually
     frees the judge's RAM, not merely drops a Python reference.
 
     Fail-first (pre-INC-5): no `release_judge()` call exists at all — the
