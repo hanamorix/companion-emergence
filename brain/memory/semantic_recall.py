@@ -49,7 +49,8 @@ This module owns:
     hot path)
   - the query embed (the ONE allowed synchronous in-turn embed, decision 4)
   - the cosine coarse-cut (cheap pre-filter to `relevance.CANDIDATE_POOL`,
-    filled genuine-first: `genuine_first_coarse_cut`, spec §4, S77)
+    genuine-first: the top 50 genuine plus the family in the plain top 50,
+    `genuine_first_coarse_cut`, spec §4, S77)
   - the rerank call (`reranker.build_reranker_provider` +
     `reranker.rerank_for_recall`, its width fitted per message to the
     measured rerank cost on this host) and its no-rerank alternative
@@ -72,7 +73,6 @@ or clustering (Stage 5, unaffected).
 
 from __future__ import annotations
 
-import heapq
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -364,23 +364,38 @@ def genuine_first_coarse_cut(
     pool: dict[str, tuple[Memory, np.ndarray]],
     size: int = CANDIDATE_POOL,
 ) -> list[tuple[str, float]]:
-    """The `size`-candidate coarse cut of `cosine_scored`, filled genuine-first
-    (name-recall fix R3 follow-up, spec §4, S77): every genuine memory by
-    descending cosine, then monologue-family memories by descending cosine for
-    any places left. A monologue-family memory therefore can never keep a
-    genuine one out of the pool, however many of them out-score it.
+    """One query's coarse cut (name-recall fix R3 follow-up, spec §4, S77
+    revised): the `size` best GENUINE memories by descending cosine, then the
+    monologue-family memories that sit in today's plain cosine top-`size`, by
+    descending cosine. No new constant, no score multiplier, scores unchanged.
 
-    One pass over the scored list: `heapq.nsmallest` on the key `(is_family,
-    -cosine)` (the family flag is computed once per entry) keeps only the
-    `size` best, O(N log size), with the same stable tie order as a full sort
-    (input order among equal keys). No second scan of the pool.
+    The cut can therefore hold more than `size` entries (up to 2 x `size`),
+    and it guarantees both halves of spec §4/S16: a family memory can never
+    keep a genuine one out of it (genuine memories fill their own `size`
+    places), and a family memory that plain cosine would have admitted is
+    still in it (so it can surface, ranked after the genuine ones). Rerank
+    slots go to this order's prefix, i.e. genuine first: family memories are
+    reranked only if width remains, and `rerank_for_recall` only ever sees the
+    first `CANDIDATE_POOL` documents.
+
+    One pass over the candidates: a single sort by cosine, then a walk that
+    stops as soon as the plain top-`size` is behind it and `size` genuine
+    memories are held (the family flag is computed only for entries walked,
+    once each). Ties keep input order, as the plain cosine sort did.
     `cosine_scored` may arrive unsorted.
     """
-    return heapq.nsmallest(
-        size,
-        cosine_scored,
-        key=lambda pair: (is_monologue_family(pool[pair[0]][0]), -pair[1]),
-    )
+    ordered = sorted(cosine_scored, key=lambda pair: -pair[1])
+    genuine: list[tuple[str, float]] = []
+    family: list[tuple[str, float]] = []
+    for rank, pair in enumerate(ordered):
+        if rank >= size and len(genuine) >= size:
+            break
+        if is_monologue_family(pool[pair[0]][0]):
+            if rank < size:
+                family.append(pair)
+        elif len(genuine) < size:
+            genuine.append(pair)
+    return genuine + family
 
 
 def genuine_first_ranking(
@@ -640,9 +655,10 @@ def run_semantic_recall(
     (`build_embedding_provider()` — F1 #259 increment 8: the per-recall
     query embed is transient and is never cached/persisted, so it goes
     straight through the provider with no cache row to write), cosines it
-    against the model_id-scoped candidate pool as a CHEAP COARSE CUT (the
-    `relevance.CANDIDATE_POOL` best, filled genuine-first: genuine memories
-    by cosine, then monologue-family by cosine, `genuine_first_coarse_cut`),
+    against the model_id-scoped candidate pool as a CHEAP COARSE CUT (the top
+    `relevance.CANDIDATE_POOL` genuine memories by cosine plus the
+    monologue-family memories in the plain top-`CANDIDATE_POOL`, so it can
+    exceed 50: `genuine_first_coarse_cut`),
     then `rank_and_gate`s the coarse cut:
 
       - reranked path: a cross-encoder rerank of a per-message-width prefix
@@ -702,7 +718,7 @@ def run_semantic_recall(
         cosine_scored = [
             (mid, cosine_similarity(query_vec, vec)) for mid, (_, vec) in pool.items()
         ]
-        # Spec §4, S77: the 50-candidate pool is filled genuine-first.
+        # Spec §4, S77: top 50 genuine + the family memories in the plain top 50.
         coarse = genuine_first_coarse_cut(cosine_scored, pool)
 
         gated = rank_and_gate(
