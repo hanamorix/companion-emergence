@@ -264,6 +264,44 @@ def test_merged_fill_takes_genuine_keyword_hits_before_family_ones(tmp_path: Pat
     assert set(ids[7:]) <= {m.id for m in family}
 
 
+def _family_flood_store() -> tuple[MemoryStore, list[Memory], list[Memory]]:
+    """14 monologue-family memories matching 4 query words at importance 9.5 and
+    6 genuine ones matching 1 word at importance 3.0: with `limit * 2` = 16 the
+    ranker's old window held only 2 of the genuine ones."""
+    store = MemoryStore(":memory:")
+    family = [
+        _mem(store, f"quokka harbour market garden family note {i}", importance=9.5, memory_type="monologue")
+        for i in range(14)
+    ]
+    genuine = [_mem(store, f"quokka plain genuine entry {i}", importance=3.0) for i in range(6)]
+    return store, family, genuine
+
+
+def test_family_flood_cannot_crowd_genuine_keyword_hits_out_of_the_limit(tmp_path: Path) -> None:
+    store, family, genuine = _family_flood_store()
+    ids = [r[0] for r in _active_rows(_render(store, "quokka harbour market garden", tmp_path, None))]
+    assert len(ids) == SNIPPET_COUNT
+    assert {m.id for m in genuine} <= set(ids), "every genuine hit the ranker found is rendered ahead of any family hit"
+    assert ids[: len(genuine)] and {*ids[: len(genuine)]} == {m.id for m in genuine}
+
+
+def test_family_flood_on_the_no_persona_dir_path(tmp_path: Path) -> None:
+    store, family, genuine = _family_flood_store()
+    block = _build_recall_block(store, "quokka harbour market garden", persona_dir=None)
+    assert all(m.id in block for m in genuine)
+
+
+def test_full_inject_slots_go_to_genuine_memories_before_monologue_family_ones(tmp_path: Path) -> None:
+    store = MemoryStore(":memory:")
+    sem = [_mem(store, f"harbour gull entry {i} " + _LONG.replace("quokka", "gull")) for i in range(5)]
+    family = _mem(store, f"{_LONG} (family)", importance=9.9, memory_type="monologue_trace")
+    genuine = [_mem(store, f"{_LONG} (genuine {i})", importance=9.0) for i in range(3)]
+    rows = _active_rows(_render(store, "quokka", tmp_path, _semantic(full=sem)))
+    full_keyword = {rid for rid, body in rows[5:] if not _is_snippet(body)}
+    assert full_keyword == {m.id for m in genuine}, "the 3 promoted-full slots are genuine; the family hit is a snippet"
+    assert family.id in {rid for rid, _ in rows}
+
+
 def test_semantic_snippet_tier_renders_in_path_order_not_resorted_by_importance(tmp_path: Path) -> None:
     """P-11 (R3's hand-off): a high-importance monologue-family memory in the
     semantic snippet tier must not render above a genuine snippet the path

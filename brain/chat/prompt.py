@@ -25,6 +25,7 @@ from brain.engines.research_ambient import build_research_awareness_block
 from brain.maker.ambient import build_maker_awareness_block
 from brain.memory.recall_open import open_memory
 from brain.memory.relevance import (
+    CANDIDATE_POOL,
     FULL_INJECT_IMPORTANCE,
     FULL_INJECT_MAX,
     SNIPPET_COUNT,
@@ -36,6 +37,7 @@ from brain.memory.semantic_recall import (
     MAX_STANDOUT_COUNT,
     SemanticRecallResult,
     genuine_first_memories,
+    is_monologue_family,
     run_semantic_recall,
 )
 from brain.memory.store import MemoryStore
@@ -822,13 +824,16 @@ def _full_inject_ids(mems: list) -> set[str]:
 
     A candidate with ``importance >= FULL_INJECT_IMPORTANCE`` is never gated
     behind a read-call. At most ``FULL_INJECT_MAX`` are full-injected
-    (highest-importance first) so the volatile prompt tail stays bounded (C20);
+    (highest-importance first, genuine before monologue-family) so the
+    volatile prompt tail stays bounded (C20);
     any further imp≥9 candidates fall back to snippets.
     """
     if not SNIPPET_MODE_ENABLED:
         return set()
     hi = [m for m in mems if float(getattr(m, "importance", 0) or 0) >= FULL_INJECT_IMPORTANCE]
-    hi.sort(key=lambda m: -float(getattr(m, "importance", 0) or 0))
+    # Highest importance first; a monologue-family memory never takes one of
+    # the few full-inject slots from a genuine one (name-recall fix R4, S16).
+    hi.sort(key=lambda m: (is_monologue_family(m), -float(getattr(m, "importance", 0) or 0)))
     return {m.id for m in hi[:FULL_INJECT_MAX]}
 
 
@@ -1049,7 +1054,9 @@ def _build_recall_block(
         candidates: list = []
         merged: dict[str, float] = {}
         try:
-            ranked = rank_memories(store, None, tokens, limit=limit)
+            # The ranker's whole candidate pool, so the monologue-family
+            # partition below can promote genuine hits into the `limit` (spec §4).
+            ranked = rank_memories(store, None, tokens, limit=CANDIDATE_POOL)
         except Exception:  # noqa: BLE001
             ranked = []
         for mem, score in ranked:
@@ -1177,6 +1184,10 @@ def _build_recall_block(
                 limit=limit * 2,
                 hebbian=heb,
                 lost_query=" ".join(legacy_tokens),
+                # ACTIVE hits come from the ranker's whole candidate pool so the
+                # family partition below is not confined to the first 2*limit
+                # (spec §4); fading and lost keep their old windows.
+                rank_limit=CANDIDATE_POOL,
             )
         except Exception:  # noqa: BLE001
             result = None
@@ -1356,8 +1367,8 @@ def _build_recall_block(
         # rendered in FULL goes through the one door (`open_memory`: +1.0,
         # deliberate=False, per-id enqueue when persona_dir is set), a genuine
         # snippet takes the rank-weighted fractional bump and is folded into one
-        # batched enqueue. `seen` (created before the active-selection fork and
-        # already threaded through the semantic tier) dedups every id across every
+        # batched enqueue. `seen` (created before the active tier is rendered and
+        # threaded through it and the fading tier) dedups every id across every
         # tier this turn, so a memory opened once is bumped/enqueued once.
         #
         # Behaviour preservation (SNIPPET_MODE_ENABLED True, production): full-open

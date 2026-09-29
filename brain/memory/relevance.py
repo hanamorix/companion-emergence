@@ -44,8 +44,8 @@ HEB_DEPTH = 2
 HEB_DECAY_PER_HOP = 0.5
 
 # Candidate pool pulled from FTS before ranking — wider than the render limit so
-# the ranker has something to reorder. A named const, sibling to
-# `_RECALL_TOKEN_LIMIT`.
+# the ranker has something to reorder (and the recall paths something to
+# partition genuine-first before cutting to their limit).
 CANDIDATE_POOL = 50
 
 # Flag: when False, falls back to recency-only `search_text` (score None).

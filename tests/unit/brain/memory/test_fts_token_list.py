@@ -70,3 +70,25 @@ def test_search_with_loss_active_bucket_uses_every_list_token(tmp_path: Path) ->
     store, (mem, _other) = _store_with("the AI lab", "harbour entry")
     res = search_with_loss(tmp_path, store, ["ai"], limit=5, lost_query="zzz")
     assert [m.id for m in res.active] == [mem.id]
+
+
+def test_rank_limit_widens_the_active_bucket_only(tmp_path: Path) -> None:
+    """R4: `rank_limit` gives the active bucket the ranker's wider window, while
+    the fading bucket keeps the first-`limit` window it always had and the
+    graveyard keeps `limit`."""
+    store = MemoryStore(":memory:")
+    for i in range(6):
+        store.create(
+            Memory.create_new(content=f"quokka active entry {i}", memory_type="conversation", domain="us", importance=5.0)
+        )
+    for i in range(6):
+        faded = Memory.create_new(
+            content=f"quokka faded original {i}", memory_type="conversation", domain="us", importance=9.0
+        )
+        store.create(faded)
+        store.fade(faded.id, summary=f"quokka faded summary {i}")
+    narrow = search_with_loss(tmp_path, store, ["quokka"], limit=3)
+    wide = search_with_loss(tmp_path, store, ["quokka"], limit=3, rank_limit=50)
+    assert len(narrow.fading) == 3 and len(narrow.active) == 0, "the narrow window is all high-importance fading"
+    assert len(wide.active) == 6, "active drawn from the wide window"
+    assert [m.id for m in wide.fading] == [m.id for m in narrow.fading], "fading window unchanged"

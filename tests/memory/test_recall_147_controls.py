@@ -44,6 +44,7 @@ from tests.memory.recall_147_fixtures import (
 BASE_CONTROL_AT_8 = 0.8333333333333334
 BASE_CONTROL_AT_9 = 0.875  # reported only (ADV-8): recall@9 on a keyword-only set
 BASE_RARE_AT_8 = 0.9583333333333334
+BASE_RARE_NOSHORT_AT_8 = 1.0  # same rare-token queries with NO short tokens: isolates the cap removal
 BASE_CONTROL_SEMANTIC_AT_9 = 0.0  # the base's conclusive semantic result suppresses keyword
 BASE_RARE_SEMANTIC_AT_9 = 0.0
 _EPS = 1e-9
@@ -61,6 +62,12 @@ def control():
 @pytest.fixture(scope="module")
 def rare():
     store, queries = build_control_set(seed=147, n_queries=24, rare_target=True)
+    return store, queries, add_semantic_decoys(store)
+
+
+@pytest.fixture(scope="module")
+def rare_noshort():
+    store, queries = build_control_set(seed=147, n_queries=24, rare_target=True, n_short=0)
     return store, queries, add_semantic_decoys(store)
 
 
@@ -96,14 +103,21 @@ def test_control_recall_at_8_is_not_below_base(control, tmp_path: Path) -> None:
     assert got >= BASE_CONTROL_AT_8 - _EPS, f"recall@8 {got} < base {BASE_CONTROL_AT_8}"
 
 
-def test_control_recall_at_9_is_reported_not_gated(control, tmp_path: Path) -> None:
+def test_control_recall_at_9_advisory_adv8_does_not_regress(control, tmp_path: Path) -> None:
     store, queries, _ = control
     got = recall_at(store, queries, cutoff=_SEMANTIC_PRESENT_CUTOFF, persona_dir=tmp_path)
     assert got >= BASE_CONTROL_AT_9 - _EPS, f"recall@9 {got} < base {BASE_CONTROL_AT_9} (ADV-8)"
 
 
-def test_semantic_present_recall_at_9_is_not_below_base(control, rare, tmp_path: Path) -> None:
-    for (store, queries, decoys), base in ((control, BASE_CONTROL_SEMANTIC_AT_9), (rare, BASE_RARE_SEMANTIC_AT_9)):
+def test_semantic_present_recall_at_9_is_not_below_base(control, rare, rare_noshort, tmp_path: Path) -> None:
+    # NOTE: the base's conclusive semantic result suppresses the keyword search, so the base
+    # value is 0.0 by construction and "not below base" alone is weak; the > 0.5 line below
+    # (keyword hits really fill the leftover slots) carries the set.
+    for (store, queries, decoys), base in (
+        (control, BASE_CONTROL_SEMANTIC_AT_9),
+        (rare, BASE_RARE_SEMANTIC_AT_9),
+        (rare_noshort, BASE_RARE_SEMANTIC_AT_9),
+    ):
         got = recall_at_with_semantic(
             store, queries, decoys, cutoff=_SEMANTIC_PRESENT_CUTOFF, persona_dir=tmp_path
         )
@@ -115,14 +129,25 @@ def test_semantic_present_recall_at_9_is_not_below_base(control, rare, tmp_path:
     ) > 0.5
 
 
+def test_rare_token_recall_without_short_tokens_is_not_below_base(rare_noshort, tmp_path: Path) -> None:
+    """Isolation: the same rare-word-amid-12-common-words queries with NO short
+    token do not regress once the cap is gone, so the failure below is the short
+    tokens' competition, not the high-frequency filler."""
+    store, queries, _ = rare_noshort
+    got = recall_at(store, queries, cutoff=_KEYWORD_ONLY_CUTOFF, persona_dir=tmp_path)
+    assert got >= BASE_RARE_NOSHORT_AT_8 - _EPS, f"recall@8 {got} < base {BASE_RARE_NOSHORT_AT_8}"
+
+
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "C12 set (iii) shape FAILS: with the ten-token cap removed (S9/S52) a target reached "
-        "through ONE rare word amid 12 high-frequency words is outranked by memories matching "
-        "several of the common words (recall@8 0.875 vs base 0.958 here; 0.667 vs 0.833 on "
-        "the synthetic DB copy, c12_syn_f.py). Question to Planning/owner in R4/5-build.md; "
-        "remove this marker when a ruling lands and the gate is met."
+        "C12 set (iii) shape FAILS: a target reached through ONE rare word, in a query that also "
+        "carries short tokens the admission change lets through (acronyms, digits, short words of "
+        "moderate frequency, S36) plus 12 high-frequency words, is outranked by memories matching "
+        "several of those short tokens (recall@8 0.875 vs base 0.958 here; 0.667 vs 0.833 on the "
+        "synthetic DB copy, c12_syn_f.py). The same queries WITHOUT short tokens do not regress. "
+        "Question to Planning/owner in R4/5-build.md; remove this marker when a ruling lands and "
+        "the gate is met."
     ),
 )
 def test_rare_token_recall_at_8_is_not_below_base(rare, tmp_path: Path) -> None:

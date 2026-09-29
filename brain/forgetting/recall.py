@@ -44,6 +44,7 @@ def search_with_loss(
     limit: int = 5,
     hebbian: HebbianMatrix | None = None,
     lost_query: str | None = None,
+    rank_limit: int | None = None,
 ) -> SearchResult:
     """Partitioned search: active + fading via ranked retrieval, lost via graveyard.
 
@@ -63,6 +64,13 @@ def search_with_loss(
             here so the grief-breadcrumb firing does not widen when the
             keyword search's token cap is removed (name-recall fix R4, plan
             P-14/P-25, Q16 interim, PARKED for the owner).
+        rank_limit: Optional wider window for the ACTIVE bucket only (default:
+            ``limit``). ``active`` is drawn from the top ``rank_limit`` ranked
+            results so a caller that re-orders it (passive recall puts
+            monologue-family hits after genuine ones, name-recall fix R4, spec
+            §4) is not limited to the first ``limit``. The fading bucket keeps
+            the first ``limit`` window and the lost bucket ``limit``, exactly
+            as before, so widening it cannot change either.
 
     Returns:
         SearchResult with active, fading, and lost lists partitioned by state,
@@ -71,10 +79,12 @@ def search_with_loss(
     if not query:
         return SearchResult()
 
-    ranked = rank_memories(store, hebbian, query, limit=limit, include_fading=True)
-    active = [m for m, _ in ranked if m.state == "active"]
+    window = max(limit, rank_limit) if rank_limit is not None else limit
+    ranked_wide = rank_memories(store, hebbian, query, limit=window, include_fading=True)
+    ranked = ranked_wide[:limit]
+    active = [m for m, _ in ranked_wide if m.state == "active"]
     fading = [m for m, _ in ranked if m.state == "fading"]
-    scores = {m.id: s for m, s in ranked if s is not None}
+    scores = {m.id: s for m, s in ranked_wide if s is not None}
     if lost_query is None:
         lost_query = query if isinstance(query, str) else " ".join(query)
     lost = graveyard.search(persona_dir, lost_query, limit=limit)

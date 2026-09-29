@@ -89,7 +89,12 @@ def _sentence(
 
 
 def build_control_set(
-    *, seed: int, n_queries: int, rare_target: bool = False, n_background: int = 500
+    *,
+    seed: int,
+    n_queries: int,
+    rare_target: bool = False,
+    n_background: int = 500,
+    n_short: int = 3,
 ) -> tuple[MemoryStore, list[ControlQuery]]:
     """Build a store and `n_queries` labelled control queries.
 
@@ -97,9 +102,10 @@ def build_control_set(
     word slots, a fraction carrying the SHORT tokens. Target for query i: ONE
     extra memory of the same template with four query words in its slots
     (`rare_target`: ONE rare word, present in no other memory, and nothing else
-    the query says). The query repeats those target words and adds three short
-    tokens and 9 (12 when `rare_target`) CROWD words, so it always has more
-    than 10 salient tokens.
+    the query says). The query repeats those target words and adds `n_short`
+    short tokens (0 isolates the cap removal from the short-token admission)
+    and 9 (12 when `rare_target`) CROWD words, so it always has more than 10
+    salient tokens when `n_short` is 3.
     """
     rng = random.Random(seed)
     store = MemoryStore(":memory:")
@@ -131,7 +137,7 @@ def build_control_set(
             content=content, memory_type="conversation", domain="us", importance=5.0
         )
         store.create(target)
-        shorts = rng.sample(SHORT, 3)
+        shorts = rng.sample(SHORT, 3)[:n_short]  # always draw 3: keeps the RNG stream identical
         crowd = rng.sample(CROWD, 12 if rare_target else 9)
         words = [*target_words, *shorts, *crowd]
         rng.shuffle(words)
