@@ -170,15 +170,17 @@ changing any caller.
    smoke, atomic swap) → the Restart button's graceful restart (ends the conversation via the
    session snapshot) → `/health`. The button is labelled like Restart's ("End conversation and
    update the brain") so ending the conversation is never a surprise.
-4. **Revert:** "Use the release brain" → clear `current` → restart. Folders are kept until
-   pruned, so re-applying the same commit is instant.
+4. **Revert:** "Use the release brain" → clear `current` → restart. The overlay it left stays
+   as `previous`, so re-applying that commit is instant (the folder is reused). A folder that
+   is neither `active` nor `previous` is pruned at the next install — unless a running bridge
+   still uses it, and then re-applying its commit installs into a fresh `-rN` folder beside it.
 
 ## 5. When an overlay stops being valid
 
 | Situation | Result |
 |---|---|
-| The app updates to a new release | New `bundle-id` → the hook ignores the old overlay → the release brain runs. If `main` is still ahead, Check offers it again. A stale overlay can never downgrade a newer bundle. |
-| The app is moved or reinstalled at the same version | Same `bundle-id` → the overlay stays valid (plain files, no absolute paths — why this is a pointer file and not a venv). |
+| The app updates to a new release | New `_ce_bundle_id` → the hook ignores the old overlay → the release brain runs. If `main` is still ahead, Check offers it again. A stale overlay can never downgrade a newer bundle. |
+| The app is moved or reinstalled at the same version | Same `_ce_bundle_id` → the overlay stays valid (plain files, no absolute paths — why this is a pointer file and not a venv). |
 | `current.json` corrupt, folder missing | The hook does nothing → the release brain. |
 
 ## 6. Errors
@@ -244,7 +246,7 @@ exists.
 | Unit | Tests |
 |---|---|
 | `brain/update/` | Diff against a fake bundle's dist-info (changed pins only; pip/setuptools/wheel dropped). Swap: current/previous rotate, atomic, prune keeps two. Lock. Import-smoke failure deletes the folder and leaves `current.json` byte-identical. Revert and rollback. Source kind execs `scripts/update.sh`. |
-| Activation hook | Through-path with a real interpreter: subprocess with `KINDLED_HOME=tmp` and an overlay holding a decoy module → the overlay wins. Mismatched `bundle-id`, corrupt JSON, missing folder → bundle. Start-up cost check. **Home-resolution parity:** the hook's copy of the home lookup must equal `brain.paths.get_home()` for `KINDLED_HOME`, `NELLBRAIN_HOME` and the platformdirs default (the Rust `nellbrain_home()` drift bug, CLAUDE.local.md Gotchas, is the precedent). |
+| Activation hook | Through-path with a real interpreter: subprocess with `KINDLED_HOME=tmp` and an overlay holding a decoy module → the overlay wins. Mismatched `_ce_bundle_id`, corrupt JSON, missing folder → bundle. Start-up cost check. **Home-resolution parity:** the hook's copy of the home lookup must equal `brain.paths.get_home()` for `KINDLED_HOME`, `NELLBRAIN_HOME` and the platformdirs default (the Rust `nellbrain_home()` drift bug, CLAUDE.local.md Gotchas, is the precedent). |
 | Tolerant readers | Canary per reader (§7). |
 | Rust | Manifest verification with a throwaway key pair (valid; tampered manifest, tampered sig, wrong key rejected). Availability decision table (§3.2). |
 | Frontend (vitest) | Brain row in every state; `bridgeVersionCheck` with and without an overlay. |
@@ -271,7 +273,7 @@ slice.
 
 - **Reads from:** the supervisor lifecycle (`nell supervisor stop/start/restart`,
   `bridge.json`), `/health`, `/sessions/snapshot` and `/supervisor/shutdown` (via the
-  Restart button's graceful flow), the bundle's dist-info records and `bundle-id`.
+  Restart button's graceful flow), the bundle's dist-info records and `_ce_bundle_id`.
 - **Feeds into:** `/health.overlay` (read by `bridgeVersionCheck` and ConnectionPanel), the app
   log and launch-failures log (rollback events), `nell paths` (`overlay_dir`, `overlay_active`).
 - **Scope:** an ops surface, not an organ — Nell's emotional and memory loops do not consume it
@@ -372,7 +374,12 @@ under it. Both `os.replace` calls (the staging rename and the `current.json` wri
 transient `PermissionError` for ~1.5 s (Windows AV, a hook reading the file at start-up). The
 overlay e2e now does a real `--require-hashes` download of a changed pin, a third install
 (rotation + prune), `--rollback`, and fails on any `.pth` inside an overlay (the hook puts the
-folder on `sys.path` directly, so a `.pth` there would be silently ignored).
+folder on `sys.path` directly, so a `.pth` there would be silently ignored). From ToT's #314
+review: an install never renames or deletes a folder that is named in `current.json` **or in
+use** (the same check prune makes) — re-applying the commit of an unnamed, in-use folder goes to
+a fresh `-rN` folder; the e2e marks a folder in use by a live process and proves prune keeps it
+and a re-apply installs beside it. Only the bridge marks a folder: short-lived `nell`
+subprocesses don't, and an update removing their folder mid-run is accepted.
 
 **Out of scope:** updating the app shell (the signed Tauri updater keeps doing that); persona
 data changes beyond the tolerant-reader fix.

@@ -463,3 +463,34 @@ def test_staging_rename_rides_out_a_transient_permission_error(tmp_path, monkeyp
                                  root=root, pip_extra=["--no-index", "--find-links", str(finds)])
     assert (root / entry["dir"] / "brain").is_dir()
     assert overlay.read_state(root)["active"] == entry
+
+
+def test_reapplying_a_commit_never_deletes_its_folder_while_a_process_uses_it(tmp_path):
+    """#314 review (ToT): a bridge stays on A, updates go to B then C (prune keeps A
+    only because it's in use), then A's commit is applied again. A's folder is not
+    named by current.json but is still loaded — the install must go to a fresh
+    folder, not rmtree the live one as 'leftover'."""
+    import os
+
+    finds = tmp_path / "finds"
+    finds.mkdir()
+    brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
+    req = tmp_path / "requirements.txt"
+    req.write_text("", encoding="utf-8")
+    site = _fake_bundle(tmp_path, {})
+    root = tmp_path / "brain-overlay"
+    kw = {"wheel": brain_whl, "requirements": req, "site_dir": site, "root": root,
+          "pip_extra": ["--no-index", "--find-links", str(finds)]}
+    a = install.apply_update(commit="a" * 40, **kw)
+    live = root / a["dir"]
+    (live / overlay.IN_USE_DIR).mkdir()
+    (live / overlay.IN_USE_DIR / str(os.getpid())).write_text("", encoding="utf-8")
+    (live / "sentinel").write_text("the running bridge's files", encoding="utf-8")
+    for d in ("bbbb", "cccc"):
+        overlay.activate(root, {"dir": d, "commit": d[0] * 40, "brain_version": "9.9.9", "bundle_id": "bundle-1"})
+    assert a["dir"] not in {e["dir"] for e in overlay.read_state(root).values() if e}
+
+    again = install.apply_update(commit="a" * 40, **kw)
+    assert (live / "sentinel").is_file(), "the in-use folder was deleted under the live process"
+    assert again["dir"] == f"{a['dir']}-r1"
+    assert overlay.read_state(root)["active"] == again

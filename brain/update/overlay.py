@@ -85,7 +85,8 @@ def mark_in_use(root: Path | None = None) -> None:
     (marks / str(os.getpid())).write_text("", encoding="utf-8")
 
 
-def _in_use(folder: Path) -> bool:
+def in_use(folder: Path) -> bool:
+    """A live process runs `brain` from this folder (it wrote an .in-use marker)."""
     # ponytail: a reused pid keeps a folder one prune longer — the safe direction.
     try:
         return any(m.name.isdigit() and pid_is_alive(int(m.name)) for m in (folder / IN_USE_DIR).iterdir())
@@ -122,7 +123,7 @@ def prune(root: Path) -> None:
     if not root.is_dir():
         return
     for child in root.iterdir():
-        if child.is_dir() and child.name not in keep and not _in_use(child):
+        if child.is_dir() and child.name not in keep and not in_use(child):
             shutil.rmtree(child, ignore_errors=True)
 
 

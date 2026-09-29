@@ -42,11 +42,15 @@ fi
 
 # #304: a second install whose requirements really differ from the bundle — one small
 # pure-Python pin swapped for an older release, hashed by `uv pip compile` — so pip does
-# a real --require-hashes download; a third install (rotation + prune); then --rollback.
+# a real --require-hashes download; more installs (rotation + prune); then --rollback.
+# #302/#314: A is marked in use by a live process (this script's shell, as a bridge marks
+# its folder at start), so prune must keep it and re-applying A must install beside it.
 A=e2e0000000000000000000000000000000000000
 B=e2e1111111111111111111111111111111111111
 C=e2e2222222222222222222222222222222222222
+D=e2e3333333333333333333333333333333333333
 OV="$WORK/home/brain-overlay"
+native() { if [ "${PY%.exe}" != "$PY" ]; then cygpath -w "$1"; else printf '%s' "$1"; fi; }
 status_is() {  # <active commit> <previous commit | None>
   nell update --status | "$PY" -P -c "import json, sys
 s = json.load(sys.stdin)
@@ -54,25 +58,40 @@ got = ((s['active'] or {}).get('commit'), (s['previous'] or {}).get('commit'))
 assert got == (sys.argv[1], None if sys.argv[2] == 'None' else sys.argv[2]), got" "$1" "$2"
 }
 certifi_is() { "$PY" -P -c "import importlib.metadata as m, sys; v = m.version('certifi'); assert v == sys.argv[1], v" "$1"; }
+has_dir() { ls "$OV" | grep -Eqx "$1"; }  # an overlay folder name matches the regex
 status_is $A None
+A_DIR="$(ls "$OV" | grep -Ex 'e2e000000000-[0-9a-f]{8}')"
+# Run directly (not in $(...)), so the marker names this script's shell: alive until the end.
+"$PY" -P -c "import os, pathlib, sys; d = pathlib.Path(sys.argv[1]) / '.in-use'; d.mkdir(exist_ok=True); (d / str(os.getppid())).write_text('')" "$(native "$OV/$A_DIR")"
 CERT_BUNDLE="$(sed -n -E 's/^certifi==([^ ;\\]+).*/\1/p' "$WORK/req.txt")"
 [ -n "$CERT_BUNDLE" ] || { echo "e2e: FAIL no certifi pin to swap" >&2; exit 1; }
 echo "certifi<$CERT_BUNDLE" | uv pip compile - --quiet --no-header --no-annotate --generate-hashes -o "$WORK/certifi.txt"
 CERT_OLD="$(sed -n -E 's/^certifi==([^ ;\\]+).*/\1/p' "$WORK/certifi.txt")"
 awk '/^certifi==/{skip=1} skip{if(!/\\$/)skip=0; next} 1' "$WORK/req.txt" > "$WORK/req2.txt"
 cat "$WORK/certifi.txt" >> "$WORK/req2.txt"
-if [ "${PY%.exe}" != "$PY" ]; then REQ2="$(cygpath -w "$WORK/req2.txt")"; else REQ2="$WORK/req2.txt"; fi
+REQ2="$(native "$WORK/req2.txt")"
 nell update --wheel "$WHL" --requirements "$REQ2" --commit $B
 certifi_is "$CERT_OLD"
 status_is $B $A
 echo "e2e: hashed download of certifi $CERT_OLD (bundle has $CERT_BUNDLE) is live"
 nell update --wheel "$WHL" --requirements "$REQ" --commit $C
 status_is $C $B
-if ls -d "$OV"/e2e000000000-* >/dev/null 2>&1; then echo "e2e: FAIL prune kept the oldest overlay" >&2; exit 1; fi
-echo "e2e: rotation keeps two, prune removed the oldest"
+[ -f "$OV/$A_DIR/stamp.json" ] || { echo "e2e: FAIL prune deleted an overlay a live process uses" >&2; exit 1; }
+echo "e2e: prune keeps an unnamed overlay a live process uses"
+nell update --wheel "$WHL" --requirements "$REQ" --commit $A
+status_is $A $C
+has_dir "$A_DIR-r1" && [ -f "$OV/$A_DIR/stamp.json" ] || { echo "e2e: FAIL re-applying A replaced its in-use folder" >&2; exit 1; }
+echo "e2e: re-applying an in-use overlay's commit installs beside it"
+rm -rf "$OV/$A_DIR/.in-use"
+nell update --wheel "$WHL" --requirements "$REQ2" --commit $D
+status_is $D $A
+for gone in "$A_DIR" 'e2e111111111-[0-9a-f]{8}' 'e2e222222222-[0-9a-f]{8}'; do
+  if has_dir "$gone"; then echo "e2e: FAIL prune kept $gone" >&2; exit 1; fi
+done
+echo "e2e: rotation keeps two, prune removed the rest once no process uses them"
 nell update --rollback >/dev/null
-status_is $B None
-certifi_is "$CERT_OLD"
+status_is $A None
+certifi_is "$CERT_BUNDLE"
 echo "e2e: rollback runs the previous overlay again"
 PTH="$(find "$OV" -name '*.pth' | head -n1)"
 [ -z "$PTH" ] || { echo "e2e: FAIL $PTH — the hook doesn't process .pth files inside an overlay (#302)" >&2; exit 1; }
