@@ -520,3 +520,86 @@ def test_the_rendered_block_fills_the_nine_slots_genuine_first(
     assert set(_ids(genuine)) <= set(shown), "every genuine memory is rendered"
     assert set(shown) & set(_ids(family)) == set(_ids(reversed(family))[:3])
     assert len(shown) == 9
+
+
+# ---------------------------------------------------------------------------
+# Every route to the cosine path keeps the order (review F6)
+# ---------------------------------------------------------------------------
+
+
+def _assert_genuine_first_cosine(result, genuine, family) -> None:
+    assert result is not None and result.path == "cosine"
+    kept = _ids([*result.full, *result.snippet])
+    assert kept == _ids(sorted(genuine, key=lambda m: -result.scores[m.id])) + _ids(
+        sorted(family, key=lambda m: -result.scores[m.id])
+    )[: len(kept) - len(genuine)]
+
+
+def test_a_normalization_fallback_hands_a_family_pool_to_the_cosine_path_genuine_first(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = MemoryStore(tmp_path / "memories.db")
+    genuine, family = _seed(store, monkeypatch, [0.6, 0.7, 0.65], [0.99, 0.98, 0.97, 0.96])
+    _cosine_floor(store, 0.5)
+    _rerank_floor(store)
+    _install_reranker(monkeypatch, _Recording())
+    monkeypatch.setattr(
+        reranker_mod,
+        "rerank_for_recall",
+        lambda *a, **kw: reranker_mod.RecallRerank(
+            width=5, reranked=False, hand_off="normalization", normalization=None, measured=False
+        ),
+    )
+
+    _assert_genuine_first_cosine(run_semantic_recall(store, tmp_path, _QUERY), genuine, family)
+
+
+def test_a_missing_rerank_floor_hands_a_family_pool_to_the_cosine_path_genuine_first(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = MemoryStore(tmp_path / "memories.db")
+    genuine, family = _seed(store, monkeypatch, [0.6, 0.7, 0.65], [0.99, 0.98, 0.97, 0.96])
+    _cosine_floor(store, 0.5)
+    _warm()
+    _install_reranker(monkeypatch, _Recording({m.content: 50.0 for m in [*genuine, *family]}))
+
+    def _boom(model_id: str):
+        raise RuntimeError("simulated rerank bootstrap failure")
+
+    monkeypatch.setattr("brain.memory.reranker._bootstrap_reranker_provider", _boom)
+
+    _assert_genuine_first_cosine(run_semantic_recall(store, tmp_path, _QUERY), genuine, family)
+
+
+def test_a_pool_below_the_rerank_minimum_ranks_genuine_first_on_the_cosine_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = MemoryStore(tmp_path / "memories.db")
+    genuine, family = _seed(store, monkeypatch, [0.6, 0.7], [0.99, 0.98])  # 4 < 5 real
+    _cosine_floor(store, 0.5)
+    rec = _Recording()
+    _install_reranker(monkeypatch, rec)
+
+    result = run_semantic_recall(store, tmp_path, _QUERY)
+
+    _assert_genuine_first_cosine(result, genuine, family)
+    assert rec.scored_calls() == []
+
+
+def test_order_age_re_sorts_the_matched_set_by_date_as_before(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Pins the interaction the tool's docstring describes: `order="age"` is
+    the caller's own request to sort the matched set by date, so R3's
+    genuine-first order applies to `order="relevance"` and to WHICH memories
+    clear the floor, not to a date-sorted view (plan P-21: today's tail runs
+    unchanged)."""
+    store = MemoryStore(tmp_path / "memories.db")
+    genuine, family = _seed(store, monkeypatch, [0.6, 0.7, 0.65], [0.99, 0.98, 0.97])
+    _cosine_floor(store, 0.5)
+    _no_reranker(monkeypatch)
+    by_age = sorted([*genuine, *family], key=lambda m: m.created_at, reverse=True)
+
+    assert _tool(tmp_path, store, limit=6, order="age") == _ids(by_age)
+    relevance = _tool(tmp_path, store, limit=6)
+    assert set(relevance[:3]) == set(_ids(genuine)), "the default order is genuine first"

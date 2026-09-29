@@ -265,7 +265,12 @@ class SemanticRecallResult:
     """A CONCLUSIVE semantic-primary recall — the caller renders this and
     skips the lexical fallback entirely for this turn.
 
-    `full` / `snippet` are Memory lists in reranker-SELECTION order;
+    `full` / `snippet` are Memory lists in the path's own order (name-recall
+    fix R3: genuine memories by score, then monologue-family memories by
+    score; `full` is the first five). `hits` is the SAME list as one ordered,
+    path- and paragraph-tagged sequence, DERIVED from `full` + `snippet` by
+    `run_semantic_recall` (a result built by hand leaves it empty; R4
+    assembles from `hits` and must not accept both).
     `scores` maps memory_id -> reranker score for callers that want the raw
     number (tests, logging). NOTE: unlike the pre-#231 cosine-era version,
     `scores` only covers candidates that were actually scored (the
@@ -500,7 +505,8 @@ def _cosine_ranking(
     log_calibration: bool,
 ) -> GatedRanking | None:
     """The no-rerank (cosine) path (spec §2, S5/S6/S22/S25/S60): the coarse
-    cut's candidates ranked by cosine, gated by the cosine floor
+    cut's candidates ranked genuine-first then monologue-family, each by
+    cosine (R3, spec §4), gated by the cosine floor
     (`store.get_cosine_floor`: persisted, else the bootstrap). `None` when no
     cosine gate can be had (the bootstrap failed): the turn then contributes
     no semantic results, never an ungated ranking.

@@ -116,7 +116,11 @@ def _semantic_top_k(
     §4): every genuine memory by descending score, then every monologue-family
     memory by descending score, so a monologue-family memory never takes a
     result slot from a floor-clearing genuine one. The rerank prefix already
-    took genuine candidates first (``rank_and_gate``).
+    took genuine candidates first (``rank_and_gate``). That order is what the
+    default ``order="relevance"`` returns; ``order="age"`` still re-sorts the
+    matched set by date (and ``emotion`` still boosts) in ``search_memories``'
+    unchanged tail (plan P-21), so a newer monologue-family memory can precede
+    an older genuine one there by the caller's own request.
 
     Deliberately does NOT reuse ``semantic_recall``'s option-4 surfacing
     tiers (≤5 full / 6-9 / cap-at-9) — that machinery decides whether to
