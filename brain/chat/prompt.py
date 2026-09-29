@@ -1211,7 +1211,14 @@ def _build_recall_block(
         # live per call (brain/memory/semantic_recall.py; F2a inc8, #250
         # §7/§8 cut it over from a fixed module constant to a per-persona
         # DB-calibrated value), no per-persona calibration FILE to load.
-        semantic_result = run_semantic_recall(store, persona_dir, user_input)
+        # Name-recall fix R6 (spec §3, S34, S53): a paragraph none of whose
+        # words is a keyword token or a word of a known name found in this
+        # message is dropped from the per-paragraph search (tested after name
+        # protection, so a paragraph holding only a known name is kept).
+        keyword_words = frozenset(tokens) | {word for name in names for word in name.split()}
+        semantic_result = run_semantic_recall(
+            store, persona_dir, user_input, keyword_words=keyword_words
+        )
     except Exception:  # noqa: BLE001
         # Defense-in-depth: run_semantic_recall already wraps its own body in
         # a broad except (its docstring's fail-soft contract: ANY failure ->

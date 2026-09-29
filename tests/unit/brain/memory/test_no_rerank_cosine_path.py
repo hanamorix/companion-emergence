@@ -79,7 +79,10 @@ class _Embedder(EmbeddingProvider):
 
     def embed_batch(self, texts):
         self.batch_calls += 1
-        if self._batch_raises:
+        # Fails the bootstrap's batch (the bundled pairs) only: since
+        # name-recall fix R6 the recall query is embedded by `embed_batch`
+        # too, and that embed must still succeed here.
+        if self._batch_raises and _QUERY not in texts:
             raise RuntimeError("simulated embed_batch failure")
         return [self.embed(t) for t in texts]
 

@@ -59,7 +59,10 @@ def _ids_of(cut) -> list[str]:
 def _spy_rank_and_gate(
     monkeypatch: pytest.MonkeyPatch, module: str
 ) -> list[list[tuple[str, float]]]:
-    """Record the coarse cut each caller hands `rank_and_gate` (the pool)."""
+    """Record the coarse cut each caller hands `rank_and_gate` (the pool).
+    Since name-recall fix R6 both callers reach it through
+    `semantic_recall.search_paragraphs`, so the spy sits there; `module` names
+    the caller under test for the reader."""
     seen: list[list[tuple[str, float]]] = []
     real = sr.rank_and_gate
 
@@ -67,7 +70,8 @@ def _spy_rank_and_gate(
         seen.append(list(coarse))
         return real(store, query, pool, coarse, **kwargs)
 
-    monkeypatch.setattr(f"{module}.rank_and_gate", _spy)
+    del module
+    monkeypatch.setattr(sr, "rank_and_gate", _spy)
     return seen
 
 

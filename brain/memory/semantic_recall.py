@@ -83,17 +83,21 @@ or clustering (Stage 5, unaffected).
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+import re
+import threading
+import time
+from collections.abc import Callable, Collection, Iterable
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
 
-from brain.dev_constants import MONOLOGUE_FAMILY_TYPES
+from brain import tunables
+from brain.dev_constants import MONOLOGUE_FAMILY_TYPES, RERANK_MIN_REAL_CANDIDATES
 from brain.memory import embeddings as embeddings_mod
 from brain.memory import floor_startup
 from brain.memory import reranker as reranker_mod
 from brain.memory.embedding_matrix import EmbeddingMatrix, build_embedding_matrix
-from brain.memory.embeddings import cosine_similarity
 from brain.memory.relevance import CANDIDATE_POOL
 from brain.memory.store import (
     CALIBRATION_SCORE_SCALE,
@@ -341,6 +345,16 @@ class SemanticRecallResult:
     tail_scores: dict[str, float] = field(default_factory=dict)
     tail_scale: str | None = None
     tail_pass_mark: float | None = None
+    # Name-recall fix R6 (spec §3, §6; S30, S53): every query of the
+    # per-paragraph search (`ParagraphOutcome`, in query order) and the
+    # message-level figures (see `ParagraphSearch`). `path`, `scale`,
+    # `pass_mark`, `scores` and the `tail_*` fields above describe the first
+    # query with a gated ranking (the only one on a one-paragraph message).
+    paragraphs: tuple[ParagraphOutcome, ...] = ()
+    whole_message_fallback: bool = False
+    total_width: int = 0
+    budget: float | None = None
+    rerank_budget: float | None = None
 
 
 RERANKED_PATH = "reranked"
@@ -423,12 +437,26 @@ def genuine_first_coarse_cut(
     `cosine_scored` may arrive unsorted.
     """
     ordered = sorted(cosine_scored, key=lambda pair: -pair[1])
+    return _walk_coarse_cut(ordered, lambda mid: is_monologue_family(pool[mid][0]), size)
+
+
+def _walk_coarse_cut(
+    ordered: Iterable[tuple[str, float]],
+    is_family: Callable[[str], bool],
+    size: int,
+) -> list[tuple[str, float]]:
+    """The walk of `genuine_first_coarse_cut` over `(id, cosine)` pairs
+    already in descending cosine order (ties in input order): keep genuine
+    memories up to `size`, family memories only while the rank is inside the
+    plain top-`size`, stop once both are settled. `is_family` is called at
+    most once per entry walked. `ordered` may be a lazy iterator (R6 feeds
+    it from one `argsort` per query), so nothing past the stop is produced."""
     genuine: list[tuple[str, float]] = []
     family: list[tuple[str, float]] = []
     for rank, pair in enumerate(ordered):
         if rank >= size and len(genuine) >= size:
             break
-        if is_monologue_family(pool[pair[0]][0]):
+        if is_family(pair[0]):
             if rank < size:
                 family.append(pair)
         elif len(genuine) < size:
@@ -475,6 +503,12 @@ class GatedRanking:
     ranked: list[tuple[str, float]]
     pass_mark: float
     tail: GatedRanking | None = None
+    # Name-recall fix R6 (S58): the real candidates the reranker actually
+    # scored for this query (0 when no rerank ran). Set by `rank_and_gate`;
+    # also non-zero on a cosine ranking whose query was reranked but could not
+    # be gated (no rerank floor yet), since that rerank still used up part of
+    # the message's 50 real candidates.
+    real_width: int = 0
 
 
 def gated_cleared(gated: GatedRanking) -> list[tuple[str, float, str]]:
@@ -536,8 +570,12 @@ def _reranked_ranking(
     log_calibration: bool,
     coarse: list[tuple[str, float]] | None = None,
     embedder_model_id: str | None = None,
-) -> GatedRanking | None:
-    """The reranked path, or `None` when the turn must take the cosine path
+    budget_seconds: float | None = None,
+    max_real: int = CANDIDATE_POOL,
+    sizes: reranker_mod.PairSizes | None = None,
+) -> tuple[GatedRanking | None, int]:
+    """`(ranking, reranked real candidates)`. The ranking is the reranked
+    path's, or `None` when the turn must take the cosine path
     instead: the reranker failed to construct or score, fewer than the S5
     minimum of real candidates fit the budget or exist, the anchor
     normalization fell back (`did_normalize=False`: raw scores are NEVER
@@ -548,7 +586,14 @@ def _reranked_ranking(
     When `coarse` and `embedder_model_id` are given (`rank_and_gate` always
     does), the returned ranking also carries the cosine tail (spec §4, S82):
     the monologue-family candidates that got no rerank slot, gated by the
-    cosine floor (`_cosine_tail`)."""
+    cosine floor (`_cosine_tail`).
+
+    `budget_seconds`, `max_real` and `sizes` go to `rerank_for_recall`
+    (name-recall fix R6: a paragraph's fair share of the rerank budget, what
+    is left of the message's 50 real candidates, and its pair token counts
+    computed ahead). The second element is how many real candidates were
+    actually reranked (0 when no rerank ran), whether or not the ranking
+    could then be gated."""
     try:
         reranker_provider = reranker_mod.build_reranker_provider(store=store)
         # Name-recall fix R1 (spec §1): the width is fitted for THIS message
@@ -560,20 +605,27 @@ def _reranked_ranking(
         # group in cosine order, so the fitted prefix takes every genuine
         # candidate before any monologue-family one.
         outcome = reranker_mod.rerank_for_recall(
-            reranker_provider, query, [pool[mid][0].content for mid in coarse_ids]
+            reranker_provider,
+            query,
+            [pool[mid][0].content for mid in coarse_ids],
+            budget_seconds=budget_seconds,
+            max_real=max_real,
+            sizes=sizes,
         )
     except Exception:  # noqa: BLE001 — a reranker failure is a cosine-path turn, not keyword-only
         log.warning("semantic recall: reranker failed — taking the cosine path", exc_info=True)
-        return None
+        return None, 0
     if not outcome.reranked or outcome.normalization is None:
         log.info(
             "semantic recall: no rerank (%s, width %d) — taking the cosine path",
             outcome.hand_off,
             outcome.width,
         )
-        return None
+        # A rerank that ran but could not be normalized still used its width.
+        return None, outcome.width if outcome.hand_off == "normalization" else 0
     reranker_model_id = reranker_provider.model_id()
     normalization = outcome.normalization
+    reranked_width = normalization.real_width
     scored_ids = coarse_ids[: normalization.real_width]
     rerank_scores = normalization.scores
     if log_calibration:
@@ -605,7 +657,7 @@ def _reranked_ranking(
         log.warning(
             "semantic recall: rerank floor read failed — taking the cosine path", exc_info=True
         )
-        return None
+        return None, reranked_width
     if floor_row is None:
         # S91: this turn reranked but has no floor to gate the scores with. It
         # takes the cosine path, and the need is flagged: the rerank bootstrap
@@ -616,7 +668,7 @@ def _reranked_ranking(
             "first-need background bootstrap has not produced one) — taking the cosine path",
             reranker_model_id,
         )
-        return None
+        return None, reranked_width
     log.debug(
         "semantic recall: floor=%.4f model=%s cold_start=%s sample_pairs=%d updated_at=%s",
         floor_row["floor"],
@@ -636,12 +688,16 @@ def _reranked_ranking(
             set(scored_ids),
             embedder_model_id=embedder_model_id,
         )
-    return GatedRanking(
-        path=RERANKED_PATH,
-        scale=CALIBRATION_SCORE_SCALE,
-        ranked=ranked,
-        pass_mark=floor_row["floor"],
-        tail=tail,
+    return (
+        GatedRanking(
+            path=RERANKED_PATH,
+            scale=CALIBRATION_SCORE_SCALE,
+            ranked=ranked,
+            pass_mark=floor_row["floor"],
+            tail=tail,
+            real_width=reranked_width,
+        ),
+        reranked_width,
     )
 
 
@@ -758,6 +814,9 @@ def rank_and_gate(
     *,
     embedder_model_id: str,
     log_calibration: bool,
+    budget_seconds: float | None = None,
+    max_real: int = CANDIDATE_POOL,
+    sizes: reranker_mod.PairSizes | None = None,
 ) -> GatedRanking | None:
     """Score one query's coarse cut and return what to gate (name-recall fix
     R2, spec §2): the reranked path when a rerank of >= 5 real candidates
@@ -771,10 +830,16 @@ def rank_and_gate(
     A reranked ranking also carries the cosine tail (spec §4, S82) of its
     unreranked monologue-family candidates (`GatedRanking.tail`); the tail
     writes NO calibration row (S84), so a reranked turn logs only its
-    'normalized' row."""
+    'normalized' row.
+
+    Name-recall fix R6: `budget_seconds` (default: the whole tunable budget),
+    `max_real` (default: the design maximum of 50) and `sizes` (default:
+    computed here) are one paragraph's fair share, its part of the message's
+    50 real candidates and its pair token counts; the returned ranking's
+    `real_width` says how many real candidates were reranked."""
     # R3 (spec §4): genuine candidates are taken first for the rerank prefix.
     coarse_ids = genuine_first([mid for mid, _ in coarse], pool)
-    gated = _reranked_ranking(
+    gated, reranked_width = _reranked_ranking(
         store,
         query,
         pool,
@@ -782,10 +847,13 @@ def rank_and_gate(
         log_calibration=log_calibration,
         coarse=coarse,
         embedder_model_id=embedder_model_id,
+        budget_seconds=budget_seconds,
+        max_real=max_real,
+        sizes=sizes,
     )
     if gated is not None:
         return gated
-    return _cosine_ranking(
+    cosine = _cosine_ranking(
         store,
         query,
         pool,
@@ -793,25 +861,564 @@ def rank_and_gate(
         embedder_model_id=embedder_model_id,
         log_calibration=log_calibration,
     )
+    if cosine is None or not reranked_width:
+        return cosine
+    return replace(cosine, real_width=reranked_width)
+
+
+# ---------------------------------------------------------------------------
+# Per-paragraph semantic search (name-recall fix R6; spec §3, §4, §7: S10, S11,
+# S17, S29, S33, S34, S44, S46, S53, S55, S58, S61, S63, S64, S86; plan P-7,
+# P-10, P-23, P-26-P-29)
+# ---------------------------------------------------------------------------
+#
+# A message is split into paragraphs (`str.splitlines()`, blank ones and ones
+# with no keyword word dropped); every paragraph is embedded in one batch and
+# searched on its own (its own coarse cut of 50 genuine plus the family in its
+# plain top 50); the cuts are merged by memory id, a memory going to the
+# paragraph with its best cosine score. One per-message time budget (the
+# `reranker.latency_budget_seconds` tunable) pays for everything: the
+# per-message setup `T_m` and the per-paragraph embed + scan + pair-size time
+# `T_p` (running averages in this process, ratio of sums, no constant) come
+# off the top, and what is left is split equally among the paragraphs for
+# their reranks. Paragraphs are then served in order of their best cosine
+# score, each reranking its own candidates against its own text with its own
+# anchors, within its share and within what is left of the message's 50 real
+# candidates; a paragraph that cannot fit 5 takes the cosine path. The
+# results are assembled across paragraphs (`assemble_paragraph_results`).
+
+# Clock seam for the per-message budget (T_m, T_p, the time already spent).
+# Production: `time.monotonic`. Tests script it.
+_clock: Callable[[], float] = time.monotonic
+
+# The keyword selector's word pattern (`brain.chat.prompt._extract_recall_tokens`,
+# `brain.memory.known_names`): a paragraph's words for the emptiness test.
+_WORD_RE = re.compile(r"[A-Za-z0-9]+")
+
+# Test-only seam (CONC-1): called inside a running-time update, between
+# reading the current sums and writing the new ones. `None` in production.
+_time_update_hook: Callable[[], None] | None = None
+
+
+@dataclass(frozen=True)
+class _TimeSums:
+    samples: int = 0
+    seconds: float = 0.0
+
+
+class _RunningTime:
+    """A process-wide running average of seconds per sample, as a ratio of
+    sums (plan P-7, P-26: no averaging constant). One lock guards the sums;
+    the state is an immutable pair swapped whole, so a reader never sees half
+    an update and a concurrent update is never lost (CONC-1)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._sums = _TimeSums()
+
+    def record(self, seconds: float) -> None:
+        with self._lock:
+            current = self._sums
+            if _time_update_hook is not None:
+                _time_update_hook()
+            self._sums = _TimeSums(current.samples + 1, current.seconds + max(0.0, seconds))
+
+    def average(self) -> float | None:
+        """Mean seconds per sample, or `None` before the first sample."""
+        with self._lock:
+            sums = self._sums
+        return sums.seconds / sums.samples if sums.samples else None
+
+    def sums(self) -> _TimeSums:
+        with self._lock:
+            return self._sums
+
+    def reset(self) -> None:
+        with self._lock:
+            self._sums = _TimeSums()
+
+
+# `T_m`: per-message setup before the first query is embedded (paragraph
+# split, the stacked matrix, the lean pool read; plan P-26).
+_message_overhead = _RunningTime()
+# `T_p`: per query, its share of the batch embed + its cosine scan and coarse
+# cut + its pair-size probe (plan P-7, P-28). Shared by passive recall and
+# the tool.
+_paragraph_time = _RunningTime()
+
+
+def _reset_paragraph_time_model() -> None:
+    """Test-only: forget both running averages."""
+    _message_overhead.reset()
+    _paragraph_time.reset()
+
+
+def split_paragraphs(text: str, keyword_words: Collection[str] | None) -> list[str]:
+    """The message's paragraphs for the per-paragraph search (spec §3, S10,
+    S29, S34, S53): `str.splitlines()` (every line ending: `\\n`, `\\r\\n`,
+    `\\r`, ...), blank lines dropped, each paragraph's text as written.
+
+    With more than one paragraph, a paragraph none of whose words (the
+    keyword selector's `[A-Za-z0-9]+` words, lower-cased) is in
+    `keyword_words` is dropped ("ok", "lol"). The caller builds
+    `keyword_words` from its own keyword tokens plus the words of the known
+    names matched in the message, so the test runs after name protection
+    and a paragraph holding only a known name is kept. `None` skips the
+    test. A message with one non-blank paragraph keeps it (one paragraph
+    behaves as today). Returns `[]` for a blank message, and `[]` when every
+    paragraph was dropped (the caller then searches the whole message)."""
+    lines = [line for line in text.splitlines() if line.strip()]
+    if len(lines) <= 1 or keyword_words is None:
+        return lines
+    return [
+        line
+        for line in lines
+        if any(word.lower() in keyword_words for word in _WORD_RE.findall(line))
+    ]
+
+
+def _serve_order(best_cosines: list[float | None]) -> list[int]:
+    """Paragraph indexes in the order they are served their rerank widths
+    (S58): by best cosine score, descending, ties by paragraph index;
+    paragraphs with no candidate last."""
+    return sorted(
+        range(len(best_cosines)),
+        key=lambda i: (best_cosines[i] is None, -(best_cosines[i] or 0.0), i),
+    )
+
+
+def _allocate_next(fitted_width: int, used: int) -> int:
+    """One served paragraph's real candidates (S58): its full fitted width,
+    capped by what is left of the message's 50 real candidates, or 0 (the
+    cosine path) when that is below the S5 minimum."""
+    width = min(fitted_width, CANDIDATE_POOL - used)
+    return width if width >= RERANK_MIN_REAL_CANDIDATES else 0
+
+
+def allocate_widths(fitted: list[tuple[int, float | None]]) -> list[int]:
+    """Real rerank candidates per paragraph when the shares may sum above 50
+    (spec §7, S58; plan P-29, criterion C9d). `fitted` is, per paragraph, the
+    width fitted on its equal share and its best cosine score. Paragraphs are
+    served by best cosine score (ties by index); each gets its full fitted
+    width while at least 5 of the 50 remain for it, else 0 (the cosine path).
+    When the widths sum to 50 or less every one is kept (a width below 5 is 0
+    either way). Pure.
+
+    Passive recall and the tool apply the same two steps (`_serve_order`,
+    `_allocate_next`) one paragraph at a time, fitting each paragraph's width
+    just before its rerank so it uses the cost model as the previous
+    paragraph's measured rerank left it; with an unchanged cost model the
+    result is this function's."""
+    widths = [0] * len(fitted)
+    used = 0
+    for i in _serve_order([best for _, best in fitted]):
+        width = _allocate_next(fitted[i][0], used)
+        widths[i] = width
+        used += width
+    return widths
+
+
+@dataclass(frozen=True)
+class ParagraphOutcome:
+    """One query of a message's semantic search (R6): its index (the
+    `SemanticHit.paragraph` tag), its text (the rerank and calibration
+    query), its gated ranking (`None` when no gate was possible: no
+    candidate, or no cosine floor yet), its candidate count after the merge,
+    and its best cosine score. `gated.real_width` is the real candidates the
+    reranker scored for it (0 when none)."""
+
+    index: int
+    query: str
+    gated: GatedRanking | None
+    candidate_count: int
+    best_cosine: float | None
+
+
+@dataclass(frozen=True)
+class ParagraphSearch:
+    """Everything one message's per-paragraph search produced (R6): each
+    query's outcome, the merged candidates' rows, and the message-level
+    figures the diagnostics record carries (S30, S53): whether the whole
+    message was searched as one query (`whole_message_fallback`), the real
+    candidates reranked in total (`total_width`, never above 50, S58), the
+    per-message `budget` and the part of it left for reranking
+    (`rerank_budget`). `paragraph_count` is the number of queries scored
+    (1 on the whole-message fallback; 2 on a first message re-scored as its
+    first paragraph and the rest, S63)."""
+
+    outcomes: tuple[ParagraphOutcome, ...]
+    pool: dict[str, tuple[Memory, np.ndarray]]
+    whole_message_fallback: bool
+    total_width: int
+    budget: float
+    rerank_budget: float
+
+    @property
+    def paragraph_count(self) -> int:
+        return len(self.outcomes)
+
+
+def _unit_rows(vectors: list[np.ndarray]) -> np.ndarray:
+    """Query vectors stacked as float32 rows scaled to unit length (a zero
+    vector stays zero, so its cosines are 0.0, as `cosine_similarity`)."""
+    queries = np.stack([np.asarray(v, dtype=np.float32) for v in vectors]).astype(np.float32)
+    norms = np.linalg.norm(queries, axis=1, keepdims=True)
+    np.divide(queries, norms, out=queries, where=norms > 0)
+    return queries
+
+
+def search_paragraphs(
+    store: MemoryStore,
+    text: str,
+    *,
+    keyword_words: Collection[str] | None = None,
+    exclude: Collection[str] = frozenset(),
+    log_calibration: bool,
+) -> ParagraphSearch | None:
+    """One message's per-paragraph semantic search, up to the gated
+    ranking of each query (spec §3; the assembly across paragraphs is
+    `assemble_paragraph_results`). Shared by passive recall
+    (`log_calibration=True`) and `search_memories` (`False`, S56).
+
+    Steps: (1) split (`split_paragraphs`); (2) the lean pool: the stacked
+    unit matrix (`EmbeddingMatrix.stacked`, P-23) restricted to the rows that
+    are active and in state 'active' (`MemoryStore.active_state_memory_types`,
+    P-27), minus `exclude`; its time is the message's `T_m` sample (P-26; the
+    embedding provider's own construction, a one-time process cost, is not);
+    (3) the queries: one paragraph, or every paragraph when the running
+    averages say `T_m + P x T_p` fits the budget, else the whole message as
+    one query (S29, S34, S46). Before any `T_p` measurement in this process
+    the first paragraph is embedded, searched and timed alone first; if P
+    times that time does not fit, the rest of the message is ONE query and
+    the message is scored as those two paragraphs (S63); (4) one
+    `embed_batch` per group, one matrix product per group, each query's
+    coarse cut from its own scores (S77); (5) merge: a memory goes to the
+    query with its best cosine (ties: the earlier query), keeping that score
+    (S11, S53); (6) the reranker's pair sizes per query, timed into its `T_p`
+    sample (P-28; the one-time warm-up is not); (7) what is left of the
+    budget after `T_m + (queries) x T_p` (the averages, this message's
+    samples included) or after the time actually spent so far, whichever is
+    more, is split equally among the queries (S33, S46, S61: a one-query
+    message pays its embed + scan too); (8) the queries are served in order
+    of best cosine, each `rank_and_gate`d on its own candidates, text and
+    anchors within its share and what is left of the 50 real candidates
+    (S58): reranked, else the cosine path; passive recall logs each query's
+    calibration row with that query as its text (S30).
+
+    `None` when there is no candidate pool, no query text, or the embed
+    fails. Other failures raise (callers fail soft)."""
+    start = _clock()
+    budget = float(
+        tunables.get_tunable(
+            "reranker.latency_budget_seconds", reranker_mod.LATENCY_BUDGET_SECONDS
+        )
+    )
+    paragraphs = split_paragraphs(text, keyword_words)
+    whole_message = False
+    if not paragraphs:
+        if not text.strip():
+            return None
+        paragraphs = [text]
+        whole_message = True
+
+    matrix = build_embedding_matrix(store.db_path)
+    ids, unit = matrix.stacked()
+    if not ids:
+        return None
+    types = store.active_state_memory_types()
+    excluded = frozenset(exclude)
+    rows = [i for i, mid in enumerate(ids) if mid in types and mid not in excluded]
+    if not rows:
+        return None
+    row_index = np.asarray(rows, dtype=np.intp)
+    pool_ids = [ids[i] for i in rows]
+
+    before_provider = _clock()
+    try:
+        # Looked up via the MODULE so a test's monkeypatch on
+        # `embeddings.build_embedding_provider` is honored.
+        embedder = embeddings_mod.build_embedding_provider()
+    except Exception:  # noqa: BLE001 — fail-soft
+        log.exception("semantic recall: embedding provider unavailable — falling back to lexical")
+        return None
+    one_time = _clock() - before_provider
+    _message_overhead.record(_clock() - start - one_time)
+    overhead = _message_overhead.average() or 0.0
+
+    def is_family(mid: str) -> bool:
+        return types[mid] in MONOLOGUE_FAMILY_TYPES
+
+    def embed_and_cut(texts: list[str]) -> list[tuple[list[tuple[str, float]], float]]:
+        """Embed `texts` in one batch and cut each; per text its coarse cut
+        and its `T_p` part so far (its share of the embed + its scan)."""
+        began = _clock()
+        vectors = embedder.embed_batch(texts)
+        embed_share = (_clock() - began) / len(texts)
+        began = _clock()
+        scores = (unit @ _unit_rows(vectors).T)[row_index]
+        product_share = (_clock() - began) / len(texts)
+        out = []
+        for column in range(len(texts)):
+            began = _clock()
+            query_scores = scores[:, column]
+            order = np.argsort(-query_scores, kind="stable")
+            cut = _walk_coarse_cut(
+                ((pool_ids[j], float(query_scores[j])) for j in order), is_family, CANDIDATE_POOL
+            )
+            out.append((cut, embed_share + product_share + (_clock() - began)))
+        return out
+
+    try:
+        count = len(paragraphs)
+        paragraph_time = _paragraph_time.average()
+        if count == 1:
+            queries = list(paragraphs)
+            searched = embed_and_cut(queries)
+        elif paragraph_time is not None:
+            if overhead + count * paragraph_time <= budget:
+                queries = list(paragraphs)
+            else:
+                queries, whole_message = [text], True
+            searched = embed_and_cut(queries)
+        else:
+            # S46/S63: no measurement yet in this process. Time the first
+            # paragraph alone, then decide.
+            first = embed_and_cut(paragraphs[:1])
+            if overhead + count * first[0][1] <= budget:
+                queries = list(paragraphs)
+                searched = first + embed_and_cut(paragraphs[1:])
+            else:
+                queries = [paragraphs[0], "\n".join(paragraphs[1:])]
+                searched = first + embed_and_cut(queries[1:])
+    except Exception:  # noqa: BLE001 — fail-soft
+        log.exception("semantic recall: query embed failed — falling back to lexical")
+        return None
+
+    # Merge (S11, S53): each memory goes to the query with its best cosine.
+    best: dict[str, tuple[float, int]] = {}
+    for qi, (cut, _) in enumerate(searched):
+        for mid, cosine in cut:
+            if mid not in best or cosine > best[mid][0]:
+                best[mid] = (cosine, qi)
+    assigned = [[(mid, c) for mid, c in cut if best[mid][1] == qi] for qi, (cut, _) in enumerate(searched)]
+    memories = store.get_active_by_ids(list(best))
+    vector_of = dict(zip(pool_ids, row_index, strict=True))
+    pool = {mid: (memories[mid], unit[vector_of[mid]]) for mid in best if mid in memories}
+    assigned = [[(mid, c) for mid, c in cut if mid in pool] for cut in assigned]
+
+    # Pair sizes per rerankable query, timed into its T_p sample (P-28).
+    samples = [part for _, part in searched]
+    sizes: dict[int, reranker_mod.PairSizes] = {}
+    rerankable = [qi for qi, cut in enumerate(assigned) if len(cut) >= RERANK_MIN_REAL_CANDIDATES]
+    if rerankable:
+        try:
+            reranker_provider = reranker_mod.build_reranker_provider(store=store)
+            began = _clock()
+            first_docs = _prefix_documents(pool, assigned[rerankable[0]])
+            reranker_mod.warm_up_for_recall(reranker_provider, queries[rerankable[0]], first_docs)
+            one_time += _clock() - began
+            for qi in rerankable:
+                began = _clock()
+                sizes[qi] = reranker_mod.recall_pair_sizes(
+                    reranker_provider, queries[qi], _prefix_documents(pool, assigned[qi])
+                )
+                samples[qi] += _clock() - began
+        except Exception:  # noqa: BLE001 — each query's rank_and_gate retries and fails soft
+            log.warning("semantic recall: pair-size probe failed", exc_info=True)
+            sizes = {}
+    for sample in samples:
+        _paragraph_time.record(sample)
+
+    # The rerank budget (S46, S61): the budget minus T_m and every query's
+    # T_p (the averages, including this message's samples), or minus the
+    # time actually spent so far if that is more (a wait on the embedder's
+    # lock, an unusually long batch), never below zero; shared equally (S33).
+    spent = max(
+        overhead + len(queries) * (_paragraph_time.average() or 0.0),
+        _clock() - start - one_time,
+    )
+    rerank_budget = max(0.0, budget - spent)
+    share = rerank_budget / len(queries)
+
+    best_cosines = [max((c for _, c in cut), default=None) for cut in assigned]
+    embedder_model_id = embedder.model_id()
+    gated_by_query: dict[int, GatedRanking | None] = {}
+    used = 0
+    for qi in _serve_order(best_cosines):
+        if not assigned[qi]:
+            gated_by_query[qi] = None
+            continue
+        gated = rank_and_gate(
+            store,
+            queries[qi],
+            pool,
+            assigned[qi],
+            embedder_model_id=embedder_model_id,
+            log_calibration=log_calibration,
+            budget_seconds=share,
+            max_real=CANDIDATE_POOL - used,
+            sizes=sizes.get(qi),
+        )
+        gated_by_query[qi] = gated
+        used += gated.real_width if gated is not None else 0
+    outcomes = tuple(
+        ParagraphOutcome(
+            index=qi,
+            query=queries[qi],
+            gated=gated_by_query.get(qi),
+            candidate_count=len(assigned[qi]),
+            best_cosine=best_cosines[qi],
+        )
+        for qi in range(len(queries))
+    )
+    return ParagraphSearch(
+        outcomes=outcomes,
+        pool=pool,
+        whole_message_fallback=whole_message,
+        total_width=used,
+        budget=budget,
+        rerank_budget=rerank_budget,
+    )
+
+
+def _prefix_documents(
+    pool: dict[str, tuple[Memory, np.ndarray]], coarse: list[tuple[str, float]]
+) -> list[str]:
+    """A query's candidate documents in the order `rank_and_gate` hands them
+    to the reranker (genuine first, each group by cosine)."""
+    return [pool[mid][0].content for mid in genuine_first([mid for mid, _ in coarse], pool)]
+
+
+@dataclass(frozen=True)
+class AssembledHit:
+    """One result of `assemble_paragraph_results`: the memory id, its score
+    on its own path's scale, that path, the paragraph (query index) it came
+    from and whether it is a monologue-family memory."""
+
+    memory_id: str
+    score: float
+    path: str
+    paragraph: int
+    monologue_family: bool
+
+
+def assemble_paragraph_results(search: ParagraphSearch, cap: int) -> list[AssembledHit]:
+    """The final semantic order across paragraphs, at most `cap` results
+    (spec §3, §4, §7; plan P-10; criteria C8b, C8c):
+
+      RG  reranked genuine results, by anchor-normalized score across paragraphs;
+      RM  reranked monologue-family results, the same way;
+      CG  cosine-path genuine results: each cosine-path paragraph's best
+          genuine memory at the head (by cosine), then the rest by cosine;
+      CM  cosine-scale monologue-family results by cosine: those of cosine-path
+          paragraphs and every reranked paragraph's cosine tail (S82), regrouped
+          after all cosine-path genuine results and de-duplicated (S86).
+
+    Only results that clear their own path's floor enter (scales are never
+    compared: reranked groups sort by normalized score, cosine groups by
+    cosine). Guaranteed slots (S33, S44, S55, S64): each reranked paragraph's
+    best genuine result, then each cosine-path paragraph's, are kept first,
+    reranked ones by normalized score, then cosine-path ones by cosine; past
+    `cap` the excess guarantees are dropped; a paragraph whose best genuine
+    memory does not clear its floor (or that has only monologue-family
+    results) has none. The remaining slots go to the other results in group
+    order. The kept results are returned in group order."""
+    pool = search.pool
+
+    def family(mid: str) -> bool:
+        return is_monologue_family(pool[mid][0])
+
+    rg: list[AssembledHit] = []
+    rm: list[AssembledHit] = []
+    cg: list[AssembledHit] = []
+    cm: list[AssembledHit] = []
+    guaranteed_reranked: list[AssembledHit] = []
+    guaranteed_cosine: list[AssembledHit] = []
+    for outcome in search.outcomes:
+        gated = outcome.gated
+        if gated is None:
+            continue
+        own = [
+            AssembledHit(mid, score, gated.path, outcome.index, family(mid))
+            for mid, score in gated.ranked
+            if score >= gated.pass_mark
+        ]
+        genuine = [hit for hit in own if not hit.monologue_family]
+        fam = [hit for hit in own if hit.monologue_family]
+        if gated.path == RERANKED_PATH:
+            rg += genuine
+            rm += fam
+            if genuine:
+                guaranteed_reranked.append(max(genuine, key=lambda hit: hit.score))
+        else:
+            cg += genuine
+            cm += fam
+            if genuine:
+                guaranteed_cosine.append(max(genuine, key=lambda hit: hit.score))
+        if gated.tail is not None:
+            cm += [
+                AssembledHit(mid, score, gated.tail.path, outcome.index, family(mid))
+                for mid, score in gated.tail.ranked
+                if score >= gated.tail.pass_mark
+            ]
+
+    def by_score(hits: list[AssembledHit]) -> list[AssembledHit]:
+        return sorted(hits, key=lambda hit: -hit.score)
+
+    guarantees = (by_score(guaranteed_reranked) + by_score(guaranteed_cosine))[: max(cap, 0)]
+    kept = {hit.memory_id for hit in guarantees}
+    cosine_heads = [hit for hit in by_score(guaranteed_cosine) if hit.memory_id in kept]
+    head_ids = {hit.memory_id for hit in cosine_heads}
+    groups = [
+        by_score(rg),
+        by_score(rm),
+        cosine_heads + [hit for hit in by_score(cg) if hit.memory_id not in head_ids],
+        by_score(cm),
+    ]
+    room = max(cap, 0) - len(kept)
+    for group in groups:
+        for hit in group:
+            if room <= 0:
+                break
+            if hit.memory_id not in kept:
+                kept.add(hit.memory_id)
+                room -= 1
+    ordered: list[AssembledHit] = []
+    seen: set[str] = set()
+    for group in groups:
+        for hit in group:
+            if hit.memory_id in kept and hit.memory_id not in seen:
+                seen.add(hit.memory_id)
+                ordered.append(hit)
+    return ordered
 
 
 def run_semantic_recall(
     store: MemoryStore,
     persona_dir: Path,
     user_input: str,
+    *,
+    keyword_words: Collection[str] | None = None,
 ) -> SemanticRecallResult | None:
     """Attempt semantic-PRIMARY recall for one turn.
 
-    Embeds `user_input` (~34ms, synchronous — the ONE allowed in-turn embed,
-    spec decision 4) via the shared process-cached embedding provider
-    (`build_embedding_provider()` — F1 #259 increment 8: the per-recall
-    query embed is transient and is never cached/persisted, so it goes
-    straight through the provider with no cache row to write), cosines it
-    against the model_id-scoped candidate pool as a CHEAP COARSE CUT (the top
-    `relevance.CANDIDATE_POOL` genuine memories by cosine plus the
-    monologue-family memories in the plain top-`CANDIDATE_POOL`, so it can
-    exceed 50: `genuine_first_coarse_cut`),
-    then `rank_and_gate`s the coarse cut:
+    Name-recall fix R6 (spec §3): the message is searched per paragraph
+    (`search_paragraphs`: split with `str.splitlines()`, blank paragraphs and
+    paragraphs with none of `keyword_words` dropped, every paragraph embedded
+    in one batch via the shared process-cached embedding provider, each
+    searched and cut on its own, the cuts merged, one per-message time budget
+    for the embeds, scans and reranks) and the results assembled across
+    paragraphs (`assemble_paragraph_results`, capped at `MAX_STANDOUT_COUNT`).
+    A one-paragraph message behaves as before apart from its embed + scan
+    time counting in the budget (S61). `keyword_words` is the caller's
+    keyword token set plus the words of the known names in the message
+    (`brain.chat.prompt`); `None` (direct callers) drops blank paragraphs
+    only.
+
+    Each query's coarse cut (the top `relevance.CANDIDATE_POOL` genuine
+    memories by cosine plus the monologue-family memories in its plain
+    top-`CANDIDATE_POOL`, `genuine_first_coarse_cut`, S77) is
+    `rank_and_gate`d:
 
       - reranked path: a cross-encoder rerank of a per-message-width prefix
         (`reranker.rerank_for_recall`, anchors on top, >= 5 real
@@ -822,12 +1429,12 @@ def run_semantic_recall(
         normalization falls back, the coarse cut ranked by cosine, gated by
         the cosine floor (`store.get_cosine_floor`). Not keyword-only.
 
-    Passive recall logs the turn's calibration row(s), each stamped with its
-    own true scale (a reranked turn logs only the `normalized` row: its
-    cosine tail, spec §4 S82, writes none, S84; a turn whose rerank scored but
+    Passive recall logs each query's calibration row(s), each stamped with its
+    own true scale and carrying that query (the paragraph, not the whole
+    message) as its text (a reranked query logs only the `normalized` row: its
+    cosine tail, spec §4 S82, writes none, S84; a query whose rerank scored but
     whose rerank floor was unavailable logs the `normalized` row, then the
-    cosine path's `cosine` row), and floor-gates
-    through `select_gated_standouts` (each result by its own scale's floor).
+    cosine path's `cosine` row).
 
     Returns a populated `SemanticRecallResult` ONLY when at least one
     candidate clears the operative floor of the path taken. Returns `None`
@@ -852,71 +1459,49 @@ def run_semantic_recall(
     unchanged.
     """
     try:
-        matrix = build_embedding_matrix(store.db_path)
-        pool = build_semantic_candidate_pool(store, matrix)
-        if not pool:
-            return None
-        try:
-            # Looked up via the MODULE (not a bare imported name) so a
-            # test's monkeypatch on `embeddings.build_embedding_provider` is
-            # honored — mirrors `is_duplicate`'s/`MemoryStore.embed_row`'s
-            # identical dynamic lookup. F1 #259 increment 8: the per-recall
-            # query embed is transient (never persisted), so it goes
-            # straight through the process-cached provider — no cache row
-            # to write or evict.
-            embedder = embeddings_mod.build_embedding_provider()
-            query_vec = embedder.embed(user_input).astype("float32")
-        except Exception:  # noqa: BLE001 — fail-soft
-            log.exception("run_semantic_recall: query embed failed — falling back to lexical")
-            return None
-
-        cosine_scored = [
-            (mid, cosine_similarity(query_vec, vec)) for mid, (_, vec) in pool.items()
-        ]
-        # Spec §4, S77: top 50 genuine + the family memories in the plain top 50.
-        coarse = genuine_first_coarse_cut(cosine_scored, pool)
-
-        gated = rank_and_gate(
-            store,
-            user_input,
-            pool,
-            coarse,
-            embedder_model_id=embedder.model_id(),
-            log_calibration=True,
+        search = search_paragraphs(
+            store, user_input, keyword_words=keyword_words, log_calibration=True
         )
-        if gated is None:
+        if search is None:
             return None
-
-        tiers = select_gated_standouts(gated)
+        assembled = assemble_paragraph_results(search, MAX_STANDOUT_COUNT)
+        tiers = _surfacing([(hit.memory_id, hit.score) for hit in assembled])
         if tiers is None:
             return None
-
+        pool = search.pool
         full = [pool[mid][0] for mid in tiers.full_ids]
         snippet = [pool[mid][0] for mid in tiers.snippet_ids]
-        scores = dict(gated.ranked)
-        tail = gated.tail
-        tail_scores = dict(tail.ranked) if tail is not None else {}
         hits = [
             SemanticHit(
-                memory=mem,
-                score=tail_scores[mem.id] if mem.id in tail_scores else scores[mem.id],
-                path=tail.path if mem.id in tail_scores and tail is not None else gated.path,
-                paragraph=SINGLE_QUERY_PARAGRAPH,
-                monologue_family=is_monologue_family(mem),
+                memory=pool[hit.memory_id][0],
+                score=hit.score,
+                path=hit.path,
+                paragraph=hit.paragraph,
+                monologue_family=hit.monologue_family,
             )
-            for mem in (*full, *snippet)
+            for hit in assembled[: len(full) + len(snippet)]
         ]
+        # The legacy single-ranking fields describe the first query that has
+        # a gated ranking (the only one on a one-paragraph message); every
+        # query's own ranking is in `paragraphs`.
+        primary = next(o.gated for o in search.outcomes if o.gated is not None)
+        tail = primary.tail
         return SemanticRecallResult(
             full=full,
             snippet=snippet,
-            scores=scores,
+            scores=dict(primary.ranked),
             hits=hits,
-            path=gated.path,
-            scale=gated.scale,
-            pass_mark=gated.pass_mark,
-            tail_scores=tail_scores,
+            path=primary.path,
+            scale=primary.scale,
+            pass_mark=primary.pass_mark,
+            tail_scores=dict(tail.ranked) if tail is not None else {},
             tail_scale=tail.scale if tail is not None else None,
             tail_pass_mark=tail.pass_mark if tail is not None else None,
+            paragraphs=search.outcomes,
+            whole_message_fallback=search.whole_message_fallback,
+            total_width=search.total_width,
+            budget=search.budget,
+            rerank_budget=search.rerank_budget,
         )
     except Exception:  # noqa: BLE001 — fail-soft: ANY failure demotes to lexical, never raises
         log.warning(

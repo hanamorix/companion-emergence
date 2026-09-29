@@ -1035,6 +1035,43 @@ class RecallRerank:
     measured: bool
 
 
+@dataclass(frozen=True)
+class PairSizes:
+    """One query's pair token counts, computed ahead of its rerank
+    (`recall_pair_sizes`) so a caller can time them apart from the rerank
+    itself (name-recall fix R6, plan P-28: the pair-length computation is
+    part of the per-paragraph time `T_p`, not of the rerank budget).
+
+    `lengths` is `provider.pair_token_lengths(query, [*candidates, *ANCHOR_POOL])`
+    over the query's first `CANDIDATE_POOL` candidates, or `None` when the
+    tokenizer probe failed (the "sizes" hand-off)."""
+
+    lengths: list[int] | None
+
+
+def warm_up_for_recall(
+    provider: RerankerProvider, query: str, candidate_documents: Sequence[str]
+) -> None:
+    """The two discarded warm-up reranks (plan P-1), run now if this
+    process has not run them yet for the provider's model id. A caller that
+    times its own pair-size probe (`recall_pair_sizes`) calls this first, so
+    the one-time ONNX session load is never timed into `T_p`."""
+    _warm_up_once(provider, query, list(candidate_documents[:CANDIDATE_POOL]))
+
+
+def recall_pair_sizes(
+    provider: RerankerProvider, query: str, candidate_documents: Sequence[str]
+) -> PairSizes:
+    """The pair token counts `rerank_for_recall` would compute for this
+    query, computed now (see `PairSizes`). Warms up first (the real
+    provider's tokenizer exists only once its model is loaded). Raises
+    whatever the provider raises."""
+    pool = list(candidate_documents[:CANDIDATE_POOL])
+    _warm_up_once(provider, query, pool)
+    lengths = provider.pair_token_lengths(query, [*pool, *ANCHOR_POOL])
+    return PairSizes(lengths=None if lengths is None else list(lengths))
+
+
 def rerank_for_recall(
     provider: RerankerProvider,
     query: str,
@@ -1042,6 +1079,7 @@ def rerank_for_recall(
     *,
     budget_seconds: float | None = None,
     max_real: int = CANDIDATE_POOL,
+    sizes: PairSizes | None = None,
 ) -> RecallRerank:
     """Fit this query's width, rerank that prefix with anchors on top, and
     record the call in the cost model (spec §1, S23/S24/S32/S62/S67/S75).
@@ -1050,15 +1088,20 @@ def rerank_for_recall(
     `fit_rerank_width`); only the first `CANDIDATE_POOL` are considered.
     `budget_seconds` defaults to the `reranker.latency_budget_seconds`
     tunable read now; `max_real` lets a caller give this query less than the
-    design maximum. Raises whatever the provider raises (warm-up, lengths,
-    scoring); callers treat that as a reranker failure."""
+    design maximum (name-recall fix R6, S58: what is left of the message's
+    50 real candidates; below the S5 minimum the hand-off is "allocation").
+    `sizes`, when given, are this query's pair token counts computed ahead
+    by `recall_pair_sizes` over the same documents (R6 times them into
+    `T_p`); otherwise they are computed here. Raises whatever the provider
+    raises (warm-up, lengths, scoring); callers treat that as a reranker
+    failure."""
     pool = list(candidate_documents[:CANDIDATE_POOL])
     cap = min(max_real, CANDIDATE_POOL)
     if min(len(pool), cap) < RERANK_MIN_REAL_CANDIDATES:
         return RecallRerank(
-            width=min(len(pool), cap),
+            width=min(len(pool), max(cap, 0)),
             reranked=False,
-            hand_off="pool",
+            hand_off="pool" if len(pool) < RERANK_MIN_REAL_CANDIDATES else "allocation",
             normalization=None,
             measured=False,
         )
@@ -1071,7 +1114,15 @@ def rerank_for_recall(
     # Warm up before the length probe: on the real provider the first rerank
     # loads the ONNX session, and with it the tokenizer the probe uses.
     _warm_up_once(provider, query, pool)
-    lengths = provider.pair_token_lengths(query, [*pool, *ANCHOR_POOL])
+    if sizes is None:
+        lengths = provider.pair_token_lengths(query, [*pool, *ANCHOR_POOL])
+    else:
+        lengths = sizes.lengths
+        if lengths is not None and len(lengths) != len(pool) + len(ANCHOR_POOL):
+            raise ValueError(
+                f"rerank_for_recall: {len(lengths)} precomputed pair sizes for "
+                f"{len(pool)} candidates + {len(ANCHOR_POOL)} anchors"
+            )
     if lengths is None:
         # Token sizes unavailable (the tokenizer probe failed): a width cannot
         # be sized against the latency budget or the RAM bound, and a batch of

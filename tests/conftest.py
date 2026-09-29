@@ -311,6 +311,21 @@ def _reset_reranker_provider_cache() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _paragraph_time_model_reset(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Name-recall fix R6 (plan P-24): reset the per-message budget's running
+    averages (`T_m`, `T_p`) before and after each test, and freeze the budget
+    clock (`semantic_recall._clock`) at 0 so every test sees `T_m = T_p = 0`
+    and the whole rerank budget, exactly as before R6, unless it scripts the
+    clock itself (the per-paragraph budget tests do)."""
+    from brain.memory import semantic_recall
+
+    semantic_recall._reset_paragraph_time_model()
+    monkeypatch.setattr(semantic_recall, "_clock", lambda: 0.0)
+    yield
+    semantic_recall._reset_paragraph_time_model()
+
+
+@pytest.fixture(autouse=True)
 def _floor_bootstrap_background_off_by_default(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[None]:

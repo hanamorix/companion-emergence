@@ -2806,6 +2806,33 @@ class MemoryStore:
             self._conn.commit()
         return [(_row_to_memory(row), float(row["_bm25"])) for row in rows]
 
+    def active_state_memory_types(self) -> dict[str, str]:
+        """`{id: memory_type}` for every memory that is `active = 1` AND in
+        `state = 'active'`: the semantic candidate pool's membership in one
+        narrow two-column SELECT (name-recall fix R6, plan P-27), no JSON
+        decoding, no bump. The full rows are fetched afterwards for the few
+        candidates that survive the cosine cut (`get_active_by_ids`)."""
+        rows = self._conn.execute(
+            "SELECT id, memory_type FROM memories WHERE active = 1 AND state = 'active'"
+        ).fetchall()
+        return {row[0]: row[1] for row in rows}
+
+    def get_active_by_ids(self, ids: Sequence[str]) -> dict[str, Memory]:
+        """`{id: Memory}` for those of `ids` that are still `active = 1` and in
+        `state = 'active'` (a row that faded or was deactivated since the
+        pool was read is simply absent). A plain SELECT: never bumps
+        `recall_count` or `last_accessed_at` (name-recall fix R6, plan P-27)."""
+        wanted = list(dict.fromkeys(ids))
+        if not wanted:
+            return {}
+        placeholders = ",".join("?" * len(wanted))
+        rows = self._conn.execute(
+            f"SELECT * FROM memories WHERE id IN ({placeholders})"
+            " AND active = 1 AND state = 'active'",
+            wanted,
+        ).fetchall()
+        return {row["id"]: _row_to_memory(row) for row in rows}
+
     def list_active(self, limit: int | None = None) -> list[Memory]:
         """Return active memories ordered by created_at desc."""
         sql = "SELECT * FROM memories WHERE active = 1 ORDER BY created_at DESC"

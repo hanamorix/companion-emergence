@@ -7,9 +7,6 @@ import re
 from pathlib import Path
 from typing import Literal
 
-from brain.memory import embeddings as embeddings_mod
-from brain.memory.embedding_matrix import build_embedding_matrix
-from brain.memory.embeddings import cosine_similarity
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.relevance import (
     CANDIDATE_POOL,
@@ -20,11 +17,9 @@ from brain.memory.relevance import (
     snippet_length,
 )
 from brain.memory.semantic_recall import (
-    build_semantic_candidate_pool,
-    gated_cleared,
-    genuine_first_coarse_cut,
+    assemble_paragraph_results,
     genuine_first_memories,
-    rank_and_gate,
+    search_paragraphs,
 )
 from brain.memory.store import Memory, MemoryStore, split_by_raw_query_floor
 from brain.tools.impls._common import _mem_to_result
@@ -207,21 +202,21 @@ def _semantic_top_k(
 ) -> list[Memory] | None:
     """Top-K semantically matched memories for an ACTIVE search call.
 
-    #231 RERANKER RE-ARCHITECTURE (Q1, resolved 2026-09-10): embeds ``query``
-    once via the shared process-cached embedding provider
-    (``build_embedding_provider()``, cached by model_id — no per-call model
-    reload; F1 #259 increment 8: the query embed is transient/never
-    persisted, so it goes straight through the provider with no cache row
-    to write), cosines it against every actively-cached memory vector
-    (Stage 3's ``build_semantic_candidate_pool``: active memories that
-    already have a cached vector under the current model_id — never
-    triggers a new embed for an uncached memory, the same warm-up contract
-    passive recall uses) as a CHEAP COARSE CUT to ``relevance.CANDIDATE_
-    POOL`` (the top 50 genuine plus the family in the plain top 50, spec §4 S77),
-    then scores the coarse cut with ``semantic_recall.rank_and_gate``
-    — the SAME path choice, floor and scale passive recall uses (name-recall
-    fix R2, spec §2): a per-message-width cross-encoder rerank gated by the
-    calibrated, anchor-normalized rerank floor when >= 5 real candidates fit
+    #231 RERANKER RE-ARCHITECTURE (Q1, resolved 2026-09-10), per paragraph
+    since name-recall fix R6 (spec §3, S29: "the tool's explicit query is also
+    split by paragraph"): ``semantic_recall.search_paragraphs`` splits
+    ``query`` into paragraphs, embeds them in one batch through the shared
+    process-cached embedding provider, cosines each against every active
+    memory that already has a cached vector under the current model_id (never
+    triggers a new embed for an uncached memory, the warm-up contract passive
+    recall uses; ``exclude`` ids are removed first), cuts each paragraph's
+    pool to the top 50 genuine plus the family in its plain top 50 (spec §4
+    S77), merges the cuts (a memory goes to the paragraph with its best
+    cosine) and scores each paragraph with ``semantic_recall.rank_and_gate``
+    within the one per-message time budget: the SAME path choice, floor and
+    scale passive recall uses (name-recall fix R2, spec §2), a
+    per-paragraph-width cross-encoder rerank gated by the calibrated,
+    anchor-normalized rerank floor when >= 5 real candidates fit its share
     (F2b #276 §2/§4), otherwise (fewer than 5 fit or exist, or the reranker
     failed to load/score, or its normalization fell back) the cosine ranking
     gated by the cosine floor. A reranker failure no longer demotes this call
@@ -232,19 +227,19 @@ def _semantic_top_k(
     NOTHING clears it — or no cosine gate exists yet (the cosine bootstrap
     was not computed yet, or failed) — this returns ``None`` (the tool's EXISTING empty-semantic→
     lexical fallback — never returns nothing, never hands back semantic junk
-    that never cleared a floor). Otherwise returns the top ``limit``
-    floor-clearing memories in the path's own order (name-recall fix R3, spec
-    §4): every genuine memory by descending score, then every monologue-family
-    memory by descending score, so a monologue-family memory never takes a
-    result slot from a floor-clearing genuine one; on a reranked path the
-    unreranked monologue-family memories that clear the COSINE floor follow
-    (spec §4, S82: ``gated_cleared``, each result gated by its own scale's
-    floor only). The rerank prefix already
-    took genuine candidates first (``rank_and_gate``). That order is what the
-    default ``order="relevance"`` returns; ``order="age"`` still re-sorts the
-    matched set by date (and ``emotion`` still boosts) in ``search_memories``'
-    unchanged tail (plan P-21), so a newer monologue-family memory can precede
-    an older genuine one there by the caller's own request.
+    that never cleared a floor). Otherwise returns up to ``limit``
+    floor-clearing memories in the spec §4 order across paragraphs
+    (``semantic_recall.assemble_paragraph_results``): reranked genuine,
+    reranked monologue-family, cosine-path genuine (each cosine-path
+    paragraph's best genuine memory at its head), cosine-scale
+    monologue-family (including every reranked paragraph's cosine tail, S82,
+    S86), each result gated by its own scale's floor only, each paragraph's
+    best genuine memory guaranteed a slot within ``limit`` (S33, S55, S64).
+    That order is what the default ``order="relevance"`` returns;
+    ``order="age"`` still re-sorts the matched set by date (and ``emotion``
+    still boosts) in ``search_memories``' unchanged tail (plan P-21), so a
+    newer monologue-family memory can precede an older genuine one there by
+    the caller's own request.
 
     Deliberately does NOT reuse ``semantic_recall``'s option-4 surfacing
     tiers (≤5 full / 6-9 / cap-at-9) — that machinery decides whether to
@@ -262,49 +257,26 @@ def _semantic_top_k(
     error only demotes this call to lexical, never breaks the tool.
     """
     try:
-        matrix = build_embedding_matrix(store.db_path)
-        pool = build_semantic_candidate_pool(store, matrix)
-        if not pool:
-            return None
-        try:
-            # Looked up via the MODULE (not a bare imported name) so a
-            # test's monkeypatch on `embeddings.build_embedding_provider` is
-            # honored — mirrors `run_semantic_recall`'s/`is_duplicate`'s
-            # identical dynamic lookup.
-            embedder = embeddings_mod.build_embedding_provider()
-            query_vec = embedder.embed(query).astype("float32")
-        except Exception:  # noqa: BLE001 — fail-soft
-            logger.exception(
-                "search_memories(semantic): query embed failed — falling back to lexical"
-            )
-            return None
-
-        cosine_scored = [
-            (mid, cosine_similarity(query_vec, vec))
-            for mid, (_, vec) in pool.items()
-            if mid not in exclude
-        ]
-        if not cosine_scored:
-            return None
-        # Spec §4, S77: top 50 genuine + the family memories in the plain top 50.
-        coarse = genuine_first_coarse_cut(cosine_scored, pool)
-
-        gated = rank_and_gate(
+        # Name-recall fix R6 (spec §3, S29): her query is searched per
+        # paragraph like passive recall (same split, pool, budget, allocation
+        # and per-paragraph rerank or cosine path; no calibration row, S56).
+        # Its keyword words are every word she typed (S81), so only a
+        # paragraph with no word at all is dropped.
+        search = search_paragraphs(
             store,
             query,
-            pool,
-            coarse,
-            embedder_model_id=embedder.model_id(),
+            keyword_words=frozenset(_query_words(query)),
+            exclude=exclude,
             log_calibration=False,
         )
-        if gated is None:
+        if search is None:
             return None
-        # Each result faces only its own scale's floor (spec §4, S82): the
-        # ranking's results, then its cosine tail's.
-        cleared = gated_cleared(gated)
-        if not cleared:
+        # The per-paragraph assembly (spec §3/§4, S64): each result faces only
+        # its own scale's floor; guaranteed slots per paragraph within `limit`.
+        assembled = assemble_paragraph_results(search, limit)
+        if not assembled:
             return None
-        return [pool[mid][0] for mid, _, _ in cleared[:limit]]
+        return [search.pool[hit.memory_id][0] for hit in assembled]
     except Exception:  # noqa: BLE001 — fail-soft: ANY failure demotes to lexical, never raises
         logger.warning(
             "search_memories(semantic): semantic path failed — falling back to lexical",
