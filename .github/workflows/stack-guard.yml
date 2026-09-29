@@ -1,0 +1,85 @@
+name: stack-guard
+
+# #282: stacked pull requests merge bottom-up, each into main.
+#
+# - stack-guard (every open PR): red when the PR's base isn't main, naming the PR to
+#   merge first. A signal on the PR page, not a lock (see ADVISORY below).
+# - stranded-after-merge (a PR merged into anything but main): comments on it that
+#   its changes aren't on main, and whether they're stranded (the F2 incident, #281).
+#
+# ADVISORY: a required check can't block a stacked merge — branch protection
+# applies to a PR's base branch, and a stacked PR's base is an unprotected feature
+# branch. The real guard is the repo's delete-branch-on-merge setting (on since
+# 2026-09-25; it was off during F2): GitHub deletes a merged PR's branch and
+# retargets the next PR in the stack to main. Full rationale: CONTRIBUTING.md,
+# "Stacked pull requests", and the notes on #282.
+#
+# Runs on every base (no `branches:` filter — that would skip exactly the stacked
+# PRs) and on `edited`, which fires when a PR's base changes. The script reads the
+# base live from the API, so a manual re-run after a retarget also turns it green.
+#
+# `pull_request`, not `pull_request_target`: a PR runs its own copy of this check.
+# It guards against accidents between trusted collaborators, not a malicious PR.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited, ready_for_review, closed]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  stack-guard:
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # `edited` also fires on title/body edits: a newer run supersedes an older one.
+    concurrency:
+      group: stack-guard-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          sparse-checkout: scripts/stack_guard.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Base must be main
+        env:
+          MODE: check
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/stack_guard.sh
+
+  stranded-after-merge:
+    if: >-
+      github.event.action == 'closed'
+      && github.event.pull_request.merged
+      && github.event.pull_request.base.ref != github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write  # to comment on the merged PR
+    steps:
+      # The merge's own commit on the base branch: it always exists (the merged PR's
+      # head branch may already be auto-deleted) and carries the script.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          sparse-checkout: scripts/stack_guard.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Are these changes on main?
+        env:
+          MODE: merged
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/stack_guard.sh
