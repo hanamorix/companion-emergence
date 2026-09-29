@@ -99,7 +99,9 @@ gate (`reranker.normalize_against_anchors`) compares against. See
 
 Name-recall fix R2 (spec §2, S18/S25/S38): the same module also owns the
 COSINE floor the no-rerank path gates on (`get_cosine_bootstrap_floor`, the
-same F-beta fit over the same bundled pairs scored by the embedder, and
+same F-beta fit over the same bundled pairs scored by the embedder, computed
+once per process by the central cadence job via `run_cosine_bootstrap`, never
+on the recall hot path, S85; and
 `derive_and_persist_cosine_floor`, the daily fit from `cosine`-scale rows
 only into `cosine_floor_calibration`). Both derivations share `_fit_or_hold`;
 the two scales are never mixed.

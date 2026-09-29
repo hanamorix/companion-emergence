@@ -752,9 +752,11 @@ def _build_gated_jobs(
     test/dev disable knob) is left out. Pass 2, session snapshot/prune,
     emotion backfill and embedding backfill have no interval: each runs at
     every idle pass while it has work (S53/S66). Deploy recalibration is due
-    while the stored floor is stale (S70/S73). Self-model articulation keeps
-    its own cadence (S29). Every other job is an interval job whose cadence
-    file the central function owns.
+    while the stored floor is stale (S70/S73). The cosine floor bootstrap
+    (name-recall fix S85) is due while neither a calibrated cosine row nor the
+    process-cached bootstrap exists and its failure back-off has elapsed.
+    Self-model articulation keeps its own cadence (S29). Every other job is an
+    interval job whose cadence file the central function owns.
 
     Each ``run`` closure looks its tick function up by module-global name at
     call time (so tests can monkeypatch them) and returns

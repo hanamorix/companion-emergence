@@ -17,6 +17,9 @@ deploy recalibration immediately before daily calibration (S70/S73).
 
 Cadence rules (interval jobs, owned here):
 
+* A predicate job's own condition holds (the cosine floor bootstrap,
+  name-recall fix S85: no calibrated cosine row, no cached bootstrap, its
+  failure back-off elapsed), like deploy recalibration.
 * A missing OR corrupt cadence file is created as "last ran now"
   (``next_at = now + interval``) and the job does not run on that pass
   (S22/S69). A present file with a past ``next_at`` is simply overdue (S34),

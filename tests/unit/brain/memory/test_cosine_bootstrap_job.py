@@ -78,6 +78,25 @@ def test_a_turn_before_the_lull_is_keyword_only_and_computes_nothing(
         assert run_semantic_recall(store, tmp_path, _QUERY) is None, "keyword-only, every turn"
 
 
+def test_the_no_floor_turn_logs_nothing_above_debug(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Every keyword-only turn before the job ran passes through the no-floor
+    branch: it must not spam the log (DEBUG only)."""
+    store = MemoryStore(tmp_path / "memories.db")
+    _seed_pool(store, monkeypatch, [0.99, 0.98, 0.97])
+
+    with caplog.at_level("INFO", logger="brain.memory.semantic_recall"):
+        assert run_semantic_recall(store, tmp_path, _QUERY) is None
+
+    floor_lines = [
+        r
+        for r in caplog.records
+        if r.name == "brain.memory.semantic_recall" and "cosine floor" in r.getMessage()
+    ]
+    assert floor_lines == []
+
+
 def test_after_the_job_ran_the_cosine_path_is_active(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
