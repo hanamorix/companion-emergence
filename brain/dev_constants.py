@@ -101,3 +101,11 @@ PASS2_NOBRIDGE_DRAIN_BUDGET_S: float = 20.0
 # first search on a slow CPU can legitimately take 44-60 s+ (O7/O15) — that is
 # a known, accepted consequence of this bound, not a defect.
 SEARCH_BRIDGE_TIMEOUT_S: float = 45.0
+
+# --- recall diagnostics log file name (name-recall fix D1, S59) -------------
+# One JSONL record per passive recall or `search_memories` call, in the
+# persona directory beside the other persona JSONL logs (NOT memories.db and
+# NOT the calibration log, S30). A file name is a fixed dev-level constant:
+# nothing reads or overrides it at run time. See
+# `brain.memory.recall_diagnostics`.
+RECALL_DIAGNOSTICS_LOG_FILENAME: str = "recall_diagnostics.log.jsonl"
