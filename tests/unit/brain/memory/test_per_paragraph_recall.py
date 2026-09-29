@@ -1558,3 +1558,133 @@ def test_a_rerank_whose_normalization_fell_back_still_counts_toward_the_fifty(
     assert search.total_width == 50
     assert [o.reranked_width for o in search.outcomes] == [10, 10, 10, 10, 10, 0]
     assert {o.gated.path for o in search.outcomes} == {COSINE_PATH}
+
+
+# ---------------------------------------------------------------------------
+# Review round 2 (R6/6-redteam-code.round2.md): G1-G3
+# ---------------------------------------------------------------------------
+
+
+def test_a_pool_below_five_never_builds_the_reranker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """G1: fewer than 5 real candidates exist, so no rerank can run and the
+    reranker (a model load on first use) is not even built."""
+    embedder = _AxisEmbedder({"kite words": 0})
+    store = MemoryStore(tmp_path / "memories.db")
+    _install(monkeypatch, embedder)
+    for j in range(3):
+        _mem(store, f"r6 few {j}", {0: 0.9 - 0.01 * j})
+    _cosine_floor(store, 0.5)
+    built: list[int] = []
+
+    def _build(**kwargs):
+        built.append(1)
+        return _Reranker()
+
+    monkeypatch.setattr("brain.memory.reranker.build_reranker_provider", _build)
+
+    result = run_semantic_recall(store, tmp_path, "kite words")
+
+    assert result is not None and result.path == COSINE_PATH
+    assert built == []
+
+
+class _WarmUpFails(_Reranker):
+    def rerank(self, query, documents):
+        self.calls.append((query, list(documents)))
+        raise RuntimeError("simulated warm-up failure")
+
+
+def test_a_reranker_whose_warm_up_fails_is_tried_once_per_message(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """G2: the provider builds but its first rerank (the warm-up) raises: one
+    attempt for the message, no pair-size probe, every paragraph on the
+    cosine path."""
+    embedder = _AxisEmbedder({_P1: 0, _P2: 1, _P3: 2})
+    store = MemoryStore(tmp_path / "memories.db")
+    _install(monkeypatch, embedder)
+    for axis in range(3):
+        for j in range(6):
+            _mem(store, f"r6 warm {axis} {j}", {axis: 0.9 - 0.01 * j})
+    _cosine_floor(store, 0.5)
+    rec = _WarmUpFails()
+    _install(monkeypatch, embedder, rec)
+
+    result = run_semantic_recall(store, tmp_path, _THREE)
+
+    assert len(rec.calls) == 1
+    assert rec.probed == []
+    assert result is not None
+    assert [o.gated.path for o in result.paragraphs] == [COSINE_PATH] * 3
+
+
+class _ProbeFailsFor(_Reranker):
+    def __init__(self, failing_query: str, **kwargs):
+        super().__init__(**kwargs)
+        self.failing_query = failing_query
+
+    def pair_token_lengths(self, query, documents):
+        if query == self.failing_query:
+            self.probed.append(query)
+            raise RuntimeError("simulated probe failure for one query")
+        return super().pair_token_lengths(query, documents)
+
+
+def test_one_querys_probe_failure_keeps_the_other_queries_sizes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """G2: a pair-size probe that fails for P2 only: P1 still reranks with the
+    sizes computed ahead; P2 gets none (its own rank_and_gate retries)."""
+    embedder = _AxisEmbedder({_P1: 0, _P2: 1})
+    store = MemoryStore(tmp_path / "memories.db")
+    _install(monkeypatch, embedder)
+    contents = [
+        _mem(store, f"r6 probe {axis} {j}", {axis: 0.9 - 0.01 * j}).content
+        for axis in (0, 1)
+        for j in range(6)
+    ]
+    rec = _ProbeFailsFor(_P2, scores=dict.fromkeys(contents, 5.0))
+    _install(monkeypatch, embedder, rec)
+    _rerank_floor(store, 1.0)
+    _cosine_floor(store, 0.5)
+    _warm()
+    calls = _spy_rank_and_gate(monkeypatch)
+
+    run_semantic_recall(store, tmp_path, f"{_P1}\n{_P2}")
+
+    sizes = {c["query"]: c["sizes"] for c in calls}
+    assert sizes[_P1] is not None and sizes[_P1].lengths is not None
+    assert sizes[_P2] is None
+
+
+def test_a_rerank_whose_floor_read_failed_still_counts_toward_the_fifty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """G3 (S58): each query reranks 12 and then the rerank floor cannot be
+    read: the 12 still count, so 4 queries rerank (48) and the rest do not."""
+    texts = [f"floor {chr(97 + i)} words" for i in range(6)]
+    embedder = _AxisEmbedder({t: i for i, t in enumerate(texts)})
+    store = MemoryStore(tmp_path / "memories.db")
+    _install(monkeypatch, embedder)
+    contents = [
+        _mem(store, f"r6 floor {i} {j}", {i: 0.9 - 0.01 * j}).content
+        for i in range(6)
+        for j in range(12)
+    ]
+    rec = _Reranker(dict.fromkeys(contents, 5.0))
+    _install(monkeypatch, embedder, rec)
+    _cosine_floor(store, 0.5)
+    _warm()
+
+    def _broken(self, model_id):
+        raise RuntimeError("simulated floor read failure")
+
+    monkeypatch.setattr(MemoryStore, "get_reranker_floor", _broken)
+
+    search = search_paragraphs(store, "\n".join(texts), log_calibration=False)
+
+    assert search is not None
+    assert len(rec.scored()) == 4
+    assert search.total_width == 48
