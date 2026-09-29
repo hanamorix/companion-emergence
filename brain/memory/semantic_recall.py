@@ -58,9 +58,10 @@ This module owns:
     "snippet"). Rendering (actual body/snippet text, recall-counter ticks)
     stays owned by ``brain.chat.prompt``, mirroring how it already
     renders/bumps the lexical path — this module only decides WHICH ids go
-    in which bucket, in reranker-SELECTION order; presentation order is the
-    caller's call (spec: "the reranker selects, the normal sort orders the
-    presentation").
+    in which bucket, in the path's own order (name-recall fix R3, spec §4:
+    genuine memories first, then the monologue family, each by the path's
+    score); presentation order within the snippet tier is still the caller's
+    call until R4 (plan P-11).
 
 Does NOT touch: the lexical/blend fallback itself (untouched, reused
 as-is), the embed-on-write / idle-backfill machinery (Stage 2, unaffected),
@@ -70,11 +71,12 @@ or clustering (Stage 5, unaffected).
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 
+from brain.dev_constants import MONOLOGUE_FAMILY_TYPES
 from brain.memory import embeddings as embeddings_mod
 from brain.memory import reranker as reranker_mod
 from brain.memory.embedding_matrix import EmbeddingMatrix, build_embedding_matrix
@@ -149,10 +151,11 @@ class SemanticSurfacing:
     """The surfacing-tier id split for a CONCLUSIVE (at least one
     above-floor candidate) reranked result.
 
-    Both lists are in reranker-SELECTION order (highest reranker score
-    first) — the reranker decides membership and ranking of the standout
-    set; the caller decides PRESENTATION order for the snippet tier (spec:
-    "the reranker selects, the normal sort orders the presentation").
+    Both lists are in the path's own order, as handed to `select_standouts`
+    (name-recall fix R3: genuine memories by score, then monologue-family
+    memories by score) — the path decides membership and ranking of the
+    standout set; the caller decides PRESENTATION order for the snippet tier
+    (until R4, plan P-11).
     """
 
     full_ids: list[str]
@@ -187,9 +190,13 @@ def select_standouts(reranked_desc: list[tuple[str, float]], floor: float) -> Se
       - >=10 standouts: capped at `MAX_STANDOUT_COUNT` (top 5 full + 4
         snippet) — NOT demoted to lexical (see that constant's docstring).
 
-    `reranked_desc` must already be sorted descending by score (the
-    caller's job — this function trusts the ordering, mirroring the old
-    `classify_semantic_shape`/`surfacing_tiers` contract).
+    `reranked_desc` must already be in the path's final order (the caller's
+    job — this function trusts the ordering, mirroring the old
+    `classify_semantic_shape`/`surfacing_tiers` contract): sorted descending by
+    score, except that (name-recall fix R3, spec §4) `rank_and_gate` places
+    every genuine memory ahead of every monologue-family one, so the
+    `MAX_STANDOUT_COUNT` cut below never drops a floor-clearing genuine
+    memory while keeping a monologue-family one.
     """
     standouts = [(mid, score) for mid, score in reranked_desc if score >= floor]
     if not standouts:
@@ -280,6 +287,10 @@ class SemanticRecallResult:
     full: list[Memory]
     snippet: list[Memory]
     scores: dict[str, float]
+    # Name-recall fix R3 (plan R3 row): the same standouts as ONE ordered list
+    # (`full` then `snippet`, the path's own order), each tagged with the path
+    # that scored it and the paragraph that produced it, for the R4 assembly.
+    hits: list[SemanticHit] = field(default_factory=list)
     # Name-recall fix R2 (spec §2, C2c): which path produced this result, the
     # scale `scores` are on ('normalized' reranker scores or raw 'cosine') and
     # the pass mark that was actually applied to them. Never mixed: a result
@@ -292,17 +303,64 @@ class SemanticRecallResult:
 RERANKED_PATH = "reranked"
 COSINE_PATH = "cosine"
 
+# Every semantic result is one query today, so its paragraph tag is 0; R6's
+# per-paragraph search assigns the real index.
+SINGLE_QUERY_PARAGRAPH = 0
+
+
+@dataclass(frozen=True)
+class SemanticHit:
+    """One surfaced semantic result, tagged for the final assembly (plan R3
+    row, P-10): its `path` ("reranked" / "cosine"), the `paragraph` that
+    produced it, the `score` on that path's scale, and whether it belongs to
+    the monologue family (spec §4)."""
+
+    memory: Memory
+    score: float
+    path: str
+    paragraph: int
+    monologue_family: bool
+
+
+def is_monologue_family(memory: Memory) -> bool:
+    """True for the kindled's own generated monologue memories (spec §4,
+    S16): the types in `MONOLOGUE_FAMILY_TYPES`. Genuine memories are
+    everything else."""
+    return memory.memory_type in MONOLOGUE_FAMILY_TYPES
+
+
+def genuine_first(ids: list[str], pool: dict[str, tuple[Memory, np.ndarray]]) -> list[str]:
+    """`ids` with every genuine memory ahead of every monologue-family one,
+    each group keeping its incoming (cosine) order. Used for the rerank
+    prefix: the width fit and the reranker take genuine candidates first
+    (spec §4, S13/S16; no score multiplier)."""
+    genuine = [mid for mid in ids if not is_monologue_family(pool[mid][0])]
+    family = [mid for mid in ids if is_monologue_family(pool[mid][0])]
+    return genuine + family
+
+
+def genuine_first_ranking(
+    scored: list[tuple[str, float]], pool: dict[str, tuple[Memory, np.ndarray]]
+) -> list[tuple[str, float]]:
+    """`(id, score)` pairs in a path's final order: genuine memories by
+    descending score, then monologue-family memories by descending score.
+    The sort is stable, so equal scores keep their incoming order."""
+    return sorted(scored, key=lambda pair: (is_monologue_family(pool[pair[0]][0]), -pair[1]))
+
 
 @dataclass(frozen=True)
 class GatedRanking:
     """Every candidate one turn's gate examined, best first, on ONE scale,
     plus the pass mark that scale is gated by (name-recall fix R2, spec §2).
 
-    `ranked` is `(memory_id, score)` sorted descending: normalized reranker
-    scores for the reranked path (the fitted prefix only), raw cosine
-    similarities for the cosine path (the whole coarse cut). The caller
-    applies `pass_mark` (`select_standouts` for passive recall, a plain
-    filter in the tool); this object never mixes the two scales.
+    `ranked` is `(memory_id, score)` in the path's final order (name-recall
+    fix R3, spec §4): every genuine memory by descending score, then every
+    monologue-family memory by descending score. Scores are normalized
+    reranker scores for the reranked path (the fitted prefix only), raw
+    cosine similarities for the cosine path (the whole coarse cut). The
+    caller applies `pass_mark` (`select_standouts` for passive recall, a
+    plain filter in the tool), both of which keep this order; this object
+    never mixes the two scales.
     """
 
     path: str
@@ -354,11 +412,13 @@ def _reranked_ranking(
     try:
         reranker_provider = reranker_mod.build_reranker_provider(store=store)
         # Name-recall fix R1 (spec §1): the width is fitted for THIS message
-        # from its own candidates' surviving pair lengths and the process's
+        # from its own candidates' pair token counts and the process's
         # measured cost model (no hourly sample, diagnosis H8); anchors come
         # on top of the fitted real candidates; the call is measured and
-        # feeds the cost model. Prefix order is the cosine coarse cut here;
-        # R3 puts genuine candidates ahead of the monologue family.
+        # feeds the cost model. `coarse_ids` arrives genuine-first (R3, spec
+        # §4: genuine candidates are taken first for rerank slots), each
+        # group in cosine order, so the fitted prefix takes every genuine
+        # candidate before any monologue-family one.
         outcome = reranker_mod.rerank_for_recall(
             reranker_provider, query, [pool[mid][0].content for mid in coarse_ids]
         )
@@ -421,7 +481,7 @@ def _reranked_ranking(
         floor_row["sample_pairs"],
         floor_row["updated_at"],
     )
-    ranked = sorted(zip(scored_ids, rerank_scores, strict=True), key=lambda pair: -pair[1])
+    ranked = genuine_first_ranking(list(zip(scored_ids, rerank_scores, strict=True)), pool)
     return GatedRanking(
         path=RERANKED_PATH,
         scale=CALIBRATION_SCORE_SCALE,
@@ -450,7 +510,7 @@ def _cosine_ranking(
     order, EXAMINED by the gate, pass or fail (S60: the fit needs the
     negatives too), scale 'cosine', the embedder model id as the row's model
     id. The tool never logs (S56)."""
-    ranked = sorted(((mid, float(c)) for mid, c in coarse), key=lambda pair: -pair[1])
+    ranked = genuine_first_ranking([(mid, float(c)) for mid, c in coarse], pool)
     if log_calibration and ranked:
         examined = ranked[:MAX_STANDOUT_COUNT]
         _log_calibration_row(
@@ -508,7 +568,8 @@ def rank_and_gate(
     Shared by passive recall and `search_memories` so the two never diverge
     on path choice, floor or scale. `log_calibration=True` (passive recall
     only, S56) writes the turn's calibration row on whichever path ran."""
-    coarse_ids = [mid for mid, _ in coarse]
+    # R3 (spec §4): genuine candidates are taken first for the rerank prefix.
+    coarse_ids = genuine_first([mid for mid, _ in coarse], pool)
     gated = _reranked_ranking(store, query, pool, coarse_ids, log_calibration=log_calibration)
     if gated is not None:
         return gated
@@ -614,10 +675,22 @@ def run_semantic_recall(
 
         full = [pool[mid][0] for mid in tiers.full_ids]
         snippet = [pool[mid][0] for mid in tiers.snippet_ids]
+        scores = dict(gated.ranked)
+        hits = [
+            SemanticHit(
+                memory=mem,
+                score=scores[mem.id],
+                path=gated.path,
+                paragraph=SINGLE_QUERY_PARAGRAPH,
+                monologue_family=is_monologue_family(mem),
+            )
+            for mem in (*full, *snippet)
+        ]
         return SemanticRecallResult(
             full=full,
             snippet=snippet,
-            scores=dict(gated.ranked),
+            scores=scores,
+            hits=hits,
             path=gated.path,
             scale=gated.scale,
             pass_mark=gated.pass_mark,

@@ -112,7 +112,11 @@ def _semantic_top_k(
     failed) — this returns ``None`` (the tool's EXISTING empty-semantic→
     lexical fallback — never returns nothing, never hands back semantic junk
     that never cleared a floor). Otherwise returns the top ``limit``
-    floor-clearing memories in descending score order.
+    floor-clearing memories in the path's own order (name-recall fix R3, spec
+    §4): every genuine memory by descending score, then every monologue-family
+    memory by descending score, so a monologue-family memory never takes a
+    result slot from a floor-clearing genuine one. The rerank prefix already
+    took genuine candidates first (``rank_and_gate``).
 
     Deliberately does NOT reuse ``semantic_recall``'s option-4 surfacing
     tiers (≤5 full / 6-9 / cap-at-9) — that machinery decides whether to
