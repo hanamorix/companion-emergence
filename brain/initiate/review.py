@@ -21,6 +21,7 @@ import json
 import logging
 import secrets
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -351,13 +352,21 @@ def run_initiate_review_tick(
     now: datetime | None = None,
     user_presence: UserPresence | None = None,
     is_rest_state: bool = False,
+    should_pause: Callable[[], bool] | None = None,
+    paused_out: list[bool] | None = None,
 ) -> None:
     """Process up to cap_per_tick queued candidates through the pipeline.
 
     D-reflection runs between the candidate-fetch and the three-prompt
     composition loop.  Empty queue → D is skipped entirely.  Each
     candidate's D decision determines whether it reaches composition
-    (promote) or draft_space.md (filter).
+    (promote) or draft_space.md (filter). The D-reflection gate itself is
+    ONE batched call (2-plan §4.1: indivisible) — ``should_pause`` (INC-10,
+    S14/S32) is checked only in the composition loop below, between
+    candidates (item unit = one candidate); saved progress is
+    ``initiate_candidates.jsonl`` itself (a promoted-and-composed candidate
+    is removed from it by ``_process_one_candidate``/its callees, so a
+    resumed pass never re-composes it).
 
     Fault-isolated per candidate: an exception in one candidate's
     processing does not block the others.
@@ -498,7 +507,7 @@ def run_initiate_review_tick(
         if not slot:
             return  # deferred — cadence re-fires next tick
 
-        for candidate in candidates:
+        for i, candidate in enumerate(candidates):
             if candidate.candidate_id not in promote_ids:
                 continue
             try:
@@ -517,6 +526,11 @@ def run_initiate_review_tick(
                     "initiate review tick: unrecoverable error on candidate %s",
                     candidate.candidate_id,
                 )
+            if should_pause is not None and i < len(candidates) - 1 and should_pause():
+                logger.info("initiate review tick: pausing between candidates for chat (INC-10)")
+                if paused_out is not None:
+                    paused_out.append(True)
+                return
 
         # --- Drift check — emit operator-tier alert if D's promote-rate drifts ---
         # Runs only inside the throttle slot — a throttle-deferred tick also

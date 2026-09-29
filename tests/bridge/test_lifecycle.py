@@ -34,15 +34,34 @@ def test_supervisor_tick_emits_event(persona_dir: Path):
             assert seen, "supervisor_tick not received within 3s"
 
 
-def test_supervisor_prunes_old_empty_sessions(persona_dir: Path):
-    """Empty app-created sessions have no buffer file, so supervisor must prune registry."""
+def test_supervisor_prunes_old_empty_sessions(
+    persona_dir: Path, monkeypatch
+) -> None:
+    """Empty app-created sessions have no buffer file, so supervisor must prune registry.
+
+    ram-spike-fix INC-9 (C39, S72, 2-plan §3.3a): the prune is a gated job of
+    the central cadence function and prunes only empty sessions that PREDATE
+    the current idle window (``created_at`` at or before the last message) —
+    never one opened during it (fbdd3acc: the app opens a session on mount).
+    So: a session opened before any message is kept; once a message lands
+    AFTER it and the lull has passed, the next idle pass prunes it.
+    """
+    from brain.bridge import cli_throttle
     from brain.chat.session import all_sessions, reset_registry
 
     reset_registry()
     try:
-        with _client(persona_dir, tick_interval_s=0.1, silence_minutes=0.001) as c:
+        with _client(persona_dir, tick_interval_s=0.1) as c:
             c.post("/session/new", json={"client": "tests"})
             assert len(all_sessions()) == 1
+            # No message yet: the session was opened during the current idle
+            # window, so idle passes must NOT prune it (C39(ii)).
+            time.sleep(0.5)
+            assert len(all_sessions()) == 1
+            # Backdate the session and put the last message after its creation
+            # but more than a lull ago: it now predates the idle window.
+            all_sessions()[0].created_at = datetime.now(UTC) - timedelta(hours=2)
+            cli_throttle.mark_interactive_active(at=time.monotonic() - 3600.0)
             deadline = time.time() + 3
             while time.time() < deadline and all_sessions():
                 time.sleep(0.05)

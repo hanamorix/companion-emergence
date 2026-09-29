@@ -89,6 +89,39 @@ def load(persona_dir: Path) -> SelfModelCadenceState:
     )
 
 
+def load_or_init(
+    persona_dir: Path, *, now: datetime
+) -> tuple[SelfModelCadenceState, bool]:
+    """Load the cadence as a GATED job does (ram-spike-fix INC-9, S22/S69).
+
+    Self-model articulation is a gated job of the central cadence function
+    that keeps its own cadence (S29), so its loader gets the same
+    missing/corrupt rule as the central function's interval jobs: a missing
+    or corrupt file (unreadable, not JSON, not an object, or no parseable
+    ``next_reflection_at``) is written as "last ran now" (normal interval
+    from ``now``, zero failures) and returned with ``created=True`` — the
+    reflection first runs one full interval later. ``load`` (fail toward
+    running) is kept for callers outside the central function.
+
+    Returns ``(state, created)``.
+    """
+    try:
+        data = json.loads(_state_path(persona_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = None
+    next_at = _parse_ts(data.get("next_reflection_at")) if isinstance(data, dict) else None
+    if next_at is not None:
+        cf = data.get("consecutive_failures", 0)
+        if not isinstance(cf, int) or cf < 0:
+            cf = 0
+        return SelfModelCadenceState(next_reflection_at=next_at, consecutive_failures=cf), False
+    state = SelfModelCadenceState(
+        next_reflection_at=now + timedelta(seconds=_BASE_INTERVAL_S), consecutive_failures=0
+    )
+    save(persona_dir, state)
+    return state, True
+
+
 def save(persona_dir: Path, state: SelfModelCadenceState) -> None:
     """Atomically persist the cadence (temp file + rename)."""
     path = _state_path(persona_dir)

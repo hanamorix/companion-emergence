@@ -1928,6 +1928,31 @@ def _personas_handler(args: argparse.Namespace) -> int:
     return 0
 
 
+def _drain_pass2_at_exit(persona_dir: Path) -> None:
+    """`nell chat --no-bridge` exit-drain (S78/S80): this process has no
+    later lull to wait for (S78 — the round-3 fix's throttle-gated
+    `drain_pending()` call was found INERT here by round-4's cold red-team,
+    since `respond()` re-stamps the exact anchor the throttle gate reads),
+    so this calls the new no-lull entrypoint directly instead: takes the
+    cross-process drain lock, drains with no `should_pause` (S78) but a
+    bounded `time_budget_s` and CLI progress output (S80 — closes round-6's
+    MAJOR: an unbounded exit-drain could hang the terminal for hours on a
+    near-cap backlog with zero feedback). Anything left when the budget
+    trips stays in the durable, persisted queue (S64) for the next bridge.
+    """
+    from brain import dev_constants
+    from brain.chat import pass2_queue
+
+    def _print_progress(done: int, total: int) -> None:
+        print(f"pass-2: {done} of {total} done")
+
+    pass2_queue.drain_all_locked(
+        persona_dir,
+        on_progress=_print_progress,
+        time_budget_s=dev_constants.PASS2_NOBRIDGE_DRAIN_BUDGET_S,
+    )
+
+
 def _chat_direct_mode(args: argparse.Namespace) -> int:
     """Dispatch `nell chat` to the chat engine (in-process, no bridge).
 
@@ -1998,6 +2023,7 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
                         RuntimeWarning,
                         stacklevel=1,
                     )
+                _drain_pass2_at_exit(persona_dir)
                 return 0
 
             # Interactive REPL mode
@@ -2043,6 +2069,7 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
                         RuntimeWarning,
                         stacklevel=1,
                     )
+                _drain_pass2_at_exit(persona_dir)
                 # Summary
                 print(
                     f"\nSession ended. {session.turns} turn(s), "

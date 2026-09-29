@@ -289,4 +289,100 @@ describe("App presence column (glass redesign)", () => {
     );
     expect(screen.getByText(/rest need/)).toBeInTheDocument();
   });
+
+  it("shows the background-work label and one job, cleared when none run", async () => {
+    // ram-spike-fix INC-11 follow-up (spec §6, S15/S23/S38; owner-set
+    // wording + layout). One running job: the label line, then
+    // "<name> (<descriptor>)" on its own line below it.
+    const runningState = (jobs: { name: string; running_for_seconds: number }[]) => ({
+      persona: "nell",
+      emotions: {},
+      body: null,
+      interior: { dream: null, research: null, heartbeat: null, reflex: null },
+      soul_highlight: null,
+      connection: { provider: "claude-cli", model: null, last_heartbeat_at: null },
+      mode: "live" as const,
+      recovering: false,
+      felt_time_recovered: false,
+      background_jobs: jobs,
+    });
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      fetchPersonaState
+        .mockReset()
+        .mockResolvedValueOnce(runningState([{ name: "compaction", running_for_seconds: 5 }])) // poll 1: running
+        .mockResolvedValue(runningState([])); // poll 2+: cleared
+
+      render(<App />);
+      await waitFor(() =>
+        expect(screen.getByText("Current background tasks:")).toBeInTheDocument(),
+      );
+      expect(screen.getByText("compaction (conversation compaction)")).toBeInTheDocument();
+
+      await vi.advanceTimersByTimeAsync(5000); // poll 2
+      await waitFor(() =>
+        expect(screen.queryByText("Current background tasks:")).not.toBeInTheDocument(),
+      );
+      expect(screen.queryByText(/conversation compaction/)).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("renders 3 jobs one per line, longest-running first, in the bridge's given order", async () => {
+    // The bridge already orders `background_jobs` longest-running first
+    // (brain/bridge/background_jobs.snapshot_with_elapsed) — the app must
+    // render that order as given, not re-sort it.
+    fetchPersonaState.mockReset().mockResolvedValue({
+      persona: "nell",
+      emotions: {},
+      body: null,
+      interior: { dream: null, research: null, heartbeat: null, reflex: null },
+      soul_highlight: null,
+      connection: { provider: "claude-cli", model: null, last_heartbeat_at: null },
+      mode: "live",
+      recovering: false,
+      felt_time_recovered: false,
+      background_jobs: [
+        { name: "heartbeat", running_for_seconds: 42.0 }, // longest-running -> first
+        { name: "compaction", running_for_seconds: 8.5 },
+        { name: "pass2", running_for_seconds: 1.2 }, // most recent -> last
+      ],
+    });
+
+    render(<App />);
+
+    await waitFor(() =>
+      expect(screen.getByText("Current background tasks:")).toBeInTheDocument(),
+    );
+    const container = screen.getByText("Current background tasks:").parentElement;
+    expect(container).not.toBeNull();
+    const lines = Array.from(container!.children).map((el) => el.textContent);
+    expect(lines).toEqual([
+      "Current background tasks:",
+      "heartbeat (heartbeat)",
+      "compaction (conversation compaction)",
+      "pass2 (follow-up memory pass)",
+    ]);
+  });
+
+  it("renders no background-work line when the field is absent (older bridge)", async () => {
+    fetchPersonaState.mockReset().mockResolvedValue({
+      persona: "nell",
+      emotions: {},
+      body: null,
+      interior: { dream: null, research: null, heartbeat: null, reflex: null },
+      soul_highlight: null,
+      connection: { provider: "claude-cli", model: null, last_heartbeat_at: null },
+      mode: "live",
+      recovering: false,
+      felt_time_recovered: false,
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText(/Nell/)).toBeInTheDocument());
+    expect(screen.queryByText("Current background tasks:")).not.toBeInTheDocument();
+  });
 });

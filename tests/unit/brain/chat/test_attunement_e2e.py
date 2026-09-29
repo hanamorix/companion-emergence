@@ -37,7 +37,7 @@ from brain.bridge.chat import ChatMessage, ChatResponse, ToolCall
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-def _wait_for_attunement_threads(timeout: float = 5.0) -> None:
+def _wait_for_attunement_threads(persona_dir, timeout: float = 5.0) -> None:
     # Pass-2 extraction now flows through the in-process pass2_queue (single
     # worker) rather than a per-turn daemon thread (#27). Drain it synchronously:
     # cli_throttle is idle in tests (conftest reset), so drain_pending runs the
@@ -46,7 +46,7 @@ def _wait_for_attunement_threads(timeout: float = 5.0) -> None:
     from brain.chat import pass2_queue
 
     cli_throttle.reset()
-    pass2_queue.drain_pending()
+    pass2_queue.drain_pending(persona_dir)
 
 
 def _fake_detector_output(source_turn_id: str = "msg-0") -> DetectorOutput:
@@ -163,7 +163,7 @@ def test_attunement_pass2_writes_current_read_on_substantive_turn(tmp_path: Path
                 persona_dir=persona_dir,
             )
             assert resp.content == "Here with you."
-            _wait_for_attunement_threads()
+            _wait_for_attunement_threads(persona_dir)
     finally:
         store.close()
         hebbian.close()
@@ -200,7 +200,7 @@ def test_attunement_pass2_writes_learned_patterns_on_substantive_turn(tmp_path: 
                 hebbian=hebbian,
                 persona_dir=persona_dir,
             )
-            _wait_for_attunement_threads()
+            _wait_for_attunement_threads(persona_dir)
     finally:
         store.close()
         hebbian.close()
@@ -257,7 +257,7 @@ def test_both_pass2s_fire_on_same_turn(tmp_path: Path, monkeypatch):
             assert "Tell me about it" in resp.content
 
             # Wait for both daemon threads to settle.
-            _wait_for_attunement_threads()
+            _wait_for_attunement_threads(persona_dir)
 
             # Wait for monologue pass-2 too.
             deadline = time.time() + 5.0
@@ -442,7 +442,7 @@ def test_crystallisation_forming_to_known_on_10th_evidence(tmp_path: Path):
                 hebbian=hebbian,
                 persona_dir=persona_dir,
             )
-            _wait_for_attunement_threads()
+            _wait_for_attunement_threads(persona_dir)
     finally:
         store.close()
         hebbian.close()
@@ -559,7 +559,7 @@ def test_short_message_does_not_fire_pass2(tmp_path: Path):
                 hebbian=hebbian,
                 persona_dir=persona_dir,
             )
-            _wait_for_attunement_threads()
+            _wait_for_attunement_threads(persona_dir)
             mock_detector.assert_not_called()
     finally:
         store.close()
@@ -592,7 +592,7 @@ def test_four_words_does_not_fire_pass2(tmp_path: Path):
                 hebbian=hebbian,
                 persona_dir=persona_dir,
             )
-            _wait_for_attunement_threads()
+            _wait_for_attunement_threads(persona_dir)
             mock_detector.assert_not_called()
     finally:
         store.close()
@@ -624,7 +624,7 @@ def test_five_words_fires_pass2(tmp_path: Path):
                 hebbian=hebbian,
                 persona_dir=persona_dir,
             )
-            _wait_for_attunement_threads()
+            _wait_for_attunement_threads(persona_dir)
             mock_detector.assert_called_once()
     finally:
         store.close()
@@ -675,7 +675,7 @@ def test_budget_exhausted_defers_without_calling_detector(tmp_path: Path):
                 hebbian=hebbian,
                 persona_dir=persona_dir,
             )
-            _wait_for_attunement_threads()
+            _wait_for_attunement_threads(persona_dir)
             mock_detector.assert_not_called()
     finally:
         store.close()
@@ -712,7 +712,7 @@ def test_budget_exhausted_does_not_write_error_log(tmp_path: Path):
                 hebbian=hebbian,
                 persona_dir=persona_dir,
             )
-            _wait_for_attunement_threads()
+            _wait_for_attunement_threads(persona_dir)
     finally:
         store.close()
         hebbian.close()

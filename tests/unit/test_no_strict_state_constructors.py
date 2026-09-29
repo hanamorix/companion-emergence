@@ -24,6 +24,9 @@ _KWARG_NAMES = {"kwargs", "kw", "opts", "options", "params", "overrides", "defau
 # a second, unfiltered `cls(**record)` elsewhere in the same file would also pass.
 _ALLOWED = {
     ("brain/memory/judge_full_ft.py", "CrossEncoder"),  # model keyword options
+    ("brain/memory/judge_lora.py", "CrossEncoder"),  # model keyword options (offline_load_kwargs)
+    ("brain/memory/relevance_judge.py", "CrossEncoder"),  # model keyword options (offline_load_kwargs)
+    ("brain/bridge/daemon.py", "Popen"),  # subprocess kwargs (env), not a persisted record
     ("brain/pronouns.py", "PronounSet"),  # filters to known fields itself
     ("brain/state_compat.py", "cls"),  # the helper itself — filters to declared fields first
 }

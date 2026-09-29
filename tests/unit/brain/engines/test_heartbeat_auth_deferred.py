@@ -107,9 +107,9 @@ def test_run_tick_persists_when_overdue_dream_is_deferred(tmp_path: Path, monkey
     seen: list[float] = []
     real = eng._apply_emotion_decay
 
-    def spy(elapsed_seconds, *, dry_run):
+    def spy(elapsed_seconds, *, tick_at, state, dry_run):
         seen.append(elapsed_seconds)
-        return real(elapsed_seconds, dry_run=dry_run)
+        return real(elapsed_seconds, tick_at=tick_at, state=state, dry_run=dry_run)
 
     monkeypatch.setattr(eng, "_apply_emotion_decay", spy)
     try:

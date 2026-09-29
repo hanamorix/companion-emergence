@@ -33,10 +33,11 @@ OG reference: NellBrain/nell_supervisor.py:368-407 (run_folded).
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
-from collections.abc import Callable
-from contextlib import ExitStack
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -58,7 +59,8 @@ from brain.attunement.backfill import (
 from brain.attunement.backfill import (
     should_run_supplementary_backfill as _attunement_should_run_supplementary_backfill,
 )
-from brain.bridge import cli_throttle, persisted_cadence
+from brain.bridge import central_cadence, cli_throttle, persisted_cadence
+from brain.bridge.central_cadence import GatedJob, JobOutcome
 from brain.bridge.events import EventBus
 from brain.bridge.model_tier import (
     TIER_BACKGROUND_CLASSIFIER,
@@ -67,7 +69,12 @@ from brain.bridge.model_tier import (
     build_tier_provider,
 )
 from brain.bridge.provider import LLMProvider
-from brain.chat.session import prune_empty_sessions, remove_session
+from brain.chat import pass2_queue
+from brain.chat.session import (
+    has_prunable_empty_sessions,
+    prune_empty_sessions,
+    remove_session,
+)
 from brain.engines import interest_sweep
 from brain.felt_time import FeltTime, TickContext
 from brain.felt_time.lived_age import IntensityDrivers
@@ -89,10 +96,10 @@ from brain.health.vocab_repair import (
     should_run_vocab_repair as _vocab_repair_should_run,
 )
 from brain.ingest.emotion_backfill import (
-    run_emotion_backfill as _emotion_backfill_run,
+    has_emotion_backfill_work as _emotion_backfill_has_work,
 )
 from brain.ingest.emotion_backfill import (
-    should_run_emotion_backfill as _emotion_backfill_should_run,
+    run_emotion_backfill as _emotion_backfill_run,
 )
 from brain.ingest.pipeline import (
     finalize_stale_sessions,
@@ -102,6 +109,9 @@ from brain.initiate.review import _rest_state_from_energy, run_initiate_review_t
 from brain.initiate.user_pattern import compute_user_presence
 from brain.memory.embedding_backfill import (
     delete_legacy_embeddings_db as _delete_legacy_embeddings_db,
+)
+from brain.memory.embedding_backfill import (
+    has_embedding_backfill_work as _embedding_backfill_has_work_probe,
 )
 from brain.memory.embedding_backfill import (
     run_embedding_backfill_tick as _embedding_backfill_run_tick,
@@ -120,7 +130,7 @@ from brain.self_model import cadence as self_model_cadence
 from brain.self_model import reconcile as sm_reconcile
 from brain.self_model import state as self_model_state
 from brain.self_model.articulate import articulate as sm_articulate
-from brain.self_model.articulate import articulate_min_idle_seconds, log_self_model_deferred
+from brain.self_model.articulate import log_self_model_deferred
 from brain.self_model.derived import compute_baseline, compute_derived
 from brain.self_model.gap import compute_gap
 from brain.self_model.resolve import (
@@ -142,6 +152,7 @@ _HEARTBEAT_TICK_SYSTEM_PROMPT_SEGMENTS = prompt_strings.register_segments(
 _SOUL_BACKLOG_DRAIN_CAP = 25
 
 
+
 def run_folded(
     stop_event: threading.Event,
     *,
@@ -149,7 +160,6 @@ def run_folded(
     provider: LLMProvider,
     event_bus: EventBus,
     tick_interval_s: float = 60.0,
-    silence_minutes: float = 10.0,
     heartbeat_interval_s: float | None = 900.0,
     soul_review_interval_s: float | None = 6 * 3600.0,
     finalize_after_hours: float = 24.0,
@@ -168,6 +178,7 @@ def run_folded(
     clustering_interval_s: float | None = 6 * 3600.0,
     vocab_repair_interval_s: float | None = 6 * 3600.0,
     is_session_busy: Callable[[str], bool] | None = None,
+    bridge_started_at: datetime | None = None,
 ) -> None:
     """Run supervisor + heartbeat + soul-review + finalize cadences until stop_event is set.
 
@@ -209,8 +220,9 @@ def run_folded(
     ``calibration_interval_s=None`` disables the autonomous daily calibration
     cadence (F2a #250, spec Section 5) — a 4th sibling to
     ``compaction_interval_s``, mirroring its idle-gate + restart-safety shape
-    (own persisted ``calibration_cadence.json``, startup catch-up + periodic
-    daily fire). Default 86400s (daily), matching compaction — same
+    (own persisted ``calibration_cadence.json``, daily fire at a lull via the
+    central cadence function — no startup catch-up since ram-spike-fix INC-9).
+    Default 86400s (daily), matching compaction — same
     rationale: rides existing, already-idle-gated infra. This increment
     (inc5) scopes the tick to retention pruning of ``calibration_log`` only
     (acceptance 5b); the judge-labeling pass (Section 6) and floor derivation
@@ -221,8 +233,7 @@ def run_folded(
     self-tune cadence (F2c inc2, spec Section 2) — wired structurally
     identically to ``interest_sweep_interval_s`` immediately above (own
     persisted ``judge_selftune_cadence.json``, own fault-isolated tick, NO
-    startup catch-up), not to ``calibration_interval_s``'s daily
-    catch-up-or-idle shape. Default matches
+    startup catch-up). Default matches
     ``brain.memory.judge_selftune.JUDGE_TUNE_INTERVAL_HOURS`` (168h/weekly).
     This increment (inc2) is a SCAFFOLD ONLY: the cadence, the >handful
     gate, runtime RAM tier-detection and the cgroup-aware OOM-safety
@@ -239,82 +250,32 @@ def run_folded(
         f"{soul_review_interval_s:.0f}s" if soul_review_interval_s is not None else "disabled",
         f"{finalize_interval_s:.0f}s" if finalize_interval_s is not None else "disabled",
     )
+    # S84: "bridge start" for the empty-session prune's idle window when no
+    # message has been seen in this process (see _build_gated_jobs). The
+    # bridge passes the moment it captured BEFORE starting this thread (and
+    # so before it serves /session/new): capturing it here, inside the
+    # thread, would race the app-mount session (stage-6 S84 MAJOR). Every
+    # production caller must pass it (today: server.py's lifespan only);
+    # callers that pass nothing (tests, direct calls) get "now".
+    if bridge_started_at is None:
+        bridge_started_at = datetime.now(UTC)
     last_heartbeat_at = time.monotonic() if heartbeat_interval_s is not None else None
-    # Soul review is PERSISTED (survives restart/sleep); forgetting+narrative
-    # maintenance is ALSO PERSISTED now (defer #21 — its own maintenance_cadence
-    # file), still decoupled from soul review so a soul-review catch-up burst
-    # doesn't drag narrative's LLM calls onto the fast cadence.
+    # Non-gated cadences keep their own timing (S16): soul review (own
+    # self-pacing cadence), log rotation, vocab repair, voice reflection.
     soul_cadence_state = (
         soul_cadence.load_cadence_state(persona_dir)
         if soul_review_interval_s is not None
         else None
     )
-    maintenance_cadence_state = (
-        persisted_cadence.load_cadence(persona_dir, "maintenance_cadence.json")
-        if soul_review_interval_s is not None
-        else None
-    )
-    # Interest sweep — weekly persisted wall-clock cadence (Task 10).
-    # None-gated like every other cadence: `*_interval_s` is not a user-facing
-    # setting (the brain still owns the cadence — the default IS the spec
-    # constant), it is the test/dev disable knob. Load-bearing for anything
-    # driving a real supervisor in a sandbox (e.g. the tests/harness live rig),
-    # since the sweep calls a real provider and writes interests.json.
-    interest_sweep_cadence_state = (
-        persisted_cadence.load_cadence(persona_dir, interest_sweep.SWEEP_CADENCE_FILE)
-        if interest_sweep_interval_s is not None
-        else None
-    )
-    # Judge self-tune — weekly persisted wall-clock cadence (F2c inc2, spec
-    # Section 2). Same None-gated posture as interest sweep immediately
-    # above (own disable knob, not a user-facing setting) and its own
-    # persisted cadence file, decoupled from every other cadence.
-    judge_selftune_cadence_state = (
-        persisted_cadence.load_cadence(persona_dir, JUDGE_TUNE_CADENCE_FILE)
-        if judge_selftune_interval_s is not None
-        else None
-    )
     _last_intensity_drivers: IntensityDrivers | None = None
-    finalize_cadence_state = (
-        persisted_cadence.load_cadence(persona_dir, "finalize_cadence.json")
-        if finalize_interval_s is not None
-        else None
-    )
     log_rotation_cadence_state = (
         persisted_cadence.load_cadence(persona_dir, "log_rotation_cadence.json")
         if log_rotation_interval_s is not None
         else None
     )
-    initiate_review_cadence_state = (
-        persisted_cadence.load_cadence(persona_dir, "initiate_review_cadence.json")
-        if initiate_review_interval_s is not None
-        else None
-    )
     voice_cadence_state = (
         persisted_cadence.load_cadence(persona_dir, "voice_reflection_cadence.json")
         if voice_reflection_interval_s is not None
-        else None
-    )
-    compaction_cadence_state = (
-        persisted_cadence.load_cadence(persona_dir, "compaction_cadence.json")
-        if compaction_interval_s is not None
-        else None
-    )
-    # Daily calibration cadence (F2a #250 inc5, spec Section 5) — own
-    # persisted `calibration_cadence.json`, independent of compaction's file
-    # even though the default interval matches (mirrors compaction's own
-    # independent-file rationale vs voice reflection above).
-    calibration_cadence_state = (
-        persisted_cadence.load_cadence(persona_dir, "calibration_cadence.json")
-        if calibration_interval_s is not None
-        else None
-    )
-    # Memory-vector clustering (Stage 5, #157) — own persisted wall-clock
-    # cadence, decoupled from every other cadence (see clustering_interval_s
-    # docstring above).
-    clustering_cadence_state = (
-        persisted_cadence.load_cadence(persona_dir, "clustering_cadence.json")
-        if clustering_interval_s is not None
         else None
     )
     vocab_repair_cadence_state = (
@@ -341,67 +302,14 @@ def run_folded(
     except Exception as exc:  # noqa: BLE001
         logger.warning("attunement backfill failed during startup: %s", exc)
 
-    # One-shot startup: catch-up compaction (owner ruling 2026-08-13 — compaction
-    # fires at startup OR during idle). Runs the age-gated cascade once now to fold
-    # any turns that crossed the 24/48/72h thresholds while the app was off. Startup
-    # is idle by nature (no in-flight requests), so it fires cleanly; the periodic
-    # cascade is idle-gated thereafter. Fault-isolated (recipe item 3). Skipped when
-    # the compaction cadence is disabled (tests/dev), mirroring the periodic gate.
-    try:
-        if compaction_interval_s is not None:
-            from brain.chat.compaction import build_compaction_provider
-
-            _run_compaction_tick(
-                persona_dir, build_compaction_provider(persona_dir),
-                is_session_busy=is_session_busy,
-            )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("startup catch-up compaction failed: %s", exc)
-
-    # One-shot startup: catch-up calibration tick (F2a #250 inc5, spec Section
-    # 5). Mirrors compaction's startup-catch-up-or-idle posture immediately
-    # above (owner ruling 2026-08-13, carried into this sibling cadence): a
-    # retention prune that was due while the app was off runs promptly now,
-    # rather than waiting up to a full day for the periodic cadence below.
-    # Startup is idle by nature (no in-flight requests yet), so it fires
-    # cleanly. Fault-isolated (recipe item 3). Skipped when the calibration
-    # cadence is disabled (tests/dev), mirroring the periodic gate.
-    try:
-        if calibration_interval_s is not None:
-            _run_calibration_tick(persona_dir, is_session_busy=is_session_busy)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("startup catch-up calibration tick failed: %s", exc)
-
-    # One-shot startup: F2b deploy-time one-time floor recalibration (spec
-    # §6, #276 inc3) — DISTINCT from the daily-cadence catch-up immediately
-    # above. That catch-up only fires the derivation when the persisted
-    # `calibration_cadence.json` says a daily firing is DUE; this check
-    # fires on the raw->normalized SCALE TRANSITION itself, regardless of
-    # cadence timing, so an existing deployment never rides a stale
-    # raw-scale floor under F2b's normalized gate for a full cadence
-    # window. Gated on the same `calibration_interval_s is not None` flag
-    # as the calibration subsystem generally (tests/dev disable knob) —
-    # when calibration itself is off, there is no floor-gated recall path
-    # for this check to protect. Idempotent by construction (see
-    # `_run_deploy_recalibration_check`'s docstring) and fault-isolated
-    # here, mirroring every other one-shot startup step in this function.
-    try:
-        if calibration_interval_s is not None:
-            _run_deploy_recalibration_check(persona_dir)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("startup deploy recalibration check failed: %s", exc)
-
-    # One-shot startup: re-tag emotion-less memories so existing personas
-    # benefit from the A2 forward-only emotion seeding.  Independent of the
-    # attunement backfill (separate if, not elif) — both can fire on the same
-    # startup if needed.  Fault-isolated per autonomous-behaviour recipe item 3.
-    try:
-        if _emotion_backfill_should_run(persona_dir):
-            _emotion_backfill_run(
-                persona_dir, provider=build_tier_provider(persona_dir, TIER_BACKGROUND_CLASSIFIER)
-            )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("emotion backfill failed during startup: %s", exc)
+    # ram-spike-fix INC-9 (S23/S34, C26): NO startup catch-up of any gated
+    # job. The former one-shots here — catch-up compaction, the catch-up
+    # calibration tick, the deploy-time floor recalibration and the emotion
+    # backfill — are gated jobs of the central cadence function now; the
+    # bridge starting is simply its first pass (a lull when chat is idle), so
+    # an overdue job runs there and a not-due one does not. The one-shots
+    # left below are not gated jobs (vocab repair keeps its own timing, S16;
+    # the rest are provider-free repairs).
 
     # One-shot startup: repair already-stubbed emotion_vocabulary.json entries.
     # Step 1 bumps decay_half_life_days from the bad 1.0 → 14.0 (sync,
@@ -475,122 +383,145 @@ def run_folded(
     except Exception as exc:  # noqa: BLE001
         logger.warning("legacy embeddings.db deletion check failed during startup: %s", exc)
 
+    def _maybe_run_heartbeat() -> None:
+        """The heartbeat's own 15-minute timer (S16/S21) — not a gated job.
+        Called at the top of every loop pass AND by the central cadence
+        function between gated jobs, so a heartbeat that falls due while a
+        job runs waits only for that job to return, and the next job waits
+        for the whole heartbeat pass (single supervisor thread, S41/S65)."""
+        nonlocal last_heartbeat_at, _last_intensity_drivers
+        # Heartbeat cadence — independent of session-cleanup cadence.
+        # Fault-isolated so a heartbeat failure can't take down the
+        # session-cleanup loop or cascade into bridge shutdown.
+        # INTENTIONALLY STILL MONOTONIC (defer #21 residual — NOT an oversight):
+        # _heartbeat_and_felt_time consumes last_heartbeat_at to compute the
+        # felt-time wall_s elapsed-since-last (line ~701), whose monotonic basis
+        # is a deliberately-conservative bias (it underweights activity across a
+        # system sleep rather than overweighting it — see that function's
+        # docstring). The 15-min interval also fires within a typical session, so
+        # the restart-reset bite is lowest of all cadences. Converting it would
+        # need the felt-time elapsed reworked off a persisted last-fire; not worth
+        # the risk on the highest-fan-out cadence. Persist this ONLY alongside a
+        # felt-time-elapsed redesign.
+        if (
+            heartbeat_interval_s is not None
+            and last_heartbeat_at is not None
+            and time.monotonic() - last_heartbeat_at >= heartbeat_interval_s
+        ):
+            _heartbeat_attempt_result = _heartbeat_and_felt_time(
+                persona_dir, provider, event_bus, last_heartbeat_at
+            )
+            # Stage-6 red-team MAJOR, fixed (ram-spike-fix INC-7, S21):
+            # `_heartbeat_and_felt_time` now returns None WITHOUT doing
+            # anything when a chat reply is in flight (the new start
+            # check) — advancing `last_heartbeat_at` unconditionally in
+            # that case would restart this whole 15-min countdown on a
+            # tick that did no work, so a chat session busy enough to
+            # almost always have a reply in flight near the 15-min mark
+            # could defer the heartbeat far past its own interval,
+            # indefinitely. Only advance on an ACTUAL attempt (non-None
+            # return) — a skipped tick leaves `last_heartbeat_at`
+            # untouched, so the very next supervisor loop pass (seconds
+            # away, not 15 minutes) re-checks immediately instead of
+            # waiting out a full fresh interval.
+            if _heartbeat_attempt_result is not None:
+                _last_intensity_drivers = _heartbeat_attempt_result
+                last_heartbeat_at = time.monotonic()
+
+    def _between_items() -> bool:
+        """INC-10 between-items hook (spec §4, S14/S31/S41/S65): a pausable
+        gated job's own loop calls this between items. It runs the SAME
+        heartbeat hook `between_jobs` uses (so a heartbeat that falls due
+        mid-job still runs only between items, never during one, S41/S65),
+        then reports whether the job should pause (chat active again,
+        S14/S43) — True means "stop here, save progress, return
+        JobOutcome.PAUSED"; the caller does not advance its cadence."""
+        try:
+            _maybe_run_heartbeat()
+        except Exception:
+            logger.exception("supervisor between-items heartbeat hook raised")
+        return not cli_throttle.is_chat_idle()
+
+    # The gated jobs, in the S55 order (see brain/bridge/central_cadence.py).
+    tick_stats = {"closed_sessions": 0, "pruned_empty_sessions": 0}
+    # The per-tick shared MemoryStore (#132: one memories.db open per tick,
+    # reused by the snapshot/prune job, the backfill probes and jobs, maker and
+    # notes). Set for the duration of each loop iteration; None outside it or
+    # when the open failed (a job then opens its own short-lived store).
+    tick_ctx: dict[str, MemoryStore | None] = {"store": None}
+    gated_jobs = _build_gated_jobs(
+        persona_dir=persona_dir,
+        provider=provider,
+        event_bus=event_bus,
+        is_session_busy=is_session_busy,
+        finalize_after_hours=finalize_after_hours,
+        finalize_interval_s=finalize_interval_s,
+        initiate_review_interval_s=initiate_review_interval_s,
+        maintenance_interval_s=soul_review_interval_s,
+        self_model_interval_s=self_model_interval_s,
+        compaction_interval_s=compaction_interval_s,
+        calibration_interval_s=calibration_interval_s,
+        interest_sweep_interval_s=interest_sweep_interval_s,
+        judge_selftune_interval_s=judge_selftune_interval_s,
+        clustering_interval_s=clustering_interval_s,
+        intensity_drivers=lambda: _last_intensity_drivers,
+        tick_stats=tick_stats,
+        tick_ctx=tick_ctx,
+        bridge_started_at=bridge_started_at,
+        between_items=_between_items,
+    )
+
     while not stop_event.is_set():
-        # store is opened here (per-tick, this thread only — H-A hardening) and reused by
-        # the maker/notes ticks below in this same iteration, instead of each opening its
-        # own separate connection (#132: 3 memories.db opens/tick -> 1). It is NOT closed by
-        # the ExitStack below (no stack.callback(store.close)) — it survives past that
-        # block and is closed once, in the `finally` after the notes tick (search
-        # "per-tick store close" below), guaranteeing cleanup even if something in between
-        # raises uncaught. Reset to None every iteration so a failed open this iteration
-        # can never fall through to a stale/closed object from the previous one.
+        tick_stats["closed_sessions"] = 0
+        tick_stats["pruned_empty_sessions"] = 0
+        # store is opened here (per-tick, this thread only — H-A hardening) and
+        # shared by this iteration's snapshot/prune job, backfill probes/jobs and
+        # the maker/notes ticks (#132: one memories.db open per tick). It is
+        # closed once, in the `finally` below (search "per-tick store close"),
+        # guaranteeing cleanup even if something in between raises uncaught.
+        # Reset to None every iteration so a failed open can never fall through
+        # to a stale/closed object from the previous one.
         store: MemoryStore | None = None
         try:
-            store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
-            with ExitStack() as stack:
-                hebbian = HebbianMatrix(persona_dir / "hebbian.db", integrity_check=False)
-                stack.callback(hebbian.close)
+            try:
+                store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+            except Exception:
+                logger.exception("supervisor per-tick store open raised")
+            tick_ctx["store"] = store
 
-                reports = snapshot_stale_sessions(
-                    persona_dir,
-                    silence_minutes=silence_minutes,
-                    store=store,
-                    hebbian=hebbian,
-                    provider=build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING),
+            # Heartbeat first (its own timer), fault-isolated so a heartbeat
+            # failure can't take down the rest of the loop.
+            try:
+                _maybe_run_heartbeat()
+            except Exception:
+                logger.exception("supervisor heartbeat cadence raised")
+
+            # The central cadence function (ram-spike-fix INC-9): every gated
+            # job, idle-gated and in the fixed S55 order, with the heartbeat
+            # hook between jobs. Fault-isolated per job inside, and as a whole
+            # here.
+            try:
+                central_cadence.run_central_pass(
+                    persona_dir, gated_jobs, between_jobs=_maybe_run_heartbeat
                 )
-                # Snapshot is NON-destructive — do NOT call remove_session
-                # here. Session lifecycle is owned by finalize_stale_sessions
-                # below and the explicit /sessions/close path.
-                pruned_empty_sessions = prune_empty_sessions(
-                    older_than_seconds=silence_minutes * 60.0,
-                    persona_name=persona_dir.name,
-                )
+            except Exception:
+                logger.exception("supervisor central cadence pass raised")
 
-                # Idle-chipped embedding backfill (Stage 2, semantic-retrieval
-                # build; F1 #259 increment 3 rewires backlog + rate) — reuses
-                # the `store` handle already open for the snapshot above, so
-                # no extra connection. Idle-gated behind
-                # cli_throttle.background_slot() (mirrors maintenance /
-                # interest-sweep below): before increment 3 this ran on
-                # EVERY base tick unconditionally, unlike every other
-                # background maintenance cadence in this file — a denied
-                # slot now just defers this firing to the next tick rather
-                # than skipping the idle check other cadences get. Batch
-                # size is internally runtime-derived and scan_cap-bounded
-                # (see brain/memory/embedding_backfill.py), so it is cheap
-                # when caught up and never spikes CPU on a cold-start
-                # backlog. This is the primary embed-on-write mechanism for
-                # the ~11 write sites that call MemoryStore's create method
-                # directly and never write a row embedding themselves (see
-                # that module's docstring) — fault-isolated so a backfill
-                # error never takes down the session-cleanup tick.
-                try:
-                    with cli_throttle.background_slot() as _backfill_slot:
-                        if _backfill_slot:
-                            backfill_result = _embedding_backfill_run_tick(persona_dir, store)
-                            logger.info(
-                                "embedding backfill tick: scanned=%d embedded=%d "
-                                "skipped_short=%d errors=%d batch_size=%d",
-                                backfill_result.scanned,
-                                backfill_result.embedded,
-                                backfill_result.skipped_short,
-                                backfill_result.errors,
-                                backfill_result.batch_size,
-                            )
-                except Exception:
-                    logger.exception("supervisor embedding backfill tick raised")
-
-            # Publish events outside the with-block — events don't need stores.
-            for r in reports:
+            try:
                 event_bus.publish(
                     {
-                        "type": "session_snapshot",
-                        "session_id": r.session_id,
-                        "extracted_since_cursor": r.extracted,
-                        "committed": r.committed,
-                        "enqueued": r.enqueued,
-                        "deduped": r.deduped,
-                        "soul_candidates": r.soul_candidates,
-                        "errors": r.errors,
+                        "type": "supervisor_tick",
+                        "closed_sessions": tick_stats["closed_sessions"],
+                        "pruned_empty_sessions": tick_stats["pruned_empty_sessions"],
+                        "next_tick_in_s": tick_interval_s,
                         "at": _now_iso(),
                     }
                 )
-            event_bus.publish(
-                {
-                    "type": "supervisor_tick",
-                    "closed_sessions": len(reports),
-                    "pruned_empty_sessions": len(pruned_empty_sessions),
-                    "next_tick_in_s": tick_interval_s,
-                    "at": _now_iso(),
-                }
-            )
-        except Exception:
-            logger.exception("supervisor tick raised")
+            except Exception:
+                logger.exception("supervisor tick event publish raised")
 
-        try:
-            # Heartbeat cadence — independent of session-cleanup cadence.
-            # Fault-isolated so a heartbeat failure can't take down the
-            # session-cleanup loop or cascade into bridge shutdown.
-            # INTENTIONALLY STILL MONOTONIC (defer #21 residual — NOT an oversight):
-            # _heartbeat_and_felt_time consumes last_heartbeat_at to compute the
-            # felt-time wall_s elapsed-since-last (line ~701), whose monotonic basis
-            # is a deliberately-conservative bias (it underweights activity across a
-            # system sleep rather than overweighting it — see that function's
-            # docstring). The 15-min interval also fires within a typical session, so
-            # the restart-reset bite is lowest of all cadences. Converting it would
-            # need the felt-time elapsed reworked off a persisted last-fire; not worth
-            # the risk on the highest-fan-out cadence. Persist this ONLY alongside a
-            # felt-time-elapsed redesign.
-            if (
-                heartbeat_interval_s is not None
-                and last_heartbeat_at is not None
-                and time.monotonic() - last_heartbeat_at >= heartbeat_interval_s
-            ):
-                _last_intensity_drivers = _heartbeat_and_felt_time(
-                    persona_dir, provider, event_bus, last_heartbeat_at
-                )
-                last_heartbeat_at = time.monotonic()
-
+            # Non-gated work below keeps its own timing (S16) — unchanged by
+            # INC-9 apart from moving out of the old per-job blocks.
             # Soul-review cadence — slowest of the three. Each pass is up to
             # 5 LLM calls (one per candidate). Fault-isolated so a model
             # outage doesn't take the supervisor down.
@@ -626,184 +557,6 @@ def run_folded(
                 )
                 soul_cadence.save_cadence_state(persona_dir, soul_cadence_state)
 
-            # Maintenance cadence — forgetting + narrative, PERSISTED wall-clock on
-            # the same interval value as soul review but its OWN state file (defer
-            # #21), decoupled from soul review above so a soul-review catch-up burst
-            # doesn't run narrative's LLM calls every 30 min. Decoupling is safe:
-            # forgetting already exempts under-review soul-linked memories, so pass
-            # order relative to soul review doesn't matter.
-            #
-            # Throttled behind cli_throttle.background_slot() (mirrors interest-sweep
-            # below): forgetting/narrative are the expensive, LLM-touching work in
-            # this block; a denied slot means neither runs THIS firing (deferred to
-            # the next 6h cadence, not lost — accepted tradeoff, see 1-spec.md #132).
-            # The two try/except blocks below stay independent under the slot check,
-            # exactly as they were before this throttle was added — a forgetting
-            # failure must not also skip narrative.
-            if maintenance_cadence_state is not None and persisted_cadence.is_due(
-                maintenance_cadence_state, now=datetime.now(UTC)
-            ):
-                try:
-                    with cli_throttle.background_slot() as _maint_slot:
-                        if _maint_slot:
-                            try:
-                                forgetting_run_pass(
-                                    persona_dir,
-                                    event_bus=event_bus,
-                                    intensity_drivers=_last_intensity_drivers,
-                                )
-                            except Exception:
-                                logger.exception("supervisor forgetting pass raised")
-                            # Narrative-memory arc-update runs AFTER forgetting so a
-                            # memory forgetting just dropped doesn't enter an arc born
-                            # this tick.
-                            try:
-                                _run_narrative_memory_pass(persona_dir, provider, event_bus)
-                            except Exception:
-                                logger.exception("supervisor narrative-memory pass raised")
-                except Exception:
-                    # Mirrors interest-sweep's enclosing try/except (cli_throttle
-                    # fails open internally and shouldn't raise here, but this
-                    # keeps the two blocks' fault-isolation shape identical rather
-                    # than relying on that internal guarantee alone).
-                    logger.exception("supervisor maintenance throttle raised")
-                # Expire stale pending file-write proposals (24h TTL) so a confirm
-                # card the user never acted on stops surfacing on /persona/state.
-                # Fail-isolated: a sweep error must not skip the rest of the tick.
-                try:
-                    from brain.files import pending as _file_pending
-
-                    _file_pending.sweep_expired(persona_dir, now=datetime.now(UTC))
-                except Exception:
-                    logger.exception("supervisor pending-write sweep raised")
-                # Reap aged .lock.stale-* / .corrupt-* forensic residue (#176).
-                # Fail-isolated for the same reason as the sweep above.
-                try:
-                    from brain.health import sidecar_sweep as _sidecar_sweep
-
-                    _sidecar_sweep.sweep_stale_sidecars(persona_dir, now=datetime.now(UTC))
-                except Exception:
-                    logger.exception("supervisor sidecar sweep raised")
-                # End-of-block advance+save (not a finally): every statement above is
-                # inside its own try/except, so the block body cannot raise — the
-                # advance is unconditionally reached. (defer #21)
-                maintenance_cadence_state = persisted_cadence.advance(
-                    now=datetime.now(UTC), interval_s=soul_review_interval_s
-                )
-                persisted_cadence.save_cadence(
-                    persona_dir, "maintenance_cadence.json", maintenance_cadence_state
-                )
-
-            # Interest sweep — weekly, persisted wall-clock (Task 10). Safety net
-            # behind the per-turn extractor inlet (spec 2026-07-13 §6.3): proposes
-            # <=3 new interests + <=3 retirements from recent lived material.
-            # run_sweep_tick is a leaf engine call (not a supervisor _run_X_tick
-            # wrapper) that owns neither cadence nor throttle by design — this
-            # block owns both. Own per-tick MemoryStore (ExitStack, mirrors the
-            # maker/notes store-ownership pattern) since run_sweep_tick takes
-            # store= directly. Throttled via cli_throttle.background_slot; the
-            # returned dict (spawned/retired/error) is caller-facing only, so it
-            # is ignored here.
-            if interest_sweep_cadence_state is not None and persisted_cadence.is_due(
-                interest_sweep_cadence_state, now=datetime.now(UTC)
-            ):
-                try:
-                    with (
-                        ExitStack() as _sweep_stack,
-                        cli_throttle.background_slot() as _sweep_slot,
-                    ):
-                        if _sweep_slot:
-                            _sweep_store = MemoryStore(persona_dir / "memories.db")
-                            _sweep_stack.callback(_sweep_store.close)
-                            interest_sweep.run_sweep_tick(
-                                store=_sweep_store,
-                                provider=build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING),
-                                interests_path=persona_dir / "interests.json",
-                                default_interests_path=(
-                                    Path(__file__).resolve().parent.parent
-                                    / "engines"
-                                    / "default_interests.json"
-                                ),
-                                now=datetime.now(UTC),
-                            )
-                except Exception:
-                    logger.exception("supervisor interest-sweep tick raised")
-                # End-of-block advance+save: body above is fully wrapped, so this
-                # is unconditionally reached (cadence invariant, defer #21 pattern).
-                interest_sweep_cadence_state = persisted_cadence.advance(
-                    now=datetime.now(UTC),
-                    interval_s=interest_sweep_interval_s,
-                )
-                persisted_cadence.save_cadence(
-                    persona_dir, interest_sweep.SWEEP_CADENCE_FILE, interest_sweep_cadence_state
-                )
-
-            # Judge self-tune — weekly, persisted wall-clock (F2c inc2, spec
-            # Section 2). Structurally identical to the interest-sweep block
-            # immediately above: `_run_judge_selftune_tick` is a leaf engine
-            # call (not a supervisor `_run_X_tick` wrapper despite its name)
-            # that owns neither cadence nor throttle by design — this block
-            # owns both, same as interest sweep. Own per-tick MemoryStore
-            # (ExitStack), own cli_throttle.background_slot. NO startup
-            # catch-up (mirrors interest sweep, NOT the daily calibration
-            # tick's catch-up-at-boot shape) — a due-while-off firing just
-            # waits for the next idle moment, since a week's slack on an
-            # already-weekly cadence is immaterial. The returned dict
-            # (fired/tune_grade/new_decisions/error) is caller-facing only
-            # (mirrors interest sweep's ignored return value), so it is
-            # ignored here.
-            if judge_selftune_cadence_state is not None and persisted_cadence.is_due(
-                judge_selftune_cadence_state, now=datetime.now(UTC)
-            ):
-                try:
-                    with (
-                        ExitStack() as _judge_selftune_stack,
-                        cli_throttle.background_slot() as _judge_selftune_slot,
-                    ):
-                        if _judge_selftune_slot:
-                            _judge_selftune_store = MemoryStore(persona_dir / "memories.db")
-                            _judge_selftune_stack.callback(_judge_selftune_store.close)
-                            _run_judge_selftune_tick(
-                                store=_judge_selftune_store,
-                                now=datetime.now(UTC),
-                                persona_dir=persona_dir,
-                            )
-                except Exception:
-                    logger.exception("supervisor judge-selftune tick raised")
-                # End-of-block advance+save: body above is fully wrapped, so this
-                # is unconditionally reached (cadence invariant, defer #21 pattern).
-                judge_selftune_cadence_state = persisted_cadence.advance(
-                    now=datetime.now(UTC),
-                    interval_s=judge_selftune_interval_s,
-                )
-                persisted_cadence.save_cadence(
-                    persona_dir, JUDGE_TUNE_CADENCE_FILE, judge_selftune_cadence_state
-                )
-
-            # Finalize cadence — 24h silence (default) or explicit. Each pass
-            # runs at most one final snapshot per stale session, then deletes
-            # buffer + cursor + registry entry. Slow cadence (hourly default)
-            # because the threshold is days, not minutes.
-            if finalize_cadence_state is not None and persisted_cadence.is_due(
-                finalize_cadence_state, now=datetime.now(UTC)
-            ):
-                try:
-                    _run_finalize_tick(
-                        persona_dir,
-                        build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING),
-                        event_bus,
-                        finalize_after_hours=finalize_after_hours,
-                    )
-                except Exception:
-                    logger.exception("supervisor finalize tick raised")
-                finally:
-                    finalize_cadence_state = persisted_cadence.advance(
-                        now=datetime.now(UTC), interval_s=finalize_interval_s
-                    )
-                    persisted_cadence.save_cadence(
-                        persona_dir, "finalize_cadence.json", finalize_cadence_state
-                    )
-
             # Log-rotation cadence — hourly default. Bounded JSONL archives so
             # heartbeats/dreams/emotion_growth don't grow forever; yearly
             # archive for soul_audit (every decision must remain reachable).
@@ -821,30 +574,6 @@ def run_folded(
                     )
                     persisted_cadence.save_cadence(
                         persona_dir, "log_rotation_cadence.json", log_rotation_cadence_state
-                    )
-
-            # Memory-vector clustering cadence (Stage 5, #157) — own
-            # persisted wall-clock cadence, default 6h (see
-            # clustering_interval_s docstring). A full numpy k-means pass
-            # over the persona's currently-embedded vectors; off the message
-            # hot path by construction (only ever called from here). Own
-            # ExitStack ownership inside _run_clustering_tick (mirrors
-            # _run_log_rotation_tick/_run_narrative_memory_pass) since the
-            # per-tick `hebbian` handle opened earlier in this loop is
-            # already closed by the time this block runs.
-            if clustering_cadence_state is not None and persisted_cadence.is_due(
-                clustering_cadence_state, now=datetime.now(UTC)
-            ):
-                try:
-                    _run_clustering_tick(persona_dir)
-                except Exception:
-                    logger.exception("supervisor clustering tick raised")
-                finally:
-                    clustering_cadence_state = persisted_cadence.advance(
-                        now=datetime.now(UTC), interval_s=clustering_interval_s
-                    )
-                    persisted_cadence.save_cadence(
-                        persona_dir, "clustering_cadence.json", clustering_cadence_state
                     )
 
             # Vocab-repair cadence (#173) — 6h default. The startup pass above
@@ -865,23 +594,6 @@ def run_folded(
                     )
                     persisted_cadence.save_cadence(
                         persona_dir, "vocab_repair_cadence.json", vocab_repair_cadence_state
-                    )
-
-            # Initiate review cadence — mirrors soul_review. Per-pass cost cap
-            # (3 candidates max). Fault-isolated.
-            if initiate_review_cadence_state is not None and persisted_cadence.is_due(
-                initiate_review_cadence_state, now=datetime.now(UTC)
-            ):
-                try:
-                    _run_initiate_review_tick(persona_dir, provider, event_bus)
-                except Exception:
-                    logger.exception("supervisor initiate-review tick raised")
-                finally:
-                    initiate_review_cadence_state = persisted_cadence.advance(
-                        now=datetime.now(UTC), interval_s=initiate_review_interval_s
-                    )
-                    persisted_cadence.save_cadence(
-                        persona_dir, "initiate_review_cadence.json", initiate_review_cadence_state
                     )
 
             # Voice-reflection cadence — daily by default. Gathers last 7 days
@@ -906,27 +618,6 @@ def run_folded(
                     persisted_cadence.save_cadence(
                         persona_dir, "voice_reflection_cadence.json", voice_cadence_state
                     )
-
-            # Self-model reflection cadence — its OWN persisted-cadence block,
-            # mirroring soul review's decoupling from the monotonic timers. The
-            # tick gates itself internally on a persisted wall-clock cadence
-            # (self_model_cadence_state.json, which survives restart/sleep), so
-            # this enable flag only switches the block on/off — the pacing lives
-            # in the tick. Fault-isolated so a reflection crash can't take the
-            # supervisor down (Organ DoD — the producer fires on the live path).
-            # Cost: pinned to SELF_MODEL_MODEL (haiku) via build_self_model_provider
-            # — the tick's only model call is the articulate note (a one-sentence
-            # housekeeping call), so it must not inherit the persona chat provider.
-            if self_model_interval_s is not None:
-                try:
-                    from brain.self_model.articulate import build_self_model_provider
-                    _run_self_model_tick(
-                        persona_dir,
-                        provider=build_self_model_provider(persona_dir),
-                        event_bus=event_bus,
-                    )
-                except Exception:
-                    logger.exception("supervisor self-model tick raised")
 
             # Maker (autonomous making) tick — fail-isolated. The tick gates itself
             # internally on the persisted creative charge (maker_charge.json); this
@@ -964,6 +655,8 @@ def run_folded(
             elif notes_enabled:
                 logger.debug("supervisor notes tick skipped: per-tick store unavailable this tick")
         finally:
+            # per-tick store close
+            tick_ctx["store"] = None
             if store is not None:
                 try:
                     # Belt-and-suspenders; read BEFORE close. Every MemoryStore
@@ -997,61 +690,501 @@ def run_folded(
             except Exception:
                 logger.exception("supervisor kindled-link tick raised")
 
-        # Conversation-compaction cadence — daily by default (86400s).
-        # Folds aged, already-extracted turns into a persisted summary block at
-        # the head of each session buffer (lossless: raw turns archived first).
-        # PERSISTED via persisted_cadence.json — mirrors voice/maintenance so the
-        # daily interval fires correctly after a restart or system sleep (the
-        # exact class of bug #21 fixed for the other cadences). Uses a dedicated
-        # `compaction_cadence.json` (own file, even though the interval matches
-        # voice reflection) so its advance is always unconditional and independent.
-        # Cost: pinned to COMPACTION_MODEL (haiku) via build_compaction_provider.
-        if compaction_cadence_state is not None and persisted_cadence.is_due(
-            compaction_cadence_state, now=datetime.now(UTC)
-        ):
-            try:
-                from brain.chat.compaction import build_compaction_provider
-                _run_compaction_tick(
-                    persona_dir, build_compaction_provider(persona_dir),
-                    is_session_busy=is_session_busy,
-                )
-            except Exception:
-                logger.exception("supervisor compaction tick raised")
-            finally:
-                compaction_cadence_state = persisted_cadence.advance(
-                    now=datetime.now(UTC), interval_s=compaction_interval_s
-                )
-                persisted_cadence.save_cadence(
-                    persona_dir, "compaction_cadence.json", compaction_cadence_state
-                )
-
-        # Daily calibration cadence (F2a #250 inc5, spec Section 5) — 4th
-        # sibling cadence to compaction/clustering/vocab-repair. PERSISTED via
-        # its own `calibration_cadence.json` (mirrors compaction: independent
-        # file even though the default interval matches, so its advance is
-        # always unconditional and independent). INC5 scope: retention
-        # pruning of `calibration_log` only (acceptance 5b) — see
-        # `_run_calibration_tick`'s docstring for the full scope note; the
-        # judge-labeling pass (Section 6) and floor derivation (Section 7)
-        # land in later increments.
-        if calibration_cadence_state is not None and persisted_cadence.is_due(
-            calibration_cadence_state, now=datetime.now(UTC)
-        ):
-            try:
-                _run_calibration_tick(persona_dir, is_session_busy=is_session_busy)
-            except Exception:
-                logger.exception("supervisor calibration tick raised")
-            finally:
-                calibration_cadence_state = persisted_cadence.advance(
-                    now=datetime.now(UTC), interval_s=calibration_interval_s
-                )
-                persisted_cadence.save_cadence(
-                    persona_dir, "calibration_cadence.json", calibration_cadence_state
-                )
-
         # Wait for the next tick or for stop_event, whichever comes first.
         stop_event.wait(timeout=tick_interval_s)
     logger.info("supervisor stopped persona=%s", persona_dir.name)
+
+
+def _snapshot_has_work(persona_dir: Path) -> bool:
+    """The session-snapshot half of the snapshot/prune job's "has work"
+    probe (INC-9, S66): any active-conversation buffer that is a ghost (no
+    readable turns — the sweep cleans it up) or holds turns past its
+    extraction cursor (summary blocks excluded, as the snapshot itself
+    excludes them). No age check: the job only runs on an idle pass, so
+    every session's last turn is at least the lull old (S72/S83)."""
+    from brain.ingest.buffer import (
+        list_active_sessions,
+        read_cursor,
+        read_session,
+        read_session_after,
+    )
+
+    for sid in list_active_sessions(persona_dir):
+        try:
+            if not read_session(persona_dir, sid):
+                return True
+            after = read_session_after(persona_dir, sid, read_cursor(persona_dir, sid))
+            if any(t.get("speaker") != "summary" for t in after):
+                return True
+        except Exception:  # noqa: BLE001 — let the sweep's own per-session isolation handle it
+            return True
+    return False
+
+
+def _build_gated_jobs(
+    *,
+    persona_dir: Path,
+    provider: LLMProvider,
+    event_bus: EventBus,
+    is_session_busy: Callable[[str], bool] | None,
+    finalize_after_hours: float,
+    finalize_interval_s: float | None,
+    initiate_review_interval_s: float | None,
+    maintenance_interval_s: float | None,
+    self_model_interval_s: float | None,
+    compaction_interval_s: float | None,
+    calibration_interval_s: float | None,
+    interest_sweep_interval_s: float | None,
+    judge_selftune_interval_s: float | None,
+    clustering_interval_s: float | None,
+    intensity_drivers: Callable[[], IntensityDrivers | None],
+    tick_stats: dict[str, int],
+    tick_ctx: dict[str, MemoryStore | None] | None = None,
+    bridge_started_at: datetime | None = None,
+    between_items: Callable[[], bool] | None = None,
+) -> list[GatedJob]:
+    """The job table of the central cadence function (INC-9, S16/S55/S70).
+
+    One ``GatedJob`` per gated job; a job whose ``*_interval_s`` is None (the
+    test/dev disable knob) is left out. Pass 2, session snapshot/prune,
+    emotion backfill and embedding backfill have no interval: each runs at
+    every idle pass while it has work (S53/S66). Deploy recalibration is due
+    while the stored floor is stale (S70/S73). Self-model articulation keeps
+    its own cadence (S29). Every other job is an interval job whose cadence
+    file the central function owns.
+
+    Each ``run`` closure looks its tick function up by module-global name at
+    call time (so tests can monkeypatch them) and returns
+    ``JobOutcome.SKIPPED`` when it lost the concurrency-slot race or deferred
+    without doing the job's work (S20: no cadence advance).
+    """
+    jobs: list[GatedJob] = []
+    started_at = bridge_started_at if bridge_started_at is not None else datetime.now(UTC)
+    ctx: dict[str, MemoryStore | None] = tick_ctx if tick_ctx is not None else {"store": None}
+    # INC-10 (S14/S41/S65): the between-items hook every pausable job's own
+    # loop asks. Callers that don't wire one (older tests, direct unit
+    # calls) get the bare idle check with no heartbeat hook — same
+    # behavior pass2's should_pause had before this increment.
+    _between_items: Callable[[], bool] = (
+        between_items if between_items is not None else (lambda: not cli_throttle.is_chat_idle())
+    )
+
+    @contextmanager
+    def _tick_store() -> Iterator[MemoryStore]:
+        """The loop's per-tick shared store when there is one (#132), else a
+        short-lived store of the job's own."""
+        shared = ctx.get("store")
+        if shared is not None:
+            yield shared
+            return
+        own = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+        try:
+            yield own
+        finally:
+            own.close()
+
+    # 1. pass 2 — S53: every idle pass while the saved queue is non-empty.
+    def _pass2_run() -> JobOutcome:
+        with cli_throttle.background_slot() as slot:
+            if not slot:
+                return JobOutcome.SKIPPED
+            # S14 (per item): a message arriving mid-drain stops it at the next
+            # item boundary; what's left stays saved for the next lull (S64).
+            # INC-10: should_pause is the between-items hook (heartbeat + idle),
+            # not a bare idle check, so a heartbeat due mid-drain still runs
+            # between items rather than waiting for the whole drain (S41/S65).
+            drained = pass2_queue.drain_all_locked(persona_dir, should_pause=_between_items)
+        logger.info("pass-2 job: drained=%d", drained)
+        # 0 drained with work queued = another process holds pass2_drain.lock
+        # (S77): nothing ran, so report a skip (pass 2 has no cadence either way).
+        if drained == 0:
+            return JobOutcome.SKIPPED
+        # INC-10 (C8): drained something but the saved queue (S64, the queue
+        # file itself IS pass 2's saved progress) still has items — the
+        # between-items hook stopped the drain for chat, not an empty queue.
+        if pass2_queue.queue_length(persona_dir) > 0:
+            return JobOutcome.PAUSED
+        return JobOutcome.COMPLETED
+
+    jobs.append(
+        GatedJob(
+            "pass2",
+            run=_pass2_run,
+            has_work=lambda: pass2_queue.queue_length(persona_dir) > 0,
+        )
+    )
+
+    # 2. session snapshot / empty-session prune — S66/S72/S83.
+    def _prune_age(now: datetime) -> float:
+        # S72 / 2-plan §3.3a: prune only sessions that predate the CURRENT idle
+        # window — never the lull value, never a constant. The window opens at
+        # the last message. S84: when no message has been seen in this process
+        # (S82 seeded nothing and none arrived, so time_since_last_message() is
+        # +inf), the window is anchored at bridge start instead — an empty
+        # session created before this bridge started is prunable, one created
+        # after it (e.g. the app-mount session) is kept until a later start.
+        # time_since_last_message() itself is left untouched (it is also
+        # is_chat_idle's anchor, S82): the fallback lives only here.
+        since = cli_throttle.time_since_last_message()
+        if math.isinf(since):
+            return max(0.0, (now - started_at).total_seconds())
+        return since
+
+    def _snapshot_prune_has_work() -> bool:
+        if _snapshot_has_work(persona_dir):
+            return True
+        now = datetime.now(UTC)
+        return has_prunable_empty_sessions(
+            older_than_seconds=_prune_age(now), now=now, persona_name=persona_dir.name
+        )
+
+    def _snapshot_prune_run() -> JobOutcome:
+        snapshot_paused_out: list[bool] = []
+        with ExitStack() as stack:
+            store = stack.enter_context(_tick_store())
+            hebbian = HebbianMatrix(persona_dir / "hebbian.db", integrity_check=False)
+            stack.callback(hebbian.close)
+            # No per-session age threshold (silence 0): the job only runs on an
+            # idle pass, so every session's last turn is at least the lull old.
+            # Snapshot is NON-destructive — do NOT call remove_session here.
+            reports = snapshot_stale_sessions(
+                persona_dir,
+                silence_minutes=0.0,
+                store=store,
+                hebbian=hebbian,
+                provider=build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING),
+                should_pause=_between_items,
+                paused_out=snapshot_paused_out,
+            )
+        # Prune is indivisible (§4.4) — it always runs once per pass
+        # regardless of whether the snapshot half paused above.
+        prune_now = datetime.now(UTC)
+        pruned = prune_empty_sessions(
+            older_than_seconds=_prune_age(prune_now), now=prune_now, persona_name=persona_dir.name
+        )
+        tick_stats["closed_sessions"] += len(reports)
+        tick_stats["pruned_empty_sessions"] += len(pruned)
+        for r in reports:
+            event_bus.publish(
+                {
+                    "type": "session_snapshot",
+                    "session_id": r.session_id,
+                    "extracted_since_cursor": r.extracted,
+                    "committed": r.committed,
+                    "enqueued": r.enqueued,
+                    "deduped": r.deduped,
+                    "soul_candidates": r.soul_candidates,
+                    "errors": r.errors,
+                    "at": _now_iso(),
+                }
+            )
+        return JobOutcome.PAUSED if snapshot_paused_out else JobOutcome.COMPLETED
+
+    jobs.append(
+        GatedJob("session_snapshot_prune", run=_snapshot_prune_run, has_work=_snapshot_prune_has_work)
+    )
+
+    # 3. emotion backfill — S53/S66 (was a startup one-shot only).
+    def _emotion_backfill_job_has_work() -> bool:
+        with _tick_store() as store:
+            return _emotion_backfill_has_work(persona_dir, store=store)
+
+    def _emotion_backfill_job() -> JobOutcome:
+        # The per-tick shared store (#132): one memories.db connection per tick.
+        emotion_paused_out: list[bool] = []
+        with _tick_store() as store:
+            _emotion_backfill_run(
+                persona_dir,
+                provider=build_tier_provider(persona_dir, TIER_BACKGROUND_CLASSIFIER),
+                store=store,
+                should_pause=_between_items,
+                paused_out=emotion_paused_out,
+            )
+        # INC-10 (C8): PAUSED only when the between-items hook itself stopped
+        # the pass (emotion_paused_out, set at that exact return site) — NOT
+        # merely whenever status=="running", which ALSO covers the unrelated
+        # zero-tagged-guard case (a systematic tagger failure leaves status
+        # "running" too, but that is not a chat-idle pause and must not stop
+        # the S55 sequence for the jobs after this one).
+        return JobOutcome.PAUSED if emotion_paused_out else JobOutcome.COMPLETED
+
+    jobs.append(
+        GatedJob(
+            "emotion_backfill",
+            run=_emotion_backfill_job,
+            has_work=_emotion_backfill_job_has_work,
+        )
+    )
+
+    # 4. embedding backfill — S53/S66 (was every base tick behind a slot).
+    def _embedding_backfill_has_work() -> bool:
+        with _tick_store() as store:
+            return _embedding_backfill_has_work_probe(store)
+
+    def _embedding_backfill_job() -> JobOutcome:
+        with cli_throttle.background_slot() as slot, _tick_store() as store:
+            if not slot:
+                return JobOutcome.SKIPPED
+            result = _embedding_backfill_run_tick(persona_dir, store)
+            logger.info(
+                "embedding backfill tick: scanned=%d embedded=%d "
+                "skipped_short=%d errors=%d batch_size=%d",
+                result.scanned,
+                result.embedded,
+                result.skipped_short,
+                result.errors,
+                result.batch_size,
+            )
+        return JobOutcome.COMPLETED
+
+    jobs.append(
+        GatedJob(
+            "embedding_backfill",
+            run=_embedding_backfill_job,
+            has_work=_embedding_backfill_has_work,
+        )
+    )
+
+    # 5. maintenance — forgetting + narrative (+ the two cheap sweeps).
+    if maintenance_interval_s is not None:
+
+        def _maintenance_run() -> JobOutcome:
+            with cli_throttle.background_slot() as slot:
+                if not slot:
+                    return JobOutcome.SKIPPED
+                forgetting_progress: dict[str, bool] = {}
+                try:
+                    forgetting_run_pass(
+                        persona_dir,
+                        event_bus=event_bus,
+                        intensity_drivers=intensity_drivers(),
+                        should_pause=_between_items,
+                        progress_out=forgetting_progress,
+                    )
+                except Exception:
+                    logger.exception("supervisor forgetting pass raised")
+                if forgetting_progress.get("paused"):
+                    # INC-10 (C8): forgetting stopped between memories for
+                    # chat — its own cursor (job_progress) already saved the
+                    # resume point; skip narrative/the sweeps this pass so
+                    # the whole maintenance job reports PAUSED (no cadence
+                    # advance, S36) rather than silently completing them out
+                    # of order relative to a still-mid-pass forgetting.
+                    return JobOutcome.PAUSED
+                # Narrative-memory arc-update runs AFTER forgetting so a memory
+                # forgetting just dropped doesn't enter an arc born this tick.
+                try:
+                    _run_narrative_memory_pass(persona_dir, provider, event_bus)
+                except Exception:
+                    logger.exception("supervisor narrative-memory pass raised")
+            # Expire stale pending file-write proposals (24h TTL).
+            try:
+                from brain.files import pending as _file_pending
+
+                _file_pending.sweep_expired(persona_dir, now=datetime.now(UTC))
+            except Exception:
+                logger.exception("supervisor pending-write sweep raised")
+            # Reap aged .lock.stale-* / .corrupt-* forensic residue (#176).
+            try:
+                from brain.health import sidecar_sweep as _sidecar_sweep
+
+                _sidecar_sweep.sweep_stale_sidecars(persona_dir, now=datetime.now(UTC))
+            except Exception:
+                logger.exception("supervisor sidecar sweep raised")
+            return JobOutcome.COMPLETED
+
+        jobs.append(
+            GatedJob(
+                "maintenance",
+                run=_maintenance_run,
+                cadence_file="maintenance_cadence.json",
+                interval_s=maintenance_interval_s,
+            )
+        )
+
+    # 6. interest sweep — weekly.
+    if interest_sweep_interval_s is not None:
+
+        def _interest_sweep_run() -> JobOutcome:
+            with ExitStack() as stack, cli_throttle.background_slot() as slot:
+                if not slot:
+                    return JobOutcome.SKIPPED
+                sweep_store = MemoryStore(persona_dir / "memories.db")
+                stack.callback(sweep_store.close)
+                interest_sweep.run_sweep_tick(
+                    store=sweep_store,
+                    provider=build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING),
+                    interests_path=persona_dir / "interests.json",
+                    default_interests_path=(
+                        Path(__file__).resolve().parent.parent
+                        / "engines"
+                        / "default_interests.json"
+                    ),
+                    now=datetime.now(UTC),
+                )
+            return JobOutcome.COMPLETED
+
+        jobs.append(
+            GatedJob(
+                "interest_sweep",
+                run=_interest_sweep_run,
+                cadence_file=interest_sweep.SWEEP_CADENCE_FILE,
+                interval_s=interest_sweep_interval_s,
+            )
+        )
+
+    # 7. self-model articulation — keeps its own cadence (S29); due when that
+    # cadence says so, with the gated-job missing/corrupt rule (S22/S69).
+    if self_model_interval_s is not None:
+
+        def _self_model_due() -> bool:
+            now = datetime.now(UTC)
+            state, created = self_model_cadence.load_or_init(persona_dir, now=now)
+            return not created and self_model_cadence.is_due(state, now=now)
+
+        def _self_model_run() -> JobOutcome:
+            from brain.self_model.articulate import build_self_model_provider
+
+            ran = _run_self_model_tick(
+                persona_dir,
+                provider=build_self_model_provider(persona_dir),
+                event_bus=event_bus,
+            )
+            return JobOutcome.SKIPPED if ran is False else JobOutcome.COMPLETED
+
+        jobs.append(
+            GatedJob("self_model_articulation", run=_self_model_run, has_work=_self_model_due)
+        )
+
+    # 8. compaction — daily.
+    if compaction_interval_s is not None:
+
+        def _compaction_run() -> JobOutcome:
+            from brain.chat.compaction import build_compaction_provider
+
+            paused = _run_compaction_tick(
+                persona_dir,
+                build_compaction_provider(persona_dir),
+                is_session_busy=is_session_busy,
+                should_pause=_between_items,
+            )
+            return JobOutcome.PAUSED if paused else JobOutcome.COMPLETED
+
+        jobs.append(
+            GatedJob(
+                "compaction",
+                run=_compaction_run,
+                cadence_file="compaction_cadence.json",
+                interval_s=compaction_interval_s,
+            )
+        )
+
+    # 9. clustering — 6h.
+    if clustering_interval_s is not None:
+        jobs.append(
+            GatedJob(
+                "clustering",
+                run=lambda: _run_clustering_tick(persona_dir),
+                cadence_file="clustering_cadence.json",
+                interval_s=clustering_interval_s,
+            )
+        )
+
+    if calibration_interval_s is not None:
+        # 10. deploy recalibration (the stale-floor refit, S70/S73) — due while
+        # the stored floor is stale; immediately before daily calibration.
+        jobs.append(
+            GatedJob(
+                "deploy_recalibration",
+                run=lambda: _run_deploy_recalibration(persona_dir),
+                has_work=lambda: _deploy_recalibration_due(persona_dir),
+            )
+        )
+
+        # 11. daily calibration — calibration before self-tune (S43).
+        def _calibration_run() -> JobOutcome:
+            ran = _run_calibration_tick(
+                persona_dir, is_session_busy=is_session_busy, should_pause=_between_items
+            )
+            if ran is None:
+                return JobOutcome.PAUSED
+            return JobOutcome.SKIPPED if ran is False else JobOutcome.COMPLETED
+
+        jobs.append(
+            GatedJob(
+                "daily_calibration",
+                run=_calibration_run,
+                cadence_file="calibration_cadence.json",
+                interval_s=calibration_interval_s,
+            )
+        )
+
+    # 12. weekly judge self-tune.
+    if judge_selftune_interval_s is not None:
+
+        def _selftune_run() -> JobOutcome:
+            with ExitStack() as stack, cli_throttle.background_slot() as slot:
+                if not slot:
+                    return JobOutcome.SKIPPED
+                selftune_store = MemoryStore(persona_dir / "memories.db")
+                stack.callback(selftune_store.close)
+                _run_judge_selftune_tick(
+                    store=selftune_store,
+                    now=datetime.now(UTC),
+                    persona_dir=persona_dir,
+                )
+            return JobOutcome.COMPLETED
+
+        jobs.append(
+            GatedJob(
+                "weekly_selftune",
+                run=_selftune_run,
+                cadence_file=JUDGE_TUNE_CADENCE_FILE,
+                interval_s=judge_selftune_interval_s,
+            )
+        )
+
+    # 13. finalize — hourly sweep, 24h silence threshold.
+    if finalize_interval_s is not None:
+
+        def _finalize_run() -> JobOutcome:
+            paused = _run_finalize_tick(
+                persona_dir,
+                build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING),
+                event_bus,
+                finalize_after_hours=finalize_after_hours,
+                should_pause=_between_items,
+            )
+            return JobOutcome.PAUSED if paused else JobOutcome.COMPLETED
+
+        jobs.append(
+            GatedJob(
+                "finalize",
+                run=_finalize_run,
+                cadence_file="finalize_cadence.json",
+                interval_s=finalize_interval_s,
+            )
+        )
+
+    # 14. initiate review — 15 min.
+    if initiate_review_interval_s is not None:
+
+        def _initiate_review_run() -> JobOutcome:
+            paused = _run_initiate_review_tick(
+                persona_dir, provider, event_bus, should_pause=_between_items
+            )
+            return JobOutcome.PAUSED if paused else JobOutcome.COMPLETED
+
+        jobs.append(
+            GatedJob(
+                "initiate_review",
+                run=_initiate_review_run,
+                cadence_file="initiate_review_cadence.json",
+                interval_s=initiate_review_interval_s,
+            )
+        )
+
+    return central_cadence.order_jobs(jobs)
 
 
 def _run_vocab_repair_tick(persona_dir: Path) -> None:
@@ -1215,7 +1348,22 @@ def _heartbeat_and_felt_time(
     without driving the full run_folded loop. Fault-isolated: heartbeat
     errors are caught and reflex_n defaults to 0; felt-time errors are
     caught and None is returned. The caller updates last_heartbeat_at.
+
+    Start check (S21, C9(b)): does not start a pass — heartbeat OR
+    felt-time — while a chat reply is being generated, checked once here;
+    once a pass has started (this check passed) it always runs to
+    completion even if a reply starts mid-pass (the heartbeat engine
+    itself never re-checks this once inside `run_tick`). This is the ONLY
+    caller of `run_tick` that carries this check — `nell heartbeat` (a
+    separate process, cli.py) and the shutdown close tick (server.py) are
+    not gated on it.
     """
+    if cli_throttle.reply_in_flight():
+        logger.debug(
+            "supervisor heartbeat tick deferred: a chat reply is in flight (S21)"
+        )
+        return None
+
     from brain.felt_time.chat_log import count_chat_turns_since
 
     heartbeat_result = None
@@ -1630,8 +1778,12 @@ def _run_self_model_tick(
     *,
     provider: LLMProvider,
     event_bus: EventBus | object,
-) -> None:
+) -> bool:
     """Run one autonomous self-model reflection pass — the whole organ.
+
+    Returns True when the reflection ran (and its cadence was saved by
+    outcome), False when it did not run (not due, or the pre-flight slot peek
+    denied it — cadence untouched).
 
     Composes the self-model end-to-end on the live supervisor path
     (Organ Definition-of-Done — the producer fires here, not just in
@@ -1644,11 +1796,12 @@ def _run_self_model_tick(
          before any of the tick's own work, mirroring brain/maker/__init__.py's
          "Pre-flight throttle gate" comment exactly. cli_throttle.slot_available()
          is a read-only peek (never touches the shared semaphore); on denial we
-         log + advance the cadence to a short "deferred" retry and return
-         WITHOUT calling _self_model_reflect at all — steps 1-9 below never run,
-         so a denied attempt has zero side effects (no gap computation, no
-         budget consumption, no sustained_ticks/gaps_surfaced change, no
-         self_model_state.json write).
+         log and return WITHOUT calling _self_model_reflect at all and WITHOUT
+         touching the cadence (ram-spike-fix INC-9, S20: a skip is not a run,
+         so the reflection stays due) — steps 1-9 below never run, so a denied
+         attempt has zero side effects (no gap computation, no budget
+         consumption, no sustained_ticks/gaps_surfaced change, no
+         self_model_state.json or cadence write).
       1. Read the recent active emotion-bearing memories.
       2. short = compute_derived(memories, body)       (recent normalized mean, short half-life)
       3. long  = compute_baseline(memories)            (baseline normalized mean, long half-life)
@@ -1681,18 +1834,25 @@ def _run_self_model_tick(
     now = datetime.now(UTC)
 
     # ── 0: persisted-cadence gate (NOT monotonic — survives restart/sleep) ──
+    # ram-spike-fix INC-9 (S29): self-model articulation is a gated job of the
+    # central cadence function (brain/bridge/central_cadence.py), which runs it
+    # only on an idle pass; it STILL checks its own cadence here (6 h normal,
+    # 30-min backlog re-run, failure backoff — brain/self_model/cadence.py)
+    # before it actually runs. These own timers are to be absorbed later by the
+    # expanded central cadence function (the planned version that takes over
+    # everything that runs on a recurring cadence), at which point this
+    # module-local cadence goes away.
     cadence_state = self_model_cadence.load(persona_dir)
     if not self_model_cadence.is_due(cadence_state, now=now):
-        return
+        return False
 
     # ── 0a: pre-flight throttle peek (a defer must cost NOTHING) ────────────
-    if not cli_throttle.slot_available(min_idle=articulate_min_idle_seconds()):
+    # ram-spike-fix INC-9 (S20, C22): a no-lull / slot-denied skip leaves the
+    # cadence file UNCHANGED (it used to write a short "deferred" retry), so
+    # the reflection is simply still due at the next idle pass.
+    if not cli_throttle.slot_available():
         log_self_model_deferred(persona_dir)
-        cadence_state = self_model_cadence.compute_next_state(
-            cadence_state, outcome="deferred", now=now
-        )
-        self_model_cadence.save(persona_dir, cadence_state)
-        return
+        return False
 
     outcome = "clean"
     try:
@@ -1709,6 +1869,7 @@ def _run_self_model_tick(
         cadence_state, outcome=outcome, now=now
     )
     self_model_cadence.save(persona_dir, cadence_state)
+    return True
 
 
 def _self_model_reflect(
@@ -2085,7 +2246,8 @@ def _run_compaction_tick(
     provider: LLMProvider,
     *,
     is_session_busy: Callable[[str], bool] | None = None,
-) -> None:
+    should_pause: Callable[[], bool] | None = None,
+) -> bool:
     """Run the age-gated cascade on each active conversation, then check the weekly
     session-rollover (1c-B) — cascade-fold FIRST, then rollover, so a swap seeds from
     the just-updated tiers (M2). Per-session failures are logged and do not stop the
@@ -2100,12 +2262,23 @@ def _run_compaction_tick(
     ``perform_rollover``, whose destructive section holds ``registry_lock()`` across
     its seed re-read → successor-pointer write, serializing it against a concurrent
     live-turn persist (see brain/chat/rollover.py + session.persist_turns_following_
-    successor). At startup ``is_session_busy`` is None / returns False (no requests
-    yet), so the startup catch-up cascade fires.
+    successor).
 
     Provider is COMPACTION_MODEL (haiku) via build_compaction_provider — cost
-    stays off the chat model. Called from the persisted_cadence block in
-    run_folded (daily default, survives restart/sleep per #21) and once at startup.
+    stays off the chat model. Called only by the central cadence function's
+    compaction job (daily default, persisted cadence per #21; ram-spike-fix
+    INC-9 removed the startup catch-up call — an overdue cascade runs at the
+    first lull, the bridge-start lull included).
+
+    ``should_pause`` (INC-10, S14/S32/S41/S65): checked BETWEEN sessions —
+    the S32 table's item unit for compaction is "one session"
+    (supervisor.py:2125 historically; per-session buffer state is already
+    persisted per fold, so stopping here loses no progress). Returns True
+    when it stopped early for chat with sessions still unvisited this pass
+    (C8: the caller must not advance ``compaction_cadence.json`` and must
+    report ``JobOutcome.PAUSED``); resuming just re-lists active sessions and
+    re-applies the same age-gated cascade, which is a no-op for a session
+    this pass already cascaded (nothing new is old enough yet).
     """
     from brain.chat.compaction import (
         _ROLLOVER_QUIET_GAP,
@@ -2116,13 +2289,14 @@ def _run_compaction_tick(
     from brain.ingest.buffer import list_active_sessions
 
     persona_name = persona_dir.name
+    session_ids = list(list_active_sessions(persona_dir))
     with ExitStack() as stack:
         store = MemoryStore(persona_dir / "memories.db")
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
 
-        for session_id in list_active_sessions(persona_dir):
+        for i, session_id in enumerate(session_ids):
             now = datetime.now(UTC)
             # Idle-gate: skip a session with an in-flight request (owner ruling) —
             # its cascade AND its rollover defer to the next idle tick. Compaction
@@ -2147,6 +2321,15 @@ def _run_compaction_tick(
             except Exception:
                 logger.exception("weekly rollover: session=%s raised", session_id)
 
+            if (
+                should_pause is not None
+                and i < len(session_ids) - 1
+                and should_pause()
+            ):
+                logger.info("compaction tick: pausing between sessions for chat (INC-10)")
+                return True
+    return False
+
 
 def _run_calibration_tick(
     persona_dir: Path,
@@ -2154,11 +2337,14 @@ def _run_calibration_tick(
     is_session_busy: Callable[[str], bool] | None = None,
     provider: LLMProvider | None = None,
     judge: RelevanceJudgeProvider | None = None,
-) -> None:
+    should_pause: Callable[[], bool] | None = None,
+) -> bool | None:
     """F2a daily calibration tick (#250, spec Section 5) — 4th sibling cadence
     to compaction/clustering/vocab-repair, mirroring ``_run_compaction_tick``'s
     idle-gate + restart-safety shape: own persisted ``calibration_cadence.json``,
-    startup catch-up + periodic daily fire in ``run_folded``.
+    daily fire via the central cadence function (no startup catch-up since
+    ram-spike-fix INC-9). Returns False when it deferred for a busy session
+    (a skip: the caller does not advance the cadence), True otherwise.
 
     **INC5 SCOPE:** retention pruning — deletes ``calibration_log`` rows
     outside the rolling ``day_bucket`` window via ``MemoryStore.
@@ -2218,13 +2404,10 @@ def _run_calibration_tick(
     currently has an in-flight request, the WHOLE tick defers to the next
     firing, rather than partially running while a live turn may still be
     calling ``store.log_calibration_sample`` (#250 inc4) against the same
-    table. At startup ``is_session_busy`` is None / no session has an
-    in-flight request yet, so the startup catch-up fires cleanly (mirrors
-    compaction).
+    table.
 
-    Fault-isolated by the caller (``run_folded``'s ``try/except
-    logger.exception`` around both the startup catch-up and periodic-fire
-    call sites, mirroring ``_run_clustering_tick``) — this function itself
+    Fault-isolated by the caller (the central cadence function's per-job
+    guard, mirroring ``_run_clustering_tick``) — this function itself
     does not swallow the PRUNE step's errors, so those are still visible in
     that wrapping try/except. The JUDGE-LABELING step is different: spec
     Section 6 requires a judge/torch/Haiku failure to never crash the tick
@@ -2237,7 +2420,9 @@ def _run_calibration_tick(
 
         if any(is_session_busy(sid) for sid in list_active_sessions(persona_dir)):
             logger.info("calibration tick: deferred, a session is busy")
-            return
+            # ram-spike-fix INC-9 (S20): a deferral is a skip, not a run — the
+            # caller (the central cadence function) must NOT advance the cadence.
+            return False
 
     with ExitStack() as stack:
         # integrity_check=False mirrors the sweep/maker/notes/vocab-repair/
@@ -2273,15 +2458,43 @@ def _run_calibration_tick(
                 current = judge_lora.resolve_current_checkpoint(persona_dir)
                 if current is not None:
                     full_model_dir = str(current)
+            label_progress: dict[str, bool] = {}
             labeled = label_calibration_sample(
                 store,
                 provider=tiebreak_provider,
                 judge=judge,
                 full_model_dir=full_model_dir,
+                should_pause=should_pause,
+                progress_out=label_progress,
             )
             logger.info("calibration tick: labeled=%d calibration_log rows this pass", labeled)
         except Exception:  # noqa: BLE001 — judge/torch/Haiku failure must not crash the tick
             logger.exception("calibration tick: judge-labeling pass raised; continuing")
+            label_progress = {}
+        finally:
+            # S11/S27 (inc5), S31 (inc10): the judge is built for this tick
+            # alone (label_calibration_sample above, lazily and only if there
+            # were rows to label) and never kept beyond it — release its RAM
+            # whether or not the pass actually built one, whether it
+            # succeeded/raised/PAUSED (release_judge() is a cheap no-op when
+            # nothing was loaded). This covers BOTH the finish arm and the
+            # INC-10 pause arm (C2): a between-items pause mid-labeling still
+            # reaches this `finally` on the very next loop iteration's break.
+            from brain.memory.relevance_judge import release_judge
+
+            release_judge()
+
+        if label_progress.get("paused"):
+            # INC-10 (C8): the between-items hook stopped labeling with rows
+            # still unlabeled — skip floor derivation (it reads the SAME
+            # day's labeled pairs; run it once labeling actually finishes)
+            # and report PAUSED so the central cadence function does not
+            # advance calibration_cadence.json (S36) and stops the S55
+            # sequence here (S43). The next lull re-fires this tick; already-
+            # labeled rows are never re-sampled (label_calibration_sample's
+            # own docstring), so no item 1..k is redone.
+            logger.info("calibration tick: paused mid-labeling; floor derivation deferred")
+            return None
 
         try:
             from brain.memory import floor_calibration
@@ -2301,6 +2514,7 @@ def _run_calibration_tick(
             )
         except Exception:  # noqa: BLE001 — floor-derivation failure must not crash the tick
             logger.exception("calibration tick: floor-derivation pass raised; continuing")
+    return True
 
 
 # Pre-flip revision Change 1's §6 retry gate (see `_run_deploy_
@@ -2386,26 +2600,42 @@ def _run_deploy_recalibration_check(persona_dir: Path) -> None:
     — and the no-row gate above survives a real restart the same way (a
     JSON file under `persona_dir`, not in-process state).
 
-    Placed at the bridge-startup seam in `run_folded`, immediately after
-    the existing F2a startup catch-up calibration tick — but unlike that
-    catch-up (which reuses `_run_calibration_tick`'s prune + judge-label +
+    Run by the central cadence function immediately before the daily
+    calibration job (INC-9) — but unlike that job (which reuses `_run_calibration_tick`'s prune + judge-label +
     cadence-scoped floor derivation), this is deliberately its OWN,
     narrower function: no pruning, no judge-labeling, no cadence-due check
     on the migration path — only the one scale-transition floor derivation,
     so a deploy recovers a scale-correct floor even when the daily cadence
     itself is disabled for a long window or has not yet come due.
 
-    Fault-isolated by the CALLER (`run_folded`'s `try/except
-    logger.warning`, mirroring every other one-shot startup step in this
-    function) — a failure constructing the store, the reranker provider, or
-    running the derivation must never crash bridge startup; the stale row
-    (or absence of one) is simply picked up again on the next startup.
+    Fault-isolated by the CALLER (the central cadence function's per-job
+    guard) — a failure constructing the store, the reranker provider, or
+    running the derivation must never crash the supervisor; the stale row
+    (or absence of one) is simply picked up again at a later lull.
+
+    ram-spike-fix INC-9 (S70/S73, C38): this is no longer a startup one-shot.
+    It is a gated job of the central cadence function
+    (``brain/bridge/central_cadence.py``), run at the first lull (the
+    bridge-start lull included) immediately before daily calibration: its
+    "due" half is ``_deploy_recalibration_due`` and its "run" half is
+    ``_run_deploy_recalibration``. This wrapper (due, then run) is kept for
+    direct callers.
     """
+    if _deploy_recalibration_due(persona_dir):
+        _run_deploy_recalibration(persona_dir)
+
+
+def _deploy_recalibration_due(persona_dir: Path) -> bool:
+    """The deploy recalibration job's due predicate (INC-9, S70/S73, C38):
+    the stored floor for the current reranker model is stale (absent, or
+    still raw-scale) AND, when NO row exists at all, the existing daily
+    no-row retry file (``_DEPLOY_RECAL_RETRY_CADENCE_FILE``) is due — today's
+    daily retry, kept as is (a missing retry file is due, so a floor row that
+    is absent runs at the first lull). A raw-scale row is always due. Read-
+    only: writes nothing."""
     with ExitStack() as stack:
         # integrity_check=False mirrors every other background-tick store
-        # open in this file (compaction/calibration/clustering ticks) — a
-        # full PRAGMA integrity_check on a one-shot startup check is
-        # unwarranted.
+        # open in this file (compaction/calibration/clustering ticks).
         store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
         stack.callback(store.close)
 
@@ -2414,49 +2644,76 @@ def _run_deploy_recalibration_check(persona_dir: Path) -> None:
         current_reranker_model_id = build_reranker_provider(store=store).model_id()
 
         if not store.reranker_floor_is_stale(current_reranker_model_id):
-            logger.info(
-                "deploy recalibration check: %s already normalized-scale, skipping",
+            logger.debug(
+                "deploy recalibration check: %s already normalized-scale, not due",
                 current_reranker_model_id,
             )
-            return
+            return False
 
-        # Change 1's §6 gate (see docstring above): only the no-row case is
-        # rate-limited — an existing raw-scale row always migrates now.
+        # Change 1's §6 gate (see _run_deploy_recalibration_check's docstring):
+        # only the no-row case is rate-limited — an existing raw-scale row is
+        # always due.
         if store.get_persisted_reranker_floor(current_reranker_model_id) is None:
-            now = datetime.now(UTC)
             retry_cadence = persisted_cadence.load_cadence(
                 persona_dir, _DEPLOY_RECAL_RETRY_CADENCE_FILE
             )
-            if not persisted_cadence.is_due(retry_cadence, now=now):
-                logger.info(
+            if not persisted_cadence.is_due(retry_cadence, now=datetime.now(UTC)):
+                logger.debug(
                     "deploy recalibration check: %s has no persisted floor yet (Change 1's "
                     "data-starvation ramp, or a genuinely fresh install) and was already "
-                    "retried within the last %.0fs — skipping this restart to avoid "
-                    "re-spinning; the daily calibration tick stays the authoritative path "
-                    "once enough data accumulates",
+                    "retried within the last %.0fs — not due; the daily calibration tick "
+                    "stays the authoritative path once enough data accumulates",
                     current_reranker_model_id,
                     _DEPLOY_RECAL_RETRY_INTERVAL_SECONDS,
                 )
-                return
-            persisted_cadence.save_cadence(
-                persona_dir,
-                _DEPLOY_RECAL_RETRY_CADENCE_FILE,
-                persisted_cadence.advance(now=now, interval_s=_DEPLOY_RECAL_RETRY_INTERVAL_SECONDS),
-            )
+                return False
+        return True
+
+
+def _run_deploy_recalibration(persona_dir: Path) -> None:
+    """The deploy recalibration job's run half (INC-9): one out-of-cycle
+    ``derive_and_persist_floor`` for the current reranker model. In the
+    no-row case the daily retry file advances once the attempt returns or
+    raises (S44), never before it (S36: a process death mid-attempt leaves
+    it due). Re-checks staleness first, so a floor made fresh between the due
+    check and this call is left alone."""
+    with ExitStack() as stack:
+        store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+        stack.callback(store.close)
+
+        from brain.memory.reranker import build_reranker_provider
+
+        current_reranker_model_id = build_reranker_provider(store=store).model_id()
+        if not store.reranker_floor_is_stale(current_reranker_model_id):
+            return
+        no_row = store.get_persisted_reranker_floor(current_reranker_model_id) is None
 
         from brain.memory import floor_calibration
 
-        outcome = floor_calibration.derive_and_persist_floor(store, current_reranker_model_id)
-        logger.info(
-            "deploy recalibration check: out-of-cycle floor derivation for %s -> "
-            "accepted=%s floor=%s cold_start=%s held_for_data_starvation=%s sample_pairs=%d",
-            current_reranker_model_id,
-            outcome.accepted,
-            outcome.floor,
-            outcome.is_cold_start,
-            outcome.held_for_data_starvation,
-            outcome.sample_pairs,
-        )
+        try:
+            outcome = floor_calibration.derive_and_persist_floor(
+                store, current_reranker_model_id
+            )
+            logger.info(
+                "deploy recalibration check: out-of-cycle floor derivation for %s -> "
+                "accepted=%s floor=%s cold_start=%s held_for_data_starvation=%s "
+                "sample_pairs=%d",
+                current_reranker_model_id,
+                outcome.accepted,
+                outcome.floor,
+                outcome.is_cold_start,
+                outcome.held_for_data_starvation,
+                outcome.sample_pairs,
+            )
+        finally:
+            if no_row:
+                persisted_cadence.save_cadence(
+                    persona_dir,
+                    _DEPLOY_RECAL_RETRY_CADENCE_FILE,
+                    persisted_cadence.advance(
+                        now=datetime.now(UTC), interval_s=_DEPLOY_RECAL_RETRY_INTERVAL_SECONDS
+                    ),
+                )
 
 
 def _run_finalize_tick(
@@ -2465,7 +2722,8 @@ def _run_finalize_tick(
     event_bus: EventBus,
     *,
     finalize_after_hours: float,
-) -> None:
+    should_pause: Callable[[], bool] | None = None,
+) -> bool:
     """Run one finalize pass — per-tick stores, then drop registry entries
     for every session that was finalized.
 
@@ -2474,7 +2732,12 @@ def _run_finalize_tick(
     ExitStack. The supervisor follows up by calling remove_session() for
     each finalized session — finalize itself doesn't touch the in-memory
     registry.
+
+    ``should_pause`` (INC-10): forwarded to ``finalize_stale_sessions``,
+    which checks it between finalized sessions (S32: item = one stale
+    session). Returns True when it stopped early for chat.
     """
+    paused_out: list[bool] = []
     with ExitStack() as stack:
         store = MemoryStore(persona_dir / "memories.db")
         stack.callback(store.close)
@@ -2487,6 +2750,8 @@ def _run_finalize_tick(
             store=store,
             hebbian=hebbian,
             provider=provider,
+            should_pause=should_pause,
+            paused_out=paused_out,
         )
 
     for r in reports:
@@ -2502,13 +2767,16 @@ def _run_finalize_tick(
                 "at": _now_iso(),
             }
         )
+    return bool(paused_out)
 
 
 def _run_initiate_review_tick(
     persona_dir: Path,
     provider: LLMProvider,
     event_bus: EventBus | object,
-) -> None:
+    *,
+    should_pause: Callable[[], bool] | None = None,
+) -> bool:
     """Build voice template + invoke run_initiate_review_tick.
 
     Mirrors _run_soul_review_tick's per-tick store-ownership pattern.
@@ -2567,6 +2835,7 @@ def _run_initiate_review_tick(
             exc_info=True,
         )
         is_rest_state = False  # fail-open: a body bug must never silence her permanently
+    _paused_out: list[bool] = []
     run_initiate_review_tick(
         persona_dir,
         provider=provider,
@@ -2574,6 +2843,8 @@ def _run_initiate_review_tick(
         cap_per_tick=cap_per_tick,
         user_presence=_user_presence,
         is_rest_state=is_rest_state,
+        should_pause=should_pause,
+        paused_out=_paused_out,
     )
     event_bus.publish(
         {
@@ -2581,6 +2852,7 @@ def _run_initiate_review_tick(
             "at": _now_iso(),
         }
     )
+    return bool(_paused_out)
 
 
 def _run_voice_reflection_tick(

@@ -21,6 +21,7 @@ import {
   approvePendingWrite,
   declinePendingWrite,
   fetchPersonaState,
+  type BackgroundJob,
   type PendingWrite,
   type PersonaState,
 } from "./bridge";
@@ -578,6 +579,7 @@ function PresenceIdentity({
   isSpeaking: boolean;
 }) {
   const statusLine = isSpeaking ? "thinking…" : humanizeEmotionStatus(state?.emotions ?? null);
+  const backgroundJobsLines = formatBackgroundJobsLines(state?.background_jobs ?? null);
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 18, marginTop: 18 }}>
       <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
@@ -599,6 +601,13 @@ function PresenceIdentity({
         </div>
         {statusLine && (
           <div style={{ fontSize: 12, color: "var(--text-mute)" }}>{statusLine}</div>
+        )}
+        {backgroundJobsLines && (
+          <div style={{ fontSize: 12, color: BACKGROUND_JOBS_LINE_COLOR, textAlign: "center" }}>
+            {backgroundJobsLines.map((line, i) => (
+              <div key={i}>{line}</div>
+            ))}
+          </div>
         )}
       </div>
       <div
@@ -653,6 +662,95 @@ function humanizeEmotionStatus(emotions: Record<string, number> | null): string 
   if (top.length === 0) return null;
   if (top.length === 1) return `${top[0]} climbing`;
   return `${top[0]} climbing · ${top[1]} underneath`;
+}
+
+/** ram-spike-fix INC-11 (spec §6, S15/S23/S38) — owner-set wording (Roy,
+ *  INC-11 follow-up). One named constant so it stays a one-place edit if
+ *  the copy changes again. Appears once, as the first line; the running
+ *  jobs are listed below it, one per line (see `formatBackgroundJobsLines`). */
+const BACKGROUND_JOBS_LABEL = "Current background tasks:";
+
+/** Whether "<job>(<descriptor>)" has a space before the parenthesis. Owner
+ *  confirmed: yes, a space (ram-spike-fix INC-11 follow-up, e.g. "pass2
+ *  (follow-up memory pass)"). Isolated here so it stays a one-character
+ *  change if that ever flips back. */
+const JOB_LABEL_PAREN_SPACE = " ";
+
+/** Per-job descriptor shown in parentheses after the bridge's internal job
+ *  name (ram-spike-fix INC-11 follow-up, owner-set). Keys are the bridge's
+ *  job/heartbeat names (brain/bridge/central_cadence.py GATED_JOB_ORDER,
+ *  plus "heartbeat"); an unrecognized name (e.g. a newer bridge) falls back
+ *  to itself as its own descriptor so the line still renders something
+ *  sensible instead of "name(undefined)". */
+const JOB_DESCRIPTORS: Record<string, string> = {
+  pass2: "follow-up memory pass",
+  session_snapshot_prune: "conversation snapshot",
+  emotion_backfill: "emotion tagging",
+  embedding_backfill: "memory indexing",
+  maintenance: "maintenance",
+  interest_sweep: "interest review",
+  self_model_articulation: "self-description update",
+  compaction: "conversation compaction",
+  clustering: "memory grouping",
+  deploy_recalibration: "recall recalibration",
+  daily_calibration: "recall calibration",
+  weekly_selftune: "weekly judge tune-up",
+  finalize: "closing old sessions",
+  initiate_review: "reach-out review",
+  heartbeat: "heartbeat",
+};
+
+/** ram-spike-fix INC-11 follow-up: "avoid a strong flicker if a bunch are
+ *  happening quickly" — pick the app's existing text colour closest to the
+ *  current background, so the line reads as a near-blend rather than a
+ *  bright flash whenever it appears/changes/disappears. This app is
+ *  dark-only (styles.css: "Dark-only, ember accent... See DESIGN-SPEC" — no
+ *  prefers-color-scheme / data-theme switch exists), so the closest colour
+ *  is a STATIC choice, not a runtime one.
+ *
+ *  Resolved by CIE76 Lab distance (deltaE) from `--bg-scene` (#191214, the
+ *  app's opaque base behind this unpaneled row) to every text colour
+ *  actually used as `color:` somewhere in this app today: --text (ΔE
+ *  87.7), --text-mid (ΔE 65.8), --linen/#fff (ΔE 93.8), --crimson (ΔE
+ *  70.9), --lacquer/--accent (ΔE 64.0), --rose (ΔE 63.3), --accent-text
+ *  (ΔE 69.0), #7fc9a0 (ΔE 78.9) — and the winner, --text-mute (==
+ *  --mauve), at ΔE 43.3, well below every other candidate. --text-mute is
+ *  also what `statusLine` right above this already uses, so this keeps
+ *  the two lines visually consistent as a side effect, not by design.
+ *
+ *  KNOWN TRADE-OFF, stage-6 cold red-team MAJOR, not silently resolved:
+ *  --text-mute composited over --bg-scene measures ~4.04:1 WCAG contrast,
+ *  below the 4.5:1 AA floor this codebase already enforces for the SAME
+ *  token in a similar spot (styles.css's .chat-input::placeholder comment:
+ *  --text-mute measured ~3.8:1 there, so it falls back to --text-mid
+ *  instead). "Closest to the background" and "AA-legible" pull in opposite
+ *  directions by construction — the flicker-suppression goal this constant
+ *  exists for IS blending toward the background. This line already reused
+ *  --text-mute at the same size on the same background before this
+ *  follow-up (the pre-existing statusLine div right above it), so this is
+ *  extending an already-shipped pattern, not a new regression.
+ *
+ *  OWNER ACCEPTED this trade-off, 2026-09-27: "I've no trouble reading the
+ *  status line as it is, and this isn't meant to be a highly visible
+ *  thing, more an indicator if you're looking for one and just a little
+ *  thing that's there if you're not. So --text-mute." */
+const BACKGROUND_JOBS_LINE_COLOR = "var(--text-mute)";
+
+/** "<name><space?>(<descriptor>)" for one running job, e.g.
+ *  "pass2 (follow-up memory pass)" (see JOB_LABEL_PAREN_SPACE). */
+function formatJobLabel(name: string): string {
+  const descriptor = JOB_DESCRIPTORS[name] ?? name;
+  return `${name}${JOB_LABEL_PAREN_SPACE}(${descriptor})`;
+}
+
+/** Lines to render for the background-work block, or null when nothing is
+ *  running (ram-spike-fix INC-11 follow-up). First line is the label;
+ *  each running job gets its own line below it. The bridge already orders
+ *  `jobs` longest-running first (`background_jobs.snapshot_with_elapsed`),
+ *  so this renders them in that order without re-sorting. */
+function formatBackgroundJobsLines(jobs: BackgroundJob[] | null): string[] | null {
+  if (!jobs || jobs.length === 0) return null;
+  return [BACKGROUND_JOBS_LABEL, ...jobs.map((j) => formatJobLabel(j.name))];
 }
 
 function capitalize(s: string): string {

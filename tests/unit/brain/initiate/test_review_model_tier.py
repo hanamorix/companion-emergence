@@ -137,8 +137,12 @@ def test_gate_provider_is_built_internally_from_persona_dir_not_the_provider_par
 
 
 def test_run_initiate_review_tick_signature_unchanged() -> None:
-    """C10 backward-compat: no new parameter was added to the tick's public
-    signature — a positive structural check, not just "the existing tests pass"."""
+    """C10 backward-compat: no new REQUIRED parameter was added to the
+    tick's public signature — a positive structural check, not just "the
+    existing tests pass". ram-spike-fix INC-10 appends `should_pause`/
+    `paused_out` (the between-items pause hook, C8/S14) at the end, both
+    keyword-only and defaulted to None -- every existing call site (26+4
+    positional/keyword calls with the original 7 params) is unaffected."""
     import inspect
 
     sig = inspect.signature(run_initiate_review_tick)
@@ -150,21 +154,30 @@ def test_run_initiate_review_tick_signature_unchanged() -> None:
         "now",
         "user_presence",
         "is_rest_state",
+        "should_pause",
+        "paused_out",
     ]
+    for name in ("should_pause", "paused_out"):
+        param = sig.parameters[name]
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY
+        assert param.default is None
 
 
 def test_run_initiate_review_tick_wrapper_supervisor_signature_unchanged() -> None:
     """C10's second backward-compat sub-criterion: brain.bridge.supervisor's
-    _run_initiate_review_tick (the sole production caller) also kept its exact
-    original 3-parameter signature — the fix never touched it at all."""
+    _run_initiate_review_tick (the sole production caller) keeps its exact
+    original 3-parameter signature for POSITIONAL/keyword callers -- INC-10
+    adds one new keyword-only `should_pause` param, defaulted to None, so
+    every existing 3-positional-argument call site is unaffected."""
     import inspect
 
     from brain.bridge.supervisor import _run_initiate_review_tick
 
     sig = inspect.signature(_run_initiate_review_tick)
-    assert list(sig.parameters) == ["persona_dir", "provider", "event_bus"]
-    # None of the three parameters gained a default — this function's callers
-    # (26+4 existing test call sites, all positional/keyword with 3 real
-    # arguments) are provably unaffected.
-    for name, param in sig.parameters.items():
-        assert param.default is inspect.Parameter.empty, f"{name} gained a default"
+    assert list(sig.parameters) == ["persona_dir", "provider", "event_bus", "should_pause"]
+    # The original three parameters keep no default (existing callers are
+    # provably unaffected); the new one is keyword-only and defaulted.
+    for name in ("persona_dir", "provider", "event_bus"):
+        assert sig.parameters[name].default is inspect.Parameter.empty, f"{name} gained a default"
+    assert sig.parameters["should_pause"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert sig.parameters["should_pause"].default is None

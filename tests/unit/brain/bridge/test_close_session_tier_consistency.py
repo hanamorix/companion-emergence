@@ -46,7 +46,7 @@ def _tiers_passed_to_snapshot_and_finalize(supervisor_src: str) -> tuple[str, st
     snapshot_m = re.search(
         r"reports = snapshot_stale_sessions\(\s*\n"
         r"\s*persona_dir,\s*\n"
-        r"\s*silence_minutes=silence_minutes,\s*\n"
+        r"\s*silence_minutes=0\.0,\s*\n"
         r"\s*store=store,\s*\n"
         r"\s*hebbian=hebbian,\s*\n"
         r"\s*provider=build_tier_provider\(persona_dir,\s*([A-Z_]+)\)",

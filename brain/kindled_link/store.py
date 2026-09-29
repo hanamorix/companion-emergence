@@ -171,13 +171,11 @@ class KindledLinkStore:
     def __init__(self, db_path: str | Path, *, integrity_check: bool = True) -> None:
         self._conn = sqlite3.connect(str(db_path))
         if integrity_check:
-            try:
-                result = self._conn.execute("PRAGMA integrity_check").fetchall()
-            except sqlite3.DatabaseError as exc:
-                self._conn.close()
-                from brain.health.anomaly import BrainIntegrityError
+            from brain.health.integrity_retry import run_integrity_check_with_retry
 
-                raise BrainIntegrityError(str(db_path), str(exc)) from exc
+            result = run_integrity_check_with_retry(
+                self._conn, db_path, caller="KindledLinkStore"
+            )
             if result != [("ok",)]:
                 detail = "; ".join(str(row[0]) for row in result)
                 self._conn.close()

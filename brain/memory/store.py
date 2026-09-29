@@ -17,6 +17,7 @@ import math
 import re
 import sqlite3
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -24,7 +25,7 @@ from typing import Any
 
 import numpy as np
 
-from brain import tunables
+from brain import dev_constants, tunables
 from brain.memory.floor_calibration import RETENTION_WINDOW_DAYS_DEFAULT
 
 logger = logging.getLogger(__name__)
@@ -631,6 +632,7 @@ def _bump_amount(bump: bool | float) -> float | None:
     return amount if amount != 0.0 else None
 
 
+
 class MemoryStore:
     """SQLite-backed store for Memory records.
 
@@ -640,36 +642,40 @@ class MemoryStore:
 
     def __init__(self, db_path: str | Path, *, integrity_check: bool = True) -> None:
         self._db_path = Path(db_path)
-        self._conn = sqlite3.connect(str(db_path))
+        self._conn = sqlite3.connect(
+            str(db_path), timeout=dev_constants.MEMORIES_DB_BUSY_TIMEOUT_S
+        )
         # Run integrity check BEFORE setting row_factory so result rows are
         # plain tuples — the comparison [("ok",)] is unambiguous. Hot request
         # paths may pass integrity_check=False and leave deep checks to health.
         if integrity_check:
-            try:
-                result = self._conn.execute("PRAGMA integrity_check").fetchall()
-            except sqlite3.DatabaseError as exc:
-                self._conn.close()
-                from brain.health.anomaly import BrainIntegrityError
+            from brain.health.integrity_retry import run_integrity_check_with_retry
 
-                raise BrainIntegrityError(str(db_path), str(exc)) from exc
+            result = run_integrity_check_with_retry(
+                self._conn, db_path, caller="MemoryStore"
+            )
             if result != [("ok",)]:
                 detail = "; ".join(str(row[0]) for row in result)
                 self._conn.close()
                 from brain.health.anomaly import BrainIntegrityError
 
                 raise BrainIntegrityError(str(db_path), detail)
-        # WAL + 5s busy_timeout — the bridge runs concurrent writers
-        # (chat tool calls, supervisor stale-close sweep, heartbeat,
-        # growth). Without WAL these can surface as `database is
-        # locked` under realistic desktop timing. In-memory dbs reject
-        # WAL; the fallback keeps tests using `:memory:` working. We
-        # set these AFTER the integrity check so a corrupt-file probe
-        # still surfaces BrainIntegrityError instead of a pragma crash.
+        # WAL + a busy_timeout well above the longest single memories.db
+        # write transaction (dev_constants.MEMORIES_DB_BUSY_TIMEOUT_S; see
+        # that module for the sizing basis, S48/S58) — the bridge runs
+        # concurrent writers (chat tool calls, supervisor stale-close
+        # sweep, heartbeat, growth). Without WAL these can surface as
+        # `database is locked` under realistic desktop timing. In-memory
+        # dbs reject WAL; the fallback keeps tests using `:memory:`
+        # working. We set these AFTER the integrity check so a corrupt-file
+        # probe still surfaces BrainIntegrityError instead of a pragma crash.
         try:
             self._conn.execute("PRAGMA journal_mode = WAL")
         except sqlite3.OperationalError:
             pass
-        self._conn.execute("PRAGMA busy_timeout = 5000")
+        self._conn.execute(
+            f"PRAGMA busy_timeout = {int(dev_constants.MEMORIES_DB_BUSY_TIMEOUT_S * 1000)}"
+        )
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         # Idempotent column migration for upgraded personas — _SCHEMA's
@@ -787,56 +793,12 @@ class MemoryStore:
         # Index on state — used by forgetting pass to find fading rows fast.
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_state ON memories(state)")
         self._conn.commit()
-        self._boot_fts_backstop()
-
-    def _boot_fts_backstop(self) -> None:
-        """FTS5 boot integrity-check → rebuild backstop.
-
-        Runs on EVERY constructor, including ``integrity_check=False`` ones
-        (the hot/feed paths): this FTS check is separate from the ``memories.db``
-        ``PRAGMA integrity_check`` gated by that flag — it is a cheap
-        FTS-internal consistency probe, not a full-DB scan, and must run so a
-        feed-path writer never operates against a stale/absent FTS index.
-
-        Rebuilds when the shadow index is corrupt (integrity-check raises) OR
-        empty against a pre-populated ``memories`` table — which covers both a
-        persona whose ``memories.db`` predates FTS (the table was just created
-        against existing rows) and a cleared/corrupted index (C2 self-heal).
-        Fail-soft: a rebuild failure logs and leaves the LIKE fallback usable.
-        """
-        try:
-            self._conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('integrity-check')")
-            healthy = True
-        except sqlite3.DatabaseError:
-            healthy = False
-        needs_rebuild = not healthy
-        if healthy:
-            try:
-                mem_rows = self._conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
-                # COUNT(*) on the FTS table itself reads the external CONTENT
-                # table, not the index — use the `_docsize` shadow table for the
-                # true count of INDEXED rows so an empty index against a
-                # populated `memories` (predates-FTS, or a cleared index) is
-                # detected.
-                fts_rows = self._conn.execute(
-                    "SELECT COUNT(*) FROM memories_fts_docsize"
-                ).fetchone()[0]
-                # mem_rows != fts_rows catches BOTH the empty-index case
-                # (predates-FTS / cleared → fts_rows==0) AND partial staleness
-                # (0 < fts_rows < mem_rows) at no extra cost (stage-6 minor).
-                needs_rebuild = mem_rows != fts_rows
-            except sqlite3.DatabaseError:
-                needs_rebuild = True
-        if needs_rebuild:
-            try:
-                self._conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
-            except sqlite3.DatabaseError as exc:
-                logger.warning("memories_fts rebuild failed; LIKE fallback in use: %s", exc)
-        # The 'integrity-check'/'rebuild' commands are INSERT statements, so
-        # sqlite3 opens an implicit write transaction. Commit it unconditionally
-        # (even the read-only integrity-check path) so no boot leaves a lock held
-        # against the other ~15 concurrent MemoryStore connections to this file.
-        self._conn.commit()
+        # FTS5 integrity-check/rebuild backstop (formerly `_boot_fts_backstop`,
+        # run unconditionally on EVERY open) has moved to a once-per-process
+        # check in `brain.memory.db_health.run_fts_health_check_once`, called
+        # explicitly by the bridge lifespan before the first store open
+        # (spec §6c, S60/S61/S74) — not from this constructor, so a per-turn
+        # `MemoryStore()` open never takes the write lock this check needs.
 
     def close(self) -> None:
         """Close the underlying connection. Safe to call multiple times."""
@@ -2310,6 +2272,40 @@ class MemoryStore:
             # clear-on-failure branch in `_reembed_or_clear` is now
             # belt-and-suspenders, since the row is already NULL going in.
             self._reembed_or_clear(memory_id, fields["content"])
+
+    def update_emotions_batch(self, rows: Sequence[tuple[str, dict[str, float]]]) -> None:
+        """Write a batch of emotions-only updates in ONE transaction (C10(b),
+        S17/S45): the heartbeat's batched decay pass, not the per-row
+        ``update(emotions=...)`` path (which commits per call).
+
+        Same column semantics as ``update(emotions=...)``: ``emotions_json``
+        replaced, ``peak_emotion_intensity`` raised via ``MAX(...)`` — never
+        lowered by decay (store.py:2197-2203). No embedding/content column is
+        touched (that branch of ``update`` only fires when ``content`` is
+        among the updated fields, which is never true here) — nothing new is
+        added to the row (I2/I8), and ``PRAGMA table_info(memories)`` is
+        unaffected (no schema change).
+
+        Every ``execute`` below runs before the single trailing ``commit()``,
+        so the whole batch is exactly one transaction (sqlite3's default
+        deferred-transaction behavior: an implicit BEGIN on the first write,
+        held open until this commit) — never one transaction per row. Callers
+        are responsible for pre-filtering to rows whose emotions actually
+        changed (S18); this method does not re-check and will happily rewrite
+        an unchanged row if asked to.
+
+        No-op (no transaction opened, no commit) when ``rows`` is empty.
+        """
+        if not rows:
+            return
+        for memory_id, emotions in rows:
+            new_max = max((float(v) for v in emotions.values()), default=0.0)
+            self._conn.execute(
+                "UPDATE memories SET emotions_json = ?, "
+                "peak_emotion_intensity = MAX(peak_emotion_intensity, ?) WHERE id = ?",
+                (json.dumps(emotions), new_max, memory_id),
+            )
+        self._conn.commit()
 
     def deactivate(self, memory_id: str) -> None:
         """Mark a memory inactive (F22 semantics). Raises KeyError if unknown."""

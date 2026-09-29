@@ -397,6 +397,22 @@ def _save_cursor(
         logger.warning("embedding_backfill: could not persist cursor (best-effort)", exc_info=True)
 
 
+def has_embedding_backfill_work(store: MemoryStore) -> bool:
+    """The central cadence function's "embedding backfill has work" probe
+    (ram-spike-fix INC-9, S53/S66): True iff the backlog (exactly
+    ``MemoryStore.list_unembedded_since``'s definition, from the start of
+    history, under the current embedding model) holds at least one row.
+    Reads one row at most; writes nothing."""
+    from brain.memory import embeddings as embeddings_mod
+
+    model_id = embeddings_mod.build_embedding_provider().model_id()
+    return bool(
+        store.list_unembedded_since(
+            None, limit=1, current_model_id=model_id, min_chars=MIN_CHARS_TO_EMBED
+        )
+    )
+
+
 def run_embedding_backfill_tick(
     persona_dir,  # noqa: ANN001 — Path, kept untyped to avoid importing pathlib just for the hint here
     store: MemoryStore,

@@ -306,6 +306,43 @@ def test_training_wraps_the_loaded_model_once(
     assert loads == [str(tiny_model_dir)]
 
 
+def test_lora_construction_site_forces_cpu_even_if_mps_reported_available(
+    tiny_model_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S81 owner ruling (RAM-spike-fix ledger, "CPU everywhere
+    (Recommended)"): `build_lora_retrain_fn`'s CrossEncoder construction
+    passes `device="cpu"` explicitly, so the judge never lands on MPS even
+    on a machine that reports it available. Bites against the pre-S81 code,
+    which passed no `device=` kwarg at all."""
+    import sentence_transformers
+    import torch
+
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+
+    real_init = sentence_transformers.CrossEncoder.__init__
+    captured: dict[str, object] = {}
+
+    def capturing_init(self, *a, **kw):
+        real_init(self, *a, **kw)
+        captured["device_kwarg"] = kw.get("device")
+        captured["device_actual"] = str(self.device)
+
+    monkeypatch.setattr(sentence_transformers.CrossEncoder, "__init__", capturing_init)
+
+    build_lora_retrain_fn(
+        tiny_model_dir, target_modules=_TARGET_MODULES, modules_to_save=_MODULES_TO_SAVE,
+        lora_rank=4, epochs=1,
+    )(_TRAIN_TRIPLES)
+
+    assert captured.get("device_kwarg") == "cpu", (
+        f"expected build_lora_retrain_fn's CrossEncoder construction to pass device='cpu' "
+        f"even with MPS reported available, got {captured.get('device_kwarg')!r}"
+    )
+    assert captured.get("device_actual") == "cpu", (
+        f"expected the resulting model to actually be on cpu, got {captured.get('device_actual')!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # build_lora_retrain_fn: produces a working label callable.
 # ---------------------------------------------------------------------------

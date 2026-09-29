@@ -38,7 +38,7 @@ from pathlib import Path
 
 import numpy as np
 
-from brain import tunables
+from brain import dev_constants, tunables
 from brain.bridge.model_tier import MODEL_RELEVANCE_JUDGE
 from brain.memory.reranker import _available_ram_headroom_bytes
 
@@ -63,15 +63,14 @@ _TUNE_GRADE_ORDER = (TUNE_GRADE_KNOB_REFIT, TUNE_GRADE_LORA, TUNE_GRADE_FULL_FT)
 # non-None `haiku_label` POSITIONS (one Haiku decision each — spec §2's
 # pinned counting unit, red-team fix F-2) than this have accumulated across
 # UNCONSUMED `calibration_log` rows (`MemoryStore.count_new_haiku_
-# decisions`). Provisional default — "a handful" ~5, so "more than a
-# handful" starts just past it. Unlike the RAM-tier/footprint tunables
-# below, this one isn't hardware-dependent, so it is a build-time judgment
-# call rather than a dry-run-derived figure (spec's Open Reconfirmations
-# list it alongside the RAM thresholds as a build-time derivation, not an
-# owner fork).
-JUDGE_TUNE_GATE_HANDFUL_DECISIONS: int = tunables.register(
-    "judge_selftune.gate_handful_decisions", 20
-)
+# decisions`). OWNER 2026-09-26 set this at 200 and ruled it a DEV-level
+# constant, not a user tunable (S7/S26): it exists so there is enough data
+# to derive meaningful drift signal and so calibration does not react to
+# background noise, not to shape user-visible behaviour — so it lives in
+# `brain.dev_constants`, not `tunables.register()`-ed here like the
+# RAM-tier/footprint knobs below. Re-exported under this module's existing
+# name so call sites and tests are unaffected by the move.
+JUDGE_TUNE_GATE_HANDFUL_DECISIONS: int = dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS
 
 # RAM tier thresholds (spec §1: "set by the dry-run... NOT hand-picked").
 # ⚠ PROVISIONAL until F2c inc5's timed LoRA dry-run on deploy-class
@@ -707,9 +706,11 @@ def _run_judge_selftune_tick(*, store, now: datetime, persona_dir: Path | None =
         except Exception:  # noqa: BLE001 — reaping is best-effort; never blocks the tick
             logger.warning("judge self-tune: orphan knob-row reap faulted", exc_info=True)
     try:
-        gate_handful = tunables.get_tunable(
-            "judge_selftune.gate_handful_decisions", JUDGE_TUNE_GATE_HANDFUL_DECISIONS
-        )
+        # Dev-level constant (S26), not a user tunable — read directly, not
+        # via tunables.get_tunable (see JUDGE_TUNE_GATE_HANDFUL_DECISIONS
+        # above). Module-global lookup (not a captured default) so a test
+        # can still override it via monkeypatch.setattr on this module.
+        gate_handful = JUDGE_TUNE_GATE_HANDFUL_DECISIONS
         # F2c inc8: only Haiku decisions logged within one weekly cadence of
         # `now` are counted (and so trained on — every training read is scoped
         # to `row_ids`).
@@ -775,6 +776,21 @@ def _run_judge_selftune_tick(*, store, now: datetime, persona_dir: Path | None =
     except Exception as exc:  # noqa: BLE001 — fault-isolated, mirrors run_sweep_tick
         logger.warning("judge self-tune tick failed: %s", exc)
         result["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        # S11/S27 (inc5): release the judge's RAM once this tick FINISHES,
+        # whichever path it took — the weak knob-refit path builds no judge
+        # at all (release_judge() is then a cheap no-op); the weight-retrain
+        # path (`_run_weight_retrain`) may build the shared cached base judge
+        # (`build_judge_provider()`) and/or per-persona `FullModelJudge`/
+        # LoRA/full-FT scratch models that are never cached (module docstring
+        # above `relevance_judge._provider_cache`) — `release_judge()` drops
+        # the cache AND gc.collect()s (+ malloc_trim(0) on Linux / malloc_zone_pressure_relief on macOS) so those
+        # uncached, now-unreferenced models are actually reclaimed too. The
+        # PAUSE arm (a mid-tick idle-loss) is INC-10; this tick has no pause
+        # point yet, so every path here is a FINISH.
+        from brain.memory.relevance_judge import release_judge
+
+        release_judge()
     if result["fired"]:
         # F2c inc8 (spec §3): the accumulated rows are cleared once the weekly
         # self-tune has trained on them. Runs AFTER the tune's own end-of-tick

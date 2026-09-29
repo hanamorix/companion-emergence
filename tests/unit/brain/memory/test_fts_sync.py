@@ -1,16 +1,24 @@
-"""FTS5 shadow-index sync + boot rebuild + multi-term OR (P2 — C1/C2/C15/C23).
+"""FTS5 shadow-index sync + health-check rebuild + multi-term OR (P2 — C1/C2/C15/C23).
 
 Each oracle is written to FAIL against the named known-bad state:
   - C1/C15 fail if the sync triggers are removed (FTS drifts from `memories`).
-  - C2 fails if the boot integrity/rebuild backstop is absent (FTS stays empty).
+  - C2 fails if the FTS health check's rebuild is absent (FTS stays empty).
   - C23 fails against a bare-term (implicit-AND) MATCH (zero rows for a disjoint
     multi-term query).
+
+RAM-spike-fix INC-3 (spec §6c): the self-heal in C2 used to run implicitly on
+EVERY `MemoryStore()` open (`_boot_fts_backstop`, retired); it now runs only
+via an explicit `db_health.run_fts_health_check_once(db_path)` call (the
+bridge lifespan's job in production) — so this test calls it directly rather
+than relying on a bare re-open. See `test_db_health.py` for the health-check
+module's own criteria (C34/C37).
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
+from brain.memory import db_health
 from brain.memory.store import Memory, MemoryStore
 
 
@@ -53,24 +61,30 @@ def test_c1_fts_stays_in_sync_on_insert_update_delete() -> None:
     assert _fts_ids(store, "apple") == _like_ids(store, "apple") == {b.id, c.id}
 
 
-def test_c2_fts_self_heals_on_boot_no_memory_lost(tmp_path: Path) -> None:
+def test_c2_fts_self_heals_on_health_check_no_memory_lost(tmp_path: Path) -> None:
     db = tmp_path / "memories.db"
+    db_health._reset_for_tests()
     store = MemoryStore(db)
     for i in range(3):
         store.create(_mem(f"apple number {i}"))
     assert _fts_ids(store, "apple")  # non-empty before
 
-    # Deliberately clear the shadow index (external-content delete-all).
+    # Deliberately clear the shadow index (external-content delete-all) —
+    # this also drops mem_rows != fts_rows out of sync (count_mismatch).
     store._conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('delete-all')")
     store._conn.commit()
     assert not _fts_ids(store, "apple")  # empty now
     mem_count = store.count(active_only=False)
     store.close()
 
-    # Re-opening runs the integrity-check → rebuild backstop.
+    # The explicit health check (the bridge lifespan's call in production)
+    # detects the count mismatch and rebuilds — a bare re-open no longer
+    # self-heals (INC-3: the check moved out of MemoryStore.__init__).
+    db_health.run_fts_health_check_once(db)
+
     store2 = MemoryStore(db)
     try:
-        assert _fts_ids(store2, "apple"), "boot rebuild should re-seed the FTS index"
+        assert _fts_ids(store2, "apple"), "health-check rebuild should re-seed the FTS index"
         assert store2.count(active_only=False) == mem_count, "no memory lost across rebuild"
     finally:
         store2.close()

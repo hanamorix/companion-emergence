@@ -13,9 +13,12 @@ import os
 from pathlib import Path
 from typing import Any
 
+import httpx
 from mcp.server import Server
 from mcp.types import ImageContent, TextContent, Tool
 
+from brain import dev_constants
+from brain.bridge import state_file
 from brain.mcp_server.audit import log_invocation
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
@@ -23,10 +26,60 @@ from brain.tools import NELL_TOOL_NAMES
 from brain.tools.dispatch import dispatch
 from brain.tools.schemas import build_schemas
 
+# Tools dispatched to the running bridge over its local HTTP API instead of
+# in-process (INC-4, S9/S10): the per-turn MCP tool process never builds the
+# embedder/reranker/vector matrix for these — the bridge already holds them
+# as long-lived singletons (S11). No fallback: a bridge failure is an error
+# result, not a local model load (S10).
+_BRIDGE_ROUTED_TOOLS = frozenset({"search_memories"})
+
 # Must match brain.mcp_server.audit._RESULT_SUMMARY_MAX_CHARS — both
 # files truncate at the same boundary so the audit log preview length
 # stays consistent regardless of which truncation triggered first.
 _RESULT_SUMMARY_MAX_CHARS = 140
+
+
+def _search_via_bridge(persona_dir: Path, arguments: dict[str, Any]) -> dict:
+    """Forward a search_memories call to the running bridge over HTTP (INC-4).
+
+    Reads bridge.json for the port + bearer token (the same auth /health
+    uses, S54) and posts to POST /tools/search_memories. No fallback: any
+    failure here becomes an error result — nothing in this process ever
+    builds the embedder/reranker/vector matrix (S10).
+
+    Outcomes:
+      - bridge.json missing / no recorded port / connection refused/reset →
+        {"error": "bridge unreachable"}.
+      - call exceeds SEARCH_BRIDGE_TIMEOUT_S → {"error": "bridge timeout"}
+        (distinct from "unreachable", S39).
+      - non-200 response → {"error": "bridge error <status>"}.
+      - 200 → the bridge's JSON body, unchanged (byte-identical to an
+        in-bridge dispatch() call for the same args, C1b).
+
+    Any OTHER exception here (e.g. a malformed 200 body from resp.json())
+    is not caught locally — it propagates to _call_tool's own outer
+    try/except, which turns it into an {"error": ...} result and an
+    outcome="error" audit row. Fail-soft (S10) still holds end to end;
+    it's just handled one frame up, not inside this function.
+    """
+    state = state_file.read(persona_dir)
+    if state is None or state.port is None:
+        return {"error": "bridge unreachable"}
+    headers = {"Authorization": f"Bearer {state.auth_token}"} if state.auth_token else {}
+    try:
+        resp = httpx.post(
+            f"http://127.0.0.1:{state.port}/tools/search_memories",
+            json=arguments,
+            headers=headers,
+            timeout=dev_constants.SEARCH_BRIDGE_TIMEOUT_S,
+        )
+    except httpx.TimeoutException:
+        return {"error": "bridge timeout"}
+    except httpx.HTTPError:
+        return {"error": "bridge unreachable"}
+    if resp.status_code == 200:
+        return resp.json()
+    return {"error": f"bridge error {resp.status_code}"}
 
 
 def register_tools(
@@ -69,14 +122,17 @@ def register_tools(
             # Harmless for every tool outside dispatch()'s _PROVIDER_TOOLS set,
             # which is the only consumer of this kwarg.
             session_id = os.environ.get("NELL_MCP_SESSION_ID") or None
-            result = dispatch(
-                name,
-                arguments,
-                store=store,
-                hebbian=hebbian,
-                persona_dir=persona_dir,
-                session_id=session_id,
-            )
+            if name in _BRIDGE_ROUTED_TOOLS:
+                result = _search_via_bridge(persona_dir, arguments)
+            else:
+                result = dispatch(
+                    name,
+                    arguments,
+                    store=store,
+                    hebbian=hebbian,
+                    persona_dir=persona_dir,
+                    session_id=session_id,
+                )
             # Viewable-image result: read_file (and any future image-returning
             # tool) signals an image with a structured `image` key. Emit an MCP
             # ImageContent block so the model actually SEES the pixels under the

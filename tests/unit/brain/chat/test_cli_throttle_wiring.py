@@ -1,4 +1,8 @@
-"""engine.respond() must call cli_throttle.mark_interactive_active on every turn."""
+"""engine.respond() must call cli_throttle.note_user_message/note_reply_end on
+every turn (ram-spike-fix INC-6: replaces the retired mark_interactive_active
+call sites in engine.py — mark_interactive_active itself is KEPT in
+cli_throttle.py as a test/back-compat helper, but production code no longer
+calls it)."""
 
 from __future__ import annotations
 
@@ -33,13 +37,14 @@ def persona_dir(tmp_path: Path) -> Path:
 
 
 def test_respond_marks_interactive_active(persona_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """engine.respond must mark interactive-active so background CLI yields."""
+    """engine.respond must stamp chat activity (note_user_message) so
+    background CLI yields."""
     import brain.bridge.cli_throttle as throttle
 
     called: dict[str, int] = {"n": 0}
     monkeypatch.setattr(
         throttle,
-        "mark_interactive_active",
+        "note_user_message",
         lambda *a, **k: called.__setitem__("n", called["n"] + 1),
     )
 
@@ -58,7 +63,7 @@ def test_respond_marks_interactive_active(persona_dir: Path, monkeypatch: pytest
         store.close()
         hebbian.close()
 
-    assert called["n"] >= 1, "mark_interactive_active was not called by respond()"
+    assert called["n"] >= 1, "note_user_message was not called by respond()"
 
 
 def test_respond_degrades_to_full_suite_when_salience_raises(
@@ -113,20 +118,28 @@ def test_respond_degrades_to_full_suite_when_salience_raises(
 def test_respond_re_stamps_interactive_active_at_turn_end(
     persona_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """respond() must call mark_interactive_active at turn-END as well as turn-START.
+    """respond() must stamp activity at turn-END (note_reply_end) as well as
+    turn-START (note_user_message) — ram-spike-fix INC-6's exception-safe
+    split of the old single mark_interactive_active-twice shape (3376b2c1's
+    end-of-turn re-stamp rationale, preserved).
 
     A long LLM call (e.g. 5-minute tool round-trip) can exhaust the idle
     window before the turn finishes, letting a background job fire concurrently.
-    The second stamp just before ChatResult is returned resets the idle window
-    to turn-END.
+    The end-of-turn stamp (now in a `finally`, via the `respond` wrapper)
+    resets the idle window to turn-END even on an exception.
     """
     import brain.bridge.cli_throttle as throttle
 
-    called: dict[str, int] = {"n": 0}
+    called: dict[str, int] = {"start": 0, "end": 0}
     monkeypatch.setattr(
         throttle,
-        "mark_interactive_active",
-        lambda *a, **k: called.__setitem__("n", called["n"] + 1),
+        "note_user_message",
+        lambda *a, **k: called.__setitem__("start", called["start"] + 1),
+    )
+    monkeypatch.setattr(
+        throttle,
+        "note_reply_end",
+        lambda *a, **k: called.__setitem__("end", called["end"] + 1),
     )
 
     store = MemoryStore(db_path=":memory:")
@@ -144,7 +157,45 @@ def test_respond_re_stamps_interactive_active_at_turn_end(
         store.close()
         hebbian.close()
 
-    assert called["n"] >= 2, (
-        f"mark_interactive_active was called {called['n']} time(s); "
-        "expected ≥2 (start + end of turn)"
+    assert called["start"] >= 1 and called["end"] >= 1, (
+        f"note_user_message called {called['start']}x, note_reply_end called "
+        f"{called['end']}x; expected >=1 each (start + end of turn)"
+    )
+
+
+def test_respond_calls_note_reply_end_even_when_inner_body_raises(
+    persona_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exception-safety point of the respond()/_respond_inner() split
+    (ram-spike-fix INC-6): note_reply_end() must fire in a `finally` even
+    when the turn's own body raises, so the in-flight counter is never left
+    stuck (which would make is_chat_idle() report False forever)."""
+    import brain.chat.engine as engine_mod
+    from brain.bridge import cli_throttle
+
+    monkeypatch.setattr(
+        engine_mod,
+        "_respond_inner",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    cli_throttle.reset()
+    store = MemoryStore(db_path=":memory:")
+    hebbian = HebbianMatrix(db_path=":memory:")
+    try:
+        with pytest.raises(RuntimeError):
+            respond(
+                persona_dir,
+                "hello",
+                store=store,
+                hebbian=hebbian,
+                provider=FakeProvider(),
+                voice_md_override="# Nell\n\nHello.",
+            )
+    finally:
+        store.close()
+        hebbian.close()
+
+    assert cli_throttle._inflight_replies == 0, (  # noqa: SLF001 — the exact invariant under test
+        "an exception in the turn body must not leave the in-flight counter stuck"
     )

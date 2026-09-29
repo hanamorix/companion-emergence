@@ -40,46 +40,32 @@ logger = logging.getLogger(__name__)
 
 LOCKFILE = "bridge.json.lock"
 
-_LOCK_STALE_SECONDS = 120.0
-# Known UX edge (accepted): a crash followed by a relaunch within
-# _LOCK_STALE_SECONDS of the lock's mtime blocks startup until the window
-# passes. Single-user desktop app — acceptable; documented here.
+# S50/S56: real OS-level lock (like brain.utils.file_lock's sidecar pattern),
+# held for the bridge's whole process life and released by the OS itself on
+# crash or reboot — no pid-alive / age / health-probe staleness guessing.
+_IS_WINDOWS = sys.platform.startswith("win")
 
+if _IS_WINDOWS:
+    # msvcrt is a Windows-only stdlib module; importing on POSIX would fail
+    # at module load (mirrors brain.utils.file_lock's guard).
+    import msvcrt
+else:
+    import fcntl
 
-def _lock_age_seconds(path: Path) -> float:
-    try:
-        return max(0.0, time.time() - path.stat().st_mtime)
-    except OSError:
-        return 0.0
-
-
-def _archive_stale_lock(path: Path) -> None:
-    """Rename a stale lock to a timestamped .stale-* sibling as evidence —
-    never silently delete it."""
-    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    target = path.with_name(f"{path.name}.stale-{stamp}")
-    try:
-        path.replace(target)
-    except FileNotFoundError:
-        return
-
-
-def _recorded_bridge_health(persona_dir: Path) -> bool:
-    """True iff the recorded bridge port answers /health 200.
-
-    Safe against PID/port reuse BECAUSE /health requires bearer auth
-    (server.py — Depends(require_http_auth)): a stray process squatting the
-    recorded port fails the token check → non-200 → lock recovers. If /health
-    auth is ever relaxed, this recovery path silently breaks."""
-    s = state_file.read(persona_dir)
-    if s is None or s.port is None:
-        return False
-    headers = {"Authorization": f"Bearer {s.auth_token}"} if s.auth_token else {}
-    try:
-        r = httpx.get(f"http://127.0.0.1:{s.port}/health", headers=headers, timeout=0.5)
-        return r.status_code == 200
-    except httpx.HTTPError:
-        return False
+# Windows only: the byte range msvcrt.locking() locks/unlocks. Windows
+# mandatory byte-range locking blocks ANY overlapping I/O from another
+# handle — including a plain read — not just writes (unlike POSIX flock,
+# which is advisory and never blocks a read). A far, fixed offset well
+# beyond the file's real (tiny) content means a normal whole-file read of
+# that real content (which ends long before this offset) never overlaps
+# the locked range, so the pid at offset 0 stays plainly readable while
+# the lock is held (C18c) — no special "read only this sub-region" contract
+# for readers, and the pid sits at the SAME offset on both platforms.
+# msvcrt.locking locks a real byte range via LockFileEx even when nothing
+# has ever been written there; it does not require file content to exist
+# at that offset, and an os.ftruncate() to a smaller size afterward does
+# not release or move the lock (the lock is independent of current EOF).
+_WINDOWS_LOCK_OFFSET = 1 << 20  # 1 MiB
 
 
 def run_recovery_if_needed(persona_dir: Path) -> int | None:
@@ -115,62 +101,121 @@ def run_recovery_if_needed(persona_dir: Path) -> int | None:
 
 
 def acquire_lock(persona_dir: Path) -> int | None:
-    """Create the lockfile atomically. Returns fd on success, None on conflict."""
+    """Take the bridge's OS-level lock for the whole process life.
+
+    Same pattern as brain.utils.file_lock: open with O_CREAT (never O_EXCL —
+    the file itself is never recreated, only its lock contended for) and take
+    a non-blocking flock/msvcrt lock on that fd. A crash or reboot releases
+    the OS lock instantly, so there is no pid-alive / age / health-probe
+    staleness logic left to guess with (S50) — the lock IS the liveness
+    signal.
+
+    Returns the open fd (the caller must keep it open for the lock's
+    duration and pass it to release_lock) on success, or None if another
+    live process holds the lock.
+
+    The pid is written into the file for information only (S50) — never
+    read back to make a decision here. It sits at offset 0 on BOTH
+    platforms: on Windows the locked byte range is at a far fixed offset
+    (`_WINDOWS_LOCK_OFFSET`, see its own comment) well past the file's real
+    content, so a plain whole-file read never overlaps it; on POSIX flock
+    is advisory over the whole file regardless, so a reader was never
+    blocked there either way.
+    """
     path = persona_dir / LOCKFILE
+    fd = os.open(str(path), os.O_CREAT | os.O_RDWR)
     try:
-        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
-        os.write(fd, str(os.getpid()).encode())
-        return fd
-    except FileExistsError:
-        age = _lock_age_seconds(path)
-        try:
-            existing_text = path.read_text().strip()
-            existing_pid = int(existing_text)
-            if not state_file.pid_is_alive(existing_pid):
-                # Double-read guard: best-effort, NOT atomic (TOCTOU race between
-                # read and replace). Acceptable for a single-user desktop app; the
-                # stale lock is archived as evidence, never silently deleted.
-                if path.read_text().strip() != existing_text:
-                    return None
-                _archive_stale_lock(path)
-                return acquire_lock(persona_dir)
-            if age > _LOCK_STALE_SECONDS and not _recorded_bridge_health(persona_dir):
-                logger.warning(
-                    "recovering stale bridge lockfile with alive pid but dead health pid=%s age=%.1fs",
-                    existing_pid,
-                    age,
-                )
-                if path.read_text().strip() != existing_text:
-                    return None
-                _archive_stale_lock(path)
-                return acquire_lock(persona_dir)
-        except FileNotFoundError:
-            return acquire_lock(persona_dir)
-        except ValueError:
-            if age > _LOCK_STALE_SECONDS:
-                # Double-read guard (best-effort, not atomic — same TOCTOU caveat
-                # as the dead/alive-pid branches): if a concurrent starter replaced
-                # the corrupt lock with a valid one between our first read and now,
-                # bail rather than archive their live lock.
-                if path.read_text().strip() != existing_text:
-                    return None
-                logger.warning("recovering stale corrupt bridge lockfile age=%.1fs", age)
-                _archive_stale_lock(path)
-                return acquire_lock(persona_dir)
-        except OSError:
-            pass
+        if _IS_WINDOWS:
+            os.lseek(fd, _WINDOWS_LOCK_OFFSET, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        os.close(fd)
         return None
+
+    os.ftruncate(fd, 0)
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.write(fd, str(os.getpid()).encode())
+    return fd
 
 
 def release_lock(persona_dir: Path, fd: int) -> None:
+    """Unlock and close the fd. Never unlinks the file (S56) — unlinking
+
+    would let a second process create a NEW file under the same name and
+    lock THAT one, so two processes could each believe they hold "the"
+    bridge lock on two different inodes."""
+    try:
+        if _IS_WINDOWS:
+            os.lseek(fd, _WINDOWS_LOCK_OFFSET, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
     try:
         os.close(fd)
     except OSError:
         pass
+
+
+def _kill_if_alive(pid: int, sig: int) -> bool:
+    """``os.kill(pid, sig)``, tolerating "already dead" identically on both
+    platforms. Returns True if the pid was alive and got signaled, False if
+    it was already dead.
+
+    POSIX: a dead pid raises ``ProcessLookupError``. Windows: ``os.kill``'s
+    ``TerminateProcess``-based implementation instead raises a plain
+    ``OSError`` with ``winerror == 87`` (ERROR_INVALID_PARAMETER) for an
+    already-exited pid — a documented CPython-on-Windows quirk, NOT
+    ``ProcessLookupError`` — so it must be checked for explicitly rather
+    than assumed covered by the POSIX exception type. (CI 2026-09-26:
+    windows-latest hit exactly this, unhandled, inside cmd_start's
+    readiness-timeout orphan-kill path.)
+    """
     try:
-        (persona_dir / LOCKFILE).unlink()
-    except FileNotFoundError:
-        pass
+        os.kill(pid, sig)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError as exc:
+        if _IS_WINDOWS and getattr(exc, "winerror", None) == 87:
+            return False
+        raise
+
+
+def _path_eq(p1: str, p2: str) -> bool:
+    return p1 == p2 or os.path.normcase(p1) == os.path.normcase(p2)
+
+
+def bridge_python() -> tuple[str, dict[str, str] | None]:
+    """The interpreter (and env, or None to inherit) to spawn a bridge child with,
+    such that the spawned process's pid IS the runner's own ``os.getpid()``.
+
+    Windows venv: ``sys.executable`` (``.venv\\Scripts\\python.exe``) is the
+    venv *redirector* (``venvlauncher.exe``, used by both ``python -m venv``
+    and uv), which starts the real base interpreter as a SECOND process. So
+    ``Popen(...).pid`` is the redirector's pid, while the runner writes its
+    own (different) ``os.getpid()`` into bridge.json. ``cmd_start``'s
+    readiness check (``s.pid == pid``) could then never match: a healthy
+    bridge was reported as failed after the full 50s wait and its
+    redirector killed. Same fix as the stdlib's own
+    ``multiprocessing.popen_spawn_win32``: launch ``sys._base_executable``
+    directly and pass the venv via ``__PYVENV_LAUNCHER__``, exactly what the
+    redirector itself would have done, minus the extra process.
+
+    Everywhere else (POSIX, where a venv python is a symlink/copy with no
+    redirector; or a non-venv Windows runtime such as the bundled
+    python-build-standalone one) this is plain ``sys.executable``, env
+    inherited.
+    """
+    base = getattr(sys, "_base_executable", None)
+    if _IS_WINDOWS and base and not _path_eq(sys.executable, base):
+        env = os.environ.copy()
+        env["__PYVENV_LAUNCHER__"] = sys.executable
+        return base, env
+    return sys.executable, None
 
 
 def spawn_detached(
@@ -179,11 +224,47 @@ def spawn_detached(
     client_origin: str,
     log_path: Path,
 ) -> int:
-    """Spawn the bridge server in a detached process. Returns child pid."""
+    """Spawn the bridge server in a detached process. Returns child pid —
+    the runner's own pid on every OS (see ``bridge_python``).
+
+    The Popen handle is kept in ``_spawned_children`` (keyed by that pid) so
+    ``cmd_start`` can notice promptly, via ``Popen.poll()``, that the child
+    already exited (e.g. lost the bridge lock) instead of waiting out its
+    whole readiness window. ``poll()`` and not a pid-alive probe: on POSIX an
+    exited-but-unreaped child is a zombie that ``os.kill(pid, 0)`` still
+    reports alive, and ``poll()`` is also what reaps it.
+    """
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_fh = open(log_path, "ab")  # noqa: SIM115
-    cmd = [
-        sys.executable,
+    python, env = bridge_python()
+    popen_extra: dict[str, object] = {} if env is None else {"env": env}
+    cmd = [python, *_runner_argv(persona_dir, idle_shutdown_seconds, client_origin)]
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            **popen_extra,
+        )
+        _spawned_children[proc.pid] = proc
+        return proc.pid
+    finally:
+        log_fh.close()
+
+
+# pid -> Popen for children spawn_detached started and cmd_start has not yet
+# finished waiting on (cmd_start pops its own entry). See spawn_detached.
+_spawned_children: dict[int, subprocess.Popen] = {}
+
+
+def _runner_argv(
+    persona_dir: Path, idle_shutdown_seconds: float | None, client_origin: str
+) -> list[str]:
+    """The bridge child's argv after the interpreter (see spawn_detached)."""
+    argv = [
         "-P",  # -m would put the caller's cwd (maybe a checkout's brain/) on sys.path
         "-m",
         "brain.bridge.runner",
@@ -193,19 +274,21 @@ def spawn_detached(
         client_origin,
     ]
     if idle_shutdown_seconds is not None:
-        cmd += ["--idle-shutdown-seconds", str(idle_shutdown_seconds)]
+        argv += ["--idle-shutdown-seconds", str(idle_shutdown_seconds)]
+    return argv
 
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=log_fh,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        return proc.pid
-    finally:
-        log_fh.close()
+
+# S57: cmd_start's refusal paths keep their existing wording, byte-identical.
+_LOCK_HELD_MSG = "bridge already starting (lockfile held)"
+
+
+def _refuse_already_running(persona_dir: Path, out: dict | None) -> int:
+    """cmd_start's state-file "already running" refusal (S57 wording). Returns 2."""
+    cur = state_file.read(persona_dir)
+    print(f"bridge already running on port {cur.port} (pid {cur.pid})", file=sys.stderr)
+    if out is not None and cur is not None and cur.pid is not None and cur.port is not None:
+        out["readiness"] = BridgeReadiness(pid=cur.pid, port=cur.port, auth_token=cur.auth_token)
+    return 2
 
 
 @dataclass
@@ -242,13 +325,7 @@ def cmd_start(args, *, out: dict | None = None) -> int:
         return 1
 
     if state_file.is_running(persona_dir):
-        cur = state_file.read(persona_dir)
-        print(f"bridge already running on port {cur.port} (pid {cur.pid})", file=sys.stderr)
-        if out is not None and cur is not None and cur.pid is not None and cur.port is not None:
-            out["readiness"] = BridgeReadiness(
-                pid=cur.pid, port=cur.port, auth_token=cur.auth_token
-            )
-        return 2
+        return _refuse_already_running(persona_dir, out)
 
     # Hold the lock through recovery (so two concurrent starters can't both
     # recover), then RELEASE it right before spawning. The bridge PROCESS — the
@@ -258,7 +335,7 @@ def cmd_start(args, *, out: dict | None = None) -> int:
     # v0.0.36). The runner's lifetime lock is the real guard against two bridges.
     fd = acquire_lock(persona_dir)
     if fd is None:
-        print("bridge already starting (lockfile held)", file=sys.stderr)
+        print(_LOCK_HELD_MSG, file=sys.stderr)
         return 2
 
     client_origin = getattr(args, "client_origin", "cli")
@@ -281,6 +358,15 @@ def cmd_start(args, *, out: dict | None = None) -> int:
     idle = float(args.idle_shutdown) * 60 if args.idle_shutdown > 0 else None
     release_lock(persona_dir, fd)  # hand the lock to the child runner
     pid = spawn_detached(persona_dir, idle, client_origin, log_path)
+    try:
+        return _await_readiness(persona_dir, pid, log_path, out)
+    finally:
+        _spawned_children.pop(pid, None)
+
+
+def _await_readiness(persona_dir: Path, pid: int, log_path: Path, out: dict | None) -> int:
+    """cmd_start's readiness wait for the child it just spawned (see cmd_start)."""
+    proc = _spawned_children.get(pid)
 
     # Readiness window: Windows cold-boot (recovery + persona load + soul review)
     # routinely exceeds 5s; the old 5s deadline killed a healthy-but-slow bridge.
@@ -305,12 +391,30 @@ def cmd_start(args, *, out: dict | None = None) -> int:
                         )
                     return 0
             except httpx.HTTPError:
-                continue
+                pass
+        # The child already exited without becoming ready: stop waiting now,
+        # not at the deadline. poll() is None for a child still starting up,
+        # so a slow start never trips this; with bridge_python() the Popen is
+        # the runner itself (and a Windows venv redirector, were one in
+        # between, stays alive exactly as long as the runner it wraps).
+        rc = proc.poll() if proc is not None else None
+        if rc is not None:
+            if rc == 2:
+                # runner.main's own refusal (S57): a live bridge is recorded,
+                # or another starter's child holds the lock. Same wording as
+                # cmd_start's own two refusal paths.
+                if state_file.is_running(persona_dir):
+                    return _refuse_already_running(persona_dir, out)
+                print(_LOCK_HELD_MSG, file=sys.stderr)
+                return 2
+            print(
+                f"bridge process (pid {pid}) exited with code {rc} before becoming ready. "
+                f"Inspect log at {log_path}",
+                file=sys.stderr,
+            )
+            return 1
     # Readiness failed — kill the orphan child and tell the user where to look.
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass  # already dead
+    _kill_if_alive(pid, signal.SIGTERM)  # already-dead is fine either way
     print(
         f"bridge spawned (pid {pid}) but /health did not respond in 50s — "
         f"killed orphan child. Inspect log at {log_path}",
@@ -403,9 +507,7 @@ def cmd_stop(args) -> int:
                     "Recovery will snapshot active sessions non-destructively on next start.",
                     file=sys.stderr,
                 )
-                try:
-                    os.kill(s.pid, signal.SIGTERM)  # TerminateProcess on Windows — explicit, logged, dirty by design
-                except ProcessLookupError:
+                if not _kill_if_alive(s.pid, signal.SIGTERM):  # TerminateProcess on Windows — explicit, logged, dirty by design
                     print("bridge not running")
                     return 0
             else:
@@ -417,9 +519,7 @@ def cmd_stop(args) -> int:
                 return 1
         else:
             logger.warning("shutdown endpoint failed; falling back to SIGTERM on POSIX", exc_info=True)
-            try:
-                os.kill(s.pid, signal.SIGTERM)
-            except ProcessLookupError:
+            if not _kill_if_alive(s.pid, signal.SIGTERM):
                 print("bridge not running")
                 return 0
 

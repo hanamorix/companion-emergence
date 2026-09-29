@@ -18,6 +18,13 @@ import pytest
 from brain.bridge import daemon
 
 
+@pytest.fixture(autouse=True)
+def _isolated_spawned_children(monkeypatch: pytest.MonkeyPatch) -> None:
+    """spawn_detached records each Popen in a module dict; keep fakes from
+    leaking across tests."""
+    monkeypatch.setattr(daemon, "_spawned_children", {})
+
+
 def _args(persona: str, **kw) -> argparse.Namespace:
     ns = argparse.Namespace(persona=persona, idle_shutdown=30, client_origin="cli", timeout=180.0)
     for k, v in kw.items():
@@ -150,25 +157,6 @@ def _patch_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, persona: str =
     return log_dir
 
 
-def test_acquire_lock_does_not_unlink_new_lock_after_stale_read(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    persona_dir = tmp_path / "persona"
-    persona_dir.mkdir()
-    lock_path = persona_dir / daemon.LOCKFILE
-    lock_path.write_text("999999", encoding="utf-8")
-
-    def fake_pid_is_alive(_pid: int) -> bool:
-        lock_path.write_text("123456", encoding="utf-8")
-        return False
-
-    monkeypatch.setattr(daemon.state_file, "pid_is_alive", fake_pid_is_alive)
-
-    assert daemon.acquire_lock(persona_dir) is None
-    assert lock_path.read_text(encoding="utf-8") == "123456"
-
-
 # ---------- cmd_run ----------
 
 
@@ -202,7 +190,12 @@ def test_cmd_run_calls_foreground_runner_without_detaching(
         "client_origin": "launchd",
         "idle_shutdown_seconds": None,
     }
-    assert not (persona_dir / daemon.LOCKFILE).exists()
+    # S56: release_lock never unlinks — the lock file persists after release,
+    # only the OS-level lock on it is dropped (a fresh acquire must succeed).
+    assert (persona_dir / daemon.LOCKFILE).exists()
+    fd = daemon.acquire_lock(persona_dir)
+    assert fd is not None
+    daemon.release_lock(persona_dir, fd)
 
 
 def test_cmd_run_converts_idle_shutdown_minutes(
@@ -721,46 +714,167 @@ def test_acquire_lock_succeeds_on_fresh_persona_dir(tmp_path: Path) -> None:
     assert fd is not None
     assert (persona_dir / daemon.LOCKFILE).exists()
     daemon.release_lock(persona_dir, fd)
-    assert not (persona_dir / daemon.LOCKFILE).exists()
+    # S56: release_lock NEVER unlinks — the file persists, only the OS lock
+    # on it is dropped.
+    assert (persona_dir / daemon.LOCKFILE).exists()
 
 
-def test_acquire_lock_returns_none_when_existing_pid_alive(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    persona_dir = tmp_path / "persona"
-    persona_dir.mkdir()
-    (persona_dir / daemon.LOCKFILE).write_text("12345", encoding="utf-8")
-    monkeypatch.setattr(daemon.state_file, "pid_is_alive", lambda _pid: True)
-    assert daemon.acquire_lock(persona_dir) is None
-    # Lock untouched.
-    assert (persona_dir / daemon.LOCKFILE).read_text(encoding="utf-8") == "12345"
-
-
-def test_acquire_lock_recovers_stale_lockfile(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Existing lock holds a dead pid → unlink + re-acquire."""
-    persona_dir = tmp_path / "persona"
-    persona_dir.mkdir()
-    (persona_dir / daemon.LOCKFILE).write_text("99999", encoding="utf-8")
-    monkeypatch.setattr(daemon.state_file, "pid_is_alive", lambda _pid: False)
-    fd = daemon.acquire_lock(persona_dir)
-    assert fd is not None
-    # New lockfile holds our pid.
-    assert (persona_dir / daemon.LOCKFILE).read_text(encoding="utf-8") == str(os.getpid())
-    daemon.release_lock(persona_dir, fd)
-
-
-def test_acquire_lock_returns_none_on_garbage_pid(
+def test_acquire_lock_content_is_irrelevant_only_the_os_lock_matters(
     tmp_path: Path,
 ) -> None:
-    """Lockfile contains non-integer text → ValueError caught, return None."""
+    """A pre-existing lockfile with arbitrary/garbage content (a leftover pid,
+    non-integer garbage, or nothing at all) does not itself block a fresh
+    acquire — S50 removed all pid/content-based staleness guessing. The ONLY
+    thing that can refuse an acquire is another process actually holding the
+    OS-level lock right now (covered by the contention tests below)."""
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
     (persona_dir / daemon.LOCKFILE).write_text("not-a-pid", encoding="utf-8")
-    assert daemon.acquire_lock(persona_dir) is None
+
+    fd = daemon.acquire_lock(persona_dir)
+    assert fd is not None
+    # Content is truncated and replaced with our own pid on success.
+    assert (persona_dir / daemon.LOCKFILE).read_bytes().count(str(os.getpid()).encode()) == 1
+    daemon.release_lock(persona_dir, fd)
+
+
+def test_acquire_lock_c18a_kill_then_restart_acquires_immediately_no_archive(
+    tmp_path: Path,
+) -> None:
+    """C18(a): kill -9 the bridge (simulated: the OS drops the flock/msvcrt
+    lock the instant the holding fd is closed, exactly what happens when a
+    process is SIGKILLed — no cleanup code runs either way); the next start
+    acquires the lock immediately (< 1s), with no 120s wait and no
+    `.stale-*` archive file created (that whole mechanism, and the file it
+    used to write, no longer exists)."""
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+
+    fd1 = daemon.acquire_lock(persona_dir)
+    assert fd1 is not None
+    # Simulate a SIGKILL: the process dies without running release_lock, but
+    # the kernel still releases the OS-level lock on fd close. Closing the
+    # bare fd (bypassing release_lock's unlock+close) reproduces exactly that.
+    os.close(fd1)
+
+    started = time.time()
+    fd2 = daemon.acquire_lock(persona_dir)
+    elapsed = time.time() - started
+
+    assert fd2 is not None
+    assert elapsed < 1.0
+    assert list(persona_dir.glob("bridge.json.lock.stale-*")) == []
+    daemon.release_lock(persona_dir, fd2)
+
+
+def test_acquire_lock_c18b_reboot_with_pid_reuse_acquires_immediately(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C18(b): simulated reboot with pid reuse — the lock file's leftover
+    content names the pid of a live, unrelated process (a reboot clears all
+    OS locks but the lock FILE itself, being on disk, survives with its old
+    content). No process holds the OS lock. A start must still acquire
+    immediately: pid liveness is never consulted."""
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    # Leftover content names a pid that IS alive (this test process itself)
+    # but is unrelated to any bridge — the reboot dropped the real lock.
+    (persona_dir / daemon.LOCKFILE).write_text(str(os.getpid()), encoding="utf-8")
+    # Even if something still consulted liveness, it would say "alive" here —
+    # proving the acquire below does NOT consult it at all.
+    monkeypatch.setattr(daemon.state_file, "pid_is_alive", lambda _pid: True)
+
+    started = time.time()
+    fd = daemon.acquire_lock(persona_dir)
+    elapsed = time.time() - started
+
+    assert fd is not None
+    assert elapsed < 1.0
+    daemon.release_lock(persona_dir, fd)
+
+
+def test_acquire_lock_c18c_pid_readable_by_another_reader_while_held(
+    tmp_path: Path,
+) -> None:
+    """C18(c): while a bridge holds the lock, a second process can still read
+    the pid from the lock file. On POSIX the pid sits at offset 0 (flock is
+    advisory; reads are never blocked). On Windows the pid ALSO sits at
+    offset 0 — the locked byte is at a far offset instead (see
+    `_WINDOWS_LOCK_OFFSET`'s own comment: an earlier layout locked byte 0
+    and pushed the pid to offset 1, which windows-latest CI caught as a
+    real `PermissionError` here, since a whole-file read still overlaps a
+    locked byte 0 even though the pid itself sat past it) — this assertion
+    is offset-agnostic (it just looks for the pid's digits anywhere in the
+    file) so it holds unmodified on a real Windows CI runner too."""
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    fd = daemon.acquire_lock(persona_dir)
+    assert fd is not None
+    try:
+        raw = (persona_dir / daemon.LOCKFILE).read_bytes()
+        assert str(os.getpid()).encode() in raw
+    finally:
+        daemon.release_lock(persona_dir, fd)
+
+
+def test_acquire_lock_c19_two_racing_acquires_exactly_one_wins(tmp_path: Path) -> None:
+    """C19(b)-equivalent at the acquire_lock layer (the exclusive point
+    runner.main relies on, S57): two threads racing acquire_lock on the same
+    persona dir at once — exactly one gets a live fd, the other gets None.
+    A real two-child-process race (tests/bridge/test_runner_mutual_exclusion.py)
+    exercises the same guarantee through runner.main end to end; this proves
+    the exclusion itself, at the primitive the plan names as the one
+    exclusive point."""
+    import threading
+
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    barrier = threading.Barrier(2)
+    results: list[int | None] = [None, None]
+
+    def _race(i: int) -> None:
+        barrier.wait()
+        results[i] = daemon.acquire_lock(persona_dir)
+
+    threads = [threading.Thread(target=_race, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5.0)
+
+    winners = [fd for fd in results if fd is not None]
+    losers = [fd for fd in results if fd is None]
+    assert len(winners) == 1
+    assert len(losers) == 1
+    daemon.release_lock(persona_dir, winners[0])
+
+
+def test_release_lock_never_unlinks_and_inode_is_stable(tmp_path: Path) -> None:
+    """C19(c): the lock file's inode is the same before and after acquire +
+    release, and release never unlinks it — spied via os.unlink."""
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    fd = daemon.acquire_lock(persona_dir)
+    assert fd is not None
+    lock_path = persona_dir / daemon.LOCKFILE
+    inode_before = lock_path.stat().st_ino
+
+    unlink_calls: list[Path] = []
+    real_unlink = os.unlink
+
+    def spy_unlink(path, *a, **kw):
+        unlink_calls.append(Path(str(path)))
+        return real_unlink(path, *a, **kw)
+
+    import unittest.mock
+
+    with unittest.mock.patch("os.unlink", side_effect=spy_unlink):
+        daemon.release_lock(persona_dir, fd)
+
+    assert unlink_calls == []
+    assert lock_path.exists()
+    assert lock_path.stat().st_ino == inode_before
 
 
 def test_release_lock_is_idempotent_after_external_unlink(
@@ -797,7 +911,8 @@ def test_spawn_detached_invokes_popen_with_detach_flags(
     class FakeProc:
         pid = 4242
 
-    def fake_popen(cmd, *, stdout, stderr, stdin, start_new_session):
+    def fake_popen(cmd, *, stdout, stderr, stdin, start_new_session, **_kw):
+        # **_kw: `env` is passed on a Windows venv (see bridge_python).
         captured["cmd"] = cmd
         captured["start_new_session"] = start_new_session
         captured["stderr"] = stderr
@@ -820,7 +935,7 @@ def test_spawn_detached_invokes_popen_with_detach_flags(
     assert captured["stdin"] is subprocess.DEVNULL
     assert captured["stdout_is_file"] is True
     cmd = captured["cmd"]
-    assert sys.executable in cmd
+    assert cmd[0] == daemon.bridge_python()[0]
     assert "-m" in cmd and "brain.bridge.runner" in cmd
     assert "--persona-dir" in cmd
     assert "--client-origin" in cmd and "cli" in cmd
@@ -849,7 +964,79 @@ def test_spawn_detached_isolates_the_bridge_from_the_callers_cwd(
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
     daemon.spawn_detached(persona_dir, None, "cli", tmp_path / "bridge.log")
-    assert captured["cmd"][:4] == [sys.executable, "-P", "-m", "brain.bridge.runner"]
+    assert captured["cmd"][:4] == [daemon.bridge_python()[0], "-P", "-m", "brain.bridge.runner"]
+
+
+def _capture_spawn(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    captured: dict[str, object] = {}
+
+    class FakeProc:
+        pid = 7
+
+    def fake_popen(cmd, **kw):
+        captured["cmd"] = cmd
+        captured["kw"] = kw
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    daemon.spawn_detached(persona_dir, None, "cli", tmp_path / "bridge.log")
+    return captured
+
+
+def test_spawn_detached_windows_venv_launches_base_interpreter_not_the_redirector(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows venv: sys.executable is the venv redirector, which runs the real
+    interpreter as a SECOND process, so Popen.pid != the runner's os.getpid()
+    and cmd_start's `s.pid == pid` readiness match could never succeed (the
+    C19(a) windows-latest failure). Spawn the base interpreter directly with
+    __PYVENV_LAUNCHER__, like multiprocessing.popen_spawn_win32 does."""
+    venv_py = str(tmp_path / "venv" / "Scripts" / "python.exe")
+    base_py = str(tmp_path / "base" / "python.exe")
+    monkeypatch.setattr(daemon, "_IS_WINDOWS", True)
+    monkeypatch.setattr(sys, "executable", venv_py)
+    monkeypatch.setattr(sys, "_base_executable", base_py, raising=False)
+    monkeypatch.setenv("KEEP_ME", "1")
+
+    captured = _capture_spawn(tmp_path, monkeypatch)
+    assert captured["cmd"][:4] == [base_py, "-P", "-m", "brain.bridge.runner"]
+    env = captured["kw"]["env"]
+    assert env["__PYVENV_LAUNCHER__"] == venv_py
+    assert env["KEEP_ME"] == "1"  # rest of the environment still inherited
+
+
+def test_spawn_detached_windows_non_venv_uses_sys_executable_and_inherits_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bundled python-build-standalone runtime (no venv): no redirector, so
+    nothing changes — sys.executable, env inherited."""
+    py = str(tmp_path / "python-runtime" / "python.exe")
+    monkeypatch.setattr(daemon, "_IS_WINDOWS", True)
+    monkeypatch.setattr(sys, "executable", py)
+    monkeypatch.setattr(sys, "_base_executable", py, raising=False)
+
+    captured = _capture_spawn(tmp_path, monkeypatch)
+    assert captured["cmd"][0] == py
+    assert "env" not in captured["kw"]
+
+
+def test_spawn_detached_posix_venv_uses_sys_executable_and_inherits_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POSIX venv python is a symlink/copy, not a redirector: spawning
+    sys._base_executable there would LOSE the venv, so it must not."""
+    monkeypatch.setattr(daemon, "_IS_WINDOWS", False)
+    monkeypatch.setattr(sys, "executable", "/v/bin/python")
+    monkeypatch.setattr(sys, "_base_executable", "/usr/bin/python3", raising=False)
+
+    captured = _capture_spawn(tmp_path, monkeypatch)
+    assert captured["cmd"][0] == "/v/bin/python"
+    assert "env" not in captured["kw"]
 
 
 def test_spawn_detached_omits_idle_arg_when_none(
@@ -1567,97 +1754,316 @@ def test_cmd_stop_on_windows_does_not_fallback_to_sigterm_when_http_fails(
     assert "shutdown endpoint unreachable" in capsys.readouterr().err
 
 
-def test_acquire_lock_recovers_old_garbage_lockfile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cmd_start_refusal_wording_is_byte_identical(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    """C28: both refusal strings are byte-identical to today's wording — the
+    state-file pre-check ("bridge already running on port … (pid …)") and
+    the lock branch ("bridge already starting (lockfile held)"). Neither
+    changed shape when the lock mechanism underneath them did."""
+    from brain.bridge import state_file
+
+    _patch_paths(monkeypatch, tmp_path)
+    persona_dir = tmp_path / "home" / "personas" / "nell"
+    state_file.write(
+        persona_dir,
+        state_file.BridgeState(
+            persona="nell", pid=555, port=51500, started_at="2026-05-08T00:00:00+00:00",
+            stopped_at=None, shutdown_clean=False, client_origin="cli",
+        ),
+    )
+    monkeypatch.setattr(state_file, "is_running", lambda _p: True)
+    rc = daemon.cmd_start(_args("nell"))
+    assert rc == 2
+    assert "bridge already running on port 51500 (pid 555)" in capsys.readouterr().err
+
+    # Second refusal path: is_running False but the OS lock is already held.
+    monkeypatch.setattr(state_file, "is_running", lambda _p: False)
+    held_fd = daemon.acquire_lock(persona_dir)
+    assert held_fd is not None
+    try:
+        monkeypatch.setattr(daemon, "acquire_lock", lambda _p: None)
+        rc = daemon.cmd_start(_args("nell"))
+        assert rc == 2
+        assert "bridge already starting (lockfile held)" in capsys.readouterr().err
+    finally:
+        daemon.release_lock(persona_dir, held_fd)
+
+
+def test_c14_fcntl_and_msvcrt_imports_are_platform_gated() -> None:
+    """C14 (lock part): no Linux/POSIX-only or Windows-only mechanism is
+    reachable on the required path regardless of platform — `fcntl` must
+    only ever be imported under the non-Windows branch of the `_IS_WINDOWS`
+    guard, `msvcrt` only under the Windows branch, and neither name may be
+    imported anywhere else in the module — via ANY import form (`import X`,
+    `import X as y`, or `from X import ...`), not just a plain `import X`
+    (a red-team pass on an earlier draft of this test found it only checked
+    `ast.Import`, so an ungated `from fcntl import flock` elsewhere in the
+    module would have slipped past every assertion undetected)."""
+    import ast
+    import inspect
+
+    source = inspect.getsource(daemon)
+    tree = ast.parse(source)
+
+    def touched_module_names(nodes: list[ast.AST]) -> list[str]:
+        """Every module name touched by an Import or ImportFrom anywhere in
+        the given subtrees, regardless of import form or nesting depth."""
+        hits: list[str] = []
+        for top in nodes:
+            for sub in ast.walk(top):
+                if isinstance(sub, ast.Import):
+                    hits.extend(alias.name for alias in sub.names)
+                elif isinstance(sub, ast.ImportFrom) and sub.module:
+                    hits.append(sub.module)
+        return hits
+
+    guard = next(
+        (
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.If) and "_IS_WINDOWS" in ast.unparse(node.test)
+        ),
+        None,
+    )
+    assert guard is not None, "expected a top-level `if ... _IS_WINDOWS` guard"
+    assert "msvcrt" in touched_module_names(guard.body)
+    assert "fcntl" in touched_module_names(guard.orelse)
+
+    # Whole-module count: each name must appear as an import target EXACTLY
+    # once — i.e. only at its one gated site above, never anywhere else
+    # (module level, inside a function, via any import form).
+    all_hits = touched_module_names([tree])
+    assert all_hits.count("fcntl") == 1, "fcntl must be imported at exactly one (gated) site"
+    assert all_hits.count("msvcrt") == 1, "msvcrt must be imported at exactly one (gated) site"
+
+
+# ---------- Windows CI regression, 2026-09-26: pid readability + os.kill quirk ----------
+#
+# windows-latest CI (run 36285257761 @ ff16de6c) failed on:
+#  1/2. test_acquire_lock_c18c_pid_readable_by_another_reader_while_held and
+#       test_acquire_lock_content_is_irrelevant_only_the_os_lock_matters:
+#       PermissionError [Errno 13] reading the lock file while held. Windows
+#       byte-range locking blocks ANY overlapping I/O from another handle —
+#       including reads — unlike POSIX flock (advisory, never blocks a
+#       read). The old layout locked byte 0 and put the pid at offset 1; a
+#       whole-file read from offset 0 overlaps the locked byte and fails as
+#       a whole, even though the pid itself (offset 1+) was never actually
+#       locked. Fixed by locking a FAR, fixed offset (_WINDOWS_LOCK_OFFSET,
+#       1 MiB) instead — the file's real (tiny) content never reaches that
+#       far, so a plain whole-file read no longer overlaps the lock at all,
+#       and the pid can go back to offset 0 on both platforms symmetrically.
+#  3.   test_c19a_two_cmd_starts_forced_into_handoff_window: an unhandled
+#       thread exception from cmd_start's readiness-timeout orphan-kill path
+#       — os.kill(pid, SIGTERM) on an already-exited pid raises a plain
+#       OSError with winerror 87 on Windows (not ProcessLookupError, which
+#       is what the code only caught). Fixed with the shared
+#       _kill_if_alive() helper above cmd_start/cmd_stop.
+#
+# No Windows host is available here; the tests below exercise the Windows
+# code paths structurally by monkeypatching `daemon._IS_WINDOWS` and a fake
+# msvcrt module standing in for the real one (which only exists on real
+# Windows) — real CI verification is still required and is out of this
+# run's reach.
+
+
+class _FakeMsvcrt:
+    """Stands in for the real (Windows-only) msvcrt module so the Windows
+    branch of acquire_lock/release_lock can be exercised on any platform.
+    Records the REAL fd position (queried via a real os.lseek(fd, 0,
+    SEEK_CUR), which does not move it) at the moment `locking()` is called
+    — this is the actual position the production code's own real
+    `os.lseek(fd, _WINDOWS_LOCK_OFFSET, ...)` call left the fd at, so this
+    genuinely proves which offset the lock call targeted, not merely what
+    the fake was told to expect."""
+
+    LK_NBLCK = 2
+    LK_UNLCK = 0
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, int, int]] = []  # (mode, fd_position_at_call, nbytes)
+
+    def locking(self, fd: int, mode: int, nbytes: int) -> None:
+        pos = os.lseek(fd, 0, os.SEEK_CUR)
+        self.calls.append((mode, pos, nbytes))
+
+
+def test_acquire_lock_windows_path_locks_far_offset_pid_stays_at_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows-path structural regression test for CI failures 1/2 above:
+    the lock call must target `_WINDOWS_LOCK_OFFSET`, NOT offset 0 — and the
+    pid must land at real offset 0 in the file regardless, so a plain
+    whole-file read (what the failing tests do) never overlaps the lock."""
+    fake = _FakeMsvcrt()
+    monkeypatch.setattr(daemon, "_IS_WINDOWS", True)
+    monkeypatch.setattr(daemon, "msvcrt", fake, raising=False)
+
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
     lock_path = persona_dir / daemon.LOCKFILE
-    lock_path.write_text("not-a-pid", encoding="utf-8")
-    old = time.time() - 600
-    os.utime(lock_path, (old, old))
 
     fd = daemon.acquire_lock(persona_dir)
-
     assert fd is not None
-    assert lock_path.read_text(encoding="utf-8") == str(os.getpid())
-    stale_files = list(persona_dir.glob("bridge.json.lock.stale-*"))
-    assert stale_files, "old corrupt lock should be preserved as stale evidence"
-    daemon.release_lock(persona_dir, fd)
+    try:
+        assert len(fake.calls) == 1
+        mode, pos, nbytes = fake.calls[0]
+        assert mode == fake.LK_NBLCK
+        assert nbytes == 1
+        assert pos == daemon._WINDOWS_LOCK_OFFSET, (
+            "the lock call must target the far offset, not offset 0 — "
+            "locking offset 0 is exactly what made a plain read fail on "
+            "real Windows CI"
+        )
+        # The pid itself must be readable via a plain whole-file read —
+        # this is what PermissionError'd on real Windows before the fix.
+        raw = lock_path.read_bytes()
+        assert raw == str(os.getpid()).encode()
+    finally:
+        daemon.release_lock(persona_dir, fd)
+
+    assert len(fake.calls) == 2
+    unlock_mode, unlock_pos, unlock_nbytes = fake.calls[1]
+    assert unlock_mode == fake.LK_UNLCK
+    assert unlock_nbytes == 1
+    assert unlock_pos == daemon._WINDOWS_LOCK_OFFSET
 
 
-def test_acquire_lock_blocks_recent_garbage_lockfile(tmp_path: Path) -> None:
-    persona_dir = tmp_path / "persona"
-    persona_dir.mkdir()
-    lock_path = persona_dir / daemon.LOCKFILE
-    lock_path.write_text("not-a-pid", encoding="utf-8")
-
-    assert daemon.acquire_lock(persona_dir) is None
-    assert lock_path.read_text(encoding="utf-8") == "not-a-pid"
+def test_kill_if_alive_signals_a_live_pid(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(daemon.os, "kill", lambda pid, sig: calls.append((pid, sig)))
+    assert daemon._kill_if_alive(4242, 15) is True
+    assert calls == [(4242, 15)]
 
 
-def test_acquire_lock_corrupt_branch_bails_if_lock_changed_under_race(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Double-read guard on the corrupt-lock branch: if a concurrent starter replaced
-    the corrupt lock with a valid one between our first read and the guard's re-read,
-    acquire_lock must return None without archiving the live lock.
+def test_kill_if_alive_posix_dead_pid_returns_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    """POSIX: ProcessLookupError -> False, swallowed, no raise."""
 
-    Simulation: patch pathlib.Path.read_text so that the second call (the guard
-    re-read) returns a different value than the first call (which seeded
-    existing_text).  The first call returns the original corrupt content; the
-    second returns a valid pid string, mimicking a concurrent write.
+    def fake_kill(pid, sig):
+        raise ProcessLookupError()
+
+    monkeypatch.setattr(daemon.os, "kill", fake_kill)
+    assert daemon._kill_if_alive(12345, 15) is False
+
+
+def test_kill_if_alive_windows_already_dead_pid_returns_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression test for CI failure 3 above: on Windows, os.kill on an
+    already-exited pid raises a plain OSError with winerror 87 — NOT
+    ProcessLookupError. Must be swallowed (return False), not left to crash
+    the caller (which is what happened, unhandled, inside a background
+    thread in test_c19a_two_cmd_starts_forced_into_handoff_window on real
+    windows-latest CI)."""
+    monkeypatch.setattr(daemon, "_IS_WINDOWS", True)
+
+    def fake_kill(pid, sig):
+        err = OSError("The parameter is incorrect")
+        err.winerror = 87
+        raise err
+
+    monkeypatch.setattr(daemon.os, "kill", fake_kill)
+    assert daemon._kill_if_alive(99999, 15) is False
+
+
+def test_kill_if_alive_windows_other_oserror_still_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only winerror 87 (already-dead) is swallowed on Windows — any other
+    OSError from os.kill is a real failure and must propagate."""
+    monkeypatch.setattr(daemon, "_IS_WINDOWS", True)
+
+    def fake_kill(pid, sig):
+        err = OSError("access is denied")
+        err.winerror = 5
+        raise err
+
+    monkeypatch.setattr(daemon.os, "kill", fake_kill)
+    with pytest.raises(OSError):
+        daemon._kill_if_alive(99999, 15)
+
+
+def test_kill_if_alive_posix_unrelated_oserror_still_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On POSIX (_IS_WINDOWS False), an OSError that happens to carry a
+    winerror-87-shaped attribute (which would never occur for real on
+    POSIX) must NOT be swallowed — the Windows-specific tolerance is gated
+    on platform, not merely on the attribute's value.
+
+    _IS_WINDOWS is explicitly forced False here (not read off the real
+    host) so this exercises the POSIX branch of `_kill_if_alive` on every
+    CI runner, including a real Windows one — the real host's own OS is a
+    separate, host-specific fact this test isn't about (see the sibling
+    `test_kill_if_alive_windows_*` tests for the Windows branch, forced
+    True the same way). An earlier version of this test asserted the real
+    `daemon._IS_WINDOWS` instead of forcing it, which correctly failed the
+    assertion itself when actually run on windows-latest CI (2026-09-27) —
+    not a wrong result, but the wrong thing to assert: the test's own
+    purpose (POSIX-branch behavior) is independent of the host it happens
+    to run on.
     """
-    persona_dir = tmp_path / "persona"
-    persona_dir.mkdir()
-    lock_path = persona_dir / daemon.LOCKFILE
-    lock_path.write_text("not-a-pid", encoding="utf-8")
-    old = time.time() - 600
-    os.utime(lock_path, (old, old))
+    monkeypatch.setattr(daemon, "_IS_WINDOWS", False)
 
-    original_read_text = Path.read_text
-    read_count = {"n": 0}
+    def fake_kill(pid, sig):
+        err = OSError("some other real POSIX error")
+        err.winerror = 87  # contrived: would never happen for real on POSIX
+        raise err
 
-    def patched_read_text(self, **kwargs):
-        result = original_read_text(self, **kwargs)
-        if self == lock_path:
-            read_count["n"] += 1
-            if read_count["n"] >= 2:
-                # Second read (the guard re-read): simulate concurrent replacement.
-                return "77777"
-        return result
-
-    monkeypatch.setattr(Path, "read_text", patched_read_text)
-
-    archived: list[object] = []
-    monkeypatch.setattr(daemon, "_archive_stale_lock", lambda p: archived.append(p))
-
-    result = daemon.acquire_lock(persona_dir)
-
-    # Guard fired: content changed → bail without archiving.
-    assert result is None
-    assert not archived, "archive must not be called when guard detects lock changed under race"
+    monkeypatch.setattr(daemon.os, "kill", fake_kill)
+    with pytest.raises(OSError):
+        daemon._kill_if_alive(99999, 15)
 
 
-def test_acquire_lock_recovers_old_alive_pid_when_bridge_health_is_dead(
+def test_cmd_start_kills_orphan_via_shared_helper_tolerating_windows_already_dead(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    persona_dir = tmp_path / "persona"
-    persona_dir.mkdir()
-    lock_path = persona_dir / daemon.LOCKFILE
-    lock_path.write_text("12345", encoding="utf-8")
-    old = time.time() - 600
-    os.utime(lock_path, (old, old))
+    """End-to-end regression for CI failure 3: cmd_start's own readiness-
+    timeout orphan-kill path must not crash even when the orphan pid has
+    already exited AND we're on the Windows os.kill-quirk path."""
+    import httpx
 
-    monkeypatch.setattr(daemon.state_file, "pid_is_alive", lambda _pid: True)
-    monkeypatch.setattr(daemon, "_recorded_bridge_health", lambda _persona_dir: False)
+    from brain.bridge import state_file
 
-    fd = daemon.acquire_lock(persona_dir)
+    _patch_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(state_file, "is_running", lambda _p: False)
+    monkeypatch.setattr(daemon, "run_recovery_if_needed", lambda _p: None)
+    monkeypatch.setattr(daemon, "_IS_WINDOWS", True)
+    # cmd_start's own pre-flight acquire_lock also takes the (now Windows-
+    # shaped) branch; stand in for the real (POSIX-only-here) msvcrt module
+    # so that real call succeeds structurally, same as the dedicated lock
+    # test above — this test is specifically about the os.kill quirk, not
+    # the lock mechanism itself.
+    monkeypatch.setattr(daemon, "msvcrt", _FakeMsvcrt(), raising=False)
 
-    assert fd is not None
-    stale_files = list(persona_dir.glob("bridge.json.lock.stale-*"))
-    assert stale_files, "recovered alive-pid-dead-health lock should be archived as evidence"
-    daemon.release_lock(persona_dir, fd)
+    orphan_pid = 424242
+
+    def fake_spawn(persona_dir_arg, idle, client_origin, log_path):
+        state_file.write(
+            persona_dir_arg,
+            state_file.BridgeState(
+                persona="nell", pid=orphan_pid, port=51999,
+                started_at="2026-05-08T00:00:00+00:00", stopped_at=None,
+                shutdown_clean=False, client_origin=client_origin,
+            ),
+        )
+        return orphan_pid
+
+    monkeypatch.setattr(daemon, "spawn_detached", fake_spawn)
+
+    def fake_get(*a, **kw):
+        raise httpx.ConnectError("refused")
+
+    monkeypatch.setattr("httpx.get", fake_get)
+    monkeypatch.setattr("brain.bridge.daemon.time.sleep", lambda _s: None)
+    fake_now = iter([0.0, 1.0, 2.0, 51.0])
+    monkeypatch.setattr("brain.bridge.daemon.time.time", lambda: next(fake_now))
+
+    def fake_kill(pid, sig):
+        err = OSError("The parameter is incorrect")
+        err.winerror = 87
+        raise err
+
+    monkeypatch.setattr(daemon.os, "kill", fake_kill)
+
+    rc = daemon.cmd_start(_args("nell"))  # must not raise
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "killed orphan child" in err
 
 
 def test_cmd_stop_on_windows_with_force_terminates(
@@ -1686,3 +2092,153 @@ def test_cmd_stop_on_windows_with_force_terminates(
     assert rc == 0
     assert killed == [44444]
     assert "forcing Windows termination" in capsys.readouterr().err
+
+
+# ---------- cmd_start: early exit when its own child already exited ----------
+
+
+class _FakeChild:
+    """A spawned child whose poll() returns None for `alive_polls` calls, then rc."""
+
+    def __init__(self, pid: int, rc: int | None, alive_polls: int = 0) -> None:
+        self.pid = pid
+        self._rc = rc
+        self._alive_polls = alive_polls
+        self.polls = 0
+
+    def poll(self) -> int | None:
+        self.polls += 1
+        if self.polls <= self._alive_polls:
+            return None
+        return self._rc
+
+
+def _early_exit_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, child: _FakeChild, *, on_spawn=None
+) -> dict[str, float]:
+    """cmd_start with a fake registered child and a fake clock; returns a dict
+    whose "now" is the fake time cmd_start ended at."""
+    from brain.bridge import state_file
+
+    _patch_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(daemon, "run_recovery_if_needed", lambda _p: None)
+
+    def fake_spawn(pd, idle, origin, log_path):
+        daemon._spawned_children[child.pid] = child
+        if on_spawn is not None:
+            on_spawn(pd)
+        return child.pid
+
+    monkeypatch.setattr(daemon, "spawn_detached", fake_spawn)
+    monkeypatch.setattr(state_file, "is_running", lambda _p: False)
+    clock = {"now": 0.0}
+
+    def fake_sleep(dt: float) -> None:
+        clock["now"] += dt
+
+    monkeypatch.setattr("brain.bridge.daemon.time.sleep", fake_sleep)
+    monkeypatch.setattr("brain.bridge.daemon.time.time", lambda: clock["now"])
+
+    def no_health(*a, **kw):
+        raise AssertionError("no state_file matches this child, /health must not be probed")
+
+    monkeypatch.setattr("httpx.get", no_health)
+    monkeypatch.setattr(
+        daemon, "_kill_if_alive", lambda *a: pytest.fail("early exit must not take the orphan-kill path")
+    )
+    return clock
+
+
+def test_cmd_start_child_lost_lock_returns_2_promptly_with_lock_wording(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """The child exits 2 (runner.main's refusal) and no live bridge is
+    recorded: report at once with the S57 lock wording, byte-identical, and
+    return 2, instead of waiting out the 50s readiness window."""
+    child = _FakeChild(pid=7001, rc=2, alive_polls=3)
+    clock = _early_exit_setup(tmp_path, monkeypatch, child)
+    rc = daemon.cmd_start(_args("nell"))
+    assert rc == 2
+    assert capsys.readouterr().err == "bridge already starting (lockfile held)\n"
+    assert clock["now"] < 1.0  # 4 poll ticks, not the 50s deadline
+    assert daemon._spawned_children == {}  # handle dropped
+
+
+def test_cmd_start_child_refused_live_bridge_reports_already_running_and_readiness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """The child exits 2 because another bridge is live: the S57 'already
+    running' wording (byte-identical) and the live bridge's readiness in
+    `out`, exactly as cmd_start's own pre-check reports it."""
+    from brain.bridge import state_file
+
+    child = _FakeChild(pid=7002, rc=2, alive_polls=1)
+    live = {"on": False}
+
+    def winner_appears(pd):
+        state_file.write(
+            pd,
+            state_file.BridgeState(
+                persona="nell", pid=8123, port=51777, started_at="2026-09-27T00:00:00+00:00",
+                stopped_at=None, shutdown_clean=False, client_origin="cli", auth_token="tok",
+            ),
+        )
+        live["on"] = True
+
+    clock = _early_exit_setup(tmp_path, monkeypatch, child, on_spawn=winner_appears)
+    # is_running False at the pre-check (before spawn), True once the winner wrote state.
+    monkeypatch.setattr(state_file, "is_running", lambda _p: live["on"])
+    out: dict = {}
+    rc = daemon.cmd_start(_args("nell"), out=out)
+    assert rc == 2
+    assert capsys.readouterr().err == "bridge already running on port 51777 (pid 8123)\n"
+    r = out["readiness"]
+    assert (r.pid, r.port, r.auth_token) == (8123, 51777, "tok")
+    assert clock["now"] < 1.0
+
+
+def test_cmd_start_child_crashed_returns_1_promptly_pointing_at_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    child = _FakeChild(pid=7003, rc=1, alive_polls=0)
+    clock = _early_exit_setup(tmp_path, monkeypatch, child)
+    rc = daemon.cmd_start(_args("nell"))
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "bridge process (pid 7003) exited with code 1 before becoming ready" in err
+    assert "bridge-nell.log" in err
+    assert clock["now"] < 1.0
+
+
+def test_cmd_start_slow_starting_child_is_not_mistaken_for_exited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """No misfire: a child that is still starting (poll() None) for most of
+    the window and then becomes ready is reported started, rc 0."""
+    from brain.bridge import state_file
+
+    child = _FakeChild(pid=7004, rc=None)  # never exits
+    clock = _early_exit_setup(tmp_path, monkeypatch, child)
+    persona_dir = tmp_path / "home" / "personas" / "nell"
+    real_read = state_file.read
+
+    def read_ready_after_40s(pd):
+        if clock["now"] < 40.0:
+            return None
+        return state_file.BridgeState(
+            persona="nell", pid=7004, port=51888, started_at="2026-09-27T00:00:00+00:00",
+            stopped_at=None, shutdown_clean=False, client_origin="cli",
+        )
+
+    monkeypatch.setattr(state_file, "read", read_ready_after_40s)
+
+    class _Ok:
+        status_code = 200
+
+    monkeypatch.setattr("httpx.get", lambda *a, **kw: _Ok())
+    rc = daemon.cmd_start(_args("nell"))
+    assert rc == 0
+    assert "bridge started on port 51888 (pid 7004)" in capsys.readouterr().out
+    assert child.polls > 300  # it really was polled throughout, never read as exited
+    assert real_read(persona_dir) is None  # nothing else wrote state
+

@@ -388,16 +388,47 @@ def prune_empty_sessions(
         now = datetime.now(UTC)
     removed: list[str] = []
     with _LOCK:
-        for sid, session in list(_SESSIONS.items()):
-            if persona_name is not None and session.persona_name != persona_name:
-                continue
-            if session.turns != 0 or session.history:
-                continue
-            age = (now - session.created_at).total_seconds()
-            if age >= older_than_seconds:
-                _SESSIONS.pop(sid, None)
-                removed.append(sid)
+        for sid in _prunable_empty_session_ids_locked(
+            older_than_seconds=older_than_seconds, now=now, persona_name=persona_name
+        ):
+            _SESSIONS.pop(sid, None)
+            removed.append(sid)
     return removed
+
+
+def _prunable_empty_session_ids_locked(
+    *, older_than_seconds: float, now: datetime, persona_name: str | None
+) -> list[str]:
+    """Ids ``prune_empty_sessions`` would remove. Caller holds ``_LOCK``."""
+    ids: list[str] = []
+    for sid, session in _SESSIONS.items():
+        if persona_name is not None and session.persona_name != persona_name:
+            continue
+        if session.turns != 0 or session.history:
+            continue
+        age = (now - session.created_at).total_seconds()
+        if age >= older_than_seconds:
+            ids.append(sid)
+    return ids
+
+
+def has_prunable_empty_sessions(
+    *,
+    older_than_seconds: float,
+    now: datetime | None = None,
+    persona_name: str | None = None,
+) -> bool:
+    """Read-only probe: would ``prune_empty_sessions`` with the same
+    arguments remove anything? (The central cadence function's "prune has
+    work" check, ram-spike-fix INC-9, S66.) Removes nothing."""
+    if now is None:
+        now = datetime.now(UTC)
+    with _LOCK:
+        return bool(
+            _prunable_empty_session_ids_locked(
+                older_than_seconds=older_than_seconds, now=now, persona_name=persona_name
+            )
+        )
 
 
 def reset_registry() -> None:

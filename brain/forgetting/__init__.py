@@ -8,10 +8,12 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from brain.bridge import job_progress
 from brain.felt_time.lived_age import IntensityDrivers
 from brain.felt_time.state import load_or_recover as load_felt_time
 from brain.forgetting import graveyard, policy, salience, tombstone
@@ -93,16 +95,34 @@ def _load_migration_grace(persona_dir: Path) -> tuple[datetime | None, float]:
     return mig, lived
 
 
+_FORGETTING_PROGRESS_JOB = "forgetting"
+
+
 def run_pass(
     persona_dir: Path,
     *,
     event_bus: Any,
     intensity_drivers: IntensityDrivers | None = None,
+    should_pause: Callable[[], bool] | None = None,
+    progress_out: dict[str, bool] | None = None,
 ) -> dict[str, int]:
     """Run one forgetting pass over all active+fading memories.
 
     Returns an aggregate summary dict with counts; also publishes a
     `forgetting_pass` event_bus event with the same payload.
+
+    ``should_pause`` (ram-spike-fix INC-10, S14/S32/S41/S65): checked after
+    each memory. The S32 table's item unit is "one memory"; this pass
+    previously had no per-item resume point at all (counters were only
+    persisted at pass end) — resume is now a NEW ``forgetting_progress.json``
+    cursor (``brain.bridge.job_progress``, C31), a keyset position over
+    memories ordered by ``id`` (the same collation SQLite already sorts
+    strings by, so a Python string comparison on the resumed slice matches
+    the SQL ``ORDER BY``). ``counters`` (consecutive-low-passes) are now
+    ALSO persisted after every memory, not only at pass end, so a pause or a
+    crash mid-pass never loses or re-applies a counter update. On a clean
+    finish the cursor is cleared (a stale cursor would otherwise cause the
+    NEXT pass to wrongly skip the memories before it).
     """
     start = time.monotonic()
     counters = _load_forgetting_state(persona_dir)
@@ -126,16 +146,36 @@ def run_pass(
     )
 
     try:
-        # Walk active + fading memories.
+        # Walk active + fading memories, ordered by id (INC-10: a stable,
+        # deterministic order the resume cursor below can key off).
         # Use a direct SELECT (not store.get) so the forgetting pass does NOT
         # bump recall_count — the pass is an internal evaluation, not a user
         # recall. Bumping via store.get would inflate recall salience and prevent
         # the consecutive-low-passes counter from accumulating correctly.
         rows = store._conn.execute(
-            "SELECT * FROM memories WHERE state IN ('active', 'fading')"
+            "SELECT * FROM memories WHERE state IN ('active', 'fading') ORDER BY id"
         ).fetchall()
         memories = [_row_to_memory(r) for r in rows]
         summary["total"] = len(memories)
+
+        resume_cursor = job_progress.load_progress(persona_dir, _FORGETTING_PROGRESS_JOB)
+        last_id = resume_cursor.get("last_id") if isinstance(resume_cursor, dict) else None
+        if isinstance(last_id, str):
+            # Stage-6 red-team MAJOR, fixed: the cursor's anchor row may no
+            # longer be IN `memories` on resume -- a LOSE transition
+            # hard-deletes the row (store.hard_delete, below), so an exact
+            # `m.id == last_id` search would never match and resume_idx
+            # would silently stay 0, reprocessing the WHOLE backlog. Since
+            # `memories` is a deterministic `ORDER BY id` scan, the correct
+            # resume point is keyset-style: the first row whose id sorts
+            # AFTER last_id — this is correct whether or not that exact row
+            # still exists (deleted, or merely absent for any other reason).
+            resume_idx = len(memories)
+            for i, m in enumerate(memories):
+                if m.id > last_id:
+                    resume_idx = i
+                    break
+            memories = memories[resume_idx:]
 
         for memory in memories:
             memory_id = memory.id
@@ -225,10 +265,41 @@ def run_pass(
                 counters[memory_id] = next_low
             else:
                 counters.pop(memory_id, None)
+
+            # INC-10 (S14/S32/S41/S65): persist progress after EVERY memory —
+            # counters used to be saved only at pass end (module docstring's
+            # own note) — so a between-items pause or a crash mid-pass loses
+            # nothing and never re-applies a counter update on resume.
+            # Stage-6 red-team MINOR, addressed: these are two separate
+            # atomic writes, not one atomic pair — a crash in the narrow
+            # window between them is possible. Cursor is saved FIRST so that
+            # window's failure mode is "this item's counter update is lost"
+            # (self-healing: consecutive_low_passes just takes one extra
+            # pass to reach LOST_THRESHOLD, a soft heuristic already
+            # tolerant of resets), never "double-applied" (which the
+            # opposite order would risk: an already-saved cursor is what a
+            # resume trusts to skip the item, so counters must not be
+            # written to look "not yet done" behind a cursor that already
+            # says it's done).
+            job_progress.save_progress(
+                persona_dir, _FORGETTING_PROGRESS_JOB, {"last_id": memory_id}
+            )
+            _persist_forgetting_state(persona_dir, counters)
+            if should_pause is not None and memory is not memories[-1] and should_pause():
+                log.info("forgetting pass: pausing between memories for chat (INC-10)")
+                summary["duration_ms"] = int((time.monotonic() - start) * 1000)
+                event_bus.publish({"type": "forgetting_pass", **summary})
+                if progress_out is not None:
+                    progress_out["paused"] = True
+                return summary
     finally:
         store.close()
         hebbian.close()
 
+    # A clean finish clears the cursor — a stale one would wrongly make the
+    # NEXT pass skip memories that precede it (this pass already re-evaluated
+    # the whole backlog by the time it gets here).
+    job_progress.clear_progress(persona_dir, _FORGETTING_PROGRESS_JOB)
     _persist_forgetting_state(persona_dir, counters)
     summary["duration_ms"] = int((time.monotonic() - start) * 1000)
     event_bus.publish({"type": "forgetting_pass", **summary})

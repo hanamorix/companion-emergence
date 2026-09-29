@@ -22,20 +22,30 @@ def test_run_compaction_tick_importable_and_callable():
     # Positional contract: (persona_dir, provider). The idle-gate added an optional
     # keyword-only ``is_session_busy`` (defaulted, so the tick stays importable and
     # callable without it — startup catch-up passes None).
-    assert params == ["persona_dir", "provider", "is_session_busy"], (
-        f"expected (persona_dir, provider, *, is_session_busy), got {params}"
+    # INC-10 (ram-spike-fix) adds keyword-only `should_pause` (between-items
+    # pause hook, default None => never pauses).
+    assert params == ["persona_dir", "provider", "is_session_busy", "should_pause"], (
+        f"expected (persona_dir, provider, *, is_session_busy, should_pause), got {params}"
     )
     busy = sig.parameters["is_session_busy"]
     assert busy.kind is inspect.Parameter.KEYWORD_ONLY
     assert busy.default is None
 
 
-def test_compaction_cadence_due_now_when_missing():
+def test_compaction_cadence_missing_is_created_as_last_ran_now():
+    """ram-spike-fix INC-9 (S22/S69): compaction is a gated job, so a missing
+    cadence file is created as "last ran now" (next_at = now + interval) and
+    the job is NOT due — it first runs one full interval later."""
     with tempfile.TemporaryDirectory() as d:
         pd = Path(d)
         now = datetime(2026, 6, 29, 12, tzinfo=UTC)
-        state = pc.load_cadence(pd, "compaction_cadence.json")
-        assert pc.is_due(state, now=now) is True
+        state, created = pc.load_or_init_cadence(
+            pd, "compaction_cadence.json", now=now, interval_s=86400.0
+        )
+        assert created is True
+        assert state.next_at == now + timedelta(seconds=86400.0)
+        assert pc.is_due(state, now=now) is False
+        assert pc.load_cadence(pd, "compaction_cadence.json").next_at == state.next_at
 
 
 def test_compaction_cadence_not_due_after_advance_and_fires_at_86400():

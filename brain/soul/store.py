@@ -72,13 +72,11 @@ class SoulStore:
         self._conn = sqlite3.connect(self._db_path)
 
         # Integrity check BEFORE row_factory — result rows must be plain tuples.
-        try:
-            result = self._conn.execute("PRAGMA integrity_check").fetchall()
-        except sqlite3.DatabaseError as exc:
-            self._conn.close()
-            from brain.health.anomaly import BrainIntegrityError
+        from brain.health.integrity_retry import run_integrity_check_with_retry
 
-            raise BrainIntegrityError(self._db_path, str(exc)) from exc
+        result = run_integrity_check_with_retry(
+            self._conn, self._db_path, caller="SoulStore"
+        )
 
         if result != [("ok",)]:
             detail = "; ".join(str(row[0]) for row in result)
