@@ -261,8 +261,9 @@ class SemanticRecallResult:
     `full` / `snippet` are Memory lists in reranker-SELECTION order;
     `scores` maps memory_id -> reranker score for callers that want the raw
     number (tests, logging). NOTE: unlike the pre-#231 cosine-era version,
-    `scores` only covers candidates that were actually reranked (the
-    auto-scaled-width slice of the cosine coarse-cut), not the whole pool.
+    `scores` only covers candidates that were actually scored (the
+    per-message-width prefix of the coarse cut on the reranked path, the
+    whole coarse cut on the cosine path), not the whole pool.
 
     F2b (#276 §2): as of the per-query anchor-median normalization, this is
     the NORMALIZED score (`raw - median(anchor_scores)`, or raw unmodified
@@ -372,6 +373,29 @@ def _reranked_ranking(
         )
         return None
     reranker_model_id = reranker_provider.model_id()
+    normalization = outcome.normalization
+    scored_ids = coarse_ids[: normalization.real_width]
+    rerank_scores = normalization.scores
+    if log_calibration:
+        # F2a (#250 inc4) / F2b (#276 §5): the real-query calibration row.
+        # `query` is byte-identical to what was just embedded/reranked;
+        # `scored_ids`/`rerank_scores` are the SAME already-normalized values
+        # that feed the floor gate (the fitted prefix; anchors are never
+        # logged). F2c inc1: `candidate_docs` is the recall-time text
+        # snapshot, 1:1 with `scored_ids`. Logged BEFORE the floor is read,
+        # as before R2: the rerank succeeded and these normalized scores are
+        # the training data the rerank floor's own fit needs, even on a turn
+        # whose rerank floor turns out to be unavailable (then the cosine
+        # path also logs its own, cosine-scale, row for the same query).
+        _log_calibration_row(
+            store,
+            query,
+            scored_ids,
+            list(rerank_scores),
+            reranker_model_id,
+            pool,
+            CALIBRATION_SCORE_SCALE,
+        )
     try:
         # F2a inc8 (#250 §7 UPDATED): the floor is read LIVE per call, keyed
         # by the RUNTIME reranker model_id; no persisted row serves a derived
@@ -389,25 +413,6 @@ def _reranked_ranking(
             reranker_model_id,
         )
         return None
-    normalization = outcome.normalization
-    scored_ids = coarse_ids[: normalization.real_width]
-    rerank_scores = normalization.scores
-    if log_calibration:
-        # F2a (#250 inc4) / F2b (#276 §5): the real-query calibration row.
-        # `query` is byte-identical to what was just embedded/reranked;
-        # `scored_ids`/`rerank_scores` are the SAME already-normalized values
-        # that feed the floor gate (the fitted prefix; anchors are never
-        # logged). F2c inc1: `candidate_docs` is the recall-time text
-        # snapshot, 1:1 with `scored_ids`.
-        _log_calibration_row(
-            store,
-            query,
-            scored_ids,
-            list(rerank_scores),
-            reranker_model_id,
-            pool,
-            CALIBRATION_SCORE_SCALE,
-        )
     log.debug(
         "semantic recall: floor=%.4f model=%s cold_start=%s sample_pairs=%d updated_at=%s",
         floor_row["floor"],

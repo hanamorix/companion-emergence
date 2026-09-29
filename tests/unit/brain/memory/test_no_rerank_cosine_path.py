@@ -318,8 +318,10 @@ def test_rerank_floor_bootstrap_failure_takes_the_cosine_path(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """No persisted rerank floor and the rerank bootstrap itself fails: the
-    reranker cannot gate this turn, so it is a cosine-path turn, and only the
-    cosine row is logged (one row per paragraph)."""
+    reranker cannot gate this turn, so it is a cosine-path turn. The rerank
+    that DID score is still logged (as before R2: its normalized scores are the
+    data the rerank floor's own fit needs, review F4), then the cosine path logs
+    its own cosine-scale row: two rows, each on its own true scale."""
     store = MemoryStore(tmp_path / "memories.db")
     mems = _seed_pool(store, monkeypatch, [0.95, 0.9, 0.85, 0.8, 0.75, 0.3])
     _write_cosine_floor(store, 0.5)
@@ -334,8 +336,11 @@ def test_rerank_floor_bootstrap_failure_takes_the_cosine_path(
     result = run_semantic_recall(store, tmp_path, _QUERY)
 
     assert result is not None and result.path == "cosine"
-    (row,) = _cal_rows(store)
-    assert row["score_scale"] == COSINE_SCORE_SCALE and row["reranker_model_id"] == _EMBEDDER_ID
+    rows = _cal_rows(store)
+    assert [(r["score_scale"], r["reranker_model_id"]) for r in rows] == [
+        (CALIBRATION_SCORE_SCALE, _RERANKER_ID),
+        (COSINE_SCORE_SCALE, _EMBEDDER_ID),
+    ]
 
 
 # ---------------------------------------------------------------------------

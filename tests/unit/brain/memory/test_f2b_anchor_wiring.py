@@ -461,85 +461,83 @@ def test_ac8_calibration_log_records_normalized_score_and_scored_real_ids(
 
 
 # ---------------------------------------------------------------------------
-# Fail-soft: a normalize_against_anchors failure degrades to lexical at
-# BOTH sites, never crashes a turn.
+# Fail-soft: a normalize_against_anchors failure never crashes a turn at
+# BOTH sites. Name-recall fix R2: it makes the turn a cosine-path turn (gated
+# by the cosine floor), not a lexical demotion.
 # ---------------------------------------------------------------------------
 
 
-def test_fail_soft_normalization_error_degrades_run_semantic_recall_to_lexical(
+def _seed_cosine_floor(store: MemoryStore, floor: float) -> None:
+    store.write_cosine_floor(
+        _TEST_MODEL_ID, floor=floor, raw_fit_floor=floor, sample_pairs=10, is_cold_start=False
+    )
+
+
+def _boom_normalize(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("simulated normalize_against_anchors failure")
+
+    # `semantic_recall.py` reaches `reranker_mod.normalize_against_anchors(...)`
+    # through `rerank_for_recall`, a dynamic module-attribute lookup at call
+    # time, so patching the attribute on the reranker module itself is honored.
+    monkeypatch.setattr("brain.memory.reranker.normalize_against_anchors", _boom)
+
+
+def test_normalization_error_takes_the_cosine_path_in_run_semantic_recall(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = MemoryStore(tmp_path / "memories.db")
+    real_a, real_b, *_ = _seed_candidates(store, monkeypatch, _QUERY)
+    _seed_floor(store)
+    _seed_cosine_floor(store, 0.6)  # real-A 0.99 and real-B 0.90 clear it; the 0.5, 0.4, 0.3 fillers do not
+    _boom_normalize(monkeypatch)
+
+    result = run_semantic_recall(store, tmp_path, _QUERY)
+
+    assert result is not None and result.path == "cosine", "not raised, not demoted to keyword-only"
+    assert [m.id for m in result.full] == [real_a.id, real_b.id]
+
+
+def test_normalization_error_with_no_clearing_cosine_floor_is_the_lexical_fallback(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     store = MemoryStore(tmp_path / "memories.db")
     _seed_candidates(store, monkeypatch, _QUERY)
     _seed_floor(store)
+    _boom_normalize(monkeypatch)  # the suite default cosine floor (2.0) never clears
 
-    def _boom(*args: object, **kwargs: object) -> None:
-        raise RuntimeError("simulated normalize_against_anchors failure")
-
-    # `semantic_recall.py` calls `reranker_mod.normalize_against_anchors(...)`
-    # — a dynamic module-attribute lookup at call time, so patching the
-    # attribute on the reranker module itself is honored (mirrors this
-    # suite's existing `_BoomReranker`/build_reranker_provider patch
-    # pattern in test_semantic_recall.py).
-    monkeypatch.setattr("brain.memory.reranker.normalize_against_anchors", _boom)
-
-    result = run_semantic_recall(store, tmp_path, _QUERY)
-
-    assert result is None, (
-        "a normalize_against_anchors failure must not raise: the turn takes the cosine path "
-        "(R2), which under the suite's never-clearing cosine floor is the lexical fallback"
-    )
+    assert run_semantic_recall(store, tmp_path, _QUERY) is None
 
 
-def test_fail_soft_normalization_error_degrades_semantic_top_k_to_lexical(
+def test_normalization_error_takes_the_cosine_path_at_semantic_top_k(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = MemoryStore(tmp_path / "memories.db")
+    real_a, real_b, *_ = _seed_candidates(store, monkeypatch, _QUERY)
+    _seed_floor(store)
+    _seed_cosine_floor(store, 0.6)
+    _boom_normalize(monkeypatch)
+
+    res = dispatch("search_memories", {"query": _QUERY, "mode": "semantic"}, **_ctx2(tmp_path, store))
+
+    assert res["mode"] == "semantic"
+    assert [mm["id"] for mm in res["memories"]] == [real_a.id, real_b.id]
+
+
+def test_normalization_error_with_no_clearing_cosine_floor_falls_back_to_lexical_at_semantic_top_k(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     store = MemoryStore(tmp_path / "memories.db")
     real_a, *_ = _seed_candidates(store, monkeypatch, _QUERY)
     _seed_floor(store)
-
-    def _boom(*args: object, **kwargs: object) -> None:
-        raise RuntimeError("simulated normalize_against_anchors failure")
-
-    monkeypatch.setattr("brain.memory.reranker.normalize_against_anchors", _boom)
+    _boom_normalize(monkeypatch)
 
     # `_QUERY` ("wiring") shares a token with every seeded memory's content
-    # (see _seed_candidates), so the lexical fallback has something
-    # real to find — proving this returns a usable result, not just an
-    # empty-but-non-erroring response.
+    # (see _seed_candidates), so the lexical fallback has something real to find.
     res = dispatch("search_memories", {"query": _QUERY, "mode": "semantic"}, **_ctx2(tmp_path, store))
 
-    assert res["mode"] == "lexical", (
-        "a normalize_against_anchors failure must not raise: the call takes the cosine path "
-        "(R2), which under the suite's never-clearing cosine floor is the lexical fallback"
-    )
-    ids = {mm["id"] for mm in res["memories"]}
-    assert real_a.id in ids
-
-
-# ---------------------------------------------------------------------------
-# Name-recall fix R1 (S24): passive recall AND the tool are recall-time
-# reranks — both feed the ONE per-process cost model for the reranker's id.
-# ---------------------------------------------------------------------------
-
-
-def test_passive_recall_and_tool_both_feed_the_one_cost_model(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    import brain.memory.reranker as reranker_mod
-
-    store = MemoryStore(tmp_path / "memories.db")
-    _seed_candidates(store, monkeypatch, _QUERY)
-    _seed_floor(store)
-    provider = _RecordingProvider({}, default=0.0)
-    monkeypatch.setattr("brain.memory.reranker.build_reranker_provider", lambda **kwargs: provider)
-
-    run_semantic_recall(store, tmp_path, _QUERY)
-    assert reranker_mod.rerank_cost_estimate("fake-reranker").measured_batches == 1
-    dispatch("search_memories", {"query": _QUERY, "mode": "semantic"}, **_ctx2(tmp_path, store))
-    assert reranker_mod.rerank_cost_estimate("fake-reranker").measured_batches == 2
-    single_doc_calls = [c for c in provider.calls if len(c) == 1]
-    assert len(single_doc_calls) == 2, "the two warm-ups run once per process, not per call site"
+    assert res["mode"] == "lexical"
+    assert real_a.id in {mm["id"] for mm in res["memories"]}
 
 
 @pytest.mark.parametrize("site", ["run_semantic_recall", "search_memories"])

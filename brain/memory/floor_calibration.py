@@ -426,7 +426,8 @@ def get_bootstrap_floor(reranker_model_id: str) -> dict[str, Any] | None:
     turn): any failure constructing the provider or fitting the threshold
     (a reranker load error, an empty/degenerate pairs list, ...) is caught,
     logged, and returns `None` — `get_reranker_floor` then degrades to the
-    PRE-ruling contract (`None` -> caller falls back to lexical), the
+    PRE-ruling contract (`None` -> the reranker cannot gate the turn and
+    recall takes the cosine path, name-recall fix R2), the
     bootstrap's own last-resort failure path.
     """
     cached = _bootstrap_floor_cache.get(reranker_model_id)
@@ -446,7 +447,7 @@ def get_bootstrap_floor(reranker_model_id: str) -> dict[str, Any] | None:
         except Exception:  # noqa: BLE001 — fail-soft: must never break a recall/self-check
             logger.exception(
                 "floor_calibration: bootstrap floor computation failed for %s -> "
-                "get_reranker_floor degrades to the pre-ruling None/lexical-fallback contract",
+                "get_reranker_floor degrades to the pre-ruling None contract (cosine path)",
                 reranker_model_id,
             )
             return None
@@ -728,6 +729,7 @@ def derive_and_persist_cosine_floor(
             is_cold_start=False,
         ),
         label="cosine floor calibration",
+        require_both_classes=True,
     )
 
 
@@ -738,18 +740,38 @@ def _fit_or_hold(
     read_prior: Callable[[], dict[str, Any] | None],
     write: Callable[[float, int], None],
     label: str,
+    require_both_classes: bool = False,
 ) -> FloorDerivationOutcome:
     """The fit-or-hold core both floors share (Change 1's "nimble floor"
     mechanism, unchanged): a day with `>= FLOOR_FIT_MIN_LABELED_PAIRS` labeled
     pairs is fit and persisted directly; otherwise the data-starvation
     backstop holds the persisted prior (or writes nothing when there is none).
+
+    `require_both_classes` (the cosine floor, name-recall fix R2 review F1):
+    a day whose labeled pairs are all one class has nothing to separate, and
+    `fit_threshold_fbeta`'s answer for it is a sentinel one unit past the
+    observed scores (built for unbounded logits). On the cosine scale
+    (legal range [-1, 1]) that is a floor no cosine can reach (all
+    irrelevant: every no-rerank turn abstains, held until a later day has
+    200 labeled pairs) or one that gates nothing (all relevant). Such a day
+    is treated as no usable fit: hold the prior, or write nothing while the
+    bootstrap serves. The rerank floor keeps its pre-R2 behaviour.
     """
     beta = tunables.get_tunable("calibration.floor_fit_beta", FLOOR_FIT_BETA)
     min_labeled_pairs = tunables.get_tunable(
         "calibration.floor_fit_min_labeled_pairs", FLOOR_FIT_MIN_LABELED_PAIRS
     )
 
-    if len(real_pairs) >= min_labeled_pairs:
+    fit_is_usable = len(real_pairs) >= min_labeled_pairs
+    if fit_is_usable and require_both_classes and len({lab for _, lab in real_pairs}) < 2:
+        logger.info(
+            "%s: the day's %d labeled pairs for %s are all one class — no threshold to fit, "
+            "treating as no usable fit",
+            label, len(real_pairs), model_id,
+        )
+        fit_is_usable = False
+
+    if fit_is_usable:
         raw_floor = fit_threshold_fbeta(real_pairs, beta=beta)
         write(raw_floor, len(real_pairs))
         logger.info(
@@ -766,7 +788,8 @@ def _fit_or_hold(
         )
 
     # Data-starvation backstop: the most recently completed day did not
-    # clear FLOOR_FIT_MIN_LABELED_PAIRS. Read the PERSISTED-ONLY prior row
+    # clear FLOOR_FIT_MIN_LABELED_PAIRS (or, for the cosine floor, held one
+    # class only). Read the PERSISTED-ONLY prior row
     # (never the transient bootstrap the floor getter would otherwise serve
     # on a miss) so the no-prior-row edge case below is judged on whether a
     # REAL row exists, not on whether SOME floor is servable.
@@ -774,7 +797,8 @@ def _fit_or_hold(
     if prior is not None:
         logger.info(
             "%s: data-starvation backstop held the floor for %s "
-            "(sample_pairs=%d < min=%d; holding prior floor=%.4f unchanged, no refit attempted)",
+            "(sample_pairs=%d, min=%d, no usable fit; holding prior floor=%.4f unchanged, "
+            "no refit attempted)",
             label, model_id, len(real_pairs), min_labeled_pairs, prior["floor"],
         )
         return FloorDerivationOutcome(
@@ -788,7 +812,7 @@ def _fit_or_hold(
 
     logger.info(
         "%s: data-starvation backstop, no prior floor row for %s "
-        "(sample_pairs=%d < min=%d) — writing nothing; recall stays served by "
+        "(sample_pairs=%d, min=%d, no usable fit) — writing nothing; recall stays served by "
         "the bootstrap floor in the meantime",
         label, model_id, len(real_pairs), min_labeled_pairs,
     )

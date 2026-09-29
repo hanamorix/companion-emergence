@@ -1574,7 +1574,8 @@ class MemoryStore:
         Only returns `None` now on the bootstrap's OWN fail-soft path (the
         bootstrap computation itself raised — a reranker load/fit failure)
         — the pre-ruling contract, preserved as the last resort so a broken
-        bootstrap still degrades this turn to lexical rather than crashing.
+        bootstrap never crashes a turn: the reranker cannot gate it, so
+        recall takes the cosine path (name-recall fix R2, spec §2).
 
         Read-only: does not write or bump anything.
         """

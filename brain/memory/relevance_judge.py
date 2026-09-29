@@ -92,9 +92,11 @@ _HAIKU_TIEBREAK_PROMPT = prompt_strings.register("memory.relevance_judge.haiku_t
 #       sampled separately (S25: `label_calibration_sample`), so each gets
 #       up to this many rows and neither dilutes the other's fit.
 #   (ii) UPPER bound — bounding the local judge's daily compute on the
-#       no-AVX2 potato baseline (spec Section 7): 100 forward passes/day
-#       through a cross-encoder is a bounded, once-daily idle cost, not the
-#       thousands of raw per-turn rows actually logged.
+#       no-AVX2 potato baseline (spec Section 7): 100 rows a day per scale
+#       (at most 200 across the reranked and cosine scales, whose rows
+#       carry at most 50 and 9 candidates) through a cross-encoder is a
+#       bounded, once-daily idle cost, not the thousands of raw per-turn
+#       rows actually logged.
 # Operator-tunable (`calibration.judge_sample_rows`) for a box where either
 # side of this balance needs shifting.
 CALIBRATION_SAMPLE_ROWS: int = tunables.register("calibration.judge_sample_rows", 100)

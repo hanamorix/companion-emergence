@@ -674,7 +674,7 @@ def test_run_semantic_recall_uses_the_bootstrap_floor_when_no_row_exists_yet(
     assert count == 0, "reading/using the bootstrap floor must never persist a row"
 
 
-def test_run_semantic_recall_falls_back_to_lexical_when_the_bootstrap_computation_fails(
+def test_run_semantic_recall_has_no_semantic_result_when_the_rerank_bootstrap_fails_and_the_cosine_floor_never_clears(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """The bootstrap floor's OWN fail-soft path (spec Section 7: the
@@ -707,7 +707,7 @@ def test_run_semantic_recall_falls_back_to_lexical_when_the_bootstrap_computatio
 
     result = run_semantic_recall(store, tmp_path, "any query")
 
-    assert result is None, "a failed bootstrap computation must fall back to lexical, not crash"
+    assert result is None, "a failed rerank bootstrap must not crash (cosine path, never-clearing default floor)"
 
 
 def test_run_semantic_recall_is_fail_soft_when_floor_read_raises(

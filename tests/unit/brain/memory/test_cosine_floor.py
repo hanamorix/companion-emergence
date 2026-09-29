@@ -364,3 +364,135 @@ def test_labeling_samples_each_scale_separately(store: MemoryStore) -> None:
         ).fetchall()
     )
     assert by_scale == {CALIBRATION_SCORE_SCALE: 2, COSINE_SCORE_SCALE: 2}
+
+
+# ---------------------------------------------------------------------------
+# Review F1: a single-class day has no threshold to fit; never persist a
+# sentinel outside the cosine range
+# ---------------------------------------------------------------------------
+
+
+def _seed_single_class_day(store: MemoryStore, label: str, *, model_id: str = _EMBEDDER_ID) -> None:
+    rows = -(-FLOOR_FIT_MIN_LABELED_PAIRS // 9)  # rows of 9 candidates, enough for the minimum
+    for _ in range(rows):
+        _insert_row(
+            store,
+            [0.80 + 0.005 * i for i in range(9)],
+            [label] * 9,
+            model_id=model_id,
+            scale=COSINE_SCORE_SCALE,
+        )
+
+
+@pytest.mark.parametrize("label", ["irrelevant", "relevant"])
+def test_a_single_class_cosine_day_writes_nothing_without_a_prior(store: MemoryStore, label: str) -> None:
+    _seed_single_class_day(store, label)
+    out = derive_and_persist_cosine_floor(store, _EMBEDDER_ID)
+    assert out.accepted is False and out.held_for_data_starvation and out.floor is None
+    assert store.get_persisted_cosine_floor(_EMBEDDER_ID) is None, (
+        "no sentinel outside [-1, 1] may be persisted; the bootstrap keeps serving"
+    )
+
+
+@pytest.mark.parametrize("label", ["irrelevant", "relevant"])
+def test_a_single_class_cosine_day_holds_the_prior_row(store: MemoryStore, label: str) -> None:
+    store.write_cosine_floor(_EMBEDDER_ID, floor=0.83, raw_fit_floor=0.83, sample_pairs=300, is_cold_start=False)
+    _seed_single_class_day(store, label)
+    out = derive_and_persist_cosine_floor(store, _EMBEDDER_ID)
+    assert out.accepted is False and out.floor == pytest.approx(0.83)
+    assert store.get_persisted_cosine_floor(_EMBEDDER_ID)["floor"] == pytest.approx(0.83)
+
+
+def test_the_persisted_cosine_floor_stays_inside_the_cosine_range_for_two_class_days(store: MemoryStore) -> None:
+    rng = np.random.default_rng(11)
+    _seed_scale(store, rng, n=FLOOR_FIT_MIN_LABELED_PAIRS, model_id=_EMBEDDER_ID, scale=COSINE_SCORE_SCALE,
+                rel=0.88, irr=0.80, sd=0.02)
+    out = derive_and_persist_cosine_floor(store, _EMBEDDER_ID)
+    assert out.accepted and -1.0 <= out.floor <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# Review F2: each scale's fit reads ITS OWN most recent labeled day
+# ---------------------------------------------------------------------------
+
+
+def test_each_scale_reads_its_own_most_recent_labeled_day(store: MemoryStore) -> None:
+    """The latest normalized-labeled day is later than the latest cosine-labeled
+    day: the cosine fit must still find its own (earlier) day, not read zero
+    rows because a normalized row set the 'most recent day'."""
+    _insert_row(store, [0.9, 0.2], ["relevant", "irrelevant"], model_id="m", scale=COSINE_SCORE_SCALE,
+                day_bucket="2026-09-27")
+    _insert_row(store, [0.85], ["relevant"], model_id="m", scale=COSINE_SCORE_SCALE, day_bucket="2026-09-27")
+    _insert_row(store, [4.0, -4.0], ["relevant", "irrelevant"], model_id="m", scale=CALIBRATION_SCORE_SCALE,
+                day_bucket="2026-09-28")
+    assert sorted(s for s, _ in store.labeled_calibration_pairs("m", COSINE_SCORE_SCALE)) == [0.2, 0.85, 0.9]
+    assert sorted(s for s, _ in store.labeled_calibration_pairs("m")) == [-4.0, 4.0]
+
+
+# ---------------------------------------------------------------------------
+# Review F5: the tick's fault isolation and pause behaviour around the cosine step
+# ---------------------------------------------------------------------------
+
+
+def _seed_cosine_fit_day(pd: Path) -> None:
+    rng = np.random.default_rng(5)
+    seed = MemoryStore(pd / "memories.db", integrity_check=False)
+    _seed_scale(seed, rng, n=FLOOR_FIT_MIN_LABELED_PAIRS + 20, model_id=_EMBEDDER_ID,
+                scale=COSINE_SCORE_SCALE, rel=0.9, irr=0.1, sd=0.1)
+    seed.close()
+
+
+def _persisted(pd: Path):
+    check = MemoryStore(pd / "memories.db", integrity_check=False)
+    try:
+        return check.get_persisted_reranker_floor(_RERANKER_ID), check.get_persisted_cosine_floor(_EMBEDDER_ID)
+    finally:
+        check.close()
+
+
+def test_a_failing_rerank_floor_step_does_not_skip_the_cosine_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _boom(*a, **kw):
+        raise RuntimeError("simulated rerank floor derivation failure")
+
+    monkeypatch.setattr(floor_calibration, "derive_and_persist_floor", _boom)
+    with tempfile.TemporaryDirectory() as d:
+        pd = Path(d)
+        _seed_cosine_fit_day(pd)
+        assert _run_calibration_tick(pd) is True
+        rerank_row, cosine_row = _persisted(pd)
+    assert rerank_row is None and cosine_row is not None
+
+
+def test_a_failing_cosine_floor_step_does_not_fail_the_tick_or_undo_the_rerank_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _boom(*a, **kw):
+        raise RuntimeError("simulated cosine floor derivation failure")
+
+    monkeypatch.setattr(floor_calibration, "derive_and_persist_cosine_floor", _boom)
+    n = FLOOR_FIT_MIN_LABELED_PAIRS + 20
+    with tempfile.TemporaryDirectory() as d:
+        pd = Path(d)
+        seed = MemoryStore(pd / "memories.db", integrity_check=False)
+        _seed_scale(seed, np.random.default_rng(6), n=n, model_id=_RERANKER_ID,
+                    scale=CALIBRATION_SCORE_SCALE, rel=3.0, irr=-3.0, sd=1.0)
+        seed.close()
+        assert _run_calibration_tick(pd) is True
+        rerank_row, cosine_row = _persisted(pd)
+    assert rerank_row is not None and cosine_row is None
+
+
+def test_a_paused_labeling_pass_defers_the_cosine_floor_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    from brain.memory import relevance_judge
+
+    monkeypatch.setattr(relevance_judge, "build_judge_provider", lambda full_model_dir=None: FakeRelevanceJudgeProvider())
+    with tempfile.TemporaryDirectory() as d:
+        pd = Path(d)
+        _seed_cosine_fit_day(pd)
+        seed = MemoryStore(pd / "memories.db", integrity_check=False)
+        for _ in range(2):  # two unlabeled rows: labeling pauses between them
+            _insert_row(seed, [0.5], None, model_id=_EMBEDDER_ID, scale=COSINE_SCORE_SCALE)
+        seed.close()
+        assert _run_calibration_tick(pd, should_pause=lambda: True) is None
+        _, cosine_row = _persisted(pd)
+    assert cosine_row is None, "a paused tick derives no floor of either scale"
