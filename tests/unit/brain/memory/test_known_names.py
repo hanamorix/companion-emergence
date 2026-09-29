@@ -71,8 +71,19 @@ def persona(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def quick_busy(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Shrink the writers' busy timeout so a locked file fails at once."""
-    monkeypatch.setattr(dev_constants, "MEMORIES_DB_BUSY_TIMEOUT_S", 0.05)
+    """Shrink the writers' busy wait so a locked file fails at once.
+
+    The writers pass no timeout (SQLite's default, S88), so the seam fills one in
+    on any connect call that does not carry its own.
+    """
+    real = sqlite3.connect
+
+    def quick(database: str, *args: object, **kwargs: object) -> sqlite3.Connection:
+        if not args:
+            kwargs.setdefault("timeout", 0.05)
+        return real(database, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(kn.sqlite3, "connect", quick)
 
 
 # ---------------------------------------------------------------------------
@@ -600,6 +611,28 @@ def test_a_writer_that_meets_a_locked_healthy_file_never_renames_it(
     assert _names(persona) == {"alpha", "bravo"}
 
 
+def test_writers_use_sqlites_default_busy_timeout_not_the_memories_db_constant(
+    persona: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # S88: no timeout argument on any writer-side connect (SQLite's default, 5 s),
+    # whatever memories.db's constant is set to.
+    monkeypatch.setattr(dev_constants, "MEMORIES_DB_BUSY_TIMEOUT_S", 123.0)
+    seen: list[dict] = []
+    real = sqlite3.connect
+
+    def spy(database: str, *args: object, **kwargs: object) -> sqlite3.Connection:
+        seen.append({"args": args, **kwargs})
+        return real(database, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(kn.sqlite3, "connect", spy)
+    _db(persona).write_bytes(_GARBAGE)  # exercises _insert_rows and _confirmed_corrupt
+    assert kn.admit_names(persona, ["pretzel"], "tool") == ["pretzel"]
+    assert len(seen) >= 3  # failed insert, quick_check, insert into the fresh file
+    for call in seen:
+        assert "timeout" not in call and call["args"] == ()
+    assert real(str(_db(persona))).execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+
+
 def test_a_locked_file_is_not_confirmed_corrupt(persona: Path, quick_busy: None) -> None:
     kn.admit_names(persona, ["alpha"], "gate")
     with _exclusive_lock(persona):
@@ -780,6 +813,29 @@ def test_renaming_a_corrupt_file_aside_takes_its_journal_sidecar_with_it(persona
     (db_aside,) = [p for p in aside if not p.name.endswith("-journal")]
     assert db_aside.read_bytes() == _GARBAGE
     assert moved.name == db_aside.name + "-journal"
+
+
+@pytest.mark.parametrize(
+    ("entry", "lower"),
+    [("José", "jos"), ("Zoë", "zo"), ("Müller", "m ller"), ("Åsa Núñez", "sa n ez")],
+)
+def test_the_display_form_keeps_accents_exactly_as_extracted(
+    persona: Path, entry: str, lower: str
+) -> None:
+    # S87: matching stays on the shared ASCII tokenizer (#317 covers accented
+    # Latin), but the stored display form loses nothing, so it survives #317.
+    assert kn.admit_names(persona, [entry], "gate", now=T0) == [lower]
+    assert _rows(persona) == [(lower, entry, "gate", T0.isoformat())]
+    assert kn.normalize_name(entry) == lower
+
+
+def test_the_display_form_keeps_case_spacing_and_accents_but_trims_the_ends(
+    persona: Path,
+) -> None:
+    kn.admit_names(persona, ["  Zoë  Núñez\t"], "tool", now=T0)
+    ((lower, display, _, _),) = _rows(persona)
+    assert display == "Zoë  Núñez"
+    assert lower == "zo n ez"
 
 
 # ---------------------------------------------------------------------------

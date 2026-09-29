@@ -406,11 +406,9 @@ def admit_names(
 
 
 def _insert_rows(path: Path, rows: list[tuple[str, str, str, str]]) -> None:
-    conn = sqlite3.connect(
-        str(path),
-        timeout=dev_constants.MEMORIES_DB_BUSY_TIMEOUT_S,
-        isolation_level=None,
-    )
+    # No timeout argument: SQLite's own default busy wait (S88). memories.db's 30 s
+    # constant is sized for its clustering writes and does not apply to this file.
+    conn = sqlite3.connect(str(path), isolation_level=None)
     try:
         mode = conn.execute("PRAGMA journal_mode=DELETE").fetchone()
         if mode is None or str(mode[0]).lower() != "delete":
@@ -470,7 +468,7 @@ def _confirmed_corrupt(path: Path) -> bool:
     """
     conn: sqlite3.Connection | None = None
     try:
-        conn = sqlite3.connect(str(path), timeout=dev_constants.MEMORIES_DB_BUSY_TIMEOUT_S)
+        conn = sqlite3.connect(str(path))
         row = conn.execute("PRAGMA quick_check").fetchone()
     except sqlite3.OperationalError:
         return False
