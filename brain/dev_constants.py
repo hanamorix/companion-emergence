@@ -30,6 +30,13 @@ from __future__ import annotations
 # constant is memories.db-specific, not a global sqlite default.
 MEMORIES_DB_BUSY_TIMEOUT_S: float = 30.0
 
+# --- known-names file name (name-recall fix N1, S26) -------------------------
+# The kindled's running list of known name words: its own small SQLite file in
+# the persona directory, NOT memories.db and not keyed to memories (S19, S26).
+# A fixed dev-level file name: nothing reads or overrides it at run time. See
+# `brain.memory.known_names`.
+KNOWN_NAMES_DB_FILENAME: str = "known_names.db"
+
 # --- sqlite store integrity-check transient-error retry (C16 Windows CI
 # flake, INC-10 follow-up, ram-spike-fix; generalized from MemoryStore-only
 # to all 4 sqlite stores per orchestrator directive 2026-09-28) ------------

@@ -349,6 +349,19 @@ def _cosine_floor_never_clears_by_default(
 
 
 @pytest.fixture(autouse=True)
+def _reset_known_names_cache() -> Iterator[None]:
+    """Drop brain.memory.known_names's process-level per-path list cache before
+    and after each test (name-recall fix N1, P-24): a test that reads the list
+    through the cache must not see one a prior/later test cached, and a stale
+    entry could otherwise survive a tmp_path reuse of the same signature."""
+    from brain.memory import known_names
+
+    known_names._reset_cache()
+    yield
+    known_names._reset_cache()
+
+
+@pytest.fixture(autouse=True)
 def _fake_relevance_judge_provider_by_default(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> None:
