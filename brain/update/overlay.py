@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import sysconfig
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -23,6 +24,10 @@ from brain.update.overlay_hook import BUNDLE_ID_FILE
 
 STATE_FILE = "current.json"
 LOCK_FILE = ".lock"
+# <overlay folder>/.in-use/<pid>: a process running `brain` from that folder (#302).
+IN_USE_DIR = ".in-use"
+_RETRY_ATTEMPTS = 6
+_RETRY_DELAY_S = 0.05  # doubling: ~1.5 s in all before the error is let through
 
 
 class OverlayBusy(RuntimeError):  # noqa: N818
@@ -89,7 +94,48 @@ def _write_state(root: Path, active: dict | None, previous: dict | None) -> None
     root.mkdir(parents=True, exist_ok=True)
     tmp = root / f"{STATE_FILE}.tmp"
     tmp.write_text(json.dumps({"active": active, "previous": previous}, indent=2), encoding="utf-8")
-    os.replace(tmp, root / STATE_FILE)
+    replace_retrying(tmp, root / STATE_FILE)
+
+
+def replace_retrying(src: Path, dst: Path) -> None:
+    """os.replace, riding out a transient PermissionError — on Windows, AV scanning
+    freshly written files or another interpreter's hook reading current.json at
+    start-up (#302). Anything else, or a lock that outlasts the retries, raises."""
+    for attempt in range(_RETRY_ATTEMPTS):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == _RETRY_ATTEMPTS - 1:
+                raise
+            time.sleep(_RETRY_DELAY_S * 2**attempt)
+
+
+def mark_in_use(root: Path | None = None) -> None:
+    """Record that THIS process runs `brain` from an overlay folder, so prune leaves
+    the folder alone while the process lives (#302). No-op on the release brain.
+    Called once at bridge start; prune ignores a dead process's marker."""
+    import brain
+
+    root = (root or overlay_root()).resolve()
+    try:
+        rel = Path(brain.__file__).resolve().relative_to(root)
+    except ValueError:
+        return
+    if len(rel.parts) < 2:
+        return
+    marks = root / rel.parts[0] / IN_USE_DIR
+    marks.mkdir(exist_ok=True)
+    (marks / str(os.getpid())).write_text("", encoding="utf-8")
+
+
+def in_use(folder: Path) -> bool:
+    """A live process runs `brain` from this folder (it wrote an .in-use marker)."""
+    # ponytail: a reused pid keeps a folder one prune longer — the safe direction.
+    try:
+        return any(m.name.isdigit() and pid_is_alive(int(m.name)) for m in (folder / IN_USE_DIR).iterdir())
+    except OSError:
+        return False
 
 
 def activate(root: Path, entry: dict) -> None:
@@ -121,7 +167,7 @@ def prune(root: Path) -> None:
     if not root.is_dir():
         return
     for child in root.iterdir():
-        if child.is_dir() and child.name not in keep:
+        if child.is_dir() and child.name not in keep and not in_use(child):
             shutil.rmtree(child, ignore_errors=True)
 
 
