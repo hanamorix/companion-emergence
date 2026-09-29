@@ -267,8 +267,9 @@ class CrossEncoderProvider(RerankerProvider):
         the model maximum already enabled on it) and counted with
         `surviving_pair_token_lengths`. Fail-soft: on any failure the result is
         `None` (logged), never a character count, so a different unit can never
-        reach the token-based cost model; the caller then fits no width from
-        sizes and records no sample (`rerank_for_recall`)."""
+        reach the token-based cost model; the caller then does not rerank that
+        query (hand-off "sizes", `rerank_for_recall`): a batch whose size is
+        unknown cannot be held to the latency budget or the RAM bound."""
         try:
             with self._rerank_lock:
                 tokenizer = self._pair_tokenizer()
@@ -1006,7 +1007,8 @@ class RecallRerank:
     must NOT gate any score (`normalization` is then `None`): `hand_off`
     says why the no-rerank path takes over — "pool" (fewer than the S5
     minimum of candidates exist), "budget" (fewer than the minimum fit the latency budget or the RAM
-    bound), or "normalization" (the anchor median could not be taken).
+    bound), "sizes" (the pairs' token lengths could not be read, so no width can be sized), or
+    "normalization" (the anchor median could not be taken).
     `measured` — whether this call added a sample to the cost model."""
 
     width: int
@@ -1054,19 +1056,18 @@ def rerank_for_recall(
     _warm_up_once(provider, query, pool)
     lengths = provider.pair_token_lengths(query, [*pool, *ANCHOR_POOL])
     if lengths is None:
-        # Token sizes unavailable (the tokenizer probe failed): no size to fit
-        # a width from, so the width is the S5 minimum, as before the first
-        # measurement, and this call is NOT recorded (S75: the cost model
-        # holds tokens only; the padded size of this batch is unknown).
-        candidate_tokens = anchor_tokens = None
-        width = RERANK_MIN_REAL_CANDIDATES  # the pool and cap are at least this (checked above)
-    else:
-        candidate_tokens, anchor_tokens = lengths[: len(pool)], lengths[len(pool) :]
-        estimate = rerank_cost_estimate(model_id)
-        headroom = _available_ram_headroom_bytes() if estimate is not None else None
-        width = fit_rerank_width(
-            candidate_tokens, anchor_tokens, estimate, budget_seconds, headroom, cap
+        # Token sizes unavailable (the tokenizer probe failed): a width cannot
+        # be sized against the latency budget or the RAM bound, and a batch of
+        # unknown padded size must not run unbudgeted, so this query is not
+        # reranked (the no-rerank path serves it). No sample is recorded either:
+        # the cost model holds tokens only (S75).
+        return RecallRerank(
+            width=0, reranked=False, hand_off="sizes", normalization=None, measured=False
         )
+    candidate_tokens, anchor_tokens = lengths[: len(pool)], lengths[len(pool) :]
+    estimate = rerank_cost_estimate(model_id)
+    headroom = _available_ram_headroom_bytes() if estimate is not None else None
+    width = fit_rerank_width(candidate_tokens, anchor_tokens, estimate, budget_seconds, headroom, cap)
 
     if width < RERANK_MIN_REAL_CANDIDATES:
         # PARKED SEAM (owner ruling pending: Q15 / ledger F10, stuck-width
@@ -1086,11 +1087,7 @@ def rerank_for_recall(
 
     normalization = normalize_against_anchors(provider, query, pool[:width])
     measured = False
-    if (
-        normalization.seconds is not None
-        and candidate_tokens is not None
-        and anchor_tokens is not None
-    ):
+    if normalization.seconds is not None:
         k = normalization.anchor_count
         longest = max([*candidate_tokens[:width], *anchor_tokens[:k]])
         _record_rerank_cost(

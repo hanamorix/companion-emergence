@@ -491,14 +491,17 @@ def test_c1c_tokenizer_failure_gives_no_lengths_never_characters(
     assert any("token lengths unavailable" in r.message for r in caplog.records)
 
 
-def test_c1c_no_token_lengths_means_the_minimum_width_and_no_recorded_sample(clock: _Clock) -> None:
+def test_c1c_no_token_lengths_means_no_rerank_and_no_recorded_sample(clock: _Clock) -> None:
+    """A batch of unknown padded size must not run unbudgeted (hand-off
+    "sizes": the no-rerank path serves the query), and no sample is
+    recorded (a character count must never reach the token-based sums)."""
+
     class _NoLengths(_CostScriptedProvider):
         def pair_token_lengths(self, query, documents):
             return None
 
         def rerank(self, query, documents):
             self.calls.append(list(documents))
-            self.clock.t += 0.5
             return FakeRerankerProvider.rerank(self, query, documents)
 
     reranker_mod._record_rerank_cost(_MODEL, 1_000, 1.0, None)  # a prior token-unit sample
@@ -507,8 +510,9 @@ def test_c1c_no_token_lengths_means_the_minimum_width_and_no_recorded_sample(clo
 
     out = rerank_for_recall(provider, _QUERY, _docs(30, 400), budget_seconds=4.0)
 
-    assert out.width == RERANK_MIN_REAL_CANDIDATES and out.reranked
+    assert out.hand_off == "sizes" and not out.reranked and out.normalization is None
     assert out.measured is False
+    assert [c for c in provider.calls if len(c) > 1] == [], "no combined rerank runs"
     assert reranker_mod._cost_sums[_MODEL] == before, "no sample without a known padded size"
 
 
@@ -564,6 +568,23 @@ def test_s75_cjk_and_emoji_candidates_are_costed_by_tokens_not_characters(clock:
     assert width_latin == _reference_width([latin_n] * 12, anchors, 0.0, 1e-3, budget) == 12
     assert width_cjk == _reference_width([cjk_n] * 12, anchors, 0.0, 1e-3, budget)
     assert width_cjk < width_latin, "a CJK-heavy pool gets a narrower rerank than a Latin one"
+
+
+def test_s75_rerank_for_recall_sizes_the_width_in_tokens(clock: _Clock) -> None:
+    """End to end through `rerank_for_recall` with a seeded estimate: the same
+    ten candidates, equal in characters, get a wide rerank as Latin text and a
+    narrow one as CJK text, because the width is sized from their tokens."""
+    reranker_mod._record_rerank_cost(_MODEL, 1_000, 1.0, None)  # 1 ms per padded token
+    latin, cjk = "a" * 600, "\u5496" * 600
+    budget = 2.0
+
+    provider = _TokenizingProvider(clock, overhead=0.0, rate=1e-3)
+    out_latin = rerank_for_recall(provider, _QUERY, [latin] * 30, budget_seconds=budget)
+    provider = _TokenizingProvider(clock, overhead=0.0, rate=1e-3)
+    out_cjk = rerank_for_recall(provider, _QUERY, [cjk] * 30, budget_seconds=budget)
+
+    assert out_latin.reranked and out_latin.width > RERANK_MIN_REAL_CANDIDATES
+    assert out_cjk.width < out_latin.width, "equal characters, ten times the tokens"
 
 
 def test_s75_the_recorded_sample_is_in_tokens(clock: _Clock) -> None:
