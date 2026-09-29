@@ -27,8 +27,9 @@ def test_inventory_renders_full_registry_not_a_subset() -> None:
     inventory's whole job is telling her what exists when it is not in hand, so
     it must never render the recruited subset."""
     out = build_tool_inventory("Nell")
-    assert len(NELL_TOOL_NAMES) == 28
-    assert sum(1 for n in NELL_TOOL_NAMES if f"`{n}`" in out) == 28
+    # 28 before the name-recall fix added the add-name tool (S69), 29 with it.
+    assert len(NELL_TOOL_NAMES) == 29
+    assert sum(1 for n in NELL_TOOL_NAMES if f"`{n}`" in out) == 29
 
 
 def test_inventory_carries_the_reach_valve() -> None:

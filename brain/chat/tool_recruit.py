@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from brain.chat.salience import SalienceSignal
 from brain.tools import NELL_TOOL_NAMES
+from brain.tools.schemas import ADD_NAME_TOOL_NAME
 
 # SalienceSignal.maximal() yields score=1.0; 0.999 absorbs float drift only.
 _MAXIMAL_SCORE = 0.999
@@ -17,7 +18,9 @@ _MAXIMAL_SCORE = 0.999
 
 # Always available — interior voice, self-state reads, the escalation valve,
 # and memory search (v0.0.33 Track 1: she can always reach for what she
-# knows; heavy memory tools stay salience-gated below).
+# knows; heavy memory tools stay salience-gated below). The add-name tool is in
+# the core too (name-recall fix, S69, pending owner review): she can record a name
+# whenever one comes up, not only when memory salience fires.
 REFLEXIVE_CORE: tuple[str, ...] = (
     "record_monologue",
     "recall_monologue",
@@ -30,6 +33,7 @@ REFLEXIVE_CORE: tuple[str, ...] = (
     "pressure_since",
     "search_memories",
     "read_full_memory",
+    ADD_NAME_TOOL_NAME,
 )
 
 _MEMORY_TOOLS = (
