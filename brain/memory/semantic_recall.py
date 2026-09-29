@@ -32,9 +32,10 @@ exist, the reranker fails to load or score, or its anchor normalization has
 no median, the turn takes the NO-RERANK path: the coarse cut's candidates are
 ranked by cosine and gated by a COSINE floor (`MemoryStore.get_cosine_floor`,
 its own table, bootstrapped from the same bundled pairs until the daily tick
-calibrates it; the bootstrap is computed once per process by the central
-cadence job in the first lull, never on this hot path: until a cosine floor
-exists this path renders keyword results only, S85). A reranker failure therefore no longer demotes the turn to
+calibrates it; the bootstrap is computed once per process at process start,
+never on the reply path, and a failed one is retried at the next lull by the
+central cadence job: until a cosine floor exists this path renders keyword
+results only, S85). A reranker failure therefore no longer demotes the turn to
 keyword-only. The two scales never mix: a reranked candidate is gated by the
 normalized rerank floor, a cosine-path candidate by the cosine floor, and each
 path's calibration row carries its own true scale. (Spec §4, S82: a reranked
@@ -689,10 +690,10 @@ def _cosine_ranking(
     """The no-rerank (cosine) path (spec §2, S5/S6/S22/S25/S60): the coarse
     cut's candidates ranked genuine-first then monologue-family, each by
     cosine (R3, spec §4), gated by the cosine floor
-    (`store.get_cosine_floor`: persisted, else the bootstrap the central
-    cadence job computed off the hot path, S85). `None` when no cosine gate
-    exists yet (no calibrated row and the job has not produced the bootstrap,
-    or it failed and is backing off): the turn then contributes no semantic
+    (`store.get_cosine_floor`: persisted, else the bootstrap computed at
+    process start off the reply path, S85). `None` when no cosine gate exists
+    yet (no calibrated row, and the startup computation has not finished or
+    failed and awaits the next-lull retry): the turn then contributes no semantic
     results (keyword only), never an ungated ranking.
 
     Passive recall (`log_calibration`) writes ONE calibration row: the first
@@ -827,8 +828,8 @@ def run_semantic_recall(
       - an empty or sparse candidate pool (cold-start / idle backfill not
         caught up — "graceful warm-up"),
       - an embed failure, or no cosine floor yet on the cosine path (the
-        bootstrap not computed yet or backing off after a failure: no gate is
-        possible; never an ungated ranking),
+        bootstrap not computed yet, or failed and awaiting the next-lull retry: no
+        gate is possible; never an ungated ranking),
       - ANY failure ANYWHERE in this function (fail-soft: a broken/missing
         local model, a transient store error such as a locked sqlite db
         during the background backfill, or a floor-read error must never

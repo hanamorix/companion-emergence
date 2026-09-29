@@ -1041,26 +1041,6 @@ def build_app(
             mig_thread.start()
             app.state.bridge.migration_thread = mig_thread
 
-        # Floor bootstraps (name-recall fix S85, revised; spec §2): the cosine
-        # and rerank bootstrap floors are computed ONCE per process, here at
-        # process start, on a daemon thread off every reply path (recall only
-        # peeks the caches). Until it finishes, recall that needs a missing
-        # floor renders keyword results only; a failed bootstrap is retried at
-        # the next lull by the central cadence jobs. Off with the other
-        # background threads in tests. Fault-isolated: never breaks startup.
-        if bg:
-            try:
-                from brain.bridge import cli_throttle as _cli_throttle
-                from brain.memory import floor_startup as _floor_startup
-
-                app.state.bridge.floor_bootstrap_thread = _floor_startup.start_background(
-                    persona_dir,
-                    activity_marker=_cli_throttle.chat_activity_marker,
-                    name="floor-bootstrap",
-                )
-            except Exception:  # noqa: BLE001 — startup must not break on the bootstrap thread
-                logger.exception("floor bootstrap startup thread could not be started")
-
         # One-time tunables migration (ram-spike-fix INC-6, S25/S30/S37/S52/S71):
         # retires the pre-lull idle-tuning keys into the single
         # chat.idle_lull_seconds key. Synchronous, BEFORE the supervisor thread
@@ -1093,6 +1073,29 @@ def build_app(
             seed_last_message_from_active_conversations(persona_dir)
         except Exception as _exc:  # noqa: BLE001 — startup must not break; already fails closed internally
             logger.warning("is-chat-idle seed from active_conversations failed: %s", _exc)
+
+        # Floor bootstraps (name-recall fix S85, revised; spec §2): the cosine
+        # and rerank bootstrap floors are computed ONCE per process, here at
+        # process start, on a daemon thread off every reply path (recall only
+        # peeks the caches). Until it finishes, recall that needs a missing
+        # floor renders keyword results only; a failed bootstrap is retried at
+        # the next lull by the central cadence jobs. Off with the other
+        # background threads in tests. Fault-isolated: never breaks startup.
+        # Started AFTER the is-chat-idle seed above (the retry rule reads the
+        # same anchor through `chat_activity_marker`, so nothing may read it
+        # before the seed) and before the supervisor thread.
+        if bg:
+            try:
+                from brain.bridge import cli_throttle as _cli_throttle
+                from brain.memory import floor_startup as _floor_startup
+
+                app.state.bridge.floor_bootstrap_thread = _floor_startup.start_background(
+                    persona_dir,
+                    activity_marker=_cli_throttle.chat_activity_marker,
+                    name="floor-bootstrap",
+                )
+            except Exception:  # noqa: BLE001 — startup must not break on the bootstrap thread
+                logger.exception("floor bootstrap startup thread could not be started")
 
         # S84: "bridge start" for the empty-session prune (no message seen yet
         # in this process). Captured here, on this thread, BEFORE the supervisor

@@ -8,8 +8,8 @@ computed while a reply is being built: `MemoryStore.get_cosine_floor` /
 
 * once per process, at process start, `compute_missing_floors` computes every
   bootstrap that is missing (no calibrated row, not yet cached), the cosine one
-  first, then the rerank one, one after the other (never both models loaded at
-  once by this module). Two entry points call it: the bridge's startup
+  first, then the rerank one, one after the other (this module never loads
+  both models concurrently; both then stay resident in their provider caches). Two entry points call it: the bridge's startup
   background thread (`brain.bridge.server` lifespan) and `nell chat
   --no-bridge` session start (`brain.cli`), so recall "works from the first
   message" except for the moments before this finishes;
@@ -18,7 +18,11 @@ computed while a reply is being built: `MemoryStore.get_cosine_floor` /
   `rerank_floor_bootstrap` retry it at the next lull: due again only after chat
   activity has happened since the failure (no time constants).
 
-Nothing here raises.
+`compute_missing_floors` never raises: a failure is logged and recorded as a
+failed attempt (retried at the next lull). The `run_*_floor` helpers are
+fail-soft too; only their tiny id lookups (`embedder_model_id`,
+`reranker_model_id`) could raise, and every caller sits inside a guard
+(`compute_missing_floors`, the cadence pass).
 """
 
 from __future__ import annotations
@@ -128,10 +132,13 @@ def compute_missing_floors(
             return
         finally:
             store.close()
-        if cosine_needed:
-            run_cosine_floor(activity_marker=activity_marker())
-        if rerank_needed:
-            run_rerank_floor(activity_marker=activity_marker())
+        for needed, run in ((cosine_needed, run_cosine_floor), (rerank_needed, run_rerank_floor)):
+            if not needed:
+                continue
+            try:
+                run(activity_marker=activity_marker())
+            except Exception:  # noqa: BLE001 — one floor failing must not stop the other
+                logger.exception("floor_startup: %s raised", run.__name__)
     finally:
         _startup_active.clear()
 

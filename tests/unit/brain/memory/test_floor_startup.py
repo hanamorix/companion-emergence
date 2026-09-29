@@ -37,6 +37,14 @@ from tests.unit.brain.memory.test_monologue_last import (
     _seed,
 )
 
+
+@pytest.fixture(autouse=True)
+def _clean_startup_flag():
+    floor_startup._startup_active.clear()  # noqa: SLF001
+    yield
+    floor_startup._startup_active.clear()  # noqa: SLF001
+
+
 _COSINE_ID = "startup-cosine-id"
 _RERANK_ID = "startup-rerank-id"
 
@@ -135,6 +143,20 @@ def test_a_failing_cosine_bootstrap_does_not_stop_the_rerank_one_and_never_raise
     assert floor_calibration.peek_bootstrap_floor(_RERANK_ID) is not None
 
 
+def test_a_raising_run_helper_does_not_stop_the_other_floor_and_never_raises(
+    computes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def _boom(**kw):
+        raise RuntimeError("cosine helper raised")
+
+    monkeypatch.setattr(floor_startup, "run_cosine_floor", _boom)
+
+    floor_startup.compute_missing_floors(tmp_path)
+
+    assert ("end", "rerank") in computes
+    assert not floor_startup.startup_compute_active()
+
+
 def test_startup_never_raises_when_the_store_cannot_be_opened(
     computes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -208,6 +230,100 @@ def test_start_background_runs_the_computation_on_a_daemon_thread(computes, tmp_
 
     assert thread.daemon and not thread.is_alive()
     assert ("end", "rerank") in computes
+
+
+def test_start_background_forwards_the_activity_marker_to_the_thread(
+    computes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(floor_calibration, "get_cosine_bootstrap_floor", lambda _id: None)
+
+    floor_startup.start_background(tmp_path, activity_marker=lambda: 7.0).join(timeout=10)
+
+    assert not floor_calibration.cosine_bootstrap_due(_COSINE_ID, activity_marker=7.0)
+    assert floor_calibration.cosine_bootstrap_due(_COSINE_ID, activity_marker=8.0)
+
+
+# ---------------------------------------------------------------------------
+# The real activity marker (the retry rule's premise) and the startup order
+# ---------------------------------------------------------------------------
+
+
+def test_the_real_chat_activity_marker_changes_when_chat_happens_and_only_then() -> None:
+    cli_throttle.reset()
+    try:
+        idle_marker = cli_throttle.chat_activity_marker()
+        cli_throttle.is_chat_idle()
+        assert cli_throttle.chat_activity_marker() == idle_marker, "idle checks do not change it"
+
+        cli_throttle.note_user_message(at=100.0)
+        after_message = cli_throttle.chat_activity_marker()
+        assert after_message != idle_marker
+
+        cli_throttle.note_reply_end(at=160.0)
+        after_reply = cli_throttle.chat_activity_marker()
+        assert after_reply != after_message
+
+        cli_throttle.mark_interactive_active(at=400.0)
+        assert cli_throttle.chat_activity_marker() != after_reply
+        for _ in range(3):
+            cli_throttle.is_chat_idle(now=10_000.0)
+            cli_throttle.slot_available(now=10_000.0)
+        assert cli_throttle.chat_activity_marker() == 400.0, "a lull passing does not change it"
+    finally:
+        cli_throttle.reset()
+
+
+def test_the_real_marker_drives_the_retry_rule_end_to_end(
+    computes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cli_throttle.reset()
+    try:
+        monkeypatch.setattr(floor_calibration, "get_cosine_bootstrap_floor", lambda _id: None)
+        floor_startup.compute_missing_floors(
+            tmp_path, activity_marker=cli_throttle.chat_activity_marker
+        )
+        store = MemoryStore(tmp_path / "memories.db")
+        try:
+            marker = cli_throttle.chat_activity_marker
+            assert not floor_startup.cosine_floor_due(store, activity_marker=marker())
+
+            cli_throttle.note_user_message(at=50.0)
+            cli_throttle.note_reply_end(at=60.0)
+
+            assert floor_startup.cosine_floor_due(store, activity_marker=marker())
+        finally:
+            store.close()
+    finally:
+        cli_throttle.reset()
+
+
+def test_the_bridge_seeds_the_idle_anchor_before_it_starts_the_floor_thread(
+    bridge_persona: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    order: list[str] = []
+    real_seed = cli_throttle.seed_last_message_from_active_conversations
+
+    def _seed(persona_dir):
+        order.append("seed")
+        return real_seed(persona_dir)
+
+    def _start(persona_dir, *, activity_marker, name="floor-bootstrap"):
+        order.append("floor-thread")
+        t = threading.Thread(target=lambda: None, daemon=True)
+        t.start()
+        return t
+
+    monkeypatch.setattr(cli_throttle, "seed_last_message_from_active_conversations", _seed)
+    monkeypatch.setattr(floor_startup, "start_background", _start)
+    monkeypatch.setattr("brain.bridge.supervisor.run_folded", lambda **kw: None)
+    app = server.build_app(
+        persona_dir=bridge_persona, client_origin="tests", background_threads=True
+    )
+
+    with TestClient(app):
+        pass
+
+    assert order == ["seed", "floor-thread"]
 
 
 # ---------------------------------------------------------------------------

@@ -17,9 +17,10 @@ deploy recalibration immediately before daily calibration (S70/S73).
 
 Cadence rules (interval jobs, owned here):
 
-* A predicate job's own condition holds (the cosine floor bootstrap,
-  name-recall fix S85: no calibrated cosine row, no cached bootstrap, its
-  failure back-off elapsed), like deploy recalibration.
+* A predicate job's own condition holds (the two floor-bootstrap RETRY jobs,
+  name-recall fix S85 revised: no calibrated row, no cached bootstrap, chat
+  has happened since the failed attempt, the process-start computation not
+  running), like deploy recalibration.
 * A missing OR corrupt cadence file is created as "last ran now"
   (``next_at = now + interval``) and the job does not run on that pass
   (S22/S69). A present file with a past ``next_at`` is simply overdue (S34),
@@ -175,7 +176,7 @@ def run_central_pass(
 
     def _decide(job: str, action: str) -> None:
         decisions.append(JobDecision(job, action))
-        # skip-not-due fires for most jobs on most passes (15 lines a minute
+        # skip-not-due fires for most jobs on most passes (16 lines a minute
         # while idle); keep it out of the INFO log. Every other decision is INFO.
         level = logging.DEBUG if action == "skip-not-due" else logging.INFO
         logger.log(level, "central cadence: job=%s action=%s", job, action)

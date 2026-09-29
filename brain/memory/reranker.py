@@ -358,6 +358,11 @@ _provider_cache: dict[str, RerankerProvider] = {}
 _provider_cache_lock = threading.Lock()
 
 
+# Unrecognised `reranker.precision` values already warned about (the due checks
+# call `resolve_reranker_model_id` on every idle pass: warn once per value).
+_warned_precisions: set[object] = set()
+
+
 def resolve_reranker_model_id() -> str:
     """The runtime reranker model id (the id `build_reranker_provider()`'s
     provider reports from `model_id()`): `model_tier.MODEL_RERANKER_FP16` (the
@@ -369,7 +374,8 @@ def resolve_reranker_model_id() -> str:
     precision = tunables.get_tunable("reranker.precision", RERANKER_PRECISION)
     if precision == RERANKER_PRECISION_FP32:
         return model_for_tier(TIER_RERANKER)
-    if precision != RERANKER_PRECISION_FP16:
+    if precision != RERANKER_PRECISION_FP16 and precision not in _warned_precisions:
+        _warned_precisions.add(precision)
         log.warning(
             "reranker: unrecognized reranker.precision override %r — falling back to "
             "the pinned default %r",
@@ -453,11 +459,11 @@ def _bootstrap_reranker_provider(model_id: str) -> RerankerProvider:
     `build_reranker_provider` reads/writes, double-checked locking to
     match) so a caller that resolves to this same `model_id` elsewhere in
     the process reuses the already-loaded ONNX session instead of paying
-    for a second one. In practice this is very often a cache HIT: every
-    production call site that ends up asking `get_reranker_floor` a
-    question (`run_semantic_recall`, `_semantic_top_k`) has ALREADY
-    resolved/cached a provider for the exact model_id in question via
-    `build_reranker_provider` by the time it does so.
+    for a second one. In production a cache HIT is the rule: the only
+    caller path, `floor_startup.run_rerank_floor` (process start, or the
+    next-lull retry job; name-recall fix S85 revised), calls
+    `build_reranker_provider()` first, which registers the fp16 model and
+    caches the provider for the runtime model_id.
     """
     cached = _provider_cache.get(model_id)
     if cached is not None:

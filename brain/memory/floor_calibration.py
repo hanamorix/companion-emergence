@@ -63,32 +63,35 @@ so retention no longer needs to cover `FLOOR_FIT_MIN_LABELED_PAIRS`'s
 worst-case multi-day accumulation, only the current day plus a small
 safety margin.
 
-HOT-PATH no-persisted-floor bootstrap (F2a inc8, #250 §7 UPDATED, Roy
-2026-09-18): `get_bootstrap_floor` below is the module's OTHER, still-
-standing cold-start path — since Change 1 removes `derive_and_persist_
-floor`'s own bundled-pairs cold-start branch (see above), this hot path is
-now the ONLY place `reranker.py`'s bundled `_FP16_GATE_PAIRS` still gets
-scored to synthesize a floor (via the shared `_cold_start_pairs` helper
-below). It serves the true first-ever-install case, before any tick has
-run: `get_bootstrap_floor` is called SYNCHRONOUSLY from
-`MemoryStore.get_reranker_floor` whenever no `reranker_floor_calibration`
-row exists yet for a model_id — i.e. it can fire on the per-turn hot path,
-on the very FIRST no-row recall of the process. It is computed ONCE per
-model_id and cached process-wide (never persisted to `memories.db` — a
+No-persisted-floor RERANK bootstrap (F2a inc8, #250 §7 UPDATED, Roy
+2026-09-18; computed off the reply path since name-recall fix S85, revised):
+`get_bootstrap_floor` below is the module's OTHER, still-standing cold-start
+path — since Change 1 removes `derive_and_persist_floor`'s own bundled-pairs
+cold-start branch (see above), it is now the ONLY place `reranker.py`'s
+bundled `_FP16_GATE_PAIRS` still gets scored to synthesize a floor (via the
+shared `_cold_start_pairs` helper below). It serves the true first-ever-install
+case, before any tick has run. It is NEVER called from a reply:
+`MemoryStore.get_reranker_floor` only peeks the process cache
+(`peek_bootstrap_floor`). `run_rerank_bootstrap` computes it once per process
+at process start (`brain.memory.floor_startup`: the bridge's startup thread,
+`nell chat --no-bridge` session start) and the central cadence job
+`rerank_floor_bootstrap` retries a failed one at the next lull. It is computed
+ONCE per model_id and cached process-wide (never persisted to `memories.db` — a
 transient, in-memory-only fallback that a real persisted row always
 supersedes, see that function's docstring), and it deliberately builds its
 own reranker provider via `reranker._bootstrap_reranker_provider` rather
 than `reranker.build_reranker_provider` — the latter resolves its OWN
 model_id from the `reranker.precision` tunable (ignoring any
-caller-specified id), whereas this hot path must score the bundled pairs
-through the EXACT `model_id` `get_reranker_floor`'s caller is asking about
-(see `_bootstrap_reranker_provider`'s own docstring, current as of Change
-2's removal of the fp16/fp32 precision self-check this used to also dodge
-recursion through). Never touches the §6 torch-backed relevance judge —
-jina (ONNX, via `reranker.CrossEncoderProvider`) is the only model
-involved.
+caller-specified id), whereas this bootstrap must score the bundled pairs
+through the EXACT `model_id` it was asked about (`floor_startup.run_rerank_floor`
+calls `build_reranker_provider()` first, so the provider for the runtime
+model id is registered and cached; see `_bootstrap_reranker_provider`'s own
+docstring, current as of Change 2's removal of the fp16/fp32 precision
+self-check this used to also dodge recursion through). Never touches the §6
+torch-backed relevance judge — jina (ONNX, via `reranker.CrossEncoderProvider`)
+is the only model involved.
 
-F2b §5b (#276 inc3, UNCHANGED by Change 1): both this hot-path bootstrap
+F2b §5b (#276 inc3, UNCHANGED by Change 1): both this bootstrap
 AND (formerly) the now-removed `derive_and_persist_floor` cold-start
 branch fit on the per-query ANCHOR-NORMALIZED score
 (`raw - median(anchor_scores)`, `reranker.normalize_bundled_pairs_against_
@@ -100,8 +103,8 @@ gate (`reranker.normalize_against_anchors`) compares against. See
 Name-recall fix R2 (spec §2, S18/S25/S38): the same module also owns the
 COSINE floor the no-rerank path gates on (`get_cosine_bootstrap_floor`, the
 same F-beta fit over the same bundled pairs scored by the embedder, computed
-once per process by the central cadence job via `run_cosine_bootstrap`, never
-on the recall hot path, S85; and
+once per process at process start via `run_cosine_bootstrap`, retried at the next
+lull by the central cadence job, never on the reply path, S85; and
 `derive_and_persist_cosine_floor`, the daily fit from `cosine`-scale rows
 only into `cosine_floor_calibration`). Both derivations share `_fit_or_hold`;
 the two scales are never mixed.
@@ -577,7 +580,7 @@ _bootstrap_failed_at: dict[tuple[str, str], object] = {}
 def peek_cosine_bootstrap_floor(embedder_model_id: str) -> dict[str, Any] | None:
     """The cached cosine bootstrap floor for `embedder_model_id`, or `None`
     when it has not been computed in this process. NEVER computes anything
-    (S85): this is what the recall hot path reads through
+    (S85): this is what the reply path reads through
     `MemoryStore.get_cosine_floor`."""
     cached = _cosine_bootstrap_floor_cache.get(embedder_model_id)
     return dict(cached) if cached is not None else None
@@ -730,7 +733,7 @@ class FloorDerivationOutcome:
     the backstop held with NO prior row at all (a fresh deploy still inside
     Change 1's data-starvation ramp — nothing is in effect from THIS
     module for that case; per-turn recall still gets a served floor from
-    the separate, transient `get_bootstrap_floor` hot path — see
+    the separate, transient `get_bootstrap_floor` cache — see
     `MemoryStore.get_reranker_floor`)."""
 
     raw_fit_floor: float | None
@@ -804,7 +807,7 @@ def derive_and_persist_floor(store: MemoryStore, reranker_model_id: str) -> Floo
              crash on the `None` prior, do not synthesize a floor just to
              have something to persist — `floor`/`raw_fit_floor` in the
              returned outcome are `None`. Recall stays served meanwhile by
-             the separate hot-path `get_bootstrap_floor`
+             the separate `get_bootstrap_floor` cache
              (`MemoryStore.get_reranker_floor`'s own no-persisted-row
              fallback, untouched by this revision). Once some day
              accumulates `>= FLOOR_FIT_MIN_LABELED_PAIRS` real pairs, this

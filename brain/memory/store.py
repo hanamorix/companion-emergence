@@ -499,7 +499,7 @@ CREATE TABLE IF NOT EXISTS reranker_floor_calibration (
 -- scale is the table). Written only by the daily calibration tick
 -- (`floor_calibration.derive_and_persist_cosine_floor`); until a row exists,
 -- `MemoryStore.get_cosine_floor` serves the process-cached, never-persisted
--- bootstrap the central cadence job computed (S85), or None before it ran.
+-- bootstrap computed at process start (S85 revised), or None before it ran.
 -- `CREATE TABLE IF NOT EXISTS` on open: legacy-safe and idempotent (I9), no
 -- existing table or row is touched.
 CREATE TABLE IF NOT EXISTS cosine_floor_calibration (
@@ -1770,9 +1770,11 @@ class MemoryStore:
         computed (`floor_calibration.run_cosine_bootstrap`: the same F-beta
         fit over the same bundled example pairs the rerank floor bootstraps
         from, scored by this embedder), never persisted. This method NEVER
-        computes the bootstrap (name-recall fix S85: no hot-path compute): it
-        returns `None` while neither a persisted row nor the cached bootstrap
-        exists (the job has not run yet, or it failed and is backing off). The
+        computes the bootstrap (name-recall fix S85 revised: it is computed at
+        process start, `brain.memory.floor_startup`): it returns `None` while
+        neither a persisted row nor the cached bootstrap exists (the startup
+        computation has not finished, or it failed and awaits the next-lull
+        retry by the central cadence job). The
         caller then has no cosine gate and the turn contributes no semantic
         results (keyword only), never an ungated cosine ranking.
 
@@ -1783,8 +1785,8 @@ class MemoryStore:
             return persisted
         from brain.memory import floor_calibration
 
-        # S85: the hot path only PEEKS the process cache; the bootstrap is
-        # computed by the central cadence job in the first lull.
+        # S85 (revised): the reply path only PEEKS the process cache; the
+        # bootstrap is computed at process start, retried at the next lull.
         return floor_calibration.peek_cosine_bootstrap_floor(embedder_model_id)
 
     def write_cosine_floor(
