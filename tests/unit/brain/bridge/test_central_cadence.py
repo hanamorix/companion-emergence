@@ -139,6 +139,7 @@ def stubs(monkeypatch):
             "deploy_recalibration",
             "cosine_floor_bootstrap",
             "rerank_floor_bootstrap",
+            "rerank_width_remeasure",
         ),
         True,
     )
@@ -201,6 +202,12 @@ def stubs(monkeypatch):
         lambda _s, **_k: work["rerank_floor_bootstrap"],
     )
     monkeypatch.setattr(supervisor.floor_startup, "run_rerank_floor", rec("rerank_floor_bootstrap"))
+    monkeypatch.setattr(
+        supervisor.reranker, "stuck_width_due", lambda _m: work["rerank_width_remeasure"]
+    )
+    monkeypatch.setattr(
+        supervisor.reranker, "remeasure_stuck_width", rec("rerank_width_remeasure", True)
+    )
     monkeypatch.setattr(supervisor, "forgetting_run_pass", rec("maintenance"))
     monkeypatch.setattr(supervisor, "_run_narrative_memory_pass", lambda *a, **k: None)
     monkeypatch.setattr("brain.files.pending.sweep_expired", lambda *a, **k: None)
@@ -246,13 +253,18 @@ def _fake_jobs(names, log, *, due=True):
 # ---------------------------------------------------------------------------
 
 
-def test_job_table_is_the_16_gated_jobs_in_the_s55_order(tmp_path):
+def test_job_table_is_the_17_gated_jobs_in_the_s55_order(tmp_path):
     names = [j.name for j in _real_jobs(_persona(tmp_path))]
     assert names == list(GATED_JOB_ORDER)
-    assert len(names) == 16
-    # S85 (revised): the two floor-bootstrap RETRY jobs follow embedding backfill.
+    assert len(names) == 17
+    # S85 (revised): the two floor-bootstrap RETRY jobs follow embedding backfill;
+    # name-recall fix S100: the stuck-width re-measure follows them.
     i_bs = names.index("embedding_backfill")
-    assert names[i_bs + 1 : i_bs + 3] == ["cosine_floor_bootstrap", "rerank_floor_bootstrap"]
+    assert names[i_bs + 1 : i_bs + 4] == [
+        "cosine_floor_bootstrap",
+        "rerank_floor_bootstrap",
+        "rerank_width_remeasure",
+    ]
     # C38: deploy recalibration immediately after clustering, immediately
     # before daily calibration; C15/S43: calibration before self-tune.
     i = names.index("deploy_recalibration")
@@ -272,6 +284,7 @@ def test_job_table_due_sources(tmp_path):
         *NO_INTERVAL_JOBS,
         "cosine_floor_bootstrap",
         "rerank_floor_bootstrap",
+        "rerank_width_remeasure",
         "deploy_recalibration",
         "self_model_articulation",
     ):
@@ -288,7 +301,7 @@ def test_unknown_job_name_is_rejected():
 # ---------------------------------------------------------------------------
 
 
-def test_c15a_all_16_due_run_in_s55_order_real_table(tmp_path, stubs):
+def test_c15a_all_17_due_run_in_s55_order_real_table(tmp_path, stubs):
     persona_dir = _persona(tmp_path)
     _seed_all_overdue(persona_dir)
     decisions = _pass(persona_dir, _real_jobs(persona_dir))
@@ -351,7 +364,7 @@ def test_c5_no_gated_job_starts_inside_the_lull_then_all_start_after(tmp_path, s
         assert stubs.order == [], f"a gated job started inside the lull (t-t0={t - t0})"
 
     _pass(persona_dir, jobs, idle=lambda: cli_throttle.is_chat_idle(now=t0 + lull))
-    assert stubs.order == list(GATED_JOB_ORDER), "all 16 due jobs start at the first pass after"
+    assert stubs.order == list(GATED_JOB_ORDER), "all 17 due jobs start at the first pass after"
 
 
 def test_c5_reply_in_flight_blocks_even_past_the_lull(tmp_path, stubs):
@@ -463,7 +476,7 @@ def test_c6_skip_leaves_every_cadence_file_byte_identical_and_still_due(tmp_path
     assert stubs.order == []
     assert _snapshot_bytes(persona_dir) == before
     if deny == "slot":
-        assert [d.action for d in decisions if d.action != "init-cadence"] == ["skip-slot"] * 16
+        assert [d.action for d in decisions if d.action != "init-cadence"] == ["skip-slot"] * 17
 
     _pass(persona_dir, jobs)  # next pass, idle + slot: every job still due
     assert stubs.order == list(GATED_JOB_ORDER)
@@ -484,6 +497,7 @@ def test_c6_inner_slot_denial_is_a_skip_not_a_run(tmp_path, stubs, monkeypatch):
         "embedding_backfill",
         "cosine_floor_bootstrap",
         "rerank_floor_bootstrap",
+        "rerank_width_remeasure",
         "maintenance",
         "interest_sweep",
         "weekly_selftune",

@@ -21,7 +21,9 @@ Cadence rules (interval jobs, owned here):
   name-recall fix S85 revised, S91/S92: no calibrated row, no cached
   bootstrap, the floor was needed or its last attempt failed, chat has
   happened since the failed attempt, and no bootstrap of that floor in
-  flight), like deploy recalibration.
+  flight), like deploy recalibration; and the stuck-width re-measure
+  (name-recall fix S100, S113: a stuck budget miss on an already-loaded
+  reranker, not yet re-measured at this chat activity marker).
 * A missing OR corrupt cadence file is created as "last ran now"
   (``next_at = now + interval``) and the job does not run on that pass
   (S22/S69). A present file with a past ``next_at`` is simply overdue (S34),
@@ -66,7 +68,9 @@ logger = logging.getLogger(__name__)
 # S55 order, with deploy recalibration (S70/S73) immediately before daily
 # calibration and, after embedding backfill, the once-per-process cosine floor
 # bootstrap (name-recall fix S85; it needs the embedder, off the recall hot
-# path). Names are the job table's keys and the log's `job=` values.
+# path), then the stuck-width re-measure (S100: one timed rerank per lull
+# while the learned cost says fewer than 5 candidates fit). Names are the job
+# table's keys and the log's `job=` values.
 GATED_JOB_ORDER: tuple[str, ...] = (
     "pass2",
     "session_snapshot_prune",
@@ -74,6 +78,7 @@ GATED_JOB_ORDER: tuple[str, ...] = (
     "embedding_backfill",
     "cosine_floor_bootstrap",
     "rerank_floor_bootstrap",
+    "rerank_width_remeasure",
     "maintenance",
     "interest_sweep",
     "self_model_articulation",

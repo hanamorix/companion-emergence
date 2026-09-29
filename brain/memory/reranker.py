@@ -61,12 +61,14 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from brain import tunables
 from brain.dev_constants import RERANK_MIN_REAL_CANDIDATES
+from brain.memory import cost_period
+from brain.memory.cost_period import PeriodSums
 from brain.memory.relevance import CANDIDATE_POOL
 
 if TYPE_CHECKING:
@@ -533,8 +535,12 @@ def _reset_reranker_provider_cache() -> None:
 # `normalize_against_anchors`); the two warm-up reranks a process runs first
 # are discarded, as the hourly measurement discarded them (S24/S32).
 #
-# PARKED (owner, Q15 / ledger F10): nothing here recovers from a stuck
-# estimate. See the marked seam in `rerank_for_recall`.
+# The time sums cover the current 24-hour compaction period (S101, S114; see
+# `cost_period`). Stuck-width recovery (S100, S113, S116): the last query that
+# went to the cosine path for lack of budget is kept per model id; while the
+# estimate says its first 5 candidates do not fit the full latency budget, the
+# `rerank_width_remeasure` gated job re-measures them once per chat lull
+# (`stuck_width_due`, `remeasure_stuck_width`).
 
 # Clock seam: `rerank_timed` reads elapsed time through this name so tests can
 # inject a scripted clock (criterion C1a). Production: `time.monotonic`.
@@ -581,23 +587,42 @@ def _rss_delta(before: float | None, after: float | None) -> float | None:
 
 @dataclass(frozen=True)
 class _CostSums:
-    """Running sums for one reranker model id. Immutable: an update builds a
-    new instance and swaps it in under `_cost_lock`, so a reader never sees
-    half of one sample's sums (CONC-1).
+    """One reranker model id's cost state. Immutable: an update builds a new
+    instance and swaps it in under `_cost_lock`, so a reader never sees half
+    of one sample (CONC-1).
 
-    `sum_x`/`sum_xx`/`ram_x` are Python ints (x = pairs * longest pair is an
-    integer token count), so the least-squares denominator
-    `n * sum_xx - sum_x ** 2` is exact however long the process runs."""
+    `period` is the time model: this compaction period's running sums and the
+    fit carried in from the previous period (name-recall fix S101, S114;
+    `cost_period`). `n`, `sum_x`, `sum_y`, `sum_xy`, `sum_xx` read the current
+    period's sums. The RAM fields are process lifetime (not reset at the
+    tick): the high water is a property of the ONNX arena this process holds
+    (S74), and forgetting it would dilute the RAM figure (R1 round-1 F1)."""
 
-    n: int = 0
-    sum_x: int = 0
-    sum_y: float = 0.0
-    sum_xy: float = 0.0
-    sum_xx: int = 0
+    period: PeriodSums = PeriodSums()
     # RAM (see the section header): growth past the high water only.
     peak_x: int = 0  # largest padded size measured so far (the high water)
     ram_bytes: float = 0.0  # sum of max(0, RSS delta) over calls that went past the high water
     ram_x: int = 0  # sum of (x - high water before the call) over those same calls
+
+    @property
+    def n(self) -> int:
+        return self.period.sums.n
+
+    @property
+    def sum_x(self) -> int:
+        return self.period.sums.sum_x
+
+    @property
+    def sum_y(self) -> float:
+        return self.period.sums.sum_y
+
+    @property
+    def sum_xy(self) -> float:
+        return self.period.sums.sum_xy
+
+    @property
+    def sum_xx(self) -> int:
+        return self.period.sums.sum_xx
 
     def plus(self, padded_tokens: int, seconds: float, rss_delta_bytes: float | None) -> _CostSums:
         ram_bytes, ram_x = self.ram_bytes, self.ram_x
@@ -605,15 +630,14 @@ class _CostSums:
             ram_bytes += max(0.0, rss_delta_bytes)
             ram_x += padded_tokens - self.peak_x
         return _CostSums(
-            n=self.n + 1,
-            sum_x=self.sum_x + padded_tokens,
-            sum_y=self.sum_y + seconds,
-            sum_xy=self.sum_xy + padded_tokens * seconds,
-            sum_xx=self.sum_xx + padded_tokens * padded_tokens,
+            period=self.period.plus(padded_tokens, seconds),
             peak_x=max(self.peak_x, padded_tokens),
             ram_bytes=ram_bytes,
             ram_x=ram_x,
         )
+
+    def next_period(self) -> _CostSums:
+        return replace(self, period=self.period.next_period())
 
 
 @dataclass(frozen=True)
@@ -622,7 +646,8 @@ class RerankCostEstimate:
     header). `ram_bytes_per_token` is RSS growth per padded token past
     `peak_padded_tokens` (the largest padded batch measured so far); `None`
     when no call past the high water had a readable RSS delta (the RAM term
-    of the width fit is then skipped)."""
+    of the width fit is then skipped). `measured_batches` = the measurements
+    behind the time fit in effect."""
 
     overhead_seconds: float
     seconds_per_token: float
@@ -631,30 +656,39 @@ class RerankCostEstimate:
     peak_padded_tokens: int = 0
 
 
+@dataclass(frozen=True)
+class _BudgetMiss:
+    """The last query per reranker model id that went to the cosine path for
+    lack of budget (S113): its text, its first `RERANK_MIN_REAL_CANDIDATES`
+    prefix candidates and their pair token sizes, and the anchors' pair sizes.
+    Held until a rerank proves 5 fit (S116 a), the re-measure job clears or
+    drops it (S116), or a newer miss replaces it. Holds one query text (a whole
+    paste on the fallback path) and 5 memory texts per model id."""
+
+    query: str
+    documents: tuple[str, ...]
+    candidate_tokens: tuple[int, ...]
+    anchor_tokens: tuple[int, ...]
+
+
 def _fit_cost(sums: _CostSums) -> tuple[float, float] | None:
-    """(overhead, rate) by ordinary least squares over the running sums
-    (spec §1, S67). Degenerate fits fall back to a zero overhead and the
-    through-origin ratio of sums (plan P-2): a single measured batch, all
-    batches of one padded size (`n * sum_xx - sum_x ** 2 == 0`), a negative
-    fitted overhead, or a non-positive fitted rate. `None` before any
-    measured batch with a non-zero size."""
-    if sums.n == 0 or sums.sum_x <= 0:
-        return None
-    denominator = sums.n * sums.sum_xx - sums.sum_x * sums.sum_x
-    if denominator > 0:
-        rate = (sums.n * sums.sum_xy - sums.sum_x * sums.sum_y) / denominator
-        overhead = (sums.sum_y - rate * sums.sum_x) / sums.n
-        if overhead >= 0.0 and rate > 0.0:
-            return overhead, rate
-    return 0.0, sums.sum_y / sums.sum_x
+    """(overhead, rate) in effect for `sums` (S67 least squares over the
+    current period, with the S101/S114 carried fit; `cost_period`)."""
+    fit = sums.period.fit()
+    return None if fit is None else (fit.overhead, fit.rate)
 
 
-# model_id -> running sums, and the model ids whose warm-up has run. One lock
-# guards both (every read and every read-modify-write), so a concurrent
-# passive recall and `search_memories` call (#297: the tool runs in a bridge
-# worker thread) never lose a sample.
+# model_id -> cost state, the model ids whose warm-up has run, the last query
+# per model id that went to the cosine path for lack of budget (S113), and the
+# chat activity marker of each model id's last re-measure (S100). One lock
+# guards them all (every read and every read-modify-write), so a concurrent
+# passive recall, `search_memories` call (#297: the tool runs in a bridge
+# worker thread), the re-measure job and the compaction tick never lose an
+# update.
 _cost_sums: dict[str, _CostSums] = {}
 _warmed_model_ids: set[str] = set()
+_budget_misses: dict[str, _BudgetMiss] = {}
+_remeasured_marker: dict[str, object] = {}
 _cost_lock = threading.Lock()
 
 # Test-only seam (CONC-1): called inside an update, between reading the
@@ -669,16 +703,15 @@ def rerank_cost_estimate(model_id: str) -> RerankCostEstimate | None:
         sums = _cost_sums.get(model_id)
     if sums is None:
         return None
-    fit = _fit_cost(sums)
+    fit = sums.period.fit()
     if fit is None:
         return None
-    overhead, rate = fit
     ram_per_token = sums.ram_bytes / sums.ram_x if sums.ram_x > 0 else None
     return RerankCostEstimate(
-        overhead_seconds=overhead,
-        seconds_per_token=rate,
+        overhead_seconds=fit.overhead,
+        seconds_per_token=fit.rate,
         ram_bytes_per_token=ram_per_token,
-        measured_batches=sums.n,
+        measured_batches=fit.samples,
         peak_padded_tokens=sums.peak_x,
     )
 
@@ -686,7 +719,7 @@ def rerank_cost_estimate(model_id: str) -> RerankCostEstimate | None:
 def _record_rerank_cost(
     model_id: str, padded_tokens: int, seconds: float, rss_delta_bytes: float | None
 ) -> None:
-    """Add one measured recall rerank to `model_id`'s running sums."""
+    """Add one measured rerank to `model_id`'s running sums."""
     with _cost_lock:
         current = _cost_sums.get(model_id, _CostSums())
         if _cost_update_hook is not None:
@@ -694,11 +727,170 @@ def _record_rerank_cost(
         _cost_sums[model_id] = current.plus(padded_tokens, seconds, rss_delta_bytes)
 
 
+def _start_new_rerank_period() -> None:
+    """The 24-hour compaction tick (S101): every model id's time sums start
+    over, the fit in effect carried (S114). RAM and warm-up state are kept."""
+    with _cost_lock:
+        for model_id, sums in list(_cost_sums.items()):
+            _cost_sums[model_id] = sums.next_period()
+
+
+cost_period.on_new_period(_start_new_rerank_period)
+
+
 def _reset_rerank_cost_model() -> None:
-    """Test-only: forget every model id's running sums and warm-up state."""
+    """Test-only: forget every model id's running sums, warm-up state, budget
+    misses and re-measure markers."""
     with _cost_lock:
         _cost_sums.clear()
         _warmed_model_ids.clear()
+        _budget_misses.clear()
+        _remeasured_marker.clear()
+
+
+def _full_rerank_budget() -> float:
+    """The full per-call rerank latency budget (`reranker.latency_budget_seconds`,
+    read now): what "stuck" and the S116 clear are judged against (S113, S116),
+    never a paragraph's share or a message's remainder."""
+    return float(tunables.get_tunable("reranker.latency_budget_seconds", LATENCY_BUDGET_SECONDS))
+
+
+def _is_stuck(miss: _BudgetMiss, estimate: RerankCostEstimate | None) -> bool:
+    """S113: the estimate predicts that fewer than 5 real candidates of the
+    miss fit the full budget (time term only; the RAM bound is not the learned
+    cost)."""
+    if estimate is None:
+        return False
+    width = fit_rerank_width(
+        miss.candidate_tokens,
+        miss.anchor_tokens,
+        estimate,
+        _full_rerank_budget(),
+        None,
+        RERANK_MIN_REAL_CANDIDATES,
+    )
+    return width < RERANK_MIN_REAL_CANDIDATES
+
+
+def _drop_miss(model_id: str, miss: _BudgetMiss) -> None:
+    """Remove `model_id`'s miss iff it is still `miss` (a newer one survives,
+    CONC-8)."""
+    with _cost_lock:
+        if _budget_misses.get(model_id) is miss:
+            del _budget_misses[model_id]
+
+
+def _job_state(model_id: str) -> tuple[_BudgetMiss | None, object, bool]:
+    """(miss, the marker of the last re-measure or `_NEVER`, warmed) under the
+    lock."""
+    with _cost_lock:
+        return (
+            _budget_misses.get(model_id),
+            _remeasured_marker.get(model_id, _NEVER),
+            model_id in _warmed_model_ids,
+        )
+
+
+# "No re-measure yet" for a model id: distinct from every chat activity
+# marker value, including the `-inf` of a process that has seen no message.
+_NEVER = object()
+
+# Test-only seam (CONC-8): called by `remeasure_stuck_width` between its
+# measured rerank and its clear/drop. `None` in production.
+_remeasure_hook: Callable[[], None] | None = None
+
+
+def stuck_width_due(activity_marker: object) -> bool:
+    """Whether the `rerank_width_remeasure` job is due (S100, S113): the
+    runtime reranker model id has a budget miss that is stuck under the
+    current estimate, its warm-up has run in this process and its provider is
+    cached (the job never builds or loads a model), and no re-measure has run
+    at this chat activity marker (once per lull). A miss found not stuck is
+    dropped. Takes `_cost_lock` only briefly, never nested."""
+    model_id = resolve_reranker_model_id()
+    miss, stamp, warmed = _job_state(model_id)
+    if miss is None or not warmed or _provider_cache.get(model_id) is None:
+        return False
+    if stamp is not _NEVER and stamp == activity_marker:
+        return False
+    if not _is_stuck(miss, rerank_cost_estimate(model_id)):
+        _drop_miss(model_id, miss)
+        return False
+    return True
+
+
+def remeasure_stuck_width(activity_marker: object) -> bool:
+    """The `rerank_width_remeasure` job's run (S100, S113, S116): one timed
+    rerank of the stuck miss's 5 candidates (5 real + `anchor_count(5)`
+    anchors) on the already-loaded provider, added to the cost sums. Then the
+    miss is cleared when the measured seconds are within the full budget
+    (S116 a: 5 fit) and dropped when they exceed it (S116 b: genuinely too
+    long, not stuck). The marker is stamped first, so a failing or RAM-skipped
+    run still runs once per lull. Skipped (miss kept) when the miss is no
+    longer stuck (then dropped) or the RAM bound predicts the batch does not
+    fit the current headroom. Returns True iff the rerank ran. Provider
+    exceptions propagate (the central pass logs them)."""
+    model_id = resolve_reranker_model_id()
+    miss, _, warmed = _job_state(model_id)
+    provider = _provider_cache.get(model_id)
+    if miss is None or not warmed or provider is None:
+        return False
+    with _cost_lock:
+        _remeasured_marker[model_id] = activity_marker
+    estimate = rerank_cost_estimate(model_id)
+    if not _is_stuck(miss, estimate):
+        _drop_miss(model_id, miss)
+        return False
+    k = anchor_count(len(miss.documents))
+    padded = (len(miss.documents) + k) * max([*miss.candidate_tokens, *miss.anchor_tokens[:k]])
+    ram_per_token = estimate.ram_bytes_per_token if estimate is not None else None
+    if ram_per_token is not None and ram_per_token > 0.0:
+        headroom = _available_ram_headroom_bytes()
+        growth = max(0, padded - estimate.peak_padded_tokens)
+        if headroom is not None and ram_per_token * growth > headroom:
+            log.info("rerank width re-measure: skipped, the batch does not fit the RAM headroom")
+            return False
+    _, seconds = _measured_rerank(
+        provider, model_id, miss.query, list(miss.documents), miss.candidate_tokens, miss.anchor_tokens
+    )
+    if _remeasure_hook is not None:
+        _remeasure_hook()
+    budget = _full_rerank_budget()
+    if seconds is not None:
+        _drop_miss(model_id, miss)
+    log.info(
+        "rerank width re-measure: model=%s padded_tokens=%d seconds=%s budget=%s -> %s",
+        model_id,
+        padded,
+        seconds,
+        budget,
+        "5 fit" if seconds is not None and seconds <= budget else "too long, dropped",
+    )
+    return True
+
+
+def _measured_rerank(
+    provider: RerankerProvider,
+    model_id: str,
+    query: str,
+    documents: list[str],
+    candidate_tokens: Sequence[int],
+    anchor_tokens: Sequence[int],
+) -> tuple[AnchorNormalizationResult, float | None]:
+    """Rerank `documents` with anchors on top and record the call in the cost
+    model (x = (n + k) x the longest of the n candidates' and k anchors' pair
+    sizes). Shared by `rerank_for_recall` and the re-measure job. Returns the
+    normalization and the measured seconds (`None` when the provider gave
+    none: nothing recorded)."""
+    normalization = normalize_against_anchors(provider, query, documents)
+    if normalization.seconds is None:
+        return normalization, None
+    k = normalization.anchor_count
+    longest = max([*candidate_tokens[: len(documents)], *anchor_tokens[:k]])
+    _record_rerank_cost(
+        model_id, (len(documents) + k) * longest, normalization.seconds, normalization.rss_delta_bytes
+    )
+    return normalization, normalization.seconds
 
 
 def _warm_up_once(provider: RerankerProvider, query: str, documents: Sequence[str]) -> None:
@@ -1138,30 +1330,34 @@ def rerank_for_recall(
     width = fit_rerank_width(candidate_tokens, anchor_tokens, estimate, budget_seconds, headroom, cap)
 
     if width < RERANK_MIN_REAL_CANDIDATES:
-        # PARKED SEAM (owner ruling pending: Q15 / ledger F10, stuck-width
-        # recovery). Reaching here means the MEASURED estimate says fewer
-        # than the S5 minimum fit, so this query is not reranked and so adds
-        # no new measurement. If every later message also lands here, the
-        # estimate never changes again until the process restarts (the
-        # absorbing state, criterion ADV-9). No recovery rule is built; the
-        # owner's rule, if any, goes here. `hand_off="budget"` marks this
-        # case apart from a small pool. (The RAM term alone lands here only
-        # for batches larger than any measured so far: within the high water
-        # it predicts no growth, so it cannot lock the width below a size
-        # already run.)
+        # The MEASURED estimate says fewer than the S5 minimum fit this
+        # query's budget, so it is not reranked and adds no measurement. It is
+        # kept as the model id's last budget miss (S113); while the estimate
+        # says its first 5 do not fit the FULL budget, the re-measure job
+        # re-times them at a chat lull (S100), so an inflated estimate cannot
+        # absorb every later message. (The RAM term alone lands here only for
+        # batches larger than any measured so far.)
+        miss = _BudgetMiss(
+            query=query,
+            documents=tuple(pool[:RERANK_MIN_REAL_CANDIDATES]),
+            candidate_tokens=tuple(candidate_tokens[:RERANK_MIN_REAL_CANDIDATES]),
+            anchor_tokens=tuple(anchor_tokens),
+        )
+        with _cost_lock:
+            _budget_misses[model_id] = miss
         return RecallRerank(
             width=width, reranked=False, hand_off="budget", normalization=None, measured=False
         )
 
-    normalization = normalize_against_anchors(provider, query, pool[:width])
-    measured = False
-    if normalization.seconds is not None:
-        k = normalization.anchor_count
-        longest = max([*candidate_tokens[:width], *anchor_tokens[:k]])
-        _record_rerank_cost(
-            model_id, (width + k) * longest, normalization.seconds, normalization.rss_delta_bytes
-        )
-        measured = True
+    normalization, seconds = _measured_rerank(
+        provider, model_id, query, pool[:width], candidate_tokens, anchor_tokens
+    )
+    measured = seconds is not None
+    if measured and seconds <= _full_rerank_budget():
+        # S116 (a): a rerank of 5 or more real candidates ran within the full
+        # budget, which proves 5 fit: the model id is not stuck.
+        with _cost_lock:
+            _budget_misses.pop(model_id, None)
     if not normalization.did_normalize:
         # Raw scores: never handed to a caller that could gate them.
         return RecallRerank(

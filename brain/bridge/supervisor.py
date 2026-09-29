@@ -107,7 +107,7 @@ from brain.ingest.pipeline import (
 )
 from brain.initiate.review import _rest_state_from_energy, run_initiate_review_tick
 from brain.initiate.user_pattern import compute_user_presence
-from brain.memory import floor_startup
+from brain.memory import cost_period, floor_startup, reranker
 from brain.memory.embedding_backfill import (
     delete_legacy_embeddings_db as _delete_legacy_embeddings_db,
 )
@@ -994,6 +994,27 @@ def _build_gated_jobs(
         )
     )
 
+    # 4c. stuck-width re-measure — name-recall fix S100, S113, S116 (spec §7).
+    # Due while the runtime reranker's last budget miss is stuck (the learned
+    # cost says fewer than 5 of its candidates fit the full latency budget),
+    # the reranker is already loaded, and no re-measure has run at this chat
+    # activity marker (once per lull; no time constant). One timed rerank of
+    # 5 candidates on the loaded provider; never loads a model.
+    def _rerank_width_remeasure_job() -> JobOutcome:
+        with cli_throttle.background_slot() as slot:
+            if not slot:
+                return JobOutcome.SKIPPED
+            reranker.remeasure_stuck_width(cli_throttle.chat_activity_marker())
+        return JobOutcome.COMPLETED
+
+    jobs.append(
+        GatedJob(
+            "rerank_width_remeasure",
+            run=_rerank_width_remeasure_job,
+            has_work=lambda: reranker.stuck_width_due(cli_throttle.chat_activity_marker()),
+        )
+    )
+
     # 5. maintenance — forgetting + narrative (+ the two cheap sweeps).
     if maintenance_interval_s is not None:
 
@@ -1109,14 +1130,23 @@ def _build_gated_jobs(
     if compaction_interval_s is not None:
 
         def _compaction_run() -> JobOutcome:
-            from brain.chat.compaction import build_compaction_provider
+            # Name-recall fix S101: the 24-hour compaction tick starts a new
+            # cost period (the rerank and paragraph-embed running sums reset,
+            # the fit in effect carried) whenever this job's cadence advances:
+            # it completed, or it raised (S44). A paused tick does not.
+            paused = False
+            try:
+                from brain.chat.compaction import build_compaction_provider
 
-            paused = _run_compaction_tick(
-                persona_dir,
-                build_compaction_provider(persona_dir),
-                is_session_busy=is_session_busy,
-                should_pause=_between_items,
-            )
+                paused = _run_compaction_tick(
+                    persona_dir,
+                    build_compaction_provider(persona_dir),
+                    is_session_busy=is_session_busy,
+                    should_pause=_between_items,
+                )
+            finally:
+                if not paused:
+                    cost_period.start_new_period()
             return JobOutcome.PAUSED if paused else JobOutcome.COMPLETED
 
         jobs.append(
