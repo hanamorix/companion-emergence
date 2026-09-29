@@ -309,12 +309,12 @@ def test_manual_override_wins_over_avx2_auto_detected_default(
     monkeypatch.setattr(reranker_mod, "LATENCY_BUDGET_SECONDS", 2.0)
 
     # Name-recall fix R1: the budget feeds the per-message width fit. A
-    # measured cost of 1/1024 s per padded character (overhead 0) and pairs
-    # of 8 characters make each document cost 1/128 s, so the 0.25 s
+    # measured cost of 1/1024 s per padded token (overhead 0) and pairs
+    # of 8 tokens make each document cost 1/128 s, so the 0.25 s
     # override fits 32 documents (24 real + 8 anchors) where the 2.0 s
     # default would fit the whole 50-candidate pool.
-    class _EightCharPairs(FakeRerankerProvider):
-        def pair_char_lengths(self, query, documents):
+    class _EightTokenPairs(FakeRerankerProvider):
+        def pair_token_lengths(self, query, documents):
             return [8 for _ in documents]
 
         def model_id(self) -> str:
@@ -323,7 +323,7 @@ def test_manual_override_wins_over_avx2_auto_detected_default(
     reranker_mod._record_rerank_cost("override-test-provider", 1024, 1.0, None)
 
     outcome = reranker_mod.rerank_for_recall(
-        _EightCharPairs(default=0.0), "q", [f"doc-{i}" for i in range(50)]
+        _EightTokenPairs(default=0.0), "q", [f"doc-{i}" for i in range(50)]
     )
     # 24 real + min(8, 24 // 2) = 8 anchors = 32 documents = 0.25 s; 25 real
     # would be 33 documents. The default budget would have given 50.

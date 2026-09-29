@@ -214,7 +214,7 @@ def test_budget_share_below_five_takes_the_cosine_path(
     _write_cosine_floor(store, 0.5)
     rec = _Recording(scores={m.content: 50.0 for m in mems})
     monkeypatch.setattr("brain.memory.reranker.build_reranker_provider", lambda **kw: rec)
-    reranker_mod._record_rerank_cost(_RERANKER_ID, 1_000, 1.0, None)  # 1 ms per padded char
+    reranker_mod._record_rerank_cost(_RERANKER_ID, 1_000, 1.0, None)  # 1 ms per padded token
     monkeypatch.setattr(reranker_mod, "LATENCY_BUDGET_SECONDS", 1e-6)
 
     result = run_semantic_recall(store, tmp_path, _QUERY)

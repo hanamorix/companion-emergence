@@ -31,8 +31,8 @@ Also owns the PER-MESSAGE rerank-width fit (name-recall fix R1, spec §1,
 S4/S23/S24/S32/S62/S67): the hourly width sample (one query's top-5 docs,
 cached ~1 h, diagnosis H8) is gone. Every recall-time rerank is timed and
 feeds a per-process, per-reranker-model cost model (a per-call overhead plus
-a per-character rate over the batch's padded size, separated by least
-squares over running sums) and a RAM-per-character figure (RSS delta around
+a per-token rate over the batch's padded size in reranker tokens, separated by
+least squares over running sums) and a RAM-per-token figure (RSS delta around
 the same call); each message then fits its own width to the lengths of its
 own candidates within the latency budget (``LATENCY_BUDGET_SECONDS``, the one
 ops tunable) and the measured RAM bound. See the "Per-message rerank width"
@@ -178,7 +178,7 @@ class RerankerProvider(ABC):
         `seconds` is the wall time of the scoring call, read from the module
         clock seam `_clock`; `rss_delta_bytes` is this process's RSS after
         minus before the call (`None` when RSS is unreadable, e.g. not Linux),
-        the per-character RAM measurement S32 asks for. Only RECALL paths call
+        the per-token RAM measurement S32 asks for. Only RECALL paths call
         this (passive recall and `search_memories`, via
         `normalize_against_anchors`); bootstrap-floor and calibration scoring
         call plain `rerank()` and so never feed the cost model (S24).
@@ -192,11 +192,17 @@ class RerankerProvider(ABC):
         seconds = _clock() - start
         return scores, seconds, _rss_delta(before, _current_rss_bytes())
 
-    def pair_char_lengths(self, query: str, documents: Sequence[str]) -> list[int]:
-        """Per document, the character length of the (query, document) pair
-        as the model sees it (S62, plan P-32): query + document characters.
-        This default counts full lengths; `CrossEncoderProvider` overrides it
-        to count only the characters that survive tokenizer truncation."""
+    def pair_token_lengths(self, query: str, documents: Sequence[str]) -> list[int] | None:
+        """Per document, the length in reranker TOKENS of the (query, document)
+        pair as the model sees it, after truncation (S62, S75): the cost model's
+        size unit, because the reranker pays per padded token, not per
+        character. `None` means token counts are unavailable.
+
+        This default has no tokenizer, so it counts characters as a stand-in
+        (`len(query) + len(doc)`): a provider with no tokenizer is only a test
+        double, where the unit is whatever the test scripts consistently.
+        `CrossEncoderProvider` overrides it with the loaded model's own
+        tokenizer."""
         return [len(query) + len(doc) for doc in documents]
 
 
@@ -254,29 +260,30 @@ class CrossEncoderProvider(RerankerProvider):
             after = _current_rss_bytes()
         return scores, seconds, _rss_delta(before, after)
 
-    def pair_char_lengths(self, query: str, documents: Sequence[str]) -> list[int]:
-        """Surviving pair lengths (S62, plan P-32): each (query, document)
-        pair is encoded with the loaded model's OWN tokenizer (the same
-        `encode_batch` call fastembed makes before scoring, truncation at the
-        model maximum already enabled on it) and counted with
-        `surviving_pair_char_lengths`. Fail-soft: on any failure the full
-        character lengths are used instead (logged); they over-estimate a
-        truncated pair, never under-estimate it, so the width errs narrow."""
+    def pair_token_lengths(self, query: str, documents: Sequence[str]) -> list[int] | None:
+        """Surviving pair lengths in tokens (S62, S75, plan P-32): each (query,
+        document) pair is encoded with the loaded model's OWN tokenizer (the
+        same `encode_batch` call fastembed makes before scoring, truncation at
+        the model maximum already enabled on it) and counted with
+        `surviving_pair_token_lengths`. Fail-soft: on any failure the result is
+        `None` (logged), never a character count, so a different unit can never
+        reach the token-based cost model; the caller then fits no width from
+        sizes and records no sample (`rerank_for_recall`)."""
         try:
             with self._rerank_lock:
                 tokenizer = self._pair_tokenizer()
                 encodings = tokenizer.encode_batch([(query, doc) for doc in documents])
-            return surviving_pair_char_lengths(query, documents, encodings)
+            return surviving_pair_token_lengths(encodings)
         except Exception:  # noqa: BLE001 — fail-soft: a length probe must never break recall
             # Warn with the traceback once per provider; later failures (the
             # same broken accessor, every message) log at debug level.
             first = not getattr(self, "_length_probe_failed", False)
             self._length_probe_failed = True
             (log.warning if first else log.debug)(
-                "reranker: surviving pair lengths unavailable — counting full character lengths",
+                "reranker: surviving pair token lengths unavailable — sizing the rerank without them",
                 exc_info=first,
             )
-            return super().pair_char_lengths(query, documents)
+            return None
 
     def _pair_tokenizer(self) -> Any:
         """The loaded fastembed cross-encoder's tokenizer (a PRIVATE fastembed
@@ -298,34 +305,19 @@ class CrossEncoderProvider(RerankerProvider):
         return self._model_id
 
 
-def surviving_pair_char_lengths(
-    query: str, documents: Sequence[str], encodings: Sequence[Any]
-) -> list[int]:
-    """Characters of each (query, document) pair that survive tokenizer
-    truncation (S62), from each pair encoding's `offsets` and `sequence_ids`
-    (sequence 0 = query, 1 = document; special and padding tokens carry no
-    sequence id) and `overflowing` (non-empty iff the pair was truncated).
+def surviving_pair_token_lengths(encodings: Sequence[Any]) -> list[int]:
+    """Tokens of each (query, document) pair that the reranker actually runs,
+    counted from each pair encoding after truncation (S62, S75): the tokens
+    the tokenizer kept, special tokens included (the model pays for those
+    too), padding excluded. The encoding's `attention_mask` is 1 for exactly
+    those tokens; the batch's padding to its own longest pair (which the
+    tokenizer adds on `encode_batch`) carries 0, so it is not counted. A
+    pair truncated to the model maximum therefore counts at the maximum, and
+    a short pair at its own length.
 
-    A pair that was not truncated counts at its full length. For a truncated
-    pair each segment counts up to the end offset of its last surviving
-    token, or at its full length when that token reaches the segment's last
-    non-whitespace character (the segment was not the one cut; trailing
-    whitespace carries no token of its own)."""
-    lengths: list[int] = []
-    for doc, encoding in zip(documents, encodings, strict=True):
-        if not encoding.overflowing:
-            lengths.append(len(query) + len(doc))
-            continue
-        last_end = {0: 0, 1: 0}
-        for (_start, end), sequence_id in zip(encoding.offsets, encoding.sequence_ids, strict=True):
-            if sequence_id in last_end and end > last_end[sequence_id]:
-                last_end[sequence_id] = end
-        lengths.append(_surviving_chars(query, last_end[0]) + _surviving_chars(doc, last_end[1]))
-    return lengths
-
-
-def _surviving_chars(text: str, last_end: int) -> int:
-    return len(text) if last_end >= len(text.rstrip()) else last_end
+    Counted per pair, not per character: the same number of characters is a
+    very different token count in Latin text and in CJK or emoji text."""
+    return [sum(encoding.attention_mask) for encoding in encodings]
 
 
 class FakeRerankerProvider(RerankerProvider):
@@ -492,24 +484,32 @@ def _reset_reranker_provider_cache() -> None:
 # to 4). Now EVERY recall-time rerank is a measurement (S24):
 #
 #   - A rerank batch of `pairs` documents whose longest (query, document)
-#     pair is `L` characters costs `overhead + rate * x` seconds, x = pairs * L,
+#     pair is `L` reranker tokens costs `overhead + rate * x` seconds,
+#     x = pairs * L,
 #     because the reranker pads every pair in a batch to the longest one
 #     (fastembed `preprocessor_utils.load_tokenizer` enables padding; S67).
 #   - `overhead` and `rate` are separated by ordinary least squares over the
 #     running sums (count, sum x, sum y, sum x*y, sum x*x) of this process's
 #     recall reranks, per reranker model id (spec §1). No persistence and no
 #     averaging constant: every measured call weighs the same.
-#   - RAM per padded character of GROWTH (S32: RSS delta around recall-time
+#   - RAM per padded token of GROWTH (S32: RSS delta around recall-time
 #     reranks). The ONNX runtime keeps the memory a batch needed and reuses
 #     it, so a call whose padded size x is within the largest size already
 #     run (the high water) shows no RSS growth, and only a call that goes
-#     past the high water grows RSS, by about (x - high water) * RAM/char.
-#     So RAM/char = sum of max(0, RSS delta) / sum of (x - high water) over
+#     past the high water grows RSS, by about (x - high water) * RAM/token.
+#     So RAM/token = sum of max(0, RSS delta) / sum of (x - high water) over
 #     the calls that went past it, and a candidate batch is predicted to need
-#     RAM/char * max(0, x - high water) more memory, checked against the
+#     RAM/token * max(0, x - high water) more memory, checked against the
 #     current headroom. (Averaging deltas over EVERY call would dilute the
 #     figure towards 0 as calls within the high water accumulate, and the
 #     bound would stop binding: stage-6 finding F1.)
+#   - The size unit is reranker TOKENS (S75), counted per pair from the
+#     reranker's own tokenizer after truncation (`pair_token_lengths`), not
+#     characters: the reranker pays per padded token, and the same number
+#     of characters is a very different token count in Latin text and in CJK
+#     or emoji text (samples through the shipped tokenizer: about 0.2 tokens
+#     per character in plain English words, about 0.5 in Chinese, about 1.0
+#     in emoji).
 #
 # Only recall reranks feed it (`rerank_timed`, called by
 # `normalize_against_anchors`); the two warm-up reranks a process runs first
@@ -568,7 +568,7 @@ class _CostSums:
     half of one sample's sums (CONC-1).
 
     `sum_x`/`sum_xx`/`ram_x` are Python ints (x = pairs * longest pair is an
-    integer character count), so the least-squares denominator
+    integer token count), so the least-squares denominator
     `n * sum_xx - sum_x ** 2` is exact however long the process runs."""
 
     n: int = 0
@@ -581,18 +581,18 @@ class _CostSums:
     ram_bytes: float = 0.0  # sum of max(0, RSS delta) over calls that went past the high water
     ram_x: int = 0  # sum of (x - high water before the call) over those same calls
 
-    def plus(self, padded_chars: int, seconds: float, rss_delta_bytes: float | None) -> _CostSums:
+    def plus(self, padded_tokens: int, seconds: float, rss_delta_bytes: float | None) -> _CostSums:
         ram_bytes, ram_x = self.ram_bytes, self.ram_x
-        if rss_delta_bytes is not None and padded_chars > self.peak_x:
+        if rss_delta_bytes is not None and padded_tokens > self.peak_x:
             ram_bytes += max(0.0, rss_delta_bytes)
-            ram_x += padded_chars - self.peak_x
+            ram_x += padded_tokens - self.peak_x
         return _CostSums(
             n=self.n + 1,
-            sum_x=self.sum_x + padded_chars,
+            sum_x=self.sum_x + padded_tokens,
             sum_y=self.sum_y + seconds,
-            sum_xy=self.sum_xy + padded_chars * seconds,
-            sum_xx=self.sum_xx + padded_chars * padded_chars,
-            peak_x=max(self.peak_x, padded_chars),
+            sum_xy=self.sum_xy + padded_tokens * seconds,
+            sum_xx=self.sum_xx + padded_tokens * padded_tokens,
+            peak_x=max(self.peak_x, padded_tokens),
             ram_bytes=ram_bytes,
             ram_x=ram_x,
         )
@@ -601,16 +601,16 @@ class _CostSums:
 @dataclass(frozen=True)
 class RerankCostEstimate:
     """The fitted cost model for one reranker model id (see the section
-    header). `ram_bytes_per_char` is RSS growth per padded character past
-    `peak_padded_chars` (the largest padded batch measured so far); `None`
+    header). `ram_bytes_per_token` is RSS growth per padded token past
+    `peak_padded_tokens` (the largest padded batch measured so far); `None`
     when no call past the high water had a readable RSS delta (the RAM term
     of the width fit is then skipped)."""
 
     overhead_seconds: float
-    seconds_per_char: float
-    ram_bytes_per_char: float | None
+    seconds_per_token: float
+    ram_bytes_per_token: float | None
     measured_batches: int
-    peak_padded_chars: int = 0
+    peak_padded_tokens: int = 0
 
 
 def _fit_cost(sums: _CostSums) -> tuple[float, float] | None:
@@ -655,25 +655,25 @@ def rerank_cost_estimate(model_id: str) -> RerankCostEstimate | None:
     if fit is None:
         return None
     overhead, rate = fit
-    ram_per_char = sums.ram_bytes / sums.ram_x if sums.ram_x > 0 else None
+    ram_per_token = sums.ram_bytes / sums.ram_x if sums.ram_x > 0 else None
     return RerankCostEstimate(
         overhead_seconds=overhead,
-        seconds_per_char=rate,
-        ram_bytes_per_char=ram_per_char,
+        seconds_per_token=rate,
+        ram_bytes_per_token=ram_per_token,
         measured_batches=sums.n,
-        peak_padded_chars=sums.peak_x,
+        peak_padded_tokens=sums.peak_x,
     )
 
 
 def _record_rerank_cost(
-    model_id: str, padded_chars: int, seconds: float, rss_delta_bytes: float | None
+    model_id: str, padded_tokens: int, seconds: float, rss_delta_bytes: float | None
 ) -> None:
     """Add one measured recall rerank to `model_id`'s running sums."""
     with _cost_lock:
         current = _cost_sums.get(model_id, _CostSums())
         if _cost_update_hook is not None:
             _cost_update_hook()
-        _cost_sums[model_id] = current.plus(padded_chars, seconds, rss_delta_bytes)
+        _cost_sums[model_id] = current.plus(padded_tokens, seconds, rss_delta_bytes)
 
 
 def _reset_rerank_cost_model() -> None:
@@ -939,17 +939,17 @@ def anchor_count(real_width: int) -> int:
     return min(P, real_width // ANCHOR_SPLIT_DIVISOR)
 
 
-def prefix_cost(estimate: RerankCostEstimate, pairs: int, longest_pair_chars: int) -> float:
+def prefix_cost(estimate: RerankCostEstimate, pairs: int, longest_pair_tokens: int) -> float:
     """Predicted seconds for one rerank batch of `pairs` documents whose
-    longest (query, document) pair is `longest_pair_chars` characters
-    (S67: per-call overhead + per-character rate * padded size). The one
+    longest (query, document) pair is `longest_pair_tokens` reranker tokens
+    (S67, S75: per-call overhead + per-token rate * padded size). The one
     place the cost model's shape lives."""
-    return estimate.overhead_seconds + estimate.seconds_per_char * pairs * longest_pair_chars
+    return estimate.overhead_seconds + estimate.seconds_per_token * pairs * longest_pair_tokens
 
 
 def fit_rerank_width(
-    candidate_pair_chars: Sequence[int],
-    anchor_pair_chars: Sequence[int],
+    candidate_pair_tokens: Sequence[int],
+    anchor_pair_tokens: Sequence[int],
     estimate: RerankCostEstimate | None,
     budget_seconds: float,
     headroom_bytes: float | None,
@@ -957,16 +957,16 @@ def fit_rerank_width(
 ) -> int:
     """How many real candidates to rerank this message (spec §1).
 
-    `candidate_pair_chars` are the candidates' surviving pair lengths (S62)
+    `candidate_pair_tokens` are the candidates' surviving pair lengths (S62)
     in the caller's prefix order (genuine first, then monologue-family, each
-    by cosine score, S16/S28); `anchor_pair_chars` the same for
+    by cosine score, S16/S28); `anchor_pair_tokens` the same for
     `ANCHOR_POOL` (at least `P` entries). Before the first measurement
     (`estimate is None`) the width is the S5 minimum (S24). Otherwise it is
     the longest prefix n <= min(len(candidates), max_real) such that the
     batch of n real + `anchor_count(n)` anchors fits the budget
     (`prefix_cost`, padded to its longest pair, anchors included in both
     factors) and, when a RAM figure and a headroom reading exist, the RSS
-    growth it is predicted to need (RAM per character times its padded size
+    growth it is predicted to need (RAM per token times its padded size
     past the high water, see the section header) fits the headroom (S32,
     S65: no chunking).
     Both factors of the padded size only grow with n, so the scan stops at
@@ -974,22 +974,22 @@ def fit_rerank_width(
 
     The result may be below the S5 minimum; the caller then does not rerank
     (S5/S23). Pure: no clock, no I/O."""
-    limit = min(len(candidate_pair_chars), max_real)
+    limit = min(len(candidate_pair_tokens), max_real)
     if estimate is None:
         return min(RERANK_MIN_REAL_CANDIDATES, limit)
-    ram_per_char = estimate.ram_bytes_per_char
-    ram_bound = ram_per_char is not None and ram_per_char > 0.0 and headroom_bytes is not None
+    ram_per_token = estimate.ram_bytes_per_token
+    ram_bound = ram_per_token is not None and ram_per_token > 0.0 and headroom_bytes is not None
     width = 0
     longest_real = 0
     for n in range(1, limit + 1):
-        longest_real = max(longest_real, candidate_pair_chars[n - 1])
+        longest_real = max(longest_real, candidate_pair_tokens[n - 1])
         k = anchor_count(n)
-        longest = max([longest_real, *anchor_pair_chars[:k]])
+        longest = max([longest_real, *anchor_pair_tokens[:k]])
         pairs = n + k
         if prefix_cost(estimate, pairs, longest) > budget_seconds:
             break
-        growth = max(0, pairs * longest - estimate.peak_padded_chars)
-        if ram_bound and ram_per_char * growth > headroom_bytes:
+        growth = max(0, pairs * longest - estimate.peak_padded_tokens)
+        if ram_bound and ram_per_token * growth > headroom_bytes:
             break
         width = n
     return width
@@ -1025,7 +1025,7 @@ def rerank_for_recall(
     max_real: int = CANDIDATE_POOL,
 ) -> RecallRerank:
     """Fit this query's width, rerank that prefix with anchors on top, and
-    record the call in the cost model (spec §1, S23/S24/S32/S62/S67).
+    record the call in the cost model (spec §1, S23/S24/S32/S62/S67/S75).
 
     `candidate_documents` are the query's candidates in prefix order (see
     `fit_rerank_width`); only the first `CANDIDATE_POOL` are considered.
@@ -1052,11 +1052,21 @@ def rerank_for_recall(
     # Warm up before the length probe: on the real provider the first rerank
     # loads the ONNX session, and with it the tokenizer the probe uses.
     _warm_up_once(provider, query, pool)
-    lengths = provider.pair_char_lengths(query, [*pool, *ANCHOR_POOL])
-    candidate_chars, anchor_chars = lengths[: len(pool)], lengths[len(pool) :]
-    estimate = rerank_cost_estimate(model_id)
-    headroom = _available_ram_headroom_bytes() if estimate is not None else None
-    width = fit_rerank_width(candidate_chars, anchor_chars, estimate, budget_seconds, headroom, cap)
+    lengths = provider.pair_token_lengths(query, [*pool, *ANCHOR_POOL])
+    if lengths is None:
+        # Token sizes unavailable (the tokenizer probe failed): no size to fit
+        # a width from, so the width is the S5 minimum, as before the first
+        # measurement, and this call is NOT recorded (S75: the cost model
+        # holds tokens only; the padded size of this batch is unknown).
+        candidate_tokens = anchor_tokens = None
+        width = RERANK_MIN_REAL_CANDIDATES  # the pool and cap are at least this (checked above)
+    else:
+        candidate_tokens, anchor_tokens = lengths[: len(pool)], lengths[len(pool) :]
+        estimate = rerank_cost_estimate(model_id)
+        headroom = _available_ram_headroom_bytes() if estimate is not None else None
+        width = fit_rerank_width(
+            candidate_tokens, anchor_tokens, estimate, budget_seconds, headroom, cap
+        )
 
     if width < RERANK_MIN_REAL_CANDIDATES:
         # PARKED SEAM (owner ruling pending: Q15 / ledger F10, stuck-width
@@ -1076,9 +1086,13 @@ def rerank_for_recall(
 
     normalization = normalize_against_anchors(provider, query, pool[:width])
     measured = False
-    if normalization.seconds is not None:
+    if (
+        normalization.seconds is not None
+        and candidate_tokens is not None
+        and anchor_tokens is not None
+    ):
         k = normalization.anchor_count
-        longest = max([*candidate_chars[:width], *anchor_chars[:k]])
+        longest = max([*candidate_tokens[:width], *anchor_tokens[:k]])
         _record_rerank_cost(
             model_id, (width + k) * longest, normalization.seconds, normalization.rss_delta_bytes
         )

@@ -4,13 +4,15 @@ C1c, CONC-1, C2c part 1, INV-I13a, ADV-9 in
 
 The hourly width sample (one query's top-5 documents, cached ~1 h,
 diagnosis H8) is replaced by a cost model learned from every recall-time
-rerank: seconds = overhead + rate * (pairs * longest pair), both fitted by
+rerank: seconds = overhead + rate * (pairs * longest pair), the size in
+reranker tokens (S75), both fitted by
 least squares over running sums, per process and per reranker model id;
 each message fits its own width to its own candidates.
 
 All offline and deterministic: timing comes from a scripted clock injected
 through `reranker._clock`, advanced by a fake reranker whose per-call cost is
-exactly `overhead + rate * len(documents) * longest pair`; RSS comes from a
+exactly `overhead + rate * len(documents) * longest pair` (in tokens; the
+fake providers' stand-in for a token is one character); RSS comes from a
 scripted `_current_rss_bytes`. No model, no network.
 """
 
@@ -34,7 +36,7 @@ from brain.memory.reranker import (
     fit_rerank_width,
     rerank_cost_estimate,
     rerank_for_recall,
-    surviving_pair_char_lengths,
+    surviving_pair_token_lengths,
 )
 
 _MODEL = "cost-scripted"
@@ -65,7 +67,7 @@ class _CostScriptedProvider(FakeRerankerProvider):
 
     def rerank(self, query: str, documents: list[str]) -> list[float]:
         self.calls.append(list(documents))
-        longest = max(self.pair_char_lengths(query, documents))
+        longest = max(self.pair_token_lengths(query, documents))
         self.clock.t += self.overhead + self.rate * len(documents) * longest
         return super().rerank(query, documents)
 
@@ -83,14 +85,14 @@ def clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
     return c
 
 
-def _docs(n: int, pair_chars: int, tag: str = "d") -> list[str]:
+def _docs(n: int, pair_tokens: int, tag: str = "d") -> list[str]:
     """`n` distinct documents whose (query `_QUERY`, doc) pair is exactly
-    `pair_chars` characters."""
-    body = pair_chars - len(_QUERY)
+    `pair_tokens` tokens (the fake providers count one token per character)."""
+    body = pair_tokens - len(_QUERY)
     return [(f"{tag}{i:03d}" + "x" * body)[:body] for i in range(n)]
 
 
-def _anchor_pair_chars(query: str = _QUERY) -> list[int]:
+def _anchor_pair_tokens(query: str = _QUERY) -> list[int]:
     return [len(query) + len(a) for a in ANCHOR_POOL]
 
 
@@ -101,7 +103,7 @@ def _reference_width(
     rate: float,
     budget: float,
     *,
-    ram_per_char: float | None = None,
+    ram_per_token: float | None = None,
     headroom: float | None = None,
     peak: int = 0,
     cap: int = CANDIDATE_POOL,
@@ -109,7 +111,7 @@ def _reference_width(
     """Independent recomputation of the width (spec §1 / S67 / S23): the
     LARGEST n whose batch of n real + min(8, n // 2) anchors, padded to its
     longest pair, is predicted to fit the budget, and whose RSS growth past
-    the measured high water `peak` (RAM per char times the padded size above
+    the measured high water `peak` (RAM per token times the padded size above
     `peak`) fits the headroom. Scans every n (no early stop), so it does not
     lean on the implementation's monotonicity argument."""
     best = 0
@@ -119,14 +121,14 @@ def _reference_width(
         padded = (n + k) * longest
         if overhead + rate * padded > budget:
             continue
-        if ram_per_char and headroom is not None and ram_per_char * max(0, padded - peak) > headroom:
+        if ram_per_token and headroom is not None and ram_per_token * max(0, padded - peak) > headroom:
             continue
         best = n
     return best
 
 
 def _sum_model_width(cand: list[int], anchors: list[int], rate: float, budget: float) -> int:
-    """The OLD model's shape (a plain per-character sum, no padding, no
+    """The OLD model's shape (a plain per-token sum, no padding, no
     overhead) — used only to show the padding fixture discriminates."""
     best = 0
     for n in range(1, len(cand) + 1):
@@ -168,7 +170,7 @@ def test_c1a_i_first_rerank_is_five_real_plus_two_anchors_after_two_discarded_wa
     assert est is not None and est.measured_batches == 1
     # One batch: overhead 0, rate = ratio of sums.
     assert est.overhead_seconds == 0.0
-    assert est.seconds_per_char == pytest.approx(y / x)
+    assert est.seconds_per_token == pytest.approx(y / x)
 
 
 def test_c1a_i_warmups_run_once_per_model_id(clock: _Clock) -> None:
@@ -207,7 +209,7 @@ def test_c1a_ii_two_padded_sizes_recover_overhead_and_rate(clock: _Clock) -> Non
     slope, intercept = np.polyfit(xs, ys, 1)
     est = rerank_cost_estimate(_MODEL)
     assert est.overhead_seconds == pytest.approx(intercept, rel=1e-9) == pytest.approx(o0, rel=1e-9)
-    assert est.seconds_per_char == pytest.approx(slope, rel=1e-9) == pytest.approx(r0, rel=1e-9)
+    assert est.seconds_per_token == pytest.approx(slope, rel=1e-9) == pytest.approx(r0, rel=1e-9)
     # Able to fail: the plain ratio-of-sums model (no overhead term) is wrong here.
     assert sum(ys) / sum(xs) != pytest.approx(r0, rel=1e-3)
 
@@ -217,7 +219,7 @@ def test_c1a_ii_same_padded_size_is_degenerate_ratio_of_sums() -> None:
     reranker_mod._record_rerank_cost(_MODEL, 700, 2.0, None)
     est = rerank_cost_estimate(_MODEL)
     assert est.overhead_seconds == 0.0
-    assert est.seconds_per_char == pytest.approx(3.0 / 1400)
+    assert est.seconds_per_token == pytest.approx(3.0 / 1400)
 
 
 def test_c1a_ii_negative_fitted_overhead_falls_back_to_ratio() -> None:
@@ -226,7 +228,7 @@ def test_c1a_ii_negative_fitted_overhead_falls_back_to_ratio() -> None:
     reranker_mod._record_rerank_cost(_MODEL, 200, 0.3, None)
     est = rerank_cost_estimate(_MODEL)
     assert est.overhead_seconds == 0.0
-    assert est.seconds_per_char == pytest.approx(0.4 / 300)
+    assert est.seconds_per_token == pytest.approx(0.4 / 300)
 
 
 def test_c1a_ii_non_positive_fitted_rate_falls_back_to_ratio() -> None:
@@ -234,7 +236,7 @@ def test_c1a_ii_non_positive_fitted_rate_falls_back_to_ratio() -> None:
     reranker_mod._record_rerank_cost(_MODEL, 200, 0.1, None)
     est = rerank_cost_estimate(_MODEL)
     assert est.overhead_seconds == 0.0
-    assert est.seconds_per_char == pytest.approx(0.4 / 300)
+    assert est.seconds_per_token == pytest.approx(0.4 / 300)
 
 
 def test_no_estimate_before_any_measurement() -> None:
@@ -248,7 +250,7 @@ def test_no_estimate_before_any_measurement() -> None:
 
 def test_c1a_iii_long_candidate_inside_short_prefix_stops_the_width(clock: _Clock) -> None:
     """Six short candidates, then one long one: padding the batch to the long
-    pair makes the 7-candidate prefix cost 10 x 1000 characters, although the
+    pair makes the 7-candidate prefix cost 10 x 1000 tokens, although the
     plain sum of its pair lengths would have fit."""
     reranker_mod._record_rerank_cost(_MODEL, 10_000, 1.0, None)  # overhead 0, rate 1e-4
     provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-4)
@@ -258,7 +260,7 @@ def test_c1a_iii_long_candidate_inside_short_prefix_stops_the_width(clock: _Cloc
 
     out = rerank_for_recall(provider, _QUERY, docs, budget_seconds=budget)
 
-    anchors = _anchor_pair_chars()
+    anchors = _anchor_pair_tokens()
     expected = _reference_width(cand, anchors, 0.0, 1e-4, budget)
     assert out.width == expected == 6
     assert _sum_model_width(cand, anchors, 1e-4, budget) > 6, (
@@ -269,7 +271,7 @@ def test_c1a_iii_long_candidate_inside_short_prefix_stops_the_width(clock: _Cloc
 
 
 @pytest.mark.parametrize(
-    ("cand", "overhead", "rate", "budget", "ram_per_char", "headroom", "peak"),
+    ("cand", "overhead", "rate", "budget", "ram_per_token", "headroom", "peak"),
     [
         ([120] * 50, 0.05, 1e-4, 4.0, None, None, 0),
         ([900, 120, 300, 2000, 80, 80, 80, 1500] + [200] * 30, 0.3, 5e-5, 2.0, None, None, 0),
@@ -285,27 +287,27 @@ def test_c1a_iii_fit_matches_the_independent_reference(
     overhead: float,
     rate: float,
     budget: float,
-    ram_per_char: float | None,
+    ram_per_token: float | None,
     headroom: float | None,
     peak: int,
 ) -> None:
-    est = RerankCostEstimate(overhead, rate, ram_per_char, measured_batches=3, peak_padded_chars=peak)
-    anchors = _anchor_pair_chars()
+    est = RerankCostEstimate(overhead, rate, ram_per_token, measured_batches=3, peak_padded_tokens=peak)
+    anchors = _anchor_pair_tokens()
     got = fit_rerank_width(cand, anchors, est, budget, headroom)
     assert got == _reference_width(
-        cand, anchors, overhead, rate, budget, ram_per_char=ram_per_char, headroom=headroom, peak=peak
+        cand, anchors, overhead, rate, budget, ram_per_token=ram_per_token, headroom=headroom, peak=peak
     )
 
 
 def test_fit_is_the_minimum_before_the_first_measurement() -> None:
-    assert fit_rerank_width([5000] * 50, _anchor_pair_chars(), None, 0.001, None) == 5
-    assert fit_rerank_width([10] * 3, _anchor_pair_chars(), None, 4.0, None) == 3
+    assert fit_rerank_width([5000] * 50, _anchor_pair_tokens(), None, 0.001, None) == 5
+    assert fit_rerank_width([10] * 3, _anchor_pair_tokens(), None, 4.0, None) == 3
 
 
 def test_fit_is_capped_at_fifty_real_and_at_max_real() -> None:
     est = RerankCostEstimate(0.0, 1e-12, None, measured_batches=2)
-    assert fit_rerank_width([10] * 80, _anchor_pair_chars(), est, 4.0, None) == CANDIDATE_POOL == 50
-    assert fit_rerank_width([10] * 80, _anchor_pair_chars(), est, 4.0, None, max_real=12) == 12
+    assert fit_rerank_width([10] * 80, _anchor_pair_tokens(), est, 4.0, None) == CANDIDATE_POOL == 50
+    assert fit_rerank_width([10] * 80, _anchor_pair_tokens(), est, 4.0, None, max_real=12) == 12
 
 
 # ---------------------------------------------------------------------------
@@ -317,7 +319,7 @@ def test_c1a_iv_short_message_after_a_long_one_gets_a_wider_rerank(clock: _Clock
     o0, r0, budget = 0.2, 2e-4, 4.0
     provider = _CostScriptedProvider(clock, overhead=o0, rate=r0)
     long_docs, short_docs = _docs(50, 1200, "L"), _docs(50, 150, "S")
-    anchors = _anchor_pair_chars()
+    anchors = _anchor_pair_tokens()
 
     widths = []
     for docs, pair in ((long_docs, 1200), (short_docs, 150), (long_docs, 1200), (short_docs, 150)):
@@ -327,7 +329,7 @@ def test_c1a_iv_short_message_after_a_long_one_gets_a_wider_rerank(clock: _Clock
             expected = 5
         else:
             expected = _reference_width(
-                [pair] * 50, anchors, est.overhead_seconds, est.seconds_per_char, budget
+                [pair] * 50, anchors, est.overhead_seconds, est.seconds_per_token, budget
             )
         assert out.width == expected
         widths.append(out.width)
@@ -382,52 +384,59 @@ def test_bundled_pair_scoring_is_not_a_recall_measurement(clock: _Clock) -> None
 
 
 # ---------------------------------------------------------------------------
-# C1c: pair lengths at their surviving (post-truncation) length (S62).
+# C1c: pair lengths in reranker tokens, at their surviving (post-truncation)
+# count (S62, S75).
 # ---------------------------------------------------------------------------
 
+_SPECIAL_TOKENS = 4  # the real tokenizer's pair template: <s> q </s></s> d </s>
+_ASCII_PER_TOKEN = 10  # the fake tokenizer: a run of up to 10 ASCII characters is one token
 
-def _fake_encoding(query: str, doc: str, doc_keep: int | None) -> SimpleNamespace:
-    """A pair encoding shaped like `tokenizers.Encoding`: one token per 10
-    characters, special tokens (no sequence id) around each segment,
-    document truncated to `doc_keep` characters when given."""
-    offsets, seq_ids = [(0, 0)], [None]
-    for start in range(0, len(query), 10):
-        offsets.append((start, min(start + 10, len(query))))
-        seq_ids.append(0)
-    offsets.append((0, 0))
-    seq_ids.append(None)
-    kept = len(doc) if doc_keep is None else doc_keep
-    for start in range(0, kept, 10):
-        offsets.append((start, min(start + 10, kept)))
-        seq_ids.append(1)
-    offsets.append((0, 0))
-    seq_ids.append(None)
-    overflowing = [] if doc_keep is None else [SimpleNamespace()]
-    return SimpleNamespace(offsets=offsets, sequence_ids=seq_ids, overflowing=overflowing)
+
+def _fake_segment_tokens(text: str) -> int:
+    """The fake tokenizer's token count for one segment: ASCII text packs
+    `_ASCII_PER_TOKEN` characters per token (Latin words), every other
+    character (CJK, emoji) costs one token of its own, as with the shipped
+    tokenizer's roughly 0.2 / 0.5 / 1.0 tokens per character."""
+    ascii_chars = sum(1 for ch in text if ord(ch) < 128)
+    return -(-ascii_chars // _ASCII_PER_TOKEN) + (len(text) - ascii_chars)
+
+
+def _fake_encodings(pairs, max_tokens: int) -> list[SimpleNamespace]:
+    """Pair encodings shaped like `tokenizers.Encoding` after `encode_batch`
+    with truncation at `max_tokens` and padding to the batch's longest pair:
+    `attention_mask` is 1 for every token the model runs (special tokens
+    included) and 0 for padding. A pair over the maximum keeps its query and
+    cuts the document (the query is short in these fixtures)."""
+    kept = []
+    for query, doc in pairs:
+        doc_tokens = min(_fake_segment_tokens(doc), max_tokens - _SPECIAL_TOKENS - _fake_segment_tokens(query))
+        kept.append(_SPECIAL_TOKENS + _fake_segment_tokens(query) + doc_tokens)
+    longest = max(kept, default=0)
+    return [
+        SimpleNamespace(attention_mask=[1] * n + [0] * (longest - n), ids=[7] * longest) for n in kept
+    ]
 
 
 class _FakeTokenizer:
-    def __init__(self, limit_chars: int) -> None:
-        self.limit_chars = limit_chars
+    def __init__(self, max_tokens: int) -> None:
+        self.max_tokens = max_tokens
         self.batches: list[list[tuple[str, str]]] = []
 
     def encode_batch(self, pairs):
         self.batches.append(list(pairs))
-        return [
-            _fake_encoding(q, d, self.limit_chars if len(d) > self.limit_chars else None)
-            for q, d in pairs
-        ]
+        return _fake_encodings(self.batches[-1], self.max_tokens)
 
 
-def test_c1c_truncated_document_counts_at_its_surviving_length() -> None:
+def test_c1c_truncated_pair_counts_at_the_model_maximum_and_padding_is_not_counted() -> None:
     query = "what is up"
     long_doc, short_doc = "y" * 5000, "z" * 300
-    encodings = [_fake_encoding(query, long_doc, 1200), _fake_encoding(query, short_doc, None)]
+    encodings = _fake_encodings([(query, long_doc), (query, short_doc)], max_tokens=100)
+    assert len(encodings[1].attention_mask) == 100, "fixture: the short pair is padded to the long one"
 
-    lengths = surviving_pair_char_lengths(query, [long_doc, short_doc], encodings)
+    lengths = surviving_pair_token_lengths(encodings)
 
-    assert lengths[0] == len(query) + 1200, "a plain len(doc) would give 5010"
-    assert lengths[1] == len(query) + 300, "a document under the limit counts at its full length"
+    assert lengths[0] == 100, "the cut pair counts at the model maximum (tokens surviving truncation)"
+    assert lengths[1] == _SPECIAL_TOKENS + 1 + 30, "the short pair counts its own tokens, not its padding"
 
 
 def _encoder_provider(tokenizer) -> CrossEncoderProvider:
@@ -441,19 +450,19 @@ def _encoder_provider(tokenizer) -> CrossEncoderProvider:
     return provider
 
 
-def test_c1c_cross_encoder_provider_uses_its_tokenizer_offsets() -> None:
-    tokenizer = _FakeTokenizer(limit_chars=1200)
+def test_c1c_cross_encoder_provider_counts_its_tokenizers_tokens() -> None:
+    tokenizer = _FakeTokenizer(max_tokens=100)
     provider = _encoder_provider(tokenizer)
     docs = ["y" * 5000, "z" * 300]
 
-    lengths = provider.pair_char_lengths("what is up", docs)
+    lengths = provider.pair_token_lengths("what is up", docs)
 
-    assert lengths == [10 + 1200, 10 + 300]
+    assert lengths == [100, _SPECIAL_TOKENS + 1 + 30], "tokens, not the 5,010 / 310 characters"
     assert tokenizer.batches == [[("what is up", d) for d in docs]], "one encode_batch over the pairs"
 
 
 def test_c1c_tokenizer_loaded_on_first_use() -> None:
-    tokenizer = _FakeTokenizer(limit_chars=1200)
+    tokenizer = _FakeTokenizer(max_tokens=100)
     provider = _encoder_provider(tokenizer)
     inner = provider._model.model
     inner.model = None
@@ -463,26 +472,49 @@ def test_c1c_tokenizer_loaded_on_first_use() -> None:
         inner.model = object()
 
     inner.load_onnx_model = _load
-    provider.pair_char_lengths("q", ["abc"])
-    provider.pair_char_lengths("q", ["abc"])
+    provider.pair_token_lengths("q", ["abc"])
+    provider.pair_token_lengths("q", ["abc"])
     assert inner.loads == 1
 
 
-def test_c1c_tokenizer_failure_falls_back_to_full_lengths(caplog: pytest.LogCaptureFixture) -> None:
+def test_c1c_tokenizer_failure_gives_no_lengths_never_characters(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     class _Boom:
         def encode_batch(self, pairs):
             raise RuntimeError("simulated tokenizer failure")
 
     provider = _encoder_provider(_Boom())
     with caplog.at_level(logging.WARNING, logger=reranker_mod.__name__):
-        lengths = provider.pair_char_lengths("q", ["y" * 5000])
-    assert lengths == [1 + 5000], "falls back to the full (over-estimating) length"
-    assert any("surviving pair lengths unavailable" in r.message for r in caplog.records)
+        lengths = provider.pair_token_lengths("q", ["y" * 5000])
+    assert lengths is None, "a character count must never reach the token-based cost model"
+    assert any("token lengths unavailable" in r.message for r in caplog.records)
+
+
+def test_c1c_no_token_lengths_means_the_minimum_width_and_no_recorded_sample(clock: _Clock) -> None:
+    class _NoLengths(_CostScriptedProvider):
+        def pair_token_lengths(self, query, documents):
+            return None
+
+        def rerank(self, query, documents):
+            self.calls.append(list(documents))
+            self.clock.t += 0.5
+            return FakeRerankerProvider.rerank(self, query, documents)
+
+    reranker_mod._record_rerank_cost(_MODEL, 1_000, 1.0, None)  # a prior token-unit sample
+    before = reranker_mod._cost_sums[_MODEL]
+    provider = _NoLengths(clock, overhead=0.0, rate=0.0)
+
+    out = rerank_for_recall(provider, _QUERY, _docs(30, 400), budget_seconds=4.0)
+
+    assert out.width == RERANK_MIN_REAL_CANDIDATES and out.reranked
+    assert out.measured is False
+    assert reranker_mod._cost_sums[_MODEL] == before, "no sample without a known padded size"
 
 
 def test_c1c_width_fit_and_measurement_use_the_surviving_lengths(clock: _Clock) -> None:
     class _Truncating(_CostScriptedProvider):
-        def pair_char_lengths(self, query, documents):
+        def pair_token_lengths(self, query, documents):
             return [len(query) + min(len(d), 1200) for d in documents]
 
     provider = _Truncating(clock, overhead=0.0, rate=1e-5)
@@ -490,6 +522,61 @@ def test_c1c_width_fit_and_measurement_use_the_surviving_lengths(clock: _Clock) 
 
     sums = reranker_mod._cost_sums[_MODEL]
     assert sums.sum_x == 7 * (1 + 1200), "x uses the surviving pair length, not 7 * 5001"
+
+
+class _TokenizingProvider(_CostScriptedProvider):
+    """A scripted-clock provider that sizes pairs with the fake tokenizer
+    (through the same `surviving_pair_token_lengths` the real provider
+    uses), so a document's cost follows its TOKENS, as the real reranker's
+    does."""
+
+    def __init__(self, clock: _Clock, overhead: float, rate: float, max_tokens: int = 100_000) -> None:
+        super().__init__(clock, overhead, rate)
+        self.tokenizer = _FakeTokenizer(max_tokens)
+
+    def pair_token_lengths(self, query, documents):
+        return surviving_pair_token_lengths(self.tokenizer.encode_batch([(query, d) for d in documents]))
+
+
+def test_s75_cjk_and_emoji_candidates_are_costed_by_tokens_not_characters(clock: _Clock) -> None:
+    """The misestimate S75 fixes: equal characters, very different tokens.
+    600 Latin characters are 60 tokens, 600 Chinese or emoji characters are
+    600 tokens, ten times the padded size (and, at a per-token rate, the
+    cost). A character-based model sizes all three alike."""
+    latin = "a" * 600
+    cjk = "\u5496" * 600
+    emoji = "\U0001f600" * 600
+    provider = _TokenizingProvider(clock, overhead=0.0, rate=1e-3)
+
+    latin_n, cjk_n, emoji_n = (provider.pair_token_lengths(_QUERY, [d])[0] for d in (latin, cjk, emoji))
+    assert len({len(latin), len(cjk), len(emoji)}) == 1, "fixture: the same character count"
+    assert latin_n == _SPECIAL_TOKENS + 1 + 60
+    assert cjk_n == emoji_n == _SPECIAL_TOKENS + 1 + 600
+
+    # The fit: one budget, the same 12 candidates, Latin or CJK. By characters
+    # the two pools are identical, so a character model gives one width for
+    # both; by tokens the Latin pool fits whole and the CJK pool is cut.
+    anchors = provider.pair_token_lengths(_QUERY, ANCHOR_POOL)
+    est = RerankCostEstimate(0.0, 1e-3, None, measured_batches=2)
+    budget = 5.0  # seconds
+    width_latin = fit_rerank_width([latin_n] * 12, anchors, est, budget, None)
+    width_cjk = fit_rerank_width([cjk_n] * 12, anchors, est, budget, None)
+    assert width_latin == _reference_width([latin_n] * 12, anchors, 0.0, 1e-3, budget) == 12
+    assert width_cjk == _reference_width([cjk_n] * 12, anchors, 0.0, 1e-3, budget)
+    assert width_cjk < width_latin, "a CJK-heavy pool gets a narrower rerank than a Latin one"
+
+
+def test_s75_the_recorded_sample_is_in_tokens(clock: _Clock) -> None:
+    provider = _TokenizingProvider(clock, overhead=0.0, rate=1e-3)
+    cjk = "\u5496" * 600
+
+    out = rerank_for_recall(provider, _QUERY, [cjk] * 10, budget_seconds=1_000.0)
+
+    k = out.normalization.anchor_count
+    anchors = provider.pair_token_lengths(_QUERY, ANCHOR_POOL)[:k]
+    longest = max(_SPECIAL_TOKENS + 1 + 600, *anchors)
+    assert reranker_mod._cost_sums[_MODEL].sum_x == (out.width + k) * longest
+    assert longest == 605, "600 CJK characters are 600 tokens; a character count would record 601"
 
 
 # ---------------------------------------------------------------------------
@@ -536,21 +623,21 @@ def test_inv_i13a_rss_unreadable_skips_the_ram_term(clock: _Clock, monkeypatch: 
     provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-6)
     rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0)
     est = rerank_cost_estimate(_MODEL)
-    assert est.ram_bytes_per_char is None
+    assert est.ram_bytes_per_token is None
 
     out = rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0)
     assert out.width == 50, "no RAM figure -> width is time-bound only, headroom ignored"
 
 
-def test_ram_bound_from_rss_delta_per_padded_char(clock: _Clock, monkeypatch: pytest.MonkeyPatch) -> None:
-    rss = iter([1_000.0, 1_000.0 + 7 * 400 * 1_000.0])  # +1,000 bytes per padded character
+def test_ram_bound_from_rss_delta_per_padded_token(clock: _Clock, monkeypatch: pytest.MonkeyPatch) -> None:
+    rss = iter([1_000.0, 1_000.0 + 7 * 400 * 1_000.0])  # +1,000 bytes per padded token
     monkeypatch.setattr(reranker_mod, "_current_rss_bytes", lambda: next(rss))
     provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-9)
     rerank_for_recall(provider, _QUERY, _docs(50, 400), budget_seconds=4.0)
     est = rerank_cost_estimate(_MODEL)
-    assert est.ram_bytes_per_char == pytest.approx(1_000.0)
+    assert est.ram_bytes_per_token == pytest.approx(1_000.0)
 
-    assert est.peak_padded_chars == 7 * 400
+    assert est.peak_padded_tokens == 7 * 400
 
     # Growth room for 5 more padded documents past the 7 already run:
     # 12 documents = 8 real + 4 anchors fit, 13 (9 real + 4) do not.
@@ -559,44 +646,44 @@ def test_ram_bound_from_rss_delta_per_padded_char(clock: _Clock, monkeypatch: py
     monkeypatch.setattr(reranker_mod, "_current_rss_bytes", lambda: None)
     out = rerank_for_recall(provider, _QUERY, _docs(50, 400), budget_seconds=4.0)
     assert out.width == _reference_width(
-        [400] * 50, _anchor_pair_chars(), 0.0, est.seconds_per_char, 4.0,
-        ram_per_char=1_000.0, headroom=headroom, peak=7 * 400,
+        [400] * 50, _anchor_pair_tokens(), 0.0, est.seconds_per_token, 4.0,
+        ram_per_token=1_000.0, headroom=headroom, peak=7 * 400,
     ) == 8
 
 
 def test_ram_figure_does_not_dilute_with_calls_inside_the_high_water() -> None:
     """Stage-6 finding F1: the runtime reuses the memory a batch needed, so
     calls within the high water show ~0 RSS growth. They must not dilute
-    RAM per character towards 0 (which would switch the bound off): only
-    growth past the high water is counted, per character of that growth."""
-    reranker_mod._record_rerank_cost(_MODEL, 2_800, 0.1, 2_800 * 1_000.0)  # first batch: 1,000 B/char
+    RAM per token towards 0 (which would switch the bound off): only
+    growth past the high water is counted, per token of that growth."""
+    reranker_mod._record_rerank_cost(_MODEL, 2_800, 0.1, 2_800 * 1_000.0)  # first batch: 1,000 B/token
     for _ in range(100):
         reranker_mod._record_rerank_cost(_MODEL, 2_800, 0.1, 0.0)  # reuse, no growth
     reranker_mod._record_rerank_cost(_MODEL, 1_000, 0.05, 5_000_000.0)  # another thread's allocation
     est = rerank_cost_estimate(_MODEL)
-    assert est.ram_bytes_per_char == pytest.approx(1_000.0), "neither diluted nor contaminated"
-    assert est.peak_padded_chars == 2_800
+    assert est.ram_bytes_per_token == pytest.approx(1_000.0), "neither diluted nor contaminated"
+    assert est.peak_padded_tokens == 2_800
 
     reranker_mod._record_rerank_cost(_MODEL, 4_800, 0.2, 2_000 * 500.0)  # past the high water
     est = rerank_cost_estimate(_MODEL)
-    assert est.ram_bytes_per_char == pytest.approx((2_800_000.0 + 1_000_000.0) / 4_800)
-    assert est.peak_padded_chars == 4_800
+    assert est.ram_bytes_per_token == pytest.approx((2_800_000.0 + 1_000_000.0) / 4_800)
+    assert est.peak_padded_tokens == 4_800
 
 
 def test_ram_term_never_blocks_a_batch_within_the_high_water() -> None:
     """Within the high water no growth is predicted, so even a tiny headroom
     leaves every batch up to the size already run; only growth past it is
     checked against the headroom."""
-    est = RerankCostEstimate(0.0, 1e-9, 1_000.0, measured_batches=4, peak_padded_chars=12 * 400)
-    width = fit_rerank_width([400] * 50, _anchor_pair_chars(), est, 4.0, headroom_bytes=1.0)
+    est = RerankCostEstimate(0.0, 1e-9, 1_000.0, measured_batches=4, peak_padded_tokens=12 * 400)
+    width = fit_rerank_width([400] * 50, _anchor_pair_tokens(), est, 4.0, headroom_bytes=1.0)
     assert width == 8, "12 padded documents (8 real + 4 anchors) are within the high water; 13 are not"
 
 
 def test_negative_rss_delta_clamps_to_zero_in_the_ram_sum() -> None:
-    reranker_mod._record_rerank_cost(_MODEL, 1_000, 0.1, -5_000.0)  # past high water 0: +1,000 chars, 0 B
-    reranker_mod._record_rerank_cost(_MODEL, 2_000, 0.2, 4_000.0)  # past high water 1,000: +1,000 chars
+    reranker_mod._record_rerank_cost(_MODEL, 1_000, 0.1, -5_000.0)  # past high water 0: +1,000 tokens, 0 B
+    reranker_mod._record_rerank_cost(_MODEL, 2_000, 0.2, 4_000.0)  # past high water 1,000: +1,000 tokens
     est = rerank_cost_estimate(_MODEL)
-    assert est.ram_bytes_per_char == pytest.approx(4_000.0 / 2_000)
+    assert est.ram_bytes_per_token == pytest.approx(4_000.0 / 2_000)
 
 
 # ---------------------------------------------------------------------------
@@ -663,7 +750,7 @@ def test_conc1_interleaved_update_is_counted_and_reader_sees_whole_updates(
     # state (one sample or both), never a mix of halves. Both samples lie on
     # y = 0.001 * x, so either whole state fits to that rate.
     assert seen is not None and seen.measured_batches in (1, 2)
-    assert seen.seconds_per_char == pytest.approx(0.001)
+    assert seen.seconds_per_token == pytest.approx(0.001)
     assert seen.overhead_seconds == pytest.approx(0.0, abs=1e-12)
 
 
@@ -685,7 +772,7 @@ def test_adv9_inflated_first_sample_is_absorbing_until_restart(clock: _Clock) ->
     later message hand off ("budget") with no rerank, so no new measurement
     is ever taken and the estimate never moves. No recovery rule is built
     (PARKED for the owner); this test changes when he rules."""
-    reranker_mod._record_rerank_cost(_MODEL, 100, 1_000.0, None)  # 10 s per character
+    reranker_mod._record_rerank_cost(_MODEL, 100, 1_000.0, None)  # 10 s per token
     before = reranker_mod._cost_sums[_MODEL]
     provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-9)  # the host is actually fast
 
@@ -767,7 +854,7 @@ def test_c1c_tokenizer_failure_warns_once_per_provider(caplog: pytest.LogCapture
 
     provider = _encoder_provider(_Boom())
     with caplog.at_level(logging.DEBUG, logger=reranker_mod.__name__):
-        provider.pair_char_lengths("q", ["abc"])
-        provider.pair_char_lengths("q", ["abc"])
+        provider.pair_token_lengths("q", ["abc"])
+        provider.pair_token_lengths("q", ["abc"])
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1, "one warning (with traceback), later failures at debug level"

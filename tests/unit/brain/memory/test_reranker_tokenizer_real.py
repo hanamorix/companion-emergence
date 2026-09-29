@@ -1,5 +1,6 @@
 """Name-recall fix R1, criterion C1c (real tokenizer half): surviving pair
-lengths (S62) agree with the reranker's OWN tokenizer offsets.
+lengths, in reranker tokens (S62, S75), agree with the reranker's OWN
+tokenizer.
 
 Loads ONLY the cached reranker tokenizer files (tokenizer.json and its
 configs, via fastembed's own `load_tokenizer`, the loader the reranker uses)
@@ -16,7 +17,7 @@ from pathlib import Path
 import pytest
 
 from brain.bridge.model_tier import TIER_RERANKER, model_for_tier
-from brain.memory.reranker import surviving_pair_char_lengths
+from brain.memory.reranker import surviving_pair_token_lengths
 from brain.paths import get_cache_dir
 
 pytestmark = [pytest.mark.requires_models, pytest.mark.integration]
@@ -43,53 +44,68 @@ def _cached_tokenizer_dir() -> Path | None:
     return directory if all((directory / name).exists() for name in _TOKENIZER_FILES) else None
 
 
-def test_surviving_length_agrees_with_the_real_tokenizer_offsets() -> None:
+def _tokenizer():
     directory = _cached_tokenizer_dir()
     if directory is None:
         pytest.skip("reranker tokenizer files not in the local cache; skipping without a network request")
     from fastembed.common.preprocessor_utils import load_tokenizer
 
     tokenizer, _ = load_tokenizer(model_dir=directory)
+    return tokenizer
+
+
+def test_token_length_agrees_with_the_real_tokenizer_and_excludes_padding() -> None:
+    tokenizer = _tokenizer()
+    max_tokens = tokenizer.truncation["max_length"]
     query = "what does Bob like to drink in the morning"
     long_doc = " ".join(f"word{i}" for i in range(1200))[:6000]
     short_doc = "Bob always starts his day with a strong cup of black coffee."
-    assert len(long_doc) == 6000
 
     encodings = tokenizer.encode_batch([(query, long_doc), (query, short_doc)])
-    lengths = surviving_pair_char_lengths(query, [long_doc, short_doc], encodings)
+    lengths = surviving_pair_token_lengths(encodings)
 
-    # Independent computation from the tokenizer's own offsets: the long
-    # document is cut (the model maximum is reached), so its surviving
-    # characters end at its last surviving token; the query is whole.
-    long_enc = encodings[0]
-    doc_ends = [end for (_s, end), seq in zip(long_enc.offsets, long_enc.sequence_ids, strict=True) if seq == 1]
+    long_enc, short_enc = encodings
     assert long_enc.overflowing, "fixture precondition: the 6,000-character document is truncated"
-    expected_long = len(query) + max(doc_ends)
-    assert max(doc_ends) < len(long_doc)
-    assert lengths[0] == expected_long
-    assert lengths[1] == len(query) + len(short_doc), "an untruncated pair counts at its full length"
+    assert lengths[0] == max_tokens, "a truncated pair counts at the model maximum"
+    assert lengths[1] < lengths[0]
+    # The short pair is padded to the long pair's length inside this batch,
+    # so its token ids are as long as the long pair's; only the mask tells
+    # its real length, and a pair encoded alone must agree with it.
+    assert len(short_enc.ids) == len(long_enc.ids)
+    (alone,) = tokenizer.encode_batch([(query, short_doc)])
+    assert lengths[1] == len(alone.ids), "padding is not counted: the same pair alone is unpadded"
+    content = sum(1 for seq in alone.sequence_ids if seq is not None)
+    assert lengths[1] > content, "special tokens are counted (the model runs them)"
 
 
-def test_surviving_length_when_the_query_is_cut_too() -> None:
+def test_token_length_when_the_query_is_cut_too() -> None:
     """A very long query and a long document are both cut (the tokenizer's
-    longest-first truncation): each segment counts up to its own last
-    surviving token (plan §9c K)."""
-    directory = _cached_tokenizer_dir()
-    if directory is None:
-        pytest.skip("reranker tokenizer files not in the local cache; skipping without a network request")
-    from fastembed.common.preprocessor_utils import load_tokenizer
-
-    tokenizer, _ = load_tokenizer(model_dir=directory)
+    longest-first truncation): the pair still counts at the model maximum."""
+    tokenizer = _tokenizer()
     query = " ".join(f"ask{i}" for i in range(1200))[:5600]
     doc = " ".join(f"note{i}" for i in range(1200))[:6000]
 
     (encoding,) = tokenizer.encode_batch([(query, doc)])
-    (length,) = surviving_pair_char_lengths(query, [doc], [encoding])
+    (length,) = surviving_pair_token_lengths([encoding])
 
     ends = {0: 0, 1: 0}
     for (_s, end), seq in zip(encoding.offsets, encoding.sequence_ids, strict=True):
         if seq in ends:
             ends[seq] = max(ends[seq], end)
     assert ends[0] < len(query) and ends[1] < len(doc), "fixture precondition: both segments are cut"
-    assert length == ends[0] + ends[1]
+    assert length == tokenizer.truncation["max_length"]
 
+
+def test_cjk_and_emoji_cost_more_tokens_per_character_than_latin() -> None:
+    """The misestimate S75 fixes, on the shipped tokenizer: the same number
+    of characters is a very different number of tokens."""
+    tokenizer = _tokenizer()
+    query = "what does Bob like to drink"
+    docs = ["coffee " * 60, "\u5496\u5561" * 210, "\U0001f600\U0001f389" * 210]
+    assert len({len(d) for d in docs}) == 1, "fixture: the same character count"
+
+    lengths = surviving_pair_token_lengths(tokenizer.encode_batch([(query, d) for d in docs]))
+    latin, cjk, emoji = lengths
+
+    assert cjk > 1.5 * latin, "a character count would size these alike"
+    assert emoji > 2 * latin
