@@ -101,7 +101,8 @@ def inflight(kind: str) -> bool:
 
 
 def startup_compute_active() -> bool:
-    """True while the cosine bootstrap is in flight (kept for the cadence job)."""
+    """True while the cosine bootstrap is in flight (a convenience alias of
+    `inflight("cosine")`)."""
     return inflight("cosine")
 
 
@@ -166,6 +167,17 @@ def run_rerank_floor(*, activity_marker: object = None) -> dict | None:
     return floor_calibration.run_rerank_bootstrap(model_id, activity_marker=activity_marker)
 
 
+def _record_failure(kind: str, marker: object) -> None:
+    """Record a failed `kind` attempt that never reached the bootstrap function
+    (store would not open, a due check or an id lookup raised), so the message
+    retry (S92) still picks the floor up. Never raises."""
+    try:
+        model_id = embedder_model_id() if kind == "cosine" else reranker_model_id()
+        floor_calibration._record_attempt(kind, model_id, False, marker)  # noqa: SLF001
+    except Exception:  # noqa: BLE001
+        logger.debug("floor_startup: could not record a %s failure", kind, exc_info=True)
+
+
 def run_guarded(kind: str, run, *, activity_marker: object = None) -> bool:
     """Run `run(activity_marker=...)` under the `kind` in-flight slot; False
     (nothing run) when another bootstrap of that floor is already in flight."""
@@ -188,20 +200,22 @@ def compute_missing_floors(
     missing. Opens its own short-lived store to read the calibrated row and
     closes it before any model loads. Never raises. `_registered` = the caller
     already holds the cosine in-flight slot (`start_background`)."""
-    from brain.memory.store import MemoryStore
-
     if not _registered and not try_begin("cosine"):
         return
     try:
         try:
+            from brain.memory.store import MemoryStore
+
             store = MemoryStore(Path(persona_dir) / "memories.db", integrity_check=False)
         except Exception:  # noqa: BLE001
             logger.exception("floor_startup: could not open the store; floor not computed")
+            _record_failure("cosine", activity_marker())
             return
         try:
             cosine_needed = cosine_floor_due(store, activity_marker=activity_marker())
         except Exception:  # noqa: BLE001
             logger.exception("floor_startup: due check failed; floor not computed")
+            _record_failure("cosine", activity_marker())
             return
         finally:
             store.close()
@@ -210,6 +224,7 @@ def compute_missing_floors(
                 run_cosine_floor(activity_marker=activity_marker())
             except Exception:  # noqa: BLE001
                 logger.exception("floor_startup: the cosine bootstrap raised")
+                _record_failure("cosine", activity_marker())
     finally:
         end("cosine")
 
@@ -274,7 +289,13 @@ def request_rerank_bootstrap() -> threading.Thread | None:
     time, and returns immediately (never on the reply path). Returns the thread
     started, or `None` (already in flight, or inhibited). Never raises."""
     try:
-        floor_calibration.note_bootstrap_needed("rerank", reranker_model_id())
+        model_id = reranker_model_id()
+        floor_calibration.note_bootstrap_needed("rerank", model_id)
+        if floor_calibration.bootstrap_failed("rerank", model_id):
+            # A bootstrap already failed: retries belong to the next incoming
+            # MESSAGE (`on_incoming_message`, S92) and the cadence job, not to
+            # every reranked turn or paragraph.
+            return None
         return _spawn(
             "rerank",
             lambda: run_rerank_floor(activity_marker=_current_marker()),
@@ -299,6 +320,11 @@ def _retry_body(kind: str, persona_dir: Path) -> None:
     finally:
         store.close()
     if calibrated:
+        # The floor exists (a calibrated row): the failed record is moot, so
+        # later messages stop spawning this retry.
+        floor_calibration.forget_failure(
+            kind, embedder_model_id() if kind == "cosine" else reranker_model_id()
+        )
         return
     run = run_cosine_floor if kind == "cosine" else run_rerank_floor
     run(activity_marker=_current_marker())

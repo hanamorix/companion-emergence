@@ -460,8 +460,8 @@ def _bootstrap_reranker_provider(model_id: str) -> RerankerProvider:
     match) so a caller that resolves to this same `model_id` elsewhere in
     the process reuses the already-loaded ONNX session instead of paying
     for a second one. In production a cache HIT is the rule: the only
-    caller path, `floor_startup.run_rerank_floor` (process start, or the
-    next-lull retry job; name-recall fix S85 revised), calls
+    caller path, `floor_startup.run_rerank_floor` (first need, the per-message
+    retry, or the next-lull retry job; name-recall fix S91/S92), calls
     `build_reranker_provider()` first, which registers the fp16 model and
     caches the provider for the runtime model_id.
     """

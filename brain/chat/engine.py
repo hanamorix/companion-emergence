@@ -130,16 +130,18 @@ def respond(
     )
 
     cli_throttle.note_user_message()
-    # S92 (name-recall fix): each incoming message retries a FAILED floor
-    # bootstrap in the background (off this reply path; never raises, never
-    # blocks; at most one bootstrap in flight per floor).
     try:
-        from brain.memory import floor_startup
+        # S92 (name-recall fix): each incoming message retries a FAILED floor
+        # bootstrap in the background (off this reply path; never raises, never
+        # blocks: it only reads the small retry-state under its own lock and
+        # starts a daemon thread; at most one bootstrap in flight per floor).
+        # Inside the `try` so `note_reply_end()` runs whatever happens here.
+        try:
+            from brain.memory import floor_startup
 
-        floor_startup.on_incoming_message(persona_dir)
-    except Exception:  # noqa: BLE001 — the floor retry must never touch a reply
-        logger.debug("floor bootstrap message hook failed", exc_info=True)
-    try:
+            floor_startup.on_incoming_message(persona_dir)
+        except Exception:  # noqa: BLE001 — the floor retry must never touch a reply
+            logger.debug("floor bootstrap message hook failed", exc_info=True)
         return _respond_inner(
             persona_dir,
             user_input,

@@ -1,8 +1,10 @@
-"""Name-recall fix S85 (spec §2, revised): both bootstrap floors (cosine and
-rerank) are computed once per process at process start, off the reply path, by
-`floor_startup.compute_missing_floors`, in the bridge's startup thread and at
-`nell chat --no-bridge` session start. Recall only ever PEEKS the caches; a
-failed bootstrap is retried at the next lull by the central cadence jobs.
+"""Name-recall fix S85 revised, S91, S92 (spec §2): the COSINE floor is computed
+once per process at process start, off the reply path
+(`floor_startup.compute_missing_floors`: the bridge's startup thread and
+`nell chat --no-bridge` session start); the RERANK floor on first need, in the
+background; a failed bootstrap of either is retried in the background on each
+incoming message and at the next lull by the central cadence jobs; never more
+than one bootstrap in flight per floor. Recall only ever PEEKS the caches.
 
 Also pins the model ids the job and the lookup key on to the ids the real
 providers report.
@@ -1053,3 +1055,248 @@ def test_start_background_claims_the_cosine_slot_before_the_thread_runs(
         thread.join(timeout=5)
 
     assert seen == [True]
+
+
+# ---------------------------------------------------------------------------
+# Review round 1: the reply thread never waits behind a running bootstrap, the
+# request is not per-rerank, no-start states are recorded, moot records are
+# cleared, the hook sits inside `respond`'s try, slots are always released
+# ---------------------------------------------------------------------------
+
+
+def _finishes_within(fn, seconds: float = 5.0) -> bool:
+    done = threading.Event()
+
+    def _run():
+        try:
+            fn()
+        finally:
+            done.set()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return done.wait(seconds)
+
+
+def test_the_reply_thread_helpers_never_wait_behind_a_bootstrap_holding_the_compute_locks(
+    computes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, background_on
+) -> None:
+    """The real compute functions hold their locks across a model download; the
+    helpers the reply thread calls (`on_incoming_message`,
+    `request_rerank_bootstrap`, the state readers) must not use those locks."""
+    floor_calibration._record_attempt("cosine", _COSINE_ID, False, 1.0)  # noqa: SLF001
+    floor_calibration._record_attempt("rerank", _RERANK_ID, False, 1.0)  # noqa: SLF001
+    # the spawned retries would need the compute locks: keep them from starting
+    monkeypatch.setattr(floor_startup, "_background_inhibited", True)
+    with (
+        floor_calibration._cosine_bootstrap_floor_cache_lock,  # noqa: SLF001
+        floor_calibration._bootstrap_floor_cache_lock,  # noqa: SLF001
+    ):
+        assert _finishes_within(lambda: floor_startup.on_incoming_message(tmp_path))
+        assert _finishes_within(floor_startup.request_rerank_bootstrap)
+        assert _finishes_within(lambda: floor_calibration.bootstrap_failed("cosine", _COSINE_ID))
+        assert _finishes_within(lambda: floor_calibration.note_bootstrap_needed("rerank", "x"))
+        assert _finishes_within(
+            lambda: floor_calibration.rerank_bootstrap_due(_RERANK_ID, activity_marker=2.0)
+        )
+        assert _finishes_within(
+            lambda: floor_calibration.cosine_bootstrap_due(_COSINE_ID, activity_marker=2.0)
+        )
+
+
+def test_the_first_need_request_is_not_repeated_per_rerank_once_a_bootstrap_failed(
+    computes, monkeypatch: pytest.MonkeyPatch, background_on
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        floor_calibration, "get_bootstrap_floor", lambda mid: calls.append(mid) or None
+    )
+
+    first = floor_startup.request_rerank_bootstrap()
+    assert first is not None
+    first.join(timeout=10)
+    assert len(calls) == 1 and floor_calibration.bootstrap_failed("rerank", _RERANK_ID)
+
+    for _ in range(4):
+        assert floor_startup.request_rerank_bootstrap() is None, "retries belong to the message"
+    assert len(calls) == 1
+
+
+def test_a_startup_that_could_not_even_try_is_recorded_so_the_message_retry_picks_it_up(
+    computes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, background_on
+) -> None:
+    real_init = MemoryStore.__init__
+    monkeypatch.setattr(
+        MemoryStore, "__init__", lambda *a, **k: (_ for _ in ()).throw(OSError("no"))
+    )
+
+    floor_startup.compute_missing_floors(tmp_path)
+
+    assert floor_calibration.bootstrap_failed("cosine", _COSINE_ID), "recorded, not silent"
+    monkeypatch.setattr(MemoryStore, "__init__", real_init)
+    for t in floor_startup.on_incoming_message(tmp_path):
+        t.join(timeout=10)
+    assert ("end", "cosine") in computes, "the next message computed it"
+
+
+def test_a_moot_failed_record_is_cleared_once_a_calibrated_row_exists(
+    computes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, background_on
+) -> None:
+    floor_calibration._record_attempt("cosine", _COSINE_ID, False, 1.0)  # noqa: SLF001
+    store = MemoryStore(tmp_path / "memories.db")
+    store.write_cosine_floor(
+        _COSINE_ID, floor=0.5, raw_fit_floor=0.5, sample_pairs=300, is_cold_start=False
+    )
+    store.close()
+
+    (thread,) = floor_startup.on_incoming_message(tmp_path)
+    thread.join(timeout=10)
+
+    assert not floor_calibration.bootstrap_failed("cosine", _COSINE_ID)
+    assert floor_startup.on_incoming_message(tmp_path) == [], "later messages start nothing"
+    assert computes == []
+
+
+def test_the_retry_body_closes_its_store(
+    computes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, background_on
+) -> None:
+    closed: list[bool] = []
+    real_close = MemoryStore.close
+    monkeypatch.setattr(
+        MemoryStore, "close", lambda self: (closed.append(True), real_close(self))[1]
+    )
+    floor_calibration._record_attempt("cosine", _COSINE_ID, False, 1.0)  # noqa: SLF001
+
+    for t in floor_startup.on_incoming_message(tmp_path):
+        t.join(timeout=10)
+
+    assert closed, "the retry's store was closed"
+
+
+def test_a_background_attempt_records_the_registered_activity_marker(
+    computes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, background_on
+) -> None:
+    monkeypatch.setattr(floor_calibration, "get_cosine_bootstrap_floor", lambda _id: None)
+    monkeypatch.setattr(floor_calibration, "get_bootstrap_floor", lambda _id: None)
+    floor_startup.set_activity_marker_provider(lambda: 9.0)
+    floor_calibration._record_attempt("cosine", _COSINE_ID, False, 1.0)  # noqa: SLF001
+
+    for t in floor_startup.on_incoming_message(tmp_path):
+        t.join(timeout=10)
+    request = floor_startup.request_rerank_bootstrap()
+    request.join(timeout=10)
+
+    assert not floor_calibration.cosine_bootstrap_due(_COSINE_ID, activity_marker=9.0)
+    assert floor_calibration.cosine_bootstrap_due(_COSINE_ID, activity_marker=10.0)
+    assert not floor_calibration.rerank_bootstrap_due(_RERANK_ID, activity_marker=9.0)
+    assert floor_calibration.rerank_bootstrap_due(_RERANK_ID, activity_marker=10.0)
+
+
+def test_start_background_registers_the_marker_provider_and_refuses_a_taken_slot(
+    computes, tmp_path: Path
+) -> None:
+    assert floor_startup.try_begin("cosine")
+    try:
+        assert floor_startup.start_background(tmp_path, activity_marker=lambda: 3.0) is None
+    finally:
+        floor_startup.end("cosine")
+    assert floor_startup._current_marker() == 3.0  # noqa: SLF001, the provider was registered
+
+    thread = floor_startup.start_background(tmp_path, activity_marker=lambda: 4.0)
+    assert thread is not None
+    thread.join(timeout=10)
+    assert floor_startup._current_marker() == 4.0  # noqa: SLF001
+
+
+def test_slots_are_always_released_and_a_taken_slot_is_refused(
+    computes, monkeypatch: pytest.MonkeyPatch, background_on
+) -> None:
+    # a spawned body that raises releases its slot
+    thread = floor_startup._spawn("cosine", lambda: 1 / 0, name="boom")  # noqa: SLF001
+    thread.join(timeout=10)
+    assert not floor_startup.inflight("cosine")
+
+    # run_guarded releases on an exception, and refuses when the slot is taken
+    with pytest.raises(ZeroDivisionError):
+        floor_startup.run_guarded("rerank", lambda **kw: 1 / 0)
+    assert not floor_startup.inflight("rerank")
+    ran: list[int] = []
+    assert floor_startup.try_begin("rerank")
+    try:
+        assert floor_startup.run_guarded("rerank", lambda **kw: ran.append(1)) is False
+        assert ran == []
+    finally:
+        floor_startup.end("rerank")
+    assert floor_startup.run_guarded("rerank", lambda **kw: ran.append(1)) is True
+
+    # a thread that cannot start releases its slot
+    monkeypatch.setattr(
+        threading.Thread, "start", lambda self: (_ for _ in ()).throw(RuntimeError("no threads"))
+    )
+    with pytest.raises(RuntimeError):
+        floor_startup._spawn("cosine", lambda: None, name="nostart")  # noqa: SLF001
+    assert not floor_startup.inflight("cosine")
+    with pytest.raises(RuntimeError):
+        floor_startup.start_background(Path("."))
+    assert not floor_startup.inflight("cosine")
+
+
+def test_the_cadence_job_runs_through_the_in_flight_slot(
+    computes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from brain.bridge import supervisor
+    from tests.unit.brain.bridge.test_central_cadence import _granting_slot, _persona
+
+    monkeypatch.setattr(supervisor.cli_throttle, "background_slot", _granting_slot)
+    persona_dir = _persona(tmp_path)
+    (job,) = _bootstrap_job_named(persona_dir, "cosine_floor_bootstrap")
+    from brain.bridge.central_cadence import JobOutcome
+
+    assert floor_startup.try_begin("cosine")
+    try:
+        assert job.run() is JobOutcome.SKIPPED, "another cosine bootstrap is in flight"
+        assert computes == []
+    finally:
+        floor_startup.end("cosine")
+    assert job.run() is JobOutcome.COMPLETED
+    assert ("end", "cosine") in computes
+
+
+def _engine_persona(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    import json
+
+    from brain import paths
+
+    d = tmp_path / "personas" / "nell"
+    d.mkdir(parents=True)
+    (d / "persona_config.json").write_text(json.dumps({"provider": "fake", "searcher": "noop"}))
+    (d / "emotion_vocabulary.json").write_text(json.dumps({"version": 1, "emotions": []}))
+    monkeypatch.setattr(paths, "get_home", lambda: tmp_path)
+    return d
+
+
+def test_the_message_hook_runs_before_the_turn_and_inside_the_reply_bookkeeping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The hook runs before `_respond_inner`, and a BaseException from it still
+    lets `note_reply_end()` run (the in-flight counter is never left stuck)."""
+    from brain.chat import engine
+
+    d = _engine_persona(tmp_path, monkeypatch)
+    order: list[str] = []
+    monkeypatch.setattr(floor_startup, "on_incoming_message", lambda pd: order.append("hook"))
+    monkeypatch.setattr(engine, "_respond_inner", lambda *a, **k: order.append("turn") or "done")
+    cli_throttle.reset()
+    try:
+        assert engine.respond(d, "hi", store=None, hebbian=None, provider=None) == "done"
+        assert order == ["hook", "turn"]
+        assert not cli_throttle.reply_in_flight()
+
+        def _interrupt(pd):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(floor_startup, "on_incoming_message", _interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            engine.respond(d, "hi", store=None, hebbian=None, provider=None)
+        assert not cli_throttle.reply_in_flight(), "note_reply_end ran despite the BaseException"
+    finally:
+        cli_throttle.reset()

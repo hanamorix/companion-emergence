@@ -122,16 +122,17 @@ log = logging.getLogger(__name__)
 # comment: `MemoryStore.get_reranker_floor` returns a servable floor when no
 # persisted row exists yet, serving a derived, process-wide cached BOOTSTRAP
 # floor instead of `None` (see `floor_calibration.get_bootstrap_floor`; name-
-# recall fix S85 revised: that bootstrap is computed at process start off the
-# reply path and retried at the next lull, never here). This decouples semantic recall's
+# recall fix S85 revised, S91/S92: that bootstrap is computed in the background
+# on first need and retried on each message / at the next lull, never here).
+# This decouples semantic recall's
 # EXISTENCE from the daily calibration tick ever having fired for the
 # runtime model_id — the earlier design ("no row -> None -> fall back to
 # lexical, exactly like an empty/sparse candidate pool") permanently
 # coupled recall to the tick (disabled calibration, or a recall running
 # before the tick's first idle moment, silently and PERMANENTLY demoted to
 # lexical-only even with embeddings present) — see the spec's §7 UPDATED
-# note for the full rationale. No floor yet (the startup computation has not
-# finished, or it failed and awaits the next-lull retry) means the
+# note for the full rationale. No floor yet (the first-need bootstrap has not
+# finished, or it failed and awaits the next message / lull retry) means the
 # reranker cannot gate this turn, so (name-recall fix R2, spec §2) the turn
 # takes the cosine path instead (`rank_and_gate`); it is no longer the
 # ROUTINE fresh-install/no-tick-yet case either.

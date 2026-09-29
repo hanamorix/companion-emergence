@@ -18,9 +18,10 @@ deploy recalibration immediately before daily calibration (S70/S73).
 Cadence rules (interval jobs, owned here):
 
 * A predicate job's own condition holds (the two floor-bootstrap RETRY jobs,
-  name-recall fix S85 revised: no calibrated row, no cached bootstrap, chat
-  has happened since the failed attempt, the process-start computation not
-  running), like deploy recalibration.
+  name-recall fix S85 revised, S91/S92: no calibrated row, no cached
+  bootstrap, the floor was needed or its last attempt failed, chat has
+  happened since the failed attempt, and no bootstrap of that floor in
+  flight), like deploy recalibration.
 * A missing OR corrupt cadence file is created as "last ran now"
   (``next_at = now + interval``) and the job does not run on that pass
   (S22/S69). A present file with a past ``next_at`` is simply overdue (S34),

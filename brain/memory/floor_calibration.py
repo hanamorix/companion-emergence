@@ -72,10 +72,11 @@ bundled `_FP16_GATE_PAIRS` still gets scored to synthesize a floor (via the
 shared `_cold_start_pairs` helper below). It serves the true first-ever-install
 case, before any tick has run. It is NEVER called from a reply:
 `MemoryStore.get_reranker_floor` only peeks the process cache
-(`peek_bootstrap_floor`). `run_rerank_bootstrap` computes it once per process
-at process start (`brain.memory.floor_startup`: the bridge's startup thread,
-`nell chat --no-bridge` session start) and the central cadence job
-`rerank_floor_bootstrap` retries a failed one at the next lull. It is computed
+(`peek_bootstrap_floor`). `run_rerank_bootstrap` computes it in the background
+on FIRST NEED (S91: a reranked turn found no floor, `brain.memory.floor_startup.
+request_rerank_bootstrap`), a failed one is retried in the background on each
+incoming message (S92) and by the central cadence job `rerank_floor_bootstrap`
+at the next lull. It is computed
 ONCE per model_id and cached process-wide (never persisted to `memories.db` — a
 transient, in-memory-only fallback that a real persisted row always
 supersedes, see that function's docstring), and it deliberately builds its
@@ -373,9 +374,10 @@ def _cold_start_pairs(reranker_provider: RerankerProvider) -> list[tuple[float, 
 # ---------------------------------------------------------------------------
 # Rerank bootstrap floor (F2a inc8, #250 §7 UPDATED, Roy 2026-09-18) — the
 # DEFAULT `get_reranker_floor` serves (from this cache, name-recall fix S85
-# revised) when NO persisted row exists yet, so semantic recall's existence
-# is decoupled from the daily tick ever having fired. Process-wide cache,
-# keyed by model_id, computed ONCE at process start (never on a reply).
+# revised, S91) when NO persisted row exists yet, so semantic recall's
+# existence is decoupled from the daily tick ever having fired. Process-wide
+# cache, keyed by model_id, computed ONCE on first need in the background
+# (never on a reply).
 # ---------------------------------------------------------------------------
 
 # model_id -> the bootstrap floor dict last derived for it (same shape as
@@ -401,12 +403,13 @@ def peek_bootstrap_floor(reranker_model_id: str) -> dict[str, Any] | None:
 
 
 def rerank_bootstrap_due(reranker_model_id: str, *, activity_marker: object = None) -> bool:
-    """True when the rerank bootstrap for `reranker_model_id` is not cached and
-    either was never attempted or last failed under a different
-    `activity_marker` (the next-lull retry rule)."""
+    """True when the rerank bootstrap for `reranker_model_id` is not cached, a
+    turn NEEDED it or an attempt FAILED (S91: never just because the process
+    started), and it either was never attempted or last failed under a
+    different `activity_marker` (the next-lull retry rule)."""
     if peek_bootstrap_floor(reranker_model_id) is not None:
         return False
-    with _cosine_bootstrap_floor_cache_lock:
+    with _state_lock:
         wanted = ("rerank", reranker_model_id) in _bootstrap_needed or (
             "rerank",
             reranker_model_id,
@@ -468,13 +471,14 @@ def get_bootstrap_floor(reranker_model_id: str) -> dict[str, Any] | None:
     model_id (this cache) and NEVER involves the §6 torch-backed relevance
     judge — only jina (ONNX, via `CrossEncoderProvider`) scores the bundled
     pairs, so no torch import and no extra latency beyond this one-time cost
-    ever touch the reply path. Name-recall fix S85 (revised): this function is
-    NEVER called from a reply (`get_reranker_floor` only peeks the cache).
-    `run_rerank_bootstrap` computes it once per process at process start
+    ever touch the reply path. Name-recall fix S85 (revised) / S91 / S92: this
+    function is NEVER called from a reply (`get_reranker_floor` only peeks the
+    cache). `run_rerank_bootstrap` computes it in the background on first need
     (`brain.memory.floor_startup`, after `reranker.build_reranker_provider()`
     has registered and cached the provider for this model id, so the ONNX
-    session is warm), and the central cadence job retries a failed one at the
-    next lull.
+    session is warm: the turn that raised the need had just reranked), a failed
+    one is retried in the background on each incoming message and by the
+    central cadence job at the next lull.
 
     NEVER PERSISTED: this is a transient, in-memory-only fallback — the
     caller (`MemoryStore.get_reranker_floor`) always checks the PERSISTED
@@ -535,7 +539,7 @@ def _reset_bootstrap_floor_cache() -> None:
     """
     with _bootstrap_floor_cache_lock:
         _bootstrap_floor_cache.clear()
-    with _cosine_bootstrap_floor_cache_lock:
+    with _state_lock:
         for key in [k for k in _bootstrap_failed_at if k[0] == "rerank"]:
             del _bootstrap_failed_at[key]
         _bootstrap_needed.difference_update({k for k in _bootstrap_needed if k[0] == "rerank"})
@@ -560,6 +564,13 @@ def _reset_bootstrap_floor_cache() -> None:
 
 _cosine_bootstrap_floor_cache: dict[str, dict[str, Any]] = {}
 _cosine_bootstrap_floor_cache_lock = threading.Lock()
+# Guards ONLY the small retry-bookkeeping state below (`_bootstrap_failed_at`,
+# `_bootstrap_needed`), for both floors. Deliberately NOT the compute locks:
+# `get_cosine_bootstrap_floor` / `get_bootstrap_floor` hold those across a model
+# download/load, and the reply thread reads this state (the `respond()` hook,
+# the first-need request), so it must never wait behind a bootstrap (S91/S92:
+# "never on the reply path").
+_state_lock = threading.Lock()
 
 
 def _cosine_bootstrap_pairs(embedder: Any) -> list[tuple[float, str]]:
@@ -591,14 +602,21 @@ _bootstrap_needed: set[tuple[str, str]] = set()
 
 def note_bootstrap_needed(kind: str, model_id: str) -> None:
     """Record that a turn needed the `kind` bootstrap floor and found none."""
-    with _cosine_bootstrap_floor_cache_lock:
+    with _state_lock:
         _bootstrap_needed.add((kind, model_id))
+
+
+def forget_failure(kind: str, model_id: str) -> None:
+    """Drop the failed-attempt record of a floor that no longer needs a
+    bootstrap (a calibrated row exists), so the message retry stops spawning."""
+    with _state_lock:
+        _bootstrap_failed_at.pop((kind, model_id), None)
 
 
 def bootstrap_failed(kind: str, model_id: str) -> bool:
     """True when a `kind` bootstrap attempt for `model_id` failed and no floor
     has been cached since (the on-each-message background retry, S92)."""
-    with _cosine_bootstrap_floor_cache_lock:
+    with _state_lock:
         return (kind, model_id) in _bootstrap_failed_at
 
 
@@ -612,13 +630,13 @@ def peek_cosine_bootstrap_floor(embedder_model_id: str) -> dict[str, Any] | None
 
 
 def _retry_due(kind: str, model_id: str, activity_marker: object) -> bool:
-    with _cosine_bootstrap_floor_cache_lock:
+    with _state_lock:
         failed = _bootstrap_failed_at.get((kind, model_id), _UNSET)
     return failed is _UNSET or failed != activity_marker
 
 
 def _record_attempt(kind: str, model_id: str, ok: bool, activity_marker: object) -> None:
-    with _cosine_bootstrap_floor_cache_lock:
+    with _state_lock:
         if ok:
             _bootstrap_failed_at.pop((kind, model_id), None)
             _bootstrap_needed.discard((kind, model_id))
@@ -721,6 +739,7 @@ def _reset_cosine_bootstrap_floor_cache() -> None:
     `tests/conftest.py` next to `_reset_bootstrap_floor_cache`."""
     with _cosine_bootstrap_floor_cache_lock:
         _cosine_bootstrap_floor_cache.clear()
+    with _state_lock:
         for key in [k for k in _bootstrap_failed_at if k[0] == "cosine"]:
             del _bootstrap_failed_at[key]
         _bootstrap_needed.difference_update({k for k in _bootstrap_needed if k[0] == "cosine"})

@@ -1075,11 +1075,13 @@ def build_app(
             logger.warning("is-chat-idle seed from active_conversations failed: %s", _exc)
 
         # Floor bootstraps (name-recall fix S85, revised; spec §2): the cosine
-        # and rerank bootstrap floors are computed ONCE per process, here at
-        # process start, on a daemon thread off every reply path (recall only
-        # peeks the caches). Until it finishes, recall that needs a missing
-        # floor renders keyword results only; a failed bootstrap is retried at
-        # the next lull by the central cadence jobs. Off with the other
+        # (S91: only the COSINE one) bootstrap floor is computed ONCE per
+        # process, here at process start, on a daemon thread off every reply
+        # path (recall only peeks the caches). Until it finishes, the no-rerank
+        # path renders keyword results only. The RERANK floor bootstraps on
+        # first need in the background; a failed bootstrap is retried in the
+        # background on each incoming message (`respond()`, S92) and at the
+        # next lull by the central cadence jobs. Off with the other
         # background threads in tests. Fault-isolated: never breaks startup.
         # Started AFTER the is-chat-idle seed above (the retry rule reads the
         # same anchor through `chat_activity_marker`, so nothing may read it

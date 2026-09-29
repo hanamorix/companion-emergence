@@ -1619,10 +1619,11 @@ class MemoryStore:
         Name-recall fix S85 (revised): this method NEVER computes that
         bootstrap. It returns the persisted row, else the cached bootstrap
         (`floor_calibration.peek_bootstrap_floor`), else `None`. The bootstrap
-        is computed once per process at process start off the reply path
-        (`brain.memory.floor_startup`: bridge startup thread, `nell chat
-        --no-bridge` session start) and a failed one is retried at the next
-        lull by the central cadence job; `None` (not computed yet, or it
+        is computed in the background on FIRST NEED (S91: a reranked turn that
+        finds no floor takes the cosine path and flags it,
+        `brain.memory.floor_startup.request_rerank_bootstrap`); a failed one
+        is retried in the background on each incoming message (S92) and at the
+        next lull by the central cadence job; `None` (not computed yet, or it
         failed) means the reranker cannot gate the turn and recall takes the
         no-rerank path (name-recall fix R2, spec §2), which is keyword-only
         while the cosine floor is also missing.
