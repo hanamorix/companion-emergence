@@ -951,6 +951,14 @@ def build_app(
         _work_dir = _claude_work_dir()
         if _work_dir is not None:
             logger.info("claude working directory: %s", _work_dir)
+        # #302: running from a brain overlay → mark its folder in use so a later
+        # `nell update` prune leaves it alone while this process lives. Fail-soft.
+        try:
+            from brain.update.overlay import mark_in_use
+
+            mark_in_use()
+        except Exception:
+            logger.warning("could not mark the brain overlay in use", exc_info=True)
 
         # Rewrite the ops-tunables defaults section (spec 2026-07-04). Fail-soft:
         # write_defaults_section swallows its own errors; belt-and-braces here so

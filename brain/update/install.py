@@ -150,6 +150,12 @@ def apply_update(*, wheel: Path, requirements: Path, commit: str, site_dir: Path
     with overlay.overlay_lock(root):
         state = overlay.read_state(root)
         named = {e["dir"] for e in (state["active"], state["previous"]) if e}
+
+        def protected(folder: Path) -> bool:
+            # never rename or delete a folder current.json names, or one a live process
+            # still runs `brain` from — prune keeps those too (#302, #314)
+            return folder.name in named or overlay.in_use(folder)
+
         target = root / entry["dir"]
         try:
             stamp = json.loads((target / "stamp.json").read_text(encoding="utf-8"))
@@ -158,14 +164,15 @@ def apply_update(*, wheel: Path, requirements: Path, commit: str, site_dir: Path
         matches = (isinstance(stamp, dict) and stamp.get("commit") == commit
                    and stamp.get("bundle_id") == bundle_id and target.name in named)
         if not matches:
-            if target.exists() and target.name in named:
-                # `target` is current.json's active or previous folder, just with a
-                # stamp that doesn't match (e.g. corrupted) — never rename or delete
-                # a folder current.json names; install into a fresh one instead. Pick
-                # the first counter not already named (not pid-based: a prior run's
-                # `-r<pid>` folder could still be named when the OS reuses that pid).
+            if target.exists() and protected(target):
+                # `target` is current.json's active or previous folder with a stamp that
+                # doesn't match (e.g. corrupted), or an unnamed folder a live bridge still
+                # runs from (the same commit re-applied after newer ones) — install into
+                # a fresh one instead. Pick the first counter not already protected (not
+                # pid-based: a prior run's `-r<pid>` folder could still be named when the
+                # OS reuses that pid).
                 n = 1
-                while f"{base}-r{n}" in named:
+                while protected(root / f"{base}-r{n}"):
                     n += 1
                 entry["dir"] = f"{base}-r{n}"
                 target = root / entry["dir"]
@@ -191,13 +198,13 @@ def apply_update(*, wheel: Path, requirements: Path, commit: str, site_dir: Path
                 _smoke(staging, smoke_modules, site_dir)
                 stamp = {**entry, "installed_at": iso_utc(datetime.now(UTC))}
                 (staging / "stamp.json").write_text(json.dumps(stamp, indent=2), encoding="utf-8")
-                # Checked, not assumed: the named case above should already have
-                # redirected `target` away from anything current.json names. This is
+                # Checked, not assumed: the protected case above should already have
+                # redirected `target` away from anything named or in use. This is
                 # unreachable in the happy path; it's the guard.
-                if target.name in named:
-                    raise UpdateError(f"refusing to replace {target.name}: current.json names it")
+                if protected(target):
+                    raise UpdateError(f"refusing to replace {target.name}: current.json names it or a running brain uses it")
                 if target.exists():
-                    # `target` is NOT named by current.json — it's leftover garbage
+                    # `target` is neither named nor in use — it's leftover garbage
                     # from an earlier crashed/partial install. Safe to remove outright;
                     # if it can't be removed, fail loudly rather than silently
                     # swallowing it (current.json is still untouched).
@@ -205,7 +212,7 @@ def apply_update(*, wheel: Path, requirements: Path, commit: str, site_dir: Path
                         shutil.rmtree(target)
                     except OSError as e:
                         raise UpdateError(f"could not remove leftover overlay folder {target}: {e}") from e
-                os.replace(staging, target)
+                overlay.replace_retrying(staging, target)
             except OSError as exc:
                 shutil.rmtree(staging, ignore_errors=True)
                 raise UpdateError(f"update failed: {exc}") from exc
