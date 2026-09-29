@@ -1,9 +1,11 @@
-"""Name-recall fix R4 (spec §5, S8, S35, S52, S57; plan P-21): `search_memories`
+"""Name-recall fix R4 (spec §5, S8, S35, S52, S79, S81; plan P-21): `search_memories`
 
   - semantic mode merges the keyword search in BELOW the semantic results, in
     the slots they leave under the limit (criteria C7, C8, C5b);
-  - lexical mode runs its query through the recall token selector with NO cap
-    and the store admits every token the selector kept (C5b, S57).
+  - the keyword side (both modes) sends EVERY word of the query, no stopword
+    drop and no cap (S81, superseding S57 for the tool), in two tiers: the
+    words the store has always searched (3+ characters), then the 1-2 character
+    words, whose hits only fill leftover slots (S79).
 
 Driven through the real `dispatch` path with a scripted embedder and reranker,
 like `test_search_memories_mode.py`. Synthetic data only.
@@ -354,3 +356,79 @@ def test_a_tier_two_genuine_hit_precedes_a_tier_one_family_hit(tmp_path: Path) -
     genuine = _mem(store, "an AI notebook, nothing else")
     ids = _ids(dispatch("search_memories", {"query": "quokka AI", "mode": "lexical", "limit": 8}, **ctx))
     assert ids.index(genuine.id) < ids.index(family.id)
+
+
+# ---------------------------------------------------------------------------
+# Round-4 review: tier-2 extras (found only through 1-2 character words) must
+# not displace, out-order or link to what tier 1 (today's search) returns.
+# ---------------------------------------------------------------------------
+
+
+def _short_word_junk(store: MemoryStore, n: int) -> list[Memory]:
+    """Newer memories matching only the 1-2 character words of a query."""
+    return [_mem(store, f"my dog is s big number {i}") for i in range(n)]
+
+
+def test_order_age_never_lets_short_word_extras_displace_tier_one_hits(tmp_path: Path) -> None:
+    ctx = _ctx(tmp_path)
+    store = ctx["store"]
+    targets = [_mem(store, f"quokka rescue report {i}") for i in range(3)]
+    _short_word_junk(store, 20)  # created later: an age sort would put them first
+    query = "quokka rescue, Canary's is my"
+    for order in ("relevance", "age"):
+        ids = _ids(dispatch("search_memories", {"query": query, "mode": "lexical", "limit": 5, "order": order}, **ctx))
+        assert {m.id for m in targets} <= set(ids[:5]), order
+        assert set(ids[:3]) == {m.id for m in targets}, f"tier-1 hits lead under order={order}"
+
+
+def test_an_emotion_boost_cannot_lift_a_short_word_extra_over_tier_one_hits(tmp_path: Path) -> None:
+    ctx = _ctx(tmp_path)
+    store = ctx["store"]
+    tier1 = [_mem(store, f"quokka rescue report {i}") for i in range(3)]
+    joyful = Memory.create_new(content="an AI notebook", memory_type="event", domain="d", emotions={"joy": 8.0})
+    store.create(joyful)
+    ids = _ids(
+        dispatch("search_memories", {"query": "quokka rescue AI", "mode": "lexical", "limit": 3, "emotion": "joy"}, **ctx)
+    )
+    assert set(ids) == {m.id for m in tier1}
+
+
+def test_co_recall_never_links_the_anchor_to_a_short_word_extra(tmp_path: Path) -> None:
+    ctx = _ctx(tmp_path)
+    store = ctx["store"]
+    _mem(store, "quokka rescue report a")
+    _mem(store, "quokka rescue report b")
+    junk = _short_word_junk(store, 3)
+    edges: list[tuple[str, str]] = []
+    real = ctx["hebbian"].strengthen
+    ctx["hebbian"].strengthen = lambda a, b, delta=0.1: (edges.append((a, b)), real(a, b, delta))[1]
+    dispatch("search_memories", {"query": "quokka rescue is s", "mode": "lexical", "limit": 5}, **ctx)
+    assert edges, "the two tier-1 hits are still linked"
+    assert not ({b for _, b in edges} & {m.id for m in junk})
+
+
+def test_exclude_ids_apply_to_tier_two_and_a_hit_in_both_tiers_appears_once(tmp_path: Path) -> None:
+    ctx = _ctx(tmp_path)
+    store = ctx["store"]
+    both = _mem(store, "quokka rescue and an AI notebook")
+    only_short = _mem(store, "an AI notebook")
+    excluded = _mem(store, "another AI notebook")
+    ids = _ids(
+        dispatch(
+            "search_memories",
+            {"query": "quokka AI", "mode": "lexical", "limit": 8, "exclude_ids": [excluded.id]},
+            **ctx,
+        )
+    )
+    assert ids.count(both.id) == 1
+    assert only_short.id in ids and excluded.id not in ids
+
+
+def test_a_family_flood_matching_only_a_short_word_cannot_hide_a_genuine_hit(tmp_path: Path) -> None:
+    ctx = _ctx(tmp_path)
+    store = ctx["store"]
+    for i in range(60):
+        _mem(store, f"ai family note {i}", memory_type="monologue", importance=9.5)
+    genuine = _mem(store, "a plain AI entry", importance=3.0)
+    ids = _ids(dispatch("search_memories", {"query": "AI", "mode": "lexical", "limit": 8}, **ctx))
+    assert ids[0] == genuine.id

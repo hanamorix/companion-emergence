@@ -83,6 +83,15 @@ def _query_words(query: str) -> list[str]:
     return words
 
 
+class _KeywordHits(list):
+    """The tool's keyword hits, best-first, remembering which of them were found
+    ONLY through tier 2 (`tier2_only`, S79): the caller's age sort, emotion boost
+    and co-recall reinforcement must not let those extras displace, reorder
+    ahead of, or link to what tier 1 (today's search) surfaces."""
+
+    tier2_only: frozenset[str] = frozenset()
+
+
 def _keyword_candidates(
     store: MemoryStore,
     hebbian: HebbianMatrix,
@@ -125,7 +134,10 @@ def _keyword_candidates(
             if m.id not in seen:
                 seen.add(m.id)
                 merged.append(m)
-    return genuine_first_memories(merged)
+    hits = _KeywordHits(genuine_first_memories(merged))
+    if len(tiers) == 2:
+        hits.tier2_only = frozenset(m.id for m in tiers[1]) - {m.id for m in tiers[0]}
+    return hits
 
 
 def _lexical_candidates(
@@ -137,9 +149,12 @@ def _lexical_candidates(
     exclude: frozenset[str],
 ) -> list[Memory]:
     """``mode="lexical"``: the keyword search (``_keyword_candidates``), first
-    ``limit`` results. Shares the emotion-boost/formatting tail below with the
-    semantic mode."""
-    return _keyword_candidates(store, hebbian, query, exclude=exclude)[:limit]
+    ``limit`` results (still remembering which came only from tier 2). Shares
+    the emotion-boost/formatting tail below with the semantic mode."""
+    hits = _keyword_candidates(store, hebbian, query, exclude=exclude)
+    first = _KeywordHits(hits[:limit])
+    first.tier2_only = getattr(hits, "tier2_only", frozenset())
+    return first
 
 
 def _merge_keyword_below_semantic(
@@ -309,7 +324,7 @@ def search_memories(
     ``order`` picks how the MATCHED set (whichever ``mode`` produced it) is
     ordered before the final ``limit`` slice (#231, Planning-signed-off
     option A):
-      - ``"relevance"`` (default): today's behavior, byte-identical — the
+      - ``"relevance"`` (default): the matched candidates in the order ``mode`` ranked them — the
         matched candidates are fetched at ``limit`` and used as-is, in
         whatever order ``mode`` already ranked them.
       - ``"age"``: WIDENS the internal fetch to ``CANDIDATE_POOL`` (today 50)
@@ -378,10 +393,11 @@ def search_memories(
     # "age" widens the internal fetch to CANDIDATE_POOL so there is an
     # actually-wide matched set to age-sort before the real `limit` slice;
     # "relevance" fetches exactly `limit`, unchanged from before this
-    # toggle existed — byte-identical default behavior.
+    # toggle existed.
     fetch_limit = CANDIDATE_POOL if resolved_order == "age" else limit
 
     candidates: list[Memory] | None = None
+    tier2_only: frozenset[str] = frozenset()
     if resolved_mode == "semantic":
         semantic = _semantic_top_k(store, persona_dir, query, limit=fetch_limit, exclude=exclude)
         if semantic is None:
@@ -391,29 +407,43 @@ def search_memories(
             # merges in below the semantic results, filling the slots they leave
             # under the fetch limit. The reported mode stays "semantic": at
             # least one semantic result contributed.
-            candidates = _merge_keyword_below_semantic(
-                semantic,
-                _keyword_candidates(store, hebbian, query, exclude=exclude),
-                cap=fetch_limit,
-            )
+            keyword = _keyword_candidates(store, hebbian, query, exclude=exclude)
+            tier2_only = getattr(keyword, "tier2_only", frozenset())
+            candidates = _merge_keyword_below_semantic(semantic, keyword, cap=fetch_limit)
     if candidates is None:
         candidates = _lexical_candidates(store, hebbian, query, limit=fetch_limit, exclude=exclude)
+        tier2_only = getattr(candidates, "tier2_only", frozenset())
 
-    if resolved_order == "age":
-        candidates = sorted(candidates, key=lambda m: m.created_at, reverse=True)
+    def _tail_order(group: list[Memory]) -> list[Memory]:
+        """The caller's own re-ordering requests (`order="age"`, `emotion`) on
+        one group of candidates."""
+        if resolved_order == "age":
+            group = sorted(group, key=lambda m: m.created_at, reverse=True)
+        if emotion is not None:
+            emotion_lower = emotion.lower().strip()
+            # Partition: emotion-matching memories first, then the rest.
+            # Use id-set membership (O(n)) rather than object identity (O(n²)).
+            boosted = [m for m in group if emotion_lower in {k.lower() for k in m.emotions}]
+            boosted_ids = {m.id for m in boosted}
+            group = boosted + [m for m in group if m.id not in boosted_ids]
+        return group
 
-    if emotion is not None:
-        emotion_lower = emotion.lower().strip()
-        # Partition: emotion-matching memories first, then the rest.
-        # Use id-set membership (O(n)) rather than object identity (O(n²)).
-        boosted = [m for m in candidates if emotion_lower in {k.lower() for k in m.emotions}]
-        boosted_ids = {m.id for m in boosted}
-        rest = [m for m in candidates if m.id not in boosted_ids]
-        ordered = boosted + rest
+    if tier2_only and (resolved_order == "age" or emotion is not None):
+        # S79: hits found only through the 1-2 character words are EXTRAS. They
+        # are ordered among themselves and follow every other candidate, so an
+        # age sort or an emotion boost can never let them displace a result
+        # today's search (or the semantic path) already returns.
+        ordered = _tail_order([m for m in candidates if m.id not in tier2_only]) + _tail_order(
+            [m for m in candidates if m.id in tier2_only]
+        )
     else:
-        ordered = candidates
+        ordered = _tail_order(candidates)
 
-    _reinforce_corecall(hebbian, ordered[: _CORECALL_FANOUT + 1])
+    # Co-recall reinforcement is a persistent write: never link the anchor to an
+    # extra found only through a 1-2 character word (S79, S81).
+    _reinforce_corecall(
+        hebbian, [m for m in ordered if m.id not in tier2_only][: _CORECALL_FANOUT + 1]
+    )
     results = [_snippet_result(m) for m in ordered[:limit]]
 
     return {

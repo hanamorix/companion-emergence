@@ -675,3 +675,56 @@ def test_a_tier_two_genuine_hit_precedes_a_tier_one_family_hit_without_persona_d
     store, family, target, message = _family_in_tier_one_store()
     block = _build_recall_block(store, message, persona_dir=None)
     assert block.index(target.id) < block.index(family.id)
+
+
+def _quota_store(*, both_tiers_first: bool = False) -> tuple[MemoryStore, list[Memory], list[Memory], str]:
+    """Tier-1 memories (the ten rare words), tier-2-only memories (common words
+    beyond the old cap, made frequent by fillers) and the message."""
+    store = MemoryStore(":memory:")
+    tier1 = [_mem(store, f"{' '.join(_RARE)} tier one {i}", importance=9.0 + 0.1 * i) for i in range(2)]
+    if both_tiers_first:
+        # this one is ALSO reachable through the common words (found by both tiers)
+        tier1.append(_mem(store, f"{' '.join(_RARE)} {' '.join(_COMMON)} both tiers", importance=9.05))
+    tier2 = [_mem(store, f"{' '.join(_COMMON)} tier two {i}", importance=10.0) for i in range(3)]
+    for i in range(12):
+        _mem(store, f"{_COMMON[i % 2]} filler line {i} about nothing in particular", importance=4.0)
+    return store, tier1, tier2, " ".join(_RARE + _COMMON)
+
+
+def test_semantic_present_quota_is_spent_on_tier_one_hits_first(tmp_path: Path) -> None:
+    store, tier1, tier2, message = _quota_store()
+    sem = [_mem(store, f"harbour gull entry {i} " + _LONG.replace("quokka", "gull")) for i in range(5)]
+    rows = _active_rows(_render(store, message, tmp_path, _semantic(full=sem)))
+    ids = [r[0] for r in rows]
+    full = {rid for rid, body in rows if not _is_snippet(body)}
+    assert {m.id for m in tier1} <= full, "both tier-1 hits are full (importance rule, beyond position 5)"
+    assert ids.index(tier1[0].id) < min(ids.index(m.id) for m in tier2 if m.id in ids)
+    assert len(full - {m.id for m in sem}) == FULL_INJECT_MAX, "the quota of 3: two tier-1, one tier-2"
+
+
+def test_no_persona_dir_quota_is_spent_on_tier_one_hits_first() -> None:
+    store, tier1, tier2, message = _quota_store()
+    block = _build_recall_block(store, message, persona_dir=None)
+    full_lines = [ln for ln in block.splitlines() if ln.startswith("- [") and not ln.rstrip().endswith('…"')]
+    assert all(any(m.id in ln for ln in full_lines) for m in tier1)
+    assert sum(1 for m in tier2 if any(m.id in ln for ln in full_lines)) == FULL_INJECT_MAX - len(tier1)
+
+
+def test_a_hit_found_by_both_tiers_keeps_its_tier_one_quota_priority(tmp_path: Path) -> None:
+    store, tier1, tier2, message = _quota_store(both_tiers_first=True)
+    rows = _active_rows(_render(store, message, tmp_path, None))
+    full = {rid for rid, body in rows if not _is_snippet(body)}
+    assert {m.id for m in tier1} <= full
+    assert not ({m.id for m in tier2} & full)
+
+
+def test_a_family_flood_matching_only_tier_two_tokens_cannot_hide_a_genuine_hit(tmp_path: Path) -> None:
+    store = MemoryStore(":memory:")
+    _mem(store, "decoy " + " ".join(_RARE))
+    for i in range(60):
+        _mem(store, f"{' '.join(_COMMON)} family note {i}", memory_type="monologue", importance=9.5)
+    genuine = _mem(store, f"{_COMMON[0]} plain genuine entry", importance=3.0)
+    message = " ".join(_RARE + _COMMON)
+    ids = [r[0] for r in _active_rows(_render(store, message, tmp_path, None))]
+    assert genuine.id in ids
+    assert _build_recall_block(store, message, persona_dir=None).count(genuine.id) == 1
