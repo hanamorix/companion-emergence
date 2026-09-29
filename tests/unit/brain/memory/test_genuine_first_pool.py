@@ -48,7 +48,9 @@ def _pool_of(specs: list[tuple[str, str, float]]):
     return scored, pool
 
 
-def _spy_rank_and_gate(monkeypatch: pytest.MonkeyPatch, module: str) -> list[list[tuple[str, float]]]:
+def _spy_rank_and_gate(
+    monkeypatch: pytest.MonkeyPatch, module: str
+) -> list[list[tuple[str, float]]]:
     """Record the coarse cut each caller hands `rank_and_gate` (the pool)."""
     seen: list[list[tuple[str, float]]] = []
     real = sr.rank_and_gate
@@ -76,7 +78,9 @@ def test_family_memories_that_outscore_a_genuine_one_do_not_keep_it_out_of_the_p
     ids = [mid for mid, _ in cut]
     assert len(cut) == CANDIDATE_POOL
     assert ids[:2] == ["g0", "g1"], "genuine first, by cosine"
-    assert ids[2:] == [f"f{i}" for i in range(CANDIDATE_POOL - 2)], "family fills the rest by cosine"
+    assert ids[2:] == [f"f{i}" for i in range(CANDIDATE_POOL - 2)], (
+        "family fills the rest by cosine"
+    )
 
 
 def test_fewer_genuine_than_the_pool_fills_the_remainder_with_the_best_family_by_cosine() -> None:
@@ -118,6 +122,27 @@ def test_a_genuine_memory_far_below_every_family_cosine_still_leads_the_pool() -
 
     assert ids[:2] == ["g_near_zero", "g_negative"]
     assert len(ids) == CANDIDATE_POOL
+
+
+def test_the_cut_equals_a_full_stable_sort_on_the_same_key_including_ties() -> None:
+    """The bounded selection returns exactly what a full stable sort would."""
+    import random
+
+    rng = random.Random(77)
+    specs = [
+        (
+            f"m{i}",
+            rng.choice(("event", "monologue", "conversation", "monologue_trace")),
+            rng.choice((0.1, 0.2, 0.3, 0.4, 0.5)),
+        )  # coarse values force many ties
+        for i in range(300)
+    ]
+    scored, pool = _pool_of(specs)
+    for size in (1, 7, CANDIDATE_POOL, 299, 300, 500):
+        expected = sorted(scored, key=lambda p: (sr.is_monologue_family(pool[p[0]][0]), -p[1]))[
+            :size
+        ]
+        assert genuine_first_coarse_cut(scored, pool, size=size) == expected
 
 
 def test_the_family_flag_is_computed_once_per_entry_so_the_scan_stays_one_pass(
@@ -213,10 +238,11 @@ def test_the_tool_pool_holds_the_genuine_memories_despite_a_family_flood(
 def test_with_fifty_genuine_memories_no_family_memory_surfaces_even_above_the_floor(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, path: str
 ) -> None:
-    """S77's literal consequence, pinned as intended: with >= 50 genuine
-    memories in the pool the family takes no place in it, so a family memory
-    that would clear the floor is not a semantic result (it can still surface
-    through the keyword side)."""
+    """Pins the CURRENT behaviour under S77's literal text (REVIEW-PENDING, not
+    ratified as intended; it is in tension with S16's "they can still appear"
+    and is put to the owner): with >= 50 genuine memories in the pool the
+    family takes no place in it, so a family memory that would clear the floor
+    is not a semantic result (it can still surface through the keyword side)."""
     store = MemoryStore(tmp_path / "memories.db")
     genuine_cosines = [0.80 - i * 0.005 for i in range(CANDIDATE_POOL + 2)]
     genuine, family = _seed(store, monkeypatch, genuine_cosines, [0.95, 0.94, 0.93])
@@ -239,3 +265,36 @@ def test_with_fifty_genuine_memories_no_family_memory_surfaces_even_above_the_fl
     assert coarse_ids == _ids(genuine[:CANDIDATE_POOL])
     assert result is not None and result.path == path
     assert set(_ids([*result.full, *result.snippet])).isdisjoint(_ids(family))
+
+
+@pytest.mark.parametrize("path", ["cosine", "reranked"])
+def test_the_tool_with_fifty_genuine_memories_gets_no_family_result_and_reranks_on_the_reranked_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, path: str
+) -> None:
+    """The tool's counterpart of the 50-genuine pin. On the reranked path the
+    reranker must actually have scored the pool (a scored call was made), so
+    the variant cannot pass on the cosine path by accident."""
+    store = MemoryStore(tmp_path / "memories.db")
+    genuine_cosines = [0.80 - i * 0.005 for i in range(CANDIDATE_POOL + 2)]
+    genuine, family = _seed(store, monkeypatch, genuine_cosines, [0.95, 0.94, 0.93])
+    _cosine_floor(store, 0.4)
+    _rerank_floor(store, floor=1.0)
+    rec = None
+    if path == "cosine":
+        _no_reranker(monkeypatch)
+    else:
+        _warm()
+        scripted = {g.content: 5.0 for g in genuine}
+        scripted.update({f.content: 50.0 for f in family})
+        rec = _Recording(scripted)
+        _install_reranker(monkeypatch, rec)
+    seen = _spy_rank_and_gate(monkeypatch, "brain.tools.impls.search_memories")
+
+    got = _tool(tmp_path, store, limit=5)
+
+    (coarse,) = seen
+    assert [mid for mid, _ in coarse] == _ids(genuine[:CANDIDATE_POOL])
+    assert set(got).isdisjoint(_ids(family)) and len(got) == 5
+    if rec is not None:
+        assert rec.scored_calls(), "the reranked variant must have scored the pool"
+        assert not any(f.content in call for call in rec.scored_calls() for f in family)

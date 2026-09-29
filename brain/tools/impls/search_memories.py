@@ -157,7 +157,8 @@ def _semantic_top_k(
     already have a cached vector under the current model_id — never
     triggers a new embed for an uncached memory, the same warm-up contract
     passive recall uses) as a CHEAP COARSE CUT to ``relevance.CANDIDATE_
-    POOL`` (filled genuine-first, spec §4 S77), then scores the coarse cut with ``semantic_recall.rank_and_gate``
+    POOL`` (filled genuine-first, spec §4 S77), then scores the coarse cut with
+    ``semantic_recall.rank_and_gate``
     — the SAME path choice, floor and scale passive recall uses (name-recall
     fix R2, spec §2): a per-message-width cross-encoder rerank gated by the
     calibrated, anchor-normalized rerank floor when >= 5 real candidates fit

@@ -72,6 +72,7 @@ or clustering (Stage 5, unaffected).
 
 from __future__ import annotations
 
+import heapq
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -369,15 +370,17 @@ def genuine_first_coarse_cut(
     any places left. A monologue-family memory therefore can never keep a
     genuine one out of the pool, however many of them out-score it.
 
-    One sort over the scored list (the family flag is computed once per entry
-    as part of the sort key); no second scan of the pool. Ties keep input
-    order, as the plain cosine sort did. `cosine_scored` may arrive unsorted.
+    One pass over the scored list: `heapq.nsmallest` on the key `(is_family,
+    -cosine)` (the family flag is computed once per entry) keeps only the
+    `size` best, O(N log size), with the same stable tie order as a full sort
+    (input order among equal keys). No second scan of the pool.
+    `cosine_scored` may arrive unsorted.
     """
-    ordered = sorted(
+    return heapq.nsmallest(
+        size,
         cosine_scored,
         key=lambda pair: (is_monologue_family(pool[pair[0]][0]), -pair[1]),
     )
-    return ordered[:size]
 
 
 def genuine_first_ranking(
