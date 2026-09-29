@@ -55,7 +55,8 @@ This module owns:
     `reranker.rerank_for_recall`, its width fitted per message to the
     measured rerank cost on this host) and its no-rerank alternative
     (`rank_and_gate`: reranked path or cosine path, one gate per scale)
-  - the floor-gated standout selection (`select_standouts`) — replaces
+  - the floor-gated standout selection (`select_standouts`,
+    `select_gated_standouts` for a reranked paragraph's cosine tail) — replaces
     `classify_semantic_shape`'s cosine standout/clump judgment
   - the surfacing-tier decision (which candidate ids are "full" vs
     "snippet"). Rendering (actual body/snippet text, recall-counter ticks)
@@ -201,7 +202,13 @@ def select_standouts(reranked_desc: list[tuple[str, float]], floor: float) -> Se
     `MAX_STANDOUT_COUNT` cut below never drops a floor-clearing genuine
     memory while keeping a monologue-family one.
     """
-    standouts = [(mid, score) for mid, score in reranked_desc if score >= floor]
+    return _surfacing([(mid, score) for mid, score in reranked_desc if score >= floor])
+
+
+def _surfacing(standouts: list[tuple[str, float]]) -> SemanticSurfacing | None:
+    """The surfacing tiers of an already floor-cleared, already ordered list
+    (`select_standouts`, `select_gated_standouts`): `None` when empty,
+    otherwise the first `MAX_STANDOUT_COUNT` split 5 full / rest snippet."""
     if not standouts:
         return None
     capped_ids = [mid for mid, _ in standouts[:MAX_STANDOUT_COUNT]]
@@ -290,7 +297,17 @@ class SemanticRecallResult:
 
     Name-recall fix R2: on the cosine path (`path == "cosine"`) `scores` are
     the raw cosine similarities of the coarse cut and `pass_mark` is the
-    cosine floor; the two scales are never mixed within one result.
+    cosine floor; the two scales are never mixed within `scores`.
+
+    Name-recall fix S82 (spec §4): a RERANKED result can also carry a cosine
+    tail, the monologue-family candidates that got no rerank slot, gated by
+    the cosine floor and placed after every reranked result in `full` /
+    `snippet`. `path`, `scale`, `pass_mark` and `scores` describe the
+    result's own (primary) ranking only; the tail's raw cosine scores are in
+    `tail_scores` (every examined tail candidate), its scale and cosine
+    floor in `tail_scale` / `tail_pass_mark` (all `None` / empty without a
+    tail). Each hit's own `path` and `score` in `hits` say which scale
+    surfaced it; the two scales' scores are never compared.
     """
 
     full: list[Memory]
@@ -308,6 +325,10 @@ class SemanticRecallResult:
     path: str = "reranked"
     scale: str = CALIBRATION_SCORE_SCALE
     pass_mark: float | None = None
+    # Spec §4, S82: the cosine tail of a reranked result (see the class doc).
+    tail_scores: dict[str, float] = field(default_factory=dict)
+    tail_scale: str | None = None
+    tail_pass_mark: float | None = None
 
 
 RERANKED_PATH = "reranked"
@@ -378,8 +399,10 @@ def genuine_first_coarse_cut(
     family memories are reranked only if width remains, and
     `rerank_for_recall` only ever sees the first `CANDIDATE_POOL` documents,
     so with `size` or more genuine memories a family memory is never in the
-    rerank prefix: on a paragraph that takes the reranked path it is not a
-    result (a result is wholly one path), on a cosine-path paragraph it is.
+    rerank prefix. On a reranked paragraph such a family memory is not
+    reranked but is still a candidate: it forms the paragraph's cosine tail,
+    gated by the cosine floor and ranked after the reranked results
+    (`_cosine_tail`, spec §4, S82).
 
     One pass over the candidates: a single sort by cosine, then a walk that
     stops as soon as the plain top-`size` is behind it and `size` genuine
@@ -420,15 +443,50 @@ class GatedRanking:
     monologue-family memory by descending score. Scores are normalized
     reranker scores for the reranked path (the fitted prefix only), raw
     cosine similarities for the cosine path (the whole coarse cut). The
-    caller applies `pass_mark` (`select_standouts` for passive recall, a
-    plain filter in the tool), both of which keep this order; this object
-    never mixes the two scales.
+    caller applies `pass_mark` (`select_gated_standouts` for passive recall,
+    `gated_cleared` in the tool), both of which keep this order. Every
+    ranking is on ONE scale and gated only by that scale's `pass_mark`.
+
+    `tail` (name-recall fix, spec §4, S82): on a reranked ranking, the
+    monologue-family candidates that got no rerank slot, ranked by cosine and
+    gated by the COSINE floor, as their own cosine-scale `GatedRanking`;
+    their results follow every result of this ranking (the S44
+    "cosine-path monologue-family" group). One paragraph can therefore
+    produce results on both scales; the two rankings' scores are never
+    compared or merged, each result faces only its own scale's floor. `None`
+    on a cosine ranking, when every family candidate was reranked, or when
+    the cosine floor could not be read.
     """
 
     path: str
     scale: str
     ranked: list[tuple[str, float]]
     pass_mark: float
+    tail: GatedRanking | None = None
+
+
+def gated_cleared(gated: GatedRanking) -> list[tuple[str, float, str]]:
+    """`(memory_id, score, path)` for every result that clears its OWN scale's
+    floor, in the spec §4 final order for one paragraph: the ranking's own
+    results (genuine, then family), then its cosine tail's results. Scores of
+    the two segments are never compared."""
+    cleared = [(mid, score, gated.path) for mid, score in gated.ranked if score >= gated.pass_mark]
+    if gated.tail is not None:
+        cleared += [
+            (mid, score, gated.tail.path)
+            for mid, score in gated.tail.ranked
+            if score >= gated.tail.pass_mark
+        ]
+    return cleared
+
+
+def select_gated_standouts(gated: GatedRanking) -> SemanticSurfacing | None:
+    """`select_standouts` for a `GatedRanking` that may carry a cosine tail:
+    the cleared results of `gated_cleared` (each gated only by its own
+    scale's floor), tiered together, capped at `MAX_STANDOUT_COUNT` with the
+    tail last, so the cap drops tail results before any result of the
+    ranking's own scale. `None` when nothing clears."""
+    return _surfacing([(mid, score) for mid, score, _ in gated_cleared(gated)])
 
 
 def _log_calibration_row(
@@ -464,13 +522,20 @@ def _reranked_ranking(
     coarse_ids: list[str],
     *,
     log_calibration: bool,
+    coarse: list[tuple[str, float]] | None = None,
+    embedder_model_id: str | None = None,
 ) -> GatedRanking | None:
     """The reranked path, or `None` when the turn must take the cosine path
     instead: the reranker failed to construct or score, fewer than the S5
     minimum of real candidates fit the budget or exist, the anchor
     normalization fell back (`did_normalize=False`: raw scores are NEVER
     gated, P-6), or the rerank floor could not be read (the bootstrap fit
-    itself failed: the reranker cannot gate this turn)."""
+    itself failed: the reranker cannot gate this turn).
+
+    When `coarse` and `embedder_model_id` are given (`rank_and_gate` always
+    does), the returned ranking also carries the cosine tail (spec §4, S82):
+    the monologue-family candidates that got no rerank slot, gated by the
+    cosine floor (`_cosine_tail`)."""
     try:
         reranker_provider = reranker_mod.build_reranker_provider(store=store)
         # Name-recall fix R1 (spec §1): the width is fitted for THIS message
@@ -544,12 +609,64 @@ def _reranked_ranking(
         floor_row["updated_at"],
     )
     ranked = genuine_first_ranking(list(zip(scored_ids, rerank_scores, strict=True)), pool)
+    tail = None
+    if coarse is not None and embedder_model_id is not None:
+        tail = _cosine_tail(
+            store,
+            query,
+            pool,
+            coarse,
+            set(scored_ids),
+            embedder_model_id=embedder_model_id,
+            log_calibration=log_calibration,
+        )
     return GatedRanking(
         path=RERANKED_PATH,
         scale=CALIBRATION_SCORE_SCALE,
         ranked=ranked,
         pass_mark=floor_row["floor"],
+        tail=tail,
     )
+
+
+def _cosine_tail(
+    store: MemoryStore,
+    query: str,
+    pool: dict[str, tuple[Memory, np.ndarray]],
+    coarse: list[tuple[str, float]],
+    reranked_ids: set[str],
+    *,
+    embedder_model_id: str,
+    log_calibration: bool,
+) -> GatedRanking | None:
+    """The cosine tail of a reranked paragraph (spec §4, S82): the
+    monologue-family candidates of `coarse` that got no rerank slot, ranked by
+    cosine and gated by the COSINE floor, on the cosine scale, exactly as the
+    cosine path treats them (`_cosine_ranking`: one calibration row of the
+    examined candidates, scale 'cosine', passive recall only). Unreranked
+    GENUINE candidates are not part of the tail (S53: candidates beyond the
+    width are dropped). `None` when there is no such candidate (the cosine
+    floor is then not even read) or the cosine floor cannot be had; fail-soft:
+    a failure here never demotes the reranked results."""
+    try:
+        unreranked_family = [
+            (mid, cosine)
+            for mid, cosine in coarse
+            if mid not in reranked_ids and is_monologue_family(pool[mid][0])
+        ]
+        if not unreranked_family:
+            return None
+        return _cosine_ranking(
+            store,
+            query,
+            pool,
+            unreranked_family,
+            embedder_model_id=embedder_model_id,
+            log_calibration=log_calibration,
+        )
+    except Exception:  # noqa: BLE001 — fail-soft: the reranked results stand without the tail
+        log.warning("semantic recall: cosine tail failed — reranked results only", exc_info=True)
+        return None
 
 
 def _cosine_ranking(
@@ -630,10 +747,24 @@ def rank_and_gate(
 
     Shared by passive recall and `search_memories` so the two never diverge
     on path choice, floor or scale. `log_calibration=True` (passive recall
-    only, S56) writes the turn's calibration row on whichever path ran."""
+    only, S56) writes the turn's calibration row on whichever path ran.
+
+    A reranked ranking also carries the cosine tail (spec §4, S82) of its
+    unreranked monologue-family candidates (`GatedRanking.tail`); its
+    calibration row (scale 'cosine') is written too, so one passive turn may
+    log a 'normalized' row and a 'cosine' row, each stamped with its own
+    scale."""
     # R3 (spec §4): genuine candidates are taken first for the rerank prefix.
     coarse_ids = genuine_first([mid for mid, _ in coarse], pool)
-    gated = _reranked_ranking(store, query, pool, coarse_ids, log_calibration=log_calibration)
+    gated = _reranked_ranking(
+        store,
+        query,
+        pool,
+        coarse_ids,
+        log_calibration=log_calibration,
+        coarse=coarse,
+        embedder_model_id=embedder_model_id,
+    )
     if gated is not None:
         return gated
     return _cosine_ranking(
@@ -735,18 +866,20 @@ def run_semantic_recall(
         if gated is None:
             return None
 
-        tiers = select_standouts(gated.ranked, gated.pass_mark)
+        tiers = select_gated_standouts(gated)
         if tiers is None:
             return None
 
         full = [pool[mid][0] for mid in tiers.full_ids]
         snippet = [pool[mid][0] for mid in tiers.snippet_ids]
         scores = dict(gated.ranked)
+        tail = gated.tail
+        tail_scores = dict(tail.ranked) if tail is not None else {}
         hits = [
             SemanticHit(
                 memory=mem,
-                score=scores[mem.id],
-                path=gated.path,
+                score=tail_scores[mem.id] if mem.id in tail_scores else scores[mem.id],
+                path=tail.path if mem.id in tail_scores and tail is not None else gated.path,
                 paragraph=SINGLE_QUERY_PARAGRAPH,
                 monologue_family=is_monologue_family(mem),
             )
@@ -760,6 +893,9 @@ def run_semantic_recall(
             path=gated.path,
             scale=gated.scale,
             pass_mark=gated.pass_mark,
+            tail_scores=tail_scores,
+            tail_scale=tail.scale if tail is not None else None,
+            tail_pass_mark=tail.pass_mark if tail is not None else None,
         )
     except Exception:  # noqa: BLE001 — fail-soft: ANY failure demotes to lexical, never raises
         log.warning(

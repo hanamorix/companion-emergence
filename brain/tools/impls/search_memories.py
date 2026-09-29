@@ -14,6 +14,7 @@ from brain.memory.hebbian import HebbianMatrix
 from brain.memory.relevance import CANDIDATE_POOL, rank_memories, snippet_length
 from brain.memory.semantic_recall import (
     build_semantic_candidate_pool,
+    gated_cleared,
     genuine_first_coarse_cut,
     genuine_first_memories,
     rank_and_gate,
@@ -254,10 +255,12 @@ def _semantic_top_k(
         )
         if gated is None:
             return None
-        cleared = [(mid, score) for mid, score in gated.ranked if score >= gated.pass_mark]
+        # Each result faces only its own scale's floor (spec §4, S82): the
+        # ranking's results, then its cosine tail's.
+        cleared = gated_cleared(gated)
         if not cleared:
             return None
-        return [pool[mid][0] for mid, _ in cleared[:limit]]
+        return [pool[mid][0] for mid, _, _ in cleared[:limit]]
     except Exception:  # noqa: BLE001 — fail-soft: ANY failure demotes to lexical, never raises
         logger.warning(
             "search_memories(semantic): semantic path failed — falling back to lexical",

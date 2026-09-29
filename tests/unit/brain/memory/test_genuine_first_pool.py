@@ -324,8 +324,10 @@ def test_with_fifty_genuine_memories_the_rerank_prefix_holds_no_family_memory(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """The family stays in the pool (behind the 50 genuine ones) but
-    `rerank_for_recall` sees only the first 50 documents, so on the reranked
-    path a family memory is never scored when 50 genuine memories exist."""
+    `rerank_for_recall` sees only the first 50 documents, so a family memory is
+    never RERANKED when 50 genuine memories exist (its cosine tail, S82, is
+    covered in `test_hybrid_family_tail.py`; here the 9-cap is filled by
+    reranked genuine results, so no tail result surfaces)."""
     store = MemoryStore(tmp_path / "memories.db")
     genuine, family = _seed(
         store, monkeypatch, [0.80 - i * 0.005 for i in range(CANDIDATE_POOL)], [0.95, 0.94]
