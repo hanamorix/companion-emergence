@@ -749,7 +749,7 @@ def test_available_ram_headroom_falls_back_to_meminfo_when_no_cgroup(monkeypatch
 
 def test_available_ram_headroom_none_when_everything_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     """Safe-degrade case: no cgroup limit and an unreadable/absent
-    /proc/meminfo (or a non-Linux platform) -> None, which get_rerank_width
+    /proc/meminfo (or a non-Linux platform) -> None, which the width fit
     must treat as 'skip the memory term', never as unlimited headroom."""
     monkeypatch.setattr(reranker_mod, "_cgroup_v2_memory_headroom_bytes", lambda: None)
     monkeypatch.setattr(reranker_mod, "_cgroup_v1_memory_headroom_bytes", lambda: None)

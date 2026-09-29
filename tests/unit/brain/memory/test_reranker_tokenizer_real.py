@@ -68,3 +68,28 @@ def test_surviving_length_agrees_with_the_real_tokenizer_offsets() -> None:
     assert max(doc_ends) < len(long_doc)
     assert lengths[0] == expected_long
     assert lengths[1] == len(query) + len(short_doc), "an untruncated pair counts at its full length"
+
+
+def test_surviving_length_when_the_query_is_cut_too() -> None:
+    """A very long query and a long document are both cut (the tokenizer's
+    longest-first truncation): each segment counts up to its own last
+    surviving token (plan §9c K)."""
+    directory = _cached_tokenizer_dir()
+    if directory is None:
+        pytest.skip("reranker tokenizer files not in the local cache; skipping without a network request")
+    from fastembed.common.preprocessor_utils import load_tokenizer
+
+    tokenizer, _ = load_tokenizer(model_dir=directory)
+    query = " ".join(f"ask{i}" for i in range(1200))[:5600]
+    doc = " ".join(f"note{i}" for i in range(1200))[:6000]
+
+    (encoding,) = tokenizer.encode_batch([(query, doc)])
+    (length,) = surviving_pair_char_lengths(query, [doc], [encoding])
+
+    ends = {0: 0, 1: 0}
+    for (_s, end), seq in zip(encoding.offsets, encoding.sequence_ids, strict=True):
+        if seq in ends:
+            ends[seq] = max(ends[seq], end)
+    assert ends[0] < len(query) and ends[1] < len(doc), "fixture precondition: both segments are cut"
+    assert length == ends[0] + ends[1]
+

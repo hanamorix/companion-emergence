@@ -103,13 +103,15 @@ def _reference_width(
     *,
     ram_per_char: float | None = None,
     headroom: float | None = None,
+    peak: int = 0,
     cap: int = CANDIDATE_POOL,
 ) -> int:
     """Independent recomputation of the width (spec §1 / S67 / S23): the
     LARGEST n whose batch of n real + min(8, n // 2) anchors, padded to its
-    longest pair, is predicted to fit the budget and the RAM headroom. Scans
-    every n (no early stop), so it does not lean on the implementation's
-    monotonicity argument."""
+    longest pair, is predicted to fit the budget, and whose RSS growth past
+    the measured high water `peak` (RAM per char times the padded size above
+    `peak`) fits the headroom. Scans every n (no early stop), so it does not
+    lean on the implementation's monotonicity argument."""
     best = 0
     for n in range(1, min(len(cand), cap) + 1):
         k = min(8, n // 2)
@@ -117,7 +119,7 @@ def _reference_width(
         padded = (n + k) * longest
         if overhead + rate * padded > budget:
             continue
-        if ram_per_char and headroom is not None and ram_per_char * padded > headroom:
+        if ram_per_char and headroom is not None and ram_per_char * max(0, padded - peak) > headroom:
             continue
         best = n
     return best
@@ -267,13 +269,15 @@ def test_c1a_iii_long_candidate_inside_short_prefix_stops_the_width(clock: _Cloc
 
 
 @pytest.mark.parametrize(
-    ("cand", "overhead", "rate", "budget", "ram_per_char", "headroom"),
+    ("cand", "overhead", "rate", "budget", "ram_per_char", "headroom", "peak"),
     [
-        ([120] * 50, 0.05, 1e-4, 4.0, None, None),
-        ([900, 120, 300, 2000, 80, 80, 80, 1500] + [200] * 30, 0.3, 5e-5, 2.0, None, None),
-        ([400] * 50, 0.0, 1e-5, 4.0, 1_000.0, 2_000_000.0),
-        ([60] * 12, 1.5, 1e-3, 4.0, None, None),
-        ([3000] * 50, 0.1, 1e-4, 4.0, None, None),
+        ([120] * 50, 0.05, 1e-4, 4.0, None, None, 0),
+        ([900, 120, 300, 2000, 80, 80, 80, 1500] + [200] * 30, 0.3, 5e-5, 2.0, None, None, 0),
+        ([400] * 50, 0.0, 1e-5, 4.0, 1_000.0, 2_000_000.0, 0),
+        ([400] * 50, 0.0, 1e-5, 4.0, 1_000.0, 2_000_000.0, 6_000),
+        ([400] * 50, 0.0, 1e-5, 4.0, 1_000.0, 1.0, 6_000),
+        ([60] * 12, 1.5, 1e-3, 4.0, None, None, 0),
+        ([3000] * 50, 0.1, 1e-4, 4.0, None, None, 0),
     ],
 )
 def test_c1a_iii_fit_matches_the_independent_reference(
@@ -283,12 +287,13 @@ def test_c1a_iii_fit_matches_the_independent_reference(
     budget: float,
     ram_per_char: float | None,
     headroom: float | None,
+    peak: int,
 ) -> None:
-    est = RerankCostEstimate(overhead, rate, ram_per_char, measured_batches=3)
+    est = RerankCostEstimate(overhead, rate, ram_per_char, measured_batches=3, peak_padded_chars=peak)
     anchors = _anchor_pair_chars()
     got = fit_rerank_width(cand, anchors, est, budget, headroom)
     assert got == _reference_width(
-        cand, anchors, overhead, rate, budget, ram_per_char=ram_per_char, headroom=headroom
+        cand, anchors, overhead, rate, budget, ram_per_char=ram_per_char, headroom=headroom, peak=peak
     )
 
 
@@ -545,21 +550,53 @@ def test_ram_bound_from_rss_delta_per_padded_char(clock: _Clock, monkeypatch: py
     est = rerank_cost_estimate(_MODEL)
     assert est.ram_bytes_per_char == pytest.approx(1_000.0)
 
-    headroom = 1_000.0 * 12 * 400  # fits 12 padded documents: 8 real + 4 anchors
+    assert est.peak_padded_chars == 7 * 400
+
+    # Growth room for 5 more padded documents past the 7 already run:
+    # 12 documents = 8 real + 4 anchors fit, 13 (9 real + 4) do not.
+    headroom = 1_000.0 * (12 * 400 - 7 * 400)
     monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: headroom)
     monkeypatch.setattr(reranker_mod, "_current_rss_bytes", lambda: None)
     out = rerank_for_recall(provider, _QUERY, _docs(50, 400), budget_seconds=4.0)
     assert out.width == _reference_width(
         [400] * 50, _anchor_pair_chars(), 0.0, est.seconds_per_char, 4.0,
-        ram_per_char=1_000.0, headroom=headroom,
+        ram_per_char=1_000.0, headroom=headroom, peak=7 * 400,
     ) == 8
 
 
-def test_negative_rss_delta_clamps_to_zero_in_the_ram_sum() -> None:
-    reranker_mod._record_rerank_cost(_MODEL, 1_000, 0.1, -5_000.0)
-    reranker_mod._record_rerank_cost(_MODEL, 2_000, 0.2, 4_000.0)
+def test_ram_figure_does_not_dilute_with_calls_inside_the_high_water() -> None:
+    """Stage-6 finding F1: the runtime reuses the memory a batch needed, so
+    calls within the high water show ~0 RSS growth. They must not dilute
+    RAM per character towards 0 (which would switch the bound off): only
+    growth past the high water is counted, per character of that growth."""
+    reranker_mod._record_rerank_cost(_MODEL, 2_800, 0.1, 2_800 * 1_000.0)  # first batch: 1,000 B/char
+    for _ in range(100):
+        reranker_mod._record_rerank_cost(_MODEL, 2_800, 0.1, 0.0)  # reuse, no growth
+    reranker_mod._record_rerank_cost(_MODEL, 1_000, 0.05, 5_000_000.0)  # another thread's allocation
     est = rerank_cost_estimate(_MODEL)
-    assert est.ram_bytes_per_char == pytest.approx(4_000.0 / 3_000)
+    assert est.ram_bytes_per_char == pytest.approx(1_000.0), "neither diluted nor contaminated"
+    assert est.peak_padded_chars == 2_800
+
+    reranker_mod._record_rerank_cost(_MODEL, 4_800, 0.2, 2_000 * 500.0)  # past the high water
+    est = rerank_cost_estimate(_MODEL)
+    assert est.ram_bytes_per_char == pytest.approx((2_800_000.0 + 1_000_000.0) / 4_800)
+    assert est.peak_padded_chars == 4_800
+
+
+def test_ram_term_never_blocks_a_batch_within_the_high_water() -> None:
+    """Within the high water no growth is predicted, so even a tiny headroom
+    leaves every batch up to the size already run; only growth past it is
+    checked against the headroom."""
+    est = RerankCostEstimate(0.0, 1e-9, 1_000.0, measured_batches=4, peak_padded_chars=12 * 400)
+    width = fit_rerank_width([400] * 50, _anchor_pair_chars(), est, 4.0, headroom_bytes=1.0)
+    assert width == 8, "12 padded documents (8 real + 4 anchors) are within the high water; 13 are not"
+
+
+def test_negative_rss_delta_clamps_to_zero_in_the_ram_sum() -> None:
+    reranker_mod._record_rerank_cost(_MODEL, 1_000, 0.1, -5_000.0)  # past high water 0: +1,000 chars, 0 B
+    reranker_mod._record_rerank_cost(_MODEL, 2_000, 0.2, 4_000.0)  # past high water 1,000: +1,000 chars
+    est = rerank_cost_estimate(_MODEL)
+    assert est.ram_bytes_per_char == pytest.approx(4_000.0 / 2_000)
 
 
 # ---------------------------------------------------------------------------
@@ -576,7 +613,9 @@ class _NoLock:
         return False
 
 
-def _run_interleaved_updates(monkeypatch: pytest.MonkeyPatch) -> tuple[int, RerankCostEstimate | None]:
+def _run_interleaved_updates(
+    monkeypatch: pytest.MonkeyPatch, second_update_wait: float
+) -> tuple[int, RerankCostEstimate | None]:
     second_started = threading.Event()
     second_done = threading.Event()
     reader_result: list[RerankCostEstimate | None] = []
@@ -602,8 +641,9 @@ def _run_interleaved_updates(monkeypatch: pytest.MonkeyPatch) -> tuple[int, Rera
             t.start()
         second_started.wait(timeout=2.0)
         # Guarded: the second update blocks on the lock, so this times out.
-        # Unguarded: it completes inside the first update's read->write gap.
-        second_done.wait(timeout=0.3)
+        # Unguarded: it completes inside the first update's read->write gap
+        # (the wait returns as soon as it does).
+        second_done.wait(timeout=second_update_wait)
 
     monkeypatch.setattr(reranker_mod, "_cost_update_hook", _hook)
     reranker_mod._record_rerank_cost(_MODEL, 100, 0.1, None)
@@ -615,7 +655,7 @@ def _run_interleaved_updates(monkeypatch: pytest.MonkeyPatch) -> tuple[int, Rera
 def test_conc1_interleaved_update_is_counted_and_reader_sees_whole_updates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    count, seen = _run_interleaved_updates(monkeypatch)
+    count, seen = _run_interleaved_updates(monkeypatch, second_update_wait=0.3)
     sums = reranker_mod._cost_sums[_MODEL]
     assert count == 2, "both updates counted"
     assert sums.sum_x == 400 and sums.sum_y == pytest.approx(0.4)
@@ -629,7 +669,9 @@ def test_conc1_interleaved_update_is_counted_and_reader_sees_whole_updates(
 
 def test_conc1_able_to_fail_without_the_lock(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(reranker_mod, "_cost_lock", _NoLock())
-    count, _ = _run_interleaved_updates(monkeypatch)
+    # A long wait: without the lock the second update finishes inside the
+    # window however slow the host, so this never flakes.
+    count, _ = _run_interleaved_updates(monkeypatch, second_update_wait=30.0)
     assert count == 1, "without the lock the interleaved update is lost (the guard is what CONC-1 tests)"
 
 
@@ -653,3 +695,79 @@ def test_adv9_inflated_first_sample_is_absorbing_until_restart(clock: _Clock) ->
 
     assert reranker_mod._cost_sums[_MODEL] == before
     assert [c for c in provider.calls if len(c) > 1] == []
+
+
+# ---------------------------------------------------------------------------
+# Round-2 additions (stage-6 findings): the provider's timing bracket, the
+# normalization hand-off, the one-time fallback warning.
+# ---------------------------------------------------------------------------
+
+
+def test_cross_encoder_rerank_timed_excludes_time_waiting_for_the_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P-3: the time a recall spends WAITING for another thread's rerank
+    (the provider lock) is not part of its measured cost. The clock advances
+    10 s while the lock is held elsewhere, and the scoring itself takes
+    0.5 s: the measurement must be 0.5 s."""
+    clock = _Clock()
+    monkeypatch.setattr(reranker_mod, "_clock", clock)
+    monkeypatch.setattr(reranker_mod, "_current_rss_bytes", lambda: None)
+
+    class _Model:
+        def rerank(self, query, documents):
+            clock.t += 0.5
+            return [0.0 for _ in documents]
+
+    provider = object.__new__(CrossEncoderProvider)
+    provider._model_id = "fake-encoder"
+    provider._rerank_lock = threading.Lock()
+    provider._model = _Model()
+    result: list[tuple] = []
+
+    provider._rerank_lock.acquire()
+    worker = threading.Thread(target=lambda: result.append(provider.rerank_timed("q", ["a", "b"])))
+    worker.start()
+    worker.join(timeout=0.2)  # the worker is now blocked on the lock
+    clock.t += 10.0  # another thread's rerank holding the lock
+    provider._rerank_lock.release()
+    worker.join(timeout=5.0)
+
+    (scores, seconds, rss_delta) = result[0]
+    assert scores == [0.0, 0.0]
+    assert seconds == pytest.approx(0.5), "lock wait must not be counted as this call's cost"
+    assert rss_delta is None
+
+
+def test_normalization_hand_off_carries_no_scores(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the anchor median could not be taken, the raw scores never reach
+    the caller (nothing can gate them): `normalization` is None."""
+
+    def _raw(provider, query, real_documents):
+        scores, seconds, rss = provider.rerank_timed(query, list(real_documents))
+        return reranker_mod.AnchorNormalizationResult(
+            scores=scores, real_width=len(scores), did_normalize=False, seconds=seconds, rss_delta_bytes=rss
+        )
+
+    monkeypatch.setattr(reranker_mod, "normalize_against_anchors", _raw)
+    provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-6)
+
+    out = rerank_for_recall(provider, _QUERY, _docs(10, 100), budget_seconds=4.0)
+
+    assert out.hand_off == "normalization" and not out.reranked
+    assert out.normalization is None
+
+
+def test_c1c_tokenizer_failure_warns_once_per_provider(caplog: pytest.LogCaptureFixture) -> None:
+    class _Boom:
+        def encode_batch(self, pairs):
+            raise RuntimeError("simulated tokenizer failure")
+
+    provider = _encoder_provider(_Boom())
+    with caplog.at_level(logging.DEBUG, logger=reranker_mod.__name__):
+        provider.pair_char_lengths("q", ["abc"])
+        provider.pair_char_lengths("q", ["abc"])
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, "one warning (with traceback), later failures at debug level"

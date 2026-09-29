@@ -268,9 +268,13 @@ class CrossEncoderProvider(RerankerProvider):
                 encodings = tokenizer.encode_batch([(query, doc) for doc in documents])
             return surviving_pair_char_lengths(query, documents, encodings)
         except Exception:  # noqa: BLE001 — fail-soft: a length probe must never break recall
-            log.warning(
+            # Warn with the traceback once per provider; later failures (the
+            # same broken accessor, every message) log at debug level.
+            first = not getattr(self, "_length_probe_failed", False)
+            self._length_probe_failed = True
+            (log.warning if first else log.debug)(
                 "reranker: surviving pair lengths unavailable — counting full character lengths",
-                exc_info=True,
+                exc_info=first,
             )
             return super().pair_char_lengths(query, documents)
 
@@ -495,9 +499,17 @@ def _reset_reranker_provider_cache() -> None:
 #     running sums (count, sum x, sum y, sum x*y, sum x*x) of this process's
 #     recall reranks, per reranker model id (spec §1). No persistence and no
 #     averaging constant: every measured call weighs the same.
-#   - RAM per padded character = sum of max(0, RSS delta) / sum of x over the
-#     same calls (S32: RSS delta around recall-time reranks). Padded
-#     characters because peak memory follows the padded batch.
+#   - RAM per padded character of GROWTH (S32: RSS delta around recall-time
+#     reranks). The ONNX runtime keeps the memory a batch needed and reuses
+#     it, so a call whose padded size x is within the largest size already
+#     run (the high water) shows no RSS growth, and only a call that goes
+#     past the high water grows RSS, by about (x - high water) * RAM/char.
+#     So RAM/char = sum of max(0, RSS delta) / sum of (x - high water) over
+#     the calls that went past it, and a candidate batch is predicted to need
+#     RAM/char * max(0, x - high water) more memory, checked against the
+#     current headroom. (Averaging deltas over EVERY call would dilute the
+#     figure towards 0 as calls within the high water accumulate, and the
+#     bound would stop binding: stage-6 finding F1.)
 #
 # Only recall reranks feed it (`rerank_timed`, called by
 # `normalize_against_anchors`); the two warm-up reranks a process runs first
@@ -564,20 +576,23 @@ class _CostSums:
     sum_y: float = 0.0
     sum_xy: float = 0.0
     sum_xx: int = 0
-    ram_bytes: float = 0.0  # sum of max(0, RSS delta), over calls whose delta was readable
-    ram_x: int = 0  # sum of x over those same calls
+    # RAM (see the section header): growth past the high water only.
+    peak_x: int = 0  # largest padded size measured so far (the high water)
+    ram_bytes: float = 0.0  # sum of max(0, RSS delta) over calls that went past the high water
+    ram_x: int = 0  # sum of (x - high water before the call) over those same calls
 
     def plus(self, padded_chars: int, seconds: float, rss_delta_bytes: float | None) -> _CostSums:
         ram_bytes, ram_x = self.ram_bytes, self.ram_x
-        if rss_delta_bytes is not None:
+        if rss_delta_bytes is not None and padded_chars > self.peak_x:
             ram_bytes += max(0.0, rss_delta_bytes)
-            ram_x += padded_chars
+            ram_x += padded_chars - self.peak_x
         return _CostSums(
             n=self.n + 1,
             sum_x=self.sum_x + padded_chars,
             sum_y=self.sum_y + seconds,
             sum_xy=self.sum_xy + padded_chars * seconds,
             sum_xx=self.sum_xx + padded_chars * padded_chars,
+            peak_x=max(self.peak_x, padded_chars),
             ram_bytes=ram_bytes,
             ram_x=ram_x,
         )
@@ -586,13 +601,16 @@ class _CostSums:
 @dataclass(frozen=True)
 class RerankCostEstimate:
     """The fitted cost model for one reranker model id (see the section
-    header). `ram_bytes_per_char` is `None` when no measured call had a
-    readable RSS delta (the RAM term of the width fit is then skipped)."""
+    header). `ram_bytes_per_char` is RSS growth per padded character past
+    `peak_padded_chars` (the largest padded batch measured so far); `None`
+    when no call past the high water had a readable RSS delta (the RAM term
+    of the width fit is then skipped)."""
 
     overhead_seconds: float
     seconds_per_char: float
     ram_bytes_per_char: float | None
     measured_batches: int
+    peak_padded_chars: int = 0
 
 
 def _fit_cost(sums: _CostSums) -> tuple[float, float] | None:
@@ -643,6 +661,7 @@ def rerank_cost_estimate(model_id: str) -> RerankCostEstimate | None:
         seconds_per_char=rate,
         ram_bytes_per_char=ram_per_char,
         measured_batches=sums.n,
+        peak_padded_chars=sums.peak_x,
     )
 
 
@@ -946,8 +965,10 @@ def fit_rerank_width(
     the longest prefix n <= min(len(candidates), max_real) such that the
     batch of n real + `anchor_count(n)` anchors fits the budget
     (`prefix_cost`, padded to its longest pair, anchors included in both
-    factors) and, when a RAM figure and a headroom reading exist, its padded
-    size times RAM per character fits the headroom (S32, S65: no chunking).
+    factors) and, when a RAM figure and a headroom reading exist, the RSS
+    growth it is predicted to need (RAM per character times its padded size
+    past the high water, see the section header) fits the headroom (S32,
+    S65: no chunking).
     Both factors of the padded size only grow with n, so the scan stops at
     the first prefix that does not fit.
 
@@ -967,7 +988,8 @@ def fit_rerank_width(
         pairs = n + k
         if prefix_cost(estimate, pairs, longest) > budget_seconds:
             break
-        if ram_bound and ram_per_char * pairs * longest > headroom_bytes:
+        growth = max(0, pairs * longest - estimate.peak_padded_chars)
+        if ram_bound and ram_per_char * growth > headroom_bytes:
             break
         width = n
     return width
@@ -981,9 +1003,9 @@ class RecallRerank:
     caller's list). `reranked` — True iff the rerank ran and its scores are
     anchor-normalized; `normalization` then holds them (`scores[i]` belongs
     to the caller's `i`-th candidate). When `reranked` is False the caller
-    must NOT gate any score: `hand_off` says why the no-rerank path takes
-    over — "pool" (fewer than the S5 minimum of candidates exist),
-    "budget" (fewer than the minimum fit the latency budget or the RAM
+    must NOT gate any score (`normalization` is then `None`): `hand_off`
+    says why the no-rerank path takes over — "pool" (fewer than the S5
+    minimum of candidates exist), "budget" (fewer than the minimum fit the latency budget or the RAM
     bound), or "normalization" (the anchor median could not be taken).
     `measured` — whether this call added a sample to the cost model."""
 
@@ -1044,7 +1066,10 @@ def rerank_for_recall(
         # estimate never changes again until the process restarts (the
         # absorbing state, criterion ADV-9). No recovery rule is built; the
         # owner's rule, if any, goes here. `hand_off="budget"` marks this
-        # case apart from a small pool.
+        # case apart from a small pool. (The RAM term alone lands here only
+        # for batches larger than any measured so far: within the high water
+        # it predicts no growth, so it cannot lock the width below a size
+        # already run.)
         return RecallRerank(
             width=width, reranked=False, hand_off="budget", normalization=None, measured=False
         )
@@ -1059,11 +1084,12 @@ def rerank_for_recall(
         )
         measured = True
     if not normalization.did_normalize:
+        # Raw scores: never handed to a caller that could gate them.
         return RecallRerank(
             width=width,
             reranked=False,
             hand_off="normalization",
-            normalization=normalization,
+            normalization=None,
             measured=measured,
         )
     return RecallRerank(
