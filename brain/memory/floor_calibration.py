@@ -111,7 +111,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -388,9 +387,43 @@ _bootstrap_floor_cache: dict[str, dict[str, Any]] = {}
 _bootstrap_floor_cache_lock = threading.Lock()
 
 
+def peek_bootstrap_floor(reranker_model_id: str) -> dict[str, Any] | None:
+    """The cached RERANK bootstrap floor for `reranker_model_id`, or `None`
+    when it has not been computed in this process. NEVER computes anything
+    (S85 revised): this is what the recall path reads through
+    `MemoryStore.get_reranker_floor`."""
+    cached = _bootstrap_floor_cache.get(reranker_model_id)
+    return dict(cached) if cached is not None else None
+
+
+def rerank_bootstrap_due(reranker_model_id: str, *, activity_marker: object = None) -> bool:
+    """True when the rerank bootstrap for `reranker_model_id` is not cached and
+    either was never attempted or last failed under a different
+    `activity_marker` (the next-lull retry rule)."""
+    if peek_bootstrap_floor(reranker_model_id) is not None:
+        return False
+    return _retry_due("rerank", reranker_model_id, activity_marker)
+
+
+def run_rerank_bootstrap(
+    reranker_model_id: str, *, activity_marker: object = None
+) -> dict[str, Any] | None:
+    """Compute the rerank bootstrap floor (process start, or the next-lull
+    retry by the cadence job; S85 revised): never on the reply path. Success
+    caches it; failure records `activity_marker`. Never raises."""
+    try:
+        result = get_bootstrap_floor(reranker_model_id)
+    except Exception:  # noqa: BLE001 — must never raise into a thread or the pass
+        logger.exception("floor_calibration: rerank bootstrap raised for %s", reranker_model_id)
+        result = None
+    _record_attempt("rerank", reranker_model_id, result is not None, activity_marker)
+    return result
+
+
 def get_bootstrap_floor(reranker_model_id: str) -> dict[str, Any] | None:
-    """Derived DEFAULT floor for `reranker_model_id`, served by
-    `MemoryStore.get_reranker_floor` whenever no persisted
+    """COMPUTE the derived DEFAULT floor for `reranker_model_id` and cache it;
+    `MemoryStore.get_reranker_floor` serves the cache (`peek_bootstrap_floor`)
+    whenever no persisted
     `reranker_floor_calibration` row exists yet (spec Section 7, UPDATED
     2026-09-18 — Roy's bootstrap-floor ruling, F2a inc8): "no floor ->
     lexical" permanently coupled semantic recall's EXISTENCE to the daily
@@ -424,14 +457,13 @@ def get_bootstrap_floor(reranker_model_id: str) -> dict[str, Any] | None:
     model_id (this cache) and NEVER involves the §6 torch-backed relevance
     judge — only jina (ONNX, via `CrossEncoderProvider`) scores the bundled
     pairs, so no torch import and no extra latency beyond this one-time cost
-    ever touch the hot path. In practice this is very often a cache HIT on
-    the underlying reranker PROVIDER too (not just this floor cache): the
-    production call sites (`run_semantic_recall`, `_semantic_top_k`) all
-    resolve/construct their own reranker provider for this exact model_id
-    via `reranker.build_reranker_provider` BEFORE ever calling `get_
-    reranker_floor`, which already populated
-    `reranker._provider_cache[model_id]` — `_bootstrap_reranker_provider`
-    reads that same cache, so the ONNX session is typically already warm.
+    ever touch the reply path. Name-recall fix S85 (revised): this function is
+    NEVER called from a reply (`get_reranker_floor` only peeks the cache).
+    `run_rerank_bootstrap` computes it once per process at process start
+    (`brain.memory.floor_startup`, after `reranker.build_reranker_provider()`
+    has registered and cached the provider for this model id, so the ONNX
+    session is warm), and the central cadence job retries a failed one at the
+    next lull.
 
     NEVER PERSISTED: this is a transient, in-memory-only fallback — the
     caller (`MemoryStore.get_reranker_floor`) always checks the PERSISTED
@@ -492,6 +524,9 @@ def _reset_bootstrap_floor_cache() -> None:
     """
     with _bootstrap_floor_cache_lock:
         _bootstrap_floor_cache.clear()
+    with _cosine_bootstrap_floor_cache_lock:
+        for key in [k for k in _bootstrap_failed_at if k[0] == "rerank"]:
+            del _bootstrap_failed_at[key]
 
 
 # ---------------------------------------------------------------------------
@@ -502,12 +537,13 @@ def _reset_bootstrap_floor_cache() -> None:
 # persisted (the daily tick's `derive_and_persist_cosine_floor` supersedes it
 # for good once it writes a row).
 #
-# Name-recall fix S85 (spec §2): the bootstrap is NEVER computed on the recall
-# hot path. `MemoryStore.get_cosine_floor` only PEEKS the cache
-# (`peek_cosine_bootstrap_floor`); the bridge's central cadence function runs
-# `run_cosine_bootstrap` once per process in the first lull, with bounded
-# exponential back-off on failure. Until a cosine floor exists (bootstrap or
-# calibrated) the no-rerank path renders keyword results only.
+# Name-recall fix S85 (spec §2, revised): the bootstrap is NEVER computed on the
+# reply path. `MemoryStore.get_cosine_floor` only PEEKS the cache
+# (`peek_cosine_bootstrap_floor`); `run_cosine_bootstrap` computes it once per
+# process at process start (bridge startup thread, `nell chat --no-bridge`
+# session start: `brain.memory.floor_startup`), and on failure the central
+# cadence job retries it at the next lull. Until a cosine floor exists
+# (bootstrap or calibrated) the no-rerank path renders keyword results only.
 # ---------------------------------------------------------------------------
 
 _cosine_bootstrap_floor_cache: dict[str, dict[str, Any]] = {}
@@ -527,15 +563,15 @@ def _cosine_bootstrap_pairs(embedder: Any) -> list[tuple[float, str]]:
     return list(zip(scores, _BOOTSTRAP_LABELS, strict=True))
 
 
-# Bounded exponential back-off after a failed bootstrap (S85): the first retry
-# after 60 s, doubling per consecutive failure, capped at one hour. Operational
-# retry cadence, not a scoring value.
-COSINE_BOOTSTRAP_BACKOFF_INITIAL_S = 60.0
-COSINE_BOOTSTRAP_BACKOFF_MAX_S = 3600.0
-
-# embedder id -> (consecutive failures, earliest next attempt on the caller's
-# clock). Guarded by `_cosine_bootstrap_floor_cache_lock`.
-_cosine_bootstrap_backoff: dict[str, tuple[int, float]] = {}
+# Retry rule after a failed bootstrap (S85 revised): NO time constants. A
+# failed attempt records the caller's chat-activity marker (an opaque token that
+# changes whenever the user chats: `cli_throttle.chat_activity_marker()` in the
+# bridge). The bootstrap is due again only once that marker has CHANGED, i.e.
+# chat happened since the failure and the central cadence job then reaches the
+# next lull: at most one retry per lull, never one per turn or per pass.
+_UNSET = object()
+# ("cosine" | "rerank", model id) -> the activity marker at the last failure.
+_bootstrap_failed_at: dict[tuple[str, str], object] = {}
 
 
 def peek_cosine_bootstrap_floor(embedder_model_id: str) -> dict[str, Any] | None:
@@ -547,52 +583,43 @@ def peek_cosine_bootstrap_floor(embedder_model_id: str) -> dict[str, Any] | None
     return dict(cached) if cached is not None else None
 
 
-def cosine_bootstrap_due(embedder_model_id: str, *, now: float | None = None) -> bool:
-    """True when the bootstrap for `embedder_model_id` is not cached and its
-    back-off (if any) has elapsed. `now` is the caller's monotonic clock
-    (injectable; default `time.monotonic()`)."""
+def _retry_due(kind: str, model_id: str, activity_marker: object) -> bool:
+    with _cosine_bootstrap_floor_cache_lock:
+        failed = _bootstrap_failed_at.get((kind, model_id), _UNSET)
+    return failed is _UNSET or failed != activity_marker
+
+
+def _record_attempt(kind: str, model_id: str, ok: bool, activity_marker: object) -> None:
+    with _cosine_bootstrap_floor_cache_lock:
+        if ok:
+            _bootstrap_failed_at.pop((kind, model_id), None)
+        else:
+            _bootstrap_failed_at[(kind, model_id)] = activity_marker
+
+
+def cosine_bootstrap_due(embedder_model_id: str, *, activity_marker: object = None) -> bool:
+    """True when the cosine bootstrap for `embedder_model_id` is not cached and
+    either was never attempted or last failed under a different
+    `activity_marker` (the next-lull retry rule above)."""
     if peek_cosine_bootstrap_floor(embedder_model_id) is not None:
         return False
-    when = time.monotonic() if now is None else now
-    with _cosine_bootstrap_floor_cache_lock:
-        state = _cosine_bootstrap_backoff.get(embedder_model_id)
-    return state is None or when >= state[1]
+    return _retry_due("cosine", embedder_model_id, activity_marker)
 
 
-def run_cosine_bootstrap(embedder_model_id: str, *, now: float | None = None) -> dict[str, Any] | None:
-    """Compute the cosine bootstrap floor once (the cadence job's body, S85).
-
-    Success caches the floor for the process and clears any back-off. Failure
-    (`get_cosine_bootstrap_floor` returned `None`) records the next allowed
-    attempt at `now + min(INITIAL * 2 ** (failures - 1), MAX)`; nothing calls
-    this before then (`cosine_bootstrap_due`), so a failing bootstrap costs
-    one attempt per back-off window, never one per turn. Never raises."""
+def run_cosine_bootstrap(
+    embedder_model_id: str, *, activity_marker: object = None
+) -> dict[str, Any] | None:
+    """Compute the cosine bootstrap floor (process start, or the next-lull
+    retry by the cadence job; S85). Success caches it for the process; failure
+    records `activity_marker` so it is not retried until chat has happened
+    again. Never raises."""
     try:
         result = get_cosine_bootstrap_floor(embedder_model_id)
-    except Exception:  # noqa: BLE001 — a cadence job must never raise into the pass
+    except Exception:  # noqa: BLE001 — must never raise into a thread or the pass
         logger.exception("floor_calibration: cosine bootstrap raised for %s", embedder_model_id)
         result = None
-    # The back-off window starts when the attempt ENDED (a slow failing embed
-    # must not eat its own window); an injected `now` is taken as given.
-    when = time.monotonic() if now is None else now
-    with _cosine_bootstrap_floor_cache_lock:
-        if result is not None:
-            _cosine_bootstrap_backoff.pop(embedder_model_id, None)
-            return result
-        failures = _cosine_bootstrap_backoff.get(embedder_model_id, (0, 0.0))[0] + 1
-        delay = min(
-            COSINE_BOOTSTRAP_BACKOFF_INITIAL_S * 2 ** (failures - 1),
-            COSINE_BOOTSTRAP_BACKOFF_MAX_S,
-        )
-        _cosine_bootstrap_backoff[embedder_model_id] = (failures, when + delay)
-    logger.warning(
-        "floor_calibration: cosine bootstrap failed for %s (attempt %d); the no-rerank path "
-        "stays keyword-only, next attempt in %.0f s",
-        embedder_model_id,
-        failures,
-        delay,
-    )
-    return None
+    _record_attempt("cosine", embedder_model_id, result is not None, activity_marker)
+    return result
 
 
 def get_cosine_bootstrap_floor(embedder_model_id: str) -> dict[str, Any] | None:
@@ -602,9 +629,10 @@ def get_cosine_bootstrap_floor(embedder_model_id: str) -> dict[str, Any] | None:
     pairs"). Same dict shape as `get_bootstrap_floor`, with `embedder_model_id`
     in place of `reranker_model_id`.
 
-    OFF THE HOT PATH ONLY (S85): the only caller is `run_cosine_bootstrap`,
-    the central-cadence job; `MemoryStore.get_cosine_floor` reads the cache
-    through `peek_cosine_bootstrap_floor` and never calls this.
+    OFF THE REPLY PATH ONLY (S85): the only caller is `run_cosine_bootstrap`
+    (process-start thread, or the central-cadence retry job);
+    `MemoryStore.get_cosine_floor` reads the cache through
+    `peek_cosine_bootstrap_floor` and never calls this.
 
     The embedder is the process-cached production provider
     (`embeddings.build_embedding_provider()`, looked up through the module so
@@ -613,8 +641,8 @@ def get_cosine_bootstrap_floor(embedder_model_id: str) -> dict[str, Any] | None:
 
     FAIL-SOFT: any failure (provider build/embed error, id mismatch,
     degenerate pairs) is logged and returns `None` (never cached;
-    `run_cosine_bootstrap` backs off before the next attempt); until a floor
-    exists the no-rerank path renders keyword results only (spec §2). Never an
+    `run_cosine_bootstrap` records the failure and the cadence job retries at
+    the next lull); until a floor exists the no-rerank path renders keyword results only (spec §2). Never an
     ungated cosine ranking.
     """
     cached = _cosine_bootstrap_floor_cache.get(embedder_model_id)
@@ -664,7 +692,8 @@ def _reset_cosine_bootstrap_floor_cache() -> None:
     `tests/conftest.py` next to `_reset_bootstrap_floor_cache`."""
     with _cosine_bootstrap_floor_cache_lock:
         _cosine_bootstrap_floor_cache.clear()
-        _cosine_bootstrap_backoff.clear()
+        for key in [k for k in _bootstrap_failed_at if k[0] == "cosine"]:
+            del _bootstrap_failed_at[key]
 
 
 # ---------------------------------------------------------------------------

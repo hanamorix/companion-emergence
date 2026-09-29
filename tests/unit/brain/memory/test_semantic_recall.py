@@ -656,6 +656,11 @@ def test_run_semantic_recall_uses_the_bootstrap_floor_when_no_row_exists_yet(
     _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
     _pad_to_rerank_minimum(store, 1)
 
+    # S85 (revised): the bootstrap is computed at process start, never by a read.
+    from brain.memory import floor_calibration
+
+    assert store.get_reranker_floor("fake-reranker") is None, "a read never computes it"
+    assert floor_calibration.run_rerank_bootstrap("fake-reranker") is not None
     floor = store.get_reranker_floor("fake-reranker")
     assert floor is not None, "test precondition: no persisted row, but a bootstrap must be served"
     assert floor["updated_at"] is None, "test precondition: this must be the transient bootstrap"

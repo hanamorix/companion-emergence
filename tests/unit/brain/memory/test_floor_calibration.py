@@ -472,8 +472,14 @@ def test_no_prior_row_and_starved_writes_nothing_no_crash(store: MemoryStore) ->
         assert outcome.raw_fit_floor is None
         assert store.get_persisted_reranker_floor(MODEL_ID) is None, "must write NOTHING, not a placeholder row"
 
+        # S85 (revised): the reply path only peeks the cache; the bootstrap is
+        # computed at process start (`run_rerank_bootstrap`), then served.
+        from brain.memory import floor_calibration
+
+        assert store.get_reranker_floor(MODEL_ID) is None, "the reply path never computes it"
+        assert floor_calibration.run_rerank_bootstrap(MODEL_ID) is not None
         bootstrap_served = store.get_reranker_floor(MODEL_ID)
-        assert bootstrap_served is not None, "recall must still get a served floor via the bootstrap hot path"
+        assert bootstrap_served is not None, "recall gets a served floor once the startup bootstrap ran"
         assert bootstrap_served["is_cold_start"] is True
     finally:
         del reranker_mod._bootstrap_reranker_provider
@@ -816,13 +822,17 @@ def test_bootstrap_floor_is_computed_once_and_cached_not_per_call(
     monkeypatch.setattr(floor_calibration, "fit_threshold_fbeta", _counting_fit)
 
     store = MemoryStore(db_path=":memory:")
-    results = [store.get_reranker_floor("bootstrap-cache-once-test-model") for _ in range(5)]
+    model_id = "bootstrap-cache-once-test-model"
+    assert store.get_reranker_floor(model_id) is None, "the reply path never computes it (S85)"
+    for _ in range(5):
+        assert floor_calibration.run_rerank_bootstrap(model_id) is not None
+    results = [store.get_reranker_floor(model_id) for _ in range(5)]
 
     assert all(r is not None for r in results)
     assert all(r["floor"] == pytest.approx(results[0]["floor"]) for r in results), (
         "every call must serve the SAME cached value"
     )
-    assert call_count["n"] == 1, "the fit must run exactly once across 5 repeated no-row calls"
+    assert call_count["n"] == 1, "the fit must run exactly once across 5 repeated bootstrap runs"
 
 
 def test_bootstrap_floor_never_touches_torch_or_the_relevance_judge(
@@ -942,11 +952,10 @@ def test_bootstrap_floor_normalization_never_reenters_get_reranker_floor(
 
     monkeypatch.setattr(MemoryStore, "get_reranker_floor", _counting_get_floor)
 
-    store = MemoryStore(db_path=":memory:")
-    result = store.get_reranker_floor("recursion-guard-test-model")
+    result = floor_calibration.run_rerank_bootstrap("recursion-guard-test-model")
 
     assert result is not None
-    assert call_count["n"] == 1, (
+    assert call_count["n"] == 0, (
         "the bootstrap's anchor-normalization must not re-enter get_reranker_floor — a count > 1 "
         "means the normalization routed through a store-touching provider (e.g. "
         "build_reranker_provider) instead of the guarded _bootstrap_reranker_provider"

@@ -1,10 +1,12 @@
-"""Name-recall fix S85 (spec §2): the cosine-floor bootstrap is computed ONCE
-per process, OFF the hot path, by the central cadence function in the first
-lull, with back-off on failure. Until a cosine floor exists (bootstrap or
-calibrated) the no-rerank path renders keyword results only.
+"""Name-recall fix S85 (spec §2, revised): the cosine-floor bootstrap is never
+computed on the reply path. It is computed once per process at process start
+(`test_floor_startup.py`); a failed one is retried at the next lull by the
+central cadence job `cosine_floor_bootstrap` (due again only after chat has
+happened since the failure; no time constants). Until a cosine floor exists
+(bootstrap or calibrated) the no-rerank path renders keyword results only.
 
-All offline: the R2 scripted embedder, an in-tmp store, an injected clock.
-Synthetic data only.
+All offline: the R2 scripted embedder, an in-tmp store, an injected activity
+marker. Synthetic data only.
 """
 
 from __future__ import annotations
@@ -105,7 +107,7 @@ def test_after_the_job_ran_the_cosine_path_is_active(
     mems = _seed_pool(store, monkeypatch, [0.99, 0.98, 0.97])
     assert run_semantic_recall(store, tmp_path, _QUERY) is None, "before the job: keyword-only"
 
-    assert floor_calibration.run_cosine_bootstrap(_EMBEDDER_ID, now=0.0) is not None
+    assert floor_calibration.run_cosine_bootstrap(_EMBEDDER_ID) is not None
 
     result = run_semantic_recall(store, tmp_path, _QUERY)
     assert result is not None and result.path == "cosine"
@@ -137,50 +139,24 @@ def test_a_calibrated_row_gates_the_cosine_path_without_any_bootstrap(
 # ---------------------------------------------------------------------------
 
 
-def test_a_failing_bootstrap_backs_off_exponentially_with_a_cap(
+def test_there_are_no_back_off_constants() -> None:
+    """S85 (revised): the retry rule has no time constants at all."""
+    assert not [n for n in dir(floor_calibration) if "BACKOFF" in n.upper()]
+
+
+def test_a_failed_bootstrap_is_retried_only_after_chat_activity_changed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = _counting_bootstrap(monkeypatch, fail=True)
-    first = floor_calibration.COSINE_BOOTSTRAP_BACKOFF_INITIAL_S
-    cap = floor_calibration.COSINE_BOOTSTRAP_BACKOFF_MAX_S
-    assert floor_calibration.cosine_bootstrap_due("emb", now=0.0), "never tried: due"
+    assert floor_calibration.cosine_bootstrap_due("emb", activity_marker=1.0), "never tried"
 
-    now = 100.0
-    delays = []
-    for _ in range(9):
-        assert floor_calibration.run_cosine_bootstrap("emb", now=now) is None
-        delay = min(first * 2 ** len(delays), cap)
-        delays.append(delay)
-        assert not floor_calibration.cosine_bootstrap_due("emb", now=now + delay - 0.001)
-        assert floor_calibration.cosine_bootstrap_due("emb", now=now + delay)
-        now += delay
+    assert floor_calibration.run_cosine_bootstrap("emb", activity_marker=1.0) is None
 
-    assert delays[:3] == [first, 2 * first, 4 * first]
-    assert delays[-1] == cap, "bounded"
-    assert len(calls) == 9
-
-
-def test_the_back_off_window_starts_when_the_failed_attempt_ended(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A slow failing embed (100 s here) must not eat its own back-off window:
-    the next attempt is not due until INITIAL seconds after it ENDED."""
-    clock = {"t": 1000.0}
-    monkeypatch.setattr(floor_calibration.time, "monotonic", lambda: clock["t"])
-
-    def _slow_failure(_id):
-        clock["t"] += 100.0
-        return None
-
-    monkeypatch.setattr(floor_calibration, "get_cosine_bootstrap_floor", _slow_failure)
-    first = floor_calibration.COSINE_BOOTSTRAP_BACKOFF_INITIAL_S
-
-    assert floor_calibration.run_cosine_bootstrap("emb") is None
-
-    assert clock["t"] == 1100.0
-    assert not floor_calibration.cosine_bootstrap_due("emb", now=1100.0)
-    assert not floor_calibration.cosine_bootstrap_due("emb", now=1100.0 + first - 0.001)
-    assert floor_calibration.cosine_bootstrap_due("emb", now=1100.0 + first)
+    assert not floor_calibration.cosine_bootstrap_due("emb", activity_marker=1.0), "same lull"
+    assert floor_calibration.cosine_bootstrap_due("emb", activity_marker=2.0), "chat happened"
+    assert floor_calibration.run_cosine_bootstrap("emb", activity_marker=2.0) is None
+    assert not floor_calibration.cosine_bootstrap_due("emb", activity_marker=2.0)
+    assert len(calls) == 2
 
 
 def test_a_persisted_row_outranks_a_cached_bootstrap(
@@ -189,7 +165,7 @@ def test_a_persisted_row_outranks_a_cached_bootstrap(
     """Once the daily tick has written a calibrated row it supersedes the
     process-cached bootstrap, even though the cache is still populated."""
     _counting_bootstrap(monkeypatch)
-    assert floor_calibration.run_cosine_bootstrap("emb", now=0.0) is not None
+    assert floor_calibration.run_cosine_bootstrap("emb") is not None
     assert floor_calibration.peek_cosine_bootstrap_floor("emb")["floor"] == pytest.approx(0.5)
     store = MemoryStore(tmp_path / "memories.db")
     assert store.get_cosine_floor("emb")["floor"] == pytest.approx(0.5), "bootstrap until a row"
@@ -208,7 +184,7 @@ def test_recall_turns_never_retry_a_failed_bootstrap(
     calls = _counting_bootstrap(monkeypatch, fail=True)
     store = MemoryStore(tmp_path / "memories.db")
     _seed_pool(store, monkeypatch, [0.99, 0.98, 0.97])
-    assert floor_calibration.run_cosine_bootstrap(_EMBEDDER_ID, now=0.0) is None
+    assert floor_calibration.run_cosine_bootstrap(_EMBEDDER_ID) is None
     assert len(calls) == 1
 
     for _ in range(5):
@@ -217,17 +193,16 @@ def test_recall_turns_never_retry_a_failed_bootstrap(
     assert len(calls) == 1, "no per-turn retry: only the job computes"
 
 
-def test_a_success_clears_the_back_off_and_is_never_due_again(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_a_success_is_never_due_again(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = _counting_bootstrap(monkeypatch, fail=True)
-    assert floor_calibration.run_cosine_bootstrap("emb", now=0.0) is None
-    assert not floor_calibration.cosine_bootstrap_due("emb", now=1.0)
+    assert floor_calibration.run_cosine_bootstrap("emb", activity_marker=1.0) is None
+    assert not floor_calibration.cosine_bootstrap_due("emb", activity_marker=1.0)
 
     calls_ok = _counting_bootstrap(monkeypatch)
-    assert floor_calibration.run_cosine_bootstrap("emb", now=61.0) is not None
+    assert floor_calibration.run_cosine_bootstrap("emb", activity_marker=2.0) is not None
     assert floor_calibration.peek_cosine_bootstrap_floor("emb") is not None
-    assert not floor_calibration.cosine_bootstrap_due("emb", now=10_000_000.0), "computed once"
+    for marker in (1.0, 2.0, 3.0):
+        assert not floor_calibration.cosine_bootstrap_due("emb", activity_marker=marker)
     assert len(calls) == 1 and len(calls_ok) == 1
 
 
@@ -237,8 +212,8 @@ def test_run_cosine_bootstrap_never_raises(monkeypatch: pytest.MonkeyPatch) -> N
 
     monkeypatch.setattr(floor_calibration, "get_cosine_bootstrap_floor", _boom)
 
-    assert floor_calibration.run_cosine_bootstrap("emb", now=0.0) is None
-    assert not floor_calibration.cosine_bootstrap_due("emb", now=1.0)
+    assert floor_calibration.run_cosine_bootstrap("emb", activity_marker=1.0) is None
+    assert not floor_calibration.cosine_bootstrap_due("emb", activity_marker=1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -246,8 +221,8 @@ def test_run_cosine_bootstrap_never_raises(monkeypatch: pytest.MonkeyPatch) -> N
 # ---------------------------------------------------------------------------
 
 
-def _bootstrap_only(persona_dir: Path):
-    return [j for j in _real_jobs(persona_dir) if j.name == _JOB]
+def _bootstrap_only(persona_dir: Path, name: str = _JOB):
+    return [j for j in _real_jobs(persona_dir) if j.name == name]
 
 
 def _pass(persona_dir, jobs, *, idle):
@@ -260,12 +235,22 @@ def _pass(persona_dir, jobs, *, idle):
     )
 
 
-def test_the_job_runs_once_at_the_first_lull_and_never_inside_a_chat(
+def _chat_activity(monkeypatch: pytest.MonkeyPatch) -> dict:
+    """Drive `cli_throttle.chat_activity_marker` from the test."""
+    marker = {"m": 1.0}
+    from brain.bridge import cli_throttle
+
+    monkeypatch.setattr(cli_throttle, "chat_activity_marker", lambda: marker["m"])
+    return marker
+
+
+def test_the_job_is_the_retry_path_it_runs_at_a_lull_and_never_inside_a_chat(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     from brain.bridge import supervisor
 
     monkeypatch.setattr(supervisor.cli_throttle, "background_slot", _granting_slot)
+    _chat_activity(monkeypatch)
     calls = _counting_bootstrap(monkeypatch)
     persona_dir = _persona(tmp_path)
     jobs = _bootstrap_only(persona_dir)
@@ -275,11 +260,11 @@ def test_the_job_runs_once_at_the_first_lull_and_never_inside_a_chat(
     assert calls == [], "not inside a chat"
 
     _pass(persona_dir, jobs, idle=True)
-    assert calls == [model_tier.model_for_tier(model_tier.TIER_EMBEDDING)], "the first lull"
+    assert calls == [model_tier.model_for_tier(model_tier.TIER_EMBEDDING)], "the lull"
 
     for _ in range(3):
         _pass(persona_dir, jobs, idle=True)
-    assert len(calls) == 1, "computed once per process"
+    assert len(calls) == 1, "computed; a floor exists, nothing left to retry"
 
 
 def test_the_job_is_not_due_while_a_calibrated_floor_exists(
@@ -288,6 +273,7 @@ def test_the_job_is_not_due_while_a_calibrated_floor_exists(
     from brain.bridge import supervisor
 
     monkeypatch.setattr(supervisor.cli_throttle, "background_slot", _granting_slot)
+    _chat_activity(monkeypatch)
     calls = _counting_bootstrap(monkeypatch)
     persona_dir = _persona(tmp_path)
     embedder_id = model_tier.model_for_tier(model_tier.TIER_EMBEDDING)
@@ -302,25 +288,50 @@ def test_the_job_is_not_due_while_a_calibrated_floor_exists(
     assert calls == []
 
 
-def test_a_failed_job_run_backs_off_and_is_not_retried_on_the_next_passes(
+def test_a_failed_bootstrap_is_retried_once_per_lull_not_every_pass(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     from brain.bridge import supervisor
 
     monkeypatch.setattr(supervisor.cli_throttle, "background_slot", _granting_slot)
+    marker = _chat_activity(monkeypatch)
     calls = _counting_bootstrap(monkeypatch, fail=True)
-    clock = {"t": 1000.0}
-    monkeypatch.setattr(floor_calibration.time, "monotonic", lambda: clock["t"])
     persona_dir = _persona(tmp_path)
     jobs = _bootstrap_only(persona_dir)
 
     _pass(persona_dir, jobs, idle=True)
     assert len(calls) == 1
     for _ in range(5):
-        clock["t"] += 10.0  # well inside the first back-off window
         _pass(persona_dir, jobs, idle=True)
-    assert len(calls) == 1, "no retry inside the back-off window"
+    assert len(calls) == 1, "still the same lull: no retry however many passes"
 
-    clock["t"] += floor_calibration.COSINE_BOOTSTRAP_BACKOFF_INITIAL_S
+    marker["m"] = 2.0  # the user chatted; the next lull is a new one
+    _pass(persona_dir, jobs, idle=False)
+    assert len(calls) == 1, "not during the chat"
     _pass(persona_dir, jobs, idle=True)
-    assert len(calls) == 2, "one retry once the window has elapsed"
+    assert len(calls) == 2, "one retry at the next lull"
+    for _ in range(3):
+        _pass(persona_dir, jobs, idle=True)
+    assert len(calls) == 2
+
+
+def test_the_job_yields_while_the_startup_computation_is_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from brain.bridge import supervisor
+    from brain.memory import floor_startup
+
+    monkeypatch.setattr(supervisor.cli_throttle, "background_slot", _granting_slot)
+    _chat_activity(monkeypatch)
+    calls = _counting_bootstrap(monkeypatch)
+    persona_dir = _persona(tmp_path)
+    jobs = _bootstrap_only(persona_dir)
+
+    floor_startup._startup_active.set()  # noqa: SLF001
+    try:
+        _pass(persona_dir, jobs, idle=True)
+        assert calls == [], "the startup thread is already doing this work"
+    finally:
+        floor_startup._startup_active.clear()  # noqa: SLF001
+    _pass(persona_dir, jobs, idle=True)
+    assert len(calls) == 1

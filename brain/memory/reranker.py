@@ -358,6 +358,27 @@ _provider_cache: dict[str, RerankerProvider] = {}
 _provider_cache_lock = threading.Lock()
 
 
+def resolve_reranker_model_id() -> str:
+    """The runtime reranker model id (the id `build_reranker_provider()`'s
+    provider reports from `model_id()`): `model_tier.MODEL_RERANKER_FP16` (the
+    pinned default) or `TIER_RERANKER`'s fp32 id when the `reranker.precision`
+    tunable says "fp32". Pure and cheap: builds and loads nothing, so the
+    floor-bootstrap due checks can use it every pass."""
+    from brain.bridge.model_tier import MODEL_RERANKER_FP16, TIER_RERANKER, model_for_tier
+
+    precision = tunables.get_tunable("reranker.precision", RERANKER_PRECISION)
+    if precision == RERANKER_PRECISION_FP32:
+        return model_for_tier(TIER_RERANKER)
+    if precision != RERANKER_PRECISION_FP16:
+        log.warning(
+            "reranker: unrecognized reranker.precision override %r — falling back to "
+            "the pinned default %r",
+            precision,
+            RERANKER_PRECISION,
+        )
+    return MODEL_RERANKER_FP16
+
+
 def build_reranker_provider(*, store: MemoryStore | None = None) -> RerankerProvider:
     """The production reranker provider: a `CrossEncoderProvider` pinned to
     `RERANKER_PRECISION`'s resolved id — `model_tier.MODEL_RERANKER_FP16`
@@ -394,19 +415,9 @@ def build_reranker_provider(*, store: MemoryStore | None = None) -> RerankerProv
 
     fp32_model_id = model_for_tier(TIER_RERANKER)
     cache_dir = get_cache_dir()
-    precision = tunables.get_tunable("reranker.precision", RERANKER_PRECISION)
-    if precision == RERANKER_PRECISION_FP32:
-        model_id = fp32_model_id
-    else:
-        if precision != RERANKER_PRECISION_FP16:
-            log.warning(
-                "reranker: unrecognized reranker.precision override %r — falling back to "
-                "the pinned default %r",
-                precision,
-                RERANKER_PRECISION,
-            )
+    model_id = resolve_reranker_model_id()
+    if model_id == MODEL_RERANKER_FP16:
         _register_fp16_reranker_model(MODEL_RERANKER_FP16, fp32_model_id)
-        model_id = MODEL_RERANKER_FP16
 
     provider = _provider_cache.get(model_id)
     if provider is not None:

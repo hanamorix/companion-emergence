@@ -166,7 +166,7 @@ def test_get_cosine_floor_serves_the_never_persisted_bootstrap_once_the_job_comp
     table, _ = _sep_table(relevant=[0.9, 0.85, 0.8], irrelevant=[0.2, 0.1, 0.2])
     monkeypatch.setattr("brain.memory.embeddings.build_embedding_provider", lambda: _SeparableEmbedder(table))
     monkeypatch.setattr(floor_calibration, "get_cosine_bootstrap_floor", _REAL_COSINE_BOOTSTRAP)
-    assert floor_calibration.run_cosine_bootstrap(_SEP_ID, now=0.0) is not None
+    assert floor_calibration.run_cosine_bootstrap(_SEP_ID) is not None
     floor = store.get_cosine_floor(_SEP_ID)
     assert floor is not None and floor["is_cold_start"] is True and floor["updated_at"] is None
     assert store.get_persisted_cosine_floor(_SEP_ID) is None

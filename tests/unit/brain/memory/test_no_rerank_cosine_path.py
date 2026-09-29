@@ -258,7 +258,7 @@ def test_uncalibrated_cosine_floor_is_the_fbeta_fit_over_the_bundled_pairs(
     below = expected - 0.02
     mems = _seed_pool(store, monkeypatch, [*high, clearing_low, below])
     # S85: the bootstrap is computed off the hot path (the cadence job), not by the recall.
-    assert floor_calibration.run_cosine_bootstrap(_EMBEDDER_ID, now=0.0) is not None
+    assert floor_calibration.run_cosine_bootstrap(_EMBEDDER_ID) is not None
 
     result = run_semantic_recall(store, tmp_path, _QUERY)
 
@@ -279,7 +279,7 @@ def test_cosine_bootstrap_failure_yields_no_semantic_result(
     monkeypatch.setattr(floor_calibration, "get_cosine_bootstrap_floor", _REAL_COSINE_BOOTSTRAP)
     store = MemoryStore(tmp_path / "memories.db")
     _seed_pool(store, monkeypatch, [0.99, 0.98, 0.97], batch_raises=True)
-    assert floor_calibration.run_cosine_bootstrap(_EMBEDDER_ID, now=0.0) is None
+    assert floor_calibration.run_cosine_bootstrap(_EMBEDDER_ID) is None
 
     assert run_semantic_recall(store, tmp_path, _QUERY) is None
 

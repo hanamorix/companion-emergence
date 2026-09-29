@@ -116,18 +116,19 @@ log = logging.getLogger(__name__)
 #
 # No hardcoded fallback value lives here — but as of F2a inc8's bootstrap
 # ruling (#250 §7 UPDATED, Roy 2026-09-18) this is no longer a placeholder
-# comment: `MemoryStore.get_reranker_floor` itself ALWAYS returns a servable
-# floor when no persisted row exists yet, serving a derived, process-wide
-# cached BOOTSTRAP floor instead of `None` (see
-# `floor_calibration.get_bootstrap_floor`). This decouples semantic recall's
+# comment: `MemoryStore.get_reranker_floor` returns a servable floor when no
+# persisted row exists yet, serving a derived, process-wide cached BOOTSTRAP
+# floor instead of `None` (see `floor_calibration.get_bootstrap_floor`; name-
+# recall fix S85 revised: that bootstrap is computed at process start off the
+# reply path and retried at the next lull, never here). This decouples semantic recall's
 # EXISTENCE from the daily calibration tick ever having fired for the
 # runtime model_id — the earlier design ("no row -> None -> fall back to
 # lexical, exactly like an empty/sparse candidate pool") permanently
 # coupled recall to the tick (disabled calibration, or a recall running
 # before the tick's first idle moment, silently and PERMANENTLY demoted to
 # lexical-only even with embeddings present) — see the spec's §7 UPDATED
-# note for the full rationale. A floor-read failure (the bootstrap
-# computation's OWN fail-soft path — a reranker load/fit error) means the
+# note for the full rationale. No floor yet (the startup computation has not
+# finished, or it failed and awaits the next-lull retry) means the
 # reranker cannot gate this turn, so (name-recall fix R2, spec §2) the turn
 # takes the cosine path instead (`rank_and_gate`); it is no longer the
 # ROUTINE fresh-install/no-tick-yet case either.
@@ -592,8 +593,8 @@ def _reranked_ranking(
         )
     try:
         # F2a inc8 (#250 §7 UPDATED): the floor is read LIVE per call, keyed
-        # by the RUNTIME reranker model_id; no persisted row serves a derived
-        # bootstrap. `None` fires only on the bootstrap's own fail-soft path.
+        # by the RUNTIME reranker model_id; no persisted row serves the cached
+        # bootstrap (S85 revised: never computed here). `None` = no floor yet.
         floor_row = store.get_reranker_floor(reranker_model_id)
     except Exception:  # noqa: BLE001
         log.warning(
@@ -601,9 +602,9 @@ def _reranked_ranking(
         )
         return None
     if floor_row is None:
-        log.info(
-            "semantic recall: no rerank floor available (bootstrap failed) for %s — "
-            "taking the cosine path",
+        log.debug(
+            "semantic recall: no rerank floor yet for %s (no calibrated row, and the "
+            "process-start bootstrap has not produced one) — taking the cosine path",
             reranker_model_id,
         )
         return None

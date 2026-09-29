@@ -66,9 +66,7 @@ from brain.bridge.model_tier import (
     TIER_BACKGROUND_CLASSIFIER,
     TIER_BACKGROUND_GENERATIVE,
     TIER_BACKGROUND_HOUSEKEEPING,
-    TIER_EMBEDDING,
     build_tier_provider,
-    model_for_tier,
 )
 from brain.bridge.provider import LLMProvider
 from brain.chat import pass2_queue
@@ -109,7 +107,7 @@ from brain.ingest.pipeline import (
 )
 from brain.initiate.review import _rest_state_from_energy, run_initiate_review_tick
 from brain.initiate.user_pattern import compute_user_presence
-from brain.memory import floor_calibration
+from brain.memory import floor_startup
 from brain.memory.embedding_backfill import (
     delete_legacy_embeddings_db as _delete_legacy_embeddings_db,
 )
@@ -752,9 +750,11 @@ def _build_gated_jobs(
     test/dev disable knob) is left out. Pass 2, session snapshot/prune,
     emotion backfill and embedding backfill have no interval: each runs at
     every idle pass while it has work (S53/S66). Deploy recalibration is due
-    while the stored floor is stale (S70/S73). The cosine floor bootstrap
-    (name-recall fix S85) is due while neither a calibrated cosine row nor the
-    process-cached bootstrap exists and its failure back-off has elapsed.
+    while the stored floor is stale (S70/S73). The cosine and rerank floor
+    bootstraps (name-recall fix S85, revised) are computed at process start and
+    are the next-lull RETRY path here: due while neither a calibrated row nor
+    the process-cached bootstrap exists and chat has happened since the failed
+    attempt.
     Self-model articulation keeps its own cadence (S29). Every other job is an
     interval job whose cadence file the central function owns.
 
@@ -950,34 +950,40 @@ def _build_gated_jobs(
         )
     )
 
-    # 4b. cosine floor bootstrap — name-recall fix S85 (spec §2): computed ONCE
-    # per process in the first lull, never on the recall hot path; a failure
-    # backs off (bounded exponential, `floor_calibration.run_cosine_bootstrap`)
-    # so a failing bootstrap costs one attempt per window, never one per turn.
-    # Due only while neither a calibrated cosine row nor the cached bootstrap
-    # exists. Until it exists the no-rerank path renders keyword results only.
-    def _cosine_bootstrap_embedder_id() -> str:
-        return model_for_tier(TIER_EMBEDDING)
-
-    def _cosine_bootstrap_has_work() -> bool:
-        embedder_id = _cosine_bootstrap_embedder_id()
-        if not floor_calibration.cosine_bootstrap_due(embedder_id):
+    # 4b. floor bootstraps — name-recall fix S85 (revised, spec §2). Both the
+    # cosine and the rerank bootstrap floors are computed at process start off
+    # the reply path (`floor_startup.compute_missing_floors`: the bridge's
+    # startup thread). These two jobs are the RETRY path: a failed bootstrap is
+    # retried at the next lull (due only once chat has happened since the failed
+    # attempt, `cli_throttle.chat_activity_marker`; no time constants), and
+    # neither is due once a floor exists (calibrated row or cached bootstrap) or
+    # while the startup computation is still running. Until a floor exists that
+    # path renders keyword results only.
+    def _floor_bootstrap_due(due_fn: Callable[..., bool]) -> bool:
+        if floor_startup.startup_compute_active():
             return False
         with _tick_store() as store:
-            return store.get_persisted_cosine_floor(embedder_id) is None
+            return due_fn(store, activity_marker=cli_throttle.chat_activity_marker())
 
-    def _cosine_bootstrap_job() -> JobOutcome:
+    def _floor_bootstrap_job(run_fn: Callable[..., object]) -> JobOutcome:
         with cli_throttle.background_slot() as slot:
             if not slot:
                 return JobOutcome.SKIPPED
-            floor_calibration.run_cosine_bootstrap(_cosine_bootstrap_embedder_id())
+            run_fn(activity_marker=cli_throttle.chat_activity_marker())
         return JobOutcome.COMPLETED
 
     jobs.append(
         GatedJob(
             "cosine_floor_bootstrap",
-            run=_cosine_bootstrap_job,
-            has_work=_cosine_bootstrap_has_work,
+            run=lambda: _floor_bootstrap_job(floor_startup.run_cosine_floor),
+            has_work=lambda: _floor_bootstrap_due(floor_startup.cosine_floor_due),
+        )
+    )
+    jobs.append(
+        GatedJob(
+            "rerank_floor_bootstrap",
+            run=lambda: _floor_bootstrap_job(floor_startup.run_rerank_floor),
+            has_work=lambda: _floor_bootstrap_due(floor_startup.rerank_floor_due),
         )
     )
 

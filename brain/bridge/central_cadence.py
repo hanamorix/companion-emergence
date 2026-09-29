@@ -71,6 +71,7 @@ GATED_JOB_ORDER: tuple[str, ...] = (
     "emotion_backfill",
     "embedding_backfill",
     "cosine_floor_bootstrap",
+    "rerank_floor_bootstrap",
     "maintenance",
     "interest_sweep",
     "self_model_articulation",

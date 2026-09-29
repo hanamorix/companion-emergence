@@ -1575,40 +1575,37 @@ class MemoryStore:
         exists, it is returned and this method does no further work.
 
         If no row exists yet (fresh install / early days / a brand-new
-        reranker model_id that has never been calibrated — including, as of
-        the pre-flip revision's Change 1, a deploy still inside the
-        data-starvation backstop's ramp, since that backstop's no-prior-row
-        edge case intentionally writes nothing), F2a inc8 (#250 §7 UPDATED,
+        reranker model_id that has never been calibrated, or a deploy still
+        inside the data-starvation backstop's ramp), F2a inc8 (#250 §7 UPDATED,
         Roy 2026-09-18's bootstrap-floor ruling) serves a derived,
-        process-wide-cached BOOTSTRAP floor instead of `None` —
-        `floor_calibration.get_bootstrap_floor`, computed once (jina-only,
-        torch-free) from the bundled `_FP16_GATE_PAIRS` and cached, never
-        persisted to this table. This decouples semantic recall's EXISTENCE
-        from the daily tick ever having fired: the old "no row -> None ->
-        every caller falls back to lexical" contract permanently coupled
-        recall to the tick (disable calibration, or recall running before
-        the tick's first idle moment, silently and permanently demoted to
-        lexical-only even with embeddings present).
+        process-wide-cached BOOTSTRAP floor instead of `None`
+        (`floor_calibration.get_bootstrap_floor`, jina-only, torch-free, from
+        the bundled `_FP16_GATE_PAIRS`), never persisted to this table.
+
+        Name-recall fix S85 (revised): this method NEVER computes that
+        bootstrap. It returns the persisted row, else the cached bootstrap
+        (`floor_calibration.peek_bootstrap_floor`), else `None`. The bootstrap
+        is computed once per process at process start off the reply path
+        (`brain.memory.floor_startup`: bridge startup thread, `nell chat
+        --no-bridge` session start) and a failed one is retried at the next
+        lull by the central cadence job; `None` (not computed yet, or it
+        failed) means the reranker cannot gate the turn and recall takes the
+        no-rerank path (name-recall fix R2, spec §2), which is keyword-only
+        while the cosine floor is also missing.
 
         A persisted row, once the tick writes one, is read FIRST on every
-        subsequent call and supersedes the bootstrap for good — the
-        bootstrap cache is never consulted again for that model_id, so a
-        stale bootstrap value can never shadow a real corpus-derived floor.
-
-        Only returns `None` now on the bootstrap's OWN fail-soft path (the
-        bootstrap computation itself raised — a reranker load/fit failure)
-        — the pre-ruling contract, preserved as the last resort so a broken
-        bootstrap never crashes a turn: the reranker cannot gate it, so
-        recall takes the cosine path (name-recall fix R2, spec §2).
+        subsequent call and supersedes the bootstrap for good.
 
         Read-only: does not write or bump anything.
         """
         persisted = self.get_persisted_reranker_floor(reranker_model_id)
         if persisted is not None:
             return persisted
-        from brain.memory.floor_calibration import get_bootstrap_floor
+        from brain.memory.floor_calibration import peek_bootstrap_floor
 
-        return get_bootstrap_floor(reranker_model_id)
+        # S85 (revised): the reply path only PEEKS the process cache; the
+        # bootstrap is computed at process start / retried at the next lull.
+        return peek_bootstrap_floor(reranker_model_id)
 
     def reranker_floor_is_stale(self, reranker_model_id: str) -> bool:
         """True iff `reranker_model_id`'s PERSISTED `reranker_floor_

@@ -1944,6 +1944,28 @@ def _drain_pass2_at_exit(persona_dir: Path) -> None:
     )
 
 
+def _start_floor_bootstrap_for_direct_chat(persona_dir: Path, *, blocking: bool) -> None:
+    """`nell chat --no-bridge` session start (name-recall fix S85, revised):
+    compute the cosine and rerank bootstrap floors ONCE for this process, off
+    the per-turn path (recall only peeks the caches; there is no supervisor
+    here to run the retry job).
+
+    The interactive REPL starts it on a daemon thread so the prompt appears at
+    once (its first turn may be keyword-only if the thread is still running);
+    the one-shot form (`blocking`) computes before its single turn, because
+    that turn is the only one there will be. Fail-soft: never blocks or breaks
+    the chat."""
+    try:
+        from brain.memory import floor_startup
+
+        if blocking:
+            floor_startup.compute_missing_floors(persona_dir)
+        else:
+            floor_startup.start_background(persona_dir, name="floor-bootstrap-direct-chat")
+    except Exception as exc:  # noqa: BLE001 — never break the chat
+        print(f"note: floor bootstrap not started ({exc})", file=sys.stderr)
+
+
 def _chat_direct_mode(args: argparse.Namespace) -> int:
     """Dispatch `nell chat` to the chat engine (in-process, no bridge).
 
@@ -1973,6 +1995,8 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
         )
 
     provider_name, _ = _resolve_routing(persona_dir, args)
+
+    _start_floor_bootstrap_for_direct_chat(persona_dir, blocking=bool(getattr(args, "message", None)))
 
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
