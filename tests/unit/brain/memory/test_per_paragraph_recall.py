@@ -398,8 +398,9 @@ def test_one_paragraph_pays_its_embed_scan_and_pair_size_time_out_of_the_budget(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """S61: no exemption for P = 1. Budget 4 s, `T_m` 0.25 s (the pool read),
-    `T_p` 0.5 s embed + 0.125 s pair-size probe; the 10 s warm-up is one-time
-    and not counted. Share = 4 - 0.25 - 0.625."""
+    embed 0.5 s (the embed cost series' prediction for this one text, S108),
+    scan 0.125 s (the pair-size probe); the 10 s warm-up is one-time and not
+    counted. Share = 4 - 0.25 - 0.5 - 0.125."""
     _budget(monkeypatch, 4.0)
     store, rec, clock = _budget_case(monkeypatch, tmp_path, embed_seconds=0.5)
     calls = _spy_rank_and_gate(monkeypatch)
@@ -412,7 +413,9 @@ def test_one_paragraph_pays_its_embed_scan_and_pair_size_time_out_of_the_budget(
     assert result.rerank_budget == pytest.approx(3.125)
     assert result.budget == pytest.approx(4.0)
     assert sr._message_overhead.average() == pytest.approx(0.25)
-    assert sr._paragraph_time.average() == pytest.approx(0.625)
+    assert sr._scan_time.average() == pytest.approx(0.125)
+    text = "kite over the harbour"
+    assert sr._embed_cost.fit(_EMBEDDER_ID).predict(len(text)) == pytest.approx(0.5)
 
 
 def test_the_rerank_budget_uses_the_running_averages_not_this_messages_elapsed_time(
@@ -480,7 +483,8 @@ def test_paragraphs_that_do_not_fit_are_searched_as_one_whole_message_query(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _budget(monkeypatch, 4.0)
-    sr._paragraph_time.record(3.0)  # 3 x 3 s > 4 s
+    sr._embed_cost.record(_EMBEDDER_ID, 100, 0.0)  # warm, embedding costs nothing
+    sr._scan_time.record(3.0)  # 3 x 3 s > 4 s
     embedder = _AxisEmbedder({_P1: 0, _P2: 1, _P3: 2})
     store = MemoryStore(tmp_path / "memories.db")
     _install(monkeypatch, embedder)
@@ -512,14 +516,14 @@ def _two_query_store(monkeypatch, tmp_path, clock, seconds_per_text):
 def test_a_first_message_that_does_not_fit_is_scored_as_its_first_paragraph_and_the_rest(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """S63: no `T_p` yet; the first paragraph is embedded and timed alone
-    (1.5 s); 3 x 1.5 s does not fit 4 s, so the rest is ONE query and the two
-    are re-scored as two paragraphs: own candidates (a memory found by both
+    """S63/S115: no measurement yet; the first paragraph is embedded and timed
+    alone (1.4 s); 3 x 1.4 s does not fit 4 s, so the rest is ONE query and the
+    two are re-scored as two paragraphs: own candidates (a memory found by both
     goes to its better cosine), own rerank with own anchors, equal shares."""
     clock = _Clock()
     monkeypatch.setattr(sr, "_clock", clock)
     _budget(monkeypatch, 4.0)
-    store, embedder, rec, first, rest = _two_query_store(monkeypatch, tmp_path, clock, 1.5)
+    store, embedder, rec, first, rest = _two_query_store(monkeypatch, tmp_path, clock, 1.4)
     calls = _spy_rank_and_gate(monkeypatch)
 
     result = run_semantic_recall(store, tmp_path, _THREE)
@@ -533,7 +537,12 @@ def test_a_first_message_that_does_not_fit_is_scored_as_its_first_paragraph_and_
     assert [mid for mid, _ in by_query[_P1]["coarse"]] == _ids(first)
     assert [mid for mid, _ in by_query[_REST]["coarse"]] == _ids(rest)
     assert by_query[_P1]["budget_seconds"] == pytest.approx(by_query[_REST]["budget_seconds"])
-    assert by_query[_P1]["budget_seconds"] == pytest.approx((4.0 - 2 * 1.5) / 2)
+    # The embed term is the series' prediction for the two queries as one batch
+    # (S108): samples (len P1, 1.4) and (len REST, 1.4) fit no positive rate, so
+    # the ratio of sums, 2.8 / (len P1 + len REST) per token, x = 2 x len REST.
+    predicted = 2.8 / (len(_P1) + len(_REST)) * 2 * len(_REST)
+    assert predicted < 4.0
+    assert by_query[_P1]["budget_seconds"] == pytest.approx((4.0 - predicted) / 2)
     scored = rec.scored()
     assert [q for q, _ in scored] == [_P1, _REST], "one rerank per query, each against its own text"
     for _, docs in scored:
@@ -1291,8 +1300,8 @@ def test_the_tool_keeps_a_guaranteed_slot_ahead_of_keyword_hits_under_any_order(
 def test_the_paragraph_time_includes_the_scan_and_the_cut(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """F2: `T_p` = embed 0.5 + matrix product 0.0625 + coarse cut 0.03125 +
-    pair-size probe 0.125 (spec §3 "embed + scan time"; P-28)."""
+    """F2: the scan time = matrix product 0.0625 + coarse cut 0.03125 +
+    pair-size probe 0.125 (P-28); the embed (0.5) is the embed series' (S108)."""
     _budget(monkeypatch, 4.0)
     store, rec, clock = _budget_case(monkeypatch, tmp_path, embed_seconds=0.5)
     real_rows, real_walk = sr._unit_rows, sr._walk_coarse_cut
@@ -1311,8 +1320,8 @@ def test_the_paragraph_time_includes_the_scan_and_the_cut(
     result = run_semantic_recall(store, tmp_path, "kite over the harbour")
 
     assert result is not None
-    assert sr._paragraph_time.average() == pytest.approx(0.5 + 0.0625 + 0.03125 + 0.125)
-    assert result.rerank_budget == pytest.approx(4.0 - 0.25 - 0.71875)
+    assert sr._scan_time.average() == pytest.approx(0.0625 + 0.03125 + 0.125)
+    assert result.rerank_budget == pytest.approx(4.0 - 0.25 - 0.5 - 0.21875)
 
 
 def test_a_rerank_that_ran_without_a_gate_still_counts_toward_the_fifty(
@@ -1470,12 +1479,13 @@ def test_a_memory_equally_close_to_two_paragraphs_goes_to_the_earlier_one(
 def test_the_fit_decision_counts_the_message_overhead(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """3 x `T_p` 1.0 fits 3.5 s alone, but with `T_m` 0.75 it does not:
-    the whole message is one query."""
+    """3 x scan 1.0 (embedding free) fits 3.5 s alone, but with `T_m` 0.75 it
+    does not: the whole message is one query."""
     clock = _Clock()
     monkeypatch.setattr(sr, "_clock", clock)
     _budget(monkeypatch, 3.5)
-    sr._paragraph_time.record(1.0)
+    sr._embed_cost.record(_EMBEDDER_ID, 100, 0.0)
+    sr._scan_time.record(1.0)
     sr._message_overhead.record(0.75)
     embedder = _AxisEmbedder({_P1: 0, _P2: 1, _P3: 2})
     store = MemoryStore(tmp_path / "memories.db")

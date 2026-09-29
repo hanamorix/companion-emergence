@@ -194,6 +194,14 @@ class RerankerProvider(ABC):
         seconds = _clock() - start
         return scores, seconds, _rss_delta(before, _current_rss_bytes())
 
+    def pair_token_lengths_timed(
+        self, query: str, documents: Sequence[str]
+    ) -> tuple[list[int] | None, float | None]:
+        """`pair_token_lengths` plus its seconds measured inside the provider's
+        lock (round-3 N3-1). This default measures nothing (`None`): the caller
+        times the call itself (test doubles hold no lock)."""
+        return self.pair_token_lengths(query, documents), None
+
     def pair_token_lengths(self, query: str, documents: Sequence[str]) -> list[int] | None:
         """Per document, the length in reranker TOKENS of the (query, document)
         pair as the model sees it, after truncation (S62, S75): the cost model's
@@ -263,7 +271,16 @@ class CrossEncoderProvider(RerankerProvider):
         return scores, seconds, _rss_delta(before, after)
 
     def pair_token_lengths(self, query: str, documents: Sequence[str]) -> list[int] | None:
-        """Surviving pair lengths in tokens (S62, S75, plan P-32): each (query,
+        return self.pair_token_lengths_timed(query, documents)[0]
+
+    def pair_token_lengths_timed(
+        self, query: str, documents: Sequence[str]
+    ) -> tuple[list[int] | None, float | None]:
+        """`pair_token_lengths` with its seconds read inside `_rerank_lock`, so a
+        wait behind another thread's rerank (e.g. the re-measure job's) is
+        never timed as work (round-3 N3-1).
+
+        Surviving pair lengths in tokens (S62, S75, plan P-32): each (query,
         document) pair is encoded with the loaded model's OWN tokenizer (the
         same `encode_batch` call fastembed makes before scoring, truncation at
         the model maximum already enabled on it) and counted with
@@ -275,8 +292,10 @@ class CrossEncoderProvider(RerankerProvider):
         try:
             with self._rerank_lock:
                 tokenizer = self._pair_tokenizer()
+                start = _clock()
                 encodings = tokenizer.encode_batch([(query, doc) for doc in documents])
-            return surviving_pair_token_lengths(encodings)
+                seconds = _clock() - start
+            return surviving_pair_token_lengths(encodings), seconds
         except Exception:  # noqa: BLE001 — fail-soft: a length probe must never break recall
             # Warn with the traceback once per provider; later failures (the
             # same broken accessor, every message) log at debug level.
@@ -286,7 +305,7 @@ class CrossEncoderProvider(RerankerProvider):
                 "reranker: surviving pair token lengths unavailable — sizing the rerank without them",
                 exc_info=first,
             )
-            return None
+            return None, None
 
     def _pair_tokenizer(self) -> Any:
         """The loaded fastembed cross-encoder's tokenizer (a PRIVATE fastembed
@@ -1236,9 +1255,12 @@ class PairSizes:
 
     `lengths` is `provider.pair_token_lengths(query, [*candidates, *ANCHOR_POOL])`
     over the query's first `CANDIDATE_POOL` candidates, or `None` when the
-    tokenizer probe failed (the "sizes" hand-off)."""
+    tokenizer probe failed (the "sizes" hand-off). `seconds` is the probe's
+    time measured inside the provider's lock (round-3 N3-1), or `None` when
+    the provider measures none (the caller then times the call)."""
 
     lengths: list[int] | None
+    seconds: float | None = None
 
 
 def warm_up_for_recall(
@@ -1260,8 +1282,8 @@ def recall_pair_sizes(
     whatever the provider raises."""
     pool = list(candidate_documents[:CANDIDATE_POOL])
     _warm_up_once(provider, query, pool)
-    lengths = provider.pair_token_lengths(query, [*pool, *ANCHOR_POOL])
-    return PairSizes(lengths=None if lengths is None else list(lengths))
+    lengths, seconds = provider.pair_token_lengths_timed(query, [*pool, *ANCHOR_POOL])
+    return PairSizes(lengths=None if lengths is None else list(lengths), seconds=seconds)
 
 
 def rerank_for_recall(

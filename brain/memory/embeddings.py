@@ -29,8 +29,9 @@ import logging
 import os
 import shutil
 import threading
+import time
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,11 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 _DEFAULT_DIM = 256
+
+
+# Clock seam for the in-lock timings (`embed_batch_timed`, `token_lengths_timed`;
+# name-recall fix S108, round-3 N3-1). Production: `time.monotonic`.
+_clock: Callable[[], float] = time.monotonic
 
 
 class EmbeddingProvider(ABC):
@@ -61,6 +67,31 @@ class EmbeddingProvider(ABC):
         if isinstance(texts, str):
             raise TypeError("embed_batch expects a sequence of strings, not a single str")
         return [self.embed(text) for text in texts]
+
+    def embed_batch_timed(self, texts: Sequence[str]) -> tuple[list[np.ndarray], float | None]:
+        """`embed_batch` plus the seconds the model spent on it, measured inside
+        the provider's own lock, so time spent WAITING for another thread's
+        embed is never counted as this call's cost (name-recall fix S108, the
+        paragraph embed cost series). This default measures nothing (`None`):
+        the caller times the call itself (test doubles hold no lock)."""
+        return self.embed_batch(texts), None
+
+    def token_lengths(self, texts: Sequence[str]) -> list[int] | None:
+        """Each text's size in the model's tokens (S108), or `None` when it
+        cannot be read. This default counts characters, a stand-in unit for
+        test doubles that have no tokenizer (self-consistent per model id);
+        the production provider counts real tokens."""
+        return [len(text) for text in texts]
+
+    def token_lengths_timed(self, texts: Sequence[str]) -> tuple[list[int] | None, float | None]:
+        """`token_lengths` plus its in-lock seconds (`None`: the caller times
+        it); see `embed_batch_timed`."""
+        return self.token_lengths(texts), None
+
+    def ensure_loaded(self) -> None:
+        """Load the model now if it loads lazily (S109: the one-time load is
+        kept out of every timed sample). This default does nothing."""
+        return None
 
     @abstractmethod
     def embedding_dim(self) -> int:
@@ -344,20 +375,75 @@ class FastEmbedProvider(EmbeddingProvider):
         of the same string by float noise only (verified against the real
         model in `test_embedding_real_model.py`).
         """
+        return self.embed_batch_timed(texts)[0]
+
+    def embed_batch_timed(self, texts: Sequence[str]) -> tuple[list[np.ndarray], float | None]:
+        """`embed_batch` with its model seconds read INSIDE `_embed_lock`
+        (after any wait for another thread's embed, and after the lazy
+        generator fastembed returns has been consumed), so a lock wait is
+        never timed as work (name-recall fix S108, round-3 N3-1)."""
         if isinstance(texts, str):
             raise TypeError("embed_batch expects a sequence of strings, not a single str")
         batch = list(texts)
         if not batch:
-            return []
+            return [], 0.0
         with self._embed_lock:
+            start = _clock()
             vectors = [np.asarray(v, dtype=np.float32) for v in self._model.embed(batch)]
+            seconds = _clock() - start
             if len(vectors) != len(batch):
                 raise RuntimeError(
                     f"FastEmbedProvider.embed_batch: model returned {len(vectors)} "
                     f"vectors for {len(batch)} texts"
                 )
             self._note_real_dim(vectors[0])
-        return vectors
+        return vectors, seconds
+
+    def _inner_model(self) -> Any:
+        """fastembed's inner ONNX text model (`TextEmbedding.model`, whose
+        `model` is the ONNX session once loaded and `tokenize` the exact call
+        `onnx_embed` makes). Coupled to fastembed internals behind this one
+        accessor, like `CrossEncoderProvider._pair_tokenizer`."""
+        return self._model.model
+
+    def _load_locked(self) -> None:
+        """Build the ONNX session and tokenizer if not built. Caller holds
+        `_embed_lock` (fastembed's own lazy first load is unguarded)."""
+        inner = self._inner_model()
+        if getattr(inner, "model", None) is None:
+            inner.load_onnx_model()
+
+    def ensure_loaded(self) -> None:
+        """Build the ONNX session now (S109), once: a no-op when built."""
+        if getattr(self._inner_model(), "model", None) is not None:
+            return
+        with self._embed_lock:
+            self._load_locked()
+
+    def token_lengths(self, texts: Sequence[str]) -> list[int] | None:
+        return self.token_lengths_timed(texts)[0]
+
+    def token_lengths_timed(self, texts: Sequence[str]) -> tuple[list[int] | None, float | None]:
+        """Each text's tokens as the model runs it (S108): `sum(attention_mask)`
+        of fastembed's own `tokenize` (truncation at the input limit and batch
+        padding exactly as `onnx_embed` applies them; padding is not counted,
+        special tokens are), with the seconds read inside `_embed_lock`.
+        Fail-soft: any failure is `(None, None)`, warned once per provider."""
+        try:
+            with self._embed_lock:
+                self._load_locked()
+                start = _clock()
+                encodings = self._inner_model().tokenize(list(texts))
+                seconds = _clock() - start
+            return [int(sum(encoding.attention_mask)) for encoding in encodings], seconds
+        except Exception:  # noqa: BLE001 — fail-soft: a length probe must never break recall
+            first = not getattr(self, "_length_probe_failed", False)
+            self._length_probe_failed = True
+            (logger.warning if first else logger.debug)(
+                "embeddings: token lengths unavailable — the paragraph embed cost is not sized",
+                exc_info=first,
+            )
+            return None, None
 
     def _note_real_dim(self, arr: np.ndarray) -> None:
         """Establish the REAL dim from the first vector this instance ever

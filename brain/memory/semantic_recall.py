@@ -94,8 +94,8 @@ import numpy as np
 
 from brain import dev_constants, tunables
 from brain.dev_constants import MONOLOGUE_FAMILY_TYPES, RERANK_MIN_REAL_CANDIDATES
+from brain.memory import cost_period, floor_startup
 from brain.memory import embeddings as embeddings_mod
-from brain.memory import floor_startup
 from brain.memory import reranker as reranker_mod
 from brain.memory.embedding_matrix import EmbeddingMatrix, build_embedding_matrix
 from brain.memory.relevance import CANDIDATE_POOL
@@ -972,16 +972,54 @@ class _RunningTime:
 # `T_m`: per-message setup before the first query is embedded (paragraph
 # split, the stacked matrix, the lean pool read; plan P-26).
 _message_overhead = _RunningTime()
-# `T_p`: per query, its share of the batch embed + its cosine scan and coarse
-# cut + its pair-size probe (plan P-7, P-28). Shared by passive recall and
-# the tool.
-_paragraph_time = _RunningTime()
+# `T_s`: per query, its share of the matrix product + its coarse cut + its
+# reranker pair-size probe (plan P-7, P-28; S108: the per-paragraph scan time
+# stays a running average). Shared by passive recall and the tool.
+_scan_time = _RunningTime()
+# The paragraph embed cost (S108, S118): per embedder model id, one sample per
+# embed batch, x = texts x the longest text's tokens, y = its in-lock seconds;
+# least squares per 24-hour compaction period (`cost_period`).
+_embed_cost = cost_period.PeriodCostSeries("paragraph embed")
+# Embedder model ids whose first embed of this process has run (S117).
+_embed_warmed: set[str] = set()
+_embed_warm_lock = threading.Lock()
+
+
+def _warm_up_embedder_once(embedder: embeddings_mod.EmbeddingProvider, model_id: str, text: str) -> None:
+    """S117: the process's first embed for `model_id`, discarded (untimed,
+    in no sample), as the reranker's warm-up discards its first inferences.
+    Marked done only after it succeeds; two threads racing here may both warm
+    up, which costs time but never skews a sample."""
+    with _embed_warm_lock:
+        if model_id in _embed_warmed:
+            return
+    embedder.embed(text)
+    with _embed_warm_lock:
+        _embed_warmed.add(model_id)
+
+
+def _timed_probe(
+    embedder: embeddings_mod.EmbeddingProvider, texts: list[str]) -> tuple[list[int] | None, float]:
+    """`embedder.token_lengths_timed(texts)` and its seconds: the in-lock
+    figure when the provider reports one, else the call's own time. A probe
+    that raises is `None` lengths (fail-soft)."""
+    began = _clock()
+    try:
+        lengths, in_lock = embedder.token_lengths_timed(texts)
+    except Exception:  # noqa: BLE001 — fail-soft: sizing only
+        log.warning("semantic recall: token-count probe failed", exc_info=True)
+        return None, _clock() - began
+    return lengths, (in_lock if in_lock is not None else _clock() - began)
 
 
 def _reset_paragraph_time_model() -> None:
-    """Test-only: forget both running averages."""
+    """Test-only: forget the running averages, the embed cost series and the
+    embed warm-up state."""
     _message_overhead.reset()
-    _paragraph_time.reset()
+    _scan_time.reset()
+    _embed_cost.clear()
+    with _embed_warm_lock:
+        _embed_warmed.clear()
 
 
 def split_paragraphs(text: str, keyword_words: Collection[str] | None) -> list[str]:
@@ -1178,21 +1216,45 @@ def search_paragraphs(
         # Looked up via the MODULE so a test's monkeypatch on
         # `embeddings.build_embedding_provider` is honored.
         embedder = embeddings_mod.build_embedding_provider()
+        embedder_model_id = embedder.model_id()
+        # One-time costs kept out of every sample (like the provider's
+        # construction and the matrix's first build): the model load (S109)
+        # and the process's first embed for this model id, discarded (S117).
+        embedder.ensure_loaded()
+        _warm_up_embedder_once(embedder, embedder_model_id, paragraphs[0])
     except Exception:  # noqa: BLE001 — fail-soft
         log.exception("semantic recall: embedding provider unavailable — falling back to lexical")
         return None
-    _message_overhead.record(before_provider - start - one_time)
+
+    # Token counts (S108) for the paragraphs and, when there are several, the
+    # whole message (the fallback query); its time is part of this message's
+    # setup `T_m`, measured inside the provider's lock (round-3 N3-1).
+    probe_texts = list(paragraphs) if len(paragraphs) == 1 else [*paragraphs, text]
+    probed, probe_seconds = _timed_probe(embedder, probe_texts)
+    tokens_of: dict[str, int] | None = (
+        None if probed is None or len(probed) != len(probe_texts) else dict(zip(probe_texts, probed, strict=True))
+    )
+    _message_overhead.record(before_provider - start - one_time + probe_seconds)
     overhead = _message_overhead.average() or 0.0
 
     def is_family(mid: str) -> bool:
         return types[mid] in MONOLOGUE_FAMILY_TYPES
 
+    embed_seconds: list[float] = []
+
     def embed_and_cut(texts: list[str]) -> list[tuple[list[tuple[str, float]], float]]:
         """Embed `texts` in one batch and cut each; per text its coarse cut
-        and its `T_p` part so far (its share of the embed + its scan)."""
+        and its scan part (its share of the matrix product + its cut). The
+        batch's embed seconds (in-lock) go to `embed_seconds` and, with the
+        texts' token counts known, to the embed cost series as one sample,
+        x = texts x the longest text's tokens (S108). No probe time is in it."""
         began = _clock()
-        vectors = embedder.embed_batch(texts)
-        embed_share = (_clock() - began) / len(texts)
+        vectors, in_lock = embedder.embed_batch_timed(texts)
+        seconds = in_lock if in_lock is not None else _clock() - began
+        embed_seconds.append(seconds)
+        sizes = None if tokens_of is None else [tokens_of.get(t) for t in texts]
+        if sizes is not None and None not in sizes and max(sizes) > 0:
+            _embed_cost.record(embedder_model_id, len(texts) * max(sizes), seconds)
         began = _clock()
         scores = (unit @ _unit_rows(vectors).T)[row_index]
         product_share = (_clock() - began) / len(texts)
@@ -1204,31 +1266,54 @@ def search_paragraphs(
             cut = _walk_coarse_cut(
                 ((pool_ids[j], float(query_scores[j])) for j in order), is_family, CANDIDATE_POOL
             )
-            out.append((cut, embed_share + product_share + (_clock() - began)))
+            out.append((cut, product_share + (_clock() - began)))
         return out
+
+    def predicted_embed(queries: list[str]) -> float | None:
+        """The embed cost series' prediction for embedding `queries` as one
+        batch (S108): `o + r x (queries x longest query's tokens)`."""
+        fit = _embed_cost.fit(embedder_model_id)
+        sizes = None if tokens_of is None else [tokens_of.get(q) for q in queries]
+        if fit is None or sizes is None or None in sizes:
+            return None
+        return fit.predict(len(queries) * max(sizes))
 
     try:
         count = len(paragraphs)
-        paragraph_time = _paragraph_time.average()
+        scan_time = _scan_time.average()
+        whole = predicted_embed(paragraphs) if count > 1 else None
         if count == 1:
             queries = list(paragraphs)
             searched = embed_and_cut(queries)
-        elif paragraph_time is not None:
-            if overhead + count * paragraph_time <= budget:
+        elif tokens_of is None:
+            # Token counts unknown (round-3 N3-3: checked before the
+            # first-message rule): no prediction can be made, one query.
+            queries, whole_message = [text], True
+            searched = embed_and_cut(queries)
+        elif whole is not None and scan_time is not None:
+            if overhead + whole + count * scan_time <= budget:
                 queries = list(paragraphs)
             else:
                 queries, whole_message = [text], True
             searched = embed_and_cut(queries)
         else:
-            # S46/S63: no measurement yet in this process. Time the first
-            # paragraph alone, then decide.
+            # S46/S63/S115: no measurement yet in this process. Time the first
+            # paragraph alone (embed + scan), then decide on count x that time.
             first = embed_and_cut(paragraphs[:1])
-            if overhead + count * first[0][1] <= budget:
+            if overhead + count * (embed_seconds[0] + first[0][1]) <= budget:
                 queries = list(paragraphs)
                 searched = first + embed_and_cut(paragraphs[1:])
             else:
-                queries = [paragraphs[0], "\n".join(paragraphs[1:])]
-                searched = first + embed_and_cut(queries[1:])
+                rest = "\n".join(paragraphs[1:])
+                queries = [paragraphs[0], rest]
+                # The rest query's token count, probed now; its time is that
+                # query's scan-side work (first message only).
+                rest_tokens, rest_probe = _timed_probe(embedder, [rest])
+                if rest_tokens is not None and len(rest_tokens) == 1:
+                    tokens_of[rest] = rest_tokens[0]
+                searched = first + [
+                    (cut, part + rest_probe) for cut, part in embed_and_cut(queries[1:])
+                ]
     except Exception:  # noqa: BLE001 — fail-soft
         log.exception("semantic recall: query embed failed — falling back to lexical")
         return None
@@ -1245,7 +1330,9 @@ def search_paragraphs(
     pool = {mid: (memories[mid], unit[vector_of[mid]]) for mid in best if mid in memories}
     assigned = [[(mid, c) for mid, c in cut if mid in pool] for cut in assigned]
 
-    # Pair sizes per rerankable query, timed into its T_p sample (P-28).
+    # Pair sizes per rerankable query, their in-lock time added to its scan
+    # sample (P-28; round-3 N3-1: a wait behind another thread's rerank, e.g.
+    # the re-measure job's, is not timed as work).
     samples = [part for _, part in searched]
     sizes: dict[int, reranker_mod.PairSizes] = {}
     rerankable = [qi for qi, cut in enumerate(assigned) if len(cut) >= RERANK_MIN_REAL_CANDIDATES]
@@ -1273,19 +1360,25 @@ def search_paragraphs(
                 )
             except Exception:  # noqa: BLE001 — this query's rank_and_gate retries and fails soft
                 log.warning("semantic recall: pair-size probe failed", exc_info=True)
-            samples[qi] += _clock() - began
+                continue
+            in_lock = sizes[qi].seconds
+            samples[qi] += in_lock if in_lock is not None else _clock() - began
     for sample in samples:
-        _paragraph_time.record(sample)
+        _scan_time.record(sample)
 
-    # The rerank budget (S46, S61; plan P-28): the budget minus T_m and every
-    # query's T_p, both the running averages of this process (this message's
-    # own samples included), never below zero; shared equally (S33).
-    spent = overhead + len(queries) * (_paragraph_time.average() or 0.0)
+    # The rerank budget (S46, S61, S108; plan P-28): the budget minus `T_m`,
+    # the embed cost series' prediction for the queries embedded, and every
+    # query's scan time (running average), this message's samples included,
+    # never below zero; shared equally (S33). With token counts unknown the
+    # prediction is replaced by this message's measured embed seconds.
+    embed_term = predicted_embed(queries)
+    if embed_term is None:
+        embed_term = sum(embed_seconds)
+    spent = overhead + embed_term + len(queries) * (_scan_time.average() or 0.0)
     rerank_budget = max(0.0, budget - spent)
     share = rerank_budget / len(queries)
 
     best_cosines = [max((c for _, c in cut), default=None) for cut in assigned]
-    embedder_model_id = embedder.model_id()
     gated_by_query: dict[int, GatedRanking | None] = {}
     width_by_query: dict[int, int] = {}
     used = 0
