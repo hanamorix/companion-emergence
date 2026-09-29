@@ -32,6 +32,7 @@ from unittest.mock import mock_open
 
 import pytest
 
+from brain import dev_constants
 from brain.bridge import persisted_cadence as pc
 from brain.bridge.model_tier import MODEL_RELEVANCE_JUDGE
 from brain.memory import judge_selftune
@@ -1051,14 +1052,16 @@ def test_haiku_oracle_note_is_present_in_judge_selftune_source() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Tunables (I3/I7): every threshold this module uses is registered, not a
-# bare constant — spot-check the registry has them under the right keys.
+# Tunables (I3/I7): every HARDWARE-DERIVED threshold this module uses is
+# registered, not a bare constant — spot-check the registry has them under
+# the right keys. The self-tune gate is the deliberate exception (S26: a
+# dev-level constant, not a user tunable — RAM-spike-fix INC-1) and is
+# checked separately below, for absence.
 # ---------------------------------------------------------------------------
 
 
 def test_every_judge_selftune_threshold_is_a_registered_tunable() -> None:
     for key in (
-        "judge_selftune.gate_handful_decisions",
         "judge_selftune.ram_tier_lora_min_bytes",
         "judge_selftune.ram_tier_full_ft_min_bytes",
         "judge_selftune.footprint_knob_refit_bytes",
@@ -1066,6 +1069,18 @@ def test_every_judge_selftune_threshold_is_a_registered_tunable() -> None:
         "judge_selftune.footprint_full_ft_bytes",
     ):
         assert key in judge_selftune.tunables._registry, f"{key} must be tunables.register()-ed"
+
+
+def test_gate_handful_decisions_is_a_dev_constant_not_a_tunable() -> None:
+    """S26 (owner ruling): the self-tune gate is dev-level, not user-facing
+    — it must NOT be tunables.register()-ed, and its value must come from
+    brain.dev_constants (not a bare literal reintroduced in this module)."""
+    assert "judge_selftune.gate_handful_decisions" not in judge_selftune.tunables._registry
+    assert judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS == 200
+    assert (
+        judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
+        == dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS
+    )
 
 
 # ---------------------------------------------------------------------------

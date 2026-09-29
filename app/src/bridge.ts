@@ -155,6 +155,23 @@ export interface PersonaState {
    *  Optional so older bridge builds without the field parse — falls through
    *  to undefined and the UI treats it as an empty list. */
   pending_writes?: PendingWrite[];
+  /** Gated background jobs and/or the heartbeat currently running in the
+   *  bridge process (ram-spike-fix INC-11), ordered LONGEST-RUNNING FIRST
+   *  by the bridge; [] when none are. Optional so older bridge builds
+   *  without the field degrade to no line shown. A paused job is not
+   *  included. */
+  background_jobs?: BackgroundJob[];
+}
+
+/** One entry in `PersonaState.background_jobs` (ram-spike-fix INC-11). */
+export interface BackgroundJob {
+  /** The bridge's internal job/heartbeat name, e.g. "compaction" or
+   *  "heartbeat" — see brain/bridge/central_cadence.py GATED_JOB_ORDER. */
+  name: string;
+  /** How long this name has been running, unbroken, in seconds. Measured
+   *  server-side from `time.monotonic()`; not wall-clock, don't format it
+   *  as a timestamp. */
+  running_for_seconds: number;
 }
 
 export interface PendingWrite {

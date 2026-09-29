@@ -77,15 +77,12 @@ def _inhibit_bridge_background_threads(monkeypatch: pytest.MonkeyPatch) -> None:
 def _reset_pass2_queue() -> Iterator[None]:
     """Reset pass2_queue global state before and after each test.
 
-    Mirrors _reset_cli_throttle.  Without this, tests that call enqueue()
-    leave items in the queue (or a running worker thread) that contaminate
-    subsequent tests in the same process.
-
-    Also inhibits the daemon worker so enqueue() never spawns a background
-    thread during tests — tests drive drain_pending() synchronously, and a
-    live worker would race those drains.
+    Mirrors _reset_cli_throttle.  Without this, test-only side effects
+    registered for queued items would leak into subsequent tests in the same
+    process. (There is no worker thread to inhibit any more: ram-spike-fix
+    INC-9 moved the bridge-side drain into the supervisor's central cadence
+    function; tests drive drain_pending()/drain_all_locked() directly.)
     """
-    pass2_queue._worker_inhibited = True
     pass2_queue.reset()
     yield
     pass2_queue.reset()

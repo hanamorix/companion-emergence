@@ -15,7 +15,7 @@ from brain.attunement.store import BufferTurn
 from brain.chat.tool_loop import _spawn_pass2_attunement
 
 
-def _wait_for_attunement_threads(timeout: float = 5.0) -> None:
+def _wait_for_attunement_threads(persona_dir, timeout: float = 5.0) -> None:
     # Pass-2 now flows through the in-process pass2_queue (single worker, #27),
     # not a per-turn daemon thread. Drain it synchronously (cli_throttle idle in
     # tests via conftest). Kept the name so callers are unchanged.
@@ -23,7 +23,7 @@ def _wait_for_attunement_threads(timeout: float = 5.0) -> None:
     from brain.chat import pass2_queue
 
     cli_throttle.reset()
-    pass2_queue.drain_pending()
+    pass2_queue.drain_pending(persona_dir)
 
 
 def test_spawn_skips_when_buffer_empty(tmp_path: Path):
@@ -35,7 +35,7 @@ def test_spawn_skips_when_buffer_empty(tmp_path: Path):
             reply_text="hi",
             buffer_slice=[],
         )
-        _wait_for_attunement_threads()
+        _wait_for_attunement_threads(tmp_path)
         mock_detector.assert_not_called()
 
 
@@ -49,7 +49,7 @@ def test_spawn_defers_when_budget_exhausted(tmp_path: Path):
             reply_text="Tell me about it.",
             buffer_slice=[BufferTurn(id="t1", content="I had a long day today, love.")],
         )
-        _wait_for_attunement_threads()
+        _wait_for_attunement_threads(tmp_path)
         mock_detector.assert_not_called()
 
 
@@ -62,7 +62,7 @@ def test_detector_exception_logged_to_errors_jsonl(tmp_path: Path):
             reply_text="Tell me about it.",
             buffer_slice=[BufferTurn(id="t1", content="I had a long day today, love.")],
         )
-        _wait_for_attunement_threads()
+        _wait_for_attunement_threads(tmp_path)
     errors_path = tmp_path / "attunement_errors.jsonl"
     assert errors_path.exists()
     assert "boom" in errors_path.read_text()
@@ -113,7 +113,7 @@ def test_spawn_skips_when_message_too_short(tmp_path: Path):
             reply_text="ok",
             buffer_slice=[BufferTurn(id="t1", content="ok")],
         )
-        _wait_for_attunement_threads()
+        _wait_for_attunement_threads(tmp_path)
         mock_detector.assert_not_called()
 
 
@@ -173,5 +173,5 @@ def test_pass2_threads_user_name_from_persona_config(tmp_path: Path):
             reply_text="Tell me about it.",
             buffer_slice=[BufferTurn(id="t1", content="I had a long day today, love.")],
         )
-        _wait_for_attunement_threads()
+        _wait_for_attunement_threads(tmp_path)
     assert mock_detector.call_args.kwargs["user_name"] == "Alex"

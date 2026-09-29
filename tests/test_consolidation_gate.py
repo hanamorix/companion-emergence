@@ -368,14 +368,75 @@ def test_c8_weight5_over_preexisting_weak_edge(persona):
 
 
 # --------------------------------------------------------------------------- C9
-def test_c9_gate_runs_before_reflex_in_run_tick():
-    import inspect
+def test_c9_gate_runs_before_reflex_in_run_tick(monkeypatch, tmp_path):
+    """C9: on every heartbeat tick that reaches the tick body, the
+    consolidation gate must run before reflex evaluation, so each idle
+    cycle consolidates the accumulated pending-candidate queue before the
+    generative engines (reflex/dream) produce the next cycle's candidates.
 
-    from brain.engines import heartbeat
+    Behavioral proof, not a source-order grep: patches both
+    `run_consolidation` and `HeartbeatEngine._try_fire_reflex` to record
+    the order they're actually invoked in at runtime, across
+    `HeartbeatEngine.run_tick`'s real dispatch (first-ever-tick init,
+    then a fresh tick). ram-spike-fix INC-7 split run_tick's old
+    monolithic body into `_run_tick_body` (fresh tick) / `_resume_decay_only`
+    (resumes an interrupted decay pass and stops, per spec §5) — a source
+    grep on `run_tick` itself no longer finds either call. The resumed
+    path runs neither consolidation nor reflex at all (nothing else that
+    tick), so it can't violate this ordering; only the fresh-tick path is
+    exercised here.
+    """
+    from brain.bridge.provider import FakeProvider
+    from brain.engines.heartbeat import HeartbeatEngine
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import MemoryStore
 
-    src = inspect.getsource(heartbeat.HeartbeatEngine.run_tick)
-    assert "run_consolidation(" in src
-    assert src.index("run_consolidation(") < src.index("_try_fire_reflex(")
+    # Keep dream/reflex/research/growth from constructing a real CLI
+    # provider against a bare tmp_path persona (same guard
+    # test_heartbeat_decay_batching.py uses).
+    monkeypatch.setattr(
+        "brain.engines.heartbeat.build_tier_provider", lambda *a, **k: FakeProvider()
+    )
+
+    store = MemoryStore(db_path=":memory:")
+    hebbian = HebbianMatrix(db_path=":memory:")
+    engine = HeartbeatEngine(
+        store=store,
+        hebbian=hebbian,
+        provider=FakeProvider(),
+        state_path=tmp_path / "hb_state.json",
+        config_path=tmp_path / "hb_config.json",
+        dream_log_path=tmp_path / "dreams.log.jsonl",
+        heartbeat_log_path=tmp_path / "heartbeats.log.jsonl",
+        persona_name="Canary",
+        persona_system_prompt="You are Canary.",
+    )
+    # First-ever tick only initializes state and defers all work — get it
+    # out of the way so the second call exercises the real fresh-tick body.
+    engine.run_tick()
+
+    call_order: list[str] = []
+
+    def _fake_run_consolidation(*_args, **_kwargs):
+        call_order.append("consolidation")
+
+    monkeypatch.setattr(
+        "brain.engines.consolidation.run_consolidation", _fake_run_consolidation
+    )
+
+    orig_try_fire_reflex = HeartbeatEngine._try_fire_reflex
+
+    def _spy_try_fire_reflex(self, *args, **kwargs):
+        call_order.append("reflex")
+        return orig_try_fire_reflex(self, *args, **kwargs)
+
+    monkeypatch.setattr(HeartbeatEngine, "_try_fire_reflex", _spy_try_fire_reflex)
+
+    engine.run_tick()
+
+    assert call_order == ["consolidation", "reflex"], (
+        f"consolidation gate must run before reflex evaluation, got: {call_order}"
+    )
 
 
 # -------------------------------------------------------------------------- C10

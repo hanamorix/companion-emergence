@@ -89,6 +89,29 @@ def _persona_dir(tmp_path: Path) -> Path:
     return p
 
 
+def _seed_overdue(persona_dir: Path, filename: str) -> None:
+    """ram-spike-fix INC-9 (S22/S34): a MISSING gated-job cadence file is
+    created as "last ran now" (the job waits one full interval), so a test
+    that wants a gated job to fire on its first pass seeds an OVERDUE file."""
+    persisted_cadence.save_cadence(
+        persona_dir,
+        filename,
+        persisted_cadence.CadenceState(next_at=datetime.now(UTC) - timedelta(hours=1)),
+    )
+
+
+def _seed_self_model_overdue(persona_dir: Path) -> None:
+    """Same, for self-model articulation's own cadence module (S29)."""
+    from brain.self_model import cadence as self_model_cadence
+
+    self_model_cadence.save(
+        persona_dir,
+        self_model_cadence.SelfModelCadenceState(
+            next_reflection_at=datetime.now(UTC) - timedelta(hours=1), consecutive_failures=0
+        ),
+    )
+
+
 class _CapturingBus:
     """In-process bus stand-in that records every published event.
 
@@ -188,6 +211,93 @@ def test_run_folded_fires_heartbeat_after_interval(tmp_path: Path) -> None:
     assert not t.is_alive(), "supervisor loop did not exit after stop_event"
 
 
+def test_run_folded_retries_heartbeat_soon_after_a_skip_not_a_full_interval(
+    tmp_path: Path,
+) -> None:
+    """Round-2 red-team MINOR (INC-7, self-acknowledged gap in
+    8-harness.md): `last_heartbeat_at` must advance ONLY when
+    `_heartbeat_and_felt_time` actually does something (returns non-None),
+    not on a skip (e.g. a reply in flight, S21) — otherwise a skip would
+    reset the full `heartbeat_interval_s` countdown, and a busy chat
+    session could defer the heartbeat indefinitely. Proven here by making
+    `_heartbeat_and_felt_time` return None for its first two calls, then a
+    real (non-None) sentinel, and recording the `last_heartbeat_at` VALUE
+    the supervisor hands to each call (its 4th positional arg) rather than
+    the wall-clock gap between calls: two skip calls must see the exact
+    same `last_heartbeat_at` (proving a skip left it untouched), and the
+    call after the first success must see an ADVANCED value relative to
+    what the success itself saw (proving a real run does advance it).
+    This is deterministic — no real-time margin — because it inspects the
+    value the code under test computed, not how long the test took to
+    observe it (a wall-clock-gap version of this assertion flaked on a
+    loaded macOS CI runner: an outer-loop pass was delayed long enough to
+    make a real skip's gap look like a full-interval gap by coincidence)."""
+    persona_dir = _persona_dir(tmp_path)
+    bus = EventBus()
+    stop = threading.Event()
+    seen_last_heartbeat_at: list[float] = []
+    call_results: list[bool] = []  # True once a call is allowed to "succeed"
+
+    heartbeat_interval_s = 0.3
+    tick_interval_s = 0.05
+
+    def fake_heartbeat_and_felt_time(persona_dir, provider, event_bus, last_heartbeat_at):
+        seen_last_heartbeat_at.append(last_heartbeat_at)
+        # First 2 calls simulate a reply-in-flight skip (S21): return None,
+        # doing nothing. From the 3rd call on, simulate a real pass.
+        succeeded = len(seen_last_heartbeat_at) >= 3
+        call_results.append(succeeded)
+        return object() if succeeded else None
+
+    def runner():
+        with patch(
+            "brain.bridge.supervisor._heartbeat_and_felt_time",
+            side_effect=fake_heartbeat_and_felt_time,
+        ):
+            run_folded(
+                stop,
+                persona_dir=persona_dir,
+                provider=FakeProvider(),
+                event_bus=bus,
+                tick_interval_s=tick_interval_s,
+                heartbeat_interval_s=heartbeat_interval_s,
+            )
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    try:
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and len(seen_last_heartbeat_at) < 4:
+            time.sleep(0.02)
+        assert len(seen_last_heartbeat_at) >= 4, "did not observe enough heartbeat attempts"
+    finally:
+        stop.set()
+        t.join(timeout=5.0)
+    assert not t.is_alive()
+
+    # The two SKIPPED calls (both None) must have been handed the exact
+    # SAME `last_heartbeat_at` value — proving the skip left it untouched
+    # instead of restarting the full heartbeat_interval_s countdown.
+    first_success_idx = call_results.index(True)
+    assert first_success_idx >= 2, "expected at least 2 skips before the first success"
+    assert seen_last_heartbeat_at[1] == seen_last_heartbeat_at[0], (
+        f"a skipped attempt was handed a different last_heartbeat_at "
+        f"({seen_last_heartbeat_at[1]!r} vs {seen_last_heartbeat_at[0]!r}) — "
+        f"a skip must not advance it, or a busy session could defer the "
+        f"heartbeat indefinitely"
+    )
+
+    # The call AFTER the first success must be handed an ADVANCED
+    # last_heartbeat_at relative to the value the success itself saw —
+    # proving a real (non-skipped) run DOES advance it.
+    assert first_success_idx + 1 < len(seen_last_heartbeat_at), (
+        "no call observed after the first success"
+    )
+    assert seen_last_heartbeat_at[first_success_idx + 1] > seen_last_heartbeat_at[first_success_idx], (
+        "last_heartbeat_at was not advanced after a real (non-skipped) heartbeat run"
+    )
+
+
 def test_heartbeat_failure_does_not_break_supervisor_loop(tmp_path: Path) -> None:
     """A heartbeat exception is fault-isolated; supervisor keeps ticking.
 
@@ -269,15 +379,27 @@ def test_run_heartbeat_tick_publishes_result_event(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_supervisor_snapshot_sweep_keeps_session_alive(tmp_path: Path) -> None:
+def test_supervisor_snapshot_sweep_keeps_session_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """After a snapshot sweep, the session must remain in _SESSIONS and its
     buffer file on disk."""
     from brain.chat.session import create_session, get_session, reset_registry
     from brain.ingest.buffer import ingest_turn
 
+    # ram-spike-fix INC-9 (S66/S72/S83): the snapshot/prune is a gated job of
+    # the central cadence function with NO per-session age threshold — it
+    # runs at any idle pass while a buffer has un-extracted turns. Chat is
+    # idle by default (conftest's autouse cli_throttle reset).
+
     reset_registry()
     persona_dir = _persona_dir(tmp_path)
     sess = create_session(persona_dir.name)
+    # The registry entry reflects the buffered turn (as the chat path would):
+    # it is created before this supervisor starts and no message is seen in
+    # the process, so an EMPTY one would be prunable under S84 — this test is
+    # about the snapshot not evicting a session that has turns.
+    sess.turns = 1
     sid = sess.session_id
     old_ts = (datetime.now(UTC) - timedelta(minutes=6)).isoformat()
     ingest_turn(
@@ -295,7 +417,6 @@ def test_supervisor_snapshot_sweep_keeps_session_alive(tmp_path: Path) -> None:
             "provider": FakeProvider(),
             "event_bus": bus,
             "tick_interval_s": 0.1,
-            "silence_minutes": 5.0,
             "heartbeat_interval_s": None,
             "soul_review_interval_s": None,
             "finalize_interval_s": None,
@@ -312,6 +433,59 @@ def test_supervisor_snapshot_sweep_keeps_session_alive(tmp_path: Path) -> None:
     types = [e.get("type") for e in bus.events]
     assert "session_snapshot" in types
     assert "session_closed" not in types
+    reset_registry()
+
+
+def test_supervisor_snapshot_sweep_defers_while_chat_active(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ram-spike-fix INC-6, C4(c) runtime coverage for the session-snapshot/
+    prune caller specifically (closes a stage-6 code red-team label-audit gap
+    — the prior test for this caller was static text-presence, not a runtime
+    "flip not-idle, assert it defers" test): a session old enough to be
+    snapshotted, but chat marked recently active, must NOT be swept."""
+    from brain.bridge import cli_throttle
+    from brain.chat.session import create_session, reset_registry
+    from brain.ingest.buffer import ingest_turn
+
+    cli_throttle.mark_interactive_active()
+
+    reset_registry()
+    persona_dir = _persona_dir(tmp_path)
+    sess = create_session(persona_dir.name)
+    sid = sess.session_id
+    old_ts = (datetime.now(UTC) - timedelta(minutes=6)).isoformat()
+    ingest_turn(
+        persona_dir, {"session_id": sid, "speaker": "user", "text": "earlier", "ts": old_ts}
+    )
+
+    bus = _CapturingBus()
+    stop = threading.Event()
+    t = threading.Thread(
+        target=run_folded,
+        args=(stop,),
+        kwargs={
+            "persona_dir": persona_dir,
+            "provider": FakeProvider(),
+            "event_bus": bus,
+            "tick_interval_s": 0.1,
+            "heartbeat_interval_s": None,
+            "soul_review_interval_s": None,
+            "finalize_interval_s": None,
+        },
+    )
+    t.start()
+    # Give it several ticks to prove the deferral is not just timing luck.
+    _wait_until(
+        lambda: len([e for e in bus.events if e.get("type") == "supervisor_tick"]) >= 3
+    )
+    stop.set()
+    t.join(timeout=30.0)
+
+    types = [e.get("type") for e in bus.events]
+    assert "session_snapshot" not in types, (
+        "snapshot must defer while chat is not idle, even for a stale-enough session"
+    )
     reset_registry()
 
 
@@ -347,7 +521,6 @@ def test_supervisor_tick_embeds_backlogged_memory(tmp_path: Path) -> None:
             "provider": FakeProvider(),
             "event_bus": bus,
             "tick_interval_s": 0.1,
-            "silence_minutes": 5.0,
             "heartbeat_interval_s": None,
             "soul_review_interval_s": None,
             "finalize_interval_s": None,
@@ -403,7 +576,6 @@ def test_supervisor_embedding_backfill_defers_while_chat_active(tmp_path: Path) 
             "provider": FakeProvider(),
             "event_bus": bus,
             "tick_interval_s": 0.1,
-            "silence_minutes": 5.0,
             "heartbeat_interval_s": None,
             "soul_review_interval_s": None,
             "finalize_interval_s": None,
@@ -604,7 +776,6 @@ def test_supervisor_finalize_cadence_drops_old_sessions(tmp_path: Path) -> None:
             "provider": FakeProvider(),
             "event_bus": bus,
             "tick_interval_s": 0.1,
-            "silence_minutes": 5.0,
             "heartbeat_interval_s": None,
             "soul_review_interval_s": None,
             "finalize_after_hours": 24.0,
@@ -793,8 +964,10 @@ def test_run_folded_fires_log_rotation_after_interval(tmp_path: Path) -> None:
 def test_run_folded_fires_self_model_tick_when_due(tmp_path: Path) -> None:
     """run_folded wires the self-model reflection into its own cadence block,
     fault-isolated. The tick is persisted-cadence-gated internally (mirrors
-    soul review), so a fresh persona is due on the first iteration."""
+    soul review); its cadence is seeded overdue so it is due on the first
+    iteration (ram-spike-fix INC-9: a missing file means "last ran now")."""
     persona_dir = _persona_dir(tmp_path)
+    _seed_self_model_overdue(persona_dir)
     bus = EventBus()
     stop = threading.Event()
     fired = threading.Event()
@@ -872,6 +1045,7 @@ def test_run_folded_skips_self_model_when_disabled(tmp_path: Path) -> None:
 def test_run_folded_self_model_fault_isolated(tmp_path: Path) -> None:
     """A self-model tick that raises must not take down the supervisor loop."""
     persona_dir = _persona_dir(tmp_path)
+    _seed_self_model_overdue(persona_dir)
     bus = EventBus()
     stop = threading.Event()
     fired = threading.Event()
@@ -1108,7 +1282,7 @@ def test_supervisor_initiate_review_tick_passes_rest_state_low_energy(tmp_path: 
 
     captured: dict[str, object] = {}
 
-    def fake_review_tick(persona_dir, *, provider, voice_template, cap_per_tick, user_presence, is_rest_state=False):
+    def fake_review_tick(persona_dir, *, provider, voice_template, cap_per_tick, user_presence, is_rest_state=False, should_pause=None, paused_out=None):
         captured["is_rest_state"] = is_rest_state
 
     low_energy_body = BodyState(
@@ -1145,7 +1319,7 @@ def test_supervisor_initiate_review_tick_passes_rest_state_active_energy(tmp_pat
 
     captured: dict[str, object] = {}
 
-    def fake_review_tick(persona_dir, *, provider, voice_template, cap_per_tick, user_presence, is_rest_state=False):
+    def fake_review_tick(persona_dir, *, provider, voice_template, cap_per_tick, user_presence, is_rest_state=False, should_pause=None, paused_out=None):
         captured["is_rest_state"] = is_rest_state
 
     active_energy_body = BodyState(
@@ -1179,7 +1353,7 @@ def test_supervisor_initiate_review_tick_rest_state_fail_open(tmp_path: Path) ->
 
     captured: dict[str, object] = {}
 
-    def fake_review_tick(persona_dir, *, provider, voice_template, cap_per_tick, user_presence, is_rest_state=False):
+    def fake_review_tick(persona_dir, *, provider, voice_template, cap_per_tick, user_presence, is_rest_state=False, should_pause=None, paused_out=None):
         captured["is_rest_state"] = is_rest_state
 
     with (
@@ -1202,10 +1376,12 @@ def test_supervisor_initiate_review_tick_rest_state_fail_open(tmp_path: Path) ->
 
 
 def test_run_folded_fires_interest_sweep_when_due(tmp_path: Path) -> None:
-    """A fresh persona has no interest_sweep_cadence.json yet, so it's due-now
-    on the very first tick: run_folded must call run_sweep_tick and advance
+    """An overdue interest_sweep_cadence.json (seeded; ram-spike-fix INC-9: a
+    MISSING file now means "last ran now") is due on the very first tick:
+    run_folded must call run_sweep_tick and advance
     the persisted cadence past now, even though the tick was a no-op."""
     persona_dir = _persona_dir(tmp_path)
+    _seed_overdue(persona_dir, interest_sweep.SWEEP_CADENCE_FILE)
     bus = EventBus()
     stop = threading.Event()
     fired = threading.Event()
@@ -1250,6 +1426,7 @@ def test_run_folded_interest_sweep_advances_cadence_even_when_tick_raises(tmp_pa
     wrap around it must hold anyway: a raised exception must not stop the
     end-of-block advance+save, and must not kill the supervisor loop."""
     persona_dir = _persona_dir(tmp_path)
+    _seed_overdue(persona_dir, interest_sweep.SWEEP_CADENCE_FILE)
     bus = EventBus()
     stop = threading.Event()
     fired = threading.Event()

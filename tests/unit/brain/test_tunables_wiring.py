@@ -22,11 +22,14 @@ def _write(home, overrides):
     )
 
 
-def test_throttle_idle_override(tunables_home):
-    _write(tunables_home, {"throttle.background_min_idle_seconds": 30.0})
+def test_chat_idle_lull_override(tunables_home):
+    """The ONE registered ops-timing key (ram-spike-fix INC-6, C4(b)/C27):
+    chat.idle_lull_seconds, read only by cli_throttle's private
+    _lull_seconds(), called only from is_chat_idle()."""
+    _write(tunables_home, {"chat.idle_lull_seconds": 30.0})
     from brain.bridge import cli_throttle
 
-    assert cli_throttle._idle_seconds() == 30.0
+    assert cli_throttle._lull_seconds() == 30.0
 
 
 def test_throttle_concurrency_override(tunables_home):
@@ -34,13 +37,6 @@ def test_throttle_concurrency_override(tunables_home):
     from brain.bridge import cli_throttle
 
     assert cli_throttle._max_concurrent_background() == 2
-
-
-def test_pass2_idle_override(tunables_home):
-    _write(tunables_home, {"chat.pass2_min_idle_seconds": 5.0})
-    from brain.chat import pass2_queue
-
-    assert pass2_queue._pass2_idle_seconds() == 5.0
 
 
 def test_keepalive_override(tunables_home):

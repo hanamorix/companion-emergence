@@ -51,13 +51,11 @@ class HebbianMatrix:
         # open in _build_recall_block) pass integrity_check=False to skip the
         # full-DB PRAGMA integrity_check and take a lightweight WAL open.
         if integrity_check:
-            try:
-                result = self._conn.execute("PRAGMA integrity_check").fetchall()
-            except sqlite3.DatabaseError as exc:
-                self._conn.close()
-                from brain.health.anomaly import BrainIntegrityError
+            from brain.health.integrity_retry import run_integrity_check_with_retry
 
-                raise BrainIntegrityError(str(db_path), str(exc)) from exc
+            result = run_integrity_check_with_retry(
+                self._conn, db_path, caller="HebbianMatrix"
+            )
             if result != [("ok",)]:
                 detail = "; ".join(str(row[0]) for row in result)
                 self._conn.close()

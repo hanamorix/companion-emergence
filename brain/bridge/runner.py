@@ -227,7 +227,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--persona-dir", required=True, type=Path)
     p.add_argument("--client-origin", default="cli")
     p.add_argument("--idle-shutdown-seconds", type=float, default=None)
-    args = p.parse_args(argv)
+    try:
+        args = p.parse_args(argv)
+    except SystemExit as exc:
+        # argparse exits 2 on a usage error, but 2 is this entrypoint's S57
+        # refusal code, which cmd_start reports as "already running/starting".
+        # Keep 2 meaning only that; a bad argv is an ordinary failure.
+        return 1 if exc.code == 2 else exc.code
 
     # Mutual-exclusion (Bug 2a, v0.0.36): the detached runner — spawned by
     # cmd_start on app open — must refuse to bind a SECOND bridge for a persona

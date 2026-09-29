@@ -169,6 +169,12 @@ def merge_into_learned(
     Confirmation clears any prior falsified_at — a pattern can recover from
     sustained contradiction via fresh evidence.
     """
+    # PASS2-AT-LEAST-ONCE: a pass-2 crash/restart repeat (see
+    # pass2_queue.py's drain_all_locked pop-after-process step) can call
+    # this twice for one logical item, adding one extra evidence-count
+    # increment to a pattern. Owner-accepted 2026-09-26: "the odds of it
+    # happening are tiny, the consequence if it happens are small." See
+    # #240 (emotion-system untangle) for the durable fix.
     now = now_iso or _now_iso()
     existing = {p.id: p for p in read_learned_patterns(persona_dir)}
 

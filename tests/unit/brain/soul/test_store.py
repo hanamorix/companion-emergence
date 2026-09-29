@@ -112,7 +112,10 @@ def test_count_returns_active_only() -> None:
 
 
 def test_integrity_check_raises_on_corrupt_db(tmp_path: Path) -> None:
-    """SoulStore raises BrainIntegrityError on corrupt SQLite file."""
+    """SoulStore raises BrainIntegrityError on corrupt SQLite file,
+    immediately (no retry) — "this is not a sqlite file at all" produces
+    SQLite's real "file is not a database" message, which is NOT on the
+    shared transient allowlist (brain.health.integrity_retry)."""
     from brain.health.anomaly import BrainIntegrityError
 
     corrupt_path = tmp_path / "corrupt.db"
@@ -120,6 +123,38 @@ def test_integrity_check_raises_on_corrupt_db(tmp_path: Path) -> None:
 
     with pytest.raises(BrainIntegrityError):
         SoulStore(str(corrupt_path))
+
+
+def test_soul_store_transient_disk_io_error_retries_then_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SoulStore routes through the SAME shared
+    `brain.health.integrity_retry` helper as MemoryStore/HebbianMatrix/
+    KindledLinkStore (orchestrator directive 2026-09-28: one shared helper so
+    the allowlist can't drift between stores)."""
+    import sqlite3
+
+    from brain import dev_constants
+
+    calls = {"n": 0}
+    real_connect = sqlite3.connect
+
+    class _FlakyConn(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):  # type: ignore[override]
+            if isinstance(sql, str) and sql.strip() == "PRAGMA integrity_check":
+                calls["n"] += 1
+                if calls["n"] < dev_constants.SQLITE_INTEGRITY_CHECK_RETRY_ATTEMPTS:
+                    raise sqlite3.OperationalError("disk I/O error")
+            return super().execute(sql, *args, **kwargs)
+
+    def _connect(*args, **kwargs):
+        kwargs.setdefault("factory", _FlakyConn)
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr("brain.soul.store.sqlite3.connect", _connect)
+    store = SoulStore(str(tmp_path / "soul.db"))
+    store.close()
+    assert calls["n"] == dev_constants.SQLITE_INTEGRITY_CHECK_RETRY_ATTEMPTS
 
 
 def test_save_and_list_voice_evolution(tmp_path: Path) -> None:

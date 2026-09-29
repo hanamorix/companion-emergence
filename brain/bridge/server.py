@@ -73,9 +73,11 @@ from brain.health.alarm import compute_pending_alarms
 from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
 from brain.health.walker import walk_persona
 from brain.ingest.buffer import _SESSION_ID_RE as _BUFFER_SESSION_ID_RE
+from brain.memory.db_health import run_fts_health_check_once
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.persona_config import PersonaConfig
+from brain.tools.dispatch import dispatch
 
 logger = logging.getLogger(__name__)
 
@@ -280,6 +282,35 @@ def _respond_blocking(
             session=sess,
             shared_files=shared_files,
             reply_to_audit_id=reply_to_audit_id,
+        )
+
+
+def _search_memories_blocking(persona_dir: Path, req: SearchMemoriesReq) -> dict:
+    """Wrap brain.tools.dispatch.dispatch("search_memories", ...) — blocks;
+    called via asyncio.to_thread.
+
+    Opens fresh per-call MemoryStore + HebbianMatrix INSIDE the worker thread
+    (H-A thread-ownership rule), same as _respond_blocking. Uses the SAME
+    dispatch() entry-point the in-process chat-engine tool loop uses, so the
+    returned dict (incl. `mode`) is byte-identical to an in-process call for
+    the same args (C1b) — this endpoint is a transport, not a second
+    implementation. The bridge's own embedder/reranker/vector-matrix
+    singletons (built once at bridge startup, S11) are what `search_memories`
+    reaches for internally; nothing model-related is built here.
+    """
+    from contextlib import ExitStack
+
+    with ExitStack() as stack:
+        store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+        stack.callback(store.close)
+        hebbian = HebbianMatrix(persona_dir / "hebbian.db")
+        stack.callback(hebbian.close)
+        return dispatch(
+            "search_memories",
+            req.model_dump(),
+            store=store,
+            hebbian=hebbian,
+            persona_dir=persona_dir,
         )
 
 
@@ -745,6 +776,22 @@ class CloseReq(BaseModel):
     session_id: str = Field(..., min_length=36, max_length=36, pattern=r"^[0-9a-fA-F-]{36}$")
 
 
+class SearchMemoriesReq(BaseModel):
+    """Wire body for POST /tools/search_memories (INC-4, S9/S10).
+
+    Mirrors brain.tools.impls.search_memories's own LLM-facing args
+    (build_schemas) exactly — the MCP child forwards the tool call's
+    arguments dict straight into this model, unchanged.
+    """
+
+    query: str
+    emotion: str | None = None
+    limit: int = 5
+    exclude_ids: list[str] | None = None
+    mode: Literal["semantic", "lexical"] = "semantic"
+    order: Literal["relevance", "age"] = "relevance"
+
+
 class ChatHistoryEntry(BaseModel):
     """One turn surfaced to the renderer.
 
@@ -823,9 +870,9 @@ class BridgeAppState:
 
 
 # Test-only inhibit for the lifespan's background threads (the supervisor and the
-# compaction-backlog-migration thread). Mirrors ``pass2_queue._worker_inhibited``:
-# the root ``tests/conftest.py`` sets it True so endpoint tests do not race a live
-# supervisor over the session they just seeded (hunts/bridge-order-pollution-flakes).
+# compaction-backlog-migration thread). The root ``tests/conftest.py`` sets it
+# True so endpoint tests do not race a live supervisor over the session they just
+# seeded (hunts/bridge-order-pollution-flakes).
 # NOT an ops/user knob — no env var, no config; production never sets it. An
 # explicit ``build_app(background_threads=...)`` always wins over this flag.
 _background_threads_inhibited: bool = False
@@ -835,7 +882,6 @@ def build_app(
     persona_dir: Path,
     client_origin: str = "cli",
     tick_interval_s: float = 60.0,
-    silence_minutes: float = 10.0,
     idle_shutdown_seconds: float | None = None,
     auth_token: str | None = None,
     shutdown_controller: BridgeShutdownController | None = None,
@@ -932,6 +978,21 @@ def build_app(
         except Exception as _exc:  # noqa: BLE001 — startup must not break on the nudge
             logger.warning("pronoun nudge check failed: %s", _exc)
 
+        # FTS5 health check (spec §6c, S60/S61/S62/S74): the bridge's first
+        # memories.db action, before any MemoryStore is opened for this
+        # persona — runs at most once per process per resolved db path, logs
+        # any non-healthy result, and rebuilds only on real corruption (never
+        # on a lock timeout). The per-turn MCP child, CLI commands,
+        # `nell chat --no-bridge` and cmd_start's recovery never call this.
+        # Fail-soft like every other non-essential step in this function
+        # (write_defaults_section, the last_opened_at touch, the pronoun
+        # nudge above/below): a bug in this brand-new module must never be
+        # the reason a bridge fails to start (code-red-team pass 1, M1).
+        try:
+            run_fts_health_check_once(persona_dir / "memories.db")
+        except Exception as _exc:  # noqa: BLE001
+            logger.warning("FTS health check skipped: %s", _exc)
+
         # Load the persona emotion vocabulary before any chat request can arrive.
         # Without this, aggregate_state silently drops all persona-extension
         # emotions for ~15 min after launch (until the supervisor heartbeat tick
@@ -980,6 +1041,45 @@ def build_app(
             mig_thread.start()
             app.state.bridge.migration_thread = mig_thread
 
+        # One-time tunables migration (ram-spike-fix INC-6, S25/S30/S37/S52/S71):
+        # retires the pre-lull idle-tuning keys into the single
+        # chat.idle_lull_seconds key. Synchronous, BEFORE the supervisor thread
+        # starts (C12: ordering asserted here) so no code — including the
+        # supervisor's first loop pass — can ever read a stale key. Fail-safe
+        # internally (never raises); the try/except here is belt-and-suspenders
+        # matching every other non-essential startup step in this function.
+        try:
+            from brain import paths
+            from brain.tunables_migration import migrate_idle_keys
+
+            # tunables.json lives at KINDLED_HOME (paths.get_home()), NOT under
+            # this persona's own directory (get_home()/"personas"/<name>) —
+            # passing persona_dir here would silently migrate a file that
+            # doesn't exist (stage-6 code red-team BLOCKER, caught before ship).
+            migrate_idle_keys(paths.get_home())
+        except Exception as _exc:  # noqa: BLE001 — startup must not break on the migration
+            logger.warning("tunables idle-key migration failed: %s", _exc)
+
+        # S82: seed is_chat_idle's anchor from the newest message timestamp
+        # already saved in THIS persona's active_conversations/ buffers —
+        # BEFORE the supervisor thread starts (same ordering rationale as the
+        # tunables migration above: no reader of the anchor may run first).
+        # No new persisted file; the function itself fails closed internally
+        # on a malformed saved timestamp (S63), so this try/except is
+        # belt-and-suspenders matching every other non-essential startup step.
+        try:
+            from brain.bridge.cli_throttle import seed_last_message_from_active_conversations
+
+            seed_last_message_from_active_conversations(persona_dir)
+        except Exception as _exc:  # noqa: BLE001 — startup must not break; already fails closed internally
+            logger.warning("is-chat-idle seed from active_conversations failed: %s", _exc)
+
+        # S84: "bridge start" for the empty-session prune (no message seen yet
+        # in this process). Captured here, on this thread, BEFORE the supervisor
+        # thread starts and before `yield` lets any /session/new in, so every
+        # session this bridge creates is provably after it.
+        bridge_started_at = datetime.now(UTC)
+
         # Spawn supervisor thread (non-daemon — joins on shutdown)
         from brain.bridge.supervisor import run_folded
 
@@ -1015,8 +1115,8 @@ def build_app(
                     "provider": provider,
                     "event_bus": bus,
                     "tick_interval_s": tick_interval_s,
-                    "silence_minutes": silence_minutes,
                     "is_session_busy": _is_session_busy,
+                    "bridge_started_at": bridge_started_at,
                 },
                 name="sp7-supervisor",
                 daemon=False,
@@ -2543,6 +2643,12 @@ def build_app(
         return ChatHistoryResponse(
             messages=trimmed, next_before_turn=next_cursor, session_id=resolved
         )
+
+    # ── POST /tools/search_memories — bridge-resident search (INC-4, S9/S10) ──
+    @app.post("/tools/search_memories", dependencies=[Depends(require_http_auth)])
+    async def search_memories_endpoint(req: SearchMemoriesReq) -> dict[str, Any]:
+        s: BridgeAppState = app.state.bridge
+        return await asyncio.to_thread(_search_memories_blocking, s.persona_dir, req)
 
     # ── POST /chat — JSON one-shot fallback ────────────────────────────────
     @app.post("/chat", dependencies=[Depends(require_http_auth)])

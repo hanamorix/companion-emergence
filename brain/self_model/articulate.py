@@ -10,11 +10,13 @@ Budget: _DAILY_ARTICULATE_BUDGET calls/day, midnight-local reset, stored in
   Mirrors brain/attunement/budget.py exactly in shape.
   Fail-safe-permissive: a corrupt/unreadable file -> allow the call.
 
-Throttle: requests the shared cli_throttle background slot with a short
-  min_idle (self_model.articulate_min_idle_seconds, default 30s) rather than
-  the 300s default - self-model's tick is low-priority background housekeeping,
-  same treatment brain/chat/pass2_queue.py already gives its own low-priority
-  drain. On denial, raises cli_throttle.ThrottleDeferred (does not sleep, does
+Throttle: requests the shared cli_throttle background slot — the single
+  registered chat-idle lull (cli_throttle.is_chat_idle, default 600s), same
+  gate every other background/cadence caller now asks (ram-spike-fix INC-6,
+  S28/S29/S40). Previously this call used its own shorter
+  self_model.articulate_min_idle_seconds (30s) window; that per-caller
+  override is retired along with every other caller-specific idle knob (C4).
+  On denial, raises cli_throttle.ThrottleDeferred (does not sleep, does
   not retry inline) - the caller (brain/bridge/supervisor.py's
   _run_self_model_tick) is the one that retries, via a pre-flight
   cli_throttle.slot_available() peek checked BEFORE this module's gap
@@ -38,7 +40,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from brain import prompt_strings, tunables
+from brain import prompt_strings
 from brain.bridge import cli_throttle
 from brain.bridge.usage_log import log_usage
 from brain.self_model.gap import Gap
@@ -58,19 +60,6 @@ _DAILY_ARTICULATE_BUDGET: int = 50   # Haiku calls / persona / day
 
 _BUDGET_FILE = "daily_articulate_budget.json"
 _ARTICULATE_ERRORS_FILE = "self_model_articulate_errors.jsonl"
-
-# The idle bar this call requests from cli_throttle, same value and rationale
-# as pass2_queue.py's _PASS2_IDLE_SECONDS: a short, tunable, non-default
-# window for a low-priority background call. Public (no leading underscore)
-# because brain/bridge/supervisor.py's pre-flight peek needs the exact same
-# value the real acquire below uses - one shared getter, not a duplicated
-# tunable lookup.
-_ARTICULATE_IDLE_SECONDS = tunables.register("self_model.articulate_min_idle_seconds", 30.0)
-
-
-def articulate_min_idle_seconds() -> float:
-    return tunables.get_tunable("self_model.articulate_min_idle_seconds", _ARTICULATE_IDLE_SECONDS)
-
 
 # The self-model tick's articulate note is cheap housekeeping — one short
 # sentence, not a chat reply — so it must not inherit the (larger, costlier)
@@ -274,12 +263,12 @@ def articulate(gap: Gap, *, provider: Any, persona_dir: Path) -> str | None:
     seg = _PROMPT_SEGMENTS
     prompt = seg[0] + deltas_text + seg[1] + f"{gap.unnamed_pressure:.2f}" + seg[2]
 
-    # 3. Throttle: single non-blocking acquire, min_idle=articulate_min_idle_seconds()
-    #    (default 30s, not cli_throttle's 300s default). No retry loop here - a
-    #    denial raises ThrottleDeferred immediately; the caller's pre-flight peek
+    # 3. Throttle: single non-blocking acquire against the one shared
+    #    is-chat-idle lull (C4/S28/S29). No retry loop here - a denial raises
+    #    ThrottleDeferred immediately; the caller's pre-flight peek
     #    (brain/bridge/supervisor.py's _run_self_model_tick) is what retries, via
     #    the persisted cadence, at zero cost to this function.
-    if not cli_throttle.acquire_background(min_idle=articulate_min_idle_seconds()):
+    if not cli_throttle.acquire_background():
         log_self_model_deferred(persona_dir)
         raise cli_throttle.ThrottleDeferred(
             "self_model articulate: throttle slot unavailable"

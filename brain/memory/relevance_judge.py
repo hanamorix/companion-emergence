@@ -46,7 +46,7 @@ import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from brain import prompt_strings, tunables
 from brain.bridge.provider import LLMProvider
@@ -225,6 +225,168 @@ def judge_knob_key(model_id: str, checkpoint: str | Path | None) -> str:
     return f"{model_id}@{Path(checkpoint).name}"
 
 
+def _hf_cached(model_id: str, cache_dir: str | Path | None) -> bool:
+    """True iff `model_id` is fully present in the local Hugging Face cache
+    at `cache_dir`, checked WITHOUT ever touching the network (S2/S19,
+    inc5). Uses `huggingface_hub.snapshot_download(..., local_files_only=
+    True)` — the same resolver `CrossEncoder` itself uses internally — so
+    "cached" here means exactly what a real offline load would need, not an
+    approximation of it (e.g. a bare directory-listing guess). A repo
+    missing entirely -> `LocalEntryNotFoundError` -> False, never raises.
+    `HFValidationError` (`model_id` isn't shaped like `namespace/repo_name`
+    — a non-existent local path reaching here, since `offline_load_kwargs`
+    routes any REAL local directory around this function entirely) is
+    treated the same as "not cached": False, so the caller falls back to
+    today's online-load attempt rather than crashing the tick on a
+    malformed id.
+
+    Round-3 CI follow-up: `snapshot_download(local_files_only=True)`
+    succeeding only proves every needed file's symlink EXISTS locally, not
+    that it finished downloading — a process killed mid-transfer (the CI
+    diagnosis: a 300s-timeout-killed subprocess mid-download) can leave a
+    genuinely truncated blob at the correct symlinked path, which this
+    resolver call alone does NOT detect (confirmed empirically: a copy of
+    this repo's real cache with `model.safetensors` truncated to 10MB still
+    resolves as "cached" here without the check below). Per spec S19, a
+    partially downloaded model is NOT "in the cache" -- so `_snapshot_
+    complete` additionally verifies every file the load needs is present at
+    its FULL recorded size, offline, before this returns True.
+    """
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import HFValidationError, LocalEntryNotFoundError
+
+    try:
+        snapshot_path = snapshot_download(
+            repo_id=model_id,
+            cache_dir=str(cache_dir) if cache_dir is not None else None,
+            local_files_only=True,
+        )
+    except (LocalEntryNotFoundError, HFValidationError):
+        return False
+    return _snapshot_complete(Path(snapshot_path))
+
+
+def _snapshot_complete(snapshot_dir: Path) -> bool:
+    """Offline completeness check for an already-resolved HF cache snapshot
+    directory (round-3 CI follow-up, S19): every file the resolved revision
+    lists must exist (through the snapshot dir's symlinks into `blobs/`)
+    at exactly its recorded byte size.
+
+    Ground truth is `<repo_root>/trees/<revision>.json` -- huggingface_hub's
+    OWN locally-cached git-tree manifest for this exact revision (present
+    for every repo this project's pinned `huggingface-hub==1.30.0` downloads;
+    confirmed by inspecting all three models this project currently caches).
+    This is the same manifest `snapshot_download` itself consults to resolve
+    the snapshot in the first place, so checking against it re-verifies
+    EXACTLY the file set `_hf_cached`'s caller already expects, never a
+    stricter or looser scope (no risk of flagging a file the real load never
+    needed, since the manifest lists exactly what a full, unrestricted
+    `snapshot_download` — what this module calls — resolves).
+
+    Deliberately SIZE, not a full re-hash: a truncated/killed transfer is
+    caught by size alone (this follow-up's diagnosed failure mode), and
+    re-hashing a ~2.2GB weights file on every judge build (called once per
+    calibration/self-tune tick, so not hot-path, but still non-trivial CPU)
+    is a real cost for a failure mode size already catches. A file whose
+    bytes are wrong but whose LENGTH happens to match (e.g. this project's
+    documented VM block-corruption failure mode) is NOT caught here --
+    `TorchCrossEncoderJudge.__init__`'s offline-load-raises retry is the
+    second, independent layer of defense for that residual case (round-3
+    S19 note there).
+
+    If the manifest itself is missing or unreadable, this falls back to
+    trusting `snapshot_download`'s own resolution (True) rather than
+    forcing an online re-fetch. Round-3 cold code red-team (agentId
+    a1aba2a010dee57f6, MAJOR): a `trees/<revision>.json` manifest is written
+    only as a side effect of an online download by a tree-cache-aware
+    huggingface_hub client -- a cache populated before this project pinned
+    `huggingface-hub==1.30.0` (or via `local_dir` mode, which keeps its own
+    tree cache at a different path) would never have one, and returning
+    False there would silently reclassify an already-good, already-accepted
+    cache as "not cached" on every persona that upgrades into this fix,
+    forcing an unwanted ~2.2GB re-download (or a silent tick no-op if
+    offline) with no user-visible signal. Falling back to True for a
+    missing manifest is exactly today's PRE-round-3 behavior for that case
+    (no new regression introduced for it) while still gaining the size
+    check for every fresh download going forward, which always gets one
+    (confirmed: every model this project currently caches has a `trees/`
+    entry). Logged once per occurrence so a persona silently missing this
+    verification is still observable.
+    """
+    revision = snapshot_dir.name
+    repo_root = snapshot_dir.parent.parent
+    tree_path = repo_root / "trees" / f"{revision}.json"
+    try:
+        manifest = json.loads(tree_path.read_text())
+        files: dict[str, dict[str, Any]] = manifest["files"]
+    except (OSError, ValueError, KeyError):
+        logger.warning(
+            "no readable trees/%s.json manifest under %s -- cannot size-verify this "
+            "snapshot's completeness, falling back to trusting it (pre-round-3 behavior)",
+            revision,
+            repo_root,
+        )
+        return True
+
+    for rel_path, meta in files.items():
+        expected_size = meta.get("lfs_size", meta.get("size"))
+        if expected_size is None:
+            return False
+        try:
+            actual_size = (snapshot_dir / rel_path).stat().st_size
+        except OSError:
+            return False  # missing file, or a broken symlink (blob deleted)
+        if actual_size != expected_size:
+            return False  # truncated/corrupted-length blob
+    return True
+
+
+def offline_load_kwargs(model_id_or_path: str, cache_dir: str | Path | None) -> dict[str, Any]:
+    """The kwargs to splat into a `CrossEncoder(...)` construction at a judge
+    load site (S2/S19, inc5) so a cached model makes ZERO Hugging Face
+    requests — not merely "no full download", but no HEAD/GET at all (C3a).
+
+    A LOCAL checkpoint directory (a persona's own tuned judge,
+    `judge_full_ft.load_full_scorer` / `judge_full_ft.build_full_ft_retrain_
+    fn` / `judge_lora.build_lora_retrain_fn`'s `start_model_path` when it
+    names a prior week's saved checkpoint) is already on disk — no Hub
+    resolution is possible or needed, so it goes straight to offline mode
+    with no network round-trip to decide. A Hugging Face repo id (the BASE
+    judge, or a weight-retrain's `start_model_path` before any checkpoint
+    exists yet) is checked via `_hf_cached`: present -> offline mode (no HF
+    request at all); absent -> `{}` (today's online load, C3b) — never a
+    process-global `HF_HUB_OFFLINE` mutation, which is read at import time
+    and would leak to other threads' unrelated loads (2-plan §2).
+
+    "Offline mode" is two kwargs, not one — empirically confirmed (this
+    module, manual trace) against the installed transformers/sentence-
+    transformers/huggingface_hub versions:
+      - `local_files_only=True`: covers the base config/tokenizer/weights
+        resolution (`AutoConfig`/`AutoModel.from_pretrained`'s own `hub_
+        kwargs`).
+      - `model_kwargs={"adapter_kwargs": {"local_files_only": True}}`:
+        covers a SEPARATE, independent check `transformers.models.auto.
+        auto_factory._BaseAutoModelClass.from_pretrained` runs before that —
+        `find_adapter_config_file(...)` probing for a PEFT `adapter_config.
+        json` — which reads its own `local_files_only` from `adapter_kwargs`
+        ONLY, not from the top-level `local_files_only` param at all (a
+        transformers library quirk, not a bge-reranker-v2-m3 specifics):
+        without this second kwarg, a fully-cached, `local_files_only=True`
+        load still issues a real HEAD request for `adapter_config.json` and
+        falls back to the cache only after that request errors/times out —
+        exactly the residual network touch C3a forbids. Confirmed by socket-
+        level connect-call counting: 0 with both kwargs, 1+ (with retries)
+        with `local_files_only=True` alone.
+    """
+    if Path(model_id_or_path).is_dir():
+        offline = True
+    else:
+        offline = _hf_cached(model_id_or_path, cache_dir)
+    if not offline:
+        return {}
+    return {"local_files_only": True, "model_kwargs": {"adapter_kwargs": {"local_files_only": True}}}
+
+
 class TorchCrossEncoderJudge(RelevanceJudgeProvider):
     """Real local judge via `sentence_transformers.CrossEncoder` (torch
     backend, CPU-only install — see pyproject.toml). Production default.
@@ -245,7 +407,45 @@ class TorchCrossEncoderJudge(RelevanceJudgeProvider):
         from sentence_transformers import CrossEncoder
 
         self._model_id = model_id
-        self._model = CrossEncoder(model_id, cache_folder=str(cache_dir))
+        # S81 owner ruling (Roy, RAM-spike-fix ledger, "CPU everywhere
+        # (Recommended)"): every judge construction site runs on CPU on
+        # every platform, never MPS. Without an explicit `device=`,
+        # sentence_transformers.util.get_device_name() picks 'mps' whenever
+        # torch.backends.mps.is_available() is true -- which a real macOS
+        # install's torch build reports, and release_judge() has no
+        # MPS-specific release call, so an MPS-resident judge risked a
+        # low-memory Mac hitting the same OOM CI saw under MPS's smaller
+        # memory budget.
+        load_kwargs = offline_load_kwargs(model_id, cache_dir)
+        try:
+            self._model = CrossEncoder(
+                model_id, cache_folder=str(cache_dir), device="cpu", **load_kwargs
+            )
+        except Exception:
+            # Round-3 CI follow-up (S19): `_hf_cached`'s size check (see its
+            # docstring) catches a truncated/killed-mid-download blob, but
+            # NOT a same-size-wrong-bytes corruption (this project's
+            # documented VM block-corruption failure mode) or any other way
+            # an offline load can fail despite passing that check. `load_
+            # kwargs` non-empty means we DID attempt the offline path (S2/
+            # S19: only reached when `_hf_cached` said "cached"); retry
+            # ONCE without it so huggingface_hub's real network downloader
+            # (which DOES hash-verify on transfer, unlike a local_files_
+            # only resolution) can detect and re-fetch whatever is actually
+            # bad. If `load_kwargs` was already empty, we were already on
+            # the online path — no second online attempt to make; let the
+            # original exception propagate rather than silently retrying
+            # the identical call.
+            if not load_kwargs:
+                raise
+            logger.warning(
+                "offline load of judge %r failed despite _hf_cached reporting it complete "
+                "-- retrying online once (S19: an offline load that raises is treated as "
+                "not really cached)",
+                model_id,
+                exc_info=True,
+            )
+            self._model = CrossEncoder(model_id, cache_folder=str(cache_dir), device="cpu")
         # Same rationale as CrossEncoderProvider._rerank_lock: a shared
         # instance of this provider (the process-wide cache below) could in
         # principle have .score() called concurrently; serialize inference
@@ -398,6 +598,79 @@ def _reset_judge_provider_cache() -> None:
         _provider_cache.clear()
 
 
+def release_judge() -> None:
+    """Release the judge's RAM after a calibration or self-tune job FINISHES
+    (S11/S27, inc5; the PAUSE arm is INC-10). Called in the `finally` of
+    `supervisor._run_calibration_tick`'s judge-labeling step and of
+    `judge_selftune._run_judge_selftune_tick` — unconditionally, whether or
+    not that tick actually built a judge this time (a no-op is cheap; a
+    missed release is a RAM leak, so every finish path calls this rather
+    than only the ones known to have built something).
+
+    Drops BOTH kinds of judge reference this module can hold at the end of a
+    tick:
+      - the cached shared BASE judge (`_provider_cache`, `TorchCrossEncoder
+        Judge`) — popped under `_provider_cache_lock` so a concurrent
+        `build_judge_provider()` call never observes a half-cleared cache;
+      - any per-persona `FullModelJudge` / weight-retrain scratch model the
+        caller built and returned from this call — those are NEVER cached
+        (module docstring above `_provider_cache`), so ordinary CPython
+        refcounting already drops them once the caller's own local
+        variables go out of scope; `gc.collect()` below is what reclaims
+        them if a reference cycle (torch's autograd graph, a bound closure)
+        kept one alive past that point.
+
+    Then, on every platform, `gc.collect()` (reclaims any of the above still
+    alive only via a cycle); on Linux, `ctypes.CDLL("libc.so.6").
+    malloc_trim(0)` — glibc's allocator does not always return freed pages
+    to the OS on `free()` alone (O7: Linux RSS only drops after gc+trim),
+    so this is the step that actually shows up in `psutil`'s RSS reading.
+    macOS gets its analogue, `malloc_zone_pressure_relief(NULL, 0)` from
+    libSystem (guarded by `sys.platform == "darwin"`, fail-soft the same
+    way); Windows needs none (its heap returns freed pages on its own — the
+    C2 RSS test passes there without one).
+    The Linux call is guarded both by `sys.platform.startswith("linux")`
+    (never attempted on macOS/Windows, which have no `libc.so.6` and no
+    `malloc_trim` — I13) and by a try/except around the `CDLL`/symbol lookup itself (a musl-based
+    Linux, or a hardened glibc build missing the symbol, would otherwise
+    raise here; logged once, not re-raised, since a failed trim only means
+    RSS drops less promptly, not that anything is wrong).
+    """
+    import gc
+    import sys
+
+    with _provider_cache_lock:
+        _provider_cache.clear()
+
+    gc.collect()
+
+    if sys.platform.startswith("linux"):
+        try:
+            import ctypes
+
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except (OSError, AttributeError):
+            logger.warning("release_judge: malloc_trim(0) unavailable on this libc — RSS may drop later")
+    elif sys.platform == "darwin":
+        # macOS analogue of the Linux malloc_trim(0) above: libSystem's
+        # malloc zones keep freed pages resident after free(), so after the
+        # judge's tensors are dropped RSS can sit well above the pre-load
+        # level (CI measured 26.3% retained vs the 25% C2 bound on macos-14;
+        # the calibration arm retained ~20%). `malloc_zone_pressure_relief(
+        # NULL, 0)` asks every zone to return whatever it can to the OS.
+        # Fail-soft like the Linux branch: any failure to find or call it is
+        # logged and swallowed, since it only affects how promptly RSS drops.
+        try:
+            import ctypes
+
+            relief = ctypes.CDLL("/usr/lib/libSystem.B.dylib").malloc_zone_pressure_relief
+            relief.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            relief.restype = ctypes.c_size_t
+            relief(None, 0)
+        except Exception:  # ctypes can raise OSError / AttributeError / ArgumentError
+            logger.warning("release_judge: malloc_zone_pressure_relief unavailable on this macOS — RSS may drop later")
+
+
 # ---------------------------------------------------------------------------
 # Haiku tie-break — mirrors consolidation._make_haiku_classifier's shape
 # (construction + call + fail-soft-on-any-failure), so it is mockable the
@@ -468,6 +741,8 @@ def label_calibration_sample(
     judge: RelevanceJudgeProvider | None = None,
     sample_rows: int | None = None,
     full_model_dir: str | None = None,
+    should_pause: Callable[[], bool] | None = None,
+    progress_out: dict[str, bool] | None = None,
 ) -> int:
     """Label a SAMPLE of unlabeled `calibration_log` rows: the local judge
     (`judge`, or the real `build_judge_provider()` if not injected) scores
@@ -508,6 +783,16 @@ def label_calibration_sample(
       - a Haiku failure -> handled inside `_make_haiku_tiebreak` itself
         (returns None, not an exception) — never reaches this function's
         try/except at all.
+
+    ``should_pause`` (ram-spike-fix INC-10, S14/S31/S41/S65): checked after
+    each row is written, before the next one starts — the S32 table's item
+    unit for daily calibration is "one calibration_log row". When it fires
+    with rows still remaining, the loop stops there; `progress_out["paused"]`
+    (if a dict was passed) is set True so the caller can skip floor
+    derivation and report the tick as paused rather than completed. The
+    "already-labeled rows not re-labeled" resume guarantee (C8) needs no new
+    cursor: `store.sample_unlabeled_calibration_rows` only ever samples
+    `local_judge_label IS NULL` rows, so a labeled row is never re-sampled.
     """
     if sample_rows is None:
         sample_rows = tunables.get_tunable("calibration.judge_sample_rows", CALIBRATION_SAMPLE_ROWS)
@@ -596,4 +881,9 @@ def label_calibration_sample(
                 "calibration judge: row id=%s failed; leaving unlabeled for a later tick",
                 row.get("id"),
             )
+        if should_pause is not None and row is not rows[-1] and should_pause():
+            logger.info("calibration judge: pausing between rows for chat (INC-10)")
+            if progress_out is not None:
+                progress_out["paused"] = True
+            break
     return labeled

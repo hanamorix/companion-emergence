@@ -824,7 +824,7 @@ def test_snapshot_stale_sessions_respects_ten_minute_threshold(
     minutes must NOT be extracted; one idle just over 10 minutes must. This
     exercises snapshot_stale_sessions's pre-existing, unchanged gate-comparison
     logic — it does not itself prove the production default changed (that is
-    `test_silence_minutes_defaults_are_ten_minutes` in
+    `test_run_folded_and_build_app_no_longer_take_silence_minutes` in
     tests/unit/brain/bridge/test_supervisor_db_overhead.py); it confirms the
     mechanism the new default now feeds into still works correctly.
     """

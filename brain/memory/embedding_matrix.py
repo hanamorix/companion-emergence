@@ -87,6 +87,8 @@ from pathlib import Path
 
 import numpy as np
 
+from brain import dev_constants
+
 logger = logging.getLogger(__name__)
 
 # Retrieval embeddings are float32, of whatever dimension the ACTIVE model
@@ -250,12 +252,16 @@ class EmbeddingMatrix:
         `EmbeddingMatrix.put()` is the backstop against a genuinely wrong-dim
         vector reaching `_vectors` (see that method).
         """
-        conn = sqlite3.connect(str(self._db_path))
+        conn = sqlite3.connect(
+            str(self._db_path), timeout=dev_constants.MEMORIES_DB_BUSY_TIMEOUT_S
+        )
         try:
-            # Mirror MemoryStore's 5s busy_timeout (WAL is already on the
-            # DB) so a concurrent writer does not surface "database is
-            # locked" on the default busy_timeout=0.
-            conn.execute("PRAGMA busy_timeout = 5000")
+            # Mirror MemoryStore's busy_timeout (WAL is already on the DB)
+            # so a concurrent writer does not surface "database is locked"
+            # on the default busy_timeout=0.
+            conn.execute(
+                f"PRAGMA busy_timeout = {int(dev_constants.MEMORIES_DB_BUSY_TIMEOUT_S * 1000)}"
+            )
             rows = conn.execute(
                 "SELECT id, embedding FROM memories"
                 " WHERE active = 1 AND embedding IS NOT NULL"

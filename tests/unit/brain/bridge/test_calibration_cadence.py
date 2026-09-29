@@ -34,8 +34,11 @@ def test_run_calibration_tick_importable_and_callable():
     # lazily"). Both keyword-only, both defaulted, so every existing
     # zero-arg call site (run_folded's startup catch-up + periodic fire)
     # keeps working unmodified.
-    assert params == ["persona_dir", "is_session_busy", "provider", "judge"], (
-        f"expected (persona_dir, *, is_session_busy, provider, judge), got {params}"
+    # INC-10 (ram-spike-fix): adds keyword-only `should_pause` (the
+    # between-items pause hook, default None => never pauses — every
+    # existing zero-arg call site keeps working unmodified).
+    assert params == ["persona_dir", "is_session_busy", "provider", "judge", "should_pause"], (
+        f"expected (persona_dir, *, is_session_busy, provider, judge, should_pause), got {params}"
     )
     busy = sig.parameters["is_session_busy"]
     assert busy.kind is inspect.Parameter.KEYWORD_ONLY
@@ -48,12 +51,20 @@ def test_run_calibration_tick_importable_and_callable():
     assert judge_param.default is None
 
 
-def test_calibration_cadence_due_now_when_missing():
+def test_calibration_cadence_missing_is_created_as_last_ran_now():
+    """ram-spike-fix INC-9 (S22/S69): calibration is a gated job, so a missing
+    cadence file is created as "last ran now" (next_at = now + interval) and
+    the job is NOT due — it first runs one full interval later."""
     with tempfile.TemporaryDirectory() as d:
         pd = Path(d)
         now = datetime(2026, 6, 29, 12, tzinfo=UTC)
-        state = pc.load_cadence(pd, "calibration_cadence.json")
-        assert pc.is_due(state, now=now) is True
+        state, created = pc.load_or_init_cadence(
+            pd, "calibration_cadence.json", now=now, interval_s=86400.0
+        )
+        assert created is True
+        assert state.next_at == now + timedelta(seconds=86400.0)
+        assert pc.is_due(state, now=now) is False
+        assert pc.load_cadence(pd, "calibration_cadence.json").next_at == state.next_at
 
 
 def test_calibration_cadence_not_due_after_advance_and_fires_at_86400():

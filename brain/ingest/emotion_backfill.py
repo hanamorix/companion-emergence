@@ -27,6 +27,7 @@ from brain.state_compat import from_known_fields
 
 if TYPE_CHECKING:
     from brain.bridge.provider import LLMProvider
+    from brain.memory.store import MemoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -35,21 +36,14 @@ _STATE_FILE = "emotion_backfill_state.json"
 # ---------------------------------------------------------------------------
 # Yield-to-chat helpers
 # ---------------------------------------------------------------------------
-
-_ACTIVE_CHAT_IDLE_MINUTES = 5.0  # if the user chatted within this window, yield
-
-
-def _user_recently_active(persona_dir: Path, *, now: _datetime | None = None) -> bool:
-    """True if the user has an active chat session (a turn in the last 5 min).
-
-    The backfill yields to active chat so it never saturates the Claude CLI
-    subscription out from under an interactive turn.
-    """
-    from brain.body.session_hours import compute_active_session_hours
-
-    _now = now or _datetime.now(UTC)
-    return compute_active_session_hours(persona_dir, now=_now) > 0.0
-
+#
+# ram-spike-fix INC-6 (S28/S29/S40/C4): the disk-based, wall-clock
+# _user_recently_active/_ACTIVE_CHAT_IDLE_MINUTES mechanism is retired — it
+# was ALSO dead code (it read compute_active_session_hours, never the
+# _ACTIVE_CHAT_IDLE_MINUTES constant it was named after; found during
+# 2-plan's re-verification, see 2-plan.md §V). The loop now asks the single
+# shared cli_throttle.is_chat_idle() gate, same as every other background
+# caller.
 
 # Inter-call pacing: pause between successful tag+write operations so the
 # backfill never bursts all its budget in one sitting and starves interactive
@@ -234,6 +228,72 @@ def should_run_emotion_backfill(persona_dir: Path) -> bool:
         store.close()
 
 
+def has_emotion_backfill_work(
+    persona_dir: Path,
+    *,
+    store: MemoryStore | None = None,
+    now: _datetime | None = None,
+) -> bool:
+    """The central cadence function's "emotion backfill has work" probe
+    (ram-spike-fix INC-9, S53/S66): the backfill runs at every idle pass while
+    this is True.
+
+    Same answer as ``should_run_emotion_backfill`` (not complete, and some
+    active memory has an empty emotion vector), with two differences made for
+    a probe asked every idle pass:
+
+    * A backfill that hit its daily cap today (state ``deferred_to_next_day``
+      and the budget file dated today — the budget's own day boundary, the
+      one the cap resets on) has no work until that day is over, so the cap
+      is not re-hit on every pass.
+    * It streams only the ``emotions_json`` column and stops at the first
+      empty vector, instead of loading every active memory row (with its
+      embedding) into memory the way ``list_active`` does.
+
+    ``store``: an already-open ``MemoryStore`` on this persona's
+    ``memories.db`` to read through (the supervisor's per-tick store); when
+    None, a short-lived one is opened and closed here.
+    """
+    existing = _load_state(persona_dir)
+    if existing is not None and existing.status == "complete":
+        return False
+    if existing is not None and existing.status == "deferred_to_next_day":
+        now = now or _datetime.now(UTC)
+        try:
+            raw = json.loads(_budget_path(persona_dir).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raw = {}
+        if isinstance(raw, dict) and raw.get("date") == _today_str(now):
+            return False
+
+    def _scan(s: MemoryStore) -> bool:
+        cur = s._conn.execute(  # noqa: SLF001 — one-column streaming read
+            "SELECT emotions_json FROM memories WHERE active = 1"
+        )
+        try:
+            for (emotions_json,) in cur:
+                if not json.loads(emotions_json):
+                    return True
+            return False
+        finally:
+            cur.close()
+
+    if store is not None:
+        return _scan(store)
+
+    db_path = persona_dir / "memories.db"
+    if not db_path.exists():
+        return False
+
+    from brain.memory.store import MemoryStore as _MemoryStore
+
+    own = _MemoryStore(str(db_path), integrity_check=False)
+    try:
+        return _scan(own)
+    finally:
+        own.close()
+
+
 def run_emotion_backfill(
     persona_dir: Path,
     *,
@@ -242,8 +302,16 @@ def run_emotion_backfill(
     cap: int = 200,
     now_dt: _datetime | None = None,
     delay_s: float = _INTER_CALL_DELAY_S,
+    store: MemoryStore | None = None,
+    should_pause: Callable[[], bool] | None = None,
+    paused_out: list[bool] | None = None,
 ) -> EmotionBackfillState:
     """Run (or resume) the one-time emotion backfill.
+
+    ``store``: an already-open ``MemoryStore`` on this persona's
+    ``memories.db`` to use (and NOT close) — the supervisor passes its
+    per-tick shared store so a tick keeps one memories.db connection (#132,
+    ram-spike-fix INC-9). When None, the run opens and closes its own.
 
     - Selects ALL active memories with ``emotions == {}`` ordered by ``m.id``
       (stable, deterministic cursor — no sampling).
@@ -265,6 +333,14 @@ def run_emotion_backfill(
     the default Haiku tagger is used; ``provider`` (if given) is passed to it so
     tests can inject a stub without shelling out to the Claude CLI.
 
+    ``should_pause`` (ram-spike-fix INC-10, S14/S41/S65): checked between
+    memories, same as the yield-gate always was; defaults to a bare
+    ``not is_chat_idle()`` check (this function's pre-INC-10 behavior) when
+    omitted, so existing callers are unaffected. The supervisor passes its
+    between-items hook (heartbeat + idle) instead, so a heartbeat due
+    mid-backfill runs between memories rather than waiting for the whole
+    candidate list.
+
     Mirrors ``brain.attunement.backfill.run_backfill``.
     """
     if tagger_fn is None:
@@ -281,13 +357,16 @@ def run_emotion_backfill(
     vocab = _load_vocab()
 
     db_path = persona_dir / "memories.db"
-    from brain.memory.store import MemoryStore
+    from brain.memory.store import MemoryStore as _MemoryStore
 
     # Single store handle for the whole run — avoids opening a fresh connection
     # per write-back (mirrors the attunement backfill's single-handle pattern).
-    # MemoryStore uses WAL + 5s busy_timeout so a long-running backfill does
-    # not block the main chat path.
-    store = MemoryStore(str(db_path), integrity_check=False)
+    # MemoryStore uses WAL + a busy timeout so a long-running backfill does
+    # not block the main chat path. A caller-supplied store is used as is and
+    # left open (the caller owns it).
+    own_store = store is None
+    if own_store:
+        store = _MemoryStore(str(db_path), integrity_check=False)
     try:
         all_active = store.list_active()
 
@@ -327,24 +406,34 @@ def run_emotion_backfill(
         # Import once before loop — local import is circular-safe.
         from brain.bridge import cli_throttle as _cli_throttle  # noqa: PLC0415
 
+        if should_pause is None:
+            should_pause = lambda: not _cli_throttle.is_chat_idle()  # noqa: E731
+
         for memory in candidates:
-            # Yield gate (disk-based, restart-robust): stop if the user is
-            # actively chatting so the CLI is free.  The cursor is preserved —
-            # the next supervisor pass resumes from here.
-            if _user_recently_active(persona_dir, now=now_dt):
+            # Yield gate (INC-10 between-items hook): stop if the caller says
+            # pause (chat active again, or — via the supervisor's hook — a
+            # heartbeat just ran) so the CLI is free.  The cursor is already
+            # saved as of the last completed memory (state below is the last
+            # `_save_state` write) — RETURN here, not `break`: falling through
+            # to the post-loop "mark complete" code below would wrongly stamp
+            # status="complete" while candidates this run never reached are
+            # still untagged (the exact bug INC-10's crash/pause-resume proof
+            # would catch — a paused run must stay status="running" so the
+            # next pass resumes it, never silently skip the rest forever).
+            if should_pause():
                 logger.info(
-                    "emotion_backfill: yielding — user actively chatting; "
+                    "emotion_backfill: yielding — should_pause; "
                     "will resume when idle"
                 )
-                break
+                if paused_out is not None:
+                    paused_out.append(True)
+                return state
 
             # Global concurrency cap: only one background CLI consumer at a time.
             # Wraps budget-check + Haiku call + write-back so the slot is held for
             # the full per-memory unit of work and released before the pacing sleep.
             # Per-iteration acquire/release is safe because the 1.5s inter-call
             # delay means there is no tight-loop gap concern.
-            # Belt-and-suspenders: _user_recently_active (disk, restart-robust) and
-            # cli_throttle (monotonic clock, resets on restart) both guard the call.
             with _cli_throttle.background_slot() as _slot:
                 if not _slot:
                     logger.info(
@@ -421,4 +510,5 @@ def run_emotion_backfill(
         return state
 
     finally:
-        store.close()
+        if own_store:
+            store.close()

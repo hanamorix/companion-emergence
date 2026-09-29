@@ -66,6 +66,34 @@ _NEVER_REOFFER: frozenset[str] = frozenset({
 })
 
 
+def run_pass2_monologue(
+    *,
+    monologue_text: str,
+    visible_reply: str,
+    recent_user_msgs: tuple[str, ...],
+    persona_dir: Path,
+) -> None:
+    """The monologue pass-2 run body — UNCHANGED from the pre-INC-8 closure
+    that used to live inside ``_spawn_pass2`` (S76: same operations, just a
+    named top-level function now so ``pass2_queue._dispatch`` can call it
+    by "kind" instead of the queue holding an unpicklable/unserializable
+    closure). Called once per queued ``"monologue"`` record; a pass-2
+    crash/restart repeat (see ``pass2_queue.drain_all_locked``'s
+    pop-after-process step) can call this twice for one logical item."""
+    try:
+        from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER, build_tier_provider
+
+        out = extract_from_thinking(
+            provider=build_tier_provider(persona_dir, TIER_BACKGROUND_CLASSIFIER),
+            monologue_blocks=(monologue_text,),
+            visible_reply=visible_reply,
+            recent_turn_context=recent_user_msgs,
+        )
+        apply_side_effects(out, persona_dir=persona_dir)
+    except Exception:  # noqa: BLE001
+        logger.exception("pass-2 monologue extraction failed")
+
+
 def _spawn_pass2(
     *,
     provider: LLMProvider,
@@ -74,37 +102,31 @@ def _spawn_pass2(
     recent_user_msgs: tuple[str, ...],
     persona_dir: Path,
 ) -> None:
-    """Enqueue pass-2 onto the process-global pass2_queue worker.
-
-    The worker drains the queue serially via cli_throttle (yields to
-    interactive chat, respects the background-concurrency cap).  Raw
-    monologue text is persisted synchronously before this call, so
-    in-memory queue loss only drops extraction, not the trace itself.
+    """Enqueue pass-2 onto the persisted pass2_queue (INC-8: a serializable
+    record, not a closure — see ``pass2_queue.py``'s module docstring). The
+    worker drains the queue serially via cli_throttle (yields to
+    interactive chat, respects the background-concurrency cap). Raw
+    monologue text is persisted synchronously before this call, so a
+    not-yet-drained item is durable across a restart (INC-8), not lost.
 
     ``provider`` is accepted but no longer used for the extraction call itself
     (#154): pass-2 extraction is a classifier-tier operation and must not
     inherit the live chat provider this parameter historically carried.
-    ``_run()`` builds its own ``TIER_BACKGROUND_CLASSIFIER`` provider from
-    ``persona_dir`` instead. The parameter is kept (not removed) so existing
-    callers/tests are unaffected — a signature change here is exactly the
-    class of break #154's initiate/review.py rework hit four times running.
+    ``run_pass2_monologue`` builds its own ``TIER_BACKGROUND_CLASSIFIER``
+    provider from ``persona_dir`` instead. The parameter is kept (not
+    removed) so existing callers/tests are unaffected — a signature change
+    here is exactly the class of break #154's initiate/review.py rework hit
+    four times running.
     """
-
-    def _run() -> None:
-        try:
-            from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER, build_tier_provider
-
-            out = extract_from_thinking(
-                provider=build_tier_provider(persona_dir, TIER_BACKGROUND_CLASSIFIER),
-                monologue_blocks=(monologue_text,),
-                visible_reply=visible_reply,
-                recent_turn_context=recent_user_msgs,
-            )
-            apply_side_effects(out, persona_dir=persona_dir)
-        except Exception:  # noqa: BLE001
-            logger.exception("pass-2 monologue extraction failed")
-
-    pass2_queue.enqueue(_run, label=f"monologue-{next(_pass2_counter)}")
+    next(_pass2_counter)  # kept for label-numbering parity with prior behaviour
+    record = {
+        "id": pass2_queue.new_record_id(),
+        "kind": "monologue",
+        "monologue_text": monologue_text,
+        "visible_reply": visible_reply,
+        "recent_user_msgs": list(recent_user_msgs),
+    }
+    pass2_queue.enqueue(record, persona_dir=persona_dir)
 
 
 def _attunement_now_iso() -> str:
@@ -172,7 +194,8 @@ def _spawn_pass2_attunement(
     reply_text: str,
     buffer_slice: list[BufferTurn],
 ) -> None:
-    """Enqueue the attunement pass-2 onto the process-global pass2_queue worker.
+    """Enqueue the attunement pass-2 onto the persisted pass2_queue (INC-8:
+    a serializable record, not a closure).
 
     Mirrors _spawn_pass2 — enqueues rather than spawning a per-turn daemon
     thread.  No-ops when the detector gate says this turn doesn't warrant a
@@ -180,12 +203,16 @@ def _spawn_pass2_attunement(
     """
     if not should_run_detector(buffer_slice, user_message, reply_text):
         return
-    pass2_queue.enqueue(
-        lambda: _run_attunement_pass2(
-            persona_dir, turn_id, user_message, reply_text, buffer_slice
-        ),
-        label=f"attunement-{next(_attunement_counter)}",
-    )
+    next(_attunement_counter)  # kept for label-numbering parity with prior behaviour
+    record = {
+        "id": pass2_queue.new_record_id(),
+        "kind": "attunement",
+        "turn_id": turn_id,
+        "user_message": user_message,
+        "reply_text": reply_text,
+        "buffer_slice": [{"id": bt.id, "content": bt.content} for bt in buffer_slice],
+    }
+    pass2_queue.enqueue(record, persona_dir=persona_dir)
 
 
 def _buffer_slice_from_messages(messages: list[ChatMessage]) -> list[BufferTurn]:

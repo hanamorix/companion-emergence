@@ -378,6 +378,12 @@ def _apply_emotion_delta(delta: dict[str, float], persona_dir: Path) -> None:
     writing — LLM-invented names are silently dropped here (mirrors the
     _normalize pattern in brain/ingest/emotion_backfill.py).
     """
+    # PASS2-AT-LEAST-ONCE: a pass-2 crash/restart repeat (see
+    # pass2_queue.py's drain_all_locked pop-after-process step) can call
+    # this twice for one logical item, adding one extra emotion nudge to
+    # aggregate_state. Owner-accepted 2026-09-26: "the odds of it happening
+    # are tiny, the consequence if it happens are small." See #240
+    # (emotion-system untangle) for the durable fix.
     from brain.memory.store import Memory, MemoryStore
 
     store = MemoryStore(persona_dir / "memories.db")
