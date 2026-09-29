@@ -104,11 +104,12 @@ Sometimes one piece of work needs another that isn't merged yet, so you base the
 ### What helps you follow it
 
 - **The `stack-guard` check** is red on any PR whose base isn't main. Its message says what to do: "merge #N first" while the PR below is open, or "retarget this PR to main" if the PR below has already merged. Once the PR targets main it goes green. A base change re-runs it, and the check reads the PR's current base, so re-running it by hand also works.
-- **A stranded-changes alarm.** If a PR does get merged into anything other than main, a comment appears on it within seconds. It says whether the changes will still reach main (the branch's own PR is still open: merge that next) or are **stranded** (that PR already merged or was closed), and how to recover: open a PR from that branch to main.
+- **A stranded-changes alarm.** If a PR does get merged into anything other than main, a comment appears on it within seconds. It says whether the changes will still reach main (the branch's own PR is still open: merge that next) or are **stranded** (that PR had already merged before this one, or was closed), and how to recover: open a PR from that branch to main. It stays quiet if the branch's PR merged *after* this one and so carried the changes along.
+- Both only show up on branches that include the workflow, so merge main into an older branch to get them.
 
 ### It's a signal, not a lock
 
-The red check can't stop the merge button. GitHub's "required checks" belong to the branch a PR merges *into*. A stacked PR merges into a feature branch, which has no protection, so even a check marked required on main never gets a say. (Issue #282 hoped for a hard block; there isn't a way to get one without also blocking ordinary pushes to feature branches.)
+The red check can't stop the merge button. GitHub's "required checks" belong to the branch a PR merges *into*. A stacked PR merges into a feature branch, which has no protection, so even a check marked required on main never gets a say. (Issue #282 hoped for a hard block. As far as we can tell, the only way to get one, a ruleset requiring the check on every branch, would also get in the way of ordinary pushes to feature branches. That's untested, and we haven't tried it.)
 
 What really keeps stacks safe is the **auto-delete setting**. Once PR A merges, its branch disappears within a couple of seconds and PR B is moved to main, so there's no stale branch left to merge into. The check warns you before a mistake, and the alarm tells you straight after one.
 

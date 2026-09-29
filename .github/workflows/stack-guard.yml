@@ -78,6 +78,7 @@ jobs:
         env:
           MODE: merged
           BASE_REF: ${{ github.event.pull_request.base.ref }}
+          MERGED_AT: ${{ github.event.pull_request.merged_at }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           REPO: ${{ github.repository }}
