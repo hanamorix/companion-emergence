@@ -10,7 +10,7 @@ was rewritten accordingly: `ema_update`/`stability_gate_accepts`/
 `_bootstrap_ci` no longer exist (see the dead-code test below), and
 `derive_and_persist_floor`'s own cold-start branch (bundled-pair fit,
 unconditionally persisted) is gone, replaced by a data-starvation backstop.
-`get_bootstrap_floor` (the SEPARATE, still-standing hot-path bootstrap) and
+`get_bootstrap_floor` (the SEPARATE, still-standing rerank bootstrap, now computed at process start) and
 `fit_threshold_fbeta` (the raw fit itself) are UNCHANGED by Change 1 and
 keep their existing coverage below.
 
@@ -721,7 +721,7 @@ def test_cold_start_pairs_uses_the_shared_anchor_normalization_helper() -> None:
 
 # ---------------------------------------------------------------------------
 # get_bootstrap_floor — F2a inc8 (#250 §7 UPDATED, Roy 2026-09-18): the
-# hot-path DEFAULT `get_reranker_floor` serves instead of None when no
+# DEFAULT `get_reranker_floor` serves (from the cache) instead of None when no
 # persisted row exists yet. UNCHANGED by Change 1. All offline via a
 # scripted FakeRerankerProvider monkeypatched onto
 # `reranker._bootstrap_reranker_provider` directly.

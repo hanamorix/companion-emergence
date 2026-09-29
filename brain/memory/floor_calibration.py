@@ -371,10 +371,11 @@ def _cold_start_pairs(reranker_provider: RerankerProvider) -> list[tuple[float, 
 
 
 # ---------------------------------------------------------------------------
-# Hot-path bootstrap floor (F2a inc8, #250 §7 UPDATED, Roy 2026-09-18) —
-# the DEFAULT `get_reranker_floor` serves when NO persisted row exists yet,
-# so semantic recall's existence is decoupled from the daily tick ever
-# having fired. Process-wide cache, keyed by model_id, computed ONCE.
+# Rerank bootstrap floor (F2a inc8, #250 §7 UPDATED, Roy 2026-09-18) — the
+# DEFAULT `get_reranker_floor` serves (from this cache, name-recall fix S85
+# revised) when NO persisted row exists yet, so semantic recall's existence
+# is decoupled from the daily tick ever having fired. Process-wide cache,
+# keyed by model_id, computed ONCE at process start (never on a reply).
 # ---------------------------------------------------------------------------
 
 # model_id -> the bootstrap floor dict last derived for it (same shape as

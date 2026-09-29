@@ -152,6 +152,9 @@ def start_background(
     """Run `compute_missing_floors` on a daemon thread and return it (started).
     Daemon: never holds up a shutdown; a process that exits mid-compute simply
     computes again next start."""
+    # Set the flag BEFORE the thread exists, so the cadence job can never win a
+    # race against the startup computation (`compute_missing_floors` clears it).
+    _startup_active.set()
     thread = threading.Thread(
         target=compute_missing_floors,
         args=(persona_dir,),
@@ -159,5 +162,9 @@ def start_background(
         name=name,
         daemon=True,
     )
-    thread.start()
+    try:
+        thread.start()
+    except Exception:
+        _startup_active.clear()
+        raise
     return thread

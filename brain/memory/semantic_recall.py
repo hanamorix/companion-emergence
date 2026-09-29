@@ -45,9 +45,10 @@ paragraph can then yield results on both scales, each gated only by its own
 floor.) The module returns `None`
 (the caller falls through UNCHANGED to the existing lexical/blend retrieval)
 only for an empty/sparse pool (cold-start "graceful warm-up"), an embed
-failure, no cosine floor yet (S85: no calibrated row and the cadence job has not
-produced the bootstrap), or when nothing clears the floor of the path taken. This module never touches that fallback
-path.
+failure, no cosine floor yet (S85: no calibrated row, and the process-start
+computation has not finished or failed and awaits the next-lull retry), or when
+nothing clears the floor of the path taken. This module never touches that
+fallback path.
 
 This module owns:
   - the semantic candidate-pool builder (active-STATE memories that already

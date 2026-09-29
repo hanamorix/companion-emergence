@@ -61,7 +61,7 @@ def _counting_bootstrap(monkeypatch: pytest.MonkeyPatch, *, fail: bool = False) 
 
 
 # ---------------------------------------------------------------------------
-# The hot path never computes; keyword-only until a floor exists
+# The reply path never computes; keyword-only until a floor exists
 # ---------------------------------------------------------------------------
 
 
@@ -135,7 +135,7 @@ def test_a_calibrated_row_gates_the_cosine_path_without_any_bootstrap(
 
 
 # ---------------------------------------------------------------------------
-# Back-off on failure (injected clock), no per-turn retries
+# Retry at the next lull (activity marker), no per-turn retries
 # ---------------------------------------------------------------------------
 
 
@@ -217,7 +217,7 @@ def test_run_cosine_bootstrap_never_raises(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 # ---------------------------------------------------------------------------
-# The central-cadence job: first lull, once, not while a floor exists
+# The central-cadence job: the next-lull retry path, not while a floor exists
 # ---------------------------------------------------------------------------
 
 

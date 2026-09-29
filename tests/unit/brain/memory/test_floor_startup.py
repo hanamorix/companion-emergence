@@ -726,3 +726,45 @@ def test_the_reranker_id_the_bootstrap_keys_on_is_the_real_providers_model_id(
         else model_tier.model_for_tier(model_tier.TIER_RERANKER)
     )
     assert provider.model_id() == expected
+
+
+def test_an_unrecognised_precision_override_warns_once_not_on_every_call(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    real_get = reranker_mod.tunables.get_tunable
+    monkeypatch.setattr(
+        reranker_mod.tunables,
+        "get_tunable",
+        lambda key, default=None: "fp8" if key == "reranker.precision" else real_get(key, default),
+    )
+    reranker_mod._warned_precisions.clear()  # noqa: SLF001
+
+    with caplog.at_level("WARNING", logger="brain.memory.reranker"):
+        for _ in range(4):
+            assert resolve_reranker_model_id() == model_tier.MODEL_RERANKER_FP16
+
+    warnings = [r for r in caplog.records if "unrecognized reranker.precision" in r.getMessage()]
+    assert len(warnings) == 1
+
+
+def test_start_background_sets_the_startup_flag_before_the_thread_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The cadence job must never win a race against the startup thread: the
+    flag is already set when `start_background` returns, even before the
+    thread has been scheduled."""
+    gate = threading.Event()
+    seen: list[bool] = []
+
+    def _slow(persona_dir, *, activity_marker):
+        gate.wait(5)
+
+    monkeypatch.setattr(floor_startup, "compute_missing_floors", _slow)
+    thread = floor_startup.start_background(tmp_path)
+    try:
+        seen.append(floor_startup.startup_compute_active())
+    finally:
+        gate.set()
+        thread.join(timeout=5)
+
+    assert seen == [True]
