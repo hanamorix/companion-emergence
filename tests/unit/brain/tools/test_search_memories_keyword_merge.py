@@ -428,22 +428,67 @@ def test_the_semantic_hit_stays_in_the_result_when_the_query_holds_a_short_word(
     assert _ids(res2)[0] == sem.id, "the newest result is a semantic one and it is in the results"
 
 
-def test_an_emotion_matching_semantic_hit_is_boosted_over_keyword_hits(
+def test_the_emotion_boost_applies_to_the_whole_merged_list(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Same finding 1, emotion half: the boost applies to the whole merged list,
-    the semantic result included."""
+    """Round-5 finding 1, emotion half, and the base tail: the boost partitions the
+    merged list, so an emotion-matching KEYWORD hit moves ahead of the semantic
+    result, and an emotion-matching semantic result ahead of the keyword hits."""
     ctx = _ctx(tmp_path)
     store = ctx["store"]
-    sem = Memory.create_new(
-        content="deep breathing is easy and calming", memory_type="event", domain="d", emotions={"joy": 8.0}
+    sem = _mem(store, "deep breathing is easy and calming")
+    joyful_kw = Memory.create_new(
+        content=f"{_LONG} (joyful)", memory_type="event", domain="d", importance=1.0, emotions={"joy": 8.0}
     )
-    store.create(sem)
+    store.create(joyful_kw)
     kw = [_mem(store, f"{_LONG} (variant {i})") for i in range(3)]
     _semantic_setup(monkeypatch, store, "quokka is", [(sem, 6.0)])
-    ids = _ids(dispatch("search_memories", {"query": "quokka is", "limit": 3, "emotion": "joy"}, **ctx))
-    assert ids[0] == sem.id
-    assert set(ids[1:]) <= {m.id for m in kw}
+    ids = _ids(dispatch("search_memories", {"query": "quokka is", "limit": 5, "emotion": "joy"}, **ctx))
+    assert ids[0] == joyful_kw.id, "the boost lifts the joyful keyword hit over the semantic result"
+    assert ids[1] == sem.id
+    assert set(ids[2:]) == {m.id for m in kw}
+
+
+def test_lexical_emotion_boost_moves_matching_hits_first_and_keeps_the_rest_in_order(
+    tmp_path: Path,
+) -> None:
+    ctx = _ctx(tmp_path)
+    store = ctx["store"]
+    emotions = ["joy", "grief", "calm", "awe"]
+    by_emotion: dict[str, str] = {}
+    for i, emotion in enumerate(emotions):
+        m = Memory.create_new(
+            content=f"{_LONG} (entry {i})", memory_type="event", domain="d", importance=5.0, emotions={emotion: 1.0}
+        )
+        store.create(m)
+        by_emotion[emotion] = m.id
+    base = _ids(dispatch("search_memories", {"query": "quokka", "mode": "lexical", "limit": 8}, **ctx))
+    assert len(base) == 4
+    last = base[-1]  # whichever ranks last without the boost
+    target = next(e for e, mid in by_emotion.items() if mid == last)
+    ids = _ids(
+        dispatch("search_memories", {"query": "quokka", "mode": "lexical", "limit": 8, "emotion": target}, **ctx)
+    )
+    assert ids[0] == last, "the emotion-matching hit moves first"
+    assert ids[1:] == base[:-1], "the rest keep their relevance order"
+
+
+def test_order_age_sorts_the_whole_candidate_pool_not_the_first_few(tmp_path: Path) -> None:
+    """`order="age"` widens the lexical fetch to CANDIDATE_POOL (today's rule): the
+    newest match wins even when it is the least relevant of 15."""
+    from datetime import UTC, datetime, timedelta  # noqa: PLC0415
+
+    ctx = _ctx(tmp_path)
+    store = ctx["store"]
+    mems = [_mem(store, f"{_LONG} (note {i})", importance=9.0 - 0.5 * i) for i in range(15)]
+    for i, m in enumerate(mems):  # the less relevant, the newer
+        store._conn.execute(  # noqa: SLF001
+            "UPDATE memories SET created_at = ? WHERE id = ?",
+            ((datetime.now(UTC) - timedelta(days=100 - 5 * i)).isoformat(), m.id),
+        )
+    store._conn.commit()  # noqa: SLF001
+    ids = _ids(dispatch("search_memories", {"query": "quokka", "mode": "lexical", "limit": 3, "order": "age"}, **ctx))
+    assert ids == [mems[14].id, mems[13].id, mems[12].id]
 
 
 def test_co_recall_links_the_anchor_to_the_first_results_as_before(tmp_path: Path) -> None:
@@ -476,6 +521,10 @@ def test_the_tools_paragraph_emptiness_words_are_the_words_its_keyword_side_sear
     assert words == {"quokka", "rescue", "lol"}, "3+ character words, no stopword drop, no 1-2 character word"
     kept = split_paragraphs("Quokka rescue\nok\nlol\nAI is", words)
     assert kept == ["Quokka rescue", "lol"], "'ok' and 'AI is' are dropped, exactly as the keyword side would ignore them"
+    # no stopword drop (S99): a paragraph of stopwords the raw query still searches is kept
+    stop = "the and\nquokka rescue"
+    assert tool._keyword_words(stop, tmp_path) == {"the", "and", "quokka", "rescue"}  # noqa: SLF001
+    assert split_paragraphs(stop, tool._keyword_words(stop, tmp_path)) == ["the and", "quokka rescue"]  # noqa: SLF001
 
 
 def test_a_listed_names_words_keep_its_paragraph(tmp_path: Path) -> None:

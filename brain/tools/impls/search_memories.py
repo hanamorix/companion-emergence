@@ -292,9 +292,8 @@ def search_memories(
     ``order`` picks how the MATCHED set (whichever ``mode`` produced it) is
     ordered before the final ``limit`` slice (#231, Planning-signed-off
     option A):
-      - ``"relevance"`` (default): the matched
-        candidates are fetched at ``limit`` and used as-is, in
-        whatever order ``mode`` already ranked them.
+      - ``"relevance"`` (default): the matched candidates are used as-is
+        (sliced to ``limit``), in whatever order ``mode`` already ranked them.
       - ``"age"``: WIDENS the internal fetch to ``CANDIDATE_POOL`` (today 50)
         for BOTH modes — lexical calls ``rank_memories(..., limit=
         CANDIDATE_POOL)``; semantic reranks up to ``CANDIDATE_POOL``
