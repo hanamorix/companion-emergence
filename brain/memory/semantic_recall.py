@@ -48,7 +48,8 @@ This module owns:
     embed for an uncached memory; that bulk-embed job is Stage 2's, off this
     hot path)
   - the query embed (the ONE allowed synchronous in-turn embed, decision 4)
-  - the cosine coarse-cut (cheap pre-filter to `relevance.CANDIDATE_POOL`)
+  - the cosine coarse-cut (cheap pre-filter to `relevance.CANDIDATE_POOL`,
+    filled genuine-first: `genuine_first_coarse_cut`, spec §4, S77)
   - the rerank call (`reranker.build_reranker_provider` +
     `reranker.rerank_for_recall`, its width fitted per message to the
     measured rerank cost on this host) and its no-rerank alternative
@@ -636,8 +637,10 @@ def run_semantic_recall(
     (`build_embedding_provider()` — F1 #259 increment 8: the per-recall
     query embed is transient and is never cached/persisted, so it goes
     straight through the provider with no cache row to write), cosines it
-    against the model_id-scoped candidate pool as a CHEAP COARSE CUT (top-
-    `relevance.CANDIDATE_POOL`), then `rank_and_gate`s the coarse cut:
+    against the model_id-scoped candidate pool as a CHEAP COARSE CUT (the
+    `relevance.CANDIDATE_POOL` best, filled genuine-first: genuine memories
+    by cosine, then monologue-family by cosine, `genuine_first_coarse_cut`),
+    then `rank_and_gate`s the coarse cut:
 
       - reranked path: a cross-encoder rerank of a per-message-width prefix
         (`reranker.rerank_for_recall`, anchors on top, >= 5 real

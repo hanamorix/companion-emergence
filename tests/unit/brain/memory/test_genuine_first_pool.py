@@ -107,6 +107,19 @@ def test_the_pool_is_filled_from_the_scores_not_a_multiplier() -> None:
     assert genuine_first_coarse_cut(scored, pool) == [("g", 0.25), ("f", 0.99)]
 
 
+def test_a_genuine_memory_far_below_every_family_cosine_still_leads_the_pool() -> None:
+    """No hidden multiplier: however low the genuine cosine (near zero, even
+    negative) and however high the family cosines, genuine memories come first."""
+    specs = [(f"f{i}", "monologue_trace", 0.90 - i * 0.001) for i in range(60)]
+    specs += [("g_near_zero", "event", 0.05), ("g_negative", "event", -0.20)]
+    scored, pool = _pool_of(specs)
+
+    ids = [mid for mid, _ in genuine_first_coarse_cut(scored, pool)]
+
+    assert ids[:2] == ["g_near_zero", "g_negative"]
+    assert len(ids) == CANDIDATE_POOL
+
+
 def test_the_family_flag_is_computed_once_per_entry_so_the_scan_stays_one_pass(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -194,3 +207,35 @@ def test_the_tool_pool_holds_the_genuine_memories_despite_a_family_flood(
     assert len(coarse_ids) == CANDIDATE_POOL
     assert coarse_ids[:3] == _ids(genuine)
     assert set(_ids(genuine)) <= set(got)
+
+
+@pytest.mark.parametrize("path", ["cosine", "reranked"])
+def test_with_fifty_genuine_memories_no_family_memory_surfaces_even_above_the_floor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, path: str
+) -> None:
+    """S77's literal consequence, pinned as intended: with >= 50 genuine
+    memories in the pool the family takes no place in it, so a family memory
+    that would clear the floor is not a semantic result (it can still surface
+    through the keyword side)."""
+    store = MemoryStore(tmp_path / "memories.db")
+    genuine_cosines = [0.80 - i * 0.005 for i in range(CANDIDATE_POOL + 2)]
+    genuine, family = _seed(store, monkeypatch, genuine_cosines, [0.95, 0.94, 0.93])
+    _cosine_floor(store, 0.4)
+    _rerank_floor(store, floor=1.0)
+    if path == "cosine":
+        _no_reranker(monkeypatch)
+    else:
+        _warm()
+        scripted = {g.content: 5.0 for g in genuine}
+        scripted.update({f.content: 50.0 for f in family})
+        _install_reranker(monkeypatch, _Recording(scripted))
+    seen = _spy_rank_and_gate(monkeypatch, "brain.memory.semantic_recall")
+
+    result = run_semantic_recall(store, tmp_path, _QUERY)
+
+    (coarse,) = seen
+    coarse_ids = [mid for mid, _ in coarse]
+    assert set(coarse_ids).isdisjoint(_ids(family))
+    assert coarse_ids == _ids(genuine[:CANDIDATE_POOL])
+    assert result is not None and result.path == path
+    assert set(_ids([*result.full, *result.snippet])).isdisjoint(_ids(family))
