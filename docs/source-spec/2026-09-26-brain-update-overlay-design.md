@@ -105,8 +105,11 @@ Behaviour depends on `install_kind`:
      (`python -P <ensurepip/_bundled/pip-*.whl>/pip install --target <overlay>/<commit>
      --no-deps --require-hashes -r <diff>`), then the wheel itself (`--no-deps`). The bundle is
      never written to.
-  3. Import smoke with the overlay first on `sys.path`: `brain.cli`, `brain.bridge.server`,
-     `brain.chat.engine`. Failure → delete `<commit>/`, leave `current.json` untouched.
+  3. Import smoke (`brain.cli`, `brain.bridge.server`, `brain.chat.engine`) in a fresh
+     interpreter with `KINDLED_NO_OVERLAY=1` and the new folder placed where the hook will put
+     it — just before the bundle's site-packages, after the stdlib (#303) — so it sees what the
+     overlay will see once active. The install is built in a `.staging-*` folder; failure →
+     delete it, leave `current.json` untouched.
   4. Write `<commit>/stamp.json` (`commit`, `brain_version`, `bundle_id`, installed-at) and
      swap `current.json` atomically (write temp, `os.replace`). The old `current` becomes
      `previous`; folders other than those two are pruned.
@@ -114,7 +117,8 @@ Behaviour depends on `install_kind`:
   This is #256's request (a thin entry point to the script) and keeps one source-install
   updater.
 - `--revert`: clear `current` (no overlay → the release brain). `--rollback`: make `previous`
-  current (or clear it if there is no previous).
+  current. With no `previous`, rollback reverts to the release brain and keeps the overlay it
+  left as `previous`, so the next prune doesn't delete it.
 - A lock file in the overlay root refuses a second concurrent run.
 - Overlay root: `<KINDLED_HOME>/brain-overlay/` via `brain.paths` (`get_home()`), shared by all
   personas (it holds code, not persona data).
@@ -123,15 +127,17 @@ Behaviour depends on `install_kind`:
 
 `build_python_runtime.sh` writes into the bundled site-packages:
 
-- `_ce_overlay.pth` containing one line: `import _ce_overlay`.
+- `_ce_overlay.pth` containing one line: `import _ce_overlay; _ce_overlay.activate(_ce_overlay.SITE)`.
 - `_ce_overlay.py`: resolves the home directory the same way `brain.paths.get_home()` does
   (`KINDLED_HOME`, then deprecated `NELLBRAIN_HOME`, then platformdirs), reads
-  `brain-overlay/current.json`, and if its `bundle_id` equals this runtime's `bundle-id` file and
-  the folder exists, inserts the overlay folder at the front of `sys.path`.
+  `brain-overlay/current.json`, and if its `bundle_id` equals this runtime's `_ce_bundle_id`
+  file and the folder exists, inserts the overlay folder into `sys.path` **just before the
+  bundle's site-packages** — after the stdlib, so the overlay's packages (and `brain`) win over
+  the bundle's but never shadow the stdlib. `KINDLED_NO_OVERLAY=1` skips it.
 - **Fails open**: any exception → do nothing → the release brain runs. It must stay cheap
   (runs at every interpreter start) and import nothing heavy.
-- `bundle-id`: a file in the runtime root, written at build time: the SHA-256 of the exported
-  requirements plus the brain wheel's version.
+- `_ce_bundle_id`: a file beside the hook in the bundled site-packages, written at build time:
+  the SHA-256 of the exported requirements plus the brain wheel's filename.
 
 Because every launch path (wrapper, services, `pythonw -c` on Windows, the `-P -m` bridge
 spawn) starts the bundled interpreter, the `.pth` activates the overlay for all of them without
