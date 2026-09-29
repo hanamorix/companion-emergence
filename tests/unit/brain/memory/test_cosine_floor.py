@@ -147,12 +147,26 @@ def test_get_cosine_floor_prefers_the_persisted_row_over_the_bootstrap(
     assert store.get_cosine_floor(_EMBEDDER_ID)["floor"] == pytest.approx(0.33)
 
 
-def test_get_cosine_floor_serves_the_never_persisted_bootstrap_on_a_miss(
+def test_get_cosine_floor_never_computes_the_bootstrap_on_a_miss(
+    store: MemoryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S85: the hot-path read only peeks the process cache. With neither a
+    persisted row nor a cached bootstrap it returns None and computes nothing."""
+    monkeypatch.setattr(
+        floor_calibration,
+        "get_cosine_bootstrap_floor",
+        lambda _id: pytest.fail("the hot path computed the bootstrap"),
+    )
+    assert store.get_cosine_floor(_SEP_ID) is None
+
+
+def test_get_cosine_floor_serves_the_never_persisted_bootstrap_once_the_job_computed_it(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     table, _ = _sep_table(relevant=[0.9, 0.85, 0.8], irrelevant=[0.2, 0.1, 0.2])
     monkeypatch.setattr("brain.memory.embeddings.build_embedding_provider", lambda: _SeparableEmbedder(table))
     monkeypatch.setattr(floor_calibration, "get_cosine_bootstrap_floor", _REAL_COSINE_BOOTSTRAP)
+    assert floor_calibration.run_cosine_bootstrap(_SEP_ID, now=0.0) is not None
     floor = store.get_cosine_floor(_SEP_ID)
     assert floor is not None and floor["is_cold_start"] is True and floor["updated_at"] is None
     assert store.get_persisted_cosine_floor(_SEP_ID) is None

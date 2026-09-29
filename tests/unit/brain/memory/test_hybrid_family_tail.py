@@ -341,30 +341,26 @@ def test_a_missing_cosine_floor_keeps_the_reranked_results(
     assert result.tail_scores == {} and result.tail_scale is None
 
 
-def test_a_passive_turn_logs_one_calibration_row_per_scale_each_stamped_with_its_own(
+def test_the_family_tail_writes_no_calibration_row(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """S84: a reranked turn with a cosine tail logs ONLY its 'normalized' row.
+    The daily cosine fit trains on no-rerank-path rows, never on a family-only
+    sample (diagnostics, R7, still record the tail)."""
     store, genuine, family, rec = _first_rerank_case(monkeypatch, tmp_path, cosine_floor=0.5)
 
-    run_semantic_recall(store, tmp_path, _QUERY)
+    result = run_semantic_recall(store, tmp_path, _QUERY)
 
+    assert result is not None and set(result.tail_scores) == set(_ids(family[2:])), "tail examined"
     rows = _cal_rows(store)
-    assert [r["score_scale"] for r in rows] == ["normalized", COSINE_SCORE_SCALE]
+    assert [r["score_scale"] for r in rows] == ["normalized"]
     normalized_ids = json.loads(rows[0]["candidate_ids"])
-    cosine_ids = json.loads(rows[1]["candidate_ids"])
     assert set(normalized_ids) == set(_ids(genuine) + _ids(family[:2]))
-    assert cosine_ids == _ids(family[2:6]), "the unreranked family, in cosine order"
-    assert set(normalized_ids).isdisjoint(cosine_ids), "each candidate logged on one scale only"
+    assert set(normalized_ids).isdisjoint(_ids(family[2:])), "no tail candidate is logged anywhere"
     stamped = store._conn.execute(  # noqa: SLF001
-        "SELECT reranker_model_id, reranker_scores FROM calibration_log ORDER BY id"
+        "SELECT reranker_model_id FROM calibration_log"
     ).fetchall()
-    assert stamped[0]["reranker_model_id"] == "fake-reranker"
-    assert stamped[1]["reranker_model_id"] == "r3-test-embedder", (
-        "the embedder id, as on the cosine path"
-    )
-    assert json.loads(stamped[1]["reranker_scores"]) == pytest.approx(
-        [0.97, 0.96, 0.95, 0.94], abs=1e-5
-    ), "raw cosines"
+    assert [r["reranker_model_id"] for r in stamped] == ["fake-reranker"]
 
 
 # ---------------------------------------------------------------------------

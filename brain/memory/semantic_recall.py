@@ -32,7 +32,9 @@ exist, the reranker fails to load or score, or its anchor normalization has
 no median, the turn takes the NO-RERANK path: the coarse cut's candidates are
 ranked by cosine and gated by a COSINE floor (`MemoryStore.get_cosine_floor`,
 its own table, bootstrapped from the same bundled pairs until the daily tick
-calibrates it). A reranker failure therefore no longer demotes the turn to
+calibrates it; the bootstrap is computed once per process by the central
+cadence job in the first lull, never on this hot path: until a cosine floor
+exists this path renders keyword results only, S85). A reranker failure therefore no longer demotes the turn to
 keyword-only. The two scales never mix: a reranked candidate is gated by the
 normalized rerank floor, a cosine-path candidate by the cosine floor, and each
 path's calibration row carries its own true scale. (Spec §4, S82: a reranked
@@ -42,8 +44,8 @@ paragraph can then yield results on both scales, each gated only by its own
 floor.) The module returns `None`
 (the caller falls through UNCHANGED to the existing lexical/blend retrieval)
 only for an empty/sparse pool (cold-start "graceful warm-up"), an embed
-failure, a cosine bootstrap failure (no gate is possible), or when nothing
-clears the floor of the path taken. This module never touches that fallback
+failure, no cosine floor yet (S85: no calibrated row and the cadence job has not
+produced the bootstrap), or when nothing clears the floor of the path taken. This module never touches that fallback
 path.
 
 This module owns:
@@ -623,7 +625,6 @@ def _reranked_ranking(
             coarse,
             set(scored_ids),
             embedder_model_id=embedder_model_id,
-            log_calibration=log_calibration,
         )
     return GatedRanking(
         path=RERANKED_PATH,
@@ -642,13 +643,13 @@ def _cosine_tail(
     reranked_ids: set[str],
     *,
     embedder_model_id: str,
-    log_calibration: bool,
 ) -> GatedRanking | None:
     """The cosine tail of a reranked paragraph (spec §4, S82): the
     monologue-family candidates of `coarse` that got no rerank slot, ranked by
-    cosine and gated by the COSINE floor, on the cosine scale, exactly as the
-    cosine path treats them (`_cosine_ranking`: one calibration row of the
-    examined candidates, scale 'cosine', passive recall only). Unreranked
+    cosine and gated by the COSINE floor, on the cosine scale, ranked through
+    `_cosine_ranking` but WRITING NO calibration row (S84: the daily cosine fit
+    trains only on no-rerank-path rows, never on a family-only sample;
+    diagnostics still record the tail). Unreranked
     GENUINE candidates are not part of the tail (S53: candidates beyond the
     width are dropped). `None` when there is no such candidate (the cosine
     floor is then not even read) or the cosine floor cannot be had; fail-soft:
@@ -667,7 +668,7 @@ def _cosine_tail(
             pool,
             unreranked_family,
             embedder_model_id=embedder_model_id,
-            log_calibration=log_calibration,
+            log_calibration=False,
         )
     except Exception:  # noqa: BLE001 — fail-soft: the reranked results stand without the tail
         log.warning("semantic recall: cosine tail failed — reranked results only", exc_info=True)
@@ -686,9 +687,11 @@ def _cosine_ranking(
     """The no-rerank (cosine) path (spec §2, S5/S6/S22/S25/S60): the coarse
     cut's candidates ranked genuine-first then monologue-family, each by
     cosine (R3, spec §4), gated by the cosine floor
-    (`store.get_cosine_floor`: persisted, else the bootstrap). `None` when no
-    cosine gate can be had (the bootstrap failed): the turn then contributes
-    no semantic results, never an ungated ranking.
+    (`store.get_cosine_floor`: persisted, else the bootstrap the central
+    cadence job computed off the hot path, S85). `None` when no cosine gate
+    exists yet (no calibrated row and the job has not produced the bootstrap,
+    or it failed and is backing off): the turn then contributes no semantic
+    results (keyword only), never an ungated ranking.
 
     Passive recall (`log_calibration`) writes ONE calibration row: the first
     `MAX_STANDOUT_COUNT` (9, the semantic cap) candidates in the path's own
@@ -715,9 +718,9 @@ def _cosine_ranking(
         )
         return None
     if floor_row is None:
-        log.info(
-            "semantic recall: no cosine floor available (bootstrap failed) for %s — "
-            "no semantic results",
+        log.debug(
+            "semantic recall: no cosine floor yet for %s (no calibrated row, and the cadence "
+            "job has not produced the bootstrap) — keyword only",
             embedder_model_id,
         )
         return None
@@ -755,10 +758,9 @@ def rank_and_gate(
     only, S56) writes the turn's calibration row on whichever path ran.
 
     A reranked ranking also carries the cosine tail (spec §4, S82) of its
-    unreranked monologue-family candidates (`GatedRanking.tail`); its
-    calibration row (scale 'cosine') is written too, so one passive turn may
-    log a 'normalized' row and a 'cosine' row, each stamped with its own
-    scale."""
+    unreranked monologue-family candidates (`GatedRanking.tail`); the tail
+    writes NO calibration row (S84), so a reranked turn logs only its
+    'normalized' row."""
     # R3 (spec §4): genuine candidates are taken first for the rerank prefix.
     coarse_ids = genuine_first([mid for mid, _ in coarse], pool)
     gated = _reranked_ranking(
@@ -810,10 +812,10 @@ def run_semantic_recall(
         the cosine floor (`store.get_cosine_floor`). Not keyword-only.
 
     Passive recall logs the turn's calibration row(s), each stamped with its
-    own true scale (a reranked turn logs the `normalized` row, plus a
-    `cosine` row when its cosine tail has candidates, spec §4 S82; a turn
-    whose rerank scored but whose rerank floor was unavailable logs the
-    `normalized` row, then the cosine path's `cosine` row), and floor-gates
+    own true scale (a reranked turn logs only the `normalized` row: its
+    cosine tail, spec §4 S82, writes none, S84; a turn whose rerank scored but
+    whose rerank floor was unavailable logs the `normalized` row, then the
+    cosine path's `cosine` row), and floor-gates
     through `select_gated_standouts` (each result by its own scale's floor).
 
     Returns a populated `SemanticRecallResult` ONLY when at least one
@@ -822,8 +824,9 @@ def run_semantic_recall(
       - nothing clears the floor,
       - an empty or sparse candidate pool (cold-start / idle backfill not
         caught up — "graceful warm-up"),
-      - an embed failure, or a failed cosine bootstrap on the cosine path
-        (no gate is possible; never an ungated ranking),
+      - an embed failure, or no cosine floor yet on the cosine path (the
+        bootstrap not computed yet or backing off after a failure: no gate is
+        possible; never an ungated ranking),
       - ANY failure ANYWHERE in this function (fail-soft: a broken/missing
         local model, a transient store error such as a locked sqlite db
         during the background backfill, or a floor-read error must never

@@ -59,12 +59,15 @@ from brain.bridge import background_jobs, cli_throttle, persisted_cadence
 logger = logging.getLogger(__name__)
 
 # S55 order, with deploy recalibration (S70/S73) immediately before daily
-# calibration. Names are the job table's keys and the log's `job=` values.
+# calibration and, after embedding backfill, the once-per-process cosine floor
+# bootstrap (name-recall fix S85; it needs the embedder, off the recall hot
+# path). Names are the job table's keys and the log's `job=` values.
 GATED_JOB_ORDER: tuple[str, ...] = (
     "pass2",
     "session_snapshot_prune",
     "emotion_backfill",
     "embedding_backfill",
+    "cosine_floor_bootstrap",
     "maintenance",
     "interest_sweep",
     "self_model_articulation",

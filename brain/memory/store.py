@@ -1734,13 +1734,15 @@ class MemoryStore:
 
         The PERSISTED `cosine_floor_calibration` row first (written by the
         daily tick, `floor_calibration.derive_and_persist_cosine_floor`); if
-        none exists yet, a derived, process-cached BOOTSTRAP
-        (`floor_calibration.get_cosine_bootstrap_floor`: the same F-beta fit
-        over the same bundled example pairs the rerank floor bootstraps
-        from, scored by this embedder), never persisted. `None` only when
-        that bootstrap itself failed: the caller then has no cosine gate and
-        the turn contributes no semantic results (keyword only), never an
-        ungated cosine ranking.
+        none exists yet, the process-cached BOOTSTRAP the central cadence job
+        computed (`floor_calibration.run_cosine_bootstrap`: the same F-beta
+        fit over the same bundled example pairs the rerank floor bootstraps
+        from, scored by this embedder), never persisted. This method NEVER
+        computes the bootstrap (name-recall fix S85: no hot-path compute): it
+        returns `None` while neither a persisted row nor the cached bootstrap
+        exists (the job has not run yet, or it failed and is backing off). The
+        caller then has no cosine gate and the turn contributes no semantic
+        results (keyword only), never an ungated cosine ranking.
 
         Read-only: does not write or bump anything.
         """
@@ -1749,7 +1751,9 @@ class MemoryStore:
             return persisted
         from brain.memory import floor_calibration
 
-        return floor_calibration.get_cosine_bootstrap_floor(embedder_model_id)
+        # S85: the hot path only PEEKS the process cache; the bootstrap is
+        # computed by the central cadence job in the first lull.
+        return floor_calibration.peek_cosine_bootstrap_floor(embedder_model_id)
 
     def write_cosine_floor(
         self,

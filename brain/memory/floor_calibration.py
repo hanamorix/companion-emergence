@@ -109,6 +109,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -498,6 +499,13 @@ def _reset_bootstrap_floor_cache() -> None:
 # Process-wide cache keyed by embedder model id, computed ONCE, never
 # persisted (the daily tick's `derive_and_persist_cosine_floor` supersedes it
 # for good once it writes a row).
+#
+# Name-recall fix S85 (spec §2): the bootstrap is NEVER computed on the recall
+# hot path. `MemoryStore.get_cosine_floor` only PEEKS the cache
+# (`peek_cosine_bootstrap_floor`); the bridge's central cadence function runs
+# `run_cosine_bootstrap` once per process in the first lull, with bounded
+# exponential back-off on failure. Until a cosine floor exists (bootstrap or
+# calibrated) the no-rerank path renders keyword results only.
 # ---------------------------------------------------------------------------
 
 _cosine_bootstrap_floor_cache: dict[str, dict[str, Any]] = {}
@@ -517,13 +525,82 @@ def _cosine_bootstrap_pairs(embedder: Any) -> list[tuple[float, str]]:
     return list(zip(scores, _BOOTSTRAP_LABELS, strict=True))
 
 
+# Bounded exponential back-off after a failed bootstrap (S85): the first retry
+# after 60 s, doubling per consecutive failure, capped at one hour. Operational
+# retry cadence, not a scoring value.
+COSINE_BOOTSTRAP_BACKOFF_INITIAL_S = 60.0
+COSINE_BOOTSTRAP_BACKOFF_MAX_S = 3600.0
+
+# embedder id -> (consecutive failures, earliest next attempt on the caller's
+# clock). Guarded by `_cosine_bootstrap_floor_cache_lock`.
+_cosine_bootstrap_backoff: dict[str, tuple[int, float]] = {}
+
+
+def peek_cosine_bootstrap_floor(embedder_model_id: str) -> dict[str, Any] | None:
+    """The cached cosine bootstrap floor for `embedder_model_id`, or `None`
+    when it has not been computed in this process. NEVER computes anything
+    (S85): this is what the recall hot path reads through
+    `MemoryStore.get_cosine_floor`."""
+    cached = _cosine_bootstrap_floor_cache.get(embedder_model_id)
+    return dict(cached) if cached is not None else None
+
+
+def cosine_bootstrap_due(embedder_model_id: str, *, now: float | None = None) -> bool:
+    """True when the bootstrap for `embedder_model_id` is not cached and its
+    back-off (if any) has elapsed. `now` is the caller's monotonic clock
+    (injectable; default `time.monotonic()`)."""
+    if peek_cosine_bootstrap_floor(embedder_model_id) is not None:
+        return False
+    when = time.monotonic() if now is None else now
+    with _cosine_bootstrap_floor_cache_lock:
+        state = _cosine_bootstrap_backoff.get(embedder_model_id)
+    return state is None or when >= state[1]
+
+
+def run_cosine_bootstrap(embedder_model_id: str, *, now: float | None = None) -> dict[str, Any] | None:
+    """Compute the cosine bootstrap floor once (the cadence job's body, S85).
+
+    Success caches the floor for the process and clears any back-off. Failure
+    (`get_cosine_bootstrap_floor` returned `None`) records the next allowed
+    attempt at `now + min(INITIAL * 2 ** (failures - 1), MAX)`; nothing calls
+    this before then (`cosine_bootstrap_due`), so a failing bootstrap costs
+    one attempt per back-off window, never one per turn. Never raises."""
+    when = time.monotonic() if now is None else now
+    try:
+        result = get_cosine_bootstrap_floor(embedder_model_id)
+    except Exception:  # noqa: BLE001 — a cadence job must never raise into the pass
+        logger.exception("floor_calibration: cosine bootstrap raised for %s", embedder_model_id)
+        result = None
+    with _cosine_bootstrap_floor_cache_lock:
+        if result is not None:
+            _cosine_bootstrap_backoff.pop(embedder_model_id, None)
+            return result
+        failures = _cosine_bootstrap_backoff.get(embedder_model_id, (0, 0.0))[0] + 1
+        delay = min(
+            COSINE_BOOTSTRAP_BACKOFF_INITIAL_S * 2 ** (failures - 1),
+            COSINE_BOOTSTRAP_BACKOFF_MAX_S,
+        )
+        _cosine_bootstrap_backoff[embedder_model_id] = (failures, when + delay)
+    logger.warning(
+        "floor_calibration: cosine bootstrap failed for %s (attempt %d); the no-rerank path "
+        "stays keyword-only, next attempt in %.0f s",
+        embedder_model_id,
+        failures,
+        delay,
+    )
+    return None
+
+
 def get_cosine_bootstrap_floor(embedder_model_id: str) -> dict[str, Any] | None:
-    """Derived DEFAULT cosine floor for `embedder_model_id`, served by
-    `MemoryStore.get_cosine_floor` while no persisted `cosine_floor_
-    calibration` row exists (spec §2, S18: "until a calibrated cosine floor
-    exists, a starting value is computed with the same F-beta fit over the
-    same bundled example pairs"). Same dict shape as `get_bootstrap_floor`,
-    with `embedder_model_id` in place of `reranker_model_id`.
+    """COMPUTE the derived DEFAULT cosine floor for `embedder_model_id` and
+    cache it (spec §2, S18: "until a calibrated cosine floor exists, a starting
+    value is computed with the same F-beta fit over the same bundled example
+    pairs"). Same dict shape as `get_bootstrap_floor`, with `embedder_model_id`
+    in place of `reranker_model_id`.
+
+    OFF THE HOT PATH ONLY (S85): the only caller is `run_cosine_bootstrap`,
+    the central-cadence job; `MemoryStore.get_cosine_floor` reads the cache
+    through `peek_cosine_bootstrap_floor` and never calls this.
 
     The embedder is the process-cached production provider
     (`embeddings.build_embedding_provider()`, looked up through the module so
@@ -531,9 +608,10 @@ def get_cosine_bootstrap_floor(embedder_model_id: str) -> dict[str, Any] | None:
     requested id: a floor fit under one embedder is never served for another.
 
     FAIL-SOFT: any failure (provider build/embed error, id mismatch,
-    degenerate pairs) is logged and returns `None` (never cached, so a later
-    call retries); the caller then has no cosine gate and the turn renders
-    keyword results only (spec §2 bullet 3). Never an ungated cosine ranking.
+    degenerate pairs) is logged and returns `None` (never cached;
+    `run_cosine_bootstrap` backs off before the next attempt); until a floor
+    exists the no-rerank path renders keyword results only (spec §2). Never an
+    ungated cosine ranking.
     """
     cached = _cosine_bootstrap_floor_cache.get(embedder_model_id)
     if cached is not None:
@@ -561,7 +639,7 @@ def get_cosine_bootstrap_floor(embedder_model_id: str) -> dict[str, Any] | None:
         except Exception:  # noqa: BLE001 — fail-soft: must never break a recall
             logger.exception(
                 "floor_calibration: cosine bootstrap floor computation failed for %s -> "
-                "no cosine gate this turn (keyword-only)",
+                "no cosine gate (the no-rerank path stays keyword-only)",
                 embedder_model_id,
             )
             return None
@@ -582,6 +660,7 @@ def _reset_cosine_bootstrap_floor_cache() -> None:
     `tests/conftest.py` next to `_reset_bootstrap_floor_cache`."""
     with _cosine_bootstrap_floor_cache_lock:
         _cosine_bootstrap_floor_cache.clear()
+        _cosine_bootstrap_backoff.clear()
 
 
 # ---------------------------------------------------------------------------
