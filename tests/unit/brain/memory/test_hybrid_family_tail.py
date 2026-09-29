@@ -116,10 +116,10 @@ def test_an_unreranked_family_memory_below_the_cosine_floor_does_not_surface(
 def test_each_result_is_gated_only_by_its_own_scales_floor_never_the_other(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """No cross-scale comparison: (a) a tail cosine (0.97) far above the rerank
-    floor's number (1.0 is > 0.97, so use a rerank floor of 0.1) but below the
-    cosine floor 0.99 is NOT admitted; (b) a rerank floor no reranked score
-    reaches is covered by its own test below."""
+    """No cross-scale comparison: tail cosines (0.97 and below) pass the rerank
+    floor's NUMBER (0.1) but not the cosine floor (0.99), so they are not
+    admitted. The opposite case (a rerank floor nothing reranked reaches) is
+    the next test."""
     store, genuine, family, rec = _first_rerank_case(monkeypatch, tmp_path, cosine_floor=0.99)
     _rerank_floor(store, floor=0.1)
 
@@ -324,6 +324,21 @@ def test_a_cosine_floor_failure_keeps_the_reranked_results(
     assert result is not None and result.path == RERANKED_PATH
     assert _ids([*result.full, *result.snippet]) == _ids(reversed(genuine)) + _ids(family[:2])
     assert result.tail_scores == {}
+
+
+def test_a_missing_cosine_floor_keeps_the_reranked_results(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`get_cosine_floor` returning None (the bootstrap failed) is a tail
+    without a gate: no tail, the reranked results stand."""
+    store, genuine, family, rec = _first_rerank_case(monkeypatch, tmp_path, cosine_floor=0.5)
+    monkeypatch.setattr(store, "get_cosine_floor", lambda model_id: None)
+
+    result = run_semantic_recall(store, tmp_path, _QUERY)
+
+    assert result is not None and result.path == RERANKED_PATH
+    assert _ids([*result.full, *result.snippet]) == _ids(reversed(genuine)) + _ids(family[:2])
+    assert result.tail_scores == {} and result.tail_scale is None
 
 
 def test_a_passive_turn_logs_one_calibration_row_per_scale_each_stamped_with_its_own(

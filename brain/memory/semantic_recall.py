@@ -35,7 +35,11 @@ its own table, bootstrapped from the same bundled pairs until the daily tick
 calibrates it). A reranker failure therefore no longer demotes the turn to
 keyword-only. The two scales never mix: a reranked candidate is gated by the
 normalized rerank floor, a cosine-path candidate by the cosine floor, and each
-path's calibration row carries its own true scale. The module returns `None`
+path's calibration row carries its own true scale. (Spec §4, S82: a reranked
+paragraph's monologue-family candidates that got no rerank slot form a cosine
+TAIL, gated by the cosine floor and ranked after its reranked results; a
+paragraph can then yield results on both scales, each gated only by its own
+floor.) The module returns `None`
 (the caller falls through UNCHANGED to the existing lexical/blend retrieval)
 only for an empty/sparse pool (cold-start "graceful warm-up"), an embed
 failure, a cosine bootstrap failure (no gate is possible), or when nothing
