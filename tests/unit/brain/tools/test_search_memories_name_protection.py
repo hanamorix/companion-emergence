@@ -366,8 +366,9 @@ def _will_world(persona: Path):
 
 
 def test_lexical_name_and_query_hits_lead_then_name_only_then_general(tmp_path: Path) -> None:
-    # 'will' is a 4-letter word the tool DOES send (S81), so the general search finds every Will
-    # memory too; use the 2-letter name 'al' to get a true name-only group (a tier-2 short word).
+    # The tool sends every word (S81), so its general search (tier 1 + tier 2) also finds
+    # every 'Al' memory through the short-word tier: here group 1 holds A and B1, group 3 C.
+    # A true name-only group is covered by the unit tests of `lead_with_names`.
     persona = tmp_path / "listed"
     ctx = _ctx(persona)
     store = ctx["store"]
@@ -406,3 +407,21 @@ def test_semantic_the_same_order_holds_behind_the_semantic_results(
     _semantic_setup(monkeypatch, store, query, [(sem, 6.0)])
     ids = _ids(dispatch("search_memories", {"query": query, "limit": 8}, **ctx))
     assert ids == [sem.id, a.id, b1.id, c.id]
+
+
+def test_a_name_plus_query_hit_found_only_through_tier_two_still_leads(tmp_path: Path) -> None:
+    """Name ('al') and the rest of the query ('ai') are both 2-letter words, so
+    the tool's general search reaches everything through tier 2 only. S89's
+    'general search' counts tier 2: 60 name-only memories must not crowd out the
+    memory matching both."""
+    persona = tmp_path / "listed"
+    ctx = _ctx(persona)
+    store = ctx["store"]
+    target = _mem(
+        store,
+        "Al built an AI notebook about tide tables and kept it on the boat all through the long wet autumn season",
+    )
+    for i in range(60):
+        _mem(store, f"Al chased the ball, walk {i}")
+    _list(persona, "Al")
+    assert _ids(_lexical(ctx, "al ai", limit=5))[0] == target.id

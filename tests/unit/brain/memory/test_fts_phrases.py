@@ -205,3 +205,11 @@ def test_lead_with_names_trusts_the_name_query_where_the_text_matcher_cannot_see
     other = _m(store, "thirty pounds of gravel")
     out = relevance.lead_with_names([name_only, accented], [other, accented], ["jose"])
     assert [m.id for m in out] == [accented.id, name_only.id, other.id]
+
+
+def test_lead_with_names_text_match_respects_word_boundaries() -> None:
+    store = MemoryStore(":memory:")
+    also = _m(store, "also fine, nothing to do with anyone")  # contains 'al' only inside 'also'
+    name_only = _m(store, "Al waved from the pier")
+    out = relevance.lead_with_names([name_only], [also], ["al"])
+    assert [m.id for m in out] == [name_only.id, also.id], "a substring is not a match"

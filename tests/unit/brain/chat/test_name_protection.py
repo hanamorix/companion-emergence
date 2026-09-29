@@ -443,6 +443,18 @@ def test_a_word_only_part_of_a_listed_name_elsewhere_in_the_message_is_still_lis
     # "new york" is listed but the message says "glimmer new": no match, so 'glimmer' is unknown as usual
     _, block = _twin(tmp_path, "listed", "glimmer new zorblax", list_names=["New York"])
     assert "glimmer" in _not_recognised(block)
+    # "york" alone (df 0) while "new york" is listed but does not match: an ordinary unknown word
+    _, block2 = _twin(tmp_path, "york", "york vexillum", list_names=["New York"])
+    assert "york" in _not_recognised(block2)
+
+
+def test_every_word_of_a_matched_multi_word_name_is_excluded_not_only_the_first(tmp_path: Path) -> None:
+    # 'harbour' is in the store (df > 0); 'blorpville' is not, and is the SECOND word
+    _, before = _twin(tmp_path, "empty", "harbour blorpville vexillum")
+    assert "blorpville" in _not_recognised(before), "precondition"
+    _, after = _twin(tmp_path, "listed", "harbour blorpville vexillum", list_names=["Harbour Blorpville"])
+    assert "blorpville" not in _not_recognised(after)
+    assert "vexillum" in _not_recognised(after)
 
 
 # --------------------------------------------------------------------------
@@ -675,3 +687,30 @@ def test_a_general_hit_holding_the_name_leads_even_beyond_the_name_querys_window
     w2 = _many_pretzels(p2, n=80)
     _list_names(p2, "Pretzel")
     assert _ids(_render(w2, message, p2, limit=2))[0] == w2.target.id, "also with a tiny render limit"
+
+
+def _tier_two_world(persona: Path, n: int = 60):
+    """A name ('al') and the rest of the message ('ai') are BOTH 2-letter words,
+    so the general search reaches everything through tier 2 only (tier 1's raw
+    string drops both): the S89 'general search' must count tier 2."""
+    persist_felt_time(FeltTimeState(lived_age_hours=48.0), persona)
+    store = MemoryStore(":memory:")
+    target = _mem(
+        store,
+        "Al built an AI notebook about tide tables and kept it on the boat all through the long wet autumn season",
+    )
+    others = [_mem(store, f"Al chased the ball, walk {i}") for i in range(n)]
+    return SimpleNamespace(store=store, target=target, others=others)
+
+
+def test_a_name_plus_message_hit_found_only_through_tier_two_still_leads(tmp_path: Path) -> None:
+    """The reading of S89's 'general search' = tier 1 AND tier 2 (the brief said
+    tier 1): a memory matching the name and another short word of the message is
+    found by the general search only through tier 2, and must not be crowded out
+    by 60 name-only memories."""
+    p = tmp_path / "p"
+    p.mkdir()
+    w = _tier_two_world(p)
+    _list_names(p, "Al")
+    ids = _ids(_render(w, "al ai", p))
+    assert ids[0] == w.target.id
