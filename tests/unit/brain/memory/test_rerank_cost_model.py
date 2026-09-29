@@ -784,15 +784,18 @@ def test_conc1_able_to_fail_without_the_lock(monkeypatch: pytest.MonkeyPatch) ->
 
 
 # ---------------------------------------------------------------------------
-# ADV-9 (advisory; owner input for the PARKED Q15 / F10): the absorbing state.
+# The absorbing state that S100's re-measure job recovers from (its recovery
+# is `test_rerank_recovery.py`, criterion C15f).
 # ---------------------------------------------------------------------------
 
 
-def test_adv9_inflated_first_sample_is_absorbing_until_restart(clock: _Clock) -> None:
-    """Demonstration, not a requirement: one inflated measurement makes every
-    later message hand off ("budget") with no rerank, so no new measurement
-    is ever taken and the estimate never moves. No recovery rule is built
-    (PARKED for the owner); this test changes when he rules."""
+def test_inflated_first_sample_absorbs_every_message_without_the_remeasure_job(
+    clock: _Clock,
+) -> None:
+    """One inflated measurement makes every later message hand off ("budget")
+    with no rerank, so messages alone never take a new measurement and the
+    estimate never moves; only the lull re-measure job (S100) or the next
+    compaction period (S101/S114) changes it."""
     reranker_mod._record_rerank_cost(_MODEL, 100, 1_000.0, None)  # 10 s per token
     before = reranker_mod._cost_sums[_MODEL]
     provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-9)  # the host is actually fast
