@@ -146,3 +146,62 @@ def test_names_in_is_fail_soft(tmp_path: Path) -> None:
     kn.admit_names(tmp_path, ["Pretzel"], "tool")
     with patch.object(relevance, "load_known_names", side_effect=RuntimeError("boom")):
         assert names_in(tmp_path, "pretzel") == []
+
+
+# --------------------------------------------------------------------------
+# lead_with_names (S89)
+# --------------------------------------------------------------------------
+
+
+def _m(store: MemoryStore, content: str) -> Memory:
+    return _mem(store, content)
+
+
+def test_lead_with_names_orders_both_then_name_only_then_general() -> None:
+    store = MemoryStore(":memory:")
+    both = _m(store, "Pretzel weighs thirty pounds")
+    name_only = _m(store, "Pretzel chased the ball")
+    general_only = _m(store, "thirty pounds of gravel")
+    out = relevance.lead_with_names(
+        [name_only, both], [general_only, both], ["pretzel"]
+    )
+    assert [m.id for m in out] == [both.id, name_only.id, general_only.id]
+
+
+def test_lead_with_names_decides_membership_from_the_hit_not_the_name_window() -> None:
+    store = MemoryStore(":memory:")
+    holds_name = _m(store, "Pretzel weighs thirty pounds")  # NOT in the (truncated) name hits
+    name_only = _m(store, "Pretzel chased the ball")
+    other = _m(store, "thirty pounds of gravel")
+    out = relevance.lead_with_names([name_only], [other, holds_name], ["pretzel"])
+    assert [m.id for m in out] == [holds_name.id, name_only.id, other.id]
+
+
+def test_lead_with_names_matches_a_multi_word_name_only_as_consecutive_words() -> None:
+    store = MemoryStore(":memory:")
+    ny = _m(store, "moved to New York in spring")
+    split = _m(store, "a new dress and a York postcard")
+    name_hit = _m(store, "New York is loud")
+    out = relevance.lead_with_names([name_hit], [split, ny], ["new york"])
+    assert [m.id for m in out] == [ny.id, name_hit.id, split.id]
+
+
+def test_lead_with_names_is_the_identity_without_names_or_name_hits_and_dedups() -> None:
+    store = MemoryStore(":memory:")
+    a = _m(store, "Pretzel one")
+    b = _m(store, "Two things")
+    assert [m.id for m in relevance.lead_with_names([], [b, a], ["pretzel"])] == [b.id, a.id]
+    assert [m.id for m in relevance.lead_with_names([a], [b, a], [])] == [b.id, a.id]
+    out = relevance.lead_with_names([a, a], [a, b, a], ["pretzel"])
+    assert [m.id for m in out] == [a.id, b.id]
+
+
+def test_lead_with_names_trusts_the_name_query_where_the_text_matcher_cannot_see_the_match() -> None:
+    """The FTS tokenizer folds accents ("Jose" matches "José"); the ASCII text
+    matcher does not. A general hit the name query returned is a name hit either way."""
+    store = MemoryStore(":memory:")
+    accented = _m(store, "José weighs thirty pounds")
+    name_only = _m(store, "Jose chased the ball")
+    other = _m(store, "thirty pounds of gravel")
+    out = relevance.lead_with_names([name_only, accented], [other, accented], ["jose"])
+    assert [m.id for m in out] == [accented.id, name_only.id, other.id]

@@ -13,6 +13,7 @@ from brain.memory.embeddings import cosine_similarity
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.relevance import (
     CANDIDATE_POOL,
+    lead_with_names,
     names_in,
     rank_memories,
     rank_name_hits,
@@ -123,8 +124,9 @@ def _keyword_candidates(
     Name protection (R5, spec §5, S27, S35, S79), BOTH modes: the known names
     in her query (matched on the raw words, before any stopword or length rule;
     ``persona_dir`` locates the list) run ONE extra keyword query, sent as FTS
-    phrases; its hits lead this list, ahead of tier 1 and tier 2 (genuine before
-    monologue family across all of them, spec §4). No graveyard is involved
+    phrases; its hits lead this list (S89: those the general search, tier 1 and
+    tier 2, also found first, then name-only hits, then the general hits;
+    genuine before monologue family across all of them, spec §4). No graveyard is involved
     here. Every word of her query is still searched (S81), so a listed name is
     protected in rank, not merely found.
     """
@@ -144,13 +146,15 @@ def _keyword_candidates(
         )
         tiers.append([m for m, _ in ranked])
     seen: set[str] = set()
-    merged: list[Memory] = []
-    for tier in (name_hits, *tiers):
+    general: list[Memory] = []
+    for tier in tiers:
         for m in tier:
             if m.id not in seen:
                 seen.add(m.id)
-                merged.append(m)
-    hits = _KeywordHits(genuine_first_memories(merged))
+                general.append(m)
+    # S89: name hits the general search also found first, then name-only hits,
+    # then the general hits; the family after every genuine hit (spec §4).
+    hits = _KeywordHits(genuine_first_memories(lead_with_names(name_hits, general, names)))
     if len(tiers) == 2:
         hits.tier2_only = (
             frozenset(m.id for m in tiers[1])

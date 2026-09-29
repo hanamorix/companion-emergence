@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from brain.dev_constants import MONOLOGUE_FAMILY_TYPES
-from brain.memory.known_names import load_known_names, match_known_names
+from brain.memory.known_names import KnownNames, load_known_names, match_known_names
 from brain.memory.store import FtsPhrases
 
 logger = logging.getLogger(__name__)
@@ -259,10 +259,10 @@ def rank_name_hits(
     every other keyword search (``rank_memories``: BM25 + importance + hebbian +
     recency), over the matched names sent as FTS PHRASES (each name is one
     quoted phrase, no length floor, ORed), active and fading memories, the
-    monologue family after every genuine hit. The caller ranks these hits ahead
-    of the general keyword hits (FTS5 cannot weight one term above another, so
-    a frequently mentioned name would otherwise be out-ranked by one rare
-    word). It does NOT touch the lost-memory (graveyard) search: passive recall
+    monologue family after every genuine hit. The caller leads the keyword hits
+    with them (`lead_with_names`, S89), because FTS5 cannot weight one term
+    above another and a frequently mentioned name would otherwise be
+    out-ranked by one rare word. It does NOT touch the lost-memory (graveyard) search: passive recall
     feeds that only the legacy capped token set until the owner rules on the
     graveyard widening (F11, plan P-14/P-25).
 
@@ -279,3 +279,46 @@ def rank_name_hits(
         include_fading=True,
         genuine_first=True,
     )
+
+
+def lead_with_names(
+    name_hits: Sequence[Memory], general_hits: Sequence[Memory], names: Sequence[str]
+) -> list[Memory]:
+    """Order the keyword hits: the name query's lead, without letting name-only
+    memories crowd out the ones that match the rest of the message too.
+
+    Name-recall fix R5 follow-up (spec section 5, S89, derived from S27/S79/S40).
+    Three groups, each in its own order, each memory once:
+
+    1. general hits that also match a name (the memory matches the name AND the
+       rest of the message), in the general search's order;
+    2. name-only hits, in the name query's order;
+    3. the remaining general hits, in the general search's order.
+
+    So a name that matches a great many memories cannot push out a memory
+    matching the name and the message's other words, while the name still
+    outranks every general hit that does not match it. ``general_hits`` is the
+    whole general keyword search in its final order (tier 1, then tier 2).
+    "Also matches a name" is decided per general hit, not by the name query's
+    ranked window (which a name with many memories would truncate): the hit is
+    in the name query's result OR its text holds a matched name as consecutive
+    words (the matcher's own rule). No names, or a name query with no hits (none
+    matched, or it failed): ``general_hits`` unchanged.
+    """
+    if not names or not name_hits:
+        return list(general_hits)
+    known = KnownNames.from_names(names)
+    name_ids = {m.id for m in name_hits}
+    named = {
+        m.id for m in general_hits if m.id in name_ids or match_known_names(m.content or "", known)
+    }
+    both = [m for m in general_hits if m.id in named]
+    name_only = [m for m in name_hits if m.id not in named]
+    rest = [m for m in general_hits if m.id not in named]
+    seen: set[str] = set()
+    out: list[Memory] = []
+    for m in (*both, *name_only, *rest):
+        if m.id not in seen:
+            seen.add(m.id)
+            out.append(m)
+    return out

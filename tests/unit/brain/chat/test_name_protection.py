@@ -405,49 +405,44 @@ def test_the_name_query_shares_the_turns_one_hebbian_handle(tmp_path: Path) -> N
 
 
 # --------------------------------------------------------------------------
-# P-15: matched names join the "not recognised" candidates
+# S90: a listed name is never shown as "not recognised"
 # --------------------------------------------------------------------------
 
 
-def test_a_matched_name_the_store_has_never_seen_is_listed_as_not_recognised(tmp_path: Path) -> None:
-    _, before = _twin(tmp_path, "empty", "zed zorblax")
-    assert "zed" in _not_recognised(before), "precondition: a 3-letter unknown is listed today"
-
-    # 'ed' is dropped by the selector (2 letters, lower case, df 0) so it is
-    # listed only because the name list matched it.
-    _, without = _twin(tmp_path, "without", "ed zorblax")
-    assert "ed" not in _not_recognised(without)
-    _, with_name = _twin(tmp_path, "with", "ed zorblax", list_names=["Ed"])
-    assert "ed" in _not_recognised(with_name)
+def test_a_listed_name_is_never_shown_as_not_recognised(tmp_path: Path) -> None:
+    # 'zed' (3 letters, df 0) is a selector token, so today it is listed
+    _, before = _twin(tmp_path, "empty", "zed vexillum")
+    assert "zed" in _not_recognised(before), "precondition: an unknown 3-letter word is listed today"
+    _, after = _twin(tmp_path, "listed", "zed vexillum", list_names=["Zed"])
+    assert "zed" not in _not_recognised(after), "a listed name is known by definition"
+    assert "vexillum" in _not_recognised(after), "an ordinary unknown word is still listed"
 
 
-def test_a_matched_name_the_store_knows_is_not_listed_as_not_recognised(tmp_path: Path) -> None:
-    """A listed name with memories (df > 0) is not 'not recognised', however it
-    is typed: the lookup must include the names' own words."""
+def test_a_listed_name_the_selector_drops_is_not_listed_either(tmp_path: Path) -> None:
+    # 'ed' (2 letters, lower case, df 0) is dropped by the selector: never listed
+    _, block = _twin(tmp_path, "listed", "ed zorblax", list_names=["Ed"])
+    assert "ed" not in _not_recognised(block)
+
+
+def test_a_listed_name_with_memories_is_not_listed(tmp_path: Path) -> None:
     _, block = _twin(tmp_path, "listed", "will zorblax quixotic", direct=["will"])
     assert "will" not in _not_recognised(block)
-    _, block2 = _twin(tmp_path, "listed2", "al zorblax quixotic", list_names=["Al"])
-    assert "al" not in _not_recognised(block2)
 
 
-def test_a_single_word_name_that_is_also_a_selector_token_is_listed_once(tmp_path: Path) -> None:
-    _, block = _twin(tmp_path, "listed", "glimmer zorblax", list_names=["Glimmer"])
-    assert _not_recognised(block).count("glimmer") == 1
+def test_the_words_of_a_matched_multi_word_name_are_not_listed(tmp_path: Path) -> None:
+    _, before = _twin(tmp_path, "empty", "glimmer harbour zorblax")
+    assert "glimmer" in _not_recognised(before), "precondition"
+    _, after = _twin(tmp_path, "listed", "glimmer harbour zorblax", list_names=["Glimmer Harbour"])
+    assert "glimmer" not in _not_recognised(after)
+    assert "glimmer harbour" not in _not_recognised(after)
 
 
-def test_a_multi_word_name_is_listed_when_any_word_is_unknown_not_only_the_first(tmp_path: Path) -> None:
-    # 'harbour' is in the store (df > 0); 'glimmer' is not
-    _, block = _twin(tmp_path, "second", "harbour glimmer zorblax", list_names=["Harbour Glimmer"])
-    assert "harbour glimmer" in _not_recognised(block)
-    # every word known: the phrase is not listed
-    _, block2 = _twin(tmp_path, "known", "ferry engine zorblax", list_names=["Ferry Engine"])
-    assert "ferry engine" not in _not_recognised(block2)
-
-
-def test_a_multi_word_name_with_an_unknown_word_is_listed_by_its_phrase(tmp_path: Path) -> None:
-    _, block = _twin(tmp_path, "with", "glimmer harbour zorblax", list_names=["Glimmer Harbour"])
-    listed = _not_recognised(block)
-    assert "glimmer harbour" in listed, "one word of the phrase is unknown (df 0)"
+def test_a_word_only_part_of_a_listed_name_elsewhere_in_the_message_is_still_listed(
+    tmp_path: Path,
+) -> None:
+    # "new york" is listed but the message says "glimmer new": no match, so 'glimmer' is unknown as usual
+    _, block = _twin(tmp_path, "listed", "glimmer new zorblax", list_names=["New York"])
+    assert "glimmer" in _not_recognised(block)
 
 
 # --------------------------------------------------------------------------
@@ -571,3 +566,112 @@ def test_name_hits_are_ordered_among_themselves_by_blended_score(tmp_path: Path)
     assert _ids(block) == [high.id, low.id], "the better blended score leads within the name hits"
     softened = _softened(block)
     assert softened[0].startswith("Loud") and softened[1].startswith("Quiet")
+
+
+# --------------------------------------------------------------------------
+# S89: name hits the general search also found lead, then name-only hits,
+# then the general hits
+# --------------------------------------------------------------------------
+
+
+def _many_pretzels(persona: Path, n: int = 60):
+    persist_felt_time(FeltTimeState(lived_age_hours=48.0), persona)
+    store = MemoryStore(":memory:")
+    target = _mem(
+        store, "Pretzel weighs about thirty pounds and is a scruffy terrier mix, heavier than he looks"
+    )
+    rare = _mem(store, "zorblax quixotic vellum ledger kept by the harbour clerk")
+    others = [_mem(store, f"Pretzel chased the ball across the yard, walk number {i}") for i in range(n)]
+    return SimpleNamespace(store=store, target=target, rare=rare, others=others)
+
+
+def test_a_name_with_many_memories_no_longer_pushes_out_a_memory_matching_the_rest_of_the_message(
+    tmp_path: Path,
+) -> None:
+    """The F1 case: 60 memories of the name, one of which also matches the rest
+    of the message."""
+    message = "how heavy is pretzel, is he a terrier, thirty pounds?"
+    p0 = tmp_path / "empty"
+    p0.mkdir()
+    w0 = _many_pretzels(p0)
+    assert _ids(_render(w0, message, p0))[0] == w0.target.id, "precondition: base ranks it first"
+
+    p1 = tmp_path / "listed"
+    p1.mkdir()
+    w1 = _many_pretzels(p1)
+    _list_names(p1, "Pretzel")
+    ids = _ids(_render(w1, message, p1))
+    assert ids[0] == w1.target.id, "matching the name AND the rest of the message it leads"
+    assert len(ids) == 8
+
+
+def _will_world(persona: Path, *, fade: bool = False):
+    """A = name + the rest of the message, B = name only (ranks ABOVE A in the
+    name query alone), C = the rest of the message only. 'will' is dropped by the
+    selector, so the name query is the only route by which B is found."""
+    persist_felt_time(FeltTimeState(lived_age_hours=48.0), persona)
+    store = MemoryStore(":memory:")
+    a = _mem(store, "Will noted that zorblax and quixotic vellum stayed in the ledger all through the storm season")
+    b1 = _mem(store, "Will waved from the pier", importance=9.0)
+    b2 = _mem(store, "Will sang on the ferry", importance=8.0)
+    c = _mem(store, "zorblax and quixotic vellum ledger kept by the harbour clerk")
+    if fade:
+        for m in (a, b1, b2, c):
+            _fade(store, m)
+    return SimpleNamespace(store=store, a=a, b1=b1, b2=b2, c=c)
+
+
+def test_name_and_message_hits_lead_then_name_only_then_general(tmp_path: Path) -> None:
+    message = "will zorblax quixotic"
+    p0 = tmp_path / "empty"
+    p0.mkdir()
+    w0 = _will_world(p0)
+    assert set(_ids(_render(w0, message, p0))) == {w0.a.id, w0.c.id}, (
+        "precondition: without the list only the two general hits appear"
+    )
+
+    p1 = tmp_path / "listed"
+    p1.mkdir()
+    w1 = _will_world(p1)
+    _list_names_direct(p1, "will")
+    ids = _ids(_render(w1, message, p1))
+    assert ids == [w1.a.id, w1.b1.id, w1.b2.id, w1.c.id], (
+        "name + rest of the message first, then name-only in the name query's order, then general-only"
+    )
+
+
+def test_the_same_order_holds_in_the_softened_section(tmp_path: Path) -> None:
+    p = tmp_path / "p"
+    p.mkdir()
+    w = _will_world(p, fade=True)
+    _list_names_direct(p, "will")
+    soft = _softened(_render(w, "will zorblax quixotic", p))
+    assert [s[:12] for s in soft] == ["Will noted t", "Will waved f", "Will sang on", "zorblax and "]
+
+
+def test_the_same_order_holds_behind_the_semantic_results(tmp_path: Path) -> None:
+    p = tmp_path / "p"
+    p.mkdir()
+    w = _will_world(p)
+    sem = _mem(w.store, "the sunlit dock where the boats moor at low tide")
+    _list_names_direct(p, "will")
+    semantic = SemanticRecallResult(full=[sem], snippet=[], scores={sem.id: 5.0})
+    ids = _ids(_render(w, "will zorblax quixotic", p, semantic=semantic))
+    assert ids == [sem.id, w.a.id, w.b1.id, w.b2.id, w.c.id]
+
+
+def test_a_general_hit_holding_the_name_leads_even_beyond_the_name_querys_window(tmp_path: Path) -> None:
+    """The name query's ranked window is 2 x limit; a name with far more memories
+    would truncate it. Whether a general hit 'also matches the name' is decided
+    from the hit itself, not from that window."""
+    message = "how heavy is pretzel, is he a terrier, thirty pounds?"
+    p = tmp_path / "p"
+    p.mkdir()
+    w = _many_pretzels(p, n=80)  # more than the ranker's whole FTS pool of 50
+    _list_names(p, "Pretzel")
+    assert _ids(_render(w, message, p))[0] == w.target.id
+    p2 = tmp_path / "q"
+    p2.mkdir()
+    w2 = _many_pretzels(p2, n=80)
+    _list_names(p2, "Pretzel")
+    assert _ids(_render(w2, message, p2, limit=2))[0] == w2.target.id, "also with a tiny render limit"

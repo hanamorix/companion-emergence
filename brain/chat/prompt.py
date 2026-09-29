@@ -30,6 +30,7 @@ from brain.memory.relevance import (
     FULL_INJECT_MAX,
     SNIPPET_COUNT,
     SNIPPET_MODE_ENABLED,
+    lead_with_names,
     names_in,
     rank_name_hits,
     snippet_length,
@@ -1071,8 +1072,10 @@ def _build_recall_block(
     names found in ``user_input`` (raw words, before the stopword and length
     rules) run ONE extra keyword query, sent as FTS phrases through the same
     ranker on the same hebbian handle; its active and fading hits lead the
-    keyword hits (S79: name query, then tier 1, then tier 2). It never feeds
-    the graveyard. A message that is only a known name still recalls.
+    keyword hits (S79, S89: name hits the general search also found, then
+    name-only hits, then the general hits). It never feeds the graveyard, and
+    a listed name is never shown as "not recognised" (S90). A message that is
+    only a known name still recalls.
 
     Strategy: extract salient content tokens from ``user_input`` (drop
     stopwords/short fragments; ranked by corpus IDF + proper-noun bonus —
@@ -1352,19 +1355,15 @@ def _build_recall_block(
     # S71 (REVIEW-PENDING): the list keeps today's size and filter: it is
     # chosen from the tokens the old 10-token selector picked; the tokens
     # beyond that are searched but never listed.
-    # R5 (P-15, S31/S53): the matched known names join the candidates. A
-    # single-word name is checked like any token; a multi-word name is listed
-    # when one of its words is unknown (a necessary condition for the phrase
-    # to be absent).
-    extra_names = [n for n in names if n not in legacy_tokens]
-    lookup = legacy_tokens + [
-        w for n in extra_names for w in n.split(" ") if w not in legacy_tokens
-    ]
-    stats = store.term_stats(lookup)
+    # S90 (R5 follow-up): a word on the known-names list is never "not
+    # recognised", whatever the store holds: a listed name is known by
+    # definition. The words of a matched multi-word name count as listed.
+    stats = store.term_stats(legacy_tokens)
+    listed_words = {w for n in names for w in n.split(" ")}
     unfamiliar: list[str] = [
-        c
-        for c in [*legacy_tokens, *extra_names]
-        if any(stats.get(w.lower(), (0, 0.0))[0] == 0 for w in c.split(" "))
+        t
+        for t in legacy_tokens
+        if t not in listed_words and stats.get(t.lower(), (0, 0.0))[0] == 0
     ]
 
     # B → A fallback: when noise risk is high, keep only proper-noun-shaped tokens.
@@ -1397,11 +1396,19 @@ def _build_recall_block(
         - {m.id for m in active_hits}
         - {m.id for m in name_active}
     )
+    # S89: name hits the general search (tier 1 then tier 2) also found lead,
+    # then name-only hits, then the general hits; the family after every genuine.
     active_hits = genuine_first_memories(
-        _order_keyword_tiers(name_active, active_hits, [m for m in tier2_active if m.id not in seen_fading])
+        lead_with_names(
+            name_active,
+            _order_keyword_tiers(active_hits, [m for m in tier2_active if m.id not in seen_fading]),
+            names,
+        )
     )
-    fading_hits = _order_keyword_tiers(
-        name_fading, fading_hits, [m for m in tier2_fading if m.id not in seen_active]
+    fading_hits = lead_with_names(
+        name_fading,
+        _order_keyword_tiers(fading_hits, [m for m in tier2_fading if m.id not in seen_active]),
+        names,
     )
 
     # The "active:" section: semantic results first, keyword hits in the slots

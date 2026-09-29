@@ -320,3 +320,89 @@ def test_the_name_query_gets_the_tools_hebbian_handle_and_orders_by_blended_scor
         ids = _ids(_lexical(ctx, "pretzel"))
     assert handles == [ctx["hebbian"]]
     assert ids == [high.id, low.id]
+
+
+# --------------------------------------------------------------------------
+# S89: name hits the general search also found lead, then name-only hits,
+# then the general hits
+# --------------------------------------------------------------------------
+
+
+def _many_pretzels(persona: Path, n: int = 60):
+    ctx = _ctx(persona)
+    store = ctx["store"]
+    target = _mem(store, "Pretzel weighs about thirty pounds and is a scruffy terrier mix, heavier than he looks")
+    _mem(store, "zorblax quixotic vellum ledger kept by the harbour clerk")
+    for i in range(n):
+        _mem(store, f"Pretzel chased the ball across the yard, walk number {i}")
+    return ctx, target
+
+
+def test_a_name_with_many_memories_no_longer_pushes_out_a_memory_matching_the_rest_of_the_query(
+    tmp_path: Path,
+) -> None:
+    query = "how heavy is pretzel, is he a terrier, thirty pounds?"
+    ctx0, target0 = _many_pretzels(tmp_path / "empty")
+    assert _ids(_lexical(ctx0, query, limit=5))[0] == target0.id, "precondition: base ranks it first"
+    persona = tmp_path / "listed"
+    ctx, target = _many_pretzels(persona)
+    _list(persona, "Pretzel")
+    ids = _ids(_lexical(ctx, query, limit=5))
+    assert ids[0] == target.id
+    assert len(ids) == 5
+
+
+def _will_world(persona: Path):
+    ctx = _ctx(persona)
+    store = ctx["store"]
+    a = _mem(store, "Will noted that zorblax and quixotic vellum stayed in the ledger all through the storm season")
+    b1 = _mem(store, "Will waved from the pier")
+    b2 = _mem(store, "Will sang on the ferry")
+    c = _mem(store, "zorblax and quixotic vellum ledger kept by the harbour clerk")
+    store._conn.execute("UPDATE memories SET importance = 9.0 WHERE id = ?", (b1.id,))  # noqa: SLF001
+    store._conn.execute("UPDATE memories SET importance = 8.0 WHERE id = ?", (b2.id,))  # noqa: SLF001
+    store._conn.commit()  # noqa: SLF001
+    return ctx, a, b1, b2, c
+
+
+def test_lexical_name_and_query_hits_lead_then_name_only_then_general(tmp_path: Path) -> None:
+    # 'will' is a 4-letter word the tool DOES send (S81), so the general search finds every Will
+    # memory too; use the 2-letter name 'al' to get a true name-only group (a tier-2 short word).
+    persona = tmp_path / "listed"
+    ctx = _ctx(persona)
+    store = ctx["store"]
+    a = _mem(store, "Al noted that zorblax and quixotic vellum stayed in the ledger all through the storm season")
+    b1 = _mem(store, "Al waved from the pier")
+    c = _mem(store, "zorblax and quixotic vellum ledger kept by the harbour clerk")
+    store._conn.execute("UPDATE memories SET importance = 9.0 WHERE id = ?", (b1.id,))  # noqa: SLF001
+    store._conn.commit()  # noqa: SLF001
+    _list(persona, "Al")
+    ids = _ids(_lexical(ctx, "al zorblax quixotic", limit=8))
+    assert ids == [a.id, b1.id, c.id]
+
+
+def test_lexical_all_general_hits_holding_the_name_precede_the_name_only_ones(tmp_path: Path) -> None:
+    persona = tmp_path / "listed"
+    ctx, a, b1, b2, c = _will_world(persona)
+    _list_direct(persona, "will")
+    ids = _ids(_lexical(ctx, "will zorblax quixotic", limit=8))
+    assert ids[0] == a.id, "name + rest of the query leads, whatever the name query's own order says"
+    assert set(ids) == {a.id, b1.id, b2.id, c.id}
+    assert ids.index(c.id) > ids.index(a.id), "the general-only hit follows the name + query hit"
+
+
+def test_semantic_the_same_order_holds_behind_the_semantic_results(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    query = "al zorblax quixotic"
+    persona = tmp_path / "listed"
+    ctx = _ctx(persona)
+    store = ctx["store"]
+    a = _mem(store, "Al noted that zorblax and quixotic vellum stayed in the ledger all through the storm season")
+    b1 = _mem(store, "Al waved from the pier")
+    c = _mem(store, "zorblax and quixotic vellum ledger kept by the harbour clerk")
+    sem = _mem(store, "the sunlit dock where the boats moor at low tide")
+    _list(persona, "Al")
+    _semantic_setup(monkeypatch, store, query, [(sem, 6.0)])
+    ids = _ids(dispatch("search_memories", {"query": query, "limit": 8}, **ctx))
+    assert ids == [sem.id, a.id, b1.id, c.id]
