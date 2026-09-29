@@ -538,3 +538,32 @@ def test_passive_recall_and_tool_both_feed_the_one_cost_model(
     assert reranker_mod.rerank_cost_estimate("fake-reranker").measured_batches == 2
     single_doc_calls = [c for c in provider.calls if len(c) == 1]
     assert len(single_doc_calls) == 2, "the two warm-ups run once per process, not per call site"
+
+
+@pytest.mark.parametrize("site", ["run_semantic_recall", "search_memories"])
+def test_pool_below_the_minimum_hands_off_at_both_call_sites(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture, site: str
+) -> None:
+    """R1 (S5/S23): fewer than 5 real candidates -> no rerank at all, and the
+    call site takes its explicit hand-off branch (logged at info), not the
+    broad fail-soft `except` (which would log a warning traceback). R2 turns
+    this branch into the cosine path."""
+    import logging
+
+    store = MemoryStore(tmp_path / "memories.db")
+    real_a, *_, filler_e = _seed_candidates(store, monkeypatch, _QUERY)
+    store.deactivate(filler_e.id)  # 4 candidates left in the pool
+    _seed_floor(store)
+    provider = _RecordingProvider({real_a.content: 50.0}, default=0.0)
+    monkeypatch.setattr("brain.memory.reranker.build_reranker_provider", lambda **kwargs: provider)
+
+    with caplog.at_level(logging.INFO):
+        if site == "run_semantic_recall":
+            assert run_semantic_recall(store, tmp_path, _QUERY) is None
+        else:
+            res = dispatch("search_memories", {"query": _QUERY, "mode": "semantic"}, **_ctx2(tmp_path, store))
+            assert res["mode"] == "lexical"
+
+    assert provider.calls == [], "no warm-up and no rerank below the minimum"
+    assert any("no rerank (pool" in r.getMessage() for r in caplog.records), "the explicit hand-off branch ran"
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records), "not the fail-soft except"
