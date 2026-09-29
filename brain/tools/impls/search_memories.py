@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -64,6 +65,22 @@ def _snippet_result(memory) -> dict:
     return result
 
 
+def _query_words(query: str) -> list[str]:
+    """Every word of the kindled's own query, lower-cased and de-duplicated, in
+    order. No stopword drop, no length floor, no cap (spec §5/§7, S81, which
+    supersedes S57 for the tool): the query is deliberate and short, so a
+    lowercase name not yet on the known-names list, or any other word she
+    chose, is still searched."""
+    seen: set[str] = set()
+    words: list[str] = []
+    for m in re.finditer(r"[A-Za-z0-9]+", query):
+        low = m.group().lower()
+        if low not in seen:
+            seen.add(low)
+            words.append(low)
+    return words
+
+
 def _keyword_candidates(
     store: MemoryStore,
     hebbian: HebbianMatrix,
@@ -72,27 +89,22 @@ def _keyword_candidates(
     exclude: frozenset[str],
 ) -> list[Memory]:
     """The tool's keyword search, every candidate best-first (name-recall fix
-    R4, spec §5, S57, plan P-21): BM25 text-match + importance + hebbian
-    spreading-activation + recency via ``rank_memories``, over the token list
-    the recall selector keeps from ``query``, with NO cap (S52) and the same
-    stopword rules passive recall applies. The store admits every token the
-    selector kept (2-letter names and acronyms included). Monologue-family
-    hits follow genuine ones (spec §4, S16): ``genuine_first`` ranks them
-    after every genuine match in the ranker's candidate pool and its final
-    order, so a family hit never takes a slot from a genuine one. ``exclude``
-    ids are removed before ranking.
+    R4, spec §5, S81): BM25 text-match + importance + hebbian
+    spreading-activation + recency via ``rank_memories`` over EVERY word of
+    ``query`` (`_query_words`), one OR query, the store admitting each word.
+    Monologue-family hits follow genuine ones (spec §4, S16): ``genuine_first``
+    ranks them after every genuine match in the ranker's candidate pool and its
+    final order, so a family hit never takes a slot from a genuine one.
+    ``exclude`` ids are removed before ranking.
 
-    The selector is imported lazily from ``brain.chat.prompt`` (the pattern
-    ``brain/tools/dispatch.py`` uses): the chat layer must not be a top-level
-    dependency of the tools package.
+    R5 seam: the known-names query (its hits ahead of everything, S79) belongs
+    in front of this list in BOTH modes; it is not built yet.
     """
-    from brain.chat.prompt import _extract_recall_tokens
-
-    tokens = _extract_recall_tokens(query, store)
-    if not tokens:
+    words = _query_words(query)
+    if not words:
         return []
     ranked = rank_memories(
-        store, hebbian, tokens, limit=CANDIDATE_POOL, exclude_ids=exclude, genuine_first=True
+        store, hebbian, words, limit=CANDIDATE_POOL, exclude_ids=exclude, genuine_first=True
     )
     return [m for m, _ in ranked]
 
@@ -263,12 +275,11 @@ def search_memories(
         contributed).
       - ``"lexical"``: the blended keyword ranker — BM25 text-match +
         importance + hebbian spreading-activation + recency, via
-        ``rank_memories`` (see ``_keyword_candidates``). The query goes
-        through the recall token selector with no cap (spec §5, S52/S57): every
-        meaningful word is kept under the recall stopword rules, and the store
-        admits every token the selector kept, so 'Henryk preferences
-        personality' finds memories mentioning ANY kept token, as a union, not
-        the empty AND-intersection.
+        ``rank_memories`` (see ``_keyword_candidates``). EVERY word of the
+        query is sent, with no stopword drop, no length floor and no cap (spec
+        §5, S81), so 'Henryk preferences personality' finds memories
+        mentioning ANY word, as a union, not the empty AND-intersection, and a
+        lowercase name not yet on the known-names list is still found.
 
     ``order`` picks how the MATCHED set (whichever ``mode`` produced it) is
     ordered before the final ``limit`` slice (#231, Planning-signed-off

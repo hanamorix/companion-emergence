@@ -19,7 +19,6 @@ import numpy as np
 import pytest
 
 from brain.bridge import model_tier
-from brain.chat.prompt import _extract_recall_tokens
 from brain.dev_constants import RERANK_MIN_REAL_CANDIDATES
 from brain.memory.embeddings import EmbeddingProvider
 from brain.memory.hebbian import HebbianMatrix
@@ -278,14 +277,13 @@ def _cap_store(store: MemoryStore) -> Memory:
     return target
 
 
-def test_lexical_mode_sends_every_token_the_selector_keeps_to_the_ranker(tmp_path: Path) -> None:
+def test_lexical_mode_sends_every_word_of_the_query_to_the_ranker(tmp_path: Path) -> None:
+    """S81: every word, stopwords included, no length floor, no cap."""
     ctx = _ctx(tmp_path)
     store = ctx["store"]
     target = _cap_store(store)
-    query = "the " + " ".join(_RARE + _COMMON) + " and of"
-    expected = _extract_recall_tokens(query, store)  # independent: the selector's own uncapped output
-    assert len(expected) == 12
-    assert "the" not in expected and "and" not in expected, "stopwords the selector drops are not sent"
+    query = "the " + " ".join(_RARE + _COMMON) + " and of AI"
+    expected = ["the", *_RARE, *_COMMON, "and", "of", "ai"]
 
     import brain.tools.impls.search_memories as tool  # noqa: PLC0415
 
@@ -300,11 +298,11 @@ def test_lexical_mode_sends_every_token_the_selector_keeps_to_the_ranker(tmp_pat
         res = dispatch("search_memories", {"query": query, "mode": "lexical", "limit": 8}, **ctx)
 
     assert res["mode"] == "lexical"
-    assert seen == [expected], "the ranker received exactly the selector's uncapped tokens"
-    assert target.id in _ids(res), "a token beyond the old ten-token cap is searched"
+    assert seen == [expected], "the ranker received every word of the query, in order, once each"
+    assert target.id in _ids(res), "a word beyond the old ten-token cap is searched"
 
 
-def test_lexical_mode_admits_a_two_letter_acronym_the_selector_keeps(tmp_path: Path) -> None:
+def test_lexical_mode_admits_a_two_letter_acronym(tmp_path: Path) -> None:
     ctx = _ctx(tmp_path)
     store = ctx["store"]
     ai = _mem(store, "Bob showed Canary an AI notebook about tide tables")
@@ -315,8 +313,21 @@ def test_lexical_mode_admits_a_two_letter_acronym_the_selector_keeps(tmp_path: P
     assert _ids(res) == [ai.id]
 
 
-def test_lexical_mode_with_only_stopwords_returns_nothing(tmp_path: Path) -> None:
+def test_a_stopword_query_and_a_lowercase_unlisted_name_are_searched_in_both_modes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """S81 (supersedes S57 for the tool): no stopword drop, so a lowercase name
+    that is also a stopword ('will'), not yet on any known-names list, finds its
+    memories in lexical mode and in the keyword side of semantic mode."""
     ctx = _ctx(tmp_path)
-    _mem(ctx["store"], "the and of a list of words")
-    res = dispatch("search_memories", {"query": "the and of", "mode": "lexical"}, **ctx)
-    assert res["memories"] == []
+    store = ctx["store"]
+    will = _mem(store, "Will came by the workshop with a lantern")
+    assert _ids(dispatch("search_memories", {"query": "will", "mode": "lexical"}, **ctx)) == [will.id]
+    assert _ids(dispatch("search_memories", {"query": "the and of", "mode": "lexical"}, **ctx))
+
+    sem = _mem(store, "deep breathing eases racing thoughts")
+    _semantic_setup(monkeypatch, store, "will", [(sem, 6.0)])
+    res = dispatch("search_memories", {"query": "will", "limit": 5}, **ctx)
+    assert res["mode"] == "semantic"
+    ids = _ids(res)
+    assert ids[0] == sem.id and will.id in ids

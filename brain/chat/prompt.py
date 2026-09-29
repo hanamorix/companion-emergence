@@ -39,7 +39,7 @@ from brain.memory.semantic_recall import (
     is_monologue_family,
     run_semantic_recall,
 )
-from brain.memory.store import MemoryStore
+from brain.memory.store import _FTS_TOKEN_MIN_LEN, MemoryStore
 from brain.soul.store import SoulStore
 from brain.utils.time import format_local, to_local
 
@@ -866,6 +866,58 @@ def _snippet_bump_amount(rank: int, group_size: int) -> float:
     return 0.8 - 0.7 * (rank / (group_size - 1))
 
 
+def _keyword_tiers(tokens: list[str], legacy_tokens: list[str]) -> tuple[str, list[str]]:
+    """Split the selector's tokens into the two keyword-search tiers (name-recall
+    fix R4, spec §5, S79).
+
+    Tier 1 is today's search EXACTLY: the old top-`_RECALL_TOKEN_LIMIT` tokens
+    joined into one raw string, which the store tokenizes with its
+    `_FTS_TOKEN_MIN_LEN` floor as it always did, so nothing today's search finds
+    can be lost. Tier 2 is everything tier 1 does not reach: the tokens beyond the
+    old top 10, and any old-top-10 token under the floor (a 2-letter name or
+    acronym the store now admits, S36). Tier 2 only fills the slots tier 1
+    leaves. Returns ``(tier-1 query string, tier-2 token list)``.
+    """
+    reached = {t for t in legacy_tokens if len(t) >= _FTS_TOKEN_MIN_LEN}
+    return " ".join(legacy_tokens), [t for t in tokens if t not in reached]
+
+
+def _sort_keyword_tier(ranked: list) -> list:
+    """One tier's ``(memory, score-or-None)`` pairs as memories, deduped, best
+    blended score first (scores are only comparable inside one query), falling
+    back to (-importance, -ts) when the ranker is off."""
+    mems: list = []
+    ids: set[str] = set()
+    scores: dict[str, float] = {}
+    for mem, score in ranked:
+        if mem.id not in ids:
+            ids.add(mem.id)
+            mems.append(mem)
+        if score is not None:
+            scores[mem.id] = max(scores.get(mem.id, score), score)
+    if scores:
+        mems.sort(key=lambda m: -scores.get(m.id, float("-inf")))
+    else:
+        mems.sort(key=_recall_sort_key)
+    return mems
+
+
+def _order_keyword_tiers(*tiers: list) -> list:
+    """Concatenate keyword tiers in order, dropping repeats (a memory keeps the
+    first, highest, tier it appeared in). Order of the arguments = the order of
+    the spec's keyword search (S79): the NAME query's hits first (R5 fills that
+    slot; it is empty until then), then today's capped selection, then the
+    remaining tokens."""
+    seen: set[str] = set()
+    out: list = []
+    for tier in tiers:
+        for mem in tier:
+            if mem.id not in seen:
+                seen.add(mem.id)
+                out.append(mem)
+    return out
+
+
 def _assemble_active_entries(
     semantic_result: SemanticRecallResult | None,
     keyword_hits: list,
@@ -884,8 +936,8 @@ def _assemble_active_entries(
     Full vs snippet is by POSITION across the merged list (the first
     ``FULL_INJECT_STANDOUT_MAX`` = 5 full), except that a keyword hit with
     importance >= ``FULL_INJECT_IMPORTANCE`` renders full (at most
-    ``FULL_INJECT_MAX`` of them, today's ``_full_inject_ids`` rule), even when
-    that makes more than 5 full. No slot is reserved for any keyword hit.
+    ``FULL_INJECT_MAX`` of them, S80: only hits shown full because of that rule
+    count toward the 3), even when that makes more than 5 full. No slot is reserved for any keyword hit.
 
     No semantic result (P-12): keyword-only turn under today's lexical caps
     (``limit``) and full-inject rule, unchanged.
@@ -904,7 +956,10 @@ def _assemble_active_entries(
     taken = {m.id for m in semantic}
     room = max(0, MAX_STANDOUT_COUNT - len(semantic))
     fill = [m for m in keyword_hits if m.id not in taken][:room]
-    promoted = _full_inject_ids(fill)
+    # S80: the "up to 3" counts only hits shown full BECAUSE of the importance
+    # rule; a hit already full by position does not use one of the 3.
+    beyond = [m for j, m in enumerate(fill) if len(semantic) + j >= FULL_INJECT_STANDOUT_MAX]
+    promoted = _full_inject_ids(beyond)
 
     entries: list[tuple[object, bool]] = [(m, m.id in semantic_full_ids) for m in semantic]
     for j, mem in enumerate(fill):
@@ -1049,29 +1104,25 @@ def _build_recall_block(
         # the main path, no surfacing bump.
         from brain.memory.relevance import rank_memories
 
-        seen: set = set()
-        candidates: list = []
-        merged: dict[str, float] = {}
+        # Two tiers (S79): today's capped query, then the remaining tokens.
+        capped_query, remainder = _keyword_tiers(tokens, legacy_tokens)
         try:
-            ranked = rank_memories(store, None, tokens, limit=limit, genuine_first=True)
+            ranked = rank_memories(store, None, capped_query, limit=limit, genuine_first=True)
         except Exception:  # noqa: BLE001
             ranked = []
-        for mem, score in ranked:
-            if mem.id not in seen:
-                seen.add(mem.id)
-                candidates.append(mem)
-                if score is not None:
-                    merged[mem.id] = score
-            elif score is not None:
-                merged[mem.id] = max(merged.get(mem.id, score), score)
+        try:
+            ranked2 = (
+                rank_memories(store, None, remainder, limit=limit, genuine_first=True)
+                if remainder
+                else []
+            )
+        except Exception:  # noqa: BLE001
+            ranked2 = []
+        candidates = _order_keyword_tiers([], _sort_keyword_tier(ranked), _sort_keyword_tier(ranked2))
 
         if not candidates:
             return ""
 
-        if merged:
-            candidates.sort(key=lambda m: -merged.get(m.id, float("-inf")))
-        else:
-            candidates.sort(key=_recall_sort_key)
         top = genuine_first_memories(candidates)[:limit]
         full_ids = _full_inject_ids(top)
 
@@ -1143,6 +1194,9 @@ def _build_recall_block(
     # always use what's computed here.
     from brain.forgetting.recall import search_with_loss
     from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.relevance import rank_memories
+
+    capped_query, remainder = _keyword_tiers(tokens, legacy_tokens)
 
     seen_active: set = set()
     seen_fading: set = set()
@@ -1171,22 +1225,35 @@ def _build_recall_block(
         except Exception:  # noqa: BLE001 — hebbian is a tie-breaker; degrade to None
             heb = None
         try:
-            # The active/fading ranker gets EVERY selector token (the cap is
-            # gone, spec §5); the graveyard is fed exactly what it always got,
-            # the old capped selection joined (P-14/P-25, Q16 interim).
+            # Tier 1 (spec §5, S79): TODAY's search, the old capped selection
+            # joined into one raw-string query, so nothing it finds is lost; the
+            # graveyard is fed the same string (P-14/P-25, Q16 interim).
             result = search_with_loss(
                 persona_dir,
                 store,
-                tokens,
+                capped_query,
                 limit=limit * 2,
                 hebbian=heb,
-                lost_query=" ".join(legacy_tokens),
+                lost_query=capped_query,
                 # The monologue family ranks after every genuine memory in the
                 # ranker's pool and window (spec §4, S16, Acceptance 8).
                 genuine_first=True,
             )
         except Exception:  # noqa: BLE001
             result = None
+        # Tier 2 (S79): the tokens tier 1 does not reach, filling only the
+        # slots tier 1 leaves (they rank after every tier-1 hit). No graveyard.
+        tier2_active: list = []
+        tier2_fading: list = []
+        if remainder:
+            try:
+                ranked2 = rank_memories(
+                    store, heb, remainder, limit=limit * 2, include_fading=True, genuine_first=True
+                )
+            except Exception:  # noqa: BLE001
+                ranked2 = []
+            tier2_active = _sort_keyword_tier([p for p in ranked2 if p[0].state == "active"])
+            tier2_fading = _sort_keyword_tier([p for p in ranked2 if p[0].state == "fading"])
         if result is not None:
             for mem in result.active:
                 s = result.scores.get(mem.id)
@@ -1249,11 +1316,17 @@ def _build_recall_block(
         active_hits.sort(key=lambda m: -merged_score.get(m.id, float("-inf")))
     else:
         active_hits.sort(key=_recall_sort_key)
-    active_hits = genuine_first_memories(active_hits)
     if merged_fading:
         fading_hits.sort(key=lambda m: -merged_fading.get(m.id, float("-inf")))
     else:
         fading_hits.sort(key=_recall_sort_key)
+    # Keyword tiers (S79): name-query hits (R5 seam: [] until then), then tier 1
+    # (today's capped search), then tier 2; the family after every genuine hit.
+    name_active: list = []
+    active_hits = genuine_first_memories(
+        _order_keyword_tiers(name_active, active_hits, [m for m in tier2_active if m.id not in seen_fading])
+    )
+    fading_hits = _order_keyword_tiers(fading_hits, [m for m in tier2_fading if m.id not in seen_active])
 
     # The "active:" section: semantic results first, keyword hits in the slots
     # they leave, tiers by position (P-10). A CONCLUSIVE semantic result always

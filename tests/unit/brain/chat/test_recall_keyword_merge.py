@@ -418,8 +418,11 @@ def test_not_recognised_list_is_chosen_from_the_old_top_ten(tmp_path: Path) -> N
     assert listed == legacy
     assert len(listed) == _RECALL_TOKEN_LIMIT
     assert not (set(tokens[_RECALL_TOKEN_LIMIT:]) & set(listed))
-    # the uncapped search still received every token
-    assert queries and set(queries[0]) == set(tokens)
+    # S79: tier 1 = today's search (the old top 10 joined into one raw string);
+    # tier 2 = the tokens beyond it, so together every token is still searched
+    assert queries[0] == " ".join(legacy)
+    assert set(queries[1]) == set(tokens[_RECALL_TOKEN_LIMIT:])
+    assert set(legacy) | set(queries[1]) == set(tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -490,9 +493,10 @@ def test_graveyard_entry_inside_the_old_top_ten_is_still_returned_and_touches_on
     assert touch.call_count == 1
 
 
-def test_name_of_a_lost_only_word_beyond_the_cap_keeps_the_general_query_uncapped(tmp_path: Path) -> None:
-    """The general query to the active/fading ranker receives every token while
-    the graveyard receives only the legacy set."""
+def test_tier_one_query_is_todays_capped_string_and_feeds_the_graveyard_too(tmp_path: Path) -> None:
+    """S79: the active/fading search's first tier is today's query (the old top
+    10 joined) and the graveyard receives exactly that string; the tokens
+    beyond it go to a second, graveyard-free tier."""
     store, message, legacy = _graveyard_fixture(tmp_path, buried_word="harbour")
     calls: list[dict] = []
     import brain.chat.prompt as prompt_mod  # noqa: PLC0415
@@ -501,7 +505,7 @@ def test_name_of_a_lost_only_word_beyond_the_cap_keeps_the_general_query_uncappe
     real = recall_mod.search_with_loss
 
     def spy(persona_dir, st, query, **kwargs):
-        calls.append({"query": list(query), "lost_query": kwargs.get("lost_query")})
+        calls.append({"query": query, "lost_query": kwargs.get("lost_query")})
         return real(persona_dir, st, query, **kwargs)
 
     with (
@@ -509,8 +513,8 @@ def test_name_of_a_lost_only_word_beyond_the_cap_keeps_the_general_query_uncappe
         patch.object(prompt_mod, "run_semantic_recall", return_value=None),
     ):
         _build_recall_block(store, message, persona_dir=tmp_path)
-    assert len(calls) == 1
-    assert len(calls[0]["query"]) == 12
+    assert len(calls) == 1, "one search_with_loss call: the graveyard is fed once"
+    assert calls[0]["query"] == " ".join(legacy)
     assert calls[0]["lost_query"] == " ".join(legacy)
 
 
@@ -540,3 +544,96 @@ def test_block_frame_and_section_order_are_preserved_on_a_merged_turn(tmp_path: 
     ]
     assert order == sorted(order)
     assert any(re.match(r'^    - \S+: "', ln) for ln in lines), "bullet format `    - <id>: \"<text>\"`"
+
+
+# ---------------------------------------------------------------------------
+# S79: keyword order = name query (R5 seam), today's capped selection, then the
+# remaining tokens filling only the leftover slots.
+# ---------------------------------------------------------------------------
+
+
+def test_tier_two_hits_follow_every_tier_one_hit(tmp_path: Path) -> None:
+    store = MemoryStore(":memory:")
+    target, message = _cap_fixture(store)
+    rows = _active_rows(_render(store, message, tmp_path, None))
+    ids = [r[0] for r in rows]
+    decoy_id = next(mid for mid, body in rows if body.startswith("decoy"))
+    assert ids[0] == decoy_id, "tier 1 (today's capped search) leads"
+    assert target.id in ids[1:], "tier 2 (the tokens beyond the cap) follows and adds"
+
+
+def test_tier_two_only_fills_leftover_slots(tmp_path: Path) -> None:
+    """Enough tier-1 hits to fill the cap leave no slot for tier 2: nothing
+    today's search finds is displaced by the extra tokens (S79, C12)."""
+    store = MemoryStore(":memory:")
+    target, message = _cap_fixture(store)
+    tier_one = [_mem(store, f"{_RARE[i % 10]} {_RARE[(i + 1) % 10]} tier one entry {i}") for i in range(10)]
+    ids = [r[0] for r in _active_rows(_render(store, message, tmp_path, None))]
+    assert len(ids) == SNIPPET_COUNT
+    assert target.id not in ids
+    tier_one_ids = {m.id for m in tier_one} | {
+        mid for mid, body in _active_rows(_render(store, message, tmp_path, None)) if body.startswith("decoy")
+    }
+    assert set(ids) <= tier_one_ids, "every rendered hit is a tier-1 hit"
+
+
+def test_tier_one_alone_equals_todays_search_when_nothing_is_beyond_it(tmp_path: Path) -> None:
+    """A message of 10 or fewer salient tokens, all 3+ characters, has no tier 2:
+    exactly one FTS query, the raw string base code sent."""
+    store = MemoryStore(":memory:")
+    for i in range(3):
+        _mem(store, f"quokka harbour entry {i}")
+    queries: list = []
+    original = MemoryStore.search_fts_scored
+
+    def spy(self, query, **kwargs):
+        queries.append(query)
+        return original(self, query, **kwargs)
+
+    with patch.object(MemoryStore, "search_fts_scored", spy):
+        _render(store, "quokka harbour", tmp_path, None)
+    assert queries == [" ".join(_legacy_capped_tokens(_extract_recall_tokens("quokka harbour", store)))]
+
+
+def test_a_two_letter_token_in_the_old_top_ten_is_searched_in_tier_two(tmp_path: Path) -> None:
+    """The store's 3-character floor stays in tier 1 (so it equals base); a
+    2-letter acronym the selector kept still reaches the store, via tier 2 (S36)."""
+    store = MemoryStore(":memory:")
+    ai = _mem(store, "Bob showed Canary an AI notebook about tide tables")
+    for i in range(3):
+        _mem(store, f"harbour filler entry {i}")
+    ids = [r[0] for r in _active_rows(_render(store, "AI harbour", tmp_path, None))]
+    assert ai.id in ids
+
+
+# ---------------------------------------------------------------------------
+# S80: the "up to 3" counts only hits shown full BECAUSE of the importance rule.
+# ---------------------------------------------------------------------------
+
+
+def test_importance_rule_quota_ignores_hits_already_full_by_position(tmp_path: Path) -> None:
+    store = MemoryStore(":memory:")
+    sem = [_mem(store, f"harbour gull entry {i} " + _LONG.replace("quokka", "gull")) for i in range(3)]
+    for i in range(6):
+        _mem(store, f"{_LONG} (important {i})", importance=9.5 - 0.1 * i)
+    rows = _active_rows(_render(store, "quokka", tmp_path, _semantic(full=sem)))
+    assert len(rows) == 9
+    fulls = sum(1 for _, body in rows if not _is_snippet(body))
+    # 3 semantic + keyword positions 4 and 5 by position + 3 promoted by importance beyond position 5
+    assert fulls == 3 + 2 + FULL_INJECT_MAX
+    assert _is_snippet(rows[-1][1])
+
+
+def test_a_fading_memory_reachable_only_through_tier_two_is_still_softened_in(tmp_path: Path) -> None:
+    """Tier 2 adds to the softened (fading) section too, after tier 1's hits.
+    (The fade is a direct state update: `store.fade` would embed.)"""
+    store = MemoryStore(":memory:")
+    _target, message = _cap_fixture(store)
+    faded = _mem(store, "an old harbour morning long since faded from that summer")
+    store._conn.execute(  # noqa: SLF001
+        "UPDATE memories SET state = 'fading', content_snapshot = content WHERE id = ?", (faded.id,)
+    )
+    store._conn.commit()  # noqa: SLF001
+    block = _render(store, message, tmp_path, None)
+    assert "softened (fading" in block
+    assert "an old harbour" in block

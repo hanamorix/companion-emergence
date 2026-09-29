@@ -142,40 +142,22 @@ def test_rare_token_recall_without_short_tokens_is_not_below_base(rare_noshort, 
     assert got >= BASE_RARE_NOSHORT_AT_8 - _EPS, f"recall@8 {got} < base {BASE_RARE_NOSHORT_AT_8}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "C12 set (iii) shape FAILS: a target reached through ONE rare word, in a query that also "
-        "carries short tokens the admission change lets through (acronyms, digits, short words of "
-        "moderate frequency, S36) plus 12 high-frequency words, is outranked by memories matching "
-        "several of those short tokens (recall@8 0.875 vs base 0.958 here; 0.667 vs 0.833 on the "
-        "synthetic DB copy, c12_syn_f.py). The same queries WITHOUT short tokens do not regress. "
-        "Question to Planning/owner in R4/5-build.md; remove this marker when a ruling lands and "
-        "the gate is met."
-    ),
-)
 def test_rare_token_recall_at_8_is_not_below_base(rare, tmp_path: Path) -> None:
+    """C12 set (iii) shape. It FAILED for the plain uncapped single query (recall@8
+    0.875 vs base 0.958 here; 0.667 vs 0.833 on the synthetic DB copy) because
+    mid-frequency short tokens then competed with the one rare word; S79's tiers
+    (today's capped query first, the rest only in leftover slots) fix it."""
     store, queries, _ = rare
     got = recall_at(store, queries, cutoff=_KEYWORD_ONLY_CUTOFF, persona_dir=tmp_path)
     assert got >= BASE_RARE_AT_8 - _EPS, f"recall@8 {got} < base {BASE_RARE_AT_8}"
 
 
-def test_a_variant_admitting_every_raw_token_scores_below_base_on_a_set(rare, tmp_path: Path) -> None:
-    """Able to fail (oracle rule): the fixtures discriminate. A selector that
-    admits EVERY raw token, stopwords included, scores below the base on the
-    rare-token set at its own cutoff."""
-
-    def every_raw_token(user_input: str, store=None) -> list[str]:
-        out: list[str] = []
-        for m in re.finditer(r"[A-Za-z0-9]+", user_input):
-            tok = m.group().lower()
-            if tok not in out:
-                out.append(tok)
-        return out
-
+def test_the_plain_uncapped_single_query_scores_below_base_on_the_rare_set(rare, tmp_path: Path) -> None:
+    """Able to fail (oracle rule): the fixture discriminates. The build this
+    increment started from, ONE uncapped query over every token, scores below
+    base on the rare-token set at its own cutoff; the tiered search does not."""
     store, queries, _ = rare
-    with patch("brain.chat.prompt._extract_recall_tokens", every_raw_token):
+    with patch("brain.chat.prompt._keyword_tiers", lambda tokens, legacy: (tokens, [])):
         got = recall_at(store, queries, cutoff=_KEYWORD_ONLY_CUTOFF, persona_dir=tmp_path)
     assert got < BASE_RARE_AT_8 - _EPS
 
@@ -183,16 +165,18 @@ def test_a_variant_admitting_every_raw_token_scores_below_base_on_a_set(rare, tm
 def test_a_capped_selector_with_short_token_admission_scores_below_base_on_the_control_set(
     control, tmp_path: Path
 ) -> None:
-    """Able to fail (oracle rule), the discriminating variant: keeping the old
-    ten-token cap while the store admits the short tokens scores BELOW the base
-    on the control set (the base drops those tokens at the store, so the cap
-    then costs it nothing), which the as-built code does not."""
+    """Able to fail, second variant: keeping the old cap while the store admits
+    the short tokens in the one query (no tier split) scores below the base on
+    the control set."""
     real = _extract_recall_tokens
 
     def capped(user_input: str, store=None) -> list[str]:
         return _legacy_capped_tokens(real(user_input, store))
 
     store, queries, _ = control
-    with patch("brain.chat.prompt._extract_recall_tokens", capped):
+    with (
+        patch("brain.chat.prompt._extract_recall_tokens", capped),
+        patch("brain.chat.prompt._keyword_tiers", lambda tokens, legacy: (tokens, [])),
+    ):
         got = recall_at(store, queries, cutoff=_KEYWORD_ONLY_CUTOFF, persona_dir=tmp_path)
     assert got < BASE_CONTROL_AT_8 - _EPS
