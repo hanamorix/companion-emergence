@@ -1067,6 +1067,13 @@ def _build_recall_block(
     with a high-importance full-inject bypass, and stop bumping recall_count on
     mere surfacing.
 
+    Name protection (name-recall fix R5, spec §5, S27): the persona's known
+    names found in ``user_input`` (raw words, before the stopword and length
+    rules) run ONE extra keyword query, sent as FTS phrases through the same
+    ranker on the same hebbian handle; its active and fading hits lead the
+    keyword hits (S79: name query, then tier 1, then tier 2). It never feeds
+    the graveyard. A message that is only a known name still recalls.
+
     Strategy: extract salient content tokens from ``user_input`` (drop
     stopwords/short fragments; ranked by corpus IDF + proper-noun bonus —
     Tier-1 recall-query fix; name-recall fix R4: EVERY surviving token is
@@ -1257,16 +1264,23 @@ def _build_recall_block(
             # Tier 1 (spec §5, S79): TODAY's search, the old capped selection
             # joined into one raw-string query, so nothing it finds is lost; the
             # graveyard is fed the same string (P-14/P-25, Q16 interim).
-            result = search_with_loss(
-                persona_dir,
-                store,
-                capped_query,
-                limit=limit * 2,
-                hebbian=heb,
-                lost_query=capped_query,
-                # The monologue family ranks after every genuine memory in the
-                # ranker's pool and window (spec §4, S16, Acceptance 8).
-                genuine_first=True,
+            # A message that is only a known name has no selector token, so this
+            # query is empty: skip the call (an empty lost query would match
+            # EVERY graveyard entry and fire grief touches on a name-only turn).
+            result = (
+                search_with_loss(
+                    persona_dir,
+                    store,
+                    capped_query,
+                    limit=limit * 2,
+                    hebbian=heb,
+                    lost_query=capped_query,
+                    # The monologue family ranks after every genuine memory in
+                    # the ranker's pool and window (spec §4, S16, Acceptance 8).
+                    genuine_first=True,
+                )
+                if capped_query
+                else None
             )
         except Exception:  # noqa: BLE001
             result = None

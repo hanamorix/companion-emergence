@@ -292,3 +292,31 @@ def test_a_failing_names_lookup_leaves_the_tool_working(tmp_path: Path) -> None:
     with patch("brain.memory.relevance.load_known_names", side_effect=RuntimeError("boom")):
         ids = _ids(_lexical(ctx, "pretzel zorblax quixotic"))
     assert ids[0] == general.id
+
+
+def test_the_name_query_gets_the_tools_hebbian_handle_and_orders_by_blended_score(tmp_path: Path) -> None:
+    persona = tmp_path / "listed"
+    ctx = _ctx(persona)
+    low = _mem(ctx["store"], "Pretzel is a scruffy terrier mix, the quiet one")
+    high = _mem(ctx["store"], "Pretzel is a scruffy terrier mix, the loud one")
+    ctx["store"]._conn.execute(  # noqa: SLF001
+        "UPDATE memories SET importance = 8.0 WHERE id = ?", (high.id,)
+    )
+    ctx["store"]._conn.execute(  # noqa: SLF001
+        "UPDATE memories SET importance = 2.0 WHERE id = ?", (low.id,)
+    )
+    ctx["store"]._conn.commit()  # noqa: SLF001
+    _list(persona, "Pretzel")
+    import brain.tools.impls.search_memories as tool  # noqa: PLC0415
+
+    handles: list = []
+    real = tool.rank_name_hits
+
+    def spy(store, hebbian, names, **kw):
+        handles.append(hebbian)
+        return real(store, hebbian, names, **kw)
+
+    with patch.object(tool, "rank_name_hits", spy):
+        ids = _ids(_lexical(ctx, "pretzel"))
+    assert handles == [ctx["hebbian"]]
+    assert ids == [high.id, low.id]

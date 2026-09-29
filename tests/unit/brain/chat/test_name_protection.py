@@ -410,7 +410,6 @@ def test_the_name_query_shares_the_turns_one_hebbian_handle(tmp_path: Path) -> N
 
 
 def test_a_matched_name_the_store_has_never_seen_is_listed_as_not_recognised(tmp_path: Path) -> None:
-    message = "quill zorblax"  # two df>0 words keep the block alive on their own
     _, before = _twin(tmp_path, "empty", "zed zorblax")
     assert "zed" in _not_recognised(before), "precondition: a 3-letter unknown is listed today"
 
@@ -420,7 +419,29 @@ def test_a_matched_name_the_store_has_never_seen_is_listed_as_not_recognised(tmp
     assert "ed" not in _not_recognised(without)
     _, with_name = _twin(tmp_path, "with", "ed zorblax", list_names=["Ed"])
     assert "ed" in _not_recognised(with_name)
-    del message
+
+
+def test_a_matched_name_the_store_knows_is_not_listed_as_not_recognised(tmp_path: Path) -> None:
+    """A listed name with memories (df > 0) is not 'not recognised', however it
+    is typed: the lookup must include the names' own words."""
+    _, block = _twin(tmp_path, "listed", "will zorblax quixotic", direct=["will"])
+    assert "will" not in _not_recognised(block)
+    _, block2 = _twin(tmp_path, "listed2", "al zorblax quixotic", list_names=["Al"])
+    assert "al" not in _not_recognised(block2)
+
+
+def test_a_single_word_name_that_is_also_a_selector_token_is_listed_once(tmp_path: Path) -> None:
+    _, block = _twin(tmp_path, "listed", "glimmer zorblax", list_names=["Glimmer"])
+    assert _not_recognised(block).count("glimmer") == 1
+
+
+def test_a_multi_word_name_is_listed_when_any_word_is_unknown_not_only_the_first(tmp_path: Path) -> None:
+    # 'harbour' is in the store (df > 0); 'glimmer' is not
+    _, block = _twin(tmp_path, "second", "harbour glimmer zorblax", list_names=["Harbour Glimmer"])
+    assert "harbour glimmer" in _not_recognised(block)
+    # every word known: the phrase is not listed
+    _, block2 = _twin(tmp_path, "known", "ferry engine zorblax", list_names=["Ferry Engine"])
+    assert "ferry engine" not in _not_recognised(block2)
 
 
 def test_a_multi_word_name_with_an_unknown_word_is_listed_by_its_phrase(tmp_path: Path) -> None:
@@ -462,8 +483,10 @@ def test_no_persona_dir_means_no_name_protection_and_no_crash(tmp_path: Path) ->
     persona.mkdir()
     w = _world(persona)
     _list_names(persona, "Pretzel")
+    # (the no-persona_dir block has a different bullet shape; compare by content)
     block = _build_recall_block(w.store, "pretzel zorblax quixotic", persona_dir=None)
-    assert "zorblax" in block or "Pretzel" in block
+    lines = [ln for ln in block.splitlines() if ln.startswith("- [importance")]
+    assert "zorblax" in lines[0], "the general hit still leads: no list is read without a persona_dir"
 
 
 def test_a_name_hit_that_is_also_a_short_word_hit_is_not_demoted_in_the_importance_quota(
@@ -497,3 +520,54 @@ def test_a_name_hit_that_is_also_a_short_word_hit_is_not_demoted_in_the_importan
     w, general, al, persona = build("listed", True)
     rows = _rows(_render(w, message, persona))
     assert rows[0][0] == al.id and not rows[0][1].endswith("…"), "the leading name hit renders in full"
+
+
+def test_a_message_that_is_only_a_listed_name_never_queries_the_graveyard_with_nothing(tmp_path: Path) -> None:
+    """The name-only path has no selector token, so the general query is empty.
+    An empty lost query would match EVERY graveyard entry (and fire grief
+    touches): the general search is skipped and the graveyard is not called."""
+    persona = tmp_path / "p"
+    persona.mkdir()
+    w = _world(persona)
+    _list_names_direct(persona, "will")
+    _bury(persona, "A summary of some long forgotten harbour afternoon", "mem-lost-a")
+    _bury(persona, "Another lost note about the ferry timetable", "mem-lost-b")
+    queries: list[str] = []
+    real = gv.search
+
+    def spy(persona_dir, query, **kw):
+        queries.append(query)
+        return real(persona_dir, query, **kw)
+
+    with (
+        patch("brain.forgetting.recall.graveyard.search", spy),
+        patch("brain.grief.handle_recall_touch") as touch,
+    ):
+        block = _render(w, "will", persona)
+    assert queries == [], "the graveyard is not called at all on a name-only turn"
+    assert "lost (no longer in active memory)" not in block
+    assert touch.call_count == 0
+    assert _ids(block) == [w.will.id]
+
+
+def test_name_hits_are_ordered_among_themselves_by_blended_score(tmp_path: Path) -> None:
+    def build(name: str):
+        persona = tmp_path / name
+        persona.mkdir()
+        persist_felt_time(FeltTimeState(lived_age_hours=48.0), persona)
+        store = MemoryStore(":memory:")
+        low = _mem(store, "Pretzel is a scruffy terrier mix, the quiet one", importance=2.0)
+        high = _mem(store, "Pretzel is a scruffy terrier mix, the loud one", importance=8.0)
+        low_f = _mem(store, "Quiet Pretzel faded into the old summer", importance=2.0)
+        high_f = _mem(store, "Loud Pretzel faded into the old summer", importance=8.0)
+        _fade(store, low_f)
+        _fade(store, high_f)
+        _list_names(persona, "Pretzel")
+        w = SimpleNamespace(store=store)
+        return w, low, high, persona
+
+    w, low, high, persona = build("p")
+    block = _render(w, "pretzel", persona)
+    assert _ids(block) == [high.id, low.id], "the better blended score leads within the name hits"
+    softened = _softened(block)
+    assert softened[0].startswith("Loud") and softened[1].startswith("Quiet")

@@ -240,8 +240,8 @@ def names_in(persona_dir: Path | str | None, text: str) -> list[str]:
         return []
     try:
         return match_known_names(text, load_known_names(persona_dir))
-    except Exception:  # noqa: BLE001 - name protection must never break recall
-        logger.warning("known names: lookup failed; no name protection this call", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - name protection must never break recall
+        logger.warning("known names: lookup failed (%s); no name protection this call", exc)
         return []
 
 
