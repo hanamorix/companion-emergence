@@ -1,12 +1,13 @@
-"""Name-recall fix R5 (spec §5, S27, S35, S47, S79, S81): name protection in the
+"""Name-recall fix R5 (spec §5, S27, S35, S47, S99): name protection in the
 `search_memories` tool, criterion C5b's name half.
 
 Both modes: the known names in her query (matched on the raw words, before any
 stopword or length rule) run ONE extra keyword query, sent as FTS phrases, whose
 hits lead the keyword hits. Semantic mode keeps its semantic results first (S42)
 and puts the name hits at the head of the keyword hits that fill the leftover
-slots. S81 (every word of her query is searched) is unchanged: a listed name is
-protected in RANK, not merely found.
+slots. The general keyword search is today's (the raw query, the store's
+3-character floor, S99), so a listed name is protected in RANK, and a listed
+2-letter name is FOUND at all only through the name query.
 
 Every "leads" assertion has its precondition run on a twin persona with an empty
 list. Driven through the real `dispatch` path like
@@ -104,8 +105,8 @@ def test_lexical_a_listed_lowercase_name_leads(tmp_path: Path) -> None:
 
 
 def test_lexical_a_name_beyond_the_old_ten_token_window_still_leads(tmp_path: Path) -> None:
-    """S81 sends every word; the name query does not depend on where the name
-    falls in the query."""
+    """The raw query has no word cap (S99) and the name query does not depend on
+    where the name falls in the query."""
     filler = "alpha bravo charlie delta echo foxtrot golf hotel india juliet"  # 10 words, in no memory
     query = f"{filler} zorblax quixotic pretzel"
     ctx0, general0, _, _, _ = _world(tmp_path / "empty")
@@ -119,7 +120,9 @@ def test_lexical_a_name_beyond_the_old_ten_token_window_still_leads(tmp_path: Pa
 def test_lexical_a_listed_two_letter_name_leads(tmp_path: Path) -> None:
     ctx0, general0, _, al0, _ = _world(tmp_path / "empty")
     ids0 = _ids(_lexical(ctx0, "al zorblax quixotic"))
-    assert ids0[0] == general0.id and ids0.index(al0.id) > 0, "precondition: the 2-letter word only follows"
+    assert ids0[0] == general0.id and al0.id not in ids0, (
+        "precondition: today's search drops the 2-letter word, so the memory is not found at all"
+    )
     persona = tmp_path / "listed"
     ctx, _, _, al, _ = _world(persona)
     _list(persona, "Al")
@@ -129,7 +132,7 @@ def test_lexical_a_listed_two_letter_name_leads(tmp_path: Path) -> None:
 def test_lexical_a_listed_stopword_name_leads(tmp_path: Path) -> None:
     ctx0, general0, _, _, will0 = _world(tmp_path / "empty")
     ids0 = _ids(_lexical(ctx0, "will zorblax quixotic"))
-    assert ids0[0] == general0.id and will0.id in ids0, "precondition: S81 finds it, but behind"
+    assert ids0[0] == general0.id and will0.id in ids0, "precondition: found as a plain word, but behind"
     persona = tmp_path / "listed"
     ctx, general, _, _, will = _world(persona)
     _list_direct(persona, "will")
@@ -193,10 +196,10 @@ def test_lexical_exclude_ids_apply_to_the_name_query(tmp_path: Path) -> None:
     assert ids[0] in {pretzel[1].id, pretzel[2].id}
 
 
-def test_lexical_a_name_hit_that_is_also_a_short_word_is_not_a_tier_two_extra(tmp_path: Path) -> None:
-    """Under `order="age"` the tier-2 extras (found only through the 1-2
-    character words) follow everything else. A hit the NAME query found is not
-    an extra: it sorts with the other results by age."""
+def test_lexical_a_name_hit_is_an_ordinary_result_under_order_age(tmp_path: Path) -> None:
+    """Under `order="age"` a name hit sorts with the other results by age (no
+    hit is set apart, S99); without the listing today's search never finds the
+    2-letter name's memory."""
     query = "al zorblax quixotic"
 
     def build(name: str, listed: bool):
@@ -212,13 +215,13 @@ def test_lexical_a_name_hit_that_is_also_a_short_word_is_not_a_tier_two_extra(tm
 
     ctx0, general0, al0 = build("empty", False)
     ids0 = _ids(_lexical(ctx0, query, order="age", limit=5))
-    assert ids0.index(general0.id) < ids0.index(al0.id), "precondition: the extra follows despite being newer"
-    ctx1, _, al1 = build("listed", True)
+    assert ids0 == [general0.id], "precondition: today's search drops the 2-letter word"
+    ctx1, general1, al1 = build("listed", True)
     ids1 = _ids(_lexical(ctx1, query, order="age", limit=5))
-    assert ids1[0] == al1.id, "listed: an ordinary result, so the newer memory leads the age sort"
+    assert ids1 == [al1.id, general1.id], "listed: the newer memory leads the age sort"
 
 
-def test_lexical_family_name_hits_follow_genuine_hits_across_all_tiers(tmp_path: Path) -> None:
+def test_lexical_family_name_hits_follow_genuine_hits(tmp_path: Path) -> None:
     persona = tmp_path / "listed"
     ctx, general, pretzel, _, _ = _world(persona)
     fam = _mem(ctx["store"], "Pretzel, I keep circling Pretzel in my head", memory_type="monologue")
@@ -366,9 +369,8 @@ def _will_world(persona: Path):
 
 
 def test_lexical_name_and_query_hits_lead_then_name_only_then_general(tmp_path: Path) -> None:
-    # The tool sends every word (S81), so its general search (tier 1 + tier 2) also finds
-    # every 'Al' memory through the short-word tier: here group 1 holds A and B1, group 3 C.
-    # A true name-only group is covered by the unit tests of `lead_with_names`.
+    # Today's general search drops the 2-letter word: A and C match the rest of the query,
+    # so group 1 (name and rest) holds A, group 2 (name only) B1, group 3 C.
     persona = tmp_path / "listed"
     ctx = _ctx(persona)
     store = ctx["store"]
@@ -409,19 +411,17 @@ def test_semantic_the_same_order_holds_behind_the_semantic_results(
     assert ids == [sem.id, a.id, b1.id, c.id]
 
 
-def test_a_name_plus_query_hit_found_only_through_tier_two_still_leads(tmp_path: Path) -> None:
-    """Name ('al') and the rest of the query ('ai') are both 2-letter words, so
-    the tool's general search reaches everything through tier 2 only. S89's
-    'general search' counts tier 2: 60 name-only memories must not crowd out the
-    memory matching both."""
+def test_a_query_of_only_two_letter_words_returns_only_the_name_hits(tmp_path: Path) -> None:
+    """Today's search drops every 2-letter word, so 'al ai' reaches memories only
+    through the listed name: the 'Al' memories, never a memory that only holds
+    the acronym 'AI'."""
     persona = tmp_path / "listed"
     ctx = _ctx(persona)
     store = ctx["store"]
-    target = _mem(
-        store,
-        "Al built an AI notebook about tide tables and kept it on the boat all through the long wet autumn season",
-    )
-    for i in range(60):
-        _mem(store, f"Al chased the ball, walk {i}")
+    al = [_mem(store, f"Al chased the ball, walk {i}") for i in range(3)]
+    ai_only = _mem(store, "an AI notebook about tide tables")
+    assert _ids(_lexical(ctx, "al ai", limit=8)) == [], "precondition: nothing without the listing"
     _list(persona, "Al")
-    assert _ids(_lexical(ctx, "al ai", limit=5))[0] == target.id
+    ids = _ids(_lexical(ctx, "al ai", limit=8))
+    assert set(ids) == {m.id for m in al}
+    assert ai_only.id not in ids

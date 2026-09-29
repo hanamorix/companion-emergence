@@ -71,30 +71,18 @@ def _snippet_result(memory) -> dict:
     return result
 
 
-def _query_words(query: str) -> list[str]:
-    """Every word of the kindled's own query, lower-cased and de-duplicated, in
-    order. No stopword drop, no length floor, no cap (spec §5/§7, S81, which
-    supersedes S57 for the tool): the query is deliberate and short, so a
-    lowercase name not yet on the known-names list, or any other word she
-    chose, is still searched."""
-    seen: set[str] = set()
-    words: list[str] = []
-    for m in re.finditer(r"[A-Za-z0-9]+", query):
-        low = m.group().lower()
-        if low not in seen:
-            seen.add(low)
-            words.append(low)
-    return words
-
-
-class _KeywordHits(list):
-    """The tool's keyword hits, best-first, remembering which of them were found
-    ONLY through tier 2 (`tier2_only`, S79): the caller's age sort, emotion boost
-    and co-recall reinforcement must not let those extras displace, reorder
-    ahead of, or link to what tier 1 (today's search) surfaces. (A hit the name
-    query also found is not an extra.)"""
-
-    tier2_only: frozenset[str] = frozenset()
+def _keyword_words(query: str, persona_dir: Path | None) -> frozenset[str]:
+    """The tool's keyword token set for the per-paragraph emptiness test (spec
+    §3): the words the store's raw-query builder admits from the kindled's own
+    query (`split_by_raw_query_floor`, today's 3-character floor, no stopword
+    drop, S99), plus the words of the known names in it (tested after name
+    protection, so a paragraph holding only a listed name is kept). A paragraph
+    with none of these words is dropped, exactly the words the keyword side of
+    this call would search."""
+    words = [m.group().lower() for m in re.finditer(r"[A-Za-z0-9]+", query)]
+    kept, _short = split_by_raw_query_floor(words)
+    names = names_in(persona_dir, query)
+    return frozenset(kept) | {word for name in names for word in name.split()}
 
 
 def _keyword_candidates(
@@ -105,60 +93,35 @@ def _keyword_candidates(
     exclude: frozenset[str],
     persona_dir: Path | None = None,
 ) -> list[Memory]:
-    """The tool's keyword search, every candidate best-first (name-recall fix
-    R4, spec §5, S81, S79): BM25 text-match + importance + hebbian
-    spreading-activation + recency via ``rank_memories`` over EVERY word of
-    ``query`` (`_query_words`), in two tiers so the extra words only add:
-    tier 1 is the words the store's raw-string builder has always searched (3+
-    characters, stopwords included, exactly what this tool sent before); tier 2
-    is the 1-2 character words (a 2-letter name, an acronym, a digit, S36),
-    whose hits follow every tier-1 hit and so only fill leftover slots. (Sent
-    in ONE query they out-rank the rare word the kindled asked about: the #147
-    fear, measured on the control fixtures.) Monologue-family hits follow
-    genuine ones (spec §4, S16, ``genuine_first``). ``exclude`` ids are removed
-    before ranking.
+    """The tool's keyword search, every candidate best-first (both modes): today's
+    ranker exactly, plus the name query (name-recall fix R4/R5, spec §5/§7, S99).
 
-    Name protection (R5, spec §5, S27, S35, S79), BOTH modes: the known names
-    in her query (matched on the raw words, before any stopword or length rule;
+    The general search is what this tool has always done: the raw ``query``
+    string through ``rank_memories`` (BM25 text-match + importance + hebbian
+    spreading-activation + recency), which the store tokenizes itself (3+
+    character words, OR-joined). No every-word rule, no tiers, no cap change and
+    no short-token admission for the tool (S99: finer kindled control over the
+    tool is its own issue, #319); ``exclude`` ids are removed before ranking.
+    The monologue family ranks after every genuine hit, in the candidate pool
+    and in the result (``genuine_first``, spec §4 / criterion 8, which names the
+    tool; not one of the S81 rules S99 removes).
+
+    Name protection (R5, spec §5, S27, S35), BOTH modes: the known names in her
+    query (matched on the raw words, before any stopword or length rule;
     ``persona_dir`` locates the list) run ONE extra keyword query, sent as FTS
-    phrases; its hits lead this list (S89: those the general search, tier 1 and
-    tier 2, also found first, then name-only hits, then the general hits;
-    genuine before monologue family across all of them, spec §4). No graveyard is involved
-    here. Every word of her query is still searched (S81), so a listed name is
-    protected in rank, not merely found.
+    phrases; its hits lead this list (S89: those the general search also found
+    first, then name-only hits, then the general hits). No graveyard is involved
+    here. Without a listed name in her query the result is exactly today's.
     """
-    words = _query_words(query)
-    if not words:
-        return []
-    kept, short = split_by_raw_query_floor(words)
+    ranked = rank_memories(
+        store, hebbian, query, limit=CANDIDATE_POOL, exclude_ids=exclude, genuine_first=True
+    )
+    general = [m for m, _ in ranked]
     names = names_in(persona_dir, query)
     name_ranked = rank_name_hits(store, hebbian, names, limit=CANDIDATE_POOL, exclude_ids=exclude)
-    name_hits = [m for m, _ in name_ranked]
-    tiers: list[list[Memory]] = []
-    for tier_words in (kept, short):
-        if not tier_words:
-            continue
-        ranked = rank_memories(
-            store, hebbian, tier_words, limit=CANDIDATE_POOL, exclude_ids=exclude, genuine_first=True
-        )
-        tiers.append([m for m, _ in ranked])
-    seen: set[str] = set()
-    general: list[Memory] = []
-    for tier in tiers:
-        for m in tier:
-            if m.id not in seen:
-                seen.add(m.id)
-                general.append(m)
-    # S89: name hits the general search also found first, then name-only hits,
-    # then the general hits; the family after every genuine hit (spec §4).
-    hits = _KeywordHits(genuine_first_memories(lead_with_names(name_hits, general, names)))
-    if len(tiers) == 2:
-        hits.tier2_only = (
-            frozenset(m.id for m in tiers[1])
-            - {m.id for m in tiers[0]}
-            - {m.id for m in name_hits}
-        )
-    return hits
+    # The monologue family follows every genuine hit (spec §4, S16, criterion 8:
+    # "in passive recall and the tool"); a separate rule from the words searched.
+    return genuine_first_memories(lead_with_names([m for m, _ in name_ranked], general, names))
 
 
 def _lexical_candidates(
@@ -170,14 +133,11 @@ def _lexical_candidates(
     exclude: frozenset[str],
     persona_dir: Path | None = None,
 ) -> list[Memory]:
-    """``mode="lexical"``: the keyword search (``_keyword_candidates``, name
-    query first, R5), first ``limit`` results (still remembering which came
-    only from tier 2). Shares the emotion-boost/formatting tail below with the
-    semantic mode."""
+    """``mode="lexical"``: today's keyword ranker plus the name query (R5, S99),
+    the first ``limit`` results. Shares the emotion-boost/formatting tail below
+    with the semantic mode."""
     hits = _keyword_candidates(store, hebbian, query, exclude=exclude, persona_dir=persona_dir)
-    first = _KeywordHits(hits[:limit])
-    first.tier2_only = getattr(hits, "tier2_only", frozenset())
-    return first
+    return hits[:limit]
 
 
 @dataclass(frozen=True)
@@ -260,12 +220,12 @@ def _semantic_top_k(
         # Name-recall fix R6 (spec §3, S29): her query is searched per
         # paragraph like passive recall (same split, pool, budget, allocation
         # and per-paragraph rerank or cosine path; no calibration row, S56).
-        # Its keyword words are every word she typed (S81), so only a
-        # paragraph with no word at all is dropped.
+        # A paragraph with none of the words this call's keyword side
+        # searches (`_keyword_words`, S99) is dropped.
         search = search_paragraphs(
             store,
             query,
-            keyword_words=frozenset(_query_words(query)),
+            keyword_words=_keyword_words(query, persona_dir),
             exclude=exclude,
             log_calibration=False,
         )
@@ -316,22 +276,24 @@ def search_memories(
         nothing clearing a floor) — the returned ``mode`` reflects the path
         actually used ("semantic" iff at least one semantic result
         contributed).
-      - ``"lexical"``: the blended keyword ranker — BM25 text-match +
+      - ``"lexical"``: today's blended keyword ranker — BM25 text-match +
         importance + hebbian spreading-activation + recency, via
-        ``rank_memories`` (see ``_keyword_candidates``). EVERY word of the
-        query is sent, with no stopword drop, no length floor and no cap (spec
-        §5, S81), so 'Henryk preferences personality' finds memories
-        mentioning ANY word, as a union, not the empty AND-intersection, and a
-        lowercase name not yet on the known-names list is still found. A name
-        that IS on the list (matched on her raw words, before any stopword or
-        length rule) adds the one name query (R5, spec §5): its hits lead the
-        keyword results in both modes.
+        ``rank_memories`` (see ``_keyword_candidates``). The raw multi-word
+        query is passed straight through, exactly as before this build: its
+        tokenize+OR split lives in ``store._to_fts_match`` (so 'Henryk
+        preferences personality' finds memories mentioning ANY token, as a
+        union, not the empty AND-intersection), including the store's
+        3-character floor (spec §7, S99: finer kindled control over which
+        words this tool searches is its own issue, #319). The one addition is
+        name protection (R5, spec §5): a name on the known-names list (matched
+        on her raw words, before any stopword or length rule) adds the one
+        name query, whose hits lead the keyword results in both modes.
 
     ``order`` picks how the MATCHED set (whichever ``mode`` produced it) is
     ordered before the final ``limit`` slice (#231, Planning-signed-off
     option A):
-      - ``"relevance"`` (default): the matched candidates in the order ``mode`` ranked them — the
-        matched candidates are fetched at ``limit`` and used as-is, in
+      - ``"relevance"`` (default): the matched
+        candidates are fetched at ``limit`` and used as-is, in
         whatever order ``mode`` already ranked them.
       - ``"age"``: WIDENS the internal fetch to ``CANDIDATE_POOL`` (today 50)
         for BOTH modes — lexical calls ``rank_memories(..., limit=
@@ -403,20 +365,19 @@ def search_memories(
     fetch_limit = CANDIDATE_POOL if resolved_order == "age" else limit
 
     candidates: list[Memory] | None = None
-    tier2_only: frozenset[str] = frozenset()
     if resolved_mode == "semantic":
         semantic = _semantic_top_k(store, persona_dir, query, limit=fetch_limit, exclude=exclude)
         if semantic is None:
             resolved_mode = "lexical"
         else:
             # Name-recall fix R4 (spec §5, S8/S35, P-21): the keyword search
-            # merges in below the semantic results, filling the slots they leave
-            # under the fetch limit. The reported mode stays "semantic": at
-            # least one semantic result contributed.
+            # (today's, plus the name query, S99) merges in below the semantic
+            # results, filling the slots they leave under the fetch limit. The
+            # reported mode stays "semantic": at least one semantic result
+            # contributed.
             keyword = _keyword_candidates(
                 store, hebbian, query, exclude=exclude, persona_dir=persona_dir
             )
-            tier2_only = getattr(keyword, "tier2_only", frozenset())
             # Spec §4, S97/S98: the six result groups in the dev-constants
             # order, each paragraph's guaranteed slot kept first.
             candidates = merge_with_keyword(
@@ -426,38 +387,22 @@ def search_memories(
         candidates = _lexical_candidates(
             store, hebbian, query, limit=fetch_limit, exclude=exclude, persona_dir=persona_dir
         )
-        tier2_only = getattr(candidates, "tier2_only", frozenset())
 
-    def _tail_order(group: list[Memory]) -> list[Memory]:
-        """The caller's own re-ordering requests (`order="age"`, `emotion`) on
-        one group of candidates."""
-        if resolved_order == "age":
-            group = sorted(group, key=lambda m: m.created_at, reverse=True)
-        if emotion is not None:
-            emotion_lower = emotion.lower().strip()
-            # Partition: emotion-matching memories first, then the rest.
-            # Use id-set membership (O(n)) rather than object identity (O(n²)).
-            boosted = [m for m in group if emotion_lower in {k.lower() for k in m.emotions}]
-            boosted_ids = {m.id for m in boosted}
-            group = boosted + [m for m in group if m.id not in boosted_ids]
-        return group
+    if resolved_order == "age":
+        candidates = sorted(candidates, key=lambda m: m.created_at, reverse=True)
 
-    if tier2_only and (resolved_order == "age" or emotion is not None):
-        # S79: hits found only through the 1-2 character words are EXTRAS. They
-        # are ordered among themselves and follow every other candidate, so an
-        # age sort or an emotion boost can never let them displace a result
-        # today's search (or the semantic path) already returns.
-        ordered = _tail_order([m for m in candidates if m.id not in tier2_only]) + _tail_order(
-            [m for m in candidates if m.id in tier2_only]
-        )
+    if emotion is not None:
+        emotion_lower = emotion.lower().strip()
+        # Partition: emotion-matching memories first, then the rest.
+        # Use id-set membership (O(n)) rather than object identity (O(n²)).
+        boosted = [m for m in candidates if emotion_lower in {k.lower() for k in m.emotions}]
+        boosted_ids = {m.id for m in boosted}
+        rest = [m for m in candidates if m.id not in boosted_ids]
+        ordered = boosted + rest
     else:
-        ordered = _tail_order(candidates)
+        ordered = candidates
 
-    # Co-recall reinforcement is a persistent write: never link the anchor to an
-    # extra found only through a 1-2 character word (S79, S81).
-    _reinforce_corecall(
-        hebbian, [m for m in ordered if m.id not in tier2_only][: _CORECALL_FANOUT + 1]
-    )
+    _reinforce_corecall(hebbian, ordered[: _CORECALL_FANOUT + 1])
     results = [_snippet_result(m) for m in ordered[:limit]]
 
     return {

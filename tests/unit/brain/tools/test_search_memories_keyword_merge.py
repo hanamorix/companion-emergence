@@ -1,11 +1,12 @@
-"""Name-recall fix R4 (spec §5, S8, S35, S52, S79, S81; plan P-21): `search_memories`
+"""Name-recall fix R4 (spec §5, S8, S35, S99; plan P-21): `search_memories`
 
   - semantic mode merges the keyword search in BELOW the semantic results, in
     the slots they leave under the limit (criteria C7, C8, C5b);
-  - the keyword side (both modes) sends EVERY word of the query, no stopword
-    drop and no cap (S81, superseding S57 for the tool), in two tiers: the
-    words the store has always searched (3+ characters), then the 1-2 character
-    words, whose hits only fill leftover slots (S79).
+  - the keyword side (both modes) is exactly today's search (S99): the raw
+    query string through `rank_memories`, the store's 3-character floor, no
+    every-word rule, no tiers, no short-token admission (finer kindled control
+    is its own issue, #319); the name query is the only addition (R5, in
+    `test_search_memories_name_protection.py`).
 
 Driven through the real `dispatch` path with a scripted embedder and reranker,
 like `test_search_memories_mode.py`. Synthetic data only.
@@ -264,7 +265,7 @@ def test_a_family_flood_larger_than_the_candidate_pool_cannot_hide_genuine_hits(
 
 
 # ---------------------------------------------------------------------------
-# C5b (S57): the tool's lexical mode goes through the recall selector, no cap.
+# C5b (S99): the tool's keyword side is today's search, in both modes.
 # ---------------------------------------------------------------------------
 
 _RARE = ["zephyr", "mosaic", "lantern", "orchid", "pewter", "saffron", "tundra", "velvet", "willow", "yonder"]
@@ -279,10 +280,9 @@ def _cap_store(store: MemoryStore) -> Memory:
     return target
 
 
-def test_lexical_mode_sends_every_word_of_the_query_to_the_ranker_in_two_tiers(tmp_path: Path) -> None:
-    """S81 + S79: every word, stopwords included, no cap; the words the raw-string
-    builder has always searched (3+ characters) first, the 1-2 character words
-    as a second ranker call whose hits only follow."""
+def test_lexical_mode_sends_the_raw_query_string_to_the_ranker_once(tmp_path: Path) -> None:
+    """S99: no words split out, no tiers, no second call: the ranker gets the
+    query exactly as the kindled typed it, as it always did (the store splits it)."""
     ctx = _ctx(tmp_path)
     store = ctx["store"]
     target = _cap_store(store)
@@ -294,141 +294,221 @@ def test_lexical_mode_sends_every_word_of_the_query_to_the_ranker_in_two_tiers(t
     seen: list = []
 
     def spy(st, heb, q, **kwargs):
-        seen.append(list(q))
+        seen.append(q)
         return real(st, heb, q, **kwargs)
 
     with patch.object(tool, "rank_memories", spy):
         res = dispatch("search_memories", {"query": query, "mode": "lexical", "limit": 8}, **ctx)
 
     assert res["mode"] == "lexical"
-    assert seen == [["the", *_RARE, *_COMMON, "and"], ["of", "ai"]]
-    assert target.id in _ids(res), "a word beyond the old ten-token cap is searched"
+    assert seen == [query]
+    assert isinstance(seen[0], str)
+    assert target.id in _ids(res), "a word beyond the tenth is searched, as the raw query always did"
 
 
-def test_short_word_hits_only_follow_tier_one_hits(tmp_path: Path) -> None:
+_QUERIES = [
+    "quokka harbour",
+    "the and of quokka",
+    "quokka AI is my",
+    "harbour market notebook tide tables quokka rescue report walk",
+    "AI",
+    "will",
+]
+
+
+def _base_corpus(store: MemoryStore) -> None:
+    for i in range(4):
+        _mem(store, f"quokka rescue report {i} at the harbour market")
+    _mem(store, "an AI notebook about tide tables, and my walk to the market")
+    _mem(store, "Will came by the workshop with a lantern")
+    _mem(store, "my dog is s big, the and of it")
+    for i in range(3):
+        _mem(store, f"harbour filler line {i} about nothing in particular")
+
+
+@pytest.mark.parametrize("query", _QUERIES)
+@pytest.mark.parametrize("limit", [3, 8])
+def test_lexical_results_equal_today_s_ranker_output(tmp_path: Path, query: str, limit: int) -> None:
+    """The base-equality pin: with no listed name in the query, lexical mode
+    returns exactly `rank_memories(store, hebbian, <raw query>, limit=)` (what
+    `origin/main` returns), for stopword, short-word, acronym and long queries."""
+    from brain.memory.relevance import rank_memories  # noqa: PLC0415
+
+    ctx = _ctx(tmp_path)
+    store = ctx["store"]
+    _base_corpus(store)
+    expected = [m.id for m, _ in rank_memories(store, ctx["hebbian"], query, limit=limit)]
+    res = dispatch("search_memories", {"query": query, "mode": "lexical", "limit": limit}, **ctx)
+    assert _ids(res) == expected
+
+
+def test_two_letter_words_are_not_searched_by_the_tool(tmp_path: Path) -> None:
+    """The store's 3-character floor stands for the tool (S99): a 2-character
+    acronym finds nothing, and beside a longer word it adds no hit."""
     ctx = _ctx(tmp_path)
     store = ctx["store"]
     only_long = [_mem(store, f"quokka harbour note {i}") for i in range(3)]
     ai = _mem(store, "an AI notebook, nothing else")
+    assert _ids(dispatch("search_memories", {"query": "AI", "mode": "lexical"}, **ctx)) == []
     ids = _ids(dispatch("search_memories", {"query": "quokka AI", "mode": "lexical", "limit": 8}, **ctx))
-    assert ids[:3] and set(ids[:3]) == {m.id for m in only_long}
-    assert ids[3] == ai.id
-
-    ids2 = _ids(dispatch("search_memories", {"query": "quokka AI", "mode": "lexical", "limit": 3}, **ctx))
-    assert ai.id not in ids2, "with tier 1 filling the limit, the short word displaces nothing"
+    assert set(ids) == {m.id for m in only_long}
+    assert ai.id not in ids, "with room to spare, a short word still pads nothing"
 
 
-def test_lexical_mode_admits_a_two_letter_acronym(tmp_path: Path) -> None:
-    ctx = _ctx(tmp_path)
-    store = ctx["store"]
-    ai = _mem(store, "Bob showed Canary an AI notebook about tide tables")
-    _mem(store, "harbour filler entry")
-    # base behaviour: the raw-string path drops 2-character tokens
-    assert store.search_fts_scored("AI", limit=10) == []
-    res = dispatch("search_memories", {"query": "AI", "mode": "lexical"}, **ctx)
-    assert _ids(res) == [ai.id]
-
-
-def test_a_stopword_query_and_a_lowercase_unlisted_name_are_searched_in_both_modes(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """S81 (supersedes S57 for the tool): no stopword drop, so a lowercase name
-    that is also a stopword ('will'), not yet on any known-names list, finds its
-    memories in lexical mode and in the keyword side of semantic mode."""
+def test_a_three_letter_stopword_query_is_still_searched_as_it_always_was(tmp_path: Path) -> None:
     ctx = _ctx(tmp_path)
     store = ctx["store"]
     will = _mem(store, "Will came by the workshop with a lantern")
     assert _ids(dispatch("search_memories", {"query": "will", "mode": "lexical"}, **ctx)) == [will.id]
     assert _ids(dispatch("search_memories", {"query": "the and of", "mode": "lexical"}, **ctx))
 
+
+def test_semantic_mode_keyword_side_is_the_same_raw_query(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Semantic mode's keyword hits are today's search too: a 2-letter word adds
+    none, and the merge leaves the semantic results first."""
+    from brain.memory.relevance import rank_memories  # noqa: PLC0415
+
+    ctx = _ctx(tmp_path)
+    store = ctx["store"]
     sem = _mem(store, "deep breathing eases racing thoughts")
-    _semantic_setup(monkeypatch, store, "will", [(sem, 6.0)])
-    res = dispatch("search_memories", {"query": "will", "limit": 5}, **ctx)
+    _base_corpus(store)
+    query = "quokka rescue AI is"
+    expected = [m.id for m, _ in rank_memories(store, ctx["hebbian"], query, limit=50)]
+    _semantic_setup(monkeypatch, store, query, [(sem, 6.0)])
+    res = dispatch("search_memories", {"query": query, "limit": 6}, **ctx)
     assert res["mode"] == "semantic"
-    ids = _ids(res)
-    assert ids[0] == sem.id and will.id in ids
+    assert _ids(res) == [sem.id, *expected[:5]]
 
 
-def test_a_tier_two_genuine_hit_precedes_a_tier_one_family_hit(tmp_path: Path) -> None:
+def test_the_semantic_hit_stays_in_the_result_when_the_query_holds_a_short_word(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Round-5 review, finding 1 (MAJOR, at 96493752): in semantic mode a semantic
+    result that also matched a 1-2 character word was demoted to a tier-2 'extra'
+    and could be dropped from the results. With the tiers gone (S99) the semantic
+    hit is sorted like any other result under `order="age"`, whatever short word
+    the query holds, and stays in the results."""
+    from datetime import UTC, datetime, timedelta  # noqa: PLC0415
+
     ctx = _ctx(tmp_path)
     store = ctx["store"]
-    family = _mem(store, "quokka harbour trace note", memory_type="monologue", importance=9.5)
-    genuine = _mem(store, "an AI notebook, nothing else")
-    ids = _ids(dispatch("search_memories", {"query": "quokka AI", "mode": "lexical", "limit": 8}, **ctx))
-    assert ids.index(genuine.id) < ids.index(family.id)
+    sem = _mem(store, "deep breathing is easy and calming")
+    old = _mem(store, f"{_LONG} (old)")
+    new = _mem(store, f"{_LONG} (new)")
+    for m, days in ((sem, 5), (old, 30), (new, 1)):
+        store._conn.execute(  # noqa: SLF001
+            "UPDATE memories SET created_at = ? WHERE id = ?",
+            ((datetime.now(UTC) - timedelta(days=days)).isoformat(), m.id),
+        )
+    store._conn.commit()  # noqa: SLF001
+    _semantic_setup(monkeypatch, store, "quokka is", [(sem, 6.0)])
+    res = dispatch("search_memories", {"query": "quokka is", "limit": 3, "order": "age"}, **ctx)
+    assert res["mode"] == "semantic"
+    assert _ids(res) == [new.id, sem.id, old.id]
 
-
-# ---------------------------------------------------------------------------
-# Round-4 review: tier-2 extras (found only through 1-2 character words) must
-# not displace, out-order or link to what tier 1 (today's search) returns.
-# ---------------------------------------------------------------------------
-
-
-def _short_word_junk(store: MemoryStore, n: int) -> list[Memory]:
-    """Newer memories matching only the 1-2 character words of a query."""
-    return [_mem(store, f"my dog is s big number {i}") for i in range(n)]
-
-
-def test_order_age_never_lets_short_word_extras_displace_tier_one_hits(tmp_path: Path) -> None:
-    ctx = _ctx(tmp_path)
-    store = ctx["store"]
-    targets = [_mem(store, f"quokka rescue report {i}") for i in range(3)]
-    _short_word_junk(store, 20)  # created later: an age sort would put them first
-    query = "quokka rescue, Canary's is my"
-    for order in ("relevance", "age"):
-        ids = _ids(dispatch("search_memories", {"query": query, "mode": "lexical", "limit": 5, "order": order}, **ctx))
-        assert {m.id for m in targets} <= set(ids[:5]), order
-        assert set(ids[:3]) == {m.id for m in targets}, f"tier-1 hits lead under order={order}"
-
-
-def test_an_emotion_boost_cannot_lift_a_short_word_extra_over_tier_one_hits(tmp_path: Path) -> None:
-    ctx = _ctx(tmp_path)
-    store = ctx["store"]
-    tier1 = [_mem(store, f"quokka rescue report {i}") for i in range(3)]
-    joyful = Memory.create_new(content="an AI notebook", memory_type="event", domain="d", emotions={"joy": 8.0})
-    store.create(joyful)
-    ids = _ids(
-        dispatch("search_memories", {"query": "quokka rescue AI", "mode": "lexical", "limit": 3, "emotion": "joy"}, **ctx)
+    # the newest result is the semantic one and three older keyword hits crowd the limit
+    store._conn.execute(  # noqa: SLF001
+        "UPDATE memories SET created_at = ? WHERE id = ?",
+        ((datetime.now(UTC) - timedelta(hours=1)).isoformat(), sem.id),
     )
-    assert set(ids) == {m.id for m in tier1}
+    older = [_mem(store, f"{_LONG} (older {i})") for i in range(3)]
+    for m in older:
+        store._conn.execute(  # noqa: SLF001
+            "UPDATE memories SET created_at = ? WHERE id = ?",
+            ((datetime.now(UTC) - timedelta(days=40)).isoformat(), m.id),
+        )
+    store._conn.execute(  # noqa: SLF001
+        "UPDATE memories SET created_at = ? WHERE id = ?",
+        ((datetime.now(UTC) - timedelta(days=60)).isoformat(), new.id),
+    )
+    store._conn.commit()  # noqa: SLF001
+    res2 = dispatch("search_memories", {"query": "quokka is", "limit": 3, "order": "age"}, **ctx)
+    assert _ids(res2)[0] == sem.id, "the newest result is a semantic one and it is in the results"
 
 
-def test_co_recall_never_links_the_anchor_to_a_short_word_extra(tmp_path: Path) -> None:
+def test_an_emotion_matching_semantic_hit_is_boosted_over_keyword_hits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Same finding 1, emotion half: the boost applies to the whole merged list,
+    the semantic result included."""
     ctx = _ctx(tmp_path)
     store = ctx["store"]
-    _mem(store, "quokka rescue report a")
-    _mem(store, "quokka rescue report b")
-    junk = _short_word_junk(store, 3)
+    sem = Memory.create_new(
+        content="deep breathing is easy and calming", memory_type="event", domain="d", emotions={"joy": 8.0}
+    )
+    store.create(sem)
+    kw = [_mem(store, f"{_LONG} (variant {i})") for i in range(3)]
+    _semantic_setup(monkeypatch, store, "quokka is", [(sem, 6.0)])
+    ids = _ids(dispatch("search_memories", {"query": "quokka is", "limit": 3, "emotion": "joy"}, **ctx))
+    assert ids[0] == sem.id
+    assert set(ids[1:]) <= {m.id for m in kw}
+
+
+def test_co_recall_links_the_anchor_to_the_first_results_as_before(tmp_path: Path) -> None:
+    ctx = _ctx(tmp_path)
+    store = ctx["store"]
+    hits = [_mem(store, f"quokka rescue report {i}") for i in range(6)]
     edges: list[tuple[str, str]] = []
     real = ctx["hebbian"].strengthen
     ctx["hebbian"].strengthen = lambda a, b, delta=0.1: (edges.append((a, b)), real(a, b, delta))[1]
-    dispatch("search_memories", {"query": "quokka rescue is s", "mode": "lexical", "limit": 5}, **ctx)
-    assert edges, "the two tier-1 hits are still linked"
-    assert not ({b for _, b in edges} & {m.id for m in junk})
+    res = dispatch("search_memories", {"query": "quokka rescue is s", "mode": "lexical", "limit": 6}, **ctx)
+    ids = _ids(res)
+    assert {m.id for m in hits} == set(ids)
+    assert [b for _, b in edges] == ids[1:5], "the anchor (first result) links to the next four"
+    assert {a for a, _ in edges} == {ids[0]}
 
 
-def test_exclude_ids_apply_to_tier_two_and_a_hit_in_both_tiers_appears_once(tmp_path: Path) -> None:
+# ---------------------------------------------------------------------------
+# F7 (R6 review; spec §3): the tool's per-paragraph "keyword token set is
+# empty" test uses the words this tool's keyword side actually searches.
+# ---------------------------------------------------------------------------
+
+
+def test_the_tools_paragraph_emptiness_words_are_the_words_its_keyword_side_searches(
+    tmp_path: Path,
+) -> None:
+    import brain.tools.impls.search_memories as tool  # noqa: PLC0415
+    from brain.memory.semantic_recall import split_paragraphs  # noqa: PLC0415
+
+    words = tool._keyword_words("Quokka rescue\nok\nlol\nAI is", tmp_path)  # noqa: SLF001
+    assert words == {"quokka", "rescue", "lol"}, "3+ character words, no stopword drop, no 1-2 character word"
+    kept = split_paragraphs("Quokka rescue\nok\nlol\nAI is", words)
+    assert kept == ["Quokka rescue", "lol"], "'ok' and 'AI is' are dropped, exactly as the keyword side would ignore them"
+
+
+def test_a_listed_names_words_keep_its_paragraph(tmp_path: Path) -> None:
+    """Tested after name protection: a paragraph holding only a listed (2-letter)
+    name is kept even though the raw-query floor would ignore the word."""
+    import brain.tools.impls.search_memories as tool  # noqa: PLC0415
+    from brain.memory import known_names as kn  # noqa: PLC0415
+    from brain.memory.semantic_recall import split_paragraphs  # noqa: PLC0415
+
+    persona = tmp_path / "p"
+    persona.mkdir()
+    assert kn.admit_names(persona, ["Al", "New York"], "tool")
+    text = "quokka rescue\nAl\nok\nnew york"
+    words = tool._keyword_words(text, persona)  # noqa: SLF001
+    assert {"al", "new", "york"} <= words
+    assert split_paragraphs(text, words) == ["quokka rescue", "Al", "new york"]
+
+
+def test_the_tool_passes_that_word_set_to_the_paragraph_search(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import brain.tools.impls.search_memories as tool  # noqa: PLC0415
+
     ctx = _ctx(tmp_path)
-    store = ctx["store"]
-    both = _mem(store, "quokka rescue and an AI notebook")
-    only_short = _mem(store, "an AI notebook")
-    excluded = _mem(store, "another AI notebook")
-    ids = _ids(
-        dispatch(
-            "search_memories",
-            {"query": "quokka AI", "mode": "lexical", "limit": 8, "exclude_ids": [excluded.id]},
-            **ctx,
-        )
-    )
-    assert ids.count(both.id) == 1
-    assert only_short.id in ids and excluded.id not in ids
+    sem = _mem(ctx["store"], "deep breathing eases racing thoughts")
+    _semantic_setup(monkeypatch, ctx["store"], "quokka rescue\nok", [(sem, 6.0)])
+    seen: list = []
+    real = tool.search_paragraphs
 
+    def spy(store, query, **kw):
+        seen.append(kw["keyword_words"])
+        return real(store, query, **kw)
 
-def test_a_family_flood_matching_only_a_short_word_cannot_hide_a_genuine_hit(tmp_path: Path) -> None:
-    ctx = _ctx(tmp_path)
-    store = ctx["store"]
-    for i in range(60):
-        _mem(store, f"ai family note {i}", memory_type="monologue", importance=9.5)
-    genuine = _mem(store, "a plain AI entry", importance=3.0)
-    ids = _ids(dispatch("search_memories", {"query": "AI", "mode": "lexical", "limit": 8}, **ctx))
-    assert ids[0] == genuine.id
+    with patch.object(tool, "search_paragraphs", spy):
+        dispatch("search_memories", {"query": "quokka rescue\nok"}, **ctx)
+    assert seen == [frozenset({"quokka", "rescue"})]

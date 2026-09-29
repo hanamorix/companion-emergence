@@ -52,7 +52,7 @@ BASE_RARE_AT_8 = 0.9583333333333334
 BASE_RARE_NOSHORT_AT_8 = 1.0  # same rare-token queries with NO short tokens: isolates the cap removal
 BASE_CONTROL_SEMANTIC_AT_9 = 0.0  # the base's conclusive semantic result suppresses keyword
 BASE_RARE_SEMANTIC_AT_9 = 0.0
-# The search TOOL's lexical mode (S81), same fixtures, same base: (limit) -> recall.
+# The search TOOL's lexical mode (S99: today's search), same fixtures, same base: (limit) -> recall.
 BASE_TOOL_CONTROL = {3: 1.0, 5: 1.0, 8: 1.0}
 BASE_TOOL_RARE = {3: 0.875, 5: 0.9166666666666666, 8: 1.0}
 _EPS = 1e-9
@@ -187,20 +187,26 @@ def test_a_capped_selector_with_short_token_admission_scores_below_base_on_the_c
 
 
 @pytest.mark.parametrize("limit", [3, 5, 8])
-def test_tool_lexical_recall_is_not_below_base(control, rare, limit: int, tmp_path: Path) -> None:
-    """#147 on the tool (S52, S81): the tool sends every word of a long query, and
-    the 1-2 character words must only add (tier 2), never out-rank the rare word."""
+def test_tool_lexical_recall_equals_base(control, rare, limit: int, tmp_path: Path) -> None:
+    """#147 on the tool (S99): the tool's keyword side is today's search, so its
+    recall on both sets is the base value, not merely not below it."""
     for (store, queries, _), base in ((control, BASE_TOOL_CONTROL), (rare, BASE_TOOL_RARE)):
         got = tool_recall_at(store, queries, limit=limit, persona_dir=tmp_path)
-        assert got >= base[limit] - _EPS, f"tool recall@{limit} {got} < base {base[limit]}"
+        assert abs(got - base[limit]) <= _EPS, f"tool recall@{limit} {got} != base {base[limit]}"
 
 
-def test_a_single_untiered_tool_query_scores_below_base(rare, tmp_path: Path) -> None:
-    """Able to fail: sending every word, short ones included, in ONE query (the
-    tool as first built for S81) drops recall below the base on the rare set."""
+def test_an_every_word_tool_query_is_not_base_equal(rare, tmp_path: Path) -> None:
+    """Able to fail: sending every word, short ones included, in one token-list
+    query (the tool as built for S81) scores below base on the rare set, so the
+    equality test above would catch a return to it."""
     import brain.tools.impls.search_memories as tool  # noqa: PLC0415
 
+    real = tool.rank_memories
+
+    def every_word(store, hebbian, query, **kwargs):
+        return real(store, hebbian, re.findall(r"[A-Za-z0-9]+", query.lower()), **kwargs)
+
     store, queries, _ = rare
-    with patch.object(tool, "split_by_raw_query_floor", lambda words: (list(words), [])):
+    with patch.object(tool, "rank_memories", every_word):
         got = tool_recall_at(store, queries, limit=3, persona_dir=tmp_path)
     assert got < BASE_TOOL_RARE[3] - _EPS

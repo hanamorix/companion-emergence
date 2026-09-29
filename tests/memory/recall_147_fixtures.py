@@ -232,7 +232,7 @@ def tool_recall_at(
     persona_dir: Path,
 ) -> float:
     """Mean over queries of |targets among the `limit` results of the search
-    TOOL in lexical mode| / |targets| (the tool's keyword side, S81; the same
+    TOOL in lexical mode| / |targets| (the tool's keyword side, S99; the same
     fixtures and labels as `recall_at`). Runs on the base code too."""
     from brain.memory.hebbian import HebbianMatrix
     from brain.tools.dispatch import dispatch
