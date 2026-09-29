@@ -7,12 +7,11 @@ from pathlib import Path
 from typing import Literal
 
 from brain.memory import embeddings as embeddings_mod
-from brain.memory import reranker as reranker_mod
 from brain.memory.embedding_matrix import build_embedding_matrix
 from brain.memory.embeddings import cosine_similarity
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.relevance import CANDIDATE_POOL, rank_memories, snippet_length
-from brain.memory.semantic_recall import build_semantic_candidate_pool
+from brain.memory.semantic_recall import build_semantic_candidate_pool, rank_and_gate
 from brain.memory.store import Memory, MemoryStore
 from brain.tools.impls._common import _mem_to_result
 
@@ -86,7 +85,7 @@ def _semantic_top_k(
     limit: int,
     exclude: frozenset[str],
 ) -> list[Memory] | None:
-    """Top-K reranked memories for an ACTIVE search call.
+    """Top-K semantically matched memories for an ACTIVE search call.
 
     #231 RERANKER RE-ARCHITECTURE (Q1, resolved 2026-09-10): embeds ``query``
     once via the shared process-cached embedding provider
@@ -98,44 +97,37 @@ def _semantic_top_k(
     already have a cached vector under the current model_id — never
     triggers a new embed for an uncached memory, the same warm-up contract
     passive recall uses) as a CHEAP COARSE CUT to ``relevance.CANDIDATE_
-    POOL``, then reranks an auto-scaled-width slice of that coarse cut with
-    the cross-encoder (``reranker.build_reranker_provider`` + ``reranker.
-    rerank_for_recall``, the same per-message width fit ``run_semantic_recall``
-    uses).
+    POOL``, then scores the coarse cut with ``semantic_recall.rank_and_gate``
+    — the SAME path choice, floor and scale passive recall uses (name-recall
+    fix R2, spec §2): a per-message-width cross-encoder rerank gated by the
+    calibrated, anchor-normalized rerank floor when >= 5 real candidates fit
+    (F2b #276 §2/§4), otherwise (fewer than 5 fit or exist, or the reranker
+    failed to load/score, or its normalization fell back) the cosine ranking
+    gated by the cosine floor. A reranker failure no longer demotes this call
+    to lexical. This site writes NO calibration row on either path (S56:
+    calibration rows stay passive-recall only, as today).
 
-    F2b (#276 §2/§4): the score compared against the floor is the
-    per-query anchor-median NORMALIZED score (``reranker.normalize_
-    against_anchors``), not the raw cross-encoder score — same mechanism
-    and ordering (normalize THEN gate) as ``run_semantic_recall``'s
-    identical composition. This site has no calibration-log write.
-
-    The reranker here improves ORDERING; the CALIBRATED reranker floor
-    (F2a inc8, #250 §7/§8 cutover — read live via
-    ``store.get_reranker_floor(reranker_provider.model_id())``, replacing
-    the deleted ``RERANK_FLOOR`` module constant) decides semantic-vs-
-    lexical: if NOTHING clears the floor — or no calibrated floor row exists
-    yet for the runtime model_id — this returns ``None`` (the tool's
-    EXISTING empty-semantic→lexical fallback — never returns nothing, never
-    hands back semantic junk that never cleared the floor).
-    Otherwise returns the top ``limit`` floor-clearing memories in
-    reranker-descending order.
+    The CALIBRATED floor of the path taken decides semantic-vs-lexical: if
+    NOTHING clears it — or no cosine gate can be had (the cosine bootstrap
+    failed) — this returns ``None`` (the tool's EXISTING empty-semantic→
+    lexical fallback — never returns nothing, never hands back semantic junk
+    that never cleared a floor). Otherwise returns the top ``limit``
+    floor-clearing memories in descending score order.
 
     Deliberately does NOT reuse ``semantic_recall``'s option-4 surfacing
     tiers (≤5 full / 6-9 / cap-at-9) — that machinery decides whether to
     surface an unsolicited passive-recall block at all, and how much of it
     to show in full vs snippet. Here the model explicitly asked for a
-    search, so a plain top-k reranked ranking is the natural "semantic
-    search" behavior, mirroring how the lexical path is a plain top-k
-    relevance ranking too.
+    search, so a plain top-k ranking is the natural "semantic search"
+    behavior, mirroring how the lexical path is a plain top-k relevance
+    ranking too.
 
     Returns ``None`` (never raises) when semantic search cannot run right
-    now — no cached vectors yet, an embedding/reranker-model failure, or any
-    other error anywhere in this path — so the caller falls back to the
-    lexical path. Mirrors ``run_semantic_recall``'s fail-soft posture: the
-    whole body is wrapped so a broken/missing local model or a transient
-    store error only demotes this call to lexical, never breaks the tool —
-    and a reranker failure demotes to lexical too, never to raw cosine
-    ranking (the unreliable signal the reranker replaces).
+    now — no cached vectors yet, an embedding-model failure, or any other
+    error anywhere in this path — so the caller falls back to the lexical
+    path. Mirrors ``run_semantic_recall``'s fail-soft posture: the whole
+    body is wrapped so a broken/missing local model or a transient store
+    error only demotes this call to lexical, never breaks the tool.
     """
     try:
         matrix = build_embedding_matrix(store.db_path)
@@ -147,7 +139,8 @@ def _semantic_top_k(
             # test's monkeypatch on `embeddings.build_embedding_provider` is
             # honored — mirrors `run_semantic_recall`'s/`is_duplicate`'s
             # identical dynamic lookup.
-            query_vec = embeddings_mod.build_embedding_provider().embed(query).astype("float32")
+            embedder = embeddings_mod.build_embedding_provider()
+            query_vec = embedder.embed(query).astype("float32")
         except Exception:  # noqa: BLE001 — fail-soft
             logger.exception(
                 "search_memories(semantic): query embed failed — falling back to lexical"
@@ -164,66 +157,20 @@ def _semantic_top_k(
         cosine_scored.sort(key=lambda pair: -pair[1])
         coarse = cosine_scored[:CANDIDATE_POOL]
 
-        reranker_provider = reranker_mod.build_reranker_provider(store=store)
-        # Name-recall fix R1 (spec §1): same per-message width fit, anchors
-        # on top and cost measurement as `run_semantic_recall` (the tool's
-        # reranks are recall-time reranks too, S24). `normalization.scores`
-        # is positionally aligned with `scored_ids` 1:1; anchors never leave
-        # the helper, so they can never enter the gate or the returned list.
-        # This site has no calibration-log write (S56).
-        coarse_ids = [mid for mid, _ in coarse]
-        outcome = reranker_mod.rerank_for_recall(
-            reranker_provider, query, [pool[mid][0].content for mid in coarse_ids]
+        gated = rank_and_gate(
+            store,
+            query,
+            pool,
+            coarse,
+            embedder_model_id=embedder.model_id(),
+            log_calibration=False,
         )
-        if not outcome.reranked or outcome.normalization is None:
-            # Fewer than the S5 minimum fit (or exist), or no anchor median:
-            # nothing may be gated (S5/S7). R2 sends this case to the cosine
-            # path; until then the tool falls back to lexical.
-            logger.info(
-                "search_memories(semantic): no rerank (%s, width %d) — falling back to lexical",
-                outcome.hand_off,
-                outcome.width,
-            )
+        if gated is None:
             return None
-        normalization = outcome.normalization
-        scored_ids = coarse_ids[: normalization.real_width]
-        rerank_scores = normalization.scores
-
-        # F2a inc8 (#250 §7 UPDATED): read the operative floor live, keyed
-        # by the RUNTIME reranker model_id — mirrors `run_semantic_recall`'s
-        # identical lookup. No persisted row yet (daily tick has never
-        # fired for this model_id) no longer means "nothing to read" —
-        # `get_reranker_floor` serves a derived bootstrap instead. `None`
-        # now fires ONLY on the bootstrap's own fail-soft path (a reranker
-        # load/fit failure), which still falls back to lexical here, never
-        # a guessed floor value.
-        floor_row = store.get_reranker_floor(reranker_provider.model_id())
-        if floor_row is None:
-            logger.info(
-                "search_memories(semantic): no floor available (bootstrap computation failed) "
-                "for %s — falling back to lexical",
-                reranker_provider.model_id(),
-            )
+        cleared = [(mid, score) for mid, score in gated.ranked if score >= gated.pass_mark]
+        if not cleared:
             return None
-        logger.debug(
-            "search_memories(semantic): floor=%.4f model=%s cold_start=%s "
-            "sample_pairs=%d updated_at=%s",
-            floor_row["floor"],
-            reranker_provider.model_id(),
-            floor_row["is_cold_start"],
-            floor_row["sample_pairs"],
-            floor_row["updated_at"],
-        )
-
-        reranked = [
-            (mid, score)
-            for mid, score in zip(scored_ids, rerank_scores, strict=True)
-            if score >= floor_row["floor"]
-        ]
-        if not reranked:
-            return None
-        reranked.sort(key=lambda pair: -pair[1])
-        return [pool[mid][0] for mid, _ in reranked[:limit]]
+        return [pool[mid][0] for mid, _ in cleared[:limit]]
     except Exception:  # noqa: BLE001 — fail-soft: ANY failure demotes to lexical, never raises
         logger.warning(
             "search_memories(semantic): semantic path failed — falling back to lexical",

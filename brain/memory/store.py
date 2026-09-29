@@ -60,6 +60,13 @@ CALIBRATION_LOG_RETENTION_WINDOW_DAYS: float = tunables.register(
 # why the two scales must never be mixed into one floor fit.
 CALIBRATION_SCORE_SCALE = "normalized"
 
+# Name-recall fix R2 (spec §2, S25/S38/S60): the OTHER scale a `calibration_log`
+# row can carry: raw cosine similarities from the no-rerank path (fewer than 5
+# real candidates fit or exist, or the reranker failed). The two scales are
+# never mixed in a fit: `labeled_calibration_pairs` takes the scale it fits,
+# and the cosine floor lives in its own table (`cosine_floor_calibration`).
+COSINE_SCORE_SCALE = "cosine"
+
 
 def _haiku_decision_count(haiku_label_json: str | None) -> int:
     """Number of Haiku decisions a `calibration_log` row carries: its non-None
@@ -357,6 +364,10 @@ CREATE TABLE IF NOT EXISTS cluster_centroids (
 -- candidate for F2c/inc3's deploy-time one-time-recalibration trigger
 -- (spec §6) — "has a normalized-scale row ever been logged" is exactly a
 -- deploy-detection signal, though wiring that trigger is out of scope here.
+-- Name-recall fix R2 (spec §2, S25): a third value, 'cosine', marks rows the
+-- no-rerank path logs (raw cosine similarities, the EMBEDDER model id in
+-- `reranker_model_id`). The scales are never mixed: each floor is fit from
+-- its own scale's rows only (`labeled_calibration_pairs(..., score_scale)`).
 -- `local_judge_raw_score` (F2c inc1, data foundation only — spec §3
 -- Addition A): the bge judge's RAW per-candidate score/logit, JSON-encoded
 -- and positionally aligned with `candidate_ids` (same convention as
@@ -478,6 +489,25 @@ CREATE TABLE IF NOT EXISTS reranker_floor_calibration (
     is_cold_start INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     score_scale TEXT NOT NULL DEFAULT 'raw'
+);
+
+-- Name-recall fix R2 (spec §2, S18/S25/S38): the COSINE pass mark the no-rerank
+-- path gates on, in its OWN table keyed by the EMBEDDER model id. It is not a
+-- row in `reranker_floor_calibration`: that table's stale-scale refit
+-- (`reranker_floor_is_stale`) would read a cosine row as a raw-scale floor and
+-- re-fit it forever. Same columns as the rerank floor minus `score_scale` (the
+-- scale is the table). Written only by the daily calibration tick
+-- (`floor_calibration.derive_and_persist_cosine_floor`); until a row exists,
+-- `MemoryStore.get_cosine_floor` serves a derived, never-persisted bootstrap.
+-- `CREATE TABLE IF NOT EXISTS` on open: legacy-safe and idempotent (I9), no
+-- existing table or row is touched.
+CREATE TABLE IF NOT EXISTS cosine_floor_calibration (
+    embedder_model_id TEXT PRIMARY KEY,
+    floor REAL NOT NULL,
+    raw_fit_floor REAL NOT NULL,
+    sample_pairs INTEGER NOT NULL,
+    is_cold_start INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 -- F2c (inc2, red-team fix F-1, spec §2): per-persona weekly judge self-tune
@@ -1098,6 +1128,8 @@ class MemoryStore:
         reranker_scores: list[float],
         reranker_model_id: str,
         candidate_docs: list[str] | None = None,
+        *,
+        score_scale: str = CALIBRATION_SCORE_SCALE,
     ) -> None:
         """Log one recall turn's (query, candidate ids, reranker scores) row
         to `calibration_log` (F2a #250 inc4).
@@ -1123,14 +1155,21 @@ class MemoryStore:
         have doc text in hand keep working unchanged — this method does no
         fetching of its own.
 
-        F2b (#276 §5): `reranker_scores` must be the caller's already-
-        NORMALIZED per-query anchor-corrected value (`brain.memory.
+        F2b (#276 §5): on the reranked path `reranker_scores` is the caller's
+        already-NORMALIZED per-query anchor-corrected value (`brain.memory.
         reranker.normalize_against_anchors`'s output), not the raw
-        cross-encoder score — this method stamps every row it writes with
-        `score_scale = CALIBRATION_SCORE_SCALE` ('normalized') accordingly.
-        This method does no normalization itself; it trusts the caller the
-        same way it already trusts `candidate_ids`/`reranker_scores` to be
-        the already-computed per-turn output.
+        cross-encoder score, stamped `score_scale = CALIBRATION_SCORE_SCALE`
+        ('normalized', the default). This method does no normalization
+        itself; it trusts the caller the same way it already trusts
+        `candidate_ids`/`reranker_scores` to be the already-computed per-turn
+        output.
+
+        Name-recall fix R2 (spec §2, S25, S60): the no-rerank path logs its
+        cosine similarities with `score_scale=COSINE_SCORE_SCALE` and the
+        EMBEDDER model id in `reranker_model_id` (the legacy column name; the
+        cosine floor is keyed by that same id). The row is stamped with the
+        scale the scores are actually on, so a fit never sees a score on the
+        wrong scale. An unknown scale is refused rather than stamped.
 
         ONE bounded INSERT — no embedding, no model call, off the hot path
         in every sense except this single cheap write (I6). Fail-soft is
@@ -1140,6 +1179,8 @@ class MemoryStore:
         caller that forgets to guard it fails loudly instead of silently
         losing calibration data.
         """
+        if score_scale not in (CALIBRATION_SCORE_SCALE, COSINE_SCORE_SCALE):
+            raise ValueError(f"log_calibration_sample: unknown score_scale {score_scale!r}")
         self._conn.execute(
             "INSERT INTO calibration_log "
             "(query, candidate_ids, reranker_scores, reranker_model_id, score_scale, "
@@ -1150,7 +1191,7 @@ class MemoryStore:
                 json.dumps(list(candidate_ids)),
                 json.dumps([float(s) for s in reranker_scores]),
                 reranker_model_id,
-                CALIBRATION_SCORE_SCALE,
+                score_scale,
                 json.dumps(list(candidate_docs)) if candidate_docs is not None else None,
             ),
         )
@@ -1271,7 +1312,9 @@ class MemoryStore:
         self._conn.commit()
         return deleted
 
-    def sample_unlabeled_calibration_rows(self, limit: int) -> list[dict[str, Any]]:
+    def sample_unlabeled_calibration_rows(
+        self, limit: int, *, cosine: bool | None = None
+    ) -> list[dict[str, Any]]:
         """Return up to `limit` `calibration_log` rows with no
         `local_judge_label` yet (F2a #250 inc6, spec Section 6/7) — the daily
         judge pass's SAMPLE, not every logged row (the spec's explicit
@@ -1287,16 +1330,30 @@ class MemoryStore:
         Python lists, not raw JSON strings — mirrors how `get()` decodes
         `metadata_json` before returning a `Memory`.
 
+        `cosine` (name-recall fix R2, S25: the tick labels the two scales
+        separately, so neither dilutes the other's daily sample): `None`
+        (default) samples every unlabeled row, `False` only rows NOT on the
+        cosine scale, `True` only cosine-scale rows.
+
         Read-only: does not bump `recall_count` (reads `calibration_log`,
         not `memories`) and does not label anything itself — labeling +
         writeback is the caller's job (`relevance_judge.
         label_calibration_sample` + `write_calibration_labels` below).
         """
+        scale_clause = ""
+        params: tuple[Any, ...] = ()
+        if cosine is True:
+            scale_clause = " AND score_scale = ?"
+            params = (COSINE_SCORE_SCALE,)
+        elif cosine is False:
+            scale_clause = " AND score_scale != ?"
+            params = (COSINE_SCORE_SCALE,)
         rows = self._conn.execute(
             "SELECT id, query, candidate_ids, reranker_scores, reranker_model_id "
-            "FROM calibration_log WHERE local_judge_label IS NULL "
-            "ORDER BY RANDOM() LIMIT ?",
-            (int(limit),),
+            "FROM calibration_log WHERE local_judge_label IS NULL"
+            + scale_clause
+            + " ORDER BY RANDOM() LIMIT ?",
+            (*params, int(limit)),
         ).fetchall()
         return [
             {
@@ -1355,7 +1412,9 @@ class MemoryStore:
         )
         self._conn.commit()
 
-    def labeled_calibration_pairs(self, reranker_model_id: str) -> list[tuple[float, str]]:
+    def labeled_calibration_pairs(
+        self, reranker_model_id: str, score_scale: str = CALIBRATION_SCORE_SCALE
+    ) -> list[tuple[float, str]]:
         """`(reranker_score, effective_label)` pairs for the MOST RECENTLY
         COMPLETED DAY's LABELED `calibration_log` rows matching
         `reranker_model_id` (F2a #250 inc7, spec Section 7; pre-flip
@@ -1404,6 +1463,12 @@ class MemoryStore:
         lookup below is scoped by this same score_scale filter, so a
         raw-scale row can never be picked as "the most recent day" either.
 
+        Name-recall fix R2 (S25, "floor fits never mix scales"): `score_scale`
+        picks the ONE scale this read fits (default 'normalized', the
+        reranker floor; the cosine floor's fit passes 'cosine' with the
+        embedder model id in the `reranker_model_id` slot). The day-scoping,
+        labels and the F2c hold filter are identical for both.
+
         Read-only: does not bump `recall_count` and does not label or
         write anything (mirrors `sample_unlabeled_calibration_rows`'s own
         read-only posture).
@@ -1419,7 +1484,7 @@ class MemoryStore:
             "SELECT MAX(day_bucket) AS max_day FROM calibration_log "
             "WHERE reranker_model_id = ? AND local_judge_label IS NOT NULL AND score_scale = ? "
             "AND day_bucket >= ?",
-            (reranker_model_id, CALIBRATION_SCORE_SCALE, view),
+            (reranker_model_id, score_scale, view),
         ).fetchone()
         most_recent_day = max_day_row["max_day"] if max_day_row is not None else None
         if most_recent_day is None:
@@ -1428,7 +1493,7 @@ class MemoryStore:
             "SELECT reranker_scores, local_judge_label, haiku_label FROM calibration_log "
             "WHERE reranker_model_id = ? AND local_judge_label IS NOT NULL "
             "AND score_scale = ? AND day_bucket = ? AND day_bucket >= ?",
-            (reranker_model_id, CALIBRATION_SCORE_SCALE, most_recent_day, view),
+            (reranker_model_id, score_scale, most_recent_day, view),
         ).fetchall()
         pairs: list[tuple[float, str]] = []
         for row in rows:
@@ -1613,6 +1678,83 @@ class MemoryStore:
                 int(sample_pairs),
                 int(is_cold_start),
                 str(score_scale),
+            ),
+        )
+        self._conn.commit()
+
+    def get_persisted_cosine_floor(self, embedder_model_id: str) -> dict[str, Any] | None:
+        """Return ONLY the PERSISTED `cosine_floor_calibration` row for
+        `embedder_model_id`, or `None` (name-recall fix R2, spec §2, S38) —
+        never the transient bootstrap `get_cosine_floor` serves on a miss.
+        Mirrors `get_persisted_reranker_floor`; read-only."""
+        row = self._conn.execute(
+            "SELECT embedder_model_id, floor, raw_fit_floor, sample_pairs, is_cold_start, "
+            "updated_at FROM cosine_floor_calibration WHERE embedder_model_id = ?",
+            (embedder_model_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "embedder_model_id": row["embedder_model_id"],
+            "floor": float(row["floor"]),
+            "raw_fit_floor": float(row["raw_fit_floor"]),
+            "sample_pairs": int(row["sample_pairs"]),
+            "is_cold_start": bool(row["is_cold_start"]),
+            "updated_at": row["updated_at"],
+        }
+
+    def get_cosine_floor(self, embedder_model_id: str) -> dict[str, Any] | None:
+        """Return the operative COSINE floor for `embedder_model_id` (name-
+        recall fix R2, spec §2, S18/S25/S38): the gate the no-rerank path
+        applies to raw cosine similarities.
+
+        The PERSISTED `cosine_floor_calibration` row first (written by the
+        daily tick, `floor_calibration.derive_and_persist_cosine_floor`); if
+        none exists yet, a derived, process-cached BOOTSTRAP
+        (`floor_calibration.get_cosine_bootstrap_floor`: the same F-beta fit
+        over the same bundled example pairs the rerank floor bootstraps
+        from, scored by this embedder), never persisted. `None` only when
+        that bootstrap itself failed: the caller then has no cosine gate and
+        the turn contributes no semantic results (keyword only), never an
+        ungated cosine ranking.
+
+        Read-only: does not write or bump anything.
+        """
+        persisted = self.get_persisted_cosine_floor(embedder_model_id)
+        if persisted is not None:
+            return persisted
+        from brain.memory import floor_calibration
+
+        return floor_calibration.get_cosine_bootstrap_floor(embedder_model_id)
+
+    def write_cosine_floor(
+        self,
+        embedder_model_id: str,
+        *,
+        floor: float,
+        raw_fit_floor: float,
+        sample_pairs: int,
+        is_cold_start: bool,
+    ) -> None:
+        """Upsert this cycle's derived cosine floor for `embedder_model_id`
+        (name-recall fix R2, spec §2, S38): the ONLY write path into
+        `cosine_floor_calibration`, called only by the daily tick's
+        `floor_calibration.derive_and_persist_cosine_floor` on an accepted
+        cycle. Same wholesale-replace upsert as `write_reranker_floor`."""
+        self._conn.execute(
+            "INSERT INTO cosine_floor_calibration "
+            "(embedder_model_id, floor, raw_fit_floor, sample_pairs, is_cold_start, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(embedder_model_id) DO UPDATE SET "
+            "floor = excluded.floor, raw_fit_floor = excluded.raw_fit_floor, "
+            "sample_pairs = excluded.sample_pairs, is_cold_start = excluded.is_cold_start, "
+            "updated_at = excluded.updated_at",
+            (
+                embedder_model_id,
+                float(floor),
+                float(raw_fit_floor),
+                int(sample_pairs),
+                int(is_cold_start),
             ),
         )
         self._conn.commit()

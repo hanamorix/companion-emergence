@@ -280,9 +280,10 @@ def _get_batch_size(provider, scan_cap: int) -> int:  # noqa: ANN001
     must not serialize concurrent callers behind it) and caches with
     first-writer-wins (`setdefault`) so a measurement race between two
     threads on the very first call never lets a later, possibly-noisier
-    measurement overwrite an already-cached figure. Mirrors
-    reranker.py's `_warm_per_doc_latency`, minus its periodic-recompute
-    machinery — see module docstring for why this measures only once.
+    measurement overwrite an already-cached figure. Measured once per
+    process with no periodic recompute (see module docstring for why). It
+    once mirrored reranker.py's hourly `_warm_per_doc_latency`, which the
+    name-recall fix's per-message width (R1) removed.
 
     `scan_cap` is folded into the cached figure via `_derive_batch_size`'s
     upper clamp: in production `run_embedding_backfill_tick` is always

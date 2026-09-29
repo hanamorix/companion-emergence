@@ -302,10 +302,50 @@ def _reset_reranker_provider_cache() -> Iterator[None]:
     reranker._reset_reranker_provider_cache()
     reranker._reset_rerank_cost_model()
     floor_calibration._reset_bootstrap_floor_cache()
+    floor_calibration._reset_cosine_bootstrap_floor_cache()
     yield
     reranker._reset_reranker_provider_cache()
     reranker._reset_rerank_cost_model()
     floor_calibration._reset_bootstrap_floor_cache()
+    floor_calibration._reset_cosine_bootstrap_floor_cache()
+
+
+@pytest.fixture(autouse=True)
+def _cosine_floor_never_clears_by_default(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default the COSINE bootstrap floor (name-recall fix R2, plan P-24) to a
+    value no cosine similarity can reach, mirroring
+    `_fake_reranker_provider_by_default`'s "unscripted scores never clear the
+    floor" default.
+
+    With the no-rerank path, a test whose store has fewer than 5 embedded
+    candidates (or a reranker that fails) now reaches the cosine gate instead
+    of returning `None`. Left to the real bootstrap, the offline fake
+    embedder's arbitrary cosines would fit an arbitrary floor and some
+    candidates could clear it by accident; pinning the floor above 1.0 keeps
+    every such test on its old keyword-only outcome. A test that wants the
+    cosine path to pass either persists a row (`store.write_cosine_floor`) or
+    monkeypatches `floor_calibration.get_cosine_bootstrap_floor` itself; a
+    test of the real bootstrap calls the function object it imported at
+    module load (this patch replaces only the module attribute).
+    """
+    if "requires_network" in request.keywords:
+        return
+    from brain.memory import floor_calibration
+
+    monkeypatch.setattr(
+        floor_calibration,
+        "get_cosine_bootstrap_floor",
+        lambda embedder_model_id: {
+            "embedder_model_id": embedder_model_id,
+            "floor": 2.0,
+            "raw_fit_floor": 2.0,
+            "sample_pairs": 0,
+            "is_cold_start": True,
+            "updated_at": None,
+        },
+    )
 
 
 @pytest.fixture(autouse=True)

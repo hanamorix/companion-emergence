@@ -486,7 +486,8 @@ def test_fail_soft_normalization_error_degrades_run_semantic_recall_to_lexical(
     result = run_semantic_recall(store, tmp_path, _QUERY)
 
     assert result is None, (
-        "a normalize_against_anchors failure must demote this turn to the lexical fallback, not raise"
+        "a normalize_against_anchors failure must not raise: the turn takes the cosine path "
+        "(R2), which under the suite's never-clearing cosine floor is the lexical fallback"
     )
 
 
@@ -509,7 +510,8 @@ def test_fail_soft_normalization_error_degrades_semantic_top_k_to_lexical(
     res = dispatch("search_memories", {"query": _QUERY, "mode": "semantic"}, **_ctx2(tmp_path, store))
 
     assert res["mode"] == "lexical", (
-        "a normalize_against_anchors failure must demote this call to the lexical fallback, not raise"
+        "a normalize_against_anchors failure must not raise: the call takes the cosine path "
+        "(R2), which under the suite's never-clearing cosine floor is the lexical fallback"
     )
     ids = {mm["id"] for mm in res["memories"]}
     assert real_a.id in ids
@@ -546,8 +548,10 @@ def test_pool_below_the_minimum_hands_off_at_both_call_sites(
 ) -> None:
     """R1 (S5/S23): fewer than 5 real candidates -> no rerank at all, and the
     call site takes its explicit hand-off branch (logged at info), not the
-    broad fail-soft `except` (which would log a warning traceback). R2 turns
-    this branch into the cosine path."""
+    broad fail-soft `except` (which would log a warning traceback). R2: the
+    branch is the cosine path (`test_no_rerank_cosine_path.py` covers its
+    results); under the suite's never-clearing cosine floor it yields no
+    semantic result here."""
     import logging
 
     store = MemoryStore(tmp_path / "memories.db")

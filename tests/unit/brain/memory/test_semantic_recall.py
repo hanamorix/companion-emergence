@@ -371,9 +371,11 @@ def test_run_semantic_recall_is_fail_soft_when_scoring_raises(
 def test_run_semantic_recall_is_fail_soft_when_reranker_raises(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """#231: a reranker failure must demote to the LEXICAL fallback, never
-    raise and never fall back to raw cosine ranking (the unreliable signal
-    the reranker replaces)."""
+    """A reranker failure never raises. Name-recall fix R2 (spec §2): it no
+    longer demotes straight to the lexical fallback: the turn takes the
+    COSINE path, gated by the cosine floor (results in
+    `test_no_rerank_cosine_path.py`). The suite's default cosine floor never
+    clears, so here that means no semantic result: the keyword fallback."""
 
     class _BoomReranker(FakeRerankerProvider):
         def rerank(self, query: str, documents: list[str]):
@@ -397,7 +399,7 @@ def test_run_semantic_recall_is_fail_soft_when_reranker_raises(
 
     result = run_semantic_recall(store, tmp_path, "any query")
 
-    assert result is None, "a reranker failure must demote this turn to the lexical fallback, not raise"
+    assert result is None, "a reranker failure must not raise (cosine path, never-clearing default floor)"
 
 
 # ---------------------------------------------------------------------------
@@ -679,7 +681,9 @@ def test_run_semantic_recall_falls_back_to_lexical_when_the_bootstrap_computatio
     bootstrap computation itself must never crash a turn): if deriving the
     bootstrap raises (a reranker load/fit failure), `get_reranker_floor`
     degrades to the pre-ruling `None` contract, and `run_semantic_recall`
-    falls back to lexical exactly as it did before this ruling."""
+    (name-recall fix R2) takes the cosine path instead of demoting straight
+    to lexical; the suite's never-clearing default cosine floor leaves that
+    turn with no semantic result."""
     content = "a memory that would clear any floor this suite ever seeds"
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
@@ -710,8 +714,9 @@ def test_run_semantic_recall_is_fail_soft_when_floor_read_raises(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A `store.get_reranker_floor` failure (e.g. a transient sqlite error)
-    must demote this turn to lexical, exactly like every other fail-soft
-    trigger in this function — never propagate out of `run_semantic_recall`."""
+    must never propagate out of `run_semantic_recall` (R2: it makes this a
+    cosine-path turn; the suite's never-clearing default cosine floor leaves
+    no semantic result, i.e. the lexical fallback)."""
     content = "a memory that DOES have a cached vector"
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
@@ -731,6 +736,6 @@ def test_run_semantic_recall_is_fail_soft_when_floor_read_raises(
 
     result = run_semantic_recall(store, tmp_path, "any query")
 
-    assert result is None, "a floor-read failure must demote this turn to lexical, not raise"
+    assert result is None, "a floor-read failure must not raise (cosine path, never-clearing default floor)"
 
 

@@ -19,17 +19,27 @@ per-runtime-model floor read live from `MemoryStore.get_reranker_floor`,
 derived+persisted daily against the actual corpus (`floor_calibration.py`).
 
 Recall runs semantic cosine as a CHEAP COARSE CUT (narrow the pool before
-the comparatively expensive reranker), then reranks the (auto-scaled-width)
+the comparatively expensive reranker), then reranks the (per-message-width)
 survivors, then floor-gates the RERANKER score to decide relevance. When
 that produces a CONCLUSIVE result (at least one candidate clears the
 calibrated floor) that result is surfaced and the existing lexical path
-never runs for that turn. When NOTHING clears the floor — or the candidate pool is
-empty/sparse (cold-start / idle backfill hasn't caught up yet — the
-"graceful warm-up" contract), or any embedding/reranker-infra failure — this
-module returns ``None`` and the caller (``brain.chat.prompt.
-_build_recall_block``) falls through UNCHANGED to the existing lexical/blend
-retrieval, exactly as it behaved before this stage. This module never
-touches that fallback path.
+never runs for that turn.
+
+Name-recall fix R2 (spec §2): the reranker is no longer the only way to a
+semantic result. When fewer than 5 real candidates fit the rerank budget or
+exist, the reranker fails to load or score, or its anchor normalization has
+no median, the turn takes the NO-RERANK path: the coarse cut's candidates are
+ranked by cosine and gated by a COSINE floor (`MemoryStore.get_cosine_floor`,
+its own table, bootstrapped from the same bundled pairs until the daily tick
+calibrates it). A reranker failure therefore no longer demotes the turn to
+keyword-only. The two scales never mix: a reranked candidate is gated by the
+normalized rerank floor, a cosine-path candidate by the cosine floor, and each
+path's calibration row carries its own true scale. The module returns `None`
+(the caller falls through UNCHANGED to the existing lexical/blend retrieval)
+only for an empty/sparse pool (cold-start "graceful warm-up"), an embed
+failure, a cosine bootstrap failure (no gate is possible), or when nothing
+clears the floor of the path taken. This module never touches that fallback
+path.
 
 This module owns:
   - the semantic candidate-pool builder (active-STATE memories that already
@@ -40,7 +50,8 @@ This module owns:
   - the cosine coarse-cut (cheap pre-filter to `relevance.CANDIDATE_POOL`)
   - the rerank call (`reranker.build_reranker_provider` +
     `reranker.rerank_for_recall`, its width fitted per message to the
-    measured rerank cost on this host)
+    measured rerank cost on this host) and its no-rerank alternative
+    (`rank_and_gate`: reranked path or cosine path, one gate per scale)
   - the floor-gated standout selection (`select_standouts`) — replaces
     `classify_semantic_shape`'s cosine standout/clump judgment
   - the surfacing-tier decision (which candidate ids are "full" vs
@@ -69,7 +80,12 @@ from brain.memory import reranker as reranker_mod
 from brain.memory.embedding_matrix import EmbeddingMatrix, build_embedding_matrix
 from brain.memory.embeddings import cosine_similarity
 from brain.memory.relevance import CANDIDATE_POOL
-from brain.memory.store import Memory, MemoryStore
+from brain.memory.store import (
+    CALIBRATION_SCORE_SCALE,
+    COSINE_SCORE_SCALE,
+    Memory,
+    MemoryStore,
+)
 
 log = logging.getLogger(__name__)
 
@@ -98,11 +114,11 @@ log = logging.getLogger(__name__)
 # coupled recall to the tick (disabled calibration, or a recall running
 # before the tick's first idle moment, silently and PERMANENTLY demoted to
 # lexical-only even with embeddings present) — see the spec's §7 UPDATED
-# note for the full rationale. `run_semantic_recall` still returns `None`
-# on a floor-read failure (the bootstrap computation's OWN fail-soft path —
-# a reranker load/fit error), treated exactly like any other "semantic path
-# not ready yet" precondition (empty/sparse candidate pool, embed failure,
-# ...); it is just no longer the ROUTINE fresh-install/no-tick-yet case.
+# note for the full rationale. A floor-read failure (the bootstrap
+# computation's OWN fail-soft path — a reranker load/fit error) means the
+# reranker cannot gate this turn, so (name-recall fix R2, spec §2) the turn
+# takes the cosine path instead (`rank_and_gate`); it is no longer the
+# ROUTINE fresh-install/no-tick-yet case either.
 # Once the daily tick DOES persist a real corpus-derived floor for this
 # model_id, that persisted row supersedes the bootstrap on every subsequent
 # call — see `floor_calibration.derive_and_persist_floor`'s cold-start
@@ -254,11 +270,251 @@ class SemanticRecallResult:
     anchors`) — the SAME value the floor gate actually compared against,
     never the pre-normalization raw reranker score. Anchor documents are
     never candidates, so they never appear here.
+
+    Name-recall fix R2: on the cosine path (`path == "cosine"`) `scores` are
+    the raw cosine similarities of the coarse cut and `pass_mark` is the
+    cosine floor; the two scales are never mixed within one result.
     """
 
     full: list[Memory]
     snippet: list[Memory]
     scores: dict[str, float]
+    # Name-recall fix R2 (spec §2, C2c): which path produced this result, the
+    # scale `scores` are on ('normalized' reranker scores or raw 'cosine') and
+    # the pass mark that was actually applied to them. Never mixed: a result
+    # is wholly one path.
+    path: str = "reranked"
+    scale: str = CALIBRATION_SCORE_SCALE
+    pass_mark: float | None = None
+
+
+RERANKED_PATH = "reranked"
+COSINE_PATH = "cosine"
+
+
+@dataclass(frozen=True)
+class GatedRanking:
+    """Every candidate one turn's gate examined, best first, on ONE scale,
+    plus the pass mark that scale is gated by (name-recall fix R2, spec §2).
+
+    `ranked` is `(memory_id, score)` sorted descending: normalized reranker
+    scores for the reranked path (the fitted prefix only), raw cosine
+    similarities for the cosine path (the whole coarse cut). The caller
+    applies `pass_mark` (`select_standouts` for passive recall, a plain
+    filter in the tool); this object never mixes the two scales.
+    """
+
+    path: str
+    scale: str
+    ranked: list[tuple[str, float]]
+    pass_mark: float
+
+
+def _log_calibration_row(
+    store: MemoryStore,
+    query: str,
+    ids: list[str],
+    scores: list[float],
+    model_id: str,
+    pool: dict[str, tuple[Memory, np.ndarray]],
+    scale: str,
+) -> None:
+    """One `calibration_log` row for `query`: `ids` and `scores` aligned 1:1
+    (with the recall-time document snapshot), stamped with the scale the
+    scores are ACTUALLY on. Fail-soft: a logging failure only loses this
+    turn's row, it never demotes a good semantic result to lexical."""
+    try:
+        store.log_calibration_sample(
+            query=query,
+            candidate_ids=ids,
+            reranker_scores=scores,
+            reranker_model_id=model_id,
+            candidate_docs=[pool[mid][0].content for mid in ids],
+            score_scale=scale,
+        )
+    except Exception:  # noqa: BLE001 — fail-soft: logging must never break recall
+        log.warning("semantic recall: calibration log write failed — continuing", exc_info=True)
+
+
+def _reranked_ranking(
+    store: MemoryStore,
+    query: str,
+    pool: dict[str, tuple[Memory, np.ndarray]],
+    coarse_ids: list[str],
+    *,
+    log_calibration: bool,
+) -> GatedRanking | None:
+    """The reranked path, or `None` when the turn must take the cosine path
+    instead: the reranker failed to construct or score, fewer than the S5
+    minimum of real candidates fit the budget or exist, the anchor
+    normalization fell back (`did_normalize=False`: raw scores are NEVER
+    gated, P-6), or the rerank floor could not be read (the bootstrap fit
+    itself failed: the reranker cannot gate this turn)."""
+    try:
+        reranker_provider = reranker_mod.build_reranker_provider(store=store)
+        # Name-recall fix R1 (spec §1): the width is fitted for THIS message
+        # from its own candidates' surviving pair lengths and the process's
+        # measured cost model (no hourly sample, diagnosis H8); anchors come
+        # on top of the fitted real candidates; the call is measured and
+        # feeds the cost model. Prefix order is the cosine coarse cut here;
+        # R3 puts genuine candidates ahead of the monologue family.
+        outcome = reranker_mod.rerank_for_recall(
+            reranker_provider, query, [pool[mid][0].content for mid in coarse_ids]
+        )
+    except Exception:  # noqa: BLE001 — a reranker failure is a cosine-path turn, not keyword-only
+        log.warning("semantic recall: reranker failed — taking the cosine path", exc_info=True)
+        return None
+    if not outcome.reranked or outcome.normalization is None:
+        log.info(
+            "semantic recall: no rerank (%s, width %d) — taking the cosine path",
+            outcome.hand_off,
+            outcome.width,
+        )
+        return None
+    reranker_model_id = reranker_provider.model_id()
+    try:
+        # F2a inc8 (#250 §7 UPDATED): the floor is read LIVE per call, keyed
+        # by the RUNTIME reranker model_id; no persisted row serves a derived
+        # bootstrap. `None` fires only on the bootstrap's own fail-soft path.
+        floor_row = store.get_reranker_floor(reranker_model_id)
+    except Exception:  # noqa: BLE001
+        log.warning(
+            "semantic recall: rerank floor read failed — taking the cosine path", exc_info=True
+        )
+        return None
+    if floor_row is None:
+        log.info(
+            "semantic recall: no rerank floor available (bootstrap failed) for %s — "
+            "taking the cosine path",
+            reranker_model_id,
+        )
+        return None
+    normalization = outcome.normalization
+    scored_ids = coarse_ids[: normalization.real_width]
+    rerank_scores = normalization.scores
+    if log_calibration:
+        # F2a (#250 inc4) / F2b (#276 §5): the real-query calibration row.
+        # `query` is byte-identical to what was just embedded/reranked;
+        # `scored_ids`/`rerank_scores` are the SAME already-normalized values
+        # that feed the floor gate (the fitted prefix; anchors are never
+        # logged). F2c inc1: `candidate_docs` is the recall-time text
+        # snapshot, 1:1 with `scored_ids`.
+        _log_calibration_row(
+            store,
+            query,
+            scored_ids,
+            list(rerank_scores),
+            reranker_model_id,
+            pool,
+            CALIBRATION_SCORE_SCALE,
+        )
+    log.debug(
+        "semantic recall: floor=%.4f model=%s cold_start=%s sample_pairs=%d updated_at=%s",
+        floor_row["floor"],
+        reranker_model_id,
+        floor_row["is_cold_start"],
+        floor_row["sample_pairs"],
+        floor_row["updated_at"],
+    )
+    ranked = sorted(zip(scored_ids, rerank_scores, strict=True), key=lambda pair: -pair[1])
+    return GatedRanking(
+        path=RERANKED_PATH,
+        scale=CALIBRATION_SCORE_SCALE,
+        ranked=ranked,
+        pass_mark=floor_row["floor"],
+    )
+
+
+def _cosine_ranking(
+    store: MemoryStore,
+    query: str,
+    pool: dict[str, tuple[Memory, np.ndarray]],
+    coarse: list[tuple[str, float]],
+    *,
+    embedder_model_id: str,
+    log_calibration: bool,
+) -> GatedRanking | None:
+    """The no-rerank (cosine) path (spec §2, S5/S6/S22/S25/S60): the coarse
+    cut's candidates ranked by cosine, gated by the cosine floor
+    (`store.get_cosine_floor`: persisted, else the bootstrap). `None` when no
+    cosine gate can be had (the bootstrap failed): the turn then contributes
+    no semantic results, never an ungated ranking.
+
+    Passive recall (`log_calibration`) writes ONE calibration row: the first
+    `MAX_STANDOUT_COUNT` (9, the semantic cap) candidates in the path's own
+    order, EXAMINED by the gate, pass or fail (S60: the fit needs the
+    negatives too), scale 'cosine', the embedder model id as the row's model
+    id. The tool never logs (S56)."""
+    ranked = sorted(((mid, float(c)) for mid, c in coarse), key=lambda pair: -pair[1])
+    if log_calibration and ranked:
+        examined = ranked[:MAX_STANDOUT_COUNT]
+        _log_calibration_row(
+            store,
+            query,
+            [mid for mid, _ in examined],
+            [score for _, score in examined],
+            embedder_model_id,
+            pool,
+            COSINE_SCORE_SCALE,
+        )
+    try:
+        floor_row = store.get_cosine_floor(embedder_model_id)
+    except Exception:  # noqa: BLE001
+        log.warning(
+            "semantic recall: cosine floor read failed — no semantic results", exc_info=True
+        )
+        return None
+    if floor_row is None:
+        log.info(
+            "semantic recall: no cosine floor available (bootstrap failed) for %s — "
+            "no semantic results",
+            embedder_model_id,
+        )
+        return None
+    log.debug(
+        "semantic recall: cosine floor=%.4f model=%s cold_start=%s sample_pairs=%d",
+        floor_row["floor"],
+        embedder_model_id,
+        floor_row["is_cold_start"],
+        floor_row["sample_pairs"],
+    )
+    return GatedRanking(
+        path=COSINE_PATH,
+        scale=COSINE_SCORE_SCALE,
+        ranked=ranked,
+        pass_mark=floor_row["floor"],
+    )
+
+
+def rank_and_gate(
+    store: MemoryStore,
+    query: str,
+    pool: dict[str, tuple[Memory, np.ndarray]],
+    coarse: list[tuple[str, float]],
+    *,
+    embedder_model_id: str,
+    log_calibration: bool,
+) -> GatedRanking | None:
+    """Score one query's coarse cut and return what to gate (name-recall fix
+    R2, spec §2): the reranked path when a rerank of >= 5 real candidates
+    ran and normalized, otherwise the cosine path. `None` = no semantic
+    result is possible this turn (no cosine gate).
+
+    Shared by passive recall and `search_memories` so the two never diverge
+    on path choice, floor or scale. `log_calibration=True` (passive recall
+    only, S56) writes the turn's calibration row on whichever path ran."""
+    coarse_ids = [mid for mid, _ in coarse]
+    gated = _reranked_ranking(store, query, pool, coarse_ids, log_calibration=log_calibration)
+    if gated is not None:
+        return gated
+    return _cosine_ranking(
+        store,
+        query,
+        pool,
+        coarse,
+        embedder_model_id=embedder_model_id,
+        log_calibration=log_calibration,
+    )
 
 
 def run_semantic_recall(
@@ -274,39 +530,34 @@ def run_semantic_recall(
     query embed is transient and is never cached/persisted, so it goes
     straight through the provider with no cache row to write), cosines it
     against the model_id-scoped candidate pool as a CHEAP COARSE CUT (top-
-    `relevance.CANDIDATE_POOL`), reranks an auto-scaled-width slice of that
-    coarse cut with a cross-encoder (`reranker.build_reranker_provider` +
-    `reranker.rerank_for_recall`, width fitted per message), and floor-gates
-    the reranker score
-    (`select_standouts`, against the CALIBRATED floor read live via
-    `store.get_reranker_floor(reranker_provider.model_id())` — F2a inc8,
-    #250 §7/§8 cutover) to decide relevance (#231 RERANKER RE-ARCHITECTURE
-    — replaces the pre-#231 cosine standout/clump classifier).
+    `relevance.CANDIDATE_POOL`), then `rank_and_gate`s the coarse cut:
+
+      - reranked path: a cross-encoder rerank of a per-message-width prefix
+        (`reranker.rerank_for_recall`, anchors on top, >= 5 real
+        candidates), gated by the CALIBRATED rerank floor
+        (`store.get_reranker_floor`) on the anchor-normalized score;
+      - cosine path (name-recall fix R2, spec §2): when fewer than 5 real
+        candidates fit or exist, the reranker fails to load/score, or its
+        normalization falls back, the coarse cut ranked by cosine, gated by
+        the cosine floor (`store.get_cosine_floor`). Not keyword-only.
+
+    Both paths log one calibration row for the turn (each stamped with its
+    own true scale) and floor-gate through `select_standouts`.
 
     Returns a populated `SemanticRecallResult` ONLY when at least one
-    candidate clears the operative floor (persisted, or — F2a inc8, #250 §7
-    UPDATED — the derived bootstrap when no persisted row exists yet; see
-    the module-docstring note above `select_standouts`). Returns `None` for
-    every INCONCLUSIVE case:
+    candidate clears the operative floor of the path taken. Returns `None`
+    for every INCONCLUSIVE case:
       - nothing clears the floor,
       - an empty or sparse candidate pool (cold-start / idle backfill not
         caught up — "graceful warm-up"),
-      - the bootstrap computation itself failed (no persisted row AND the
-        bootstrap fit raised — a reranker load/fit error) — this is now the
-        ONLY way "no floor" demotes to lexical; a merely-absent persisted
-        row no longer does, on its own, since the bootstrap always fills it,
-      - ANY failure ANYWHERE in this function — constructing the local
-        embedding/reranker provider, embedding the query, building the
-        candidate pool, cosine scoring, reranking, reading the calibrated
-        floor, or floor-gating (fail-soft: a broken/missing local model, a
-        transient store error such as a locked sqlite db during the
-        background backfill, or a floor-read error, must never break
-        recall — it only demotes this turn to lexical-primary, matching the
-        spec's warm-up contract, and — per the #231 build brief — a
-        reranker failure demotes to the LEXICAL backstop, never to raw
-        cosine ranking, the unreliable signal the reranker replaces). The
-        whole body is wrapped in a broad `except Exception` for exactly
-        this reason.
+      - an embed failure, or a failed cosine bootstrap on the cosine path
+        (no gate is possible; never an ungated ranking),
+      - ANY failure ANYWHERE in this function (fail-soft: a broken/missing
+        local model, a transient store error such as a locked sqlite db
+        during the background backfill, or a floor-read error must never
+        break recall — it only demotes this turn to lexical-primary,
+        matching the spec's warm-up contract). The whole body is wrapped in
+        a broad `except Exception` for exactly this reason.
 
     Never renders anything and never bumps `recall_count` itself — the
     caller (`brain.chat.prompt._build_recall_block`) owns rendering and the
@@ -327,7 +578,8 @@ def run_semantic_recall(
             # query embed is transient (never persisted), so it goes
             # straight through the process-cached provider — no cache row
             # to write or evict.
-            query_vec = embeddings_mod.build_embedding_provider().embed(user_input).astype("float32")
+            embedder = embeddings_mod.build_embedding_provider()
+            query_vec = embedder.embed(user_input).astype("float32")
         except Exception:  # noqa: BLE001 — fail-soft
             log.exception("run_semantic_recall: query embed failed — falling back to lexical")
             return None
@@ -338,115 +590,31 @@ def run_semantic_recall(
         cosine_scored.sort(key=lambda pair: -pair[1])
         coarse = cosine_scored[:CANDIDATE_POOL]
 
-        reranker_provider = reranker_mod.build_reranker_provider(store=store)
-        # Name-recall fix R1 (spec §1): the width is fitted for THIS message
-        # from its own candidates' surviving pair lengths and the process's
-        # measured cost model (no hourly sample, diagnosis H8); anchors come
-        # on top of the fitted real candidates; the call is measured and
-        # feeds the cost model. Prefix order is the cosine coarse cut here;
-        # R3 puts genuine candidates ahead of the monologue family.
-        coarse_ids = [mid for mid, _ in coarse]
-        outcome = reranker_mod.rerank_for_recall(
-            reranker_provider, user_input, [pool[mid][0].content for mid in coarse_ids]
+        gated = rank_and_gate(
+            store,
+            user_input,
+            pool,
+            coarse,
+            embedder_model_id=embedder.model_id(),
+            log_calibration=True,
         )
-        if not outcome.reranked or outcome.normalization is None:
-            # Fewer than the S5 minimum fit (or exist), or no anchor median:
-            # no score from this query may be gated (S5/S7, H7). R2 sends
-            # this case to the cosine path; until then it is inconclusive.
-            log.info(
-                "run_semantic_recall: no rerank (%s, width %d) — falling back to lexical",
-                outcome.hand_off,
-                outcome.width,
-            )
-            return None
-        normalization = outcome.normalization
-        scored_ids = coarse_ids[: normalization.real_width]
-        real_documents = [pool[mid][0].content for mid in scored_ids]
-        rerank_scores = normalization.scores
-        try:
-            # F2a (#250 inc4), re-pointed by F2b (#276 §5): real-query
-            # calibration logging (spec Section 4/5). `user_input` is logged
-            # byte-identical to what was just embedded/reranked above — no
-            # synthetic/reconstructed query. `scored_ids`/`rerank_scores`
-            # are the SAME already-computed, already-NORMALIZED per-turn
-            # values that feed the floor gate just below (computed once,
-            # above, reused as-is here) — never the raw pre-normalization
-            # score, and exactly the ids scored this call (the fitted
-            # prefix; anchors are never logged). `log_calibration_sample`
-            # stamps the current score_scale on this row itself. One
-            # bounded INSERT, off the hot path in every sense but this
-            # single cheap write (I6). Wrapped separately from the outer
-            # fail-soft `except` below so a logging failure can NEVER demote
-            # a good semantic result to the lexical fallback — it only
-            # loses that one turn's calibration row.
-            #
-            # F2c inc1 (data foundation only, spec §3 Addition B):
-            # `candidate_docs` is `real_documents`, built from `scored_ids`
-            # in the same order, so it is positionally 1:1 with
-            # `scored_ids`/`candidate_ids` exactly the way `rerank_scores`
-            # already is. This is the RECALL-TIME text
-            # snapshot — the whole point of logging it here rather than
-            # re-fetching by id later is that a memory can drift/be
-            # forgotten between this turn and whenever F2c's weekly tick
-            # consumes the row.
-            store.log_calibration_sample(
-                query=user_input,
-                candidate_ids=scored_ids,
-                reranker_scores=rerank_scores,
-                reranker_model_id=reranker_provider.model_id(),
-                candidate_docs=real_documents,
-            )
-        except Exception:  # noqa: BLE001 — fail-soft: logging must never break recall
-            log.warning(
-                "run_semantic_recall: calibration log write failed — continuing",
-                exc_info=True,
-            )
-        reranked = list(zip(scored_ids, rerank_scores, strict=True))
-        reranked.sort(key=lambda pair: -pair[1])
-
-        # F2a inc8 (#250 §7 UPDATED): the floor is read LIVE per call, keyed
-        # by the RUNTIME reranker model_id (whichever of fp32/fp16 the
-        # precision self-check actually shipped — matches how inc4's
-        # calibration-log write and inc7's tick both key by
-        # `reranker_provider.model_id()`). No persisted row yet (daily tick
-        # has never fired for this model_id) no longer means INCONCLUSIVE —
-        # `get_reranker_floor` serves a derived bootstrap instead (see this
-        # module's own top-of-file comment). `floor_row is None` now fires
-        # ONLY on the bootstrap's own fail-soft path (a reranker load/fit
-        # failure); this check stays as the fail-soft demotion, never
-        # invents a placeholder numeric floor itself.
-        floor_row = store.get_reranker_floor(reranker_provider.model_id())
-        if floor_row is None:
-            log.info(
-                "run_semantic_recall: no floor available (bootstrap computation failed) for %s — "
-                "falling back to lexical",
-                reranker_provider.model_id(),
-            )
+        if gated is None:
             return None
 
-        # Observability (F2a inc8 scope item 5 — carries the red-team's MED
-        # note): cheap, off the critical timing (one debug log line) —
-        # lets live testing see which floor value actually gated this turn
-        # and whether it's still the cold-start bootstrap or a real
-        # corpus-derived fit, without adding per-turn work beyond the log
-        # call itself.
-        log.debug(
-            "run_semantic_recall: floor=%.4f model=%s cold_start=%s "
-            "sample_pairs=%d updated_at=%s",
-            floor_row["floor"],
-            reranker_provider.model_id(),
-            floor_row["is_cold_start"],
-            floor_row["sample_pairs"],
-            floor_row["updated_at"],
-        )
-
-        tiers = select_standouts(reranked, floor_row["floor"])
+        tiers = select_standouts(gated.ranked, gated.pass_mark)
         if tiers is None:
             return None
 
         full = [pool[mid][0] for mid in tiers.full_ids]
         snippet = [pool[mid][0] for mid in tiers.snippet_ids]
-        return SemanticRecallResult(full=full, snippet=snippet, scores=dict(reranked))
+        return SemanticRecallResult(
+            full=full,
+            snippet=snippet,
+            scores=dict(gated.ranked),
+            path=gated.path,
+            scale=gated.scale,
+            pass_mark=gated.pass_mark,
+        )
     except Exception:  # noqa: BLE001 — fail-soft: ANY failure demotes to lexical, never raises
         log.warning(
             "run_semantic_recall: semantic path failed — falling back to lexical",

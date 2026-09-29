@@ -2373,6 +2373,13 @@ def _run_calibration_tick(
     ``semantic_recall.RERANK_FLOOR`` constant. This tick's own job stays
     unchanged: derive and WRITE the floor to ``memories.db`` (I1).
 
+    **NAME-RECALL FIX R2 SCOPE (spec §2, S25/S38):** the judge-labeling step
+    samples the reranked/legacy and the cosine score scales separately, and
+    a further step derives the COSINE floor
+    (``floor_calibration.derive_and_persist_cosine_floor``, cosine-scale rows
+    only, embedder model id, its own table) after the rerank floor. Floor
+    fits never mix scales.
+
     Pre-flip revision Change 2 removed the cross-increment step this
     docstring used to describe here: an ACCEPTED floor write no longer
     invalidates a cached fp16-vs-fp32 precision decision, because that
@@ -2514,6 +2521,30 @@ def _run_calibration_tick(
             )
         except Exception:  # noqa: BLE001 — floor-derivation failure must not crash the tick
             logger.exception("calibration tick: floor-derivation pass raised; continuing")
+
+        # Name-recall fix R2 (spec §2, S25/S38): the COSINE floor, fit from
+        # the cosine-scale rows only and persisted to its own table keyed by
+        # the embedder model id. Its own try/except (mirrors the rerank-floor
+        # step above): a failure here must not undo the rerank floor.
+        try:
+            from brain.memory import embeddings as embeddings_mod
+            from brain.memory import floor_calibration
+
+            embedder_model_id = embeddings_mod.build_embedding_provider().model_id()
+            cosine_outcome = floor_calibration.derive_and_persist_cosine_floor(
+                store, embedder_model_id
+            )
+            logger.info(
+                "calibration tick: cosine floor derivation for %s -> accepted=%s floor=%s "
+                "held_for_data_starvation=%s sample_pairs=%d",
+                embedder_model_id,
+                cosine_outcome.accepted,
+                cosine_outcome.floor,
+                cosine_outcome.held_for_data_starvation,
+                cosine_outcome.sample_pairs,
+            )
+        except Exception:  # noqa: BLE001 — cosine-floor failure must not crash the tick
+            logger.exception("calibration tick: cosine-floor derivation pass raised; continuing")
     return True
 
 

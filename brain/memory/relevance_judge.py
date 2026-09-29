@@ -82,17 +82,15 @@ _HAIKU_TIEBREAK_PROMPT = prompt_strings.register("memory.relevance_judge.haiku_t
 # shape as store.py's CALIBRATION_LOG_RETENTION_WINDOW_DAYS:
 #   (i) LOWER bound — the spec cites the cutoff-fit's research basis as
 #       "robust at hundreds of pairs" (Section 7). Each sampled row yields
-#       one judged PAIR per candidate in that row's rerank pool (the
-#       auto-scaled width `reranker.get_rerank_width` chose that turn,
-#       bounded above by `relevance.CANDIDATE_POOL`=50 and below by its own
-#       floor of 1 on a maximally latency-starved potato host). 100 rows is
-#       chosen so that even a persistently narrow, single-candidate pool
-#       (the auto-scaler's worst case) still clears "hundreds of pairs" by
-#       inc7's floor-fit time (the fit itself draws from accumulated
-#       labeled rows across the retention window, not one day in
-#       isolation) — a genuinely narrow-pool host is rare in practice
-#       (get_rerank_width only bottoms out at 1 under a very tight budget +
-#       slow per-doc cost), so ordinary hosts clear it in a single day.
+#       one judged PAIR per candidate in that row's candidate list: a
+#       reranked row carries every real candidate of its per-message rerank
+#       width (at least `RERANK_MIN_REAL_CANDIDATES` = 5, S5, at most
+#       `relevance.CANDIDATE_POOL`=50); a cosine-scale row (name-recall fix
+#       R2, S60) carries up to 9. 100 rows therefore yield at least 500
+#       pairs from reranked rows, comfortably past "hundreds of pairs" by
+#       inc7's floor-fit time even at the minimum width. The two scales are
+#       sampled separately (S25: `label_calibration_sample`), so each gets
+#       up to this many rows and neither dilutes the other's fit.
 #   (ii) UPPER bound — bounding the local judge's daily compute on the
 #       no-AVX2 potato baseline (spec Section 7): 100 forward passes/day
 #       through a cross-encoder is a bounded, once-daily idle cost, not the
@@ -797,7 +795,15 @@ def label_calibration_sample(
     if sample_rows is None:
         sample_rows = tunables.get_tunable("calibration.judge_sample_rows", CALIBRATION_SAMPLE_ROWS)
 
-    rows = store.sample_unlabeled_calibration_rows(limit=int(sample_rows))
+    # Name-recall fix R2 (S25): the two score scales are labeled separately,
+    # each with its own `sample_rows` budget, so a busy reranked scale never
+    # starves the cosine scale's daily sample (or the reverse): the cosine
+    # floor is fit from cosine-scale rows only. (Labels themselves are scale-
+    # independent: the judge scores query x document text, not the logged
+    # score.) Rows of any non-cosine scale, legacy 'raw' included, stay in the
+    # first sample exactly as before.
+    rows = store.sample_unlabeled_calibration_rows(limit=int(sample_rows), cosine=False)
+    rows += store.sample_unlabeled_calibration_rows(limit=int(sample_rows), cosine=True)
     if not rows:
         return 0
 
