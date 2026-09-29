@@ -1217,14 +1217,20 @@ def search_paragraphs(
         # `embeddings.build_embedding_provider` is honored.
         embedder = embeddings_mod.build_embedding_provider()
         embedder_model_id = embedder.model_id()
-        # One-time costs kept out of every sample (like the provider's
-        # construction and the matrix's first build): the model load (S109)
-        # and the process's first embed for this model id, discarded (S117).
-        embedder.ensure_loaded()
-        _warm_up_embedder_once(embedder, embedder_model_id, paragraphs[0])
     except Exception:  # noqa: BLE001 — fail-soft
         log.exception("semantic recall: embedding provider unavailable — falling back to lexical")
         return None
+    # One-time costs kept out of every sample (like the provider's
+    # construction and the matrix's first build): the model load (S109) and
+    # the process's first embed for this model id, discarded (S117). Both are
+    # fail-soft: a failure here only means the one-time cost may land in a
+    # sample (the warm-up is retried on the next message), and the embed below
+    # decides whether semantic recall runs.
+    try:
+        embedder.ensure_loaded()
+        _warm_up_embedder_once(embedder, embedder_model_id, paragraphs[0])
+    except Exception:  # noqa: BLE001 — fail-soft
+        log.warning("semantic recall: embedder load/warm-up failed", exc_info=True)
 
     # Token counts (S108) for the paragraphs and, when there are several, the
     # whole message (the fallback query); its time is part of this message's
@@ -1241,6 +1247,7 @@ def search_paragraphs(
         return types[mid] in MONOLOGUE_FAMILY_TYPES
 
     embed_seconds: list[float] = []
+    embed_calls: list[list[str]] = []
 
     def embed_and_cut(texts: list[str]) -> list[tuple[list[tuple[str, float]], float]]:
         """Embed `texts` in one batch and cut each; per text its coarse cut
@@ -1252,6 +1259,7 @@ def search_paragraphs(
         vectors, in_lock = embedder.embed_batch_timed(texts)
         seconds = in_lock if in_lock is not None else _clock() - began
         embed_seconds.append(seconds)
+        embed_calls.append(list(texts))
         sizes = None if tokens_of is None else [tokens_of.get(t) for t in texts]
         if sizes is not None and None not in sizes and max(sizes) > 0:
             _embed_cost.record(embedder_model_id, len(texts) * max(sizes), seconds)
@@ -1371,7 +1379,10 @@ def search_paragraphs(
     # query's scan time (running average), this message's samples included,
     # never below zero; shared equally (S33). With token counts unknown the
     # prediction is replaced by this message's measured embed seconds.
-    embed_term = predicted_embed(queries)
+    # One prediction per embed call actually made (each call pays its own
+    # overhead: the S63 first message makes two).
+    predictions = [predicted_embed(call) for call in embed_calls]
+    embed_term = None if None in predictions else sum(predictions)
     if embed_term is None:
         embed_term = sum(embed_seconds)
     spent = overhead + embed_term + len(queries) * (_scan_time.average() or 0.0)

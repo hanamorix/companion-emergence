@@ -517,13 +517,13 @@ def test_a_first_message_that_does_not_fit_is_scored_as_its_first_paragraph_and_
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """S63/S115: no measurement yet; the first paragraph is embedded and timed
-    alone (1.4 s); 3 x 1.4 s does not fit 4 s, so the rest is ONE query and the
+    alone (1.5 s); 3 x 1.5 s does not fit 4 s, so the rest is ONE query and the
     two are re-scored as two paragraphs: own candidates (a memory found by both
     goes to its better cosine), own rerank with own anchors, equal shares."""
     clock = _Clock()
     monkeypatch.setattr(sr, "_clock", clock)
     _budget(monkeypatch, 4.0)
-    store, embedder, rec, first, rest = _two_query_store(monkeypatch, tmp_path, clock, 1.4)
+    store, embedder, rec, first, rest = _two_query_store(monkeypatch, tmp_path, clock, 1.5)
     calls = _spy_rank_and_gate(monkeypatch)
 
     result = run_semantic_recall(store, tmp_path, _THREE)
@@ -537,11 +537,10 @@ def test_a_first_message_that_does_not_fit_is_scored_as_its_first_paragraph_and_
     assert [mid for mid, _ in by_query[_P1]["coarse"]] == _ids(first)
     assert [mid for mid, _ in by_query[_REST]["coarse"]] == _ids(rest)
     assert by_query[_P1]["budget_seconds"] == pytest.approx(by_query[_REST]["budget_seconds"])
-    # The embed term is the series' prediction for the two queries as one batch
-    # (S108): samples (len P1, 1.4) and (len REST, 1.4) fit no positive rate, so
-    # the ratio of sums, 2.8 / (len P1 + len REST) per token, x = 2 x len REST.
-    predicted = 2.8 / (len(_P1) + len(_REST)) * 2 * len(_REST)
-    assert predicted < 4.0
+    # The embed term is the series' prediction per embed call made (S108): two
+    # calls, samples (len P1, 1.5) and (len REST, 1.5) fit no positive rate, so
+    # the ratio of sums 3.0 / (len P1 + len REST) per token, over len P1 + len REST.
+    predicted = 3.0 / (len(_P1) + len(_REST)) * len(_P1) + 3.0 / (len(_P1) + len(_REST)) * len(_REST)
     assert by_query[_P1]["budget_seconds"] == pytest.approx((4.0 - predicted) / 2)
     scored = rec.scored()
     assert [q for q, _ in scored] == [_P1, _REST], "one rerank per query, each against its own text"

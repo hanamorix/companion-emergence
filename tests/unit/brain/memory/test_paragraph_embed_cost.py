@@ -258,7 +258,7 @@ def test_c18_load_and_first_embed_are_kept_out_of_every_sample(monkeypatch, tmp_
     assert sr._scan_time.average() == pytest.approx(0.0)
 
 
-def test_c18_a_failed_warm_up_is_retried_and_falls_back(monkeypatch, tmp_path: Path) -> None:
+def test_c18_a_failed_warm_up_is_retried_and_does_not_stop_recall(monkeypatch, tmp_path: Path) -> None:
     clock = _clocked(monkeypatch)
     embedder = _CostEmbedder(clock)
     store = _store(monkeypatch, tmp_path, embedder)
@@ -271,10 +271,43 @@ def test_c18_a_failed_warm_up_is_retried_and_falls_back(monkeypatch, tmp_path: P
         return real_embed(text)
 
     monkeypatch.setattr(embedder, "embed", _embed)
-    assert run_semantic_recall(store, tmp_path, "kite over the harbour") is None
+    assert run_semantic_recall(store, tmp_path, "kite over the harbour") is not None, (
+        "a failed warm-up does not stop recall (review F2)"
+    )
+    assert sr._embed_warmed == set(), "not marked warm after a failure"
     fail["on"] = False
     assert run_semantic_recall(store, tmp_path, "kite over the harbour") is not None
-    assert embedder.single_embeds == ["kite over the harbour"]
+    assert embedder.single_embeds == ["kite over the harbour"], "retried once, on the next message"
+    assert sr._embed_warmed == {_EMBEDDER_ID}
+
+
+def test_c16_the_paragraph_embed_series_is_reset_by_the_tick_and_rescaled() -> None:
+    """S101/S118 on the real series (review F1): the tick carries its fit and
+    one new size rescales it."""
+    from brain.memory import cost_period
+
+    sr._embed_cost.record(_EMBEDDER_ID, 20, _O + _R * 20)
+    sr._embed_cost.record(_EMBEDDER_ID, 40, _O + _R * 40)
+    carried = sr._embed_cost.fit(_EMBEDDER_ID)
+    cost_period.start_new_period()
+    state = sr._embed_cost.state(_EMBEDDER_ID)
+    assert state.sums.n == 0 and state.carried == carried
+    sr._embed_cost.record(_EMBEDDER_ID, 30, 2 * (_O + _R * 30))
+    fit = sr._embed_cost.fit(_EMBEDDER_ID)
+    assert fit.predict(30) == pytest.approx(2 * (_O + _R * 30))
+    assert fit.rate == pytest.approx(2 * _R) and fit.overhead == pytest.approx(2 * _O)
+
+
+def test_f2_a_failing_ensure_loaded_does_not_disable_semantic_recall(monkeypatch, tmp_path: Path) -> None:
+    clock = _clocked(monkeypatch)
+    embedder = _CostEmbedder(clock)
+    store = _store(monkeypatch, tmp_path, embedder)
+
+    def _broken():
+        raise AttributeError("fastembed internals renamed")
+
+    monkeypatch.setattr(embedder, "ensure_loaded", _broken)
+    assert run_semantic_recall(store, tmp_path, "kite over the harbour") is not None
 
 
 # ---------------------------------------------------------------------------
