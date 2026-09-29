@@ -24,6 +24,7 @@ from brain.engines.daemon_state import DaemonState, get_residue_context
 from brain.engines.research_ambient import build_research_awareness_block
 from brain.maker.ambient import build_maker_awareness_block
 from brain.memory.recall_open import open_memory
+from brain.memory.recall_stopwords import RECALL_STOPWORDS
 from brain.memory.relevance import (
     FULL_INJECT_IMPORTANCE,
     FULL_INJECT_MAX,
@@ -1602,48 +1603,10 @@ _RECALL_TOKEN_MIN_LEN = 3
 # those two outputs do not widen (S71, Q16 interim; PARKED/REVIEW-PENDING).
 _RECALL_TOKEN_LIMIT = 10
 
-# Conservative closed-class English function words + common discourse
-# interjections/fillers — deliberately EXCLUDES content words ("issue",
-# "first", "quick", "seems", "memory", "trigger", "signal", "logger" etc.),
-# which are demoted by salience ordering, not filtered outright. English-
-# specific (documented limitation). Static frozenset: no NLTK/sklearn
-# dependency for a word list.
-_RECALL_STOPWORDS: frozenset[str] = frozenset(
-    {
-        # articles
-        "a", "an", "the",
-        # pronouns / determiners
-        "i", "me", "my", "mine", "myself",
-        "you", "your", "yours", "yourself", "yourselves",
-        "he", "him", "his", "himself",
-        "she", "her", "hers", "herself",
-        "it", "its", "itself",
-        "we", "us", "our", "ours", "ourselves",
-        "they", "them", "their", "theirs", "themselves",
-        "this", "that", "these", "those",
-        "who", "whom", "whose", "which", "what",
-        "whoever", "whatever", "whichever",
-        "any", "some", "all", "both", "each", "either", "neither",
-        "every", "other", "another", "such", "own", "same", "only", "none",
-        # auxiliaries / modals
-        "am", "is", "are", "was", "were", "be", "been", "being",
-        "have", "has", "had", "having",
-        "do", "does", "did", "doing",
-        "will", "would", "shall", "should", "can", "could", "may", "might", "must",
-        # prepositions
-        "about", "above", "across", "after", "against", "along", "among",
-        "around", "at", "before", "behind", "below", "beside", "between",
-        "by", "down", "during", "except", "for", "from", "in", "into",
-        "near", "of", "off", "on", "out", "over", "since", "through", "to",
-        "towards", "under", "until", "up", "upon", "with", "within", "without",
-        # conjunctions
-        "and", "but", "or", "nor", "so", "yet", "because", "although",
-        "though", "while", "if", "unless", "whether", "than", "as",
-        # common discourse interjections / fillers
-        "alrighty", "okay", "ok", "yeah", "yep", "nope", "hmm", "anyway",
-        "gonna", "wanna", "oh", "hey", "yes", "no", "alright", "hi", "hello",
-    }
-)
+# The stopword set lives in brain.memory.recall_stopwords (moved there so the
+# known-names admission filter can use it without importing the chat layer, S70).
+# Alias kept: the selector below and its tests read it under this name.
+_RECALL_STOPWORDS: frozenset[str] = RECALL_STOPWORDS
 
 
 def _extract_recall_tokens(user_input: str, store: MemoryStore | None = None) -> list[str]:
