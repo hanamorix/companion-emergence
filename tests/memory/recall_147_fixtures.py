@@ -222,3 +222,31 @@ def recall_at_with_semantic(
             top = active_ids(block)[:cutoff]
             total += sum(1 for mid in top if mid in q.targets) / len(q.targets)
     return total / len(queries)
+
+
+def tool_recall_at(
+    store: MemoryStore,
+    queries: list[ControlQuery],
+    *,
+    limit: int,
+    persona_dir: Path,
+) -> float:
+    """Mean over queries of |targets among the `limit` results of the search
+    TOOL in lexical mode| / |targets| (the tool's keyword side, S81; the same
+    fixtures and labels as `recall_at`). Runs on the base code too."""
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.tools.dispatch import dispatch
+
+    heb = HebbianMatrix(":memory:")
+    total = 0.0
+    for q in queries:
+        res = dispatch(
+            "search_memories",
+            {"query": q.text, "mode": "lexical", "limit": limit},
+            store=store,
+            hebbian=heb,
+            persona_dir=persona_dir,
+        )
+        ids = [m["id"] for m in res["memories"]]
+        total += sum(1 for mid in ids if mid in q.targets) / len(q.targets)
+    return total / len(queries)

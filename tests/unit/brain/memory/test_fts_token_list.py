@@ -15,7 +15,7 @@ from brain.dev_constants import MONOLOGUE_FAMILY_TYPES
 from brain.forgetting.recall import search_with_loss
 from brain.memory import relevance
 from brain.memory.relevance import rank_memories
-from brain.memory.store import Memory, MemoryStore, _to_fts_match
+from brain.memory.store import Memory, MemoryStore, _to_fts_match, split_by_raw_query_floor
 
 
 def _store_with(*contents: str) -> tuple[MemoryStore, list[Memory]]:
@@ -138,3 +138,10 @@ def test_search_with_loss_passes_genuine_first_and_keeps_the_bucket_windows(tmp_
     assert len(plain.active) <= 8 and len(genuine_first.active) <= 8, "the window is `limit` either way"
     assert {m.id for m in genuine} <= {m.id for m in genuine_first.active}
     assert not ({m.id for m in genuine} <= {m.id for m in plain.active})
+
+
+def test_split_by_raw_query_floor_matches_what_the_raw_string_builder_admits() -> None:
+    tokens = ["ai", "cat", "42", "nasa", "tv", "harbour"]
+    kept, short = split_by_raw_query_floor(tokens)
+    assert kept == ["cat", "nasa", "harbour"] and short == ["ai", "42", "tv"]
+    assert _to_fts_match(" ".join(tokens)) == _to_fts_match(kept), "kept = exactly the raw string's terms"

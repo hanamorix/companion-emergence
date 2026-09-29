@@ -15,9 +15,10 @@ from brain.memory.relevance import CANDIDATE_POOL, rank_memories, snippet_length
 from brain.memory.semantic_recall import (
     build_semantic_candidate_pool,
     genuine_first_coarse_cut,
+    genuine_first_memories,
     rank_and_gate,
 )
-from brain.memory.store import Memory, MemoryStore
+from brain.memory.store import Memory, MemoryStore, split_by_raw_query_floor
 from brain.tools.impls._common import _mem_to_result
 
 logger = logging.getLogger(__name__)
@@ -89,13 +90,17 @@ def _keyword_candidates(
     exclude: frozenset[str],
 ) -> list[Memory]:
     """The tool's keyword search, every candidate best-first (name-recall fix
-    R4, spec §5, S81): BM25 text-match + importance + hebbian
+    R4, spec §5, S81, S79): BM25 text-match + importance + hebbian
     spreading-activation + recency via ``rank_memories`` over EVERY word of
-    ``query`` (`_query_words`), one OR query, the store admitting each word.
-    Monologue-family hits follow genuine ones (spec §4, S16): ``genuine_first``
-    ranks them after every genuine match in the ranker's candidate pool and its
-    final order, so a family hit never takes a slot from a genuine one.
-    ``exclude`` ids are removed before ranking.
+    ``query`` (`_query_words`), in two tiers so the extra words only add:
+    tier 1 is the words the store's raw-string builder has always searched (3+
+    characters, stopwords included, exactly what this tool sent before); tier 2
+    is the 1-2 character words (a 2-letter name, an acronym, a digit, S36),
+    whose hits follow every tier-1 hit and so only fill leftover slots. (Sent
+    in ONE query they out-rank the rare word the kindled asked about: the #147
+    fear, measured on the control fixtures.) Monologue-family hits follow
+    genuine ones (spec §4, S16, ``genuine_first``). ``exclude`` ids are removed
+    before ranking.
 
     R5 seam: the known-names query (its hits ahead of everything, S79) belongs
     in front of this list in BOTH modes; it is not built yet.
@@ -103,10 +108,23 @@ def _keyword_candidates(
     words = _query_words(query)
     if not words:
         return []
-    ranked = rank_memories(
-        store, hebbian, words, limit=CANDIDATE_POOL, exclude_ids=exclude, genuine_first=True
-    )
-    return [m for m, _ in ranked]
+    kept, short = split_by_raw_query_floor(words)
+    tiers: list[list[Memory]] = []
+    for tier_words in (kept, short):
+        if not tier_words:
+            continue
+        ranked = rank_memories(
+            store, hebbian, tier_words, limit=CANDIDATE_POOL, exclude_ids=exclude, genuine_first=True
+        )
+        tiers.append([m for m, _ in ranked])
+    seen: set[str] = set()
+    merged: list[Memory] = []
+    for tier in tiers:
+        for m in tier:
+            if m.id not in seen:
+                seen.add(m.id)
+                merged.append(m)
+    return genuine_first_memories(merged)
 
 
 def _lexical_candidates(

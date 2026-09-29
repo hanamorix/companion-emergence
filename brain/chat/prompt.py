@@ -39,7 +39,7 @@ from brain.memory.semantic_recall import (
     is_monologue_family,
     run_semantic_recall,
 )
-from brain.memory.store import _FTS_TOKEN_MIN_LEN, MemoryStore
+from brain.memory.store import MemoryStore, split_by_raw_query_floor
 from brain.soul.store import SoulStore
 from brain.utils.time import format_local, to_local
 
@@ -818,7 +818,7 @@ def _recall_sort_key(m):
     return (-importance, -ts)
 
 
-def _full_inject_ids(mems: list) -> set[str]:
+def _full_inject_ids(mems: list, quota: int = FULL_INJECT_MAX) -> set[str]:
     """Ids of the candidates rendered in full (untruncated body).
 
     A candidate with ``importance >= FULL_INJECT_IMPORTANCE`` is never gated
@@ -833,7 +833,19 @@ def _full_inject_ids(mems: list) -> set[str]:
     # Highest importance first; a monologue-family memory never takes one of
     # the few full-inject slots from a genuine one (name-recall fix R4, S16).
     hi.sort(key=lambda m: (is_monologue_family(m), -float(getattr(m, "importance", 0) or 0)))
-    return {m.id for m in hi[:FULL_INJECT_MAX]}
+    return {m.id for m in hi[:quota]}
+
+
+def _tiered_full_inject_ids(mems: list, tier2_ids: frozenset[str]) -> set[str]:
+    """`_full_inject_ids` with the quota spent on tier-1 hits first (S79): a
+    tier-2 hit (found only through the extra tokens) can use a full-inject slot
+    only if tier 1 leaves one, so the extra tokens never take a render or a full
+    bump from something today's search already surfaced."""
+    first = _full_inject_ids([m for m in mems if m.id not in tier2_ids])
+    room = FULL_INJECT_MAX - len(first)
+    if room <= 0:
+        return first
+    return first | _full_inject_ids([m for m in mems if m.id in tier2_ids], quota=room)
 
 
 def _recall_snippet(mem, *, full: bool) -> str:
@@ -872,13 +884,13 @@ def _keyword_tiers(tokens: list[str], legacy_tokens: list[str]) -> tuple[str, li
 
     Tier 1 is today's search EXACTLY: the old top-`_RECALL_TOKEN_LIMIT` tokens
     joined into one raw string, which the store tokenizes with its
-    `_FTS_TOKEN_MIN_LEN` floor as it always did, so nothing today's search finds
+    length floor as it always did, so nothing today's search finds
     can be lost. Tier 2 is everything tier 1 does not reach: the tokens beyond the
     old top 10, and any old-top-10 token under the floor (a 2-letter name or
     acronym the store now admits, S36). Tier 2 only fills the slots tier 1
     leaves. Returns ``(tier-1 query string, tier-2 token list)``.
     """
-    reached = {t for t in legacy_tokens if len(t) >= _FTS_TOKEN_MIN_LEN}
+    reached = set(split_by_raw_query_floor(legacy_tokens)[0])
     return " ".join(legacy_tokens), [t for t in tokens if t not in reached]
 
 
@@ -923,6 +935,7 @@ def _assemble_active_entries(
     keyword_hits: list,
     *,
     limit: int,
+    tier2_ids: frozenset[str] = frozenset(),
 ) -> list[tuple[object, bool]]:
     """The "active:" section's memories as ONE ordered list of
     ``(memory, render_full)`` (name-recall fix R4, spec §3/§5, P-10, P-11).
@@ -942,13 +955,15 @@ def _assemble_active_entries(
     No semantic result (P-12): keyword-only turn under today's lexical caps
     (``limit``) and full-inject rule, unchanged.
 
-    ``keyword_hits`` is already in final keyword order (blended score,
-    genuine before monologue-family). ``semantic_result.hits`` is not read:
+    ``keyword_hits`` is already in final keyword order (tier 1, then tier 2, each
+    by blended score; genuine before monologue-family). ``tier2_ids`` names the
+    hits found only through the extra tokens: they use the importance quota
+    only after tier 1 (S79). ``semantic_result.hits`` is not read:
     ``full`` + ``snippet`` are the one source of truth.
     """
     if semantic_result is None:
         top = keyword_hits[:limit]
-        full_ids = _full_inject_ids(top)
+        full_ids = _tiered_full_inject_ids(top, tier2_ids)
         return [(m, m.id in full_ids) for m in top]
 
     semantic = [*semantic_result.full, *semantic_result.snippet]
@@ -959,7 +974,7 @@ def _assemble_active_entries(
     # S80: the "up to 3" counts only hits shown full BECAUSE of the importance
     # rule; a hit already full by position does not use one of the 3.
     beyond = [m for j, m in enumerate(fill) if len(semantic) + j >= FULL_INJECT_STANDOUT_MAX]
-    promoted = _full_inject_ids(beyond)
+    promoted = _tiered_full_inject_ids(beyond, tier2_ids)
 
     entries: list[tuple[object, bool]] = [(m, m.id in semantic_full_ids) for m in semantic]
     for j, mem in enumerate(fill):
@@ -1053,9 +1068,10 @@ def _build_recall_block(
     Strategy: extract salient content tokens from ``user_input`` (drop
     stopwords/short fragments; ranked by corpus IDF + proper-noun bonus —
     Tier-1 recall-query fix; name-recall fix R4: EVERY surviving token is
-    searched, the old 10-token cap is gone), issue ONE combined OR query via a
-    single search_with_loss call (sharing a single per-turn HebbianMatrix
-    handle), render four sections:
+    searched, the old 10-token cap is gone), search in two tiers (S79: today's
+    capped query through one search_with_loss call, then the tokens it does not
+    reach, filling only leftover slots; both share a single per-turn
+    HebbianMatrix handle), render four sections:
       - active memories: the semantic results first, then the keyword hits in
         the slots the semantic results leave under the cap of 9 (the first 5
         positions full, later ones snippets, except a keyword hit with
@@ -1099,8 +1115,8 @@ def _build_recall_block(
 
     if persona_dir is None:
         # Legacy path — no persona_dir → cannot locate hebbian.db or the
-        # graveyard. Ranked retrieval over ONE combined OR query (Tier-1: was
-        # a per-token loop; hebbian=None → w_heb=0), same snippet render as
+        # graveyard. Ranked retrieval over the two keyword tiers (S79; was a
+        # per-token loop; hebbian=None → w_heb=0), same snippet render as
         # the main path, no surfacing bump.
         from brain.memory.relevance import rank_memories
 
@@ -1124,7 +1140,9 @@ def _build_recall_block(
             return ""
 
         top = genuine_first_memories(candidates)[:limit]
-        full_ids = _full_inject_ids(top)
+        full_ids = _tiered_full_inject_ids(
+            top, frozenset(m.id for m in _sort_keyword_tier(ranked2)) - {m.id for m in _sort_keyword_tier(ranked)}
+        )
 
         lines = ["── recall (memories matching this turn) ──"]
         if SNIPPET_MODE_ENABLED:
@@ -1215,8 +1233,8 @@ def _build_recall_block(
     merged_fading: dict[str, float] = {}
 
     # THE one hebbian open site in all of P2 (spec §2): open exactly one
-    # HebbianMatrix for the turn's single combined search_with_loss call,
-    # close it once. integrity_check=False → no per-turn full-DB scan.
+    # HebbianMatrix for the turn's search_with_loss call (and the tier-2 ranker
+    # call that shares it), close it once. integrity_check=False → no per-turn full-DB scan.
     # Fail-soft: any open error → heb=None (w_heb=0) and the search still runs.
     heb = None
     try:
@@ -1323,6 +1341,7 @@ def _build_recall_block(
     # Keyword tiers (S79): name-query hits (R5 seam: [] until then), then tier 1
     # (today's capped search), then tier 2; the family after every genuine hit.
     name_active: list = []
+    tier2_only = frozenset(m.id for m in tier2_active) - {m.id for m in active_hits}
     active_hits = genuine_first_memories(
         _order_keyword_tiers(name_active, active_hits, [m for m in tier2_active if m.id not in seen_fading])
     )
@@ -1332,7 +1351,9 @@ def _build_recall_block(
     # they leave, tiers by position (P-10). A CONCLUSIVE semantic result always
     # carries at least one surfaced candidate (`run_semantic_recall` returns
     # `None` for every inconclusive/empty case), so it alone keeps the block.
-    active_entries = _assemble_active_entries(semantic_result, active_hits, limit=limit)
+    active_entries = _assemble_active_entries(
+        semantic_result, active_hits, limit=limit, tier2_ids=tier2_only
+    )
     if not active_entries and not fading_hits and not lost_hits and not unfamiliar:
         return ""
 
@@ -1573,12 +1594,12 @@ _RECALL_TOKEN_MIN_LEN = 3
 # message's 8 salient content tokens ("logger, live, first, quick, memory,
 # trigger, garbage, treasure") all survive selection regardless of IDF.
 #
-# Name-recall fix R4 (spec §5, S9/S52): this is NO LONGER a search cap.
-# `_extract_recall_tokens` returns every survivor and every keyword search
-# takes them all. The constant now names only the size of the LEGACY selection
-# (`_legacy_capped_tokens`), which still feeds the graveyard search and the
-# "not recognised" list so those two outputs do not widen with the cap
-# (S71, Q16 interim; both PARKED/REVIEW-PENDING for the owner).
+# Name-recall fix R4 (spec §5, S9/S52/S79): this is NO LONGER a search cap.
+# `_extract_recall_tokens` returns every survivor and every token is searched.
+# The constant now names the size of the LEGACY selection
+# (`_legacy_capped_tokens`): tier 1 of the keyword search (today's query, S79),
+# and what still feeds the graveyard search and the "not recognised" list so
+# those two outputs do not widen (S71, Q16 interim; PARKED/REVIEW-PENDING).
 _RECALL_TOKEN_LIMIT = 10
 
 # Conservative closed-class English function words + common discourse
@@ -1743,8 +1764,8 @@ def _legacy_capped_tokens(ranked: list[str]) -> list[str]:
     salience-ranked tokens `_extract_recall_tokens` returns.
 
     Bit-identical to what the selector returned before the cap was removed
-    (P-31). Feeds the graveyard search and the "not recognised" list only; the
-    active/fading keyword search takes every token.
+    (P-31). It is tier 1 of the keyword search (S79), and feeds the graveyard
+    search and the "not recognised" list; the remaining tokens are tier 2.
     """
     return ranked[:_RECALL_TOKEN_LIMIT]
 

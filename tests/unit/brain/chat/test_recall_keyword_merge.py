@@ -637,3 +637,41 @@ def test_a_fading_memory_reachable_only_through_tier_two_is_still_softened_in(tm
     block = _render(store, message, tmp_path, None)
     assert "softened (fading" in block
     assert "an old harbour" in block
+
+
+def test_importance_quota_is_spent_on_tier_one_hits_before_tier_two(tmp_path: Path) -> None:
+    """The extra tokens never take a full render (or the full bump) from a hit
+    today's search already surfaces: five importance-9 tier-1 hits use the quota
+    of 3 before three importance-10 tier-2 hits are considered."""
+    store = MemoryStore(":memory:")
+    tier1 = [_mem(store, f"{' '.join(_RARE)} tier one {i}", importance=9.0 + 0.1 * i) for i in range(5)]
+    tier2 = [_mem(store, f"{' '.join(_COMMON)} tier two {i}", importance=10.0) for i in range(3)]
+    for i in range(12):  # make the common words frequent, so they rank beyond the old top 10
+        _mem(store, f"{_COMMON[i % 2]} filler line {i} about nothing in particular", importance=4.0)
+    message = " ".join(_RARE + _COMMON)
+    rows = _active_rows(_render(store, message, tmp_path, None))
+    full = {rid for rid, body in rows if not _is_snippet(body)}
+    top3_tier1 = {m.id for m in sorted(tier1, key=lambda m: -m.importance)[:3]}
+    assert full == top3_tier1
+    assert not ({m.id for m in tier2} & full)
+
+
+def _family_in_tier_one_store() -> tuple[MemoryStore, Memory, Memory, str]:
+    store = MemoryStore(":memory:")
+    family = _mem(store, "decoy " + " ".join(_RARE), memory_type="monologue", importance=9.5)
+    target = _mem(store, f"the {' '.join(_COMMON)} morning walk with Canary")
+    for i in range(3):
+        _mem(store, f"{_COMMON[i % 2]} filler line {i} about nothing in particular", importance=4.0)
+    return store, family, target, " ".join(_RARE + _COMMON)
+
+
+def test_a_tier_two_genuine_hit_precedes_a_tier_one_family_hit(tmp_path: Path) -> None:
+    store, family, target, message = _family_in_tier_one_store()
+    ids = [r[0] for r in _active_rows(_render(store, message, tmp_path, None))]
+    assert ids.index(target.id) < ids.index(family.id)
+
+
+def test_a_tier_two_genuine_hit_precedes_a_tier_one_family_hit_without_persona_dir() -> None:
+    store, family, target, message = _family_in_tier_one_store()
+    block = _build_recall_block(store, message, persona_dir=None)
+    assert block.index(target.id) < block.index(family.id)

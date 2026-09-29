@@ -617,6 +617,16 @@ _ALLOWED_FILTER_COLUMNS = frozenset({"domain", "memory_type"})
 _FTS_TOKEN_MIN_LEN = 3
 
 
+def split_by_raw_query_floor(tokens: Sequence[str]) -> tuple[list[str], list[str]]:
+    """``(kept, short)``: the tokens the raw-string query builder admits, and the
+    ones its ``_FTS_TOKEN_MIN_LEN`` floor drops. Lets a caller search the first
+    group exactly as a raw string always was (name-recall fix R4, S79) and route
+    the second (2-letter names, acronyms, digits, S36) elsewhere, without
+    duplicating the floor."""
+    kept = [t for t in tokens if len(t) >= _FTS_TOKEN_MIN_LEN]
+    return kept, [t for t in tokens if len(t) < _FTS_TOKEN_MIN_LEN]
+
+
 def _to_fts_match(query: str | Sequence[str]) -> str:
     """Build an FTS5 MATCH expression from a query.
 

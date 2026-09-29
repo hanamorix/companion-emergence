@@ -42,6 +42,7 @@ from tests.memory.recall_147_fixtures import (
     build_control_set,
     recall_at,
     recall_at_with_semantic,
+    tool_recall_at,
 )
 
 # Provenance: `origin/main` ed9b83ef, fixtures `build_control_set(seed=147, n_queries=24, ...)`.
@@ -51,6 +52,9 @@ BASE_RARE_AT_8 = 0.9583333333333334
 BASE_RARE_NOSHORT_AT_8 = 1.0  # same rare-token queries with NO short tokens: isolates the cap removal
 BASE_CONTROL_SEMANTIC_AT_9 = 0.0  # the base's conclusive semantic result suppresses keyword
 BASE_RARE_SEMANTIC_AT_9 = 0.0
+# The search TOOL's lexical mode (S81), same fixtures, same base: (limit) -> recall.
+BASE_TOOL_CONTROL = {3: 1.0, 5: 1.0, 8: 1.0}
+BASE_TOOL_RARE = {3: 0.875, 5: 0.9166666666666666, 8: 1.0}
 _EPS = 1e-9
 
 _KEYWORD_ONLY_CUTOFF = SNIPPET_COUNT  # 8: no semantic result renders (S68)
@@ -180,3 +184,23 @@ def test_a_capped_selector_with_short_token_admission_scores_below_base_on_the_c
     ):
         got = recall_at(store, queries, cutoff=_KEYWORD_ONLY_CUTOFF, persona_dir=tmp_path)
     assert got < BASE_CONTROL_AT_8 - _EPS
+
+
+@pytest.mark.parametrize("limit", [3, 5, 8])
+def test_tool_lexical_recall_is_not_below_base(control, rare, limit: int, tmp_path: Path) -> None:
+    """#147 on the tool (S52, S81): the tool sends every word of a long query, and
+    the 1-2 character words must only add (tier 2), never out-rank the rare word."""
+    for (store, queries, _), base in ((control, BASE_TOOL_CONTROL), (rare, BASE_TOOL_RARE)):
+        got = tool_recall_at(store, queries, limit=limit, persona_dir=tmp_path)
+        assert got >= base[limit] - _EPS, f"tool recall@{limit} {got} < base {base[limit]}"
+
+
+def test_a_single_untiered_tool_query_scores_below_base(rare, tmp_path: Path) -> None:
+    """Able to fail: sending every word, short ones included, in ONE query (the
+    tool as first built for S81) drops recall below the base on the rare set."""
+    import brain.tools.impls.search_memories as tool  # noqa: PLC0415
+
+    store, queries, _ = rare
+    with patch.object(tool, "split_by_raw_query_floor", lambda words: (list(words), [])):
+        got = tool_recall_at(store, queries, limit=3, persona_dir=tmp_path)
+    assert got < BASE_TOOL_RARE[3] - _EPS

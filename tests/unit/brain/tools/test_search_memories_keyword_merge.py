@@ -277,13 +277,14 @@ def _cap_store(store: MemoryStore) -> Memory:
     return target
 
 
-def test_lexical_mode_sends_every_word_of_the_query_to_the_ranker(tmp_path: Path) -> None:
-    """S81: every word, stopwords included, no length floor, no cap."""
+def test_lexical_mode_sends_every_word_of_the_query_to_the_ranker_in_two_tiers(tmp_path: Path) -> None:
+    """S81 + S79: every word, stopwords included, no cap; the words the raw-string
+    builder has always searched (3+ characters) first, the 1-2 character words
+    as a second ranker call whose hits only follow."""
     ctx = _ctx(tmp_path)
     store = ctx["store"]
     target = _cap_store(store)
     query = "the " + " ".join(_RARE + _COMMON) + " and of AI"
-    expected = ["the", *_RARE, *_COMMON, "and", "of", "ai"]
 
     import brain.tools.impls.search_memories as tool  # noqa: PLC0415
 
@@ -291,15 +292,28 @@ def test_lexical_mode_sends_every_word_of_the_query_to_the_ranker(tmp_path: Path
     seen: list = []
 
     def spy(st, heb, q, **kwargs):
-        seen.append(q)
+        seen.append(list(q))
         return real(st, heb, q, **kwargs)
 
     with patch.object(tool, "rank_memories", spy):
         res = dispatch("search_memories", {"query": query, "mode": "lexical", "limit": 8}, **ctx)
 
     assert res["mode"] == "lexical"
-    assert seen == [expected], "the ranker received every word of the query, in order, once each"
+    assert seen == [["the", *_RARE, *_COMMON, "and"], ["of", "ai"]]
     assert target.id in _ids(res), "a word beyond the old ten-token cap is searched"
+
+
+def test_short_word_hits_only_follow_tier_one_hits(tmp_path: Path) -> None:
+    ctx = _ctx(tmp_path)
+    store = ctx["store"]
+    only_long = [_mem(store, f"quokka harbour note {i}") for i in range(3)]
+    ai = _mem(store, "an AI notebook, nothing else")
+    ids = _ids(dispatch("search_memories", {"query": "quokka AI", "mode": "lexical", "limit": 8}, **ctx))
+    assert ids[:3] and set(ids[:3]) == {m.id for m in only_long}
+    assert ids[3] == ai.id
+
+    ids2 = _ids(dispatch("search_memories", {"query": "quokka AI", "mode": "lexical", "limit": 3}, **ctx))
+    assert ai.id not in ids2, "with tier 1 filling the limit, the short word displaces nothing"
 
 
 def test_lexical_mode_admits_a_two_letter_acronym(tmp_path: Path) -> None:
@@ -331,3 +345,12 @@ def test_a_stopword_query_and_a_lowercase_unlisted_name_are_searched_in_both_mod
     assert res["mode"] == "semantic"
     ids = _ids(res)
     assert ids[0] == sem.id and will.id in ids
+
+
+def test_a_tier_two_genuine_hit_precedes_a_tier_one_family_hit(tmp_path: Path) -> None:
+    ctx = _ctx(tmp_path)
+    store = ctx["store"]
+    family = _mem(store, "quokka harbour trace note", memory_type="monologue", importance=9.5)
+    genuine = _mem(store, "an AI notebook, nothing else")
+    ids = _ids(dispatch("search_memories", {"query": "quokka AI", "mode": "lexical", "limit": 8}, **ctx))
+    assert ids.index(genuine.id) < ids.index(family.id)
