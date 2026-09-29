@@ -1173,6 +1173,8 @@ def test_a_reader_keeps_its_snapshot_across_a_put_and_evict_and_the_next_reader_
     ids2, unit2 = matrix.stacked()
     assert ids2 == ("a", "c")
     assert unit2[0] == pytest.approx([0.0, 0.0, 1.0, 0.0])
+    matrix.evict("c")
+    assert matrix.stacked()[0] == ("a",), "an evict alone also drops the cached stack"
 
 
 def test_a_concurrent_running_time_update_is_never_lost(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1196,3 +1198,77 @@ def test_a_concurrent_running_time_update_is_never_lost(monkeypatch: pytest.Monk
     assert sums.samples == 2
     assert sums.seconds == pytest.approx(3.0)
     assert running.average() == pytest.approx(1.5)
+
+
+def test_each_cosine_path_paragraphs_best_heads_the_group_before_other_cosine_genuine_results() -> None:
+    """C8b: A's second result (0.85) outscores B's best (0.7), yet B's best
+    sits at the head of the cosine-path genuine group with A's best."""
+    a1, a2, b1 = _m("a1"), _m("a2"), _m("b1")
+    search = _hand_search(
+        [(COSINE_PATH, [(a1, 0.9), (a2, 0.85)], 0.5, None), (COSINE_PATH, [(b1, 0.7)], 0.5, None)]
+    )
+    assert [h.memory_id for h in assemble_paragraph_results(search, 9)] == [a1.id, b1.id, a2.id]
+
+
+_KEYWORD_FIRST = (
+    KEYWORD_GENUINE,
+    RERANKED_GENUINE,
+    RERANKED_FAMILY,
+    COSINE_GENUINE,
+    COSINE_FAMILY,
+    KEYWORD_FAMILY,
+)
+
+
+def test_passive_recall_keeps_a_guaranteed_slot_ahead_of_keyword_hits_under_any_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With keyword genuine hits ordered first and more of them than the cap,
+    the paragraph's guaranteed semantic result still takes a slot."""
+    monkeypatch.setattr(dev_constants, "RECALL_RESULT_GROUP_ORDER", _KEYWORD_FIRST)
+    store = MemoryStore(":memory:")
+    head = Memory.create_new(content="a cosine path genuine memory", memory_type="event", domain="us")
+    store.create(head)
+    keyword = [
+        Memory.create_new(content=f"{_LONG} (keyword {i})", memory_type="conversation", domain="us")
+        for i in range(12)
+    ]
+    for m in keyword:
+        store.create(m)
+    semantic = SemanticRecallResult(
+        full=[head],
+        snippet=[],
+        scores={head.id: 0.9},
+        hits=[SemanticHit(head, 0.9, COSINE_PATH, 0, False)],
+        path=COSINE_PATH,
+        guaranteed_ids=(head.id,),
+    )
+    ids = [mid for mid, _ in _active_rows(_render(store, "quokka photographs", tmp_path, semantic))]
+    assert len(ids) == 9
+    assert ids[-1] == head.id
+
+
+def test_the_tool_keeps_a_guaranteed_slot_ahead_of_keyword_hits_under_any_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import brain.tools.impls.search_memories as tool
+
+    monkeypatch.setattr(dev_constants, "RECALL_RESULT_GROUP_ORDER", _KEYWORD_FIRST)
+    store = MemoryStore(":memory:")
+    head = Memory.create_new(content="a cosine path genuine memory", memory_type="event", domain="us")
+    store.create(head)
+    for i in range(6):
+        store.create(
+            Memory.create_new(content=f"the quokka photographs {i}", memory_type="conversation", domain="us")
+        )
+    semantic = tool._SemanticTopK(grouped=[(head, COSINE_GENUINE)], guaranteed=[head.id])  # noqa: SLF001
+    monkeypatch.setattr(tool, "_semantic_top_k", lambda *a, **kw: semantic)
+    out = dispatch(
+        "search_memories",
+        {"query": "quokka photographs", "limit": 3},
+        store=store,
+        hebbian=HebbianMatrix(":memory:"),
+        persona_dir=tmp_path,
+    )
+    ids = [m["id"] for m in out["memories"]]
+    assert len(ids) == 3 and ids[-1] == head.id
