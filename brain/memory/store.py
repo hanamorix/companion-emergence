@@ -617,12 +617,19 @@ _ALLOWED_FILTER_COLUMNS = frozenset({"domain", "memory_type"})
 _FTS_TOKEN_MIN_LEN = 3
 
 
-def _to_fts_match(query: str) -> str:
-    """Build an FTS5 MATCH expression from a raw query string.
+def _to_fts_match(query: str | Sequence[str]) -> str:
+    """Build an FTS5 MATCH expression from a query.
 
-    Tokenizes (split on ``[^A-Za-z0-9]+``, drop tokens shorter than
-    ``_FTS_TOKEN_MIN_LEN``, dedup case-insensitively) and **OR-joins each term
-    wrapped in double-quotes** — e.g. ``'"henryk" OR "preferences"'``.
+    A raw query STRING is tokenized (split on ``[^A-Za-z0-9]+``, drop tokens
+    shorter than ``_FTS_TOKEN_MIN_LEN``, dedup case-insensitively) and
+    **OR-joins each term wrapped in double-quotes** — e.g.
+    ``'"henryk" OR "preferences"'``.
+
+    A query given as a token LIST is the recall selector's own output
+    (name-recall fix R4, spec §5, S36): the caller has already applied the
+    stopword and shape rules, so EVERY token it kept is admitted here whatever
+    its length (a 2-letter name or an acronym included) — only the
+    alphanumeric split and the case-insensitive dedup are applied.
 
     The OR is mandatory, not cosmetic: FTS5's default bare-term MATCH is an
     implicit AND, so a disjoint multi-term query would return ZERO rows. The
@@ -632,10 +639,16 @@ def _to_fts_match(query: str) -> str:
     Returns ``""`` when the query yields no usable tokens (caller returns no
     matches rather than issuing a MATCH).
     """
+    if isinstance(query, str):
+        pieces = re.split(r"[^A-Za-z0-9]+", query)
+        min_len = _FTS_TOKEN_MIN_LEN
+    else:
+        pieces = [p for token in query for p in re.split(r"[^A-Za-z0-9]+", token)]
+        min_len = 1
     seen: set[str] = set()
     terms: list[str] = []
-    for piece in re.split(r"[^A-Za-z0-9]+", query):
-        if len(piece) < _FTS_TOKEN_MIN_LEN:
+    for piece in pieces:
+        if len(piece) < min_len:
             continue
         low = piece.lower()
         if low in seen:
@@ -2675,7 +2688,7 @@ class MemoryStore:
 
     def search_fts_scored(
         self,
-        query: str,
+        query: str | Sequence[str],
         *,
         active_only: bool = True,
         include_fading: bool = True,
@@ -2696,7 +2709,10 @@ class MemoryStore:
         matched rows' ``recall_count`` (+1.0) / ``last_accessed_at`` are
         bumped; a float bumps ``recall_count`` by that amount instead.
 
-        An empty/all-tokens-dropped query returns ``[]`` (no MATCH is issued).
+        ``query`` may be a raw string (tokens under 3 characters dropped) or the
+        recall selector's token list (every token admitted, see
+        ``_to_fts_match``). An empty/all-tokens-dropped query returns ``[]``
+        (no MATCH is issued).
         """
         match = _to_fts_match(query)
         if not match:

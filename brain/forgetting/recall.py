@@ -7,6 +7,7 @@ three buckets distinctly.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -38,21 +39,30 @@ class SearchResult:
 def search_with_loss(
     persona_dir: Path,
     store: MemoryStore,
-    query: str,
+    query: str | Sequence[str],
     *,
     limit: int = 5,
     hebbian: HebbianMatrix | None = None,
+    lost_query: str | None = None,
 ) -> SearchResult:
     """Partitioned search: active + fading via ranked retrieval, lost via graveyard.
 
     Args:
         persona_dir: Path to the persona directory (for graveyard access).
         store: MemoryStore instance for active/fading memory queries.
-        query: Search query string.
+        query: Search query: a raw string, or the recall selector's token list
+            (every token admitted by the store's query builder, name-recall
+            fix R4).
         limit: Maximum results per bucket.
         hebbian: Optional HebbianMatrix — **forwarded** to rank_memories (this
             function never opens one; the caller owns its lifecycle). None →
             the hebbian ranking term is 0.
+        lost_query: Optional query string that alone feeds the graveyard (lost
+            bucket) search; default = ``query`` (joined with spaces when it is
+            a token list). Passive recall passes the legacy capped token set
+            here so the grief-breadcrumb firing does not widen when the
+            keyword search's token cap is removed (name-recall fix R4, plan
+            P-14/P-25, Q16 interim, PARKED for the owner).
 
     Returns:
         SearchResult with active, fading, and lost lists partitioned by state,
@@ -65,6 +75,8 @@ def search_with_loss(
     active = [m for m, _ in ranked if m.state == "active"]
     fading = [m for m, _ in ranked if m.state == "fading"]
     scores = {m.id: s for m, s in ranked if s is not None}
-    lost = graveyard.search(persona_dir, query, limit=limit)
+    if lost_query is None:
+        lost_query = query if isinstance(query, str) else " ".join(query)
+    lost = graveyard.search(persona_dir, lost_query, limit=limit)
 
     return SearchResult(active=active, fading=fading, lost=lost, scores=scores)

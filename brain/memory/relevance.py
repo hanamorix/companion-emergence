@@ -21,7 +21,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Sequence
 
     from brain.memory.hebbian import HebbianMatrix
     from brain.memory.store import Memory, MemoryStore
@@ -93,7 +93,7 @@ def _created_ts(mem: Memory) -> float:
 def rank_memories(
     store: MemoryStore,
     hebbian: HebbianMatrix | None,
-    query: str,
+    query: str | Sequence[str],
     *,
     limit: int,
     exclude_ids: Iterable[str] = frozenset(),
@@ -109,6 +109,10 @@ def rank_memories(
     ``rank_memories`` NEVER opens a ``HebbianMatrix``: ``hebbian`` is supplied by
     the caller (or ``None``, which zeroes the ``w_heb`` term). This makes the
     "opens N× per turn" defect structurally impossible.
+
+    ``query`` is a raw string (the store drops tokens under 3 characters) or a
+    token LIST, the recall selector's own output, of which the store admits
+    every token (name-recall fix R4, spec §5). Both forms are one OR query.
     """
     exclude = frozenset(exclude_ids)
 
@@ -119,7 +123,7 @@ def rank_memories(
         # matches backfills from the next candidate instead of shrinking the
         # result (stage-6 minor).
         fallback = store.search_text(
-            query,
+            query if isinstance(query, str) else " ".join(query),
             active_only=active_only,
             include_fading=include_fading,
             bump=False,

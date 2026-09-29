@@ -171,6 +171,17 @@ def _ctx(tmp_path: Path, store: MemoryStore) -> dict:
     return {"store": store, "hebbian": HebbianMatrix(":memory:"), "persona_dir": tmp_path}
 
 
+def _semantic_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate the tool's cosine-path GATING under test: name-recall fix R4
+    merges the tool's keyword hits below the semantic results, and every
+    seeded memory here shares the query token, so the keyword side would
+    legitimately add the very memories the floor gates out. The merge itself is
+    covered in `test_search_memories_keyword_merge.py`."""
+    monkeypatch.setattr(
+        "brain.tools.impls.search_memories._keyword_candidates", lambda *a, **k: []
+    )
+
+
 def _no_reranker(monkeypatch: pytest.MonkeyPatch) -> None:
     def _boom(**kwargs):
         raise RuntimeError("simulated reranker construction failure")
@@ -311,6 +322,7 @@ def test_reranker_failure_on_the_tool_takes_the_cosine_path(
     mems = _seed_pool(store, monkeypatch, [0.95, 0.9, 0.85, 0.8, 0.75, 0.3, 0.2])
     _write_cosine_floor(store, 0.5)
     _no_reranker(monkeypatch)
+    _semantic_only(monkeypatch)
 
     res = dispatch("search_memories", {"query": _QUERY, "mode": "semantic", "limit": 9}, **_ctx(tmp_path, store))
 
@@ -474,6 +486,7 @@ def test_the_tool_gates_the_cosine_path_by_the_cosine_floor(
     mems = _seed_pool(store, monkeypatch, [0.95, 0.9, 0.7, 0.45, 0.3])  # 5, all real
     _write_cosine_floor(store, 0.6)
     _no_reranker(monkeypatch)
+    _semantic_only(monkeypatch)
 
     res = dispatch("search_memories", {"query": _QUERY, "mode": "semantic", "limit": 9}, **_ctx(tmp_path, store))
 

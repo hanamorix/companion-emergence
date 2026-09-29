@@ -209,6 +209,17 @@ def _above_to_below_scores(real_a_content: str, real_b_content: str) -> dict[str
     }
 
 
+def _semantic_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate the semantic selection under test: name-recall fix R4 merges the
+    tool's keyword hits in below the semantic results, and every seeded memory
+    here shares the query token, so without this the keyword side would
+    legitimately surface the very memories these tests assert are gated out.
+    The merge itself is covered in `test_search_memories_keyword_merge.py`."""
+    monkeypatch.setattr(
+        "brain.tools.impls.search_memories._keyword_candidates", lambda *a, **k: []
+    )
+
+
 def _ctx2(tmp_path: Path, store: MemoryStore) -> dict:
     """Site-2 dispatch context (mirrors `test_search_memories_mode.py`'s
     `_ctx`, but takes an already-constructed `store` so callers can seed it
@@ -271,6 +282,7 @@ def test_ac5_semantic_top_k_floor_follows_normalized_score_same_as_run_semantic_
     (AC5's explicit "not just one" requirement)."""
     store = MemoryStore(tmp_path / "memories.db")
     real_a, real_b, *_ = _seed_candidates(store, monkeypatch, _QUERY)
+    _semantic_only(monkeypatch)
     _seed_floor(store)
 
     if direction == "below_to_above":
@@ -400,6 +412,7 @@ def test_ac2_anchor_never_surfaces_in_semantic_top_k_even_at_very_high_score(
 ) -> None:
     store = MemoryStore(tmp_path / "memories.db")
     real_a, real_b, *_ = _seed_candidates(store, monkeypatch, _QUERY)
+    _semantic_only(monkeypatch)
     _seed_floor(store)
     scores = _high_anchor_scores(real_a.content, real_b.content)
     monkeypatch.setattr(
@@ -514,6 +527,7 @@ def test_normalization_error_takes_the_cosine_path_at_semantic_top_k(
 ) -> None:
     store = MemoryStore(tmp_path / "memories.db")
     real_a, real_b, *_ = _seed_candidates(store, monkeypatch, _QUERY)
+    _semantic_only(monkeypatch)
     _seed_floor(store)
     _seed_cosine_floor(store, 0.6)
     _boom_normalize(monkeypatch)

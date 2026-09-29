@@ -246,11 +246,17 @@ def _display_ids(block: str) -> list[str]:
 
 # ---------------------------------------------------------------------------
 # #88 case: paraphrase (no shared keyword) beats a keyword-overlap decoy —
-# the reranker floor-gates the decoy out, full-inject tier (1 standout).
+# the reranker floor-gates the decoy out of the SEMANTIC results, so the
+# paraphrase leads. Name-recall fix R4 (spec §5, S8): the keyword search now
+# always runs and fills the slots semantic leaves, so the decoy (a real
+# keyword hit) follows the paraphrase as a keyword result instead of being
+# suppressed; it is never ranked above it and is bumped once, as a keyword hit.
 # ---------------------------------------------------------------------------
 
 
-def test_88_paraphrase_beats_keyword_overlap_decoy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_88_paraphrase_leads_and_keyword_overlap_decoy_follows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     query = "how do I calm down when everything feels like too much"
     target = "deep breathing helps when you are feeling anxious"
     decoy = "too much of a flood of party invitations this week"
@@ -279,9 +285,14 @@ def test_88_paraphrase_beats_keyword_overlap_decoy(monkeypatch: pytest.MonkeyPat
     block = _build_recall_block(store, query, persona_dir=tmp_path)
 
     assert target in block, "the semantically-matching paraphrase memory surfaces"
-    assert decoy not in block, "the keyword-overlap-but-semantically-wrong decoy does NOT surface"
+    ids = _display_ids(block)
+    assert ids.index(m_target.id) == 0, "the semantic standout leads the active section"
+    assert m_decoy.id in ids, "the keyword-overlap decoy now follows as a KEYWORD hit (always merged)"
+    assert ids.index(m_decoy.id) > ids.index(m_target.id), "the decoy never outranks the paraphrase"
     assert _rc(store, m_target.id) - before_target == pytest.approx(1.0), "sole standout gets a FULL tick"
-    assert _rc(store, m_decoy.id) == before_decoy, "the excluded decoy is never bumped"
+    assert _rc(store, m_decoy.id) - before_decoy == pytest.approx(1.0), (
+        "the keyword hit sits in the first 5 positions, so it renders full and takes one full tick"
+    )
 
 
 # ---------------------------------------------------------------------------

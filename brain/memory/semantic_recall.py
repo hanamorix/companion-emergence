@@ -22,8 +22,9 @@ Recall runs semantic cosine as a CHEAP COARSE CUT (narrow the pool before
 the comparatively expensive reranker), then reranks the (per-message-width)
 survivors, then floor-gates the RERANKER score to decide relevance. When
 that produces a CONCLUSIVE result (at least one candidate clears the
-calibrated floor) that result is surfaced and the existing lexical path
-never runs for that turn.
+calibrated floor) that result leads the "active:" section; since name-recall
+fix R4 (spec §5) the keyword search still runs every turn and fills the
+slots the semantic results leave, instead of being suppressed.
 
 Name-recall fix R2 (spec §2): the reranker is no longer the only way to a
 semantic result. When fewer than 5 real candidates fit the rerank budget or
@@ -60,8 +61,8 @@ This module owns:
     renders/bumps the lexical path — this module only decides WHICH ids go
     in which bucket, in the path's own order (name-recall fix R3, spec §4:
     genuine memories first, then the monologue family, each by the path's
-    score); presentation order within the snippet tier is still the caller's
-    call until R4 (plan P-11).
+    score); the caller renders that order as it is (R4, plan P-11: no
+    presentation re-sort) with the keyword hits merged in below it.
 
 Does NOT touch: the lexical/blend fallback itself (untouched, reused
 as-is), the embed-on-write / idle-backfill machinery (Stage 2, unaffected),
@@ -154,8 +155,8 @@ class SemanticSurfacing:
     Both lists are in the path's own order, as handed to `select_standouts`
     (name-recall fix R3: genuine memories by score, then monologue-family
     memories by score) — the path decides membership and ranking of the
-    standout set; the caller decides PRESENTATION order for the snippet tier
-    (until R4, plan P-11).
+    standout set, and the caller renders that order unchanged (name-recall
+    fix R4, plan P-11: the snippet tier is no longer re-sorted).
     """
 
     full_ids: list[str]
@@ -269,8 +270,9 @@ class SemanticRecallResult:
     fix R3: genuine memories by score, then monologue-family memories by
     score; `full` is the first five). `hits` is the SAME list as one ordered,
     path- and paragraph-tagged sequence, DERIVED from `full` + `snippet` by
-    `run_semantic_recall` (a result built by hand leaves it empty; R4
-    assembles from `hits` and must not accept both).
+    `run_semantic_recall` (a result built by hand leaves it empty). The
+    R4 prompt assembly reads `full` + `snippet` only, never `hits`, so there is
+    one source of truth.
     `scores` maps memory_id -> reranker score for callers that want the raw
     number (tests, logging). NOTE: unlike the pre-#231 cosine-era version,
     `scores` only covers candidates that were actually scored (the
@@ -294,7 +296,8 @@ class SemanticRecallResult:
     scores: dict[str, float]
     # Name-recall fix R3 (plan R3 row): the same standouts as ONE ordered list
     # (`full` then `snippet`, the path's own order), each tagged with the path
-    # that scored it and the paragraph that produced it, for the R4 assembly.
+    # that scored it and the paragraph that produced it (diagnostics and R6's
+    # per-paragraph assembly; the R4 prompt assembly reads `full` + `snippet`).
     hits: list[SemanticHit] = field(default_factory=list)
     # Name-recall fix R2 (spec §2, C2c): which path produced this result, the
     # scale `scores` are on ('normalized' reranker scores or raw 'cosine') and
@@ -332,6 +335,16 @@ def is_monologue_family(memory: Memory) -> bool:
     S16): the types in `MONOLOGUE_FAMILY_TYPES`. Genuine memories are
     everything else."""
     return memory.memory_type in MONOLOGUE_FAMILY_TYPES
+
+
+def genuine_first_memories(memories: list[Memory]) -> list[Memory]:
+    """`memories` with every genuine memory ahead of every monologue-family
+    one, each group keeping its incoming order (a stable partition). Used for
+    the KEYWORD path (name-recall fix R4, spec §4 final order): keyword
+    monologue-family hits follow keyword genuine hits, no score multiplier."""
+    genuine = [m for m in memories if not is_monologue_family(m)]
+    family = [m for m in memories if is_monologue_family(m)]
+    return genuine + family
 
 
 def genuine_first(ids: list[str], pool: dict[str, tuple[Memory, np.ndarray]]) -> list[str]:

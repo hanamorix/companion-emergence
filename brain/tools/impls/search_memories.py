@@ -11,7 +11,11 @@ from brain.memory.embedding_matrix import build_embedding_matrix
 from brain.memory.embeddings import cosine_similarity
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.relevance import CANDIDATE_POOL, rank_memories, snippet_length
-from brain.memory.semantic_recall import build_semantic_candidate_pool, rank_and_gate
+from brain.memory.semantic_recall import (
+    build_semantic_candidate_pool,
+    genuine_first_memories,
+    rank_and_gate,
+)
 from brain.memory.store import Memory, MemoryStore
 from brain.tools.impls._common import _mem_to_result
 
@@ -60,6 +64,36 @@ def _snippet_result(memory) -> dict:
     return result
 
 
+def _keyword_candidates(
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    query: str,
+    *,
+    exclude: frozenset[str],
+) -> list[Memory]:
+    """The tool's keyword search, every candidate best-first (name-recall fix
+    R4, spec §5, S57, plan P-21): BM25 text-match + importance + hebbian
+    spreading-activation + recency via ``rank_memories``, over the token list
+    the recall selector keeps from ``query``, with NO cap (S52) and the same
+    stopword rules passive recall applies. The store admits every token the
+    selector kept (2-letter names and acronyms included). Monologue-family
+    hits follow genuine ones (spec §4), ranked over the ranker's whole
+    candidate pool so a family hit never takes a slot from a genuine one that
+    the ranker also found. ``exclude`` ids are removed before ranking.
+
+    The selector is imported lazily from ``brain.chat.prompt`` (the pattern
+    ``brain/tools/dispatch.py`` uses): the chat layer must not be a top-level
+    dependency of the tools package.
+    """
+    from brain.chat.prompt import _extract_recall_tokens
+
+    tokens = _extract_recall_tokens(query, store)
+    if not tokens:
+        return []
+    ranked = rank_memories(store, hebbian, tokens, limit=CANDIDATE_POOL, exclude_ids=exclude)
+    return genuine_first_memories([m for m, _ in ranked])
+
+
 def _lexical_candidates(
     store: MemoryStore,
     hebbian: HebbianMatrix,
@@ -68,13 +102,24 @@ def _lexical_candidates(
     limit: int,
     exclude: frozenset[str],
 ) -> list[Memory]:
-    """Today's keyword ranker: BM25 text-match + importance + hebbian
-    spreading-activation + recency, via ``rank_memories``. Unchanged
-    behavior — this is exactly what ``search_memories`` did before the
-    ``mode`` toggle existed, extracted so both modes share the same
-    emotion-boost/formatting tail below."""
-    ranked = rank_memories(store, hebbian, query, limit=limit, exclude_ids=exclude)
-    return [m for m, _ in ranked]
+    """``mode="lexical"``: the keyword search (``_keyword_candidates``), first
+    ``limit`` results. Shares the emotion-boost/formatting tail below with the
+    semantic mode."""
+    return _keyword_candidates(store, hebbian, query, exclude=exclude)[:limit]
+
+
+def _merge_keyword_below_semantic(
+    semantic: list[Memory], keyword: list[Memory], *, cap: int
+) -> list[Memory]:
+    """The semantic results, then the keyword hits that are not already
+    semantic hits, in the slots the semantic results leave under ``cap``
+    (spec §5: keyword hits fill the leftover slots and take the next
+    positions; a memory found by both keeps its semantic position, once; no
+    slot is reserved for a keyword hit)."""
+    taken = {m.id for m in semantic}
+    room = max(0, cap - len(semantic))
+    fill = [m for m in keyword if m.id not in taken][:room]
+    return [*semantic, *fill]
 
 
 def _semantic_top_k(
@@ -203,19 +248,24 @@ def search_memories(
 
     ``mode`` picks the retrieval path (default ``"semantic"``):
       - ``"semantic"``: embeds ``query`` once and ranks the persona's cached
-        memory vectors by cosine similarity, top-k (see ``_semantic_top_k``).
-        Meaning-based — catches a paraphrase with no shared keyword. Fails
-        soft to ``"lexical"`` the instant semantic retrieval can't run right
-        now (no cached vectors yet / embedding model unavailable / any embed
-        error) — the returned ``mode`` reflects the path actually used.
-      - ``"lexical"``: today's blended keyword ranker — BM25 text-match +
+        memory vectors (see ``_semantic_top_k``). Meaning-based — catches a
+        paraphrase with no shared keyword. Name-recall fix R4 (spec §5): the
+        keyword search (below) is merged in under the semantic results,
+        filling only the slots they leave under ``limit``; a memory found by
+        both appears once, at its semantic position. Fails soft to
+        ``"lexical"`` the instant semantic retrieval can't run right now (no
+        cached vectors yet / embedding model unavailable / any embed error /
+        nothing clearing a floor) — the returned ``mode`` reflects the path
+        actually used ("semantic" iff at least one semantic result
+        contributed).
+      - ``"lexical"``: the blended keyword ranker — BM25 text-match +
         importance + hebbian spreading-activation + recency, via
-        ``rank_memories`` (see ``_lexical_candidates``). Unchanged from
-        before this mode toggle existed. The raw multi-word query is passed
-        straight through — its tokenize+OR split lives in
-        ``store._to_fts_match`` (so 'Henryk preferences personality' finds
-        memories mentioning ANY token, as a union, not the empty
-        AND-intersection).
+        ``rank_memories`` (see ``_keyword_candidates``). The query goes
+        through the recall token selector with no cap (spec §5, S52/S57): every
+        meaningful word is kept under the recall stopword rules, and the store
+        admits every token the selector kept, so 'Henryk preferences
+        personality' finds memories mentioning ANY kept token, as a union, not
+        the empty AND-intersection.
 
     ``order`` picks how the MATCHED set (whichever ``mode`` produced it) is
     ordered before the final ``limit`` slice (#231, Planning-signed-off
@@ -294,9 +344,19 @@ def search_memories(
 
     candidates: list[Memory] | None = None
     if resolved_mode == "semantic":
-        candidates = _semantic_top_k(store, persona_dir, query, limit=fetch_limit, exclude=exclude)
-        if candidates is None:
+        semantic = _semantic_top_k(store, persona_dir, query, limit=fetch_limit, exclude=exclude)
+        if semantic is None:
             resolved_mode = "lexical"
+        else:
+            # Name-recall fix R4 (spec §5, S8/S35, P-21): the keyword search
+            # merges in below the semantic results, filling the slots they leave
+            # under the fetch limit. The reported mode stays "semantic": at
+            # least one semantic result contributed.
+            candidates = _merge_keyword_below_semantic(
+                semantic,
+                _keyword_candidates(store, hebbian, query, exclude=exclude),
+                cap=fetch_limit,
+            )
     if candidates is None:
         candidates = _lexical_candidates(store, hebbian, query, limit=fetch_limit, exclude=exclude)
 
