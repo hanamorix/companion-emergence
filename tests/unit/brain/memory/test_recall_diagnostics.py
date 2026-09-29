@@ -160,10 +160,13 @@ def test_log_recall_appends_exactly_one_line_per_call_to_the_named_file(tmp_path
     ]
 
 
-def test_append_keeps_non_ascii_text_as_utf8(tmp_path):
+def test_append_round_trips_non_ascii_text_and_writes_pure_ascii_lines(tmp_path):
     path = rd.diagnostics_path(tmp_path)
-    assert rd.append_record(path, {"ts": NOW.isoformat(), "scale": "échelle"}) is True
-    assert _read_records(path)[0]["scale"] == "échelle"
+    assert rd.append_record(path, {"ts": NOW.isoformat(), "scale": "échelle\u2028"}) is True
+    raw = path.read_bytes()
+    assert raw.isascii()  # no U+2028 for a str.splitlines() reader to split on
+    assert len(raw.decode().splitlines()) == 1
+    assert _read_records(path)[0]["scale"] == "échelle\u2028"
 
 
 def test_concurrent_appends_all_land_as_intact_lines(tmp_path):
@@ -196,9 +199,10 @@ def test_log_recall_never_raises_when_the_path_cannot_be_opened(tmp_path, caplog
     blocker = tmp_path / "not_a_dir"
     blocker.write_text("x")
     bad = blocker / "recall_diagnostics.log.jsonl"  # parent is a regular file
-    with caplog.at_level(logging.ERROR, logger=rd.logger.name):
+    with caplog.at_level(logging.WARNING, logger=rd.logger.name):
         assert rd.log_recall(bad, **_kwargs()) is False
-    assert any("append" in r.getMessage() and r.exc_info for r in caplog.records)
+    assert any("append" in r.getMessage() and r.levelno == logging.WARNING for r in caplog.records)
+    assert not any(r.exc_info for r in caplog.records)  # no traceback per call
 
 
 def test_log_recall_never_raises_on_bad_input_and_writes_nothing(tmp_path, caplog):
@@ -215,6 +219,18 @@ def test_append_never_raises_on_an_unserialisable_record(tmp_path):
     path = rd.diagnostics_path(tmp_path)
     assert rd.append_record(path, {"ts": NOW.isoformat(), "x": float("nan")}) is False
     assert not path.exists() or path.read_bytes() == b""
+
+
+def test_append_is_fail_soft_when_the_write_itself_raises(tmp_path, monkeypatch, caplog):
+    path = rd.diagnostics_path(tmp_path)
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(rd, "open", boom, raising=False)
+    with caplog.at_level(logging.WARNING, logger=rd.logger.name):
+        assert rd.log_recall(path, **_kwargs()) is False
+    assert any("append" in r.getMessage() for r in caplog.records)
 
 
 # --- prune (C10) -------------------------------------------------------------
@@ -290,6 +306,23 @@ def test_prune_removes_lines_it_cannot_age_and_leaves_no_temp_file(tmp_path):
     assert not (tmp_path / "recall_diagnostics.log.jsonl.tmp").exists()
 
 
+def test_prune_removes_lines_whose_ts_or_json_breaks_the_parser_with_an_unexpected_error(tmp_path):
+    """An out-of-range but well-formed ts raises OverflowError inside the astimezone
+    conversion and deeply nested JSON raises RecursionError; neither may wedge the prune."""
+    path = rd.diagnostics_path(tmp_path)
+    _write(
+        path,
+        [
+            '{"ts": "0001-01-01T00:00:00+05:00"}',
+            '{"ts": "9999-12-31T23:59:59-05:00"}',
+            "[" * 100_000,
+            _rec_line(NOW - timedelta(hours=1), 5),
+        ],
+    )
+    assert rd.prune(path, window_days=2.0, now=NOW) == 3
+    assert [r["n"] for r in _read_records(path)] == [5]
+
+
 def test_prune_handles_crlf_and_blank_lines(tmp_path):
     path = rd.diagnostics_path(tmp_path)
     data = (
@@ -361,45 +394,67 @@ def test_prune_survives_os_replace_raising_and_leaves_the_original_intact(
 # --- CONC-3: an append inside the prune's read -> rewrite window ------------
 
 
-def _run_append_inside_prune_window(path: Path) -> dict:
-    """Run a prune whose `os.replace` first launches a concurrent append and
-    gives it time to run; return what the append thread saw."""
+def _append_inside_prune_window(monkeypatch, path: Path, point: str, *, settle_s: float) -> dict:
+    """Arrange for a concurrent append to be launched from inside a prune, at `point`:
+    "after_read" (just after the prune has read the file, before it filters and
+    rewrites) or "at_replace" (just before `os.replace`). The append thread gets
+    `settle_s` to finish before the prune continues; `state["done_in_window"]` says
+    whether it did (a lock that covers the window makes that False)."""
     real_replace = os.replace
-    state: dict = {"finished_before_replace": None}
-    appended = {"n": 999}
+    real_record_ts = rd._record_ts
+    state: dict = {"launched": False, "done_in_window": None, "thread": None}
+    done = threading.Event()
 
-    def append_thread_body() -> None:
-        rd.append_record(path, {"ts": NOW.isoformat(), "source": "passive", **appended})
+    def body() -> None:
+        rd.append_record(path, {"ts": NOW.isoformat(), "source": "passive", "n": 999})
+        done.set()
 
-    def replace_with_concurrent_append(src, dst):
-        t = threading.Thread(target=append_thread_body, daemon=True)
-        t.start()
-        t.join(timeout=0.5)  # window: the append thread gets a fair chance to write
-        state["finished_before_replace"] = not t.is_alive()
+    def launch() -> None:
+        if state["launched"]:
+            return
+        state["launched"] = True
+        t = threading.Thread(target=body, daemon=True)
         state["thread"] = t
+        t.start()
+        state["done_in_window"] = done.wait(timeout=settle_s)
+
+    def record_ts_after_read(raw_line):
+        launch()
+        return real_record_ts(raw_line)
+
+    def replace_after_launch(src, dst):
+        launch()
         real_replace(src, dst)
 
-    return {"state": state, "hook": replace_with_concurrent_append}
+    if point == "after_read":
+        monkeypatch.setattr(rd, "_record_ts", record_ts_after_read)
+    else:
+        monkeypatch.setattr(rd.os, "replace", replace_after_launch)
+    return state
 
 
+@pytest.mark.parametrize("point", ["after_read", "at_replace"])
 def test_append_attempted_inside_the_prune_window_blocks_and_lands_after_the_rewrite(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, point
 ):
     path = rd.diagnostics_path(tmp_path)
     _write(path, [_rec_line(NOW - timedelta(days=9), 0), _rec_line(NOW - timedelta(hours=1), 1)])
-    seam = _run_append_inside_prune_window(path)
-    monkeypatch.setattr(rd.os, "replace", seam["hook"])
+    state = _append_inside_prune_window(monkeypatch, path, point, settle_s=0.5)
     assert rd.prune(path, window_days=2.0, now=NOW) == 1
     monkeypatch.undo()
-    seam["state"]["thread"].join(timeout=10)
-    assert not seam["state"]["thread"].is_alive()
-    assert seam["state"]["finished_before_replace"] is False  # it was blocked by the prune's lock
+    state["thread"].join(timeout=10)
+    assert not state["thread"].is_alive()
+    assert state["done_in_window"] is False  # it was blocked by the prune's lock
     assert [r["n"] for r in _read_records(path)] == [1, 999]  # not lost, and after the rewrite
 
 
-def test_the_lock_is_what_protects_the_append_a_lockless_prune_loses_it(tmp_path, monkeypatch):
+@pytest.mark.parametrize("point", ["after_read", "at_replace"])
+def test_the_lock_is_what_protects_the_append_a_lockless_prune_loses_it(
+    tmp_path, monkeypatch, point
+):
     """Able-to-fail check for CONC-3: with the lock replaced by a no-op the same
-    interleaving loses the concurrent append."""
+    interleaving loses the concurrent append (the wait is on the thread's own
+    completion event, so the outcome does not depend on a wall-clock guess)."""
 
     @contextlib.contextmanager
     def no_lock(path, *, blocking=True):
@@ -408,10 +463,9 @@ def test_the_lock_is_what_protects_the_append_a_lockless_prune_loses_it(tmp_path
     monkeypatch.setattr(rd, "file_lock", no_lock)
     path = rd.diagnostics_path(tmp_path)
     _write(path, [_rec_line(NOW - timedelta(days=9), 0), _rec_line(NOW - timedelta(hours=1), 1)])
-    seam = _run_append_inside_prune_window(path)
-    monkeypatch.setattr(rd.os, "replace", seam["hook"])
+    state = _append_inside_prune_window(monkeypatch, path, point, settle_s=30.0)
     assert rd.prune(path, window_days=2.0, now=NOW) == 1
     monkeypatch.undo()
-    seam["state"]["thread"].join(timeout=10)
-    assert seam["state"]["finished_before_replace"] is True  # not blocked
+    state["thread"].join(timeout=10)
+    assert state["done_in_window"] is True  # not blocked
     assert [r["n"] for r in _read_records(path)] == [1]  # the append (999) was overwritten

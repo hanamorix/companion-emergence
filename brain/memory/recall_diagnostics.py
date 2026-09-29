@@ -139,17 +139,19 @@ def append_record(path: Path, record: dict[str, Any]) -> bool:
     """Append ``record`` as one JSON line under the OS file lock. Returns True
     on success; never raises (a failure is logged and returns False)."""
     try:
-        line = (json.dumps(record, ensure_ascii=False, allow_nan=False, default=str) + "\n").encode(
-            "utf-8"
-        )
+        # ensure_ascii (the default) keeps every line pure ASCII, so no exotic
+        # separator (U+2028) can split a line for a `str.splitlines()` reader.
+        line = (json.dumps(record, allow_nan=False, default=str) + "\n").encode("utf-8")
+        # No fsync: this runs on the recall path (I6) and the data is
+        # diagnostic; the lock, not a sync, is what makes concurrent appends safe.
         with file_lock(path):
             with open(path, "ab") as fh:
                 fh.write(line)
-                fh.flush()
-                os.fsync(fh.fileno())
         return True
-    except Exception:  # noqa: BLE001 — diagnostics must never reach recall
-        logger.exception("recall diagnostics: append to %s failed; record dropped", path)
+    except Exception as exc:  # noqa: BLE001 — diagnostics must never reach recall
+        # A warning without a traceback: a persistent failure (unwritable dir, full disk)
+        # repeats on every recall and must not flood the log with stack traces.
+        logger.warning("recall diagnostics: append to %s failed (%r); record dropped", path, exc)
         return False
 
 
@@ -192,10 +194,9 @@ def _record_ts(raw_line: bytes) -> datetime | None:
         obj = json.loads(raw_line)
         if not isinstance(obj, dict):
             return None
-        ts = datetime.fromisoformat(obj["ts"])
-    except (ValueError, KeyError, TypeError):
+        return _utc(datetime.fromisoformat(obj["ts"]))
+    except Exception:  # noqa: BLE001 — any line that cannot be aged (bad JSON, RecursionError, an out-of-range ts's OverflowError) is un-agable
         return None
-    return _utc(ts)
 
 
 def _default_window_days() -> float:
@@ -241,6 +242,7 @@ def prune(path: Path, *, window_days: float | None = None, now: datetime | None 
                 return 0
             kept: list[bytes] = []
             removed = 0
+            unagable = 0
             for line in raw.split(b"\n"):
                 line = line.rstrip(b"\r")
                 if not line.strip():
@@ -250,8 +252,16 @@ def prune(path: Path, *, window_days: float | None = None, now: datetime | None 
                     kept.append(line)
                 else:
                     removed += 1
+                    if ts is None:
+                        unagable += 1
             if removed == 0:
                 return 0
+            if unagable:
+                logger.warning(
+                    "recall diagnostics: removing %d line(s) of %s with no readable ts",
+                    unagable,
+                    path,
+                )
             try:
                 with open(tmp, "wb") as out:
                     for line in kept:
