@@ -169,3 +169,15 @@ def test_schema_prose_is_british_but_identifiers_are_not() -> None:
     # the underscore in crystallize_soul denies it one.
     assert "crystallize_soul" in schemas, "the tool's dict key was renamed"
     assert schemas["crystallize_soul"]["name"] == "crystallize_soul"
+
+
+def test_add_name_tool_line_says_what_the_tool_does() -> None:
+    """The inventory gloss is the description's first sentence: it must be the sentence
+    that says what the tool does, not the placeholder marker sentence (N2)."""
+    from brain.tools.schemas import ADD_NAME_TOOL_NAME
+
+    line = next(
+        ln for ln in build_tool_inventory("Nell").splitlines() if f"`{ADD_NAME_TOOL_NAME}`" in ln
+    )
+    assert "list of names you know" in line
+    assert "PLACEHOLDER" not in line

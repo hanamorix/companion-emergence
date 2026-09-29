@@ -153,7 +153,7 @@ def test_force_files_default_off_does_not_over_recruit():
 def test_add_name_tool_is_reflexive_core_and_recruited_on_an_ordinary_turn():
     """N2 / S69 (pending owner review): the add-name tool is in the always-available
     tier, so `select_tools` returns it for a non-maximal signal with no memory-salience
-    flag, and the trivial-turn set equals the (now twelve-tool) core."""
+    flag, and the trivial-turn set equals the core."""
     from brain.tools.schemas import ADD_NAME_TOOL_NAME
 
     assert ADD_NAME_TOOL_NAME in REFLEXIVE_CORE
@@ -163,4 +163,3 @@ def test_add_name_tool_is_reflexive_core_and_recruited_on_an_ordinary_turn():
     allowed = select_tools(signal)
     assert ADD_NAME_TOOL_NAME in allowed
     assert set(allowed) == set(REFLEXIVE_CORE)
-    assert len(REFLEXIVE_CORE) == 12

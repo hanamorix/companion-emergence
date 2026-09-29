@@ -78,9 +78,10 @@ def _rows(persona_dir: Path) -> list[tuple[str, str, str]]:
         conn.close()
 
 
-def _long_text(marker: str) -> str:
-    """A 1,600-character text whose marker word sits far beyond the old 400 cut."""
-    return ("filler words " * 110) + marker + (" more filler" * 10)
+def _long_text(marker: str, *, size: int = 1600) -> str:
+    """A text of about `size` characters whose marker word sits at the very end,
+    far beyond the old 400 cut (and, with a large `size`, beyond any smaller cut)."""
+    return ("filler words " * (size // 13)) + marker
 
 
 # ===========================================================================
@@ -112,6 +113,29 @@ def test_judge_duplicate_adds_no_names(persona):
     assert res.duplicates == 1
     assert _rows(tmp) == []
     assert not kn.known_names_path(tmp).exists()  # nothing written, file never created
+
+
+def test_judge_duplicate_with_a_target_id_still_adds_no_names(persona):
+    """A duplicate that names the memory it duplicates is still a duplicate."""
+    tmp, store, hebbian, queue = persona
+    target = store.create(_mem("Bob's dog Pretzel", "conversation"))
+    queue.enqueue(_mem("Bob's dog Pretzel again", "dream"), source="x")
+    reply = json.dumps({"verdict": "duplicate", "target_id": target, "names": ["Pretzel"]})
+    res = _gate(tmp, store, hebbian, FakeProvider(reply))
+    assert res.duplicates == 1
+    assert _rows(tmp) == []
+
+
+def test_judge_reply_that_is_not_json_promotes_the_candidate_and_loses_its_names(persona):
+    """A syntax break inside the reply (here a names array that never closes) is a
+    reply-level failure: the classifier's fail-open rule promotes the candidate (never
+    drops it) and no names are written. Pinned so the fail-open rule stays deliberate."""
+    tmp, store, hebbian, queue = persona
+    queue.enqueue(_mem("Bob and Wren walked", "dream"), source="x")
+    broken = '{"verdict": "duplicate", "names": ["Wren", "Pre'
+    res = _gate(tmp, store, hebbian, FakeProvider(broken))
+    assert res.promoted == 1 and res.duplicates == 0
+    assert _rows(tmp) == []
 
 
 def test_injected_decision_names_follow_the_same_rule(persona):
@@ -148,8 +172,10 @@ def test_judge_prompt_carries_the_whole_candidate(persona):
     """C6: a 1,000+ character candidate reaches the judge untruncated (the first-400
     cut is gone). Able to fail: a `[:400]` cut drops the marker."""
     tmp, store, hebbian, queue = persona
-    text = _long_text("ENDMARKER")
-    assert len(text) > 1000 and text.index("ENDMARKER") > 1000
+    text = _long_text("ENDMARKER", size=6000)
+    assert (
+        len(text) > 5000 and text.index("ENDMARKER") > 5000
+    )  # no smaller re-introduced cut passes
     queue.enqueue(_mem(text, "dream"), source="x")
     provider = FakeProvider(json.dumps({"verdict": "new", "names": []}))
     _gate(tmp, store, hebbian, provider)
@@ -295,7 +321,8 @@ def test_reappraiser_prompt_carries_the_whole_memory(persona):
     """C6: the whole memory is read (today first 400 chars). Able to fail: a `[:400]`
     cut drops the marker."""
     tmp, store, _h, _q = persona
-    text = _long_text("ENDMARKER")
+    text = _long_text("ENDMARKER", size=6000)
+    assert text.index("ENDMARKER") > 5000  # no smaller re-introduced cut passes
     mem = _mem(text, "conversation", importance=3.0)
     store.create(mem)
     provider = FakeProvider(json.dumps({"importance": 5, "names": []}))
@@ -330,7 +357,17 @@ def test_reappraiser_old_number_only_reply_still_scores(persona):
         ('{"importance": "nan", "names": ["Zed"]}', 4.0, ("Zed",)),
         ('{"importance": 1e999}', 4.0, ()),  # non-finite: unchanged
         ('sure: {"importance": 9, "names": ["Zed"]} done', 9.0, ("Zed",)),  # prose around it
-        ('{"importance": 7, "names": ["Wr', 7.0, ()),  # truncated JSON: number regex, no names
+        ('{"importance": 7, "names": ["Wr', 7.0, ()),  # truncated JSON: keyed pattern, no names
+        ('{"names": ["Room 12', 4.0, ()),  # truncated before the score: never a digit from a name
+        ('{"names": ["Apollo 13"], "importance": 8,}', 8.0, ()),  # trailing comma: keyed, not 13
+        (
+            '{"names": ["Room 101"], "importance": 7} {"x": 1}',
+            7.0,
+            (),
+        ),  # two objects: keyed, not 101
+        ('{"names": ["Room 101"],}', 4.0, ()),  # no score anywhere: unchanged, not 101
+        ('{"importance": "1_0"}', 4.0, ()),  # not a plain decimal string
+        ('{"importance": ' + "9" * 400 + "}", 4.0, ()),  # int too large for a float: unchanged
         ("Room 12, importance 3", 12.0, ()),  # regex fallback is today's first number
         ("no number", 4.0, ()),
         ("", 4.0, ()),

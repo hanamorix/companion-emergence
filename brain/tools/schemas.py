@@ -16,7 +16,8 @@ from __future__ import annotations
 # constant, marked PLACEHOLDER, with no em-dash. To finalize: edit these three
 # constants only (the tool table, dispatch, registry and recruit tier all read
 # ADD_NAME_TOOL_NAME). The first sentence of the description is what the tool
-# inventory shows as the gloss (`chat/tool_inventory.py`).
+# inventory shows as the gloss (`chat/tool_inventory.py`), so the marker sentence
+# comes after the sentence that says what the tool does.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # PLACEHOLDER identifier (carries the marker on purpose; the owner picks the real one).
@@ -24,15 +25,15 @@ ADD_NAME_TOOL_NAME = "add_name_placeholder"
 
 # PLACEHOLDER description.
 ADD_NAME_TOOL_DESCRIPTION = (
-    "PLACEHOLDER wording, the owner supplies the final text. "
     "Add a name to the list of names you know, such as a person, a pet or a place, "
-    "so that memories holding that name are found when someone says it."
+    "so that memories holding that name are found when someone says it. "
+    "PLACEHOLDER wording, the owner supplies the final text."
 )
 
 # PLACEHOLDER parameter description.
 ADD_NAME_PARAM_DESCRIPTION = (
-    "PLACEHOLDER wording, the owner supplies the final text. "
-    "The name to add, spelled the way you want it kept."
+    "The name to add, spelled the way you want it kept. "
+    "PLACEHOLDER wording, the owner supplies the final text."
 )
 
 # ─────────────────────────────────────────────────────────────────────────────

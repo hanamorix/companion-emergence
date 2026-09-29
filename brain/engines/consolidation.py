@@ -75,7 +75,9 @@ class Decision:
         "Names are added three ways", item 1). Written to the known-names list by
         `_dispatch` for every verdict except "duplicate" (on "merge" too, from the
         candidate text). Empty when the judge returned none or its `names` field
-        was absent or malformed (never a reason to lose the verdict).
+        was absent or malformed (a malformed VALUE never costs the verdict; a reply
+        that is not JSON at all still promotes the candidate, the classifier's
+        fail-open-toward-keeping-content rule).
     """
 
     verdict: str
@@ -456,29 +458,41 @@ def _admit_extracted_names(
         logger.warning("consolidation %s: known-names write failed", label, exc_info=True)
 
 
+_NUMBER_RE = re.compile(r"-?\d+(\.\d+)?")  # today's first-number regex, unchanged
+_KEYED_IMPORTANCE_RE = re.compile(r'"importance"\s*:\s*"?(-?\d+(?:\.\d+)?)"?')
+
+
 def _coerce_score(value: object) -> float | None:
-    """A finite number from a JSON value (int, float or numeric string), else None."""
+    """A finite number from a JSON value (a number, or a plain decimal string), else None."""
     if isinstance(value, bool):
         return None
+    if isinstance(value, str):
+        if not _NUMBER_RE.fullmatch(value.strip()):
+            return None
+    elif not isinstance(value, (int, float)):
+        return None
     try:
-        number = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
         return None
     return number if math.isfinite(number) else None
-
-
-_FIRST_NUMBER_RE = re.compile(r"-?\d+(\.\d+)?")
 
 
 def _parse_reappraisal(raw: str, current: float) -> Reappraisal:
     """Read a re-appraiser reply: a JSON object with `importance` and `names`.
 
-    JSON first (P-18). A reply with no parseable JSON object falls back to
-    today's first-number regex with no names (the old "reply with ONLY the number"
-    shape still works). A JSON object whose `importance` is missing or not a
-    number leaves the importance unchanged (the regex is NOT used there: it would
-    read a digit out of a name). Malformed `names` never changes the score.
+    JSON first (P-18). A reply with no `{` at all falls back to today's
+    first-number regex with no names (the old "reply with ONLY the number" shape
+    still works). A reply that has a `{` but is not parseable JSON (a comma too
+    many, a second object, a cut-off reply) is read only through the keyed
+    `"importance": <number>` pattern: the first-number regex would read a digit
+    out of a name ("Apollo 13"). A JSON object whose `importance` is missing or
+    not a number leaves the importance unchanged, for the same reason. Malformed
+    `names` never change the score.
     """
+    if "{" not in raw:
+        match = _NUMBER_RE.search(raw)
+        return Reappraisal(float(match.group(0)) if match else current)
     data: object = None
     if re.search(r"\{.*\}", raw, re.DOTALL):
         try:
@@ -487,15 +501,10 @@ def _parse_reappraisal(raw: str, current: float) -> Reappraisal:
             data = None
     if isinstance(data, dict):
         score = _coerce_score(data.get("importance"))
-        try:
-            names = _parse_names(data.get("names"), source="reappraiser")
-        except Exception:  # noqa: BLE001 — defensive: names never break the score
-            names = ()
+        names = _parse_names(data.get("names"), source="reappraiser")
         return Reappraisal(current if score is None else score, names)
-    match = _FIRST_NUMBER_RE.search(raw)
-    if not match:
-        return Reappraisal(current)
-    return Reappraisal(float(match.group(0)))
+    keyed = _KEYED_IMPORTANCE_RE.search(raw)
+    return Reappraisal(float(keyed.group(1)) if keyed else current)
 
 
 def _make_haiku_reappraiser(provider) -> Reappraiser:
