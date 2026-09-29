@@ -1945,10 +1945,11 @@ def _drain_pass2_at_exit(persona_dir: Path) -> None:
 
 
 def _start_floor_bootstrap_for_direct_chat(persona_dir: Path, *, blocking: bool) -> None:
-    """`nell chat --no-bridge` session start (name-recall fix S85, revised):
-    compute the cosine and rerank bootstrap floors ONCE for this process, off
-    the per-turn path (recall only peeks the caches; there is no supervisor
-    here to run the retry job).
+    """`nell chat --no-bridge` session start (name-recall fix S85 revised, S91):
+    compute the COSINE bootstrap floor ONCE for this process, off the per-turn
+    path (recall only peeks the caches; there is no supervisor here to run the
+    retry job, so the rerank floor is computed on first need and a failed
+    bootstrap retried on each message, both in the background: `respond()`).
 
     The interactive REPL starts it on a daemon thread so the prompt appears at
     once (its first turn may be keyword-only if the thread is still running);
@@ -1956,12 +1957,20 @@ def _start_floor_bootstrap_for_direct_chat(persona_dir: Path, *, blocking: bool)
     that turn is the only one there will be. Fail-soft: never blocks or breaks
     the chat."""
     try:
+        from brain.bridge import cli_throttle
         from brain.memory import floor_startup
 
+        floor_startup.set_activity_marker_provider(cli_throttle.chat_activity_marker)
         if blocking:
-            floor_startup.compute_missing_floors(persona_dir)
+            floor_startup.compute_missing_floors(
+                persona_dir, activity_marker=cli_throttle.chat_activity_marker
+            )
         else:
-            floor_startup.start_background(persona_dir, name="floor-bootstrap-direct-chat")
+            floor_startup.start_background(
+                persona_dir,
+                activity_marker=cli_throttle.chat_activity_marker,
+                name="floor-bootstrap-direct-chat",
+            )
     except Exception as exc:  # noqa: BLE001 — never break the chat
         print(f"note: floor bootstrap not started ({exc})", file=sys.stderr)
 

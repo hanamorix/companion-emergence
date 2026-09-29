@@ -751,10 +751,11 @@ def _build_gated_jobs(
     emotion backfill and embedding backfill have no interval: each runs at
     every idle pass while it has work (S53/S66). Deploy recalibration is due
     while the stored floor is stale (S70/S73). The cosine and rerank floor
-    bootstraps (name-recall fix S85, revised) are computed at process start and
-    are the next-lull RETRY path here: due while neither a calibrated row nor
-    the process-cached bootstrap exists and chat has happened since the failed
-    attempt.
+    bootstraps (name-recall fix S85 revised, S91, S92) are the next-lull RETRY
+    path here: due while neither a calibrated row nor the process-cached
+    bootstrap exists, the floor was needed or its last attempt failed (the
+    rerank one is never due just because the process started), chat has
+    happened since the failed attempt, and none is already in flight.
     Self-model articulation keeps its own cadence (S29). Every other job is an
     interval job whose cadence file the central function owns.
 
@@ -950,40 +951,46 @@ def _build_gated_jobs(
         )
     )
 
-    # 4b. floor bootstraps — name-recall fix S85 (revised, spec §2). Both the
-    # cosine and the rerank bootstrap floors are computed at process start off
-    # the reply path (`floor_startup.compute_missing_floors`: the bridge's
-    # startup thread). These two jobs are the RETRY path: a failed bootstrap is
-    # retried at the next lull (due only once chat has happened since the failed
-    # attempt, `cli_throttle.chat_activity_marker`; no time constants), and
-    # neither is due once a floor exists (calibrated row or cached bootstrap) or
-    # while the startup computation is still running. Until a floor exists that
-    # path renders keyword results only.
-    def _floor_bootstrap_due(due_fn: Callable[..., bool]) -> bool:
-        if floor_startup.startup_compute_active():
+    # 4b. floor bootstraps — name-recall fix S85 revised / S91 / S92 (spec §2).
+    # The COSINE bootstrap is computed at process start; the RERANK bootstrap on
+    # first need, in the background (`floor_startup.request_rerank_bootstrap`);
+    # a failed one is retried in the background on each incoming message. These
+    # two jobs are the lull-time RETRY path: a floor is due only while it is
+    # missing (no calibrated row, not cached), it was needed or its last attempt
+    # failed (the rerank floor is never due just because the process started),
+    # chat has happened since the failed attempt (`cli_throttle.
+    # chat_activity_marker`; no time constants), and no bootstrap of that floor
+    # is already in flight. Until a floor exists that path renders keyword
+    # results only.
+    def _floor_bootstrap_due(kind: str, due_fn: Callable[..., bool]) -> bool:
+        if floor_startup.inflight(kind):
             return False
         with _tick_store() as store:
             return due_fn(store, activity_marker=cli_throttle.chat_activity_marker())
 
-    def _floor_bootstrap_job(run_fn: Callable[..., object]) -> JobOutcome:
+    def _floor_bootstrap_job(kind: str, run_fn: Callable[..., object]) -> JobOutcome:
         with cli_throttle.background_slot() as slot:
             if not slot:
                 return JobOutcome.SKIPPED
-            run_fn(activity_marker=cli_throttle.chat_activity_marker())
+            ran = floor_startup.run_guarded(
+                kind, run_fn, activity_marker=cli_throttle.chat_activity_marker()
+            )
+            if not ran:
+                return JobOutcome.SKIPPED
         return JobOutcome.COMPLETED
 
     jobs.append(
         GatedJob(
             "cosine_floor_bootstrap",
-            run=lambda: _floor_bootstrap_job(floor_startup.run_cosine_floor),
-            has_work=lambda: _floor_bootstrap_due(floor_startup.cosine_floor_due),
+            run=lambda: _floor_bootstrap_job("cosine", floor_startup.run_cosine_floor),
+            has_work=lambda: _floor_bootstrap_due("cosine", floor_startup.cosine_floor_due),
         )
     )
     jobs.append(
         GatedJob(
             "rerank_floor_bootstrap",
-            run=lambda: _floor_bootstrap_job(floor_startup.run_rerank_floor),
-            has_work=lambda: _floor_bootstrap_due(floor_startup.rerank_floor_due),
+            run=lambda: _floor_bootstrap_job("rerank", floor_startup.run_rerank_floor),
+            has_work=lambda: _floor_bootstrap_due("rerank", floor_startup.rerank_floor_due),
         )
     )
 

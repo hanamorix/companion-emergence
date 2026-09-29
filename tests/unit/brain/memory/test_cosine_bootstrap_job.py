@@ -327,11 +327,11 @@ def test_the_job_yields_while_the_startup_computation_is_running(
     persona_dir = _persona(tmp_path)
     jobs = _bootstrap_only(persona_dir)
 
-    floor_startup._startup_active.set()  # noqa: SLF001
+    assert floor_startup.try_begin("cosine")
     try:
         _pass(persona_dir, jobs, idle=True)
         assert calls == [], "the startup thread is already doing this work"
     finally:
-        floor_startup._startup_active.clear()  # noqa: SLF001
+        floor_startup.end("cosine")
     _pass(persona_dir, jobs, idle=True)
     assert len(calls) == 1

@@ -40,9 +40,16 @@ from tests.unit.brain.memory.test_monologue_last import (
 
 @pytest.fixture(autouse=True)
 def _clean_startup_flag():
-    floor_startup._startup_active.clear()  # noqa: SLF001
+    floor_startup._inflight.clear()  # noqa: SLF001
     yield
-    floor_startup._startup_active.clear()  # noqa: SLF001
+    floor_startup._inflight.clear()  # noqa: SLF001
+
+
+@pytest.fixture
+def background_on(monkeypatch: pytest.MonkeyPatch):
+    """Let the on-need / on-message starters spawn real daemon threads (the
+    suite-wide default inhibits them)."""
+    monkeypatch.setattr(floor_startup, "_background_inhibited", False)
 
 
 _COSINE_ID = "startup-cosine-id"
@@ -96,19 +103,15 @@ def computes(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
 # ---------------------------------------------------------------------------
 
 
-def test_startup_computes_the_cosine_floor_then_the_rerank_floor_one_after_the_other(
+def test_startup_computes_only_the_cosine_floor_never_the_rerank_one(
     computes, tmp_path: Path
 ) -> None:
+    """S91: nothing loads the reranker at boot."""
     floor_startup.compute_missing_floors(tmp_path)
 
-    assert computes == [
-        ("start", "cosine"),
-        ("end", "cosine"),
-        ("start", "rerank"),
-        ("end", "rerank"),
-    ], "sequential: the second model is not touched until the first finished"
+    assert computes == [("start", "cosine"), ("end", "cosine")]
     assert floor_calibration.peek_cosine_bootstrap_floor(_COSINE_ID) is not None
-    assert floor_calibration.peek_bootstrap_floor(_RERANK_ID) is not None
+    assert floor_calibration.peek_bootstrap_floor(_RERANK_ID) is None
 
 
 def test_startup_skips_a_floor_that_is_calibrated_or_already_cached(
@@ -121,14 +124,21 @@ def test_startup_skips_a_floor_that_is_calibrated_or_already_cached(
     store.close()
 
     floor_startup.compute_missing_floors(tmp_path)
-    assert computes == [("start", "rerank"), ("end", "rerank")], "calibrated cosine row: skipped"
+    assert computes == [], "calibrated cosine row: skipped"
+
+    store = MemoryStore(tmp_path / "memories.db")
+    store._conn.execute("DELETE FROM cosine_floor_calibration")  # noqa: SLF001
+    store._conn.commit()  # noqa: SLF001
+    store.close()
+    floor_startup.compute_missing_floors(tmp_path)
+    assert computes == [("start", "cosine"), ("end", "cosine")]
 
     computes.clear()
     floor_startup.compute_missing_floors(tmp_path)
-    assert computes == [], "everything cached or calibrated: nothing to do"
+    assert computes == [], "cached: nothing to do"
 
 
-def test_a_failing_cosine_bootstrap_does_not_stop_the_rerank_one_and_never_raises(
+def test_a_failing_cosine_bootstrap_never_raises_and_is_recorded(
     computes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     def _boom(_id):
@@ -138,12 +148,12 @@ def test_a_failing_cosine_bootstrap_does_not_stop_the_rerank_one_and_never_raise
 
     floor_startup.compute_missing_floors(tmp_path)
 
-    assert ("end", "rerank") in computes
     assert floor_calibration.peek_cosine_bootstrap_floor(_COSINE_ID) is None
-    assert floor_calibration.peek_bootstrap_floor(_RERANK_ID) is not None
+    assert floor_calibration.bootstrap_failed("cosine", _COSINE_ID)
+    assert not floor_startup.inflight("cosine")
 
 
-def test_a_raising_run_helper_does_not_stop_the_other_floor_and_never_raises(
+def test_a_raising_run_helper_never_raises_and_releases_the_slot(
     computes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     def _boom(**kw):
@@ -153,7 +163,6 @@ def test_a_raising_run_helper_does_not_stop_the_other_floor_and_never_raises(
 
     floor_startup.compute_missing_floors(tmp_path)
 
-    assert ("end", "rerank") in computes
     assert not floor_startup.startup_compute_active()
 
 
@@ -229,7 +238,7 @@ def test_start_background_runs_the_computation_on_a_daemon_thread(computes, tmp_
     thread.join(timeout=10)
 
     assert thread.daemon and not thread.is_alive()
-    assert ("end", "rerank") in computes
+    assert ("end", "cosine") in computes
 
 
 def test_start_background_forwards_the_activity_marker_to_the_thread(
@@ -331,7 +340,15 @@ def test_the_bridge_seeds_the_idle_anchor_before_it_starts_the_floor_thread(
 # ---------------------------------------------------------------------------
 
 
-def test_a_reranked_turn_without_a_rerank_floor_never_computes_the_bootstrap(
+def _reranking_store(monkeypatch, tmp_path):
+    store = MemoryStore(tmp_path / "memories.db")
+    genuine, _ = _seed(store, monkeypatch, [0.9, 0.8, 0.7, 0.6, 0.5, 0.45], [])
+    _cosine_floor(store, 0.4)
+    _install_reranker(monkeypatch, _Recording({g.content: 9.0 for g in genuine}))
+    return store, genuine
+
+
+def test_a_reranked_turn_without_a_rerank_floor_never_computes_the_bootstrap_on_the_reply_path(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(
@@ -339,10 +356,7 @@ def test_a_reranked_turn_without_a_rerank_floor_never_computes_the_bootstrap(
         "get_bootstrap_floor",
         lambda _id: pytest.fail("the reply path computed the rerank bootstrap"),
     )
-    store = MemoryStore(tmp_path / "memories.db")
-    genuine, _ = _seed(store, monkeypatch, [0.9, 0.8, 0.7, 0.6, 0.5, 0.45], [])
-    _cosine_floor(store, 0.4)
-    _install_reranker(monkeypatch, _Recording({g.content: 9.0 for g in genuine}))
+    store, genuine = _reranking_store(monkeypatch, tmp_path)
 
     for _ in range(3):
         result = run_semantic_recall(store, tmp_path, _QUERY)
@@ -350,21 +364,258 @@ def test_a_reranked_turn_without_a_rerank_floor_never_computes_the_bootstrap(
         assert set(_ids(genuine)) >= set(_ids([*result.full, *result.snippet]))
 
 
-def test_once_the_startup_bootstrap_ran_the_reranked_path_is_used(
+def test_the_first_reranked_turn_with_no_floor_takes_the_cosine_path_flags_it_and_bootstraps_in_the_background(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, background_on
+) -> None:
+    """S91: the turn that would rerank finds no rerank floor: it takes the cosine
+    path, raises the need flag, and the bootstrap runs on a background thread
+    (not on this thread); the next turn reranks once the floor exists."""
+    store, genuine = _reranking_store(monkeypatch, tmp_path)
+    monkeypatch.setattr(floor_startup, "reranker_model_id", lambda: "fake-reranker")
+    threads_seen: list[str] = []
+    gate = threading.Event()
+
+    def _bootstrap(model_id: str):
+        threads_seen.append(threading.current_thread().name)
+        gate.wait(5)
+        floor_calibration._bootstrap_floor_cache[model_id] = _floor_row(  # noqa: SLF001
+            model_id, "reranker_model_id", 1.0
+        )
+        return dict(floor_calibration._bootstrap_floor_cache[model_id])  # noqa: SLF001
+
+    monkeypatch.setattr(floor_calibration, "get_bootstrap_floor", _bootstrap)
+    started: list = []
+    real_request = floor_startup.request_rerank_bootstrap
+    monkeypatch.setattr(
+        floor_startup,
+        "request_rerank_bootstrap",
+        lambda: started.append(real_request()) or started[-1],
+    )
+
+    first = run_semantic_recall(store, tmp_path, _QUERY)
+
+    assert first is not None and first.path == "cosine"
+    (thread,) = started
+    assert thread is not None and thread.daemon
+    assert ("rerank", "fake-reranker") in floor_calibration._bootstrap_needed, (  # noqa: SLF001
+        "the need is flagged"
+    )
+    assert floor_startup.inflight("rerank"), "the background bootstrap is in flight"
+    # while it is still running, another reranked turn neither blocks nor starts a second one
+    second_while_running = run_semantic_recall(store, tmp_path, _QUERY)
+    assert second_while_running.path == "cosine"
+    assert started[-1] is None, "one at a time"
+    gate.set()
+    thread.join(timeout=10)
+    assert threads_seen == [thread.name] and threading.current_thread().name not in threads_seen
+    assert not floor_startup.inflight("rerank")
+
+    third = run_semantic_recall(store, tmp_path, _QUERY)
+    assert third is not None and third.path == "reranked", "the next turn reranks"
+
+
+def test_once_a_rerank_floor_exists_the_reranked_path_is_used_without_any_request(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    store = MemoryStore(tmp_path / "memories.db")
-    genuine, _ = _seed(store, monkeypatch, [0.9, 0.8, 0.7, 0.6, 0.5, 0.45], [])
-    _cosine_floor(store, 0.4)
-    _install_reranker(monkeypatch, _Recording({g.content: 9.0 for g in genuine}))
-    assert run_semantic_recall(store, tmp_path, _QUERY).path == "cosine"
-
+    store, genuine = _reranking_store(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        floor_startup,
+        "request_rerank_bootstrap",
+        lambda: pytest.fail("a floor exists: nothing to request"),
+    )
     floor_calibration._bootstrap_floor_cache["fake-reranker"] = _floor_row(  # noqa: SLF001
         "fake-reranker", "reranker_model_id", 1.0
     )
 
     result = run_semantic_recall(store, tmp_path, _QUERY)
+
     assert result is not None and result.path == "reranked"
+
+
+def test_a_session_that_never_reranks_never_loads_the_reranker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, background_on
+) -> None:
+    """S91: a pool too small to rerank never raises the need, so the rerank
+    bootstrap never starts."""
+    monkeypatch.setattr(
+        floor_startup,
+        "request_rerank_bootstrap",
+        lambda: pytest.fail("this session never reranks"),
+    )
+    store = MemoryStore(tmp_path / "memories.db")
+    _seed(store, monkeypatch, [0.9, 0.8], [])
+    _cosine_floor(store, 0.4)
+    _install_reranker(monkeypatch, _Recording({}))
+
+    result = run_semantic_recall(store, tmp_path, _QUERY)
+
+    assert result is not None and result.path == "cosine"
+
+
+# ---------------------------------------------------------------------------
+# S92: a failed bootstrap retries in the background on each incoming message
+# ---------------------------------------------------------------------------
+
+
+def _fail_then_succeed(monkeypatch, kind: str, model_id: str):
+    """`get_*_bootstrap_floor` that fails until `state["ok"]` is set; records the
+    thread each attempt ran on and can be gated."""
+    state = {"ok": False, "calls": [], "gate": None}
+
+    def _compute(mid: str):
+        state["calls"].append(threading.current_thread().name)
+        if state["gate"] is not None:
+            state["gate"].wait(5)
+        if not state["ok"]:
+            return None
+        row = _floor_row(mid, "embedder_model_id" if kind == "cosine" else "reranker_model_id")
+        cache = (
+            floor_calibration._cosine_bootstrap_floor_cache  # noqa: SLF001
+            if kind == "cosine"
+            else floor_calibration._bootstrap_floor_cache  # noqa: SLF001
+        )
+        cache[mid] = row
+        return dict(row)
+
+    name = "get_cosine_bootstrap_floor" if kind == "cosine" else "get_bootstrap_floor"
+    monkeypatch.setattr(floor_calibration, name, _compute)
+    return state
+
+
+@pytest.mark.parametrize("kind", ["cosine", "rerank"])
+def test_a_failed_bootstrap_is_retried_in_the_background_on_each_message_until_it_succeeds(
+    kind, computes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, background_on
+) -> None:
+    model_id = _COSINE_ID if kind == "cosine" else _RERANK_ID
+    state = _fail_then_succeed(monkeypatch, kind, model_id)
+    run = floor_startup.run_cosine_floor if kind == "cosine" else floor_startup.run_rerank_floor
+    assert run(activity_marker=1.0) is None, "the first attempt failed"
+    assert floor_calibration.bootstrap_failed(kind, model_id)
+    state["calls"].clear()
+    me = threading.current_thread().name
+
+    for _ in range(3):
+        threads = floor_startup.on_incoming_message(tmp_path)
+        assert len(threads) == 1
+        threads[0].join(timeout=10)
+        assert state["calls"][-1] == threads[0].name != me, "off the reply path"
+    assert len(state["calls"]) == 3, "one attempt per message while it keeps failing"
+
+    state["ok"] = True
+    (thread,) = floor_startup.on_incoming_message(tmp_path)
+    thread.join(timeout=10)
+    assert not floor_calibration.bootstrap_failed(kind, model_id)
+
+    state["calls"].clear()
+    assert floor_startup.on_incoming_message(tmp_path) == []
+    assert state["calls"] == [], "succeeded: no more retries"
+
+
+@pytest.mark.parametrize("kind", ["cosine", "rerank"])
+def test_never_more_than_one_bootstrap_in_flight_per_floor(
+    kind, computes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, background_on
+) -> None:
+    model_id = _COSINE_ID if kind == "cosine" else _RERANK_ID
+    state = _fail_then_succeed(monkeypatch, kind, model_id)
+    run = floor_startup.run_cosine_floor if kind == "cosine" else floor_startup.run_rerank_floor
+    run(activity_marker=1.0)
+    state["calls"].clear()
+    state["gate"] = threading.Event()
+
+    first = floor_startup.on_incoming_message(tmp_path)
+    assert len(first) == 1
+    for _ in range(5):
+        assert floor_startup.on_incoming_message(tmp_path) == [], "already in flight"
+    assert floor_startup.inflight(kind)
+    state["gate"].set()
+    first[0].join(timeout=10)
+
+    assert len(state["calls"]) == 1, "no concurrent duplicates"
+    assert not floor_startup.inflight(kind)
+
+
+def test_the_two_floors_retry_independently_each_at_most_one_in_flight(
+    computes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, background_on
+) -> None:
+    cosine = _fail_then_succeed(monkeypatch, "cosine", _COSINE_ID)
+    rerank_calls: list[str] = []
+    monkeypatch.setattr(
+        floor_calibration, "get_bootstrap_floor", lambda mid: rerank_calls.append(mid) or None
+    )
+    floor_startup.run_cosine_floor(activity_marker=1.0)
+    floor_startup.run_rerank_floor(activity_marker=1.0)
+    cosine["calls"].clear()
+    rerank_calls.clear()
+
+    threads = floor_startup.on_incoming_message(tmp_path)
+    for t in threads:
+        t.join(timeout=10)
+
+    assert len(threads) == 2
+    assert len(cosine["calls"]) == 1 and len(rerank_calls) == 1
+
+
+def test_a_message_retry_skips_a_floor_that_is_calibrated(
+    computes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, background_on
+) -> None:
+    state = _fail_then_succeed(monkeypatch, "cosine", _COSINE_ID)
+    floor_startup.run_cosine_floor(activity_marker=1.0)
+    state["calls"].clear()
+    store = MemoryStore(tmp_path / "memories.db")
+    store.write_cosine_floor(
+        _COSINE_ID, floor=0.5, raw_fit_floor=0.5, sample_pairs=300, is_cold_start=False
+    )
+    store.close()
+
+    for t in floor_startup.on_incoming_message(tmp_path):
+        t.join(timeout=10)
+
+    assert state["calls"] == [], "a calibrated row makes the failed bootstrap moot"
+
+
+def test_a_message_without_a_failed_bootstrap_starts_nothing(
+    computes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, background_on
+) -> None:
+    assert floor_startup.on_incoming_message(tmp_path) == []
+    assert computes == []
+
+
+def test_respond_hooks_the_message_retry_before_the_turn_and_survives_a_failing_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`respond()` calls `on_incoming_message(persona_dir)` once per message,
+    after the activity marker moved (so the cadence rule sees the chat), and a
+    raising hook never touches the turn."""
+    import json
+
+    from brain import paths
+    from brain.chat.session import reset_registry
+    from brain.cli import main
+
+    d = tmp_path / "personas" / "nell"
+    d.mkdir(parents=True)
+    (d / "persona_config.json").write_text(json.dumps({"provider": "fake", "searcher": "noop"}))
+    (d / "emotion_vocabulary.json").write_text(json.dumps({"version": 1, "emotions": []}))
+    monkeypatch.setattr(paths, "get_home", lambda: tmp_path)
+    monkeypatch.setattr("brain.cli._start_floor_bootstrap_for_direct_chat", lambda *a, **k: None)
+    seen: list = []
+
+    def _hook(persona_dir):
+        seen.append((persona_dir, cli_throttle.chat_activity_marker()))
+        raise RuntimeError("hook exploded")
+
+    monkeypatch.setattr(floor_startup, "on_incoming_message", _hook)
+    cli_throttle.reset()
+    reset_registry()
+    try:
+        with patch("builtins.input", side_effect=["one", "two", "exit"]):
+            assert main(["chat", "--persona", "nell", "--no-bridge"]) == 0
+    finally:
+        reset_registry()
+        cli_throttle.reset()
+
+    assert [p for p, _ in seen] == [d, d], "once per message"
+    assert all(m != float("-inf") for _, m in seen), "the marker had already moved"
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +630,10 @@ def test_the_rerank_bootstrap_retries_only_after_chat_activity_changed(
     monkeypatch.setattr(
         floor_calibration, "get_bootstrap_floor", lambda mid: calls.append(mid) or None
     )
+    assert not floor_calibration.rerank_bootstrap_due("rr", activity_marker=1.0), (
+        "S91: not wanted until a turn needed it or an attempt failed"
+    )
+    floor_calibration.note_bootstrap_needed("rerank", "rr")
     assert floor_calibration.rerank_bootstrap_due("rr", activity_marker=1.0)
 
     assert floor_calibration.run_rerank_bootstrap("rr", activity_marker=1.0) is None
@@ -461,6 +716,10 @@ def test_the_rerank_job_retries_a_failed_bootstrap_once_per_lull(
     jobs = _bootstrap_job(persona_dir)
     assert [j.name for j in jobs] == ["rerank_floor_bootstrap"]
 
+    _pass(persona_dir, jobs, idle=True)
+    assert calls == [], "S91: never due until a turn needed the floor or an attempt failed"
+    floor_calibration.note_bootstrap_needed("rerank", resolve_reranker_model_id())
+
     _pass(persona_dir, jobs, idle=False)
     assert calls == [], "never inside a chat"
     _pass(persona_dir, jobs, idle=True)
@@ -472,6 +731,32 @@ def test_the_rerank_job_retries_a_failed_bootstrap_once_per_lull(
     marker["m"] = 2.0
     _pass(persona_dir, jobs, idle=True)
     assert len(calls) == 2, "one retry at the next lull"
+
+
+@pytest.mark.parametrize("kind", ["cosine", "rerank"])
+def test_a_floor_job_is_not_due_while_a_bootstrap_of_that_floor_is_in_flight(
+    kind, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from tests.unit.brain.bridge.test_central_cadence import _persona
+
+    persona_dir = _persona(tmp_path)
+    (job,) = _bootstrap_job_named(persona_dir, f"{kind}_floor_bootstrap")
+    if kind == "rerank":
+        floor_calibration.note_bootstrap_needed("rerank", resolve_reranker_model_id())
+    monkeypatch.setattr(cli_throttle, "chat_activity_marker", lambda: 1.0)
+    assert job.has_work() is True, "test precondition: due when nothing is in flight"
+
+    assert floor_startup.try_begin(kind)
+    try:
+        assert job.has_work() is False
+    finally:
+        floor_startup.end(kind)
+
+
+def _bootstrap_job_named(persona_dir: Path, name: str):
+    from tests.unit.brain.bridge.test_central_cadence import _real_jobs
+
+    return [j for j in _real_jobs(persona_dir) if j.name == name]
 
 
 def test_the_rerank_job_is_not_due_with_a_calibrated_row_or_a_cached_bootstrap(
@@ -585,7 +870,7 @@ def test_direct_chat_start_computes_synchronously_for_a_one_shot_and_in_a_thread
         patch.object(floor_startup, "start_background") as background,
     ):
         _start_floor_bootstrap_for_direct_chat(tmp_path, blocking=True)
-        compute.assert_called_once_with(tmp_path)
+        compute.assert_called_once_with(tmp_path, activity_marker=cli_throttle.chat_activity_marker)
         background.assert_not_called()
 
     with (
@@ -747,7 +1032,7 @@ def test_an_unrecognised_precision_override_warns_once_not_on_every_call(
     assert len(warnings) == 1
 
 
-def test_start_background_sets_the_startup_flag_before_the_thread_runs(
+def test_start_background_claims_the_cosine_slot_before_the_thread_runs(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """The cadence job must never win a race against the startup thread: the
@@ -756,7 +1041,7 @@ def test_start_background_sets_the_startup_flag_before_the_thread_runs(
     gate = threading.Event()
     seen: list[bool] = []
 
-    def _slow(persona_dir, *, activity_marker):
+    def _slow(persona_dir, *, activity_marker, **kw):
         gate.wait(5)
 
     monkeypatch.setattr(floor_startup, "compute_missing_floors", _slow)

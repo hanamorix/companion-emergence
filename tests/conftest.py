@@ -311,6 +311,26 @@ def _reset_reranker_provider_cache() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _floor_bootstrap_background_off_by_default(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[None]:
+    """Keep the floor bootstraps' background starters (name-recall fix S91/S92:
+    the first-need rerank request and the on-each-message retry) from spawning
+    threads in unrelated tests: a recall without a rerank floor or a `respond()`
+    after a failed bootstrap would otherwise leak a daemon thread that computes
+    (and caches) a floor after this test's teardown reset. The bookkeeping
+    (need flag, failed record) still happens; tests of the starters themselves
+    flip `floor_startup._background_inhibited` back. Also clears the in-flight
+    slots before and after each test."""
+    from brain.memory import floor_startup
+
+    monkeypatch.setattr(floor_startup, "_background_inhibited", True)
+    floor_startup._inflight.clear()  # noqa: SLF001
+    yield
+    floor_startup._inflight.clear()  # noqa: SLF001
+
+
+@pytest.fixture(autouse=True)
 def _cosine_floor_never_clears_by_default(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> None:

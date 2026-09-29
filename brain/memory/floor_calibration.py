@@ -406,7 +406,14 @@ def rerank_bootstrap_due(reranker_model_id: str, *, activity_marker: object = No
     `activity_marker` (the next-lull retry rule)."""
     if peek_bootstrap_floor(reranker_model_id) is not None:
         return False
-    return _retry_due("rerank", reranker_model_id, activity_marker)
+    with _cosine_bootstrap_floor_cache_lock:
+        wanted = ("rerank", reranker_model_id) in _bootstrap_needed or (
+            "rerank",
+            reranker_model_id,
+        ) in _bootstrap_failed_at
+    # S91: the rerank bootstrap is wanted only once a turn needed it (or an
+    # attempt failed); it is never computed just because the process started.
+    return wanted and _retry_due("rerank", reranker_model_id, activity_marker)
 
 
 def run_rerank_bootstrap(
@@ -531,6 +538,7 @@ def _reset_bootstrap_floor_cache() -> None:
     with _cosine_bootstrap_floor_cache_lock:
         for key in [k for k in _bootstrap_failed_at if k[0] == "rerank"]:
             del _bootstrap_failed_at[key]
+        _bootstrap_needed.difference_update({k for k in _bootstrap_needed if k[0] == "rerank"})
 
 
 # ---------------------------------------------------------------------------
@@ -576,6 +584,22 @@ def _cosine_bootstrap_pairs(embedder: Any) -> list[tuple[float, str]]:
 _UNSET = object()
 # ("cosine" | "rerank", model id) -> the activity marker at the last failure.
 _bootstrap_failed_at: dict[tuple[str, str], object] = {}
+# ("rerank", model id) pairs a reranking turn found without a floor (S91): the
+# rerank bootstrap is wanted only once a turn needed it, never at process start.
+_bootstrap_needed: set[tuple[str, str]] = set()
+
+
+def note_bootstrap_needed(kind: str, model_id: str) -> None:
+    """Record that a turn needed the `kind` bootstrap floor and found none."""
+    with _cosine_bootstrap_floor_cache_lock:
+        _bootstrap_needed.add((kind, model_id))
+
+
+def bootstrap_failed(kind: str, model_id: str) -> bool:
+    """True when a `kind` bootstrap attempt for `model_id` failed and no floor
+    has been cached since (the on-each-message background retry, S92)."""
+    with _cosine_bootstrap_floor_cache_lock:
+        return (kind, model_id) in _bootstrap_failed_at
 
 
 def peek_cosine_bootstrap_floor(embedder_model_id: str) -> dict[str, Any] | None:
@@ -597,6 +621,7 @@ def _record_attempt(kind: str, model_id: str, ok: bool, activity_marker: object)
     with _cosine_bootstrap_floor_cache_lock:
         if ok:
             _bootstrap_failed_at.pop((kind, model_id), None)
+            _bootstrap_needed.discard((kind, model_id))
         else:
             _bootstrap_failed_at[(kind, model_id)] = activity_marker
 
@@ -698,6 +723,7 @@ def _reset_cosine_bootstrap_floor_cache() -> None:
         _cosine_bootstrap_floor_cache.clear()
         for key in [k for k in _bootstrap_failed_at if k[0] == "cosine"]:
             del _bootstrap_failed_at[key]
+        _bootstrap_needed.difference_update({k for k in _bootstrap_needed if k[0] == "cosine"})
 
 
 # ---------------------------------------------------------------------------

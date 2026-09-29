@@ -90,6 +90,7 @@ import numpy as np
 
 from brain.dev_constants import MONOLOGUE_FAMILY_TYPES
 from brain.memory import embeddings as embeddings_mod
+from brain.memory import floor_startup
 from brain.memory import reranker as reranker_mod
 from brain.memory.embedding_matrix import EmbeddingMatrix, build_embedding_matrix
 from brain.memory.embeddings import cosine_similarity
@@ -539,8 +540,9 @@ def _reranked_ranking(
     instead: the reranker failed to construct or score, fewer than the S5
     minimum of real candidates fit the budget or exist, the anchor
     normalization fell back (`did_normalize=False`: raw scores are NEVER
-    gated, P-6), or the rerank floor could not be read (the bootstrap fit
-    itself failed: the reranker cannot gate this turn).
+    gated, P-6), or there is no rerank floor yet (S91: the need is flagged and
+    the bootstrap starts in the background; the reranker cannot gate this
+    turn).
 
     When `coarse` and `embedder_model_id` are given (`rank_and_gate` always
     does), the returned ranking also carries the cosine tail (spec §4, S82):
@@ -604,9 +606,13 @@ def _reranked_ranking(
         )
         return None
     if floor_row is None:
+        # S91: this turn reranked but has no floor to gate the scores with. It
+        # takes the cosine path, and the need is flagged: the rerank bootstrap
+        # starts in the background (one at a time), never on this reply path.
+        floor_startup.request_rerank_bootstrap()
         log.debug(
             "semantic recall: no rerank floor yet for %s (no calibrated row, and the "
-            "process-start bootstrap has not produced one) — taking the cosine path",
+            "first-need background bootstrap has not produced one) — taking the cosine path",
             reranker_model_id,
         )
         return None
