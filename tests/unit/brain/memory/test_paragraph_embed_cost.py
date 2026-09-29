@@ -516,3 +516,23 @@ def test_c15b_a_many_paragraph_message_on_a_healthy_model_leaves_no_stuck_state(
     assert search is not None and search.total_width == 0
     assert _RERANKER_ID in reranker_mod._budget_misses, "recorded (S113)"
     assert reranker_mod.stuck_width_due(1.0) is False, "5 fit the full budget: not stuck"
+
+
+def test_f2_a_broken_load_warns_once_then_logs_at_debug(monkeypatch, tmp_path: Path, caplog) -> None:
+    """Round-2 review N2: a load that fails on every message (renamed fastembed
+    internals) warns with a traceback once per model id, then at debug."""
+    import logging
+
+    clock = _clocked(monkeypatch)
+    embedder = _CostEmbedder(clock)
+    store = _store(monkeypatch, tmp_path, embedder)
+
+    def _broken():
+        raise AttributeError("fastembed internals renamed")
+
+    monkeypatch.setattr(embedder, "ensure_loaded", _broken)
+    with caplog.at_level(logging.DEBUG, logger="brain.memory.semantic_recall"):
+        for _ in range(3):
+            run_semantic_recall(store, tmp_path, "kite over the harbour")
+    failures = [r for r in caplog.records if "load/warm-up failed" in r.getMessage()]
+    assert [r.levelno for r in failures] == [logging.WARNING, logging.DEBUG, logging.DEBUG]

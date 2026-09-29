@@ -529,8 +529,10 @@ def _reset_reranker_provider_cache() -> None:
 #     (fastembed `preprocessor_utils.load_tokenizer` enables padding; S67).
 #   - `overhead` and `rate` are separated by ordinary least squares over the
 #     running sums (count, sum x, sum y, sum x*y, sum x*x) of this process's
-#     recall reranks, per reranker model id (spec §1). No persistence and no
-#     averaging constant: every measured call weighs the same.
+#     recall reranks (and the S100 re-measure job's), per reranker model id
+#     (spec §1). The sums cover the current 24-hour compaction period (S101,
+#     S114; `cost_period`). No persistence and no averaging constant: every
+#     measured call in a period weighs the same.
 #   - RAM per padded token of GROWTH (S32: RSS delta around recall-time
 #     reranks). The ONNX runtime keeps the memory a batch needed and reuses
 #     it, so a call whose padded size x is within the largest size already

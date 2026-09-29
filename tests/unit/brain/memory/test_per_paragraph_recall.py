@@ -513,6 +513,41 @@ def _two_query_store(monkeypatch, tmp_path, clock, seconds_per_text):
     return store, embedder, rec, first, rest
 
 
+def test_the_first_message_rest_query_is_sized_and_its_probe_is_scan_time(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """S63 path, round-2 review N3: the rest query's token count is probed
+    (its embed call becomes an embed-series sample) and the probe's time is the
+    rest query's scan-side work. Unequal per-call seconds (P1 1.5 s, REST
+    2.5 s) so the per-call prediction differs from the measured sum."""
+    clock = _Clock()
+    monkeypatch.setattr(sr, "_clock", clock)
+    _budget(monkeypatch, 4.2)  # 3 x 1.5 s does not fit: the S63 split
+    store, embedder, rec, first, rest = _two_query_store(monkeypatch, tmp_path, clock, 0.0)
+    seconds = {_P1: 1.5, _REST: 2.5}
+
+    def embed_batch(texts):
+        embedder.batches.append(list(texts))
+        clock.advance(sum(seconds.get(t, 0.0) for t in texts))
+        return [embedder.embed(t) for t in texts]
+
+    def token_lengths_timed(texts):
+        if texts == [_REST]:
+            clock.advance(0.05)
+        return [len(t) for t in texts], None
+
+    monkeypatch.setattr(embedder, "embed_batch", embed_batch)
+    monkeypatch.setattr(embedder, "token_lengths_timed", token_lengths_timed)
+
+    result = run_semantic_recall(store, tmp_path, _THREE)
+
+    assert result is not None and [o.query for o in result.paragraphs] == [_P1, _REST]
+    state = sr._embed_cost.state(_EMBEDDER_ID)
+    assert state.sums.n == 2 and state.sums.sum_x == len(_P1) + len(_REST)
+    assert state.sums.sum_y == pytest.approx(4.0)
+    assert sr._scan_time.sums().seconds == pytest.approx(0.05), "the rest probe is the rest query's scan time"
+
+
 def test_a_first_message_that_does_not_fit_is_scored_as_its_first_paragraph_and_the_rest(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

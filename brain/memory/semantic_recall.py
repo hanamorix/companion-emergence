@@ -909,16 +909,18 @@ def rank_and_gate(
 # plain top 50); the cuts are merged by memory id, a memory going to the
 # paragraph with its best cosine score. One per-message time budget (the
 # `reranker.latency_budget_seconds` tunable) pays for everything: the
-# per-message setup `T_m` and the per-paragraph embed + scan + pair-size time
-# `T_p` (running averages in this process, ratio of sums, no constant) come
-# off the top, and what is left is split equally among the paragraphs for
+# per-message setup `T_m` (with the token-count probe) and the per-query scan
+# time `T_s` (product share + coarse cut + pair-size probe; running averages in
+# this process, ratio of sums, no constant) and the paragraph embed cost (a
+# length-aware least-squares fit per 24-hour compaction period, S108, S118)
+# come off the top, and what is left is split equally among the paragraphs for
 # their reranks. Paragraphs are then served in order of their best cosine
 # score, each reranking its own candidates against its own text with its own
 # anchors, within its share and within what is left of the message's 50 real
 # candidates; a paragraph that cannot fit 5 takes the cosine path. The
 # results are assembled across paragraphs (`assemble_paragraph_results`).
 
-# Clock seam for the per-message budget (T_m, T_p, the time already spent).
+# Clock seam for the per-message budget (T_m, T_s, the embed calls).
 # Production: `time.monotonic`. Tests script it.
 _clock: Callable[[], float] = time.monotonic
 
@@ -983,6 +985,8 @@ _embed_cost = cost_period.PeriodCostSeries("paragraph embed")
 # Embedder model ids whose first embed of this process has run (S117).
 _embed_warmed: set[str] = set()
 _embed_warm_lock = threading.Lock()
+# Embedder model ids whose load/warm-up has failed once (warn once, then debug).
+_embed_warm_failed: set[str] = set()
 
 
 def _warm_up_embedder_once(embedder: embeddings_mod.EmbeddingProvider, model_id: str, text: str) -> None:
@@ -1020,6 +1024,7 @@ def _reset_paragraph_time_model() -> None:
     _embed_cost.clear()
     with _embed_warm_lock:
         _embed_warmed.clear()
+    _embed_warm_failed.clear()
 
 
 def split_paragraphs(text: str, keyword_words: Collection[str] | None) -> list[str]:
@@ -1155,20 +1160,24 @@ def search_paragraphs(
     Steps: (1) split (`split_paragraphs`); (2) the lean pool: the stacked
     unit matrix (`EmbeddingMatrix.stacked`, P-23) restricted to the rows that
     are active and in state 'active' (`MemoryStore.active_state_memory_types`,
-    P-27), minus `exclude`; its time is the message's `T_m` sample (P-26; the
-    embedding provider's own construction, a one-time process cost, is not);
-    (3) the queries: one paragraph, or every paragraph when the running
-    averages say `T_m + P x T_p` fits the budget, else the whole message as
-    one query (S29, S34, S46). Before any `T_p` measurement in this process
-    the first paragraph is embedded, searched and timed alone first; if P
-    times that time does not fit, the rest of the message is ONE query and
-    the message is scored as those two paragraphs (S63); (4) one
-    `embed_batch` per group, one matrix product per group, each query's
-    coarse cut from its own scores (S77); (5) merge: a memory goes to the
-    query with its best cosine (ties: the earlier query), keeping that score
-    (S11, S53); (6) the reranker's pair sizes per query, timed into its `T_p`
-    sample (P-28; the one-time warm-up is not); (7) what is left of the
-    budget after `T_m + (queries) x T_p` (the running averages, this
+    P-27), minus `exclude`; its time plus the token-count probe is the
+    message's `T_m` sample (P-26; the embedding provider's construction, its
+    model load (S109) and its first embed (S117) are one-time and are not);
+    (3) the queries: one paragraph; with token counts unknown the whole
+    message as one query; with the models warm every paragraph when
+    `T_m + E(P, longest) + P x T_s` fits the budget (E the length-aware
+    embed fit, S108), else the whole message as one query (S29, S34, S46);
+    before any embed measurement in this process the first paragraph is
+    embedded, searched and timed alone first; if P times that time does not
+    fit, the rest of the message is ONE query and the message is scored as
+    those two paragraphs (S63, S115); (4) one `embed_batch` per group (its
+    in-lock seconds one embed-series sample), one matrix product per group,
+    each query's coarse cut from its own scores (S77); (5) merge: a memory
+    goes to the query with its best cosine (ties: the earlier query),
+    keeping that score (S11, S53); (6) the reranker's pair sizes per query,
+    their in-lock time added to its scan sample `T_s` (P-28; the one-time
+    warm-up is not); (7) what is left of the budget after `T_m`, the embed
+    fit's prediction per embed call made, and `(queries) x T_s` (this
     message's samples included) is split equally among the queries (S33,
     S46, S61: a one-query message pays its embed + scan too); (8) the
     queries are served in order
@@ -1230,7 +1239,13 @@ def search_paragraphs(
         embedder.ensure_loaded()
         _warm_up_embedder_once(embedder, embedder_model_id, paragraphs[0])
     except Exception:  # noqa: BLE001 — fail-soft
-        log.warning("semantic recall: embedder load/warm-up failed", exc_info=True)
+        # Warn with the traceback once per model id; later failures (the same
+        # broken internals, every message) log at debug level.
+        first = embedder_model_id not in _embed_warm_failed
+        _embed_warm_failed.add(embedder_model_id)
+        (log.warning if first else log.debug)(
+            "semantic recall: embedder load/warm-up failed", exc_info=first
+        )
 
     # Token counts (S108) for the paragraphs and, when there are several, the
     # whole message (the fallback query); its time is part of this message's
@@ -1351,7 +1366,7 @@ def search_paragraphs(
         try:
             reranker_provider = reranker_mod.build_reranker_provider(store=store)
             # The one-time warm-up (plan P-1) runs before the probes are
-            # timed, so the ONNX session load never lands in `T_p`.
+            # timed, so the ONNX session load never lands in `T_s`.
             first_docs = _prefix_documents(pool, assigned[rerankable[0]])
             reranker_mod.warm_up_for_recall(reranker_provider, queries[rerankable[0]], first_docs)
         except Exception:  # noqa: BLE001 — fail-soft: the cosine path serves every query
