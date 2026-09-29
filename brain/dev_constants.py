@@ -141,19 +141,12 @@ MONOLOGUE_FAMILY_TYPES: frozenset[str] = frozenset(
 
 # --- recall result order (name-recall fix, spec §4, S97, S98) ---------------
 # The order of the six result groups of a recall (passive recall and the
-# `search_memories` tool alike): reorder this tuple to change the order, a
-# one-line edit. The group names are fixed identifiers read by
+# `search_memories` tool alike): reorder the names on this one line to change
+# the order. The group names are fixed identifiers read by
 # `brain.memory.semantic_recall.order_result_groups`; every name must appear
 # exactly once. Sub-orders inside a group (scores, genuine first, each
 # paragraph's guaranteed slot, name hits first) stay in code. A
 # "cosine_family" memory is a monologue-family memory that was not reranked
 # (gated only by the cosine floor: the cosine path and every reranked
 # paragraph's unreranked tail); S97 puts it below the keyword genuine hits.
-RECALL_RESULT_GROUP_ORDER: tuple[str, ...] = (
-    "reranked_genuine",
-    "reranked_family",
-    "cosine_genuine",
-    "keyword_genuine",
-    "cosine_family",
-    "keyword_family",
-)
+RECALL_RESULT_GROUP_ORDER: tuple[str, ...] = ("reranked_genuine", "reranked_family", "cosine_genuine", "keyword_genuine", "cosine_family", "keyword_family")  # fmt: skip

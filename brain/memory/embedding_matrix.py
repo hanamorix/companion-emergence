@@ -350,7 +350,9 @@ class EmbeddingMatrix:
             if self._stacked is None:
                 ids = tuple(self._vectors)
                 if ids:
-                    unit = np.stack([self._vectors[mid] for mid in ids]).astype(np.float32)
+                    unit = np.stack([self._vectors[mid] for mid in ids]).astype(
+                        np.float32, copy=False
+                    )
                     norms = np.linalg.norm(unit, axis=1, keepdims=True)
                     np.divide(unit, norms, out=unit, where=norms > 0)
                 else:

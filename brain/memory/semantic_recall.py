@@ -608,7 +608,19 @@ def _reranked_ranking(
     is left of the message's 50 real candidates, and its pair token counts
     computed ahead). The second element is how many real candidates were
     actually reranked (0 when no rerank ran), whether or not the ranking
-    could then be gated."""
+    could then be gated.
+
+    When fewer than the S5 minimum of real candidates exist or are allowed
+    (`max_real`, what is left of the message's 50), no rerank can run and the
+    reranker is not even built (hand-off "pool" / "allocation")."""
+    if min(len(coarse_ids), max_real) < RERANK_MIN_REAL_CANDIDATES:
+        log.info(
+            "semantic recall: no rerank (%s, %d candidates, %d allowed) — taking the cosine path",
+            "pool" if len(coarse_ids) < RERANK_MIN_REAL_CANDIDATES else "allocation",
+            len(coarse_ids),
+            max_real,
+        )
+        return None, 0
     try:
         reranker_provider = reranker_mod.build_reranker_provider(store=store)
         # Name-recall fix R1 (spec §1): the width is fitted for THIS message
@@ -832,11 +844,15 @@ def rank_and_gate(
     budget_seconds: float | None = None,
     max_real: int = CANDIDATE_POOL,
     sizes: reranker_mod.PairSizes | None = None,
-) -> GatedRanking | None:
-    """Score one query's coarse cut and return what to gate (name-recall fix
-    R2, spec §2): the reranked path when a rerank of >= 5 real candidates
-    ran and normalized, otherwise the cosine path. `None` = no semantic
-    result is possible this turn (no cosine gate).
+) -> tuple[GatedRanking | None, int]:
+    """Score one query's coarse cut and return `(what to gate, real
+    candidates reranked)` (name-recall fix R2, spec §2): the reranked path
+    when a rerank of >= 5 real candidates ran and normalized, otherwise the
+    cosine path. A `None` ranking = no semantic result is possible for this
+    query (no cosine gate). The second element counts the real candidates a
+    rerank actually scored (0 when none ran) whether or not a ranking could
+    then be gated, so the message's 50-candidate maximum (S58) counts a
+    rerank that ran on a query with no gate too.
 
     Shared by passive recall and `search_memories` so the two never diverge
     on path choice, floor or scale. `log_calibration=True` (passive recall
@@ -851,7 +867,7 @@ def rank_and_gate(
     `max_real` (default: the design maximum of 50) and `sizes` (default:
     computed here) are one paragraph's fair share, its part of the message's
     50 real candidates and its pair token counts; the returned ranking's
-    `real_width` says how many real candidates were reranked."""
+    `real_width` also says how many real candidates were reranked."""
     # R3 (spec §4): genuine candidates are taken first for the rerank prefix.
     coarse_ids = genuine_first([mid for mid, _ in coarse], pool)
     gated, reranked_width = _reranked_ranking(
@@ -867,7 +883,7 @@ def rank_and_gate(
         sizes=sizes,
     )
     if gated is not None:
-        return gated
+        return gated, reranked_width
     cosine = _cosine_ranking(
         store,
         query,
@@ -877,8 +893,8 @@ def rank_and_gate(
         log_calibration=log_calibration,
     )
     if cosine is None or not reranked_width:
-        return cosine
-    return replace(cosine, real_width=reranked_width)
+        return cosine, reranked_width
+    return replace(cosine, real_width=reranked_width), reranked_width
 
 
 # ---------------------------------------------------------------------------
@@ -1039,7 +1055,7 @@ class ParagraphOutcome:
     `SemanticHit.paragraph` tag), its text (the rerank and calibration
     query), its gated ranking (`None` when no gate was possible: no
     candidate, or no cosine floor yet), its candidate count after the merge,
-    and its best cosine score. `gated.real_width` is the real candidates the
+    and its best cosine score. `reranked_width` is the real candidates the
     reranker scored for it (0 when none)."""
 
     index: int
@@ -1047,6 +1063,9 @@ class ParagraphOutcome:
     gated: GatedRanking | None
     candidate_count: int
     best_cosine: float | None
+    # Real candidates a rerank scored for this query (0 when none ran), also
+    # when no ranking could be gated (S58: it still counts toward the 50).
+    reranked_width: int = 0
 
 
 @dataclass(frozen=True)
@@ -1137,6 +1156,12 @@ def search_paragraphs(
         whole_message = True
 
     matrix = build_embedding_matrix(store.db_path)
+    # The matrix's first lazy build (one DB scan per process) is a one-time
+    # cost like the embedding provider's construction, so it is kept out of
+    # `T_m`; once built this is a no-op.
+    before_build = _clock()
+    matrix.ensure_built()
+    one_time = _clock() - before_build
     ids, unit = matrix.stacked()
     if not ids:
         return None
@@ -1156,7 +1181,7 @@ def search_paragraphs(
     except Exception:  # noqa: BLE001 — fail-soft
         log.exception("semantic recall: embedding provider unavailable — falling back to lexical")
         return None
-    _message_overhead.record(before_provider - start)
+    _message_overhead.record(before_provider - start - one_time)
     overhead = _message_overhead.average() or 0.0
 
     def is_family(mid: str) -> bool:
@@ -1224,6 +1249,9 @@ def search_paragraphs(
     samples = [part for _, part in searched]
     sizes: dict[int, reranker_mod.PairSizes] = {}
     rerankable = [qi for qi, cut in enumerate(assigned) if len(cut) >= RERANK_MIN_REAL_CANDIDATES]
+    # A reranker that cannot be built or warmed up fails once per message: the
+    # remaining queries take the cosine path without retrying the load.
+    reranker_down = False
     if rerankable:
         try:
             reranker_provider = reranker_mod.build_reranker_provider(store=store)
@@ -1231,15 +1259,21 @@ def search_paragraphs(
             # timed, so the ONNX session load never lands in `T_p`.
             first_docs = _prefix_documents(pool, assigned[rerankable[0]])
             reranker_mod.warm_up_for_recall(reranker_provider, queries[rerankable[0]], first_docs)
-            for qi in rerankable:
-                began = _clock()
+        except Exception:  # noqa: BLE001 — fail-soft: the cosine path serves every query
+            log.warning(
+                "semantic recall: reranker unavailable — cosine path for this message",
+                exc_info=True,
+            )
+            reranker_down = True
+        for qi in [] if reranker_down else rerankable:
+            began = _clock()
+            try:
                 sizes[qi] = reranker_mod.recall_pair_sizes(
                     reranker_provider, queries[qi], _prefix_documents(pool, assigned[qi])
                 )
-                samples[qi] += _clock() - began
-        except Exception:  # noqa: BLE001 — each query's rank_and_gate retries and fails soft
-            log.warning("semantic recall: pair-size probe failed", exc_info=True)
-            sizes = {}
+            except Exception:  # noqa: BLE001 — this query's rank_and_gate retries and fails soft
+                log.warning("semantic recall: pair-size probe failed", exc_info=True)
+            samples[qi] += _clock() - began
     for sample in samples:
         _paragraph_time.record(sample)
 
@@ -1253,12 +1287,13 @@ def search_paragraphs(
     best_cosines = [max((c for _, c in cut), default=None) for cut in assigned]
     embedder_model_id = embedder.model_id()
     gated_by_query: dict[int, GatedRanking | None] = {}
+    width_by_query: dict[int, int] = {}
     used = 0
     for qi in _serve_order(best_cosines):
         if not assigned[qi]:
             gated_by_query[qi] = None
             continue
-        gated = rank_and_gate(
+        gated, reranked = rank_and_gate(
             store,
             queries[qi],
             pool,
@@ -1266,11 +1301,12 @@ def search_paragraphs(
             embedder_model_id=embedder_model_id,
             log_calibration=log_calibration,
             budget_seconds=share,
-            max_real=CANDIDATE_POOL - used,
+            max_real=0 if reranker_down else CANDIDATE_POOL - used,
             sizes=sizes.get(qi),
         )
         gated_by_query[qi] = gated
-        used += gated.real_width if gated is not None else 0
+        width_by_query[qi] = reranked
+        used += reranked
     outcomes = tuple(
         ParagraphOutcome(
             index=qi,
@@ -1278,6 +1314,7 @@ def search_paragraphs(
             gated=gated_by_query.get(qi),
             candidate_count=len(assigned[qi]),
             best_cosine=best_cosines[qi],
+            reranked_width=width_by_query.get(qi, 0),
         )
         for qi in range(len(queries))
     )
@@ -1350,6 +1387,11 @@ def result_group_order() -> tuple[str, ...]:
             f"exactly once, got {order!r}"
         )
     return order
+
+
+# A list that does not name each group once fails at import (loudly), not on
+# every recall turn inside the fail-soft wrapper (S98 review F6).
+result_group_order()
 
 
 def order_result_groups(

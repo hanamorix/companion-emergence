@@ -99,15 +99,22 @@ class _AxisEmbedder(EmbeddingProvider):
     `_OTHER`. Records every batch; each text of a batch advances the clock by
     `seconds_per_text`."""
 
-    def __init__(self, axes: dict[str, int], clock: _Clock | None = None, seconds_per_text: float = 0.0):
+    def __init__(
+        self,
+        axes: dict[str, int],
+        clock: _Clock | None = None,
+        seconds_per_text: float = 0.0,
+        scale: float = 1.0,
+    ):
         self.axes = axes
         self.clock = clock
         self.seconds_per_text = seconds_per_text
+        self.scale = scale
         self.batches: list[list[str]] = []
 
     def embed(self, text: str) -> np.ndarray:
         v = np.zeros(_DIM, dtype=np.float32)
-        v[self.axes.get(text, _OTHER)] = 1.0
+        v[self.axes.get(text, _OTHER)] = self.scale
         return v
 
     def embed_batch(self, texts):
@@ -144,6 +151,7 @@ class _Reranker(RerankerProvider):
         self.warm_seconds = warm_seconds
         self.probe_seconds = probe_seconds
         self.calls: list[tuple[str, list[str]]] = []
+        self.probed: list[str] = []
 
     def rerank(self, query: str, documents: list[str]) -> list[float]:
         self.calls.append((query, list(documents)))
@@ -152,6 +160,7 @@ class _Reranker(RerankerProvider):
         return [self.scores.get(d, self.default) for d in documents]
 
     def pair_token_lengths(self, query, documents):
+        self.probed.append(query)
         if self.clock is not None:
             self.clock.advance(self.probe_seconds)
         return super().pair_token_lengths(query, documents)
@@ -315,7 +324,7 @@ def test_one_paragraph_embeds_once_and_its_pool_equals_the_per_row_computation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     message = "The kite flew over the harbour. Then it came down."
-    embedder = _AxisEmbedder({})
+    embedder = _AxisEmbedder({}, scale=3.0)  # not unit length: the scan must normalize it
     store, memories = _random_store(monkeypatch, tmp_path, embedder)
     rec = _Reranker({m.content: 5.0 for m in memories})
     _install(monkeypatch, embedder, rec)
@@ -1272,3 +1281,280 @@ def test_the_tool_keeps_a_guaranteed_slot_ahead_of_keyword_hits_under_any_order(
     )
     ids = [m["id"] for m in out["memories"]]
     assert len(ids) == 3 and ids[-1] == head.id
+
+
+# ---------------------------------------------------------------------------
+# Review round 1 (R6/6-redteam-code.md): F2-F6, F8
+# ---------------------------------------------------------------------------
+
+
+def test_the_paragraph_time_includes_the_scan_and_the_cut(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """F2: `T_p` = embed 0.5 + matrix product 0.0625 + coarse cut 0.03125 +
+    pair-size probe 0.125 (spec §3 "embed + scan time"; P-28)."""
+    _budget(monkeypatch, 4.0)
+    store, rec, clock = _budget_case(monkeypatch, tmp_path, embed_seconds=0.5)
+    real_rows, real_walk = sr._unit_rows, sr._walk_coarse_cut
+
+    def _rows(vectors):
+        clock.advance(0.0625)
+        return real_rows(vectors)
+
+    def _walk(ordered, is_family, size):
+        clock.advance(0.03125)
+        return real_walk(ordered, is_family, size)
+
+    monkeypatch.setattr(sr, "_unit_rows", _rows)
+    monkeypatch.setattr(sr, "_walk_coarse_cut", _walk)
+
+    result = run_semantic_recall(store, tmp_path, "kite over the harbour")
+
+    assert result is not None
+    assert sr._paragraph_time.average() == pytest.approx(0.5 + 0.0625 + 0.03125 + 0.125)
+    assert result.rerank_budget == pytest.approx(4.0 - 0.25 - 0.71875)
+
+
+def test_a_rerank_that_ran_without_a_gate_still_counts_toward_the_fifty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """F3 (S58): no rerank floor and no cosine floor yet (a fresh persona):
+    every query reranks and then has nothing to gate with, yet its reranked
+    candidates still count, so 11 paragraphs of 5 rerank 10 times (50), not 11."""
+    texts = [f"fresh {chr(97 + i)} words" for i in range(11)]
+    embedder = _AxisEmbedder({t: i for i, t in enumerate(texts)})
+    store = MemoryStore(tmp_path / "memories.db")
+    _install(monkeypatch, embedder)
+    contents = [_mem(store, f"r6 fresh {i} {j}", {i: 0.9 - 0.01 * j}).content for i in range(11) for j in range(5)]
+    rec = _Reranker(dict.fromkeys(contents, 5.0))
+    _install(monkeypatch, embedder, rec)
+
+    search = search_paragraphs(store, "\n".join(texts), log_calibration=False)
+
+    assert search is not None
+    assert all(o.gated is None for o in search.outcomes), "no floor: nothing to gate"
+    assert len(rec.scored()) == 10
+    assert search.total_width == 50
+    assert sum(o.reranked_width for o in search.outcomes) == 50
+
+
+def test_the_matrix_first_build_is_kept_out_of_the_message_overhead(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """F4: the one-time lazy matrix load (5 s here) is not a `T_m` sample."""
+    _budget(monkeypatch, 4.0)
+    store, rec, clock = _budget_case(monkeypatch, tmp_path, embed_seconds=0.5)
+    real_build = EmbeddingMatrix.ensure_built
+
+    def _slow_first_build(self):
+        if not self._built:
+            clock.advance(5.0)
+        return real_build(self)
+
+    monkeypatch.setattr(EmbeddingMatrix, "ensure_built", _slow_first_build)
+
+    run_semantic_recall(store, tmp_path, "kite over the harbour")
+
+    assert sr._message_overhead.average() == pytest.approx(0.25)
+
+
+def test_a_reranker_that_cannot_load_is_tried_once_per_message(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """F5: three rerankable paragraphs and a reranker that fails to build:
+    one attempt for the message, every paragraph on the cosine path."""
+    embedder = _AxisEmbedder({_P1: 0, _P2: 1, _P3: 2})
+    store = MemoryStore(tmp_path / "memories.db")
+    _install(monkeypatch, embedder)
+    for axis in range(3):
+        for j in range(6):
+            _mem(store, f"r6 down {axis} {j}", {axis: 0.9 - 0.01 * j})
+    _cosine_floor(store, 0.5)
+    attempts: list[int] = []
+
+    def _boom(**kwargs):
+        attempts.append(1)
+        raise RuntimeError("simulated reranker construction failure")
+
+    monkeypatch.setattr("brain.memory.reranker.build_reranker_provider", _boom)
+
+    result = run_semantic_recall(store, tmp_path, _THREE)
+
+    assert len(attempts) == 1
+    assert result is not None
+    assert [o.gated.path for o in result.paragraphs] == [COSINE_PATH] * 3
+
+
+def test_the_group_order_is_one_line_naming_each_group_once() -> None:
+    """S98 "a single line change": the six names sit on one source line; each
+    group appears exactly once (independent of the order chosen)."""
+    import inspect
+
+    source = inspect.getsource(dev_constants)
+    (line,) = [ln for ln in source.splitlines() if ln.startswith("RECALL_RESULT_GROUP_ORDER")]
+    assert all(f'"{name}"' in line for name in _S97_ORDER)
+    order = dev_constants.RECALL_RESULT_GROUP_ORDER
+    assert len(order) == 6 and set(order) == set(_S97_ORDER)
+
+
+def test_a_bad_group_list_fails_at_import_not_silently_per_turn(tmp_path: Path) -> None:
+    """F6: a list that does not name each group once stops the import, so a
+    mis-edit cannot switch semantic recall off quietly."""
+    import subprocess
+    import sys
+
+    code = (
+        "import brain.dev_constants as d\n"
+        "d.RECALL_RESULT_GROUP_ORDER = d.RECALL_RESULT_GROUP_ORDER[:5]\n"
+        "import brain.memory.semantic_recall\n"
+    )
+    root = Path(__file__).resolve().parents[4]
+    run = subprocess.run(
+        [sys.executable, "-c", code], cwd=root, capture_output=True, text=True, timeout=120
+    )
+    assert run.returncode != 0
+    assert "RECALL_RESULT_GROUP_ORDER" in run.stderr
+
+
+def test_a_rebuild_drops_the_cached_stack(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """F8 / P-23: a build swap invalidates the stack like put and evict."""
+    store = MemoryStore(tmp_path / "memories.db")
+    first = _mem(store, "r6 first row", {0: 0.5})
+    matrix = EmbeddingMatrix(tmp_path / "memories.db", model_id=_EMBEDDER_ID)
+    assert matrix.stacked()[0] == (first.id,)
+    second = _mem(store, "r6 second row", {1: 0.5})  # written to the DB only
+
+    matrix.rebuild()
+
+    assert set(matrix.stacked()[0]) == {first.id, second.id}
+
+
+def test_get_active_by_ids_skips_a_row_that_faded_or_was_deactivated(tmp_path: Path) -> None:
+    """F8 / P-27: the full-row read after the cosine cut re-checks the state,
+    so a memory that faded between the two reads is not a candidate."""
+    store = MemoryStore(tmp_path / "memories.db")
+    kept, faded, gone = (
+        Memory.create_new(content=c, memory_type="event", domain="d") for c in ("k", "f", "g")
+    )
+    for m in (kept, faded, gone):
+        store.create(m)
+    store._conn.execute("UPDATE memories SET state = 'fading' WHERE id = ?", (faded.id,))  # noqa: SLF001
+    store._conn.execute("UPDATE memories SET active = 0 WHERE id = ?", (gone.id,))  # noqa: SLF001
+    store._conn.commit()  # noqa: SLF001
+
+    assert set(store.get_active_by_ids([kept.id, faded.id, gone.id])) == {kept.id}
+
+
+def test_the_emptiness_test_is_case_insensitive() -> None:
+    assert split_paragraphs("ok\nKITE over the Harbour", {"kite"}) == ["KITE over the Harbour"]
+
+
+def test_a_memory_equally_close_to_two_paragraphs_goes_to_the_earlier_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    embedder = _AxisEmbedder({_P1: 0, _P2: 1})
+    store = MemoryStore(tmp_path / "memories.db")
+    _install(monkeypatch, embedder)
+    tie = _mem(store, "equally close", {0: 0.6, 1: 0.6})
+    _cosine_floor(store, 0.1)
+    _no_reranker(monkeypatch)
+    calls = _spy_rank_and_gate(monkeypatch)
+
+    run_semantic_recall(store, tmp_path, f"{_P1}\n{_P2}")
+
+    by_query = {c["query"]: dict(c["coarse"]) for c in calls}
+    assert tie.id in by_query[_P1]
+    assert _P2 not in by_query or tie.id not in by_query[_P2]
+
+
+def test_the_fit_decision_counts_the_message_overhead(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """3 x `T_p` 1.0 fits 3.5 s alone, but with `T_m` 0.75 it does not:
+    the whole message is one query."""
+    clock = _Clock()
+    monkeypatch.setattr(sr, "_clock", clock)
+    _budget(monkeypatch, 3.5)
+    sr._paragraph_time.record(1.0)
+    sr._message_overhead.record(0.75)
+    embedder = _AxisEmbedder({_P1: 0, _P2: 1, _P3: 2})
+    store = MemoryStore(tmp_path / "memories.db")
+    _install(monkeypatch, embedder)
+    _slow_store_reads(monkeypatch, clock, 0.75)
+    _mem(store, "a memory", {_OTHER: 0.9})
+    _cosine_floor(store, 0.5)
+    _no_reranker(monkeypatch)
+
+    result = run_semantic_recall(store, tmp_path, _THREE)
+
+    assert embedder.batches == [[_THREE]]
+    assert result is not None and result.whole_message_fallback is True
+
+
+def test_the_first_message_decision_counts_the_message_overhead(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """S63 decision: first paragraph timed at 1.0 s; 3 x 1.0 fits 3.5 s alone,
+    but with `T_m` 0.75 it does not: first paragraph plus the rest."""
+    clock = _Clock()
+    monkeypatch.setattr(sr, "_clock", clock)
+    _budget(monkeypatch, 3.5)
+    store, embedder, rec, first, rest = _two_query_store(monkeypatch, tmp_path, clock, 1.0)
+    _slow_store_reads(monkeypatch, clock, 0.75)
+
+    run_semantic_recall(store, tmp_path, _THREE)
+
+    assert embedder.batches == [[_P1], [_REST]]
+
+
+def test_only_a_query_that_can_rerank_is_probed_for_pair_sizes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    embedder = _AxisEmbedder({_P1: 0, _P2: 1})
+    store = MemoryStore(tmp_path / "memories.db")
+    _install(monkeypatch, embedder)
+    big = [_mem(store, f"r6 big {i}", {0: 0.9 - 0.01 * i}).content for i in range(6)]
+    for i in range(2):
+        _mem(store, f"r6 small {i}", {1: 0.8 - 0.01 * i})
+    rec = _Reranker(dict.fromkeys(big, 5.0))
+    _install(monkeypatch, embedder, rec)
+    _rerank_floor(store, 1.0)
+    _cosine_floor(store, 0.5)
+    _warm()
+
+    run_semantic_recall(store, tmp_path, f"{_P1}\n{_P2}")
+
+    assert set(rec.probed) == {_P1}
+
+
+def test_a_rerank_whose_normalization_fell_back_still_counts_toward_the_fifty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """F3 (S58): a rerank that ran but could not be normalized (P-6) used its
+    width: 6 paragraphs whose reranks each score 10 and fall back use the 50
+    after 5 of them, so the 6th is not reranked."""
+    texts = [f"norm {chr(97 + i)} words" for i in range(6)]
+    embedder = _AxisEmbedder({t: i for i, t in enumerate(texts)})
+    store = MemoryStore(tmp_path / "memories.db")
+    _install(monkeypatch, embedder, _Reranker())
+    for i in range(6):
+        for j in range(12):
+            _mem(store, f"r6 norm {i} {j}", {i: 0.9 - 0.01 * j})
+    _cosine_floor(store, 0.5)
+    seen_max: list[int] = []
+
+    def _fell_back(provider, query, docs, *, budget_seconds=None, max_real=50, sizes=None):
+        seen_max.append(max_real)
+        return reranker_mod.RecallRerank(
+            width=10, reranked=False, hand_off="normalization", normalization=None, measured=False
+        )
+
+    monkeypatch.setattr(reranker_mod, "rerank_for_recall", _fell_back)
+
+    search = search_paragraphs(store, "\n".join(texts), log_calibration=False)
+
+    assert search is not None
+    assert seen_max == [50, 40, 30, 20, 10], "the 6th query has 0 left: no rerank call"
+    assert search.total_width == 50
+    assert [o.reranked_width for o in search.outcomes] == [10, 10, 10, 10, 10, 0]
+    assert {o.gated.path for o in search.outcomes} == {COSINE_PATH}
