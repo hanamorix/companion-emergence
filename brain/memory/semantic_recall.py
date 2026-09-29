@@ -320,8 +320,9 @@ class SemanticRecallResult:
     hits: list[SemanticHit] = field(default_factory=list)
     # Name-recall fix R2 (spec §2, C2c): which path produced this result, the
     # scale `scores` are on ('normalized' reranker scores or raw 'cosine') and
-    # the pass mark that was actually applied to them. Never mixed: a result
-    # is wholly one path.
+    # the pass mark that was actually applied to them: the result's own
+    # (primary) ranking; a reranked result's cosine tail (S82) is described
+    # by the `tail_*` fields and by each hit's own `path`.
     path: str = "reranked"
     scale: str = CALIBRATION_SCORE_SCALE
     pass_mark: float | None = None
@@ -805,9 +806,11 @@ def run_semantic_recall(
         the cosine floor (`store.get_cosine_floor`). Not keyword-only.
 
     Passive recall logs the turn's calibration row(s), each stamped with its
-    own true scale (normally one; a turn whose rerank scored but whose
-    rerank floor was unavailable logs the `normalized` row, then the cosine
-    path's `cosine` row), and floor-gates through `select_standouts`.
+    own true scale (a reranked turn logs the `normalized` row, plus a
+    `cosine` row when its cosine tail has candidates, spec §4 S82; a turn
+    whose rerank scored but whose rerank floor was unavailable logs the
+    `normalized` row, then the cosine path's `cosine` row), and floor-gates
+    through `select_gated_standouts` (each result by its own scale's floor).
 
     Returns a populated `SemanticRecallResult` ONLY when at least one
     candidate clears the operative floor of the path taken. Returns `None`

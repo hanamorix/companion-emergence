@@ -264,6 +264,51 @@ def test_no_tail_when_every_family_memory_was_reranked_and_the_cosine_floor_is_n
     assert reads == [], "no unreranked family candidate: the cosine floor is not consulted"
 
 
+def test_reranked_results_lead_even_when_their_scores_are_below_the_tail_cosines(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The two scales are never merged into one ordering: reranked scores
+    (0.2-0.4 here, above a rerank floor of 0.1) are all numerically BELOW the
+    tail cosines (0.94-0.99), and the reranked results still come first."""
+    store = MemoryStore(tmp_path / "memories.db")
+    genuine, family = _seed(
+        store, monkeypatch, [0.50, 0.40, 0.30], [0.99, 0.98, 0.97, 0.96, 0.95, 0.94]
+    )
+    _cosine_floor(store, 0.5)
+    _rerank_floor(store, floor=0.1)
+    scripted = {g.content: 0.2 + 0.05 * i for i, g in enumerate(genuine)}
+    scripted.update({family[0].content: 0.4, family[1].content: 0.35})
+    _install_reranker(monkeypatch, _Recording(scripted))
+
+    result = run_semantic_recall(store, tmp_path, _QUERY)
+
+    assert result is not None
+    assert max(result.scores.values()) < min(result.tail_scores.values())
+    assert [h.path for h in result.hits] == [RERANKED_PATH] * 5 + [COSINE_PATH] * 4
+    kept = _ids([*result.full, *result.snippet])
+    assert kept[:5] == _ids(reversed(genuine)) + _ids(family[:2])
+    assert kept[5:] == _ids(family[2:6])
+
+
+def test_an_unexpected_tail_failure_keeps_the_reranked_results(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The tail's own outer guard: whatever goes wrong while building it, the
+    reranked results stand."""
+    store, genuine, family, rec = _first_rerank_case(monkeypatch, tmp_path, cosine_floor=0.5)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("tail exploded")
+
+    monkeypatch.setattr(sr, "_cosine_ranking", _boom)
+
+    result = run_semantic_recall(store, tmp_path, _QUERY)
+
+    assert result is not None and result.path == RERANKED_PATH
+    assert _ids([*result.full, *result.snippet]) == _ids(reversed(genuine)) + _ids(family[:2])
+    assert result.tail_scores == {}
+
+
 def test_a_cosine_floor_failure_keeps_the_reranked_results(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -295,6 +340,16 @@ def test_a_passive_turn_logs_one_calibration_row_per_scale_each_stamped_with_its
     assert set(normalized_ids) == set(_ids(genuine) + _ids(family[:2]))
     assert cosine_ids == _ids(family[2:6]), "the unreranked family, in cosine order"
     assert set(normalized_ids).isdisjoint(cosine_ids), "each candidate logged on one scale only"
+    stamped = store._conn.execute(  # noqa: SLF001
+        "SELECT reranker_model_id, reranker_scores FROM calibration_log ORDER BY id"
+    ).fetchall()
+    assert stamped[0]["reranker_model_id"] == "fake-reranker"
+    assert stamped[1]["reranker_model_id"] == "r3-test-embedder", (
+        "the embedder id, as on the cosine path"
+    )
+    assert json.loads(stamped[1]["reranker_scores"]) == pytest.approx(
+        [0.97, 0.96, 0.95, 0.94], abs=1e-5
+    ), "raw cosines"
 
 
 # ---------------------------------------------------------------------------

@@ -195,7 +195,10 @@ def _semantic_top_k(
     floor-clearing memories in the path's own order (name-recall fix R3, spec
     §4): every genuine memory by descending score, then every monologue-family
     memory by descending score, so a monologue-family memory never takes a
-    result slot from a floor-clearing genuine one. The rerank prefix already
+    result slot from a floor-clearing genuine one; on a reranked path the
+    unreranked monologue-family memories that clear the COSINE floor follow
+    (spec §4, S82: ``gated_cleared``, each result gated by its own scale's
+    floor only). The rerank prefix already
     took genuine candidates first (``rank_and_gate``). That order is what the
     default ``order="relevance"`` returns; ``order="age"`` still re-sorts the
     matched set by date (and ``emotion`` still boosts) in ``search_memories``'
