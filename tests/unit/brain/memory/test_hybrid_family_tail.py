@@ -426,7 +426,9 @@ def _spy_tool_semantic(monkeypatch: pytest.MonkeyPatch) -> list:
 
     def _spy(*args, **kwargs):
         out = real(*args, **kwargs)
-        captured.append(out)
+        # Name-recall fix R6 (S97/S98): the semantic side returns each result
+        # with its group; the memories, in the semantic order, are captured.
+        captured.append(None if out is None else [memory for memory, _ in out.grouped])
         return out
 
     monkeypatch.setattr(tool, "_semantic_top_k", _spy)

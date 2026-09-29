@@ -41,6 +41,7 @@ from brain.memory.semantic_recall import (
     SemanticRecallResult,
     genuine_first_memories,
     is_monologue_family,
+    merge_with_keyword,
     run_semantic_recall,
 )
 from brain.memory.store import MemoryStore, split_by_raw_query_floor
@@ -943,17 +944,21 @@ def _assemble_active_entries(
     """The "active:" section's memories as ONE ordered list of
     ``(memory, render_full)`` (name-recall fix R4, spec §3/§5, P-10, P-11).
 
-    Semantic result present: the semantic memories first, in the path's own
-    order (``full`` then ``snippet``; there is no presentation re-sort, P-11),
-    then the keyword hits that are not already semantic hits, in their own
-    order, filling only the slots the semantic results leave under the
-    semantic cap (``MAX_STANDOUT_COUNT`` = 9) and taking the next positions. A
-    memory found by both paths appears once, at its semantic position and tier.
+    Semantic result present (spec §4, S97, S98): the six result groups in the
+    order of ``dev_constants.RECALL_RESULT_GROUP_ORDER`` (by default reranked
+    genuine, reranked monologue-family, cosine-path genuine, keyword genuine,
+    non-reranked monologue-family, keyword monologue-family), each paragraph's
+    guaranteed slot kept first, at most the semantic cap
+    (``MAX_STANDOUT_COUNT`` = 9; ``semantic_recall.merge_with_keyword``). The
+    semantic results keep their own order inside each group (there is no
+    presentation re-sort, P-11); a memory found by both paths appears once, as
+    a semantic result (I4). No slot is reserved for any keyword hit.
     Full vs snippet is by POSITION across the merged list (the first
-    ``FULL_INJECT_STANDOUT_MAX`` = 5 full), except that a keyword hit with
+    ``FULL_INJECT_STANDOUT_MAX`` = 5 full; a semantic result only when its own
+    tier was full), except that a keyword hit with
     importance >= ``FULL_INJECT_IMPORTANCE`` renders full (at most
     ``FULL_INJECT_MAX`` of them, S80: only hits shown full because of that rule
-    count toward the 3), even when that makes more than 5 full. No slot is reserved for any keyword hit.
+    count toward the 3), even when that makes more than 5 full.
 
     No semantic result (P-12): keyword-only turn under today's lexical caps
     (``limit``) and full-inject rule, unchanged.
@@ -961,29 +966,47 @@ def _assemble_active_entries(
     ``keyword_hits`` is already in final keyword order (tier 1, then tier 2, each
     by blended score; genuine before monologue-family). ``tier2_ids`` names the
     hits found only through the extra tokens: they use the importance quota
-    only after tier 1 (S79). ``semantic_result.hits`` is not read:
-    ``full`` + ``snippet`` are the one source of truth.
+    only after tier 1 (S79). ``full`` + ``snippet`` are the one source of
+    truth for WHICH semantic memories and their order; ``hits`` only says
+    which scale surfaced each (its group).
     """
     if semantic_result is None:
         top = keyword_hits[:limit]
         full_ids = _tiered_full_inject_ids(top, tier2_ids)
         return [(m, m.id in full_ids) for m in top]
 
-    semantic = [*semantic_result.full, *semantic_result.snippet]
+    # Spec §4, S97/S98: the six result groups in `dev_constants.
+    # RECALL_RESULT_GROUP_ORDER` (a non-reranked monologue memory never takes a
+    # slot ahead of a keyword genuine hit), each paragraph's guaranteed slot
+    # kept first, at most the semantic cap.
+    semantic_ids = {m.id for m in (*semantic_result.full, *semantic_result.snippet)}
     semantic_full_ids = {m.id for m in semantic_result.full}
-    taken = {m.id for m in semantic}
-    room = max(0, MAX_STANDOUT_COUNT - len(semantic))
-    fill = [m for m in keyword_hits if m.id not in taken][:room]
+    merged = merge_with_keyword(
+        semantic_result.grouped(),
+        keyword_hits,
+        cap=MAX_STANDOUT_COUNT,
+        guaranteed=semantic_result.guaranteed_ids,
+    )
     # S80: the "up to 3" counts only hits shown full BECAUSE of the importance
     # rule; a hit already full by position does not use one of the 3.
-    beyond = [m for j, m in enumerate(fill) if len(semantic) + j >= FULL_INJECT_STANDOUT_MAX]
+    beyond = [
+        m
+        for position, m in enumerate(merged)
+        if m.id not in semantic_ids and position >= FULL_INJECT_STANDOUT_MAX
+    ]
     promoted = _tiered_full_inject_ids(beyond, tier2_ids)
-
-    entries: list[tuple[object, bool]] = [(m, m.id in semantic_full_ids) for m in semantic]
-    for j, mem in enumerate(fill):
-        position = len(semantic) + j
-        entries.append((mem, position < FULL_INJECT_STANDOUT_MAX or mem.id in promoted))
-    return entries
+    # Full by POSITION (the first five), and a semantic result only if its own
+    # tier was full (a non-reranked monologue memory moved below the keyword
+    # genuine hits past position five renders as a snippet).
+    return [
+        (
+            mem,
+            (mem.id in semantic_full_ids and position < FULL_INJECT_STANDOUT_MAX)
+            if mem.id in semantic_ids
+            else (position < FULL_INJECT_STANDOUT_MAX or mem.id in promoted),
+        )
+        for position, mem in enumerate(merged)
+    ]
 
 
 def _render_active_lines(entries: list[tuple[object, bool]]) -> list[str]:

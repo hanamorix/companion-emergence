@@ -298,8 +298,29 @@ def test_the_tool_surfaces_the_same_family_memories_on_the_cosine_path(
     _cosine_floor(store, 0.4)
     _no_reranker(monkeypatch)
 
-    # The tool tops the semantic results up from its keyword side, so compare the head.
-    assert _tool(tmp_path, store, limit=5)[:3] == _ids(family)
+    import brain.tools.impls.search_memories as tool
+
+    captured: list = []
+    real = tool._semantic_top_k  # noqa: SLF001
+
+    def _spy(*args, **kwargs):
+        out = real(*args, **kwargs)
+        captured.append(out)
+        return out
+
+    monkeypatch.setattr(tool, "_semantic_top_k", _spy)
+    returned = _tool(tmp_path, store, limit=5)
+
+    # The semantic side surfaces the family memories on the cosine path. Since
+    # S97 (spec §4) a non-reranked monologue memory ranks below every keyword
+    # genuine hit, so in the returned list any of them comes after those.
+    (semantic,) = captured
+    assert [m.id for m, _ in semantic.grouped] == _ids(family)
+    assert {group for _, group in semantic.grouped} == {"cosine_family"}
+    position = {mid: i for i, mid in enumerate(returned)}
+    shown_genuine = [position[mid] for mid in _ids(genuine) if mid in position]
+    shown_family = [position[mid] for mid in _ids(family) if mid in position]
+    assert all(g < f for g in shown_genuine for f in shown_family)
 
 
 def test_family_memories_take_rerank_slots_only_after_every_genuine_one(

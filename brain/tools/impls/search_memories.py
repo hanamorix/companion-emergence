@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -17,8 +18,9 @@ from brain.memory.relevance import (
     snippet_length,
 )
 from brain.memory.semantic_recall import (
-    assemble_paragraph_results,
+    assemble_with_guarantees,
     genuine_first_memories,
+    merge_with_keyword,
     search_paragraphs,
 )
 from brain.memory.store import Memory, MemoryStore, split_by_raw_query_floor
@@ -178,18 +180,14 @@ def _lexical_candidates(
     return first
 
 
-def _merge_keyword_below_semantic(
-    semantic: list[Memory], keyword: list[Memory], *, cap: int
-) -> list[Memory]:
-    """The semantic results, then the keyword hits that are not already
-    semantic hits, in the slots the semantic results leave under ``cap``
-    (spec §5: keyword hits fill the leftover slots and take the next
-    positions; a memory found by both keeps its semantic position, once; no
-    slot is reserved for a keyword hit)."""
-    taken = {m.id for m in semantic}
-    room = max(0, cap - len(semantic))
-    fill = [m for m in keyword if m.id not in taken][:room]
-    return [*semantic, *fill]
+@dataclass(frozen=True)
+class _SemanticTopK:
+    """The semantic side of a call (name-recall fix R6, S97/S98): each
+    result with its result group, in the semantic order, and the guaranteed
+    ids in their S64 order (``semantic_recall.merge_with_keyword`` input)."""
+
+    grouped: list[tuple[Memory, str]]
+    guaranteed: list[str]
 
 
 def _semantic_top_k(
@@ -199,7 +197,7 @@ def _semantic_top_k(
     *,
     limit: int,
     exclude: frozenset[str],
-) -> list[Memory] | None:
+) -> _SemanticTopK | None:
     """Top-K semantically matched memories for an ACTIVE search call.
 
     #231 RERANKER RE-ARCHITECTURE (Q1, resolved 2026-09-10), per paragraph
@@ -228,8 +226,10 @@ def _semantic_top_k(
     was not computed yet, or failed) — this returns ``None`` (the tool's EXISTING empty-semantic→
     lexical fallback — never returns nothing, never hands back semantic junk
     that never cleared a floor). Otherwise returns up to ``limit``
-    floor-clearing memories in the spec §4 order across paragraphs
-    (``semantic_recall.assemble_paragraph_results``): reranked genuine,
+    floor-clearing memories, each with its result group, and the guaranteed
+    ids, in the spec §4 order across paragraphs
+    (``semantic_recall.assemble_with_guarantees``; the caller merges the
+    keyword hits in with ``merge_with_keyword``, S97/S98): reranked genuine,
     reranked monologue-family, cosine-path genuine (each cosine-path
     paragraph's best genuine memory at its head), cosine-scale
     monologue-family (including every reranked paragraph's cosine tail, S82,
@@ -273,10 +273,13 @@ def _semantic_top_k(
             return None
         # The per-paragraph assembly (spec §3/§4, S64): each result faces only
         # its own scale's floor; guaranteed slots per paragraph within `limit`.
-        assembled = assemble_paragraph_results(search, limit)
+        assembled, guaranteed = assemble_with_guarantees(search, limit)
         if not assembled:
             return None
-        return [search.pool[hit.memory_id][0] for hit in assembled]
+        return _SemanticTopK(
+            grouped=[(search.pool[hit.memory_id][0], hit.group) for hit in assembled],
+            guaranteed=guaranteed,
+        )
     except Exception:  # noqa: BLE001 — fail-soft: ANY failure demotes to lexical, never raises
         logger.warning(
             "search_memories(semantic): semantic path failed — falling back to lexical",
@@ -303,9 +306,11 @@ def search_memories(
       - ``"semantic"``: embeds ``query`` once and ranks the persona's cached
         memory vectors (see ``_semantic_top_k``). Meaning-based — catches a
         paraphrase with no shared keyword. Name-recall fix R4 (spec §5): the
-        keyword search (below) is merged in under the semantic results,
-        filling only the slots they leave under ``limit``; a memory found by
-        both appears once, at its semantic position. Fails soft to
+        keyword search (below) is merged with the semantic results in the
+        six-group order of ``dev_constants.RECALL_RESULT_GROUP_ORDER`` (spec
+        §4, S97/S98: keyword genuine hits above the non-reranked
+        monologue-family results), under ``limit``; a memory found by both
+        appears once, as a semantic result. Fails soft to
         ``"lexical"`` the instant semantic retrieval can't run right now (no
         cached vectors yet / embedding model unavailable / any embed error /
         nothing clearing a floor) — the returned ``mode`` reflects the path
@@ -412,7 +417,11 @@ def search_memories(
                 store, hebbian, query, exclude=exclude, persona_dir=persona_dir
             )
             tier2_only = getattr(keyword, "tier2_only", frozenset())
-            candidates = _merge_keyword_below_semantic(semantic, keyword, cap=fetch_limit)
+            # Spec §4, S97/S98: the six result groups in the dev-constants
+            # order, each paragraph's guaranteed slot kept first.
+            candidates = merge_with_keyword(
+                semantic.grouped, keyword, cap=fetch_limit, guaranteed=semantic.guaranteed
+            )
     if candidates is None:
         candidates = _lexical_candidates(
             store, hebbian, query, limit=fetch_limit, exclude=exclude, persona_dir=persona_dir

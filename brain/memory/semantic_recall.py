@@ -86,13 +86,13 @@ import logging
 import re
 import threading
 import time
-from collections.abc import Callable, Collection, Iterable
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
 
-from brain import tunables
+from brain import dev_constants, tunables
 from brain.dev_constants import MONOLOGUE_FAMILY_TYPES, RERANK_MIN_REAL_CANDIDATES
 from brain.memory import embeddings as embeddings_mod
 from brain.memory import floor_startup
@@ -355,6 +355,21 @@ class SemanticRecallResult:
     total_width: int = 0
     budget: float | None = None
     rerank_budget: float | None = None
+    # Spec §3/§7 (S33, S55, S64): the guaranteed results' ids (each
+    # paragraph's best floor-clearing genuine memory), reranked-path ones by
+    # normalized score, then cosine-path ones by cosine. The final merge with
+    # the keyword hits (`merge_with_keyword`, S97/S98) keeps them first.
+    guaranteed_ids: tuple[str, ...] = ()
+
+    def grouped(self) -> list[tuple[Memory, str]]:
+        """`full` + `snippet` in order, each with its result group (spec §4,
+        S97): from its hit's path when `hits` has it, else from this result's
+        own `path` (a result built by hand)."""
+        path_of = {hit.memory.id: hit.path for hit in self.hits}
+        return [
+            (memory, result_group(path_of.get(memory.id, self.path), is_monologue_family(memory)))
+            for memory in [*self.full, *self.snippet]
+        ]
 
 
 RERANKED_PATH = "reranked"
@@ -1096,10 +1111,10 @@ def search_paragraphs(
     query with its best cosine (ties: the earlier query), keeping that score
     (S11, S53); (6) the reranker's pair sizes per query, timed into its `T_p`
     sample (P-28; the one-time warm-up is not); (7) what is left of the
-    budget after `T_m + (queries) x T_p` (the averages, this message's
-    samples included) or after the time actually spent so far, whichever is
-    more, is split equally among the queries (S33, S46, S61: a one-query
-    message pays its embed + scan too); (8) the queries are served in order
+    budget after `T_m + (queries) x T_p` (the running averages, this
+    message's samples included) is split equally among the queries (S33,
+    S46, S61: a one-query message pays its embed + scan too); (8) the
+    queries are served in order
     of best cosine, each `rank_and_gate`d on its own candidates, text and
     anchors within its share and what is left of the 50 real candidates
     (S58): reranked, else the cosine path; passive recall logs each query's
@@ -1141,8 +1156,7 @@ def search_paragraphs(
     except Exception:  # noqa: BLE001 — fail-soft
         log.exception("semantic recall: embedding provider unavailable — falling back to lexical")
         return None
-    one_time = _clock() - before_provider
-    _message_overhead.record(_clock() - start - one_time)
+    _message_overhead.record(before_provider - start)
     overhead = _message_overhead.average() or 0.0
 
     def is_family(mid: str) -> bool:
@@ -1213,10 +1227,10 @@ def search_paragraphs(
     if rerankable:
         try:
             reranker_provider = reranker_mod.build_reranker_provider(store=store)
-            began = _clock()
+            # The one-time warm-up (plan P-1) runs before the probes are
+            # timed, so the ONNX session load never lands in `T_p`.
             first_docs = _prefix_documents(pool, assigned[rerankable[0]])
             reranker_mod.warm_up_for_recall(reranker_provider, queries[rerankable[0]], first_docs)
-            one_time += _clock() - began
             for qi in rerankable:
                 began = _clock()
                 sizes[qi] = reranker_mod.recall_pair_sizes(
@@ -1229,14 +1243,10 @@ def search_paragraphs(
     for sample in samples:
         _paragraph_time.record(sample)
 
-    # The rerank budget (S46, S61): the budget minus T_m and every query's
-    # T_p (the averages, including this message's samples), or minus the
-    # time actually spent so far if that is more (a wait on the embedder's
-    # lock, an unusually long batch), never below zero; shared equally (S33).
-    spent = max(
-        overhead + len(queries) * (_paragraph_time.average() or 0.0),
-        _clock() - start - one_time,
-    )
+    # The rerank budget (S46, S61; plan P-28): the budget minus T_m and every
+    # query's T_p, both the running averages of this process (this message's
+    # own samples included), never below zero; shared equally (S33).
+    spent = overhead + len(queries) * (_paragraph_time.average() or 0.0)
     rerank_budget = max(0.0, budget - spent)
     share = rerank_budget / len(queries)
 
@@ -1301,96 +1311,206 @@ class AssembledHit:
     paragraph: int
     monologue_family: bool
 
+    @property
+    def group(self) -> str:
+        return result_group(self.path, self.monologue_family)
 
-def assemble_paragraph_results(search: ParagraphSearch, cap: int) -> list[AssembledHit]:
-    """The final semantic order across paragraphs, at most `cap` results
+
+# The six result groups of a recall (spec §4, S97). Their ORDER is
+# `dev_constants.RECALL_RESULT_GROUP_ORDER` (S98), read at call time; the
+# names here are the identifiers that list uses.
+RERANKED_GENUINE = "reranked_genuine"
+RERANKED_FAMILY = "reranked_family"
+COSINE_GENUINE = "cosine_genuine"
+KEYWORD_GENUINE = "keyword_genuine"
+COSINE_FAMILY = "cosine_family"
+KEYWORD_FAMILY = "keyword_family"
+RESULT_GROUPS = frozenset(
+    {RERANKED_GENUINE, RERANKED_FAMILY, COSINE_GENUINE, KEYWORD_GENUINE, COSINE_FAMILY, KEYWORD_FAMILY}
+)
+
+
+def result_group(path: str, monologue_family: bool) -> str:
+    """The group of a semantic result: by the scale that gated it and whether
+    it is a monologue-family memory. A monologue-family memory on the cosine
+    scale (the cosine path, or a reranked paragraph's unreranked tail) is
+    `COSINE_FAMILY`, the non-reranked family group of S97."""
+    if path == RERANKED_PATH:
+        return RERANKED_FAMILY if monologue_family else RERANKED_GENUINE
+    return COSINE_FAMILY if monologue_family else COSINE_GENUINE
+
+
+def result_group_order() -> tuple[str, ...]:
+    """`dev_constants.RECALL_RESULT_GROUP_ORDER`, read now (S98), checked to
+    name each of the six groups exactly once (`ValueError` otherwise)."""
+    order = tuple(dev_constants.RECALL_RESULT_GROUP_ORDER)
+    if len(order) != len(RESULT_GROUPS) or set(order) != RESULT_GROUPS:
+        raise ValueError(
+            f"dev_constants.RECALL_RESULT_GROUP_ORDER must name each of {sorted(RESULT_GROUPS)} "
+            f"exactly once, got {order!r}"
+        )
+    return order
+
+
+def order_result_groups(
+    groups: Mapping[str, Sequence[str]], cap: int, guaranteed: Sequence[str] = ()
+) -> list[str]:
+    """The final result ids, at most `cap` (spec §3, §4, §7; S33, S55, S64,
+    S97, S98; plan P-10): the `guaranteed` ids are kept first, in the order
+    given (the S64 order), up to `cap` (the excess dropped); the remaining
+    slots go to the other ids in group order (`result_group_order()`), each
+    group in its own order. The kept ids are returned in group order; an id
+    listed in more than one group counts once, at its first group in that
+    order. A guaranteed id must be in one of `groups`."""
+    order = result_group_order()
+    cap = max(cap, 0)
+    in_order = list(dict.fromkeys(mid for name in order for mid in groups.get(name, ())))
+    listed = set(in_order)
+    kept: set[str] = set()
+    for mid in guaranteed:
+        if len(kept) >= cap:
+            break
+        if mid in listed:
+            kept.add(mid)
+    for mid in in_order:
+        if len(kept) >= cap:
+            break
+        kept.add(mid)
+    return [mid for mid in in_order if mid in kept]
+
+
+def paragraph_result_groups(
+    search: ParagraphSearch,
+) -> tuple[dict[str, list[AssembledHit]], list[AssembledHit]]:
+    """Every floor-clearing semantic result of a message, by group, each
+    group in its own order, and the guaranteed results in the S64 order
     (spec §3, §4, §7; plan P-10; criteria C8b, C8c):
 
-      RG  reranked genuine results, by anchor-normalized score across paragraphs;
-      RM  reranked monologue-family results, the same way;
-      CG  cosine-path genuine results: each cosine-path paragraph's best
-          genuine memory at the head (by cosine), then the rest by cosine;
-      CM  cosine-scale monologue-family results by cosine: those of cosine-path
-          paragraphs and every reranked paragraph's cosine tail (S82), regrouped
-          after all cosine-path genuine results and de-duplicated (S86).
+      reranked genuine / reranked family: by anchor-normalized score across
+          paragraphs;
+      cosine genuine: each cosine-path paragraph's best genuine memory at the
+          head (by cosine), then the rest by cosine;
+      cosine family: the monologue-family results on the cosine scale by
+          cosine, those of cosine-path paragraphs and every reranked
+          paragraph's cosine tail (S82), regrouped across paragraphs and
+          de-duplicated (S86).
 
     Only results that clear their own path's floor enter (scales are never
     compared: reranked groups sort by normalized score, cosine groups by
-    cosine). Guaranteed slots (S33, S44, S55, S64): each reranked paragraph's
-    best genuine result, then each cosine-path paragraph's, are kept first,
-    reranked ones by normalized score, then cosine-path ones by cosine; past
-    `cap` the excess guarantees are dropped; a paragraph whose best genuine
-    memory does not clear its floor (or that has only monologue-family
-    results) has none. The remaining slots go to the other results in group
-    order. The kept results are returned in group order."""
+    cosine). Guaranteed (S33, S44, S55, S64): each reranked paragraph's best
+    genuine result, by normalized score, then each cosine-path paragraph's,
+    by cosine; a paragraph whose best genuine memory does not clear its floor
+    (or that has only monologue-family results) has none."""
     pool = search.pool
 
     def family(mid: str) -> bool:
         return is_monologue_family(pool[mid][0])
 
-    rg: list[AssembledHit] = []
-    rm: list[AssembledHit] = []
-    cg: list[AssembledHit] = []
-    cm: list[AssembledHit] = []
+    members: dict[str, list[AssembledHit]] = {
+        RERANKED_GENUINE: [],
+        RERANKED_FAMILY: [],
+        COSINE_GENUINE: [],
+        COSINE_FAMILY: [],
+    }
     guaranteed_reranked: list[AssembledHit] = []
     guaranteed_cosine: list[AssembledHit] = []
     for outcome in search.outcomes:
         gated = outcome.gated
         if gated is None:
             continue
-        own = [
-            AssembledHit(mid, score, gated.path, outcome.index, family(mid))
+        rankings = [gated] if gated.tail is None else [gated, gated.tail]
+        for ranking in rankings:
+            for mid, score in ranking.ranked:
+                if score >= ranking.pass_mark:
+                    hit = AssembledHit(mid, score, ranking.path, outcome.index, family(mid))
+                    members[hit.group].append(hit)
+        own_genuine = [
+            AssembledHit(mid, score, gated.path, outcome.index, False)
             for mid, score in gated.ranked
-            if score >= gated.pass_mark
+            if score >= gated.pass_mark and not family(mid)
         ]
-        genuine = [hit for hit in own if not hit.monologue_family]
-        fam = [hit for hit in own if hit.monologue_family]
-        if gated.path == RERANKED_PATH:
-            rg += genuine
-            rm += fam
-            if genuine:
-                guaranteed_reranked.append(max(genuine, key=lambda hit: hit.score))
-        else:
-            cg += genuine
-            cm += fam
-            if genuine:
-                guaranteed_cosine.append(max(genuine, key=lambda hit: hit.score))
-        if gated.tail is not None:
-            cm += [
-                AssembledHit(mid, score, gated.tail.path, outcome.index, family(mid))
-                for mid, score in gated.tail.ranked
-                if score >= gated.tail.pass_mark
-            ]
+        if own_genuine:
+            best = max(own_genuine, key=lambda hit: hit.score)
+            (guaranteed_reranked if gated.path == RERANKED_PATH else guaranteed_cosine).append(best)
 
     def by_score(hits: list[AssembledHit]) -> list[AssembledHit]:
         return sorted(hits, key=lambda hit: -hit.score)
 
-    guarantees = (by_score(guaranteed_reranked) + by_score(guaranteed_cosine))[: max(cap, 0)]
-    kept = {hit.memory_id for hit in guarantees}
-    cosine_heads = [hit for hit in by_score(guaranteed_cosine) if hit.memory_id in kept]
-    head_ids = {hit.memory_id for hit in cosine_heads}
-    groups = [
-        by_score(rg),
-        by_score(rm),
-        cosine_heads + [hit for hit in by_score(cg) if hit.memory_id not in head_ids],
-        by_score(cm),
-    ]
-    room = max(cap, 0) - len(kept)
-    for group in groups:
-        for hit in group:
-            if room <= 0:
-                break
-            if hit.memory_id not in kept:
-                kept.add(hit.memory_id)
-                room -= 1
-    ordered: list[AssembledHit] = []
-    seen: set[str] = set()
-    for group in groups:
-        for hit in group:
-            if hit.memory_id in kept and hit.memory_id not in seen:
+    def first_per_id(hits: list[AssembledHit]) -> list[AssembledHit]:
+        seen: set[str] = set()
+        out = []
+        for hit in hits:
+            if hit.memory_id not in seen:
                 seen.add(hit.memory_id)
-                ordered.append(hit)
-    return ordered
+                out.append(hit)
+        return out
+
+    heads = by_score(guaranteed_cosine)
+    head_ids = {hit.memory_id for hit in heads}
+    groups = {
+        RERANKED_GENUINE: by_score(members[RERANKED_GENUINE]),
+        RERANKED_FAMILY: by_score(members[RERANKED_FAMILY]),
+        COSINE_GENUINE: heads
+        + [hit for hit in by_score(members[COSINE_GENUINE]) if hit.memory_id not in head_ids],
+        COSINE_FAMILY: first_per_id(by_score(members[COSINE_FAMILY])),
+    }
+    return groups, by_score(guaranteed_reranked) + heads
+
+
+def assemble_paragraph_results(search: ParagraphSearch, cap: int) -> list[AssembledHit]:
+    """The semantic results alone, in the final order, at most `cap`
+    (`paragraph_result_groups` then `order_result_groups` with no keyword
+    hits): the guaranteed results first, the rest in group order."""
+    return assemble_with_guarantees(search, cap)[0]
+
+
+def assemble_with_guarantees(search: ParagraphSearch, cap: int) -> tuple[list[AssembledHit], list[str]]:
+    """`assemble_paragraph_results`, plus every guaranteed id in the S64
+    order (whether or not the cap kept it)."""
+    groups, guaranteed = paragraph_result_groups(search)
+    by_id: dict[str, AssembledHit] = {}
+    for name in result_group_order():
+        for hit in groups.get(name, ()):
+            by_id.setdefault(hit.memory_id, hit)
+    guaranteed_ids = [hit.memory_id for hit in guaranteed]
+    ids = order_result_groups(
+        {name: [hit.memory_id for hit in hits] for name, hits in groups.items()},
+        cap,
+        guaranteed_ids,
+    )
+    return [by_id[mid] for mid in ids], guaranteed_ids
+
+
+def merge_with_keyword(
+    semantic: Sequence[tuple[Memory, str]],
+    keyword: Sequence[Memory],
+    *,
+    cap: int,
+    guaranteed: Sequence[str] = (),
+) -> list[Memory]:
+    """The final result list of a turn or a tool call with semantic results
+    (spec §4, S97, S98; I4): `semantic` is `(memory, group)` in the semantic
+    order, `keyword` the keyword hits in their own final order (name hits
+    first, genuine before monologue-family). A keyword hit that is also a
+    semantic result is dropped from the keyword side (dedup favors semantic,
+    I4); the rest split into the keyword genuine and keyword family groups.
+    The six groups are then ordered by `order_result_groups`, at most `cap`,
+    the `guaranteed` semantic ids (in their S64 order) kept first."""
+    by_id: dict[str, Memory] = {}
+    groups: dict[str, list[str]] = {name: [] for name in RESULT_GROUPS}
+    for memory, group in semantic:
+        if memory.id not in by_id:
+            by_id[memory.id] = memory
+            groups[group].append(memory.id)
+    for memory in keyword:
+        if memory.id not in by_id:
+            by_id[memory.id] = memory
+            groups[KEYWORD_FAMILY if is_monologue_family(memory) else KEYWORD_GENUINE].append(
+                memory.id
+            )
+    semantic_ids = {memory.id for memory, _ in semantic}
+    ids = order_result_groups(groups, cap, [mid for mid in guaranteed if mid in semantic_ids])
+    return [by_id[mid] for mid in ids]
 
 
 def run_semantic_recall(
@@ -1464,7 +1584,7 @@ def run_semantic_recall(
         )
         if search is None:
             return None
-        assembled = assemble_paragraph_results(search, MAX_STANDOUT_COUNT)
+        assembled, guaranteed_ids = assemble_with_guarantees(search, MAX_STANDOUT_COUNT)
         tiers = _surfacing([(hit.memory_id, hit.score) for hit in assembled])
         if tiers is None:
             return None
@@ -1502,6 +1622,7 @@ def run_semantic_recall(
             total_width=search.total_width,
             budget=search.budget,
             rerank_budget=search.rerank_budget,
+            guaranteed_ids=tuple(guaranteed_ids),
         )
     except Exception:  # noqa: BLE001 — fail-soft: ANY failure demotes to lexical, never raises
         log.warning(
