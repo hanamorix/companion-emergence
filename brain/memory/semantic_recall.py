@@ -546,8 +546,10 @@ def run_semantic_recall(
         normalization falls back, the coarse cut ranked by cosine, gated by
         the cosine floor (`store.get_cosine_floor`). Not keyword-only.
 
-    Both paths log one calibration row for the turn (each stamped with its
-    own true scale) and floor-gate through `select_standouts`.
+    Passive recall logs the turn's calibration row(s), each stamped with its
+    own true scale (normally one; a turn whose rerank scored but whose
+    rerank floor was unavailable logs the `normalized` row, then the cosine
+    path's `cosine` row), and floor-gates through `select_standouts`.
 
     Returns a populated `SemanticRecallResult` ONLY when at least one
     candidate clears the operative floor of the path taken. Returns `None`

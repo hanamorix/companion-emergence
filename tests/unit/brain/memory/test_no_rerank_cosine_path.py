@@ -26,7 +26,11 @@ from brain.bridge import model_tier
 from brain.memory import floor_calibration
 from brain.memory import reranker as reranker_mod
 from brain.memory.embeddings import EmbeddingProvider
-from brain.memory.floor_calibration import FLOOR_FIT_BETA, fit_threshold_fbeta
+from brain.memory.floor_calibration import (
+    FLOOR_FIT_BETA,
+    fit_threshold_fbeta,
+    threshold_separates,
+)
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.reranker import (
     _FP16_GATE_PAIRS,
@@ -233,9 +237,9 @@ def test_uncalibrated_cosine_floor_is_the_fbeta_fit_over_the_bundled_pairs(
     for q, d in labeled:
         a, b = embedder.embed(q), embedder.embed(d)
         cosines.append(float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))))
-    expected = fit_threshold_fbeta(
-        list(zip(cosines, ["relevant"] * 3 + ["irrelevant"] * 3, strict=True)), beta=FLOOR_FIT_BETA
-    )
+    labeled_cosines = list(zip(cosines, ["relevant"] * 3 + ["irrelevant"] * 3, strict=True))
+    expected = fit_threshold_fbeta(labeled_cosines, beta=FLOOR_FIT_BETA)
+    assert threshold_separates(labeled_cosines, expected), "test precondition: a gating bootstrap"
 
     store = MemoryStore(tmp_path / "memories.db")
     high = [0.9, 0.8]

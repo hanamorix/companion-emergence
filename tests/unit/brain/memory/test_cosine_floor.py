@@ -47,6 +47,51 @@ def store() -> MemoryStore:
     return MemoryStore(db_path=":memory:")
 
 
+_SEP_ID = "separable-embedder"
+_SEP_DIM = 16
+
+
+def _sep_table(*, relevant: list[float], irrelevant: list[float]) -> tuple[dict[str, np.ndarray], list[float]]:
+    """Vectors for the six bundled pairs whose cosines are exactly `relevant`
+    (pairs 1-3) and `irrelevant` (pairs 4-6), with the texts the pairs share
+    (the calm-down query is also pair 4's document and pair 6's query) placed
+    so every pair keeps its own cosine. Returns (table, cosines in pair order)."""
+    pairs = _FP16_GATE_PAIRS[:6]
+    (q1, d1), (q2, d2), (q3, d3), (q4, d4), (q5, d5), (q6, d6) = pairs
+    assert d4 == q1 and q6 == q1, "the bundled set's shared text this fixture relies on"
+
+    def unit(i: int) -> np.ndarray:
+        v = np.zeros(_SEP_DIM, dtype=np.float32)
+        v[i] = 1.0
+        return v
+
+    def near(i: int, j: int, c: float) -> np.ndarray:
+        return (c * unit(i) + float(np.sqrt(1.0 - c * c)) * unit(j)).astype(np.float32)
+
+    table = {
+        q1: unit(0),
+        d1: near(0, 1, relevant[0]),
+        q2: unit(2), d2: near(2, 3, relevant[1]),
+        q3: unit(4), d3: near(4, 5, relevant[2]),
+        q4: near(0, 6, irrelevant[0]),
+        q5: unit(7), d5: near(7, 8, irrelevant[1]),
+        d6: near(0, 9, irrelevant[2]),
+    }
+    return table, [*relevant, *irrelevant]
+
+
+class _SeparableEmbedder(FakeEmbeddingProvider):
+    def __init__(self, table: dict[str, np.ndarray]) -> None:
+        super().__init__(dim=_SEP_DIM)
+        self._table = table
+
+    def embed(self, text: str) -> np.ndarray:
+        return self._table[text]
+
+    def model_id(self) -> str:
+        return _SEP_ID
+
+
 def _insert_row(
     store: MemoryStore,
     scores: list[float],
@@ -105,10 +150,12 @@ def test_get_cosine_floor_prefers_the_persisted_row_over_the_bootstrap(
 def test_get_cosine_floor_serves_the_never_persisted_bootstrap_on_a_miss(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    table, _ = _sep_table(relevant=[0.9, 0.85, 0.8], irrelevant=[0.2, 0.1, 0.2])
+    monkeypatch.setattr("brain.memory.embeddings.build_embedding_provider", lambda: _SeparableEmbedder(table))
     monkeypatch.setattr(floor_calibration, "get_cosine_bootstrap_floor", _REAL_COSINE_BOOTSTRAP)
-    floor = store.get_cosine_floor(_EMBEDDER_ID)
+    floor = store.get_cosine_floor(_SEP_ID)
     assert floor is not None and floor["is_cold_start"] is True and floor["updated_at"] is None
-    assert store.get_persisted_cosine_floor(_EMBEDDER_ID) is None
+    assert store.get_persisted_cosine_floor(_SEP_ID) is None
 
 
 def test_a_persisted_cosine_row_does_not_trip_the_rerank_floor_stale_scale_check(store: MemoryStore) -> None:
@@ -217,7 +264,8 @@ def test_labeled_pairs_read_only_the_requested_scale(store: MemoryStore) -> None
 def test_bootstrap_is_the_fbeta_fit_over_the_bundled_pairs_cosines_cached_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    embedder = FakeEmbeddingProvider()
+    table, cosines = _sep_table(relevant=[0.9, 0.85, 0.8], irrelevant=[0.2, 0.1, 0.2])
+    embedder = _SeparableEmbedder(table)
     calls = {"batch": 0}
     real_batch = embedder.embed_batch
 
@@ -227,33 +275,38 @@ def test_bootstrap_is_the_fbeta_fit_over_the_bundled_pairs_cosines_cached_once(
 
     monkeypatch.setattr(embedder, "embed_batch", counting_batch)
     monkeypatch.setattr("brain.memory.embeddings.build_embedding_provider", lambda: embedder)
-
+    # Recomputed with plain numpy from the vectors the embedder hands out.
     labeled = _FP16_GATE_PAIRS[:6]
-    cosines = []
+    measured = []
     for q, d in labeled:
-        a, b = embedder.embed(q), embedder.embed(d)
-        cosines.append(float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))))
+        a, b = table[q], table[d]
+        measured.append(float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))))
+    assert measured == pytest.approx(cosines, abs=1e-6)
     expected = fit_threshold_fbeta(
-        list(zip(cosines, ["relevant"] * 3 + ["irrelevant"] * 3, strict=True)), beta=FLOOR_FIT_BETA
+        list(zip(measured, ["relevant"] * 3 + ["irrelevant"] * 3, strict=True)), beta=FLOOR_FIT_BETA
     )
+    assert 0.2 < expected <= 0.8, "test precondition: the fit is a real threshold between the classes"
 
-    first = _REAL_COSINE_BOOTSTRAP(_EMBEDDER_ID)
-    second = _REAL_COSINE_BOOTSTRAP(_EMBEDDER_ID)
+    first = _REAL_COSINE_BOOTSTRAP(_SEP_ID)
+    second = _REAL_COSINE_BOOTSTRAP(_SEP_ID)
 
     assert first is not None and first["floor"] == pytest.approx(expected)
-    assert first["embedder_model_id"] == _EMBEDDER_ID and first["is_cold_start"] is True
+    assert first["embedder_model_id"] == _SEP_ID and first["is_cold_start"] is True
     assert first["sample_pairs"] == 6 and second == first
     assert calls["batch"] == 1, "one embed_batch for the whole bundled set, computed once per process"
 
 
 def test_bootstrap_for_a_different_embedder_id_is_none_and_not_cached(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("brain.memory.embeddings.build_embedding_provider", lambda: FakeEmbeddingProvider())
+    table, _ = _sep_table(relevant=[0.9, 0.85, 0.8], irrelevant=[0.2, 0.1, 0.2])
+    monkeypatch.setattr("brain.memory.embeddings.build_embedding_provider", lambda: _SeparableEmbedder(table))
     assert _REAL_COSINE_BOOTSTRAP("some-other-embedder") is None
-    assert _REAL_COSINE_BOOTSTRAP(_EMBEDDER_ID) is not None, "a mismatch is not cached against the real id"
+    assert _REAL_COSINE_BOOTSTRAP(_SEP_ID) is not None, "a mismatch is not cached against the real id"
 
 
 def test_bootstrap_failure_returns_none_and_is_retried(monkeypatch: pytest.MonkeyPatch) -> None:
-    class _Boom(FakeEmbeddingProvider):
+    table, _ = _sep_table(relevant=[0.9, 0.85, 0.8], irrelevant=[0.2, 0.1, 0.2])
+
+    class _Boom(_SeparableEmbedder):
         fail = True
 
         def embed_batch(self, texts):
@@ -261,11 +314,20 @@ def test_bootstrap_failure_returns_none_and_is_retried(monkeypatch: pytest.Monke
                 raise RuntimeError("simulated embed failure")
             return super().embed_batch(texts)
 
-    embedder = _Boom()
+    embedder = _Boom(table)
     monkeypatch.setattr("brain.memory.embeddings.build_embedding_provider", lambda: embedder)
-    assert _REAL_COSINE_BOOTSTRAP(_EMBEDDER_ID) is None
+    assert _REAL_COSINE_BOOTSTRAP(_SEP_ID) is None
     embedder.fail = False
-    assert _REAL_COSINE_BOOTSTRAP(_EMBEDDER_ID) is not None
+    assert _REAL_COSINE_BOOTSTRAP(_SEP_ID) is not None
+
+
+def test_bootstrap_refuses_a_fit_that_gates_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An embedder that scores the decoys at or above the relevant pairs fits
+    'serve everything' (a threshold below every cosine): no gate is possible,
+    so no bootstrap is served (keyword-only), never a silent pass-all floor."""
+    table, _ = _sep_table(relevant=[0.80, 0.79, 0.78], irrelevant=[0.85, 0.86, 0.87])
+    monkeypatch.setattr("brain.memory.embeddings.build_embedding_provider", lambda: _SeparableEmbedder(table))
+    assert _REAL_COSINE_BOOTSTRAP(_SEP_ID) is None
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +463,34 @@ def test_a_single_class_cosine_day_holds_the_prior_row(store: MemoryStore, label
     out = derive_and_persist_cosine_floor(store, _EMBEDDER_ID)
     assert out.accepted is False and out.floor == pytest.approx(0.83)
     assert store.get_persisted_cosine_floor(_EMBEDDER_ID)["floor"] == pytest.approx(0.83)
+
+
+def _seed_skewed_day(store: MemoryStore, *, relevant_fraction: float, seed: int) -> None:
+    """The reviewer's regime: overlapping cosines, most labels one class. The
+    recall-leaning F-beta then picks 'serve everything' (a threshold below the
+    day's minimum), which gates nothing."""
+    rng = np.random.default_rng(seed)
+    n = FLOOR_FIT_MIN_LABELED_PAIRS + 16
+    for _ in range(n):
+        relevant = rng.random() < relevant_fraction
+        score = float(rng.normal(0.84 if relevant else 0.82, 0.03))
+        _insert_row(store, [score], ["relevant" if relevant else "irrelevant"], model_id=_EMBEDDER_ID,
+                    scale=COSINE_SCORE_SCALE)
+
+
+@pytest.mark.parametrize(("fraction", "seed"), [(0.7, 1), (0.8, 3), (0.95, 2)])
+def test_a_skewed_overlapping_cosine_day_never_persists_a_gates_nothing_floor(
+    store: MemoryStore, fraction: float, seed: int
+) -> None:
+    _seed_skewed_day(store, relevant_fraction=fraction, seed=seed)
+    pairs = store.labeled_calibration_pairs(_EMBEDDER_ID, COSINE_SCORE_SCALE)
+    raw = fit_threshold_fbeta(pairs, beta=FLOOR_FIT_BETA)
+    assert raw <= min(s for s, _ in pairs) or raw > max(s for s, _ in pairs), (
+        "test precondition: this day's raw fit is a pass-all/pass-none sentinel"
+    )
+    out = derive_and_persist_cosine_floor(store, _EMBEDDER_ID)
+    assert out.accepted is False and out.held_for_data_starvation
+    assert store.get_persisted_cosine_floor(_EMBEDDER_ID) is None
 
 
 def test_the_persisted_cosine_floor_stays_inside_the_cosine_range_for_two_class_days(store: MemoryStore) -> None:

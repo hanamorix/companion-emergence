@@ -287,6 +287,21 @@ def fit_threshold_fbeta(pairs: list[tuple[float, str]], *, beta: float) -> float
     return best_threshold
 
 
+def threshold_separates(pairs: list[tuple[float, str]], threshold: float) -> bool:
+    """True iff `threshold` splits `pairs`' scores into a non-empty passing
+    side and a non-empty failing side (name-recall fix R2, review N1/N4).
+
+    `fit_threshold_fbeta` answers with a sentinel one unit past the observed
+    scores when there is nothing to separate (one label class), and its
+    recall-leaning F-beta also picks the "serve everything" candidate when the
+    classes overlap heavily; both are built for unbounded logits. A threshold
+    that passes every score or none of them is not a gate. The COSINE floor
+    (legal range [-1, 1]) refuses such a fit rather than persist or serve it.
+    """
+    passing = sum(1 for score, _ in pairs if score >= threshold)
+    return 0 < passing < len(pairs)
+
+
 # ---------------------------------------------------------------------------
 # Cold-start bootstrap fit — reuses reranker.py's bundled pairs. Pre-flip
 # revision Change 1: the ONLY caller left is `get_bootstrap_floor` below —
@@ -538,6 +553,11 @@ def get_cosine_bootstrap_floor(embedder_model_id: str) -> dict[str, Any] | None:
             pairs = _cosine_bootstrap_pairs(embedder)
             beta = tunables.get_tunable("calibration.floor_fit_beta", FLOOR_FIT_BETA)
             floor = fit_threshold_fbeta(pairs, beta=beta)
+            if not threshold_separates(pairs, floor):
+                raise RuntimeError(
+                    f"the bundled pairs' cosines are not separated by any threshold "
+                    f"(fit {floor:.4f}); the embedder cannot gate"
+                )
         except Exception:  # noqa: BLE001 — fail-soft: must never break a recall
             logger.exception(
                 "floor_calibration: cosine bootstrap floor computation failed for %s -> "
@@ -629,10 +649,13 @@ class FloorDerivationOutcome:
     unrelated to this field."""
 
     held_for_data_starvation: bool
-    """True iff the most recently completed day's usable labeled-pair
-    count fell below `FLOOR_FIT_MIN_LABELED_PAIRS` this cycle (whether or
-    not a prior row existed to hold) — replaces the removed stability
-    gate's `held_for_stability`. Holds carry NO memory: the very next day
+    """True iff this cycle had no usable fit: the most recently completed
+    day's usable labeled-pair count fell below `FLOOR_FIT_MIN_LABELED_PAIRS`
+    (whether or not a prior row existed to hold), or — the cosine floor only,
+    name-recall fix R2 — its fit passed all or none of the day's scores
+    (`threshold_separates`), so `sample_pairs` can be at or above the minimum
+    with this flag set. Replaces the removed stability gate's
+    `held_for_stability`. Holds carry NO memory: the very next day
     that clears the threshold fits fresh from that day alone, with no
     dependence on however many prior holds preceded it (unlike the removed
     stability gate, which compared every later day against the same
@@ -729,7 +752,7 @@ def derive_and_persist_cosine_floor(
             is_cold_start=False,
         ),
         label="cosine floor calibration",
-        require_both_classes=True,
+        require_separating_threshold=True,
     )
 
 
@@ -740,20 +763,21 @@ def _fit_or_hold(
     read_prior: Callable[[], dict[str, Any] | None],
     write: Callable[[float, int], None],
     label: str,
-    require_both_classes: bool = False,
+    require_separating_threshold: bool = False,
 ) -> FloorDerivationOutcome:
     """The fit-or-hold core both floors share (Change 1's "nimble floor"
     mechanism, unchanged): a day with `>= FLOOR_FIT_MIN_LABELED_PAIRS` labeled
     pairs is fit and persisted directly; otherwise the data-starvation
     backstop holds the persisted prior (or writes nothing when there is none).
 
-    `require_both_classes` (the cosine floor, name-recall fix R2 review F1):
-    a day whose labeled pairs are all one class has nothing to separate, and
-    `fit_threshold_fbeta`'s answer for it is a sentinel one unit past the
-    observed scores (built for unbounded logits). On the cosine scale
-    (legal range [-1, 1]) that is a floor no cosine can reach (all
-    irrelevant: every no-rerank turn abstains, held until a later day has
-    200 labeled pairs) or one that gates nothing (all relevant). Such a day
+    `require_separating_threshold` (the cosine floor, name-recall fix R2
+    review F1/N1): a fit that passes every one of the day's scores, or none of
+    them, is not a gate (`threshold_separates`). That is what
+    `fit_threshold_fbeta` returns for a single-class day (a sentinel one unit
+    past the observed scores, built for unbounded logits) and for a heavily
+    overlapping or skewed day where "serve everything" maximises its
+    recall-leaning F-beta. On the cosine scale (legal range [-1, 1]) that
+    persists a floor no cosine can reach or one that gates nothing. Such a day
     is treated as no usable fit: hold the prior, or write nothing while the
     bootstrap serves. The rerank floor keeps its pre-R2 behaviour.
     """
@@ -763,16 +787,18 @@ def _fit_or_hold(
     )
 
     fit_is_usable = len(real_pairs) >= min_labeled_pairs
-    if fit_is_usable and require_both_classes and len({lab for _, lab in real_pairs}) < 2:
+    raw_floor = fit_threshold_fbeta(real_pairs, beta=beta) if fit_is_usable else None
+    if raw_floor is not None and require_separating_threshold and not threshold_separates(
+        real_pairs, raw_floor
+    ):
         logger.info(
-            "%s: the day's %d labeled pairs for %s are all one class — no threshold to fit, "
-            "treating as no usable fit",
-            label, len(real_pairs), model_id,
+            "%s: the day's %d labeled pairs for %s fit a threshold (%.4f) that passes all or none "
+            "of them — no gate to persist, treating as no usable fit",
+            label, len(real_pairs), model_id, raw_floor,
         )
         fit_is_usable = False
 
-    if fit_is_usable:
-        raw_floor = fit_threshold_fbeta(real_pairs, beta=beta)
+    if fit_is_usable and raw_floor is not None:
         write(raw_floor, len(real_pairs))
         logger.info(
             "%s: wrote raw floor=%.4f for %s, sample_pairs=%d (no EMA, no gate)",
@@ -788,8 +814,8 @@ def _fit_or_hold(
         )
 
     # Data-starvation backstop: the most recently completed day did not
-    # clear FLOOR_FIT_MIN_LABELED_PAIRS (or, for the cosine floor, held one
-    # class only). Read the PERSISTED-ONLY prior row
+    # clear FLOOR_FIT_MIN_LABELED_PAIRS (or, for the cosine floor, fit a
+    # threshold that gates nothing). Read the PERSISTED-ONLY prior row
     # (never the transient bootstrap the floor getter would otherwise serve
     # on a miss) so the no-prior-row edge case below is judged on whether a
     # REAL row exists, not on whether SOME floor is servable.
