@@ -357,6 +357,28 @@ def genuine_first(ids: list[str], pool: dict[str, tuple[Memory, np.ndarray]]) ->
     return genuine + family
 
 
+def genuine_first_coarse_cut(
+    cosine_scored: list[tuple[str, float]],
+    pool: dict[str, tuple[Memory, np.ndarray]],
+    size: int = CANDIDATE_POOL,
+) -> list[tuple[str, float]]:
+    """The `size`-candidate coarse cut of `cosine_scored`, filled genuine-first
+    (name-recall fix R3 follow-up, spec §4, S77): every genuine memory by
+    descending cosine, then monologue-family memories by descending cosine for
+    any places left. A monologue-family memory therefore can never keep a
+    genuine one out of the pool, however many of them out-score it.
+
+    One sort over the scored list (the family flag is computed once per entry
+    as part of the sort key); no second scan of the pool. Ties keep input
+    order, as the plain cosine sort did. `cosine_scored` may arrive unsorted.
+    """
+    ordered = sorted(
+        cosine_scored,
+        key=lambda pair: (is_monologue_family(pool[pair[0]][0]), -pair[1]),
+    )
+    return ordered[:size]
+
+
 def genuine_first_ranking(
     scored: list[tuple[str, float]], pool: dict[str, tuple[Memory, np.ndarray]]
 ) -> list[tuple[str, float]]:
@@ -674,8 +696,8 @@ def run_semantic_recall(
         cosine_scored = [
             (mid, cosine_similarity(query_vec, vec)) for mid, (_, vec) in pool.items()
         ]
-        cosine_scored.sort(key=lambda pair: -pair[1])
-        coarse = cosine_scored[:CANDIDATE_POOL]
+        # Spec §4, S77: the 50-candidate pool is filled genuine-first.
+        coarse = genuine_first_coarse_cut(cosine_scored, pool)
 
         gated = rank_and_gate(
             store,

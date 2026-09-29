@@ -11,7 +11,11 @@ from brain.memory.embedding_matrix import build_embedding_matrix
 from brain.memory.embeddings import cosine_similarity
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.relevance import CANDIDATE_POOL, rank_memories, snippet_length
-from brain.memory.semantic_recall import build_semantic_candidate_pool, rank_and_gate
+from brain.memory.semantic_recall import (
+    build_semantic_candidate_pool,
+    genuine_first_coarse_cut,
+    rank_and_gate,
+)
 from brain.memory.store import Memory, MemoryStore
 from brain.tools.impls._common import _mem_to_result
 
@@ -206,8 +210,8 @@ def _semantic_top_k(
         ]
         if not cosine_scored:
             return None
-        cosine_scored.sort(key=lambda pair: -pair[1])
-        coarse = cosine_scored[:CANDIDATE_POOL]
+        # Spec §4, S77: the 50-candidate pool is filled genuine-first.
+        coarse = genuine_first_coarse_cut(cosine_scored, pool)
 
         gated = rank_and_gate(
             store,
