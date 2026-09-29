@@ -99,6 +99,8 @@ def test_a_multi_word_name_is_unaffected_by_the_nt_skip():
     known = KnownNames.from_names(["don juan"])
     assert match_known_names("Don Juan sailed", known) == ["don juan"]
     assert match_known_names("don juan'", known) == ["don juan"]
+    # the skip is for a SINGLE-word name only: a multi-word name ending an "x't" stays matched
+    assert match_known_names("new york't", KnownNames.from_names(["new york"])) == ["new york"]
 
 
 def test_names_in_inherits_the_nt_skip(tmp_path):
