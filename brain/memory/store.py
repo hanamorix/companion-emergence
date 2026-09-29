@@ -498,7 +498,8 @@ CREATE TABLE IF NOT EXISTS reranker_floor_calibration (
 -- re-fit it forever. Same columns as the rerank floor minus `score_scale` (the
 -- scale is the table). Written only by the daily calibration tick
 -- (`floor_calibration.derive_and_persist_cosine_floor`); until a row exists,
--- `MemoryStore.get_cosine_floor` serves a derived, never-persisted bootstrap.
+-- `MemoryStore.get_cosine_floor` serves the process-cached, never-persisted
+-- bootstrap the central cadence job computed (S85), or None before it ran.
 -- `CREATE TABLE IF NOT EXISTS` on open: legacy-safe and idempotent (I9), no
 -- existing table or row is touched.
 CREATE TABLE IF NOT EXISTS cosine_floor_calibration (

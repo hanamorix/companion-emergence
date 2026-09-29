@@ -649,7 +649,8 @@ def _cosine_tail(
     cosine and gated by the COSINE floor, on the cosine scale, ranked through
     `_cosine_ranking` but WRITING NO calibration row (S84: the daily cosine fit
     trains only on no-rerank-path rows, never on a family-only sample;
-    diagnostics still record the tail). Unreranked
+    the examined tail stays on `GatedRanking.tail` / `SemanticRecallResult.
+    tail_scores` for the diagnostics record, R7). Unreranked
     GENUINE candidates are not part of the tail (S53: candidates beyond the
     width are dropped). `None` when there is no such candidate (the cosine
     floor is then not even read) or the cosine floor cannot be had; fail-soft:

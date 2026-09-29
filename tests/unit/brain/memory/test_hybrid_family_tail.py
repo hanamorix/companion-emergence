@@ -329,8 +329,8 @@ def test_a_cosine_floor_failure_keeps_the_reranked_results(
 def test_a_missing_cosine_floor_keeps_the_reranked_results(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """`get_cosine_floor` returning None (the bootstrap failed) is a tail
-    without a gate: no tail, the reranked results stand."""
+    """`get_cosine_floor` returning None (no bootstrap yet, or it failed) is a
+    tail without a gate: no tail, the reranked results stand."""
     store, genuine, family, rec = _first_rerank_case(monkeypatch, tmp_path, cosine_floor=0.5)
     monkeypatch.setattr(store, "get_cosine_floor", lambda model_id: None)
 

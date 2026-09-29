@@ -171,7 +171,7 @@ def run_central_pass(
 
     def _decide(job: str, action: str) -> None:
         decisions.append(JobDecision(job, action))
-        # skip-not-due fires for most jobs on most passes (14 lines a minute
+        # skip-not-due fires for most jobs on most passes (15 lines a minute
         # while idle); keep it out of the INFO log. Every other decision is INFO.
         level = logging.DEBUG if action == "skip-not-due" else logging.INFO
         logger.log(level, "central cadence: job=%s action=%s", job, action)

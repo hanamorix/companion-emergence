@@ -141,6 +141,48 @@ def test_a_failing_bootstrap_backs_off_exponentially_with_a_cap(
     assert len(calls) == 9
 
 
+def test_the_back_off_window_starts_when_the_failed_attempt_ended(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow failing embed (100 s here) must not eat its own back-off window:
+    the next attempt is not due until INITIAL seconds after it ENDED."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(floor_calibration.time, "monotonic", lambda: clock["t"])
+
+    def _slow_failure(_id):
+        clock["t"] += 100.0
+        return None
+
+    monkeypatch.setattr(floor_calibration, "get_cosine_bootstrap_floor", _slow_failure)
+    first = floor_calibration.COSINE_BOOTSTRAP_BACKOFF_INITIAL_S
+
+    assert floor_calibration.run_cosine_bootstrap("emb") is None
+
+    assert clock["t"] == 1100.0
+    assert not floor_calibration.cosine_bootstrap_due("emb", now=1100.0)
+    assert not floor_calibration.cosine_bootstrap_due("emb", now=1100.0 + first - 0.001)
+    assert floor_calibration.cosine_bootstrap_due("emb", now=1100.0 + first)
+
+
+def test_a_persisted_row_outranks_a_cached_bootstrap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Once the daily tick has written a calibrated row it supersedes the
+    process-cached bootstrap, even though the cache is still populated."""
+    _counting_bootstrap(monkeypatch)
+    assert floor_calibration.run_cosine_bootstrap("emb", now=0.0) is not None
+    assert floor_calibration.peek_cosine_bootstrap_floor("emb")["floor"] == pytest.approx(0.5)
+    store = MemoryStore(tmp_path / "memories.db")
+    assert store.get_cosine_floor("emb")["floor"] == pytest.approx(0.5), "bootstrap until a row"
+
+    store.write_cosine_floor(
+        "emb", floor=0.33, raw_fit_floor=0.33, sample_pairs=300, is_cold_start=False
+    )
+
+    got = store.get_cosine_floor("emb")
+    assert got["floor"] == pytest.approx(0.33) and got["is_cold_start"] is False
+
+
 def test_recall_turns_never_retry_a_failed_bootstrap(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

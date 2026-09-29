@@ -565,12 +565,14 @@ def run_cosine_bootstrap(embedder_model_id: str, *, now: float | None = None) ->
     attempt at `now + min(INITIAL * 2 ** (failures - 1), MAX)`; nothing calls
     this before then (`cosine_bootstrap_due`), so a failing bootstrap costs
     one attempt per back-off window, never one per turn. Never raises."""
-    when = time.monotonic() if now is None else now
     try:
         result = get_cosine_bootstrap_floor(embedder_model_id)
     except Exception:  # noqa: BLE001 — a cadence job must never raise into the pass
         logger.exception("floor_calibration: cosine bootstrap raised for %s", embedder_model_id)
         result = None
+    # The back-off window starts when the attempt ENDED (a slow failing embed
+    # must not eat its own window); an injected `now` is taken as given.
+    when = time.monotonic() if now is None else now
     with _cosine_bootstrap_floor_cache_lock:
         if result is not None:
             _cosine_bootstrap_backoff.pop(embedder_model_id, None)
