@@ -82,6 +82,14 @@ const MAX_STAGED_FILES = 8;
 
 /** Type check shared by the picker, drag-drop and paste (#268): the same
  *  eight types as ACCEPTED_FILE_TYPES, so all three entry paths agree. */
+// Grow the composer to fit its text, up to 192 px — on typing, and when a failed
+// send gives the text back (#301).
+function fitComposer(ta: HTMLTextAreaElement | null): void {
+  if (!ta) return;
+  ta.style.height = "auto";
+  ta.style.height = `${Math.min(ta.scrollHeight, 192)}px`;
+}
+
 function isAcceptedType(type: string, name: string): boolean {
   if (ACCEPTED_MIME_TYPES.has(type)) return true;
   const lower = name.toLowerCase();
@@ -172,6 +180,14 @@ interface Props {
 export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltTimeRecovered = false, eventStream, mode = "live" }: Props) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
+  // The composer text as of NOW, not as of the last render: a failed send (#301)
+  // decides whether to give its text back from this, and a refused connection can
+  // fail before React has re-rendered the cleared box. Set it only through here.
+  const inputNowRef = useRef("");
+  const setComposerText = (v: string) => {
+    inputNowRef.current = v;
+    setInput(v);
+  };
   const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Phase 4 (v0.0.15-alpha.2): map empty/whitespace-only strings to a
@@ -505,20 +521,22 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
   }
 
   function removeStaged(previewUrl: string) {
-    URL.revokeObjectURL(previewUrl);
+    // A given-back image (#301) is also on the failed message's bubble: leave its
+    // URL for the unmount sweep (trackedUrlsRef) instead of breaking that thumbnail.
+    if (!messages.some((m) => m.imageThumb === previewUrl)) URL.revokeObjectURL(previewUrl);
     updateStaged((prev) => prev.filter((f) => f.previewUrl !== previewUrl));
   }
 
   function insertEmoji(emoji: string) {
     const ta = textareaRef.current;
     if (!ta) {
-      setInput((v) => v + emoji);
+      setComposerText(inputNowRef.current + emoji);
       return;
     }
     const start = ta.selectionStart ?? input.length;
     const end = ta.selectionEnd ?? input.length;
     const next = input.slice(0, start) + emoji + input.slice(end);
-    setInput(next);
+    setComposerText(next);
     // Restore caret after the inserted emoji on next paint.
     requestAnimationFrame(() => {
       ta.focus();
@@ -536,14 +554,17 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
   // opts.sharedFiles: forwarded to streamChat for file/image sends.
   // opts.text: the outbound message text.
   // opts.imageThumb: thumbnail URL for the user bubble (image sends).
+  // opts.onFailed: called once if the turn fails (not on a user stop), so the
+  //   caller can give back what the user wrote (#301).
   async function streamTurn(opts: {
     text: string;
     replyToAuditId?: string;
     sharedFiles?: SharedFileRef[];
     imageThumb?: string;
     prepend?: Message[];
+    onFailed?: () => void;
   }): Promise<void> {
-    const { text: outboundText, replyToAuditId, sharedFiles, imageThumb, prepend = [] } = opts;
+    const { text: outboundText, replyToAuditId, sharedFiles, imageThumb, prepend = [], onFailed } = opts;
 
     // Session resolve: reattach or create.
     let sessionId = sessionRef.current;
@@ -564,6 +585,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
           sessionId = await newSession(persona);
         } catch (e) {
           setErrorSafe(`Bridge unreachable: ${errString(e)}`);
+          onFailed?.();
           return;
         }
       }
@@ -592,6 +614,27 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
 
     setMessages((m) => [...m, ...prepend, userMsg, replyStub]);
     setStreaming(true);
+
+    // Every failed end of this turn: the error, a visible failure marker in place
+    // of the empty reply stub (audit 2026-05-07 P2-10: the transcript must match
+    // what was actually said), and the caller's onFailed (#301).
+    const failTurn = (errMsg: string) => {
+      setErrorSafe(errMsg);
+      setStreaming(false);
+      setMessages((m) =>
+        m.map((b) =>
+          b.id === replyId
+            ? {
+                ...b,
+                text: `(${capitalize(persona)} couldn't answer — see the error below.)`,
+                streaming: false,
+                time: formatTime(),
+              }
+            : b,
+        ),
+      );
+      onFailed?.();
+    };
     setErrorSafe(null);
     setMemorySaveWarning(null);
 
@@ -641,45 +684,13 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
                   sessionRef.current = fresh;
                   await runStream(fresh, /* isRetry */ true);
                 } catch (e) {
-                  setErrorSafe(`Bridge unreachable: ${errString(e)}`);
-                  setStreaming(false);
-                  setMessages((m) =>
-                    m.map((b) =>
-                      b.id === replyId
-                        ? {
-                            ...b,
-                            text: `(${capitalize(persona)} couldn't answer — see the error below.)`,
-                            streaming: false,
-                            time: formatTime(),
-                          }
-                        : b,
-                    ),
-                  );
+                  failTurn(`Bridge unreachable: ${errString(e)}`);
                 }
               })();
               return;
             }
-            setErrorSafe(msg);
-            setStreaming(false);
             cancelRef.current = null;
-            // Audit 2026-05-07 P2-10: replace the empty streaming
-            // stub with a visible failure marker. Previously onError
-            // only set the error string, leaving an empty persona
-            // bubble in the transcript that didn't match what was
-            // actually said. The bubble now shows a clear failure
-            // note so the transcript matches reality.
-            setMessages((m) =>
-              m.map((b) =>
-                b.id === replyId
-                  ? {
-                      ...b,
-                      text: `(${capitalize(persona)} couldn't answer — see the error below.)`,
-                      streaming: false,
-                      time: formatTime(),
-                    }
-                  : b,
-              ),
-            );
+            failTurn(msg);
           },
         },
         (() => {
@@ -694,21 +705,8 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
     try {
       await runStream(sessionId, /* isRetry */ false);
     } catch (e) {
-      setErrorSafe(errString(e));
-      setStreaming(false);
       // Same defense for synchronous failures before streamChat returns.
-      setMessages((m) =>
-        m.map((b) =>
-          b.id === replyId
-            ? {
-                ...b,
-                text: `(${capitalize(persona)} couldn't answer — see the error below.)`,
-                streaming: false,
-                time: formatTime(),
-              }
-            : b,
-        ),
-      );
+      failTurn(errString(e));
     }
   }
 
@@ -743,7 +741,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
 
     updateStaged(() => []);
     setEmojiOpen(false);
-    setInput("");
+    setComposerText("");
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
     }
@@ -752,6 +750,16 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
       text: outboundText,
       sharedFiles,
       imageThumb,
+      // #301: a failed turn gives back what was written — the typed text (not
+      // the default "look at this" line) and the attached files — unless the
+      // user has already started on something else. Card replies keep their own
+      // box and never land here.
+      onFailed: () => {
+        if (inputNowRef.current.trim() !== "" || stagedRef.current.length > 0) return;
+        setComposerText(text);
+        updateStaged(() => ready);
+        requestAnimationFrame(() => fitComposer(textareaRef.current));
+      },
     });
   }
 
@@ -1010,13 +1018,9 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
           <textarea
             ref={textareaRef}
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onChange={(e) => setComposerText(e.target.value)}
             onKeyDown={onKey}
-            onInput={(e) => {
-              const ta = e.currentTarget;
-              ta.style.height = "auto";
-              ta.style.height = `${Math.min(ta.scrollHeight, 192)}px`;
-            }}
+            onInput={(e) => fitComposer(e.currentTarget)}
             placeholder={`Write to ${capitalize(persona)}…`}
             className="chat-input"
             style={{
