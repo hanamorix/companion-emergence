@@ -11,11 +11,7 @@ from brain.memory.embedding_matrix import build_embedding_matrix
 from brain.memory.embeddings import cosine_similarity
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.relevance import CANDIDATE_POOL, rank_memories, snippet_length
-from brain.memory.semantic_recall import (
-    build_semantic_candidate_pool,
-    genuine_first_memories,
-    rank_and_gate,
-)
+from brain.memory.semantic_recall import build_semantic_candidate_pool, rank_and_gate
 from brain.memory.store import Memory, MemoryStore
 from brain.tools.impls._common import _mem_to_result
 
@@ -77,9 +73,10 @@ def _keyword_candidates(
     the recall selector keeps from ``query``, with NO cap (S52) and the same
     stopword rules passive recall applies. The store admits every token the
     selector kept (2-letter names and acronyms included). Monologue-family
-    hits follow genuine ones (spec §4), ranked over the ranker's whole
-    candidate pool so a family hit never takes a slot from a genuine one that
-    the ranker also found. ``exclude`` ids are removed before ranking.
+    hits follow genuine ones (spec §4, S16): ``genuine_first`` ranks them
+    after every genuine match in the ranker's candidate pool and its final
+    order, so a family hit never takes a slot from a genuine one. ``exclude``
+    ids are removed before ranking.
 
     The selector is imported lazily from ``brain.chat.prompt`` (the pattern
     ``brain/tools/dispatch.py`` uses): the chat layer must not be a top-level
@@ -90,8 +87,10 @@ def _keyword_candidates(
     tokens = _extract_recall_tokens(query, store)
     if not tokens:
         return []
-    ranked = rank_memories(store, hebbian, tokens, limit=CANDIDATE_POOL, exclude_ids=exclude)
-    return genuine_first_memories([m for m, _ in ranked])
+    ranked = rank_memories(
+        store, hebbian, tokens, limit=CANDIDATE_POOL, exclude_ids=exclude, genuine_first=True
+    )
+    return [m for m, _ in ranked]
 
 
 def _lexical_candidates(

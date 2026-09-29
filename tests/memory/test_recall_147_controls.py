@@ -29,7 +29,11 @@ from unittest.mock import patch
 
 import pytest
 
-from brain.chat.prompt import _RECALL_STOPWORDS, _extract_recall_tokens
+from brain.chat.prompt import (
+    _RECALL_STOPWORDS,
+    _extract_recall_tokens,
+    _legacy_capped_tokens,
+)
 from brain.memory.relevance import SNIPPET_COUNT
 from brain.memory.semantic_recall import MAX_STANDOUT_COUNT
 from tests.memory.recall_147_fixtures import (
@@ -140,6 +144,7 @@ def test_rare_token_recall_without_short_tokens_is_not_below_base(rare_noshort, 
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason=(
         "C12 set (iii) shape FAILS: a target reached through ONE rare word, in a query that also "
         "carries short tokens the admission change lets through (acronyms, digits, short words of "
@@ -173,3 +178,21 @@ def test_a_variant_admitting_every_raw_token_scores_below_base_on_a_set(rare, tm
     with patch("brain.chat.prompt._extract_recall_tokens", every_raw_token):
         got = recall_at(store, queries, cutoff=_KEYWORD_ONLY_CUTOFF, persona_dir=tmp_path)
     assert got < BASE_RARE_AT_8 - _EPS
+
+
+def test_a_capped_selector_with_short_token_admission_scores_below_base_on_the_control_set(
+    control, tmp_path: Path
+) -> None:
+    """Able to fail (oracle rule), the discriminating variant: keeping the old
+    ten-token cap while the store admits the short tokens scores BELOW the base
+    on the control set (the base drops those tokens at the store, so the cap
+    then costs it nothing), which the as-built code does not."""
+    real = _extract_recall_tokens
+
+    def capped(user_input: str, store=None) -> list[str]:
+        return _legacy_capped_tokens(real(user_input, store))
+
+    store, queries, _ = control
+    with patch("brain.chat.prompt._extract_recall_tokens", capped):
+        got = recall_at(store, queries, cutoff=_KEYWORD_ONLY_CUTOFF, persona_dir=tmp_path)
+    assert got < BASE_CONTROL_AT_8 - _EPS

@@ -242,6 +242,26 @@ def test_keyword_monologue_family_hits_follow_genuine_ones_in_both_modes(
     assert set(merged[1:]) == {m.id for m in genuine}
 
 
+def test_a_family_flood_larger_than_the_candidate_pool_cannot_hide_genuine_hits(tmp_path: Path) -> None:
+    """60 monologue-family memories that out-rank 6 genuine ones on bm25 and
+    importance fill the ranker's whole 50-row pool unless the pool is family-
+    last (spec §4, S16, Acceptance 8): the tool still returns every genuine hit
+    first, in lexical mode."""
+    ctx = _ctx(tmp_path)
+    store = ctx["store"]
+    for i in range(60):
+        _mem(store, f"quokka harbour market garden family note {i}", memory_type="monologue", importance=9.5)
+    genuine = [_mem(store, f"quokka plain genuine entry {i}", importance=3.0) for i in range(6)]
+    res = dispatch(
+        "search_memories",
+        {"query": "quokka harbour market garden", "mode": "lexical", "limit": 8},
+        **ctx,
+    )
+    ids = _ids(res)
+    assert {m.id for m in genuine} == set(ids[:6])
+    assert len(ids) == 8
+
+
 # ---------------------------------------------------------------------------
 # C5b (S57): the tool's lexical mode goes through the recall selector, no cap.
 # ---------------------------------------------------------------------------

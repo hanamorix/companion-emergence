@@ -17,7 +17,7 @@ import math
 import re
 import sqlite3
 import uuid
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -2694,6 +2694,7 @@ class MemoryStore:
         include_fading: bool = True,
         limit: int | None = None,
         bump: bool | float = False,
+        family_types: Collection[str] = (),
     ) -> list[tuple[Memory, float]]:
         """FTS5/BM25 text-match search, best-match first.
 
@@ -2713,6 +2714,12 @@ class MemoryStore:
         recall selector's token list (every token admitted, see
         ``_to_fts_match``). An empty/all-tokens-dropped query returns ``[]``
         (no MATCH is issued).
+
+        ``family_types`` (name-recall fix R4, spec §4, S16): memory types
+        ordered AFTER every other match before ``limit`` applies (each group by
+        bm25), so a flood of monologue-family matches can never fill the
+        candidate pool and keep a genuine match out of it. Empty (default): pure
+        bm25 order, unchanged.
         """
         match = _to_fts_match(query)
         if not match:
@@ -2727,7 +2734,12 @@ class MemoryStore:
             sql += " AND m.active = 1"
         if not include_fading:
             sql += " AND m.state != 'fading'"
-        sql += " ORDER BY _bm25 ASC"
+        if family_types:
+            family = sorted(family_types)
+            sql += f" ORDER BY (m.memory_type IN ({','.join('?' * len(family))})) ASC, _bm25 ASC"
+            params.extend(family)
+        else:
+            sql += " ORDER BY _bm25 ASC"
         if limit is not None:
             sql += " LIMIT ?"
             params.append(limit)

@@ -20,6 +20,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from brain.dev_constants import MONOLOGUE_FAMILY_TYPES
+
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
@@ -99,6 +101,7 @@ def rank_memories(
     exclude_ids: Iterable[str] = frozenset(),
     active_only: bool = True,
     include_fading: bool = True,
+    genuine_first: bool = False,
 ) -> list[tuple[Memory, float | None]]:
     """Rank committed memories by blended relevance — bump-free, best→worst.
 
@@ -113,6 +116,12 @@ def rank_memories(
     ``query`` is a raw string (the store drops tokens under 3 characters) or a
     token LIST, the recall selector's own output, of which the store admits
     every token (name-recall fix R4, spec §5). Both forms are one OR query.
+
+    ``genuine_first`` (name-recall fix R4, spec §4, S16, Acceptance 8): the
+    monologue family ranks after every genuine memory, in the candidate pool
+    the FTS query hands the ranker AND in the final order, with no score
+    multiplier. So a family flood can neither fill the pool nor fill the first
+    ``limit`` results while a genuine match exists. Default False: unchanged.
     """
     exclude = frozenset(exclude_ids)
 
@@ -138,6 +147,7 @@ def rank_memories(
         include_fading=include_fading,
         bump=False,
         limit=CANDIDATE_POOL,
+        family_types=MONOLOGUE_FAMILY_TYPES if genuine_first else (),
     )
     if not scored:
         return []
@@ -172,5 +182,14 @@ def rank_memories(
 
     # P3: filter superseded here  (no-op today — forward-compat seam, spec §6.8)
 
-    ranked.sort(key=lambda pair: (-pair[1], -_created_ts(pair[0])))
+    if genuine_first:
+        ranked.sort(
+            key=lambda pair: (
+                pair[0].memory_type in MONOLOGUE_FAMILY_TYPES,
+                -pair[1],
+                -_created_ts(pair[0]),
+            )
+        )
+    else:
+        ranked.sort(key=lambda pair: (-pair[1], -_created_ts(pair[0])))
     return [(mem, score) for mem, score in ranked[:limit]]

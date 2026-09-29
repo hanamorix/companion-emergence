@@ -9,6 +9,9 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
+from brain.dev_constants import MONOLOGUE_FAMILY_TYPES
 from brain.forgetting.recall import search_with_loss
 from brain.memory import relevance
 from brain.memory.relevance import rank_memories
@@ -72,23 +75,66 @@ def test_search_with_loss_active_bucket_uses_every_list_token(tmp_path: Path) ->
     assert [m.id for m in res.active] == [mem.id]
 
 
-def test_rank_limit_widens_the_active_bucket_only(tmp_path: Path) -> None:
-    """R4: `rank_limit` gives the active bucket the ranker's wider window, while
-    the fading bucket keeps the first-`limit` window it always had and the
-    graveyard keeps `limit`."""
+def _flood(store: MemoryStore, n_family: int, n_genuine: int) -> tuple[list[Memory], list[Memory]]:
+    family = [
+        Memory.create_new(
+            content=f"quokka harbour market garden family {i}", memory_type="monologue", domain="us", importance=9.5
+        )
+        for i in range(n_family)
+    ]
+    genuine = [
+        Memory.create_new(content=f"quokka plain entry {i}", memory_type="conversation", domain="us", importance=3.0)
+        for i in range(n_genuine)
+    ]
+    for m in [*family, *genuine]:
+        store.create(m)
+    return family, genuine
+
+
+def test_search_fts_scored_family_types_keep_a_family_flood_out_of_the_candidate_pool() -> None:
     store = MemoryStore(":memory:")
-    for i in range(6):
+    family, genuine = _flood(store, 60, 6)
+    query = ["quokka", "harbour", "market", "garden"]
+    plain = {m.id for m, _ in store.search_fts_scored(query, limit=50)}
+    ordered = store.search_fts_scored(query, limit=50, family_types=MONOLOGUE_FAMILY_TYPES)
+    assert not ({m.id for m in genuine} & plain), "premise: a plain bm25 pool of 50 is all family"
+    assert {m.id for m in genuine} <= {m.id for m, _ in ordered}, "family-last pool holds every genuine match"
+    assert [m.memory_type for m, _ in ordered][:6] == ["conversation"] * 6
+
+
+def test_rank_memories_genuine_first_puts_the_family_after_every_genuine_memory() -> None:
+    store = MemoryStore(":memory:")
+    family, genuine = _flood(store, 14, 6)
+    out = rank_memories(store, None, ["quokka", "harbour", "market", "garden"], limit=8, genuine_first=True)
+    assert {m.id for m, _ in out[:6]} == {m.id for m in genuine}
+    assert all(m.memory_type == "monologue" for m, _ in out[6:])
+    default = rank_memories(store, None, ["quokka", "harbour", "market", "garden"], limit=8)
+    assert all(m.memory_type == "monologue" for m, _ in default), "default ranking is unchanged (family outranks)"
+
+
+def test_genuine_first_changes_nothing_when_no_family_memory_matches() -> None:
+    store = MemoryStore(":memory:")
+    for i in range(30):
         store.create(
-            Memory.create_new(content=f"quokka active entry {i}", memory_type="conversation", domain="us", importance=5.0)
+            Memory.create_new(
+                content=f"quokka harbour entry {i} " + "market " * (i % 4),
+                memory_type="conversation",
+                domain="us",
+                importance=float(1 + i % 9),
+            )
         )
-    for i in range(6):
-        faded = Memory.create_new(
-            content=f"quokka faded original {i}", memory_type="conversation", domain="us", importance=9.0
-        )
-        store.create(faded)
-        store.fade(faded.id, summary=f"quokka faded summary {i}")
-    narrow = search_with_loss(tmp_path, store, ["quokka"], limit=3)
-    wide = search_with_loss(tmp_path, store, ["quokka"], limit=3, rank_limit=50)
-    assert len(narrow.fading) == 3 and len(narrow.active) == 0, "the narrow window is all high-importance fading"
-    assert len(wide.active) == 6, "active drawn from the wide window"
-    assert [m.id for m in wide.fading] == [m.id for m in narrow.fading], "fading window unchanged"
+    q = ["quokka", "harbour", "market"]
+    a = [(m.id, s) for m, s in rank_memories(store, None, q, limit=16)]
+    b = [(m.id, s) for m, s in rank_memories(store, None, q, limit=16, genuine_first=True)]
+    assert [i for i, _ in a] == [i for i, _ in b]
+    assert [s for _, s in a] == pytest.approx([s for _, s in b])
+
+
+def test_search_with_loss_passes_genuine_first_and_keeps_the_bucket_windows(tmp_path: Path) -> None:
+    store = MemoryStore(":memory:")
+    family, genuine = _flood(store, 20, 6)
+    plain = search_with_loss(tmp_path, store, ["quokka", "harbour"], limit=8)
+    genuine_first = search_with_loss(tmp_path, store, ["quokka", "harbour"], limit=8, genuine_first=True)
+    assert len(plain.active) <= 8 and len(genuine_first.active) <= 8, "the window is `limit` either way"
+    assert {m.id for m in genuine} <= {m.id for m in genuine_first.active}
+    assert not ({m.id for m in genuine} <= {m.id for m in plain.active})

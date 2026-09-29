@@ -264,29 +264,35 @@ def test_merged_fill_takes_genuine_keyword_hits_before_family_ones(tmp_path: Pat
     assert set(ids[7:]) <= {m.id for m in family}
 
 
-def _family_flood_store() -> tuple[MemoryStore, list[Memory], list[Memory]]:
-    """14 monologue-family memories matching 4 query words at importance 9.5 and
-    6 genuine ones matching 1 word at importance 3.0: with `limit * 2` = 16 the
-    ranker's old window held only 2 of the genuine ones."""
+def _family_flood_store(n_family: int) -> tuple[MemoryStore, list[Memory], list[Memory]]:
+    """`n_family` monologue-family memories matching 4 query words at importance
+    9.5 and 6 genuine ones matching 1 word at importance 3.0. The family
+    outranks the genuine ones on every signal (bm25, importance), and at 60 it
+    outnumbers the ranker's whole 50-row candidate pool."""
     store = MemoryStore(":memory:")
     family = [
         _mem(store, f"quokka harbour market garden family note {i}", importance=9.5, memory_type="monologue")
-        for i in range(14)
+        for i in range(n_family)
     ]
     genuine = [_mem(store, f"quokka plain genuine entry {i}", importance=3.0) for i in range(6)]
     return store, family, genuine
 
 
-def test_family_flood_cannot_crowd_genuine_keyword_hits_out_of_the_limit(tmp_path: Path) -> None:
-    store, family, genuine = _family_flood_store()
+@pytest.mark.parametrize("n_family", [14, 44, 45, 60])
+def test_family_flood_cannot_crowd_genuine_keyword_hits_out_of_the_limit(tmp_path: Path, n_family: int) -> None:
+    """Floods of 14 (past the old 2*limit window), 45 and 60 (past the ranker's
+    50-row candidate pool): every genuine match still renders, ahead of every
+    family match (spec §4, S16, Acceptance 8)."""
+    store, family, genuine = _family_flood_store(n_family)
     ids = [r[0] for r in _active_rows(_render(store, "quokka harbour market garden", tmp_path, None))]
     assert len(ids) == SNIPPET_COUNT
-    assert {m.id for m in genuine} <= set(ids), "every genuine hit the ranker found is rendered ahead of any family hit"
-    assert ids[: len(genuine)] and {*ids[: len(genuine)]} == {m.id for m in genuine}
+    assert {m.id for m in genuine} <= set(ids), "every genuine hit the store holds is rendered"
+    assert {*ids[: len(genuine)]} == {m.id for m in genuine}, "and they lead the family hits"
 
 
-def test_family_flood_on_the_no_persona_dir_path(tmp_path: Path) -> None:
-    store, family, genuine = _family_flood_store()
+@pytest.mark.parametrize("n_family", [14, 60])
+def test_family_flood_on_the_no_persona_dir_path(n_family: int) -> None:
+    store, family, genuine = _family_flood_store(n_family)
     block = _build_recall_block(store, "quokka harbour market garden", persona_dir=None)
     assert all(m.id in block for m in genuine)
 

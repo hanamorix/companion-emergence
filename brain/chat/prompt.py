@@ -25,7 +25,6 @@ from brain.engines.research_ambient import build_research_awareness_block
 from brain.maker.ambient import build_maker_awareness_block
 from brain.memory.recall_open import open_memory
 from brain.memory.relevance import (
-    CANDIDATE_POOL,
     FULL_INJECT_IMPORTANCE,
     FULL_INJECT_MAX,
     SNIPPET_COUNT,
@@ -1054,9 +1053,7 @@ def _build_recall_block(
         candidates: list = []
         merged: dict[str, float] = {}
         try:
-            # The ranker's whole candidate pool, so the monologue-family
-            # partition below can promote genuine hits into the `limit` (spec §4).
-            ranked = rank_memories(store, None, tokens, limit=CANDIDATE_POOL)
+            ranked = rank_memories(store, None, tokens, limit=limit, genuine_first=True)
         except Exception:  # noqa: BLE001
             ranked = []
         for mem, score in ranked:
@@ -1184,10 +1181,9 @@ def _build_recall_block(
                 limit=limit * 2,
                 hebbian=heb,
                 lost_query=" ".join(legacy_tokens),
-                # ACTIVE hits come from the ranker's whole candidate pool so the
-                # family partition below is not confined to the first 2*limit
-                # (spec §4); fading and lost keep their old windows.
-                rank_limit=CANDIDATE_POOL,
+                # The monologue family ranks after every genuine memory in the
+                # ranker's pool and window (spec §4, S16, Acceptance 8).
+                genuine_first=True,
             )
         except Exception:  # noqa: BLE001
             result = None
