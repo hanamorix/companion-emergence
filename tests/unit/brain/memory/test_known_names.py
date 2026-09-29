@@ -701,6 +701,87 @@ def test_an_os_error_from_the_lock_is_logged_and_never_raised(
     assert any("could not write" in r.message for r in caplog.records)
 
 
+def test_a_lone_surrogate_in_an_extracted_name_does_not_lose_the_name_or_raise(
+    persona: Path,
+) -> None:
+    # A model's JSON escape can decode to half an emoji; SQLite cannot bind it.
+    out = kn.admit_names(persona, ["Zoe\ud83d", "Wren"], "gate", now=T0)
+    assert out == ["zoe", "wren"]
+    assert _names(persona) == {"zoe", "wren"}
+
+
+@pytest.mark.parametrize("exc", [sqlite3.InterfaceError("bad bind"), ValueError("bad value")])
+def test_a_write_that_fails_for_any_database_or_value_reason_is_logged_not_raised(
+    persona: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    exc: Exception,
+) -> None:
+    def boom(path: Path, rows: list[tuple[str, str, str, str]]) -> None:
+        raise exc
+
+    monkeypatch.setattr(kn, "_insert_rows", boom)
+    with caplog.at_level(logging.WARNING, logger=kn.logger.name):
+        assert kn.admit_names(persona, ["pretzel"], "gate") == []
+    assert any("could not write" in r.message for r in caplog.records)
+
+
+def test_an_unreadable_signature_keeps_the_previous_list_and_warns_once(
+    persona: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    kn.admit_names(persona, ["alpha"], "gate")
+    before = kn.load_known_names(persona)
+    cached = dict(kn._cache)
+    real_stat = os.stat
+
+    def refuse(path: object, *a: object, **k: object) -> os.stat_result:
+        if str(path) == str(_db(persona)):
+            raise PermissionError("denied")
+        return real_stat(path, *a, **k)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(kn.os, "stat", refuse)
+    with caplog.at_level(logging.DEBUG, logger=kn.logger.name):
+        for _ in range(3):
+            assert kn.load_known_names(persona) is before  # not treated as "missing"
+    assert kn._cache == cached
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "signature unavailable" in warnings[0].message
+
+
+def test_a_file_the_reader_cannot_get_past_warns_once_but_plain_busy_does_not(
+    persona: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    kn.admit_names(persona, ["alpha"], "gate")
+    with caplog.at_level(logging.DEBUG, logger=kn.logger.name):
+        with _exclusive_lock(persona):  # an ordinary writer mid-commit
+            kn.load_known_names(persona)
+            kn.load_known_names(persona)
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+        hot = tmp_path / "hot"  # a crashed writer's hot journal: not transient in practice
+        _make_hot_journal(_db(persona), hot)
+        for _ in range(3):
+            kn.load_known_names(hot)
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "cannot be read now" in warnings[0].message
+
+
+def test_renaming_a_corrupt_file_aside_takes_its_journal_sidecar_with_it(persona: Path) -> None:
+    # Called directly: on a real write SQLite itself disposes of an unusable
+    # journal before the rename is reached, so the sidecar branch is exercised here.
+    journal = Path(str(_db(persona)) + "-journal")
+    _db(persona).write_bytes(_GARBAGE)
+    journal.write_bytes(b"stale journal bytes")
+    assert kn._rename_aside(_db(persona)) is True
+    assert not _db(persona).exists() and not journal.exists()
+    aside = _aside(persona)
+    assert len(aside) == 2
+    (moved,) = [p for p in aside if p.name.endswith("-journal")]
+    assert moved.read_bytes() == b"stale journal bytes"
+    (db_aside,) = [p for p in aside if not p.name.endswith("-journal")]
+    assert db_aside.read_bytes() == _GARBAGE
+    assert moved.name == db_aside.name + "-journal"
+
+
 # ---------------------------------------------------------------------------
 # CONC-4: writers in two processes
 # ---------------------------------------------------------------------------
@@ -724,13 +805,13 @@ for k in range(5):
 def test_two_processes_writing_at_once_lose_nothing_and_keep_first_seen(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[4]
     env = {**os.environ, "PYTHONPATH": str(root)}
-    stamps = {
-        datetime(2026, 9, 29, 12, 0, 0, tzinfo=UTC).isoformat(),
-        datetime(2026, 9, 29, 12, 0, 1, tzinfo=UTC).isoformat(),
-    }
+    seeded = datetime(2026, 9, 28, 8, 0, 0, tzinfo=UTC).isoformat()
     for rnd in range(20):
         persona = tmp_path / f"run{rnd}"
         persona.mkdir()
+        # The shared name is already in the list, from an earlier day and another
+        # source: neither writer may replace its row.
+        kn.admit_names(persona, ["SharedName"], "reappraiser", now=datetime.fromisoformat(seeded))
         go = tmp_path / f"go{rnd}"
         procs = [
             subprocess.Popen(
@@ -750,8 +831,10 @@ def test_two_processes_writing_at_once_lose_nothing_and_keep_first_seen(tmp_path
         rows = _rows(persona)
         expected = {f"{t}name{rnd}x{k}" for t in ("a", "b") for k in range(5)} | {"sharedname"}
         assert {r[0] for r in rows} == expected
-        shared = [r for r in rows if r[0] == "sharedname"]
-        assert len(shared) == 1 and shared[0][3] in stamps
+        assert len(rows) == len(expected)
+        assert [r for r in rows if r[0] == "sharedname"] == [
+            ("sharedname", "SharedName", "reappraiser", seeded)
+        ]
 
 
 # ---------------------------------------------------------------------------

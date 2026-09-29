@@ -196,19 +196,33 @@ class _SignatureUnavailableError(Exception):
 
 
 class _TransientError(Exception):
-    """The row read hit a locked file (or a hot journal): keep the previous list."""
+    """The row read hit a locked file (or a hot journal): keep the previous list.
+
+    ``busy`` is True for an ordinary writer-mid-commit lock (expected, debug
+    level) and False for anything else the read-only reader cannot get past (a
+    hot journal, an unopenable path): those are logged once at warning level so
+    name protection going quiet is visible.
+    """
+
+    def __init__(self, message: str, *, busy: bool = False) -> None:
+        super().__init__(message)
+        self.busy = busy
 
 
 _cache_lock = threading.Lock()
 # path string -> (signature the rows were read under, the rows). The signature
 # is None for a missing file.
 _cache: dict[str, tuple[_Signature | None, KnownNames]] = {}
+# (path, message) pairs already logged at warning level (one line per distinct
+# problem, not one per recall turn). Guarded by _cache_lock.
+_warned: set[tuple[str, str]] = set()
 
 
 def _reset_cache() -> None:
     """Drop every cached list (test isolation)."""
     with _cache_lock:
         _cache.clear()
+        _warned.clear()
 
 
 def _signature(path: Path) -> _Signature | None:
@@ -262,9 +276,9 @@ def _read_rows(path: Path) -> KnownNames:
         conn = sqlite3.connect(uri, uri=True, timeout=0)
         rows = conn.execute("SELECT name_lower FROM known_names").fetchall()
     except sqlite3.OperationalError as exc:
-        if not _is_locked(exc) and "no such table" in str(exc).lower():
+        if "no such table" in str(exc).lower():
             return EMPTY
-        raise _TransientError(str(exc)) from exc
+        raise _TransientError(str(exc), busy=_is_locked(exc)) from exc
     except sqlite3.DatabaseError as exc:
         logger.warning(
             "known names: %s is not a readable database (%s); reading as empty", path, exc
@@ -274,6 +288,19 @@ def _read_rows(path: Path) -> KnownNames:
         if conn is not None:
             conn.close()
     return KnownNames.from_names(r[0] for r in rows if isinstance(r[0], str))
+
+
+def _warn_once(key: str, message: str, fmt: str, *args: object) -> None:
+    """Log at warning level the first time a (path, message) pair is seen.
+
+    Caller holds ``_cache_lock``. Later repeats go to debug, so a permanently
+    unreadable file is visible once without a line per recall turn.
+    """
+    if (key, message) in _warned:
+        logger.debug("known names: " + fmt, *args)
+        return
+    _warned.add((key, message))
+    logger.warning("known names: " + fmt, *args)
 
 
 def load_known_names(persona_dir: Path | str) -> KnownNames:
@@ -292,7 +319,9 @@ def load_known_names(persona_dir: Path | str) -> KnownNames:
         try:
             sig = _signature(path)
         except _SignatureUnavailableError as exc:
-            logger.debug("known names: signature unavailable for %s (%s)", path, exc)
+            _warn_once(
+                key, str(exc), "signature unavailable for %s (%s); previous list kept", path, exc
+            )
             return previous
         if cached is not None and cached[0] == sig:
             return cached[1]
@@ -302,9 +331,12 @@ def load_known_names(persona_dir: Path | str) -> KnownNames:
             try:
                 names = _read_rows(path)
             except _TransientError as exc:
-                logger.debug(
-                    "known names: %s busy or unreadable now (%s); previous list kept", path, exc
-                )
+                if exc.busy:
+                    logger.debug("known names: %s busy now (%s); previous list kept", path, exc)
+                else:
+                    _warn_once(
+                        key, str(exc), "%s cannot be read now (%s); previous list kept", path, exc
+                    )
                 return previous
         _cache[key] = (sig, names)
         return names
@@ -324,7 +356,9 @@ def _admit(name: object) -> tuple[str, str] | None:
     """
     if not isinstance(name, str):
         return None
-    display = name.strip()
+    # A lone UTF-16 surrogate (a half emoji from a model's JSON escape) cannot be
+    # bound to SQLite; replace it so the name itself is still admitted.
+    display = name.strip().encode("utf-8", "replace").decode("utf-8")
     lower = normalize_name(display)
     if not lower or lower in RECALL_STOPWORDS:
         return None
@@ -365,7 +399,7 @@ def admit_names(
     try:
         with file_lock(path):
             written = _write_rows(path, rows)
-    except OSError as exc:
+    except (OSError, sqlite3.Error, ValueError) as exc:
         logger.warning("known names: could not write %s (%s); write skipped", path, exc)
         return []
     return list(admitted) if written else []
