@@ -244,7 +244,7 @@ def test_the_tool_pool_is_the_genuine_then_the_plain_top_fifty_family(
 ) -> None:
     store = MemoryStore(tmp_path / "memories.db")
     genuine, family = _flood(store, monkeypatch)
-    _floors_and_path(store, monkeypatch, genuine, family, path)
+    rec = _floors_and_path(store, monkeypatch, genuine, family, path)
     seen = _spy_rank_and_gate(monkeypatch, "brain.tools.impls.search_memories")
 
     got = _tool(tmp_path, store, limit=5)
@@ -254,6 +254,8 @@ def test_the_tool_pool_is_the_genuine_then_the_plain_top_fifty_family(
     assert coarse_ids[:3] == _ids(genuine)
     assert coarse_ids[3:] == _ids(family[:CANDIDATE_POOL])
     assert set(_ids(genuine)) <= set(got)
+    if path == "reranked":
+        assert rec.scored_calls(), "the reranked variant must actually have reranked"
 
 
 def test_a_family_memory_above_the_cosine_floor_still_surfaces_after_fifty_genuine_ones(
@@ -346,3 +348,26 @@ def test_with_fifty_genuine_memories_the_rerank_prefix_holds_no_family_memory(
     )
     assert result is not None and result.path == "reranked"
     assert set(_ids([*result.full, *result.snippet])).isdisjoint(_ids(family))
+
+
+def test_the_tool_removes_excluded_ids_before_the_cut_so_they_take_no_place_in_the_pool(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """53 genuine memories, the 3 best excluded: the pool is the 50 remaining
+    genuine ones (an exclusion applied AFTER the cut would leave only 47) plus
+    the plain-top-50 family."""
+    store = MemoryStore(tmp_path / "memories.db")
+    genuine, family = _seed(
+        store, monkeypatch, [0.80 - i * 0.005 for i in range(CANDIDATE_POOL + 3)], [0.95]
+    )
+    _cosine_floor(store, 0.4)
+    _no_reranker(monkeypatch)
+    seen = _spy_rank_and_gate(monkeypatch, "brain.tools.impls.search_memories")
+    excluded = _ids(genuine[:3])
+
+    _tool(tmp_path, store, limit=5, exclude_ids=excluded)
+
+    (coarse,) = seen
+    coarse_ids = _ids_of(coarse)
+    assert set(coarse_ids).isdisjoint(excluded)
+    assert coarse_ids == _ids(genuine[3:]) + _ids(family)

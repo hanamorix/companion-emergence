@@ -373,10 +373,13 @@ def genuine_first_coarse_cut(
     and it guarantees both halves of spec §4/S16: a family memory can never
     keep a genuine one out of it (genuine memories fill their own `size`
     places), and a family memory that plain cosine would have admitted is
-    still in it (so it can surface, ranked after the genuine ones). Rerank
-    slots go to this order's prefix, i.e. genuine first: family memories are
-    reranked only if width remains, and `rerank_for_recall` only ever sees the
-    first `CANDIDATE_POOL` documents.
+    still in it (so it can surface on the cosine path, ranked after the
+    genuine ones). Rerank slots go to this order's prefix, i.e. genuine first:
+    family memories are reranked only if width remains, and
+    `rerank_for_recall` only ever sees the first `CANDIDATE_POOL` documents,
+    so with `size` or more genuine memories a family memory is never in the
+    rerank prefix: on a paragraph that takes the reranked path it is not a
+    result (a result is wholly one path), on a cosine-path paragraph it is.
 
     One pass over the candidates: a single sort by cosine, then a walk that
     stops as soon as the plain top-`size` is behind it and `size` genuine
