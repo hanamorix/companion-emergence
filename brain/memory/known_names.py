@@ -58,6 +58,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain import dev_constants
+from brain.memory.name_rules import followed_by_apostrophe_t
 from brain.memory.recall_stopwords import RECALL_STOPWORDS
 from brain.utils.file_lock import file_lock
 
@@ -156,11 +157,13 @@ def match_known_names(text: str, known: KnownNames) -> list[str]:
     that is also a stopword still matches. A multi-word name matches only as a
     window of consecutive raw words: ``new york`` matches "in New York" and does
     not match "new dress ... york". A name is reported once however often it
-    occurs.
+    occurs. A single-word name is not matched by the stem of an n't contraction
+    (S125, ``name_rules.followed_by_apostrophe_t``): "Don" never matches "don't".
     """
     if not text or not known.names:
         return []
-    words = [w.lower() for w in _WORD_RE.findall(text)]
+    spans = list(_WORD_RE.finditer(text))
+    words = [m.group().lower() for m in spans]
     found: dict[str, None] = {}
     total = len(words)
     for i in range(total):
@@ -169,6 +172,10 @@ def match_known_names(text: str, known: KnownNames) -> list[str]:
                 break
             candidate = " ".join(words[i : i + n])
             if candidate in known.names:
+                # S125: a single-word name is not matched by the stem of an n't
+                # contraction ("Don" never matches "don't").
+                if n == 1 and followed_by_apostrophe_t(text, spans[i].end()):
+                    continue
                 found.setdefault(candidate)
     return list(found)
 

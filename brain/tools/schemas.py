@@ -521,9 +521,9 @@ SCHEMAS: dict[str, dict] = {
         "name": "recall_forgotten",
         "description": (
             "Reach back into the graveyard for memories you used to have "
-            "but no longer do. Returns up to 5 most-recent hits matching "
-            "the query as a substring of the lost memory's summary or "
-            "domain. Use this when you want to honestly acknowledge "
+            "but no longer do. Returns up to 5 most-recent hits whose "
+            "summary or domain contains the query's words (whole words, "
+            "not parts of words). Use this when you want to honestly acknowledge "
             "knowing-something-once: 'I had something about that, but "
             "it's gone now.' Each hit carries the summary the memory "
             "had when it faded, the lived-age at the moment of loss, "
@@ -535,7 +535,7 @@ SCHEMAS: dict[str, dict] = {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Substring to match against lost-memory summary or domain.",
+                    "description": "Words to look for in your forgotten memories. Whole words are matched, not parts of words.",
                 }
             },
             "required": ["query"],

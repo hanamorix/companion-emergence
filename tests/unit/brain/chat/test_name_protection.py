@@ -341,21 +341,21 @@ def _bury(persona: Path, content: str, mem_id: str) -> None:
     )
 
 
-def test_the_name_query_does_not_feed_the_graveyard(tmp_path: Path) -> None:
-    """A listed name the selector drops ('will') is searched by the name query
-    but NOT handed to `graveyard.search`: the lost bucket keeps today's feed
-    (P-14, the F11 interim), so a name whose only memory is lost surfaces no
-    lost hit through this query."""
+def test_a_listed_name_is_handed_to_the_graveyard_beside_the_capped_words(tmp_path: Path) -> None:
+    """A listed name the selector drops ('will') is handed to `graveyard.search`
+    as a NAME beside today's capped word string (S102, S119). A stopword-name
+    matches an entry only where capitalized and not at a sentence start (S121)."""
     persona = tmp_path / "p"
     persona.mkdir()
     w = _world(persona)
     _list_names_direct(persona, "will")
-    _bury(persona, "Will once waved from the pier at dusk", "mem-lost-will")
-    queries: list[str] = []
+    _bury(persona, "saw Will wave", "mem-lost-will")
+    _bury(persona, "Will you come", "mem-lost-modal")
+    calls: list[tuple[str, list[str]]] = []
     real = gv.search
 
     def spy(persona_dir, query, **kw):
-        queries.append(query)
+        calls.append((query, list(kw.get("names", ()))))
         return real(persona_dir, query, **kw)
 
     with (
@@ -366,9 +366,10 @@ def test_the_name_query_does_not_feed_the_graveyard(tmp_path: Path) -> None:
 
     legacy = " ".join(_legacy_capped_tokens(_extract_recall_tokens("will zorblax quixotic", w.store)))
     assert "will" not in legacy.split(), "precondition: the selector drops the name"
-    assert queries == [legacy], "the graveyard gets today's capped token string only"
-    assert "lost (no longer in active memory)" not in block
-    assert touch.call_count == 0
+    assert calls == [(legacy, ["will"])], "today's capped words, and the name beside them"
+    assert "lost (no longer in active memory)" in block and "saw Will wave" in block
+    assert "Will you come" not in block, "S121: a modal 'Will' at a sentence start is not the name"
+    assert touch.call_args.kwargs["touched_ids"] == ["mem-lost-will"]
     assert _ids(block)[0] == w.will.id, "the active memory is still found and leads"
 
 
@@ -529,21 +530,22 @@ def test_a_name_hit_that_is_also_a_short_word_hit_is_not_demoted_in_the_importan
     assert rows[0][0] == al.id and not rows[0][1].endswith("…"), "the leading name hit renders in full"
 
 
-def test_a_message_that_is_only_a_listed_name_never_queries_the_graveyard_with_nothing(tmp_path: Path) -> None:
+def test_a_message_that_is_only_a_listed_name_searches_the_graveyard_for_the_name_only(tmp_path: Path) -> None:
     """The name-only path has no selector token, so the general query is empty.
-    An empty lost query would match EVERY graveyard entry (and fire grief
-    touches): the general search is skipped and the graveyard is not called."""
+    The graveyard is searched ONCE with no query words and the name (never an
+    empty query, which would match everything): only the entry holding the name
+    is shown, the general search is skipped."""
     persona = tmp_path / "p"
     persona.mkdir()
     w = _world(persona)
     _list_names_direct(persona, "will")
     _bury(persona, "A summary of some long forgotten harbour afternoon", "mem-lost-a")
-    _bury(persona, "Another lost note about the ferry timetable", "mem-lost-b")
-    queries: list[str] = []
+    _bury(persona, "cheered when Will came", "mem-lost-b")
+    calls: list[tuple[str, list[str]]] = []
     real = gv.search
 
     def spy(persona_dir, query, **kw):
-        queries.append(query)
+        calls.append((query, list(kw.get("names", ()))))
         return real(persona_dir, query, **kw)
 
     with (
@@ -551,9 +553,10 @@ def test_a_message_that_is_only_a_listed_name_never_queries_the_graveyard_with_n
         patch("brain.grief.handle_recall_touch") as touch,
     ):
         block = _render(w, "will", persona)
-    assert queries == [], "the graveyard is not called at all on a name-only turn"
-    assert "lost (no longer in active memory)" not in block
-    assert touch.call_count == 0
+    assert calls == [("", ["will"])], "one graveyard call: no words, the name"
+    assert "lost (no longer in active memory)" in block and "cheered when Will" in block
+    assert "long forgotten harbour" not in block
+    assert touch.call_args.kwargs["touched_ids"] == ["mem-lost-b"]
     assert _ids(block) == [w.will.id]
 
 

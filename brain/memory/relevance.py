@@ -262,9 +262,8 @@ def rank_name_hits(
     monologue family after every genuine hit. The caller leads the keyword hits
     with them (`lead_with_names`, S89), because FTS5 cannot weight one term
     above another and a frequently mentioned name would otherwise be
-    out-ranked by one rare word. It does NOT touch the lost-memory (graveyard) search: passive recall
-    feeds that only the legacy capped token set until the owner rules on the
-    graveyard widening (F11, plan P-14/P-25).
+    out-ranked by one rare word. It does not touch the lost-memory (graveyard) search itself: passive recall hands the same names to
+    the graveyard through ``search_with_loss(lost_names=)`` (S102).
 
     ``names`` come from :func:`names_in`; none means no query (``[]``).
     """

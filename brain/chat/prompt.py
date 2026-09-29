@@ -1096,8 +1096,8 @@ def _build_recall_block(
     rules) run ONE extra keyword query, sent as FTS phrases through the same
     ranker on the same hebbian handle; its active and fading hits lead the
     keyword hits (S79, S89: name hits the general search also found, then
-    name-only hits, then the general hits). It never feeds the graveyard, and
-    a listed name is never shown as "not recognised" (S90). A message that is
+    name-only hits, then the general hits). The same names also feed the graveyard
+    search (S102, S119: whole-word matching, hits first). A listed name is never shown as "not recognised" (S90). A message that is
     only a known name still recalls.
 
     Strategy: extract salient content tokens from ``user_input`` (drop
@@ -1119,7 +1119,11 @@ def _build_recall_block(
     The graveyard search and the "not recognised" list are fed the OLD capped
     token selection (the first ``_RECALL_TOKEN_LIMIT`` of the ranked tokens),
     not the uncapped set: the cap removal applies to searching the active and
-    fading memories only (S71; Q16 interim, PARKED for the owner).
+    fading memories only (S71). The graveyard search additionally gets the
+    listed names in the message (any length, phrases, hits first, S102, S119),
+    matches whole words of 4+ characters only, drops recall stopwords and
+    contraction fragments (S123, S128), and a grief touch fires only for a
+    forgotten memory shown in the "lost" section (S102).
 
     Falls back to ranked retrieval with no graveyard/hebbian when persona_dir
     is None (e.g. called directly in tests without a dir).
@@ -1263,14 +1267,16 @@ def _build_recall_block(
     from brain.memory.relevance import rank_memories
 
     capped_query, remainder = _keyword_tiers(tokens, legacy_tokens)
+    # The contraction stems of the raw message (S126): the graveyard's word feed
+    # drops them (the capped token string no longer holds the apostrophes).
+    from brain.memory.name_rules import contraction_stems
+
+    _lost_fragments = contraction_stems(user_input)
 
     seen_active: set = set()
     seen_fading: set = set()
-    # seen_lost accumulates graveyard hit IDs for two purposes:
-    #   1. Dedup within the (now single) search result (render path below).
-    #   2. Passed to handle_recall_touch as the grief accumulator (see the
-    #      fault-isolated block after this loop). Both paths read the same
-    #      set — no separate copy needed.
+    # seen_lost dedups the (single) graveyard search result by memory id. The
+    # grief touch is fed only the entries actually shown (lost_top, below).
     seen_lost: set = set()
     active_hits: list = []
     fading_hits: list = []
@@ -1307,12 +1313,18 @@ def _build_recall_block(
                     capped_query,
                     limit=limit * 2,
                     hebbian=heb,
-                    lost_query=capped_query,
+                    # Today's 10 words minus the contraction fragments of the raw
+                    # message (its apostrophes are gone from the capped string,
+                    # S123/S126), plus the listed names (S102, S119).
+                    lost_query=" ".join(
+                        t for t in legacy_tokens if t.lower() not in _lost_fragments
+                    ),
+                    lost_names=names,
                     # The monologue family ranks after every genuine memory in
                     # the ranker's pool and window (spec §4, S16, Acceptance 8).
                     genuine_first=True,
                 )
-                if capped_query
+                if capped_query or names
                 else None
             )
         except Exception:  # noqa: BLE001
@@ -1333,10 +1345,9 @@ def _build_recall_block(
         # Name query (R5, spec §5, S27, S35): ONE extra keyword query for the
         # message's name words, phrases through the same ranker, active and
         # fading buckets, sharing this turn's hebbian handle. Its hits rank
-        # ahead of the general keyword hits (merged below). It does NOT feed the
-        # graveyard: the lost bucket keeps today's capped-token feed until the
-        # owner rules on F11 (P-14/P-25), so a name whose only memory is lost
-        # surfaces no lost hit through this query.
+        # ahead of the general keyword hits (merged below). The same names reach
+        # the graveyard through the tier-1 call above (lost_names, S102), not
+        # through this query.
         if names:
             try:
                 ranked_names = rank_name_hits(store, heb, names, limit=limit * 2)
@@ -1451,34 +1462,32 @@ def _build_recall_block(
     if not active_entries and not fading_hits and not lost_hits and not unfamiliar:
         return ""
 
-    # Fire recall-touch grief breadcrumbs for any graveyard hits — ALWAYS
-    # (Stage-3 Defect-3 fix), regardless of the active-selection fork below.
-    # This is the ONLY call site of handle_recall_touch in this function, so
-    # it fires exactly once per turn: once iff there's a graveyard hit,
-    # never otherwise — on both the semantic-conclusive and inconclusive
-    # branches alike.
-    # handle_recall_touch is internally fault-isolated; this outer try
-    # guards only against import-time failures on brain.grief / brain.felt_time.
-    if seen_lost:
+    fading_top = fading_hits[:limit]
+    lost_top = lost_hits[:limit]
+
+    # Fire recall-touch grief breadcrumbs ONLY for the forgotten memories shown in
+    # the "lost" section below (S102): a memory that merely matched but was cut by
+    # the render limit writes no grief. Still ONE call per turn, ALWAYS (Stage-3
+    # Defect-3 fix), regardless of the active-selection fork: once iff a lost
+    # memory is shown, never otherwise. handle_recall_touch is internally
+    # fault-isolated; this outer try guards only against import-time failures on
+    # brain.grief / brain.felt_time.
+    shown_lost_ids = sorted({e["memory_id"] for e in lost_top if e.get("memory_id")})
+    if shown_lost_ids:
         try:
             from brain.felt_time.state import load_or_recover as _load_felt
-            from brain.forgetting import graveyard as _grave
             from brain.grief import handle_recall_touch
 
             felt_state, _ = _load_felt(persona_dir)
-            grave_entries = _grave.read_all(persona_dir)
             handle_recall_touch(
-                touched_ids=sorted(seen_lost),
-                graveyard_entries=grave_entries,
+                touched_ids=shown_lost_ids,
+                graveyard_entries=lost_top,
                 persona_dir=persona_dir,
                 store=store,
                 lived_age_hours_now=felt_state.lived_age_hours,
             )
         except Exception:  # noqa: BLE001
             log.exception("grief.handle_recall_touch failed inside _build_recall_block")
-
-    fading_top = fading_hits[:limit]
-    lost_top = lost_hits[:limit]
 
     # ONE per-turn dedup set threaded through EVERY passive tier (#231
     # consolidation, reconciliation D): the active tier (semantic + keyword,
