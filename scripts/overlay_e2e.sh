@@ -7,7 +7,8 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RT="$REPO/app/src-tauri/python-runtime"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+# The in-use holder (below) exits when $WORK/stop appears; let it go before cleaning up.
+trap 'touch "$WORK/stop" 2>/dev/null; wait 2>/dev/null; rm -rf "$WORK"' EXIT
 unset NELLBRAIN_HOME
 case "$(uname -s)" in
   # Windows: call the bundled python.exe the way nell.bat does (Git Bash can't exec the .bat cleanly — see app/build_python_runtime.sh step 6a). What this proves is that the bundled python.exe and pythonw.exe process the overlay .pth; nell.bat itself is covered by tests/integration/test_nell_bat_wrapper.py and the build's verify step.
@@ -61,8 +62,17 @@ certifi_is() { "$PY" -P -c "import importlib.metadata as m, sys; v = m.version('
 has_dir() { ls "$OV" | grep -Eqx "$1"; }  # an overlay folder name matches the regex
 status_is $A None
 A_DIR="$(ls "$OV" | grep -Ex 'e2e000000000-[0-9a-f]{8}')"
-# Run directly (not in $(...)), so the marker names this script's shell: alive until the end.
-"$PY" -P -c "import os, pathlib, sys; d = pathlib.Path(sys.argv[1]) / '.in-use'; d.mkdir(exist_ok=True); (d / str(os.getppid())).write_text('')" "$(native "$OV/$A_DIR")"
+# A live process running A's brain marks it in use through the real mark_in_use() (what a
+# bridge does at start), then lives until $WORK/stop appears. Its own pid, not a parent's:
+# under Git Bash a native program's parent is a short-lived fork, not this script's shell.
+"$PY" -P -c "import pathlib, sys, time
+from brain.update.overlay import mark_in_use
+mark_in_use()
+stop, end = pathlib.Path(sys.argv[1]), time.time() + 900
+while not stop.exists() and time.time() < end:
+    time.sleep(0.2)" "$(native "$WORK/stop")" &
+for _ in $(seq 100); do ls "$OV/$A_DIR/.in-use/"* >/dev/null 2>&1 && break; sleep 0.2; done
+ls "$OV/$A_DIR/.in-use/"* >/dev/null 2>&1 || { echo "e2e: FAIL mark_in_use wrote no marker for A" >&2; exit 1; }
 CERT_BUNDLE="$(sed -n -E 's/^certifi==([^ ;\\]+).*/\1/p' "$WORK/req.txt")"
 [ -n "$CERT_BUNDLE" ] || { echo "e2e: FAIL no certifi pin to swap" >&2; exit 1; }
 echo "certifi<$CERT_BUNDLE" | uv pip compile - --quiet --no-header --no-annotate --generate-hashes -o "$WORK/certifi.txt"
@@ -82,13 +92,13 @@ nell update --wheel "$WHL" --requirements "$REQ" --commit $A
 status_is $A $C
 has_dir "$A_DIR-r1" && [ -f "$OV/$A_DIR/stamp.json" ] || { echo "e2e: FAIL re-applying A replaced its in-use folder" >&2; exit 1; }
 echo "e2e: re-applying an in-use overlay's commit installs beside it"
-rm -rf "$OV/$A_DIR/.in-use"
+touch "$WORK/stop"; wait  # the holder exits; its marker stays behind, now naming a dead pid
 nell update --wheel "$WHL" --requirements "$REQ2" --commit $D
 status_is $D $A
 for gone in "$A_DIR" 'e2e111111111-[0-9a-f]{8}' 'e2e222222222-[0-9a-f]{8}'; do
   if has_dir "$gone"; then echo "e2e: FAIL prune kept $gone" >&2; exit 1; fi
 done
-echo "e2e: rotation keeps two, prune removed the rest once no process uses them"
+echo "e2e: rotation keeps two, prune removed the rest once no process uses them (a dead marker doesn't count)"
 nell update --rollback >/dev/null
 status_is $A None
 certifi_is "$CERT_BUNDLE"
