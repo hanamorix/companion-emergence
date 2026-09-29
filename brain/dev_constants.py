@@ -109,3 +109,13 @@ SEARCH_BRIDGE_TIMEOUT_S: float = 45.0
 # nothing reads or overrides it at run time. See
 # `brain.memory.recall_diagnostics`.
 RECALL_DIAGNOSTICS_LOG_FILENAME: str = "recall_diagnostics.log.jsonl"
+
+# --- rerank minimum (name-recall fix R1, S5/S23/S24) ------------------------
+# The fewest REAL memory candidates a rerank runs with: when fewer fit the
+# latency budget (or the pool holds fewer), the rerank is skipped and the
+# no-rerank path takes over; it is also the width before the first cost
+# measurement of a process. The owner's number (S5: "if the number of
+# candidates it can score in a given time is lower than 5, just don't rerank
+# them"), not a tuned value. With it, a rerank always carries at least
+# `reranker.K_MIN` anchors (k = min(8, real // 2) = 2 at 5 real).
+RERANK_MIN_REAL_CANDIDATES: int = 5

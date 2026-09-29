@@ -989,8 +989,10 @@ def test_ac13c_directional_guard_normalized_floor_correctly_abstains_what_raw_fl
 
     # The candidate's per-call NORMALIZED score, via the REAL gate-path
     # helper (the same one run at recall time, semantic_recall.py §2).
-    real_documents = [candidate_doc, "filler-candidate-1", "filler-candidate-2"]
-    gate_result = normalize_against_anchors(provider, "some real query", real_documents, width=5)
+    # (name-recall fix R1: anchors come on top of the real documents, so the
+    # recall-time minimum of 5 real candidates gets k = 2 anchors.)
+    real_documents = [candidate_doc, *(f"filler-candidate-{i}" for i in range(1, 5))]
+    gate_result = normalize_against_anchors(provider, "some real query", real_documents)
     assert gate_result.did_normalize is True
     normalized_candidate_score = gate_result.scores[0]
 

@@ -24,8 +24,9 @@ import pytest
 
 import brain.memory.semantic_recall as semantic_recall_mod
 from brain.bridge import model_tier
+from brain.dev_constants import RERANK_MIN_REAL_CANDIDATES
 from brain.memory.embedding_matrix import EmbeddingMatrix
-from brain.memory.reranker import FakeRerankerProvider
+from brain.memory.reranker import ANCHOR_POOL, FakeRerankerProvider
 from brain.memory.semantic_recall import (
     FULL_INJECT_STANDOUT_MAX,
     MAX_STANDOUT_COUNT,
@@ -104,6 +105,31 @@ def _mem(store: MemoryStore, content: str, *, state: str = "active") -> Memory:
     )
     store.create(m)
     return m
+
+
+# Name-recall fix R1 (S5/S23): a rerank runs only with at least
+# RERANK_MIN_REAL_CANDIDATES real candidates in the pool, so a test that
+# drives `run_semantic_recall` through the reranker pads a smaller pool with
+# filler memories the fake reranker leaves unscored (its far-below-any-floor
+# default), which therefore never surface.
+_FILLER_PREFIX = "unscored filler memory"
+# Anchors (appended on top of every rerank since R1) scored at 0.0, so the
+# anchor median is 0.0 and each scripted score's normalized value equals the
+# raw value these tests script against the seeded floor.
+_ANCHORS_AT_ZERO = dict.fromkeys(ANCHOR_POOL, 0.0)
+
+
+def _pad_to_rerank_minimum(store: MemoryStore, have: int) -> list[Memory]:
+    fillers = []
+    for i in range(RERANK_MIN_REAL_CANDIDATES - have):
+        filler = _mem(store, f"{_FILLER_PREFIX} {i}")
+        _seed_row_vector(store, filler.id, np.zeros(384, dtype=np.float32))
+        fillers.append(filler)
+    return fillers
+
+
+def _fillers(store: MemoryStore) -> list[Memory]:
+    return [m for m in store.list_active() if m.content.startswith(_FILLER_PREFIX)]
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +361,7 @@ def test_run_semantic_recall_is_fail_soft_when_scoring_raises(
     store = MemoryStore(tmp_path / "memories.db")
     mem = _mem(store, "a memory that DOES have a cached vector")
     _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
+    _pad_to_rerank_minimum(store, 1)
 
     result = run_semantic_recall(store, tmp_path, "any query")
 
@@ -366,6 +393,7 @@ def test_run_semantic_recall_is_fail_soft_when_reranker_raises(
     store = MemoryStore(tmp_path / "memories.db")
     mem = _mem(store, "a memory that DOES have a cached vector")
     _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
+    _pad_to_rerank_minimum(store, 1)
 
     result = run_semantic_recall(store, tmp_path, "any query")
 
@@ -393,7 +421,7 @@ def test_run_semantic_recall_writes_one_calibration_log_row_with_real_query(
 
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
-        lambda **kwargs: FakeRerankerProvider(scores={content: _TEST_FLOOR + 1.0}),
+        lambda **kwargs: FakeRerankerProvider(scores={**_ANCHORS_AT_ZERO, content: _TEST_FLOOR + 1.0}),
     )
     _align_embedding_tier(monkeypatch)
 
@@ -401,6 +429,7 @@ def test_run_semantic_recall_writes_one_calibration_log_row_with_real_query(
     _seed_floor(store)
     mem = _mem(store, content)
     _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
+    _pad_to_rerank_minimum(store, 1)
 
     result = run_semantic_recall(store, tmp_path, query)
 
@@ -449,7 +478,9 @@ def test_run_semantic_recall_logs_candidate_docs_as_recall_time_snapshot(
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
         lambda **kwargs: FakeRerankerProvider(
-            scores={original_content: _TEST_FLOOR + 1.0, other_content: _TEST_FLOOR + 0.5}
+            scores={
+                **_ANCHORS_AT_ZERO,
+                original_content: _TEST_FLOOR + 1.0, other_content: _TEST_FLOOR + 0.5}
         ),
     )
     _align_embedding_tier(monkeypatch)
@@ -460,6 +491,7 @@ def test_run_semantic_recall_logs_candidate_docs_as_recall_time_snapshot(
     other = _mem(store, other_content)
     _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
     _seed_row_vector(store, other.id, np.zeros(384, dtype=np.float32))
+    _pad_to_rerank_minimum(store, 2)
 
     result = run_semantic_recall(store, tmp_path, query)
     assert result is not None
@@ -475,12 +507,15 @@ def test_run_semantic_recall_logs_candidate_docs_as_recall_time_snapshot(
     candidate_ids = json.loads(row["candidate_ids"])
     candidate_docs = json.loads(row["candidate_docs"])
     assert len(candidate_docs) == len(candidate_ids), "candidate_docs must be 1:1 with candidate_ids"
-    assert len(candidate_ids) == 2, "test precondition: both seeded candidates must have been scored"
+    assert {mem.id, other.id} <= set(candidate_ids), (
+        "test precondition: both seeded candidates must have been scored"
+    )
 
     # Positional alignment: the doc at each index must be the RECALL-TIME
     # content of the memory whose id sits at that same index — not some
     # other candidate's content shifted into its slot by a reorder.
     expected_content_by_id = {mem.id: original_content, other.id: other_content}
+    expected_content_by_id.update({f.id: f.content for f in _fillers(store)})
     for cand_id, cand_doc in zip(candidate_ids, candidate_docs, strict=True):
         assert cand_doc == expected_content_by_id[cand_id], (
             "candidate_docs must be positionally aligned with candidate_ids — the doc logged at "
@@ -510,7 +545,7 @@ def test_calibration_log_write_failure_does_not_break_recall(
     content = "a memory that clears the floor"
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
-        lambda **kwargs: FakeRerankerProvider(scores={content: _TEST_FLOOR + 1.0}),
+        lambda **kwargs: FakeRerankerProvider(scores={**_ANCHORS_AT_ZERO, content: _TEST_FLOOR + 1.0}),
     )
     _align_embedding_tier(monkeypatch)
 
@@ -523,6 +558,7 @@ def test_calibration_log_write_failure_does_not_break_recall(
     _seed_floor(store)
     mem = _mem(store, content)
     _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
+    _pad_to_rerank_minimum(store, 1)
 
     result = run_semantic_recall(store, tmp_path, "any query")
 
@@ -551,7 +587,7 @@ def test_run_semantic_recall_uses_the_calibrated_floor_to_keep_a_candidate(
     # so this test could not pass by accident against a stale/wrong floor.
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
-        lambda **kwargs: FakeRerankerProvider(scores={content: seeded_floor + 0.01}),
+        lambda **kwargs: FakeRerankerProvider(scores={**_ANCHORS_AT_ZERO, content: seeded_floor + 0.01}),
     )
     _align_embedding_tier(monkeypatch)
 
@@ -559,6 +595,7 @@ def test_run_semantic_recall_uses_the_calibrated_floor_to_keep_a_candidate(
     _seed_floor(store, seeded_floor)
     mem = _mem(store, content)
     _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
+    _pad_to_rerank_minimum(store, 1)
 
     result = run_semantic_recall(store, tmp_path, "any query")
 
@@ -578,7 +615,7 @@ def test_run_semantic_recall_uses_the_calibrated_floor_to_abstain(
     seeded_floor = 2.5
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
-        lambda **kwargs: FakeRerankerProvider(scores={content: seeded_floor - 0.01}),
+        lambda **kwargs: FakeRerankerProvider(scores={**_ANCHORS_AT_ZERO, content: seeded_floor - 0.01}),
     )
     _align_embedding_tier(monkeypatch)
 
@@ -586,6 +623,7 @@ def test_run_semantic_recall_uses_the_calibrated_floor_to_abstain(
     _seed_floor(store, seeded_floor)
     mem = _mem(store, content)
     _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
+    _pad_to_rerank_minimum(store, 1)
 
     result = run_semantic_recall(store, tmp_path, "any query")
 
@@ -607,13 +645,14 @@ def test_run_semantic_recall_uses_the_bootstrap_floor_when_no_row_exists_yet(
     content = "a memory that would clear any floor this suite ever seeds"
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
-        lambda **kwargs: FakeRerankerProvider(scores={content: 1_000.0}),
+        lambda **kwargs: FakeRerankerProvider(scores={**_ANCHORS_AT_ZERO, content: 1_000.0}),
     )
     _align_embedding_tier(monkeypatch)
 
     store = MemoryStore(tmp_path / "memories.db")
     mem = _mem(store, content)
     _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
+    _pad_to_rerank_minimum(store, 1)
 
     floor = store.get_reranker_floor("fake-reranker")
     assert floor is not None, "test precondition: no persisted row, but a bootstrap must be served"
@@ -644,7 +683,7 @@ def test_run_semantic_recall_falls_back_to_lexical_when_the_bootstrap_computatio
     content = "a memory that would clear any floor this suite ever seeds"
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
-        lambda **kwargs: FakeRerankerProvider(scores={content: 1_000.0}),
+        lambda **kwargs: FakeRerankerProvider(scores={**_ANCHORS_AT_ZERO, content: 1_000.0}),
     )
 
     def _boom(model_id: str):
@@ -656,6 +695,7 @@ def test_run_semantic_recall_falls_back_to_lexical_when_the_bootstrap_computatio
     store = MemoryStore(tmp_path / "memories.db")
     mem = _mem(store, content)
     _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
+    _pad_to_rerank_minimum(store, 1)
 
     assert store.get_reranker_floor("fake-reranker") is None, (
         "test precondition: a failed bootstrap computation must degrade to None"
@@ -675,7 +715,7 @@ def test_run_semantic_recall_is_fail_soft_when_floor_read_raises(
     content = "a memory that DOES have a cached vector"
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
-        lambda **kwargs: FakeRerankerProvider(scores={content: 1_000.0}),
+        lambda **kwargs: FakeRerankerProvider(scores={**_ANCHORS_AT_ZERO, content: 1_000.0}),
     )
     _align_embedding_tier(monkeypatch)
 
@@ -687,6 +727,7 @@ def test_run_semantic_recall_is_fail_soft_when_floor_read_raises(
     store = MemoryStore(tmp_path / "memories.db")
     mem = _mem(store, content)
     _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
+    _pad_to_rerank_minimum(store, 1)
 
     result = run_semantic_recall(store, tmp_path, "any query")
 

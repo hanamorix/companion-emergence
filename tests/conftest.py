@@ -288,8 +288,9 @@ def _fake_reranker_provider_by_default(
 @pytest.fixture(autouse=True)
 def _reset_reranker_provider_cache() -> Iterator[None]:
     """Reset reranker.build_reranker_provider()'s process-level provider
-    cache, its warm-latency cache, its warm-memory cache (pre-flip revision
-    Change 3 — mirrors the warm-latency cache, same rationale), and
+    cache, the per-message width fit's rerank cost model (running sums and
+    warm-up state per reranker model id; name-recall fix R1, plan P-24 —
+    replaces the removed hourly warm-latency / warm-memory caches), and
     floor_calibration's bootstrap-floor cache (F2a inc8, #250 §7 UPDATED)
     before and after each test — mirrors `_reset_embedding_provider_cache`
     above for the same reason (a test that calls the REAL `build_reranker_
@@ -299,13 +300,11 @@ def _reset_reranker_provider_cache() -> Iterator[None]:
     from brain.memory import floor_calibration, reranker
 
     reranker._reset_reranker_provider_cache()
-    reranker._reset_latency_cache()
-    reranker._reset_memory_cache()
+    reranker._reset_rerank_cost_model()
     floor_calibration._reset_bootstrap_floor_cache()
     yield
     reranker._reset_reranker_provider_cache()
-    reranker._reset_latency_cache()
-    reranker._reset_memory_cache()
+    reranker._reset_rerank_cost_model()
     floor_calibration._reset_bootstrap_floor_cache()
 
 

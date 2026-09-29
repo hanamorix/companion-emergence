@@ -154,12 +154,32 @@ def _patch_reranker(monkeypatch: pytest.MonkeyPatch, scores: dict[str, float]) -
     calibrated floor), so a test that wants a CONCLUSIVE semantic result
     must script the specific memory contents it expects to clear the
     floor."""
-    from brain.memory.reranker import FakeRerankerProvider
+    from brain.memory.reranker import ANCHOR_POOL, FakeRerankerProvider
 
+    # Name-recall fix R1: anchors come on top of every rerank; scored at 0.0
+    # so each scripted score's normalized value equals the scripted value.
+    scripted = {**dict.fromkeys(ANCHOR_POOL, 0.0), **scores}
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
-        lambda **kwargs: FakeRerankerProvider(scores=scores),
+        lambda **kwargs: FakeRerankerProvider(scores=scripted),
     )
+
+
+def _pad_semantic_pool(store: MemoryStore, have: int) -> None:
+    """Name-recall fix R1 (S5/S23): a rerank runs only with at least
+    RERANK_MIN_REAL_CANDIDATES candidates, so a semantic-mode test with a
+    smaller pool adds filler memories: low cosine, no word shared with any
+    query here, and unscripted for the fake reranker (its far-below-floor
+    default), so they never surface."""
+    from brain.dev_constants import RERANK_MIN_REAL_CANDIDATES
+
+    for i in range(RERANK_MIN_REAL_CANDIDATES - have):
+        filler = _seed(store, f"zzfiller{i} qqpadding", created_at=_OLD)
+        store._conn.execute(  # noqa: SLF001
+            "UPDATE memories SET embedding = ?, embedding_model_id = ? WHERE id = ?",
+            (_unit_vec_with_cosine(0.05).tobytes(), _SCRIPTED_MODEL_ID, filler.id),
+        )
+    store._conn.commit()  # noqa: SLF001
 
 
 def _seed_floor(
@@ -282,6 +302,7 @@ def test_order_age_semantic_widens_and_age_sorts_over_top_k_cosine(
         vectors,
         contents_by_id={strong_old.id: strong_old_text, weak_recent.id: weak_recent_text},
     )
+    _pad_semantic_pool(ctx["store"], 2)
     _patch_provider(monkeypatch, vectors, dim=dim)
     _seed_floor(ctx["store"])
     # Both clear the calibrated floor (order="age" widens the fetch, it

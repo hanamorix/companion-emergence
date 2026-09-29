@@ -39,7 +39,8 @@ This module owns:
   - the query embed (the ONE allowed synchronous in-turn embed, decision 4)
   - the cosine coarse-cut (cheap pre-filter to `relevance.CANDIDATE_POOL`)
   - the rerank call (`reranker.build_reranker_provider` +
-    `reranker.get_rerank_width`, auto-scaled to a measured per-host latency)
+    `reranker.rerank_for_recall`, its width fitted per message to the
+    measured rerank cost on this host)
   - the floor-gated standout selection (`select_standouts`) — replaces
     `classify_semantic_shape`'s cosine standout/clump judgment
   - the surfacing-tier decision (which candidate ids are "full" vs
@@ -275,7 +276,8 @@ def run_semantic_recall(
     against the model_id-scoped candidate pool as a CHEAP COARSE CUT (top-
     `relevance.CANDIDATE_POOL`), reranks an auto-scaled-width slice of that
     coarse cut with a cross-encoder (`reranker.build_reranker_provider` +
-    `reranker.get_rerank_width`), and floor-gates the reranker score
+    `reranker.rerank_for_recall`, width fitted per message), and floor-gates
+    the reranker score
     (`select_standouts`, against the CALIBRATED floor read live via
     `store.get_reranker_floor(reranker_provider.model_id())` — F2a inc8,
     #250 §7/§8 cutover) to decide relevance (#231 RERANKER RE-ARCHITECTURE
@@ -337,36 +339,29 @@ def run_semantic_recall(
         coarse = cosine_scored[:CANDIDATE_POOL]
 
         reranker_provider = reranker_mod.build_reranker_provider(store=store)
-        # #231-fix: calibrate on REAL candidate-pool documents (a small
-        # sample off the front of the already cosine-sorted `coarse`
-        # list) rather than a synthetic placeholder — see
-        # reranker.get_rerank_width's docstring.
-        calibration_sample = [
-            pool[mid][0].content
-            for mid, _ in coarse[: reranker_mod.CALIBRATION_SAMPLE_SIZE]
-        ]
-        width = reranker_mod.get_rerank_width(len(coarse), reranker_provider, calibration_sample)
-        to_rerank = coarse[:width]
-        rerank_ids = [mid for mid, _ in to_rerank]
-        real_documents = [pool[mid][0].content for mid in rerank_ids]
-        # F2b (#276 §2/§4): one combined rerank() call (real candidates +
-        # hardware-derived anchor count), normalized against the anchor
-        # median BEFORE anything downstream (the log write, the floor gate)
-        # ever sees a score — `normalize_against_anchors` is inc1's already-
-        # built, already-tested helper; this call site only wires it in, it
-        # does not reimplement any of its arithmetic. `scored_ids` is the
-        # PREFIX of `rerank_ids` that was actually scored this call
-        # (`result.real_width` <= `width` — fewer than `width` only when
-        # anchors were reserved out of it, spec §3); `result.scores` is
-        # positionally aligned with `scored_ids` 1:1. Anchors themselves
-        # never appear in `result.scores`/`scored_ids` — this is computed
-        # entirely inside the helper and never leaves it, so there is
-        # nothing here that could leak an anchor id/content into the
-        # log write, the gate, or the surfaced result below.
-        normalization = reranker_mod.normalize_against_anchors(
-            reranker_provider, user_input, real_documents, width
+        # Name-recall fix R1 (spec §1): the width is fitted for THIS message
+        # from its own candidates' surviving pair lengths and the process's
+        # measured cost model (no hourly sample, diagnosis H8); anchors come
+        # on top of the fitted real candidates; the call is measured and
+        # feeds the cost model. Prefix order is the cosine coarse cut here;
+        # R3 puts genuine candidates ahead of the monologue family.
+        coarse_ids = [mid for mid, _ in coarse]
+        outcome = reranker_mod.rerank_for_recall(
+            reranker_provider, user_input, [pool[mid][0].content for mid in coarse_ids]
         )
-        scored_ids = rerank_ids[: normalization.real_width]
+        if not outcome.reranked or outcome.normalization is None:
+            # Fewer than the S5 minimum fit (or exist), or no anchor median:
+            # no score from this query may be gated (S5/S7, H7). R2 sends
+            # this case to the cosine path; until then it is inconclusive.
+            log.info(
+                "run_semantic_recall: no rerank (%s, width %d) — falling back to lexical",
+                outcome.hand_off,
+                outcome.width,
+            )
+            return None
+        normalization = outcome.normalization
+        scored_ids = coarse_ids[: normalization.real_width]
+        real_documents = [pool[mid][0].content for mid in scored_ids]
         rerank_scores = normalization.scores
         try:
             # F2a (#250 inc4), re-pointed by F2b (#276 §5): real-query
@@ -376,9 +371,8 @@ def run_semantic_recall(
             # are the SAME already-computed, already-NORMALIZED per-turn
             # values that feed the floor gate just below (computed once,
             # above, reused as-is here) — never the raw pre-normalization
-            # score, and never more ids than were actually scored this call
-            # (`scored_ids`, not the full `rerank_ids`, when anchors
-            # narrowed `real_width` below `width`). `log_calibration_sample`
+            # score, and exactly the ids scored this call (the fitted
+            # prefix; anchors are never logged). `log_calibration_sample`
             # stamps the current score_scale on this row itself. One
             # bounded INSERT, off the hot path in every sense but this
             # single cheap write (I6). Wrapped separately from the outer
@@ -387,13 +381,10 @@ def run_semantic_recall(
             # loses that one turn's calibration row.
             #
             # F2c inc1 (data foundation only, spec §3 Addition B):
-            # `candidate_docs` is `real_documents` sliced to the SAME
-            # `normalization.real_width` prefix as `scored_ids` above —
-            # `real_documents` is built from `rerank_ids` in the same order
-            # (`real_documents = [pool[mid][0].content for mid in
-            # rerank_ids]`, above), so `real_documents[:real_width]` is
-            # positionally 1:1 with `scored_ids`/`candidate_ids` exactly the
-            # way `rerank_scores` already is. This is the RECALL-TIME text
+            # `candidate_docs` is `real_documents`, built from `scored_ids`
+            # in the same order, so it is positionally 1:1 with
+            # `scored_ids`/`candidate_ids` exactly the way `rerank_scores`
+            # already is. This is the RECALL-TIME text
             # snapshot — the whole point of logging it here rather than
             # re-fetching by id later is that a memory can drift/be
             # forgotten between this turn and whenever F2c's weekly tick
@@ -403,7 +394,7 @@ def run_semantic_recall(
                 candidate_ids=scored_ids,
                 reranker_scores=rerank_scores,
                 reranker_model_id=reranker_provider.model_id(),
-                candidate_docs=real_documents[: normalization.real_width],
+                candidate_docs=real_documents,
             )
         except Exception:  # noqa: BLE001 — fail-soft: logging must never break recall
             log.warning(

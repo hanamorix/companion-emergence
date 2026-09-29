@@ -18,9 +18,10 @@ import numpy as np
 import pytest
 
 from brain.bridge import model_tier
+from brain.dev_constants import RERANK_MIN_REAL_CANDIDATES
 from brain.memory.embeddings import EmbeddingProvider
 from brain.memory.hebbian import HebbianMatrix
-from brain.memory.reranker import FakeRerankerProvider
+from brain.memory.reranker import ANCHOR_POOL, FakeRerankerProvider
 from brain.memory.store import Memory, MemoryStore
 from brain.tools.dispatch import dispatch
 
@@ -136,10 +137,28 @@ def _patch_reranker(monkeypatch: pytest.MonkeyPatch, scores: dict[str, float]) -
     a CONCLUSIVE (floor-clearing) semantic result must script the specific
     memory contents it expects to surface, same pattern as `_patch_provider`
     above for the embedding side."""
+    # Name-recall fix R1: anchors come on top of every rerank; scored at 0.0
+    # so each scripted score's normalized value equals the scripted value.
+    scripted = {**dict.fromkeys(ANCHOR_POOL, 0.0), **scores}
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
-        lambda **kwargs: FakeRerankerProvider(scores=scores),
+        lambda **kwargs: FakeRerankerProvider(scores=scripted),
     )
+
+
+def _pad_semantic_pool(store: MemoryStore, have: int) -> None:
+    """Name-recall fix R1 (S5/S23): a rerank runs only with at least
+    RERANK_MIN_REAL_CANDIDATES candidates, so a semantic-mode test with a
+    smaller pool adds filler memories: low cosine, no word shared with any
+    query here, and unscripted for the fake reranker (its far-below-floor
+    default), so they never surface in either mode."""
+    for i in range(RERANK_MIN_REAL_CANDIDATES - have):
+        filler = _seed(store, f"zzfiller{i} qqpadding")
+        store._conn.execute(  # noqa: SLF001
+            "UPDATE memories SET embedding = ?, embedding_model_id = ? WHERE id = ?",
+            (_unit_vec_with_cosine(0.05).tobytes(), _SCRIPTED_MODEL_ID, filler.id),
+        )
+    store._conn.commit()  # noqa: SLF001
 
 
 def _seed_floor(
@@ -177,6 +196,7 @@ def test_default_mode_is_semantic(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     m_target = _seed(ctx["store"], target)
 
     _seed_vectors(ctx["store"], vectors, contents_by_id={m_target.id: target})
+    _pad_semantic_pool(ctx["store"], 1)
     _patch_provider(monkeypatch, vectors, dim=dim)
     _seed_floor(ctx["store"])
     _patch_reranker(monkeypatch, scores={target: _TEST_FLOOR + 5.0})
@@ -255,6 +275,7 @@ def test_mode_semantic_paraphrase_beats_keyword_overlap_decoy(
     m_decoy = _seed(ctx["store"], decoy)
 
     _seed_vectors(ctx["store"], vectors, contents_by_id={m_target.id: target, m_decoy.id: decoy})
+    _pad_semantic_pool(ctx["store"], 2)
     _patch_provider(monkeypatch, vectors, dim=dim)
     _seed_floor(ctx["store"])
     # Both clear the calibrated floor (so the assertion actually exercises

@@ -100,7 +100,8 @@ def _semantic_top_k(
     passive recall uses) as a CHEAP COARSE CUT to ``relevance.CANDIDATE_
     POOL``, then reranks an auto-scaled-width slice of that coarse cut with
     the cross-encoder (``reranker.build_reranker_provider`` + ``reranker.
-    get_rerank_width``, same auto-scaling ``run_semantic_recall`` uses).
+    rerank_for_recall``, the same per-message width fit ``run_semantic_recall``
+    uses).
 
     F2b (#276 §2/§4): the score compared against the floor is the
     per-query anchor-median NORMALIZED score (``reranker.normalize_
@@ -164,31 +165,28 @@ def _semantic_top_k(
         coarse = cosine_scored[:CANDIDATE_POOL]
 
         reranker_provider = reranker_mod.build_reranker_provider(store=store)
-        # #231-fix: calibrate on REAL candidate-pool documents (a small
-        # sample off the front of the already cosine-sorted `coarse`
-        # list) rather than a synthetic placeholder — see
-        # reranker.get_rerank_width's docstring.
-        calibration_sample = [
-            pool[mid][0].content
-            for mid, _ in coarse[: reranker_mod.CALIBRATION_SAMPLE_SIZE]
-        ]
-        width = reranker_mod.get_rerank_width(len(coarse), reranker_provider, calibration_sample)
-        to_rerank = coarse[:width]
-        rerank_ids = [mid for mid, _ in to_rerank]
-        real_documents = [pool[mid][0].content for mid in rerank_ids]
-        # F2b (#276 §2/§4): normalize against the anchor median BEFORE the
-        # floor gate below — mirrors `run_semantic_recall`'s identical
-        # wiring (inc1's `normalize_against_anchors` is reused unchanged,
-        # not reimplemented here). `scored_ids` is the PREFIX of
-        # `rerank_ids` actually scored this call (`result.real_width` <=
-        # `width`); `result.scores` is positionally aligned with it 1:1.
-        # This site has no calibration-log write to re-point (confirmed —
-        # only `run_semantic_recall` logs). Anchors never leave the helper,
-        # so they can never enter `scored_ids`/the gate/the returned list.
-        normalization = reranker_mod.normalize_against_anchors(
-            reranker_provider, query, real_documents, width
+        # Name-recall fix R1 (spec §1): same per-message width fit, anchors
+        # on top and cost measurement as `run_semantic_recall` (the tool's
+        # reranks are recall-time reranks too, S24). `normalization.scores`
+        # is positionally aligned with `scored_ids` 1:1; anchors never leave
+        # the helper, so they can never enter the gate or the returned list.
+        # This site has no calibration-log write (S56).
+        coarse_ids = [mid for mid, _ in coarse]
+        outcome = reranker_mod.rerank_for_recall(
+            reranker_provider, query, [pool[mid][0].content for mid in coarse_ids]
         )
-        scored_ids = rerank_ids[: normalization.real_width]
+        if not outcome.reranked or outcome.normalization is None:
+            # Fewer than the S5 minimum fit (or exist), or no anchor median:
+            # nothing may be gated (S5/S7). R2 sends this case to the cosine
+            # path; until then the tool falls back to lexical.
+            logger.info(
+                "search_memories(semantic): no rerank (%s, width %d) — falling back to lexical",
+                outcome.hand_off,
+                outcome.width,
+            )
+            return None
+        normalization = outcome.normalization
+        scored_ids = coarse_ids[: normalization.real_width]
         rerank_scores = normalization.scores
 
         # F2a inc8 (#250 §7 UPDATED): read the operative floor live, keyed
