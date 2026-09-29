@@ -33,6 +33,10 @@ from brain.memory.recall_stopwords import RECALL_STOPWORDS
 
 T0 = datetime(2026, 9, 29, 12, 0, 0, tzinfo=UTC)
 
+# The test's own connections use this, so a seam on ``sqlite3.connect`` (which is the
+# same module object the code under test uses) never sees them.
+_CONNECT = sqlite3.connect
+
 
 def _db(persona: Path) -> Path:
     return kn.known_names_path(persona)
@@ -74,13 +78,16 @@ def quick_busy(monkeypatch: pytest.MonkeyPatch) -> None:
     """Shrink the writers' busy wait so a locked file fails at once.
 
     The writers pass no timeout (SQLite's default, S88), so the seam fills one in
-    on any connect call that does not carry its own.
+    on every writer-side connect (the reader's ``uri=True`` connect is left alone)
+    and FAILS a writer that brings its own, so a writer that goes back to a fixed
+    constant fails these tests at once instead of merely making them slow.
     """
     real = sqlite3.connect
 
     def quick(database: str, *args: object, **kwargs: object) -> sqlite3.Connection:
-        if not args:
-            kwargs.setdefault("timeout", 0.05)
+        if not kwargs.get("uri"):
+            assert "timeout" not in kwargs and not args, "writers must use SQLite's default timeout"
+            kwargs["timeout"] = 0.05
         return real(database, *args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(kn.sqlite3, "connect", quick)
@@ -542,7 +549,7 @@ def test_a_write_between_the_row_read_and_the_cache_store_is_seen_next_lookup(
 @contextlib.contextmanager
 def _exclusive_lock(persona: Path):
     """A writer mid-commit: an open exclusive transaction on the names file."""
-    conn = sqlite3.connect(str(_db(persona)), isolation_level=None, timeout=0)
+    conn = _CONNECT(str(_db(persona)), isolation_level=None, timeout=0)
     conn.execute("BEGIN EXCLUSIVE")
     try:
         yield conn
@@ -741,6 +748,8 @@ def test_a_lone_surrogate_in_an_extracted_name_does_not_lose_the_name_or_raise(
     out = kn.admit_names(persona, ["Zoe\ud83d", "Wren"], "gate", now=T0)
     assert out == ["zoe", "wren"]
     assert _names(persona) == {"zoe", "wren"}
+    # SQLite cannot bind the half emoji; UTF-8 "replace" turns it into "?".
+    assert {r[0]: r[1] for r in _rows(persona)} == {"zoe": "Zoe?", "wren": "Wren"}
 
 
 @pytest.mark.parametrize("exc", [sqlite3.InterfaceError("bad bind"), ValueError("bad value")])
@@ -817,7 +826,14 @@ def test_renaming_a_corrupt_file_aside_takes_its_journal_sidecar_with_it(persona
 
 @pytest.mark.parametrize(
     ("entry", "lower"),
-    [("José", "jos"), ("Zoë", "zo"), ("Müller", "m ller"), ("Åsa Núñez", "sa n ez")],
+    [
+        ("José", "jos"),
+        ("Zoë", "zo"),
+        ("Müller", "m ller"),
+        ("Åsa Núñez", "sa n ez"),
+        ("Jose\u0301", "jose"),  # decomposed (NFD): stored with the combining mark, not composed
+        ("Zoe\u0308", "zoe"),
+    ],
 )
 def test_the_display_form_keeps_accents_exactly_as_extracted(
     persona: Path, entry: str, lower: str

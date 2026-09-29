@@ -357,7 +357,7 @@ def _admit(name: object) -> tuple[str, str] | None:
     if not isinstance(name, str):
         return None
     # A lone UTF-16 surrogate (a half emoji from a model's JSON escape) cannot be
-    # bound to SQLite; replace it so the name itself is still admitted.
+    # bound to SQLite; the replace step turns it into "?" so the name is still admitted.
     display = name.strip().encode("utf-8", "replace").decode("utf-8")
     lower = normalize_name(display)
     if not lower or lower in RECALL_STOPWORDS:
