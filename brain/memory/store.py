@@ -628,6 +628,21 @@ def split_by_raw_query_floor(tokens: Sequence[str]) -> tuple[list[str], list[str
     return kept, [t for t in tokens if len(t) < _FTS_TOKEN_MIN_LEN]
 
 
+class FtsPhrases(tuple):
+    """A keyword query made of whole PHRASES (name-recall fix R5, spec §5, S47).
+
+    Each element is one phrase: its words (letter/digit runs) must occur
+    consecutively, in order. ``_to_fts_match`` sends each element as ONE quoted
+    FTS phrase and OR-joins them, with no length floor and no splitting into
+    separate terms: a listed name is matched as the name ("new york" does not
+    match "new dress ... york street"), and a 2-letter name is not dropped. A
+    plain ``tuple`` subclass so it travels through every ``str | Sequence[str]``
+    query parameter (``rank_memories``, ``search_fts_scored``) unchanged.
+    """
+
+    __slots__ = ()
+
+
 def _to_fts_match(query: str | Sequence[str]) -> str:
     """Build an FTS5 MATCH expression from a query.
 
@@ -647,9 +662,28 @@ def _to_fts_match(query: str | Sequence[str]) -> str:
     double-quoting makes each term a literal FTS string, immune to a token that
     collides with an FTS keyword (AND/OR/NOT/NEAR) or a special char.
 
+    A :class:`FtsPhrases` query (the known-names query, R5) is a list of whole
+    phrases: each is sent as one double-quoted FTS phrase (its words re-joined
+    by single spaces, so nothing but letters, digits and spaces can reach the
+    expression), OR-joined, with no length floor.
+
     Returns ``""`` when the query yields no usable tokens (caller returns no
     matches rather than issuing a MATCH).
     """
+    if isinstance(query, FtsPhrases):
+        seen_phrases: set[str] = set()
+        phrases: list[str] = []
+        for phrase in query:
+            words = re.findall(r"[A-Za-z0-9]+", phrase)
+            if not words:
+                continue
+            text = " ".join(words)
+            low = text.lower()
+            if low in seen_phrases:
+                continue
+            seen_phrases.add(low)
+            phrases.append(f'"{text}"')
+        return " OR ".join(phrases)
     if isinstance(query, str):
         pieces = re.split(r"[^A-Za-z0-9]+", query)
         min_len = _FTS_TOKEN_MIN_LEN

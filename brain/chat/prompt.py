@@ -30,6 +30,8 @@ from brain.memory.relevance import (
     FULL_INJECT_MAX,
     SNIPPET_COUNT,
     SNIPPET_MODE_ENABLED,
+    names_in,
+    rank_name_hits,
     snippet_length,
 )
 from brain.memory.semantic_recall import (
@@ -918,9 +920,8 @@ def _sort_keyword_tier(ranked: list) -> list:
 def _order_keyword_tiers(*tiers: list) -> list:
     """Concatenate keyword tiers in order, dropping repeats (a memory keeps the
     first, highest, tier it appeared in). Order of the arguments = the order of
-    the spec's keyword search (S79): the NAME query's hits first (R5 fills that
-    slot; it is empty until then), then today's capped selection, then the
-    remaining tokens."""
+    the spec's keyword search (S79): the NAME query's hits first (R5), then
+    today's capped selection, then the remaining tokens."""
     seen: set[str] = set()
     out: list = []
     for tier in tiers:
@@ -1108,7 +1109,13 @@ def _build_recall_block(
     and the block is omitted from the prompt.
     """
     tokens = _extract_recall_tokens(user_input, store)
-    if not tokens:
+    # Name protection (name-recall fix R5, spec §5, S27, S36, S47): the known
+    # names in her words, matched on the RAW words before the stopword and
+    # length rules. A message that is only a known name ("Will", "Al") still
+    # has something to search, so it is not empty. No persona_dir means no
+    # known-names file to read: no protection on that (test-only) path.
+    names = names_in(persona_dir, user_input)
+    if not tokens and not names:
         return ""
     # The old top-`_RECALL_TOKEN_LIMIT` selection (P-31): still what the
     # graveyard search and the "not recognised" list are fed (S71, Q16 interim).
@@ -1228,6 +1235,9 @@ def _build_recall_block(
     active_hits: list = []
     fading_hits: list = []
     lost_hits: list = []
+    # The name query's hits (R5), ranked ahead of every general keyword hit.
+    name_active: list = []
+    name_fading: list = []
     # id → best blended score (None-sentinel: an unranked id is simply
     # absent, so the merge falls back to (-importance, -ts) for it).
     merged_score: dict[str, float] = {}
@@ -1273,6 +1283,20 @@ def _build_recall_block(
                 ranked2 = []
             tier2_active = _sort_keyword_tier([p for p in ranked2 if p[0].state == "active"])
             tier2_fading = _sort_keyword_tier([p for p in ranked2 if p[0].state == "fading"])
+        # Name query (R5, spec §5, S27, S35): ONE extra keyword query for the
+        # message's name words, phrases through the same ranker, active and
+        # fading buckets, sharing this turn's hebbian handle. Its hits rank
+        # ahead of the general keyword hits (merged below). It does NOT feed the
+        # graveyard: the lost bucket keeps today's capped-token feed until the
+        # owner rules on F11 (P-14/P-25), so a name whose only memory is lost
+        # surfaces no lost hit through this query.
+        if names:
+            try:
+                ranked_names = rank_name_hits(store, heb, names, limit=limit * 2)
+            except Exception:  # noqa: BLE001
+                ranked_names = []
+            name_active = _sort_keyword_tier([p for p in ranked_names if p[0].state == "active"])
+            name_fading = _sort_keyword_tier([p for p in ranked_names if p[0].state == "fading"])
         if result is not None:
             for mem in result.active:
                 s = result.scores.get(mem.id)
@@ -1314,8 +1338,20 @@ def _build_recall_block(
     # S71 (REVIEW-PENDING): the list keeps today's size and filter: it is
     # chosen from the tokens the old 10-token selector picked; the tokens
     # beyond that are searched but never listed.
-    stats = store.term_stats(legacy_tokens)
-    unfamiliar: list[str] = [t for t in legacy_tokens if stats.get(t.lower(), (0, 0.0))[0] == 0]
+    # R5 (P-15, S31/S53): the matched known names join the candidates. A
+    # single-word name is checked like any token; a multi-word name is listed
+    # when one of its words is unknown (a necessary condition for the phrase
+    # to be absent).
+    extra_names = [n for n in names if n not in legacy_tokens]
+    lookup = legacy_tokens + [
+        w for n in extra_names for w in n.split(" ") if w not in legacy_tokens
+    ]
+    stats = store.term_stats(lookup)
+    unfamiliar: list[str] = [
+        c
+        for c in [*legacy_tokens, *extra_names]
+        if any(stats.get(w.lower(), (0, 0.0))[0] == 0 for w in c.split(" "))
+    ]
 
     # B → A fallback: when noise risk is high, keep only proper-noun-shaped tokens.
     # Tokens are already lowercased, so capitalisation is re-read from the raw
@@ -1339,14 +1375,20 @@ def _build_recall_block(
         fading_hits.sort(key=lambda m: -merged_fading.get(m.id, float("-inf")))
     else:
         fading_hits.sort(key=_recall_sort_key)
-    # Keyword tiers (S79): name-query hits (R5 seam: [] until then), then tier 1
-    # (today's capped search), then tier 2; the family after every genuine hit.
-    name_active: list = []
-    tier2_only = frozenset(m.id for m in tier2_active) - {m.id for m in active_hits}
+    # Keyword tiers (S79): name-query hits first (R5), then tier 1 (today's
+    # capped search), then tier 2; the family after every genuine hit. A hit the
+    # name query or tier 1 also found is not a tier-2 extra.
+    tier2_only = (
+        frozenset(m.id for m in tier2_active)
+        - {m.id for m in active_hits}
+        - {m.id for m in name_active}
+    )
     active_hits = genuine_first_memories(
         _order_keyword_tiers(name_active, active_hits, [m for m in tier2_active if m.id not in seen_fading])
     )
-    fading_hits = _order_keyword_tiers(fading_hits, [m for m in tier2_fading if m.id not in seen_active])
+    fading_hits = _order_keyword_tiers(
+        name_fading, fading_hits, [m for m in tier2_fading if m.id not in seen_active]
+    )
 
     # The "active:" section: semantic results first, keyword hits in the slots
     # they leave, tiers by position (P-10). A CONCLUSIVE semantic result always

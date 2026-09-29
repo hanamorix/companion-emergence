@@ -11,7 +11,13 @@ from brain.memory import embeddings as embeddings_mod
 from brain.memory.embedding_matrix import build_embedding_matrix
 from brain.memory.embeddings import cosine_similarity
 from brain.memory.hebbian import HebbianMatrix
-from brain.memory.relevance import CANDIDATE_POOL, rank_memories, snippet_length
+from brain.memory.relevance import (
+    CANDIDATE_POOL,
+    names_in,
+    rank_memories,
+    rank_name_hits,
+    snippet_length,
+)
 from brain.memory.semantic_recall import (
     build_semantic_candidate_pool,
     gated_cleared,
@@ -87,7 +93,8 @@ class _KeywordHits(list):
     """The tool's keyword hits, best-first, remembering which of them were found
     ONLY through tier 2 (`tier2_only`, S79): the caller's age sort, emotion boost
     and co-recall reinforcement must not let those extras displace, reorder
-    ahead of, or link to what tier 1 (today's search) surfaces."""
+    ahead of, or link to what tier 1 (today's search) surfaces. (A hit the name
+    query also found is not an extra.)"""
 
     tier2_only: frozenset[str] = frozenset()
 
@@ -98,6 +105,7 @@ def _keyword_candidates(
     query: str,
     *,
     exclude: frozenset[str],
+    persona_dir: Path | None = None,
 ) -> list[Memory]:
     """The tool's keyword search, every candidate best-first (name-recall fix
     R4, spec §5, S81, S79): BM25 text-match + importance + hebbian
@@ -112,13 +120,21 @@ def _keyword_candidates(
     genuine ones (spec §4, S16, ``genuine_first``). ``exclude`` ids are removed
     before ranking.
 
-    R5 seam: the known-names query (its hits ahead of everything, S79) belongs
-    in front of this list in BOTH modes; it is not built yet.
+    Name protection (R5, spec §5, S27, S35, S79), BOTH modes: the known names
+    in her query (matched on the raw words, before any stopword or length rule;
+    ``persona_dir`` locates the list) run ONE extra keyword query, sent as FTS
+    phrases; its hits lead this list, ahead of tier 1 and tier 2 (genuine before
+    monologue family across all of them, spec §4). No graveyard is involved
+    here. Every word of her query is still searched (S81), so a listed name is
+    protected in rank, not merely found.
     """
     words = _query_words(query)
     if not words:
         return []
     kept, short = split_by_raw_query_floor(words)
+    names = names_in(persona_dir, query)
+    name_ranked = rank_name_hits(store, hebbian, names, limit=CANDIDATE_POOL, exclude_ids=exclude)
+    name_hits = [m for m, _ in name_ranked]
     tiers: list[list[Memory]] = []
     for tier_words in (kept, short):
         if not tier_words:
@@ -129,14 +145,18 @@ def _keyword_candidates(
         tiers.append([m for m, _ in ranked])
     seen: set[str] = set()
     merged: list[Memory] = []
-    for tier in tiers:
+    for tier in (name_hits, *tiers):
         for m in tier:
             if m.id not in seen:
                 seen.add(m.id)
                 merged.append(m)
     hits = _KeywordHits(genuine_first_memories(merged))
     if len(tiers) == 2:
-        hits.tier2_only = frozenset(m.id for m in tiers[1]) - {m.id for m in tiers[0]}
+        hits.tier2_only = (
+            frozenset(m.id for m in tiers[1])
+            - {m.id for m in tiers[0]}
+            - {m.id for m in name_hits}
+        )
     return hits
 
 
@@ -147,11 +167,13 @@ def _lexical_candidates(
     *,
     limit: int,
     exclude: frozenset[str],
+    persona_dir: Path | None = None,
 ) -> list[Memory]:
-    """``mode="lexical"``: the keyword search (``_keyword_candidates``), first
-    ``limit`` results (still remembering which came only from tier 2). Shares
-    the emotion-boost/formatting tail below with the semantic mode."""
-    hits = _keyword_candidates(store, hebbian, query, exclude=exclude)
+    """``mode="lexical"``: the keyword search (``_keyword_candidates``, name
+    query first, R5), first ``limit`` results (still remembering which came
+    only from tier 2). Shares the emotion-boost/formatting tail below with the
+    semantic mode."""
+    hits = _keyword_candidates(store, hebbian, query, exclude=exclude, persona_dir=persona_dir)
     first = _KeywordHits(hits[:limit])
     first.tier2_only = getattr(hits, "tier2_only", frozenset())
     return first
@@ -319,7 +341,10 @@ def search_memories(
         query is sent, with no stopword drop, no length floor and no cap (spec
         §5, S81), so 'Henryk preferences personality' finds memories
         mentioning ANY word, as a union, not the empty AND-intersection, and a
-        lowercase name not yet on the known-names list is still found.
+        lowercase name not yet on the known-names list is still found. A name
+        that IS on the list (matched on her raw words, before any stopword or
+        length rule) adds the one name query (R5, spec §5): its hits lead the
+        keyword results in both modes.
 
     ``order`` picks how the MATCHED set (whichever ``mode`` produced it) is
     ordered before the final ``limit`` slice (#231, Planning-signed-off
@@ -407,11 +432,15 @@ def search_memories(
             # merges in below the semantic results, filling the slots they leave
             # under the fetch limit. The reported mode stays "semantic": at
             # least one semantic result contributed.
-            keyword = _keyword_candidates(store, hebbian, query, exclude=exclude)
+            keyword = _keyword_candidates(
+                store, hebbian, query, exclude=exclude, persona_dir=persona_dir
+            )
             tier2_only = getattr(keyword, "tier2_only", frozenset())
             candidates = _merge_keyword_below_semantic(semantic, keyword, cap=fetch_limit)
     if candidates is None:
-        candidates = _lexical_candidates(store, hebbian, query, limit=fetch_limit, exclude=exclude)
+        candidates = _lexical_candidates(
+            store, hebbian, query, limit=fetch_limit, exclude=exclude, persona_dir=persona_dir
+        )
         tier2_only = getattr(candidates, "tier2_only", frozenset())
 
     def _tail_order(group: list[Memory]) -> list[Memory]:
