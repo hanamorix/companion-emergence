@@ -32,6 +32,7 @@ from brain.felt_time.state import FeltTimeState
 from brain.felt_time.state import persist as persist_felt_time
 from brain.forgetting import graveyard as gv
 from brain.forgetting.salience import SalienceInputs
+from brain.memory import keyword_budget
 from brain.memory.pending import PendingQueue
 from brain.memory.relevance import FULL_INJECT_MAX, SNIPPET_COUNT
 from brain.memory.semantic_recall import (
@@ -370,6 +371,10 @@ def test_a_two_letter_acronym_the_selector_keeps_reaches_the_store(tmp_path: Pat
     for i in range(3):
         _mem(store, f"harbour filler entry {i}")
     assert _extract_recall_tokens("AI", store) == ["ai"]
+    # Tier 1 searches no word here (its 3-character floor drops "ai"), so this
+    # message has no tier-1 seed: give the extra-words step a measured estimate
+    # (S131: with no estimate at all it searches nothing; see test_keyword_budget_recall).
+    keyword_budget._keyword_cost.record(str(store.db_path), 1, 0.0)
     # the raw-string path (other callers) keeps its 3-character minimum ...
     assert store.search_fts_scored("ai", limit=10) == []
     # ... a selector token list admits it, in passive recall too

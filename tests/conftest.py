@@ -326,6 +326,21 @@ def _paragraph_time_model_reset(monkeypatch: pytest.MonkeyPatch) -> Iterator[Non
 
 
 @pytest.fixture(autouse=True)
+def _keyword_budget_reset(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Long-paste increment (S103, plan P-3): reset the keyword extra-words cost
+    series and re-arm its first-sample discard before and after each test, and
+    freeze the budget clock (`keyword_budget._clock`) at 0, so an unscripted
+    test sees `left` = the whole budget and a seed rate of 0 (every extra word
+    fits), exactly as before S103, unless it scripts the clock itself."""
+    from brain.memory import keyword_budget
+
+    keyword_budget._reset_keyword_cost()
+    monkeypatch.setattr(keyword_budget, "_clock", lambda: 0.0)
+    yield
+    keyword_budget._reset_keyword_cost()
+
+
+@pytest.fixture(autouse=True)
 def _floor_bootstrap_background_off_by_default(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[None]:

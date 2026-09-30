@@ -23,6 +23,7 @@ from brain.chat.tool_inventory import build_tool_inventory
 from brain.engines.daemon_state import DaemonState, get_residue_context
 from brain.engines.research_ambient import build_research_awareness_block
 from brain.maker.ambient import build_maker_awareness_block
+from brain.memory import keyword_budget
 from brain.memory.recall_open import open_memory
 from brain.memory.recall_stopwords import RECALL_STOPWORDS
 from brain.memory.relevance import (
@@ -1145,6 +1146,9 @@ def _build_recall_block(
     Empty input or no matches in any bucket → returns the empty string
     and the block is omitted from the prompt.
     """
+    # The per-message recall clock (S132): "what is left of the budget" for the
+    # extra words (tier 2) is the budget minus the wall time spent from here.
+    started = keyword_budget.now()
     tokens = _extract_recall_tokens(user_input, store)
     # Name protection (name-recall fix R5, spec §5, S27, S36, S47): the known
     # names in her words, matched on the RAW words before the stopword and
@@ -1167,15 +1171,22 @@ def _build_recall_block(
 
         # Two tiers (S79): today's capped query, then the remaining tokens.
         capped_query, remainder = _keyword_tiers(tokens, legacy_tokens)
+        seed = None
         try:
-            ranked = rank_memories(store, None, capped_query, limit=limit, genuine_first=True)
+            ranked, seed = keyword_budget.timed_tier1(
+                store,
+                legacy_tokens,
+                lambda: rank_memories(store, None, capped_query, limit=limit, genuine_first=True),
+            )
         except Exception:  # noqa: BLE001
             ranked = []
         try:
-            ranked2 = (
-                rank_memories(store, None, remainder, limit=limit, genuine_first=True)
-                if remainder
-                else []
+            ranked2 = keyword_budget.search_extra_words(
+                store,
+                remainder,
+                started,
+                lambda words: rank_memories(store, None, words, limit=limit, genuine_first=True),
+                seed,
             )
         except Exception:  # noqa: BLE001
             ranked2 = []
@@ -1294,6 +1305,7 @@ def _build_recall_block(
     # call that shares it), close it once. integrity_check=False → no per-turn full-DB scan.
     # Fail-soft: any open error → heb=None (w_heb=0) and the search still runs.
     heb = None
+    seed = None
     try:
         try:
             heb = HebbianMatrix(persona_dir / "hebbian.db", integrity_check=False)
@@ -1307,8 +1319,10 @@ def _build_recall_block(
             # only a known name has no selector token, so the query is empty but
             # the call still runs for the names (the graveyard never sees an
             # empty word string with no names: that matches nothing).
-            result = (
-                search_with_loss(
+            result, seed = keyword_budget.timed_tier1(
+                store,
+                legacy_tokens,
+                lambda: search_with_loss(
                     persona_dir,
                     store,
                     capped_query,
@@ -1326,23 +1340,10 @@ def _build_recall_block(
                     genuine_first=True,
                 )
                 if capped_query or names
-                else None
+                else None,
             )
         except Exception:  # noqa: BLE001
             result = None
-        # Tier 2 (S79): the tokens tier 1 does not reach, filling only the
-        # slots tier 1 leaves (they rank after every tier-1 hit). No graveyard.
-        tier2_active: list = []
-        tier2_fading: list = []
-        if remainder:
-            try:
-                ranked2 = rank_memories(
-                    store, heb, remainder, limit=limit * 2, include_fading=True, genuine_first=True
-                )
-            except Exception:  # noqa: BLE001
-                ranked2 = []
-            tier2_active = _sort_keyword_tier([p for p in ranked2 if p[0].state == "active"])
-            tier2_fading = _sort_keyword_tier([p for p in ranked2 if p[0].state == "fading"])
         # Name query (R5, spec §5, S27, S35): ONE extra keyword query for the
         # message's name words, phrases through the same ranker, active and
         # fading buckets, sharing this turn's hebbian handle. Its hits rank
@@ -1356,6 +1357,29 @@ def _build_recall_block(
                 ranked_names = []
             name_active = _sort_keyword_tier([p for p in ranked_names if p[0].state == "active"])
             name_fading = _sort_keyword_tier([p for p in ranked_names if p[0].state == "fading"])
+        # Tier 2 (S79, S103): the tokens tier 1 does not reach, filling only the
+        # slots tier 1 leaves (they rank after every tier-1 hit). No graveyard.
+        # Runs AFTER tier 1 and the name query so their time counts: it searches
+        # as many of the extra words (the selector's salience order) as fit what
+        # is left of the per-message recall budget, and drops the rest for this
+        # turn (keyword_budget, S131-S134).
+        tier2_active: list = []
+        tier2_fading: list = []
+        if remainder:
+            try:
+                ranked2 = keyword_budget.search_extra_words(
+                    store,
+                    remainder,
+                    started,
+                    lambda words: rank_memories(
+                        store, heb, words, limit=limit * 2, include_fading=True, genuine_first=True
+                    ),
+                    seed,
+                )
+            except Exception:  # noqa: BLE001
+                ranked2 = []
+            tier2_active = _sort_keyword_tier([p for p in ranked2 if p[0].state == "active"])
+            tier2_fading = _sort_keyword_tier([p for p in ranked2 if p[0].state == "fading"])
         if result is not None:
             for mem in result.active:
                 s = result.scores.get(mem.id)

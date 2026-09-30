@@ -30,6 +30,7 @@ from brain.felt_time.state import FeltTimeState
 from brain.felt_time.state import persist as persist_felt_time
 from brain.forgetting import graveyard as gv
 from brain.forgetting.salience import SalienceInputs
+from brain.memory import keyword_budget
 from brain.memory import known_names as kn
 from brain.memory.semantic_recall import SemanticRecallResult
 from brain.memory.store import FtsPhrases, Memory, MemoryStore, _to_fts_match
@@ -715,5 +716,9 @@ def test_a_name_plus_message_hit_found_only_through_tier_two_still_leads(tmp_pat
     p.mkdir()
     w = _tier_two_world(p)
     _list_names(p, "Al")
+    # Both words are under tier 1's 3-character floor, so tier 1 gives no seed:
+    # give the extra-words step a measured estimate (S131; with none it searches
+    # nothing, see test_keyword_budget_recall).
+    keyword_budget._keyword_cost.record(str(w.store.db_path), 1, 0.0)
     ids = _ids(_render(w, "al ai", p))
     assert ids[0] == w.target.id
