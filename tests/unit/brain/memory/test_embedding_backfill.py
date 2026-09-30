@@ -1334,13 +1334,16 @@ def test_delete_legacy_embeddings_db_delete_error_is_caught_and_logged(
     assert "failed to delete legacy embeddings.db" in caplog.text
 
 
-def _trap_provider_construction(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+def _trap_provider_construction(
+    monkeypatch: pytest.MonkeyPatch, built: list[str] | None = None
+) -> list[str]:
     """Make building any embedding provider fail the test: both the cached
     builder and `FastEmbedProvider.__init__` (which downloads the ~2.1 GB
-    model when it is not cached). Returns the list a call would append to."""
+    model when it is not cached). Returns the list a call would append to (the
+    given one, so several traps can share it)."""
     from brain.memory import embeddings as embeddings_mod
 
-    built: list[str] = []
+    built = [] if built is None else built
 
     def _boom(*_a: object, **_k: object) -> None:
         built.append("built")
@@ -1373,7 +1376,7 @@ def test_delete_legacy_embeddings_db_builds_no_provider_to_read_the_model_id(
         assert db_path.exists()
         monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
         store.embed_row(made[1].id, made[1].content)
-        _trap_provider_construction(monkeypatch)
+        _trap_provider_construction(monkeypatch, built)
         assert delete_legacy_embeddings_db(tmp_path, store) is True  # deleted
     finally:
         store.close()

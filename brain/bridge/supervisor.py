@@ -371,7 +371,7 @@ def run_folded(
     # above) rather than reusing the main loop's per-tick store, since this
     # runs once before that loop starts. Fault-isolated (recipe item 3): the
     # function itself already catches delete errors per-file, and this
-    # try/except is the outer safety net (e.g. a provider-load failure) so
+    # try/except is the outer safety net (e.g. a store open failure) so
     # a stuck stale file can never crash the bridge — worst case, it is
     # just re-checked (and left in place, or deleted) on the next startup.
     try:
