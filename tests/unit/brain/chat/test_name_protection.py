@@ -32,6 +32,7 @@ from brain.forgetting import graveyard as gv
 from brain.forgetting.salience import SalienceInputs
 from brain.memory import keyword_budget
 from brain.memory import known_names as kn
+from brain.memory.relevance import names_in
 from brain.memory.semantic_recall import SemanticRecallResult
 from brain.memory.store import FtsPhrases, Memory, MemoryStore, _to_fts_match
 
@@ -141,7 +142,8 @@ def _world(persona: Path) -> SimpleNamespace:
     general = _mem(store, "zorblax and quixotic vellum ledger kept by the harbour clerk")
     pretzel = [_mem(store, f"Pretzel is a scruffy terrier mix, walk number {i}") for i in range(3)]
     al = _mem(store, "Al fixed the ferry engine before the storm")
-    will = _mem(store, "Will brought the lantern to the workshop")
+    # "Will" mid-sentence: a stopword-name matches only there (S104/S121).
+    will = _mem(store, "then Will brought the lantern to the workshop")
     for i in range(6):
         _mem(store, f"unrelated harbour filler line {i} about tides and nothing else")
     return SimpleNamespace(store=store, general=general, pretzel=pretzel, al=al, will=will)
@@ -271,19 +273,33 @@ def test_a_listed_two_letter_name_leads(tmp_path: Path) -> None:
 
 
 def test_a_listed_name_that_is_also_a_stopword_survives_the_stopword_rule(tmp_path: Path) -> None:
-    message = "will zorblax quixotic"
+    # S104: written capitalized, not at a sentence start.
+    # (A capitalized mid-sentence "Will" is also a selector token, so the general
+    # search finds the memory too; the name query makes it LEAD.)
+    message = "so Will zorblax quixotic"
     w0, before = _twin(tmp_path, "empty", message)
-    assert w0.will.id not in _ids(before), "precondition: 'will' is dropped by the selector"
-    # inserted directly: admission (S70) keeps stopword strings out of the list
+    assert _ids(before)[0] == w0.general.id, "precondition: without the list the rare words lead"
     w1, after = _twin(tmp_path, "listed", message, direct=["will"])
     ids = _ids(after)
     assert ids[0] == w1.will.id and ids[1] == w1.general.id
 
 
-def test_a_message_that_is_only_a_listed_stopword_name_still_recalls(tmp_path: Path) -> None:
-    w0, before = _twin(tmp_path, "empty", "will")
-    assert before == "", "precondition: the selector drops it, so nothing is searched"
-    w1, after = _twin(tmp_path, "listed", "will", direct=["will"])
+def test_a_lowercase_modal_will_is_not_the_listed_name(tmp_path: Path) -> None:
+    # S104 (flipped from the graveyard increment's interim pin): the modal "will"
+    # triggers no name query, so the name memory gets no lead.
+    w1, after = _twin(tmp_path, "listed", "will zorblax quixotic", direct=["will"])
+    assert w1.will.id not in _ids(after)
+
+
+def test_a_message_that_is_only_a_stopword_name_at_its_start_is_not_a_name(tmp_path: Path) -> None:
+    # S104: the message start is a sentence start, so "will" and "Will" alone are
+    # not the name. ("Will" may still be a selector token of its own: the general
+    # search is not name protection.)
+    _, block = _twin(tmp_path, "listed-lower", "will", direct=["will"])
+    assert block == ""
+    for message in ("will", "Will"):
+        assert names_in(tmp_path / "listed-lower", message) == [], message
+    w1, after = _twin(tmp_path, "listed-mid", "so Will", direct=["will"])
     assert _ids(after) == [w1.will.id]
 
 
@@ -363,10 +379,20 @@ def test_a_listed_name_is_handed_to_the_graveyard_beside_the_capped_words(tmp_pa
         patch("brain.forgetting.recall.graveyard.search", spy),
         patch("brain.grief.handle_recall_touch") as touch,
     ):
-        block = _render(w, "will zorblax quixotic", persona)
-
+        modal = _render(w, "will zorblax quixotic", persona)
     legacy = " ".join(_legacy_capped_tokens(_extract_recall_tokens("will zorblax quixotic", w.store)))
-    assert "will" not in legacy.split(), "precondition: the selector drops the name"
+    # S104 (flipped from the interim pin): a lower-case modal "will" is not the name.
+    assert calls == [(legacy, [])]
+    assert "lost (no longer in active memory)" not in modal and touch.call_count == 0
+
+    calls.clear()
+    with (
+        patch("brain.forgetting.recall.graveyard.search", spy),
+        patch("brain.grief.handle_recall_touch") as touch,
+    ):
+        block = _render(w, "so Will zorblax quixotic", persona)
+
+    legacy = " ".join(_legacy_capped_tokens(_extract_recall_tokens("so Will zorblax quixotic", w.store)))
     assert calls == [(legacy, ["will"])], "today's capped words, and the name beside them"
     assert "lost (no longer in active memory)" in block and "saw Will wave" in block
     assert "Will you come" not in block, "S121: a modal 'Will' at a sentence start is not the name"
@@ -539,9 +565,9 @@ def test_a_message_that_is_only_a_listed_name_searches_the_graveyard_for_the_nam
     persona = tmp_path / "p"
     persona.mkdir()
     w = _world(persona)
-    _list_names_direct(persona, "will")
+    _list_names_direct(persona, "will", "bo")
     _bury(persona, "A summary of some long forgotten harbour afternoon", "mem-lost-a")
-    _bury(persona, "cheered when Will came", "mem-lost-b")
+    _bury(persona, "cheered when Bo came", "mem-lost-b")
     calls: list[tuple[str, list[str]]] = []
     real = gv.search
 
@@ -549,16 +575,23 @@ def test_a_message_that_is_only_a_listed_name_searches_the_graveyard_for_the_nam
         calls.append((query, list(kw.get("names", ()))))
         return real(persona_dir, query, **kw)
 
+    with patch("brain.forgetting.recall.graveyard.search", spy):
+        assert _render(w, "will", persona) == "", "S104: 'will' at the message start is no name"
+    assert calls == [], "no name and no word: the graveyard is not called"
+    # A name-only message needs a listed name the selector drops: a capitalized
+    # mid-sentence "Will" is a selector token (S104 leaves no name-only stopword
+    # message), and a short name in the store is kept, so "bo" (in no active
+    # memory) is used here.
     with (
         patch("brain.forgetting.recall.graveyard.search", spy),
         patch("brain.grief.handle_recall_touch") as touch,
     ):
-        block = _render(w, "will", persona)
-    assert calls == [("", ["will"])], "one graveyard call: no words, the name"
-    assert "lost (no longer in active memory)" in block and "cheered when Will" in block
+        block = _render(w, "bo", persona)
+    assert calls == [("", ["bo"])], "one graveyard call: no words, the name"
+    assert "lost (no longer in active memory)" in block and "cheered when Bo" in block
     assert "long forgotten harbour" not in block
     assert touch.call_args.kwargs["touched_ids"] == ["mem-lost-b"]
-    assert _ids(block) == [w.will.id]
+    assert _ids(block) == []
 
 
 def test_name_hits_are_ordered_among_themselves_by_blended_score(tmp_path: Path) -> None:
@@ -623,13 +656,16 @@ def test_a_name_with_many_memories_no_longer_pushes_out_a_memory_matching_the_re
 
 def _will_world(persona: Path, *, fade: bool = False):
     """A = name + the rest of the message, B = name only (ranks ABOVE A in the
-    name query alone), C = the rest of the message only. 'will' is dropped by the
-    selector, so the name query is the only route by which B is found."""
+    name query alone), C = the rest of the message only. The lower-case 2-letter
+    'al' is dropped by the selector, so the name query is the only route by which B
+    is found. (Before S104 this world used a lower-case 'will'; a lower-case modal
+    'will' is no longer the name, and a capitalized mid-sentence 'Will' is a
+    selector token, so a short name keeps the test's point.)"""
     persist_felt_time(FeltTimeState(lived_age_hours=48.0), persona)
     store = MemoryStore(":memory:")
-    a = _mem(store, "Will noted that zorblax and quixotic vellum stayed in the ledger all through the storm season")
-    b1 = _mem(store, "Will waved from the pier", importance=9.0)
-    b2 = _mem(store, "Will sang on the ferry", importance=8.0)
+    a = _mem(store, "Al noted that zorblax and quixotic vellum stayed in the ledger all through the storm season")
+    b1 = _mem(store, "Al waved from the pier", importance=9.0)
+    b2 = _mem(store, "Al sang on the ferry", importance=8.0)
     c = _mem(store, "zorblax and quixotic vellum ledger kept by the harbour clerk")
     if fade:
         for m in (a, b1, b2, c):
@@ -638,18 +674,20 @@ def _will_world(persona: Path, *, fade: bool = False):
 
 
 def test_name_and_message_hits_lead_then_name_only_then_general(tmp_path: Path) -> None:
-    message = "will zorblax quixotic"
+    message = "al zorblax quixotic"
     p0 = tmp_path / "empty"
     p0.mkdir()
     w0 = _will_world(p0)
-    assert set(_ids(_render(w0, message, p0))) == {w0.a.id, w0.c.id}, (
-        "precondition: without the list only the two general hits appear"
-    )
+    # (A short name that is in the store is a selector token, so the general search
+    # finds the name memories too; without the list the rare-word hit C is not
+    # behind them.)
+    ids0 = _ids(_render(w0, message, p0))
+    assert ids0.index(w0.c.id) < ids0.index(w0.b2.id), "precondition: the list changes the order"
 
     p1 = tmp_path / "listed"
     p1.mkdir()
     w1 = _will_world(p1)
-    _list_names_direct(p1, "will")
+    _list_names_direct(p1, "al")
     ids = _ids(_render(w1, message, p1))
     assert ids == [w1.a.id, w1.b1.id, w1.b2.id, w1.c.id], (
         "name + rest of the message first, then name-only in the name query's order, then general-only"
@@ -660,9 +698,9 @@ def test_the_same_order_holds_in_the_softened_section(tmp_path: Path) -> None:
     p = tmp_path / "p"
     p.mkdir()
     w = _will_world(p, fade=True)
-    _list_names_direct(p, "will")
-    soft = _softened(_render(w, "will zorblax quixotic", p))
-    assert [s[:12] for s in soft] == ["Will noted t", "Will waved f", "Will sang on", "zorblax and "]
+    _list_names_direct(p, "al")
+    soft = _softened(_render(w, "al zorblax quixotic", p))
+    assert [s[:12] for s in soft] == ["Al noted tha", "Al waved fro", "Al sang on t", "zorblax and "]
 
 
 def test_the_same_order_holds_behind_the_semantic_results(tmp_path: Path) -> None:
@@ -670,9 +708,9 @@ def test_the_same_order_holds_behind_the_semantic_results(tmp_path: Path) -> Non
     p.mkdir()
     w = _will_world(p)
     sem = _mem(w.store, "the sunlit dock where the boats moor at low tide")
-    _list_names_direct(p, "will")
+    _list_names_direct(p, "al")
     semantic = SemanticRecallResult(full=[sem], snippet=[], scores={sem.id: 5.0})
-    ids = _ids(_render(w, "will zorblax quixotic", p, semantic=semantic))
+    ids = _ids(_render(w, "al zorblax quixotic", p, semantic=semantic))
     assert ids == [sem.id, w.a.id, w.b1.id, w.b2.id, w.c.id]
 
 

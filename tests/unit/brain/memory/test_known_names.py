@@ -115,13 +115,15 @@ def test_listed_two_letter_name_survives_the_length_rule() -> None:
 
 
 def test_listed_stopword_survives_the_stopword_rule() -> None:
-    # The stopword entry is written straight into the list here: admission (S70)
-    # keeps such entries out through every writer (see the admission tests), so
-    # this asserts the matcher, not the admission.
+    # Names increment (S104): a listed stopword-name survives the recall stopword
+    # rule, but only where written capitalized and not at a sentence start. The
+    # base pinned the interim state ("Will you come" and "she will come" matched);
+    # both are now the modal "will", not the name.
     assert "will" in RECALL_STOPWORDS
     known = kn.KnownNames.from_names(["will"])
-    assert kn.match_known_names("Will you come", known) == ["will"]
-    assert kn.match_known_names("she will come", known) == ["will"]
+    assert kn.match_known_names("we saw Will today", known) == ["will"]
+    assert kn.match_known_names("Will you come", known) == []
+    assert kn.match_known_names("she will come", known) == []
 
 
 def test_multiword_name_matches_only_the_consecutive_raw_words() -> None:
@@ -208,21 +210,25 @@ def test_stopword_entries_are_rejected_and_nothing_is_written(persona: Path, ent
     assert not _db(persona).exists()
 
 
-def test_every_recall_stopword_is_rejected_by_every_writer(persona: Path) -> None:
-    for source in kn.SOURCES:
+def test_every_recall_stopword_is_rejected_by_every_mechanical_writer(persona: Path) -> None:
+    # S70 for the gate judge and the re-appraiser. The tool is the S104 exception:
+    # a whole-form stopword is the kindled's stopword-name (tested in
+    # test_names_increment.py), so it is not in this loop.
+    for source in ("gate", "reappraiser"):
         assert kn.admit_names(persona, sorted(RECALL_STOPWORDS), source) == []
     assert not _db(persona).exists()
 
 
 def test_other_entries_are_admitted_as_extracted(persona: Path) -> None:
+    # "of the" (every word a recall stopword) is refused since S106; the base
+    # admitted it.
     out = kn.admit_names(
         persona, ["Grace", "Will Smith", "NY", "the hague", "of the"], "tool", now=T0
     )
-    assert out == ["grace", "will smith", "ny", "the hague", "of the"]
+    assert out == ["grace", "will smith", "ny", "the hague"]
     assert _rows(persona) == [
         ("grace", "Grace", "tool", T0.isoformat()),
         ("ny", "NY", "tool", T0.isoformat()),
-        ("of the", "of the", "tool", T0.isoformat()),
         ("the hague", "the hague", "tool", T0.isoformat()),
         ("will smith", "Will Smith", "tool", T0.isoformat()),
     ]
@@ -275,13 +281,16 @@ def test_a_missing_persona_directory_is_created_by_the_first_write(tmp_path: Pat
 
 
 def test_an_existing_name_keeps_its_first_seen_time_display_and_source(persona: Path) -> None:
+    # A MECHANICAL re-add keeps the first row. (The kindled's add makes the row hers,
+    # display and source, first-seen kept: names increment I2, tested in
+    # test_names_increment.py.)
     kn.admit_names(persona, ["Pretzel"], "gate", now=T0)
     later = T0 + timedelta(days=1)
-    out = kn.admit_names(persona, ["PRETZEL", "wren"], "tool", now=later)
+    out = kn.admit_names(persona, ["PRETZEL", "wren"], "reappraiser", now=later)
     assert out == ["pretzel", "wren"]  # a name already in the list still counts as in the list
     assert _rows(persona) == [
         ("pretzel", "Pretzel", "gate", T0.isoformat()),
-        ("wren", "wren", "tool", later.isoformat()),
+        ("wren", "wren", "reappraiser", later.isoformat()),
     ]
 
 
@@ -723,7 +732,7 @@ def test_the_write_happens_inside_the_os_file_lock(
     assert kn.admit_names(persona, ["pretzel"], "tool") == ["pretzel"]
     assert events == [f"lock {_db(persona).name}", "insert", "unlock"]
     events.clear()
-    kn.admit_names(persona, ["the"], "tool")  # rejected: no lock, no write
+    kn.admit_names(persona, ["the"], "gate")  # rejected: no lock, no write (the tool may add "the", S104)
     assert events == []
 
 
@@ -745,11 +754,15 @@ def test_a_lone_surrogate_in_an_extracted_name_does_not_lose_the_name_or_raise(
     persona: Path,
 ) -> None:
     # A model's JSON escape can decode to half an emoji; SQLite cannot bind it.
-    out = kn.admit_names(persona, ["Zoe\ud83d", "Wren"], "gate", now=T0)
+    # From the tool the name is kept: SQLite cannot bind the half emoji; UTF-8
+    # "replace" turns it into "?". From an extraction prompt (gate, re-appraiser)
+    # it is refused, without raising: a lone surrogate is not a letter (S106).
+    out = kn.admit_names(persona, ["Zoe\ud83d", "Wren"], "tool", now=T0)
     assert out == ["zoe", "wren"]
     assert _names(persona) == {"zoe", "wren"}
-    # SQLite cannot bind the half emoji; UTF-8 "replace" turns it into "?".
     assert {r[0]: r[1] for r in _rows(persona)} == {"zoe": "Zoe?", "wren": "Wren"}
+    assert kn.admit_names(persona, ["Bea\ud83d"], "gate", now=T0) == []
+    assert "bea" not in _names(persona)
 
 
 @pytest.mark.parametrize("exc", [sqlite3.InterfaceError("bad bind"), ValueError("bad value")])

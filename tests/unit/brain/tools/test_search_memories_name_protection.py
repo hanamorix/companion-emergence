@@ -76,7 +76,8 @@ def _world(persona: Path):
     general = _mem(store, "zorblax and quixotic vellum ledger kept by the harbour clerk")
     pretzel = [_mem(store, f"Pretzel is a scruffy terrier mix, walk number {i}") for i in range(3)]
     al = _mem(store, "Al fixed the ferry engine before the storm")
-    will = _mem(store, "Will brought the lantern to the workshop")
+    # "Will" mid-sentence: a stopword-name matches only there (S104/S121).
+    will = _mem(store, "then Will brought the lantern to the workshop")
     for i in range(6):
         _mem(store, f"unrelated harbour filler line {i} about tides and nothing else")
     return ctx, general, pretzel, al, will
@@ -131,13 +132,17 @@ def test_lexical_a_listed_two_letter_name_leads(tmp_path: Path) -> None:
 
 def test_lexical_a_listed_stopword_name_leads(tmp_path: Path) -> None:
     ctx0, general0, _, _, will0 = _world(tmp_path / "empty")
-    ids0 = _ids(_lexical(ctx0, "will zorblax quixotic"))
+    # S104: the name is written capitalized mid-query ("so" is under the tool's
+    # 3-character floor, so the general search is unchanged).
+    ids0 = _ids(_lexical(ctx0, "so Will zorblax quixotic"))
     assert ids0[0] == general0.id and will0.id in ids0, "precondition: found as a plain word, but behind"
     persona = tmp_path / "listed"
     ctx, general, _, _, will = _world(persona)
     _list_direct(persona, "will")
-    ids = _ids(_lexical(ctx, "will zorblax quixotic"))
+    ids = _ids(_lexical(ctx, "so Will zorblax quixotic"))
     assert ids[:2] == [will.id, general.id]
+    # a query that STARTS with the name: a sentence start, no name (S104; owner FYI-3)
+    assert _ids(_lexical(ctx, "Will zorblax quixotic"))[0] == general.id
 
 
 def test_lexical_a_multi_word_name_is_one_phrase(tmp_path: Path) -> None:
@@ -358,9 +363,10 @@ def test_a_name_with_many_memories_no_longer_pushes_out_a_memory_matching_the_re
 def _will_world(persona: Path):
     ctx = _ctx(persona)
     store = ctx["store"]
-    a = _mem(store, "Will noted that zorblax and quixotic vellum stayed in the ledger all through the storm season")
-    b1 = _mem(store, "Will waved from the pier")
-    b2 = _mem(store, "Will sang on the ferry")
+    # "Will" mid-sentence in every memory: S104/S121.
+    a = _mem(store, "so Will noted that zorblax and quixotic vellum stayed in the ledger all through the storm season")
+    b1 = _mem(store, "then Will waved from the pier")
+    b2 = _mem(store, "and Will sang on the ferry")
     c = _mem(store, "zorblax and quixotic vellum ledger kept by the harbour clerk")
     store._conn.execute("UPDATE memories SET importance = 9.0 WHERE id = ?", (b1.id,))  # noqa: SLF001
     store._conn.execute("UPDATE memories SET importance = 8.0 WHERE id = ?", (b2.id,))  # noqa: SLF001
@@ -388,7 +394,7 @@ def test_lexical_all_general_hits_holding_the_name_precede_the_name_only_ones(tm
     persona = tmp_path / "listed"
     ctx, a, b1, b2, c = _will_world(persona)
     _list_direct(persona, "will")
-    ids = _ids(_lexical(ctx, "will zorblax quixotic", limit=8))
+    ids = _ids(_lexical(ctx, "so Will zorblax quixotic", limit=8))
     assert ids[0] == a.id, "name + rest of the query leads, whatever the name query's own order says"
     assert set(ids) == {a.id, b1.id, b2.id, c.id}
     assert ids.index(c.id) > ids.index(a.id), "the general-only hit follows the name + query hit"

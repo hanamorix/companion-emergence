@@ -23,6 +23,7 @@ from collections.abc import Sequence
 from brain.memory.recall_stopwords import RECALL_STOPWORDS
 
 __all__ = [
+    "APOSTROPHES",
     "contraction_stems",
     "WORD_RE",
     "followed_by_apostrophe_t",
@@ -34,7 +35,10 @@ __all__ = [
 #: The one word split (runs of ASCII letters and digits): the keyword search's,
 #: the known-names matcher's and the forgotten-memory search's (S102).
 WORD_RE = re.compile(r"[A-Za-z0-9]+")
-_APOSTROPHES = ("'", "’")
+#: The apostrophes the rules recognise (straight and curly), shared with the
+#: known-names character rule for extracted names (S106).
+APOSTROPHES: tuple[str, ...] = ("'", "’")
+_APOSTROPHES = APOSTROPHES
 # The contraction endings whose stem is a fragment, not a word (S126). "t" is
 # the n't ending (the stem then ends in "n"); the stem before 's is kept.
 _FRAGMENT_SUFFIXES = ("t", "ll", "re", "ve", "d", "m")
