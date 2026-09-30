@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from brain.tools.dispatch import _DISPATCH, _PROVIDER_TOOLS, ToolDispatchError, dispatch
-from brain.tools.schemas import ADD_NAME_TOOL_NAME
+from brain.tools.schemas import ADD_NAME_TOOL_NAME, REMOVE_NAME_TOOL_NAME
 
 
 def _make_ctx(tmp_path: Path) -> dict:
@@ -275,6 +275,7 @@ def test_all_dispatched_tools_dispatch_without_crash(tmp_path: Path) -> None:
             "emotions": {"love": 10, "joy": 8},
         },
         ADD_NAME_TOOL_NAME: {"name": "Wren"},
+        REMOVE_NAME_TOOL_NAME: {"name": "Wren"},
         "boot": {},
         "get_soul": {},
         "crystallize_soul": {

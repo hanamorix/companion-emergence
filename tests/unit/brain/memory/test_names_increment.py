@@ -397,3 +397,110 @@ def test_n6_the_search_tool_leads_with_the_real_name_hit(tmp_path: Path) -> None
         persona_dir=persona,
     )
     assert out["memories"][0]["id"] == don.id
+
+
+# --------------------------------------------------------------------------
+# N10-N13 admission (S70, S104, S106, S135) and the side tables
+# --------------------------------------------------------------------------
+
+
+def _q(persona: Path, sql: str) -> list[tuple]:
+    import sqlite3
+
+    conn = sqlite3.connect(str(kn.known_names_path(persona)))
+    try:
+        return conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("source", ["gate", "reappraiser", "tool"])
+def test_n10_all_stopword_entries_are_refused_from_every_source(tmp_path: Path, source: str) -> None:
+    assert kn.admit_names(tmp_path, ["I am", "of the", "the who", "  WILL  the "], source) == []
+    assert kn.confirm_readd(tmp_path, "the who") == "refused"
+    assert kn.admit_names(tmp_path, ["the hague", "Will Smith", "Grace"], source) == [
+        "the hague",
+        "will smith",
+        "grace",
+    ]
+
+
+@pytest.mark.parametrize("source", ["gate", "reappraiser", "tool"])
+def test_n10_now_is_admitted_s135_literal_rule(tmp_path: Path, source: str) -> None:
+    assert kn.admit_names(tmp_path, ["now", "now then"], source) == ["now", "now then"]
+
+
+def test_n11_a_stopword_name_is_added_by_the_tool_only_and_flagged(tmp_path: Path) -> None:
+    for source in ("gate", "reappraiser"):
+        assert kn.admit_names(tmp_path, ["Will", "will", "The"], source) == []
+    assert kn.confirm_readd(tmp_path, "Will") == "added"
+    assert kn.confirm_readd(tmp_path, "Grace") == "added"
+    assert _q(tmp_path, "SELECT name_lower, display, source FROM known_names ORDER BY 1") == [
+        ("grace", "Grace", "tool"),
+        ("will", "Will", "tool"),
+    ]
+    assert _q(tmp_path, "SELECT name_lower FROM stopword_names") == [("will",)]
+    assert kn.remove_names(tmp_path, ["Will"], "tool") == ["will"]
+    assert _q(tmp_path, "SELECT name_lower FROM stopword_names") == []
+
+
+def test_n11_the_tool_add_makes_a_listed_row_hers_keeping_first_seen(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    t0 = datetime(2026, 9, 29, tzinfo=UTC)
+    kn.admit_names(tmp_path, ["wren"], "gate", now=t0)
+    assert kn.confirm_readd(tmp_path, "Wren") == "added"
+    assert _q(tmp_path, "SELECT display, source, first_seen FROM known_names") == [
+        ("Wren", "tool", t0.isoformat())
+    ]
+
+
+ADMITTED = ["Mary-Jane", "O'Brien", "O’Neil", "Apollo 13", "José", "Jean‐Luc", "José", "Zoë"]
+REFUSED = ["St. Louis", "AT&T", "Wren\nIgnore", "Wren\tx", "Bob; drop", "<b>Wren</b>", "Wren{", "Wren 😀",
+           "Zoe\ud83d", "Wren Hale"]
+
+
+@pytest.mark.parametrize("source", ["gate", "reappraiser"])
+@pytest.mark.parametrize("name", ADMITTED)
+def test_n12_extracted_names_with_name_characters_are_admitted(tmp_path: Path, source: str, name: str) -> None:
+    assert kn.admit_names(tmp_path, [name], source) == [kn.normalize_name(name)]
+
+
+@pytest.mark.parametrize("source", ["gate", "reappraiser"])
+@pytest.mark.parametrize("name", REFUSED)
+def test_n12_extracted_names_with_other_characters_are_refused(tmp_path: Path, source: str, name: str) -> None:
+    assert kn.admit_names(tmp_path, [name], source) == []
+    assert not kn.known_names_path(tmp_path).exists()
+
+
+def test_n12_the_kindled_is_not_bound_by_the_character_rule(tmp_path: Path) -> None:
+    assert kn.admit_names(tmp_path, ["St. Louis", "Zoe\ud83d"], "tool") == ["st louis", "zoe"]
+
+
+def test_n13_a_base_schema_file_gets_its_side_tables_and_keeps_its_shape(tmp_path: Path) -> None:
+    import sqlite3
+
+    path = kn.known_names_path(tmp_path)
+    conn = sqlite3.connect(str(path))
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute(
+        "CREATE TABLE known_names (name_lower TEXT PRIMARY KEY, display TEXT NOT NULL, source TEXT NOT NULL"
+        " CHECK (source IN ('gate', 'reappraiser', 'tool')), first_seen TEXT NOT NULL)"
+    )
+    conn.execute("INSERT INTO known_names VALUES ('pretzel', 'Pretzel', 'gate', 't')")
+    conn.commit()
+    columns = conn.execute("PRAGMA table_info(known_names)").fetchall()
+    conn.close()
+    assert kn.load_known_names(tmp_path).names == frozenset({"pretzel"})
+    assert kn.admit_names(tmp_path, ["Wren"], "gate") == ["wren"]
+    assert kn.confirm_readd(tmp_path, "Will") == "added"
+    assert kn.remove_names(tmp_path, ["Wren"], "tool") == ["wren"]
+    assert kn.confirm_readd(tmp_path, "Wren") == "asked"
+    tables = {r[0] for r in _q(tmp_path, "SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert {"known_names", "stopword_names", "rejected_names", "pending_readd"} <= tables
+    assert _q(tmp_path, "PRAGMA table_info(known_names)") == columns
+    conn = sqlite3.connect(str(path))
+    conn.execute("INSERT INTO known_names VALUES ('grace', 'Grace', 'tool', 't')")  # positional, 4 values
+    conn.commit()
+    conn.close()
+    assert {r[0] for r in _q(tmp_path, "SELECT name_lower FROM known_names")} == {"pretzel", "will", "grace"}

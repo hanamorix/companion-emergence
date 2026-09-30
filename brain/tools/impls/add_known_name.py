@@ -1,17 +1,27 @@
-"""add-name tool implementation: the kindled adds a name to her known-names list.
+"""add_name tool implementation: the kindled adds a name to her known-names list.
 
 The third way a name reaches the list (spec §5, "Names are added three ways",
 item 3; the other two are the temp gate's judge and the on-recall re-appraiser).
 Dispatched in the MCP subprocess like ``add_memory`` (not bridge-routed): it only
 writes the small known-names file under the OS file lock.
 
-All admission goes through ``brain.memory.known_names.admit_names`` (S70): an
-entry that is a recall stopword ("will", "the") is rejected with nothing written;
-every other entry is admitted as given, its display form kept intact (S87).
+Its one writer is ``brain.memory.known_names.confirm_readd`` (names increment,
+S104, S135, S137, S138):
 
-The tool's identifier and its persona-facing text are PLACEHOLDERS owned by the
-owner (I10); they live in ``brain/tools/schemas.py``. This module's own name is
-not persona-facing.
+* an entry refused by the admission rules (every word a recall stopword, e.g. "I
+  am"; no word in it; not a string) is not added. A name whose whole form is ONE
+  recall stopword ("Will") is added, flagged: it then matches only written
+  capitalized and not at a sentence start (S104);
+* a name on the rejects list (removed earlier, by her or by the re-appraiser) is
+  not added on the first call: the reply carries the approved question (wording
+  file section 7). If her NEXT tool call is ``add_name`` with the same name, it is
+  added and taken off the rejects list; any other next call lapses the question
+  (the dispatch hook, ``known_names.note_tool_call``);
+* any other name is added, or made hers if already listed (her spelling, source
+  ``tool``).
+
+The tool's identifier and persona-facing text are the owner's approved wording in
+``brain/tools/schemas.py``. This module's own name is not persona-facing.
 """
 
 from __future__ import annotations
@@ -20,27 +30,34 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from brain.memory.known_names import admit_names
+from brain import prompt_strings
+from brain.memory.known_names import confirm_readd
 
 logger = logging.getLogger(__name__)
+
+# The approved reply for a name on the rejects list (S137, wording file section 7).
+_REJECTED_REPLY = prompt_strings.register("tools.add_name.rejected_reply")
 
 
 def add_known_name(name: Any, *, persona_dir: Path, **_unused: Any) -> dict:
     """Add ``name`` to the persona's known-names list (source ``tool``).
 
-    Returns structured fields only, no prose:
+    Returns:
       - ``added``: True when the name is on the list after the call (a name
-        already listed counts, the list is a set); False when the admission filter
-        rejected it (stopword entry, no word in it, not a string) or the write
-        could not be made (logged, never raised).
+        already listed counts); False when the admission rules refused it, the
+        write could not be made (logged, never raised), or the name is on the
+        rejects list and this call asked the S137 question;
       - ``name``: the name as given, whitespace-trimmed (display form intact); an
-        empty string when the argument was not a string.
+        empty string when the argument was not a string;
+      - ``message`` (only when this call asked the S137 question): the approved
+        text, with ``{name}`` = the name as given.
 
-    Never raises for a bad argument or an I/O failure: a tool result is data, and
-    the model deciding what to do about ``added: false`` is its own business.
+    Never raises for a bad argument or an I/O failure.
     """
     given = name.strip() if isinstance(name, str) else ""
     if not given:
         return {"added": False, "name": given}
-    admitted = admit_names(persona_dir, [given], "tool")
-    return {"added": bool(admitted), "name": given}
+    outcome = confirm_readd(persona_dir, given)
+    if outcome == "asked":
+        return {"added": False, "name": given, "message": _REJECTED_REPLY.format(name=given)}
+    return {"added": outcome == "added", "name": given}

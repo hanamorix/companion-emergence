@@ -72,9 +72,19 @@ def test_every_non_stopword_entry_is_admitted_as_given(tmp_path, name):
 
 
 @pytest.mark.parametrize("name", ["will", "Will", "the", "THE", "may"])
-def test_stopword_entry_is_rejected_with_nothing_written(tmp_path, name):
-    """S70: an entry whose lower-cased form is a recall stopword is rejected."""
+def test_a_one_word_stopword_entry_is_added_as_a_stopword_name(tmp_path, name):
+    """S104 (names increment; the base refused these, S70): the kindled may add a name
+    whose whole form is one recall stopword; it is flagged and matches only written
+    capitalized and not at a sentence start."""
     assert name.lower() in RECALL_STOPWORDS
+    got = add_known_name(name, persona_dir=tmp_path)
+    assert got == {"added": True, "name": name}
+    assert _rows(tmp_path) == [(name.lower(), name, "tool")]
+
+
+@pytest.mark.parametrize("name", ["I am", "of the", "the who"])
+def test_an_all_stopword_entry_is_rejected_with_nothing_written(tmp_path, name):
+    """S106: an entry whose every word is a recall stopword is refused, even from the tool."""
     got = add_known_name(name, persona_dir=tmp_path)
     assert got["added"] is False
     assert _rows(tmp_path) == []
@@ -96,27 +106,30 @@ def test_result_is_structured_fields_only_and_json_serialisable(tmp_path):
     json.dumps(got)
 
 
-def test_a_name_already_listed_reports_added_true_and_keeps_the_first_row(tmp_path):
+def test_a_name_already_listed_reports_added_true_and_becomes_hers(tmp_path):
+    # Names increment I2 (S105 "never one the kindled added"; the approved parameter
+    # text "spelled the way you want it kept"): her add makes the row hers.
     kn.admit_names(tmp_path, ["Wren"], "gate")
     assert add_known_name("wren", persona_dir=tmp_path)["added"] is True
-    assert _rows(tmp_path) == [("wren", "Wren", "gate")]  # INSERT OR IGNORE: first row kept
+    assert _rows(tmp_path) == [("wren", "wren", "tool")]
 
 
 def test_write_failure_reports_added_false_not_raises(tmp_path, monkeypatch):
-    monkeypatch.setattr(impl_mod, "admit_names", lambda *a, **k: [])
+    monkeypatch.setattr(impl_mod, "confirm_readd", lambda *a, **k: "refused")
     assert add_known_name("Wren", persona_dir=tmp_path) == {"added": False, "name": "Wren"}
 
 
-def test_the_writer_goes_through_admit_names_with_source_tool(tmp_path, monkeypatch):
+def test_the_writer_is_confirm_readd(tmp_path, monkeypatch):
+    # Names increment (R3-4): the tool's one writer.
     seen = []
 
-    def _spy(persona_dir, names, source, **kw):
-        seen.append((Path(persona_dir), list(names), source))
-        return ["wren"]
+    def _spy(persona_dir, name, **kw):
+        seen.append((Path(persona_dir), name))
+        return "added"
 
-    monkeypatch.setattr(impl_mod, "admit_names", _spy)
+    monkeypatch.setattr(impl_mod, "confirm_readd", _spy)
     add_known_name("Wren", persona_dir=tmp_path)
-    assert seen == [(tmp_path, ["Wren"], "tool")]
+    assert seen == [(tmp_path, "Wren")]
 
 
 # ---------------------------------------------------------------- registry and dispatch
@@ -138,8 +151,8 @@ def test_dispatch_routes_to_the_impl_in_process(tmp_path):
     assert _rows(tmp_path) == [("wren", "Wren", "tool")]
 
 
-def test_dispatch_stopword_returns_added_false(tmp_path):
-    got = dispatch(ADD_NAME_TOOL_NAME, {"name": "will"}, **_ctx(tmp_path))
+def test_dispatch_all_stopword_entry_returns_added_false(tmp_path):
+    got = dispatch(ADD_NAME_TOOL_NAME, {"name": "I am"}, **_ctx(tmp_path))
     assert got["added"] is False
     assert _rows(tmp_path) == []
 
@@ -177,8 +190,11 @@ def test_maximal_signal_and_capability_expansion_still_include_it():
 
 
 def test_core_membership_is_exact_no_other_tool_moved():
-    """The existing eleven stay; the add-name tool is the one addition."""
-    assert REFLEXIVE_CORE[:-1] == (
+    """The existing eleven stay; the two name tools are the additions (S69; I4)."""
+    from brain.tools.schemas import REMOVE_NAME_TOOL_NAME
+
+    assert REFLEXIVE_CORE[-1] == REMOVE_NAME_TOOL_NAME
+    assert REFLEXIVE_CORE[:-2] == (
         "record_monologue",
         "recall_monologue",
         "reach_for_capability",
@@ -191,4 +207,4 @@ def test_core_membership_is_exact_no_other_tool_moved():
         "search_memories",
         "read_full_memory",
     )
-    assert REFLEXIVE_CORE[-1] == ADD_NAME_TOOL_NAME
+    assert REFLEXIVE_CORE[-2] == ADD_NAME_TOOL_NAME

@@ -15,6 +15,7 @@ from brain.felt_time.tool import felt_time_now as _felt_time_now_impl
 from brain.felt_time.tool import pressure_since as _pressure_since_impl
 from brain.forgetting.tool import recall_forgotten as _recall_forgotten_impl
 from brain.memory.hebbian import HebbianMatrix
+from brain.memory.known_names import note_tool_call
 from brain.memory.store import MemoryStore
 from brain.monologue.recall import recall_monologue
 from brain.narrative_memory.tool import list_open_arcs as _list_open_arcs_impl
@@ -35,10 +36,11 @@ from brain.tools.impls.reach_for_capability import reach_for_capability
 from brain.tools.impls.read_file import read_file
 from brain.tools.impls.read_full_memory import read_full_memory
 from brain.tools.impls.read_work import read_work
+from brain.tools.impls.remove_known_name import remove_known_name
 from brain.tools.impls.save_work import save_work
 from brain.tools.impls.search_memories import search_memories
 from brain.tools.impls.search_works import search_works
-from brain.tools.schemas import ADD_NAME_TOOL_NAME, SCHEMAS
+from brain.tools.schemas import ADD_NAME_TOOL_NAME, REMOVE_NAME_TOOL_NAME, SCHEMAS
 
 log = logging.getLogger(__name__)
 
@@ -140,6 +142,7 @@ _DISPATCH: dict[str, Any] = {
     "add_journal": add_journal,
     "add_memory": add_memory,
     ADD_NAME_TOOL_NAME: add_known_name,
+    REMOVE_NAME_TOOL_NAME: remove_known_name,
     "boot": boot,
     "get_soul": get_soul,
     "crystallize_soul": crystallize_soul,
@@ -262,6 +265,11 @@ def dispatch(
     -------
     dict — the impl's return value, JSON-serialisable.
     """
+    # Name-recall fix, names increment (S137, S138): every call that reaches brain
+    # tool dispatch is "her next tool call" for a pending add_name question, so the
+    # hook runs FIRST, before the unknown-tool and argument checks (a malformed call
+    # that reaches here counts). It never raises and never touches ``arguments``.
+    note_tool_call(persona_dir, name, arguments, add_tool_name=ADD_NAME_TOOL_NAME)
     fn = _DISPATCH.get(name)
     if fn is None:
         # M-10: don't enumerate known tools in the error returned to the LLM.

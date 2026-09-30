@@ -27,9 +27,10 @@ def test_inventory_renders_full_registry_not_a_subset() -> None:
     inventory's whole job is telling her what exists when it is not in hand, so
     it must never render the recruited subset."""
     out = build_tool_inventory("Nell")
-    # 28 before the name-recall fix added the add-name tool (S69), 29 with it.
-    assert len(NELL_TOOL_NAMES) == 29
-    assert sum(1 for n in NELL_TOOL_NAMES if f"`{n}`" in out) == 29
+    # 28 before the name-recall fix added the add-name tool (S69), 29 with it, 30 with
+    # remove_name (names increment, S107).
+    assert len(NELL_TOOL_NAMES) == 30
+    assert sum(1 for n in NELL_TOOL_NAMES if f"`{n}`" in out) == 30
 
 
 def test_inventory_carries_the_reach_valve() -> None:
@@ -179,5 +180,5 @@ def test_add_name_tool_line_says_what_the_tool_does() -> None:
     line = next(
         ln for ln in build_tool_inventory("Nell").splitlines() if f"`{ADD_NAME_TOOL_NAME}`" in ln
     )
-    assert "list of names you know" in line
+    assert "Add a name to your list of known names" in line
     assert "PLACEHOLDER" not in line

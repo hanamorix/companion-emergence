@@ -9,31 +9,37 @@ the OG brain.
 from __future__ import annotations
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PLACEHOLDER strings for the add-name tool (name-recall fix, I10, S51).
+# The name tools (name-recall fix, names increment; S104, S105, S107, S135, S137).
 #
-# The tool's identifier, its description and its `name` parameter description are
-# the OWNER'S wording, finalized at the end of the build. Until then each is one
-# constant, marked PLACEHOLDER, with no em-dash. To finalize: edit these three
-# constants only (the tool table, dispatch, registry and recruit tier all read
-# ADD_NAME_TOOL_NAME). The first sentence of the description is what the tool
-# inventory shows as the gloss (`chat/tool_inventory.py`), so the marker sentence
-# comes after the sentence that says what the tool does.
+# Identifiers, descriptions and parameter texts are the owner's approved wording,
+# byte-exact from ~/.claude/plans/name-recall-fix-wording.md section 1 (S107): two
+# tools, not one with a switch. The tool table, dispatch, registry and recruit tier
+# all read these constants. The first sentence of each description is what the
+# tool inventory shows as the gloss (`chat/tool_inventory.py`).
 # ─────────────────────────────────────────────────────────────────────────────
 
-# PLACEHOLDER identifier (carries the marker on purpose; the owner picks the real one).
-ADD_NAME_TOOL_NAME = "add_name_placeholder"
+ADD_NAME_TOOL_NAME = "add_name"
+REMOVE_NAME_TOOL_NAME = "remove_name"
 
-# PLACEHOLDER description.
 ADD_NAME_TOOL_DESCRIPTION = (
-    "Add a name to the list of names you know, such as a person, a pet or a place, "
-    "so that memories holding that name are found when someone says it. "
-    "PLACEHOLDER wording, the owner supplies the final text."
+    "Add a name to your list of known names: a person, a pet, a place, or anything else "
+    "with a proper name. When a known name comes up in conversation, even in passing, "
+    "memories that mention it are found. If the name is also an everyday word (like "
+    "Will), it is only matched when written with a capital letter partway through a "
+    "sentence."
 )
 
-# PLACEHOLDER parameter description.
 ADD_NAME_PARAM_DESCRIPTION = (
-    "The name to add, spelled the way you want it kept. "
-    "PLACEHOLDER wording, the owner supplies the final text."
+    "The name, spelled the way you want it kept."
+)
+
+REMOVE_NAME_TOOL_DESCRIPTION = (
+    "Remove a name from your list of known names, for example an ordinary word that was "
+    "added by mistake. Removing a name does not change any memories."
+)
+
+REMOVE_NAME_PARAM_DESCRIPTION = (
+    "The name to remove, as it appears on your list."
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -764,6 +770,20 @@ SCHEMAS: dict[str, dict] = {
                 "name": {
                     "type": "string",
                     "description": ADD_NAME_PARAM_DESCRIPTION,
+                },
+            },
+            "required": ["name"],
+        },
+    },
+    REMOVE_NAME_TOOL_NAME: {
+        "name": REMOVE_NAME_TOOL_NAME,
+        "description": REMOVE_NAME_TOOL_DESCRIPTION,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": REMOVE_NAME_PARAM_DESCRIPTION,
                 },
             },
             "required": ["name"],
