@@ -72,7 +72,14 @@ metrics:                  # standing regression metrics (source: the JSONL logs)
       cache_creation==0 contribute to the sums only (no per-row division).
     direction: higher_is_better
     regression_threshold: "-10%"
-    gating: true
+    gating: false
+    # ADVISORY since #333. A cache break shows up as cache_creation rising, which
+    # cache_creation_per_chat_call and cost_per_chat_call_usd already gate. The ratio misfires
+    # whenever a change SHRINKS the cached prefix: #332 removed a ~9.3k-token block that was
+    # always read from cache, so cache_read fell faster than cache_creation (ratio −26%/−18%/−2%
+    # on 3 identical pairs) while cost fell 23–47%. If it drops, predict "OLD minus the removed
+    # block" (subtract the block from OLD's cache_read per internal call) and compare; a real
+    # break lands far BELOW that prediction (a simulated one: −81%).
 
   # --- BLOCKED: not measurable from current logs; needs stage-2 instrumentation ---
   # tool_calls_per_request and file_reread_per_request — BLOCKED. The grouping key `request_id`
@@ -106,6 +113,15 @@ metrics:                  # standing regression metrics (source: the JSONL logs)
   to gate (not just advise), baseline and check must run a **comparable set of chat turns**
   (ideally a fixed replay script), else a change that legitimately does more shows a false
   regression. Until a replay harness exists, treat deltas as advisory; confirm with conformance.
+- **Running the replay A/B (lessons from #332).** `cache_replay_workload.py` defaults to the
+  no-tools TEXT path; pass `--with-tools` to measure the tools-bearing chat prefix production
+  uses (the tools path now logs usage rows too). Run OLD from a `git worktree` of the
+  merge-base with its own `uv sync --extra dev`, not via `PYTHONPATH`. Use the default home so
+  the brain's own `CLAUDE_CONFIG_DIR` applies (a scratch home loads the owner's global config,
+  which biases the comparison). Record each arm's exact launch command. If Sonnet's safety
+  classifier flags the scripted conversation (it did on both builds, 2026-09-30), run BOTH arms
+  on Haiku via `get_provider(..., model_override="haiku")`: the token metrics hold across
+  models; cost is then Haiku prices.
 - **These metrics exist because the v0.0.38 file-tool token-cost regression was only catchable
   via `tool_invocations.log.jsonl`.** Any change touching an un-instrumented area must add
   logging in stage 2 ("instrument before you build").
