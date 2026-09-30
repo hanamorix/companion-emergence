@@ -23,13 +23,18 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from brain.dev_constants import MONOLOGUE_FAMILY_TYPES
-from brain.memory.known_names import KnownNames, load_known_names, match_known_names
+from brain.memory.known_names import (
+    KnownNames,
+    load_known_names,
+    match_known_names,
+    name_hit_ok,
+)
 from brain.memory.store import FtsPhrases
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Callable, Iterable, Sequence
 
     from brain.memory.hebbian import HebbianMatrix
     from brain.memory.store import Memory, MemoryStore
@@ -108,6 +113,7 @@ def rank_memories(
     active_only: bool = True,
     include_fading: bool = True,
     genuine_first: bool = False,
+    keep: Callable[[str, Sequence[str]], bool] | None = None,
 ) -> list[tuple[Memory, float | None]]:
     """Rank committed memories by blended relevance — bump-free, best→worst.
 
@@ -128,6 +134,14 @@ def rank_memories(
     the FTS query hands the ranker AND in the final order, with no score
     multiplier. So a family flood can neither fill the pool nor fill the first
     ``limit`` results while a genuine match exists. Default False: unchanged.
+
+    ``keep(text, phrases)`` (name-recall fix, names increment, S121/S129): a hit
+    filter on the memory's text, judged for the given phrases; rows it rejects
+    never take a place in the candidate pool. The FTS path judges each row for all
+    of the query's phrases (one OR query: the row may have matched any of them);
+    the recency fallback, one substring search per phrase, judges each row for the
+    phrase that found it and fetches every match of that phrase (a limited fetch
+    could be all rejected). None (default): unchanged.
     """
     exclude = frozenset(exclude_ids)
 
@@ -137,7 +151,7 @@ def rank_memories(
         # drop excluded ids, THEN slice — so an excluded id inside the top-`limit`
         # matches backfills from the next candidate instead of shrinking the
         # result (stage-6 minor).
-        fetch = (limit + len(exclude)) if limit is not None else None
+        fetch = (limit + len(exclude)) if limit is not None and keep is None else None
         if isinstance(query, FtsPhrases):
             # Whole phrases: one substring search per phrase, newest first
             # across them (a joined string would only match all of them at once).
@@ -150,19 +164,28 @@ def rank_memories(
                     bump=False,
                     limit=fetch,
                 ):
-                    found.setdefault(m.id, m)
+                    if keep is None or keep(m.content or "", (phrase,)):
+                        found.setdefault(m.id, m)
             fallback = sorted(found.values(), key=_created_ts, reverse=True)
         else:
+            joined = query if isinstance(query, str) else " ".join(query)
             fallback = store.search_text(
-                query if isinstance(query, str) else " ".join(query),
+                joined,
                 active_only=active_only,
                 include_fading=include_fading,
                 bump=False,
                 limit=fetch,
             )
+            if keep is not None:
+                phrases = (query,) if isinstance(query, str) else tuple(query)
+                fallback = [m for m in fallback if keep(m.content or "", phrases)]
         kept = [(m, None) for m in fallback if m.id not in exclude]
         return kept[:limit] if limit is not None else kept
 
+    fts_kwargs: dict = {}
+    if keep is not None:
+        phrases = (query,) if isinstance(query, str) else tuple(query)
+        fts_kwargs["keep"] = lambda text: keep(text or "", phrases)
     scored = store.search_fts_scored(
         query,
         active_only=active_only,
@@ -170,6 +193,7 @@ def rank_memories(
         bump=False,
         limit=CANDIDATE_POOL,
         family_types=MONOLOGUE_FAMILY_TYPES if genuine_first else (),
+        **fts_kwargs,
     )
     if not scored:
         return []
@@ -266,9 +290,27 @@ def rank_name_hits(
     the graveyard through ``search_with_loss(lost_names=)`` (S102).
 
     ``names`` come from :func:`names_in`; none means no query (``[]``).
+
+    The hits are filtered with the shared name rules (names increment, S121,
+    S129): a hit whose only occurrences of the queried names break them (a
+    stopword-name written in lower case or at a sentence start, "Don" as the stem
+    of "don't") is dropped, before the candidate pool is cut, so such rows cannot
+    fill it (``known_names.name_hit_ok``: judged per name; a row matched only
+    through FTS's diacritic folding is kept).
     """
     if not names:
         return []
+    # One snapshot per phrase set (the FTS path judges all names, the recency
+    # fallback one name at a time), built once per call, not once per row.
+    snapshots: dict[tuple[str, ...], KnownNames] = {}
+
+    def _keep(text: str, phrases: Sequence[str]) -> bool:
+        key = tuple(phrases)
+        known = snapshots.get(key)
+        if known is None:
+            known = snapshots[key] = KnownNames.from_names(key)
+        return name_hit_ok(text, key, known)
+
     return rank_memories(
         store,
         hebbian,
@@ -277,6 +319,7 @@ def rank_name_hits(
         exclude_ids=exclude_ids,
         include_fading=True,
         genuine_first=True,
+        keep=_keep,
     )
 
 

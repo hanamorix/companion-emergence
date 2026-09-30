@@ -17,7 +17,7 @@ import math
 import re
 import sqlite3
 import uuid
-from collections.abc import Collection, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -2744,6 +2744,7 @@ class MemoryStore:
         limit: int | None = None,
         bump: bool | float = False,
         family_types: Collection[str] = (),
+        keep: Callable[[str], bool] | None = None,
     ) -> list[tuple[Memory, float]]:
         """FTS5/BM25 text-match search, best-match first.
 
@@ -2769,6 +2770,14 @@ class MemoryStore:
         bm25), so a flood of monologue-family matches can never fill the
         candidate pool and keep a genuine match out of it. Empty (default): pure
         bm25 order, unchanged.
+
+        ``keep`` (name-recall fix, names increment, S121/S129): a row filter on
+        the raw ``content``, applied BEFORE ``limit`` so rejected rows never take a
+        place in the result. The first query is today's, with ``LIMIT``; only when
+        it dropped a row and came back full is a second query (no ``LIMIT``) read
+        from the cursor, skipping every id the first one returned, until ``limit``
+        rows passed. Only the returned rows are bumped. None (default): today's
+        single query, unchanged.
         """
         match = _to_fts_match(query)
         if not match:
@@ -2789,10 +2798,13 @@ class MemoryStore:
             params.extend(family)
         else:
             sql += " ORDER BY _bm25 ASC"
-        if limit is not None:
-            sql += " LIMIT ?"
-            params.append(limit)
-        rows = self._conn.execute(sql, params).fetchall()
+        if keep is None:
+            if limit is not None:
+                sql += " LIMIT ?"
+                params.append(limit)
+            rows = self._conn.execute(sql, params).fetchall()
+        else:
+            rows = self._fts_rows_kept(sql, params, limit, keep)
         amount = _bump_amount(bump)
         if rows and amount is not None:
             now_iso = datetime.now(UTC).isoformat()
@@ -2805,6 +2817,36 @@ class MemoryStore:
             )
             self._conn.commit()
         return [(_row_to_memory(row), float(row["_bm25"])) for row in rows]
+
+    def _fts_rows_kept(
+        self,
+        sql: str,
+        params: list[Any],
+        limit: int | None,
+        keep: Callable[[str], bool],
+    ) -> list[sqlite3.Row]:
+        """``search_fts_scored``'s rows that pass ``keep``, in the query's order,
+        at most ``limit`` (see its docstring)."""
+        if limit is None:
+            return [row for row in self._conn.execute(sql, params).fetchall() if keep(row["content"])]
+        first = self._conn.execute(sql + " LIMIT ?", [*params, limit]).fetchall()
+        kept = [row for row in first if keep(row["content"])]
+        if len(kept) == len(first) or len(first) < limit:
+            return kept
+        seen = {row["id"] for row in first}
+        cursor = self._conn.execute(sql, params)
+        try:
+            for row in cursor:
+                if row["id"] in seen:
+                    continue
+                seen.add(row["id"])
+                if keep(row["content"]):
+                    kept.append(row)
+                    if len(kept) >= limit:
+                        break
+        finally:
+            cursor.close()
+        return kept
 
     def active_state_memory_types(self) -> dict[str, str]:
         """`{id: memory_type}` for every memory that is `active = 1` AND in
