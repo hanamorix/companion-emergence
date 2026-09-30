@@ -776,6 +776,7 @@ def _remember_too_long(model_id: str) -> None:
 
 
 def _too_long_remembered(model_id: str) -> bool:
+    """Whether `model_id` has a remembered S127 "too long" verdict."""
     with _cost_lock:
         return model_id in _too_long_fit
 
