@@ -937,7 +937,7 @@ def fake_reranker(monkeypatch):
     from brain.memory.reranker import FakeRerankerProvider
 
     monkeypatch.setattr(
-        reranker_mod, "build_reranker_provider", lambda **kw: FakeRerankerProvider()
+        reranker_mod, "resolve_reranker_model_id", lambda: FakeRerankerProvider().model_id()
     )
     return "fake-reranker"
 

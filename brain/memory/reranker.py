@@ -223,12 +223,13 @@ class CrossEncoderProvider(RerankerProvider):
     (`model_for_tier(TIER_RERANKER)`), never hardcoded here — same
     convention as `FastEmbedProvider` in `embeddings.py`.
 
-    The model file is downloaded once (fastembed's own lazy-download-on-first-
-    use behavior) into `cache_dir` and used fully offline after — no network
-    call happens at rerank() time once the file is cached. Construction
-    itself does NOT download; the download is deferred to fastembed's own
-    internals on first `rerank()` call (`lazy_load=True`), matching
-    `FastEmbedProvider`'s posture.
+    The model file is downloaded once into `cache_dir` and used fully offline
+    after — no network call happens at rerank() time once the file is cached.
+    Construction DOES download it when it is not cached: fastembed's
+    `OnnxTextCrossEncoder.__init__` calls `download_model()` unconditionally,
+    and `lazy_load=True` defers only building the ONNX session to the first
+    `rerank()` call (the same posture as `FastEmbedProvider`). So never
+    construct one just to read its id: use `resolve_reranker_model_id()`.
     """
 
     def __init__(self, model_id: str, cache_dir: str | Path) -> None:

@@ -42,6 +42,15 @@ _EMBEDDER_ID = "fake-256"  # FakeEmbeddingProvider().model_id(), what the suite'
 _RERANKER_ID = "fake-reranker"
 
 
+@pytest.fixture(autouse=True)
+def _suite_fake_model_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The tick reads the runtime model ids from the id accessors (it never
+    builds a provider to learn them), so the ids the suite's fakes report are
+    supplied through those accessors."""
+    monkeypatch.setattr("brain.memory.embeddings.resolve_embedding_model_id", lambda: _EMBEDDER_ID)
+    monkeypatch.setattr("brain.memory.reranker.resolve_reranker_model_id", lambda: _RERANKER_ID)
+
+
 @pytest.fixture
 def store() -> MemoryStore:
     return MemoryStore(db_path=":memory:")

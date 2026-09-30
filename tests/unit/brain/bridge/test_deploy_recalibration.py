@@ -65,7 +65,7 @@ def test_deploy_recalibration_fires_exactly_once_when_no_row_exists(monkeypatch)
     from brain.memory.reranker import FakeRerankerProvider
     from brain.memory.store import MemoryStore
 
-    monkeypatch.setattr(reranker_mod, "build_reranker_provider", lambda **kwargs: FakeRerankerProvider())
+    monkeypatch.setattr(reranker_mod, "resolve_reranker_model_id", lambda: FakeRerankerProvider().model_id())
 
     calls: list[str] = []
 
@@ -108,7 +108,7 @@ def test_deploy_recalibration_fires_for_a_legacy_raw_scale_row(monkeypatch):
     from brain.memory.reranker import FakeRerankerProvider
     from brain.memory.store import MemoryStore
 
-    monkeypatch.setattr(reranker_mod, "build_reranker_provider", lambda **kwargs: FakeRerankerProvider())
+    monkeypatch.setattr(reranker_mod, "resolve_reranker_model_id", lambda: FakeRerankerProvider().model_id())
 
     calls: list[str] = []
 
@@ -147,7 +147,7 @@ def test_deploy_recalibration_noops_when_already_normalized(monkeypatch):
     from brain.memory.reranker import FakeRerankerProvider
     from brain.memory.store import MemoryStore
 
-    monkeypatch.setattr(reranker_mod, "build_reranker_provider", lambda **kwargs: FakeRerankerProvider())
+    monkeypatch.setattr(reranker_mod, "resolve_reranker_model_id", lambda: FakeRerankerProvider().model_id())
 
     calls: list[str] = []
     monkeypatch.setattr(
@@ -178,7 +178,7 @@ def test_deploy_recalibration_does_not_refire_on_a_second_startup(monkeypatch):
     from brain.memory.floor_calibration import FloorDerivationOutcome
     from brain.memory.reranker import FakeRerankerProvider
 
-    monkeypatch.setattr(reranker_mod, "build_reranker_provider", lambda **kwargs: FakeRerankerProvider())
+    monkeypatch.setattr(reranker_mod, "resolve_reranker_model_id", lambda: FakeRerankerProvider().model_id())
 
     calls: list[str] = []
 
@@ -215,7 +215,7 @@ def test_deploy_recalibration_does_not_refire_after_a_normal_daily_tick(monkeypa
     from brain.memory.relevance_judge import FakeRelevanceJudgeProvider
     from brain.memory.reranker import FakeRerankerProvider
 
-    monkeypatch.setattr(reranker_mod, "build_reranker_provider", lambda **kwargs: FakeRerankerProvider())
+    monkeypatch.setattr(reranker_mod, "resolve_reranker_model_id", lambda: FakeRerankerProvider().model_id())
 
     deploy_calls: list[str] = []
 
@@ -263,7 +263,7 @@ def test_deploy_recalibration_does_not_crash_on_a_derivation_failure(monkeypatch
     from brain.memory import reranker as reranker_mod
     from brain.memory.reranker import FakeRerankerProvider
 
-    monkeypatch.setattr(reranker_mod, "build_reranker_provider", lambda **kwargs: FakeRerankerProvider())
+    monkeypatch.setattr(reranker_mod, "resolve_reranker_model_id", lambda: FakeRerankerProvider().model_id())
 
     def _raising_derive(store, model_id, **kw):
         raise RuntimeError("simulated floor-derivation failure")
@@ -310,7 +310,7 @@ def test_deploy_recalibration_gate_does_not_spin_when_no_row_and_insufficient_da
     from brain.memory.reranker import FakeRerankerProvider
     from brain.memory.store import MemoryStore
 
-    monkeypatch.setattr(reranker_mod, "build_reranker_provider", lambda **kwargs: FakeRerankerProvider())
+    monkeypatch.setattr(reranker_mod, "resolve_reranker_model_id", lambda: FakeRerankerProvider().model_id())
 
     call_count = {"n": 0}
     real_derive = fc_mod.derive_and_persist_floor
@@ -365,7 +365,7 @@ def test_deploy_recalibration_gate_still_fires_for_an_existing_raw_scale_row_wit
     from brain.memory.reranker import FakeRerankerProvider
     from brain.memory.store import CALIBRATION_SCORE_SCALE, MemoryStore
 
-    monkeypatch.setattr(reranker_mod, "build_reranker_provider", lambda **kwargs: FakeRerankerProvider())
+    monkeypatch.setattr(reranker_mod, "resolve_reranker_model_id", lambda: FakeRerankerProvider().model_id())
 
     with tempfile.TemporaryDirectory() as d:
         pd = Path(d)
@@ -436,7 +436,7 @@ def test_deploy_recalibration_gate_retries_after_the_retry_window_elapses(monkey
     from brain.memory import reranker as reranker_mod
     from brain.memory.reranker import FakeRerankerProvider
 
-    monkeypatch.setattr(reranker_mod, "build_reranker_provider", lambda **kwargs: FakeRerankerProvider())
+    monkeypatch.setattr(reranker_mod, "resolve_reranker_model_id", lambda: FakeRerankerProvider().model_id())
 
     call_count = {"n": 0}
     real_derive = fc_mod.derive_and_persist_floor

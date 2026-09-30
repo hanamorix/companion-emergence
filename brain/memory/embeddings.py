@@ -500,6 +500,21 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / denom)
 
 
+def resolve_embedding_model_id() -> str:
+    """The runtime embedding model id (the id `build_embedding_provider()`'s
+    provider reports from `model_id()`): `model_tier.TIER_EMBEDDING`'s model
+    string. Pure and cheap: builds, loads and downloads nothing. A caller that
+    needs only the id (a floor lookup, a due check, a log line) must use this,
+    never `build_embedding_provider().model_id()`: constructing a
+    `FastEmbedProvider` downloads and materializes the whole model when it is
+    not cached (a fresh install, CI), which is a multi-GB cost just to read a
+    string. The reranker's counterpart is
+    `reranker.resolve_reranker_model_id`."""
+    from brain.bridge.model_tier import TIER_EMBEDDING, model_for_tier
+
+    return model_for_tier(TIER_EMBEDDING)
+
+
 # Process-wide provider cache keyed by model_id (see build_embedding_provider).
 # Kept at module scope rather than a closure so `_reset_embedding_provider_cache`
 # (test-only) can reach it, and so monkeypatching the *function* (the whole
@@ -561,10 +576,10 @@ def build_embedding_provider() -> EmbeddingProvider:
     path never reads or writes `_provider_cache` at all, and a cached REAL
     provider can never leak into a test expecting the fake (nor vice versa).
     """
-    from brain.bridge.model_tier import MODEL_EMBEDDING_DIM, TIER_EMBEDDING, model_for_tier
+    from brain.bridge.model_tier import MODEL_EMBEDDING_DIM
     from brain.paths import get_cache_dir
 
-    model_id = model_for_tier(TIER_EMBEDDING)
+    model_id = resolve_embedding_model_id()
 
     provider = _provider_cache.get(model_id)
     if provider is not None:

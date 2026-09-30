@@ -110,9 +110,9 @@ def embedder_model_id() -> str:
     """The embedder id the cosine bootstrap and the recall lookup key on: the
     tier's model string, which is also what `FastEmbedProvider.model_id()`
     returns in production (pinned by a test)."""
-    from brain.bridge.model_tier import TIER_EMBEDDING, model_for_tier
+    from brain.memory.embeddings import resolve_embedding_model_id
 
-    return model_for_tier(TIER_EMBEDDING)
+    return resolve_embedding_model_id()
 
 
 def reranker_model_id() -> str:

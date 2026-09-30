@@ -2438,7 +2438,7 @@ def _run_calibration_tick(
     **INC7 SCOPE:** floor derivation + persistence (spec Section 7), via
     ``floor_calibration.derive_and_persist_floor`` — runs against the
     CURRENT production reranker's model_id
-    (``reranker.build_reranker_provider().model_id()``), reading whatever
+    (``reranker.resolve_reranker_model_id()``), reading whatever
     labeled ``calibration_log`` pairs the judge pass above has accumulated
     for the MOST RECENTLY COMPLETED DAY for that model_id (pre-flip
     revision Change 1 re-points this from a pooled multi-day read to a
@@ -2584,9 +2584,11 @@ def _run_calibration_tick(
 
         try:
             from brain.memory import floor_calibration
-            from brain.memory.reranker import build_reranker_provider
+            from brain.memory.reranker import resolve_reranker_model_id
 
-            current_reranker_model_id = build_reranker_provider(store=store).model_id()
+            # The id only: building a provider to read it would download the
+            # model on an install that has not cached it.
+            current_reranker_model_id = resolve_reranker_model_id()
             outcome = floor_calibration.derive_and_persist_floor(store, current_reranker_model_id)
             logger.info(
                 "calibration tick: floor derivation for %s -> accepted=%s floor=%s "
@@ -2609,7 +2611,10 @@ def _run_calibration_tick(
             from brain.memory import embeddings as embeddings_mod
             from brain.memory import floor_calibration
 
-            embedder_model_id = embeddings_mod.build_embedding_provider().model_id()
+            # The id only: building a provider to read it downloads and
+            # materializes the whole embedding model when it is not cached (a
+            # fresh install, CI), inside the calibration tick.
+            embedder_model_id = embeddings_mod.resolve_embedding_model_id()
             cosine_outcome = floor_calibration.derive_and_persist_cosine_floor(
                 store, embedder_model_id
             )
@@ -2749,9 +2754,9 @@ def _deploy_recalibration_due(persona_dir: Path) -> bool:
         store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
         stack.callback(store.close)
 
-        from brain.memory.reranker import build_reranker_provider
+        from brain.memory.reranker import resolve_reranker_model_id
 
-        current_reranker_model_id = build_reranker_provider(store=store).model_id()
+        current_reranker_model_id = resolve_reranker_model_id()
 
         if not store.reranker_floor_is_stale(current_reranker_model_id):
             logger.debug(
@@ -2791,9 +2796,9 @@ def _run_deploy_recalibration(persona_dir: Path) -> None:
         store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
         stack.callback(store.close)
 
-        from brain.memory.reranker import build_reranker_provider
+        from brain.memory.reranker import resolve_reranker_model_id
 
-        current_reranker_model_id = build_reranker_provider(store=store).model_id()
+        current_reranker_model_id = resolve_reranker_model_id()
         if not store.reranker_floor_is_stale(current_reranker_model_id):
             return
         no_row = store.get_persisted_reranker_floor(current_reranker_model_id) is None
