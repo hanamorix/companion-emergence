@@ -702,9 +702,11 @@ def _fit_cost(sums: _CostSums) -> tuple[float, float] | None:
 
 
 # model_id -> cost state, the model ids whose warm-up has run, the last query
-# per model id that went to the cosine path for lack of budget (S113), and the
-# chat activity marker of each model id's last re-measure (S100). One lock
-# guards them all (every read and every read-modify-write), so a concurrent
+# per model id that went to the cosine path for lack of budget (S113), the chat
+# activity marker of each model id's last re-measure (S100), and the "too long"
+# verdicts (S127: the (overhead, rate) of the fit in effect when the job's own
+# 5-candidate rerank exceeded the full budget; it ends when that fit changes).
+# One lock guards them all (every read and every read-modify-write), so a concurrent
 # passive recall, `search_memories` call (#297: the tool runs in a bridge
 # worker thread), the re-measure job and the compaction tick never lose an
 # update.
@@ -712,6 +714,7 @@ _cost_sums: dict[str, _CostSums] = {}
 _warmed_model_ids: set[str] = set()
 _budget_misses: dict[str, _BudgetMiss] = {}
 _remeasured_marker: dict[str, object] = {}
+_too_long_fit: dict[str, tuple[float, float]] = {}
 _cost_lock = threading.Lock()
 
 # Test-only seam (CONC-1): called inside an update, between reading the
@@ -747,12 +750,41 @@ def _record_rerank_cost(
         current = _cost_sums.get(model_id, _CostSums())
         if _cost_update_hook is not None:
             _cost_update_hook()
-        _cost_sums[model_id] = current.plus(padded_tokens, seconds, rss_delta_bytes)
+        updated = current.plus(padded_tokens, seconds, rss_delta_bytes)
+        _cost_sums[model_id] = updated
+        _end_too_long_if_fit_changed(model_id, updated)
+
+
+def _end_too_long_if_fit_changed(model_id: str, sums: _CostSums) -> None:
+    """S127: a remembered "too long" verdict ends as soon as the fitted cost
+    model (overhead, rate) differs from the one it was reached under. Call with
+    `_cost_lock` held, after `sums` is stored."""
+    held = _too_long_fit.get(model_id)
+    if held is not None and _fit_cost(sums) != held:
+        del _too_long_fit[model_id]
+
+
+def _remember_too_long(model_id: str) -> None:
+    """S127: remember that the job measured the stuck record's 5 candidates
+    over the full budget, under the fit now in effect (which already includes
+    that measurement)."""
+    with _cost_lock:
+        sums = _cost_sums.get(model_id)
+        fit = None if sums is None else _fit_cost(sums)
+        if fit is not None:
+            _too_long_fit[model_id] = fit
+
+
+def _too_long_remembered(model_id: str) -> bool:
+    with _cost_lock:
+        return model_id in _too_long_fit
 
 
 def _start_new_rerank_period() -> None:
     """The 24-hour compaction tick (S101): every model id's time sums start
-    over, the fit in effect carried (S114). RAM and warm-up state are kept."""
+    over, the fit in effect carried (S114). RAM and warm-up state are kept, and
+    so are "too long" verdicts: the carried fit is the fit the verdict was
+    reached under (S127)."""
     with _cost_lock:
         for model_id, sums in list(_cost_sums.items()):
             _cost_sums[model_id] = sums.next_period()
@@ -763,12 +795,13 @@ cost_period.on_new_period(_start_new_rerank_period)
 
 def _reset_rerank_cost_model() -> None:
     """Test-only: forget every model id's running sums, warm-up state, budget
-    misses and re-measure markers."""
+    misses, re-measure markers and "too long" verdicts."""
     with _cost_lock:
         _cost_sums.clear()
         _warmed_model_ids.clear()
         _budget_misses.clear()
         _remeasured_marker.clear()
+        _too_long_fit.clear()
 
 
 def _full_rerank_budget() -> float:
@@ -827,12 +860,17 @@ def stuck_width_due(activity_marker: object) -> bool:
     """Whether the `rerank_width_remeasure` job is due (S100, S113): the
     runtime reranker model id has a budget miss that is stuck under the
     current estimate, its warm-up has run in this process and its provider is
-    cached (the job never builds or loads a model), and no re-measure has run
-    at this chat activity marker (once per lull). A miss found not stuck is
-    dropped. Takes `_cost_lock` only briefly, never nested."""
+    cached (the job never builds or loads a model), no re-measure has run
+    at this chat activity marker (once per lull), and no "too long" verdict is
+    remembered (S127: the job's own measured 5 candidates exceeded the full
+    budget under the fit still in effect, so a new record does not re-trigger
+    the job until the fit changes). A miss found not stuck is dropped. Takes
+    `_cost_lock` only briefly, never nested."""
     model_id = resolve_reranker_model_id()
     miss, stamp, warmed = _job_state(model_id)
     if miss is None or not warmed or _provider_cache.get(model_id) is None:
+        return False
+    if _too_long_remembered(model_id):
         return False
     if stamp is not _NEVER and stamp == activity_marker:
         return False
@@ -848,15 +886,19 @@ def remeasure_stuck_width(activity_marker: object) -> bool:
     anchors) on the already-loaded provider, added to the cost sums. Then the
     miss is cleared when the measured seconds are within the full budget
     (S116 a: 5 fit) and dropped when they exceed it (S116 b: genuinely too
-    long, not stuck). The marker is stamped first, so a failing or RAM-skipped
-    run still runs once per lull. Skipped (miss kept) when the miss is no
-    longer stuck (then dropped) or the RAM bound predicts the batch does not
-    fit the current headroom. Returns True iff the rerank ran. Provider
-    exceptions propagate (the central pass logs them)."""
+    long, not stuck), and that verdict is remembered until the fitted cost
+    model next changes (S127). The marker is stamped first, so a failing or
+    RAM-skipped run still runs once per lull. Skipped (miss kept) when the
+    miss is no longer stuck (then dropped), a "too long" verdict is
+    remembered, or the RAM bound predicts the batch does not fit the current
+    headroom. Returns True iff the rerank ran. Provider exceptions propagate
+    (the central pass logs them)."""
     model_id = resolve_reranker_model_id()
     miss, _, warmed = _job_state(model_id)
     provider = _provider_cache.get(model_id)
     if miss is None or not warmed or provider is None:
+        return False
+    if _too_long_remembered(model_id):
         return False
     with _cost_lock:
         _remeasured_marker[model_id] = activity_marker
@@ -881,6 +923,8 @@ def remeasure_stuck_width(activity_marker: object) -> bool:
     budget = _full_rerank_budget()
     if seconds is not None:
         _drop_miss(model_id, miss)
+        if seconds > budget:
+            _remember_too_long(model_id)
     log.info(
         "rerank width re-measure: model=%s padded_tokens=%d seconds=%s budget=%s -> %s",
         model_id,
