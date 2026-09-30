@@ -127,6 +127,101 @@ def test_release_leaves_a_lock_another_process_now_owns(tmp_path):
     assert (tmp_path / ".lock").read_text(encoding="utf-8") == "424242"
 
 
+def test_loaded_overlay_is_none_for_the_bundle_brain(tmp_path, monkeypatch):
+    import brain
+
+    monkeypatch.setenv("KINDLED_HOME", str(tmp_path / "home"))
+    pkg = tmp_path / "site-packages" / "brain"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    monkeypatch.setattr(brain, "__file__", str(pkg / "__init__.py"))
+    assert overlay.loaded_overlay() is None
+
+
+def _brain_in_overlay(tmp_path, monkeypatch, stamp):
+    import brain
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("KINDLED_HOME", str(home))
+    folder = overlay.overlay_root() / "abc123def456-0123abcd"
+    (folder / "brain").mkdir(parents=True)
+    (folder / "brain" / "__init__.py").write_text("", encoding="utf-8")
+    if stamp is not None:
+        (folder / "stamp.json").write_text(stamp, encoding="utf-8")
+    monkeypatch.setattr(brain, "__file__", str(folder / "brain" / "__init__.py"))
+
+
+def test_loaded_overlay_reads_the_running_folders_stamp(tmp_path, monkeypatch):
+    _brain_in_overlay(tmp_path, monkeypatch, json.dumps(
+        {"dir": "abc123def456-0123abcd", "commit": "a" * 40, "brain_version": "0.0.43"}))
+    assert overlay.loaded_overlay() == {
+        "dir": "abc123def456-0123abcd", "commit": "a" * 40, "brain_version": "0.0.43",
+        "bundle_match": False}
+
+
+def test_loaded_overlay_without_a_readable_stamp_still_names_the_folder(tmp_path, monkeypatch):
+    _brain_in_overlay(tmp_path, monkeypatch, "{not json")
+    assert overlay.loaded_overlay() == {
+        "dir": "abc123def456-0123abcd", "commit": None, "brain_version": None,
+        "bundle_match": False}
+
+
+def test_loaded_overlay_is_none_when_brain_resolves_to_the_overlay_root(tmp_path, monkeypatch):
+    import brain
+
+    monkeypatch.setenv("KINDLED_HOME", str(tmp_path / "home"))
+    root = overlay.overlay_root()
+    root.mkdir(parents=True)
+    monkeypatch.setattr(brain, "__file__", str(root))
+    assert overlay.loaded_overlay() is None
+
+
+def _bundle(tmp_path, monkeypatch, bundle_id):
+    """Point the running bundle's purelib at a temp dir holding `bundle_id` (None = no file)."""
+    import sysconfig
+
+    from brain.update.overlay_hook import BUNDLE_ID_FILE
+
+    site = tmp_path / "bundle-site"
+    site.mkdir(exist_ok=True)
+    if bundle_id is not None:
+        (site / BUNDLE_ID_FILE).write_text(bundle_id + "\n", encoding="utf-8")
+    real = sysconfig.get_paths
+    monkeypatch.setattr(sysconfig, "get_paths", lambda *a, **k: {**real(*a, **k), "purelib": str(site)})
+
+
+def _stamp(bundle_id=None):
+    s = {"dir": "abc123def456-0123abcd", "commit": "a" * 40, "brain_version": "0.0.43"}
+    if bundle_id is not None:
+        s["bundle_id"] = bundle_id
+    return json.dumps(s)
+
+
+def test_loaded_overlay_matches_when_the_stamp_names_the_running_bundle(tmp_path, monkeypatch):
+    _brain_in_overlay(tmp_path, monkeypatch, _stamp("bundle-1"))
+    _bundle(tmp_path, monkeypatch, "bundle-1")
+    assert overlay.loaded_overlay()["bundle_match"] is True
+
+
+def test_loaded_overlay_does_not_match_another_bundle(tmp_path, monkeypatch):
+    _brain_in_overlay(tmp_path, monkeypatch, _stamp("bundle-1"))
+    _bundle(tmp_path, monkeypatch, "bundle-2")
+    assert overlay.loaded_overlay()["bundle_match"] is False
+
+
+def test_loaded_overlay_without_a_stamp_bundle_id_does_not_match(tmp_path, monkeypatch):
+    _brain_in_overlay(tmp_path, monkeypatch, _stamp())
+    _bundle(tmp_path, monkeypatch, "bundle-1")
+    assert overlay.loaded_overlay()["bundle_match"] is False
+
+
+def test_loaded_overlay_without_a_bundle_id_file_does_not_match(tmp_path, monkeypatch):
+    _brain_in_overlay(tmp_path, monkeypatch, _stamp("bundle-1"))
+    _bundle(tmp_path, monkeypatch, None)
+    assert overlay.loaded_overlay()["bundle_match"] is False
+    assert overlay.current_bundle_id() is None
+
+
 def test_prune_skips_a_folder_a_live_process_still_uses(tmp_path):
     """#302: a bridge left running on an older overlay (a second persona, or
     update.sh --no-restart) must not have its folder deleted under it."""

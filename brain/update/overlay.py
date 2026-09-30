@@ -13,12 +13,14 @@ import contextlib
 import json
 import os
 import shutil
+import sysconfig
 import time
 from collections.abc import Iterator
 from pathlib import Path
 
 from brain.bridge.state_file import pid_is_alive
 from brain.paths import get_home
+from brain.update.overlay_hook import BUNDLE_ID_FILE
 
 STATE_FILE = "current.json"
 LOCK_FILE = ".lock"
@@ -44,6 +46,48 @@ def read_state(root: Path) -> dict:
     if not isinstance(data, dict):
         return {"active": None, "previous": None}
     return {"active": data.get("active") or None, "previous": data.get("previous") or None}
+
+
+def current_bundle_id() -> str | None:
+    """The running bundle's id (`_ce_bundle_id` in its site-packages); None in a dev
+    venv or when unreadable."""
+    try:
+        text = (Path(sysconfig.get_paths()["purelib"]) / BUNDLE_ID_FILE).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return text.strip() or None
+
+
+def loaded_overlay() -> dict | None:
+    """The overlay THIS interpreter loaded `brain` from — read from that folder's
+    stamp, not current.json, because an install swapped in after start is not what
+    is running. None when `brain` comes from the bundle (or a checkout)."""
+    import brain
+
+    root = overlay_root().resolve()
+    try:
+        rel = Path(brain.__file__).resolve().relative_to(root)
+    except ValueError:
+        return None
+    if not rel.parts:
+        return None  # brain resolved to the root itself: no overlay folder to name
+    folder = rel.parts[0]
+    try:
+        stamp = json.loads((root / folder / "stamp.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        stamp = None
+    if not isinstance(stamp, dict):
+        stamp = {}
+    stamp_bundle = stamp.get("bundle_id")
+    return {
+        "dir": folder,
+        "commit": stamp.get("commit"),
+        "brain_version": stamp.get("brain_version"),
+        # False = this overlay was built for another bundle (e.g. the app was
+        # reinstalled under it); the app then treats the bridge as stale.
+        "bundle_match": isinstance(stamp_bundle, str) and bool(stamp_bundle)
+        and stamp_bundle == current_bundle_id(),
+    }
 
 
 def _write_state(root: Path, active: dict | None, previous: dict | None) -> None:
