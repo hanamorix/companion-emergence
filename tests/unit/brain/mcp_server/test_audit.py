@@ -44,6 +44,19 @@ def test_log_invocation_redacts_sensitive_argument_fields(tmp_path: Path) -> Non
     assert "private body text" not in rec["result_summary"]
 
 
+def test_log_invocation_redacts_urls(tmp_path: Path) -> None:
+    """#273: a visited URL is as identifying as a search query."""
+    log_invocation(
+        tmp_path,
+        name="some_tool",
+        arguments={"url": "https://example.com/private/page"},
+        result_summary='{"url": "https://example.com/private/page"}',
+    )
+    rec = json.loads((tmp_path / "tool_invocations.log.jsonl").read_text(encoding="utf-8"))
+    assert rec["arguments"]["url"] == "[REDACTED]"
+    assert "example.com" not in rec["result_summary"]
+
+
 def test_log_invocation_metadata_mode_omits_arguments_and_summary(
     tmp_path: Path, monkeypatch
 ) -> None:
