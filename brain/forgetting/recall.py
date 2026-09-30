@@ -69,7 +69,7 @@ def search_with_loss(
             a token list). Passive recall passes the legacy capped token set
             here so the grief-breadcrumb firing does not widen when the
             keyword search's token cap is removed (name-recall fix R4, plan
-            P-14/P-25, Q16 interim, PARKED for the owner).
+            P-14/P-25, S71), minus the message's contraction fragments (S123).
         lost_names: Listed names found in the message, handed to the graveyard
             search beside ``lost_query`` (name-recall fix S102, S119): they
             match at any length, as phrases, and their hits rank first. A

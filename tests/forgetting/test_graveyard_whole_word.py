@@ -146,6 +146,11 @@ def test_contraction_stems_are_not_query_words(apos):
     assert query_words(f"Jonas{apos}s boat, Marcus{apos}s boat") == ["jonas", "boat", "marcus"]
 
 
+def test_no_standalone_wins_exception(tmp_path):
+    # S126: the stem is dropped even when the same word also appears standalone.
+    assert query_words("Couldn came by. I couldn't know.") == ["came", "know"]
+
+
 def test_dont_know_does_not_match_dont_entries(tmp_path):
     _write(tmp_path, [("a", "I don't remember the boat", "chat"), ("b", "don't wait up", "chat"), ("c", "Don's boat", "chat"),
                       ("d", "we know the way", "chat")])
@@ -195,6 +200,9 @@ def test_without_names_newest_first(tmp_path):
         ('so he asked "Will you?"', "chat", True),
         ("nothing", "team Will", True),
         ("nothing", "Will", False),
+        ("Hi, Will", "chat", True),  # a comma is not a sentence end (S104)
+        ("\u0130\u0130\u0130 saw Will", "chat", True),  # F12: spans on the original text
+        ("\u0130 was there. Will you", "chat", False),
     ],
 )
 def test_a_stopword_name_matches_only_capitalized_mid_sentence(tmp_path, summary, domain, expected):
@@ -223,8 +231,21 @@ def test_a_multi_word_name_ignores_the_nt_skip(tmp_path):
 def test_an_entry_with_no_substring_hit_is_never_split(tmp_path, monkeypatch):
     _write(tmp_path, [("a", "nothing relevant at all", "chat"), ("b", "the harbour at dusk", "chat")])
     calls: list[str] = []
-    real = graveyard._split_words
-    monkeypatch.setattr(graveyard, "_split_words", lambda text: calls.append(text) or real(text))
+
+    class Counting:
+        def __init__(self, real):
+            self._real = real
+
+        def findall(self, text):
+            calls.append(text)
+            return self._real.findall(text)
+
+        def finditer(self, text):
+            calls.append(text)
+            return self._real.finditer(text)
+
+    monkeypatch.setattr(graveyard, "_WORD_RE", Counting(graveyard._WORD_RE))
+    calls.clear()
     assert _ids(search(tmp_path, "harbour")) == ["b"]
     assert "the harbour at dusk" in calls
     assert "nothing relevant at all" not in calls
@@ -238,6 +259,18 @@ def test_the_graveyard_follows_name_rules(monkeypatch, tmp_path):
     assert _ids(search(tmp_path, "", names=["don"])) == ["a"]
     monkeypatch.setattr("brain.forgetting.graveyard.contraction_stems", lambda _t: frozenset())
     assert query_words("didn't know") == ["didn", "know"]
+    # the stopword-name predicate is the shared one too (T2)
+    _write(tmp_path, [("b", "Will you come", "chat")])
+    assert search(tmp_path, "", names=["will"]) == []
+    monkeypatch.setattr("brain.forgetting.graveyard.is_stopword_name", lambda _n: False)
+    assert _ids(search(tmp_path, "", names=["will"])) == ["b"]
+
+
+def test_one_word_split_everywhere():
+    from brain.memory import name_rules
+
+    assert graveyard._WORD_RE is name_rules.WORD_RE
+    assert kn._WORD_RE is name_rules.WORD_RE
 
 
 # G23 isolation, search_with_loss
@@ -291,3 +324,20 @@ def test_recall_forgotten_wording_is_byte_exact():
     )
     assert d["parameters"]["required"] == ["query"] and set(d["parameters"]["properties"]) == {"query"}
     assert q["type"] == "string"
+
+
+def test_a_name_only_turn_does_not_run_the_ranked_search(tmp_path, monkeypatch):
+    store = MemoryStore(":memory:")
+    _write(tmp_path, [("a", "Al waved", "chat")])
+    called = []
+    monkeypatch.setattr("brain.forgetting.recall.rank_memories", lambda *a, **k: called.append(1) or [])
+    assert _ids(search_with_loss(tmp_path, store, "", lost_names=["al"]).lost) == ["a"]
+    assert called == []
+
+
+def test_a_failing_graveyard_search_is_logged(tmp_path, monkeypatch, caplog):
+    store = MemoryStore(":memory:")
+    monkeypatch.setattr(graveyard, "search", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    with caplog.at_level("ERROR"):
+        assert search_with_loss(tmp_path, store, "harbour").lost == []
+    assert "graveyard search failed" in caplog.text

@@ -49,7 +49,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import sqlite3
 import threading
 from collections.abc import Iterable, Sequence
@@ -58,7 +57,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain import dev_constants
-from brain.memory.name_rules import followed_by_apostrophe_t
+from brain.memory.name_rules import WORD_RE, followed_by_apostrophe_t
 from brain.memory.recall_stopwords import RECALL_STOPWORDS
 from brain.utils.file_lock import file_lock
 
@@ -82,7 +81,7 @@ SOURCES: tuple[str, ...] = ("gate", "reappraiser", "tool")
 # The recall tokenizer's word boundary (`brain.chat.prompt._extract_recall_tokens`
 # matches runs of ASCII letters and digits). Non-Latin and space-less scripts
 # are out of scope (#317).
-_WORD_RE = re.compile(r"[A-Za-z0-9]+")
+_WORD_RE = WORD_RE
 
 # SQLite header: the 4-byte big-endian file change counter is at offset 24, so
 # the first 28 bytes hold it. Valid because the file is journal_mode=DELETE.

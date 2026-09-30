@@ -24,13 +24,16 @@ from brain.memory.recall_stopwords import RECALL_STOPWORDS
 
 __all__ = [
     "contraction_stems",
+    "WORD_RE",
     "followed_by_apostrophe_t",
     "is_sentence_start",
     "is_stopword_name",
     "stopword_name_occurrence_ok",
 ]
 
-_WORD_RE = re.compile(r"[A-Za-z0-9]+")
+#: The one word split (runs of ASCII letters and digits): the keyword search's,
+#: the known-names matcher's and the forgotten-memory search's (S102).
+WORD_RE = re.compile(r"[A-Za-z0-9]+")
 _APOSTROPHES = ("'", "’")
 # The contraction endings whose stem is a fragment, not a word (S126). "t" is
 # the n't ending (the stem then ends in "n"); the stem before 's is kept.
@@ -71,7 +74,7 @@ def contraction_stems(text: str) -> frozenset[str]:
     curly apostrophes, any letter case. A stem before n't must end in "n".
     """
     out: set[str] = set()
-    for m in _WORD_RE.finditer(text):
+    for m in WORD_RE.finditer(text):
         end = m.end()
         if not _followed_by_fragment_suffix(text, end):
             continue
@@ -87,7 +90,7 @@ def is_stopword_name(name: str) -> bool:
     """True when the name's whole normalized form (lower-cased words, single
     spaced) is a recall stopword: exactly the names S70 refuses to admit and
     S104 lets the kindled add with the tool, flagged."""
-    return " ".join(w.lower() for w in _WORD_RE.findall(name)) in RECALL_STOPWORDS
+    return " ".join(w.lower() for w in WORD_RE.findall(name)) in RECALL_STOPWORDS
 
 
 def is_sentence_start(text: str, pos: int) -> bool:

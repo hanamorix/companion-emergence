@@ -105,6 +105,25 @@ def test_a_listed_name_equal_to_a_stem_does_not_flood_on_dont(tmp_path):
     assert _lost_lines(block) == [] and touch.call_count == 0
 
 
+def test_four_letter_stems_are_not_fed_on_the_passive_path_either(tmp_path):
+    # T1: the stems that matter are 4+ characters (the floor drops `don` anyway).
+    for message, stem, noisy in [
+        ("I couldn't find it", "couldn", "she couldn't stop crying"),
+        ("I didn't find it", "didn", "he didn't stop"),
+        ("it doesn't find", "doesn", "it doesn't stop"),
+    ]:
+        sub = tmp_path / stem
+        sub.mkdir()
+        entries = [_entry("m1", noisy, 1), _entry("m2", "find the old boat", 2)]
+        store = _world(sub, entries, store_texts=("a quiet filler line",))
+        tokens = _extract_recall_tokens(message, store)
+        assert stem in tokens, "precondition: the real selector hands the stem to the graveyard feed"
+        block, touch = _render(store, sub, message)
+        lost = _lost_lines(block)
+        assert len(lost) == 1 and "find the" in lost[0], (message, lost)
+        assert touch.call_args.kwargs["touched_ids"] == ["m2"]
+
+
 # G10 names reach the graveyard; G11 name-only; G12 one call
 def test_a_listed_name_reaches_the_graveyard_and_an_unlisted_one_does_not(tmp_path, monkeypatch):
     kn.admit_names(tmp_path, ["Al"], "tool")

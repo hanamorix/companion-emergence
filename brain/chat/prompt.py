@@ -1301,11 +1301,12 @@ def _build_recall_block(
             heb = None
         try:
             # Tier 1 (spec §5, S79): TODAY's search, the old capped selection
-            # joined into one raw-string query, so nothing it finds is lost; the
-            # graveyard is fed the same string (P-14/P-25, Q16 interim).
-            # A message that is only a known name has no selector token, so this
-            # query is empty: skip the call (an empty lost query would match
-            # EVERY graveyard entry and fire grief touches on a name-only turn).
+            # joined into one raw-string query, so nothing it finds is lost. The
+            # graveyard gets the same words minus the message's contraction
+            # fragments (S123) plus the listed names (S102). A message that is
+            # only a known name has no selector token, so the query is empty but
+            # the call still runs for the names (the graveyard never sees an
+            # empty word string with no names: that matches nothing).
             result = (
                 search_with_loss(
                     persona_dir,
@@ -1702,7 +1703,7 @@ _RECALL_TOKEN_MIN_LEN = 3
 # The constant now names the size of the LEGACY selection
 # (`_legacy_capped_tokens`): tier 1 of the keyword search (today's query, S79),
 # and what still feeds the graveyard search and the "not recognised" list so
-# those two outputs do not widen (S71, Q16 interim; PARKED/REVIEW-PENDING).
+# those two outputs do not widen (S71; the graveyard also gets the listed names, S102).
 _RECALL_TOKEN_LIMIT = 10
 
 # The stopword set lives in brain.memory.recall_stopwords (moved there so the

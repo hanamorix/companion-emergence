@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from collections.abc import Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -20,8 +19,12 @@ from pathlib import Path
 from brain.forgetting.salience import SalienceInputs
 from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
 from brain.memory.name_rules import (
+    WORD_RE as _WORD_RE,
+)
+from brain.memory.name_rules import (
     contraction_stems,
     followed_by_apostrophe_t,
+    is_stopword_name,
     stopword_name_occurrence_ok,
 )
 from brain.memory.recall_stopwords import RECALL_STOPWORDS
@@ -74,8 +77,6 @@ def append(
             os.fsync(fh.fileno())
 
 
-_WORD_RE = re.compile(r"[A-Za-z0-9]+")
-
 #: Ordinary query words shorter than this are not searched (today's minimum,
 #: S128); listed names are the one exception and match at any length.
 _MIN_WORD_LEN = 4
@@ -127,9 +128,13 @@ def _field_matches(
     low = text.lower()
     if not any(h in low for h in hints):
         return False, False
+    # Words come from the ORIGINAL text, each lower-cased (F12: never offsets or
+    # words taken from a lower-cased copy).
+    word_hit = bool(words) and not words.isdisjoint(w.lower() for w in _WORD_RE.findall(text))
+    if not names or not any(w in low for phrase in names for w in phrase):
+        return word_hit, False
     split = _split_words(text)
     entry_words = [w for w, _, _ in split]
-    word_hit = bool(words) and any(w in words for w in entry_words)
     name_hit = False
     for name in names:
         n = len(name)
@@ -141,9 +146,7 @@ def _field_matches(
             if n == 1 and followed_by_apostrophe_t(text, spans[0][1]):
                 continue
             # S121: a stopword-name only where capitalized, not at a sentence start.
-            if " ".join(name) in RECALL_STOPWORDS and not stopword_name_occurrence_ok(
-                text, spans
-            ):
+            if is_stopword_name(" ".join(name)) and not stopword_name_occurrence_ok(text, spans):
                 continue
             name_hit = True
             break
