@@ -673,11 +673,14 @@ def test_supervisor_startup_deletes_legacy_embeddings_db_when_fully_embedded(
     all, proving the hook lives before that loop, not inside it — and
     actually deletes the stale file once every active row already carries a
     current-model embedding."""
+    from brain.bridge import model_tier
     from brain.memory import embeddings as embeddings_mod
     from brain.memory.store import Memory, MemoryStore
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+    # The deletion gate reads the current model id without building a provider.
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
 
     persona_dir = _persona_dir(tmp_path)
     store = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
@@ -715,11 +718,14 @@ def test_supervisor_startup_defers_legacy_embeddings_db_deletion_with_backlog(
     """Same startup hook, other half: a still-un-embedded active row means
     the backlog gate is non-empty, so the legacy file must be left in place
     for the next startup rather than deleted early."""
+    from brain.bridge import model_tier
     from brain.memory import embeddings as embeddings_mod
     from brain.memory.store import Memory, MemoryStore
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+    # The deletion gate reads the current model id without building a provider.
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
 
     persona_dir = _persona_dir(tmp_path)
     store = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)

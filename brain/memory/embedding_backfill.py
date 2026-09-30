@@ -404,10 +404,13 @@ def has_embedding_backfill_work(store: MemoryStore) -> bool:
     (ram-spike-fix INC-9, S53/S66): True iff the backlog (exactly
     ``MemoryStore.list_unembedded_since``'s definition, from the start of
     history, under the current embedding model) holds at least one row.
-    Reads one row at most; writes nothing."""
+    Reads one row at most; writes nothing. Builds no provider: the model id
+    comes from `resolve_embedding_model_id()`, because constructing a
+    `FastEmbedProvider` downloads the whole model when it is not cached, and
+    this probe runs on every idle pass."""
     from brain.memory import embeddings as embeddings_mod
 
-    model_id = embeddings_mod.build_embedding_provider().model_id()
+    model_id = embeddings_mod.resolve_embedding_model_id()
     return bool(
         store.list_unembedded_since(
             None, limit=1, current_model_id=model_id, min_chars=MIN_CHARS_TO_EMBED
@@ -704,9 +707,9 @@ def run_embedding_backfill_to_completion(
             stopped_reason = "stalled_no_progress"
             break
 
-    provider = embeddings_mod.build_embedding_provider()
     final_failed = store.count_unembedded(
-        current_model_id=provider.model_id(), min_chars=MIN_CHARS_TO_EMBED
+        current_model_id=embeddings_mod.resolve_embedding_model_id(),
+        min_chars=MIN_CHARS_TO_EMBED,
     )
 
     return BackfillDrainResult(
@@ -742,9 +745,9 @@ def delete_legacy_embeddings_db(persona_dir, store: MemoryStore) -> bool:  # noq
     one-go CLI drain (`run_embedding_backfill_to_completion`) already use
     (see `MemoryStore.count_unembedded`), so "safe to delete" means exactly
     "the backfill considers itself caught up". The current model id comes
-    from `build_embedding_provider()` (looked up through the module, same
-    dynamic-lookup convention as `MemoryStore.embed_row` and the CLI
-    backfill command), which is pinned to `model_tier.TIER_EMBEDDING` — so a
+    from `resolve_embedding_model_id()` (looked up through the module; it
+    builds no provider), which is `model_tier.TIER_EMBEDDING`'s model string,
+    the id `build_embedding_provider()`'s provider reports — so a
     `MODEL_EMBEDDING` swap correctly reopens the gate (old-model rows count
     as backlog) rather than deleting the file out from under an in-progress
     re-embed.
@@ -774,9 +777,9 @@ def delete_legacy_embeddings_db(persona_dir, store: MemoryStore) -> bool:  # noq
     if not db_path.exists():
         return False
 
-    provider = embeddings_mod.build_embedding_provider()
+    current_model_id = embeddings_mod.resolve_embedding_model_id()
     backlog = store.count_unembedded(
-        current_model_id=provider.model_id(), min_chars=MIN_CHARS_TO_EMBED
+        current_model_id=current_model_id, min_chars=MIN_CHARS_TO_EMBED
     )
     if backlog > 0:
         logger.info(
@@ -784,7 +787,7 @@ def delete_legacy_embeddings_db(persona_dir, store: MemoryStore) -> bool:  # noq
             "un-embedded under the current model (%s)",
             persona_dir.name,
             backlog,
-            provider.model_id(),
+            current_model_id,
         )
         return False
 
@@ -807,7 +810,7 @@ def delete_legacy_embeddings_db(persona_dir, store: MemoryStore) -> bool:  # noq
             "deleted legacy embeddings.db for %s (all active rows embedded "
             "under current model %s)",
             persona_dir.name,
-            provider.model_id(),
+            current_model_id,
         )
 
     return deleted_main

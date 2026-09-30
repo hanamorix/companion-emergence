@@ -645,7 +645,7 @@ def _embed_backfill_handler(args: argparse.Namespace) -> int:
         MIN_CHARS_TO_EMBED,
         run_embedding_backfill_to_completion,
     )
-    from brain.memory.embeddings import build_embedding_provider
+    from brain.memory.embeddings import resolve_embedding_model_id
 
     # `_open_memory_store_for_cli` is documented as opening for "read-only
     # CLI inspection" (its other 3 call sites only ever read) — `MemoryStore`
@@ -659,9 +659,12 @@ def _embed_backfill_handler(args: argparse.Namespace) -> int:
 
     persona_dir = get_persona_dir(args.persona)
     try:
-        provider = build_embedding_provider()
+        # The id only: no provider is built here (constructing one downloads
+        # the model when uncached, even for an empty backlog); the drain builds
+        # its own when there are rows to embed.
+        model_id = resolve_embedding_model_id()
         total_backlog = store.count_unembedded(
-            current_model_id=provider.model_id(), min_chars=MIN_CHARS_TO_EMBED
+            current_model_id=model_id, min_chars=MIN_CHARS_TO_EMBED
         )
 
         if total_backlog == 0:
@@ -670,7 +673,7 @@ def _embed_backfill_handler(args: argparse.Namespace) -> int:
 
         print(
             f"embedding backfill for '{args.persona}': {total_backlog} row(s) to "
-            f"embed (model={provider.model_id()!r})"
+            f"embed (model={model_id!r})"
         )
 
         start = time.monotonic()

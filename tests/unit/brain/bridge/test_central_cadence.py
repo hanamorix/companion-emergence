@@ -1168,10 +1168,19 @@ def test_c39_emotion_backfill_has_work_probe(tmp_path):
         store.close()
 
 
-def test_c39_embedding_backfill_has_work_probe(tmp_path):
+def test_c39_embedding_backfill_has_work_probe(tmp_path, monkeypatch):
     from brain.memory import embedding_backfill as ebf
+    from brain.memory import embeddings as embeddings_mod
     from brain.memory.store import MemoryStore
 
+    # The probe reads the current model id with `resolve_embedding_model_id()`
+    # (it builds no provider); the rows below are embedded by the suite's fake
+    # provider under the fake's id, so the accessor is pointed at that id.
+    monkeypatch.setattr(
+        embeddings_mod,
+        "resolve_embedding_model_id",
+        lambda: embeddings_mod.FakeEmbeddingProvider(dim=256).model_id(),
+    )
     persona_dir = _persona(tmp_path)
     store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
     try:
@@ -1181,6 +1190,34 @@ def test_c39_embedding_backfill_has_work_probe(tmp_path):
         assert ebf.has_embedding_backfill_work(store) is True
         store.embed_row(m.id, m.content)
         assert ebf.has_embedding_backfill_work(store) is False
+    finally:
+        store.close()
+
+
+def test_c39_embedding_backfill_has_work_probe_builds_no_provider(tmp_path, monkeypatch):
+    """The probe runs on every idle pass: it must not construct a provider
+    (`FastEmbedProvider.__init__` downloads the model when it is uncached)."""
+    from brain.memory import embedding_backfill as ebf
+    from brain.memory import embeddings as embeddings_mod
+    from brain.memory.store import MemoryStore
+
+    fake_id = embeddings_mod.FakeEmbeddingProvider(dim=256).model_id()
+    monkeypatch.setattr(embeddings_mod, "resolve_embedding_model_id", lambda: fake_id)
+    persona_dir = _persona(tmp_path)
+    store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+    try:
+        m = _mem()
+        store.create(m)
+        built: list[str] = []
+
+        def _boom(*_a, **_k):
+            built.append("built")
+            raise AssertionError("an embedding provider was constructed to read the model id")
+
+        monkeypatch.setattr(embeddings_mod, "build_embedding_provider", _boom)
+        monkeypatch.setattr(embeddings_mod.FastEmbedProvider, "__init__", _boom)
+        assert ebf.has_embedding_backfill_work(store) is True
+        assert built == []
     finally:
         store.close()
 
