@@ -422,9 +422,10 @@ def build_reranker_provider(*, store: MemoryStore | None = None) -> RerankerProv
     constructed per resolved model_id now, never both. `store` is kept as a
     keyword-only parameter purely for call-site compatibility with every
     existing production caller (`semantic_recall.run_semantic_recall`,
-    `search_memories._semantic_top_k`, `supervisor._run_calibration_tick`/
-    `_run_deploy_recalibration_check`, `floor_calibration.py`) — it is no
-    longer read by this function at all.
+    `search_memories._semantic_top_k`) — it is no longer read by this
+    function at all. The supervisor's calibration tick and deploy
+    recalibration job do not build a provider: they read the id from
+    `resolve_reranker_model_id()`.
 
     PROCESS-WIDE CACHING, same rationale as `embeddings.build_embedding_
     provider`: constructing a CrossEncoderProvider builds a real ONNX
