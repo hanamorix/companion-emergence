@@ -28,11 +28,16 @@
  * lands when /state poll flips back to "live".
  *
  * `restart()` resolves true when the bridge is healthy again (graceful or
- * forced path); false when the flow ends in `failed` or a restart is
- * already in flight.
+ * forced path); false when the flow ends in `failed`.
+ *
+ * One restart app-wide (#310): App, RestartBridgeButton and useBrainUpdate each
+ * hold an instance, so the state and the in-flight run live at module scope. A
+ * caller that asks while a restart is running joins it and gets its result,
+ * and every instance renders the same state (the button stays disabled while
+ * a brain update's restart runs).
  */
 
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useSyncExternalStore } from "react";
 import type { PersonaState } from "../bridge";
 import {
   snapshotActiveSession,
@@ -102,26 +107,49 @@ async function pollHealth(persona: string, deadline: number): Promise<void> {
 const FAILED_USER_MESSAGE =
   "Restart failed. Try `nell service status` from terminal, or restart Companion Emergence.";
 
+// Module scope (#310), same pattern as useBrainUpdate: the bridge is app-wide,
+// so its restart is too. `inFlight` is the running restart, which later callers
+// join.
+// ponytail: one bridge per app, so one store; key by persona if that changes.
+let shared: { state: RestartState; errorDetail: string | null } = {
+  state: "idle",
+  errorDetail: null,
+};
+let inFlight: Promise<boolean> | null = null;
+const listeners = new Set<() => void>();
+
+function setShared(patch: Partial<typeof shared>): void {
+  shared = { ...shared, ...patch };
+  listeners.forEach((l) => l());
+}
+
+function subscribe(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
+
+function transition(next: RestartState): void {
+  setShared({ state: next });
+}
+
+function setErrorDetail(detail: string | null): void {
+  setShared({ errorDetail: detail });
+}
+
+/** Reset for test isolation — never call in production code. */
+export function _resetRestartBridgeForTests(): void {
+  shared = { state: "idle", errorDetail: null };
+  inFlight = null;
+}
+
 export function useRestartBridge(
   persona: string,
   currentMode: PersonaState["mode"],
 ): UseRestartBridge {
-  const [state, setState] = useState<RestartState>("idle");
-  const [errorDetail, setErrorDetail] = useState<string | null>(null);
-  // Tracks the latest reachable state without going through React's render
-  // queue — needed inside the async restart() body where stale closures
-  // would otherwise see "idle" forever.
-  const stateRef = useRef<RestartState>("idle");
-  const inFlightRef = useRef<boolean>(false);
-
-  const transition = useCallback((next: RestartState) => {
-    stateRef.current = next;
-    setState(next);
-  }, []);
+  const { state, errorDetail } = useSyncExternalStore(subscribe, () => shared);
 
   const restart = useCallback((): Promise<boolean> => {
-    if (inFlightRef.current) return Promise.resolve(false);
-    inFlightRef.current = true;
+    if (inFlight) return inFlight;
     setErrorDetail(null);
 
     const run = async (): Promise<boolean> => {
@@ -210,30 +238,32 @@ export function useRestartBridge(
         }
         return true;
       } finally {
-        inFlightRef.current = false;
+        inFlight = null;
       }
     };
 
-    return run();
-  }, [persona, transition]);
+    inFlight = run();
+    return inFlight;
+  }, [persona]);
 
-  const onModeChanged = useCallback(
-    (mode: PersonaState["mode"]) => {
-      if (stateRef.current === "reconnecting" && mode === "live") {
-        transition("success");
-      }
-    },
-    [transition],
-  );
+  const onModeChanged = useCallback((mode: PersonaState["mode"]) => {
+    if (shared.state === "reconnecting" && mode === "live") {
+      transition("success");
+    }
+  }, []);
 
   // Also catch the live-mode flip via the prop, so parents that only
   // re-render (without explicitly calling onModeChanged) still resolve
-  // the terminal state.
+  // the terminal state. And once the bridge drops again, "success" belongs
+  // to the last incident: back to idle so the banner's button is clickable
+  // (per-instance state used to get this from the banner remounting).
   useEffect(() => {
     if (state === "reconnecting" && currentMode === "live") {
       transition("success");
+    } else if (state === "success" && currentMode !== "live") {
+      transition("idle");
     }
-  }, [currentMode, state, transition]);
+  }, [currentMode, state]);
 
   return { state, errorDetail, restart, onModeChanged };
 }
