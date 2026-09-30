@@ -42,8 +42,10 @@ from brain.memory.store import MemoryStore, split_by_raw_query_floor
 log = logging.getLogger(__name__)
 
 # Clock seam for the per-message budget and the cost samples. Production:
-# `time.monotonic`. Tests script it.
-_clock: Callable[[], float] = time.monotonic
+# `time.perf_counter` (monotonic, and fine-grained on every platform: a coarse
+# clock would read a short search as 0.0 s and turn the estimate into "every word
+# fits"). Tests script it.
+_clock: Callable[[], float] = time.perf_counter
 
 # The per-word keyword cost (S103, S131): per store database path, one sample
 # per tier-2 search, x = words sent to the store, y = that call's seconds.
@@ -116,8 +118,8 @@ def timed_tier1[T](
     (its 3-character floor applied), `seconds` = the whole call (S131: this
     message's own tier-1 search). `None` when tier 1 searched no word. An
     exception from `call` propagates; nothing is recorded, tier 1 is unchanged."""
-    result, seconds = timed(call)
     x1 = len(split_by_raw_query_floor(list(legacy_tokens))[0])
+    result, seconds = timed(call)
     return result, ((x1, seconds) if x1 > 0 else None)
 
 

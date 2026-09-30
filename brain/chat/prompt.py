@@ -1189,6 +1189,7 @@ def _build_recall_block(
                 seed,
             )
         except Exception:  # noqa: BLE001
+            log.debug("_build_recall_block: tier-2 keyword step failed", exc_info=True)
             ranked2 = []
         candidates = _order_keyword_tiers([], _sort_keyword_tier(ranked), _sort_keyword_tier(ranked2))
 
@@ -1377,6 +1378,7 @@ def _build_recall_block(
                     seed,
                 )
             except Exception:  # noqa: BLE001
+                log.debug("_build_recall_block: tier-2 keyword step failed", exc_info=True)
                 ranked2 = []
             tier2_active = _sort_keyword_tier([p for p in ranked2 if p[0].state == "active"])
             tier2_fading = _sort_keyword_tier([p for p in ranked2 if p[0].state == "fading"])
