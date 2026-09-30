@@ -589,15 +589,30 @@ export async function fetchChatHistory(
   return (await r.json()) as ChatHistoryResponse;
 }
 
+/** /health.overlay (#286): the brain-main overlay the bridge runs; null = the release brain. */
+export interface BridgeOverlay {
+  commit: string | null;
+  brain_version: string | null;
+  /** false: the overlay was built for another bundle (the app was reinstalled
+   *  under a running bridge) — treat the bridge as stale. */
+  bundle_match?: boolean;
+}
+
+export interface BridgeHealth {
+  liveness: string;
+  version?: string;
+  overlay?: BridgeOverlay | null;
+}
+
 /** Lightweight /health probe used by the restart hook's poll loop and the
  *  boot-time version handshake.  The `version` field is present from v0.0.33+
  *  (bridge V2 handshake); older bridges omit it. */
-export async function fetchHealth(persona: string): Promise<{ liveness: string; version?: string }> {
+export async function fetchHealth(persona: string): Promise<BridgeHealth> {
   const r = await bridgeFetch(persona, (creds) =>
     fetch(`${creds.url}/health`, { headers: authOnlyHeaders(creds) }),
   );
   if (!r.ok) throw new Error(`/health ${r.status}`);
-  return (await r.json()) as { liveness: string; version?: string };
+  return (await r.json()) as BridgeHealth;
 }
 
 /** The three model tiers the bridge supports. */

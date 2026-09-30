@@ -2159,12 +2159,15 @@ dependencies = [
 name = "nellface"
 version = "0.0.42"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "dirs 5.0.1",
  "libc",
+ "minisign-verify",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-notification",

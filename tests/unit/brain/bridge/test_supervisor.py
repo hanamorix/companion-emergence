@@ -3,6 +3,7 @@ thread that runs session-cleanup AND autonomous heartbeat cadences."""
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -70,6 +71,35 @@ def _wait_until(pred, *, timeout: float = 30.0, interval: float = 0.02) -> bool:
             return True
         time.sleep(interval)
     return bool(pred())
+
+
+# run_folded's pre-loop startup (vocab repair, soul-candidate repair, store opens) can
+# pass 5 s on a slow CI runner (#272). A generous budget costs nothing on a fast one:
+# every wait below returns as soon as its condition holds.
+_STARTUP_BUDGET_S = 30.0
+
+
+@contextlib.contextmanager
+def _running_supervisor(stop: threading.Event, runner):
+    """Run `runner` (a closure calling run_folded(stop, ...)) in a daemon thread and
+    ALWAYS stop + join it on the way out, so an assertion that fails inside the block
+    can't leak a live supervisor into later tests (#110, #272). Yields the thread."""
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    try:
+        yield t
+    finally:
+        stop.set()
+        t.join(timeout=_STARTUP_BUDGET_S)
+
+
+def _ran_a_few_passes(bus: _CapturingBus) -> bool:
+    """The loop really ran (each pass publishes supervisor_tick) — so a "never fires
+    when disabled" check isn't vacuous on a slow runner whose startup outlasts a sleep."""
+    return _wait_until(
+        lambda: sum(e.get("type") == "supervisor_tick" for e in bus.events) >= 3,
+        timeout=_STARTUP_BUDGET_S,
+    )
 
 
 def test_audit_logs_registered_for_rotation() -> None:
@@ -147,7 +177,7 @@ def test_run_folded_exits_when_stop_event_is_set(tmp_path: Path) -> None:
 def test_run_folded_skips_heartbeat_when_disabled(tmp_path: Path) -> None:
     """heartbeat_interval_s=None disables the autonomous cadence."""
     persona_dir = _persona_dir(tmp_path)
-    bus = EventBus()
+    bus = _CapturingBus()
     stop = threading.Event()
     fired: list[int] = []
 
@@ -165,14 +195,8 @@ def test_run_folded_skips_heartbeat_when_disabled(tmp_path: Path) -> None:
                 heartbeat_interval_s=None,
             )
 
-    t = threading.Thread(target=runner, daemon=True)
-    t.start()
-    # Let it run a few cycles then stop
-    import time as _t
-
-    _t.sleep(0.3)
-    stop.set()
-    t.join(timeout=5.0)
+    with _running_supervisor(stop, runner) as t:
+        assert _ran_a_few_passes(bus), "supervisor loop never ran"
     assert not t.is_alive()
     assert len(fired) == 0, "heartbeat fired even though disabled"
 
@@ -203,11 +227,8 @@ def test_run_folded_fires_heartbeat_after_interval(tmp_path: Path) -> None:
                 heartbeat_interval_s=0.0,  # fire on first iteration
             )
 
-    t = threading.Thread(target=runner, daemon=True)
-    t.start()
-    assert fired.wait(timeout=5.0), "heartbeat never fired despite zero interval"
-    stop.set()
-    t.join(timeout=5.0)
+    with _running_supervisor(stop, runner) as t:
+        assert fired.wait(timeout=_STARTUP_BUDGET_S), "heartbeat never fired despite zero interval"
     assert not t.is_alive(), "supervisor loop did not exit after stop_event"
 
 
@@ -266,13 +287,13 @@ def test_run_folded_retries_heartbeat_soon_after_a_skip_not_a_full_interval(
     t = threading.Thread(target=runner, daemon=True)
     t.start()
     try:
-        deadline = time.monotonic() + 10.0
+        deadline = time.monotonic() + _STARTUP_BUDGET_S
         while time.monotonic() < deadline and len(seen_last_heartbeat_at) < 4:
             time.sleep(0.02)
         assert len(seen_last_heartbeat_at) >= 4, "did not observe enough heartbeat attempts"
     finally:
         stop.set()
-        t.join(timeout=5.0)
+        t.join(timeout=_STARTUP_BUDGET_S)
     assert not t.is_alive()
 
     # The two SKIPPED calls (both None) must have been handed the exact
@@ -953,11 +974,8 @@ def test_run_folded_fires_log_rotation_after_interval(tmp_path: Path) -> None:
                 log_rotation_interval_s=0.0,  # fire on first iteration
             )
 
-    t = threading.Thread(target=runner, daemon=True)
-    t.start()
-    assert fired.wait(timeout=5.0), "log rotation never fired despite zero interval"
-    stop.set()
-    t.join(timeout=5.0)
+    with _running_supervisor(stop, runner) as t:
+        assert fired.wait(timeout=_STARTUP_BUDGET_S), "log rotation never fired despite zero interval"
     assert not t.is_alive()
 
 
@@ -995,18 +1013,15 @@ def test_run_folded_fires_self_model_tick_when_due(tmp_path: Path) -> None:
                 self_model_interval_s=0.0,  # enabled
             )
 
-    t = threading.Thread(target=runner, daemon=True)
-    t.start()
-    assert fired.wait(timeout=5.0), "self-model tick never fired despite enabled cadence"
-    stop.set()
-    t.join(timeout=5.0)
+    with _running_supervisor(stop, runner) as t:
+        assert fired.wait(timeout=_STARTUP_BUDGET_S), "self-model tick never fired despite enabled cadence"
     assert not t.is_alive()
 
 
 def test_run_folded_skips_self_model_when_disabled(tmp_path: Path) -> None:
     """self_model_interval_s=None disables the self-model cadence block."""
     persona_dir = _persona_dir(tmp_path)
-    bus = EventBus()
+    bus = _CapturingBus()
     stop = threading.Event()
     fired: list[int] = []
 
@@ -1033,11 +1048,8 @@ def test_run_folded_skips_self_model_when_disabled(tmp_path: Path) -> None:
                 self_model_interval_s=None,
             )
 
-    t = threading.Thread(target=runner, daemon=True)
-    t.start()
-    time.sleep(0.3)  # a window in which it COULD misbehave — not pollable
-    stop.set()
-    t.join(timeout=30.0)
+    with _running_supervisor(stop, runner) as t:
+        assert _ran_a_few_passes(bus), "supervisor loop never ran"
     assert not t.is_alive()
     assert fired == [], "self-model tick fired even though disabled"
 
@@ -1071,20 +1083,17 @@ def test_run_folded_self_model_fault_isolated(tmp_path: Path) -> None:
                 self_model_interval_s=0.0,
             )
 
-    t = threading.Thread(target=runner, daemon=True)
-    t.start()
-    assert fired.wait(timeout=5.0), "self-model tick never fired"
-    # Loop survives the crash — give it time to keep ticking, then stop.
-    time.sleep(0.2)
-    stop.set()
-    t.join(timeout=5.0)
+    with _running_supervisor(stop, runner) as t:
+        assert fired.wait(timeout=_STARTUP_BUDGET_S), "self-model tick never fired"
+        # Loop survives the crash — give it time to keep ticking, then stop.
+        time.sleep(0.2)
     assert not t.is_alive(), "supervisor loop died on a self-model crash (not fault-isolated)"
 
 
 def test_run_folded_skips_log_rotation_when_disabled(tmp_path: Path) -> None:
     """log_rotation_interval_s=None disables the cadence."""
     persona_dir = _persona_dir(tmp_path)
-    bus = EventBus()
+    bus = _CapturingBus()
     stop = threading.Event()
     fired: list[int] = []
 
@@ -1108,11 +1117,8 @@ def test_run_folded_skips_log_rotation_when_disabled(tmp_path: Path) -> None:
                 log_rotation_interval_s=None,
             )
 
-    t = threading.Thread(target=runner, daemon=True)
-    t.start()
-    time.sleep(0.3)
-    stop.set()
-    t.join(timeout=5.0)
+    with _running_supervisor(stop, runner) as t:
+        assert _ran_a_few_passes(bus), "supervisor loop never ran"
     assert not t.is_alive()
     assert fired == [], "log rotation fired even though disabled"
 
@@ -1145,17 +1151,14 @@ def test_run_folded_fires_initiate_review_after_interval(tmp_path: Path) -> None
                 initiate_review_interval_s=0.0,
             )
 
-    t = threading.Thread(target=runner, daemon=True)
-    t.start()
-    assert fired.wait(timeout=5.0), "initiate review never fired"
-    stop.set()
-    t.join(timeout=5.0)
+    with _running_supervisor(stop, runner) as t:
+        assert fired.wait(timeout=_STARTUP_BUDGET_S), "initiate review never fired"
     assert not t.is_alive()
 
 
 def test_run_folded_skips_initiate_review_when_disabled(tmp_path: Path) -> None:
     persona_dir = _persona_dir(tmp_path)
-    bus = EventBus()
+    bus = _CapturingBus()
     stop = threading.Event()
     fired: list[int] = []
 
@@ -1180,11 +1183,8 @@ def test_run_folded_skips_initiate_review_when_disabled(tmp_path: Path) -> None:
                 initiate_review_interval_s=None,
             )
 
-    t = threading.Thread(target=runner, daemon=True)
-    t.start()
-    time.sleep(0.3)
-    stop.set()
-    t.join(timeout=5.0)
+    with _running_supervisor(stop, runner) as t:
+        assert _ran_a_few_passes(bus), "supervisor loop never ran"
     assert not t.is_alive()
     assert fired == []
 
@@ -1218,17 +1218,14 @@ def test_run_folded_fires_voice_reflection_after_interval(tmp_path: Path) -> Non
                 voice_reflection_interval_s=0.0,
             )
 
-    t = threading.Thread(target=runner, daemon=True)
-    t.start()
-    assert fired.wait(timeout=5.0), "voice reflection never fired"
-    stop.set()
-    t.join(timeout=5.0)
+    with _running_supervisor(stop, runner) as t:
+        assert fired.wait(timeout=_STARTUP_BUDGET_S), "voice reflection never fired"
     assert not t.is_alive()
 
 
 def test_run_folded_skips_voice_reflection_when_disabled(tmp_path: Path) -> None:
     persona_dir = _persona_dir(tmp_path)
-    bus = EventBus()
+    bus = _CapturingBus()
     stop = threading.Event()
     fired: list[int] = []
 
@@ -1254,11 +1251,8 @@ def test_run_folded_skips_voice_reflection_when_disabled(tmp_path: Path) -> None
                 voice_reflection_interval_s=None,
             )
 
-    t = threading.Thread(target=runner, daemon=True)
-    t.start()
-    time.sleep(0.3)
-    stop.set()
-    t.join(timeout=5.0)
+    with _running_supervisor(stop, runner) as t:
+        assert _ran_a_few_passes(bus), "supervisor loop never ran"
     assert not t.is_alive()
     assert fired == []
 
@@ -1408,11 +1402,8 @@ def test_run_folded_fires_interest_sweep_when_due(tmp_path: Path) -> None:
                 voice_reflection_interval_s=None,
             )
 
-    t = threading.Thread(target=runner, daemon=True)
-    t.start()
-    assert fired.wait(timeout=5.0), "interest sweep never fired"
-    stop.set()
-    t.join(timeout=5.0)
+    with _running_supervisor(stop, runner) as t:
+        assert fired.wait(timeout=_STARTUP_BUDGET_S), "interest sweep never fired"
     assert not t.is_alive()
     assert len(calls) == 1
 
@@ -1451,12 +1442,9 @@ def test_run_folded_interest_sweep_advances_cadence_even_when_tick_raises(tmp_pa
                 voice_reflection_interval_s=None,
             )
 
-    t = threading.Thread(target=runner, daemon=True)
-    t.start()
-    # #210: wait for the tick itself rather than a fixed 0.3 s window (flaked on windows-latest).
-    assert fired.wait(timeout=5.0), "interest sweep tick never ran"
-    stop.set()
-    t.join(timeout=5.0)
+    with _running_supervisor(stop, runner) as t:
+        # #210: wait for the tick itself rather than a fixed 0.3 s window (flaked on windows-latest).
+        assert fired.wait(timeout=_STARTUP_BUDGET_S), "interest sweep tick never ran"
     assert not t.is_alive(), "supervisor loop must not die from a tick exception"
 
     state = persisted_cadence.load_cadence(persona_dir, interest_sweep.SWEEP_CADENCE_FILE)
@@ -1473,7 +1461,7 @@ def test_run_folded_interest_sweep_interval_none_disables_it(tmp_path: Path) -> 
     interests.json, so a run that hasn't opted in must be able to switch it off.
     """
     persona_dir = _persona_dir(tmp_path)
-    bus = EventBus()
+    bus = _CapturingBus()
     stop = threading.Event()
     calls: list[dict] = []
     errors: list[BaseException] = []
@@ -1501,11 +1489,8 @@ def test_run_folded_interest_sweep_interval_none_disables_it(tmp_path: Path) -> 
         except BaseException as exc:  # noqa: BLE001 - surfaced via `errors` below
             errors.append(exc)
 
-    t = threading.Thread(target=runner, daemon=True)
-    t.start()
-    time.sleep(0.3)
-    stop.set()
-    t.join(timeout=5.0)
+    with _running_supervisor(stop, runner) as t:
+        assert _ran_a_few_passes(bus), "supervisor loop never ran"
     assert not t.is_alive()
     # Guard against a vacuous pass: if run_folded rejected the kwarg the thread
     # would die and the assertions below would hold for the wrong reason.

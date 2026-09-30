@@ -308,21 +308,24 @@ _STREAM_EOF = object()
 # Lean CLI invocation — strip built-in tool definitions (~14K tok/call saved)
 # ---------------------------------------------------------------------------
 
-# Claude Code's built-in tools are loaded into every -p invocation. Disallowing
-# the ones she has no business calling removes their definition tokens from
-# cache-creation cost AND keeps them out of her hands.
+# Claude Code loads its built-in tools into every -p invocation, and
+# --dangerously-skip-permissions rides every call, so whatever is loaded is
+# callable. --allowedTools is a permission list, not an exclusive one.
 #
-# This list is POLICY, not dead weight. --allowedTools is a permission list, not
-# an exclusive one (the CLI's exclusive flag, --tools, is unused here), and
-# --dangerously-skip-permissions rides every call — so anything left off this
-# list is genuinely callable. 87bfc692's original comment claimed the opposite
-# ("she can't call them anyway"); it was wrong, and WebFetch/WebSearch were
-# swept out on that false premise, silently removing chat-time web access (#71).
+# Two layers (#329):
+#   1. --tools=<list> — the CLI's EXCLUSIVE built-in allowlist. Chat gets
+#      WebSearch,WebFetch (#71: web access is a real capability); background
+#      generate() gets none. Only applied when the CLI supports it
+#      (_cli_supports_tools_flag).
+#   2. --disallowedTools (this list) — a second layer, and the whole posture on
+#      a CLI without --tools. POLICY, not dead weight: 87bfc692 once claimed "she
+#      can't call them anyway", which was wrong, and swept WebFetch/WebSearch out
+#      on that premise (#71).
+# --strict-mcp-config then limits MCP servers to our own --mcp-config (none for
+# background calls), which also keeps the account's claude.ai connectors out.
 #
 # Spiked, not remembered: docs/cli-provider-capabilities.md carries the dated
-# row (2026-07-14) — with --allowedTools "Read", a Bash call still ran. An
-# unspiked comment is what caused #71 in the first place; don't trust this one
-# either if the CLI has moved. Re-spike and date a new row.
+# rows (2026-07-14 --allowedTools; 2026-09-30 --tools). Re-spike on a CLI bump.
 #
 # Keep Bash/Edit/Write/Task blocked — a companion has no business with a shell.
 # Do NOT re-add WebFetch/WebSearch; test_web_tools_stay_callable_at_chat_time
@@ -342,10 +345,155 @@ _BUILTIN_TOOLS_DISALLOWED: tuple[str, ...] = (
 )
 
 
-def _apply_lean_flags(cmd: list[str]) -> None:
-    """Disallow the built-in tools she has no business calling and pin to the
-    configured MCP server. Trims their definition tokens from cache-creation
-    cost; see _BUILTIN_TOOLS_DISALLOWED for why this is policy, not dead weight."""
+# Built-ins a chat turn may use (#71); background calls get none.
+_CHAT_BUILTIN_TOOLS: tuple[str, ...] = ("WebSearch", "WebFetch")
+_NO_BUILTIN_TOOLS: tuple[str, ...] = ()
+
+# Whether this machine's claude CLI has --tools. None = not yet known.
+_TOOLS_FLAG_SUPPORTED: bool | None = None
+_tools_probe_retry_at: float = 0.0
+_tools_warned: bool = False
+_tools_window_warned_at: float | None = None
+_tools_flag_lock = threading.Lock()
+_monotonic = time.monotonic  # module alias so tests can stub the clock without patching `time`
+
+_TOOLS_PROBE_ARGV: tuple[str, ...] = ("claude", "--help")
+# Parse-only: an empty stdin makes the CLI stop before any model call (rc 1 either way).
+# The print flag deliberately doesn't follow the program name directly, so the tests'
+# spawn-site scan (program name then print flag) doesn't count a probe as a model call.
+_TOOLS_CONFIRM_ARGV: tuple[str, ...] = ("claude", "--tools=", "-p")
+_TOOLS_PROBE_TIMEOUT_S = 10
+_TOOLS_PROBE_RETRY_S = 60.0
+# The option line in the help's own shapes: `  --tools <`, `  -t, --tools <`,
+# `  --x, --tools <`, `  --tools [..]` — never a description that merely mentions it
+# (2.1.284's --restricted text wraps onto a line starting "--tools names them").
+_TOOLS_OPTION_RE = re.compile(
+    r"^ {2}(?:-\w, )?(?:--[\w-]+, )*--tools\b(?:, --[\w-]+)*[ =<\[]", re.M
+)
+# Proof the output really is the help text in the format we parse.
+_HELP_SENTINEL_RE = re.compile(r"^ {2}--output-format <", re.M)
+# The option itself, never --allowedTools / --disallowedTools / --tools-foo.
+_TOOLS_REJECTED_RE = re.compile(r"(?<![\w-])--tools\b(?!-)")
+
+
+def _run_tools_probe(argv: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        list(argv),
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=_subprocess_env(),
+        cwd=_claude_work_dir(),
+        timeout=_TOOLS_PROBE_TIMEOUT_S,
+        check=False,
+        creationflags=_NO_WINDOW,
+    )
+
+
+def _probe_tools_flag() -> bool | None:
+    """Ask the CLI whether it has --tools. None = couldn't tell (don't cache).
+
+    `--help` is fast, but the CLI hides options it accepts (--system-prompt-file
+    isn't listed), so "absent" is confirmed by a parse-only `--tools=` run:
+    "Input must be provided" means the option parsed; "unknown option" means it
+    didn't. Anything unexpected is indeterminate, never "unsupported".
+    """
+    try:
+        help_run = _run_tools_probe(_TOOLS_PROBE_ARGV)
+        if help_run.returncode != 0 or not _HELP_SENTINEL_RE.search(help_run.stdout or ""):
+            return None
+        if _TOOLS_OPTION_RE.search(help_run.stdout):
+            return True
+        confirm = _run_tools_probe(_TOOLS_CONFIRM_ARGV)
+    except Exception:  # noqa: BLE001 — a probe must never break a call
+        return None
+    err = confirm.stderr or ""
+    if "input must be provided" in err.lower():
+        return True
+    if "unknown option" in err.lower() and _TOOLS_REJECTED_RE.search(err):
+        return False
+    return None
+
+
+def _cli_supports_tools_flag() -> bool:
+    """True when the claude CLI accepts --tools (see _BUILTIN_TOOLS_DISALLOWED).
+
+    Probed once per process and cached once the answer is definitive. A probe
+    that couldn't tell is not cached: calls fall back until a retry 60 s later.
+    """
+    global _TOOLS_FLAG_SUPPORTED, _tools_probe_retry_at, _tools_warned, _tools_window_warned_at
+    supported = _TOOLS_FLAG_SUPPORTED
+    if supported is not None:
+        return supported
+    with _tools_flag_lock:
+        if _TOOLS_FLAG_SUPPORTED is not None:
+            return _TOOLS_FLAG_SUPPORTED
+        now = _monotonic()
+        if now < _tools_probe_retry_at:
+            return False
+        result = _probe_tools_flag()
+        if result is None:
+            _tools_probe_retry_at = now + _TOOLS_PROBE_RETRY_S
+            if (
+                _tools_window_warned_at is None
+                or now - _tools_window_warned_at >= _TOOLS_PROBE_RETRY_S
+            ):
+                _tools_window_warned_at = now
+                logger.warning(
+                    "could not tell whether this claude CLI supports --tools; built-in tools "
+                    "are only partly restricted until a retry in %.0fs",
+                    _TOOLS_PROBE_RETRY_S,
+                )
+            return False
+        _TOOLS_FLAG_SUPPORTED = result
+        if not result and not _tools_warned:
+            _tools_warned = True
+            logger.warning(
+                "this claude CLI has no --tools option; built-in tools are only partly "
+                "restricted (disallow list only) — update Claude Code"
+            )
+        return result
+
+
+def _reset_tools_flag_cache() -> None:
+    """Test hook: forget the probe result."""
+    global _TOOLS_FLAG_SUPPORTED, _tools_probe_retry_at, _tools_warned, _tools_window_warned_at
+    with _tools_flag_lock:
+        _TOOLS_FLAG_SUPPORTED = None
+        _tools_probe_retry_at = 0.0
+        _tools_warned = False
+        _tools_window_warned_at = None
+
+
+def _note_tools_flag_rejected(stderr: str) -> None:
+    """Fall back for this process if the CLI rejected --tools (#329, owner ruling).
+
+    Callers pass stderr only from a failure that happened before the CLI ran
+    anything (empty stdout / no frame): that's where a parse rejection lands,
+    and nothing a model, tool or web page wrote can be in it. Never raises.
+    """
+    global _TOOLS_FLAG_SUPPORTED
+    if _TOOLS_FLAG_SUPPORTED is not True or not _TOOLS_REJECTED_RE.search(stderr or ""):
+        return
+    with _tools_flag_lock:
+        if _TOOLS_FLAG_SUPPORTED is not True:
+            return
+        _TOOLS_FLAG_SUPPORTED = False
+    logger.warning("claude rejected --tools; falling back for this process (disallow list only)")
+
+
+def _apply_lean_flags(cmd: list[str], *, builtins: tuple[str, ...] = _NO_BUILTIN_TOOLS) -> None:
+    """Apply the tool posture (#329): the exclusive --tools=<builtins> allowlist
+    (when the CLI supports it), the disallow list, and --strict-mcp-config.
+
+    Defaults to NO built-ins, so a new call site fails closed; chat sites pass
+    _CHAT_BUILTIN_TOOLS. The equals form keeps an empty list as one non-empty
+    argv element ("--tools="), never a bare "" that Windows quoting could drop.
+    """
+    if _cli_supports_tools_flag():
+        cmd.append(f"--tools={','.join(builtins)}")
     cmd.extend(["--disallowedTools", *_BUILTIN_TOOLS_DISALLOWED])
     cmd.append("--strict-mcp-config")
 
@@ -606,6 +754,8 @@ def _claude_failure_detail(result: subprocess.CompletedProcess[str]) -> str:
     """
     detail = _claude_failure_detail_text(result)
     provider_auth.note_cli_failure(detail)  # #246: every exit!=0 text passes through here
+    if not (result.stdout or "").strip():  # #329: a pre-execution failure, e.g. a rejected --tools
+        _note_tools_flag_rejected(result.stderr or "")
     return detail
 
 
@@ -703,6 +853,7 @@ class ClaudeCliProvider(LLMProvider):
             "--model",
             self._model,
         ]
+        _apply_lean_flags(cmd)  # #329: background calls get no tools at all
         with _system_prompt_tempfile(system) as sp_path:
             if sp_path is not None:
                 cmd.extend(["--system-prompt-file", sp_path])
@@ -838,6 +989,7 @@ class ClaudeCliProvider(LLMProvider):
             self._model,
         ]
         cmd.extend(["--max-budget-usd", str(_MAX_TURN_BUDGET_USD(self._model))])
+        _apply_lean_flags(cmd, builtins=_CHAT_BUILTIN_TOOLS)
         with _system_prompt_tempfile(system_prompt) as sp_path:
             if sp_path is not None:
                 cmd.extend(["--system-prompt-file", sp_path])
@@ -1014,7 +1166,8 @@ class ClaudeCliProvider(LLMProvider):
                 return
             cmd.extend(["--mcp-config", tmp_mcp_path])
             cmd.extend(["--allowedTools", *allowed_mcp])
-            _apply_lean_flags(cmd)
+        # Always, not only with tools: a tools-less turn must not get every built-in (#329).
+        _apply_lean_flags(cmd, builtins=_CHAT_BUILTIN_TOOLS)
 
         try:
             yield from self._run_chat_stream(
@@ -1231,6 +1384,8 @@ class ClaudeCliProvider(LLMProvider):
                         stderr_text = proc.stderr.read() if proc.stderr else ""
                         # #246: the one exit!=0 site that bypasses _claude_failure_detail.
                         provider_auth.note_cli_failure(stderr_text)
+                        if frames_seen == 0:  # #329: failed before any frame, e.g. rejected --tools
+                            _note_tools_flag_rejected(stderr_text)
                         yield StreamError(
                             stage="claude_cli_exit",
                             detail=f"exit {rc}: {stderr_text[:200]}",
@@ -1344,7 +1499,7 @@ class ClaudeCliProvider(LLMProvider):
             ]
             cmd.extend(["--mcp-config", tmp_path])
             cmd.extend(["--allowedTools", *allowed_mcp])
-            _apply_lean_flags(cmd)
+            _apply_lean_flags(cmd, builtins=_CHAT_BUILTIN_TOOLS)
             cmd.extend(["--max-budget-usd", str(_MAX_TURN_BUDGET_USD(self._model))])
 
             with _system_prompt_tempfile(system_prompt) as sp_path:

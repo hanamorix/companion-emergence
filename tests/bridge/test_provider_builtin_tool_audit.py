@@ -420,7 +420,8 @@ def test_mcp_row_then_builtin_flush_both_survive(tmp_path):
 # C9 — argv and stdin are untouched (cost/cache can't move)
 # ---------------------------------------------------------------------------
 
-# Captured from origin/main (6f70d7b6) with the same inputs; tempfile paths normalised.
+# Captured from main with the same inputs (re-captured after #332 added --tools=);
+# tempfile paths normalised.
 _EXPECTED_ARGV = [
     "claude",
     "-p",
@@ -436,6 +437,7 @@ _EXPECTED_ARGV = [
     "<TMP>",
     "--allowedTools",
     "<ALLOWED>",
+    "--tools=WebSearch,WebFetch",  # #332: the exclusive built-in allowlist
     "--disallowedTools",
     "Bash",
     "Read",
@@ -485,7 +487,8 @@ def _capture_argv_and_stdin(tmp_path, monkeypatch) -> tuple[list[str], str]:
     assert argv[budget] == str(_MAX_TURN_BUDGET_USD("haiku"))
     argv[budget] = "<BUDGET>"
     allowed = argv.index("--allowedTools")
-    end = argv.index("--disallowedTools")
+    # The variadic list runs to the next flag, whatever that flag is.
+    end = next(i for i in range(allowed + 1, len(argv)) if argv[i].startswith("--"))
     assert argv[allowed + 1 : end] == [f"mcp__brain-tools__{n}" for n in NELL_TOOL_NAMES]
     argv[allowed + 1 : end] = ["<ALLOWED>"]
     stdin = "".join(c.args[0] for c in proc.stdin.write.call_args_list)

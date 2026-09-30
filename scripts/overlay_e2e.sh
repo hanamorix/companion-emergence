@@ -21,6 +21,7 @@ case "$(uname -s)" in
     export KINDLED_HOME="$WORK/home"
     nell() { "$RT/bin/nell" "$@"; };;
 esac
+COMMIT=e2e0000000000000000000000000000000000000
 where_brain() { "$1" -P -c "import brain, sys; sys.stdout.write(brain.__file__)"; }
 
 cd "$REPO"
@@ -32,8 +33,9 @@ if [ "${PY%.exe}" != "$PY" ]; then WHL="$(cygpath -w "$WHL")"; REQ="$(cygpath -w
 cd /
 nell update --status | tee "$WORK/status.json"
 grep -q '"supported": true' "$WORK/status.json" || { echo "e2e: runtime has no overlay hook" >&2; exit 1; }
-nell update --wheel "$WHL" --requirements "$REQ" --commit e2e0000000000000000000000000000000000000  # = $A below
+nell update --wheel "$WHL" --requirements "$REQ" --commit "$COMMIT"  # = $A below
 case "$(where_brain "$PY")" in *brain-overlay*) echo "e2e: python sees the overlay brain";; *) echo "e2e: FAIL overlay not active" >&2; exit 1;; esac
+"$PY" -P -c "from brain.update.overlay import loaded_overlay as l; o=l(); assert o and o['commit']=='$COMMIT' and o['bundle_match'], o; print('e2e: loaded_overlay OK')"
 nell --version
 if [ -n "$PYW" ]; then
   "$PYW" -P -c "import brain, pathlib; pathlib.Path(r'$(cygpath -w "$WORK")/pyw.txt').write_text(brain.__file__)"
