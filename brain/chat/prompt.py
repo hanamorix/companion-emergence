@@ -1155,7 +1155,7 @@ def _build_recall_block(
     if not tokens and not names:
         return ""
     # The old top-`_RECALL_TOKEN_LIMIT` selection (P-31): still what the
-    # graveyard search and the "not recognised" list are fed (S71, Q16 interim).
+    # graveyard search and the "not recognised" list are fed (S71; the graveyard also gets the listed names, S102).
     legacy_tokens = _legacy_capped_tokens(tokens)
 
     if persona_dir is None:

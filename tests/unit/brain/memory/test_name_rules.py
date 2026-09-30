@@ -68,6 +68,9 @@ def test_is_stopword_name():
         ("Bob: Will you", 5, False),  # S104-literal: a speaker label is not a sentence end
         ('"Will you?"', 1, False),
         ("so... Will you", 6, True),  # the ellipsis IS a period run
+        ("so\u2026 Will you", 4, False),  # S104-literal: only . ! ? (a one-character ellipsis is not)
+        ("a; Will you", 3, False),
+        ("(Will you", 1, False),
     ],
 )
 def test_is_sentence_start(text, pos, expected):

@@ -231,6 +231,8 @@ def test_a_multi_word_name_ignores_the_nt_skip(tmp_path):
 def test_an_entry_with_no_substring_hit_is_never_split(tmp_path, monkeypatch):
     _write(tmp_path, [("a", "nothing relevant at all", "chat"), ("b", "the harbour at dusk", "chat")])
     calls: list[str] = []
+    findalls: list[str] = []
+    finditers: list[str] = []
 
     class Counting:
         def __init__(self, real):
@@ -238,10 +240,12 @@ def test_an_entry_with_no_substring_hit_is_never_split(tmp_path, monkeypatch):
 
         def findall(self, text):
             calls.append(text)
+            findalls.append(text)
             return self._real.findall(text)
 
         def finditer(self, text):
             calls.append(text)
+            finditers.append(text)
             return self._real.finditer(text)
 
     monkeypatch.setattr(graveyard, "_WORD_RE", Counting(graveyard._WORD_RE))
@@ -249,6 +253,8 @@ def test_an_entry_with_no_substring_hit_is_never_split(tmp_path, monkeypatch):
     assert _ids(search(tmp_path, "harbour")) == ["b"]
     assert "the harbour at dusk" in calls
     assert "nothing relevant at all" not in calls
+    # T7: a plain word hit is found with one findall and is never split into spans
+    assert findalls.count("the harbour at dusk") == 1 and finditers == []
 
 
 # G30 shared definition
@@ -341,3 +347,19 @@ def test_a_failing_graveyard_search_is_logged(tmp_path, monkeypatch, caplog):
     with caplog.at_level("ERROR"):
         assert search_with_loss(tmp_path, store, "harbour").lost == []
     assert "graveyard search failed" in caplog.text
+
+
+def test_more_than_one_listed_name_is_searched(tmp_path):
+    _write(tmp_path, [("a", "Al waved", "chat"), ("b", "Pretzel slept", "chat"), ("c", "nothing", "chat")])
+    assert set(_ids(search(tmp_path, "", names=["al", "pretzel"]))) == {"a", "b"}
+
+
+def test_only_real_name_hits_rank_first(tmp_path):
+    # T5b: an entry holding the name only as a substring ("alone"), or a stopword-name
+    # the rule rejects ("Will you"), matches by a word but is NOT a name hit.
+    _write(
+        tmp_path,
+        [("old-al", "Al waved at the harbour", "chat"), ("sub", "alone at the harbour", "chat"),
+         ("modal", "Will you come about the harbour", "chat")],
+    )
+    assert _ids(search(tmp_path, "harbour", names=["al", "will"])) == ["old-al", "modal", "sub"]

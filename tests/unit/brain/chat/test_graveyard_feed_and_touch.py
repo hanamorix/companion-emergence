@@ -149,6 +149,17 @@ def test_a_name_only_message_searches_the_graveyard_once_with_the_name(tmp_path,
     assert touch.call_args.kwargs["touched_ids"] == ["m1"]
 
 
+def test_two_listed_names_both_reach_the_graveyard(tmp_path, monkeypatch):
+    kn.admit_names(tmp_path, ["Al", "Pretzel"], "tool")
+    entries = [_entry("m1", "Al waved", 1), _entry("m2", "Pretzel slept", 2), _entry("m3", "Bo waved", 3)]
+    store = _world(tmp_path, entries)
+    calls = _spy_search(monkeypatch)
+    block, touch = _render(store, tmp_path, "did Al and Pretzel come by the harbour today")
+    assert calls[0][1] == ["al", "pretzel"]
+    assert len(_lost_lines(block)) == 2
+    assert touch.call_args.kwargs["touched_ids"] == ["m1", "m2"]
+
+
 # G9: today's 10 words, no backfill
 def test_word_feed_is_the_old_capped_selection_without_backfill(tmp_path, monkeypatch):
     rare = ["zephyr", "quokka", "marmot", "nutmeg", "obelisk", "pumice", "quartz", "rowan", "saffron"]
