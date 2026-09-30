@@ -526,6 +526,19 @@ def test_no_persona_dir_path_cuts_and_skips_like_the_persona_path(
     assert tier2(wire_calls) == []
 
 
+def test_no_persona_dir_path_sizes_a_fresh_process_from_its_tier_one_seed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clock: Clock
+) -> None:
+    w = make_world(tmp_path, n=40, names=False)
+    t1 = B / 16
+    calls = wire(monkeypatch, clock, t_sem=0.0, t1=t1)
+    render(w, persona=False)
+    want = keyword_budget.words_that_fit(keyword_budget.seed_fit(10, t1), len(w.words), B - t1)
+    t2 = tier2(calls)
+    assert 0 < want < len(w.words)
+    assert len(t2) == 1 and t2[0][1] == w.words[:want], "sized from tier 1's own timing on this path too"
+
+
 # ---------------------------------------------------------------------------
 # L13: composition with the semantic step (S132).
 # ---------------------------------------------------------------------------

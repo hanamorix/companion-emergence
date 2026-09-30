@@ -18,11 +18,13 @@ import math
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from brain import tunables
 from brain.memory import cost_period, keyword_budget
 from brain.memory.cost_period import LinearFit
 
@@ -191,6 +193,30 @@ def test_no_sample_from_tier_one_a_skip_or_a_raising_search(clock: Clock) -> Non
     with pytest.raises(RuntimeError):
         keyword_budget.search_extra_words(store, WORDS[:10], 0.0, boom, (3, 0.0))
     assert sums(store) is None, "a search that raised records nothing"
+
+
+def test_a_step_where_one_word_does_not_fit_records_nothing(clock: Clock) -> None:
+    store = _store()
+    consume_discard()
+    two_size_fit(store, B / 256, B / 1024)
+    before = sums(store)
+    # left = overhead + half a word: the step is decided as n = 0, not skipped by left <= 0
+    started = -(B - (B / 256 + B / 2048))
+    assert run_step(store, WORDS, started=started, seed=None, cost=B / 64, clock=clock) == []
+    assert sums(store) == before
+
+
+def test_the_budget_is_the_tunable_read_now(monkeypatch: pytest.MonkeyPatch) -> None:
+    real = tunables.get_tunable
+
+    def override(name, default, *a, **k):
+        return 6.0 if name == "reranker.latency_budget_seconds" else real(name, default, *a, **k)
+
+    monkeypatch.setattr(tunables, "get_tunable", override)
+    assert keyword_budget.recall_budget_seconds() == 6.0
+    store = _store()
+    two_size_fit(store, 0.0, 6.0 / 1024)
+    assert [len(c) for c in run_step(store, WORDS)] == [1024], "sized against the tunable's 6.0"
 
 
 def test_the_estimate_follows_two_sizes_the_least_squares_fit(clock: Clock) -> None:
@@ -500,6 +526,8 @@ def test_the_series_state_is_read_once_per_step(monkeypatch: pytest.MonkeyPatch)
 def test_two_threads_finishing_a_first_search_together_discard_exactly_one(monkeypatch: pytest.MonkeyPatch) -> None:
     barrier = threading.Barrier(2)
     monkeypatch.setattr(keyword_budget, "_record_hook", lambda: barrier.wait(timeout=5))
+    # inside the critical section, between the check and the set: a window the lock must close
+    monkeypatch.setattr(keyword_budget, "_flag_hook", lambda: time.sleep(0.05))
     threads = [
         threading.Thread(target=keyword_budget.record_tier2, args=("race2.db", 10, 0.25)) for _ in range(2)
     ]

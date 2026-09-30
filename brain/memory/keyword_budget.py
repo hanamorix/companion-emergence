@@ -54,8 +54,10 @@ _keyword_cost = cost_period.PeriodCostSeries("keyword extra words")
 _first_sample_lock = threading.Lock()
 _first_sample_spent = False
 
-# Test-only seam: called at the top of `record_tier2`, before the flag check.
+# Test-only seams: `_record_hook` is called at the top of `record_tier2`, before
+# the flag check; `_flag_hook` inside the lock, between the check and the set.
 _record_hook: Callable[[], None] | None = None
+_flag_hook: Callable[[], None] | None = None
 
 
 def _reset_keyword_cost() -> None:
@@ -135,6 +137,8 @@ def record_tier2(key: str, words: int, seconds: float) -> None:
         _record_hook()
     with _first_sample_lock:
         if not _first_sample_spent:
+            if _flag_hook is not None:
+                _flag_hook()
             _first_sample_spent = True
             return
     _keyword_cost.record(key, words, seconds)
