@@ -328,7 +328,9 @@ def test_reappraiser_prompt_carries_the_whole_memory(persona):
     provider = FakeProvider(json.dumps({"importance": 5, "names": []}))
     _reappraise_run(store, tmp, mem, provider=provider)
     prompt, system = provider.calls[0]
-    assert prompt == text
+    # names increment (S106, S107): the whole memory in its <memory> fence, after the
+    # KNOWN NAMES line (no listed name here).
+    assert prompt == f"KNOWN NAMES: []\n<memory>\n{text}\n</memory>"
     assert "names" in system
 
 

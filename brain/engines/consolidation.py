@@ -40,7 +40,14 @@ from brain.memory import embeddings as embeddings_mod
 from brain.memory.embedding_matrix import build_embedding_matrix
 from brain.memory.embeddings import cosine_similarity
 from brain.memory.hebbian import HebbianMatrix
-from brain.memory.known_names import admit_names
+from brain.memory.known_names import (
+    admit_names,
+    listed_display_forms,
+    load_known_names,
+    match_known_names,
+    normalize_name,
+    remove_names,
+)
 from brain.memory.pending import SALIENCE_ELIGIBLE_TYPES, PendingQueue
 from brain.memory.semantic_recall import build_semantic_candidate_pool
 from brain.memory.store import Memory, MemoryStore, clamp_importance
@@ -51,6 +58,18 @@ logger = logging.getLogger(__name__)
 # Text externalized to prompt_strings.toml [engines.consolidation] (issue #129 stage 2c).
 _REAPPRAISER_PROMPT = prompt_strings.register("engines.consolidation.reappraiser_prompt")
 _CLASSIFIER_PROMPT = prompt_strings.register("engines.consolidation.classifier_prompt")
+# The user-message templates (name-recall fix, names increment: S106 fences, S107,
+# S136 one <existing> fence per EXISTING memory). Filled with str.format; memory
+# text is an argument, so braces inside it are inert.
+_CLASSIFIER_USER_TEMPLATE = prompt_strings.register(
+    "engines.consolidation.classifier_user_template"
+)
+_CLASSIFIER_EXISTING_ITEM_TEMPLATE = prompt_strings.register(
+    "engines.consolidation.classifier_existing_item_template"
+)
+_REAPPRAISER_USER_TEMPLATE = prompt_strings.register(
+    "engines.consolidation.reappraiser_user_template"
+)
 
 _GATE_LOCK_FILENAME = "consolidation_gate"  # file_lock adds the .lock sidecar
 _ARCHIVE_FILENAME = "consolidation_archive.jsonl"
@@ -90,11 +109,14 @@ Classifier = Callable[[Memory, list[Memory]], Decision]
 
 
 class Reappraisal(NamedTuple):
-    """What a Reappraiser returns for one memory: a fresh importance and the
-    names / proper nouns it found in the memory's text (spec §5, item 2)."""
+    """What a Reappraiser returns for one memory: a fresh importance, the names /
+    proper nouns it found in the memory's text (spec §5, item 2), and the listed
+    names it was shown (KNOWN NAMES) that it judges are not names (``not_names``,
+    S105, S107)."""
 
     importance: float
     names: tuple[str, ...] = ()
+    not_names: tuple[str, ...] = ()
 
 
 # P3 retention rework, Change 3: importance re-rating on recall, via the
@@ -189,7 +211,11 @@ def run_consolidation(
                 )
                 classifier = _promote_all_classifier
         if reappraiser is None:
-            reappraiser = _make_haiku_reappraiser(provider) if provider is not None else _noop_reappraiser
+            reappraiser = (
+                _make_haiku_reappraiser(provider, persona_dir)
+                if provider is not None
+                else _noop_reappraiser
+            )
         result = _run_locked(store, persona_dir, classifier, hebbian, salience_floor, reappraiser)
     logger.info("consolidation gate run: %s", json.dumps(result.as_log()))
     return result
@@ -443,6 +469,54 @@ def _parse_names(value: object, *, source: str) -> tuple[str, ...]:
     return tuple(kept)
 
 
+def _escape_tag(text: str, tag: str) -> str:
+    """Escape every tag of the fence's name inside memory text (S106): opening,
+    closing, self-closing, with attributes, any case, whitespace inside the
+    brackets, terminated or not (``<`` becomes ``&lt;``), so memory text can
+    neither close its fence nor open another. ``<memo>`` and ``<memoryx>`` are
+    left alone. Look-alike characters (a zero-width space inside the tag, a
+    fullwidth ``<``) are not tags and are not escaped: a stated limit."""
+    return re.sub(r"<(?=\s*/?\s*" + re.escape(tag) + r"\b)", "&lt;", text, flags=re.IGNORECASE)
+
+
+def _escape_tags(text: str, tags: tuple[str, ...]) -> str:
+    for tag in tags:
+        text = _escape_tag(text, tag)
+    return text
+
+
+# Both of the judge's fence tags are escaped in the candidate AND in every
+# EXISTING memory (S136), so a candidate cannot forge an EXISTING block and an
+# existing memory cannot close its own fence or open a candidate.
+_JUDGE_TAGS: tuple[str, ...] = ("candidate", "existing")
+
+
+def _classifier_user_message(cand: Memory, context: list[Memory]) -> str:
+    """The judge's user message: the whole candidate in its <candidate> fence, then
+    each EXISTING memory (the base's first 200 characters) in its own <existing>
+    fence after an ``- id=<id>:`` line (S136), or ``(none)``."""
+    items = [
+        _CLASSIFIER_EXISTING_ITEM_TEMPLATE.format(
+            id=m.id, content=_escape_tags(m.content[:200], _JUDGE_TAGS)
+        )
+        for m in context
+    ]
+    return _CLASSIFIER_USER_TEMPLATE.format(
+        candidate=_escape_tags(cand.content, _JUDGE_TAGS),
+        existing="\n".join(items) or "(none)",
+    )
+
+
+def _reappraiser_user_message(memory: Memory, offered: list[str]) -> str:
+    """The re-appraiser's user message: KNOWN NAMES (the listed names that occur in
+    the memory, display forms, a JSON array) then the whole memory in its
+    <memory> fence (S105, S106, S107)."""
+    known = json.dumps([_escape_tag(d, "memory") for d in offered], ensure_ascii=False)
+    return _REAPPRAISER_USER_TEMPLATE.format(
+        known_names=known, memory=_escape_tag(memory.content, "memory")
+    )
+
+
 def _admit_extracted_names(
     persona_dir: Path, names: object, *, list_source: str, label: str
 ) -> None:
@@ -502,12 +576,13 @@ def _parse_reappraisal(raw: str, current: float) -> Reappraisal:
     if isinstance(data, dict):
         score = _coerce_score(data.get("importance"))
         names = _parse_names(data.get("names"), source="reappraiser")
-        return Reappraisal(current if score is None else score, names)
+        not_names = _parse_names(data.get("not_names"), source="reappraiser not_names")
+        return Reappraisal(current if score is None else score, names, not_names)
     keyed = _KEYED_IMPORTANCE_RE.search(raw)
     return Reappraisal(float(keyed.group(1)) if keyed else current)
 
 
-def _make_haiku_reappraiser(provider) -> Reappraiser:
+def _make_haiku_reappraiser(provider, persona_dir: Path | None = None) -> Reappraiser:
     """Build the Haiku-backed default importance re-appraiser (Change 3).
 
     Judges importance fresh from the memory's content in the moment it is
@@ -518,12 +593,18 @@ def _make_haiku_reappraiser(provider) -> Reappraiser:
     it. Output is clamped [0, 10] by the caller (`_handle_reappraisals`) via the
     shared `clamp_importance`. On any parse/provider failure the fallback is the
     memory's CURRENT importance with no names (a no-op) — never a crash, never a
-    ratchet."""
+    ratchet.
+
+    The memory goes in its <memory> fence after a KNOWN NAMES line: the display
+    forms of the persona's listed names that occur in it (``[]`` without a persona
+    directory or on any failure), so it can name any that is not a name in
+    ``not_names`` (S105, S107)."""
     prompt = _REAPPRAISER_PROMPT
 
     def _reappraise(memory: Memory) -> Reappraisal:
         try:
-            raw = provider.generate(memory.content, system=prompt)
+            offered = listed_display_forms(persona_dir, memory.content)
+            raw = provider.generate(_reappraiser_user_message(memory, offered), system=prompt)
             return _parse_reappraisal(raw, memory.importance)
         except Exception:  # noqa: BLE001 — a provider fault must not lose the row
             logger.warning("consolidation Haiku reappraise failed; importance unchanged")
@@ -550,7 +631,11 @@ def _handle_reappraisals(
     the merge-dispatch idiom above (`_dispatch`'s `verdict == "merge"` branch).
 
     The names the reappraiser found are written to the known-names list only
-    after the importance update succeeded (P-18), fail-soft.
+    after the importance update succeeded (P-18), fail-soft. Before that, its
+    ``not_names`` remove listed names (S105): only a name that is listed, occurs
+    in this memory's text (the matcher, entry-side rules), and is not also in its
+    ``names``; the write itself never removes a name the kindled added, and puts
+    each removed name on the rejects list (S135).
     """
     for entry in entries:
         memory_id = entry.get("memory_id")
@@ -561,7 +646,12 @@ def _handle_reappraisals(
         if memory is None:
             continue  # already gone — no resurrection
         try:
-            new_importance, names = reappraiser(memory)
+            appraisal = reappraiser(memory)
+            # Attribute access inside the same try: a reappraiser that returns a
+            # bare number is skipped with a log line, as before.
+            new_importance = appraisal.importance
+            names = appraisal.names
+            not_names = getattr(appraisal, "not_names", ())
         except Exception:  # noqa: BLE001 — a reappraiser fault must not lose the batch
             logger.exception("consolidation gate: reappraiser raised; skipping")
             continue
@@ -572,7 +662,26 @@ def _handle_reappraisals(
             # raised (finding #3).
             continue
         result.reappraised += 1
+        _remove_not_names(persona_dir, memory, names, not_names)
         _admit_extracted_names(persona_dir, names, list_source="reappraiser", label="reappraiser")
+
+
+def _remove_not_names(persona_dir: Path, memory: Memory, names: object, not_names: object) -> None:
+    """The re-appraiser's removals (S105), fail-soft: listed names that occur in
+    this memory and that the reply put under ``not_names`` but not under
+    ``names``. ``remove_names`` refuses a name the kindled added."""
+    try:
+        wanted = {normalize_name(n) for n in _parse_names(not_names, source="reappraiser not_names")}
+        kept = {normalize_name(n) for n in _parse_names(names, source="reappraiser")}
+        wanted = {n for n in wanted - kept if n}
+        if not wanted:
+            return
+        present = set(match_known_names(memory.content or "", load_known_names(persona_dir)))
+        targets = sorted(wanted & present)
+        if targets:
+            remove_names(persona_dir, targets, "reappraiser")
+    except Exception:  # noqa: BLE001 — a names write never costs the importance update
+        logger.warning("consolidation reappraiser: known-names removal failed", exc_info=True)
 
 
 def _archive_preimage(persona_dir: Path, target: Memory, source_id: str) -> None:
@@ -693,10 +802,10 @@ def _make_haiku_classifier(provider) -> Classifier:
     prompt = _CLASSIFIER_PROMPT
 
     def _classify(cand: Memory, context: list[Memory]) -> Decision:
-        ctx = "\n".join(f"- id={m.id}: {m.content[:200]}" for m in context) or "(none)"
         # The WHOLE candidate: the verdict and the names are both read from all of
-        # it (the first-400-character cut is gone, spec §5 item 1, S51).
-        user = f"CANDIDATE: {cand.content}\nEXISTING:\n{ctx}"
+        # it (the first-400-character cut is gone, spec §5 item 1, S51), in its
+        # fence; each EXISTING memory in its own fence (S106, S136).
+        user = _classifier_user_message(cand, context)
         try:
             raw = provider.generate(user, system=prompt)
             data = json.loads(_extract_json(raw))

@@ -34,8 +34,10 @@ def _strings() -> dict[str, str]:
     }
 
 
-@pytest.mark.parametrize("label", list(_strings()))
+@pytest.mark.parametrize("label", ["tool identifier", "tool description", "tool parameter description"])
 def test_each_string_carries_the_placeholder_marker(label):
+    # The two prompts carry the approved wording now (names increment, S107);
+    # their byte-exact test is in tests/unit/brain/engines/test_names_increment_consolidation.py.
     assert "placeholder" in _strings()[label].lower(), label
 
 
