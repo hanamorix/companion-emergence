@@ -587,6 +587,8 @@ def test_s139_coverage_resets_with_the_period_and_the_tick_window_keeps_s133() -
     two_size_fit(store, 0.0, B / 256)
     keyword_budget._record(_key(store), 4096, 4096 * B / 256)  # noqa: SLF001  (a big sample this period)
     assert keyword_budget.choose_estimate(store, 4000, None).source == "series"
+    keyword_budget._record(_key(store), 8, 8 * B / 256)  # noqa: SLF001  (a later, smaller sample must not shrink the coverage)
+    assert keyword_budget.choose_estimate(store, 4000, (8, 8 * B / 512)).source == "series", "coverage is the LARGEST sample"
     cost_period.start_new_period()
     est = keyword_budget.choose_estimate(store, 4000, (8, 8 * B / 512))
     assert est.source == "carried/seed" and not est.larger, "S133 window after a tick: the lower cost"
