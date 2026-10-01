@@ -19,6 +19,7 @@ vi.mock("../appConfig", () => ({
   applyBrainUpdate: vi.fn(),
   rollbackBrain: vi.fn(),
   revertBrain: vi.fn(),
+  confirmBrainUpdate: vi.fn(async () => undefined),
 }));
 
 vi.mock("../bridge", () => ({
@@ -182,6 +183,7 @@ describe("useBrainUpdate", () => {
     expect(appConfig.rollbackBrain).not.toHaveBeenCalled();
     expect(bridge.fetchHealth).toHaveBeenCalledWith(PERSONA);
     expect(result.current.state).toEqual({ kind: "none", reason: "already_active" });
+    expect(appConfig.confirmBrainUpdate).toHaveBeenCalledWith(commit);
   });
 
   it("apply() reports an error when the restarted brain isn't the update", async () => {
@@ -205,6 +207,7 @@ describe("useBrainUpdate", () => {
       kind: "error",
       detail: "The update installed, but the brain didn't load it. Use the release brain below, or restart Companion Emergence.",
     });
+    expect(appConfig.confirmBrainUpdate).not.toHaveBeenCalled();
   });
 
   it("apply() rolls back and restarts once when the first restart is unhealthy", async () => {
