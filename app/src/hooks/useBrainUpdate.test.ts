@@ -216,7 +216,7 @@ describe("useBrainUpdate", () => {
       checkResult({ available: true, commit, brain_version: "0.0.44", reason: "available" }),
     );
     vi.mocked(appConfig.applyBrainUpdate).mockResolvedValue({ commit, brain_version: "0.0.44", had_active: true });
-    vi.mocked(appConfig.rollbackBrain).mockResolvedValue(undefined);
+    vi.mocked(appConfig.rollbackBrain).mockResolvedValue(null);
     const restart = mockRestart(false, true);
 
     const { result } = renderHook(() => useBrainUpdate(PERSONA, "live"));
@@ -262,7 +262,7 @@ describe("useBrainUpdate", () => {
       checkResult({ available: true, commit, brain_version: "0.0.44", reason: "available" }),
     );
     vi.mocked(appConfig.applyBrainUpdate).mockResolvedValue({ commit, brain_version: "0.0.44", had_active: true });
-    vi.mocked(appConfig.rollbackBrain).mockResolvedValue(undefined);
+    vi.mocked(appConfig.rollbackBrain).mockResolvedValue(null);
     vi.mocked(appConfig.revertBrain).mockResolvedValue(undefined);
     const restart = mockRestart(false, false, true);
 
@@ -286,7 +286,7 @@ describe("useBrainUpdate", () => {
       checkResult({ available: true, commit, brain_version: "0.0.44", reason: "available" }),
     );
     vi.mocked(appConfig.applyBrainUpdate).mockResolvedValue({ commit, brain_version: "0.0.44", had_active: true });
-    vi.mocked(appConfig.rollbackBrain).mockResolvedValue(undefined);
+    vi.mocked(appConfig.rollbackBrain).mockResolvedValue(null);
     vi.mocked(appConfig.revertBrain).mockResolvedValue(undefined);
     mockRestart(false, false, false);
 
@@ -440,7 +440,7 @@ describe("useBrainUpdate", () => {
       checkResult({ available: true, commit, brain_version: "0.0.44", reason: "available" }),
     );
     vi.mocked(appConfig.applyBrainUpdate).mockResolvedValue({ commit, brain_version: "0.0.44", had_active: true });
-    vi.mocked(appConfig.rollbackBrain).mockResolvedValue(undefined);
+    vi.mocked(appConfig.rollbackBrain).mockResolvedValue(null);
     vi.mocked(appConfig.revertBrain).mockRejectedValue(new Error("revert failed"));
     const restart = mockRestart(false, false, true);
 

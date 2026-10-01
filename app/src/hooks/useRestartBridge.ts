@@ -136,6 +136,12 @@ function setErrorDetail(detail: string | null): void {
   setShared({ errorDetail: detail });
 }
 
+/** Back to idle after a restart nobody pressed (the launch path, #335), so the
+ *  Restart button doesn't show its result. A no-op while a restart runs. */
+export function clearRestartState(): void {
+  if (!inFlight) setShared({ state: "idle", errorDetail: null });
+}
+
 /** Reset for test isolation — never call in production code. */
 export function _resetRestartBridgeForTests(): void {
   shared = { state: "idle", errorDetail: null };

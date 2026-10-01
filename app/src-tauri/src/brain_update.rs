@@ -192,6 +192,12 @@ pub(crate) fn active_commit_from_status(status: &str) -> Option<String> {
     active.get("commit")?.as_str().map(str::to_string)
 }
 
+/// `nell update --rollback`'s printed state → the overlay it landed on (None = the
+/// release brain), so the app can say which brain is back (#335).
+pub(crate) fn active_commit_after_flip(stdout: &str) -> Option<String> {
+    status_json(stdout)?.get("active")?.get("commit")?.as_str().map(str::to_string)
+}
+
 /// What the launch path needs to know about the active overlay (#335).
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct BrainOverlayStatus {
@@ -494,10 +500,12 @@ pub(crate) async fn apply_brain_update(app: tauri::AppHandle) -> Result<BrainUpd
 
 /// The updated bridge was unhealthy (spec §6): make the previous overlay current
 /// (or the release brain when there is none). The frontend restarts afterwards.
+/// Returns the commit it landed on; None = the release brain (#335).
 #[tauri::command]
-pub(crate) async fn rollback_brain(app: tauri::AppHandle, reason: String) -> Result<(), String> {
+pub(crate) async fn rollback_brain(app: tauri::AppHandle, reason: String) -> Result<Option<String>, String> {
     log_event(&app, "brain update: rolled back", &reason);
-    run_nell(&app, &["update", "--rollback"], FLIP_TIMEOUT_S).await.map(|_| ())
+    let out = run_nell(&app, &["update", "--rollback"], FLIP_TIMEOUT_S).await?;
+    Ok(active_commit_after_flip(&out))
 }
 
 /// "Use the release brain": clear the active overlay. The frontend restarts afterwards.
@@ -675,6 +683,15 @@ mod tests {
         assert!(!status_supported(none));
         assert_eq!(active_commit_from_status(none), None);
         assert!(!status_supported("garbage"));
+    }
+
+    #[test]
+    fn reads_where_a_rollback_landed() {
+        // `nell update --rollback` prints the new state: an overlay, or none (the release brain)
+        let landed = r#"{"active": {"dir": "d", "commit": "abc", "bundle_id": "b"}, "previous": null}"#;
+        assert_eq!(active_commit_after_flip(landed).as_deref(), Some("abc"));
+        assert_eq!(active_commit_after_flip(r#"{"active": null, "previous": {"commit": "x"}}"#), None);
+        assert_eq!(active_commit_after_flip("garbage"), None);
     }
 
     #[test]

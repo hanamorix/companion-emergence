@@ -60,6 +60,10 @@ Verified on `main` @ 7365c0a9:
   `active.commit == commit`; otherwise a no-op. The active entry changed underneath, which is
   harmless.
 - `rollback` / `revert` are unchanged: a restored `previous` keeps its own flag.
+- Re-activating the folder that is already active (a CLI `nell update` of the active
+  commit) keeps that entry's `confirmed` and `undo`: a build that proved itself stays proven.
+- `/health` gains `overlay_disabled: bool`: `KINDLED_NO_OVERLAY` is set on the bridge, so it
+  ignores any overlay on purpose. Additive.
 - CLI: `nell update --confirm COMMIT`, in the existing mutually exclusive `update_mode` group;
   it prints the state like `--rollback`. `--status` already prints the whole entry, so the
   flag shows there with no change.
@@ -74,17 +78,23 @@ brain is broken.
   `confirmed` is the entry's flag, `true` when missing or when there is no active overlay;
   `undo` is the entry's field, `"revert"` when missing.
 - `confirm_brain_update(commit: String)`: runs `nell update --confirm <commit>`.
+- `rollback_brain` now returns the commit it landed on (`None` = the release brain), parsed
+  from the state `nell update --rollback` prints, so the app can name the brain that's back.
 - Both are registered in `generate_handler!`, with camelCase-arg wrappers in `appConfig.ts`.
 
 ### 3.3 Frontend
 
 - **`useRestartBridge.ts`:** export the module-level restart as a plain
   `restartBridge(persona): Promise<boolean>` (the #336 store); the hook's `restart` calls it.
-  Launch code runs before `Ready` mounts, so it can't use the hook.
+  Launch code runs before `Ready` mounts, so it can't use the hook. `clearRestartState()`
+  returns the shared state to idle (unless a restart is running) after a restart the launch
+  made, so the Restart button never shows "Restarted ✓" for a restart nobody pressed.
 - **`brainRecovery.ts` (new):** `recoverUnhealthyBrain(persona, undo, reason)`, the rollback
   chain moved out of `useBrainUpdate.apply`: `undo` (rollback or revert), restart, then
   revert and restart again if still unhealthy (skipping the second revert when `undo` was
-  already a revert). It returns `"rolled_back" | "release" | "failed"`. `apply` passes
+  already a revert). It returns `{ ok, error, outcome }`, where `outcome` is
+  `"rolled_back" | "release" | "failed"`, taken from where the rollback landed. The notice
+  comes from `outcome`, never from a second status read. `apply` passes
   `had_active ? "rollback" : "revert"`; the launch path passes `status.undo`. `apply` and the launch path both call it, so the
   chain exists once (#315's lesson).
 - **`useBrainUpdate.apply`:** after its existing check (`running.commit === applied.commit`),
@@ -102,6 +112,7 @@ brain is broken.
 | Situation | Action |
 |---|---|
 | No active overlay | Unchanged. |
+| Active overlay, but the bridge reports `overlay_disabled` | Leave it alone: no restart, no confirm (the user's escape hatch). |
 | Bridge healthy, `loaded == active`, unconfirmed | `confirm_brain_update(active)`, silently. |
 | Bridge healthy, `loaded != active` (A) | `restartBridge`; on success with `loaded == active`, confirm. Otherwise, if the active overlay is **unconfirmed**: `recoverUnhealthyBrain(status.undo, …)` and a notice. If it is **confirmed** (decision 1: never dropped automatically): a failed restart goes to `BridgeErrorScreen` with **Use the release brain**; a healthy bridge on another build is left running. |
 | Start fails, active **unconfirmed** (C) | `recoverUnhealthyBrain(status.undo, "unconfirmed overlay failed to start at launch")`, retry the start, notice. |

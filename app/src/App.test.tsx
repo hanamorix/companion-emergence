@@ -44,7 +44,7 @@ const {
   brainLoginStatus: vi.fn(async () => ({ authorized: true })),
   brainOverlayStatus: vi.fn(async () => ({ active_commit: null as string | null, confirmed: true, undo: "revert" })),
   revertBrain: vi.fn(async () => undefined),
-  rollbackBrain: vi.fn(async (_reason: string) => undefined),
+  rollbackBrain: vi.fn(async (_reason: string): Promise<string | null> => null),
   confirmBrainUpdate: vi.fn(async (_commit: string) => undefined),
   nellbrainHomePath: vi.fn(async (): Promise<string | null> => null),
 }));
@@ -409,7 +409,7 @@ describe("App launch recovery (#335)", () => {
     ensureBridgeRunning.mockReset();
     brainOverlayStatus.mockReset();
     revertBrain.mockReset().mockResolvedValue(undefined);
-    rollbackBrain.mockReset().mockResolvedValue(undefined);
+    rollbackBrain.mockReset().mockResolvedValue(null);
     setAlwaysOnTop.mockReset().mockResolvedValue(undefined);
     brainLoginStatus.mockReset().mockResolvedValue({ authorized: true });
   });
@@ -465,6 +465,7 @@ describe("App launch recovery (#335)", () => {
 
   it("an unproven update that won't start rolls back by itself and says so", async () => {
     ensureBridgeRunning.mockRejectedValueOnce(new Error("boom")).mockResolvedValue(undefined);
+    rollbackBrain.mockResolvedValueOnce("a".repeat(40)); // landed on the earlier build
     brainOverlayStatus
       .mockResolvedValueOnce({ active_commit: "b".repeat(40), confirmed: false, undo: "rollback" })
       .mockResolvedValue({ active_commit: "a".repeat(40), confirmed: true, undo: "revert" });

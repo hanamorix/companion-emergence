@@ -9,7 +9,7 @@ import { renderHook, act, waitFor, cleanup } from "@testing-library/react";
 
 import * as bridge from "../bridge";
 import * as appConfig from "../appConfig";
-import { _resetRestartBridgeForTests, restartBridge, useRestartBridge } from "./useRestartBridge";
+import { _resetRestartBridgeForTests, clearRestartState, restartBridge, useRestartBridge } from "./useRestartBridge";
 
 const PERSONA = "test-persona";
 
@@ -401,6 +401,36 @@ describe("useRestartBridge", () => {
     });
     expect(await fromHook).toBe(true);
     expect(snapshotMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("(#335) clearRestartState() hides a restart nobody pressed, but never one in flight", async () => {
+    let releaseSnapshot!: () => void;
+    vi.spyOn(bridge, "snapshotActiveSession").mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          releaseSnapshot = () => resolve(jsonResponse(200));
+        }),
+    );
+    vi.spyOn(bridge, "shutdownBridge").mockResolvedValue(jsonResponse(202));
+    vi.spyOn(appConfig, "ensureBridgeRunning").mockResolvedValue(undefined);
+    vi.spyOn(bridge, "fetchHealth").mockResolvedValue({ liveness: "ok" });
+
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    let pending: Promise<boolean> = Promise.resolve(false);
+    act(() => {
+      pending = restartBridge(PERSONA);
+    });
+    await waitFor(() => expect(result.current.state).toBe("closing"));
+    act(() => clearRestartState());
+    expect(result.current.state).toBe("closing"); // in flight: untouched
+
+    await act(async () => {
+      releaseSnapshot();
+      await pending;
+    });
+    expect(result.current.state).toBe("reconnecting");
+    act(() => clearRestartState());
+    expect(result.current.state).toBe("idle");
   });
 
   it("(#310) a shared success goes back to idle when the bridge drops again", async () => {

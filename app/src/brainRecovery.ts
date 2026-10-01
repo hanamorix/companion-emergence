@@ -18,7 +18,7 @@ import {
 } from "./appConfig";
 import { fetchHealth } from "./bridge";
 import { ensureBridgeCurrent } from "./bridgeVersionCheck";
-import { restartBridge } from "./hooks/useRestartBridge";
+import { clearRestartState, restartBridge } from "./hooks/useRestartBridge";
 import { errString } from "./lib/errString";
 
 export type UndoKind = BrainOverlayStatus["undo"];
@@ -28,6 +28,8 @@ export interface RecoveryResult {
   ok: boolean;
   /** a failed switch to the release brain ("Couldn't switch back…") */
   error: string | null;
+  /** where it ended: an earlier overlay, the release brain, or nothing healthy */
+  outcome: "rolled_back" | "release" | "failed";
 }
 
 export async function recoverUnhealthyBrain(
@@ -36,15 +38,18 @@ export async function recoverUnhealthyBrain(
   restart: () => Promise<boolean>,
 ): Promise<RecoveryResult> {
   let undoError: string | null = null;
+  let landedOn: string | null = null; // the overlay a rollback landed on; null = release
   try {
-    if (undo === "rollback") await rollbackBrain(reason);
+    if (undo === "rollback") landedOn = await rollbackBrain(reason);
     else await revertBrain();
   } catch (e) {
     undoError = errString(e) || "unknown error";
   }
   // A failed undo leaves the still-broken build in place — restarting onto it
   // would just repeat the failure, so skip that restart.
-  if (undoError === null && (await restart())) return { ok: true, error: null };
+  if (undoError === null && (await restart())) {
+    return { ok: true, error: null, outcome: landedOn ? "rolled_back" : "release" };
+  }
   // undo "revert": the revert WAS the release-brain step, so don't revert twice.
   let revertError: string | null = undo === "rollback" ? null : undoError;
   if (undo === "rollback") {
@@ -56,7 +61,9 @@ export async function recoverUnhealthyBrain(
   }
   // The release brain is the floor — always try the restart, even after a
   // failed revert, so a still-good overlay/release brain gets one more shot.
-  return { ok: await restart(), error: revertError };
+  const ok = await restart();
+  // a failed revert left some overlay active, so it isn't the release brain running
+  return { ok, error: revertError, outcome: !ok ? "failed" : revertError === null ? "release" : "rolled_back" };
 }
 
 export const NOTICE_ROLLED_BACK = "The brain update didn't start, so the previous brain is back.";
@@ -88,12 +95,28 @@ async function overlayStatus(): Promise<BrainOverlayStatus> {
   }
 }
 
-async function loadedCommit(persona: string): Promise<string | null> {
+/** What the running bridge loaded, and whether the user's escape hatch
+ *  (KINDLED_NO_OVERLAY) has it ignoring overlays on purpose. */
+async function runningOverlay(persona: string): Promise<{ commit: string | null; disabled: boolean }> {
   try {
-    return (await fetchHealth(persona)).overlay?.commit ?? null;
+    const health = await fetchHealth(persona);
+    return { commit: health.overlay?.commit ?? null, disabled: health.overlay_disabled === true };
   } catch {
-    return null;
+    return { commit: null, disabled: false };
   }
+}
+
+/** A restart the launch made, not the user: keep it off the Restart button. */
+async function restartQuietly(persona: string): Promise<boolean> {
+  try {
+    return await restartBridge(persona);
+  } finally {
+    clearRestartState();
+  }
+}
+
+function noticeFor(r: RecoveryResult): string {
+  return r.outcome === "rolled_back" ? NOTICE_ROLLED_BACK : NOTICE_RELEASE;
 }
 
 async function confirmQuietly(commit: string): Promise<void> {
@@ -112,10 +135,6 @@ async function startOk(persona: string): Promise<boolean> {
   } catch {
     return false;
   }
-}
-
-async function noticeAfterRecovery(): Promise<string> {
-  return (await overlayStatus()).active_commit ? NOTICE_ROLLED_BACK : NOTICE_RELEASE;
 }
 
 async function failedRecovery(r: RecoveryResult, fallback: string): Promise<LaunchResult> {
@@ -153,20 +172,23 @@ export async function launchBrain(persona: string): Promise<LaunchResult> {
       () => startOk(persona),
     );
     if (!r.ok) return failedRecovery(r, error);
-    return ready(persona, await noticeAfterRecovery());
+    return ready(persona, noticeFor(r));
   }
 
   const status = await statusP;
   let notice: string | null = null;
   if (status.active_commit) {
     const commit = status.active_commit;
-    if ((await loadedCommit(persona)) === commit) {
+    const running = await runningOverlay(persona);
+    if (running.disabled) {
+      // the user's escape hatch: leave the overlay alone, no restart, no confirm
+    } else if (running.commit === commit) {
       // silent (spec §3.3): never hold the launch on it
       if (!status.confirmed) void confirmQuietly(commit);
     } else {
       // case A: the update installed but the bridge never restarted onto it
-      const restarted = await restartBridge(persona);
-      if (restarted && (await loadedCommit(persona)) === commit) {
+      const restarted = await restartQuietly(persona);
+      if (restarted && (await runningOverlay(persona)).commit === commit) {
         void confirmQuietly(commit);
       } else if (status.confirmed) {
         if (!restarted) {
@@ -177,10 +199,10 @@ export async function launchBrain(persona: string): Promise<LaunchResult> {
         const r = await recoverUnhealthyBrain(
           status.undo,
           "unfinished brain update didn't load at launch",
-          () => restartBridge(persona),
+          () => restartQuietly(persona),
         );
         if (!r.ok) return failedRecovery(r, "The brain update didn't load.");
-        notice = await noticeAfterRecovery();
+        notice = noticeFor(r);
       }
     }
   }

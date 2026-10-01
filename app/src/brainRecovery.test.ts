@@ -17,11 +17,14 @@ vi.mock("./appConfig", () => ({
   confirmBrainUpdate: vi.fn(async () => undefined),
   ensureBridgeRunning: vi.fn(async () => undefined),
   revertBrain: vi.fn(async () => undefined),
-  rollbackBrain: vi.fn(async () => undefined),
+  rollbackBrain: vi.fn(async (): Promise<string | null> => null),
 }));
 vi.mock("./bridge", () => ({ fetchHealth: vi.fn() }));
 vi.mock("./bridgeVersionCheck", () => ({ ensureBridgeCurrent: vi.fn(async () => "ok") }));
-vi.mock("./hooks/useRestartBridge", () => ({ restartBridge: vi.fn(async () => true) }));
+vi.mock("./hooks/useRestartBridge", () => ({
+  restartBridge: vi.fn(async () => true),
+  clearRestartState: vi.fn(),
+}));
 
 const P = "nell";
 const NEW = "b".repeat(40);
@@ -39,6 +42,10 @@ function loaded(...commits: (string | null)[]) {
     m.mockResolvedValueOnce({ liveness: "ok", overlay: c ? { commit: c, brain_version: "0.0.44", bundle_match: true } : null });
   }
 }
+/** rollbackBrain lands on `commit` (null = the release brain). */
+function rollsBackTo(commit: string | null) {
+  vi.mocked(appConfig.rollbackBrain).mockResolvedValueOnce(commit);
+}
 function starts(...results: boolean[]) {
   const m = vi.mocked(appConfig.ensureBridgeRunning);
   for (const ok of results) {
@@ -53,6 +60,7 @@ beforeEach(() => {
   vi.mocked(appConfig.brainOverlayStatus).mockReset();
   vi.mocked(bridge.fetchHealth).mockReset();
   vi.mocked(restartModule.restartBridge).mockReset().mockResolvedValue(true);
+  vi.mocked(appConfig.rollbackBrain).mockReset().mockResolvedValue(null);
 });
 
 afterEach(() => {
@@ -100,6 +108,7 @@ describe("launchBrain (#335)", () => {
   it("case A: the restart fails on an unconfirmed update → rolled back, with a notice", async () => {
     status({ active_commit: NEW, confirmed: false, undo: "rollback" }, { active_commit: OLD, confirmed: true, undo: "revert" });
     loaded(OLD);
+    rollsBackTo(OLD);
     vi.mocked(restartModule.restartBridge).mockResolvedValueOnce(false).mockResolvedValueOnce(true);
     expect(await launchBrain(P)).toEqual({ kind: "ready", versionMismatch: false, notice: NOTICE_ROLLED_BACK });
     expect(appConfig.rollbackBrain).toHaveBeenCalledWith("unfinished brain update didn't load at launch");
@@ -118,6 +127,7 @@ describe("launchBrain (#335)", () => {
 
   it("case C: an unconfirmed build that won't start → rolled back, retried, notice", async () => {
     status({ active_commit: NEW, confirmed: false, undo: "rollback" }, { active_commit: OLD, confirmed: true, undo: "revert" });
+    rollsBackTo(OLD);
     starts(false, true);
     expect(await launchBrain(P)).toEqual({ kind: "ready", versionMismatch: false, notice: NOTICE_ROLLED_BACK });
     expect(appConfig.rollbackBrain).toHaveBeenCalledWith("unconfirmed overlay failed to start at launch");
@@ -126,6 +136,7 @@ describe("launchBrain (#335)", () => {
 
   it("case C: the rolled-back build fails too → the release brain, release notice", async () => {
     status({ active_commit: NEW, confirmed: false, undo: "rollback" }, NONE);
+    rollsBackTo(OLD);
     starts(false, false, true);
     expect(await launchBrain(P)).toEqual({ kind: "ready", versionMismatch: false, notice: NOTICE_RELEASE });
     expect(appConfig.rollbackBrain).toHaveBeenCalledTimes(1);
@@ -151,6 +162,41 @@ describe("launchBrain (#335)", () => {
     status({ active_commit: NEW, confirmed: false, undo: "rollback" }, NONE);
     vi.mocked(appConfig.ensureBridgeRunning).mockRejectedValue(new Error("boom"));
     expect(await launchBrain(P)).toEqual({ kind: "error", error: "boom", canUseReleaseBrain: false });
+  });
+
+  it("the notice comes from what the rollback did, not a second status read", async () => {
+    // a slow or odd re-read would have said "release brain" after a successful rollback
+    status({ active_commit: NEW, confirmed: false, undo: "rollback" }, NONE);
+    rollsBackTo(OLD);
+    starts(false, true);
+    expect(await launchBrain(P)).toEqual({ kind: "ready", versionMismatch: false, notice: NOTICE_ROLLED_BACK });
+    expect(appConfig.brainOverlayStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("the overlay escape hatch is honoured: no restart, no confirm", async () => {
+    status({ active_commit: NEW, confirmed: false, undo: "rollback" });
+    vi.mocked(bridge.fetchHealth).mockResolvedValue({ liveness: "ok", overlay: null, overlay_disabled: true });
+    expect(await launchBrain(P)).toEqual({ kind: "ready", versionMismatch: false, notice: null });
+    expect(restartModule.restartBridge).not.toHaveBeenCalled();
+    expect(appConfig.confirmBrainUpdate).not.toHaveBeenCalled();
+    expect(appConfig.rollbackBrain).not.toHaveBeenCalled();
+  });
+
+  it("case A: a confirmed build whose restart comes back healthy on another build is left running", async () => {
+    status({ active_commit: NEW, confirmed: true, undo: "rollback" });
+    loaded(OLD, OLD);
+    expect(await launchBrain(P)).toEqual({ kind: "ready", versionMismatch: false, notice: null });
+    expect(restartModule.restartBridge).toHaveBeenCalledTimes(1);
+    expect(appConfig.rollbackBrain).not.toHaveBeenCalled();
+    expect(appConfig.revertBrain).not.toHaveBeenCalled();
+    expect(appConfig.confirmBrainUpdate).not.toHaveBeenCalled();
+  });
+
+  it("a restart the launch made is cleared from the Restart button's state", async () => {
+    status({ active_commit: NEW, confirmed: false, undo: "rollback" });
+    loaded(OLD, NEW);
+    await launchBrain(P);
+    expect(restartModule.clearRestartState).toHaveBeenCalled();
   });
 
   it("a hung status check doesn't hold the launch", async () => {
