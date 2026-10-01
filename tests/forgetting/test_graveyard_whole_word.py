@@ -1,5 +1,5 @@
 """Whole-word forgotten-memory search (name-recall fix S102, S119, S121, S123,
-S125, S128): matching, the four-letter minimum, the word filter, listed names,
+S125, S128, S150, S151): matching, the four-letter minimum, the word filter, listed names,
 order, and the shared rules. Synthetic entries only."""
 
 from __future__ import annotations
@@ -46,7 +46,8 @@ def test_whole_word_only_rain_never_matches_training(tmp_path):
          ("d", "no match here", "training"), ("e", "nothing at all", "rain"),
          ("f", "rain-soaked boots", "chat"), ("g", "rainy days and rain2", "chat")],
     )
-    assert set(_ids(search(tmp_path, "rain"))) == {"a", "c", "e", "f"}
+    # S150: the domain label ("e": domain "rain") is never matched.
+    assert set(_ids(search(tmp_path, "rain"))) == {"a", "c", "f"}
 
 
 def test_words_under_four_characters_are_not_query_words(tmp_path):
@@ -184,6 +185,44 @@ def test_without_names_newest_first(tmp_path):
     assert _ids(search(tmp_path, "harbour")) == ["b", "a"]
 
 
+# S150: the domain label is for filtering, never for keyword matching
+def _domain_world(persona: Path) -> None:
+    _write(
+        persona,
+        [("sum", "the garden gate at dusk", "household"), ("dom", "a quiet evening walk", "gardening"),
+         ("both", "gardening notes", "gardening"), ("name", "Al waved hello", "lunchtime"),
+         ("nameonlydomain", "a quiet evening", "Al")],
+    )
+
+
+def test_a_query_word_found_only_in_the_domain_matches_nothing(tmp_path):
+    _domain_world(tmp_path)
+    assert _ids(search(tmp_path, "gardening")) == ["both"]
+    assert search(tmp_path, "household") == []
+    assert _ids(search(tmp_path, "gate")) == ["sum"]  # a summary word still matches
+
+
+def test_a_listed_name_found_only_in_the_domain_matches_nothing(tmp_path):
+    _domain_world(tmp_path)
+    assert _ids(search(tmp_path, "", names=["al"])) == ["name"]
+
+
+def test_the_tool_does_not_match_the_domain_either(tmp_path):
+    _domain_world(tmp_path)
+    kn.admit_names(tmp_path, ["Al"], "tool")
+    assert _ids(recall_forgotten(arguments={"query": "gardening"}, persona_dir=tmp_path)["hits"]) == ["both"]
+    assert recall_forgotten(arguments={"query": "household"}, persona_dir=tmp_path)["hits"] == []
+    assert _ids(recall_forgotten(arguments={"query": "what about Al"}, persona_dir=tmp_path)["hits"]) == ["name"]
+
+
+def test_passive_recall_does_not_match_the_domain(tmp_path):
+    _domain_world(tmp_path)
+    store = MemoryStore(":memory:")
+    assert _ids(search_with_loss(tmp_path, store, "gardening").lost) == ["both"]
+    assert search_with_loss(tmp_path, store, "household").lost == []
+    assert _ids(search_with_loss(tmp_path, store, "", lost_names=["al"]).lost) == ["name"]
+
+
 # G19 stopword-name entry side (S121, superseded by S151: capitalized in any position)
 @pytest.mark.parametrize(
     ("summary", "domain", "expected"),
@@ -200,8 +239,8 @@ def test_without_names_newest_first(tmp_path):
         ("we said Will", "chat", True),
         ("Bob: Will you come", "chat", True),
         ('so he asked "Will you?"', "chat", True),
-        ("nothing", "team Will", True),
-        ("nothing", "Will", True),  # the domain is searched until S150 (the next commit)
+        ("nothing", "team Will", False),  # S150: never the domain
+        ("nothing", "Will", False),
         ("Hi, Will", "chat", True),
         ("\u0130\u0130\u0130 saw Will", "chat", True),  # F12: spans on the original text
         ("\u0130 was there. Will you", "chat", True),

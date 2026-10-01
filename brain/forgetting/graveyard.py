@@ -162,15 +162,15 @@ def search(
     limit: int = 5,
     names: Sequence[str] = (),
 ) -> list[dict]:
-    """Whole-word search of summary + domain (name-recall fix S102, S119, S123, S128).
+    """Whole-word search of the summary (name-recall fix S102, S119, S123, S128, S150).
 
     An entry matches when any of the query's words (:func:`query_words`) occurs
     as a whole word, or any listed name in ``names`` occurs as a phrase of
-    consecutive whole words, in its summary or in its domain (fields are tested
-    separately). Names match at any length; a stopword-name only where
-    capitalized, in any position (S151), and a single-word name never
-    as the stem of an n't contraction (S125). No words and no names: no hits.
-    Order: name hits first, then the rest, each newest first
+    consecutive whole words, in its summary. The domain label is never matched
+    (S150: it is for filtering, not for keyword matching). Names match at any
+    length; a stopword-name only where capitalized (S151) and a single-word name
+    never as the stem of an n't contraction (S125). No words and no names: no
+    hits. Order: name hits first, then the rest, each newest first
     (``forgotten_at_iso``), then ``limit`` (S119). Tolerates corrupt JSONL lines.
     """
     path = persona_dir / GRAVEYARD_FILENAME
@@ -187,12 +187,7 @@ def search(
     hints = words | {w for phrase in name_phrases for w in phrase}
     hits: list[tuple[dict, bool]] = []
     for entry in iter_jsonl_skipping_corrupt(path):
-        matched = False
-        by_name = False
-        for field in ((entry.get("summary") or ""), (entry.get("domain") or "")):
-            hit, name_hit = _field_matches(field, words, name_phrases, hints)
-            matched = matched or hit
-            by_name = by_name or name_hit
+        matched, by_name = _field_matches(entry.get("summary") or "", words, name_phrases, hints)
         if matched:
             hits.append((entry, by_name))
     # Newest first (ISO 8601 sorts lexicographically), then name hits first (stable).
