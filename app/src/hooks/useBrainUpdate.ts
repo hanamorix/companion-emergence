@@ -11,10 +11,11 @@ import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "
 import {
   applyBrainUpdate,
   checkBrainUpdate,
+  confirmBrainUpdate,
   revertBrain,
-  rollbackBrain,
   type BrainUpdateApplied,
 } from "../appConfig";
+import { recoverUnhealthyBrain } from "../brainRecovery";
 import { fetchHealth } from "../bridge";
 import type { BridgeOverlay, PersonaState } from "../bridge";
 import { errString } from "../lib/errString";
@@ -143,49 +144,31 @@ export function useBrainUpdate(
       if (await restart()) {
         // healthy isn't enough: the running bridge must be on the new build
         const running = await refreshOverlay();
-        setShared(running?.commit !== applied.commit
-          ? { kind: "error", detail: NOT_LOADED }
-          : { kind: "none", reason: "already_active" });
-        return;
-      }
-      // §6: the updated bridge is unhealthy → undo and restart; if that is
-      // unhealthy too, the release brain and restart. Undo = roll back to the
-      // overlay that was active before, or — when there was none — the release
-      // brain itself (a rollback there would keep this broken build as the
-      // rollback target).
-      let undoError: string | null = null;
-      try {
-        if (applied.had_active) await rollbackBrain("bridge unhealthy after a brain update");
-        else await revertBrain();
-      } catch (e) {
-        undoError = errString(e) || "unknown error";
-      }
-      // A failed undo leaves the still-broken build in place — restarting onto
-      // it would just repeat the failure, so skip that restart.
-      if (undoError === null && (await restart())) {
-        await refreshOverlay();
-        setShared({ kind: "rolled_back" });
-        return;
-      }
-      // had_active false: the revert WAS the undo, so don't revert twice.
-      let revertError: string | null = applied.had_active ? null : undoError;
-      if (applied.had_active) {
-        try {
-          await revertBrain();
-        } catch (e) {
-          revertError = errString(e) || "unknown error";
+        if (running?.commit !== applied.commit) {
+          setShared({ kind: "error", detail: NOT_LOADED });
+          return;
         }
+        // proven: a later failed start is no longer this update's fault (#335).
+        // A failed confirm only means the next healthy launch confirms it.
+        await confirmBrainUpdate(applied.commit).catch((e) =>
+          console.warn("[useBrainUpdate] confirm failed:", e),
+        );
+        setShared({ kind: "none", reason: "already_active" });
+        return;
       }
-      // The release brain is the floor — always try the restart, even after a
-      // failed revert, so a still-good overlay/release brain gets one more shot.
-      const ok = await restart();
+      // §6: the updated bridge is unhealthy → the shared undo chain (#335).
+      const r = await recoverUnhealthyBrain(
+        applied.had_active ? "rollback" : "revert",
+        "bridge unhealthy after a brain update",
+        restart,
+      );
       await refreshOverlay();
-      setShared(revertError !== null
+      setShared(r.error !== null
         ? {
             kind: "error",
-            detail: `Couldn't switch back to the release brain: ${revertError}. Try Restart, or restart Companion Emergence.`,
+            detail: `Couldn't switch back to the release brain: ${r.error}. Try Restart, or restart Companion Emergence.`,
           }
-        : ok ? { kind: "rolled_back" } : { kind: "error", detail: RESTART_FAILED });
+        : r.ok ? { kind: "rolled_back" } : { kind: "error", detail: RESTART_FAILED });
     } finally {
       shared.busy = false;
     }

@@ -330,12 +330,29 @@ export async function applyBrainUpdate(): Promise<BrainUpdateApplied> {
   return await invoke<BrainUpdateApplied>("apply_brain_update");
 }
 
-/** The updated bridge was unhealthy: previous overlay (or the release brain). */
-export async function rollbackBrain(reason: string): Promise<void> {
-  await invoke<void>("rollback_brain", { reason });
+/** The updated bridge was unhealthy: previous overlay (or the release brain).
+ *  Resolves the commit it landed on; null = the release brain (#335). */
+export async function rollbackBrain(reason: string): Promise<string | null> {
+  return await invoke<string | null>("rollback_brain", { reason });
 }
 
 /** "Use the release brain": clear the active overlay. The caller restarts the bridge. */
 export async function revertBrain(): Promise<void> {
   await invoke<void>("revert_brain");
+}
+
+/** The launch check (#335): the active overlay, whether it has proven itself, how to undo it. */
+export interface BrainOverlayStatus {
+  active_commit: string | null;
+  confirmed: boolean;
+  undo: "rollback" | "revert";
+}
+
+export async function brainOverlayStatus(): Promise<BrainOverlayStatus> {
+  return await invoke<BrainOverlayStatus>("brain_overlay_status");
+}
+
+/** The bridge came back healthy on `commit`: mark the overlay proven. */
+export async function confirmBrainUpdate(commit: string): Promise<void> {
+  await invoke<void>("confirm_brain_update", { commit });
 }

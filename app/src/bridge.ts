@@ -602,6 +602,8 @@ export interface BridgeHealth {
   liveness: string;
   version?: string;
   overlay?: BridgeOverlay | null;
+  /** #335: KINDLED_NO_OVERLAY is set on the bridge — any overlay is ignored on purpose. */
+  overlay_disabled?: boolean;
 }
 
 /** Lightweight /health probe used by the restart hook's poll loop and the
