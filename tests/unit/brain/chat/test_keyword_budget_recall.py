@@ -152,6 +152,19 @@ def make_world(
     )
 
 
+def mark_covered(key: str) -> None:
+    """Raise the series' largest-sample size without touching the fit (a test seam: replaces the
+    state's sums with `max_x` raised, under the series' own lock)."""
+    import dataclasses
+
+    series = keyword_budget._keyword_cost  # noqa: SLF001
+    with series._lock:  # noqa: SLF001
+        state = series._states[key]  # noqa: SLF001
+        series._states[key] = dataclasses.replace(  # noqa: SLF001
+            state, sums=dataclasses.replace(state.sums, max_x=10**6)
+        )
+
+
 def seed_fit(store: MemoryStore, overhead: float = OVH, rate: float = RATE, *, covered: bool = True) -> LinearFit:
     """Sizes 4 and 8: the OLS denominator is 16, so the fit is exactly (overhead, rate).
     `covered` (default): the series is taken to hold a sample at least as large as any
@@ -160,8 +173,7 @@ def seed_fit(store: MemoryStore, overhead: float = OVH, rate: float = RATE, *, c
     for x in (4, 8):
         keyword_budget._record(key, x, overhead + x * rate)  # noqa: SLF001
     if covered:
-        with keyword_budget._max_words_lock:  # noqa: SLF001
-            keyword_budget._max_words[key] = 10**6  # noqa: SLF001
+        mark_covered(key)
     fit = keyword_budget._keyword_cost.fit(key)  # noqa: SLF001
     assert (fit.overhead, fit.rate) == (overhead, rate)
     return fit

@@ -59,20 +59,6 @@ _clock: Callable[[], float] = time.perf_counter
 # per tier-2 search, x = words sent to the store, y = that call's seconds.
 _keyword_cost = cost_period.PeriodCostSeries("keyword extra words")
 
-# S139: the largest tier-2 sample (in words) recorded this period, per store key,
-# so the linear fit is never extrapolated beyond sizes it has measured. Reset at
-# the 24-hour tick with the series. Own lock; read once per step.
-_max_words_lock = threading.Lock()
-_max_words: dict[str, int] = {}
-
-
-def _start_new_max_period() -> None:
-    with _max_words_lock:
-        _max_words.clear()
-
-
-cost_period.on_new_period(_start_new_max_period)
-
 # S134: the first tier-2 sample of this process is discarded. One process-wide
 # flag under its own lock; the compaction tick does not re-arm it.
 _first_sample_lock = threading.Lock()
@@ -88,7 +74,6 @@ def _reset_keyword_cost() -> None:
     """Test-only: forget the series and re-arm the first-sample discard."""
     global _first_sample_spent
     _keyword_cost.clear()
-    _start_new_max_period()
     with _first_sample_lock:
         _first_sample_spent = False
 
@@ -173,10 +158,9 @@ def record_tier2(key: str, words: int, seconds: float) -> None:
 
 
 def _record(key: str, words: int, seconds: float) -> None:
-    """One sample into the series and the period's largest-sample size (S139)."""
+    """One sample into the series (its sums also keep the period's largest
+    sample size, `max_x`, which is S139's coverage)."""
     _keyword_cost.record(key, words, seconds)
-    with _max_words_lock:
-        _max_words[key] = max(_max_words.get(key, 0), words)
 
 
 @dataclass(frozen=True)
@@ -213,15 +197,13 @@ def choose_estimate(
     - No tier-2 sample yet (S131, S133, S140): the seed alone in a fresh
       process, the LOWER of the carried fit and the seed after a tick."""
     key = str(store.db_path)
-    state = _keyword_cost.state(key)
-    with _max_words_lock:
-        measured = _max_words.get(key, 0)
+    state = _keyword_cost.state(key)  # one snapshot: the sums and the largest sample size together
     from_seed = seed_fit(*seed) if seed is not None else None
     if state is not None and state.sums.n > 0:
         own = state.fit()
         if own is None:
             return None if from_seed is None else Estimate((from_seed,), True, "seed")
-        if measured >= extras or from_seed is None:
+        if state.sums.max_x >= extras or from_seed is None:
             return Estimate((own,), True, "series")
         return Estimate((own, from_seed), True, "series+seed")
     fits: list[cost_period.LinearFit] = []

@@ -620,3 +620,30 @@ def test_s140_tier_one_that_searched_nothing_seeds_with_its_own_time_as_a_one_wo
     # sized as one word per B/4: left = 3B/4 fits 3 extras
     calls = run_step(store, _words(40), started=0.0, seed=seed)
     assert [len(c) for c in calls] == [3]
+
+
+def test_a_combined_estimate_fits_exactly_the_predicate_on_its_combined_cost() -> None:
+    """Independent of the implementation: the largest n whose combined predicted cost fits `left`,
+    found by brute force, for both combination rules, including a zero rate and left == a predicted cost."""
+    fits = [
+        (LinearFit(0.0, B / 1024, 2), LinearFit(B / 4, B / 4096, 2)),
+        (LinearFit(B / 8, 0.0, 1), LinearFit(0.0, B / 512, 1)),
+        (LinearFit(B / 16, B / 2048, 2), LinearFit(B / 16, B / 2048, 2)),
+    ]
+    for pair in fits:
+        for larger in (True, False):
+            est = keyword_budget.Estimate(pair, larger, "t")
+            for left in (0.0, B / 64, B / 8, est.predict(37), est.predict(200), B / 2, B):
+                brute = max((n for n in range(0, 301) if n == 0 or est.predict(n) <= left), default=0)
+                assert est.words_that_fit(300, left) == brute, (pair, larger, left)
+
+
+def test_the_period_keeps_its_largest_sample_size_with_the_sums_and_resets_with_them() -> None:
+    sums = cost_period.LinearSums().plus(5, 0.1).plus(3, 0.1).plus(9, 0.2).plus(4, 0.1)
+    assert sums.max_x == 9, "the largest, not the last"
+    store = _store()
+    seed_series(store, (4, 0.25), (80, 1.0), (8, 0.5))
+    assert keyword_budget._keyword_cost.state(_key(store)).sums.max_x == 80  # noqa: SLF001
+    cost_period.start_new_period()
+    state = keyword_budget._keyword_cost.state(_key(store))  # noqa: SLF001
+    assert state.sums.max_x == 0 and state.sums.n == 0 and state.carried is not None

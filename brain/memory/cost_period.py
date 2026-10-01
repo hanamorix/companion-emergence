@@ -41,6 +41,9 @@ class LinearSums:
     sum_y: float = 0.0
     sum_xy: float = 0.0
     sum_xx: int = 0
+    # The largest x among this period's samples (name-recall fix S139: the
+    # range the fit has measured), atomic with the sums and reset with them.
+    max_x: int = 0
 
     def plus(self, x: int, y: float) -> LinearSums:
         return LinearSums(
@@ -49,6 +52,7 @@ class LinearSums:
             sum_y=self.sum_y + y,
             sum_xy=self.sum_xy + x * y,
             sum_xx=self.sum_xx + x * x,
+            max_x=max(self.max_x, x),
         )
 
     @property
