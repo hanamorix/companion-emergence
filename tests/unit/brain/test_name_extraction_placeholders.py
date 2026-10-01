@@ -2,15 +2,15 @@
 wording, byte-exact, and no placeholder is left (S107; criteria N18, N23-N25).
 
 This file held N2's PLACEHOLDER-marker test; the owner's wording now replaces
-every placeholder. The texts below are copied from
-``~/.claude/plans/name-recall-fix-wording.md`` sections 1, 4 and 7; the stage-8
+every placeholder (the last one, the `rerank_width_remeasure` label, is final: wording
+file section 8). The texts below are copied from
+``~/.claude/plans/name-recall-fix-wording.md`` sections 1, 4, 7 and 8; the stage-8
 harness additionally compares them with that file. The two consolidation prompts
 are pinned in ``tests/unit/brain/engines/test_names_increment_consolidation.py``.
 """
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 import pytest
@@ -95,13 +95,12 @@ def test_no_placeholder_left_in_the_consolidation_prompts():
     assert "placeholder" not in _consolidation_toml_section().lower()
 
 
-def test_app_job_descriptors_carry_the_two_labels_and_the_marked_placeholder():
+def test_app_job_descriptors_carry_the_three_final_labels_and_no_placeholder():
+    """Wording file section 4 (two labels) and section 8 (`rerank_width_remeasure`, final):
+    each label is present at its site, and no PLACEHOLDER marker is left in App.tsx."""
     lines = (_REPO / "app/src/App.tsx").read_text(encoding="utf-8").splitlines()
     stripped = [line.strip() for line in lines]
     assert 'cosine_floor_bootstrap: "similarity pass mark setup",' in stripped
     assert 'rerank_floor_bootstrap: "re-scoring pass mark setup",' in stripped
-    i = stripped.index('rerank_width_remeasure: "re-scoring cost check",')
-    assert "PLACEHOLDER" in stripped[i - 1]
-    # the only PLACEHOLDER in App.tsx is that marked comment
-    marked = [n for n, line in enumerate(lines) if re.search("placeholder", line, re.I) and "PLACEHOLDER wording" in line]
-    assert marked == [i - 1]
+    assert 'rerank_width_remeasure: "re-scoring cost check",' in stripped
+    assert [n for n, line in enumerate(lines) if "PLACEHOLDER" in line] == []

@@ -674,13 +674,13 @@ def test_c16d_only_the_compaction_job_calls_start_new_period() -> None:
 
 
 # ---------------------------------------------------------------------------
-# C15h: the NellFace label (placeholder).
+# C15h: the NellFace label (final: wording file section 8).
 # ---------------------------------------------------------------------------
 
 
-def test_c15h_job_descriptor_is_a_marked_placeholder_without_em_dash() -> None:
+def test_c15h_job_descriptor_is_the_final_label_without_a_placeholder_marker() -> None:
     lines = (_REPO / "app" / "src" / "App.tsx").read_text(encoding="utf-8").splitlines()
     i = next(n for n, line in enumerate(lines) if "rerank_width_remeasure:" in line)
     assert lines[i].strip() == 'rerank_width_remeasure: "re-scoring cost check",'
-    assert "PLACEHOLDER" in lines[i - 1]
-    assert "—" not in lines[i] and "—" not in lines[i - 1]
+    assert "—" not in lines[i]
+    assert all("PLACEHOLDER" not in line for line in lines)

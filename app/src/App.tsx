@@ -687,7 +687,6 @@ const JOB_DESCRIPTORS: Record<string, string> = {
   session_snapshot_prune: "conversation snapshot",
   emotion_backfill: "emotion tagging",
   embedding_backfill: "memory indexing",
-  // PLACEHOLDER wording (name-recall fix S100): the label is with the owner (I10).
   rerank_width_remeasure: "re-scoring cost check",
   cosine_floor_bootstrap: "similarity pass mark setup",
   rerank_floor_bootstrap: "re-scoring pass mark setup",
