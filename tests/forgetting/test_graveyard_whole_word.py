@@ -359,7 +359,7 @@ def test_recall_forgotten_wording_is_byte_exact():
     d = SCHEMAS["recall_forgotten"]
     assert d["description"] == (
         "Reach back into the graveyard for memories you used to have but no longer do. "
-        "Returns up to 5 most-recent hits whose summary or domain contains the query's words "
+        "Returns up to 5 most-recent hits whose summary contains the query's words "
         "(whole words, not parts of words). Use this when you want to honestly acknowledge "
         "knowing-something-once: 'I had something about that, but it's gone now.' Each hit "
         "carries the summary the memory had when it faded, the lived-age at the moment of loss, "

@@ -25,8 +25,7 @@ ADD_NAME_TOOL_DESCRIPTION = (
     "Add a name to your list of known names: a person, a pet, a place, or anything else "
     "with a proper name. When a known name comes up in conversation, even in passing, "
     "memories that mention it are found. If the name is also an everyday word (like "
-    "Will), it is only matched when written with a capital letter partway through a "
-    "sentence."
+    "Will), it is only matched when written with a capital letter."
 )
 
 ADD_NAME_PARAM_DESCRIPTION = (
@@ -528,7 +527,7 @@ SCHEMAS: dict[str, dict] = {
         "description": (
             "Reach back into the graveyard for memories you used to have "
             "but no longer do. Returns up to 5 most-recent hits whose "
-            "summary or domain contains the query's words (whole words, "
+            "summary contains the query's words (whole words, "
             "not parts of words). Use this when you want to honestly acknowledge "
             "knowing-something-once: 'I had something about that, but "
             "it's gone now.' Each hit carries the summary the memory "

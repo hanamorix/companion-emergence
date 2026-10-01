@@ -24,7 +24,7 @@ ADD_DESCRIPTION = (
     "Add a name to your list of known names: a person, a pet, a place, or anything else with a "
     "proper name. When a known name comes up in conversation, even in passing, memories that "
     "mention it are found. If the name is also an everyday word (like Will), it is only matched "
-    "when written with a capital letter partway through a sentence."
+    "when written with a capital letter."
 )
 ADD_PARAM = "The name, spelled the way you want it kept."
 REMOVE_DESCRIPTION = (
