@@ -9,7 +9,7 @@ import { renderHook, act, waitFor, cleanup } from "@testing-library/react";
 
 import * as bridge from "../bridge";
 import * as appConfig from "../appConfig";
-import { useRestartBridge } from "./useRestartBridge";
+import { _resetRestartBridgeForTests, useRestartBridge } from "./useRestartBridge";
 
 const PERSONA = "test-persona";
 
@@ -22,6 +22,7 @@ function jsonResponse(status: number, body: object = {}): Response {
 
 beforeEach(() => {
   vi.restoreAllMocks();
+  _resetRestartBridgeForTests();
 });
 
 afterEach(() => {
@@ -302,11 +303,11 @@ describe("useRestartBridge", () => {
     expect(result.current.state).toBe("failed");
   });
 
-  it("a second restart() while one is in flight resolves false immediately", async () => {
+  it("a second restart() while one is in flight joins it and resolves with its result", async () => {
     // Controllable deferred (see re-entry guard test above) so the first
     // restart's real 5s withTimeout timer never outlives this test.
     let releaseSnapshot!: () => void;
-    vi.spyOn(bridge, "snapshotActiveSession").mockImplementation(
+    const snapshotMock = vi.spyOn(bridge, "snapshotActiveSession").mockImplementation(
       () =>
         new Promise<Response>((resolve) => {
           releaseSnapshot = () => resolve(jsonResponse(200));
@@ -320,22 +321,80 @@ describe("useRestartBridge", () => {
       useRestartBridge(PERSONA, "bridge_down"),
     );
 
-    let firstRestart: Promise<boolean> = Promise.resolve(false);
+    let first: Promise<boolean> = Promise.resolve(false);
+    let second: Promise<boolean> = Promise.resolve(false);
     act(() => {
-      firstRestart = result.current.restart();
+      first = result.current.restart();
+      second = result.current.restart();
     });
 
-    let secondResolved: boolean | undefined;
-    await act(async () => {
-      secondResolved = await result.current.restart();
-    });
-
-    expect(secondResolved).toBe(false);
-
-    // Drain the first restart so no state update or timer outlives this test.
     await act(async () => {
       releaseSnapshot();
-      await firstRestart;
+      await first;
     });
+    expect(await second).toBe(true);
+    expect(snapshotMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("(#310) separate hook instances share one restart and one state", async () => {
+    let releaseSnapshot!: () => void;
+    const snapshotMock = vi.spyOn(bridge, "snapshotActiveSession").mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          releaseSnapshot = () => resolve(jsonResponse(200));
+        }),
+    );
+    vi.spyOn(bridge, "shutdownBridge").mockResolvedValue(jsonResponse(202));
+    vi.spyOn(appConfig, "ensureBridgeRunning").mockResolvedValue(undefined);
+    vi.spyOn(bridge, "fetchHealth").mockResolvedValue({ liveness: "ok" });
+
+    // e.g. useBrainUpdate's instance and the Restart button's instance
+    const a = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    const b = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+
+    let fromA: Promise<boolean> = Promise.resolve(false);
+    act(() => {
+      fromA = a.result.current.restart();
+    });
+    // B sees A's restart in progress (the button would render non-interactive)
+    await waitFor(() => expect(b.result.current.state).toBe("closing"));
+
+    let fromB: Promise<boolean> = Promise.resolve(false);
+    act(() => {
+      fromB = b.result.current.restart();
+    });
+    await act(async () => {
+      releaseSnapshot();
+      await fromA;
+    });
+
+    expect(await fromB).toBe(true);
+    expect(snapshotMock).toHaveBeenCalledTimes(1);
+    expect(b.result.current.state).toBe("reconnecting");
+  });
+
+  it("(#310) a shared success goes back to idle when the bridge drops again", async () => {
+    vi.spyOn(bridge, "snapshotActiveSession").mockResolvedValue(jsonResponse(200));
+    vi.spyOn(bridge, "shutdownBridge").mockResolvedValue(jsonResponse(202));
+    vi.spyOn(appConfig, "ensureBridgeRunning").mockResolvedValue(undefined);
+    vi.spyOn(bridge, "fetchHealth").mockResolvedValue({ liveness: "ok" });
+
+    const { result, rerender } = renderHook(
+      ({ mode }: { mode: "live" | "bridge_down" }) =>
+        useRestartBridge(PERSONA, mode),
+      { initialProps: { mode: "bridge_down" } },
+    );
+    await act(async () => {
+      await result.current.restart();
+    });
+    rerender({ mode: "live" });
+    await waitFor(() => expect(result.current.state).toBe("success"));
+
+    // A later outage: the banner's button (a fresh instance) must be clickable,
+    // not stuck on the last incident's "Restarted ✓".
+    rerender({ mode: "bridge_down" });
+    await waitFor(() => expect(result.current.state).toBe("idle"));
+    const fresh = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    expect(fresh.result.current.state).toBe("idle");
   });
 });
