@@ -290,16 +290,17 @@ def test_a_lowercase_modal_will_is_not_the_listed_name(tmp_path: Path) -> None:
     assert w1.will.id not in _ids(after)
 
 
-def test_a_message_that_is_only_a_stopword_name_at_its_start_is_not_a_name(tmp_path: Path) -> None:
-    # S104: the message start is a sentence start, so "will" and "Will" alone are
-    # not the name. ("Will" may still be a selector token of its own: the general
-    # search is not name protection.)
+def test_a_capitalized_stopword_name_is_a_name_at_the_message_start_too(tmp_path: Path) -> None:
+    # S151 (supersedes S104's sentence-start rule): "Will" is the name in any
+    # position, the message start included; a lower-case "will" never is.
     _, block = _twin(tmp_path, "listed-lower", "will", direct=["will"])
     assert block == ""
-    for message in ("will", "Will"):
-        assert names_in(tmp_path / "listed-lower", message) == [], message
-    w1, after = _twin(tmp_path, "listed-mid", "so Will", direct=["will"])
+    assert names_in(tmp_path / "listed-lower", "will") == []
+    assert names_in(tmp_path / "listed-lower", "Will") == ["will"]
+    w1, after = _twin(tmp_path, "listed-start", "Will", direct=["will"])
     assert _ids(after) == [w1.will.id]
+    w2, after = _twin(tmp_path, "listed-mid", "so Will", direct=["will"])
+    assert _ids(after) == [w2.will.id]
 
 
 def test_a_listed_multi_word_name_matches_only_consecutive_words_as_one_phrase(tmp_path: Path) -> None:
@@ -360,13 +361,14 @@ def _bury(persona: Path, content: str, mem_id: str) -> None:
 def test_a_listed_name_is_handed_to_the_graveyard_beside_the_capped_words(tmp_path: Path) -> None:
     """A listed name the selector drops ('will') is handed to `graveyard.search`
     as a NAME beside today's capped word string (S102, S119). A stopword-name
-    matches an entry only where capitalized and not at a sentence start (S121)."""
+    matches an entry only where capitalized, in any position (S121, S151)."""
     persona = tmp_path / "p"
     persona.mkdir()
     w = _world(persona)
     _list_names_direct(persona, "will")
     _bury(persona, "saw Will wave", "mem-lost-will")
-    _bury(persona, "Will you come", "mem-lost-modal")
+    _bury(persona, "Will you come", "mem-lost-start")
+    _bury(persona, "will you come", "mem-lost-modal")
     calls: list[tuple[str, list[str]]] = []
     real = gv.search
 
@@ -394,8 +396,9 @@ def test_a_listed_name_is_handed_to_the_graveyard_beside_the_capped_words(tmp_pa
     legacy = " ".join(_legacy_capped_tokens(_extract_recall_tokens("so Will zorblax quixotic", w.store)))
     assert calls == [(legacy, ["will"])], "today's capped words, and the name beside them"
     assert "lost (no longer in active memory)" in block and "saw Will wave" in block
-    assert "Will you come" not in block, "S121: a modal 'Will' at a sentence start is not the name"
-    assert touch.call_args.kwargs["touched_ids"] == ["mem-lost-will"]
+    assert "Will you come" in block, "S151: a capitalized 'Will' at a sentence start is the name"
+    assert "will you come" not in block, "a lower-case modal 'will' is not the name"
+    assert touch.call_args.kwargs["touched_ids"] == ["mem-lost-start", "mem-lost-will"]
     assert _ids(block)[0] == w.will.id, "the active memory is still found and leads"
 
 

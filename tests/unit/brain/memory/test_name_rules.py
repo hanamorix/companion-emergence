@@ -1,5 +1,5 @@
 """The one shared definition of the name and contraction rules
-(`brain.memory.name_rules`; name-recall fix S104, S121, S125, S126)."""
+(`brain.memory.name_rules`; name-recall fix S104, S125, S126, S151)."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from brain.memory.known_names import KnownNames, match_known_names
 from brain.memory.name_rules import (
     contraction_stems,
     followed_by_apostrophe_t,
-    is_sentence_start,
     is_stopword_name,
     stopword_name_occurrence_ok,
 )
@@ -54,34 +53,29 @@ def test_is_stopword_name():
     assert not is_stopword_name("new york")
 
 
+def test_the_sentence_start_rule_is_gone():
+    """S151 supersedes S104/S121: no position rule is left in the shared definition."""
+    assert not hasattr(name_rules, "is_sentence_start")
+    assert "is_sentence_start" not in name_rules.__all__
+
+
 @pytest.mark.parametrize(
-    ("text", "pos", "expected"),
+    ("text", "start", "end", "expected"),
     [
-        ("Will you", 0, True),
-        ("saw Will today", 4, False),
-        ("he left. Will you", 9, True),
-        ("really! Will you", 8, True),
-        ("really? Will you", 8, True),
-        ("first line\nWill you", 11, True),
-        ("first line \n  Will you", 14, True),
-        ("we said Will", 8, False),
-        ("Bob: Will you", 5, False),  # S104-literal: a speaker label is not a sentence end
-        ('"Will you?"', 1, False),
-        ("so... Will you", 6, True),  # the ellipsis IS a period run
-        ("so\u2026 Will you", 4, False),  # S104-literal: only . ! ? (a one-character ellipsis is not)
-        ("a; Will you", 3, False),
-        ("(Will you", 1, False),
+        ("saw Will today", 4, 8, True),  # mid-sentence
+        ("Will you", 0, 4, True),  # the text start (S151)
+        ("he left. Will you", 9, 13, True),  # after a period
+        ("really! Will you", 8, 12, True),
+        ("first line\nWill you", 11, 15, True),  # after a newline
+        ("Bob: Will you", 5, 9, True),
+        ("WILL you", 0, 4, True),  # a capital first letter
+        ("I will go", 2, 6, False),  # lower case
+        ("Will you? will you", 10, 14, False),  # lower case after a capitalized one
+        ("wILL", 0, 4, False),
     ],
 )
-def test_is_sentence_start(text, pos, expected):
-    assert is_sentence_start(text, pos) is expected
-
-
-def test_stopword_name_occurrence_ok():
-    ok = lambda t, s, e: stopword_name_occurrence_ok(t, [(s, e)])  # noqa: E731
-    assert ok("saw Will today", 4, 8)
-    assert not ok("Will you", 0, 4)
-    assert not ok("I will go", 2, 6)  # lowercase
+def test_stopword_name_occurrence_ok(text, start, end, expected):
+    assert stopword_name_occurrence_ok(text, [(start, end)]) is expected
     assert not stopword_name_occurrence_ok("saw Will", [])
 
 

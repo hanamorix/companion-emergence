@@ -10,9 +10,10 @@ increment's message-side rules all import the SAME functions and cannot drift
   matched by "don't".
 - S126: "contraction fragments" are the stem before n't, 'll, 're, 've, 'd or
   'm. The stem before 's is KEPT (it is also the possessive: "Don's boat").
-- S104/S121: a stopword-name (a listed name whose whole form is a recall
-  stopword, e.g. "Will") matches only where written capitalized and not at
-  the start of a sentence (text start, a newline before it, or after . ! ?).
+- S104/S151: a stopword-name (a listed name whose whole form is a recall
+  stopword, e.g. "Will") matches only where written capitalized, in any
+  position, the start of a sentence included ("Will you come" matches; "will"
+  never does). The message side and the memory side share this one rule.
 """
 
 from __future__ import annotations
@@ -27,7 +28,6 @@ __all__ = [
     "contraction_stems",
     "WORD_RE",
     "followed_by_apostrophe_t",
-    "is_sentence_start",
     "is_stopword_name",
     "stopword_name_occurrence_ok",
 ]
@@ -91,31 +91,16 @@ def contraction_stems(text: str) -> frozenset[str]:
 
 def is_stopword_name(name: str) -> bool:
     """True when the name's whole normalized form (lower-cased words, single
-    spaced) is a recall stopword: exactly the names S70 refuses to admit and
-    S104 lets the kindled add with the tool, flagged."""
+    spaced) is a recall stopword ("will"): a stopword-name (S104), which matches
+    only written capitalized (S151). Every recall stopword is one word, so a
+    multi-word name is never one."""
     return " ".join(w.lower() for w in WORD_RE.findall(name)) in RECALL_STOPWORDS
-
-
-def is_sentence_start(text: str, pos: int) -> bool:
-    """True when ``pos`` starts a sentence (S104): the start of the text, a
-    newline in the whitespace run before it, or the previous non-space
-    character is one of . ! ?"""
-    i = pos - 1
-    while i >= 0 and text[i].isspace():
-        if text[i] == "\n":
-            return True
-        i -= 1
-    if i < 0:
-        return True
-    return text[i] in ".!?"
 
 
 def stopword_name_occurrence_ok(text: str, spans: Sequence[tuple[int, int]]) -> bool:
     """A stopword-name occurrence (the ``(start, end)`` spans of its words in
-    ``text``) counts only if every word starts with an uppercase letter and the
-    first word is not at a sentence start (S104, S121)."""
+    ``text``) counts only if every word starts with an uppercase letter, in any
+    position, a sentence start included (S151)."""
     if not spans:
         return False
-    if any(not text[start : start + 1].isupper() for start, _ in spans):
-        return False
-    return not is_sentence_start(text, spans[0][0])
+    return all(text[start : start + 1].isupper() for start, _ in spans)

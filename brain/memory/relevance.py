@@ -292,8 +292,8 @@ def rank_name_hits(
     ``names`` come from :func:`names_in`; none means no query (``[]``).
 
     The hits are filtered with the shared name rules (names increment, S121,
-    S129): a hit whose only occurrences of the queried names break them (a
-    stopword-name written in lower case or at a sentence start, "Don" as the stem
+    S129, S151): a hit whose only occurrences of the queried names break them (a
+    stopword-name written in lower case, "Don" as the stem
     of "don't") is dropped, before the candidate pool is cut, so such rows cannot
     fill it (``known_names.name_hit_ok``: judged per name; a row matched only
     through FTS's diacritic folding is kept).

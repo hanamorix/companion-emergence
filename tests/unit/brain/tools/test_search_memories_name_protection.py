@@ -132,7 +132,7 @@ def test_lexical_a_listed_two_letter_name_leads(tmp_path: Path) -> None:
 
 def test_lexical_a_listed_stopword_name_leads(tmp_path: Path) -> None:
     ctx0, general0, _, _, will0 = _world(tmp_path / "empty")
-    # S104: the name is written capitalized mid-query ("so" is under the tool's
+    # S104/S151: the name is written capitalized mid-query ("so" is under the tool's
     # 3-character floor, so the general search is unchanged).
     ids0 = _ids(_lexical(ctx0, "so Will zorblax quixotic"))
     assert ids0[0] == general0.id and will0.id in ids0, "precondition: found as a plain word, but behind"
@@ -141,8 +141,10 @@ def test_lexical_a_listed_stopword_name_leads(tmp_path: Path) -> None:
     _list_direct(persona, "will")
     ids = _ids(_lexical(ctx, "so Will zorblax quixotic"))
     assert ids[:2] == [will.id, general.id]
-    # a query that STARTS with the name: a sentence start, no name (S104; owner FYI-3)
-    assert _ids(_lexical(ctx, "Will zorblax quixotic"))[0] == general.id
+    # a query that STARTS with the name is a name too (S151 supersedes S104's sentence-start rule)
+    assert _ids(_lexical(ctx, "Will zorblax quixotic"))[:2] == [will.id, general.id]
+    # a lower-case "will" never is
+    assert _ids(_lexical(ctx, "will zorblax quixotic"))[0] == general.id
 
 
 def test_lexical_a_multi_word_name_is_one_phrase(tmp_path: Path) -> None:

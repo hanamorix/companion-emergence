@@ -115,14 +115,13 @@ def test_listed_two_letter_name_survives_the_length_rule() -> None:
 
 
 def test_listed_stopword_survives_the_stopword_rule() -> None:
-    # Names increment (S104): a listed stopword-name survives the recall stopword
-    # rule, but only where written capitalized and not at a sentence start. The
-    # base pinned the interim state ("Will you come" and "she will come" matched);
-    # both are now the modal "will", not the name.
+    # Names increment (S104, S151): a listed stopword-name survives the recall stopword
+    # rule, but only where written capitalized (any position, a sentence start
+    # included). A lower-case "will" is the modal, not the name.
     assert "will" in RECALL_STOPWORDS
     known = kn.KnownNames.from_names(["will"])
     assert kn.match_known_names("we saw Will today", known) == ["will"]
-    assert kn.match_known_names("Will you come", known) == []
+    assert kn.match_known_names("Will you come", known) == ["will"]
     assert kn.match_known_names("she will come", known) == []
 
 

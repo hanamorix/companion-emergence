@@ -1,8 +1,8 @@
 """The recall token selector's stopword set.
 
-Lives here, below the chat layer, so the known-names admission filter
-(``brain.memory.known_names``, S70) can use it without importing
-``brain.chat``. ``brain.chat.prompt`` keeps ``_RECALL_STOPWORDS`` as an alias
+Lives here, below the chat layer, so the name rules
+(``brain.memory.name_rules.is_stopword_name``, S104/S151) can use it without
+importing ``brain.chat``. ``brain.chat.prompt`` keeps ``_RECALL_STOPWORDS`` as an alias
 of :data:`RECALL_STOPWORDS`, so the selector and its tests are unchanged.
 """
 

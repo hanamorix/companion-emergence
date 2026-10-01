@@ -170,18 +170,29 @@ def test_matcher_scales_with_the_message_not_the_list(shape: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "text", ["we saw Will today", "Hi, Will", "ask WILL", "Will you come? then Will went"]
+    "text",
+    [
+        "we saw Will today",
+        "Hi, Will",
+        "ask WILL",
+        "Will you come? then Will went",
+        # S151: a sentence start is a match too
+        "Will you come",
+        "ok. Will you",
+        "ok! Will",
+        "ok? Will",
+        "ok\nWill",
+        "ok \n  Will",
+    ],
 )
-def test_n3_a_stopword_name_matches_capitalized_mid_sentence(text: str) -> None:
+def test_n3_a_stopword_name_matches_capitalized_in_any_position(text: str) -> None:
     assert kn.match_known_names(text, _known("will")) == ["will"]
 
 
 @pytest.mark.parametrize(
-    "text",
-    ["Will you come", "ok. Will you", "ok! Will", "ok? Will", "ok\nWill", "ok \n  Will", "i will go",
-     "she will"],
+    "text", ["i will go", "she will", "will you come", "ok. will you", "ok\nwill", "wILL"]
 )
-def test_n3_a_stopword_name_never_matches_lower_case_or_at_a_sentence_start(text: str) -> None:
+def test_n3_a_stopword_name_never_matches_lower_case(text: str) -> None:
     assert kn.match_known_names(text, _known("will")) == []
 
 
@@ -190,7 +201,8 @@ def test_n3_an_ordinary_name_matches_anywhere_in_any_case(tmp_path: Path) -> Non
     assert kn.match_known_names("so pretzel ran", _known("pretzel")) == ["pretzel"]
     kn.confirm_readd(tmp_path, "Will")
     assert names_in(tmp_path, "we saw Will today") == ["will"]
-    assert names_in(tmp_path, "Will you come") == []
+    assert names_in(tmp_path, "Will you come") == ["will"]  # S151: the sentence start counts
+    assert names_in(tmp_path, "will you come") == []
 
 
 def test_n4_the_nt_skip_is_kept_for_single_word_names_only() -> None:
@@ -220,7 +232,7 @@ def test_n5_the_matcher_calls_the_shared_rules_through_its_namespace(monkeypatch
 
 def test_n5_no_private_copy_of_the_shared_rules() -> None:
     shared = {"is_stopword_name", "stopword_name_occurrence_ok", "followed_by_apostrophe_t",
-              "is_sentence_start", "contraction_stems"}
+              "contraction_stems"}
     for folder in ("brain/memory", "brain/engines", "brain/tools", "brain/chat"):
         for path in (_REPO / folder).rglob("*.py"):
             if path.name == "name_rules.py":
@@ -249,11 +261,12 @@ def _hit_contents(store: MemoryStore, names: list[str], limit: int = 20) -> list
     return [m.content for m, _ in rank_name_hits(store, None, names, limit=limit)]
 
 
-def test_n6_the_nt_stem_and_the_modal_will_are_filtered_out() -> None:
+def test_n6_the_nt_stem_and_the_lower_case_modal_will_are_filtered_out() -> None:
     store, _ = _store("don't wait up", "I don't know", "Don fixed the gate")
     assert _hit_contents(store, ["don"]) == ["Don fixed the gate"]
     store, _ = _store("Will you come", "I will go", "he left. Will you", "then Will waved")
-    assert _hit_contents(store, ["will"]) == ["then Will waved"]
+    # S151: a capitalized "Will" at a sentence start is kept; only the lower-case one is dropped.
+    assert sorted(_hit_contents(store, ["will"])) == ["Will you come", "he left. Will you", "then Will waved"]
 
 
 def test_n6_a_row_matched_only_through_diacritic_folding_is_kept() -> None:
@@ -269,7 +282,8 @@ def test_n6_a_row_matched_only_through_diacritic_folding_is_kept() -> None:
         ("don't wait", ["don", "al"], False),  # don INVALID, al ABSENT
         ("Al said don't", ["don", "al"], True),  # al VALID
         ("then Will waved", ["will"], True),  # VALID
-        ("Will you come", ["will"], False),  # INVALID
+        ("Will you come", ["will"], True),  # VALID (S151: a sentence start is a match)
+        ("I will go", ["will"], False),  # INVALID (lower case)
         ("a wrench on the bench", ["wren"], True),  # ABSENT (substring fallback)
         ("a wrench and I will", ["wren", "will"], False),  # will INVALID, wren ABSENT
     ],
@@ -331,7 +345,7 @@ def test_n7_bump_touches_only_the_returned_rows() -> None:
 def test_n8_the_recency_fallback_is_filtered_per_phrase(monkeypatch) -> None:
     monkeypatch.setattr(relevance, "RELEVANCE_RANKING_ENABLED", False)
     store, _ = _store("Will you come", "I will go", "he left. Will you", "then Will waved")
-    assert _hit_contents(store, ["will"]) == ["then Will waved"]
+    assert sorted(_hit_contents(store, ["will"])) == ["Will you come", "he left. Will you", "then Will waved"]
     store, _ = _store("a wrench on the bench")
     assert _hit_contents(store, ["wren"]) == ["a wrench on the bench"]
     store, _ = _store("then Will waved", *[f"I will go {i}" for i in range(8)])
@@ -542,7 +556,7 @@ def test_f1_ascii_text_skips_the_fold_and_keeps_the_verdict(monkeypatch) -> None
     calls: list[str] = []
     real = kn._fold_text
     monkeypatch.setattr(kn, "_fold_text", lambda t: calls.append(t) or real(t))
-    assert kn.name_hit_ok("Will you come", ["will", "pretzel"]) is False
+    assert kn.name_hit_ok("I will go", ["will", "pretzel"]) is False
     assert calls == []
     assert kn.name_hit_ok("Renée came and I will go home", ["will", "renee"]) is True
     assert calls == ["Renée came and I will go home"]

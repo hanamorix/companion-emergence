@@ -145,7 +145,7 @@ def _field_matches(
             # S125: a single-word name is not the stem of an n't contraction.
             if n == 1 and followed_by_apostrophe_t(text, spans[0][1]):
                 continue
-            # S121: a stopword-name only where capitalized, not at a sentence start.
+            # S151: a stopword-name only where capitalized (any position).
             if is_stopword_name(" ".join(name)) and not stopword_name_occurrence_ok(text, spans):
                 continue
             name_hit = True
@@ -168,7 +168,7 @@ def search(
     as a whole word, or any listed name in ``names`` occurs as a phrase of
     consecutive whole words, in its summary or in its domain (fields are tested
     separately). Names match at any length; a stopword-name only where
-    capitalized and not at a sentence start (S121) and a single-word name never
+    capitalized, in any position (S151), and a single-word name never
     as the stem of an n't contraction (S125). No words and no names: no hits.
     Order: name hits first, then the rest, each newest first
     (``forgotten_at_iso``), then ``limit`` (S119). Tolerates corrupt JSONL lines.

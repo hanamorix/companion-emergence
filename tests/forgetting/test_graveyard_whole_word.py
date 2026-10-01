@@ -184,28 +184,31 @@ def test_without_names_newest_first(tmp_path):
     assert _ids(search(tmp_path, "harbour")) == ["b", "a"]
 
 
-# G19 stopword-name entry side (S121)
+# G19 stopword-name entry side (S121, superseded by S151: capitalized in any position)
 @pytest.mark.parametrize(
     ("summary", "domain", "expected"),
     [
         ("saw Will today", "chat", True),
-        ("Will you come", "chat", False),
-        ("he left. Will you come", "chat", False),
-        ("really! Will you", "chat", False),
-        ("really? Will you", "chat", False),
-        ("first line\nWill you", "chat", False),
+        ("Will you come", "chat", True),  # S151: a sentence start counts
+        ("he left. Will you come", "chat", True),
+        ("really! Will you", "chat", True),
+        ("really? Will you", "chat", True),
+        ("first line\nWill you", "chat", True),
         ("I will go", "chat", False),
+        ("will you come", "chat", False),
+        ("ok. will you come", "chat", False),
         ("we said Will", "chat", True),
         ("Bob: Will you come", "chat", True),
         ('so he asked "Will you?"', "chat", True),
         ("nothing", "team Will", True),
-        ("nothing", "Will", False),
-        ("Hi, Will", "chat", True),  # a comma is not a sentence end (S104)
+        ("nothing", "Will", True),  # the domain is searched until S150 (the next commit)
+        ("Hi, Will", "chat", True),
         ("\u0130\u0130\u0130 saw Will", "chat", True),  # F12: spans on the original text
-        ("\u0130 was there. Will you", "chat", False),
+        ("\u0130 was there. Will you", "chat", True),
+        ("\u0130 was there. will you", "chat", False),
     ],
 )
-def test_a_stopword_name_matches_only_capitalized_mid_sentence(tmp_path, summary, domain, expected):
+def test_a_stopword_name_matches_only_capitalized_in_any_position(tmp_path, summary, domain, expected):
     _write(tmp_path, [("a", summary, domain)])
     assert bool(search(tmp_path, "", names=["will"])) is expected
 
@@ -266,7 +269,7 @@ def test_the_graveyard_follows_name_rules(monkeypatch, tmp_path):
     monkeypatch.setattr("brain.forgetting.graveyard.contraction_stems", lambda _t: frozenset())
     assert query_words("didn't know") == ["didn", "know"]
     # the stopword-name predicate is the shared one too (T2)
-    _write(tmp_path, [("b", "Will you come", "chat")])
+    _write(tmp_path, [("b", "will you come", "chat")])
     assert search(tmp_path, "", names=["will"]) == []
     monkeypatch.setattr("brain.forgetting.graveyard.is_stopword_name", lambda _n: False)
     assert _ids(search(tmp_path, "", names=["will"])) == ["b"]
@@ -356,10 +359,10 @@ def test_more_than_one_listed_name_is_searched(tmp_path):
 
 def test_only_real_name_hits_rank_first(tmp_path):
     # T5b: an entry holding the name only as a substring ("alone"), or a stopword-name
-    # the rule rejects ("Will you"), matches by a word but is NOT a name hit.
+    # the rule rejects ("will you", lower case), matches by a word but is NOT a name hit.
     _write(
         tmp_path,
         [("old-al", "Al waved at the harbour", "chat"), ("sub", "alone at the harbour", "chat"),
-         ("modal", "Will you come about the harbour", "chat")],
+         ("modal", "will you come about the harbour", "chat")],
     )
     assert _ids(search(tmp_path, "harbour", names=["al", "will"])) == ["old-al", "modal", "sub"]

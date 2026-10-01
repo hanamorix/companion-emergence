@@ -286,8 +286,8 @@ def normalize_name(name: str) -> str:
 
 def _single_occurrence_ok(text: str, span: tuple[int, int], stopword_name: bool) -> bool:
     """The occurrence rules for a single-word name (the shared ``name_rules``):
-    S125, never the stem of an n't contraction ("Don" in "don't"); S104/S121, a
-    stopword-name only written capitalized and not at a sentence start."""
+    S125, never the stem of an n't contraction ("Don" in "don't"); S104/S151, a
+    stopword-name only written capitalized (any position)."""
     if followed_by_apostrophe_t(text, span[1]):
         return False
     return not (stopword_name and not stopword_name_occurrence_ok(text, [span]))
@@ -306,10 +306,10 @@ def match_known_names(text: str, known: KnownNames, *, apply_rules: bool = True)
     not with the number of listed names.
 
     Occurrence rules (single-word names only; every recall stopword is one word):
-    S125, "Don" never matches "don't"; S104/S121, a stopword-name ("will") matches
-    only where written capitalized and not at a sentence start (message start, a
-    newline, or after . ! ?). ``apply_rules=False`` skips both and reports every
-    CANDIDATE occurrence (used by :func:`name_hit_ok`).
+    S125, "Don" never matches "don't"; S104/S151, a stopword-name ("will") matches
+    only where written capitalized, in any position (a sentence start included).
+    ``apply_rules=False`` skips both and reports every CANDIDATE occurrence (used by
+    :func:`name_hit_ok`).
     """
     if not text or not known.names:
         return []
