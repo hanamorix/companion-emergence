@@ -66,7 +66,7 @@ def consume_discard() -> None:
 def seed_series(store, *samples: tuple[int, float]) -> None:
     """Write samples straight into the series (bypasses the discard by design)."""
     for x, y in samples:
-        keyword_budget._keyword_cost.record(_key(store), x, y)  # noqa: SLF001
+        keyword_budget._record(_key(store), x, y)  # noqa: SLF001
 
 
 def two_size_fit(store, overhead: float, rate: float) -> None:
@@ -464,8 +464,8 @@ def test_timed_tier1_seed_counts_the_words_the_store_searches() -> None:
     tokens = ["alpha", "ab", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india"]
     _, seed = keyword_budget.timed_tier1(store, tokens, lambda: None)
     assert seed[0] == 9
-    _, none_seed = keyword_budget.timed_tier1(store, ["ab", "cd"], lambda: None)
-    assert none_seed is None, "tier 1 searched no word: no seed"
+    _, one_word_seed = keyword_budget.timed_tier1(store, ["ab", "cd"], lambda: None)
+    assert one_word_seed is not None and one_word_seed[0] == 1, "S140: tier 1 searched no word: its time is a one-word cost"
 
 
 # ---------------------------------------------------------------------------
@@ -537,3 +537,84 @@ def test_two_threads_finishing_a_first_search_together_discard_exactly_one(monke
         t.join()
     s = keyword_budget._keyword_cost.state("race2.db").sums  # noqa: SLF001
     assert s.n == 1, "one discarded, one recorded"
+
+
+# ---------------------------------------------------------------------------
+# S139: the linear fit is never extrapolated; S140: tier 1 searched nothing.
+# ---------------------------------------------------------------------------
+
+
+def _words(n: int) -> list[str]:
+    return WORDS[:n]
+
+
+def test_s139_an_uncovered_series_is_sized_by_the_larger_cost_of_the_fit_and_the_seed() -> None:
+    store = _store()
+    two_size_fit(store, 0.0, B / 2048)  # sizes 4 and 8 only: 9+ extras are uncovered
+    # seed dearer than the fit (rate B/1024): the seed bounds it: 1024 words fit, not the fit's 2048
+    assert [len(c) for c in run_step(store, _words(4096), seed=(8, 8 * B / 1024))] == [1024]
+    # seed cheaper than the fit: the fit is the larger cost: its 2048
+    assert [len(c) for c in run_step(store, _words(4096), seed=(8, 8 * B / 4096))] == [2048]
+
+
+def test_s139_a_series_that_has_measured_the_extras_size_is_sized_by_the_fit_alone() -> None:
+    store = _store()
+    two_size_fit(store, 0.0, B / 2048)  # largest sample: 8 words
+    dear_seed = (8, 16 * B)  # a word costs 2B: nothing fits under it
+    assert [len(c) for c in run_step(store, _words(8), seed=dear_seed)] == [8], "8 extras are covered: the dear seed is ignored"
+    assert run_step(store, _words(9), seed=dear_seed) == [], "9 extras are not covered: the dear seed fits none"
+
+
+def test_s139_without_a_seed_an_uncovered_series_has_only_its_fit() -> None:
+    store = _store()
+    two_size_fit(store, 0.0, B / 2048)
+    assert [len(c) for c in run_step(store, _words(4096), seed=None)] == [2048]
+
+
+def test_s139_coverage_is_the_largest_recorded_sample_not_the_discarded_first_one(clock: Clock) -> None:
+    store = _store()
+    run_step(store, _words(500), seed=(8, 0.0), cost=B / 64, clock=clock)  # the discarded first sample (500 words)
+    assert sums(store) is None
+    clock.t = 0.0
+    run_step(store, _words(20), seed=(8, 0.0), cost=B / 64, clock=clock)  # recorded: 20 words
+    est = keyword_budget.choose_estimate(store, 100, (8, 8 * B / 4096))
+    assert est.source == "series+seed", "100 extras exceed the 20-word sample (the discarded 500 does not count)"
+    assert keyword_budget.choose_estimate(store, 20, (8, 8 * B / 4096)).source == "series"
+
+
+def test_s139_coverage_resets_with_the_period_and_the_tick_window_keeps_s133() -> None:
+    store = _store()
+    two_size_fit(store, 0.0, B / 256)
+    keyword_budget._record(_key(store), 4096, 4096 * B / 256)  # noqa: SLF001  (a big sample this period)
+    assert keyword_budget.choose_estimate(store, 4000, None).source == "series"
+    cost_period.start_new_period()
+    est = keyword_budget.choose_estimate(store, 4000, (8, 8 * B / 512))
+    assert est.source == "carried/seed" and not est.larger, "S133 window after a tick: the lower cost"
+    keyword_budget._record(_key(store), 8, 8 * B / 256)  # noqa: SLF001
+    est = keyword_budget.choose_estimate(store, 4000, (8, 8 * B / 512))
+    assert est.source == "series+seed" and est.larger, "the big sample belonged to the old period: uncovered again"
+
+
+def test_estimate_prediction_and_fit_agree() -> None:
+    a, b = LinearFit(0.0, B / 1024, 2), LinearFit(B / 4, B / 4096, 2)
+    larger = keyword_budget.Estimate((a, b), True, "t")
+    lower = keyword_budget.Estimate((a, b), False, "t")
+    for n in (10, 1000, 3000):
+        assert larger.predict(n) == max(a.predict(n), b.predict(n))
+        assert lower.predict(n) == min(a.predict(n), b.predict(n))
+    left = B / 2
+    assert larger.words_that_fit(4096, left) == min(keyword_budget.words_that_fit(f, 4096, left) for f in (a, b))
+    assert lower.words_that_fit(4096, left) == max(keyword_budget.words_that_fit(f, 4096, left) for f in (a, b))
+
+
+def test_s140_tier_one_that_searched_nothing_seeds_with_its_own_time_as_a_one_word_cost(clock: Clock) -> None:
+    store = _store()
+
+    def tier1():
+        clock.advance(B / 4)
+
+    _, seed = keyword_budget.timed_tier1(store, ["ab", "cd"], tier1)
+    assert seed == (1, B / 4)
+    # sized as one word per B/4: left = 3B/4 fits 3 extras
+    calls = run_step(store, _words(40), started=0.0, seed=seed)
+    assert [len(c) for c in calls] == [3]

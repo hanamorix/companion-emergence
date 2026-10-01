@@ -152,11 +152,16 @@ def make_world(
     )
 
 
-def seed_fit(store: MemoryStore, overhead: float = OVH, rate: float = RATE) -> LinearFit:
-    """Sizes 4 and 8: the OLS denominator is 16, so the fit is exactly (overhead, rate)."""
+def seed_fit(store: MemoryStore, overhead: float = OVH, rate: float = RATE, *, covered: bool = True) -> LinearFit:
+    """Sizes 4 and 8: the OLS denominator is 16, so the fit is exactly (overhead, rate).
+    `covered` (default): the series is taken to hold a sample at least as large as any
+    extras the test sends, so the S101 line sizes the step alone (S139 has its own tests)."""
     key = str(store.db_path)
     for x in (4, 8):
-        keyword_budget._keyword_cost.record(key, x, overhead + x * rate)  # noqa: SLF001
+        keyword_budget._record(key, x, overhead + x * rate)  # noqa: SLF001
+    if covered:
+        with keyword_budget._max_words_lock:  # noqa: SLF001
+            keyword_budget._max_words[key] = 10**6  # noqa: SLF001
     fit = keyword_budget._keyword_cost.fit(key)  # noqa: SLF001
     assert (fit.overhead, fit.rate) == (overhead, rate)
     return fit
@@ -471,28 +476,58 @@ def test_residue_tier_one_raised_and_no_estimate_means_no_extras(
     assert len(tier2(calls)) == 1
 
 
-def test_residue_a_message_whose_tier_one_words_are_all_under_the_floor_has_no_seed(
+def test_s140_a_message_whose_tier_one_words_are_all_under_the_floor_is_seeded_by_tier_ones_own_time(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clock: Clock
 ) -> None:
-    """"AI ML": the store's floor leaves tier 1 with no word, so no seed exists. In a fresh
-    process with no estimate the two words are not searched; once the series has an
-    estimate they are. (Owner FYI: S131 says a fresh process always has a seed; this is
-    the one message shape where it does not.)"""
+    """Twelve 2-letter acronyms: the store's 3-character floor leaves tier 1 with no word, so
+    tier 1's own measured time is the seed, taken as a one-word cost (S140): the message is
+    still bounded and still gets extras, in a fresh process with no estimate."""
     persona = tmp_path / "p"
-    persona.mkdir(parents=True, exist_ok=True)
+    persona.mkdir()
     persist_felt_time(FeltTimeState(lived_age_hours=48.0), persona)
     store = MemoryStore(":memory:")
-    target = _mem(store, "AI ML notes from the harbour course")
-    calls = wire(monkeypatch, clock, t_sem=0.0, t1=0.0)
+    acronyms = [f"A{c}" for c in "ABCDEFGHIJKL"]
+    target = _mem(store, " ".join(acronyms) + " notes from the harbour course")
+    t1 = B / 4
+    calls = wire(monkeypatch, clock, t_sem=0.0, t1=t1)
+    block = _build_recall_block(store, " ".join(acronyms), persona_dir=persona)
+    t2 = tier2(calls)
+    assert len(t2) == 1 and len(t2[0][1]) == 3, "left = 3B/4 at a one-word cost of B/4: three extras"
+    assert t2[0][1] == _keyword_tiers(*(lambda tk: (tk, _legacy_capped_tokens(tk)))(_extract_recall_tokens(" ".join(acronyms), store)))[1][:3]
+    assert target.id in block
 
-    def go() -> str:
-        return _build_recall_block(store, "AI ML", persona_dir=persona)
 
-    block = go()
-    assert tier2(calls) == [] and target.id not in block
-    seed_fit(store)
-    block = go()
-    assert len(tier2(calls)) == 1 and target.id in block
+def test_s140_tier_one_raised_and_no_estimate_still_means_no_extras(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clock: Clock
+) -> None:
+    w = make_world(tmp_path, n=40)
+    calls = wire(monkeypatch, clock, t_sem=0.0, t1=0.0, t_name=0.0)
+    import brain.forgetting.recall as recall
+
+    def boom(*_a, **_k):
+        raise RuntimeError("tier 1 failed")
+
+    monkeypatch.setattr(recall, "search_with_loss", boom)
+    render(w)
+    assert tier2(calls) == [], "no seed, no fit: never unbounded"
+
+
+def test_s139_an_uncovered_series_is_bounded_by_the_seed_in_the_real_block(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clock: Clock
+) -> None:
+    n_fit_target = 80
+    left = OVH + (n_fit_target + 0.5) * RATE
+    t1 = 40 * RATE  # seed rate 4 x RATE (ten tier-1 words)
+    for covered, want in ((False, 21), (True, n_fit_target)):
+        keyword_budget._reset_keyword_cost()  # noqa: SLF001
+        ck = Clock()
+        monkeypatch.setattr(keyword_budget, "_clock", ck)
+        w = make_world(tmp_path / f"c{covered}", n=40)
+        seed_fit(w.store, covered=covered)
+        calls = wire(monkeypatch, ck, t_sem=t_sem_for(left, t1=t1), t1=t1)
+        render(w)
+        t2 = tier2(calls)
+        assert len(t2) == 1 and t2[0][1] == w.words[:want], (covered, len(t2[0][1]) if t2 else None)
 
 
 # ---------------------------------------------------------------------------

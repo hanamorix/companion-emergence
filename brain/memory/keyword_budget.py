@@ -21,8 +21,15 @@ discarded (S134), as the rerank and embed series discard their first call.
 Until the period has a tier-2 sample the estimate comes from this message's own
 tier-1 search (the "seed", S131: tier 1 always runs first, so tier 2 never runs
 unbounded): alone in a fresh process, the lower of it and the carried fit after
-a tick (S133). The seed is per message and is never stored. With no estimate at
-all (tier 1 raised or searched no word) no extra word is searched.
+a tick (S133). When tier 1 searched no word (every word under the store's
+3-character floor) its own measured time is the seed, as a one-word cost
+(S140). The seed is per message and is never stored. With no estimate at all
+(tier 1 raised) no extra word is searched.
+
+The linear fit is never extrapolated (S139): the real cost is superlinear in
+the word count, so until the series holds a tier-2 sample of at least as many
+words as the current extras, the budget is sized from the LARGER predicted cost
+of the series fit and the seed (the seed over-cuts, never overruns).
 
 The search tool is not affected (S99): its keyword side never comes here.
 """
@@ -33,6 +40,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 
 from brain import tunables
 from brain.memory import cost_period
@@ -51,6 +59,20 @@ _clock: Callable[[], float] = time.perf_counter
 # per tier-2 search, x = words sent to the store, y = that call's seconds.
 _keyword_cost = cost_period.PeriodCostSeries("keyword extra words")
 
+# S139: the largest tier-2 sample (in words) recorded this period, per store key,
+# so the linear fit is never extrapolated beyond sizes it has measured. Reset at
+# the 24-hour tick with the series. Own lock; read once per step.
+_max_words_lock = threading.Lock()
+_max_words: dict[str, int] = {}
+
+
+def _start_new_max_period() -> None:
+    with _max_words_lock:
+        _max_words.clear()
+
+
+cost_period.on_new_period(_start_new_max_period)
+
 # S134: the first tier-2 sample of this process is discarded. One process-wide
 # flag under its own lock; the compaction tick does not re-arm it.
 _first_sample_lock = threading.Lock()
@@ -66,6 +88,7 @@ def _reset_keyword_cost() -> None:
     """Test-only: forget the series and re-arm the first-sample discard."""
     global _first_sample_spent
     _keyword_cost.clear()
+    _start_new_max_period()
     with _first_sample_lock:
         _first_sample_spent = False
 
@@ -112,15 +135,18 @@ def timed[T](call: Callable[[], T]) -> tuple[T, float]:
 
 def timed_tier1[T](
     store: MemoryStore, legacy_tokens: Sequence[str], call: Callable[[], T]
-) -> tuple[T, tuple[int, float] | None]:
+) -> tuple[T, tuple[int, float]]:
     """Run tier 1's own search and return `(its result, the seed)`. The seed is
     `(x1, seconds)`: `x1` = the words the store actually searches in tier 1
-    (its 3-character floor applied), `seconds` = the whole call (S131: this
-    message's own tier-1 search). `None` when tier 1 searched no word. An
-    exception from `call` propagates; nothing is recorded, tier 1 is unchanged."""
+    (its 3-character floor applied; 1 when it searched none, S140: a one-word
+    cost), `seconds` = the whole call (S131: this message's own tier-1 search).
+    An exception from `call` propagates (no seed); nothing is recorded, tier 1
+    is unchanged."""
     x1 = len(split_by_raw_query_floor(list(legacy_tokens))[0])
     result, seconds = timed(call)
-    return result, ((x1, seconds) if x1 > 0 else None)
+    # S140: tier 1 searched nothing (every word under the floor): its own
+    # measured time is the seed, taken as a one-word cost.
+    return result, (max(x1, 1), seconds)
 
 
 def seed_fit(words: int, seconds: float) -> cost_period.LinearFit | None:
@@ -143,7 +169,67 @@ def record_tier2(key: str, words: int, seconds: float) -> None:
                 _flag_hook()
             _first_sample_spent = True
             return
+    _record(key, words, seconds)
+
+
+def _record(key: str, words: int, seconds: float) -> None:
+    """One sample into the series and the period's largest-sample size (S139)."""
     _keyword_cost.record(key, words, seconds)
+    with _max_words_lock:
+        _max_words[key] = max(_max_words.get(key, 0), words)
+
+
+@dataclass(frozen=True)
+class Estimate:
+    """The cost estimate a step is sized from: one or two linear fits and how
+    they combine. `larger` (S139): the larger predicted cost, so a prefix fits
+    only if it fits under every fit; otherwise (S133) the lower, so it fits if
+    it fits under any."""
+
+    fits: tuple[cost_period.LinearFit, ...]
+    larger: bool
+    source: str
+
+    def predict(self, words: int) -> float:
+        costs = [f.predict(words) for f in self.fits]
+        return max(costs) if self.larger else min(costs)
+
+    def words_that_fit(self, count: int, left: float) -> int:
+        fitting = [words_that_fit(f, count, left) for f in self.fits]
+        return min(fitting) if self.larger else max(fitting)
+
+
+def choose_estimate(
+    store: MemoryStore, extras: int, seed: tuple[int, float] | None
+) -> Estimate | None:
+    """The estimate for a message with `extras` extra words (None: nothing to
+    size from, S131: no extras). Reads the series state and the period's
+    largest sample once each.
+
+    - The period has a tier-2 sample: the series fit (own, or the carried fit
+      rescaled, S101, S114), alone when a sample of at least `extras` words
+      exists; until then (S139) the LARGER cost of it and the seed, since the
+      linear fit is not extrapolated.
+    - No tier-2 sample yet (S131, S133, S140): the seed alone in a fresh
+      process, the LOWER of the carried fit and the seed after a tick."""
+    key = str(store.db_path)
+    state = _keyword_cost.state(key)
+    with _max_words_lock:
+        measured = _max_words.get(key, 0)
+    from_seed = seed_fit(*seed) if seed is not None else None
+    if state is not None and state.sums.n > 0:
+        own = state.fit()
+        if own is None:
+            return None if from_seed is None else Estimate((from_seed,), True, "seed")
+        if measured >= extras or from_seed is None:
+            return Estimate((own,), True, "series")
+        return Estimate((own, from_seed), True, "series+seed")
+    fits: list[cost_period.LinearFit] = []
+    if state is not None and state.carried is not None:
+        fits.append(state.carried)
+    if from_seed is not None:
+        fits.append(from_seed)
+    return Estimate(tuple(fits), False, "carried/seed") if fits else None
 
 
 def search_extra_words(
@@ -164,36 +250,20 @@ def search_extra_words(
     left = recall_budget_seconds() - (now() - started)
     if left <= 0:
         return []
-    key = str(store.db_path)
-    state = _keyword_cost.state(key)  # read once: sizing and sample share it
-    candidates: list[cost_period.LinearFit] = []
-    if state is not None and state.sums.n > 0:
-        own = state.fit()
-        if own is not None:
-            candidates.append(own)
-        source = "series"
-    else:
-        # No tier-2 sample in this period yet (S131, S133): the carried fit
-        # (after a tick) and this message's tier-1 seed; the lower cost wins.
-        if state is not None and state.carried is not None:
-            candidates.append(state.carried)
-        from_seed = seed_fit(*seed) if seed is not None else None
-        if from_seed is not None:
-            candidates.append(from_seed)
-        source = "carried/seed"
-    if not candidates:
+    estimate = choose_estimate(store, len(words), seed)
+    if estimate is None:
         return []
-    n = max(words_that_fit(c, len(words), left) for c in candidates)
+    n = estimate.words_that_fit(len(words), left)
     if n < len(words):
         log.debug(
             "keyword budget: searching %d of %d extra words (left %.3fs, estimate from %s)",
             n,
             len(words),
             left,
-            source,
+            estimate.source,
         )
     if n <= 0:
         return []
     found, seconds = timed(lambda: search(words[:n]))
-    record_tier2(key, n, seconds)
+    record_tier2(str(store.db_path), n, seconds)
     return found
