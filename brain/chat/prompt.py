@@ -1473,10 +1473,13 @@ def _build_recall_block(
             names,
         )
     )
-    fading_hits = lead_with_names(
-        name_fading,
-        _order_keyword_tiers(fading_hits, [m for m in tier2_fading if m.id not in seen_active]),
-        names,
+    # The fading hits follow the same order (S16): the family after every genuine hit.
+    fading_hits = genuine_first_memories(
+        lead_with_names(
+            name_fading,
+            _order_keyword_tiers(fading_hits, [m for m in tier2_fading if m.id not in seen_active]),
+            names,
+        )
     )
 
     # The "active:" section: semantic results first, keyword hits in the slots

@@ -40,8 +40,10 @@ from brain.memory.store import FtsPhrases, Memory, MemoryStore, _to_fts_match
 # --------------------------------------------------------------------------
 
 
-def _mem(store: MemoryStore, content: str, *, importance: float = 5.0) -> Memory:
-    m = Memory.create_new(content=content, memory_type="conversation", domain="us", importance=importance)
+def _mem(
+    store: MemoryStore, content: str, *, importance: float = 5.0, memory_type: str = "conversation"
+) -> Memory:
+    m = Memory.create_new(content=content, memory_type=memory_type, domain="us", importance=importance)
     store.create(m)
     return m
 
@@ -203,6 +205,67 @@ def test_the_name_query_hits_lead_in_the_softened_section_too(tmp_path: Path) ->
     after = _softened(build("listed", True))
     assert after[0].startswith("Pretzel faded"), "the name's fading hit leads the softened section"
     assert len(after) == len(before) == 2
+
+
+# S16 on the fading keyword hits: the monologue family follows every genuine hit, as in the
+# active section (name-recall fix, small batch).
+
+
+def _fading_block(tmp_path: Path, name: str, items: list[tuple[str, str, float]], message: str, *names: str) -> list[str]:
+    persona = tmp_path / name
+    persona.mkdir()
+    persist_felt_time(FeltTimeState(lived_age_hours=48.0), persona)
+    store = MemoryStore(":memory:")
+    for text, memory_type, importance in items:
+        _fade(store, _mem(store, text, importance=importance, memory_type=memory_type))
+    if names:
+        _list_names(persona, *names)
+    return _softened(_render(SimpleNamespace(store=store), message, persona))
+
+
+def test_a_fading_monologue_family_hit_follows_a_fading_genuine_hit(tmp_path: Path) -> None:
+    out = _fading_block(
+        tmp_path,
+        "p",
+        [
+            ("quokka harbour monologue long since faded away", "monologue", 9.9),
+            ("quokka harbour afternoon long since faded away", "conversation", 1.0),
+        ],
+        "quokka harbour",
+    )
+    assert len(out) == 2
+    assert out[0].startswith("quokka harbour afte") and out[1].startswith("quokka harbour mono")
+
+
+def test_the_fading_family_goes_after_every_genuine_hit_keeping_each_groups_order(tmp_path: Path) -> None:
+    items = [
+        ("quokka harbour F1 faded away", "monologue", 9.9),
+        ("quokka harbour G1 faded away", "conversation", 5.0),
+        ("quokka harbour F2 faded away", "monologue_trace", 9.0),
+        ("quokka harbour G2 faded away", "conversation", 3.0),
+    ]
+    out = _fading_block(tmp_path, "p", items, "quokka harbour")
+    assert [o.split()[2] for o in out] == ["G1", "G2", "F1", "F2"]
+
+
+def test_an_all_genuine_fading_list_keeps_its_order(tmp_path: Path) -> None:
+    items = [
+        ("quokka harbour GA faded away", "conversation", 9.0),
+        ("quokka harbour GB faded away", "conversation", 2.0),
+        ("quokka harbour GC faded away", "episodic", 5.0),
+    ]
+    out = _fading_block(tmp_path, "p", items, "quokka harbour")
+    assert [o.split()[2] for o in out] == ["GA", "GC", "GB"], "importance order, unchanged by the partition"
+
+
+def test_a_fading_family_name_hit_still_follows_the_genuine_hits_and_the_name_leads_among_genuine(tmp_path: Path) -> None:
+    items = [
+        ("Pretzel monologue drifted through the old summer", "monologue", 9.9),
+        ("a faded zorblax quixotic tale of a ledger", "conversation", 9.0),
+        ("Pretzel faded into the old summer", "conversation", 1.0),
+    ]
+    out = _fading_block(tmp_path, "p", items, "pretzel zorblax quixotic", "Pretzel")
+    assert [o[:12] for o in out] == ["Pretzel fade", "a faded zorb", "Pretzel mono"]
 
 
 def test_name_hits_follow_the_semantic_results_and_lead_the_keyword_hits(tmp_path: Path) -> None:
