@@ -251,6 +251,29 @@ def test_mark_in_use_does_nothing_for_the_release_brain(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.parametrize("layout", [
+    ("abc123def456-0123abcd", "brain", "__init__.py"),  # a real overlay import
+    ("stray.py",),  # a file straight in the root: no folder to name
+])
+def test_loaded_overlay_and_mark_in_use_agree_on_the_folder(tmp_path, monkeypatch, layout):
+    """#315: /health.overlay and the prune markers resolve the running folder through
+    one helper, so they name the same folder (or none) for every layout."""
+    import brain
+
+    monkeypatch.setenv("KINDLED_HOME", str(tmp_path / "home"))
+    root = overlay.overlay_root()
+    target = root.joinpath(*layout)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("", encoding="utf-8")
+    monkeypatch.setattr(brain, "__file__", str(target))
+
+    loaded = overlay.loaded_overlay()
+    overlay.mark_in_use()
+    marked = [m.parent.parent.name for m in root.glob(f"*/{overlay.IN_USE_DIR}/{os.getpid()}")]
+    assert (loaded["dir"] if loaded else None) == (marked[0] if marked else None)
+    assert len(marked) <= 1
+
+
 def test_replace_retries_a_transient_permission_error(tmp_path, monkeypatch):
     """#302: Windows AV (or another interpreter's hook reading current.json) can hold
     the file briefly; a short bounded retry rides it out."""
