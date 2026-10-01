@@ -47,6 +47,8 @@ _SENSITIVE_KEYS = {
     "memory_id",
     "session_id",
     "work_id",
+    # #273: a visited URL is as identifying as a search query.
+    "url",
 }
 
 
@@ -104,6 +106,7 @@ def log_invocation(
     outcome: str | None = None,
     monologue_text: str | None = None,
     stored_image_path: str | None = None,
+    origin: str | None = None,
 ) -> None:
     """Append one invocation record to <persona_dir>/tool_invocations.log.jsonl.
 
@@ -136,6 +139,12 @@ def log_invocation(
         privacy-mode branch, and NOT redacted. It is emitted in ``full`` /
         ``redacted`` / ``metadata`` modes; only ``off`` (which skips all logging)
         drops it. NEVER contains base64 / image bytes.
+    origin:
+        ``None`` for a brain-tools call made through this MCP server. The bridge
+        passes ``"cli_builtin"`` for a Claude CLI built-in (WebSearch, WebFetch,
+        ToolSearch, ...) it saw in the stream (#273). Metadata, written in every
+        mode but ``off``; ``_read_audit_lines_since`` skips such rows so they
+        stay audit-only.
     """
     mode = _audit_mode(persona_dir)
     if mode == "off":
@@ -147,6 +156,14 @@ def log_invocation(
     elif mode == "metadata":
         safe_arguments = _OMITTED
         safe_summary = ""
+    elif origin is not None:
+        # A CLI built-in's schema is an open set the key denylist was never
+        # sized for (TaskCreate.description, SendMessage.to, ...): keep the
+        # keys so the trace shows what kind of call it was, hide every value.
+        safe_arguments = (
+            {str(k): _REDACTED for k in arguments} if isinstance(arguments, dict) else _REDACTED
+        )
+        safe_summary = _redact_summary(result_summary)
     else:
         safe_arguments = _redact_value(arguments)
         safe_summary = _redact_summary(result_summary)
@@ -172,6 +189,8 @@ def log_invocation(
     # can bind to the image by its content hash. Never base64.
     if stored_image_path:
         record["stored_image_path"] = stored_image_path
+    if origin is not None:
+        record["origin"] = origin
     request_id = os.environ.get("NELL_MCP_AUDIT_REQUEST_ID")
     if request_id:
         record["request_id"] = request_id

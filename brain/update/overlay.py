@@ -58,20 +58,28 @@ def current_bundle_id() -> str | None:
     return text.strip() or None
 
 
-def loaded_overlay() -> dict | None:
-    """The overlay THIS interpreter loaded `brain` from — read from that folder's
-    stamp, not current.json, because an install swapped in after start is not what
-    is running. None when `brain` comes from the bundle (or a checkout)."""
+def _loaded_folder(root: Path) -> str | None:
+    """The overlay folder under `root` this interpreter imported `brain` from; None
+    for the release brain or a checkout. /health.overlay and the prune markers both
+    resolve it here, so they can't disagree on which folder is running (#315)."""
     import brain
 
-    root = overlay_root().resolve()
     try:
         rel = Path(brain.__file__).resolve().relative_to(root)
     except ValueError:
         return None
-    if not rel.parts:
-        return None  # brain resolved to the root itself: no overlay folder to name
-    folder = rel.parts[0]
+    # An overlay import is <folder>/brain/__init__.py; fewer parts is no folder.
+    return rel.parts[0] if len(rel.parts) >= 2 else None
+
+
+def loaded_overlay() -> dict | None:
+    """The overlay THIS interpreter loaded `brain` from — read from that folder's
+    stamp, not current.json, because an install swapped in after start is not what
+    is running. None when `brain` comes from the bundle (or a checkout)."""
+    root = overlay_root().resolve()
+    folder = _loaded_folder(root)
+    if folder is None:
+        return None
     try:
         stamp = json.loads((root / folder / "stamp.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -115,16 +123,11 @@ def mark_in_use(root: Path | None = None) -> None:
     """Record that THIS process runs `brain` from an overlay folder, so prune leaves
     the folder alone while the process lives (#302). No-op on the release brain.
     Called once at bridge start; prune ignores a dead process's marker."""
-    import brain
-
     root = (root or overlay_root()).resolve()
-    try:
-        rel = Path(brain.__file__).resolve().relative_to(root)
-    except ValueError:
+    folder = _loaded_folder(root)
+    if folder is None:
         return
-    if len(rel.parts) < 2:
-        return
-    marks = root / rel.parts[0] / IN_USE_DIR
+    marks = root / folder / IN_USE_DIR
     marks.mkdir(exist_ok=True)
     (marks / str(os.getpid())).write_text("", encoding="utf-8")
 

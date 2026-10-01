@@ -1252,6 +1252,9 @@ class ClaudeCliProvider(LLMProvider):
             tool_in_flight = False
             tool_name: str | None = None
             frames_seen = 0
+            # #273: the CLI's built-in tool calls (WebSearch, WebFetch, ...),
+            # keyed by tool_use id, written to the audit log once the stream ends.
+            builtin_calls: dict[str, dict[str, Any]] = {}
 
             try:
                 while True:
@@ -1309,6 +1312,7 @@ class ClaudeCliProvider(LLMProvider):
                     elif t == "assistant":
                         # Snapshot frame — fallback content when result frame absent.
                         msg_content = obj.get("message", {}).get("content", [])
+                        _collect_builtin_calls(msg_content, builtin_calls)
                         if isinstance(msg_content, list):
                             for blk in msg_content:
                                 if isinstance(blk, dict) and blk.get("type") == "tool_use":
@@ -1321,6 +1325,8 @@ class ClaudeCliProvider(LLMProvider):
                                 if isinstance(blk, dict) and blk.get("type") == "text"
                             ]
                             assistant_snapshot = "".join(parts)
+                    elif t == "user":
+                        _collect_builtin_results(obj, builtin_calls)
                     elif t == "result":
                         result_text = str(obj.get("result", ""))
                         metadata: dict[str, Any] = {
@@ -1393,6 +1399,11 @@ class ClaudeCliProvider(LLMProvider):
                 raise
             finally:
                 reader.join(timeout=5)
+                # One flush for every exit: on success the proxy exhausts this
+                # generator before it reads the audit log; on a StreamError it
+                # raises out of its for-loop and CPython closes the generator
+                # while the exception unwinds, so the rows are on disk first.
+                _flush_builtin_audit(persona_dir, builtin_calls)
 
     def _chat_with_mcp_tools(
         self,
@@ -1573,6 +1584,105 @@ class ClaudeCliProvider(LLMProvider):
                     pass
 
 
+_CLI_BUILTIN_ORIGIN = "cli_builtin"
+_BRAIN_TOOLS_PREFIX = "mcp__brain-tools__"
+
+
+def _collect_builtin_calls(content: Any, calls: dict[str, dict[str, Any]]) -> None:
+    """Record each CLI built-in `tool_use` block (#273).
+
+    A brain-tools call (`mcp__brain-tools__*`) is skipped: the MCP child logs
+    it. Anything else ran inside the `claude` subprocess and is invisible to
+    the MCP child: WebSearch, WebFetch, ToolSearch and whatever other built-in
+    the CLI exposes (owner ruling: every built-in, no allowlist). With
+    --strict-mcp-config only brain-tools is loaded, so a non-brain MCP tool
+    here would also be labelled a built-in. The first block for an id wins.
+    """
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        tool_id, name = block.get("id"), block.get("name")
+        if not isinstance(tool_id, str) or not isinstance(name, str) or not name:
+            continue
+        if name.startswith(_BRAIN_TOOLS_PREFIX) or tool_id in calls:
+            continue
+        tool_input = block.get("input")
+        calls[tool_id] = {
+            "name": name,
+            "arguments": tool_input if isinstance(tool_input, dict) else {},
+            "result": "",
+            "is_error": False,
+            "answered": False,
+        }
+
+
+def _collect_builtin_results(frame: dict[str, Any], calls: dict[str, dict[str, Any]]) -> None:
+    """Attach a `user` frame's `tool_result` blocks to their recorded calls."""
+    message = frame.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        tool_use_id = block.get("tool_use_id")
+        call = calls.get(tool_use_id) if isinstance(tool_use_id, str) else None
+        if call is None:
+            continue
+        call["result"] = _tool_result_text(block.get("content"))
+        call["is_error"] = bool(block.get("is_error"))
+        call["answered"] = True
+
+
+def _tool_result_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            b["text"]
+            if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)
+            else json.dumps(b, default=str, ensure_ascii=False)
+            for b in content
+        )
+    return json.dumps(content, default=str, ensure_ascii=False)
+
+
+def _flush_builtin_audit(persona_dir: Path | None, calls: dict[str, dict[str, Any]]) -> None:
+    """Write the turn's built-in calls to the audit log, marked `cli_builtin`.
+
+    Runs once, after the stream. By then this turn's MCP child has written its
+    own rows (it logs before returning each result), so the two writers don't
+    interleave on the success path. Rows are stamped at flush time and follow
+    the turn's MCP rows. Observability only: never raises.
+    """
+    if persona_dir is None or not calls:
+        return
+    try:
+        from brain.mcp_server import audit
+
+        for call in calls.values():
+            if not call["answered"]:
+                outcome, error = "error", "no result before the stream ended"
+            elif call["is_error"]:
+                outcome, error = "error", "tool reported an error"
+            else:
+                outcome, error = "ok", None
+            audit.log_invocation(
+                persona_dir,
+                name=call["name"],
+                arguments=call["arguments"],
+                # JSON so redacted mode can hide it: a search result starts with the query.
+                result_summary=json.dumps({"result": call["result"]}, ensure_ascii=False),
+                error=error,
+                outcome=outcome,
+                origin=_CLI_BUILTIN_ORIGIN,
+            )
+    except Exception as exc:  # noqa: BLE001 — audit must never break a turn
+        logger.warning("built-in tool audit write failed: %s", exc)
+
+
 def _read_audit_lines_since(
     audit_log_path: Path,
     offset: int,
@@ -1632,6 +1742,10 @@ def _read_audit_lines_since(
             entry = json.loads(line)
         except json.JSONDecodeError:
             malformed += 1
+            continue
+        if entry.get("origin") == _CLI_BUILTIN_ORIGIN:
+            # #273: audit-only. The CLI already ran these; they are not the
+            # turn's tool invocations.
             continue
         if request_id is not None:
             entry_request_id = entry.get("request_id")
