@@ -53,7 +53,7 @@ Verified on `main` @ 7365c0a9:
   deliberately left, which a rollback would bring back. This is the same distinction
   `useBrainUpdate.apply` makes today from `had_active`, recorded where the launch path can
   read it. A missing `undo` reads as `"revert"`, the floor.
-- `install.install_overlay` activates with `{**entry, "confirmed": False, "undo": ...}`.
+- `install.apply_update` activates with `{**entry, "confirmed": False, "undo": ...}`.
   Every activation by install is unconfirmed, including the instant reuse of an existing
   folder. The stamp (`stamp.json`) carries neither field: they are state, not build identity.
 - `overlay.confirm(root, commit)`: under the lock, set `active["confirmed"] = True` only when
@@ -74,7 +74,8 @@ Both run on the release brain through `run_nell`'s `floor()`, so they work while
 brain is broken.
 
 - `brain_overlay_status() -> { active_commit: Option<String>, confirmed: bool, undo: String }`:
-  wraps `nell update --status`. Reuses `active_commit_from_status` (bundle check included);
+  wraps `nell update --status` with a 5 s timeout, the same cap as the app's launch check
+  (a slow process never outlives the launch). Reuses `active_commit_from_status` (bundle check included);
   `confirmed` is the entry's flag, `true` when missing or when there is no active overlay;
   `undo` is the entry's field, `"revert"` when missing.
 - `confirm_brain_update(commit: String)`: runs `nell update --confirm <commit>`.
@@ -89,7 +90,7 @@ brain is broken.
   Launch code runs before `Ready` mounts, so it can't use the hook. `clearRestartState()`
   returns the shared state to idle (unless a restart is running) after a restart the launch
   made, so the Restart button never shows "Restarted ✓" for a restart nobody pressed.
-- **`brainRecovery.ts` (new):** `recoverUnhealthyBrain(persona, undo, reason)`, the rollback
+- **`brainRecovery.ts` (new):** `recoverUnhealthyBrain(undo, reason, restart)`, the rollback
   chain moved out of `useBrainUpdate.apply`: `undo` (rollback or revert), restart, then
   revert and restart again if still unhealthy (skipping the second revert when `undo` was
   already a revert). It returns `{ ok, error, outcome }`, where `outcome` is

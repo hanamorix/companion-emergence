@@ -245,6 +245,9 @@ const SIG_MAX: usize = 4 * 1024;
 const WHEEL_MAX: usize = 64 * 1024 * 1024;
 const REQUIREMENTS_MAX: usize = 1024 * 1024;
 const STATUS_TIMEOUT_S: u64 = 30;
+// the launch check (#335): the app stops waiting at 5 s (brainRecovery.ts STATUS_TIMEOUT_MS),
+// so the nell process stops then too instead of outliving the launch
+const LAUNCH_STATUS_TIMEOUT_S: u64 = 5;
 const INSTALL_TIMEOUT_S: u64 = 900; // pip may fetch a changed wheel or two
 const FLIP_TIMEOUT_S: u64 = 60;
 
@@ -522,7 +525,7 @@ pub(crate) async fn brain_overlay_status(app: tauri::AppHandle) -> Result<BrainO
     if crate::bundled_nell_path(&app)?.is_none() {
         return Ok(overlay_status_from(""));
     }
-    let status = run_nell(&app, &["update", "--status"], STATUS_TIMEOUT_S).await?;
+    let status = run_nell(&app, &["update", "--status"], LAUNCH_STATUS_TIMEOUT_S).await?;
     Ok(overlay_status_from(&status))
 }
 
@@ -683,6 +686,15 @@ mod tests {
         assert!(!status_supported(none));
         assert_eq!(active_commit_from_status(none), None);
         assert!(!status_supported("garbage"));
+    }
+
+    #[test]
+    fn the_launch_status_check_gives_up_with_the_app() {
+        // app/src/brainRecovery.ts STATUS_TIMEOUT_MS = 5000: past that the app treats the
+        // status as "no overlay", so the nell process must not outlive it (#338 review)
+        assert_eq!(LAUNCH_STATUS_TIMEOUT_S, 5);
+        let js = include_str!("../../src/brainRecovery.ts");
+        assert!(js.contains("STATUS_TIMEOUT_MS = 5000"), "keep the Rust and JS caps in step");
     }
 
     #[test]
