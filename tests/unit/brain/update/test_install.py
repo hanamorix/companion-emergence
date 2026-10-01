@@ -199,6 +199,27 @@ def test_reapplying_the_same_commit_reuses_the_folder(tmp_path):
     assert marker.exists() and overlay.read_state(root)["active"]["commit"] == "a" * 40
 
 
+def test_reapplying_the_active_commit_keeps_its_confirmation(tmp_path):
+    """#335: `nell update` of the commit already active reuses its folder; a build that
+    has proven itself stays proven (and keeps its undo), so an unrelated later start
+    failure can't auto-roll it back."""
+    finds = tmp_path / "finds"
+    finds.mkdir()
+    brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
+    req = tmp_path / "requirements.txt"
+    req.write_text("", encoding="utf-8")
+    site = _fake_bundle(tmp_path, {})
+    root = tmp_path / "brain-overlay"
+    kw = {"wheel": brain_whl, "requirements": req, "commit": "a" * 40, "site_dir": site, "root": root,
+          "pip_extra": ["--no-index", "--find-links", str(finds)]}
+    first = install.apply_update(**kw)
+    overlay.confirm(root, first["commit"])
+    again = install.apply_update(**kw)
+    assert again["dir"] == first["dir"]
+    assert again["confirmed"] is True and again["undo"] == first["undo"]
+    assert overlay.read_state(root)["active"] == again
+
+
 def test_failed_swap_keeps_the_active_overlay(tmp_path, monkeypatch):
     finds = tmp_path / "finds"
     finds.mkdir()

@@ -1380,6 +1380,9 @@ def build_app(
             "overlay": None if running is None else {
                 "commit": running["commit"], "brain_version": running["brain_version"],
                 "bundle_match": running["bundle_match"]},
+            # #335: the user's escape hatch is on, so any overlay is ignored on purpose;
+            # the app must not restart this bridge to "finish" an update every launch.
+            "overlay_disabled": bool(os.environ.get("KINDLED_NO_OVERLAY")),
         }
 
     @app.post(

@@ -227,6 +227,9 @@ def apply_update(*, wheel: Path, requirements: Path, commit: str, site_dir: Path
         # the stamp (written above from `entry`) stays build identity only; current.json
         # also records that this build is unproven and how to undo it (#335)
         active = {**entry, "confirmed": False, "undo": undo}
+        if was and was.get("dir") == entry["dir"]:
+            # re-applying the active build (CLI): a build that proved itself stays proven
+            active = {**entry, "confirmed": was.get("confirmed", True), "undo": was.get("undo", "revert")}
         overlay.activate(root, active)
         overlay.prune(root)
     return active
