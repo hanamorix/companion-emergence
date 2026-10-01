@@ -623,7 +623,7 @@ def test_s140_tier_one_that_searched_nothing_seeds_with_its_own_time_as_a_one_wo
 
 
 def test_a_combined_estimate_fits_exactly_the_predicate_on_its_combined_cost() -> None:
-    """Independent of the implementation: the largest n whose combined predicted cost fits `left`,
+    """Independent of `words_that_fit` (the oracle is `est.predict`, whose min/max rule the source-selection tests pin): the largest n whose combined predicted cost fits `left`,
     found by brute force, for both combination rules, including a zero rate and left == a predicted cost."""
     fits = [
         (LinearFit(0.0, B / 1024, 2), LinearFit(B / 4, B / 4096, 2)),
