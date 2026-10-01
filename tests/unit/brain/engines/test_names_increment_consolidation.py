@@ -262,6 +262,10 @@ def test_n20_known_names_are_the_listed_names_in_the_memory_as_display_forms(per
         assert kn.confirm_readd(tmp, name) == "added"
     mem = store.create(_mem("Will you come on tuesday? Wren asked."))
     provider = _reappraise(store, tmp, store.get(mem, bump=False), _reply())
+    # S151: a capitalized "Will" at a sentence start is the listed name.
+    assert provider.calls[0][0].startswith('KNOWN NAMES: ["Will", "Tuesday", "Wren"]\n')
+    mem1 = store.create(_mem("will you come on tuesday? Wren asked."))
+    provider = _reappraise(store, tmp, store.get(mem1, bump=False), _reply())
     assert provider.calls[0][0].startswith('KNOWN NAMES: ["Tuesday", "Wren"]\n')
     mem2 = store.create(_mem("then Will came"))
     provider = _reappraise(store, tmp, store.get(mem2, bump=False), _reply())
