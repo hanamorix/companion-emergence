@@ -82,6 +82,7 @@ or clustering (Stage 5, unaffected).
 
 from __future__ import annotations
 
+import ast
 import logging
 import re
 import threading
@@ -1496,14 +1497,66 @@ def result_group(path: str, monologue_family: bool) -> str:
     return COSINE_FAMILY if monologue_family else COSINE_GENUINE
 
 
+def _group_order_problem(order: Sequence[object]) -> tuple[int | None, str] | None:
+    """The first thing wrong with a result-group list, as ``(index, why)`` (``index``
+    is the 0-based position of the bad entry, None for a group the list lacks), or
+    None when the list names each of the six groups exactly once."""
+    seen: set[str] = set()
+    for index, entry in enumerate(order):
+        if not isinstance(entry, str):
+            return index, f"entry {index + 1} of {len(order)} is {entry!r}, not a group name"
+        if entry not in RESULT_GROUPS:
+            return index, f"entry {index + 1} of {len(order)}, {entry!r}, is not a result group"
+        if entry in seen:
+            return index, f"entry {index + 1} of {len(order)}, {entry!r}, is listed twice"
+        seen.add(entry)
+    missing = sorted(RESULT_GROUPS - seen)
+    if missing:
+        return None, f"the list does not name {', '.join(repr(m) for m in missing)}"
+    return None
+
+
+def _dev_constants_location(index: int | None, path: str | Path | None = None) -> tuple[str, int | None]:
+    """``(file, line)`` of the ``RECALL_RESULT_GROUP_ORDER`` entry at ``index`` in the
+    source file of ``dev_constants`` (or of ``path``, a test seam): the line of that
+    element of the literal tuple, else the line of the assignment (a missing group has
+    no element). The line is None when the file cannot be read or parsed. Run only
+    when a list is already known to be bad."""
+    where = str(path if path is not None else getattr(dev_constants, "__file__", None) or "brain/dev_constants.py")
+    try:
+        tree = ast.parse(Path(where).read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, ValueError):
+        return where, None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = [t for t in node.targets if isinstance(t, ast.Name)]
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            targets = [node.target]
+        else:
+            continue
+        if not any(t.id == "RECALL_RESULT_GROUP_ORDER" for t in targets) or node.value is None:
+            continue
+        value = node.value
+        if index is not None and isinstance(value, (ast.Tuple, ast.List)) and index < len(value.elts):
+            return where, value.elts[index].lineno
+        return where, node.lineno
+    return where, None
+
+
 def result_group_order() -> tuple[str, ...]:
     """`dev_constants.RECALL_RESULT_GROUP_ORDER`, read now (S98), checked to
-    name each of the six groups exactly once (`ValueError` otherwise)."""
+    name each of the six groups exactly once. A mis-edited list raises
+    `ValueError` whose text names the bad entry, the file and the line number
+    (S143)."""
     order = tuple(dev_constants.RECALL_RESULT_GROUP_ORDER)
-    if len(order) != len(RESULT_GROUPS) or set(order) != RESULT_GROUPS:
+    problem = _group_order_problem(order)
+    if problem is not None:
+        index, why = problem
+        where, line = _dev_constants_location(index)
+        place = f"{where}:{line}" if line is not None else f"{where} (line unknown)"
         raise ValueError(
-            f"dev_constants.RECALL_RESULT_GROUP_ORDER must name each of {sorted(RESULT_GROUPS)} "
-            f"exactly once, got {order!r}"
+            f"{place}: RECALL_RESULT_GROUP_ORDER is mis-edited: {why}. "
+            f"It must name each of {sorted(RESULT_GROUPS)} exactly once."
         )
     return order
 
