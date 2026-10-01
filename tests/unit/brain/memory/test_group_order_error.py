@@ -69,6 +69,32 @@ def test_the_line_is_the_bad_elements_line_in_a_multi_line_file(tmp_path: Path, 
     assert first - 1 != first  # the assignment line differs from every element line
 
 
+def test_a_plain_assignment_and_a_list_literal_are_located_too(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text('"""h"""\n\nRECALL_RESULT_GROUP_ORDER = [\n    "x",\n    "y",\n]\n', encoding="utf-8")
+    assert sr._dev_constants_location(1, tmp_path / "a.py") == (str(tmp_path / "a.py"), 5)  # noqa: SLF001
+
+
+def test_a_source_that_is_not_a_literal_of_the_runtime_length_gives_the_assignments_line(tmp_path: Path) -> None:
+    """The element is only trusted when the source is a literal sequence of the runtime length,
+    with no starred element: otherwise the effective list is not the one written there."""
+    call = tmp_path / "call.py"
+    call.write_text("X = 1\nRECALL_RESULT_GROUP_ORDER = tuple(\n    ['a', 'b', 'c']\n)\n", encoding="utf-8")
+    assert sr._dev_constants_location(1, call, length=3)[1] == 2  # noqa: SLF001
+    star = tmp_path / "star.py"
+    star.write_text("RECALL_RESULT_GROUP_ORDER = (\n    'a',\n    *OTHER,\n    'b',\n)\n", encoding="utf-8")
+    assert sr._dev_constants_location(2, star, length=3)[1] == 1  # noqa: SLF001
+    short = tmp_path / "short.py"
+    short.write_text("RECALL_RESULT_GROUP_ORDER = (\n    'a',\n    'b',\n)\n", encoding="utf-8")
+    assert sr._dev_constants_location(1, short, length=3)[1] == 1  # noqa: SLF001  (runtime list longer than the source)
+    assert sr._dev_constants_location(1, short, length=2)[1] == 3  # noqa: SLF001  (same length: the element's line)
+
+
+def test_a_non_string_entry_is_named_whatever_it_is() -> None:
+    for bad in (7, None, ["reranked_genuine"], {"a": 1}):
+        index, why = sr._group_order_problem(_GOOD[:2] + [bad] + _GOOD[3:])  # noqa: SLF001
+        assert index == 2 and "not a group name" in why and f"{bad!r}" in why
+
+
 def test_a_missing_group_has_the_assignments_line(tmp_path: Path) -> None:
     first = _write_constants(tmp_path / "dc.py", _GOOD[:5], pad=4)
     _where, line = sr._dev_constants_location(None, tmp_path / "dc.py")  # noqa: SLF001
@@ -97,6 +123,23 @@ def test_the_error_carries_entry_file_and_line_through_the_real_function(
     text = str(exc.value)
     assert f"{tmp_path / 'dc.py'}:{first + 4}:" in text
     assert "'cosine_famly'" in text and "entry 5 of 6" in text
+
+
+def test_the_glue_passes_the_runtime_length_so_a_source_of_another_length_gives_the_assignments_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = list(_GOOD)
+    runtime[3] = "keyword_genuin"
+    src = tmp_path / "dc.py"
+    src.write_text(
+        '"""h"""\nRECALL_RESULT_GROUP_ORDER = (\n    "reranked_genuine",\n    "x1",\n    "x2",\n    "x3",\n    "keyword_family",\n)\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(dev_constants, "__file__", str(src))
+    monkeypatch.setattr(dev_constants, "RECALL_RESULT_GROUP_ORDER", tuple(runtime))
+    with pytest.raises(ValueError) as exc:
+        sr.result_group_order()
+    assert f"{src}:2:" in str(exc.value) and "'keyword_genuin'" in str(exc.value)
 
 
 def test_the_error_says_the_line_is_unknown_when_the_source_is_unreadable(

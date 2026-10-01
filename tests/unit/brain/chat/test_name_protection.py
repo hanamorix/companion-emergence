@@ -258,6 +258,19 @@ def test_an_all_genuine_fading_list_keeps_its_order(tmp_path: Path) -> None:
     assert [o.split()[2] for o in out] == ["GA", "GC", "GB"], "importance order, unchanged by the partition"
 
 
+def test_the_render_limit_cuts_the_fading_family_before_any_genuine_hit(tmp_path: Path) -> None:
+    persona = tmp_path / "p"
+    persona.mkdir()
+    persist_felt_time(FeltTimeState(lived_age_hours=48.0), persona)
+    store = MemoryStore(":memory:")
+    for i in range(3):
+        _fade(store, _mem(store, f"quokka harbour family {i} faded away", importance=9.5, memory_type="monologue"))
+    for i in range(3):
+        _fade(store, _mem(store, f"quokka harbour genuine {i} faded away", importance=1.0 + i))
+    out = _softened(_render(SimpleNamespace(store=store), "quokka harbour", persona, limit=3))
+    assert len(out) == 3 and all(o.startswith("quokka harbour genu") for o in out)
+
+
 def test_a_fading_family_name_hit_still_follows_the_genuine_hits_and_the_name_leads_among_genuine(tmp_path: Path) -> None:
     items = [
         ("Pretzel monologue drifted through the old summer", "monologue", 9.9),
@@ -335,7 +348,7 @@ def test_a_listed_two_letter_name_leads(tmp_path: Path) -> None:
 
 
 def test_a_listed_name_that_is_also_a_stopword_survives_the_stopword_rule(tmp_path: Path) -> None:
-    # S104: written capitalized, not at a sentence start.
+    # S104/S151: written capitalized (any position).
     # (A capitalized mid-sentence "Will" is also a selector token, so the general
     # search finds the memory too; the name query makes it LEAD.)
     message = "so Will zorblax quixotic"

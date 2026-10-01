@@ -255,10 +255,9 @@ def names_in(persona_dir: Path | str | None, text: str) -> list[str]:
     protection for this call, never a failed recall.
 
     This is the single place where "which of her words count as a name" is
-    decided for both passive recall and the search tool. A policy for a name
-    that is also a stopword (an open question with the owner: a person called
-    "Will" cannot be listed while the admission rule rejects stopword strings)
-    belongs here, not in the two call sites.
+    decided for both passive recall and the search tool. A name that is also a
+    stopword ("Will") is listed like any other (S104, S144) and matches only
+    written capitalized (S151, ``name_rules``).
     """
     if persona_dir is None or not text:
         return []

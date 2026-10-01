@@ -1516,12 +1516,15 @@ def _group_order_problem(order: Sequence[object]) -> tuple[int | None, str] | No
     return None
 
 
-def _dev_constants_location(index: int | None, path: str | Path | None = None) -> tuple[str, int | None]:
+def _dev_constants_location(
+    index: int | None, path: str | Path | None = None, length: int | None = None
+) -> tuple[str, int | None]:
     """``(file, line)`` of the ``RECALL_RESULT_GROUP_ORDER`` entry at ``index`` in the
     source file of ``dev_constants`` (or of ``path``, a test seam): the line of that
-    element of the literal tuple, else the line of the assignment (a missing group has
-    no element). The line is None when the file cannot be read or parsed. Run only
-    when a list is already known to be bad."""
+    element when the source is a literal tuple/list with no starred element and (when
+    ``length`` is given) as many elements as the runtime list; else the line of the
+    assignment (also for a missing group, which has no element). The line is None when
+    the file cannot be read or parsed. Run only when a list is already known to be bad."""
     where = str(path if path is not None else getattr(dev_constants, "__file__", None) or "brain/dev_constants.py")
     try:
         tree = ast.parse(Path(where).read_text(encoding="utf-8"))
@@ -1537,7 +1540,13 @@ def _dev_constants_location(index: int | None, path: str | Path | None = None) -
         if not any(t.id == "RECALL_RESULT_GROUP_ORDER" for t in targets) or node.value is None:
             continue
         value = node.value
-        if index is not None and isinstance(value, (ast.Tuple, ast.List)) and index < len(value.elts):
+        if (
+            index is not None
+            and isinstance(value, (ast.Tuple, ast.List))
+            and not any(isinstance(e, ast.Starred) for e in value.elts)
+            and (length if length is not None else len(value.elts)) == len(value.elts)
+            and index < len(value.elts)
+        ):
             return where, value.elts[index].lineno
         return where, node.lineno
     return where, None
@@ -1552,7 +1561,7 @@ def result_group_order() -> tuple[str, ...]:
     problem = _group_order_problem(order)
     if problem is not None:
         index, why = problem
-        where, line = _dev_constants_location(index)
+        where, line = _dev_constants_location(index, length=len(order))
         place = f"{where}:{line}" if line is not None else f"{where} (line unknown)"
         raise ValueError(
             f"{place}: RECALL_RESULT_GROUP_ORDER is mis-edited: {why}. "

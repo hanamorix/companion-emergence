@@ -1735,8 +1735,8 @@ _RECALL_TOKEN_MIN_LEN = 3
 # those two outputs do not widen (S71; the graveyard also gets the listed names, S102).
 _RECALL_TOKEN_LIMIT = 10
 
-# The stopword set lives in brain.memory.recall_stopwords (moved there so the
-# known-names admission filter can use it without importing the chat layer, S70).
+# The stopword set lives in brain.memory.recall_stopwords (moved there so the name
+# rules, ``brain.memory.name_rules``, can use it without importing the chat layer).
 # Alias kept: the selector below and its tests read it under this name.
 _RECALL_STOPWORDS: frozenset[str] = RECALL_STOPWORDS
 
