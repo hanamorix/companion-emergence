@@ -6,7 +6,7 @@
 //   4. no selection, ≥2 personas → picker shown
 
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
 
 // ── Heavy Tauri / Tauri-window deps ──────────────────────────────────────────
@@ -28,6 +28,11 @@ const {
   ensureBridgeRunning,
   setAlwaysOnTop,
   brainLoginStatus,
+  brainOverlayStatus,
+  revertBrain,
+  rollbackBrain,
+  confirmBrainUpdate,
+  nellbrainHomePath,
 } = vi.hoisted(() => ({
   readAppConfig: vi.fn(),
   writeAppConfig: vi.fn(async () => undefined),
@@ -37,6 +42,11 @@ const {
   // Default authorized:true so these boot-routing tests never see the
   // brain-login banner — that's covered separately in App.brainLogin.test.tsx.
   brainLoginStatus: vi.fn(async () => ({ authorized: true })),
+  brainOverlayStatus: vi.fn(async () => ({ active_commit: null as string | null, confirmed: true, undo: "revert" })),
+  revertBrain: vi.fn(async () => undefined),
+  rollbackBrain: vi.fn(async (_reason: string) => undefined),
+  confirmBrainUpdate: vi.fn(async (_commit: string) => undefined),
+  nellbrainHomePath: vi.fn(async (): Promise<string | null> => null),
 }));
 
 vi.mock("./appConfig", () => ({
@@ -46,6 +56,11 @@ vi.mock("./appConfig", () => ({
   ensureBridgeRunning,
   setAlwaysOnTop,
   brainLoginStatus,
+  brainOverlayStatus,
+  revertBrain,
+  rollbackBrain,
+  confirmBrainUpdate,
+  nellbrainHomePath,
 }));
 
 // ── bridge ────────────────────────────────────────────────────────────────────
@@ -116,6 +131,7 @@ vi.mock("./bridgeVersionCheck", () => ({
 
 // ── Import App after all mocks are in place ───────────────────────────────────
 import App from "./App";
+import { NOTICE_ROLLED_BACK } from "./brainRecovery";
 
 function baseConfig(selected_persona: string | null = null) {
   return { selected_persona, always_on_top: false, reduced_motion: false };
@@ -384,5 +400,59 @@ describe("App presence column (glass redesign)", () => {
 
     await waitFor(() => expect(screen.getByText(/Nell/)).toBeInTheDocument());
     expect(screen.queryByText("Current background tasks:")).not.toBeInTheDocument();
+  });
+});
+
+describe("App launch recovery (#335)", () => {
+  beforeEach(() => {
+    readAppConfig.mockReset().mockResolvedValue(baseConfig("nell"));
+    ensureBridgeRunning.mockReset();
+    brainOverlayStatus.mockReset();
+    revertBrain.mockReset().mockResolvedValue(undefined);
+    rollbackBrain.mockReset().mockResolvedValue(undefined);
+    setAlwaysOnTop.mockReset().mockResolvedValue(undefined);
+    brainLoginStatus.mockReset().mockResolvedValue({ authorized: true });
+  });
+
+  afterEach(cleanup);
+
+  it("a proven brain update that won't start offers the release brain, which then starts", async () => {
+    ensureBridgeRunning.mockRejectedValueOnce(new Error("supervisor_start_timeout")).mockResolvedValue(undefined);
+    brainOverlayStatus
+      .mockResolvedValueOnce({ active_commit: "a".repeat(40), confirmed: true, undo: "rollback" })
+      .mockResolvedValue({ active_commit: null, confirmed: true, undo: "revert" });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Use the release brain" }));
+
+    await waitFor(() => expect(revertBrain).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(screen.queryByText(/Brain startup needs attention/)).not.toBeInTheDocument(),
+    );
+    expect(rollbackBrain).not.toHaveBeenCalled();
+    expect(ensureBridgeRunning).toHaveBeenCalledTimes(2);
+  });
+
+  it("without an active overlay the error screen has no release-brain button", async () => {
+    ensureBridgeRunning.mockRejectedValue(new Error("supervisor_start_timeout"));
+    brainOverlayStatus.mockResolvedValue({ active_commit: null, confirmed: true, undo: "revert" });
+
+    render(<App />);
+    await screen.findByText(/Brain startup needs attention/);
+    expect(screen.queryByRole("button", { name: "Use the release brain" })).not.toBeInTheDocument();
+  });
+
+  it("an unproven update that won't start rolls back by itself and says so", async () => {
+    ensureBridgeRunning.mockRejectedValueOnce(new Error("boom")).mockResolvedValue(undefined);
+    brainOverlayStatus
+      .mockResolvedValueOnce({ active_commit: "b".repeat(40), confirmed: false, undo: "rollback" })
+      .mockResolvedValue({ active_commit: "a".repeat(40), confirmed: true, undo: "revert" });
+
+    render(<App />);
+    expect(await screen.findByText(NOTICE_ROLLED_BACK)).toBeInTheDocument();
+    expect(rollbackBrain).toHaveBeenCalledWith("unconfirmed overlay failed to start at launch");
+
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss notice" }));
+    expect(screen.queryByText(NOTICE_ROLLED_BACK)).not.toBeInTheDocument();
   });
 });
