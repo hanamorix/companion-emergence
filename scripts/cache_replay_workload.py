@@ -3,7 +3,7 @@
 The standing project metrics are aggregates over "whatever turns happened to
 run", so they cannot isolate this change's own contribution (a false-regression
 risk — see guarded-change config Notes). This script is the *comparable
-workload* the plan requires: a deterministic sequence of N≥6 chat turns fired
+workload* the plan requires: a fixed warm-up turn plus a deterministic sequence of N≥6 chat turns fired
 in ONE session, spaced well under the 5-minute cache TTL, runnable identically
 against the OLD build (clone pre-change) and the NEW build. Diffing the two runs
 is the C8/C9 A/B; the per-run report also evaluates C1 from cache_debug.jsonl.
@@ -35,6 +35,30 @@ judge whether NEW regressed relative to OLD, not against memory of a real
 persona. The scratch persona is seeded with deterministic memory fixtures (unless
 ``--no-seed``) so the volatile tail actually renders and axis-(b) is testable.
 
+Cache-break check (#339)
+------------------------
+``check_cache_break`` is a pure, per-run check over ``chat_usage.jsonl`` rows (no model call, no call
+counts, no OLD-vs-NEW comparison). The FIRST chat row of a run writes the fixed part of the prompt
+fresh: its ``cache_creation_input_tokens`` is F. Every later row should read that part from cache; a
+later row whose ``cache_creation_input_tokens`` reaches F within the config's ``regression_threshold``
+(creation * 100 >= F * (100 - T)) is a cache break. A smaller prompt cannot trip it, because each run
+is measured against its own first row. Verdicts: PASS, FAIL, UNMEASURED (never a pass).
+
+Every replay therefore starts with a fixed tool-free WARM-UP turn (``WARMUP_PROMPT``, "ok", a
+micro-ack the monologue directive exempts; "tool-free" = the prompt elicits no tool call, tools are
+still offered on the tools path like on every other turn) on BOTH the text path and the
+``--with-tools`` path, so the first row is expected to be a single-API-call cold write and F clean
+(if it still ran tools the verdict is UNMEASURED). The warm-up is one EXTRA chat row in the run's
+means and series (``chat_rows_observed`` = turns + 1): use the same setting (``--no-warmup`` on both
+or neither) for the two arms of a ``--compare``, which warns when they differ. The first row is valid only if it has int
+token fields, creation > 0, ``num_turns == 1`` and it read less than T% of what it wrote (a warm
+row, e.g. a back-to-back re-run, is UNMEASURED). The replay prints ``cache_break_check: <STATUS>``
+on stderr and stores the result under ``cache_break_check`` in the metrics JSON; ``--cache-break-check
+USAGE.jsonl`` runs it on any log slice (exit 0 PASS / 1 FAIL / 2 UNMEASURED).
+Limits: it detects a break that re-writes >= (100 - T)% of F; a partial break (e.g. only the system
+block behind an intact tools block) is left to the cache_creation_per_chat_call and
+cost_per_chat_call_usd metrics. See guarded-change.companion.md, metric cache_read_ratio.
+
 Usage
 -----
     # New build, scratch persona, 6 turns, with replies for C7:
@@ -50,6 +74,9 @@ Usage
     # Compare: prints C1/C8/C9 numbers + the C7 OLD-vs-NEW side-by-side:
     uv run python scripts/cache_replay_workload.py --compare \
         /tmp/cache-replay-old.json /tmp/cache-replay-new.json
+
+    # Cache-break check on any run's chat rows (1-based over chat rows from --from-row):
+    uv run python scripts/cache_replay_workload.py --cache-break-check chat_usage.jsonl --from-row 1
 """
 
 from __future__ import annotations
@@ -57,10 +84,19 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_CONFIG = REPO_ROOT / "guarded-change.companion.md"
+
+# The fixed first turn of every run (see "Cache-break check" above): a micro-ack, exempt from the
+# record_monologue directive (brain/chat/monologue_prompts.py), so the row is a single API call.
+WARMUP_PROMPT = "ok"
 
 # Deterministic, content-bearing prompts (≥6). Each is substantive enough to
 # exercise recall / emotion / monologue blocks, so the volatile tail is non-
@@ -171,15 +207,15 @@ _SEED_MEMORIES = [
 class _TextPathProvider:
     """Wrap the real provider so `chat()` forces the non-tool TEXT path.
 
-    Why: only the text path (`provider.chat` w/o tools → `log_usage(call_type="chat")`)
-    and `chat_stream` write `chat_usage.jsonl`. The MCP tools path
-    (`_chat_with_mcp_tools`) runs tools in-subprocess but logs NO usage row, so a
-    tool-bearing replay produces zero chat rows and C8/C9 can't be read. Stripping
-    tools routes every turn through the logging text path. This does NOT affect C1
-    (the static system block is identical with or without tools) and keeps the A/B
-    apples-to-apples (BOTH arms use the same path). Caveat recorded in 8-harness:
-    absolute token counts omit the MCP tool-definition block, so the gated signal is
-    the DIRECTION (creation↓ + read↑), not an absolute size.
+    Why: the default replay measures the no-tools text path (`provider.chat` w/o tools ->
+    `log_usage(call_type="chat")`), the path earlier A/B runs used, so numbers stay comparable.
+    The MCP tools path (`_chat_with_mcp_tools`) runs tools in-subprocess and logs a usage row
+    too (provider.py calls `log_usage` there), so `--with-tools` measures the production
+    tool-bearing path instead. Stripping tools does NOT affect C1 (the static system block is
+    identical with or without tools) and keeps the A/B apples-to-apples (BOTH arms use the same
+    path). Caveat recorded in 8-harness: absolute token counts omit the MCP tool-definition
+    block on this path, so the gated signal is the DIRECTION (creation down + read up), not an
+    absolute size.
     """
 
     def __init__(self, real) -> None:
@@ -227,8 +263,13 @@ def run_replay(
     force_text_path: bool = True,
     history_file: Path | None = None,
     history_msgs: int | None = None,
+    warmup: bool = True,
 ) -> tuple[dict, list[dict]]:
     """Fire `turns` deterministic chat turns in one session; collect metrics + replies.
+
+    With `warmup` (default) the run FIRST sends the fixed tool-free `WARMUP_PROMPT` as turn 0, on
+    the same path as the other turns (text or tools), so the run's first chat row is
+    expected to be a single-API-call cold write for `check_cache_break`. It is extra to `turns`.
 
     NELL_CACHE_DEBUG is set before the engine is imported so the new build emits
     cache_debug.jsonl. Imports are local so the env var is in place first. Returns
@@ -263,10 +304,14 @@ def run_replay(
         print(f"# seeded {n} history msgs from {history_file.name} (window caps replay to 80)", file=sys.stderr)
 
     prompts = (REPLAY_PROMPTS * ((turns // len(REPLAY_PROMPTS)) + 1))[:turns]
+    sequence = ([(0, WARMUP_PROMPT)] if warmup else []) + list(enumerate(prompts, 1))
     replies: list[dict] = []
-    print(f"# cache replay — {turns} turns, session={session.session_id}", file=sys.stderr)
+    print(
+        f"# cache replay — {turns} turns{' + warm-up' if warmup else ''}, session={session.session_id}",
+        file=sys.stderr,
+    )
     try:
-        for i, prompt in enumerate(prompts, 1):
+        for pos, (i, prompt) in enumerate(sequence):
             t0 = time.monotonic()
             result = respond(
                 persona_dir,
@@ -278,11 +323,12 @@ def run_replay(
             )
             dt = time.monotonic() - t0
             replies.append({"turn": i, "prompt": prompt, "reply": result.content})
+            label = "warm-up" if i == 0 else f"{i}/{turns}"
             print(
-                f"[{i}/{turns}] {dt:.1f}s — reply {len(result.content)} chars",
+                f"[{label}] {dt:.1f}s — reply {len(result.content)} chars",
                 file=sys.stderr,
             )
-            if i < turns:
+            if pos < len(sequence) - 1:
                 time.sleep(gap_s)  # keep turns < 5-min TTL apart but distinct
     finally:
         store.close()
@@ -292,7 +338,184 @@ def run_replay(
     debug_rows = [
         r for r in _read_jsonl(debug_path)[debug_before:] if r.get("call_type") in ("chat", "chat_stream")
     ]
-    return _summarise(usage_rows, debug_rows, turns=turns), replies
+    summary = _summarise(usage_rows, debug_rows, turns=turns)
+    summary["warmup_turn"] = warmup
+    print(format_cache_break_line(summary["cache_break_check"]), file=sys.stderr)
+    return summary, replies
+
+
+def _is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _unmeasured(reason: str, **extra) -> dict:
+    out = {
+        "status": "UNMEASURED",
+        "reason": reason,
+        "fixed_prompt_tokens": None,
+        "threshold_pct": None,
+        "rows_checked": 0,
+        "max_share_of_F": None,
+        "breaks": [],
+    }
+    out.update(extra)
+    return out
+
+
+def _gap_s(prev: dict, cur: dict) -> float | None:
+    try:
+        t0 = datetime.fromisoformat(str(prev.get("ts")))
+        t1 = datetime.fromisoformat(str(cur.get("ts")))
+        return round((t1 - t0).total_seconds(), 1)
+    except (TypeError, ValueError):
+        return None
+
+
+def check_cache_break(rows: list[dict], *, threshold_pct: float) -> dict:
+    """Per-run cache-break check (#339). See the module docstring ("Cache-break check").
+
+    ``rows`` is one run's usage rows in log order; only ``call_type == "chat"`` rows count. The first
+    chat row is the reference (strict-first: a later row is warm by construction): F is its
+    ``cache_creation_input_tokens``. A later row breaks when ``creation * 100 >= F * (100 - T)``,
+    T = ``threshold_pct`` (from the config; no constant here). A break wins over a malformed row.
+    Returns {status: PASS|FAIL|UNMEASURED, reason, fixed_prompt_tokens, threshold_pct,
+    rows_checked, max_share_of_F, breaks: [{row, creation, share_of_F, ts, gap_s}]}.
+    """
+    if isinstance(threshold_pct, bool) or not isinstance(threshold_pct, (int, float)) or not (0 < threshold_pct < 100):
+        return _unmeasured(f"threshold {threshold_pct!r} is not a percentage in (0, 100)")
+    t = float(threshold_pct)
+    chat = [r for r in rows if isinstance(r, dict) and r.get("call_type") == "chat"]
+    if len(chat) < 2:
+        return _unmeasured(f"V1: need >= 2 chat rows, got {len(chat)}", threshold_pct=t)
+    first = chat[0]
+    inp = first.get("input_tokens")
+    cre = first.get("cache_creation_input_tokens")
+    rd = first.get("cache_read_input_tokens")
+    if not (_is_int(inp) and _is_int(cre) and _is_int(rd)) or cre <= 0:
+        return _unmeasured(
+            "V2: first chat row needs int input/creation/read tokens and creation > 0", threshold_pct=t
+        )
+    if not (_is_int(first.get("num_turns")) and first["num_turns"] == 1):
+        return _unmeasured(
+            f"V3: first chat row has num_turns={first.get('num_turns')!r}, not 1; its creation is not a "
+            "clean fixed-prompt write (run a tool-free warm-up turn first)",
+            threshold_pct=t,
+        )
+    if rd * 100 >= cre * t:
+        return _unmeasured(
+            f"V4: first chat row read {rd} tokens against {cre} written (>= {t:g}% of it): it was not a "
+            "cold write, so F is unknown (the fixed prompt was already cached)",
+            threshold_pct=t,
+        )
+    breaks: list[dict] = []
+    unusable: list[str] = []
+    max_share = 0.0
+    for i in range(1, len(chat)):
+        cur = chat[i]
+        c = cur.get("cache_creation_input_tokens")
+        if not _is_int(c):
+            unusable.append(f"row {i + 1}: cache_creation_input_tokens missing or not an int")
+            continue
+        m0, m1 = first.get("model"), cur.get("model")
+        if m0 is not None and m1 is not None and m0 != m1:
+            unusable.append(f"row {i + 1}: model {m1!r} differs from the first row's {m0!r} (not comparable)")
+            continue
+        max_share = max(max_share, c / cre)
+        if c * 100 >= cre * (100 - t):
+            breaks.append(
+                {
+                    "row": i + 1,
+                    "creation": c,
+                    "share_of_F": round(c / cre, 3),
+                    "ts": cur.get("ts"),
+                    "gap_s": _gap_s(chat[i - 1], cur),
+                }
+            )
+    common = {
+        "fixed_prompt_tokens": cre,
+        "threshold_pct": t,
+        "rows_checked": len(chat) - 1,
+        "max_share_of_F": round(max_share, 3),
+        "breaks": breaks,
+    }
+    if breaks:
+        return {
+            "status": "FAIL",
+            "reason": f"{len(breaks)} later chat row(s) re-wrote >= {100 - t:g}% of the first row's "
+            f"fresh cache write (F={cre})",
+            **common,
+        }
+    if unusable:
+        return {"status": "UNMEASURED", "reason": "; ".join(unusable), **common}
+    return {
+        "status": "PASS",
+        "reason": f"no later chat row re-wrote >= {100 - t:g}% of F={cre} (max share {common['max_share_of_F']})",
+        **common,
+    }
+
+
+def read_regression_threshold(config_path: Path | str | None = None) -> float:
+    """|regression_threshold| of the ``cache_read_ratio`` entry in the project config ("-10%" -> 10.0)."""
+    path = Path(config_path) if config_path else DEFAULT_CONFIG
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise ValueError(f"cannot read config {path}: {exc}") from exc
+    start = next((i for i, ln in enumerate(lines) if re.match(r"\s*-\s*name:\s*cache_read_ratio\s*$", ln)), None)
+    if start is None:
+        raise ValueError(f"no cache_read_ratio entry in {path}")
+    for ln in lines[start + 1 :]:
+        if re.match(r"\s*-\s*name:", ln):
+            break
+        m = re.match(r'\s*regression_threshold:\s*"?([-+]?\d+(?:\.\d+)?)%"?', ln)
+        if m:
+            return abs(float(m.group(1)))
+    raise ValueError(f"cache_read_ratio entry in {path} has no parsable regression_threshold")
+
+
+def format_cache_break_line(result: dict) -> str:
+    return f"cache_break_check: {result['status']} ({result['reason']})"
+
+
+_CACHE_BREAK_EXIT = {"PASS": 0, "FAIL": 1}
+
+
+def _read_jsonl_strict(path: Path) -> list[dict]:
+    """Every non-blank line must be a JSON object. A torn or corrupt line could be the very row
+    that shows a break (or the reference row), so skipping it silently could turn a FAIL into a
+    PASS; the check refuses instead (exit 2)."""
+    rows: list[dict] = []
+    for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"{path}: line {n} is not valid JSON ({exc.msg}); refusing to skip it "
+                "(slice the file past it, e.g. tail -n +K, or repair the line)"
+            ) from exc
+        if not isinstance(obj, dict):
+            raise ValueError(f"{path}: line {n} is not a JSON object; refusing to skip it")
+        rows.append(obj)
+    return rows
+
+
+def cache_break_cli(path: Path, from_row: int, threshold_override: float | None) -> int:
+    """`--cache-break-check`: exit 0 PASS / 1 FAIL / 2 UNMEASURED or any error (never 1 for an error)."""
+    try:
+        if from_row < 1:
+            raise ValueError("--from-row must be >= 1 (1-based over chat rows)")
+        if not path.exists():
+            raise ValueError(f"no such file: {path}")
+        threshold = threshold_override if threshold_override is not None else read_regression_threshold()
+        chat = [r for r in _read_jsonl_strict(path) if r.get("call_type") == "chat"]
+        result = check_cache_break(chat[from_row - 1 :], threshold_pct=threshold)
+    except Exception as exc:  # noqa: BLE001 - an error must be exit 2, never exit 1 (= FAIL)
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2))
+    return _CACHE_BREAK_EXIT.get(result["status"], 2)
 
 
 def _mean(xs: list[float]) -> float:
@@ -317,6 +540,11 @@ def _summarise(usage_rows: list[dict], debug_rows: list[dict], *, turns: int) ->
     else:
         c1 = {"available": False, "note": "no cache_debug.jsonl rows (old build / NELL_CACHE_DEBUG unset)"}
 
+    try:
+        cache_break = check_cache_break(usage_rows, threshold_pct=read_regression_threshold())
+    except ValueError as exc:
+        cache_break = _unmeasured(f"threshold unreadable: {exc}")
+
     return {
         "turns_requested": turns,
         "chat_rows_observed": len(usage_rows),
@@ -334,12 +562,19 @@ def _summarise(usage_rows: list[dict], debug_rows: list[dict], *, turns: int) ->
             "Option B is required.",
             "last_turn_cache_creation": creation[-1] if creation else None,
         },
+        "cache_break_check": cache_break,
     }
 
 
 def compare(old_path: Path, new_path: Path) -> int:
     old = json.loads(old_path.read_text())
     new = json.loads(new_path.read_text())
+    if bool(old.get("warmup_turn")) != bool(new.get("warmup_turn")):
+        print(
+            f"WARNING: warmup_turn differs (old={bool(old.get('warmup_turn'))}, new={bool(new.get('warmup_turn'))}): "
+            "the cold warm-up row is in only one arm's means and series, which skews every number below. "
+            "Re-run both arms with the same setting (--no-warmup on both, or neither).\n"
+        )
     oc = old["c8_cache"]["mean_cache_creation"]
     nc = new["c8_cache"]["mean_cache_creation"]
     orr = old["c8_cache"]["mean_cache_read"]
@@ -435,7 +670,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--persona-dir", type=Path, help="isolated persona directory to run against")
     p.add_argument("--scratch", action="store_true", help="create a throwaway persona under a temp dir")
-    p.add_argument("--turns", type=int, default=6, help="number of chat turns (≥6 recommended)")
+    p.add_argument("--turns", type=int, default=6, help="number of chat turns (≥6 recommended; the warm-up turn is extra)")
     p.add_argument("--gap-s", type=float, default=3.0, help="seconds between turns (keep < 5min TTL)")
     p.add_argument("--provider", default="claude-cli", help="provider name (claude-cli | fake)")
     p.add_argument("--out", type=Path, help="write the metrics JSON to this path")
@@ -452,8 +687,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--with-tools",
         action="store_true",
-        help="keep MCP tools enabled (NOTE: the tools path logs no usage row, so chat_usage.jsonl "
-        "stays empty and C8/C9 can't be read — default forces the logging text path)",
+        help="keep MCP tools enabled: measures the production tool-bearing chat path, which logs "
+        "usage rows like the text path (default strips tools and measures the no-tools text path)",
+    )
+    p.add_argument(
+        "--no-warmup",
+        action="store_true",
+        help="skip the fixed tool-free warm-up turn (then the first chat row may be multi-call or warm "
+        "and cache_break_check may be UNMEASURED)",
+    )
+    p.add_argument(
+        "--cache-break-check",
+        type=Path,
+        metavar="USAGE.jsonl",
+        help="run the per-run cache-break check on this chat_usage.jsonl instead of a replay "
+        "(exit 0 PASS / 1 FAIL / 2 UNMEASURED or error)",
+    )
+    p.add_argument(
+        "--from-row",
+        type=int,
+        default=1,
+        help="with --cache-break-check: 1-based index over the file's chat rows where the run starts",
+    )
+    p.add_argument(
+        "--regression-threshold",
+        type=float,
+        metavar="PCT",
+        help="with --cache-break-check: override the percentage read from the config's cache_read_ratio entry",
     )
     p.add_argument(
         "--history-file",
@@ -481,6 +741,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.compare:
         return compare(args.compare[0], args.compare[1])
+    if args.cache_break_check:
+        return cache_break_cli(args.cache_break_check, args.from_row, args.regression_threshold)
 
     persona_dir = args.persona_dir
     if args.scratch:
@@ -510,6 +772,7 @@ def main(argv: list[str] | None = None) -> int:
         force_text_path=not args.with_tools,
         history_file=args.history_file,
         history_msgs=args.history_msgs,
+        warmup=not args.no_warmup,
     )
     text = json.dumps(summary, indent=2)
     if args.out:
