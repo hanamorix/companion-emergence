@@ -103,7 +103,7 @@ brain is broken.
 |---|---|
 | No active overlay | Unchanged. |
 | Bridge healthy, `loaded == active`, unconfirmed | `confirm_brain_update(active)`, silently. |
-| Bridge healthy, `loaded != active` (A) | `restartBridge`; on success with `loaded == active`, confirm; on failure, or still `loaded != active`, `recoverUnhealthyBrain(status.undo, …)` and a notice. |
+| Bridge healthy, `loaded != active` (A) | `restartBridge`; on success with `loaded == active`, confirm. Otherwise, if the active overlay is **unconfirmed**: `recoverUnhealthyBrain(status.undo, …)` and a notice. If it is **confirmed** (decision 1: never dropped automatically): a failed restart goes to `BridgeErrorScreen` with **Use the release brain**; a healthy bridge on another build is left running. |
 | Start fails, active **unconfirmed** (C) | `recoverUnhealthyBrain(status.undo, "unconfirmed overlay failed to start at launch")`, retry the start, notice. |
 | Start fails, active **confirmed** | `BridgeErrorScreen` with **Use the release brain**. |
 
@@ -126,7 +126,7 @@ The release brain stays the floor.
 
 | Failure | Behaviour |
 |---|---|
-| `brain_overlay_status` fails (nell won't run on the release brain) | Treat as "no active overlay": today's behaviour. The release brain itself is broken, which is out of scope. |
+| `brain_overlay_status` fails or takes longer than 5 s (nell won't run on the release brain) | Treat as "no active overlay": today's behaviour. The release brain itself is broken, which is out of scope. |
 | `confirm_brain_update` fails | Log it; the build stays unconfirmed and the next healthy launch confirms it. Worst case, a later start failure auto-rolls back a build that had in fact worked: reversible, since re-apply is instant. |
 | Recovery's rollback/revert fails | Same as `apply`'s chain today: "Couldn't switch back to the release brain: …", then `BridgeErrorScreen` with the button. |
 | Overlay lock busy at launch (an update still running in another process) | The step fails like any other; the user gets `BridgeErrorScreen`, and Retry works once the lock is free. |
