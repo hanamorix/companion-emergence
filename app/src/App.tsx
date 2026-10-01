@@ -78,6 +78,9 @@ export default function App() {
 
   /** #335: the active brain update won't start — clear it and start on the release brain. */
   async function startOnReleaseBrain(persona: string) {
+    // the revert can take a while: show progress, and take the button away so a
+    // second click can't race it into a false "update already running" error
+    setPhase({ kind: "starting-bridge", persona, error: null });
     try {
       await revertBrain();
     } catch (e) {

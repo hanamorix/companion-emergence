@@ -433,6 +433,27 @@ describe("App launch recovery (#335)", () => {
     expect(ensureBridgeRunning).toHaveBeenCalledTimes(2);
   });
 
+  it("switching to the release brain shows progress, not a clickable error screen", async () => {
+    ensureBridgeRunning.mockRejectedValueOnce(new Error("supervisor_start_timeout")).mockResolvedValue(undefined);
+    brainOverlayStatus
+      .mockResolvedValueOnce({ active_commit: "a".repeat(40), confirmed: true, undo: "rollback" })
+      .mockResolvedValue({ active_commit: null, confirmed: true, undo: "revert" });
+    let release!: () => void;
+    revertBrain.mockReturnValueOnce(
+      new Promise<undefined>((resolve) => {
+        release = () => resolve(undefined);
+      }),
+    );
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Use the release brain" }));
+
+    expect(await screen.findByText(/Starting brain for nell/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Use the release brain" })).not.toBeInTheDocument();
+    release();
+    await waitFor(() => expect(ensureBridgeRunning).toHaveBeenCalledTimes(2));
+  });
+
   it("without an active overlay the error screen has no release-brain button", async () => {
     ensureBridgeRunning.mockRejectedValue(new Error("supervisor_start_timeout"));
     brainOverlayStatus.mockResolvedValue({ active_commit: null, confirmed: true, undo: "revert" });

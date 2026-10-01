@@ -161,12 +161,13 @@ export async function launchBrain(persona: string): Promise<LaunchResult> {
   if (status.active_commit) {
     const commit = status.active_commit;
     if ((await loadedCommit(persona)) === commit) {
-      if (!status.confirmed) await confirmQuietly(commit);
+      // silent (spec §3.3): never hold the launch on it
+      if (!status.confirmed) void confirmQuietly(commit);
     } else {
       // case A: the update installed but the bridge never restarted onto it
       const restarted = await restartBridge(persona);
       if (restarted && (await loadedCommit(persona)) === commit) {
-        await confirmQuietly(commit);
+        void confirmQuietly(commit);
       } else if (status.confirmed) {
         if (!restarted) {
           return { kind: "error", error: "The brain didn't come back after a restart.", canUseReleaseBrain: true };

@@ -167,6 +167,18 @@ describe("launchBrain (#335)", () => {
     expect(bridge.fetchHealth).not.toHaveBeenCalled();
   });
 
+  it("a slow confirm doesn't hold the launch (it is silent, spec §3.3)", async () => {
+    status({ active_commit: NEW, confirmed: false, undo: "rollback" });
+    loaded(NEW);
+    vi.mocked(appConfig.confirmBrainUpdate).mockReturnValueOnce(new Promise(() => undefined));
+    const r = await Promise.race([
+      launchBrain(P),
+      new Promise((resolve) => setTimeout(() => resolve("held"), 200)),
+    ]);
+    expect(r).toMatchObject({ kind: "ready" });
+    expect(appConfig.confirmBrainUpdate).toHaveBeenCalledWith(NEW);
+  });
+
   it("a failed confirm still launches (the next healthy launch confirms)", async () => {
     status({ active_commit: NEW, confirmed: false, undo: "rollback" });
     loaded(NEW);
