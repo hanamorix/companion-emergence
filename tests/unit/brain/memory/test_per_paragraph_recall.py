@@ -15,6 +15,7 @@ scripted fake rerankers, a scripted clock, an in-tmp store. Synthetic data only.
 
 from __future__ import annotations
 
+import logging
 import math
 import random
 import threading
@@ -1572,11 +1573,18 @@ def test_only_a_query_that_can_rerank_is_probed_for_pair_sizes(
 
 
 def test_a_rerank_whose_normalization_fell_back_still_counts_toward_the_fifty(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """F3 (S58): a rerank that ran but could not be normalized (P-6) used its
     width: 6 paragraphs whose reranks each score 10 and fall back use the 50
-    after 5 of them, so the 6th is not reranked."""
+    after 5 of them, so the 6th is not reranked.
+
+    The stub takes any arguments (a later added one cannot turn the call into a
+    TypeError that the broad `except` in `rank_and_gate` would swallow as a
+    cosine-path turn), and the test asserts it is on the intended path: the stub
+    ran for every paragraph with the real call shape, no "reranker failed" warning
+    was logged, and each fallback logged the normalization hand-off."""
+    caplog.set_level(logging.INFO, logger="brain.memory.semantic_recall")
     texts = [f"norm {chr(97 + i)} words" for i in range(6)]
     embedder = _AxisEmbedder({t: i for i, t in enumerate(texts)})
     store = MemoryStore(tmp_path / "memories.db")
@@ -1585,10 +1593,10 @@ def test_a_rerank_whose_normalization_fell_back_still_counts_toward_the_fifty(
         for j in range(12):
             _mem(store, f"r6 norm {i} {j}", {i: 0.9 - 0.01 * j})
     _cosine_floor(store, 0.5)
-    seen_max: list[int] = []
+    calls: list[tuple[tuple, dict]] = []
 
-    def _fell_back(provider, query, docs, *, budget_seconds=None, max_real=50, sizes=None):
-        seen_max.append(max_real)
+    def _fell_back(*args, **kwargs):
+        calls.append((args, kwargs))
         return reranker_mod.RecallRerank(
             width=10, reranked=False, hand_off="normalization", normalization=None, measured=False
         )
@@ -1598,7 +1606,15 @@ def test_a_rerank_whose_normalization_fell_back_still_counts_toward_the_fifty(
     search = search_paragraphs(store, "\n".join(texts), log_calibration=False)
 
     assert search is not None
-    assert seen_max == [50, 40, 30, 20, 10], "the 6th query has 0 left: no rerank call"
+    # The stub ran, once per rerank attempt, with the call shape production uses.
+    assert len(calls) == 5, "the 6th query has 0 left: no rerank call"
+    for (args, kwargs), expected in zip(calls, [50, 40, 30, 20, 10], strict=True):
+        assert len(args) == 3 and args[1] in texts and len(args[2]) >= 5
+        assert kwargs["max_real"] == expected and "budget_seconds" in kwargs and "sizes" in kwargs
+    # The path is the normalization hand-off, not a swallowed failure.
+    assert not [r for r in caplog.records if "reranker failed" in r.getMessage()]
+    handoffs = [r.getMessage() for r in caplog.records if "no rerank (normalization, width 10)" in r.getMessage()]
+    assert len(handoffs) == 5
     assert search.total_width == 50
     assert [o.reranked_width for o in search.outcomes] == [10, 10, 10, 10, 10, 0]
     assert {o.gated.path for o in search.outcomes} == {COSINE_PATH}
