@@ -397,8 +397,13 @@ def name_hit_ok(text: str, names: Sequence[str], known: KnownNames | None = None
         return True
     candidates = set(match_known_names(text, known, apply_rules=False))
     absent = [n for n in known.names if n not in candidates]
-    if absent and match_known_names(
-        _fold_text(text), KnownNames.from_names(absent), apply_rules=False
+    # FOLD-ONLY needs a non-ASCII character: for ASCII text the fold and the
+    # shared word split are the same runs, so the fold could not change the verdict
+    # (and it is the costly step on a long scan of rejected rows).
+    if (
+        absent
+        and not text.isascii()
+        and match_known_names(_fold_text(text), KnownNames.from_names(absent), apply_rules=False)
     ):
         return True
     return not candidates

@@ -504,3 +504,22 @@ def test_n13_a_base_schema_file_gets_its_side_tables_and_keeps_its_shape(tmp_pat
     conn.commit()
     conn.close()
     assert {r[0] for r in _q(tmp_path, "SELECT name_lower FROM known_names")} == {"pretzel", "will", "grace"}
+
+
+def test_n8_the_fallback_judges_each_row_for_the_phrase_that_found_it(monkeypatch) -> None:
+    # Code review F5(b): "a wrench and I will" is found by "wren" (a substring, so
+    # unjudgeable: kept as at the base) and by "will" (modal: rejected for "will").
+    monkeypatch.setattr(relevance, "RELEVANCE_RANKING_ENABLED", False)
+    store, _ = _store("a wrench and I will")
+    assert _hit_contents(store, ["wren", "will"]) == ["a wrench and I will"]
+
+
+def test_f1_ascii_text_skips_the_fold_and_keeps_the_verdict(monkeypatch) -> None:
+    # Code review F1: for ASCII text the fold equals the shared split, so it is skipped.
+    calls: list[str] = []
+    real = kn._fold_text
+    monkeypatch.setattr(kn, "_fold_text", lambda t: calls.append(t) or real(t))
+    assert kn.name_hit_ok("Will you come", ["will", "pretzel"]) is False
+    assert calls == []
+    assert kn.name_hit_ok("Renée came and I will go home", ["will", "renee"]) is True
+    assert calls == ["Renée came and I will go home"]

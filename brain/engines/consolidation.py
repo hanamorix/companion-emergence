@@ -476,7 +476,11 @@ def _escape_tag(text: str, tag: str) -> str:
     neither close its fence nor open another. ``<memo>`` and ``<memoryx>`` are
     left alone. Look-alike characters (a zero-width space inside the tag, a
     fullwidth ``<``) are not tags and are not escaped: a stated limit."""
-    return re.sub(r"<(?=\s*/?\s*" + re.escape(tag) + r"\b)", "&lt;", text, flags=re.IGNORECASE)
+    # One whitespace run before the optional slash and one after it (never two
+    # adjacent \s* runs: linear, not quadratic, on a long run of spaces).
+    return re.sub(
+        r"<(?=\s*(?:/\s*)?" + re.escape(tag) + r"\b)", "&lt;", text, flags=re.IGNORECASE
+    )
 
 
 def _escape_tags(text: str, tags: tuple[str, ...]) -> str:

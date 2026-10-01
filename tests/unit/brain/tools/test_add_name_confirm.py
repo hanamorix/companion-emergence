@@ -33,6 +33,32 @@ ASK = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_nested_lock(monkeypatch):
+    """Every test here runs with a depth-checking wrapper around the known-names
+    file lock: the lock is not re-entrant, so a nested acquisition would deadlock;
+    this makes it fail the test at once instead (criterion N34, mutant D25)."""
+    real = kn.file_lock
+    depth = [0]
+    nested: list[str] = []
+
+    @contextlib.contextmanager
+    def checked(path, *args, **kwargs):
+        if depth[0]:
+            nested.append(str(path))
+            raise AssertionError("nested known-names file_lock (not re-entrant)")
+        depth[0] += 1
+        try:
+            with real(path, *args, **kwargs) as got:
+                yield got
+        finally:
+            depth[0] -= 1
+
+    monkeypatch.setattr(kn, "file_lock", checked)
+    yield
+    assert nested == [], f"nested file_lock acquisitions: {nested}"
+
+
 def _ctx(persona: Path) -> dict:
     return {"store": MemoryStore(":memory:"), "hebbian": HebbianMatrix(":memory:"), "persona_dir": persona}
 
@@ -409,3 +435,35 @@ def test_n34_a_failed_add_loses_neither_the_reject_nor_the_question(tmp_path, mo
     assert _rejected(tmp_path) == {"tuesday": "tool"}
     assert _pending(tmp_path) == ["tuesday"]
     assert "tuesday" not in _listed(tmp_path)
+
+
+# --------------------------------------------------------------------------
+# Code review F3-F5: confirm-step gaps
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("listed", "asked", "confirmed"), [("O'Brien", "O'Brien", "o'brien"),
+                                                             ("New York", "New York", "new   york")])
+def test_f3_a_punctuated_or_multi_word_rejected_name_confirms_through_dispatch(tmp_path, listed, asked, confirmed):
+    kn.admit_names(tmp_path, [listed], "gate")
+    assert kn.remove_names(tmp_path, [listed], "tool")
+    assert _add(tmp_path, asked)["added"] is False
+    assert _add(tmp_path, confirmed)["added"] is True
+    assert kn.normalize_name(listed) in _listed(tmp_path)
+    assert _rejected(tmp_path) == {} and _pending(tmp_path) == []
+
+
+def test_f4_a_question_for_one_name_never_confirms_another(tmp_path):
+    kn.admit_names(tmp_path, ["Tuesday", "Harbour"], "gate")
+    kn.remove_names(tmp_path, ["Tuesday", "Harbour"], "tool")
+    assert kn.confirm_readd(tmp_path, "Tuesday") == "asked"
+    assert kn.confirm_readd(tmp_path, "Harbour") == "asked", "a pending question for Tuesday is not a yes for Harbour"
+    assert _pending(tmp_path) == ["harbour"]
+    assert set(_rejected(tmp_path)) == {"tuesday", "harbour"}
+
+
+def test_f5_an_ordinary_add_clears_a_stale_question(tmp_path):
+    _removed_tuesday(tmp_path)
+    assert kn.confirm_readd(tmp_path, "Tuesday") == "asked"
+    assert kn.confirm_readd(tmp_path, "Wren") == "added"
+    assert _pending(tmp_path) == []

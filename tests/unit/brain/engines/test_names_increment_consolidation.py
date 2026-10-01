@@ -387,3 +387,14 @@ def test_n15_n30_a_rejected_name_is_refused_by_the_gate_and_the_reappraiser(pers
     assert "tuesday" not in listed and "pretzel" in listed
     assert _rejected(tmp) == {"tuesday": remover}
     assert _pending(tmp) == [], "a mechanical add never asks the S137 question"
+
+
+def test_n19_the_escape_is_linear_on_a_long_whitespace_run():
+    # Code review F2: two adjacent \s* runs were quadratic (about 1 s on 20,000 spaces).
+    import time
+
+    text = "<" + " " * 20000 + "and then </memory>"
+    t0 = time.perf_counter()
+    out = cons._escape_tag(text, "memory")
+    assert time.perf_counter() - t0 < 0.2
+    assert out.endswith("&lt;/memory>")
