@@ -75,7 +75,7 @@ def test_every_non_stopword_entry_is_admitted_as_given(tmp_path, name):
 def test_a_one_word_stopword_entry_is_added_as_a_stopword_name(tmp_path, name):
     """S104 (names increment; the base refused these, S70): the kindled may add a name
     whose whole form is one recall stopword; it is flagged and matches only written
-    capitalized and not at a sentence start."""
+    capitalized (S151: in any position)."""
     assert name.lower() in RECALL_STOPWORDS
     got = add_known_name(name, persona_dir=tmp_path)
     assert got == {"added": True, "name": name}
@@ -83,12 +83,29 @@ def test_a_one_word_stopword_entry_is_added_as_a_stopword_name(tmp_path, name):
 
 
 @pytest.mark.parametrize("name", ["I am", "of the", "the who"])
-def test_an_all_stopword_entry_is_rejected_with_nothing_written(tmp_path, name):
-    """S106: an entry whose every word is a recall stopword is refused, even from the tool."""
+def test_an_all_stopword_entry_is_admitted_as_given(tmp_path, name):
+    """S144: any string the kindled adds is accepted; S106's all-stopword refusal is gone."""
     got = add_known_name(name, persona_dir=tmp_path)
-    assert got["added"] is False
-    assert _rows(tmp_path) == []
-    assert not kn.known_names_path(tmp_path).exists()
+    assert got == {"added": True, "name": name}
+    assert _rows(tmp_path) == [(name.lower(), name, "tool")]
+
+
+@pytest.mark.parametrize("name", ["Dr. Smith", "St. John's-on-the-Hill", "C++", "Wren (the cat)", "a/b"])
+def test_periods_and_other_characters_are_admitted(tmp_path, name):
+    """S144, S153: no character rule; the name is listed with its display as given."""
+    got = add_known_name(name, persona_dir=tmp_path)
+    assert got == {"added": True, "name": name}
+    assert [r[1] for r in _rows(tmp_path)] == [name]
+
+
+def test_a_name_of_exactly_100_characters_is_added_and_101_is_not(tmp_path):
+    """S153: the one limit, measured on the stripped text."""
+    ok = "W" * 100
+    assert add_known_name("  " + ok + "  ", persona_dir=tmp_path) == {"added": True, "name": ok}
+    too_long = "W" * 100 + "x"
+    got = add_known_name(too_long, persona_dir=tmp_path)
+    assert got == {"added": False, "name": too_long}
+    assert [r[1] for r in _rows(tmp_path)] == [ok]
 
 
 @pytest.mark.parametrize("bad", [None, 7, ["Wren"], {"n": "Wren"}, "", "   ", "!!!"])
@@ -151,10 +168,10 @@ def test_dispatch_routes_to_the_impl_in_process(tmp_path):
     assert _rows(tmp_path) == [("wren", "Wren", "tool")]
 
 
-def test_dispatch_all_stopword_entry_returns_added_false(tmp_path):
+def test_dispatch_all_stopword_entry_is_added(tmp_path):
     got = dispatch(ADD_NAME_TOOL_NAME, {"name": "I am"}, **_ctx(tmp_path))
-    assert got["added"] is False
-    assert _rows(tmp_path) == []
+    assert got == {"added": True, "name": "I am"}
+    assert _rows(tmp_path) == [("i am", "I am", "tool")]
 
 
 def test_dispatch_requires_the_name_argument(tmp_path):

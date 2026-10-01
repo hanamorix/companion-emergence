@@ -525,7 +525,8 @@ def _admit_extracted_names(
     persona_dir: Path, names: object, *, list_source: str, label: str
 ) -> None:
     """Write model-extracted names to the known-names list through the one
-    admission function (S70: stopword entries are rejected there). Fail-soft: a
+    admission function (S144, S152, S153: admitted as given, up to the length limit; the
+    rejects list still refuses a removed name, S135). Fail-soft: a
     failure is logged and never propagates, so a names write can never lose the
     candidate or the importance update it rides on (P-17, P-18)."""
     try:

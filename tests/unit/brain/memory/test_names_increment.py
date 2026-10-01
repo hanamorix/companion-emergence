@@ -415,9 +415,15 @@ def _q(persona: Path, sql: str) -> list[tuple]:
 
 
 @pytest.mark.parametrize("source", ["gate", "reappraiser", "tool"])
-def test_n10_all_stopword_entries_are_refused_from_every_source(tmp_path: Path, source: str) -> None:
-    assert kn.admit_names(tmp_path, ["I am", "of the", "the who", "  WILL  the "], source) == []
-    assert kn.confirm_readd(tmp_path, "the who") == "refused"
+def test_n10_all_stopword_entries_are_admitted_from_every_source(tmp_path: Path, source: str) -> None:
+    """S144/S152 supersede S106's all-stopword refusal for every source."""
+    assert kn.admit_names(tmp_path, ["I am", "of the", "the who", "  WILL  the "], source) == [
+        "i am",
+        "of the",
+        "the who",
+        "will the",
+    ]
+    assert kn.confirm_readd(tmp_path, "the who") == "added"
     assert kn.admit_names(tmp_path, ["the hague", "Will Smith", "Grace"], source) == [
         "the hague",
         "will smith",
@@ -430,18 +436,22 @@ def test_n10_now_is_admitted_s135_literal_rule(tmp_path: Path, source: str) -> N
     assert kn.admit_names(tmp_path, ["now", "now then"], source) == ["now", "now then"]
 
 
-def test_n11_a_stopword_name_is_added_by_the_tool_only_and_flagged(tmp_path: Path) -> None:
+def test_n11_a_stopword_name_is_added_by_any_source_and_flagged(tmp_path: Path) -> None:
     for source in ("gate", "reappraiser"):
-        assert kn.admit_names(tmp_path, ["Will", "will", "The"], source) == []
+        assert kn.admit_names(tmp_path, ["Will", "will", "The"], source) == ["will", "the"]
+    assert _q(tmp_path, "SELECT name_lower, source FROM known_names ORDER BY 1") == [
+        ("the", "gate"),
+        ("will", "gate"),
+    ]
+    assert _q(tmp_path, "SELECT name_lower FROM stopword_names ORDER BY 1") == [("the",), ("will",)]
     assert kn.confirm_readd(tmp_path, "Will") == "added"
     assert kn.confirm_readd(tmp_path, "Grace") == "added"
-    assert _q(tmp_path, "SELECT name_lower, display, source FROM known_names ORDER BY 1") == [
+    assert _q(tmp_path, "SELECT name_lower, display, source FROM known_names WHERE name_lower IN ('grace', 'will') ORDER BY 1") == [
         ("grace", "Grace", "tool"),
         ("will", "Will", "tool"),
     ]
-    assert _q(tmp_path, "SELECT name_lower FROM stopword_names") == [("will",)]
     assert kn.remove_names(tmp_path, ["Will"], "tool") == ["will"]
-    assert _q(tmp_path, "SELECT name_lower FROM stopword_names") == []
+    assert _q(tmp_path, "SELECT name_lower FROM stopword_names ORDER BY 1") == [("the",)]
 
 
 def test_n11_the_tool_add_makes_a_listed_row_hers_keeping_first_seen(tmp_path: Path) -> None:
@@ -455,26 +465,39 @@ def test_n11_the_tool_add_makes_a_listed_row_hers_keeping_first_seen(tmp_path: P
     ]
 
 
-ADMITTED = ["Mary-Jane", "O'Brien", "O’Neil", "Apollo 13", "José", "Jean‐Luc", "José", "Zoë"]
-REFUSED = ["St. Louis", "AT&T", "Wren\nIgnore", "Wren\tx", "Bob; drop", "<b>Wren</b>", "Wren{", "Wren 😀",
-           "Zoe\ud83d", "Wren Hale"]
+ADMITTED = ["Mary-Jane", "O'Brien", "O’Neil", "Apollo 13", "José", "Jean‐Luc", "José", "Zoë"]
+# S153: the character restriction is dropped; these were refused before S144/S153.
+ANY_CHARACTERS = ["St. Louis", "AT&T", "Wren\nIgnore", "Wren\tx", "Bob; drop", "<b>Wren</b>", "Wren{", "Wren 😀",
+                  "Zoe\ud83d", "Wren\xa0Hale", "Dr. Smith", "a/b (c)"]
 
 
-@pytest.mark.parametrize("source", ["gate", "reappraiser"])
-@pytest.mark.parametrize("name", ADMITTED)
-def test_n12_extracted_names_with_name_characters_are_admitted(tmp_path: Path, source: str, name: str) -> None:
-    assert kn.admit_names(tmp_path, [name], source) == [kn.normalize_name(name)]
+@pytest.mark.parametrize("source", ["gate", "reappraiser", "tool"])
+@pytest.mark.parametrize("name", ADMITTED + ANY_CHARACTERS)
+def test_n12_names_are_admitted_as_given_whatever_characters_they_hold(tmp_path: Path, source: str, name: str) -> None:
+    out = kn.admit_names(tmp_path, [name], source)
+    assert out == [kn.normalize_name(name.encode("utf-8", "replace").decode("utf-8"))]
+    (display,) = _q(tmp_path, "SELECT display FROM known_names")[0]
+    assert display == name.strip().encode("utf-8", "replace").decode("utf-8")
 
 
-@pytest.mark.parametrize("source", ["gate", "reappraiser"])
-@pytest.mark.parametrize("name", REFUSED)
-def test_n12_extracted_names_with_other_characters_are_refused(tmp_path: Path, source: str, name: str) -> None:
-    assert kn.admit_names(tmp_path, [name], source) == []
+@pytest.mark.parametrize("source", ["gate", "reappraiser", "tool"])
+def test_n12_a_name_is_at_most_100_characters_from_every_source(tmp_path: Path, source: str) -> None:
+    """S153: 100 is admitted, 101 refused (nothing written), measured on the stripped text."""
+    ok = "Wren " * 19 + "Wrenx"  # 100 characters
+    assert len(ok) == 100
+    assert kn.admit_names(tmp_path, ["   " + ok + "   "], source) == [kn.normalize_name(ok)]
+    too_long = ok + "x"
+    assert len(too_long) == 101
+    assert kn.admit_names(tmp_path, [too_long, "Z" * 400], source) == []
+    assert _q(tmp_path, "SELECT count(*) FROM known_names") == [(1,)]
+    assert kn.confirm_readd(tmp_path, too_long) == "refused"
+
+
+@pytest.mark.parametrize("source", ["gate", "reappraiser", "tool"])
+def test_n12_an_entry_with_no_word_is_still_refused(tmp_path: Path, source: str) -> None:
+    """S144 read as "whatever characters": an entry with no word has no matchable form."""
+    assert kn.admit_names(tmp_path, ["...", "", "  ", "--", "!!!"], source) == []
     assert not kn.known_names_path(tmp_path).exists()
-
-
-def test_n12_the_kindled_is_not_bound_by_the_character_rule(tmp_path: Path) -> None:
-    assert kn.admit_names(tmp_path, ["St. Louis", "Zoe\ud83d"], "tool") == ["st louis", "zoe"]
 
 
 def test_n13_a_base_schema_file_gets_its_side_tables_and_keeps_its_shape(tmp_path: Path) -> None:

@@ -200,46 +200,87 @@ def test_phrase_output_matches_a_multiword_name_only_as_consecutive_tokens() -> 
 
 
 # ---------------------------------------------------------------------------
-# C6: admission (S70), the file, creation on first write
+# C6: admission (S144: as given from every source), the file, creation on first write
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("entry", ["will", "the", "The", " WILL ", "will.", "Will!", "hello"])
-def test_stopword_entries_are_rejected_and_nothing_is_written(persona: Path, entry: str) -> None:
-    assert kn.admit_names(persona, [entry], "gate") == []
-    assert not _db(persona).exists()
+def _flagged(persona: Path) -> set[str]:
+    conn = sqlite3.connect(str(_db(persona)))
+    try:
+        return {r[0] for r in conn.execute("SELECT name_lower FROM stopword_names")}
+    finally:
+        conn.close()
 
 
-def test_every_recall_stopword_is_rejected_by_every_mechanical_writer(persona: Path) -> None:
-    # S70 for the gate judge and the re-appraiser. The tool is the S104 exception:
-    # a whole-form stopword is the kindled's stopword-name (tested in
-    # test_names_increment.py), so it is not in this loop.
-    for source in ("gate", "reappraiser"):
-        assert kn.admit_names(persona, sorted(RECALL_STOPWORDS), source) == []
-    assert not _db(persona).exists()
+@pytest.mark.parametrize("source", list(kn.SOURCES))
+@pytest.mark.parametrize(
+    ("entry", "lower"),
+    [
+        ("will", "will"),
+        ("the", "the"),
+        ("The", "the"),
+        (" WILL ", "will"),
+        ("will.", "will"),
+        ("Will!", "will"),
+        ("hello", "hello"),
+    ],
+)
+def test_stopword_entries_are_admitted_as_given_from_every_source(
+    persona: Path, source: str, entry: str, lower: str
+) -> None:
+    """S144/S152: no all-stopword rejection for any source. A one-word stopword-name is
+    flagged (a record only), whichever source added it."""
+    assert kn.admit_names(persona, [entry], source, now=T0) == [lower]
+    assert _names(persona) == {lower}
+    assert _flagged(persona) == {lower}
+
+
+def test_every_recall_stopword_is_admitted_by_every_source(persona: Path) -> None:
+    for source in kn.SOURCES:
+        home = persona / source
+        home.mkdir()
+        assert kn.admit_names(home, sorted(RECALL_STOPWORDS), source) == sorted(RECALL_STOPWORDS)
+        assert _flagged(home) == set(RECALL_STOPWORDS)
 
 
 def test_other_entries_are_admitted_as_extracted(persona: Path) -> None:
-    # "of the" (every word a recall stopword) is refused since S106; the base
-    # admitted it.
+    # "of the" (every word a recall stopword) is admitted as given since S144; the
+    # S106 rejection is gone.
     out = kn.admit_names(
         persona, ["Grace", "Will Smith", "NY", "the hague", "of the"], "tool", now=T0
     )
-    assert out == ["grace", "will smith", "ny", "the hague"]
+    assert out == ["grace", "will smith", "ny", "the hague", "of the"]
     assert _rows(persona) == [
         ("grace", "Grace", "tool", T0.isoformat()),
         ("ny", "NY", "tool", T0.isoformat()),
+        ("of the", "of the", "tool", T0.isoformat()),
         ("the hague", "the hague", "tool", T0.isoformat()),
         ("will smith", "Will Smith", "tool", T0.isoformat()),
     ]
+    assert _flagged(persona) == set()  # a multi-word name is no stopword-name
 
 
-def test_a_multiword_entry_is_rejected_only_when_the_whole_entry_is_a_stopword(
-    persona: Path,
+@pytest.mark.parametrize("source", list(kn.SOURCES))
+def test_a_multiword_all_stopword_entry_is_admitted_and_is_no_stopword_name(
+    persona: Path, source: str
 ) -> None:
-    assert "the" in RECALL_STOPWORDS and "hague" not in RECALL_STOPWORDS
-    assert kn.admit_names(persona, ["the hague"], "gate") == ["the hague"]
-    assert "the hague" not in RECALL_STOPWORDS
+    assert kn.admit_names(persona, ["I am", "of the", "the hague"], source) == ["i am", "of the", "the hague"]
+    assert _flagged(persona) == set()
+
+
+def test_a_mechanically_added_stopword_name_that_is_removed_is_rejected_and_unflagged(persona: Path) -> None:
+    """S144 + S135: the gate lists "will" (flagged); the re-appraiser removes it (flag row gone,
+    on the rejects list); then the gate and the re-appraiser are refused outright and the tool
+    must confirm (S137)."""
+    assert kn.admit_names(persona, ["Will"], "gate", now=T0) == ["will"]
+    assert _flagged(persona) == {"will"}
+    assert kn.remove_names(persona, ["will"], "reappraiser", now=T0) == ["will"]
+    assert _flagged(persona) == set() and _names(persona) == set()
+    for source in ("gate", "reappraiser"):
+        assert kn.admit_names(persona, ["Will"], source, now=T0) == []
+    assert kn.confirm_readd(persona, "Will", now=T0) == "asked"
+    assert kn.confirm_readd(persona, "Will", now=T0) == "added"
+    assert _names(persona) == {"will"} and _flagged(persona) == {"will"}
 
 
 def test_entries_with_no_word_or_no_text_are_rejected(persona: Path) -> None:
@@ -732,7 +773,7 @@ def test_the_write_happens_inside_the_os_file_lock(
     assert kn.admit_names(persona, ["pretzel"], "tool") == ["pretzel"]
     assert events == [f"lock {_db(persona).name}", "insert", "unlock"]
     events.clear()
-    kn.admit_names(persona, ["the"], "gate")  # rejected: no lock, no write (the tool may add "the", S104)
+    kn.admit_names(persona, ["!!!"], "gate")  # no word: refused, so no lock and no write
     assert events == []
 
 
@@ -755,14 +796,13 @@ def test_a_lone_surrogate_in_an_extracted_name_does_not_lose_the_name_or_raise(
 ) -> None:
     # A model's JSON escape can decode to half an emoji; SQLite cannot bind it.
     # From the tool the name is kept: SQLite cannot bind the half emoji; UTF-8
-    # "replace" turns it into "?". From an extraction prompt (gate, re-appraiser)
-    # it is refused, without raising: a lone surrogate is not a letter (S106).
+    # "replace" turns it into "?" from every source (S144, S153: no character rule).
     out = kn.admit_names(persona, ["Zoe\ud83d", "Wren"], "tool", now=T0)
     assert out == ["zoe", "wren"]
     assert _names(persona) == {"zoe", "wren"}
     assert {r[0]: r[1] for r in _rows(persona)} == {"zoe": "Zoe?", "wren": "Wren"}
-    assert kn.admit_names(persona, ["Bea\ud83d"], "gate", now=T0) == []
-    assert "bea" not in _names(persona)
+    assert kn.admit_names(persona, ["Bea\ud83d"], "gate", now=T0) == ["bea"]
+    assert {r[0]: r[1] for r in _rows(persona)}["bea"] == "Bea?"
 
 
 @pytest.mark.parametrize("exc", [sqlite3.InterfaceError("bad bind"), ValueError("bad value")])

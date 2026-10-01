@@ -35,8 +35,7 @@ __all__ = [
 #: The one word split (runs of ASCII letters and digits): the keyword search's,
 #: the known-names matcher's and the forgotten-memory search's (S102).
 WORD_RE = re.compile(r"[A-Za-z0-9]+")
-#: The apostrophes the rules recognise (straight and curly), shared with the
-#: known-names character rule for extracted names (S106).
+#: The apostrophes the contraction rules recognise (straight and curly).
 APOSTROPHES: tuple[str, ...] = ("'", "’")
 _APOSTROPHES = APOSTROPHES
 # The contraction endings whose stem is a fragment, not a word (S126). "t" is

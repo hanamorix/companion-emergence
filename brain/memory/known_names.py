@@ -1,7 +1,7 @@
 """The known-names list: a running list of name words, and the matcher over it.
 
 Name-recall fix, increments N1 and "names" (spec section 5 and 7: S19, S26, S37,
-S47, S49, S66, S70, S104-S106, S121, S125, S129, S135-S138). The kindled's recall
+S47, S49, S66, S70, S104-S106, S121, S125, S129, S135-S138, S144, S151-S153). The kindled's recall
 protects a word she has been told is a name (or has learned is one), whatever the
 stopword and length rules would otherwise do to it. The list lives in its own small
 SQLite file in the persona directory (``known_names.db``): not memories.db, not
@@ -14,10 +14,9 @@ Tables of the file:
   by single spaces), ``display`` (as extracted, or as the kindled spelled it),
   ``source`` (``gate`` / ``reappraiser`` / ``tool``) and ``first_seen`` (UTC ISO).
 * ``stopword_names``: the S104 flag. A row means the listed name is a stopword-name
-  ("Will"), which only the tool can add. It is a record of how the name was
-  admitted; matching decides stopword-ness with the shared
-  ``name_rules.is_stopword_name`` (the graveyard, which is handed bare names, uses
-  the same predicate), so no reader reads this table.
+  ("Will"), whichever source added it (S144). It is a record only; matching decides
+  stopword-ness with the shared ``name_rules.is_stopword_name`` (the graveyard, which
+  is handed bare names, uses the same predicate), so no reader reads this table.
 * ``rejected_names``: the S135 rejects list. Every removed name goes on it, whoever
   removed it (the kindled with ``remove_name``, or the re-appraiser). Mechanical
   adders are refused a rejected name outright; the kindled's ``add_name`` re-adds it
@@ -56,12 +55,12 @@ Aho-Corasick automaton (a trie over name words with failure links). A multi-word
 name matches only as a window of consecutive raw words, and
 :func:`names_fts_query` sends matched names to the keyword search as FTS phrases.
 
-Admission (:func:`admit_names`, :func:`confirm_readd`; S70, S104, S106, S135): an
-entry whose every word is a recall stopword is refused ("I am", "of the"; "now" is
-not a recall stopword and is admitted, S135), except that the tool may add a name
-whose whole form is ONE recall stopword (S104, flagged); names returned by the
-extraction prompts may hold only letters, digits, spaces, apostrophes and hyphens
-(S106); a mechanical source never adds a rejected name (S135).
+Admission (:func:`admit_names`, :func:`confirm_readd`; S144, S152, S153, S135): a name is
+admitted as given from every source (the kindled's add_name, the gate judge, the
+re-appraiser): periods, several words and common words all pass, whatever characters it
+holds; a one-word stopword-name is flagged (S104). The only refusals are a non-string, a
+name longer than ``MAX_NAME_LENGTH`` characters (S153), a name with no word in it (it has
+no matchable form), and, for a mechanical source, a name on the rejects list (S135).
 """
 
 from __future__ import annotations
@@ -81,13 +80,11 @@ from typing import Literal
 
 from brain import dev_constants
 from brain.memory.name_rules import (
-    APOSTROPHES,
     WORD_RE,
     followed_by_apostrophe_t,
     is_stopword_name,
     stopword_name_occurrence_ok,
 )
-from brain.memory.recall_stopwords import RECALL_STOPWORDS
 from brain.utils.file_lock import file_lock
 
 logger = logging.getLogger(__name__)
@@ -161,10 +158,9 @@ _PENDING_READD_SCHEMA = (
 _SQLITE_BUSY = 5
 _SQLITE_LOCKED = 6
 
-# S106: the characters a name returned by an extraction prompt may hold, besides
-# letters (combining marks count with letters, so a decomposed accent passes, S87)
-# and decimal digits.
-_NAME_HYPHENS: tuple[str, ...] = ("-", "‐", "‑")
+#: The longest name admitted, in characters, from every source (S153). The one limit that
+#: stands in for the old character rule; the extraction prompts' fences are the other.
+MAX_NAME_LENGTH = 100
 
 
 class _WordAutomaton:
@@ -602,53 +598,28 @@ def listed_display_forms(persona_dir: Path | str | None, text: str) -> list[str]
 # ---------------------------------------------------------------------------
 
 
-def _has_only_name_characters(text: str) -> bool:
-    """S106: letters (combining marks included), decimal digits, spaces (U+0020),
-    apostrophes (straight and curly) and hyphens only."""
-    for ch in text:
-        if ch.isalpha() or ch.isdecimal() or ch == " " or ch in APOSTROPHES or ch in _NAME_HYPHENS:
-            continue
-        if unicodedata.category(ch).startswith("M"):
-            continue
-        return False
-    return True
-
-
-def _every_word_refused(words: Sequence[str]) -> bool:
-    """S106 as ruled literal in S135: an entry whose every word is a recall
-    stopword ("i am", "of the"). "now" is not a recall stopword, so it passes."""
-    return all(w in RECALL_STOPWORDS for w in words)
-
-
 def _admit(name: object, source: str) -> tuple[str, str] | None:
     """``(name_lower, display)`` if the entry is admissible from ``source``, else None.
 
-    Refused (logged at debug, so a refusal leaves a trace): a non-string; from a
-    mechanical source, a name holding a character other than letters, digits,
-    spaces, apostrophes and hyphens (S106); an entry with no word in it; an entry
-    whose every word is a recall stopword (S106/S135), except that the tool may add
-    a name whose whole form is one recall stopword (S104). Everything else is
-    admitted as given.
+    Refused (logged at debug, so a refusal leaves a trace): a non-string; a name longer
+    than :data:`MAX_NAME_LENGTH` characters once stripped (S153); an entry with no word in
+    it (its normalized form is empty, so it can neither be stored nor matched). Everything
+    else is admitted as given from every source (S144, S152): no character rule and no
+    stopword rule. The rejects list is applied by the writers, not here.
     """
     if not isinstance(name, str):
         logger.debug("known names: refused a non-string entry from %s", source)
         return None
     raw = name.strip()
-    if source != TOOL_SOURCE and not _has_only_name_characters(raw):
-        logger.debug("known names: refused %r from %s (character rule, S106)", raw, source)
+    if len(raw) > MAX_NAME_LENGTH:
+        logger.debug("known names: refused a %d-character entry from %s (limit, S153)", len(raw), source)
         return None
     # A lone UTF-16 surrogate (a half emoji from a model's JSON escape) cannot be
-    # bound to SQLite; the replace step turns it into "?" so a tool name is still
-    # admitted (a mechanical source's surrogate was refused above).
+    # bound to SQLite; the replace step turns it into "?" so the name is still admitted.
     display = raw.encode("utf-8", "replace").decode("utf-8")
     lower = normalize_name(display)
     if not lower:
         logger.debug("known names: refused %r from %s (no word)", raw, source)
-        return None
-    if _every_word_refused(lower.split(" ")) and not (
-        source == TOOL_SOURCE and is_stopword_name(lower)
-    ):
-        logger.debug("known names: refused %r from %s (every word a stopword)", raw, source)
         return None
     return lower, display
 
@@ -713,6 +684,13 @@ def _write_tool_row(conn: sqlite3.Connection, row: tuple[str, str, str, str]) ->
         " ON CONFLICT(name_lower) DO UPDATE SET display = excluded.display, source = ?",
         (lower, display, TOOL_SOURCE, stamp, TOOL_SOURCE),
     )
+    _flag_stopword_name(conn, lower, stamp)
+
+
+def _flag_stopword_name(conn: sqlite3.Connection, lower: str, stamp: str) -> None:
+    """Record a one-word stopword-name ("will") in ``stopword_names``, whichever source
+    added it (S144). A record only: matching decides stopword-ness with the shared
+    ``name_rules.is_stopword_name``."""
     if is_stopword_name(lower):
         conn.execute(
             "INSERT OR IGNORE INTO stopword_names (name_lower, flagged_at) VALUES (?, ?)",
@@ -740,6 +718,7 @@ def _insert_in_txn(conn: sqlite3.Connection, rows: list[tuple[str, str, str, str
                 " VALUES (?, ?, ?, ?)",
                 row,
             )
+            _flag_stopword_name(conn, lower, row[3])
     return refused
 
 

@@ -8,10 +8,11 @@ writes the small known-names file under the OS file lock.
 Its one writer is ``brain.memory.known_names.confirm_readd`` (names increment,
 S104, S135, S137, S138):
 
-* an entry refused by the admission rules (every word a recall stopword, e.g. "I
-  am"; no word in it; not a string) is not added. A name whose whole form is ONE
-  recall stopword ("Will") is added, flagged: it then matches only written
-  capitalized and not at a sentence start (S104);
+* an entry refused by the admission rules (longer than 100 characters, S153; no word
+  in it; not a string) is not added. Everything else is added as given (S144): periods,
+  several words and common words pass. A name whose whole form is ONE recall stopword
+  ("Will") is added, flagged: it then matches only written capitalized, in any position
+  (S104, S151);
 * a name on the rejects list (removed earlier, by her or by the re-appraiser) is
   not added on the first call: the reply carries the approved question (wording
   file section 7). If her NEXT tool call is ``add_name`` with the same name, it is

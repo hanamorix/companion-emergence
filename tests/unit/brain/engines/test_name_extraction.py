@@ -235,13 +235,17 @@ def test_judge_unknown_verdict_falls_to_new_and_still_writes_names(persona):
 
 
 def test_gate_names_go_through_the_admission_function(persona):
-    """S70: a recall-stopword entry is rejected with nothing written; the rest are
-    admitted as extracted."""
+    """S144: the judge's extracted names are admitted as given (a common word, several
+    stopwords, a period); a 101-character name is refused (S153); a no-word entry is refused."""
     tmp, store, hebbian, queue = persona
     queue.enqueue(_mem("Will and Grace and the Hague", "dream"), source="x")
-    reply = json.dumps({"verdict": "new", "names": ["will", "Grace", "the", "the Hague"]})
+    long_name = "W" * 101
+    reply = json.dumps(
+        {"verdict": "new", "names": ["will", "Grace", "the", "the Hague", "I am", "Dr. Smith", long_name, "..."]}
+    )
     _gate(tmp, store, hebbian, FakeProvider(reply))
-    assert [r[0] for r in _rows(tmp)] == ["grace", "the hague"]
+    assert [r[0] for r in _rows(tmp)] == ["dr smith", "grace", "i am", "the", "the hague", "will"]
+    assert {r[2] for r in _rows(tmp)} == {"gate"}
 
 
 def test_gate_writer_calls_admit_names_with_source_gate(persona, monkeypatch):
@@ -416,13 +420,21 @@ def test_reappraiser_provider_failure_is_a_noop(persona):
 
 
 def test_reappraiser_names_go_through_admission_and_carry_source(persona):
-    """S70 for the second writer: a stopword entry is rejected, others admitted."""
+    """S152: the second writer admits as the first does (S144): a stopword entry, several
+    words and a period pass; over 100 characters and no-word entries do not."""
     tmp, store, _h, _q = persona
     mem = _mem("Will visited Grace", "conversation", importance=3.0)
     store.create(mem)
-    fake = FakeProvider(json.dumps({"importance": 5, "names": ["will", "Grace"]}))
+    fake = FakeProvider(
+        json.dumps({"importance": 5, "names": ["will", "Grace", "of the", "St. Ann", "X" * 101, "!!!"]})
+    )
     _reappraise_run(store, tmp, mem, provider=fake)
-    assert _rows(tmp) == [("grace", "Grace", "reappraiser")]
+    assert _rows(tmp) == [
+        ("grace", "Grace", "reappraiser"),
+        ("of the", "of the", "reappraiser"),
+        ("st ann", "St. Ann", "reappraiser"),
+        ("will", "will", "reappraiser"),
+    ]
 
 
 def test_reappraiser_names_written_only_after_the_importance_update(persona):
