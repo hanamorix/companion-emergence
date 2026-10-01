@@ -192,6 +192,32 @@ pub(crate) fn active_commit_from_status(status: &str) -> Option<String> {
     active.get("commit")?.as_str().map(str::to_string)
 }
 
+/// What the launch path needs to know about the active overlay (#335).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub(crate) struct BrainOverlayStatus {
+    pub active_commit: Option<String>,
+    /// false: installed but never seen running; missing/odd → true (never auto-drop on a guess)
+    pub confirmed: bool,
+    /// "rollback" | "revert"; missing/odd → "revert" (the release brain, the floor)
+    pub undo: String,
+}
+
+pub(crate) fn overlay_status_from(status: &str) -> BrainOverlayStatus {
+    let Some(commit) = active_commit_from_status(status) else {
+        return BrainOverlayStatus { active_commit: None, confirmed: true, undo: "revert".into() };
+    };
+    let active = status_json(status).and_then(|v| v.get("active").cloned()).unwrap_or_default();
+    BrainOverlayStatus {
+        active_commit: Some(commit),
+        confirmed: active.get("confirmed").and_then(|c| c.as_bool()).unwrap_or(true),
+        undo: match active.get("undo").and_then(|u| u.as_str()) {
+            Some("rollback") => "rollback",
+            _ => "revert",
+        }
+        .into(),
+    }
+}
+
 /// The base64-wrapped minisign public key from tauri.conf.json's updater plugin.
 pub(crate) fn updater_pubkey(plugins: &HashMap<String, serde_json::Value>) -> Result<String, String> {
     plugins
@@ -481,6 +507,23 @@ pub(crate) async fn revert_brain(app: tauri::AppHandle) -> Result<(), String> {
     run_nell(&app, &["update", "--revert"], FLIP_TIMEOUT_S).await.map(|_| ())
 }
 
+/// The launch check (#335): is an overlay active, has it proven itself, how to undo it.
+/// A dev build has no bundled nell and no overlay, so don't spawn anything.
+#[tauri::command]
+pub(crate) async fn brain_overlay_status(app: tauri::AppHandle) -> Result<BrainOverlayStatus, String> {
+    if crate::bundled_nell_path(&app)?.is_none() {
+        return Ok(overlay_status_from(""));
+    }
+    let status = run_nell(&app, &["update", "--status"], STATUS_TIMEOUT_S).await?;
+    Ok(overlay_status_from(&status))
+}
+
+/// The bridge came back healthy on this commit: it has proven itself (#335).
+#[tauri::command]
+pub(crate) async fn confirm_brain_update(app: tauri::AppHandle, commit: String) -> Result<(), String> {
+    run_nell(&app, &["update", "--confirm", &commit], FLIP_TIMEOUT_S).await.map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,6 +675,36 @@ mod tests {
         assert!(!status_supported(none));
         assert_eq!(active_commit_from_status(none), None);
         assert!(!status_supported("garbage"));
+    }
+
+    #[test]
+    fn reads_the_overlay_status_for_launch() {
+        // confirmed/undo sit before bundle_id so the bundle swap below only hits the top level
+        let s = r#"{"supported": true, "install_kind": "bundled", "bundle_id": "b",
+                    "active": {"dir": "d", "commit": "abc", "confirmed": false, "undo": "rollback",
+                               "brain_version": "0.0.43", "bundle_id": "b"},
+                    "previous": null}"#;
+        let none = BrainOverlayStatus { active_commit: None, confirmed: true, undo: "revert".into() };
+        assert_eq!(
+            overlay_status_from(s),
+            BrainOverlayStatus { active_commit: Some("abc".into()), confirmed: false, undo: "rollback".into() }
+        );
+        // written before #335: no flag → proven; no undo → the release brain (the floor)
+        let old = r#"{"bundle_id": "b", "active": {"commit": "abc", "bundle_id": "b"}, "previous": null}"#;
+        assert_eq!(
+            overlay_status_from(old),
+            BrainOverlayStatus { active_commit: Some("abc".into()), confirmed: true, undo: "revert".into() }
+        );
+        // odd values never auto-drop a build: treated as proven, undo → revert
+        let odd = r#"{"bundle_id": "b", "active": {"commit": "abc", "confirmed": "no", "undo": "sideways", "bundle_id": "b"}, "previous": null}"#;
+        assert_eq!(
+            overlay_status_from(odd),
+            BrainOverlayStatus { active_commit: Some("abc".into()), confirmed: true, undo: "revert".into() }
+        );
+        // another bundle's overlay never loads; garbage / dev builds: no overlay
+        let other = s.replacen(r#""bundle_id": "b","#, r#""bundle_id": "other","#, 1);
+        assert_eq!(overlay_status_from(&other), none);
+        assert_eq!(overlay_status_from(""), none);
     }
 
     #[test]

@@ -339,3 +339,19 @@ export async function rollbackBrain(reason: string): Promise<void> {
 export async function revertBrain(): Promise<void> {
   await invoke<void>("revert_brain");
 }
+
+/** The launch check (#335): the active overlay, whether it has proven itself, how to undo it. */
+export interface BrainOverlayStatus {
+  active_commit: string | null;
+  confirmed: boolean;
+  undo: "rollback" | "revert";
+}
+
+export async function brainOverlayStatus(): Promise<BrainOverlayStatus> {
+  return await invoke<BrainOverlayStatus>("brain_overlay_status");
+}
+
+/** The bridge came back healthy on `commit`: mark the overlay proven. */
+export async function confirmBrainUpdate(commit: string): Promise<void> {
+  await invoke<void>("confirm_brain_update", { commit });
+}
