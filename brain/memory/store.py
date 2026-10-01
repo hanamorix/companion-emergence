@@ -17,7 +17,7 @@ import math
 import re
 import sqlite3
 import uuid
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -59,6 +59,13 @@ CALIBRATION_LOG_RETENTION_WINDOW_DAYS: float = tunables.register(
 # cross-encoder score — see the `calibration_log` schema comment above for
 # why the two scales must never be mixed into one floor fit.
 CALIBRATION_SCORE_SCALE = "normalized"
+
+# Name-recall fix R2 (spec §2, S25/S38/S60): the OTHER scale a `calibration_log`
+# row can carry: raw cosine similarities from the no-rerank path (fewer than 5
+# real candidates fit or exist, or the reranker failed). The two scales are
+# never mixed in a fit: `labeled_calibration_pairs` takes the scale it fits,
+# and the cosine floor lives in its own table (`cosine_floor_calibration`).
+COSINE_SCORE_SCALE = "cosine"
 
 
 def _haiku_decision_count(haiku_label_json: str | None) -> int:
@@ -357,6 +364,10 @@ CREATE TABLE IF NOT EXISTS cluster_centroids (
 -- candidate for F2c/inc3's deploy-time one-time-recalibration trigger
 -- (spec §6) — "has a normalized-scale row ever been logged" is exactly a
 -- deploy-detection signal, though wiring that trigger is out of scope here.
+-- Name-recall fix R2 (spec §2, S25): a third value, 'cosine', marks rows the
+-- no-rerank path logs (raw cosine similarities, the EMBEDDER model id in
+-- `reranker_model_id`). The scales are never mixed: each floor is fit from
+-- its own scale's rows only (`labeled_calibration_pairs(..., score_scale)`).
 -- `local_judge_raw_score` (F2c inc1, data foundation only — spec §3
 -- Addition A): the bge judge's RAW per-candidate score/logit, JSON-encoded
 -- and positionally aligned with `candidate_ids` (same convention as
@@ -480,6 +491,26 @@ CREATE TABLE IF NOT EXISTS reranker_floor_calibration (
     score_scale TEXT NOT NULL DEFAULT 'raw'
 );
 
+-- Name-recall fix R2 (spec §2, S18/S25/S38): the COSINE pass mark the no-rerank
+-- path gates on, in its OWN table keyed by the EMBEDDER model id. It is not a
+-- row in `reranker_floor_calibration`: that table's stale-scale refit
+-- (`reranker_floor_is_stale`) would read a cosine row as a raw-scale floor and
+-- re-fit it forever. Same columns as the rerank floor minus `score_scale` (the
+-- scale is the table). Written only by the daily calibration tick
+-- (`floor_calibration.derive_and_persist_cosine_floor`); until a row exists,
+-- `MemoryStore.get_cosine_floor` serves the process-cached, never-persisted
+-- bootstrap computed at process start (S85 revised), or None before it ran.
+-- `CREATE TABLE IF NOT EXISTS` on open: legacy-safe and idempotent (I9), no
+-- existing table or row is touched.
+CREATE TABLE IF NOT EXISTS cosine_floor_calibration (
+    embedder_model_id TEXT PRIMARY KEY,
+    floor REAL NOT NULL,
+    raw_fit_floor REAL NOT NULL,
+    sample_pairs INTEGER NOT NULL,
+    is_cold_start INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 -- F2c (inc2, red-team fix F-1, spec §2): per-persona weekly judge self-tune
 -- MARKER — mirrors `reranker_floor_calibration`'s posture immediately above
 -- (a small per-persona artifact table in memories.db, never a side file,
@@ -587,25 +618,82 @@ _ALLOWED_FILTER_COLUMNS = frozenset({"domain", "memory_type"})
 _FTS_TOKEN_MIN_LEN = 3
 
 
-def _to_fts_match(query: str) -> str:
-    """Build an FTS5 MATCH expression from a raw query string.
+def split_by_raw_query_floor(tokens: Sequence[str]) -> tuple[list[str], list[str]]:
+    """``(kept, short)``: the tokens the raw-string query builder admits, and the
+    ones its ``_FTS_TOKEN_MIN_LEN`` floor drops. Lets a caller search the first
+    group exactly as a raw string always was (name-recall fix R4, S79) and route
+    the second (2-letter names, acronyms, digits, S36) elsewhere, without
+    duplicating the floor."""
+    kept = [t for t in tokens if len(t) >= _FTS_TOKEN_MIN_LEN]
+    return kept, [t for t in tokens if len(t) < _FTS_TOKEN_MIN_LEN]
 
-    Tokenizes (split on ``[^A-Za-z0-9]+``, drop tokens shorter than
-    ``_FTS_TOKEN_MIN_LEN``, dedup case-insensitively) and **OR-joins each term
-    wrapped in double-quotes** — e.g. ``'"henryk" OR "preferences"'``.
+
+class FtsPhrases(tuple):
+    """A keyword query made of whole PHRASES (name-recall fix R5, spec §5, S47).
+
+    Each element is one phrase: its words (letter/digit runs) must occur
+    consecutively, in order. ``_to_fts_match`` sends each element as ONE quoted
+    FTS phrase and OR-joins them, with no length floor and no splitting into
+    separate terms: a listed name is matched as the name ("new york" does not
+    match "new dress ... york street"), and a 2-letter name is not dropped. A
+    plain ``tuple`` subclass so it travels through every ``str | Sequence[str]``
+    query parameter (``rank_memories``, ``search_fts_scored``) unchanged.
+    """
+
+    __slots__ = ()
+
+
+def _to_fts_match(query: str | Sequence[str]) -> str:
+    """Build an FTS5 MATCH expression from a query.
+
+    A raw query STRING is tokenized (split on ``[^A-Za-z0-9]+``, drop tokens
+    shorter than ``_FTS_TOKEN_MIN_LEN``, dedup case-insensitively) and
+    **OR-joins each term wrapped in double-quotes** — e.g.
+    ``'"henryk" OR "preferences"'``.
+
+    A query given as a token LIST is the recall selector's own output
+    (name-recall fix R4, spec §5, S36): the caller has already applied the
+    stopword and shape rules, so EVERY token it kept is admitted here whatever
+    its length (a 2-letter name or an acronym included) — only the
+    alphanumeric split and the case-insensitive dedup are applied.
 
     The OR is mandatory, not cosmetic: FTS5's default bare-term MATCH is an
     implicit AND, so a disjoint multi-term query would return ZERO rows. The
     double-quoting makes each term a literal FTS string, immune to a token that
     collides with an FTS keyword (AND/OR/NOT/NEAR) or a special char.
 
+    A :class:`FtsPhrases` query (the known-names query, R5) is a list of whole
+    phrases: each is sent as one double-quoted FTS phrase (its words re-joined
+    by single spaces, so nothing but letters, digits and spaces can reach the
+    expression), OR-joined, with no length floor.
+
     Returns ``""`` when the query yields no usable tokens (caller returns no
     matches rather than issuing a MATCH).
     """
+    if isinstance(query, FtsPhrases):
+        seen_phrases: set[str] = set()
+        phrases: list[str] = []
+        for phrase in query:
+            words = re.findall(r"[A-Za-z0-9]+", phrase)
+            if not words:
+                continue
+            text = " ".join(words)
+            low = text.lower()
+            if low in seen_phrases:
+                continue
+            seen_phrases.add(low)
+            phrases.append(f'"{text}"')
+        return " OR ".join(phrases)
+    if isinstance(query, str):
+        pieces = re.split(r"[^A-Za-z0-9]+", query)
+        min_len = _FTS_TOKEN_MIN_LEN
+    else:
+        pieces = [p for token in query for p in re.split(r"[^A-Za-z0-9]+", token)]
+        min_len = 1
     seen: set[str] = set()
     terms: list[str] = []
-    for piece in re.split(r"[^A-Za-z0-9]+", query):
-        if len(piece) < _FTS_TOKEN_MIN_LEN:
+    for piece in pieces:
+        if len(piece) < min_len:
             continue
         low = piece.lower()
         if low in seen:
@@ -1098,6 +1186,8 @@ class MemoryStore:
         reranker_scores: list[float],
         reranker_model_id: str,
         candidate_docs: list[str] | None = None,
+        *,
+        score_scale: str = CALIBRATION_SCORE_SCALE,
     ) -> None:
         """Log one recall turn's (query, candidate ids, reranker scores) row
         to `calibration_log` (F2a #250 inc4).
@@ -1123,14 +1213,21 @@ class MemoryStore:
         have doc text in hand keep working unchanged — this method does no
         fetching of its own.
 
-        F2b (#276 §5): `reranker_scores` must be the caller's already-
-        NORMALIZED per-query anchor-corrected value (`brain.memory.
+        F2b (#276 §5): on the reranked path `reranker_scores` is the caller's
+        already-NORMALIZED per-query anchor-corrected value (`brain.memory.
         reranker.normalize_against_anchors`'s output), not the raw
-        cross-encoder score — this method stamps every row it writes with
-        `score_scale = CALIBRATION_SCORE_SCALE` ('normalized') accordingly.
-        This method does no normalization itself; it trusts the caller the
-        same way it already trusts `candidate_ids`/`reranker_scores` to be
-        the already-computed per-turn output.
+        cross-encoder score, stamped `score_scale = CALIBRATION_SCORE_SCALE`
+        ('normalized', the default). This method does no normalization
+        itself; it trusts the caller the same way it already trusts
+        `candidate_ids`/`reranker_scores` to be the already-computed per-turn
+        output.
+
+        Name-recall fix R2 (spec §2, S25, S60): the no-rerank path logs its
+        cosine similarities with `score_scale=COSINE_SCORE_SCALE` and the
+        EMBEDDER model id in `reranker_model_id` (the legacy column name; the
+        cosine floor is keyed by that same id). The row is stamped with the
+        scale the scores are actually on, so a fit never sees a score on the
+        wrong scale. An unknown scale is refused rather than stamped.
 
         ONE bounded INSERT — no embedding, no model call, off the hot path
         in every sense except this single cheap write (I6). Fail-soft is
@@ -1140,6 +1237,8 @@ class MemoryStore:
         caller that forgets to guard it fails loudly instead of silently
         losing calibration data.
         """
+        if score_scale not in (CALIBRATION_SCORE_SCALE, COSINE_SCORE_SCALE):
+            raise ValueError(f"log_calibration_sample: unknown score_scale {score_scale!r}")
         self._conn.execute(
             "INSERT INTO calibration_log "
             "(query, candidate_ids, reranker_scores, reranker_model_id, score_scale, "
@@ -1150,7 +1249,7 @@ class MemoryStore:
                 json.dumps(list(candidate_ids)),
                 json.dumps([float(s) for s in reranker_scores]),
                 reranker_model_id,
-                CALIBRATION_SCORE_SCALE,
+                score_scale,
                 json.dumps(list(candidate_docs)) if candidate_docs is not None else None,
             ),
         )
@@ -1271,7 +1370,9 @@ class MemoryStore:
         self._conn.commit()
         return deleted
 
-    def sample_unlabeled_calibration_rows(self, limit: int) -> list[dict[str, Any]]:
+    def sample_unlabeled_calibration_rows(
+        self, limit: int, *, cosine: bool | None = None
+    ) -> list[dict[str, Any]]:
         """Return up to `limit` `calibration_log` rows with no
         `local_judge_label` yet (F2a #250 inc6, spec Section 6/7) — the daily
         judge pass's SAMPLE, not every logged row (the spec's explicit
@@ -1287,16 +1388,30 @@ class MemoryStore:
         Python lists, not raw JSON strings — mirrors how `get()` decodes
         `metadata_json` before returning a `Memory`.
 
+        `cosine` (name-recall fix R2, S25: the tick labels the two scales
+        separately, so neither dilutes the other's daily sample): `None`
+        (default) samples every unlabeled row, `False` only rows NOT on the
+        cosine scale, `True` only cosine-scale rows.
+
         Read-only: does not bump `recall_count` (reads `calibration_log`,
         not `memories`) and does not label anything itself — labeling +
         writeback is the caller's job (`relevance_judge.
         label_calibration_sample` + `write_calibration_labels` below).
         """
+        scale_clause = ""
+        params: tuple[Any, ...] = ()
+        if cosine is True:
+            scale_clause = " AND score_scale = ?"
+            params = (COSINE_SCORE_SCALE,)
+        elif cosine is False:
+            scale_clause = " AND score_scale != ?"
+            params = (COSINE_SCORE_SCALE,)
         rows = self._conn.execute(
             "SELECT id, query, candidate_ids, reranker_scores, reranker_model_id "
-            "FROM calibration_log WHERE local_judge_label IS NULL "
-            "ORDER BY RANDOM() LIMIT ?",
-            (int(limit),),
+            "FROM calibration_log WHERE local_judge_label IS NULL"
+            + scale_clause
+            + " ORDER BY RANDOM() LIMIT ?",
+            (*params, int(limit)),
         ).fetchall()
         return [
             {
@@ -1355,7 +1470,9 @@ class MemoryStore:
         )
         self._conn.commit()
 
-    def labeled_calibration_pairs(self, reranker_model_id: str) -> list[tuple[float, str]]:
+    def labeled_calibration_pairs(
+        self, reranker_model_id: str, score_scale: str = CALIBRATION_SCORE_SCALE
+    ) -> list[tuple[float, str]]:
         """`(reranker_score, effective_label)` pairs for the MOST RECENTLY
         COMPLETED DAY's LABELED `calibration_log` rows matching
         `reranker_model_id` (F2a #250 inc7, spec Section 7; pre-flip
@@ -1404,6 +1521,12 @@ class MemoryStore:
         lookup below is scoped by this same score_scale filter, so a
         raw-scale row can never be picked as "the most recent day" either.
 
+        Name-recall fix R2 (S25, "floor fits never mix scales"): `score_scale`
+        picks the ONE scale this read fits (default 'normalized', the
+        reranker floor; the cosine floor's fit passes 'cosine' with the
+        embedder model id in the `reranker_model_id` slot). The day-scoping,
+        labels and the F2c hold filter are identical for both.
+
         Read-only: does not bump `recall_count` and does not label or
         write anything (mirrors `sample_unlabeled_calibration_rows`'s own
         read-only posture).
@@ -1419,7 +1542,7 @@ class MemoryStore:
             "SELECT MAX(day_bucket) AS max_day FROM calibration_log "
             "WHERE reranker_model_id = ? AND local_judge_label IS NOT NULL AND score_scale = ? "
             "AND day_bucket >= ?",
-            (reranker_model_id, CALIBRATION_SCORE_SCALE, view),
+            (reranker_model_id, score_scale, view),
         ).fetchone()
         most_recent_day = max_day_row["max_day"] if max_day_row is not None else None
         if most_recent_day is None:
@@ -1428,7 +1551,7 @@ class MemoryStore:
             "SELECT reranker_scores, local_judge_label, haiku_label FROM calibration_log "
             "WHERE reranker_model_id = ? AND local_judge_label IS NOT NULL "
             "AND score_scale = ? AND day_bucket = ? AND day_bucket >= ?",
-            (reranker_model_id, CALIBRATION_SCORE_SCALE, most_recent_day, view),
+            (reranker_model_id, score_scale, most_recent_day, view),
         ).fetchall()
         pairs: list[tuple[float, str]] = []
         for row in rows:
@@ -1486,39 +1609,38 @@ class MemoryStore:
         exists, it is returned and this method does no further work.
 
         If no row exists yet (fresh install / early days / a brand-new
-        reranker model_id that has never been calibrated — including, as of
-        the pre-flip revision's Change 1, a deploy still inside the
-        data-starvation backstop's ramp, since that backstop's no-prior-row
-        edge case intentionally writes nothing), F2a inc8 (#250 §7 UPDATED,
+        reranker model_id that has never been calibrated, or a deploy still
+        inside the data-starvation backstop's ramp), F2a inc8 (#250 §7 UPDATED,
         Roy 2026-09-18's bootstrap-floor ruling) serves a derived,
-        process-wide-cached BOOTSTRAP floor instead of `None` —
-        `floor_calibration.get_bootstrap_floor`, computed once (jina-only,
-        torch-free) from the bundled `_FP16_GATE_PAIRS` and cached, never
-        persisted to this table. This decouples semantic recall's EXISTENCE
-        from the daily tick ever having fired: the old "no row -> None ->
-        every caller falls back to lexical" contract permanently coupled
-        recall to the tick (disable calibration, or recall running before
-        the tick's first idle moment, silently and permanently demoted to
-        lexical-only even with embeddings present).
+        process-wide-cached BOOTSTRAP floor instead of `None`
+        (`floor_calibration.get_bootstrap_floor`, jina-only, torch-free, from
+        the bundled `_FP16_GATE_PAIRS`), never persisted to this table.
+
+        Name-recall fix S85 (revised): this method NEVER computes that
+        bootstrap. It returns the persisted row, else the cached bootstrap
+        (`floor_calibration.peek_bootstrap_floor`), else `None`. The bootstrap
+        is computed in the background on FIRST NEED (S91: a reranked turn that
+        finds no floor takes the cosine path and flags it,
+        `brain.memory.floor_startup.request_rerank_bootstrap`); a failed one
+        is retried in the background on each incoming message (S92) and at the
+        next lull by the central cadence job; `None` (not computed yet, or it
+        failed) means the reranker cannot gate the turn and recall takes the
+        no-rerank path (name-recall fix R2, spec §2), which is keyword-only
+        while the cosine floor is also missing.
 
         A persisted row, once the tick writes one, is read FIRST on every
-        subsequent call and supersedes the bootstrap for good — the
-        bootstrap cache is never consulted again for that model_id, so a
-        stale bootstrap value can never shadow a real corpus-derived floor.
-
-        Only returns `None` now on the bootstrap's OWN fail-soft path (the
-        bootstrap computation itself raised — a reranker load/fit failure)
-        — the pre-ruling contract, preserved as the last resort so a broken
-        bootstrap still degrades this turn to lexical rather than crashing.
+        subsequent call and supersedes the bootstrap for good.
 
         Read-only: does not write or bump anything.
         """
         persisted = self.get_persisted_reranker_floor(reranker_model_id)
         if persisted is not None:
             return persisted
-        from brain.memory.floor_calibration import get_bootstrap_floor
+        from brain.memory.floor_calibration import peek_bootstrap_floor
 
-        return get_bootstrap_floor(reranker_model_id)
+        # S85 (revised): the reply path only PEEKS the process cache; the
+        # bootstrap is computed at process start / retried at the next lull.
+        return peek_bootstrap_floor(reranker_model_id)
 
     def reranker_floor_is_stale(self, reranker_model_id: str) -> bool:
         """True iff `reranker_model_id`'s PERSISTED `reranker_floor_
@@ -1613,6 +1735,89 @@ class MemoryStore:
                 int(sample_pairs),
                 int(is_cold_start),
                 str(score_scale),
+            ),
+        )
+        self._conn.commit()
+
+    def get_persisted_cosine_floor(self, embedder_model_id: str) -> dict[str, Any] | None:
+        """Return ONLY the PERSISTED `cosine_floor_calibration` row for
+        `embedder_model_id`, or `None` (name-recall fix R2, spec §2, S38) —
+        never the transient bootstrap `get_cosine_floor` serves on a miss.
+        Mirrors `get_persisted_reranker_floor`; read-only."""
+        row = self._conn.execute(
+            "SELECT embedder_model_id, floor, raw_fit_floor, sample_pairs, is_cold_start, "
+            "updated_at FROM cosine_floor_calibration WHERE embedder_model_id = ?",
+            (embedder_model_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "embedder_model_id": row["embedder_model_id"],
+            "floor": float(row["floor"]),
+            "raw_fit_floor": float(row["raw_fit_floor"]),
+            "sample_pairs": int(row["sample_pairs"]),
+            "is_cold_start": bool(row["is_cold_start"]),
+            "updated_at": row["updated_at"],
+        }
+
+    def get_cosine_floor(self, embedder_model_id: str) -> dict[str, Any] | None:
+        """Return the operative COSINE floor for `embedder_model_id` (name-
+        recall fix R2, spec §2, S18/S25/S38): the gate the no-rerank path
+        applies to raw cosine similarities.
+
+        The PERSISTED `cosine_floor_calibration` row first (written by the
+        daily tick, `floor_calibration.derive_and_persist_cosine_floor`); if
+        none exists yet, the process-cached BOOTSTRAP the central cadence job
+        computed (`floor_calibration.run_cosine_bootstrap`: the same F-beta
+        fit over the same bundled example pairs the rerank floor bootstraps
+        from, scored by this embedder), never persisted. This method NEVER
+        computes the bootstrap (name-recall fix S85 revised: it is computed at
+        process start, `brain.memory.floor_startup`): it returns `None` while
+        neither a persisted row nor the cached bootstrap exists (the startup
+        computation has not finished, or it failed and awaits the next-lull
+        retry by the central cadence job). The
+        caller then has no cosine gate and the turn contributes no semantic
+        results (keyword only), never an ungated cosine ranking.
+
+        Read-only: does not write or bump anything.
+        """
+        persisted = self.get_persisted_cosine_floor(embedder_model_id)
+        if persisted is not None:
+            return persisted
+        from brain.memory import floor_calibration
+
+        # S85 (revised): the reply path only PEEKS the process cache; the
+        # bootstrap is computed at process start, retried at the next lull.
+        return floor_calibration.peek_cosine_bootstrap_floor(embedder_model_id)
+
+    def write_cosine_floor(
+        self,
+        embedder_model_id: str,
+        *,
+        floor: float,
+        raw_fit_floor: float,
+        sample_pairs: int,
+        is_cold_start: bool,
+    ) -> None:
+        """Upsert this cycle's derived cosine floor for `embedder_model_id`
+        (name-recall fix R2, spec §2, S38): the ONLY write path into
+        `cosine_floor_calibration`, called only by the daily tick's
+        `floor_calibration.derive_and_persist_cosine_floor` on an accepted
+        cycle. Same wholesale-replace upsert as `write_reranker_floor`."""
+        self._conn.execute(
+            "INSERT INTO cosine_floor_calibration "
+            "(embedder_model_id, floor, raw_fit_floor, sample_pairs, is_cold_start, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(embedder_model_id) DO UPDATE SET "
+            "floor = excluded.floor, raw_fit_floor = excluded.raw_fit_floor, "
+            "sample_pairs = excluded.sample_pairs, is_cold_start = excluded.is_cold_start, "
+            "updated_at = excluded.updated_at",
+            (
+                embedder_model_id,
+                float(floor),
+                float(raw_fit_floor),
+                int(sample_pairs),
+                int(is_cold_start),
             ),
         )
         self._conn.commit()
@@ -2532,12 +2737,13 @@ class MemoryStore:
 
     def search_fts_scored(
         self,
-        query: str,
+        query: str | Sequence[str],
         *,
         active_only: bool = True,
         include_fading: bool = True,
         limit: int | None = None,
         bump: bool | float = False,
+        family_types: Collection[str] = (),
     ) -> list[tuple[Memory, float]]:
         """FTS5/BM25 text-match search, best-match first.
 
@@ -2553,7 +2759,16 @@ class MemoryStore:
         matched rows' ``recall_count`` (+1.0) / ``last_accessed_at`` are
         bumped; a float bumps ``recall_count`` by that amount instead.
 
-        An empty/all-tokens-dropped query returns ``[]`` (no MATCH is issued).
+        ``query`` may be a raw string (tokens under 3 characters dropped) or the
+        recall selector's token list (every token admitted, see
+        ``_to_fts_match``). An empty/all-tokens-dropped query returns ``[]``
+        (no MATCH is issued).
+
+        ``family_types`` (name-recall fix R4, spec §4, S16): memory types
+        ordered AFTER every other match before ``limit`` applies (each group by
+        bm25), so a flood of monologue-family matches can never fill the
+        candidate pool and keep a genuine match out of it. Empty (default): pure
+        bm25 order, unchanged.
         """
         match = _to_fts_match(query)
         if not match:
@@ -2568,7 +2783,12 @@ class MemoryStore:
             sql += " AND m.active = 1"
         if not include_fading:
             sql += " AND m.state != 'fading'"
-        sql += " ORDER BY _bm25 ASC"
+        if family_types:
+            family = sorted(family_types)
+            sql += f" ORDER BY (m.memory_type IN ({','.join('?' * len(family))})) ASC, _bm25 ASC"
+            params.extend(family)
+        else:
+            sql += " ORDER BY _bm25 ASC"
         if limit is not None:
             sql += " LIMIT ?"
             params.append(limit)
@@ -2585,6 +2805,33 @@ class MemoryStore:
             )
             self._conn.commit()
         return [(_row_to_memory(row), float(row["_bm25"])) for row in rows]
+
+    def active_state_memory_types(self) -> dict[str, str]:
+        """`{id: memory_type}` for every memory that is `active = 1` AND in
+        `state = 'active'`: the semantic candidate pool's membership in one
+        narrow two-column SELECT (name-recall fix R6, plan P-27), no JSON
+        decoding, no bump. The full rows are fetched afterwards for the few
+        candidates that survive the cosine cut (`get_active_by_ids`)."""
+        rows = self._conn.execute(
+            "SELECT id, memory_type FROM memories WHERE active = 1 AND state = 'active'"
+        ).fetchall()
+        return {row[0]: row[1] for row in rows}
+
+    def get_active_by_ids(self, ids: Sequence[str]) -> dict[str, Memory]:
+        """`{id: Memory}` for those of `ids` that are still `active = 1` and in
+        `state = 'active'` (a row that faded or was deactivated since the
+        pool was read is simply absent). A plain SELECT: never bumps
+        `recall_count` or `last_accessed_at` (name-recall fix R6, plan P-27)."""
+        wanted = list(dict.fromkeys(ids))
+        if not wanted:
+            return {}
+        placeholders = ",".join("?" * len(wanted))
+        rows = self._conn.execute(
+            f"SELECT * FROM memories WHERE id IN ({placeholders})"
+            " AND active = 1 AND state = 'active'",
+            wanted,
+        ).fetchall()
+        return {row["id"]: _row_to_memory(row) for row in rows}
 
     def list_active(self, limit: int | None = None) -> list[Memory]:
         """Return active memories ordered by created_at desc."""

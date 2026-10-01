@@ -107,6 +107,7 @@ from brain.ingest.pipeline import (
 )
 from brain.initiate.review import _rest_state_from_energy, run_initiate_review_tick
 from brain.initiate.user_pattern import compute_user_presence
+from brain.memory import floor_startup
 from brain.memory.embedding_backfill import (
     delete_legacy_embeddings_db as _delete_legacy_embeddings_db,
 )
@@ -749,9 +750,14 @@ def _build_gated_jobs(
     test/dev disable knob) is left out. Pass 2, session snapshot/prune,
     emotion backfill and embedding backfill have no interval: each runs at
     every idle pass while it has work (S53/S66). Deploy recalibration is due
-    while the stored floor is stale (S70/S73). Self-model articulation keeps
-    its own cadence (S29). Every other job is an interval job whose cadence
-    file the central function owns.
+    while the stored floor is stale (S70/S73). The cosine and rerank floor
+    bootstraps (name-recall fix S85 revised, S91, S92) are the next-lull RETRY
+    path here: due while neither a calibrated row nor the process-cached
+    bootstrap exists, the floor was needed or its last attempt failed (the
+    rerank one is never due just because the process started), chat has
+    happened since the failed attempt, and none is already in flight.
+    Self-model articulation keeps its own cadence (S29). Every other job is an
+    interval job whose cadence file the central function owns.
 
     Each ``run`` closure looks its tick function up by module-global name at
     call time (so tests can monkeypatch them) and returns
@@ -942,6 +948,49 @@ def _build_gated_jobs(
             "embedding_backfill",
             run=_embedding_backfill_job,
             has_work=_embedding_backfill_has_work,
+        )
+    )
+
+    # 4b. floor bootstraps — name-recall fix S85 revised / S91 / S92 (spec §2).
+    # The COSINE bootstrap is computed at process start; the RERANK bootstrap on
+    # first need, in the background (`floor_startup.request_rerank_bootstrap`);
+    # a failed one is retried in the background on each incoming message. These
+    # two jobs are the lull-time RETRY path: a floor is due only while it is
+    # missing (no calibrated row, not cached), it was needed or its last attempt
+    # failed (the rerank floor is never due just because the process started),
+    # chat has happened since the failed attempt (`cli_throttle.
+    # chat_activity_marker`; no time constants), and no bootstrap of that floor
+    # is already in flight. Until a floor exists that path renders keyword
+    # results only.
+    def _floor_bootstrap_due(kind: str, due_fn: Callable[..., bool]) -> bool:
+        if floor_startup.inflight(kind):
+            return False
+        with _tick_store() as store:
+            return due_fn(store, activity_marker=cli_throttle.chat_activity_marker())
+
+    def _floor_bootstrap_job(kind: str, run_fn: Callable[..., object]) -> JobOutcome:
+        with cli_throttle.background_slot() as slot:
+            if not slot:
+                return JobOutcome.SKIPPED
+            ran = floor_startup.run_guarded(
+                kind, run_fn, activity_marker=cli_throttle.chat_activity_marker()
+            )
+            if not ran:
+                return JobOutcome.SKIPPED
+        return JobOutcome.COMPLETED
+
+    jobs.append(
+        GatedJob(
+            "cosine_floor_bootstrap",
+            run=lambda: _floor_bootstrap_job("cosine", floor_startup.run_cosine_floor),
+            has_work=lambda: _floor_bootstrap_due("cosine", floor_startup.cosine_floor_due),
+        )
+    )
+    jobs.append(
+        GatedJob(
+            "rerank_floor_bootstrap",
+            run=lambda: _floor_bootstrap_job("rerank", floor_startup.run_rerank_floor),
+            has_work=lambda: _floor_bootstrap_due("rerank", floor_startup.rerank_floor_due),
         )
     )
 
@@ -2373,6 +2422,13 @@ def _run_calibration_tick(
     ``semantic_recall.RERANK_FLOOR`` constant. This tick's own job stays
     unchanged: derive and WRITE the floor to ``memories.db`` (I1).
 
+    **NAME-RECALL FIX R2 SCOPE (spec §2, S25/S38):** the judge-labeling step
+    samples the reranked/legacy and the cosine score scales separately, and
+    a further step derives the COSINE floor
+    (``floor_calibration.derive_and_persist_cosine_floor``, cosine-scale rows
+    only, embedder model id, its own table) after the rerank floor. Floor
+    fits never mix scales.
+
     Pre-flip revision Change 2 removed the cross-increment step this
     docstring used to describe here: an ACCEPTED floor write no longer
     invalidates a cached fp16-vs-fp32 precision decision, because that
@@ -2514,6 +2570,30 @@ def _run_calibration_tick(
             )
         except Exception:  # noqa: BLE001 — floor-derivation failure must not crash the tick
             logger.exception("calibration tick: floor-derivation pass raised; continuing")
+
+        # Name-recall fix R2 (spec §2, S25/S38): the COSINE floor, fit from
+        # the cosine-scale rows only and persisted to its own table keyed by
+        # the embedder model id. Its own try/except (mirrors the rerank-floor
+        # step above): a failure here must not undo the rerank floor.
+        try:
+            from brain.memory import embeddings as embeddings_mod
+            from brain.memory import floor_calibration
+
+            embedder_model_id = embeddings_mod.build_embedding_provider().model_id()
+            cosine_outcome = floor_calibration.derive_and_persist_cosine_floor(
+                store, embedder_model_id
+            )
+            logger.info(
+                "calibration tick: cosine floor derivation for %s -> accepted=%s floor=%s "
+                "held_for_data_starvation=%s sample_pairs=%d",
+                embedder_model_id,
+                cosine_outcome.accepted,
+                cosine_outcome.floor,
+                cosine_outcome.held_for_data_starvation,
+                cosine_outcome.sample_pairs,
+            )
+        except Exception:  # noqa: BLE001 — cosine-floor failure must not crash the tick
+            logger.exception("calibration tick: cosine-floor derivation pass raised; continuing")
     return True
 
 

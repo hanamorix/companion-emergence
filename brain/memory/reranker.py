@@ -27,15 +27,16 @@ Mirrors ``brain/memory/embeddings.py``'s ``FastEmbedProvider`` +
   - ``_reset_reranker_provider_cache()``: test-only reset hook, wired into
     ``tests/conftest.py``'s autouse fixture alongside the embedding one.
 
-Also owns the AUTO-SCALING rerank-width calculation (spec point 3): the
-number of candidates reranked self-derives from a MEASURED warm per-doc
-rerank latency on the actual host vs a fixed latency budget — no per-corpus,
-no per-persona, no operator tuning; only the budget itself
-(``LATENCY_BUDGET_SECONDS``) is an ops tunable. Pre-flip revision Change 3
-adds a second, MEMORY bound alongside the time one: a measured-once-warm-
-and-cached per-doc memory cost vs a cheap per-call, cgroup-aware RAM-
-headroom read — see ``get_rerank_width`` and the "Memory bound" section
-above it.
+Also owns the PER-MESSAGE rerank-width fit (name-recall fix R1, spec §1,
+S4/S23/S24/S32/S62/S67): the hourly width sample (one query's top-5 docs,
+cached ~1 h, diagnosis H8) is gone. Every recall-time rerank is timed and
+feeds a per-process, per-reranker-model cost model (a per-call overhead plus
+a per-token rate over the batch's padded size in reranker tokens, separated by
+least squares over running sums) and a RAM-per-token figure (RSS delta around
+the same call); each message then fits its own width to the lengths of its
+own candidates within the latency budget (``LATENCY_BUDGET_SECONDS``, the one
+ops tunable) and the measured RAM bound. See the "Per-message rerank width"
+section and ``rerank_for_recall``.
 
 F2a inc2 (#250 §2) originally owned a cached, first-use, on-box fp16-vs-fp32
 accuracy SELF-CHECK here (dual-loading both ONNX exports at first use to
@@ -54,18 +55,18 @@ See ``RERANKER_PRECISION`` (the tunable default, mirroring
 from __future__ import annotations
 
 import logging
-import math
 import statistics
 import sys
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from brain import tunables
+from brain.dev_constants import RERANK_MIN_REAL_CANDIDATES
 from brain.memory.relevance import CANDIDATE_POOL
 
 if TYPE_CHECKING:
@@ -129,7 +130,7 @@ _AVX2_PRESENT = _detect_avx2()
 # Registered here (the owning module) as the DEFAULT only; a manual
 # override in tunables.json wins over this auto-detected value via
 # tunables.get_tunable's existing override-precedence mechanism (see
-# `get_rerank_width` below) — this AVX2-awareness only changes what the
+# `rerank_for_recall` below) — this AVX2-awareness only changes what the
 # default resolves to, never the override behavior itself. Read at call
 # time via tunables.get_tunable so a live override applies with no restart.
 LATENCY_BUDGET_SECONDS: float = tunables.register(
@@ -167,6 +168,42 @@ class RerankerProvider(ABC):
     @abstractmethod
     def model_id(self) -> str:
         """Stable identifier for the model producing these scores."""
+
+    def rerank_timed(
+        self, query: str, documents: list[str]
+    ) -> tuple[list[float], float, float | None]:
+        """`rerank()` plus the measurements the per-message width fit learns
+        from (name-recall fix R1, plan P-3): `(scores, seconds, rss_delta_bytes)`.
+
+        `seconds` is the wall time of the scoring call, read from the module
+        clock seam `_clock`; `rss_delta_bytes` is this process's RSS after
+        minus before the call (`None` when RSS is unreadable, e.g. not Linux),
+        the per-token RAM measurement S32 asks for. Only RECALL paths call
+        this (passive recall and `search_memories`, via
+        `normalize_against_anchors`); bootstrap-floor and calibration scoring
+        call plain `rerank()` and so never feed the cost model (S24).
+
+        `CrossEncoderProvider` overrides this to take both readings INSIDE its
+        instance lock, so a concurrent recall waiting on the lock never
+        inflates the measured time."""
+        before = _current_rss_bytes()
+        start = _clock()
+        scores = list(self.rerank(query, documents))
+        seconds = _clock() - start
+        return scores, seconds, _rss_delta(before, _current_rss_bytes())
+
+    def pair_token_lengths(self, query: str, documents: Sequence[str]) -> list[int] | None:
+        """Per document, the length in reranker TOKENS of the (query, document)
+        pair as the model sees it, after truncation (S62, S75): the cost model's
+        size unit, because the reranker pays per padded token, not per
+        character. `None` means token counts are unavailable.
+
+        This default has no tokenizer, so it counts characters as a stand-in
+        (`len(query) + len(doc)`): a provider with no tokenizer is only a test
+        double, where the unit is whatever the test scripts consistently.
+        `CrossEncoderProvider` overrides it with the loaded model's own
+        tokenizer."""
+        return [len(query) + len(doc) for doc in documents]
 
 
 class CrossEncoderProvider(RerankerProvider):
@@ -209,8 +246,79 @@ class CrossEncoderProvider(RerankerProvider):
         with self._rerank_lock:
             return list(self._model.rerank(query, documents))
 
+    def rerank_timed(
+        self, query: str, documents: list[str]
+    ) -> tuple[list[float], float, float | None]:
+        """See `RerankerProvider.rerank_timed`. Both readings are taken while
+        holding `_rerank_lock`, so time spent WAITING for another thread's
+        rerank is never counted as this call's cost (plan P-3)."""
+        with self._rerank_lock:
+            before = _current_rss_bytes()
+            start = _clock()
+            scores = list(self._model.rerank(query, documents))
+            seconds = _clock() - start
+            after = _current_rss_bytes()
+        return scores, seconds, _rss_delta(before, after)
+
+    def pair_token_lengths(self, query: str, documents: Sequence[str]) -> list[int] | None:
+        """Surviving pair lengths in tokens (S62, S75, plan P-32): each (query,
+        document) pair is encoded with the loaded model's OWN tokenizer (the
+        same `encode_batch` call fastembed makes before scoring, truncation at
+        the model maximum already enabled on it) and counted with
+        `surviving_pair_token_lengths`. Fail-soft: on any failure the result is
+        `None` (logged), never a character count, so a different unit can never
+        reach the token-based cost model; the caller then does not rerank that
+        query (hand-off "sizes", `rerank_for_recall`): a batch whose size is
+        unknown cannot be held to the latency budget or the RAM bound."""
+        try:
+            with self._rerank_lock:
+                tokenizer = self._pair_tokenizer()
+                encodings = tokenizer.encode_batch([(query, doc) for doc in documents])
+            return surviving_pair_token_lengths(encodings)
+        except Exception:  # noqa: BLE001 — fail-soft: a length probe must never break recall
+            # Warn with the traceback once per provider; later failures (the
+            # same broken accessor, every message) log at debug level.
+            first = not getattr(self, "_length_probe_failed", False)
+            self._length_probe_failed = True
+            (log.warning if first else log.debug)(
+                "reranker: surviving pair token lengths unavailable — sizing the rerank without them",
+                exc_info=first,
+            )
+            return None
+
+    def _pair_tokenizer(self) -> Any:
+        """The loaded fastembed cross-encoder's tokenizer (a PRIVATE fastembed
+        attribute, `TextCrossEncoder.model.tokenizer`; the same class of
+        coupling as the lazy-load notes above, kept behind this one accessor).
+        The tokenizer only exists once the ONNX model has loaded
+        (`lazy_load=True`), so this loads it the way fastembed's own first
+        `rerank()` would. Caller holds `_rerank_lock` (the same lock that
+        guards fastembed's unlocked first-load path)."""
+        inner = self._model.model
+        if getattr(inner, "model", None) is None:
+            inner.load_onnx_model()
+        tokenizer = inner.tokenizer
+        if tokenizer is None:
+            raise RuntimeError("reranker tokenizer not loaded")
+        return tokenizer
+
     def model_id(self) -> str:
         return self._model_id
+
+
+def surviving_pair_token_lengths(encodings: Sequence[Any]) -> list[int]:
+    """Tokens of each (query, document) pair that the reranker actually runs,
+    counted from each pair encoding after truncation (S62, S75): the tokens
+    the tokenizer kept, special tokens included (the model pays for those
+    too), padding excluded. The encoding's `attention_mask` is 1 for exactly
+    those tokens; the batch's padding to its own longest pair (which the
+    tokenizer adds on `encode_batch`) carries 0, so it is not counted. A
+    pair truncated to the model maximum therefore counts at the maximum, and
+    a short pair at its own length.
+
+    Counted per pair, not per character: the same number of characters is a
+    very different token count in Latin text and in CJK or emoji text."""
+    return [sum(encoding.attention_mask) for encoding in encodings]
 
 
 class FakeRerankerProvider(RerankerProvider):
@@ -250,6 +358,33 @@ _provider_cache: dict[str, RerankerProvider] = {}
 _provider_cache_lock = threading.Lock()
 
 
+# Unrecognised `reranker.precision` values already warned about (the due checks
+# call `resolve_reranker_model_id` on every idle pass: warn once per value).
+_warned_precisions: set[object] = set()
+
+
+def resolve_reranker_model_id() -> str:
+    """The runtime reranker model id (the id `build_reranker_provider()`'s
+    provider reports from `model_id()`): `model_tier.MODEL_RERANKER_FP16` (the
+    pinned default) or `TIER_RERANKER`'s fp32 id when the `reranker.precision`
+    tunable says "fp32". Pure and cheap: builds and loads nothing, so the
+    floor-bootstrap due checks can use it every pass."""
+    from brain.bridge.model_tier import MODEL_RERANKER_FP16, TIER_RERANKER, model_for_tier
+
+    precision = tunables.get_tunable("reranker.precision", RERANKER_PRECISION)
+    if precision == RERANKER_PRECISION_FP32:
+        return model_for_tier(TIER_RERANKER)
+    if precision != RERANKER_PRECISION_FP16 and precision not in _warned_precisions:
+        _warned_precisions.add(precision)
+        log.warning(
+            "reranker: unrecognized reranker.precision override %r — falling back to "
+            "the pinned default %r",
+            precision,
+            RERANKER_PRECISION,
+        )
+    return MODEL_RERANKER_FP16
+
+
 def build_reranker_provider(*, store: MemoryStore | None = None) -> RerankerProvider:
     """The production reranker provider: a `CrossEncoderProvider` pinned to
     `RERANKER_PRECISION`'s resolved id — `model_tier.MODEL_RERANKER_FP16`
@@ -286,19 +421,9 @@ def build_reranker_provider(*, store: MemoryStore | None = None) -> RerankerProv
 
     fp32_model_id = model_for_tier(TIER_RERANKER)
     cache_dir = get_cache_dir()
-    precision = tunables.get_tunable("reranker.precision", RERANKER_PRECISION)
-    if precision == RERANKER_PRECISION_FP32:
-        model_id = fp32_model_id
-    else:
-        if precision != RERANKER_PRECISION_FP16:
-            log.warning(
-                "reranker: unrecognized reranker.precision override %r — falling back to "
-                "the pinned default %r",
-                precision,
-                RERANKER_PRECISION,
-            )
+    model_id = resolve_reranker_model_id()
+    if model_id == MODEL_RERANKER_FP16:
         _register_fp16_reranker_model(MODEL_RERANKER_FP16, fp32_model_id)
-        model_id = MODEL_RERANKER_FP16
 
     provider = _provider_cache.get(model_id)
     if provider is not None:
@@ -334,11 +459,11 @@ def _bootstrap_reranker_provider(model_id: str) -> RerankerProvider:
     `build_reranker_provider` reads/writes, double-checked locking to
     match) so a caller that resolves to this same `model_id` elsewhere in
     the process reuses the already-loaded ONNX session instead of paying
-    for a second one. In practice this is very often a cache HIT: every
-    production call site that ends up asking `get_reranker_floor` a
-    question (`run_semantic_recall`, `_semantic_top_k`) has ALREADY
-    resolved/cached a provider for the exact model_id in question via
-    `build_reranker_provider` by the time it does so.
+    for a second one. In production a cache HIT is the rule: the only
+    caller path, `floor_startup.run_rerank_floor` (first need, the per-message
+    retry, or the next-lull retry job; name-recall fix S91/S92), calls
+    `build_reranker_provider()` first, which registers the fp16 model and
+    caches the provider for the runtime model_id.
     """
     cached = _provider_cache.get(model_id)
     if cached is not None:
@@ -367,203 +492,61 @@ def _reset_reranker_provider_cache() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Auto-scaling rerank width (spec point 3).
+# Per-message rerank width: the cost model (name-recall fix R1, spec §1).
 # ---------------------------------------------------------------------------
 #
-# The number of candidates actually sent through the (comparatively
-# expensive) reranker self-derives from a MEASURED warm per-doc rerank
-# latency on the actual host vs LATENCY_BUDGET_SECONDS — no per-corpus,
-# per-persona, or operator tuning; a one-time hardware self-calibration,
-# cached and periodically recomputed.
+# Replaces the hourly width measurement (`get_rerank_width` and its
+# `_latency_cache` / `_memory_cache`: one query's top-5 documents, timed once
+# and cached for an hour, diagnosis H8; a message of long monologue traces
+# at the top of the hour pinned every message of that hour to a width of 2
+# to 4). Now EVERY recall-time rerank is a measurement (S24):
+#
+#   - A rerank batch of `pairs` documents whose longest (query, document)
+#     pair is `L` reranker tokens costs `overhead + rate * x` seconds,
+#     x = pairs * L,
+#     because the reranker pads every pair in a batch to the longest one
+#     (fastembed `preprocessor_utils.load_tokenizer` enables padding; S67).
+#   - `overhead` and `rate` are separated by ordinary least squares over the
+#     running sums (count, sum x, sum y, sum x*y, sum x*x) of this process's
+#     recall reranks, per reranker model id (spec §1). No persistence and no
+#     averaging constant: every measured call weighs the same.
+#   - RAM per padded token of GROWTH (S32: RSS delta around recall-time
+#     reranks). The ONNX runtime keeps the memory a batch needed and reuses
+#     it, so a call whose padded size x is within the largest size already
+#     run (the high water) shows no RSS growth, and only a call that goes
+#     past the high water grows RSS, by about (x - high water) * RAM/token.
+#     So RAM/token = sum of max(0, RSS delta) / sum of (x - high water) over
+#     the calls that went past it, and a candidate batch is predicted to need
+#     RAM/token * max(0, x - high water) more memory, checked against the
+#     current headroom. (Averaging deltas over EVERY call would dilute the
+#     figure towards 0 as calls within the high water accumulate, and the
+#     bound would stop binding: stage-6 finding F1.)
+#   - The size unit is reranker TOKENS (S75), counted per pair from the
+#     reranker's own tokenizer after truncation (`pair_token_lengths`), not
+#     characters: the reranker pays per padded token, and the same number
+#     of characters is a very different token count in Latin text and in CJK
+#     or emoji text (samples through the shipped tokenizer: about 0.2 tokens
+#     per character in plain English words, about 0.5 in Chinese, about 1.0
+#     in emoji).
+#
+# Only recall reranks feed it (`rerank_timed`, called by
+# `normalize_against_anchors`); the two warm-up reranks a process runs first
+# are discarded, as the hourly measurement discarded them (S24/S32).
+#
+# PARKED (owner, Q15 / ledger F10): nothing here recovers from a stuck
+# estimate. See the marked seam in `rerank_for_recall`.
+
+# Clock seam: `rerank_timed` reads elapsed time through this name so tests can
+# inject a scripted clock (criterion C1a). Production: `time.monotonic`.
+_clock: Callable[[], float] = time.monotonic
 
 # Cold-cache timing trap ([[single-shot-timing-cold-cache-trap]]): the first
-# rerank() call on a freshly-constructed provider pays ONNX session
-# warm-up cost far above steady-state — discard this many calls before
-# starting to time.
+# rerank() calls on a freshly-constructed provider pay ONNX session warm-up
+# cost far above steady state. The first recall rerank of a process (per
+# reranker model id) is preceded by this many single-document reranks whose
+# results and timings are discarded (S24/S32 "two warm-up reranks discarded
+# as today").
 _WARMUP_RERANKS = 2
-
-# Average over this many WARM calls (post-discard) rather than trusting a
-# single sample, a lone reading can still jitter (scheduler noise, a
-# concurrent backfill tick). Must stay >= CALIBRATION_SAMPLE_SIZE below,
-# since `_doc_for`'s index restarts at 0 in each loop (warmup and measured
-# are counted separately), a measured-call count smaller than the sample
-# size would leave the tail of a wider sample never actually measured.
-_MEASURE_RERANKS = 5
-
-# Recompute the cached per-doc figure this often (startup + periodic, spec
-# point 3) rather than trusting a single boot-time measurement forever — a
-# long-lived process could see its host's effective throughput change
-# (thermal throttling, a noisy neighbor). Not an operator tunable: this is
-# an internal self-calibration cadence, not a latency/behavior knob.
-_LATENCY_RECOMPUTE_INTERVAL_SECONDS = 3600.0
-
-_MEASURE_QUERY = "warm-up latency calibration query"
-
-# FALLBACK-ONLY synthetic calibration document, used only when no real
-# candidate-pool documents are available to calibrate against (see
-# CALIBRATION_SAMPLE_SIZE below for the preferred path). #231-fix: the
-# ORIGINAL version of this string was a 17-word stub ("a short
-# representative memory sentence used only to measure warm per-doc
-# cross-encoder rerank latency on this host") — a live no-AVX2 run found
-# that stub measures ~7-8ms/doc, while REAL corpus documents reranked in
-# production cost ~128ms/doc: the auto-scale throttle this feeds
-# (`get_rerank_width`) was a structural no-op because the calibration input
-# was not representative of what actually gets reranked. Sized instead to
-# match aggregate content-length stats pulled from a live production memory
-# corpus (mean ~300 chars / ~45 words, median ~175 chars / ~25 words per
-# memory) — this fallback targets the MEAN (the longer of the two), so a
-# measurement that has to fall back to it errs toward under-throttling (a
-# wider width) rather than over-throttling.
-_MEASURE_DOCUMENT = (
-    "a longer representative memory passage, sized to match a typical "
-    "corpus document rather than a short placeholder, used only to measure "
-    "warm per-document cross-encoder rerank latency realistically on this "
-    "host so the auto-scaling width calculation reflects real production "
-    "cost instead of an artificially cheap calibration figure"
-)
-
-# How many REAL candidate-pool documents callers should sample for
-# calibration when they can supply them (the preferred path, see
-# `get_rerank_width`'s `sample_documents` parameter). Calibration runs
-# synchronously in-band on the first recall of the process (see
-# `_warm_per_doc_latency`), so this is a tradeoff, not a free knob: a wider
-# sample makes the measured per-doc figure more representative of the real
-# corpus, but each extra sampled document is roughly one extra rerank() call
-# added to that one-time first-recall calibration cost (kept in lockstep
-# with `_MEASURE_RERANKS` above, see its comment).
-CALIBRATION_SAMPLE_SIZE = 5
-
-# model_id -> (per_doc_seconds, measured_at_monotonic). Process-wide, mirrors
-# the provider cache above — one measurement per model_id, shared across
-# every recall in the process.
-_latency_cache: dict[str, tuple[float, float]] = {}
-_latency_cache_lock = threading.Lock()
-
-
-def _measure_warm_per_doc_latency(
-    provider: RerankerProvider, sample_docs: list[str] | None = None
-) -> float:
-    """Time `_MEASURE_RERANKS` single-document rerank() calls AFTER
-    discarding `_WARMUP_RERANKS` cold ones; return the mean seconds/doc.
-
-    A single-document rerank isolates per-doc cost from batching effects —
-    the width calculation multiplies this back out linearly
-    (`floor(budget / per_doc)`), matching how `get_rerank_width` actually
-    uses the figure.
-
-    #231-fix: `sample_docs`, when non-empty, is REAL candidate-pool document
-    content supplied by the caller (the preferred calibration input — see
-    `get_rerank_width`) and is cycled through across the warmup + measured
-    calls, one document per call, so the mean reflects real corpus document
-    length rather than always the same document. Falls back to the fixed
-    synthetic `_MEASURE_DOCUMENT` (see its own comment) only when no real
-    docs are available — e.g. a caller that hasn't threaded them through, or
-    an empty candidate pool.
-    """
-    docs = list(sample_docs) if sample_docs else [_MEASURE_DOCUMENT]
-
-    def _doc_for(i: int) -> list[str]:
-        return [docs[i % len(docs)]]
-
-    for i in range(_WARMUP_RERANKS):
-        list(provider.rerank(_MEASURE_QUERY, _doc_for(i)))
-
-    samples: list[float] = []
-    for i in range(_MEASURE_RERANKS):
-        start = time.monotonic()
-        list(provider.rerank(_MEASURE_QUERY, _doc_for(i)))
-        samples.append(time.monotonic() - start)
-    return sum(samples) / len(samples)
-
-
-def _warm_per_doc_latency(
-    provider: RerankerProvider, sample_docs: list[str] | None = None
-) -> float:
-    """Cached warm per-doc latency for `provider`'s model_id, measuring (and
-    caching) on first use or once `_LATENCY_RECOMPUTE_INTERVAL_SECONDS` has
-    elapsed since the last measurement.
-
-    The first semantic recall of each process pays this calibration cost
-    in-band (the warmup plus measured reranks above run synchronously before
-    that recall's width is known). It is cached after that first call, so
-    every later recall in the process reads the cached value instead —
-    `sample_docs` passed on a later (cache-hit) call is simply ignored, same
-    as it would be if the whole function signature hadn't changed; only the
-    FIRST caller within `_LATENCY_RECOMPUTE_INTERVAL_SECONDS` actually
-    supplies the docs a measurement uses.
-
-    Fail-soft: a measurement failure (e.g. the real model errors on the
-    calibration call) logs and returns 0.0 — `get_rerank_width` treats 0.0
-    as "no latency signal, don't throttle by it," capping width by pool size
-    / CANDIDATE_POOL alone instead. Never raises into a recall.
-    """
-    model_id = provider.model_id()
-    now = time.monotonic()
-    with _latency_cache_lock:
-        cached = _latency_cache.get(model_id)
-        if cached is not None and (now - cached[1]) < _LATENCY_RECOMPUTE_INTERVAL_SECONDS:
-            return cached[0]
-
-    # Measure OUTSIDE the lock — a real rerank call can take real time
-    # (seconds), and holding the lock across it would serialize every
-    # concurrent recall behind this one measurement.
-    try:
-        measured = _measure_warm_per_doc_latency(provider, sample_docs)
-    except Exception:  # noqa: BLE001 — fail-soft: never break recall over a calibration failure
-        log.exception("reranker: warm-latency measurement failed — width will not be latency-throttled")
-        measured = 0.0
-
-    with _latency_cache_lock:
-        _latency_cache[model_id] = (measured, now)
-    return measured
-
-
-def _reset_latency_cache() -> None:
-    """Test-only: clear the measured-latency cache."""
-    with _latency_cache_lock:
-        _latency_cache.clear()
-
-
-# ---------------------------------------------------------------------------
-# Memory bound for auto-scaling rerank width (pre-flip revision, Change 3).
-# ---------------------------------------------------------------------------
-#
-# `get_rerank_width` was latency-derived only, memory-blind: fp16's extra
-# speed, with no memory bound to check against, was poured entirely into a
-# wider width and OOM'd at 5.36 GiB under a 5.5G cgroup cap (the fp16
-# natural-width run, Testing 2026-09-23). This section adds a MEASURED
-# memory term as an additional `min()` bound, mirroring the existing
-# measure-once-warm-and-cache `_warm_per_doc_latency` pattern exactly:
-# `per_doc_MEMORY` is measured once per model_id (RSS delta around a warm
-# rerank batch of known size, divided by batch size) and cached, recomputed
-# on the same cadence as the latency figure; `available_RAM_headroom` is a
-# cheap per-call read (cgroup-limit-aware, falling back to host free memory),
-# mirroring the `_detect_avx2` /proc-read shape: cheap, dependency-free,
-# safely degrades on any read/parse error or unsupported platform, never
-# crashes. On any failure to determine either figure, the memory term is
-# SKIPPED entirely (never assume unlimited headroom) — `get_rerank_width`
-# degrades to exactly the pre-Change-3 time-only bound.
-
-# Batch size for the one-time warm RSS-delta memory measurement. Reuses
-# `_MEASURE_RERANKS`'s value (rather than inventing a second, differently-
-# derived integer): the same magnitude reasoning applies — large enough that
-# the RSS delta from reranking the batch clears ordinary allocator/GC noise,
-# small enough that the one-time measurement stays cheap.
-_MEMORY_MEASURE_BATCH_SIZE = _MEASURE_RERANKS
-
-# Recompute the cached per-doc memory figure on the SAME cadence as the
-# per-doc latency figure above (`_LATENCY_RECOMPUTE_INTERVAL_SECONDS`) — a
-# long-lived process's per-doc memory cost can drift for the same class of
-# reasons the latency figure can (allocator fragmentation, a noisy
-# neighbor's memory pressure), so this reuses that cadence rather than
-# introducing a second, arbitrarily-different one.
-_MEMORY_RECOMPUTE_INTERVAL_SECONDS = _LATENCY_RECOMPUTE_INTERVAL_SECONDS
-
-# model_id -> (per_doc_bytes, measured_at_monotonic). Process-wide, mirrors
-# `_latency_cache` above exactly — one measurement per model_id, shared
-# across every recall in the process.
-_memory_cache: dict[str, tuple[float, float]] = {}
-_memory_cache_lock = threading.Lock()
 
 
 def _current_rss_bytes() -> float | None:
@@ -571,7 +554,8 @@ def _current_rss_bytes() -> float | None:
     `/proc/self/status`'s `VmRSS` line — the same shape as `_detect_avx2`'s
     `/proc` read (Linux-only; fail-soft to `None` on any read/parse error or
     an unsupported platform, since there is no `/proc` on macOS/Windows).
-    Never raises."""
+    Never raises. `None` makes the RAM term of the width fit skip (the width
+    is then time-bound only), never assume unlimited memory."""
     if sys.platform != "linux":
         return None
     try:
@@ -582,97 +566,156 @@ def _current_rss_bytes() -> float | None:
                     return float(line.split()[1]) * 1024.0
         return None
     except Exception:  # noqa: BLE001 — fail-soft: an RSS probe must never break a recall
-        log.exception("reranker: RSS read failed — per-doc memory measurement will be skipped")
+        log.exception("reranker: RSS read failed — the rerank's RAM measurement will be skipped")
         return None
 
 
-def _measure_warm_per_doc_memory(
-    provider: RerankerProvider, sample_docs: list[str] | None = None
-) -> float:
-    """RSS delta bracketing `_MEMORY_MEASURE_BATCH_SIZE` warm rerank() calls,
-    divided by that batch size — the per-candidate memory cost `get_rerank_
-    width`'s memory bound divides headroom by.
-
-    Each bracketed call is SINGLE-document — one document per `rerank()`
-    call, cycling through `sample_docs` exactly like `_measure_warm_per_doc_
-    latency`'s `_doc_for` helper — rather than one N-document batch call.
-    This mirrors that function's per-doc isolation shape (reusing it, not
-    inventing a second one, per this change's own requirement) AND matters
-    structurally: a caller-facing invariant elsewhere in this codebase
-    (`test_f2b_anchor_wiring.py`'s "exactly one combined rerank() call"
-    checks) identifies the real+anchor call specifically by it being the
-    only MULTI-document `rerank()` call in a turn — a single N-document
-    batch call here would collide with that and be mistaken for a second
-    combined call. Keeping every calibration call length-1 avoids that
-    collision entirely, the same way the existing latency measurement's
-    single-document calls already do.
-
-    `_WARMUP_RERANKS` warmup calls are run first and discarded before the
-    measured sequence, matching `_measure_warm_per_doc_latency`'s
-    cold-cache-trap avoidance ([[single-shot-timing-cold-cache-trap]]) —
-    a cold ONNX session's first calls do real allocation work
-    (session/tensor buffers) unrelated to steady-state per-doc memory cost.
-
-    A negative delta (RSS can legitimately drop between the two reads — a
-    GC pass, another thread freeing memory) or an unreadable RSS clamps to
-    0.0 — the same "no signal" sentinel `_warm_per_doc_latency` uses for a
-    measurement failure, which `get_rerank_width` already treats as "skip
-    this term".
-    """
-    docs = list(sample_docs) if sample_docs else [_MEASURE_DOCUMENT]
-
-    def _doc_for(i: int) -> list[str]:
-        return [docs[i % len(docs)]]
-
-    for i in range(_WARMUP_RERANKS):
-        list(provider.rerank(_MEASURE_QUERY, _doc_for(i)))  # warmup, discarded
-
-    before = _current_rss_bytes()
-    for i in range(_MEMORY_MEASURE_BATCH_SIZE):
-        list(provider.rerank(_MEASURE_QUERY, _doc_for(i)))
-    after = _current_rss_bytes()
-
+def _rss_delta(before: float | None, after: float | None) -> float | None:
+    """RSS after minus before, or `None` when either read failed. May be
+    negative (a GC pass, another thread freeing memory); the running sum
+    clamps each delta at 0."""
     if before is None or after is None:
-        return 0.0
-    delta = after - before
-    if delta <= 0.0:
-        return 0.0
-    return delta / _MEMORY_MEASURE_BATCH_SIZE
+        return None
+    return after - before
 
 
-def _warm_per_doc_memory(
-    provider: RerankerProvider, sample_docs: list[str] | None = None
-) -> float:
-    """Cached warm per-doc memory cost for `provider`'s model_id — mirrors
-    `_warm_per_doc_latency` exactly: measured (and cached) on first use or
-    once `_MEMORY_RECOMPUTE_INTERVAL_SECONDS` has elapsed since the last
-    measurement, measured OUTSIDE the lock (a real rerank batch takes real
-    time, and holding the lock across it would serialize every concurrent
-    recall behind this one measurement), fail-soft to 0.0 (`get_rerank_
-    width` treats 0.0 as "no memory signal, don't throttle by it") on any
-    measurement failure. Never raises into a recall."""
+@dataclass(frozen=True)
+class _CostSums:
+    """Running sums for one reranker model id. Immutable: an update builds a
+    new instance and swaps it in under `_cost_lock`, so a reader never sees
+    half of one sample's sums (CONC-1).
+
+    `sum_x`/`sum_xx`/`ram_x` are Python ints (x = pairs * longest pair is an
+    integer token count), so the least-squares denominator
+    `n * sum_xx - sum_x ** 2` is exact however long the process runs."""
+
+    n: int = 0
+    sum_x: int = 0
+    sum_y: float = 0.0
+    sum_xy: float = 0.0
+    sum_xx: int = 0
+    # RAM (see the section header): growth past the high water only.
+    peak_x: int = 0  # largest padded size measured so far (the high water)
+    ram_bytes: float = 0.0  # sum of max(0, RSS delta) over calls that went past the high water
+    ram_x: int = 0  # sum of (x - high water before the call) over those same calls
+
+    def plus(self, padded_tokens: int, seconds: float, rss_delta_bytes: float | None) -> _CostSums:
+        ram_bytes, ram_x = self.ram_bytes, self.ram_x
+        if rss_delta_bytes is not None and padded_tokens > self.peak_x:
+            ram_bytes += max(0.0, rss_delta_bytes)
+            ram_x += padded_tokens - self.peak_x
+        return _CostSums(
+            n=self.n + 1,
+            sum_x=self.sum_x + padded_tokens,
+            sum_y=self.sum_y + seconds,
+            sum_xy=self.sum_xy + padded_tokens * seconds,
+            sum_xx=self.sum_xx + padded_tokens * padded_tokens,
+            peak_x=max(self.peak_x, padded_tokens),
+            ram_bytes=ram_bytes,
+            ram_x=ram_x,
+        )
+
+
+@dataclass(frozen=True)
+class RerankCostEstimate:
+    """The fitted cost model for one reranker model id (see the section
+    header). `ram_bytes_per_token` is RSS growth per padded token past
+    `peak_padded_tokens` (the largest padded batch measured so far); `None`
+    when no call past the high water had a readable RSS delta (the RAM term
+    of the width fit is then skipped)."""
+
+    overhead_seconds: float
+    seconds_per_token: float
+    ram_bytes_per_token: float | None
+    measured_batches: int
+    peak_padded_tokens: int = 0
+
+
+def _fit_cost(sums: _CostSums) -> tuple[float, float] | None:
+    """(overhead, rate) by ordinary least squares over the running sums
+    (spec §1, S67). Degenerate fits fall back to a zero overhead and the
+    through-origin ratio of sums (plan P-2): a single measured batch, all
+    batches of one padded size (`n * sum_xx - sum_x ** 2 == 0`), a negative
+    fitted overhead, or a non-positive fitted rate. `None` before any
+    measured batch with a non-zero size."""
+    if sums.n == 0 or sums.sum_x <= 0:
+        return None
+    denominator = sums.n * sums.sum_xx - sums.sum_x * sums.sum_x
+    if denominator > 0:
+        rate = (sums.n * sums.sum_xy - sums.sum_x * sums.sum_y) / denominator
+        overhead = (sums.sum_y - rate * sums.sum_x) / sums.n
+        if overhead >= 0.0 and rate > 0.0:
+            return overhead, rate
+    return 0.0, sums.sum_y / sums.sum_x
+
+
+# model_id -> running sums, and the model ids whose warm-up has run. One lock
+# guards both (every read and every read-modify-write), so a concurrent
+# passive recall and `search_memories` call (#297: the tool runs in a bridge
+# worker thread) never lose a sample.
+_cost_sums: dict[str, _CostSums] = {}
+_warmed_model_ids: set[str] = set()
+_cost_lock = threading.Lock()
+
+# Test-only seam (CONC-1): called inside an update, between reading the
+# current sums and writing the new ones. Always `None` in production.
+_cost_update_hook: Callable[[], None] | None = None
+
+
+def rerank_cost_estimate(model_id: str) -> RerankCostEstimate | None:
+    """The current cost model for `model_id`, or `None` before its first
+    measured recall rerank (the width is then the S5 minimum, S24)."""
+    with _cost_lock:
+        sums = _cost_sums.get(model_id)
+    if sums is None:
+        return None
+    fit = _fit_cost(sums)
+    if fit is None:
+        return None
+    overhead, rate = fit
+    ram_per_token = sums.ram_bytes / sums.ram_x if sums.ram_x > 0 else None
+    return RerankCostEstimate(
+        overhead_seconds=overhead,
+        seconds_per_token=rate,
+        ram_bytes_per_token=ram_per_token,
+        measured_batches=sums.n,
+        peak_padded_tokens=sums.peak_x,
+    )
+
+
+def _record_rerank_cost(
+    model_id: str, padded_tokens: int, seconds: float, rss_delta_bytes: float | None
+) -> None:
+    """Add one measured recall rerank to `model_id`'s running sums."""
+    with _cost_lock:
+        current = _cost_sums.get(model_id, _CostSums())
+        if _cost_update_hook is not None:
+            _cost_update_hook()
+        _cost_sums[model_id] = current.plus(padded_tokens, seconds, rss_delta_bytes)
+
+
+def _reset_rerank_cost_model() -> None:
+    """Test-only: forget every model id's running sums and warm-up state."""
+    with _cost_lock:
+        _cost_sums.clear()
+        _warmed_model_ids.clear()
+
+
+def _warm_up_once(provider: RerankerProvider, query: str, documents: Sequence[str]) -> None:
+    """Before the first measured recall rerank of this process for the
+    provider's model id: `_WARMUP_RERANKS` single-document reranks on the
+    current candidates' first documents, results and timings discarded
+    (plan P-1). Plain `rerank()`, so nothing here reaches the cost model.
+    Marked done only after they succeed; two threads racing here may both
+    warm up, which costs time but never skews a measurement."""
     model_id = provider.model_id()
-    now = time.monotonic()
-    with _memory_cache_lock:
-        cached = _memory_cache.get(model_id)
-        if cached is not None and (now - cached[1]) < _MEMORY_RECOMPUTE_INTERVAL_SECONDS:
-            return cached[0]
-
-    try:
-        measured = _measure_warm_per_doc_memory(provider, sample_docs)
-    except Exception:  # noqa: BLE001 — fail-soft: never break recall over a calibration failure
-        log.exception("reranker: warm-memory measurement failed — width will not be memory-throttled")
-        measured = 0.0
-
-    with _memory_cache_lock:
-        _memory_cache[model_id] = (measured, now)
-    return measured
-
-
-def _reset_memory_cache() -> None:
-    """Test-only: clear the measured-memory cache."""
-    with _memory_cache_lock:
-        _memory_cache.clear()
+    with _cost_lock:
+        if model_id in _warmed_model_ids:
+            return
+    for i in range(_WARMUP_RERANKS):
+        list(provider.rerank(query, [documents[i % len(documents)]]))
+    with _cost_lock:
+        _warmed_model_ids.add(model_id)
 
 
 _CGROUP_V2_ROOT = "/sys/fs/cgroup"
@@ -880,9 +923,9 @@ def _proc_meminfo_available_bytes() -> float | None:
 
 
 def _available_ram_headroom_bytes() -> float | None:
-    """Cheap, per-call RAM-headroom read for `get_rerank_width`'s memory
-    bound — cadence is a fresh read on every call (not cached like the
-    per-doc TIME/MEMORY figures above), since this is inexpensive (a
+    """Cheap, per-call RAM-headroom read for the width fit's memory
+    bound (`rerank_for_recall`) — a fresh read on every message, since
+    this is inexpensive (a
     handful of small `/proc`-or-`/sys` reads) and lets width react to
     headroom changes mid-session (another process on the box growing), the
     same trade-off the spec's own Open Reconfirmation favors absent a
@@ -895,9 +938,9 @@ def _available_ram_headroom_bytes() -> float | None:
     fixes. Tries cgroup v2 first, then v1, then falls back to the host-wide
     `/proc/meminfo` reading only when no cgroup limit applies (or it's
     explicitly unbounded). Returns `None` — never a fabricated number —
-    when every source is unavailable/unsupported/errors; `get_rerank_width`
+    when every source is unavailable/unsupported/errors; the width fit
     treats `None` as "skip the memory term", never as "unlimited
-    headroom"."""
+    headroom". Also imported by `judge_selftune.py`."""
     headroom = _cgroup_v2_memory_headroom_bytes()
     if headroom is None:
         headroom = _cgroup_v1_memory_headroom_bytes()
@@ -906,66 +949,231 @@ def _available_ram_headroom_bytes() -> float | None:
     return headroom
 
 
-def get_rerank_width(
-    pool_size: int,
-    provider: RerankerProvider,
-    sample_documents: list[str] | None = None,
+def anchor_count(real_width: int) -> int:
+    """Anchors appended ON TOP of `real_width` real candidates (S23):
+    `k = min(P, real_width // ANCHOR_SPLIT_DIVISOR)`, so a rerank sends
+    `real_width + k` documents. With the S5 minimum of real candidates,
+    `k >= K_MIN`."""
+    return min(P, real_width // ANCHOR_SPLIT_DIVISOR)
+
+
+def prefix_cost(estimate: RerankCostEstimate, pairs: int, longest_pair_tokens: int) -> float:
+    """Predicted seconds for one rerank batch of `pairs` documents whose
+    longest (query, document) pair is `longest_pair_tokens` reranker tokens
+    (S67, S75: per-call overhead + per-token rate * padded size). The one
+    place the cost model's shape lives."""
+    return estimate.overhead_seconds + estimate.seconds_per_token * pairs * longest_pair_tokens
+
+
+def fit_rerank_width(
+    candidate_pair_tokens: Sequence[int],
+    anchor_pair_tokens: Sequence[int],
+    estimate: RerankCostEstimate | None,
+    budget_seconds: float,
+    headroom_bytes: float | None,
+    max_real: int = CANDIDATE_POOL,
 ) -> int:
-    """How many of the (cosine-coarse-cut) candidate pool to actually rerank.
+    """How many real candidates to rerank this message (spec §1).
 
-    `= max(1, min(pool_size, CANDIDATE_POOL, floor(LATENCY_BUDGET_SECONDS /
-    per_doc_TIME), floor(available_RAM_headroom / per_doc_MEMORY)))` — the
-    pre-flip revision's Change 3 formula: the original time-only bound plus
-    a MEMORY bound as an additional `min()` term. On fast (AVX2), spacious
-    hardware the measured per-doc latency and memory cost are both small
-    relative to budget/headroom, so both bounds allow a wide rerank; on slow
-    and/or RAM-tight hardware either (or both) narrows automatically,
-    staying within budget AND within a safe memory ceiling — the fp16
-    natural-width OOM (extra speed poured into a wider width with no memory
-    check) is exactly the case a time-only bound could never catch. An
-    auto-scaler computing a width under 50 on a constrained host is intended
-    (not a violation) — the whole point is that the count adapts to the
-    host, not to a fixed target.
+    `candidate_pair_tokens` are the candidates' surviving pair lengths (S62)
+    in the caller's prefix order (genuine first, then monologue-family, each
+    by cosine score, S16/S28); `anchor_pair_tokens` the same for
+    `ANCHOR_POOL` (at least `P` entries). Before the first measurement
+    (`estimate is None`) the width is the S5 minimum (S24). Otherwise it is
+    the longest prefix n <= min(len(candidates), max_real) such that the
+    batch of n real + `anchor_count(n)` anchors fits the budget
+    (`prefix_cost`, padded to its longest pair, anchors included in both
+    factors) and, when a RAM figure and a headroom reading exist, the RSS
+    growth it is predicted to need (RAM per token times its padded size
+    past the high water, see the section header) fits the headroom (S32,
+    S65: no chunking).
+    Both factors of the padded size only grow with n, so the scan stops at
+    the first prefix that does not fit.
 
-    The memory bound is SKIPPED (formula degrades to exactly the pre-
-    Change-3 time-only bound) whenever either input is unavailable: `per_doc
-    _MEMORY <= 0.0` (no measured signal — mirrors `per_doc_TIME`'s identical
-    0.0-means-"don't throttle by it" contract) or `available_RAM_headroom is
-    None` (the cheap per-call read found no usable source — see
-    `_available_ram_headroom_bytes`). This never assumes unlimited headroom;
-    it only ever narrows width when it has a genuine measured reason to.
+    The result may be below the S5 minimum; the caller then does not rerank
+    (S5/S23). Pure: no clock, no I/O."""
+    limit = min(len(candidate_pair_tokens), max_real)
+    if estimate is None:
+        return min(RERANK_MIN_REAL_CANDIDATES, limit)
+    ram_per_token = estimate.ram_bytes_per_token
+    ram_bound = ram_per_token is not None and ram_per_token > 0.0 and headroom_bytes is not None
+    width = 0
+    longest_real = 0
+    for n in range(1, limit + 1):
+        longest_real = max(longest_real, candidate_pair_tokens[n - 1])
+        k = anchor_count(n)
+        longest = max([longest_real, *anchor_pair_tokens[:k]])
+        pairs = n + k
+        if prefix_cost(estimate, pairs, longest) > budget_seconds:
+            break
+        growth = max(0, pairs * longest - estimate.peak_padded_tokens)
+        if ram_bound and ram_per_token * growth > headroom_bytes:
+            break
+        width = n
+    return width
 
-    `sample_documents` (#231-fix): a small sample of REAL candidate-pool
-    document content (see `CALIBRATION_SAMPLE_SIZE`), used to calibrate
-    `warm_per_doc` against actual corpus documents instead of a synthetic
-    placeholder — a fixed short stub massively under-measures real
-    cross-encoder cost, which made this auto-scaler a structural no-op (it
-    always computed a budget far in excess of `CANDIDATE_POOL`, so the min()
-    always picked `CANDIDATE_POOL` regardless of true per-doc cost). Optional
-    and purely additive: omitting it (or an empty list) falls back to the
-    original fixed-placeholder calibration, unchanged. The same sample feeds
-    BOTH the time and memory measurements.
 
-    `pool_size <= 0` returns 0 (nothing to rerank — the caller's empty-pool
-    case never reaches here in practice, but this stays well-defined).
-    """
-    if pool_size <= 0:
-        return 0
-    budget = tunables.get_tunable("reranker.latency_budget_seconds", LATENCY_BUDGET_SECONDS)
-    per_doc_time = _warm_per_doc_latency(provider, sample_documents)
-    if per_doc_time <= 0.0:
-        time_width = pool_size
+@dataclass(frozen=True)
+class RecallRerank:
+    """What `rerank_for_recall` did for one query.
+
+    `width` — real candidates the fit allowed (the first `width` of the
+    caller's list). `reranked` — True iff the rerank ran and its scores are
+    anchor-normalized; `normalization` then holds them (`scores[i]` belongs
+    to the caller's `i`-th candidate). When `reranked` is False the caller
+    must NOT gate any score (`normalization` is then `None`): `hand_off`
+    says why the no-rerank path takes over — "pool" (fewer than the S5
+    minimum of candidates exist), "budget" (fewer than the minimum fit the latency budget or the RAM
+    bound), "sizes" (the pairs' token lengths could not be read, so no width can be sized), or
+    "normalization" (the anchor median could not be taken).
+    `measured` — whether this call added a sample to the cost model."""
+
+    width: int
+    reranked: bool
+    hand_off: str | None
+    normalization: AnchorNormalizationResult | None
+    measured: bool
+
+
+@dataclass(frozen=True)
+class PairSizes:
+    """One query's pair token counts, computed ahead of its rerank
+    (`recall_pair_sizes`) so a caller can time them apart from the rerank
+    itself (name-recall fix R6, plan P-28: the pair-length computation is
+    part of the per-paragraph time `T_p`, not of the rerank budget).
+
+    `lengths` is `provider.pair_token_lengths(query, [*candidates, *ANCHOR_POOL])`
+    over the query's first `CANDIDATE_POOL` candidates, or `None` when the
+    tokenizer probe failed (the "sizes" hand-off)."""
+
+    lengths: list[int] | None
+
+
+def warm_up_for_recall(
+    provider: RerankerProvider, query: str, candidate_documents: Sequence[str]
+) -> None:
+    """The two discarded warm-up reranks (plan P-1), run now if this
+    process has not run them yet for the provider's model id. A caller that
+    times its own pair-size probe (`recall_pair_sizes`) calls this first, so
+    the one-time ONNX session load is never timed into `T_p`."""
+    _warm_up_once(provider, query, list(candidate_documents[:CANDIDATE_POOL]))
+
+
+def recall_pair_sizes(
+    provider: RerankerProvider, query: str, candidate_documents: Sequence[str]
+) -> PairSizes:
+    """The pair token counts `rerank_for_recall` would compute for this
+    query, computed now (see `PairSizes`). Warms up first (the real
+    provider's tokenizer exists only once its model is loaded). Raises
+    whatever the provider raises."""
+    pool = list(candidate_documents[:CANDIDATE_POOL])
+    _warm_up_once(provider, query, pool)
+    lengths = provider.pair_token_lengths(query, [*pool, *ANCHOR_POOL])
+    return PairSizes(lengths=None if lengths is None else list(lengths))
+
+
+def rerank_for_recall(
+    provider: RerankerProvider,
+    query: str,
+    candidate_documents: Sequence[str],
+    *,
+    budget_seconds: float | None = None,
+    max_real: int = CANDIDATE_POOL,
+    sizes: PairSizes | None = None,
+) -> RecallRerank:
+    """Fit this query's width, rerank that prefix with anchors on top, and
+    record the call in the cost model (spec §1, S23/S24/S32/S62/S67/S75).
+
+    `candidate_documents` are the query's candidates in prefix order (see
+    `fit_rerank_width`); only the first `CANDIDATE_POOL` are considered.
+    `budget_seconds` defaults to the `reranker.latency_budget_seconds`
+    tunable read now; `max_real` lets a caller give this query less than the
+    design maximum (name-recall fix R6, S58: what is left of the message's
+    50 real candidates; below the S5 minimum the hand-off is "allocation").
+    `sizes`, when given, are this query's pair token counts computed ahead
+    by `recall_pair_sizes` over the same documents (R6 times them into
+    `T_p`); otherwise they are computed here. Raises whatever the provider
+    raises (warm-up, lengths, scoring); callers treat that as a reranker
+    failure."""
+    pool = list(candidate_documents[:CANDIDATE_POOL])
+    cap = min(max_real, CANDIDATE_POOL)
+    if min(len(pool), cap) < RERANK_MIN_REAL_CANDIDATES:
+        return RecallRerank(
+            width=min(len(pool), max(cap, 0)),
+            reranked=False,
+            hand_off="pool" if len(pool) < RERANK_MIN_REAL_CANDIDATES else "allocation",
+            normalization=None,
+            measured=False,
+        )
+
+    if budget_seconds is None:
+        budget_seconds = tunables.get_tunable(
+            "reranker.latency_budget_seconds", LATENCY_BUDGET_SECONDS
+        )
+    model_id = provider.model_id()
+    # Warm up before the length probe: on the real provider the first rerank
+    # loads the ONNX session, and with it the tokenizer the probe uses.
+    _warm_up_once(provider, query, pool)
+    if sizes is None:
+        lengths = provider.pair_token_lengths(query, [*pool, *ANCHOR_POOL])
     else:
-        time_width = math.floor(budget / per_doc_time)
+        lengths = sizes.lengths
+        if lengths is not None and len(lengths) != len(pool) + len(ANCHOR_POOL):
+            raise ValueError(
+                f"rerank_for_recall: {len(lengths)} precomputed pair sizes for "
+                f"{len(pool)} candidates + {len(ANCHOR_POOL)} anchors"
+            )
+    if lengths is None:
+        # Token sizes unavailable (the tokenizer probe failed): a width cannot
+        # be sized against the latency budget or the RAM bound, and a batch of
+        # unknown padded size must not run unbudgeted, so this query is not
+        # reranked (the no-rerank path serves it). No sample is recorded either:
+        # the cost model holds tokens only (S75).
+        return RecallRerank(
+            width=0, reranked=False, hand_off="sizes", normalization=None, measured=False
+        )
+    candidate_tokens, anchor_tokens = lengths[: len(pool)], lengths[len(pool) :]
+    estimate = rerank_cost_estimate(model_id)
+    headroom = _available_ram_headroom_bytes() if estimate is not None else None
+    width = fit_rerank_width(candidate_tokens, anchor_tokens, estimate, budget_seconds, headroom, cap)
 
-    bounds = [pool_size, CANDIDATE_POOL, time_width]
+    if width < RERANK_MIN_REAL_CANDIDATES:
+        # PARKED SEAM (owner ruling pending: Q15 / ledger F10, stuck-width
+        # recovery). Reaching here means the MEASURED estimate says fewer
+        # than the S5 minimum fit, so this query is not reranked and so adds
+        # no new measurement. If every later message also lands here, the
+        # estimate never changes again until the process restarts (the
+        # absorbing state, criterion ADV-9). No recovery rule is built; the
+        # owner's rule, if any, goes here. `hand_off="budget"` marks this
+        # case apart from a small pool. (The RAM term alone lands here only
+        # for batches larger than any measured so far: within the high water
+        # it predicts no growth, so it cannot lock the width below a size
+        # already run.)
+        return RecallRerank(
+            width=width, reranked=False, hand_off="budget", normalization=None, measured=False
+        )
 
-    per_doc_memory = _warm_per_doc_memory(provider, sample_documents)
-    headroom = _available_ram_headroom_bytes()
-    if per_doc_memory > 0.0 and headroom is not None:
-        bounds.append(math.floor(headroom / per_doc_memory))
-
-    return max(1, min(bounds))
+    normalization = normalize_against_anchors(provider, query, pool[:width])
+    measured = False
+    if normalization.seconds is not None:
+        k = normalization.anchor_count
+        longest = max([*candidate_tokens[:width], *anchor_tokens[:k]])
+        _record_rerank_cost(
+            model_id, (width + k) * longest, normalization.seconds, normalization.rss_delta_bytes
+        )
+        measured = True
+    if not normalization.did_normalize:
+        # Raw scores: never handed to a caller that could gate them.
+        return RecallRerank(
+            width=width,
+            reranked=False,
+            hand_off="normalization",
+            normalization=None,
+            measured=measured,
+        )
+    return RecallRerank(
+        width=width, reranked=True, hand_off=None, normalization=normalization, measured=measured
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -984,27 +1192,22 @@ def get_rerank_width(
 # so a single anomalous anchor score cannot swing the whole correction, the
 # same robust-statistics posture F2a's own design favors generally.
 #
-# `k = min(P, floor(width / 2))` — the anchor count `k` is HARDWARE-DERIVED
-# from `get_rerank_width`'s own output, never a hand-picked constant [OWNER
+# `k = min(P, real_width // 2)` (`anchor_count`) — the anchor count is
+# derived from the hardware-fitted width, never a hand-picked constant [OWNER
 # 2026-09-22 "that, is a magic number constant. No. Have it scale based on
-# the hardware capability like everything else"]. Anchors are RESERVED OUT
-# OF `width`, never appended on top of it, so the one combined rerank() call
-# scores exactly `real_width + k = width` documents — the same budget-
-# derived count `get_rerank_width` already enforces, never more (I6: zero
-# net latency added over today's one bounded per-turn rerank step).
-#
-# This section builds ONLY the isolated mechanism (helper + anchor pool).
-# Wiring it into `semantic_recall.py` / `search_memories.py`'s floor-gate
-# call sites, re-pointing F2a's calibration-log write at the normalized
-# score, and the deploy-time one-time recalibration are LATER increments
-# (spec §2/§5/§6) — see `~/.claude/plans/f2b-anchor-normalization-spec.md`.
+# the hardware capability like everything else"]. Name-recall fix R1 (S23):
+# anchors now come ON TOP of the real candidates (they were reserved out of
+# the width until R1): width counts real candidates, a rerank sends
+# `real_width + k` documents, and the anchors' cost is inside the width fit
+# (`fit_rerank_width` prices the whole batch, anchors included), so the
+# per-turn rerank stays inside the latency budget (I6).
 
 # The meaningful-median floor: below 2 anchor scores, "median" degenerates
 # (a single value, or an arbitrary pick between two with no robust middle)
 # and offers no protection against one anomalous anchor swinging the whole
 # correction — the same robust-statistics reasoning the median choice above
-# rests on. SIZES the anchor mechanism (I3-clean — same precedent class as
-# `CALIBRATION_SAMPLE_SIZE` above); it is NOT a relevance threshold — no
+# rests on. SIZES the anchor mechanism (I3-clean); it is NOT a relevance
+# threshold — no
 # memory/candidate score is ever compared against `K_MIN`.
 K_MIN = 2
 
@@ -1149,116 +1352,82 @@ def normalize_bundled_pairs_against_anchors(
 
 @dataclass(frozen=True)
 class AnchorNormalizationResult:
-    """Result of `normalize_against_anchors` — everything a (later-increment)
-    caller needs to map scores back onto real candidate ids.
+    """Result of `normalize_against_anchors`.
 
-    `scores` — one float per ACTUALLY-SCORED real candidate, positionally
-    aligned with the FRONT of the caller's `real_documents` (i.e.
-    `real_documents[:real_width]` — see `real_width`). Median-normalized
+    `scores` — one float per real candidate, positionally aligned with the
+    caller's `real_documents` (all of them are scored). Median-normalized
     (`raw - median(anchor_scores)`) when `did_normalize` is True; raw,
-    unmodified reranker scores when False (the no-op case — F2a-only
-    behaviour for that call).
+    unmodified reranker scores when False (the defensive no-op below), which
+    a caller must never gate against the normalized floor.
 
-    `real_width` — how many of the caller's `real_documents` were actually
-    sent to the reranker (`== len(scores)`). Equals `width` when
-    `did_normalize` is False (no anchors reserved that call) and
-    `width - k` when True.
+    `real_width` — `len(real_documents)` (`== len(scores)`).
 
-    `did_normalize` — False on a near-degenerate `width` (`k < K_MIN`, i.e.
-    `width < 4` at today's `K_MIN`/split values): no anchors were appended,
-    `scores` are RAW. True whenever the median correction actually ran.
+    `did_normalize` — False only when `anchor_count(real_width) < K_MIN`
+    (fewer than 4 real documents): no anchors were appended, `scores` are
+    RAW. Recall callers never get here (they rerank at least the S5 minimum
+    of 5 real candidates, so k >= 2).
+
+    `anchor_count` — anchors appended on top (`0` on the no-op).
+    `seconds` / `rss_delta_bytes` — the scoring call's measurements from
+    `RerankerProvider.rerank_timed` (feed the width fit's cost model).
     """
 
     scores: list[float]
     real_width: int
     did_normalize: bool
+    anchor_count: int = 0
+    seconds: float | None = None
+    rss_delta_bytes: float | None = None
 
 
 def normalize_against_anchors(
     provider: RerankerProvider,
     query: str,
-    real_documents: list[str],
-    width: int,
+    real_documents: Sequence[str],
 ) -> AnchorNormalizationResult:
-    """Per-query anchor-median normalization (F2b, #276) — see the module
-    section header above for the mechanism and the owner ruling that shaped
-    `k`'s derivation.
+    """Per-query anchor-median normalization (F2b, #276), anchors ON TOP
+    (name-recall fix R1, S23) — see the section header above.
 
-    `real_documents` is the caller's coarse-ranked REAL candidate content,
-    already ordered best-first (the same list a caller would otherwise slice
-    to `width` and rerank directly) — this function does its OWN slicing
-    (`real_documents[:real_width]`), so callers should NOT pre-slice to
-    `width` themselves. `width` is exactly what `get_rerank_width(...)`
-    returned for this call.
+    Scores EVERY document in `real_documents` (the caller passes exactly the
+    prefix it fitted, e.g. `rerank_for_recall`'s `width`), plus
+    `k = anchor_count(len(real_documents))` anchors (`ANCHOR_POOL[:k]`)
+    appended after them, in ONE combined `rerank_timed` call; splits the
+    scores positionally back into real vs anchor and returns
+    `raw_real_scores - median(anchor_scores)`. Computed FRESH on every call:
+    the anchor offset is a per-QUERY property, so caching it across calls
+    would defeat the point of the correction.
 
-    Computes `k = min(P, width // ANCHOR_SPLIT_DIVISOR)` (anchors keep at
-    most half the rerank slots, capped at the curated pool size) and, when
-    `k >= K_MIN`, reserves
-    `k` anchors OUT OF `width` (never on top of it — `real_width = width -
-    k`), makes ONE combined `rerank(query, real_documents[:real_width] +
-    ANCHOR_POOL[:k])` call, splits the returned scores positionally back
-    into real vs. anchor, and returns `raw_real_scores - median(anchor_
-    scores)`. Computed FRESH on every call — unlike `_latency_cache` /
-    `_provider_cache` above (which memoize call-STABLE properties: warm
-    per-doc timing, a loaded model), the anchor offset is a per-QUERY
-    property, so caching it across calls would defeat the point of the
-    correction.
-
-    No-ops (raw scores, no anchors appended) when `k < K_MIN` — `width` too
-    small for a meaningful anchor median while still leaving a real
-    candidate slot; see `AnchorNormalizationResult.did_normalize`.
-
-    Total documents ever sent to `provider.rerank()` is exactly `width` in
-    both branches (`real_width + k` when normalizing, `real_width` alone —
-    `== width` — on no-op): never more than the budget-derived count
-    `get_rerank_width` already enforces (I6).
+    Defensive no-op (raw scores, no anchors appended, `did_normalize=False`)
+    when `k < K_MIN`: too few real documents for a meaningful anchor median.
 
     Anchor documents/scores are used ONLY to compute the median offset and
     are NEVER returned — callers must not treat them as candidates.
-
-    Fail-soft guard: in the anchor-reserving branch (`k >= K_MIN`), the
-    invariant `len(real_documents) >= real_width` always holds for
-    correctly-wired callers (`real_documents` is the coarse-ranked pool
-    backing `width = min(pool_size, ...) <= pool_size <= len(real_documents)`,
-    and `real_width <= width`), but is not itself enforced here. A future
-    caller that violates it would otherwise misalign the positional
-    real/anchor split — `real_documents[:real_width]` silently returns fewer
-    than `real_width` documents, so the positional
-    `raw_scores[:real_width]` / `raw_scores[real_width:]` split spills
-    anchor-scored positions into `real_scores` and can leave `anchor_scores`
-    EMPTY, calling `statistics.median([])`, which raises `StatisticsError`
-    and crashes recall. This is hot-path-adjacent, so a violation degrades
-    gracefully instead of raising: it logs a warning (so the real bug stays
-    visible) and no-ops to RAW scores over whatever `real_documents` are
-    actually available (`did_normalize=False`), same shape as the `k <
-    K_MIN` no-op above.
     """
-    k = min(P, width // ANCHOR_SPLIT_DIVISOR)
+    real = list(real_documents)
+    real_width = len(real)
+    k = anchor_count(real_width)
     if k < K_MIN:
-        real_width = width
-        scores = list(provider.rerank(query, real_documents[:real_width]))
-        return AnchorNormalizationResult(scores=scores, real_width=real_width, did_normalize=False)
-
-    real_width = width - k
-    if len(real_documents) < real_width:
-        log.warning(
-            "normalize_against_anchors: invariant len(real_documents) >= "
-            "real_width violated (len(real_documents)=%d, real_width=%d, "
-            "width=%d) — degrading to raw scores over the available "
-            "real_documents, no anchors appended",
-            len(real_documents),
-            real_width,
-            width,
+        scores, seconds, rss_delta = provider.rerank_timed(query, real)
+        return AnchorNormalizationResult(
+            scores=scores,
+            real_width=real_width,
+            did_normalize=False,
+            seconds=seconds,
+            rss_delta_bytes=rss_delta,
         )
-        scores = list(provider.rerank(query, real_documents))
-        return AnchorNormalizationResult(scores=scores, real_width=len(real_documents), did_normalize=False)
 
-    combined = real_documents[:real_width] + ANCHOR_POOL[:k]
-    raw_scores = list(provider.rerank(query, combined))
+    raw_scores, seconds, rss_delta = provider.rerank_timed(query, real + ANCHOR_POOL[:k])
     real_scores = raw_scores[:real_width]
     anchor_scores = raw_scores[real_width:]
     normalized = _median_normalize(real_scores, anchor_scores)
-    return AnchorNormalizationResult(scores=normalized, real_width=real_width, did_normalize=True)
+    return AnchorNormalizationResult(
+        scores=normalized,
+        real_width=real_width,
+        did_normalize=True,
+        anchor_count=k,
+        seconds=seconds,
+        rss_delta_bytes=rss_delta,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -187,6 +187,33 @@ def _patch_reranker(monkeypatch: pytest.MonkeyPatch, scores: dict[str, float]) -
     )
 
 
+def _prime_warm_fast_process() -> None:
+    """Name-recall fix R1 (S24): the FIRST rerank of a process runs at the
+    S5 minimum of 5 real candidates. Tests about the steady-state tier shape
+    (more than 5 standouts) prime the fake reranker's cost model with one
+    fast measured rerank, as in a process that has already recalled, so the
+    width fit covers their whole pool."""
+    from brain.memory import reranker as reranker_mod
+
+    reranker_mod._record_rerank_cost(_FAKE_RERANKER_MODEL_ID, 1_000, 1e-6, None)
+
+
+def _pad_semantic_pool(store: MemoryStore, have: int) -> None:
+    """Name-recall fix R1 (S5/S23): a rerank runs only with at least
+    RERANK_MIN_REAL_CANDIDATES candidates; pads a smaller pool with
+    low-cosine filler memories that share no word with any query here and
+    are unscripted for the fake reranker (far below any floor)."""
+    from brain.dev_constants import RERANK_MIN_REAL_CANDIDATES
+
+    for i in range(RERANK_MIN_REAL_CANDIDATES - have):
+        filler = _mem(store, f"zzfiller{i} qqpadding")
+        store._conn.execute(  # noqa: SLF001
+            "UPDATE memories SET embedding = ?, embedding_model_id = ? WHERE id = ?",
+            (_unit_vec_with_cosine(0.05).tobytes(), _SCRIPTED_MODEL_ID, filler.id),
+        )
+    store._conn.commit()  # noqa: SLF001
+
+
 def _seed_floor(
     store: MemoryStore, floor: float = _TEST_FLOOR, *, model_id: str = _FAKE_RERANKER_MODEL_ID
 ) -> None:
@@ -219,11 +246,17 @@ def _display_ids(block: str) -> list[str]:
 
 # ---------------------------------------------------------------------------
 # #88 case: paraphrase (no shared keyword) beats a keyword-overlap decoy —
-# the reranker floor-gates the decoy out, full-inject tier (1 standout).
+# the reranker floor-gates the decoy out of the SEMANTIC results, so the
+# paraphrase leads. Name-recall fix R4 (spec §5, S8): the keyword search now
+# always runs and fills the slots semantic leaves, so the decoy (a real
+# keyword hit) follows the paraphrase as a keyword result instead of being
+# suppressed; it is never ranked above it and is bumped once, as a keyword hit.
 # ---------------------------------------------------------------------------
 
 
-def test_88_paraphrase_beats_keyword_overlap_decoy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_88_paraphrase_leads_and_keyword_overlap_decoy_follows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     query = "how do I calm down when everything feels like too much"
     target = "deep breathing helps when you are feeling anxious"
     decoy = "too much of a flood of party invitations this week"
@@ -240,6 +273,7 @@ def test_88_paraphrase_beats_keyword_overlap_decoy(monkeypatch: pytest.MonkeyPat
     m_decoy = _mem(store, decoy)
 
     _seed_vectors(store, vectors, contents_by_id={m_target.id: target, m_decoy.id: decoy})
+    _pad_semantic_pool(store, 2)
     _patch_provider(monkeypatch, vectors, dim=dim)
     _seed_floor(store)
     _patch_reranker(
@@ -251,9 +285,14 @@ def test_88_paraphrase_beats_keyword_overlap_decoy(monkeypatch: pytest.MonkeyPat
     block = _build_recall_block(store, query, persona_dir=tmp_path)
 
     assert target in block, "the semantically-matching paraphrase memory surfaces"
-    assert decoy not in block, "the keyword-overlap-but-semantically-wrong decoy does NOT surface"
+    ids = _display_ids(block)
+    assert ids.index(m_target.id) == 0, "the semantic standout leads the active section"
+    assert m_decoy.id in ids, "the keyword-overlap decoy now follows as a KEYWORD hit (always merged)"
+    assert ids.index(m_decoy.id) > ids.index(m_target.id), "the decoy never outranks the paraphrase"
     assert _rc(store, m_target.id) - before_target == pytest.approx(1.0), "sole standout gets a FULL tick"
-    assert _rc(store, m_decoy.id) == before_decoy, "the excluded decoy is never bumped"
+    assert _rc(store, m_decoy.id) - before_decoy == pytest.approx(1.0), (
+        "the keyword hit sits in the first 5 positions, so it renders full and takes one full tick"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -335,18 +374,15 @@ def test_warmup_empty_vector_store_falls_back_to_lexical(tmp_path: Path) -> None
 def test_6_standouts_top5_full_plus_one_snippet_with_correct_ticks(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    _prime_warm_fast_process()
     query = "target query"
     dim = _EMBED_DIM
     contents = [f"standout memory number {i}" for i in range(6)]
     noise_content = "noise memory scored but never surfaced"
-    # F2b (#276 §3): anchors are RESERVED OUT of the auto-scaled rerank
-    # width (`real_width = width - k`, `k` growing with width) — so with
-    # only the 7 candidates above, `width == 7` would narrow `real_width`
-    # to 4, silently dropping `noise_content` (rank 6) and two standouts
-    # from ever reaching the reranker at all. These low-cosine filler
-    # candidates pad `width` up (to 15: real_width == 8) so all 7 of the
-    # candidates this test actually cares about stay within real_width —
-    # they rank BELOW noise_content and are intentionally left unscripted
+    # Low-cosine filler candidates (added for F2b, when anchors were
+    # reserved out of the width; since name-recall fix R1 anchors come on
+    # top, and `_prime_warm_fast_process` below lets the width cover the
+    # whole pool) — they rank BELOW noise_content and are intentionally left unscripted
     # (falling to FakeRerankerProvider's far-below-floor default, same as
     # noise_content historically relied on pre-F2b), so they play no part
     # in this test's own assertions either way.
@@ -419,16 +455,15 @@ def test_6_standouts_top5_full_plus_one_snippet_with_correct_ticks(
 def test_10_or_more_standouts_caps_at_9_not_lexical_fallback(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    _prime_warm_fast_process()
     query = "capped query"
     dim = _EMBED_DIM
     contents = [f"clearly relevant memory number {i}" for i in range(12)]
-    # F2b (#276 §3): with only the 12 candidates above, `width == 12` would
-    # narrow `real_width` to 6 (anchors reserved out of width), so fewer
-    # than 9 of them would ever reach the reranker at all — this padding
-    # (low-cosine, unscripted, never scored/surfaced either way) widens
-    # `width` to 18 (`real_width == 10`), enough for MORE than
-    # MAX_STANDOUT_COUNT to actually clear the floor, so the assertion
-    # below genuinely exercises the CAP, not just real_width narrowing.
+    # Low-cosine, unscripted padding (added for F2b, when anchors were
+    # reserved out of the width; harmless since name-recall fix R1). With
+    # `_prime_warm_fast_process` below the whole pool is reranked, so MORE
+    # than MAX_STANDOUT_COUNT clear the floor and the assertion below
+    # genuinely exercises the CAP.
     filler_contents = [f"unrelated filler memory {i}" for i in range(6)]
 
     vectors = {query: _query_unit_vec()}

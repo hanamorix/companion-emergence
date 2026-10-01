@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import time
 
-from brain.chat.prompt import _RECALL_STOPWORDS, _extract_recall_tokens
+from brain.chat.prompt import _RECALL_STOPWORDS, _extract_recall_tokens, _legacy_capped_tokens
 from tests.memory.recall_eval import (
     COMMON_STORE_FRACTION,
     GOLD,
@@ -203,9 +203,16 @@ def test_g9_cap_pressure_favors_in_store_tokens() -> None:
         for w in new_words:
             assert stats.get(w, (0, 0.0))[0] == 0, f"{w!r} must be df==0 in the seeded store"
 
-        selected = set(_extract_recall_tokens(msg, store))
+        ranked = _extract_recall_tokens(msg, store)
+        # Name-recall fix R4: the selector returns every survivor (no cap);
+        # the cap pressure this guards is the LEGACY top-10 selection, which
+        # still feeds the graveyard and the "not recognised" list.
+        assert len(ranked) > 10, "the selector no longer caps"
+        selected = set(_legacy_capped_tokens(ranked))
+        assert len(selected) == 10
         missing = base_selected - selected
         assert not missing, f"in-store tokens evicted under cap pressure: {missing}"
+        assert set(ranked) >= base_selected, "every survivor is returned uncapped"
     finally:
         store.close()
 

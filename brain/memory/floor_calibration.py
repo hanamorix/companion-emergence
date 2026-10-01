@@ -63,32 +63,36 @@ so retention no longer needs to cover `FLOOR_FIT_MIN_LABELED_PAIRS`'s
 worst-case multi-day accumulation, only the current day plus a small
 safety margin.
 
-HOT-PATH no-persisted-floor bootstrap (F2a inc8, #250 §7 UPDATED, Roy
-2026-09-18): `get_bootstrap_floor` below is the module's OTHER, still-
-standing cold-start path — since Change 1 removes `derive_and_persist_
-floor`'s own bundled-pairs cold-start branch (see above), this hot path is
-now the ONLY place `reranker.py`'s bundled `_FP16_GATE_PAIRS` still gets
-scored to synthesize a floor (via the shared `_cold_start_pairs` helper
-below). It serves the true first-ever-install case, before any tick has
-run: `get_bootstrap_floor` is called SYNCHRONOUSLY from
-`MemoryStore.get_reranker_floor` whenever no `reranker_floor_calibration`
-row exists yet for a model_id — i.e. it can fire on the per-turn hot path,
-on the very FIRST no-row recall of the process. It is computed ONCE per
-model_id and cached process-wide (never persisted to `memories.db` — a
+No-persisted-floor RERANK bootstrap (F2a inc8, #250 §7 UPDATED, Roy
+2026-09-18; computed off the reply path since name-recall fix S85, revised):
+`get_bootstrap_floor` below is the module's OTHER, still-standing cold-start
+path — since Change 1 removes `derive_and_persist_floor`'s own bundled-pairs
+cold-start branch (see above), it is now the ONLY place `reranker.py`'s
+bundled `_FP16_GATE_PAIRS` still gets scored to synthesize a floor (via the
+shared `_cold_start_pairs` helper below). It serves the true first-ever-install
+case, before any tick has run. It is NEVER called from a reply:
+`MemoryStore.get_reranker_floor` only peeks the process cache
+(`peek_bootstrap_floor`). `run_rerank_bootstrap` computes it in the background
+on FIRST NEED (S91: a reranked turn found no floor, `brain.memory.floor_startup.
+request_rerank_bootstrap`), a failed one is retried in the background on each
+incoming message (S92) and by the central cadence job `rerank_floor_bootstrap`
+at the next lull. It is computed
+ONCE per model_id and cached process-wide (never persisted to `memories.db` — a
 transient, in-memory-only fallback that a real persisted row always
 supersedes, see that function's docstring), and it deliberately builds its
 own reranker provider via `reranker._bootstrap_reranker_provider` rather
 than `reranker.build_reranker_provider` — the latter resolves its OWN
 model_id from the `reranker.precision` tunable (ignoring any
-caller-specified id), whereas this hot path must score the bundled pairs
-through the EXACT `model_id` `get_reranker_floor`'s caller is asking about
-(see `_bootstrap_reranker_provider`'s own docstring, current as of Change
-2's removal of the fp16/fp32 precision self-check this used to also dodge
-recursion through). Never touches the §6 torch-backed relevance judge —
-jina (ONNX, via `reranker.CrossEncoderProvider`) is the only model
-involved.
+caller-specified id), whereas this bootstrap must score the bundled pairs
+through the EXACT `model_id` it was asked about (`floor_startup.run_rerank_floor`
+calls `build_reranker_provider()` first, so the provider for the runtime
+model id is registered and cached; see `_bootstrap_reranker_provider`'s own
+docstring, current as of Change 2's removal of the fp16/fp32 precision
+self-check this used to also dodge recursion through). Never touches the §6
+torch-backed relevance judge — jina (ONNX, via `reranker.CrossEncoderProvider`)
+is the only model involved.
 
-F2b §5b (#276 inc3, UNCHANGED by Change 1): both this hot-path bootstrap
+F2b §5b (#276 inc3, UNCHANGED by Change 1): both this bootstrap
 AND (formerly) the now-removed `derive_and_persist_floor` cold-start
 branch fit on the per-query ANCHOR-NORMALIZED score
 (`raw - median(anchor_scores)`, `reranker.normalize_bundled_pairs_against_
@@ -96,12 +100,22 @@ anchors` — the FULL curated anchor pool, off the hot path), not the raw
 reranker score, so the fit lands on the same scale the per-recall floor
 gate (`reranker.normalize_against_anchors`) compares against. See
 `_cold_start_pairs` below for the shared normalization mechanism.
+
+Name-recall fix R2 (spec §2, S18/S25/S38): the same module also owns the
+COSINE floor the no-rerank path gates on (`get_cosine_bootstrap_floor`, the
+same F-beta fit over the same bundled pairs scored by the embedder, computed
+once per process at process start via `run_cosine_bootstrap`, retried at the next
+lull by the central cadence job, never on the reply path, S85; and
+`derive_and_persist_cosine_floor`, the daily fit from `cosine`-scale rows
+only into `cosine_floor_calibration`). Both derivations share `_fit_or_hold`;
+the two scales are never mixed.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -279,12 +293,40 @@ def fit_threshold_fbeta(pairs: list[tuple[float, str]], *, beta: float) -> float
     return best_threshold
 
 
+def threshold_separates(pairs: list[tuple[float, str]], threshold: float) -> bool:
+    """True iff `threshold` splits `pairs`' scores into a non-empty passing
+    side and a non-empty failing side (name-recall fix R2, review N1/N4).
+
+    `fit_threshold_fbeta` answers with a sentinel one unit past the observed
+    scores when there is nothing to separate (one label class), and its
+    recall-leaning F-beta also picks the "serve everything" candidate when the
+    classes overlap heavily; both are built for unbounded logits. A threshold
+    that passes every score or none of them is not a gate. The COSINE floor
+    (legal range [-1, 1]) refuses such a fit rather than persist or serve it.
+    """
+    passing = sum(1 for score, _ in pairs if score >= threshold)
+    return 0 < passing < len(pairs)
+
+
 # ---------------------------------------------------------------------------
 # Cold-start bootstrap fit — reuses reranker.py's bundled pairs. Pre-flip
 # revision Change 1: the ONLY caller left is `get_bootstrap_floor` below —
 # `derive_and_persist_floor`'s own cold-start branch (the daily-tick path)
 # is removed; see the module docstring.
 # ---------------------------------------------------------------------------
+
+
+# The bundled example pairs both bootstraps (rerank floor and, name-recall fix
+# R2, spec §2/S18, cosine floor) fit over, and their labels: `reranker.py`'s
+# grouping comment puts the clearly-relevant pairs first and the clearly
+# irrelevant decoys next; the borderline remainder carries no clean label.
+_BOOTSTRAP_LABELS: list[str] = ["relevant"] * 3 + ["irrelevant"] * 3
+
+
+def _bootstrap_labeled_pairs() -> list[tuple[str, str]]:
+    from brain.memory.reranker import _FP16_GATE_PAIRS
+
+    return _FP16_GATE_PAIRS[: len(_BOOTSTRAP_LABELS)]
 
 
 def _cold_start_pairs(reranker_provider: RerankerProvider) -> list[tuple[float, str]]:
@@ -321,24 +363,26 @@ def _cold_start_pairs(reranker_provider: RerankerProvider) -> list[tuple[float, 
     cold-start branch (the daily-tick path this helper used to ALSO back)
     is removed; see the module docstring.
     """
-    from brain.memory.reranker import _FP16_GATE_PAIRS, normalize_bundled_pairs_against_anchors
+    from brain.memory.reranker import normalize_bundled_pairs_against_anchors
 
-    labeled_slice = _FP16_GATE_PAIRS[:6]
-    labels = ["relevant"] * 3 + ["irrelevant"] * 3
-    normalized_scores = normalize_bundled_pairs_against_anchors(reranker_provider, labeled_slice)
-    return list(zip((float(s) for s in normalized_scores), labels, strict=True))
+    normalized_scores = normalize_bundled_pairs_against_anchors(
+        reranker_provider, _bootstrap_labeled_pairs()
+    )
+    return list(zip((float(s) for s in normalized_scores), _BOOTSTRAP_LABELS, strict=True))
 
 
 # ---------------------------------------------------------------------------
-# Hot-path bootstrap floor (F2a inc8, #250 §7 UPDATED, Roy 2026-09-18) —
-# the DEFAULT `get_reranker_floor` serves when NO persisted row exists yet,
-# so semantic recall's existence is decoupled from the daily tick ever
-# having fired. Process-wide cache, keyed by model_id, computed ONCE.
+# Rerank bootstrap floor (F2a inc8, #250 §7 UPDATED, Roy 2026-09-18) — the
+# DEFAULT `get_reranker_floor` serves (from this cache, name-recall fix S85
+# revised, S91) when NO persisted row exists yet, so semantic recall's
+# existence is decoupled from the daily tick ever having fired. Process-wide
+# cache, keyed by model_id, computed ONCE on first need in the background
+# (never on a reply).
 # ---------------------------------------------------------------------------
 
 # model_id -> the bootstrap floor dict last derived for it (same shape as
 # `MemoryStore.get_reranker_floor`'s persisted-row dict). Process-wide,
-# mirrors `reranker.py`'s `_provider_cache`/`_latency_cache` pattern
+# mirrors `reranker.py`'s `_provider_cache` pattern
 # (pre-flip revision Change 2 removed the sibling `_precision_decision_
 # cache` this comment used to also list, along with the precision
 # self-check it backed): computed once per model_id, reused by every later
@@ -349,9 +393,51 @@ _bootstrap_floor_cache: dict[str, dict[str, Any]] = {}
 _bootstrap_floor_cache_lock = threading.Lock()
 
 
+def peek_bootstrap_floor(reranker_model_id: str) -> dict[str, Any] | None:
+    """The cached RERANK bootstrap floor for `reranker_model_id`, or `None`
+    when it has not been computed in this process. NEVER computes anything
+    (S85 revised): this is what the recall path reads through
+    `MemoryStore.get_reranker_floor`."""
+    cached = _bootstrap_floor_cache.get(reranker_model_id)
+    return dict(cached) if cached is not None else None
+
+
+def rerank_bootstrap_due(reranker_model_id: str, *, activity_marker: object = None) -> bool:
+    """True when the rerank bootstrap for `reranker_model_id` is not cached, a
+    turn NEEDED it or an attempt FAILED (S91: never just because the process
+    started), and it either was never attempted or last failed under a
+    different `activity_marker` (the next-lull retry rule)."""
+    if peek_bootstrap_floor(reranker_model_id) is not None:
+        return False
+    with _state_lock:
+        wanted = ("rerank", reranker_model_id) in _bootstrap_needed or (
+            "rerank",
+            reranker_model_id,
+        ) in _bootstrap_failed_at
+    # S91: the rerank bootstrap is wanted only once a turn needed it (or an
+    # attempt failed); it is never computed just because the process started.
+    return wanted and _retry_due("rerank", reranker_model_id, activity_marker)
+
+
+def run_rerank_bootstrap(
+    reranker_model_id: str, *, activity_marker: object = None
+) -> dict[str, Any] | None:
+    """Compute the rerank bootstrap floor (process start, or the next-lull
+    retry by the cadence job; S85 revised): never on the reply path. Success
+    caches it; failure records `activity_marker`. Never raises."""
+    try:
+        result = get_bootstrap_floor(reranker_model_id)
+    except Exception:  # noqa: BLE001 — must never raise into a thread or the pass
+        logger.exception("floor_calibration: rerank bootstrap raised for %s", reranker_model_id)
+        result = None
+    _record_attempt("rerank", reranker_model_id, result is not None, activity_marker)
+    return result
+
+
 def get_bootstrap_floor(reranker_model_id: str) -> dict[str, Any] | None:
-    """Derived DEFAULT floor for `reranker_model_id`, served by
-    `MemoryStore.get_reranker_floor` whenever no persisted
+    """COMPUTE the derived DEFAULT floor for `reranker_model_id` and cache it;
+    `MemoryStore.get_reranker_floor` serves the cache (`peek_bootstrap_floor`)
+    whenever no persisted
     `reranker_floor_calibration` row exists yet (spec Section 7, UPDATED
     2026-09-18 — Roy's bootstrap-floor ruling, F2a inc8): "no floor ->
     lexical" permanently coupled semantic recall's EXISTENCE to the daily
@@ -385,14 +471,14 @@ def get_bootstrap_floor(reranker_model_id: str) -> dict[str, Any] | None:
     model_id (this cache) and NEVER involves the §6 torch-backed relevance
     judge — only jina (ONNX, via `CrossEncoderProvider`) scores the bundled
     pairs, so no torch import and no extra latency beyond this one-time cost
-    ever touch the hot path. In practice this is very often a cache HIT on
-    the underlying reranker PROVIDER too (not just this floor cache): the
-    production call sites (`run_semantic_recall`, `_semantic_top_k`) all
-    resolve/construct their own reranker provider for this exact model_id
-    via `reranker.build_reranker_provider` BEFORE ever calling `get_
-    reranker_floor`, which already populated
-    `reranker._provider_cache[model_id]` — `_bootstrap_reranker_provider`
-    reads that same cache, so the ONNX session is typically already warm.
+    ever touch the reply path. Name-recall fix S85 (revised) / S91 / S92: this
+    function is NEVER called from a reply (`get_reranker_floor` only peeks the
+    cache). `run_rerank_bootstrap` computes it in the background on first need
+    (`brain.memory.floor_startup`, after `reranker.build_reranker_provider()`
+    has registered and cached the provider for this model id, so the ONNX
+    session is warm: the turn that raised the need had just reranked), a failed
+    one is retried in the background on each incoming message and by the
+    central cadence job at the next lull.
 
     NEVER PERSISTED: this is a transient, in-memory-only fallback — the
     caller (`MemoryStore.get_reranker_floor`) always checks the PERSISTED
@@ -405,7 +491,8 @@ def get_bootstrap_floor(reranker_model_id: str) -> dict[str, Any] | None:
     turn): any failure constructing the provider or fitting the threshold
     (a reranker load error, an empty/degenerate pairs list, ...) is caught,
     logged, and returns `None` — `get_reranker_floor` then degrades to the
-    PRE-ruling contract (`None` -> caller falls back to lexical), the
+    PRE-ruling contract (`None` -> the reranker cannot gate the turn and
+    recall takes the cosine path, name-recall fix R2), the
     bootstrap's own last-resort failure path.
     """
     cached = _bootstrap_floor_cache.get(reranker_model_id)
@@ -425,7 +512,7 @@ def get_bootstrap_floor(reranker_model_id: str) -> dict[str, Any] | None:
         except Exception:  # noqa: BLE001 — fail-soft: must never break a recall/self-check
             logger.exception(
                 "floor_calibration: bootstrap floor computation failed for %s -> "
-                "get_reranker_floor degrades to the pre-ruling None/lexical-fallback contract",
+                "get_reranker_floor degrades to the pre-ruling None contract (cosine path)",
                 reranker_model_id,
             )
             return None
@@ -452,6 +539,210 @@ def _reset_bootstrap_floor_cache() -> None:
     """
     with _bootstrap_floor_cache_lock:
         _bootstrap_floor_cache.clear()
+    with _state_lock:
+        for key in [k for k in _bootstrap_failed_at if k[0] == "rerank"]:
+            del _bootstrap_failed_at[key]
+        _bootstrap_needed.difference_update({k for k in _bootstrap_needed if k[0] == "rerank"})
+
+
+# ---------------------------------------------------------------------------
+# Cosine-floor bootstrap (name-recall fix R2, spec §2, S18/S25/S38): the same
+# F-beta fit over the same bundled example pairs, but the pairs' scores are
+# the cosine similarities of their embeddings under the production embedder.
+# Process-wide cache keyed by embedder model id, computed ONCE, never
+# persisted (the daily tick's `derive_and_persist_cosine_floor` supersedes it
+# for good once it writes a row).
+#
+# Name-recall fix S85 (spec §2, revised): the bootstrap is NEVER computed on the
+# reply path. `MemoryStore.get_cosine_floor` only PEEKS the cache
+# (`peek_cosine_bootstrap_floor`); `run_cosine_bootstrap` computes it once per
+# process at process start (bridge startup thread, `nell chat --no-bridge`
+# session start: `brain.memory.floor_startup`), and on failure the central
+# cadence job retries it at the next lull. Until a cosine floor exists
+# (bootstrap or calibrated) the no-rerank path renders keyword results only.
+# ---------------------------------------------------------------------------
+
+_cosine_bootstrap_floor_cache: dict[str, dict[str, Any]] = {}
+_cosine_bootstrap_floor_cache_lock = threading.Lock()
+# Guards ONLY the small retry-bookkeeping state below (`_bootstrap_failed_at`,
+# `_bootstrap_needed`), for both floors. Deliberately NOT the compute locks:
+# `get_cosine_bootstrap_floor` / `get_bootstrap_floor` hold those across a model
+# download/load, and the reply thread reads this state (the `respond()` hook,
+# the first-need request), so it must never wait behind a bootstrap (S91/S92:
+# "never on the reply path").
+_state_lock = threading.Lock()
+
+
+def _cosine_bootstrap_pairs(embedder: Any) -> list[tuple[float, str]]:
+    """Cosine similarity of each bundled labeled pair under `embedder`, with
+    its label. ONE `embed_batch` over every query then every document, so the
+    scores come from the same model call shape the recall path uses."""
+    from brain.memory.embeddings import cosine_similarity
+
+    labeled = _bootstrap_labeled_pairs()
+    vectors = embedder.embed_batch([q for q, _ in labeled] + [d for _, d in labeled])
+    count = len(labeled)
+    scores = [cosine_similarity(vectors[i], vectors[count + i]) for i in range(count)]
+    return list(zip(scores, _BOOTSTRAP_LABELS, strict=True))
+
+
+# Retry rule after a failed bootstrap (S85 revised): NO time constants. A
+# failed attempt records the caller's chat-activity marker (an opaque token that
+# changes whenever the user chats: `cli_throttle.chat_activity_marker()` in the
+# bridge). The bootstrap is due again only once that marker has CHANGED, i.e.
+# chat happened since the failure and the central cadence job then reaches the
+# next lull: at most one retry per lull, never one per turn or per pass.
+_UNSET = object()
+# ("cosine" | "rerank", model id) -> the activity marker at the last failure.
+_bootstrap_failed_at: dict[tuple[str, str], object] = {}
+# ("rerank", model id) pairs a reranking turn found without a floor (S91): the
+# rerank bootstrap is wanted only once a turn needed it, never at process start.
+_bootstrap_needed: set[tuple[str, str]] = set()
+
+
+def note_bootstrap_needed(kind: str, model_id: str) -> None:
+    """Record that a turn needed the `kind` bootstrap floor and found none."""
+    with _state_lock:
+        _bootstrap_needed.add((kind, model_id))
+
+
+def forget_failure(kind: str, model_id: str) -> None:
+    """Drop the failed-attempt record of a floor that no longer needs a
+    bootstrap (a calibrated row exists), so the message retry stops spawning."""
+    with _state_lock:
+        _bootstrap_failed_at.pop((kind, model_id), None)
+
+
+def bootstrap_failed(kind: str, model_id: str) -> bool:
+    """True when a `kind` bootstrap attempt for `model_id` failed and no floor
+    has been cached since (the on-each-message background retry, S92)."""
+    with _state_lock:
+        return (kind, model_id) in _bootstrap_failed_at
+
+
+def peek_cosine_bootstrap_floor(embedder_model_id: str) -> dict[str, Any] | None:
+    """The cached cosine bootstrap floor for `embedder_model_id`, or `None`
+    when it has not been computed in this process. NEVER computes anything
+    (S85): this is what the reply path reads through
+    `MemoryStore.get_cosine_floor`."""
+    cached = _cosine_bootstrap_floor_cache.get(embedder_model_id)
+    return dict(cached) if cached is not None else None
+
+
+def _retry_due(kind: str, model_id: str, activity_marker: object) -> bool:
+    with _state_lock:
+        failed = _bootstrap_failed_at.get((kind, model_id), _UNSET)
+    return failed is _UNSET or failed != activity_marker
+
+
+def _record_attempt(kind: str, model_id: str, ok: bool, activity_marker: object) -> None:
+    with _state_lock:
+        if ok:
+            _bootstrap_failed_at.pop((kind, model_id), None)
+            _bootstrap_needed.discard((kind, model_id))
+        else:
+            _bootstrap_failed_at[(kind, model_id)] = activity_marker
+
+
+def cosine_bootstrap_due(embedder_model_id: str, *, activity_marker: object = None) -> bool:
+    """True when the cosine bootstrap for `embedder_model_id` is not cached and
+    either was never attempted or last failed under a different
+    `activity_marker` (the next-lull retry rule above)."""
+    if peek_cosine_bootstrap_floor(embedder_model_id) is not None:
+        return False
+    return _retry_due("cosine", embedder_model_id, activity_marker)
+
+
+def run_cosine_bootstrap(
+    embedder_model_id: str, *, activity_marker: object = None
+) -> dict[str, Any] | None:
+    """Compute the cosine bootstrap floor (process start, or the next-lull
+    retry by the cadence job; S85). Success caches it for the process; failure
+    records `activity_marker` so it is not retried until chat has happened
+    again. Never raises."""
+    try:
+        result = get_cosine_bootstrap_floor(embedder_model_id)
+    except Exception:  # noqa: BLE001 — must never raise into a thread or the pass
+        logger.exception("floor_calibration: cosine bootstrap raised for %s", embedder_model_id)
+        result = None
+    _record_attempt("cosine", embedder_model_id, result is not None, activity_marker)
+    return result
+
+
+def get_cosine_bootstrap_floor(embedder_model_id: str) -> dict[str, Any] | None:
+    """COMPUTE the derived DEFAULT cosine floor for `embedder_model_id` and
+    cache it (spec §2, S18: "until a calibrated cosine floor exists, a starting
+    value is computed with the same F-beta fit over the same bundled example
+    pairs"). Same dict shape as `get_bootstrap_floor`, with `embedder_model_id`
+    in place of `reranker_model_id`.
+
+    OFF THE REPLY PATH ONLY (S85): the only caller is `run_cosine_bootstrap`
+    (process-start thread, or the central-cadence retry job);
+    `MemoryStore.get_cosine_floor` reads the cache through
+    `peek_cosine_bootstrap_floor` and never calls this.
+
+    The embedder is the process-cached production provider
+    (`embeddings.build_embedding_provider()`, looked up through the module so
+    a test's monkeypatch is honoured). Its `model_id()` must equal the
+    requested id: a floor fit under one embedder is never served for another.
+
+    FAIL-SOFT: any failure (provider build/embed error, id mismatch,
+    degenerate pairs) is logged and returns `None` (never cached;
+    `run_cosine_bootstrap` records the failure and the cadence job retries at
+    the next lull); until a floor exists the no-rerank path renders keyword results only (spec §2). Never an
+    ungated cosine ranking.
+    """
+    cached = _cosine_bootstrap_floor_cache.get(embedder_model_id)
+    if cached is not None:
+        return dict(cached)
+    with _cosine_bootstrap_floor_cache_lock:
+        cached = _cosine_bootstrap_floor_cache.get(embedder_model_id)
+        if cached is not None:
+            return dict(cached)
+        try:
+            from brain.memory import embeddings as embeddings_mod
+
+            embedder = embeddings_mod.build_embedding_provider()
+            if embedder.model_id() != embedder_model_id:
+                raise RuntimeError(
+                    f"embedder model id {embedder.model_id()!r} != requested {embedder_model_id!r}"
+                )
+            pairs = _cosine_bootstrap_pairs(embedder)
+            beta = tunables.get_tunable("calibration.floor_fit_beta", FLOOR_FIT_BETA)
+            floor = fit_threshold_fbeta(pairs, beta=beta)
+            if not threshold_separates(pairs, floor):
+                raise RuntimeError(
+                    f"the bundled pairs' cosines are not separated by any threshold "
+                    f"(fit {floor:.4f}); the embedder cannot gate"
+                )
+        except Exception:  # noqa: BLE001 — fail-soft: must never break a recall
+            logger.exception(
+                "floor_calibration: cosine bootstrap floor computation failed for %s -> "
+                "no cosine gate (the no-rerank path stays keyword-only)",
+                embedder_model_id,
+            )
+            return None
+        result: dict[str, Any] = {
+            "embedder_model_id": embedder_model_id,
+            "floor": floor,
+            "raw_fit_floor": floor,
+            "sample_pairs": len(pairs),
+            "is_cold_start": True,
+            "updated_at": None,
+        }
+        _cosine_bootstrap_floor_cache[embedder_model_id] = result
+        return dict(result)
+
+
+def _reset_cosine_bootstrap_floor_cache() -> None:
+    """Test-only: clear the cached cosine bootstrap floor(s); wired into
+    `tests/conftest.py` next to `_reset_bootstrap_floor_cache`."""
+    with _cosine_bootstrap_floor_cache_lock:
+        _cosine_bootstrap_floor_cache.clear()
+    with _state_lock:
+        for key in [k for k in _bootstrap_failed_at if k[0] == "cosine"]:
+            del _bootstrap_failed_at[key]
+        _bootstrap_needed.difference_update({k for k in _bootstrap_needed if k[0] == "cosine"})
 
 
 # ---------------------------------------------------------------------------
@@ -488,7 +779,7 @@ class FloorDerivationOutcome:
     the backstop held with NO prior row at all (a fresh deploy still inside
     Change 1's data-starvation ramp — nothing is in effect from THIS
     module for that case; per-turn recall still gets a served floor from
-    the separate, transient `get_bootstrap_floor` hot path — see
+    the separate, transient `get_bootstrap_floor` cache — see
     `MemoryStore.get_reranker_floor`)."""
 
     raw_fit_floor: float | None
@@ -519,10 +810,13 @@ class FloorDerivationOutcome:
     unrelated to this field."""
 
     held_for_data_starvation: bool
-    """True iff the most recently completed day's usable labeled-pair
-    count fell below `FLOOR_FIT_MIN_LABELED_PAIRS` this cycle (whether or
-    not a prior row existed to hold) — replaces the removed stability
-    gate's `held_for_stability`. Holds carry NO memory: the very next day
+    """True iff this cycle had no usable fit: the most recently completed
+    day's usable labeled-pair count fell below `FLOOR_FIT_MIN_LABELED_PAIRS`
+    (whether or not a prior row existed to hold), or — the cosine floor only,
+    name-recall fix R2 — its fit passed all or none of the day's scores
+    (`threshold_separates`), so `sample_pairs` can be at or above the minimum
+    with this flag set. Replaces the removed stability gate's
+    `held_for_stability`. Holds carry NO memory: the very next day
     that clears the threshold fits fresh from that day alone, with no
     dependence on however many prior holds preceded it (unlike the removed
     stability gate, which compared every later day against the same
@@ -559,7 +853,7 @@ def derive_and_persist_floor(store: MemoryStore, reranker_model_id: str) -> Floo
              crash on the `None` prior, do not synthesize a floor just to
              have something to persist — `floor`/`raw_fit_floor` in the
              returned outcome are `None`. Recall stays served meanwhile by
-             the separate hot-path `get_bootstrap_floor`
+             the separate `get_bootstrap_floor` cache
              (`MemoryStore.get_reranker_floor`'s own no-persisted-row
              fallback, untouched by this revision). Once some day
              accumulates `>= FLOOR_FIT_MIN_LABELED_PAIRS` real pairs, this
@@ -578,25 +872,98 @@ def derive_and_persist_floor(store: MemoryStore, reranker_model_id: str) -> Floo
     ever needed a bootstrap RNG. Neither exists in this function anymore —
     see the module docstring's "What is removed."
     """
+    return _fit_or_hold(
+        model_id=reranker_model_id,
+        real_pairs=store.labeled_calibration_pairs(reranker_model_id),
+        read_prior=lambda: store.get_persisted_reranker_floor(reranker_model_id),
+        write=lambda floor, n_pairs: store.write_reranker_floor(
+            reranker_model_id,
+            floor=floor,
+            raw_fit_floor=floor,
+            sample_pairs=n_pairs,
+            is_cold_start=False,
+        ),
+        label="floor calibration",
+    )
+
+
+def derive_and_persist_cosine_floor(
+    store: MemoryStore, embedder_model_id: str
+) -> FloorDerivationOutcome:
+    """The COSINE-scale twin of `derive_and_persist_floor` (name-recall fix
+    R2, spec §2, S25/S38): fit the cosine floor for `embedder_model_id` from
+    the most recently completed day's labeled `cosine`-scale rows only
+    (`MemoryStore.labeled_calibration_pairs(..., score_scale='cosine')`, the
+    embedder model id being the row's `reranker_model_id`) and persist it to
+    `cosine_floor_calibration`. Same day scope, same F-beta fit, same
+    `FLOOR_FIT_MIN_LABELED_PAIRS` data-starvation backstop (hold the prior
+    row, or write nothing while none exists and the bootstrap serves), so the
+    two scales are fit by one mechanism and never from each other's rows."""
+    from brain.memory.store import COSINE_SCORE_SCALE
+
+    return _fit_or_hold(
+        model_id=embedder_model_id,
+        real_pairs=store.labeled_calibration_pairs(embedder_model_id, COSINE_SCORE_SCALE),
+        read_prior=lambda: store.get_persisted_cosine_floor(embedder_model_id),
+        write=lambda floor, n_pairs: store.write_cosine_floor(
+            embedder_model_id,
+            floor=floor,
+            raw_fit_floor=floor,
+            sample_pairs=n_pairs,
+            is_cold_start=False,
+        ),
+        label="cosine floor calibration",
+        require_separating_threshold=True,
+    )
+
+
+def _fit_or_hold(
+    *,
+    model_id: str,
+    real_pairs: list[tuple[float, str]],
+    read_prior: Callable[[], dict[str, Any] | None],
+    write: Callable[[float, int], None],
+    label: str,
+    require_separating_threshold: bool = False,
+) -> FloorDerivationOutcome:
+    """The fit-or-hold core both floors share (Change 1's "nimble floor"
+    mechanism, unchanged): a day with `>= FLOOR_FIT_MIN_LABELED_PAIRS` labeled
+    pairs is fit and persisted directly; otherwise the data-starvation
+    backstop holds the persisted prior (or writes nothing when there is none).
+
+    `require_separating_threshold` (the cosine floor, name-recall fix R2
+    review F1/N1): a fit that passes every one of the day's scores, or none of
+    them, is not a gate (`threshold_separates`). That is what
+    `fit_threshold_fbeta` returns for a single-class day (a sentinel one unit
+    past the observed scores, built for unbounded logits) and for a heavily
+    overlapping or skewed day where "serve everything" maximises its
+    recall-leaning F-beta. On the cosine scale (legal range [-1, 1]) that
+    persists a floor no cosine can reach or one that gates nothing. Such a day
+    is treated as no usable fit: hold the prior, or write nothing while the
+    bootstrap serves. The rerank floor keeps its pre-R2 behaviour.
+    """
     beta = tunables.get_tunable("calibration.floor_fit_beta", FLOOR_FIT_BETA)
     min_labeled_pairs = tunables.get_tunable(
         "calibration.floor_fit_min_labeled_pairs", FLOOR_FIT_MIN_LABELED_PAIRS
     )
 
-    real_pairs = store.labeled_calibration_pairs(reranker_model_id)
-
-    if len(real_pairs) >= min_labeled_pairs:
-        raw_floor = fit_threshold_fbeta(real_pairs, beta=beta)
-        store.write_reranker_floor(
-            reranker_model_id,
-            floor=raw_floor,
-            raw_fit_floor=raw_floor,
-            sample_pairs=len(real_pairs),
-            is_cold_start=False,
-        )
+    fit_is_usable = len(real_pairs) >= min_labeled_pairs
+    raw_floor = fit_threshold_fbeta(real_pairs, beta=beta) if fit_is_usable else None
+    if raw_floor is not None and require_separating_threshold and not threshold_separates(
+        real_pairs, raw_floor
+    ):
         logger.info(
-            "floor calibration: wrote raw floor=%.4f for %s, sample_pairs=%d (no EMA, no gate)",
-            raw_floor, reranker_model_id, len(real_pairs),
+            "%s: the day's %d labeled pairs for %s fit a threshold (%.4f) that passes all or none "
+            "of them — no gate to persist, treating as no usable fit",
+            label, len(real_pairs), model_id, raw_floor,
+        )
+        fit_is_usable = False
+
+    if fit_is_usable and raw_floor is not None:
+        write(raw_floor, len(real_pairs))
+        logger.info(
+            "%s: wrote raw floor=%.4f for %s, sample_pairs=%d (no EMA, no gate)",
+            label, raw_floor, model_id, len(real_pairs),
         )
         return FloorDerivationOutcome(
             accepted=True,
@@ -608,16 +975,18 @@ def derive_and_persist_floor(store: MemoryStore, reranker_model_id: str) -> Floo
         )
 
     # Data-starvation backstop: the most recently completed day did not
-    # clear FLOOR_FIT_MIN_LABELED_PAIRS. Read the PERSISTED-ONLY prior row
-    # (never the transient bootstrap `get_reranker_floor` would otherwise
-    # serve on a miss) so the no-prior-row edge case below is judged on
-    # whether a REAL row exists, not on whether SOME floor is servable.
-    prior = store.get_persisted_reranker_floor(reranker_model_id)
+    # clear FLOOR_FIT_MIN_LABELED_PAIRS (or, for the cosine floor, fit a
+    # threshold that gates nothing). Read the PERSISTED-ONLY prior row
+    # (never the transient bootstrap the floor getter would otherwise serve
+    # on a miss) so the no-prior-row edge case below is judged on whether a
+    # REAL row exists, not on whether SOME floor is servable.
+    prior = read_prior()
     if prior is not None:
         logger.info(
-            "floor calibration: data-starvation backstop held the floor for %s "
-            "(sample_pairs=%d < min=%d; holding prior floor=%.4f unchanged, no refit attempted)",
-            reranker_model_id, len(real_pairs), min_labeled_pairs, prior["floor"],
+            "%s: data-starvation backstop held the floor for %s "
+            "(sample_pairs=%d, min=%d, no usable fit; holding prior floor=%.4f unchanged, "
+            "no refit attempted)",
+            label, model_id, len(real_pairs), min_labeled_pairs, prior["floor"],
         )
         return FloorDerivationOutcome(
             accepted=False,
@@ -629,10 +998,10 @@ def derive_and_persist_floor(store: MemoryStore, reranker_model_id: str) -> Floo
         )
 
     logger.info(
-        "floor calibration: data-starvation backstop, no prior floor row for %s "
-        "(sample_pairs=%d < min=%d) — writing nothing; recall stays served by "
-        "get_bootstrap_floor in the meantime",
-        reranker_model_id, len(real_pairs), min_labeled_pairs,
+        "%s: data-starvation backstop, no prior floor row for %s "
+        "(sample_pairs=%d, min=%d, no usable fit) — writing nothing; recall stays served by "
+        "the bootstrap floor in the meantime",
+        label, model_id, len(real_pairs), min_labeled_pairs,
     )
     return FloorDerivationOutcome(
         accepted=False,

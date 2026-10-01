@@ -30,6 +30,13 @@ from __future__ import annotations
 # constant is memories.db-specific, not a global sqlite default.
 MEMORIES_DB_BUSY_TIMEOUT_S: float = 30.0
 
+# --- known-names file name (name-recall fix N1, S26) -------------------------
+# The kindled's running list of known name words: its own small SQLite file in
+# the persona directory, NOT memories.db and not keyed to memories (S19, S26).
+# A fixed dev-level file name: nothing reads or overrides it at run time. See
+# `brain.memory.known_names`.
+KNOWN_NAMES_DB_FILENAME: str = "known_names.db"
+
 # --- sqlite store integrity-check transient-error retry (C16 Windows CI
 # flake, INC-10 follow-up, ram-spike-fix; generalized from MemoryStore-only
 # to all 4 sqlite stores per orchestrator directive 2026-09-28) ------------
@@ -101,3 +108,33 @@ PASS2_NOBRIDGE_DRAIN_BUDGET_S: float = 20.0
 # first search on a slow CPU can legitimately take 44-60 s+ (O7/O15) — that is
 # a known, accepted consequence of this bound, not a defect.
 SEARCH_BRIDGE_TIMEOUT_S: float = 45.0
+
+# --- recall diagnostics log file name (name-recall fix D1, S59) -------------
+# One JSONL record per passive recall or `search_memories` call, in the
+# persona directory beside the other persona JSONL logs (NOT memories.db and
+# NOT the calibration log, S30). A file name is a fixed dev-level constant:
+# nothing reads or overrides it at run time. See
+# `brain.memory.recall_diagnostics`.
+RECALL_DIAGNOSTICS_LOG_FILENAME: str = "recall_diagnostics.log.jsonl"
+
+# --- rerank minimum (name-recall fix R1, S5/S23/S24) ------------------------
+# The fewest REAL memory candidates a rerank runs with: when fewer fit the
+# latency budget (or the pool holds fewer), the rerank is skipped and the
+# no-rerank path takes over; it is also the width before the first cost
+# measurement of a process. The owner's number (S5: "if the number of
+# candidates it can score in a given time is lower than 5, just don't rerank
+# them"), not a tuned value. With it, a rerank always carries at least
+# `reranker.K_MIN` anchors (k = min(8, real // 2) = 2 at 5 real).
+RERANK_MIN_REAL_CANDIDATES: int = 5
+
+# --- monologue family (name-recall fix R3, S13/S16) -------------------------
+# The memory types the kindled's own generated inner-monologue machinery
+# writes. In semantic recall they rank AFTER genuine memories within each path
+# and genuine candidates are taken first for rerank slots (spec §4): a
+# structural ordering, never a score multiplier. A fixed dev-level set of the
+# four types the spec names (monologue, monologue_trace, monologue_emotion,
+# monologue_soul_candidate); nothing reads or overrides it at run time. See
+# `brain.memory.semantic_recall.is_monologue_family`.
+MONOLOGUE_FAMILY_TYPES: frozenset[str] = frozenset(
+    {"monologue", "monologue_trace", "monologue_emotion", "monologue_soul_candidate"}
+)

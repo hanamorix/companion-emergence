@@ -12,6 +12,7 @@ no sleeps with tight margins, no real LLM/model, synthetic tmp personas only.
 job calls, so the job wiring (names, order, due sources, cadence files,
 outcomes) is the code under test, not a proxy.
 """
+
 from __future__ import annotations
 
 import ast
@@ -132,7 +133,15 @@ def stubs(monkeypatch):
     every no-interval/predicate job report work. The job table itself, the
     central function and the cadence handling stay real."""
     order: list[str] = []
-    work = dict.fromkeys((*NO_INTERVAL_JOBS, "deploy_recalibration"), True)
+    work = dict.fromkeys(
+        (
+            *NO_INTERVAL_JOBS,
+            "deploy_recalibration",
+            "cosine_floor_bootstrap",
+            "rerank_floor_bootstrap",
+        ),
+        True,
+    )
 
     def rec(name, ret=None):
         def _f(*_a, **_k):
@@ -155,7 +164,9 @@ def stubs(monkeypatch):
         return 1
 
     monkeypatch.setattr(pass2_queue, "drain_all_locked", _pass2_drain)
-    monkeypatch.setattr(supervisor, "_snapshot_has_work", lambda _pd: work["session_snapshot_prune"])
+    monkeypatch.setattr(
+        supervisor, "_snapshot_has_work", lambda _pd: work["session_snapshot_prune"]
+    )
     monkeypatch.setattr(supervisor, "snapshot_stale_sessions", rec("session_snapshot_prune", []))
     monkeypatch.setattr(
         supervisor, "_emotion_backfill_has_work", lambda _pd, **_k: work["emotion_backfill"]
@@ -163,7 +174,9 @@ def stubs(monkeypatch):
     # INC-10: _emotion_backfill_job reads .status off the return value to
     # tell a real between-items pause ("running") from a finish.
     monkeypatch.setattr(
-        supervisor, "_emotion_backfill_run", rec("emotion_backfill", SimpleNamespace(status="complete"))
+        supervisor,
+        "_emotion_backfill_run",
+        rec("emotion_backfill", SimpleNamespace(status="complete")),
     )
     monkeypatch.setattr(
         supervisor, "_embedding_backfill_has_work_probe", lambda _s: work["embedding_backfill"]
@@ -176,6 +189,18 @@ def stubs(monkeypatch):
             SimpleNamespace(scanned=0, embedded=0, skipped_short=0, errors=0, batch_size=1),
         ),
     )
+    monkeypatch.setattr(
+        supervisor.floor_startup,
+        "cosine_floor_due",
+        lambda _s, **_k: work["cosine_floor_bootstrap"],
+    )
+    monkeypatch.setattr(supervisor.floor_startup, "run_cosine_floor", rec("cosine_floor_bootstrap"))
+    monkeypatch.setattr(
+        supervisor.floor_startup,
+        "rerank_floor_due",
+        lambda _s, **_k: work["rerank_floor_bootstrap"],
+    )
+    monkeypatch.setattr(supervisor.floor_startup, "run_rerank_floor", rec("rerank_floor_bootstrap"))
     monkeypatch.setattr(supervisor, "forgetting_run_pass", rec("maintenance"))
     monkeypatch.setattr(supervisor, "_run_narrative_memory_pass", lambda *a, **k: None)
     monkeypatch.setattr("brain.files.pending.sweep_expired", lambda *a, **k: None)
@@ -213,9 +238,7 @@ def _pass(persona_dir, jobs, *, idle=True, slot=True, now=NOW, between_jobs=None
 
 
 def _fake_jobs(names, log, *, due=True):
-    return [
-        GatedJob(n, run=(lambda n=n: log.append(n)), has_work=(lambda: due)) for n in names
-    ]
+    return [GatedJob(n, run=(lambda n=n: log.append(n)), has_work=(lambda: due)) for n in names]
 
 
 # ---------------------------------------------------------------------------
@@ -223,10 +246,13 @@ def _fake_jobs(names, log, *, due=True):
 # ---------------------------------------------------------------------------
 
 
-def test_job_table_is_the_14_gated_jobs_in_the_s55_order(tmp_path):
+def test_job_table_is_the_16_gated_jobs_in_the_s55_order(tmp_path):
     names = [j.name for j in _real_jobs(_persona(tmp_path))]
     assert names == list(GATED_JOB_ORDER)
-    assert len(names) == 14
+    assert len(names) == 16
+    # S85 (revised): the two floor-bootstrap RETRY jobs follow embedding backfill.
+    i_bs = names.index("embedding_backfill")
+    assert names[i_bs + 1 : i_bs + 3] == ["cosine_floor_bootstrap", "rerank_floor_bootstrap"]
     # C38: deploy recalibration immediately after clustering, immediately
     # before daily calibration; C15/S43: calibration before self-tune.
     i = names.index("deploy_recalibration")
@@ -242,7 +268,13 @@ def test_job_table_due_sources(tmp_path):
         assert jobs[name].cadence_file == filename and jobs[name].interval_s == interval
     # No-interval jobs (S53/S66) and the predicate jobs (S70 deploy, S29
     # self-model) own no cadence file here.
-    for name in (*NO_INTERVAL_JOBS, "deploy_recalibration", "self_model_articulation"):
+    for name in (
+        *NO_INTERVAL_JOBS,
+        "cosine_floor_bootstrap",
+        "rerank_floor_bootstrap",
+        "deploy_recalibration",
+        "self_model_articulation",
+    ):
         assert jobs[name].cadence_file is None and jobs[name].has_work is not None
 
 
@@ -256,7 +288,7 @@ def test_unknown_job_name_is_rejected():
 # ---------------------------------------------------------------------------
 
 
-def test_c15a_all_14_due_run_in_s55_order_real_table(tmp_path, stubs):
+def test_c15a_all_16_due_run_in_s55_order_real_table(tmp_path, stubs):
     persona_dir = _persona(tmp_path)
     _seed_all_overdue(persona_dir)
     decisions = _pass(persona_dir, _real_jobs(persona_dir))
@@ -319,7 +351,7 @@ def test_c5_no_gated_job_starts_inside_the_lull_then_all_start_after(tmp_path, s
         assert stubs.order == [], f"a gated job started inside the lull (t-t0={t - t0})"
 
     _pass(persona_dir, jobs, idle=lambda: cli_throttle.is_chat_idle(now=t0 + lull))
-    assert stubs.order == list(GATED_JOB_ORDER), "all 14 due jobs start at the first pass after"
+    assert stubs.order == list(GATED_JOB_ORDER), "all 16 due jobs start at the first pass after"
 
 
 def test_c5_reply_in_flight_blocks_even_past_the_lull(tmp_path, stubs):
@@ -427,13 +459,11 @@ def test_c6_skip_leaves_every_cadence_file_byte_identical_and_still_due(tmp_path
     jobs = _real_jobs(persona_dir)
     before = _snapshot_bytes(persona_dir)
 
-    decisions = _pass(
-        persona_dir, jobs, idle=(deny != "no-lull"), slot=(deny != "slot")
-    )
+    decisions = _pass(persona_dir, jobs, idle=(deny != "no-lull"), slot=(deny != "slot"))
     assert stubs.order == []
     assert _snapshot_bytes(persona_dir) == before
     if deny == "slot":
-        assert [d.action for d in decisions if d.action != "init-cadence"] == ["skip-slot"] * 14
+        assert [d.action for d in decisions if d.action != "init-cadence"] == ["skip-slot"] * 16
 
     _pass(persona_dir, jobs)  # next pass, idle + slot: every job still due
     assert stubs.order == list(GATED_JOB_ORDER)
@@ -450,7 +480,13 @@ def test_c6_inner_slot_denial_is_a_skip_not_a_run(tmp_path, stubs, monkeypatch):
     decisions = _pass(persona_dir, _real_jobs(persona_dir))
     skipped = {d.job for d in decisions if d.action == "skipped"}
     assert skipped == {
-        "pass2", "embedding_backfill", "maintenance", "interest_sweep", "weekly_selftune"
+        "pass2",
+        "embedding_backfill",
+        "cosine_floor_bootstrap",
+        "rerank_floor_bootstrap",
+        "maintenance",
+        "interest_sweep",
+        "weekly_selftune",
     }
     after = _snapshot_bytes(persona_dir)
     for name in ("maintenance", "interest_sweep", "weekly_selftune"):
@@ -898,8 +934,12 @@ def _floor(persona_dir, model_id, scale):
     store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
     try:
         store.write_reranker_floor(
-            model_id, floor=1.0, raw_fit_floor=1.0, sample_pairs=200,
-            is_cold_start=False, score_scale=scale,
+            model_id,
+            floor=1.0,
+            raw_fit_floor=1.0,
+            sample_pairs=200,
+            is_cold_start=False,
+            score_scale=scale,
         )
     finally:
         store.close()
@@ -916,11 +956,17 @@ def test_c38_fresh_floor_is_not_due(tmp_path, fake_reranker):
 def test_c38_raw_scale_floor_is_due_regardless_of_retry_file(tmp_path, fake_reranker):
     persona_dir = _persona(tmp_path)
     _floor(persona_dir, fake_reranker, "raw")
-    _seed(persona_dir, supervisor._DEPLOY_RECAL_RETRY_CADENCE_FILE, datetime.now(UTC) + timedelta(hours=5))
+    _seed(
+        persona_dir,
+        supervisor._DEPLOY_RECAL_RETRY_CADENCE_FILE,
+        datetime.now(UTC) + timedelta(hours=5),
+    )
     assert supervisor._deploy_recalibration_due(persona_dir) is True
 
 
-def test_c38_no_row_is_due_at_first_lull_then_retried_at_most_daily(tmp_path, fake_reranker, monkeypatch):
+def test_c38_no_row_is_due_at_first_lull_then_retried_at_most_daily(
+    tmp_path, fake_reranker, monkeypatch
+):
     from brain.memory import floor_calibration as fc_mod
 
     persona_dir = _persona(tmp_path)
@@ -929,10 +975,15 @@ def test_c38_no_row_is_due_at_first_lull_then_retried_at_most_daily(tmp_path, fa
     monkeypatch.setattr(
         fc_mod,
         "derive_and_persist_floor",
-        lambda store, model_id, **kw: calls.append(model_id)
-        or SimpleNamespace(
-            accepted=False, floor=None, is_cold_start=False,
-            held_for_data_starvation=True, sample_pairs=0,
+        lambda store, model_id, **kw: (
+            calls.append(model_id)
+            or SimpleNamespace(
+                accepted=False,
+                floor=None,
+                is_cold_start=False,
+                held_for_data_starvation=True,
+                sample_pairs=0,
+            )
         ),
     )
     supervisor._run_deploy_recalibration(persona_dir)  # writes nothing: row still absent
@@ -973,7 +1024,9 @@ def test_c39_snapshot_has_work_probe(tmp_path):
 
     persona_dir = _persona(tmp_path)
     assert supervisor._snapshot_has_work(persona_dir) is False
-    sid = ingest_turn(persona_dir, {"speaker": "user", "text": "hi", "ts": "2026-09-27T10:00:00+00:00"})
+    sid = ingest_turn(
+        persona_dir, {"speaker": "user", "text": "hi", "ts": "2026-09-27T10:00:00+00:00"}
+    )
     assert supervisor._snapshot_has_work(persona_dir) is True  # un-extracted turn
     write_cursor(persona_dir, sid, "2026-09-27T10:00:00+00:00")
     assert supervisor._snapshot_has_work(persona_dir) is False  # all extracted
@@ -988,9 +1041,7 @@ def test_c39_snapshot_has_work_probe(tmp_path):
 
 
 def _prune_job(persona_dir, **overrides):
-    return [
-        j for j in _real_jobs(persona_dir, **overrides) if j.name == "session_snapshot_prune"
-    ]
+    return [j for j in _real_jobs(persona_dir, **overrides) if j.name == "session_snapshot_prune"]
 
 
 def test_c39_prune_removes_a_session_that_predates_the_idle_window(tmp_path, monkeypatch):
@@ -1077,8 +1128,12 @@ def test_c39_emotion_backfill_has_work_probe(tmp_path):
             eb._save_state(  # noqa: SLF001
                 persona_dir,
                 eb.EmotionBackfillState(
-                    started_at="x", total_memories=2, tagged_memories=1,
-                    last_cursor="", status=status, schema_version="v1",
+                    started_at="x",
+                    total_memories=2,
+                    tagged_memories=1,
+                    last_cursor="",
+                    status=status,
+                    schema_version="v1",
                 ),
             )
 
@@ -1091,9 +1146,10 @@ def test_c39_emotion_backfill_has_work_probe(tmp_path):
             json.dumps({"date": eb._today_str(now), "count": 200})  # noqa: SLF001
         )
         assert eb.has_emotion_backfill_work(persona_dir, store=store, now=now) is False
-        assert eb.has_emotion_backfill_work(
-            persona_dir, store=store, now=now + timedelta(days=1)
-        ) is True
+        assert (
+            eb.has_emotion_backfill_work(persona_dir, store=store, now=now + timedelta(days=1))
+            is True
+        )
     finally:
         store.close()
 
@@ -1173,7 +1229,9 @@ def test_each_interval_cadence_file_is_read_once_per_pass(tmp_path, stubs, monke
     assert sorted(calls) == sorted(f for f, _i in INTERVAL_JOBS.values())
 
 
-def test_pass2_reports_skipped_when_another_process_holds_the_drain_lock(tmp_path, stubs, monkeypatch):
+def test_pass2_reports_skipped_when_another_process_holds_the_drain_lock(
+    tmp_path, stubs, monkeypatch
+):
     persona_dir = _persona(tmp_path)
     monkeypatch.setattr(pass2_queue, "drain_all_locked", lambda *a, **k: 0)
     decisions = _pass(persona_dir, [j for j in _real_jobs(persona_dir) if j.name == "pass2"])
@@ -1193,9 +1251,7 @@ def _prune_setup(tmp_path, monkeypatch):
     return persona_dir
 
 
-def test_s84_no_message_seen_prunes_an_empty_session_older_than_bridge_start(
-    tmp_path, monkeypatch
-):
+def test_s84_no_message_seen_prunes_an_empty_session_older_than_bridge_start(tmp_path, monkeypatch):
     """(i) No message seen (anchor -inf, nothing seeded) + an empty session
     created before this bridge started → pruned at an idle pass."""
     from brain.chat.session import all_sessions, create_session, reset_registry
@@ -1346,7 +1402,9 @@ def test_s84_run_folded_live_prunes_pre_start_session_keeps_post_start_one(tmp_p
         assert all(s.session_id != old.session_id for s in all_sessions()), "pre-start session kept"
         new = create_session(persona_dir.name)  # opened after bridge start
         _time.sleep(0.3)  # several 0.05 s passes
-        assert any(s.session_id == new.session_id for s in all_sessions()), "post-start session pruned"
+        assert any(s.session_id == new.session_id for s in all_sessions()), (
+            "post-start session pruned"
+        )
     finally:
         stop.set()
         t.join(timeout=10.0)

@@ -24,8 +24,10 @@ import pytest
 
 import brain.memory.semantic_recall as semantic_recall_mod
 from brain.bridge import model_tier
+from brain.dev_constants import RERANK_MIN_REAL_CANDIDATES
 from brain.memory.embedding_matrix import EmbeddingMatrix
-from brain.memory.reranker import FakeRerankerProvider
+from brain.memory.embeddings import FakeEmbeddingProvider
+from brain.memory.reranker import ANCHOR_POOL, FakeRerankerProvider
 from brain.memory.semantic_recall import (
     FULL_INJECT_STANDOUT_MAX,
     MAX_STANDOUT_COUNT,
@@ -36,6 +38,12 @@ from brain.memory.semantic_recall import (
 from brain.memory.store import Memory, MemoryStore
 
 _TEST_MODEL_ID = "fake-test-model"
+# The seeded row vectors have the query embedder's dimension (the suite's
+# default fake embedder). Name-recall fix R6 (plan P-23) scores the pool with
+# one matrix product, which needs the two to agree; the old per-row
+# `cosine_similarity` returned 0.0 for a zero vector before looking at its
+# length, so these tests used to seed an unrelated 384.
+_SEED_DIM = FakeEmbeddingProvider().embedding_dim()
 
 # F2a inc8 cutover: `select_standouts` takes the floor as an explicit
 # parameter now (no more module-level `RERANK_FLOOR`) — this is an
@@ -104,6 +112,31 @@ def _mem(store: MemoryStore, content: str, *, state: str = "active") -> Memory:
     )
     store.create(m)
     return m
+
+
+# Name-recall fix R1 (S5/S23): a rerank runs only with at least
+# RERANK_MIN_REAL_CANDIDATES real candidates in the pool, so a test that
+# drives `run_semantic_recall` through the reranker pads a smaller pool with
+# filler memories the fake reranker leaves unscored (its far-below-any-floor
+# default), which therefore never surface.
+_FILLER_PREFIX = "unscored filler memory"
+# Anchors (appended on top of every rerank since R1) scored at 0.0, so the
+# anchor median is 0.0 and each scripted score's normalized value equals the
+# raw value these tests script against the seeded floor.
+_ANCHORS_AT_ZERO = dict.fromkeys(ANCHOR_POOL, 0.0)
+
+
+def _pad_to_rerank_minimum(store: MemoryStore, have: int) -> list[Memory]:
+    fillers = []
+    for i in range(RERANK_MIN_REAL_CANDIDATES - have):
+        filler = _mem(store, f"{_FILLER_PREFIX} {i}")
+        _seed_row_vector(store, filler.id, np.zeros(_SEED_DIM, dtype=np.float32))
+        fillers.append(filler)
+    return fillers
+
+
+def _fillers(store: MemoryStore) -> list[Memory]:
+    return [m for m in store.list_active() if m.content.startswith(_FILLER_PREFIX)]
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +249,7 @@ def test_pool_only_includes_memories_with_a_cached_vector(tmp_path: Path) -> Non
     store = MemoryStore(tmp_path / "memories.db")
     embedded = _mem(store, "this one is already embedded")
     not_embedded = _mem(store, "this one is NOT embedded yet")
-    _seed_row_vector(store, embedded.id, np.zeros(384, dtype=np.float32))
+    _seed_row_vector(store, embedded.id, np.zeros(_SEED_DIM, dtype=np.float32))
 
     matrix = EmbeddingMatrix(store.db_path, model_id=_TEST_MODEL_ID)
     pool = build_semantic_candidate_pool(store, matrix)
@@ -254,8 +287,8 @@ def test_pool_excludes_fading_state_memories_even_if_cached(tmp_path: Path) -> N
     fading_summary = "a softened fading memory"
     store.fade(fading_mem.id, summary=fading_summary)
 
-    _seed_row_vector(store, active_mem.id, np.zeros(384, dtype=np.float32))
-    _seed_row_vector(store, fading_mem.id, np.ones(384, dtype=np.float32))
+    _seed_row_vector(store, active_mem.id, np.zeros(_SEED_DIM, dtype=np.float32))
+    _seed_row_vector(store, fading_mem.id, np.ones(_SEED_DIM, dtype=np.float32))
 
     matrix = EmbeddingMatrix(store.db_path, model_id=_TEST_MODEL_ID)
     pool = build_semantic_candidate_pool(store, matrix)
@@ -271,7 +304,7 @@ def test_pool_build_never_bumps_recall_count(tmp_path: Path) -> None:
         "SELECT recall_count FROM memories WHERE id = ?", (m.id,)
     ).fetchone()[0]
 
-    _seed_row_vector(store, m.id, np.zeros(384, dtype=np.float32))
+    _seed_row_vector(store, m.id, np.zeros(_SEED_DIM, dtype=np.float32))
     matrix = EmbeddingMatrix(store.db_path, model_id=_TEST_MODEL_ID)
     build_semantic_candidate_pool(store, matrix)
 
@@ -295,22 +328,30 @@ def test_pool_build_never_bumps_recall_count(tmp_path: Path) -> None:
 def test_run_semantic_recall_is_fail_soft_when_pool_build_raises(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A failure inside build_semantic_candidate_pool (e.g. a real
+    """A failure inside the candidate-pool read (e.g. a real
     `sqlite3.OperationalError: database is locked` from the store, plausible
     given the supervisor's background-thread embedding backfill racing this
     call) must not propagate -- run_semantic_recall must catch it and return
-    None, exactly like the already-caught cache-open/query-embed failures."""
+    None, exactly like the already-caught cache-open/query-embed failures.
+    (Name-recall fix R6, plan P-27: the pool is read by the lean
+    `active_state_memory_types` SELECT; the matrix holds a vector, so the read
+    is actually reached.)"""
+    reached: list[bool] = []
 
-    def _raise(store: MemoryStore, matrix: object) -> dict:
+    def _raise(self: MemoryStore) -> dict:
+        reached.append(True)
         raise RuntimeError("sqlite3.OperationalError: database is locked (simulated)")
 
-    monkeypatch.setattr(semantic_recall_mod, "build_semantic_candidate_pool", _raise)
+    monkeypatch.setattr(MemoryStore, "active_state_memory_types", _raise)
+    _align_embedding_tier(monkeypatch)
 
-    store = MemoryStore(":memory:")
-    _mem(store, "something the pool build never gets a chance to see")
+    store = MemoryStore(tmp_path / "memories.db")
+    mem = _mem(store, "something the pool build never gets a chance to see")
+    _seed_row_vector(store, mem.id, np.ones(_SEED_DIM, dtype=np.float32))
 
     result = run_semantic_recall(store, tmp_path, "any query")
 
+    assert reached, "the pool read must have been reached (else the test is vacuous)"
     assert result is None, "a pool-build failure must demote this turn to the lexical fallback, not raise"
 
 
@@ -326,27 +367,36 @@ def test_run_semantic_recall_is_fail_soft_when_scoring_raises(
     model id would make the pool come back empty and never reach scoring at
     all (see `_align_embedding_tier`'s docstring)."""
 
-    def _raise_cosine(*args: object, **kwargs: object) -> float:
+    reached: list[bool] = []
+
+    def _raise_cosine(*args: object, **kwargs: object) -> list:
+        reached.append(True)
         raise RuntimeError("simulated scoring failure")
 
-    monkeypatch.setattr(semantic_recall_mod, "cosine_similarity", _raise_cosine)
+    # Name-recall fix R6 (plan P-23): scoring is one matrix product per query
+    # followed by the coarse-cut walk; the failure is injected in the walk.
+    monkeypatch.setattr(semantic_recall_mod, "_walk_coarse_cut", _raise_cosine)
     _align_embedding_tier(monkeypatch)
 
     store = MemoryStore(tmp_path / "memories.db")
     mem = _mem(store, "a memory that DOES have a cached vector")
-    _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
+    _seed_row_vector(store, mem.id, np.zeros(_SEED_DIM, dtype=np.float32))
+    _pad_to_rerank_minimum(store, 1)
 
     result = run_semantic_recall(store, tmp_path, "any query")
 
+    assert reached, "scoring must have been reached (else the test is vacuous)"
     assert result is None, "a scoring failure must demote this turn to the lexical fallback, not raise"
 
 
 def test_run_semantic_recall_is_fail_soft_when_reranker_raises(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """#231: a reranker failure must demote to the LEXICAL fallback, never
-    raise and never fall back to raw cosine ranking (the unreliable signal
-    the reranker replaces)."""
+    """A reranker failure never raises. Name-recall fix R2 (spec §2): it no
+    longer demotes straight to the lexical fallback: the turn takes the
+    COSINE path, gated by the cosine floor (results in
+    `test_no_rerank_cosine_path.py`). The suite's default cosine floor never
+    clears, so here that means no semantic result: the keyword fallback."""
 
     class _BoomReranker(FakeRerankerProvider):
         def rerank(self, query: str, documents: list[str]):
@@ -365,11 +415,12 @@ def test_run_semantic_recall_is_fail_soft_when_reranker_raises(
 
     store = MemoryStore(tmp_path / "memories.db")
     mem = _mem(store, "a memory that DOES have a cached vector")
-    _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
+    _seed_row_vector(store, mem.id, np.zeros(_SEED_DIM, dtype=np.float32))
+    _pad_to_rerank_minimum(store, 1)
 
     result = run_semantic_recall(store, tmp_path, "any query")
 
-    assert result is None, "a reranker failure must demote this turn to the lexical fallback, not raise"
+    assert result is None, "a reranker failure must not raise (cosine path, never-clearing default floor)"
 
 
 # ---------------------------------------------------------------------------
@@ -393,14 +444,15 @@ def test_run_semantic_recall_writes_one_calibration_log_row_with_real_query(
 
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
-        lambda **kwargs: FakeRerankerProvider(scores={content: _TEST_FLOOR + 1.0}),
+        lambda **kwargs: FakeRerankerProvider(scores={**_ANCHORS_AT_ZERO, content: _TEST_FLOOR + 1.0}),
     )
     _align_embedding_tier(monkeypatch)
 
     store = MemoryStore(tmp_path / "memories.db")
     _seed_floor(store)
     mem = _mem(store, content)
-    _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
+    _seed_row_vector(store, mem.id, np.zeros(_SEED_DIM, dtype=np.float32))
+    _pad_to_rerank_minimum(store, 1)
 
     result = run_semantic_recall(store, tmp_path, query)
 
@@ -449,7 +501,9 @@ def test_run_semantic_recall_logs_candidate_docs_as_recall_time_snapshot(
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
         lambda **kwargs: FakeRerankerProvider(
-            scores={original_content: _TEST_FLOOR + 1.0, other_content: _TEST_FLOOR + 0.5}
+            scores={
+                **_ANCHORS_AT_ZERO,
+                original_content: _TEST_FLOOR + 1.0, other_content: _TEST_FLOOR + 0.5}
         ),
     )
     _align_embedding_tier(monkeypatch)
@@ -458,8 +512,9 @@ def test_run_semantic_recall_logs_candidate_docs_as_recall_time_snapshot(
     _seed_floor(store)
     mem = _mem(store, original_content)
     other = _mem(store, other_content)
-    _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
-    _seed_row_vector(store, other.id, np.zeros(384, dtype=np.float32))
+    _seed_row_vector(store, mem.id, np.zeros(_SEED_DIM, dtype=np.float32))
+    _seed_row_vector(store, other.id, np.zeros(_SEED_DIM, dtype=np.float32))
+    _pad_to_rerank_minimum(store, 2)
 
     result = run_semantic_recall(store, tmp_path, query)
     assert result is not None
@@ -475,12 +530,15 @@ def test_run_semantic_recall_logs_candidate_docs_as_recall_time_snapshot(
     candidate_ids = json.loads(row["candidate_ids"])
     candidate_docs = json.loads(row["candidate_docs"])
     assert len(candidate_docs) == len(candidate_ids), "candidate_docs must be 1:1 with candidate_ids"
-    assert len(candidate_ids) == 2, "test precondition: both seeded candidates must have been scored"
+    assert {mem.id, other.id} <= set(candidate_ids), (
+        "test precondition: both seeded candidates must have been scored"
+    )
 
     # Positional alignment: the doc at each index must be the RECALL-TIME
     # content of the memory whose id sits at that same index — not some
     # other candidate's content shifted into its slot by a reorder.
     expected_content_by_id = {mem.id: original_content, other.id: other_content}
+    expected_content_by_id.update({f.id: f.content for f in _fillers(store)})
     for cand_id, cand_doc in zip(candidate_ids, candidate_docs, strict=True):
         assert cand_doc == expected_content_by_id[cand_id], (
             "candidate_docs must be positionally aligned with candidate_ids — the doc logged at "
@@ -510,7 +568,7 @@ def test_calibration_log_write_failure_does_not_break_recall(
     content = "a memory that clears the floor"
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
-        lambda **kwargs: FakeRerankerProvider(scores={content: _TEST_FLOOR + 1.0}),
+        lambda **kwargs: FakeRerankerProvider(scores={**_ANCHORS_AT_ZERO, content: _TEST_FLOOR + 1.0}),
     )
     _align_embedding_tier(monkeypatch)
 
@@ -522,7 +580,8 @@ def test_calibration_log_write_failure_does_not_break_recall(
     store = MemoryStore(tmp_path / "memories.db")
     _seed_floor(store)
     mem = _mem(store, content)
-    _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
+    _seed_row_vector(store, mem.id, np.zeros(_SEED_DIM, dtype=np.float32))
+    _pad_to_rerank_minimum(store, 1)
 
     result = run_semantic_recall(store, tmp_path, "any query")
 
@@ -551,14 +610,15 @@ def test_run_semantic_recall_uses_the_calibrated_floor_to_keep_a_candidate(
     # so this test could not pass by accident against a stale/wrong floor.
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
-        lambda **kwargs: FakeRerankerProvider(scores={content: seeded_floor + 0.01}),
+        lambda **kwargs: FakeRerankerProvider(scores={**_ANCHORS_AT_ZERO, content: seeded_floor + 0.01}),
     )
     _align_embedding_tier(monkeypatch)
 
     store = MemoryStore(tmp_path / "memories.db")
     _seed_floor(store, seeded_floor)
     mem = _mem(store, content)
-    _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
+    _seed_row_vector(store, mem.id, np.zeros(_SEED_DIM, dtype=np.float32))
+    _pad_to_rerank_minimum(store, 1)
 
     result = run_semantic_recall(store, tmp_path, "any query")
 
@@ -578,14 +638,15 @@ def test_run_semantic_recall_uses_the_calibrated_floor_to_abstain(
     seeded_floor = 2.5
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
-        lambda **kwargs: FakeRerankerProvider(scores={content: seeded_floor - 0.01}),
+        lambda **kwargs: FakeRerankerProvider(scores={**_ANCHORS_AT_ZERO, content: seeded_floor - 0.01}),
     )
     _align_embedding_tier(monkeypatch)
 
     store = MemoryStore(tmp_path / "memories.db")
     _seed_floor(store, seeded_floor)
     mem = _mem(store, content)
-    _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
+    _seed_row_vector(store, mem.id, np.zeros(_SEED_DIM, dtype=np.float32))
+    _pad_to_rerank_minimum(store, 1)
 
     result = run_semantic_recall(store, tmp_path, "any query")
 
@@ -607,14 +668,20 @@ def test_run_semantic_recall_uses_the_bootstrap_floor_when_no_row_exists_yet(
     content = "a memory that would clear any floor this suite ever seeds"
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
-        lambda **kwargs: FakeRerankerProvider(scores={content: 1_000.0}),
+        lambda **kwargs: FakeRerankerProvider(scores={**_ANCHORS_AT_ZERO, content: 1_000.0}),
     )
     _align_embedding_tier(monkeypatch)
 
     store = MemoryStore(tmp_path / "memories.db")
     mem = _mem(store, content)
-    _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
+    _seed_row_vector(store, mem.id, np.zeros(_SEED_DIM, dtype=np.float32))
+    _pad_to_rerank_minimum(store, 1)
 
+    # S85 (revised): the bootstrap is computed at process start, never by a read.
+    from brain.memory import floor_calibration
+
+    assert store.get_reranker_floor("fake-reranker") is None, "a read never computes it"
+    assert floor_calibration.run_rerank_bootstrap("fake-reranker") is not None
     floor = store.get_reranker_floor("fake-reranker")
     assert floor is not None, "test precondition: no persisted row, but a bootstrap must be served"
     assert floor["updated_at"] is None, "test precondition: this must be the transient bootstrap"
@@ -633,18 +700,20 @@ def test_run_semantic_recall_uses_the_bootstrap_floor_when_no_row_exists_yet(
     assert count == 0, "reading/using the bootstrap floor must never persist a row"
 
 
-def test_run_semantic_recall_falls_back_to_lexical_when_the_bootstrap_computation_fails(
+def test_run_semantic_recall_has_no_semantic_result_when_the_rerank_bootstrap_fails_and_the_cosine_floor_never_clears(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """The bootstrap floor's OWN fail-soft path (spec Section 7: the
     bootstrap computation itself must never crash a turn): if deriving the
     bootstrap raises (a reranker load/fit failure), `get_reranker_floor`
     degrades to the pre-ruling `None` contract, and `run_semantic_recall`
-    falls back to lexical exactly as it did before this ruling."""
+    (name-recall fix R2) takes the cosine path instead of demoting straight
+    to lexical; the suite's never-clearing default cosine floor leaves that
+    turn with no semantic result."""
     content = "a memory that would clear any floor this suite ever seeds"
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
-        lambda **kwargs: FakeRerankerProvider(scores={content: 1_000.0}),
+        lambda **kwargs: FakeRerankerProvider(scores={**_ANCHORS_AT_ZERO, content: 1_000.0}),
     )
 
     def _boom(model_id: str):
@@ -655,7 +724,8 @@ def test_run_semantic_recall_falls_back_to_lexical_when_the_bootstrap_computatio
 
     store = MemoryStore(tmp_path / "memories.db")
     mem = _mem(store, content)
-    _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
+    _seed_row_vector(store, mem.id, np.zeros(_SEED_DIM, dtype=np.float32))
+    _pad_to_rerank_minimum(store, 1)
 
     assert store.get_reranker_floor("fake-reranker") is None, (
         "test precondition: a failed bootstrap computation must degrade to None"
@@ -663,19 +733,20 @@ def test_run_semantic_recall_falls_back_to_lexical_when_the_bootstrap_computatio
 
     result = run_semantic_recall(store, tmp_path, "any query")
 
-    assert result is None, "a failed bootstrap computation must fall back to lexical, not crash"
+    assert result is None, "a failed rerank bootstrap must not crash (cosine path, never-clearing default floor)"
 
 
 def test_run_semantic_recall_is_fail_soft_when_floor_read_raises(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A `store.get_reranker_floor` failure (e.g. a transient sqlite error)
-    must demote this turn to lexical, exactly like every other fail-soft
-    trigger in this function — never propagate out of `run_semantic_recall`."""
+    must never propagate out of `run_semantic_recall` (R2: it makes this a
+    cosine-path turn; the suite's never-clearing default cosine floor leaves
+    no semantic result, i.e. the lexical fallback)."""
     content = "a memory that DOES have a cached vector"
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
-        lambda **kwargs: FakeRerankerProvider(scores={content: 1_000.0}),
+        lambda **kwargs: FakeRerankerProvider(scores={**_ANCHORS_AT_ZERO, content: 1_000.0}),
     )
     _align_embedding_tier(monkeypatch)
 
@@ -686,10 +757,11 @@ def test_run_semantic_recall_is_fail_soft_when_floor_read_raises(
 
     store = MemoryStore(tmp_path / "memories.db")
     mem = _mem(store, content)
-    _seed_row_vector(store, mem.id, np.zeros(384, dtype=np.float32))
+    _seed_row_vector(store, mem.id, np.zeros(_SEED_DIM, dtype=np.float32))
+    _pad_to_rerank_minimum(store, 1)
 
     result = run_semantic_recall(store, tmp_path, "any query")
 
-    assert result is None, "a floor-read failure must demote this turn to lexical, not raise"
+    assert result is None, "a floor-read failure must not raise (cosine path, never-clearing default floor)"
 
 

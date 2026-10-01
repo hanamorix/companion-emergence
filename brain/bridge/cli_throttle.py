@@ -286,6 +286,16 @@ def time_since_last_message(*, now: float | None = None) -> float:
         return t - _last_message_mono
 
 
+def chat_activity_marker() -> float:
+    """An opaque token that changes whenever the user chats: the monotonic
+    anchor ``is_chat_idle`` reads (last user message / reply end). Callers
+    compare it for equality only, e.g. the floor-bootstrap retry rule ("retry
+    at the next lull" = once chat has happened since the failed attempt,
+    name-recall fix S85)."""
+    with _lock:
+        return _last_message_mono
+
+
 def _log_is_chat_idle_error(exc: Exception) -> None:
     global _err_last_key, _err_last_logged_mono, _err_suppressed_count
     key = f"{type(exc).__name__}:{exc}"

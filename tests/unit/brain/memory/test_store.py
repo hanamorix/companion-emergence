@@ -3020,7 +3020,13 @@ def test_get_reranker_floor_returns_a_bootstrap_when_never_derived(store: Memory
     longer a `None` result — `get_reranker_floor` now serves a derived,
     transient BOOTSTRAP floor instead (this REPLACES the pre-ruling
     `test_get_reranker_floor_returns_none_when_never_derived` behavior).
-    Nothing is written to the table by merely reading it."""
+    Nothing is written to the table by merely reading it. Name-recall fix S85
+    (revised): the read only PEEKS the process cache; the bootstrap is computed
+    at process start / by the retry job (`run_rerank_bootstrap`)."""
+    from brain.memory import floor_calibration
+
+    assert store.get_reranker_floor("never-calibrated-model") is None, "reads never compute it"
+    assert floor_calibration.run_rerank_bootstrap("never-calibrated-model") is not None
     result = store.get_reranker_floor("never-calibrated-model")
     assert result is not None
     assert result["reranker_model_id"] == "never-calibrated-model"
@@ -3051,6 +3057,7 @@ def test_get_reranker_floor_persisted_row_supersedes_a_warm_bootstrap_cache(
         lambda model_id: FakeRerankerProvider(scores=scores_by_doc),
     )
 
+    assert floor_calibration.run_rerank_bootstrap(model_id) is not None
     bootstrap = store.get_reranker_floor(model_id)
     assert bootstrap is not None
     assert bootstrap["is_cold_start"] is True
@@ -3090,6 +3097,7 @@ def test_get_persisted_reranker_floor_returns_none_on_a_miss_never_the_bootstrap
     # Confirm the bootstrap IS servable for this same model_id via the
     # ordinary get_reranker_floor — proving the None above is specifically
     # about "no PERSISTED row", not "no floor at all".
+    assert floor_calibration.run_rerank_bootstrap("no-row-model") is not None
     bootstrap = store.get_reranker_floor("no-row-model")
     assert bootstrap is not None
     assert store.get_persisted_reranker_floor("no-row-model") is None, (

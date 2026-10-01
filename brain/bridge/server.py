@@ -1083,6 +1083,31 @@ def build_app(
         except Exception as _exc:  # noqa: BLE001 — startup must not break; already fails closed internally
             logger.warning("is-chat-idle seed from active_conversations failed: %s", _exc)
 
+        # Floor bootstraps (name-recall fix S85, revised; spec §2): the cosine
+        # (S91: only the COSINE one) bootstrap floor is computed ONCE per
+        # process, here at process start, on a daemon thread off every reply
+        # path (recall only peeks the caches). Until it finishes, the no-rerank
+        # path renders keyword results only. The RERANK floor bootstraps on
+        # first need in the background; a failed bootstrap is retried in the
+        # background on each incoming message (`respond()`, S92) and at the
+        # next lull by the central cadence jobs. Off with the other
+        # background threads in tests. Fault-isolated: never breaks startup.
+        # Started AFTER the is-chat-idle seed above (the retry rule reads the
+        # same anchor through `chat_activity_marker`, so nothing may read it
+        # before the seed) and before the supervisor thread.
+        if bg:
+            try:
+                from brain.bridge import cli_throttle as _cli_throttle
+                from brain.memory import floor_startup as _floor_startup
+
+                app.state.bridge.floor_bootstrap_thread = _floor_startup.start_background(
+                    persona_dir,
+                    activity_marker=_cli_throttle.chat_activity_marker,
+                    name="floor-bootstrap",
+                )
+            except Exception:  # noqa: BLE001 — startup must not break on the bootstrap thread
+                logger.exception("floor bootstrap startup thread could not be started")
+
         # S84: "bridge start" for the empty-session prune (no message seen yet
         # in this process). Captured here, on this thread, BEFORE the supervisor
         # thread starts and before `yield` lets any /session/new in, so every

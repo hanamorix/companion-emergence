@@ -86,3 +86,30 @@ def test_real_embedding_model_produces_distinguishable_vectors_for_different_tex
 
     assert not np.array_equal(a, b)
     assert a.shape == b.shape == (MODEL_EMBEDDING_DIM,)
+
+
+@pytest.mark.requires_models
+def test_real_embedding_model_batch_matches_single_embeds_within_1e_5() -> None:
+    """E1 (name-recall fix, spec §3): `embed_batch` returns, for every text,
+    the vector `embed` returns for that text, within 1e-5 per component.
+    Fastembed pads a batch to its longest input, so texts of very different
+    lengths are the case that could diverge; two texts are the shortest and
+    longest of the set on purpose. Embedder only (one model, run alone)."""
+    provider = build_embedding_provider()
+    texts = [
+        "ok",
+        "the cat sat on the mat",
+        "Pretzel is a scruffy terrier mix, about thirty pounds. " * 12,
+        "quantum entanglement in superconducting circuits",
+    ]
+
+    batch = provider.embed_batch(texts)
+    singles = [provider.embed(t) for t in texts]
+
+    assert len(batch) == len(texts)
+    for text, b, s in zip(texts, batch, singles, strict=True):
+        assert b.dtype == np.float32
+        assert b.shape == (MODEL_EMBEDDING_DIM,)
+        np.testing.assert_allclose(
+            b, s, atol=1e-5, rtol=0, err_msg=f"batch != single for {text[:30]!r}"
+        )

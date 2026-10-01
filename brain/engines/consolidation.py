@@ -25,11 +25,13 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 
@@ -38,6 +40,7 @@ from brain.memory import embeddings as embeddings_mod
 from brain.memory.embedding_matrix import build_embedding_matrix
 from brain.memory.embeddings import cosine_similarity
 from brain.memory.hebbian import HebbianMatrix
+from brain.memory.known_names import admit_names
 from brain.memory.pending import SALIENCE_ELIGIBLE_TYPES, PendingQueue
 from brain.memory.semantic_recall import build_semantic_candidate_pool
 from brain.memory.store import Memory, MemoryStore, clamp_importance
@@ -68,20 +71,39 @@ class Decision:
     merged_content: for a merge, the classifier's surgical-edit result; when
         absent the gate applies a conservative loss-free fold (append the new
         fact) so both facts survive.
+    names: names / proper nouns the judge found in the CANDIDATE text (spec §5,
+        "Names are added three ways", item 1). Written to the known-names list by
+        `_dispatch` for every verdict except "duplicate" (on "merge" too, from the
+        candidate text). Empty when the judge returned none or its `names` field
+        was absent or malformed (a malformed VALUE never costs the verdict; a reply
+        that is not JSON at all still promotes the candidate, the classifier's
+        fail-open-toward-keeping-content rule).
     """
 
     verdict: str
     target_id: str | None = None
     merged_content: str | None = None
+    names: tuple[str, ...] = ()
 
 
 Classifier = Callable[[Memory, list[Memory]], Decision]
 
+
+class Reappraisal(NamedTuple):
+    """What a Reappraiser returns for one memory: a fresh importance and the
+    names / proper nouns it found in the memory's text (spec §5, item 2)."""
+
+    importance: float
+    names: tuple[str, ...] = ()
+
+
 # P3 retention rework, Change 3: importance re-rating on recall, via the
-# pending queue. A Reappraiser judges a fresh importance for an EXISTING
-# memory (not a Pass-2 candidate decision) — same injectable-seam shape as
-# Classifier, so tests pass a fake returning a known value.
-Reappraiser = Callable[[Memory], float]
+# pending queue. A Reappraiser judges a fresh importance (and finds names) for
+# an EXISTING memory (not a Pass-2 candidate decision) — same injectable-seam
+# shape as Classifier, so tests pass a fake returning a known value. Since the
+# name-recall fix it returns `Reappraisal(importance, names)`, no longer a bare
+# number.
+Reappraiser = Callable[[Memory], Reappraisal]
 
 
 @dataclass
@@ -198,7 +220,9 @@ def _run_locked(
 
     result = ConsolidationResult(batch=len(candidate_entries))
     if reappraise_entries:
-        _handle_reappraisals(store, reappraise_entries, reappraiser or _noop_reappraiser, result)
+        _handle_reappraisals(
+            store, persona_dir, reappraise_entries, reappraiser or _noop_reappraiser, result
+        )
     if not candidate_entries:
         return result
 
@@ -381,12 +405,106 @@ def _related_existing_lexical(store: MemoryStore, cand: Memory, *, limit: int = 
     return out
 
 
-def _noop_reappraiser(memory: Memory) -> float:
+def _noop_reappraiser(memory: Memory) -> Reappraisal:
     """No-provider fallback (Change 3 default when no provider is configured):
-    importance unchanged. There is NO mechanism-driven monotone climb — this
-    is what dissolves the recall-frequency-ratchet risk at the root (STAGE-3
+    importance unchanged, no names. There is NO mechanism-driven monotone climb —
+    this is what dissolves the recall-frequency-ratchet risk at the root (STAGE-3
     CORRECTION finding #2)."""
-    return memory.importance
+    return Reappraisal(memory.importance)
+
+
+def _parse_names(value: object, *, source: str) -> tuple[str, ...]:
+    """Fail-soft reading of a model's `names` field: a list of strings.
+
+    Absent (None) is normal and silent. Anything else that is not a list, and any
+    list element that is not a non-blank string, is dropped with a log line;
+    nothing here raises, so a malformed `names` can never cost the caller its
+    verdict or its score. Order is kept; duplicates are the admission function's
+    business.
+    """
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        logger.warning(
+            "consolidation %s: ignoring a non-list 'names' field (%s)", source, type(value).__name__
+        )
+        return ()
+    kept: list[str] = []
+    dropped = 0
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            kept.append(item.strip())
+        else:
+            dropped += 1
+    if dropped:
+        logger.warning(
+            "consolidation %s: dropped %d malformed entries from 'names'", source, dropped
+        )
+    return tuple(kept)
+
+
+def _admit_extracted_names(
+    persona_dir: Path, names: object, *, list_source: str, label: str
+) -> None:
+    """Write model-extracted names to the known-names list through the one
+    admission function (S70: stopword entries are rejected there). Fail-soft: a
+    failure is logged and never propagates, so a names write can never lose the
+    candidate or the importance update it rides on (P-17, P-18)."""
+    try:
+        cleaned = _parse_names(names, source=label)
+        if cleaned:
+            admit_names(persona_dir, cleaned, list_source)
+    except Exception:  # noqa: BLE001 — names are a side channel, never a reason to lose the work
+        logger.warning("consolidation %s: known-names write failed", label, exc_info=True)
+
+
+_NUMBER_RE = re.compile(r"-?\d+(\.\d+)?")  # today's first-number regex, unchanged
+_KEYED_IMPORTANCE_RE = re.compile(r'"importance"\s*:\s*"?(-?\d+(?:\.\d+)?)"?')
+
+
+def _coerce_score(value: object) -> float | None:
+    """A finite number from a JSON value (a number, or a plain decimal string), else None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        if not _NUMBER_RE.fullmatch(value.strip()):
+            return None
+    elif not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _parse_reappraisal(raw: str, current: float) -> Reappraisal:
+    """Read a re-appraiser reply: a JSON object with `importance` and `names`.
+
+    JSON first (P-18). A reply with no `{` at all falls back to today's
+    first-number regex with no names (the old "reply with ONLY the number" shape
+    still works). A reply that has a `{` but is not parseable JSON (a comma too
+    many, a second object, a cut-off reply) is read only through the keyed
+    `"importance": <number>` pattern: the first-number regex would read a digit
+    out of a name ("Apollo 13"). A JSON object whose `importance` is missing or
+    not a number leaves the importance unchanged, for the same reason. Malformed
+    `names` never change the score.
+    """
+    if "{" not in raw:
+        match = _NUMBER_RE.search(raw)
+        return Reappraisal(float(match.group(0)) if match else current)
+    data: object = None
+    if re.search(r"\{.*\}", raw, re.DOTALL):
+        try:
+            data = json.loads(_extract_json(raw))
+        except ValueError:
+            data = None
+    if isinstance(data, dict):
+        score = _coerce_score(data.get("importance"))
+        names = _parse_names(data.get("names"), source="reappraiser")
+        return Reappraisal(current if score is None else score, names)
+    keyed = _KEYED_IMPORTANCE_RE.search(raw)
+    return Reappraisal(float(keyed.group(1)) if keyed else current)
 
 
 def _make_haiku_reappraiser(provider) -> Reappraiser:
@@ -395,41 +513,44 @@ def _make_haiku_reappraiser(provider) -> Reappraiser:
     Judges importance fresh from the memory's content in the moment it is
     re-appraised, not from how often it has been recalled: a still-relevant
     journal entry keeps or raises its importance, a past-due appointment
-    (Roy's jury-duty case) drops. Output is clamped [0, 10] by the caller
-    (`_handle_reappraisals`) via the shared `clamp_importance`. On any parse/
-    provider failure the fallback is the memory's CURRENT importance (a
-    no-op) — never a crash, never a ratchet."""
+    (Roy's jury-duty case) drops. It reads the WHOLE memory (the old
+    first-400-character cut is gone, spec §5) and also returns the names found in
+    it. Output is clamped [0, 10] by the caller (`_handle_reappraisals`) via the
+    shared `clamp_importance`. On any parse/provider failure the fallback is the
+    memory's CURRENT importance with no names (a no-op) — never a crash, never a
+    ratchet."""
     prompt = _REAPPRAISER_PROMPT
 
-    def _reappraise(memory: Memory) -> float:
+    def _reappraise(memory: Memory) -> Reappraisal:
         try:
-            raw = provider.generate(memory.content[:400], system=prompt)
-            match = re.search(r"-?\d+(\.\d+)?", raw)
-            if not match:
-                return memory.importance
-            return float(match.group(0))
+            raw = provider.generate(memory.content, system=prompt)
+            return _parse_reappraisal(raw, memory.importance)
         except Exception:  # noqa: BLE001 — a provider fault must not lose the row
             logger.warning("consolidation Haiku reappraise failed; importance unchanged")
-            return memory.importance
+            return Reappraisal(memory.importance)
 
     return _reappraise
 
 
 def _handle_reappraisals(
     store: MemoryStore,
+    persona_dir: Path,
     entries: list[dict],
     reappraiser: Reappraiser,
     result: ConsolidationResult,
 ) -> None:
     """Process Change-3 existing-memory re-appraise items: load the target
-    row, compute a new importance via the injectable `reappraiser`, and
-    UPDATE it in place (never an INSERT — C3.1).
+    row, compute a new importance (and names) via the injectable `reappraiser`,
+    and UPDATE it in place (never an INSERT — C3.1).
 
     A row missing at the read (already gone before this tick) or hard-deleted
     between the read and the write (a concurrent forgetting LOSE, or a delete
     triggered mid-appraisal) is skipped: no resurrection, no crash (C3.2).
     The `store.update` call is wrapped in `try/except KeyError`, mirroring
     the merge-dispatch idiom above (`_dispatch`'s `verdict == "merge"` branch).
+
+    The names the reappraiser found are written to the known-names list only
+    after the importance update succeeded (P-18), fail-soft.
     """
     for entry in entries:
         memory_id = entry.get("memory_id")
@@ -440,7 +561,7 @@ def _handle_reappraisals(
         if memory is None:
             continue  # already gone — no resurrection
         try:
-            new_importance = reappraiser(memory)
+            new_importance, names = reappraiser(memory)
         except Exception:  # noqa: BLE001 — a reappraiser fault must not lose the batch
             logger.exception("consolidation gate: reappraiser raised; skipping")
             continue
@@ -451,6 +572,7 @@ def _handle_reappraisals(
             # raised (finding #3).
             continue
         result.reappraised += 1
+        _admit_extracted_names(persona_dir, names, list_source="reappraiser", label="reappraiser")
 
 
 def _archive_preimage(persona_dir: Path, target: Memory, source_id: str) -> None:
@@ -483,6 +605,11 @@ def _dispatch(
     if verdict == "duplicate":
         result.duplicates += 1  # discard: candidate was already removed by drain()
         return
+
+    # Names the judge found in the candidate text: every verdict except
+    # "duplicate", a deferred merge included (P-17; `INSERT OR IGNORE` makes the
+    # repeat on the re-judged tick harmless). Fail-soft, before the verdict acts.
+    _admit_extracted_names(persona_dir, decision.names, list_source="gate", label="gate judge")
 
     if verdict == "merge":
         target = store.get(decision.target_id) if decision.target_id else None
@@ -567,7 +694,9 @@ def _make_haiku_classifier(provider) -> Classifier:
 
     def _classify(cand: Memory, context: list[Memory]) -> Decision:
         ctx = "\n".join(f"- id={m.id}: {m.content[:200]}" for m in context) or "(none)"
-        user = f"CANDIDATE: {cand.content[:400]}\nEXISTING:\n{ctx}"
+        # The WHOLE candidate: the verdict and the names are both read from all of
+        # it (the first-400-character cut is gone, spec §5 item 1, S51).
+        user = f"CANDIDATE: {cand.content}\nEXISTING:\n{ctx}"
         try:
             raw = provider.generate(user, system=prompt)
             data = json.loads(_extract_json(raw))
@@ -578,6 +707,7 @@ def _make_haiku_classifier(provider) -> Classifier:
                 verdict=verdict,
                 target_id=data.get("target_id") or None,
                 merged_content=data.get("merged_content") or None,
+                names=_parse_names(data.get("names"), source="gate judge"),
             )
         except Exception:  # noqa: BLE001
             logger.warning("consolidation Haiku classify failed; promoting candidate")

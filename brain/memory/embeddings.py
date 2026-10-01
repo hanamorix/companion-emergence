@@ -30,6 +30,7 @@ import os
 import shutil
 import threading
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -42,11 +43,24 @@ _DEFAULT_DIM = 256
 
 class EmbeddingProvider(ABC):
     """Abstract embedding provider. Subclasses implement `embed`, `embedding_dim`
-    and `model_id`."""
+    and `model_id`; `embed_batch` has a default built on `embed`."""
 
     @abstractmethod
     def embed(self, text: str) -> np.ndarray:
         """Return a 1-D numpy array of dimension `embedding_dim()`."""
+
+    def embed_batch(self, texts: Sequence[str]) -> list[np.ndarray]:
+        """Return one 1-D vector per text, in input order (`[]` for no texts).
+
+        Each element is what `embed(text)` returns for that text. This
+        default simply loops `embed`, so every existing provider (including
+        test doubles that only implement `embed`) supports it unchanged;
+        providers with a real batched path override it. A bare `str` is
+        rejected: iterating it would silently embed one character at a time.
+        """
+        if isinstance(texts, str):
+            raise TypeError("embed_batch expects a sequence of strings, not a single str")
+        return [self.embed(text) for text in texts]
 
     @abstractmethod
     def embedding_dim(self) -> int:
@@ -85,6 +99,14 @@ class FakeEmbeddingProvider(EmbeddingProvider):
         if norm == 0.0:
             raise ValueError(f"FakeEmbeddingProvider produced a zero-norm vector (dim={self._dim})")
         return vec / norm
+
+    def embed_batch(self, texts: Sequence[str]) -> list[np.ndarray]:
+        # Explicit override (not just the inherited default) so the fake
+        # documents the contract: a batch is exactly the per-text `embed`
+        # vectors, order preserved, so tests can assert batch == single.
+        if isinstance(texts, str):
+            raise TypeError("embed_batch expects a sequence of strings, not a single str")
+        return [self.embed(text) for text in texts]
 
     def embedding_dim(self) -> int:
         return self._dim
@@ -308,28 +330,60 @@ class FastEmbedProvider(EmbeddingProvider):
         with self._embed_lock:
             (vec,) = self._model.embed([text])
             arr = np.asarray(vec, dtype=np.float32)
-            if self._real_dim is None:
-                # First real embed this instance has ever performed — this is
-                # the "first used" moment the real dim is established from,
-                # and the ONE point a stale MODEL_EMBEDDING_DIM gets caught
-                # loudly rather than silently (#259 inc7 red-team F1).
-                self._real_dim = arr.shape[0]
-                if self._declared_dim is not None and self._real_dim != self._declared_dim:
-                    logger.error(
-                        "FastEmbedProvider: model %s produced dim=%d but the "
-                        "declared/sanity dim (model_tier.MODEL_EMBEDDING_DIM) "
-                        "is %d — that constant is stale (likely a model swap "
-                        "that didn't update it together). This is NOT fatal: "
-                        "embed/decode/cluster all follow the REAL dim (%d), "
-                        "not the constant. Update MODEL_EMBEDDING_DIM to %d "
-                        "to clear this warning.",
-                        self._model_id,
-                        self._real_dim,
-                        self._declared_dim,
-                        self._real_dim,
-                        self._real_dim,
-                    )
+            self._note_real_dim(arr)
         return arr
+
+    def embed_batch(self, texts: Sequence[str]) -> list[np.ndarray]:
+        """Embed every text in ONE model call, under the same instance lock
+        as `embed` (so a batch never overlaps another embed on this shared
+        provider, and never races fastembed's lazy first load).
+
+        Returns one float32 vector per text, in input order; `[]` for no
+        texts (the model is not touched). Fastembed pads a batch to its
+        longest input, so a vector can differ from the single-text `embed`
+        of the same string by float noise only (verified against the real
+        model in `test_embedding_real_model.py`).
+        """
+        if isinstance(texts, str):
+            raise TypeError("embed_batch expects a sequence of strings, not a single str")
+        batch = list(texts)
+        if not batch:
+            return []
+        with self._embed_lock:
+            vectors = [np.asarray(v, dtype=np.float32) for v in self._model.embed(batch)]
+            if len(vectors) != len(batch):
+                raise RuntimeError(
+                    f"FastEmbedProvider.embed_batch: model returned {len(vectors)} "
+                    f"vectors for {len(batch)} texts"
+                )
+            self._note_real_dim(vectors[0])
+        return vectors
+
+    def _note_real_dim(self, arr: np.ndarray) -> None:
+        """Establish the REAL dim from the first vector this instance ever
+        produces (single or batch) and log the stale-declared-dim mismatch.
+        Caller holds `_embed_lock`."""
+        if self._real_dim is None:
+            # First real embed this instance has ever performed — this is
+            # the "first used" moment the real dim is established from,
+            # and the ONE point a stale MODEL_EMBEDDING_DIM gets caught
+            # loudly rather than silently (#259 inc7 red-team F1).
+            self._real_dim = arr.shape[0]
+            if self._declared_dim is not None and self._real_dim != self._declared_dim:
+                logger.error(
+                    "FastEmbedProvider: model %s produced dim=%d but the "
+                    "declared/sanity dim (model_tier.MODEL_EMBEDDING_DIM) "
+                    "is %d — that constant is stale (likely a model swap "
+                    "that didn't update it together). This is NOT fatal: "
+                    "embed/decode/cluster all follow the REAL dim (%d), "
+                    "not the constant. Update MODEL_EMBEDDING_DIM to %d "
+                    "to clear this warning.",
+                    self._model_id,
+                    self._real_dim,
+                    self._declared_dim,
+                    self._real_dim,
+                    self._real_dim,
+                )
 
     def embedding_dim(self) -> int:
         """The REAL output dimension of the loaded model.

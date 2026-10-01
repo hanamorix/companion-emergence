@@ -20,6 +20,7 @@ from brain.monologue.recall import recall_monologue
 from brain.narrative_memory.tool import list_open_arcs as _list_open_arcs_impl
 from brain.narrative_memory.tool import recall_arc as _recall_arc_impl
 from brain.tools.impls.add_journal import add_journal
+from brain.tools.impls.add_known_name import add_known_name
 from brain.tools.impls.add_memory import add_memory
 from brain.tools.impls.boot import boot
 from brain.tools.impls.compact_history import compact_history
@@ -37,7 +38,7 @@ from brain.tools.impls.read_work import read_work
 from brain.tools.impls.save_work import save_work
 from brain.tools.impls.search_memories import search_memories
 from brain.tools.impls.search_works import search_works
-from brain.tools.schemas import SCHEMAS
+from brain.tools.schemas import ADD_NAME_TOOL_NAME, SCHEMAS
 
 log = logging.getLogger(__name__)
 
@@ -138,6 +139,7 @@ _DISPATCH: dict[str, Any] = {
     "read_full_memory": read_full_memory,
     "add_journal": add_journal,
     "add_memory": add_memory,
+    ADD_NAME_TOOL_NAME: add_known_name,
     "boot": boot,
     "get_soul": get_soul,
     "crystallize_soul": crystallize_soul,
