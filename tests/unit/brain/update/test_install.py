@@ -400,8 +400,8 @@ def test_redirected_name_that_exists_on_disk_unnamed_is_replaced(tmp_path):
 
 def test_stamp_carries_installed_at_but_current_json_entry_does_not(tmp_path):
     """Spec gap: stamp.json gets an installed_at timestamp (diagnostic only); the
-    entry stored in current.json stays exactly {dir, commit, brain_version,
-    bundle_id} so it round-trips through equality checks unchanged."""
+    entry stored in current.json carries no installed_at, so it round-trips
+    through equality checks unchanged."""
     finds = tmp_path / "finds"
     finds.mkdir()
     brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
@@ -413,9 +413,46 @@ def test_stamp_carries_installed_at_but_current_json_entry_does_not(tmp_path):
                                  root=root, pip_extra=["--no-index", "--find-links", str(finds)])
     stamp = json.loads((root / entry["dir"] / "stamp.json").read_text(encoding="utf-8"))
     assert "installed_at" in stamp and stamp["installed_at"].endswith("Z")
-    assert set(entry) == {"dir", "commit", "brain_version", "bundle_id"}
+    assert set(entry) == {"dir", "commit", "brain_version", "bundle_id", "confirmed", "undo"}
     assert overlay.read_state(root)["active"] == entry
 
+
+
+def test_install_marks_the_new_overlay_unconfirmed_with_its_undo(tmp_path):
+    """#335: every install is unproven until the app sees it run; `undo` records how to
+    back it out — revert when the release brain was running, rollback when an overlay was."""
+    finds = tmp_path / "finds"
+    finds.mkdir()
+    brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
+    req = tmp_path / "requirements.txt"
+    req.write_text("", encoding="utf-8")
+    site = _fake_bundle(tmp_path, {})
+    root = tmp_path / "brain-overlay"
+    extra = ["--no-index", "--find-links", str(finds)]
+    first = install.apply_update(wheel=brain_whl, requirements=req, commit="a" * 40, site_dir=site,
+                                 root=root, pip_extra=extra)
+    assert first["confirmed"] is False and first["undo"] == "revert"
+    second = install.apply_update(wheel=brain_whl, requirements=req, commit="b" * 40, site_dir=site,
+                                  root=root, pip_extra=extra)
+    assert second["confirmed"] is False and second["undo"] == "rollback"
+    assert overlay.read_state(root)["active"] == second
+    stamp = json.loads((root / second["dir"] / "stamp.json").read_text(encoding="utf-8"))
+    assert "confirmed" not in stamp and "undo" not in stamp
+
+
+def test_an_active_overlay_for_another_bundle_does_not_make_undo_a_rollback(tmp_path):
+    """That overlay never loads under this bundle, so the release brain was running."""
+    finds = tmp_path / "finds"
+    finds.mkdir()
+    brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
+    req = tmp_path / "requirements.txt"
+    req.write_text("", encoding="utf-8")
+    site = _fake_bundle(tmp_path, {})
+    root = tmp_path / "brain-overlay"
+    overlay.activate(root, {"dir": "old", "commit": "c" * 40, "brain_version": "1.0", "bundle_id": "other"})
+    entry = install.apply_update(wheel=brain_whl, requirements=req, commit="a" * 40, site_dir=site,
+                                 root=root, pip_extra=["--no-index", "--find-links", str(finds)])
+    assert entry["undo"] == "revert"
 
 def test_unsafe_commit_labels_are_refused(tmp_path):
     for bad in ("../x", "/abs", "", ".hidden", "a/b"):

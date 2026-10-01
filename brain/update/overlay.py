@@ -161,6 +161,16 @@ def rollback(root: Path) -> None:
     _write_state(root, state["previous"], None)
 
 
+def confirm(root: Path, commit: str) -> None:
+    """Mark the active overlay as proven (#335): the app saw a healthy bridge running it.
+    A no-op unless `commit` is still the active one, since another update may have
+    landed underneath. Callers hold overlay_lock."""
+    state = read_state(root)
+    active = state["active"]
+    if active and active.get("commit") == commit and active.get("confirmed") is False:
+        _write_state(root, {**active, "confirmed": True}, state["previous"])
+
+
 def prune(root: Path) -> None:
     state = read_state(root)
     keep = {e["dir"] for e in (state["active"], state["previous"]) if e and e.get("dir")}
