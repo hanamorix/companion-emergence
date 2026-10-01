@@ -142,109 +142,113 @@ export function _resetRestartBridgeForTests(): void {
   inFlight = null;
 }
 
+/** The app-wide restart (#310). Plain function so code that runs before any
+ *  component mounts (the launch path, #335) can call it; the hook wraps it. */
+export function restartBridge(persona: string): Promise<boolean> {
+  if (inFlight) return inFlight;
+  setErrorDetail(null);
+
+  const run = async (): Promise<boolean> => {
+    try {
+      // Try graceful snapshot → shutdown → ensureBridgeRunning → health.
+      // Any timeout on snapshot escalates to SIGKILL fallback.
+      // A second health-poll failure → failed.
+      const tryGraceful = async (): Promise<boolean> => {
+        transition("closing");
+        try {
+          await withTimeout(
+            snapshotActiveSession(persona),
+            TIMEOUT_CLOSE_MS,
+            "/sessions/snapshot",
+          );
+        } catch {
+          return false;
+        }
+
+        transition("shutting_down");
+        try {
+          await withTimeout(
+            shutdownBridge(persona),
+            TIMEOUT_SHUTDOWN_MS,
+            "/supervisor/shutdown",
+          );
+        } catch {
+          // Network failures here are expected — the bridge drops the
+          // connection as it dies. Spec §6.4: treat as success and
+          // proceed to ensureBridgeRunning + health poll.
+        }
+
+        // Explicitly start a fresh bridge so the health poll has something
+        // to reach. Failure here means we can't guarantee a live bridge —
+        // escalate to forced restart.
+        transition("reconnecting");
+        try {
+          await ensureBridgeRunning(persona);
+        } catch {
+          return false;
+        }
+
+        transition("waiting_for_health");
+        try {
+          await pollHealth(persona, Date.now() + TIMEOUT_HEALTH_MS);
+        } catch {
+          return false;
+        }
+        // Bridge is healthy — move to reconnecting so the parent's
+        // live-mode flip (onModeChanged / prop-effect) can resolve to success.
+        transition("reconnecting");
+        return true;
+      };
+
+      const tryForced = async (): Promise<boolean> => {
+        transition("forcing");
+        try {
+          await invokeForceRestart(persona);
+        } catch (e) {
+          setErrorDetail(errString(e) || FAILED_USER_MESSAGE);
+          return false;
+        }
+        transition("waiting_for_health");
+        try {
+          await pollHealth(persona, Date.now() + TIMEOUT_HEALTH_MS);
+        } catch {
+          setErrorDetail(FAILED_USER_MESSAGE);
+          return false;
+        }
+        return true;
+      };
+
+      const gracefulOk = await tryGraceful();
+      const ok = gracefulOk || (await tryForced());
+      if (!ok) {
+        transition("failed");
+        return false;
+      }
+      // Graceful path ends in reconnecting (after ensureBridgeRunning +
+      // pollHealth — the final reconnecting is the handoff to the parent's
+      // live-mode flip). Forced path ends in waiting_for_health; push it
+      // to reconnecting here so onModeChanged / prop-effect can resolve
+      // reconnecting → success when mode flips live.
+      if (!gracefulOk) {
+        transition("reconnecting");
+      }
+      return true;
+    } finally {
+      inFlight = null;
+    }
+  };
+
+  inFlight = run();
+  return inFlight;
+}
+
 export function useRestartBridge(
   persona: string,
   currentMode: PersonaState["mode"],
 ): UseRestartBridge {
   const { state, errorDetail } = useSyncExternalStore(subscribe, () => shared);
 
-  const restart = useCallback((): Promise<boolean> => {
-    if (inFlight) return inFlight;
-    setErrorDetail(null);
-
-    const run = async (): Promise<boolean> => {
-      try {
-        // Try graceful snapshot → shutdown → ensureBridgeRunning → health.
-        // Any timeout on snapshot escalates to SIGKILL fallback.
-        // A second health-poll failure → failed.
-        const tryGraceful = async (): Promise<boolean> => {
-          transition("closing");
-          try {
-            await withTimeout(
-              snapshotActiveSession(persona),
-              TIMEOUT_CLOSE_MS,
-              "/sessions/snapshot",
-            );
-          } catch {
-            return false;
-          }
-
-          transition("shutting_down");
-          try {
-            await withTimeout(
-              shutdownBridge(persona),
-              TIMEOUT_SHUTDOWN_MS,
-              "/supervisor/shutdown",
-            );
-          } catch {
-            // Network failures here are expected — the bridge drops the
-            // connection as it dies. Spec §6.4: treat as success and
-            // proceed to ensureBridgeRunning + health poll.
-          }
-
-          // Explicitly start a fresh bridge so the health poll has something
-          // to reach. Failure here means we can't guarantee a live bridge —
-          // escalate to forced restart.
-          transition("reconnecting");
-          try {
-            await ensureBridgeRunning(persona);
-          } catch {
-            return false;
-          }
-
-          transition("waiting_for_health");
-          try {
-            await pollHealth(persona, Date.now() + TIMEOUT_HEALTH_MS);
-          } catch {
-            return false;
-          }
-          // Bridge is healthy — move to reconnecting so the parent's
-          // live-mode flip (onModeChanged / prop-effect) can resolve to success.
-          transition("reconnecting");
-          return true;
-        };
-
-        const tryForced = async (): Promise<boolean> => {
-          transition("forcing");
-          try {
-            await invokeForceRestart(persona);
-          } catch (e) {
-            setErrorDetail(errString(e) || FAILED_USER_MESSAGE);
-            return false;
-          }
-          transition("waiting_for_health");
-          try {
-            await pollHealth(persona, Date.now() + TIMEOUT_HEALTH_MS);
-          } catch {
-            setErrorDetail(FAILED_USER_MESSAGE);
-            return false;
-          }
-          return true;
-        };
-
-        const gracefulOk = await tryGraceful();
-        const ok = gracefulOk || (await tryForced());
-        if (!ok) {
-          transition("failed");
-          return false;
-        }
-        // Graceful path ends in reconnecting (after ensureBridgeRunning +
-        // pollHealth — the final reconnecting is the handoff to the parent's
-        // live-mode flip). Forced path ends in waiting_for_health; push it
-        // to reconnecting here so onModeChanged / prop-effect can resolve
-        // reconnecting → success when mode flips live.
-        if (!gracefulOk) {
-          transition("reconnecting");
-        }
-        return true;
-      } finally {
-        inFlight = null;
-      }
-    };
-
-    inFlight = run();
-    return inFlight;
-  }, [persona]);
+  const restart = useCallback(() => restartBridge(persona), [persona]);
 
   const onModeChanged = useCallback((mode: PersonaState["mode"]) => {
     if (shared.state === "reconnecting" && mode === "live") {
