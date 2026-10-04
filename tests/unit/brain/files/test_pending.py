@@ -143,6 +143,64 @@ def test_readers_tolerate_records_with_and_without_the_new_fields(tmp_path):
                           now=now) == new
 
 
+def test_two_simultaneous_claims_of_one_record_cannot_both_win(tmp_path, monkeypatch):
+    """#346: expect= is a re-read; without a lock two claimers that both read 'pending' both
+    write. A barrier inside get() forces exactly that overlap (it times out if the lock
+    serialises them, which is the point)."""
+    import threading
+
+    from brain.files import pending
+
+    rid = _rec(tmp_path)
+    real_get, barrier = pending.get, threading.Barrier(2)
+
+    def _overlapping_get(*a, **k):
+        rec = real_get(*a, **k)
+        try:
+            barrier.wait(timeout=0.4)
+        except threading.BrokenBarrierError:
+            pass
+        return rec
+
+    monkeypatch.setattr(pending, "get", _overlapping_get)
+    outcomes: list[object] = []
+
+    def _claim():
+        try:
+            outcomes.append(pending.mark(tmp_path, rid, status="committing", expect="pending"))
+        except Exception as exc:  # a crash on the shared .tmp is a failure too, not a lost race
+            outcomes.append(exc)
+
+    threads = [threading.Thread(target=_claim) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(outcomes, key=repr) == [False, True]
+
+
+def test_create_and_mark_both_take_the_store_lock(tmp_path, monkeypatch):
+    """create shares the `.tmp` naming with mark, so it must serialise with it too."""
+    import contextlib
+
+    from brain.files import pending
+
+    held: list[str] = []
+    real = pending.file_lock
+
+    @contextlib.contextmanager
+    def _spy(path, **kw):
+        held.append(path.name)
+        with real(path, **kw) as ok:
+            yield ok
+
+    monkeypatch.setattr(pending, "file_lock", _spy)
+    rid = _rec(tmp_path)
+    assert held == [".records"]
+    pending.mark(tmp_path, rid, status="committing")
+    assert held == [".records", ".records"]
+
+
 def test_sweep_does_not_overwrite_a_record_claimed_after_its_read(tmp_path, monkeypatch):
     """#344 review F-d: sweep read 'pending', a claim landed, sweep's unconditional
     mark then overwrote the live claim with 'expired'. With expect='pending' it must not."""

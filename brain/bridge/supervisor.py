@@ -177,6 +177,7 @@ def run_folded(
     judge_selftune_interval_s: float | None = JUDGE_TUNE_INTERVAL_HOURS * 3600.0,
     clustering_interval_s: float | None = 6 * 3600.0,
     vocab_repair_interval_s: float | None = 6 * 3600.0,
+    pending_reconcile_interval_s: float | None = 900.0,
     is_session_busy: Callable[[str], bool] | None = None,
     bridge_started_at: datetime | None = None,
 ) -> None:
@@ -281,6 +282,11 @@ def run_folded(
     vocab_repair_cadence_state = (
         persisted_cadence.load_cadence(persona_dir, "vocab_repair_cadence.json")
         if vocab_repair_interval_s is not None
+        else None
+    )
+    pending_reconcile_cadence_state = (
+        persisted_cadence.load_cadence(persona_dir, "pending_reconcile_cadence.json")
+        if pending_reconcile_interval_s is not None
         else None
     )
 
@@ -599,6 +605,23 @@ def run_folded(
                     )
                     persisted_cadence.save_cadence(
                         persona_dir, "vocab_repair_cadence.json", vocab_repair_cadence_state
+                    )
+
+            # Pending-write reconcile (#346) — its own short persisted cadence, so a write stranded
+            # mid-session is recovered without waiting on the maintenance job's throttle-slot /
+            # PAUSED / 6h gates. Provider-free; the helper has its own try/except.
+            if pending_reconcile_cadence_state is not None and persisted_cadence.is_due(
+                pending_reconcile_cadence_state, now=datetime.now(UTC)
+            ):
+                try:
+                    _run_pending_reconcile_tick(persona_dir)
+                finally:
+                    pending_reconcile_cadence_state = persisted_cadence.advance(
+                        now=datetime.now(UTC), interval_s=pending_reconcile_interval_s
+                    )
+                    persisted_cadence.save_cadence(
+                        persona_dir, "pending_reconcile_cadence.json",
+                        pending_reconcile_cadence_state,
                     )
 
             # Voice-reflection cadence — daily by default. Gathers last 7 days
