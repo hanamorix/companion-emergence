@@ -276,6 +276,31 @@ def test_cs8b_the_deadline_interrupt_fires_only_while_armed_and_is_recorded(big_
     assert big_store._conn.execute("SELECT 1").fetchone()[0] == 1  # noqa: SLF001
 
 
+def test_cs8a_a_refused_row_stops_the_walk_it_does_not_skip_to_a_shorter_one(store: MemoryStore) -> None:
+    """Rows in a fixed order: one short reject and two long rows on the first page
+    (limit 3), then three more long rows, then 199 short rejects. The budget
+    refuses the third continuation row (too many characters in all); the walk
+    STOPS there, though each short row after it would have been allowed on its own."""
+    sql = (
+        "SELECT m.*, 0.0 AS _bm25 FROM memories m WHERE m.active = 1 "
+        "ORDER BY (CASE WHEN m.content LIKE 'i will see you at the harbour 0000' THEN 0 "
+        "WHEN m.content LIKE 'Will%' THEN 1 ELSE 2 END), m.id"
+    )
+    judged: list[str] = []
+
+    def keep(text: str) -> bool:
+        judged.append(text)
+        return "lantern number 0 " in text  # one long row is kept, the rest rejected
+
+    long_row = len(
+        next(r[0] for r in store._conn.execute("SELECT content FROM memories") if r[0].startswith("Will"))  # noqa: SLF001
+    )
+    budget = _Budget(60.0, allows=lambda rows, chars: chars <= 2 * long_row + 10)
+    store._fts_rows_kept(sql, [], 3, keep, budget)  # noqa: SLF001
+    assert len(judged) == 3 + 2, "the first page (3 rows) and two continuation rows, then the walk stops"
+    assert budget.finished == [2 * long_row]
+
+
 # ---------------------------------------------------------------------------
 # CS8c: the first page always runs; left <= 0 runs no continuation.
 # ---------------------------------------------------------------------------
