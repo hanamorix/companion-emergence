@@ -1862,7 +1862,7 @@ class MemoryStore:
     def _cost_window_sums(
         self, series: str, host: str, key: str, cut: float
     ) -> cost_series.LinearSums:
-        row = self._conn.execute(
+        n, sum_x, sum_y, sum_xy, sum_xx, max_x = self._conn.execute(
             "SELECT COUNT(*), COALESCE(SUM(x), 0), COALESCE(SUM(seconds), 0.0), "
             "COALESCE(SUM(x * seconds), 0.0), COALESCE(SUM(x * x), 0), COALESCE(MAX(x), 0) "
             "FROM cost_series_samples "
@@ -1870,12 +1870,12 @@ class MemoryStore:
             (series, host, key, cut),
         ).fetchone()
         return cost_series.LinearSums(
-            n=int(row[0]),
-            sum_x=int(row[1]),
-            sum_y=float(row[2]),
-            sum_xy=float(row[3]),
-            sum_xx=int(row[4]),
-            max_x=int(row[5]),
+            n=int(n),
+            sum_x=int(sum_x),
+            sum_y=float(sum_y),
+            sum_xy=float(sum_xy),
+            sum_xx=int(sum_xx),
+            max_x=int(max_x),
         )
 
     def _cost_carried_row(self, series: str, host: str, key: str) -> cost_series.RangedFit | None:
@@ -1886,8 +1886,9 @@ class MemoryStore:
         ).fetchone()
         if row is None:
             return None
+        overhead, rate, samples, max_x = row
         return cost_series.RangedFit(
-            cost_series.LinearFit(float(row[0]), float(row[1]), int(row[2])), int(row[3])
+            cost_series.LinearFit(float(overhead), float(rate), int(samples)), int(max_x)
         )
 
     def cost_series_state(
