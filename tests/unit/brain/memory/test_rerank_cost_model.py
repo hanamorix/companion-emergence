@@ -998,22 +998,27 @@ def test_cs15_the_cap_is_per_model_id(clock: _Clock, monkeypatch: pytest.MonkeyP
 def test_cs15_the_cap_holds_until_a_rerank_was_recorded(
     clock: _Clock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A first rerank that fails (the provider raises on the measured call, after
+    the warm-ups) records nothing, so the next one is still the seeding rerank."""
     monkeypatch.setattr(reranker_mod, "_current_rss_bytes", lambda: 1.0e9)
     _persist_estimate()
 
-    class _NoLengths(_CostScriptedProvider):
-        def pair_token_lengths(self, query, documents):
-            return None
+    class _FailsOnce(_CostScriptedProvider):
+        failures = 1
 
         def rerank(self, query, documents):
-            return FakeRerankerProvider.rerank(self, query, documents)
+            if len(documents) > 1 and self.failures:
+                self.failures -= 1
+                raise RuntimeError("the measured rerank failed")
+            return super().rerank(query, documents)
 
-    unsized = _NoLengths(clock, overhead=0.0, rate=1e-4)
-    assert rerank_for_recall(unsized, _QUERY, _docs(50, 100), budget_seconds=4.0).hand_off == "sizes"
-    provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-4)
+    provider = _FailsOnce(clock, overhead=0.0, rate=1e-4)
+    with pytest.raises(RuntimeError, match="measured rerank failed"):
+        rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0)
     assert rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0).width == 5, (
         "nothing was measured yet, so the first measured rerank is still the seed"
     )
+    assert rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0).width > 5
 
 
 def test_cs15_with_an_empty_database_the_first_rerank_is_five_as_today(
