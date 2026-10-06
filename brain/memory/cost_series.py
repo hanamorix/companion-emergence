@@ -214,7 +214,7 @@ _machine_override: str | None = None
 def _read_machine_id(path: Path) -> str | None:
     try:
         text = path.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
+    except (FileNotFoundError, UnicodeDecodeError):
         return None
     return text if _ID_RE.fullmatch(text) else None
 
@@ -233,6 +233,14 @@ def _create_machine_id(path: Path) -> str:
     temp = path.with_name(f"{path.name}.{fresh}.tmp")
     temp.write_text(fresh, encoding="utf-8")
     try:
+        if path.exists():
+            winner = _read_machine_id(path)  # another process may have just won
+            if winner is not None:
+                return winner
+            # A file is there but holds no valid id (empty, damaged): replace it
+            # whole, so persistence is not lost for good on this machine.
+            os.replace(temp, path)
+            return fresh
         try:
             os.link(temp, path)
         except FileExistsError:
@@ -342,7 +350,8 @@ def flush(store: MemoryStore) -> int:
         if sample.taken_at > now - window:
             groups.setdefault((sample.series, sample.host, sample.key), []).append(sample)
     written = 0
-    for (series, host, key), group in groups.items():
+    pending = list(groups.items())
+    for index, ((series, host, key), group) in enumerate(pending):
         try:
             store.record_cost_samples(
                 series,
@@ -355,8 +364,13 @@ def flush(store: MemoryStore) -> int:
             written += len(group)
         except Exception as exc:  # noqa: BLE001 - a failed save keeps the samples for the next flush
             _note_failure("flush", exc)
+            # Put this group and every group not yet tried back, and stop: a
+            # database that is locked for the busy timeout is locked for the rest
+            # too, and a stop must not wait it out once per series.
             with _pending_lock:
-                _pending.extend(group)
+                for _unwritten_key, unwritten in pending[index:]:
+                    _pending.extend(unwritten)
+            break
     return written
 
 

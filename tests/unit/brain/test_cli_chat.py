@@ -365,3 +365,11 @@ def test_a_failing_cost_series_flush_never_breaks_the_exit(persona_dir: Path) ->
     _buffer_cost_samples(persona_dir)
     with patch("brain.memory.cost_series.flush", side_effect=RuntimeError("flush failed")):
         assert main(["chat", "--persona", "nell", "--no-bridge", "hello"]) == 0
+
+
+def test_a_failing_one_shot_turn_still_saves_the_buffered_cost_series_samples(persona_dir: Path) -> None:
+    _buffer_cost_samples(persona_dir)
+    with patch("brain.chat.engine.respond", side_effect=RuntimeError("provider failed")):
+        with pytest.raises(RuntimeError, match="provider failed"):
+            main(["chat", "--persona", "nell", "--no-bridge", "hello"])
+    assert _saved_cost_samples(persona_dir) >= 2

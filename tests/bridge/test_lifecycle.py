@@ -558,3 +558,26 @@ def test_a_failing_cost_series_flush_does_not_stop_the_teardown(persona_dir: Pat
     with _client(persona_dir, background_threads=False):
         pass
     assert _saved_cost_samples(persona_dir) == 0
+
+
+def test_the_teardown_flush_runs_after_the_supervisor_has_stopped_and_before_the_heartbeat_close(
+    persona_dir: Path, monkeypatch
+) -> None:
+    """S164: the supervisor thread is the only other flusher, so the flush waits
+    for it to stop; the heartbeat close follows."""
+    from brain.bridge import server, supervisor
+    from brain.memory import cost_series
+
+    order: list[str] = []
+
+    def fake_supervisor(*, stop_event, **_kw):
+        stop_event.wait(30)
+        time.sleep(0.3)  # still "running" for a moment after the stop is requested
+        order.append("supervisor-stopped")
+
+    monkeypatch.setattr(supervisor, "run_folded", fake_supervisor)
+    monkeypatch.setattr(cost_series, "flush", lambda _store: order.append("flush"))
+    monkeypatch.setattr(server, "_run_heartbeat_close", lambda *a, **k: order.append("heartbeat"))
+    with _client(persona_dir, tick_interval_s=3600):
+        pass
+    assert order == ["supervisor-stopped", "flush", "heartbeat"]

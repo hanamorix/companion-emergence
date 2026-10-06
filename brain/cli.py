@@ -2037,13 +2037,18 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
             # One-shot mode
             message = getattr(args, "message", None)
             if message:
-                result = respond(
-                    persona_dir,
-                    message,
-                    store=store,
-                    hebbian=hebbian,
-                    provider=provider,
-                )
+                try:
+                    result = respond(
+                        persona_dir,
+                        message,
+                        store=store,
+                        hebbian=hebbian,
+                        provider=provider,
+                    )
+                except BaseException:
+                    # A failed turn still saves the timings it buffered (S164).
+                    _flush_cost_series_at_exit(store)
+                    raise
                 print(result.content)
                 # Flush conversation through ingest pipeline (best-effort).
                 # Mirrors the REPL's finally block — without this, every

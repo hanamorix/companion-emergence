@@ -453,6 +453,41 @@ def test_cs8e_the_search_tool_passes_the_clock_reading_from_the_top_of_its_call(
     assert seen == [3.0]
 
 
+def test_cs8e_the_search_tools_semantic_mode_passes_the_clock_reading_too(
+    tmp_path: Path, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tool's default (semantic) mode merges the keyword search in through a
+    second call site; it must pass `started` as well (the lexical call site is
+    pinned above)."""
+    import brain.tools.impls.search_memories as tool
+    from brain.memory import known_names as kn
+    from brain.tools.dispatch import dispatch
+    from tests.unit.brain.tools.test_search_memories_keyword_merge import _ctx
+    from tests.unit.brain.tools.test_search_memories_keyword_merge import _mem as tool_mem
+
+    ctx = _ctx(tmp_path)
+    tool_mem(ctx["store"], "Quill came by the harbour")
+    assert kn.admit_names(ctx["persona_dir"], ["Quill"], "tool")
+    clock.t = 3.0
+    seen: list[float | None] = []
+    real = tool.rank_name_hits
+    real_rank = tool.rank_memories
+
+    def advance(*a, **k):
+        clock.t = 50.0
+        return real_rank(*a, **k)
+
+    def spy(store, hebbian, names, **kw):
+        seen.append(kw.get("started"))
+        return real(store, hebbian, names, **kw)
+
+    monkeypatch.setattr(tool, "_semantic_top_k", lambda *a, **k: tool._SemanticTopK(grouped=[], guaranteed=[]))
+    monkeypatch.setattr(tool, "rank_name_hits", spy)
+    monkeypatch.setattr(tool, "rank_memories", advance)
+    dispatch("search_memories", {"query": "Quill", "mode": "semantic", "limit": 5}, **ctx)
+    assert seen == [3.0]
+
+
 def test_cs8e_without_started_the_walk_is_unbudgeted(
     store: MemoryStore, clock: Clock, judged: Judged, monkeypatch: pytest.MonkeyPatch
 ) -> None:

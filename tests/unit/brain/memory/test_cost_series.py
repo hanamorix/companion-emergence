@@ -799,3 +799,101 @@ def test_cs6c_the_take_out_is_atomic_against_a_record_made_while_it_runs(
     threads[0].join(10)
     assert cost_series.flush(store) == 1, "the sample made during the take-out was kept for the next flush"
     assert store._conn.execute("SELECT COUNT(*) FROM cost_series_samples").fetchone()[0] == 2  # noqa: SLF001
+
+
+@pytest.mark.parametrize("content", [b"", b"\xff\xfe not utf-8", b"ABCDEF" * 6, b"short"])
+def test_cs3d_a_damaged_machine_id_file_is_replaced_not_given_up_on(
+    real_machine_id: Path, content: bytes
+) -> None:
+    (real_machine_id / "machine_id").write_bytes(content)
+    ident = cost_series.machine_id()
+    assert len(ident) == 32 and (real_machine_id / "machine_id").read_text() == ident
+    cost_series._reset_machine_id()
+    assert cost_series.machine_id() == ident, "and the repaired file is what later processes read"
+
+
+def test_flush_stops_at_the_first_failed_write_and_keeps_every_untried_group(
+    store: MemoryStore, series: CostSeries, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    other = CostSeries("other series")
+    _record(series, store, [(1000, 0.1)])
+    _record(other, store, [(1000, 0.2)])
+    tried: list[str] = []
+
+    def boom(self, name, *a, **k):
+        tried.append(name)
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(MemoryStore, "record_cost_samples", boom)
+    assert cost_series.flush(store) == 0
+    assert len(tried) == 1, "one busy timeout at most, not one per series"
+    monkeypatch.undo()
+    assert cost_series.flush(store) == 2, "both groups were kept for the next flush"
+
+
+def _production_series():
+    from brain.memory import keyword_budget, reranker, semantic_recall
+
+    return [
+        ("rerank", reranker._rerank_cost, "m"),  # noqa: SLF001
+        ("paragraph embed", semantic_recall._embed_cost, "m"),  # noqa: SLF001
+        ("recall setup", semantic_recall._message_overhead, ""),  # noqa: SLF001
+        ("paragraph scan", semantic_recall._scan_time, ""),  # noqa: SLF001
+        ("keyword extra words", keyword_budget._keyword_cost, ""),  # noqa: SLF001
+        ("name matching", keyword_budget._name_cost, "keyword"),  # noqa: SLF001
+    ]
+
+
+@pytest.mark.parametrize("which", range(6))
+@pytest.mark.parametrize("flushed", [True, False])
+def test_cs1_each_production_series_counts_a_sample_for_exactly_the_window(
+    store: MemoryStore, clock: Clock, which: int, flushed: bool
+) -> None:
+    """CS1a on EACH of the six series' own objects (not the generic class): the
+    estimate at t0 + W - 1 is the independent least-squares fit, at exactly t0 + W
+    the samples no longer count."""
+    name, series, key = _production_series()[which]
+    assert series.name == name
+    points = [(1000, 0.3), (3000, 0.7), (2000, 0.5001)]
+    for x, y in points:
+        series.record(store, key, x, y)
+    if flushed:
+        cost_series.flush(store)
+    clock.now = T0 + W - 1
+    _assert_fit(series.fit(store, key), points)
+    clock.now = T0 + W
+    state = series.state(store, key)
+    assert state is not None and state.sums.n == 0
+
+
+@pytest.mark.parametrize("which", range(6))
+def test_cs2_each_production_series_survives_a_restart(tmp_path: Path, clock: Clock, which: int) -> None:
+    _name, series, key = _production_series()[which]
+    path = tmp_path / "memories.db"
+    first = MemoryStore(path, integrity_check=False)
+    for x, y in [(1000, 0.3), (3000, 0.7)]:
+        series.record(first, key, x, y)
+    cost_series.flush(first)
+    before = series.estimate(first, key)
+    first.close()
+    cost_series._reset_pending()
+    second = MemoryStore(path, integrity_check=False)
+    try:
+        assert before is not None and series.estimate(second, key) == before
+    finally:
+        second.close()
+
+
+def test_cs6e_window_counts_also_reads_the_database_before_the_buffer(
+    store: MemoryStore, series: CostSeries, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _record(series, store, [(1000, 0.3), (3000, 0.7)])
+
+    def flush_between() -> None:
+        monkeypatch.setattr(cost_series, "_between_reads_hook", None)
+        cost_series.flush(store)
+
+    monkeypatch.setattr(cost_series, "_between_reads_hook", flush_between)
+    before, after = series.window_counts(store, "m", T0 - 1)
+    assert before + after <= 2, "a flush between the two reads never makes a sample count twice"
+    assert sum(series.window_counts(store, "m", T0 - 1)) == 2
