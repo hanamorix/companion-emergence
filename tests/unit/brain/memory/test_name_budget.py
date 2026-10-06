@@ -295,7 +295,7 @@ def test_cs8a_a_refused_row_stops_the_walk_it_does_not_skip_to_a_shorter_one(sto
     long_row = len(
         next(r[0] for r in store._conn.execute("SELECT content FROM memories") if r[0].startswith("Will"))  # noqa: SLF001
     )
-    budget = _Budget(60.0, allows=lambda rows, chars: chars <= 2 * long_row + 10)
+    budget = _Budget(60.0, allows=lambda rows, chars: chars <= 2 * long_row + 100)
     store._fts_rows_kept(sql, [], 3, keep, budget)  # noqa: SLF001
     assert len(judged) == 3 + 2, "the first page (3 rows) and two continuation rows, then the walk stops"
     assert budget.finished == [2 * long_row]
