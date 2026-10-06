@@ -214,7 +214,7 @@ def _floors_and_path(store, monkeypatch, genuine, family, path, *, family_scores
     if path == "cosine":
         _no_reranker(monkeypatch)
         return None
-    _warm()
+    _warm(store)
     scripted = {g.content: 5.0 + i for i, g in enumerate(genuine)}
     scripted.update(family_scores or {})
     rec = _Recording(scripted)
@@ -359,7 +359,7 @@ def test_with_fifty_genuine_memories_the_rerank_prefix_holds_no_family_memory(
     )
     _cosine_floor(store, 0.4)
     _rerank_floor(store, floor=1.0)
-    _warm()
+    _warm(store)
     scripted = {g.content: 5.0 for g in genuine}
     scripted.update({f.content: 50.0 for f in family})
     rec = _Recording(scripted)

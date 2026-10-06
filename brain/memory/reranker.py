@@ -61,14 +61,14 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass, replace
+from contextlib import AbstractContextManager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from brain import tunables
 from brain.dev_constants import RERANK_MIN_REAL_CANDIDATES
-from brain.memory import cost_period
-from brain.memory.cost_period import PeriodSums
+from brain.memory import cost_series
 from brain.memory.relevance import CANDIDATE_POOL
 
 if TYPE_CHECKING:
@@ -530,11 +530,11 @@ def _reset_reranker_provider_cache() -> None:
 #     because the reranker pads every pair in a batch to the longest one
 #     (fastembed `preprocessor_utils.load_tokenizer` enables padding; S67).
 #   - `overhead` and `rate` are separated by ordinary least squares over the
-#     running sums (count, sum x, sum y, sum x*y, sum x*x) of this process's
-#     recall reranks (and the S100 re-measure job's), per reranker model id
-#     (spec §1). The sums cover the current 24-hour compaction period (S101,
-#     S114; `cost_period`). No persistence and no averaging constant: every
-#     measured call in a period weighs the same.
+#     samples of the recall reranks (and the S100 re-measure job's), per
+#     reranker model id (spec §1). The samples are the last 24 hours' (S146,
+#     S114; `cost_series`), saved in memories.db so a restart continues from
+#     them, with no averaging constant: every sample in the window weighs the
+#     same.
 #   - RAM per padded token of GROWTH (S32: RSS delta around recall-time
 #     reranks). The ONNX runtime keeps the memory a batch needed and reuses
 #     it, so a call whose padded size x is within the largest size already
@@ -558,8 +558,11 @@ def _reset_reranker_provider_cache() -> None:
 # `normalize_against_anchors`); the two warm-up reranks a process runs first
 # are discarded, as the hourly measurement discarded them (S24/S32).
 #
-# The time sums cover the current 24-hour compaction period (S101, S114; see
-# `cost_period`). Stuck-width recovery (S100, S113, S116): the last query that
+# The time series is a rolling 24-hour window saved in memories.db (S146; see
+# `cost_series`); RAM and warm-up state stay process memory. The first measured
+# recall rerank of a process per model id is sized to the S5 minimum even when
+# a saved estimate exists, where RSS is readable (S158), because it seeds the
+# RAM high water. Stuck-width recovery (S100, S113, S116): the last query that
 # went to the cosine path for lack of budget is kept per model id; while the
 # estimate says its first 5 candidates do not fit the full latency budget, the
 # `rerank_width_remeasure` gated job re-measures them once per chat lull
@@ -609,58 +612,28 @@ def _rss_delta(before: float | None, after: float | None) -> float | None:
 
 
 @dataclass(frozen=True)
-class _CostSums:
-    """One reranker model id's cost state. Immutable: an update builds a new
-    instance and swaps it in under `_cost_lock`, so a reader never sees half
-    of one sample (CONC-1).
+class _RamState:
+    """One reranker model id's RAM state: process memory, not part of the
+    saved time series (the high water is a property of the ONNX arena this
+    process holds, S74, and forgetting it would dilute the RAM figure, R1
+    round-1 F1). Immutable: an update builds a new instance and swaps it in
+    under `_cost_lock`, so a reader never sees half of one sample (CONC-1).
+    The model id having an entry means this process has recorded a measured
+    rerank for it (S158)."""
 
-    `period` is the time model: this compaction period's running sums and the
-    fit carried in from the previous period (name-recall fix S101, S114;
-    `cost_period`). `n`, `sum_x`, `sum_y`, `sum_xy`, `sum_xx` read the current
-    period's sums. The RAM fields are process lifetime (not reset at the
-    tick): the high water is a property of the ONNX arena this process holds
-    (S74), and forgetting it would dilute the RAM figure (R1 round-1 F1)."""
-
-    period: PeriodSums = PeriodSums()
     # RAM (see the section header): growth past the high water only.
     peak_x: int = 0  # largest padded size measured so far (the high water)
     ram_bytes: float = 0.0  # sum of max(0, RSS delta) over calls that went past the high water
     ram_x: int = 0  # sum of (x - high water before the call) over those same calls
 
-    @property
-    def n(self) -> int:
-        return self.period.sums.n
-
-    @property
-    def sum_x(self) -> int:
-        return self.period.sums.sum_x
-
-    @property
-    def sum_y(self) -> float:
-        return self.period.sums.sum_y
-
-    @property
-    def sum_xy(self) -> float:
-        return self.period.sums.sum_xy
-
-    @property
-    def sum_xx(self) -> int:
-        return self.period.sums.sum_xx
-
-    def plus(self, padded_tokens: int, seconds: float, rss_delta_bytes: float | None) -> _CostSums:
+    def plus(self, padded_tokens: int, rss_delta_bytes: float | None) -> _RamState:
         ram_bytes, ram_x = self.ram_bytes, self.ram_x
         if rss_delta_bytes is not None and padded_tokens > self.peak_x:
             ram_bytes += max(0.0, rss_delta_bytes)
             ram_x += padded_tokens - self.peak_x
-        return _CostSums(
-            period=self.period.plus(padded_tokens, seconds),
-            peak_x=max(self.peak_x, padded_tokens),
-            ram_bytes=ram_bytes,
-            ram_x=ram_x,
+        return _RamState(
+            peak_x=max(self.peak_x, padded_tokens), ram_bytes=ram_bytes, ram_x=ram_x
         )
-
-    def next_period(self) -> _CostSums:
-        return replace(self, period=self.period.next_period())
 
 
 @dataclass(frozen=True)
@@ -694,115 +667,138 @@ class _BudgetMiss:
     anchor_tokens: tuple[int, ...]
 
 
-def _fit_cost(sums: _CostSums) -> tuple[float, float] | None:
-    """(overhead, rate) in effect for `sums` (S67 least squares over the
-    current period, with the S101/S114 carried fit; `cost_period`)."""
-    fit = sums.period.fit()
-    return None if fit is None else (fit.overhead, fit.rate)
-
-
-# model_id -> cost state, the model ids whose warm-up has run, the last query
-# per model id that went to the cosine path for lack of budget (S113), the chat
+# model_id -> RAM state, the model ids whose warm-up has run, the last query per
+# model id that went to the cosine path for lack of budget (S113), the chat
 # activity marker of each model id's last re-measure (S100), and the "too long"
-# verdicts (S127: the (overhead, rate) of the fit in effect when the job's own
-# 5-candidate rerank exceeded the full budget; it ends when that fit changes).
-# One lock guards them all (every read and every read-modify-write), so a concurrent
+# verdicts (S127: remembered until the cost estimate next changes, decided by
+# which samples the window holds, not by comparing fitted floats). One lock
+# guards them all (every read and every read-modify-write), so a concurrent
 # passive recall, `search_memories` call (#297: the tool runs in a bridge
-# worker thread), the re-measure job and the compaction tick never lose an
-# update.
-_cost_sums: dict[str, _CostSums] = {}
+# worker thread) and the re-measure job never lose an update. The time series
+# itself is `_rerank_cost` (rolling window, memories.db, `cost_series`).
+_rerank_cost = cost_series.CostSeries("rerank")
+_ram_state: dict[str, _RamState] = {}
 _warmed_model_ids: set[str] = set()
 _budget_misses: dict[str, _BudgetMiss] = {}
 _remeasured_marker: dict[str, object] = {}
-_too_long_fit: dict[str, tuple[float, float]] = {}
+
+
+@dataclass(frozen=True)
+class _Verdict:
+    """S127: the wall time a "too long" verdict was reached at and how many
+    window samples had been taken at or before it. The verdict holds while no
+    sample was taken after that time and those samples are all still in the
+    window."""
+
+    taken_at: float
+    before: int
+
+
+_too_long: dict[str, _Verdict] = {}
 _cost_lock = threading.Lock()
 
 # Test-only seam (CONC-1): called inside an update, between reading the
-# current sums and writing the new ones. Always `None` in production.
+# current RAM state and writing the new one. Always `None` in production.
 _cost_update_hook: Callable[[], None] | None = None
 
 
-def rerank_cost_estimate(model_id: str) -> RerankCostEstimate | None:
-    """The current cost model for `model_id`, or `None` before its first
-    measured recall rerank (the width is then the S5 minimum, S24)."""
-    with _cost_lock:
-        sums = _cost_sums.get(model_id)
-    if sums is None:
-        return None
-    fit = sums.period.fit()
+def rerank_cost_estimate(model_id: str, store: MemoryStore) -> RerankCostEstimate | None:
+    """The current cost model for `model_id`: the time fit of the last 24
+    hours (S146; saved, so available from the first message after a restart)
+    and this process's RAM figure. `None` when there is no time estimate (the
+    first startup on this machine: the width is then the S5 minimum, S24)."""
+    fit = _rerank_cost.fit(store, model_id)
     if fit is None:
         return None
-    ram_per_token = sums.ram_bytes / sums.ram_x if sums.ram_x > 0 else None
+    with _cost_lock:
+        ram = _ram_state.get(model_id, _RamState())
+    ram_per_token = ram.ram_bytes / ram.ram_x if ram.ram_x > 0 else None
     return RerankCostEstimate(
         overhead_seconds=fit.overhead,
         seconds_per_token=fit.rate,
         ram_bytes_per_token=ram_per_token,
         measured_batches=fit.samples,
-        peak_padded_tokens=sums.peak_x,
+        peak_padded_tokens=ram.peak_x,
     )
 
 
 def _record_rerank_cost(
-    model_id: str, padded_tokens: int, seconds: float, rss_delta_bytes: float | None
+    model_id: str,
+    store: MemoryStore,
+    padded_tokens: int,
+    seconds: float,
+    rss_delta_bytes: float | None,
 ) -> None:
-    """Add one measured rerank to `model_id`'s running sums."""
+    """Add one measured rerank: its RAM figure to this process's state and its
+    time to the buffered series (S164: nothing is written to the database
+    here)."""
     with _cost_lock:
-        current = _cost_sums.get(model_id, _CostSums())
+        current = _ram_state.get(model_id, _RamState())
         if _cost_update_hook is not None:
             _cost_update_hook()
-        updated = current.plus(padded_tokens, seconds, rss_delta_bytes)
-        _cost_sums[model_id] = updated
-        _end_too_long_if_fit_changed(model_id, updated)
+        _ram_state[model_id] = current.plus(padded_tokens, rss_delta_bytes)
+    _rerank_cost.record(store, model_id, padded_tokens, seconds)
 
 
-def _end_too_long_if_fit_changed(model_id: str, sums: _CostSums) -> None:
-    """S127: a remembered "too long" verdict ends as soon as the fitted cost
-    model (overhead, rate) differs from the one it was reached under. Call with
-    `_cost_lock` held, after `sums` is stored."""
-    held = _too_long_fit.get(model_id)
-    if held is not None and _fit_cost(sums) != held:
-        del _too_long_fit[model_id]
-
-
-def _remember_too_long(model_id: str) -> None:
+def _remember_too_long(model_id: str, store: MemoryStore) -> None:
     """S127: remember that the job measured the stuck record's 5 candidates
-    over the full budget, under the fit now in effect (which already includes
-    that measurement)."""
+    over the full budget. The job's own sample is already buffered, so it was
+    taken at or before this moment and counts in the held total; the verdict
+    then ends only when a sample arrives or one of those ages out. A failed read
+    remembers nothing (the job simply runs again at the next lull)."""
+    try:
+        now = cost_series._wall_clock()
+        before, _after = _rerank_cost.window_counts(store, model_id, now)
+    except Exception:  # noqa: BLE001 - fail soft
+        log.warning("rerank width re-measure: could not record a too-long verdict", exc_info=True)
+        return
     with _cost_lock:
-        sums = _cost_sums.get(model_id)
-        fit = None if sums is None else _fit_cost(sums)
-        if fit is not None:
-            _too_long_fit[model_id] = fit
+        _too_long[model_id] = _Verdict(now, before)
 
 
-def _too_long_remembered(model_id: str) -> bool:
-    """Whether `model_id` has a remembered S127 "too long" verdict."""
+def _too_long_remembered(model_id: str, store: MemoryStore) -> bool:
+    """Whether `model_id` has a remembered S127 "too long" verdict that still
+    holds. A verdict whose window changed (a sample arrived after it, or one
+    it counted aged out) is dropped here, when consulted. A failed read keeps
+    the verdict (no over-budget re-run on a database hiccup)."""
     with _cost_lock:
-        return model_id in _too_long_fit
-
-
-def _start_new_rerank_period() -> None:
-    """The 24-hour compaction tick (S101): every model id's time sums start
-    over, the fit in effect carried (S114). RAM and warm-up state are kept, and
-    so are "too long" verdicts: the carried fit is the fit the verdict was
-    reached under (S127)."""
+        verdict = _too_long.get(model_id)
+    if verdict is None:
+        return False
+    try:
+        before, after = _rerank_cost.window_counts(store, model_id, verdict.taken_at)
+    except Exception:  # noqa: BLE001 - fail soft: keep the verdict
+        log.debug("rerank width re-measure: verdict read failed", exc_info=True)
+        return True
+    if after == 0 and before == verdict.before:
+        return True
     with _cost_lock:
-        for model_id, sums in list(_cost_sums.items()):
-            _cost_sums[model_id] = sums.next_period()
+        if _too_long.get(model_id) is verdict:
+            del _too_long[model_id]
+    return False
 
 
-cost_period.on_new_period(_start_new_rerank_period)
+def _ram_unseeded(model_id: str) -> bool:
+    """S158: this process has not yet recorded a measured rerank for
+    `model_id` and RSS is readable (Linux), so its first measured recall
+    rerank must run at the S5 minimum to seed the RAM high water, whatever the
+    saved time estimate says."""
+    with _cost_lock:
+        if model_id in _ram_state:
+            return False
+    return _current_rss_bytes() is not None
 
 
 def _reset_rerank_cost_model() -> None:
-    """Test-only: forget every model id's running sums, warm-up state, budget
-    misses, re-measure markers and "too long" verdicts."""
+    """Test-only: forget every model id's RAM state, warm-up state, budget
+    misses, re-measure markers and "too long" verdicts. The saved series lives
+    in the database and the process buffer (`cost_series._reset_pending`)."""
     with _cost_lock:
-        _cost_sums.clear()
+        _ram_state.clear()
         _warmed_model_ids.clear()
         _budget_misses.clear()
         _remeasured_marker.clear()
-        _too_long_fit.clear()
+        _too_long.clear()
 
 
 def _full_rerank_budget() -> float:
@@ -857,53 +853,59 @@ _NEVER = object()
 _remeasure_hook: Callable[[], None] | None = None
 
 
-def stuck_width_due(activity_marker: object) -> bool:
+def stuck_width_due(
+    activity_marker: object, store_factory: Callable[[], AbstractContextManager[MemoryStore]]
+) -> bool:
     """Whether the `rerank_width_remeasure` job is due (S100, S113): the
     runtime reranker model id has a budget miss that is stuck under the
     current estimate, its warm-up has run in this process and its provider is
     cached (the job never builds or loads a model), no re-measure has run
     at this chat activity marker (once per lull), and no "too long" verdict is
     remembered (S127: the job's own measured 5 candidates exceeded the full
-    budget under the fit still in effect, so a new record does not re-trigger
-    the job until the fit changes). A miss found not stuck is dropped. Takes
-    `_cost_lock` only briefly, never nested."""
+    budget, and no sample has arrived or aged out since, so a new record does
+    not re-trigger the job until the estimate changes). A miss found not stuck
+    is dropped. The in-memory checks come first; `store_factory` (a context
+    manager yielding a store, opened only past them) supplies the saved series.
+    Takes `_cost_lock` only briefly, never nested."""
     model_id = resolve_reranker_model_id()
     miss, stamp, warmed = _job_state(model_id)
     if miss is None or not warmed or _provider_cache.get(model_id) is None:
         return False
-    if _too_long_remembered(model_id):
-        return False
     if stamp is not _NEVER and stamp == activity_marker:
         return False
-    if not _is_stuck(miss, rerank_cost_estimate(model_id)):
-        _drop_miss(model_id, miss)
-        return False
+    with store_factory() as store:
+        if _too_long_remembered(model_id, store):
+            return False
+        if not _is_stuck(miss, rerank_cost_estimate(model_id, store)):
+            _drop_miss(model_id, miss)
+            return False
     return True
 
 
-def remeasure_stuck_width(activity_marker: object) -> bool:
+def remeasure_stuck_width(activity_marker: object, store: MemoryStore) -> bool:
     """The `rerank_width_remeasure` job's run (S100, S113, S116): one timed
     rerank of the stuck miss's 5 candidates (5 real + `anchor_count(5)`
     anchors) on the already-loaded provider, added to the cost sums. Then the
     miss is cleared when the measured seconds are within the full budget
     (S116 a: 5 fit) and dropped when they exceed it (S116 b: genuinely too
-    long, not stuck), and that verdict is remembered until the fitted cost
-    model next changes (S127). The marker is stamped first, so a failing or
-    RAM-skipped run still runs once per lull. Skipped (miss kept) when the
-    miss is no longer stuck (then dropped), a "too long" verdict is
-    remembered, or the RAM bound predicts the batch does not fit the current
-    headroom. Returns True iff the rerank ran. Provider exceptions propagate
+    long, not stuck), and that verdict is remembered until the estimate next
+    changes (S127: a sample arrives or one it counted ages out). The marker
+    is stamped after the verdict check and before the measurement, so a failing
+    or RAM-skipped run still runs once per lull, while a run skipped by a held
+    verdict stamps nothing. Skipped (miss kept) when the miss is no longer
+    stuck (then dropped), a "too long" verdict is remembered, or the RAM bound
+    predicts the batch does not fit the current headroom. Returns True iff the rerank ran. Provider exceptions propagate
     (the central pass logs them)."""
     model_id = resolve_reranker_model_id()
     miss, _, warmed = _job_state(model_id)
     provider = _provider_cache.get(model_id)
     if miss is None or not warmed or provider is None:
         return False
-    if _too_long_remembered(model_id):
+    if _too_long_remembered(model_id, store):
         return False
     with _cost_lock:
         _remeasured_marker[model_id] = activity_marker
-    estimate = rerank_cost_estimate(model_id)
+    estimate = rerank_cost_estimate(model_id, store)
     if not _is_stuck(miss, estimate):
         _drop_miss(model_id, miss)
         return False
@@ -917,7 +919,13 @@ def remeasure_stuck_width(activity_marker: object) -> bool:
             log.info("rerank width re-measure: skipped, the batch does not fit the RAM headroom")
             return False
     _, seconds = _measured_rerank(
-        provider, model_id, miss.query, list(miss.documents), miss.candidate_tokens, miss.anchor_tokens
+        provider,
+        model_id,
+        store,
+        miss.query,
+        list(miss.documents),
+        miss.candidate_tokens,
+        miss.anchor_tokens,
     )
     if _remeasure_hook is not None:
         _remeasure_hook()
@@ -925,7 +933,7 @@ def remeasure_stuck_width(activity_marker: object) -> bool:
     if seconds is not None:
         _drop_miss(model_id, miss)
         if seconds > budget:
-            _remember_too_long(model_id)
+            _remember_too_long(model_id, store)
     log.info(
         "rerank width re-measure: model=%s padded_tokens=%d seconds=%s budget=%s -> %s",
         model_id,
@@ -940,6 +948,7 @@ def remeasure_stuck_width(activity_marker: object) -> bool:
 def _measured_rerank(
     provider: RerankerProvider,
     model_id: str,
+    store: MemoryStore,
     query: str,
     documents: list[str],
     candidate_tokens: Sequence[int],
@@ -956,7 +965,11 @@ def _measured_rerank(
     k = normalization.anchor_count
     longest = max([*candidate_tokens[: len(documents)], *anchor_tokens[:k]])
     _record_rerank_cost(
-        model_id, (len(documents) + k) * longest, normalization.seconds, normalization.rss_delta_bytes
+        model_id,
+        store,
+        (len(documents) + k) * longest,
+        normalization.seconds,
+        normalization.rss_delta_bytes,
     )
     return normalization, normalization.seconds
 
@@ -1340,6 +1353,7 @@ def rerank_for_recall(
     query: str,
     candidate_documents: Sequence[str],
     *,
+    store: MemoryStore,
     budget_seconds: float | None = None,
     max_real: int = CANDIDATE_POOL,
     sizes: PairSizes | None = None,
@@ -1349,6 +1363,8 @@ def rerank_for_recall(
 
     `candidate_documents` are the query's candidates in prefix order (see
     `fit_rerank_width`); only the first `CANDIDATE_POOL` are considered.
+    `store` is the caller's memory store: the saved time series is read from
+    it and the measured call is buffered against it (S146, S164).
     `budget_seconds` defaults to the `reranker.latency_budget_seconds`
     tunable read now; `max_real` lets a caller give this query less than the
     design maximum (name-recall fix R6, S58: what is left of the message's
@@ -1396,7 +1412,12 @@ def rerank_for_recall(
             width=0, reranked=False, hand_off="sizes", normalization=None, measured=False
         )
     candidate_tokens, anchor_tokens = lengths[: len(pool)], lengths[len(pool) :]
-    estimate = rerank_cost_estimate(model_id)
+    estimate = rerank_cost_estimate(model_id, store)
+    if estimate is not None and _ram_unseeded(model_id):
+        # S158: the saved estimate would size this process's first measured
+        # rerank past the S5 minimum, but that rerank seeds the RAM high water
+        # the width fit's RAM bound needs; it runs at 5 (where RSS is readable).
+        estimate = None
     headroom = _available_ram_headroom_bytes() if estimate is not None else None
     width = fit_rerank_width(candidate_tokens, anchor_tokens, estimate, budget_seconds, headroom, cap)
 
@@ -1421,7 +1442,7 @@ def rerank_for_recall(
         )
 
     normalization, seconds = _measured_rerank(
-        provider, model_id, query, pool[:width], candidate_tokens, anchor_tokens
+        provider, model_id, store, query, pool[:width], candidate_tokens, anchor_tokens
     )
     measured = seconds is not None
     if measured and seconds <= _full_rerank_budget():

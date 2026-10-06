@@ -636,6 +636,7 @@ def _reranked_ranking(
             reranker_provider,
             query,
             [pool[mid][0].content for mid in coarse_ids],
+            store=store,
             budget_seconds=budget_seconds,
             max_real=max_real,
             sizes=sizes,

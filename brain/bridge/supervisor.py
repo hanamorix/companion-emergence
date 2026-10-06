@@ -107,7 +107,7 @@ from brain.ingest.pipeline import (
 )
 from brain.initiate.review import _rest_state_from_energy, run_initiate_review_tick
 from brain.initiate.user_pattern import compute_user_presence
-from brain.memory import cost_period, floor_startup, reranker
+from brain.memory import cost_series, floor_startup, reranker
 from brain.memory.embedding_backfill import (
     delete_legacy_embeddings_db as _delete_legacy_embeddings_db,
 )
@@ -1004,14 +1004,35 @@ def _build_gated_jobs(
         with cli_throttle.background_slot() as slot:
             if not slot:
                 return JobOutcome.SKIPPED
-            reranker.remeasure_stuck_width(cli_throttle.chat_activity_marker())
+            with _tick_store() as store:
+                reranker.remeasure_stuck_width(cli_throttle.chat_activity_marker(), store)
         return JobOutcome.COMPLETED
 
     jobs.append(
         GatedJob(
             "rerank_width_remeasure",
             run=_rerank_width_remeasure_job,
-            has_work=lambda: reranker.stuck_width_due(cli_throttle.chat_activity_marker()),
+            has_work=lambda: reranker.stuck_width_due(
+                cli_throttle.chat_activity_marker(), _tick_store
+            ),
+        )
+    )
+
+    # 4d. cost-series flush — name-recall fix S146, S164. The measured timings
+    # behind the per-message recall budget are only buffered in memory on the
+    # reply path; this job saves them to memories.db at the next lull. Due
+    # while the process buffer holds samples for this persona's database (no
+    # database is opened to decide that).
+    def _cost_series_flush_run() -> JobOutcome:
+        with _tick_store() as store:
+            cost_series.flush(store)
+        return JobOutcome.COMPLETED
+
+    jobs.append(
+        GatedJob(
+            "cost_series_flush",
+            run=_cost_series_flush_run,
+            has_work=lambda: cost_series.has_pending(persona_dir / "memories.db"),
         )
     )
 
@@ -1130,23 +1151,14 @@ def _build_gated_jobs(
     if compaction_interval_s is not None:
 
         def _compaction_run() -> JobOutcome:
-            # Name-recall fix S101: the 24-hour compaction tick starts a new
-            # cost period (the rerank and paragraph-embed running sums reset,
-            # the fit in effect carried) whenever this job's cadence advances:
-            # it completed, or it raised (S44). A paused tick does not.
-            paused = False
-            try:
-                from brain.chat.compaction import build_compaction_provider
+            from brain.chat.compaction import build_compaction_provider
 
-                paused = _run_compaction_tick(
-                    persona_dir,
-                    build_compaction_provider(persona_dir),
-                    is_session_busy=is_session_busy,
-                    should_pause=_between_items,
-                )
-            finally:
-                if not paused:
-                    cost_period.start_new_period()
+            paused = _run_compaction_tick(
+                persona_dir,
+                build_compaction_provider(persona_dir),
+                is_session_busy=is_session_busy,
+                should_pause=_between_items,
+            )
             return JobOutcome.PAUSED if paused else JobOutcome.COMPLETED
 
         jobs.append(

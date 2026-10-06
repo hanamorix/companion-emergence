@@ -159,7 +159,7 @@ def test_the_cap_drops_tail_results_before_any_reranked_result(
     )
     _cosine_floor(store, 0.4)
     _rerank_floor(store, floor=_RERANK_FLOOR)
-    _warm()
+    _warm(store)
     _install_reranker(
         monkeypatch, _Recording({g.content: 5.0 + i * 0.01 for i, g in enumerate(genuine)})
     )
@@ -185,7 +185,7 @@ def test_a_family_memory_surfaces_semantically_at_fifty_genuine_when_no_genuine_
     )
     _cosine_floor(store, 0.9)
     _rerank_floor(store, floor=_RERANK_FLOOR)
-    _warm()
+    _warm(store)
     _install_reranker(monkeypatch, _Recording({g.content: -3.0 for g in genuine}))
 
     result = run_semantic_recall(store, tmp_path, _QUERY)

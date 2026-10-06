@@ -437,9 +437,9 @@ def test_the_rerank_budget_uses_the_running_averages_not_this_messages_elapsed_t
     assert [c["budget_seconds"] for c in calls] == pytest.approx([4 - 0.25 - 0.25, 4 - 0.25 - 0.5])
 
 
-def _threshold_budget(rec: _Reranker, query: str, docs: list[str]) -> float:
+def _threshold_budget(rec: _Reranker, store: MemoryStore, query: str, docs: list[str]) -> float:
     """The smallest rerank share at which 5 real candidates fit the cost model."""
-    estimate = reranker_mod.rerank_cost_estimate(_RERANKER_ID)
+    estimate = reranker_mod.rerank_cost_estimate(_RERANKER_ID, store)
     lengths = rec.pair_token_lengths(query, [*docs, *ANCHOR_POOL])
     cand, anchors = lengths[: len(docs)], lengths[len(docs) :]
     k = reranker_mod.anchor_count(5)
@@ -459,9 +459,9 @@ def test_the_embed_and_scan_time_can_push_one_paragraph_onto_the_cosine_path(
     store, rec, clock = _budget_case(
         monkeypatch, tmp_path, embed_seconds=embed_seconds, probe=0.0, warm=0.0
     )
-    reranker_mod._record_rerank_cost(_RERANKER_ID, 1_000, 1.0, None)
+    reranker_mod._record_rerank_cost(_RERANKER_ID, store, 1_000, 1.0, None)
     docs = [f"r6 budget memory {i}" for i in range(6)]
-    cost5 = _threshold_budget(rec, "kite over the harbour", docs)
+    cost5 = _threshold_budget(rec, store, "kite over the harbour", docs)
     _budget(monkeypatch, 0.25 + cost5 + 0.25)
 
     result = run_semantic_recall(store, tmp_path, "kite over the harbour")
@@ -510,7 +510,7 @@ def _two_query_store(monkeypatch, tmp_path, clock, seconds_per_text):
     rec = _Reranker({m.content: 5.0 for m in [*first, *rest]})
     _install(monkeypatch, embedder, rec)
     _rerank_floor(store, 1.0)
-    _warm()
+    _warm(store)
     return store, embedder, rec, first, rest
 
 
@@ -698,7 +698,7 @@ def test_the_message_never_reranks_more_than_fifty_real_candidates(
     _install(monkeypatch, embedder, rec)
     _rerank_floor(store, 1.0)
     _cosine_floor(store, 0.1)
-    _warm()
+    _warm(store)
 
     search = search_paragraphs(store, "\n".join(texts), log_calibration=False)
 
@@ -732,7 +732,7 @@ def _guarantee_store(monkeypatch, tmp_path, *, p2_type="event", with_p3=False):
     _install(monkeypatch, embedder, rec)
     _rerank_floor(store, 1.0)
     _cosine_floor(store, 0.5)
-    _warm()
+    _warm(store)
     return store, p1, p2, p3
 
 
@@ -810,7 +810,7 @@ def test_eleven_paragraphs_over_the_passive_cap_keep_reranked_guarantees_then_co
     _install(monkeypatch, embedder, rec)
     _rerank_floor(store, 0.1)
     _cosine_floor(store, 0.5)
-    _warm()
+    _warm(store)
 
     result = run_semantic_recall(store, tmp_path, "\n".join(texts))
 
@@ -1111,7 +1111,7 @@ def test_each_paragraphs_rerank_logs_the_paragraph_as_its_query_and_the_tool_log
     rec = _Reranker(dict.fromkeys(contents, 5.0))
     _install(monkeypatch, embedder, rec)
     _rerank_floor(store, 1.0)
-    _warm()
+    _warm(store)
 
     run_semantic_recall(store, tmp_path, f"{_P1}\n{_P2}")
 
@@ -1565,7 +1565,7 @@ def test_only_a_query_that_can_rerank_is_probed_for_pair_sizes(
     _install(monkeypatch, embedder, rec)
     _rerank_floor(store, 1.0)
     _cosine_floor(store, 0.5)
-    _warm()
+    _warm(store)
 
     run_semantic_recall(store, tmp_path, f"{_P1}\n{_P2}")
 
@@ -1709,7 +1709,7 @@ def test_one_querys_probe_failure_keeps_the_other_queries_sizes(
     _install(monkeypatch, embedder, rec)
     _rerank_floor(store, 1.0)
     _cosine_floor(store, 0.5)
-    _warm()
+    _warm(store)
     calls = _spy_rank_and_gate(monkeypatch)
 
     run_semantic_recall(store, tmp_path, f"{_P1}\n{_P2}")
@@ -1736,7 +1736,7 @@ def test_a_rerank_whose_floor_read_failed_still_counts_toward_the_fifty(
     rec = _Reranker(dict.fromkeys(contents, 5.0))
     _install(monkeypatch, embedder, rec)
     _cosine_floor(store, 0.5)
-    _warm()
+    _warm(store)
 
     def _broken(self, model_id):
         raise RuntimeError("simulated floor read failure")

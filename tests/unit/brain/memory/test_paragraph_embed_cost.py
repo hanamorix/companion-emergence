@@ -13,6 +13,7 @@ test.
 from __future__ import annotations
 
 import threading
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -334,7 +335,7 @@ def test_c20_waits_before_the_lock_are_not_timed(monkeypatch, tmp_path: Path) ->
     _install(monkeypatch, embedder, rec)
     _rerank_floor(store, 1.0)
     _cosine_floor(store, 0.5)
-    _warm()
+    _warm(store)
 
     run_semantic_recall(store, tmp_path, "kite over the harbour")
 
@@ -465,7 +466,7 @@ def test_c19_end_to_end_the_sixth_paragraph_reranks_five(monkeypatch, tmp_path: 
     _install(monkeypatch, embedder, rec)
     _rerank_floor(store, 1.0)
     _cosine_floor(store, 0.1)
-    _warm()
+    _warm(store)
 
     search = search_paragraphs(store, "\n".join(texts), log_calibration=False)
 
@@ -508,14 +509,14 @@ def test_c15b_a_many_paragraph_message_on_a_healthy_model_leaves_no_stuck_state(
     pair = len(texts[0]) + len("rs para 0 memory 0")
     longest = max(pair, *(len(texts[0]) + len(a) for a in reranker_mod.ANCHOR_POOL[:2]))
     for x in (7 * longest, 14 * longest):
-        reranker_mod._record_rerank_cost(_RERANKER_ID, x, 1.2 * x / (7 * longest), None)
+        reranker_mod._record_rerank_cost(_RERANKER_ID, store, x, 1.2 * x / (7 * longest), None)
     assert clock.now == 0.0
 
     search = search_paragraphs(store, "\n".join(texts), log_calibration=False)
 
     assert search is not None and search.total_width == 0
     assert _RERANKER_ID in reranker_mod._budget_misses, "recorded (S113)"
-    assert reranker_mod.stuck_width_due(1.0) is False, "5 fit the full budget: not stuck"
+    assert reranker_mod.stuck_width_due(1.0, lambda: nullcontext(store)) is False, "5 fit the full budget: not stuck"
 
 
 def test_f2_a_broken_load_warns_once_then_logs_at_debug(monkeypatch, tmp_path: Path, caplog) -> None:

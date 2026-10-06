@@ -1,6 +1,7 @@
 """Name-recall fix R1-recovery: stuck-width recovery at a chat lull (spec §7;
 S100, S113, S116; criteria C15a-C15h, C16d, CONC-8, CONC-9 in
-`changes/name-recall-fix/R1-recovery/1.5-criteria.md`).
+`changes/name-recall-fix/R1-recovery/1.5-criteria.md`), on the cost-series
+increment's saved 24-hour window (S127 by sample identity, CS5).
 
 All offline: the scripted clock and cost-scripted fake reranker of
 `test_rerank_cost_model.py` (a call costs overhead + rate x padded tokens; one
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 import ast
 import threading
+from contextlib import nullcontext
 from fractions import Fraction
 from pathlib import Path
 
@@ -24,8 +26,8 @@ import brain.memory.reranker as reranker_mod
 from brain import tunables
 from brain.bridge import supervisor
 from brain.bridge.central_cadence import JobOutcome
-from brain.memory import cost_period
-from brain.memory.reranker import rerank_cost_estimate, rerank_for_recall
+from brain.memory import cost_series
+from brain.memory.store import MemoryStore
 from tests.unit.brain.bridge.test_central_cadence import (
     _denying_slot,
     _granting_slot,
@@ -46,6 +48,48 @@ _B = 4.0
 _L = 600
 _X5 = 7 * _L
 _REPO = Path(__file__).resolve().parents[4]
+
+# The store this test's recall calls and re-measure runs use (an autouse fixture
+# opens one per test) and a stepping wall clock, so no two samples share a
+# `taken_at` and an "after the verdict" sample is strictly after it.
+_STORE: MemoryStore
+
+
+@pytest.fixture(autouse=True)
+def _store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    global _STORE
+    _STORE = MemoryStore(tmp_path / "memories.db", integrity_check=False)
+    now = [1_000_000.0]
+
+    def _wall() -> float:
+        now[0] += 0.001
+        return now[0]
+
+    monkeypatch.setattr(cost_series, "_wall_clock", _wall)
+    yield _STORE
+    _STORE.close()
+
+
+def rerank_cost_estimate(model_id):
+    return reranker_mod.rerank_cost_estimate(model_id, _STORE)
+
+
+def _due(marker) -> bool:
+    return reranker_mod.stuck_width_due(marker, lambda: nullcontext(_STORE))
+
+
+def _remeasure(marker) -> bool:
+    return reranker_mod.remeasure_stuck_width(marker, _STORE)
+
+
+def _verdict() -> bool:
+    return reranker_mod._too_long_remembered(_MODEL, _STORE)
+
+
+def _window() -> cost_series.LinearSums:
+    state = reranker_mod._rerank_cost.state(_STORE, _MODEL)
+    assert state is not None
+    return state.sums
 
 
 @pytest.fixture
@@ -73,7 +117,9 @@ def _true_cost_provider(clock: _Clock, seconds_for_five: float, overhead: float 
 
 
 def _message(provider, *, budget: float = _B, docs=None):
-    return rerank_for_recall(provider, _QUERY, docs or _docs(50, _L), budget_seconds=budget)
+    return reranker_mod.rerank_for_recall(
+        provider, _QUERY, docs or _docs(50, _L), budget_seconds=budget, store=_STORE
+    )
 
 
 def _seven_doc_calls(provider) -> list[list[str]]:
@@ -86,7 +132,7 @@ def _seven_doc_calls(provider) -> list[list[str]]:
 
 
 def test_c15a_a_budget_miss_records_the_query_and_its_first_five(clock: _Clock) -> None:
-    reranker_mod._record_rerank_cost(_MODEL, 100, 1_000.0, None)  # inflated
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 100, 1_000.0, None)  # inflated
     provider = _true_cost_provider(clock, 1.2)
     docs = _docs(50, _L)
     out = _message(provider, docs=docs)
@@ -99,11 +145,13 @@ def test_c15a_a_budget_miss_records_the_query_and_its_first_five(clock: _Clock) 
 
 
 def test_c15a_pool_allocation_and_sizes_hand_offs_write_no_record(clock: _Clock) -> None:
-    reranker_mod._record_rerank_cost(_MODEL, 100, 1_000.0, None)
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 100, 1_000.0, None)
     provider = _true_cost_provider(clock, 1.2)
-    assert rerank_for_recall(provider, _QUERY, _docs(4, _L), budget_seconds=_B).hand_off == "pool"
+    assert _message(provider, docs=_docs(4, _L)).hand_off == "pool"
     assert (
-        rerank_for_recall(provider, _QUERY, _docs(50, _L), budget_seconds=_B, max_real=4).hand_off
+        reranker_mod.rerank_for_recall(
+            provider, _QUERY, _docs(50, _L), budget_seconds=_B, max_real=4, store=_STORE
+        ).hand_off
         == "allocation"
     )
 
@@ -115,7 +163,7 @@ def test_c15a_pool_allocation_and_sizes_hand_offs_write_no_record(clock: _Clock)
             return _MODEL
 
     no_sizes = _NoSizes(default=0.0)
-    assert rerank_for_recall(no_sizes, _QUERY, _docs(50, _L), budget_seconds=_B).hand_off == "sizes"
+    assert _message(no_sizes).hand_off == "sizes"
     assert _MODEL not in reranker_mod._budget_misses
 
 
@@ -127,7 +175,7 @@ def test_c15a_pool_allocation_and_sizes_hand_offs_write_no_record(clock: _Clock)
 def _healthy_estimate(provider) -> None:
     """Two measured sizes of the true cost (overhead 0, the provider's rate)."""
     for x in (_X5, 2 * _X5):
-        reranker_mod._record_rerank_cost(_MODEL, x, provider.rate * x, None)
+        reranker_mod._record_rerank_cost(_MODEL, _STORE, x, provider.rate * x, None)
 
 
 def test_c15b_a_small_share_miss_on_a_healthy_model_is_not_stuck(
@@ -143,16 +191,16 @@ def test_c15b_a_small_share_miss_on_a_healthy_model_is_not_stuck(
         out = _message(provider, budget=share)
         assert out.hand_off == "budget"
         assert _MODEL in reranker_mod._budget_misses
-        assert reranker_mod.stuck_width_due(1.0) is False
+        assert _due(1.0) is False
         assert _MODEL not in reranker_mod._budget_misses
 
 
 def test_c15b_an_inflated_estimate_is_stuck(clock: _Clock, monkeypatch: pytest.MonkeyPatch) -> None:
     provider = _true_cost_provider(clock, 1.2)
     _cached(monkeypatch, provider)
-    reranker_mod._record_rerank_cost(_MODEL, _X5, 40 * 1.2, None)
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, _X5, 40 * 1.2, None)
     assert _message(provider).hand_off == "budget"
-    assert reranker_mod.stuck_width_due(1.0) is True
+    assert _due(1.0) is True
 
 
 # ---------------------------------------------------------------------------
@@ -185,20 +233,20 @@ def test_c15c_a_a_within_budget_rerank_clears_and_an_over_budget_one_does_not(
 def _stuck(clock: _Clock, monkeypatch: pytest.MonkeyPatch, seconds_for_five: float = 1.2):
     provider = _true_cost_provider(clock, seconds_for_five)
     _cached(monkeypatch, provider)
-    reranker_mod._record_rerank_cost(_MODEL, _X5, 40 * 1.2, None)
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, _X5, 40 * 1.2, None)
     assert _message(provider).hand_off == "budget"
     return provider
 
 
 def test_c15d_due_needs_a_warmed_cached_provider(clock: _Clock, monkeypatch: pytest.MonkeyPatch) -> None:
     provider = _stuck(clock, monkeypatch)
-    assert reranker_mod.stuck_width_due(1.0)
+    assert _due(1.0)
     monkeypatch.delitem(reranker_mod._provider_cache, _MODEL)
-    assert not reranker_mod.stuck_width_due(1.0), "no cached provider: never builds one"
+    assert not _due(1.0), "no cached provider: never builds one"
     _cached(monkeypatch, provider)
     with reranker_mod._cost_lock:
         reranker_mod._warmed_model_ids.discard(_MODEL)
-    assert not reranker_mod.stuck_width_due(1.0), "not warmed: the session has not run"
+    assert not _due(1.0), "not warmed: the session has not run"
 
 
 def test_c15d_conc9_once_per_lull_per_model_id(clock: _Clock, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -207,15 +255,15 @@ def test_c15d_conc9_once_per_lull_per_model_id(clock: _Clock, monkeypatch: pytes
     # S127), so only the marker limits the next run.
     provider = _stuck(clock, monkeypatch)
     marker = float("-inf")  # a process that has seen no message
-    assert reranker_mod.stuck_width_due(marker)
+    assert _due(marker)
     monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
     # A run at the -inf marker (the record is cleared: 5 fit) ...
-    assert reranker_mod.remeasure_stuck_width(marker)
-    assert not reranker_mod._too_long_remembered(_MODEL)
+    assert _remeasure(marker)
+    assert not _verdict()
     # ... then a tool call records a NEW miss without moving the marker.
     assert _message(provider).hand_off == "budget"
-    assert not reranker_mod.stuck_width_due(marker), "one re-measure per lull, per model id"
-    assert reranker_mod.stuck_width_due(5.0), "the marker moved: due again"
+    assert not _due(marker), "one re-measure per lull, per model id"
+    assert _due(5.0), "the marker moved: due again"
 
 
 def test_c15d_the_record_key_is_the_cache_key_through_the_real_builder(
@@ -243,9 +291,9 @@ def test_c15d_the_record_key_is_the_cache_key_through_the_real_builder(
     )
     provider = real_build()
     assert built == [_MODEL] and provider.model_id() == _MODEL
-    reranker_mod._record_rerank_cost(_MODEL, _X5, 40 * 1.2, None)
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, _X5, 40 * 1.2, None)
     assert _message(provider).hand_off == "budget"
-    assert reranker_mod.stuck_width_due(1.0)
+    assert _due(1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -258,12 +306,12 @@ def test_c15e_one_rerank_of_five_real_plus_two_anchors_recorded_at_seven_times_l
 ) -> None:
     provider = _stuck(clock, monkeypatch)
     miss = reranker_mod._budget_misses[_MODEL]
-    before = reranker_mod._cost_sums[_MODEL]
+    before = _window()
     provider.calls.clear()
-    assert reranker_mod.remeasure_stuck_width(1.0)
+    assert _remeasure(1.0)
     assert len(provider.calls) == 1
     assert provider.calls[0] == [*miss.documents, *reranker_mod.ANCHOR_POOL[:2]]
-    after = reranker_mod._cost_sums[_MODEL]
+    after = _window()
     assert after.n == before.n + 1 and after.sum_x == before.sum_x + _X5
     assert after.sum_y - before.sum_y == pytest.approx(1.2)
     assert _MODEL not in reranker_mod._budget_misses, "1.2 s <= B: cleared (S116 a)"
@@ -273,13 +321,13 @@ def test_c15e_run_rejudges_first_and_skips_a_no_longer_stuck_record(
     clock: _Clock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     provider = _stuck(clock, monkeypatch)
-    assert reranker_mod.stuck_width_due(1.0)
+    assert _due(1.0)
     # Between the due check and the run, chat reranks change the estimate.
     _healthy_estimate(provider)
     for _ in range(60):
-        reranker_mod._record_rerank_cost(_MODEL, 2 * _X5, provider.rate * 2 * _X5, None)
+        reranker_mod._record_rerank_cost(_MODEL, _STORE, 2 * _X5, provider.rate * 2 * _X5, None)
     provider.calls.clear()
-    assert reranker_mod.remeasure_stuck_width(1.0) is False
+    assert _remeasure(1.0) is False
     assert provider.calls == []
     assert _MODEL not in reranker_mod._budget_misses
 
@@ -289,16 +337,16 @@ def test_c15e_stamp_before_the_ram_check(clock: _Clock, monkeypatch: pytest.Monk
     _cached(monkeypatch, provider)
     # One inflated sample at a SMALL size with an RSS delta: a RAM figure whose
     # high water (100 tokens) is far below the job's 5 + 2 batch.
-    reranker_mod._record_rerank_cost(_MODEL, 100, 40 * 1.2 * 100 / _X5, 1e6)
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 100, 40 * 1.2 * 100 / _X5, 1e6)
     monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
     assert _message(provider).hand_off == "budget"
     monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 1.0)
     provider.calls.clear()
-    assert reranker_mod.remeasure_stuck_width(7.0) is False
+    assert _remeasure(7.0) is False
     assert provider.calls == [], "RAM-skipped: no rerank"
     assert _MODEL in reranker_mod._budget_misses, "RAM-skipped: record kept"
-    assert not reranker_mod.stuck_width_due(7.0), "stamped: not due again at the same marker"
-    assert reranker_mod.stuck_width_due(8.0)
+    assert not _due(7.0), "stamped: not due again at the same marker"
+    assert _due(8.0)
 
 
 # ---------------------------------------------------------------------------
@@ -315,8 +363,8 @@ def _drive(provider, *, limit: int = 200) -> int:
         if out.reranked:
             return runs
         assert out.hand_off == "budget"
-        assert reranker_mod.stuck_width_due(float(lull))
-        assert reranker_mod.remeasure_stuck_width(float(lull))
+        assert _due(float(lull))
+        assert _remeasure(float(lull))
         assert _MODEL not in reranker_mod._budget_misses
         runs += 1
     raise AssertionError("never recovered")
@@ -333,7 +381,7 @@ def test_c15f_1_first_period_single_size(clock: _Clock, monkeypatch: pytest.Monk
     t = Fraction(3, 10) * Fraction(_B)
     provider = _true_cost_provider(clock, float(t))
     _cached(monkeypatch, provider)
-    reranker_mod._record_rerank_cost(_MODEL, _X5, float(40 * t), None)
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, _X5, float(40 * t), None)
 
     def predict(k: int) -> Fraction:  # ratio of sums at one size
         return (40 * t + k * t) / (k + 1)
@@ -342,7 +390,7 @@ def test_c15f_1_first_period_single_size(clock: _Clock, monkeypatch: pytest.Monk
     assert expected == 16
     assert predict(15) / _B > Fraction(101, 100) and predict(16) / _B < Fraction(99, 100)
     assert _drive(provider) == expected
-    assert not reranker_mod.stuck_width_due(99.0)
+    assert not _due(99.0)
 
 
 def test_c15f_2_first_period_two_sizes(clock: _Clock, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -353,7 +401,7 @@ def test_c15f_2_first_period_two_sizes(clock: _Clock, monkeypatch: pytest.Monkey
     _cached(monkeypatch, provider)
     x1 = 2 * _X5
     y1 = 40 * (o + provider.rate * x1)
-    reranker_mod._record_rerank_cost(_MODEL, x1, y1, None)
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, x1, y1, None)
 
     def predict(k: int) -> float:
         points = [(x1, y1)] + [(_X5, t5)] * k
@@ -371,15 +419,19 @@ def test_c15f_2_first_period_two_sizes(clock: _Clock, monkeypatch: pytest.Monkey
     assert _drive(provider) == expected
 
 
-def test_c15f_3_after_a_reset_the_rescaled_carry_recovers_in_one(
+def test_c15f_3_after_the_window_empties_the_rescaled_carry_recovers_in_one(
     clock: _Clock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     provider = _true_cost_provider(clock, 1.2)
     _cached(monkeypatch, provider)
-    # An inflated fit at two sizes, carried into the next period.
-    reranker_mod._record_rerank_cost(_MODEL, _X5, 40 * 1.2, None)
-    reranker_mod._record_rerank_cost(_MODEL, 2 * _X5, 80 * 1.2, None)
-    cost_period.start_new_period()
+    # An inflated fit at two sizes, saved; then a downtime longer than the
+    # window leaves only the carried estimate (S146, S114).
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, _X5, 40 * 1.2, None)
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 2 * _X5, 80 * 1.2, None)
+    assert cost_series.flush(_STORE) == 2
+    real = cost_series._wall_clock
+    monkeypatch.setattr(cost_series, "_wall_clock", lambda: real() + cost_series.window_seconds() + 60.0)
+    assert _window().n == 0
     assert _drive(provider) == 1
     assert rerank_cost_estimate(_MODEL).seconds_per_token * _X5 == pytest.approx(1.2)
 
@@ -391,14 +443,14 @@ def test_c15f_4_an_accurate_too_long_record_is_dropped_after_one_run(
     _cached(monkeypatch, provider)
     _healthy_estimate(provider)
     assert _message(provider).hand_off == "budget"
-    assert reranker_mod.stuck_width_due(1.0)
-    assert reranker_mod.remeasure_stuck_width(1.0)
+    assert _due(1.0)
+    assert _remeasure(1.0)
     assert _MODEL not in reranker_mod._budget_misses, "S116 (b): too long, dropped"
-    assert not reranker_mod.stuck_width_due(2.0)
+    assert not _due(2.0)
     # S127: the verdict is remembered, so the next budget miss (a new record)
     # does not bring the job back; see the S127 tests below.
     assert _message(provider).hand_off == "budget"
-    assert not reranker_mod.stuck_width_due(2.0)
+    assert not _due(2.0)
 
 
 # ---------------------------------------------------------------------------
@@ -413,8 +465,8 @@ def _too_long(clock: _Clock, monkeypatch: pytest.MonkeyPatch):
     _cached(monkeypatch, provider)
     _healthy_estimate(provider)
     assert _message(provider).hand_off == "budget"
-    assert reranker_mod.stuck_width_due(1.0)
-    assert reranker_mod.remeasure_stuck_width(1.0)
+    assert _due(1.0)
+    assert _remeasure(1.0)
     return provider
 
 
@@ -427,8 +479,8 @@ def test_s127_new_budget_misses_do_not_re_run_the_over_budget_rerank(
     for lull in range(2, 8):
         assert _message(provider).hand_off == "budget", "5 still never fit"
         assert _MODEL in reranker_mod._budget_misses, "a new stuck record"
-        assert reranker_mod.stuck_width_due(float(lull)) is False
-        assert reranker_mod.remeasure_stuck_width(float(lull)) is False
+        assert _due(float(lull)) is False
+        assert _remeasure(float(lull)) is False
     assert len(_seven_doc_calls(provider)) == 1, "no further over-budget rerank (no lock hold)"
     assert clock.t == held, "no rerank time spent at any later lull"
 
@@ -442,92 +494,132 @@ def test_s127_the_run_itself_skips_while_the_verdict_is_remembered(
     assert _message(provider).hand_off == "budget"
     calls = len(provider.calls)
     stamp = reranker_mod._remeasured_marker[_MODEL]
-    assert reranker_mod.remeasure_stuck_width(9.0) is False
+    assert _remeasure(9.0) is False
     assert len(provider.calls) == calls
     assert reranker_mod._remeasured_marker[_MODEL] == stamp
     assert _MODEL in reranker_mod._budget_misses, "the new record is kept"
 
 
-def test_s127_the_verdict_ends_when_the_fitted_cost_model_changes(
+def test_s127_the_verdict_ends_when_a_new_sample_arrives(
     clock: _Clock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     provider = _too_long(clock, monkeypatch)
     assert _message(provider).hand_off == "budget"
-    assert not reranker_mod.stuck_width_due(2.0)
+    assert not _due(2.0)
     before = rerank_cost_estimate(_MODEL)
-    # Any measurement that moves the fit (here a slower batch, so the model
-    # still says 5 do not fit and the record is still stuck).
-    reranker_mod._record_rerank_cost(_MODEL, 4 * _X5, 4 * 6.0, None)
+    # Any measurement (here a slower batch, so the model still says 5 do not
+    # fit and the record is still stuck).
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 4 * _X5, 4 * 6.0, None)
     after = rerank_cost_estimate(_MODEL)
     assert (after.overhead_seconds, after.seconds_per_token) != (
         before.overhead_seconds,
         before.seconds_per_token,
     )
-    assert not reranker_mod._too_long_remembered(_MODEL)
-    assert reranker_mod.stuck_width_due(2.0) is True, "the estimate changed: the job may run again"
+    assert not _verdict()
+    assert _due(2.0) is True, "the estimate changed: the job may run again"
     calls = len(_seven_doc_calls(provider))
-    assert reranker_mod.remeasure_stuck_width(2.0) is True
+    assert _remeasure(2.0) is True
     assert len(_seven_doc_calls(provider)) == calls + 1
 
 
-def test_s127_a_sample_that_leaves_the_fit_unchanged_keeps_the_verdict(
+def test_s127_a_sample_flushed_by_another_connection_ends_the_verdict(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _too_long(clock, monkeypatch)
+    assert _verdict()
+    other = MemoryStore(_STORE.db_path, integrity_check=False)
+    try:
+        # What another process's flush writes (its buffer is not this one's: the
+        # rows appear in the database only when it flushes).
+        now = cost_series._wall_clock()
+        other.record_cost_samples(
+            "rerank", "test-machine", _MODEL, [(3 * _X5, 9.0, now)], now=now, window_seconds=cost_series.window_seconds()
+        )
+    finally:
+        other.close()
+    assert not _verdict()
+
+
+def test_s127_a_sample_that_ages_out_ends_the_verdict(
     clock: _Clock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """"Changes" is the fitted (overhead, rate), not the sample count: at one
-    batch size the fit is the ratio of sums, so one more sample of the same
-    cost leaves it exactly as it was."""
+    _too_long(clock, monkeypatch)
+    assert _verdict()
+    real = cost_series._wall_clock
+    shift = [0.0]
+    monkeypatch.setattr(cost_series, "_wall_clock", lambda: real() + shift[0])
+    shift[0] = 60.0
+    assert _verdict(), "a time step that changes nothing keeps the verdict"
+    shift[0] = cost_series.window_seconds() + 60.0
+    assert not _verdict(), "the samples it counted left the window"
+
+
+def test_s127_the_verdict_survives_its_own_flush_with_non_dyadic_seconds(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R4-1: the buffer-to-database move re-sums the floats differently (the
+    database `SUM` and the Python sum disagree in the last bits), so a verdict
+    that compared the fitted (overhead, rate) pair would end at its own flush
+    and bring the over-budget re-measure back at the next lull (`b3a60a8b`).
+    The verdict compares which samples the window holds, so it survives."""
     provider = _true_cost_provider(clock, 5.0)
     _cached(monkeypatch, provider)
-    reranker_mod._record_rerank_cost(_MODEL, _X5, 5.0, None)  # one size, 5 s: stuck
+    points = [(_X5 + 17 * i, 5.0 + 0.13 * i + 0.0071 * (i % 3)) for i in range(1, 12)]
+    for x, y in points:
+        reranker_mod._record_rerank_cost(_MODEL, _STORE, x, y, None)
     assert _message(provider).hand_off == "budget"
-    assert reranker_mod.remeasure_stuck_width(1.0)  # measures 5.0 s > B
-    assert reranker_mod._too_long_remembered(_MODEL)
-    before = rerank_cost_estimate(_MODEL)
-    reranker_mod._record_rerank_cost(_MODEL, _X5, 5.0, None)
-    after = rerank_cost_estimate(_MODEL)
-    assert after.measured_batches == before.measured_batches + 1
-    assert (after.overhead_seconds, after.seconds_per_token) == (
-        before.overhead_seconds,
-        before.seconds_per_token,
+    assert _due(1.0)
+    assert _remeasure(1.0)  # one over-budget measurement; the verdict is remembered
+    assert _verdict()
+    # The premise (so the case is not vacuous): the same samples, summed in
+    # Python (the buffer) and by the database (after the flush), give different
+    # fitted floats.
+    buffered = reranker_mod._rerank_cost.estimate(_STORE, _MODEL)
+    assert cost_series.flush(_STORE) >= len(points)
+    flushed = reranker_mod._rerank_cost.estimate(_STORE, _MODEL)
+    assert buffered is not None and flushed is not None
+    assert (buffered.fit.overhead, buffered.fit.rate) != (flushed.fit.overhead, flushed.fit.rate), (
+        "the fit moved when the samples were flushed: with floats compared the verdict would end"
     )
-    assert reranker_mod._too_long_remembered(_MODEL)
+    assert _verdict(), "but no sample arrived or aged out: the verdict holds across its own flush"
+    assert _due(2.0) is False
+    calls = len(_seven_doc_calls(provider))
+    assert _remeasure(2.0) is False
+    assert len(_seven_doc_calls(provider)) == calls
 
 
-def test_s127_the_verdict_survives_the_compaction_tick_and_ends_at_the_next_fit_change(
-    clock: _Clock, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    provider = _too_long(clock, monkeypatch)
-    cost_period.start_new_period()  # the 24-hour tick: the fit in effect is carried
-    assert reranker_mod._too_long_remembered(_MODEL)
-    assert _message(provider).hand_off == "budget"
-    assert not reranker_mod.stuck_width_due(3.0)
-    # The new period's first measurement (one size) rescales the carry: a change.
-    reranker_mod._record_rerank_cost(_MODEL, _X5, 6.0, None)
-    assert not reranker_mod._too_long_remembered(_MODEL)
+def test_s127_a_failed_read_keeps_the_verdict(clock: _Clock, monkeypatch: pytest.MonkeyPatch) -> None:
+    _too_long(clock, monkeypatch)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(_STORE, "cost_series_window_counts", boom)
+    assert _verdict(), "no over-budget re-run on a database hiccup"
 
 
-def test_s127_the_verdict_is_reached_under_the_fit_that_includes_the_jobs_own_sample(
+def test_s127_the_verdict_is_not_ended_by_the_jobs_own_sample(
     clock: _Clock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The estimate was inflated (40 x 1.2 s at one size) and the job's own
-    measurement (5 s > B) moves the fit; the verdict is still remembered, because
-    it is stored under the fit that includes that sample."""
+    measurement (5 s > B) moves the fit; the verdict is still remembered,
+    because that sample was taken before the verdict was reached."""
     provider = _stuck(clock, monkeypatch, seconds_for_five=5.0)
     before = rerank_cost_estimate(_MODEL)
-    assert reranker_mod.remeasure_stuck_width(1.0)
+    assert _remeasure(1.0)
     after = rerank_cost_estimate(_MODEL)
     assert after.seconds_per_token != before.seconds_per_token, "the job's sample moved the fit"
-    assert reranker_mod._too_long_remembered(_MODEL)
+    assert _verdict()
     assert _message(provider).hand_off == "budget", "still stuck under the new fit"
-    assert reranker_mod.stuck_width_due(2.0) is False
+    assert _due(2.0) is False
 
 
 def test_s127_a_within_budget_run_remembers_nothing(
     clock: _Clock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _stuck(clock, monkeypatch)  # the run measures 1.2 s <= B
-    assert reranker_mod.remeasure_stuck_width(1.0)
-    assert not reranker_mod._too_long_remembered(_MODEL)
+    assert _remeasure(1.0)
+    assert not _verdict()
 
 
 def test_s127_a_run_measuring_exactly_the_budget_is_not_too_long(
@@ -536,12 +628,12 @@ def test_s127_a_run_measuring_exactly_the_budget_is_not_too_long(
     """Equality at B fits (S116 a clears on `<=`); only over B is the verdict."""
     provider = _CostScriptedProvider(clock, overhead=_B, rate=0.0)  # 5 + 2 take exactly B
     _cached(monkeypatch, provider)
-    reranker_mod._record_rerank_cost(_MODEL, _X5, 40 * _B, None)  # inflated: stuck
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, _X5, 40 * _B, None)  # inflated: stuck
     assert _message(provider).hand_off == "budget"
     began = clock.t
-    assert reranker_mod.remeasure_stuck_width(1.0)
+    assert _remeasure(1.0)
     assert clock.t - began == pytest.approx(_B)
-    assert not reranker_mod._too_long_remembered(_MODEL)
+    assert not _verdict()
     assert _MODEL not in reranker_mod._budget_misses
 
 
@@ -550,18 +642,18 @@ def test_s127_a_model_id_with_no_verdict_is_unaffected(
 ) -> None:
     """The verdict is per model id: another id's verdict does not block this one."""
     with reranker_mod._cost_lock:
-        reranker_mod._too_long_fit["some-other-reranker"] = (0.0, 1.0)
+        reranker_mod._too_long["some-other-reranker"] = reranker_mod._Verdict(0.0, 0)
     provider = _stuck(clock, monkeypatch)
-    assert reranker_mod.stuck_width_due(1.0) is True
-    assert reranker_mod.remeasure_stuck_width(1.0) is True
+    assert _due(1.0) is True
+    assert _remeasure(1.0) is True
     assert provider is not None
 
 
 def test_s127_the_test_reset_forgets_verdicts() -> None:
     with reranker_mod._cost_lock:
-        reranker_mod._too_long_fit[_MODEL] = (0.0, 1.0)
+        reranker_mod._too_long[_MODEL] = reranker_mod._Verdict(0.0, 0)
     reranker_mod._reset_rerank_cost_model()
-    assert reranker_mod._too_long_fit == {}
+    assert reranker_mod._too_long == {}
 
 
 # ---------------------------------------------------------------------------
@@ -584,7 +676,7 @@ def test_conc8_a_new_record_during_the_run_survives(clock: _Clock, monkeypatch: 
         t.join(5.0)
 
     monkeypatch.setattr(reranker_mod, "_remeasure_hook", _chat_records_a_miss)
-    assert reranker_mod.remeasure_stuck_width(1.0)
+    assert _remeasure(1.0)
     assert reranker_mod._budget_misses.get(_MODEL) is newer
     assert provider is not None
 
@@ -601,76 +693,82 @@ def _job(tmp_path, name):
 def test_c15g_the_job_forwards_the_real_marker_and_respects_the_slot(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    seen: list[tuple[str, object]] = []
+    seen: list[tuple[str, object, object]] = []
     monkeypatch.setattr(supervisor.cli_throttle, "chat_activity_marker", lambda: 42.5)
     monkeypatch.setattr(
-        supervisor.reranker, "stuck_width_due", lambda m: seen.append(("due", m)) or True
+        supervisor.reranker,
+        "stuck_width_due",
+        lambda m, factory: seen.append(("due", m, callable(factory))) or True,
     )
     monkeypatch.setattr(
-        supervisor.reranker, "remeasure_stuck_width", lambda m: seen.append(("run", m)) or True
+        supervisor.reranker,
+        "remeasure_stuck_width",
+        lambda m, store: seen.append(("run", m, isinstance(store, MemoryStore))) or True,
     )
     job = _job(tmp_path, "rerank_width_remeasure")
     assert job.has_work() is True
     monkeypatch.setattr(supervisor.cli_throttle, "background_slot", _granting_slot)
     assert job.run() is JobOutcome.COMPLETED
-    assert seen == [("due", 42.5), ("run", 42.5)]
+    assert seen == [("due", 42.5, True), ("run", 42.5, True)]
     monkeypatch.setattr(supervisor.cli_throttle, "background_slot", _denying_slot)
     assert job.run() is JobOutcome.SKIPPED
-    assert seen == [("due", 42.5), ("run", 42.5)], "slot lost: no rerank"
+    assert seen == [("due", 42.5, True), ("run", 42.5, True)], "slot lost: no rerank"
+
+
+def test_c15g_the_due_check_opens_no_store_until_the_in_memory_checks_pass(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    opened: list[int] = []
+
+    def factory():
+        opened.append(1)
+        return nullcontext(_STORE)
+
+    # No miss recorded, nothing warmed, no cached provider: every in-memory
+    # check says no, so the store factory is never called.
+    assert reranker_mod.stuck_width_due(1.0, factory) is False
+    assert opened == []
+    provider = _stuck(clock, monkeypatch)
+    assert provider is not None
+    assert reranker_mod.stuck_width_due(1.0, factory) is True
+    assert opened == [1]
 
 
 @pytest.mark.parametrize(
-    ("tick", "outcome", "resets"),
-    [
-        (lambda *a, **k: False, JobOutcome.COMPLETED, 1),
-        (lambda *a, **k: True, JobOutcome.PAUSED, 0),
-    ],
+    ("tick", "outcome"),
+    [(lambda *a, **k: False, JobOutcome.COMPLETED), (lambda *a, **k: True, JobOutcome.PAUSED)],
 )
-def test_c16d_the_compaction_job_starts_a_new_period_unless_paused(
-    tmp_path, monkeypatch: pytest.MonkeyPatch, tick, outcome, resets
+def test_c16d_the_compaction_job_maps_its_tick_and_touches_no_cost_series(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, tick, outcome
 ) -> None:
-    calls: list[int] = []
-    monkeypatch.setattr(supervisor.cost_period, "start_new_period", lambda: calls.append(1))
+    """CS1d: the 24-hour compaction tick no longer starts a cost period (S146:
+    a rolling window, no reset); every series' estimate is unchanged by it."""
     monkeypatch.setattr(supervisor, "_run_compaction_tick", tick)
     monkeypatch.setattr("brain.chat.compaction.build_compaction_provider", lambda _pd: None)
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, _X5, 1.2, None)
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 2 * _X5, 2.4, None)
+    before = rerank_cost_estimate(_MODEL)
     assert _job(tmp_path, "compaction").run() is outcome
-    assert len(calls) == resets
+    assert rerank_cost_estimate(_MODEL) == before
 
 
-@pytest.mark.parametrize("where", ["provider", "tick"])
-def test_c16d_a_raising_compaction_job_still_starts_a_new_period(
-    tmp_path, monkeypatch: pytest.MonkeyPatch, where
-) -> None:
-    calls: list[int] = []
-    monkeypatch.setattr(supervisor.cost_period, "start_new_period", lambda: calls.append(1))
-
+def test_c16d_a_raising_compaction_job_propagates(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     def boom(*_a, **_k):
         raise RuntimeError("compaction failed")
 
-    if where == "provider":
-        monkeypatch.setattr("brain.chat.compaction.build_compaction_provider", boom)
-    else:
-        monkeypatch.setattr("brain.chat.compaction.build_compaction_provider", lambda _pd: None)
-        monkeypatch.setattr(supervisor, "_run_compaction_tick", boom)
+    monkeypatch.setattr("brain.chat.compaction.build_compaction_provider", lambda _pd: None)
+    monkeypatch.setattr(supervisor, "_run_compaction_tick", boom)
     with pytest.raises(RuntimeError):
         _job(tmp_path, "compaction").run()
-    assert calls == [1]
 
 
-def test_c16d_only_the_compaction_job_calls_start_new_period() -> None:
-    """So a `nell chat --no-bridge` process (no supervisor) keeps its
-    process-lifetime averages."""
-    callers = []
+def test_c16d_nothing_starts_a_new_period_any_more() -> None:
+    """S146 supersedes S101's reset at the compaction tick."""
     for path in sorted((_REPO / "brain").rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "start_new_period"
-            ):
-                callers.append(path.relative_to(_REPO).as_posix())
-    assert callers == ["brain/bridge/supervisor.py"]
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                assert node.func.attr != "start_new_period", path
 
 
 # ---------------------------------------------------------------------------
@@ -684,3 +782,4 @@ def test_c15h_job_descriptor_is_the_final_label_without_a_placeholder_marker() -
     assert lines[i].strip() == 'rerank_width_remeasure: "re-scoring cost check",'
     assert "—" not in lines[i]
     assert all("PLACEHOLDER" not in line for line in lines)
+    assert all("cost_series_flush" not in line for line in lines), "no label entry for the flush job (O10)"

@@ -187,7 +187,7 @@ def _patch_reranker(monkeypatch: pytest.MonkeyPatch, scores: dict[str, float]) -
     )
 
 
-def _prime_warm_fast_process() -> None:
+def _prime_warm_fast_process(store: MemoryStore) -> None:
     """Name-recall fix R1 (S24): the FIRST rerank of a process runs at the
     S5 minimum of 5 real candidates. Tests about the steady-state tier shape
     (more than 5 standouts) prime the fake reranker's cost model with one
@@ -195,7 +195,7 @@ def _prime_warm_fast_process() -> None:
     width fit covers their whole pool."""
     from brain.memory import reranker as reranker_mod
 
-    reranker_mod._record_rerank_cost(_FAKE_RERANKER_MODEL_ID, 1_000, 1e-6, None)
+    reranker_mod._record_rerank_cost(_FAKE_RERANKER_MODEL_ID, store, 1_000, 1e-6, None)
 
 
 def _pad_semantic_pool(store: MemoryStore, have: int) -> None:
@@ -374,7 +374,6 @@ def test_warmup_empty_vector_store_falls_back_to_lexical(tmp_path: Path) -> None
 def test_6_standouts_top5_full_plus_one_snippet_with_correct_ticks(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    _prime_warm_fast_process()
     query = "target query"
     dim = _EMBED_DIM
     contents = [f"standout memory number {i}" for i in range(6)]
@@ -399,6 +398,7 @@ def test_6_standouts_top5_full_plus_one_snippet_with_correct_ticks(
         vectors[content] = _unit_vec_with_cosine(0.3 - 0.01 * i)
 
     store = _store(tmp_path)
+    _prime_warm_fast_process(store)
     mems = [_mem(store, c) for c in contents]
     noise_mem = _mem(store, noise_content)
     filler_mems = [_mem(store, c) for c in filler_contents]
@@ -455,7 +455,6 @@ def test_6_standouts_top5_full_plus_one_snippet_with_correct_ticks(
 def test_10_or_more_standouts_caps_at_9_not_lexical_fallback(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    _prime_warm_fast_process()
     query = "capped query"
     dim = _EMBED_DIM
     contents = [f"clearly relevant memory number {i}" for i in range(12)]
@@ -473,6 +472,7 @@ def test_10_or_more_standouts_caps_at_9_not_lexical_fallback(
         vectors[content] = _unit_vec_with_cosine(0.3 - 0.01 * i)
 
     store = _store(tmp_path)
+    _prime_warm_fast_process(store)
     mems = [_mem(store, c) for c in contents]
     filler_mems = [_mem(store, c) for c in filler_contents]
 

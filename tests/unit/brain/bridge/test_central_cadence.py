@@ -140,6 +140,7 @@ def stubs(monkeypatch):
             "cosine_floor_bootstrap",
             "rerank_floor_bootstrap",
             "rerank_width_remeasure",
+            "cost_series_flush",
         ),
         True,
     )
@@ -203,8 +204,12 @@ def stubs(monkeypatch):
     )
     monkeypatch.setattr(supervisor.floor_startup, "run_rerank_floor", rec("rerank_floor_bootstrap"))
     monkeypatch.setattr(
-        supervisor.reranker, "stuck_width_due", lambda _m: work["rerank_width_remeasure"]
+        supervisor.reranker, "stuck_width_due", lambda _m, _f: work["rerank_width_remeasure"]
     )
+    monkeypatch.setattr(
+        supervisor.cost_series, "has_pending", lambda _db: work["cost_series_flush"]
+    )
+    monkeypatch.setattr(supervisor.cost_series, "flush", rec("cost_series_flush", 1))
     monkeypatch.setattr(
         supervisor.reranker, "remeasure_stuck_width", rec("rerank_width_remeasure", True)
     )
@@ -253,17 +258,20 @@ def _fake_jobs(names, log, *, due=True):
 # ---------------------------------------------------------------------------
 
 
-def test_job_table_is_the_17_gated_jobs_in_the_s55_order(tmp_path):
+def test_job_table_is_the_18_gated_jobs_in_the_s55_order(tmp_path):
     names = [j.name for j in _real_jobs(_persona(tmp_path))]
     assert names == list(GATED_JOB_ORDER)
-    assert len(names) == 17
+    assert len(names) == 18
     # S85 (revised): the two floor-bootstrap RETRY jobs follow embedding backfill;
-    # name-recall fix S100: the stuck-width re-measure follows them.
+    # name-recall fix S100: the stuck-width re-measure follows them, and S164's
+    # cost-series flush follows that (the re-measure's own sample is saved the
+    # same lull).
     i_bs = names.index("embedding_backfill")
-    assert names[i_bs + 1 : i_bs + 4] == [
+    assert names[i_bs + 1 : i_bs + 5] == [
         "cosine_floor_bootstrap",
         "rerank_floor_bootstrap",
         "rerank_width_remeasure",
+        "cost_series_flush",
     ]
     # C38: deploy recalibration immediately after clustering, immediately
     # before daily calibration; C15/S43: calibration before self-tune.
@@ -285,6 +293,7 @@ def test_job_table_due_sources(tmp_path):
         "cosine_floor_bootstrap",
         "rerank_floor_bootstrap",
         "rerank_width_remeasure",
+        "cost_series_flush",
         "deploy_recalibration",
         "self_model_articulation",
     ):
@@ -364,7 +373,7 @@ def test_c5_no_gated_job_starts_inside_the_lull_then_all_start_after(tmp_path, s
         assert stubs.order == [], f"a gated job started inside the lull (t-t0={t - t0})"
 
     _pass(persona_dir, jobs, idle=lambda: cli_throttle.is_chat_idle(now=t0 + lull))
-    assert stubs.order == list(GATED_JOB_ORDER), "all 17 due jobs start at the first pass after"
+    assert stubs.order == list(GATED_JOB_ORDER), "all 18 due jobs start at the first pass after"
 
 
 def test_c5_reply_in_flight_blocks_even_past_the_lull(tmp_path, stubs):
@@ -476,7 +485,7 @@ def test_c6_skip_leaves_every_cadence_file_byte_identical_and_still_due(tmp_path
     assert stubs.order == []
     assert _snapshot_bytes(persona_dir) == before
     if deny == "slot":
-        assert [d.action for d in decisions if d.action != "init-cadence"] == ["skip-slot"] * 17
+        assert [d.action for d in decisions if d.action != "init-cadence"] == ["skip-slot"] * 18
 
     _pass(persona_dir, jobs)  # next pass, idle + slot: every job still due
     assert stubs.order == list(GATED_JOB_ORDER)

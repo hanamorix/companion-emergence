@@ -35,6 +35,7 @@ from brain.memory.reranker import (
     normalize_against_anchors,
     normalize_bundled_pairs_against_anchors,
 )
+from brain.memory.store import MemoryStore
 
 # ---------------------------------------------------------------------------
 # FakeRerankerProvider — scriptable, offline
@@ -320,10 +321,11 @@ def test_manual_override_wins_over_avx2_auto_detected_default(
         def model_id(self) -> str:
             return "override-test-provider"
 
-    reranker_mod._record_rerank_cost("override-test-provider", 1024, 1.0, None)
+    store = MemoryStore(tmp_path / "memories.db", integrity_check=False)
+    reranker_mod._record_rerank_cost("override-test-provider", store, 1024, 1.0, None)
 
     outcome = reranker_mod.rerank_for_recall(
-        _EightTokenPairs(default=0.0), "q", [f"doc-{i}" for i in range(50)]
+        _EightTokenPairs(default=0.0), "q", [f"doc-{i}" for i in range(50)], store=store
     )
     # 24 real + min(8, 24 // 2) = 8 anchors = 32 documents = 0.25 s; 25 real
     # would be 33 documents. The default budget would have given 50.

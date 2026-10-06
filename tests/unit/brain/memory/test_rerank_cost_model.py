@@ -1,13 +1,14 @@
 """Name-recall fix R1: the per-message rerank width (spec §1; criteria C1a,
 C1c, CONC-1, C2c part 1, INV-I13a, ADV-9 in
-`changes/name-recall-fix/1.5-criteria.md`).
+`changes/name-recall-fix/1.5-criteria.md`), on the cost-series increment's
+saved 24-hour window (S146, S158, S164; criteria CS1, CS2, CS3, CS15).
 
 The hourly width sample (one query's top-5 documents, cached ~1 h,
 diagnosis H8) is replaced by a cost model learned from every recall-time
 rerank: seconds = overhead + rate * (pairs * longest pair), the size in
 reranker tokens (S75), both fitted by
-least squares over running sums, per process and per reranker model id;
-each message fits its own width to its own candidates.
+least squares over the last 24 hours' samples (saved in memories.db), per
+reranker model id; each message fits its own width to its own candidates.
 
 All offline and deterministic: timing comes from a scripted clock injected
 through `reranker._clock`, advanced by a fake reranker whose per-call cost is
@@ -20,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -27,6 +29,7 @@ import pytest
 
 import brain.memory.reranker as reranker_mod
 from brain.dev_constants import RERANK_MIN_REAL_CANDIDATES
+from brain.memory import cost_series
 from brain.memory.relevance import CANDIDATE_POOL
 from brain.memory.reranker import (
     ANCHOR_POOL,
@@ -34,13 +37,39 @@ from brain.memory.reranker import (
     FakeRerankerProvider,
     RerankCostEstimate,
     fit_rerank_width,
-    rerank_cost_estimate,
-    rerank_for_recall,
     surviving_pair_token_lengths,
 )
+from brain.memory.store import MemoryStore
 
 _MODEL = "cost-scripted"
 _QUERY = "q"
+
+# The store this test's recall calls run against (an autouse fixture below
+# opens one per test); the module-level helpers add it to every call.
+_STORE: MemoryStore
+
+
+@pytest.fixture(autouse=True)
+def _store(tmp_path: Path):
+    global _STORE
+    _STORE = MemoryStore(tmp_path / "memories.db", integrity_check=False)
+    yield _STORE
+    _STORE.close()
+
+
+def rerank_for_recall(provider, query, documents, **kwargs):
+    return reranker_mod.rerank_for_recall(provider, query, documents, store=_STORE, **kwargs)
+
+
+def rerank_cost_estimate(model_id):
+    return reranker_mod.rerank_cost_estimate(model_id, _STORE)
+
+
+def _window(model_id: str = _MODEL) -> cost_series.LinearSums:
+    """The window's sums for the rerank series (database + this process's buffer)."""
+    state = reranker_mod._rerank_cost.state(_STORE, model_id)
+    assert state is not None
+    return state.sums
 
 
 class _Clock:
@@ -163,7 +192,7 @@ def test_c1a_i_first_rerank_is_five_real_plus_two_anchors_after_two_discarded_wa
     # Fit inputs == the measured call only (recomputed here): x = 7 * 1200.
     x = 7 * 1200
     y = 0.2 + 2e-4 * x
-    sums = reranker_mod._cost_sums[_MODEL]
+    sums = _window()
     assert (sums.n, sums.sum_x, sums.sum_xx) == (1, x, x * x)
     assert sums.sum_y == pytest.approx(y)
     est = rerank_cost_estimate(_MODEL)
@@ -199,7 +228,7 @@ def test_c1a_ii_two_padded_sizes_recover_overhead_and_rate(clock: _Clock) -> Non
     rerank_for_recall(provider, _QUERY, _docs(50, 1200, "L"), budget_seconds=4.0)  # M_long
     rerank_for_recall(provider, _QUERY, _docs(50, 150, "S"), budget_seconds=4.0)  # M_short
 
-    sums = reranker_mod._cost_sums[_MODEL]
+    sums = _window()
     assert sums.n == 2
     # Independent ordinary least squares over the measured (x, y) pairs.
     measured = [c for c in provider.calls if len(c) > 1]
@@ -215,8 +244,8 @@ def test_c1a_ii_two_padded_sizes_recover_overhead_and_rate(clock: _Clock) -> Non
 
 
 def test_c1a_ii_same_padded_size_is_degenerate_ratio_of_sums() -> None:
-    reranker_mod._record_rerank_cost(_MODEL, 700, 1.0, None)
-    reranker_mod._record_rerank_cost(_MODEL, 700, 2.0, None)
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 700, 1.0, None)
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 700, 2.0, None)
     est = rerank_cost_estimate(_MODEL)
     assert est.overhead_seconds == 0.0
     assert est.seconds_per_token == pytest.approx(3.0 / 1400)
@@ -224,16 +253,16 @@ def test_c1a_ii_same_padded_size_is_degenerate_ratio_of_sums() -> None:
 
 def test_c1a_ii_negative_fitted_overhead_falls_back_to_ratio() -> None:
     # slope 0.002, intercept -0.1 -> negative overhead -> ratio of sums.
-    reranker_mod._record_rerank_cost(_MODEL, 100, 0.1, None)
-    reranker_mod._record_rerank_cost(_MODEL, 200, 0.3, None)
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 100, 0.1, None)
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 200, 0.3, None)
     est = rerank_cost_estimate(_MODEL)
     assert est.overhead_seconds == 0.0
     assert est.seconds_per_token == pytest.approx(0.4 / 300)
 
 
 def test_c1a_ii_non_positive_fitted_rate_falls_back_to_ratio() -> None:
-    reranker_mod._record_rerank_cost(_MODEL, 100, 0.3, None)
-    reranker_mod._record_rerank_cost(_MODEL, 200, 0.1, None)
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 100, 0.3, None)
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 200, 0.1, None)
     est = rerank_cost_estimate(_MODEL)
     assert est.overhead_seconds == 0.0
     assert est.seconds_per_token == pytest.approx(0.4 / 300)
@@ -252,7 +281,7 @@ def test_c1a_iii_long_candidate_inside_short_prefix_stops_the_width(clock: _Cloc
     """Six short candidates, then one long one: padding the batch to the long
     pair makes the 7-candidate prefix cost 10 x 1000 tokens, although the
     plain sum of its pair lengths would have fit."""
-    reranker_mod._record_rerank_cost(_MODEL, 10_000, 1.0, None)  # overhead 0, rate 1e-4
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 10_000, 1.0, None)  # overhead 0, rate 1e-4
     provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-4)
     cand = [250] * 6 + [1000] + [250] * 5
     docs = [_docs(1, n, f"c{i}")[0] for i, n in enumerate(cand)]
@@ -504,8 +533,8 @@ def test_c1c_no_token_lengths_means_no_rerank_and_no_recorded_sample(clock: _Clo
             self.calls.append(list(documents))
             return FakeRerankerProvider.rerank(self, query, documents)
 
-    reranker_mod._record_rerank_cost(_MODEL, 1_000, 1.0, None)  # a prior token-unit sample
-    before = reranker_mod._cost_sums[_MODEL]
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 1_000, 1.0, None)  # a prior token-unit sample
+    before = _window()
     provider = _NoLengths(clock, overhead=0.0, rate=0.0)
 
     out = rerank_for_recall(provider, _QUERY, _docs(30, 400), budget_seconds=4.0)
@@ -513,7 +542,7 @@ def test_c1c_no_token_lengths_means_no_rerank_and_no_recorded_sample(clock: _Clo
     assert out.hand_off == "sizes" and not out.reranked and out.normalization is None
     assert out.measured is False
     assert [c for c in provider.calls if len(c) > 1] == [], "no combined rerank runs"
-    assert reranker_mod._cost_sums[_MODEL] == before, "no sample without a known padded size"
+    assert _window() == before, "no sample without a known padded size"
 
 
 def test_c1c_width_fit_and_measurement_use_the_surviving_lengths(clock: _Clock) -> None:
@@ -524,7 +553,7 @@ def test_c1c_width_fit_and_measurement_use_the_surviving_lengths(clock: _Clock) 
     provider = _Truncating(clock, overhead=0.0, rate=1e-5)
     rerank_for_recall(provider, _QUERY, ["w" * 5000] * 10, budget_seconds=4.0)
 
-    sums = reranker_mod._cost_sums[_MODEL]
+    sums = _window()
     assert sums.sum_x == 7 * (1 + 1200), "x uses the surviving pair length, not 7 * 5001"
 
 
@@ -574,7 +603,7 @@ def test_s75_rerank_for_recall_sizes_the_width_in_tokens(clock: _Clock) -> None:
     """End to end through `rerank_for_recall` with a seeded estimate: the same
     ten candidates, equal in characters, get a wide rerank as Latin text and a
     narrow one as CJK text, because the width is sized from their tokens."""
-    reranker_mod._record_rerank_cost(_MODEL, 1_000, 1.0, None)  # 1 ms per padded token
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 1_000, 1.0, None)  # 1 ms per padded token
     latin, cjk = "a" * 600, "\u5496" * 600
     budget = 2.0
 
@@ -596,7 +625,7 @@ def test_s75_the_recorded_sample_is_in_tokens(clock: _Clock) -> None:
     k = out.normalization.anchor_count
     anchors = provider.pair_token_lengths(_QUERY, ANCHOR_POOL)[:k]
     longest = max(_SPECIAL_TOKENS + 1 + 600, *anchors)
-    assert reranker_mod._cost_sums[_MODEL].sum_x == (out.width + k) * longest
+    assert _window().sum_x == (out.width + k) * longest
     assert longest == 605, "600 CJK characters are 600 tokens; a character count would record 601"
 
 
@@ -611,7 +640,7 @@ def test_c2c_every_rerank_has_five_real_and_two_anchors_and_is_normalized(
     clock: _Clock, pool: int, seed_rate: float | None
 ) -> None:
     if seed_rate is not None:
-        reranker_mod._record_rerank_cost(_MODEL, 1_000, seed_rate * 1_000, None)
+        reranker_mod._record_rerank_cost(_MODEL, _STORE, 1_000, seed_rate * 1_000, None)
     provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-6)
 
     out = rerank_for_recall(provider, _QUERY, _docs(pool, 400), budget_seconds=4.0)
@@ -677,15 +706,15 @@ def test_ram_figure_does_not_dilute_with_calls_inside_the_high_water() -> None:
     calls within the high water show ~0 RSS growth. They must not dilute
     RAM per token towards 0 (which would switch the bound off): only
     growth past the high water is counted, per token of that growth."""
-    reranker_mod._record_rerank_cost(_MODEL, 2_800, 0.1, 2_800 * 1_000.0)  # first batch: 1,000 B/token
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 2_800, 0.1, 2_800 * 1_000.0)  # first batch: 1,000 B/token
     for _ in range(100):
-        reranker_mod._record_rerank_cost(_MODEL, 2_800, 0.1, 0.0)  # reuse, no growth
-    reranker_mod._record_rerank_cost(_MODEL, 1_000, 0.05, 5_000_000.0)  # another thread's allocation
+        reranker_mod._record_rerank_cost(_MODEL, _STORE, 2_800, 0.1, 0.0)  # reuse, no growth
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 1_000, 0.05, 5_000_000.0)  # another thread's allocation
     est = rerank_cost_estimate(_MODEL)
     assert est.ram_bytes_per_token == pytest.approx(1_000.0), "neither diluted nor contaminated"
     assert est.peak_padded_tokens == 2_800
 
-    reranker_mod._record_rerank_cost(_MODEL, 4_800, 0.2, 2_000 * 500.0)  # past the high water
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 4_800, 0.2, 2_000 * 500.0)  # past the high water
     est = rerank_cost_estimate(_MODEL)
     assert est.ram_bytes_per_token == pytest.approx((2_800_000.0 + 1_000_000.0) / 4_800)
     assert est.peak_padded_tokens == 4_800
@@ -701,8 +730,8 @@ def test_ram_term_never_blocks_a_batch_within_the_high_water() -> None:
 
 
 def test_negative_rss_delta_clamps_to_zero_in_the_ram_sum() -> None:
-    reranker_mod._record_rerank_cost(_MODEL, 1_000, 0.1, -5_000.0)  # past high water 0: +1,000 tokens, 0 B
-    reranker_mod._record_rerank_cost(_MODEL, 2_000, 0.2, 4_000.0)  # past high water 1,000: +1,000 tokens
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 1_000, 0.1, -5_000.0)  # past high water 0: +1,000 tokens, 0 B
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 2_000, 0.2, 4_000.0)  # past high water 1,000: +1,000 tokens
     est = rerank_cost_estimate(_MODEL)
     assert est.ram_bytes_per_token == pytest.approx(4_000.0 / 2_000)
 
@@ -723,7 +752,10 @@ class _NoLock:
 
 def _run_interleaved_updates(
     monkeypatch: pytest.MonkeyPatch, second_update_wait: float
-) -> tuple[int, RerankCostEstimate | None]:
+) -> tuple[reranker_mod._RamState, RerankCostEstimate | None]:
+    """Two updates of the process's RAM state interleaved: the second runs
+    between the first's read and write (the process-memory part of a measured
+    rerank; the time sample itself only appends to the locked buffer)."""
     second_started = threading.Event()
     second_done = threading.Event()
     reader_result: list[RerankCostEstimate | None] = []
@@ -731,7 +763,7 @@ def _run_interleaved_updates(
 
     def _second_update() -> None:
         second_started.set()
-        reranker_mod._record_rerank_cost(_MODEL, 300, 0.3, None)
+        reranker_mod._record_rerank_cost(_MODEL, _STORE, 300, 0.3, 2_000.0)  # +200 tokens past 100
         second_done.set()
 
     def _reader() -> None:
@@ -754,33 +786,30 @@ def _run_interleaved_updates(
         second_done.wait(timeout=second_update_wait)
 
     monkeypatch.setattr(reranker_mod, "_cost_update_hook", _hook)
-    reranker_mod._record_rerank_cost(_MODEL, 100, 0.1, None)
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 100, 0.1, 1_000.0)  # +100 tokens past 0
     for t in threads:
         t.join(timeout=5.0)
-    return reranker_mod._cost_sums[_MODEL].n, (reader_result[0] if reader_result else None)
+    return reranker_mod._ram_state[_MODEL], (reader_result[0] if reader_result else None)
 
 
 def test_conc1_interleaved_update_is_counted_and_reader_sees_whole_updates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    count, seen = _run_interleaved_updates(monkeypatch, second_update_wait=0.3)
-    sums = reranker_mod._cost_sums[_MODEL]
-    assert count == 2, "both updates counted"
-    assert sums.sum_x == 400 and sums.sum_y == pytest.approx(0.4)
+    ram, seen = _run_interleaved_updates(monkeypatch, second_update_wait=0.3)
+    assert (ram.peak_x, ram.ram_x, ram.ram_bytes) == (300, 300, 3_000.0), "both updates counted"
+    assert _window().n == 2, "and both time samples are buffered"
     # The reader ran while the first update held the lock, so it saw a whole
-    # state (one sample or both), never a mix of halves. Both samples lie on
-    # y = 0.001 * x, so either whole state fits to that rate.
-    assert seen is not None and seen.measured_batches in (1, 2)
-    assert seen.seconds_per_token == pytest.approx(0.001)
-    assert seen.overhead_seconds == pytest.approx(0.0, abs=1e-12)
+    # state (the first update's or both), never a mix of halves; both have
+    # 10 bytes per token of growth.
+    assert seen is None or seen.ram_bytes_per_token == pytest.approx(10.0)
 
 
 def test_conc1_able_to_fail_without_the_lock(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(reranker_mod, "_cost_lock", _NoLock())
     # A long wait: without the lock the second update finishes inside the
     # window however slow the host, so this never flakes.
-    count, _ = _run_interleaved_updates(monkeypatch, second_update_wait=30.0)
-    assert count == 1, "without the lock the interleaved update is lost (the guard is what CONC-1 tests)"
+    ram, _ = _run_interleaved_updates(monkeypatch, second_update_wait=30.0)
+    assert ram.peak_x == 100, "without the lock the interleaved update is lost (the guard is what CONC-1 tests)"
 
 
 # ---------------------------------------------------------------------------
@@ -796,15 +825,15 @@ def test_inflated_first_sample_absorbs_every_message_without_the_remeasure_job(
     with no rerank, so messages alone never take a new measurement and the
     estimate never moves; only the lull re-measure job (S100) or the next
     compaction period (S101/S114) changes it."""
-    reranker_mod._record_rerank_cost(_MODEL, 100, 1_000.0, None)  # 10 s per token
-    before = reranker_mod._cost_sums[_MODEL]
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 100, 1_000.0, None)  # 10 s per token
+    before = _window()
     provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-9)  # the host is actually fast
 
     for _ in range(5):
         out = rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0)
         assert out.hand_off == "budget" and not out.measured
 
-    assert reranker_mod._cost_sums[_MODEL] == before
+    assert _window() == before
     assert [c for c in provider.calls if len(c) > 1] == []
 
 
@@ -882,3 +911,114 @@ def test_c1c_tokenizer_failure_warns_once_per_provider(caplog: pytest.LogCapture
         provider.pair_token_lengths("q", ["abc"])
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1, "one warning (with traceback), later failures at debug level"
+
+
+# ---------------------------------------------------------------------------
+# Cost-series increment: the saved window (CS1-CS3 for the rerank series) and
+# the per-restart RAM seed (CS15, S158).
+# ---------------------------------------------------------------------------
+
+
+def _persist_estimate(model: str = _MODEL) -> None:
+    """A previous process measured two sizes (rate 1e-4 s per padded token, no
+    overhead) and saved them; this process then starts with no in-memory state."""
+    reranker_mod._rerank_cost.record(_STORE, model, 700, 0.07)
+    reranker_mod._rerank_cost.record(_STORE, model, 1400, 0.14)
+    assert cost_series.flush(_STORE) == 2
+    reranker_mod._reset_rerank_cost_model()
+    cost_series._reset_pending()
+
+
+def test_cs2_a_restart_keeps_the_estimate_and_the_width_it_gives(clock: _Clock) -> None:
+    provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-4)
+    est_before = None
+    _persist_estimate()
+    est_before = rerank_cost_estimate(_MODEL)
+    assert est_before is not None and est_before.seconds_per_token == pytest.approx(1e-4)
+    out = rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0)
+    # The estimate sizes this process's FIRST recall rerank too (RSS is
+    # unreadable here, S158 does not apply): 100 tokens a pair, 1e-4 s a token.
+    assert out.width == _reference_width([100] * 50, _anchor_pair_tokens(), 0.0, 1e-4, 4.0)
+    assert out.width > RERANK_MIN_REAL_CANDIDATES
+
+
+def test_cs3a_the_first_startup_on_a_machine_sizes_the_first_rerank_at_five(clock: _Clock) -> None:
+    provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-9)
+    assert rerank_cost_estimate(_MODEL) is None
+    out = rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0)
+    assert out.width == 5
+    assert _window().n == 1, "its sample is buffered (S24)"
+
+
+def test_cs3b_after_a_downtime_the_carried_estimate_applies(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wall = [1_000_000.0]
+    monkeypatch.setattr(cost_series, "_wall_clock", lambda: wall[0])
+    _persist_estimate()
+    wall[0] += cost_series.window_seconds() + 60.0
+    state = reranker_mod._rerank_cost.state(_STORE, _MODEL)
+    assert state is not None and state.sums.n == 0, "every sample is older than the window"
+    est = rerank_cost_estimate(_MODEL)
+    assert est is not None and est.seconds_per_token == pytest.approx(1e-4)
+
+
+def test_cs3c_another_machines_samples_do_not_size_this_one(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cost_series, "_machine_override", "another-machine")
+    _persist_estimate()
+    monkeypatch.setattr(cost_series, "_machine_override", "test-machine")
+    assert rerank_cost_estimate(_MODEL) is None
+
+
+def test_cs15_the_first_measured_rerank_of_a_process_runs_at_five_where_rss_is_readable(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(reranker_mod, "_current_rss_bytes", lambda: 1.0e9)
+    _persist_estimate()
+    provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-4)
+    first = rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0)
+    assert first.width == 5, "seeds the RAM high water, whatever the saved estimate says"
+    second = rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0)
+    assert second.width == _reference_width([100] * 50, _anchor_pair_tokens(), 0.0, 1e-4, 4.0) > 5
+
+
+def test_cs15_the_cap_is_per_model_id(clock: _Clock, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(reranker_mod, "_current_rss_bytes", lambda: 1.0e9)
+    _persist_estimate()
+    _persist_estimate("another-model")
+    provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-4)
+    other = _CostScriptedProvider(clock, overhead=0.0, rate=1e-4, model="another-model")
+    assert rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0).width == 5
+    assert rerank_for_recall(other, _QUERY, _docs(50, 100), budget_seconds=4.0).width == 5
+    assert rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0).width > 5
+
+
+def test_cs15_the_cap_holds_until_a_rerank_was_recorded(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(reranker_mod, "_current_rss_bytes", lambda: 1.0e9)
+    _persist_estimate()
+
+    class _NoLengths(_CostScriptedProvider):
+        def pair_token_lengths(self, query, documents):
+            return None
+
+        def rerank(self, query, documents):
+            return FakeRerankerProvider.rerank(self, query, documents)
+
+    unsized = _NoLengths(clock, overhead=0.0, rate=1e-4)
+    assert rerank_for_recall(unsized, _QUERY, _docs(50, 100), budget_seconds=4.0).hand_off == "sizes"
+    provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-4)
+    assert rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0).width == 5, (
+        "nothing was measured yet, so the first measured rerank is still the seed"
+    )
+
+
+def test_cs15_with_an_empty_database_the_first_rerank_is_five_as_today(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(reranker_mod, "_current_rss_bytes", lambda: 1.0e9)
+    provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-9)
+    assert rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0).width == 5

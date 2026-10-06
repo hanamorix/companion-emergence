@@ -143,10 +143,10 @@ def _cosine_floor(store: MemoryStore, floor: float = 0.5) -> None:
     )
 
 
-def _warm() -> None:
+def _warm(store: MemoryStore) -> None:
     """A process that has already reranked (S24): the width fit then covers
     the whole (<= 50) pool instead of the first-rerank minimum of 5."""
-    reranker_mod._record_rerank_cost(_RERANKER_ID, 1_000, 1e-6, None)
+    reranker_mod._record_rerank_cost(_RERANKER_ID, store, 1_000, 1e-6, None)
 
 
 def _install_reranker(monkeypatch: pytest.MonkeyPatch, rec: RerankerProvider) -> None:
@@ -254,7 +254,7 @@ def test_the_rerank_prefix_keeps_cosine_order_inside_each_group(
         store, monkeypatch, [0.30, 0.90, 0.60, 0.10, 0.20, 0.80], [0.50, 0.99, 0.70]
     )
     _rerank_floor(store)
-    _warm()
+    _warm(store)
     rec = _Recording()
     _install_reranker(monkeypatch, rec)
 
@@ -281,7 +281,7 @@ def test_reranked_results_put_every_genuine_memory_above_every_monologue_one(
     store = MemoryStore(tmp_path / "memories.db")
     genuine, family = _seed(store, monkeypatch, [0.6] * 5, [0.9] * 5)
     _rerank_floor(store, floor=1.0)
-    _warm()
+    _warm(store)
     scripted = {g.content: 3.0 + i for i, g in enumerate(genuine)}  # 3..7
     scripted.update({f.content: 20.0 + i for i, f in enumerate(family)})  # 20..24
     _install_reranker(monkeypatch, _Recording(scripted))
@@ -302,7 +302,7 @@ def test_the_cap_drops_monologue_memories_before_any_floor_clearing_genuine_one(
     store = MemoryStore(tmp_path / "memories.db")
     genuine, family = _seed(store, monkeypatch, [0.6] * 6, [0.9] * 6)
     _rerank_floor(store, floor=1.0)
-    _warm()
+    _warm(store)
     scripted = {g.content: 2.0 + i for i, g in enumerate(genuine)}
     scripted.update({f.content: 50.0 + i for i, f in enumerate(family)})
     _install_reranker(monkeypatch, _Recording(scripted))
@@ -322,7 +322,7 @@ def test_more_genuine_than_the_cap_leaves_no_room_for_monologue_memories(
     store = MemoryStore(tmp_path / "memories.db")
     genuine, family = _seed(store, monkeypatch, [0.6] * 12, [0.95] * 3)
     _rerank_floor(store, floor=1.0)
-    _warm()
+    _warm(store)
     scripted = {g.content: 2.0 + i for i, g in enumerate(genuine)}
     scripted.update({f.content: 90.0 for f in family})
     _install_reranker(monkeypatch, _Recording(scripted))
@@ -342,7 +342,7 @@ def test_a_pool_of_only_monologue_memories_still_surfaces_them_by_score(
     store = MemoryStore(tmp_path / "memories.db")
     _, family = _seed(store, monkeypatch, [], [0.9, 0.8, 0.7, 0.6, 0.5, 0.4])
     _rerank_floor(store, floor=1.0)
-    _warm()
+    _warm(store)
     _install_reranker(
         monkeypatch, _Recording({f.content: 5.0 + i for i, f in enumerate(family)})
     )
@@ -359,7 +359,7 @@ def test_the_result_carries_one_ordered_tagged_hit_per_surfaced_memory(
     store = MemoryStore(tmp_path / "memories.db")
     genuine, family = _seed(store, monkeypatch, [0.6] * 3, [0.9] * 3)
     _rerank_floor(store, floor=1.0)
-    _warm()
+    _warm(store)
     scripted = {g.content: 5.0 + i for i, g in enumerate(genuine)}
     scripted.update({f.content: 9.0 + i for i, f in enumerate(family)})
     _install_reranker(monkeypatch, _Recording(scripted))
@@ -457,7 +457,7 @@ def test_the_tool_never_gives_a_result_slot_to_a_monologue_memory_over_a_genuine
     if path == "cosine":
         _no_reranker(monkeypatch)
     else:
-        _warm()
+        _warm(store)
         scripted = {g.content: 2.0 + i for i, g in enumerate(genuine)}
         scripted.update({f.content: 40.0 + i for i, f in enumerate(family)})
         _install_reranker(monkeypatch, _Recording(scripted))
@@ -481,7 +481,7 @@ def test_the_tool_removes_excluded_ids_before_ranking_and_still_ranks_genuine_fi
     if path == "cosine":
         _no_reranker(monkeypatch)
     else:
-        _warm()
+        _warm(store)
         scripted = {g.content: 2.0 + i for i, g in enumerate(genuine)}
         scripted.update({f.content: 40.0 + i for i, f in enumerate(family)})
         rec = _Recording(scripted)
@@ -509,7 +509,7 @@ def test_the_rendered_block_fills_the_nine_slots_genuine_first(
     store = MemoryStore(tmp_path / "memories.db")
     genuine, family = _seed(store, monkeypatch, [0.6] * 6, [0.9] * 6)
     _rerank_floor(store, floor=1.0)
-    _warm()
+    _warm(store)
     scripted = {g.content: 2.0 + i for i, g in enumerate(genuine)}
     scripted.update({f.content: 60.0 + i for i, f in enumerate(family)})
     _install_reranker(monkeypatch, _Recording(scripted))
@@ -560,7 +560,7 @@ def test_a_missing_rerank_floor_hands_a_family_pool_to_the_cosine_path_genuine_f
     store = MemoryStore(tmp_path / "memories.db")
     genuine, family = _seed(store, monkeypatch, [0.6, 0.7, 0.65], [0.99, 0.98, 0.97, 0.96])
     _cosine_floor(store, 0.5)
-    _warm()
+    _warm(store)
     _install_reranker(monkeypatch, _Recording({m.content: 50.0 for m in [*genuine, *family]}))
 
     def _boom(model_id: str):
