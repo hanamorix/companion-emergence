@@ -199,6 +199,44 @@ describe("launchBrain (#335)", () => {
     expect(restartModule.clearRestartState).toHaveBeenCalled();
   });
 
+  it("a slow status check on a failed start is waited for, so recovery still runs (#338 review)", async () => {
+    vi.useFakeTimers();
+    // the fast launch check hangs past its cap; the patient re-check answers
+    vi.mocked(appConfig.brainOverlayStatus).mockImplementation((patient?: boolean) =>
+      patient
+        ? new Promise((resolve) =>
+            setTimeout(() => resolve({ active_commit: NEW, confirmed: false, undo: "rollback" }), 8000),
+          )
+        : new Promise(() => undefined),
+    );
+    starts(false, true);
+    rollsBackTo(OLD);
+    const pending = launchBrain(P);
+    await vi.advanceTimersByTimeAsync(STATUS_TIMEOUT_MS + 9000);
+    expect(await pending).toEqual({ kind: "ready", versionMismatch: false, notice: NOTICE_ROLLED_BACK });
+    expect(appConfig.brainOverlayStatus).toHaveBeenCalledWith(true);
+  });
+
+  it("the error screen's release-brain button waits for a slow status check too", async () => {
+    vi.useFakeTimers();
+    let fastCalls = 0;
+    vi.mocked(appConfig.brainOverlayStatus).mockImplementation((patient?: boolean) =>
+      patient
+        ? new Promise((resolve) =>
+            setTimeout(() => resolve({ active_commit: NEW, confirmed: false, undo: "rollback" }), 8000),
+          )
+        : fastCalls++ === 0
+          ? Promise.resolve({ active_commit: NEW, confirmed: false, undo: "rollback" })
+          : new Promise(() => undefined), // the re-read after a failed recovery is slow
+    );
+    vi.mocked(appConfig.ensureBridgeRunning).mockRejectedValue(new Error("boom"));
+    vi.mocked(appConfig.rollbackBrain).mockRejectedValue(new Error("locked"));
+    vi.mocked(appConfig.revertBrain).mockRejectedValueOnce(new Error("locked"));
+    const pending = launchBrain(P);
+    await vi.advanceTimersByTimeAsync(9000);
+    expect(await pending).toMatchObject({ kind: "error", canUseReleaseBrain: true });
+  });
+
   it("a hung status check doesn't hold the launch", async () => {
     vi.useFakeTimers();
     vi.mocked(appConfig.brainOverlayStatus).mockReturnValue(new Promise(() => undefined));

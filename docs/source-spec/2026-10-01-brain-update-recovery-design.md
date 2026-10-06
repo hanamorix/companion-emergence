@@ -75,7 +75,7 @@ brain is broken.
 
 - `brain_overlay_status() -> { active_commit: Option<String>, confirmed: bool, undo: String }`:
   wraps `nell update --status` with a 5 s timeout, the same cap as the app's launch check
-  (a slow process never outlives the launch). Reuses `active_commit_from_status` (bundle check included);
+  (a slow process never outlives the launch); `patient: true` (after a failed start) uses 30 s. Reuses `active_commit_from_status` (bundle check included);
   `confirmed` is the entry's flag, `true` when missing or when there is no active overlay;
   `undo` is the entry's field, `"revert"` when missing.
 - `confirm_brain_update(commit: String)`: runs `nell update --confirm <commit>`.
@@ -138,7 +138,7 @@ The release brain stays the floor.
 
 | Failure | Behaviour |
 |---|---|
-| `brain_overlay_status` fails or takes longer than 5 s (nell won't run on the release brain) | Treat as "no active overlay": today's behaviour. The release brain itself is broken, which is out of scope. |
+| `brain_overlay_status` fails or takes longer than 5 s (nell won't run on the release brain, or a slow machine) | Healthy launch: treat as "no active overlay" (today's behaviour; the launch must not wait). Failed start: ask again patiently (`patient: true`, Rust's 30 s), since the user is already looking at an error and a slow machine must not switch recovery off. The error screen's button reads it the same way. |
 | `confirm_brain_update` fails | Log it; the build stays unconfirmed and the next healthy launch confirms it. Worst case, a later start failure auto-rolls back a build that had in fact worked: reversible, since re-apply is instant. |
 | Recovery's rollback/revert fails | Same as `apply`'s chain today: "Couldn't switch back to the release brain: …", then `BridgeErrorScreen` with the button. |
 | Overlay lock busy at launch (an update still running in another process) | The step fails like any other; the user gets `BridgeErrorScreen`, and Retry works once the lock is free. |

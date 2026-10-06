@@ -518,14 +518,25 @@ pub(crate) async fn revert_brain(app: tauri::AppHandle) -> Result<(), String> {
     run_nell(&app, &["update", "--revert"], FLIP_TIMEOUT_S).await.map(|_| ())
 }
 
+/// The launch check is quick: the app stops waiting at 5 s, so nell stops then too.
+/// After a failed start the app asks again patiently: the user is already looking at
+/// an error, and a slow machine must not switch recovery off (#338 review).
+pub(crate) fn overlay_status_timeout_s(patient: bool) -> u64 {
+    if patient { STATUS_TIMEOUT_S } else { LAUNCH_STATUS_TIMEOUT_S }
+}
+
 /// The launch check (#335): is an overlay active, has it proven itself, how to undo it.
 /// A dev build has no bundled nell and no overlay, so don't spawn anything.
 #[tauri::command]
-pub(crate) async fn brain_overlay_status(app: tauri::AppHandle) -> Result<BrainOverlayStatus, String> {
+pub(crate) async fn brain_overlay_status(
+    app: tauri::AppHandle,
+    patient: Option<bool>,
+) -> Result<BrainOverlayStatus, String> {
     if crate::bundled_nell_path(&app)?.is_none() {
         return Ok(overlay_status_from(""));
     }
-    let status = run_nell(&app, &["update", "--status"], LAUNCH_STATUS_TIMEOUT_S).await?;
+    let timeout = overlay_status_timeout_s(patient.unwrap_or(false));
+    let status = run_nell(&app, &["update", "--status"], timeout).await?;
     Ok(overlay_status_from(&status))
 }
 
@@ -693,6 +704,10 @@ mod tests {
         // app/src/brainRecovery.ts STATUS_TIMEOUT_MS = 5000: past that the app treats the
         // status as "no overlay", so the nell process must not outlive it (#338 review)
         assert_eq!(LAUNCH_STATUS_TIMEOUT_S, 5);
+        // after a failed start the app asks again patiently: a slow machine must not
+        // switch recovery off (#338 review)
+        assert_eq!(overlay_status_timeout_s(false), LAUNCH_STATUS_TIMEOUT_S);
+        assert_eq!(overlay_status_timeout_s(true), STATUS_TIMEOUT_S);
         let js = include_str!("../../src/brainRecovery.ts");
         assert!(js.contains("STATUS_TIMEOUT_MS = 5000"), "keep the Rust and JS caps in step");
     }

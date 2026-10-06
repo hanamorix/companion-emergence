@@ -348,8 +348,9 @@ export interface BrainOverlayStatus {
   undo: "rollback" | "revert";
 }
 
-export async function brainOverlayStatus(): Promise<BrainOverlayStatus> {
-  return await invoke<BrainOverlayStatus>("brain_overlay_status");
+/** `patient`: after a failed start, wait the full 30 s instead of the 5 s launch cap. */
+export async function brainOverlayStatus(patient = false): Promise<BrainOverlayStatus> {
+  return await invoke<BrainOverlayStatus>("brain_overlay_status", { patient });
 }
 
 /** The bridge came back healthy on `commit`: mark the overlay proven. */

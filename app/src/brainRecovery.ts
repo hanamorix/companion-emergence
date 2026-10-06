@@ -77,21 +77,33 @@ export type LaunchResult =
   | { kind: "ready"; versionMismatch: boolean; notice: string | null }
   | { kind: "error"; error: string; canUseReleaseBrain: boolean };
 
-/** The overlay status, or "no overlay" if the release-brain `nell` fails or is slow:
- *  that is today's behaviour, and the launch must not wait on it (spec §5). */
-async function overlayStatus(): Promise<BrainOverlayStatus> {
+/** The quick launch check: null when the release-brain `nell` fails or doesn't answer
+ *  within 5 s. A healthy launch then carries on as "no overlay" — it must not wait on
+ *  it (spec §5); a failed start asks again with patientStatus(). */
+async function quickStatus(): Promise<BrainOverlayStatus | null> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
       brainOverlayStatus(),
-      new Promise<BrainOverlayStatus>((resolve) => {
-        timer = setTimeout(() => resolve(NO_OVERLAY), STATUS_TIMEOUT_MS);
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), STATUS_TIMEOUT_MS);
       }),
     ]);
   } catch {
-    return NO_OVERLAY;
+    return null;
   } finally {
     clearTimeout(timer);
+  }
+}
+
+/** After a failed start the user is already looking at an error, so waiting costs
+ *  nothing: a slow machine must not switch recovery off (#338 review). Bounded by
+ *  Rust's 30 s; a failure there is "no overlay", today's behaviour. */
+async function patientStatus(): Promise<BrainOverlayStatus> {
+  try {
+    return await brainOverlayStatus(true);
+  } catch {
+    return NO_OVERLAY;
   }
 }
 
@@ -138,7 +150,7 @@ async function startOk(persona: string): Promise<boolean> {
 }
 
 async function failedRecovery(r: RecoveryResult, fallback: string): Promise<LaunchResult> {
-  const after = await overlayStatus();
+  const after = await patientStatus();
   return {
     kind: "error",
     error: r.error !== null ? `Couldn't switch back to the release brain: ${r.error}` : fallback,
@@ -157,12 +169,12 @@ async function ready(persona: string, notice: string | null): Promise<LaunchResu
  * never dropped on a guess — the error screen offers the release brain instead.
  */
 export async function launchBrain(persona: string): Promise<LaunchResult> {
-  const statusP = overlayStatus(); // runs alongside the start
+  const quickP = quickStatus(); // runs alongside the start
   try {
     await ensureBridgeRunning(persona);
   } catch (e) {
     const error = errString(e) || "the bridge didn't start";
-    const status = await statusP;
+    const status = (await quickP) ?? (await patientStatus());
     if (!status.active_commit) return { kind: "error", error, canUseReleaseBrain: false };
     if (status.confirmed) return { kind: "error", error, canUseReleaseBrain: true };
     // case C: the update never proved itself and won't start
@@ -175,7 +187,7 @@ export async function launchBrain(persona: string): Promise<LaunchResult> {
     return ready(persona, noticeFor(r));
   }
 
-  const status = await statusP;
+  const status = (await quickP) ?? NO_OVERLAY;
   let notice: string | null = null;
   if (status.active_commit) {
     const commit = status.active_commit;
