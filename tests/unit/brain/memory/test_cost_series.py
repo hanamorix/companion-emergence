@@ -824,11 +824,43 @@ def test_flush_stops_at_the_first_failed_write_and_keeps_every_untried_group(
         tried.append(name)
         raise sqlite3.OperationalError("database is locked")
 
-    monkeypatch.setattr(MemoryStore, "record_cost_samples", boom)
-    assert cost_series.flush(store) == 0
+    with monkeypatch.context() as patched:
+        patched.setattr(MemoryStore, "record_cost_samples", boom)
+        assert cost_series.flush(store) == 0
     assert len(tried) == 1, "one busy timeout at most, not one per series"
-    monkeypatch.undo()
     assert cost_series.flush(store) == 2, "both groups were kept for the next flush"
+
+
+def test_flush_drops_a_group_that_fails_for_a_reason_other_than_a_lock_and_saves_the_rest(
+    store: MemoryStore, series: CostSeries, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    other = CostSeries("other series")
+    _record(series, store, [(1000, 0.1)])
+    _record(other, store, [(1000, 0.2)])
+    real = MemoryStore.record_cost_samples
+
+    def picky(self, name, *a, **k):
+        if name == "test series":
+            raise ValueError("a deterministic per-group failure")
+        return real(self, name, *a, **k)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(MemoryStore, "record_cost_samples", picky)
+        assert cost_series.flush(store) == 1, "the other series is saved"
+    assert not cost_series.has_pending(store.db_path), "and the failing group does not block every later flush"
+
+
+def test_a_flush_prunes_expired_rows_of_other_hosts_and_keys_of_the_same_series(
+    store: MemoryStore, series: CostSeries, clock: Clock
+) -> None:
+    store._conn.execute(  # noqa: SLF001
+        "INSERT INTO cost_series_samples VALUES ('test series', 'old-host', 'retired-model', 5, 0.1, ?)", (T0 - W - 1,)
+    )
+    store._conn.commit()  # noqa: SLF001
+    series.record(store, "m", 1000, 0.1)
+    cost_series.flush(store)
+    hosts = {r[0] for r in store._conn.execute("SELECT host FROM cost_series_samples")}  # noqa: SLF001
+    assert hosts == {"test-machine"}
 
 
 def _production_series():

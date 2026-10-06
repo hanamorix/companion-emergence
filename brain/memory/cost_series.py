@@ -39,6 +39,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import sqlite3
 import threading
 import time
 import uuid
@@ -362,15 +363,20 @@ def flush(store: MemoryStore) -> int:
                 window_seconds=window,
             )
             written += len(group)
-        except Exception as exc:  # noqa: BLE001 - a failed save keeps the samples for the next flush
+        except (sqlite3.OperationalError, RuntimeError) as exc:
             _note_failure("flush", exc)
-            # Put this group and every group not yet tried back, and stop: a
-            # database that is locked for the busy timeout is locked for the rest
-            # too, and a stop must not wait it out once per series.
+            # A locked or busy database (or a connection inside someone else's
+            # transaction, `record_cost_samples`' RuntimeError): put this group and every group not yet
+            # tried back, and stop (it is locked for the rest too, and a stop must
+            # not wait out the busy timeout once per series).
             with _pending_lock:
                 for _unwritten_key, unwritten in pending[index:]:
                     _pending.extend(unwritten)
             break
+        except Exception as exc:  # noqa: BLE001 - a failure of this group alone
+            # Not a lock: retrying would fail the same way at the head of every
+            # flush and starve the other series, so this group is dropped.
+            _note_failure("flush (group dropped)", exc)
     return written
 
 

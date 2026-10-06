@@ -1950,10 +1950,12 @@ class MemoryStore:
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 [(series, host, key, x, seconds, taken_at) for x, seconds, taken_at in samples],
             )
+            # Every expired row of this series goes, whatever its host or key: rows
+            # of a retired model id or of another machine's id would otherwise stay
+            # for good.
             self._conn.execute(
-                "DELETE FROM cost_series_samples "
-                "WHERE series = ? AND host = ? AND series_key = ? AND taken_at <= ?",
-                (series, host, key, cut),
+                "DELETE FROM cost_series_samples WHERE series = ? AND taken_at <= ?",
+                (series, cut),
             )
             sums = self._cost_window_sums(series, host, key, cut)
             carried = self._cost_carried_row(series, host, key)
