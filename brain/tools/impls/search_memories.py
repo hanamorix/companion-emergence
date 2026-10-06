@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from brain.memory import keyword_budget
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.relevance import (
     CANDIDATE_POOL,
@@ -92,6 +93,7 @@ def _keyword_candidates(
     *,
     exclude: frozenset[str],
     persona_dir: Path | None = None,
+    started: float | None = None,
 ) -> list[Memory]:
     """The tool's keyword search, every candidate best-first (both modes): today's
     ranker exactly, plus the name query (name-recall fix R4/R5, spec §5/§7, S99).
@@ -112,13 +114,19 @@ def _keyword_candidates(
     phrases; its hits lead this list (S89: those the general search also found
     first, then name-only hits, then the general hits). No graveyard is involved
     here. Without a listed name in her query the result is exactly today's.
+
+    ``started`` (name-recall fix S145, S155, S157): the budget clock reading at
+    the top of the tool call; the name query's continuation walk runs under the
+    per-message recall time budget from it (`rank_name_hits`).
     """
     ranked = rank_memories(
         store, hebbian, query, limit=CANDIDATE_POOL, exclude_ids=exclude, genuine_first=True
     )
     general = [m for m, _ in ranked]
     names = names_in(persona_dir, query)
-    name_ranked = rank_name_hits(store, hebbian, names, limit=CANDIDATE_POOL, exclude_ids=exclude)
+    name_ranked = rank_name_hits(
+        store, hebbian, names, limit=CANDIDATE_POOL, exclude_ids=exclude, started=started
+    )
     # The monologue family follows every genuine hit (spec §4, S16, criterion 8:
     # "in passive recall and the tool"); a separate rule from the words searched.
     return genuine_first_memories(lead_with_names([m for m, _ in name_ranked], general, names))
@@ -132,11 +140,14 @@ def _lexical_candidates(
     limit: int,
     exclude: frozenset[str],
     persona_dir: Path | None = None,
+    started: float | None = None,
 ) -> list[Memory]:
     """``mode="lexical"``: today's keyword ranker plus the name query (R5, S99),
     the first ``limit`` results. Shares the emotion-boost/formatting tail below
     with the semantic mode."""
-    hits = _keyword_candidates(store, hebbian, query, exclude=exclude, persona_dir=persona_dir)
+    hits = _keyword_candidates(
+        store, hebbian, query, exclude=exclude, persona_dir=persona_dir, started=started
+    )
     return hits[:limit]
 
 
@@ -343,6 +354,9 @@ def search_memories(
         count          — number of results returned
         memories       — list of snippet-result dicts (``snippet: true`` + id)
     """
+    # The per-call budget clock (S132, S157): what is left of the recall budget
+    # for the name query's continuation is measured from here.
+    started = keyword_budget.now()
     exclude = frozenset(exclude_ids or ())
 
     # #231 Fix 3 (owner ruling — resolved_mode must never lie): normalize
@@ -375,7 +389,7 @@ def search_memories(
             # reported mode stays "semantic": at least one semantic result
             # contributed.
             keyword = _keyword_candidates(
-                store, hebbian, query, exclude=exclude, persona_dir=persona_dir
+                store, hebbian, query, exclude=exclude, persona_dir=persona_dir, started=started
             )
             # Spec §4, S97/S98: the six result groups in the dev-constants
             # order, each paragraph's guaranteed slot kept first.
@@ -384,7 +398,13 @@ def search_memories(
             )
     if candidates is None:
         candidates = _lexical_candidates(
-            store, hebbian, query, limit=fetch_limit, exclude=exclude, persona_dir=persona_dir
+            store,
+            hebbian,
+            query,
+            limit=fetch_limit,
+            exclude=exclude,
+            persona_dir=persona_dir,
+            started=started,
         )
 
     if resolved_order == "age":

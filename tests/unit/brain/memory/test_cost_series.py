@@ -679,3 +679,14 @@ def test_s127_window_counts_split_at_the_verdict_time(
     assert series.window_counts(store, "m", T0 + 5) == (2, 1), "moving a sample to the database changes no count"
     clock.now = T0 + W + 1  # the two oldest age out
     assert series.window_counts(store, "m", T0 + 5) == (0, 1)
+
+
+def test_cs1d_the_period_module_is_gone_and_nothing_imports_it() -> None:
+    """S146 supersedes S101: no per-period series, no tick hook."""
+    import importlib.util
+
+    name = "cost_" + "period"
+    assert importlib.util.find_spec(f"brain.memory.{name}") is None
+    repo = Path(__file__).resolve().parents[4]
+    for path in sorted((repo / "brain").rglob("*.py")):
+        assert name not in path.read_text(encoding="utf-8"), path

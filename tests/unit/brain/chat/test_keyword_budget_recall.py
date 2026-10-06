@@ -39,7 +39,7 @@ from brain.felt_time.state import FeltTimeState
 from brain.felt_time.state import persist as persist_felt_time
 from brain.memory import keyword_budget, relevance
 from brain.memory import known_names as kn
-from brain.memory.cost_period import LinearFit
+from brain.memory.cost_series import LinearFit
 from brain.memory.store import FtsPhrases, Memory, MemoryStore
 
 B = keyword_budget.recall_budget_seconds()
@@ -152,31 +152,24 @@ def make_world(
     )
 
 
-def mark_covered(key: str) -> None:
-    """Raise the series' largest-sample size without touching the fit (a test seam: replaces the
-    state's sums with `max_x` raised, under the series' own lock)."""
-    import dataclasses
-
-    series = keyword_budget._keyword_cost  # noqa: SLF001
-    with series._lock:  # noqa: SLF001
-        state = series._states[key]  # noqa: SLF001
-        series._states[key] = dataclasses.replace(  # noqa: SLF001
-            state, sums=dataclasses.replace(state.sums, max_x=10**6)
-        )
-
-
 def seed_fit(store: MemoryStore, overhead: float = OVH, rate: float = RATE, *, covered: bool = True) -> LinearFit:
     """Sizes 4 and 8: the OLS denominator is 16, so the fit is exactly (overhead, rate).
-    `covered` (default): the series is taken to hold a sample at least as large as any
-    extras the test sends, so the S101 line sizes the step alone (S139 has its own tests)."""
-    key = str(store.db_path)
-    for x in (4, 8):
-        keyword_budget._record(key, x, overhead + x * rate)  # noqa: SLF001
-    if covered:
-        mark_covered(key)
-    fit = keyword_budget._keyword_cost.fit(key)  # noqa: SLF001
+    `covered` (default): the window also holds a sample at 4,096 words ON THE SAME LINE
+    (exact in binary floating point), so the series' measured range covers any extras the
+    test sends and the estimate sizes the step alone (S139 has its own tests); the fit is
+    unchanged."""
+    xs = (4, 8, 4096) if covered else (4, 8)
+    for x in xs:
+        keyword_budget._keyword_cost.record(store, "", x, overhead + x * rate)  # noqa: SLF001
+    fit = keyword_budget._keyword_cost.fit(store, "")  # noqa: SLF001
     assert (fit.overhead, fit.rate) == (overhead, rate)
     return fit
+
+
+def window_n(store: MemoryStore) -> int:
+    """How many samples the keyword series' window holds (buffer included)."""
+    state = keyword_budget._keyword_cost.state(store, "")  # noqa: SLF001
+    return 0 if state is None else state.sums.n
 
 
 @pytest.fixture
@@ -438,12 +431,20 @@ def test_when_nothing_fits_no_extra_word_is_searched_and_the_rest_still_runs(
     if mode == "fresh" and case == "one-word-does-not-fit":
         # the seed rate is T1 / 10 words: pick a left below one word of the seed
         left = (T1 / 10) / 2
+    before = window_n(w.store)
     calls = wire(monkeypatch, clock, t_sem=t_sem_for(left))
     block = render(w)
-    assert tier2(calls) == [], "no tier-2 search of any size (no probe, no partial)"
-    state = keyword_budget._keyword_cost.state(str(w.store.db_path))  # noqa: SLF001
-    assert (state is None) if mode == "fresh" else (state.sums.n == 2), "no sample recorded"
-    assert kinds(calls) == ["tier1", "name"], "tier 1 and the name query still run"
+    if case == "one-word-does-not-fit":
+        # S156: time is left but the estimate fits no word: ONE probe word, so a
+        # too-high estimate re-samples itself (its sample is this process's first,
+        # discarded, S134)
+        t2 = tier2(calls)
+        assert len(t2) == 1 and t2[0][1] == w.words[:1], "exactly one probe word"
+        assert kinds(calls) == ["tier1", "name", "tier2"]
+    else:
+        assert tier2(calls) == [], "no time left: no tier-2 search of any size"
+        assert kinds(calls) == ["tier1", "name"], "tier 1 and the name query still run"
+    assert window_n(w.store) == before, "no sample recorded (nothing searched, or the discarded first)"
     assert w.mems.t1a.id in block, "the block renders from tier 1"
 
 
@@ -466,7 +467,7 @@ def test_a_fresh_process_sizes_tier_two_from_the_tier_one_seed_with_the_floor_fi
     render(w)
     t2 = tier2(calls)
     assert len(t2) == 1 and t2[0][1] == w.words[:40], "floor(left / (t1 / 9)) = 40; a count of 10 would give 45"
-    assert keyword_budget._keyword_cost.state(str(w.store.db_path)) is None, "S134: first sample discarded"  # noqa: SLF001
+    assert window_n(w.store) == 0, "S134: first sample discarded"
 
 
 def test_residue_tier_one_raised_and_no_estimate_means_no_extras(
@@ -561,8 +562,7 @@ def test_no_persona_dir_path_cuts_and_skips_like_the_persona_path(
     assert len(t2) == 1 and t2[0][1] == w.words[:n]
     assert t2[0][2] == {"limit": 8, "genuine_first": True}
     assert kinds(calls) == ["tier1-legacy", "tier2"]
-    state = keyword_budget._keyword_cost.state(str(w.store.db_path)).sums  # noqa: SLF001
-    assert state.n == 2, "the discarded first sample leaves the two seeded ones"
+    assert window_n(w.store) == 3, "the discarded first sample leaves the three seeded ones"
     # exhausted: nothing is searched
     keyword_budget._reset_keyword_cost()  # noqa: SLF001
     seed_fit(w.store)
@@ -609,9 +609,10 @@ def test_extras_share_the_one_budget_with_the_semantic_step(
         render(w)
         t2 = tier2(calls)
         left = B - (c + T1 + T_NAME)
-        want = 0 if left <= 0 else min(len(w.words), keyword_budget.words_that_fit(fit, len(w.words), left))
+        # S156: time left but nothing fits -> one probe word
+        want = 0 if left <= 0 else max(1, min(len(w.words), keyword_budget.words_that_fit(fit, len(w.words), left)))
         assert (len(t2[0][1]) if t2 else 0) == want
-        assert ck.t <= B + 1e-9 or want == 0, "the cut message never overruns the budget"
+        assert ck.t <= B + 1e-9 or want <= 1, "the cut message never overruns the budget (but for S156's one probe word)"
         seen.append(want)
     assert seen[0] == 0 and seen == sorted(seen), "monotone in what the semantic step left"
     assert seen[-1] > seen[1]
@@ -630,7 +631,9 @@ def test_the_tool_never_touches_the_keyword_budget(monkeypatch: pytest.MonkeyPat
     def forbidden(*_a, **_k):
         raise AssertionError("the search tool must not use the keyword budget")
 
-    for name in ("search_extra_words", "timed_tier1", "record_tier2", "timed", "now"):
+    # The extra-words machinery is passive recall's only (S99); the tool's name
+    # query shares the budget CLOCK (`now`, S157) and nothing else of it.
+    for name in ("search_extra_words", "timed_tier1", "record_tier2", "timed"):
         monkeypatch.setattr(keyword_budget, name, forbidden)
     ctx = _ctx(tmp_path)
     store = ctx["store"]
@@ -647,4 +650,4 @@ def test_the_tool_never_touches_the_keyword_budget(monkeypatch: pytest.MonkeyPat
     res = dispatch("search_memories", {"query": long_query, "mode": "lexical", "limit": 8}, **ctx)
     assert res["memories"], "the tool still searches and finds"
     assert queries == [long_query], "the raw query, every word, exactly as today"
-    assert keyword_budget._keyword_cost.state(str(store.db_path)) is None  # noqa: SLF001
+    assert window_n(store) == 0

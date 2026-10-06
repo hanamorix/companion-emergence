@@ -302,6 +302,15 @@ def _db_key(db_path: str | os.PathLike[str]) -> str:
     return str(Path(db_path).resolve())
 
 
+def _store_key(store: MemoryStore) -> str:
+    """The buffer's key for a store's database: its resolved path, or, for an
+    in-memory database (tests; each connection is its own database), the
+    connection's identity."""
+    if str(store.db_path) == ":memory:":
+        return f":memory:{id(store)}"
+    return _db_key(store.db_path)
+
+
 def has_pending(db_path: str | os.PathLike[str]) -> bool:
     """Whether the buffer holds samples for the database at `db_path` (the
     flush job's due test; no database is opened)."""
@@ -319,7 +328,7 @@ def flush(store: MemoryStore) -> int:
     written. A group whose write raises (a locked database, a connection
     already inside a transaction) goes back into the buffer; nothing is lost
     and nothing is written twice. Never raises for a failed write."""
-    db = _db_key(store.db_path)
+    db = _store_key(store)
     now = _wall_clock()
     window = window_seconds()
     with _pending_lock:
@@ -389,7 +398,7 @@ class CostSeries:
         """Buffer several samples taken now."""
         now = _wall_clock()
         host = machine_id()
-        db = _db_key(store.db_path)
+        db = _store_key(store)
         rows = [_Sample(db, self.name, host, key, x, max(0.0, y), now) for x, y in samples]
         if rows:
             with _pending_lock:
@@ -423,7 +432,7 @@ class CostSeries:
             return None
         if _between_reads_hook is not None:
             _between_reads_hook()
-        for sample in self._buffered(_db_key(store.db_path), host, key, now - window):
+        for sample in self._buffered(_store_key(store), host, key, now - window):
             sums = sums.plus(sample.x, sample.seconds)
         return SeriesState(sums, carried)
 
@@ -455,7 +464,7 @@ class CostSeries:
         )
         if _between_reads_hook is not None:
             _between_reads_hook()
-        for sample in self._buffered(_db_key(store.db_path), host, key, now - window):
+        for sample in self._buffered(_store_key(store), host, key, now - window):
             if sample.taken_at > since:
                 after += 1
             else:

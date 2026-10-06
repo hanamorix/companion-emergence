@@ -16,12 +16,13 @@ import logging
 import math
 import re
 import sqlite3
+import threading
 import uuid
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 
@@ -753,6 +754,61 @@ def _bump_amount(bump: bool | float) -> float | None:
     amount = float(bump)
     return amount if amount != 0.0 else None
 
+
+
+class KeepBudget(Protocol):
+    """The time budget of a filtered FTS search's continuation (name-recall fix
+    S145, S155, S160): see `MemoryStore._fts_rows_kept`. `begin()` starts the
+    walk and returns the seconds left for it (`None`: none, run no continuation
+    query); `allows(rows_judged, chars)` is asked before each continuation row is
+    judged (`chars` = the characters of the rows judged so far, including that
+    row); `finish(chars)` is called once when the walk ends, with the characters
+    judged (0 when it judged no row)."""
+
+    def begin(self) -> float | None: ...
+
+    def allows(self, rows_judged: int, chars: int) -> bool: ...
+
+    def finish(self, chars: int) -> None: ...
+
+
+class _Deadline:
+    """Interrupts a running statement on `conn` once `seconds` have passed
+    (`sqlite3.Connection.interrupt` from a helper thread). SQLite applies an
+    interrupt only while a statement is running, so one fired just BEFORE the
+    walk's statement begins (a deadline of almost no time) would be lost: the
+    helper therefore re-sends it every `seconds` until disarmed. The callback
+    only acts while `active`, under the lock, so `disarm()` (called BEFORE the
+    cursor closes) guarantees no interrupt can land on a later statement of the
+    same connection; `fired` says whether this deadline sent an interrupt, so the
+    caller swallows only an interrupt of its own."""
+
+    def __init__(self, conn: sqlite3.Connection, seconds: float) -> None:
+        self._conn = conn
+        self._lock = threading.Lock()
+        self._active = True
+        self._stop = threading.Event()
+        self._interval = max(0.0, seconds)
+        self.fired = False
+        self._thread = threading.Thread(target=self._run, name="fts-deadline", daemon=True)
+
+    def arm(self) -> None:
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            self._fire()
+
+    def _fire(self) -> None:
+        with self._lock:
+            if self._active:
+                self.fired = True
+                self._conn.interrupt()
+
+    def disarm(self) -> None:
+        with self._lock:
+            self._active = False
+        self._stop.set()
 
 
 class MemoryStore:
@@ -2913,6 +2969,7 @@ class MemoryStore:
         bump: bool | float = False,
         family_types: Collection[str] = (),
         keep: Callable[[str], bool] | None = None,
+        keep_budget: KeepBudget | None = None,
     ) -> list[tuple[Memory, float]]:
         """FTS5/BM25 text-match search, best-match first.
 
@@ -2946,6 +3003,10 @@ class MemoryStore:
         from the cursor, skipping every id the first one returned, until ``limit``
         rows passed. Only the returned rows are bumped. None (default): today's
         single query, unchanged.
+
+        ``keep_budget`` (name-recall fix S145, S155, S160): a time budget for that
+        second query only (the first page and today's no-budget path are
+        unchanged); see ``_fts_rows_kept``.
         """
         match = _to_fts_match(query)
         if not match:
@@ -2972,7 +3033,7 @@ class MemoryStore:
                 params.append(limit)
             rows = self._conn.execute(sql, params).fetchall()
         else:
-            rows = self._fts_rows_kept(sql, params, limit, keep)
+            rows = self._fts_rows_kept(sql, params, limit, keep, keep_budget)
         amount = _bump_amount(bump)
         if rows and amount is not None:
             now_iso = datetime.now(UTC).isoformat()
@@ -2992,9 +3053,20 @@ class MemoryStore:
         params: list[Any],
         limit: int | None,
         keep: Callable[[str], bool],
+        keep_budget: KeepBudget | None = None,
     ) -> list[sqlite3.Row]:
         """``search_fts_scored``'s rows that pass ``keep``, in the query's order,
-        at most ``limit`` (see its docstring)."""
+        at most ``limit`` (see its docstring).
+
+        With a ``keep_budget`` the CONTINUATION (the second query, read only when
+        the first page came back full and dropped a row) runs under it: ``begin()``
+        gives the seconds left (none: no continuation); a deadline timer interrupts
+        the continuation query itself when they are spent (S145: one query that is
+        itself long cannot overrun the budget); before each row ``allows`` may stop
+        the walk (the prediction, from the second judged row on); and ``finish`` is
+        told the characters judged. The walk's rows are a prefix of the unbudgeted
+        walk's, the kept rows a prefix of its kept rows. Only an interrupt this
+        deadline fired is swallowed; any other ``OperationalError`` propagates."""
         if limit is None:
             return [row for row in self._conn.execute(sql, params).fetchall() if keep(row["content"])]
         first = self._conn.execute(sql + " LIMIT ?", [*params, limit]).fetchall()
@@ -3002,18 +3074,56 @@ class MemoryStore:
         if len(kept) == len(first) or len(first) < limit:
             return kept
         seen = {row["id"] for row in first}
-        cursor = self._conn.execute(sql, params)
+        if keep_budget is None:
+            cursor = self._conn.execute(sql, params)
+            try:
+                for row in cursor:
+                    if row["id"] in seen:
+                        continue
+                    seen.add(row["id"])
+                    if keep(row["content"]):
+                        kept.append(row)
+                        if len(kept) >= limit:
+                            break
+            finally:
+                cursor.close()
+            return kept
+        left = keep_budget.begin()
+        if left is None:
+            return kept
+        judged = 0
+        chars = 0
+        deadline = _Deadline(self._conn, left)
+        cursor = None
         try:
-            for row in cursor:
-                if row["id"] in seen:
-                    continue
-                seen.add(row["id"])
-                if keep(row["content"]):
-                    kept.append(row)
-                    if len(kept) >= limit:
+            deadline.arm()
+            try:
+                cursor = self._conn.execute(sql, params)
+                for row in cursor:
+                    if row["id"] in seen:
+                        continue
+                    seen.add(row["id"])
+                    text = row["content"] or ""
+                    if not keep_budget.allows(judged, chars + len(text)):
                         break
+                    judged += 1
+                    chars += len(text)
+                    if keep(row["content"]):
+                        kept.append(row)
+                        if len(kept) >= limit:
+                            break
+            except sqlite3.OperationalError as exc:
+                # Only the interrupt this deadline sent ends the walk quietly.
+                if not (deadline.fired and "interrupt" in str(exc).lower()):
+                    raise
+            finally:
+                # Disarmed BEFORE the cursor closes: no interrupt can reach a
+                # later statement of this connection.
+                deadline.disarm()
+                if cursor is not None:
+                    cursor.close()
         finally:
-            cursor.close()
+            keep_budget.finish(chars if judged else 0)
         return kept
 
     def active_state_memory_types(self) -> dict[str, str]:

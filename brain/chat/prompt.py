@@ -1171,9 +1171,9 @@ def _build_recall_block(
 
         # Two tiers (S79): today's capped query, then the remaining tokens.
         capped_query, remainder = _keyword_tiers(tokens, legacy_tokens)
-        seed = None
+        tier1 = None
         try:
-            ranked, seed = keyword_budget.timed_tier1(
+            ranked, tier1 = keyword_budget.timed_tier1(
                 store,
                 legacy_tokens,
                 lambda: rank_memories(store, None, capped_query, limit=limit, genuine_first=True),
@@ -1186,7 +1186,7 @@ def _build_recall_block(
                 remainder,
                 started,
                 lambda words: rank_memories(store, None, words, limit=limit, genuine_first=True),
-                seed,
+                tier1,
             )
         except Exception:  # noqa: BLE001
             log.debug("_build_recall_block: tier-2 keyword step failed", exc_info=True)
@@ -1306,7 +1306,7 @@ def _build_recall_block(
     # call that shares it), close it once. integrity_check=False → no per-turn full-DB scan.
     # Fail-soft: any open error → heb=None (w_heb=0) and the search still runs.
     heb = None
-    seed = None
+    tier1 = None
     try:
         try:
             heb = HebbianMatrix(persona_dir / "hebbian.db", integrity_check=False)
@@ -1320,7 +1320,7 @@ def _build_recall_block(
             # only a known name has no selector token, so the query is empty but
             # the call still runs for the names (the graveyard never sees an
             # empty word string with no names: that matches nothing).
-            result, seed = keyword_budget.timed_tier1(
+            result, tier1 = keyword_budget.timed_tier1(
                 store,
                 legacy_tokens,
                 lambda: search_with_loss(
@@ -1353,7 +1353,7 @@ def _build_recall_block(
         # through this query.
         if names:
             try:
-                ranked_names = rank_name_hits(store, heb, names, limit=limit * 2)
+                ranked_names = rank_name_hits(store, heb, names, limit=limit * 2, started=started)
             except Exception:  # noqa: BLE001
                 ranked_names = []
             name_active = _sort_keyword_tier([p for p in ranked_names if p[0].state == "active"])
@@ -1375,7 +1375,7 @@ def _build_recall_block(
                     lambda words: rank_memories(
                         store, heb, words, limit=limit * 2, include_fading=True, genuine_first=True
                     ),
-                    seed,
+                    tier1,
                 )
             except Exception:  # noqa: BLE001
                 log.debug("_build_recall_block: tier-2 keyword step failed", exc_info=True)

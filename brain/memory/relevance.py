@@ -29,7 +29,7 @@ from brain.memory.known_names import (
     match_known_names,
     name_hit_ok,
 )
-from brain.memory.store import FtsPhrases
+from brain.memory.store import FtsPhrases, KeepBudget
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +114,7 @@ def rank_memories(
     include_fading: bool = True,
     genuine_first: bool = False,
     keep: Callable[[str, Sequence[str]], bool] | None = None,
+    keep_budget: KeepBudget | None = None,
 ) -> list[tuple[Memory, float | None]]:
     """Rank committed memories by blended relevance — bump-free, best→worst.
 
@@ -142,6 +143,11 @@ def rank_memories(
     the recency fallback, one substring search per phrase, judges each row for the
     phrase that found it and fetches every match of that phrase (a limited fetch
     could be all rejected). None (default): unchanged.
+
+    ``keep_budget`` (name-recall fix S145, S155, S160): a time budget for the
+    FTS path's continuation walk past the first page (`MemoryStore.
+    _fts_rows_kept`); only meaningful with ``keep``. The recency fallback has no
+    walk to budget. None (default): unchanged.
     """
     exclude = frozenset(exclude_ids)
 
@@ -186,6 +192,8 @@ def rank_memories(
     if keep is not None:
         phrases = (query,) if isinstance(query, str) else tuple(query)
         fts_kwargs["keep"] = lambda text: keep(text or "", phrases)
+        if keep_budget is not None:
+            fts_kwargs["keep_budget"] = keep_budget
     scored = store.search_fts_scored(
         query,
         active_only=active_only,
@@ -275,6 +283,7 @@ def rank_name_hits(
     *,
     limit: int,
     exclude_ids: Iterable[str] = frozenset(),
+    started: float | None = None,
 ) -> list[tuple[Memory, float | None]]:
     """The name query: ONE keyword query for the message's name words.
 
@@ -289,6 +298,14 @@ def rank_name_hits(
     the graveyard through ``search_with_loss(lost_names=)`` (S102).
 
     ``names`` come from :func:`names_in`; none means no query (``[]``).
+
+    ``started`` (name-recall fix S145, S155, S157, S160): the budget clock reading
+    at the top of the message's recall (`keyword_budget.now()`). With it, the
+    query's first page always runs and only the continuation past it, the walk
+    over the rows the filter keeps rejecting, runs under the per-message time
+    budget (`keyword_budget.NameWalkBudget`: the measured name-matching cost, the
+    time left after what this message has already spent). Without it (None) the
+    walk is unbudgeted, as before.
 
     The hits are filtered with the shared name rules (names increment, S121,
     S129, S151): a hit whose only occurrences of the queried names break them (a
@@ -310,6 +327,11 @@ def rank_name_hits(
             known = snapshots[key] = KnownNames.from_names(key)
         return name_hit_ok(text, key, known)
 
+    keep_budget = None
+    if started is not None:
+        from brain.memory import keyword_budget  # local: keyword_budget -> reranker -> relevance
+
+        keep_budget = keyword_budget.NameWalkBudget(store, started)
     return rank_memories(
         store,
         hebbian,
@@ -319,6 +341,7 @@ def rank_name_hits(
         include_fading=True,
         genuine_first=True,
         keep=_keep,
+        keep_budget=keep_budget,
     )
 
 
