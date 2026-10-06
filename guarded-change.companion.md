@@ -4,9 +4,9 @@ Per-project config for the `guarded-change` skill. Parameterizes the agnostic lo
 companion-emergence on **this** machine (macOS, dev repo, persona `nell`).
 See `~/.claude/skills/guarded-change/METHODOLOGY.md` for the contract.
 
-Adapted from the upstream `guarded-change.companion.md` (which targeted a Linux box and a
-different persona). Path changes here: XDG `~/.local/share/...` → macOS
-`~/Library/Application Support/...`; persona → `nell`; bundled Linux runtime →
+Adapted from the upstream `guarded-change.companion.md` (which targeted a Linux box +
+persona "Phoebe"). Path changes here: XDG `~/.local/share/...` → macOS
+`~/Library/Application Support/...`; persona `Phoebe` → `nell`; bundled Linux runtime →
 the dev repo `brain/` (the authoritative source we edit + test here).
 
 ```yaml
