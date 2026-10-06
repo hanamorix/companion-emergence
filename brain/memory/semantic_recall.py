@@ -95,7 +95,7 @@ import numpy as np
 
 from brain import dev_constants, tunables
 from brain.dev_constants import MONOLOGUE_FAMILY_TYPES, RERANK_MIN_REAL_CANDIDATES
-from brain.memory import cost_period, floor_startup
+from brain.memory import cost_series, floor_startup
 from brain.memory import embeddings as embeddings_mod
 from brain.memory import reranker as reranker_mod
 from brain.memory.embedding_matrix import EmbeddingMatrix, build_embedding_matrix
@@ -930,60 +930,23 @@ _clock: Callable[[], float] = time.monotonic
 # `brain.memory.known_names`): a paragraph's words for the emptiness test.
 _WORD_RE = re.compile(r"[A-Za-z0-9]+")
 
-# Test-only seam (CONC-1): called inside a running-time update, between
-# reading the current sums and writing the new ones. `None` in production.
-_time_update_hook: Callable[[], None] | None = None
-
-
-@dataclass(frozen=True)
-class _TimeSums:
-    samples: int = 0
-    seconds: float = 0.0
-
-
-class _RunningTime:
-    """A process-wide running average of seconds per sample, as a ratio of
-    sums (plan P-7, P-26: no averaging constant). One lock guards the sums;
-    the state is an immutable pair swapped whole, so a reader never sees half
-    an update and a concurrent update is never lost (CONC-1)."""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._sums = _TimeSums()
-
-    def record(self, seconds: float) -> None:
-        with self._lock:
-            current = self._sums
-            if _time_update_hook is not None:
-                _time_update_hook()
-            self._sums = _TimeSums(current.samples + 1, current.seconds + max(0.0, seconds))
-
-    def average(self) -> float | None:
-        """Mean seconds per sample, or `None` before the first sample."""
-        with self._lock:
-            sums = self._sums
-        return sums.seconds / sums.samples if sums.samples else None
-
-    def sums(self) -> _TimeSums:
-        with self._lock:
-            return self._sums
-
-    def reset(self) -> None:
-        with self._lock:
-            self._sums = _TimeSums()
-
-
+# The three paragraph-time series are rolling 24-hour windows saved in
+# memories.db (name-recall fix S146, S155: `cost_series`), so a restart
+# continues from them. Samples are only buffered on the reply path (S164).
+#
 # `T_m`: per-message setup before the first query is embedded (paragraph
-# split, the stacked matrix, the lean pool read; plan P-26).
-_message_overhead = _RunningTime()
+# split, the stacked matrix, the lean pool read; plan P-26). One key, x = 1:
+# its estimate is the window's mean.
+_message_overhead = cost_series.CostSeries("recall setup")
 # `T_s`: per query, its share of the matrix product + its coarse cut + its
 # reranker pair-size probe (plan P-7, P-28; S108: the per-paragraph scan time
-# stays a running average). Shared by passive recall and the tool.
-_scan_time = _RunningTime()
+# is a mean over the window). Shared by passive recall and the tool. One key,
+# x = 1.
+_scan_time = cost_series.CostSeries("paragraph scan")
 # The paragraph embed cost (S108, S118): per embedder model id, one sample per
 # embed batch, x = texts x the longest text's tokens, y = its in-lock seconds;
-# least squares per 24-hour compaction period (`cost_period`).
-_embed_cost = cost_period.PeriodCostSeries("paragraph embed")
+# least squares over the window.
+_embed_cost = cost_series.CostSeries("paragraph embed")
 # Embedder model ids whose first embed of this process has run (S117).
 _embed_warmed: set[str] = set()
 _embed_warm_lock = threading.Lock()
@@ -1019,11 +982,8 @@ def _timed_probe(
 
 
 def _reset_paragraph_time_model() -> None:
-    """Test-only: forget the running averages, the embed cost series and the
-    embed warm-up state."""
-    _message_overhead.reset()
-    _scan_time.reset()
-    _embed_cost.clear()
+    """Test-only: forget the embed warm-up state. The three series live in the
+    database and the process buffer (`cost_series._reset_pending`)."""
     with _embed_warm_lock:
         _embed_warmed.clear()
     _embed_warm_failed.clear()
@@ -1257,8 +1217,8 @@ def search_paragraphs(
     tokens_of: dict[str, int] | None = (
         None if probed is None or len(probed) != len(probe_texts) else dict(zip(probe_texts, probed, strict=True))
     )
-    _message_overhead.record(before_provider - start - one_time + probe_seconds)
-    overhead = _message_overhead.average() or 0.0
+    _message_overhead.record(store, "", 1, before_provider - start - one_time + probe_seconds)
+    overhead = _message_overhead.mean(store, "") or 0.0
 
     def is_family(mid: str) -> bool:
         return types[mid] in MONOLOGUE_FAMILY_TYPES
@@ -1279,7 +1239,7 @@ def search_paragraphs(
         embed_calls.append(list(texts))
         sizes = None if tokens_of is None else [tokens_of.get(t) for t in texts]
         if sizes is not None and None not in sizes and max(sizes) > 0:
-            _embed_cost.record(embedder_model_id, len(texts) * max(sizes), seconds)
+            _embed_cost.record(store, embedder_model_id, len(texts) * max(sizes), seconds)
         began = _clock()
         scores = (unit @ _unit_rows(vectors).T)[row_index]
         product_share = (_clock() - began) / len(texts)
@@ -1297,7 +1257,7 @@ def search_paragraphs(
     def predicted_embed(queries: list[str]) -> float | None:
         """The embed cost series' prediction for embedding `queries` as one
         batch (S108): `o + r x (queries x longest query's tokens)`."""
-        fit = _embed_cost.fit(embedder_model_id)
+        fit = _embed_cost.fit(store, embedder_model_id)
         sizes = None if tokens_of is None else [tokens_of.get(q) for q in queries]
         if fit is None or sizes is None or None in sizes:
             return None
@@ -1305,7 +1265,7 @@ def search_paragraphs(
 
     try:
         count = len(paragraphs)
-        scan_time = _scan_time.average()
+        scan_time = _scan_time.mean(store, "")
         whole = predicted_embed(paragraphs) if count > 1 else None
         if count == 1:
             queries = list(paragraphs)
@@ -1388,8 +1348,7 @@ def search_paragraphs(
                 continue
             in_lock = sizes[qi].seconds
             samples[qi] += in_lock if in_lock is not None else _clock() - began
-    for sample in samples:
-        _scan_time.record(sample)
+    _scan_time.record_many(store, "", [(1, sample) for sample in samples])
 
     # The rerank budget (S46, S61, S108; plan P-28): the budget minus `T_m`,
     # the embed cost series' prediction for the queries embedded, and every
@@ -1402,7 +1361,7 @@ def search_paragraphs(
     embed_term = None if None in predictions else sum(predictions)
     if embed_term is None:
         embed_term = sum(embed_seconds)
-    spent = overhead + embed_term + len(queries) * (_scan_time.average() or 0.0)
+    spent = overhead + embed_term + len(queries) * (_scan_time.mean(store, "") or 0.0)
     rerank_budget = max(0.0, budget - spent)
     share = rerank_budget / len(queries)
 

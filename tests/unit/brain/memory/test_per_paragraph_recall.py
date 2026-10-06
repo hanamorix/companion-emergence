@@ -413,10 +413,10 @@ def test_one_paragraph_pays_its_embed_scan_and_pair_size_time_out_of_the_budget(
     assert call["budget_seconds"] == pytest.approx(3.125)
     assert result.rerank_budget == pytest.approx(3.125)
     assert result.budget == pytest.approx(4.0)
-    assert sr._message_overhead.average() == pytest.approx(0.25)
-    assert sr._scan_time.average() == pytest.approx(0.125)
+    assert sr._message_overhead.mean(store, "") == pytest.approx(0.25)
+    assert sr._scan_time.mean(store, "") == pytest.approx(0.125)
     text = "kite over the harbour"
-    assert sr._embed_cost.fit(_EMBEDDER_ID).predict(len(text)) == pytest.approx(0.5)
+    assert sr._embed_cost.fit(store, _EMBEDDER_ID).predict(len(text)) == pytest.approx(0.5)
 
 
 def test_the_rerank_budget_uses_the_running_averages_not_this_messages_elapsed_time(
@@ -484,10 +484,10 @@ def test_paragraphs_that_do_not_fit_are_searched_as_one_whole_message_query(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _budget(monkeypatch, 4.0)
-    sr._embed_cost.record(_EMBEDDER_ID, 100, 0.0)  # warm, embedding costs nothing
-    sr._scan_time.record(3.0)  # 3 x 3 s > 4 s
     embedder = _AxisEmbedder({_P1: 0, _P2: 1, _P3: 2})
     store = MemoryStore(tmp_path / "memories.db")
+    sr._embed_cost.record(store, _EMBEDDER_ID, 100, 0.0)  # warm, embedding costs nothing
+    sr._scan_time.record(store, "", 1, 3.0)  # 3 x 3 s > 4 s
     _install(monkeypatch, embedder)
     _mem(store, "a memory of the whole message", {_OTHER: 0.9})
     _cosine_floor(store, 0.5)
@@ -543,10 +543,12 @@ def test_the_first_message_rest_query_is_sized_and_its_probe_is_scan_time(
     result = run_semantic_recall(store, tmp_path, _THREE)
 
     assert result is not None and [o.query for o in result.paragraphs] == [_P1, _REST]
-    state = sr._embed_cost.state(_EMBEDDER_ID)
+    state = sr._embed_cost.state(store, _EMBEDDER_ID)
     assert state.sums.n == 2 and state.sums.sum_x == len(_P1) + len(_REST)
     assert state.sums.sum_y == pytest.approx(4.0)
-    assert sr._scan_time.sums().seconds == pytest.approx(0.05), "the rest probe is the rest query's scan time"
+    assert sr._scan_time.state(store, "").sums.sum_y == pytest.approx(0.05), (
+        "the rest probe is the rest query's scan time"
+    )
 
 
 def test_a_first_message_that_does_not_fit_is_scored_as_its_first_paragraph_and_the_rest(
@@ -1230,29 +1232,6 @@ def test_a_reader_keeps_its_snapshot_across_a_put_and_evict_and_the_next_reader_
     assert matrix.stacked()[0] == ("a",), "an evict alone also drops the cached stack"
 
 
-def test_a_concurrent_running_time_update_is_never_lost(monkeypatch: pytest.MonkeyPatch) -> None:
-    """CONC-1 for `T_p` / `T_m`: a second update injected between the read and
-    the write of an update is counted too."""
-    running = sr._RunningTime()
-    other: list[threading.Thread] = []
-
-    def _hook() -> None:
-        monkeypatch.setattr(sr, "_time_update_hook", None)
-        t = threading.Thread(target=running.record, args=(2.0,))
-        t.start()
-        t.join(timeout=0.3)
-        other.append(t)
-
-    monkeypatch.setattr(sr, "_time_update_hook", _hook)
-    running.record(1.0)
-    other[0].join(timeout=5)
-
-    sums = running.sums()
-    assert sums.samples == 2
-    assert sums.seconds == pytest.approx(3.0)
-    assert running.average() == pytest.approx(1.5)
-
-
 def test_each_cosine_path_paragraphs_best_heads_the_group_before_other_cosine_genuine_results() -> None:
     """C8b: A's second result (0.85) outscores B's best (0.7), yet B's best
     sits at the head of the cosine-path genuine group with A's best."""
@@ -1355,7 +1334,7 @@ def test_the_paragraph_time_includes_the_scan_and_the_cut(
     result = run_semantic_recall(store, tmp_path, "kite over the harbour")
 
     assert result is not None
-    assert sr._scan_time.average() == pytest.approx(0.0625 + 0.03125 + 0.125)
+    assert sr._scan_time.mean(store, "") == pytest.approx(0.0625 + 0.03125 + 0.125)
     assert result.rerank_budget == pytest.approx(4.0 - 0.25 - 0.5 - 0.21875)
 
 
@@ -1399,7 +1378,7 @@ def test_the_matrix_first_build_is_kept_out_of_the_message_overhead(
 
     run_semantic_recall(store, tmp_path, "kite over the harbour")
 
-    assert sr._message_overhead.average() == pytest.approx(0.25)
+    assert sr._message_overhead.mean(store, "") == pytest.approx(0.25)
 
 
 def test_a_reranker_that_cannot_load_is_tried_once_per_message(
@@ -1519,11 +1498,11 @@ def test_the_fit_decision_counts_the_message_overhead(
     clock = _Clock()
     monkeypatch.setattr(sr, "_clock", clock)
     _budget(monkeypatch, 3.5)
-    sr._embed_cost.record(_EMBEDDER_ID, 100, 0.0)
-    sr._scan_time.record(1.0)
-    sr._message_overhead.record(0.75)
     embedder = _AxisEmbedder({_P1: 0, _P2: 1, _P3: 2})
     store = MemoryStore(tmp_path / "memories.db")
+    sr._embed_cost.record(store, _EMBEDDER_ID, 100, 0.0)
+    sr._scan_time.record(store, "", 1, 1.0)
+    sr._message_overhead.record(store, "", 1, 0.75)
     _install(monkeypatch, embedder)
     _slow_store_reads(monkeypatch, clock, 0.75)
     _mem(store, "a memory", {_OTHER: 0.9})
