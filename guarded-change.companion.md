@@ -68,42 +68,81 @@ metrics:                  # standing regression metrics (source: the JSONL logs)
   - name: cache_read_ratio
     source: >
       Per-run cache-break check over chat_usage.jsonl rows (call_type==chat; one run = one slice
-      of rows in log order). The FIRST chat row writes the fixed part of the prompt fresh, so its
-      cache_creation_input_tokens is F. Every LATER row should read that part from cache; a later
-      row whose cache_creation_input_tokens * 100 >= F * (100 - T) is a cache break, T = the
-      regression_threshold below. Value = max later-row creation / F. Each run is measured against
-      its own first row, so no OLD/NEW baseline, replay workload or call count is needed and a
-      change that shrinks the cached prompt cannot trip it. Run `python
-      scripts/cache_replay_workload.py --cache-break-check <chat_usage.jsonl> [--from-row N]`
-      (exit 0 PASS / 1 FAIL / 2 UNMEASURED), or read the `cache_break_check` key / stderr line
-      of a replay run (a replay starts with a fixed warm-up turn unless --no-warmup).
-    direction: lower_is_better
-    regression_threshold: "-10%"
+      of rows in log order, e.g. one replay). The run's first chat row (the cold write) is never
+      judged. Only single-call rows (num_turns == 1) are judged; every later such row's
+      cache_read_input_tokens is compared with S, the highest read among the earlier judged rows
+      (running max). A judged row is a cache break if its read is 0 or below S (T below is 0:
+      read * 100 < S * (100 - T)). The run needs at least 2 judged rows (one establishes S, one is
+      compared against it), else the verdict is UNMEASURED. Multi-call rows (num_turns != 1, tool
+      turns) are not judged and impose no rule: a row's usage is the SUM over the turn's API calls,
+      so its read is not comparable, and a tool-using message's first call has the same cached
+      prefix (system prompt and tool block) as a plain message's, the model decides on tools only
+      after that call, so a prefix break shows on plain rows too (micro-acks are exempt from the
+      monologue call only). Each run is measured against its own reads, so no OLD/NEW baseline,
+      call count or logging change is needed and a change that shrinks the cached prefix cannot
+      trip it. Run `uv run python scripts/cache_replay_workload.py --cache-break-check
+      <chat_usage.jsonl> [--from-row N]` (exit 0 PASS / 1 FAIL / 2 UNMEASURED or any error), or
+      run a replay (same exit codes after the metrics JSON is written; the stderr line
+      `cache_break_check: <STATUS>` and the `cache_break_check` key in the JSON carry the verdict;
+      a replay sends a warm-up turn, one plain micro-ack, the content turns and one trailing plain
+      micro-ack). The result names the judged and multi-call rows; a FAIL names each break row with
+      its read, the S it was compared against, share of S, ts and the gap to the previous row.
+    direction: stable
+    regression_threshold: "0%"
     gating: true
-    # Reworked in #339. The old sum(read)/sum(creation) ratio read a smaller cached prefix as a
-    # break (#332: ratio -26%/-18%/-2% while cost fell 23-47%), was made advisory in #333/#334,
-    # and is replaced by the per-run check above; gating again.
-    # - "-10%" is NOT a baseline delta here: read it as "a later row re-writes within 10% of F".
-    # - The first row is valid only if it has int token fields and creation > 0, num_turns == 1,
-    #   and it read less than T% of what it wrote (a cold write). Otherwise the verdict is
-    #   UNMEASURED (exit 2) = an unverified gating criterion: stop for the human, never a pass.
-    #   The replay's warm-up turn is expected to make the first row a single-call cold write on
-    #   both the text path and the --with-tools path (not verified against the real CLI; if the
-    #   warm-up row still ran tools the verdict is UNMEASURED). At least 2 chat rows are needed.
-    #   A back-to-back re-run inside the cache lifetime (the CLI writes 1h entries) starts warm and
-    #   is UNMEASURED. The cache prefix is tools, then system, then messages: an arm whose TOOLS
-    #   block changed (the #332 case) starts cold because the prefix differs from the start; a
-    #   system-only change keeps the tools block cached, so its first row may read it and be
-    #   UNMEASURED. Run the check on a cold arm, or on the first run of the hour.
-    #   The warm-up is one extra chat row in a replay's means/series: use the same --no-warmup
-    #   setting on both arms of a --compare.
-    # - Limits: it detects a re-write of >= (100-T)% of F. A partial break (e.g. only the system
-    #   block behind an intact tools block) re-writes less and is left to
-    #   cache_creation_per_chat_call and cost_per_chat_call_usd, which still gate. F is whatever
-    #   the CLI wrote to cache on the first call. A later row that legitimately writes that much
-    #   (compaction, a huge file read, an idle gap beyond the cache lifetime) is reported as a
-    #   break, naming the row, its share of F, its ts and the gap to the previous row. A later row
-    #   on a different model than the first is not comparable (UNMEASURED unless another row breaks).
+    # Reworked in #339/#340. The old sum(read)/sum(creation) ratio read a smaller cached prefix as a
+    # break (#332: ratio -26%/-18%/-2% while cost fell 23-47%) and was made advisory in #333/#334.
+    # The first per-run version (a later row re-writing within 10% of the first row's creation) was
+    # shown by the #340 review to FAIL healthy runs: a healthy later row re-writes the volatile tail
+    # and the new exchange, which can be as large as the first row's whole write. A real healthy
+    # 8-turn replay (2026-10-06) FAILED it on 7 later rows. This version compares READS only.
+    # - Meaning of the fields: `direction: stable` and `regression_threshold: "0%"` mean "a judged
+    #   row's read stays at or above the run's own stable read S, with 0% tolerance". They are not
+    #   an OLD->NEW delta (the old `lower_is_better` / "-10%" no longer applies to this metric).
+    # - Basis of T = 0 (a measurement, 2026-10-06, throwaway sandbox persona, haiku, claude CLI
+    #   2.1.219, tools path, 8 turns + warm-up): healthy first-call reads did not vary at all. Six
+    #   exact first-call reads were all 6449 tokens (three single-call rows, three two-call rows
+    #   whose first call is total read minus last-call read), two more inferred, two not derivable.
+    #   (The log held two more chat rows than the nine replay turns, of unidentified origin; two of
+    #   the three single-call rows are among the last three rows, and read 6449 as well.)
+    #   Hana's review reports a constant 15,476 read on real rows as a second datum. So zero wobble
+    #   is OBSERVED, not bounded: the sample is one run, one persona, one model, the tools path only
+    #   (the text path is unmeasured), and six agreeing reads cannot exclude an occasional
+    #   variation. The consequence is stated: with T = 0 any plain row reading below the run's
+    #   earlier highest read FAILs a gating run, a transient miss included. The FAIL names the
+    #   row, read, S, share, ts and gap; if a healthy run ever fails by a small margin, re-measure
+    #   and set T here (the check reads it from this entry).
+    # - Basis of S = running max: the cache demonstrably served that read earlier in the same run,
+    #   so a later plain row reading less lost something. Failure modes: one outlier (higher) read
+    #   makes the following healthy rows FAIL, and a history-window slide, compaction or an idle gap
+    #   beyond the cache lifetime reads as a break (the report carries ts and gap).
+    # - Basis of the minimum of 2 judged rows (derived, not tuned): a single judged row can only
+    #   establish S; a comparison needs a second row.
+    # - UNMEASURED (exit 2) = an unverified gating criterion: stop for the human, never a pass.
+    #   Causes: fewer than 2 chat rows or fewer than 2 judged rows (e.g. most tools-path rows were
+    #   multi-call); a judged-candidate row with no int read, with creation 0 and read 0 (no cache
+    #   activity at all), or on a different model than the run's (the model of the first usable
+    #   single-call later row); a threshold outside [0, 100); an unreadable config; a log line the
+    #   shared jsonl reader had to skip (never judged from the remaining rows).
+    # - Replay: after the warm-up the replay sends one plain micro-ack and, after the content
+    #   turns, one more, so a break that begins during the content turns and persists is seen by a
+    #   plain row (a transient miss that has recovered by the trailing row is not seen). The model
+    #   still decides about tools, so these may come back multi-call (UNMEASURED: re-run).
+    #   --no-warmup without --no-plain-turns makes the leading plain turn the never-judged first
+    #   row, which leaves one judgeable row on the tools path (UNMEASURED): use the two flags
+    #   together. Each arm of an A/B replay exits with its own verdict code (an OLD arm may
+    #   legitimately exit 1 or 2; the metrics JSON is written first). The warm-up and the plain turns are extra chat rows in a replay's means/series:
+    #   use the same --no-warmup / --no-plain-turns settings on both arms of a --compare.
+    # - Limits: (1) a persistent PARTIAL break (e.g. the system block churning behind an intact
+    #   tools block) leaves a stable prefix that S then follows, so it is not caught here; PASS does
+    #   not certify its absence, cache_creation_per_chat_call and cost_per_chat_call_usd still gate
+    #   it. (2) The first judged row only establishes S (it is checked for read > 0). (3) A slice
+    #   must be ONE run: a prompt or tools change, an idle gap or a window slide inside it reads as
+    #   a break. (4) num_turns == 1 meaning one API call is an assumption (measured n=1 rows had
+    #   total == last-call numbers; the fixture's num_turns 4 is not its 3 calls, so only == 1 is
+    #   used). (5) A break confined to tool-using rows, or after the last plain row, is not seen
+    #   directly (basis above). Why gate it: a baseline-free within-run detector of a read collapse,
+    #   complementary to the creation and cost metrics.
 
   # --- BLOCKED: not measurable from current logs; needs stage-2 instrumentation ---
   # tool_calls_per_request and file_reread_per_request — BLOCKED. The grouping key `request_id`
@@ -145,9 +184,11 @@ metrics:                  # standing regression metrics (source: the JSONL logs)
   which biases the comparison). Record each arm's exact launch command. If Sonnet's safety
   classifier flags the scripted conversation (it did on both builds, 2026-09-30), run BOTH arms
   on Haiku via `get_provider(..., model_override="haiku")`: the token metrics hold across
-  models; cost is then Haiku prices. The replay now starts with a fixed warm-up turn (one extra
-  chat row in the means and series): run both arms with the same setting, `--no-warmup` on both
-  when the OLD tree's script predates it; `--compare` warns when they differ.
+  models; cost is then Haiku prices. The replay now also sends a fixed warm-up turn, one plain
+  micro-ack and, after the content turns, one more (extra chat rows in the means and series; they
+  give the cache_read_ratio check the single-call rows it judges): run both arms with the same
+  settings, `--no-warmup --no-plain-turns` on both when the OLD tree's script predates them;
+  `--compare` warns on stderr when they differ.
 - **These metrics exist because the v0.0.38 file-tool token-cost regression was only catchable
   via `tool_invocations.log.jsonl`.** Any change touching an un-instrumented area must add
   logging in stage 2 ("instrument before you build").

@@ -3,7 +3,7 @@
 The standing project metrics are aggregates over "whatever turns happened to
 run", so they cannot isolate this change's own contribution (a false-regression
 risk — see guarded-change config Notes). This script is the *comparable
-workload* the plan requires: a fixed warm-up turn plus a deterministic sequence of N≥6 chat turns fired
+workload* the plan requires: a fixed warm-up turn, two plain micro-acks and a deterministic sequence of N≥6 chat turns fired
 in ONE session, spaced well under the 5-minute cache TTL, runnable identically
 against the OLD build (clone pre-change) and the NEW build. Diffing the two runs
 is the C8/C9 A/B; the per-run report also evaluates C1 from cache_debug.jsonl.
@@ -37,27 +37,40 @@ persona. The scratch persona is seeded with deterministic memory fixtures (unles
 
 Cache-break check (#339)
 ------------------------
-``check_cache_break`` is a pure, per-run check over ``chat_usage.jsonl`` rows (no model call, no call
-counts, no OLD-vs-NEW comparison). The FIRST chat row of a run writes the fixed part of the prompt
-fresh: its ``cache_creation_input_tokens`` is F. Every later row should read that part from cache; a
-later row whose ``cache_creation_input_tokens`` reaches F within the config's ``regression_threshold``
-(creation * 100 >= F * (100 - T)) is a cache break. A smaller prompt cannot trip it, because each run
-is measured against its own first row. Verdicts: PASS, FAIL, UNMEASURED (never a pass).
-
-Every replay therefore starts with a fixed tool-free WARM-UP turn (``WARMUP_PROMPT``, "ok", a
-micro-ack the monologue directive exempts; "tool-free" = the prompt elicits no tool call, tools are
-still offered on the tools path like on every other turn) on BOTH the text path and the
-``--with-tools`` path, so the first row is expected to be a single-API-call cold write and F clean
-(if it still ran tools the verdict is UNMEASURED). The warm-up is one EXTRA chat row in the run's
-means and series (``chat_rows_observed`` = turns + 1): use the same setting (``--no-warmup`` on both
-or neither) for the two arms of a ``--compare``, which warns when they differ. The first row is valid only if it has int
-token fields, creation > 0, ``num_turns == 1`` and it read less than T% of what it wrote (a warm
-row, e.g. a back-to-back re-run, is UNMEASURED). The replay prints ``cache_break_check: <STATUS>``
-on stderr and stores the result under ``cache_break_check`` in the metrics JSON; ``--cache-break-check
-USAGE.jsonl`` runs it on any log slice (exit 0 PASS / 1 FAIL / 2 UNMEASURED).
-Limits: it detects a break that re-writes >= (100 - T)% of F; a partial break (e.g. only the system
-block behind an intact tools block) is left to the cache_creation_per_chat_call and
-cost_per_chat_call_usd metrics. See guarded-change.companion.md, metric cache_read_ratio.
+``check_cache_break`` is a pure, per-run check over ``chat_usage.jsonl`` rows (no model call, no
+OLD-vs-NEW comparison). A cache break is a later PLAIN chat row whose ``cache_read_input_tokens`` falls
+below the run's stable read S (threshold T from the config, 0 today: read 0 or any read below S).
+Rules (see ``check_cache_break`` and guarded-change.companion.md, metric cache_read_ratio):
+- The first chat row (the cold write) is never judged. Only single-call rows (``num_turns == 1``)
+  are judged: a row's usage is the SUM over the turn's API calls, so a multi-call (tool) row's read is
+  not comparable. Multi-call rows are not judged and impose no rule: a tool-using message's first call
+  has the same cached prefix (system prompt and tool block) as a plain message's, the model decides on
+  tools only after that call, so a prefix break shows on plain rows too.
+- S = the highest read among earlier judged rows (running max). A judged row is a break if its read is
+  0 or below S. The run needs at least ``MIN_JUDGED_ROWS`` (2) judged rows (one establishes S, one is
+  compared against it), else UNMEASURED. Verdicts: PASS, FAIL, UNMEASURED (never a pass).
+Every replay therefore sends the fixed turns: a WARM-UP (``WARMUP_PROMPT``, the cold first row, never
+judged), one leading plain micro-ack (``PLAIN_LEAD_PROMPT``, establishes S), the content turns, and one
+trailing plain micro-ack (``PLAIN_TRAIL_PROMPT``) so a break that begins during the content turns and
+persists is seen by a plain row (a transient miss that has recovered by the trailing row is not seen).
+``--no-warmup`` without ``--no-plain-turns`` makes the leading micro-ack the never-judged first row, which
+leaves one judgeable row on the tools path (UNMEASURED): use the two flags together. Micro-acks are exempt from the record_monologue directive
+(brain/chat/monologue_prompts.py), which is what keeps them plain; the model still decides about tools,
+so if fewer than 2 plain rows result the verdict is UNMEASURED. The warm-up and plain turns are EXTRA
+chat rows in a run's means and series (``chat_rows_observed`` = turns + 3 when every turn logs exactly one
+row; a turn can log more, e.g. a capability-recruit re-run): use the same settings
+(``--no-warmup`` / ``--no-plain-turns`` on both or neither) for the two arms of a ``--compare``, which
+warns when they differ. The replay prints ``cache_break_check: <STATUS>`` on stderr, stores the result
+under ``cache_break_check`` in the metrics JSON, and exits 0 PASS / 1 FAIL / 2 UNMEASURED after the
+JSON is written, for each arm of an A/B (an OLD arm may legitimately exit 1 or 2); pre-run argument errors
+exit 1, argparse usage errors and the live-persona refusal exit 2, a crash exits 1: the stderr
+``cache_break_check:`` line is what identifies a verdict. ``--cache-break-check USAGE.jsonl``
+runs the check on any log slice with the same codes (any error exits 2); it needs the project
+environment (``uv run python scripts/cache_replay_workload.py ...``) because it reads rows through
+brain.health.jsonl_reader and the threshold through PyYAML.
+Limits: a persistent PARTIAL break leaves a stable prefix (S is built from reads) and is left to the
+cache_creation_per_chat_call and cost_per_chat_call_usd metrics; the first judged row only establishes S;
+a slice must be one run (a prompt change, TTL gap or history-window slide inside it reads as a break).
 
 Usage
 -----
@@ -95,8 +108,18 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = REPO_ROOT / "guarded-change.companion.md"
 
 # The fixed first turn of every run (see "Cache-break check" above): a micro-ack, exempt from the
-# record_monologue directive (brain/chat/monologue_prompts.py), so the row is a single API call.
+# record_monologue directive (brain/chat/monologue_prompts.py), so the row is expected to be a single
+# API call. It is the run's cold write and is never judged.
 WARMUP_PROMPT = "ok"
+
+# Plain micro-acks (same exemption) that give the check single-call rows to judge: one right after the
+# warm-up (establishes S) and one after the content turns (sees a break that began during them).
+PLAIN_LEAD_PROMPT = "hi"
+PLAIN_TRAIL_PROMPT = "thanks"
+
+# Minimum judged rows for a verdict. Derived, not tuned: one judged row can only establish S, a
+# comparison needs a second one.
+MIN_JUDGED_ROWS = 2
 
 # Deterministic, content-bearing prompts (≥6). Each is substantive enough to
 # exercise recall / emotion / monologue blocks, so the volatile tail is non-
@@ -175,18 +198,10 @@ def _seed_history_buffer(
 
 
 def _read_jsonl(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    rows: list[dict] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rows.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return rows
+    """Lenient read through the shared streaming reader (corrupt lines are skipped with a warning)."""
+    from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
+
+    return list(iter_jsonl_skipping_corrupt(path))
 
 
 # Deterministic memory fixtures, content chosen to MATCH tokens in REPLAY_PROMPTS
@@ -264,12 +279,15 @@ def run_replay(
     history_file: Path | None = None,
     history_msgs: int | None = None,
     warmup: bool = True,
+    plain_turns: bool = True,
 ) -> tuple[dict, list[dict]]:
     """Fire `turns` deterministic chat turns in one session; collect metrics + replies.
 
-    With `warmup` (default) the run FIRST sends the fixed tool-free `WARMUP_PROMPT` as turn 0, on
-    the same path as the other turns (text or tools), so the run's first chat row is
-    expected to be a single-API-call cold write for `check_cache_break`. It is extra to `turns`.
+    With `warmup` (default) the run FIRST sends the fixed `WARMUP_PROMPT` as turn 0, on the same path
+    as the other turns (text or tools): the run's cold write, never judged by `check_cache_break`.
+    With `plain_turns` (default) it then sends one plain micro-ack (`PLAIN_LEAD_PROMPT`, reply id
+    "p1") before the content turns and one (`PLAIN_TRAIL_PROMPT`, reply id "p2") after them, which
+    give the check single-call rows to judge. All of these are extra to `turns`.
 
     NELL_CACHE_DEBUG is set before the engine is imported so the new build emits
     cache_debug.jsonl. Imports are local so the env var is in place first. Returns
@@ -304,10 +322,16 @@ def run_replay(
         print(f"# seeded {n} history msgs from {history_file.name} (window caps replay to 80)", file=sys.stderr)
 
     prompts = (REPLAY_PROMPTS * ((turns // len(REPLAY_PROMPTS)) + 1))[:turns]
-    sequence = ([(0, WARMUP_PROMPT)] if warmup else []) + list(enumerate(prompts, 1))
+    sequence = (
+        ([(0, WARMUP_PROMPT)] if warmup else [])
+        + ([("p1", PLAIN_LEAD_PROMPT)] if plain_turns else [])
+        + list(enumerate(prompts, 1))
+        + ([("p2", PLAIN_TRAIL_PROMPT)] if plain_turns else [])
+    )
     replies: list[dict] = []
     print(
-        f"# cache replay — {turns} turns{' + warm-up' if warmup else ''}, session={session.session_id}",
+        f"# cache replay — {turns} turns{' + warm-up' if warmup else ''}{' + 2 plain turns' if plain_turns else ''}, "
+        f"session={session.session_id}",
         file=sys.stderr,
     )
     try:
@@ -323,7 +347,7 @@ def run_replay(
             )
             dt = time.monotonic() - t0
             replies.append({"turn": i, "prompt": prompt, "reply": result.content})
-            label = "warm-up" if i == 0 else f"{i}/{turns}"
+            label = "warm-up" if i == 0 else (f"plain {i}" if isinstance(i, str) else f"{i}/{turns}")
             print(
                 f"[{label}] {dt:.1f}s — reply {len(result.content)} chars",
                 file=sys.stderr,
@@ -338,8 +362,14 @@ def run_replay(
     debug_rows = [
         r for r in _read_jsonl(debug_path)[debug_before:] if r.get("call_type") in ("chat", "chat_stream")
     ]
-    summary = _summarise(usage_rows, debug_rows, turns=turns)
+    rows_error = None
+    try:
+        _read_rows_fail_closed(usage_path)  # the verdict must not rest on rows the shared reader skipped
+    except ValueError as exc:
+        rows_error = str(exc)
+    summary = _summarise(usage_rows, debug_rows, turns=turns, rows_error=rows_error)
     summary["warmup_turn"] = warmup
+    summary["plain_turns"] = plain_turns
     print(format_cache_break_line(summary["cache_break_check"]), file=sys.stderr)
     return summary, replies
 
@@ -352,10 +382,12 @@ def _unmeasured(reason: str, **extra) -> dict:
     out = {
         "status": "UNMEASURED",
         "reason": reason,
-        "fixed_prompt_tokens": None,
+        "stable_read_tokens": None,
         "threshold_pct": None,
         "rows_checked": 0,
-        "max_share_of_F": None,
+        "multicall_rows": [],
+        "min_judged_rows": MIN_JUDGED_ROWS,
+        "min_share_of_S": None,
         "breaks": [],
     }
     out.update(extra)
@@ -375,102 +407,146 @@ def check_cache_break(rows: list[dict], *, threshold_pct: float) -> dict:
     """Per-run cache-break check (#339). See the module docstring ("Cache-break check").
 
     ``rows`` is one run's usage rows in log order; only ``call_type == "chat"`` rows count. The first
-    chat row is the reference (strict-first: a later row is warm by construction): F is its
-    ``cache_creation_input_tokens``. A later row breaks when ``creation * 100 >= F * (100 - T)``,
-    T = ``threshold_pct`` (from the config; no constant here). A break wins over a malformed row.
-    Returns {status: PASS|FAIL|UNMEASURED, reason, fixed_prompt_tokens, threshold_pct,
-    rows_checked, max_share_of_F, breaks: [{row, creation, share_of_F, ts, gap_s}]}.
+    chat row (the cold write) is never judged and is not a reference. Later rows are walked in order:
+    - ``num_turns`` not an int equal to 1 (absent, bool, 2+): a multi-call row. Its read is a SUM over the
+      turn's API calls (the JSON result's ``usage`` sums them; ``iterations`` keeps only the last call),
+      so it is not judged and imposes no rule (basis: a tool-using message's first call has the same
+      cached prefix as a plain message's, the model decides on tools only after that call, so a prefix
+      break shows on plain rows too). Listed in ``multicall_rows``.
+    - unusable (skipped, makes the verdict UNMEASURED unless a break exists): ``cache_read_input_tokens``
+      not an int; creation 0 AND read 0 (no cache activity at all); a model that differs from the run's
+      model (the model of the first usable single-call later row; a missing model is comparable).
+    - judged (single-call, usable): a break if read == 0, or if S is defined and
+      read*100 < S*(100-T), T = ``threshold_pct`` from the config (0 today: any read below S). S is the
+      highest read among earlier judged rows that were not breaks. A break does not change S.
+    Verdict: any break FAIL; else any unusable row UNMEASURED; else fewer than MIN_JUDGED_ROWS judged
+    rows UNMEASURED; else PASS. Fewer than 2 chat rows or a T outside [0, 100): UNMEASURED.
+    Returns {status, reason, stable_read_tokens, threshold_pct, rows_checked (= judged), multicall_rows,
+    min_judged_rows, min_share_of_S, breaks: [{row, read, reference_read, share_of_S, creation,
+    num_turns, ts, gap_s}]}; reference_read / share_of_S are None for a zero read while S is undefined.
     """
-    if isinstance(threshold_pct, bool) or not isinstance(threshold_pct, (int, float)) or not (0 < threshold_pct < 100):
-        return _unmeasured(f"threshold {threshold_pct!r} is not a percentage in (0, 100)")
+    if isinstance(threshold_pct, bool) or not isinstance(threshold_pct, (int, float)) or not (0 <= threshold_pct < 100):
+        return _unmeasured(f"threshold {threshold_pct!r} is not a percentage in [0, 100)")
     t = float(threshold_pct)
     chat = [r for r in rows if isinstance(r, dict) and r.get("call_type") == "chat"]
     if len(chat) < 2:
-        return _unmeasured(f"V1: need >= 2 chat rows, got {len(chat)}", threshold_pct=t)
-    first = chat[0]
-    inp = first.get("input_tokens")
-    cre = first.get("cache_creation_input_tokens")
-    rd = first.get("cache_read_input_tokens")
-    if not (_is_int(inp) and _is_int(cre) and _is_int(rd)) or cre <= 0:
-        return _unmeasured(
-            "V2: first chat row needs int input/creation/read tokens and creation > 0", threshold_pct=t
-        )
-    if not (_is_int(first.get("num_turns")) and first["num_turns"] == 1):
-        return _unmeasured(
-            f"V3: first chat row has num_turns={first.get('num_turns')!r}, not 1; its creation is not a "
-            "clean fixed-prompt write (run a tool-free warm-up turn first)",
-            threshold_pct=t,
-        )
-    if rd * 100 >= cre * t:
-        return _unmeasured(
-            f"V4: first chat row read {rd} tokens against {cre} written (>= {t:g}% of it): it was not a "
-            "cold write, so F is unknown (the fixed prompt was already cached)",
-            threshold_pct=t,
-        )
-    breaks: list[dict] = []
+        return _unmeasured(f"need >= 2 chat rows, got {len(chat)}", threshold_pct=t)
+    stable: int | None = None
+    run_model = None
+    judged = 0
+    min_share: float | None = None
+    multicall: list[int] = []
     unusable: list[str] = []
-    max_share = 0.0
-    for i in range(1, len(chat)):
-        cur = chat[i]
-        c = cur.get("cache_creation_input_tokens")
-        if not _is_int(c):
-            unusable.append(f"row {i + 1}: cache_creation_input_tokens missing or not an int")
+    breaks: list[dict] = []
+    for idx in range(1, len(chat)):
+        n, cur = idx + 1, chat[idx]
+        if not (_is_int(cur.get("num_turns")) and cur["num_turns"] == 1):
+            multicall.append(n)
             continue
-        m0, m1 = first.get("model"), cur.get("model")
-        if m0 is not None and m1 is not None and m0 != m1:
-            unusable.append(f"row {i + 1}: model {m1!r} differs from the first row's {m0!r} (not comparable)")
+        rd, cre = cur.get("cache_read_input_tokens"), cur.get("cache_creation_input_tokens")
+        if not _is_int(rd):
+            unusable.append(f"row {n}: cache_read_input_tokens missing or not an int")
             continue
-        max_share = max(max_share, c / cre)
-        if c * 100 >= cre * (100 - t):
+        if rd == 0 and _is_int(cre) and cre == 0:
+            unusable.append(f"row {n}: no cache activity (creation 0 and read 0)")
+            continue
+        model = cur.get("model")
+        if model is not None:
+            if run_model is None:
+                run_model = model
+            elif model != run_model:
+                unusable.append(f"row {n}: model {model!r} differs from the run's {run_model!r} (not comparable)")
+                continue
+        judged += 1
+        if rd == 0 or (stable is not None and rd * 100 < stable * (100 - t)):
             breaks.append(
                 {
-                    "row": i + 1,
-                    "creation": c,
-                    "share_of_F": round(c / cre, 3),
+                    "row": n,
+                    "read": rd,
+                    "reference_read": stable,
+                    "share_of_S": round(rd / stable, 3) if stable else None,
+                    "creation": cre,
+                    "num_turns": 1,
                     "ts": cur.get("ts"),
-                    "gap_s": _gap_s(chat[i - 1], cur),
+                    "gap_s": _gap_s(chat[idx - 1], cur),
                 }
             )
+            continue
+        if stable is not None:
+            share = rd / stable
+            min_share = share if min_share is None else min(min_share, share)
+        stable = rd if stable is None else max(stable, rd)
+    coverage = f"judged {judged} of {len(chat) - 1} later rows; {len(multicall)} multi-call rows not judged"
     common = {
-        "fixed_prompt_tokens": cre,
+        "stable_read_tokens": stable,
         "threshold_pct": t,
-        "rows_checked": len(chat) - 1,
-        "max_share_of_F": round(max_share, 3),
+        "rows_checked": judged,
+        "multicall_rows": multicall,
+        "min_judged_rows": MIN_JUDGED_ROWS,
+        "min_share_of_S": None if min_share is None else round(min_share, 3),
         "breaks": breaks,
     }
     if breaks:
         return {
             "status": "FAIL",
-            "reason": f"{len(breaks)} later chat row(s) re-wrote >= {100 - t:g}% of the first row's "
-            f"fresh cache write (F={cre})",
+            "reason": f"{len(breaks)} judged row(s) broke: "
+            + "; ".join(
+                f"row {b['row']} read {b['read']}"
+                + (f" vs S={b['reference_read']}" if b["reference_read"] is not None else " with no S yet")
+                for b in breaks[:5]
+            )
+            + (f"; +{len(breaks) - 5} more" if len(breaks) > 5 else "")
+            + f" ({coverage})",
             **common,
         }
     if unusable:
-        return {"status": "UNMEASURED", "reason": "; ".join(unusable), **common}
-    return {
-        "status": "PASS",
-        "reason": f"no later chat row re-wrote >= {100 - t:g}% of F={cre} (max share {common['max_share_of_F']})",
-        **common,
-    }
+        return {"status": "UNMEASURED", "reason": "; ".join(unusable) + f" ({coverage})", **common}
+    if judged < MIN_JUDGED_ROWS:
+        return {
+            "status": "UNMEASURED",
+            "reason": f"need >= {MIN_JUDGED_ROWS} judged single-call rows (one establishes S, one is compared); {coverage}",
+            **common,
+        }
+    return {"status": "PASS", "reason": f"no judged row read below S={stable} ({coverage})", **common}
+
+
+_YAML_FENCE_RE = re.compile(r"^```yaml[ \t]*\n(.*?)^```[ \t]*$", re.M | re.S)
 
 
 def read_regression_threshold(config_path: Path | str | None = None) -> float:
-    """|regression_threshold| of the ``cache_read_ratio`` entry in the project config ("-10%" -> 10.0)."""
+    """|regression_threshold| of the ``cache_read_ratio`` entry in the project config ("0%" -> 0.0).
+
+    Parses the config's ``yaml`` fence(s) with PyYAML (a locked transitive dependency of the project,
+    imported lazily; no pyproject change). Any problem raises ValueError.
+    """
     path = Path(config_path) if config_path else DEFAULT_CONFIG
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        text = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise ValueError(f"cannot read config {path}: {exc}") from exc
-    start = next((i for i, ln in enumerate(lines) if re.match(r"\s*-\s*name:\s*cache_read_ratio\s*$", ln)), None)
-    if start is None:
-        raise ValueError(f"no cache_read_ratio entry in {path}")
-    for ln in lines[start + 1 :]:
-        if re.match(r"\s*-\s*name:", ln):
-            break
-        m = re.match(r'\s*regression_threshold:\s*"?([-+]?\d+(?:\.\d+)?)%"?', ln)
-        if m:
-            return abs(float(m.group(1)))
-    raise ValueError(f"cache_read_ratio entry in {path} has no parsable regression_threshold")
+    try:
+        import yaml
+    except ImportError as exc:  # PyYAML is in every synced environment; a bare interpreter lands here
+        raise ValueError("PyYAML is not importable (run via `uv run python ...`)") from exc
+    fences = _YAML_FENCE_RE.findall(text)
+    if not fences:
+        raise ValueError(f"no ```yaml fence in {path}")
+    for body in fences:
+        try:
+            doc = yaml.safe_load(body)
+        except yaml.YAMLError as exc:
+            raise ValueError(f"yaml fence in {path} does not parse: {exc}") from exc
+        metrics = doc.get("metrics") if isinstance(doc, dict) else None
+        if not isinstance(metrics, list):
+            continue
+        for entry in metrics:
+            if isinstance(entry, dict) and entry.get("name") == "cache_read_ratio":
+                raw = entry.get("regression_threshold")
+                m = re.fullmatch(r"\s*[-+]?(\d+(?:\.\d+)?)%\s*", raw) if isinstance(raw, str) else None
+                if not m:
+                    raise ValueError(f"cache_read_ratio entry in {path}: regression_threshold {raw!r} is not N%")
+                return abs(float(m.group(1)))
+    raise ValueError(f"no cache_read_ratio entry in the yaml fence(s) of {path}")
 
 
 def format_cache_break_line(result: dict) -> str:
@@ -480,24 +556,34 @@ def format_cache_break_line(result: dict) -> str:
 _CACHE_BREAK_EXIT = {"PASS": 0, "FAIL": 1}
 
 
-def _read_jsonl_strict(path: Path) -> list[dict]:
-    """Every non-blank line must be a JSON object. A torn or corrupt line could be the very row
-    that shows a break (or the reference row), so skipping it silently could turn a FAIL into a
-    PASS; the check refuses instead (exit 2)."""
-    rows: list[dict] = []
-    for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        if not line.strip():
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise ValueError(
-                f"{path}: line {n} is not valid JSON ({exc.msg}); refusing to skip it "
-                "(slice the file past it, e.g. tail -n +K, or repair the line)"
-            ) from exc
-        if not isinstance(obj, dict):
-            raise ValueError(f"{path}: line {n} is not a JSON object; refusing to skip it")
-        rows.append(obj)
+def _exit_code_for(result: object) -> int:
+    """0 PASS / 1 FAIL / 2 UNMEASURED, a missing or unknown status, or anything else."""
+    status = result.get("status") if isinstance(result, dict) else None
+    return _CACHE_BREAK_EXIT.get(status, 2)
+
+
+def _read_rows_fail_closed(path: Path) -> list[dict]:
+    """Rows from the shared streaming reader, refusing to continue if it skipped any line.
+
+    A torn or corrupt line could be the very row that shows a break, so a verdict from the surviving
+    rows could turn a FAIL into a PASS. The shared reader skips such lines with a warning; this wrapper
+    cross-checks the number of rows it returned against the file's non-blank lines (same line
+    iteration), which does not depend on how logging is configured.
+    """
+    from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
+
+    if not path.exists():  # a provider that never logs usage (e.g. --provider fake): no rows, not an error
+        return []
+    with open(path, encoding="utf-8") as fh:
+        non_blank = sum(1 for raw in fh if raw.rstrip("\r\n").strip())
+    rows = list(iter_jsonl_skipping_corrupt(path))
+    skipped = non_blank - len(rows)
+    if skipped > 0:
+        raise ValueError(
+            f"{path}: the shared jsonl reader skipped {skipped} corrupt or non-object line(s) (its warnings, when logging "
+            "is enabled, name them); refusing to judge from the remaining rows. Slice the file past them (e.g. tail -n +K), or "
+            "repair them; corruption left over from an earlier run outside the slice needs slicing past it too"
+        )
     return rows
 
 
@@ -509,20 +595,20 @@ def cache_break_cli(path: Path, from_row: int, threshold_override: float | None)
         if not path.exists():
             raise ValueError(f"no such file: {path}")
         threshold = threshold_override if threshold_override is not None else read_regression_threshold()
-        chat = [r for r in _read_jsonl_strict(path) if r.get("call_type") == "chat"]
+        chat = [r for r in _read_rows_fail_closed(path) if r.get("call_type") == "chat"]
         result = check_cache_break(chat[from_row - 1 :], threshold_pct=threshold)
     except Exception as exc:  # noqa: BLE001 - an error must be exit 2, never exit 1 (= FAIL)
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     print(json.dumps(result, indent=2))
-    return _CACHE_BREAK_EXIT.get(result["status"], 2)
+    return _exit_code_for(result)
 
 
 def _mean(xs: list[float]) -> float:
     return sum(xs) / len(xs) if xs else 0.0
 
 
-def _summarise(usage_rows: list[dict], debug_rows: list[dict], *, turns: int) -> dict:
+def _summarise(usage_rows: list[dict], debug_rows: list[dict], *, turns: int, rows_error: str | None = None) -> dict:
     creation = [float(r.get("cache_creation_input_tokens", 0) or 0) for r in usage_rows]
     read = [float(r.get("cache_read_input_tokens", 0) or 0) for r in usage_rows]
     hashes = [r.get("system_sha256") for r in debug_rows if r.get("system_sha256")]
@@ -540,10 +626,13 @@ def _summarise(usage_rows: list[dict], debug_rows: list[dict], *, turns: int) ->
     else:
         c1 = {"available": False, "note": "no cache_debug.jsonl rows (old build / NELL_CACHE_DEBUG unset)"}
 
-    try:
-        cache_break = check_cache_break(usage_rows, threshold_pct=read_regression_threshold())
-    except ValueError as exc:
-        cache_break = _unmeasured(f"threshold unreadable: {exc}")
+    if rows_error is not None:
+        cache_break = _unmeasured(rows_error)
+    else:
+        try:
+            cache_break = check_cache_break(usage_rows, threshold_pct=read_regression_threshold())
+        except ValueError as exc:
+            cache_break = _unmeasured(f"threshold unreadable: {exc}")
 
     return {
         "turns_requested": turns,
@@ -569,12 +658,35 @@ def _summarise(usage_rows: list[dict], debug_rows: list[dict], *, turns: int) ->
 def compare(old_path: Path, new_path: Path) -> int:
     old = json.loads(old_path.read_text())
     new = json.loads(new_path.read_text())
+    def _verdict(js: dict) -> str:
+        cb = js.get("cache_break_check")
+        if isinstance(cb, dict) and "status" in cb and "reason" in cb:
+            return format_cache_break_line(cb)
+        return "cache_break_check: n/a (run predates the check)"
+
+    def _status(js: dict) -> str:
+        cb = js.get("cache_break_check")
+        return str(cb.get("status")) if isinstance(cb, dict) and cb.get("status") else "n/a"
+
+    # Diagnostics go to stderr so stdout stays the A/B report.
     if bool(old.get("warmup_turn")) != bool(new.get("warmup_turn")):
         print(
             f"WARNING: warmup_turn differs (old={bool(old.get('warmup_turn'))}, new={bool(new.get('warmup_turn'))}): "
             "the cold warm-up row is in only one arm's means and series, which skews every number below. "
-            "Re-run both arms with the same setting (--no-warmup on both, or neither).\n"
+            f"Re-run both arms with the same setting (--no-warmup on both, or neither). "
+            f"(cache_break_check: old {_status(old)}, new {_status(new)})",
+            file=sys.stderr,
         )
+    if bool(old.get("plain_turns")) != bool(new.get("plain_turns")):
+        print(
+            f"WARNING: plain_turns differs (old={bool(old.get('plain_turns'))}, new={bool(new.get('plain_turns'))}): "
+            "the plain micro-ack rows are in only one arm's means and series, which skews every number below. "
+            f"Re-run both arms with the same setting (--no-plain-turns on both, or neither). "
+            f"(cache_break_check: old {_status(old)}, new {_status(new)})",
+            file=sys.stderr,
+        )
+    print(f"old {_verdict(old)}", file=sys.stderr)
+    print(f"new {_verdict(new)}", file=sys.stderr)
     oc = old["c8_cache"]["mean_cache_creation"]
     nc = new["c8_cache"]["mean_cache_creation"]
     orr = old["c8_cache"]["mean_cache_read"]
@@ -670,7 +782,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--persona-dir", type=Path, help="isolated persona directory to run against")
     p.add_argument("--scratch", action="store_true", help="create a throwaway persona under a temp dir")
-    p.add_argument("--turns", type=int, default=6, help="number of chat turns (≥6 recommended; the warm-up turn is extra)")
+    p.add_argument("--turns", type=int, default=6, help="number of chat turns (≥6 recommended; the warm-up and the two plain turns are extra)")
     p.add_argument("--gap-s", type=float, default=3.0, help="seconds between turns (keep < 5min TTL)")
     p.add_argument("--provider", default="claude-cli", help="provider name (claude-cli | fake)")
     p.add_argument("--out", type=Path, help="write the metrics JSON to this path")
@@ -693,15 +805,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--no-warmup",
         action="store_true",
-        help="skip the fixed tool-free warm-up turn (then the first chat row may be multi-call or warm "
-        "and cache_break_check may be UNMEASURED)",
+        help="skip the fixed warm-up turn (the run's cold first row, never judged by cache_break_check); "
+        "use together with --no-plain-turns, otherwise the leading plain turn becomes the never-judged "
+        "first row and a tools-path run has one judgeable row (UNMEASURED)",
+    )
+    p.add_argument(
+        "--no-plain-turns",
+        action="store_true",
+        help="skip the leading and trailing plain micro-ack turns (the single-call rows cache_break_check "
+        "judges; without them the verdict is usually UNMEASURED on the tools path)",
     )
     p.add_argument(
         "--cache-break-check",
         type=Path,
         metavar="USAGE.jsonl",
         help="run the per-run cache-break check on this chat_usage.jsonl instead of a replay "
-        "(exit 0 PASS / 1 FAIL / 2 UNMEASURED or error)",
+        "(exit 0 PASS / 1 FAIL / 2 UNMEASURED or error; run it via `uv run python`)",
     )
     p.add_argument(
         "--from-row",
@@ -713,7 +832,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--regression-threshold",
         type=float,
         metavar="PCT",
-        help="with --cache-break-check: override the percentage read from the config's cache_read_ratio entry",
+        help="with --cache-break-check: override the percentage in [0, 100) read from the config's cache_read_ratio entry",
     )
     p.add_argument(
         "--history-file",
@@ -773,6 +892,7 @@ def main(argv: list[str] | None = None) -> int:
         history_file=args.history_file,
         history_msgs=args.history_msgs,
         warmup=not args.no_warmup,
+        plain_turns=not args.no_plain_turns,
     )
     text = json.dumps(summary, indent=2)
     if args.out:
@@ -783,7 +903,7 @@ def main(argv: list[str] | None = None) -> int:
             replies_path.write_text(json.dumps(replies, indent=2), encoding="utf-8")
             print(f"replies: {replies_path}", file=sys.stderr)
     print(text)
-    return 0
+    return _exit_code_for(summary.get("cache_break_check"))
 
 
 if __name__ == "__main__":
