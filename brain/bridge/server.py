@@ -73,6 +73,7 @@ from brain.health.alarm import compute_pending_alarms
 from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
 from brain.health.walker import walk_persona
 from brain.ingest.buffer import _SESSION_ID_RE as _BUFFER_SESSION_ID_RE
+from brain.memory import cost_series
 from brain.memory.db_health import run_fts_health_check_once
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
@@ -593,6 +594,25 @@ def _chat_error_code(exc: BaseException) -> str:
     """Stable client code for a failed chat turn (#246): ``auth_expired`` when the
     failing call's own text is an auth failure, else the generic ``provider_failed``."""
     return "auth_expired" if provider_auth.is_auth_failure(str(exc)) else "provider_failed"
+
+
+async def _flush_cost_series_at_stop(persona_dir: Path) -> None:
+    """The bridge's clean stop saves the cost-series samples still buffered in
+    memory (name-recall fix S146, S164: only a crash may lose them; a normal
+    stop must not, or a restart would not continue from the saved timings).
+    Opens its own short-lived store in a worker thread; never raises."""
+
+    def _flush() -> None:
+        store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+        try:
+            cost_series.flush(store)
+        finally:
+            store.close()
+
+    try:
+        await asyncio.to_thread(_flush)
+    except Exception:
+        logger.exception("cost-series flush failed during shutdown")
 
 
 def _run_heartbeat_close(persona_dir: Path, provider: LLMProvider) -> None:
@@ -1162,6 +1182,7 @@ def build_app(
             #   2. Drain in-flight chats (best-effort wait, 30s cap)
             #   3. Close all live sessions via ingest pipeline (silence_minutes=0)
             #   4. Stop supervisor thread (180s join cap)
+            #   4b. Flush the buffered cost-series samples to memories.db
             #   5. Heartbeat close-trigger (Reflex Phase 2 growth tick anchor)
             #   6. Publish shutdown event
             #   7. Clear publisher
@@ -1225,6 +1246,10 @@ def build_app(
                 sup_thread.join(timeout=180.0)
                 if sup_thread.is_alive():
                     logger.warning("supervisor thread did not stop within 180s")
+
+            # 4b. Save the buffered cost-series samples (S146, S164) now that
+            #     the supervisor, the only other flusher, has stopped.
+            await _flush_cost_series_at_stop(persona_dir)
 
             # 5. Heartbeat close-trigger — anchor for Reflex Phase 2 weekly growth.
             #    In-process import + run_tick(trigger="close"). Best-effort:

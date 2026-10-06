@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import shutil
 import sys
@@ -1922,6 +1923,20 @@ def _personas_handler(args: argparse.Namespace) -> int:
     return 0
 
 
+def _flush_cost_series_at_exit(store: MemoryStore) -> None:
+    """`nell chat --no-bridge` exit (name-recall fix S146, S164): this process
+    has no lull cadence to save the cost-series samples it buffered, so it
+    saves them here, in its own try and BEFORE the pass-2 exit drain (which can
+    run for a while and is not wrapped), so the shared series reaches the bridge
+    and later sessions whatever the drain does. Prints nothing; fail-soft."""
+    try:
+        from brain.memory import cost_series
+
+        cost_series.flush(store)
+    except Exception:  # noqa: BLE001 - never let a timing save break an exit
+        logging.getLogger(__name__).warning("cost-series flush at exit failed", exc_info=True)
+
+
 def _drain_pass2_at_exit(persona_dir: Path) -> None:
     """`nell chat --no-bridge` exit-drain (S78/S80): this process has no
     later lull to wait for (S78 — the round-3 fix's throttle-gated
@@ -2050,6 +2065,7 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
                         RuntimeWarning,
                         stacklevel=1,
                     )
+                _flush_cost_series_at_exit(store)
                 _drain_pass2_at_exit(persona_dir)
                 return 0
 
@@ -2096,6 +2112,7 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
                         RuntimeWarning,
                         stacklevel=1,
                     )
+                _flush_cost_series_at_exit(store)
                 _drain_pass2_at_exit(persona_dir)
                 # Summary
                 print(

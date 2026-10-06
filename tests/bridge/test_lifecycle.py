@@ -508,3 +508,53 @@ def test_idle_watcher_uses_shutdown_controller_not_os_kill(monkeypatch):
     asyncio.run(_idle_watcher(state, idle_shutdown_seconds=0.01))
 
     assert controller.reasons == ["idle_timeout"]
+
+
+def _buffered_cost_samples(persona_dir: Path, n: int) -> None:
+    """Buffer `n` cost-series samples against the persona's memories.db, as a
+    passive recall would, without flushing them."""
+    from brain.memory import cost_series
+    from brain.memory.store import MemoryStore
+
+    store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+    try:
+        series = cost_series.CostSeries("rerank")
+        for i in range(1, n + 1):
+            series.record(store, "m", 1000 * i, 0.1 * i)
+    finally:
+        store.close()
+
+
+def _saved_cost_samples(persona_dir: Path) -> int:
+    import sqlite3
+
+    con = sqlite3.connect(persona_dir / "memories.db")
+    try:
+        return con.execute("SELECT COUNT(*) FROM cost_series_samples").fetchone()[0]
+    finally:
+        con.close()
+
+
+def test_clean_stop_saves_the_buffered_cost_series_samples(persona_dir: Path) -> None:
+    """S146/S164 (CS17e): the lifespan teardown flushes, so a normal stop does
+    not lose the samples taken since the last lull. No supervisor runs here, so
+    the teardown is the only flusher."""
+    _buffered_cost_samples(persona_dir, 3)
+    assert _saved_cost_samples(persona_dir) == 0
+    with _client(persona_dir, background_threads=False):
+        assert _saved_cost_samples(persona_dir) == 0, "nothing is written while the bridge runs"
+    assert _saved_cost_samples(persona_dir) == 3
+
+
+def test_a_failing_cost_series_flush_does_not_stop_the_teardown(persona_dir: Path, monkeypatch) -> None:
+    from brain.memory import cost_series
+
+    _buffered_cost_samples(persona_dir, 2)
+
+    def boom(_store):
+        raise RuntimeError("flush failed")
+
+    monkeypatch.setattr(cost_series, "flush", boom)
+    with _client(persona_dir, background_threads=False):
+        pass
+    assert _saved_cost_samples(persona_dir) == 0
