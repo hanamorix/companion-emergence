@@ -155,7 +155,7 @@ def test_characterization_compare_fails_when_creation_does_not_drop(tmp_path, ca
 # --------------------------------------------------------------------------------------
 
 
-def test_c1_hana_counterexample_passes():
+def test_c1_review_counterexample_passes():
     # (creation/read) rows from the #340 review: the 6000-token prefix is read every turn.
     rows = [row(17000, 0, t=0), row(11500, 6000, t=1), row(16000, 6000, t=2)]
     assert _old_rule_fails(rows)  # precondition: the replaced rule FAILed this healthy run (16000/17000)

@@ -105,7 +105,7 @@ metrics:                  # standing regression metrics (source: the JSONL logs)
     #   whose first call is total read minus last-call read), two more inferred, two not derivable.
     #   (The log held two more chat rows than the nine replay turns, of unidentified origin; two of
     #   the three single-call rows are among the last three rows, and read 6449 as well.)
-    #   Hana's review reports a constant 15,476 read on real rows as a second datum. So zero wobble
+    #   The #340 review reports a constant 15,476 read on real rows as a second datum. So zero wobble
     #   is OBSERVED, not bounded: the sample is one run, one persona, one model, the tools path only
     #   (the text path is unmeasured), and six agreeing reads cannot exclude an occasional
     #   variation. The consequence is stated: with T = 0 any plain row reading below the run's
