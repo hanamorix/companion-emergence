@@ -771,3 +771,31 @@ def test_cs6c_concurrent_records_and_flushes_lose_no_sample(store: MemoryStore, 
     cost_series.flush(store)
     total = store._conn.execute("SELECT COUNT(*) FROM cost_series_samples").fetchone()[0]  # noqa: SLF001
     assert total == threads_n * per_thread
+
+
+def test_cs6c_the_take_out_is_atomic_against_a_record_made_while_it_runs(
+    store: MemoryStore, series: CostSeries, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A record that arrives while the flush is taking its samples out (between
+    reading the buffer and emptying it) must wait for the take-out, not be wiped
+    with it: the injected thread blocks on the buffer lock in the real code."""
+    series.record(store, "m", 1000, 0.1)
+    threads: list[threading.Thread] = []
+
+    class Interleaving(list):
+        armed = True
+
+        def __iter__(self):
+            yield from list.__iter__(self)
+            if Interleaving.armed:
+                Interleaving.armed = False
+                t = threading.Thread(target=lambda: series.record(store, "m", 2000, 0.2))
+                t.start()
+                t.join(0.3)  # in the real code it is blocked on the lock; unguarded it finishes now
+                threads.append(t)
+
+    monkeypatch.setattr(cost_series, "_pending", Interleaving(cost_series._pending))
+    assert cost_series.flush(store) == 1
+    threads[0].join(10)
+    assert cost_series.flush(store) == 1, "the sample made during the take-out was kept for the next flush"
+    assert store._conn.execute("SELECT COUNT(*) FROM cost_series_samples").fetchone()[0] == 2  # noqa: SLF001
