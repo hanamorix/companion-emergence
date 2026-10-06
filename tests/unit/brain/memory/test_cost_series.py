@@ -690,3 +690,84 @@ def test_cs1d_the_period_module_is_gone_and_nothing_imports_it() -> None:
     repo = Path(__file__).resolve().parents[4]
     for path in sorted((repo / "brain").rglob("*.py")):
         assert name not in path.read_text(encoding="utf-8"), path
+
+
+def test_cs1_a_flush_prunes_exactly_the_rows_that_have_left_the_window(
+    store: MemoryStore, series: CostSeries, clock: Clock
+) -> None:
+    """The prune boundary is the read boundary: a row with taken_at == now - W is
+    out of the window and deleted; one tick later than that stays."""
+    series.record(store, "m", 1000, 0.1)  # taken at T0
+    clock.now = T0 + 5
+    series.record(store, "m", 2000, 0.2)  # taken at T0 + 5
+    store.record_cost_samples("test series", "test-machine", "m", [], now=T0 + W, window_seconds=W)
+    rows = [r[0] for r in store._conn.execute("SELECT taken_at FROM cost_series_samples")]  # noqa: SLF001
+    assert rows == [], "nothing was flushed yet: only the explicit prune ran on an empty table"
+    cost_series.flush(store)
+    store.record_cost_samples("test series", "test-machine", "m", [], now=T0 + W, window_seconds=W)
+    left = sorted(r[0] for r in store._conn.execute("SELECT taken_at FROM cost_series_samples"))  # noqa: SLF001
+    assert left == [T0 + 5], "the sample taken at exactly now - W is pruned; the later one stays"
+
+
+def test_cs3d_the_machine_id_is_created_through_an_atomic_exclusive_link(
+    real_machine_id: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str, str]] = []
+    real_link = cost_series.os.link
+
+    def spy(src, dst):
+        calls.append((str(src), str(dst)))
+        return real_link(src, dst)
+
+    monkeypatch.setattr(cost_series.os, "link", spy)
+    ident = cost_series.machine_id()
+    assert len(calls) == 1 and calls[0][1].endswith("machine_id") and calls[0][0].endswith(".tmp")
+    assert (real_machine_id / "machine_id").read_text() == ident
+
+
+def test_cs6c_concurrent_records_and_flushes_lose_no_sample(store: MemoryStore, series: CostSeries) -> None:
+    """Threads recording while another flushes: after a final flush every sample
+    is in the database exactly once (the buffer's take-out and the appends are
+    under one lock)."""
+    import sys
+
+    threads_n, per_thread = 4, 400
+    stop = threading.Event()
+    errors: list[BaseException] = []
+
+    def record(offset: int) -> None:
+        try:
+            for i in range(per_thread):
+                series.record(store, "m", offset * per_thread + i + 1, 0.001)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def flusher() -> None:
+        # Its own connection: a sqlite3 connection is used by one thread.
+        other = MemoryStore(store.db_path, integrity_check=False)
+        try:
+            while not stop.is_set():
+                cost_series.flush(other)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+        finally:
+            other.close()
+
+    previous = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        workers = [threading.Thread(target=record, args=(k,)) for k in range(threads_n)]
+        bg = threading.Thread(target=flusher)
+        bg.start()
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join(60)
+        stop.set()
+        bg.join(60)
+    finally:
+        sys.setswitchinterval(previous)
+    assert not errors, errors
+    cost_series.flush(store)
+    total = store._conn.execute("SELECT COUNT(*) FROM cost_series_samples").fetchone()[0]  # noqa: SLF001
+    assert total == threads_n * per_thread
