@@ -341,6 +341,23 @@ def _keyword_budget_reset(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _cost_series_state_reset(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Cost-series increment (S146, S159, S163, S164): empty the in-process
+    sample buffer and the warn-once flags before and after each test, and give
+    every test a fixed machine id so no test writes `machine_id` into a real
+    home directory. The `machine_id` tests clear `_machine_override` themselves
+    and point `KINDLED_HOME` at a tmp path."""
+    from brain.memory import cost_series
+
+    cost_series._reset_pending()
+    cost_series._reset_machine_id()
+    monkeypatch.setattr(cost_series, "_machine_override", "test-machine")
+    yield
+    cost_series._reset_pending()
+    cost_series._reset_machine_id()
+
+
+@pytest.fixture(autouse=True)
 def _floor_bootstrap_background_off_by_default(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[None]:

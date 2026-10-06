@@ -150,3 +150,11 @@ MONOLOGUE_FAMILY_TYPES: frozenset[str] = frozenset(
 # (gated only by the cosine floor: the cosine path and every reranked
 # paragraph's unreranked tail); S97 puts it below the keyword genuine hits.
 RECALL_RESULT_GROUP_ORDER: tuple[str, ...] = ("reranked_genuine", "reranked_family", "cosine_genuine", "keyword_genuine", "cosine_family", "keyword_family")  # fmt: skip
+
+# --- cost-series window (name-recall fix S146) ------------------------------
+# Every measured cost series (the rerank, paragraph-embed, recall-setup,
+# paragraph-scan, keyword extra-words and name-matching timings) is a rolling
+# average over this window: a sample counts for this long after it was taken,
+# then drops out; there is no daily reset. The owner's number (S146: "a rolling
+# average over the last 24 hours"). See `brain.memory.cost_series`.
+COST_SERIES_WINDOW_S: float = 24 * 60 * 60

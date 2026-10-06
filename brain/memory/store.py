@@ -26,6 +26,7 @@ from typing import Any
 import numpy as np
 
 from brain import dev_constants, tunables
+from brain.memory import cost_series
 from brain.memory.floor_calibration import RETENTION_WINDOW_DAYS_DEFAULT
 
 logger = logging.getLogger(__name__)
@@ -509,6 +510,39 @@ CREATE TABLE IF NOT EXISTS cosine_floor_calibration (
     sample_pairs INTEGER NOT NULL,
     is_cold_start INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Cost series (name-recall fix S146, S159, S163, S164, S41, I9): the measured
+-- timings behind the per-message recall time budget, kept over a rolling
+-- 24-hour window and saved so a restart continues from them.
+-- `cost_series_samples` holds one row per measurement (the window is the rows
+-- with `taken_at` inside the last 24 hours; each flush prunes its key's older
+-- rows); its covering index serves the window aggregate without touching the
+-- table. `cost_series_carried` holds, per key, the estimate in effect after the
+-- last flush and the largest size measured, for a window that is empty or has
+-- one size. `host` is this machine's random id (a copied database starts as a
+-- first startup on the new machine). `CREATE TABLE IF NOT EXISTS` on open:
+-- legacy-safe and idempotent (I9), no existing table or row is touched.
+CREATE TABLE IF NOT EXISTS cost_series_samples (
+    series TEXT NOT NULL,
+    host TEXT NOT NULL,
+    series_key TEXT NOT NULL,
+    x INTEGER NOT NULL,
+    seconds REAL NOT NULL,
+    taken_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cost_series_samples
+    ON cost_series_samples (series, host, series_key, taken_at, x, seconds);
+CREATE TABLE IF NOT EXISTS cost_series_carried (
+    series TEXT NOT NULL,
+    host TEXT NOT NULL,
+    series_key TEXT NOT NULL,
+    overhead REAL NOT NULL,
+    rate REAL NOT NULL,
+    samples INTEGER NOT NULL,
+    max_x INTEGER NOT NULL,
+    fitted_at REAL NOT NULL,
+    PRIMARY KEY (series, host, series_key)
 );
 
 -- F2c (inc2, red-team fix F-1, spec §2): per-persona weekly judge self-tune
@@ -1759,6 +1793,140 @@ class MemoryStore:
             "is_cold_start": bool(row["is_cold_start"]),
             "updated_at": row["updated_at"],
         }
+
+    # ------------------------------------------------------------------
+    # Cost series (name-recall fix S146, S164): `brain.memory.cost_series`
+    # owns the maths and the buffer; these three methods are its storage.
+    # ------------------------------------------------------------------
+
+    # Test seam, `None` in production: called inside `record_cost_samples`'s
+    # transaction, between reading the window and writing the carried row.
+    _cost_record_hook: Callable[[], None] | None = None
+
+    def _cost_window_sums(
+        self, series: str, host: str, key: str, cut: float
+    ) -> cost_series.LinearSums:
+        row = self._conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(x), 0), COALESCE(SUM(seconds), 0.0), "
+            "COALESCE(SUM(x * seconds), 0.0), COALESCE(SUM(x * x), 0), COALESCE(MAX(x), 0) "
+            "FROM cost_series_samples "
+            "WHERE series = ? AND host = ? AND series_key = ? AND taken_at > ?",
+            (series, host, key, cut),
+        ).fetchone()
+        return cost_series.LinearSums(
+            n=int(row[0]),
+            sum_x=int(row[1]),
+            sum_y=float(row[2]),
+            sum_xy=float(row[3]),
+            sum_xx=int(row[4]),
+            max_x=int(row[5]),
+        )
+
+    def _cost_carried_row(self, series: str, host: str, key: str) -> cost_series.RangedFit | None:
+        row = self._conn.execute(
+            "SELECT overhead, rate, samples, max_x FROM cost_series_carried "
+            "WHERE series = ? AND host = ? AND series_key = ?",
+            (series, host, key),
+        ).fetchone()
+        if row is None:
+            return None
+        return cost_series.RangedFit(
+            cost_series.LinearFit(float(row[0]), float(row[1]), int(row[2])), int(row[3])
+        )
+
+    def cost_series_state(
+        self, series: str, host: str, key: str, *, now: float, window_seconds: float
+    ) -> tuple[cost_series.LinearSums, cost_series.RangedFit | None]:
+        """The window's sums (samples with `taken_at > now - window_seconds`)
+        and the carried estimate for one series key on one machine. The
+        window is one aggregate `SELECT` served by the covering index."""
+        return (
+            self._cost_window_sums(series, host, key, now - window_seconds),
+            self._cost_carried_row(series, host, key),
+        )
+
+    def cost_series_window_counts(
+        self,
+        series: str,
+        host: str,
+        key: str,
+        *,
+        since: float,
+        now: float,
+        window_seconds: float,
+    ) -> tuple[int, int]:
+        """`(before, after)`: the window's samples taken at or before `since`
+        and after it (S127: "has the estimate changed since the verdict")."""
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(taken_at <= ?), 0), COALESCE(SUM(taken_at > ?), 0) "
+            "FROM cost_series_samples "
+            "WHERE series = ? AND host = ? AND series_key = ? AND taken_at > ?",
+            (since, since, series, host, key, now - window_seconds),
+        ).fetchone()
+        return int(row[0]), int(row[1])
+
+    def record_cost_samples(
+        self,
+        series: str,
+        host: str,
+        key: str,
+        samples: Sequence[tuple[int, float, float]],
+        *,
+        now: float,
+        window_seconds: float,
+    ) -> None:
+        """Save `samples` (`(x, seconds, taken_at)`) for one series key, prune
+        the key's rows outside the window and save the estimate in effect after
+        them as the carried row, all in ONE write transaction (`BEGIN
+        IMMEDIATE`: a second writer waits for this one, so the carried row is
+        never computed from a window another flush is changing). Called only by
+        `cost_series.flush`. Raises when the connection is already inside a
+        transaction (the commit would take someone else's writes with it) and on
+        any database error, after rolling back."""
+        if self._conn.in_transaction:
+            raise RuntimeError("cost series: cannot save inside an open transaction")
+        cut = now - window_seconds
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.executemany(
+                "INSERT INTO cost_series_samples (series, host, series_key, x, seconds, taken_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                [(series, host, key, x, seconds, taken_at) for x, seconds, taken_at in samples],
+            )
+            self._conn.execute(
+                "DELETE FROM cost_series_samples "
+                "WHERE series = ? AND host = ? AND series_key = ? AND taken_at <= ?",
+                (series, host, key, cut),
+            )
+            sums = self._cost_window_sums(series, host, key, cut)
+            carried = self._cost_carried_row(series, host, key)
+            if self._cost_record_hook is not None:
+                self._cost_record_hook()
+            estimate = cost_series.SeriesState(sums, carried).estimate()
+            if estimate is not None:
+                self._conn.execute(
+                    "INSERT INTO cost_series_carried "
+                    "(series, host, series_key, overhead, rate, samples, max_x, fitted_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT (series, host, series_key) DO UPDATE SET "
+                    "overhead = excluded.overhead, rate = excluded.rate, "
+                    "samples = excluded.samples, max_x = excluded.max_x, "
+                    "fitted_at = excluded.fitted_at",
+                    (
+                        series,
+                        host,
+                        key,
+                        estimate.fit.overhead,
+                        estimate.fit.rate,
+                        estimate.fit.samples,
+                        estimate.max_x,
+                        now,
+                    ),
+                )
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
 
     def get_cosine_floor(self, embedder_model_id: str) -> dict[str, Any] | None:
         """Return the operative COSINE floor for `embedder_model_id` (name-
