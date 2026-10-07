@@ -1892,6 +1892,8 @@ pub fn run() {
             brain_update::apply_brain_update,
             brain_update::rollback_brain,
             brain_update::revert_brain,
+            brain_update::brain_overlay_status,
+            brain_update::confirm_brain_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

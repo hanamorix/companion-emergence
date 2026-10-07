@@ -46,6 +46,14 @@ def test_revert_and_rollback(tmp_path, monkeypatch, capsys):
     assert overlay.read_state(root) == {"active": None, "previous": _entry("aaaa")}
 
 
+
+def test_confirm_marks_the_active_overlay(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
+    root = overlay.overlay_root()
+    overlay.activate(root, {**_entry("a"), "confirmed": False, "undo": "revert"})
+    assert cli.main(["update", "--confirm", "a" * 10]) == 0
+    assert json.loads(capsys.readouterr().out)["active"]["confirmed"] is True
+
 def test_revert_help_mentions_the_no_overlay_escape_hatch(capsys):
     with pytest.raises(SystemExit):
         cli.main(["update", "--help"])
