@@ -37,40 +37,21 @@ persona. The scratch persona is seeded with deterministic memory fixtures (unles
 
 Cache-break check (#339)
 ------------------------
-``check_cache_break`` is a pure, per-run check over ``chat_usage.jsonl`` rows (no model call, no
-OLD-vs-NEW comparison). A cache break is a later PLAIN chat row whose ``cache_read_input_tokens`` falls
-below the run's stable read S (threshold T from the config, 0 today: read 0 or any read below S).
-Rules (see ``check_cache_break`` and guarded-change.companion.md, metric cache_read_ratio):
-- The first chat row (the cold write) is never judged. Only single-call rows (``num_turns == 1``)
-  are judged: a row's usage is the SUM over the turn's API calls, so a multi-call (tool) row's read is
-  not comparable. Multi-call rows are not judged and impose no rule: a tool-using message's first call
-  has the same cached prefix (system prompt and tool block) as a plain message's, the model decides on
-  tools only after that call, so a prefix break shows on plain rows too.
-- S = the highest read among earlier judged rows (running max). A judged row is a break if its read is
-  0 or below S. The run needs at least ``MIN_JUDGED_ROWS`` (2) judged rows (one establishes S, one is
-  compared against it), else UNMEASURED. Verdicts: PASS, FAIL, UNMEASURED (never a pass).
-Every replay therefore sends the fixed turns: a WARM-UP (``WARMUP_PROMPT``, the cold first row, never
-judged), one leading plain micro-ack (``PLAIN_LEAD_PROMPT``, establishes S), the content turns, and one
-trailing plain micro-ack (``PLAIN_TRAIL_PROMPT``) so a break that begins during the content turns and
-persists is seen by a plain row (a transient miss that has recovered by the trailing row is not seen).
-``--no-warmup`` without ``--no-plain-turns`` makes the leading micro-ack the never-judged first row, which
-leaves one judgeable row on the tools path (UNMEASURED): use the two flags together. Micro-acks are exempt from the record_monologue directive
-(brain/chat/monologue_prompts.py), which is what keeps them plain; the model still decides about tools,
-so if fewer than 2 plain rows result the verdict is UNMEASURED. The warm-up and plain turns are EXTRA
-chat rows in a run's means and series (``chat_rows_observed`` = turns + 3 when every turn logs exactly one
-row; a turn can log more, e.g. a capability-recruit re-run): use the same settings
-(``--no-warmup`` / ``--no-plain-turns`` on both or neither) for the two arms of a ``--compare``, which
-warns when they differ. The replay prints ``cache_break_check: <STATUS>`` on stderr, stores the result
-under ``cache_break_check`` in the metrics JSON, and exits 0 PASS / 1 FAIL / 2 UNMEASURED after the
-JSON is written, for each arm of an A/B (an OLD arm may legitimately exit 1 or 2); pre-run argument errors
-exit 1, argparse usage errors and the live-persona refusal exit 2, a crash exits 1: the stderr
-``cache_break_check:`` line is what identifies a verdict. ``--cache-break-check USAGE.jsonl``
-runs the check on any log slice with the same codes (any error exits 2); it needs the project
-environment (``uv run python scripts/cache_replay_workload.py ...``) because it reads rows through
-brain.health.jsonl_reader and the threshold through PyYAML.
-Limits: a persistent PARTIAL break leaves a stable prefix (S is built from reads) and is left to the
-cache_creation_per_chat_call and cost_per_chat_call_usd metrics; the first judged row only establishes S;
-a slice must be one run (a prompt change, TTL gap or history-window slide inside it reads as a break).
+``check_cache_break`` is a pure per-run check over ``chat_usage.jsonl`` rows (no model call, no OLD-vs-NEW
+comparison). Its definition, bases and limits live in ONE place: the ``cache_read_ratio`` entry of
+guarded-change.companion.md. Every replay sends a fixed turn script: a WARM-UP (``WARMUP_PROMPT``), one plain
+micro-ack (``PLAIN_LEAD_PROMPT``), the content turns, one plain micro-ack (``PLAIN_TRAIL_PROMPT``). Switch the
+extras off with ``--no-warmup`` / ``--no-plain-turns`` (together, and with the same settings on both arms of a
+``--compare``, which prints "not comparable" when they differ). The verdict is stored under
+``cache_break_check`` in the metrics JSON and printed as ``cache_break_check: <STATUS>`` on stderr.
+
+Exit codes. A verdict: 0 PASS (also NOT_APPLICABLE: a provider that never logs usage, e.g. ``--provider fake``),
+10 FAIL, 11 UNMEASURED (never a pass: stop for the human); the metrics JSON is written first. Errors never use
+10 or 11: 1 = an uncaught crash, ``--turns`` below 1, ``--dump-replies`` without ``--out``; 2 = argparse usage
+errors, no persona dir given, and bad ``--cache-break-check`` arguments. ``--cache-break-check USAGE.jsonl`` runs the
+check on any log slice with the same verdict codes (a corrupt line or an unreadable file or config is UNMEASURED,
+11); it needs the project environment (``uv run python scripts/cache_replay_workload.py ...``). ``--compare``
+returns 0 / 10 / 11 (C8 pass / fail / not comparable).
 
 Usage
 -----
@@ -120,6 +101,15 @@ PLAIN_TRAIL_PROMPT = "thanks"
 # Minimum judged rows for a verdict. Derived, not tuned: one judged row can only establish S, a
 # comparison needs a second one.
 MIN_JUDGED_ROWS = 2
+
+# Exit codes of a verdict. 1 (crash) and 2 (argparse usage error) are never used for one.
+EXIT_PASS = 0
+EXIT_FAIL = 10
+EXIT_UNMEASURED = 11
+
+# Providers that never call log_usage (checked against brain/bridge/provider.py by a test): a replay with one of
+# them has no usage rows by design, so the cache-break check does not apply (a real provider with no rows is UNMEASURED).
+_NON_LOGGING_PROVIDERS = frozenset({"fake", "ollama"})
 
 # Deterministic, content-bearing prompts (≥6). Each is substantive enough to
 # exercise recall / emotion / monologue blocks, so the volatile tail is non-
@@ -197,11 +187,62 @@ def _seed_history_buffer(
     return len(rows)
 
 
-def _read_jsonl(path: Path) -> list[dict]:
-    """Lenient read through the shared streaming reader (corrupt lines are skipped with a warning)."""
+def _file_size(path: Path) -> int:
+    return path.stat().st_size if path.exists() else 0
+
+
+def _nonblank_lines(chunk: bytes) -> int:
+    """Non-blank lines of `chunk`, split like the shared reader's text-mode iteration (\n, \r\n, \r)."""
+    return sum(1 for ln in chunk.splitlines() if ln.decode("utf-8", "replace").strip())
+
+
+def _read_run_slice(path: Path, offset: int, boundaries: tuple[int, ...] | list[int] = ()):
+    """Parse ONCE, through the shared reader, only the bytes appended to `path` after byte `offset`.
+
+    Returns (rows, skipped, line_counts, consistent). `skipped` = non-blank lines of the slice minus the rows the
+    reader returned (it skips corrupt or non-object lines with a warning). `boundaries` are the file sizes recorded
+    after each turn; `line_counts[i]` = non-blank lines in turn i's byte range; `consistent` is True only when
+    nothing was skipped, the last boundary is the final size and the counts add up to the rows, i.e. the rows map
+    1:1 to turns (assumes each turn's rows are written before respond() returns). A file smaller than `offset`
+    or than the last boundary, or a decreasing boundary, means the log was rotated or truncated during the run:
+    ValueError. The shared reader has no offset argument, so the appended bytes are parsed from a temporary copy
+    (its warnings number lines from 1 at `offset` and name that copy). A decode error is a ValueError too.
+    """
     from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
 
-    return list(iter_jsonl_skipping_corrupt(path))
+    last = offset
+    for b in boundaries:
+        if b < last:
+            raise ValueError(f"{path}: the log shrank during the run (a boundary fell from {last} to {b} bytes)")
+        last = b
+    data = b""
+    size = 0
+    if path.exists():
+        with open(path, "rb") as fh:
+            size = os.fstat(fh.fileno()).st_size
+            if size < offset:
+                raise ValueError(f"{path}: the log shrank during the run ({offset} bytes before, {size} after: rotated or truncated)")
+            fh.seek(offset)
+            data = fh.read()
+    elif offset > 0:
+        raise ValueError(f"{path}: the log disappeared during the run ({offset} bytes before)")
+    if boundaries and size < boundaries[-1]:
+        raise ValueError(f"{path}: the log shrank during the run (last turn boundary {boundaries[-1]}, size {size} after)")
+    size = offset + len(data)
+    rows: list[dict] = []
+    if data:
+        with tempfile.TemporaryDirectory(prefix="crw-slice-") as td:
+            tmp = Path(td) / "slice.jsonl"
+            tmp.write_bytes(data)
+            rows = list(iter_jsonl_skipping_corrupt(tmp))
+    skipped = _nonblank_lines(data) - len(rows)
+    counts: list[int] = []
+    start = offset
+    for b in boundaries:
+        counts.append(_nonblank_lines(data[start - offset : b - offset]))
+        start = b
+    consistent = bool(boundaries) and skipped == 0 and boundaries[-1] == size and sum(counts) == len(rows)
+    return rows, skipped, counts, consistent
 
 
 # Deterministic memory fixtures, content chosen to MATCH tokens in REPLAY_PROMPTS
@@ -283,6 +324,7 @@ def run_replay(
 ) -> tuple[dict, list[dict]]:
     """Fire `turns` deterministic chat turns in one session; collect metrics + replies.
 
+    The usage log is parsed once, from the bytes the run appended (see `_read_run_slice`).
     With `warmup` (default) the run FIRST sends the fixed `WARMUP_PROMPT` as turn 0, on the same path
     as the other turns (text or tools): the run's cold write, never judged by `check_cache_break`.
     With `plain_turns` (default) it then sends one plain micro-ack (`PLAIN_LEAD_PROMPT`, reply id
@@ -303,8 +345,9 @@ def run_replay(
 
     usage_path = persona_dir / "chat_usage.jsonl"
     debug_path = persona_dir / "cache_debug.jsonl"
-    usage_before = len(_read_jsonl(usage_path))
-    debug_before = len(_read_jsonl(debug_path))
+    # Byte sizes before the run (no parsing): only the bytes appended during the run are ever parsed.
+    usage_offset = _file_size(usage_path)
+    debug_offset = _file_size(debug_path)
 
     provider = get_provider(provider_name, persona_dir=persona_dir)
     if force_text_path:
@@ -329,6 +372,7 @@ def run_replay(
         + ([("p2", PLAIN_TRAIL_PROMPT)] if plain_turns else [])
     )
     replies: list[dict] = []
+    boundaries: list[int] = []  # usage-file size after each turn: attributes the appended rows to their turns
     print(
         f"# cache replay — {turns} turns{' + warm-up' if warmup else ''}{' + 2 plain turns' if plain_turns else ''}, "
         f"session={session.session_id}",
@@ -346,6 +390,7 @@ def run_replay(
                 session=session,
             )
             dt = time.monotonic() - t0
+            boundaries.append(_file_size(usage_path))
             replies.append({"turn": i, "prompt": prompt, "reply": result.content})
             label = "warm-up" if i == 0 else (f"plain {i}" if isinstance(i, str) else f"{i}/{turns}")
             print(
@@ -358,16 +403,46 @@ def run_replay(
         store.close()
         hebbian.close()
 
-    usage_rows = [r for r in _read_jsonl(usage_path)[usage_before:] if r.get("call_type") == "chat"]
-    debug_rows = [
-        r for r in _read_jsonl(debug_path)[debug_before:] if r.get("call_type") in ("chat", "chat_stream")
-    ]
     rows_error = None
+    usage_all: list[dict] = []
+    row_turns: list | None = None
+    skipped = 0
     try:
-        _read_rows_fail_closed(usage_path)  # the verdict must not rest on rows the shared reader skipped
-    except ValueError as exc:
+        usage_all, skipped, counts, consistent = _read_run_slice(usage_path, usage_offset, boundaries)
+        if skipped:
+            rows_error = (
+                f"the shared jsonl reader skipped {skipped} corrupt or non-object line(s) among the "
+                f"{_file_size(usage_path) - usage_offset} bytes this run appended to {usage_path} (byte offset "
+                f"{usage_offset}; the reader's warnings, when logging is enabled, number lines from 1 at that offset and name a temporary copy of those bytes); "
+                "refusing to judge from the remaining rows"
+            )
+        elif consistent:
+            ids = [i for i, _ in sequence]
+            per_row = [tid for tid, n in zip(ids, counts, strict=True) for _ in range(n)]
+            row_turns = [tid for tid, r in zip(per_row, usage_all, strict=True) if r.get("call_type") == "chat"]
+    except (ValueError, OSError) as exc:  # shrink / rotation, a decode or I/O error: never judged, never a late crash
         rows_error = str(exc)
-    summary = _summarise(usage_rows, debug_rows, turns=turns, rows_error=rows_error)
+    usage_rows = [r for r in usage_all if r.get("call_type") == "chat"]
+    debug_error = None
+    try:
+        debug_all, _, _, _ = _read_run_slice(debug_path, debug_offset)
+    except (ValueError, OSError) as exc:
+        debug_all, debug_error = [], str(exc)
+    debug_rows = [r for r in debug_all if r.get("call_type") in ("chat", "chat_stream")]
+    not_applicable = None
+    if provider_name in _NON_LOGGING_PROVIDERS and not usage_all and rows_error is None:
+        not_applicable = f"provider {provider_name!r} never logs usage rows; the check is not applicable"
+    summary = _summarise(
+        usage_rows,
+        debug_rows,
+        turns=turns,
+        rows_error=rows_error,
+        not_applicable_reason=not_applicable,
+        row_turns=row_turns,
+        trailing_plain=plain_turns,
+        debug_error=debug_error,
+    )
+    summary["with_tools"] = not force_text_path
     summary["warmup_turn"] = warmup
     summary["plain_turns"] = plain_turns
     print(format_cache_break_line(summary["cache_break_check"]), file=sys.stderr)
@@ -394,6 +469,12 @@ def _unmeasured(reason: str, **extra) -> dict:
     return out
 
 
+def _not_applicable(reason: str) -> dict:
+    out = _unmeasured(reason)
+    out["status"] = "NOT_APPLICABLE"
+    return out
+
+
 def _gap_s(prev: dict, cur: dict) -> float | None:
     try:
         t0 = datetime.fromisoformat(str(prev.get("ts")))
@@ -404,26 +485,11 @@ def _gap_s(prev: dict, cur: dict) -> float | None:
 
 
 def check_cache_break(rows: list[dict], *, threshold_pct: float) -> dict:
-    """Per-run cache-break check (#339). See the module docstring ("Cache-break check").
+    """Per-run cache-break check (#339) over one run's usage rows. Definition, bases and limits:
+    guarded-change.companion.md, metric cache_read_ratio (the one home).
 
-    ``rows`` is one run's usage rows in log order; only ``call_type == "chat"`` rows count. The first
-    chat row (the cold write) is never judged and is not a reference. Later rows are walked in order:
-    - ``num_turns`` not an int equal to 1 (absent, bool, 2+): a multi-call row. Its read is a SUM over the
-      turn's API calls (the JSON result's ``usage`` sums them; ``iterations`` keeps only the last call),
-      so it is not judged and imposes no rule (basis: a tool-using message's first call has the same
-      cached prefix as a plain message's, the model decides on tools only after that call, so a prefix
-      break shows on plain rows too). Listed in ``multicall_rows``.
-    - unusable (skipped, makes the verdict UNMEASURED unless a break exists): ``cache_read_input_tokens``
-      not an int; creation 0 AND read 0 (no cache activity at all); a model that differs from the run's
-      model (the model of the first usable single-call later row; a missing model is comparable).
-    - judged (single-call, usable): a break if read == 0, or if S is defined and
-      read*100 < S*(100-T), T = ``threshold_pct`` from the config (0 today: any read below S). S is the
-      highest read among earlier judged rows that were not breaks. A break does not change S.
-    Verdict: any break FAIL; else any unusable row UNMEASURED; else fewer than MIN_JUDGED_ROWS judged
-    rows UNMEASURED; else PASS. Fewer than 2 chat rows or a T outside [0, 100): UNMEASURED.
-    Returns {status, reason, stable_read_tokens, threshold_pct, rows_checked (= judged), multicall_rows,
-    min_judged_rows, min_share_of_S, breaks: [{row, read, reference_read, share_of_S, creation,
-    num_turns, ts, gap_s}]}; reference_read / share_of_S are None for a zero read while S is undefined.
+    Returns {status, reason, stable_read_tokens, threshold_pct, rows_checked, multicall_rows, min_judged_rows,
+    min_share_of_S, breaks: [{row, read, reference_read, share_of_S, creation, num_turns, ts, gap_s}]}.
     """
     if isinstance(threshold_pct, bool) or not isinstance(threshold_pct, (int, float)) or not (0 <= threshold_pct < 100):
         return _unmeasured(f"threshold {threshold_pct!r} is not a percentage in [0, 100)")
@@ -444,8 +510,8 @@ def check_cache_break(rows: list[dict], *, threshold_pct: float) -> dict:
             multicall.append(n)
             continue
         rd, cre = cur.get("cache_read_input_tokens"), cur.get("cache_creation_input_tokens")
-        if not _is_int(rd):
-            unusable.append(f"row {n}: cache_read_input_tokens missing or not an int")
+        if not _is_int(rd) or rd < 0:
+            unusable.append(f"row {n}: cache_read_input_tokens missing, not an int or negative")
             continue
         if rd == 0 and _is_int(cre) and cre == 0:
             unusable.append(f"row {n}: no cache activity (creation 0 and read 0)")
@@ -471,11 +537,11 @@ def check_cache_break(rows: list[dict], *, threshold_pct: float) -> dict:
                     "gap_s": _gap_s(chat[idx - 1], cur),
                 }
             )
-            continue
-        if stable is not None:
+        elif stable is not None:
             share = rd / stable
             min_share = share if min_share is None else min(min_share, share)
-        stable = rd if stable is None else max(stable, rd)
+        if rd > 0:  # a zero read is a break and never becomes S (S stays None or > 0)
+            stable = rd if stable is None else min(stable, rd)
     coverage = f"judged {judged} of {len(chat) - 1} later rows; {len(multicall)} multi-call rows not judged"
     common = {
         "stable_read_tokens": stable,
@@ -507,7 +573,11 @@ def check_cache_break(rows: list[dict], *, threshold_pct: float) -> dict:
             "reason": f"need >= {MIN_JUDGED_ROWS} judged single-call rows (one establishes S, one is compared); {coverage}",
             **common,
         }
-    return {"status": "PASS", "reason": f"no judged row read below S={stable} ({coverage})", **common}
+    return {
+        "status": "PASS",
+        "reason": f"no judged row read below S, the minimum of the earlier judged reads (final S={stable}) ({coverage})",
+        **common,
+    }
 
 
 _YAML_FENCE_RE = re.compile(r"^```yaml[ \t]*\n(.*?)^```[ \t]*$", re.M | re.S)
@@ -516,8 +586,8 @@ _YAML_FENCE_RE = re.compile(r"^```yaml[ \t]*\n(.*?)^```[ \t]*$", re.M | re.S)
 def read_regression_threshold(config_path: Path | str | None = None) -> float:
     """|regression_threshold| of the ``cache_read_ratio`` entry in the project config ("0%" -> 0.0).
 
-    Parses the config's ``yaml`` fence(s) with PyYAML (a locked transitive dependency of the project,
-    imported lazily; no pyproject change). Any problem raises ValueError.
+    Parses the config's ``yaml`` fence(s) with PyYAML (a declared dependency of the project, imported lazily).
+    Any problem raises ValueError.
     """
     path = Path(config_path) if config_path else DEFAULT_CONFIG
     try:
@@ -553,13 +623,13 @@ def format_cache_break_line(result: dict) -> str:
     return f"cache_break_check: {result['status']} ({result['reason']})"
 
 
-_CACHE_BREAK_EXIT = {"PASS": 0, "FAIL": 1}
+_CACHE_BREAK_EXIT = {"PASS": EXIT_PASS, "NOT_APPLICABLE": EXIT_PASS, "FAIL": EXIT_FAIL}
 
 
 def _exit_code_for(result: object) -> int:
-    """0 PASS / 1 FAIL / 2 UNMEASURED, a missing or unknown status, or anything else."""
+    """0 PASS / NOT_APPLICABLE, 10 FAIL, 11 UNMEASURED or a missing / unknown status or anything else."""
     status = result.get("status") if isinstance(result, dict) else None
-    return _CACHE_BREAK_EXIT.get(status, 2)
+    return _CACHE_BREAK_EXIT.get(status, EXIT_UNMEASURED)
 
 
 def _read_rows_fail_closed(path: Path) -> list[dict]:
@@ -588,18 +658,26 @@ def _read_rows_fail_closed(path: Path) -> list[dict]:
 
 
 def cache_break_cli(path: Path, from_row: int, threshold_override: float | None) -> int:
-    """`--cache-break-check`: exit 0 PASS / 1 FAIL / 2 UNMEASURED or any error (never 1 for an error)."""
+    """`--cache-break-check`: 0 PASS / 10 FAIL / 11 UNMEASURED or could not measure; 2 for bad arguments.
+
+    Anything unexpected propagates (a crash, exit 1): it is never reported as a verdict.
+    """
+    if from_row < 1:
+        print("ERROR: --from-row must be >= 1 (1-based over chat rows)", file=sys.stderr)
+        return 2
+    if not path.is_file():
+        print(f"ERROR: no such file: {path}", file=sys.stderr)
+        return 2
+    if threshold_override is not None and not (0 <= threshold_override < 100):  # also False for nan
+        print(f"ERROR: --regression-threshold {threshold_override!r} is not a percentage in [0, 100)", file=sys.stderr)
+        return 2
     try:
-        if from_row < 1:
-            raise ValueError("--from-row must be >= 1 (1-based over chat rows)")
-        if not path.exists():
-            raise ValueError(f"no such file: {path}")
         threshold = threshold_override if threshold_override is not None else read_regression_threshold()
         chat = [r for r in _read_rows_fail_closed(path) if r.get("call_type") == "chat"]
-        result = check_cache_break(chat[from_row - 1 :], threshold_pct=threshold)
-    except Exception as exc:  # noqa: BLE001 - an error must be exit 2, never exit 1 (= FAIL)
+    except (ValueError, OSError) as exc:  # could not measure: unmeasured, never a verdict of break
         print(f"ERROR: {exc}", file=sys.stderr)
-        return 2
+        return EXIT_UNMEASURED
+    result = check_cache_break(chat[from_row - 1 :], threshold_pct=threshold)
     print(json.dumps(result, indent=2))
     return _exit_code_for(result)
 
@@ -608,7 +686,25 @@ def _mean(xs: list[float]) -> float:
     return sum(xs) / len(xs) if xs else 0.0
 
 
-def _summarise(usage_rows: list[dict], debug_rows: list[dict], *, turns: int, rows_error: str | None = None) -> dict:
+_ROWS_INCLUDE = (
+    "all chat rows of the run (the warm-up and plain micro-ack rows are included when the replay flags are on)"
+)
+
+
+def _summarise(
+    usage_rows: list[dict],
+    debug_rows: list[dict],
+    *,
+    turns: int,
+    rows_error: str | None = None,
+    not_applicable_reason: str | None = None,
+    row_turns: list | None = None,
+    trailing_plain: bool = False,
+    debug_error: str | None = None,
+) -> dict:
+    """`row_turns`: the turn id (0, "p1", 1.., "p2") of every row in `usage_rows`, or None when the rows could not be
+    attributed to turns. It only decides `last_turn_cache_creation` (the last chat row of the last CONTENT turn);
+    the means and series stay over all rows, labelled by `c8_cache.rows_include`."""
     creation = [float(r.get("cache_creation_input_tokens", 0) or 0) for r in usage_rows]
     read = [float(r.get("cache_read_input_tokens", 0) or 0) for r in usage_rows]
     hashes = [r.get("system_sha256") for r in debug_rows if r.get("system_sha256")]
@@ -623,10 +719,14 @@ def _summarise(usage_rows: list[dict], debug_rows: list[dict], *, turns: int, ro
             "byte_stable": len(distinct_hashes) == 1,
             "sample": distinct_hashes[:3],
         }
+    elif debug_error is not None:
+        c1 = {"available": False, "note": f"cache_debug.jsonl could not be read during the run: {debug_error}"}
     else:
         c1 = {"available": False, "note": "no cache_debug.jsonl rows (old build / NELL_CACHE_DEBUG unset)"}
 
-    if rows_error is not None:
+    if not_applicable_reason is not None:
+        cache_break = _not_applicable(not_applicable_reason)
+    elif rows_error is not None:
         cache_break = _unmeasured(rows_error)
     else:
         try:
@@ -634,6 +734,16 @@ def _summarise(usage_rows: list[dict], debug_rows: list[dict], *, turns: int, ro
         except ValueError as exc:
             cache_break = _unmeasured(f"threshold unreadable: {exc}")
 
+    if row_turns is not None:
+        content = [c for tid, c in zip(row_turns, creation, strict=True) if isinstance(tid, int) and tid >= 1]
+        last_content = content[-1] if content else None
+        last_note = "creation of the last chat row of the last content turn"
+    elif trailing_plain:
+        last_content = None
+        last_note = "unavailable: the rows could not be attributed to turns and the run ends with a plain micro-ack"
+    else:
+        last_content = creation[-1] if creation else None
+        last_note = "creation of the last chat row (the run has no trailing plain turn)"
     return {
         "turns_requested": turns,
         "chat_rows_observed": len(usage_rows),
@@ -643,21 +753,31 @@ def _summarise(usage_rows: list[dict], debug_rows: list[dict], *, turns: int, ro
             "mean_cache_read": round(_mean(read), 1),
             "cache_creation_series": creation,
             "cache_read_series": read,
+            "rows_include": _ROWS_INCLUDE,
+            "row_turns": row_turns,
         },
         "c9_history_caching": {
             "note": "decide by comparison: does NEW mean_cache_creation drop toward "
             "'new exchange + volatile' vs OLD? if yes, CLI breakpoints the user "
             "message and A+ captured most of B; if it stays at history scale, "
             "Option B is required.",
-            "last_turn_cache_creation": creation[-1] if creation else None,
+            "last_turn_cache_creation": last_content,
+            "last_turn_note": last_note,
         },
         "cache_break_check": cache_break,
     }
 
 
+def _flags(js: dict) -> tuple[bool, bool]:
+    """(warm-up, plain turns) an arm's replay used; a missing key means the turn was not sent (older script)."""
+    return bool(js.get("warmup_turn")), bool(js.get("plain_turns"))
+
+
 def compare(old_path: Path, new_path: Path) -> int:
+    """Print the A/B report; returns 0 (C8 pass), 10 (C8 fail) or 11 (not comparable)."""
     old = json.loads(old_path.read_text())
     new = json.loads(new_path.read_text())
+
     def _verdict(js: dict) -> str:
         cb = js.get("cache_break_check")
         if isinstance(cb, dict) and "status" in cb and "reason" in cb:
@@ -668,32 +788,62 @@ def compare(old_path: Path, new_path: Path) -> int:
         cb = js.get("cache_break_check")
         return str(cb.get("status")) if isinstance(cb, dict) and cb.get("status") else "n/a"
 
-    # Diagnostics go to stderr so stdout stays the A/B report.
-    if bool(old.get("warmup_turn")) != bool(new.get("warmup_turn")):
+    # Diagnostics go to stderr; stdout is the A/B report (which also says when the arms are not comparable).
+    if _flags(old)[0] != _flags(new)[0]:
         print(
-            f"WARNING: warmup_turn differs (old={bool(old.get('warmup_turn'))}, new={bool(new.get('warmup_turn'))}): "
-            "the cold warm-up row is in only one arm's means and series, which skews every number below. "
+            f"WARNING: warmup_turn differs (old={_flags(old)[0]}, new={_flags(new)[0]}): "
+            "the cold warm-up row is in only one arm's means and series, so the arms are not comparable. "
             f"Re-run both arms with the same setting (--no-warmup on both, or neither). "
             f"(cache_break_check: old {_status(old)}, new {_status(new)})",
             file=sys.stderr,
         )
-    if bool(old.get("plain_turns")) != bool(new.get("plain_turns")):
+    if _flags(old)[1] != _flags(new)[1]:
         print(
-            f"WARNING: plain_turns differs (old={bool(old.get('plain_turns'))}, new={bool(new.get('plain_turns'))}): "
-            "the plain micro-ack rows are in only one arm's means and series, which skews every number below. "
+            f"WARNING: plain_turns differs (old={_flags(old)[1]}, new={_flags(new)[1]}): "
+            "the plain micro-ack rows are in only one arm's means and series, so the arms are not comparable. "
             f"Re-run both arms with the same setting (--no-plain-turns on both, or neither). "
             f"(cache_break_check: old {_status(old)}, new {_status(new)})",
             file=sys.stderr,
         )
     print(f"old {_verdict(old)}", file=sys.stderr)
     print(f"new {_verdict(new)}", file=sys.stderr)
+
+    reasons = []
+    if _flags(old) != _flags(new):
+        reasons.append(
+            f"the arms' turn scripts differ (old: warm-up={_flags(old)[0]}, plain turns={_flags(old)[1]}; "
+            f"new: warm-up={_flags(new)[0]}, plain turns={_flags(new)[1]})"
+        )
+    for key in ("turns_requested", "with_tools"):
+        if key in old and key in new and old[key] != new[key]:
+            reasons.append(f"{key} differs (old={old[key]!r}, new={new[key]!r})")
+    comparable = not reasons
+
     oc = old["c8_cache"]["mean_cache_creation"]
     nc = new["c8_cache"]["mean_cache_creation"]
     orr = old["c8_cache"]["mean_cache_read"]
     nr = new["c8_cache"]["mean_cache_read"]
+
+    def _last_label(js: dict) -> str:
+        if "row_turns" not in js.get("c8_cache", {}) and _flags(js)[1]:
+            return " (last row: includes the trailing micro-ack)"
+        return ""
+
     print("# cache replay A/B (old → new)\n")
-    print(f"mean cache_creation/turn: {oc:.0f} → {nc:.0f}  ({_pct(oc, nc)})")
-    print(f"mean cache_read/turn:     {orr:.0f} → {nr:.0f}  ({_pct(orr, nr)})")
+    if not comparable:
+        print("NOT COMPARABLE: " + "; ".join(reasons) + ". No deltas and no C8 verdict are printed; re-run both arms with")
+        print("the same settings (see the replay A/B note in guarded-change.companion.md).\n")
+        print(f"mean cache_creation/row:  old {oc:.0f}, new {nc:.0f}  (no delta: not comparable)")
+        print(f"mean cache_read/row:      old {orr:.0f}, new {nr:.0f}  (no delta: not comparable)")
+    else:
+        if ("cache_break_check" in old) != ("cache_break_check" in new):
+            which = "old" if "cache_break_check" not in old else "new"
+            print(
+                f"note: the {which} arm predates the cache-break check and the warm-up / plain-turn settings; it is "
+                "comparable because both arms ran the same turn script (no warm-up, no plain turns).\n"
+            )
+        print(f"mean cache_creation/turn: {oc:.0f} → {nc:.0f}  ({_pct(oc, nc)})")
+        print(f"mean cache_read/turn:     {orr:.0f} → {nr:.0f}  ({_pct(orr, nr)})")
     # C8's GATED signal is a material, consistent drop in cache_creation/turn — the
     # frozen system block shifting from create→read. The "corresponding read rise"
     # is real but, when history dominates the read, masked in the mean (a ~4K system
@@ -704,11 +854,14 @@ def compare(old_path: Path, new_path: Path) -> int:
     create_drop_pct = ((oc - nc) / oc * 100) if oc else 0.0
     read_ok = nr >= 0.5 * orr  # read didn't collapse
     c8_pass = create_drop_pct >= 5.0 and read_ok
-    print(
-        f"\nC8 (system-block cache stops re-creating): {'PASS' if c8_pass else 'FAIL'}"
-        f"  — cache_creation/turn {-create_drop_pct:+.0f}% (gated: want a material drop);"
-        f" read {_pct(orr, nr)} (context, history-dominated)"
-    )
+    if comparable:
+        print(
+            f"\nC8 (system-block cache stops re-creating): {'PASS' if c8_pass else 'FAIL'}"
+            f"  (cache_creation/turn {-create_drop_pct:+.0f}%, gated: want a material drop;"
+            f" read {_pct(orr, nr)}, context, history-dominated)"
+        )
+    else:
+        print("\nC8 (system-block cache stops re-creating): not comparable (no verdict)")
     c1 = new.get("c1_system_byte_stability", {})
     if c1.get("available"):
         print(f"C1 (frozen system byte-stable, new build): "
@@ -716,11 +869,14 @@ def compare(old_path: Path, new_path: Path) -> int:
               f"(distinct system hashes: {c1.get('distinct_system_sha256')})")
     else:
         print("C1: n/a (new-build run had no cache_debug.jsonl — set NELL_CACHE_DEBUG=1)")
-    print("\nC9 (history caching, measure-and-decide): compare last-turn cache_creation —")
-    print(f"  old last turn: {old['c9_history_caching'].get('last_turn_cache_creation')}")
-    print(f"  new last turn: {new['c9_history_caching'].get('last_turn_cache_creation')}")
+    if comparable:
+        print("\nC9 (history caching, measure-and-decide): compare last-turn cache_creation:")
+    else:
+        print("\nC9 (history caching): last-turn cache_creation of each arm, for reference only (arms not comparable):")
+    print(f"  old last turn: {old['c9_history_caching'].get('last_turn_cache_creation')}{_last_label(old)}")
+    print(f"  new last turn: {new['c9_history_caching'].get('last_turn_cache_creation')}{_last_label(new)}")
 
-    # Per-turn trend — the A+ tell. If NEW's read CLIMBS with turn number (history
+    # Per-row trend: the A+ tell. If NEW's read CLIMBS with row number (history
     # accumulating, append-only) while creation stays flat, A+ is working. If NEW's
     # read stays floored while OLD's climbs, the history isn't caching (windowing or
     # no user-message breakpoint).
@@ -732,10 +888,17 @@ def compare(old_path: Path, new_path: Path) -> int:
     def _g(xs: list, j: int) -> str:
         return f"{xs[j]:.0f}" if j < len(xs) else "-"
 
-    print("\nper-turn trend (create / read):")
-    print(f"  {'turn':>4}  {'OLD create':>11} {'OLD read':>9}   {'NEW create':>11} {'NEW read':>9}")
-    for i in range(max(len(ocs), len(ncs))):
-        print(f"  {i + 1:>4}  {_g(ocs, i):>11} {_g(ors, i):>9}   {_g(ncs, i):>11} {_g(nrs, i):>9}")
+    if comparable:
+        print("\nper-row trend (create / read), one row per chat row of the run:")
+        print(f"  {'row':>4}  {'OLD create':>11} {'OLD read':>9}   {'NEW create':>11} {'NEW read':>9}")
+        for i in range(max(len(ocs), len(ncs))):
+            print(f"  {i + 1:>4}  {_g(ocs, i):>11} {_g(ors, i):>9}   {_g(ncs, i):>11} {_g(nrs, i):>9}")
+    else:
+        for tag, js, cs, rs in (("old", old, ocs, ors), ("new", new, ncs, nrs)):
+            ids = js["c8_cache"].get("row_turns")
+            labels = [str(x) for x in ids] if isinstance(ids, list) and len(ids) == len(cs) else [str(i + 1) for i in range(len(cs))]
+            print(f"\n{tag} arm per-row series (create / read), rows labelled by turn id when known:")
+            print("  " + "  ".join(f"{lab}:{c:.0f}/{r:.0f}" for lab, c, r in zip(labels, cs, rs, strict=False)))
 
     # C7 side-by-side: if both runs dumped replies (sibling <out>.replies.json),
     # print old-vs-new per prompt so the human judge can score voice + ambient-
@@ -758,7 +921,9 @@ def compare(old_path: Path, new_path: Path) -> int:
             print("\n" + "-" * 78)
     else:
         print("\n(C7 side-by-side unavailable — re-run both arms with --dump-replies)")
-    return 0 if c8_pass else 1
+    if not comparable:
+        return EXIT_UNMEASURED
+    return EXIT_PASS if c8_pass else EXIT_FAIL
 
 
 def _sibling_replies(metrics_path: Path) -> list[dict]:
@@ -820,7 +985,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         metavar="USAGE.jsonl",
         help="run the per-run cache-break check on this chat_usage.jsonl instead of a replay "
-        "(exit 0 PASS / 1 FAIL / 2 UNMEASURED or error; run it via `uv run python`)",
+        "(exit 0 PASS / 10 FAIL / 11 UNMEASURED or could not measure / 2 bad arguments; run it via `uv run python`)",
     )
     p.add_argument(
         "--from-row",
