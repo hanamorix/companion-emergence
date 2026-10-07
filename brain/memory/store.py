@@ -3074,8 +3074,10 @@ class MemoryStore:
         id, one at a time, in rank order, so the clock (``allows``) can stop the
         walk after any row: it is the hard stop inside a page, because a page is
         sized from an estimate. ``finish`` is told the characters judged. The
-        walk's rows are a prefix of the unbudgeted walk's, the kept rows a prefix
-        of its kept rows; any ``sqlite3.OperationalError`` propagates."""
+        walk's rows follow the ordering statement's order, which has matched the
+        wide statement's (the unbudgeted walk's) in every case checked; rows are
+        skipped by id, so the walk loses and repeats none even if it did not;
+        any ``sqlite3.OperationalError`` propagates."""
         if limit is None:
             return [row for row in self._conn.execute(sql, params).fetchall() if keep(row["content"])]
         if keep_budget is None:

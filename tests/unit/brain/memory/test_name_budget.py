@@ -2,8 +2,8 @@
 query's continuation walk runs under the per-message time budget and learns its
 own cost (criteria CS8a-CS8g, CS3a name half).
 
-A "continuation" is the second query `MemoryStore._fts_rows_kept` makes when the
-first page (50 rows) came back full and the name filter rejected some of it. The
+A "continuation" is the walk `MemoryStore._fts_rows_kept` makes past the first page
+(50 rows) when it came back full and the name filter rejected some of it. The
 fixture is a real file database in which 200 short rows hold the modal "will"
 written in lower case (the stopword-name "Will" matches only when capitalized,
 S151, so every one is rejected) and five long rows hold "Will": by bm25 the 200
@@ -277,6 +277,20 @@ def _make_paged_store(path: Path, *, family: bool = False, long_rows: bool = Fal
     return s
 
 
+@pytest.fixture(autouse=True)
+def _page_loop_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A walk whose page loop never ends (a mutant, a regression) fails instead of hanging."""
+    real = store_mod._page_rows  # noqa: SLF001
+    asked = {"n": 0}
+
+    def guarded(remaining: float, per_row: float) -> int:
+        asked["n"] += 1
+        assert asked["n"] <= 20_000, "the page loop did not end"
+        return real(remaining, per_row)
+
+    monkeypatch.setattr(store_mod, "_page_rows", guarded)
+
+
 @pytest.fixture
 def paged(tmp_path: Path) -> Iterator[MemoryStore]:
     s = _make_paged_store(tmp_path / "paged.db")
@@ -308,6 +322,11 @@ def _ids(rows) -> list[tuple[str, float]]:
     return [(r["id"], r["_bm25"]) for r in rows]
 
 
+def _records(rows) -> list[tuple[tuple[str, ...], tuple]]:
+    """Every column of every row (the full record and the score), in order."""
+    return [(tuple(r.keys()), tuple(r)) for r in rows]
+
+
 @pytest.mark.parametrize(
     ("first_cost", "left"),
     [(1.0, 1.0), (0.5, 1.0), (1.0, 7.0), (2.0**-20, 1000.0)],
@@ -325,6 +344,7 @@ def test_cs8b1_paging_judges_every_row_once_in_the_unbudgeted_order_whatever_the
     assert len(full_keep.texts) == PAGED_ROWS + 3, "the unbudgeted walk judges every match"
     assert keep.texts == full_keep.texts, "each row once, in the unbudgeted order, the first page's ids not again"
     assert _ids(rows) == _ids(expected), "the same full records and scores, in the same order"
+    assert _records(rows) == _records(expected) and rows, "every column of every kept row, not just the id"
 
 
 def test_cs8b1_the_family_types_order_by_pages_the_same_way(tmp_path: Path, clock: Clock) -> None:
@@ -531,6 +551,49 @@ def test_cs8b4_an_error_while_reading_a_page_propagates_closes_the_cursor_and_st
     assert budget.finished == [sum(len(t) for t in keep.texts[FIRST:])], "the two rows judged are handed to finish"
 
 
+def test_cs8b4_an_error_from_a_by_id_read_propagates_closes_the_cursor_and_still_finishes(
+    paged: MemoryStore, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _FailingRead(_Conn):
+        reads = 0
+
+        def execute(self, sql, *args):
+            if "WHERE m.id =" in sql:
+                type(self).reads += 1
+                if type(self).reads == 3:
+                    raise sqlite3.OperationalError("database is locked")
+            return super().execute(sql, *args)
+
+    proxy = _FailingRead(paged._conn)  # noqa: SLF001
+    monkeypatch.setattr(paged, "_conn", proxy)
+    budget = _Budget(60.0, clock=clock)
+    keep = _Keep(clock, cost=lambda i: 1.0 if i < FIRST else 0.0)
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        _walk_rows(paged, budget, keep)
+    assert proxy.log == ["closed"], "the ordering cursor is closed on the way out"
+    assert budget.finished == [sum(len(t) for t in keep.texts[FIRST:])], "the rows judged so far are handed to finish"
+    assert len(keep.texts) == FIRST + 2
+
+
+def test_cs8b3_a_short_page_ends_the_walk_and_the_page_loop_is_bounded(
+    paged: MemoryStore, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cursor runs dry: the short page ends the walk. The loop guard turns a walk that
+    would spin on an exhausted cursor (the mutant) into a failure instead of a hang."""
+    real = store_mod._page_rows  # noqa: SLF001
+    asked = {"n": 0}
+
+    def guarded(remaining: float, per_row: float) -> int:
+        asked["n"] += 1
+        assert asked["n"] <= 3 * (PAGED_ROWS + 3), "the page loop did not end on an exhausted cursor"
+        return real(remaining, per_row)
+
+    monkeypatch.setattr(store_mod, "_page_rows", guarded)
+    keep = _Keep(clock)
+    _walk_rows(paged, _Budget(1.0, clock=clock), keep)
+    assert len(keep.texts) == PAGED_ROWS + 3 and asked["n"] <= PAGED_ROWS + 3 + 1
+
+
 def _bounded_walk(paged: MemoryStore, clock: Clock, *, left: float, first_cost: float, later_cost: float,
                   first: float = 0.0, ordering: float = 0.0):
     clock.t = 0.0
@@ -621,7 +684,7 @@ def test_cs8a_a_refused_row_stops_the_walk_it_does_not_skip_to_a_shorter_one(sto
 
 
 class _Spy:
-    """A connection proxy that logs every statement; `interrupt` etc. forwarded."""
+    """A connection proxy that logs every statement; everything else is forwarded."""
 
     def __init__(self, conn) -> None:
         self._conn = conn

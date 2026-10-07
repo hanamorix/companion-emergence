@@ -1011,9 +1011,12 @@ def test_cs17f_appending_a_sample_drops_every_buffered_sample_past_the_window(
         other_store.close()
 
 
-def test_cs17f_a_flush_that_never_succeeds_cannot_grow_the_buffer_past_one_window(
+def test_cs17f_a_flush_that_keeps_failing_holds_at_most_one_window_and_loses_none_in_it(
     store: MemoryStore, series: CostSeries, clock: Clock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """(`flush` itself already drops expired samples before it writes, so this scenario is bounded
+    with or without the append-time prune; the prune is what bounds a buffer that is never flushed,
+    pinned by the test above. This one pins that no in-window sample is lost on the way.)"""
     def locked(*args, **kwargs):
         raise sqlite3.OperationalError("database is locked")
 

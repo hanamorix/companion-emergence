@@ -11,7 +11,8 @@ mean.
 
 Six series use it: the rerank (`reranker.py`), the paragraph embed, the recall
 setup and the paragraph scan (`semantic_recall.py`), the keyword extra words
-and the name matching (`keyword_budget.py`). Each is keyed by what it measures
+and the name matching (`keyword_budget.py`); a seventh, the rerank's RAM growth
+(`RAM_SERIES`, S171), saves a weighted ratio of its sums instead of a fit. Each is keyed by what it measures
 (a model id, a store) and, in storage, by the machine too (S159): a persona
 database copied to another machine starts there as a first startup, because
 this machine's random id (`machine_id`, S163) differs.

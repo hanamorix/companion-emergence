@@ -633,9 +633,9 @@ class _RamState:
 class RerankCostEstimate:
     """The fitted cost model for one reranker model id (see the section
     header). `ram_bytes_per_token` is RSS growth per padded token past
-    `peak_padded_tokens` (the largest padded batch measured so far); `None`
-    when no call past the high water had a readable RSS delta (the RAM term
-    of the width fit is then skipped). `measured_batches` = the measurements
+    `peak_padded_tokens` (the largest padded batch this process has measured);
+    `None` when no saved or buffered call past a high water had a readable RSS
+    delta (the RAM term of the width fit is then skipped). `measured_batches` = the measurements
     behind the time fit in effect."""
 
     overhead_seconds: float
@@ -660,7 +660,8 @@ class _BudgetMiss:
     anchor_tokens: tuple[int, ...]
 
 
-# model_id -> RAM state, the model ids whose warm-up has run, the last query per
+# model_id -> this process's high water (the RAM figure itself is the saved series
+# `_ram_cost`), the model ids whose warm-up has run, the last query per
 # model id that went to the cosine path for lack of budget (S113), the chat
 # activity marker of each model id's last re-measure (S100), and the "too long"
 # verdicts (S127: remembered until the cost estimate next changes, decided by

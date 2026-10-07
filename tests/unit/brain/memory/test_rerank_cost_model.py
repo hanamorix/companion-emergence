@@ -792,7 +792,7 @@ def _run_interleaved_updates(
     return reranker_mod._ram_state[_MODEL], (reader_result[0] if reader_result else None)
 
 
-def test_conc1_interleaved_update_is_counted_and_reader_sees_whole_updates(
+def test_conc1_interleaved_update_is_counted_and_reader_sees_whole_updates(  # against writers; a flush's take-out gap can still hide a buffered sample for a moment (cost_series module docstring)
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ram, seen = _run_interleaved_updates(monkeypatch, second_update_wait=0.3)
@@ -1067,6 +1067,24 @@ def test_cs15_a_saved_figure_of_zero_is_no_figure_and_the_seed_runs(
     _persist_ram(bytes_per_token=figure)
     provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-4)
     assert rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0).width == 5
+
+
+def test_cs15_a_figure_carried_after_downtime_still_avoids_the_seed(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wall = [1_000_000.0]
+    monkeypatch.setattr(cost_series, "_wall_clock", lambda: wall[0])
+    monkeypatch.setattr(reranker_mod, "_current_rss_bytes", lambda: 1.0e9)
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
+    _persist_estimate()
+    _persist_ram()
+    wall[0] += cost_series.window_seconds() + 60.0  # downtime: every sample is past the window
+    reranker_mod._rerank_cost.record(_STORE, _MODEL, 700, 0.07)  # (a fresh time sample so the time series answers)
+    reranker_mod._rerank_cost.record(_STORE, _MODEL, 1400, 0.14)
+    provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-4)
+    assert rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0).width > 5, (
+        "the carried RAM figure answers when its window is empty"
+    )
 
 
 def test_cs15_a_figure_saved_on_another_machine_does_not_count(
