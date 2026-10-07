@@ -11,12 +11,13 @@ this store.
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import math
 import re
 import sqlite3
-import threading
+import sys
 import uuid
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field
@@ -758,12 +759,15 @@ def _bump_amount(bump: bool | float) -> float | None:
 
 class KeepBudget(Protocol):
     """The time budget of a filtered FTS search's continuation (name-recall fix
-    S145, S155, S160): see `MemoryStore._fts_rows_kept`. `begin()` starts the
-    walk and returns the seconds left for it (`None`: none, run no continuation
-    query); `allows(rows_judged, chars)` is asked before each continuation row is
-    judged (`chars` = the characters of the rows judged so far, including that
-    row); `finish(chars)` is called once when the walk ends, with the characters
-    judged (0 when it judged no row)."""
+    S145, S155, S160, S170): see `MemoryStore._fts_rows_kept`. `now()` is the
+    budget's own clock in seconds (the walk's timing uses it, so a test can
+    script it); `begin()` starts the walk and returns the seconds left for it
+    (`None`: none, read no continuation); `allows(rows_judged, chars)` is asked
+    before each continuation row is judged (`chars` = the characters of the rows
+    judged so far, including that row); `finish(chars)` is called once when the
+    walk ends, with the characters judged (0 when it judged no row)."""
+
+    def now(self) -> float: ...
 
     def begin(self) -> float | None: ...
 
@@ -772,43 +776,33 @@ class KeepBudget(Protocol):
     def finish(self, chars: int) -> None: ...
 
 
-class _Deadline:
-    """Interrupts a running statement on `conn` once `seconds` have passed
-    (`sqlite3.Connection.interrupt` from a helper thread). SQLite applies an
-    interrupt only while a statement is running, so one fired just BEFORE the
-    walk's statement begins (a deadline of almost no time) would be lost: the
-    helper therefore re-sends it every `seconds` until disarmed. The callback
-    only acts while `active`, under the lock, so `disarm()` (called BEFORE the
-    cursor closes) guarantees no interrupt can land on a later statement of the
-    same connection; `fired` says whether this deadline sent an interrupt, so the
-    caller swallows only an interrupt of its own."""
+def _page_rows(remaining: float, per_row: float) -> int:
+    """How many rows one page of the budgeted walk may hold (S170): the rows
+    that fit `remaining` seconds at `per_row` seconds each. 0 = no time left or
+    not even one row fits (the walk ends); a `per_row` of 0 (no cost was measurable) gives
+    a page of one row, never an unlimited fetch; a quotient too large for an
+    int is capped at `sys.maxsize`."""
+    if remaining <= 0.0 or remaining < per_row:
+        return 0
+    if per_row <= 0.0:
+        return 1
+    rows = remaining / per_row
+    if rows >= sys.maxsize:
+        return sys.maxsize
+    return int(rows)
 
-    def __init__(self, conn: sqlite3.Connection, seconds: float) -> None:
-        self._conn = conn
-        self._lock = threading.Lock()
-        self._active = True
-        self._stop = threading.Event()
-        self._interval = max(0.0, seconds)
-        self.fired = False
-        self._thread = threading.Thread(target=self._run, name="fts-deadline", daemon=True)
 
-    def arm(self) -> None:
-        self._thread.start()
+_WIDE_SELECT = "SELECT m.*, "
 
-    def _run(self) -> None:
-        while not self._stop.wait(self._interval):
-            self._fire()
 
-    def _fire(self) -> None:
-        with self._lock:
-            if self._active:
-                self.fired = True
-                self._conn.interrupt()
-
-    def disarm(self) -> None:
-        with self._lock:
-            self._active = False
-        self._stop.set()
+def _ordering_sql(sql: str) -> str:
+    """The narrow ordering statement of a wide `search_fts_scored` statement: the
+    same FROM, WHERE and ORDER BY, selecting only `m.id` and the score, so the
+    sort carries no row (S170: with `m.*` SQLite sorts every match with its whole
+    row, the embedding included, before it returns the first one)."""
+    if not sql.startswith(_WIDE_SELECT):
+        raise ValueError("the statement must begin with 'SELECT m.*, '")
+    return "SELECT m.id, " + sql[len(_WIDE_SELECT) :]
 
 
 class MemoryStore:
@@ -3002,13 +2996,13 @@ class MemoryStore:
         ``keep`` (name-recall fix, names increment, S121/S129): a row filter on
         the raw ``content``, applied BEFORE ``limit`` so rejected rows never take a
         place in the result. The first query is today's, with ``LIMIT``; only when
-        it dropped a row and came back full is a second query (no ``LIMIT``) read
-        from the cursor, skipping every id the first one returned, until ``limit``
+        it dropped a row and came back full does the walk continue past it, in the
+        same order and skipping every id the first one returned, until ``limit``
         rows passed. Only the returned rows are bumped. None (default): today's
         single query, unchanged.
 
-        ``keep_budget`` (name-recall fix S145, S155, S160): a time budget for that
-        second query only (the first page and today's no-budget path are
+        ``keep_budget`` (name-recall fix S145, S155, S160, S170): a time budget for
+        that continuation only (the first page and today's no-budget path are
         unchanged); see ``_fts_rows_kept``.
         """
         match = _to_fts_match(query)
@@ -3059,20 +3053,36 @@ class MemoryStore:
         keep_budget: KeepBudget | None = None,
     ) -> list[sqlite3.Row]:
         """``search_fts_scored``'s rows that pass ``keep``, in the query's order,
-        at most ``limit`` (see its docstring).
+        at most ``limit`` (see its docstring). ``sql`` must begin ``SELECT m.*, ``
+        and end with its ORDER BY.
 
-        With a ``keep_budget`` the CONTINUATION (the second query, read only when
-        the first page came back full and dropped a row) runs under it: ``begin()``
-        gives the seconds left (none: no continuation); a deadline timer interrupts
-        the continuation query itself when they are spent (S145: one query that is
-        itself long cannot overrun the budget); before each row ``allows`` may stop
-        the walk (the prediction, from the second judged row on); and ``finish`` is
-        told the characters judged. The walk's rows are a prefix of the unbudgeted
-        walk's, the kept rows a prefix of its kept rows. Only an interrupt this
-        deadline fired is swallowed; any other ``OperationalError`` propagates."""
+        With a ``keep_budget`` the continuation (read only when the first page
+        came back full and dropped a row) runs under it (S145, S170). The first
+        page is timed with the budget's clock: the seconds ``execute`` took (the
+        scan, scoring and sort SQLite does before it returns a row) and the
+        seconds per row of fetching and judging it. ``begin()`` gives the seconds
+        left; unless one row is affordable after that first-page cost, no
+        continuation statement runs and the first page's kept rows are the result.
+        Otherwise a narrow ordering statement (the same order, selecting only the
+        id and the score, so the sort carries no row) runs once and its cursor is
+        read in pages. Before each page its size is the rows that fit the time
+        remaining at the measured per-row cost; a page that judged rows replaces
+        that cost with its own (the worst seen on the continuation's own pages is
+        kept, so a slower page makes the next smaller). A row is read in full by
+        id, one at a time, in rank order, so the clock (``allows``) can stop the
+        walk after any row: it is the hard stop inside a page, because a page is
+        sized from an estimate. ``finish`` is told the characters judged. The
+        walk's rows are a prefix of the unbudgeted walk's, the kept rows a prefix
+        of its kept rows; any ``sqlite3.OperationalError`` propagates."""
         if limit is None:
             return [row for row in self._conn.execute(sql, params).fetchall() if keep(row["content"])]
-        first = self._conn.execute(sql + " LIMIT ?", [*params, limit]).fetchall()
+        if keep_budget is None:
+            first = self._conn.execute(sql + " LIMIT ?", [*params, limit]).fetchall()
+        else:
+            began = keep_budget.now()
+            cursor = self._conn.execute(sql + " LIMIT ?", [*params, limit])
+            executed = keep_budget.now()
+            first = cursor.fetchall()
         kept = [row for row in first if keep(row["content"])]
         if len(kept) == len(first) or len(first) < limit:
             return kept
@@ -3091,40 +3101,57 @@ class MemoryStore:
             finally:
                 cursor.close()
             return kept
+        overhead = executed - began
+        per_row = (keep_budget.now() - executed) / len(first)
         left = keep_budget.begin()
         if left is None:
             return kept
         judged = 0
         chars = 0
-        deadline = _Deadline(self._conn, left)
-        cursor = None
         try:
-            deadline.arm()
+            started = keep_budget.now()
+            if left - overhead < per_row:
+                return kept
+            ordering = self._conn.execute(_ordering_sql(sql), params)
             try:
-                cursor = self._conn.execute(sql, params)
-                for row in cursor:
-                    if row["id"] in seen:
-                        continue
-                    seen.add(row["id"])
-                    text = row["content"] or ""
-                    if not keep_budget.allows(judged, chars + len(text)):
+                own_worst = 0.0
+                done = False
+                while not done:
+                    page = _page_rows(left - (keep_budget.now() - started), per_row)
+                    if page < 1:
                         break
-                    judged += 1
-                    chars += len(text)
-                    if keep(row["content"]):
-                        kept.append(row)
-                        if len(kept) >= limit:
+                    rows = list(itertools.islice(ordering, page))
+                    page_began = keep_budget.now()
+                    page_judged = 0
+                    for ordered in rows:
+                        if ordered["id"] in seen:
+                            continue
+                        seen.add(ordered["id"])
+                        row = self._conn.execute(
+                            _WIDE_SELECT + "? AS _bm25 FROM memories m WHERE m.id = ?",
+                            (ordered["_bm25"], ordered["id"]),
+                        ).fetchone()
+                        if row is None:
+                            continue
+                        text = row["content"] or ""
+                        if not keep_budget.allows(judged, chars + len(text)):
+                            done = True
                             break
-            except sqlite3.OperationalError as exc:
-                # Only the interrupt this deadline sent ends the walk quietly.
-                if not (deadline.fired and "interrupt" in str(exc).lower()):
-                    raise
+                        judged += 1
+                        page_judged += 1
+                        chars += len(text)
+                        if keep(row["content"]):
+                            kept.append(row)
+                            if len(kept) >= limit:
+                                done = True
+                                break
+                    if page_judged:
+                        own_worst = max(own_worst, (keep_budget.now() - page_began) / page_judged)
+                        per_row = own_worst
+                    if len(rows) < page:
+                        done = True
             finally:
-                # Disarmed BEFORE the cursor closes: no interrupt can reach a
-                # later statement of this connection.
-                deadline.disarm()
-                if cursor is not None:
-                    cursor.close()
+                ordering.close()
         finally:
             keep_budget.finish(chars if judged else 0)
         return kept

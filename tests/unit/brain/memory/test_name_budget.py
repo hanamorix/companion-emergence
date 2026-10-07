@@ -14,14 +14,18 @@ the filter judges advances the budget clock by a fixed cost per character
 
 from __future__ import annotations
 
+import inspect
 import sqlite3
+import sys
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
 from brain.memory import cost_series, keyword_budget, relevance
-from brain.memory.store import Memory, MemoryStore, _Deadline
+from brain.memory import store as store_mod
+from brain.memory.store import Memory, MemoryStore
 
 B = keyword_budget.recall_budget_seconds()
 BIG_ROWS = 40_000
@@ -134,14 +138,14 @@ def test_fixture_the_first_page_is_all_rejects_and_the_hits_lie_past_it(
     assert all(t.startswith("i will") for t in texts[:FIRST_PAGE])
 
 
-def test_cs8a_without_an_estimate_the_clock_alone_stops_the_walk_when_left_is_reached(
+def test_cs8a_without_an_estimate_the_pages_and_the_clock_stop_the_walk_when_left_is_reached(
     store: MemoryStore, clock: Clock, judged: Judged
 ) -> None:
     _, full = _walk(store, clock, judged, left=None)
     hits, texts = _walk(store, clock, judged, left=10.5 * ROW_COST)
     continuation = texts[FIRST_PAGE:]
-    assert len(continuation) == 11, "10 rows leave 0.5 row: the 11th is judged, then the elapsed time has reached left"
-    assert continuation == full[FIRST_PAGE : FIRST_PAGE + 11], "a prefix of the unbudgeted walk's rows"
+    assert len(continuation) == 10, "S170: one page holds the 10 rows that fit; the 0.5 row left is less than a row"
+    assert continuation == full[FIRST_PAGE : FIRST_PAGE + 10], "a prefix of the unbudgeted walk's rows"
     assert hits == [], "the rejected prefix holds no hit"
 
 
@@ -192,88 +196,398 @@ def test_cs8a_kept_rows_are_a_prefix_of_the_unbudgeted_kept_rows(
 
 
 # ---------------------------------------------------------------------------
-# CS8b: the continuation query itself is clock-bounded.
+# CS8b (S170): the continuation is read in pages of ONE narrow ordering
+# statement; the deadline is checked between pages and a page's size is derived
+# from the measured per-row cost. Time is scripted (dyadic numbers, so every
+# boundary is exact): the first page's `execute` and the ordering statement
+# advance the clock from a sqlite trace callback, each judged row from `keep`.
 # ---------------------------------------------------------------------------
+
+SQL = (
+    "SELECT m.*, bm25(memories_fts) AS _bm25 FROM memories_fts f JOIN memories m ON m.rowid = f.rowid "
+    "WHERE memories_fts MATCH ? AND m.active = 1 ORDER BY _bm25 ASC"
+)
+FAMILY_SQL = (
+    "SELECT m.*, bm25(memories_fts) AS _bm25 FROM memories_fts f JOIN memories m ON m.rowid = f.rowid "
+    "WHERE memories_fts MATCH ? AND m.active = 1 ORDER BY (m.memory_type IN (?, ?)) ASC, _bm25 ASC"
+)
+FIRST = 5  # the first page's LIMIT in these tests
+PAGED_ROWS = 40
 
 
 class _Budget:
-    """A KeepBudget stub: `left` seconds, always allows, records what it is told."""
+    """A KeepBudget on a scripted clock (`clock`: None = a clock that never moves).
+    With `clock_bound`, `allows` ends the walk once its elapsed time reaches `left`,
+    as `NameWalkBudget.allows` does; `allows=` replaces that."""
 
-    def __init__(self, left: float | None, *, allows=lambda rows, chars: True) -> None:
+    def __init__(self, left: float | None, *, clock: Clock | None = None, clock_bound: bool = False, allows=None) -> None:
         self._left = left
+        self._clock = clock
+        self._clock_bound = clock_bound
         self._allows = allows
+        self.began = 0.0
         self.finished: list[int] = []
 
+    def now(self) -> float:
+        return 0.0 if self._clock is None else self._clock.t
+
     def begin(self):
+        self.began = self.now()
         return self._left
 
     def allows(self, rows_judged, chars):
-        return self._allows(rows_judged, chars)
+        if self._allows is not None:
+            return self._allows(rows_judged, chars)
+        return not (self._clock_bound and self.now() - self.began >= self._left)
 
     def finish(self, chars):
         self.finished.append(chars)
 
 
-@pytest.fixture(scope="module")
-def big_store(tmp_path_factory: pytest.TempPathFactory) -> Iterator[MemoryStore]:
-    s = MemoryStore(tmp_path_factory.mktemp("big") / "big.db", integrity_check=False)
-    s._conn.executemany(  # noqa: SLF001
-        "INSERT INTO memories (id, content, memory_type, domain, emotions_json, tags_json, created_at) "
-        "VALUES (?, ?, 'conversation', 'us', '{}', '[]', '2026-01-01T00:00:00+00:00')",
-        [(f"id{i:06d}", f"i will {i} " + "x" * 40) for i in range(BIG_ROWS)],
-    )
-    s._conn.commit()  # noqa: SLF001
+class _Keep:
+    """The name filter: keeps "Will" rows, records every text it is asked about and
+    advances the scripted clock by `cost(i)` for the i-th call (0-based)."""
+
+    def __init__(self, clock: Clock, cost=lambda i: 0.0) -> None:
+        self.clock = clock
+        self.cost = cost
+        self.texts: list[str] = []
+
+    def __call__(self, text: str) -> bool:
+        i = len(self.texts)
+        self.texts.append(text)
+        self.clock.t += self.cost(i)
+        return text.startswith("Will")
+
+
+def _make_paged_store(path: Path, *, family: bool = False, long_rows: bool = False) -> MemoryStore:
+    s = MemoryStore(path, integrity_check=False)
+    for i in range(PAGED_ROWS):  # equal lengths: equal bm25, so ties straddle every page boundary
+        kind = "monologue" if family and i % 3 == 0 else "conversation"
+        s.create(Memory.create_new(content=ROW.format(i=i), memory_type=kind, domain="us"))
+    for j in range(3):
+        filler = " ".join(f"padding{j}x{k}" for k in range(20 + 5 * j))
+        if long_rows:
+            filler *= 40
+        s.create(
+            Memory.create_new(
+                content=f"Will brought the lantern number {j} and {filler}", memory_type="conversation", domain="us"
+            )
+        )
+    return s
+
+
+@pytest.fixture
+def paged(tmp_path: Path) -> Iterator[MemoryStore]:
+    s = _make_paged_store(tmp_path / "paged.db")
     yield s
     s.close()
 
 
-def _kept(store: MemoryStore, budget) -> list:
-    sql = (
-        "SELECT m.*, bm25(memories_fts) AS _bm25 FROM memories_fts f JOIN memories m ON m.rowid = f.rowid "
-        "WHERE memories_fts MATCH ? AND m.active = 1 ORDER BY _bm25 ASC"
-    )
-    return store._fts_rows_kept(sql, ['"will"'], 10, lambda text: False, budget)  # noqa: SLF001
+def _trace(store: MemoryStore, clock: Clock, *, first: float = 0.0, ordering: float = 0.0) -> list[str]:
+    """Log every statement the store's connection starts; the first page's statement
+    advances the scripted clock by `first`, the ordering statement by `ordering`."""
+    statements: list[str] = []
+
+    def callback(sql: str) -> None:
+        statements.append(sql)
+        if sql.startswith("SELECT m.*, bm25") and "LIMIT" in sql:
+            clock.t += first
+        elif sql.startswith("SELECT m.id, "):
+            clock.t += ordering
+
+    store._conn.set_trace_callback(callback)  # noqa: SLF001
+    return statements
 
 
-def test_cs8b_a_deadline_that_expires_during_the_continuation_query_interrupts_it(
-    big_store: MemoryStore,
+def _walk_rows(store: MemoryStore, budget, keep, *, sql: str = SQL, params=None):
+    return store._fts_rows_kept(sql, params or ['"will"'], FIRST, keep, budget)  # noqa: SLF001
+
+
+def _ids(rows) -> list[tuple[str, float]]:
+    return [(r["id"], r["_bm25"]) for r in rows]
+
+
+@pytest.mark.parametrize(
+    ("first_cost", "left"),
+    [(1.0, 1.0), (0.5, 1.0), (1.0, 7.0), (2.0**-20, 1000.0)],
+    ids=["page of 1", "page of 2", "page of 7 then 1", "the whole cursor"],
+)
+def test_cs8b1_paging_judges_every_row_once_in_the_unbudgeted_order_whatever_the_page_size(
+    paged: MemoryStore, clock: Clock, first_cost: float, left: float
 ) -> None:
-    first_page_kept = []  # the filter rejects everything: nothing to keep from the first page
-    budget = _Budget(0.0)
-    assert _kept(big_store, budget) == first_page_kept, "returns the first page's kept rows"
-    assert budget.finished == [0], "interrupted with no row judged: nothing recorded"
-    # the connection is healthy afterwards
-    assert big_store._conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == BIG_ROWS  # noqa: SLF001
+    clock.t = 0.0
+    full_keep = _Keep(clock)
+    expected = _walk_rows(paged, None, full_keep)
+    clock.t = 0.0
+    keep = _Keep(clock, cost=lambda i: first_cost if i < FIRST else 0.0)
+    rows = _walk_rows(paged, _Budget(left, clock=clock), keep)
+    assert len(full_keep.texts) == PAGED_ROWS + 3, "the unbudgeted walk judges every match"
+    assert keep.texts == full_keep.texts, "each row once, in the unbudgeted order, the first page's ids not again"
+    assert _ids(rows) == _ids(expected), "the same full records and scores, in the same order"
 
 
-def test_cs8b_an_interrupt_the_deadline_did_not_fire_still_propagates(big_store: MemoryStore) -> None:
+def test_cs8b1_the_family_types_order_by_pages_the_same_way(tmp_path: Path, clock: Clock) -> None:
+    s = _make_paged_store(tmp_path / "family.db", family=True)
+    try:
+        params = ['"will"', "monologue", "monologue_trace"]
+        full_keep = _Keep(clock)
+        expected = _walk_rows(s, None, full_keep, sql=FAMILY_SQL, params=params)
+        keep = _Keep(clock, cost=lambda i: 1.0 if i < FIRST else 0.0)
+        rows = _walk_rows(s, _Budget(5.0, clock=clock), keep, sql=FAMILY_SQL, params=params)
+        assert keep.texts == full_keep.texts and _ids(rows) == _ids(expected)
+    finally:
+        s.close()
+
+
+def test_cs8b1_an_ordering_that_differs_from_the_first_pages_loses_and_repeats_no_row(
+    paged: MemoryStore, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The order equality of the narrow and the wide statement is an observation, not a
+    guarantee: the walk skips by id, so even an ordering that disagrees with the first
+    page's (here: reversed) judges every row exactly once."""
+    reversed_sql = (
+        "SELECT m.id, bm25(memories_fts) AS _bm25 FROM memories_fts f JOIN memories m ON m.rowid = f.rowid "
+        "WHERE memories_fts MATCH ? AND m.active = 1 ORDER BY m.id DESC"
+    )
+    monkeypatch.setattr(store_mod, "_ordering_sql", lambda sql: reversed_sql)
+    full_keep = _Keep(clock)
+    expected = _walk_rows(paged, None, full_keep)
+    keep = _Keep(clock, cost=lambda i: 1.0 if i < FIRST else 0.0)
+    rows = _walk_rows(paged, _Budget(5.0, clock=clock), keep)
+    assert len(keep.texts) == len(set(keep.texts)) == PAGED_ROWS + 3
+    assert sorted(keep.texts) == sorted(full_keep.texts)
+    assert {r["id"] for r in rows} == {r["id"] for r in expected}
+
+
+@pytest.mark.parametrize(
+    ("remaining", "per_row", "rows"),
+    [(0.75, 0.125, 6), (0.125, 0.125, 1), (0.0625, 0.125, 0), (1.0, 0.0, 1), (0.0, 0.0, 0)],
+)
+def test_cs8b2_the_page_size_is_the_rows_that_fit_the_time_remaining(remaining: float, per_row: float, rows: int) -> None:
+    assert store_mod._page_rows(remaining, per_row) == rows  # noqa: SLF001
+
+
+def test_cs8b2_a_per_row_cost_too_small_to_divide_is_capped_never_raised() -> None:
+    assert store_mod._page_rows(1.0, 5e-324) == sys.maxsize  # noqa: SLF001 - the quotient is infinite
+    assert store_mod._page_rows(1.0, 1e-300) == sys.maxsize  # noqa: SLF001 - beyond an int
+
+
+def test_cs8b2_when_no_row_is_affordable_after_the_first_pages_overhead_no_continuation_runs(
+    paged: MemoryStore, clock: Clock
+) -> None:
+    statements = _trace(paged, clock, first=0.9375)
+    keep = _Keep(clock, cost=lambda i: 0.125 if i < FIRST else 0.0)
+    budget = _Budget(1.0, clock=clock)
+    rows = _walk_rows(paged, budget, keep)
+    # remaining 1.0 - overhead 0.9375 = 0.0625 is less than one row (0.125)
+    assert rows == [] and len(keep.texts) == FIRST, "the first page's kept rows, nothing else judged"
+    assert not [s for s in statements if s.startswith("SELECT m.id, ")], "no ordering statement"
+    assert budget.finished == [0], "nothing judged past the first page: nothing recorded"
+
+
+def test_cs8b2_the_first_page_of_rows_holds_what_fits_after_the_ordering_statement(
+    paged: MemoryStore, clock: Clock
+) -> None:
+    statements = _trace(paged, clock, ordering=0.25)
+    keep = _Keep(clock, cost=lambda i: 0.125)
+    budget = _Budget(1.0, clock=clock, clock_bound=True)
+    _walk_rows(paged, budget, keep)
+    ordering = [s for s in statements if s.startswith("SELECT m.id, ")]
+    assert len(ordering) == 1, "the ordering statement runs once"
+    # remaining after it is 0.75 = six rows at 0.125: the first page of rows holds six
+    assert len(keep.texts) == FIRST + 6
+    assert budget.finished == [sum(len(t) for t in keep.texts[FIRST:])]
+
+
+def test_cs8b2_the_ordering_statement_sorts_ids_and_scores_not_rows(paged: MemoryStore, clock: Clock) -> None:
+    statements = _trace(paged, clock)
+    _walk_rows(paged, _Budget(1000.0, clock=clock), _Keep(clock, cost=lambda i: 0.0))
+    (ordering,) = [s for s in statements if s.startswith("SELECT m.id, ")]
+    select_list = ordering.split(" FROM ")[0]
+    assert "m.*" not in select_list and "content" not in select_list, select_list
+    assert "ORDER BY _bm25 ASC" in ordering and "LIMIT" not in ordering
+
+
+def test_cs8b2_a_per_row_cost_of_zero_gives_pages_of_one_row_and_still_finishes(
+    paged: MemoryStore, clock: Clock
+) -> None:
+    keep = _Keep(clock)
+    _walk_rows(paged, _Budget(1.0, clock=clock), keep)
+    assert len(keep.texts) == PAGED_ROWS + 3
+
+
+def _page_sizes(monkeypatch: pytest.MonkeyPatch) -> list[tuple[float, float]]:
+    calls: list[tuple[float, float]] = []
+    real = store_mod._page_rows  # noqa: SLF001
+
+    def recording(remaining: float, per_row: float) -> int:
+        calls.append((remaining, per_row))
+        return real(remaining, per_row)
+
+    monkeypatch.setattr(store_mod, "_page_rows", recording)
+    return calls
+
+
+def test_cs8b3_a_page_is_sized_from_the_time_remaining_and_the_worst_per_row_figure_of_the_continuation(
+    paged: MemoryStore, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _page_sizes(monkeypatch)
+
+    def cost(i: int) -> float:
+        if i < FIRST:
+            return 0.125  # the first page: 0.125 s a row
+        j = i - FIRST  # the j-th row judged past the first page
+        if j < 16:  # page 1 judges sixteen rows: fifteen cheap and one slow
+            return 0.5 if j == 15 else 0.0625
+        return 0.03125 if j < 29 else 0.25  # page 2 judges thirteen cheaper rows; page 3 only slow ones
+
+    left = 2.625  # page 1 holds 21 ids: the five first-page ids are skipped, sixteen rows are judged
+    _walk_rows(paged, _Budget(left, clock=clock, clock_bound=True), _Keep(clock, cost=cost))
+    assert calls[0] == (left, 0.125), "page 1: all the time left, the first page's per-row figure"
+    page_one = (15 * 0.0625 + 0.5) / 16
+    assert calls[1] == (left - 1.4375, page_one), "page 2: the time remaining, page 1's own figure"
+    assert calls[2][1] == page_one, "page 3: a cheaper page 2 does not shrink the figure again (the worst is kept)"
+    assert calls[2][0] == pytest.approx(left - 1.4375 - 13 * 0.03125)
+
+
+def test_cs8b3_a_page_of_only_skipped_ids_does_not_change_the_per_row_figure(
+    paged: MemoryStore, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _page_sizes(monkeypatch)
+    # first page 1.0 s a row, left 3.0: page 1 holds three ids, all of them first-page ids (skipped)
+    _walk_rows(paged, _Budget(3.0, clock=clock, clock_bound=True), _Keep(clock, cost=lambda i: 1.0 if i < FIRST else 0.0))
+    assert calls[0] == (3.0, 1.0)
+    assert calls[1] == (3.0, 1.0), "nothing was judged on page 1: the figure stays"
+
+
+def test_cs8b3_the_walk_ends_when_the_cursor_is_exhausted_or_limit_rows_are_kept(
+    paged: MemoryStore, clock: Clock
+) -> None:
+    keep = _Keep(clock)
+    rows = paged._fts_rows_kept(SQL, ['"will"'], 2, keep, _Budget(1.0, clock=clock))  # noqa: SLF001
+    # limit 2: the two shortest "Will" rows end the walk before the cursor is read to its end
+    assert len(rows) == 2 and len(keep.texts) < PAGED_ROWS + 3
+
+
+def test_cs8b4_no_interrupt_machinery_is_left_in_the_store() -> None:
+    assert not hasattr(store_mod, "_Deadline")
+    assert "threading" not in vars(store_mod)
+    for obj in (
+        store_mod.MemoryStore.search_fts_scored,
+        store_mod.MemoryStore._fts_rows_kept,  # noqa: SLF001
+        store_mod.KeepBudget,
+    ):
+        text = inspect.getsource(obj).lower()
+        assert "interrupt" not in text and "deadline" not in text, obj
+
+
+class _Cursor:
+    def __init__(self, cursor, log: list[str]) -> None:
+        self._cursor = cursor
+        self._log = log
+
+    def __iter__(self):
+        return iter(self._cursor)
+
+    def close(self) -> None:
+        self._log.append("closed")
+        self._cursor.close()
+
+
+class _Conn:
+    """A connection proxy that wraps the ordering cursor to see it closed."""
+
+    def __init__(self, conn) -> None:
+        self._conn = conn
+        self.log: list[str] = []
+
+    def execute(self, sql, *args):
+        cursor = self._conn.execute(sql, *args)
+        return _Cursor(cursor, self.log) if sql.startswith("SELECT m.id, ") else cursor
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_cs8b4_an_error_while_reading_a_page_propagates_closes_the_cursor_and_still_finishes(
+    paged: MemoryStore, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proxy = _Conn(paged._conn)  # noqa: SLF001
+    monkeypatch.setattr(paged, "_conn", proxy)
+    calls = {"n": 0}
+
     def locked(rows, chars):
-        raise sqlite3.OperationalError("database is locked")
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise sqlite3.OperationalError("database is locked")
+        return True
 
+    budget = _Budget(60.0, clock=clock, allows=locked)
+    keep = _Keep(clock, cost=lambda i: 1.0 if i < FIRST else 0.0)
     with pytest.raises(sqlite3.OperationalError, match="locked"):
-        _kept(big_store, _Budget(60.0, allows=locked))
+        _walk_rows(paged, budget, keep)
+    assert proxy.log == ["closed"], "the ordering cursor is closed on the way out"
+    assert budget.finished == [sum(len(t) for t in keep.texts[FIRST:])], "the two rows judged are handed to finish"
 
 
-def test_cs8b_a_timer_callback_run_after_disarm_interrupts_nothing(big_store: MemoryStore) -> None:
-    deadline = _Deadline(big_store._conn, 3600.0)  # noqa: SLF001
-    deadline.arm()
-    deadline.disarm()
-    deadline._fire()  # noqa: SLF001 - the timer thread running late, after the cursor closed
-    assert deadline.fired is False
-    assert big_store._conn.execute("SELECT 1").fetchone()[0] == 1  # noqa: SLF001
-    # and a full read still completes on the same connection
-    assert len(big_store._conn.execute("SELECT id FROM memories").fetchall()) == BIG_ROWS  # noqa: SLF001
+def _bounded_walk(paged: MemoryStore, clock: Clock, *, left: float, first_cost: float, later_cost: float,
+                  first: float = 0.0, ordering: float = 0.0):
+    clock.t = 0.0
+    statements = _trace(paged, clock, first=first, ordering=ordering)
+    keep = _Keep(clock, cost=lambda i: first_cost if i < FIRST else later_cost)
+    budget = _Budget(left, clock=clock, clock_bound=True)
+    _walk_rows(paged, budget, keep)
+    return statements, keep, clock.t - budget.began
 
 
-def test_cs8b_the_deadline_interrupt_fires_only_while_armed_and_is_recorded(big_store: MemoryStore) -> None:
-    deadline = _Deadline(big_store._conn, 0.0)  # noqa: SLF001
-    deadline.arm()
-    with pytest.raises(sqlite3.OperationalError):
-        for _ in range(50):  # long enough for the 0 s timer to fire inside a statement
-            big_store._conn.execute("SELECT COUNT(*), SUM(length(content)) FROM memories").fetchall()  # noqa: SLF001
-    assert deadline.fired is True
-    deadline.disarm()
-    assert big_store._conn.execute("SELECT 1").fetchone()[0] == 1  # noqa: SLF001
+def test_cs8b5_with_exact_figures_the_walk_fits_left(paged: MemoryStore, clock: Clock) -> None:
+    _, keep, elapsed = _bounded_walk(paged, clock, left=2.0, first_cost=0.125, later_cost=0.125, ordering=0.25)
+    assert elapsed <= 2.0 and len(keep.texts) == FIRST + 14, "0.25 + 14 rows x 0.125 = 2.0"
+
+
+def test_cs8b5_a_per_row_figure_measured_four_times_too_low_still_ends_within_one_row_of_left(
+    paged: MemoryStore, clock: Clock
+) -> None:
+    _, keep, elapsed = _bounded_walk(paged, clock, left=2.0, first_cost=0.03125, later_cost=0.125, ordering=0.25)
+    assert elapsed <= 2.0 + 0.125, "the per-row clock ends the page the estimate over-sized"
+    assert len(keep.texts) - FIRST < PAGED_ROWS + 3 - FIRST, "the walk did not reach the end of the cursor"
+
+
+@pytest.mark.parametrize("ordering_over_first", [1.0, 1.25, 1.5, 2.0])
+@pytest.mark.parametrize("left_over_first", [1.0, 1.25, 1.5, 2.0])
+def test_cs8b5_the_residual_overshoot_is_the_ordering_statements_excess_over_the_first_pages_execute(
+    paged: MemoryStore, clock: Clock, ordering_over_first: float, left_over_first: float
+) -> None:
+    overhead, row = 0.25, 0.0625
+    left = left_over_first * overhead
+    statements, _, elapsed = _bounded_walk(
+        paged, clock, left=left, first_cost=row, later_cost=row, first=overhead, ordering=ordering_over_first * overhead
+    )
+    ran = any(s.startswith("SELECT m.id, ") for s in statements)
+    assert ran == (left - overhead >= row), "the guard: run the ordering statement exactly when one row is affordable"
+    if ran:
+        excess = (ordering_over_first - 1.0) * overhead
+        assert elapsed <= left + excess + row
+
+
+def test_cs8b6_long_contents_leave_the_hits_of_an_ample_budget_equal_to_the_unbudgeted_walk(tmp_path: Path) -> None:
+    s = _make_paged_store(tmp_path / "long.db", long_rows=True)
+    try:
+        sink = Clock()
+        full = _walk_rows(s, None, _Keep(sink))
+        real_clock = _Budget(60.0)
+        real_clock.now = time.perf_counter  # type: ignore[method-assign]
+        rows = _walk_rows(s, real_clock, _Keep(sink))
+        assert _ids(rows) == _ids(full) and len(rows) == 3
+        assert max(len(r["content"]) for r in rows) > 3000
+    finally:
+        s.close()
+
+
+def test_the_name_walk_budget_reads_the_modules_clock(store: MemoryStore, clock: Clock) -> None:
+    clock.t = 3.5
+    assert keyword_budget.NameWalkBudget(store, started=0.0).now() == 3.5
 
 
 def test_cs8a_a_refused_row_stops_the_walk_it_does_not_skip_to_a_shorter_one(store: MemoryStore) -> None:

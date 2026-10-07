@@ -300,7 +300,7 @@ class NameWalkBudget:
     `begin()` reads the saved estimate FIRST (that read is not part of the walk's
     time), then starts the walk's clock, and returns `left` = the recall budget
     minus the time already spent since `started`, or `None` when none is left (the
-    continuation query is then not run). `allows(rows_judged, chars)` is asked
+    continuation is then not read). `allows(rows_judged, chars)` is asked
     before each row: no once the walk's own elapsed time has reached `left`; from
     the second judged row on, no when the predicted cost of `chars` characters (the
     rows judged including this one) exceeds `left`; with no estimate the clock
@@ -314,6 +314,9 @@ class NameWalkBudget:
         self._fit: cost_series.LinearFit | None = None
         self._left = 0.0
         self._began = 0.0
+
+    def now(self) -> float:
+        return now()
 
     def begin(self) -> float | None:
         ranged = _name_cost.estimate(self._store, _NAME_KEY)
