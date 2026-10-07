@@ -85,3 +85,80 @@ def test_find_duplicate_ignores_stale_pending_past_ttl(tmp_path):
     create(tmp_path, op="append", resolved_path="/x/n.md", content="body", now=old)
     assert find_duplicate(tmp_path, op="append", resolved_path="/x/n.md",
                            content_sha=sha, now=datetime.now(UTC)) is None
+
+
+# ---- #344: compare-and-set mark + extras + list_by_status ------------------
+
+
+def _rec(tmp_path, **kw):
+    return create(tmp_path, op="create", resolved_path="/x", content="c",
+                  now=kw.pop("now", datetime(2026, 6, 14, tzinfo=UTC)), **kw)
+
+
+def test_mark_merges_extra_fields(tmp_path):
+    from brain.files import pending
+
+    rid = _rec(tmp_path)
+    assert pending.mark(tmp_path, rid, status="committing", claimed_at="2026-06-14T00:01:00+00:00")
+    rec = get(tmp_path, rid)
+    assert rec["status"] == "committing"
+    assert rec["claimed_at"] == "2026-06-14T00:01:00+00:00"
+
+
+def test_mark_expect_is_a_compare_and_set(tmp_path):
+    from brain.files import pending
+
+    rid = _rec(tmp_path)
+    assert pending.mark(tmp_path, rid, status="committing", expect="pending") is True
+    # A second claimer finds it already claimed: refused, record untouched.
+    assert pending.mark(tmp_path, rid, status="committing", expect="pending", claimed_at="x") is False
+    assert "claimed_at" not in get(tmp_path, rid)
+    # Without expect the old unconditional behaviour is unchanged.
+    assert pending.mark(tmp_path, rid, status="committed") is True
+
+
+def test_list_by_status(tmp_path):
+    from brain.files import pending
+
+    a, b = _rec(tmp_path, making_id="1"), create(
+        tmp_path, op="create", resolved_path="/y", content="d", now=datetime(2026, 6, 14, 1, tzinfo=UTC))
+    pending.mark(tmp_path, a, status="committing")
+    assert [r["id"] for r in pending.list_by_status(tmp_path, "committing")] == [a]
+    assert [r["id"] for r in pending.list_by_status(tmp_path, "pending")] == [b]
+
+
+def test_readers_tolerate_records_with_and_without_the_new_fields(tmp_path):
+    """#344 added claimed_at / resolved_by to the record. Both readers and the dedupe must work
+    on a record that has neither (written by an older brain) and on one that has them."""
+    from brain.files import pending
+
+    now = datetime(2026, 6, 14, tzinfo=UTC)
+    old = create(tmp_path, op="create", resolved_path="/old", content="o", now=now)
+    new = create(tmp_path, op="create", resolved_path="/new", content="n", now=now)
+    pending.mark(tmp_path, new, status="pending", claimed_at="2026-06-14T00:00:00+00:00",
+                 resolved_by="reconcile")
+    assert {r["id"] for r in list_pending(tmp_path, now=now)} == {old, new}
+    sha = hashlib.sha256(b"n").hexdigest()
+    assert find_duplicate(tmp_path, op="create", resolved_path="/new", content_sha=sha,
+                          now=now) == new
+
+
+def test_sweep_does_not_overwrite_a_record_claimed_after_its_read(tmp_path, monkeypatch):
+    """#344 review F-d: sweep read 'pending', a claim landed, sweep's unconditional
+    mark then overwrote the live claim with 'expired'. With expect='pending' it must not."""
+    from brain.files import pending
+
+    t0 = datetime(2026, 6, 14, tzinfo=UTC)
+    rid = create(tmp_path, op="create", resolved_path="/x", content="c", now=t0)
+    real_all = pending._all
+
+    def _all_then_claim(persona_dir):
+        rows = real_all(persona_dir)
+        pending.mark(persona_dir, rid, status="committing")  # the competing claim
+        return rows
+
+    monkeypatch.setattr(pending, "_all", _all_then_claim)
+    n = sweep_expired(tmp_path, now=t0 + timedelta(hours=25))
+    monkeypatch.undo()
+    assert get(tmp_path, rid)["status"] == "committing"
+    assert n == 0, "a sweep whose mark was refused must not count the record"

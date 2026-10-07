@@ -311,6 +311,11 @@ def run_folded(
     # left below are not gated jobs (vocab repair keeps its own timing, S16;
     # the rest are provider-free repairs).
 
+    # One-shot startup: resolve file-write proposals a crash left in 'committing' (#344).
+    # Provider-free and cheap, so it runs BEFORE the vocab repair (which can make a Haiku call);
+    # its own try/except lives inside the helper.
+    _run_pending_reconcile_tick(persona_dir, stale_after=_STARTUP_RECONCILE_GATE)
+
     # One-shot startup: repair already-stubbed emotion_vocabulary.json entries.
     # Step 1 bumps decay_half_life_days from the bad 1.0 → 14.0 (sync,
     # provider-free, so it always lands). Step 2 re-derives descriptions via
@@ -984,6 +989,8 @@ def _build_gated_jobs(
                 _file_pending.sweep_expired(persona_dir, now=datetime.now(UTC))
             except Exception:
                 logger.exception("supervisor pending-write sweep raised")
+            # Resolve writes a crash stranded in 'committing' (#344). Own try/except inside.
+            _run_pending_reconcile_tick(persona_dir)
             # Reap aged .lock.stale-* / .corrupt-* forensic residue (#176).
             try:
                 from brain.health import sidecar_sweep as _sidecar_sweep
@@ -1206,6 +1213,26 @@ def _run_vocab_repair_tick(persona_dir: Path) -> None:
         )
     finally:
         _store.close()
+
+
+# A freshly started process cannot have a commit of its own in flight, and a real write takes
+# milliseconds, so recovery at startup needn't wait out the full 10-minute gate (a quick launchd
+# restart would otherwise leave a crashed commit stranded until the next maintenance tick).
+_STARTUP_RECONCILE_GATE = timedelta(minutes=1)
+
+
+def _run_pending_reconcile_tick(persona_dir: Path, *, stale_after: timedelta | None = None) -> None:
+    """Reconcile file-write proposals stranded in 'committing' (#344). Provider-free, fail-soft."""
+    try:
+        # Resolved at call time (not module import) so the seam is patchable and import-light.
+        from brain.files import commit as _commit
+
+        kw = {} if stale_after is None else {"stale_after": stale_after}
+        n = _commit.reconcile_stale_commits(persona_dir, now=datetime.now(UTC), **kw)
+        if n:
+            logger.info("pending reconcile: resolved %d stranded write(s)", n)
+    except Exception:
+        logger.exception("supervisor pending-write reconcile raised")
 
 
 def _run_maker_tick(persona_dir, *, store, provider):

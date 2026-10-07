@@ -95,19 +95,34 @@ def find_duplicate(persona_dir: Path, *, op: str, resolved_path: str,
     return None
 
 
-def mark(persona_dir: Path, rid: str, *, status: str) -> bool:
-    """Set the record's status. Returns True if it took, False if it did not.
+def list_by_status(persona_dir: Path, status: str) -> list[dict]:
+    """Every record currently in `status`, oldest-unspecified order (callers sort)."""
+    return [r for r in _all(persona_dir) if r.get("status") == status]
+
+
+def mark(persona_dir: Path, rid: str, *, status: str, expect: str | None = None,
+         **extra) -> bool:
+    """Set the record's status (and merge `extra` fields). True if it took, False if not.
 
     Returning a bool rather than failing mutely is load-bearing (#101): get()
     swallows OSError/ValueError, so a transient read failure made this a silent
     no-op. commit_write then wrote the file while the record stayed 'pending',
     and its status guard — the thing making the commit idempotent — stopped
     guarding, so a retry appended the block a second time.
+
+    `expect` makes this a compare-and-set (#344): the status is re-read HERE and
+    nothing is written unless it equals `expect`. That shrinks every
+    read-decide-write window to this function's own few lines. It is not an
+    inter-process lock — ponytail: a lock around the read->replace if two
+    writers on one rid ever show up in practice.
     """
     rec = get(persona_dir, rid)
     if rec is None:
         return False
+    if expect is not None and rec.get("status") != expect:
+        return False
     rec["status"] = status
+    rec.update(extra)
     p = _dir(persona_dir) / f"{rid}.json"
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps(rec), encoding="utf-8")
@@ -125,6 +140,7 @@ def sweep_expired(persona_dir: Path, *, now: datetime) -> int:
         except (ValueError, KeyError):
             continue
         if age > timedelta(hours=_TTL_HOURS):
-            mark(persona_dir, r["id"], status="expired")
-            n += 1
+            # expect='pending': a card claimed since the read above is live, not expired (#344).
+            if mark(persona_dir, r["id"], status="expired", expect="pending"):
+                n += 1
     return n
