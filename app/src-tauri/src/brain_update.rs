@@ -192,6 +192,38 @@ pub(crate) fn active_commit_from_status(status: &str) -> Option<String> {
     active.get("commit")?.as_str().map(str::to_string)
 }
 
+/// `nell update --rollback`'s printed state → the overlay it landed on (None = the
+/// release brain), so the app can say which brain is back (#335).
+pub(crate) fn active_commit_after_flip(stdout: &str) -> Option<String> {
+    status_json(stdout)?.get("active")?.get("commit")?.as_str().map(str::to_string)
+}
+
+/// What the launch path needs to know about the active overlay (#335).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub(crate) struct BrainOverlayStatus {
+    pub active_commit: Option<String>,
+    /// false: installed but never seen running; missing/odd → true (never auto-drop on a guess)
+    pub confirmed: bool,
+    /// "rollback" | "revert"; missing/odd → "revert" (the release brain, the floor)
+    pub undo: String,
+}
+
+pub(crate) fn overlay_status_from(status: &str) -> BrainOverlayStatus {
+    let Some(commit) = active_commit_from_status(status) else {
+        return BrainOverlayStatus { active_commit: None, confirmed: true, undo: "revert".into() };
+    };
+    let active = status_json(status).and_then(|v| v.get("active").cloned()).unwrap_or_default();
+    BrainOverlayStatus {
+        active_commit: Some(commit),
+        confirmed: active.get("confirmed").and_then(|c| c.as_bool()).unwrap_or(true),
+        undo: match active.get("undo").and_then(|u| u.as_str()) {
+            Some("rollback") => "rollback",
+            _ => "revert",
+        }
+        .into(),
+    }
+}
+
 /// The base64-wrapped minisign public key from tauri.conf.json's updater plugin.
 pub(crate) fn updater_pubkey(plugins: &HashMap<String, serde_json::Value>) -> Result<String, String> {
     plugins
@@ -213,6 +245,9 @@ const SIG_MAX: usize = 4 * 1024;
 const WHEEL_MAX: usize = 64 * 1024 * 1024;
 const REQUIREMENTS_MAX: usize = 1024 * 1024;
 const STATUS_TIMEOUT_S: u64 = 30;
+// the launch check (#335): the app stops waiting at 5 s (brainRecovery.ts STATUS_TIMEOUT_MS),
+// so the nell process stops then too instead of outliving the launch
+const LAUNCH_STATUS_TIMEOUT_S: u64 = 5;
 const INSTALL_TIMEOUT_S: u64 = 900; // pip may fetch a changed wheel or two
 const FLIP_TIMEOUT_S: u64 = 60;
 
@@ -468,10 +503,12 @@ pub(crate) async fn apply_brain_update(app: tauri::AppHandle) -> Result<BrainUpd
 
 /// The updated bridge was unhealthy (spec §6): make the previous overlay current
 /// (or the release brain when there is none). The frontend restarts afterwards.
+/// Returns the commit it landed on; None = the release brain (#335).
 #[tauri::command]
-pub(crate) async fn rollback_brain(app: tauri::AppHandle, reason: String) -> Result<(), String> {
+pub(crate) async fn rollback_brain(app: tauri::AppHandle, reason: String) -> Result<Option<String>, String> {
     log_event(&app, "brain update: rolled back", &reason);
-    run_nell(&app, &["update", "--rollback"], FLIP_TIMEOUT_S).await.map(|_| ())
+    let out = run_nell(&app, &["update", "--rollback"], FLIP_TIMEOUT_S).await?;
+    Ok(active_commit_after_flip(&out))
 }
 
 /// "Use the release brain": clear the active overlay. The frontend restarts afterwards.
@@ -479,6 +516,34 @@ pub(crate) async fn rollback_brain(app: tauri::AppHandle, reason: String) -> Res
 pub(crate) async fn revert_brain(app: tauri::AppHandle) -> Result<(), String> {
     log_event(&app, "brain update: switched to the release brain", "");
     run_nell(&app, &["update", "--revert"], FLIP_TIMEOUT_S).await.map(|_| ())
+}
+
+/// The launch check is quick: the app stops waiting at 5 s, so nell stops then too.
+/// After a failed start the app asks again patiently: the user is already looking at
+/// an error, and a slow machine must not switch recovery off (#338 review).
+pub(crate) fn overlay_status_timeout_s(patient: bool) -> u64 {
+    if patient { STATUS_TIMEOUT_S } else { LAUNCH_STATUS_TIMEOUT_S }
+}
+
+/// The launch check (#335): is an overlay active, has it proven itself, how to undo it.
+/// A dev build has no bundled nell and no overlay, so don't spawn anything.
+#[tauri::command]
+pub(crate) async fn brain_overlay_status(
+    app: tauri::AppHandle,
+    patient: Option<bool>,
+) -> Result<BrainOverlayStatus, String> {
+    if crate::bundled_nell_path(&app)?.is_none() {
+        return Ok(overlay_status_from(""));
+    }
+    let timeout = overlay_status_timeout_s(patient.unwrap_or(false));
+    let status = run_nell(&app, &["update", "--status"], timeout).await?;
+    Ok(overlay_status_from(&status))
+}
+
+/// The bridge came back healthy on this commit: it has proven itself (#335).
+#[tauri::command]
+pub(crate) async fn confirm_brain_update(app: tauri::AppHandle, commit: String) -> Result<(), String> {
+    run_nell(&app, &["update", "--confirm", &commit], FLIP_TIMEOUT_S).await.map(|_| ())
 }
 
 #[cfg(test)]
@@ -632,6 +697,58 @@ mod tests {
         assert!(!status_supported(none));
         assert_eq!(active_commit_from_status(none), None);
         assert!(!status_supported("garbage"));
+    }
+
+    #[test]
+    fn the_launch_status_check_gives_up_with_the_app() {
+        // app/src/brainRecovery.ts STATUS_TIMEOUT_MS = 5000: past that the app treats the
+        // status as "no overlay", so the nell process must not outlive it (#338 review)
+        assert_eq!(LAUNCH_STATUS_TIMEOUT_S, 5);
+        // after a failed start the app asks again patiently: a slow machine must not
+        // switch recovery off (#338 review)
+        assert_eq!(overlay_status_timeout_s(false), LAUNCH_STATUS_TIMEOUT_S);
+        assert_eq!(overlay_status_timeout_s(true), STATUS_TIMEOUT_S);
+        let js = include_str!("../../src/brainRecovery.ts");
+        assert!(js.contains("STATUS_TIMEOUT_MS = 5000"), "keep the Rust and JS caps in step");
+    }
+
+    #[test]
+    fn reads_where_a_rollback_landed() {
+        // `nell update --rollback` prints the new state: an overlay, or none (the release brain)
+        let landed = r#"{"active": {"dir": "d", "commit": "abc", "bundle_id": "b"}, "previous": null}"#;
+        assert_eq!(active_commit_after_flip(landed).as_deref(), Some("abc"));
+        assert_eq!(active_commit_after_flip(r#"{"active": null, "previous": {"commit": "x"}}"#), None);
+        assert_eq!(active_commit_after_flip("garbage"), None);
+    }
+
+    #[test]
+    fn reads_the_overlay_status_for_launch() {
+        // confirmed/undo sit before bundle_id so the bundle swap below only hits the top level
+        let s = r#"{"supported": true, "install_kind": "bundled", "bundle_id": "b",
+                    "active": {"dir": "d", "commit": "abc", "confirmed": false, "undo": "rollback",
+                               "brain_version": "0.0.43", "bundle_id": "b"},
+                    "previous": null}"#;
+        let none = BrainOverlayStatus { active_commit: None, confirmed: true, undo: "revert".into() };
+        assert_eq!(
+            overlay_status_from(s),
+            BrainOverlayStatus { active_commit: Some("abc".into()), confirmed: false, undo: "rollback".into() }
+        );
+        // written before #335: no flag → proven; no undo → the release brain (the floor)
+        let old = r#"{"bundle_id": "b", "active": {"commit": "abc", "bundle_id": "b"}, "previous": null}"#;
+        assert_eq!(
+            overlay_status_from(old),
+            BrainOverlayStatus { active_commit: Some("abc".into()), confirmed: true, undo: "revert".into() }
+        );
+        // odd values never auto-drop a build: treated as proven, undo → revert
+        let odd = r#"{"bundle_id": "b", "active": {"commit": "abc", "confirmed": "no", "undo": "sideways", "bundle_id": "b"}, "previous": null}"#;
+        assert_eq!(
+            overlay_status_from(odd),
+            BrainOverlayStatus { active_commit: Some("abc".into()), confirmed: true, undo: "revert".into() }
+        );
+        // another bundle's overlay never loads; garbage / dev builds: no overlay
+        let other = s.replacen(r#""bundle_id": "b","#, r#""bundle_id": "other","#, 1);
+        assert_eq!(overlay_status_from(&other), none);
+        assert_eq!(overlay_status_from(""), none);
     }
 
     #[test]

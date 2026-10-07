@@ -1788,6 +1788,11 @@ def _update_handler(args: argparse.Namespace) -> int:
                 (overlay.revert if args.revert else overlay.rollback)(root)
             print(json.dumps(overlay.read_state(root), indent=2))
             return 0
+        if args.confirm:
+            with overlay.overlay_lock(root):
+                overlay.confirm(root, args.confirm)
+            print(json.dumps(overlay.read_state(root), indent=2))
+            return 0
         if kind == "source" and args.wheel is None:
             import brain
 
@@ -3278,6 +3283,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "KINDLED_NO_OVERLAY=1 first.",
     )
     update_mode.add_argument("--rollback", action="store_true", help="Go back to the previous overlay.")
+    update_mode.add_argument(
+        "--confirm", metavar="COMMIT",
+        help="Mark the active overlay as proven to run (the app does this after a healthy restart).",
+    )
     update_sub.add_argument("script_args", nargs=argparse.REMAINDER,
                             help="Source installs: arguments passed to scripts/update.sh (after --).")
     update_sub.set_defaults(func=_update_handler)

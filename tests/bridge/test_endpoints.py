@@ -1051,6 +1051,17 @@ def test_health_reports_the_running_overlay(persona_dir: Path, monkeypatch):
     assert r.json()["overlay"] == {"commit": "a" * 40, "brain_version": "0.0.43", "bundle_match": True}
 
 
+def test_health_reports_whether_the_overlay_escape_is_set(persona_dir: Path, monkeypatch):
+    """#335: with KINDLED_NO_OVERLAY set the bridge ignores any overlay on purpose, so the
+    app must not keep restarting it to 'finish' an update at every launch."""
+    monkeypatch.delenv("KINDLED_NO_OVERLAY", raising=False)
+    with _make_client(persona_dir) as c:
+        assert c.get("/health").json()["overlay_disabled"] is False
+    monkeypatch.setenv("KINDLED_NO_OVERLAY", "1")
+    with _make_client(persona_dir) as c:
+        assert c.get("/health").json()["overlay_disabled"] is True
+
+
 def test_health_survives_a_failing_overlay_probe(persona_dir: Path, monkeypatch):
     """/health is the restart poll: an overlay probe error must never 500 it."""
     import brain.bridge.server as server

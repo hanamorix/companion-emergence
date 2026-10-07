@@ -300,3 +300,27 @@ def test_replace_gives_up_after_the_bounded_retries(tmp_path, monkeypatch):
     monkeypatch.setattr(overlay, "_RETRY_DELAY_S", 0)
     with pytest.raises(PermissionError):
         overlay.activate(tmp_path, ENTRY_A)
+
+
+def test_confirm_marks_only_the_matching_active_overlay(tmp_path):
+    """#335: the app confirms the build it saw running; a commit that is no longer
+    active (another update landed underneath) is left alone."""
+    overlay.activate(tmp_path, {**ENTRY_A, "confirmed": False, "undo": "revert"})
+    overlay.confirm(tmp_path, "f" * 40)
+    assert overlay.read_state(tmp_path)["active"]["confirmed"] is False
+    overlay.confirm(tmp_path, ENTRY_A["commit"])
+    assert overlay.read_state(tmp_path)["active"] == {**ENTRY_A, "confirmed": True, "undo": "revert"}
+
+
+def test_confirm_without_an_active_overlay_is_a_no_op(tmp_path):
+    overlay.confirm(tmp_path, "c" * 40)
+    assert overlay.read_state(tmp_path) == {"active": None, "previous": None}
+    assert not (tmp_path / overlay.STATE_FILE).exists()
+
+
+def test_rollback_keeps_the_restored_entrys_own_flags(tmp_path):
+    a = {**ENTRY_A, "confirmed": True, "undo": "revert"}
+    overlay.activate(tmp_path, a)
+    overlay.activate(tmp_path, {**ENTRY_B, "confirmed": False, "undo": "rollback"})
+    overlay.rollback(tmp_path)
+    assert overlay.read_state(tmp_path)["active"] == a

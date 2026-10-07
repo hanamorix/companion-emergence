@@ -2,11 +2,11 @@ import { useCallback, useEffect, useState, useRef } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   brainLoginStatus,
-  ensureBridgeRunning,
   listPersonas,
   nellbrainHomePath,
   readAppConfig,
   revealInFileManager,
+  revertBrain,
   setAlwaysOnTop,
   writeAppConfig,
   type AppConfig,
@@ -25,7 +25,7 @@ import {
   type PendingWrite,
   type PersonaState,
 } from "./bridge";
-import { ensureBridgeCurrent } from "./bridgeVersionCheck";
+import { launchBrain } from "./brainRecovery";
 import { NellAvatar } from "./components/NellAvatar";
 import { ChatPanel } from "./components/ChatPanel";
 import { PendingWriteCard } from "./components/PendingWriteCard";
@@ -43,7 +43,7 @@ type AppPhase =
   | { kind: "loading" }
   | { kind: "wizard" }
   | { kind: "picker"; personas: PersonaSummary[] }
-  | { kind: "starting-bridge"; persona: string; error: string | null }
+  | { kind: "starting-bridge"; persona: string; error: string | null; canUseReleaseBrain?: boolean }
   | { kind: "ready"; persona: string };
 
 /**
@@ -58,17 +58,41 @@ export default function App() {
   const [phase, setPhase] = useState<AppPhase>({ kind: "loading" });
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [versionMismatch, setVersionMismatch] = useState(false);
+  const [recoveryNotice, setRecoveryNotice] = useState<string | null>(null);
 
   async function startPersona(persona: string) {
     setPhase({ kind: "starting-bridge", persona, error: null });
     try {
-      await ensureBridgeRunning(persona);
-      const versionResult = await ensureBridgeCurrent(persona);
-      setVersionMismatch(versionResult === "version_mismatch_unresolved");
+      const r = await launchBrain(persona);
+      if (r.kind === "error") {
+        setPhase({ kind: "starting-bridge", persona, error: r.error, canUseReleaseBrain: r.canUseReleaseBrain });
+        return;
+      }
+      setVersionMismatch(r.versionMismatch);
+      setRecoveryNotice(r.notice);
       setPhase({ kind: "ready", persona });
     } catch (e) {
       setPhase({ kind: "starting-bridge", persona, error: errString(e) });
     }
+  }
+
+  /** #335: the active brain update won't start — clear it and start on the release brain. */
+  async function startOnReleaseBrain(persona: string) {
+    // the revert can take a while: show progress, and take the button away so a
+    // second click can't race it into a false "update already running" error
+    setPhase({ kind: "starting-bridge", persona, error: null });
+    try {
+      await revertBrain();
+    } catch (e) {
+      setPhase({
+        kind: "starting-bridge",
+        persona,
+        error: `Couldn't switch to the release brain: ${errString(e)}`,
+        canUseReleaseBrain: true,
+      });
+      return;
+    }
+    await startPersona(persona);
   }
 
   // Boot: read config, decide first-launch vs ready, ensure bridge, etc.
@@ -135,6 +159,9 @@ export default function App() {
           onRetry={() => void startPersona(phase.persona)}
           onOpenAnyway={() => setPhase({ kind: "ready", persona: phase.persona })}
           onRunSetup={() => setPhase({ kind: "wizard" })}
+          onUseReleaseBrain={
+            phase.canUseReleaseBrain ? () => void startOnReleaseBrain(phase.persona) : undefined
+          }
         />
       );
     }
@@ -169,6 +196,34 @@ export default function App() {
           Companion's brain is running a different version — restart the app or reboot if things misbehave.
         </div>
       )}
+      {recoveryNotice && (
+        <div
+          role="status"
+          style={{
+            position: "absolute",
+            bottom: versionMismatch ? 30 : 8,
+            left: "50%",
+            transform: "translateX(-50%)",
+            fontSize: 10,
+            color: "var(--mauve)",
+            background: "rgba(30,24,26,0.82)",
+            padding: "3px 10px",
+            borderRadius: 6,
+            zIndex: 100,
+            whiteSpace: "nowrap",
+          }}
+        >
+          {recoveryNotice}
+          <button
+            type="button"
+            aria-label="Dismiss notice"
+            onClick={() => setRecoveryNotice(null)}
+            style={{ marginLeft: 8, background: "none", border: "none", color: "inherit", cursor: "pointer", fontSize: 10 }}
+          >
+            ×
+          </button>
+        </div>
+      )}
       <Ready config={config!} setConfig={setConfig} persona={phase.persona} />
     </>
   );
@@ -180,12 +235,14 @@ function BridgeErrorScreen({
   onRetry,
   onOpenAnyway,
   onRunSetup,
+  onUseReleaseBrain,
 }: {
   persona: string;
   error: string;
   onRetry: () => void;
   onOpenAnyway: () => void;
   onRunSetup: () => void;
+  onUseReleaseBrain?: () => void;
 }) {
   const diagnostics = `persona=${persona}\nbridge_start_error=${error}`;
   const [logPath, setLogPath] = useState<string | null>(null);
@@ -226,6 +283,7 @@ function BridgeErrorScreen({
         <div style={{ maxWidth: 420, color: "var(--mauve)", fontSize: 12, lineHeight: 1.6 }}>
           Companion Emergence could not start the bridge for <strong>{persona}</strong>.
           You can retry, open the app in degraded mode, or re-run setup.
+          {onUseReleaseBrain && " A brain update is active; the release brain is the one that shipped with the app."}
         </div>
         <pre
           style={{
@@ -245,6 +303,7 @@ function BridgeErrorScreen({
           {diagnostics}
         </pre>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "center" }}>
+          {onUseReleaseBrain && <BootButton onClick={onUseReleaseBrain}>Use the release brain</BootButton>}
           <BootButton onClick={onRetry}>Retry</BootButton>
           <BootButton onClick={onOpenAnyway}>Open degraded</BootButton>
           <BootButton onClick={onRunSetup}>Re-run setup</BootButton>
