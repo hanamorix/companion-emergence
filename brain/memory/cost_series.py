@@ -433,7 +433,11 @@ class CostSeries:
         db = _store_key(store)
         rows = [_Sample(db, self.name, host, key, x, max(0.0, y), now) for x, y in samples]
         if rows:
+            cut = now - window_seconds()
             with _pending_lock:
+                # S176: a flush that keeps failing must not grow the buffer without
+                # bound; a sample past the window would have aged out anyway.
+                _pending[:] = [s for s in _pending if s.taken_at > cut]
                 _pending.extend(rows)
 
     def _buffered(self, db: str, host: str, key: str, cut: float) -> list[_Sample]:

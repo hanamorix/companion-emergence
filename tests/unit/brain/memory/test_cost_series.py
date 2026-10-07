@@ -932,8 +932,29 @@ def test_cs6e_window_counts_also_reads_the_database_before_the_buffer(
 
 
 # ---------------------------------------------------------------------------
-# Follow-up (S171): the ratio estimate of a through-origin series.
+# Follow-up (S171, S176; R2-5): the ratio estimate, the bounded buffer, CS1b per series.
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("which", range(6))
+@pytest.mark.parametrize("flushed", [True, False])
+def test_cs1b_each_production_series_counts_only_the_later_samples_when_the_earlier_age_out(
+    store: MemoryStore, clock: Clock, which: int, flushed: bool
+) -> None:
+    """Parent CS1b on EACH series' own object: samples at t0 and at t0 + W/2; at t0 + W only the
+    later ones count (independent least-squares fit of them alone)."""
+    _name, series, key = _production_series()[which]
+    early = [(1000, 0.3), (3000, 0.7)]
+    later = [(2000, 0.5), (4000, 0.9)]
+    for x, y in early:
+        series.record(store, key, x, y)
+    clock.now = T0 + W / 2
+    for x, y in later:
+        series.record(store, key, x, y)
+    if flushed:
+        cost_series.flush(store)
+    clock.now = T0 + W
+    _assert_fit(series.fit(store, key), later)
 
 
 def test_the_ratio_estimate_is_the_weighted_ratio_of_the_sums_whatever_the_sizes() -> None:
@@ -962,3 +983,46 @@ def test_the_ram_series_saves_its_ratio_as_the_carried_row(store: MemoryStore, c
     clock.now = T0 + W + 1  # every sample aged out: the carried ratio answers, not a re-fit
     fit = ram.fit(store, "m")
     assert fit is not None and fit.rate == pytest.approx(6_000_000.0 / 4000)
+
+
+def _buffered() -> list[cost_series._Sample]:  # noqa: SLF001
+    with cost_series._pending_lock:  # noqa: SLF001
+        return list(cost_series._pending)  # noqa: SLF001
+
+
+def test_cs17f_appending_a_sample_drops_every_buffered_sample_past_the_window(
+    store: MemoryStore, series: CostSeries, clock: Clock, tmp_path: Path
+) -> None:
+    other_store = MemoryStore(tmp_path / "other.db", integrity_check=False)
+    try:
+        other = CostSeries("another series")
+        series.record(store, "m", 1000, 0.1)  # at T0
+        other.record(other_store, "k", 1000, 0.1)  # at T0, another database and series
+        clock.now = T0 + 5
+        series.record(store, "m", 2000, 0.2)  # at T0 + 5
+        assert len(_buffered()) == 3, "nothing is past the window yet"
+        clock.now = T0 + W  # the T0 samples are exactly one window old: gone; T0 + 5 stays
+        series.record(store, "m", 3000, 0.3)
+        assert sorted(s.x for s in _buffered()) == [2000, 3000]
+        clock.now = T0 + W + 5 + 1  # now the T0 + 5 sample is past the window too
+        other.record(other_store, "k", 4000, 0.4)
+        assert sorted(s.x for s in _buffered()) == [3000, 4000]
+    finally:
+        other_store.close()
+
+
+def test_cs17f_a_flush_that_never_succeeds_cannot_grow_the_buffer_past_one_window(
+    store: MemoryStore, series: CostSeries, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def locked(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(store, "record_cost_samples", locked)
+        for step in range(30):
+            clock.now = T0 + step * (W / 10)  # three days of samples, ten per window
+            series.record(store, "m", 1000 + step, 0.1)
+            assert cost_series.flush(store) == 0
+        held = [s for s in _buffered() if s.db == cost_series._store_key(store)]  # noqa: SLF001
+        assert len(held) == 10 and all(s.taken_at > clock.now - W for s in held)
+    assert cost_series.flush(store) == 10, "a flush that finally succeeds writes the in-window ones once"
