@@ -742,6 +742,21 @@ def test_a_hung_commit_that_lands_after_reconcile_corrects_the_record_and_nell(e
     assert not any(x.startswith("you let me write") for x in texts)
 
 
+@pytest.mark.parametrize("outcome", ["committed", "declined", "abandoned", "unverified", "late"])
+def test_no_persona_facing_memory_contains_an_em_dash(env, outcome):
+    """Review on #348: anything injected into the kindled's context stays free of em-dashes
+    (an LLM writing tell). Covers every outcome _wire_memory can write."""
+    persona, out = env
+    persona.mkdir(parents=True, exist_ok=True)
+    store = MemoryStore(persona / "memories.db")
+    try:
+        commit_mod._wire_memory(store, path=str(out / "n.md"), outcome=outcome)
+    finally:
+        store.close()
+    texts = [m.content for m in PendingQueue(persona).read_recent("file_write", limit=10)]
+    assert len(texts) == 1 and "—" not in texts[0] and "–" not in texts[0]
+
+
 # ---- C14: the final mark at the source ---------------------------------------
 
 

@@ -23,7 +23,7 @@ def _wire_memory(store, *, path: str, outcome: str) -> None:
         content = f"you let me write to {path}"
     elif outcome == "abandoned":
         # approved, but a crash meant the block never reached the file (found by reconcile, #345)
-        content = f"you approved my write to {path}, but I can't find it there — it may not have landed"
+        content = f"you approved my write to {path}, but I can't find it there. It may not have landed."
     elif outcome == "late":
         content = f"the write to {path} that I thought hadn't landed did land after all"
     elif outcome == "unverified":
@@ -168,7 +168,7 @@ def _inspect_target(rec: dict) -> str:
 
 
 _COMMIT_STALE = timedelta(minutes=10)
-_COMMIT_UNVERIFIABLE = timedelta(hours=24)
+_COMMIT_UNVERIFIABLE = timedelta(hours=pending._TTL_HOURS)  # one clock for the whole card
 
 
 def _claim_age(rec: dict, now: datetime) -> timedelta | None:

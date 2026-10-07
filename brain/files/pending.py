@@ -134,7 +134,9 @@ def mark(persona_dir: Path, rid: str, *, status: str, expect: str | None = None,
     `expect` makes this a compare-and-set (#344): the status is re-read HERE and
     nothing is written unless it equals `expect`. The read and the replace run under
     one store-wide cross-process lock (#346), so two claimers cannot both win and the
-    shared `.tmp` can't tear. Readers (`get`/`_all`) stay lock-free: `replace` is atomic.
+    shared `.tmp` can't tear. Readers (`get`/`_all`) stay lock-free: on POSIX `replace` is atomic;
+    on Windows it can raise PermissionError while a lock-free reader has the file open. Every
+    caller already treats a failed mark as 'did not take' (bool / OSError handled), so that recovers.
     """
     with _lock(persona_dir):
         rec = get(persona_dir, rid)
