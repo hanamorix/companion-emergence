@@ -464,6 +464,18 @@ def test_cs17b_flush_writes_empties_and_drops_aged_samples(
     assert n == 2
 
 
+def test_cs17b_flush_drops_a_sample_that_aged_while_nothing_was_appended(
+    store: MemoryStore, series: CostSeries, clock: Clock
+) -> None:
+    """Without a later append the buffer's own prune never runs (S176), so the flush's own filter is
+    what keeps an aged sample out of the database (the prune must not stand in for it)."""
+    _record(series, store, [(1000, 0.3), (2000, 0.5)])
+    clock.now = T0 + W + 5
+    assert cost_series.flush(store) == 0
+    assert store._conn.execute("SELECT COUNT(*) FROM cost_series_samples").fetchone()[0] == 0  # noqa: SLF001
+    assert not cost_series.has_pending(store.db_path)
+
+
 def test_cs17b_a_failing_write_puts_the_samples_back(
     store: MemoryStore, series: CostSeries, monkeypatch: pytest.MonkeyPatch
 ) -> None:
