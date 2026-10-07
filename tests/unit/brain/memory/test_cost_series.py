@@ -929,3 +929,36 @@ def test_cs6e_window_counts_also_reads_the_database_before_the_buffer(
     before, after = series.window_counts(store, "m", T0 - 1)
     assert before + after <= 2, "a flush between the two reads never makes a sample count twice"
     assert sum(series.window_counts(store, "m", T0 - 1)) == 2
+
+
+# ---------------------------------------------------------------------------
+# Follow-up (S171): the ratio estimate of a through-origin series.
+# ---------------------------------------------------------------------------
+
+
+def test_the_ratio_estimate_is_the_weighted_ratio_of_the_sums_whatever_the_sizes() -> None:
+    """S171: a through-origin series answers sum(y) / sum(x), no overhead, even with two sizes
+    (an ordinary fit of these points would have an overhead and a different slope)."""
+    state = _state([(1000, 3_000_000.0), (3000, 5_000_000.0)])
+    ratio = state.estimate(True)
+    assert ratio is not None and ratio.fit.overhead == 0.0 and ratio.max_x == 3000
+    assert ratio.fit.rate == pytest.approx(8_000_000.0 / 4_000)
+    ordinary = state.estimate()  # least squares: 2,000,000 B overhead and 1,000 B a token
+    assert ordinary is not None and ordinary.fit.rate == pytest.approx(1_000.0)
+    # an empty window answers with the carried row as it is
+    carried = RangedFit(LinearFit(0.0, 1234.5, 3), 2500)
+    assert SeriesState(LinearSums(), carried).estimate(True) == carried
+
+
+def test_the_ram_series_saves_its_ratio_as_the_carried_row(store: MemoryStore, clock: Clock) -> None:
+    ram = CostSeries(cost_series.RAM_SERIES)
+    ram.record(store, "m", 1000, 1_000_000.0)
+    ram.record(store, "m", 3000, 5_000_000.0)
+    cost_series.flush(store)
+    row = store._conn.execute(  # noqa: SLF001
+        "SELECT overhead, rate FROM cost_series_carried WHERE series = ?", (cost_series.RAM_SERIES,)
+    ).fetchone()
+    assert row[0] == 0.0 and row[1] == pytest.approx(6_000_000.0 / 4000)
+    clock.now = T0 + W + 1  # every sample aged out: the carried ratio answers, not a re-fit
+    fit = ram.fit(store, "m")
+    assert fit is not None and fit.rate == pytest.approx(6_000_000.0 / 4000)

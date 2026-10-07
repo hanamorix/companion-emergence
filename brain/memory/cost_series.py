@@ -55,6 +55,12 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# S171: the series name of the rerank's RAM growth (x = padded tokens past the
+# process high water, y = RSS bytes it grew by), and the series whose estimate is
+# the weighted ratio of the window's sums (bytes per token) rather than a fit.
+RAM_SERIES = "rerank ram"
+THROUGH_ORIGIN_SERIES = frozenset({RAM_SERIES})
+
 # Wall clock for `taken_at` and the window cut. Samples are shared with other
 # processes, so the clock must be one they agree on; a jump of the system clock
 # moves the window (accepted). Tests script it.
@@ -157,16 +163,22 @@ class SeriesState:
     sums: LinearSums = LinearSums()
     carried: RangedFit | None = None
 
-    def estimate(self) -> RangedFit | None:
+    def estimate(self, through_origin: bool = False) -> RangedFit | None:
         """The estimate in effect (S146, S114): an empty window answers with
         the carried estimate as it is; a window with two sizes with its own
         fit; a window with one size with the carried fit rescaled by one
         factor so its prediction at that size equals the window's mean (the
         measured range is then the larger of the two); with nothing carried,
-        the window's own fit."""
+        the window's own fit. `through_origin` (a ratio series, S171): the
+        window's weighted ratio of sums as the rate, no overhead, whatever
+        sizes it holds; an empty window still answers with the carried ratio."""
         sums, carried = self.sums, self.carried
         if sums.n == 0:
             return carried
+        if through_origin:
+            if sums.sum_x <= 0:
+                return carried
+            return RangedFit(LinearFit(0.0, sums.sum_y / sums.sum_x, sums.n), sums.max_x)
         if carried is None or sums.has_two_sizes:
             return _own(sums)
         # One size: every sample's x equals sum_x / n.
@@ -459,7 +471,7 @@ class CostSeries:
     def estimate(self, store: MemoryStore, key: str) -> RangedFit | None:
         """The estimate in effect (see `SeriesState.estimate`)."""
         state = self.state(store, key)
-        return None if state is None else state.estimate()
+        return None if state is None else state.estimate(self.name in THROUGH_ORIGIN_SERIES)
 
     def fit(self, store: MemoryStore, key: str) -> LinearFit | None:
         found = self.estimate(store, key)

@@ -1955,7 +1955,9 @@ class MemoryStore:
             carried = self._cost_carried_row(series, host, key)
             if self._cost_record_hook is not None:
                 self._cost_record_hook()
-            estimate = cost_series.SeriesState(sums, carried).estimate()
+            estimate = cost_series.SeriesState(sums, carried).estimate(
+                series in cost_series.THROUGH_ORIGIN_SERIES
+            )
             if estimate is not None:
                 self._conn.execute(
                     "INSERT INTO cost_series_carried "

@@ -558,11 +558,13 @@ def _reset_reranker_provider_cache() -> None:
 # `normalize_against_anchors`); the two warm-up reranks a process runs first
 # are discarded, as the hourly measurement discarded them (S24/S32).
 #
-# The time series is a rolling 24-hour window saved in memories.db (S146; see
-# `cost_series`); RAM and warm-up state stay process memory. The first measured
-# recall rerank of a process per model id is sized to the S5 minimum even when
-# a saved estimate exists, where RSS is readable (S158), because it seeds the
-# RAM high water. Stuck-width recovery (S100, S113, S116): the last query that
+# The time series and the RAM figure are rolling 24-hour windows saved in
+# memories.db (S146, S171; see `cost_series`); the high water and the warm-up
+# state stay process memory. The first measured recall rerank of a process per
+# model id is sized to the S5 minimum only on the first-ever startup on this
+# machine (no saved time estimate, or none with a RAM figure above 0) where RSS
+# is readable (S158, S171), because it measures the RAM growth. Stuck-width
+# recovery (S100, S113, S116): the last query that
 # went to the cosine path for lack of budget is kept per model id; while the
 # estimate says its first 5 candidates do not fit the full latency budget, the
 # `rerank_width_remeasure` gated job re-measures them once per chat lull
@@ -613,27 +615,18 @@ def _rss_delta(before: float | None, after: float | None) -> float | None:
 
 @dataclass(frozen=True)
 class _RamState:
-    """One reranker model id's RAM state: process memory, not part of the
-    saved time series (the high water is a property of the ONNX arena this
-    process holds, S74, and forgetting it would dilute the RAM figure, R1
-    round-1 F1). Immutable: an update builds a new instance and swaps it in
-    under `_cost_lock`, so a reader never sees half of one sample (CONC-1).
-    The model id having an entry means this process has recorded a measured
-    rerank for it (S158)."""
+    """One reranker model id's process-local RAM state: the high water, the
+    largest padded size this process has measured (a property of the ONNX arena
+    this process holds, S74; a new process starts at 0). The RAM growth figure
+    itself is a saved series (`_ram_cost`, S171), not part of this state. The
+    model id having an entry means this process has recorded a measured rerank
+    for it (S158). Immutable: an update builds a new instance and swaps it in
+    under `_cost_lock`."""
 
-    # RAM (see the section header): growth past the high water only.
     peak_x: int = 0  # largest padded size measured so far (the high water)
-    ram_bytes: float = 0.0  # sum of max(0, RSS delta) over calls that went past the high water
-    ram_x: int = 0  # sum of (x - high water before the call) over those same calls
 
-    def plus(self, padded_tokens: int, rss_delta_bytes: float | None) -> _RamState:
-        ram_bytes, ram_x = self.ram_bytes, self.ram_x
-        if rss_delta_bytes is not None and padded_tokens > self.peak_x:
-            ram_bytes += max(0.0, rss_delta_bytes)
-            ram_x += padded_tokens - self.peak_x
-        return _RamState(
-            peak_x=max(self.peak_x, padded_tokens), ram_bytes=ram_bytes, ram_x=ram_x
-        )
+    def plus(self, padded_tokens: int) -> _RamState:
+        return _RamState(peak_x=max(self.peak_x, padded_tokens))
 
 
 @dataclass(frozen=True)
@@ -677,6 +670,10 @@ class _BudgetMiss:
 # worker thread) and the re-measure job never lose an update. The time series
 # itself is `_rerank_cost` (rolling window, memories.db, `cost_series`).
 _rerank_cost = cost_series.CostSeries("rerank")
+# S171: RSS growth per padded token past the high water, saved like the time series
+# (host-keyed, 24 h window, carried row); its estimate is the weighted ratio of the
+# window's sums (`cost_series.THROUGH_ORIGIN_SERIES`).
+_ram_cost = cost_series.CostSeries(cost_series.RAM_SERIES)
 _ram_state: dict[str, _RamState] = {}
 _warmed_model_ids: set[str] = set()
 _budget_misses: dict[str, _BudgetMiss] = {}
@@ -704,19 +701,22 @@ _cost_update_hook: Callable[[], None] | None = None
 
 def rerank_cost_estimate(model_id: str, store: MemoryStore) -> RerankCostEstimate | None:
     """The current cost model for `model_id`: the time fit of the last 24
-    hours (S146; saved, so available from the first message after a restart)
-    and this process's RAM figure. `None` when there is no time estimate (the
-    first startup on this machine: the width is then the S5 minimum, S24)."""
+    hours (S146; saved, so available from the first message after a restart),
+    this process's high water and the saved RAM figure (S171). `None` when there
+    is no time estimate (the first startup on this machine: the width is then
+    the S5 minimum, S24). The high water is read BEFORE the RAM figure:
+    `_record_rerank_cost` buffers a sample before it publishes the new high
+    water, so a reader that sees the new high water also sees its sample."""
     fit = _rerank_cost.fit(store, model_id)
     if fit is None:
         return None
     with _cost_lock:
         ram = _ram_state.get(model_id, _RamState())
-    ram_per_token = ram.ram_bytes / ram.ram_x if ram.ram_x > 0 else None
+    ram_fit = _ram_cost.fit(store, model_id)
     return RerankCostEstimate(
         overhead_seconds=fit.overhead,
         seconds_per_token=fit.rate,
-        ram_bytes_per_token=ram_per_token,
+        ram_bytes_per_token=None if ram_fit is None else ram_fit.rate,
         measured_batches=fit.samples,
         peak_padded_tokens=ram.peak_x,
     )
@@ -729,14 +729,21 @@ def _record_rerank_cost(
     seconds: float,
     rss_delta_bytes: float | None,
 ) -> None:
-    """Add one measured rerank: its RAM figure to this process's state and its
-    time to the buffered series (S164: nothing is written to the database
-    here)."""
+    """Add one measured rerank: its RAM growth (a call that went past this
+    process's high water with a readable RSS delta) and its time to the buffered
+    series (S164: nothing is written to the database here). The RAM sample is
+    buffered BEFORE the new high water is published (`rerank_cost_estimate` reads
+    them in the opposite order), both under `_cost_lock`; the buffer's own lock is
+    only ever taken inside it."""
     with _cost_lock:
         current = _ram_state.get(model_id, _RamState())
         if _cost_update_hook is not None:
             _cost_update_hook()
-        _ram_state[model_id] = current.plus(padded_tokens, rss_delta_bytes)
+        if rss_delta_bytes is not None and padded_tokens > current.peak_x:
+            _ram_cost.record(
+                store, model_id, padded_tokens - current.peak_x, max(0.0, rss_delta_bytes)
+            )
+        _ram_state[model_id] = current.plus(padded_tokens)
     _rerank_cost.record(store, model_id, padded_tokens, seconds)
 
 
@@ -778,14 +785,19 @@ def _too_long_remembered(model_id: str, store: MemoryStore) -> bool:
     return False
 
 
-def _ram_unseeded(model_id: str) -> bool:
-    """S158: this process has not yet recorded a measured rerank for
-    `model_id` and RSS is readable (Linux), so its first measured recall
-    rerank must run at the S5 minimum to seed the RAM high water, whatever the
-    saved time estimate says."""
+def _ram_unseeded(model_id: str, estimate: RerankCostEstimate) -> bool:
+    """S158/S171: this process has not yet recorded a measured rerank for
+    `model_id`, RSS is readable (Linux) and no RAM figure greater than 0 is saved
+    for this model id on this machine, so its first measured recall rerank must run
+    at the S5 minimum to measure RAM growth, whatever the saved time estimate says.
+    With a saved figure (any restart after the first-ever startup on this host)
+    it is False: the first rerank is sized by the estimate."""
     with _cost_lock:
         if model_id in _ram_state:
             return False
+    figure = estimate.ram_bytes_per_token
+    if figure is not None and figure > 0.0:
+        return False
     return _current_rss_bytes() is not None
 
 
@@ -1413,10 +1425,11 @@ def rerank_for_recall(
         )
     candidate_tokens, anchor_tokens = lengths[: len(pool)], lengths[len(pool) :]
     estimate = rerank_cost_estimate(model_id, store)
-    if estimate is not None and _ram_unseeded(model_id):
-        # S158: the saved estimate would size this process's first measured
-        # rerank past the S5 minimum, but that rerank seeds the RAM high water
-        # the width fit's RAM bound needs; it runs at 5 (where RSS is readable).
+    if estimate is not None and _ram_unseeded(model_id, estimate):
+        # S158/S171: a saved time estimate without a saved RAM figure would size
+        # this process's first measured rerank past the S5 minimum, but that
+        # rerank measures the RAM growth the width fit's RAM bound needs; it runs
+        # at 5 (where RSS is readable).
         estimate = None
     headroom = _available_ram_headroom_bytes() if estimate is not None else None
     width = fit_rerank_width(candidate_tokens, anchor_tokens, estimate, budget_seconds, headroom, cap)
