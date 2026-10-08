@@ -32,18 +32,6 @@ def _lines(persona_dir) -> list[int]:
     return [json.loads(x)["n"] for x in path.read_text().splitlines() if x.strip()]
 
 
-def _buffer_one(persona_dir, n: int = 1) -> None:
-    """Make one append meet a held lock (in a thread so a blocking append fails, not hangs)."""
-    path = rd.diagnostics_path(persona_dir)
-    with rd.file_lock(path):
-        t = threading.Thread(target=rd.append_record, args=(path, _rec(n)), daemon=True)
-        t.start()
-        t.join(timeout=5)
-        assert not t.is_alive()
-    # the lock was released after the append buffered; make sure the retry did not already write it
-    assert rd.has_pending(path) or _lines(persona_dir) == [n]
-
-
 def test_the_flush_job_follows_the_cost_series_flush_in_the_order() -> None:
     i = GATED_JOB_ORDER.index("cost_series_flush")
     assert GATED_JOB_ORDER[i + 1] == "recall_diagnostics_flush"
@@ -79,6 +67,7 @@ def test_the_run_leaves_the_records_buffered_while_the_lock_is_still_held(tmp_pa
         r.start()
         r.join(timeout=5)
         assert not r.is_alive(), "the lull job waited on the held lock"
+        assert done == [JobOutcome.SKIPPED]  # nothing written: not reported as completed
         assert rd.has_pending(path)  # still buffered: the next lull retries
         assert _lines(persona) == []
     assert rd.flush_pending(path) == 1

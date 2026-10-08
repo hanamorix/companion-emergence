@@ -214,9 +214,12 @@ def stubs(monkeypatch):
     monkeypatch.setattr(
         supervisor.recall_diagnostics, "has_pending", lambda _p: work["recall_diagnostics_flush"]
     )
-    monkeypatch.setattr(
-        supervisor.recall_diagnostics, "flush_pending", rec("recall_diagnostics_flush", 1)
-    )
+    def _diagnostics_flush(_p):
+        order.append("recall_diagnostics_flush")
+        work["recall_diagnostics_flush"] = False  # the buffer is empty after a flush that wrote
+        return 1
+
+    monkeypatch.setattr(supervisor.recall_diagnostics, "flush_pending", _diagnostics_flush)
     monkeypatch.setattr(
         supervisor.reranker, "remeasure_stuck_width", rec("rerank_width_remeasure", True)
     )

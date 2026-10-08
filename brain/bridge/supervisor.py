@@ -1043,8 +1043,10 @@ def _build_gated_jobs(
     # while this process buffers records for this persona's log (nothing opened
     # to decide that). Same shape as 4d (S164).
     def _recall_diagnostics_flush_run() -> JobOutcome:
-        recall_diagnostics.flush_pending(recall_diagnostics.diagnostics_path(persona_dir))
-        return JobOutcome.COMPLETED
+        log_path = recall_diagnostics.diagnostics_path(persona_dir)
+        recall_diagnostics.flush_pending(log_path)
+        # The lock was still held (nothing written): not a completed run, the next lull retries.
+        return JobOutcome.SKIPPED if recall_diagnostics.has_pending(log_path) else JobOutcome.COMPLETED
 
     jobs.append(
         GatedJob(
