@@ -978,12 +978,31 @@ def test_the_ratio_estimate_is_the_weighted_ratio_of_the_sums_whatever_the_sizes
     assert ratio.fit.rate == pytest.approx(8_000_000.0 / 4_000)
     ordinary = state.estimate()  # least squares: 2,000,000 B overhead and 1,000 B a token
     assert ordinary is not None and ordinary.fit.rate == pytest.approx(1_000.0)
-    # an empty window answers with the carried row as it is
+    # S178: an empty window answers nothing, whatever row is carried (an ordinary series
+    # still answers its carried fit: S146, CS3b)
     carried = RangedFit(LinearFit(0.0, 1234.5, 3), 2500)
-    assert SeriesState(LinearSums(), carried).estimate(True) == carried
+    assert SeriesState(LinearSums(), carried).estimate(True) is None
+    assert SeriesState(LinearSums(), RangedFit(LinearFit(0.0, 9.9e12, 7), 99)).estimate(True) is None
+    assert SeriesState(LinearSums(), carried).estimate() == carried
 
 
-def test_the_ram_series_saves_its_ratio_as_the_carried_row(store: MemoryStore, clock: Clock) -> None:
+def test_a_ratio_window_whose_sizes_sum_to_zero_has_no_figure() -> None:
+    """S178: samples of size 0 give no ratio (and no division), carried row or not."""
+    zero = LinearSums().plus(0, 5.0)
+    carried = RangedFit(LinearFit(0.0, 1234.5, 3), 2500)
+    assert SeriesState(zero, carried).estimate(True) is None
+    assert SeriesState(zero, None).estimate(True) is None
+
+
+def test_a_ratio_window_with_one_sample_answers_that_samples_ratio() -> None:
+    """S178 / A1b: the figure ages out sample by sample, not all at once."""
+    one = LinearSums().plus(2000, 5_000_000.0)
+    carried = RangedFit(LinearFit(0.0, 1.0e12, 9), 9000)
+    got = SeriesState(one, carried).estimate(True)
+    assert got is not None and got.fit.rate == pytest.approx(2500.0) and got.max_x == 2000
+
+
+def test_the_ram_series_saves_its_ratio_as_the_carried_row_but_never_answers_from_it(store: MemoryStore, clock: Clock) -> None:
     ram = CostSeries(cost_series.RAM_SERIES)
     ram.record(store, "m", 1000, 1_000_000.0)
     ram.record(store, "m", 3000, 5_000_000.0)
@@ -992,9 +1011,14 @@ def test_the_ram_series_saves_its_ratio_as_the_carried_row(store: MemoryStore, c
         "SELECT overhead, rate FROM cost_series_carried WHERE series = ?", (cost_series.RAM_SERIES,)
     ).fetchone()
     assert row[0] == 0.0 and row[1] == pytest.approx(6_000_000.0 / 4000)
-    clock.now = T0 + W + 1  # every sample aged out: the carried ratio answers, not a re-fit
-    fit = ram.fit(store, "m")
-    assert fit is not None and fit.rate == pytest.approx(6_000_000.0 / 4000)
+    clock.now = T0 + W + 1  # every sample aged out: the ratio series has no figure (S178), the row is not read
+    assert ram.fit(store, "m") is None
+    other = CostSeries("a time series")
+    other.record(store, "m", 1000, 0.1)
+    other.record(store, "m", 2000, 0.2)
+    cost_series.flush(store)
+    clock.now = T0 + 2 * W + 2  # an ordinary series still answers its carried fit after downtime (S146, CS3b)
+    assert other.fit(store, "m") is not None
 
 
 def _buffered() -> list[cost_series._Sample]:  # noqa: SLF001

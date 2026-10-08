@@ -349,6 +349,41 @@ def test_c15e_stamp_before_the_ram_check(clock: _Clock, monkeypatch: pytest.Monk
     assert _due(8.0)
 
 
+def test_s178_a_too_high_ram_figure_skips_the_job_until_its_samples_age_out_then_the_job_runs(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A1d: the RAM bound skips the 5-candidate re-measure while the (too-high) figure's sample
+    is in the window; once it has aged out the figure is absent, the bound is off and the job
+    runs and records the RAM sample that re-seeds the figure."""
+    provider = _true_cost_provider(clock, 1.2)
+    _cached(monkeypatch, provider)
+    # An inflated time sample and a RAM figure of 10,000 bytes a token at a small high water.
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 100, 40 * 1.2 * 100 / _X5, 1e6)
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
+    assert _message(provider).hand_off == "budget"
+    assert cost_series.flush(_STORE) >= 1
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 1.0)
+    assert rerank_cost_estimate(_MODEL).ram_bytes_per_token == pytest.approx(1e4)
+    provider.calls.clear()
+    assert _remeasure(7.0) is False and provider.calls == [], "the too-high figure skips the job"
+    assert _MODEL in reranker_mod._budget_misses
+
+    real = cost_series._wall_clock
+    shift = [0.0]
+    monkeypatch.setattr(cost_series, "_wall_clock", lambda: real() + shift[0])
+    shift[0] = cost_series.window_seconds() + 60.0  # every sample is past the window
+    est = rerank_cost_estimate(_MODEL)
+    assert est is not None and est.ram_bytes_per_token is None, "no figure; the carried time fit still says stuck"
+    rss = iter(float(1_000_000 * n) for n in range(10_000))
+    monkeypatch.setattr(reranker_mod, "_current_rss_bytes", lambda: next(rss))
+    assert _due(8.0) is True
+    assert _remeasure(8.0) is True
+    assert len(_seven_doc_calls(provider)) == 1, "the 5 + 2 measurement ran"
+    state = reranker_mod._ram_cost.state(_STORE, _MODEL)
+    assert state is not None and state.sums.n == 1, "its RAM sample re-seeded the figure"
+    assert rerank_cost_estimate(_MODEL).ram_bytes_per_token is not None
+
+
 # ---------------------------------------------------------------------------
 # C15f: recovery in three regimes, plus the S116 (b) drop.
 # ---------------------------------------------------------------------------

@@ -522,7 +522,7 @@ CREATE TABLE IF NOT EXISTS cosine_floor_calibration (
 -- rows); its covering index serves the window aggregate without touching the
 -- table. `cost_series_carried` holds, per key, the estimate in effect after the
 -- last flush and the largest size measured, for a window that is empty or has
--- one size. `host` is this machine's random id (a copied database starts as a
+-- one size (the ratio series, S178, never reads it: an empty window has no figure). `host` is this machine's random id (a copied database starts as a
 -- first startup on the new machine). `CREATE TABLE IF NOT EXISTS` on open:
 -- legacy-safe and idempotent (I9), no existing table or row is touched.
 CREATE TABLE IF NOT EXISTS cost_series_samples (

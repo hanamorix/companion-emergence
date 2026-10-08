@@ -22,7 +22,10 @@ the samples; `cost_series_carried` holds, per key, the estimate in effect after
 the last flush and the largest size it was measured at. The carried estimate is
 what a window with no sample (a long downtime) still answers with, and what a
 window with one size is rescaled from (S114: one factor so the carried fit's
-prediction at that size equals the window's mean).
+prediction at that size equals the window's mean). The ratio series does not
+use it: with no sample in its window it has no figure (S178), so a too-high
+figure leaves by ageing out; its carried row is written like the others and
+only records the estimate in effect after the last flush.
 
 Writes (S164): a sample is only appended to an in-process buffer
 (`CostSeries.record`); nothing on the reply path writes the database. The
@@ -172,14 +175,17 @@ class SeriesState:
         measured range is then the larger of the two); with nothing carried,
         the window's own fit. `through_origin` (a ratio series, S171): the
         window's weighted ratio of sums as the rate, no overhead, whatever
-        sizes it holds; an empty window still answers with the carried ratio."""
+        sizes it holds; with no sample in the window (or sizes that sum to 0)
+        it answers nothing, whatever row is carried (S178: a too-high figure
+        recovers by ageing out of the window, after which the series is seeded
+        again as on a first-ever startup)."""
         sums, carried = self.sums, self.carried
+        if through_origin:
+            if sums.n == 0 or sums.sum_x <= 0:
+                return None
+            return RangedFit(LinearFit(0.0, sums.sum_y / sums.sum_x, sums.n), sums.max_x)
         if sums.n == 0:
             return carried
-        if through_origin:
-            if sums.sum_x <= 0:
-                return carried
-            return RangedFit(LinearFit(0.0, sums.sum_y / sums.sum_x, sums.n), sums.max_x)
         if carried is None or sums.has_two_sizes:
             return _own(sums)
         # One size: every sample's x equals sum_x / n.

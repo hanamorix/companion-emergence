@@ -562,8 +562,9 @@ def _reset_reranker_provider_cache() -> None:
 # memories.db (S146, S171; see `cost_series`); the high water and the warm-up
 # state stay process memory. The first measured recall rerank of a process per
 # model id is sized to the S5 minimum only on the first-ever startup on this
-# machine (no saved time estimate, or none with a RAM figure above 0) where RSS
-# is readable (S158, S171), because it measures the RAM growth. Stuck-width
+# machine (no saved time estimate, or none with a RAM figure above 0 in its
+# 24-hour window: a figure whose samples have all aged out is no figure, S178)
+# where RSS is readable (S158, S171), because it measures the RAM growth. Stuck-width
 # recovery (S100, S113, S116): the last query that
 # went to the cosine path for lack of budget is kept per model id; while the
 # estimate says its first 5 candidates do not fit the full latency budget, the
@@ -791,8 +792,13 @@ def _ram_unseeded(model_id: str, estimate: RerankCostEstimate) -> bool:
     `model_id`, RSS is readable (Linux) and no RAM figure greater than 0 is saved
     for this model id on this machine, so its first measured recall rerank must run
     at the S5 minimum to measure RAM growth, whatever the saved time estimate says.
-    With a saved figure (any restart after the first-ever startup on this host)
-    it is False: the first rerank is sized by the estimate."""
+    "Saved" means a sample in the 24-hour window (S178): a figure whose samples
+    have all aged out is no figure, so a too-high one is re-seeded here instead of
+    staying for good. With a figure (a restart soon after the first-ever startup
+    on this host) it is False: the first rerank is sized by the estimate. A process
+    that has already recorded a rerank is never unseeded (its RAM window can empty
+    while it runs; then the width fit has no RAM term until a call past the high
+    water records a sample)."""
     with _cost_lock:
         if model_id in _ram_state:
             return False
