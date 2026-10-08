@@ -107,7 +107,7 @@ from brain.ingest.pipeline import (
 )
 from brain.initiate.review import _rest_state_from_energy, run_initiate_review_tick
 from brain.initiate.user_pattern import compute_user_presence
-from brain.memory import cost_series, floor_startup, reranker
+from brain.memory import cost_series, floor_startup, recall_diagnostics, reranker
 from brain.memory.embedding_backfill import (
     delete_legacy_embeddings_db as _delete_legacy_embeddings_db,
 )
@@ -2532,6 +2532,20 @@ def _run_calibration_tick(
 
         pruned = store.prune_calibration_log()
         logger.info("calibration tick: pruned=%d calibration_log rows outside retention window", pruned)
+
+        # Name-recall fix R7 (spec section 6, S48, plan P-22): the recall
+        # diagnostics log is pruned here, on the calibration log's retention
+        # window, right after the calibration log and before the labeling step and
+        # its pause return; never from a recall path. Its own guard: the prune is
+        # fail-soft itself, the guard covers the path function.
+        try:
+            removed = recall_diagnostics.prune(recall_diagnostics.diagnostics_path(persona_dir))
+            logger.info(
+                "calibration tick: pruned=%d recall diagnostics records outside retention window",
+                removed,
+            )
+        except Exception:  # noqa: BLE001 — a diagnostics prune must not break the tick
+            logger.exception("calibration tick: recall diagnostics prune failed")
 
         try:
             from brain.memory.relevance_judge import label_calibration_sample
