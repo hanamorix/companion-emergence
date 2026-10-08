@@ -927,13 +927,23 @@ def test_s179_schema_rows_and_pruning(tmp_path: Path) -> None:
         store.save_cost_verdict("rerank", "m3", "c", later, 1, now=later, window_seconds=window)
         assert store.cost_verdict("rerank", "m2", "b") is None
         assert store.cost_verdict("rerank", "m3", "c") == (later, 1)
+        # the boundary: a row exactly one window old goes (like a sample), one a moment younger stays;
+        # another series' rows are not touched
+        t = later + 10.0
+        store.save_cost_verdict("other series", "m1", "z", 5.0, 1, now=5.0, window_seconds=window)
+        store.save_cost_verdict("rerank", "m4", "d", t, 2, now=t, window_seconds=window)
+        store.save_cost_verdict("rerank", "m5", "e", t + 0.5, 2, now=t + 0.5, window_seconds=window)
+        store.save_cost_verdict("rerank", "m6", "f", t + window, 2, now=t + window, window_seconds=window)
+        assert store.cost_verdict("rerank", "m4", "d") is None, "taken_at == now - window is pruned by the next write"
+        assert store.cost_verdict("rerank", "m5", "e") == (t + 0.5, 2), "a moment younger stays"
+        assert store.cost_verdict("other series", "m1", "z") == (5.0, 1), "another series is not pruned"
         store._conn.execute("BEGIN")  # noqa: SLF001
         with pytest.raises(RuntimeError):
             store.save_cost_verdict("rerank", "m3", "c", 1.0, 1, now=1.0, window_seconds=window)
         with pytest.raises(RuntimeError):
-            store.clear_cost_verdict("rerank", "m3", "c", later)
+            store.clear_cost_verdict("rerank", "m6", "f", t + window)
         store._conn.rollback()  # noqa: SLF001
-        assert store.cost_verdict("rerank", "m3", "c") == (later, 1)
+        assert store.cost_verdict("rerank", "m6", "f") == (t + window, 2)
     finally:
         store.close()
 
@@ -954,6 +964,72 @@ def test_s179_the_table_is_created_on_open_and_an_old_database_opens(tmp_path: P
         store.close()
 
 
+def test_s179_a_verdict_reached_while_the_saved_row_is_read_is_not_overwritten(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The row is read outside `_cost_lock`; a verdict the job reaches meanwhile wins."""
+    provider = _too_long(clock, monkeypatch)
+    _restart()
+    _after_restart(provider, monkeypatch)
+    meanwhile = reranker_mod._Verdict(123.0, 4)
+    real = _STORE.cost_verdict
+
+    def reads_and_races(*a, **k):
+        row = real(*a, **k)
+        with reranker_mod._cost_lock:
+            reranker_mod._too_long[_MODEL] = meanwhile
+        return row
+
+    monkeypatch.setattr(_STORE, "cost_verdict", reads_and_races)
+    assert reranker_mod._load_saved_verdict(_MODEL, _STORE) is meanwhile
+    assert reranker_mod._too_long[_MODEL] is meanwhile
+
+
+def _verdict_statements(store: MemoryStore) -> list[str]:
+    seen: list[str] = []
+    store._conn.set_trace_callback(  # noqa: SLF001
+        lambda sql: seen.append(sql) if "cost_series_verdicts" in sql else None
+    )
+    return seen
+
+
+def test_s179_the_saved_row_is_read_once_per_process_also_when_there_is_none(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A2i by SQL count, for the common case (no verdict was ever reached) and for a saved row."""
+    provider = _stuck(clock, monkeypatch)  # a stuck record, no verdict
+    seen = _verdict_statements(_STORE)
+    for lull in (1.0, 2.0, 3.0):
+        assert _due(lull) is True
+    assert len(seen) == 1 and seen[0].lstrip().upper().startswith("SELECT"), seen
+    provider = _too_long(clock, monkeypatch)
+    _restart()
+    _after_restart(provider, monkeypatch)
+    seen = _verdict_statements(_STORE)
+    for lull in (1.0, 2.0, 3.0):
+        assert _due(lull) is False and _remeasure(lull) is False
+    assert len(seen) == 1, seen
+
+
+def test_s179_a_reranking_turn_and_the_recording_of_its_cost_touch_no_verdict(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A2g at run time: with a verdict saved, messages (budget hand-offs and a real rerank on
+    another model id) and the recording of their costs execute no verdict statement."""
+    provider = _too_long(clock, monkeypatch)
+    for name in ("save_cost_verdict", "clear_cost_verdict", "cost_verdict"):
+
+        def spy(*a, _name=name, **k):
+            raise AssertionError(f"{_name} ran on the reply path")
+
+        monkeypatch.setattr(_STORE, name, spy)
+    assert _message(provider).hand_off == "budget"
+    other = _CostScriptedProvider(clock, overhead=0.0, rate=1e-4, model="another-reranker")
+    out = reranker_mod.rerank_for_recall(other, _QUERY, _docs(50, _L), budget_seconds=_B, store=_STORE)
+    assert out.reranked and out.measured, "a real rerank ran and its cost was recorded"
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 3 * _X5, 3.0, 1e6)
+
+
 def test_s179_only_the_lull_job_entry_points_touch_the_verdict() -> None:
     """A2g: nothing on the reply path (`rerank_for_recall` and the callers of the rerank) writes
     or deletes a verdict: the verdict helpers are called only from the due check and the job."""
@@ -970,6 +1046,25 @@ def test_s179_only_the_lull_job_entry_points_touch_the_verdict() -> None:
         "_end_verdict": {"_too_long_remembered"},
         "_load_saved_verdict": {"_too_long_remembered"},
     }
+    storage = {
+        "save_verdict": {"_remember_too_long"},
+        "load_verdict": {"_load_saved_verdict"},
+        "clear_verdict": {"_end_verdict"},
+    }
+    found: dict[str, set[str]] = {n: set() for n in storage}
+    for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+        for call in [c for c in ast.walk(fn) if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)]:
+            if call.func.attr in storage:
+                found[call.func.attr].add(fn.name)
+    assert found == storage, "the series' verdict methods are called only by the verdict helpers"
+    module_level = [
+        c
+        for stmt in tree.body
+        if not isinstance(stmt, (ast.FunctionDef, ast.ClassDef))
+        for c in ast.walk(stmt)
+        if isinstance(c, ast.Call)
+    ]
+    assert not [c for c in module_level if getattr(c.func, "attr", getattr(c.func, "id", "")) in {*storage, *names}]
     definers = {"reranker.py", "cost_series.py", "store.py"}  # the helpers and the storage methods they use
     for path in (_REPO / "brain").rglob("*.py"):
         text = path.read_text(encoding="utf-8")

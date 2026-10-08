@@ -635,8 +635,9 @@ class RerankCostEstimate:
     """The fitted cost model for one reranker model id (see the section
     header). `ram_bytes_per_token` is RSS growth per padded token past
     `peak_padded_tokens` (the largest padded batch this process has measured);
-    `None` when no saved or buffered call past a high water had a readable RSS
-    delta (the RAM term of the width fit is then skipped). `measured_batches` = the measurements
+    `None` when no call past a high water with a readable RSS delta is in the
+    24-hour window, saved or buffered (S178; the RAM term of the width fit is then
+    skipped, and so is the re-measure job's RAM-headroom check). `measured_batches` = the measurements
     behind the time fit in effect."""
 
     overhead_seconds: float
@@ -674,8 +675,9 @@ class _BudgetMiss:
 # itself is `_rerank_cost` (rolling window, memories.db, `cost_series`).
 _rerank_cost = cost_series.CostSeries("rerank")
 # S171: RSS growth per padded token past the high water, saved like the time series
-# (host-keyed, 24 h window, carried row); its estimate is the weighted ratio of the
-# window's sums (`cost_series.THROUGH_ORIGIN_SERIES`).
+# (host-keyed, 24 h window); its estimate is the weighted ratio of the window's sums
+# (`cost_series.THROUGH_ORIGIN_SERIES`) and it has none once the window is empty
+# (S178: its carried row is not read).
 _ram_cost = cost_series.CostSeries(cost_series.RAM_SERIES)
 _ram_state: dict[str, _RamState] = {}
 _warmed_model_ids: set[str] = set()
@@ -765,16 +767,17 @@ def _remember_too_long(model_id: str, store: MemoryStore) -> None:
     except Exception:  # noqa: BLE001 - fail soft
         log.warning("rerank width re-measure: could not record a too-long verdict", exc_info=True)
         return
+    marker = (cost_series._store_key(store), model_id)
     with _cost_lock:
         _too_long[model_id] = _Verdict(now, before)
-        _too_long_loaded.add((cost_series._store_key(store), model_id))
+        _too_long_loaded.add(marker)
     # S179: saved with the host-keyed series, so a restart does not run the
     # over-budget rerank again. Written here, by the lull job (never on the reply
     # path, S164); a failed write leaves the in-process verdict standing.
     try:
         _rerank_cost.save_verdict(store, model_id, now, before)
-    except Exception:  # noqa: BLE001 - fail soft
-        log.warning("rerank width re-measure: could not save the too-long verdict", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - fail soft; warned once, then debug
+        cost_series._note_failure("verdict save", exc)
 
 
 def _load_saved_verdict(model_id: str, store: MemoryStore) -> _Verdict | None:
@@ -819,9 +822,10 @@ def _too_long_remembered(model_id: str, store: MemoryStore) -> bool:
     aged out) is dropped here, when consulted, and its saved row deleted. A failed
     read of the window keeps the verdict (no over-budget re-run on a database
     hiccup)."""
+    marker = (cost_series._store_key(store), model_id)  # outside the lock: it resolves a path
     with _cost_lock:
         verdict = _too_long.get(model_id)
-        unread = verdict is None and (cost_series._store_key(store), model_id) not in _too_long_loaded
+        unread = verdict is None and marker not in _too_long_loaded
     if unread:
         verdict = _load_saved_verdict(model_id, store)
     if verdict is None:
@@ -935,8 +939,11 @@ def stuck_width_due(
     budget, and no sample has arrived or aged out since, so a new record does
     not re-trigger the job until the estimate changes). A miss found not stuck
     is dropped. The in-memory checks come first; `store_factory` (a context
-    manager yielding a store, opened only past them) supplies the saved series.
-    Takes `_cost_lock` only briefly, never nested."""
+    manager yielding a store, opened only past them) supplies the saved series
+    and the saved verdict, which this check may read (once per process) and delete
+    when the verdict has ended (S179: the one write a due check makes; it runs in
+    the lull job, never on the reply path). Takes `_cost_lock` only briefly,
+    never nested."""
     model_id = resolve_reranker_model_id()
     miss, stamp, warmed = _job_state(model_id)
     if miss is None or not warmed or _provider_cache.get(model_id) is None:

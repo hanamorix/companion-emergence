@@ -24,8 +24,8 @@ what a window with no sample (a long downtime) still answers with, and what a
 window with one size is rescaled from (S114: one factor so the carried fit's
 prediction at that size equals the window's mean). The ratio series does not
 use it: with no sample in its window it has no figure (S178), so a too-high
-figure leaves by ageing out; its carried row is written like the others and
-only records the estimate in effect after the last flush.
+figure leaves by ageing out. Its carried row is still written by a flush that
+leaves an estimate, and is never read.
 
 Verdicts (S179): the rerank's S127 "too long" verdict is saved with the series,
 one row per (series, machine id, key) in `cost_series_verdicts`, by

@@ -11,7 +11,8 @@ Tables of the file:
 
 * ``known_names`` (unchanged since N1): one row per name, ``name_lower`` (the
   lower-cased form, words split on the recall tokenizer's word boundary and joined
-  by single spaces), ``display`` (as extracted, or as the kindled spelled it),
+  by single spaces; for a name with no ASCII letter or digit its raw lower-cased
+  string, S166, see :func:`name_key`), ``display`` (as extracted, or as the kindled spelled it),
   ``source`` (``gate`` / ``reappraiser`` / ``tool``) and ``first_seen`` (UTC ISO).
 * ``stopword_names``: the S104 flag. A row means the listed name is a stopword-name
   ("Will"), whichever source added it (S144). It is a record only; matching decides
