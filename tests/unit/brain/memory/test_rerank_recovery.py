@@ -38,9 +38,12 @@ from tests.unit.brain.bridge.test_central_cadence import (
 from tests.unit.brain.memory.test_rerank_cost_model import (
     _MODEL,
     _QUERY,
+    _anchor_pair_tokens,
     _Clock,
     _CostScriptedProvider,
     _docs,
+    _GrowingProvider,
+    _reference_width,
 )
 
 _B = 4.0
@@ -353,9 +356,10 @@ def test_c15e_stamp_before_the_ram_check(clock: _Clock, monkeypatch: pytest.Monk
 def test_s178_a_too_high_ram_figure_skips_the_job_until_its_samples_age_out_then_the_job_runs(
     clock: _Clock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A1d: the RAM bound skips the 5-candidate re-measure while the (too-high) figure's sample
-    is in the window; once it has aged out the figure is absent, the bound is off and the job
-    runs and records the RAM sample that re-seeds the figure."""
+    """A1d / K2c: the RAM bound skips the 5-candidate re-measure while the (too-high) figure's sample
+    is in the window; once it has aged out this running process KEEPS the figure (S180) but it is
+    stale, so the bound no longer skips the job: it runs and records the RAM sample that re-seeds
+    the figure."""
     provider = _true_cost_provider(clock, 1.2)
     _cached(monkeypatch, provider)
     # An inflated time sample and a RAM figure of 10,000 bytes a token at a small high water.
@@ -374,7 +378,8 @@ def test_s178_a_too_high_ram_figure_skips_the_job_until_its_samples_age_out_then
     monkeypatch.setattr(cost_series, "_wall_clock", lambda: real() + shift[0])
     shift[0] = cost_series.window_seconds() + 60.0  # every sample is past the window
     est = rerank_cost_estimate(_MODEL)
-    assert est is not None and est.ram_bytes_per_token is None, "no figure; the carried time fit still says stuck"
+    assert est is not None and est.ram_figure_kept is True, "the running process keeps its last figure; the carried time fit still says stuck"
+    assert est.ram_bytes_per_token == pytest.approx(1e4)
     rss = iter(float(1_000_000 * n) for n in range(10_000))
     monkeypatch.setattr(reranker_mod, "_current_rss_bytes", lambda: next(rss))
     assert _due(8.0) is True
@@ -382,7 +387,116 @@ def test_s178_a_too_high_ram_figure_skips_the_job_until_its_samples_age_out_then
     assert len(_seven_doc_calls(provider)) == 1, "the 5 + 2 measurement ran"
     state = reranker_mod._ram_cost.state(_STORE, _MODEL)
     assert state is not None and state.sums.n == 1, "its RAM sample re-seeded the figure"
-    assert rerank_cost_estimate(_MODEL).ram_bytes_per_token is not None
+    est = rerank_cost_estimate(_MODEL)
+    assert est.ram_bytes_per_token is not None and est.ram_figure_kept is False
+
+
+# ---------------------------------------------------------------------------
+# S180 (K2): a running process keeps its last RAM figure when the window empties; the lull job
+# re-seeds it when it blocks a batch.
+# ---------------------------------------------------------------------------
+
+_BIG = 2_000  # pair size of the "record-high" batch: 5 + 2 of them are past the process's high water
+
+
+def _running_with_a_too_high_figure(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch, *, per_token: float = 500.0
+) -> tuple[_GrowingProvider, list[float], int]:
+    """A running process (it has recorded measured reranks, high water 2 * _X5) whose saved RAM figure is
+    10,000 bytes a token (too high for a 1 MB headroom), the figure seen by an estimate call while its
+    sample is in the window, and the time series saved. Returns the provider, the scripted wall clock and
+    the high water."""
+    wall, rss = [1_000_000.0], [1.0e9]
+    monkeypatch.setattr(cost_series, "_wall_clock", lambda: wall[0])
+    monkeypatch.setattr(reranker_mod, "_current_rss_bytes", lambda: rss[0])
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 1.0e6)
+    provider = _GrowingProvider(clock, rss, per_token=per_token)
+    _cached(monkeypatch, provider)
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 100, provider.rate * 100, 1.0e6)  # 10,000 B/token
+    _healthy_estimate(provider)  # the time estimate (two sizes); the high water is now 2 * _X5
+    assert rerank_cost_estimate(_MODEL).ram_bytes_per_token == pytest.approx(1.0e4)
+    assert cost_series.flush(_STORE) >= 1
+    return provider, wall, reranker_mod._ram_state[_MODEL].peak_x
+
+
+def _age_out_the_window(wall: list[float]) -> None:
+    wall[0] += cost_series.window_seconds() + 60.0
+
+
+def test_s180_k2a_a_running_process_whose_kept_figure_blocks_a_batch_re_seeds_it_at_the_next_lull(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider, wall, peak = _running_with_a_too_high_figure(clock, monkeypatch)
+    assert peak == 2 * _X5
+    _age_out_the_window(wall)
+    est = rerank_cost_estimate(_MODEL)
+    assert est.ram_figure_kept is True and est.ram_bytes_per_token == pytest.approx(1.0e4)
+
+    blocked = _message(provider, docs=_docs(50, _BIG))
+    assert blocked.reranked is False and blocked.hand_off == "budget", "the kept figure blocks the batch (not vacuous)"
+    assert [c for c in provider.calls if len(c) == 7] == [], "no measured rerank ran: the bound held"
+    miss = reranker_mod._budget_misses[_MODEL]
+    assert _due(1.0) is True, "the kept figure blocks the miss: the lull job is due"
+
+    provider.calls.clear()
+    assert _remeasure(1.0) is True
+    assert len(provider.calls) == 1 and len(provider.calls[0]) == 7, "one 5 + 2 measurement, past the RAM-headroom skip"
+    padded = 7 * _BIG
+    assert padded > peak, "the blocked batch is past the high water, so it records a sample"
+    est = rerank_cost_estimate(_MODEL)
+    assert est.ram_figure_kept is False and est.ram_bytes_per_token == pytest.approx(500.0 * padded / (padded - peak))
+    assert _MODEL not in reranker_mod._budget_misses, "5 fit within the budget: cleared (S116 a)"
+    assert reranker_mod._remeasured_marker[_MODEL] == 1.0, "stamped: once per lull"
+    with reranker_mod._cost_lock:
+        reranker_mod._budget_misses[_MODEL] = miss
+    assert _due(1.0) is False, "the same lull: not due again"
+
+    again = _message(provider, docs=_docs(50, _BIG))
+    est = rerank_cost_estimate(_MODEL)
+    assert again.reranked and again.width == _reference_width(
+        [_BIG] * 50, _anchor_pair_tokens(), est.overhead_seconds, est.seconds_per_token, _B,
+        ram_per_token=est.ram_bytes_per_token, headroom=1.0e6, peak=padded,
+    ), "the next recall is sized from the new figure"
+
+
+def test_s180_k2b_a_figure_still_in_the_window_is_a_legitimate_bound_and_does_not_trigger_the_job(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider, _wall, _peak = _running_with_a_too_high_figure(clock, monkeypatch)
+    blocked = _message(provider, docs=_docs(50, _BIG))
+    assert blocked.hand_off == "budget" and _MODEL in reranker_mod._budget_misses
+    assert rerank_cost_estimate(_MODEL).ram_figure_kept is False
+    provider.calls.clear()
+    assert _due(1.0) is False and _MODEL not in reranker_mod._budget_misses, "dropped as not stuck, as at base"
+    assert _remeasure(1.0) is False and provider.calls == []
+
+
+def test_s180_k2b_a_kept_figure_that_blocks_nothing_does_not_trigger_the_job(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider, wall, _peak = _running_with_a_too_high_figure(clock, monkeypatch)
+    _age_out_the_window(wall)
+    assert rerank_cost_estimate(_MODEL).ram_figure_kept is True
+    small = _message(provider, budget=0.2)  # a message remainder too small for 5, but the batch is inside the high water
+    assert small.hand_off == "budget" and _MODEL in reranker_mod._budget_misses
+    provider.calls.clear()
+    assert _due(1.0) is False and _MODEL not in reranker_mod._budget_misses
+    assert _remeasure(2.0) is False and provider.calls == []
+
+
+def test_s180_k2d_a_re_seed_that_measures_no_growth_leaves_no_figure_and_is_not_repeated(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider, wall, _peak = _running_with_a_too_high_figure(clock, monkeypatch, per_token=0.0)
+    _age_out_the_window(wall)
+    assert _message(provider, docs=_docs(50, _BIG)).hand_off == "budget"
+    assert _due(1.0) and _remeasure(1.0)
+    est = rerank_cost_estimate(_MODEL)
+    assert est.ram_bytes_per_token == 0.0 and est.ram_figure_kept is False
+    assert reranker_mod._ram_kept == {}, "a window rate of 0 forgets the stale figure"
+    provider.calls.clear()
+    assert _message(provider, docs=_docs(50, _BIG)).reranked, "no figure to block it any more"
+    assert _due(2.0) is False and _MODEL not in reranker_mod._budget_misses
 
 
 # ---------------------------------------------------------------------------

@@ -564,12 +564,19 @@ def _reset_reranker_provider_cache() -> None:
 # model id is sized to the S5 minimum only on the first-ever startup on this
 # machine (no saved time estimate, or none with a RAM figure above 0 in its
 # 24-hour window: a figure whose samples have all aged out is no figure, S178)
-# where RSS is readable (S158, S171), because it measures the RAM growth. Stuck-width
-# recovery (S100, S113, S116): the last query that
+# where RSS is readable (S158, S171), because it measures the RAM growth. A process
+# that has recorded a measured rerank keeps the last RAM figure it saw when that
+# figure's window empties (S180: it never reranks without a RAM bound, and a
+# plateaued process is exactly the one whose window empties, since a RAM sample
+# exists only for a call past the high water); the next lull re-seeds it (below).
+# Stuck-width recovery (S100, S113, S116, S180): the last query that
 # went to the cosine path for lack of budget is kept per model id; while the
-# estimate says its first 5 candidates do not fit the full latency budget, the
+# estimate says its first 5 candidates do not fit the full latency budget (time
+# term), or the KEPT RAM figure alone keeps them from fitting the headroom, the
 # `rerank_width_remeasure` gated job re-measures them once per chat lull
-# (`stuck_width_due`, `remeasure_stuck_width`).
+# (`stuck_width_due`, `remeasure_stuck_width`); a re-measure whose figure is the
+# kept one skips the RAM-headroom check, so its 5-candidate batch (past the high
+# water, because the figure blocked it) records the sample that re-seeds the figure.
 
 # Clock seam: `rerank_timed` reads elapsed time through this name so tests can
 # inject a scripted clock (criterion C1a). Production: `time.monotonic`.
@@ -636,15 +643,19 @@ class RerankCostEstimate:
     header). `ram_bytes_per_token` is RSS growth per padded token past
     `peak_padded_tokens` (the largest padded batch this process has measured);
     `None` when no call past a high water with a readable RSS delta is in the
-    24-hour window, saved or buffered (S178; the RAM term of the width fit is then
-    skipped, and so is the re-measure job's RAM-headroom check). `measured_batches` = the measurements
-    behind the time fit in effect."""
+    24-hour window, saved or buffered, and this process has no kept figure (S178:
+    the RAM term of the width fit is then skipped, and so is the re-measure job's
+    RAM-headroom check). `ram_figure_kept` is True when the window is empty and
+    `ram_bytes_per_token` is the last figure this running process saw (S180): it
+    bounds the width like a window figure, and a re-measure that finds it blocking
+    re-seeds it. `measured_batches` = the measurements behind the time fit in effect."""
 
     overhead_seconds: float
     seconds_per_token: float
     ram_bytes_per_token: float | None
     measured_batches: int
     peak_padded_tokens: int = 0
+    ram_figure_kept: bool = False
 
 
 @dataclass(frozen=True)
@@ -677,9 +688,15 @@ _rerank_cost = cost_series.CostSeries("rerank")
 # S171: RSS growth per padded token past the high water, saved like the time series
 # (host-keyed, 24 h window); its estimate is the weighted ratio of the window's sums
 # (`cost_series.THROUGH_ORIGIN_SERIES`) and it has none once the window is empty
-# (S178: its carried row is not read).
+# (S178: its carried row is not read); a running process then keeps the last figure it
+# saw (`_ram_kept`, S180).
 _ram_cost = cost_series.CostSeries(cost_series.RAM_SERIES)
 _ram_state: dict[str, _RamState] = {}
+# S180: (database, model id) -> the last RAM-per-token figure (above 0) an estimate call saw
+# in the window. Used only by a process whose `_ram_state` holds the model id (it has recorded
+# a measured rerank), and only while the window answers nothing. Process memory, never saved;
+# guarded by `_cost_lock` with `_ram_state`.
+_ram_kept: dict[tuple[str, str], float] = {}
 _warmed_model_ids: set[str] = set()
 _budget_misses: dict[str, _BudgetMiss] = {}
 _remeasured_marker: dict[str, object] = {}
@@ -714,19 +731,39 @@ def rerank_cost_estimate(model_id: str, store: MemoryStore) -> RerankCostEstimat
     is no time estimate (the first startup on this machine: the width is then
     the S5 minimum, S24). The high water is read BEFORE the RAM figure:
     `_record_rerank_cost` buffers a sample before it publishes the new high
-    water, so a reader that sees the new high water also sees its sample."""
+    water, so a reader that sees the new high water also sees its sample.
+
+    S180: the RAM figure is the window's while the window answers (a rate above
+    0 is also remembered as this process's last figure; a rate of 0 is no figure
+    and forgets it). When the window is empty and this process has recorded a
+    measured rerank for `model_id`, it is the last figure an earlier call of
+    this process saw (`ram_figure_kept`): a running process never reranks
+    without a RAM bound. A process that has not measured (a fresh one) has no
+    kept figure to use, so its first measured rerank is the width-5 seed (S178)."""
     fit = _rerank_cost.fit(store, model_id)
     if fit is None:
         return None
     with _cost_lock:
         ram = _ram_state.get(model_id, _RamState())
     ram_fit = _ram_cost.fit(store, model_id)
+    key = (cost_series._store_key(store), model_id)
+    rate: float | None = None if ram_fit is None else ram_fit.rate
+    kept = False
+    with _cost_lock:
+        if ram_fit is not None:
+            if ram_fit.rate > 0.0:
+                _ram_kept[key] = ram_fit.rate
+            else:
+                _ram_kept.pop(key, None)
+        elif model_id in _ram_state and key in _ram_kept:
+            rate, kept = _ram_kept[key], True
     return RerankCostEstimate(
         overhead_seconds=fit.overhead,
         seconds_per_token=fit.rate,
-        ram_bytes_per_token=None if ram_fit is None else ram_fit.rate,
+        ram_bytes_per_token=rate,
         measured_batches=fit.samples,
         peak_padded_tokens=ram.peak_x,
+        ram_figure_kept=kept,
     )
 
 
@@ -851,8 +888,10 @@ def _ram_unseeded(model_id: str, estimate: RerankCostEstimate) -> bool:
     staying for good. With a figure (a restart soon after the first-ever startup
     on this host) it is False: the first rerank is sized by the estimate. A process
     that has already recorded a rerank is never unseeded (its RAM window can empty
-    while it runs; then the width fit has no RAM term until a call past the high
-    water records a sample)."""
+    while it runs; then it keeps the last figure it saw, `ram_figure_kept`, S180, and
+    the re-measure job re-seeds it at a lull if it blocks a batch). A process that
+    has not recorded a rerank never uses a kept figure, so its estimate is the
+    window's alone."""
     with _cost_lock:
         if model_id in _ram_state:
             return False
@@ -868,6 +907,7 @@ def _reset_rerank_cost_model() -> None:
     in the database and the process buffer (`cost_series._reset_pending`)."""
     with _cost_lock:
         _ram_state.clear()
+        _ram_kept.clear()
         _warmed_model_ids.clear()
         _budget_misses.clear()
         _remeasured_marker.clear()
@@ -885,7 +925,8 @@ def _full_rerank_budget() -> float:
 def _is_stuck(miss: _BudgetMiss, estimate: RerankCostEstimate | None) -> bool:
     """S113: the estimate predicts that fewer than 5 real candidates of the
     miss fit the full budget (time term only; the RAM bound is not the learned
-    cost)."""
+    cost). The re-measure job's other trigger, a kept RAM figure that blocks the
+    miss (S180), is `_needs_remeasure`."""
     if estimate is None:
         return False
     width = fit_rerank_width(
@@ -894,6 +935,31 @@ def _is_stuck(miss: _BudgetMiss, estimate: RerankCostEstimate | None) -> bool:
         estimate,
         _full_rerank_budget(),
         None,
+        RERANK_MIN_REAL_CANDIDATES,
+    )
+    return width < RERANK_MIN_REAL_CANDIDATES
+
+
+def _needs_remeasure(miss: _BudgetMiss, estimate: RerankCostEstimate | None) -> bool:
+    """Whether the re-measure job should time the miss's 5 candidates (S100, S113,
+    S180): the time term says they are stuck (`_is_stuck`), or the RAM figure in use
+    is the KEPT one (a running process whose window emptied) and it keeps them from
+    fitting the current headroom. The second case is the re-seed: that figure is stale,
+    and the batch it blocks is past the high water, so measuring it records the RAM
+    sample that makes the figure present again. A figure still in the window is a
+    legitimate bound and never triggers the job."""
+    if estimate is None:
+        return False
+    if _is_stuck(miss, estimate):
+        return True
+    if not estimate.ram_figure_kept:
+        return False
+    width = fit_rerank_width(
+        miss.candidate_tokens,
+        miss.anchor_tokens,
+        estimate,
+        _full_rerank_budget(),
+        _available_ram_headroom_bytes(),
         RERANK_MIN_REAL_CANDIDATES,
     )
     return width < RERANK_MIN_REAL_CANDIDATES
@@ -930,9 +996,10 @@ _remeasure_hook: Callable[[], None] | None = None
 def stuck_width_due(
     activity_marker: object, store_factory: Callable[[], AbstractContextManager[MemoryStore]]
 ) -> bool:
-    """Whether the `rerank_width_remeasure` job is due (S100, S113): the
+    """Whether the `rerank_width_remeasure` job is due (S100, S113, S180): the
     runtime reranker model id has a budget miss that is stuck under the
-    current estimate, its warm-up has run in this process and its provider is
+    current estimate (the time term says fewer than 5 candidates fit, or the
+    kept RAM figure of a running process blocks them: `_needs_remeasure`), its warm-up has run in this process and its provider is
     cached (the job never builds or loads a model), no re-measure has run
     at this chat activity marker (once per lull), and no "too long" verdict is
     remembered (S127: the job's own measured 5 candidates exceeded the full
@@ -953,7 +1020,7 @@ def stuck_width_due(
     with store_factory() as store:
         if _too_long_remembered(model_id, store):
             return False
-        if not _is_stuck(miss, rerank_cost_estimate(model_id, store)):
+        if not _needs_remeasure(miss, rerank_cost_estimate(model_id, store)):
             _drop_miss(model_id, miss)
             return False
     return True
@@ -970,9 +1037,12 @@ def remeasure_stuck_width(activity_marker: object, store: MemoryStore) -> bool:
     is stamped after the verdict check and before the measurement, so a failing
     or RAM-skipped run still runs once per lull, while a run skipped by a held
     verdict stamps nothing. Skipped (miss kept) when the miss is no longer
-    stuck (then dropped), a "too long" verdict is remembered, or the RAM bound
-    predicts the batch does not fit the current headroom. Returns True iff the rerank ran. Provider exceptions propagate
-    (the central pass logs them)."""
+    stuck (then dropped; stuck = the time term, or the kept RAM figure of a running
+    process blocks it, S180), a "too long" verdict is remembered, or the RAM figure
+    in the window predicts the batch does not fit the current headroom. A figure that
+    is only the process's kept one (its window emptied, S180) does not skip the run:
+    the 5-candidate batch is past the high water and re-seeds it. Returns True iff the
+    rerank ran. Provider exceptions propagate (the central pass logs them)."""
     model_id = resolve_reranker_model_id()
     miss, _, warmed = _job_state(model_id)
     provider = _provider_cache.get(model_id)
@@ -983,12 +1053,17 @@ def remeasure_stuck_width(activity_marker: object, store: MemoryStore) -> bool:
     with _cost_lock:
         _remeasured_marker[model_id] = activity_marker
     estimate = rerank_cost_estimate(model_id, store)
-    if not _is_stuck(miss, estimate):
+    if not _needs_remeasure(miss, estimate):
         _drop_miss(model_id, miss)
         return False
     k = anchor_count(len(miss.documents))
     padded = (len(miss.documents) + k) * max([*miss.candidate_tokens, *miss.anchor_tokens[:k]])
-    ram_per_token = estimate.ram_bytes_per_token if estimate is not None else None
+    # S180: a KEPT figure is stale (its window emptied), so the re-measure is the re-seed
+    # and runs without the RAM-headroom check, as a first-ever startup seeds; a figure in
+    # the window still skips a batch that does not fit.
+    ram_per_token = (
+        estimate.ram_bytes_per_token if estimate is not None and not estimate.ram_figure_kept else None
+    )
     if ram_per_token is not None and ram_per_token > 0.0:
         headroom = _available_ram_headroom_bytes()
         growth = max(0, padded - estimate.peak_padded_tokens)
@@ -1506,7 +1581,8 @@ def rerank_for_recall(
         # says its first 5 do not fit the FULL budget, the re-measure job
         # re-times them at a chat lull (S100), so an inflated estimate cannot
         # absorb every later message. (The RAM term alone lands here only for
-        # batches larger than any measured so far.)
+        # batches larger than any measured so far; if the figure doing it is a
+        # running process's kept one, the same job re-seeds it, S180.)
         miss = _BudgetMiss(
             query=query,
             documents=tuple(pool[:RERANK_MIN_REAL_CANDIDATES]),

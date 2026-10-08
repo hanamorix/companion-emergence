@@ -994,9 +994,10 @@ def _build_gated_jobs(
         )
     )
 
-    # 4c. stuck-width re-measure — name-recall fix S100, S113, S116 (spec §7).
+    # 4c. stuck-width re-measure — name-recall fix S100, S113, S116, S180 (spec §7).
     # Due while the runtime reranker's last budget miss is stuck (the learned
-    # cost says fewer than 5 of its candidates fit the full latency budget),
+    # cost says fewer than 5 of its candidates fit the full latency budget, or
+    # a running process's kept RAM figure blocks them and this re-seeds it),
     # the reranker is already loaded, and no re-measure has run at this chat
     # activity marker (once per lull; no time constant). One timed rerank of
     # 5 candidates on the loaded provider; never loads a model.
