@@ -108,7 +108,7 @@ def test_a_name_of_exactly_100_characters_is_added_and_101_is_not(tmp_path):
     assert [r[1] for r in _rows(tmp_path)] == [ok]
 
 
-@pytest.mark.parametrize("bad", [None, 7, ["Wren"], {"n": "Wren"}, "", "   ", "!!!"])
+@pytest.mark.parametrize("bad", [None, 7, ["Wren"], {"n": "Wren"}, "", "   "])
 def test_bad_argument_returns_added_false_and_never_raises(tmp_path, bad):
     got = add_known_name(bad, persona_dir=tmp_path)
     assert got["added"] is False

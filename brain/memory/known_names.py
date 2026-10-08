@@ -58,9 +58,13 @@ name matches only as a window of consecutive raw words, and
 Admission (:func:`admit_names`, :func:`confirm_readd`; S144, S152, S153, S135): a name is
 admitted as given from every source (the kindled's add_name, the gate judge, the
 re-appraiser): periods, several words and common words all pass, whatever characters it
-holds; a one-word stopword-name is flagged (S104). The only refusals are a non-string, a
-name longer than ``MAX_NAME_LENGTH`` characters (S153), a name with no word in it (it has
-no matchable form), and, for a mechanical source, a name on the rejects list (S135).
+holds; a one-word stopword-name is flagged (S104). The only refusals are a non-string, an
+empty name, a name longer than ``MAX_NAME_LENGTH`` characters (S153) and, for a mechanical
+source, a name on the rejects list (S135). A name with no ASCII letter or digit (wholly
+non-Latin, or only punctuation or symbols) is admitted (S166) and keyed by its raw
+lower-cased string (:func:`name_key`); the matcher normalizes keys through the recall
+tokenizer, so such a key drops out of the snapshot and the name cannot match a message
+until the tokenizer changes (#317).
 """
 
 from __future__ import annotations
@@ -100,6 +104,7 @@ __all__ = [
     "load_known_names",
     "match_known_names",
     "name_hit_ok",
+    "name_key",
     "names_fts_query",
     "normalize_name",
     "note_tool_call",
@@ -277,6 +282,28 @@ def normalize_name(name: str) -> str:
     (S47): admission is :func:`admit_names`'s job, not this function's.
     """
     return " ".join(w.lower() for w in _WORD_RE.findall(name))
+
+
+def _clean_name(name: str) -> str:
+    """The name stripped, with a lone UTF-16 surrogate (a half emoji from a model's JSON
+    escape, which cannot be bound to SQLite) replaced by "?"."""
+    return name.strip().encode("utf-8", "replace").decode("utf-8")
+
+
+def name_key(name: str) -> str:
+    """The key a name is stored under (``name_lower``): its :func:`normalize_name` form, and
+    for a name with no ASCII letter or digit (so an empty normalized form) its raw
+    lower-cased string (S166), so such names do not all collide on an empty key. When
+    lower-casing would create an ASCII letter (U+0130 gives "i" and a combining dot,
+    U+212A KELVIN SIGN gives "k") the stripped string is the key unchanged. So a raw key
+    never holds an ASCII letter or digit: ``normalize_name(key)`` is empty, the snapshot
+    drops it, and the name matches no message (#317)."""
+    clean = _clean_name(name)
+    normalized = normalize_name(clean)
+    if normalized:
+        return normalized
+    lowered = clean.lower()
+    return clean if _WORD_RE.search(lowered) else lowered
 
 
 # ---------------------------------------------------------------------------
@@ -598,30 +625,36 @@ def listed_display_forms(persona_dir: Path | str | None, text: str) -> list[str]
 # ---------------------------------------------------------------------------
 
 
+def _too_long(name: object) -> bool:
+    """A string longer than :data:`MAX_NAME_LENGTH` characters once stripped (S153)."""
+    return isinstance(name, str) and len(name.strip()) > MAX_NAME_LENGTH
+
+
 def _admit(name: object, source: str) -> tuple[str, str] | None:
     """``(name_lower, display)`` if the entry is admissible from ``source``, else None.
 
     Refused (logged at debug, so a refusal leaves a trace): a non-string; a name longer
-    than :data:`MAX_NAME_LENGTH` characters once stripped (S153); an entry with no word in
-    it (its normalized form is empty, so it can neither be stored nor matched). Everything
-    else is admitted as given from every source (S144, S152): no character rule and no
-    stopword rule. The rejects list is applied by the writers, not here.
+    than :data:`MAX_NAME_LENGTH` characters once stripped (S153); an empty one. Everything
+    else is admitted as given from every source (S144, S152): no character rule, no
+    stopword rule and no word rule. The key is :func:`name_key` (S166: a name with no ASCII
+    letter or digit is keyed by its raw lower-cased string). The rejects list is applied by
+    the writers, not here.
     """
     if not isinstance(name, str):
         logger.debug("known names: refused a non-string entry from %s", source)
         return None
-    raw = name.strip()
-    if len(raw) > MAX_NAME_LENGTH:
-        logger.debug("known names: refused a %d-character entry from %s (limit, S153)", len(raw), source)
+    if _too_long(name):
+        logger.debug(
+            "known names: refused a %d-character entry from %s (limit, S153)", len(name.strip()), source
+        )
         return None
     # A lone UTF-16 surrogate (a half emoji from a model's JSON escape) cannot be
     # bound to SQLite; the replace step turns it into "?" so the name is still admitted.
-    display = raw.encode("utf-8", "replace").decode("utf-8")
-    lower = normalize_name(display)
-    if not lower:
-        logger.debug("known names: refused %r from %s (no word)", raw, source)
+    display = _clean_name(name)
+    if not display:
+        logger.debug("known names: refused an empty entry from %s", source)
         return None
-    return lower, display
+    return name_key(display), display
 
 
 def _ensure_tables(conn: sqlite3.Connection) -> None:
@@ -818,14 +851,15 @@ def remove_names(
 
     ``remover`` is ``"tool"`` (the kindled: any name) or ``"reappraiser"`` (never a
     name whose source is ``tool``: one the kindled added, S105). Names are compared
-    after :func:`normalize_name` (the model echoes the display form "Tuesday").
+    by :func:`name_key` (the model echoes the display form "Tuesday"; a name with no ASCII
+    letter or digit is found by its raw lower-cased key, S166).
     The source check and the delete run in one write transaction under the file
     lock. Returns the lower forms actually removed; never creates the file (a
     missing file: ``[]``); never raises (logged, ``[]``).
     """
     if remover not in REMOVERS:
         raise ValueError(f"unknown known-names remover {remover!r}; expected one of {REMOVERS}")
-    lowers = list(dict.fromkeys(normalize_name(n) for n in names if isinstance(n, str)))
+    lowers = list(dict.fromkeys(name_key(n) for n in names if isinstance(n, str)))
     lowers = [lower for lower in lowers if lower]
     if not lowers:
         return []
@@ -963,7 +997,7 @@ def note_tool_call(
         if pending is None:
             return
         given = arguments.get("name") if isinstance(arguments, Mapping) else None
-        if name == add_tool_name and isinstance(given, str) and normalize_name(given) == pending:
+        if name == add_tool_name and isinstance(given, str) and name_key(given) == pending:
             return  # the confirming call: add_name consumes the question
         with file_lock(path):
             if not path.exists():

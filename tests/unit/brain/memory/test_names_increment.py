@@ -508,10 +508,16 @@ def test_n12_a_name_is_at_most_100_characters_from_every_source(tmp_path: Path, 
 
 
 @pytest.mark.parametrize("source", ["gate", "reappraiser", "tool"])
-def test_n12_an_entry_with_no_word_is_still_refused(tmp_path: Path, source: str) -> None:
-    """S144 read as "whatever characters": an entry with no word has no matchable form."""
-    assert kn.admit_names(tmp_path, ["...", "", "  ", "--", "!!!"], source) == []
+def test_n12_an_empty_entry_is_refused_and_one_without_a_word_is_admitted_by_its_raw_key(
+    tmp_path: Path, source: str
+) -> None:
+    """S166 (replaces "an entry with no word is refused", S144 read as "whatever characters"):
+    only an empty entry has nothing to store; "...", "--", "!!!" have no ASCII letter or digit
+    and are admitted, keyed by their raw lower-cased string (they match no message, #317)."""
+    assert kn.admit_names(tmp_path, ["", "  "], source) == []
     assert not kn.known_names_path(tmp_path).exists()
+    assert kn.admit_names(tmp_path, ["...", "--", "!!!"], source) == ["...", "--", "!!!"]
+    assert kn.load_known_names(tmp_path).names == frozenset()
 
 
 def test_n13_a_base_schema_file_gets_its_side_tables_and_keeps_its_shape(tmp_path: Path) -> None:

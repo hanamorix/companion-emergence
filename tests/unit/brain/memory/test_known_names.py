@@ -282,10 +282,16 @@ def test_a_mechanically_added_stopword_name_that_is_removed_is_rejected_and_unfl
     assert _names(persona) == {"will"} and _flagged(persona) == {"will"}
 
 
-def test_entries_with_no_word_or_no_text_are_rejected(persona: Path) -> None:
-    junk: list[object] = ["", "   ", "--", "!!!", None, 7, b"pretzel"]
+def test_entries_with_no_text_are_rejected(persona: Path) -> None:
+    junk: list[object] = ["", "   ", None, 7, b"pretzel"]
     assert kn.admit_names(persona, junk, "gate") == []  # type: ignore[arg-type]
     assert not _db(persona).exists()
+
+
+def test_entries_with_no_ascii_letter_or_digit_are_admitted_by_their_raw_key(persona: Path) -> None:
+    """S166 (replaces the S144 "no word" refusal): punctuation- or symbol-only entries too."""
+    assert kn.admit_names(persona, ["--", "!!!"], "gate") == ["--", "!!!"]
+    assert _db(persona).exists()
 
 
 def test_an_unknown_source_is_refused(persona: Path) -> None:
@@ -772,7 +778,7 @@ def test_the_write_happens_inside_the_os_file_lock(
     assert kn.admit_names(persona, ["pretzel"], "tool") == ["pretzel"]
     assert events == [f"lock {_db(persona).name}", "insert", "unlock"]
     events.clear()
-    kn.admit_names(persona, ["!!!"], "gate")  # no word: refused, so no lock and no write
+    kn.admit_names(persona, ["   "], "gate")  # nothing to store: refused, so no lock and no write
     assert events == []
 
 

@@ -205,7 +205,8 @@ def test_n31_confirm_readd_outcomes(tmp_path):
     _removed_tuesday(tmp_path)
     assert kn.confirm_readd(tmp_path, "Tuesday") == "asked"
     assert kn.confirm_readd(tmp_path, "Tuesday") == "added"
-    assert kn.confirm_readd(tmp_path, "!!!") == "refused"  # no word: nothing to store (S144 keeps this refusal)
+    assert kn.confirm_readd(tmp_path, "   ") == "refused"  # nothing to store
+    assert kn.confirm_readd(tmp_path, "!!!") == "added"  # S166: no ASCII letter or digit is admitted, keyed raw
     assert kn.confirm_readd(tmp_path, "I am") == "added"  # S144: an all-stopword entry is admitted as given
     assert _pending(tmp_path) == []
 
