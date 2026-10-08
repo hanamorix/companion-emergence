@@ -20,6 +20,9 @@ dependencies = [
     "tzdata>=2024.1",
     "fastembed>=0.4",
     "pypdf>=6",
+    # scripts/cache_replay_workload.py parses the yaml fence of guarded-change.companion.md with PyYAML
+    # (it was only a transitive dependency; the cache-break check now depends on it directly).
+    "pyyaml>=6.0",
     # F2a #250 inc6 (2026-09-18 owner ruling, "torch it is then"): the
     # OFFLINE daily calibration judge (bge-reranker-v2-m3, brain/memory/
     # relevance_judge.py) loads directly via torch/sentence-transformers,
