@@ -48,6 +48,13 @@ def _forbid_cost_writes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         raise AssertionError("a cost sample was written on the reply path")
 
     monkeypatch.setattr(MemoryStore, "record_cost_samples", spy)
+
+    def verdict_spy(self, *a, **k):
+        calls.append("verdict")
+        raise AssertionError("a rerank verdict was written or deleted on the reply path (S179)")
+
+    monkeypatch.setattr(MemoryStore, "save_cost_verdict", verdict_spy)
+    monkeypatch.setattr(MemoryStore, "clear_cost_verdict", verdict_spy)
     return calls
 
 

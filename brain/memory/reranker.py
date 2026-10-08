@@ -666,7 +666,8 @@ class _BudgetMiss:
 # model id that went to the cosine path for lack of budget (S113), the chat
 # activity marker of each model id's last re-measure (S100), and the "too long"
 # verdicts (S127: remembered until the cost estimate next changes, decided by
-# which samples the window holds, not by comparing fitted floats). One lock
+# which samples the window holds, not by comparing fitted floats; saved with the
+# host-keyed series and read back once per process, S179). One lock
 # guards them all (every read and every read-modify-write), so a concurrent
 # passive recall, `search_memories` call (#297: the tool runs in a bridge
 # worker thread) and the re-measure job never lose an update. The time series
@@ -694,6 +695,9 @@ class _Verdict:
 
 
 _too_long: dict[str, _Verdict] = {}
+# S179: the (database, model id) pairs whose saved verdict row this process has read
+# (or written), so the row is read once per process, not at every due check.
+_too_long_loaded: set[tuple[str, str]] = set()
 _cost_lock = threading.Lock()
 
 # Test-only seam (CONC-1): called inside an update, between reading the
@@ -763,15 +767,63 @@ def _remember_too_long(model_id: str, store: MemoryStore) -> None:
         return
     with _cost_lock:
         _too_long[model_id] = _Verdict(now, before)
+        _too_long_loaded.add((cost_series._store_key(store), model_id))
+    # S179: saved with the host-keyed series, so a restart does not run the
+    # over-budget rerank again. Written here, by the lull job (never on the reply
+    # path, S164); a failed write leaves the in-process verdict standing.
+    try:
+        _rerank_cost.save_verdict(store, model_id, now, before)
+    except Exception:  # noqa: BLE001 - fail soft
+        log.warning("rerank width re-measure: could not save the too-long verdict", exc_info=True)
+
+
+def _load_saved_verdict(model_id: str, store: MemoryStore) -> _Verdict | None:
+    """The in-process verdict for `model_id`, first reading the saved row once per
+    (database, model id) per process (S179: a verdict reached before a restart).
+    A failed read means no verdict for now (the job may run; the read is tried
+    again at the next consult): there is nothing in this process to keep, and a
+    database that cannot answer here cannot supply the estimate that makes the
+    job due either. The database is read outside `_cost_lock`."""
+    marker = (cost_series._store_key(store), model_id)
+    try:
+        row = _rerank_cost.load_verdict(store, model_id)
+    except Exception:  # noqa: BLE001 - fail soft: no verdict, tried again next time
+        log.debug("rerank width re-measure: saved verdict read failed", exc_info=True)
+        return None
+    with _cost_lock:
+        _too_long_loaded.add(marker)
+        held = _too_long.get(model_id)
+        if held is not None or row is None:
+            return held
+        loaded = _Verdict(row[0], row[1])
+        _too_long[model_id] = loaded
+        return loaded
+
+
+def _end_verdict(model_id: str, store: MemoryStore, verdict: _Verdict) -> None:
+    """The verdict is over (S175): forget it in this process and delete its saved
+    row (only if it is still the one reached at `verdict.taken_at`; best effort)."""
+    with _cost_lock:
+        if _too_long.get(model_id) is verdict:
+            del _too_long[model_id]
+    try:
+        _rerank_cost.clear_verdict(store, model_id, verdict.taken_at)
+    except Exception:  # noqa: BLE001 - fail soft: a stale row only ends again at the next load
+        log.debug("rerank width re-measure: could not delete the saved verdict", exc_info=True)
 
 
 def _too_long_remembered(model_id: str, store: MemoryStore) -> bool:
     """Whether `model_id` has a remembered S127 "too long" verdict that still
-    holds. A verdict whose window changed (a sample arrived after it, or one
-    it counted aged out) is dropped here, when consulted. A failed read keeps
-    the verdict (no over-budget re-run on a database hiccup)."""
+    holds, in this process or saved by an earlier one on this machine (S179). A
+    verdict whose window changed (a sample arrived after it, or one it counted
+    aged out) is dropped here, when consulted, and its saved row deleted. A failed
+    read of the window keeps the verdict (no over-budget re-run on a database
+    hiccup)."""
     with _cost_lock:
         verdict = _too_long.get(model_id)
+        unread = verdict is None and (cost_series._store_key(store), model_id) not in _too_long_loaded
+    if unread:
+        verdict = _load_saved_verdict(model_id, store)
     if verdict is None:
         return False
     try:
@@ -781,9 +833,7 @@ def _too_long_remembered(model_id: str, store: MemoryStore) -> bool:
         return True
     if after == 0 and before == verdict.before:
         return True
-    with _cost_lock:
-        if _too_long.get(model_id) is verdict:
-            del _too_long[model_id]
+    _end_verdict(model_id, store, verdict)
     return False
 
 
@@ -818,6 +868,7 @@ def _reset_rerank_cost_model() -> None:
         _budget_misses.clear()
         _remeasured_marker.clear()
         _too_long.clear()
+        _too_long_loaded.clear()
 
 
 def _full_rerank_budget() -> float:

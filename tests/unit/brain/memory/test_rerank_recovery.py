@@ -14,6 +14,7 @@ Recovery counts are checked against independent computations with
 from __future__ import annotations
 
 import ast
+import sqlite3
 import threading
 from contextlib import nullcontext
 from fractions import Fraction
@@ -689,6 +690,293 @@ def test_s127_the_test_reset_forgets_verdicts() -> None:
         reranker_mod._too_long[_MODEL] = reranker_mod._Verdict(0.0, 0)
     reranker_mod._reset_rerank_cost_model()
     assert reranker_mod._too_long == {}
+
+
+# ---------------------------------------------------------------------------
+# S179: the "too long" verdict is saved with the host-keyed series and survives a restart.
+# ---------------------------------------------------------------------------
+
+
+def _restart(*, flush: bool = True) -> None:
+    """What a restart looks like to the code: the buffer is flushed (a clean stop) or lost
+    (a crash), every module-level cost state is forgotten and the file is opened by a new
+    connection."""
+    global _STORE
+    if flush:
+        cost_series.flush(_STORE)
+    path = _STORE.db_path
+    _STORE.close()
+    reranker_mod._reset_rerank_cost_model()
+    cost_series._reset_pending()
+    _STORE = MemoryStore(path, integrity_check=False)
+
+
+def _saved_verdict() -> tuple[float, int] | None:
+    return _STORE.cost_verdict("rerank", cost_series.machine_id(), _MODEL)
+
+
+def _after_restart(provider, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The new process: the provider is loaded again and the next message, still unable to
+    fit 5 candidates, records a stuck budget miss (which also warms the model up)."""
+    _cached(monkeypatch, provider)
+    assert _message(provider).hand_off == "budget"
+    assert _MODEL in reranker_mod._budget_misses
+
+
+def test_s179_the_verdict_survives_a_restart_and_the_job_does_not_rerun_the_over_budget_rerank(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = _too_long(clock, monkeypatch)
+    assert len(_seven_doc_calls(provider)) == 1
+    saved = _saved_verdict()
+    assert saved is not None and saved[1] >= 1, "the verdict is saved under this machine's id and this model id"
+    assert _STORE.cost_verdict("rerank", "another-machine", _MODEL) is None
+    _restart()
+    assert reranker_mod._too_long == {}, "the new process remembers nothing in memory"
+    _after_restart(provider, monkeypatch)
+    calls = len(provider.calls)
+    held = clock.t
+    assert _due(1.0) is False
+    assert _remeasure(1.0) is False
+    assert len(provider.calls) == calls and len(_seven_doc_calls(provider)) == 1, "no further 5 + 2 rerank"
+    assert clock.t == held, "no rerank time spent at the lull after the restart"
+    assert _saved_verdict() == saved, "the verdict still stands in the database"
+
+
+def test_s179_the_saved_row_is_read_once_per_database_and_model_id_per_process(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = _too_long(clock, monkeypatch)
+    _restart()
+    _after_restart(provider, monkeypatch)
+    reads: list[str] = []
+    real = _STORE.cost_verdict
+
+    def spy(*a, **k):
+        reads.append("read")
+        return real(*a, **k)
+
+    monkeypatch.setattr(_STORE, "cost_verdict", spy)
+    for lull in (1.0, 2.0, 3.0):
+        assert _due(lull) is False and _remeasure(lull) is False
+    assert reads == ["read"], "one SELECT on the verdict table, however many due checks and runs"
+    reads.clear()
+    other = MemoryStore(_STORE.db_path.parent / "another.db", integrity_check=False)
+    try:
+        monkeypatch.setattr(other, "cost_verdict", spy)
+        with reranker_mod._cost_lock:
+            reranker_mod._too_long.clear()
+        assert reranker_mod._too_long_remembered(_MODEL, other) is False
+        assert reads == ["read"], "a second database has its own marker: it is read, and it holds no verdict"
+        assert reranker_mod._too_long_remembered(_MODEL, _STORE) is False
+        assert reads == ["read"], "the first database's marker is set: its row is not read again"
+    finally:
+        other.close()
+
+
+def test_s179_a_sample_arriving_after_a_restart_ends_the_verdict_and_deletes_its_row(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = _too_long(clock, monkeypatch)
+    _restart()
+    _after_restart(provider, monkeypatch)
+    assert _due(1.0) is False
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 4 * _X5, 4 * 6.0, None)  # any new measurement
+    assert _due(2.0) is True, "a sample arrived: the estimate changed (S175)"
+    assert _saved_verdict() is None, "the row is gone with the verdict"
+    _restart()  # a second restart finds no verdict, whatever the job does next
+    _after_restart(provider, monkeypatch)
+    assert reranker_mod._too_long_remembered(_MODEL, _STORE) is False
+    calls = len(_seven_doc_calls(provider))
+    assert _remeasure(2.0) is True
+    assert len(_seven_doc_calls(provider)) == calls + 1
+
+
+def test_s179_a_sample_flushed_by_another_connection_after_a_restart_ends_the_verdict(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = _too_long(clock, monkeypatch)
+    _restart()
+    _after_restart(provider, monkeypatch)
+    other = MemoryStore(_STORE.db_path, integrity_check=False)
+    try:
+        now = cost_series._wall_clock()
+        other.record_cost_samples(
+            "rerank", cost_series.machine_id(), _MODEL, [(3 * _X5, 9.0, now)], now=now,
+            window_seconds=cost_series.window_seconds(),
+        )
+    finally:
+        other.close()
+    assert reranker_mod._too_long_remembered(_MODEL, _STORE) is False
+    assert _saved_verdict() is None
+
+
+def test_s179_a_sample_that_ages_out_ends_a_saved_verdict_after_a_restart(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = _too_long(clock, monkeypatch)
+    _restart()
+    _after_restart(provider, monkeypatch)
+    real = cost_series._wall_clock
+    shift = [0.0]
+    monkeypatch.setattr(cost_series, "_wall_clock", lambda: real() + shift[0])
+    shift[0] = 60.0
+    assert reranker_mod._too_long_remembered(_MODEL, _STORE) is True, "a step that changes nothing keeps it"
+    shift[0] = cost_series.window_seconds() + 60.0
+    assert reranker_mod._too_long_remembered(_MODEL, _STORE) is False, "the samples it counted left the window"
+    assert _saved_verdict() is None
+
+
+def test_s179_another_machines_verdict_does_not_count(clock: _Clock, monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = _too_long(clock, monkeypatch)
+    saved = _saved_verdict()
+    _restart()
+    monkeypatch.setattr(cost_series, "_machine_override", "another-machine")
+    assert reranker_mod._too_long_remembered(_MODEL, _STORE) is False, "S159: a copied database starts without it"
+    assert _STORE.cost_verdict("rerank", "test-machine", _MODEL) == saved, "the other machine's row is untouched"
+    _restart()
+    monkeypatch.setattr(cost_series, "_machine_override", "test-machine")
+    assert reranker_mod._too_long_remembered(_MODEL, _STORE) is True
+    assert provider is not None
+
+
+def test_s179_a_restart_after_a_crash_ends_the_verdict_and_costs_one_more_rerank(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Consequence C2, pinned: the job's own sample (and any other buffered one) is lost in a
+    crash, so the saved count is higher than the database holds and the verdict ends."""
+    provider = _true_cost_provider(clock, 5.0)
+    _cached(monkeypatch, provider)
+    _healthy_estimate(provider)
+    assert cost_series.flush(_STORE) == 2  # the estimate is in the database
+    assert _message(provider).hand_off == "budget"
+    assert _due(1.0) and _remeasure(1.0)  # the job's sample is buffered only
+    assert _saved_verdict() is not None and reranker_mod._too_long_remembered(_MODEL, _STORE)
+    _restart(flush=False)
+    _after_restart(provider, monkeypatch)
+    assert _due(2.0) is True, "the verdict does not survive a crash: one more over-budget rerank"
+    assert _saved_verdict() is None
+    calls = len(_seven_doc_calls(provider))
+    assert _remeasure(2.0) is True
+    assert len(_seven_doc_calls(provider)) == calls + 1
+
+
+def test_s179_a_failed_write_keeps_the_in_process_verdict(clock: _Clock, monkeypatch: pytest.MonkeyPatch) -> None:
+    def locked(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(_STORE, "save_cost_verdict", locked)
+    provider = _too_long(clock, monkeypatch)  # the job runs; the failed write does not raise
+    assert _verdict() is True, "the in-process verdict stands"
+    assert _saved_verdict() is None
+    assert provider is not None
+
+
+def test_s179_a_failed_read_of_the_saved_row_means_no_verdict_for_now_and_is_tried_again(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = _too_long(clock, monkeypatch)
+    _restart()
+    _after_restart(provider, monkeypatch)
+
+    def locked(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+
+    real = _STORE.cost_verdict
+    monkeypatch.setattr(_STORE, "cost_verdict", locked)
+    assert reranker_mod._too_long_remembered(_MODEL, _STORE) is False, "no verdict for now, and no raise"
+    monkeypatch.setattr(_STORE, "cost_verdict", real)
+    assert reranker_mod._too_long_remembered(_MODEL, _STORE) is True, "the read is tried again at the next consult"
+
+
+def test_s179_a_failed_delete_leaves_a_row_that_ends_again_at_the_next_load(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = _too_long(clock, monkeypatch)
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 4 * _X5, 4 * 6.0, None)
+
+    def locked(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+
+    real = _STORE.clear_cost_verdict
+    monkeypatch.setattr(_STORE, "clear_cost_verdict", locked)
+    assert _verdict() is False and _saved_verdict() is not None, "ended in process; the row could not be deleted"
+    monkeypatch.setattr(_STORE, "clear_cost_verdict", real)
+    _restart()
+    _after_restart(provider, monkeypatch)
+    assert reranker_mod._too_long_remembered(_MODEL, _STORE) is False, "the stale row no longer holds: it ends again"
+    assert _saved_verdict() is None
+
+
+def test_s179_schema_rows_and_pruning(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path / "v.db", integrity_check=False)
+    try:
+        window = cost_series.window_seconds()
+        store.save_cost_verdict("rerank", "m1", "a", 100.0, 3, now=100.0, window_seconds=window)
+        store.save_cost_verdict("rerank", "m2", "b", 200.0, 4, now=200.0, window_seconds=window)
+        assert store.cost_verdict("rerank", "m1", "a") == (100.0, 3)
+        assert store.cost_verdict("rerank", "m1", "b") is None and store.cost_verdict("other", "m1", "a") is None
+        store.save_cost_verdict("rerank", "m1", "a", 150.0, 5, now=150.0, window_seconds=window)
+        assert store.cost_verdict("rerank", "m1", "a") == (150.0, 5), "a second verdict replaces the first"
+        store.clear_cost_verdict("rerank", "m1", "a", 100.0)
+        assert store.cost_verdict("rerank", "m1", "a") == (150.0, 5), "a verdict reached meanwhile survives"
+        store.clear_cost_verdict("rerank", "m1", "a", 150.0)
+        assert store.cost_verdict("rerank", "m1", "a") is None
+        # every row of the series past the window goes on the next write, whatever its host or key
+        later = 200.0 + window + 1.0
+        store.save_cost_verdict("rerank", "m3", "c", later, 1, now=later, window_seconds=window)
+        assert store.cost_verdict("rerank", "m2", "b") is None
+        assert store.cost_verdict("rerank", "m3", "c") == (later, 1)
+        store._conn.execute("BEGIN")  # noqa: SLF001
+        with pytest.raises(RuntimeError):
+            store.save_cost_verdict("rerank", "m3", "c", 1.0, 1, now=1.0, window_seconds=window)
+        with pytest.raises(RuntimeError):
+            store.clear_cost_verdict("rerank", "m3", "c", later)
+        store._conn.rollback()  # noqa: SLF001
+        assert store.cost_verdict("rerank", "m3", "c") == (later, 1)
+    finally:
+        store.close()
+
+
+def test_s179_the_table_is_created_on_open_and_an_old_database_opens(tmp_path: Path) -> None:
+    path = tmp_path / "old.db"
+    MemoryStore(path, integrity_check=False).close()
+    con = sqlite3.connect(path)
+    con.execute("DROP TABLE cost_series_verdicts")  # a database from before the verdict was saved
+    con.commit()
+    con.close()
+    store = MemoryStore(path, integrity_check=False)
+    try:
+        assert store.cost_verdict("rerank", "m", "k") is None
+        store.save_cost_verdict("rerank", "m", "k", 1.0, 2, now=1.0, window_seconds=10.0)
+        assert store.cost_verdict("rerank", "m", "k") == (1.0, 2)
+    finally:
+        store.close()
+
+
+def test_s179_only_the_lull_job_entry_points_touch_the_verdict() -> None:
+    """A2g: nothing on the reply path (`rerank_for_recall` and the callers of the rerank) writes
+    or deletes a verdict: the verdict helpers are called only from the due check and the job."""
+    tree = ast.parse((_REPO / "brain/memory/reranker.py").read_text(encoding="utf-8"))
+    names = {"_remember_too_long", "_too_long_remembered", "_end_verdict", "_load_saved_verdict"}
+    callers: dict[str, set[str]] = {n: set() for n in names}
+    for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+        for call in [c for c in ast.walk(fn) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)]:
+            if call.func.id in names and fn.name != call.func.id:
+                callers[call.func.id].add(fn.name)
+    assert callers == {
+        "_remember_too_long": {"remeasure_stuck_width"},
+        "_too_long_remembered": {"stuck_width_due", "remeasure_stuck_width"},
+        "_end_verdict": {"_too_long_remembered"},
+        "_load_saved_verdict": {"_too_long_remembered"},
+    }
+    definers = {"reranker.py", "cost_series.py", "store.py"}  # the helpers and the storage methods they use
+    for path in (_REPO / "brain").rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        if path.name != "reranker.py":
+            assert not any(n in text for n in names), path
+        if path.name not in definers:
+            assert not any(n in text for n in ("save_verdict", "clear_verdict", "save_cost_verdict")), path
 
 
 # ---------------------------------------------------------------------------

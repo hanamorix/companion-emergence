@@ -1,5 +1,5 @@
 """Measured cost series over a rolling 24-hour window, saved in memories.db
-(name-recall fix S146, S114, S127, S159, S163, S164).
+(name-recall fix S146, S114, S127, S159, S163, S164, S178, S179).
 
 A cost series predicts the seconds of one call from its size x as
 ``overhead + rate * x``, fitted by ordinary least squares over the samples
@@ -26,6 +26,13 @@ prediction at that size equals the window's mean). The ratio series does not
 use it: with no sample in its window it has no figure (S178), so a too-high
 figure leaves by ageing out; its carried row is written like the others and
 only records the estimate in effect after the last flush.
+
+Verdicts (S179): the rerank's S127 "too long" verdict is saved with the series,
+one row per (series, machine id, key) in `cost_series_verdicts`, by
+`CostSeries.save_verdict` (written only by the lull job that reaches it), read
+once per process by `load_verdict` and deleted by `clear_verdict` when it ends.
+The row says when the verdict was reached and how many window samples had been
+taken at or before it; the caller (`reranker.py`) decides whether it still holds.
 
 Writes (S164): a sample is only appended to an in-process buffer
 (`CostSeries.record`); nothing on the reply path writes the database. The
@@ -493,6 +500,30 @@ class CostSeries:
         `T_s`), or `None` before any measurement."""
         fit = self.fit(store, key)
         return None if fit is None else fit.predict(1)
+
+    def save_verdict(self, store: MemoryStore, key: str, taken_at: float, held: int) -> None:
+        """Save this machine's S127 verdict for `key` (S179): reached at `taken_at`
+        with `held` window samples taken at or before it. Prunes the series' verdict
+        rows past the window. Raises when the write fails."""
+        store.save_cost_verdict(
+            self.name,
+            machine_id(),
+            key,
+            taken_at,
+            held,
+            now=_wall_clock(),
+            window_seconds=window_seconds(),
+        )
+
+    def load_verdict(self, store: MemoryStore, key: str) -> tuple[float, int] | None:
+        """`(taken_at, held)` of this machine's saved verdict for `key`, or `None`
+        (another machine's row does not count, S159). Raises when the read fails."""
+        return store.cost_verdict(self.name, machine_id(), key)
+
+    def clear_verdict(self, store: MemoryStore, key: str, taken_at: float) -> None:
+        """Delete this machine's saved verdict for `key` if it is still the one
+        reached at `taken_at`. Raises when the write fails."""
+        store.clear_cost_verdict(self.name, machine_id(), key, taken_at)
 
     def window_counts(self, store: MemoryStore, key: str, since: float) -> tuple[int, int]:
         """`(before, after)`: how many window samples (database first, then this

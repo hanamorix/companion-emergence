@@ -546,6 +546,21 @@ CREATE TABLE IF NOT EXISTS cost_series_carried (
     fitted_at REAL NOT NULL,
     PRIMARY KEY (series, host, series_key)
 );
+-- `cost_series_verdicts` (S179): the S127 "too long" verdict of a key, saved so a
+-- restart does not re-run the over-budget re-measure. One row per (series, host,
+-- key): `taken_at` is the wall time the verdict was reached at and `held` how many
+-- window samples had been taken at or before it; it holds while no sample was taken
+-- after `taken_at` and the window still holds `held` samples at or before it (S175).
+-- A row older than the window cannot hold any more (its samples have aged out) and
+-- is pruned by the next write.
+CREATE TABLE IF NOT EXISTS cost_series_verdicts (
+    series TEXT NOT NULL,
+    host TEXT NOT NULL,
+    series_key TEXT NOT NULL,
+    taken_at REAL NOT NULL,
+    held INTEGER NOT NULL,
+    PRIMARY KEY (series, host, series_key)
+);
 
 -- F2c (inc2, red-team fix F-1, spec §2): per-persona weekly judge self-tune
 -- MARKER — mirrors `reranker_floor_calibration`'s posture immediately above
@@ -1978,6 +1993,69 @@ class MemoryStore:
                         now,
                     ),
                 )
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+
+    def save_cost_verdict(
+        self,
+        series: str,
+        host: str,
+        key: str,
+        taken_at: float,
+        held: int,
+        *,
+        now: float,
+        window_seconds: float,
+    ) -> None:
+        """Save the S127 "too long" verdict of one series key (S179) and prune the
+        series' verdict rows older than the window, any host or key (a verdict
+        cannot outlive the samples it counted). One write transaction; raises on
+        any database error (after rolling back) and when the connection is
+        already inside a transaction. Called only by the lull job that reached
+        the verdict."""
+        if self._conn.in_transaction:
+            raise RuntimeError("cost series: cannot save a verdict inside an open transaction")
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                "DELETE FROM cost_series_verdicts WHERE series = ? AND taken_at <= ?",
+                (series, now - window_seconds),
+            )
+            self._conn.execute(
+                "INSERT OR REPLACE INTO cost_series_verdicts "
+                "(series, host, series_key, taken_at, held) VALUES (?, ?, ?, ?, ?)",
+                (series, host, key, taken_at, held),
+            )
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+
+    def cost_verdict(self, series: str, host: str, key: str) -> tuple[float, int] | None:
+        """`(taken_at, held)` of the saved verdict of one series key on one machine,
+        or `None` (S179). Read-only."""
+        row = self._conn.execute(
+            "SELECT taken_at, held FROM cost_series_verdicts "
+            "WHERE series = ? AND host = ? AND series_key = ?",
+            (series, host, key),
+        ).fetchone()
+        return None if row is None else (float(row[0]), int(row[1]))
+
+    def clear_cost_verdict(self, series: str, host: str, key: str, taken_at: float) -> None:
+        """Delete the saved verdict of one series key if it is still the one reached
+        at `taken_at` (a newer verdict written meanwhile survives). Same transaction
+        rules as `save_cost_verdict`."""
+        if self._conn.in_transaction:
+            raise RuntimeError("cost series: cannot clear a verdict inside an open transaction")
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                "DELETE FROM cost_series_verdicts "
+                "WHERE series = ? AND host = ? AND series_key = ? AND taken_at = ?",
+                (series, host, key, taken_at),
+            )
             self._conn.commit()
         except BaseException:
             self._conn.rollback()
