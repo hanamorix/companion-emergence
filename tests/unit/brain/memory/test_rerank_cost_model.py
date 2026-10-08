@@ -1400,6 +1400,26 @@ def test_s180_the_kept_figure_follows_the_last_figure_seen_and_a_zero_rate_forge
     assert est.ram_bytes_per_token is None and est.ram_figure_kept is False, "the older figure does not resurrect"
 
 
+def test_s180_the_seed_sample_is_kept_even_if_no_estimate_call_happens_before_it_ages_out(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stage-6 review F2: the figure is remembered when the process RECORDS the sample, not only when an
+    estimate call reads the window. One message after a restart (its seed sample is the only RAM sample),
+    then more than a day of quiet: the next message still finds the figure."""
+    wall, rss = [1_000_000.0], [1.0e9]
+    monkeypatch.setattr(cost_series, "_wall_clock", lambda: wall[0])
+    monkeypatch.setattr(reranker_mod, "_current_rss_bytes", lambda: rss[0])
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
+    _persist_estimate()
+    provider = _GrowingProvider(clock, rss, per_token=500.0)
+    first = rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0)
+    assert first.width == 5
+    assert len(reranker_mod._ram_kept) == 1, "remembered at the record"
+    wall[0] += cost_series.window_seconds() + 60.0  # no estimate call in between
+    est = rerank_cost_estimate(_MODEL)
+    assert est.ram_figure_kept is True and est.ram_bytes_per_token == pytest.approx(500.0)
+
+
 def test_s180_the_kept_figure_is_keyed_by_database_and_model_id_and_shared_by_stores_on_one_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1483,20 +1503,27 @@ class _OwnerLock:
 
 
 class _GuardedDict(dict):
-    """A dict that records a violation whenever a thread touches it without holding `lock`."""
+    """A dict that records a violation whenever a thread touches it without holding `lock`, and
+    which threads touched it at all."""
 
     def __init__(self, lock: _OwnerLock, violations: list[str]) -> None:
         super().__init__()
         self._owner_lock = lock
         self._violations = violations
+        self.touched_by: set[int] = set()
 
     def _check(self, what: str) -> None:
+        self.touched_by.add(threading.get_ident())
         if self._owner_lock.owner != threading.get_ident():
             self._violations.append(what)
 
     def __getitem__(self, key):
         self._check("get")
         return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        self._check("get")
+        return super().get(key, default)
 
     def __contains__(self, key):
         self._check("in")
@@ -1514,38 +1541,58 @@ class _GuardedDict(dict):
         self._check("clear")
         super().clear()
 
+    def __len__(self):
+        self._check("len")
+        return super().__len__()
+
 
 def test_s180_the_kept_figure_is_touched_only_under_the_cost_lock(monkeypatch: pytest.MonkeyPatch) -> None:
-    """K3: estimate calls from several threads, a recording thread and a reset never touch the kept
-    dict without holding `_cost_lock` (the guard records the owning thread; a bare `locked()` check
-    would pass while another thread holds the lock)."""
+    """K3: estimate calls from several threads (each with its OWN store object on the one file, as the
+    job, the tool and the reply path have), a recording thread and a reset never touch the kept dict
+    without holding `_cost_lock`. The guard records the owning thread (a bare `locked()` check would
+    pass while another thread holds the lock) and the test asserts the readers really reached the dict
+    in both branches (window answering, window empty and the figure kept)."""
+    wall = [1_000_000.0]
+    monkeypatch.setattr(cost_series, "_wall_clock", lambda: wall[0])
     lock = _OwnerLock()
     violations: list[str] = []
+    guarded = _GuardedDict(lock, violations)
     monkeypatch.setattr(reranker_mod, "_cost_lock", lock)
-    monkeypatch.setattr(reranker_mod, "_ram_kept", _GuardedDict(lock, violations))
+    monkeypatch.setattr(reranker_mod, "_ram_kept", guarded)
     reranker_mod._rerank_cost.record(_STORE, _MODEL, 700, 0.07)
-    reranker_mod._record_rerank_cost(_MODEL, _STORE, 100, 0.01, 1.0e5)
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 100, 0.01, 1.0e5)  # running; window answers 1000 B/token
     errors: list[BaseException] = []
+    results: list[RerankCostEstimate | None] = []
+    reader_ids: set[int] = set()
 
-    def _reader() -> None:
+    def _reader(phase_kept: bool) -> None:
+        store = MemoryStore(_STORE.db_path, integrity_check=False)
         try:
-            for _ in range(30):
-                est = rerank_cost_estimate(_MODEL)
-                assert est is None or est.ram_bytes_per_token is None or est.ram_bytes_per_token > 0
+            reader_ids.add(threading.get_ident())
+            for _ in range(20):
+                est = reranker_mod.rerank_cost_estimate(_MODEL, store)
+                results.append(est)
+                if est is not None:
+                    assert est.ram_figure_kept is phase_kept
         except BaseException as exc:  # noqa: BLE001 - reported by the main thread
             errors.append(exc)
+        finally:
+            store.close()
 
-    def _resetter() -> None:
-        try:
-            for _ in range(10):
-                reranker_mod._reset_rerank_cost_model()
-        except BaseException as exc:  # noqa: BLE001
-            errors.append(exc)
+    def _run(phase_kept: bool) -> None:
+        threads = [threading.Thread(target=_reader, args=(phase_kept,)) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30.0)
 
-    threads = [threading.Thread(target=_reader) for _ in range(4)] + [threading.Thread(target=_resetter)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=30.0)
+    _run(False)  # the window answers: readers write the figure
+    wall[0] += cost_series.window_seconds() + 60.0
+    reranker_mod._rerank_cost.record(_STORE, _MODEL, 700, 0.07)
+    _run(True)  # the window is empty: readers read the kept figure
+    reranker_mod._reset_rerank_cost_model()  # a reset under the same lock
     assert not errors, errors
+    answered = [e for e in results if e is not None]
+    assert len(answered) == len(results) == 160, "every reader call answered an estimate (the store was usable from its thread)"
+    assert reader_ids <= guarded.touched_by, "every reader thread reached the guarded dict"
     assert violations == [], "the kept dict was touched outside the cost lock"

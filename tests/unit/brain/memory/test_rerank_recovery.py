@@ -499,6 +499,35 @@ def test_s180_k2d_a_re_seed_that_measures_no_growth_leaves_no_figure_and_is_not_
     assert _due(2.0) is False and _MODEL not in reranker_mod._budget_misses
 
 
+def test_s180_k2b_a_re_seed_that_runs_over_the_full_budget_remembers_the_too_long_verdict(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The S127 verdict rule is unchanged for a re-seed run: the batch truly takes longer than the full
+    budget, so the verdict is remembered (and the re-seed sample was still recorded)."""
+    provider, wall, _peak = _running_with_a_too_high_figure(clock, monkeypatch)
+    provider.rate = 5.0 / (7 * _BIG)  # the estimate (made at the old rate) says 5 fit; the truth is 5 s > _B
+    _age_out_the_window(wall)
+    assert _message(provider, docs=_docs(50, _BIG)).hand_off == "budget"
+    assert _due(1.0) and _remeasure(1.0)
+    assert _verdict() is True, "5 s > the full budget: remembered (S127)"
+    assert rerank_cost_estimate(_MODEL).ram_figure_kept is False, "and the sample re-seeded the figure"
+    assert _MODEL not in reranker_mod._budget_misses, "S116 (b): dropped, not stuck but too long"
+
+
+def test_s180_k2d_a_re_seed_whose_provider_gives_no_seconds_keeps_the_miss_and_waits_for_the_next_lull(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider, wall, _peak = _running_with_a_too_high_figure(clock, monkeypatch)
+    _age_out_the_window(wall)
+    assert _message(provider, docs=_docs(50, _BIG)).hand_off == "budget"
+    provider.rerank_timed = lambda query, documents: (list(provider.rerank(query, documents)), None, None)
+    assert _due(1.0) and _remeasure(1.0) is True
+    assert _MODEL in reranker_mod._budget_misses, "no seconds, nothing recorded: the miss is kept"
+    assert rerank_cost_estimate(_MODEL).ram_figure_kept is True
+    assert _due(1.0) is False, "once per lull"
+    assert _due(2.0) is True, "and again at the next lull"
+
+
 # ---------------------------------------------------------------------------
 # C15f: recovery in three regimes, plus the S116 (b) drop.
 # ---------------------------------------------------------------------------

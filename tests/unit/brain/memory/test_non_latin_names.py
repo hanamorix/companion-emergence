@@ -226,9 +226,17 @@ def test_s1a_every_spelling_of_the_spacing_is_one_name_from_every_source(tmp_pat
     assert all(kn.name_key(x) == "田中 太郎" for x in SPELLINGS)
 
 
-def test_s1a_the_display_form_is_not_collapsed(tmp_path: Path) -> None:
-    kn.admit_names(tmp_path, ["  田中   太郎 "], "gate")
-    assert _rows(tmp_path) == [("田中 太郎", "田中   太郎", "gate")]
+@pytest.mark.parametrize("source", SOURCES)
+def test_s1a_the_display_form_is_not_collapsed(tmp_path: Path, source: str) -> None:
+    _admit(tmp_path, ["  田中   太郎 "], source)
+    assert _rows(tmp_path) == [("田中 太郎", "田中   太郎", source)]
+
+
+def test_s1a_which_display_survives_a_second_spelling_is_the_writers_existing_rule(tmp_path: Path) -> None:
+    kn.admit_names(tmp_path, ["田中  太郎", "田中 太郎"], "gate")
+    assert _rows(tmp_path) == [("田中 太郎", "田中  太郎", "gate")], "a mechanical add keeps the first display"
+    kn.confirm_readd(tmp_path, "田中\t太郎")
+    assert _rows(tmp_path) == [("田中 太郎", "田中\t太郎", "tool")], "the kindled's spelling replaces it, as at base"
 
 
 @pytest.mark.parametrize("remove_with", SPELLINGS)
@@ -293,11 +301,28 @@ def test_s1e_spaced_punctuation_collapses_like_any_other_name(tmp_path: Path) ->
     assert [r[0] for r in _rows(tmp_path)] == ["- -"]
 
 
-def test_s1g_every_key_written_comes_from_name_key() -> None:
-    """No migration (spec item 2): the only code that builds a stored key is `name_key`, through
-    `_admit`, `remove_names` and `note_tool_call`; a row written by the new rule is single-spaced."""
-    import inspect
+def test_s1g_every_key_written_comes_from_name_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No migration (spec item 2): the only code that builds a stored key is `name_key`; each writer,
+    remover and comparer calls it (a spy), so a row written by the new rule is single-spaced."""
+    calls: list[str] = []
+    real = kn.name_key
 
-    for fn in (kn._admit, kn.remove_names, kn.note_tool_call):
-        assert "name_key(" in inspect.getsource(fn), fn.__name__
-    assert "normalize_name(" not in inspect.getsource(kn._admit)
+    def spy(name: str) -> str:
+        calls.append(name)
+        return real(name)
+
+    monkeypatch.setattr(kn, "name_key", spy)
+    for label, action in (
+        ("admit_names", lambda: kn.admit_names(tmp_path, ["田中  太郎"], "gate")),
+        ("remove_names", lambda: kn.remove_names(tmp_path, ["田中\t太郎"], "tool")),
+        ("confirm_readd", lambda: kn.confirm_readd(tmp_path, "田中 太郎")),
+        (
+            "note_tool_call",
+            lambda: kn.note_tool_call(
+                tmp_path, ADD_NAME_TOOL_NAME, {"name": "田中   太郎"}, add_tool_name=ADD_NAME_TOOL_NAME
+            ),
+        ),
+    ):
+        calls.clear()
+        action()
+        assert calls, f"{label} builds its key with name_key"

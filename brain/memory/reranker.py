@@ -679,7 +679,8 @@ class _BudgetMiss:
 # activity marker of each model id's last re-measure (S100), and the "too long"
 # verdicts (S127: remembered until the cost estimate next changes, decided by
 # which samples the window holds, not by comparing fitted floats; saved with the
-# host-keyed series and read back once per process, S179). One lock
+# host-keyed series and read back once per process, S179), and the kept RAM figures
+# (`_ram_kept`, S180). One lock
 # guards them all (every read and every read-modify-write), so a concurrent
 # passive recall, `search_memories` call (#297: the tool runs in a bridge
 # worker thread) and the re-measure job never lose an update. The time series
@@ -724,6 +725,18 @@ _cost_lock = threading.Lock()
 _cost_update_hook: Callable[[], None] | None = None
 
 
+def _note_ram_figure(key: tuple[str, str], ram_fit: cost_series.RangedFit | None) -> None:
+    """S180: remember the RAM figure the window answers (a rate above 0 replaces the
+    kept one, a rate of 0 is no figure and forgets it); a window that answers nothing
+    leaves the kept figure as it is. Caller holds `_cost_lock`."""
+    if ram_fit is None:
+        return
+    if ram_fit.rate > 0.0:
+        _ram_kept[key] = ram_fit.rate
+    else:
+        _ram_kept.pop(key, None)
+
+
 def rerank_cost_estimate(model_id: str, store: MemoryStore) -> RerankCostEstimate | None:
     """The current cost model for `model_id`: the time fit of the last 24
     hours (S146; saved, so available from the first message after a restart),
@@ -750,12 +763,8 @@ def rerank_cost_estimate(model_id: str, store: MemoryStore) -> RerankCostEstimat
     rate: float | None = None if ram_fit is None else ram_fit.rate
     kept = False
     with _cost_lock:
-        if ram_fit is not None:
-            if ram_fit.rate > 0.0:
-                _ram_kept[key] = ram_fit.rate
-            else:
-                _ram_kept.pop(key, None)
-        elif model_id in _ram_state and key in _ram_kept:
+        _note_ram_figure(key, ram_fit)
+        if ram_fit is None and model_id in _ram_state and key in _ram_kept:
             rate, kept = _ram_kept[key], True
     return RerankCostEstimate(
         overhead_seconds=fit.overhead,
@@ -779,7 +788,10 @@ def _record_rerank_cost(
     series (S164: nothing is written to the database here). The RAM sample is
     buffered BEFORE the new high water is published (`rerank_cost_estimate` reads
     them in the opposite order), both under `_cost_lock`; the buffer's own lock is
-    only ever taken inside it."""
+    only ever taken inside it. After a RAM sample the process also remembers the
+    window's figure as its kept one (S180), so the sample that seeds a process is
+    kept even if no estimate call happens before it ages out."""
+    sampled = False
     with _cost_lock:
         current = _ram_state.get(model_id, _RamState())
         if _cost_update_hook is not None:
@@ -788,7 +800,16 @@ def _record_rerank_cost(
             _ram_cost.record(
                 store, model_id, padded_tokens - current.peak_x, max(0.0, rss_delta_bytes)
             )
+            sampled = True
         _ram_state[model_id] = current.plus(padded_tokens)
+    if sampled:
+        # S180: the process remembers the figure its own sample just made, so a window that
+        # empties before any later estimate call (an idle day after a seed) still leaves it
+        # a figure to keep. The read is the one every estimate makes; a failed read is no figure.
+        ram_fit = _ram_cost.fit(store, model_id)
+        key = (cost_series._store_key(store), model_id)
+        with _cost_lock:
+            _note_ram_figure(key, ram_fit)
     _rerank_cost.record(store, model_id, padded_tokens, seconds)
 
 
@@ -902,8 +923,8 @@ def _ram_unseeded(model_id: str, estimate: RerankCostEstimate) -> bool:
 
 
 def _reset_rerank_cost_model() -> None:
-    """Test-only: forget every model id's RAM state, warm-up state, budget
-    misses, re-measure markers and "too long" verdicts. The saved series lives
+    """Test-only: forget every model id's RAM state, kept RAM figures, warm-up
+    state, budget misses, re-measure markers and "too long" verdicts. The saved series lives
     in the database and the process buffer (`cost_series._reset_pending`)."""
     with _cost_lock:
         _ram_state.clear()
@@ -1064,6 +1085,8 @@ def remeasure_stuck_width(activity_marker: object, store: MemoryStore) -> bool:
     ram_per_token = (
         estimate.ram_bytes_per_token if estimate is not None and not estimate.ram_figure_kept else None
     )
+    if estimate is not None and estimate.ram_figure_kept:
+        log.info("rerank width re-measure: re-seeding the kept RAM figure (its window is empty)")
     if ram_per_token is not None and ram_per_token > 0.0:
         headroom = _available_ram_headroom_bytes()
         growth = max(0, padded - estimate.peak_padded_tokens)
