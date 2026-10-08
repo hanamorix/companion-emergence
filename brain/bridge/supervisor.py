@@ -1037,6 +1037,25 @@ def _build_gated_jobs(
         )
     )
 
+    # 4e. recall diagnostics flush — name-recall fix S189. The diagnostics append
+    # never waits for the log's lock: a record that met it held (a prune) is kept
+    # in memory and written with the next append or here, at the next lull. Due
+    # while this process buffers records for this persona's log (nothing opened
+    # to decide that). Same shape as 4d (S164).
+    def _recall_diagnostics_flush_run() -> JobOutcome:
+        recall_diagnostics.flush_pending(recall_diagnostics.diagnostics_path(persona_dir))
+        return JobOutcome.COMPLETED
+
+    jobs.append(
+        GatedJob(
+            "recall_diagnostics_flush",
+            run=_recall_diagnostics_flush_run,
+            has_work=lambda: recall_diagnostics.has_pending(
+                recall_diagnostics.diagnostics_path(persona_dir)
+            ),
+        )
+    )
+
     # 5. maintenance — forgetting + narrative (+ the two cheap sweeps).
     if maintenance_interval_s is not None:
 

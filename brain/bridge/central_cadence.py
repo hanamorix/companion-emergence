@@ -71,7 +71,8 @@ logger = logging.getLogger(__name__)
 # path), then the stuck-width re-measure (S100: one timed rerank per lull
 # while the learned cost says fewer than 5 candidates fit), then the cost-series
 # flush (S146, S164: the buffered timing samples are saved to memories.db, after
-# the re-measure so its own sample is saved the same lull). Names are the job
+# the re-measure so its own sample is saved the same lull), then the recall
+# diagnostics flush (S189: records buffered while the log's lock was held). Names are the job
 # table's keys and the log's `job=` values.
 GATED_JOB_ORDER: tuple[str, ...] = (
     "pass2",
@@ -82,6 +83,7 @@ GATED_JOB_ORDER: tuple[str, ...] = (
     "rerank_floor_bootstrap",
     "rerank_width_remeasure",
     "cost_series_flush",
+    "recall_diagnostics_flush",
     "maintenance",
     "interest_sweep",
     "self_model_articulation",

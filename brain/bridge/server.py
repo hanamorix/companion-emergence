@@ -613,6 +613,16 @@ async def _flush_cost_series_at_stop(persona_dir: Path) -> None:
         await asyncio.to_thread(_flush)
     except Exception:
         logger.exception("cost-series flush failed during shutdown")
+    # Name-recall fix S189: the recall diagnostics records buffered while the log's
+    # lock was held are written at a clean stop too (never waits, never raises).
+    try:
+        from brain.memory import recall_diagnostics
+
+        await asyncio.to_thread(
+            recall_diagnostics.flush_pending, recall_diagnostics.diagnostics_path(persona_dir)
+        )
+    except Exception:
+        logger.exception("recall diagnostics flush failed during shutdown")
 
 
 def _run_heartbeat_close(persona_dir: Path, provider: LLMProvider) -> None:

@@ -24,6 +24,14 @@ from brain.memory import recall_diagnostics as rd
 NOW = datetime(2026, 9, 29, 12, 0, 0, tzinfo=UTC)
 
 
+@pytest.fixture(autouse=True)
+def _clean_pending_buffer():
+    """The diagnostics buffer is module state (S189): no test inherits another's."""
+    rd._pending.clear()
+    yield
+    rd._pending.clear()
+
+
 def _para(
     path: str = "reranked",
     width: int = 5,
@@ -176,7 +184,9 @@ def test_concurrent_appends_all_land_as_intact_lines(tmp_path):
     def worker(k: int) -> None:
         try:
             for i in range(10):
-                assert rd.log_recall(path, **_kwargs(paragraph_count=k * 100 + i))
+                assert rd.log_recall(
+                    path, **_kwargs(paragraph_count=k * 100 + i, now=datetime.now(UTC))
+                )
         except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
 
@@ -186,6 +196,7 @@ def test_concurrent_appends_all_land_as_intact_lines(tmp_path):
     for t in threads:
         t.join(timeout=30)
     assert not errors
+    rd.flush_pending(path)  # an append that met a held lock is buffered until the next write or lull
     recs = _read_records(path)
     assert sorted(r["paragraph_count"] for r in recs) == sorted(
         k * 100 + i for k in range(4) for i in range(10)
@@ -406,7 +417,7 @@ def _append_inside_prune_window(monkeypatch, path: Path, point: str, *, settle_s
     done = threading.Event()
 
     def body() -> None:
-        rd.append_record(path, {"ts": NOW.isoformat(), "source": "passive", "n": 999})
+        rd.append_record(path, _fresh_record(999))
         done.set()
 
     def launch() -> None:
@@ -434,7 +445,7 @@ def _append_inside_prune_window(monkeypatch, path: Path, point: str, *, settle_s
 
 
 @pytest.mark.parametrize("point", ["after_read", "at_replace"])
-def test_append_attempted_inside_the_prune_window_blocks_and_lands_after_the_rewrite(
+def test_append_attempted_inside_the_prune_window_does_not_wait_and_lands_after_the_rewrite(
     tmp_path, monkeypatch, point
 ):
     path = rd.diagnostics_path(tmp_path)
@@ -444,7 +455,7 @@ def test_append_attempted_inside_the_prune_window_blocks_and_lands_after_the_rew
     monkeypatch.undo()
     state["thread"].join(timeout=10)
     assert not state["thread"].is_alive()
-    assert state["done_in_window"] is False  # it was blocked by the prune's lock
+    assert state["done_in_window"] is True  # S189: it did not wait for the prune's lock
     assert [r["n"] for r in _read_records(path)] == [1, 999]  # not lost, and after the rewrite
 
 
@@ -469,3 +480,165 @@ def test_the_lock_is_what_protects_the_append_a_lockless_prune_loses_it(
     state["thread"].join(timeout=10)
     assert state["done_in_window"] is True  # not blocked
     assert [r["n"] for r in _read_records(path)] == [1]  # the append (999) was overwritten
+
+
+# --- the append never waits on the reply path (S189) -------------------------
+
+
+def _run_with_timeout(fn, timeout: float = 5.0):
+    """Run ``fn`` in a thread; fail the test (rather than hang it) if it waits."""
+    box: dict = {}
+
+    def body() -> None:
+        try:
+            box["value"] = fn()
+        except BaseException as exc:  # noqa: BLE001
+            box["error"] = exc
+
+    t = threading.Thread(target=body, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    assert not t.is_alive(), "the call waited on the held lock"
+    assert "error" not in box, box.get("error")
+    return box["value"]
+
+
+def _fresh_record(n: int, *, age: timedelta = timedelta(0)) -> dict:
+    return {"ts": (datetime.now(UTC) - age).isoformat(), "source": "passive", "n": n}
+
+
+def test_append_with_the_lock_held_returns_at_once_and_writes_nothing_yet(tmp_path):
+    path = rd.diagnostics_path(tmp_path)
+    with rd.file_lock(path):
+        assert _run_with_timeout(lambda: rd.append_record(path, _fresh_record(1))) is True
+        assert not path.exists() or _read_records(path) == []
+
+
+def test_the_next_append_writes_the_buffered_records_first_in_order(tmp_path):
+    path = rd.diagnostics_path(tmp_path)
+    with rd.file_lock(path):
+        assert _run_with_timeout(lambda: rd.append_record(path, _fresh_record(1)))
+        assert _run_with_timeout(lambda: rd.append_record(path, _fresh_record(2)))
+    assert rd.append_record(path, _fresh_record(3)) is True
+    assert [r["n"] for r in _read_records(path)] == [1, 2, 3]
+    assert rd.append_record(path, _fresh_record(4)) is True
+    assert [r["n"] for r in _read_records(path)] == [1, 2, 3, 4]  # written once, not repeated
+
+
+def test_the_lull_flush_writes_the_buffer_when_the_lock_is_free(tmp_path):
+    path = rd.diagnostics_path(tmp_path)
+    with rd.file_lock(path):
+        assert _run_with_timeout(lambda: rd.append_record(path, _fresh_record(1)))
+        assert _run_with_timeout(lambda: rd.flush_pending(path)) == 0  # still held: no wait, no write
+    assert rd.flush_pending(path) == 1
+    assert [r["n"] for r in _read_records(path)] == [1]
+    assert rd.flush_pending(path) == 0  # nothing buffered any more
+
+
+def test_flush_with_nothing_buffered_creates_no_lock_file(tmp_path):
+    path = rd.diagnostics_path(tmp_path)
+    assert rd.flush_pending(path) == 0
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_buffered_record_older_than_the_window_is_dropped_not_written(tmp_path, monkeypatch):
+    path = rd.diagnostics_path(tmp_path)
+    monkeypatch.setattr(rd, "_default_window_days", lambda: 2.0)
+    with rd.file_lock(path):
+        assert _run_with_timeout(
+            lambda: rd.append_record(path, _fresh_record(1, age=timedelta(days=3)))
+        )
+        assert _run_with_timeout(lambda: rd.append_record(path, _fresh_record(2)))
+    assert rd.append_record(path, _fresh_record(3)) is True
+    assert [r["n"] for r in _read_records(path)] == [2, 3]  # the 3-day-old one was dropped
+
+
+def test_a_record_that_goes_stale_while_buffered_is_dropped_at_the_flush(tmp_path, monkeypatch):
+    path = rd.diagnostics_path(tmp_path)
+    monkeypatch.setattr(rd, "_default_window_days", lambda: 2.0)
+    with rd.file_lock(path):
+        # fresh when buffered (1 day old), stale by the time the lock is free (window shrinks)
+        assert _run_with_timeout(
+            lambda: rd.append_record(path, _fresh_record(1, age=timedelta(days=1)))
+        )
+    monkeypatch.setattr(rd, "_default_window_days", lambda: 0.5)
+    assert rd.flush_pending(path) == 0
+    assert not path.exists() or _read_records(path) == []
+
+
+def test_prune_flushes_the_records_buffered_while_it_held_the_lock(tmp_path):
+    path = rd.diagnostics_path(tmp_path)
+    _write(path, [_rec_line(NOW - timedelta(days=9), 0), _rec_line(NOW - timedelta(hours=1), 1)])
+    with rd.file_lock(path):
+        assert _run_with_timeout(lambda: rd.append_record(path, _fresh_record(7)))
+    assert rd.prune(path, window_days=2.0, now=NOW) == 1
+    assert [r["n"] for r in _read_records(path)] == [1, 7]  # the pruned file, then the buffered one
+
+
+def test_buffered_records_are_in_memory_only(tmp_path):
+    """A crash with the lock still held loses the buffered record (accepted): nothing
+    of it is on disk, and nothing but the buffer holds it."""
+    path = rd.diagnostics_path(tmp_path)
+    with rd.file_lock(path):
+        assert _run_with_timeout(lambda: rd.append_record(path, _fresh_record(1)))
+        assert [p.name for p in tmp_path.iterdir()] == [path.name + ".lock"]
+        assert len(rd._pending[str(path)]) == 1
+
+
+def test_a_failing_write_is_still_fail_soft_and_drops_the_record(tmp_path, monkeypatch, caplog):
+    path = rd.diagnostics_path(tmp_path)
+
+    def boom(*_a, **_k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(rd, "_write_lines", boom)
+    with caplog.at_level(logging.WARNING, logger=rd.logger.name):
+        assert rd.append_record(path, _fresh_record(1)) is False
+    assert "record dropped" in caplog.text
+    assert str(path) not in rd._pending
+
+
+def test_a_stale_record_is_not_kept_in_the_buffer_even_before_any_flush(tmp_path, monkeypatch):
+    """The window bounds the buffer itself (S189), not only what a flush writes."""
+    path = rd.diagnostics_path(tmp_path)
+    monkeypatch.setattr(rd, "_default_window_days", lambda: 2.0)
+    with rd.file_lock(path):
+        assert _run_with_timeout(
+            lambda: rd.append_record(path, _fresh_record(1, age=timedelta(days=3)))
+        )
+        assert not rd.has_pending(path)
+        assert _run_with_timeout(lambda: rd.append_record(path, _fresh_record(2)))
+        assert len(rd._pending[str(path)]) == 1
+
+
+def test_a_lock_released_between_the_failed_try_and_the_buffering_does_not_strand_the_record(
+    tmp_path, monkeypatch
+):
+    """One more non-blocking try after buffering: if the holder let go in the gap, the
+    record is written now, not left waiting for an append that may never come."""
+    path = rd.diagnostics_path(tmp_path)
+    real = rd.file_lock
+    calls = {"n": 0}
+
+    @contextlib.contextmanager
+    def first_try_reports_held(p, *, blocking=True):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield False
+        else:
+            with real(p, blocking=blocking) as acquired:
+                yield acquired
+
+    monkeypatch.setattr(rd, "file_lock", first_try_reports_held)
+    assert rd.append_record(path, _fresh_record(1)) is True
+    assert [r["n"] for r in _read_records(path)] == [1]
+    assert not rd.has_pending(path)
+
+
+def test_has_pending_is_per_path(tmp_path):
+    path = rd.diagnostics_path(tmp_path)
+    assert rd.has_pending(path) is False
+    with rd.file_lock(path):
+        assert _run_with_timeout(lambda: rd.append_record(path, _fresh_record(1)))
+        assert rd.has_pending(path) is True
+        assert rd.has_pending(rd.diagnostics_path(tmp_path / "other")) is False

@@ -1935,6 +1935,16 @@ def _flush_cost_series_at_exit(store: MemoryStore) -> None:
         cost_series.flush(store)
     except Exception:  # noqa: BLE001 - never let a timing save break an exit
         logging.getLogger(__name__).warning("cost-series flush at exit failed", exc_info=True)
+    # Name-recall fix S189: records the diagnostics append buffered while the log's
+    # lock was held (same exit, same reason; the call never waits and never raises).
+    try:
+        from brain.memory import recall_diagnostics
+
+        recall_diagnostics.flush_pending(
+            recall_diagnostics.diagnostics_path(Path(store.db_path).parent)
+        )
+    except Exception:  # noqa: BLE001 - never let a diagnostics save break an exit
+        logging.getLogger(__name__).warning("recall diagnostics flush at exit failed", exc_info=True)
 
 
 def _drain_pass2_at_exit(persona_dir: Path) -> None:
