@@ -1082,6 +1082,10 @@ def remeasure_stuck_width(activity_marker: object, store: MemoryStore) -> bool:
     # S180: a KEPT figure is stale (its window emptied), so the re-measure is the re-seed
     # and runs without the RAM-headroom check, as a first-ever startup seeds; a figure in
     # the window still skips a batch that does not fit.
+    # ACCEPTED RISK (owner, S184): this re-seed ignores memory headroom, so on a very
+    # low-memory host it can run one small (5-candidate) rerank where refusing was
+    # correct. Accepted as built; look here first if a low-memory host ever reports
+    # an out-of-memory kill at a lull.
     ram_per_token = (
         estimate.ram_bytes_per_token if estimate is not None and not estimate.ram_figure_kept else None
     )
