@@ -104,8 +104,73 @@ def test_a_name_of_exactly_100_characters_is_added_and_101_is_not(tmp_path):
     assert add_known_name("  " + ok + "  ", persona_dir=tmp_path) == {"added": True, "name": ok}
     too_long = "W" * 100 + "x"
     got = add_known_name(too_long, persona_dir=tmp_path)
-    assert got == {"added": False, "name": too_long}
+    assert got == {"added": False, "name": too_long, "message": TOO_LONG.format(name=too_long)}
     assert [r[1] for r in _rows(tmp_path)] == [ok]
+
+
+# The approved reply (wording file section 9, S168), byte-exact.
+TOO_LONG = "The name {name} is over the 100 character limit and was not added."
+
+
+def test_the_over_100_reply_is_the_approved_text_for_the_stripped_name(tmp_path):
+    name = "Wren " * 20 + "x"  # 101 characters once stripped
+    got = add_known_name("   " + name + "   ", persona_dir=tmp_path)
+    assert got == {
+        "added": False,
+        "name": name,
+        "message": f"The name {name} is over the 100 character limit and was not added.",
+    }
+    assert _rows(tmp_path) == [] and not kn.known_names_path(tmp_path).exists(), "nothing written"
+
+
+def test_the_length_is_measured_after_strip(tmp_path):
+    ok = "Wren " * 19 + "Wren"  # 99 characters
+    assert add_known_name(ok + " " * 50, persona_dir=tmp_path)["added"] is True
+    assert add_known_name("W" * 100 + " " * 50, persona_dir=tmp_path)["added"] is True
+    assert "message" in add_known_name(" " * 5 + "W" * 101, persona_dir=tmp_path)
+
+
+@pytest.mark.parametrize("name", ["{name}" * 20, "100%s%d{0}" * 12, "{" * 101, "}" * 101])
+def test_a_name_with_braces_or_percent_signs_is_echoed_unchanged(tmp_path, name):
+    got = add_known_name(name, persona_dir=tmp_path)
+    assert len(name) > 100
+    assert got["message"] == "The name " + name + " is over the 100 character limit and was not added."
+    assert got["name"] == name and got["added"] is False
+
+
+@pytest.mark.parametrize("bad", [None, 7, ["Wren"], {"n": "Wren"}, "", "   "])
+def test_every_other_refusal_stays_a_bare_added_false(tmp_path, bad):
+    got = add_known_name(bad, persona_dir=tmp_path)
+    assert got["added"] is False and "message" not in got and set(got) == {"added", "name"}
+
+
+def test_a_failed_write_stays_a_bare_added_false(tmp_path, monkeypatch):
+    def boom(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(kn, "_transact", boom)
+    got = add_known_name("Wren", persona_dir=tmp_path)
+    assert got == {"added": False, "name": "Wren"}
+
+
+def test_the_over_100_reply_reaches_the_caller_through_dispatch(tmp_path):
+    name = "W" * 101
+    assert dispatch(ADD_NAME_TOOL_NAME, {"name": name}, **_ctx(tmp_path)) == {
+        "added": False,
+        "name": name,
+        "message": TOO_LONG.format(name=name),
+    }
+    assert not kn.known_names_path(tmp_path).exists()
+
+
+def test_the_100_character_limit_stated_in_the_texts_is_the_constant():
+    """B2f: the number in the description and in the refusal reply is MAX_NAME_LENGTH."""
+    from brain import prompt_strings
+
+    n = kn.MAX_NAME_LENGTH
+    assert SCHEMAS["add_name"]["description"].endswith(f" Names can be up to {n} characters long.")
+    reply = prompt_strings.get("tools.add_name.too_long_reply")
+    assert reply == f"The name {{name}} is over the {n} character limit and was not added."
 
 
 @pytest.mark.parametrize("bad", [None, 7, ["Wren"], {"n": "Wren"}, "", "   "])

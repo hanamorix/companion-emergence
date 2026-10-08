@@ -860,3 +860,6 @@ system = "You are noticing how some of your feelings have been running lately co
 # The add_name tool's reply for a name on the rejects list (S137, wording file
 # section 7, byte-exact). Filled with str.format(name=...).
 rejected_reply = '''{name} was previously removed from your list of known names, if you want to add it back, call add_name again with the same name as your next tool call.'''
+# The add_name tool's reply for a name over 100 characters (S168, wording file
+# section 9, byte-exact). Filled with str.format(name=...).
+too_long_reply = '''The name {name} is over the 100 character limit and was not added.'''

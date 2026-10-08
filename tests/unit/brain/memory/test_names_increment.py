@@ -504,7 +504,8 @@ def test_n12_a_name_is_at_most_100_characters_from_every_source(tmp_path: Path, 
     assert len(too_long) == 101
     assert kn.admit_names(tmp_path, [too_long, "Z" * 400], source) == []
     assert _q(tmp_path, "SELECT count(*) FROM known_names") == [(1,)]
-    assert kn.confirm_readd(tmp_path, too_long) == "refused"
+    assert kn.confirm_readd(tmp_path, too_long) == "too_long"  # S168: the tool says why
+    assert kn.confirm_readd(tmp_path, 7) == "refused" and kn.confirm_readd(tmp_path, "  ") == "refused"
 
 
 @pytest.mark.parametrize("source", ["gate", "reappraiser", "tool"])

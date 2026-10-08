@@ -897,7 +897,7 @@ def remove_names(
     return list(removed) if ok and removed else []
 
 
-ReaddOutcome = Literal["added", "asked", "refused"]
+ReaddOutcome = Literal["added", "asked", "refused", "too_long"]
 
 
 def confirm_readd(
@@ -906,7 +906,10 @@ def confirm_readd(
     """The add_name tool's one writer (S104, S135, S137). Takes the file lock once
     and runs one transaction:
 
-    * the admission rules refuse the name -> ``"refused"`` (nothing written);
+    * the name is a string over ``MAX_NAME_LENGTH`` characters once stripped (S153) ->
+      ``"too_long"`` (nothing written; the tool tells her why, S168);
+    * the admission rules otherwise refuse the name (not a string, empty) -> ``"refused"``
+      (nothing written);
     * the name is on the rejects list and the pending question is for this same
       name (her previous counted tool call asked it) -> take it off the rejects
       list, clear the question, add it (source ``tool``) -> ``"added"``;
@@ -918,6 +921,8 @@ def confirm_readd(
     logged, and returns ``"refused"``: nothing is half-written, so a reject and a
     pending question survive a failed add.
     """
+    if _too_long(name):
+        return "too_long"
     item = _admit(name, TOOL_SOURCE)
     if item is None:
         return "refused"

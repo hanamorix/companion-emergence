@@ -24,7 +24,7 @@ ADD_DESCRIPTION = (
     "Add a name to your list of known names: a person, a pet, a place, or anything else with a "
     "proper name. When a known name comes up in conversation, even in passing, memories that "
     "mention it are found. If the name is also an everyday word (like Will), it is only matched "
-    "when written with a capital letter."
+    "when written with a capital letter. Names can be up to 100 characters long."
 )
 ADD_PARAM = "The name, spelled the way you want it kept."
 REMOVE_DESCRIPTION = (
@@ -36,6 +36,8 @@ REJECTED_REPLY = (
     "{name} was previously removed from your list of known names, if you want to add it back, "
     "call add_name again with the same name as your next tool call."
 )
+
+TOO_LONG_REPLY = "The name {name} is over the 100 character limit and was not added."
 
 _TELLS = ("—", "–", "delve", "tapestry", "it's not just", "not just a", "testament")
 
@@ -66,7 +68,13 @@ def test_the_rejected_reply_is_the_approved_text():
     assert prompt_strings.get("tools.add_name.rejected_reply") == REJECTED_REPLY
 
 
-@pytest.mark.parametrize("text", [ADD_DESCRIPTION, ADD_PARAM, REMOVE_DESCRIPTION, REMOVE_PARAM, REJECTED_REPLY])
+def test_the_over_100_reply_is_the_approved_text():
+    assert prompt_strings.get("tools.add_name.too_long_reply") == TOO_LONG_REPLY
+
+
+@pytest.mark.parametrize(
+    "text", [ADD_DESCRIPTION, ADD_PARAM, REMOVE_DESCRIPTION, REMOVE_PARAM, REJECTED_REPLY, TOO_LONG_REPLY]
+)
 def test_no_em_dash_or_llm_tell(text):
     for tell in _TELLS:
         assert tell not in text.lower(), tell

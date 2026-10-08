@@ -25,7 +25,8 @@ ADD_NAME_TOOL_DESCRIPTION = (
     "Add a name to your list of known names: a person, a pet, a place, or anything else "
     "with a proper name. When a known name comes up in conversation, even in passing, "
     "memories that mention it are found. If the name is also an everyday word (like "
-    "Will), it is only matched when written with a capital letter."
+    "Will), it is only matched when written with a capital letter. Names can be up to 100 "
+    "characters long."
 )
 
 ADD_NAME_PARAM_DESCRIPTION = (
