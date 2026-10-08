@@ -11,8 +11,8 @@ Tables of the file:
 
 * ``known_names`` (unchanged since N1): one row per name, ``name_lower`` (the
   lower-cased form, words split on the recall tokenizer's word boundary and joined
-  by single spaces; for a name with no ASCII letter or digit its raw lower-cased
-  string, S166, see :func:`name_key`), ``display`` (as extracted, or as the kindled spelled it),
+  by single spaces; for a name with no ASCII letter or digit its lower-cased string with
+  whitespace runs collapsed to one space, S166, S181, see :func:`name_key`), ``display`` (as extracted, or as the kindled spelled it),
   ``source`` (``gate`` / ``reappraiser`` / ``tool``) and ``first_seen`` (UTC ISO).
 * ``stopword_names``: the S104 flag. A row means the listed name is a stopword-name
   ("Will"), whichever source added it (S144). It is a record only; matching decides
@@ -62,8 +62,8 @@ re-appraiser): periods, several words and common words all pass, whatever charac
 holds; a one-word stopword-name is flagged (S104). The only refusals are a non-string, an
 empty name, a name longer than ``MAX_NAME_LENGTH`` characters (S153) and, for a mechanical
 source, a name on the rejects list (S135). A name with no ASCII letter or digit (wholly
-non-Latin, or only punctuation or symbols) is admitted (S166) and keyed by its raw
-lower-cased string (:func:`name_key`); the matcher normalizes keys through the recall
+non-Latin, or only punctuation or symbols) is admitted (S166) and keyed by its lower-cased
+string with whitespace runs collapsed to one space (S181; :func:`name_key`); the matcher normalizes keys through the recall
 tokenizer, so such a key drops out of the snapshot and the name cannot match a message
 until the tokenizer changes (#317).
 """
@@ -294,17 +294,22 @@ def _clean_name(name: str) -> str:
 def name_key(name: str) -> str:
     """The key a name is stored under (``name_lower``): its :func:`normalize_name` form, and
     for a name with no ASCII letter or digit (so an empty normalized form) its raw
-    lower-cased string (S166), so such names do not all collide on an empty key. When
-    lower-casing would create an ASCII letter (U+0130 gives "i" and a combining dot,
-    U+212A KELVIN SIGN gives "k") the stripped string is the key unchanged. So a raw key
-    never holds an ASCII letter or digit: ``normalize_name(key)`` is empty, the snapshot
-    drops it, and the name matches no message (#317)."""
+    lower-cased string (S166), so such names do not all collide on an empty key. Runs of
+    whitespace inside the name (any Unicode whitespace: spaces, tabs, newlines, NBSP,
+    U+3000) collapse to one space in the key (S181), so "田中  太郎" and "田中 太郎" are one
+    name, as "Mary  Ann" and "Mary Ann" already were (a normalized key is single-spaced by
+    construction). When lower-casing would create an ASCII letter (U+0130 gives "i" and a
+    combining dot, U+212A KELVIN SIGN gives "k") the collapsed string is the key without
+    lower-casing. So a raw key never holds an ASCII letter or digit: ``normalize_name(key)``
+    is empty, the snapshot drops it, and the name matches no message (#317). The display
+    form keeps the name as given (stripped); only the key collapses."""
     clean = _clean_name(name)
     normalized = normalize_name(clean)
     if normalized:
         return normalized
-    lowered = clean.lower()
-    return clean if _WORD_RE.search(lowered) else lowered
+    squeezed = " ".join(clean.split())
+    lowered = squeezed.lower()
+    return squeezed if _WORD_RE.search(lowered) else lowered
 
 
 # ---------------------------------------------------------------------------
@@ -638,7 +643,7 @@ def _admit(name: object, source: str) -> tuple[str, str] | None:
     than :data:`MAX_NAME_LENGTH` characters once stripped (S153); an empty one. Everything
     else is admitted as given from every source (S144, S152): no character rule, no
     stopword rule and no word rule. The key is :func:`name_key` (S166: a name with no ASCII
-    letter or digit is keyed by its raw lower-cased string). The rejects list is applied by
+    letter or digit is keyed by its lower-cased string with whitespace runs collapsed, S181). The rejects list is applied by
     the writers, not here.
     """
     if not isinstance(name, str):
@@ -853,7 +858,7 @@ def remove_names(
     ``remover`` is ``"tool"`` (the kindled: any name) or ``"reappraiser"`` (never a
     name whose source is ``tool``: one the kindled added, S105). Names are compared
     by :func:`name_key` (the model echoes the display form "Tuesday"; a name with no ASCII
-    letter or digit is found by its raw lower-cased key, S166).
+    letter or digit is found by its lower-cased, whitespace-collapsed key, S166, S181).
     The source check and the delete run in one write transaction under the file
     lock. Returns the lower forms actually removed; never creates the file (a
     missing file: ``[]``); never raises (logged, ``[]``).

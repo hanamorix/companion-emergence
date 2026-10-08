@@ -514,7 +514,7 @@ def test_n12_an_empty_entry_is_refused_and_one_without_a_word_is_admitted_by_its
 ) -> None:
     """S166 (replaces "an entry with no word is refused", S144 read as "whatever characters"):
     only an empty entry has nothing to store; "...", "--", "!!!" have no ASCII letter or digit
-    and are admitted, keyed by their raw lower-cased string (they match no message, #317)."""
+    and are admitted, keyed by their lower-cased string (whitespace runs collapsed, S181) (they match no message, #317)."""
     assert kn.admit_names(tmp_path, ["", "  "], source) == []
     assert not kn.known_names_path(tmp_path).exists()
     assert kn.admit_names(tmp_path, ["...", "--", "!!!"], source) == ["...", "--", "!!!"]

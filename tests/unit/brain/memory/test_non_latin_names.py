@@ -199,7 +199,7 @@ def test_b1f_a_name_with_an_ascii_word_keeps_its_normalized_key(given: str, key:
 
 def test_b1f_the_key_of_a_raw_name_never_holds_an_ascii_letter_or_digit() -> None:
     rng = random.Random(166)
-    pool = list("田中Ольга🐶.,!?-_ \t") + ["İ", "K", "é", "ß", "İ", "ǅ", "Σ", "ﬃ", "①", "٣"]
+    pool = list("田中Ольга🐶.,!?-_ \t\n\u00a0\u3000") + ["İ", "K", "é", "ß", "İ", "ǅ", "Σ", "ﬃ", "①", "٣"]
     for _ in range(3000):
         name = "".join(rng.choice(pool) for _ in range(rng.randint(1, 8)))
         key = kn.name_key(name)
@@ -210,12 +210,94 @@ def test_b1f_the_key_of_a_raw_name_never_holds_an_ascii_letter_or_digit() -> Non
 
 
 # --------------------------------------------------------------------------
-# B1h: pins an accepted consequence
+# S181 (S1a-S1g): runs of whitespace inside a name collapse to one space in its key
 # --------------------------------------------------------------------------
 
+SPELLINGS = ["田中 太郎", "田中  太郎", "田中\t太郎", "田中\n\n太郎", "田中\u00a0太郎", "田中\u3000太郎", "  田中   太郎  "]
 
-def test_b1h_the_key_is_the_raw_string_so_inner_whitespace_makes_two_names(tmp_path: Path) -> None:
-    kn.admit_names(tmp_path, ["田中 太郎", "田中  太郎"], "gate")
-    assert [r[0] for r in _rows(tmp_path)] == ["田中  太郎", "田中 太郎"]
-    assert kn.remove_names(tmp_path, ["田中  太郎"], "tool") == ["田中  太郎"]
-    assert [r[0] for r in _rows(tmp_path)] == ["田中 太郎"], "the other spelling is a different name"
+
+@pytest.mark.parametrize("source", SOURCES)
+def test_s1a_every_spelling_of_the_spacing_is_one_name_from_every_source(tmp_path: Path, source: str) -> None:
+    for spelling in SPELLINGS:
+        _admit(tmp_path, [spelling], source)
+    rows = _rows(tmp_path)
+    assert [r[0] for r in rows] == ["田中 太郎"], "one row, keyed by the single-spaced form"
+    assert rows[0][1].replace("\u00a0", " ").replace("\u3000", " ").split() == ["田中", "太郎"]
+    assert all(kn.name_key(x) == "田中 太郎" for x in SPELLINGS)
+
+
+def test_s1a_the_display_form_is_not_collapsed(tmp_path: Path) -> None:
+    kn.admit_names(tmp_path, ["  田中   太郎 "], "gate")
+    assert _rows(tmp_path) == [("田中 太郎", "田中   太郎", "gate")]
+
+
+@pytest.mark.parametrize("remove_with", SPELLINGS)
+def test_s1b_removing_any_spelling_removes_the_name_and_lists_it_once(tmp_path: Path, remove_with: str) -> None:
+    kn.admit_names(tmp_path, ["田中  太郎"], "gate")
+    assert kn.remove_names(tmp_path, [remove_with], "tool") == ["田中 太郎"], "it returns the key it removed"
+    assert _rows(tmp_path) == []
+    assert _q(tmp_path, "SELECT name_lower FROM rejected_names") == [("田中 太郎",)]
+    assert kn.admit_names(tmp_path, ["田中\t太郎"], "gate") == [], "the rejects list holds every spelling (S135)"
+
+
+def test_s1b_the_readd_question_and_the_pending_compare_use_the_same_key(tmp_path: Path) -> None:
+    kn.admit_names(tmp_path, ["田中 太郎"], "gate")
+    remove_known_name("田中  太郎", persona_dir=tmp_path)
+    assert kn.confirm_readd(tmp_path, "田中\u3000太郎") == "asked"
+    kn.note_tool_call(tmp_path, ADD_NAME_TOOL_NAME, {"name": "田中   太郎"}, add_tool_name=ADD_NAME_TOOL_NAME)
+    assert _q(tmp_path, "SELECT name_lower FROM pending_readd") == [("田中 太郎",)], "a spelling variant holds the question"
+    kn.note_tool_call(tmp_path, ADD_NAME_TOOL_NAME, {"name": "山田 太郎"}, add_tool_name=ADD_NAME_TOOL_NAME)
+    assert _q(tmp_path, "SELECT name_lower FROM pending_readd") == [], "another name lapses it"
+    assert kn.confirm_readd(tmp_path, "田中 太郎") == "asked"
+    assert kn.confirm_readd(tmp_path, "田中  太郎") == "added", "the confirming call may use another spelling"
+
+
+@pytest.mark.parametrize("source", SOURCES)
+def test_s1c_the_case_folding_exceptions_collapse_too(tmp_path: Path, source: str) -> None:
+    _admit(tmp_path, ["\u0130  \u0130", "\u0130 \u0130", "\u212a\t\u212a"], source)
+    keys = [r[0] for r in _rows(tmp_path)]
+    assert sorted(keys) == sorted(["\u0130 \u0130", "\u212a \u212a"])
+    assert all(not WORD_RE.search(k) for k in keys), "no ASCII letter or digit: out of the snapshot"
+    assert kn.load_known_names(tmp_path).names == frozenset()
+
+
+def test_s1c_the_key_property_holds_with_whitespace_runs() -> None:
+    rng = random.Random(181)
+    pool = list("田中Ольга🐶.,!?-_ \t\n\u00a0\u3000") + ["İ", "K", "é", "ß", "ﬃ", "①", "٣", "a", "7"]
+    for _ in range(3000):
+        name = "".join(rng.choice(pool) for _ in range(rng.randint(1, 10)))
+        key = kn.name_key(name)
+        assert key == kn.name_key(key)
+        assert "  " not in key and not any(c.isspace() and c != " " for c in key), "no whitespace run, only single spaces"
+        assert key == key.strip()
+        if not kn.normalize_name(name) and key:
+            assert not WORD_RE.search(key) and kn.normalize_name(key) == ""
+        assert kn.name_key(name) == kn.name_key(" ".join(name.split())), "collapsing the name first changes nothing"
+
+
+@pytest.mark.parametrize("source", SOURCES)
+def test_s1d_names_with_an_ascii_word_are_unchanged(tmp_path: Path, source: str) -> None:
+    _admit(tmp_path, ["Mary  Ann", "Mary Ann", "mary\tann", "MARY\u00a0ANN"], source)
+    assert [r[0] for r in _rows(tmp_path)] == ["mary ann"]
+
+
+@pytest.mark.parametrize("source", SOURCES)
+@pytest.mark.parametrize("given", ["...", "!!!", "--", "🐶", "- - -", "* * *"])
+def test_s1e_symbol_and_punctuation_only_names_stay_admitted(tmp_path: Path, source: str, given: str) -> None:
+    _admit(tmp_path, [given], source)
+    assert [r[0] for r in _rows(tmp_path)] == [" ".join(given.split()).lower()]
+
+
+def test_s1e_spaced_punctuation_collapses_like_any_other_name(tmp_path: Path) -> None:
+    kn.admit_names(tmp_path, ["- -", "-  -", "-\t-"], "gate")
+    assert [r[0] for r in _rows(tmp_path)] == ["- -"]
+
+
+def test_s1g_every_key_written_comes_from_name_key() -> None:
+    """No migration (spec item 2): the only code that builds a stored key is `name_key`, through
+    `_admit`, `remove_names` and `note_tool_call`; a row written by the new rule is single-spaced."""
+    import inspect
+
+    for fn in (kn._admit, kn.remove_names, kn.note_tool_call):
+        assert "name_key(" in inspect.getsource(fn), fn.__name__
+    assert "normalize_name(" not in inspect.getsource(kn._admit)
