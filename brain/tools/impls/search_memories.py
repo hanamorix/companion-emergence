@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from brain.memory import keyword_budget
+from brain.memory import keyword_budget, recall_diagnostics
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.relevance import (
     CANDIDATE_POOL,
@@ -20,6 +20,7 @@ from brain.memory.relevance import (
 )
 from brain.memory.semantic_recall import (
     assemble_with_guarantees,
+    emit_recall_diagnostics,
     genuine_first_memories,
     merge_with_keyword,
     search_paragraphs,
@@ -227,6 +228,7 @@ def _semantic_top_k(
     body is wrapped so a broken/missing local model or a transient store
     error only demotes this call to lexical, never breaks the tool.
     """
+    search = None
     try:
         # Name-recall fix R6 (spec §3, S29): her query is searched per
         # paragraph like passive recall (same split, pool, budget, allocation
@@ -257,6 +259,13 @@ def _semantic_top_k(
             exc_info=True,
         )
         return None
+    finally:
+        # The ONE diagnostics record of a semantic request (spec section 6, S15,
+        # S56, P-22): `mode` names the stage that ran, so a call that falls back
+        # to lexical keeps this record and writes no second one. Fail-soft.
+        emit_recall_diagnostics(
+            persona_dir, search, source=recall_diagnostics.SOURCE_TOOL, mode="semantic"
+        )
 
 
 def search_memories(
@@ -377,6 +386,7 @@ def search_memories(
     # toggle existed.
     fetch_limit = CANDIDATE_POOL if resolved_order == "age" else limit
 
+    requested_lexical = resolved_mode == "lexical"
     candidates: list[Memory] | None = None
     if resolved_mode == "semantic":
         semantic = _semantic_top_k(store, persona_dir, query, limit=fetch_limit, exclude=exclude)
@@ -397,15 +407,24 @@ def search_memories(
                 semantic.grouped, keyword, cap=fetch_limit, guaranteed=semantic.guaranteed
             )
     if candidates is None:
-        candidates = _lexical_candidates(
-            store,
-            hebbian,
-            query,
-            limit=fetch_limit,
-            exclude=exclude,
-            persona_dir=persona_dir,
-            started=started,
-        )
+        try:
+            candidates = _lexical_candidates(
+                store,
+                hebbian,
+                query,
+                limit=fetch_limit,
+                exclude=exclude,
+                persona_dir=persona_dir,
+                started=started,
+            )
+        finally:
+            # A lexical REQUEST has no semantic stage: its one diagnostics record
+            # has no paragraphs (spec section 6, P-22). A semantic request that fell
+            # back already wrote its record in `_semantic_top_k`.
+            if requested_lexical:
+                emit_recall_diagnostics(
+                    persona_dir, None, source=recall_diagnostics.SOURCE_TOOL, mode="lexical"
+                )
 
     if resolved_order == "age":
         candidates = sorted(candidates, key=lambda m: m.created_at, reverse=True)

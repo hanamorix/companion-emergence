@@ -95,7 +95,7 @@ import numpy as np
 
 from brain import dev_constants, tunables
 from brain.dev_constants import MONOLOGUE_FAMILY_TYPES, RERANK_MIN_REAL_CANDIDATES
-from brain.memory import cost_series, floor_startup
+from brain.memory import cost_series, floor_startup, recall_diagnostics
 from brain.memory import embeddings as embeddings_mod
 from brain.memory import reranker as reranker_mod
 from brain.memory.embedding_matrix import EmbeddingMatrix, build_embedding_matrix
@@ -1097,6 +1097,96 @@ class ParagraphSearch:
         return len(self.outcomes)
 
 
+def paragraph_diagnostics(
+    outcomes: Sequence[ParagraphOutcome],
+) -> list[recall_diagnostics.ParagraphDiagnostic]:
+    """The diagnostics rows of one message's outcomes, in outcome order (spec
+    section 6, S15, S48, S53, S58; plan P-22, P-34).
+
+    A row's `width` is the outcome's `reranked_width` (the real candidates the
+    reranker scored for that query, 0 when none ran), never `GatedRanking.
+    real_width`: the outcome carries the width also when no ranking could be
+    gated, so S58's count toward the 50 is not lost. A query with a gated
+    ranking writes one row for it (its own path, floor and scale) and, when a
+    reranked ranking carries a cosine tail (S82), a second row for the tail
+    (cosine path, the COSINE floor and scale, width 0: no real candidate is
+    counted twice, so the rows' widths sum to the message's `total_width`). A
+    query with no gated ranking writes one row with no pass mark and no scale,
+    on the reranked path iff a rerank scored."""
+    rows: list[recall_diagnostics.ParagraphDiagnostic] = []
+    for outcome in outcomes:
+        gated = outcome.gated
+        if gated is None:
+            rows.append(
+                recall_diagnostics.ParagraphDiagnostic(
+                    path=RERANKED_PATH if outcome.reranked_width > 0 else COSINE_PATH,
+                    width=outcome.reranked_width,
+                    pass_mark=None,
+                    scale=None,
+                )
+            )
+            continue
+        rows.append(
+            recall_diagnostics.ParagraphDiagnostic(
+                path=gated.path,
+                width=outcome.reranked_width,
+                pass_mark=gated.pass_mark,
+                scale=gated.scale,
+            )
+        )
+        tail = gated.tail
+        if tail is not None:
+            rows.append(
+                recall_diagnostics.ParagraphDiagnostic(
+                    path=tail.path, width=0, pass_mark=tail.pass_mark, scale=tail.scale
+                )
+            )
+    return rows
+
+
+def emit_recall_diagnostics(
+    persona_dir: Path | None,
+    search: ParagraphSearch | None,
+    *,
+    source: str,
+    mode: str | None = None,
+) -> None:
+    """Append this call's ONE diagnostics record (spec section 6, S15, S30,
+    S59; plan P-22). Called from a `finally` at each call site, so it must never
+    raise: the path, the rows and the append are all inside one guard (a
+    `persona_dir` that is not a path, or any other failure, is logged and the
+    record dropped). `search` is `None` when no per-paragraph search ran or it
+    failed (no pool, embed failure, an exception): the record then has zero
+    paragraphs and no budget. Reads no store and no table; the only I/O is the
+    locked append."""
+    try:
+        path = recall_diagnostics.diagnostics_path(persona_dir)
+        if search is None:
+            recall_diagnostics.log_recall(
+                path,
+                source=source,
+                mode=mode,
+                paragraph_count=0,
+                whole_message_fallback=False,
+                total_width=0,
+                budget=None,
+                paragraphs=[],
+            )
+            return
+        recall_diagnostics.log_recall(
+            path,
+            source=source,
+            mode=mode,
+            paragraph_count=search.paragraph_count,
+            whole_message_fallback=search.whole_message_fallback,
+            total_width=search.total_width,
+            budget=search.budget,
+            paragraphs=paragraph_diagnostics(search.outcomes),
+        )
+    except Exception:  # noqa: BLE001 — diagnostics must never reach the recall caller
+        log.warning("recall diagnostics: could not emit a record; dropped", exc_info=True)
+
+
 def _unit_rows(vectors: list[np.ndarray]) -> np.ndarray:
     """Query vectors stacked as float32 rows scaled to unit length (a zero
     vector stays zero, so its cosines are 0.0, as `cosine_similarity`)."""
@@ -1761,6 +1851,7 @@ def run_semantic_recall(
     On `None`, the caller falls through to that EXISTING lexical/blend path,
     unchanged.
     """
+    search: ParagraphSearch | None = None
     try:
         search = search_paragraphs(
             store, user_input, keyword_words=keyword_words, log_calibration=True
@@ -1813,3 +1904,7 @@ def run_semantic_recall(
             exc_info=True,
         )
         return None
+    finally:
+        # One diagnostics record per passive recall (spec section 6, S15, P-22),
+        # fail-soft: `emit_recall_diagnostics` never raises.
+        emit_recall_diagnostics(persona_dir, search, source=recall_diagnostics.SOURCE_PASSIVE)
