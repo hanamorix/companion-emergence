@@ -60,12 +60,15 @@ from tests.unit.brain.memory.test_per_paragraph_recall import (
     _P1,
     _P2,
     _P3,
+    _REST,
     _THREE,
     _AxisEmbedder,
     _budget,
+    _Clock,
     _install,
     _mem,
     _Reranker,
+    _two_query_store,
 )
 
 _LOG = dev_constants.RECALL_DIAGNOSTICS_LOG_FILENAME
@@ -298,10 +301,11 @@ def test_a_failure_after_the_search_still_writes_the_searchs_record(
     assert record["paragraphs"] == [_row("cosine", 0, pytest.approx(0.5), COSINE_SCORE_SCALE)]
 
 
-def test_the_whole_message_fallback_and_the_two_paragraph_first_message_are_told_apart(
+def test_the_whole_message_fallback_flag_is_true_only_for_the_one_query_case(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # Whole-message fallback: three paragraphs that do not fit the budget.
+    """Three paragraphs that do not fit the budget (warm series): one whole-message
+    query, flag true."""
     _budget(monkeypatch, 4.0)
     embedder = _AxisEmbedder({_P1: 0, _P2: 1, _P3: 2})
     store = MemoryStore(tmp_path / "memories.db")
@@ -316,6 +320,27 @@ def test_the_whole_message_fallback_and_the_two_paragraph_first_message_are_told
 
     (record,) = _records(tmp_path)
     assert record["whole_message_fallback"] is True and record["paragraph_count"] == 1
+
+
+def test_a_first_message_scored_as_two_paragraphs_records_two_and_no_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R7-E2 (e), S63: no measurement yet; the first paragraph is embedded and timed
+    alone, 3 x its time does not fit, so the rest is ONE query and the message is
+    scored as those two paragraphs: `paragraph_count == 2`, not the whole-message
+    fallback."""
+    clock = _Clock()
+    monkeypatch.setattr(sr, "_clock", clock)
+    _budget(monkeypatch, 4.0)
+    store, embedder, _rec, _first, _rest = _two_query_store(monkeypatch, tmp_path, clock, 1.5)
+
+    result = run_semantic_recall(store, tmp_path, _THREE)
+
+    assert result is not None and embedder.batches == [[_P1], [_REST]]
+    (record,) = _records(tmp_path)
+    assert record["paragraph_count"] == 2 and record["whole_message_fallback"] is False
+    assert [row["path"] for row in record["paragraphs"]] == ["reranked", "reranked"]
+    assert sum(row["width"] for row in record["paragraphs"]) == record["total_width"] > 0
 
 
 def test_total_width_never_exceeds_fifty_and_equals_the_sum_of_the_rows(
@@ -446,18 +471,37 @@ def test_a_message_with_no_recall_token_and_no_listed_name_writes_no_record(
     assert _records(tmp_path) == []
 
 
+def _db_fingerprint(store: MemoryStore) -> dict[str, object]:
+    """Row counts of the tables a diagnostics write could touch, and a checksum of
+    the memories (id, content, importance, recall_count, embedding)."""
+    import hashlib
+
+    conn = store._conn  # noqa: SLF001
+    counts = {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: S608
+        for table in ("memories", "calibration_log", "reranker_floor_calibration")
+    }
+    digest = hashlib.sha256()
+    for row in conn.execute(
+        "SELECT id, content, importance, recall_count, embedding FROM memories ORDER BY id"
+    ):
+        digest.update(repr(tuple(row)).encode())
+    return {**counts, "memories_sha256": digest.hexdigest()}
+
+
 def test_only_the_log_and_its_lock_sidecar_appear_and_nothing_diagnostic_is_in_the_database(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """R7-E1 (f). The recall touches the database only through its own (passive)
+    calibration row, so the fingerprint is taken with the calibration log excluded
+    from the equality and compared for everything else."""
     store, _g, _f, _rec = _first_rerank_case(monkeypatch, tmp_path, cosine_floor=0.5)
-    before = {
-        table: store._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: SLF001, S608
-        for table in ("memories", "calibration_log", "reranker_floor_calibration")
-    }
+    before = _db_fingerprint(store)
     existing = {p.name for p in tmp_path.iterdir()}
 
     run_semantic_recall(store, tmp_path, _QUERY)
 
+    after = _db_fingerprint(store)
     new = {p.name for p in tmp_path.iterdir()} - existing
     assert new == {_LOG, _LOG + ".lock"}
     tables = {
@@ -467,20 +511,22 @@ def test_only_the_log_and_its_lock_sidecar_appear_and_nothing_diagnostic_is_in_t
         )
     }
     assert not {t for t in tables if "diagnos" in t.lower()}
-    assert store._conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == before["memories"]  # noqa: SLF001
+    assert after["calibration_log"] == before["calibration_log"] + 1, "only the passive row"
+    for key in ("memories", "reranker_floor_calibration", "memories_sha256"):
+        assert after[key] == before[key], key
 
 
 def test_a_record_holds_only_numbers_booleans_and_enum_strings(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    store, genuine, _f, _rec = _first_rerank_case(monkeypatch, tmp_path, cosine_floor=0.5)
+    store, genuine, family, _rec = _first_rerank_case(monkeypatch, tmp_path, cosine_floor=0.5)
 
     run_semantic_recall(store, tmp_path, _QUERY)
     dispatch("search_memories", {"query": _QUERY}, **_ctx(tmp_path, store))
 
     text = (tmp_path / _LOG).read_text()
     assert _QUERY not in text and "memory" not in text.replace("paragraph", "")
-    for memory in genuine:
+    for memory in [*genuine, *family]:
         assert memory.id not in text and memory.content not in text
 
 
@@ -489,54 +535,17 @@ def test_a_record_holds_only_numbers_booleans_and_enum_strings(
 # ---------------------------------------------------------------------------
 
 
-def _healthy_ids(monkeypatch, tmp_path_factory) -> list[str]:
-    root = tmp_path_factory.mktemp("healthy")
-    store, _g, _f, _rec = _first_rerank_case(monkeypatch, root, cosine_floor=0.5)
-    result = run_semantic_recall(store, root, _QUERY)
-    assert result is not None
-    # The comparison run starts from a fresh process state (the cost model and the
-    # embed warm-up are process-level; the cost series live in each store).
-    reranker_mod._reset_rerank_cost_model()
-    sr._reset_paragraph_time_model()
-    return [m.content for m in [*result.full, *result.snippet]]
-
-
-def _contents(result) -> list[str]:
-    return [m.content for m in [*result.full, *result.snippet]]
-
-
-@pytest.mark.parametrize("breakage", ["file_for_dir", "persona_none", "log_recall_raises"])
-def test_an_emission_failure_never_changes_the_result_or_raises(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    tmp_path_factory: pytest.TempPathFactory,
-    breakage: str,
-) -> None:
-    healthy = _healthy_ids(monkeypatch, tmp_path_factory)
-    store, _g, _f, _rec = _first_rerank_case(monkeypatch, tmp_path, cosine_floor=0.5)
-    persona: Path | None = tmp_path
-    if breakage == "file_for_dir":
-        persona = tmp_path / "not-a-directory"
-        persona.write_text("a file where the persona directory should be")
-    elif breakage == "persona_none":
-        persona = None
-    else:
-
-        def _raise(*args, **kwargs):
-            raise RuntimeError("simulated diagnostics failure")
-
-        monkeypatch.setattr(rd, "log_recall", _raise)
-
-    result = run_semantic_recall(store, persona, _QUERY)  # type: ignore[arg-type]
-
-    assert result is not None and _contents(result) == healthy
-    tool = search_memories(
+def _run_all_three(store: MemoryStore, persona: Path | None) -> dict[str, list[str]]:
+    """The same three calls the criteria name, on one store: a passive recall, the
+    tool's semantic request and its lexical request. Each returns the contents it
+    surfaced, in order."""
+    passive = run_semantic_recall(store, persona, _QUERY)  # type: ignore[arg-type]
+    semantic = search_memories(
         _QUERY,
         store=store,
         hebbian=HebbianMatrix(":memory:"),
         persona_dir=persona,  # type: ignore[arg-type]
     )
-    assert tool["count"] > 0
     lexical = search_memories(
         _QUERY,
         mode="lexical",
@@ -544,7 +553,62 @@ def test_an_emission_failure_never_changes_the_result_or_raises(
         hebbian=HebbianMatrix(":memory:"),
         persona_dir=persona,  # type: ignore[arg-type]
     )
-    assert lexical["mode"] == "lexical"
+    return {
+        "passive": [] if passive is None else [m.content for m in [*passive.full, *passive.snippet]],
+        "semantic": [m["content"] for m in semantic["memories"]],
+        "semantic_mode": [semantic["mode"]],
+        "lexical": [m["content"] for m in lexical["memories"]],
+        "lexical_mode": [lexical["mode"]],
+    }
+
+
+def _healthy_outcome(monkeypatch, tmp_path_factory) -> dict[str, list[str]]:
+    root = tmp_path_factory.mktemp("healthy")
+    store, _g, _f, _rec = _first_rerank_case(monkeypatch, root, cosine_floor=0.5)
+    outcome = _run_all_three(store, root)
+    assert outcome["passive"] and outcome["semantic"] and outcome["semantic_mode"] == ["semantic"]
+    # The comparison run starts from a fresh process state (the cost model and the
+    # embed warm-up are process-level; the cost series live in each store).
+    reranker_mod._reset_rerank_cost_model()
+    sr._reset_paragraph_time_model()
+    return outcome
+
+
+@pytest.mark.parametrize(
+    "breakage", ["file_for_dir", "persona_none", "log_recall_raises", "missing_directory"]
+)
+def test_an_emission_failure_never_changes_the_result_or_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    breakage: str,
+) -> None:
+    """R7-E3 (a): passive recall and both tool modes return exactly what a healthy
+    run returns. A missing persona directory is not a failure: the lock sidecar
+    creates it and the record lands there (the existing behaviour, asserted)."""
+    healthy = _healthy_outcome(monkeypatch, tmp_path_factory)
+    store, _g, _f, _rec = _first_rerank_case(monkeypatch, tmp_path, cosine_floor=0.5)
+    persona: Path | None = tmp_path
+    if breakage == "file_for_dir":
+        persona = tmp_path / "not-a-directory"
+        persona.write_text("a file where the persona directory should be")
+    elif breakage == "persona_none":
+        persona = None
+    elif breakage == "missing_directory":
+        persona = tmp_path / "gone"
+    else:
+
+        def _raise(*args, **kwargs):
+            raise RuntimeError("simulated diagnostics failure")
+
+        monkeypatch.setattr(rd, "log_recall", _raise)
+
+    assert _run_all_three(store, persona) == healthy
+
+    if breakage == "missing_directory":
+        assert persona is not None and len(_records(persona)) == 3, "the sidecar made the directory"
+    elif breakage in ("file_for_dir", "persona_none", "log_recall_raises"):
+        assert not (tmp_path / _LOG).exists()
 
 
 def test_the_emission_opens_no_database_and_makes_one_append(

@@ -329,6 +329,10 @@ def search_memories(
         Matching still happens FIRST by ``mode``; ``order`` only re-sorts the
         matched set, never changes which memories matched.
 
+    Every call writes ONE recall diagnostics record (name-recall fix R7, spec §6,
+    S15, S56): a semantic request from ``_semantic_top_k`` (also when it falls back
+    to lexical), a lexical request from this function, never a calibration row.
+
     Both modes return at most ``limit`` candidates, already ranked;
     ``exclude_ids`` (already-surfaced + explicitly-rejected ids) are dropped
     before that top-k, so the model can fetch the next tranche.

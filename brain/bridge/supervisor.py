@@ -2472,6 +2472,11 @@ def _run_calibration_tick(
     only, embedder model id, its own table) after the rerank floor. Floor
     fits never mix scales.
 
+    **NAME-RECALL FIX R7 SCOPE (spec §6, S48):** right after the calibration log
+    prune, the recall diagnostics log (``recall_diagnostics.log.jsonl`` in the
+    persona directory) is pruned on the same retention window, in its own guard,
+    before the labeling step and its pause return.
+
     Pre-flip revision Change 2 removed the cross-increment step this
     docstring used to describe here: an ACCEPTED floor write no longer
     invalidates a cached fp16-vs-fp32 precision decision, because that

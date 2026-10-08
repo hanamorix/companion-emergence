@@ -1183,8 +1183,9 @@ def emit_recall_diagnostics(
             budget=search.budget,
             paragraphs=paragraph_diagnostics(search.outcomes),
         )
-    except Exception:  # noqa: BLE001 — diagnostics must never reach the recall caller
-        log.warning("recall diagnostics: could not emit a record; dropped", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 — diagnostics must never reach the recall caller
+        # No traceback: a persistent fault here repeats on every recall (D1's rule).
+        log.warning("recall diagnostics: could not emit a record (%r); dropped", exc)
 
 
 def _unit_rows(vectors: list[np.ndarray]) -> np.ndarray:

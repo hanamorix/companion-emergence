@@ -163,31 +163,71 @@ def test_a_tick_that_defers_for_a_busy_session_does_not_prune(
 def test_the_window_is_the_calibration_retention_tunable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """R7-T1 (f): a record 2.5 days old is KEPT under the default window (3 days) and
+    REMOVED when the tunable is 2 days, so a prune that ignored the tunable (a constant
+    window) fails one of the two runs."""
     _stub_labeling(monkeypatch)
+    assert _window() == pytest.approx(3.0), "the default this test's first half relies on"
+    _seed_log(tmp_path, {"two_and_a_half_days": 2.5, "one_day": 1.0})
+    _run_calibration_tick(tmp_path)
+    assert _tags(tmp_path) == {"two_and_a_half_days", "one_day"}
+
     real = tunables.get_tunable
     monkeypatch.setattr(
         tunables,
         "get_tunable",
         lambda key, default: 2.0 if key == "calibration.retention_window_days" else real(key, default),
     )
-    _seed_log(tmp_path, {"three_days": 3.0, "one_day": 1.0})
-
     _run_calibration_tick(tmp_path)
 
     assert _tags(tmp_path) == {"one_day"}
 
 
-def test_the_prune_has_no_call_site_outside_the_supervisor() -> None:
-    """The diagnostics prune is a tick job, never a recall-path call (the calibration
-    prune's own rule: off the hot path, I6)."""
-    root = Path(rd.__file__).resolve().parents[1]
+def _prune_call_sites(root: Path) -> set[str]:
+    """Files under `root` that call the diagnostics module's `prune` by any import
+    spelling: `recall_diagnostics.prune(...)`, an alias of the module, or `prune`
+    imported by name (with or without `as`)."""
     sites: set[str] = set()
     for path in root.rglob("*.py"):
         if path.name == "recall_diagnostics.py":
             continue
-        for node in ast.walk(ast.parse(path.read_text())):
-            if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "prune":
-                owner = getattr(node.func.value, "id", "")
-                if owner == "recall_diagnostics":
+        tree = ast.parse(path.read_text())
+        modules: set[str] = set()
+        functions: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name == "recall_diagnostics":
+                        modules.add(alias.asname or alias.name)
+                    if node.module and node.module.endswith("recall_diagnostics") and alias.name == "prune":
+                        functions.add(alias.asname or alias.name)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.endswith("recall_diagnostics") and alias.asname:
+                        modules.add(alias.asname)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr == "prune":
+                if isinstance(func.value, ast.Name) and func.value.id in modules:
                     sites.add(str(path.relative_to(root)))
-    assert sites == {"bridge/supervisor.py"}
+            elif isinstance(func, ast.Name) and func.id in functions:
+                sites.add(str(path.relative_to(root)))
+    return sites
+
+
+def test_the_prune_has_no_call_site_outside_the_supervisor() -> None:
+    """The diagnostics prune is a tick job, never a recall-path call (the calibration
+    prune's own rule: off the hot path, I6). The scan sees every import spelling."""
+    root = Path(rd.__file__).resolve().parents[1]
+    assert _prune_call_sites(root) == {"bridge/supervisor.py"}
+
+
+def test_the_call_site_scan_sees_aliased_and_from_imported_calls(tmp_path: Path) -> None:
+    """The scan itself can fail: planted calls in three spellings are all found."""
+    (tmp_path / "a.py").write_text("from brain.memory import recall_diagnostics as rd\nrd.prune(1)\n")
+    (tmp_path / "b.py").write_text("from brain.memory.recall_diagnostics import prune as p\np(1)\n")
+    (tmp_path / "c.py").write_text("from brain.memory.recall_diagnostics import prune\nprune(1)\n")
+    (tmp_path / "d.py").write_text("def prune(x):\n    return x\nprune(1)\n")
+    assert _prune_call_sites(tmp_path) == {"a.py", "b.py", "c.py"}
