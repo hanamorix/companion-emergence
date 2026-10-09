@@ -754,3 +754,23 @@ def test_s202_with_no_scan_sample_yet_a_single_paragraph_is_embedded_whole(monke
     _fit_only(store, overhead=0.0, scan=None)
     run_semantic_recall(store, tmp_path, _FOUR_HUNDRED)
     assert embedder.batches == [[_FOUR_HUNDRED]]
+
+
+def test_s202_the_seconds_the_cut_probes_took_are_added_to_the_scan_sample(monkeypatch, tmp_path: Path) -> None:
+    """Able to fail: dropping the probe seconds from the sample would leave the scan series at 0."""
+    clock = _clocked(monkeypatch)
+    _set_budget(monkeypatch, 0.6)
+    embedder = _CostEmbedder(clock)
+    store = _store(monkeypatch, tmp_path, embedder)
+    _fit_only(store, overhead=0.0, scan=0.0)  # 20 scan samples of 0.0
+    real_cut = sr._cut_to_tokens
+
+    def _cut(emb, text, total, cap):
+        cut = real_cut(emb, text, total, cap)
+        return None if cut is None else sr._Cut(cut.text, cut.tokens, 0.7)
+
+    monkeypatch.setattr(sr, "_cut_to_tokens", _cut)
+    run_semantic_recall(store, tmp_path, _FOUR_HUNDRED)
+    assert len(embedder.batches[0][0]) < len(_FOUR_HUNDRED), "the paragraph was cut"
+    total = sr._scan_time.mean(store, "") * 21  # 20 zero samples plus this run's sample
+    assert total == pytest.approx(0.7, abs=0.2), "this run's scan sample carries the 0.7 s of probes"
