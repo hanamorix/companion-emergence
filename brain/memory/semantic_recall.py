@@ -1225,32 +1225,36 @@ def _word_prefix(text: str, chars: int) -> str:
 def _cut_to_tokens(
     embedder: embeddings_mod.EmbeddingProvider, text: str, total_tokens: int, cap_tokens: int
 ) -> _Cut | None:
-    """`text` as it is when it fits `cap_tokens`, else a prefix of it that does
-    (S195, S199): a first guess by proportion of characters, then shorter prefixes
-    (each strictly shorter, scaled by the token overshoot) until the embedder's own
-    token probe counts at most `cap_tokens`. It never grows a prefix back, so with an
-    uneven token density it can leave some of the budget unused. The prefix ends at a word boundary
-    where it can (`_word_prefix`). `None` when nothing fits or the probe cannot
-    size a prefix. Every probe's seconds are summed (they are scan-side time)."""
+    """`text` as it is when it fits `cap_tokens`, else its LONGEST prefix that does
+    (S195, S199), found by bisection on the character count with the embedder's own
+    token probe (the count of a prefix never shrinks as the prefix grows, and the probe
+    saturates at the model's input limit, so a proportional step would crawl: stage 8
+    saw 500 probes on a long paste). The prefix ends at a word boundary where it can
+    (`_word_prefix`). About log2(len(text)) probes. `None` when nothing fits or the
+    probe cannot size a prefix. Every probe's seconds are summed (scan-side time)."""
     if total_tokens <= cap_tokens:
         return _Cut(text, total_tokens, 0.0)
     if cap_tokens < 1 or total_tokens < 1:
         return None
     seconds = 0.0
-    chars = min(len(text), int(len(text) * cap_tokens / total_tokens))
-    while chars > 0:
-        prefix = _word_prefix(text, chars)
-        if prefix:
-            lengths, took = _timed_probe(embedder, [prefix])
-            seconds += took
-            if lengths is None or len(lengths) != 1:
-                return None
-            if lengths[0] <= cap_tokens:
-                return _Cut(prefix, lengths[0], seconds)
-            chars = min(chars - 1, int(len(prefix) * cap_tokens / lengths[0]))
+    best: tuple[str, int] | None = None
+    fits_up_to, too_long_from = 0, len(text)  # the whole text does not fit (total > cap)
+    while too_long_from - fits_up_to > 1:
+        middle = (fits_up_to + too_long_from) // 2
+        prefix = _word_prefix(text, middle)
+        if not prefix:
+            fits_up_to = middle
+            continue
+        lengths, took = _timed_probe(embedder, [prefix])
+        seconds += took
+        if lengths is None or len(lengths) != 1:
+            return None
+        if lengths[0] <= cap_tokens:
+            fits_up_to = middle
+            best = (prefix, lengths[0])
         else:
-            chars -= 1
-    return None
+            too_long_from = middle
+    return None if best is None else _Cut(best[0], best[1], seconds)
 
 
 def search_paragraphs(

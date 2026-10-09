@@ -51,10 +51,10 @@ def test_a_text_without_a_boundary_is_cut_by_characters() -> None:
     assert cut is not None and cut.text == "x" * 30 and cut.tokens == 30
 
 
-def test_the_cut_shrinks_until_the_probe_agrees() -> None:
+def test_the_cut_is_the_longest_prefix_that_fits_even_with_an_uneven_token_density() -> None:
     """A tokenizer that is dense at the start of the text (3 tokens per character for
-    the first 30 characters, then 1): the first proportional guess overshoots the cap
-    and the loop shortens it strictly each step until the probe's count fits."""
+    the first 30 characters, then 1): the cut is exactly the longest word-boundary
+    prefix whose count fits (checked by brute force), found in about log2 probes."""
 
     def dense_start(t: str) -> int:
         return len(t) + 2 * min(len(t), 30)
@@ -62,10 +62,23 @@ def test_the_cut_shrinks_until_the_probe_agrees() -> None:
     probe = _Probe(dense_start)
     text = "word " * 20
     cut = sr._cut_to_tokens(probe, text, dense_start(text), 80)
-    assert cut is not None and cut.tokens <= 80 and cut.tokens == dense_start(cut.text)
-    lengths = [len(t) for t in probe.probed]
-    assert len(lengths) >= 2, "the first guess overshot"
-    assert lengths == sorted(lengths, reverse=True) and len(set(lengths)) == len(lengths)
+    longest = max(
+        (p for n in range(1, len(text) + 1) if dense_start(p := sr._word_prefix(text, n)) <= 80),
+        key=len,
+    )
+    assert cut is not None and cut.text == longest and cut.tokens == dense_start(longest) <= 80
+    assert len(probe.probed) <= 8, "bisection, not a crawl"
+
+
+def test_a_long_text_over_a_saturating_probe_is_cut_in_few_probes() -> None:
+    """The embedder's probe saturates at the model input limit (512): every prefix over
+    it counts 512. With a cap of 511 a proportional step crawled (500 probes on a long
+    paste in stage 8); bisection needs about log2(len) probes."""
+    probe = _Probe(lambda t: min(512, len(t) // 4))
+    text = "lorem ipsum dolor " * 700  # 12,600 characters
+    cut = sr._cut_to_tokens(probe, text, 512, 511)
+    assert cut is not None and cut.tokens <= 511 and len(cut.text) <= 511 * 4 + 3
+    assert len(probe.probed) <= 16
 
 
 @pytest.mark.parametrize("cap", [0, -3])
