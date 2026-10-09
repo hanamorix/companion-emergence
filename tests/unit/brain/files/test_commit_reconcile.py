@@ -97,9 +97,12 @@ def _events(persona, name) -> list[dict]:
 
 def _wired(persona, target) -> int:
     """file_write is a GATED memory type: it lands in the consolidation queue, not memories.db."""
+    # Counts the CLAIM "you let me write to X" only. An abandoned write is wired back too (#345)
+    # as a different, true memory ("...it didn't land"); the invariant these tests pin is that a
+    # write that did not land never produces the false claim.
     needle = str(target.resolve())
     return sum(1 for m in PendingQueue(persona).read_recent("file_write", limit=50)
-               if needle in m.content)
+               if needle in m.content and m.content.startswith("you let me write"))
 
 
 def _commit_with_flaky_final_mark(persona, out, monkeypatch, *, fail_times, exc=None):
@@ -346,6 +349,38 @@ def test_unopenable_memory_store_leaves_the_record_for_the_next_pass(env, monkey
     assert _wired(persona, t) == 1
 
 
+def test_a_lost_audit_row_is_logged_loudly_not_silently(env, monkeypatch, caplog):
+    """#346: the mark already happened, so the record is terminal; if the audit append then
+    fails nothing else would ever say what reconcile did."""
+    import logging
+
+    persona, out = env
+    rid = _claim_only(persona, "create", out / "never.md", "x", age=timedelta(minutes=11))
+    monkeypatch.setattr(commit_mod, "audit", lambda *a, **k: False)
+    with caplog.at_level(logging.ERROR, logger="brain.files.commit"):
+        assert _reconcile(persona) == 1
+    assert pending.get(persona, rid)["status"] == "error"
+    assert any(rid in r.getMessage() and "audit" in r.getMessage() for r in caplog.records)
+
+
+def test_unopenable_memory_store_also_defers_an_abandoned_write(env, monkeypatch):
+    """Same rule on the abandoned leg (#345): no terminal mark if Nell couldn't be told."""
+    persona, out = env
+    t = out / "never.md"
+    rid = _claim_only(persona, "create", t, "x", age=timedelta(minutes=11))
+
+    def _boom(*a, **k):
+        raise RuntimeError("memories.db locked")
+
+    with monkeypatch.context() as m:
+        m.setattr("brain.memory.store.MemoryStore", _boom)
+        assert _reconcile(persona) == 0
+    assert pending.get(persona, rid)["status"] == "committing"
+    assert _events(persona, "commit_abandoned") == []
+    assert _reconcile(persona) == 1
+    assert len(_queue_texts(persona, t)) == 1
+
+
 # ---- C5: idempotent ----------------------------------------------------------
 
 
@@ -535,6 +570,66 @@ def test_one_bad_record_does_not_abort_the_pass(env, monkeypatch):
     assert pending.get(persona, broken)["status"] == "committing"  # contained, not fatal
 
 
+# ---- #346: an expired-but-unswept card cannot be approved -----------------------
+
+
+def test_a_23_hour_old_card_is_still_approvable(env):
+    persona, out = env
+    t = out / "n.md"
+    rid = pending.create(persona, op="create", resolved_path=str(t.resolve()), content="x",
+                         now=_now() - timedelta(hours=23))
+    store = MemoryStore(persona / "memories.db")
+    try:
+        assert commit_write(persona, rid, store=store)["ok"] is True
+    finally:
+        store.close()
+    assert t.read_text(encoding="utf-8") == "x"
+
+
+def test_commit_refuses_a_card_past_its_ttl_even_if_unswept(env):
+    persona, out = env
+    t = out / "n.md"
+    rid = pending.create(persona, op="create", resolved_path=str(t.resolve()), content="x",
+                         now=_now() - timedelta(hours=25))
+    store = MemoryStore(persona / "memories.db")
+    try:
+        res = commit_write(persona, rid, store=store)
+    finally:
+        store.close()
+    assert res["ok"] is False and "expired" in res["error"]
+    assert not t.exists()
+    assert pending.get(persona, rid)["status"] == "expired"
+
+
+def test_decline_cannot_overwrite_a_card_that_was_just_claimed_by_an_approval(env, monkeypatch):
+    """#346 review: decline pre-checks 'pending' then marks unconditionally; racing an approval
+    it could leave a written file under a record that reads 'declined'."""
+    from brain.files.commit import decline_write
+
+    persona, out = env
+    rid = pending.create(persona, op="create", resolved_path=str((out / "n.md").resolve()),
+                         content="x", now=_now())
+    stale_view = pending.get(persona, rid)
+    assert pending.mark(persona, rid, status="committing")  # the approval claimed it first
+    real_get, first = pending.get, [True]
+
+    def _stale_first_read(*a, **k):
+        if first[0]:
+            first[0] = False
+            return stale_view
+        return real_get(*a, **k)
+
+    monkeypatch.setattr(pending, "get", _stale_first_read)
+    store = MemoryStore(persona / "memories.db")
+    try:
+        res = decline_write(persona, rid, store=store)
+    finally:
+        store.close()
+    assert res["ok"] is False
+    assert pending.get(persona, rid)["status"] == "committing"
+    assert _wired(persona, out / "n.md") == 0 and _queue_texts(persona, out / "n.md") == []
+
+
 # ---- claim is a compare-and-set (ratified Q-B) ---------------------------------
 
 
@@ -565,6 +660,101 @@ def test_claim_refuses_a_record_someone_else_already_claimed(env, monkeypatch):
     assert res["ok"] is False
     assert t.read_text(encoding="utf-8") == "seed\n", "the loser of the claim must not write"
     assert len(_events(persona, "claim_failed")) == 1
+
+
+# ---- #345: an abandoned write reaches Nell (and the feed) --------------------
+
+
+def _queue_texts(persona, target):
+    needle = str(target.resolve())
+    return [m.content for m in PendingQueue(persona).read_recent("file_write", limit=50)
+            if needle in m.content]
+
+
+def test_an_abandoned_write_is_wired_back_without_its_content(env):
+    persona, out = env
+    t = out / "never.md"
+    _claim_only(persona, "create", t, "SECRET-BODY", age=timedelta(minutes=11))
+    assert _reconcile(persona) == 1
+    (text,) = _queue_texts(persona, t)
+    assert "may not have landed" in text and "approved" in text
+    assert "SECRET-BODY" not in text
+
+
+def test_an_unverifiable_write_is_not_reported_as_not_landed(env):
+    """Unreadable target after the 24h grace: we do NOT know it failed, so we must not say so."""
+    persona, out = env
+    t = out / "no-such-dir" / "n.md"
+    _claim_only(persona, "create", t, "body", age=timedelta(hours=25))
+    assert _reconcile(persona) == 1
+    (text,) = _queue_texts(persona, t)
+    assert "couldn't confirm" in text and "not have landed" not in text
+
+
+def test_an_abandoned_write_surfaces_in_the_feed(env):
+    """The reader leg (Organ DoD): reconcile -> consolidation drain -> the existing file_write feed."""
+    from brain.bridge.feed import build_file_write_entries
+    from brain.engines.consolidation import Decision, run_consolidation
+
+    persona, out = env
+    t = out / "never.md"
+    _claim_only(persona, "create", t, "body", age=timedelta(minutes=11))
+    assert _reconcile(persona) == 1
+    store = MemoryStore(persona / "memories.db")
+    try:
+        run_consolidation(store, persona_dir=persona, classifier=lambda _c, _ctx: Decision("new"))
+    finally:
+        store.close()
+    entries = build_file_write_entries(persona, limit=10)
+    (entry,) = [e for e in entries if str(t.resolve()) in e.body]
+    assert "may not have landed" in entry.body
+    # The feed renders "<opener> <body>": "I wrote to a file — ...it didn't land" contradicts itself.
+    assert "wrote" not in entry.opener
+
+
+def test_a_hung_commit_that_lands_after_reconcile_corrects_the_record_and_nell(env, monkeypatch):
+    """#345 review: reconcile (rightly) said "may not have landed" while the commit was hung; the
+    write then lands. The record flips to committed (the file is authoritative) AND Nell must be
+    told, or she holds a memory inviting a re-proposal of something that is already there."""
+    persona, out = env
+    t = out / "n.md"
+    rid = pending.create(persona, op="create", resolved_path=str(t.resolve()), content="body",
+                         now=_now())
+    real_mkdir, fired = Path.mkdir, []
+
+    def _mkdir_while_the_commit_is_hung(self, *a, **k):
+        if self == t.parent and not fired:
+            fired.append(1)  # we are between the claim and the write: reconcile runs now
+            _backdate(persona, rid, 11)
+            assert _reconcile(persona) == 1
+        return real_mkdir(self, *a, **k)
+
+    monkeypatch.setattr(Path, "mkdir", _mkdir_while_the_commit_is_hung)
+    store = MemoryStore(persona / "memories.db")
+    try:
+        assert commit_write(persona, rid, store=store)["ok"] is True
+    finally:
+        store.close()
+    assert pending.get(persona, rid)["status"] == "committed"
+    texts = _queue_texts(persona, t)
+    assert any("may not have landed" in x for x in texts)
+    assert any("did land after all" in x for x in texts)
+    assert not any(x.startswith("you let me write") for x in texts)
+
+
+@pytest.mark.parametrize("outcome", ["committed", "declined", "abandoned", "unverified", "late"])
+def test_no_persona_facing_memory_contains_an_em_dash(env, outcome):
+    """Review on #348: anything injected into the kindled's context stays free of em-dashes
+    (an LLM writing tell). Covers every outcome _wire_memory can write."""
+    persona, out = env
+    persona.mkdir(parents=True, exist_ok=True)
+    store = MemoryStore(persona / "memories.db")
+    try:
+        commit_mod._wire_memory(store, path=str(out / "n.md"), outcome=outcome)
+    finally:
+        store.close()
+    texts = [m.content for m in PendingQueue(persona).read_recent("file_write", limit=10)]
+    assert len(texts) == 1 and "—" not in texts[0] and "–" not in texts[0]
 
 
 # ---- C14: the final mark at the source ---------------------------------------

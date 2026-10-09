@@ -18,10 +18,18 @@ logger = logging.getLogger(__name__)
 def _wire_memory(store, *, path: str, outcome: str) -> None:
     from brain.memory.store import Memory
 
+    # No file content is ever stored, only the path and what happened to the write.
     if outcome == "committed":
         content = f"you let me write to {path}"
+    elif outcome == "abandoned":
+        # approved, but a crash meant the block never reached the file (found by reconcile, #345)
+        content = f"you approved my write to {path}, but I can't find it there. It may not have landed."
+    elif outcome == "late":
+        content = f"the write to {path} that I thought hadn't landed did land after all"
+    elif outcome == "unverified":
+        content = f"you approved my write to {path}, but I couldn't confirm whether it landed"
     else:
-        content = f"you declined my write to {path}"  # no file content stored
+        content = f"you declined my write to {path}"
     try:
         mem = Memory.create_new(
             content=content,
@@ -56,6 +64,10 @@ def commit_write(persona_dir: Path, rid: str, *, store) -> dict:
     rec = pending.get(persona_dir, rid)
     if rec is None or rec.get("status") != "pending":
         return {"ok": False, "error": "not a pending write"}
+    if pending.is_expired(rec, datetime.now(UTC)):
+        # The 24h sweep may not have run yet; an approval must not outlive the card's TTL (#346).
+        pending.mark(persona_dir, rid, status="expired", expect="pending")
+        return {"ok": False, "error": "this write expired (older than 24h) — ask again"}
     op, content = rec["op"], rec["content"]
     # TOCTOU: re-run the guard on the resolved path RIGHT NOW.
     g = check_write_target(rec["resolved_path"], op=op, persona_dir=persona_dir)
@@ -104,6 +116,11 @@ def commit_write(persona_dir: Path, rid: str, *, store) -> dict:
         pending.mark(persona_dir, rid, status="error")
         audit(persona_dir, event="error", id=rid, op=op, path=str(g.resolved), error=str(exc))
         return {"ok": False, "error": str(exc)}
+    # A hung commit can outlive reconcile's verdict: reconcile (rightly) saw no block and recorded
+    # "may not have landed", then our write landed. The file is authoritative, so the record flips
+    # to committed — but Nell holds a memory that invites re-proposing it, so correct that too.
+    prior = pending.get(persona_dir, rid) or {}
+    reconciled_lost = prior.get("status") == "error" and prior.get("resolved_by") == "reconcile"
     marked = _mark_final(persona_dir, rid)
     audit(
         persona_dir,
@@ -117,7 +134,8 @@ def commit_write(persona_dir: Path, rid: str, *, store) -> dict:
     )
     if marked:
         # Otherwise reconcile_stale_commits wires the memory — exactly once.
-        _wire_memory(store, path=str(g.resolved), outcome="committed")
+        _wire_memory(store, path=str(g.resolved),
+                     outcome="late" if reconciled_lost else "committed")
     return {"ok": True, "path": str(g.resolved)}
 
 
@@ -150,7 +168,7 @@ def _inspect_target(rec: dict) -> str:
 
 
 _COMMIT_STALE = timedelta(minutes=10)
-_COMMIT_UNVERIFIABLE = timedelta(hours=24)
+_COMMIT_UNVERIFIABLE = timedelta(hours=pending._TTL_HOURS)  # one clock for the whole card
 
 
 def _claim_age(rec: dict, now: datetime) -> timedelta | None:
@@ -184,25 +202,28 @@ def _reconcile_one(persona_dir: Path, rec: dict, *, now: datetime, stale_after: 
             logger.warning("pending write %s: cannot read %s yet; will retry", rid, path)
             return False
         status, event, why = "error", "commit_abandoned", "could not read target to verify"
+        wire = "unverified"
     elif verdict == "landed":
-        status, event = "committed", "commit_reconciled"
+        status, event, wire = "committed", "commit_reconciled", "committed"
         why = "block found in target; could not confirm this write placed it"
     else:
-        status, event = "error", "commit_abandoned"
+        status, event, wire = "error", "commit_abandoned", "abandoned"
         why = "target missing or does not contain the full block (a partial write may exist)"
     # Open the store BEFORE the terminal mark: once the record is 'committed' nothing would ever
     # wire its memory again, so a failure here must raise while the record is still retryable.
-    store = open_store() if status == "committed" else None
+    store = open_store()
     # expect="committing": if the slow in-flight commit finished while we inspected, this refuses.
     if not pending.mark(persona_dir, rid, status=status, expect="committing",
                         resolved_by="reconcile"):
         return False
-    audit(persona_dir, event=event, id=rid, op=op, path=path,
-          content_sha=rec.get("content_sha", ""), outcome=status, error=why)
-    if store is not None:
-        _wire_memory(store, path=path, outcome="committed")
-    else:
+    if not audit(persona_dir, event=event, id=rid, op=op, path=path,
+                 content_sha=rec.get("content_sha", ""), outcome=status, error=why):
+        # The mark already happened, so the record is terminal; nothing else would say what we did.
+        logger.error("pending write %s resolved %s by reconcile but its %s audit row was lost",
+                     rid, status, event)
+    if status == "error":
         logger.warning("pending write %s abandoned (%s): %s", rid, why, path)
+    _wire_memory(store, path=path, outcome=wire)
     return True
 
 
@@ -243,7 +264,8 @@ def decline_write(persona_dir: Path, rid: str, *, store) -> dict:
     rec = pending.get(persona_dir, rid)
     if rec is None or rec.get("status") != "pending":
         return {"ok": False, "error": "not a pending write"}
-    pending.mark(persona_dir, rid, status="declined")
+    if not pending.mark(persona_dir, rid, status="declined", expect="pending"):
+        return {"ok": False, "error": "not a pending write"}  # an approval claimed it first (#346)
     audit(
         persona_dir,
         event="decline",

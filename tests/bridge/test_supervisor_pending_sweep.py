@@ -298,3 +298,45 @@ def test_a_raising_reconcile_never_stops_startup_or_the_maintenance_tick(
 
     assert len(boom_calls) >= 2, "reconcile should have been attempted at startup AND on maintenance"
     assert swept, "a raising reconcile stopped the maintenance job before the sidecar sweep"
+
+
+def test_reconcile_has_its_own_persisted_cadence_independent_of_maintenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#346: the maintenance path shares the throttle-slot / PAUSED / 6h gates. A short own
+    cadence recovers a write stranded mid-session, with the maintenance job switched OFF."""
+    from brain.files import commit as commit_mod
+    from brain.files import pending
+
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    out = tmp_path / "out"
+    out.mkdir()
+    staged: dict = {}
+    _quiet(monkeypatch)
+    stop_event = threading.Event()
+    real, seen = commit_mod.reconcile_stale_commits, []
+
+    def spy(pd, **kw):
+        n = real(pd, **kw)
+        seen.append(kw.get("stale_after"))
+        if len(seen) == 1:  # startup done: strand a record the startup call cannot have seen
+            staged["rid"] = _stranded(pd, (out / "n.md").resolve(), age_s=11 * 60)
+        elif n:
+            stop_event.set()
+        return n
+
+    monkeypatch.setattr(commit_mod, "reconcile_stale_commits", spy)
+    threading.Timer(8.0, stop_event.set).start()
+    _run(persona_dir, stop_event, soul_review_interval_s=None, pending_reconcile_interval_s=0.05)
+
+    assert pending.get(persona_dir, staged["rid"])["status"] == "error"
+    assert (persona_dir / "cadence" / "pending_reconcile_cadence.json").exists()
+
+
+def test_pending_reconcile_cadence_default_is_fifteen_minutes() -> None:
+    """The default IS the recovery latency for a write stranded mid-session; don't let it drift."""
+    import inspect
+
+    default = inspect.signature(run_folded).parameters["pending_reconcile_interval_s"].default
+    assert default == 15 * 60.0
