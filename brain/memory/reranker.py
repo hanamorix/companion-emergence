@@ -179,7 +179,7 @@ class RerankerProvider(ABC):
 
         `seconds` is the wall time of the scoring call, read from the module
         clock seam `_clock`; `rss_delta_bytes` is this process's RSS after
-        minus before the call (`None` when RSS is unreadable, e.g. not Linux),
+        minus before the call (`None` when RSS is unreadable, e.g. psutil cannot read it),
         the per-token RAM measurement S32 asks for. Only RECALL paths call
         this (passive recall and `search_memories`, via
         `normalize_against_anchors`); bootstrap-floor and calibration scoring
@@ -1009,6 +1009,21 @@ def _full_length_pair(provider: RerankerProvider) -> tuple[str, int] | None:
     return None
 
 
+# S213: the token count of the full-length pair, remembered per model id the first time one is
+# built, so a lull that would refuse (this process's high water already covers the pair) is
+# recognised without loading the provider, warming it up or building the pair again.
+_full_pair_tokens: dict[str, int] = {}
+
+
+def _ram_figure_would_refuse(model_id: str) -> bool:
+    """S213: whether `measure_ram_figure` would refuse for the high-water reason ("this
+    process has already run a batch this large"). Cheap: process memory only. `False` while
+    the pair's token count is not yet known (the first attempt finds it out)."""
+    with _cost_lock:
+        tokens = _full_pair_tokens.get(model_id)
+        return tokens is not None and _ram_state.get(model_id, _RamState()).peak_x >= tokens
+
+
 def measure_ram_figure(provider: RerankerProvider, store: MemoryStore) -> bool:
     """S200: measure the RAM figure from ONE pair at the re-scorer's full input
     length. The two discarded warm-up reranks run first on short text (so the model
@@ -1026,15 +1041,20 @@ def measure_ram_figure(provider: RerankerProvider, store: MemoryStore) -> bool:
     exists; a question to Planning). Returns
     True only when the window then holds a RAM figure above 0. Like the first-ever seed
     it runs without a memory-headroom check: one pair, about 250 MB (S200, S184).
-    Provider exceptions propagate."""
-    _warm_up_once(provider, "warm up", ["warm up"])
+    Provider exceptions propagate. S213: every refusal that can be decided without the
+    warm-up is decided BEFORE it (the pair is built and the high water compared first), so a
+    lull that refuses costs no rerank."""
     model_id = provider.model_id()
+    if _ram_figure_would_refuse(model_id):
+        _warn_ram_figure_once("this process has already run a batch this large")
+        return False
     pair = _full_length_pair(provider)
     if pair is None:
         _warn_ram_figure_once("no full-length pair could be built")
         return False
     text, tokens = pair
     with _cost_lock:
+        _full_pair_tokens[model_id] = tokens
         high_water = _ram_state.get(model_id, _RamState()).peak_x
     if high_water >= tokens:
         # This process already ran a batch this large, so a pair of this size cannot grow
@@ -1042,6 +1062,7 @@ def measure_ram_figure(provider: RerankerProvider, store: MemoryStore) -> bool:
         # needs a fresh process). Running the pair would only cost a full-length rerank.
         _warn_ram_figure_once("this process has already run a batch this large")
         return False
+    _warm_up_once(provider, "warm up", ["warm up"])
     _scores, seconds, rss_delta = provider.rerank_timed(text, [text])
     if rss_delta is None or rss_delta <= 0.0:
         _warn_ram_figure_once("the full-length pair showed no RSS growth")
@@ -1070,6 +1091,10 @@ def run_ram_figure(activity_marker: object, store: MemoryStore) -> bool:
         with _cost_lock:
             _ram_figure_needed.discard(model_id)
         return False
+    if _ram_figure_would_refuse(model_id):
+        # S213: the attempt is stamped (once per lull) and nothing is built, loaded or warmed.
+        _warn_ram_figure_once("this process has already run a batch this large")
+        return False
     measured = measure_ram_figure(build_reranker_provider(store=store), store)
     if measured and ram_figure_ready(model_id, store):
         with _cost_lock:
@@ -1085,6 +1110,7 @@ def _reset_rerank_cost_model() -> None:
         _ram_figure_needed.clear()
         _ram_figure_attempt.clear()
         _ram_figure_warned.clear()
+        _full_pair_tokens.clear()
         _ram_state.clear()
         _ram_kept.clear()
         _warmed_model_ids.clear()
@@ -1513,22 +1539,18 @@ def _cgroup_v1_memory_headroom_bytes() -> float | None:
     return max(0.0, limit - usage)
 
 
-def _proc_meminfo_available_bytes() -> float | None:
-    """Plain host free-memory fallback: `/proc/meminfo`'s `MemAvailable`
-    line (kernel-computed "usable without swapping" estimate) — used only
-    when no cgroup memory limit applies (see `_available_ram_headroom_
-    bytes`). Same `_detect_avx2`-shaped fail-soft posture: `None` on
-    non-Linux or any read/parse error, never a fabricated figure."""
-    if sys.platform != "linux":
-        return None
+def _psutil_available_bytes() -> float | None:
+    """Plain host free-memory fallback: `psutil.virtual_memory().available` (S211: the
+    same call on Linux, macOS and Windows; the kernel's "usable without swapping"
+    estimate) — used only when no cgroup memory limit applies (see
+    `_available_ram_headroom_bytes`). `None` when psutil cannot read it (warned once per
+    process), never a fabricated figure."""
     try:
-        with open("/proc/meminfo", encoding="utf-8") as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    return float(line.split()[1]) * 1024.0
-        return None
+        import psutil
+
+        return float(psutil.virtual_memory().available)
     except Exception:  # noqa: BLE001 — fail-soft: a headroom probe must never break a recall
-        log.exception("reranker: /proc/meminfo read failed")
+        _warn_ram_figure_once("the host free memory could not be read (psutil)")
         return None
 
 
@@ -1543,11 +1565,12 @@ def _available_ram_headroom_bytes() -> float | None:
 
     cgroup-limit-aware, per the pre-flip revision's Change-3 requirement:
     Testing's own OOM reproduction ran under an explicit cgroup cap that
-    the host's plain `/proc/meminfo` free-memory reading does NOT reflect,
-    so a host-only read would fail to prevent the exact OOM this change
-    fixes. Tries cgroup v2 first, then v1, then falls back to the host-wide
-    `/proc/meminfo` reading only when no cgroup limit applies (or it's
-    explicitly unbounded). Returns `None` — never a fabricated number —
+    the host's plain free-memory reading does NOT reflect, so a host-only
+    read would fail to prevent the exact OOM this change fixes. Tries cgroup
+    v2 first, then v1 (both Linux only), then falls back to the host-wide
+    free memory read through `psutil` (S211: the same call on Linux, macOS
+    and Windows) only when no cgroup limit applies (or it's explicitly
+    unbounded). Returns `None` — never a fabricated number —
     when every source is unavailable/unsupported/errors; the width fit
     treats `None` as "skip the memory term", never as "unlimited
     headroom". Also imported by `judge_selftune.py`."""
@@ -1555,7 +1578,7 @@ def _available_ram_headroom_bytes() -> float | None:
     if headroom is None:
         headroom = _cgroup_v1_memory_headroom_bytes()
     if headroom is None:
-        headroom = _proc_meminfo_available_bytes()
+        headroom = _psutil_available_bytes()
     return headroom
 
 

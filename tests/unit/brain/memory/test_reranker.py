@@ -437,25 +437,30 @@ def test_detect_avx2_false_for_arm_style_cpuinfo_with_no_flags_line(
     assert _detect_avx2() is False
 
 
-def test_current_rss_bytes_parses_vmrss_line(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sys, "platform", "linux")
-    status = "VmPeak:\t   50000 kB\nVmRSS:\t   12345 kB\nVmData:\t   9999 kB\n"
-    monkeypatch.setattr("builtins.open", mock_open(read_data=status))
-    assert reranker_mod._current_rss_bytes() == 12345 * 1024.0
+def test_current_rss_bytes_reads_the_psutil_rss_on_every_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    """S206: the RSS comes from psutil, so the platform name does not matter."""
+    import psutil
 
+    class _Info:
+        rss = 12345 * 1024
 
-def test_current_rss_bytes_none_on_non_linux(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sys, "platform", "darwin")
-    assert reranker_mod._current_rss_bytes() is None
+    class _Proc:
+        def memory_info(self):
+            return _Info()
+
+    monkeypatch.setattr(psutil, "Process", lambda *a, **k: _Proc())
+    for platform in ("linux", "darwin", "win32"):
+        monkeypatch.setattr(sys, "platform", platform)
+        assert reranker_mod._current_rss_bytes() == 12345 * 1024.0
 
 
 def test_current_rss_bytes_fail_soft_on_read_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sys, "platform", "linux")
+    import psutil
 
     def _boom(*args, **kwargs):
-        raise OSError("simulated /proc/self/status read failure")
+        raise psutil.AccessDenied()
 
-    monkeypatch.setattr("builtins.open", _boom)
+    monkeypatch.setattr(psutil.Process, "memory_info", _boom)
     assert reranker_mod._current_rss_bytes() is None  # no raise
 
 
@@ -716,46 +721,76 @@ def test_cgroup_v1_garbage_limit_returns_none(monkeypatch: pytest.MonkeyPatch) -
     assert reranker_mod._cgroup_v1_memory_headroom_bytes() is None
 
 
-def test_proc_meminfo_available_bytes_parses_kb_line(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sys, "platform", "linux")
-    meminfo = "MemTotal:       16333000 kB\nMemFree:         2000000 kB\nMemAvailable:    5000000 kB\n"
-    monkeypatch.setattr("builtins.open", mock_open(read_data=meminfo))
-    assert reranker_mod._proc_meminfo_available_bytes() == 5_000_000 * 1024.0
+def test_psutil_available_bytes_reads_the_host_available_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """S211: the host free-memory fallback is psutil's `available`, the same call on every platform."""
+    import psutil
+
+    class _Mem:
+        available = 5_000_000 * 1024
+
+    for platform in ("linux", "darwin", "win32"):
+        monkeypatch.setattr(sys, "platform", platform)
+        monkeypatch.setattr(psutil, "virtual_memory", lambda: _Mem())
+        assert reranker_mod._psutil_available_bytes() == 5_000_000 * 1024.0
 
 
-def test_proc_meminfo_available_bytes_none_on_non_linux(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_psutil_available_bytes_none_when_psutil_fails_and_warns_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import psutil
+
+    def _boom():
+        raise OSError("no access")
+
+    monkeypatch.setattr(psutil, "virtual_memory", _boom)
+    reranker_mod._ram_figure_warned.clear()
+    with caplog.at_level("DEBUG"):
+        assert reranker_mod._psutil_available_bytes() is None
+        assert reranker_mod._psutil_available_bytes() is None
+    warns = [r for r in caplog.records if r.levelname == "WARNING" and "free memory could not be read" in r.getMessage()]
+    assert len(warns) == 1
+
+
+def test_headroom_is_read_on_a_non_linux_platform_through_psutil(monkeypatch: pytest.MonkeyPatch) -> None:
+    """S211: on macOS/Windows the cgroup readers answer None and the headroom is still psutil's."""
+    import psutil
+
+    class _Mem:
+        available = 7e9
+
     monkeypatch.setattr(sys, "platform", "darwin")
-    assert reranker_mod._proc_meminfo_available_bytes() is None
+    monkeypatch.setattr(psutil, "virtual_memory", lambda: _Mem())
+    assert reranker_mod._available_ram_headroom_bytes() == 7e9
 
 
 def test_available_ram_headroom_prefers_cgroup_v2_over_everything(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(reranker_mod, "_cgroup_v2_memory_headroom_bytes", lambda: 111.0)
     monkeypatch.setattr(reranker_mod, "_cgroup_v1_memory_headroom_bytes", lambda: 222.0)
-    monkeypatch.setattr(reranker_mod, "_proc_meminfo_available_bytes", lambda: 333.0)
+    monkeypatch.setattr(reranker_mod, "_psutil_available_bytes", lambda: 333.0)
     assert reranker_mod._available_ram_headroom_bytes() == 111.0
 
 
 def test_available_ram_headroom_falls_back_to_cgroup_v1_when_v2_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(reranker_mod, "_cgroup_v2_memory_headroom_bytes", lambda: None)
     monkeypatch.setattr(reranker_mod, "_cgroup_v1_memory_headroom_bytes", lambda: 222.0)
-    monkeypatch.setattr(reranker_mod, "_proc_meminfo_available_bytes", lambda: 333.0)
+    monkeypatch.setattr(reranker_mod, "_psutil_available_bytes", lambda: 333.0)
     assert reranker_mod._available_ram_headroom_bytes() == 222.0
 
 
-def test_available_ram_headroom_falls_back_to_meminfo_when_no_cgroup(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_available_ram_headroom_falls_back_to_psutil_when_no_cgroup(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(reranker_mod, "_cgroup_v2_memory_headroom_bytes", lambda: None)
     monkeypatch.setattr(reranker_mod, "_cgroup_v1_memory_headroom_bytes", lambda: None)
-    monkeypatch.setattr(reranker_mod, "_proc_meminfo_available_bytes", lambda: 333.0)
+    monkeypatch.setattr(reranker_mod, "_psutil_available_bytes", lambda: 333.0)
     assert reranker_mod._available_ram_headroom_bytes() == 333.0
 
 
 def test_available_ram_headroom_none_when_everything_fails(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Safe-degrade case: no cgroup limit and an unreadable/absent
-    /proc/meminfo (or a non-Linux platform) -> None, which the width fit
+    """Safe-degrade case: no cgroup limit and an unreadable
+    psutil memory read -> None, which the width fit
     must treat as 'skip the memory term', never as unlimited headroom."""
     monkeypatch.setattr(reranker_mod, "_cgroup_v2_memory_headroom_bytes", lambda: None)
     monkeypatch.setattr(reranker_mod, "_cgroup_v1_memory_headroom_bytes", lambda: None)
-    monkeypatch.setattr(reranker_mod, "_proc_meminfo_available_bytes", lambda: None)
+    monkeypatch.setattr(reranker_mod, "_psutil_available_bytes", lambda: None)
     assert reranker_mod._available_ram_headroom_bytes() is None
 
 

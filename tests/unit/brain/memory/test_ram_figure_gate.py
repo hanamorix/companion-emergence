@@ -255,6 +255,37 @@ def test_a_process_that_already_ran_a_batch_this_large_does_not_rerun_the_pair(
     provider = _CappedReranker()
     assert reranker_mod.measure_ram_figure(provider, store) is False
     assert provider.timed == []
+    assert provider.plain == [], "S213: refused before the warm-up reranks"
+
+
+def test_s213_a_known_full_pair_length_refuses_before_the_provider_is_even_built(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The job remembers the pair's token count per model; once the high water covers it, a
+    lull builds, loads and warms up nothing (and the attempt is still stamped for this lull)."""
+    store = _store(tmp_path)
+    reranker_mod.note_ram_figure_needed(_RERANKER_ID)
+    first = _CappedReranker(rss=0.0)
+    monkeypatch.setattr("brain.memory.reranker.build_reranker_provider", lambda **kw: first)
+    assert reranker_mod.run_ram_figure("m1", store) is False  # no growth: not a figure, tokens learned
+    assert reranker_mod._full_pair_tokens[_RERANKER_ID] == _FULL
+
+    reranker_mod._ram_state[_RERANKER_ID] = reranker_mod._RamState(peak_x=_FULL)
+    monkeypatch.setattr(
+        "brain.memory.reranker.build_reranker_provider", lambda **kw: pytest.fail("S213: provider built")
+    )
+    assert reranker_mod.run_ram_figure("m2", store) is False
+    assert reranker_mod._ram_figure_attempt[_RERANKER_ID] == "m2"
+    assert reranker_mod._ram_figure_needed == {_RERANKER_ID}, "the flag stays"
+
+
+def test_s213_a_lower_high_water_still_measures_after_the_length_is_known(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    reranker_mod._full_pair_tokens[_RERANKER_ID] = _FULL
+    reranker_mod._ram_state[_RERANKER_ID] = reranker_mod._RamState(peak_x=_FULL - 1)
+    provider = _CappedReranker()
+    assert reranker_mod.measure_ram_figure(provider, store) is True
+    assert len(provider.timed) == 1
 
 
 def test_a_pair_whose_ram_sample_was_not_taken_is_not_reported_as_measured(
@@ -371,6 +402,8 @@ def _store_factory(store: MemoryStore):
 def test_s201_with_no_figure_and_a_registered_direct_chat_the_measurement_runs_on_a_background_thread(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _background_on: None
 ) -> None:
+    """S210: the flagged turn starts nothing; the thread starts only when the REPL calls
+    `start_requested_ram_figure` after the reply."""
     import threading
 
     from brain.memory import floor_startup
@@ -391,17 +424,57 @@ def test_s201_with_no_figure_and_a_registered_direct_chat_the_measurement_runs_o
     result = run_semantic_recall(store, tmp_path, _QUERY)
 
     assert result is not None and result.path == COSINE_PATH, "the flagged turn takes the cosine path"
+    assert not floor_startup.inflight("ram-figure"), "S210: nothing runs while the flagged reply is built"
+    assert ran == []
+    assert reranker_mod._ram_figure_needed == {_RERANKER_ID}
+
+    thread = floor_startup.start_requested_ram_figure()  # the REPL, after the reply is printed
+    assert thread is not None
     assert floor_startup.inflight("ram-figure"), "the measurement is in flight in the background"
-    again = run_semantic_recall(store, tmp_path, _QUERY)
-    assert again is not None and again.path == COSINE_PATH, "and the next turn is not held up by it"
+    assert floor_startup.start_requested_ram_figure() is None, "the recorded need was consumed"
     gate.set()
-    for t in threading.enumerate():
-        if t.name == "ram-figure-measure":
-            t.join(timeout=10)
+    thread.join(timeout=10)
     assert [name for name, _ in ran] == ["ram-figure-measure"], "one thread, not the calling one"
     assert ran[0][1] == store.db_path, "on the persona's own database (a store of its own)"
     assert not floor_startup.inflight("ram-figure")
     assert reranker_mod.ram_figure_ready(_RERANKER_ID, store), "the figure exists afterwards"
+
+
+def test_s210_the_recall_only_records_the_need_and_a_second_flagged_turn_starts_nothing_either(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _background_on: None
+) -> None:
+    from brain.memory import floor_startup
+
+    store, _memories = _recall_setup(monkeypatch, tmp_path)
+    floor_startup.enable_background_ram_figure(tmp_path)
+    monkeypatch.setattr(reranker_mod, "run_ram_figure", lambda *a: pytest.fail("S210: started during the turn"))
+    for _ in range(2):
+        run_semantic_recall(store, tmp_path, _QUERY)
+    assert floor_startup._ram_figure_requested is True  # noqa: SLF001
+    assert not floor_startup.inflight("ram-figure")
+    started = []
+    monkeypatch.setattr(floor_startup, "_spawn", lambda kind, body, *, name: started.append(kind))
+    floor_startup.start_requested_ram_figure()
+    assert started == ["ram-figure"], "it starts only when the REPL asks, after the reply"
+
+
+def test_s210_nothing_recorded_nothing_started(tmp_path: Path, _background_on: None) -> None:
+    from brain.memory import floor_startup
+
+    floor_startup.enable_background_ram_figure(tmp_path)
+    assert floor_startup.start_requested_ram_figure() is None, "no turn flagged a need"
+    floor_startup.enable_background_ram_figure(None)
+    assert floor_startup.request_ram_figure() is False
+    assert floor_startup.start_requested_ram_figure() is None
+
+
+def test_s210_registering_again_forgets_a_recorded_need(tmp_path: Path, _background_on: None) -> None:
+    from brain.memory import floor_startup
+
+    floor_startup.enable_background_ram_figure(tmp_path)
+    assert floor_startup.request_ram_figure() is True
+    floor_startup.enable_background_ram_figure(tmp_path)
+    assert floor_startup.start_requested_ram_figure() is None
 
 
 def test_s201_without_a_registered_direct_chat_no_thread_starts(
@@ -416,7 +489,8 @@ def test_s201_without_a_registered_direct_chat_no_thread_starts(
     result = run_semantic_recall(store, tmp_path, _QUERY)
     assert result is not None and result.path == COSINE_PATH
     assert not floor_startup.inflight("ram-figure")
-    assert floor_startup.request_ram_figure() is None
+    assert floor_startup.request_ram_figure() is False
+    assert floor_startup.start_requested_ram_figure() is None
 
 
 def test_s201_with_a_saved_figure_nothing_is_requested(
@@ -465,7 +539,8 @@ def test_s201_a_failing_measurement_is_logged_not_raised_and_frees_the_slot(
         raise RuntimeError("the model would not load")
 
     monkeypatch.setattr(reranker_mod, "run_ram_figure", _boom)
-    thread = floor_startup.request_ram_figure()
+    assert floor_startup.request_ram_figure() is True
+    thread = floor_startup.start_requested_ram_figure()
     assert thread is not None
     thread.join(timeout=10)
     assert not floor_startup.inflight("ram-figure")
