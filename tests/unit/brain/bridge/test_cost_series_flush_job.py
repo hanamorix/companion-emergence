@@ -185,3 +185,37 @@ def test_cs17e_the_bridge_teardown_flushes_after_the_supervisor_stops(tmp_path, 
         assert _rows(persona) == (0 if fail else 2)
     finally:
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# S200: the RAM-figure lull job
+# ---------------------------------------------------------------------------
+
+
+def test_the_ram_figure_job_is_skipped_without_the_slot_and_runs_with_it(tmp_path, monkeypatch) -> None:
+    from contextlib import contextmanager
+
+    from brain.bridge import supervisor
+    from brain.bridge.central_cadence import JobOutcome
+
+    persona = _persona(tmp_path)
+    job = _job(persona, "rerank_ram_figure")
+    ran: list[object] = []
+    monkeypatch.setattr(
+        supervisor.reranker, "run_ram_figure", lambda marker, store: ran.append((marker, store))
+    )
+
+    @contextmanager
+    def _no_slot(*, now=None):  # noqa: ARG001
+        yield False
+
+    @contextmanager
+    def _slot(*, now=None):  # noqa: ARG001
+        yield True
+
+    monkeypatch.setattr(supervisor.cli_throttle, "background_slot", _no_slot)
+    assert job.run() is JobOutcome.SKIPPED and ran == []
+    monkeypatch.setattr(supervisor.cli_throttle, "background_slot", _slot)
+    assert job.run() is JobOutcome.COMPLETED
+    ((marker, store),) = ran
+    assert marker == supervisor.cli_throttle.chat_activity_marker() and store is not None

@@ -1603,9 +1603,10 @@ def test_the_whole_message_is_cut_to_the_tokens_the_embed_fit_says_fit(
     (query,) = batch
     assert result is not None and result.whole_message_fallback is True
     assert message.startswith(query) and len(query) <= 225
-    assert len(message[: len(query) + 6]) > 225 or message[len(query)].isspace(), (
-        "the longest word-boundary prefix that fits"
-    )
+    # the longest word-boundary prefix that fits: the next word would not
+    rest = message[len(query) :]
+    next_word = rest.split()[0]
+    assert len(query) + (len(rest) - len(rest.lstrip())) + len(next_word) > 224
 
 
 def test_when_not_even_one_token_fits_the_first_paragraph_alone_is_searched(

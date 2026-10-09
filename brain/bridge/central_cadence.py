@@ -71,8 +71,7 @@ logger = logging.getLogger(__name__)
 # path), then the stuck-width re-measure (S100: one timed rerank per lull
 # while the learned cost says fewer than 5 candidates fit), then the RAM-figure
 # measurement (S200: one full-length pair when a turn found no saved RAM figure),
-# then the cost-series
-# flush (S146, S164: the buffered timing samples are saved to memories.db, after
+# then the cost-series flush (S146, S164: the buffered timing samples are saved to memories.db, after
 # the re-measure and the RAM figure so their samples are saved the same lull), then the recall
 # diagnostics flush (S189: records buffered while the log's lock was held). Names are the job
 # table's keys and the log's `job=` values.

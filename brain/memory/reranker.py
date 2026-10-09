@@ -900,7 +900,10 @@ def _too_long_remembered(model_id: str, store: MemoryStore) -> bool:
 
 
 def _ram_unseeded(model_id: str, estimate: RerankCostEstimate) -> bool:
-    """S158/S171: this process has not yet recorded a measured rerank for
+    """S158/S171 (S200: on Linux a fresh process with no figure never reaches the
+    rerank any more, the gate in `search_paragraphs` keeps it on the cosine path until
+    the lull job has measured one; this remains for a figure that ages out between the
+    gate and the rerank): this process has not yet recorded a measured rerank for
     `model_id`, RSS is readable (Linux) and no RAM figure greater than 0 is saved
     for this model id on this machine, so its first measured recall rerank must run
     at the S5 minimum to measure RAM growth, whatever the saved time estimate says.
@@ -956,9 +959,9 @@ _PAIR_TEXT_DOUBLINGS = 8
 def ram_figure_ready(model_id: str, store: MemoryStore) -> bool:
     """S200: whether a rerank may run for `model_id`. True when RSS is unreadable
     (no figure can exist there; the older seeds apply, a question to Planning),
-    when the 24-hour window holds a RAM figure above 0, or when this process holds
-    a kept figure above 0 (S180: set only by a RAM sample or by an estimate that
-    read a window figure). A rerank having been recorded is NOT a figure: a
+    when the 24-hour window holds a RAM figure above 0, or when this process has
+    recorded a measured rerank AND holds a kept figure above 0 (S180: the figure its
+    own sample or an estimate read from the window). A rerank having been recorded is NOT a figure: a
     measurement with no RAM growth records nothing (`measure_ram_figure`). A
     failed database read is no figure (cosine path). Cheap: one read, no model."""
     if not _require_ram_figure or _current_rss_bytes() is None:
@@ -968,7 +971,11 @@ def ram_figure_ready(model_id: str, store: MemoryStore) -> bool:
         return True
     key = (cost_series._store_key(store), model_id)
     with _cost_lock:
-        return _ram_kept.get(key, 0.0) > 0.0
+        # The kept figure serves only a process that has recorded a measured rerank
+        # (S180: `rerank_cost_estimate` and `_ram_unseeded` use it on that condition
+        # only); a kept figure alone would open this gate for a rerank that is then
+        # sized as unseeded, the S193 shape.
+        return model_id in _ram_state and _ram_kept.get(key, 0.0) > 0.0
 
 
 def note_ram_figure_needed(model_id: str) -> None:
@@ -1028,22 +1035,41 @@ def measure_ram_figure(provider: RerankerProvider, store: MemoryStore) -> bool:
     sample (the high water of a fresh process is 0, so it counts) and a time sample,
     so `rerank_cost_estimate` exists afterwards and the first real rerank is sized
     by `fit_rerank_width` under the RAM bound, not at the S5 width. Returns False and
-    records NOTHING when the pair cannot be built at full length or its RSS growth
-    is unreadable or not above 0 (not a figure; the job retries at a later lull).
+    records NOTHING when the pair cannot be built at full length, when this process has
+    already run a batch this large (no growth can show), or when its RSS growth is
+    unreadable or not above 0 (not a figure; the job retries at a later lull). Returns
+    True only when the window then holds a RAM figure above 0. Like the first-ever seed
+    it runs without a memory-headroom check: one pair, about 250 MB (S200, S184).
     Provider exceptions propagate."""
     _warm_up_once(provider, "warm up", ["warm up"])
+    model_id = provider.model_id()
     pair = _full_length_pair(provider)
     if pair is None:
         log.warning("reranker: RAM figure not measured: no full-length pair could be built")
         return False
     text, tokens = pair
+    with _cost_lock:
+        high_water = _ram_state.get(model_id, _RamState()).peak_x
+    if high_water >= tokens:
+        # This process already ran a batch this large, so a pair of this size cannot grow
+        # RSS past the high water any more and no RAM sample can be taken here (a figure
+        # needs a fresh process). Running the pair would only cost a full-length rerank.
+        log.warning("reranker: RAM figure not measured: this process has already run a batch this large")
+        return False
     _scores, seconds, rss_delta = provider.rerank_timed(text, [text])
     if rss_delta is None or rss_delta <= 0.0:
         log.warning("reranker: RAM figure not measured: the full-length pair showed no RSS growth")
         return False
-    _record_rerank_cost(provider.model_id(), store, tokens, seconds, rss_delta)
-    log.info("reranker: RAM figure measured from one %d-token pair (%.0f MB growth)", tokens, rss_delta / 1e6)
-    return True
+    _record_rerank_cost(model_id, store, tokens, seconds, rss_delta)
+    fit = _ram_cost.fit(store, model_id)
+    measured = fit is not None and fit.rate > 0.0
+    log.info(
+        "reranker: RAM figure %s from one %d-token pair (%.0f MB growth)",
+        "measured" if measured else "NOT recorded",
+        tokens,
+        rss_delta / 1e6,
+    )
+    return measured
 
 
 def run_ram_figure(activity_marker: object, store: MemoryStore) -> bool:

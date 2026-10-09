@@ -125,11 +125,26 @@ def test_the_same_turn_reranks_once_a_window_figure_exists(
     assert reranker_mod._ram_figure_needed == set()
 
 
-def test_a_kept_figure_in_this_process_is_a_figure(tmp_path: Path) -> None:
+def test_a_kept_figure_counts_only_in_a_process_that_has_recorded_a_rerank(tmp_path: Path) -> None:
+    """S180: the sizing code uses a kept figure only for such a process; a kept figure
+    alone would open the gate for a rerank sized as unseeded (the S193 shape)."""
     store = _store(tmp_path)
+    key = (reranker_mod.cost_series._store_key(store), _RERANKER_ID)
     assert reranker_mod.ram_figure_ready(_RERANKER_ID, store) is False
-    reranker_mod._ram_kept[(reranker_mod.cost_series._store_key(store), _RERANKER_ID)] = 100.0
+    reranker_mod._ram_kept[key] = 100.0
+    assert reranker_mod.ram_figure_ready(_RERANKER_ID, store) is False, "kept alone is not enough"
+    reranker_mod._ram_state[_RERANKER_ID] = reranker_mod._RamState(peak_x=_FULL)
     assert reranker_mod.ram_figure_ready(_RERANKER_ID, store) is True
+
+
+def test_the_shipped_default_requires_a_ram_figure() -> None:
+    """The suite switches the requirement off (autouse); nothing else pins the
+    production default, so a flipped default would disable S200 unnoticed."""
+    import inspect
+    import re
+
+    source = inspect.getsource(reranker_mod)
+    assert re.search(r"^_require_ram_figure = True$", source, re.MULTILINE)
 
 
 def test_a_recorded_rerank_with_no_ram_growth_is_not_a_figure(tmp_path: Path) -> None:
@@ -212,6 +227,27 @@ def test_a_pair_with_no_ram_growth_records_nothing_and_is_not_a_figure(tmp_path:
     assert reranker_mod.ram_figure_ready(_RERANKER_ID, store) is False
 
 
+def test_a_process_that_already_ran_a_batch_this_large_does_not_rerun_the_pair(
+    tmp_path: Path,
+) -> None:
+    """No RSS growth can show past the high water, so the pair is not even run (it
+    would cost a full-length rerank every lull for nothing), and it is not a figure."""
+    store = _store(tmp_path)
+    reranker_mod._ram_state[_RERANKER_ID] = reranker_mod._RamState(peak_x=_FULL)
+    provider = _CappedReranker()
+    assert reranker_mod.measure_ram_figure(provider, store) is False
+    assert provider.timed == []
+
+
+def test_a_pair_whose_ram_sample_was_not_taken_is_not_reported_as_measured(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The return value is whether the window then holds a figure."""
+    store = _store(tmp_path)
+    monkeypatch.setattr(reranker_mod, "_record_rerank_cost", lambda *a, **k: None)
+    assert reranker_mod.measure_ram_figure(_CappedReranker(), store) is False
+
+
 def test_a_pair_that_never_reaches_the_input_limit_is_not_measured(tmp_path: Path) -> None:
     """A tokenizer whose count keeps growing with the text never shows the limit:
     the pair is not full length, so no (too low) figure is recorded."""
@@ -244,6 +280,7 @@ def test_the_job_is_due_only_while_needed_unmeasured_and_once_per_marker(tmp_pat
     assert reranker_mod.ram_figure_due("m1", open_store) is False, "once per chat activity marker"
     assert reranker_mod.ram_figure_due("m2", open_store) is True, "a later lull retries"
     reranker_mod._ram_kept[(reranker_mod.cost_series._store_key(store), _RERANKER_ID)] = 5.0
+    reranker_mod._ram_state[_RERANKER_ID] = reranker_mod._RamState(peak_x=_FULL)
     assert reranker_mod.ram_figure_due("m3", open_store) is False
     assert _RERANKER_ID not in reranker_mod._ram_figure_needed, "a flag whose figure exists is dropped"
 

@@ -60,7 +60,6 @@ from tests.unit.brain.memory.test_per_paragraph_recall import (
     _P1,
     _P2,
     _P3,
-    _REST,
     _THREE,
     _AxisEmbedder,
     _budget,
@@ -339,4 +338,352 @@ def test_a_first_message_scored_as_two_paragraphs_records_two_and_no_fallback(
     assert result is not None and embedder.batches == [[_P1], ["beta heron"]]
     (record,) = _records(tmp_path)
     assert record["paragraph_count"] == 2 and record["whole_message_fallback"] is False
-    assert len(record["paragraphs"]) >= 2
+    assert [row["path"] for row in record["paragraphs"]] == ["cosine", "cosine"]
+    assert record["total_width"] == 0, "the cut used the budget: no rerank share was left"
+
+
+def test_total_width_never_exceeds_fifty_and_equals_the_sum_of_the_rows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """8 paragraphs of 8 candidates, all of which fit: 64 > 50, so six paragraphs
+    rerank 8 each (48) and two take the cosine path (S58)."""
+    bests = [0.61, 0.95, 0.70, 0.88, 0.52, 0.79, 0.66, 0.90]
+    texts = [f"paragraph {chr(97 + i)} words" for i in range(8)]
+    embedder = _AxisEmbedder({t: i for i, t in enumerate(texts)})
+    store = MemoryStore(tmp_path / "memories.db")
+    _install(monkeypatch, embedder)
+    contents = []
+    for i, best in enumerate(bests):
+        for j in range(8):
+            contents.append(_mem(store, f"r7 para {i} memory {j}", {i: best - 0.001 * j}).content)
+    _install(monkeypatch, embedder, _Reranker(dict.fromkeys(contents, 5.0)))
+    _rerank_floor(store, 1.0)
+    _cosine_floor(store, 0.1)
+    _warm(store)
+
+    run_semantic_recall(store, tmp_path, "\n".join(texts))
+
+    (record,) = _records(tmp_path)
+    assert record["paragraph_count"] == 8
+    assert record["total_width"] == 48 <= 50
+    assert sum(row["width"] for row in record["paragraphs"]) == record["total_width"]
+    assert sorted(row["width"] for row in record["paragraphs"]) == [0, 0, 8, 8, 8, 8, 8, 8]
+
+
+def test_a_passive_reranked_paragraph_still_writes_its_calibration_row_with_the_paragraph(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R7-E1 (g), second clause: the diagnostics record is separate from, and does
+    not replace, the passive calibration row."""
+    store, _g, _f, _rec = _first_rerank_case(monkeypatch, tmp_path, cosine_floor=0.5)
+    before = _cal_count(store)
+
+    run_semantic_recall(store, tmp_path, _QUERY)
+
+    queries = [
+        row[0]
+        for row in store._conn.execute("SELECT query FROM calibration_log").fetchall()  # noqa: SLF001
+    ]
+    assert _cal_count(store) == before + 1 and queries == [_QUERY]
+
+
+# ---------------------------------------------------------------------------
+# R7-E1: the search tool
+# ---------------------------------------------------------------------------
+
+
+def test_tool_semantic_request_writes_one_tool_record_and_no_calibration_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store, _g, _f, _rec = _first_rerank_case(monkeypatch, tmp_path, cosine_floor=0.5)
+    before = _cal_count(store)
+
+    out = dispatch("search_memories", {"query": _QUERY}, **_ctx(tmp_path, store))
+
+    assert out["mode"] == "semantic"
+    (record,) = _records(tmp_path)
+    assert record["source"] == "tool" and record["mode"] == "semantic"
+    assert record["paragraph_count"] == 1 and record["total_width"] == 5
+    assert [r["path"] for r in record["paragraphs"]] == ["reranked", "cosine"]
+    assert _cal_count(store) == before, "S56: the tool writes no calibration row"
+
+
+def test_tool_semantic_request_that_falls_back_keeps_its_one_semantic_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The record names the stage that ran; the call reports the mode it ended in.
+    One record, not two."""
+    store = MemoryStore(tmp_path / "memories.db")
+    _install(monkeypatch, _AxisEmbedder({_QUERY: 0}))  # no vectors: the semantic stage has no pool
+
+    out = dispatch("search_memories", {"query": _QUERY}, **_ctx(tmp_path, store))
+
+    assert out["mode"] == "lexical"
+    (record,) = _records(tmp_path)
+    assert record["source"] == "tool" and record["mode"] == "semantic"
+    assert record["paragraph_count"] == 0 and record["paragraphs"] == []
+
+
+@pytest.mark.parametrize("requested", ["lexical", "garbage-mode-value"])
+def test_tool_lexical_request_writes_one_record_with_no_paragraphs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, requested: str
+) -> None:
+    store = MemoryStore(tmp_path / "memories.db")
+    before = _cal_count(store)
+
+    out = dispatch("search_memories", {"query": _QUERY, "mode": requested}, **_ctx(tmp_path, store))
+
+    assert out["mode"] == "lexical"
+    (record,) = _records(tmp_path)
+    assert record["source"] == "tool" and record["mode"] == "lexical"
+    assert record["paragraph_count"] == 0 and record["total_width"] == 0
+    assert record["paragraphs"] == [] and record["budget"] is None
+    assert _cal_count(store) == before
+
+
+# ---------------------------------------------------------------------------
+# R7-E1 (h): the real entries; (f), (i): files and privacy
+# ---------------------------------------------------------------------------
+
+
+def test_the_recall_block_writes_exactly_one_passive_record_for_a_message_with_tokens(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store, _g, _f, _rec = _first_rerank_case(monkeypatch, tmp_path, cosine_floor=0.5)
+
+    block = _build_recall_block(store, _QUERY, persona_dir=tmp_path)
+
+    assert block
+    (record,) = _records(tmp_path)
+    assert record["source"] == "passive"
+
+
+def test_a_message_with_no_recall_token_and_no_listed_name_writes_no_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Q-R7-3: no recall is performed (`_build_recall_block` returns before the
+    semantic stage), so no record is written; the block is the same empty one."""
+    store, _g, _f, _rec = _first_rerank_case(monkeypatch, tmp_path, cosine_floor=0.5)
+
+    assert _build_recall_block(store, "ok", persona_dir=tmp_path) == ""
+
+    assert _records(tmp_path) == []
+
+
+def _db_fingerprint(store: MemoryStore) -> dict[str, object]:
+    """Row counts of the tables a diagnostics write could touch, and a checksum of
+    the memories (id, content, importance, recall_count, embedding)."""
+    import hashlib
+
+    conn = store._conn  # noqa: SLF001
+    counts = {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: S608
+        for table in ("memories", "calibration_log", "reranker_floor_calibration")
+    }
+    digest = hashlib.sha256()
+    for row in conn.execute(
+        "SELECT id, content, importance, recall_count, embedding FROM memories ORDER BY id"
+    ):
+        digest.update(repr(tuple(row)).encode())
+    return {**counts, "memories_sha256": digest.hexdigest()}
+
+
+def test_only_the_log_and_its_lock_sidecar_appear_and_nothing_diagnostic_is_in_the_database(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R7-E1 (f). The recall touches the database only through its own (passive)
+    calibration row, so the fingerprint is taken with the calibration log excluded
+    from the equality and compared for everything else."""
+    store, _g, _f, _rec = _first_rerank_case(monkeypatch, tmp_path, cosine_floor=0.5)
+    before = _db_fingerprint(store)
+    existing = {p.name for p in tmp_path.iterdir()}
+
+    run_semantic_recall(store, tmp_path, _QUERY)
+
+    after = _db_fingerprint(store)
+    new = {p.name for p in tmp_path.iterdir()} - existing
+    assert new == {_LOG, _LOG + ".lock"}
+    tables = {
+        row[0]
+        for row in store._conn.execute(  # noqa: SLF001
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    assert not {t for t in tables if "diagnos" in t.lower()}
+    assert after["calibration_log"] == before["calibration_log"] + 1, "only the passive row"
+    for key in ("memories", "reranker_floor_calibration", "memories_sha256"):
+        assert after[key] == before[key], key
+
+
+def test_a_record_holds_only_numbers_booleans_and_enum_strings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store, genuine, family, _rec = _first_rerank_case(monkeypatch, tmp_path, cosine_floor=0.5)
+
+    run_semantic_recall(store, tmp_path, _QUERY)
+    dispatch("search_memories", {"query": _QUERY}, **_ctx(tmp_path, store))
+
+    text = (tmp_path / _LOG).read_text()
+    assert _QUERY not in text and "memory" not in text.replace("paragraph", "")
+    for memory in [*genuine, *family]:
+        assert memory.id not in text and memory.content not in text
+
+
+# ---------------------------------------------------------------------------
+# R7-E3: fail-soft, no store access
+# ---------------------------------------------------------------------------
+
+
+def _run_all_three(store: MemoryStore, persona: Path | None) -> dict[str, list[str]]:
+    """The same three calls the criteria name, on one store: a passive recall, the
+    tool's semantic request and its lexical request. Each returns the contents it
+    surfaced, in order."""
+    passive = run_semantic_recall(store, persona, _QUERY)  # type: ignore[arg-type]
+    semantic = search_memories(
+        _QUERY,
+        store=store,
+        hebbian=HebbianMatrix(":memory:"),
+        persona_dir=persona,  # type: ignore[arg-type]
+    )
+    lexical = search_memories(
+        _QUERY,
+        mode="lexical",
+        store=store,
+        hebbian=HebbianMatrix(":memory:"),
+        persona_dir=persona,  # type: ignore[arg-type]
+    )
+    return {
+        "passive": [] if passive is None else [m.content for m in [*passive.full, *passive.snippet]],
+        "semantic": [m["content"] for m in semantic["memories"]],
+        "semantic_mode": [semantic["mode"]],
+        "lexical": [m["content"] for m in lexical["memories"]],
+        "lexical_mode": [lexical["mode"]],
+    }
+
+
+def _healthy_outcome(monkeypatch, tmp_path_factory) -> dict[str, list[str]]:
+    root = tmp_path_factory.mktemp("healthy")
+    store, _g, _f, _rec = _first_rerank_case(monkeypatch, root, cosine_floor=0.5)
+    outcome = _run_all_three(store, root)
+    assert outcome["passive"] and outcome["semantic"] and outcome["semantic_mode"] == ["semantic"]
+    # The comparison run starts from a fresh process state (the cost model and the
+    # embed warm-up are process-level; the cost series live in each store).
+    reranker_mod._reset_rerank_cost_model()
+    sr._reset_paragraph_time_model()
+    return outcome
+
+
+@pytest.mark.parametrize(
+    "breakage", ["file_for_dir", "persona_none", "log_recall_raises", "missing_directory"]
+)
+def test_an_emission_failure_never_changes_the_result_or_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    breakage: str,
+) -> None:
+    """R7-E3 (a): passive recall and both tool modes return exactly what a healthy
+    run returns. A missing persona directory is not a failure: the lock sidecar
+    creates it and the record lands there (the existing behaviour, asserted)."""
+    healthy = _healthy_outcome(monkeypatch, tmp_path_factory)
+    store, _g, _f, _rec = _first_rerank_case(monkeypatch, tmp_path, cosine_floor=0.5)
+    persona: Path | None = tmp_path
+    if breakage == "file_for_dir":
+        persona = tmp_path / "not-a-directory"
+        persona.write_text("a file where the persona directory should be")
+    elif breakage == "persona_none":
+        persona = None
+    elif breakage == "missing_directory":
+        persona = tmp_path / "gone"
+    else:
+
+        def _raise(*args, **kwargs):
+            raise RuntimeError("simulated diagnostics failure")
+
+        monkeypatch.setattr(rd, "log_recall", _raise)
+
+    assert _run_all_three(store, persona) == healthy
+
+    if breakage == "missing_directory":
+        assert persona is not None and len(_records(persona)) == 3, "the sidecar made the directory"
+    elif breakage in ("file_for_dir", "persona_none", "log_recall_raises"):
+        assert not (tmp_path / _LOG).exists()
+
+
+def test_the_emission_opens_no_database_and_makes_one_append(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R7-E3 (b), (c): the helper takes no store, a sqlite connection attempted
+    during it fails the test, and exactly one locked append happens."""
+    assert "store" not in inspect.signature(emit_recall_diagnostics).parameters
+    gated = _ranking(RERANKED_PATH, CALIBRATION_SCORE_SCALE, 1.0, real_width=5)
+    search = ParagraphSearch(
+        outcomes=(_outcome(0, gated, 5),),
+        pool={},
+        whole_message_fallback=False,
+        total_width=5,
+        budget=4.0,
+        rerank_budget=3.0,
+    )
+
+    def _no_db(*args, **kwargs):
+        raise AssertionError("the diagnostics emission opened a database")
+
+    appends: list[Path] = []
+    real_append = rd.append_record
+
+    def _spy(path, record):
+        appends.append(path)
+        return real_append(path, record)
+
+    monkeypatch.setattr(sqlite3, "connect", _no_db)
+    monkeypatch.setattr(rd, "append_record", _spy)
+
+    emit_recall_diagnostics(tmp_path, search, source="passive")
+
+    assert appends == [tmp_path / _LOG]
+    (record,) = _records(tmp_path)
+    assert record["total_width"] == 5 and record["budget"] == pytest.approx(4.0)
+
+
+def test_the_budget_in_the_record_is_the_tunable_in_force(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store, _g, _f, _rec = _first_rerank_case(monkeypatch, tmp_path, cosine_floor=0.5)
+    real = tunables.get_tunable
+    monkeypatch.setattr(
+        tunables,
+        "get_tunable",
+        lambda key, default: 2.5 if key == "reranker.latency_budget_seconds" else real(key, default),
+    )
+
+    run_semantic_recall(store, tmp_path, _QUERY)
+
+    assert _records(tmp_path)[0]["budget"] == pytest.approx(2.5)
+
+
+def test_search_paragraphs_alone_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The record belongs to the call sites (passive recall, the tool), not to the
+    shared per-paragraph search: a direct caller leaves no file behind."""
+    store, _g, _f, _rec = _first_rerank_case(monkeypatch, tmp_path, cosine_floor=0.5)
+
+    search_paragraphs(store, _QUERY, log_calibration=False)
+
+    assert not (tmp_path / _LOG).exists()
+
+
+def test_the_emission_helper_is_called_only_from_the_three_call_sites() -> None:
+    """The three sites (plan 1.2-1.3) and nowhere else in `brain/`."""
+    callers: set[str] = set()
+    root = Path(sr.__file__).resolve().parents[1]
+    for path in root.rglob("*.py"):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+                if name == "emit_recall_diagnostics":
+                    callers.add(f"{path.relative_to(root)}")
+    assert callers == {"memory/semantic_recall.py", "tools/impls/search_memories.py"}

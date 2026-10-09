@@ -1467,7 +1467,7 @@ def search_paragraphs(
                     elif fit.rate <= 0.0:
                         cap = tokens_of[text]
                     else:
-                        cap = int((room - fit.overhead) // fit.rate)
+                        cap = int((room - fit.overhead) / fit.rate)
                     cut = cut_query(text, cap)
                     if cut is None:
                         queries = [paragraphs[0]]
@@ -1502,7 +1502,7 @@ def search_paragraphs(
                     if room <= 0:
                         cap = 0
                     elif first_tokens > 0 and embed_seconds[0] > 0.0:
-                        cap = int(room // (embed_seconds[0] / first_tokens))
+                        cap = int(room / (embed_seconds[0] / first_tokens))
                     else:
                         cap = tokens_of[rest]
                     rest_query = cut_query(rest, cap)
