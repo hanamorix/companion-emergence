@@ -1019,6 +1019,30 @@ def _build_gated_jobs(
         )
     )
 
+    # 4c2. RAM-figure measurement — name-recall fix S200 (fixes S193). A recall
+    # turn on a machine with no saved RAM figure takes the plain meaning-match
+    # path and flags the need; this job then measures the figure at the next
+    # lull, under the background slot (never while a reply is in flight), from
+    # one pair at the re-scorer's full input length, and loads the reranker
+    # here, not on the reply path. Due once per chat activity marker while the
+    # need is flagged and no figure exists. After the re-measure, before the
+    # flush (so its samples are saved the same lull).
+    def _rerank_ram_figure_job() -> JobOutcome:
+        with cli_throttle.background_slot() as slot:
+            if not slot:
+                return JobOutcome.SKIPPED
+            with _tick_store() as store:
+                reranker.run_ram_figure(cli_throttle.chat_activity_marker(), store)
+        return JobOutcome.COMPLETED
+
+    jobs.append(
+        GatedJob(
+            "rerank_ram_figure",
+            run=_rerank_ram_figure_job,
+            has_work=lambda: reranker.ram_figure_due(cli_throttle.chat_activity_marker(), _tick_store),
+        )
+    )
+
     # 4d. cost-series flush — name-recall fix S146, S164. The measured timings
     # behind the per-message recall budget are only buffered in memory on the
     # reply path; this job saves them to memories.db at the next lull. Due

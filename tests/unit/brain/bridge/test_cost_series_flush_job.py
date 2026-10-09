@@ -45,9 +45,9 @@ def _buffer(persona_dir, n: int = 3) -> MemoryStore:
     return store
 
 
-def test_cs17b_the_flush_job_follows_the_remeasure_job_in_the_order() -> None:
+def test_cs17b_the_flush_job_follows_the_remeasure_and_ram_figure_jobs_in_the_order() -> None:
     i = GATED_JOB_ORDER.index("rerank_width_remeasure")
-    assert GATED_JOB_ORDER[i + 1] == "cost_series_flush"
+    assert GATED_JOB_ORDER[i + 1 : i + 3] == ("rerank_ram_figure", "cost_series_flush")
 
 
 def test_cs17b_due_iff_the_buffer_holds_samples_for_this_personas_database(tmp_path) -> None:

@@ -69,9 +69,11 @@ logger = logging.getLogger(__name__)
 # calibration and, after embedding backfill, the once-per-process cosine floor
 # bootstrap (name-recall fix S85; it needs the embedder, off the recall hot
 # path), then the stuck-width re-measure (S100: one timed rerank per lull
-# while the learned cost says fewer than 5 candidates fit), then the cost-series
+# while the learned cost says fewer than 5 candidates fit), then the RAM-figure
+# measurement (S200: one full-length pair when a turn found no saved RAM figure),
+# then the cost-series
 # flush (S146, S164: the buffered timing samples are saved to memories.db, after
-# the re-measure so its own sample is saved the same lull), then the recall
+# the re-measure and the RAM figure so their samples are saved the same lull), then the recall
 # diagnostics flush (S189: records buffered while the log's lock was held). Names are the job
 # table's keys and the log's `job=` values.
 GATED_JOB_ORDER: tuple[str, ...] = (
@@ -82,6 +84,7 @@ GATED_JOB_ORDER: tuple[str, ...] = (
     "cosine_floor_bootstrap",
     "rerank_floor_bootstrap",
     "rerank_width_remeasure",
+    "rerank_ram_figure",
     "cost_series_flush",
     "recall_diagnostics_flush",
     "maintenance",

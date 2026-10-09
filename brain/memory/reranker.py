@@ -922,11 +922,156 @@ def _ram_unseeded(model_id: str, estimate: RerankCostEstimate) -> bool:
     return _current_rss_bytes() is not None
 
 
+# ---------------------------------------------------------------------------
+# S200: no re-scoring until a RAM figure exists (fixes the S193 first-rerank
+# regression). On a machine with no saved RAM figure a recall turn takes the
+# plain meaning-match (cosine) path and only FLAGS the need; the figure is then
+# measured at the next chat lull (the `rerank_ram_figure` gated job: never while
+# a reply is in flight, never on the reply path) from ONE (query, document) pair
+# at the re-scorer's full input length, the worst case per pair. The first real
+# rerank is then sized from that figure by `fit_rerank_width`. The older width-5
+# seeds (S158, S171, S178, S180, S182) are left as they were built; with this gate
+# they are unreachable on Linux for a fresh process and still run where RSS is
+# unreadable and in the S182 re-seed (see the run's questions to Planning).
+# ---------------------------------------------------------------------------
+
+# Test seam: tests/conftest.py sets this False so the suite's recall tests keep
+# reranking without a seeded figure; the S200 tests set it True. Production: True.
+_require_ram_figure = True
+# Reranker model ids a turn found without a RAM figure (the job is due only for
+# these) and the chat-activity marker of each id's last attempt (once per lull).
+_ram_figure_needed: set[str] = set()
+_ram_figure_attempt: dict[str, object] = {}
+
+# The full-length pair is built from this sentence repeated. The text starts at
+# `_PAIR_TEXT_START_CHARS` and doubles up to `_PAIR_TEXT_DOUBLINGS` times until
+# the pair's surviving token count stops growing (the model's input limit
+# truncates it). Any plain-English text of a few thousand characters passes a
+# 1,024-token limit; the doubling is only the search for the limit, not a size.
+_PAIR_SENTENCE = "The quick brown fox jumps over the lazy dog while the river runs past the old stone bridge. "
+_PAIR_TEXT_START_CHARS = 4096
+_PAIR_TEXT_DOUBLINGS = 8
+
+
+def ram_figure_ready(model_id: str, store: MemoryStore) -> bool:
+    """S200: whether a rerank may run for `model_id`. True when RSS is unreadable
+    (no figure can exist there; the older seeds apply, a question to Planning),
+    when the 24-hour window holds a RAM figure above 0, or when this process holds
+    a kept figure above 0 (S180: set only by a RAM sample or by an estimate that
+    read a window figure). A rerank having been recorded is NOT a figure: a
+    measurement with no RAM growth records nothing (`measure_ram_figure`). A
+    failed database read is no figure (cosine path). Cheap: one read, no model."""
+    if not _require_ram_figure or _current_rss_bytes() is None:
+        return True
+    fit = _ram_cost.fit(store, model_id)
+    if fit is not None and fit.rate > 0.0:
+        return True
+    key = (cost_series._store_key(store), model_id)
+    with _cost_lock:
+        return _ram_kept.get(key, 0.0) > 0.0
+
+
+def note_ram_figure_needed(model_id: str) -> None:
+    """S200: a recall turn that would rerank found no RAM figure; flag it so the
+    next lull's `rerank_ram_figure` job measures one. Never loads anything."""
+    with _cost_lock:
+        _ram_figure_needed.add(model_id)
+
+
+def ram_figure_due(
+    activity_marker: object, store_factory: Callable[[], AbstractContextManager[MemoryStore]]
+) -> bool:
+    """Whether the `rerank_ram_figure` job is due (S200): a turn flagged the need
+    for the runtime reranker model id, no figure exists yet, and no attempt has run
+    at this chat activity marker (once per lull; no time constant). A flag whose
+    figure has since appeared is dropped here. In-memory checks first; the store is
+    opened only past them."""
+    model_id = resolve_reranker_model_id()
+    with _cost_lock:
+        if model_id not in _ram_figure_needed:
+            return False
+        stamp = _ram_figure_attempt.get(model_id, _NEVER)
+    if stamp is not _NEVER and stamp == activity_marker:
+        return False
+    with store_factory() as store:
+        if ram_figure_ready(model_id, store):
+            with _cost_lock:
+                _ram_figure_needed.discard(model_id)
+            return False
+    return True
+
+
+def _full_length_pair(provider: RerankerProvider) -> tuple[str, int] | None:
+    """A text whose (text, text) pair has the model's full input length, and that
+    length in tokens; `None` when the provider cannot count tokens or the count was
+    still growing at the last doubling (the pair would not be full length)."""
+    previous = 0
+    chars = _PAIR_TEXT_START_CHARS
+    for _ in range(_PAIR_TEXT_DOUBLINGS + 1):
+        text = (_PAIR_SENTENCE * (chars // len(_PAIR_SENTENCE) + 1))[:chars]
+        lengths = provider.pair_token_lengths(text, [text])
+        if lengths is None or len(lengths) != 1:
+            return None
+        if lengths[0] <= previous:
+            return text, lengths[0]
+        previous = lengths[0]
+        chars *= 2
+    return None
+
+
+def measure_ram_figure(provider: RerankerProvider, store: MemoryStore) -> bool:
+    """S200: measure the RAM figure from ONE pair at the re-scorer's full input
+    length. The two discarded warm-up reranks run first on short text (so the model
+    is loaded and warmed before the pair, and the pair is not itself the load). The
+    pair's seconds and RSS growth are read inside the provider's lock and recorded
+    like any recall rerank (`_record_rerank_cost`, x = the pair's tokens): a RAM
+    sample (the high water of a fresh process is 0, so it counts) and a time sample,
+    so `rerank_cost_estimate` exists afterwards and the first real rerank is sized
+    by `fit_rerank_width` under the RAM bound, not at the S5 width. Returns False and
+    records NOTHING when the pair cannot be built at full length or its RSS growth
+    is unreadable or not above 0 (not a figure; the job retries at a later lull).
+    Provider exceptions propagate."""
+    _warm_up_once(provider, "warm up", ["warm up"])
+    pair = _full_length_pair(provider)
+    if pair is None:
+        log.warning("reranker: RAM figure not measured: no full-length pair could be built")
+        return False
+    text, tokens = pair
+    _scores, seconds, rss_delta = provider.rerank_timed(text, [text])
+    if rss_delta is None or rss_delta <= 0.0:
+        log.warning("reranker: RAM figure not measured: the full-length pair showed no RSS growth")
+        return False
+    _record_rerank_cost(provider.model_id(), store, tokens, seconds, rss_delta)
+    log.info("reranker: RAM figure measured from one %d-token pair (%.0f MB growth)", tokens, rss_delta / 1e6)
+    return True
+
+
+def run_ram_figure(activity_marker: object, store: MemoryStore) -> bool:
+    """The `rerank_ram_figure` job's run (S200): stamp the attempt, then measure
+    the figure on the runtime reranker (building the provider here, at a lull, is
+    what keeps the model load off the reply path). Returns True iff a figure was
+    recorded. Provider exceptions propagate (the central pass logs them)."""
+    model_id = resolve_reranker_model_id()
+    with _cost_lock:
+        _ram_figure_attempt[model_id] = activity_marker
+    if ram_figure_ready(model_id, store):
+        with _cost_lock:
+            _ram_figure_needed.discard(model_id)
+        return False
+    measured = measure_ram_figure(build_reranker_provider(store=store), store)
+    if measured and ram_figure_ready(model_id, store):
+        with _cost_lock:
+            _ram_figure_needed.discard(model_id)
+    return measured
+
+
 def _reset_rerank_cost_model() -> None:
     """Test-only: forget every model id's RAM state, kept RAM figures, warm-up
     state, budget misses, re-measure markers and "too long" verdicts. The saved series lives
     in the database and the process buffer (`cost_series._reset_pending`)."""
     with _cost_lock:
+        _ram_figure_needed.clear()
+        _ram_figure_attempt.clear()
         _ram_state.clear()
         _ram_kept.clear()
         _warmed_model_ids.clear()

@@ -1415,7 +1415,16 @@ def search_paragraphs(
     # A reranker that cannot be built or warmed up fails once per message: the
     # remaining queries take the cosine path without retrying the load.
     reranker_down = False
-    if rerankable:
+    ram_model_id = reranker_mod.resolve_reranker_model_id()
+    if rerankable and not reranker_mod.ram_figure_ready(ram_model_id, store):
+        # S200: no saved RAM figure on this machine, so no re-scoring runs, and nothing
+        # of the reranker is built, loaded, warmed up or probed on this reply path. The
+        # need is flagged; the next lull measures the figure (`rerank_ram_figure`). Every
+        # query takes the plain meaning-match path (`max_real=0` below).
+        reranker_mod.note_ram_figure_needed(ram_model_id)
+        log.info("semantic recall: no RAM figure yet — cosine path for this message (S200)")
+        reranker_down = True
+    elif rerankable:
         try:
             reranker_provider = reranker_mod.build_reranker_provider(store=store)
             # The one-time warm-up (plan P-1) runs before the probes are
