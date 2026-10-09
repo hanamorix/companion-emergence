@@ -453,6 +453,7 @@ def test_s201_with_no_figure_and_a_registered_direct_chat_the_measurement_runs_o
     assert ran[0][1] == store.db_path, "on the persona's own database (a store of its own)"
     assert not floor_startup.inflight("ram-figure")
     assert reranker_mod.ram_figure_ready(_RERANKER_ID, store), "the figure exists afterwards"
+    assert floor_startup.start_requested_ram_figure() is None, "the request was consumed by the start"
 
 
 def test_s210_the_recall_only_records_the_need_and_a_second_flagged_turn_starts_nothing_either(
