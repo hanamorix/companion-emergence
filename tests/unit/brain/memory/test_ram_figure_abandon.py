@@ -483,6 +483,41 @@ def test_a_flagged_reply_after_the_pair_ran_unrecorded_is_not_due_and_opens_no_s
     assert reranker_mod.ram_figure_due("a-new-marker", _open) is True, "without the mark it is due"
 
 
+def test_the_loop_closes_the_store_it_opened_for_every_run_abandoned_or_not(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    closed: list[str] = []
+    real_close = MemoryStore.close
+
+    def _close(self):
+        closed.append(threading.current_thread().name)
+        return real_close(self)
+
+    monkeypatch.setattr(MemoryStore, "close", _close)
+    provider = _Scripted()
+    fired: list[int] = []
+
+    def _probe(n: int) -> None:
+        if not fired:
+            fired.append(n)
+            cli_throttle.note_user_message()
+
+    provider.on_probe = _probe
+    loop = _Loop(monkeypatch, tmp_path, provider)
+    closed.clear()
+    thread = loop.start()
+    try:
+        assert loop.entered[1].wait(_TIMEOUT)
+        cli_throttle.note_reply_end()
+        thread.join(_TIMEOUT)
+        assert not thread.is_alive()
+        own = [name for name in closed if name == "ram-figure-measure"]
+        # due-check store + run store for the abandoned pass, the same for the measuring pass
+        assert len(own) == 4, own
+    finally:
+        loop.finish(thread)
+
+
 def test_a_reply_in_flight_when_the_thread_starts_delays_everything_until_it_ends(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
