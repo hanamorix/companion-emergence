@@ -561,10 +561,9 @@ def _reset_reranker_provider_cache() -> None:
 # The time series and the RAM figure are rolling 24-hour windows saved in
 # memories.db (S146, S171; see `cost_series`); the high water and the warm-up
 # state stay process memory. The first measured recall rerank of a process per
-# model id is sized to the S5 minimum only on the first-ever startup on this
-# machine (no saved time estimate, or none with a RAM figure above 0 in its
-# 24-hour window: a figure whose samples have all aged out is no figure, S178)
-# where RSS is readable (S158, S171), because it measures the RAM growth. A process
+# model id waits for a RAM figure (S200, S203: the one full-length pair measured at a
+# lull; a figure whose samples have all aged out is no figure, S178), where RSS is
+# readable (S206: every platform, through psutil). A process
 # that has recorded a measured rerank keeps the last RAM figure it saw when that
 # figure's window empties (S180: it never reranks without a RAM bound, and a
 # plateaued process is exactly the one whose window empties, since a RAM sample
@@ -592,23 +591,20 @@ _WARMUP_RERANKS = 2
 
 
 def _current_rss_bytes() -> float | None:
-    """This process's current resident set size, in bytes, via
-    `/proc/self/status`'s `VmRSS` line — the same shape as `_detect_avx2`'s
-    `/proc` read (Linux-only; fail-soft to `None` on any read/parse error or
-    an unsupported platform, since there is no `/proc` on macOS/Windows).
-    Never raises. `None` makes the RAM term of the width fit skip (the width
-    is then time-bound only), never assume unlimited memory."""
-    if sys.platform != "linux":
-        return None
+    """This process's current resident set size, in bytes, read through `psutil`
+    (S206: one call that works on Linux, macOS and Windows, so the RAM bound and S200
+    apply on every platform). Never raises. Returns `None` when `psutil` cannot read it
+    (not importable, or the read fails): that is the safe fallback, stated: no RAM growth
+    can be measured, so `ram_figure_ready` is True (S200's gate does not hold turns back),
+    the RAM term of the width fit is skipped and the width is time-bound only, the first
+    rerank sized at the S5 minimum; it is never read as unlimited memory. The failure is
+    warned once per process."""
     try:
-        with open("/proc/self/status", encoding="utf-8") as f:
-            for line in f:
-                if line.startswith("VmRSS:"):
-                    # e.g. "VmRSS:\t   12345 kB\n" -> kB -> bytes.
-                    return float(line.split()[1]) * 1024.0
-        return None
-    except Exception:  # noqa: BLE001 — fail-soft: an RSS probe must never break a recall
-        log.exception("reranker: RSS read failed — the rerank's RAM measurement will be skipped")
+        import psutil
+
+        return float(psutil.Process().memory_info().rss)
+    except Exception:  # noqa: BLE001 - fail-soft: an RSS probe must never break a recall
+        _warn_ram_figure_once("the process RSS could not be read (psutil)")
         return None
 
 
@@ -726,15 +722,12 @@ _cost_update_hook: Callable[[], None] | None = None
 
 
 def _note_ram_figure(key: tuple[str, str], ram_fit: cost_series.RangedFit | None) -> None:
-    """S180: remember the RAM figure the window answers (a rate above 0 replaces the
-    kept one, a rate of 0 is no figure and forgets it); a window that answers nothing
-    leaves the kept figure as it is. Caller holds `_cost_lock`."""
-    if ram_fit is None:
-        return
-    if ram_fit.rate > 0.0:
+    """S180, S204: remember the RAM figure the window answers. Only a rate above 0 is a
+    figure and replaces the kept one; a window that answers nothing, or only zero-growth
+    samples (S204: no positive sample counts as empty), leaves the kept figure as it is.
+    Caller holds `_cost_lock`."""
+    if ram_fit is not None and ram_fit.rate > 0.0:
         _ram_kept[key] = ram_fit.rate
-    else:
-        _ram_kept.pop(key, None)
 
 
 def rerank_cost_estimate(model_id: str, store: MemoryStore) -> RerankCostEstimate | None:
@@ -746,15 +739,14 @@ def rerank_cost_estimate(model_id: str, store: MemoryStore) -> RerankCostEstimat
     `_record_rerank_cost` buffers a sample before it publishes the new high
     water, so a reader that sees the new high water also sees its sample.
 
-    S180: the RAM figure is the window's while the window answers (a rate above
-    0 is also remembered as this process's last figure; a rate of 0 is no figure
-    and forgets it). When the window is empty and this process has recorded a
-    measured rerank for `model_id`, it is the last figure an earlier call of
+    S180, S204: the RAM figure is the window's while the window holds a positive
+    sample (a rate above 0, also remembered as this process's last figure; a window
+    with no positive sample counts as empty and forgets nothing). When the window is
+    empty and this process has recorded a measured rerank for `model_id`, it is the last figure an earlier call of
     this process saw (`ram_figure_kept`): a running process never reranks
     without a RAM bound. A process that has not measured (a fresh one) has no
-    kept figure to use, so its first measured rerank is the width-5 seed (S178; on Linux
-    a fresh process with no figure never reaches it, S200: the `search_paragraphs` gate
-    keeps it on the cosine path until the lull job has measured one)."""
+    kept figure to use, so it has no figure and takes the cosine path until the one-pair
+    measurement has made one (S200, S203: `search_paragraphs` and `rerank_for_recall`)."""
     fit = _rerank_cost.fit(store, model_id)
     if fit is None:
         return None
@@ -762,11 +754,13 @@ def rerank_cost_estimate(model_id: str, store: MemoryStore) -> RerankCostEstimat
         ram = _ram_state.get(model_id, _RamState())
     ram_fit = _ram_cost.fit(store, model_id)
     key = (cost_series._store_key(store), model_id)
-    rate: float | None = None if ram_fit is None else ram_fit.rate
+    # S204: a window with no positive sample (empty, or only zero-growth samples) is empty.
+    positive = ram_fit is not None and ram_fit.rate > 0.0
+    rate: float | None = ram_fit.rate if ram_fit is not None and positive else None
     kept = False
     with _cost_lock:
         _note_ram_figure(key, ram_fit)
-        if ram_fit is None and model_id in _ram_state and key in _ram_kept:
+        if not positive and model_id in _ram_state and key in _ram_kept:
             rate, kept = _ram_kept[key], True
     return RerankCostEstimate(
         overhead_seconds=fit.overhead,
@@ -901,32 +895,6 @@ def _too_long_remembered(model_id: str, store: MemoryStore) -> bool:
     return False
 
 
-def _ram_unseeded(model_id: str, estimate: RerankCostEstimate) -> bool:
-    """S158/S171 (S200: on Linux a fresh process with no figure never reaches the
-    rerank any more, the gate in `search_paragraphs` keeps it on the cosine path until
-    the lull job has measured one; this remains for a figure that ages out between the
-    gate and the rerank): this process has not yet recorded a measured rerank for
-    `model_id`, RSS is readable (Linux) and no RAM figure greater than 0 is saved
-    for this model id on this machine, so its first measured recall rerank must run
-    at the S5 minimum to measure RAM growth, whatever the saved time estimate says.
-    "Saved" means a sample in the 24-hour window (S178): a figure whose samples
-    have all aged out is no figure, so a too-high one is re-seeded here instead of
-    staying for good. With a figure (a restart soon after the first-ever startup
-    on this host) it is False: the first rerank is sized by the estimate. A process
-    that has already recorded a rerank is never unseeded (its RAM window can empty
-    while it runs; then it keeps the last figure it saw, `ram_figure_kept`, S180, and
-    the re-measure job re-seeds it at a lull if it blocks a batch). A process that
-    has not recorded a rerank never uses a kept figure, so its estimate is the
-    window's alone."""
-    with _cost_lock:
-        if model_id in _ram_state:
-            return False
-    figure = estimate.ram_bytes_per_token
-    if figure is not None and figure > 0.0:
-        return False
-    return _current_rss_bytes() is not None
-
-
 # ---------------------------------------------------------------------------
 # S200: no re-scoring until a RAM figure exists (fixes the S193 first-rerank
 # regression). On a machine with no saved RAM figure a recall turn takes the
@@ -934,10 +902,11 @@ def _ram_unseeded(model_id: str, estimate: RerankCostEstimate) -> bool:
 # measured at the next chat lull (the `rerank_ram_figure` gated job: never while
 # a reply is in flight, never on the reply path) from ONE (query, document) pair
 # at the re-scorer's full input length, the worst case per pair. The first real
-# rerank is then sized from that figure by `fit_rerank_width`. The older width-5
-# seeds (S158, S171, S178, S180, S182) are left as they were built; with this gate
-# they are unreachable on Linux for a fresh process and still run where RSS is
-# unreadable and in the S182 re-seed (see the run's questions to Planning).
+# rerank is then sized from that figure by `fit_rerank_width`. S203 retired the width-5
+# seeds of S158/S178/S180 (their trigger, a process about to rerank with no figure, now
+# takes the cosine path and flags the need). The S182 re-seed in `remeasure_stuck_width`
+# is still the stored miss's width-5 batch: its one-pair replacement cannot record a
+# sample once the process high water is past the pair (see the run's questions).
 # ---------------------------------------------------------------------------
 
 # Test seam: tests/conftest.py sets this False so the suite's recall tests keep
@@ -971,7 +940,8 @@ def _warn_ram_figure_once(reason: str) -> None:
 
 def ram_figure_ready(model_id: str, store: MemoryStore) -> bool:
     """S200: whether a rerank may run for `model_id`. True when RSS is unreadable
-    (no figure can exist there; the older seeds apply, a question to Planning),
+    (psutil could not read it, S206: no figure can be measured, so the turn is not held back
+    and the width is time-bound only),
     when the 24-hour window holds a RAM figure above 0, or when this process has
     recorded a measured rerank AND holds a kept figure above 0 (S180: the figure its
     own sample or an estimate read from the window). A rerank having been recorded is NOT a figure: a
@@ -985,9 +955,9 @@ def ram_figure_ready(model_id: str, store: MemoryStore) -> bool:
     key = (cost_series._store_key(store), model_id)
     with _cost_lock:
         # The kept figure serves only a process that has recorded a measured rerank
-        # (S180: `rerank_cost_estimate` and `_ram_unseeded` use it on that condition
-        # only); a kept figure alone would open this gate for a rerank that is then
-        # sized as unseeded, the S193 shape.
+        # (S180: `rerank_cost_estimate` uses it on that condition only); a kept
+        # figure alone would open this gate for a rerank that is then sized without a bound,
+        # the S193 shape.
         return model_id in _ram_state and _ram_kept.get(key, 0.0) > 0.0
 
 
@@ -1757,6 +1727,16 @@ def rerank_for_recall(
             "reranker.latency_budget_seconds", LATENCY_BUDGET_SECONDS
         )
     model_id = provider.model_id()
+    if not ram_figure_ready(model_id, store):
+        # S203 (the S158/S178 trigger, a process about to rerank with no RAM figure): no
+        # width-5 seeding batch any more. `search_paragraphs` holds such a turn back before it
+        # builds the reranker (S200); this is the same rule for a figure that aged out between
+        # that check and here. Nothing is warmed up or ranked; the need is flagged and the
+        # one-pair measurement (S200) makes the figure.
+        note_ram_figure_needed(model_id)
+        return RecallRerank(
+            width=0, reranked=False, hand_off="ram_figure", normalization=None, measured=False
+        )
     # Warm up before the length probe: on the real provider the first rerank
     # loads the ONNX session, and with it the tokenizer the probe uses.
     _warm_up_once(provider, query, pool)
@@ -1780,12 +1760,6 @@ def rerank_for_recall(
         )
     candidate_tokens, anchor_tokens = lengths[: len(pool)], lengths[len(pool) :]
     estimate = rerank_cost_estimate(model_id, store)
-    if estimate is not None and _ram_unseeded(model_id, estimate):
-        # S158/S171: a saved time estimate without a saved RAM figure would size
-        # this process's first measured rerank past the S5 minimum, but that
-        # rerank measures the RAM growth the width fit's RAM bound needs; it runs
-        # at 5 (where RSS is readable).
-        estimate = None
     headroom = _available_ram_headroom_bytes() if estimate is not None else None
     width = fit_rerank_width(candidate_tokens, anchor_tokens, estimate, budget_seconds, headroom, cap)
 

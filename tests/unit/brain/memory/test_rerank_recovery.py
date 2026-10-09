@@ -484,7 +484,7 @@ def test_s180_k2b_a_kept_figure_that_blocks_nothing_does_not_trigger_the_job(
     assert _remeasure(2.0) is False and provider.calls == []
 
 
-def test_s180_k2d_a_re_seed_that_measures_no_growth_leaves_no_figure_and_is_not_repeated(
+def test_s204_a_re_seed_that_measures_no_growth_keeps_the_last_figure_and_the_lull_tries_again(
     clock: _Clock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     provider, wall, _peak = _running_with_a_too_high_figure(clock, monkeypatch, per_token=0.0)
@@ -492,10 +492,15 @@ def test_s180_k2d_a_re_seed_that_measures_no_growth_leaves_no_figure_and_is_not_
     assert _message(provider, docs=_docs(50, _BIG)).hand_off == "budget"
     assert _due(1.0) and _remeasure(1.0)
     est = rerank_cost_estimate(_MODEL)
-    assert est.ram_bytes_per_token == 0.0 and est.ram_figure_kept is False
-    assert reranker_mod._ram_kept == {}, "a window rate of 0 forgets the stale figure"
+    assert est.ram_figure_kept is True and est.ram_bytes_per_token == pytest.approx(1.0e4), (
+        "S204: a window with only a zero-growth sample is empty; the last positive figure stays"
+    )
+    assert list(reranker_mod._ram_kept.values()) == [pytest.approx(1.0e4)]
     provider.calls.clear()
-    assert _message(provider, docs=_docs(50, _BIG)).reranked, "no figure to block it any more"
+    assert _message(provider, docs=_docs(50, _BIG)).reranked, (
+        "the re-measure batch raised the high water, so the kept figure no longer blocks that size"
+    )
+    assert rerank_cost_estimate(_MODEL).ram_figure_kept is True, "and the kept figure is still the last positive one"
     assert _due(2.0) is False and _MODEL not in reranker_mod._budget_misses
 
 
