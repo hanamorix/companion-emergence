@@ -29,6 +29,7 @@ import json
 import logging
 import threading
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -55,7 +56,13 @@ _lock = threading.Lock()
 # exceed any finite lull.
 _last_message_mono: float = float("-inf")
 _inflight_replies: int = 0
+# S218: replies STARTED in this process (monotone; `reset()` leaves it alone, so a snapshot
+# compared by equality can never be confused by a reset). A reply that starts and ends
+# between two looks is invisible to `_inflight_replies` and visible here.
+_replies_started: int = 0
 _inflight_background = 0
+# S218: signalled by `note_reply_end` (built on `_lock`, so waiting and the counters share it).
+_reply_ended = threading.Condition(_lock)
 
 # Rate-limited error logging state for is_chat_idle (S63; r2 m1 fix: bounded
 # volume under a persistent fault). Guarded by _lock alongside the state above.
@@ -85,6 +92,7 @@ def reset() -> None:  # test helper
         _err_last_key = None
         _err_last_logged_mono = float("-inf")
         _err_suppressed_count = 0
+        _reply_ended.notify_all()
 
 
 def mark_interactive_active(at: float | None = None) -> None:
@@ -104,10 +112,11 @@ def mark_interactive_active(at: float | None = None) -> None:
 def note_user_message(at: float | None = None) -> None:
     """Call at the start of a chat turn: stamps activity and marks a reply
     in flight (is_chat_idle is False until the matching note_reply_end)."""
-    global _last_message_mono, _inflight_replies
+    global _last_message_mono, _inflight_replies, _replies_started
     with _lock:
         _last_message_mono = time.monotonic() if at is None else at
         _inflight_replies += 1
+        _replies_started += 1
 
 
 def note_reply_end(at: float | None = None) -> None:
@@ -118,6 +127,37 @@ def note_reply_end(at: float | None = None) -> None:
     with _lock:
         _last_message_mono = time.monotonic() if at is None else at
         _inflight_replies = max(0, _inflight_replies - 1)
+        _reply_ended.notify_all()
+
+
+def reply_watch() -> Callable[[], bool]:
+    """S218: a snapshot of the reply activity, as a callable `still_clear()`.
+
+    `still_clear()` is True while no reply was in flight when the snapshot was taken AND no
+    reply has started since (a reply that started after the snapshot counts even if it has
+    already ended: its allocations may be inside whatever was measured meanwhile). If a reply
+    was in flight at the snapshot, it is False from the start, even after that reply ends.
+    The one-pair RAM measurement of `nell chat --no-bridge` abandons its sample when this
+    turns False (the process-wide RSS reading would be inflated by the reply)."""
+    with _lock:
+        started = _replies_started
+        idle = _inflight_replies == 0
+
+    def still_clear() -> bool:
+        if not idle:
+            return False
+        with _lock:
+            return _replies_started == started
+
+    return still_clear
+
+
+def wait_for_no_reply_in_flight() -> None:
+    """S218: return at once when no reply is in flight, else block until the last one ends
+    (`note_reply_end`, which `respond()` calls in a `finally`). No timeout and no polling
+    interval. For a background thread; never call it on the reply path."""
+    with _reply_ended:
+        _reply_ended.wait_for(lambda: _inflight_replies == 0)
 
 
 def reply_in_flight() -> bool:
