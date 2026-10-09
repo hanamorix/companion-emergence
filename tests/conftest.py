@@ -310,8 +310,9 @@ def _fake_reranker_provider_by_default(
 @pytest.fixture(autouse=True)
 def _reset_reranker_provider_cache() -> Iterator[None]:
     """Reset reranker.build_reranker_provider()'s process-level provider
-    cache, its warm-latency cache, its warm-memory cache (pre-flip revision
-    Change 3 — mirrors the warm-latency cache, same rationale), and
+    cache, the per-message width fit's rerank cost model (running sums and
+    warm-up state per reranker model id; name-recall fix R1, plan P-24 —
+    replaces the removed hourly warm-latency / warm-memory caches), and
     floor_calibration's bootstrap-floor cache (F2a inc8, #250 §7 UPDATED)
     before and after each test — mirrors `_reset_embedding_provider_cache`
     above for the same reason (a test that calls the REAL `build_reranker_
@@ -321,14 +322,101 @@ def _reset_reranker_provider_cache() -> Iterator[None]:
     from brain.memory import floor_calibration, reranker
 
     reranker._reset_reranker_provider_cache()
-    reranker._reset_latency_cache()
-    reranker._reset_memory_cache()
+    reranker._reset_rerank_cost_model()
     floor_calibration._reset_bootstrap_floor_cache()
+    floor_calibration._reset_cosine_bootstrap_floor_cache()
     yield
     reranker._reset_reranker_provider_cache()
-    reranker._reset_latency_cache()
-    reranker._reset_memory_cache()
+    reranker._reset_rerank_cost_model()
     floor_calibration._reset_bootstrap_floor_cache()
+    floor_calibration._reset_cosine_bootstrap_floor_cache()
+
+
+@pytest.fixture(autouse=True)
+def _paragraph_time_model_reset(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Name-recall fix R6 (plan P-24): reset the per-message budget's running
+    averages (`T_m`, `T_p`) before and after each test, and freeze the budget
+    clock (`semantic_recall._clock`) at 0 so every test sees `T_m = T_p = 0`
+    and the whole rerank budget, exactly as before R6, unless it scripts the
+    clock itself (the per-paragraph budget tests do)."""
+    from brain.memory import semantic_recall
+
+    semantic_recall._reset_paragraph_time_model()
+    monkeypatch.setattr(semantic_recall, "_clock", lambda: 0.0)
+    yield
+    semantic_recall._reset_paragraph_time_model()
+
+
+@pytest.fixture(autouse=True)
+def _floor_bootstrap_background_off_by_default(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[None]:
+    """Keep the floor bootstraps' background starters (name-recall fix S91/S92:
+    the first-need rerank request and the on-each-message retry) from spawning
+    threads in unrelated tests: a recall without a rerank floor or a `respond()`
+    after a failed bootstrap would otherwise leak a daemon thread that computes
+    (and caches) a floor after this test's teardown reset. The bookkeeping
+    (need flag, failed record) still happens; tests of the starters themselves
+    flip `floor_startup._background_inhibited` back. Also clears the in-flight
+    slots before and after each test."""
+    from brain.memory import floor_startup
+
+    monkeypatch.setattr(floor_startup, "_background_inhibited", True)
+    monkeypatch.setattr(floor_startup, "_marker_provider", floor_startup._no_marker)  # noqa: SLF001
+    floor_startup._inflight.clear()  # noqa: SLF001
+    yield
+    floor_startup._inflight.clear()  # noqa: SLF001
+
+
+@pytest.fixture(autouse=True)
+def _cosine_floor_never_clears_by_default(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default the COSINE bootstrap floor (name-recall fix R2, plan P-24) to a
+    value no cosine similarity can reach, mirroring
+    `_fake_reranker_provider_by_default`'s "unscripted scores never clear the
+    floor" default.
+
+    With the no-rerank path, a test whose store has fewer than 5 embedded
+    candidates (or a reranker that fails) now reaches the cosine gate instead
+    of returning `None`. Left to the real bootstrap, the offline fake
+    embedder's arbitrary cosines would fit an arbitrary floor and some
+    candidates could clear it by accident; pinning the floor above 1.0 keeps
+    every such test on its old keyword-only outcome. A test that wants the
+    cosine path to pass either persists a row (`store.write_cosine_floor`) or
+    monkeypatches `floor_calibration.get_cosine_bootstrap_floor` itself; a
+    test of the real bootstrap calls the function object it imported at
+    module load (this patch replaces only the module attribute).
+    """
+    if "requires_network" in request.keywords:
+        return
+    from brain.memory import floor_calibration
+
+    monkeypatch.setattr(
+        floor_calibration,
+        "get_cosine_bootstrap_floor",
+        lambda embedder_model_id: {
+            "embedder_model_id": embedder_model_id,
+            "floor": 2.0,
+            "raw_fit_floor": 2.0,
+            "sample_pairs": 0,
+            "is_cold_start": True,
+            "updated_at": None,
+        },
+    )
+
+
+@pytest.fixture(autouse=True)
+def _reset_known_names_cache() -> Iterator[None]:
+    """Drop brain.memory.known_names's process-level per-path list cache before
+    and after each test (name-recall fix N1, P-24): a test that reads the list
+    through the cache must not see one a prior/later test cached, and a stale
+    entry could otherwise survive a tmp_path reuse of the same signature."""
+    from brain.memory import known_names
+
+    known_names._reset_cache()
+    yield
+    known_names._reset_cache()
 
 
 @pytest.fixture(autouse=True)

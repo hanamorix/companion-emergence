@@ -12,7 +12,7 @@ Master ref §6 SP-3.
 """
 
 from brain.tools.dispatch import ToolDispatchError, dispatch
-from brain.tools.schemas import LOVE_TYPES, SCHEMAS
+from brain.tools.schemas import ADD_NAME_TOOL_NAME, LOVE_TYPES, SCHEMAS
 
 # Canonical tool list, in the order the LLM should see them.
 # Ported verbatim from OG NELL_TOOLS (nell_bridge.py:172-185).
@@ -26,6 +26,7 @@ NELL_TOOL_NAMES: tuple[str, ...] = (
     "read_full_memory",
     "add_journal",
     "add_memory",
+    ADD_NAME_TOOL_NAME,
     "crystallize_soul",
     "save_work",
     "list_works",

@@ -83,6 +83,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -113,6 +114,10 @@ logger = logging.getLogger(__name__)
 # a vector (a put). At swap time a tombstone deletes the id from the freshly
 # loaded dict so a concurrent evict is never undone by the rebuild.
 _TOMBSTONE = object()
+
+# Test-only seam (CONC-6): called inside `EmbeddingMatrix.stacked()` while a
+# new stacked matrix is being built under the lock. Always `None` in production.
+_stack_hook: Callable[[], None] | None = None
 
 
 class EmbeddingMatrix:
@@ -147,6 +152,12 @@ class EmbeddingMatrix:
         # `np.stack`. None means "no dimension established yet" — an empty
         # matrix accepts any dim for its first vector.
         self._expected_dim: int | None = None
+        # Name-recall fix R6 (plan P-23): the row-normalized stacked matrix the
+        # per-paragraph cosine scan multiplies against, built lazily by
+        # `stacked()` under `_lock` and dropped (set to None) under the same
+        # lock by every mutation of `_vectors` (put, evict, a build's swap), so
+        # a reader never gets a stale one after a mutation has returned.
+        self._stacked: tuple[tuple[str, ...], np.ndarray] | None = None
 
     # -- lifecycle -----------------------------------------------------
 
@@ -212,6 +223,7 @@ class EmbeddingMatrix:
                 else:
                     loaded[mem_id] = entry  # type: ignore[assignment]
             self._vectors = loaded
+            self._stacked = None
             self._built = True
             if model_id is not None:
                 self.model_id = model_id
@@ -317,6 +329,38 @@ class EmbeddingMatrix:
         with self._lock:
             return dict(self._vectors)
 
+    def stacked(self) -> tuple[tuple[str, ...], np.ndarray]:
+        """`(ids, unit)`: every held id, and a read-only float32 matrix whose
+        row `i` is `ids[i]`'s vector scaled to unit length (a zero vector stays
+        zero), so one matrix product with a unit query vector gives every
+        row's cosine similarity (name-recall fix R6, plan P-23: one product per
+        query instead of a per-row loop, and no restack per message).
+
+        Built lazily under the matrix's lock and cached until the next `put`,
+        `evict` or build swap drops it (under the same lock), so the next
+        reader after a mutation always rebuilds from the mutated `_vectors`.
+        A reader holding a previously returned pair keeps a consistent,
+        immutable snapshot: the arrays are never modified in place (CONC-6).
+        Building costs one copy of the held vectors (the cache doubles the
+        matrix's memory). Raises `ValueError` if held vectors disagree in
+        dimension (callers fail soft, as a per-row scan over them would).
+        """
+        self.ensure_built()
+        with self._lock:
+            if self._stacked is None:
+                ids = tuple(self._vectors)
+                if ids:
+                    unit = np.stack([self._vectors[mid] for mid in ids]).astype(np.float32)
+                    norms = np.linalg.norm(unit, axis=1, keepdims=True)
+                    np.divide(unit, norms, out=unit, where=norms > 0)
+                else:
+                    unit = np.zeros((0, 0), dtype=np.float32)
+                if _stack_hook is not None:
+                    _stack_hook()
+                unit.setflags(write=False)
+                self._stacked = (ids, unit)
+            return self._stacked
+
     def __len__(self) -> int:
         self.ensure_built()
         with self._lock:
@@ -377,6 +421,7 @@ class EmbeddingMatrix:
             if self._expected_dim is None:
                 self._expected_dim = vec.shape[0]
             self._vectors[memory_id] = vec
+            self._stacked = None
             if self._build_depth > 0:
                 self._pending[memory_id] = vec
 
@@ -391,6 +436,7 @@ class EmbeddingMatrix:
         fix)."""
         with self._lock:
             self._vectors.pop(memory_id, None)
+            self._stacked = None
             if self._build_depth > 0:
                 self._pending[memory_id] = _TOMBSTONE
 

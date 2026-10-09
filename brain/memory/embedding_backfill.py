@@ -44,12 +44,13 @@ RUNTIME-DERIVED BATCH SIZE (replaces the old hardcoded `DEFAULT_BATCH_SIZE =
 25`): the number of real embed computations one tick performs self-derives
 from a measured WARM per-embed time on the actual host vs a time budget
 (`floor(batch_budget_seconds / per_embed_seconds)`) — see `_get_batch_size`
-below, which mirrors ``brain/memory/reranker.py``'s auto-scaling rerank
-width. Measured ONCE per process (per model_id) and cached for the process
-lifetime — no periodic recompute (approved F1 spec §3/S10): unlike rerank
-width, hardware doesn't meaningfully drift mid-process here, and this tick
-runs unattended on the supervisor thread where a recompute would just be
-extra embed-provider calls for no real gain.
+below. Measured ONCE per process (per model_id) and cached for the
+process lifetime — no periodic recompute (approved F1 spec §3/S10):
+hardware doesn't meaningfully drift mid-process here, and this tick runs
+unattended on the supervisor thread where a recompute would just be extra
+embed-provider calls for no real gain. (The reranker's hourly width
+measurement this once mirrored was replaced by the name-recall fix's
+per-message width, which fits each message from a running cost model.)
 
 IDLE-GATED: this module's own ``run_embedding_backfill_tick`` does NOT gate
 itself — the supervisor call site (``brain/bridge/supervisor.py``) wraps the
@@ -280,9 +281,10 @@ def _get_batch_size(provider, scan_cap: int) -> int:  # noqa: ANN001
     must not serialize concurrent callers behind it) and caches with
     first-writer-wins (`setdefault`) so a measurement race between two
     threads on the very first call never lets a later, possibly-noisier
-    measurement overwrite an already-cached figure. Mirrors
-    reranker.py's `_warm_per_doc_latency`, minus its periodic-recompute
-    machinery — see module docstring for why this measures only once.
+    measurement overwrite an already-cached figure. Measured once per
+    process with no periodic recompute (see module docstring for why). It
+    once mirrored reranker.py's hourly `_warm_per_doc_latency`, which the
+    name-recall fix's per-message width (R1) removed.
 
     `scan_cap` is folded into the cached figure via `_derive_batch_size`'s
     upper clamp: in production `run_embedding_backfill_tick` is always

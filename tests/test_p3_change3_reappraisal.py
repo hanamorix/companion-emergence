@@ -15,7 +15,7 @@ import pytest
 
 from brain.chat import prompt as prompt_mod
 from brain.chat.prompt import _build_recall_block
-from brain.engines.consolidation import run_consolidation
+from brain.engines.consolidation import Reappraisal, run_consolidation
 from brain.memory.pending import PendingQueue
 from brain.memory.store import Memory, MemoryStore
 
@@ -42,8 +42,8 @@ def test_c3_1_reappraise_updates_existing_row_no_new_row(tmp_path):
 
     known_value = 7.25
 
-    def _fake_reappraiser(m: Memory) -> float:
-        return known_value
+    def _fake_reappraiser(m: Memory) -> Reappraisal:
+        return Reappraisal(known_value)
 
     result = run_consolidation(
         store, persona_dir=tmp_path,
@@ -89,11 +89,11 @@ def test_c3_2_row_deleted_mid_window_no_resurrection_no_crash(tmp_path):
     before_count = store.count(active_only=False)
     PendingQueue(tmp_path).enqueue_reappraisal(mem.id, source="recall")
 
-    def _deleting_reappraiser(m: Memory) -> float:
+    def _deleting_reappraiser(m: Memory) -> Reappraisal:
         # Fires strictly between the handler's store.get (already returned
         # `m`) and its store.update — the HARDER window (finding #3).
         store.hard_delete(m.id)
-        return 9.9
+        return Reappraisal(9.9)
 
     result = run_consolidation(
         store, persona_dir=tmp_path,
@@ -112,7 +112,7 @@ def test_c3_2_row_already_missing_at_read_is_skipped(tmp_path):
     store = MemoryStore(tmp_path / "memories.db")
     PendingQueue(tmp_path).enqueue_reappraisal("nonexistent-id", source="recall")
 
-    def _fake_reappraiser(m: Memory) -> float:
+    def _fake_reappraiser(m: Memory) -> Reappraisal:
         raise AssertionError("reappraiser must never be called for a missing row")
 
     result = run_consolidation(

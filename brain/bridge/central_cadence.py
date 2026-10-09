@@ -17,6 +17,11 @@ deploy recalibration immediately before daily calibration (S70/S73).
 
 Cadence rules (interval jobs, owned here):
 
+* A predicate job's own condition holds (the two floor-bootstrap RETRY jobs,
+  name-recall fix S85 revised, S91/S92: no calibrated row, no cached
+  bootstrap, the floor was needed or its last attempt failed, chat has
+  happened since the failed attempt, and no bootstrap of that floor in
+  flight), like deploy recalibration.
 * A missing OR corrupt cadence file is created as "last ran now"
   (``next_at = now + interval``) and the job does not run on that pass
   (S22/S69). A present file with a past ``next_at`` is simply overdue (S34),
@@ -59,12 +64,16 @@ from brain.bridge import background_jobs, cli_throttle, persisted_cadence
 logger = logging.getLogger(__name__)
 
 # S55 order, with deploy recalibration (S70/S73) immediately before daily
-# calibration. Names are the job table's keys and the log's `job=` values.
+# calibration and, after embedding backfill, the once-per-process cosine floor
+# bootstrap (name-recall fix S85; it needs the embedder, off the recall hot
+# path). Names are the job table's keys and the log's `job=` values.
 GATED_JOB_ORDER: tuple[str, ...] = (
     "pass2",
     "session_snapshot_prune",
     "emotion_backfill",
     "embedding_backfill",
+    "cosine_floor_bootstrap",
+    "rerank_floor_bootstrap",
     "maintenance",
     "interest_sweep",
     "self_model_articulation",
@@ -168,7 +177,7 @@ def run_central_pass(
 
     def _decide(job: str, action: str) -> None:
         decisions.append(JobDecision(job, action))
-        # skip-not-due fires for most jobs on most passes (14 lines a minute
+        # skip-not-due fires for most jobs on most passes (16 lines a minute
         # while idle); keep it out of the INFO log. Every other decision is INFO.
         level = logging.DEBUG if action == "skip-not-due" else logging.INFO
         logger.log(level, "central cadence: job=%s action=%s", job, action)
