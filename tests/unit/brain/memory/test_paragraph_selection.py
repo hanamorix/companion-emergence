@@ -78,7 +78,22 @@ def test_a_long_text_over_a_saturating_probe_is_cut_in_few_probes() -> None:
     text = "lorem ipsum dolor " * 700  # 12,600 characters
     cut = sr._cut_to_tokens(probe, text, 512, 511)
     assert cut is not None and cut.tokens <= 511 and len(cut.text) <= 511 * 4 + 3
+    assert len(cut.text) >= 511 * 4 - 8, "the longest fitting prefix, not some shorter one"
     assert len(probe.probed) <= 16
+
+
+def test_a_message_that_starts_with_blank_space_is_still_cut_to_the_longest_fitting_prefix() -> None:
+    """The prefix of the first few characters is empty (only whitespace): it counts as
+    fitting and the search goes on to the right (a wrong branch would stop at None or
+    search the left half)."""
+    probe = _Probe()
+    text = " " * 200 + "alpha beta gamma delta epsilon"
+    assert sr._word_prefix(text, 111) == "", "the first probe lands in the blank run"
+    cut = sr._cut_to_tokens(probe, text, len(text), 210)
+    longest = max(
+        (p for n in range(1, len(text) + 1) if len(p := sr._word_prefix(text, n)) <= 210), key=len
+    )
+    assert cut is not None and cut.text == longest and len(cut.text) <= 210
 
 
 @pytest.mark.parametrize("cap", [0, -3])
