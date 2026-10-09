@@ -373,6 +373,7 @@ def _floor_bootstrap_background_off_by_default(
 
     monkeypatch.setattr(floor_startup, "_background_inhibited", True)
     monkeypatch.setattr(floor_startup, "_marker_provider", floor_startup._no_marker)  # noqa: SLF001
+    monkeypatch.setattr(floor_startup, "_ram_figure_persona_dir", None)  # noqa: SLF001
     floor_startup._inflight.clear()  # noqa: SLF001
     yield
     floor_startup._inflight.clear()  # noqa: SLF001

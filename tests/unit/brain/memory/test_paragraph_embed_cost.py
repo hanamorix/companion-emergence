@@ -637,3 +637,66 @@ def test_f2_a_broken_load_warns_once_then_logs_at_debug(monkeypatch, tmp_path: P
             run_semantic_recall(store, tmp_path, "kite over the harbour")
     failures = [r for r in caplog.records if "load/warm-up failed" in r.getMessage()]
     assert [r.levelno for r in failures] == [logging.WARNING, logging.DEBUG, logging.DEBUG]
+
+
+# ---------------------------------------------------------------------------
+# S202: a single paragraph too long to embed in the time left is cut like the whole message
+# ---------------------------------------------------------------------------
+
+_ONE_PARAGRAPH = ("lorem ipsum " * 200)[:1000]  # no line break: one paragraph; 1 token per character here
+
+
+def test_s202_a_single_paragraph_that_does_not_fit_is_cut_to_the_longest_prefix_that_does(
+    monkeypatch, tmp_path: Path
+) -> None:
+    clock = _clocked(monkeypatch)
+    _set_budget(monkeypatch, 1.0)
+    embedder = _CostEmbedder(clock)
+    store = _store(monkeypatch, tmp_path, embedder)
+    _warm_embed_fit(store)
+    sr._message_overhead.record(store, "", 1, 0.0)
+    assert _O + _R * len(_ONE_PARAGRAPH) > 1.0, "embedding all of it would not fit (not vacuous)"
+
+    result = run_semantic_recall(store, tmp_path, _ONE_PARAGRAPH)
+
+    assert result is not None
+    (batch,) = embedder.batches
+    assert len(batch) == 1 and _ONE_PARAGRAPH.startswith(batch[0]) and batch[0] != _ONE_PARAGRAPH
+    cap = int((1.0 - _O) / _R)  # independent: 450 tokens fit the 1.0 s budget after the 0.1 s overhead
+    assert cap - 8 <= len(batch[0]) <= cap, "the longest word-boundary prefix within the cap"
+    assert _O + _R * len(batch[0]) <= 1.0 + 1e-9
+
+
+def test_s202_a_single_paragraph_that_fits_is_embedded_whole(monkeypatch, tmp_path: Path) -> None:
+    clock = _clocked(monkeypatch)
+    _set_budget(monkeypatch, 4.0)
+    embedder = _CostEmbedder(clock)
+    store = _store(monkeypatch, tmp_path, embedder)
+    _warm_embed_fit(store)
+    sr._message_overhead.record(store, "", 1, 0.0)
+    run_semantic_recall(store, tmp_path, _ONE_PARAGRAPH)
+    assert embedder.batches == [[_ONE_PARAGRAPH]]
+
+
+def test_s202_with_no_embed_fit_yet_a_single_paragraph_is_embedded_whole_as_built(
+    monkeypatch, tmp_path: Path
+) -> None:
+    clock = _clocked(monkeypatch)
+    _set_budget(monkeypatch, 1.0)
+    embedder = _CostEmbedder(clock)
+    store = _store(monkeypatch, tmp_path, embedder)  # no embed samples: the first message of a process
+    run_semantic_recall(store, tmp_path, _ONE_PARAGRAPH)
+    assert embedder.batches == [[_ONE_PARAGRAPH]]
+
+
+def test_s202_when_nothing_fits_the_single_paragraph_is_embedded_as_it_is(monkeypatch, tmp_path: Path) -> None:
+    """S61: the budget cannot hold even the embed's fixed cost: no cut can help, so the paragraph is what a
+    one-paragraph message has always been."""
+    clock = _clocked(monkeypatch)
+    _set_budget(monkeypatch, 0.05)
+    embedder = _CostEmbedder(clock)
+    store = _store(monkeypatch, tmp_path, embedder)
+    _warm_embed_fit(store)
+    sr._message_overhead.record(store, "", 1, 0.0)
+    run_semantic_recall(store, tmp_path, _ONE_PARAGRAPH)
+    assert embedder.batches == [[_ONE_PARAGRAPH]]

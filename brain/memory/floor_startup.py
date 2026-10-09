@@ -23,6 +23,9 @@ computed while a reply is being built: `MemoryStore.get_cosine_floor` /
   cadence jobs `cosine_floor_bootstrap` / `rerank_floor_bootstrap` at the next
   lull (due again only after chat activity since the failure). No time
   constants;
+* RAM FIGURE (S201): `nell chat --no-bridge` has no lull cadence, so a turn that would rerank
+  with no RAM figure flags the need and `request_ram_figure` measures it (the one full-length
+  pair, S200) on a daemon thread, off the reply path; the bridge relies on its lull job;
 * never more than ONE bootstrap in flight per floor: every start (startup
   thread, first-need request, message retry, cadence job) goes through
   `try_begin(kind)` / `end(kind)`.
@@ -303,6 +306,58 @@ def request_rerank_bootstrap() -> threading.Thread | None:
         )
     except Exception:  # noqa: BLE001
         logger.exception("floor_startup: could not request the rerank bootstrap")
+        return None
+
+
+# S201: `nell chat --no-bridge` has no lull cadence, so it measures the RAM figure itself on first
+# need. The direct chat registers its persona dir here; the bridge never does (its lull job,
+# `rerank_ram_figure`, measures the figure). None = no background measurement in this process.
+_ram_figure_persona_dir: Path | None = None
+
+
+def enable_background_ram_figure(persona_dir: Path | None) -> None:
+    """Register (or, with `None`, clear) the persona dir whose store the background RAM-figure
+    measurement (`request_ram_figure`) opens. Called by `nell chat --no-bridge` at session start."""
+    global _ram_figure_persona_dir
+    _ram_figure_persona_dir = None if persona_dir is None else Path(persona_dir)
+
+
+def _ram_figure_body(persona_dir: Path) -> None:
+    """The background measurement: the lull job's own functions (`ram_figure_due`, once per chat
+    activity marker, then `run_ram_figure`: the one full-length pair, S200), on this thread, with
+    a store of its own that it closes. Provider exceptions are logged by `_spawn`."""
+    import contextlib
+
+    from brain.memory import reranker as reranker_mod
+    from brain.memory.store import MemoryStore
+
+    @contextlib.contextmanager
+    def _store():
+        store = MemoryStore(Path(persona_dir) / "memories.db", integrity_check=False)
+        try:
+            yield store
+        finally:
+            store.close()
+
+    marker = _current_marker()
+    if not reranker_mod.ram_figure_due(marker, _store):
+        return
+    with _store() as store:
+        reranker_mod.run_ram_figure(marker, store)
+
+
+def request_ram_figure() -> threading.Thread | None:
+    """First-need request (S201, S91 pattern): a turn that would rerank found no RAM figure.
+    When the direct chat has registered its persona dir, start the one-pair measurement (S200) on a
+    daemon thread, one at a time, and return immediately (never on the reply path). Returns the
+    thread started, or `None` (not registered, already in flight, or inhibited). Never raises."""
+    persona_dir = _ram_figure_persona_dir
+    if persona_dir is None:
+        return None
+    try:
+        return _spawn("ram-figure", lambda: _ram_figure_body(persona_dir), name="ram-figure-measure")
+    except Exception:  # noqa: BLE001
+        logger.exception("floor_startup: could not request the RAM-figure measurement")
         return None
 
 

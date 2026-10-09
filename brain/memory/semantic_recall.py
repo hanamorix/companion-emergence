@@ -1438,9 +1438,34 @@ def search_paragraphs(
         # S195: the alternate paragraphs 1, 3, 5, ... (of the paragraphs that
         # survived the empty-keyword drop).
         alternates = paragraphs[::2]
+
+        def embed_token_cap(whole_text: str) -> int:
+            """S195/S202: the largest token count whose predicted single-text embed fits the
+            budget after the setup and one query's scan (the S108 embed cost model); 0 when
+            nothing fits or there is no embed fit."""
+            fit = _embed_cost.fit(store, embedder_model_id)
+            room = budget - overhead - (scan_time or 0.0)
+            if fit is None or room < fit.overhead:
+                return 0
+            if fit.rate <= 0.0:
+                return tokens_of[whole_text]
+            return int((room - fit.overhead) / fit.rate)
+
         if count == 1:
             queries = list(paragraphs)
-            searched = embed_and_cut(queries)
+            # S202: a single paragraph too long to embed in the time left is cut like the
+            # whole-message fallback (S195). Without an embed fit or a scan time (the first
+            # message) or when nothing fits, it is embedded as it is (S61, as built).
+            one_cut: tuple[str, float] | None = None
+            if tokens_of is not None and scan_time is not None:
+                predicted = predicted_embed(paragraphs)
+                if predicted is not None and overhead + predicted + scan_time > budget:
+                    one_cut = cut_query(paragraphs[0], embed_token_cap(paragraphs[0]))
+            if one_cut is None:
+                searched = embed_and_cut(queries)
+            else:
+                queries = [one_cut[0]]
+                searched = [(c, part + one_cut[1]) for c, part in embed_and_cut(queries)]
         elif tokens_of is None:
             # Token counts unknown (round-3 N3-3: checked before the
             # first-message rule): no prediction can be made, one query.
@@ -1465,15 +1490,7 @@ def search_paragraphs(
                     # after the setup and one query's scan. Nothing fits: the
                     # first paragraph alone (what a one-paragraph message does,
                     # S61).
-                    fit = _embed_cost.fit(store, embedder_model_id)
-                    room = budget - overhead - scan_time
-                    if fit is None or room < fit.overhead:
-                        cap = 0
-                    elif fit.rate <= 0.0:
-                        cap = tokens_of[text]
-                    else:
-                        cap = int((room - fit.overhead) / fit.rate)
-                    cut = cut_query(text, cap)
+                    cut = cut_query(text, embed_token_cap(text))
                     if cut is None:
                         queries = [paragraphs[0]]
                         searched = embed_and_cut(queries)
@@ -1554,6 +1571,7 @@ def search_paragraphs(
         # need is flagged; the next lull measures the figure (`rerank_ram_figure`). Every
         # query takes the plain meaning-match path (`max_real=0` below).
         reranker_mod.note_ram_figure_needed(ram_model_id)
+        floor_startup.request_ram_figure()  # S201: the direct chat measures it in the background
         log.info("semantic recall: no RAM figure yet — cosine path for this message (S200)")
         reranker_down = True
     elif rerankable:

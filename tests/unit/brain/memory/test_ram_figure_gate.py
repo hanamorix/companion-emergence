@@ -346,3 +346,162 @@ def test_a_provider_failure_in_the_job_run_propagates_for_the_central_pass_to_lo
     with pytest.raises(RuntimeError):
         reranker_mod.run_ram_figure("m1", store)
     assert reranker_mod._ram_figure_needed == {_RERANKER_ID}
+
+
+# ---------------------------------------------------------------------------
+# S201: `nell chat --no-bridge` measures the figure itself, in the background
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _background_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    from brain.memory import floor_startup
+
+    monkeypatch.setattr(floor_startup, "_background_inhibited", False)
+
+
+def _store_factory(store: MemoryStore):
+    @contextmanager
+    def _factory() -> Iterator[MemoryStore]:
+        yield store
+
+    return _factory
+
+
+def test_s201_with_no_figure_and_a_registered_direct_chat_the_measurement_runs_on_a_background_thread(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _background_on: None
+) -> None:
+    import threading
+
+    from brain.memory import floor_startup
+
+    store, _memories = _recall_setup(monkeypatch, tmp_path)
+    floor_startup.enable_background_ram_figure(tmp_path)
+    ran: list[tuple[str, object]] = []
+    gate = threading.Event()
+
+    def _run(marker, st):
+        ran.append((threading.current_thread().name, st.db_path))
+        gate.wait(10)
+        reranker_mod._record_rerank_cost(_RERANKER_ID, st, _FULL, 2.0, 245e6)
+        return True
+
+    monkeypatch.setattr(reranker_mod, "run_ram_figure", _run)
+
+    result = run_semantic_recall(store, tmp_path, _QUERY)
+
+    assert result is not None and result.path == COSINE_PATH, "the flagged turn takes the cosine path"
+    assert floor_startup.inflight("ram-figure"), "the measurement is in flight in the background"
+    again = run_semantic_recall(store, tmp_path, _QUERY)
+    assert again is not None and again.path == COSINE_PATH, "and the next turn is not held up by it"
+    gate.set()
+    for t in threading.enumerate():
+        if t.name == "ram-figure-measure":
+            t.join(timeout=10)
+    assert [name for name, _ in ran] == ["ram-figure-measure"], "one thread, not the calling one"
+    assert ran[0][1] == store.db_path, "on the persona's own database (a store of its own)"
+    assert not floor_startup.inflight("ram-figure")
+    assert reranker_mod.ram_figure_ready(_RERANKER_ID, store), "the figure exists afterwards"
+
+
+def test_s201_without_a_registered_direct_chat_no_thread_starts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _background_on: None
+) -> None:
+    """The bridge never registers: its lull job (`rerank_ram_figure`) measures the figure."""
+    from brain.memory import floor_startup
+
+    store, _memories = _recall_setup(monkeypatch, tmp_path)
+    assert floor_startup._ram_figure_persona_dir is None  # noqa: SLF001
+    monkeypatch.setattr(reranker_mod, "run_ram_figure", lambda *a: pytest.fail("no background measurement"))
+    result = run_semantic_recall(store, tmp_path, _QUERY)
+    assert result is not None and result.path == COSINE_PATH
+    assert not floor_startup.inflight("ram-figure")
+    assert floor_startup.request_ram_figure() is None
+
+
+def test_s201_with_a_saved_figure_nothing_is_requested(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _background_on: None
+) -> None:
+    from brain.memory import floor_startup
+
+    store, _memories = _recall_setup(monkeypatch, tmp_path)
+    reranker_mod._ram_cost.record(store, _RERANKER_ID, _FULL, _FULL * 250_000.0)
+    floor_startup.enable_background_ram_figure(tmp_path)
+    monkeypatch.setattr(floor_startup, "request_ram_figure", lambda: pytest.fail("a figure exists"))
+    monkeypatch.setattr(reranker_mod, "build_reranker_provider", lambda **k: _CappedReranker())
+    run_semantic_recall(store, tmp_path, _QUERY)
+    assert reranker_mod._ram_figure_needed == set()
+
+
+def test_s201_the_body_measures_once_per_activity_marker_with_a_store_of_its_own(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from brain.memory import floor_startup
+
+    store, _memories = _recall_setup(monkeypatch, tmp_path)
+    store.close()
+    reranker_mod.note_ram_figure_needed(_RERANKER_ID)
+    monkeypatch.setattr(floor_startup, "_marker_provider", lambda: "m1")
+    monkeypatch.setattr(reranker_mod, "build_reranker_provider", lambda **k: _CappedReranker())
+    reranker_mod._warmed_model_ids.add(_RERANKER_ID)
+    floor_startup._ram_figure_body(tmp_path)  # noqa: SLF001
+    assert reranker_mod._ram_figure_attempt[_RERANKER_ID] == "m1"
+    reranker_mod._ram_figure_needed.add(_RERANKER_ID)  # flagged again, same marker: not due
+    monkeypatch.setattr(reranker_mod, "run_ram_figure", lambda *a: pytest.fail("once per marker"))
+    floor_startup._ram_figure_body(tmp_path)  # noqa: SLF001
+
+
+def test_s201_a_failing_measurement_is_logged_not_raised_and_frees_the_slot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _background_on: None
+) -> None:
+    from brain.memory import floor_startup
+
+    store, _memories = _recall_setup(monkeypatch, tmp_path)
+    store.close()
+    floor_startup.enable_background_ram_figure(tmp_path)
+    reranker_mod.note_ram_figure_needed(_RERANKER_ID)
+
+    def _boom(*a, **k):
+        raise RuntimeError("the model would not load")
+
+    monkeypatch.setattr(reranker_mod, "run_ram_figure", _boom)
+    thread = floor_startup.request_ram_figure()
+    assert thread is not None
+    thread.join(timeout=10)
+    assert not floor_startup.inflight("ram-figure")
+
+
+def test_s201_only_the_interactive_session_registers_the_background_measurement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from brain import cli
+    from brain.memory import floor_startup
+
+    monkeypatch.setattr(floor_startup, "compute_missing_floors", lambda *a, **k: None)
+    monkeypatch.setattr(floor_startup, "start_background", lambda *a, **k: None)
+    cli._start_floor_bootstrap_for_direct_chat(tmp_path, blocking=False)  # noqa: SLF001
+    assert floor_startup._ram_figure_persona_dir == tmp_path  # noqa: SLF001
+    cli._start_floor_bootstrap_for_direct_chat(tmp_path, blocking=True)  # noqa: SLF001
+    assert floor_startup._ram_figure_persona_dir is None, "the one-shot form's thread would be cut off"  # noqa: SLF001
+
+
+def test_s206_the_rss_is_read_through_psutil_and_an_unreadable_one_is_none_with_one_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import psutil
+
+    monkeypatch.undo()  # the autouse gate fixture patched the reader: use the real one
+    value = reranker_mod._current_rss_bytes()  # noqa: SLF001
+    assert value is not None and value > 1e6
+    assert value == pytest.approx(psutil.Process().memory_info().rss, rel=0.5)
+
+    def _fail(self):
+        raise psutil.AccessDenied()
+
+    monkeypatch.setattr(psutil.Process, "memory_info", _fail)
+    reranker_mod._ram_figure_warned.clear()  # noqa: SLF001
+    with caplog.at_level("DEBUG"):
+        assert reranker_mod._current_rss_bytes() is None  # noqa: SLF001
+        assert reranker_mod._current_rss_bytes() is None  # noqa: SLF001
+    warns = [r for r in caplog.records if r.levelname == "WARNING" and "RSS could not be read" in r.getMessage()]
+    assert len(warns) == 1, "warned once per process"
