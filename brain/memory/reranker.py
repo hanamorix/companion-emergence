@@ -752,7 +752,9 @@ def rerank_cost_estimate(model_id: str, store: MemoryStore) -> RerankCostEstimat
     measured rerank for `model_id`, it is the last figure an earlier call of
     this process saw (`ram_figure_kept`): a running process never reranks
     without a RAM bound. A process that has not measured (a fresh one) has no
-    kept figure to use, so its first measured rerank is the width-5 seed (S178)."""
+    kept figure to use, so its first measured rerank is the width-5 seed (S178; on Linux
+    a fresh process with no figure never reaches it, S200: the `search_paragraphs` gate
+    keeps it on the cosine path until the lull job has measured one)."""
     fit = _rerank_cost.fit(store, model_id)
     if fit is None:
         return None
@@ -956,6 +958,17 @@ _PAIR_TEXT_START_CHARS = 4096
 _PAIR_TEXT_DOUBLINGS = 8
 
 
+_ram_figure_warned: set[str] = set()
+
+
+def _warn_ram_figure_once(reason: str) -> None:
+    """The lull job can reach the same refusal at every lull: warn once per reason
+    per process, then debug."""
+    first = reason not in _ram_figure_warned
+    _ram_figure_warned.add(reason)
+    (log.warning if first else log.debug)("reranker: RAM figure not measured: %s", reason)
+
+
 def ram_figure_ready(model_id: str, store: MemoryStore) -> bool:
     """S200: whether a rerank may run for `model_id`. True when RSS is unreadable
     (no figure can exist there; the older seeds apply, a question to Planning),
@@ -1037,7 +1050,10 @@ def measure_ram_figure(provider: RerankerProvider, store: MemoryStore) -> bool:
     by `fit_rerank_width` under the RAM bound, not at the S5 width. Returns False and
     records NOTHING when the pair cannot be built at full length, when this process has
     already run a batch this large (no growth can show), or when its RSS growth is
-    unreadable or not above 0 (not a figure; the job retries at a later lull). Returns
+    unreadable or not above 0 (not a figure; the job retries at a later lull, except in the
+    high-water case, which only a restart clears: a process whose RAM window later answers
+    0 after a positive figure aged out has no figure and, by S200, no re-scoring until one
+    exists; a question to Planning). Returns
     True only when the window then holds a RAM figure above 0. Like the first-ever seed
     it runs without a memory-headroom check: one pair, about 250 MB (S200, S184).
     Provider exceptions propagate."""
@@ -1045,7 +1061,7 @@ def measure_ram_figure(provider: RerankerProvider, store: MemoryStore) -> bool:
     model_id = provider.model_id()
     pair = _full_length_pair(provider)
     if pair is None:
-        log.warning("reranker: RAM figure not measured: no full-length pair could be built")
+        _warn_ram_figure_once("no full-length pair could be built")
         return False
     text, tokens = pair
     with _cost_lock:
@@ -1054,11 +1070,11 @@ def measure_ram_figure(provider: RerankerProvider, store: MemoryStore) -> bool:
         # This process already ran a batch this large, so a pair of this size cannot grow
         # RSS past the high water any more and no RAM sample can be taken here (a figure
         # needs a fresh process). Running the pair would only cost a full-length rerank.
-        log.warning("reranker: RAM figure not measured: this process has already run a batch this large")
+        _warn_ram_figure_once("this process has already run a batch this large")
         return False
     _scores, seconds, rss_delta = provider.rerank_timed(text, [text])
     if rss_delta is None or rss_delta <= 0.0:
-        log.warning("reranker: RAM figure not measured: the full-length pair showed no RSS growth")
+        _warn_ram_figure_once("the full-length pair showed no RSS growth")
         return False
     _record_rerank_cost(model_id, store, tokens, seconds, rss_delta)
     fit = _ram_cost.fit(store, model_id)
@@ -1098,6 +1114,7 @@ def _reset_rerank_cost_model() -> None:
     with _cost_lock:
         _ram_figure_needed.clear()
         _ram_figure_attempt.clear()
+        _ram_figure_warned.clear()
         _ram_state.clear()
         _ram_kept.clear()
         _warmed_model_ids.clear()

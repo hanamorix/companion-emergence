@@ -604,6 +604,66 @@ def test_a_first_message_whose_alternate_paragraphs_fit_searches_paragraphs_one_
     assert result.whole_message_fallback is False
 
 
+def test_a_first_message_whose_rest_fits_is_scored_as_two_paragraphs_each_reranked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """S63/S199: the first paragraph is long (16 x 8 characters, 1.5 s), the rest is
+    short and fits what the first paragraph's seconds per character leave of the
+    budget uncut, and its embed is quick: the two are scored as two paragraphs, each
+    reranked against its own text with its own anchors, from equal shares."""
+    clock = _Clock()
+    monkeypatch.setattr(sr, "_clock", clock)
+    _budget(monkeypatch, 2.9)  # 3 x 1.5 s and 2 x 1.5 s do not fit
+    long_first = "alpha kite notes " * 8
+    rest_text = "beta heron\ngamma tit"
+    message = f"{long_first.strip()}\n{rest_text}"
+    embedder = _AxisEmbedder({long_first.strip(): 0}, clock, 0.0)
+    store = MemoryStore(tmp_path / "memories.db")
+    first = [_mem(store, f"s63 first memory {i}", {0: 0.9 - 0.01 * i, _OTHER: 0.3}) for i in range(6)]
+    rest = [_mem(store, f"s63 rest memory {i}", {_OTHER: 0.9 - 0.01 * i, 0: 0.3}) for i in range(6)]
+    rec = _Reranker({m.content: 5.0 for m in [*first, *rest]})
+    _install(monkeypatch, embedder, rec)
+    _rerank_floor(store, 1.0)
+    _cosine_floor(store, 0.1)
+    _warm(store)
+    seconds = {long_first.strip(): 1.5, rest_text: 0.05}
+
+    def embed_batch(texts):
+        embedder.batches.append(list(texts))
+        clock.advance(sum(seconds.get(t, 0.0) for t in texts))
+        return [embedder.embed(t) for t in texts]
+
+    monkeypatch.setattr(embedder, "embed_batch", embed_batch)
+    calls = _spy_rank_and_gate(monkeypatch)
+
+    result = run_semantic_recall(store, tmp_path, message)
+
+    assert embedder.batches == [[long_first.strip()], [rest_text]]
+    assert result is not None
+    assert [o.query for o in result.paragraphs] == [long_first.strip(), rest_text]
+    assert result.whole_message_fallback is False
+    by_query = {c["query"]: c for c in calls}
+    assert by_query[long_first.strip()]["budget_seconds"] == pytest.approx(
+        by_query[rest_text]["budget_seconds"]
+    )
+    assert by_query[long_first.strip()]["budget_seconds"] > 0
+    scored = rec.scored()
+    assert [q for q, _ in scored] == [long_first.strip(), rest_text], "one rerank per query"
+    for _, docs in scored:
+        assert set(docs) & set(ANCHOR_POOL), "each rerank carries its own anchors"
+
+
+def test_two_paragraphs_that_do_not_both_fit_search_only_the_first_warm_and_first_ever(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """S195 literal reading with two paragraphs: the alternates are [paragraph 1],
+    so paragraph 2 is searched only when both fit."""
+    store, embedder = _warm_decision_case(monkeypatch, tmp_path, scan=2.0, overhead=0.0, budget=3.5)
+    result = run_semantic_recall(store, tmp_path, f"{_P1}\n{_P2}")
+    assert embedder.batches == [[_P1]]
+    assert result is not None and [o.query for o in result.paragraphs] == [_P1]
+
+
 def test_a_first_message_where_not_even_a_token_of_the_rest_fits_searches_the_first_paragraph_only(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

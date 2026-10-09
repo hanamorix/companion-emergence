@@ -1207,7 +1207,7 @@ class _Cut:
     probe_seconds: float
 
 
-_TRAILING_PARTIAL_WORD = re.compile(r"\s\S*$")
+_TRAILING_PARTIAL_WORD = re.compile(r"\s\S*\Z")
 
 
 def _word_prefix(text: str, chars: int) -> str:
@@ -1225,10 +1225,11 @@ def _word_prefix(text: str, chars: int) -> str:
 def _cut_to_tokens(
     embedder: embeddings_mod.EmbeddingProvider, text: str, total_tokens: int, cap_tokens: int
 ) -> _Cut | None:
-    """`text` as it is when it fits `cap_tokens`, else its longest prefix that does
+    """`text` as it is when it fits `cap_tokens`, else a prefix of it that does
     (S195, S199): a first guess by proportion of characters, then shorter prefixes
     (each strictly shorter, scaled by the token overshoot) until the embedder's own
-    token probe counts at most `cap_tokens`. The prefix ends at a word boundary
+    token probe counts at most `cap_tokens`. It never grows a prefix back, so with an
+    uneven token density it can leave some of the budget unused. The prefix ends at a word boundary
     where it can (`_word_prefix`). `None` when nothing fits or the probe cannot
     size a prefix. Every probe's seconds are summed (they are scan-side time)."""
     if total_tokens <= cap_tokens:

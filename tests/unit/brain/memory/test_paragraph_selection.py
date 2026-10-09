@@ -39,6 +39,11 @@ def test_the_cut_is_a_word_boundary_prefix_within_the_cap() -> None:
     assert text.startswith(cut.text)
 
 
+def test_a_prefix_ending_right_after_a_newline_keeps_the_whole_word_before_it() -> None:
+    assert sr._word_prefix("abc def\nghi", 8) == "abc def"
+    assert sr._word_prefix("abc def\nghi", 9) == "abc def"
+
+
 def test_a_text_without_a_boundary_is_cut_by_characters() -> None:
     probe = _Probe()
     text = "x" * 100

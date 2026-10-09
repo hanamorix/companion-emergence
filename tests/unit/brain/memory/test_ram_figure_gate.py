@@ -108,6 +108,24 @@ def test_with_no_figure_a_turn_takes_the_cosine_path_and_touches_nothing_of_the_
     assert reranker_mod._ram_figure_needed == {_RERANKER_ID}
 
 
+def test_a_turn_with_fewer_than_five_candidates_flags_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The need is flagged only by a turn that would rerank (5 or more candidates):
+    a small pool never asks for the reranker, so it never asks for a figure."""
+    embedder = _AxisEmbedder({_QUERY: 0})
+    store = _store(tmp_path)
+    for i in range(3):
+        _mem(store, f"s200 small pool {i}", {0: 0.9 - 0.01 * i})
+    _install(monkeypatch, embedder)
+    _cosine_floor(store, 0.1)
+
+    result = run_semantic_recall(store, tmp_path, _QUERY)
+
+    assert result is not None and result.path == COSINE_PATH
+    assert reranker_mod._ram_figure_needed == set()
+
+
 def test_the_same_turn_reranks_once_a_window_figure_exists(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
