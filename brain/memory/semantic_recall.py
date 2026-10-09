@@ -1571,7 +1571,7 @@ def search_paragraphs(
         # need is flagged; the next lull measures the figure (`rerank_ram_figure`). Every
         # query takes the plain meaning-match path (`max_real=0` below).
         reranker_mod.note_ram_figure_needed(ram_model_id)
-        floor_startup.request_ram_figure()  # S201: the direct chat measures it in the background
+        floor_startup.request_ram_figure()  # S201/S210: the direct chat measures it after this reply
         log.info("semantic recall: no RAM figure yet — cosine path for this message (S200)")
         reranker_down = True
     elif rerankable:

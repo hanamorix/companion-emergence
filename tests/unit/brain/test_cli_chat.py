@@ -131,6 +131,23 @@ def test_chat_repl_produces_response_for_one_turn(capsys: pytest.CaptureFixture)
     assert "FAKE_CHAT" in captured.out
 
 
+def test_chat_repl_starts_a_requested_ram_measurement_only_after_the_reply_is_printed(
+    capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S210: the one-pair RAM measurement a flagged turn asked for starts after that reply is
+    finished and printed, never while it is being built."""
+    from brain.memory import floor_startup
+
+    seen: list[str] = []
+    monkeypatch.setattr(
+        floor_startup, "start_requested_ram_figure", lambda: seen.append(capsys.readouterr().out)
+    )
+    with patch("builtins.input", side_effect=["hello there", "exit"]):
+        assert main(["chat", "--persona", "nell", "--no-bridge"]) == 0
+    assert len(seen) == 1, "once per reply"
+    assert "FAKE_CHAT" in seen[0], "the reply was already printed when the hook ran"
+
+
 # ── Missing persona dir ───────────────────────────────────────────────────────
 
 

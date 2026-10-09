@@ -2020,6 +2020,7 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
     from brain.chat.engine import respond
     from brain.chat.session import create_session
     from brain.ingest.pipeline import close_session, extract_session_snapshot
+    from brain.memory import floor_startup
 
     # #203: default exit is a NON-destructive snapshot (matches the GUI, which
     # only ever calls /sessions/snapshot). close_session deletes the buffer,
@@ -2113,6 +2114,9 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
                     print(result.content)
                     print()
                     total_tool_calls += len(result.tool_invocations)
+                    # S210: the reply is finished and printed; only now may the one-pair RAM
+                    # measurement a flagged turn asked for start (never while she is replying).
+                    floor_startup.start_requested_ram_figure()
             finally:
                 # Flush conversation through ingest pipeline (best-effort)
                 try:

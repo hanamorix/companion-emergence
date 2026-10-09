@@ -23,9 +23,11 @@ computed while a reply is being built: `MemoryStore.get_cosine_floor` /
   cadence jobs `cosine_floor_bootstrap` / `rerank_floor_bootstrap` at the next
   lull (due again only after chat activity since the failure). No time
   constants;
-* RAM FIGURE (S201): `nell chat --no-bridge` has no lull cadence, so a turn that would rerank
-  with no RAM figure flags the need and `request_ram_figure` measures it (the one full-length
-  pair, S200) on a daemon thread, off the reply path; the bridge relies on its lull job;
+* RAM FIGURE (S201, S210): `nell chat --no-bridge` has no lull cadence, so a turn that would rerank
+  with no RAM figure flags the need (`request_ram_figure` records it) and the REPL, once that reply
+  is finished, calls `start_requested_ram_figure`, which measures the figure (the one full-length
+  pair, S200) on a daemon thread; never while the flagged reply is being built. The bridge relies
+  on its lull job;
 * never more than ONE bootstrap in flight per floor: every start (startup
   thread, first-need request, message retry, cadence job) goes through
   `try_begin(kind)` / `end(kind)`.
@@ -313,13 +315,20 @@ def request_rerank_bootstrap() -> threading.Thread | None:
 # need. The direct chat registers its persona dir here; the bridge never does (its lull job,
 # `rerank_ram_figure`, measures the figure). None = no background measurement in this process.
 _ram_figure_persona_dir: Path | None = None
+# S210: the flagged reply only RECORDS the need here; the measurement starts after that reply has
+# finished (`start_requested_ram_figure`), never while it is being built.
+_ram_figure_requested = False
+_ram_figure_request_lock = threading.Lock()
 
 
 def enable_background_ram_figure(persona_dir: Path | None) -> None:
     """Register (or, with `None`, clear) the persona dir whose store the background RAM-figure
-    measurement (`request_ram_figure`) opens. Called by `nell chat --no-bridge` at session start."""
-    global _ram_figure_persona_dir
-    _ram_figure_persona_dir = None if persona_dir is None else Path(persona_dir)
+    measurement (`start_requested_ram_figure`) opens, and forget any recorded need. Called by
+    `nell chat --no-bridge` at session start."""
+    global _ram_figure_persona_dir, _ram_figure_requested
+    with _ram_figure_request_lock:
+        _ram_figure_persona_dir = None if persona_dir is None else Path(persona_dir)
+        _ram_figure_requested = False
 
 
 def _ram_figure_body(persona_dir: Path) -> None:
@@ -346,18 +355,36 @@ def _ram_figure_body(persona_dir: Path) -> None:
         reranker_mod.run_ram_figure(marker, store)
 
 
-def request_ram_figure() -> threading.Thread | None:
-    """First-need request (S201, S91 pattern): a turn that would rerank found no RAM figure.
-    When the direct chat has registered its persona dir, start the one-pair measurement (S200) on a
-    daemon thread, one at a time, and return immediately (never on the reply path). Returns the
-    thread started, or `None` (not registered, already in flight, or inhibited). Never raises."""
-    persona_dir = _ram_figure_persona_dir
-    if persona_dir is None:
-        return None
+def request_ram_figure() -> bool:
+    """First-need request (S201, S210): a turn that would rerank found no RAM figure. When the
+    direct chat has registered its persona dir, record the need and return True; start NOTHING
+    (S210: the measurement must not run while the reply that flagged it is being built; the REPL
+    calls `start_requested_ram_figure` once that reply is finished). Returns False when no persona
+    dir is registered (the bridge, the one-shot form). Never raises."""
+    global _ram_figure_requested
+    with _ram_figure_request_lock:
+        if _ram_figure_persona_dir is None:
+            return False
+        _ram_figure_requested = True
+        return True
+
+
+def start_requested_ram_figure() -> threading.Thread | None:
+    """S210: called by the direct chat's REPL right after a reply has been returned. When a turn
+    recorded the need (`request_ram_figure`), consume it and start the one-pair measurement (S200)
+    on a daemon thread, one at a time (S91 pattern), returning immediately. Returns the thread
+    started, or `None` (nothing recorded, not registered, already in flight, or inhibited). Never
+    raises."""
+    global _ram_figure_requested
+    with _ram_figure_request_lock:
+        persona_dir = _ram_figure_persona_dir
+        if persona_dir is None or not _ram_figure_requested:
+            return None
+        _ram_figure_requested = False
     try:
         return _spawn("ram-figure", lambda: _ram_figure_body(persona_dir), name="ram-figure-measure")
     except Exception:  # noqa: BLE001
-        logger.exception("floor_startup: could not request the RAM-figure measurement")
+        logger.exception("floor_startup: could not start the RAM-figure measurement")
         return None
 
 
