@@ -1197,6 +1197,61 @@ def _unit_rows(vectors: list[np.ndarray]) -> np.ndarray:
     return queries
 
 
+@dataclass(frozen=True)
+class _Cut:
+    """A message cut to a prefix that fits (S195, S199): its text, the token count
+    the embedder's own probe gave it, and the seconds the probes took."""
+
+    text: str
+    tokens: int
+    probe_seconds: float
+
+
+_TRAILING_PARTIAL_WORD = re.compile(r"\s\S*$")
+
+
+def _word_prefix(text: str, chars: int) -> str:
+    """The first `chars` characters of `text`, ending at a word boundary when the
+    cut falls inside a word and the prefix holds a boundary; a plain character
+    prefix otherwise (one long word, text without whitespace)."""
+    head = text[:chars]
+    if chars < len(text) and not text[chars].isspace():
+        boundary = _TRAILING_PARTIAL_WORD.search(head)
+        if boundary is not None and boundary.start() > 0:
+            head = head[: boundary.start()]
+    return head.rstrip()
+
+
+def _cut_to_tokens(
+    embedder: embeddings_mod.EmbeddingProvider, text: str, total_tokens: int, cap_tokens: int
+) -> _Cut | None:
+    """`text` as it is when it fits `cap_tokens`, else its longest prefix that does
+    (S195, S199): a first guess by proportion of characters, then shorter prefixes
+    (each strictly shorter, scaled by the token overshoot) until the embedder's own
+    token probe counts at most `cap_tokens`. The prefix ends at a word boundary
+    where it can (`_word_prefix`). `None` when nothing fits or the probe cannot
+    size a prefix. Every probe's seconds are summed (they are scan-side time)."""
+    if total_tokens <= cap_tokens:
+        return _Cut(text, total_tokens, 0.0)
+    if cap_tokens < 1 or total_tokens < 1:
+        return None
+    seconds = 0.0
+    chars = min(len(text), int(len(text) * cap_tokens / total_tokens))
+    while chars > 0:
+        prefix = _word_prefix(text, chars)
+        if prefix:
+            lengths, took = _timed_probe(embedder, [prefix])
+            seconds += took
+            if lengths is None or len(lengths) != 1:
+                return None
+            if lengths[0] <= cap_tokens:
+                return _Cut(prefix, lengths[0], seconds)
+            chars = min(chars - 1, int(len(prefix) * cap_tokens / lengths[0]))
+        else:
+            chars -= 1
+    return None
+
+
 def search_paragraphs(
     store: MemoryStore,
     text: str,
@@ -1219,11 +1274,14 @@ def search_paragraphs(
     (3) the queries: one paragraph; with token counts unknown the whole
     message as one query; with the models warm every paragraph when
     `T_m + E(P, longest) + P x T_s` fits the budget (E the length-aware
-    embed fit, S108), else the whole message as one query (S29, S34, S46);
-    before any embed measurement in this process the first paragraph is
-    embedded, searched and timed alone first; if P times that time does not
-    fit, the rest of the message is ONE query and the message is scored as
-    those two paragraphs (S63, S115); (4) one `embed_batch` per group (its
+    embed fit, S108), else paragraphs 1, 3, 5, ... when those fit, else the
+    whole message as one query cut to what fits the time left (S29, S34, S46,
+    S195; nothing fits: the first paragraph alone); before any embed
+    measurement in this process the first paragraph is embedded, searched and
+    timed alone first, then in the same order (all, alternates, else the rest
+    of the message as ONE query cut to what fits, sized from that paragraph's
+    embed seconds per token) and the message is scored as the first paragraph
+    and that rest (S63, S115, S199); (4) one `embed_batch` per group (its
     in-lock seconds one embed-series sample), one matrix product per group,
     each query's coarse cut from its own scores (S77); (5) merge: a memory
     goes to the query with its best cosine (ties: the earlier query),
@@ -1354,10 +1412,27 @@ def search_paragraphs(
             return None
         return fit.predict(len(queries) * max(sizes))
 
+    def cut_query(text_to_cut: str, cap: int) -> tuple[str, float] | None:
+        """S195/S199: `text_to_cut` cut to a prefix of at most `cap` tokens
+        (`_cut_to_tokens`); its token count is recorded for the embed prediction.
+        Returns `(query, probe seconds)`, or `None` when nothing fits or the probe
+        cannot size it."""
+        total = tokens_of.get(text_to_cut) if tokens_of is not None else None
+        if total is None or cap < 1:
+            return None
+        cut = _cut_to_tokens(embedder, text_to_cut, total, cap)
+        if cut is None:
+            return None
+        tokens_of[cut.text] = cut.tokens
+        return cut.text, cut.probe_seconds
+
     try:
         count = len(paragraphs)
         scan_time = _scan_time.mean(store, "")
         whole = predicted_embed(paragraphs) if count > 1 else None
+        # S195: the alternate paragraphs 1, 3, 5, ... (of the paragraphs that
+        # survived the empty-keyword drop).
+        alternates = paragraphs[::2]
         if count == 1:
             queries = list(paragraphs)
             searched = embed_and_cut(queries)
@@ -1369,27 +1444,79 @@ def search_paragraphs(
         elif whole is not None and scan_time is not None:
             if overhead + whole + count * scan_time <= budget:
                 queries = list(paragraphs)
+                searched = embed_and_cut(queries)
             else:
-                queries, whole_message = [text], True
-            searched = embed_and_cut(queries)
+                alternates_embed = predicted_embed(alternates)
+                if (
+                    alternates_embed is not None
+                    and overhead + alternates_embed + len(alternates) * scan_time <= budget
+                ):
+                    queries = alternates
+                    searched = embed_and_cut(queries)
+                else:
+                    # S195: the whole message as ONE query, cut to what fits the
+                    # time left (the S108 embed cost model): the largest token
+                    # count whose predicted single-text embed fits the budget
+                    # after the setup and one query's scan. Nothing fits: the
+                    # first paragraph alone (what a one-paragraph message does,
+                    # S61).
+                    fit = _embed_cost.fit(store, embedder_model_id)
+                    room = budget - overhead - scan_time
+                    if fit is None or room < fit.overhead:
+                        cap = 0
+                    elif fit.rate <= 0.0:
+                        cap = tokens_of[text]
+                    else:
+                        cap = int((room - fit.overhead) // fit.rate)
+                    cut = cut_query(text, cap)
+                    if cut is None:
+                        queries = [paragraphs[0]]
+                        searched = embed_and_cut(queries)
+                    else:
+                        queries, whole_message = [cut[0]], True
+                        searched = [(c, part + cut[1]) for c, part in embed_and_cut(queries)]
         else:
-            # S46/S63/S115: no measurement yet in this process. Time the first
-            # paragraph alone (embed + scan), then decide on count x that time.
+            # S46/S63/S115/S199: no measurement yet in this process. Time the
+            # first paragraph alone (embed + scan), then decide on count x that
+            # time, in S195's order: every paragraph, else paragraphs 1, 3, 5,
+            # ..., else the first paragraph plus the rest of the message as ONE
+            # query cut to what fits (sized from the first paragraph's measured
+            # embed seconds per token).
             first = embed_and_cut(paragraphs[:1])
-            if overhead + count * (embed_seconds[0] + first[0][1]) <= budget:
+            first_time = embed_seconds[0] + first[0][1]
+            if overhead + count * first_time <= budget:
                 queries = list(paragraphs)
                 searched = first + embed_and_cut(paragraphs[1:])
+            elif overhead + len(alternates) * first_time <= budget:
+                queries = alternates
+                searched = first + (embed_and_cut(alternates[1:]) if len(alternates) > 1 else [])
             else:
                 rest = "\n".join(paragraphs[1:])
-                queries = [paragraphs[0], rest]
-                # The rest query's token count, probed now; its time is that
-                # query's scan-side work (first message only).
                 rest_tokens, rest_probe = _timed_probe(embedder, [rest])
                 if rest_tokens is not None and len(rest_tokens) == 1:
                     tokens_of[rest] = rest_tokens[0]
-                searched = first + [
-                    (cut, part + rest_probe) for cut, part in embed_and_cut(queries[1:])
-                ]
+                first_tokens = tokens_of.get(paragraphs[0], 0)
+                rest_query: tuple[str, float] | None = (rest, 0.0)
+                if tokens_of.get(rest) is not None:
+                    room = budget - overhead - first_time - first[0][1]
+                    if room <= 0:
+                        cap = 0
+                    elif first_tokens > 0 and embed_seconds[0] > 0.0:
+                        cap = int(room // (embed_seconds[0] / first_tokens))
+                    else:
+                        cap = tokens_of[rest]
+                    rest_query = cut_query(rest, cap)
+                if rest_query is None:
+                    queries = [paragraphs[0]]
+                    searched = first
+                else:
+                    # The rest query's token count was probed above; the probes' time
+                    # is that query's scan-side work (first message only).
+                    queries = [paragraphs[0], rest_query[0]]
+                    searched = first + [
+                        (cut, part + rest_probe + rest_query[1])
+                        for cut, part in embed_and_cut(queries[1:])
+                    ]
     except Exception:  # noqa: BLE001 — fail-soft
         log.exception("semantic recall: query embed failed — falling back to lexical")
         return None

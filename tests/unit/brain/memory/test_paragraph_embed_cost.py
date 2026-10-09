@@ -149,9 +149,11 @@ def test_c17b_a_long_paste_is_predicted_from_its_own_length(
     result = run_semantic_recall(store, tmp_path, paste)
 
     assert result is not None
-    expected = [[p1, long_p, p3]] if per_paragraph else [[paste]]
+    # S195: when the paragraphs do not fit, paragraphs 1 and 3 (the long middle one
+    # skipped) are searched, still from the paste's own length: they fit here.
+    expected = [[p1, long_p, p3]] if per_paragraph else [[p1, p3]]
     assert embedder.batches == expected
-    assert result.whole_message_fallback is (not per_paragraph)
+    assert result.whole_message_fallback is False
 
 
 # ---------------------------------------------------------------------------

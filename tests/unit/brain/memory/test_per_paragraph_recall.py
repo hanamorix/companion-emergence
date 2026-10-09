@@ -510,22 +510,28 @@ def _two_query_store(monkeypatch, tmp_path, clock, seconds_per_text):
     rec = _Reranker({m.content: 5.0 for m in [*first, *rest]})
     _install(monkeypatch, embedder, rec)
     _rerank_floor(store, 1.0)
+    _cosine_floor(store, 0.1)
     _warm(store)
     return store, embedder, rec, first, rest
+
+
+_REST_CUT = "beta heron"  # _REST cut to what fits at budget 2.9 s with the first paragraph at 1.5 s
 
 
 def test_the_first_message_rest_query_is_sized_and_its_probe_is_scan_time(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """S63 path, round-2 review N3: the rest query's token count is probed
+    """S63/S199 path, round-2 review N3: the rest query's token count is probed
     (its embed call becomes an embed-series sample) and the probe's time is the
-    rest query's scan-side work. Unequal per-call seconds (P1 1.5 s, REST
-    2.5 s) so the per-call prediction differs from the measured sum."""
+    rest query's scan-side work. The rest is cut to what the first paragraph's
+    seconds per token leave of the budget: budget 2.9 s, P1 (16 chars) 1.5 s,
+    so 14 tokens fit (a word-boundary prefix: "beta heron", 10). Unequal per-call
+    seconds (P1 1.5 s, the cut 2.5 s)."""
     clock = _Clock()
     monkeypatch.setattr(sr, "_clock", clock)
-    _budget(monkeypatch, 4.2)  # 3 x 1.5 s does not fit: the S63 split
+    _budget(monkeypatch, 2.9)  # 3 x 1.5 s and 2 x 1.5 s do not fit: the S199 split
     store, embedder, rec, first, rest = _two_query_store(monkeypatch, tmp_path, clock, 0.0)
-    seconds = {_P1: 1.5, _REST: 2.5}
+    seconds = {_P1: 1.5, _REST_CUT: 2.5}
 
     def embed_batch(texts):
         embedder.batches.append(list(texts))
@@ -542,48 +548,76 @@ def test_the_first_message_rest_query_is_sized_and_its_probe_is_scan_time(
 
     result = run_semantic_recall(store, tmp_path, _THREE)
 
-    assert result is not None and [o.query for o in result.paragraphs] == [_P1, _REST]
+    assert result is not None and [o.query for o in result.paragraphs] == [_P1, _REST_CUT]
     state = sr._embed_cost.state(store, _EMBEDDER_ID)
-    assert state.sums.n == 2 and state.sums.sum_x == len(_P1) + len(_REST)
+    assert state.sums.n == 2 and state.sums.sum_x == len(_P1) + len(_REST_CUT)
     assert state.sums.sum_y == pytest.approx(4.0)
     assert sr._scan_time.state(store, "").sums.sum_y == pytest.approx(0.05), (
         "the rest probe is the rest query's scan time"
     )
 
 
-def test_a_first_message_that_does_not_fit_is_scored_as_its_first_paragraph_and_the_rest(
+def test_a_first_message_that_does_not_fit_is_scored_as_its_first_paragraph_and_the_cut_rest(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """S63/S115: no measurement yet; the first paragraph is embedded and timed
-    alone (1.5 s); 3 x 1.5 s does not fit 4 s, so the rest is ONE query and the
-    two are re-scored as two paragraphs: own candidates (a memory found by both
-    goes to its better cosine), own rerank with own anchors, equal shares."""
+    """S63/S115/S199: no measurement yet; the first paragraph is embedded and timed
+    alone (1.5 s); 3 x 1.5 s and 2 x 1.5 s (paragraphs 1 and 3) do not fit 2.9 s,
+    so the rest is ONE query cut to what fits and the two are scored as two
+    paragraphs: own candidates (a memory found by both goes to its better cosine).
+    The cut takes the rest of the budget, so neither query has a rerank share and
+    both take the cosine path."""
     clock = _Clock()
     monkeypatch.setattr(sr, "_clock", clock)
-    _budget(monkeypatch, 4.0)
+    _budget(monkeypatch, 2.9)
     store, embedder, rec, first, rest = _two_query_store(monkeypatch, tmp_path, clock, 1.5)
     calls = _spy_rank_and_gate(monkeypatch)
 
     result = run_semantic_recall(store, tmp_path, _THREE)
 
-    assert embedder.batches == [[_P1], [_REST]]
+    assert embedder.batches == [[_P1], [_REST_CUT]]
     assert result is not None
     assert len(result.paragraphs) == 2 and result.whole_message_fallback is False
-    assert [o.query for o in result.paragraphs] == [_P1, _REST]
+    assert [o.query for o in result.paragraphs] == [_P1, _REST_CUT]
     by_query = {c["query"]: c for c in calls}
-    assert set(by_query) == {_P1, _REST}
+    assert set(by_query) == {_P1, _REST_CUT}
     assert [mid for mid, _ in by_query[_P1]["coarse"]] == _ids(first)
-    assert [mid for mid, _ in by_query[_REST]["coarse"]] == _ids(rest)
-    assert by_query[_P1]["budget_seconds"] == pytest.approx(by_query[_REST]["budget_seconds"])
-    # The embed term is the series' prediction per embed call made (S108): two
-    # calls, samples (len P1, 1.5) and (len REST, 1.5) fit no positive rate, so
-    # the ratio of sums 3.0 / (len P1 + len REST) per token, over len P1 + len REST.
-    predicted = 3.0 / (len(_P1) + len(_REST)) * len(_P1) + 3.0 / (len(_P1) + len(_REST)) * len(_REST)
-    assert by_query[_P1]["budget_seconds"] == pytest.approx((4.0 - predicted) / 2)
-    scored = rec.scored()
-    assert [q for q, _ in scored] == [_P1, _REST], "one rerank per query, each against its own text"
-    for _, docs in scored:
-        assert set(docs) & set(ANCHOR_POOL), "each rerank carries its own anchors"
+    assert [mid for mid, _ in by_query[_REST_CUT]["coarse"]] == _ids(rest)
+    assert result.rerank_budget == pytest.approx(0.0)
+    assert rec.scored() == [], "the cut used the budget: the cosine path serves both"
+
+
+def test_a_first_message_whose_alternate_paragraphs_fit_searches_paragraphs_one_and_three(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """S199: every paragraph does not fit (3 x 1.5 s > 4.0 s) but paragraphs 1 and
+    3 do (2 x 1.5 s): the first is timed alone, the other alternate follows."""
+    clock = _Clock()
+    monkeypatch.setattr(sr, "_clock", clock)
+    _budget(monkeypatch, 4.0)
+    store, embedder, rec, first, rest = _two_query_store(monkeypatch, tmp_path, clock, 1.5)
+
+    result = run_semantic_recall(store, tmp_path, _THREE)
+
+    assert embedder.batches == [[_P1], [_P3]]
+    assert result is not None
+    assert [o.query for o in result.paragraphs] == [_P1, _P3]
+    assert result.whole_message_fallback is False
+
+
+def test_a_first_message_where_not_even_a_token_of_the_rest_fits_searches_the_first_paragraph_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """S199: the first paragraph alone already uses the budget, so the rest has no
+    room: only the first paragraph is searched."""
+    clock = _Clock()
+    monkeypatch.setattr(sr, "_clock", clock)
+    _budget(monkeypatch, 1.0)
+    store, embedder, rec, first, rest = _two_query_store(monkeypatch, tmp_path, clock, 1.5)
+
+    result = run_semantic_recall(store, tmp_path, _THREE)
+
+    assert embedder.batches == [[_P1]]
+    assert result is not None and [o.query for o in result.paragraphs] == [_P1]
 
 
 def test_a_first_message_that_fits_searches_every_paragraph(
@@ -1490,24 +1524,45 @@ def test_a_memory_equally_close_to_two_paragraphs_goes_to_the_earlier_one(
     assert _P2 not in by_query or tie.id not in by_query[_P2]
 
 
+def _warm_decision_case(monkeypatch, tmp_path, *, scan, overhead, budget):
+    clock = _Clock()
+    monkeypatch.setattr(sr, "_clock", clock)
+    _budget(monkeypatch, budget)
+    embedder = _AxisEmbedder({_P1: 0, _P2: 1, _P3: 2})
+    store = MemoryStore(tmp_path / "memories.db")
+    sr._embed_cost.record(store, _EMBEDDER_ID, 100, 0.0)
+    sr._scan_time.record(store, "", 1, scan)
+    sr._message_overhead.record(store, "", 1, overhead)
+    _install(monkeypatch, embedder)
+    _slow_store_reads(monkeypatch, clock, overhead)
+    _mem(store, "a memory", {_OTHER: 0.9})
+    _mem(store, "a memory of the first", {0: 0.9})
+    _mem(store, "a memory of the third", {2: 0.9})
+    _cosine_floor(store, 0.5)
+    _no_reranker(monkeypatch)
+    return store, embedder
+
+
 def test_the_fit_decision_counts_the_message_overhead(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """3 x scan 1.0 (embedding free) fits 3.5 s alone, but with `T_m` 0.75 it
-    does not: the whole message is one query."""
-    clock = _Clock()
-    monkeypatch.setattr(sr, "_clock", clock)
-    _budget(monkeypatch, 3.5)
-    embedder = _AxisEmbedder({_P1: 0, _P2: 1, _P3: 2})
-    store = MemoryStore(tmp_path / "memories.db")
-    sr._embed_cost.record(store, _EMBEDDER_ID, 100, 0.0)
-    sr._scan_time.record(store, "", 1, 1.0)
-    sr._message_overhead.record(store, "", 1, 0.75)
-    _install(monkeypatch, embedder)
-    _slow_store_reads(monkeypatch, clock, 0.75)
-    _mem(store, "a memory", {_OTHER: 0.9})
-    _cosine_floor(store, 0.5)
-    _no_reranker(monkeypatch)
+    does not; paragraphs 1 and 3 (2 x 1.0 + 0.75) do (S195)."""
+    store, embedder = _warm_decision_case(monkeypatch, tmp_path, scan=1.0, overhead=0.75, budget=3.5)
+
+    result = run_semantic_recall(store, tmp_path, _THREE)
+
+    assert embedder.batches == [[_P1, _P3]]
+    assert result is not None and result.whole_message_fallback is False
+    assert [o.query for o in result.paragraphs] == [_P1, _P3]
+
+
+def test_when_the_alternate_paragraphs_do_not_fit_either_the_whole_message_is_one_query(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Scan 1.5: 2 x 1.5 + 0.75 > 3.5 as well, so the whole message is ONE query
+    (embedding costs nothing here, so the cut is the whole message)."""
+    store, embedder = _warm_decision_case(monkeypatch, tmp_path, scan=1.5, overhead=0.75, budget=3.5)
 
     result = run_semantic_recall(store, tmp_path, _THREE)
 
@@ -1515,11 +1570,61 @@ def test_the_fit_decision_counts_the_message_overhead(
     assert result is not None and result.whole_message_fallback is True
 
 
+def test_the_whole_message_is_cut_to_the_tokens_the_embed_fit_says_fit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """S195: embed fit overhead 0.5 s + 0.01 s per token; budget 4.0, `T_m` 0.25,
+    scan 1.0: room 2.75 s, so (2.75 - 0.5) / 0.01 = 225 tokens (characters in this
+    test). Three paragraphs of 100 characters do not fit (3 x 1.0 scan + embed),
+    nor do paragraphs 1 and 3 (2 x 1.0 + 0.5 + 0.01 x 2 x 100 = 4.5 > 3.75); the
+    query is the longest word-boundary prefix of the message of at most 225
+    characters."""
+    clock = _Clock()
+    monkeypatch.setattr(sr, "_clock", clock)
+    _budget(monkeypatch, 4.0)
+    words = [f"w{i:03d}" for i in range(60)]
+    paragraphs = [" ".join(words[i * 20 : (i + 1) * 20])[:99] + "x" for i in range(3)]
+    message = "\n".join(paragraphs)
+    embedder = _AxisEmbedder(dict.fromkeys(paragraphs, 0), clock)
+    store = MemoryStore(tmp_path / "memories.db")
+    sr._embed_cost.record(store, _EMBEDDER_ID, 100, 0.5 + 0.01 * 100)
+    sr._embed_cost.record(store, _EMBEDDER_ID, 200, 0.5 + 0.01 * 200)
+    sr._scan_time.record(store, "", 1, 1.0)
+    sr._message_overhead.record(store, "", 1, 0.25)
+    _install(monkeypatch, embedder)
+    _slow_store_reads(monkeypatch, clock, 0.25)
+    _mem(store, "a memory", {_OTHER: 0.9})
+    _cosine_floor(store, 0.5)
+    _no_reranker(monkeypatch)
+
+    result = run_semantic_recall(store, tmp_path, message)
+
+    (batch,) = embedder.batches
+    (query,) = batch
+    assert result is not None and result.whole_message_fallback is True
+    assert message.startswith(query) and len(query) <= 225
+    assert len(message[: len(query) + 6]) > 225 or message[len(query)].isspace(), (
+        "the longest word-boundary prefix that fits"
+    )
+
+
+def test_when_not_even_one_token_fits_the_first_paragraph_alone_is_searched(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """S195 edge: the setup and one query's scan already use the whole budget."""
+    store, embedder = _warm_decision_case(monkeypatch, tmp_path, scan=3.0, overhead=0.75, budget=3.5)
+
+    result = run_semantic_recall(store, tmp_path, _THREE)
+
+    assert embedder.batches == [[_P1]]
+    assert result is not None and [o.query for o in result.paragraphs] == [_P1]
+
+
 def test_the_first_message_decision_counts_the_message_overhead(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """S63 decision: first paragraph timed at 1.0 s; 3 x 1.0 fits 3.5 s alone,
-    but with `T_m` 0.75 it does not: first paragraph plus the rest."""
+    """S199 decision: first paragraph timed at 1.0 s; 3 x 1.0 fits 3.5 s alone,
+    but with `T_m` 0.75 it does not; paragraphs 1 and 3 (0.75 + 2 x 1.0) do."""
     clock = _Clock()
     monkeypatch.setattr(sr, "_clock", clock)
     _budget(monkeypatch, 3.5)
@@ -1528,7 +1633,7 @@ def test_the_first_message_decision_counts_the_message_overhead(
 
     run_semantic_recall(store, tmp_path, _THREE)
 
-    assert embedder.batches == [[_P1], [_REST]]
+    assert embedder.batches == [[_P1], [_P3]]
 
 
 def test_only_a_query_that_can_rerank_is_probed_for_pair_sizes(
