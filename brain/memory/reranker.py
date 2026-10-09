@@ -604,7 +604,9 @@ def _current_rss_bytes() -> float | None:
 
         return float(psutil.Process().memory_info().rss)
     except Exception:  # noqa: BLE001 - fail-soft: an RSS probe must never break a recall
-        _warn_ram_figure_once("the process RSS could not be read (psutil)")
+        _warn_ram_figure_once(
+            "the process RSS could not be read (psutil): no RAM figure can be measured", exc_info=True
+        )
         return None
 
 
@@ -930,12 +932,13 @@ _PAIR_TEXT_DOUBLINGS = 8
 _ram_figure_warned: set[str] = set()
 
 
-def _warn_ram_figure_once(reason: str) -> None:
-    """The lull job can reach the same refusal at every lull: warn once per reason
-    per process, then debug."""
+def _warn_ram_figure_once(reason: str, *, exc_info: bool = False) -> None:
+    """A RAM-figure refusal (or an unreadable memory probe) can recur at every lull or
+    every message: warn once per reason per process, with the traceback when `exc_info`
+    is set (a probe failure), then debug."""
     first = reason not in _ram_figure_warned
     _ram_figure_warned.add(reason)
-    (log.warning if first else log.debug)("reranker: RAM figure not measured: %s", reason)
+    (log.warning if first else log.debug)("reranker: %s", reason, exc_info=exc_info and first)
 
 
 def ram_figure_ready(model_id: str, store: MemoryStore) -> bool:
@@ -1026,8 +1029,9 @@ def _ram_figure_would_refuse(model_id: str) -> bool:
 
 def measure_ram_figure(provider: RerankerProvider, store: MemoryStore) -> bool:
     """S200: measure the RAM figure from ONE pair at the re-scorer's full input
-    length. The two discarded warm-up reranks run first on short text (so the model
-    is loaded and warmed before the pair, and the pair is not itself the load). The
+    length. The pair's length is probed first (S213; this loads the model), then the two
+    discarded warm-up reranks run on short text (so the model is warmed before the pair, and
+    the pair is not itself the load). The
     pair's seconds and RSS growth are read inside the provider's lock and recorded
     like any recall rerank (`_record_rerank_cost`, x = the pair's tokens): a RAM
     sample (the high water of a fresh process is 0, so it counts) and a time sample,
@@ -1046,11 +1050,11 @@ def measure_ram_figure(provider: RerankerProvider, store: MemoryStore) -> bool:
     lull that refuses costs no rerank."""
     model_id = provider.model_id()
     if _ram_figure_would_refuse(model_id):
-        _warn_ram_figure_once("this process has already run a batch this large")
+        _warn_ram_figure_once("RAM figure not measured: this process has already run a batch this large")
         return False
     pair = _full_length_pair(provider)
     if pair is None:
-        _warn_ram_figure_once("no full-length pair could be built")
+        _warn_ram_figure_once("RAM figure not measured: no full-length pair could be built")
         return False
     text, tokens = pair
     with _cost_lock:
@@ -1060,12 +1064,12 @@ def measure_ram_figure(provider: RerankerProvider, store: MemoryStore) -> bool:
         # This process already ran a batch this large, so a pair of this size cannot grow
         # RSS past the high water any more and no RAM sample can be taken here (a figure
         # needs a fresh process). Running the pair would only cost a full-length rerank.
-        _warn_ram_figure_once("this process has already run a batch this large")
+        _warn_ram_figure_once("RAM figure not measured: this process has already run a batch this large")
         return False
     _warm_up_once(provider, "warm up", ["warm up"])
     _scores, seconds, rss_delta = provider.rerank_timed(text, [text])
     if rss_delta is None or rss_delta <= 0.0:
-        _warn_ram_figure_once("the full-length pair showed no RSS growth")
+        _warn_ram_figure_once("RAM figure not measured: the full-length pair showed no RSS growth")
         return False
     _record_rerank_cost(model_id, store, tokens, seconds, rss_delta)
     fit = _ram_cost.fit(store, model_id)
@@ -1093,7 +1097,7 @@ def run_ram_figure(activity_marker: object, store: MemoryStore) -> bool:
         return False
     if _ram_figure_would_refuse(model_id):
         # S213: the attempt is stamped (once per lull) and nothing is built, loaded or warmed.
-        _warn_ram_figure_once("this process has already run a batch this large")
+        _warn_ram_figure_once("RAM figure not measured: this process has already run a batch this large")
         return False
     measured = measure_ram_figure(build_reranker_provider(store=store), store)
     if measured and ram_figure_ready(model_id, store):
@@ -1550,7 +1554,10 @@ def _psutil_available_bytes() -> float | None:
 
         return float(psutil.virtual_memory().available)
     except Exception:  # noqa: BLE001 — fail-soft: a headroom probe must never break a recall
-        _warn_ram_figure_once("the host free memory could not be read (psutil)")
+        _warn_ram_figure_once(
+            "the host free memory could not be read (psutil): the RAM bound's headroom term is skipped",
+            exc_info=True,
+        )
         return None
 
 

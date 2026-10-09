@@ -101,8 +101,8 @@ def test_tune_grade_order_is_weak_to_beefy() -> None:
 
 
 # ---------------------------------------------------------------------------
-# _read_total_ram_bytes — mirrors reranker._proc_meminfo_available_bytes's
-# shape, MemTotal instead of MemAvailable.
+# _read_total_ram_bytes — mirrors the shape of the reranker's former
+# /proc/meminfo free-memory reader, MemTotal instead of MemAvailable.
 # ---------------------------------------------------------------------------
 
 

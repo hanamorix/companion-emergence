@@ -700,3 +700,57 @@ def test_s202_when_nothing_fits_the_single_paragraph_is_embedded_as_it_is(monkey
     sr._message_overhead.record(store, "", 1, 0.0)
     run_semantic_recall(store, tmp_path, _ONE_PARAGRAPH)
     assert embedder.batches == [[_ONE_PARAGRAPH]]
+
+
+def _fit_only(store, *, overhead: float | None, scan: float | None) -> None:
+    for n in (20, 40):
+        sr._embed_cost.record(store, _EMBEDDER_ID, n, _O + _R * n)
+    for _ in range(20):  # many samples, so the run's own sample barely moves the mean
+        if overhead is not None:
+            sr._message_overhead.record(store, "", 1, overhead)
+        if scan is not None:
+            sr._scan_time.record(store, "", 1, scan)
+
+
+_FOUR_HUNDRED = ("lorem ipsum " * 40)[:400]  # one paragraph, 400 tokens here: embed alone 0.1 + 0.8 = 0.9 s
+
+
+def test_s202_the_message_overhead_counts_against_the_room_for_the_embed(monkeypatch, tmp_path: Path) -> None:
+    """Able to fail: the embed alone (0.9 s) fits the 1.0 s budget; only with the 0.3 s setup does it not."""
+    clock = _clocked(monkeypatch)
+    _set_budget(monkeypatch, 1.0)
+    embedder = _CostEmbedder(clock)
+    store = _store(monkeypatch, tmp_path, embedder)
+    _fit_only(store, overhead=0.3, scan=0.0)
+    run_semantic_recall(store, tmp_path, _FOUR_HUNDRED)
+    (batch,) = embedder.batches
+    assert len(batch[0]) < len(_FOUR_HUNDRED), "cut: the setup leaves less room"
+    setup = sr._message_overhead.mean(store, "")  # the value the decision used (the run's own sample is in it)
+    assert 0.25 < setup <= 0.3
+    cap = int((1.0 - setup - _O) / _R)
+    assert cap - 8 <= len(batch[0]) <= cap
+
+
+def test_s202_the_scan_time_counts_against_the_room_for_the_embed(monkeypatch, tmp_path: Path) -> None:
+    clock = _clocked(monkeypatch)
+    _set_budget(monkeypatch, 1.0)
+    embedder = _CostEmbedder(clock)
+    store = _store(monkeypatch, tmp_path, embedder)
+    _fit_only(store, overhead=0.0, scan=0.3)
+    run_semantic_recall(store, tmp_path, _FOUR_HUNDRED)
+    (batch,) = embedder.batches
+    assert len(batch[0]) < len(_FOUR_HUNDRED), "cut: the scan leaves less room"
+    cap = int((1.0 - 0.3 - _O) / _R)
+    assert cap - 8 <= len(batch[0]) <= cap
+
+
+def test_s202_with_no_scan_sample_yet_a_single_paragraph_is_embedded_whole(monkeypatch, tmp_path: Path) -> None:
+    """The first message of a process: an embed fit exists (restored) but no scan time: nothing to
+    predict the room from, so the paragraph is embedded as it is (as built)."""
+    clock = _clocked(monkeypatch)
+    _set_budget(monkeypatch, 0.5)
+    embedder = _CostEmbedder(clock)
+    store = _store(monkeypatch, tmp_path, embedder)
+    _fit_only(store, overhead=0.0, scan=None)
+    run_semantic_recall(store, tmp_path, _FOUR_HUNDRED)
+    assert embedder.batches == [[_FOUR_HUNDRED]]

@@ -112,10 +112,10 @@ def _read_total_ram_bytes() -> float | None:
     RAM-tier detector's raw signal (spec §1: "RAM is the proxy for overall
     capability... an 8 GB box implies a modest CPU, 32 GB a real CPU").
 
-    Mirrors `brain.memory.reranker._proc_meminfo_available_bytes`'s SHAPE
-    exactly (same fail-soft posture: `None` on non-Linux or any read/parse
-    error, never a fabricated figure) but reads `MemTotal`, not
-    `MemAvailable` — tier detection is about the box's overall CAPABILITY
+    Mirrors the SHAPE of the reranker's former `/proc/meminfo` free-memory
+    reader (replaced by `psutil` there, S211): the same fail-soft posture (`None`
+    on non-Linux or any read/parse error, never a fabricated figure), but reads
+    `MemTotal`, not `MemAvailable` — tier detection is about the box's overall CAPABILITY
     CLASS, not this instant's free memory (that is the separate OOM-safety
     guard's job, via `_available_ram_headroom_bytes`, reused unchanged from
     `reranker.py` below). A deliberate near-duplicate of the meminfo read,

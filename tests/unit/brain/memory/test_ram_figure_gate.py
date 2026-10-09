@@ -5,8 +5,9 @@ On a machine with no saved RAM figure a recall turn takes the plain meaning-matc
 (cosine) path with nothing of the reranker built, loaded, warmed up or probed on
 the reply path, and flags the need; the `rerank_ram_figure` lull job then measures
 the figure from ONE pair at the model's full input length, and the first real
-rerank is sized from it (not the S5 width-5 seed). The older seeds (S158, S171,
-S178, S180, S182) are left as built and keep their own tests.
+rerank is sized from it (not the S5 width-5 seed). The older width-5 seeds of S158,
+S178 and S180 are retired (S203); the S182 re-seed in `remeasure_stuck_width` stays
+until the batch-sizing build (S212).
 
 No model is loaded: fake providers. `reranker._require_ram_figure` is switched on
 per test (the suite's autouse fixture switches it off).
@@ -52,6 +53,7 @@ class _CappedReranker(RerankerProvider):
         self.cap, self.seconds, self.rss = cap, seconds, rss
         self.plain: list[tuple[str, list[str]]] = []
         self.timed: list[tuple[str, list[str]]] = []
+        self.probes = 0
 
     def rerank(self, query, documents):
         self.plain.append((query, list(documents)))
@@ -62,6 +64,7 @@ class _CappedReranker(RerankerProvider):
         return [5.0 if d.startswith("s200") else 0.0 for d in documents], self.seconds, self.rss
 
     def pair_token_lengths(self, query, documents):
+        self.probes += 1
         counts = [(len(query) + len(d)) // 4 for d in documents]
         return counts if self.cap is None else [min(self.cap, c) for c in counts]
 
@@ -277,6 +280,18 @@ def test_s213_a_known_full_pair_length_refuses_before_the_provider_is_even_built
     assert reranker_mod.run_ram_figure("m2", store) is False
     assert reranker_mod._ram_figure_attempt[_RERANKER_ID] == "m2"
     assert reranker_mod._ram_figure_needed == {_RERANKER_ID}, "the flag stays"
+
+
+def test_s213_a_known_length_and_a_covering_high_water_refuse_before_even_the_pair_is_probed(
+    tmp_path: Path,
+) -> None:
+    """The first refusal in `measure_ram_figure`: no tokenization, no warm-up, no pair."""
+    store = _store(tmp_path)
+    reranker_mod._full_pair_tokens[_RERANKER_ID] = _FULL
+    reranker_mod._ram_state[_RERANKER_ID] = reranker_mod._RamState(peak_x=_FULL)
+    provider = _CappedReranker()
+    assert reranker_mod.measure_ram_figure(provider, store) is False
+    assert (provider.probes, provider.plain, provider.timed) == (0, [], [])
 
 
 def test_s213_a_lower_high_water_still_measures_after_the_length_is_known(tmp_path: Path) -> None:
@@ -525,10 +540,40 @@ def test_s201_the_body_measures_once_per_activity_marker_with_a_store_of_its_own
     floor_startup._ram_figure_body(tmp_path)  # noqa: SLF001
 
 
+def test_s201_the_marker_rule_holds_when_the_first_attempt_left_no_figure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Able to fail on its own: no figure exists after the first attempt, so only the once-per-marker
+    rule keeps the second body run from measuring again."""
+    from brain.memory import floor_startup
+
+    store, _memories = _recall_setup(monkeypatch, tmp_path)
+    store.close()
+    reranker_mod.note_ram_figure_needed(_RERANKER_ID)
+    monkeypatch.setattr(floor_startup, "_marker_provider", lambda: "m1")
+    bad = _CappedReranker(rss=0.0)
+    monkeypatch.setattr(reranker_mod, "build_reranker_provider", lambda **k: bad)
+    reranker_mod._warmed_model_ids.add(_RERANKER_ID)
+    floor_startup._ram_figure_body(tmp_path)  # noqa: SLF001
+    assert len(bad.timed) == 1 and reranker_mod._ram_figure_needed == {_RERANKER_ID}
+    floor_startup._ram_figure_body(tmp_path)  # noqa: SLF001
+    assert len(bad.timed) == 1, "same activity marker: not measured again"
+    monkeypatch.setattr(floor_startup, "_marker_provider", lambda: "m2")
+    floor_startup._ram_figure_body(tmp_path)  # noqa: SLF001
+    assert len(bad.timed) == 2, "a later lull retries"
+
+
 def test_s201_a_failing_measurement_is_logged_not_raised_and_frees_the_slot(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _background_on: None
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    _background_on: None,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     from brain.memory import floor_startup
+
+    closed: list[int] = []
+    real_close = MemoryStore.close
+    monkeypatch.setattr(MemoryStore, "close", lambda self: (closed.append(1), real_close(self))[1])
 
     store, _memories = _recall_setup(monkeypatch, tmp_path)
     store.close()
@@ -540,10 +585,14 @@ def test_s201_a_failing_measurement_is_logged_not_raised_and_frees_the_slot(
 
     monkeypatch.setattr(reranker_mod, "run_ram_figure", _boom)
     assert floor_startup.request_ram_figure() is True
-    thread = floor_startup.start_requested_ram_figure()
-    assert thread is not None
-    thread.join(timeout=10)
+    closed.clear()  # only the thread's own store counts
+    with caplog.at_level("ERROR"):
+        thread = floor_startup.start_requested_ram_figure()
+        assert thread is not None
+        thread.join(timeout=10)
     assert not floor_startup.inflight("ram-figure")
+    assert any("ram-figure bootstrap raised" in r.getMessage() for r in caplog.records), "logged, not raised"
+    assert closed, "the thread's own store was closed even though the measurement raised"
 
 
 def test_s201_only_the_interactive_session_registers_the_background_measurement(
