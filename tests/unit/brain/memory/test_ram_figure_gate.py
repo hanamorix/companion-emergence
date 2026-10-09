@@ -428,7 +428,7 @@ def test_s201_with_no_figure_and_a_registered_direct_chat_the_measurement_runs_o
     ran: list[tuple[str, object]] = []
     gate = threading.Event()
 
-    def _run(marker, st):
+    def _run(marker, st, **_kw):
         ran.append((threading.current_thread().name, st.db_path))
         gate.wait(10)
         reranker_mod._record_rerank_cost(_RERANKER_ID, st, _FULL, 2.0, 245e6)
@@ -537,7 +537,7 @@ def test_s201_the_body_measures_once_per_activity_marker_with_a_store_of_its_own
     floor_startup._ram_figure_body(tmp_path)  # noqa: SLF001
     assert reranker_mod._ram_figure_attempt[_RERANKER_ID] == "m1"
     reranker_mod._ram_figure_needed.add(_RERANKER_ID)  # flagged again, same marker: not due
-    monkeypatch.setattr(reranker_mod, "run_ram_figure", lambda *a: pytest.fail("once per marker"))
+    monkeypatch.setattr(reranker_mod, "run_ram_figure", lambda *a, **k: pytest.fail("once per marker"))
     floor_startup._ram_figure_body(tmp_path)  # noqa: SLF001
 
 

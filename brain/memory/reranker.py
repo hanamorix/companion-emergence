@@ -931,6 +931,19 @@ _PAIR_TEXT_DOUBLINGS = 8
 
 _ram_figure_warned: set[str] = set()
 
+# S218: model ids whose full-length pair ran in THIS process without a recorded sample (the
+# measurement was abandoned after the pair returned, because a reply had started). The ONNX
+# arena already holds the pair's memory (S74, S221), so a second pair would read 0 growth or a
+# few KB of page noise, and any positive value would be recorded as the figure and void the RAM
+# bound (the S193 shape). Process memory, guarded by `_cost_lock`.
+_pair_ran_unrecorded: set[str] = set()
+
+
+class RamMeasurementAbandoned(Exception):  # noqa: N818 - a control signal, not an error
+    """S218: a chat reply started while the one-pair RAM measurement ran (`nell chat
+    --no-bridge`), so the measurement is abandoned and nothing from it is recorded. Raised only
+    when the caller passed a `watch`; the bridge's lull job never does."""
+
 
 def _warn_ram_figure_once(reason: str, *, exc_info: bool = False) -> None:
     """A RAM-figure refusal (or an unreadable memory probe) can recur at every lull or
@@ -1018,16 +1031,43 @@ def _full_length_pair(provider: RerankerProvider) -> tuple[str, int] | None:
 _full_pair_tokens: dict[str, int] = {}
 
 
-def _ram_figure_would_refuse(model_id: str) -> bool:
-    """S213: whether `measure_ram_figure` would refuse for the high-water reason ("this
-    process has already run a batch this large"). Cheap: process memory only. `False` while
+_REFUSED_HIGH_WATER = "RAM figure not measured: this process has already run a batch this large"
+_REFUSED_PAIR_RAN = (
+    "RAM figure not measured: an earlier measurement in this process ran its pair and was abandoned "
+    "(a reply started); the arena already holds it, so a second pair cannot show clean growth"
+)
+
+
+def _ram_figure_refusal(model_id: str) -> str | None:
+    """S213, S218: why `measure_ram_figure` would refuse before doing any work, or `None`: this
+    process has already run a batch as large as the pair (the high water covers it), or its pair
+    already ran once and was abandoned without a sample. Cheap: process memory only. `None` while
     the pair's token count is not yet known (the first attempt finds it out)."""
     with _cost_lock:
+        if model_id in _pair_ran_unrecorded:
+            return _REFUSED_PAIR_RAN
         tokens = _full_pair_tokens.get(model_id)
-        return tokens is not None and _ram_state.get(model_id, _RamState()).peak_x >= tokens
+        if tokens is not None and _ram_state.get(model_id, _RamState()).peak_x >= tokens:
+            return _REFUSED_HIGH_WATER
+        return None
 
 
-def measure_ram_figure(provider: RerankerProvider, store: MemoryStore) -> bool:
+def _ram_figure_would_refuse(model_id: str) -> bool:
+    """S213: whether `measure_ram_figure` would refuse before doing any work (see
+    `_ram_figure_refusal`)."""
+    return _ram_figure_refusal(model_id) is not None
+
+
+def _abandon_if_replying(watch: Callable[[], bool] | None) -> None:
+    """S218: raise `RamMeasurementAbandoned` when the caller's `watch` says a reply has started
+    (or was already in flight when the watch was taken). `None` = no watch: never raises."""
+    if watch is not None and not watch():
+        raise RamMeasurementAbandoned("a reply started while the one-pair RAM measurement ran")
+
+
+def measure_ram_figure(
+    provider: RerankerProvider, store: MemoryStore, *, watch: Callable[[], bool] | None = None
+) -> bool:
     """S200: measure the RAM figure from ONE pair at the re-scorer's full input
     length. The pair's length is probed first (S213; this loads the model), then the two
     discarded warm-up reranks run on short text (so the model is warmed before the pair, and
@@ -1047,15 +1087,27 @@ def measure_ram_figure(provider: RerankerProvider, store: MemoryStore) -> bool:
     it runs without a memory-headroom check: one pair, about 250 MB (S200, S184).
     Provider exceptions propagate. S213: every refusal that can be decided without the
     warm-up is decided BEFORE it (the pair is built and the high water compared first), so a
-    lull that refuses costs no rerank."""
+    lull that refuses costs no rerank.
+
+    S218: with a `watch` (the direct chat passes `cli_throttle.reply_watch()`), a reply that
+    starts while this runs abandons it: `RamMeasurementAbandoned` is raised, checked at entry,
+    after the pair-length probe, after the warm-ups (before the pair) and after the pair
+    returns (before anything is recorded), and NOTHING is recorded (the process-wide RSS reading
+    would be inflated by the reply). A call already running (probe, warm-up, pair) finishes:
+    only its SAMPLE is guaranteed not to overlap a reply. Abandoned after the pair ran, the
+    model is marked in `_pair_ran_unrecorded` and later measurements are refused (the arena
+    holds the pair, so a second pair would read 0 or page noise)."""
     model_id = provider.model_id()
-    if _ram_figure_would_refuse(model_id):
-        _warn_ram_figure_once("RAM figure not measured: this process has already run a batch this large")
+    refusal = _ram_figure_refusal(model_id)
+    if refusal is not None:
+        _warn_ram_figure_once(refusal)
         return False
+    _abandon_if_replying(watch)
     pair = _full_length_pair(provider)
     if pair is None:
         _warn_ram_figure_once("RAM figure not measured: no full-length pair could be built")
         return False
+    _abandon_if_replying(watch)
     text, tokens = pair
     with _cost_lock:
         _full_pair_tokens[model_id] = tokens
@@ -1064,10 +1116,20 @@ def measure_ram_figure(provider: RerankerProvider, store: MemoryStore) -> bool:
         # This process already ran a batch this large, so a pair of this size cannot grow
         # RSS past the high water any more and no RAM sample can be taken here (a figure
         # needs a fresh process). Running the pair would only cost a full-length rerank.
-        _warn_ram_figure_once("RAM figure not measured: this process has already run a batch this large")
+        _warn_ram_figure_once(_REFUSED_HIGH_WATER)
         return False
     _warm_up_once(provider, "warm up", ["warm up"])
+    _abandon_if_replying(watch)
     _scores, seconds, rss_delta = provider.rerank_timed(text, [text])
+    try:
+        _abandon_if_replying(watch)
+    except RamMeasurementAbandoned:
+        # The pair ran: its memory is now in the arena, so no clean sample can come from this
+        # process (S218). Nothing is recorded; later measurements are refused.
+        with _cost_lock:
+            _pair_ran_unrecorded.add(model_id)
+        log.info("reranker: RAM figure sample discarded: a reply started while the pair ran")
+        raise
     if rss_delta is None or rss_delta <= 0.0:
         _warn_ram_figure_once("RAM figure not measured: the full-length pair showed no RSS growth")
         return False
@@ -1083,11 +1145,19 @@ def measure_ram_figure(provider: RerankerProvider, store: MemoryStore) -> bool:
     return measured
 
 
-def run_ram_figure(activity_marker: object, store: MemoryStore) -> bool:
+def run_ram_figure(
+    activity_marker: object, store: MemoryStore, *, watch: Callable[[], bool] | None = None
+) -> bool:
     """The `rerank_ram_figure` job's run (S200): stamp the attempt, then measure
     the figure on the runtime reranker (building the provider here, at a lull, is
     what keeps the model load off the reply path). Returns True iff a figure was
-    recorded. Provider exceptions propagate (the central pass logs them)."""
+    recorded. Provider exceptions propagate (the central pass logs them).
+
+    S218: `watch` (the direct chat's `cli_throttle.reply_watch()`, taken by the caller before
+    the due check and the store) is checked before the provider is built and passed to
+    `measure_ram_figure`. `RamMeasurementAbandoned` removes this model's attempt stamp, so the
+    re-run after the reply is not held back by the once-per-marker rule, keeps the need flag and
+    propagates. The bridge's lull job passes no watch."""
     model_id = resolve_reranker_model_id()
     with _cost_lock:
         _ram_figure_attempt[model_id] = activity_marker
@@ -1095,11 +1165,18 @@ def run_ram_figure(activity_marker: object, store: MemoryStore) -> bool:
         with _cost_lock:
             _ram_figure_needed.discard(model_id)
         return False
-    if _ram_figure_would_refuse(model_id):
+    refusal = _ram_figure_refusal(model_id)
+    if refusal is not None:
         # S213: the attempt is stamped (once per lull) and nothing is built, loaded or warmed.
-        _warn_ram_figure_once("RAM figure not measured: this process has already run a batch this large")
+        _warn_ram_figure_once(refusal)
         return False
-    measured = measure_ram_figure(build_reranker_provider(store=store), store)
+    try:
+        _abandon_if_replying(watch)
+        measured = measure_ram_figure(build_reranker_provider(store=store), store, watch=watch)
+    except RamMeasurementAbandoned:
+        with _cost_lock:
+            _ram_figure_attempt.pop(model_id, None)
+        raise
     if measured and ram_figure_ready(model_id, store):
         with _cost_lock:
             _ram_figure_needed.discard(model_id)
@@ -1115,6 +1192,7 @@ def _reset_rerank_cost_model() -> None:
         _ram_figure_attempt.clear()
         _ram_figure_warned.clear()
         _full_pair_tokens.clear()
+        _pair_ran_unrecorded.clear()
         _ram_state.clear()
         _ram_kept.clear()
         _warmed_model_ids.clear()

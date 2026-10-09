@@ -148,6 +148,19 @@ def test_chat_repl_starts_a_requested_ram_measurement_only_after_the_reply_is_pr
     assert "FAKE_CHAT" in seen[0], "the reply was already printed when the hook ran"
 
 
+def test_chat_repl_turn_goes_through_the_reply_signal_the_ram_measurement_watches() -> None:
+    """S218: the measurement thread abandons when a reply starts, and `respond()` is what
+    starts it: one REPL turn raises the started-replies count by exactly one and leaves no
+    reply in flight."""
+    from brain.bridge import cli_throttle
+
+    before = cli_throttle._replies_started  # noqa: SLF001
+    with patch("builtins.input", side_effect=["hello there", "exit"]):
+        assert main(["chat", "--persona", "nell", "--no-bridge"]) == 0
+    assert cli_throttle._replies_started == before + 1  # noqa: SLF001
+    assert cli_throttle.reply_in_flight() is False
+
+
 # ── Missing persona dir ───────────────────────────────────────────────────────
 
 

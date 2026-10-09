@@ -27,7 +27,8 @@ computed while a reply is being built: `MemoryStore.get_cosine_floor` /
   with no RAM figure flags the need (`request_ram_figure` records it) and the REPL, once that reply
   is finished, calls `start_requested_ram_figure`, which measures the figure (the one full-length
   pair, S200) on a daemon thread; never while the flagged reply is being built. The bridge relies
-  on its lull job;
+  on its lull job. S218: that thread also never measures across a reply (a reply that starts while
+  it runs abandons it, its sample is discarded, and it runs again once that reply has ended);
 * never more than ONE bootstrap in flight per floor: every start (startup
   thread, first-need request, message retry, cadence job) goes through
   `try_begin(kind)` / `end(kind)`.
@@ -334,9 +335,19 @@ def enable_background_ram_figure(persona_dir: Path | None) -> None:
 def _ram_figure_body(persona_dir: Path) -> None:
     """The background measurement: the lull job's own functions (`ram_figure_due`, once per chat
     activity marker, then `run_ram_figure`: the one full-length pair, S200), on this thread, with
-    a store of its own that it closes. Provider exceptions are logged by `_spawn`."""
+    a store of its own that it closes. Provider exceptions are logged by `_spawn`.
+
+    S218: this thread never measures while a reply is in flight. It first waits until none is
+    (`cli_throttle.wait_for_no_reply_in_flight`, a condition wait: no polling, no time constant),
+    takes a `reply_watch` snapshot, and runs. If a reply starts while the run is in progress the
+    run is abandoned (`RamMeasurementAbandoned`; its sample is discarded, nothing is recorded) and
+    the loop waits for that reply to end and runs again. Every repeat follows a reply start and the
+    next wait blocks until that reply ends, so the loop cannot spin; the "ram-figure" in-flight
+    slot is held for the whole loop (one thread). A run that is not abandoned (a figure, a
+    refusal, no growth, or no longer due) ends the loop."""
     import contextlib
 
+    from brain.bridge import cli_throttle
     from brain.memory import reranker as reranker_mod
     from brain.memory.store import MemoryStore
 
@@ -348,11 +359,18 @@ def _ram_figure_body(persona_dir: Path) -> None:
         finally:
             store.close()
 
-    marker = _current_marker()
-    if not reranker_mod.ram_figure_due(marker, _store):
+    while True:
+        cli_throttle.wait_for_no_reply_in_flight()
+        watch = cli_throttle.reply_watch()
+        marker = _current_marker()
+        if not reranker_mod.ram_figure_due(marker, _store):
+            return
+        try:
+            with _store() as store:
+                reranker_mod.run_ram_figure(marker, store, watch=watch)
+        except reranker_mod.RamMeasurementAbandoned:
+            continue
         return
-    with _store() as store:
-        reranker_mod.run_ram_figure(marker, store)
 
 
 def request_ram_figure() -> bool:
