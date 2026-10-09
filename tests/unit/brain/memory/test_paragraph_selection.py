@@ -47,13 +47,19 @@ def test_a_text_without_a_boundary_is_cut_by_characters() -> None:
 
 
 def test_the_cut_shrinks_until_the_probe_agrees() -> None:
-    """A tokenizer that counts 2 per character: the first proportional guess is
-    too long and the loop shortens it strictly each step."""
-    probe = _Probe(lambda t: 2 * len(t))
-    text = "word " * 40
-    cut = sr._cut_to_tokens(probe, text, 2 * len(text), 50)
-    assert cut is not None and cut.tokens <= 50 and 2 * len(cut.text) == cut.tokens
+    """A tokenizer that is dense at the start of the text (3 tokens per character for
+    the first 30 characters, then 1): the first proportional guess overshoots the cap
+    and the loop shortens it strictly each step until the probe's count fits."""
+
+    def dense_start(t: str) -> int:
+        return len(t) + 2 * min(len(t), 30)
+
+    probe = _Probe(dense_start)
+    text = "word " * 20
+    cut = sr._cut_to_tokens(probe, text, dense_start(text), 80)
+    assert cut is not None and cut.tokens <= 80 and cut.tokens == dense_start(cut.text)
     lengths = [len(t) for t in probe.probed]
+    assert len(lengths) >= 2, "the first guess overshot"
     assert lengths == sorted(lengths, reverse=True) and len(set(lengths)) == len(lengths)
 
 
