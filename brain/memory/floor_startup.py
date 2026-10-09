@@ -27,8 +27,8 @@ computed while a reply is being built: `MemoryStore.get_cosine_floor` /
   with no RAM figure flags the need (`request_ram_figure` records it) and the REPL, once that reply
   is finished, calls `start_requested_ram_figure`, which measures the figure (the one full-length
   pair, S200) on a daemon thread; never while the flagged reply is being built. The bridge relies
-  on its lull job. S218: that thread also never measures across a reply (a reply that starts while
-  it runs abandons it, its sample is discarded, and it runs again once that reply has ended);
+  on its lull job. S218: that thread's sample never spans a reply (a reply that starts while it
+  runs abandons it, the sample is discarded, and it runs again once that reply has ended);
 * never more than ONE bootstrap in flight per floor: every start (startup
   thread, first-need request, message retry, cadence job) goes through
   `try_begin(kind)` / `end(kind)`.
@@ -337,7 +337,8 @@ def _ram_figure_body(persona_dir: Path) -> None:
     activity marker, then `run_ram_figure`: the one full-length pair, S200), on this thread, with
     a store of its own that it closes. Provider exceptions are logged by `_spawn`.
 
-    S218: this thread never measures while a reply is in flight. It first waits until none is
+    S218: this thread never STARTS a measurement while a reply is in flight, and its sample never
+    spans a reply (a call already running when a reply starts finishes, its sample is discarded). It first waits until none is
     (`cli_throttle.wait_for_no_reply_in_flight`, a condition wait: no polling, no time constant),
     takes a `reply_watch` snapshot, and runs. If a reply starts while the run is in progress the
     run is abandoned (`RamMeasurementAbandoned`; its sample is discarded, nothing is recorded) and

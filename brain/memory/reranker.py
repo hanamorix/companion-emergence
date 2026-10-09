@@ -996,6 +996,10 @@ def ram_figure_due(
     with _cost_lock:
         if model_id not in _ram_figure_needed:
             return False
+        if model_id in _pair_ran_unrecorded:
+            # S218: its pair already ran in this process without a sample; every run is refused,
+            # so do not open a store for it at each flagged reply.
+            return False
         stamp = _ram_figure_attempt.get(model_id, _NEVER)
     if stamp is not _NEVER and stamp == activity_marker:
         return False
@@ -1062,6 +1066,7 @@ def _abandon_if_replying(watch: Callable[[], bool] | None) -> None:
     """S218: raise `RamMeasurementAbandoned` when the caller's `watch` says a reply has started
     (or was already in flight when the watch was taken). `None` = no watch: never raises."""
     if watch is not None and not watch():
+        log.info("reranker: RAM figure measurement abandoned: a reply started while it ran (S218)")
         raise RamMeasurementAbandoned("a reply started while the one-pair RAM measurement ran")
 
 

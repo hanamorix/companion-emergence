@@ -353,6 +353,7 @@ def test_a_reply_starting_during_the_pair_abandons_it_and_the_rerun_after_the_re
         thread.join(_TIMEOUT)
         assert not thread.is_alive()
         assert len(provider.timed) == 1, "the re-run was refused: no second pair on the grown arena"
+        assert loop.builds == 1, "the refused re-run built nothing"
         _nothing_recorded(loop.store)
         assert reranker_mod._ram_figure_needed == {_RERANKER_ID}  # noqa: SLF001
         assert all(w is not None for w in loop.watches), "the body passes a watch to every run"
@@ -384,7 +385,7 @@ def test_a_reply_that_started_and_ended_before_the_pair_returned_is_seen_too(
         assert not thread.is_alive()
         assert len(provider.timed) == 1, "the sample was discarded and the re-run refused"
         _nothing_recorded(loop.store)
-        assert len(loop.watches) == 2, "run, abandoned, run again (refused)"
+        assert len(loop.watches) == 1, "run, abandoned; the re-run is not even due (pair ran, no sample)"
     finally:
         release.set()
         loop.finish(thread)
@@ -421,6 +422,65 @@ def test_a_reply_starting_before_the_pair_abandons_it_and_the_rerun_after_the_re
         assert reranker_mod._ram_figure_needed == set()  # noqa: SLF001
     finally:
         loop.finish(thread)
+
+
+def test_a_reply_starting_during_the_warm_ups_abandons_and_the_rerun_after_the_reply_measures(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    provider = _Scripted()
+    fired: list[int] = []
+
+    def _warm(n: int) -> None:
+        if n == 2 and not fired:
+            fired.append(n)
+            cli_throttle.note_user_message()  # a reply starts during the second warm-up
+
+    provider.on_warm = _warm
+    loop = _Loop(monkeypatch, tmp_path, provider)
+    thread = loop.start()
+    try:
+        assert loop.entered[1].wait(_TIMEOUT)
+        assert provider.timed == [] and thread.is_alive(), "the pair did not run"
+        assert _RERANKER_ID not in reranker_mod._pair_ran_unrecorded  # noqa: SLF001
+        cli_throttle.note_reply_end()
+        thread.join(_TIMEOUT)
+        assert not thread.is_alive()
+        assert len(provider.timed) == 1
+        assert reranker_mod.ram_figure_ready(_RERANKER_ID, loop.store) is True
+    finally:
+        loop.finish(thread)
+
+
+def test_every_abandon_is_logged(caplog: pytest.LogCaptureFixture, tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    watch = _Watch()
+    watch.trip()
+    with caplog.at_level("INFO", logger=reranker_mod.log.name):
+        with pytest.raises(RamMeasurementAbandoned):
+            reranker_mod.measure_ram_figure(_Scripted(), store, watch=watch)
+    assert any("abandoned" in r.getMessage() for r in caplog.records)
+
+
+def test_a_flagged_reply_after_the_pair_ran_unrecorded_is_not_due_and_opens_no_store(
+    tmp_path: Path,
+) -> None:
+    reranker_mod.note_ram_figure_needed(_RERANKER_ID)
+    reranker_mod._pair_ran_unrecorded.add(_RERANKER_ID)  # noqa: SLF001
+
+    def _no_store():
+        pytest.fail("no store is opened for a measurement that will be refused")
+
+    assert reranker_mod.ram_figure_due("a-new-marker", _no_store) is False
+    reranker_mod._pair_ran_unrecorded.discard(_RERANKER_ID)  # noqa: SLF001
+    store = _store(tmp_path)
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _open():
+        yield store
+
+    assert reranker_mod.ram_figure_due("a-new-marker", _open) is True, "without the mark it is due"
 
 
 def test_a_reply_in_flight_when_the_thread_starts_delays_everything_until_it_ends(

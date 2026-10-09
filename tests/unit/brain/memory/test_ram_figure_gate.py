@@ -463,7 +463,7 @@ def test_s210_the_recall_only_records_the_need_and_a_second_flagged_turn_starts_
 
     store, _memories = _recall_setup(monkeypatch, tmp_path)
     floor_startup.enable_background_ram_figure(tmp_path)
-    monkeypatch.setattr(reranker_mod, "run_ram_figure", lambda *a: pytest.fail("S210: started during the turn"))
+    monkeypatch.setattr(reranker_mod, "run_ram_figure", lambda *a, **k: pytest.fail("S210: started during the turn"))
     for _ in range(2):
         run_semantic_recall(store, tmp_path, _QUERY)
     assert floor_startup._ram_figure_requested is True  # noqa: SLF001
@@ -501,7 +501,7 @@ def test_s201_without_a_registered_direct_chat_no_thread_starts(
 
     store, _memories = _recall_setup(monkeypatch, tmp_path)
     assert floor_startup._ram_figure_persona_dir is None  # noqa: SLF001
-    monkeypatch.setattr(reranker_mod, "run_ram_figure", lambda *a: pytest.fail("no background measurement"))
+    monkeypatch.setattr(reranker_mod, "run_ram_figure", lambda *a, **k: pytest.fail("no background measurement"))
     result = run_semantic_recall(store, tmp_path, _QUERY)
     assert result is not None and result.path == COSINE_PATH
     assert not floor_startup.inflight("ram-figure")
