@@ -759,6 +759,22 @@ def _claude_failure_detail(result: subprocess.CompletedProcess[str]) -> str:
     return detail
 
 
+def _last_result_line(stdout: str) -> dict[str, Any] | None:
+    """The last `{"type": "result"}` line of an NDJSON stdout, else None (#330).
+
+    Splits on "\n" only: `splitlines()` would also break a frame on a raw
+    U+2028/U+2029/U+0085 inside a JSON string.
+    """
+    for raw in reversed(stdout.split("\n")):
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and obj.get("type") == "result":
+            return obj
+    return None
+
+
 def _claude_failure_detail_text(result: subprocess.CompletedProcess[str]) -> str:
     stderr = (result.stderr or "").strip()
     stdout = (result.stdout or "").strip()
@@ -766,7 +782,7 @@ def _claude_failure_detail_text(result: subprocess.CompletedProcess[str]) -> str
         try:
             payload = json.loads(stdout)
         except json.JSONDecodeError:
-            payload = None
+            payload = _last_result_line(stdout)  # #330: stream-json NDJSON stdout
         if isinstance(payload, dict):
             parts: list[str] = []
             if payload.get("api_error_status") is not None:
@@ -1457,6 +1473,9 @@ class ClaudeCliProvider(LLMProvider):
             audit_offset_before = 0
 
         tmp_path: str | None = None
+        # #330: the CLI's built-in tool calls, written to the audit log in the
+        # `finally` below (one flush for every exit that got as far as stdout).
+        builtin_calls: dict[str, dict[str, Any]] = {}
         try:
             try:
                 with tempfile.NamedTemporaryFile(
@@ -1493,7 +1512,8 @@ class ClaudeCliProvider(LLMProvider):
                 "-p",
                 "--dangerously-skip-permissions",
                 "--output-format",
-                "json",
+                "stream-json",
+                "--verbose",
                 "--model",
                 self._model,
             ]
@@ -1520,10 +1540,16 @@ class ClaudeCliProvider(LLMProvider):
                         creationflags=_NO_WINDOW,
                     )
                 except subprocess.TimeoutExpired as exc:
+                    # #330 / ledger C12: the partial stdout is not scanned, so built-in
+                    # calls made before a timeout are not audited (the streaming path is).
                     raise ProviderError(
                         "claude_cli_timeout",
                         f"subprocess timed out after {self._timeout}s",
                     ) from exc
+
+            # Parse before the exit-code check so a non-zero exit still flushes
+            # the built-in calls it saw.
+            payload = _scan_blocking_stream_stdout(result.stdout, builtin_calls)
 
             if result.returncode != 0:
                 raise ProviderError(
@@ -1532,7 +1558,8 @@ class ClaudeCliProvider(LLMProvider):
                 )
 
             try:
-                payload = json.loads(result.stdout)
+                if payload is None:
+                    raise ValueError("no result frame")
                 if payload.get("subtype") == "error_max_budget_usd" or (
                     payload.get("is_error")
                     and any(
@@ -1549,7 +1576,7 @@ class ClaudeCliProvider(LLMProvider):
                 if cli_err is not None:
                     raise ProviderError("claude_cli_error", cli_err)
                 content = str(payload["result"])
-            except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            except (ValueError, KeyError, TypeError) as exc:
                 raise ProviderError(
                     "claude_cli_parse",
                     f"unexpected output format: {result.stdout[:200]!r}",
@@ -1577,6 +1604,9 @@ class ClaudeCliProvider(LLMProvider):
                 raw=None,
             )
         finally:
+            # After the `dispatched` read above, so this call's own built-in rows
+            # can never become its dispatched_invocations (audit-only, #273).
+            _flush_builtin_audit(persona_dir, builtin_calls)
             if tmp_path is not None:
                 try:
                     os.unlink(tmp_path)
@@ -1647,6 +1677,50 @@ def _tool_result_text(content: Any) -> str:
             for b in content
         )
     return json.dumps(content, default=str, ensure_ascii=False)
+
+
+def _scan_blocking_stream_stdout(
+    stdout: str | None, calls: dict[str, dict[str, Any]]
+) -> dict[str, Any] | None:
+    """Scan a blocking `claude -p --output-format stream-json --verbose` stdout (#330).
+
+    Feeds `assistant`/`user` frames to the #273 built-in collectors and returns
+    the terminal `result` frame (the same object `--output-format json` printed),
+    or None. Lines split on "\n" only: `str.splitlines()` also breaks on
+    U+2028/U+2029/U+0085, which JSON serialisers emit raw inside strings.
+    Not `_parse_stream_json_result`, which is an unrelated (dead) parser below.
+    """
+    result: dict[str, Any] | None = None
+    for raw in (stdout or "").split("\n"):
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        kind = obj.get("type")
+        if kind == "assistant":
+            message = obj.get("message")
+            _collect_builtin_calls(message.get("content") if isinstance(message, dict) else None, calls)
+        elif kind == "user":
+            _collect_builtin_results(obj, calls)
+        elif kind == "result":
+            result = obj
+    if result is None:
+        # ponytail: single-object shape (what `--output-format json` printed). Kept so
+        # stubs and any CLI that ignores the format flag still parse; delete once migrated.
+        # A typed non-result frame (e.g. a lone `init`) must NOT become the payload:
+        # _cli_error_detail would call provider_auth.note_cli_success() on it.
+        try:
+            whole = json.loads(stdout or "")
+        except json.JSONDecodeError:
+            return None
+        if isinstance(whole, dict) and whole.get("type") in (None, "result"):
+            return whole
+    return result
 
 
 def _flush_builtin_audit(persona_dir: Path | None, calls: dict[str, dict[str, Any]]) -> None:
