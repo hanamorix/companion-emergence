@@ -2088,6 +2088,23 @@ def test_j2_v1_a_capped_own_level_without_a_usage_file_counts_zero(monkeypatch: 
     assert _v1() == 0.0
 
 
+def test_j1_a_chain_with_no_capped_level_has_no_figure_of_its_own() -> None:
+    """The helper itself never turns "nothing capped" into a number: None, so the caller falls back (a 0.0 here
+    would be read as a fully used cap)."""
+    assert reranker_mod._cgroup_chain_headroom([], "memory.current", reranker_mod._RECLAIM_KEYS_V2) is None  # noqa: SLF001
+
+
+def test_j2_v1_an_unreadable_use_hierarchy_warns_that_the_walk_continues_not_that_a_level_counts_zero(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    tree = _v1_chain(_v1lvl(5_500_000_000, 5_000_000_000, _v1s()), _v1lvl(4_000_000_000, 3_500_000_000, _V1_ZERO, "0"))
+    _use_files(monkeypatch, tree, raising=(f"{_V1_PAR}/memory.use_hierarchy",))
+    with caplog.at_level("DEBUG"):
+        assert _v1() == 500_000_000.0  # the unreadable flag keeps the walk going: the parent binds
+    found = _warnings(caplog, "memory.use_hierarchy")
+    assert len(found) == 1 and "keeps going" in found[0].getMessage() and "no headroom" not in found[0].getMessage()
+
+
 # ---- J3: the headroom is the smaller of the cgroup figure and psutil (S241) ----
 
 
