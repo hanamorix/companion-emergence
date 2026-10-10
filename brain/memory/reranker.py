@@ -55,6 +55,7 @@ See ``RERANKER_PRECISION`` (the tunable default, mirroring
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import statistics
 import sys
@@ -157,6 +158,16 @@ RERANKER_PRECISION_FP32 = "fp32"
 RERANKER_PRECISION: str = tunables.register("reranker.precision", RERANKER_PRECISION_FP16)
 
 
+class RerankTerminated(Exception):  # noqa: N818 - a control signal, not an error
+    """S223: a scoring call was stopped on purpose (the stop returned by `arm_terminate` was
+    called). Raised only to a thread that armed a stop; the RAM ladder maps it to
+    `RamMeasurementAbandoned`."""
+
+
+def _noop() -> None:
+    return None
+
+
 class RerankerProvider(ABC):
     """Abstract reranker provider. Subclasses implement `rerank` and `model_id`."""
 
@@ -171,6 +182,17 @@ class RerankerProvider(ABC):
     @abstractmethod
     def model_id(self) -> str:
         """Stable identifier for the model producing these scores."""
+
+    def arm_terminate(self) -> Callable[[], None]:
+        """S223: prepare to stop the NEXT scoring call(s) made by THIS thread: returns a `stop()`
+        (callable from any thread) that makes that call end early with `RerankTerminated`, until
+        `disarm_terminate()`. The default provider cannot stop a call: it returns a no-op, and the
+        running call simply finishes (S218: only its sample is discarded)."""
+        return _noop
+
+    def disarm_terminate(self) -> None:
+        """S223: end this thread's armed scope (see `arm_terminate`). Default: nothing to do."""
+        return None
 
     def rerank_timed(
         self, query: str, documents: list[str]
@@ -235,6 +257,11 @@ class CrossEncoderProvider(RerankerProvider):
     """
 
     _session_checked = False  # S222: the live session's options are read back once (below)
+    # S223 (class defaults: tests build providers without `__init__`): see `__init__`.
+    _want_terminable = False
+    _run_wrapped = False
+    _wrapper_calls = 0
+    _drift_checked = False
 
     def __init__(self, model_id: str, cache_dir: str | Path) -> None:
         # Imported lazily (module-scoped, not top-level) so importing this
@@ -266,10 +293,100 @@ class CrossEncoderProvider(RerankerProvider):
         # rerank() call (construction + inference) behind one instance lock,
         # matching FastEmbedProvider's conservative choice.
         self._rerank_lock = threading.Lock()
+        # S223: stoppable calls. `_local.scope` is the RunOptions armed by the CALLING thread (read
+        # and written only by that thread); `_want_terminable` is set by the first arm and makes
+        # the next scored call wrap the session's `run` (a provider nobody ever armed, such as the
+        # bridge's, never touches the session); `_run_wrapped`, `_wrapper_calls` and
+        # `_drift_checked` are read and written under `_rerank_lock`.
+        self._local = threading.local()
+
+    def arm_terminate(self) -> Callable[[], None]:
+        """S223: see `RerankerProvider.arm_terminate`. Makes a fresh ONNX Runtime `RunOptions` for
+        this thread; the returned `stop()` sets its `terminate` flag, which ORT polls while the
+        call runs (a probe on this host: the production model's call stopped 118-216 ms after
+        the flag, against 6-9 s for the unstopped call). The options belong to THIS thread's call
+        only, so a stop can never reach another thread's call (the floor-bootstrap thread, a
+        reply's own recall rerank). A stop before the call starts makes the call start terminated.
+        `onnxruntime` unavailable: a no-op stop (the S218 fallback)."""
+        try:
+            import onnxruntime as ort
+
+            options = ort.RunOptions()
+        except Exception:  # noqa: BLE001
+            log.warning("reranker: cannot make runs stoppable (onnxruntime RunOptions)", exc_info=True)
+            return _noop
+        self._local.scope = options
+        self._want_terminable = True
+
+        def stop() -> None:
+            options.terminate = True
+
+        return stop
+
+    def disarm_terminate(self) -> None:
+        """S223: end this thread's armed scope."""
+        self._local.scope = None
+
+    def _install_terminable_run(self) -> None:
+        """S223: once, before the first scored call after an arm, shadow the loaded session's
+        `run` with a wrapper that hands the calling thread's armed `RunOptions` to ONNX Runtime
+        (fastembed's own call passes none). Caller holds `_rerank_lock`. Without an armed scope on
+        the calling thread (or with options supplied by the caller) the wrapper forwards its
+        arguments untouched, so every other caller sees the original behaviour. A failure to
+        install is warned once and leaves the S218 fallback (the call finishes, its sample is
+        discarded)."""
+        if self._run_wrapped or not self._want_terminable:
+            return
+        self._run_wrapped = True
+        try:
+            inner = self._model.model
+            if getattr(inner, "model", None) is None:
+                inner.load_onnx_model()
+            session = inner.model
+            original = session.run
+            local = self._local
+
+            def terminable_run(output_names: Any, input_feed: Any, run_options: Any = None) -> Any:
+                self._wrapper_calls += 1
+                options = getattr(local, "scope", None)
+                if options is None or run_options is not None:
+                    return original(output_names, input_feed, run_options)
+                try:
+                    return original(output_names, input_feed, options)
+                except Exception as exc:
+                    if options.terminate:
+                        raise RerankTerminated("the scoring call was stopped on purpose") from exc
+                    raise
+
+            session.run = terminable_run
+        except Exception:  # noqa: BLE001 - never break a recall because the stop cannot be installed
+            log.warning(
+                "reranker: could not make the scoring session stoppable; a reply that starts "
+                "during the RAM measurement waits for its call (S223 fallback to S218)",
+                exc_info=True,
+            )
+            self._run_wrapped = False
+            self._want_terminable = False
+
+    def _check_wrapper_reached_once(self, calls_before: int, documents: Sequence[str]) -> None:
+        """S223 drift check: after the first scored call (at least one document) through the
+        wrapper, warn once if the wrapper was never reached (fastembed no longer calls
+        `session.run`, so a stop would do nothing). Caller holds `_rerank_lock`. Never raises."""
+        if not self._run_wrapped or self._drift_checked or not documents:
+            return
+        self._drift_checked = True
+        if self._wrapper_calls == calls_before:
+            log.warning(
+                "reranker: the scoring call did not go through the session's run; the RAM "
+                "measurement cannot be stopped when a reply starts (S223 fallback to S218)"
+            )
 
     def rerank(self, query: str, documents: list[str]) -> list[float]:
         with self._rerank_lock:
+            self._install_terminable_run()
+            calls_before = self._wrapper_calls
             scores = list(self._model.rerank(query, documents))
+            self._check_wrapper_reached_once(calls_before, documents)
             self._check_session_options_once()
             return scores
 
@@ -300,11 +417,14 @@ class CrossEncoderProvider(RerankerProvider):
         holding `_rerank_lock`, so time spent WAITING for another thread's
         rerank is never counted as this call's cost (plan P-3)."""
         with self._rerank_lock:
+            self._install_terminable_run()  # before the clock: the install may load the session
+            calls_before = self._wrapper_calls
             before = peak_rss.begin()
             start = _clock()
             scores = list(self._model.rerank(query, documents))
             seconds = _clock() - start
             growth = peak_rss.growth_since(before)
+            self._check_wrapper_reached_once(calls_before, documents)
             self._check_session_options_once()
         return scores, seconds, growth
 
@@ -1062,6 +1182,26 @@ def _abandon_if_replying(watch: Callable[[], bool] | None) -> None:
         raise RamMeasurementAbandoned("a reply started while the RAM measurement ran")
 
 
+@contextlib.contextmanager
+def _stop_on_reply(provider: RerankerProvider, watch: Callable[[], bool] | None):
+    """S223: while the block runs, a reply that starts stops the call this thread makes on
+    `provider` (`arm_terminate`; the stop is registered with the watch's `on_reply_start`, so it
+    runs on the replying thread the moment the reply starts). On every exit the hook is
+    unregistered and the scope disarmed. No watch (the bridge's lull job), or a watch without
+    `on_reply_start` (a plain callable): nothing is armed and the call simply finishes (S218)."""
+    register = getattr(watch, "on_reply_start", None)
+    if register is None:
+        yield
+        return
+    stop = provider.arm_terminate()
+    unregister = register(stop)
+    try:
+        yield
+    finally:
+        unregister()
+        provider.disarm_terminate()
+
+
 @dataclass(frozen=True)
 class _Rung:
     """One ladder step: `pairs` documents, each pair at most `target` tokens long; `full`
@@ -1123,8 +1263,14 @@ def _run_rung(
         return False
     text, length = built
     _abandon_if_replying(watch)
-    _scores, seconds, growth = provider.rerank_timed(text, [text] * rung.pairs)
-    _abandon_if_replying(watch)  # a reply started during the call: this sample is discarded
+    try:
+        with _stop_on_reply(provider, watch):
+            _scores, seconds, growth = provider.rerank_timed(text, [text] * rung.pairs)
+    except RerankTerminated:
+        # S223: a reply started and stopped the call; nothing was measured.
+        log.info("reranker: RAM measurement stopped: a reply started during the call (S223)")
+        raise RamMeasurementAbandoned("a reply started and stopped the RAM measurement's call") from None
+    _abandon_if_replying(watch)  # a reply started after the last node: this sample is discarded
     if growth is None:
         _warn_ram_figure_once("RAM measurement stopped: the call's peak growth could not be read")
         return False
@@ -1167,9 +1313,14 @@ def measure_ram_figure(
     S218: with a `watch` (the direct chat passes `cli_throttle.reply_watch()`), a reply that
     starts while this runs abandons the rung in progress: `RamMeasurementAbandoned` is raised,
     checked before the pair-length probe, before and after each call, and that rung's sample is
-    not recorded (earlier rungs' samples stay). A call already running finishes: only its SAMPLE
-    is guaranteed not to overlap a reply. With the memory pool off an abandoned call leaves no
-    residue, so the pass simply resumes after the reply."""
+    not recorded (earlier rungs' samples stay). S223: the call already running is STOPPED when
+    the reply starts (the watch's `on_reply_start` calls the stop `provider.arm_terminate()`
+    returned: ONNX Runtime's `RunOptions.terminate`, so the reply does not wait for the call and
+    the call's own tail does not overlap the reply); a provider that cannot be stopped (the base
+    `arm_terminate`, or a session that could not be wrapped) lets the call finish and only its
+    SAMPLE is guaranteed not to overlap a reply (S218). With the memory pool off an abandoned
+    call leaves no residue, so the pass simply resumes after the reply. The model load, the
+    one-token warm-up and the tokenizer-only length probe are not stoppable."""
     model_id = provider.model_id()
     _abandon_if_replying(watch)
     pair = _full_length_pair(provider)

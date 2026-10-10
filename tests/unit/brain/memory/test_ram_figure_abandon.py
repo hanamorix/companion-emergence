@@ -98,7 +98,7 @@ def test_a_reply_starting_during_a_call_discards_that_rungs_sample_only(tmp_path
     provider.on_timed = lambda pairs, length: watch.trip() if length == 256 else None  # rung 3
     with pytest.raises(RamMeasurementAbandoned):
         reranker_mod.measure_ram_figure(provider, store, watch=watch)
-    assert provider.timed == [(1, 1024), (1, 512), (1, 256)], "the call itself cannot be interrupted"
+    assert provider.timed == [(1, 1024), (1, 512), (1, 256)], "this provider cannot stop its call (S218 fallback): it finishes"
     assert sorted(shapes_in_window(store, _MODEL)) == [(1, 512), (1, 1024)], "rungs 1 and 2 stay; 3 is not recorded"
     assert reranker_mod._rerank_cost.state(store, _MODEL).sums.n == 2  # noqa: SLF001
 
