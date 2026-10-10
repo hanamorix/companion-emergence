@@ -132,6 +132,14 @@ def make_provider(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     return _make
 
 
+def _prime(provider) -> None:
+    """Install the wrapper first (one armed call, then disarm), so a later call by another thread
+    goes THROUGH the wrapper: otherwise "that call got no options" would hold for any design."""
+    provider.arm_terminate()
+    provider.rerank("prime", ["prime"])
+    provider.disarm_terminate()
+
+
 def _on_thread(fn, *args) -> tuple[threading.Thread, dict]:
     result: dict[str, Any] = {}
 
@@ -271,6 +279,16 @@ def test_a_scoring_call_that_never_reaches_the_session_warns_once_but_an_empty_l
     assert len([r for r in caplog.records if "did not go through" in r.getMessage()]) == 1
 
 
+def test_a_normal_armed_call_logs_no_warning(make_provider, caplog: pytest.LogCaptureFixture) -> None:
+    session = _Session()
+    provider = make_provider(session)
+    provider.arm_terminate()
+    with caplog.at_level("WARNING", logger=reranker_mod.log.name):
+        provider.rerank("q", ["d"])
+        provider.rerank_timed("q", ["d"])
+    assert not [r for r in caplog.records if "stoppable" in r.getMessage() or "did not go through" in r.getMessage()]
+
+
 def test_the_base_provider_cannot_stop_its_call() -> None:
     provider = ScriptedLadderProvider()
     stop = provider.arm_terminate()
@@ -318,7 +336,7 @@ def test_a_stop_during_the_call_ends_it_with_rerank_terminated_chained_to_the_se
     assert session.stopped_by_flag == 1
 
 
-def test_a_stop_made_on_another_thread_than_the_one_that_armed_does_not_touch_that_threads_nothing(
+def test_a_thread_that_did_not_arm_gets_no_run_options_even_through_the_wrapper(
     make_provider,
 ) -> None:
     """The options belong to the arming thread: a call made by a thread that did not arm uses none."""
@@ -394,8 +412,10 @@ def test_a_stop_cannot_reach_another_threads_running_call_and_the_armed_call_sta
     arms, waits behind the lock, and its stop fires meanwhile. Y's call is untouched; X's call is
     terminated when it finally starts."""
     session = _Session()
-    session.block_all = True
     provider = make_provider(session)
+    _prime(provider)
+    session.calls.clear()
+    session.block_all = True
     y_thread, y_result = _on_thread(provider.rerank, "q", ["d"])
     assert session.entered.wait(_TIMEOUT)
 
@@ -553,8 +573,10 @@ def test_a_reply_during_another_threads_call_does_not_stop_it_and_the_ladders_ca
     """Review M1 at the ladder level: the floor-bootstrap thread's call holds the provider while the
     ladder's rung is armed and waiting; a reply starts. The bootstrap's call is not stopped."""
     session = _Session()
-    session.block_all = True
     provider = make_provider(session)
+    _prime(provider)
+    session.calls.clear()
+    session.block_all = True
     store = MemoryStore(tmp_path / "memories.db")
     bootstrap, bootstrap_result = _on_thread(provider.rerank, "q", ["d"])
     assert session.entered.wait(_TIMEOUT)

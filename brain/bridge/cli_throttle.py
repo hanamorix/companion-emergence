@@ -179,7 +179,9 @@ class ReplyWatch:
         logged and swallowed). If this watch is already not clear (a reply was in flight at the
         snapshot, or one started since) the callback runs at once, on the calling thread. Returns
         an idempotent `unregister()`; a callback unregistered before a reply starts never runs.
-        Used by the RAM ladder to stop its running ONNX call (the reply must not wait for it)."""
+        Used by the RAM ladder to stop its running ONNX call (the reply must not wait for it).
+        The callback runs on the REPLY thread, inside `note_user_message`: it must be quick and
+        must not block."""
         hook = _StartHook(callback)
         with _lock:
             _start_hooks.append(hook)

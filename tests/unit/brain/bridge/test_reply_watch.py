@@ -229,8 +229,15 @@ def test_two_watches_register_independently():
 def test_reset_clears_registrations_and_a_late_unregister_does_not_raise():
     watch = cli_throttle.reply_watch()
     calls: list[int] = []
-    unregister = watch.on_reply_start(lambda: calls.append(1))
+    watch.on_reply_start(lambda: calls.append(1))
     cli_throttle.reset()
-    unregister()  # after reset: must not raise
     cli_throttle.note_user_message()
-    assert calls == []
+    assert calls == [], "reset cleared the registration (a stale one would have fired now)"
+
+
+def test_a_late_unregister_after_reset_does_not_raise():
+    watch = cli_throttle.reply_watch()
+    unregister = watch.on_reply_start(lambda: None)
+    cli_throttle.reset()
+    unregister()
+    unregister()

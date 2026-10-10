@@ -1198,8 +1198,9 @@ def _stop_on_reply(provider: RerankerProvider, watch: Callable[[], bool] | None)
         yield
         return
     stop = provider.arm_terminate()
-    unregister = register(stop)
+    unregister = _noop
     try:
+        unregister = register(stop)
         yield
     finally:
         unregister()
