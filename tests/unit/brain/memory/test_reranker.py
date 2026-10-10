@@ -826,13 +826,6 @@ def _warnings(caplog: pytest.LogCaptureFixture, needle: str) -> list:
     return [r for r in caplog.records if r.levelname == "WARNING" and needle in r.getMessage()]
 
 
-@pytest.fixture(autouse=True)
-def _clean_ram_warn_set():
-    reranker_mod._ram_figure_warned.clear()
-    yield
-    reranker_mod._ram_figure_warned.clear()
-
-
 # ---- G1/G2/G3: the formula, what is and is not reclaimable, the clamps (one level) ----
 
 
@@ -952,7 +945,9 @@ def test_g4_unreadable_own_stat_subtracts_nothing_and_warns_once(
     with caplog.at_level("DEBUG"):
         assert _v2() == 5_000_000_000.0
         assert _v2() == 5_000_000_000.0
-    assert len(_warnings(caplog, "memory.stat")) == 1
+    warns = _warnings(caplog, "memory.stat")
+    assert len(warns) == 1
+    assert warns[0].exc_info is not None  # the traceback comes with the first warning
 
 
 def test_g4_absent_stat_file_is_silent(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
@@ -1135,6 +1130,15 @@ def test_g9_an_ancestor_without_a_usable_usage_uses_the_own_usage_and_reclaimabl
     assert len(_warnings(caplog, "memory.current")) == (0 if mode == "absent" else 1)
 
 
+def test_g9_the_fallback_reclaimable_is_capped_at_the_own_usage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Parent cap 4.0 GB without a usable usage; own usage 100 MB but an own stat claiming 900 MB reclaimable
+    (skewed files): the stand-in is capped at the own usage, so the headroom is the parent's limit, not more."""
+    own = _stat(cache=900_000_000, mapped=0, dirty=0, writeback=0, shmem=0)
+    tree = _tree({_OWN: _lvl("max", 100_000_000, own), _PAR: _lvl(4_000_000_000, None, _stat())})
+    _use_files(monkeypatch, tree)
+    assert _v2() == 4_000_000_000.0
+
+
 # ---- G10: the None cases, the files that are (not) opened ----
 
 
@@ -1206,6 +1210,30 @@ def test_g10_no_own_usage_file_and_nothing_to_measure_with_is_none(monkeypatch: 
     # an ancestor is capped but has no usable usage either, and the own level has none to stand in
     _use_files(monkeypatch, _tree({_OWN: _lvl(None, None, _stat()), _PAR: _lvl(4_000_000_000, None, _stat())}))
     assert _v2() is None
+
+
+def test_g10_with_no_own_usage_one_unusable_capped_ancestor_makes_the_whole_figure_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Own cgroup exposes no memory files; the parent is capped and readable, the root-level cap has garbage usage:
+    no figure can be given for the second level, so the reader returns None (the caller falls back) rather than a
+    figure that ignores a cap it could not measure. Pinned as the fail-soft contract (None = fall back)."""
+    tree = _tree(
+        {
+            _OWN: _lvl(None, None, None),
+            _PAR: _lvl(4_000_000_000, 3_200_000_000, _stat()),
+            _GRAND: _lvl(8_000_000_000, "abc", _stat()),
+        }
+    )
+    _use_files(monkeypatch, tree)
+    assert _v2() is None
+
+
+def test_g10_nothing_of_the_own_level_is_opened_when_no_level_has_a_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    opened: list[str] = []
+    _use_files(monkeypatch, _tree({_OWN: _lvl("max", 1, _stat()), _PAR: _lvl("max", 1, _stat())}), opened=opened)
+    assert _v2() is None
+    assert not any(p.endswith(("/memory.current", "/memory.stat")) for p in opened)
 
 
 def test_g10_the_stat_is_only_opened_after_the_own_usage_was_read(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1315,8 +1343,8 @@ def test_g13_the_ancestor_only_cap_is_not_dropped_to_psutil(monkeypatch: pytest.
     assert reranker_mod._available_ram_headroom_bytes() == 4_000_000_000.0 - (3_200_000_000.0 - 500_000_000.0)
 
 
-def _sweep_for(text: str, token: str) -> bool:
-    return token in text
+def _py_files_mentioning(root, token: str) -> list[str]:
+    return [str(p) for p in root.rglob("*.py") if token in p.read_text(encoding="utf-8")]
 
 
 def test_g12_the_docstrings_state_the_new_formula_and_the_v1_claim_is_corrected() -> None:
@@ -1327,7 +1355,7 @@ def test_g12_the_docstrings_state_the_new_formula_and_the_v1_claim_is_corrected(
     for doc in (helper, avail):
         assert "file_mapped" in doc and "tmpfs" in doc
     assert "file_writeback" in helper and "shmem" in helper
-    assert "MINIMUM" in v2 and "own usage" in v2 and "siblings" in v2
+    assert "MINIMUM" in v2 and "own usage" in v2 and "siblings" in v2 and "file_mapped" in v2
     assert "total_cache" in v1 and "total_mapped_file" in v1 and "tmpfs" in v1
     assert "OWN cgroup" in v1 and "NOT visible" in v1 and "own setting" in v1
     assert "already hierarchical" not in v1 and "no walk-up is needed" not in v1
@@ -1335,14 +1363,17 @@ def test_g12_the_docstrings_state_the_new_formula_and_the_v1_claim_is_corrected(
         assert "matches psutil" not in doc.lower() and "matches the host" not in doc.lower()
 
 
-def test_g12_no_text_in_brain_still_calls_inactive_file_the_reclaimable_term() -> None:
+def test_g12_no_text_in_brain_still_calls_inactive_file_the_reclaimable_term(tmp_path) -> None:
     from pathlib import Path
 
     root = Path(reranker_mod.__file__).resolve().parents[1]
-    hits = [str(p) for p in root.rglob("*.py") if _sweep_for(p.read_text(encoding="utf-8"), "inactive_file")]
-    assert hits == []
-    # the sweep can fail: it flags a known-bad string
-    assert _sweep_for("reclaimable = memory.stat inactive_file", "inactive_file")
+    assert (root / "memory" / "reranker.py").is_file()
+    assert _py_files_mentioning(root, "inactive_file") == []
+    # the sweep can fail: it flags a known-bad file placed in a directory it walks
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "stale.py").write_text('"""reclaimable = memory.stat inactive_file"""\n', encoding="utf-8")
+    (tmp_path / "ok.py").write_text("x = 1\n", encoding="utf-8")
+    assert _py_files_mentioning(tmp_path, "inactive_file") == [str(tmp_path / "sub" / "stale.py")]
 
 
 def test_psutil_available_bytes_reads_the_host_available_memory(monkeypatch: pytest.MonkeyPatch) -> None:
