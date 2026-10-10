@@ -295,3 +295,15 @@ def _open(store):
     from contextlib import nullcontext
 
     return nullcontext(store)
+
+
+def test_the_marker_arriving_after_the_shapes_opens_the_gate_at_once(store) -> None:
+    """The pass records the marker LAST: the groups are unchanged when it lands, so a stale
+    memo of 'no model' (keyed on the groups alone) would keep the gate shut."""
+    for pairs, length, full in [(1, FULL, True), (1, 512, False), (1, 256, False), (2, 128, False)]:
+        reranker_mod._record_rerank_cost(  # noqa: SLF001
+            _MODEL, store, pairs * length, 0.1, 5e6 * length, pairs=pairs, longest=length, full_length=full
+        )
+    assert reranker_mod.ram_figure_ready(_MODEL, store) is False
+    reranker_mod._ram_shapes.record(store, _MODEL, ram_fit.COMPLETE_MARKER, 0.0)  # noqa: SLF001
+    assert reranker_mod.ram_figure_ready(_MODEL, store) is True
