@@ -107,8 +107,9 @@ def test_no_rung_repeats_a_shape(store) -> None:
     assert len(set(provider.timed)) == len(provider.timed)
 
 
-def test_a_rung_runs_only_when_the_fit_says_it_fits_the_headroom(store, monkeypatch) -> None:
-    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 1.0)
+@pytest.mark.parametrize("headroom", [1.0, 0.0])
+def test_a_rung_runs_only_when_the_fit_says_it_fits_the_headroom(store, monkeypatch, headroom) -> None:
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: headroom)
     provider = ScriptedLadderProvider(model=_MODEL)
     assert reranker_mod.measure_ram_figure(provider, store) is True
     assert provider.timed == [(1, 1024), (1, 512), (1, 256), (1, 128)], "phase 2 stopped at its first rung"

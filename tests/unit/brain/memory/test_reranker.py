@@ -1182,14 +1182,18 @@ def test_g10_none_cases_are_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _v2() is None
 
 
-def test_g10_garbage_own_usage_is_none_even_with_a_capped_ancestor_and_no_stat_is_opened(
+def test_g10_garbage_own_usage_with_a_capped_ancestor_is_measured_by_the_ancestor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """S238 (R12 returned None here): the own level is unlimited with an unusable usage, the parent is capped at
+    4.0 GB with 3.0 GB used and 500 MB reclaimable: 1.5 GB, from the parent's own counters. The own stat is not
+    opened (nothing needs it)."""
     opened: list[str] = []
     tree = _tree({_OWN: _lvl("max", "abc", _stat()), _PAR: _lvl(4_000_000_000, 3_000_000_000, _stat())})
     _use_files(monkeypatch, tree, opened=opened)
-    assert _v2() is None
-    assert not any(p.endswith("/memory.stat") for p in opened)
+    assert _v2() == 1_500_000_000.0
+    assert f"{_V2_ROOT}/{_PAR}/memory.stat" in opened
+    assert f"{_V2_ROOT}/{_OWN}/memory.stat" not in opened
 
 
 def test_g10_no_own_usage_file_and_a_capped_ancestor_is_measured_by_the_ancestor(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1212,12 +1216,10 @@ def test_g10_no_own_usage_file_and_nothing_to_measure_with_is_none(monkeypatch: 
     assert _v2() is None
 
 
-def test_g10_with_no_own_usage_one_unusable_capped_ancestor_makes_the_whole_figure_none(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Own cgroup exposes no memory files; the parent is capped and readable, the root-level cap has garbage usage:
-    no figure can be given for the second level, so the reader returns None (the caller falls back) rather than a
-    figure that ignores a cap it could not measure. Pinned as the fail-soft contract (None = fall back)."""
+def test_g10_with_no_own_usage_one_unusable_capped_ancestor_is_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """S238 (R12 returned None here, the whole figure): the own cgroup exposes no memory files; the parent is capped
+    and readable (4.0 GB, 3.2 GB used, 500 MB reclaimable: 1.3 GB); the root-level cap has garbage usage and no
+    stand-in exists, so that level is skipped instead of ending the read."""
     tree = _tree(
         {
             _OWN: _lvl(None, None, None),
@@ -1226,7 +1228,7 @@ def test_g10_with_no_own_usage_one_unusable_capped_ancestor_makes_the_whole_figu
         }
     )
     _use_files(monkeypatch, tree)
-    assert _v2() is None
+    assert _v2() == 1_300_000_000.0
 
 
 def test_g10_nothing_of_the_own_level_is_opened_when_no_level_has_a_limit(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1306,13 +1308,15 @@ def test_g11_v1_uses_only_total_keys_not_the_non_hierarchical_ones(monkeypatch: 
     assert reranker_mod._cgroup_v1_memory_headroom_bytes() == 500_000_000.0
 
 
-def test_g11_v1_reads_only_the_own_cgroup_not_a_parent_or_the_root(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_g11_v1_a_tighter_parent_binds_and_the_roots_stat_is_a_decoy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """S237 (R12 pinned the opposite): the parent's cap now counts, with the parent's own usage (no stat file: nothing
+    subtracted) - 1.0 GB limit, 999 MB used = 1 MB; the root has no limit file, so its stat is never used."""
     files = _v1_files(_v1_stat())
     files["/sys/fs/cgroup/memory/user.slice/memory.limit_in_bytes"] = "1000000000\n"
     files["/sys/fs/cgroup/memory/user.slice/memory.usage_in_bytes"] = "999000000\n"
     files["/sys/fs/cgroup/memory/memory.stat"] = _v1_stat(cache=9_000_000_000, mapped=0, dirty=0, writeback=0, shmem=0)
     _use_files(monkeypatch, files)
-    assert reranker_mod._cgroup_v1_memory_headroom_bytes() == 1_000_000_000.0
+    assert reranker_mod._cgroup_v1_memory_headroom_bytes() == 1_000_000.0
 
 
 # ---- G12/G13: text and consumers ----
@@ -1343,6 +1347,536 @@ def test_g13_the_ancestor_only_cap_is_not_dropped_to_psutil(monkeypatch: pytest.
     assert reranker_mod._available_ram_headroom_bytes() == 4_000_000_000.0 - (3_200_000_000.0 - 500_000_000.0)
 
 
+# ---- R13: S239 memory.high and the strict number parse, S238 an unusable level never ends the read,
+# S237 the v1 reader walks its ancestors ----
+
+_ZERO = _stat(cache=0, mapped=0, dirty=0, writeback=0, shmem=0)  # reclaimable 0
+_R400 = _stat(cache=400_000_000, mapped=0, dirty=0, writeback=0, shmem=0)  # reclaimable 400 MB
+_V1_ROOT = "/sys/fs/cgroup/memory"
+_V1_PAR = f"{_V1_ROOT}/user.slice"
+_SENTINEL = str(reranker_mod._CGROUP_V1_UNBOUNDED_SENTINEL)
+
+
+def _hi(tree: dict[str, str], rel: str, value: str) -> dict[str, str]:
+    """Add a memory.high file at a level of a v2 tree."""
+    base = f"{_V2_ROOT}/{rel}" if rel else _V2_ROOT
+    tree[f"{base}/memory.high"] = f"{value}\n"
+    return tree
+
+
+def _v1lvl(limit: str | None = None, usage: str | None = None, stat: str | None = None, hier: str | None = None) -> dict:
+    return {"limit": limit, "usage": usage, "stat": stat, "hier": hier}
+
+
+def _v1tree(levels: dict[str, dict], *, own: str = _OWN) -> dict[str, str]:
+    """Synthetic v1 files for a chain; `levels` maps a relative directory ("" = the controller root) to its files."""
+    files = {"/proc/self/cgroup": f"5:memory:/{own}\n"}
+    for rel, lv in levels.items():
+        base = f"{_V1_ROOT}/{rel}" if rel else _V1_ROOT
+        for key, name in (
+            ("limit", "memory.limit_in_bytes"),
+            ("usage", "memory.usage_in_bytes"),
+            ("hier", "memory.use_hierarchy"),
+        ):
+            if lv[key] is not None:
+                files[f"{base}/{name}"] = f"{lv[key]}\n"
+        if lv["stat"] is not None:
+            files[f"{base}/memory.stat"] = lv["stat"]
+    return files
+
+
+def _v1() -> float | None:
+    return reranker_mod._cgroup_v1_memory_headroom_bytes()
+
+
+def _v1s(**kw) -> str:
+    return _v1_stat(**kw)
+
+
+_V1_ZERO = _v1s(cache=0, mapped=0, dirty=0, writeback=0, shmem=0)
+_V1_R400 = _v1s(cache=400_000_000, mapped=0, dirty=0, writeback=0, shmem=0)
+
+
+def _no_psutil(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(reranker_mod, "_psutil_available_bytes", lambda: pytest.fail("psutil must not be read"))
+
+
+# ---- H1: memory.high counts as a limit (S239) ----
+
+
+@pytest.mark.parametrize(
+    ("max_", "high", "expected"),
+    [
+        ("6000000000", "4000000000", 3_500_000_000.0),  # the high is lower: it binds (max-only would say 5.5e9)
+        ("6000000000", "8000000000", 5_500_000_000.0),  # the max is lower: it binds
+        ("max", "4000000000", 3_500_000_000.0),  # a high alone limits
+        ("6000000000", "max", 5_500_000_000.0),  # "max" high imposes nothing
+        ("6000000000", None, 5_500_000_000.0),  # an absent high imposes nothing
+        ("6000000000", "0", 0.0),  # a high of 0 is a limit of 0, not "no limit"
+    ],
+)
+def test_h1_the_limit_of_a_level_is_the_lower_of_memory_max_and_memory_high(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, max_: str, high: str | None, expected: float
+) -> None:
+    tree = _one_level(_stat(), limit=max_)
+    if high is not None:
+        _hi(tree, _OWN, high)
+    _use_files(monkeypatch, tree)
+    with caplog.at_level("DEBUG"):
+        assert _v2() == expected
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+def test_h1_a_memory_high_at_an_ancestor_is_measured_by_that_ancestors_own_counters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Own level unlimited, the parent has only a memory.high of 4.0 GB: its usage 3.2 GB with 400 MB reclaimable
+    gives 1.2 GB (the own counters would give 4.0 - (1.0 - 0.3) = 3.3 GB)."""
+    tree = _tree(
+        {
+            _OWN: _lvl("max", 1_000_000_000, _stat(cache=300_000_000, mapped=0, dirty=0, writeback=0, shmem=0)),
+            _PAR: _lvl("max", 3_200_000_000, _R400),
+        }
+    )
+    _hi(tree, _PAR, "4000000000")
+    _use_files(monkeypatch, tree)
+    assert _v2() == 1_200_000_000.0
+
+
+@pytest.mark.parametrize("bad", ["abc", "-5", "1.5", "1e9", "inf", "+5", ""])
+def test_h1_a_memory_high_that_is_not_a_plain_integer_is_ignored_and_warned_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, bad: str
+) -> None:
+    tree = _one_level(_stat())
+    _hi(tree, _OWN, bad)
+    _use_files(monkeypatch, tree)
+    with caplog.at_level("DEBUG"):
+        assert _v2() == 5_500_000_000.0  # the max alone stands
+        assert _v2() == 5_500_000_000.0
+    assert len(_warnings(caplog, "memory.high")) == 1
+
+
+def test_h1_an_unreadable_memory_high_is_ignored_and_warned_once_with_the_traceback(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    tree = _one_level(_stat())
+    _hi(tree, _OWN, "4000000000")
+    _use_files(monkeypatch, tree, raising=("memory.high",))
+    with caplog.at_level("DEBUG"):
+        assert _v2() == 5_500_000_000.0
+        assert _v2() == 5_500_000_000.0
+    found = _warnings(caplog, "memory.high")
+    assert len(found) == 1
+    assert found[0].exc_info and found[0].exc_info[0] is PermissionError
+
+
+@pytest.mark.parametrize("mode", ["garbage", "unreadable"])
+def test_h1_a_bad_memory_max_beside_a_numeric_memory_high_leaves_the_high_as_the_limit(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """R3: the readable limit stands (disclosed: it over-reads by up to high - max when the unreadable max was lower)."""
+    tree = _one_level(_stat(), limit="abc" if mode == "garbage" else "6000000000")
+    _hi(tree, _OWN, "4000000000")
+    _use_files(monkeypatch, tree, raising=("memory.max",) if mode == "unreadable" else ())
+    assert _v2() == 3_500_000_000.0
+
+
+def test_h1_memory_high_is_read_at_every_level_and_an_unlimited_levels_counters_are_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened: list[str] = []
+    levels = {_OWN: _lvl("max", 1, _stat()), _PAR: _lvl("max", 1, _stat()), _GRAND: _lvl(None, 1, _stat())}
+    _use_files(monkeypatch, _tree(levels), opened=opened)
+    assert _v2() is None
+    for rel in (_OWN, _PAR, _GRAND):
+        base = f"{_V2_ROOT}/{rel}" if rel else _V2_ROOT
+        assert f"{base}/memory.high" in opened and f"{base}/memory.max" in opened
+        assert f"{base}/memory.current" not in opened and f"{base}/memory.stat" not in opened
+
+
+# ---- H2: the strict number parse (S239) ----
+
+_BAD_NUMBERS = [
+    "1e9", "1.5e9", "-5", "+5", "1_000", "nan", "inf", "", " 12 3", "١٢٣", "²", "9" * 400, "abc", "12 ",
+]
+
+
+@pytest.mark.parametrize("bad", _BAD_NUMBERS)
+def test_h2_an_own_usage_that_is_not_a_plain_integer_is_rejected_and_warned_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, bad: str
+) -> None:
+    _use_files(monkeypatch, _one_level(_stat(), current=bad))
+    with caplog.at_level("DEBUG"):
+        assert _v2() is None  # the only level does not resolve
+        assert _v2() is None
+    assert len(_warnings(caplog, "memory.current")) == 1
+
+
+@pytest.mark.parametrize("bad", ["1e9", "-5", "1.5", "nan", "inf", "9" * 400, "١٢٣"])
+def test_h2_a_bad_own_usage_does_not_stop_a_good_ancestor_from_measuring_the_chain(
+    monkeypatch: pytest.MonkeyPatch, bad: str
+) -> None:
+    tree = _tree({_OWN: _lvl("max", bad, _ZERO), _PAR: _lvl(4_000_000_000, 3_200_000_000, _R400)})
+    _use_files(monkeypatch, tree)
+    assert _v2() == 1_200_000_000.0
+
+
+@pytest.mark.parametrize("raw", ["1000000000\n", "1000000000", "  1000000000  \n"])
+def test_h2_a_plain_integer_parses(monkeypatch: pytest.MonkeyPatch, raw: str) -> None:
+    _use_files(monkeypatch, _one_level(_stat(), current=raw.rstrip("\n")))
+    assert _v2() == 5_500_000_000.0
+
+
+def test_h2_zero_is_a_plain_integer() -> None:
+    assert reranker_mod._cgroup_plain_bytes("0\n") == 0.0
+    assert reranker_mod._cgroup_plain_bytes("000123") == 123.0
+
+
+@pytest.mark.parametrize("bad", ["1e9", "-5", "nan", "9" * 400])
+def test_h2_a_v1_usage_that_is_not_a_plain_integer_is_rejected(monkeypatch: pytest.MonkeyPatch, bad: str) -> None:
+    _use_files(monkeypatch, _v1_files(_v1_stat(), usage=bad))
+    assert _v1() is None
+
+
+@pytest.mark.parametrize("bad", ["1e9", "-5", "inf", "9" * 400, "0x10"])
+def test_h2_a_limit_that_is_not_a_plain_integer_is_skipped_at_both_versions(
+    monkeypatch: pytest.MonkeyPatch, bad: str
+) -> None:
+    _use_files(monkeypatch, _one_level(_stat(), limit=bad))
+    assert _v2() is None  # an "infinite" or negative limit is not read as a number
+    _use_files(monkeypatch, _v1_files(_v1_stat(), limit=bad))
+    assert _v1() is None
+
+
+# ---- H3: one unusable level never ends the read (S238) ----
+
+
+@pytest.mark.parametrize("mode", ["garbage", "unreadable"])
+def test_h3_an_unusable_own_usage_still_lets_the_capped_parent_bind(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, mode: str
+) -> None:
+    """R12 returned None here (the caller fell to psutil, which ignores the cap). The parent's own counters give
+    4.0 - (3.2 - 0.4) = 1.2 GB; the own stat (decoy) would give a different number."""
+    own_current = "abc" if mode == "garbage" else 900_000_000
+    tree = _tree({_OWN: _lvl(6_000_000_000, own_current, _stat()), _PAR: _lvl(4_000_000_000, 3_200_000_000, _R400)})
+    _use_files(monkeypatch, tree, raising=(f"{_OWN}/memory.current",) if mode == "unreadable" else ())
+    with caplog.at_level("DEBUG"):
+        assert _v2() == 1_200_000_000.0
+    found = _warnings(caplog, "memory.current")
+    assert len(found) == 1
+    if mode == "unreadable":
+        assert found[0].exc_info and found[0].exc_info[0] is PermissionError
+
+
+@pytest.mark.parametrize("mode", ["garbage", "unreadable"])
+def test_h3_an_unusable_own_memory_max_still_lets_the_capped_parent_bind(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    tree = _tree(
+        {
+            _OWN: _lvl("abc" if mode == "garbage" else 6_000_000_000, 1_000_000_000, _stat()),
+            _PAR: _lvl(4_000_000_000, 3_200_000_000, _R400),
+        }
+    )
+    _use_files(monkeypatch, tree, raising=(f"{_OWN}/memory.max",) if mode == "unreadable" else ())
+    assert _v2() == 1_200_000_000.0
+
+
+def test_h3_with_no_own_usage_a_garbled_near_ancestor_is_skipped_and_the_far_one_measures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R12 returned None. Parent: capped, usage garbage, nothing to stand in with; root level: capped 8.0 GB, usage
+    5.0 GB, 1.0 GB reclaimable: 4.0 GB."""
+    root_stat = _stat(cache=1_000_000_000, mapped=0, dirty=0, writeback=0, shmem=0)
+    tree = _tree(
+        {
+            _OWN: _lvl(None, None, None),
+            _PAR: _lvl(4_000_000_000, "abc", _stat()),
+            _GRAND: _lvl(8_000_000_000, 5_000_000_000, root_stat),
+        }
+    )
+    _use_files(monkeypatch, tree)
+    assert _v2() == 4_000_000_000.0
+
+
+def test_h3_the_minimum_is_over_the_resolved_levels_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Own level capped, usage garbage (unresolved); the parent resolves to 0.5 GB; the root level has a tiny limit
+    and no usable usage (unresolved, no stand-in): the unresolved levels neither lower nor raise the result."""
+    tree = _tree(
+        {
+            _OWN: _lvl(6_000_000_000, "abc", _stat()),
+            _PAR: _lvl(4_000_000_000, 3_500_000_000, _ZERO),
+            _GRAND: _lvl(100_000_000, "abc", _stat()),
+        }
+    )
+    _use_files(monkeypatch, tree)
+    assert _v2() == 500_000_000.0
+
+
+def test_h3_pinned_exposure_a_skipped_tighter_level_lets_a_looser_ancestor_bind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R6(a), the contract S238 orders and a disclosed owner question: the own level is capped at 1.0 GB but its
+    usage is unreadable, so it is skipped and the parent (8.0 GB, 3.0 GB used) gives 5.0 GB, which is more than the
+    own cap allows. A future conservative stand-in must change this test on purpose."""
+    tree = _tree({_OWN: _lvl(1_000_000_000, "abc", _stat()), _PAR: _lvl(8_000_000_000, 3_000_000_000, _ZERO)})
+    _use_files(monkeypatch, tree)
+    assert _v2() == 5_000_000_000.0
+
+
+def test_h3_a_garbled_own_usage_and_an_unreadable_ancestor_usage_warn_separately(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    tree = _tree({_OWN: _lvl(6_000_000_000, "abc", _stat()), _PAR: _lvl(4_000_000_000, 3_000_000_000, _stat())})
+    _use_files(monkeypatch, tree, raising=(f"{_PAR}/memory.current",))
+    with caplog.at_level("DEBUG"):
+        assert _v2() is None  # neither level resolves
+        assert _v2() is None
+    found = _warnings(caplog, "memory.current")
+    assert len(found) == 2
+    assert sorted(bool(r.exc_info) for r in found) == [False, True]
+
+
+def test_h3_no_level_resolving_falls_back_to_psutil_not_to_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    for tree in (
+        _tree({_OWN: _lvl(6_000_000_000, "abc", _stat())}),
+        _tree({_OWN: _lvl(None, None, None), _PAR: _lvl(4_000_000_000, "abc", _stat())}),
+    ):
+        _use_files(monkeypatch, tree)
+        monkeypatch.setattr(reranker_mod, "_psutil_available_bytes", lambda: 777.0)
+        assert _v2() is None
+        assert reranker_mod._available_ram_headroom_bytes() == 777.0
+
+
+def test_h3_a_partial_chain_returns_the_cgroup_figure_and_never_reaches_psutil(monkeypatch: pytest.MonkeyPatch) -> None:
+    tree = _tree({_OWN: _lvl(6_000_000_000, "abc", _stat()), _PAR: _lvl(4_000_000_000, 3_200_000_000, _R400)})
+    _use_files(monkeypatch, tree)
+    _no_psutil(monkeypatch)
+    assert reranker_mod._available_ram_headroom_bytes() == 1_200_000_000.0
+
+
+def test_h3_the_only_remaining_none_is_psutil_failing_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    _use_files(monkeypatch, _tree({_OWN: _lvl(6_000_000_000, "abc", _stat())}))
+    monkeypatch.setattr(reranker_mod, "_psutil_available_bytes", lambda: None)
+    assert reranker_mod._available_ram_headroom_bytes() is None
+
+
+def test_h3_no_limit_anywhere_is_still_none_and_opens_no_counters(monkeypatch: pytest.MonkeyPatch) -> None:
+    opened: list[str] = []
+    _use_files(monkeypatch, _tree({_OWN: _lvl("max", 1, _stat()), _PAR: _lvl("max", 1, _stat())}), opened=opened)
+    assert _v2() is None
+    assert not any(p.endswith(("/memory.current", "/memory.stat")) for p in opened)
+
+
+# ---- H4: the v1 reader walks its ancestors (S237) ----
+
+
+def _v1_chain(own: dict, parent: dict | None = None, root: dict | None = None) -> dict[str, str]:
+    levels = {_OWN: own}
+    if parent is not None:
+        levels[_PAR] = parent
+    if root is not None:
+        levels[""] = root
+    return _v1tree(levels)
+
+
+def test_h4_a_cap_that_only_the_parent_holds_is_seen(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R12 returned None here (and the caller used psutil). The parent's own counters: 4.0 - (3.2 - 0.4) = 1.2 GB."""
+    tree = _v1_chain(
+        _v1lvl(_SENTINEL, 500_000_000, _V1_ZERO), _v1lvl(4_000_000_000, 3_200_000_000, _V1_R400)
+    )
+    _use_files(monkeypatch, tree)
+    _no_psutil(monkeypatch)
+    assert _v1() == 1_200_000_000.0
+    assert reranker_mod._available_ram_headroom_bytes() == 1_200_000_000.0
+
+
+def test_h4_the_smaller_headroom_of_own_and_parent_binds(monkeypatch: pytest.MonkeyPatch) -> None:
+    own = _v1lvl(5_500_000_000, 5_000_000_000, _v1s())  # headroom 1.0 GB
+    _use_files(monkeypatch, _v1_chain(own, _v1lvl(4_000_000_000, 3_500_000_000, _V1_ZERO)))
+    assert _v1() == 500_000_000.0
+    _use_files(monkeypatch, _v1_chain(own, _v1lvl(20_000_000_000, 1_000_000_000, _V1_ZERO)))
+    assert _v1() == 1_000_000_000.0
+
+
+def test_h4_a_larger_limit_that_siblings_filled_binds_over_a_smaller_limit_with_room(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    own = _v1lvl(3_000_000_000, 1_000_000_000, _V1_ZERO)  # headroom 2.0 GB
+    _use_files(monkeypatch, _v1_chain(own, _v1lvl(5_000_000_000, 4_500_000_000, _V1_ZERO)))
+    assert _v1() == 500_000_000.0  # the smallest-limit reading would say 2.0 GB
+
+
+def test_h4_three_levels_take_the_minimum_each_with_its_own_counters(monkeypatch: pytest.MonkeyPatch) -> None:
+    def st(n: int) -> str:
+        return _v1s(cache=n, mapped=0, dirty=0, writeback=0, shmem=0)
+
+    own = _v1lvl(6_000_000_000, 2_000_000_000, st(300_000_000))  # 6.0 - 1.7 = 4.3 GB
+    par = _v1lvl(5_000_000_000, 4_000_000_000, st(200_000_000))  # 5.0 - 3.8 = 1.2 GB
+    root = _v1lvl(9_000_000_000, 8_000_000_000, st(500_000_000))  # 9.0 - 7.5 = 1.5 GB
+    _use_files(monkeypatch, _v1_chain(own, par, root))
+    assert _v1() == 1_200_000_000.0  # one level's counters applied to all would say 3.3 GB
+    # the controller root binds
+    root = _v1lvl(2_000_000_000, 1_900_000_000, st(100_000_000))  # 2.0 - 1.8 = 0.2 GB
+    _use_files(monkeypatch, _v1_chain(own, par, root))
+    assert _v1() == 200_000_000.0
+
+
+def test_h4_levels_without_a_limit_are_never_read_for_usage_or_stat(monkeypatch: pytest.MonkeyPatch) -> None:
+    levels = {
+        f"{_OWN}/inner": _v1lvl(4_000_000_000, 1_000_000_000, _v1s()),  # 4.0 - 0.5 = 3.5 GB
+        _OWN: _v1lvl(_SENTINEL, 9_000_000_000, _v1s()),
+        _PAR: _v1lvl("garbage", 9_000_000_000, _v1s()),
+        "": _v1lvl(None, 9_000_000_000, _v1s()),
+    }
+    opened: list[str] = []
+    files = _v1tree(levels, own=f"{_OWN}/inner")
+    _use_files(monkeypatch, files, opened=opened)
+    assert _v1() == 3_500_000_000.0
+    for unlimited in (_OWN, _PAR, ""):
+        base = f"{_V1_ROOT}/{unlimited}" if unlimited else _V1_ROOT
+        assert f"{base}/memory.usage_in_bytes" not in opened
+        assert f"{base}/memory.stat" not in opened
+
+
+@pytest.mark.parametrize("mode", ["absent", "garbage", "unreadable"])
+def test_h4_an_unusable_ancestor_usage_stands_in_with_the_own_usage_and_stat(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    own_stat = _v1s(cache=300_000_000, mapped=0, dirty=0, writeback=0, shmem=0)
+    parent_usage = {"absent": None, "garbage": "abc", "unreadable": 3_000_000_000}[mode]
+    tree = _v1_chain(_v1lvl(_SENTINEL, 1_000_000_000, own_stat), _v1lvl(4_000_000_000, parent_usage, _v1s()))
+    _use_files(monkeypatch, tree, raising=(f"{_PAR}/memory.usage_in_bytes",) if mode == "unreadable" else ())
+    assert _v1() == 3_300_000_000.0  # 4.0 - (1.0 - 0.3)
+
+
+def test_h4_an_unusable_own_usage_leaves_the_ancestors_measured_by_their_own_counters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tree = _v1_chain(_v1lvl(6_000_000_000, "abc", _v1s()), _v1lvl(4_000_000_000, 3_200_000_000, _V1_R400))
+    _use_files(monkeypatch, tree)
+    assert _v1() == 1_200_000_000.0
+
+
+def test_h4_the_clamps_hold_at_an_ancestor_level(monkeypatch: pytest.MonkeyPatch) -> None:
+    big = _v1s(cache=900_000_000, mapped=0, dirty=0, writeback=0, shmem=0)
+    own = _v1lvl(_SENTINEL, 1_000_000_000, _V1_ZERO)
+    _use_files(monkeypatch, _v1_chain(own, _v1lvl(4_000_000_000, 100_000_000, big)))
+    assert _v1() == 4_000_000_000.0  # reclaimable capped at the level's usage (100 MB)
+    _use_files(monkeypatch, _v1_chain(own, _v1lvl(1_000_000_000, 3_000_000_000, _V1_ZERO)))
+    assert _v1() == 0.0  # usage beyond the limit
+
+
+def test_h4_no_limit_anywhere_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    tree = _v1_chain(_v1lvl(_SENTINEL, 1, _v1s()), _v1lvl(None, 1, None), _v1lvl("garbage", 1, None))
+    _use_files(monkeypatch, tree)
+    assert _v1() is None
+
+
+def test_h4_only_the_total_keys_are_used_at_an_ancestor(monkeypatch: pytest.MonkeyPatch) -> None:
+    plain = "cache 700000000\nmapped_file 50000000\ndirty 30000000\nwriteback 20000000\nshmem 100000000\n"
+    tree = _v1_chain(_v1lvl(_SENTINEL, 1_000_000_000, _v1s()), _v1lvl(4_000_000_000, 3_000_000_000, plain))
+    _use_files(monkeypatch, tree)
+    assert _v1() == 1_000_000_000.0  # nothing is subtracted without the total_ lines
+
+
+@pytest.mark.parametrize(
+    ("raw", "is_limit"),
+    [
+        (0x7FFFFFFFFFFFF000, False),  # 4 KiB pages
+        (0x7FFFFFFFFFFFC000, False),  # 16 KiB pages
+        (0x7FFFFFFFFFFF0000, False),  # 64 KiB pages
+        (0x7FFFFFFFFFFE0000, True),  # not a kernel value: below the sentinel it is a (huge) limit
+    ],
+)
+def test_h4_the_unbounded_sentinel_is_page_size_independent(
+    monkeypatch: pytest.MonkeyPatch, raw: int, is_limit: bool
+) -> None:
+    _use_files(monkeypatch, _v1_files(_v1_stat(), limit=str(raw), usage="1000000000"))
+    assert (_v1() is not None) == is_limit
+
+
+def test_h4_a_level_reading_use_hierarchy_0_ends_the_walk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without hierarchical charging the parent's counters do not involve this cgroup."""
+    parent = _v1lvl(4_000_000_000, 3_900_000_000, _V1_ZERO)
+    # own unlimited: the parent's cap is not this cgroup's -> no limit seen
+    _use_files(monkeypatch, _v1_chain(_v1lvl(_SENTINEL, 1_000_000_000, _V1_ZERO, hier="0"), parent))
+    assert _v1() is None
+    # own capped, parent tighter but not charged: the own figure
+    _use_files(monkeypatch, _v1_chain(_v1lvl(6_000_000_000, 1_000_000_000, _V1_ZERO, hier="0"), parent))
+    assert _v1() == 5_000_000_000.0
+
+
+@pytest.mark.parametrize("hier", ["1", None, "garbage", "unreadable"])
+def test_h4_any_other_use_hierarchy_keeps_walking(monkeypatch: pytest.MonkeyPatch, hier: str | None) -> None:
+    unreadable = hier == "unreadable"
+    own = _v1lvl(_SENTINEL, 1_000_000_000, _V1_ZERO, hier=None if unreadable else hier)
+    tree = _v1_chain(own, _v1lvl(4_000_000_000, 3_900_000_000, _V1_ZERO))
+    if unreadable:
+        tree[f"{_V1_ROOT}/{_OWN}/memory.use_hierarchy"] = "0\n"  # would end the walk, but it cannot be read
+    _use_files(monkeypatch, tree, raising=("memory.use_hierarchy",) if unreadable else ())
+    assert _v1() == 100_000_000.0
+
+
+def test_h4_use_hierarchy_is_read_once_per_walked_level_and_not_for_the_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    opened: list[str] = []
+    tree = _v1_chain(
+        _v1lvl(_SENTINEL, 1, _V1_ZERO, hier="1"), _v1lvl(_SENTINEL, 1, _V1_ZERO, hier="1"), _v1lvl(None, 1, None, hier="1")
+    )
+    _use_files(monkeypatch, tree, opened=opened)
+    assert _v1() is None
+    assert [p for p in opened if p.endswith("memory.use_hierarchy")] == [
+        f"{_V1_ROOT}/{_OWN}/memory.use_hierarchy",
+        f"{_V1_PAR}/memory.use_hierarchy",
+    ]
+
+
+def test_h4_a_use_hierarchy_0_in_the_middle_of_the_chain_ends_the_walk_there(monkeypatch: pytest.MonkeyPatch) -> None:
+    own = _v1lvl(_SENTINEL, 1_000_000_000, _V1_ZERO, hier="1")
+    parent = _v1lvl(4_000_000_000, 3_000_000_000, _V1_ZERO, hier="0")  # the parent is not charged to the root
+    root = _v1lvl(1_100_000_000, 1_000_000_000, _V1_ZERO)
+    _use_files(monkeypatch, _v1_chain(own, parent, root))
+    assert _v1() == 1_000_000_000.0  # the parent's cap counts; the root's (0.1 GB) does not
+
+
+def test_h4_the_fallback_order_is_unchanged_with_a_walking_v1_reader(monkeypatch: pytest.MonkeyPatch) -> None:
+    tree = _v1_chain(_v1lvl(_SENTINEL, 1, _V1_ZERO), _v1lvl(None, 1, None))
+    _use_files(monkeypatch, tree)
+    monkeypatch.setattr(reranker_mod, "_psutil_available_bytes", lambda: 4242.0)
+    assert reranker_mod._available_ram_headroom_bytes() == 4242.0
+
+
+# ---- H6: the callers see the same float | None ----
+
+
+def _per_token_fit():
+    from brain.memory import ram_fit
+
+    return ram_fit.RamFit(a=0.0, b=1_000.0, c=0.0, shapes=4, samples=4, max_pairs=2, max_length=1024)
+
+
+def test_h6_a_partial_chain_figure_narrows_the_width_exactly_like_the_same_plain_number(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tree = _tree({_OWN: _lvl(6_000_000_000, "abc", _stat()), _PAR: _lvl(8_000_000_000, 7_995_000_000, _ZERO)})
+    _use_files(monkeypatch, tree)
+    _no_psutil(monkeypatch)
+    figure = reranker_mod._available_ram_headroom_bytes()
+    assert figure == 5_000_000.0
+    est = reranker_mod.RerankCostEstimate(0.0, 1e-5, _per_token_fit(), measured_batches=3)
+    cand, anchors = [400] * 50, [50] * len(ANCHOR_POOL)
+    narrowed = reranker_mod.fit_rerank_width(cand, anchors, est, 4.0, figure)
+    assert narrowed == reranker_mod.fit_rerank_width(cand, anchors, est, 4.0, 5_000_000.0)
+    assert 0 < narrowed < reranker_mod.fit_rerank_width(cand, anchors, est, 4.0, None)
+
+
+def test_h6_a_headroom_of_exactly_zero_allows_no_rerank_width() -> None:
+    est = reranker_mod.RerankCostEstimate(0.0, 1e-5, _per_token_fit(), measured_batches=3)
+    cand, anchors = [400] * 50, [50] * len(ANCHOR_POOL)
+    assert reranker_mod.fit_rerank_width(cand, anchors, est, 4.0, None) >= reranker_mod.RERANK_MIN_REAL_CANDIDATES
+    assert reranker_mod.fit_rerank_width(cand, anchors, est, 4.0, 0.0) == 0
+
+
 def _py_files_mentioning(root, token: str) -> list[str]:
     return [str(p) for p in root.rglob("*.py") if token in p.read_text(encoding="utf-8")]
 
@@ -1357,8 +1891,11 @@ def test_g12_the_docstrings_state_the_new_formula_and_the_v1_claim_is_corrected(
     assert "file_writeback" in helper and "shmem" in helper
     assert "MINIMUM" in v2 and "own usage" in v2 and "siblings" in v2 and "file_mapped" in v2
     assert "total_cache" in v1 and "total_mapped_file" in v1 and "tmpfs" in v1
-    assert "OWN cgroup" in v1 and "NOT visible" in v1 and "own setting" in v1
+    assert "MINIMUM" in v1 and "own setting" in v1 and "use_hierarchy" in v1 and "ancestor" in v1
+    assert "NOT visible" not in v1 and "Only the process's OWN cgroup is read" not in v1
     assert "already hierarchical" not in v1 and "no walk-up is needed" not in v1
+    assert "memory.high" in v2 and "plain" in v2 and "has a usable numeric limit" in " ".join(v2.split())
+    assert "psutil" in avail and "memory.high" in avail
     for doc in (v2, v1, helper, avail):
         assert "matches psutil" not in doc.lower() and "matches the host" not in doc.lower()
 

@@ -219,6 +219,19 @@ def test_oom_guard_downgrades_to_knob_refit_when_only_the_floor_fits() -> None:
     assert result == judge_selftune.TUNE_GRADE_KNOB_REFIT
 
 
+def test_oom_guard_zero_headroom_floors_to_knob_refit() -> None:
+    """A headroom of exactly 0.0 (a cgroup at its memory.high or memory.max) fits nothing but the floor."""
+    result = judge_selftune._downgrade_for_oom_safety(judge_selftune.TUNE_GRADE_FULL_FT, 0.0)
+    assert result == judge_selftune.TUNE_GRADE_KNOB_REFIT
+
+
+def test_oom_guard_docstring_names_the_psutil_fallback_not_meminfo() -> None:
+    """S239: the headroom helper falls back to psutil's host-wide available figure, not to /proc/meminfo."""
+    doc = judge_selftune._downgrade_for_oom_safety.__doc__ or ""
+    assert "psutil" in doc
+    assert "host-wide `/proc/meminfo`" not in doc and "cgroup/meminfo" not in doc
+
+
 def test_oom_guard_none_headroom_fails_toward_knob_refit() -> None:
     """No headroom signal at all (every source unavailable) means no
     signal to TRUST the RAM-tier pick with either — same fail-toward-safe
