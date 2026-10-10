@@ -29,6 +29,10 @@ Derived rules (no tuned constants):
   allow). A window without that row is a ladder that did not finish (a restart, a reply, an error):
   its fit would extrapolate batch sizes from single pairs (it under-predicts them by 17 to 100
   percent), so it is not used for sizing until the pass is finished.
+* While the window holds no measured batch of more than one pair (a ladder pass that stopped on
+  the headroom still records its completion marker), a real rerank may have no more pairs, and no
+  longer a padded length, than the largest shape measured (`RamFit.within_measured`, S242);
+  that call takes the cosine path instead of extrapolating batches from single pairs.
 * Arithmetic is exact (`fractions.Fraction`): the design columns reach 1e9 and the normal
   equations are badly conditioned in floating point.
 """
@@ -158,6 +162,16 @@ class RamFit:
     def predict(self, pairs: int, length: int) -> float:
         _, padded, squared = _columns(pairs, length)
         return max(0.0, self.a + self.b * padded + self.c * squared)
+
+    def within_measured(self, pairs: int, length: int) -> bool:
+        """S242: whether a prospective rerank of `pairs` documents padded to `length` tokens may
+        be sized by this fit. While the fit holds no measured batch of more than one pair
+        (`max_pairs <= 1`: a ladder pass that stopped on the headroom before its first batch) it
+        would extrapolate batch sizes from single pairs, which under-predicts them by 17 to 100
+        percent (the module docstring), so a call may have no more pairs, and no longer a padded
+        length, than the largest shape measured: each dimension is held to its own largest
+        measured value. Once a batch of two or more pairs is measured the cap lifts."""
+        return self.max_pairs > 1 or (pairs <= self.max_pairs and length <= self.max_length)
 
 
 def _solve(matrix: list[list[Fraction]], rhs: list[Fraction]) -> list[Fraction] | None:
