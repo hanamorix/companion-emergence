@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import statistics
 import sys
 import threading
@@ -1713,16 +1714,18 @@ def _cgroup_reclaimable_file_bytes(stat_path: str, key: str) -> float:
     """The reclaimable file cache of a cgroup, in bytes: the value of the line `key` in its
     `memory.stat` (v2: `inactive_file`; v1: `total_inactive_file`, the hierarchical figure that
     matches v1's hierarchical `memory.usage_in_bytes`). S230: the cgroup's usage counter
-    (`memory.current`) counts page cache, such as the model files the process read, which the
-    kernel gives back when memory is needed; the headroom readers subtract it from the usage so
-    that cache does not read as used.
+    (`memory.current`) counts page cache, such as the model files the process read, and the
+    kernel gives back the part it has not marked active when memory is needed, so the headroom
+    readers subtract that part from the usage and it does not read as used. Pages the process
+    keeps mapped and in use (for example model weights mapped and touched) are `active_file`
+    and are NOT subtracted: they are the working set.
 
     The key is matched exactly (the first whitespace-split token of a line), so `inactive_file`
     never matches `total_inactive_file` or the reverse. Returns 0.0, meaning "subtract nothing"
     (the figure the readers gave before S230, the tighter and safer side), when the file is absent
     (silent: a cgroup without the memory files), unreadable, has no such line, or the value is not
-    a plain non-negative integer (a sign, an underscore, nan or inf are all rejected); an
-    unreadable file or an unusable value is warned once per process. Never raises, never negative."""
+    a plain non-negative integer (a sign, an underscore, nan or inf are all rejected); all of these
+    except the absent file are warned once per process. Never raises, never negative."""
     try:
         with open(stat_path, encoding="utf-8") as f:
             content = f.read()
@@ -1738,12 +1741,17 @@ def _cgroup_reclaimable_file_bytes(stat_path: str, key: str) -> float:
         parts = line.split()
         if parts and parts[0] == key:
             if len(parts) >= 2 and parts[1].isascii() and parts[1].isdigit():
-                return float(parts[1])
+                value = float(parts[1])  # a 309-digit value parses to inf: rejected below
+                if math.isfinite(value):
+                    return value
             _warn_ram_figure_once(
                 "a cgroup memory.stat reclaimable-cache value is not a plain integer: "
                 "reclaimable file cache is not subtracted from the headroom"
             )
             return 0.0
+    _warn_ram_figure_once(
+        "a cgroup memory.stat has no reclaimable-cache line: reclaimable file cache is not subtracted from the headroom"
+    )
     return 0.0
 
 
@@ -1751,7 +1759,8 @@ def _cgroup_v2_memory_headroom_bytes() -> float | None:
     """cgroup v2 memory headroom for the CALLING PROCESS's own cgroup
     (`effective_memory.max - (memory.current - reclaimable file cache)`, where the
     reclaimable file cache is the `inactive_file` line of the same cgroup's `memory.stat`,
-    S230: page cache such as the model files does not read as used), resolved via `/proc/self/
+    S230: page cache the kernel has not marked active, such as read-once model files, does not
+    read as used; pages kept mapped and in use stay counted), resolved via `/proc/self/
     cgroup` (see `_read_proc_self_cgroup_v2_path`) rather than the fixed
     cgroup2 root — the root has no `memory.max`/`memory.current` of its
     own, so a root-only read can never see a real per-process cap.
@@ -1845,8 +1854,8 @@ def _cgroup_v1_memory_headroom_bytes() -> float | None:
     """cgroup v1 fallback for `_cgroup_v2_memory_headroom_bytes` (older
     kernels/distros without the unified v2 hierarchy): `memory.limit_in_
     bytes - (memory.usage_in_bytes - reclaimable file cache)` (S230: the
-    `total_inactive_file` line of the same cgroup's `memory.stat`, so page cache
-    such as the model files does not read as used) read from the CALLING PROCESS's own
+    `total_inactive_file` line of the same cgroup's `memory.stat`, so inactive page cache
+    such as read-once model files does not read as used) read from the CALLING PROCESS's own
     cgroup path, resolved via `/proc/self/cgroup`'s `memory` controller
     line (`_read_proc_self_cgroup_v1_memory_path`) rather than the fixed
     `/sys/fs/cgroup/memory/` root. v1's limit is already hierarchical (a
@@ -1918,9 +1927,10 @@ def _available_ram_headroom_bytes() -> float | None:
     same trade-off the spec's own Open Reconfirmation favors absent a
     concrete reason not to.
 
-    The cgroup figures are limit - (usage - reclaimable file cache) (S230): the model
-    files' page cache is given back by the kernel under pressure, so it does not read
-    as used (`inactive_file` of `memory.stat`; v1 `total_inactive_file`).
+    The cgroup figures are limit - (usage - reclaimable file cache) (S230): inactive page
+    cache (read-once model files) is given back by the kernel under pressure, so it does
+    not read as used (`inactive_file` of `memory.stat`; v1 `total_inactive_file`). Mapped
+    pages in use are active and stay counted.
 
     cgroup-limit-aware, per the pre-flip revision's Change-3 requirement:
     Testing's own OOM reproduction ran under an explicit cgroup cap that

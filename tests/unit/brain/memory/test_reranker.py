@@ -812,6 +812,8 @@ def test_cgroup_v2_usage_beyond_the_limit_after_the_subtraction_is_zero_headroom
         "inactive_file inf\n",
         "inactive_file infinity\n",
         "inactive_file\n",  # key with no value
+        "inactive_file \u00b2\n",  # a superscript digit is str.isdigit() but not a plain integer
+        "inactive_file " + "9" * 400 + "\n",  # parses to inf
         "total_inactive_file 999\ninactive_file_x 5\n",  # only look-alike keys (K5)
     ],
 )
@@ -844,6 +846,45 @@ def test_cgroup_v2_unreadable_stat_subtracts_nothing_and_warns_once(
     warns = [r for r in caplog.records if r.levelname == "WARNING" and "memory.stat" in r.getMessage()]
     assert len(warns) == 1
     reranker_mod._ram_figure_warned.clear()
+
+
+def test_cgroup_v2_absent_stat_file_is_silent(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    """K4: a cgroup without a memory.stat is not an error: pre-change figure, no warning."""
+    reranker_mod._ram_figure_warned.clear()
+    _use_files(monkeypatch, _v2_files(None))
+    with caplog.at_level("DEBUG"):
+        assert reranker_mod._cgroup_v2_memory_headroom_bytes() == 5_000_000_000.0
+    assert [r for r in caplog.records if "memory.stat" in r.getMessage()] == []
+    reranker_mod._ram_figure_warned.clear()
+
+
+def test_cgroup_v2_stat_without_the_key_warns_once(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    """A stat file that exists but has no inactive_file line means the fix silently never applies on that
+    kernel: one warning per process says so."""
+    reranker_mod._ram_figure_warned.clear()
+    _use_files(monkeypatch, _v2_files("anon 1\nfile 5\n"))
+    with caplog.at_level("DEBUG"):
+        reranker_mod._cgroup_v2_memory_headroom_bytes()
+        reranker_mod._cgroup_v2_memory_headroom_bytes()
+    warns = [r for r in caplog.records if r.levelname == "WARNING" and "memory.stat" in r.getMessage()]
+    assert len(warns) == 1
+    reranker_mod._ram_figure_warned.clear()
+
+
+def test_cgroup_v2_a_real_format_memory_stat_is_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The key names and line shape of a real kernel memory.stat (copied from this kind of host, numbers
+    synthetic): inactive_file is found among the look-alikes."""
+    stat = "".join(
+        f"{k} {v}\n"
+        for k, v in [
+            ("anon", 735232000), ("file", 817922048), ("kernel", 1), ("shmem", 0), ("file_mapped", 197251072),
+            ("file_dirty", 0), ("file_writeback", 0), ("inactive_anon", 7), ("active_anon", 735000000),
+            ("inactive_file", 729067520), ("active_file", 43708416), ("unevictable", 0), ("slab_reclaimable", 540245200),
+            ("workingset_refault_file", 3), ("pgscan", 9),
+        ]
+    )
+    _use_files(monkeypatch, _v2_files(stat, current="1500000000"))
+    assert reranker_mod._cgroup_v2_memory_headroom_bytes() == 6_000_000_000.0 - (1_500_000_000.0 - 729_067_520.0)
 
 
 def test_cgroup_v2_garbage_stat_value_warns_once(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
@@ -903,6 +944,8 @@ def test_cgroup_v1_usage_beyond_the_limit_after_the_subtraction_is_zero_headroom
         "total_inactive_file -5\n",
         "total_inactive_file nan\n",
         "total_inactive_file 1_0\n",
+        "total_inactive_file \u00b2\n",
+        "total_inactive_file " + "9" * 400 + "\n",
         "inactive_file 111\n",  # only the non-hierarchical key: not the matching term, subtract nothing
     ],
 )
