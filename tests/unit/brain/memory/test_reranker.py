@@ -947,7 +947,7 @@ def test_g4_unreadable_own_stat_subtracts_nothing_and_warns_once(
         assert _v2() == 5_000_000_000.0
     warns = _warnings(caplog, "memory.stat")
     assert len(warns) == 1
-    assert warns[0].exc_info is not None  # the traceback comes with the first warning
+    assert warns[0].exc_info and warns[0].exc_info[0] is PermissionError  # the traceback comes with the first warning
 
 
 def test_g4_absent_stat_file_is_silent(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
