@@ -15,6 +15,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from brain.utils.file_lock import file_lock
+
 logger = logging.getLogger(__name__)
 
 _RESULT_SUMMARY_MAX_CHARS = 140
@@ -63,15 +65,26 @@ def _audit_mode(persona_dir: Path) -> str:
     return "redacted"
 
 
+def _needs_rotation(log_path: Path) -> bool:
+    return log_path.exists() and log_path.stat().st_size > _MAX_LOG_BYTES
+
+
 def _rotate_if_needed(log_path: Path) -> None:
-    """Keep the local audit log bounded with a single .1 backup."""
+    """Keep the local audit log bounded with a single .1 backup.
+
+    Every appender (MCP children, streaming and blocking flushes) runs this,
+    so the check-then-rename is serialised on a sidecar lock and re-checked
+    under it (#357): a writer that saw an oversize log must not rename the
+    fresh one a concurrent rotator left behind over ``.1``. The size check
+    first runs unlocked so the common no-rotation append takes no lock.
+    """
     try:
-        if not log_path.exists() or log_path.stat().st_size <= _MAX_LOG_BYTES:
+        if not _needs_rotation(log_path):
             return
-        backup = log_path.with_name(f"{log_path.name}.1")
-        if backup.exists():
-            backup.unlink()
-        log_path.replace(backup)
+        with file_lock(log_path):
+            if _needs_rotation(log_path):
+                # replace() overwrites an existing .1 atomically on every OS.
+                log_path.replace(log_path.with_name(f"{log_path.name}.1"))
     except OSError as exc:
         logger.warning("audit log rotation failed: %s", exc)
 
