@@ -487,6 +487,13 @@ def get_bootstrap_floor(reranker_model_id: str) -> dict[str, Any] | None:
     permanently supersedes this cache for that model_id with no way for a
     stale bootstrap value to shadow it.
 
+    S247 (the RAM bound): scoring the bundled pairs is a rerank call site like any other.
+    When a pair's batch does not fit the process's memory model and the live headroom
+    (`reranker.normalize_bundled_pairs_against_anchors`, `RerankDeferred`), nothing is computed or
+    cached, this returns `None` and logs at info; `run_rerank_bootstrap` records a failed
+    attempt, so the floor is retried at the next lull (the cadence job) and by the message retry,
+    each attempt checked against the bound again.
+
     FAIL-SOFT (spec: the bootstrap computation itself must never crash a
     turn): any failure constructing the provider or fitting the threshold
     (a reranker load error, an empty/degenerate pairs list, ...) is caught,
@@ -503,10 +510,22 @@ def get_bootstrap_floor(reranker_model_id: str) -> dict[str, Any] | None:
         if cached is not None:
             return dict(cached)
         try:
-            from brain.memory.reranker import _bootstrap_reranker_provider
+            from brain.memory.reranker import RerankDeferred, _bootstrap_reranker_provider
 
             provider = _bootstrap_reranker_provider(reranker_model_id)
-            pairs = _cold_start_pairs(provider)
+            try:
+                pairs = _cold_start_pairs(provider)
+            except RerankDeferred as deferred:
+                # S247: a bundled pair's rerank does not fit the RAM bound now. Not a failure of
+                # the computation and not logged as one: nothing is cached, `None` is returned, and
+                # `run_rerank_bootstrap` records the attempt as failed, so the lull job and the
+                # message retry run it again (each attempt bounded again).
+                logger.info(
+                    "floor_calibration: rerank bootstrap floor for %s deferred, it does not fit the RAM bound now: %s",
+                    reranker_model_id,
+                    deferred,
+                )
+                return None
             beta = tunables.get_tunable("calibration.floor_fit_beta", FLOOR_FIT_BETA)
             floor = fit_threshold_fbeta(pairs, beta=beta)
         except Exception:  # noqa: BLE001 — fail-soft: must never break a recall/self-check

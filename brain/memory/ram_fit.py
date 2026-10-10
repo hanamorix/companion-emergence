@@ -26,13 +26,21 @@ Derived rules (no tuned constants):
 * The ladder that makes the samples marks the end of a COMPLETE pass with one extra row (the
   zero shape, `COMPLETE_MARKER`): the single pairs at falling lengths, then the batches of
   increasing size up to the largest a recall sends (or as far as the headroom and the time budget
-  allow). A window without that row is a ladder that did not finish (a restart, a reply, an error):
-  its fit would extrapolate batch sizes from single pairs (it under-predicts them by 17 to 100
-  percent), so it is not used for sizing until the pass is finished.
-* While the window holds no measured batch of more than one pair (a ladder pass that stopped on
-  the headroom still records its completion marker), a real rerank may have no more pairs, and no
-  longer a padded length, than the largest shape measured (`RamFit.within_measured`, S242);
-  that call takes the cosine path instead of extrapolating batches from single pairs.
+  allow). The row is recorded only when the window then holds a measured batch of MORE THAN ONE
+  PAIR (S245): a pass stopped by the headroom or the time budget before its first batch records no
+  marker and runs again at the next lull. A window without that row is a ladder that did not
+  finish (a restart, a reply, an error, a starved pass): its fit would extrapolate batch sizes from
+  single pairs (it under-predicts them by 17 to 100 percent), so it is not used for sizing until
+  the pass is finished.
+* The per-dimension cap (`RamFit.within_measured`, S242, S244): while the fit holds no measured
+  batch of more than one pair, a real rerank may have no more pairs, and no longer a padded
+  length, than the largest shape measured; that call takes the cosine path instead of
+  extrapolating batches from single pairs. The cap lifts only once a batch of more than one pair
+  is measured AND the fit is usable at all: a `RamFit` exists only when `fit_ram` accepted the
+  window (more than three distinct shapes, full rank, a full-length sample), so the lift never
+  applies to a window that fails those conditions. With the S245 marker rule a window the ladder
+  completes always holds such a batch; the cap is the defence for a marked window that does not
+  (one recorded by an earlier build, or by any other writer of the marker).
 * Arithmetic is exact (`fractions.Fraction`): the design columns reach 1e9 and the normal
   equations are badly conditioned in floating point.
 """
@@ -166,11 +174,14 @@ class RamFit:
     def within_measured(self, pairs: int, length: int) -> bool:
         """S242: whether a prospective rerank of `pairs` documents padded to `length` tokens may
         be sized by this fit. While the fit holds no measured batch of more than one pair
-        (`max_pairs <= 1`: a ladder pass that stopped on the headroom before its first batch) it
-        would extrapolate batch sizes from single pairs, which under-predicts them by 17 to 100
-        percent (the module docstring), so a call may have no more pairs, and no longer a padded
-        length, than the largest shape measured: each dimension is held to its own largest
-        measured value. Once a batch of two or more pairs is measured the cap lifts."""
+        (`max_pairs <= 1`: a marked window without a batch, which the S245 marker rule no longer
+        lets a ladder pass produce) it would extrapolate batch sizes from single pairs, which
+        under-predicts them by 17 to 100 percent (the module docstring), so a call may have no
+        more pairs, and no longer a padded length, than the largest shape measured: each dimension
+        is held to its own largest measured value. Once a batch of two or more pairs is measured
+        the cap lifts (S244). This method is only ever asked of a `RamFit`, which `fit_ram` returns
+        only for a window with more than three distinct shapes, full rank and a full-length
+        sample, so the lift always comes with those conditions."""
         return self.max_pairs > 1 or (pairs <= self.max_pairs and length <= self.max_length)
 
 

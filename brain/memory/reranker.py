@@ -165,6 +165,13 @@ class RerankTerminated(Exception):  # noqa: N818 - a control signal, not an erro
     `RamMeasurementAbandoned`."""
 
 
+class RerankDeferred(Exception):  # noqa: N818 - a control signal, not an error
+    """S247: a rerank batch was held back because it does not fit the RAM bound (no memory model,
+    no way to size it, a known headroom below its predicted growth, or larger than any shape the
+    model has measured). Nothing was scored for it. The caller treats it as "not now" and tries
+    again later (the floor bootstrap's retry, `floor_calibration.get_bootstrap_floor`)."""
+
+
 def _noop() -> None:
     return None
 
@@ -1026,6 +1033,9 @@ def _too_long_remembered(model_id: str, store: MemoryStore) -> bool:
 #     the most a recall sends, each at the longest length the time budget allows for that many
 #     pairs (every real call fits the time budget, so each real call is dominated by one of these
 #     measured shapes), each only when the fit says it fits the live headroom.
+# S245: the live headroom is checked before the model load, the warm-up and EVERY rung (the first
+# included); the completion marker is recorded only when the window holds a measured batch of more
+# than one pair, so a pass a starved host stopped runs again at the next lull.
 # The window is read to decide every rung, so a restart or an abandoned pass resumes where the
 # window stands. Real reranks add their own shapes. The ONNX memory pool and memory patterns are
 # off (S222), so a call's memory goes back after it and the sample is the call's PEAK growth
@@ -1300,6 +1310,37 @@ def _run_rung(
     return True
 
 
+def _dominating_growth(groups: Sequence[ram_fit.ShapeGroup], pairs: int, length: int) -> float | None:
+    """S245: an upper bound on the growth of a call of `pairs` documents padded to `length` tokens,
+    taken from the window: memory cannot shrink as either dimension grows, so every measured shape
+    with at least that many pairs AND at least that length needed at least as much, and the
+    SMALLEST of their mean growths is the tightest bound. `None` when no measured shape dominates."""
+    bounds = [g.sum_y / g.n for g in groups if g.n > 0 and g.pairs >= pairs and g.length >= length]
+    return min(bounds) if bounds else None
+
+
+def _ladder_headroom_stop(predicted: float | None, what: str) -> bool:
+    """S245: whether the ladder must not run `what` now, judged on a fresh read of the live
+    headroom (`_available_ram_headroom_bytes`, the S241 minimum). True when the headroom is known and
+    is zero or less (a degraded host, S240), or when it is known and the step's PREDICTED growth
+    exceeds it. `predicted` is `None` when nothing measured bounds the step (the first rung, the model
+    load, the warm-up): then only a headroom of zero stops it. An unreadable headroom (`None`) does not
+    stop the ladder, the posture the width fit has always had (the memory term is skipped, never read
+    as unlimited memory)."""
+    headroom = _available_ram_headroom_bytes()
+    if headroom is None:
+        return False
+    if headroom > 0.0 and (predicted is None or predicted <= headroom):
+        return False
+    log.info(
+        "reranker: RAM ladder stopped before %s: headroom %.0f MB, predicted %s",
+        what,
+        headroom / 1e6,
+        "unknown" if predicted is None else f"{predicted / 1e6:.0f} MB",
+    )
+    return True
+
+
 def measure_ram_figure(
     provider: RerankerProvider, store: MemoryStore, *, watch: Callable[[], bool] | None = None
 ) -> bool:
@@ -1309,12 +1350,16 @@ def measure_ram_figure(
     The next rung is always decided from the window, so a restart or an abandoned pass resumes
     where it stands, and no rung repeats a shape. A rung that cannot be built, whose peak growth
     cannot be read, or that recorded nothing new ends the pass (it is retried at a later lull).
-    A pass that gets through phase 2 (every batch size run, dominated, or ruled out by the time
-    budget or the headroom) records the completion marker; only then does the window give a model
-    for sizing (`_window_ram_fit`), so the first batches are never sized from single pairs alone.
-    The FIRST rung (the full-length pair, about 300 MB on the reference model) runs without a
-    headroom check, like the first-ever seed always did (S184, S200). Provider exceptions
-    propagate.
+    A pass that gets through phase 2 (every batch size run, dominated, or stopped by the time
+    budget or the headroom) records the completion marker ONLY IF the window then holds a measured
+    batch of more than one pair (S245); a pass that ends without one records no marker, so the window
+    gives no model and the next lull runs the ladder again (a pass stopped on a starved host must not
+    pin every rerank to the single-pair cap for 24 hours). Only a marked window gives a model for
+    sizing (`_window_ram_fit`), so the first batches are never sized from single pairs alone.
+    S245: the live headroom is checked before the warm-up and before EVERY rung, the first included
+    (`_ladder_headroom_stop`): a known headroom of zero stops the pass, a rung is predicted from the
+    fit (phase 2) or bounded by the measured shape that dominates it (phase 1), and the first rung,
+    which nothing bounds, is held to a positive headroom only. Provider exceptions propagate.
 
     S218: with a `watch` (the direct chat passes `cli_throttle.reply_watch()`), a reply that
     starts while this runs abandons the rung in progress: `RamMeasurementAbandoned` is raised,
@@ -1329,6 +1374,8 @@ def measure_ram_figure(
     one-token warm-up and the tokenizer-only length probe are not stoppable."""
     model_id = provider.model_id()
     _abandon_if_replying(watch)
+    if _ladder_headroom_stop(None, "the warm-up"):
+        return _window_ready(store, model_id)
     pair = _full_length_pair(provider)
     if pair is None:
         _warn_ram_figure_once("RAM measurement not done: no full-length pair could be built")
@@ -1346,16 +1393,21 @@ def measure_ram_figure(
         if rung is None:
             break
         shortest = min((g.length for g in groups if g.pairs == 1), default=None)
+        if _ladder_headroom_stop(_dominating_growth(groups, rung.pairs, rung.target), "a single-pair rung"):
+            return _window_ready(store, model_id)
         if not _run_rung(provider, store, model_id, base_text, rung, cap, watch):
             return _window_ready(store, model_id)
         after = _window_groups(store, model_id)
         if after is None or not _rung_made_progress(rung, shortest, after):
             _warn_ram_figure_once("RAM measurement stopped: a rung recorded nothing new")
             return _window_ready(store, model_id)
-    # Phase 2: batches of increasing size, at the time-budget frontier. The pass is COMPLETE when
-    # every size has run, been dominated by a measured shape, or been ruled out by the time
-    # budget or the live headroom (a larger one fits no better); a rung that cannot be built or
-    # read leaves it incomplete, to be retried at a later lull.
+    # Phase 2: batches of increasing size, at the time-budget frontier. The loop ENDS when every
+    # size has run or been dominated by a measured shape, or when the time budget or the live
+    # headroom stops it at the first size that does not fit: the stop is kept (not skipped past)
+    # because a later size's prediction comes from a fit built from smaller shapes only, which
+    # under-predicts larger batches. The pass is COMPLETE, and records the marker, only if the
+    # window then holds a measured batch of more than one pair (S245); a rung that cannot be built
+    # or read leaves it incomplete, to be retried at a later lull.
     completed = True
     for pairs in _batch_sizes():
         _abandon_if_replying(watch)
@@ -1370,15 +1422,20 @@ def measure_ram_figure(
         length = min(cap, int((budget - time_fit.overhead) / time_fit.rate) // pairs)
         if length < 1 or ram_fit.dominated(pairs, length, ram_fit.distinct_shapes(groups)):
             continue
-        headroom = _available_ram_headroom_bytes()
-        if headroom is not None and fit.predict(pairs, length) > headroom:
-            log.info("reranker: RAM ladder stopped: %d pairs x %d tokens would not fit the headroom", pairs, length)
+        if _ladder_headroom_stop(fit.predict(pairs, length), f"a rung of {pairs} pairs x {length} tokens"):
             break
         if not _run_rung(provider, store, model_id, base_text, _Rung(pairs, length), cap, watch):
             completed = False
             break
     if completed:
-        _mark_ladder_complete(store, model_id)
+        final = _window_groups(store, model_id)
+        if final is not None and any(g.pairs > 1 for g in final):
+            _mark_ladder_complete(store, model_id)
+        else:
+            log.info(
+                "reranker: RAM ladder ended without a measured batch of more than one pair: "
+                "no completion marker, it runs again at the next lull (S245)"
+            )
     return _window_ready(store, model_id)
 
 
@@ -1406,8 +1463,10 @@ def run_ram_figure(
     """The `rerank_ram_figure` job's run (S200): stamp the attempt, then run the ladder on the
     runtime reranker (building the provider here, at a lull, is what keeps the model load off the
     reply path). Returns True iff the window then gives a usable memory model; when it already
-    does, nothing is built or measured and the result is False. Provider exceptions propagate
-    (the central pass logs them).
+    does, nothing is built or measured and the result is False. S245: the live headroom is checked
+    BEFORE the provider is built (a known headroom of zero builds and loads nothing: the attempt
+    stamp stays, so the next chat activity marker retries, and the need flag is kept). Provider
+    exceptions propagate (the central pass logs them).
 
     S218: `watch` (the direct chat's `cli_throttle.reply_watch()`, taken by the caller before
     the due check and the store) is checked before the provider is built and passed to
@@ -1423,6 +1482,8 @@ def run_ram_figure(
         return False
     try:
         _abandon_if_replying(watch)
+        if _ladder_headroom_stop(None, "the model load"):
+            return False  # S245: nothing is loaded on a host with no headroom; the next lull retries
         ready = measure_ram_figure(build_reranker_provider(store=store), store, watch=watch)
     except RamMeasurementAbandoned:
         with _cost_lock:
@@ -1650,19 +1711,33 @@ def _measured_rerank(
     return normalization, normalization.seconds
 
 
-def _warm_up_once(provider: RerankerProvider, query: str, documents: Sequence[str]) -> None:
+def _warm_up_once(
+    provider: RerankerProvider, query: str, documents: Sequence[str], *, bounded: bool = False
+) -> None:
     """Before the first measured recall rerank of this process for the
     provider's model id: `_WARMUP_RERANKS` single-document reranks on the
     current candidates' first documents, results and timings discarded
     (plan P-1). Plain `rerank()`, so nothing here reaches the cost model.
     Marked done only after they succeed; two threads racing here may both
-    warm up, which costs time but never skews a measurement."""
+    warm up, which costs time but never skews a measurement.
+
+    S247: with `bounded` (the recall callers) each warm-up call is a rerank call site like any
+    other: it runs only when its one-pair batch fits the RAM bound now
+    (`_batch_fits_ram_bound`). When one does not, NO warm-up runs, the model is NOT marked warmed
+    (the next call tries again) and the recall goes on under its own bounds; the pair-length probe
+    that follows loads the model on demand (`CrossEncoderProvider._pair_tokenizer`), so the lengths
+    stay available (the one-time load may then be timed inside that probe: a one-sample skew, on
+    a host with no room). The ladder's own warm-up is not bounded here (`bounded` False): its
+    headroom check comes first (`measure_ram_figure`)."""
     model_id = provider.model_id()
     with _cost_lock:
         if model_id in _warmed_model_ids:
             return
-    for i in range(_WARMUP_RERANKS):
-        list(provider.rerank(query, [documents[i % len(documents)]]))
+    chosen = [documents[i % len(documents)] for i in range(_WARMUP_RERANKS)]
+    if bounded and not all(_batch_fits_ram_bound(provider, model_id, query, [doc]) for doc in chosen):
+        return
+    for doc in chosen:
+        list(provider.rerank(query, [doc]))
     with _cost_lock:
         _warmed_model_ids.add(model_id)
 
@@ -2155,6 +2230,54 @@ def _available_ram_headroom_bytes() -> float | None:
     return min(readings) if readings else None
 
 
+def _kept_ram_fits(model_id: str) -> list[ram_fit.RamFit]:
+    """The memory models this PROCESS holds for `model_id` (`_ram_fit_kept`: the last usable fit
+    of each store it has read, S225/H4b). For a caller that has no store (the floor bootstrap's
+    starters); a recall turn has always read the window before it gets here, so the fit exists."""
+    with _cost_lock:
+        return [fit for (_store, mid), fit in _ram_fit_kept.items() if mid == model_id]
+
+
+def _batch_fits_ram_bound(
+    provider: RerankerProvider, model_id: str, query: str, documents: Sequence[str]
+) -> bool:
+    """S247: whether ONE rerank call of `documents` (all scored together, padded to the longest
+    (query, document) pair) may run now. True where no RAM bound applies on this machine
+    (`_ram_bound_applies`: the per-call peak is unreadable there) and when the live headroom is
+    unreadable (the width fit's posture: the memory term, the S242 cap included, is skipped).
+    Otherwise it needs a memory model: with none held by this process the call cannot be sized and
+    does not run, and with some it needs every one of them to allow it (`RamFit.within_measured`:
+    not more pairs or a longer padded length than measured while the model holds single pairs only;
+    and the predicted growth within the headroom). The headroom is read before the pair lengths
+    (which, on the real provider, load the model on demand), so an unreadable headroom costs no
+    tokenizing."""
+    if not _ram_bound_applies():
+        return True
+    fits = _kept_ram_fits(model_id)
+    if not fits:
+        log.info("reranker: a rerank batch waits: this process holds no memory model for %s (S247)", model_id)
+        return False
+    headroom = _available_ram_headroom_bytes()
+    if headroom is None:
+        return True
+    lengths = provider.pair_token_lengths(query, documents)
+    if not lengths:
+        log.info("reranker: a rerank batch waits: its pair sizes are unavailable (S247)")
+        return False
+    pairs, longest = len(documents), max(lengths)
+    for fit in fits:
+        if not fit.within_measured(pairs, longest) or fit.predict(pairs, longest) > headroom:
+            log.info(
+                "reranker: a rerank batch of %d pairs x %d tokens waits: it does not fit the memory model "
+                "and the headroom (%.0f MB) (S247)",
+                pairs,
+                longest,
+                headroom / 1e6,
+            )
+            return False
+    return True
+
+
 def anchor_count(real_width: int) -> int:
     """Anchors appended ON TOP of `real_width` real candidates (S23):
     `k = min(P, real_width // ANCHOR_SPLIT_DIVISOR)`, so a rerank sends
@@ -2178,6 +2301,7 @@ def fit_rerank_width(
     budget_seconds: float,
     headroom_bytes: float | None,
     max_real: int = CANDIDATE_POOL,
+    seed_ram_fit: ram_fit.RamFit | None = None,
 ) -> int:
     """How many real candidates to rerank this message (spec §1).
 
@@ -2196,7 +2320,10 @@ def fit_rerank_width(
     measured batch of more than one pair, it has no more pairs and no longer a padded length
     than the largest shape measured (`RamFit.within_measured`, S242: such a batch would be
     extrapolated from single pairs; the cap is part of the RAM term, so a missing headroom
-    reading leaves the width time-bound as before).
+    reading leaves the width time-bound as before). With no time estimate (`estimate is None`)
+    the width is the S5 minimum, and when the caller passes its memory model (`seed_ram_fit`)
+    and a headroom reading that seed batch has to fit them too, else the width is 0 (S247: the seed
+    rerank is a call site like any other).
     Both factors of the padded size only grow with n, so the scan stops at
     the first prefix that does not fit.
 
@@ -2204,7 +2331,17 @@ def fit_rerank_width(
     (S5/S23). Pure: no clock, no I/O."""
     limit = min(len(candidate_pair_tokens), max_real)
     if estimate is None:
-        return min(RERANK_MIN_REAL_CANDIDATES, limit)
+        seed = min(RERANK_MIN_REAL_CANDIDATES, limit)
+        if seed_ram_fit is not None and headroom_bytes is not None and seed > 0:
+            # S247: the seed batch is a rerank call like any other. With no time estimate (the time
+            # window aged out) the width is the S5 minimum, but it still has to fit the memory model
+            # and the headroom, and the S242 cap, when the caller holds a memory model.
+            k = anchor_count(seed)
+            pairs = seed + k
+            longest = max([*candidate_pair_tokens[:seed], *anchor_pair_tokens[:k]])
+            if not seed_ram_fit.within_measured(pairs, longest) or seed_ram_fit.predict(pairs, longest) > headroom_bytes:
+                return 0
+        return seed
     memory = estimate.ram_fit
     ram_bound = memory is not None and headroom_bytes is not None
     width = 0
@@ -2268,7 +2405,7 @@ def warm_up_for_recall(
     process has not run them yet for the provider's model id. A caller that
     times its own pair-size probe (`recall_pair_sizes`) calls this first, so
     the one-time ONNX session load is never timed into `T_p`."""
-    _warm_up_once(provider, query, list(candidate_documents[:CANDIDATE_POOL]))
+    _warm_up_once(provider, query, list(candidate_documents[:CANDIDATE_POOL]), bounded=True)
 
 
 def recall_pair_sizes(
@@ -2279,7 +2416,7 @@ def recall_pair_sizes(
     provider's tokenizer exists only once its model is loaded). Raises
     whatever the provider raises."""
     pool = list(candidate_documents[:CANDIDATE_POOL])
-    _warm_up_once(provider, query, pool)
+    _warm_up_once(provider, query, pool, bounded=True)
     lengths, seconds = provider.pair_token_lengths_timed(query, [*pool, *ANCHOR_POOL])
     return PairSizes(lengths=None if lengths is None else list(lengths), seconds=seconds)
 
@@ -2336,9 +2473,10 @@ def rerank_for_recall(
         return RecallRerank(
             width=0, reranked=False, hand_off="ram_figure", normalization=None, measured=False
         )
-    # Warm up before the length probe: on the real provider the first rerank
-    # loads the ONNX session, and with it the tokenizer the probe uses.
-    _warm_up_once(provider, query, pool)
+    # Warm up before the length probe, so the one-time ONNX session load is not timed into
+    # the probe. Bounded (S247): when its one-pair batch does not fit the RAM bound it is skipped, and
+    # the probe loads the model on demand.
+    _warm_up_once(provider, query, pool, bounded=True)
     if sizes is None:
         lengths = provider.pair_token_lengths(query, [*pool, *ANCHOR_POOL])
     else:
@@ -2359,8 +2497,15 @@ def rerank_for_recall(
         )
     candidate_tokens, anchor_tokens = lengths[: len(pool)], lengths[len(pool) :]
     estimate = rerank_cost_estimate(model_id, store)
-    headroom = _available_ram_headroom_bytes() if estimate is not None else None
-    width = fit_rerank_width(candidate_tokens, anchor_tokens, estimate, budget_seconds, headroom, cap)
+    headroom = _available_ram_headroom_bytes()
+    seed_fit = _ram_fit_for(store, model_id)[0] if estimate is None else None
+    width = fit_rerank_width(
+        candidate_tokens, anchor_tokens, estimate, budget_seconds, headroom, cap, seed_ram_fit=seed_fit
+    )
+    if estimate is None and width < RERANK_MIN_REAL_CANDIDATES:
+        # S247: the seed batch does not fit the memory model and the headroom. No time estimate
+        # exists, so there is no time-stuck miss to record or re-measure.
+        return RecallRerank(width=width, reranked=False, hand_off="budget", normalization=None, measured=False)
 
     if width < RERANK_MIN_REAL_CANDIDATES:
         # The MEASURED estimate says fewer than the S5 minimum fit this
@@ -2574,10 +2719,23 @@ def normalize_bundled_pairs_against_anchors(
     Returns one normalized score per pair, positionally aligned with
     `pairs`. Anchor documents/scores are used ONLY to compute each pair's
     median offset and are never returned.
+
+    S247 (the RAM bound): each pair's call runs only when its batch fits the RAM bound NOW
+    (`_batch_fits_ram_bound`: the process's memory model and the live headroom; this caller has no
+    store, so the bound is the process's kept model). When it does not, `RerankDeferred` is raised
+    BEFORE that pair's call and nothing is returned (the pairs already scored are discarded:
+    ten tiny calls); `floor_calibration.get_bootstrap_floor` turns it into a failed attempt, which
+    the lull job and the message retry run again.
     """
     normalized: list[float] = []
+    model_id = provider.model_id()
     for query, doc in pairs:
-        raw_scores = list(provider.rerank(query, [doc, *ANCHOR_POOL]))
+        documents = [doc, *ANCHOR_POOL]
+        if not _batch_fits_ram_bound(provider, model_id, query, documents):
+            raise RerankDeferred(
+                f"a bundled pair's batch of {len(documents)} documents does not fit the RAM bound now"
+            )
+        raw_scores = list(provider.rerank(query, documents))
         real_score, anchor_scores = raw_scores[0], raw_scores[1:]
         normalized.append(_median_normalize([real_score], anchor_scores)[0])
     return normalized
