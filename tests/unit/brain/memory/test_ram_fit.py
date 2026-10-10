@@ -200,3 +200,11 @@ def test_the_intercept_only_model_is_used_when_nothing_grows() -> None:
     ]
     fit = ram_fit.fit_ram(groups)
     assert fit is not None and (fit.b, fit.c) == (0.0, 0.0) and fit.a == pytest.approx(3.0)
+
+
+def test_a_window_with_no_positive_growth_is_no_model() -> None:
+    """S204 in its new form: an always-zero peak is a failed measurement, not a model that
+    predicts no memory (that would switch the RAM bound off silently)."""
+    groups = [ShapeGroup(1, ln, ln == 1024, 3, 0.0) for ln in (1024, 512, 256, 128)]
+    assert ram_fit.enough_shapes(groups) is True
+    assert ram_fit.fit_ram(groups) is None

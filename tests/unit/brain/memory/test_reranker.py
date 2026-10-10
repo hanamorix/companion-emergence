@@ -437,31 +437,26 @@ def test_detect_avx2_false_for_arm_style_cpuinfo_with_no_flags_line(
     assert _detect_avx2() is False
 
 
-def test_current_rss_bytes_reads_the_psutil_rss_on_every_platform(monkeypatch: pytest.MonkeyPatch) -> None:
-    """S206: the RSS comes from psutil, so the platform name does not matter."""
-    import psutil
+def test_the_third_timed_value_is_the_peak_growth_read_by_the_peak_reader(monkeypatch: pytest.MonkeyPatch) -> None:
+    """S220: `rerank_timed` returns the call's PEAK growth (peak_rss), never an RSS difference."""
+    from brain.memory import peak_rss
 
-    class _Info:
-        rss = 12345 * 1024
-
-    class _Proc:
-        def memory_info(self):
-            return _Info()
-
-    monkeypatch.setattr(psutil, "Process", lambda *a, **k: _Proc())
-    for platform in ("linux", "darwin", "win32"):
-        monkeypatch.setattr(sys, "platform", platform)
-        assert reranker_mod._current_rss_bytes() == 12345 * 1024.0
+    events: list[str] = []
+    monkeypatch.setattr(peak_rss, "begin", lambda: events.append("begin") or 1000.0)
+    monkeypatch.setattr(peak_rss, "growth_since", lambda before: events.append(f"growth since {before}") or 4096.0)
+    provider = FakeRerankerProvider({})
+    original = provider.rerank
+    provider.rerank = lambda q, d: (events.append("rerank"), original(q, d))[1]
+    scores, seconds, growth = provider.rerank_timed("q", ["a", "b"])
+    assert growth == 4096.0 and events == ["begin", "rerank", "growth since 1000.0"]
+    assert len(scores) == 2 and seconds >= 0.0
 
 
-def test_current_rss_bytes_fail_soft_on_read_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    import psutil
+def test_an_unreadable_peak_is_none_in_the_timed_tuple(monkeypatch: pytest.MonkeyPatch) -> None:
+    from brain.memory import peak_rss
 
-    def _boom(*args, **kwargs):
-        raise psutil.AccessDenied()
-
-    monkeypatch.setattr(psutil.Process, "memory_info", _boom)
-    assert reranker_mod._current_rss_bytes() is None  # no raise
+    monkeypatch.setattr(peak_rss, "begin", lambda: None)
+    assert FakeRerankerProvider({}).rerank_timed("q", ["a"])[2] is None
 
 
 class _FakeTextFile:
@@ -970,7 +965,7 @@ def test_result_carries_the_rerank_timed_measurements() -> None:
     result = normalize_against_anchors(_Timed({}, default=0.0), "q", _real_docs(5))
 
     assert result.seconds == 0.25
-    assert result.rss_delta_bytes == 4096.0
+    assert result.peak_growth_bytes == 4096.0
 
 
 def test_ac11_normalize_against_anchors_has_no_bare_numeric_literal() -> None:

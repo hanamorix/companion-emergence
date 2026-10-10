@@ -1566,13 +1566,13 @@ def search_paragraphs(
     reranker_down = False
     ram_model_id = reranker_mod.resolve_reranker_model_id()
     if rerankable and not reranker_mod.ram_figure_ready(ram_model_id, store):
-        # S200: no saved RAM figure on this machine, so no re-scoring runs, and nothing
+        # S200: no usable memory model on this machine, so no re-scoring runs, and nothing
         # of the reranker is built, loaded, warmed up or probed on this reply path. The
-        # need is flagged; the next lull measures the figure (`rerank_ram_figure`). Every
+        # need is flagged; the next lull runs the ladder (`rerank_ram_figure`). Every
         # query takes the plain meaning-match path (`max_real=0` below).
         reranker_mod.note_ram_figure_needed(ram_model_id)
         floor_startup.request_ram_figure()  # S201/S210: the direct chat measures it after this reply
-        log.info("semantic recall: no RAM figure yet — cosine path for this message (S200)")
+        log.info("semantic recall: no usable RAM model yet — cosine path for this message (S200)")
         reranker_down = True
     elif rerankable:
         try:

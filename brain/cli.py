@@ -2114,8 +2114,8 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
                     print(result.content)
                     print()
                     total_tool_calls += len(result.tool_invocations)
-                    # S210: the reply is finished and printed; only now may the one-pair RAM
-                    # measurement a flagged turn asked for start (its sample never spans a reply, S218).
+                    # S210: the reply is finished and printed; only now may the RAM
+                    # ladder (S220) a flagged turn asked for start (its sample never spans a reply, S218).
                     floor_startup.start_requested_ram_figure()
             finally:
                 # Flush conversation through ingest pipeline (best-effort)

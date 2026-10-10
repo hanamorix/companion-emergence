@@ -25,6 +25,7 @@ from brain.memory import reranker as reranker_mod
 from brain.memory.reranker import RerankerProvider
 from brain.memory.semantic_recall import COSINE_PATH, RERANKED_PATH, run_semantic_recall
 from brain.memory.store import MemoryStore
+from tests.unit.brain.memory._ram_support import ScriptedLadderProvider, seed_window
 from tests.unit.brain.memory.test_monologue_last import (
     _RERANKER_ID,
     _cosine_floor,
@@ -40,7 +41,7 @@ _FULL = 1024
 @pytest.fixture(autouse=True)
 def _gate_on(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(reranker_mod, "_require_ram_figure", True)
-    monkeypatch.setattr(reranker_mod, "_current_rss_bytes", lambda: 1.0e9)
+    monkeypatch.setattr(reranker_mod.peak_rss, "available", lambda: True)
     monkeypatch.setattr(reranker_mod, "resolve_reranker_model_id", lambda: _RERANKER_ID)
 
 
@@ -138,7 +139,7 @@ def test_the_same_turn_reranks_once_a_window_figure_exists(
     rec = _CappedReranker()
     monkeypatch.setattr("brain.memory.reranker.build_reranker_provider", lambda **kw: rec)
     _warm(store)
-    reranker_mod._ram_cost.record(store, _RERANKER_ID, 1_000, 245_000.0)
+    seed_window(store, _RERANKER_ID)
 
     result = run_semantic_recall(store, tmp_path, _QUERY)
 
@@ -146,16 +147,6 @@ def test_the_same_turn_reranks_once_a_window_figure_exists(
     assert reranker_mod._ram_figure_needed == set()
 
 
-def test_a_kept_figure_counts_only_in_a_process_that_has_recorded_a_rerank(tmp_path: Path) -> None:
-    """S180: the sizing code uses a kept figure only for such a process; a kept figure
-    alone would open the gate for a rerank sized as unseeded (the S193 shape)."""
-    store = _store(tmp_path)
-    key = (reranker_mod.cost_series._store_key(store), _RERANKER_ID)
-    assert reranker_mod.ram_figure_ready(_RERANKER_ID, store) is False
-    reranker_mod._ram_kept[key] = 100.0
-    assert reranker_mod.ram_figure_ready(_RERANKER_ID, store) is False, "kept alone is not enough"
-    reranker_mod._ram_state[_RERANKER_ID] = reranker_mod._RamState(peak_x=_FULL)
-    assert reranker_mod.ram_figure_ready(_RERANKER_ID, store) is True
 
 
 def test_the_shipped_default_requires_a_ram_figure() -> None:
@@ -168,29 +159,10 @@ def test_the_shipped_default_requires_a_ram_figure() -> None:
     assert re.search(r"^_require_ram_figure = True$", source, re.MULTILINE)
 
 
-def test_a_recorded_rerank_with_no_ram_growth_is_not_a_figure(tmp_path: Path) -> None:
-    """Review L1: membership in the process's measured set is not a figure."""
-    store = _store(tmp_path)
-    reranker_mod._record_rerank_cost(_RERANKER_ID, store, _FULL, 1.0, 0.0)
-    reranker_mod._record_rerank_cost(_RERANKER_ID, store, _FULL // 2, 1.0, None)
-    assert reranker_mod.ram_figure_ready(_RERANKER_ID, store) is False
 
 
-def test_unreadable_rss_leaves_the_older_behaviour(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """No figure can ever exist where RSS is unreadable: the gate does not apply
-    (question to Planning)."""
-    monkeypatch.setattr(reranker_mod, "_current_rss_bytes", lambda: None)
-    assert reranker_mod.ram_figure_ready(_RERANKER_ID, _store(tmp_path)) is True
 
 
-def test_a_failed_database_read_is_no_figure(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    store = _store(tmp_path)
-    monkeypatch.setattr(reranker_mod._ram_cost, "fit", lambda *_a, **_k: None)
-    assert reranker_mod.ram_figure_ready(_RERANKER_ID, store) is False
 
 
 # ---------------------------------------------------------------------------
@@ -198,127 +170,22 @@ def test_a_failed_database_read_is_no_figure(
 # ---------------------------------------------------------------------------
 
 
-def test_the_measurement_runs_two_short_warm_ups_then_one_full_length_pair(tmp_path: Path) -> None:
-    store = _store(tmp_path)
-    provider = _CappedReranker()
-
-    assert reranker_mod.measure_ram_figure(provider, store) is True
-
-    assert provider.plain == [("warm up", ["warm up"])] * 2
-    ((query, documents),) = provider.timed
-    assert len(documents) == 1
-    assert provider.pair_token_lengths(query, documents) == [_FULL]
-    # one RAM sample and one time sample, both at the pair's token count
-    ram = reranker_mod._ram_cost.state(store, _RERANKER_ID).sums
-    assert (ram.n, ram.sum_x, ram.sum_y) == (1, _FULL, 245e6)
-    time_sums = reranker_mod._rerank_cost.state(store, _RERANKER_ID).sums
-    assert (time_sums.n, time_sums.sum_x, time_sums.sum_y) == (1, _FULL, 2.0)
-    assert reranker_mod.ram_figure_ready(_RERANKER_ID, store) is True
 
 
-def test_the_first_real_rerank_after_the_measurement_is_sized_from_the_figure_not_the_seed(
-    tmp_path: Path,
-) -> None:
-    """Able to fail: the width-5 seed would rerank exactly 5 real candidates."""
-    store = _store(tmp_path)
-    provider = _CappedReranker()
-    reranker_mod.measure_ram_figure(provider, store)
-    estimate = reranker_mod.rerank_cost_estimate(_RERANKER_ID, store)
-    assert estimate is not None and estimate.ram_bytes_per_token == pytest.approx(245e6 / _FULL)
-    provider.timed.clear()
-
-    documents = [f"a short memory {i}" for i in range(12)]
-    outcome = reranker_mod.rerank_for_recall(
-        provider, "a short query", documents, store=store, budget_seconds=100.0
-    )
-
-    assert outcome.reranked and outcome.width == 12
-    ((_, sent),) = provider.timed
-    assert len(sent) == 12 + reranker_mod.anchor_count(12)
 
 
-def test_a_pair_with_no_ram_growth_records_nothing_and_is_not_a_figure(tmp_path: Path) -> None:
-    store = _store(tmp_path)
-    for rss in (0.0, -5.0, None):
-        provider = _CappedReranker(rss=rss)
-        assert reranker_mod.measure_ram_figure(provider, store) is False
-    assert reranker_mod._ram_cost.state(store, _RERANKER_ID).sums.n == 0
-    assert reranker_mod._rerank_cost.state(store, _RERANKER_ID).sums.n == 0
-    assert _RERANKER_ID not in reranker_mod._ram_state
-    assert reranker_mod.ram_figure_ready(_RERANKER_ID, store) is False
 
 
-def test_a_process_that_already_ran_a_batch_this_large_does_not_rerun_the_pair(
-    tmp_path: Path,
-) -> None:
-    """No RSS growth can show past the high water, so the pair is not even run (it
-    would cost a full-length rerank every lull for nothing), and it is not a figure."""
-    store = _store(tmp_path)
-    reranker_mod._ram_state[_RERANKER_ID] = reranker_mod._RamState(peak_x=_FULL)
-    provider = _CappedReranker()
-    assert reranker_mod.measure_ram_figure(provider, store) is False
-    assert provider.timed == []
-    assert provider.plain == [], "S213: refused before the warm-up reranks"
 
 
-def test_s213_a_known_full_pair_length_refuses_before_the_provider_is_even_built(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The job remembers the pair's token count per model; once the high water covers it, a
-    lull builds, loads and warms up nothing (and the attempt is still stamped for this lull)."""
-    store = _store(tmp_path)
-    reranker_mod.note_ram_figure_needed(_RERANKER_ID)
-    first = _CappedReranker(rss=0.0)
-    monkeypatch.setattr("brain.memory.reranker.build_reranker_provider", lambda **kw: first)
-    assert reranker_mod.run_ram_figure("m1", store) is False  # no growth: not a figure, tokens learned
-    assert reranker_mod._full_pair_tokens[_RERANKER_ID] == _FULL
-
-    reranker_mod._ram_state[_RERANKER_ID] = reranker_mod._RamState(peak_x=_FULL)
-    monkeypatch.setattr(
-        "brain.memory.reranker.build_reranker_provider", lambda **kw: pytest.fail("S213: provider built")
-    )
-    assert reranker_mod.run_ram_figure("m2", store) is False
-    assert reranker_mod._ram_figure_attempt[_RERANKER_ID] == "m2"
-    assert reranker_mod._ram_figure_needed == {_RERANKER_ID}, "the flag stays"
 
 
-def test_s213_a_known_length_and_a_covering_high_water_refuse_before_even_the_pair_is_probed(
-    tmp_path: Path,
-) -> None:
-    """The first refusal in `measure_ram_figure`: no tokenization, no warm-up, no pair."""
-    store = _store(tmp_path)
-    reranker_mod._full_pair_tokens[_RERANKER_ID] = _FULL
-    reranker_mod._ram_state[_RERANKER_ID] = reranker_mod._RamState(peak_x=_FULL)
-    provider = _CappedReranker()
-    assert reranker_mod.measure_ram_figure(provider, store) is False
-    assert (provider.probes, provider.plain, provider.timed) == (0, [], [])
 
 
-def test_s213_a_lower_high_water_still_measures_after_the_length_is_known(tmp_path: Path) -> None:
-    store = _store(tmp_path)
-    reranker_mod._full_pair_tokens[_RERANKER_ID] = _FULL
-    reranker_mod._ram_state[_RERANKER_ID] = reranker_mod._RamState(peak_x=_FULL - 1)
-    provider = _CappedReranker()
-    assert reranker_mod.measure_ram_figure(provider, store) is True
-    assert len(provider.timed) == 1
 
 
-def test_a_pair_whose_ram_sample_was_not_taken_is_not_reported_as_measured(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The return value is whether the window then holds a figure."""
-    store = _store(tmp_path)
-    monkeypatch.setattr(reranker_mod, "_record_rerank_cost", lambda *a, **k: None)
-    assert reranker_mod.measure_ram_figure(_CappedReranker(), store) is False
 
 
-def test_a_pair_that_never_reaches_the_input_limit_is_not_measured(tmp_path: Path) -> None:
-    """A tokenizer whose count keeps growing with the text never shows the limit:
-    the pair is not full length, so no (too low) figure is recorded."""
-    store = _store(tmp_path)
-    provider = _CappedReranker(cap=None)
-    assert reranker_mod.measure_ram_figure(provider, store) is False
-    assert provider.timed == []
 
 
 # ---------------------------------------------------------------------------
@@ -334,49 +201,10 @@ def _factory(store: MemoryStore):
     return _open
 
 
-def test_the_job_is_due_only_while_needed_unmeasured_and_once_per_marker(tmp_path: Path) -> None:
-    store = _store(tmp_path)
-    open_store = _factory(store)
-    assert reranker_mod.ram_figure_due("m1", open_store) is False, "no turn flagged the need"
-    reranker_mod.note_ram_figure_needed(_RERANKER_ID)
-    assert reranker_mod.ram_figure_due("m1", open_store) is True
-    reranker_mod._ram_figure_attempt[_RERANKER_ID] = "m1"
-    assert reranker_mod.ram_figure_due("m1", open_store) is False, "once per chat activity marker"
-    assert reranker_mod.ram_figure_due("m2", open_store) is True, "a later lull retries"
-    reranker_mod._ram_kept[(reranker_mod.cost_series._store_key(store), _RERANKER_ID)] = 5.0
-    reranker_mod._ram_state[_RERANKER_ID] = reranker_mod._RamState(peak_x=_FULL)
-    assert reranker_mod.ram_figure_due("m3", open_store) is False
-    assert _RERANKER_ID not in reranker_mod._ram_figure_needed, "a flag whose figure exists is dropped"
 
 
-def test_the_job_run_measures_clears_the_flag_and_a_failed_run_keeps_it(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    store = _store(tmp_path)
-    reranker_mod.note_ram_figure_needed(_RERANKER_ID)
-    bad = _CappedReranker(rss=0.0)
-    monkeypatch.setattr("brain.memory.reranker.build_reranker_provider", lambda **kw: bad)
-    assert reranker_mod.run_ram_figure("m1", store) is False
-    assert reranker_mod._ram_figure_needed == {_RERANKER_ID}
-    assert reranker_mod._ram_figure_attempt[_RERANKER_ID] == "m1"
-
-    good = _CappedReranker()
-    monkeypatch.setattr("brain.memory.reranker.build_reranker_provider", lambda **kw: good)
-    assert reranker_mod.run_ram_figure("m2", store) is True
-    assert reranker_mod._ram_figure_needed == set()
-    assert reranker_mod.ram_figure_ready(_RERANKER_ID, store) is True
 
 
-def test_the_job_run_with_a_figure_already_present_measures_nothing(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    store = _store(tmp_path)
-    reranker_mod._ram_cost.record(store, _RERANKER_ID, 1_000, 245_000.0)
-    reranker_mod.note_ram_figure_needed(_RERANKER_ID)
-    boom = _CappedReranker()
-    monkeypatch.setattr("brain.memory.reranker.build_reranker_provider", lambda **kw: boom)
-    assert reranker_mod.run_ram_figure("m1", store) is False
-    assert boom.timed == [] and boom.plain == []
 
 
 def test_a_provider_failure_in_the_job_run_propagates_for_the_central_pass_to_log(
@@ -392,6 +220,133 @@ def test_a_provider_failure_in_the_job_run_propagates_for_the_central_pass_to_lo
     with pytest.raises(RuntimeError):
         reranker_mod.run_ram_figure("m1", store)
     assert reranker_mod._ram_figure_needed == {_RERANKER_ID}
+
+
+# ---------------------------------------------------------------------------
+# The gate (S200, S220, H4b): which states let a rerank run
+# ---------------------------------------------------------------------------
+
+
+def test_a_kept_fit_serves_a_running_process_whose_window_lost_the_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """H4b: a running process that once computed a usable fit keeps it when the window stops
+    giving one (a quiet day: the full-length sample aged out). The gate stays open, the need is
+    flagged so the next lull refreshes the window; a fresh process in the same state is held back."""
+    store = _store(tmp_path)
+    assert reranker_mod.ram_figure_ready(_RERANKER_ID, store) is False, "nothing yet"
+    seed_window(store, _RERANKER_ID)
+    assert reranker_mod.ram_figure_ready(_RERANKER_ID, store) is True
+    assert _RERANKER_ID not in reranker_mod._ram_figure_needed, "a window fit needs no refresh"
+    # the window loses its samples (all aged out)
+    monkeypatch.setattr(reranker_mod._ram_shapes, "shape_groups", lambda *_a, **_k: [])
+    assert reranker_mod.ram_figure_ready(_RERANKER_ID, store) is True
+    assert _RERANKER_ID in reranker_mod._ram_figure_needed, "kept: the lull is asked to refresh it"
+    estimate_fit, kept = reranker_mod._ram_fit_for(store, _RERANKER_ID)
+    assert estimate_fit is not None and kept is True
+    # a fresh process (kept fits forgotten) in the same state is held back
+    reranker_mod._reset_rerank_cost_model()
+    assert reranker_mod.ram_figure_ready(_RERANKER_ID, store) is False
+
+
+def test_the_kept_fit_is_keyed_by_database_and_model_id(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    seed_window(store, _RERANKER_ID)
+    assert reranker_mod.ram_figure_ready(_RERANKER_ID, store) is True
+    monkeypatch.setattr(reranker_mod._ram_shapes, "shape_groups", lambda *_a, **_k: [])
+    assert reranker_mod.ram_figure_ready("another-model", store) is False
+    other = MemoryStore(tmp_path / "other.db")
+    assert reranker_mod.ram_figure_ready(_RERANKER_ID, other) is False
+    assert reranker_mod.ram_figure_ready(_RERANKER_ID, store) is True
+
+
+def test_a_window_of_zero_growth_is_no_model(tmp_path: Path) -> None:
+    """S204 in its new form: an always-zero peak is a failed measurement, not a model."""
+    store = _store(tmp_path)
+    seed_window(store, _RERANKER_ID, bytes_per_token=0.0)
+    assert reranker_mod.ram_figure_ready(_RERANKER_ID, store) is False
+
+
+def test_four_short_shapes_without_the_full_length_sample_are_no_model(tmp_path: Path) -> None:
+    """The reviewer's case: short shapes only say nothing about a long first batch (S193)."""
+    store = _store(tmp_path)
+    for pairs, length in [(1, 128), (1, 256), (1, 384), (4, 256)]:
+        reranker_mod._record_rerank_cost(_RERANKER_ID, store, pairs * length, 0.1, 5e6, pairs=pairs, longest=length)
+    assert reranker_mod.ram_figure_ready(_RERANKER_ID, store) is False
+
+
+def test_an_unreadable_peak_leaves_the_older_behaviour(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(reranker_mod.peak_rss, "available", lambda: False)
+    assert reranker_mod.ram_figure_ready(_RERANKER_ID, _store(tmp_path)) is True
+
+
+def test_a_failed_database_read_is_no_model(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    monkeypatch.setattr(reranker_mod._ram_shapes, "shape_groups", lambda *_a, **_k: None)
+    assert reranker_mod.ram_figure_ready(_RERANKER_ID, store) is False
+
+
+# ---------------------------------------------------------------------------
+# The lull job: due once per chat activity marker, never builds a thread
+# ---------------------------------------------------------------------------
+
+
+def test_the_job_is_due_only_while_needed_unmeasured_and_once_per_marker(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    open_store = _factory(store)
+    assert reranker_mod.ram_figure_due("m1", open_store) is False, "no turn flagged the need"
+    reranker_mod.note_ram_figure_needed(_RERANKER_ID)
+    assert reranker_mod.ram_figure_due("m1", open_store) is True
+    reranker_mod._ram_figure_attempt[_RERANKER_ID] = "m1"
+    assert reranker_mod.ram_figure_due("m1", open_store) is False, "once per chat activity marker"
+    assert reranker_mod.ram_figure_due("m2", open_store) is True, "a later lull retries"
+    seed_window(store, _RERANKER_ID)
+    assert reranker_mod.ram_figure_due("m3", open_store) is False
+    assert _RERANKER_ID not in reranker_mod._ram_figure_needed, "a flag whose model exists is dropped"
+
+
+def test_a_kept_fit_alone_leaves_the_job_due_until_the_window_is_refreshed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = _store(tmp_path)
+    seed_window(store, _RERANKER_ID)
+    assert reranker_mod.ram_figure_ready(_RERANKER_ID, store) is True
+    monkeypatch.setattr(reranker_mod._ram_shapes, "shape_groups", lambda *_a, **_k: [])
+    assert reranker_mod.ram_figure_ready(_RERANKER_ID, store) is True  # flags the need
+    assert reranker_mod.ram_figure_due("m1", _factory(store)) is True
+
+
+def test_the_job_run_builds_the_ladder_clears_the_flag_and_a_failed_run_keeps_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = _store(tmp_path)
+    reranker_mod.note_ram_figure_needed(_RERANKER_ID)
+    bad = ScriptedLadderProvider(growth_fn=lambda *_a: None, model=_RERANKER_ID)  # the peak cannot be read
+    monkeypatch.setattr("brain.memory.reranker.build_reranker_provider", lambda **kw: bad)
+    assert reranker_mod.run_ram_figure("m1", store) is False
+    assert reranker_mod._ram_figure_needed == {_RERANKER_ID}
+    assert reranker_mod._ram_figure_attempt[_RERANKER_ID] == "m1"
+
+    good = ScriptedLadderProvider(model=_RERANKER_ID)
+    monkeypatch.setattr("brain.memory.reranker.build_reranker_provider", lambda **kw: good)
+    assert reranker_mod.run_ram_figure("m2", store) is True
+    assert reranker_mod._ram_figure_needed == set()
+    assert reranker_mod.ram_figure_ready(_RERANKER_ID, store) is True
+
+
+def test_the_job_run_with_a_model_already_present_measures_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = _store(tmp_path)
+    seed_window(store, _RERANKER_ID)
+    reranker_mod.note_ram_figure_needed(_RERANKER_ID)
+    boom = ScriptedLadderProvider(model=_RERANKER_ID)
+    monkeypatch.setattr(
+        "brain.memory.reranker.build_reranker_provider", lambda **kw: pytest.fail("a model exists: nothing is built")
+    )
+    assert reranker_mod.run_ram_figure("m1", store) is False
+    assert (boom.probes, boom.timed) == (0, [])
+    assert reranker_mod._ram_figure_needed == set()
 
 
 # ---------------------------------------------------------------------------
@@ -431,7 +386,7 @@ def test_s201_with_no_figure_and_a_registered_direct_chat_the_measurement_runs_o
     def _run(marker, st, **_kw):
         ran.append((threading.current_thread().name, st.db_path))
         gate.wait(10)
-        reranker_mod._record_rerank_cost(_RERANKER_ID, st, _FULL, 2.0, 245e6)
+        seed_window(st, _RERANKER_ID)
         return True
 
     monkeypatch.setattr(reranker_mod, "run_ram_figure", _run)
@@ -515,7 +470,7 @@ def test_s201_with_a_saved_figure_nothing_is_requested(
     from brain.memory import floor_startup
 
     store, _memories = _recall_setup(monkeypatch, tmp_path)
-    reranker_mod._ram_cost.record(store, _RERANKER_ID, _FULL, _FULL * 250_000.0)
+    seed_window(store, _RERANKER_ID, bytes_per_token=250_000.0)
     floor_startup.enable_background_ram_figure(tmp_path)
     monkeypatch.setattr(floor_startup, "request_ram_figure", lambda: pytest.fail("a figure exists"))
     monkeypatch.setattr(reranker_mod, "build_reranker_provider", lambda **k: _CappedReranker())
@@ -552,7 +507,7 @@ def test_s201_the_marker_rule_holds_when_the_first_attempt_left_no_figure(
     store.close()
     reranker_mod.note_ram_figure_needed(_RERANKER_ID)
     monkeypatch.setattr(floor_startup, "_marker_provider", lambda: "m1")
-    bad = _CappedReranker(rss=0.0)
+    bad = _CappedReranker(rss=None)  # the peak cannot be read: the first rung ends the pass
     monkeypatch.setattr(reranker_mod, "build_reranker_provider", lambda **k: bad)
     reranker_mod._warmed_model_ids.add(_RERANKER_ID)
     floor_startup._ram_figure_body(tmp_path)  # noqa: SLF001
@@ -610,23 +565,3 @@ def test_s201_only_the_interactive_session_registers_the_background_measurement(
     assert floor_startup._ram_figure_persona_dir is None, "the one-shot form's thread would be cut off"  # noqa: SLF001
 
 
-def test_s206_the_rss_is_read_through_psutil_and_an_unreadable_one_is_none_with_one_warning(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    import psutil
-
-    monkeypatch.undo()  # the autouse gate fixture patched the reader: use the real one
-    value = reranker_mod._current_rss_bytes()  # noqa: SLF001
-    assert value is not None and value > 1e6
-    assert value == pytest.approx(psutil.Process().memory_info().rss, rel=0.5)
-
-    def _fail(self):
-        raise psutil.AccessDenied()
-
-    monkeypatch.setattr(psutil.Process, "memory_info", _fail)
-    reranker_mod._ram_figure_warned.clear()  # noqa: SLF001
-    with caplog.at_level("DEBUG"):
-        assert reranker_mod._current_rss_bytes() is None  # noqa: SLF001
-        assert reranker_mod._current_rss_bytes() is None  # noqa: SLF001
-    warns = [r for r in caplog.records if r.levelname == "WARNING" and "RSS could not be read" in r.getMessage()]
-    assert len(warns) == 1, "warned once per process"

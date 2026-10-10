@@ -994,11 +994,10 @@ def _build_gated_jobs(
         )
     )
 
-    # 4c. stuck-width re-measure — name-recall fix S100, S113, S116, S180 (spec §7).
+    # 4c. stuck-width re-measure — name-recall fix S100, S113, S116 (spec §7).
     # Due while the runtime reranker's last budget miss is stuck (the learned
-    # cost says fewer than 5 of its candidates fit the full latency budget, or
-    # a running process's kept RAM figure blocks them and this re-seeds it),
-    # the reranker is already loaded, and no re-measure has run at this chat
+    # cost says fewer than 5 of its candidates fit the full latency budget),
+    # the memory model is ready (S220: never an unfitted batch), the reranker is already loaded, and no re-measure has run at this chat
     # activity marker (once per lull; no time constant). One timed rerank of
     # 5 candidates on the loaded provider; never loads a model.
     def _rerank_width_remeasure_job() -> JobOutcome:
@@ -1019,13 +1018,14 @@ def _build_gated_jobs(
         )
     )
 
-    # 4c2. RAM-figure measurement — name-recall fix S200 (fixes S193). A recall
-    # turn on a machine with no saved RAM figure takes the plain meaning-match
-    # path and flags the need; this job then measures the figure at the next
-    # lull, under the background slot (never while a reply is in flight), from
-    # one pair at the re-scorer's full input length, and loads the reranker
+    # 4c2. RAM ladder — name-recall fix S200, S208, S220 (fixes S193). A recall
+    # turn on a machine with no usable memory model takes the plain meaning-match
+    # path and flags the need; this job then runs the ladder at the next
+    # lull, under the background slot (never while a reply is in flight): single
+    # pairs from the re-scorer's full input length down, then batches of
+    # increasing size, and loads the reranker
     # here, not on the reply path. Due once per chat activity marker while the
-    # need is flagged and no figure exists. After the re-measure, before the
+    # need is flagged and the window gives no usable model. After the re-measure, before the
     # flush (so its samples are saved the same lull).
     def _rerank_ram_figure_job() -> JobOutcome:
         with cli_throttle.background_slot() as slot:

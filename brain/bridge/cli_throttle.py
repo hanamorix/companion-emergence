@@ -137,7 +137,7 @@ def reply_watch() -> Callable[[], bool]:
     reply has started since (a reply that started after the snapshot counts even if it has
     already ended: its allocations may be inside whatever was measured meanwhile). If a reply
     was in flight at the snapshot, it is False from the start, even after that reply ends.
-    The one-pair RAM measurement of `nell chat --no-bridge` abandons its sample when this
+    The RAM ladder of `nell chat --no-bridge` abandons the rung in progress when this
     turns False (the process-wide RSS reading would be inflated by the reply)."""
     with _lock:
         started = _replies_started

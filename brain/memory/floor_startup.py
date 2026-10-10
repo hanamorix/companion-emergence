@@ -25,8 +25,8 @@ computed while a reply is being built: `MemoryStore.get_cosine_floor` /
   constants;
 * RAM FIGURE (S201, S210): `nell chat --no-bridge` has no lull cadence, so a turn that would rerank
   with no RAM figure flags the need (`request_ram_figure` records it) and the REPL, once that reply
-  is finished, calls `start_requested_ram_figure`, which measures the figure (the one full-length
-  pair, S200) on a daemon thread; never while the flagged reply is being built. The bridge relies
+  is finished, calls `start_requested_ram_figure`, which runs the RAM ladder (S200, S208, S220:
+  single pairs at falling lengths, then batches of increasing size) on a daemon thread; never while the flagged reply is being built. The bridge relies
   on its lull job. S218: that thread's sample never spans a reply (a reply that starts while it
   runs abandons it, the sample is discarded, and it runs again once that reply has ended);
 * never more than ONE bootstrap in flight per floor: every start (startup
@@ -334,11 +334,12 @@ def enable_background_ram_figure(persona_dir: Path | None) -> None:
 
 def _ram_figure_body(persona_dir: Path) -> None:
     """The background measurement: the lull job's own functions (`ram_figure_due`, once per chat
-    activity marker, then `run_ram_figure`: the one full-length pair, S200), on this thread, with
+    activity marker, then `run_ram_figure`: the RAM ladder, S200/S220), on this thread, with
     a store of its own that it closes. Provider exceptions are logged by `_spawn`.
 
     S218: this thread never STARTS a measurement while a reply is in flight, and its sample never
-    spans a reply (a call already running when a reply starts finishes, its sample is discarded). It first waits until none is
+    spans a reply (a call already running when a reply starts finishes, its sample is discarded).
+    It first waits until none is
     (`cli_throttle.wait_for_no_reply_in_flight`, a condition wait: no polling, no time constant),
     takes a `reply_watch` snapshot, and runs. If a reply starts while the run is in progress the
     run is abandoned (`RamMeasurementAbandoned`; its sample is discarded, nothing is recorded) and
@@ -390,7 +391,7 @@ def request_ram_figure() -> bool:
 
 def start_requested_ram_figure() -> threading.Thread | None:
     """S210: called by the direct chat's REPL right after a reply has been returned. When a turn
-    recorded the need (`request_ram_figure`), consume it and start the one-pair measurement (S200)
+    recorded the need (`request_ram_figure`), consume it and start the RAM ladder (S200, S220)
     on a daemon thread, one at a time (S91 pattern), returning immediately. Returns the thread
     started, or `None` (nothing recorded, not registered, already in flight, or inhibited). Never
     raises."""

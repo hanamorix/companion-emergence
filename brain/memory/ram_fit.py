@@ -167,7 +167,7 @@ _SUBSETS: tuple[tuple[int, ...], ...] = ((0,), (0, 1), (0, 2), (0, 1, 2))
 
 def fit_ram(groups: Sequence[ShapeGroup]) -> RamFit | None:
     """The non-negative least-squares fit over the window's samples (every sample weighs
-    the same), or `None` unless `enough_shapes`."""
+    the same), or `None` unless `enough_shapes` and the fit predicts some growth."""
     if not enough_shapes(groups):
         return None
     best: tuple[Fraction, list[Fraction], tuple[int, ...]] | None = None
@@ -194,7 +194,7 @@ def fit_ram(groups: Sequence[ShapeGroup]) -> RamFit | None:
     coef = [Fraction(0)] * 3
     for t, ci in zip(theta, subset, strict=True):
         coef[ci] = t
-    return RamFit(
+    fit = RamFit(
         a=float(coef[0]),
         b=float(coef[1]),
         c=float(coef[2]),
@@ -203,3 +203,7 @@ def fit_ram(groups: Sequence[ShapeGroup]) -> RamFit | None:
         max_pairs=max(g.pairs for g in groups),
         max_length=max(g.length for g in groups),
     )
+    # A model that predicts no growth even at the largest shape it was fitted on is a failed
+    # measurement (an unreadable or always-zero peak), not a model: it would switch the RAM
+    # bound off without anyone noticing (S204: a window with no positive growth is empty).
+    return fit if fit.predict(fit.max_pairs, fit.max_length) > 0.0 else None

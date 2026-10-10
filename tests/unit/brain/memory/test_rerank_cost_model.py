@@ -13,8 +13,8 @@ reranker model id; each message fits its own width to its own candidates.
 All offline and deterministic: timing comes from a scripted clock injected
 through `reranker._clock`, advanced by a fake reranker whose per-call cost is
 exactly `overhead + rate * len(documents) * longest pair` (in tokens; the
-fake providers' stand-in for a token is one character); RSS comes from a
-scripted `_current_rss_bytes`. No model, no network.
+fake providers' stand-in for a token is one character); the per-call peak growth
+comes from a scripted `peak_rss`. No model, no network.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ import pytest
 
 import brain.memory.reranker as reranker_mod
 from brain.dev_constants import RERANK_MIN_REAL_CANDIDATES
-from brain.memory import cost_series
+from brain.memory import cost_series, ram_fit
 from brain.memory.relevance import CANDIDATE_POOL
 from brain.memory.reranker import (
     ANCHOR_POOL,
@@ -108,9 +108,8 @@ class _CostScriptedProvider(FakeRerankerProvider):
 def clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
     c = _Clock()
     monkeypatch.setattr(reranker_mod, "_clock", c)
-    # Deterministic default: no RSS signal, so the RAM term is skipped unless
-    # a test scripts RSS itself.
-    monkeypatch.setattr(reranker_mod, "_current_rss_bytes", lambda: None)
+    # Deterministic default: no peak-growth signal (the suite's autouse fixture switches the
+    # reader off), so the RAM term is skipped unless a test scripts the peak itself.
     return c
 
 
@@ -132,17 +131,16 @@ def _reference_width(
     rate: float,
     budget: float,
     *,
-    ram_per_token: float | None = None,
+    memory: ram_fit.RamFit | None = None,
     headroom: float | None = None,
-    peak: int = 0,
     cap: int = CANDIDATE_POOL,
 ) -> int:
     """Independent recomputation of the width (spec §1 / S67 / S23): the
     LARGEST n whose batch of n real + min(8, n // 2) anchors, padded to its
-    longest pair, is predicted to fit the budget, and whose RSS growth past
-    the measured high water `peak` (RAM per token times the padded size above
-    `peak`) fits the headroom. Scans every n (no early stop), so it does not
-    lean on the implementation's monotonicity argument."""
+    longest pair, is predicted to fit the budget, and whose predicted peak
+    growth (the memory model `a + b*T + c*B*L^2`, recomputed here from its
+    coefficients, clamped at 0) fits the headroom. Scans every n (no early stop), so it
+    does not lean on the implementation's monotonicity argument."""
     best = 0
     for n in range(1, min(len(cand), cap) + 1):
         k = min(8, n // 2)
@@ -150,8 +148,10 @@ def _reference_width(
         padded = (n + k) * longest
         if overhead + rate * padded > budget:
             continue
-        if ram_per_token and headroom is not None and ram_per_token * max(0, padded - peak) > headroom:
-            continue
+        if memory is not None and headroom is not None:
+            predicted = max(0.0, memory.a + memory.b * padded + memory.c * (n + k) * longest * longest)
+            if predicted > headroom:
+                continue
         best = n
     return best
 
@@ -299,16 +299,22 @@ def test_c1a_iii_long_candidate_inside_short_prefix_stops_the_width(clock: _Cloc
     assert combined[-1] == docs[:6] + ANCHOR_POOL[:3]
 
 
+_PER_TOKEN = ram_fit.RamFit(a=0.0, b=1_000.0, c=0.0, shapes=4, samples=4, max_pairs=2, max_length=1024)
+_QUADRATIC = ram_fit.RamFit(a=-50.0, b=60.0, c=0.17, shapes=22, samples=22, max_pairs=7, max_length=1024)
+
+
 @pytest.mark.parametrize(
-    ("cand", "overhead", "rate", "budget", "ram_per_token", "headroom", "peak"),
+    ("cand", "overhead", "rate", "budget", "memory", "headroom"),
     [
-        ([120] * 50, 0.05, 1e-4, 4.0, None, None, 0),
-        ([900, 120, 300, 2000, 80, 80, 80, 1500] + [200] * 30, 0.3, 5e-5, 2.0, None, None, 0),
-        ([400] * 50, 0.0, 1e-5, 4.0, 1_000.0, 2_000_000.0, 0),
-        ([400] * 50, 0.0, 1e-5, 4.0, 1_000.0, 2_000_000.0, 6_000),
-        ([400] * 50, 0.0, 1e-5, 4.0, 1_000.0, 1.0, 6_000),
-        ([60] * 12, 1.5, 1e-3, 4.0, None, None, 0),
-        ([3000] * 50, 0.1, 1e-4, 4.0, None, None, 0),
+        ([120] * 50, 0.05, 1e-4, 4.0, None, None),
+        ([900, 120, 300, 2000, 80, 80, 80, 1500] + [200] * 30, 0.3, 5e-5, 2.0, None, None),
+        ([400] * 50, 0.0, 1e-5, 4.0, _PER_TOKEN, 2_000_000.0),
+        ([400] * 50, 0.0, 1e-5, 4.0, _PER_TOKEN, 6_000_000.0),
+        ([400] * 50, 0.0, 1e-5, 4.0, _PER_TOKEN, 1.0),
+        ([400] * 50, 0.0, 1e-5, 4.0, _QUADRATIC, 3_000_000.0),
+        ([60] * 12, 1.5, 1e-3, 4.0, None, None),
+        ([3000] * 50, 0.1, 1e-4, 4.0, None, None),
+        ([400] * 50, 0.0, 1e-5, 4.0, _PER_TOKEN, None),
     ],
 )
 def test_c1a_iii_fit_matches_the_independent_reference(
@@ -316,15 +322,14 @@ def test_c1a_iii_fit_matches_the_independent_reference(
     overhead: float,
     rate: float,
     budget: float,
-    ram_per_token: float | None,
+    memory: ram_fit.RamFit | None,
     headroom: float | None,
-    peak: int,
 ) -> None:
-    est = RerankCostEstimate(overhead, rate, ram_per_token, measured_batches=3, peak_padded_tokens=peak)
+    est = RerankCostEstimate(overhead, rate, memory, measured_batches=3)
     anchors = _anchor_pair_tokens()
     got = fit_rerank_width(cand, anchors, est, budget, headroom)
     assert got == _reference_width(
-        cand, anchors, overhead, rate, budget, ram_per_token=ram_per_token, headroom=headroom, peak=peak
+        cand, anchors, overhead, rate, budget, memory=memory, headroom=headroom
     )
 
 
@@ -668,150 +673,106 @@ def test_c2c_every_rerank_has_five_real_and_two_anchors_and_is_normalized(
 # ---------------------------------------------------------------------------
 
 
-def test_inv_i13a_rss_unreadable_skips_the_ram_term(clock: _Clock, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_inv_i13a_an_unreadable_peak_skips_the_ram_term(clock: _Clock, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The peak reader is off (non-Linux, or a failed reset): no memory sample, no model, so the
+    RAM term is skipped and the width is time-bound only."""
     monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 1.0)  # absurdly tight
     provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-6)
     rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0)
     est = rerank_cost_estimate(_MODEL)
-    assert est.ram_bytes_per_token is None
+    assert est.ram_fit is None
+    assert reranker_mod._ram_shapes.shape_groups(_STORE, _MODEL) == []
 
     out = rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0)
-    assert out.width == 50, "no RAM figure -> width is time-bound only, headroom ignored"
+    assert out.width == 50, "no memory model -> width is time-bound only, headroom ignored"
 
 
-def test_ram_bound_from_rss_delta_per_padded_token(clock: _Clock, monkeypatch: pytest.MonkeyPatch) -> None:
-    rss = iter([1_000.0, 1_000.0 + 7 * 400 * 1_000.0])  # +1,000 bytes per padded token
-    monkeypatch.setattr(reranker_mod, "_current_rss_bytes", lambda: next(rss))
+def test_a_readable_peak_records_the_shape_of_every_measured_call(clock: _Clock, monkeypatch: pytest.MonkeyPatch) -> None:
+    """S220: the third `rerank_timed` value is the call's peak growth; the sample is keyed by the
+    call's shape (pairs, longest pair), whatever the size relative to earlier calls."""
+    growth = iter([4_000.0, 0.0, 9_000.0])
+    monkeypatch.setattr(reranker_mod.peak_rss, "begin", lambda: 1.0)
+    monkeypatch.setattr(reranker_mod.peak_rss, "growth_since", lambda before: next(growth))
     provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-9)
-    rerank_for_recall(provider, _QUERY, _docs(50, 400), budget_seconds=4.0)
+    rerank_for_recall(provider, _QUERY, _docs(50, 400), budget_seconds=4.0, max_real=5)  # 7 pairs x 400
+    rerank_for_recall(provider, _QUERY, _docs(50, 400), budget_seconds=4.0, max_real=5)  # again, same shape
+    rerank_for_recall(provider, _QUERY, _docs(50, 200), budget_seconds=4.0, max_real=5)
+    groups = reranker_mod._ram_shapes.shape_groups(_STORE, _MODEL)
+    by_shape = {ram_fit.decode_shape(x)[:2]: (n, total) for x, n, total in groups}
+    longest = lambda tokens: max(tokens, *_anchor_pair_tokens()[:2])  # noqa: E731
+    assert by_shape == {(7, longest(400)): (2, 4_000.0), (7, longest(200)): (1, 9_000.0)}
+
+
+def _seed_ram(
+    model: str = _MODEL,
+    bytes_per_token: float = 1_000.0,
+    store: MemoryStore | None = None,
+    *,
+    fresh_process: bool = True,
+) -> None:
+    """A previous process measured four shapes (growth = bytes_per_token x padded tokens, the full-length
+    one marked) and saved them; this process then starts with no in-memory state."""
+    store = store if store is not None else _STORE
+    for pairs, length, full in [(1, 1024, True), (1, 512, False), (1, 256, False), (2, 128, False)]:
+        x = ram_fit.encode_shape(pairs, length, full=full)
+        reranker_mod._ram_shapes.record(store, model, x, bytes_per_token * pairs * length)
+    assert cost_series.flush(store) >= 4
+    if fresh_process:
+        reranker_mod._reset_rerank_cost_model()
+        cost_series._reset_pending()
+
+
+def test_ram_bound_from_the_memory_model(clock: _Clock, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A usable model sizes the batch so its predicted growth (the WHOLE growth: nothing is
+    already resident with the memory pool off) fits the live headroom."""
+    _ram_figure_required(monkeypatch)
+    _persist_estimate()
+    _seed_ram(bytes_per_token=1_000.0)
     est = rerank_cost_estimate(_MODEL)
-    assert est.ram_bytes_per_token == pytest.approx(1_000.0)
+    assert est is not None and est.ram_fit is not None and est.ram_fit_kept is False
+    assert (est.ram_fit.a, est.ram_fit.b, est.ram_fit.c) == pytest.approx((0.0, 1_000.0, 0.0), abs=1e-6)
 
-    assert est.peak_padded_tokens == 7 * 400
-
-    # Growth room for 5 more padded documents past the 7 already run:
-    # 12 documents = 8 real + 4 anchors fit, 13 (9 real + 4) do not.
-    headroom = 1_000.0 * (12 * 400 - 7 * 400)
+    # Room for 12 padded documents (8 real + 4 anchors) and not for 13 (9 real + 4).
+    headroom = 1_000.0 * 12 * 400
     monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: headroom)
-    monkeypatch.setattr(reranker_mod, "_current_rss_bytes", lambda: None)
+    provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-9)
     out = rerank_for_recall(provider, _QUERY, _docs(50, 400), budget_seconds=4.0)
     assert out.width == _reference_width(
-        [400] * 50, _anchor_pair_tokens(), 0.0, est.seconds_per_token, 4.0,
-        ram_per_token=1_000.0, headroom=headroom, peak=7 * 400,
+        [400] * 50, _anchor_pair_tokens(), 0.0, est.seconds_per_token, 4.0, memory=est.ram_fit, headroom=headroom
     ) == 8
 
 
-def test_ram_figure_does_not_dilute_with_calls_inside_the_high_water() -> None:
-    """Stage-6 finding F1: the runtime reuses the memory a batch needed, so
-    calls within the high water show ~0 RSS growth. They must not dilute
-    RAM per token towards 0 (which would switch the bound off): only
-    growth past the high water is counted, per token of that growth."""
-    reranker_mod._record_rerank_cost(_MODEL, _STORE, 2_800, 0.1, 2_800 * 1_000.0)  # first batch: 1,000 B/token
-    for _ in range(100):
-        reranker_mod._record_rerank_cost(_MODEL, _STORE, 2_800, 0.1, 0.0)  # reuse, no growth
-    reranker_mod._record_rerank_cost(_MODEL, _STORE, 1_000, 0.05, 5_000_000.0)  # another thread's allocation
-    est = rerank_cost_estimate(_MODEL)
-    assert est.ram_bytes_per_token == pytest.approx(1_000.0), "neither diluted nor contaminated"
-    assert est.peak_padded_tokens == 2_800
-
-    reranker_mod._record_rerank_cost(_MODEL, _STORE, 4_800, 0.2, 2_000 * 500.0)  # past the high water
-    est = rerank_cost_estimate(_MODEL)
-    assert est.ram_bytes_per_token == pytest.approx((2_800_000.0 + 1_000_000.0) / 4_800)
-    assert est.peak_padded_tokens == 4_800
+def test_negative_growth_is_recorded_as_zero(clock: _Clock) -> None:
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 1_000, 0.1, -5_000.0, pairs=1, longest=1_000)
+    ((x, n, total),) = reranker_mod._ram_shapes.shape_groups(_STORE, _MODEL)
+    assert (ram_fit.decode_shape(x), n, total) == ((1, 1_000, False), 1, 0.0)
 
 
-def test_ram_term_never_blocks_a_batch_within_the_high_water() -> None:
-    """Within the high water no growth is predicted, so even a tiny headroom
-    leaves every batch up to the size already run; only growth past it is
-    checked against the headroom."""
-    est = RerankCostEstimate(0.0, 1e-9, 1_000.0, measured_batches=4, peak_padded_tokens=12 * 400)
-    width = fit_rerank_width([400] * 50, _anchor_pair_tokens(), est, 4.0, headroom_bytes=1.0)
-    assert width == 8, "12 padded documents (8 real + 4 anchors) are within the high water; 13 are not"
+def test_a_growth_with_no_shape_or_an_unpackable_shape_is_not_recorded(caplog: pytest.LogCaptureFixture) -> None:
+    reranker_mod._record_rerank_cost(_MODEL, _STORE, 1_000, 0.1, 5.0)  # no pairs / longest given
+    assert reranker_mod._ram_shapes.shape_groups(_STORE, _MODEL) == []
+    with caplog.at_level("WARNING"):
+        reranker_mod._record_rerank_cost(_MODEL, _STORE, 9, 0.1, 5.0, pairs=1, longest=ram_fit.MAX_LENGTH + 1)
+    assert reranker_mod._ram_shapes.shape_groups(_STORE, _MODEL) == []
+    assert any("cannot be recorded" in r.getMessage() for r in caplog.records)
+    assert _window().n == 2, "the time samples are recorded regardless"
 
 
-def test_negative_rss_delta_clamps_to_zero_in_the_ram_sum() -> None:
-    reranker_mod._record_rerank_cost(_MODEL, _STORE, 1_000, 0.1, -5_000.0)  # past high water 0: +1,000 tokens, 0 B
-    reranker_mod._record_rerank_cost(_MODEL, _STORE, 2_000, 0.2, 4_000.0)  # past high water 1,000: +1,000 tokens
-    est = rerank_cost_estimate(_MODEL)
-    assert est.ram_bytes_per_token == pytest.approx(4_000.0 / 2_000)
+def test_recorded_samples_from_many_threads_are_all_counted_once() -> None:
+    """The buffer is shared by the reply thread, the search tool's worker and the lull job."""
+    def worker(index: int) -> None:
+        for i in range(50):
+            reranker_mod._record_rerank_cost(
+                _MODEL, _STORE, 100, 0.1, 10.0, pairs=1 + (index + i) % 3, longest=100
+            )
 
-
-# ---------------------------------------------------------------------------
-# CONC-1: an update injected between another update's read and write is not
-# lost; a reader never sees half an update. Fails with the lock removed.
-# ---------------------------------------------------------------------------
-
-
-class _NoLock:
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-
-def _run_interleaved_updates(
-    monkeypatch: pytest.MonkeyPatch, second_update_wait: float
-) -> tuple[reranker_mod._RamState, RerankCostEstimate | None]:
-    """Two updates of the process's high water interleaved: the second runs
-    between the first's read and write (the process-memory part of a measured
-    rerank; the samples themselves only append to the locked buffer)."""
-    second_started = threading.Event()
-    second_done = threading.Event()
-    reader_result: list[RerankCostEstimate | None] = []
-    fired = []
-
-    def _second_update() -> None:
-        second_started.set()
-        reranker_mod._record_rerank_cost(_MODEL, _STORE, 300, 0.3, 2_000.0)  # +200 tokens past 100
-        second_done.set()
-
-    def _reader() -> None:
-        reader_result.append(rerank_cost_estimate(_MODEL))
-
-    threads: list[threading.Thread] = []
-
-    def _hook() -> None:
-        if fired:
-            return
-        fired.append(True)
-        for target in (_second_update, _reader):
-            t = threading.Thread(target=target)
-            threads.append(t)
-            t.start()
-        second_started.wait(timeout=2.0)
-        # Guarded: the second update blocks on the lock, so this times out.
-        # Unguarded: it completes inside the first update's read->write gap
-        # (the wait returns as soon as it does).
-        second_done.wait(timeout=second_update_wait)
-
-    monkeypatch.setattr(reranker_mod, "_cost_update_hook", _hook)
-    reranker_mod._record_rerank_cost(_MODEL, _STORE, 100, 0.1, 1_000.0)  # +100 tokens past 0
+    threads = [threading.Thread(target=worker, args=(n,)) for n in range(8)]
     for t in threads:
-        t.join(timeout=5.0)
-    return reranker_mod._ram_state[_MODEL], (reader_result[0] if reader_result else None)
-
-
-def test_conc1_interleaved_update_is_counted_and_reader_sees_whole_updates(  # against writers; a flush's take-out gap can still hide a buffered sample for a moment (cost_series module docstring)
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ram, seen = _run_interleaved_updates(monkeypatch, second_update_wait=0.3)
-    assert ram.peak_x == 300, "both updates counted in the high water"
-    figure = reranker_mod._ram_cost.fit(_STORE, _MODEL)
-    assert figure is not None and figure.rate == pytest.approx(10.0), "and both RAM samples are in the saved series"
-    assert _window().n == 2, "and both time samples are buffered"
-    # The reader ran while the first update held the lock, so it saw a whole
-    # state (the first update's or both), never a mix of halves; both have
-    # 10 bytes per token of growth.
-    assert seen is None or seen.ram_bytes_per_token == pytest.approx(10.0)
-
-
-def test_conc1_able_to_fail_without_the_lock(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(reranker_mod, "_cost_lock", _NoLock())
-    # A long wait: without the lock the second update finishes inside the
-    # window however slow the host, so this never flakes.
-    ram, _ = _run_interleaved_updates(monkeypatch, second_update_wait=30.0)
-    assert ram.peak_x == 100, "without the lock the interleaved update is lost (the guard is what CONC-1 tests)"
+        t.start()
+    for t in threads:
+        t.join(timeout=10.0)
+    groups = reranker_mod._ram_shapes.shape_groups(_STORE, _MODEL)
+    assert sum(n for _x, n, _t in groups) == 400 and _window().n == 400
 
 
 # ---------------------------------------------------------------------------
@@ -854,7 +815,6 @@ def test_cross_encoder_rerank_timed_excludes_time_waiting_for_the_lock(
     0.5 s: the measurement must be 0.5 s."""
     clock = _Clock()
     monkeypatch.setattr(reranker_mod, "_clock", clock)
-    monkeypatch.setattr(reranker_mod, "_current_rss_bytes", lambda: None)
 
     class _Model:
         def rerank(self, query, documents):
@@ -875,10 +835,10 @@ def test_cross_encoder_rerank_timed_excludes_time_waiting_for_the_lock(
     provider._rerank_lock.release()
     worker.join(timeout=5.0)
 
-    (scores, seconds, rss_delta) = result[0]
+    (scores, seconds, growth) = result[0]
     assert scores == [0.0, 0.0]
     assert seconds == pytest.approx(0.5), "lock wait must not be counted as this call's cost"
-    assert rss_delta is None
+    assert growth is None, "the peak reader is off in the suite"
 
 
 def test_normalization_hand_off_carries_no_scores(
@@ -890,7 +850,7 @@ def test_normalization_hand_off_carries_no_scores(
     def _raw(provider, query, real_documents):
         scores, seconds, rss = provider.rerank_timed(query, list(real_documents))
         return reranker_mod.AnchorNormalizationResult(
-            scores=scores, real_width=len(scores), did_normalize=False, seconds=seconds, rss_delta_bytes=rss
+            scores=scores, real_width=len(scores), did_normalize=False, seconds=seconds, peak_growth_bytes=rss
         )
 
     monkeypatch.setattr(reranker_mod, "normalize_against_anchors", _raw)
@@ -975,8 +935,8 @@ def test_cs3c_another_machines_samples_do_not_size_this_one(
 
 
 def _ram_figure_required(monkeypatch: pytest.MonkeyPatch) -> None:
-    """S200/S203: RSS readable and the figure required (the suite default is off)."""
-    monkeypatch.setattr(reranker_mod, "_current_rss_bytes", lambda: 1.0e9)
+    """S200/S203: the peak readable and the memory model required (the suite default is off)."""
+    monkeypatch.setattr(reranker_mod.peak_rss, "available", lambda: True)
     monkeypatch.setattr(reranker_mod, "_require_ram_figure", True)
 
 
@@ -984,7 +944,7 @@ def _assert_held_back(provider: _CostScriptedProvider, out, model: str = _MODEL)
     """S203: no width-5 seeding batch. The rerank is not run, nothing is warmed up or recorded,
     the need is flagged for the one-pair measurement (S200)."""
     assert out.reranked is False and out.width == 0 and out.hand_off == "ram_figure"
-    assert model not in reranker_mod._warmed_model_ids and model not in reranker_mod._ram_state
+    assert model not in reranker_mod._warmed_model_ids
     assert model in reranker_mod._ram_figure_needed, "the need is flagged"
     assert list(provider.calls) == [], "the provider was not called at all"
 
@@ -1004,7 +964,7 @@ def test_s203_the_hold_back_is_per_model_id(clock: _Clock, monkeypatch: pytest.M
     monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
     _persist_estimate()
     _persist_estimate("another-model")
-    _persist_ram()  # a figure for _MODEL only
+    _seed_ram()  # a model for _MODEL only
     provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-4)
     other = _CostScriptedProvider(clock, overhead=0.0, rate=1e-4, model="another-model")
     assert rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0).reranked
@@ -1022,9 +982,9 @@ def test_s203_with_an_empty_database_and_a_readable_rss_the_first_rerank_waits_f
 def test_s206_with_an_unreadable_rss_the_turn_is_not_held_back_and_the_first_rerank_is_time_bound(
     clock: _Clock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The stated fallback: psutil cannot read the RSS -> no figure can exist, the gate lets the turn
-    through, the width is sized at the S5 minimum on a first-ever startup (nothing to size from)."""
-    monkeypatch.setattr(reranker_mod, "_current_rss_bytes", lambda: None)
+    """The stated fallback: the per-call peak cannot be read -> no model can exist, the gate lets the
+    turn through, the width is sized at the S5 minimum on a first-ever startup (nothing to size from)."""
+    monkeypatch.setattr(reranker_mod.peak_rss, "available", lambda: False)
     monkeypatch.setattr(reranker_mod, "_require_ram_figure", True)
     provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-9)
     out = rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0)
@@ -1037,21 +997,13 @@ def test_s206_with_an_unreadable_rss_the_turn_is_not_held_back_and_the_first_rer
 # ---------------------------------------------------------------------------
 
 
-def _persist_ram(model: str = _MODEL, bytes_per_token: float = 1_000.0, tokens: int = 1_000) -> None:
-    """A previous process measured RSS growth past its high water and saved it."""
-    reranker_mod._ram_cost.record(_STORE, model, tokens, tokens * bytes_per_token)
-    assert cost_series.flush(_STORE) == 1
-    reranker_mod._reset_rerank_cost_model()
-    cost_series._reset_pending()
-
-
 def test_cs15_with_a_saved_ram_figure_the_first_measured_rerank_is_sized_by_the_estimate(
     clock: _Clock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(reranker_mod, "_current_rss_bytes", lambda: 1.0e9)
+    _ram_figure_required(monkeypatch)
     monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
     _persist_estimate()
-    _persist_ram()
+    _seed_ram()
     provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-4)
     first = rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0)
     assert first.width == _reference_width([100] * 50, _anchor_pair_tokens(), 0.0, 1e-4, 4.0) > 5, (
@@ -1064,7 +1016,7 @@ def test_cs15_a_saved_figure_of_zero_is_no_figure_and_the_rerank_waits(
 ) -> None:
     _ram_figure_required(monkeypatch)
     _persist_estimate()
-    _persist_ram(bytes_per_token=0.0)
+    _seed_ram(bytes_per_token=0.0)
     provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-4)
     _assert_held_back(provider, rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0))
 
@@ -1080,10 +1032,10 @@ def test_cs15_a_figure_whose_samples_aged_out_is_no_figure_and_the_rerank_waits(
     _ram_figure_required(monkeypatch)
     monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
     _persist_estimate()
-    _persist_ram()
+    _seed_ram()
     wall[0] += cost_series.window_seconds() + 60.0  # downtime: every sample is past the window
     est = reranker_mod.rerank_cost_estimate(_MODEL, _STORE)
-    assert est is not None and est.ram_bytes_per_token is None, "the time fit is carried, the ratio is not"
+    assert est is not None and est.ram_fit is None, "the time fit is carried, the memory model is not"
     provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-4)
     _assert_held_back(provider, rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0))
 
@@ -1094,7 +1046,7 @@ def test_cs15_a_figure_saved_on_another_machine_does_not_count(
     _ram_figure_required(monkeypatch)
     _persist_estimate()
     monkeypatch.setattr(cost_series, "_machine_override", "another-machine")
-    _persist_ram()
+    _seed_ram()
     monkeypatch.setattr(cost_series, "_machine_override", "test-machine")
     provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-4)
     _assert_held_back(provider, rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0))
@@ -1103,79 +1055,21 @@ def test_cs15_a_figure_saved_on_another_machine_does_not_count(
 def test_cs15_a_saved_figure_applies_the_ram_bound_from_the_first_rerank_of_a_fresh_process(
     clock: _Clock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Known consequence (review F7b, reported): the fresh process has no high water,
-    so the whole batch counts as new memory; with too little headroom for even five
-    candidates it does not rerank (the S5 rule) and records nothing."""
-    monkeypatch.setattr(reranker_mod, "_current_rss_bytes", lambda: 1.0e9)
+    """With too little headroom for even five candidates the batch does not rerank (the S5
+    rule) and records nothing: the whole predicted growth counts, nothing is already resident."""
+    _ram_figure_required(monkeypatch)
     monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 1_000.0)
     _persist_estimate()
-    _persist_ram()
+    _seed_ram()
     provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-4)
     out = rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0)
     assert out.reranked is False and out.hand_off == "budget"
 
 
-def test_cs18b_the_figure_survives_a_restart_a_second_connection_counts_and_downtime_ends_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    wall = [1_000_000.0]
-    monkeypatch.setattr(cost_series, "_wall_clock", lambda: wall[0])
-    reranker_mod._ram_cost.record(_STORE, _MODEL, 1_000, 1_000_000.0)  # 1,000 B/token
-    reranker_mod._ram_cost.record(_STORE, _MODEL, 3_000, 5_000_000.0)  # 1,667 B/token: the ratio is weighted
-    assert cost_series.flush(_STORE) == 2
-    weighted = 6_000_000.0 / 4_000
-    reranker_mod._reset_rerank_cost_model()
-    cost_series._reset_pending()
-    persist_time = reranker_mod._rerank_cost
-    persist_time.record(_STORE, _MODEL, 700, 0.07)
-    persist_time.record(_STORE, _MODEL, 1400, 0.14)
-    cost_series.flush(_STORE)
-    reopened = MemoryStore(_STORE.db_path, integrity_check=False)
-    try:
-        est = reranker_mod.rerank_cost_estimate(_MODEL, reopened)
-        assert est is not None and est.ram_bytes_per_token == pytest.approx(weighted)
-        assert est.peak_padded_tokens == 0, "the high water is process memory: a fresh process starts at 0"
-        other = MemoryStore(_STORE.db_path, integrity_check=False)  # a second connection flushes a sample
-        try:
-            reranker_mod._ram_cost.record(other, _MODEL, 1_000, 3_000_000.0)
-            cost_series.flush(other)
-        finally:
-            other.close()
-        est = reranker_mod.rerank_cost_estimate(_MODEL, reopened)
-        assert est.ram_bytes_per_token == pytest.approx(9_000_000.0 / 5_000), "its sample counts at once"
-        wall[0] += cost_series.window_seconds() + 60.0  # downtime: every sample is past the window
-        reranker_mod._rerank_cost.record(reopened, _MODEL, 700, 0.07)  # keeps the time series alive
-        est = reranker_mod.rerank_cost_estimate(_MODEL, reopened)
-        assert est is not None and est.ram_bytes_per_token is None, "S178: no sample in the window, no figure"
-    finally:
-        reopened.close()
 
 
-def test_cs18c_the_figure_is_keyed_by_model_id_and_ages_out_of_the_window(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    wall = [1_000_000.0]
-    monkeypatch.setattr(cost_series, "_wall_clock", lambda: wall[0])
-    reranker_mod._ram_cost.record(_STORE, _MODEL, 1_000, 2_000_000.0)
-    wall[0] += cost_series.window_seconds() / 2
-    reranker_mod._ram_cost.record(_STORE, _MODEL, 1_000, 4_000_000.0)
-    reranker_mod._ram_cost.record(_STORE, "another-model", 1_000, 9_000_000.0)
-    figure = lambda model: reranker_mod._ram_cost.fit(_STORE, model).rate  # noqa: E731
-    assert figure(_MODEL) == pytest.approx(3_000.0) and figure("another-model") == pytest.approx(9_000.0)
-    wall[0] += cost_series.window_seconds() / 2  # the first sample is exactly one window old: gone
-    assert figure(_MODEL) == pytest.approx(4_000.0)
 
 
-def test_cs18a_only_a_call_past_the_high_water_with_a_readable_delta_adds_a_sample(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    reranker_mod._record_rerank_cost(_MODEL, _STORE, 1_000, 0.1, None)  # unreadable RSS
-    assert reranker_mod._ram_cost.fit(_STORE, _MODEL) is None
-    reranker_mod._record_rerank_cost(_MODEL, _STORE, 1_000, 0.1, 500.0)  # peak is now 1,000 but nothing was added
-    assert reranker_mod._ram_cost.fit(_STORE, _MODEL) is None
-    reranker_mod._record_rerank_cost(_MODEL, _STORE, 1_500, 0.1, -9.0)  # past it, negative delta clamps to 0
-    state = reranker_mod._ram_cost.state(_STORE, _MODEL)
-    assert state is not None and (state.sums.n, state.sums.sum_x, state.sums.sum_y) == (1, 500, 0.0)
 
 
 def test_cs18e_recording_a_rerank_writes_nothing_to_the_database(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1185,39 +1079,8 @@ def test_cs18e_recording_a_rerank_writes_nothing_to_the_database(monkeypatch: py
     assert calls == [] and cost_series.has_pending(_STORE.db_path)
 
 
-def test_cs18f_the_ram_sample_is_buffered_before_the_new_high_water_is_published(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    seen: list[int] = []
-    real = reranker_mod._ram_cost.record
-
-    def spy(store, key, x, y):
-        seen.append(reranker_mod._ram_state.get(key, reranker_mod._RamState()).peak_x)
-        real(store, key, x, y)
-
-    monkeypatch.setattr(reranker_mod._ram_cost, "record", spy)
-    reranker_mod._record_rerank_cost(_MODEL, _STORE, 100, 0.1, 1_000.0)
-    reranker_mod._record_rerank_cost(_MODEL, _STORE, 300, 0.3, 2_000.0)
-    assert seen == [0, 100], "at each record the high water published is still the previous one"
-    assert reranker_mod._ram_state[_MODEL].peak_x == 300
 
 
-def test_cs18f_the_estimate_reads_the_high_water_before_the_ram_figure(monkeypatch: pytest.MonkeyPatch) -> None:
-    reranker_mod._record_rerank_cost(_MODEL, _STORE, 100, 0.1, 1_000.0)
-    real_fit = reranker_mod._ram_cost.fit
-    landed: list[bool] = []
-
-    def fit(store, key):
-        if not landed:  # a writer lands between the reader's two reads
-            landed.append(True)
-            reranker_mod._record_rerank_cost(_MODEL, _STORE, 300, 0.3, 2_000.0)
-        return real_fit(store, key)
-
-    monkeypatch.setattr(reranker_mod._ram_cost, "fit", fit)
-    est = reranker_mod.rerank_cost_estimate(_MODEL, _STORE)
-    assert est is not None
-    assert est.peak_padded_tokens == 100, "the high water was read first"
-    assert est.ram_bytes_per_token == pytest.approx(10.0), "the figure already holds the later sample"
 
 
 # ---------------------------------------------------------------------------
@@ -1228,140 +1091,16 @@ def test_cs18f_the_estimate_reads_the_high_water_before_the_ram_figure(monkeypat
 # ---------------------------------------------------------------------------
 
 
-class _GrowingProvider(_CostScriptedProvider):
-    """The cost-scripted fake whose every `rerank()` also grows the scripted RSS by
-    `per_token` bytes per padded token (len(documents) x the longest pair)."""
-
-    def __init__(self, clock: _Clock, rss: list[float], per_token: float) -> None:
-        super().__init__(clock, overhead=0.0, rate=1e-4)
-        self.rss = rss
-        self.per_token = per_token
-
-    def rerank(self, query: str, documents: list[str]) -> list[float]:
-        out = super().rerank(query, documents)
-        self.rss[0] += self.per_token * len(documents) * max(self.pair_token_lengths(query, documents))
-        return out
 
 
-def test_s178_a_too_high_figure_blocks_until_its_samples_age_out_and_the_one_pair_measurement_re_seeds_it(
-    clock: _Clock, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    wall = [1_000_000.0]
-    rss = [1.0e9]
-    monkeypatch.setattr(cost_series, "_wall_clock", lambda: wall[0])
-    monkeypatch.setattr(reranker_mod, "_current_rss_bytes", lambda: rss[0])
-    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 1.0e6)
-    _persist_estimate()
-    _persist_ram(bytes_per_token=1.0e9)  # absurdly high: no batch fits 1 MB
-    provider = _GrowingProvider(clock, rss, per_token=500.0)
-    window = cost_series.window_seconds()
-
-    blocked = rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0)
-    assert blocked.reranked is False and blocked.hand_off == "budget", "the F7b situation, so the case is not vacuous"
-    assert [c for c in provider.calls if len(c) > 1] == [], "no measured rerank ran"
-    assert reranker_mod._ram_cost.state(_STORE, _MODEL).sums.n == 1, "nothing recorded"
-
-    wall[0] += window - 60.0  # the sample is still inside the window: the figure applies as before
-    est = rerank_cost_estimate(_MODEL)
-    assert est is not None and est.ram_bytes_per_token == pytest.approx(1.0e9)
-    assert rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0).reranked is False
-
-    wall[0] += 120.0  # the window is empty now
-    est = rerank_cost_estimate(_MODEL)
-    assert est is not None and est.ram_bytes_per_token is None and est.measured_batches > 0
-    monkeypatch.setattr(reranker_mod, "_require_ram_figure", True)
-    held = rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0)
-    assert held.hand_off == "ram_figure" and held.reranked is False, "S203: no width-5 re-seed; the one-pair measurement makes the figure"
-    assert _MODEL in reranker_mod._ram_figure_needed
-
-    # The one-pair measurement (S200) records its sample: the figure is back and a rerank is sized by it.
-    reranker_mod._record_rerank_cost(_MODEL, _STORE, 1_000, 1.0, 500_000.0)
-    est = rerank_cost_estimate(_MODEL)
-    assert est is not None and est.ram_bytes_per_token == pytest.approx(500.0)
-    assert rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0).hand_off != "ram_figure"
 
 
-def _growth_for(n: int, peak: int, pair_tokens: int = 100) -> int:
-    """Independent: padded tokens past `peak` of a batch of `n` real candidates of `pair_tokens`
-    plus its anchors, padded to the longest pair (the width fit's RAM-term input)."""
-    k = min(8, n // 2)
-    longest = max([pair_tokens, *_anchor_pair_tokens()[:k]])
-    return max(0, (n + k) * longest - peak)
 
 
-def _running_process_with_a_figure(
-    clock: _Clock, monkeypatch: pytest.MonkeyPatch, wall: list[float], rss: list[float]
-) -> tuple[_GrowingProvider, int]:
-    """A saved time estimate, no saved RAM figure: the process's first rerank is held to 5 candidates
-    (max_real=5; S203 retired the seeding rule, the test still needs a small first sample) and records
-    the 500 B/token sample, so it is now "running" (its RAM state holds the model id).
-    Returns the provider and the process's high water."""
-    monkeypatch.setattr(cost_series, "_wall_clock", lambda: wall[0])
-    monkeypatch.setattr(reranker_mod, "_current_rss_bytes", lambda: rss[0])
-    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
-    _persist_estimate()
-    provider = _GrowingProvider(clock, rss, per_token=500.0)
-    first = rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0, max_real=5)
-    assert first.width == 5, "a first rerank held to 5 (max_real) makes the 500 B/token sample"
-    est = rerank_cost_estimate(_MODEL)
-    assert est.ram_bytes_per_token == pytest.approx(500.0) and est.ram_figure_kept is False
-    return provider, reranker_mod._ram_state[_MODEL].peak_x
 
 
-def test_s180_a_running_process_whose_ram_window_emptied_keeps_its_last_figure_and_sizes_by_it(
-    clock: _Clock, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """K1a/K1b (replaces A1g, which pinned the opposite): RAM samples exist only for calls past the
-    process's high water, so a plateaued process loses its window 24 h after its last new peak. It
-    keeps the last figure: the width fit applies the RAM term, nothing runs unbounded and no seed runs."""
-    wall, rss = [1_000_000.0], [1.0e9]
-    provider, peak = _running_process_with_a_figure(clock, monkeypatch, wall, rss)
-
-    wall[0] += cost_series.window_seconds() + 60.0  # the process kept running; its only RAM sample aged out
-    state = reranker_mod._ram_cost.state(_STORE, _MODEL)
-    assert state is not None and state.sums.n == 0, "the window is empty"
-    est = rerank_cost_estimate(_MODEL)
-    assert est.ram_bytes_per_token == pytest.approx(500.0) and est.ram_figure_kept is True
-    assert est.peak_padded_tokens == peak
-
-    headroom = 500.0 * _growth_for(8, peak) + 1.0  # room for 8 real candidates and not for 9
-    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: headroom)
-    reference = _reference_width(
-        [100] * 50, _anchor_pair_tokens(), est.overhead_seconds, est.seconds_per_token, 4.0,
-        ram_per_token=500.0, headroom=headroom, peak=peak,
-    )
-    unbounded = _reference_width([100] * 50, _anchor_pair_tokens(), est.overhead_seconds, est.seconds_per_token, 4.0)
-    assert 5 < reference < unbounded, "the RAM term (and only it) limits this width; a seed would give 5"
-    second = rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0)
-    assert second.width == reference
-    batch = provider.calls[-1]
-    padded = len(batch) * max(provider.pair_token_lengths(_QUERY, batch))
-    est = rerank_cost_estimate(_MODEL)
-    assert est.ram_figure_kept is False, "the call past the high water recorded a sample: the window answers again"
-    assert est.ram_bytes_per_token == pytest.approx(500.0 * padded / (padded - peak))
 
 
-def test_s180_a_process_that_has_not_measured_does_not_use_a_kept_figure_and_waits_for_the_measurement(
-    clock: _Clock, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """K1a: S178 is unchanged for a process whose RAM state lacks the model id (plan review F1)."""
-    wall, rss = [1_000_000.0], [1.0e9]
-    monkeypatch.setattr(cost_series, "_wall_clock", lambda: wall[0])
-    monkeypatch.setattr(reranker_mod, "_current_rss_bytes", lambda: rss[0])
-    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 1.0e6)
-    _persist_estimate()
-    _persist_ram(bytes_per_token=1.0e9)
-    est = rerank_cost_estimate(_MODEL)
-    assert est.ram_bytes_per_token == pytest.approx(1.0e9), "the figure is in the window; the process saw it"
-    assert len(reranker_mod._ram_kept) == 1 and _MODEL not in reranker_mod._ram_state
-    wall[0] += cost_series.window_seconds() + 60.0
-    est = rerank_cost_estimate(_MODEL)
-    assert est.ram_bytes_per_token is None and est.ram_figure_kept is False
-    provider = _GrowingProvider(clock, rss, per_token=500.0)
-    monkeypatch.setattr(reranker_mod, "_require_ram_figure", True)
-    held = rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0)
-    assert held.hand_off == "ram_figure" and held.reranked is False, "no kept figure for it, so no figure (S203)"
-    assert provider.calls == []
 
 
 def _age_out(wall: list[float]) -> None:
@@ -1369,128 +1108,14 @@ def _age_out(wall: list[float]) -> None:
     reranker_mod._rerank_cost.record(_STORE, _MODEL, 700, 0.07)  # keeps the time series answering
 
 
-def test_s204_the_kept_figure_follows_the_last_positive_figure_and_a_zero_window_counts_as_empty(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """K1c, S204: a new positive sample replaces the kept figure; a window that holds only a
-    zero-growth sample counts as empty, so the process keeps its last positive figure (it is not
-    forgotten and the zero is not the answer)."""
-    wall = [1_000_000.0]
-    monkeypatch.setattr(cost_series, "_wall_clock", lambda: wall[0])
-    reranker_mod._rerank_cost.record(_STORE, _MODEL, 700, 0.07)
-    reranker_mod._record_rerank_cost(_MODEL, _STORE, 100, 0.01, 1.0e5)  # 1000 B/token, high water 100
-    assert rerank_cost_estimate(_MODEL).ram_bytes_per_token == pytest.approx(1000.0)
-    _age_out(wall)
-    est = rerank_cost_estimate(_MODEL)
-    assert est.ram_figure_kept and est.ram_bytes_per_token == pytest.approx(1000.0)
-    reranker_mod._record_rerank_cost(_MODEL, _STORE, 200, 0.02, 3.0e5)  # 3000 B/token past 100
-    est = rerank_cost_estimate(_MODEL)
-    assert est.ram_figure_kept is False and est.ram_bytes_per_token == pytest.approx(3000.0)
-    _age_out(wall)
-    assert rerank_cost_estimate(_MODEL).ram_bytes_per_token == pytest.approx(3000.0), "the LAST figure, not the first"
-    reranker_mod._record_rerank_cost(_MODEL, _STORE, 300, 0.03, 0.0)  # past the high water, no growth
-    est = rerank_cost_estimate(_MODEL)
-    assert est.ram_figure_kept is True and est.ram_bytes_per_token == pytest.approx(3000.0), "a zero window is empty"
-    assert list(reranker_mod._ram_kept.values()) == [pytest.approx(3000.0)], "nothing forgotten"
-    reranker_mod._record_rerank_cost(_MODEL, _STORE, 400, 0.04, 2.0e5)  # a positive sample again
-    est = rerank_cost_estimate(_MODEL)
-    assert est.ram_figure_kept is False and est.ram_bytes_per_token > 0.0
 
 
-def test_s204_a_zero_only_window_in_a_process_that_never_measured_is_no_figure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    reranker_mod._rerank_cost.record(_STORE, _MODEL, 700, 0.07)
-    reranker_mod._ram_cost.record(_STORE, _MODEL, 700, 0.0)  # a zero-growth sample, no positive one
-    est = rerank_cost_estimate(_MODEL)
-    assert est is not None and est.ram_bytes_per_token is None and est.ram_figure_kept is False
-    monkeypatch.setattr(reranker_mod, "_current_rss_bytes", lambda: 1.0e9)
-    monkeypatch.setattr(reranker_mod, "_require_ram_figure", True)
-    assert reranker_mod.ram_figure_ready(_MODEL, _STORE) is False
 
 
-def test_s180_the_seed_sample_is_kept_even_if_no_estimate_call_happens_before_it_ages_out(
-    clock: _Clock, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Stage-6 review F2: the figure is remembered when the process RECORDS the sample, not only when an
-    estimate call reads the window. One message after a restart (its seed sample is the only RAM sample),
-    then more than a day of quiet: the next message still finds the figure."""
-    wall, rss = [1_000_000.0], [1.0e9]
-    monkeypatch.setattr(cost_series, "_wall_clock", lambda: wall[0])
-    monkeypatch.setattr(reranker_mod, "_current_rss_bytes", lambda: rss[0])
-    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
-    _persist_estimate()
-    provider = _GrowingProvider(clock, rss, per_token=500.0)
-    first = rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0, max_real=5)
-    assert first.width == 5
-    assert len(reranker_mod._ram_kept) == 1, "remembered at the record"
-    wall[0] += cost_series.window_seconds() + 60.0  # no estimate call in between
-    est = rerank_cost_estimate(_MODEL)
-    assert est.ram_figure_kept is True and est.ram_bytes_per_token == pytest.approx(500.0)
 
 
-def test_s180_the_kept_figure_is_keyed_by_database_and_model_id_and_shared_by_stores_on_one_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """K1c: another model id, or another database, has no kept figure; two store objects on one
-    file (the job's per-tick store and the reply path's) share it."""
-    wall = [1_000_000.0]
-    monkeypatch.setattr(cost_series, "_wall_clock", lambda: wall[0])
-    reranker_mod._rerank_cost.record(_STORE, _MODEL, 700, 0.07)
-    reranker_mod._record_rerank_cost(_MODEL, _STORE, 100, 0.01, 1.0e5)
-    other_model = "cost-other"
-    reranker_mod._rerank_cost.record(_STORE, other_model, 700, 0.07)
-    reranker_mod._record_rerank_cost(other_model, _STORE, 100, 0.01, None)  # measured, no RAM sample
-    assert rerank_cost_estimate(_MODEL).ram_bytes_per_token == pytest.approx(1000.0)
-    wall[0] += cost_series.window_seconds() + 60.0
-    for model in (_MODEL, other_model):
-        reranker_mod._rerank_cost.record(_STORE, model, 700, 0.07)
-    assert rerank_cost_estimate(_MODEL).ram_figure_kept is True
-    est = rerank_cost_estimate(other_model)
-    assert est.ram_bytes_per_token is None and est.ram_figure_kept is False, "another model id: no kept figure"
-    again = MemoryStore(_STORE.db_path, integrity_check=False)  # another object on the same file
-    try:
-        est = reranker_mod.rerank_cost_estimate(_MODEL, again)
-        assert est.ram_figure_kept is True and est.ram_bytes_per_token == pytest.approx(1000.0)
-    finally:
-        again.close()
-    elsewhere = MemoryStore(tmp_path / "elsewhere.db", integrity_check=False)  # another database
-    try:
-        reranker_mod._rerank_cost.record(elsewhere, _MODEL, 700, 0.07)
-        est = reranker_mod.rerank_cost_estimate(_MODEL, elsewhere)
-        assert est is not None and est.ram_bytes_per_token is None and est.ram_figure_kept is False
-    finally:
-        elsewhere.close()
 
 
-def test_s180_a_restart_forgets_the_kept_figure_and_nothing_is_written_for_it(
-    clock: _Clock, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """K1d: the kept figure is process memory: a restart (module state reset, a fresh connection) with
-    the window empty has no figure and waits for the measurement (S178, S203), and reading it wrote no row."""
-    wall, rss = [1_000_000.0], [1.0e9]
-    provider, _peak = _running_process_with_a_figure(clock, monkeypatch, wall, rss)
-    assert cost_series.flush(_STORE) >= 1
-    wall[0] += cost_series.window_seconds() + 60.0
-    statements: list[str] = []
-    _STORE._conn.set_trace_callback(statements.append)
-    try:
-        est = rerank_cost_estimate(_MODEL)
-    finally:
-        _STORE._conn.set_trace_callback(None)
-    assert est.ram_figure_kept is True
-    assert not [q for q in statements if q.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE", "REPLACE"))]
-    reranker_mod._reset_rerank_cost_model()
-    cost_series._reset_pending()
-    fresh = MemoryStore(_STORE.db_path, integrity_check=False)
-    try:
-        est = reranker_mod.rerank_cost_estimate(_MODEL, fresh)
-        assert est.ram_bytes_per_token is None and est.ram_figure_kept is False
-        monkeypatch.setattr(reranker_mod, "_require_ram_figure", True)
-        held = reranker_mod.rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0, store=fresh)
-        assert held.hand_off == "ram_figure" and held.reranked is False, "S203: waits for the one-pair measurement"
-    finally:
-        fresh.close()
 
 
 class _OwnerLock:
@@ -1555,53 +1180,3 @@ class _GuardedDict(dict):
         return super().__len__()
 
 
-def test_s180_the_kept_figure_is_touched_only_under_the_cost_lock(monkeypatch: pytest.MonkeyPatch) -> None:
-    """K3: estimate calls from several threads (each with its OWN store object on the one file, as the
-    job, the tool and the reply path have), a recording thread and a reset never touch the kept dict
-    without holding `_cost_lock`. The guard records the owning thread (a bare `locked()` check would
-    pass while another thread holds the lock) and the test asserts the readers really reached the dict
-    in both branches (window answering, window empty and the figure kept)."""
-    wall = [1_000_000.0]
-    monkeypatch.setattr(cost_series, "_wall_clock", lambda: wall[0])
-    lock = _OwnerLock()
-    violations: list[str] = []
-    guarded = _GuardedDict(lock, violations)
-    monkeypatch.setattr(reranker_mod, "_cost_lock", lock)
-    monkeypatch.setattr(reranker_mod, "_ram_kept", guarded)
-    reranker_mod._rerank_cost.record(_STORE, _MODEL, 700, 0.07)
-    reranker_mod._record_rerank_cost(_MODEL, _STORE, 100, 0.01, 1.0e5)  # running; window answers 1000 B/token
-    errors: list[BaseException] = []
-    results: list[RerankCostEstimate | None] = []
-    reader_ids: set[int] = set()
-
-    def _reader(phase_kept: bool) -> None:
-        store = MemoryStore(_STORE.db_path, integrity_check=False)
-        try:
-            reader_ids.add(threading.get_ident())
-            for _ in range(20):
-                est = reranker_mod.rerank_cost_estimate(_MODEL, store)
-                results.append(est)
-                if est is not None:
-                    assert est.ram_figure_kept is phase_kept
-        except BaseException as exc:  # noqa: BLE001 - reported by the main thread
-            errors.append(exc)
-        finally:
-            store.close()
-
-    def _run(phase_kept: bool) -> None:
-        threads = [threading.Thread(target=_reader, args=(phase_kept,)) for _ in range(4)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=30.0)
-
-    _run(False)  # the window answers: readers write the figure
-    wall[0] += cost_series.window_seconds() + 60.0
-    reranker_mod._rerank_cost.record(_STORE, _MODEL, 700, 0.07)
-    _run(True)  # the window is empty: readers read the kept figure
-    reranker_mod._reset_rerank_cost_model()  # a reset under the same lock
-    assert not errors, errors
-    answered = [e for e in results if e is not None]
-    assert len(answered) == len(results) == 160, "every reader call answered an estimate (the store was usable from its thread)"
-    assert reader_ids <= guarded.touched_by, "every reader thread reached the guarded dict"
-    assert violations == [], "the kept dict was touched outside the cost lock"
