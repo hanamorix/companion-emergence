@@ -716,6 +716,229 @@ def test_cgroup_v1_garbage_limit_returns_none(monkeypatch: pytest.MonkeyPatch) -
     assert reranker_mod._cgroup_v1_memory_headroom_bytes() is None
 
 
+# ---- S230: the cgroup headroom subtracts the reclaimable file cache (memory.stat inactive_file) ----
+
+_V2_OWN = "/sys/fs/cgroup/user.slice/app.scope"
+_V1_OWN = "/sys/fs/cgroup/memory/user.slice/app.scope"
+# Other stat lines that would give a DIFFERENT figure if the wrong key were read.
+_V2_DECOY_STAT = "anon 123\nfile 900000000\nactive_file 111111\ntotal_inactive_file 222222222\ninactive_file_x 5\n"
+
+
+def _v2_files(stat: str | None, *, limit: str = "6000000000", current: str = "1000000000") -> dict[str, str]:
+    files = {
+        "/proc/self/cgroup": "0::/user.slice/app.scope\n",
+        f"{_V2_OWN}/memory.max": f"{limit}\n",
+        f"{_V2_OWN}/memory.current": f"{current}\n",
+    }
+    if stat is not None:
+        files[f"{_V2_OWN}/memory.stat"] = stat
+    return files
+
+
+def _v1_files(stat: str | None, *, limit: str = "5500000000", usage: str = "5000000000") -> dict[str, str]:
+    files = {
+        "/proc/self/cgroup": "5:memory:/user.slice/app.scope\n",
+        f"{_V1_OWN}/memory.limit_in_bytes": f"{limit}\n",
+        f"{_V1_OWN}/memory.usage_in_bytes": f"{usage}\n",
+    }
+    if stat is not None:
+        files[f"{_V1_OWN}/memory.stat"] = stat
+    return files
+
+
+def _use_files(monkeypatch: pytest.MonkeyPatch, files: dict[str, str]) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr("builtins.open", _fake_open_dispatcher(files))
+
+
+def test_cgroup_v2_headroom_subtracts_the_reclaimable_file_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    """K1: limit 6.0 GB, current 1.0 GB of which 0.6 GB is inactive file cache -> 5.6 GB headroom. The
+    stat file also carries other cache lines that would give a different figure if read."""
+    _use_files(monkeypatch, _v2_files(_V2_DECOY_STAT + "inactive_file 600000000\n"))
+    assert reranker_mod._cgroup_v2_memory_headroom_bytes() == 5_600_000_000.0
+
+
+def test_cgroup_v2_reads_the_stat_of_the_process_own_cgroup_not_an_ancestor_or_the_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """K2: three distinct values (own, parent, root); only the own cgroup's is used."""
+    files = _v2_files("inactive_file 600000000\n")
+    files["/sys/fs/cgroup/user.slice/memory.stat"] = "inactive_file 800000000\n"
+    files["/sys/fs/cgroup/memory.stat"] = "inactive_file 900000000\n"
+    _use_files(monkeypatch, files)
+    assert reranker_mod._cgroup_v2_memory_headroom_bytes() == 5_600_000_000.0
+
+
+def test_cgroup_v2_walk_up_cap_still_gets_the_own_cgroup_subtraction(monkeypatch: pytest.MonkeyPatch) -> None:
+    """K2: own memory.max "max", the PARENT caps at 4.0 GB; the usage and the cache are the own cgroup's."""
+    files = {
+        "/proc/self/cgroup": "0::/user.slice/app.scope\n",
+        f"{_V2_OWN}/memory.max": "max\n",
+        f"{_V2_OWN}/memory.current": "1000000000\n",
+        f"{_V2_OWN}/memory.stat": "inactive_file 500000000\n",
+        "/sys/fs/cgroup/user.slice/memory.max": "4000000000\n",
+        "/sys/fs/cgroup/user.slice/memory.stat": "inactive_file 700000000\n",
+        "/sys/fs/cgroup/memory.stat": "inactive_file 900000000\n",
+    }
+    _use_files(monkeypatch, files)
+    assert reranker_mod._cgroup_v2_memory_headroom_bytes() == 3_500_000_000.0
+
+
+def test_cgroup_v2_cache_larger_than_usage_is_capped_at_the_usage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """K3: the reclaimable amount never exceeds the usage, so the headroom never exceeds the limit."""
+    _use_files(monkeypatch, _v2_files("inactive_file 3000000000\n"))
+    assert reranker_mod._cgroup_v2_memory_headroom_bytes() == 6_000_000_000.0
+
+
+def test_cgroup_v2_usage_beyond_the_limit_after_the_subtraction_is_zero_headroom(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """K3: 7.0 GB used, 0.5 GB of it reclaimable, 6.0 GB limit -> 0.0, never negative."""
+    _use_files(monkeypatch, _v2_files("inactive_file 500000000\n", current="7000000000"))
+    assert reranker_mod._cgroup_v2_memory_headroom_bytes() == 0.0
+
+
+@pytest.mark.parametrize(
+    "stat",
+    [
+        None,  # memory.stat absent
+        "",
+        "anon 1\nfile 5\n",  # no inactive_file line
+        "inactive_file abc\n",
+        "inactive_file -5\n",
+        "inactive_file +5\n",
+        "inactive_file 1_000\n",
+        "inactive_file nan\n",
+        "inactive_file inf\n",
+        "inactive_file infinity\n",
+        "inactive_file\n",  # key with no value
+        "total_inactive_file 999\ninactive_file_x 5\n",  # only look-alike keys (K5)
+    ],
+)
+def test_cgroup_v2_unusable_stat_subtracts_nothing(monkeypatch: pytest.MonkeyPatch, stat: str | None) -> None:
+    """K4: every degrade input gives the pre-change figure (limit - current = 5.0 GB), never None, never a raise."""
+    reranker_mod._ram_figure_warned.clear()
+    _use_files(monkeypatch, _v2_files(stat))
+    assert reranker_mod._cgroup_v2_memory_headroom_bytes() == 5_000_000_000.0
+    reranker_mod._ram_figure_warned.clear()
+
+
+def test_cgroup_v2_unreadable_stat_subtracts_nothing_and_warns_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """K4: a stat file that raises on open gives the pre-change figure, with one warning per process."""
+    reranker_mod._ram_figure_warned.clear()
+    files = _v2_files("inactive_file 600000000\n")
+    inner = _fake_open_dispatcher(files)
+
+    def _open(path, *args, **kwargs):
+        if str(path).endswith("/memory.stat"):
+            raise PermissionError(path)
+        return inner(path, *args, **kwargs)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr("builtins.open", _open)
+    with caplog.at_level("DEBUG"):
+        assert reranker_mod._cgroup_v2_memory_headroom_bytes() == 5_000_000_000.0
+        assert reranker_mod._cgroup_v2_memory_headroom_bytes() == 5_000_000_000.0
+    warns = [r for r in caplog.records if r.levelname == "WARNING" and "memory.stat" in r.getMessage()]
+    assert len(warns) == 1
+    reranker_mod._ram_figure_warned.clear()
+
+
+def test_cgroup_v2_garbage_stat_value_warns_once(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    reranker_mod._ram_figure_warned.clear()
+    _use_files(monkeypatch, _v2_files("inactive_file abc\n"))
+    with caplog.at_level("DEBUG"):
+        reranker_mod._cgroup_v2_memory_headroom_bytes()
+        reranker_mod._cgroup_v2_memory_headroom_bytes()
+    warns = [r for r in caplog.records if r.levelname == "WARNING" and "memory.stat" in r.getMessage()]
+    assert len(warns) == 1
+    reranker_mod._ram_figure_warned.clear()
+
+
+def test_cgroup_v2_without_a_memory_current_is_still_none_even_with_a_stat(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stat is only read after the usage was read: no usage -> None, as before."""
+    files = _v2_files("inactive_file 600000000\n")
+    del files[f"{_V2_OWN}/memory.current"]
+    _use_files(monkeypatch, files)
+    assert reranker_mod._cgroup_v2_memory_headroom_bytes() is None
+
+
+def test_cgroup_v1_headroom_subtracts_the_hierarchical_reclaimable_file_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """K6 + K5: limit 5.5 GB, usage 5.0 GB, total_inactive_file 0.4 GB -> 0.9 GB; the non-hierarchical
+    `inactive_file` line (111) and other lines are not read."""
+    _use_files(monkeypatch, _v1_files("cache 700\ninactive_file 111\ntotal_inactive_file 400000000\nactive_file 5\n"))
+    assert reranker_mod._cgroup_v1_memory_headroom_bytes() == 900_000_000.0
+
+
+def test_cgroup_v1_reads_the_stat_of_the_process_own_cgroup_not_the_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    files = _v1_files("total_inactive_file 400000000\n")
+    files["/sys/fs/cgroup/memory/memory.stat"] = "total_inactive_file 450000000\n"
+    _use_files(monkeypatch, files)
+    assert reranker_mod._cgroup_v1_memory_headroom_bytes() == 900_000_000.0
+
+
+def test_cgroup_v1_cache_larger_than_usage_is_capped_at_the_usage(monkeypatch: pytest.MonkeyPatch) -> None:
+    _use_files(monkeypatch, _v1_files("total_inactive_file 9000000000\n"))
+    assert reranker_mod._cgroup_v1_memory_headroom_bytes() == 5_500_000_000.0
+
+
+def test_cgroup_v1_usage_beyond_the_limit_after_the_subtraction_is_zero_headroom(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_files(monkeypatch, _v1_files("total_inactive_file 100000000\n", usage="6000000000"))
+    assert reranker_mod._cgroup_v1_memory_headroom_bytes() == 0.0
+
+
+@pytest.mark.parametrize(
+    "stat",
+    [
+        None,
+        "",
+        "cache 5\n",
+        "total_inactive_file abc\n",
+        "total_inactive_file -5\n",
+        "total_inactive_file nan\n",
+        "total_inactive_file 1_0\n",
+        "inactive_file 111\n",  # only the non-hierarchical key: not the matching term, subtract nothing
+    ],
+)
+def test_cgroup_v1_unusable_stat_subtracts_nothing(monkeypatch: pytest.MonkeyPatch, stat: str | None) -> None:
+    """K4/K6: pre-change figure (limit - usage = 0.5 GB)."""
+    reranker_mod._ram_figure_warned.clear()
+    _use_files(monkeypatch, _v1_files(stat))
+    assert reranker_mod._cgroup_v1_memory_headroom_bytes() == 500_000_000.0
+    reranker_mod._ram_figure_warned.clear()
+
+
+def test_available_headroom_carries_the_subtraction_and_does_not_reach_psutil(monkeypatch: pytest.MonkeyPatch) -> None:
+    """K7: the figure the width fit reads is the cgroup one with the file cache taken off; psutil is not consulted."""
+    _use_files(monkeypatch, _v2_files("inactive_file 600000000\n"))
+    monkeypatch.setattr(
+        reranker_mod, "_psutil_available_bytes", lambda: pytest.fail("psutil must not be read under a cgroup cap")
+    )
+    assert reranker_mod._available_ram_headroom_bytes() == 5_600_000_000.0
+
+
+def test_available_headroom_v1_fallback_carries_the_subtraction(monkeypatch: pytest.MonkeyPatch) -> None:
+    """K7: no v2 line in /proc/self/cgroup -> v1 is used, with its subtraction."""
+    _use_files(monkeypatch, _v1_files("total_inactive_file 400000000\n"))
+    monkeypatch.setattr(
+        reranker_mod, "_psutil_available_bytes", lambda: pytest.fail("psutil must not be read under a cgroup cap")
+    )
+    assert reranker_mod._available_ram_headroom_bytes() == 900_000_000.0
+
+
+def test_cgroup_reader_docstrings_state_the_subtraction() -> None:
+    """K10: the three docstrings name the stat term."""
+    assert "inactive_file" in (reranker_mod._cgroup_v2_memory_headroom_bytes.__doc__ or "")
+    assert "total_inactive_file" in (reranker_mod._cgroup_v1_memory_headroom_bytes.__doc__ or "")
+    assert "inactive_file" in (reranker_mod._available_ram_headroom_bytes.__doc__ or "")
+
+
 def test_psutil_available_bytes_reads_the_host_available_memory(monkeypatch: pytest.MonkeyPatch) -> None:
     """S211: the host free-memory fallback is psutil's `available`, the same call on every platform."""
     import psutil
