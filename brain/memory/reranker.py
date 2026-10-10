@@ -1709,9 +1709,49 @@ def _cgroup_v2_ancestor_dirs(cgroup_path: str) -> list[str]:
     return dirs
 
 
+def _cgroup_reclaimable_file_bytes(stat_path: str, key: str) -> float:
+    """The reclaimable file cache of a cgroup, in bytes: the value of the line `key` in its
+    `memory.stat` (v2: `inactive_file`; v1: `total_inactive_file`, the hierarchical figure that
+    matches v1's hierarchical `memory.usage_in_bytes`). S230: the cgroup's usage counter
+    (`memory.current`) counts page cache, such as the model files the process read, which the
+    kernel gives back when memory is needed; the headroom readers subtract it from the usage so
+    that cache does not read as used.
+
+    The key is matched exactly (the first whitespace-split token of a line), so `inactive_file`
+    never matches `total_inactive_file` or the reverse. Returns 0.0, meaning "subtract nothing"
+    (the figure the readers gave before S230, the tighter and safer side), when the file is absent
+    (silent: a cgroup without the memory files), unreadable, has no such line, or the value is not
+    a plain non-negative integer (a sign, an underscore, nan or inf are all rejected); an
+    unreadable file or an unusable value is warned once per process. Never raises, never negative."""
+    try:
+        with open(stat_path, encoding="utf-8") as f:
+            content = f.read()
+    except FileNotFoundError:
+        return 0.0
+    except Exception:  # noqa: BLE001 - fail-soft: a headroom probe must never break a recall
+        _warn_ram_figure_once(
+            "a cgroup memory.stat could not be read: reclaimable file cache is not subtracted from the headroom",
+            exc_info=True,
+        )
+        return 0.0
+    for line in content.splitlines():
+        parts = line.split()
+        if parts and parts[0] == key:
+            if len(parts) >= 2 and parts[1].isascii() and parts[1].isdigit():
+                return float(parts[1])
+            _warn_ram_figure_once(
+                "a cgroup memory.stat reclaimable-cache value is not a plain integer: "
+                "reclaimable file cache is not subtracted from the headroom"
+            )
+            return 0.0
+    return 0.0
+
+
 def _cgroup_v2_memory_headroom_bytes() -> float | None:
     """cgroup v2 memory headroom for the CALLING PROCESS's own cgroup
-    (`effective_memory.max - memory.current`), resolved via `/proc/self/
+    (`effective_memory.max - (memory.current - reclaimable file cache)`, where the
+    reclaimable file cache is the `inactive_file` line of the same cgroup's `memory.stat`,
+    S230: page cache such as the model files does not read as used), resolved via `/proc/self/
     cgroup` (see `_read_proc_self_cgroup_v2_path`) rather than the fixed
     cgroup2 root — the root has no `memory.max`/`memory.current` of its
     own, so a root-only read can never see a real per-process cap.
@@ -1721,7 +1761,9 @@ def _cgroup_v2_memory_headroom_bytes() -> float | None:
     numeric `memory.max` seen (skipping "max" and any level whose file is
     absent — an ancestor may not expose the controller file at all),
     since an ancestor can cap memory even when the process's own cgroup
-    reads "max". Usage is read from the process's OWN cgroup only.
+    reads "max". Usage and the reclaimable file cache are read from the
+    process's OWN cgroup only (`_cgroup_reclaimable_file_bytes`; the cache is
+    capped at the usage, and a missing or unusable `memory.stat` subtracts nothing).
 
     Returns `None` (never a fabricated headroom) when: not Linux,
     `/proc/self/cgroup` is missing/unparsable, every `memory.max` on the
@@ -1770,7 +1812,8 @@ def _cgroup_v2_memory_headroom_bytes() -> float | None:
     except Exception:  # noqa: BLE001 — fail-soft
         log.exception("reranker: cgroup v2 memory.current read/parse failed")
         return None
-    return max(0.0, effective_limit - usage)
+    reclaimable = min(_cgroup_reclaimable_file_bytes(f"{dirs[0]}/memory.stat", "inactive_file"), usage)
+    return max(0.0, effective_limit - (usage - reclaimable))
 
 
 def _read_proc_self_cgroup_v1_memory_path() -> str | None:
@@ -1801,7 +1844,9 @@ def _read_proc_self_cgroup_v1_memory_path() -> str | None:
 def _cgroup_v1_memory_headroom_bytes() -> float | None:
     """cgroup v1 fallback for `_cgroup_v2_memory_headroom_bytes` (older
     kernels/distros without the unified v2 hierarchy): `memory.limit_in_
-    bytes - memory.usage_in_bytes` read from the CALLING PROCESS's own
+    bytes - (memory.usage_in_bytes - reclaimable file cache)` (S230: the
+    `total_inactive_file` line of the same cgroup's `memory.stat`, so page cache
+    such as the model files does not read as used) read from the CALLING PROCESS's own
     cgroup path, resolved via `/proc/self/cgroup`'s `memory` controller
     line (`_read_proc_self_cgroup_v1_memory_path`) rather than the fixed
     `/sys/fs/cgroup/memory/` root. v1's limit is already hierarchical (a
@@ -1842,7 +1887,8 @@ def _cgroup_v1_memory_headroom_bytes() -> float | None:
     except Exception:  # noqa: BLE001 — fail-soft
         log.exception("reranker: cgroup v1 memory.usage_in_bytes read failed")
         return None
-    return max(0.0, limit - usage)
+    reclaimable = min(_cgroup_reclaimable_file_bytes(f"{cgroup_dir}/memory.stat", "total_inactive_file"), usage)
+    return max(0.0, limit - (usage - reclaimable))
 
 
 def _psutil_available_bytes() -> float | None:
@@ -1871,6 +1917,10 @@ def _available_ram_headroom_bytes() -> float | None:
     headroom changes mid-session (another process on the box growing), the
     same trade-off the spec's own Open Reconfirmation favors absent a
     concrete reason not to.
+
+    The cgroup figures are limit - (usage - reclaimable file cache) (S230): the model
+    files' page cache is given back by the kernel under pressure, so it does not read
+    as used (`inactive_file` of `memory.stat`; v1 `total_inactive_file`).
 
     cgroup-limit-aware, per the pre-flip revision's Change-3 requirement:
     Testing's own OOM reproduction ran under an explicit cgroup cap that
