@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
+from typing import Any
 
+import pytest
+
+from brain.mcp_server import audit
 from brain.mcp_server.audit import log_invocation
 
 
@@ -147,3 +152,52 @@ def test_log_invocation_swallows_oserror(tmp_path: Path, monkeypatch) -> None:
         log_invocation(persona, name="x", arguments={}, result_summary="x")
     finally:
         persona.chmod(0o755)
+
+
+def test_stale_rotator_does_not_clobber_the_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#357: a writer that saw an oversize log must not rotate a fresh one.
+
+    B decides to rotate, stalls just before its rename, and meanwhile A
+    rotates the same log and a new row lands in a fresh log. Unguarded, B
+    then renames that one-row log over ``.1`` and the whole old log is gone.
+    Guarded, B holds a lock and re-checks, so A waits (or B rotates first)
+    and the old rows survive in either order.
+    """
+    monkeypatch.setattr(audit, "_MAX_LOG_BYTES", 100)
+    log_path = tmp_path / "tool_invocations.log.jsonl"
+    backup = log_path.with_name(log_path.name + ".1")
+    old_rows = "old-row-" + "x" * 200 + "\n"
+    log_path.write_text(old_rows, encoding="utf-8")
+
+    at_gate, release = threading.Event(), threading.Event()
+    stalled = threading.local()
+    real_replace = Path.replace
+
+    def replace(self: Path, target: Any) -> Any:
+        if getattr(stalled, "on", False) and not release.is_set():
+            at_gate.set()
+            release.wait(timeout=5)
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", replace)
+
+    def stale_rotator() -> None:
+        stalled.on = True
+        audit._rotate_if_needed(log_path)
+
+    b = threading.Thread(target=stale_rotator)
+    b.start()
+    assert at_gate.wait(timeout=5), "B never reached its rename"
+    a = threading.Thread(target=audit._rotate_if_needed, args=(log_path,))
+    a.start()
+    a.join(timeout=0.5)  # unguarded: A finishes here; guarded: A is waiting on B's lock
+    with log_path.open("a", encoding="utf-8") as fh:
+        fh.write("new-row\n")
+    release.set()
+    b.join(timeout=10)
+    a.join(timeout=10)
+
+    surviving = "".join(p.read_text(encoding="utf-8") for p in (backup, log_path) if p.exists())
+    assert old_rows in surviving
