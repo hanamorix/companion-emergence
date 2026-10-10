@@ -63,6 +63,9 @@ _replies_started: int = 0
 _inflight_background = 0
 # S218: signalled by `note_reply_end` (built on `_lock`, so waiting and the counters share it).
 _reply_ended = threading.Condition(_lock)
+# S223: callbacks registered through `ReplyWatch.on_reply_start`, run by `note_user_message` (after
+# its counters changed and OUTSIDE `_lock`). Guarded by `_lock`.
+_start_hooks: list[_StartHook] = []
 
 # Rate-limited error logging state for is_chat_idle (S63; r2 m1 fix: bounded
 # volume under a persistent fault). Guarded by _lock alongside the state above.
@@ -92,6 +95,7 @@ def reset() -> None:  # test helper
         _err_last_key = None
         _err_last_logged_mono = float("-inf")
         _err_suppressed_count = 0
+        _start_hooks.clear()
         _reply_ended.notify_all()
 
 
@@ -117,6 +121,11 @@ def note_user_message(at: float | None = None) -> None:
         _last_message_mono = time.monotonic() if at is None else at
         _inflight_replies += 1
         _replies_started += 1
+        hooks = list(_start_hooks)
+    # S223: outside the lock (a callback may call back into this module) and never raising: the
+    # reply path must not break because a measurement's stop callback failed.
+    for hook in hooks:
+        hook.fire()
 
 
 def note_reply_end(at: float | None = None) -> None:
@@ -130,7 +139,62 @@ def note_reply_end(at: float | None = None) -> None:
         _reply_ended.notify_all()
 
 
-def reply_watch() -> Callable[[], bool]:
+class _StartHook:
+    """One registration of `ReplyWatch.on_reply_start`: runs its callback at most once."""
+
+    def __init__(self, callback: Callable[[], None]) -> None:
+        self._callback = callback
+        self._fired = False
+        self._guard = threading.Lock()
+
+    def fire(self) -> None:
+        with self._guard:
+            if self._fired:
+                return
+            self._fired = True
+        try:
+            self._callback()
+        except Exception:  # noqa: BLE001 - a stop callback must never break a reply
+            log.warning("cli_throttle: a reply-start callback raised", exc_info=True)
+
+
+class ReplyWatch:
+    """S218: a snapshot of the reply activity. Calling it returns `still_clear()` (see
+    `reply_watch`). S223: `on_reply_start` lets a measurement be told the moment a reply starts."""
+
+    def __init__(self) -> None:
+        with _lock:
+            self._started = _replies_started
+            self._idle = _inflight_replies == 0
+
+    def __call__(self) -> bool:
+        if not self._idle:
+            return False
+        with _lock:
+            return _replies_started == self._started
+
+    def on_reply_start(self, callback: Callable[[], None]) -> Callable[[], None]:
+        """S223: run `callback()` once, on the thread that calls `note_user_message`, when a reply
+        starts (after the counters changed, outside the module lock; an exception it raises is
+        logged and swallowed). If this watch is already not clear (a reply was in flight at the
+        snapshot, or one started since) the callback runs at once, on the calling thread. Returns
+        an idempotent `unregister()`; a callback unregistered before a reply starts never runs.
+        Used by the RAM ladder to stop its running ONNX call (the reply must not wait for it)."""
+        hook = _StartHook(callback)
+        with _lock:
+            _start_hooks.append(hook)
+        if not self():
+            hook.fire()
+
+        def unregister() -> None:
+            with _lock:
+                with contextlib.suppress(ValueError):
+                    _start_hooks.remove(hook)
+
+        return unregister
+
+
+def reply_watch() -> ReplyWatch:
     """S218: a snapshot of the reply activity, as a callable `still_clear()`.
 
     `still_clear()` is True while no reply was in flight when the snapshot was taken AND no
@@ -138,18 +202,9 @@ def reply_watch() -> Callable[[], bool]:
     already ended: its allocations may be inside whatever was measured meanwhile). If a reply
     was in flight at the snapshot, it is False from the start, even after that reply ends.
     The RAM ladder of `nell chat --no-bridge` abandons the rung in progress when this
-    turns False (the process-wide RSS reading would be inflated by the reply)."""
-    with _lock:
-        started = _replies_started
-        idle = _inflight_replies == 0
-
-    def still_clear() -> bool:
-        if not idle:
-            return False
-        with _lock:
-            return _replies_started == started
-
-    return still_clear
+    turns False (the process-wide RSS reading would be inflated by the reply), and (S223)
+    registers `on_reply_start` to stop the rung's running ONNX call at that moment."""
+    return ReplyWatch()
 
 
 def wait_for_no_reply_in_flight() -> None:

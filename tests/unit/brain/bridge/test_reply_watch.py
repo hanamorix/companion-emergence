@@ -139,3 +139,98 @@ def test_the_wait_ends_only_when_every_overlapping_reply_has_ended():
     finally:
         cli_throttle.reset()
         thread.join(5.0)
+
+
+# ---------------------------------------------------------------------------
+# S223 (T1): on_reply_start, the hook that stops a running measurement call
+# ---------------------------------------------------------------------------
+
+
+def test_a_callback_runs_once_on_the_replying_thread_after_the_counters_changed_and_outside_the_lock():
+    watch = cli_throttle.reply_watch()
+    seen: list[tuple[int, bool, bool, bool]] = []
+
+    def _callback() -> None:
+        # called back into the module: would deadlock if the module lock were still held
+        seen.append(
+            (threading.get_ident(), watch(), cli_throttle.reply_in_flight(), cli_throttle.reply_watch()())
+        )
+
+    watch.on_reply_start(_callback)
+    assert seen == [], "nothing runs while no reply starts"
+    cli_throttle.note_user_message()
+    assert seen == [(threading.get_ident(), False, True, False)], "a fresh watch taken during a reply is not clear"
+    cli_throttle.note_user_message()
+    assert len(seen) == 1, "once per registration, even if more replies start"
+
+
+def test_the_callback_runs_on_the_thread_that_starts_the_reply_not_the_registering_one():
+    watch = cli_throttle.reply_watch()
+    where: list[int] = []
+    watch.on_reply_start(lambda: where.append(threading.get_ident()))
+    replier = threading.Thread(target=cli_throttle.note_user_message)
+    replier.start()
+    replier.join(5.0)
+    assert where == [replier.ident]
+
+
+def test_registering_on_a_watch_that_is_not_clear_runs_the_callback_at_once_and_once():
+    watch = cli_throttle.reply_watch()
+    cli_throttle.note_user_message()  # a reply started after the snapshot
+    calls: list[int] = []
+    watch.on_reply_start(lambda: calls.append(threading.get_ident()))
+    assert calls == [threading.get_ident()]
+    cli_throttle.note_user_message()
+    assert len(calls) == 1
+
+
+def test_registering_while_a_reply_was_in_flight_at_the_snapshot_runs_at_once():
+    cli_throttle.note_user_message()
+    watch = cli_throttle.reply_watch()
+    calls: list[int] = []
+    watch.on_reply_start(lambda: calls.append(1))
+    assert calls == [1]
+
+
+def test_an_unregistered_callback_never_runs_and_unregister_is_idempotent():
+    watch = cli_throttle.reply_watch()
+    calls: list[int] = []
+    unregister = watch.on_reply_start(lambda: calls.append(1))
+    unregister()
+    unregister()
+    cli_throttle.note_user_message()
+    assert calls == []
+
+
+def test_a_raising_callback_does_not_break_the_reply_start_or_the_other_callbacks():
+    watch = cli_throttle.reply_watch()
+    calls: list[str] = []
+
+    def _bad() -> None:
+        raise RuntimeError("boom")
+
+    watch.on_reply_start(_bad)
+    watch.on_reply_start(lambda: calls.append("second"))
+    cli_throttle.note_user_message()  # must not raise
+    assert calls == ["second"]
+    assert cli_throttle.reply_in_flight() is True, "the counters were updated before the callbacks"
+
+
+def test_two_watches_register_independently():
+    first, second = cli_throttle.reply_watch(), cli_throttle.reply_watch()
+    calls: list[str] = []
+    unregister_first = first.on_reply_start(lambda: calls.append("first"))
+    second.on_reply_start(lambda: calls.append("second"))
+    unregister_first()
+    cli_throttle.note_user_message()
+    assert calls == ["second"]
+
+
+def test_reset_clears_registrations_and_a_late_unregister_does_not_raise():
+    watch = cli_throttle.reply_watch()
+    calls: list[int] = []
+    unregister = watch.on_reply_start(lambda: calls.append(1))
+    cli_throttle.reset()
+    unregister()  # after reset: must not raise
+    cli_throttle.note_user_message()
+    assert calls == []
