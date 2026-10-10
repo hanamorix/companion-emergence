@@ -390,10 +390,11 @@ def _ram_figure_not_required_by_default(monkeypatch: pytest.MonkeyPatch) -> Iter
     from brain.memory import peak_rss, reranker
 
     monkeypatch.setattr(reranker, "_require_ram_figure", False)
-    # S220: the per-call peak reader is Linux-only and process-wide (it resets the kernel's
-    # peak counter): off by default so the suite's fake rerankers neither touch /proc nor
-    # record memory samples; the reader's own tests and the S200/S220 gate tests turn it on.
-    monkeypatch.setattr(peak_rss, "_is_linux", False)
+    # S220: the per-call peak reader is process-wide (on Linux it resets the kernel's peak
+    # counter; elsewhere, S248, it samples the RSS in a thread): off by default so the suite's
+    # fake rerankers neither touch /proc nor start a sampler nor record memory samples; the
+    # reader's own tests and the S200/S220 gate tests turn it on.
+    monkeypatch.setattr(peak_rss, "_disabled", True)
     peak_rss._reset_for_tests()  # noqa: SLF001
     reranker._ram_figure_needed.clear()  # noqa: SLF001
     reranker._ram_figure_attempt.clear()  # noqa: SLF001

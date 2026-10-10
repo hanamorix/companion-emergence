@@ -945,3 +945,68 @@ def test_a_marked_window_with_a_batch_but_without_the_usable_fit_conditions_is_n
     out = reranker_mod.rerank_for_recall(provider, _QUERY, _docs(50), store=store, budget_seconds=4.0)
     assert (out.reranked, out.hand_off) == (False, "ram_figure")
     assert provider.timed == []
+
+
+# ---- S249: the RAM fit is never learned in a process that downloaded the model; it does not rerank until it restarts ----
+
+
+def test_a_process_that_downloaded_the_model_does_not_rerank_until_it_restarts(store, monkeypatch) -> None:
+    provider, _fit = _full_window(store, monkeypatch)
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 5e12)
+    assert reranker_mod.ram_figure_ready(_MODEL, store) is True
+    reranker_mod._note_model_downloaded(_MODEL)  # noqa: SLF001
+    assert reranker_mod.ram_figure_ready(_MODEL, store) is False, "even with a complete window fit"
+    before = len(provider.timed)
+    out = reranker_mod.rerank_for_recall(provider, _QUERY, _docs(50), store=store, budget_seconds=4.0)
+    assert (out.reranked, out.hand_off) == (False, "ram_figure") and len(provider.timed) == before
+    reranker_mod.note_ram_figure_needed(_MODEL)
+    assert reranker_mod.ram_figure_due("a-later-lull", lambda: _open(store)) is False, "no ladder is due"
+    with reranker_mod._cost_lock:  # noqa: SLF001
+        reranker_mod._downloaded_model_ids.clear()  # noqa: SLF001 - a restart
+    assert reranker_mod.ram_figure_ready(_MODEL, store) is True
+    out = reranker_mod.rerank_for_recall(provider, _QUERY, _docs(50), store=store, budget_seconds=4.0)
+    assert out.reranked is True
+
+
+def test_the_ladder_builds_nothing_and_runs_nothing_in_a_process_that_downloaded_the_model(store, monkeypatch) -> None:
+    provider = ScriptedLadderProvider(model=_MODEL)
+    built = _build_spy(monkeypatch, provider)
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 5e12)
+    reranker_mod.note_ram_figure_needed(_MODEL)
+    reranker_mod._note_model_downloaded(_MODEL)  # noqa: SLF001
+    assert reranker_mod.run_ram_figure("m1", store) is False
+    assert built == [] and provider.plain == [] and provider.timed == []
+    assert reranker_mod.measure_ram_figure(provider, store) is False
+    assert provider.plain == [] and provider.timed == [] and provider.probes == 0
+    assert not reranker_mod._ram_shapes.shape_groups(store, _MODEL)  # noqa: SLF001
+
+
+def test_a_build_that_itself_downloads_the_model_stops_the_pass_before_its_warm_up(store, monkeypatch) -> None:
+    provider = ScriptedLadderProvider(model=_MODEL)
+
+    def _download_while_building(**kwargs):
+        reranker_mod._note_model_downloaded(_MODEL)  # noqa: SLF001
+        return provider
+
+    monkeypatch.setattr(reranker_mod, "build_reranker_provider", _download_while_building)
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 5e12)
+    assert reranker_mod.run_ram_figure("m1", store) is False
+    assert provider.plain == [] and provider.timed == []
+    assert not reranker_mod._ram_shapes.shape_groups(store, _MODEL)  # noqa: SLF001
+
+
+def test_a_downloaded_model_records_its_time_but_no_memory_sample(store) -> None:
+    reranker_mod._note_model_downloaded(_MODEL)  # noqa: SLF001
+    reranker_mod._record_rerank_cost(_MODEL, store, 100, 0.5, 5e6, pairs=1, longest=100)  # noqa: SLF001
+    assert not reranker_mod._ram_shapes.shape_groups(store, _MODEL)  # noqa: SLF001
+    assert reranker_mod._rerank_cost.state(store, _MODEL).sums.n == 1  # noqa: SLF001
+    with reranker_mod._cost_lock:  # noqa: SLF001
+        reranker_mod._downloaded_model_ids.clear()  # noqa: SLF001
+    reranker_mod._record_rerank_cost(_MODEL, store, 100, 0.5, 5e6, pairs=1, longest=100)  # noqa: SLF001
+    assert reranker_mod._ram_shapes.shape_groups(store, _MODEL)  # noqa: SLF001
+
+
+def test_where_no_ram_bound_applies_a_download_changes_nothing(store, monkeypatch) -> None:
+    monkeypatch.setattr(reranker_mod.peak_rss, "available", lambda: False)
+    reranker_mod._note_model_downloaded(_MODEL)  # noqa: SLF001
+    assert reranker_mod.ram_figure_ready(_MODEL, store) is True

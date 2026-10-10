@@ -2788,3 +2788,51 @@ def test_the_ram_bound_texts_state_the_s245_and_s247_rules() -> None:
     assert "seed_ram_fit" in flat(reranker_mod.fit_rerank_width)
     assert "S247" in flat(reranker_mod.RerankDeferred) and "S247" in flat(reranker_mod._batch_fits_ram_bound)  # noqa: SLF001
     assert "S247" in flat(reranker_mod._warm_up_once) and "bounded" in flat(reranker_mod._warm_up_once)  # noqa: SLF001
+
+
+# ---------------------------------------------------------------------------
+# S249: has fastembed's construction got the model file in the cache, or does it download it?
+# ---------------------------------------------------------------------------
+
+
+def _hf_cache(root, repo: str, files: list[str]) -> None:
+    folder = root / ("models--" + repo.replace("/", "--"))
+    (folder / "refs").mkdir(parents=True)
+    (folder / "refs" / "main").write_text("abc123")
+    for name in files:
+        path = folder / "snapshots" / "abc123" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x")
+
+
+def _production_fp16_id() -> str:
+    from brain.bridge.model_tier import MODEL_RERANKER, MODEL_RERANKER_FP16
+
+    reranker_mod._register_fp16_reranker_model(MODEL_RERANKER_FP16, MODEL_RERANKER)  # noqa: SLF001
+    return MODEL_RERANKER_FP16
+
+
+def test_the_cached_check_follows_the_registered_repo_and_file_not_the_model_id(tmp_path) -> None:
+    from brain.bridge.model_tier import MODEL_RERANKER
+
+    model_id = _production_fp16_id()
+    assert model_id != MODEL_RERANKER
+    assert reranker_mod._model_file_cached(model_id, tmp_path) is False, "an empty cache: construction downloads"  # noqa: SLF001
+    _hf_cache(tmp_path, MODEL_RERANKER, ["onnx/model.onnx"])
+    assert reranker_mod._model_file_cached(model_id, tmp_path) is False, "only the fp32 file is cached: the fp16 export is fetched"  # noqa: SLF001
+    assert reranker_mod._model_file_cached(MODEL_RERANKER, tmp_path) is True  # noqa: SLF001
+    (tmp_path / ("models--" + MODEL_RERANKER.replace("/", "--")) / "snapshots" / "abc123" / "onnx" / "model_fp16.onnx").write_text("x")
+    assert reranker_mod._model_file_cached(model_id, tmp_path) is True  # noqa: SLF001
+
+
+def test_the_cached_check_cannot_decide_for_an_unknown_model_or_on_an_error(tmp_path, monkeypatch, caplog) -> None:
+    assert reranker_mod._model_file_cached("nobody/unknown-reranker", tmp_path) is None  # noqa: SLF001
+    import huggingface_hub
+
+    def _boom(*args, **kwargs):
+        raise OSError("cache unreadable")
+
+    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache", _boom)
+    with caplog.at_level("WARNING"):
+        assert reranker_mod._model_file_cached(_production_fp16_id(), tmp_path) is None  # noqa: SLF001
+    assert any("already cached" in r.getMessage() for r in caplog.records)

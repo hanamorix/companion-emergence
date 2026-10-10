@@ -122,3 +122,19 @@ def test_a_live_session_with_both_off_is_silent(fake_fastembed, tmp_path, caplog
 def test_an_unreadable_session_never_raises(fake_fastembed, tmp_path) -> None:
     provider = _provider_with_session(RuntimeError("no session yet"), fake_fastembed, tmp_path)
     provider._check_session_options_once()  # noqa: SLF001 - must not raise
+
+
+# --- S249: the provider remembers that THIS process downloaded the model file ---
+
+
+@pytest.mark.parametrize(("cached", "downloaded"), [(False, True), (True, False), (None, False)])
+def test_the_provider_notes_a_download_only_when_the_file_was_not_cached(
+    fake_fastembed, tmp_path, monkeypatch, cached, downloaded
+) -> None:
+    seen: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        reranker_mod, "_model_file_cached", lambda model_id, cache_dir: seen.append((model_id, str(cache_dir))) or cached
+    )
+    reranker_mod.CrossEncoderProvider("some/model", tmp_path)
+    assert seen == [("some/model", str(tmp_path))], "decided BEFORE fastembed's construction could download"
+    assert ("some/model" in reranker_mod._downloaded_model_ids) is downloaded  # noqa: SLF001
