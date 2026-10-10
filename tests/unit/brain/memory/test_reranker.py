@@ -1497,7 +1497,7 @@ def test_h1_memory_high_is_read_at_every_level_and_an_unlimited_levels_counters_
 # ---- H2: the strict number parse (S239) ----
 
 _BAD_NUMBERS = [
-    "1e9", "1.5e9", "-5", "+5", "1_000", "nan", "inf", "", " 12 3", "١٢٣", "²", "9" * 400, "abc", "12 ",
+    "1e9", "1.5e9", "-5", "+5", "1_000", "nan", "inf", "", " 12 3", "\u0661\u0662\u0663", "\u00b2", "9" * 400, "abc", "12\u00a0",
 ]
 
 
@@ -1512,11 +1512,11 @@ def test_h2_an_own_usage_that_is_not_a_plain_integer_is_rejected_and_warned_once
     assert len(_warnings(caplog, "memory.current")) == 1
 
 
-@pytest.mark.parametrize("bad", ["1e9", "-5", "1.5", "nan", "inf", "9" * 400, "١٢٣"])
+@pytest.mark.parametrize("bad", ["1e9", "-5", "1.5", "nan", "inf", "9" * 400, "\u0661\u0662\u0663"])
 def test_h2_a_bad_own_usage_does_not_stop_a_good_ancestor_from_measuring_the_chain(
     monkeypatch: pytest.MonkeyPatch, bad: str
 ) -> None:
-    tree = _tree({_OWN: _lvl("max", bad, _ZERO), _PAR: _lvl(4_000_000_000, 3_200_000_000, _R400)})
+    tree = _tree({_OWN: _lvl(6_000_000_000, bad, _ZERO), _PAR: _lvl(4_000_000_000, 3_200_000_000, _R400)})
     _use_files(monkeypatch, tree)
     assert _v2() == 1_200_000_000.0
 
@@ -1622,6 +1622,40 @@ def test_h3_pinned_exposure_a_skipped_tighter_level_lets_a_looser_ancestor_bind(
     tree = _tree({_OWN: _lvl(1_000_000_000, "abc", _stat()), _PAR: _lvl(8_000_000_000, 3_000_000_000, _ZERO)})
     _use_files(monkeypatch, tree)
     assert _v2() == 5_000_000_000.0
+
+
+def test_h3_the_own_usage_is_read_only_when_a_level_needs_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    own_current = f"{_V2_ROOT}/{_OWN}/memory.current"
+    opened: list[str] = []
+    # own unlimited, the capped parent has its own usage: the own usage is never opened
+    tree = _tree({_OWN: _lvl("max", 1_000_000_000, _stat()), _PAR: _lvl(4_000_000_000, 3_000_000_000, _ZERO)})
+    _use_files(monkeypatch, tree, opened=opened)
+    assert _v2() == 1_000_000_000.0
+    assert own_current not in opened
+    # two capped ancestors without a usage of their own: the own usage stands in for both and is opened once
+    opened.clear()
+    tree = _tree(
+        {
+            _OWN: _lvl("max", 1_000_000_000, _ZERO),
+            _PAR: _lvl(4_000_000_000, None, _stat()),
+            _GRAND: _lvl(6_000_000_000, None, _stat()),
+        }
+    )
+    _use_files(monkeypatch, tree, opened=opened)
+    assert _v2() == 3_000_000_000.0  # 4.0 - (1.0 - 0) is the smaller; 6.0 - 1.0 = 5.0
+    assert opened.count(own_current) == 1
+
+
+def test_h3_different_files_and_kinds_warn_under_separate_keys(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    tree = _one_level(_stat(), limit="abc")
+    _hi(tree, _OWN, "def")
+    _use_files(monkeypatch, tree)
+    with caplog.at_level("DEBUG"):
+        assert _v2() is None
+        assert _v2() is None
+    assert len(_warnings(caplog, "memory.max")) == 1 and len(_warnings(caplog, "memory.high")) == 1
 
 
 def test_h3_a_garbled_own_usage_and_an_unreadable_ancestor_usage_warn_separately(
@@ -1796,29 +1830,32 @@ def test_h4_the_unbounded_sentinel_is_page_size_independent(
     assert (_v1() is not None) == is_limit
 
 
-def test_h4_a_level_reading_use_hierarchy_0_ends_the_walk(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Without hierarchical charging the parent's counters do not involve this cgroup."""
-    parent = _v1lvl(4_000_000_000, 3_900_000_000, _V1_ZERO)
+def test_h4_an_ancestor_reading_use_hierarchy_0_is_not_walked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """v1 charges a cgroup into its parent only while the PARENT has hierarchy accounting on: the parent's own flag
+    gates the parent, the child's flag (here "1", a decoy) does not."""
+    parent = _v1lvl(4_000_000_000, 3_900_000_000, _V1_ZERO, hier="0")
     # own unlimited: the parent's cap is not this cgroup's -> no limit seen
-    _use_files(monkeypatch, _v1_chain(_v1lvl(_SENTINEL, 1_000_000_000, _V1_ZERO, hier="0"), parent))
+    _use_files(monkeypatch, _v1_chain(_v1lvl(_SENTINEL, 1_000_000_000, _V1_ZERO, hier="1"), parent))
     assert _v1() is None
     # own capped, parent tighter but not charged: the own figure
-    _use_files(monkeypatch, _v1_chain(_v1lvl(6_000_000_000, 1_000_000_000, _V1_ZERO, hier="0"), parent))
+    _use_files(monkeypatch, _v1_chain(_v1lvl(6_000_000_000, 1_000_000_000, _V1_ZERO, hier="1"), parent))
     assert _v1() == 5_000_000_000.0
 
 
 @pytest.mark.parametrize("hier", ["1", None, "garbage", "unreadable"])
 def test_h4_any_other_use_hierarchy_keeps_walking(monkeypatch: pytest.MonkeyPatch, hier: str | None) -> None:
+    """The parent's flag is "1", absent, garbage or unreadable: it is walked; the child's flag "0" (a decoy) is ignored."""
     unreadable = hier == "unreadable"
-    own = _v1lvl(_SENTINEL, 1_000_000_000, _V1_ZERO, hier=None if unreadable else hier)
-    tree = _v1_chain(own, _v1lvl(4_000_000_000, 3_900_000_000, _V1_ZERO))
+    own = _v1lvl(_SENTINEL, 1_000_000_000, _V1_ZERO, hier="0")
+    parent = _v1lvl(4_000_000_000, 3_900_000_000, _V1_ZERO, hier=None if unreadable else hier)
+    tree = _v1_chain(own, parent)
     if unreadable:
-        tree[f"{_V1_ROOT}/{_OWN}/memory.use_hierarchy"] = "0\n"  # would end the walk, but it cannot be read
-    _use_files(monkeypatch, tree, raising=("memory.use_hierarchy",) if unreadable else ())
+        tree[f"{_V1_PAR}/memory.use_hierarchy"] = "0\n"  # would end the walk, but it cannot be read
+    _use_files(monkeypatch, tree, raising=(f"{_V1_PAR}/memory.use_hierarchy",) if unreadable else ())
     assert _v1() == 100_000_000.0
 
 
-def test_h4_use_hierarchy_is_read_once_per_walked_level_and_not_for_the_root(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_h4_use_hierarchy_is_read_once_per_ancestor_visited_including_the_root(monkeypatch: pytest.MonkeyPatch) -> None:
     opened: list[str] = []
     tree = _v1_chain(
         _v1lvl(_SENTINEL, 1, _V1_ZERO, hier="1"), _v1lvl(_SENTINEL, 1, _V1_ZERO, hier="1"), _v1lvl(None, 1, None, hier="1")
@@ -1826,15 +1863,15 @@ def test_h4_use_hierarchy_is_read_once_per_walked_level_and_not_for_the_root(mon
     _use_files(monkeypatch, tree, opened=opened)
     assert _v1() is None
     assert [p for p in opened if p.endswith("memory.use_hierarchy")] == [
-        f"{_V1_ROOT}/{_OWN}/memory.use_hierarchy",
         f"{_V1_PAR}/memory.use_hierarchy",
+        f"{_V1_ROOT}/memory.use_hierarchy",
     ]
 
 
-def test_h4_a_use_hierarchy_0_in_the_middle_of_the_chain_ends_the_walk_there(monkeypatch: pytest.MonkeyPatch) -> None:
-    own = _v1lvl(_SENTINEL, 1_000_000_000, _V1_ZERO, hier="1")
-    parent = _v1lvl(4_000_000_000, 3_000_000_000, _V1_ZERO, hier="0")  # the parent is not charged to the root
-    root = _v1lvl(1_100_000_000, 1_000_000_000, _V1_ZERO)
+def test_h4_a_use_hierarchy_0_at_the_root_ends_the_walk_there(monkeypatch: pytest.MonkeyPatch) -> None:
+    own = _v1lvl(_SENTINEL, 1_000_000_000, _V1_ZERO)
+    parent = _v1lvl(4_000_000_000, 3_000_000_000, _V1_ZERO, hier="1")
+    root = _v1lvl(1_100_000_000, 1_000_000_000, _V1_ZERO, hier="0")  # the parent is not charged into the root
     _use_files(monkeypatch, _v1_chain(own, parent, root))
     assert _v1() == 1_000_000_000.0  # the parent's cap counts; the root's (0.1 GB) does not
 

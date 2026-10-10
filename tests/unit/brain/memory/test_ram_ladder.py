@@ -107,12 +107,25 @@ def test_no_rung_repeats_a_shape(store) -> None:
     assert len(set(provider.timed)) == len(provider.timed)
 
 
-@pytest.mark.parametrize("headroom", [1.0, 0.0])
-def test_a_rung_runs_only_when_the_fit_says_it_fits_the_headroom(store, monkeypatch, headroom) -> None:
-    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: headroom)
+def test_a_rung_runs_only_when_the_fit_says_it_fits_the_headroom(store, monkeypatch) -> None:
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 1.0)
     provider = ScriptedLadderProvider(model=_MODEL)
     assert reranker_mod.measure_ram_figure(provider, store) is True
     assert provider.timed == [(1, 1024), (1, 512), (1, 256), (1, 128)], "phase 2 stopped at its first rung"
+
+
+def test_a_headroom_of_exactly_zero_stops_phase_two_at_its_first_rung_and_the_pass_still_completes(
+    store, monkeypatch
+) -> None:
+    """S239: a cgroup at its memory.high reads a headroom of 0.0. No batch rung is predicted to fit, so phase 2 ends
+    at once; a stop for the live headroom counts as complete (a larger one fits no better), so the marker IS recorded
+    and the window holds the single-pair shapes only."""
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 0.0)
+    provider = ScriptedLadderProvider(model=_MODEL)
+    assert reranker_mod.measure_ram_figure(provider, store) is True
+    assert provider.timed == [(1, 1024), (1, 512), (1, 256), (1, 128)]
+    rows = reranker_mod._ram_shapes.shape_groups(store, _MODEL)  # noqa: SLF001
+    assert [(n, t) for x, n, t in rows if x == ram_fit.COMPLETE_MARKER] == [(1, 0.0)]
 
 
 def test_phase_two_stops_at_the_first_rung_that_does_not_fit_the_headroom(store, monkeypatch) -> None:

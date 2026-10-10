@@ -1804,12 +1804,17 @@ def _cgroup_read_file(path: str, what: str) -> str | None:
     except FileNotFoundError:
         return None
     except Exception:  # noqa: BLE001 - fail-soft: a headroom probe must never break a recall
-        _warn_ram_figure_once(f"a cgroup {what} could not be read: that figure is not used", exc_info=True)
+        _warn_ram_figure_once(
+            f"a cgroup {what} could not be read: that figure is not used (the level is skipped or measured without it)",
+            exc_info=True,
+        )
         return None
 
 
 def _warn_cgroup_not_plain(what: str) -> None:
-    _warn_ram_figure_once(f"a cgroup {what} is not a plain integer: that figure is not used")
+    _warn_ram_figure_once(
+        f"a cgroup {what} is not a plain integer: that figure is not used (the level is skipped or measured without it)"
+    )
 
 
 def _cgroup_counter_bytes(path: str, what: str) -> float | None:
@@ -1857,11 +1862,11 @@ def _cgroup_v1_level_limit(level_dir: str) -> float | None:
 
 
 def _cgroup_chain_headroom(
-    dirs: list[str], limited: list[tuple[str, float]], usage_name: str, keys: tuple[str, ...]
+    own_dir: str, limited: list[tuple[str, float]], usage_name: str, keys: tuple[str, ...]
 ) -> float | None:
-    """The headroom of a chain of cgroup levels (`dirs`, the process's own level first), the
-    smallest over the levels that RESOLVE (S236, S238), for `limited` = the levels with a limit
-    as (directory, limit) pairs, deepest first. A level's headroom is
+    """The headroom of a chain of cgroup levels (the process's own level `own_dir` and its
+    ancestors), the smallest over the levels that RESOLVE (S236, S238), for `limited` = the levels
+    with a limit as (directory, limit) pairs, deepest first. A level's headroom is
     `max(0, limit - (usage - reclaimable))` with THAT level's own usage (`usage_name`, which
     counts all of its descendants, so the siblings of the process's cgroup too: S235) and its
     own `memory.stat` (`_cgroup_reclaimable_file_bytes`, capped at that usage); the level that
@@ -1872,18 +1877,26 @@ def _cgroup_chain_headroom(
     process's own level, with no usable own usage, and an ancestor with no stand-in available,
     do not resolve and are skipped (S238), so one unusable file never ends the read. The smallest
     headroom over the others is returned; `None` when no level resolved (the caller falls back).
-    The own usage is read once, before any `memory.stat`."""
-    own_dir = dirs[0]
-    own_usage = _cgroup_counter_bytes(f"{own_dir}/{usage_name}", usage_name)
+    The process's own usage is read only when a level needs it (its own level is limited, or an
+    ancestor needs the stand-in), once, and before any `memory.stat` of the level that uses it."""
+    own_usage: float | None = None
+    own_read = False
+
+    def own() -> float | None:
+        nonlocal own_usage, own_read
+        if not own_read:
+            own_usage, own_read = _cgroup_counter_bytes(f"{own_dir}/{usage_name}", usage_name), True
+        return own_usage
+
     headroom: float | None = None
     for level_dir, limit in limited:
         usage: float | None
         if level_dir == own_dir:
-            usage, stat_dir = own_usage, own_dir
+            usage, stat_dir = own(), own_dir
         else:
             usage, stat_dir = _cgroup_counter_bytes(f"{level_dir}/{usage_name}", usage_name), level_dir
             if usage is None:
-                usage, stat_dir = own_usage, own_dir  # the figure before S235 for this level
+                usage, stat_dir = own(), own_dir  # the figure before S235 for this level
         if usage is None:
             continue  # no usable usage for this level: it does not resolve
         reclaimable = min(_cgroup_reclaimable_file_bytes(f"{stat_dir}/memory.stat", keys), usage)
@@ -1934,7 +1947,7 @@ def _cgroup_v2_memory_headroom_bytes() -> float | None:
     limited = [(d, limit) for d in dirs if (limit := _cgroup_v2_level_limit(d)) is not None]
     if not limited:
         return None  # no usable numeric cap anywhere on the chain -> caller falls back
-    return _cgroup_chain_headroom(dirs, limited, "memory.current", _RECLAIM_KEYS_V2)
+    return _cgroup_chain_headroom(dirs[0], limited, "memory.current", _RECLAIM_KEYS_V2)
 
 
 def _read_proc_self_cgroup_v1_memory_path() -> str | None:
@@ -1964,14 +1977,17 @@ def _read_proc_self_cgroup_v1_memory_path() -> str | None:
 
 def _cgroup_v1_walk_dirs(dirs: list[str]) -> list[str]:
     """The levels of a cgroup v1 chain (`dirs`, the process's own level first) that the kernel
-    charges this cgroup to (S237). v1 charges a cgroup to its parent only when hierarchy
-    accounting is on, which a cgroup's `memory.use_hierarchy` shows ("1", inherited from its
-    parent when it was created); a level reading "0" ends the walk, because its parent's usage
-    and limit do not involve this cgroup. An absent, unreadable or any other value keeps
-    walking (the safe side: more bounds). One read per walked level, none for the root."""
+    charges this cgroup to (S237). v1 charges a cgroup into its parent's counters only when the
+    PARENT has hierarchy accounting on, which the parent's own `memory.use_hierarchy` shows ("1";
+    a cgroup keeps it fixed while it has children). So an ancestor is walked only while its own
+    `memory.use_hierarchy` does not read "0": at a "0" the walk ends there, because that level's
+    usage and limit do not involve this cgroup (nor do those of anything above it). An absent,
+    unreadable or any other value keeps walking (the safe side: more bounds). One read per
+    ancestor level visited, the root included. (From the kernel's memory-controller rules; this
+    VM is cgroup v2 only, so it is tested with synthetic trees.)"""
     walked = [dirs[0]]
-    for child, parent in zip(dirs, dirs[1:], strict=False):
-        raw = _cgroup_read_file(f"{child}/memory.use_hierarchy", "memory.use_hierarchy")
+    for parent in dirs[1:]:
+        raw = _cgroup_read_file(f"{parent}/memory.use_hierarchy", "memory.use_hierarchy")
         if raw is not None and raw.strip() == "0":
             break
         walked.append(parent)
@@ -1993,9 +2009,9 @@ def _cgroup_v1_memory_headroom_bytes() -> float | None:
 
     In cgroup v1 a cgroup's `memory.limit_in_bytes` is its own setting: the kernel enforces each
     ancestor's limit separately against that ancestor's usage, which includes this cgroup and its
-    siblings, so each ancestor is read with its own counters, and the walk stops where a level's
-    `memory.use_hierarchy` reads "0" (`_cgroup_v1_walk_dirs`: no hierarchical charging, so the
-    parent's counters do not involve this cgroup).
+    siblings, so each ancestor is read with its own counters, and the walk stops at an ancestor
+    whose own `memory.use_hierarchy` reads "0" (`_cgroup_v1_walk_dirs`: no hierarchical charging,
+    so its counters do not involve this cgroup).
 
     An unbounded v1 limit reads back as the kernel's own huge sentinel value (there is no
     explicit "unbounded" marker like v2's `"max"`); a level at or above
@@ -2014,7 +2030,7 @@ def _cgroup_v1_memory_headroom_bytes() -> float | None:
     limited = [(d, limit) for d in dirs if (limit := _cgroup_v1_level_limit(d)) is not None]
     if not limited:
         return None
-    return _cgroup_chain_headroom(dirs, limited, "memory.usage_in_bytes", _RECLAIM_KEYS_V1)
+    return _cgroup_chain_headroom(dirs[0], limited, "memory.usage_in_bytes", _RECLAIM_KEYS_V1)
 
 
 def _psutil_available_bytes() -> float | None:

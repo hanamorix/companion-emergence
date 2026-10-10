@@ -173,19 +173,20 @@ def _downgrade_for_oom_safety(tune_grade: str, effective_headroom_bytes: float |
     unchanged (no duplicate cgroup read: that helper already walks
     `/proc/self/cgroup` to resolve the CALLING PROCESS's own cgroup chain, v2
     then v1, and takes the tightest headroom along it, falling back to psutil's
-    host-wide available figure only when no cgroup level could be measured) — and downgrades to the largest grade whose FOOTPRINT
-    actually fits, so a cgroup-capped box (host-total RAM looks capable,
-    but the container is capped far below it) never selects a tier that
-    would OOM. Knob-refit's footprint is tiny by construction and always
-    fits, so it is the floor this can never downgrade past.
+    host-wide available figure only when no cgroup level could be measured) — and
+    downgrades to the largest grade whose FOOTPRINT actually fits, so a
+    cgroup-capped box (host-total RAM looks capable, but the container is
+    capped far below it) never selects a tier that would OOM. Knob-refit's
+    footprint is tiny by construction and always fits, so it is the floor
+    this can never downgrade past.
 
     `effective_headroom_bytes is None` (every headroom source unavailable —
     the same fail-soft contract `_available_ram_headroom_bytes` documents:
     no cgroup level could be measured and psutil could not read the host's
-    free memory either) means there is no
-    signal to downgrade BY, but also no signal to trust the RAM-tier pick
-    WITH — this fails toward the safe floor too, the same posture
-    `_select_tune_grade_by_ram`'s own `None` branch takes, rather than
+    free memory either) means there is no signal to downgrade BY, but also
+    no signal to trust the RAM-tier pick WITH — this fails toward the safe
+    floor too, the same posture `_select_tune_grade_by_ram`'s own `None`
+    branch takes, rather than
     treating "unknown" as "unlimited" (exactly the fp16-width OOM
     `_available_ram_headroom_bytes` itself was fixed to prevent).
     """
