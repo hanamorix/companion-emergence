@@ -490,6 +490,21 @@ def test_a_rung_arms_before_the_call_and_unarms_on_every_exit(tmp_path, error) -
     assert cli_throttle._start_hooks == [], "the hook is unregistered"  # noqa: SLF001
 
 
+def test_a_watch_whose_registration_fails_leaves_nothing_armed(tmp_path) -> None:
+    class _BadWatch:
+        def __call__(self) -> bool:
+            return True
+
+        def on_reply_start(self, callback):
+            raise RuntimeError("cannot register")
+
+    store, provider = MemoryStore(tmp_path / "memories.db"), _CountingProvider(model=_MODEL)
+    with pytest.raises(RuntimeError, match="cannot register"):
+        _rung(provider, store, _BadWatch())
+    assert (provider.armed, provider.disarmed) == (1, 1)
+    store.close()
+
+
 def test_a_terminated_call_is_an_abandon_and_records_nothing(tmp_path) -> None:
     store, provider = MemoryStore(tmp_path / "memories.db"), _CountingProvider(model=_MODEL)
     provider.raise_in_timed = RerankTerminated("stopped")
