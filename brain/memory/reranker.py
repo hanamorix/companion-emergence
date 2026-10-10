@@ -1663,11 +1663,15 @@ def _warm_up_once(provider: RerankerProvider, query: str, documents: Sequence[st
 
 _CGROUP_V2_ROOT = "/sys/fs/cgroup"
 
+_CGROUP_V1_ROOT = "/sys/fs/cgroup/memory"
+
 # The kernel's own "no limit" sentinel for cgroup v1's memory.limit_in_bytes
-# (there is no explicit "unbounded" marker like v2's "max" string) — derived
-# from PAGE_COUNTER_MAX on a 4KiB-page 64-bit kernel. A limit at or above
-# this value is unbounded, never a real cap.
-_CGROUP_V1_UNBOUNDED_SENTINEL = 0x7FFFFFFFFFFFF000
+# (there is no explicit "unbounded" marker like v2's "max"): LONG_MAX rounded down
+# to a page boundary, so 0x7FFFFFFFFFFFF000 on 4 KiB pages, 0x7FFFFFFFFFFFC000 on
+# 16 KiB and 0x7FFFFFFFFFFF0000 on 64 KiB. The constant is the 64 KiB value, so a
+# limit at or above it is unbounded on every page size (S237 review F6); no real
+# cap comes near it. Never a real cap.
+_CGROUP_V1_UNBOUNDED_SENTINEL = 0x7FFFFFFFFFFF0000
 
 
 def _read_proc_self_cgroup_v2_path() -> str | None:
@@ -1695,18 +1699,16 @@ def _read_proc_self_cgroup_v2_path() -> str | None:
         return None
 
 
-def _cgroup_v2_ancestor_dirs(cgroup_path: str) -> list[str]:
-    """Every cgroup v2 directory from the process's own cgroup UP TO the
-    root, deepest first. Used to find the EFFECTIVE memory limit: a
-    cgroup's own `memory.max` may read "max" (unbounded) while an
-    ANCESTOR still caps it, so the effective limit is the MIN of every
-    numeric `memory.max` along this chain, not just the process's own
-    level."""
-    segments = [s for s in cgroup_path.split("/") if s]
+def _cgroup_ancestor_dirs(root: str, cgroup_path: str) -> list[str]:
+    """Every cgroup directory from the process's own cgroup UP TO `root` (the v2 mount or the
+    v1 memory-controller mount), deepest first. Used to find the EFFECTIVE memory limit: a
+    cgroup's own limit may read unbounded while an ANCESTOR still caps it, so the effective
+    limit is the tightest one along this chain, not just the process's own level."""
+    segments = [seg for seg in cgroup_path.split("/") if seg]
     dirs = []
     for depth in range(len(segments), -1, -1):
         sub = "/".join(segments[:depth])
-        dirs.append(f"{_CGROUP_V2_ROOT}/{sub}" if sub else _CGROUP_V2_ROOT)
+        dirs.append(f"{root}/{sub}" if sub else root)
     return dirs
 
 
@@ -1760,11 +1762,10 @@ def _cgroup_reclaimable_file_bytes(stat_path: str, keys: tuple[str, ...]) -> flo
         parts = line.split()
         if not parts or parts[0] not in keys or parts[0] in values:
             continue
-        if len(parts) >= 2 and parts[1].isascii() and parts[1].isdigit():
-            value = float(parts[1])  # a 309-digit value parses to inf: rejected below
-            if math.isfinite(value):
-                values[parts[0]] = value
-                continue
+        value = _cgroup_plain_bytes(parts[1]) if len(parts) >= 2 else None
+        if value is not None:
+            values[parts[0]] = value
+            continue
         _warn_ram_figure_once(
             "a cgroup memory.stat page-cache value is not a plain integer: "
             "reclaimable file cache is not subtracted from the headroom"
@@ -1780,30 +1781,115 @@ def _cgroup_reclaimable_file_bytes(stat_path: str, keys: tuple[str, ...]) -> flo
     return max(0.0, cache - mapped - dirty - writeback - shmem)
 
 
-def _cgroup_level_usage_bytes(path: str) -> float | None:
-    """The `memory.current` of an ANCESTOR cgroup level (S235), in bytes, or `None` when it
-    cannot be used: the file is absent (silent) or unreadable, or the value is not a plain
-    non-negative integer (both warned once per process). The caller then falls back to the
-    process's own level for that level, never to a fabricated number."""
+def _cgroup_plain_bytes(raw: str) -> float | None:
+    """The one strict parse of a cgroup number (S239): ASCII digits only, finite. A sign, a
+    decimal point, an exponent, an underscore, a non-ASCII digit, nan, inf, an empty string, text
+    inside the digits and a value so long it overflows to inf (309+ digits) are all rejected
+    (`None`); only surrounding blanks and the trailing newline are ignored."""
+    text = raw.strip(" \t\r\n")
+    if text.isascii() and text.isdigit():
+        value = float(text)  # a 309-digit value parses to inf: rejected below
+        if math.isfinite(value):
+            return value
+    return None
+
+
+def _cgroup_read_file(path: str, what: str) -> str | None:
+    """The text of one cgroup file, or `None` when it cannot be read: absent (silent: the level
+    exposes no such file) or unreadable (warned once per process and file name, with the
+    traceback). `what` is the file's base name."""
     try:
         with open(path, encoding="utf-8") as f:
-            raw = f.read().strip()
+            return f.read()
     except FileNotFoundError:
         return None
     except Exception:  # noqa: BLE001 - fail-soft: a headroom probe must never break a recall
-        _warn_ram_figure_once(
-            "an ancestor cgroup's memory.current could not be read: the process's own usage stands in for that level",
-            exc_info=True,
-        )
+        _warn_ram_figure_once(f"a cgroup {what} could not be read: that figure is not used", exc_info=True)
         return None
-    if raw.isascii() and raw.isdigit():
-        value = float(raw)
-        if math.isfinite(value):
-            return value
-    _warn_ram_figure_once(
-        "an ancestor cgroup's memory.current is not a plain integer: the process's own usage stands in for that level"
-    )
-    return None
+
+
+def _warn_cgroup_not_plain(what: str) -> None:
+    _warn_ram_figure_once(f"a cgroup {what} is not a plain integer: that figure is not used")
+
+
+def _cgroup_counter_bytes(path: str, what: str) -> float | None:
+    """A one-number cgroup counter (`memory.current`, `memory.usage_in_bytes`) in bytes, or
+    `None` when it cannot be used: absent (silent), unreadable or not a plain non-negative
+    integer (`_cgroup_plain_bytes`; both warned once per process and kind). The caller then skips
+    the level or stands in with the process's own figure, never a fabricated number."""
+    raw = _cgroup_read_file(path, what)
+    if raw is None:
+        return None
+    value = _cgroup_plain_bytes(raw)
+    if value is None:
+        _warn_cgroup_not_plain(what)
+    return value
+
+
+def _cgroup_v2_level_limit(level_dir: str) -> float | None:
+    """The limit a cgroup v2 level imposes on its processes and descendants (S239): the lower of
+    its numeric `memory.max` and `memory.high` (the kernel throttles a cgroup that runs past
+    `memory.high`, so running past it is as unwelcome as running past `memory.max`). "max", an
+    absent file, an unreadable file (warned once) and a value that is not a plain integer
+    (warned once) each contribute nothing, so a level with no usable limit imposes none. `None`
+    when neither file gives a limit."""
+    limits = []
+    for name in ("memory.max", "memory.high"):
+        raw = _cgroup_read_file(f"{level_dir}/{name}", name)
+        if raw is None or raw.strip() == "max":
+            continue
+        value = _cgroup_plain_bytes(raw)
+        if value is None:
+            _warn_cgroup_not_plain(name)
+            continue
+        limits.append(value)
+    return min(limits) if limits else None
+
+
+def _cgroup_v1_level_limit(level_dir: str) -> float | None:
+    """The limit a cgroup v1 level imposes (`memory.limit_in_bytes`), or `None` when it has none:
+    the file is absent, unreadable or not a plain integer (the last two warned once), or the
+    value is at or above the kernel's unbounded sentinel (`_CGROUP_V1_UNBOUNDED_SENTINEL`)."""
+    value = _cgroup_counter_bytes(f"{level_dir}/memory.limit_in_bytes", "memory.limit_in_bytes")
+    if value is None or value >= _CGROUP_V1_UNBOUNDED_SENTINEL:
+        return None
+    return value
+
+
+def _cgroup_chain_headroom(
+    dirs: list[str], limited: list[tuple[str, float]], usage_name: str, keys: tuple[str, ...]
+) -> float | None:
+    """The headroom of a chain of cgroup levels (`dirs`, the process's own level first), the
+    smallest over the levels that RESOLVE (S236, S238), for `limited` = the levels with a limit
+    as (directory, limit) pairs, deepest first. A level's headroom is
+    `max(0, limit - (usage - reclaimable))` with THAT level's own usage (`usage_name`, which
+    counts all of its descendants, so the siblings of the process's cgroup too: S235) and its
+    own `memory.stat` (`_cgroup_reclaimable_file_bytes`, capped at that usage); the level that
+    would run out first binds, which is not always the one with the smallest limit.
+
+    A level resolves when its usage can be used. An ancestor whose usage cannot be used stands in
+    with the process's own usage and its own reclaimable figure (the figure before S235); the
+    process's own level, with no usable own usage, and an ancestor with no stand-in available,
+    do not resolve and are skipped (S238), so one unusable file never ends the read. The smallest
+    headroom over the others is returned; `None` when no level resolved (the caller falls back).
+    The own usage is read once, before any `memory.stat`."""
+    own_dir = dirs[0]
+    own_usage = _cgroup_counter_bytes(f"{own_dir}/{usage_name}", usage_name)
+    headroom: float | None = None
+    for level_dir, limit in limited:
+        usage: float | None
+        if level_dir == own_dir:
+            usage, stat_dir = own_usage, own_dir
+        else:
+            usage, stat_dir = _cgroup_counter_bytes(f"{level_dir}/{usage_name}", usage_name), level_dir
+            if usage is None:
+                usage, stat_dir = own_usage, own_dir  # the figure before S235 for this level
+        if usage is None:
+            continue  # no usable usage for this level: it does not resolve
+        reclaimable = min(_cgroup_reclaimable_file_bytes(f"{stat_dir}/memory.stat", keys), usage)
+        level_headroom = max(0.0, limit - (usage - reclaimable))
+        headroom = level_headroom if headroom is None else min(headroom, level_headroom)
+    return headroom
 
 
 def _cgroup_v2_memory_headroom_bytes() -> float | None:
@@ -1812,92 +1898,43 @@ def _cgroup_v2_memory_headroom_bytes() -> float | None:
     `memory.max`/`memory.current` of its own, so a root-only read can never see a real
     per-process cap).
 
-    The kernel enforces EVERY level's `memory.max` on the chain from the process's own cgroup
-    up to the root, against that level's own usage, which counts all of its descendants (the
-    siblings of the process's cgroup too). So the headroom is computed per limited level,
-    `max(0, memory.max - (memory.current - reclaimable))` with that level's own `memory.current`
-    and `memory.stat` (S235), and the result is the MINIMUM over the limited levels: the level
-    that would run out first binds, which is not always the one with the smallest limit (an
-    ancestor with a larger limit whose siblings have filled it binds first). Levels reading
-    "max" or exposing no `memory.max` impose nothing and are not read further. `reclaimable` is
-    the file cache the kernel can give back (`_cgroup_reclaimable_file_bytes`, S233: `file -
-    file_mapped - file_dirty - file_writeback - shmem`, capped at that level's usage); mapped
-    model pages, dirty and writeback pages and tmpfs stay counted, and so does slab. A level
-    whose `memory.stat` cannot be used subtracts nothing for that level.
+    The kernel enforces EVERY level's limit on the chain from the process's own cgroup up to the
+    root, against that level's own usage, which counts all of its descendants (the siblings of
+    the process's cgroup too). A level's limit is the lower of its numeric `memory.max` and
+    `memory.high` (S239, `_cgroup_v2_level_limit`). So the headroom is computed per limited
+    level, `max(0, limit - (memory.current - reclaimable))` with that level's own
+    `memory.current` and `memory.stat` (S235), and the result is the MINIMUM over the levels
+    (`_cgroup_chain_headroom`): the level that would run out first binds, which is not always
+    the one with the smallest limit (an ancestor with a larger limit whose siblings have filled
+    it binds first). Levels with no numeric limit impose nothing and are not read further.
+    `reclaimable` is the file cache the kernel can give back (`_cgroup_reclaimable_file_bytes`,
+    S233: `file - file_mapped - file_dirty - file_writeback - shmem`, capped at that level's
+    usage); mapped model pages, dirty and writeback pages and tmpfs stay counted, and so does
+    slab. A level whose `memory.stat` cannot be used subtracts nothing for that level.
 
     An ancestor level whose `memory.current` cannot be used stands in with the process's own
-    level's usage and reclaimable (the figure before S235). A process whose own cgroup exposes
-    no `memory.current` at all (no controller at that level) is measured by its limited
-    ancestors' counters.
+    level's usage and reclaimable (the figure before S235). A level whose usage cannot be used
+    and has no stand-in (the process's own level, or an ancestor when the own usage is unusable
+    too) is skipped, and the result is the minimum over the levels that did resolve (S238): one
+    unreadable or garbled file never turns the read into "no bound". Numbers are plain
+    non-negative integers only (`_cgroup_plain_bytes`, S239: no sign, decimal point or
+    exponent).
 
     Returns `None` (never a fabricated headroom) when: not Linux, `/proc/self/cgroup` is
-    missing/unparsable, every `memory.max` on the chain is "max"/absent (no cap anywhere -> no
-    need to even read usage), the process's own `memory.current` is unreadable/unparsable, the
-    own level is itself limited but has no `memory.current`, no usage can be found for a limited
-    level, or any other read/parse error (logged, then degrades to `None`): every `None` case
-    means "caller falls back to the next source", never "unlimited"."""
+    missing/unparsable, no level on the chain has a usable numeric limit (no cap anywhere ->
+    no need to even read usage), or no limited level resolved. `None` means "the caller falls
+    back to the next source" (cgroup v1, then psutil's host-wide available figure), never
+    "unlimited"."""
     if sys.platform != "linux":
         return None
-
     cgroup_path = _read_proc_self_cgroup_v2_path()
     if cgroup_path is None:
         return None
-    dirs = _cgroup_v2_ancestor_dirs(cgroup_path)
-
-    limited: list[tuple[str, float]] = []  # (directory, numeric memory.max), deepest first
-    for cgroup_dir in dirs:
-        try:
-            with open(f"{cgroup_dir}/memory.max", encoding="utf-8") as f:
-                max_raw = f.read().strip()
-        except FileNotFoundError:
-            continue  # this level exposes no memory controller -> no cap here, keep walking
-        except Exception:  # noqa: BLE001 — fail-soft
-            log.exception("reranker: cgroup v2 memory.max read failed")
-            return None
-
-        if max_raw == "max":
-            continue  # explicitly unbounded at this level -> keep walking up
-
-        try:
-            level_limit = float(max_raw)
-        except Exception:  # noqa: BLE001 — fail-soft
-            log.exception("reranker: cgroup v2 memory.max parse failed")
-            return None
-        limited.append((cgroup_dir, level_limit))
-
+    dirs = _cgroup_ancestor_dirs(_CGROUP_V2_ROOT, cgroup_path)
+    limited = [(d, limit) for d in dirs if (limit := _cgroup_v2_level_limit(d)) is not None]
     if not limited:
-        return None  # no numeric cap anywhere on the chain -> caller falls back
-
-    own_usage: float | None
-    try:
-        with open(f"{dirs[0]}/memory.current", encoding="utf-8") as f:
-            own_usage = float(f.read().strip())
-    except FileNotFoundError:
-        own_usage = None  # the process's own cgroup exposes no memory controller
-    except Exception:  # noqa: BLE001 — fail-soft
-        log.exception("reranker: cgroup v2 memory.current read/parse failed")
-        return None
-
-    headroom: float | None = None
-    for level_dir, level_limit in limited:
-        if level_dir == dirs[0]:
-            if own_usage is None:
-                return None  # the own level is capped yet reports no usage: no figure
-            usage: float = own_usage
-            reclaimable = min(_cgroup_reclaimable_file_bytes(f"{level_dir}/memory.stat", _RECLAIM_KEYS_V2), usage)
-        else:
-            ancestor_usage = _cgroup_level_usage_bytes(f"{level_dir}/memory.current")
-            if ancestor_usage is not None:
-                usage = ancestor_usage
-                reclaimable = min(_cgroup_reclaimable_file_bytes(f"{level_dir}/memory.stat", _RECLAIM_KEYS_V2), usage)
-            elif own_usage is not None:
-                usage = own_usage  # the figure before S235 for this level
-                reclaimable = min(_cgroup_reclaimable_file_bytes(f"{dirs[0]}/memory.stat", _RECLAIM_KEYS_V2), usage)
-            else:
-                return None  # no usage anywhere for a capped level: no figure
-        level_headroom = max(0.0, level_limit - (usage - reclaimable))
-        headroom = level_headroom if headroom is None else min(headroom, level_headroom)
-    return headroom
+        return None  # no usable numeric cap anywhere on the chain -> caller falls back
+    return _cgroup_chain_headroom(dirs, limited, "memory.current", _RECLAIM_KEYS_V2)
 
 
 def _read_proc_self_cgroup_v1_memory_path() -> str | None:
@@ -1925,57 +1962,59 @@ def _read_proc_self_cgroup_v1_memory_path() -> str | None:
         return None
 
 
+def _cgroup_v1_walk_dirs(dirs: list[str]) -> list[str]:
+    """The levels of a cgroup v1 chain (`dirs`, the process's own level first) that the kernel
+    charges this cgroup to (S237). v1 charges a cgroup to its parent only when hierarchy
+    accounting is on, which a cgroup's `memory.use_hierarchy` shows ("1", inherited from its
+    parent when it was created); a level reading "0" ends the walk, because its parent's usage
+    and limit do not involve this cgroup. An absent, unreadable or any other value keeps
+    walking (the safe side: more bounds). One read per walked level, none for the root."""
+    walked = [dirs[0]]
+    for child, parent in zip(dirs, dirs[1:], strict=False):
+        raw = _cgroup_read_file(f"{child}/memory.use_hierarchy", "memory.use_hierarchy")
+        if raw is not None and raw.strip() == "0":
+            break
+        walked.append(parent)
+    return walked
+
+
 def _cgroup_v1_memory_headroom_bytes() -> float | None:
     """cgroup v1 fallback for `_cgroup_v2_memory_headroom_bytes` (older kernels/distros without
-    the unified v2 hierarchy): `memory.limit_in_bytes - (memory.usage_in_bytes - reclaimable
-    file cache)` (S233: `total_cache - total_mapped_file - total_dirty - total_writeback -
-    total_shmem` from the same cgroup's `memory.stat`, via `_cgroup_reclaimable_file_bytes`, so
-    clean unmapped cache such as read model files does not read as used; mapped pages, dirty
-    and writeback pages and tmpfs stay counted), read from the CALLING PROCESS's own cgroup
-    path, resolved via `/proc/self/cgroup`'s `memory` controller line
-    (`_read_proc_self_cgroup_v1_memory_path`) rather than the fixed `/sys/fs/cgroup/memory/`
-    root.
+    the unified v2 hierarchy), computed the same way (S237): for every level of the chain from
+    the process's own cgroup up to the memory-controller root, `memory.limit_in_bytes -
+    (memory.usage_in_bytes - reclaimable file cache)` with that level's own usage and
+    `memory.stat`, and the result is the MINIMUM over the levels that resolve
+    (`_cgroup_chain_headroom`). The reclaimable cache is S233's `total_cache - total_mapped_file
+    - total_dirty - total_writeback - total_shmem` (`_cgroup_reclaimable_file_bytes`, the
+    hierarchical `total_` keys), so clean unmapped cache such as read model files does not read
+    as used; mapped pages, dirty and writeback pages and tmpfs stay counted. The chain is read
+    from the CALLING PROCESS's own cgroup path, resolved via `/proc/self/cgroup`'s `memory`
+    controller line (`_read_proc_self_cgroup_v1_memory_path`) rather than the fixed root.
 
-    Only the process's OWN cgroup is read. In cgroup v1 a cgroup's `memory.limit_in_bytes` is
-    its own setting: the kernel enforces each ancestor's limit separately against that
-    ancestor's usage, so an ancestor's cap, and the usage of the process's siblings under it,
-    are NOT visible here (a child's own limit does not reflect an ancestor's, unlike the
-    walk-up `_cgroup_v2_memory_headroom_bytes` does). A cap that only an ancestor holds reads
-    as unbounded -> `None`, and a tighter ancestor cap is not seen.
+    In cgroup v1 a cgroup's `memory.limit_in_bytes` is its own setting: the kernel enforces each
+    ancestor's limit separately against that ancestor's usage, which includes this cgroup and its
+    siblings, so each ancestor is read with its own counters, and the walk stops where a level's
+    `memory.use_hierarchy` reads "0" (`_cgroup_v1_walk_dirs`: no hierarchical charging, so the
+    parent's counters do not involve this cgroup).
 
     An unbounded v1 limit reads back as the kernel's own huge sentinel value (there is no
-    explicit "unbounded" marker like v2's `"max"`); a limit at or above
-    `_CGROUP_V1_UNBOUNDED_SENTINEL` is treated as unbounded -> `None`, the same "caller falls
-    back" signal as every other case here. Same fail-soft posture as the v2 reader: `None` on
-    no v1 controller, unreadable, or unparsable — never a fabricated headroom."""
+    explicit "unbounded" marker like v2's `"max"`); a level at or above
+    `_CGROUP_V1_UNBOUNDED_SENTINEL` has no limit and is not read further. Unusable files are
+    handled as in the v2 reader (a level without usable usage is skipped or stood in for, S238).
+    `None` on no v1 controller, no limit anywhere on the walked chain, or no limited level
+    resolved - the same "caller falls back" signal as every other case here, never a fabricated
+    headroom."""
     if sys.platform != "linux":
         return None
 
     cgroup_path = _read_proc_self_cgroup_v1_memory_path()
     if cgroup_path is None:
         return None
-    cgroup_dir = f"/sys/fs/cgroup/memory/{cgroup_path}" if cgroup_path else "/sys/fs/cgroup/memory"
-
-    try:
-        with open(f"{cgroup_dir}/memory.limit_in_bytes", encoding="utf-8") as f:
-            limit = float(f.read().strip())
-    except FileNotFoundError:
-        return None  # no v1 memory controller for this process's cgroup
-    except Exception:  # noqa: BLE001 — fail-soft
-        log.exception("reranker: cgroup v1 memory.limit_in_bytes read failed")
+    dirs = _cgroup_v1_walk_dirs(_cgroup_ancestor_dirs(_CGROUP_V1_ROOT, cgroup_path))
+    limited = [(d, limit) for d in dirs if (limit := _cgroup_v1_level_limit(d)) is not None]
+    if not limited:
         return None
-
-    if limit >= _CGROUP_V1_UNBOUNDED_SENTINEL:
-        return None  # kernel's "no limit" sentinel -> caller falls back, never treated as unlimited
-
-    try:
-        with open(f"{cgroup_dir}/memory.usage_in_bytes", encoding="utf-8") as f:
-            usage = float(f.read().strip())
-    except Exception:  # noqa: BLE001 — fail-soft
-        log.exception("reranker: cgroup v1 memory.usage_in_bytes read failed")
-        return None
-    reclaimable = min(_cgroup_reclaimable_file_bytes(f"{cgroup_dir}/memory.stat", _RECLAIM_KEYS_V1), usage)
-    return max(0.0, limit - (usage - reclaimable))
+    return _cgroup_chain_headroom(dirs, limited, "memory.usage_in_bytes", _RECLAIM_KEYS_V1)
 
 
 def _psutil_available_bytes() -> float | None:
@@ -2009,9 +2048,10 @@ def _available_ram_headroom_bytes() -> float | None:
     that no process has mapped is given back by the kernel under pressure, so it does not read
     as used (`file - file_mapped - file_dirty - file_writeback - shmem` of `memory.stat`; v1
     `total_` forms); mapped model pages, dirty and writeback pages and tmpfs stay counted. The
-    v2 figure is the minimum over every limited level of the chain, each against its own usage
-    (S235). It is not the host-wide `available` figure the psutil fallback gives, which also
-    credits mapped pages and slab.
+    cgroup figure (v2 and v1 alike) is the minimum over the limited levels of the chain that
+    could be measured, each against its own usage (S235, S237, S238); a level's limit is the
+    lower of `memory.max` and `memory.high` on v2 (S239). It is not the host-wide `available`
+    figure the psutil fallback gives, which also credits mapped pages and slab.
 
     cgroup-limit-aware, per the pre-flip revision's Change-3 requirement:
     Testing's own OOM reproduction ran under an explicit cgroup cap that
@@ -2019,11 +2059,13 @@ def _available_ram_headroom_bytes() -> float | None:
     read would fail to prevent the exact OOM this change fixes. Tries cgroup
     v2 first, then v1 (both Linux only), then falls back to the host-wide
     free memory read through `psutil` (S211: the same call on Linux, macOS
-    and Windows) only when no cgroup limit applies (or it's explicitly
-    unbounded). Returns `None` — never a fabricated number —
-    when every source is unavailable/unsupported/errors; the width fit
-    treats `None` as "skip the memory term", never as "unlimited
-    headroom". Also imported by `judge_selftune.py`."""
+    and Windows) only when no cgroup level could be measured: no limit applies
+    (or it is explicitly unbounded), or every limited level was unusable (S238: one
+    unreadable level never discards a bound another level still gives). The one
+    remaining `None` — never a fabricated number — is when psutil cannot read the host
+    figure either; the width fit treats `None` as "skip the memory term" and the judge
+    tier guard floors to the safe tier, never as "unlimited headroom". Also imported by
+    `judge_selftune.py`."""
     headroom = _cgroup_v2_memory_headroom_bytes()
     if headroom is None:
         headroom = _cgroup_v1_memory_headroom_bytes()
