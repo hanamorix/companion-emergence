@@ -908,8 +908,11 @@ def test_chat_with_tools_keeps_existing_flags(persona_dir: Path) -> None:
     cmd = captured["cmd"]
     assert cmd[0] == "claude"
     assert "-p" in cmd
-    assert "--output-format" in cmd
-    assert "json" in cmd
+    # #330: the tools path now runs stream-json so built-in tool calls are auditable.
+    assert cmd[cmd.index("--output-format") + 1 : cmd.index("--output-format") + 3] == [
+        "stream-json",
+        "--verbose",
+    ]
     assert "--model" in cmd
     assert "--system-prompt-file" in cmd
     assert "--system-prompt" not in cmd  # on-argv form is the bug
