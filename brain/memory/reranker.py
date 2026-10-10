@@ -210,7 +210,7 @@ class RerankerProvider(ABC):
 
         `seconds` is the wall time of the scoring call, read from the module
         clock seam `_clock`; the third value is the call's PEAK resident-memory growth
-        in bytes (S220, S222: `peak_rss`; `None` when it cannot be read, e.g. off Linux).
+        in bytes (S220, S222: `peak_rss`; `None` when it cannot be read).
         With the ONNX memory pool off the call returns its memory, so the RSS difference
         would read about 0. Only RECALL paths call
         this (passive recall and `search_memories`, via
@@ -222,7 +222,11 @@ class RerankerProvider(ABC):
         inflates the measured time."""
         before = peak_rss.begin()
         start = _clock()
-        scores = list(self.rerank(query, documents))
+        try:
+            scores = list(self.rerank(query, documents))
+        except BaseException:
+            peak_rss.cancel()  # S248: stop the RSS sampler of a call that raised
+            raise
         seconds = _clock() - start
         return scores, seconds, peak_rss.growth_since(before)
 
@@ -282,6 +286,8 @@ class CrossEncoderProvider(RerankerProvider):
         from fastembed.rerank.cross_encoder.text_cross_encoder import TextCrossEncoder
 
         self._model_id = model_id
+        # S249: construction downloads the model file when it is not cached; remember that this process did.
+        cached = _model_file_cached(model_id, cache_dir)
         # S222: the ONNX CPU memory pool and the memory-pattern planner are OFF, so the
         # memory a call needed goes back after the call (the per-call growth is then what
         # `ram_fit` models). fastembed exposes only the pool option; the pattern option is
@@ -292,6 +298,8 @@ class CrossEncoderProvider(RerankerProvider):
             lazy_load=True,
             enable_cpu_mem_arena=False,
         )
+        if cached is False:
+            _note_model_downloaded(model_id)
         _install_memory_pattern_off(self._model)
         # Same lazy-load check-then-act race FastEmbedProvider.__init__
         # documents (fastembed's OnnxTextModel first-load path has no lock of
@@ -433,7 +441,11 @@ class CrossEncoderProvider(RerankerProvider):
             calls_before = self._wrapper_calls
             before = peak_rss.begin()
             start = _clock()
-            scores = list(self._model.rerank(query, documents))
+            try:
+                scores = list(self._model.rerank(query, documents))
+            except BaseException:
+                peak_rss.cancel()  # S248: stop the RSS sampler of a call that raised
+                raise
             seconds = _clock() - start
             growth = peak_rss.growth_since(before)
             self._check_wrapper_reached_once(calls_before, documents)
@@ -746,8 +758,8 @@ def _reset_reranker_provider_cache() -> None:
 # memories.db (S146, S171; see `cost_series`); the warm-up state and the kept fit stay process
 # memory. The first measured recall rerank of a process per model id waits for a usable memory
 # model (S200: measured at a lull by the ladder below; a window with too few shapes or no
-# full-length sample is no model), where the per-call peak is readable (Linux; elsewhere no
-# RAM bound exists, S206 posture). A running process keeps the last usable fit it computed when
+# full-length sample is no model), where the per-call peak is readable (Linux: the exact reset reading; macOS and Windows: an RSS
+# sampling thread, S248; where neither reads, no RAM bound exists, S206 posture). A running process keeps the last usable fit it computed when
 # the window stops giving one (a quiet day; H4b: it never reranks without a RAM bound) and has
 # the next lull refresh it.
 # Stuck-width recovery (S100, S113, S116): the last query that went to the cosine path for lack
@@ -827,6 +839,46 @@ _ram_fit_memo: dict[
     tuple[str, str], tuple[tuple[ram_fit.ShapeGroup, ...], bool, ram_fit.RamFit | None]
 ] = {}
 _warmed_model_ids: set[str] = set()
+
+# S249: model ids whose model file this process DOWNLOADED when it built the provider (the file was
+# not in the cache). The RAM fit is never learned in such a process (the download's buffers inflate the
+# resident set the peak is read from), and it does not rerank until it restarts. Cleared only by tests.
+_downloaded_model_ids: set[str] = set()
+
+
+def _downloaded_here(model_id: str) -> bool:
+    with _cost_lock:
+        return model_id in _downloaded_model_ids
+
+
+def _note_model_downloaded(model_id: str) -> None:
+    with _cost_lock:
+        _downloaded_model_ids.add(model_id)
+
+
+def _model_file_cached(model_id: str, cache_dir: str | Path) -> bool | None:
+    """S249: whether fastembed's construction will find the model file in the cache (True) or has to
+    download it (False); `None` when that cannot be decided (the model is not in fastembed's registry, or
+    any error: the caller then counts the model as NOT downloaded and warns once). The repository and the file
+    come from fastembed's own description of the model (`sources.hf`, `model_file`), never from the model id
+    (the registered fp16 export is another file of the fp32 repository). `try_to_load_from_cache` reads the
+    same hub layout fastembed writes (`models--org--name/snapshots/<rev>/<file>`, `refs/main`) and neither
+    downloads nor raises for an uncached file."""
+    try:
+        from fastembed.rerank.cross_encoder.text_cross_encoder import TextCrossEncoder
+        from huggingface_hub import try_to_load_from_cache
+
+        for description in TextCrossEncoder.list_supported_models():
+            if description.get("model") == model_id:
+                repo = (description.get("sources") or {}).get("hf")
+                filename = description.get("model_file")
+                if not repo or not filename:
+                    return None
+                return isinstance(try_to_load_from_cache(repo, filename, cache_dir=str(cache_dir)), str)
+        return None
+    except Exception:  # noqa: BLE001 - detection must never break building the provider
+        _warn_ram_figure_once("could not tell whether the reranker model was already cached (S249)", exc_info=True)
+        return None
 _budget_misses: dict[str, _BudgetMiss] = {}
 _remeasured_marker: dict[str, object] = {}
 
@@ -923,7 +975,7 @@ def _record_rerank_cost(
     growth by shape `(pairs, longest)` to the buffered series (S164: nothing is written to the
     database here). Every call is a sample (S220: no high water; with the memory pool off the
     call's growth is its own). `full_length` marks the ladder's full-input-length pair (H4)."""
-    if peak_growth_bytes is not None and pairs is not None and longest is not None:
+    if peak_growth_bytes is not None and pairs is not None and longest is not None and not _downloaded_here(model_id):
         x = ram_fit.encode_shape(pairs, longest, full=full_length)
         if x is None:
             _warn_ram_figure_once(f"a rerank of {pairs} pairs x {longest} tokens cannot be recorded in the RAM series")
@@ -1082,7 +1134,8 @@ def _warn_ram_figure_once(reason: str, *, exc_info: bool = False) -> None:
 
 def _ram_bound_applies() -> bool:
     """Whether a RAM bound exists on this machine at all: the memory model is required (the
-    test seam) and the per-call peak can be read (`peak_rss`: Linux). Where it cannot be read
+    test seam) and the per-call peak can be read (`peak_rss`: the exact reset reading on Linux,
+    an RSS sampling thread on macOS and Windows, S248). Where it cannot be read
     nothing holds a turn back and the width is time-bound only (S206 posture); an unreadable
     measurement is never read as unlimited memory."""
     return _require_ram_figure and peak_rss.available()
@@ -1100,12 +1153,14 @@ def ram_figure_ready(model_id: str, store: MemoryStore) -> bool:
     """S200, S220: whether a rerank may run for `model_id`. True when no RAM bound applies
     (the per-call peak is unreadable here: no model can be measured, so the turn is not held
     back and the width is time-bound only), when the 24-hour window gives a usable memory
-    model, or when this running process still holds the last one it computed (H4b: it never
+    model (S249: never in a process that downloaded the model file: False until it restarts), or when this running process still holds the last one it computed (H4b: it never
     reranks without a RAM bound; the need is then flagged so the next lull refreshes the
     window). A failed database read is no window fit (cosine path unless a fit is kept).
     Cheap: one aggregate read, no model."""
     if not _ram_bound_applies():
         return True
+    if _downloaded_here(model_id):
+        return False  # S249: this process downloaded the model: no rerank until it restarts
     fit, kept = _ram_fit_for(store, model_id)
     if fit is None:
         return False
@@ -1136,6 +1191,8 @@ def ram_figure_due(
     run at this chat activity marker (once per lull; no time constant). A flag whose model has
     since appeared is dropped here. In-memory checks first; the store is opened only past them."""
     model_id = resolve_reranker_model_id()
+    if _downloaded_here(model_id):
+        return False  # S249: nothing is learned in a process that downloaded the model
     with _cost_lock:
         if model_id not in _ram_figure_needed:
             return False
@@ -1359,7 +1416,8 @@ def measure_ram_figure(
     S245: the live headroom is checked before the warm-up and before EVERY rung, the first included
     (`_ladder_headroom_stop`): a known headroom of zero stops the pass, a rung is predicted from the
     fit (phase 2) or bounded by the measured shape that dominates it (phase 1), and the first rung,
-    which nothing bounds, is held to a positive headroom only. Provider exceptions propagate.
+    which nothing bounds, is held to a positive headroom only. S249: nothing is run (False) in a
+    process that downloaded the model file. Provider exceptions propagate.
 
     S218: with a `watch` (the direct chat passes `cli_throttle.reply_watch()`), a reply that
     starts while this runs abandons the rung in progress: `RamMeasurementAbandoned` is raised,
@@ -1373,6 +1431,9 @@ def measure_ram_figure(
     call leaves no residue, so the pass simply resumes after the reply. The model load, the
     one-token warm-up and the tokenizer-only length probe are not stoppable."""
     model_id = provider.model_id()
+    if _downloaded_here(model_id):
+        log.info("reranker: RAM ladder not run: this process downloaded the model (S249)")
+        return False
     _abandon_if_replying(watch)
     if _ladder_headroom_stop(None, "the warm-up"):
         return _window_ready(store, model_id)
@@ -1474,6 +1535,8 @@ def run_ram_figure(
     re-run after the reply is not held back by the once-per-marker rule, keeps the need flag and
     propagates. The bridge's lull job passes no watch."""
     model_id = resolve_reranker_model_id()
+    if _downloaded_here(model_id):
+        return False  # S249
     with _cost_lock:
         _ram_figure_attempt[model_id] = activity_marker
     if _window_ready(store, model_id):
@@ -1506,6 +1569,7 @@ def _reset_rerank_cost_model() -> None:
         _ram_fit_kept.clear()
         _ram_fit_memo.clear()
         _warmed_model_ids.clear()
+        _downloaded_model_ids.clear()
         _budget_misses.clear()
         _remeasured_marker.clear()
         _too_long.clear()
