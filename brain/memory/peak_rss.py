@@ -21,8 +21,10 @@ process and is warned once.
 
 Sampler containment: ONE sampler at a time; the sampler thread only reads the RSS and keeps a
 local maximum and never takes `_lock`; `stop()` joins outside `_lock` with a bounded timeout;
-`growth_since` returns `None` when no sampler is active (a second `begin()` stopped it:
-overlapping callers of different providers get no sample, never an exception); a thread that
+`growth_since` returns `None` when no sampler is active (a second `begin()` stopped it). Callers
+of different providers can overlap (each provider has its own lock): the first to finish then takes
+the later caller's sampler (a reading of the later window) and the later one gets `None`; never an
+exception (a follow-up: `begin()` could hand back a token); a thread that
 cannot start latches the reader off; `cancel()` (a call that raised) stops it.
 
 The reset is process-wide, so the reading includes anything else the process allocates during

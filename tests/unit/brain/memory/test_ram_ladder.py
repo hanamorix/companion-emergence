@@ -1010,3 +1010,12 @@ def test_where_no_ram_bound_applies_a_download_changes_nothing(store, monkeypatc
     monkeypatch.setattr(reranker_mod.peak_rss, "available", lambda: False)
     reranker_mod._note_model_downloaded(_MODEL)  # noqa: SLF001
     assert reranker_mod.ram_figure_ready(_MODEL, store) is True
+
+
+def test_a_downloaded_process_has_no_ladder_due_even_with_an_empty_window(store) -> None:
+    """The due check itself (a window that gives no model would otherwise make the ladder due)."""
+    reranker_mod.note_ram_figure_needed(_MODEL)
+    assert reranker_mod.ram_figure_due("lull-1", lambda: _open(store)) is True
+    reranker_mod._note_model_downloaded(_MODEL)  # noqa: SLF001
+    reranker_mod.note_ram_figure_needed(_MODEL)
+    assert reranker_mod.ram_figure_due("lull-2", lambda: _open(store)) is False

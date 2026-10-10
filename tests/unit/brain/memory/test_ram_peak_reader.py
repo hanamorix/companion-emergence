@@ -324,3 +324,20 @@ def test_the_ram_bound_applies_under_the_forced_sampler(forced, monkeypatch) -> 
 
     monkeypatch.setattr(reranker_mod, "_require_ram_figure", True)
     assert reranker_mod._ram_bound_applies() is True  # noqa: SLF001
+
+
+def test_the_real_provider_cancels_the_sampler_when_its_scored_call_raises(forced, monkeypatch) -> None:
+    from brain.memory.reranker import CrossEncoderProvider
+
+    class _Model:
+        def rerank(self, query, documents):
+            raise RuntimeError("boom")
+
+    provider = CrossEncoderProvider.__new__(CrossEncoderProvider)  # no fastembed: only the timed path is under test
+    provider._rerank_lock = threading.Lock()  # noqa: SLF001
+    provider._wrapper_calls = 0  # noqa: SLF001
+    provider._model = _Model()  # noqa: SLF001
+    monkeypatch.setattr(CrossEncoderProvider, "_install_terminable_run", lambda self: None)
+    with pytest.raises(RuntimeError):
+        provider.rerank_timed("q", ["d"])
+    assert _samplers() == [], "the call raised: the sampler was cancelled"
