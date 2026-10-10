@@ -1112,7 +1112,7 @@ def test_g8_equal_limits_take_the_smaller_headroom(monkeypatch: pytest.MonkeyPat
     assert _v2() == 100_000_000.0
 
 
-# ---- G9: an ancestor whose usage cannot be used stands in with the own level ----
+# ---- G9: a capped ancestor whose usage cannot be used counts 0 and borrows nothing (S240) ----
 
 
 @pytest.mark.parametrize("mode", ["absent", "garbage", "unreadable", "negative"])
@@ -2061,6 +2061,31 @@ def test_j2_v1_an_unreadable_limit_file_is_not_a_cap_and_the_level_is_skipped(mo
     tree = _v1_chain(_v1lvl(5_500_000_000, 5_000_000_000, _v1s()), _v1lvl(4_000_000_000, 3_200_000_000, _V1_R400))
     _use_files(monkeypatch, tree, raising=(f"{_V1_OWN}/memory.limit_in_bytes",))
     assert _v1() == 1_200_000_000.0
+
+
+def test_j1_an_unreadable_limit_file_beside_a_usable_one_degrades_and_the_unusable_only_level_is_skipped(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The unreadable (PermissionError) variants of the limit-file rules, at an ancestor and at the own level."""
+    # an ancestor: numeric max, memory.high unreadable -> that ancestor is degraded
+    tree = _tree({_OWN: _lvl("max", 1_000_000_000, _stat()), _PAR: _lvl(4_000_000_000, 1_000_000_000, _ZERO)})
+    _hi(tree, _PAR, "3000000000")
+    _use_files(monkeypatch, tree, raising=(f"{_PAR}/memory.high",))
+    with caplog.at_level("DEBUG"):
+        assert _v2() == 0.0
+        assert _v2() == 0.0
+    found = _warnings(caplog, "memory.high")
+    assert len(found) == 1 and found[0].exc_info and found[0].exc_info[0] is PermissionError
+    # the own level: memory.max absent and memory.high unreadable -> no usable limit file, skipped, the parent binds
+    tree = _tree({_OWN: _lvl(None, 1_000_000_000, _stat()), _PAR: _lvl(8_000_000_000, 3_000_000_000, _ZERO)})
+    _hi(tree, _OWN, "2000000000")
+    _use_files(monkeypatch, tree, raising=(f"{_OWN}/memory.high",))
+    assert _v2() == 5_000_000_000.0
+
+
+def test_j2_v1_a_capped_own_level_without_a_usage_file_counts_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    _use_files(monkeypatch, _v1_chain(_v1lvl(5_500_000_000, None, _v1s())))
+    assert _v1() == 0.0
 
 
 # ---- J3: the headroom is the smaller of the cgroup figure and psutil (S241) ----

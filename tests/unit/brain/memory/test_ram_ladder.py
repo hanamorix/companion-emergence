@@ -439,6 +439,29 @@ def test_the_stuck_width_re_measure_does_not_run_a_batch_larger_than_any_measure
         reranker_mod._provider_cache.pop(_MODEL, None)  # noqa: SLF001
 
 
+def test_the_stuck_width_re_measure_skips_on_the_smaller_of_the_cgroup_figure_and_psutil(store, monkeypatch, caplog) -> None:
+    """S241 in the second caller, through the real headroom function: a window with a measured batch (cap lifted),
+    a cgroup cap far above any host, and a host with 1 byte available: the batch does not fit, the job skips."""
+    provider = _headroom_stopped_pass(store, monkeypatch)
+    reranker_mod._record_rerank_cost(_MODEL, store, 2 * 128, 0.1, 5e6, pairs=2, longest=128)  # noqa: SLF001
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", _REAL_HEADROOM)
+    monkeypatch.setattr(reranker_mod, "_cgroup_v2_memory_headroom_bytes", lambda: 5e12)
+    monkeypatch.setattr(reranker_mod, "_cgroup_v1_memory_headroom_bytes", lambda: None)
+    monkeypatch.setattr(reranker_mod, "_psutil_available_bytes", lambda: 1.0)
+    reranker_mod._budget_misses[_MODEL] = _stuck_miss()  # noqa: SLF001
+    reranker_mod._provider_cache[_MODEL] = provider  # noqa: SLF001
+    try:
+        before = len(provider.timed)
+        with caplog.at_level("INFO"):
+            assert reranker_mod.remeasure_stuck_width("marker-1", store) is False
+        assert len(provider.timed) == before
+        assert any("does not fit the RAM headroom" in r.getMessage() for r in caplog.records)
+        monkeypatch.setattr(reranker_mod, "_psutil_available_bytes", lambda: 5e12)
+        assert reranker_mod.remeasure_stuck_width("marker-2", store) is True
+    finally:
+        reranker_mod._provider_cache.pop(_MODEL, None)  # noqa: SLF001
+
+
 # ---- S241 through the ladder: the real headroom function, its sources patched ----
 
 

@@ -226,7 +226,7 @@ def test_oom_guard_zero_headroom_floors_to_knob_refit() -> None:
 
 
 def test_oom_guard_docstring_names_the_psutil_fallback_not_meminfo() -> None:
-    """S239: the headroom helper falls back to psutil's host-wide available figure, not to /proc/meminfo."""
+    """S239: the headroom helper reads psutil's host-wide available figure, not /proc/meminfo."""
     doc = judge_selftune._downgrade_for_oom_safety.__doc__ or ""
     assert "psutil" in doc
     assert "host-wide `/proc/meminfo`" not in doc and "cgroup/meminfo" not in doc

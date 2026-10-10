@@ -1558,8 +1558,10 @@ def remeasure_stuck_width(activity_marker: object, store: MemoryStore) -> bool:
     or RAM-skipped run still runs once per lull, while a run skipped by a held
     verdict stamps nothing. Skipped (miss kept) when the memory model is not ready (S220: the
     batch is never run unfitted, same gate as every rerank), the miss is no longer
-    stuck (then dropped), a "too long" verdict is remembered, or the memory model predicts the
-    batch does not fit the current headroom. Returns True iff the rerank ran. Provider
+    stuck (then dropped), a "too long" verdict is remembered, the memory model holds no
+    batch of more than one pair and the batch is larger than any shape measured (S242,
+    `RamFit.within_measured`), or the memory model predicts the batch does not fit the current
+    headroom. Returns True iff the rerank ran. Provider
     exceptions propagate (the central pass logs them)."""
     model_id = resolve_reranker_model_id()
     miss, _, warmed = _job_state(model_id)
@@ -1805,7 +1807,9 @@ _CGROUP_UNUSABLE_NOTE = (
 )
 
 
-def _cgroup_read(path: str, what: str) -> tuple[str | None, str | None]:
+def _cgroup_read(
+    path: str, what: str, *, note: str = _CGROUP_UNUSABLE_NOTE
+) -> tuple[str | None, str | None]:
     """One cgroup file as `(text, None)`, or `(None, "absent")` when it does not exist (silent: the
     level exposes no such file), or `(None, "unreadable")` for any other failure to read it
     (warned once per process and file name, with the traceback). `what` is the file's base name.
@@ -1817,13 +1821,14 @@ def _cgroup_read(path: str, what: str) -> tuple[str | None, str | None]:
     except FileNotFoundError:
         return None, "absent"
     except Exception:  # noqa: BLE001 - fail-soft: a headroom probe must never break a recall
-        _warn_ram_figure_once(f"a cgroup {what} could not be read: {_CGROUP_UNUSABLE_NOTE}", exc_info=True)
+        _warn_ram_figure_once(f"a cgroup {what} could not be read: {note}", exc_info=True)
         return None, "unreadable"
 
 
-def _cgroup_read_file(path: str, what: str) -> str | None:
-    """The text of one cgroup file, or `None` when it is absent or unreadable (`_cgroup_read`)."""
-    return _cgroup_read(path, what)[0]
+def _cgroup_read_file(path: str, what: str, *, note: str = _CGROUP_UNUSABLE_NOTE) -> str | None:
+    """The text of one cgroup file, or `None` when it is absent or unreadable (`_cgroup_read`); `note`
+    is what the once-per-process warning says happens next."""
+    return _cgroup_read(path, what, note=note)[0]
 
 
 def _warn_cgroup_not_plain(what: str) -> None:
@@ -1834,8 +1839,9 @@ def _cgroup_counter_bytes(path: str, what: str, *, capped: bool = False) -> floa
     """A one-number cgroup counter (`memory.current`, `memory.usage_in_bytes`) in bytes, or
     `None` when it cannot be used: absent, unreadable or not a plain non-negative integer
     (`_cgroup_plain_bytes`; the last two warned once per process and kind). `capped` marks the
-    usage of a level known to be capped (S240): there an ABSENT file is unusable too and is warned
-    once, because the caller then counts the level as having no headroom."""
+    usage of a level known to be capped (S240): the result is `None` for an absent file either way,
+    but there it is also warned once, because the caller then counts the level as having no
+    headroom."""
     raw, failure = _cgroup_read(path, what)
     if raw is None:
         if failure == "absent" and capped:
@@ -2010,7 +2016,11 @@ def _cgroup_v1_walk_dirs(dirs: list[str]) -> list[str]:
     VM is cgroup v2 only, so it is tested with synthetic trees.)"""
     walked = [dirs[0]]
     for parent in dirs[1:]:
-        raw = _cgroup_read_file(f"{parent}/memory.use_hierarchy", "memory.use_hierarchy")
+        raw = _cgroup_read_file(
+            f"{parent}/memory.use_hierarchy",
+            "memory.use_hierarchy",
+            note="the v1 walk keeps going past this level (the safe side: more bounds)",
+        )
         if raw is not None and raw.strip() == "0":
             break
         walked.append(parent)
@@ -2359,8 +2369,11 @@ def rerank_for_recall(
         # says its first 5 do not fit the FULL budget, the re-measure job
         # re-times them at a chat lull (S100), so an inflated estimate cannot
         # absorb every later message. (The RAM term can land here too, for a
-        # batch whose predicted growth does not fit the headroom; the time-stuck
-        # job leaves that miss alone, and the headroom changes by itself.)
+        # batch whose predicted growth does not fit the headroom, or, while the
+        # memory model holds single pairs only, for a batch larger than any
+        # shape measured (S242); the time-stuck job leaves that miss alone. The
+        # headroom changes by itself, the single-pair model only when the
+        # ladder next measures a batch.)
         miss = _BudgetMiss(
             query=query,
             documents=tuple(pool[:RERANK_MIN_REAL_CANDIDATES]),
