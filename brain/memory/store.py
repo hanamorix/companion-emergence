@@ -1931,6 +1931,18 @@ class MemoryStore:
         ).fetchone()
         return int(row[0]), int(row[1])
 
+    def cost_series_shape_groups(
+        self, series: str, host: str, key: str, *, now: float, window_seconds: float
+    ) -> list[tuple[int, int, float]]:
+        """A shape series' window (S220) as one `(x, count, sum of seconds)` row per distinct
+        packed shape, one aggregate `SELECT ... GROUP BY x` served by the covering index."""
+        rows = self._conn.execute(
+            "SELECT x, COUNT(*), COALESCE(SUM(seconds), 0.0) FROM cost_series_samples "
+            "WHERE series = ? AND host = ? AND series_key = ? AND taken_at > ? GROUP BY x",
+            (series, host, key, now - window_seconds),
+        ).fetchall()
+        return [(int(x), int(n), float(total)) for x, n, total in rows]
+
     def record_cost_samples(
         self,
         series: str,
@@ -1966,13 +1978,22 @@ class MemoryStore:
                 "DELETE FROM cost_series_samples WHERE series = ? AND taken_at <= ?",
                 (series, cut),
             )
+            if series in cost_series.SHAPE_SERIES:
+                # S220: no carried row, and no sums over the packed x (their squares would
+                # overflow SQLite integers). The retired per-token series goes in the same
+                # transaction, so its rows do not linger for good.
+                for retired in cost_series.RETIRED_SERIES:
+                    self._conn.execute("DELETE FROM cost_series_samples WHERE series = ?", (retired,))
+                    self._conn.execute("DELETE FROM cost_series_carried WHERE series = ?", (retired,))
+                if self._cost_record_hook is not None:
+                    self._cost_record_hook()
+                self._conn.commit()
+                return
             sums = self._cost_window_sums(series, host, key, cut)
             carried = self._cost_carried_row(series, host, key)
             if self._cost_record_hook is not None:
                 self._cost_record_hook()
-            estimate = cost_series.SeriesState(sums, carried).estimate(
-                series in cost_series.THROUGH_ORIGIN_SERIES
-            )
+            estimate = cost_series.SeriesState(sums, carried).estimate()
             if estimate is not None:
                 self._conn.execute(
                     "INSERT INTO cost_series_carried "

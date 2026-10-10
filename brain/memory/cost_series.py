@@ -11,8 +11,9 @@ mean.
 
 Six series use it: the rerank (`reranker.py`), the paragraph embed, the recall
 setup and the paragraph scan (`semantic_recall.py`), the keyword extra words
-and the name matching (`keyword_budget.py`); a seventh, the rerank's RAM growth
-(`RAM_SERIES`, S171), saves a weighted ratio of its sums instead of a fit. Each is keyed by what it measures
+and the name matching (`keyword_budget.py`); a seventh, the rerank's memory growth by call
+shape (`RAM_SHAPE_SERIES`, S220), keeps the same buffer, host key and 24-hour window but is
+fitted by `ram_fit` over per-shape aggregates instead. Each is keyed by what it measures
 (a model id, a store) and, in storage, by the machine too (S159): a persona
 database copied to another machine starts there as a first startup, because
 this machine's random id (`machine_id`, S163) differs.
@@ -22,10 +23,8 @@ the samples; `cost_series_carried` holds, per key, the estimate in effect after
 the last flush and the largest size it was measured at. The carried estimate is
 what a window with no sample (a long downtime) still answers with, and what a
 window with one size is rescaled from (S114: one factor so the carried fit's
-prediction at that size equals the window's mean). The ratio series does not
-use it: with no sample in its window it has no figure (S178), so a too-high
-figure leaves by ageing out. Its carried row is still written by a flush that
-leaves an estimate, and is never read.
+prediction at that size equals the window's mean). The shape series has no carried row: an
+empty or too thin window has no fit and the machine measures again, as on a first startup.
 
 Verdicts (S179): the rerank's S127 "too long" verdict is saved with the series,
 one row per (series, machine id, key) in `cost_series_verdicts`, by
@@ -66,11 +65,16 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-# S171: the series name of the rerank's RAM growth (x = padded tokens past the
-# process high water, y = RSS bytes it grew by), and the series whose estimate is
-# the weighted ratio of the window's sums (bytes per token) rather than a fit.
-RAM_SERIES = "rerank ram"
-THROUGH_ORIGIN_SERIES = frozenset({RAM_SERIES})
+# S220: the series name of the rerank's memory growth by call SHAPE (x = the packed shape,
+# `ram_fit.encode_shape(pairs, length)`; the `seconds` column holds the call's peak resident
+# growth in bytes), and the set of such series. A shape series is read as one aggregate per
+# distinct shape (`shape_groups`), never through `state`: it has no carried row, and the sums
+# of packed x squared would overflow SQLite integers.
+RAM_SHAPE_SERIES = "rerank ram shape"
+SHAPE_SERIES = frozenset({RAM_SHAPE_SERIES})
+# The per-token series it replaced (S171): no code reads or writes it any more; its rows are
+# deleted in the transaction that first writes the shape series.
+RETIRED_SERIES = ("rerank ram",)
 
 # Wall clock for `taken_at` and the window cut. Samples are shared with other
 # processes, so the clock must be one they agree on; a jump of the system clock
@@ -174,23 +178,14 @@ class SeriesState:
     sums: LinearSums = LinearSums()
     carried: RangedFit | None = None
 
-    def estimate(self, through_origin: bool = False) -> RangedFit | None:
+    def estimate(self) -> RangedFit | None:
         """The estimate in effect (S146, S114): an empty window answers with
         the carried estimate as it is; a window with two sizes with its own
         fit; a window with one size with the carried fit rescaled by one
         factor so its prediction at that size equals the window's mean (the
         measured range is then the larger of the two); with nothing carried,
-        the window's own fit. `through_origin` (a ratio series, S171): the
-        window's weighted ratio of sums as the rate, no overhead, whatever
-        sizes it holds; with no sample in the window (or sizes that sum to 0)
-        it answers nothing, whatever row is carried (S178: a too-high figure
-        recovers by ageing out of the window, after which the series is seeded
-        again as on a first-ever startup)."""
+        the window's own fit."""
         sums, carried = self.sums, self.carried
-        if through_origin:
-            if sums.n == 0 or sums.sum_x <= 0:
-                return None
-            return RangedFit(LinearFit(0.0, sums.sum_y / sums.sum_x, sums.n), sums.max_x)
         if sums.n == 0:
             return carried
         if carried is None or sums.has_two_sizes:
@@ -489,7 +484,32 @@ class CostSeries:
     def estimate(self, store: MemoryStore, key: str) -> RangedFit | None:
         """The estimate in effect (see `SeriesState.estimate`)."""
         state = self.state(store, key)
-        return None if state is None else state.estimate(self.name in THROUGH_ORIGIN_SERIES)
+        return None if state is None else state.estimate()
+
+    def shape_groups(self, store: MemoryStore, key: str) -> list[tuple[int, int, float]] | None:
+        """A shape series' window as `(packed shape, samples, sum of growth)` per distinct
+        packed shape (S220): the database's aggregate first, then this process's buffer folded
+        in, so a flush that completes between the reads cannot count a sample twice (the same
+        order as `state`). The cost is the number of distinct shapes, never the number of
+        samples. `None` when the database read fails (a failed read is "no fit"; warned once)."""
+        now = _wall_clock()
+        window = window_seconds()
+        host = machine_id()
+        try:
+            rows = store.cost_series_shape_groups(
+                self.name, host, key, now=now, window_seconds=window
+            )
+        except Exception as exc:  # noqa: BLE001 - fail soft: no fit
+            _note_failure("read", exc)
+            return None
+        if _between_reads_hook is not None:
+            _between_reads_hook()
+        merged: dict[int, list] = {x: [n, total] for x, n, total in rows}
+        for sample in self._buffered(_store_key(store), host, key, now - window):
+            entry = merged.setdefault(sample.x, [0, 0.0])
+            entry[0] += 1
+            entry[1] += sample.seconds
+        return [(x, n, total) for x, (n, total) in merged.items()]
 
     def fit(self, store: MemoryStore, key: str) -> LinearFit | None:
         found = self.estimate(store, key)

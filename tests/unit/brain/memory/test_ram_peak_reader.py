@@ -14,7 +14,10 @@ _linux_only = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="L
 
 
 @pytest.fixture(autouse=True)
-def _fresh():
+def _fresh(monkeypatch: pytest.MonkeyPatch):
+    # The suite's autouse fixture switches the reader off (fake rerankers); these tests are
+    # about the reader itself, so it is back to the platform's real answer.
+    monkeypatch.setattr(peak_rss, "_is_linux", sys.platform.startswith("linux"))
     peak_rss._reset_for_tests()  # noqa: SLF001
     yield
     peak_rss._reset_for_tests()  # noqa: SLF001
