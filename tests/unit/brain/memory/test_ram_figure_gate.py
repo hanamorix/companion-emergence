@@ -42,6 +42,9 @@ def _gate_on(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(reranker_mod, "_require_ram_figure", True)
     monkeypatch.setattr(reranker_mod.peak_rss, "available", lambda: True)
     monkeypatch.setattr(reranker_mod, "resolve_reranker_model_id", lambda: _RERANKER_ID)
+    # S245: a ladder pass that the live headroom stops records no completion marker, so these tests must
+    # not depend on the host's free memory; the tests that care patch their own figure.
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
 
 
 class _CappedReranker(RerankerProvider):

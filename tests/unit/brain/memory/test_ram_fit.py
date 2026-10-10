@@ -264,3 +264,51 @@ def test_the_dimensions_are_the_largest_measured_ones_of_the_window() -> None:
     lifted = ram_fit.fit_ram(singles + _groups([(2, 128, 1.0)], full_at=(0, 0)))
     assert lifted is not None and lifted.max_pairs == 2 and lifted.within_measured(50, 1024)
 
+
+
+# --- S244: the lift needs a batch of more than one pair AND S220's usable-fit conditions ---
+
+
+def _shapes_of(groups):
+    return {(g.pairs, g.length) for g in groups}
+
+
+def test_a_two_pair_batch_with_only_three_distinct_shapes_gives_no_fit_and_so_no_lift() -> None:
+    groups = _groups([(1, 1024, 191.9), (1, 512, 8.4), (2, 256, 10.0)])
+    assert len(_shapes_of(groups)) == 3 and any(g.full for g in groups)
+    assert not ram_fit.enough_shapes(groups)
+    assert ram_fit.fit_ram(groups) is None
+
+
+def test_a_two_pair_batch_with_four_full_rank_shapes_but_no_full_length_sample_gives_no_fit() -> None:
+    groups = _groups([(1, 512, 8.4), (1, 256, 0.2), (1, 128, 0.2), (2, 128, 1.0)], full_at=(0, 0))
+    assert len(_shapes_of(groups)) == 4 and ram_fit.full_rank(_shapes_of(groups))
+    assert not any(g.full for g in groups)
+    assert not ram_fit.enough_shapes(groups)
+    assert ram_fit.fit_ram(groups) is None
+
+
+def test_a_two_pair_batch_on_a_rank_deficient_set_of_shapes_gives_no_fit() -> None:
+    """Four shapes of one length: the S column is the T column times the length, so the rank is 2."""
+    groups = _groups([(1, 100, 5.0), (2, 100, 10.0), (3, 100, 15.0), (4, 100, 20.0)], full_at=(1, 100))
+    assert len(_shapes_of(groups)) == 4 and any(g.full for g in groups)
+    assert not ram_fit.full_rank(_shapes_of(groups))
+    assert ram_fit.fit_ram(groups) is None
+
+
+def test_the_lift_comes_with_all_the_usable_fit_conditions() -> None:
+    """Four full-rank shapes, a full-length sample and a 2-pair batch: a fit exists and its cap is lifted."""
+    groups = _groups([(1, 1024, 191.9), (1, 512, 8.4), (1, 256, 0.2), (2, 128, 1.0)])
+    assert ram_fit.enough_shapes(groups)
+    fit = ram_fit.fit_ram(groups)
+    assert fit is not None and fit.max_pairs == 2 and fit.within_measured(50, 5000)
+
+
+def test_the_docstrings_state_the_conditions_of_the_lift_and_the_marker_rule() -> None:
+    module_doc = " ".join((ram_fit.__doc__ or "").split())
+    method_doc = " ".join((ram_fit.RamFit.within_measured.__doc__ or "").split())
+    for text in (module_doc, method_doc):
+        assert "more than three distinct shapes" in text and "full rank" in text and "full-length sample" in text
+    assert "lifts only once a batch of more than one pair is measured AND the fit is usable" in module_doc
+    assert "records no marker" in module_doc and "MORE THAN ONE PAIR" in module_doc
+    assert "headroom still records its completion marker" not in module_doc

@@ -13,6 +13,7 @@ integration" — requires_network alone is not part of that expression).
 
 from __future__ import annotations
 
+import ast as _ast
 import json
 import sys
 from unittest.mock import mock_open
@@ -2685,3 +2686,103 @@ def test_normalize_bundled_pairs_against_anchors_never_leaks_anchor_scores_into_
 
     assert len(result) == 1
     assert result[0] == pytest.approx(10.0 - (-1.0))
+
+
+# ---------------------------------------------------------------------------
+# S247: every rerank call site goes through the RAM bound. This guards ADDITIONS: a new `.rerank(` or
+# `.rerank_timed(` call anywhere in brain/ fails here until its bound is decided and listed in
+# the records' call-sites.md (R15), with the test that proves it.
+# ---------------------------------------------------------------------------
+
+_RERANK_CALL_SITES = {
+    # leaf provider methods: the calls being bounded, not call sites that decide
+    ("brain/memory/reranker.py", "RerankerProvider.rerank_timed"),
+    ("brain/memory/reranker.py", "CrossEncoderProvider.rerank"),
+    ("brain/memory/reranker.py", "CrossEncoderProvider.rerank_timed"),
+    # the ladder's rungs (S245: headroom checked before every rung, the first included)
+    ("brain/memory/reranker.py", "_run_rung"),
+    # the warm-up reranks (the ladder's own: S245 check first; the recall callers: S247 `bounded=True`)
+    ("brain/memory/reranker.py", "_warm_up_once"),
+    # the floor calibration's bundled pairs (S247: the kept memory model and the live headroom)
+    ("brain/memory/reranker.py", "normalize_bundled_pairs_against_anchors"),
+    # the per-recall gate normalization: reached only through `_measured_rerank` (the width fit's RAM term,
+    # the seed bound, the re-measure job's explicit check)
+    ("brain/memory/reranker.py", "normalize_against_anchors"),
+}
+
+
+
+class _RerankCallFinder(_ast.NodeVisitor):
+    """The (enclosing class.function) of every `.rerank(` / `.rerank_timed(` call in one module."""
+
+    def __init__(self) -> None:
+        self.stack: list[str] = []
+        self.scopes: set[str] = set()
+
+    def _scope(self, node) -> None:
+        self.stack.append(node.name)
+        self.generic_visit(node)
+        self.stack.pop()
+
+    def visit_ClassDef(self, node: _ast.ClassDef) -> None:
+        self._scope(node)
+
+    def visit_FunctionDef(self, node: _ast.FunctionDef) -> None:
+        self._scope(node)
+
+    def visit_AsyncFunctionDef(self, node: _ast.AsyncFunctionDef) -> None:
+        self._scope(node)
+
+    def visit_Call(self, node: _ast.Call) -> None:
+        func = node.func
+        if isinstance(func, _ast.Attribute) and func.attr in ("rerank", "rerank_timed"):
+            self.scopes.add(".".join(self.stack))
+        self.generic_visit(node)
+
+
+def _rerank_call_sites(root=None) -> set[tuple[str, str]]:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[4] if root is None else root
+    found: set[tuple[str, str]] = set()
+    for path in sorted((root / "brain").rglob("*.py")):
+        finder = _RerankCallFinder()
+        finder.visit(_ast.parse(path.read_text()))
+        found.update((str(path.relative_to(root)), scope) for scope in finder.scopes)
+    return found
+
+
+def test_the_rerank_call_sites_are_exactly_the_audited_set() -> None:
+    found = _rerank_call_sites()
+    assert found == _RERANK_CALL_SITES, (
+        "S247: a rerank call site was added or removed. Decide how the new site goes through the RAM bound "
+        f"and update this set and the call-sites record. Unlisted: {sorted(found - _RERANK_CALL_SITES)}; "
+        f"gone: {sorted(_RERANK_CALL_SITES - found)}"
+    )
+
+
+def test_the_call_site_scan_sees_a_call_it_has_not_been_told_about(tmp_path) -> None:
+    """The scan can fail: a throwaway tree with a rerank call is reported, enclosing function included."""
+    (tmp_path / "brain" / "memory").mkdir(parents=True)
+    (tmp_path / "brain" / "memory" / "stray.py").write_text(
+        "class Holder:\n    def go(self, p):\n        return p.rerank('q', ['d']) + p.rerank_timed('q', ['d'])\n"
+    )
+    assert _rerank_call_sites(tmp_path) == {("brain/memory/stray.py", "Holder.go")}
+
+
+def test_the_ram_bound_texts_state_the_s245_and_s247_rules() -> None:
+    from brain.memory import floor_calibration
+
+    def flat(obj) -> str:
+        return " ".join((obj.__doc__ or "").split())
+
+    measure = flat(reranker_mod.measure_ram_figure)
+    assert "records the completion marker ONLY IF the window then holds a measured batch of more than one pair" in measure
+    assert "before the warm-up and before EVERY rung, the first included" in measure
+    assert "without a headroom check" not in measure
+    assert "BEFORE the provider is built" in flat(reranker_mod.run_ram_figure)
+    assert "`RerankDeferred` is raised BEFORE that pair's call" in flat(reranker_mod.normalize_bundled_pairs_against_anchors)
+    assert "RerankDeferred" in flat(floor_calibration.get_bootstrap_floor)
+    assert "seed_ram_fit" in flat(reranker_mod.fit_rerank_width)
+    assert "S247" in flat(reranker_mod.RerankDeferred) and "S247" in flat(reranker_mod._batch_fits_ram_bound)  # noqa: SLF001
+    assert "S247" in flat(reranker_mod._warm_up_once) and "bounded" in flat(reranker_mod._warm_up_once)  # noqa: SLF001

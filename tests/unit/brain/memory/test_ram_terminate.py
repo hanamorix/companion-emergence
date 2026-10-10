@@ -42,7 +42,8 @@ def _env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(reranker_mod, "_require_ram_figure", True)
     monkeypatch.setattr(reranker_mod.peak_rss, "available", lambda: True)
     monkeypatch.setattr(reranker_mod, "resolve_reranker_model_id", lambda: _MODEL)
-    monkeypatch.setattr(reranker_mod, "_full_rerank_budget", lambda: 0.0)  # phase 1 only
+    monkeypatch.setattr(reranker_mod, "_full_rerank_budget", lambda: 2.0)
+    monkeypatch.setattr(reranker_mod, "_batch_sizes", lambda: [2])  # phase 1 plus one batch rung (S245)
     monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
 
 
@@ -567,7 +568,7 @@ def test_a_reply_stops_the_running_call_discards_its_sample_and_the_rerun_record
     cli_throttle.note_reply_end()
     session.block_lengths = set()
     assert reranker_mod.measure_ram_figure(provider, store, watch=cli_throttle.reply_watch()) is True
-    assert sorted(shapes_in_window(store, _MODEL)) == [(1, 128), (1, 256), (1, 512), (1, 1024)]
+    assert sorted(shapes_in_window(store, _MODEL)) == [(1, 128), (1, 256), (1, 512), (1, 1024), (2, 1024)]
     assert all(n == 1 for n, _total in shapes_in_window(store, _MODEL).values())
     store.close()
 
@@ -577,7 +578,7 @@ def test_without_a_reply_the_same_run_records_every_rung(make_provider, tmp_path
     provider = make_provider(session)
     store = MemoryStore(tmp_path / "memories.db")
     assert reranker_mod.measure_ram_figure(provider, store, watch=cli_throttle.reply_watch()) is True
-    assert sorted(shapes_in_window(store, _MODEL)) == [(1, 128), (1, 256), (1, 512), (1, 1024)]
+    assert sorted(shapes_in_window(store, _MODEL)) == [(1, 128), (1, 256), (1, 512), (1, 1024), (2, 1024)]
     assert session.stopped_by_flag == 0
     store.close()
 
@@ -638,7 +639,7 @@ def test_through_the_real_floor_startup_thread_a_reply_stops_the_call_and_the_re
         thread.join(_TIMEOUT)
         assert not thread.is_alive()
         assert reranker_mod.ram_figure_ready(_MODEL, loop.store) is True
-        assert sorted(shapes_in_window(loop.store, _MODEL)) == [(1, 128), (1, 256), (1, 512), (1, 1024)]
+        assert sorted(shapes_in_window(loop.store, _MODEL)) == [(1, 128), (1, 256), (1, 512), (1, 1024), (2, 1024)]
     finally:
         session.release.set()
         loop.finish(thread)

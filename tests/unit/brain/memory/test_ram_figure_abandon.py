@@ -26,6 +26,9 @@ from tests.unit.brain.memory._ram_support import FULL, ScriptedLadderProvider, s
 _MODEL = "scripted-ladder"
 _TIMEOUT = 10.0
 _PHASE_ONE = [(1, 1024), (1, 512), (1, 256), (1, 128)]
+# S245: a pass is complete (and the window gives a model) only with a measured batch of more than one
+# pair, so the scripted pass is phase 1 plus ONE batch rung (the batch sizes are cut to [2]).
+_PASS = [*_PHASE_ONE, (2, 949)]
 
 
 @pytest.fixture(autouse=True)
@@ -33,7 +36,8 @@ def _env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(reranker_mod, "_require_ram_figure", True)
     monkeypatch.setattr(reranker_mod.peak_rss, "available", lambda: True)
     monkeypatch.setattr(reranker_mod, "resolve_reranker_model_id", lambda: _MODEL)
-    monkeypatch.setattr(reranker_mod, "_full_rerank_budget", lambda: 0.0)  # phase 1 only
+    monkeypatch.setattr(reranker_mod, "_full_rerank_budget", lambda: 2.0)
+    monkeypatch.setattr(reranker_mod, "_batch_sizes", lambda: [2])  # phase 1 plus one batch rung (S245)
     monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
     monkeypatch.setattr(floor_startup, "_background_inhibited", False)
 
@@ -111,8 +115,8 @@ def test_the_next_pass_resumes_from_the_window_and_measures_the_abandoned_rung_a
     provider.on_timed = None
     provider.timed.clear()
     assert reranker_mod.measure_ram_figure(provider, store, watch=_Watch()) is True
-    assert provider.timed == [(1, 256), (1, 128)], "an abandoned call leaves no residue: it is simply measured again"
-    assert sorted(shapes_in_window(store, _MODEL)) == [(1, 128), (1, 256), (1, 512), (1, 1024)]
+    assert provider.timed == [(1, 256), (1, 128), (2, 949)], "an abandoned call leaves no residue: it is simply measured again"
+    assert sorted(shapes_in_window(store, _MODEL)) == [(1, 128), (1, 256), (1, 512), (1, 1024), (2, 949)]
 
 
 def test_a_reply_during_the_first_call_leaves_nothing_and_the_rerun_measures_it_again(tmp_path) -> None:
@@ -130,7 +134,7 @@ def test_a_reply_during_the_first_call_leaves_nothing_and_the_rerun_measures_it_
 def test_an_always_clear_watch_and_no_watch_measure_exactly_as_before(tmp_path, watch) -> None:
     store, provider = _store(tmp_path), ScriptedLadderProvider(model=_MODEL)
     assert reranker_mod.measure_ram_figure(provider, store, watch=watch) is True
-    assert provider.timed == _PHASE_ONE
+    assert provider.timed == _PASS
 
 
 def test_every_abandon_is_logged(caplog: pytest.LogCaptureFixture, tmp_path) -> None:
@@ -278,7 +282,7 @@ def test_a_reply_starting_during_a_call_abandons_that_rung_and_the_rerun_after_t
         cli_throttle.note_reply_end()
         thread.join(_TIMEOUT)
         assert not thread.is_alive()
-        assert provider.timed == [*_PHASE_ONE[:3], (1, 256), (1, 128)], "resumed from the window, no residue"
+        assert provider.timed == [*_PHASE_ONE[:3], (1, 256), (1, 128), (2, 949)], "resumed from the window, no residue"
         assert reranker_mod.ram_figure_ready(_MODEL, loop.store) is True
         assert reranker_mod._ram_figure_needed == set()  # noqa: SLF001
     finally:
@@ -298,7 +302,7 @@ def test_a_reply_that_started_and_ended_inside_a_call_is_seen_too(monkeypatch: p
         release.set()
         thread.join(_TIMEOUT)
         assert not thread.is_alive()
-        assert provider.timed == [(1, 1024), *_PHASE_ONE], "the sample was discarded; the pass ran again at once"
+        assert provider.timed == [(1, 1024), *_PASS], "the sample was discarded; the pass ran again at once"
         assert loop.runs == 2 and reranker_mod.ram_figure_ready(_MODEL, loop.store) is True
     finally:
         release.set()
@@ -328,7 +332,7 @@ def test_a_reply_starting_during_the_probe_abandons_before_any_call_and_the_reru
         cli_throttle.note_reply_end()
         thread.join(_TIMEOUT)
         assert not thread.is_alive()
-        assert provider.timed == _PHASE_ONE
+        assert provider.timed == _PASS
         assert reranker_mod.ram_figure_ready(_MODEL, loop.store) is True
         assert reranker_mod._ram_figure_needed == set()  # noqa: SLF001
     finally:
@@ -352,7 +356,7 @@ def test_a_reply_starting_during_the_warm_ups_abandons_and_the_rerun_measures(mo
         assert provider.timed == [] and thread.is_alive()
         cli_throttle.note_reply_end()
         thread.join(_TIMEOUT)
-        assert provider.timed == _PHASE_ONE
+        assert provider.timed == _PASS
     finally:
         loop.finish(thread)
 
@@ -402,7 +406,7 @@ def test_a_reply_in_flight_when_the_thread_starts_delays_everything_until_it_end
         cli_throttle.note_reply_end()
         thread.join(_TIMEOUT)
         assert not thread.is_alive()
-        assert loop.builds == 1 and provider.timed == _PHASE_ONE
+        assert loop.builds == 1 and provider.timed == _PASS
         assert reranker_mod.ram_figure_ready(_MODEL, loop.store) is True
         assert loop.waits == 1, "no abandon: one wait, one run"
     finally:
@@ -430,7 +434,7 @@ def test_a_reply_starting_between_the_wait_and_the_snapshot_abandons_at_once(mon
         assert loop.builds == 0 and provider.probes == 0, "nothing built while a reply is in flight"
         cli_throttle.note_reply_end()
         thread.join(_TIMEOUT)
-        assert loop.builds == 1 and provider.timed == _PHASE_ONE
+        assert loop.builds == 1 and provider.timed == _PASS
     finally:
         loop.finish(thread)
 

@@ -1025,3 +1025,97 @@ def test_ac13c_directional_guard_normalized_floor_correctly_abstains_what_raw_fl
         "POST-FIX: comparing the SAME normalized candidate score against the NOW-normalized "
         "bootstrap floor must correctly ABSTAIN it — the exact direction §5b fixes"
     )
+
+
+# ---------------------------------------------------------------------------
+# S247: the bundled-pair scoring is a rerank call site; it runs inside the RAM bound or it waits.
+# ---------------------------------------------------------------------------
+
+
+class _CountingBundleProvider(FakeRerankerProvider):
+    def __init__(self, scores: dict[str, float]) -> None:
+        super().__init__(scores=scores)
+        self.calls = 0
+
+    def rerank(self, query, documents):
+        self.calls += 1
+        return super().rerank(query, documents)
+
+
+def _bounded_bootstrap(monkeypatch: pytest.MonkeyPatch, model_id: str, headroom) -> _CountingBundleProvider:
+    """The RAM bound on (the peak is readable), the provider scripted, the process's kept memory model absent."""
+    from brain.memory import floor_calibration
+    from brain.memory import reranker as reranker_mod
+
+    floor_calibration._reset_bootstrap_floor_cache()
+    provider = _CountingBundleProvider(_bundled_scores(2.5, -3.0))
+    monkeypatch.setattr(reranker_mod, "_require_ram_figure", True)
+    monkeypatch.setattr(reranker_mod.peak_rss, "available", lambda: True)
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: headroom)
+    monkeypatch.setattr(reranker_mod, "_bootstrap_reranker_provider", lambda mid: provider)
+    monkeypatch.setattr(provider, "model_id", lambda: model_id)
+    return provider
+
+
+def _keep_fit(model_id: str, **kw) -> None:
+    from brain.memory import ram_fit
+    from brain.memory import reranker as reranker_mod
+
+    fit = ram_fit.RamFit(
+        a=kw.get("a", 1.0), b=0.0, c=0.0, shapes=5, samples=5, max_pairs=kw.get("max_pairs", 58), max_length=1024
+    )
+    with reranker_mod._cost_lock:  # noqa: SLF001
+        reranker_mod._ram_fit_kept[("store-key", model_id)] = fit  # noqa: SLF001
+
+
+def test_a_deferred_bootstrap_floor_returns_none_caches_nothing_and_is_not_logged_as_an_error(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from brain.memory import floor_calibration
+
+    model_id = "deferred-bootstrap-model"
+    provider = _bounded_bootstrap(monkeypatch, model_id, 5e12)  # no kept memory model: the batch cannot be sized
+    with caplog.at_level("INFO"):
+        assert floor_calibration.get_bootstrap_floor(model_id) is None
+    assert provider.calls == 0, "deferred before any rerank call"
+    assert floor_calibration.peek_bootstrap_floor(model_id) is None
+    assert not [r for r in caplog.records if r.exc_info or r.levelname in ("ERROR", "CRITICAL")]
+    assert any("deferred" in r.getMessage() and r.levelname == "INFO" for r in caplog.records)
+
+
+def test_a_deferred_bootstrap_floor_is_recorded_as_a_failed_attempt_and_computed_once_there_is_room(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from brain.memory import floor_calibration
+
+    model_id = "deferred-then-computed-model"
+    provider = _bounded_bootstrap(monkeypatch, model_id, 5e12)
+    floor_calibration.note_bootstrap_needed("rerank", model_id)
+    assert floor_calibration.run_rerank_bootstrap(model_id, activity_marker="m1") is None
+    assert floor_calibration.bootstrap_failed("rerank", model_id) is True
+    assert floor_calibration.rerank_bootstrap_due(model_id, activity_marker="m1") is False
+    assert floor_calibration.rerank_bootstrap_due(model_id, activity_marker="m2") is True
+    _keep_fit(model_id)  # the process holds a memory model now, and the headroom is ample
+    result = floor_calibration.run_rerank_bootstrap(model_id, activity_marker="m2")
+    assert result is not None and result["is_cold_start"] is True
+    assert provider.calls == len(floor_calibration._bootstrap_labeled_pairs())  # noqa: SLF001
+    assert floor_calibration.bootstrap_failed("rerank", model_id) is False
+    assert floor_calibration.peek_bootstrap_floor(model_id) is not None
+
+
+def test_a_bootstrap_floor_that_fails_for_another_reason_is_still_logged_with_its_traceback(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from brain.memory import floor_calibration
+
+    model_id = "other-failure-model"
+    provider = _bounded_bootstrap(monkeypatch, model_id, 5e12)
+    _keep_fit(model_id)
+
+    def _boom(query, documents):
+        raise RuntimeError("scoring failed")
+
+    monkeypatch.setattr(provider, "rerank", _boom)
+    with caplog.at_level("INFO"):
+        assert floor_calibration.get_bootstrap_floor(model_id) is None
+    assert any(r.exc_info for r in caplog.records)
