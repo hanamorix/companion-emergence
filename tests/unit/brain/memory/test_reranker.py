@@ -902,8 +902,17 @@ def test_cgroup_v2_without_a_memory_current_is_still_none_even_with_a_stat(monke
     """The stat is only read after the usage was read: no usage -> None, as before."""
     files = _v2_files("inactive_file 600000000\n")
     del files[f"{_V2_OWN}/memory.current"]
-    _use_files(monkeypatch, files)
+    inner = _fake_open_dispatcher(files)
+    opened: list[str] = []
+
+    def _open(path, *args, **kwargs):
+        opened.append(str(path))
+        return inner(path, *args, **kwargs)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr("builtins.open", _open)
     assert reranker_mod._cgroup_v2_memory_headroom_bytes() is None
+    assert not any(p.endswith("/memory.stat") for p in opened)
 
 
 def test_cgroup_v1_headroom_subtracts_the_hierarchical_reclaimable_file_cache(
