@@ -262,6 +262,7 @@ class CrossEncoderProvider(RerankerProvider):
     _run_wrapped = False
     _wrapper_calls = 0
     _drift_checked = False
+    _install_failed = False
 
     def __init__(self, model_id: str, cache_dir: str | Path) -> None:
         # Imported lazily (module-scoped, not top-level) so importing this
@@ -308,6 +309,8 @@ class CrossEncoderProvider(RerankerProvider):
         only, so a stop can never reach another thread's call (the floor-bootstrap thread, a
         reply's own recall rerank). A stop before the call starts makes the call start terminated.
         `onnxruntime` unavailable: a no-op stop (the S218 fallback)."""
+        if self._install_failed:
+            return _noop  # the session cannot be wrapped (warned once): S218 fallback
         try:
             import onnxruntime as ort
 
@@ -367,6 +370,7 @@ class CrossEncoderProvider(RerankerProvider):
             )
             self._run_wrapped = False
             self._want_terminable = False
+            self._install_failed = True  # never retried, never warned again
 
     def _check_wrapper_reached_once(self, calls_before: int, documents: Sequence[str]) -> None:
         """S223 drift check: after the first scored call (at least one document) through the

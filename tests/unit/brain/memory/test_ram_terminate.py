@@ -249,7 +249,10 @@ def test_a_session_whose_run_cannot_be_replaced_warns_once_and_everything_still_
         assert provider.rerank("q", ["d"]) == [0.0]
         assert provider.rerank("q", ["d"]) == [0.0]
     stop()  # harmless
-    assert frozen.calls == 2
+    assert provider.arm_terminate()() is None, "a later arm after the failed install is a no-op"
+    with caplog.at_level("WARNING", logger=reranker_mod.log.name):
+        provider.rerank("q", ["d"])
+    assert frozen.calls == 3
     assert len([r for r in caplog.records if "stoppable" in r.getMessage()]) == 1
 
 
