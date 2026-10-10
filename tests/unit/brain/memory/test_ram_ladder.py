@@ -24,6 +24,7 @@ from tests.unit.brain.memory._ram_support import (
 
 _MODEL = "scripted-ladder"
 _BUDGET = 2.0
+_REAL_HEADROOM = reranker_mod._available_ram_headroom_bytes  # noqa: SLF001 - the fixture below replaces it
 
 
 @pytest.fixture(autouse=True)
@@ -321,3 +322,142 @@ def test_the_marker_arriving_after_the_shapes_opens_the_gate_at_once(store) -> N
     assert reranker_mod.ram_figure_ready(_MODEL, store) is False
     reranker_mod._ram_shapes.record(store, _MODEL, ram_fit.COMPLETE_MARKER, 0.0)  # noqa: SLF001
     assert reranker_mod.ram_figure_ready(_MODEL, store) is True
+
+
+# ---- S242: a pass that stopped before its first batch leaves a fit that holds single pairs only ----
+
+_QUERY = "which name did we settle on for the dog"
+
+
+def _docs(n: int, chars: int = 400) -> list[str]:
+    return [f"{i} " + "word " * (chars // 5) for i in range(n)]
+
+
+def _headroom_stopped_pass(store, monkeypatch, *, headroom: float = 0.0) -> ScriptedLadderProvider:
+    """A pass whose phase 2 stops on the live headroom (it still records the completion marker, S239/R13);
+    afterwards the live headroom is generous."""
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: headroom)
+    provider = ScriptedLadderProvider(model=_MODEL)
+    assert reranker_mod.measure_ram_figure(provider, store) is True
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 1e12)
+    return provider
+
+
+def test_a_headroom_stopped_pass_leaves_a_fit_that_holds_single_pairs_only(store, monkeypatch) -> None:
+    _headroom_stopped_pass(store, monkeypatch)
+    rows = reranker_mod._ram_shapes.shape_groups(store, _MODEL)  # noqa: SLF001
+    assert ram_fit.ladder_complete(rows), "the marker is recorded"
+    fit = reranker_mod._window_ram_fit(store, _MODEL)  # noqa: SLF001
+    assert fit is not None and fit.max_pairs == 1 and fit.max_length == FULL
+
+
+def test_a_recall_after_a_headroom_stopped_pass_takes_the_cosine_path_and_a_complete_pass_reranks(
+    store, monkeypatch, tmp_path
+) -> None:
+    provider = _headroom_stopped_pass(store, monkeypatch)
+    before = len(provider.timed)
+    out = reranker_mod.rerank_for_recall(provider, _QUERY, _docs(50), store=store, budget_seconds=4.0)
+    assert (out.reranked, out.hand_off, out.measured) == (False, "budget", False)
+    assert len(provider.timed) == before, "no rerank ran"
+    # the control: the same recall on a store whose ladder ran to the end (headroom unreadable = the rungs run)
+    other = MemoryStore(tmp_path / "other.db", integrity_check=False)
+    try:
+        monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
+        control = ScriptedLadderProvider(model=_MODEL)
+        assert reranker_mod.measure_ram_figure(control, other) is True
+        fit = reranker_mod._window_ram_fit(other, _MODEL)  # noqa: SLF001
+        assert fit is not None and fit.max_pairs > 1
+        monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 1e12)
+        done = len(control.timed)
+        out = reranker_mod.rerank_for_recall(control, _QUERY, _docs(50), store=other, budget_seconds=4.0)
+        assert out.reranked is True and out.width >= reranker_mod.RERANK_MIN_REAL_CANDIDATES
+        assert len(control.timed) == done + 1
+    finally:
+        other.close()
+
+
+def test_a_measured_batch_of_two_pairs_lifts_the_cap_for_the_same_window(store, monkeypatch) -> None:
+    provider = _headroom_stopped_pass(store, monkeypatch)
+    reranker_mod._record_rerank_cost(_MODEL, store, 2 * 128, 0.1, 5e6, pairs=2, longest=128)  # noqa: SLF001
+    out = reranker_mod.rerank_for_recall(provider, _QUERY, _docs(50), store=store, budget_seconds=4.0)
+    assert out.reranked is True
+
+
+def test_a_pass_ended_by_the_time_budget_is_capped_the_same_way(store, monkeypatch) -> None:
+    """A second way to a single-pair-only window that records the marker (the budget at or below the call
+    overhead): the same capped fit, the same cosine path. Pinned (R7: the 24-hour consequence is a question)."""
+    monkeypatch.setattr(reranker_mod, "_full_rerank_budget", lambda: 0.0)
+    provider = ScriptedLadderProvider(model=_MODEL)
+    assert reranker_mod.measure_ram_figure(provider, store) is True
+    assert ram_fit.ladder_complete(reranker_mod._ram_shapes.shape_groups(store, _MODEL))  # noqa: SLF001
+    fit = reranker_mod._window_ram_fit(store, _MODEL)  # noqa: SLF001
+    assert fit is not None and fit.max_pairs == 1
+    monkeypatch.setattr(reranker_mod, "_full_rerank_budget", lambda: _BUDGET)
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 1e12)
+    out = reranker_mod.rerank_for_recall(provider, _QUERY, _docs(50), store=store, budget_seconds=4.0)
+    assert (out.reranked, out.hand_off) == (False, "budget")
+
+
+def test_the_ladders_own_batch_rungs_are_not_refused_by_the_cap(store, monkeypatch) -> None:
+    """The cap holds back real reranks, not the calls that measure larger batches: a later pass on the capped
+    window, with room, runs its first batch rung of 2 pairs."""
+    provider = _headroom_stopped_pass(store, monkeypatch)
+    before = len(provider.timed)
+    assert reranker_mod.measure_ram_figure(provider, store) is True
+    assert provider.timed[before][0] == 2 and len(provider.timed) > before
+    fit = reranker_mod._window_ram_fit(store, _MODEL)  # noqa: SLF001
+    assert fit is not None and fit.max_pairs > 1
+
+
+def _stuck_miss() -> reranker_mod._BudgetMiss:
+    return reranker_mod._BudgetMiss(  # noqa: SLF001
+        query=_QUERY,
+        documents=tuple(_docs(5)),
+        candidate_tokens=(1000,) * 5,
+        anchor_tokens=(50,) * len(reranker_mod.ANCHOR_POOL),
+    )
+
+
+def test_the_stuck_width_re_measure_does_not_run_a_batch_larger_than_any_measured(store, monkeypatch, caplog) -> None:
+    """S242 in the second caller: the miss is time-stuck (5 long candidates exceed the full budget), the window is
+    capped, the live headroom is generous: the job skips (the miss stays, no rerank ran). On a window with a
+    measured batch it runs."""
+    provider = _headroom_stopped_pass(store, monkeypatch)
+    reranker_mod._budget_misses[_MODEL] = _stuck_miss()  # noqa: SLF001
+    reranker_mod._provider_cache[_MODEL] = provider  # noqa: SLF001
+    try:
+        before = len(provider.timed)
+        with caplog.at_level("INFO"):
+            assert reranker_mod.remeasure_stuck_width("marker-1", store) is False
+        assert len(provider.timed) == before
+        assert reranker_mod._budget_misses.get(_MODEL) is not None  # noqa: SLF001
+        assert any("larger than any shape measured" in r.getMessage() for r in caplog.records)
+        reranker_mod._record_rerank_cost(_MODEL, store, 2 * 128, 0.1, 5e6, pairs=2, longest=128)  # noqa: SLF001
+        assert reranker_mod.remeasure_stuck_width("marker-2", store) is True
+        assert len(provider.timed) == before + 1
+    finally:
+        reranker_mod._provider_cache.pop(_MODEL, None)  # noqa: SLF001
+
+
+# ---- S241 through the ladder: the real headroom function, its sources patched ----
+
+
+def test_the_ladder_stops_on_the_smaller_of_the_cgroup_figure_and_psutil(store, monkeypatch) -> None:
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", _REAL_HEADROOM)
+    monkeypatch.setattr(reranker_mod, "_cgroup_v2_memory_headroom_bytes", lambda: 5e12)  # a cap above any host
+    monkeypatch.setattr(reranker_mod, "_cgroup_v1_memory_headroom_bytes", lambda: None)
+    monkeypatch.setattr(reranker_mod, "_psutil_available_bytes", lambda: 1.0)
+    provider = ScriptedLadderProvider(model=_MODEL)
+    assert reranker_mod.measure_ram_figure(provider, store) is True
+    assert provider.timed == [(1, 1024), (1, 512), (1, 256), (1, 128)], "psutil's 1 byte stopped phase 2"
+
+
+def test_the_ladder_runs_its_batches_when_both_sources_have_room(store, monkeypatch) -> None:
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", _REAL_HEADROOM)
+    monkeypatch.setattr(reranker_mod, "_cgroup_v2_memory_headroom_bytes", lambda: 5e12)
+    monkeypatch.setattr(reranker_mod, "_cgroup_v1_memory_headroom_bytes", lambda: None)
+    monkeypatch.setattr(reranker_mod, "_psutil_available_bytes", lambda: 5e12)
+    provider = ScriptedLadderProvider(model=_MODEL)
+    reranker_mod.measure_ram_figure(provider, store)
+    assert [p for p, _l in provider.timed[4:]] == _batch_sizes()
+

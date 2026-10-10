@@ -232,6 +232,40 @@ def test_oom_guard_docstring_names_the_psutil_fallback_not_meminfo() -> None:
     assert "host-wide `/proc/meminfo`" not in doc and "cgroup/meminfo" not in doc
 
 
+def test_oom_guard_docstring_states_the_smaller_of_the_cgroup_and_psutil_figures() -> None:
+    """S241: the helper returns the smaller of the cgroup figure and psutil's, not psutil only when no cgroup
+    level could be measured."""
+    doc = " ".join((judge_selftune._downgrade_for_oom_safety.__doc__ or "").split())
+    assert "smaller of" in doc and "only when no cgroup level could be measured" not in doc
+
+
+def test_oom_guard_through_the_real_headroom_reader_takes_the_smaller_of_cgroup_and_psutil(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S241 through the caller: a cgroup cap far above the host's free memory (200 GB of room) must not keep the
+    beefy tier when the host has 2 GB available; and a cgroup figure below the host's decides when it is smaller.
+    Both readings come through the REAL `_available_ram_headroom_bytes` (only its sources are patched)."""
+    from brain.memory import reranker as reranker_mod
+
+    monkeypatch.setattr(reranker_mod, "_cgroup_v2_memory_headroom_bytes", lambda: 200e9)
+    monkeypatch.setattr(reranker_mod, "_cgroup_v1_memory_headroom_bytes", lambda: None)
+    monkeypatch.setattr(reranker_mod, "_psutil_available_bytes", lambda: 2e9)
+    headroom = judge_selftune._available_ram_headroom_bytes()
+    assert headroom == 2e9
+    assert (
+        judge_selftune._downgrade_for_oom_safety(judge_selftune.TUNE_GRADE_FULL_FT, headroom)
+        == judge_selftune.TUNE_GRADE_KNOB_REFIT
+    )
+    monkeypatch.setattr(reranker_mod, "_cgroup_v2_memory_headroom_bytes", lambda: 8e9)
+    monkeypatch.setattr(reranker_mod, "_psutil_available_bytes", lambda: 64e9)
+    headroom = judge_selftune._available_ram_headroom_bytes()
+    assert headroom == 8e9
+    assert (
+        judge_selftune._downgrade_for_oom_safety(judge_selftune.TUNE_GRADE_FULL_FT, headroom)
+        == judge_selftune.TUNE_GRADE_LORA
+    )
+
+
 def test_oom_guard_none_headroom_fails_toward_knob_refit() -> None:
     """No headroom signal at all (every source unavailable) means no
     signal to TRUST the RAM-tier pick with either — same fail-toward-safe

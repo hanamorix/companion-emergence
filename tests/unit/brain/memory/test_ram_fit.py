@@ -221,3 +221,46 @@ def test_the_completion_marker_row_is_not_a_shape() -> None:
     groups = ram_fit.groups_from_rows(rows)
     assert [(g.pairs, g.length) for g in groups] == [(1, 512), (1, 1024)]
     assert ram_fit.encode_shape(1, 1) != ram_fit.COMPLETE_MARKER
+
+
+# --------------------------------------------------------------------------- S242: the per-dimension cap
+
+
+def _fit(max_pairs: int, max_length: int) -> ram_fit.RamFit:
+    return ram_fit.RamFit(a=0.0, b=1.0, c=0.0, shapes=4, samples=4, max_pairs=max_pairs, max_length=max_length)
+
+
+@pytest.mark.parametrize(
+    ("pairs", "length", "expected"),
+    [
+        (1, 1024, True),  # the largest shape measured
+        (1, 100, True),  # shorter
+        (1, 1025, False),  # longer than any measured
+        (2, 100, False),  # more pairs than any measured
+        (2, 1025, False),
+        (58, 1024, False),
+    ],
+)
+def test_a_fit_with_single_pairs_only_covers_no_more_pairs_and_no_longer_a_padded_length(
+    pairs: int, length: int, expected: bool
+) -> None:
+    assert _fit(1, 1024).within_measured(pairs, length) is expected
+
+
+def test_the_cap_lifts_once_a_batch_of_more_than_one_pair_is_measured() -> None:
+    """The order's condition: 'until the fit holds a measured batch of more than one pair'. The residual (a
+    larger batch is then extrapolated) is the disclosed reading R6."""
+    assert _fit(2, 128).within_measured(50, 5000) is True
+    assert _fit(2, 128).within_measured(2, 128) is True
+
+
+def test_the_dimensions_are_the_largest_measured_ones_of_the_window() -> None:
+    """`max_pairs` / `max_length` of a real fit are the per-dimension maxima over all its groups, so a window
+    of single pairs gives the cap and one 2-pair shape lifts it."""
+    singles = _groups([(1, 1024, 191.9), (1, 512, 8.4), (1, 256, 0.2), (1, 128, 0.2)])
+    capped = ram_fit.fit_ram(singles)
+    assert capped is not None and (capped.max_pairs, capped.max_length) == (1, 1024)
+    assert capped.within_measured(1, 1024) and not capped.within_measured(2, 1024)
+    lifted = ram_fit.fit_ram(singles + _groups([(2, 128, 1.0)], full_at=(0, 0)))
+    assert lifted is not None and lifted.max_pairs == 2 and lifted.within_measured(50, 1024)
+
