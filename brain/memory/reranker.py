@@ -1726,8 +1726,8 @@ def _warm_up_once(
     (`_batch_fits_ram_bound`). When one does not, NO warm-up runs, the model is NOT marked warmed
     (the next call tries again) and the recall goes on under its own bounds; the pair-length probe
     that follows loads the model on demand (`CrossEncoderProvider._pair_tokenizer`), so the lengths
-    stay available (the one-time load may then be timed inside that probe: a one-sample skew, on
-    a host with no room). The ladder's own warm-up is not bounded here (`bounded` False): its
+    stay available (the real provider starts the probe's clock after that load, so the load is not
+    timed into `T_p`; a test double that reports no seconds is timed by its caller). The ladder's own warm-up is not bounded here (`bounded` False): its
     headroom check comes first (`measure_ram_figure`)."""
     model_id = provider.model_id()
     with _cost_lock:
