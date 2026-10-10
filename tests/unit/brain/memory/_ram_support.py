@@ -75,7 +75,9 @@ def shapes_in_window(store, model_id: str) -> dict[tuple[int, int], tuple[int, f
     """`{(pairs, length): (samples, total growth)}` of the memory series window."""
     groups = reranker_mod._ram_shapes.shape_groups(store, model_id)  # noqa: SLF001
     assert groups is not None
-    return {ram_fit.decode_shape(x)[:2]: (n, total) for x, n, total in groups}
+    return {
+        ram_fit.decode_shape(x)[:2]: (n, total) for x, n, total in groups if x != ram_fit.COMPLETE_MARKER
+    }
 
 
 def full_marked(store, model_id: str) -> bool:
@@ -83,11 +85,14 @@ def full_marked(store, model_id: str) -> bool:
     return any(ram_fit.decode_shape(x)[2] for x, _n, _t in groups or [])
 
 
-def seed_window(store, model_id: str, bytes_per_token: float = 245.0) -> None:
-    """Four shapes (growth = bytes_per_token x padded tokens, the full-length one marked)."""
+def seed_window(store, model_id: str, bytes_per_token: float = 245.0, *, complete: bool = True) -> None:
+    """Four shapes (growth = bytes_per_token x padded tokens, the full-length one marked) and, by
+    default, the marker of a finished ladder pass."""
     for pairs, length, full in [(1, FULL, True), (1, 512, False), (1, 256, False), (2, 128, False)]:
         x = ram_fit.encode_shape(pairs, length, full=full)
         reranker_mod._ram_shapes.record(store, model_id, x, bytes_per_token * pairs * length)  # noqa: SLF001
+    if complete:
+        reranker_mod._ram_shapes.record(store, model_id, ram_fit.COMPLETE_MARKER, 0.0)  # noqa: SLF001
 
 
 def flush(store) -> None:

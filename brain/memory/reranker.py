@@ -691,7 +691,9 @@ _ram_shapes = cost_series.CostSeries(cost_series.RAM_SHAPE_SERIES)
 # (the full-length sample aged out after a quiet day). Process memory, never saved; guarded by
 # `_cost_lock` with the memo.
 _ram_fit_kept: dict[tuple[str, str], ram_fit.RamFit] = {}
-_ram_fit_memo: dict[tuple[str, str], tuple[tuple[ram_fit.ShapeGroup, ...], ram_fit.RamFit | None]] = {}
+_ram_fit_memo: dict[
+    tuple[str, str], tuple[tuple[ram_fit.ShapeGroup, ...], bool, ram_fit.RamFit | None]
+] = {}
 _warmed_model_ids: set[str] = set()
 _budget_misses: dict[str, _BudgetMiss] = {}
 _remeasured_marker: dict[str, object] = {}
@@ -716,22 +718,25 @@ _cost_lock = threading.Lock()
 
 def _window_ram_fit(store: MemoryStore, model_id: str) -> ram_fit.RamFit | None:
     """The usable fit over the shape series' window (S220), or `None` (not enough distinct
-    shapes, no full-length sample, or the database read failed). One aggregate read per call
-    (a row per distinct shape); the fit is memoised on the exact groups, so repeated calls
-    within a reply cost one read and a tuple comparison. A usable fit is also remembered as the
-    process's kept fit (H4b)."""
+    shapes, no full-length sample, no finished ladder pass, or the database read failed). A
+    window whose ladder pass did not finish (no completion marker) gives no fit: its single
+    pairs would extrapolate batch sizes (under-predicting them by 17 to 100 percent). One
+    aggregate read per call (a row per distinct shape); the fit is memoised on the exact groups,
+    so repeated calls within a reply cost one read and a tuple comparison. A usable fit is also
+    remembered as the process's kept fit (H4b)."""
     rows = _ram_shapes.shape_groups(store, model_id)
     if rows is None:
         return None
     groups = tuple(ram_fit.groups_from_rows(rows))
+    complete = ram_fit.ladder_complete(rows)
     key = (cost_series._store_key(store), model_id)
     with _cost_lock:
         memo = _ram_fit_memo.get(key)
-    if memo is not None and memo[0] == groups:
-        return memo[1]
-    fit = ram_fit.fit_ram(groups)
+    if memo is not None and memo[0] == groups and memo[1] == complete:
+        return memo[2]
+    fit = ram_fit.fit_ram(groups) if complete else None
     with _cost_lock:
-        _ram_fit_memo[key] = (groups, fit)
+        _ram_fit_memo[key] = (groups, complete, fit)
         if fit is not None:
             _ram_fit_kept[key] = fit
     return fit
@@ -974,6 +979,13 @@ def ram_figure_ready(model_id: str, store: MemoryStore) -> bool:
     return True
 
 
+def ram_figure_refresh_wanted(model_id: str) -> bool:
+    """Whether a refresh of the memory model is flagged for `model_id` (a turn found none, or
+    served only a kept one): the direct chat starts its background ladder for it."""
+    with _cost_lock:
+        return model_id in _ram_figure_needed
+
+
 def note_ram_figure_needed(model_id: str) -> None:
     """S200: a recall turn that would rerank found no usable RAM model (or only a kept one);
     flag it so the next lull's `rerank_ram_figure` job measures one. Never loads anything."""
@@ -1143,8 +1155,13 @@ def measure_ram_figure(
     gives a usable memory model, one measured call per rung, each recorded like any recall
     rerank (`_record_rerank_cost`). Returns True iff the window gives a usable model afterwards.
     The next rung is always decided from the window, so a restart or an abandoned pass resumes
-    where it stands, and no rung repeats a shape. A rung that cannot be built, or whose peak
-    growth cannot be read, ends the pass (it is retried at a later lull). Provider exceptions
+    where it stands, and no rung repeats a shape. A rung that cannot be built, whose peak growth
+    cannot be read, or that recorded nothing new ends the pass (it is retried at a later lull).
+    A pass that gets through phase 2 (every batch size run, dominated, or ruled out by the time
+    budget or the headroom) records the completion marker; only then does the window give a model
+    for sizing (`_window_ram_fit`), so the first batches are never sized from single pairs alone.
+    The FIRST rung (the full-length pair, about 300 MB on the reference model) runs without a
+    headroom check, like the first-ever seed always did (S184, S200). Provider exceptions
     propagate.
 
     S218: with a `watch` (the direct chat passes `cli_throttle.reply_watch()`), a reply that
@@ -1171,9 +1188,18 @@ def measure_ram_figure(
         rung = _next_length_rung(groups, cap)
         if rung is None:
             break
+        shortest = min((g.length for g in groups if g.pairs == 1), default=None)
         if not _run_rung(provider, store, model_id, base_text, rung, cap, watch):
             return _window_ready(store, model_id)
-    # Phase 2: batches of increasing size, at the time-budget frontier.
+        after = _window_groups(store, model_id)
+        if after is None or not _rung_made_progress(rung, shortest, after):
+            _warn_ram_figure_once("RAM measurement stopped: a rung recorded nothing new")
+            return _window_ready(store, model_id)
+    # Phase 2: batches of increasing size, at the time-budget frontier. The pass is COMPLETE when
+    # every size has run, been dominated by a measured shape, or been ruled out by the time
+    # budget or the live headroom (a larger one fits no better); a rung that cannot be built or
+    # read leaves it incomplete, to be retried at a later lull.
+    completed = True
     for pairs in _batch_sizes():
         _abandon_if_replying(watch)
         groups = _window_groups(store, model_id)
@@ -1192,8 +1218,29 @@ def measure_ram_figure(
             log.info("reranker: RAM ladder stopped: %d pairs x %d tokens would not fit the headroom", pairs, length)
             break
         if not _run_rung(provider, store, model_id, base_text, _Rung(pairs, length), cap, watch):
+            completed = False
             break
+    if completed:
+        _mark_ladder_complete(store, model_id)
     return _window_ready(store, model_id)
+
+
+def _rung_made_progress(rung: _Rung, shortest: int | None, after: Sequence[ram_fit.ShapeGroup]) -> bool:
+    """Whether a phase-1 rung left a new shape in the window: the full-length pair its marker, a
+    shorter rung a single-pair length below the shortest one measured before it. A rung that
+    recorded nothing (an unpackable shape, an unreadable series) would otherwise repeat forever."""
+    if rung.full:
+        return any(g.full for g in after)
+    singles = [g.length for g in after if g.pairs == 1]
+    return bool(singles) and shortest is not None and min(singles) < shortest
+
+
+def _mark_ladder_complete(store: MemoryStore, model_id: str) -> None:
+    """Record, once per window, that a ladder pass finished (`ram_fit.COMPLETE_MARKER`)."""
+    rows = _ram_shapes.shape_groups(store, model_id)
+    if rows is None or ram_fit.ladder_complete(rows):
+        return
+    _ram_shapes.record(store, model_id, ram_fit.COMPLETE_MARKER, 0.0)
 
 
 def run_ram_figure(
@@ -1201,8 +1248,9 @@ def run_ram_figure(
 ) -> bool:
     """The `rerank_ram_figure` job's run (S200): stamp the attempt, then run the ladder on the
     runtime reranker (building the provider here, at a lull, is what keeps the model load off the
-    reply path). Returns True iff the window then gives a usable memory model. Provider
-    exceptions propagate (the central pass logs them).
+    reply path). Returns True iff the window then gives a usable memory model; when it already
+    does, nothing is built or measured and the result is False. Provider exceptions propagate
+    (the central pass logs them).
 
     S218: `watch` (the direct chat's `cli_throttle.reply_watch()`, taken by the caller before
     the due check and the store) is checked before the provider is built and passed to

@@ -1,13 +1,12 @@
-"""S200: no re-scoring until a RAM figure exists (name-recall fix, fixes the S193
-first-rerank regression).
+"""S200, S220: no re-scoring until the machine's memory model exists (name-recall fix, fixes
+the S193 first-rerank regression).
 
-On a machine with no saved RAM figure a recall turn takes the plain meaning-match
-(cosine) path with nothing of the reranker built, loaded, warmed up or probed on
-the reply path, and flags the need; the `rerank_ram_figure` lull job then measures
-the figure from ONE pair at the model's full input length, and the first real
-rerank is sized from it (not the S5 width-5 seed). The older width-5 seeds of S158,
-S178 and S180 are retired (S203); the S182 re-seed in `remeasure_stuck_width` stays
-until the batch-sizing build (S212).
+On a machine with no usable memory model a recall turn takes the plain meaning-match (cosine)
+path with nothing of the reranker built, loaded, warmed up or probed on the reply path, and flags
+the need; the `rerank_ram_figure` lull job (or the `--no-bridge` thread) then runs the ladder
+(`test_ram_ladder.py`), and the first real rerank is sized from the fitted model. The older
+width-5 seeds and the S182 re-seed are retired (S203, S212, S220). This file covers the gate, the
+lull job's due/run logic and the background thread (S201, S210).
 
 No model is loaded: fake providers. `reranker._require_ram_figure` is switched on
 per test (the suite's autouse fixture switches it off).
@@ -147,8 +146,6 @@ def test_the_same_turn_reranks_once_a_window_figure_exists(
     assert reranker_mod._ram_figure_needed == set()
 
 
-
-
 def test_the_shipped_default_requires_a_ram_figure() -> None:
     """The suite switches the requirement off (autouse); nothing else pins the
     production default, so a flipped default would disable S200 unnoticed."""
@@ -159,33 +156,9 @@ def test_the_shipped_default_requires_a_ram_figure() -> None:
     assert re.search(r"^_require_ram_figure = True$", source, re.MULTILINE)
 
 
-
-
-
-
-
-
 # ---------------------------------------------------------------------------
 # F-B2: the measurement
 # ---------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -199,12 +172,6 @@ def _factory(store: MemoryStore):
         yield store
 
     return _open
-
-
-
-
-
-
 
 
 def test_a_provider_failure_in_the_job_run_propagates_for_the_central_pass_to_log(
@@ -247,6 +214,30 @@ def test_a_kept_fit_serves_a_running_process_whose_window_lost_the_model(
     # a fresh process (kept fits forgotten) in the same state is held back
     reranker_mod._reset_rerank_cost_model()
     assert reranker_mod.ram_figure_ready(_RERANKER_ID, store) is False
+
+
+def test_a_turn_served_by_a_kept_fit_asks_the_direct_chat_to_refresh_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """H4b: the turn still reranks (the process keeps its last fit), and under `nell chat
+    --no-bridge` (no lull job) the refresh is requested for after the reply."""
+    from brain.memory import floor_startup
+
+    store, _memories = _recall_setup(monkeypatch, tmp_path)
+    rec = _CappedReranker()
+    monkeypatch.setattr("brain.memory.reranker.build_reranker_provider", lambda **kw: rec)
+    _warm(store)
+    seed_window(store, _RERANKER_ID)
+    floor_startup.enable_background_ram_figure(tmp_path)
+    first = run_semantic_recall(store, tmp_path, _QUERY)
+    assert first is not None and first.path == RERANKED_PATH
+    assert floor_startup._ram_figure_requested is False  # noqa: SLF001, the window still gives the model
+
+    monkeypatch.setattr(reranker_mod._ram_shapes, "shape_groups", lambda *_a, **_k: [])  # the window lost it
+    second = run_semantic_recall(store, tmp_path, _QUERY)
+    assert second is not None and second.path == RERANKED_PATH, "the kept fit keeps the turn reranking"
+    assert floor_startup._ram_figure_requested is True  # noqa: SLF001
+    assert _RERANKER_ID in reranker_mod._ram_figure_needed
 
 
 def test_the_kept_fit_is_keyed_by_database_and_model_id(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

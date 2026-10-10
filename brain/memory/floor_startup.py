@@ -312,7 +312,7 @@ def request_rerank_bootstrap() -> threading.Thread | None:
         return None
 
 
-# S201: `nell chat --no-bridge` has no lull cadence, so it measures the RAM figure itself on first
+# S201: `nell chat --no-bridge` has no lull cadence, so it runs the RAM ladder itself on first
 # need. The direct chat registers its persona dir here; the bridge never does (its lull job,
 # `rerank_ram_figure`, measures the figure). None = no background measurement in this process.
 _ram_figure_persona_dir: Path | None = None
@@ -376,7 +376,7 @@ def _ram_figure_body(persona_dir: Path) -> None:
 
 
 def request_ram_figure() -> bool:
-    """First-need request (S201, S210): a turn that would rerank found no RAM figure. When the
+    """First-need request (S201, S210): a turn that would rerank found no usable memory model. When the
     direct chat has registered its persona dir, record the need and return True; start NOTHING
     (S210: the measurement must not run while the reply that flagged it is being built; the REPL
     calls `start_requested_ram_figure` once that reply is finished). Returns False when no persona

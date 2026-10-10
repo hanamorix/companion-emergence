@@ -208,3 +208,16 @@ def test_a_window_with_no_positive_growth_is_no_model() -> None:
     groups = [ShapeGroup(1, ln, ln == 1024, 3, 0.0) for ln in (1024, 512, 256, 128)]
     assert ram_fit.enough_shapes(groups) is True
     assert ram_fit.fit_ram(groups) is None
+
+
+def test_the_completion_marker_row_is_not_a_shape() -> None:
+    rows = [
+        (ram_fit.encode_shape(1, 1024, full=True), 2, 380.0),
+        (ram_fit.COMPLETE_MARKER, 1, 0.0),
+        (ram_fit.encode_shape(1, 512), 1, 70.0),
+    ]
+    assert ram_fit.ladder_complete(rows) is True
+    assert ram_fit.ladder_complete(rows[:1] + rows[2:]) is False
+    groups = ram_fit.groups_from_rows(rows)
+    assert [(g.pairs, g.length) for g in groups] == [(1, 512), (1, 1024)]
+    assert ram_fit.encode_shape(1, 1) != ram_fit.COMPLETE_MARKER

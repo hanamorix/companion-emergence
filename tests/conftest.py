@@ -382,7 +382,7 @@ def _floor_bootstrap_background_off_by_default(
 
 @pytest.fixture(autouse=True)
 def _ram_figure_not_required_by_default(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """S200: a recall on a machine with no saved RAM figure takes the cosine path
+    """S200: a recall on a machine with no usable memory model takes the cosine path
     until the lull job has measured one. The suite's recall tests build reranks from
     fakes with no seeded figure, so the requirement is off by default; the S200
     tests set `reranker._require_ram_figure` True themselves. Also clears the

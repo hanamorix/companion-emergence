@@ -134,7 +134,7 @@ def test_chat_repl_produces_response_for_one_turn(capsys: pytest.CaptureFixture)
 def test_chat_repl_starts_a_requested_ram_measurement_only_after_the_reply_is_printed(
     capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """S210: the one-pair RAM measurement a flagged turn asked for starts after that reply is
+    """S210: the RAM ladder a flagged turn asked for starts after that reply is
     finished and printed, never while it is being built."""
     from brain.memory import floor_startup
 

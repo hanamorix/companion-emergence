@@ -17,7 +17,9 @@ No macOS/Windows reader exists: there is no per-call resettable peak there (open
 
 The reset is process-wide, so the reading includes anything else the process allocates during
 the call; the callers hold the reranker's lock around the call so reranker calls do not
-overlap, and a reading inflated by another thread over-states the need (never under-states).
+overlap. Another thread's allocation during the call over-states the need; another thread FREEING
+memory right after the reset (the reset restarts the peak at the current RSS, which still holds
+it) can make the reading too low.
 """
 
 from __future__ import annotations
@@ -71,7 +73,10 @@ def available() -> bool:
     reset file writable, and no earlier failure in this process. Side-effect free (no reset)."""
     if _latched_off or not _is_linux:
         return False
-    return os.access(_PROC_STATUS, os.R_OK) and os.access(_CLEAR_REFS, os.W_OK)
+    usable = os.access(_PROC_STATUS, os.R_OK) and os.access(_CLEAR_REFS, os.W_OK)
+    if not usable:
+        _warn_once("the kernel's peak counter is not accessible here")
+    return usable
 
 
 def begin() -> float | None:

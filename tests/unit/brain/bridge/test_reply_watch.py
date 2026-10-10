@@ -1,4 +1,4 @@
-"""S218: the reply-activity signal the direct chat's one-pair RAM measurement watches.
+"""S218: the reply-activity signal the direct chat's RAM ladder watches.
 
 `cli_throttle.reply_watch()` snapshots reply activity and returns `still_clear()`;
 `wait_for_no_reply_in_flight()` blocks a background thread until no reply is in flight.

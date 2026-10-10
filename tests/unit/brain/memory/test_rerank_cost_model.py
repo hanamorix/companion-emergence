@@ -716,7 +716,8 @@ def _seed_ram(
     for pairs, length, full in [(1, 1024, True), (1, 512, False), (1, 256, False), (2, 128, False)]:
         x = ram_fit.encode_shape(pairs, length, full=full)
         reranker_mod._ram_shapes.record(store, model, x, bytes_per_token * pairs * length)
-    assert cost_series.flush(store) >= 4
+    reranker_mod._ram_shapes.record(store, model, ram_fit.COMPLETE_MARKER, 0.0)  # a finished ladder pass
+    assert cost_series.flush(store) >= 5
     if fresh_process:
         reranker_mod._reset_rerank_cost_model()
         cost_series._reset_pending()
@@ -942,7 +943,7 @@ def _ram_figure_required(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _assert_held_back(provider: _CostScriptedProvider, out, model: str = _MODEL) -> None:
     """S203: no width-5 seeding batch. The rerank is not run, nothing is warmed up or recorded,
-    the need is flagged for the one-pair measurement (S200)."""
+    the need is flagged for the RAM ladder (S200, S220)."""
     assert out.reranked is False and out.width == 0 and out.hand_off == "ram_figure"
     assert model not in reranker_mod._warmed_model_ids
     assert model in reranker_mod._ram_figure_needed, "the need is flagged"
@@ -952,7 +953,7 @@ def _assert_held_back(provider: _CostScriptedProvider, out, model: str = _MODEL)
 def test_s203_a_process_about_to_rerank_with_no_ram_figure_takes_the_cosine_handoff_and_flags_the_need(
     clock: _Clock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Replaces the S158 width-5 seeding rerank (cs15): a saved time estimate and no RAM figure."""
+    """Replaces the S158 width-5 seeding rerank (cs15): a saved time estimate and no memory model."""
     _ram_figure_required(monkeypatch)
     _persist_estimate()
     provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-4)
@@ -993,7 +994,7 @@ def test_s206_with_an_unreadable_rss_the_turn_is_not_held_back_and_the_first_rer
 
 
 # ---------------------------------------------------------------------------
-# S171, S176 follow-up: the RAM figure is a saved series (CS15 revised, CS18).
+# S171, S176, S220 follow-up: the memory samples are a saved series (CS15 revised, CS18).
 # ---------------------------------------------------------------------------
 
 
@@ -1025,7 +1026,7 @@ def test_cs15_a_figure_whose_samples_aged_out_is_no_figure_and_the_rerank_waits(
     clock: _Clock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """S178, S203: after a downtime longer than the window the saved figure's samples are gone, so a
-    fresh process has no figure: it takes the cosine path and the one-pair measurement re-seeds it
+    fresh process has no model: it takes the cosine path and the ladder makes a new one
     (S200), while the time series still answers its carried fit (CS3b)."""
     wall = [1_000_000.0]
     monkeypatch.setattr(cost_series, "_wall_clock", lambda: wall[0])
@@ -1084,10 +1085,8 @@ def test_cs18e_recording_a_rerank_writes_nothing_to_the_database(monkeypatch: py
 
 
 # ---------------------------------------------------------------------------
-# S178: a too-high saved RAM figure recovers through the window; once the window is empty the
-# next measured rerank of a fresh process re-seeds it as on a first-ever startup (A1c).
-# S180: a RUNNING process (one that has recorded a measured rerank) keeps the last figure it saw
-# when its window empties (K1a-K1c, K3); the lull job re-seeds it (test_rerank_recovery.py, K2).
+# S220: the saved memory model, its persistence and the running process's kept fit are covered in
+# test_ram_shape_series.py, test_ram_figure_gate.py and test_ram_ladder.py.
 # ---------------------------------------------------------------------------
 
 
@@ -1180,3 +1179,49 @@ class _GuardedDict(dict):
         return super().__len__()
 
 
+def test_cross_encoder_rerank_timed_reads_the_peak_inside_the_lock_and_returns_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S220/S222: the production provider resets the peak before the call and reads it after,
+    both INSIDE its lock (so a rerank waiting on the lock never has its reading reset), and
+    returns the growth as the third value. Able to fail: a provider that dropped the reading, or
+    took it outside the lock, would not pass."""
+    events: list[tuple[str, bool]] = []
+    provider = object.__new__(CrossEncoderProvider)
+    provider._model_id = "fake-encoder"
+    provider._rerank_lock = threading.Lock()
+
+    class _Model:
+        def rerank(self, query, documents):
+            events.append(("rerank", provider._rerank_lock.locked()))
+            return [0.0 for _ in documents]
+
+    provider._model = _Model()
+
+    def _begin():
+        events.append(("begin", provider._rerank_lock.locked()))
+        return 1_000.0
+
+    def _growth(before):
+        events.append((f"growth since {before}", provider._rerank_lock.locked()))
+        return 7_654_321.0
+
+    monkeypatch.setattr(reranker_mod.peak_rss, "begin", _begin)
+    monkeypatch.setattr(reranker_mod.peak_rss, "growth_since", _growth)
+    scores, _seconds, growth = provider.rerank_timed("q", ["a", "b"])
+    assert growth == 7_654_321.0 and scores == [0.0, 0.0]
+    assert events == [("begin", True), ("rerank", True), ("growth since 1000.0", True)]
+
+
+def test_cross_encoder_rerank_timed_checks_the_live_session_options_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = object.__new__(CrossEncoderProvider)
+    provider._model_id = "fake-encoder"
+    provider._rerank_lock = threading.Lock()
+    provider._model = SimpleNamespace(rerank=lambda q, d: [0.0 for _ in d])
+    checks: list[int] = []
+    monkeypatch.setattr(CrossEncoderProvider, "_check_session_options_once", lambda self: checks.append(1))
+    provider.rerank_timed("q", ["a"])
+    provider.rerank_timed("q", ["a"])
+    assert len(checks) == 2, "called on every timed call; the check itself runs once (its own flag)"

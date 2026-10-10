@@ -23,6 +23,12 @@ Derived rules (no tuned constants):
   integer determinant), and the window holds a sample taken at the model's FULL input length
   (S200's "worst case per pair": the S193 regression was a long first batch, and shapes that
   are all short say nothing about it). The full-length sample is marked in its packed shape.
+* The ladder that makes the samples marks the end of a COMPLETE pass with one extra row (the
+  zero shape, `COMPLETE_MARKER`): the single pairs at falling lengths, then the batches of
+  increasing size up to the largest a recall sends (or as far as the headroom and the time budget
+  allow). A window without that row is a ladder that did not finish (a restart, a reply, an error):
+  its fit would extrapolate batch sizes from single pairs (it under-predicts them by 17 to 100
+  percent), so it is not used for sizing until the pass is finished.
 * Arithmetic is exact (`fractions.Fraction`): the design columns reach 1e9 and the normal
   equations are badly conditioned in floating point.
 """
@@ -41,6 +47,9 @@ MAX_LENGTH = _FULL_BIT - 1  # the model's token limits are far below this
 
 # The formula's parameters (a, b, c). "Enough" needs more distinct shapes than this.
 PARAMETERS = 3
+
+# A sample at the zero shape (no pairs) is not a measurement: it marks a COMPLETE ladder pass.
+COMPLETE_MARKER = 0
 
 
 def encode_shape(pairs: int, length: int, *, full: bool = False) -> int | None:
@@ -71,9 +80,12 @@ class ShapeGroup:
 
 def groups_from_rows(rows: Iterable[tuple[int, int, float]]) -> list[ShapeGroup]:
     """Fold `(packed x, count, sum of growth)` rows into one group per (pairs, length):
-    the same shape with and without the marker is one shape."""
+    the same shape with and without the marker is one shape. The ladder-complete marker row is
+    not a shape and is skipped (`ladder_complete` reads it)."""
     merged: dict[tuple[int, int], list] = {}
     for x, count, sum_y in rows:
+        if int(x) == COMPLETE_MARKER:
+            continue
         pairs, length, full = decode_shape(int(x))
         entry = merged.setdefault((pairs, length), [False, 0, 0.0])
         entry[0] = entry[0] or full
@@ -83,6 +95,11 @@ def groups_from_rows(rows: Iterable[tuple[int, int, float]]) -> list[ShapeGroup]
         ShapeGroup(pairs, length, full, n, sum_y)
         for (pairs, length), (full, n, sum_y) in sorted(merged.items())
     ]
+
+
+def ladder_complete(rows: Iterable[tuple[int, int, float]]) -> bool:
+    """Whether the window holds the marker of a finished ladder pass."""
+    return any(int(x) == COMPLETE_MARKER for x, _n, _t in rows)
 
 
 def _columns(pairs: int, length: int) -> tuple[int, int, int]:

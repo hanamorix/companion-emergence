@@ -1989,7 +1989,7 @@ def _start_floor_bootstrap_for_direct_chat(persona_dir: Path, *, blocking: bool)
         from brain.memory import floor_startup
 
         floor_startup.set_activity_marker_provider(cli_throttle.chat_activity_marker)
-        # S201: this process has no lull cadence, so a turn that would rerank with no RAM figure
+        # S201: this process has no lull cadence, so a turn that would rerank with no usable memory model
         # measures it in the background (the REPL only: the one-shot form's single turn takes the
         # cosine path and the process ends, a thread would be cut off mid-measurement).
         floor_startup.enable_background_ram_figure(None if blocking else persona_dir)

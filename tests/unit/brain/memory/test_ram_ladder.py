@@ -19,6 +19,7 @@ from tests.unit.brain.memory._ram_support import (
     ScriptedLadderProvider,
     full_marked,
     shapes_in_window,
+    true_growth,
 )
 
 _MODEL = "scripted-ladder"
@@ -29,6 +30,7 @@ _BUDGET = 2.0
 def _env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(reranker_mod, "_require_ram_figure", True)
     monkeypatch.setattr(reranker_mod.peak_rss, "available", lambda: True)
+    monkeypatch.setattr(reranker_mod, "resolve_reranker_model_id", lambda: _MODEL)
     monkeypatch.setattr(reranker_mod, "_full_rerank_budget", lambda: _BUDGET)
     monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
 
@@ -207,3 +209,89 @@ def test_the_ladder_is_the_gate_a_fresh_machine_waits_for(store) -> None:
     cost_series.flush(store)
     measured = estimate.ram_fit.predict(1, FULL)
     assert measured == pytest.approx(219.04e6, rel=0.2)
+
+
+def test_a_pass_records_the_completion_marker_once_and_a_complete_window_is_ready(store) -> None:
+    provider = ScriptedLadderProvider(model=_MODEL)
+    reranker_mod.measure_ram_figure(provider, store)
+    reranker_mod.measure_ram_figure(provider, store)
+    rows = reranker_mod._ram_shapes.shape_groups(store, _MODEL)  # noqa: SLF001
+    assert [(n, t) for x, n, t in rows if x == ram_fit.COMPLETE_MARKER] == [(1, 0.0)]
+    assert reranker_mod._window_ready(store, _MODEL) is True  # noqa: SLF001
+
+
+def test_a_window_with_enough_shapes_but_no_completion_marker_is_no_model(store) -> None:
+    """The M1 case: single pairs alone would size the first batches (under-predicting them)."""
+    for pairs, length, full in [(1, FULL, True), (1, 512, False), (1, 256, False), (1, 128, False)]:
+        reranker_mod._record_rerank_cost(  # noqa: SLF001
+            _MODEL, store, pairs * length, 0.1, 5e6 * length, pairs=pairs, longest=length, full_length=full
+        )
+    assert ram_fit.enough_shapes(ram_fit.groups_from_rows(reranker_mod._ram_shapes.shape_groups(store, _MODEL)))  # noqa: SLF001
+    assert reranker_mod.ram_figure_ready(_MODEL, store) is False
+    assert reranker_mod.rerank_cost_estimate(_MODEL, store) is None or reranker_mod.rerank_cost_estimate(_MODEL, store).ram_fit is None
+
+
+def test_a_pass_interrupted_in_phase_two_leaves_no_model_and_the_next_pass_finishes_it(store) -> None:
+    provider = ScriptedLadderProvider(model=_MODEL, overhead=0.1, rate=1e-3)
+    watch_clear = [True]
+
+    def _trip(pairs: int, length: int) -> None:
+        if pairs == 4:
+            watch_clear[0] = False
+
+    provider.on_timed = _trip
+    with pytest.raises(reranker_mod.RamMeasurementAbandoned):
+        reranker_mod.measure_ram_figure(provider, store, watch=lambda: watch_clear[0])
+    assert [p for p, _l in provider.timed] == [1, 1, 1, 1, 2, 4], "interrupted during the 4-pair rung"
+    assert reranker_mod._window_ready(store, _MODEL) is False  # noqa: SLF001
+    reranker_mod.note_ram_figure_needed(_MODEL)
+    assert reranker_mod.ram_figure_due("later", lambda: _open(store)) is True, "the lull picks it up again"
+    provider.on_timed = None
+    provider.timed.clear()
+    assert reranker_mod.measure_ram_figure(provider, store) is True
+    assert [p for p, _l in provider.timed] == [4, 8, 16, 32, 58], "resumed from the 4-pair rung"
+    assert reranker_mod._window_ready(store, _MODEL) is True  # noqa: SLF001
+
+
+def test_a_phase_two_rung_that_cannot_be_read_leaves_the_pass_incomplete(store) -> None:
+    provider = ScriptedLadderProvider(
+        model=_MODEL, overhead=0.1, rate=1e-3, growth_fn=lambda p, ln: true_growth(p, ln) if p == 1 else None
+    )
+    assert reranker_mod.measure_ram_figure(provider, store) is False
+    assert [p for p, _l in provider.timed] == [1, 1, 1, 1, 2], "the pass stopped at the first unreadable batch"
+    assert reranker_mod._window_ready(store, _MODEL) is False  # noqa: SLF001
+
+
+def test_a_rung_that_records_nothing_ends_the_pass_instead_of_repeating(store, monkeypatch) -> None:
+    """A shape that cannot be packed records no sample; the pass must not run it again and again."""
+    monkeypatch.setattr(ram_fit, "MAX_LENGTH", 100)
+    provider = ScriptedLadderProvider(model=_MODEL)
+    assert reranker_mod.measure_ram_figure(provider, store) is False
+    assert provider.timed == [(1, FULL)]
+
+
+def test_the_frontier_length_is_capped_at_the_model_limit(store, monkeypatch) -> None:
+    """A budget far above the cost of a full-length pair would put the frontier beyond the model
+    limit: the rung is capped at the limit, so it is measured once and then counts as measured."""
+    monkeypatch.setattr(reranker_mod, "_full_rerank_budget", lambda: 100.0)
+    provider = ScriptedLadderProvider(model=_MODEL, overhead=0.1, rate=1e-3)
+    reranker_mod.measure_ram_figure(provider, store)
+    assert provider.timed[4] == (2, FULL), "2 pairs at the limit, not beyond it"
+    again = len(provider.timed)
+    reranker_mod.measure_ram_figure(provider, store)
+    assert len(provider.timed) == again
+
+
+def test_where_the_peak_cannot_be_read_no_lull_attempt_is_ever_due(store, monkeypatch) -> None:
+    """No RAM bound exists there (S206 posture): the window counts as ready, so a flagged need
+    is dropped at once and no provider is built per lull."""
+    monkeypatch.setattr(reranker_mod.peak_rss, "available", lambda: False)
+    reranker_mod.note_ram_figure_needed(_MODEL)
+    assert reranker_mod.ram_figure_due("m1", lambda: _open(store)) is False
+    assert _MODEL not in reranker_mod._ram_figure_needed  # noqa: SLF001
+
+
+def _open(store):
+    from contextlib import nullcontext
+
+    return nullcontext(store)

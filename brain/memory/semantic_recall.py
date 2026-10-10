@@ -1575,6 +1575,10 @@ def search_paragraphs(
         log.info("semantic recall: no usable RAM model yet — cosine path for this message (S200)")
         reranker_down = True
     elif rerankable:
+        if reranker_mod.ram_figure_refresh_wanted(ram_model_id):
+            # H4b: the gate served this process's kept fit (the window no longer gives one):
+            # the direct chat refreshes it in the background after this reply, like the bridge's lull job.
+            floor_startup.request_ram_figure()
         try:
             reranker_provider = reranker_mod.build_reranker_provider(store=store)
             # The one-time warm-up (plan P-1) runs before the probes are
