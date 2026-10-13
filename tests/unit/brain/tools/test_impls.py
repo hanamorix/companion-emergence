@@ -596,6 +596,141 @@ def test_crystallize_soul_invalid_love_type(tmp_path: Path) -> None:
     assert "unknown love_type" in result["reason"]
 
 
+def _linked_ids(persona_dir: Path) -> list[str]:
+    from brain.soul.store import SoulStore
+
+    soul = SoulStore(str(persona_dir / "crystallizations.db"))
+    try:
+        return soul.list_active_source_memory_ids()
+    finally:
+        soul.close()
+
+
+def _crystal_count(persona_dir: Path) -> int:
+    from brain.soul.store import SoulStore
+
+    soul = SoulStore(str(persona_dir / "crystallizations.db"))
+    try:
+        return soul.count()
+    finally:
+        soul.close()
+
+
+def test_crystallize_soul_links_a_named_memory_without_bumping_recall(tmp_path: Path) -> None:
+    """#371 C3: a valid id (even padded) is stripped, verified without a recall bump, linked, and reported."""
+    from brain.tools.impls.crystallize_soul import crystallize_soul
+
+    ctx = _ctx(tmp_path)
+    mem = _seed_memory(ctx["store"])
+    recall_before = ctx["store"].get(mem.id, bump=False).recall_count
+
+    result = crystallize_soul(
+        moment="the moment she laughed",
+        love_type="romantic",
+        why_it_matters="it was real",
+        source_memory_id=f"  {mem.id}  ",
+        **ctx,
+    )
+
+    assert result["created"] is True
+    assert result["source_memory_linked"] is True
+    assert "note" not in result
+    assert _linked_ids(tmp_path) == [mem.id]  # the stripped id, not the padded one
+    assert ctx["store"].get(mem.id, bump=False).recall_count == recall_before
+
+
+# One note for every "saved but not linked" outcome, so the model is never invited to retry or search.
+_NOT_LINKED_NOTE = (
+    "The crystallisation was saved, but no memory was linked. "
+    "Do not repeat it and do not search for the memory."
+)
+
+
+def test_crystallize_soul_unknown_memory_id_still_crystallises_and_says_not_to_repeat(tmp_path: Path) -> None:
+    """#371 C3 / m4: an id no memory has must never block or undo the permanent crystallisation."""
+    from brain.tools.impls.crystallize_soul import crystallize_soul
+
+    ctx = _ctx(tmp_path)
+    result = crystallize_soul(
+        moment="a moment",
+        love_type="romantic",
+        why_it_matters="it mattered",
+        source_memory_id="no-such-memory",
+        **ctx,
+    )
+
+    assert result["created"] is True
+    assert result["source_memory_linked"] is False
+    assert result["note"] == _NOT_LINKED_NOTE
+    assert _linked_ids(tmp_path) == []
+    assert _crystal_count(tmp_path) == 1  # really in the soul, not just reported as created
+
+
+def test_crystallize_soul_non_string_or_blank_id_means_no_link_and_todays_result_keys(tmp_path: Path) -> None:
+    """#371 C3 (in-process dispatch): omitted, None, "", "   ", an int and a list all mean 'no link'.
+    The result keys are exactly what they were before the parameter existed. (Over MCP the SDK rejects
+    the non-strings before the tool runs; that is pinned separately against the schema.)"""
+    from brain.tools.impls.crystallize_soul import crystallize_soul
+
+    ctx = _ctx(tmp_path)
+    _seed_memory(ctx["store"])
+    base = {"moment": "a moment", "love_type": "romantic", "why_it_matters": "it mattered"}
+
+    results = [crystallize_soul(**base, **ctx)]
+    for bad in (None, "", "   ", 5, ["m-1"]):
+        results.append(crystallize_soul(**base, source_memory_id=bad, **ctx))
+
+    for result in results:
+        assert result["created"] is True
+        assert set(result) == {"created", "id", "love_type", "resonance"}
+    assert _crystal_count(tmp_path) == len(results)  # each call really wrote a row
+    assert _linked_ids(tmp_path) == []
+
+
+def test_crystallize_soul_lookup_or_link_failure_never_undoes_the_crystallisation(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    """#371 C3 / n9: the crystallisation is permanent and identity-level. If verifying the memory or
+    writing the link raises, it is still created, the model gets the same pinned note, and a warning is logged."""
+    import logging
+    import sqlite3
+
+    from brain.soul.store import SoulStore
+    from brain.tools.impls.crystallize_soul import crystallize_soul
+
+    ctx = _ctx(tmp_path)
+    mem = _seed_memory(ctx["store"])
+    base = {"moment": "a moment", "love_type": "romantic", "why_it_matters": "it mattered"}
+
+    def _locked(self, *a, **k):
+        raise sqlite3.OperationalError("database is locked")
+
+    def _lookup_boom(self, *a, **k):
+        raise RuntimeError("lookup exploded")
+
+    # monkeypatch.context(), not monkeypatch.undo(): undo() would also revert the suite's autouse patches
+    # (tests/conftest.py documents this hazard).
+    with caplog.at_level(logging.WARNING, logger="brain.tools.impls.crystallize_soul"):
+        with monkeypatch.context() as patch:
+            patch.setattr(SoulStore, "link_source_memory", _locked)
+            link_failed = crystallize_soul(**base, source_memory_id=mem.id, **ctx)
+        with monkeypatch.context() as patch:
+            patch.setattr(type(ctx["store"]), "get", _lookup_boom)
+            lookup_failed = crystallize_soul(**base, source_memory_id=mem.id, **ctx)
+
+    for result in (link_failed, lookup_failed):
+        assert result["created"] is True
+        assert result["source_memory_linked"] is False
+        assert result["note"] == _NOT_LINKED_NOTE
+    assert _linked_ids(tmp_path) == []
+    soul = SoulStore(str(tmp_path / "crystallizations.db"))
+    try:
+        assert soul.count() == 2  # both crystallisations are really there
+    finally:
+        soul.close()
+    assert len([r for r in caplog.records if r.levelno >= logging.WARNING]) >= 2
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # add_memory + climax_event auto-journal hook
 # ─────────────────────────────────────────────────────────────────────────────

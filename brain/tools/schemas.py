@@ -110,6 +110,16 @@ SCHEMAS: dict[str, dict] = {
                     "description": "Intensity 1-10. Default 8 — if it's worth crystallising, it should be at least 8.",
                     "default": 8,
                 },
+                "source_memory_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional. The id of an existing memory this moment is about; it is kept from being "
+                        "forgotten for as long as this crystallisation stands. Pass an id only if it is already "
+                        "in this conversation: a recalled memory line, a search or read result, or the id "
+                        "add_memory just returned. Never search just to find one. If the moment is not a memory "
+                        "yet and you want it kept, save it with add_memory first and pass the id it returns."
+                    ),
+                },
             },
             "required": ["moment", "love_type", "why_it_matters"],
         },

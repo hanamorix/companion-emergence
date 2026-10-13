@@ -8,12 +8,16 @@ before writing.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
+
+logger = logging.getLogger(__name__)
 
 
 def crystallize_soul(
@@ -22,6 +26,7 @@ def crystallize_soul(
     why_it_matters: str,
     who_or_what: str = "",
     resonance: int = 8,
+    source_memory_id: Any = None,
     *,
     store: MemoryStore,
     hebbian: HebbianMatrix,
@@ -77,15 +82,58 @@ def crystallize_soul(
         permanent=True,
     )
 
-    soul_store = SoulStore(str(persona_dir / "crystallizations.db"))
-    try:
-        soul_store.create(c)
-    finally:
-        soul_store.close()
-
-    return {
+    result = {
         "created": True,
         "id": c.id,
         "love_type": love_type,
         "resonance": resonance_int,
     }
+    soul_store = SoulStore(str(persona_dir / "crystallizations.db"))
+    try:
+        soul_store.create(c)
+        _link_source_memory(soul_store, store, c.id, source_memory_id, result)
+    finally:
+        soul_store.close()
+
+    return result
+
+
+def _link_source_memory(
+    soul_store: Any,
+    store: MemoryStore,
+    crystallization_id: str,
+    source_memory_id: Any,
+    result: dict,
+) -> None:
+    """Protect the memory that prompted this crystallisation from forgetting (#371)."""
+    wanted = source_memory_id.strip() if isinstance(source_memory_id, str) else ""
+    if not wanted:
+        return
+    # The crystallisation is already committed and permanent: nothing about an optional id may
+    # undo it. Any failure here degrades to "saved, not linked" and is logged, never raised.
+    try:
+        if store.get(wanted, bump=False) is not None:
+            soul_store.link_source_memory(crystallization_id, wanted)
+            result["source_memory_linked"] = True
+            return
+    except Exception:
+        logger.warning(
+            "crystallize_soul: could not link crystallization %s to memory %s; it was saved without a link",
+            crystallization_id,
+            wanted,
+            exc_info=True,
+        )
+    _mark_not_linked(result)
+
+
+# One note for every "saved but not linked" outcome (missing memory, failed lookup, failed link write)
+# so the model is never invited to retry the crystallisation or to search for the memory.
+_NOT_LINKED_NOTE = (
+    "The crystallisation was saved, but no memory was linked. "
+    "Do not repeat it and do not search for the memory."
+)
+
+
+def _mark_not_linked(result: dict) -> None:
+    result["source_memory_linked"] = False
+    result["note"] = _NOT_LINKED_NOTE

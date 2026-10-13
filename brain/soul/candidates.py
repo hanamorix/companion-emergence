@@ -47,51 +47,47 @@ def list_under_review_memory_ids(persona_dir: Path) -> list[str]:
     return ids
 
 
-def _revoked_crystallization_ids(persona_dir: Path) -> set[str]:
-    """Ids of revoked crystallizations. Opens crystallizations.db only if it exists
-    (SoulStore would create it) — an absent store simply has nothing revoked."""
-    db_path = persona_dir / "crystallizations.db"
-    if not db_path.exists():
-        return set()
-
-    from brain.soul.store import SoulStore
-
-    with SoulStore(db_path) as store:
-        return {c.id for c in store.list_revoked()}
-
-
 def list_crystallised_memory_ids(persona_dir: Path) -> list[str]:
-    """Return the memory_id of every accepted candidate whose crystallization is live.
+    """Return the memory ids protected by a live crystallization, candidate ids first.
 
-    Accepting a candidate crystallises it (``review._apply_accept``) and keeps its
-    ``memory_id`` on the candidate record; that record is the only link from a
-    crystallisation back to a memory, so this is where "soul-crystallised
-    memories are exempt from forgetting" gets its ids. (Crystallizations made by
-    ``crystallize_soul`` or the migrator have no candidate and no memory link.)
+    Two sources, one store open:
 
-    A revoked crystallization stops protecting its memory (#362 ruling) —
-    ``revoke_crystallization`` only touches crystallizations.db, the candidate
-    stays ``accepted``, so the store is consulted. Only an affirmative revoke
-    drops protection: a legacy record with no ``crystallization_id`` or a
-    dangling one stays protected, because losing a memory is the worse error.
+    1. Accepted candidates. Accepting a candidate crystallises it (``review._apply_accept``)
+       and keeps its ``memory_id`` on the candidate record. ``revoke_crystallization`` only
+       touches crystallizations.db, so the candidate stays ``accepted`` and the store is
+       consulted for revoked ids. Only an affirmative revoke drops protection: a legacy
+       record with no ``crystallization_id`` or a dangling one stays protected, because
+       losing a memory is the worse error (#362 ruling).
+    2. Direct links (#371). A crystallization made by the ``crystallize_soul`` tool has no
+       candidate record; when the caller named a memory, ``SoulStore.link_source_memory``
+       recorded it. Revoked crystallizations drop out of that read by themselves.
 
-    Unlike ``list_under_review_memory_ids`` this does not swallow read errors:
-    the caller (``brain.forgetting._load_soul_linked_ids``) owns the fail-soft
-    fallback and logs it.
+    Candidate ids come first, then direct links (sorted by memory id), de-duplicated.
+    Reading never creates ``crystallizations.db``.
+
+    Unlike ``list_under_review_memory_ids`` this does not swallow read errors: the caller
+    (``brain.forgetting._load_soul_linked_ids``) owns the fail-soft fallback and logs it.
     """
     from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
 
     candidates_path = persona_dir / "soul_candidates.jsonl"
-    if not candidates_path.exists():
-        return []
+    accepted: list[dict] = []
+    if candidates_path.exists():
+        accepted = [
+            r for r in read_jsonl_skipping_corrupt(candidates_path) if r.get("status") == "accepted"
+        ]
 
-    accepted = [
-        r for r in read_jsonl_skipping_corrupt(candidates_path) if r.get("status") == "accepted"
-    ]
-    if not accepted:
-        return []
+    revoked: set[str] = set()
+    linked: list[str] = []
+    db_path = persona_dir / "crystallizations.db"
+    if db_path.exists():  # opening a SoulStore would create the file
+        from brain.soul.store import SoulStore
 
-    revoked = _revoked_crystallization_ids(persona_dir)
+        with SoulStore(db_path) as store:
+            if accepted:
+                revoked = {c.id for c in store.list_revoked()}
+            linked = store.list_active_source_memory_ids()
+
     ids: list[str] = []
     for r in accepted:
         if str(r.get("crystallization_id") or "") in revoked:
@@ -99,4 +95,5 @@ def list_crystallised_memory_ids(persona_dir: Path) -> list[str]:
         mid = str(r.get("memory_id") or "").strip()
         if mid:
             ids.append(mid)
+    ids.extend(mid for mid in linked if mid not in ids)
     return ids

@@ -330,6 +330,81 @@ def test_run_pass_exempts_soul_crystallised_memory_through_real_files(tmp_path):
     assert summary["faded"] == 0
 
 
+def _crystallise_directly(persona_dir, *, source_memory_id=None) -> str:
+    """Make a crystallisation the way the model does: the real tool through the real ``dispatch``
+    (the MCP server calls exactly this), against the persona's own memories.db."""
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.tools.dispatch import dispatch
+
+    store = MemoryStore(persona_dir / "memories.db")
+    hebbian = HebbianMatrix(":memory:")
+    try:
+        args = {"moment": "a moment she chose", "love_type": "craft", "why_it_matters": "it mattered"}
+        if source_memory_id is not None:
+            args["source_memory_id"] = source_memory_id
+        result = dispatch("crystallize_soul", args, store=store, hebbian=hebbian, persona_dir=persona_dir)
+    finally:
+        store.close()
+        hebbian.close()
+    assert result["created"] is True
+    return result["id"]
+
+
+def _state_of(persona_dir, memory_id) -> str:
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        return store._conn.execute("SELECT state FROM memories WHERE id = ?", (memory_id,)).fetchone()["state"]
+    finally:
+        store.close()
+
+
+def test_run_pass_exempts_a_memory_named_by_a_direct_crystallisation_through_dispatch(tmp_path):
+    """CANARY (#371) — the direct path end to end: dispatch("crystallize_soul", {..., source_memory_id})
+    -> SoulStore link -> list_crystallised_memory_ids -> _load_soul_linked_ids -> run_pass is_exempt.
+
+    Two personas of identical shape. The LINKED arm names its memory and nothing may fade (the frozen C1
+    wording: faded == 0, exempt >= 1). The CONTROL arm crystallises WITHOUT naming a memory and its memory
+    must fade, so a pass in the linked arm means the link did the protecting, not a gentle fixture."""
+    linked_dir, control_dir = tmp_path / "linked", tmp_path / "control"
+    linked_dir.mkdir()
+    control_dir.mkdir()
+
+    linked = _old_low_salience_memory(linked_dir)
+    _crystallise_directly(linked_dir, source_memory_id=linked)
+    summary = run_pass(linked_dir, event_bus=MagicMock())
+    assert _state_of(linked_dir, linked) == "active", "a memory named by a direct crystallisation must be exempt"
+    assert summary["faded"] == 0
+    assert summary["exempt"] >= 1
+
+    control = _old_low_salience_memory(control_dir)
+    _crystallise_directly(control_dir)
+    control_summary = run_pass(control_dir, event_bus=MagicMock())
+    assert _state_of(control_dir, control) == "fading", "the unnamed control memory must still fade"
+    assert control_summary["faded"] == 1
+
+
+def test_revoking_a_direct_crystallisation_makes_its_named_memory_forgettable_again(tmp_path):
+    """#371 C2 / L2-a: protection must be real BEFORE the revoke (otherwise 'fading afterwards' proves
+    nothing), and revoke must end it. Same #362 ruling as for accepted candidates."""
+    from brain.soul.revoke import revoke_crystallization
+    from brain.soul.store import SoulStore
+
+    memory_id = _old_low_salience_memory(tmp_path)
+    crystallization_id = _crystallise_directly(tmp_path, source_memory_id=memory_id)
+
+    run_pass(tmp_path, event_bus=MagicMock())
+    assert _state_of(tmp_path, memory_id) == "active", "the link must protect the memory first"
+
+    soul = SoulStore(str(tmp_path / "crystallizations.db"))
+    try:
+        assert revoke_crystallization(soul, crystallization_id, "no longer true") is not None
+    finally:
+        soul.close()
+
+    run_pass(tmp_path, event_bus=MagicMock())
+    assert _state_of(tmp_path, memory_id) == "fading", "a revoked crystallisation must stop protecting it"
+
+
 def test_run_pass_forgets_memory_whose_crystallisation_was_revoked(tmp_path):
     """#362 decision (2026-10-13): a revoked crystallisation stops protecting its
     source memory — revoke is Hana ruling "this is not a soul moment", and the
