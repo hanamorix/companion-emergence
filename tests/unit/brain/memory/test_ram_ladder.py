@@ -34,7 +34,9 @@ def _env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(reranker_mod.peak_rss, "available", lambda: True)
     monkeypatch.setattr(reranker_mod, "resolve_reranker_model_id", lambda: _MODEL)
     monkeypatch.setattr(reranker_mod, "_full_rerank_budget", lambda: _BUDGET)
-    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
+    # S261: free memory that cannot be read at all stops everything, so the default is ample free memory (it was
+    # "unreadable", which used to mean "no memory bound"); the tests of the unreadable case say so themselves.
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 1e15)
     # S253: the first rung (and the model load) need free memory of at least the model file's size when no
     # fit is kept; this scripted model has no file, so it reads as 1.0 byte (not above the smallest positive
     # headroom these tests use). The bound itself is exercised in test_model_load_memory_floor.py.
@@ -383,10 +385,10 @@ def test_a_recall_on_a_marked_single_pair_window_takes_the_cosine_path_and_a_com
     out = reranker_mod.rerank_for_recall(provider, _QUERY, _docs(50), store=store, budget_seconds=4.0)
     assert (out.reranked, out.hand_off, out.measured) == (False, "budget", False)
     assert len(provider.timed) == before, "no rerank ran"
-    # the control: the same recall on a store whose ladder ran to the end (headroom unreadable = the rungs run)
+    # the control: the same recall on a store whose ladder ran to the end (ample free memory = the rungs run)
     other = MemoryStore(tmp_path / "other.db", integrity_check=False)
     try:
-        monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
+        monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 1e15)
         control = ScriptedLadderProvider(model=_MODEL)
         assert reranker_mod.measure_ram_figure(control, other) is True
         fit = reranker_mod._window_ram_fit(other, _MODEL)  # noqa: SLF001
@@ -538,8 +540,8 @@ def test_run_ram_figure_builds_and_loads_nothing_when_the_headroom_is_known_and_
     assert reranker_mod.ram_figure_due("m2", lambda: _open(store)) is True, "the next lull retries"
 
 
-@pytest.mark.parametrize("headroom", [1.0, None, 5e12])
-def test_run_ram_figure_builds_the_provider_when_the_headroom_is_positive_or_unreadable(
+@pytest.mark.parametrize("headroom", [1.0, 5e12])
+def test_run_ram_figure_builds_the_provider_when_the_headroom_is_positive(
     store, monkeypatch, headroom
 ) -> None:
     """S245's rule on its own: the S253 model-file bound is off in this file (the suite default), so only a
@@ -549,6 +551,17 @@ def test_run_ram_figure_builds_the_provider_when_the_headroom_is_positive_or_unr
     monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: headroom)
     reranker_mod.run_ram_figure("m1", store)
     assert built == [1]
+
+
+def test_run_ram_figure_builds_and_loads_nothing_when_free_memory_cannot_be_read(store, monkeypatch) -> None:
+    """S261 (was: an unreadable headroom builds the provider, S245): the simple safe fallback."""
+    provider = ScriptedLadderProvider(model=_MODEL)
+    built = _build_spy(monkeypatch, provider)
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
+    reranker_mod.note_ram_figure_needed(_MODEL)
+    assert reranker_mod.run_ram_figure("m1", store) is False
+    assert built == [] and provider.plain == [] and provider.timed == []
+    assert _MODEL in reranker_mod._ram_figure_needed, "the need flag is kept"  # noqa: SLF001
 
 
 @pytest.mark.parametrize(("delta", "rungs"), [(0.0, 4), (-1.0, 1)])
@@ -614,11 +627,21 @@ def test_the_headroom_is_read_fresh_before_every_rung(store, monkeypatch) -> Non
     assert provider.timed == [(1, 1024)]
 
 
-def test_an_unreadable_headroom_does_not_stop_the_ladder(store, monkeypatch) -> None:
+def test_an_unreadable_headroom_stops_the_ladder_before_anything_runs(store, monkeypatch) -> None:
+    """S261 (was: an unreadable headroom does not stop the ladder): no warm-up, no rung, nothing recorded."""
     monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
     provider = ScriptedLadderProvider(model=_MODEL)
-    assert reranker_mod.measure_ram_figure(provider, store) is True
-    assert _marker_rows(store) == [(1, 0.0)]
+    assert reranker_mod.measure_ram_figure(provider, store) is False
+    assert provider.plain == [] and provider.timed == [] and provider.probes == 0
+    assert _marker_rows(store) == [] and not reranker_mod._ram_shapes.shape_groups(store, _MODEL)  # noqa: SLF001
+
+
+def test_free_memory_that_becomes_unreadable_mid_pass_stops_it_at_the_next_rung(store, monkeypatch) -> None:
+    readings = iter([1e15, 1e15])  # the warm-up check and the first rung's check; then nothing can be read
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: next(readings, None))
+    provider = ScriptedLadderProvider(model=_MODEL)
+    assert reranker_mod.measure_ram_figure(provider, store) is False
+    assert provider.timed == [(1, FULL)], "the first rung ran, the second was stopped"
 
 
 def test_a_pass_stopped_at_a_later_batch_rung_on_a_window_that_holds_a_batch_still_records_the_marker(
@@ -686,8 +709,8 @@ def test_the_seed_width_must_fit_the_memory_model_and_the_headroom() -> None:
 
 
 def _full_window(store, monkeypatch) -> tuple[ScriptedLadderProvider, ram_fit.RamFit]:
-    """A complete ladder pass (headroom unreadable, every rung runs) and the process's kept fit it produced."""
-    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
+    """A complete ladder pass (ample free memory, every rung runs) and the process's kept fit it produced."""
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 1e15)
     provider = ScriptedLadderProvider(model=_MODEL)
     assert reranker_mod.measure_ram_figure(provider, store) is True
     fit = reranker_mod._window_ram_fit(store, _MODEL)  # noqa: SLF001
@@ -739,7 +762,7 @@ def test_the_recall_warm_up_runs_only_when_each_one_pair_batch_fits(store, monke
     assert len(provider.plain) == before + 2 and _MODEL in reranker_mod._warmed_model_ids  # noqa: SLF001
 
 
-def test_the_warm_up_is_not_bounded_for_the_ladder_nor_where_no_bound_applies_nor_with_no_headroom_reading(
+def test_the_warm_up_is_not_bounded_for_the_ladder_nor_where_no_bound_applies_and_is_refused_with_no_headroom_reading(
     store, monkeypatch
 ) -> None:
     provider, _fit = _full_window(store, monkeypatch)
@@ -756,7 +779,7 @@ def test_the_warm_up_is_not_bounded_for_the_ladder_nor_where_no_bound_applies_no
     before = _unwarmed(provider)
     monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
     reranker_mod._warm_up_once(provider, _QUERY, docs, bounded=True)  # noqa: SLF001
-    assert len(provider.plain) == before + 2
+    assert len(provider.plain) == before, "S261: no headroom reading: the bounded warm-up is refused (it used to run)"
 
 
 def test_a_warm_up_with_no_memory_model_in_the_process_waits(store, monkeypatch) -> None:
@@ -779,13 +802,14 @@ def test_a_warmed_model_does_no_bound_work_even_with_a_memory_model_held(store, 
     assert provider.probes == probes and len(provider.plain) == before
 
 
-def test_an_unreadable_headroom_costs_no_tokenizing_and_every_warm_up_document_is_checked(store, monkeypatch) -> None:
+def test_an_unreadable_headroom_refuses_without_tokenizing_and_every_warm_up_document_is_checked(store, monkeypatch) -> None:
     provider, fit = _full_window(store, monkeypatch)
     monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
     _unwarmed(provider)
     probes = provider.probes
     reranker_mod._warm_up_once(provider, _QUERY, _docs(3, chars=3000), bounded=True)  # noqa: SLF001
-    assert provider.probes == probes, "no headroom reading: the batch runs without being sized"
+    assert provider.probes == probes, "no headroom reading (S261): refused, and not even tokenized"
+    assert _MODEL not in reranker_mod._warmed_model_ids  # noqa: SLF001
     # the second warm-up document is the long one: its batch does not fit although the first one's does
     short, long_ = _docs(1, chars=40)[0], _docs(1, chars=3000)[0]
     need_long = fit.predict(1, provider.pair_token_lengths(_QUERY, [long_])[0])
@@ -879,13 +903,14 @@ def test_the_bundled_normalization_defers_with_no_memory_model_or_no_pair_sizes_
     assert len(ran.plain) == len(_BUNDLE)
 
 
-def test_the_bundled_normalization_runs_with_no_headroom_reading_and_where_no_bound_applies(store, monkeypatch) -> None:
+def test_the_bundled_normalization_defers_with_no_headroom_reading_and_runs_where_no_bound_applies(store, monkeypatch) -> None:
     with reranker_mod._cost_lock:  # noqa: SLF001
         reranker_mod._ram_fit_kept[("k", _MODEL)] = _fit_with(a=1e15)  # NOTHING would fit
     monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
     first = _ScoringProvider(model=_MODEL)
-    reranker_mod.normalize_bundled_pairs_against_anchors(first, _BUNDLE)  # (f)
-    assert len(first.plain) == len(_BUNDLE)
+    with pytest.raises(reranker_mod.RerankDeferred):  # (f) S261: free memory cannot be read: refused (it used to run)
+        reranker_mod.normalize_bundled_pairs_against_anchors(first, _BUNDLE)
+    assert first.plain == []
     monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 1.0)
     monkeypatch.setattr(reranker_mod.peak_rss, "available", lambda: False)
     second = _ScoringProvider(model=_MODEL)
@@ -1167,3 +1192,36 @@ def test_a_phase_one_rung_bounded_by_a_measured_shape_is_judged_on_the_unscaled_
     provider = ScriptedLadderProvider(model=_MODEL)
     reranker_mod.measure_ram_figure(provider, store)
     assert len(provider.timed) == rungs
+
+
+# ---- S261: free memory that cannot be read at all takes the cheaper path everywhere ----
+
+
+def test_a_recall_takes_the_cosine_path_before_any_warm_up_probe_or_rerank_when_free_memory_cannot_be_read(
+    store, monkeypatch
+) -> None:
+    provider, _fit = _full_window(store, monkeypatch)
+    _unwarmed(provider)
+    probes, timed, plain = provider.probes, len(provider.timed), len(provider.plain)
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
+    out = reranker_mod.rerank_for_recall(provider, _QUERY, _docs(50), store=store, budget_seconds=4.0)
+    assert (out.reranked, out.hand_off, out.width) == (False, "budget", 0)
+    assert (provider.probes, len(provider.timed), len(provider.plain)) == (probes, timed, plain)
+    assert reranker_mod._budget_misses.get(_MODEL) is None  # noqa: SLF001
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 1e15)
+    assert reranker_mod.rerank_for_recall(provider, _QUERY, _docs(50), store=store, budget_seconds=4.0).reranked is True
+
+
+def test_the_stuck_width_re_measure_is_skipped_when_free_memory_cannot_be_read(store, monkeypatch) -> None:
+    provider, _fit = _full_window(store, monkeypatch)
+    reranker_mod._budget_misses[_MODEL] = _stuck_miss()  # noqa: SLF001
+    reranker_mod._provider_cache[_MODEL] = provider  # noqa: SLF001
+    try:
+        before = len(provider.timed)
+        monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
+        assert reranker_mod.remeasure_stuck_width("marker-s261", store) is False
+        assert len(provider.timed) == before
+        monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 1e15)
+        assert reranker_mod.remeasure_stuck_width("marker-s261-b", store) is True
+    finally:
+        reranker_mod._provider_cache.pop(_MODEL, None)  # noqa: SLF001

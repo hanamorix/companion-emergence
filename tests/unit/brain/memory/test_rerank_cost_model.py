@@ -962,7 +962,7 @@ def test_s203_a_process_about_to_rerank_with_no_ram_figure_takes_the_cosine_hand
 
 def test_s203_the_hold_back_is_per_model_id(clock: _Clock, monkeypatch: pytest.MonkeyPatch) -> None:
     _ram_figure_required(monkeypatch)
-    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 1e15)  # S261: ample (unreadable now means no rerank)
     _persist_estimate()
     _persist_estimate("another-model")
     _seed_ram()  # a model for _MODEL only
@@ -1002,7 +1002,7 @@ def test_cs15_with_a_saved_ram_figure_the_first_measured_rerank_is_sized_by_the_
     clock: _Clock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _ram_figure_required(monkeypatch)
-    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 1e15)  # S261: ample (unreadable now means no rerank)
     _persist_estimate()
     _seed_ram()
     provider = _CostScriptedProvider(clock, overhead=0.0, rate=1e-4)
@@ -1031,7 +1031,7 @@ def test_cs15_a_figure_whose_samples_aged_out_is_no_figure_and_the_rerank_waits(
     wall = [1_000_000.0]
     monkeypatch.setattr(cost_series, "_wall_clock", lambda: wall[0])
     _ram_figure_required(monkeypatch)
-    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 1e15)  # S261: ample (unreadable now means no rerank)
     _persist_estimate()
     _seed_ram()
     wall[0] += cost_series.window_seconds() + 60.0  # downtime: every sample is past the window

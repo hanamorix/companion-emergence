@@ -1471,14 +1471,15 @@ def _ladder_headroom_stop(predicted: float | None, what: str) -> bool:
     headroom (`_available_ram_headroom_bytes`, the S241 minimum). True when the headroom is known and
     is zero or less (a degraded host, S240), or when it is known and the step's PREDICTED growth
     exceeds it. `predicted` is `None` when nothing measured bounds the step (the model load, the
-    warm-up): then only a headroom of zero stops it. S253: the first rung and the model load are held
-    to more than that, by `_memory_floor_blocks` (the model file's size, or the kept fit's one-pair
-    prediction); the first rung no longer reaches this function with `None`. An unreadable headroom
-    (`None`) does not stop the ladder, the posture the width fit has always had (the memory term is
-    skipped, never read as unlimited memory)."""
+    warm-up): then only a headroom of zero stops it. S253, S257: the first rung and the model load are
+    held to more than that, by `_memory_floor_blocks` (the model file's size plus the first rung's bound for
+    the load; the kept fit's one-pair prediction, or the file size, for the first rung); the first rung
+    no longer reaches this function with `None`. S261: a headroom that cannot be read at all (`None`: psutil
+    and every cgroup level unreadable) stops the ladder, the simple safe fallback (it used to proceed, S241/S245)."""
     headroom = _available_ram_headroom_bytes()
     if headroom is None:
-        return False
+        log.info("reranker: RAM ladder stopped before %s: free memory cannot be read (S261)", what)
+        return True
     if headroom > 0.0 and (predicted is None or predicted <= headroom):
         return False
     log.info(
@@ -1494,6 +1495,7 @@ def _memory_wait_clear(condition: str) -> None:
     with _cost_lock:
         _memory_wait_logged.discard(condition)
         _memory_wait_logged.discard(condition + "-size")
+        _memory_wait_logged.discard(condition + "-unread")
 
 
 def _memory_wait_log_once(key: str, other: str, level: int, message: str, *args: object) -> None:
@@ -1510,16 +1512,22 @@ def _memory_wait_log_once(key: str, other: str, level: int, message: str, *args:
 def _memory_floor_blocks(condition: str, what: str, needed: Callable[[], float | None]) -> bool:
     """S253: whether `what` (the model load, the ladder's first rung) must wait because the free memory
     (`_available_ram_headroom_bytes`, the S241 minimum, read fresh) is not both positive (S245's
-    zero-headroom stop holds even against a bound of zero) and at least `needed()` bytes. An unreadable free memory does not block, the posture of S241 and S245 (the memory
-    term is skipped, never read as unlimited, and a host that cannot be read is not locked out). A bound
+    zero-headroom stop holds even against a bound of zero) and at least `needed()` bytes. S261: free memory that cannot be read at all (`None`) blocks, the simple safe
+    fallback (it used to pass, S241/S245); logged once as a condition of its own. A bound
     that cannot be determined (`needed()` returns `None`) blocks: fail safe, nothing is loaded or run on
     a guess. Logs once per condition until the check next passes (`condition` and `condition-size` are
     separate conditions). `needed` is called with no lock held and only after the free memory is known to
     be readable, so a host with no reading touches no disk."""
     headroom = _available_ram_headroom_bytes()
     if headroom is None:
-        _memory_wait_clear(condition)
-        return False
+        _memory_wait_log_once(
+            condition + "-unread",
+            condition,
+            logging.WARNING,
+            "reranker: %s waits: free memory cannot be read (S261)",
+            what,
+        )
+        return True
     if headroom <= 0.0:
         _memory_wait_log_once(
             condition,
@@ -1644,8 +1652,8 @@ def measure_ram_figure(
     fit times the S255 safety factor (phase 2, `RamFit.sized`) or bounded by the measured shape that dominates
     it (phase 1; a measurement, not a prediction, so unscaled). S253: the first rung,
     which nothing measured bounds, needs the free memory to be at least the kept fit's one-pair
-    prediction for the full-length pair, or the model file's size when no fit exists
-    (`_memory_floor_blocks`); below it nothing runs and the next lull retries. S249: nothing is run (False) in a
+    prediction for the full-length pair (times the S255 safety factor), or the model file's size when no fit
+    exists (`_memory_floor_blocks`); below it nothing runs and the next lull retries. S249: nothing is run (False) in a
     process that downloaded the model file. Provider exceptions propagate.
 
     S218: with a `watch` (the direct chat passes `cli_throttle.reply_watch()`), a reply that
@@ -1949,13 +1957,15 @@ def remeasure_stuck_width(activity_marker: object, store: MemoryStore) -> bool:
     padded = pairs * longest
     if estimate is not None and estimate.ram_fit is not None:
         headroom = _available_ram_headroom_bytes()
-        if headroom is not None:
-            if not estimate.ram_fit.within_measured(pairs, longest):
-                log.info("rerank width re-measure: skipped, the batch is larger than any shape measured (S242)")
-                return False
-            if estimate.ram_fit.sized(pairs, longest) > headroom:
-                log.info("rerank width re-measure: skipped, the batch does not fit the RAM headroom")
-                return False
+        if headroom is None:
+            log.info("rerank width re-measure: skipped, free memory cannot be read (S261)")
+            return False
+        if not estimate.ram_fit.within_measured(pairs, longest):
+            log.info("rerank width re-measure: skipped, the batch is larger than any shape measured (S242)")
+            return False
+        if estimate.ram_fit.sized(pairs, longest) > headroom:
+            log.info("rerank width re-measure: skipped, the batch does not fit the RAM headroom")
+            return False
     _, seconds = _measured_rerank(
         provider,
         model_id,
@@ -2562,9 +2572,7 @@ def _batch_fits_ram_bound(
 ) -> bool:
     """S247, S259: whether ONE rerank call of `documents` (all scored together, padded to the longest
     (query, document) pair) may run now. True where no RAM bound applies on this machine
-    (`_ram_bound_applies`: the per-call peak is unreadable there) and when the live headroom is
-    unreadable (the width fit's posture: the memory term, the S242 cap included, is skipped).
-    Otherwise it needs a memory model: with none held by this process the call cannot be sized and
+    (`_ram_bound_applies`: the per-call peak is unreadable there). Otherwise it needs a memory model: with none held by this process the call cannot be sized and
     does not run, and with some it needs every one of them to allow it (`RamFit.within_measured`:
     not more pairs or a longer padded length than measured while the model holds single pairs only;
     and the predicted growth times the S255 safety factor within the headroom). The headroom is read
@@ -2576,7 +2584,8 @@ def _batch_fits_ram_bound(
     nothing is loaded; once the lengths are known each fit must also have the file size plus the batch's
     predicted growth (times the factor) within the free memory read BEFORE the load. A model that is loaded is out
     of the free memory already and adds nothing. The size is looked up only on that path; a size that cannot be
-    determined refuses (fail safe). Logged once per condition."""
+    determined refuses (fail safe). The refusals before the tokenizing log once per condition. S261: free memory
+    that cannot be read at all refuses (it used to pass)."""
     if not _ram_bound_applies():
         return True
     fits = _kept_ram_fits(model_id)
@@ -2586,7 +2595,14 @@ def _batch_fits_ram_bound(
     loaded = _provider_model_loaded(provider)
     headroom = _available_ram_headroom_bytes()
     if headroom is None:
-        return True
+        _memory_wait_log_once(
+            "batch-unread",
+            "batch-load",
+            logging.WARNING,
+            "reranker: a rerank batch waits: free memory cannot be read (S261)",
+        )
+        return False
+    _memory_wait_clear("batch-unread")
     reserve = 0.0
     if not loaded:
         parts = _load_bound_parts(model_id)
@@ -2746,7 +2762,8 @@ class PairSizes:
 
     `lengths` is `provider.pair_token_lengths(query, [*candidates, *ANCHOR_POOL])`
     over the query's first `CANDIDATE_POOL` candidates, or `None` when the
-    tokenizer probe failed (the "sizes" hand-off). `seconds` is the probe's
+    tokenizer probe failed, or (S259) was skipped because the model is not loaded and may not be loaded
+    now (the "sizes" hand-off). `seconds` is the probe's
     time measured inside the provider's lock (round-3 N3-1), or `None` when
     the provider measures none (the caller then times the call)."""
 
@@ -2832,6 +2849,10 @@ def rerank_for_recall(
         return RecallRerank(
             width=0, reranked=False, hand_off="ram_figure", normalization=None, measured=False
         )
+    if _available_ram_headroom_bytes() is None:
+        # S261: free memory cannot be read at all (psutil and every cgroup level unreadable): the simple safe
+        # fallback is no rerank. Nothing is warmed up, probed or loaded and no miss is recorded.
+        return RecallRerank(width=0, reranked=False, hand_off="budget", normalization=None, measured=False)
     # Warm up before the length probe, so the one-time ONNX session load is not timed into
     # the probe. Bounded (S247): when its one-pair batch does not fit the RAM bound it is skipped, and
     # the probe loads the model on demand. S259: not when the model is not loaded and the free memory

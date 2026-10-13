@@ -417,7 +417,7 @@ def _ram_figure_not_required_by_default(monkeypatch: pytest.MonkeyPatch) -> Iter
     monkeypatch.setattr(reranker, "model_load_blocked_by_memory", lambda: False)
     # S255: the memory fit's safety factor is 1.0 in the suite so the many tests that pin exact
     # arithmetic (a headroom equal to a prediction) keep their meaning; the tests of the factor itself
-    # (test_ram_safety_factor.py) set the shipped value explicitly.
+    # (test_ram_fit.py, test_ram_ladder.py, test_not_loaded_batch_check.py) set the shipped value explicitly.
     from brain import dev_constants
 
     monkeypatch.setattr(dev_constants, "RAM_FIT_SAFETY_FACTOR", 1.0)

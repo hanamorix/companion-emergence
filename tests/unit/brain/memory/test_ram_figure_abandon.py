@@ -38,7 +38,9 @@ def _env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(reranker_mod, "resolve_reranker_model_id", lambda: _MODEL)
     monkeypatch.setattr(reranker_mod, "_full_rerank_budget", lambda: 2.0)
     monkeypatch.setattr(reranker_mod, "_batch_sizes", lambda: [2])  # phase 1 plus one batch rung (S245)
-    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 1e15)  # S261: ample (unreadable now means no rerank)
+    # S253/S257: the first rung and the model load need the model file's size (none exists for these doubles); 1 byte.
+    monkeypatch.setattr(reranker_mod, "_runtime_model_file_bytes", lambda model_id: 1.0)
     monkeypatch.setattr(floor_startup, "_background_inhibited", False)
 
 

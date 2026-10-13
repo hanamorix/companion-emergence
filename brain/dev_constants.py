@@ -168,12 +168,13 @@ COST_SERIES_WINDOW_S: float = 24 * 60 * 60
 # factor is a follow-up, issue #379).
 # Provenance: measured 2026-10-13 on the dev VM (4 vCPU; ONNX Runtime 1.29.0; fp16 jina v2 reranker),
 # each measurement in a FRESH process, memory pool and patterns off, default cache. 78 runs = 6 replicates
-# x 13 shapes (7 shapes the fit was fitted on, 6 held out; no batch above 7 pairs). Pre-registered rule:
+# x 13 shapes (7 shapes the fit was fitted on, up to 8 pairs; 6 held out, up to 7 pairs). Pre-registered rule:
 # settled at the first n >= 6 where the running largest underestimate moves by less than 2.0 percentage
 # points over the last 3 replicates; it settled at n = 6 (7.21 - 5.71 = 1.50 points). Largest underestimate:
 # 7.21% (a prediction of 373 MB against 402 MB measured) at the shape of 7 pairs x 300 tokens, replicate 5;
 # 0.0721 is that figure rounded up (7.208%). Record: name-recall-fix-records/R16/S255-REPORT.md in the
 # owner's plans directory. Not covered: the production ladder learns its fit inside one long-lived process,
-# where readings spread more (open fork F37), and batches above 7 pairs were not held out.
+# where readings spread more (open fork F37; S260 re-measures it there and ships the larger of the two, so this
+# one number may be raised), and batches above 7 pairs were not held out.
 RAM_FIT_LARGEST_UNDERESTIMATE: float = 0.0721
 RAM_FIT_SAFETY_FACTOR: float = 1.0 / (1.0 - RAM_FIT_LARGEST_UNDERESTIMATE)  # 1.0777

@@ -203,11 +203,21 @@ def test_free_memory_of_zero_never_passes_even_against_a_bound_of_zero(monkeypat
     assert reranker_mod._memory_floor_blocks("c", "w", lambda: 0.0) is False  # noqa: SLF001
 
 
-def test_unreadable_free_memory_blocks_nothing_and_the_bound_is_not_even_computed(monkeypatch) -> None:
+def test_unreadable_free_memory_blocks_and_the_bound_is_not_even_computed(monkeypatch, caplog) -> None:
+    """S261 (was: blocks nothing, S241/S245): free memory that cannot be read at all takes the cheaper path."""
     computed: list[int] = []
     _headroom(monkeypatch, None)
-    assert reranker_mod._memory_floor_blocks("c", "w", lambda: computed.append(1) or None) is False  # noqa: SLF001
+    with caplog.at_level(logging.INFO, logger=reranker_mod.log.name):
+        for _ in range(3):
+            assert reranker_mod._memory_floor_blocks("c", "w", lambda: computed.append(1) or None) is True  # noqa: SLF001
     assert computed == []
+    assert len([r for r in caplog.records if "(S261)" in r.getMessage()]) == 1, "logged once"
+    _headroom(monkeypatch, 1000.0)
+    assert reranker_mod._memory_floor_blocks("c", "w", lambda: 1.0) is False  # noqa: SLF001
+    _headroom(monkeypatch, None)
+    with caplog.at_level(logging.INFO, logger=reranker_mod.log.name):
+        assert reranker_mod._memory_floor_blocks("c", "w", lambda: 1.0) is True  # noqa: SLF001
+    assert len([r for r in caplog.records if "(S261)" in r.getMessage()]) == 2, "re-armed once it passed"
 
 
 def test_a_bound_that_cannot_be_determined_blocks_when_the_free_memory_is_readable(monkeypatch) -> None:
@@ -301,6 +311,15 @@ def test_with_a_kept_fit_the_load_needs_the_file_size_plus_its_one_pair_predicti
     assert reranker_mod.model_load_blocked_by_memory() is blocked
 
 
+@pytest.mark.parametrize(("headroom", "blocked"), [(9999.0, True), (10000.0, False)])
+def test_the_file_size_is_not_scaled_by_the_safety_factor_in_the_load_bound(monkeypatch, headroom, blocked) -> None:
+    """S255 scales predictions only: with no fit the bound is exactly twice the file size at the shipped factor too."""
+    monkeypatch.setattr(dev_constants, "RAM_FIT_SAFETY_FACTOR", _FACTOR)
+    _headroom(monkeypatch, headroom)
+    _file_size(monkeypatch, 5000.0)
+    assert reranker_mod.model_load_blocked_by_memory() is blocked
+
+
 def test_the_load_takes_the_largest_first_rung_among_the_fits_the_process_keeps_for_the_model(store, monkeypatch) -> None:
     _kept_fit(store, 1000.0)
     other = ram_fit.RamFit(a=0.0, b=3000.0 / 512, c=0.0, shapes=4, samples=4, max_pairs=1, max_length=512)
@@ -333,14 +352,14 @@ def test_the_size_is_asked_for_the_runtime_model_id(monkeypatch) -> None:
     assert asked == [_MODEL]
 
 
-def test_a_load_with_an_undetermined_file_size_is_refused_but_not_when_the_free_memory_is_unreadable(monkeypatch) -> None:
+def test_a_load_with_an_undetermined_file_size_is_refused_and_so_is_one_whose_free_memory_cannot_be_read(monkeypatch) -> None:
     sizes: list[str] = []
     _file_size(monkeypatch, None, sizes)
     _headroom(monkeypatch, 1e12)
     assert reranker_mod.model_load_blocked_by_memory() is True
     _headroom(monkeypatch, None)
     sizes.clear()
-    assert reranker_mod.model_load_blocked_by_memory() is False
+    assert reranker_mod.model_load_blocked_by_memory() is True, "S261 (was: proceeds)"
     assert sizes == [], "no file lookup on a host whose memory cannot be read"
 
 
@@ -465,6 +484,16 @@ def test_the_floor_job_builds_nothing_below_the_file_size_records_a_failed_attem
     assert not floor_calibration.bootstrap_failed("rerank", _FLOOR_MODEL)
 
 
+def test_the_floor_job_builds_nothing_when_free_memory_cannot_be_read(monkeypatch) -> None:
+    """S261: no model load for the floor job either; a failed attempt, retried at the next lull."""
+    built, computed = _floor_env(monkeypatch)
+    _file_size(monkeypatch, 5000.0)
+    _headroom(monkeypatch, None)
+    assert floor_startup.run_rerank_floor(activity_marker=1.0) is None
+    assert built == [] and computed == []
+    assert floor_calibration.bootstrap_failed("rerank", _FLOOR_MODEL)
+
+
 def test_the_floor_job_asks_nothing_of_a_loaded_provider(monkeypatch) -> None:
     built, computed = _floor_env(monkeypatch)
     _file_size(monkeypatch, 5000.0)
@@ -549,11 +578,12 @@ def test_an_undetermined_file_size_stops_the_first_rung_only_where_no_fit_is_kep
     assert _run_pass(store, monkeypatch).timed[:1] == [(1, FULL)]
 
 
-def test_unreadable_free_memory_runs_the_first_rung_without_looking_up_a_size(store, monkeypatch) -> None:
+def test_unreadable_free_memory_runs_no_rung_and_looks_up_no_size(store, monkeypatch) -> None:
+    """S261 (was: runs the first rung without a size lookup)."""
     sizes: list[str] = []
     _file_size(monkeypatch, None, sizes)
     _headroom(monkeypatch, None)
-    assert _run_pass(store, monkeypatch).timed[:1] == [(1, FULL)]
+    assert _run_pass(store, monkeypatch).timed == []
     assert sizes == []
 
 

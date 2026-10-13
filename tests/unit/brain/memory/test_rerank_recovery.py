@@ -258,7 +258,7 @@ def test_c15d_conc9_once_per_lull_per_model_id(clock: _Clock, monkeypatch: pytes
     provider = _stuck(clock, monkeypatch)
     marker = float("-inf")  # a process that has seen no message
     assert _due(marker)
-    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 1e15)  # S261: ample (unreadable now means no rerank)
     # A run at the -inf marker (the record is cleared: 5 fit) ...
     assert _remeasure(marker)
     assert not _verdict()
@@ -370,7 +370,7 @@ def test_c15e_stamp_before_the_ram_check(clock: _Clock, monkeypatch: pytest.Monk
     # needs far more than the headroom.
     reranker_mod._record_rerank_cost(_MODEL, _STORE, 100, 40 * 1.2 * 100 / _X5, None)
     _seed_ram(bytes_per_token=1_000.0, store=_STORE, fresh_process=False)
-    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 1e15)  # S261: ample (unreadable now means no rerank)
     assert _message(provider).hand_off == "budget"
     monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 1.0)
     provider.calls.clear()
@@ -399,7 +399,7 @@ def test_s220_the_job_runs_once_the_memory_model_is_ready(clock: _Clock, monkeyp
     provider = _stuck(clock, monkeypatch)
     _ram_figure_required(monkeypatch)
     _seed_ram(bytes_per_token=1.0, store=_STORE, fresh_process=False)  # a usable model: a tiny need, no headroom reading
-    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 1e15)  # S261: ample (unreadable now means no rerank)
     provider.calls.clear()
     assert _due(1.0) is True and _remeasure(1.0) is True
     assert len(_seven_doc_calls(provider)) == 1

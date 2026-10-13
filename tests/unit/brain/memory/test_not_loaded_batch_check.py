@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from brain import dev_constants
-from brain.memory import cost_series, ram_fit
+from brain.memory import cost_series, ram_fit, semantic_recall
 from brain.memory import reranker as reranker_mod
 from brain.memory.store import MemoryStore
 from tests.unit.brain.memory._ram_support import FULL, ScriptedLadderProvider
@@ -128,6 +128,67 @@ def test_the_file_size_is_added_to_the_batchs_growth_against_the_free_memory_rea
     assert refused.loads == 1, "disclosed: the batch's size is known only after the tokenizer probe, which loads the model"
 
 
+def test_the_post_load_check_adds_the_unscaled_file_size_to_the_scaled_growth(monkeypatch) -> None:
+    """At the shipped factor: file size + growth x factor is the boundary (a file size scaled too would move it)."""
+    monkeypatch.setattr(dev_constants, "RAM_FIT_SAFETY_FACTOR", _FACTOR)
+    _keep_fit()
+    docs = [_DOC] * 20
+    growth = 20 * 100 * _PER_TOKEN
+    need = _FILE + growth * _FACTOR
+    assert need > _LOAD_BOUND * _FACTOR, "past the pre-load check, so the post-load check decides"
+    _headroom(monkeypatch, need)
+    assert _check(_Lazy(), docs) is True
+    _headroom(monkeypatch, need - 1.0)
+    assert _check(_Lazy(), docs) is False
+
+
+def test_whether_the_model_is_loaded_is_read_before_the_free_memory(monkeypatch) -> None:
+    """A load completing between the two reads must make the check stricter, never looser."""
+    _keep_fit()
+    order: list[str] = []
+
+    class _Ordered(_Lazy):
+        def model_loaded(self):
+            order.append("loaded?")
+            return super().model_loaded()
+
+    def headroom():
+        order.append("headroom")
+        return 1e15
+
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", headroom)
+    _check(_Ordered())
+    assert order[:2] == ["loaded?", "headroom"]
+
+
+def test_a_warm_up_whose_check_loads_the_model_and_then_refuses_stops_the_turn(monkeypatch) -> None:
+    """The band: the pre-load check passes, the tokenizer probe loads the model, the post-load check refuses. The
+    caller is told to stop (the model was NOT loaded when the gate began), so this turn is no-rerank."""
+    short = ram_fit.RamFit(a=0.0, b=_PER_TOKEN, c=0.0, shapes=5, samples=5, max_pairs=58, max_length=100)
+    with reranker_mod._cost_lock:  # noqa: SLF001
+        reranker_mod._ram_fit_kept[("k", _MODEL)] = short  # noqa: SLF001
+    provider = _Lazy()
+    _headroom(monkeypatch, _FILE + 100 * _PER_TOKEN + 1000.0)  # passes the load bound (F + one pair at 100 tokens)
+    assert reranker_mod._warm_up_once(provider, _QUERY, _docs(3), bounded=True) is False  # noqa: SLF001 - a 750-token pair
+    assert provider.loads == 1 and provider.plain == [] and _MODEL not in reranker_mod._warmed_model_ids  # noqa: SLF001
+
+
+def test_the_reranked_ranking_of_a_refused_turn_is_the_cosine_path(store, monkeypatch) -> None:
+    _keep_fit(store)
+    provider = _Lazy()
+    monkeypatch.setattr(reranker_mod, "build_reranker_provider", lambda **kw: provider)
+    docs = _docs(10)
+    pool = {f"m{i}": (SimpleNamespace(content=doc), None) for i, doc in enumerate(docs)}
+    ids = list(pool)
+    _headroom(monkeypatch, _LOAD_BOUND - 1.0)
+    sizes = reranker_mod.recall_pair_sizes(provider, _QUERY, docs)
+    ranking, reranked = semantic_recall._reranked_ranking(  # noqa: SLF001
+        store, _QUERY, pool, ids, log_calibration=False, budget_seconds=4.0, sizes=sizes
+    )
+    assert (ranking, reranked) == (None, 0)
+    assert provider.probes == 0 and provider.loads == 0 and provider.timed == []
+
+
 def test_a_loaded_model_adds_nothing_and_no_size_is_looked_up(monkeypatch, _env) -> None:
     _keep_fit()
     provider = _Lazy(loaded=True)
@@ -163,12 +224,17 @@ def test_an_undetermined_file_size_refuses_without_tokenizing(monkeypatch) -> No
     assert provider.probes == 0 and provider.loads == 0
 
 
-def test_unreadable_free_memory_or_no_applicable_bound_passes_without_a_size_lookup_or_tokenizing(monkeypatch, _env) -> None:
+def test_unreadable_free_memory_refuses_and_no_applicable_bound_passes_without_a_size_lookup_or_tokenizing(
+    monkeypatch, _env, caplog
+) -> None:
+    """S261 (was: unreadable free memory passes): refused, nothing tokenized, no size lookup, logged once."""
     _keep_fit()
     _headroom(monkeypatch, None)
     provider = _Lazy()
-    assert _check(provider) is True
+    with caplog.at_level(logging.INFO, logger=reranker_mod.log.name):
+        assert _check(provider) is False and _check(provider) is False
     assert provider.probes == 0 and _env == []
+    assert len([r for r in caplog.records if "(S261)" in r.getMessage()]) == 1
     _headroom(monkeypatch, 1.0)
     monkeypatch.setattr(reranker_mod.peak_rss, "available", lambda: False)
     assert _check(provider) is True

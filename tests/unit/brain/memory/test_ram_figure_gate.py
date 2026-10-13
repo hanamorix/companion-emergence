@@ -44,7 +44,9 @@ def _gate_on(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(reranker_mod, "resolve_reranker_model_id", lambda: _RERANKER_ID)
     # S245: a ladder pass that the live headroom stops records no completion marker, so these tests must
     # not depend on the host's free memory; the tests that care patch their own figure.
-    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 1e15)  # S261: ample (unreadable now means no rerank)
+    # S253/S257: the first rung and the model load need the model file's size (none exists for these doubles); 1 byte.
+    monkeypatch.setattr(reranker_mod, "_runtime_model_file_bytes", lambda model_id: 1.0)
 
 
 class _CappedReranker(RerankerProvider):
