@@ -1173,8 +1173,9 @@ def _too_long_remembered(model_id: str, store: MemoryStore) -> bool:
 #     measured shapes), each only when the fit says it fits the live headroom.
 # S245: the live headroom is checked before the model load, the warm-up and EVERY rung (the first
 # included). S253: the model load and the first rung, which nothing measured bounds, need more than
-# a positive headroom: free memory of at least the model file's size (the first rung: the kept
-# fit's one-pair prediction when one exists); the completion marker is recorded only when the window holds a measured batch of more
+# a positive headroom: the first rung needs free memory of at least the kept fit's one-pair prediction (times
+# the S255 safety factor) or, with no fit, the model file's size; S257: the model load needs the file size plus
+# that first-rung bound, so a host that could load but never run the first rung does not load; the completion marker is recorded only when the window holds a measured batch of more
 # than one pair, so a pass a starved host stopped runs again at the next lull.
 # The window is read to decide every rung, so a restart or an abandoned pass resumes where the
 # window stands. Real reranks add their own shapes. The ONNX memory pool and memory patterns are
@@ -1555,10 +1556,34 @@ def _memory_floor_blocks(condition: str, what: str, needed: Callable[[], float |
     return True
 
 
+def _load_bound_parts(model_id: str) -> tuple[float, float] | None:
+    """S253, S257: `(file size, first-rung bound)` in bytes for loading `model_id`, or `None` when the file size
+    cannot be determined. The first-rung bound is what the ladder's first rung (the full-length single pair) will
+    need once the model is loaded: the largest, over the fits this process keeps for the model id, of the one-pair
+    prediction at that fit's longest measured length (the full input length, which a usable fit always holds) times
+    the S255 safety factor (`RamFit.sized`); with no fit it is the file size again (the order's own bound for a first
+    rung with no fit). The kept fits of every store stand in because the floor job has no store; the largest is the
+    safe one."""
+    size = _runtime_model_file_bytes(model_id)
+    if size is None:
+        return None
+    return size, max((fit.sized(1, fit.max_length) for fit in _kept_ram_fits(model_id)), default=size)
+
+
+def _load_bound(model_id: str) -> float | None:
+    """S257: the free memory the reranker model's load needs: the model file's size plus the first-rung bound
+    (`_load_bound_parts`), so a host that could load the model but never run the first rung does not load it and
+    hold it unused. `None` when the file size cannot be determined."""
+    parts = _load_bound_parts(model_id)
+    return None if parts is None else parts[0] + parts[1]
+
+
 def model_load_blocked_by_memory() -> bool:
-    """S253: whether the reranker model must not be loaded now: the free memory is not at least the model
-    file's size (`_runtime_model_file_bytes`: its size on disk, else the registry's declared size when the
-    file is yet to be downloaded; a size that cannot be determined blocks). Asked before `build_reranker_provider`
+    """S253, S257: whether the reranker model must not be loaded now: the free memory is not at least the model
+    file's size plus the first-rung bound (`_load_bound`: the file size is `_runtime_model_file_bytes`, its size on
+    disk, else the registry's declared size when the file is yet to be downloaded; the first rung is the kept fit's
+    one-pair prediction for the full-length pair times the safety factor, or the file size again when no fit is
+    kept; a size that cannot be determined blocks). Asked before `build_reranker_provider`
     by both places that load the model, the RAM lull job (`run_ram_figure`) and the floor job
     (`floor_startup.run_rerank_floor`). Not asked when this process already holds a provider for the runtime model
     id whose model is loaded (`model_loaded()`: it is out of the free memory already); a provider that is cached
@@ -1569,7 +1594,7 @@ def model_load_blocked_by_memory() -> bool:
         provider = _provider_cache.get(model_id)
         if provider is not None and provider.model_loaded():
             return False
-        return _memory_floor_blocks("load", "the reranker model load", lambda: _runtime_model_file_bytes(model_id))
+        return _memory_floor_blocks("load", "the reranker model load", lambda: _load_bound(model_id))
     except Exception:  # noqa: BLE001 - fail safe: nothing loads on an unexpected failure
         _warn_ram_figure_once("the free-memory check before the model load failed; the model is not loaded (S253)", exc_info=True)
         return True
@@ -1736,9 +1761,9 @@ def run_ram_figure(
     reply path). Returns True iff the window then gives a usable memory model; when it already
     does, nothing is built or measured and the result is False. S245: the live headroom is checked
     BEFORE the provider is built (a known headroom of zero builds and loads nothing: the attempt
-    stamp stays, so the next chat activity marker retries, and the need flag is kept). S253: so is
-    the model file's size (`model_load_blocked_by_memory`: free memory below it builds and loads
-    nothing, the stamp and the flag stay, the next lull retries). Provider
+    stamp stays, so the next chat activity marker retries, and the need flag is kept). S253, S257: so is
+    the model file's size plus the first rung's bound (`model_load_blocked_by_memory`: free memory below it
+    builds and loads nothing, the stamp and the flag stay, the next lull retries). Provider
     exceptions propagate (the central pass logs them).
 
     S218: `watch` (the direct chat's `cli_throttle.reply_watch()`, taken by the caller before
@@ -1760,7 +1785,7 @@ def run_ram_figure(
         if _ladder_headroom_stop(None, "the model load"):
             return False  # S245: nothing is loaded on a host with no headroom; the next lull retries
         if model_load_blocked_by_memory():
-            return False  # S253: nor on a host with less free memory than the model file; the next lull retries
+            return False  # S253, S257: nor on a host with less free memory than the file plus the first rung; the next lull retries
         ready = measure_ram_figure(build_reranker_provider(store=store), store, watch=watch)
     except RamMeasurementAbandoned:
         with _cost_lock:

@@ -159,8 +159,8 @@ def run_rerank_floor(*, activity_marker: object = None) -> dict | None:
 
     `reranker.build_reranker_provider()` runs first: it registers the fp16
     model and caches the provider for the runtime model id, which the bootstrap
-    (`_bootstrap_reranker_provider`) then reuses. S253: before it, the free memory
-    must be at least the model file's size unless the provider's model is already
+    (`_bootstrap_reranker_provider`) then reuses. S253, S257: before it, the free memory
+    must be at least the model file's size plus the first rung's bound unless the provider's model is already
     loaded (`reranker.model_load_blocked_by_memory`); below it nothing is built and a
     failed attempt is recorded, so the floor is retried at the next lull and message."""
     model_id = reranker_model_id()
@@ -172,7 +172,7 @@ def run_rerank_floor(*, activity_marker: object = None) -> dict | None:
         logger.exception("floor_startup: the free-memory check before the model load failed for %s", model_id)
         blocked = True
     if blocked:
-        # S253: less free memory than the model file (or its size is unknown): nothing is built or
+        # S253, S257: less free memory than the model file plus the first rung (or its size is unknown): nothing is built or
         # loaded; a failed attempt is recorded, so the next lull and the next message retry it.
         floor_calibration._record_attempt(  # noqa: SLF001
             "rerank", model_id, False, activity_marker

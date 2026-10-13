@@ -73,6 +73,11 @@ def _kept_fit(store, constant: float) -> ram_fit.RamFit:
     return fit
 
 
+def _kept_fit_bytes(constant: float) -> ram_fit.RamFit:
+    """A fit predicting `constant` bytes for one pair of FULL tokens (not registered anywhere)."""
+    return ram_fit.RamFit(a=constant, b=0.0, c=0.0, shapes=4, samples=4, max_pairs=1, max_length=FULL)
+
+
 def _s253_records(caplog) -> list[logging.LogRecord]:
     return [r for r in caplog.records if "(S253)" in r.getMessage()]
 
@@ -277,11 +282,47 @@ def test_no_free_memory_is_a_block_of_its_own_and_looks_up_no_bound(monkeypatch,
 # ---- the load check (model_load_blocked_by_memory) ----
 
 
-@pytest.mark.parametrize(("headroom", "blocked"), [(4999.0, True), (5000.0, False), (6000.0, False)])
-def test_the_load_needs_free_memory_of_at_least_the_model_file_size(monkeypatch, headroom, blocked) -> None:
+@pytest.mark.parametrize(("headroom", "blocked"), [(5000.0, True), (9999.0, True), (10000.0, False), (11000.0, False)])
+def test_with_no_fit_the_load_needs_the_file_size_twice_the_file_and_the_first_rung_bound(monkeypatch, headroom, blocked) -> None:
+    """S257: the order's own bound for a first rung with no fit is the file size again."""
     _headroom(monkeypatch, headroom)
     _file_size(monkeypatch, 5000.0)
     assert reranker_mod.model_load_blocked_by_memory() is blocked
+
+
+@pytest.mark.parametrize(("delta", "blocked"), [(-1.0, True), (0.0, False), (1.0, False)])
+def test_with_a_kept_fit_the_load_needs_the_file_size_plus_its_one_pair_prediction_times_the_factor(
+    store, monkeypatch, delta, blocked
+) -> None:
+    monkeypatch.setattr(dev_constants, "RAM_FIT_SAFETY_FACTOR", _FACTOR)
+    _kept_fit(store, 1000.0)
+    _file_size(monkeypatch, 5000.0)
+    _headroom(monkeypatch, 5000.0 + 1000.0 * _FACTOR + delta)
+    assert reranker_mod.model_load_blocked_by_memory() is blocked
+
+
+def test_the_load_takes_the_largest_first_rung_among_the_fits_the_process_keeps_for_the_model(store, monkeypatch) -> None:
+    _kept_fit(store, 1000.0)
+    other = ram_fit.RamFit(a=0.0, b=3000.0 / 512, c=0.0, shapes=4, samples=4, max_pairs=1, max_length=512)
+    reranker_mod._ram_fit_kept[("another-store", _MODEL)] = other  # noqa: SLF001 - one pair at ITS longest length: 3000
+    reranker_mod._ram_fit_kept[("another-store", "another-model")] = _kept_fit_bytes(9e9)  # noqa: SLF001 - not this model
+    _file_size(monkeypatch, 5000.0)
+    _headroom(monkeypatch, 7999.0)
+    assert reranker_mod.model_load_blocked_by_memory() is True
+    _headroom(monkeypatch, 8000.0)
+    assert reranker_mod.model_load_blocked_by_memory() is False
+
+
+def test_the_load_bound_reads_the_file_size_once(store, monkeypatch) -> None:
+    asked: list[str] = []
+    _file_size(monkeypatch, 5000.0, asked)
+    _headroom(monkeypatch, 1e12)
+    assert reranker_mod._load_bound(_MODEL) == 10000.0  # noqa: SLF001
+    assert asked == [_MODEL]
+    _kept_fit(store, 1000.0)
+    asked.clear()
+    assert reranker_mod._load_bound(_MODEL) == 6000.0  # noqa: SLF001 - the suite factor is 1.0
+    assert asked == [_MODEL]
 
 
 def test_the_size_is_asked_for_the_runtime_model_id(monkeypatch) -> None:
@@ -365,7 +406,7 @@ def test_the_ram_job_builds_and_loads_nothing_below_the_file_size_and_retries_at
     provider = ScriptedLadderProvider(model=_MODEL)
     built = _build_spy(monkeypatch, provider)
     _file_size(monkeypatch, 5000.0)
-    _headroom(monkeypatch, 4999.0)
+    _headroom(monkeypatch, 9999.0)  # S257: below the file size plus the first rung (the file size again, no fit)
     reranker_mod.note_ram_figure_needed(_MODEL)
     assert reranker_mod.run_ram_figure("m1", store) is False
     assert built == [] and provider.plain == [] and provider.timed == [] and provider.probes == 0
@@ -373,7 +414,7 @@ def test_the_ram_job_builds_and_loads_nothing_below_the_file_size_and_retries_at
     assert _MODEL in reranker_mod._ram_figure_needed, "the need flag is kept"  # noqa: SLF001
     assert reranker_mod.ram_figure_due("m1", lambda: _open(store)) is False, "once per chat activity marker"
     assert reranker_mod.ram_figure_due("m2", lambda: _open(store)) is True, "the next lull retries"
-    _headroom(monkeypatch, 5000.0)  # exactly the file size
+    _headroom(monkeypatch, 10000.0)  # exactly the bound
     reranker_mod.run_ram_figure("m2", store)
     assert built == [1]
 
@@ -412,13 +453,13 @@ def _floor_env(monkeypatch):
 def test_the_floor_job_builds_nothing_below_the_file_size_records_a_failed_attempt_and_retries(monkeypatch) -> None:
     built, computed = _floor_env(monkeypatch)
     _file_size(monkeypatch, 5000.0)
-    _headroom(monkeypatch, 4999.0)
+    _headroom(monkeypatch, 9999.0)  # S257: file size plus the first rung (the file size again, no fit)
     assert floor_startup.run_rerank_floor(activity_marker=1.0) is None
     assert built == [] and computed == []
     assert floor_calibration.bootstrap_failed("rerank", _FLOOR_MODEL)
     assert not floor_calibration.rerank_bootstrap_due(_FLOOR_MODEL, activity_marker=1.0), "same marker: not again"
     assert floor_calibration.rerank_bootstrap_due(_FLOOR_MODEL, activity_marker=2.0), "the next lull retries it"
-    _headroom(monkeypatch, 5000.0)  # exactly the file size
+    _headroom(monkeypatch, 10000.0)  # exactly the bound
     assert floor_startup.run_rerank_floor(activity_marker=2.0) == {"floor": 1.0}
     assert built == [1] and computed == [_FLOOR_MODEL]
     assert not floor_calibration.bootstrap_failed("rerank", _FLOOR_MODEL)
@@ -528,25 +569,20 @@ def test_a_rung_that_a_measured_shape_bounds_does_not_use_the_first_rung_bound(s
     assert provider.timed[:1] == [(1, 512)]
 
 
-def test_a_host_between_the_file_size_and_twice_it_loads_the_model_and_then_waits_at_the_first_rung(store, monkeypatch) -> None:
-    """The literal S253 composes two bounds: with no fit the load needs the file size, and the first rung then
-    needs it again from what is left AFTER the load. Owner question Q1 (R16 spec): accepted as built, the same
-    shape as the S254 dead zone. The model stays loaded, nothing is measured, every lull retries, cosine serves."""
-    free = {"v": 7500.0}
+def test_a_host_between_the_file_size_and_twice_it_never_loads_the_model(store, monkeypatch) -> None:
+    """S257 closes the R16 dead zone (owner question Q1): with no fit the load needs the file size plus the first
+    rung's bound (the file size again), so a host with free memory in [F, 2F) builds and loads nothing and holds no
+    unused model; every lull retries and the cosine path serves."""
     provider = ScriptedLadderProvider(model=_MODEL)
-
-    def _build(**kw):
-        free["v"] = 2500.0  # the load takes the model's resident size out of the free memory
-        return provider
-
-    monkeypatch.setattr(reranker_mod, "build_reranker_provider", _build)
+    built = _build_spy(monkeypatch, provider)
     _file_size(monkeypatch, 5000.0)
-    _headroom(monkeypatch, lambda: free["v"])
+    _headroom(monkeypatch, 7500.0)
     reranker_mod.note_ram_figure_needed(_MODEL)
     assert reranker_mod.run_ram_figure("m1", store) is False
-    assert provider.plain, "the model was loaded (the warm-up ran)"
-    assert provider.timed == [] and not reranker_mod._ram_shapes.shape_groups(store, _MODEL)  # noqa: SLF001
+    assert built == [] and provider.plain == [] and provider.timed == []
+    assert _MODEL in reranker_mod._ram_figure_needed  # noqa: SLF001
     assert reranker_mod.ram_figure_due("m2", lambda: _open(store)) is True, "retried at the next lull"
+    assert reranker_mod.run_ram_figure("m2", store) is False and built == []
 
 
 # ---- text ----
@@ -561,8 +597,10 @@ def test_the_docstrings_state_the_s253_floor() -> None:
     assert "S253" in ladder and "kept fit's one-pair prediction" in ladder and "model file's size" in ladder
     assert "held to a positive headroom only" not in ladder
     run = _flat(reranker_mod.run_ram_figure)
-    assert "S253" in run and "model file's size" in run
+    assert "S253" in run and "S257" in run and "model file's size" in run and "first rung" in run
     stop = _flat(reranker_mod._ladder_headroom_stop)  # noqa: SLF001
     assert "S253" in stop and "the first rung, the model load, the warm-up" not in stop
     assert "S253" in _flat(floor_startup.run_rerank_floor) and "model file's size" in _flat(floor_startup.run_rerank_floor)
-    assert "S253" in _flat(reranker_mod.model_load_blocked_by_memory)
+    assert "S257" in _flat(reranker_mod.model_load_blocked_by_memory)
+    assert "first-rung bound" in _flat(reranker_mod.model_load_blocked_by_memory)
+    assert "S257" in _flat(floor_startup.run_rerank_floor)
