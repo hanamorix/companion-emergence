@@ -58,6 +58,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import math
+import os
 import statistics
 import sys
 import threading
@@ -201,6 +202,12 @@ class RerankerProvider(ABC):
     def disarm_terminate(self) -> None:
         """S223: end this thread's armed scope (see `arm_terminate`). Default: nothing to do."""
         return None
+
+    def model_loaded(self) -> bool:
+        """S253: whether this provider's model is already read into memory, so a free-memory
+        check meant for the load has nothing left to guard. Default True: a provider with no
+        model file to read in (the fakes) has nothing to load."""
+        return True
 
     def rerank_timed(
         self, query: str, documents: list[str]
@@ -488,6 +495,16 @@ class CrossEncoderProvider(RerankerProvider):
                 exc_info=first,
             )
             return None, None
+
+    def model_loaded(self) -> bool:
+        """S253: whether the ONNX session is built. fastembed's `lazy_load=True` defers it to the
+        first tokenizer use or rerank, so a constructed provider is not necessarily a loaded one.
+        The same test `_pair_tokenizer` makes before it loads (`getattr(inner, "model", None)`).
+        Any failure to tell counts as not loaded (the free-memory check then applies)."""
+        try:
+            return getattr(self._model.model, "model", None) is not None
+        except Exception:  # noqa: BLE001 - fail safe: not loaded
+            return False
 
     def _pair_tokenizer(self) -> Any:
         """The loaded fastembed cross-encoder's tokenizer (a PRIVATE fastembed
@@ -845,6 +862,10 @@ _warmed_model_ids: set[str] = set()
 # resident set the peak is read from), and it does not rerank until it restarts. Cleared only by tests.
 _downloaded_model_ids: set[str] = set()
 
+# S253: the free-memory conditions already logged (one log line per condition until the check next passes).
+# Guarded by `_cost_lock`; cleared only by tests.
+_memory_wait_logged: set[str] = set()
+
 
 def _downloaded_here(model_id: str) -> bool:
     with _cost_lock:
@@ -856,6 +877,17 @@ def _note_model_downloaded(model_id: str) -> None:
         _downloaded_model_ids.add(model_id)
 
 
+def _registry_entry(model_id: str) -> dict | None:
+    """S249, S253: fastembed's own description of `model_id` (`model`, `sources.hf`, `model_file`,
+    `size_in_GB`), or `None` when the model is not in its registry. May raise: the callers wrap it."""
+    from fastembed.rerank.cross_encoder.text_cross_encoder import TextCrossEncoder
+
+    for description in TextCrossEncoder.list_supported_models():
+        if description.get("model") == model_id:
+            return description
+    return None
+
+
 def _model_file_cached(model_id: str, cache_dir: str | Path) -> bool | None:
     """S249: whether fastembed's construction will find the model file in the cache (True) or has to
     download it (False); `None` when that cannot be decided (the model is not in fastembed's registry, or
@@ -865,20 +897,70 @@ def _model_file_cached(model_id: str, cache_dir: str | Path) -> bool | None:
     same hub layout fastembed writes (`models--org--name/snapshots/<rev>/<file>`, `refs/main`) and neither
     downloads nor raises for an uncached file."""
     try:
-        from fastembed.rerank.cross_encoder.text_cross_encoder import TextCrossEncoder
         from huggingface_hub import try_to_load_from_cache
 
-        for description in TextCrossEncoder.list_supported_models():
-            if description.get("model") == model_id:
-                repo = (description.get("sources") or {}).get("hf")
-                filename = description.get("model_file")
-                if not repo or not filename:
-                    return None
-                return isinstance(try_to_load_from_cache(repo, filename, cache_dir=str(cache_dir)), str)
-        return None
+        description = _registry_entry(model_id)
+        if description is None:
+            return None
+        repo = (description.get("sources") or {}).get("hf")
+        filename = description.get("model_file")
+        if not repo or not filename:
+            return None
+        return isinstance(try_to_load_from_cache(repo, filename, cache_dir=str(cache_dir)), str)
     except Exception:  # noqa: BLE001 - detection must never break building the provider
         _warn_ram_figure_once("could not tell whether the reranker model was already cached (S249)", exc_info=True)
         return None
+
+
+def _positive_finite(value: object) -> float | None:
+    """`value` as a float when it is a positive finite number, else `None` (S253: a size of zero, a
+    negative or non-finite one, or a non-number is no size)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) and number > 0.0 else None
+
+
+def _reranker_model_file_bytes(model_id: str, cache_dir: str | Path) -> float | None:
+    """S253: the size in bytes of the ONNX file fastembed loads for `model_id`: the on-disk size of the
+    registered file when it is cached (the same registry lookup and hub layout as `_model_file_cached`, so the
+    registered fp16 export is its own file, not the fp32 one). A file that is not cached yet (this process is
+    about to download it, S249) has no size on disk: the registry's own declared `size_in_GB` (times 1e9) of
+    the same entry stands in for it. `None` when neither gives a positive finite size (no registry entry, an
+    error, a zero size): the caller then does not load (fail safe) and warns once."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        description = _registry_entry(model_id)
+        if description is None:
+            return None
+        repo = (description.get("sources") or {}).get("hf")
+        filename = description.get("model_file")
+        if repo and filename:
+            path = try_to_load_from_cache(repo, filename, cache_dir=str(cache_dir))
+            if isinstance(path, str):
+                size = _positive_finite(os.path.getsize(path))
+                if size is not None:
+                    return size
+        declared = _positive_finite(description.get("size_in_GB"))
+        return None if declared is None else declared * 1e9
+    except Exception:  # noqa: BLE001 - a size probe must never break a job
+        _warn_ram_figure_once("could not read the reranker model file's size (S253)", exc_info=True)
+        return None
+
+
+def _runtime_model_file_bytes(model_id: str) -> float | None:
+    """S253: `_reranker_model_file_bytes` for the runtime reranker in the shared model cache. The pinned fp16
+    export is registered with fastembed first, as `build_reranker_provider` does, because this can run before
+    the provider is ever built (the registry would not know the id yet and the size would read as undetermined)."""
+    from brain.bridge.model_tier import MODEL_RERANKER_FP16, TIER_RERANKER, model_for_tier
+    from brain.paths import get_cache_dir
+
+    if model_id == MODEL_RERANKER_FP16:
+        _register_fp16_reranker_model(MODEL_RERANKER_FP16, model_for_tier(TIER_RERANKER))
+    return _reranker_model_file_bytes(model_id, get_cache_dir())
+
+
 _budget_misses: dict[str, _BudgetMiss] = {}
 _remeasured_marker: dict[str, object] = {}
 
@@ -1380,10 +1462,12 @@ def _ladder_headroom_stop(predicted: float | None, what: str) -> bool:
     """S245: whether the ladder must not run `what` now, judged on a fresh read of the live
     headroom (`_available_ram_headroom_bytes`, the S241 minimum). True when the headroom is known and
     is zero or less (a degraded host, S240), or when it is known and the step's PREDICTED growth
-    exceeds it. `predicted` is `None` when nothing measured bounds the step (the first rung, the model
-    load, the warm-up): then only a headroom of zero stops it. An unreadable headroom (`None`) does not
-    stop the ladder, the posture the width fit has always had (the memory term is skipped, never read
-    as unlimited memory)."""
+    exceeds it. `predicted` is `None` when nothing measured bounds the step (the model load, the
+    warm-up): then only a headroom of zero stops it. S253: the first rung and the model load are held
+    to more than that, by `_memory_floor_blocks` (the model file's size, or the kept fit's one-pair
+    prediction); the first rung no longer reaches this function with `None`. An unreadable headroom
+    (`None`) does not stop the ladder, the posture the width fit has always had (the memory term is
+    skipped, never read as unlimited memory)."""
     headroom = _available_ram_headroom_bytes()
     if headroom is None:
         return False
@@ -1396,6 +1480,97 @@ def _ladder_headroom_stop(predicted: float | None, what: str) -> bool:
         "unknown" if predicted is None else f"{predicted / 1e6:.0f} MB",
     )
     return True
+
+
+def _memory_wait_clear(condition: str) -> None:
+    with _cost_lock:
+        _memory_wait_logged.discard(condition)
+        _memory_wait_logged.discard(condition + "-size")
+
+
+def _memory_wait_log_once(key: str, other: str, level: int, message: str, *args: object) -> None:
+    """Log `message` unless `key` was already logged and has not passed since (S253: one line per
+    condition, not one per lull). `other` is the same condition's other kind, re-armed by this one."""
+    with _cost_lock:
+        first = key not in _memory_wait_logged
+        _memory_wait_logged.add(key)
+        _memory_wait_logged.discard(other)
+    if first:
+        log.log(level, message, *args)
+
+
+def _memory_floor_blocks(condition: str, what: str, needed: Callable[[], float | None]) -> bool:
+    """S253: whether `what` (the model load, the ladder's first rung) must wait because the free memory
+    (`_available_ram_headroom_bytes`, the S241 minimum, read fresh) is not both positive and at least
+    `needed()` bytes. An unreadable free memory does not block, the posture of S241 and S245 (the memory
+    term is skipped, never read as unlimited, and a host that cannot be read is not locked out). A bound
+    that cannot be determined (`needed()` returns `None`) blocks: fail safe, nothing is loaded or run on
+    a guess. Logs once per condition until the check next passes (`condition` and `condition-size` are
+    separate conditions). `needed` is called with no lock held and only after the free memory is known to
+    be readable, so a host with no reading touches no disk."""
+    headroom = _available_ram_headroom_bytes()
+    if headroom is None:
+        _memory_wait_clear(condition)
+        return False
+    bound = needed()
+    if bound is None:
+        _memory_wait_log_once(
+            condition + "-size",
+            condition,
+            logging.WARNING,
+            "reranker: %s waits: its size bound could not be determined (free memory %.0f MB); retried at the next lull (S253)",
+            what,
+            headroom / 1e6,
+        )
+        return True
+    if headroom > 0.0 and headroom >= bound:
+        _memory_wait_clear(condition)
+        return False
+    _memory_wait_log_once(
+        condition,
+        condition + "-size",
+        logging.INFO,
+        "reranker: %s waits: free memory %.0f MB is below the %.0f MB it needs; retried at the next lull (S253)",
+        what,
+        headroom / 1e6,
+        bound / 1e6,
+    )
+    return True
+
+
+def model_load_blocked_by_memory() -> bool:
+    """S253: whether the reranker model must not be loaded now: the free memory is not at least the model
+    file's size (`_runtime_model_file_bytes`: its size on disk, else the registry's declared size when the
+    file is yet to be downloaded; a size that cannot be determined blocks). Asked before `build_reranker_provider`
+    by both places that load the model, the RAM lull job (`run_ram_figure`) and the floor job
+    (`floor_startup.run_rerank_floor`). Not asked when this process already holds a provider for the runtime model
+    id whose model is loaded (`model_loaded()`: it is out of the free memory already); a provider that is cached
+    but not yet loaded (fastembed loads lazily) is asked like none. Never raises: an unexpected error blocks
+    and warns once."""
+    try:
+        model_id = resolve_reranker_model_id()
+        provider = _provider_cache.get(model_id)
+        if provider is not None and provider.model_loaded():
+            return False
+        return _memory_floor_blocks("load", "the reranker model load", lambda: _runtime_model_file_bytes(model_id))
+    except Exception:  # noqa: BLE001 - fail safe: nothing loads on an unexpected failure
+        _warn_ram_figure_once("the free-memory check before the model load failed; the model is not loaded (S253)", exc_info=True)
+        return True
+
+
+def _first_rung_bound(store: MemoryStore, model_id: str, cap: int) -> Callable[[], float | None]:
+    """S253: the bound for the ladder's first rung, the full-length single pair (`cap` tokens): this
+    process's kept fit's one-pair prediction for it, else (no fit exists) the model file's size."""
+    key = (cost_series._store_key(store), model_id)  # noqa: SLF001
+
+    def bound() -> float | None:
+        with _cost_lock:
+            fit = _ram_fit_kept.get(key)
+        if fit is not None:
+            return fit.predict(1, cap)
+        return _runtime_model_file_bytes(model_id)
+
+    return bound
 
 
 def measure_ram_figure(
@@ -1415,8 +1590,10 @@ def measure_ram_figure(
     sizing (`_window_ram_fit`), so the first batches are never sized from single pairs alone.
     S245: the live headroom is checked before the warm-up and before EVERY rung, the first included
     (`_ladder_headroom_stop`): a known headroom of zero stops the pass, a rung is predicted from the
-    fit (phase 2) or bounded by the measured shape that dominates it (phase 1), and the first rung,
-    which nothing bounds, is held to a positive headroom only. S249: nothing is run (False) in a
+    fit (phase 2) or bounded by the measured shape that dominates it (phase 1). S253: the first rung,
+    which nothing measured bounds, needs the free memory to be at least the kept fit's one-pair
+    prediction for the full-length pair, or the model file's size when no fit exists
+    (`_memory_floor_blocks`); below it nothing runs and the next lull retries. S249: nothing is run (False) in a
     process that downloaded the model file. Provider exceptions propagate.
 
     S218: with a `watch` (the direct chat passes `cli_throttle.reply_watch()`), a reply that
@@ -1454,7 +1631,13 @@ def measure_ram_figure(
         if rung is None:
             break
         shortest = min((g.length for g in groups if g.pairs == 1), default=None)
-        if _ladder_headroom_stop(_dominating_growth(groups, rung.pairs, rung.target), "a single-pair rung"):
+        predicted = _dominating_growth(groups, rung.pairs, rung.target)
+        if predicted is None:
+            # S253: nothing measured bounds the first rung (the full-length pair).
+            stopped = _memory_floor_blocks("rung", "the ladder's first rung", _first_rung_bound(store, model_id, cap))
+        else:
+            stopped = _ladder_headroom_stop(predicted, "a single-pair rung")
+        if stopped:
             return _window_ready(store, model_id)
         if not _run_rung(provider, store, model_id, base_text, rung, cap, watch):
             return _window_ready(store, model_id)
@@ -1526,7 +1709,9 @@ def run_ram_figure(
     reply path). Returns True iff the window then gives a usable memory model; when it already
     does, nothing is built or measured and the result is False. S245: the live headroom is checked
     BEFORE the provider is built (a known headroom of zero builds and loads nothing: the attempt
-    stamp stays, so the next chat activity marker retries, and the need flag is kept). Provider
+    stamp stays, so the next chat activity marker retries, and the need flag is kept). S253: so is
+    the model file's size (`model_load_blocked_by_memory`: free memory below it builds and loads
+    nothing, the stamp and the flag stay, the next lull retries). Provider
     exceptions propagate (the central pass logs them).
 
     S218: `watch` (the direct chat's `cli_throttle.reply_watch()`, taken by the caller before
@@ -1547,6 +1732,8 @@ def run_ram_figure(
         _abandon_if_replying(watch)
         if _ladder_headroom_stop(None, "the model load"):
             return False  # S245: nothing is loaded on a host with no headroom; the next lull retries
+        if model_load_blocked_by_memory():
+            return False  # S253: nor on a host with less free memory than the model file; the next lull retries
         ready = measure_ram_figure(build_reranker_provider(store=store), store, watch=watch)
     except RamMeasurementAbandoned:
         with _cost_lock:
@@ -1570,6 +1757,7 @@ def _reset_rerank_cost_model() -> None:
         _ram_fit_memo.clear()
         _warmed_model_ids.clear()
         _downloaded_model_ids.clear()
+        _memory_wait_logged.clear()
         _budget_misses.clear()
         _remeasured_marker.clear()
         _too_long.clear()

@@ -412,6 +412,9 @@ def _ram_figure_not_required_by_default(monkeypatch: pytest.MonkeyPatch) -> Iter
     from brain.memory import peak_rss, reranker
 
     monkeypatch.setattr(reranker, "_require_ram_figure", False)
+    # S253: the free-memory check before the model load reads the host's memory and the model cache:
+    # off by default so no test depends on either; its own tests restore the real function.
+    monkeypatch.setattr(reranker, "model_load_blocked_by_memory", lambda: False)
     # S220: the per-call peak reader is process-wide (on Linux it resets the kernel's peak
     # counter; elsewhere, S248, it samples the RSS in a thread): off by default so the suite's
     # fake rerankers neither touch /proc nor start a sampler nor record memory samples; the

@@ -34,6 +34,10 @@ def _env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(reranker_mod, "resolve_reranker_model_id", lambda: _MODEL)
     monkeypatch.setattr(reranker_mod, "_full_rerank_budget", lambda: _BUDGET)
     monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: None)
+    # S253: the first rung (and the model load) need free memory of at least the model file's size when no
+    # fit is kept; this scripted model has no file, so it reads as 1.0 byte (not above the smallest positive
+    # headroom these tests use). The bound itself is exercised in test_model_load_memory_floor.py.
+    monkeypatch.setattr(reranker_mod, "_runtime_model_file_bytes", lambda model_id: 1.0)
 
 
 @pytest.fixture
