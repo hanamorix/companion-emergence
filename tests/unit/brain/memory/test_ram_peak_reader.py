@@ -251,6 +251,25 @@ def test_an_unreadable_rss_latches_the_sampler_reader_off_with_one_warning(force
     assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 1
 
 
+def test_a_baseline_that_fails_after_the_availability_read_latches_the_reader_off(forced, monkeypatch, caplog) -> None:
+    """`available()` reads the RSS once and `begin()` reads it again for the baseline: a read that
+    succeeds the first time and fails the second returns None, starts no thread, and latches."""
+    reads = {"n": 0}
+
+    def _fails_on_the_second_read() -> float | None:
+        reads["n"] += 1
+        return 100.0 if reads["n"] == 1 else None
+
+    monkeypatch.setattr(peak_rss, "_rss_now", _fails_on_the_second_read)
+    with caplog.at_level("DEBUG"):
+        assert peak_rss.begin() is None
+    assert reads["n"] == 2
+    assert _samplers() == []
+    monkeypatch.setattr(peak_rss, "_rss_now", forced)  # readable again: the latch still holds
+    assert peak_rss.available() is False, "latched off for the process"
+    assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 1
+
+
 def test_a_thread_that_cannot_start_latches_the_reader_off(forced, monkeypatch) -> None:
     def _no_thread(self) -> None:
         raise RuntimeError("can't start new thread")
