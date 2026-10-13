@@ -63,8 +63,10 @@ def _file_size(monkeypatch, size, calls: list[str] | None = None) -> None:
 
 
 def _kept_fit(store, constant: float) -> ram_fit.RamFit:
-    """A kept fit that predicts exactly `constant` bytes for any shape."""
-    fit = ram_fit.RamFit(a=constant, b=0.0, c=0.0, shapes=4, samples=4, max_pairs=1, max_length=FULL)
+    """A kept fit that predicts exactly `constant` bytes for ONE pair of FULL tokens and grows with the shape
+    (b = constant / FULL per padded token), so a wrong pair count or length in the call changes the bound."""
+    fit = ram_fit.RamFit(a=0.0, b=constant / FULL, c=0.0, shapes=4, samples=4, max_pairs=1, max_length=FULL)
+    assert fit.predict(1, FULL) == constant and fit.predict(2, FULL) != constant and fit.predict(1, FULL - 1) != constant
     reranker_mod._ram_fit_kept[(cost_series._store_key(store), _MODEL)] = fit  # noqa: SLF001
     return fit
 
@@ -162,6 +164,22 @@ def test_the_runtime_reader_registers_the_pinned_fp16_model_before_it_reads(tmp_
         custom[:] = saved
 
 
+def test_the_runtime_reader_reads_the_shared_cache_dir_and_never_raises(tmp_path, monkeypatch, caplog) -> None:
+    from brain.bridge.model_tier import MODEL_RERANKER
+
+    fp16 = _fp16_id()
+    _hub_file(tmp_path, MODEL_RERANKER, "onnx/model_fp16.onnx", 4321)
+    monkeypatch.setattr("brain.paths.get_cache_dir", lambda: tmp_path)
+    assert _REAL_FILE_BYTES(fp16) == 4321.0
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("registration exploded")
+
+    monkeypatch.setattr(reranker_mod, "_register_fp16_reranker_model", _boom)
+    with caplog.at_level(logging.WARNING, logger=reranker_mod.log.name):
+        assert _REAL_FILE_BYTES(fp16) is None
+
+
 # ---- the shared check: boundary, unreadable memory, undetermined bound, no lock held ----
 
 
@@ -228,6 +246,22 @@ def test_a_blocked_condition_logs_once_until_it_passes_and_conditions_log_separa
         assert len(_s253_records(caplog)) == 4, "re-armed once the check passed"
 
 
+def test_alternating_kinds_of_one_condition_each_log_when_they_come_back(monkeypatch, caplog) -> None:
+    _headroom(monkeypatch, 10.0)
+    with caplog.at_level(logging.INFO, logger=reranker_mod.log.name):
+        for needed in (lambda: 100.0, lambda: None, lambda: 100.0, lambda: None):
+            assert reranker_mod._memory_floor_blocks("load", "the model load", needed) is True  # noqa: SLF001
+        assert len(_s253_records(caplog)) == 4
+
+
+def test_no_free_memory_is_a_block_of_its_own_and_looks_up_no_bound(monkeypatch, caplog) -> None:
+    computed: list[int] = []
+    _headroom(monkeypatch, -5.0)
+    with caplog.at_level(logging.INFO, logger=reranker_mod.log.name):
+        assert reranker_mod._memory_floor_blocks("c", "w", lambda: computed.append(1) or 1.0) is True  # noqa: SLF001
+    assert computed == [] and len(_s253_records(caplog)) == 1
+
+
 # ---- the load check (model_load_blocked_by_memory) ----
 
 
@@ -236,6 +270,14 @@ def test_the_load_needs_free_memory_of_at_least_the_model_file_size(monkeypatch,
     _headroom(monkeypatch, headroom)
     _file_size(monkeypatch, 5000.0)
     assert reranker_mod.model_load_blocked_by_memory() is blocked
+
+
+def test_the_size_is_asked_for_the_runtime_model_id(monkeypatch) -> None:
+    asked: list[str] = []
+    _headroom(monkeypatch, 1e12)
+    _file_size(monkeypatch, 5000.0, asked)
+    assert reranker_mod.model_load_blocked_by_memory() is False
+    assert asked == [_MODEL]
 
 
 def test_a_load_with_an_undetermined_file_size_is_refused_but_not_when_the_free_memory_is_unreadable(monkeypatch) -> None:
@@ -419,6 +461,14 @@ def test_the_first_rung_needs_the_kept_fits_one_pair_prediction_not_the_file_siz
     _headroom(monkeypatch, headroom)
     provider = _run_pass(store, monkeypatch)
     assert (provider.timed[:1] == [(1, FULL)]) is ran
+
+
+def test_the_first_rung_asks_for_the_runtime_model_id_and_only_when_no_fit_is_kept(store, monkeypatch) -> None:
+    asked: list[str] = []
+    _file_size(monkeypatch, 5000.0, asked)
+    _headroom(monkeypatch, 1e12)
+    _run_pass(store, monkeypatch)
+    assert asked == [_MODEL]
 
 
 def test_an_undetermined_file_size_stops_the_first_rung_only_where_no_fit_is_kept(store, monkeypatch) -> None:

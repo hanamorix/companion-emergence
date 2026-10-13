@@ -953,12 +953,16 @@ def _runtime_model_file_bytes(model_id: str) -> float | None:
     """S253: `_reranker_model_file_bytes` for the runtime reranker in the shared model cache. The pinned fp16
     export is registered with fastembed first, as `build_reranker_provider` does, because this can run before
     the provider is ever built (the registry would not know the id yet and the size would read as undetermined)."""
-    from brain.bridge.model_tier import MODEL_RERANKER_FP16, TIER_RERANKER, model_for_tier
-    from brain.paths import get_cache_dir
+    try:
+        from brain.bridge.model_tier import MODEL_RERANKER_FP16, TIER_RERANKER, model_for_tier
+        from brain.paths import get_cache_dir
 
-    if model_id == MODEL_RERANKER_FP16:
-        _register_fp16_reranker_model(MODEL_RERANKER_FP16, model_for_tier(TIER_RERANKER))
-    return _reranker_model_file_bytes(model_id, get_cache_dir())
+        if model_id == MODEL_RERANKER_FP16:
+            _register_fp16_reranker_model(MODEL_RERANKER_FP16, model_for_tier(TIER_RERANKER))
+        return _reranker_model_file_bytes(model_id, get_cache_dir())
+    except Exception:  # noqa: BLE001 - a size probe must never break a job (the first rung's bound reaches it too)
+        _warn_ram_figure_once("could not read the reranker model file's size (S253)", exc_info=True)
+        return None
 
 
 _budget_misses: dict[str, _BudgetMiss] = {}
@@ -1168,7 +1172,9 @@ def _too_long_remembered(model_id: str, store: MemoryStore) -> bool:
 #     pairs (every real call fits the time budget, so each real call is dominated by one of these
 #     measured shapes), each only when the fit says it fits the live headroom.
 # S245: the live headroom is checked before the model load, the warm-up and EVERY rung (the first
-# included); the completion marker is recorded only when the window holds a measured batch of more
+# included). S253: the model load and the first rung, which nothing measured bounds, need more than
+# a positive headroom: free memory of at least the model file's size (the first rung: the kept
+# fit's one-pair prediction when one exists); the completion marker is recorded only when the window holds a measured batch of more
 # than one pair, so a pass a starved host stopped runs again at the next lull.
 # The window is read to decide every rung, so a restart or an abandoned pass resumes where the
 # window stands. Real reranks add their own shapes. The ONNX memory pool and memory patterns are
@@ -1501,8 +1507,8 @@ def _memory_wait_log_once(key: str, other: str, level: int, message: str, *args:
 
 def _memory_floor_blocks(condition: str, what: str, needed: Callable[[], float | None]) -> bool:
     """S253: whether `what` (the model load, the ladder's first rung) must wait because the free memory
-    (`_available_ram_headroom_bytes`, the S241 minimum, read fresh) is not both positive and at least
-    `needed()` bytes. An unreadable free memory does not block, the posture of S241 and S245 (the memory
+    (`_available_ram_headroom_bytes`, the S241 minimum, read fresh) is not both positive (S245's
+    zero-headroom stop holds even against a bound of zero) and at least `needed()` bytes. An unreadable free memory does not block, the posture of S241 and S245 (the memory
     term is skipped, never read as unlimited, and a host that cannot be read is not locked out). A bound
     that cannot be determined (`needed()` returns `None`) blocks: fail safe, nothing is loaded or run on
     a guess. Logs once per condition until the check next passes (`condition` and `condition-size` are
@@ -1512,6 +1518,16 @@ def _memory_floor_blocks(condition: str, what: str, needed: Callable[[], float |
     if headroom is None:
         _memory_wait_clear(condition)
         return False
+    if headroom <= 0.0:
+        _memory_wait_log_once(
+            condition,
+            condition + "-size",
+            logging.INFO,
+            "reranker: %s waits: no free memory (%.0f MB); retried at the next lull (S253)",
+            what,
+            headroom / 1e6,
+        )
+        return True
     bound = needed()
     if bound is None:
         _memory_wait_log_once(
@@ -1523,7 +1539,7 @@ def _memory_floor_blocks(condition: str, what: str, needed: Callable[[], float |
             headroom / 1e6,
         )
         return True
-    if headroom > 0.0 and headroom >= bound:
+    if headroom >= bound:
         _memory_wait_clear(condition)
         return False
     _memory_wait_log_once(

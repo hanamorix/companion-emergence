@@ -121,8 +121,9 @@ def test_no_rung_repeats_a_shape(store) -> None:
 
 def test_a_single_pair_rung_runs_only_when_the_shape_that_bounds_it_fits_the_headroom(store, monkeypatch) -> None:
     """S245 (was: headroom 1.0 ran all four single pairs and the pass completed). The first rung has no measured
-    shape to bound it, so a positive headroom lets it run; the next, shorter rung is bounded by the measured
-    full-length pair and a headroom of 1 byte does not hold it."""
+    shape to bound it, so it needs the model file's size (S253; this file's env reads 1 byte, so a headroom of
+    1 byte lets it run; the bound itself is tested in test_model_load_memory_floor.py); the next, shorter rung
+    is bounded by the measured full-length pair and a headroom of 1 byte does not hold it."""
     monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 1.0)
     provider = ScriptedLadderProvider(model=_MODEL)
     assert reranker_mod.measure_ram_figure(provider, store) is False
@@ -540,6 +541,8 @@ def test_run_ram_figure_builds_and_loads_nothing_when_the_headroom_is_known_and_
 def test_run_ram_figure_builds_the_provider_when_the_headroom_is_positive_or_unreadable(
     store, monkeypatch, headroom
 ) -> None:
+    """S245's rule on its own: the S253 model-file bound is off in this file (the suite default), so only a
+    zero headroom stops the build here; the file-size bound is tested in test_model_load_memory_floor.py."""
     provider = ScriptedLadderProvider(model=_MODEL)
     built = _build_spy(monkeypatch, provider)
     monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: headroom)
