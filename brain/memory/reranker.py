@@ -2017,7 +2017,7 @@ def _measured_rerank(
 
 def _warm_up_once(
     provider: RerankerProvider, query: str, documents: Sequence[str], *, bounded: bool = False
-) -> None:
+) -> bool:
     """Before the first measured recall rerank of this process for the
     provider's model id: `_WARMUP_RERANKS` single-document reranks on the
     current candidates' first documents, results and timings discarded
@@ -2027,23 +2027,29 @@ def _warm_up_once(
 
     S247: with `bounded` (the recall callers) each warm-up call is a rerank call site like any
     other: it runs only when its one-pair batch fits the RAM bound now
-    (`_batch_fits_ram_bound`). When one does not, NO warm-up runs, the model is NOT marked warmed
-    (the next call tries again) and the recall goes on under its own bounds; the pair-length probe
-    that follows loads the model on demand (`CrossEncoderProvider._pair_tokenizer`), so the lengths
-    stay available (the real provider starts the probe's clock after that load, so the load is not
-    timed into `T_p`; a test double that reports no seconds is timed by its caller). The ladder's own warm-up is not bounded here (`bounded` False): its
+    (`_batch_fits_ram_bound`). When one does not, NO warm-up runs and the model is NOT marked warmed
+    (the next call tries again). S259: the result says whether the caller may go on to probe the pair
+    lengths. It is True except when the gate refused while the model was NOT loaded at the start: the probe
+    would load the model on demand (`CrossEncoderProvider._pair_tokenizer`), which is what the gate refused, so
+    the caller takes the cosine path for this turn and the next turn checks again. A refusal with the model
+    already loaded goes on under the recall's own bounds, the lengths stay available (the real provider starts
+    the probe's clock after any load, so a load is not timed into `T_p`; a test double that reports no seconds
+    is timed by its caller). The ladder's own warm-up is not bounded here (`bounded` False): its
     headroom check comes first (`measure_ram_figure`)."""
     model_id = provider.model_id()
     with _cost_lock:
         if model_id in _warmed_model_ids:
-            return
+            return True
     chosen = [documents[i % len(documents)] for i in range(_WARMUP_RERANKS)]
-    if bounded and not all(_batch_fits_ram_bound(provider, model_id, query, [doc]) for doc in chosen):
-        return
+    if bounded:
+        was_loaded = _provider_model_loaded(provider)
+        if not all(_batch_fits_ram_bound(provider, model_id, query, [doc]) for doc in chosen):
+            return was_loaded
     for doc in chosen:
         list(provider.rerank(query, [doc]))
     with _cost_lock:
         _warmed_model_ids.add(model_id)
+    return True
 
 
 _CGROUP_V2_ROOT = "/sys/fs/cgroup"
@@ -2542,41 +2548,86 @@ def _kept_ram_fits(model_id: str) -> list[ram_fit.RamFit]:
         return [fit for (_store, mid), fit in _ram_fit_kept.items() if mid == model_id]
 
 
+def _provider_model_loaded(provider: RerankerProvider) -> bool:
+    """S259: whether `provider`'s model is already in memory; a provider that cannot say counts as NOT loaded
+    (fail safe: the load check then applies)."""
+    try:
+        return bool(provider.model_loaded())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _batch_fits_ram_bound(
     provider: RerankerProvider, model_id: str, query: str, documents: Sequence[str]
 ) -> bool:
-    """S247: whether ONE rerank call of `documents` (all scored together, padded to the longest
+    """S247, S259: whether ONE rerank call of `documents` (all scored together, padded to the longest
     (query, document) pair) may run now. True where no RAM bound applies on this machine
     (`_ram_bound_applies`: the per-call peak is unreadable there) and when the live headroom is
     unreadable (the width fit's posture: the memory term, the S242 cap included, is skipped).
     Otherwise it needs a memory model: with none held by this process the call cannot be sized and
     does not run, and with some it needs every one of them to allow it (`RamFit.within_measured`:
     not more pairs or a longer padded length than measured while the model holds single pairs only;
-    and the predicted growth within the headroom). The headroom is read before the pair lengths
-    (which, on the real provider, load the model on demand), so an unreadable headroom costs no
-    tokenizing."""
+    and the predicted growth times the S255 safety factor within the headroom). The headroom is read
+    before the pair lengths (which, on the real provider, load the model on demand), so an unreadable
+    headroom costs no tokenizing.
+
+    S259: while the provider's model is NOT loaded yet the load counts too. Before any tokenizing the free memory
+    must cover the S257 load bound (the file size plus the first rung's bound), else nothing is tokenized and so
+    nothing is loaded; once the lengths are known each fit must also have the file size plus the batch's
+    predicted growth (times the factor) within the free memory read BEFORE the load. A model that is loaded is out
+    of the free memory already and adds nothing. The size is looked up only on that path; a size that cannot be
+    determined refuses (fail safe). Logged once per condition."""
     if not _ram_bound_applies():
         return True
     fits = _kept_ram_fits(model_id)
     if not fits:
         log.info("reranker: a rerank batch waits: this process holds no memory model for %s (S247)", model_id)
         return False
+    loaded = _provider_model_loaded(provider)
     headroom = _available_ram_headroom_bytes()
     if headroom is None:
         return True
+    reserve = 0.0
+    if not loaded:
+        parts = _load_bound_parts(model_id)
+        if parts is None:
+            _memory_wait_log_once(
+                "batch-load-size",
+                "batch-load",
+                logging.WARNING,
+                "reranker: a rerank batch waits: the reranker model is not loaded and its file size could not be "
+                "determined (free memory %.0f MB) (S259)",
+                headroom / 1e6,
+            )
+            return False
+        size, first_rung = parts
+        if headroom < size + first_rung:
+            _memory_wait_log_once(
+                "batch-load",
+                "batch-load-size",
+                logging.INFO,
+                "reranker: a rerank batch waits: the reranker model is not loaded and free memory %.0f MB is below "
+                "the %.0f MB its load needs (S259)",
+                headroom / 1e6,
+                (size + first_rung) / 1e6,
+            )
+            return False
+        _memory_wait_clear("batch-load")
+        reserve = size
     lengths = provider.pair_token_lengths(query, documents)
     if not lengths:
         log.info("reranker: a rerank batch waits: its pair sizes are unavailable (S247)")
         return False
     pairs, longest = len(documents), max(lengths)
     for fit in fits:
-        if not fit.within_measured(pairs, longest) or fit.sized(pairs, longest) > headroom:
+        if not fit.within_measured(pairs, longest) or fit.sized(pairs, longest) + reserve > headroom:
             log.info(
                 "reranker: a rerank batch of %d pairs x %d tokens waits: it does not fit the memory model "
-                "and the headroom (%.0f MB) (S247)",
+                "and the headroom (%.0f MB%s) (S247)",
                 pairs,
                 longest,
                 headroom / 1e6,
+                ", the model load included (S259)" if reserve else "",
             )
             return False
     return True
@@ -2674,7 +2725,8 @@ class RecallRerank:
     must NOT gate any score (`normalization` is then `None`): `hand_off`
     says why the no-rerank path takes over — "pool" (fewer than the S5
     minimum of candidates exist), "budget" (fewer than the minimum fit the latency budget or the RAM
-    bound), "sizes" (the pairs' token lengths could not be read, so no width can be sized), or
+    bound), "sizes" (the pairs' token lengths could not be read, so no width can be sized; also, S259,
+    the model is not loaded and the free memory does not allow loading it now), or
     "normalization" (the anchor median could not be taken).
     `measured` — whether this call added a sample to the cost model."""
 
@@ -2717,10 +2769,13 @@ def recall_pair_sizes(
 ) -> PairSizes:
     """The pair token counts `rerank_for_recall` would compute for this
     query, computed now (see `PairSizes`). Warms up first (the real
-    provider's tokenizer exists only once its model is loaded). Raises
-    whatever the provider raises."""
+    provider's tokenizer exists only once its model is loaded). S259: when the
+    model is not loaded and the free memory does not allow loading it now, the
+    sizes are not probed (the probe would load it): `PairSizes(lengths=None)`, the
+    "sizes" hand-off, the no-rerank path. Raises whatever the provider raises."""
     pool = list(candidate_documents[:CANDIDATE_POOL])
-    _warm_up_once(provider, query, pool, bounded=True)
+    if not _warm_up_once(provider, query, pool, bounded=True):
+        return PairSizes(lengths=None)
     lengths, seconds = provider.pair_token_lengths_timed(query, [*pool, *ANCHOR_POOL])
     return PairSizes(lengths=None if lengths is None else list(lengths), seconds=seconds)
 
@@ -2779,8 +2834,10 @@ def rerank_for_recall(
         )
     # Warm up before the length probe, so the one-time ONNX session load is not timed into
     # the probe. Bounded (S247): when its one-pair batch does not fit the RAM bound it is skipped, and
-    # the probe loads the model on demand.
-    _warm_up_once(provider, query, pool, bounded=True)
+    # the probe loads the model on demand. S259: not when the model is not loaded and the free memory
+    # does not allow loading it now: nothing is probed, the "sizes" hand-off serves this query.
+    if not _warm_up_once(provider, query, pool, bounded=True):
+        return RecallRerank(width=0, reranked=False, hand_off="sizes", normalization=None, measured=False)
     if sizes is None:
         lengths = provider.pair_token_lengths(query, [*pool, *ANCHOR_POOL])
     else:
