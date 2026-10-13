@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from brain import dev_constants
 from brain.memory import cost_series, ram_fit
 from brain.memory import reranker as reranker_mod
 from brain.memory.relevance import CANDIDATE_POOL
@@ -1026,3 +1027,143 @@ def test_a_downloaded_process_has_no_ladder_due_even_with_an_empty_window(store)
     reranker_mod._note_model_downloaded(_MODEL)  # noqa: SLF001
     reranker_mod.note_ram_figure_needed(_MODEL)
     assert reranker_mod.ram_figure_due("lull-2", lambda: _open(store)) is False
+
+
+# ---- S255: every batch sized from the fit is sized by the prediction times the safety factor ----
+
+_FACTOR = dev_constants.RAM_FIT_SAFETY_FACTOR  # the shipped value, read at import (the suite default is 1.0)
+
+
+@pytest.fixture
+def shipped_factor(monkeypatch) -> float:
+    monkeypatch.setattr(dev_constants, "RAM_FIT_SAFETY_FACTOR", _FACTOR)
+    assert 1.0777 <= _FACTOR < 1.0778
+    return _FACTOR
+
+
+def test_the_width_scan_sizes_by_the_prediction_times_the_factor(shipped_factor) -> None:
+    fit = _fit_with(b=1000.0)
+    estimate = reranker_mod.RerankCostEstimate(
+        overhead_seconds=0.0, seconds_per_token=0.0, ram_fit=fit, measured_batches=5
+    )
+    candidates, anchors = [100] * 10, [50] * reranker_mod.P
+    need = fit.predict(7, 100)  # 5 real + 2 anchors, padded to 100
+    assert need == 7 * 100 * 1000.0
+    width = reranker_mod.fit_rerank_width
+    assert width(candidates, anchors, estimate, 10.0, need * shipped_factor) == 5
+    assert width(candidates, anchors, estimate, 10.0, need * shipped_factor - 1.0) == 4
+    assert width(candidates, anchors, estimate, 10.0, need) < 5, "the bare prediction no longer fits"
+
+
+def test_the_seed_batch_is_sized_by_the_prediction_times_the_factor(shipped_factor) -> None:
+    candidates, anchors = [100] * 10, [50] * reranker_mod.P
+    fit = _fit_with(b=1000.0)
+    pairs = reranker_mod.RERANK_MIN_REAL_CANDIDATES + reranker_mod.anchor_count(reranker_mod.RERANK_MIN_REAL_CANDIDATES)
+    need = fit.predict(pairs, 100) * shipped_factor
+    width = reranker_mod.fit_rerank_width
+    assert width(candidates, anchors, None, 4.0, need, seed_ram_fit=fit) == reranker_mod.RERANK_MIN_REAL_CANDIDATES
+    assert width(candidates, anchors, None, 4.0, need - 1.0, seed_ram_fit=fit) == 0
+    assert width(candidates, anchors, None, 4.0, fit.predict(pairs, 100), seed_ram_fit=fit) == 0
+
+
+def _first_batch_rung_prediction(store, monkeypatch) -> float:
+    """The prediction the ladder compares with the headroom before its first batch rung (spy; headroom ample)."""
+    seen: list[tuple[float | None, str]] = []
+    real = reranker_mod._ladder_headroom_stop  # noqa: SLF001
+
+    def spy(predicted, what):
+        seen.append((predicted, what))
+        return real(predicted, what)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(reranker_mod, "_ladder_headroom_stop", spy)
+        scoped.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: 1e12)
+        assert reranker_mod.measure_ram_figure(ScriptedLadderProvider(model=_MODEL), store) is True
+    rungs = [p for p, what in seen if what.startswith("a rung of")]
+    assert rungs and rungs[0] is not None
+    return rungs[0]
+
+
+def test_the_phase_two_rungs_are_sized_by_the_prediction_times_the_factor(tmp_path, monkeypatch) -> None:
+    def pass_at(name: str, factor: float, headroom: float | None) -> ScriptedLadderProvider | float:
+        monkeypatch.setattr(dev_constants, "RAM_FIT_SAFETY_FACTOR", factor)
+        fresh = MemoryStore(tmp_path / name, integrity_check=False)
+        try:
+            if headroom is None:
+                return _first_batch_rung_prediction(fresh, monkeypatch)
+            monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: headroom)
+            provider = ScriptedLadderProvider(model=_MODEL)
+            reranker_mod.measure_ram_figure(provider, fresh)
+            return provider
+        finally:
+            fresh.close()
+
+    bare = pass_at("bare.db", 1.0, None)
+    scaled = pass_at("scaled.db", _FACTOR, None)
+    assert 1.0777 <= _FACTOR < 1.0778 and bare > 0.0 and scaled == pytest.approx(bare * _FACTOR, rel=1e-9)
+    # the stop is decided on the scaled figure: between the two the first batch rung does not run, at the scaled figure it does
+    stopped = pass_at("stop.db", _FACTOR, (bare + scaled) / 2.0)
+    assert [pairs for pairs, _length in stopped.timed if pairs > 1] == []
+    ran = pass_at("ok.db", _FACTOR, scaled)
+    assert [pairs for pairs, _length in ran.timed if pairs > 1][:1] == [2]
+
+
+def test_the_stuck_width_re_measure_sizes_its_batch_by_the_prediction_times_the_factor(
+    store, monkeypatch, shipped_factor
+) -> None:
+    provider, fit = _full_window(store, monkeypatch)
+    pairs = 5 + reranker_mod.anchor_count(5)
+    need = fit.predict(pairs, 1000) * shipped_factor
+    assert need > 0.0
+    reranker_mod._budget_misses[_MODEL] = _stuck_miss()  # noqa: SLF001
+    reranker_mod._provider_cache[_MODEL] = provider  # noqa: SLF001
+    try:
+        before = len(provider.timed)
+        monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: need - 1.0)
+        assert reranker_mod.remeasure_stuck_width("marker-a", store) is False
+        assert len(provider.timed) == before, "does not fit once scaled"
+        monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: need)
+        assert reranker_mod.remeasure_stuck_width("marker-b", store) is True
+        assert len(provider.timed) == before + 1
+    finally:
+        reranker_mod._provider_cache.pop(_MODEL, None)  # noqa: SLF001
+
+
+def test_the_warm_up_batch_check_sizes_by_the_prediction_times_the_factor(store, monkeypatch, shipped_factor) -> None:
+    provider, fit = _full_window(store, monkeypatch)
+    docs = _docs(3, chars=3000)
+    tokens = provider.pair_token_lengths(_QUERY, [docs[0]])[0]
+    need = fit.predict(1, tokens) * shipped_factor
+    before = _unwarmed(provider)
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: need - 1.0)
+    reranker_mod._warm_up_once(provider, _QUERY, docs, bounded=True)  # noqa: SLF001
+    assert len(provider.plain) == before
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: need)
+    reranker_mod._warm_up_once(provider, _QUERY, docs, bounded=True)  # noqa: SLF001
+    assert len(provider.plain) == before + 2
+
+
+def test_the_floor_calibrations_bundled_batches_are_sized_by_the_prediction_times_the_factor(
+    store, monkeypatch, shipped_factor
+) -> None:
+    _built, fit = _full_window(store, monkeypatch)
+    provider = _ScoringProvider(model=_MODEL)
+    need = _bundle_need(provider, fit) * shipped_factor
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: need)
+    reranker_mod.normalize_bundled_pairs_against_anchors(provider, _BUNDLE)
+    assert len(provider.plain) == len(_BUNDLE)
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: need - 1.0)
+    with pytest.raises(reranker_mod.RerankDeferred):
+        reranker_mod.normalize_bundled_pairs_against_anchors(_ScoringProvider(model=_MODEL), _BUNDLE)
+
+
+@pytest.mark.parametrize(("delta", "rungs"), [(0.0, 4), (-1.0, 1)])
+def test_a_phase_one_rung_bounded_by_a_measured_shape_is_judged_on_the_unscaled_measurement(
+    store, monkeypatch, shipped_factor, delta, rungs
+) -> None:
+    """The factor scales PREDICTIONS. A rung a measured shape bounds is judged on that measurement as it is."""
+    monkeypatch.setattr(reranker_mod, "_full_rerank_budget", lambda: 0.0)
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: true_growth(1, FULL) + delta)
+    provider = ScriptedLadderProvider(model=_MODEL)
+    reranker_mod.measure_ram_figure(provider, store)
+    assert len(provider.timed) == rungs

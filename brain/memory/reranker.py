@@ -1179,7 +1179,8 @@ def _too_long_remembered(model_id: str, store: MemoryStore) -> bool:
 # The window is read to decide every rung, so a restart or an abandoned pass resumes where the
 # window stands. Real reranks add their own shapes. The ONNX memory pool and memory patterns are
 # off (S222), so a call's memory goes back after it and the sample is the call's PEAK growth
-# (`peak_rss`); `fit_rerank_width` sizes a batch so its predicted growth fits the live headroom.
+# (`peak_rss`); `fit_rerank_width` sizes a batch so its predicted growth, times the S255 safety factor
+# (`RamFit.sized`), fits the live headroom.
 # S203/S212/S220 retired the width-5 seeds, the high water, the kept per-token figure and the
 # S182 re-seed; a running process keeps its last usable fit instead (H4b).
 # ---------------------------------------------------------------------------
@@ -1574,17 +1575,26 @@ def model_load_blocked_by_memory() -> bool:
         return True
 
 
+def _first_rung_bytes(fit: ram_fit.RamFit | None, cap: int, model_id: str) -> float | None:
+    """S253, S255: the bound for the ladder's first rung, the full-length single pair (`cap` tokens):
+    the kept fit's one-pair prediction for it times the safety factor (`RamFit.sized`), else (no fit
+    exists) the model file's size (not scaled: it is a size, not a prediction). `None` when there is no
+    fit and the size cannot be determined."""
+    if fit is not None:
+        return fit.sized(1, cap)
+    return _runtime_model_file_bytes(model_id)
+
+
 def _first_rung_bound(store: MemoryStore, model_id: str, cap: int) -> Callable[[], float | None]:
     """S253: the bound for the ladder's first rung, the full-length single pair (`cap` tokens): this
-    process's kept fit's one-pair prediction for it, else (no fit exists) the model file's size."""
+    process's kept fit's one-pair prediction for it (S255: times the safety factor), else (no fit exists)
+    the model file's size."""
     key = (cost_series._store_key(store), model_id)  # noqa: SLF001
 
     def bound() -> float | None:
         with _cost_lock:
             fit = _ram_fit_kept.get(key)
-        if fit is not None:
-            return fit.predict(1, cap)
-        return _runtime_model_file_bytes(model_id)
+        return _first_rung_bytes(fit, cap, model_id)
 
     return bound
 
@@ -1606,7 +1616,8 @@ def measure_ram_figure(
     sizing (`_window_ram_fit`), so the first batches are never sized from single pairs alone.
     S245: the live headroom is checked before the warm-up and before EVERY rung, the first included
     (`_ladder_headroom_stop`): a known headroom of zero stops the pass, a rung is predicted from the
-    fit (phase 2) or bounded by the measured shape that dominates it (phase 1). S253: the first rung,
+    fit times the S255 safety factor (phase 2, `RamFit.sized`) or bounded by the measured shape that dominates
+    it (phase 1; a measurement, not a prediction, so unscaled). S253: the first rung,
     which nothing measured bounds, needs the free memory to be at least the kept fit's one-pair
     prediction for the full-length pair, or the model file's size when no fit exists
     (`_memory_floor_blocks`); below it nothing runs and the next lull retries. S249: nothing is run (False) in a
@@ -1682,7 +1693,7 @@ def measure_ram_figure(
         length = min(cap, int((budget - time_fit.overhead) / time_fit.rate) // pairs)
         if length < 1 or ram_fit.dominated(pairs, length, ram_fit.distinct_shapes(groups)):
             continue
-        if _ladder_headroom_stop(fit.predict(pairs, length), f"a rung of {pairs} pairs x {length} tokens"):
+        if _ladder_headroom_stop(fit.sized(pairs, length), f"a rung of {pairs} pairs x {length} tokens"):
             break
         if not _run_rung(provider, store, model_id, base_text, _Rung(pairs, length), cap, watch):
             completed = False
@@ -1889,7 +1900,7 @@ def remeasure_stuck_width(activity_marker: object, store: MemoryStore) -> bool:
     batch is never run unfitted, same gate as every rerank), the miss is no longer
     stuck (then dropped), a "too long" verdict is remembered, the memory model holds no
     batch of more than one pair and the batch is larger than any shape measured (S242,
-    `RamFit.within_measured`), or the memory model predicts the batch does not fit the current
+    `RamFit.within_measured`), or the memory model predicts (S255: times the safety factor) the batch does not fit the current
     headroom. Returns True iff the rerank ran. Provider
     exceptions propagate (the central pass logs them)."""
     model_id = resolve_reranker_model_id()
@@ -1917,7 +1928,7 @@ def remeasure_stuck_width(activity_marker: object, store: MemoryStore) -> bool:
             if not estimate.ram_fit.within_measured(pairs, longest):
                 log.info("rerank width re-measure: skipped, the batch is larger than any shape measured (S242)")
                 return False
-            if estimate.ram_fit.predict(pairs, longest) > headroom:
+            if estimate.ram_fit.sized(pairs, longest) > headroom:
                 log.info("rerank width re-measure: skipped, the batch does not fit the RAM headroom")
                 return False
     _, seconds = _measured_rerank(
@@ -2534,7 +2545,7 @@ def _batch_fits_ram_bound(
         return False
     pairs, longest = len(documents), max(lengths)
     for fit in fits:
-        if not fit.within_measured(pairs, longest) or fit.predict(pairs, longest) > headroom:
+        if not fit.within_measured(pairs, longest) or fit.sized(pairs, longest) > headroom:
             log.info(
                 "reranker: a rerank batch of %d pairs x %d tokens waits: it does not fit the memory model "
                 "and the headroom (%.0f MB) (S247)",
@@ -2582,9 +2593,9 @@ def fit_rerank_width(
     batch of n real + `anchor_count(n)` anchors fits the budget
     (`prefix_cost`, padded to its longest pair, anchors included in both
     factors) and, when a memory model and a headroom reading exist, the
-    peak growth it is predicted to need (`ram_fit.RamFit.predict` of its pair
-    count and longest pair, see the section header; the whole growth, no
-    margin) fits the headroom (S32, S65: no chunking), and, while the memory model holds no
+    peak growth it is predicted to need (`ram_fit.RamFit.sized` of its pair
+    count and longest pair, see the section header: the whole growth times the
+    measured safety factor of S255) fits the headroom (S32, S65: no chunking), and, while the memory model holds no
     measured batch of more than one pair, it has no more pairs and no longer a padded length
     than the largest shape measured (`RamFit.within_measured`, S242: such a batch would be
     extrapolated from single pairs; the cap is part of the RAM term, so a missing headroom
@@ -2607,7 +2618,7 @@ def fit_rerank_width(
             k = anchor_count(seed)
             pairs = seed + k
             longest = max([*candidate_pair_tokens[:seed], *anchor_pair_tokens[:k]])
-            if not seed_ram_fit.within_measured(pairs, longest) or seed_ram_fit.predict(pairs, longest) > headroom_bytes:
+            if not seed_ram_fit.within_measured(pairs, longest) or seed_ram_fit.sized(pairs, longest) > headroom_bytes:
                 return 0
         return seed
     memory = estimate.ram_fit
@@ -2621,7 +2632,7 @@ def fit_rerank_width(
         pairs = n + k
         if prefix_cost(estimate, pairs, longest) > budget_seconds:
             break
-        if ram_bound and (not memory.within_measured(pairs, longest) or memory.predict(pairs, longest) > headroom_bytes):
+        if ram_bound and (not memory.within_measured(pairs, longest) or memory.sized(pairs, longest) > headroom_bytes):
             break
         width = n
     return width

@@ -41,6 +41,9 @@ Derived rules (no tuned constants):
   applies to a window that fails those conditions. With the S245 marker rule a window the ladder
   completes always holds such a batch; the cap is the defence for a marked window that does not
   (one recorded by an earlier build, or by any other writer of the marker).
+* A batch is SIZED by `RamFit.sized`, the prediction times a fixed safety factor measured once
+  (`dev_constants.RAM_FIT_SAFETY_FACTOR`, S255): the fit under-predicts some unseen shapes by up to
+  about 7 percent, so a prediction is never compared with the free memory unscaled.
 * Arithmetic is exact (`fractions.Fraction`): the design columns reach 1e9 and the normal
   equations are badly conditioned in floating point.
 """
@@ -50,6 +53,8 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
+
+from brain import dev_constants
 
 # A sample's shape is packed into the integer `x` of a cost-series row:
 # pairs * SHAPE_RADIX + length, with the full-length marker in bit 19 of the length field.
@@ -170,6 +175,13 @@ class RamFit:
     def predict(self, pairs: int, length: int) -> float:
         _, padded, squared = _columns(pairs, length)
         return max(0.0, self.a + self.b * padded + self.c * squared)
+
+    def sized(self, pairs: int, length: int) -> float:
+        """S255: the growth to size a batch of `pairs` documents padded to `length` tokens by: the
+        prediction multiplied by the measured safety factor (`dev_constants.RAM_FIT_SAFETY_FACTOR`,
+        read now). Every place that decides whether a batch fits the free memory compares THIS, never
+        `predict` alone."""
+        return self.predict(pairs, length) * dev_constants.RAM_FIT_SAFETY_FACTOR
 
     def within_measured(self, pairs: int, length: int) -> bool:
         """S242: whether a prospective rerank of `pairs` documents padded to `length` tokens may

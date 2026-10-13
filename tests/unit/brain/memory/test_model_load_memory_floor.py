@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from brain import dev_constants
 from brain.memory import cost_series, floor_calibration, floor_startup, ram_fit
 from brain.memory import reranker as reranker_mod
 from brain.memory.store import MemoryStore
@@ -25,6 +26,7 @@ _MODEL = "scripted-ladder"
 _FLOOR_MODEL = "rr"
 _REAL_BLOCKED = reranker_mod.model_load_blocked_by_memory  # the suite default replaces it with `lambda: False`
 _REAL_FILE_BYTES = reranker_mod._runtime_model_file_bytes  # noqa: SLF001
+_FACTOR = dev_constants.RAM_FIT_SAFETY_FACTOR  # the shipped S255 value, read at import (the suite default is 1.0)
 
 
 @pytest.fixture(autouse=True)
@@ -471,6 +473,23 @@ def test_the_first_rung_needs_the_kept_fits_one_pair_prediction_not_the_file_siz
     _headroom(monkeypatch, headroom)
     provider = _run_pass(store, monkeypatch)
     assert (provider.timed[:1] == [(1, FULL)]) is ran
+
+
+@pytest.mark.parametrize(("delta", "ran"), [(-1.0, False), (0.0, True), (1.0, True)])
+def test_the_first_rung_needs_the_kept_fits_prediction_times_the_safety_factor(store, monkeypatch, delta, ran) -> None:
+    """S255: the one-pair prediction is scaled; the file size (no fit kept) is a size and is not."""
+    monkeypatch.setattr(dev_constants, "RAM_FIT_SAFETY_FACTOR", _FACTOR)
+    _kept_fit(store, 1000.0)
+    _file_size(monkeypatch, 1e12)
+    _headroom(monkeypatch, 1000.0 * _FACTOR + delta)
+    assert (_run_pass(store, monkeypatch).timed[:1] == [(1, FULL)]) is ran
+
+
+def test_the_first_rung_does_not_scale_the_file_size_when_no_fit_is_kept(store, monkeypatch) -> None:
+    monkeypatch.setattr(dev_constants, "RAM_FIT_SAFETY_FACTOR", _FACTOR)
+    _file_size(monkeypatch, 5000.0)
+    _headroom(monkeypatch, 5000.0)
+    assert _run_pass(store, monkeypatch).timed[:1] == [(1, FULL)]
 
 
 def test_the_first_rung_asks_for_the_runtime_model_id_and_only_when_no_fit_is_kept(store, monkeypatch) -> None:

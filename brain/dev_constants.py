@@ -158,3 +158,22 @@ RECALL_RESULT_GROUP_ORDER: tuple[str, ...] = ("reranked_genuine", "reranked_fami
 # then drops out; there is no daily reset. The owner's number (S146: "a rolling
 # average over the last 24 hours"). See `brain.memory.cost_series`.
 COST_SERIES_WINDOW_S: float = 24 * 60 * 60
+
+# --- RAM fit safety factor (name-recall fix S255) ----------------------------
+# Every batch sized from the memory fit (`brain.memory.ram_fit.RamFit`) is sized so that the fit's
+# PREDICTED growth multiplied by this factor fits the free memory (`RamFit.sized`). The largest
+# underestimate the fit made on shapes it was not fitted on is the measured figure; the factor is
+# 1 / (1 - that underestimate), so a prediction scaled by it covers the worst underestimate seen.
+# Measured ONCE, shipped as a fixed number (not a tunable, not re-measured at run time; a per-machine
+# factor is a follow-up, issue #379).
+# Provenance: measured 2026-10-13 on the dev VM (4 vCPU; ONNX Runtime 1.29.0; fp16 jina v2 reranker),
+# each measurement in a FRESH process, memory pool and patterns off, default cache. 78 runs = 6 replicates
+# x 13 shapes (7 shapes the fit was fitted on, 6 held out; no batch above 7 pairs). Pre-registered rule:
+# settled at the first n >= 6 where the running largest underestimate moves by less than 2.0 percentage
+# points over the last 3 replicates; it settled at n = 6 (7.21 - 5.71 = 1.50 points). Largest underestimate:
+# 7.21% (a prediction of 373 MB against 402 MB measured) at the shape of 7 pairs x 300 tokens, replicate 5;
+# 0.0721 is that figure rounded up (7.208%). Record: name-recall-fix-records/R16/S255-REPORT.md in the
+# owner's plans directory. Not covered: the production ladder learns its fit inside one long-lived process,
+# where readings spread more (open fork F37), and batches above 7 pairs were not held out.
+RAM_FIT_LARGEST_UNDERESTIMATE: float = 0.0721
+RAM_FIT_SAFETY_FACTOR: float = 1.0 / (1.0 - RAM_FIT_LARGEST_UNDERESTIMATE)  # 1.0777

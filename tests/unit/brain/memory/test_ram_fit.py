@@ -9,6 +9,7 @@ import random
 
 import pytest
 
+from brain import dev_constants, tunables
 from brain.memory import ram_fit
 from brain.memory.ram_fit import ShapeGroup
 
@@ -312,3 +313,36 @@ def test_the_docstrings_state_the_conditions_of_the_lift_and_the_marker_rule() -
     assert "lifts only once a batch of more than one pair is measured AND the fit is usable" in module_doc
     assert "records no marker" in module_doc and "MORE THAN ONE PAIR" in module_doc
     assert "headroom still records its completion marker" not in module_doc
+
+
+# ---- S255: the safety factor ----
+
+_SHIPPED_FACTOR = dev_constants.RAM_FIT_SAFETY_FACTOR  # read at import: the suite's default is 1.0
+
+
+def test_the_shipped_factor_is_one_over_one_minus_the_largest_measured_underestimate() -> None:
+    assert dev_constants.RAM_FIT_LARGEST_UNDERESTIMATE == 0.0721
+    assert _SHIPPED_FACTOR == 1.0 / (1.0 - 0.0721)
+    assert 1.0777 <= _SHIPPED_FACTOR < 1.0778
+    # a prediction scaled by it covers the largest underestimate: measured = predicted / (1 - U) <= predicted * factor
+    assert 100.0 * (1.0 - 0.0721) * _SHIPPED_FACTOR == pytest.approx(100.0)
+
+
+def test_the_factor_is_a_dev_constant_with_its_measurement_provenance_not_a_tunable() -> None:
+    import inspect
+
+    source = inspect.getsource(dev_constants)
+    block = source[source.index("RAM fit safety factor") : source.index("RAM_FIT_SAFETY_FACTOR: float")]
+    for word in ("2026-10-13", "FRESH process", "78 runs", "6 replicates", "7.21%", "7 pairs x 300 tokens", "S255-REPORT.md", "F37"):
+        assert word in block, word
+    assert not [name for name in tunables._registry if "ram_fit" in name or "safety_factor" in name]  # noqa: SLF001
+
+
+def test_sized_is_the_prediction_times_the_current_factor(monkeypatch) -> None:
+    fit = ram_fit.RamFit(a=10.0, b=3.0, c=0.0, shapes=5, samples=5, max_pairs=8, max_length=64)
+    assert fit.sized(4, 16) == fit.predict(4, 16) == 10.0 + 3.0 * 64  # the suite default factor is 1.0
+    monkeypatch.setattr(dev_constants, "RAM_FIT_SAFETY_FACTOR", _SHIPPED_FACTOR)
+    assert fit.sized(4, 16) == fit.predict(4, 16) * _SHIPPED_FACTOR
+    monkeypatch.setattr(dev_constants, "RAM_FIT_SAFETY_FACTOR", 2.0)
+    assert fit.sized(4, 16) == 2.0 * fit.predict(4, 16), "read at call time"
+    assert ram_fit.RamFit(a=-5.0, b=0.0, c=0.0, shapes=5, samples=5, max_pairs=1, max_length=1).sized(1, 1) == 0.0
