@@ -246,6 +246,16 @@ def test_a_blocked_condition_logs_once_until_it_passes_and_conditions_log_separa
         assert len(_s253_records(caplog)) == 4, "re-armed once the check passed"
 
 
+def test_a_condition_that_passed_logs_again_when_it_recurs(monkeypatch, caplog) -> None:
+    level = {"free": 10.0}
+    _headroom(monkeypatch, lambda: level["free"])
+    with caplog.at_level(logging.INFO, logger=reranker_mod.log.name):
+        for free, blocked in ((10.0, True), (10.0, True), (1000.0, False), (10.0, True), (10.0, True)):
+            level["free"] = free
+            assert reranker_mod._memory_floor_blocks("rung", "the first rung", lambda: 100.0) is blocked  # noqa: SLF001
+        assert len(_s253_records(caplog)) == 2
+
+
 def test_alternating_kinds_of_one_condition_each_log_when_they_come_back(monkeypatch, caplog) -> None:
     _headroom(monkeypatch, 10.0)
     with caplog.at_level(logging.INFO, logger=reranker_mod.log.name):
