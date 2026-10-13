@@ -212,9 +212,10 @@ def test_c37c_count_mismatch_rebuilds_and_logs_then_next_start_is_healthy(tmp_ho
     assert lines[0]["result"] == "count_mismatch"
 
     conn2 = sqlite3.connect(str(db))
-    assert conn2.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == conn2.execute(
-        "SELECT COUNT(*) FROM memories_fts_docsize"
-    ).fetchone()[0]
+    assert (
+        conn2.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+        == conn2.execute("SELECT COUNT(*) FROM memories_fts_docsize").fetchone()[0]
+    )
     conn2.close()
 
     # Next process start: fresh once-per-process state.
@@ -234,23 +235,23 @@ def test_c37d_damaged_fts_shadow_table_rebuilds_and_logs(tmp_home):
     persona = tmp_home.name
     db = _seeded_db(tmp_home, n=10)
 
-    # Corrupt the FTS5 shadow *content* (not its table structure) so the
-    # integrity-check genuinely raises a non-"malformed" DatabaseError AND
-    # `rebuild` (which just re-scans `memories`, not the old shadow rows) can
-    # actually repair it — a real, reproduced FTS5 corruption, not a mock.
+    # Corrupt the FTS5 shadow *content* — the index leaf rows, not the
+    # structure record (rowid 10) or averages (rowid 1) — so the
+    # integrity-check genuinely raises SQLITE_CORRUPT_VTAB AND `rebuild`
+    # (which just re-scans `memories`, not the old shadow rows) can actually
+    # repair it on every SQLite version — a real, reproduced FTS5
+    # corruption, not a mock. (The error *text* varies by version, so it
+    # isn't asserted; #318.)
     conn = sqlite3.connect(str(db))
-    conn.execute("DELETE FROM memories_fts_data WHERE rowid IN "
-                 "(SELECT rowid FROM memories_fts_data LIMIT 2)")
+    conn.execute("DELETE FROM memories_fts_data WHERE rowid > 10")
     conn.commit()
     conn.close()
 
     db_health.run_fts_health_check_once(db)
 
     lines = _health_log_lines(tmp_home, persona)
-    assert len(lines) == 1
-    assert lines[0]["result"] == "damaged"
+    assert [line["result"] for line in lines] == ["damaged"], lines
     assert lines[0]["error"]
-    assert "malformed" not in lines[0]["error"].lower()
 
     # Rebuild actually restored the index — re-open and confirm FTS is usable
     # again (mirrors test_fts_sync.py's C2 no-memory-lost assertion).
@@ -262,6 +263,27 @@ def test_c37d_damaged_fts_shadow_table_rebuilds_and_logs(tmp_home):
         assert rows == 10
     finally:
         store.close()
+
+
+def test_c37d_missing_fts_structure_record_is_damaged_never_could_not_check(tmp_home):
+    """#318: with the FTS5 structure record gone, SQLite 3.42 can't even
+    construct the table ("vtable constructor failed: memories_fts") — the
+    old text-only classifier logged that as `could_not_check` and never
+    tried a rebuild. It is damage. Newer SQLite can rebuild from it; 3.42's
+    FTS5 can't (every FTS command, `DROP TABLE` included, fails to construct
+    the table), so a `rebuild_failed` line is the honest outcome there."""
+    persona = tmp_home.name
+    db = _seeded_db(tmp_home, n=10)
+    conn = sqlite3.connect(str(db))
+    conn.execute("DELETE FROM memories_fts_data WHERE rowid IN (1, 10)")
+    conn.commit()
+    conn.close()
+
+    db_health.run_fts_health_check_once(db)
+
+    results = [line["result"] for line in _health_log_lines(tmp_home, persona)]
+    assert "damaged" in results, results
+    assert "could_not_check" not in results
 
 
 def test_c37d_malformed_disk_image_logs_and_reports_rebuild_failure(tmp_home):
@@ -303,8 +325,9 @@ class _FakeConnRaisingOnIntegrityCheck:
     records every `execute` call so a test can assert a rebuild was never
     attempted."""
 
-    def __init__(self, message: str) -> None:
+    def __init__(self, message: str, errorcode: int | None = None) -> None:
         self._message = message
+        self._errorcode = errorcode
         self.executed: list[str] = []
         self.in_transaction = False
         self.closed = False
@@ -314,7 +337,11 @@ class _FakeConnRaisingOnIntegrityCheck:
         if "busy_timeout" in sql:
             return None
         if "integrity-check" in sql:
-            raise sqlite3.OperationalError(self._message)
+            exc = sqlite3.OperationalError(self._message)
+            if self._errorcode is not None:
+                # What the sqlite3 module sets on a real error (Python 3.11+).
+                exc.sqlite_errorcode = self._errorcode
+            raise exc
         raise AssertionError(f"unexpected execute after the integrity-check failure: {sql!r}")
 
     def commit(self):
@@ -343,9 +370,36 @@ def test_non_corruption_database_error_is_could_not_check_not_damaged():
     assert fake.executed == ["INSERT INTO memories_fts(memories_fts) VALUES('integrity-check')"]
 
 
-def test_non_corruption_database_error_end_to_end_logs_but_does_not_rebuild(
-    tmp_home, monkeypatch
-):
+def test_fts_vtable_corruption_is_damaged_whatever_the_message_says():
+    """#318: SQLite words the same FTS5 shadow-table damage differently by
+    version — "vtable constructor failed: memories_fts" on 3.42, "database
+    disk image is malformed" on 3.47 — but the error code is
+    SQLITE_CORRUPT_VTAB on every version. On 3.42 the old text-only
+    classifier saw neither "corrupt" nor "malformed" and logged
+    `could_not_check`, so real FTS damage was never rebuilt."""
+    fake = _FakeConnRaisingOnIntegrityCheck(
+        "vtable constructor failed: memories_fts",
+        errorcode=sqlite3.SQLITE_CORRUPT_VTAB,
+    )
+    result, _ = db_health._classify_and_run(fake)
+    assert result == "damaged"
+
+
+def test_corrupt_error_code_is_malformed_whatever_the_message_says():
+    """A plain SQLITE_CORRUPT (the whole-file case: a truncated database) is
+    corruption even if a future SQLite words it without "malformed"."""
+    fake = _FakeConnRaisingOnIntegrityCheck("some future wording", errorcode=sqlite3.SQLITE_CORRUPT)
+    result, _ = db_health._classify_and_run(fake)
+    assert result == "malformed"
+
+
+def test_non_corruption_error_code_stays_could_not_check():
+    fake = _FakeConnRaisingOnIntegrityCheck("database is locked", errorcode=sqlite3.SQLITE_BUSY)
+    result, _ = db_health._classify_and_run(fake)
+    assert result == "could_not_check"
+
+
+def test_non_corruption_database_error_end_to_end_logs_but_does_not_rebuild(tmp_home, monkeypatch):
     """Same property through the full `run_fts_health_check_once` pipeline:
     logs `could_not_check` (not `damaged`), and the outer rebuild step in
     `run_fts_health_check_once` is never reached (only one `execute` call:

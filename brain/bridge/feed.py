@@ -61,6 +61,12 @@ TYPE_OPENER: dict[FeedEntryType, str] = {
     "kindled_link": prompt_strings.register("bridge.feed.type_opener.kindled_link"),
 }
 
+# A declined / abandoned / unverified write isn't "I wrote to a file —": the feed renders
+# "<opener> <body>", and "I wrote to a file — ...it didn't land" contradicts itself (#345).
+FILE_WRITE_UNWRITTEN_OPENER = prompt_strings.register(
+    "bridge.feed.type_opener.file_write_unwritten"
+)
+
 
 @dataclass(frozen=True)
 class FeedEntry:
@@ -145,7 +151,11 @@ def build_file_write_entries(persona_dir: Path, *, limit: int) -> list[FeedEntry
         FeedEntry(
             type="file_write",
             ts=mem.created_at.isoformat(),
-            opener=TYPE_OPENER["file_write"],
+            opener=(
+                TYPE_OPENER["file_write"]
+                if "committed" in (mem.tags or [])
+                else FILE_WRITE_UNWRITTEN_OPENER
+            ),
             body=mem.content,
             audit_id=None,
         )

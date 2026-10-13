@@ -76,6 +76,25 @@ def _classify_error_message(msg: str) -> str:
     return "could_not_check"
 
 
+def _classify_error(exc: sqlite3.DatabaseError) -> str:
+    """Classify by SQLite's error code first, then by message text (#318).
+
+    The wording drifts across SQLite versions — the same FTS5 shadow-table
+    damage reads "vtable constructor failed: memories_fts" on 3.42 and
+    "database disk image is malformed" on 3.47 — but the code doesn't:
+    SQLITE_CORRUPT_VTAB is the FTS index itself reporting damage (a rebuild
+    from `memories` can repair it), and any other SQLITE_CORRUPT is the
+    malformed case. `sqlite_errorcode` is absent on an exception built by
+    hand rather than raised by SQLite; the message is the fallback there.
+    """
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code == sqlite3.SQLITE_CORRUPT_VTAB:
+        return "damaged"
+    if code is not None and code & 0xFF == sqlite3.SQLITE_CORRUPT:
+        return "malformed"
+    return _classify_error_message(str(exc))
+
+
 def _log_health_event(persona: str, result: str, error: str | None) -> None:
     """Append one JSON line to the persona's db-health log (S62). Append-only,
     never rotated by this change; a failure to write is logged, not raised —
@@ -129,7 +148,7 @@ def _create_and_backfill_fts(conn: sqlite3.Connection) -> tuple[str, str | None]
     except sqlite3.DatabaseError as exc:
         _end_txn(conn)
         msg = str(exc)
-        return _classify_error_message(msg), msg
+        return _classify_error(exc), msg
     _end_txn(conn)
     return "fts_missing_backfilled", None
 
@@ -173,7 +192,7 @@ def _classify_and_run(conn: sqlite3.Connection) -> tuple[str, str | None]:
             # `could_not_check` — never corruption (S60; see
             # `_classify_error_message`'s docstring for why the catch-all
             # case is could_not_check, not "damaged").
-            result, error = _classify_error_message(msg), msg
+            result, error = _classify_error(exc), msg
         _end_txn(conn)
         return result, error
 
@@ -186,7 +205,7 @@ def _classify_and_run(conn: sqlite3.Connection) -> tuple[str, str | None]:
     except sqlite3.DatabaseError as exc:
         _end_txn(conn)
         msg = str(exc)
-        return _classify_error_message(msg), msg
+        return _classify_error(exc), msg
 
     _end_txn(conn)
     if mem_rows != fts_rows:

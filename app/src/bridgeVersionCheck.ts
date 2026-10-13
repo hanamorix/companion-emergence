@@ -7,7 +7,8 @@
  * module-level flag guards the second attempt.
  *
  * Returns:
- *   "ok"                         — versions match, nothing to do
+ *   "ok"                         — versions match, or the bridge runs a newer
+ *                                  brain-main overlay (#286)
  *   "restarted"                  — mismatch detected, replace succeeded
  *   "version_mismatch_unresolved"— mismatch persists after replace (or flag
  *                                  already set from a prior call this session)
@@ -17,7 +18,12 @@
  */
 
 import { getVersion } from "@tauri-apps/api/app";
-import { fetchHealth, invokeForceRestart } from "./bridge";
+import {
+  fetchHealth,
+  invokeForceRestart,
+  type BridgeHealth,
+  type BridgeOverlay,
+} from "./bridge";
 
 export type BridgeVersionResult =
   | "ok"
@@ -47,6 +53,23 @@ export function _parseSemver(
   return [Number(m[1]), Number(m[2]), Number(m[3])];
 }
 
+/**
+ * Is this bridge current for the app? Equal versions always are. A bridge
+ * running a brain-main overlay (#286) may be NEWER than the app — that is the
+ * point of the overlay, not a stale bridge.
+ */
+function _isCurrent(
+  bridgeV: [number, number, number],
+  appV: [number, number, number],
+  overlay: BridgeOverlay | null | undefined,
+): boolean {
+  // an overlay built for another bundle means the app changed under this bridge
+  if (overlay && overlay.bundle_match === false) return false;
+  const cmp =
+    bridgeV[0] - appV[0] || bridgeV[1] - appV[1] || bridgeV[2] - appV[2];
+  return cmp === 0 || (cmp > 0 && overlay != null);
+}
+
 export async function ensureBridgeCurrent(
   persona: string,
 ): Promise<BridgeVersionResult> {
@@ -67,7 +90,7 @@ export async function ensureBridgeCurrent(
   }
 
   // 2. Probe the bridge — if it errors, skip (boot must not break on this).
-  let health: { liveness: string; version?: string };
+  let health: BridgeHealth;
   try {
     health = await fetchHealth(persona);
   } catch {
@@ -87,12 +110,8 @@ export async function ensureBridgeCurrent(
       // Present-but-garbage: skip rather than destroy an unknown bridge.
       return "skipped";
     }
-    // Both parsed — compare triples.
-    if (
-      appV[0] === healthV[0] &&
-      appV[1] === healthV[1] &&
-      appV[2] === healthV[2]
-    ) {
+    // Both parsed — compare triples (equal, or bridge is a newer overlay).
+    if (_isCurrent(healthV, appV, health.overlay)) {
       return "ok";
     }
     // Explicit version mismatch → fall through to replace.
@@ -123,12 +142,7 @@ export async function ensureBridgeCurrent(
     const recheckHealth = await fetchHealth(persona);
     if (recheckHealth.version) {
       const recheckV = _parseSemver(recheckHealth.version);
-      if (
-        recheckV !== null &&
-        appV[0] === recheckV[0] &&
-        appV[1] === recheckV[1] &&
-        appV[2] === recheckV[2]
-      ) {
+      if (recheckV !== null && _isCurrent(recheckV, appV, recheckHealth.overlay)) {
         return "restarted";
       }
     }

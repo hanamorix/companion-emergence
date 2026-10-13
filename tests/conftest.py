@@ -57,6 +57,28 @@ def _reset_cli_throttle() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _pin_cli_tools_flag() -> Iterator[None]:
+    """Pin "this claude CLI supports --tools" to True for every test (#329).
+
+    Otherwise the first argv build in a test would spawn a real `claude --help`
+    probe, or consume a test's own `subprocess.run` mock. Assigned directly,
+    not via monkeypatch, so a test's `monkeypatch.undo()` can't put it back to
+    the unknown state mid-test. Probe tests reset it themselves.
+    """
+    from brain.bridge import provider
+
+    def _pin() -> None:
+        provider._TOOLS_FLAG_SUPPORTED = True
+        provider._tools_probe_retry_at = 0.0
+        provider._tools_warned = False
+        provider._tools_window_warned_at = None
+
+    _pin()
+    yield
+    _pin()
+
+
+@pytest.fixture(autouse=True)
 def _inhibit_bridge_background_threads(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep build_app's lifespan from starting the supervisor + migration threads.
 

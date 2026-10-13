@@ -79,6 +79,7 @@ from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.persona_config import PersonaConfig
 from brain.tools.dispatch import dispatch
+from brain.update.overlay import loaded_overlay
 
 logger = logging.getLogger(__name__)
 
@@ -981,6 +982,14 @@ def build_app(
         _work_dir = _claude_work_dir()
         if _work_dir is not None:
             logger.info("claude working directory: %s", _work_dir)
+        # #302: running from a brain overlay → mark its folder in use so a later
+        # `nell update` prune leaves it alone while this process lives. Fail-soft.
+        try:
+            from brain.update.overlay import mark_in_use
+
+            mark_in_use()
+        except Exception:
+            logger.warning("could not mark the brain overlay in use", exc_info=True)
 
         # Rewrite the ops-tunables defaults section (spec 2026-07-04). Fail-soft:
         # write_defaults_section swallows its own errors; belt-and-braces here so
@@ -1404,6 +1413,14 @@ def build_app(
         else:
             sup_status = "dead"
 
+        # #286: which brain-main overlay THIS process runs (None = the release
+        # brain). The app's version handshake accepts a newer overlay brain.
+        try:
+            running = loaded_overlay()
+        except Exception:  # the restart health-poll path: must never 500
+            logger.warning("overlay probe failed", exc_info=True)
+            running = None
+
         return {
             "liveness": "ok",
             "version": _brain_version,
@@ -1420,6 +1437,12 @@ def build_app(
             # #246: the brain's CLI login state — "expired" means background LLM
             # calls are backed off and the app should offer re-authorisation.
             "provider_auth": provider_auth.state(),
+            "overlay": None if running is None else {
+                "commit": running["commit"], "brain_version": running["brain_version"],
+                "bundle_match": running["bundle_match"]},
+            # #335: the user's escape hatch is on, so any overlay is ignored on purpose;
+            # the app must not restart this bridge to "finish" an update every launch.
+            "overlay_disabled": bool(os.environ.get("KINDLED_NO_OVERLAY")),
         }
 
     @app.post(

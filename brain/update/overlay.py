@@ -13,14 +13,21 @@ import contextlib
 import json
 import os
 import shutil
+import sysconfig
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
 from brain.bridge.state_file import pid_is_alive
 from brain.paths import get_home
+from brain.update.overlay_hook import BUNDLE_ID_FILE
 
 STATE_FILE = "current.json"
 LOCK_FILE = ".lock"
+# <overlay folder>/.in-use/<pid>: a process running `brain` from that folder (#302).
+IN_USE_DIR = ".in-use"
+_RETRY_ATTEMPTS = 6
+_RETRY_DELAY_S = 0.05  # doubling: ~1.5 s in all before the error is let through
 
 
 class OverlayBusy(RuntimeError):  # noqa: N818
@@ -41,11 +48,97 @@ def read_state(root: Path) -> dict:
     return {"active": data.get("active") or None, "previous": data.get("previous") or None}
 
 
+def current_bundle_id() -> str | None:
+    """The running bundle's id (`_ce_bundle_id` in its site-packages); None in a dev
+    venv or when unreadable."""
+    try:
+        text = (Path(sysconfig.get_paths()["purelib"]) / BUNDLE_ID_FILE).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return text.strip() or None
+
+
+def _loaded_folder(root: Path) -> str | None:
+    """The overlay folder under `root` this interpreter imported `brain` from; None
+    for the release brain or a checkout. /health.overlay and the prune markers both
+    resolve it here, so they can't disagree on which folder is running (#315)."""
+    import brain
+
+    try:
+        rel = Path(brain.__file__).resolve().relative_to(root)
+    except ValueError:
+        return None
+    # An overlay import is <folder>/brain/__init__.py; fewer parts is no folder.
+    return rel.parts[0] if len(rel.parts) >= 2 else None
+
+
+def loaded_overlay() -> dict | None:
+    """The overlay THIS interpreter loaded `brain` from — read from that folder's
+    stamp, not current.json, because an install swapped in after start is not what
+    is running. None when `brain` comes from the bundle (or a checkout)."""
+    root = overlay_root().resolve()
+    folder = _loaded_folder(root)
+    if folder is None:
+        return None
+    try:
+        stamp = json.loads((root / folder / "stamp.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        stamp = None
+    if not isinstance(stamp, dict):
+        stamp = {}
+    stamp_bundle = stamp.get("bundle_id")
+    return {
+        "dir": folder,
+        "commit": stamp.get("commit"),
+        "brain_version": stamp.get("brain_version"),
+        # False = this overlay was built for another bundle (e.g. the app was
+        # reinstalled under it); the app then treats the bridge as stale.
+        "bundle_match": isinstance(stamp_bundle, str) and bool(stamp_bundle)
+        and stamp_bundle == current_bundle_id(),
+    }
+
+
 def _write_state(root: Path, active: dict | None, previous: dict | None) -> None:
     root.mkdir(parents=True, exist_ok=True)
     tmp = root / f"{STATE_FILE}.tmp"
     tmp.write_text(json.dumps({"active": active, "previous": previous}, indent=2), encoding="utf-8")
-    os.replace(tmp, root / STATE_FILE)
+    replace_retrying(tmp, root / STATE_FILE)
+
+
+def replace_retrying(src: Path, dst: Path) -> None:
+    """os.replace, riding out a transient PermissionError — on Windows, AV scanning
+    freshly written files or another interpreter's hook reading current.json at
+    start-up (#302). Anything else, or a lock that outlasts the retries, raises."""
+    for attempt in range(_RETRY_ATTEMPTS):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == _RETRY_ATTEMPTS - 1:
+                raise
+            time.sleep(_RETRY_DELAY_S * 2**attempt)
+
+
+def mark_in_use(root: Path | None = None) -> None:
+    """Record that THIS process runs `brain` from an overlay folder, so prune leaves
+    the folder alone while the process lives (#302). No-op on the release brain.
+    Called once at bridge start; prune ignores a dead process's marker."""
+    root = (root or overlay_root()).resolve()
+    folder = _loaded_folder(root)
+    if folder is None:
+        return
+    marks = root / folder / IN_USE_DIR
+    marks.mkdir(exist_ok=True)
+    (marks / str(os.getpid())).write_text("", encoding="utf-8")
+
+
+def in_use(folder: Path) -> bool:
+    """A live process runs `brain` from this folder (it wrote an .in-use marker)."""
+    # ponytail: a reused pid keeps a folder one prune longer — the safe direction.
+    try:
+        return any(m.name.isdigit() and pid_is_alive(int(m.name)) for m in (folder / IN_USE_DIR).iterdir())
+    except OSError:
+        return False
 
 
 def activate(root: Path, entry: dict) -> None:
@@ -71,13 +164,23 @@ def rollback(root: Path) -> None:
     _write_state(root, state["previous"], None)
 
 
+def confirm(root: Path, commit: str) -> None:
+    """Mark the active overlay as proven (#335): the app saw a healthy bridge running it.
+    A no-op unless `commit` is still the active one, since another update may have
+    landed underneath. Callers hold overlay_lock."""
+    state = read_state(root)
+    active = state["active"]
+    if active and active.get("commit") == commit and active.get("confirmed") is False:
+        _write_state(root, {**active, "confirmed": True}, state["previous"])
+
+
 def prune(root: Path) -> None:
     state = read_state(root)
     keep = {e["dir"] for e in (state["active"], state["previous"]) if e and e.get("dir")}
     if not root.is_dir():
         return
     for child in root.iterdir():
-        if child.is_dir() and child.name not in keep:
+        if child.is_dir() and child.name not in keep and not in_use(child):
             shutil.rmtree(child, ignore_errors=True)
 
 

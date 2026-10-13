@@ -299,3 +299,61 @@ export async function submitBrainLoginCode(
 export async function cancelBrainLogin(): Promise<void> {
   await invoke("cancel_brain_login");
 }
+
+// ── Brain updates from main (#286 slice 4) ─────────────────────────────
+
+/** Rust `BrainUpdateCheck`; `reason` is one of: available, already_active,
+ *  older_than_app, app_too_old, unsupported_manifest, unparseable_version,
+ *  dev_build, unsupported_install, unreachable, bad_signature. */
+export interface BrainUpdateCheck {
+  available: boolean;
+  commit: string | null;
+  brain_version: string | null;
+  reason: string;
+  detail: string | null;
+}
+
+export interface BrainUpdateApplied {
+  commit: string;
+  brain_version: string;
+  /** An overlay was active before the install: undo = roll back to it;
+   *  otherwise undo = the release brain. */
+  had_active: boolean;
+}
+
+export async function checkBrainUpdate(): Promise<BrainUpdateCheck> {
+  return await invoke<BrainUpdateCheck>("check_brain_update");
+}
+
+/** Download, verify and install into the overlay. The caller restarts the bridge. */
+export async function applyBrainUpdate(): Promise<BrainUpdateApplied> {
+  return await invoke<BrainUpdateApplied>("apply_brain_update");
+}
+
+/** The updated bridge was unhealthy: previous overlay (or the release brain).
+ *  Resolves the commit it landed on; null = the release brain (#335). */
+export async function rollbackBrain(reason: string): Promise<string | null> {
+  return await invoke<string | null>("rollback_brain", { reason });
+}
+
+/** "Use the release brain": clear the active overlay. The caller restarts the bridge. */
+export async function revertBrain(): Promise<void> {
+  await invoke<void>("revert_brain");
+}
+
+/** The launch check (#335): the active overlay, whether it has proven itself, how to undo it. */
+export interface BrainOverlayStatus {
+  active_commit: string | null;
+  confirmed: boolean;
+  undo: "rollback" | "revert";
+}
+
+/** `patient`: after a failed start, wait the full 30 s instead of the 5 s launch cap. */
+export async function brainOverlayStatus(patient = false): Promise<BrainOverlayStatus> {
+  return await invoke<BrainOverlayStatus>("brain_overlay_status", { patient });
+}
+
+/** The bridge came back healthy on `commit`: mark the overlay proven. */
+export async function confirmBrainUpdate(commit: string): Promise<void> {
+  await invoke<void>("confirm_brain_update", { commit });
+}

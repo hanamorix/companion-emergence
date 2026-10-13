@@ -308,21 +308,24 @@ _STREAM_EOF = object()
 # Lean CLI invocation — strip built-in tool definitions (~14K tok/call saved)
 # ---------------------------------------------------------------------------
 
-# Claude Code's built-in tools are loaded into every -p invocation. Disallowing
-# the ones she has no business calling removes their definition tokens from
-# cache-creation cost AND keeps them out of her hands.
+# Claude Code loads its built-in tools into every -p invocation, and
+# --dangerously-skip-permissions rides every call, so whatever is loaded is
+# callable. --allowedTools is a permission list, not an exclusive one.
 #
-# This list is POLICY, not dead weight. --allowedTools is a permission list, not
-# an exclusive one (the CLI's exclusive flag, --tools, is unused here), and
-# --dangerously-skip-permissions rides every call — so anything left off this
-# list is genuinely callable. 87bfc692's original comment claimed the opposite
-# ("she can't call them anyway"); it was wrong, and WebFetch/WebSearch were
-# swept out on that false premise, silently removing chat-time web access (#71).
+# Two layers (#329):
+#   1. --tools=<list> — the CLI's EXCLUSIVE built-in allowlist. Chat gets
+#      WebSearch,WebFetch (#71: web access is a real capability); background
+#      generate() gets none. Only applied when the CLI supports it
+#      (_cli_supports_tools_flag).
+#   2. --disallowedTools (this list) — a second layer, and the whole posture on
+#      a CLI without --tools. POLICY, not dead weight: 87bfc692 once claimed "she
+#      can't call them anyway", which was wrong, and swept WebFetch/WebSearch out
+#      on that premise (#71).
+# --strict-mcp-config then limits MCP servers to our own --mcp-config (none for
+# background calls), which also keeps the account's claude.ai connectors out.
 #
 # Spiked, not remembered: docs/cli-provider-capabilities.md carries the dated
-# row (2026-07-14) — with --allowedTools "Read", a Bash call still ran. An
-# unspiked comment is what caused #71 in the first place; don't trust this one
-# either if the CLI has moved. Re-spike and date a new row.
+# rows (2026-07-14 --allowedTools; 2026-09-30 --tools). Re-spike on a CLI bump.
 #
 # Keep Bash/Edit/Write/Task blocked — a companion has no business with a shell.
 # Do NOT re-add WebFetch/WebSearch; test_web_tools_stay_callable_at_chat_time
@@ -342,10 +345,155 @@ _BUILTIN_TOOLS_DISALLOWED: tuple[str, ...] = (
 )
 
 
-def _apply_lean_flags(cmd: list[str]) -> None:
-    """Disallow the built-in tools she has no business calling and pin to the
-    configured MCP server. Trims their definition tokens from cache-creation
-    cost; see _BUILTIN_TOOLS_DISALLOWED for why this is policy, not dead weight."""
+# Built-ins a chat turn may use (#71); background calls get none.
+_CHAT_BUILTIN_TOOLS: tuple[str, ...] = ("WebSearch", "WebFetch")
+_NO_BUILTIN_TOOLS: tuple[str, ...] = ()
+
+# Whether this machine's claude CLI has --tools. None = not yet known.
+_TOOLS_FLAG_SUPPORTED: bool | None = None
+_tools_probe_retry_at: float = 0.0
+_tools_warned: bool = False
+_tools_window_warned_at: float | None = None
+_tools_flag_lock = threading.Lock()
+_monotonic = time.monotonic  # module alias so tests can stub the clock without patching `time`
+
+_TOOLS_PROBE_ARGV: tuple[str, ...] = ("claude", "--help")
+# Parse-only: an empty stdin makes the CLI stop before any model call (rc 1 either way).
+# The print flag deliberately doesn't follow the program name directly, so the tests'
+# spawn-site scan (program name then print flag) doesn't count a probe as a model call.
+_TOOLS_CONFIRM_ARGV: tuple[str, ...] = ("claude", "--tools=", "-p")
+_TOOLS_PROBE_TIMEOUT_S = 10
+_TOOLS_PROBE_RETRY_S = 60.0
+# The option line in the help's own shapes: `  --tools <`, `  -t, --tools <`,
+# `  --x, --tools <`, `  --tools [..]` — never a description that merely mentions it
+# (2.1.284's --restricted text wraps onto a line starting "--tools names them").
+_TOOLS_OPTION_RE = re.compile(
+    r"^ {2}(?:-\w, )?(?:--[\w-]+, )*--tools\b(?:, --[\w-]+)*[ =<\[]", re.M
+)
+# Proof the output really is the help text in the format we parse.
+_HELP_SENTINEL_RE = re.compile(r"^ {2}--output-format <", re.M)
+# The option itself, never --allowedTools / --disallowedTools / --tools-foo.
+_TOOLS_REJECTED_RE = re.compile(r"(?<![\w-])--tools\b(?!-)")
+
+
+def _run_tools_probe(argv: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        list(argv),
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=_subprocess_env(),
+        cwd=_claude_work_dir(),
+        timeout=_TOOLS_PROBE_TIMEOUT_S,
+        check=False,
+        creationflags=_NO_WINDOW,
+    )
+
+
+def _probe_tools_flag() -> bool | None:
+    """Ask the CLI whether it has --tools. None = couldn't tell (don't cache).
+
+    `--help` is fast, but the CLI hides options it accepts (--system-prompt-file
+    isn't listed), so "absent" is confirmed by a parse-only `--tools=` run:
+    "Input must be provided" means the option parsed; "unknown option" means it
+    didn't. Anything unexpected is indeterminate, never "unsupported".
+    """
+    try:
+        help_run = _run_tools_probe(_TOOLS_PROBE_ARGV)
+        if help_run.returncode != 0 or not _HELP_SENTINEL_RE.search(help_run.stdout or ""):
+            return None
+        if _TOOLS_OPTION_RE.search(help_run.stdout):
+            return True
+        confirm = _run_tools_probe(_TOOLS_CONFIRM_ARGV)
+    except Exception:  # noqa: BLE001 — a probe must never break a call
+        return None
+    err = confirm.stderr or ""
+    if "input must be provided" in err.lower():
+        return True
+    if "unknown option" in err.lower() and _TOOLS_REJECTED_RE.search(err):
+        return False
+    return None
+
+
+def _cli_supports_tools_flag() -> bool:
+    """True when the claude CLI accepts --tools (see _BUILTIN_TOOLS_DISALLOWED).
+
+    Probed once per process and cached once the answer is definitive. A probe
+    that couldn't tell is not cached: calls fall back until a retry 60 s later.
+    """
+    global _TOOLS_FLAG_SUPPORTED, _tools_probe_retry_at, _tools_warned, _tools_window_warned_at
+    supported = _TOOLS_FLAG_SUPPORTED
+    if supported is not None:
+        return supported
+    with _tools_flag_lock:
+        if _TOOLS_FLAG_SUPPORTED is not None:
+            return _TOOLS_FLAG_SUPPORTED
+        now = _monotonic()
+        if now < _tools_probe_retry_at:
+            return False
+        result = _probe_tools_flag()
+        if result is None:
+            _tools_probe_retry_at = now + _TOOLS_PROBE_RETRY_S
+            if (
+                _tools_window_warned_at is None
+                or now - _tools_window_warned_at >= _TOOLS_PROBE_RETRY_S
+            ):
+                _tools_window_warned_at = now
+                logger.warning(
+                    "could not tell whether this claude CLI supports --tools; built-in tools "
+                    "are only partly restricted until a retry in %.0fs",
+                    _TOOLS_PROBE_RETRY_S,
+                )
+            return False
+        _TOOLS_FLAG_SUPPORTED = result
+        if not result and not _tools_warned:
+            _tools_warned = True
+            logger.warning(
+                "this claude CLI has no --tools option; built-in tools are only partly "
+                "restricted (disallow list only) — update Claude Code"
+            )
+        return result
+
+
+def _reset_tools_flag_cache() -> None:
+    """Test hook: forget the probe result."""
+    global _TOOLS_FLAG_SUPPORTED, _tools_probe_retry_at, _tools_warned, _tools_window_warned_at
+    with _tools_flag_lock:
+        _TOOLS_FLAG_SUPPORTED = None
+        _tools_probe_retry_at = 0.0
+        _tools_warned = False
+        _tools_window_warned_at = None
+
+
+def _note_tools_flag_rejected(stderr: str) -> None:
+    """Fall back for this process if the CLI rejected --tools (#329, owner ruling).
+
+    Callers pass stderr only from a failure that happened before the CLI ran
+    anything (empty stdout / no frame): that's where a parse rejection lands,
+    and nothing a model, tool or web page wrote can be in it. Never raises.
+    """
+    global _TOOLS_FLAG_SUPPORTED
+    if _TOOLS_FLAG_SUPPORTED is not True or not _TOOLS_REJECTED_RE.search(stderr or ""):
+        return
+    with _tools_flag_lock:
+        if _TOOLS_FLAG_SUPPORTED is not True:
+            return
+        _TOOLS_FLAG_SUPPORTED = False
+    logger.warning("claude rejected --tools; falling back for this process (disallow list only)")
+
+
+def _apply_lean_flags(cmd: list[str], *, builtins: tuple[str, ...] = _NO_BUILTIN_TOOLS) -> None:
+    """Apply the tool posture (#329): the exclusive --tools=<builtins> allowlist
+    (when the CLI supports it), the disallow list, and --strict-mcp-config.
+
+    Defaults to NO built-ins, so a new call site fails closed; chat sites pass
+    _CHAT_BUILTIN_TOOLS. The equals form keeps an empty list as one non-empty
+    argv element ("--tools="), never a bare "" that Windows quoting could drop.
+    """
+    if _cli_supports_tools_flag():
+        cmd.append(f"--tools={','.join(builtins)}")
     cmd.extend(["--disallowedTools", *_BUILTIN_TOOLS_DISALLOWED])
     cmd.append("--strict-mcp-config")
 
@@ -606,7 +754,25 @@ def _claude_failure_detail(result: subprocess.CompletedProcess[str]) -> str:
     """
     detail = _claude_failure_detail_text(result)
     provider_auth.note_cli_failure(detail)  # #246: every exit!=0 text passes through here
+    if not (result.stdout or "").strip():  # #329: a pre-execution failure, e.g. a rejected --tools
+        _note_tools_flag_rejected(result.stderr or "")
     return detail
+
+
+def _last_result_line(stdout: str) -> dict[str, Any] | None:
+    """The last `{"type": "result"}` line of an NDJSON stdout, else None (#330).
+
+    Splits on "\n" only: `splitlines()` would also break a frame on a raw
+    U+2028/U+2029/U+0085 inside a JSON string.
+    """
+    for raw in reversed(stdout.split("\n")):
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and obj.get("type") == "result":
+            return obj
+    return None
 
 
 def _claude_failure_detail_text(result: subprocess.CompletedProcess[str]) -> str:
@@ -616,7 +782,7 @@ def _claude_failure_detail_text(result: subprocess.CompletedProcess[str]) -> str
         try:
             payload = json.loads(stdout)
         except json.JSONDecodeError:
-            payload = None
+            payload = _last_result_line(stdout)  # #330: stream-json NDJSON stdout
         if isinstance(payload, dict):
             parts: list[str] = []
             if payload.get("api_error_status") is not None:
@@ -703,6 +869,7 @@ class ClaudeCliProvider(LLMProvider):
             "--model",
             self._model,
         ]
+        _apply_lean_flags(cmd)  # #329: background calls get no tools at all
         with _system_prompt_tempfile(system) as sp_path:
             if sp_path is not None:
                 cmd.extend(["--system-prompt-file", sp_path])
@@ -838,6 +1005,7 @@ class ClaudeCliProvider(LLMProvider):
             self._model,
         ]
         cmd.extend(["--max-budget-usd", str(_MAX_TURN_BUDGET_USD(self._model))])
+        _apply_lean_flags(cmd, builtins=_CHAT_BUILTIN_TOOLS)
         with _system_prompt_tempfile(system_prompt) as sp_path:
             if sp_path is not None:
                 cmd.extend(["--system-prompt-file", sp_path])
@@ -1014,7 +1182,8 @@ class ClaudeCliProvider(LLMProvider):
                 return
             cmd.extend(["--mcp-config", tmp_mcp_path])
             cmd.extend(["--allowedTools", *allowed_mcp])
-            _apply_lean_flags(cmd)
+        # Always, not only with tools: a tools-less turn must not get every built-in (#329).
+        _apply_lean_flags(cmd, builtins=_CHAT_BUILTIN_TOOLS)
 
         try:
             yield from self._run_chat_stream(
@@ -1099,6 +1268,9 @@ class ClaudeCliProvider(LLMProvider):
             tool_in_flight = False
             tool_name: str | None = None
             frames_seen = 0
+            # #273: the CLI's built-in tool calls (WebSearch, WebFetch, ...),
+            # keyed by tool_use id, written to the audit log once the stream ends.
+            builtin_calls: dict[str, dict[str, Any]] = {}
 
             try:
                 while True:
@@ -1156,6 +1328,7 @@ class ClaudeCliProvider(LLMProvider):
                     elif t == "assistant":
                         # Snapshot frame — fallback content when result frame absent.
                         msg_content = obj.get("message", {}).get("content", [])
+                        _collect_builtin_calls(msg_content, builtin_calls)
                         if isinstance(msg_content, list):
                             for blk in msg_content:
                                 if isinstance(blk, dict) and blk.get("type") == "tool_use":
@@ -1168,6 +1341,8 @@ class ClaudeCliProvider(LLMProvider):
                                 if isinstance(blk, dict) and blk.get("type") == "text"
                             ]
                             assistant_snapshot = "".join(parts)
+                    elif t == "user":
+                        _collect_builtin_results(obj, builtin_calls)
                     elif t == "result":
                         result_text = str(obj.get("result", ""))
                         metadata: dict[str, Any] = {
@@ -1225,6 +1400,8 @@ class ClaudeCliProvider(LLMProvider):
                         stderr_text = proc.stderr.read() if proc.stderr else ""
                         # #246: the one exit!=0 site that bypasses _claude_failure_detail.
                         provider_auth.note_cli_failure(stderr_text)
+                        if frames_seen == 0:  # #329: failed before any frame, e.g. rejected --tools
+                            _note_tools_flag_rejected(stderr_text)
                         yield StreamError(
                             stage="claude_cli_exit",
                             detail=f"exit {rc}: {stderr_text[:200]}",
@@ -1238,6 +1415,11 @@ class ClaudeCliProvider(LLMProvider):
                 raise
             finally:
                 reader.join(timeout=5)
+                # One flush for every exit: on success the proxy exhausts this
+                # generator before it reads the audit log; on a StreamError it
+                # raises out of its for-loop and CPython closes the generator
+                # while the exception unwinds, so the rows are on disk first.
+                _flush_builtin_audit(persona_dir, builtin_calls)
 
     def _chat_with_mcp_tools(
         self,
@@ -1291,6 +1473,9 @@ class ClaudeCliProvider(LLMProvider):
             audit_offset_before = 0
 
         tmp_path: str | None = None
+        # #330: the CLI's built-in tool calls, written to the audit log in the
+        # `finally` below (one flush for every exit that got as far as stdout).
+        builtin_calls: dict[str, dict[str, Any]] = {}
         try:
             try:
                 with tempfile.NamedTemporaryFile(
@@ -1327,13 +1512,14 @@ class ClaudeCliProvider(LLMProvider):
                 "-p",
                 "--dangerously-skip-permissions",
                 "--output-format",
-                "json",
+                "stream-json",
+                "--verbose",
                 "--model",
                 self._model,
             ]
             cmd.extend(["--mcp-config", tmp_path])
             cmd.extend(["--allowedTools", *allowed_mcp])
-            _apply_lean_flags(cmd)
+            _apply_lean_flags(cmd, builtins=_CHAT_BUILTIN_TOOLS)
             cmd.extend(["--max-budget-usd", str(_MAX_TURN_BUDGET_USD(self._model))])
 
             with _system_prompt_tempfile(system_prompt) as sp_path:
@@ -1354,10 +1540,16 @@ class ClaudeCliProvider(LLMProvider):
                         creationflags=_NO_WINDOW,
                     )
                 except subprocess.TimeoutExpired as exc:
+                    # #330 / ledger C12: the partial stdout is not scanned, so built-in
+                    # calls made before a timeout are not audited (the streaming path is).
                     raise ProviderError(
                         "claude_cli_timeout",
                         f"subprocess timed out after {self._timeout}s",
                     ) from exc
+
+            # Parse before the exit-code check so a non-zero exit still flushes
+            # the built-in calls it saw.
+            payload = _scan_blocking_stream_stdout(result.stdout, builtin_calls)
 
             if result.returncode != 0:
                 raise ProviderError(
@@ -1366,7 +1558,8 @@ class ClaudeCliProvider(LLMProvider):
                 )
 
             try:
-                payload = json.loads(result.stdout)
+                if payload is None:
+                    raise ValueError("no result frame")
                 if payload.get("subtype") == "error_max_budget_usd" or (
                     payload.get("is_error")
                     and any(
@@ -1383,7 +1576,7 @@ class ClaudeCliProvider(LLMProvider):
                 if cli_err is not None:
                     raise ProviderError("claude_cli_error", cli_err)
                 content = str(payload["result"])
-            except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            except (ValueError, KeyError, TypeError) as exc:
                 raise ProviderError(
                     "claude_cli_parse",
                     f"unexpected output format: {result.stdout[:200]!r}",
@@ -1411,11 +1604,157 @@ class ClaudeCliProvider(LLMProvider):
                 raw=None,
             )
         finally:
+            # After the `dispatched` read above, so this call's own built-in rows
+            # can never become its dispatched_invocations (audit-only, #273).
+            _flush_builtin_audit(persona_dir, builtin_calls)
             if tmp_path is not None:
                 try:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
+
+
+_CLI_BUILTIN_ORIGIN = "cli_builtin"
+_BRAIN_TOOLS_PREFIX = "mcp__brain-tools__"
+
+
+def _collect_builtin_calls(content: Any, calls: dict[str, dict[str, Any]]) -> None:
+    """Record each CLI built-in `tool_use` block (#273).
+
+    A brain-tools call (`mcp__brain-tools__*`) is skipped: the MCP child logs
+    it. Anything else ran inside the `claude` subprocess and is invisible to
+    the MCP child: WebSearch, WebFetch, ToolSearch and whatever other built-in
+    the CLI exposes (owner ruling: every built-in, no allowlist). With
+    --strict-mcp-config only brain-tools is loaded, so a non-brain MCP tool
+    here would also be labelled a built-in. The first block for an id wins.
+    """
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        tool_id, name = block.get("id"), block.get("name")
+        if not isinstance(tool_id, str) or not isinstance(name, str) or not name:
+            continue
+        if name.startswith(_BRAIN_TOOLS_PREFIX) or tool_id in calls:
+            continue
+        tool_input = block.get("input")
+        calls[tool_id] = {
+            "name": name,
+            "arguments": tool_input if isinstance(tool_input, dict) else {},
+            "result": "",
+            "is_error": False,
+            "answered": False,
+        }
+
+
+def _collect_builtin_results(frame: dict[str, Any], calls: dict[str, dict[str, Any]]) -> None:
+    """Attach a `user` frame's `tool_result` blocks to their recorded calls."""
+    message = frame.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        tool_use_id = block.get("tool_use_id")
+        call = calls.get(tool_use_id) if isinstance(tool_use_id, str) else None
+        if call is None:
+            continue
+        call["result"] = _tool_result_text(block.get("content"))
+        call["is_error"] = bool(block.get("is_error"))
+        call["answered"] = True
+
+
+def _tool_result_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            b["text"]
+            if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)
+            else json.dumps(b, default=str, ensure_ascii=False)
+            for b in content
+        )
+    return json.dumps(content, default=str, ensure_ascii=False)
+
+
+def _scan_blocking_stream_stdout(
+    stdout: str | None, calls: dict[str, dict[str, Any]]
+) -> dict[str, Any] | None:
+    """Scan a blocking `claude -p --output-format stream-json --verbose` stdout (#330).
+
+    Feeds `assistant`/`user` frames to the #273 built-in collectors and returns
+    the terminal `result` frame (the same object `--output-format json` printed),
+    or None. Lines split on "\n" only: `str.splitlines()` also breaks on
+    U+2028/U+2029/U+0085, which JSON serialisers emit raw inside strings.
+    Not `_parse_stream_json_result`, which is an unrelated (dead) parser below.
+    """
+    result: dict[str, Any] | None = None
+    for raw in (stdout or "").split("\n"):
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        kind = obj.get("type")
+        if kind == "assistant":
+            message = obj.get("message")
+            _collect_builtin_calls(message.get("content") if isinstance(message, dict) else None, calls)
+        elif kind == "user":
+            _collect_builtin_results(obj, calls)
+        elif kind == "result":
+            result = obj
+    if result is None:
+        # ponytail: single-object shape (what `--output-format json` printed). Kept so
+        # stubs and any CLI that ignores the format flag still parse; delete once migrated.
+        # A typed non-result frame (e.g. a lone `init`) must NOT become the payload:
+        # _cli_error_detail would call provider_auth.note_cli_success() on it.
+        try:
+            whole = json.loads(stdout or "")
+        except json.JSONDecodeError:
+            return None
+        if isinstance(whole, dict) and whole.get("type") in (None, "result"):
+            return whole
+    return result
+
+
+def _flush_builtin_audit(persona_dir: Path | None, calls: dict[str, dict[str, Any]]) -> None:
+    """Write the turn's built-in calls to the audit log, marked `cli_builtin`.
+
+    Runs once, after the stream. By then this turn's MCP child has written its
+    own rows (it logs before returning each result), so the two writers don't
+    interleave on the success path. Rows are stamped at flush time and follow
+    the turn's MCP rows. Observability only: never raises.
+    """
+    if persona_dir is None or not calls:
+        return
+    try:
+        from brain.mcp_server import audit
+
+        for call in calls.values():
+            if not call["answered"]:
+                outcome, error = "error", "no result before the stream ended"
+            elif call["is_error"]:
+                outcome, error = "error", "tool reported an error"
+            else:
+                outcome, error = "ok", None
+            audit.log_invocation(
+                persona_dir,
+                name=call["name"],
+                arguments=call["arguments"],
+                # JSON so redacted mode can hide it: a search result starts with the query.
+                result_summary=json.dumps({"result": call["result"]}, ensure_ascii=False),
+                error=error,
+                outcome=outcome,
+                origin=_CLI_BUILTIN_ORIGIN,
+            )
+    except Exception as exc:  # noqa: BLE001 — audit must never break a turn
+        logger.warning("built-in tool audit write failed: %s", exc)
 
 
 def _read_audit_lines_since(
@@ -1477,6 +1816,10 @@ def _read_audit_lines_since(
             entry = json.loads(line)
         except json.JSONDecodeError:
             malformed += 1
+            continue
+        if entry.get("origin") == _CLI_BUILTIN_ORIGIN:
+            # #273: audit-only. The CLI already ran these; they are not the
+            # turn's tool invocations.
             continue
         if request_id is not None:
             entry_request_id = entry.get("request_id")

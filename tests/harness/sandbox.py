@@ -1066,12 +1066,15 @@ def sandbox(
                 # STILL hard-raise SandboxLeak.
                 #
                 # KNOWN, OWNER-ACCEPTED RISK (owner, 2026-08-07): unlike the fail-closed session-log
-                # allowlist above, ~/.claude is NOT a root the subject provably cannot write. The
-                # Canary's `claude` CLI runs the generate()/chat() paths with
-                # `--dangerously-skip-permissions` and NO --disallowedTools (the lean disallow-list
-                # is applied only on the MCP paths), so the built-in Write/Bash/Edit tools can
-                # write an ABSOLUTE ~/.claude path (hooks/settings/skills/plugins) — a real escape
-                # this downgrade would render a warning, not a raise. The owner accepted this
+                # allowlist above, ~/.claude is NOT a root the subject provably cannot write. When
+                # this was accepted, the Canary's `claude` CLI ran the generate()/chat() paths with
+                # `--dangerously-skip-permissions` and NO tool restriction, so the built-in
+                # Write/Bash/Edit tools could write an ABSOLUTE ~/.claude path (hooks/settings/
+                # skills/plugins). Since #329 every spawn site carries the posture (--tools=
+                # allowlist + the disallow list, which blocks Write/Bash/Edit on its own too), so
+                # that route is closed; the downgrade stays, as the owner's call, for anything
+                # else that writes there — a real escape it would render as a warning, not a
+                # raise. The owner accepted this
                 # tradeoff to stop the concurrent-editor false trip; see the run's decisions.md
                 # named risk-acceptance. Do NOT widen this beyond the claude_root-ONLY case.
                 if changed == [str(claude_root)]:

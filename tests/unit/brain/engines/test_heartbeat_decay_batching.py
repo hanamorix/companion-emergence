@@ -2,7 +2,7 @@
 guard (spec §5; criteria C9, C10, C17, C30).
 
 Fixtures: synthetic only (F-small, generated in-test with a deterministic
-seed per 1.5-criteria.md's fixture rule) — never touches ~/Downloads/Phoebe.
+seed per 1.5-criteria.md's fixture rule) — never touches a real persona's data directory.
 """
 
 from __future__ import annotations

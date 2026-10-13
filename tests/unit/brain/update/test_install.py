@@ -199,6 +199,27 @@ def test_reapplying_the_same_commit_reuses_the_folder(tmp_path):
     assert marker.exists() and overlay.read_state(root)["active"]["commit"] == "a" * 40
 
 
+def test_reapplying_the_active_commit_keeps_its_confirmation(tmp_path):
+    """#335: `nell update` of the commit already active reuses its folder; a build that
+    has proven itself stays proven (and keeps its undo), so an unrelated later start
+    failure can't auto-roll it back."""
+    finds = tmp_path / "finds"
+    finds.mkdir()
+    brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
+    req = tmp_path / "requirements.txt"
+    req.write_text("", encoding="utf-8")
+    site = _fake_bundle(tmp_path, {})
+    root = tmp_path / "brain-overlay"
+    kw = {"wheel": brain_whl, "requirements": req, "commit": "a" * 40, "site_dir": site, "root": root,
+          "pip_extra": ["--no-index", "--find-links", str(finds)]}
+    first = install.apply_update(**kw)
+    overlay.confirm(root, first["commit"])
+    again = install.apply_update(**kw)
+    assert again["dir"] == first["dir"]
+    assert again["confirmed"] is True and again["undo"] == first["undo"]
+    assert overlay.read_state(root)["active"] == again
+
+
 def test_failed_swap_keeps_the_active_overlay(tmp_path, monkeypatch):
     finds = tmp_path / "finds"
     finds.mkdir()
@@ -400,8 +421,8 @@ def test_redirected_name_that_exists_on_disk_unnamed_is_replaced(tmp_path):
 
 def test_stamp_carries_installed_at_but_current_json_entry_does_not(tmp_path):
     """Spec gap: stamp.json gets an installed_at timestamp (diagnostic only); the
-    entry stored in current.json stays exactly {dir, commit, brain_version,
-    bundle_id} so it round-trips through equality checks unchanged."""
+    entry stored in current.json carries no installed_at, so it round-trips
+    through equality checks unchanged."""
     finds = tmp_path / "finds"
     finds.mkdir()
     brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
@@ -413,9 +434,46 @@ def test_stamp_carries_installed_at_but_current_json_entry_does_not(tmp_path):
                                  root=root, pip_extra=["--no-index", "--find-links", str(finds)])
     stamp = json.loads((root / entry["dir"] / "stamp.json").read_text(encoding="utf-8"))
     assert "installed_at" in stamp and stamp["installed_at"].endswith("Z")
-    assert set(entry) == {"dir", "commit", "brain_version", "bundle_id"}
+    assert set(entry) == {"dir", "commit", "brain_version", "bundle_id", "confirmed", "undo"}
     assert overlay.read_state(root)["active"] == entry
 
+
+
+def test_install_marks_the_new_overlay_unconfirmed_with_its_undo(tmp_path):
+    """#335: every install is unproven until the app sees it run; `undo` records how to
+    back it out — revert when the release brain was running, rollback when an overlay was."""
+    finds = tmp_path / "finds"
+    finds.mkdir()
+    brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
+    req = tmp_path / "requirements.txt"
+    req.write_text("", encoding="utf-8")
+    site = _fake_bundle(tmp_path, {})
+    root = tmp_path / "brain-overlay"
+    extra = ["--no-index", "--find-links", str(finds)]
+    first = install.apply_update(wheel=brain_whl, requirements=req, commit="a" * 40, site_dir=site,
+                                 root=root, pip_extra=extra)
+    assert first["confirmed"] is False and first["undo"] == "revert"
+    second = install.apply_update(wheel=brain_whl, requirements=req, commit="b" * 40, site_dir=site,
+                                  root=root, pip_extra=extra)
+    assert second["confirmed"] is False and second["undo"] == "rollback"
+    assert overlay.read_state(root)["active"] == second
+    stamp = json.loads((root / second["dir"] / "stamp.json").read_text(encoding="utf-8"))
+    assert "confirmed" not in stamp and "undo" not in stamp
+
+
+def test_an_active_overlay_for_another_bundle_does_not_make_undo_a_rollback(tmp_path):
+    """That overlay never loads under this bundle, so the release brain was running."""
+    finds = tmp_path / "finds"
+    finds.mkdir()
+    brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
+    req = tmp_path / "requirements.txt"
+    req.write_text("", encoding="utf-8")
+    site = _fake_bundle(tmp_path, {})
+    root = tmp_path / "brain-overlay"
+    overlay.activate(root, {"dir": "old", "commit": "c" * 40, "brain_version": "1.0", "bundle_id": "other"})
+    entry = install.apply_update(wheel=brain_whl, requirements=req, commit="a" * 40, site_dir=site,
+                                 root=root, pip_extra=["--no-index", "--find-links", str(finds)])
+    assert entry["undo"] == "revert"
 
 def test_unsafe_commit_labels_are_refused(tmp_path):
     for bad in ("../x", "/abs", "", ".hidden", "a/b"):
@@ -435,3 +493,62 @@ def test_missing_requirements_file_is_an_update_error(tmp_path):
                              site_dir=site, root=root, pip_extra=["--no-index", "--find-links", str(finds)])
     assert overlay.read_state(root)["active"] is None
     assert not [p for p in root.iterdir() if p.name.startswith(".staging-")]
+
+
+def test_staging_rename_rides_out_a_transient_permission_error(tmp_path, monkeypatch):
+    """#302: Windows AV scanning freshly written .pyd files can briefly refuse the
+    staging → target rename; a bounded retry keeps the in-app update reliable."""
+    import os
+
+    finds = tmp_path / "finds"
+    finds.mkdir()
+    brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
+    req = tmp_path / "requirements.txt"
+    req.write_text("", encoding="utf-8")
+    site = _fake_bundle(tmp_path, {})
+    real, calls = os.replace, []
+
+    def flaky_once(src, dst):
+        calls.append(dst)
+        if len(calls) == 1:
+            raise PermissionError("scanning")
+        real(src, dst)
+
+    monkeypatch.setattr(os, "replace", flaky_once)
+    monkeypatch.setattr(overlay, "_RETRY_DELAY_S", 0)
+    root = tmp_path / "brain-overlay"
+    entry = install.apply_update(wheel=brain_whl, requirements=req, commit="9" * 40, site_dir=site,
+                                 root=root, pip_extra=["--no-index", "--find-links", str(finds)])
+    assert (root / entry["dir"] / "brain").is_dir()
+    assert overlay.read_state(root)["active"] == entry
+
+
+def test_reapplying_a_commit_never_deletes_its_folder_while_a_process_uses_it(tmp_path):
+    """#314 review (ToT): a bridge stays on A, updates go to B then C (prune keeps A
+    only because it's in use), then A's commit is applied again. A's folder is not
+    named by current.json but is still loaded — the install must go to a fresh
+    folder, not rmtree the live one as 'leftover'."""
+    import os
+
+    finds = tmp_path / "finds"
+    finds.mkdir()
+    brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
+    req = tmp_path / "requirements.txt"
+    req.write_text("", encoding="utf-8")
+    site = _fake_bundle(tmp_path, {})
+    root = tmp_path / "brain-overlay"
+    kw = {"wheel": brain_whl, "requirements": req, "site_dir": site, "root": root,
+          "pip_extra": ["--no-index", "--find-links", str(finds)]}
+    a = install.apply_update(commit="a" * 40, **kw)
+    live = root / a["dir"]
+    (live / overlay.IN_USE_DIR).mkdir()
+    (live / overlay.IN_USE_DIR / str(os.getpid())).write_text("", encoding="utf-8")
+    (live / "sentinel").write_text("the running bridge's files", encoding="utf-8")
+    for d in ("bbbb", "cccc"):
+        overlay.activate(root, {"dir": d, "commit": d[0] * 40, "brain_version": "9.9.9", "bundle_id": "bundle-1"})
+    assert a["dir"] not in {e["dir"] for e in overlay.read_state(root).values() if e}
+
+    again = install.apply_update(commit="a" * 40, **kw)
+    assert (live / "sentinel").is_file(), "the in-use folder was deleted under the live process"
+    assert again["dir"] == f"{a['dir']}-r1"
+    assert overlay.read_state(root)["active"] == again

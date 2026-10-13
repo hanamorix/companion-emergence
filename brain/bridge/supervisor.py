@@ -178,6 +178,7 @@ def run_folded(
     judge_selftune_interval_s: float | None = JUDGE_TUNE_INTERVAL_HOURS * 3600.0,
     clustering_interval_s: float | None = 6 * 3600.0,
     vocab_repair_interval_s: float | None = 6 * 3600.0,
+    pending_reconcile_interval_s: float | None = 900.0,
     is_session_busy: Callable[[str], bool] | None = None,
     bridge_started_at: datetime | None = None,
 ) -> None:
@@ -284,6 +285,11 @@ def run_folded(
         if vocab_repair_interval_s is not None
         else None
     )
+    pending_reconcile_cadence_state = (
+        persisted_cadence.load_cadence(persona_dir, "pending_reconcile_cadence.json")
+        if pending_reconcile_interval_s is not None
+        else None
+    )
 
     # One-shot startup: run the attunement backfill if this is a first-launch
     # (≥10 user turns + no completed backfill_state.json). Wrapped in
@@ -311,6 +317,11 @@ def run_folded(
     # an overdue job runs there and a not-due one does not. The one-shots
     # left below are not gated jobs (vocab repair keeps its own timing, S16;
     # the rest are provider-free repairs).
+
+    # One-shot startup: resolve file-write proposals a crash left in 'committing' (#344).
+    # Provider-free and cheap, so it runs BEFORE the vocab repair (which can make a Haiku call);
+    # its own try/except lives inside the helper.
+    _run_pending_reconcile_tick(persona_dir, stale_after=_STARTUP_RECONCILE_GATE)
 
     # One-shot startup: repair already-stubbed emotion_vocabulary.json entries.
     # Step 1 bumps decay_half_life_days from the bad 1.0 → 14.0 (sync,
@@ -595,6 +606,23 @@ def run_folded(
                     )
                     persisted_cadence.save_cadence(
                         persona_dir, "vocab_repair_cadence.json", vocab_repair_cadence_state
+                    )
+
+            # Pending-write reconcile (#346) — its own short persisted cadence, so a write stranded
+            # mid-session is recovered without waiting on the maintenance job's throttle-slot /
+            # PAUSED / 6h gates. Provider-free; the helper has its own try/except.
+            if pending_reconcile_cadence_state is not None and persisted_cadence.is_due(
+                pending_reconcile_cadence_state, now=datetime.now(UTC)
+            ):
+                try:
+                    _run_pending_reconcile_tick(persona_dir)
+                finally:
+                    pending_reconcile_cadence_state = persisted_cadence.advance(
+                        now=datetime.now(UTC), interval_s=pending_reconcile_interval_s
+                    )
+                    persisted_cadence.save_cadence(
+                        persona_dir, "pending_reconcile_cadence.json",
+                        pending_reconcile_cadence_state,
                     )
 
             # Voice-reflection cadence — daily by default. Gathers last 7 days
@@ -1121,6 +1149,8 @@ def _build_gated_jobs(
                 _file_pending.sweep_expired(persona_dir, now=datetime.now(UTC))
             except Exception:
                 logger.exception("supervisor pending-write sweep raised")
+            # Resolve writes a crash stranded in 'committing' (#344). Own try/except inside.
+            _run_pending_reconcile_tick(persona_dir)
             # Reap aged .lock.stale-* / .corrupt-* forensic residue (#176).
             try:
                 from brain.health import sidecar_sweep as _sidecar_sweep
@@ -1343,6 +1373,26 @@ def _run_vocab_repair_tick(persona_dir: Path) -> None:
         )
     finally:
         _store.close()
+
+
+# A freshly started process cannot have a commit of its own in flight, and a real write takes
+# milliseconds, so recovery at startup needn't wait out the full 10-minute gate (a quick launchd
+# restart would otherwise leave a crashed commit stranded until the next maintenance tick).
+_STARTUP_RECONCILE_GATE = timedelta(minutes=1)
+
+
+def _run_pending_reconcile_tick(persona_dir: Path, *, stale_after: timedelta | None = None) -> None:
+    """Reconcile file-write proposals stranded in 'committing' (#344). Provider-free, fail-soft."""
+    try:
+        # Resolved at call time (not module import) so the seam is patchable and import-light.
+        from brain.files import commit as _commit
+
+        kw = {} if stale_after is None else {"stale_after": stale_after}
+        n = _commit.reconcile_stale_commits(persona_dir, now=datetime.now(UTC), **kw)
+        if n:
+            logger.info("pending reconcile: resolved %d stranded write(s)", n)
+    except Exception:
+        logger.exception("supervisor pending-write reconcile raised")
 
 
 def _run_maker_tick(persona_dir, *, store, provider):

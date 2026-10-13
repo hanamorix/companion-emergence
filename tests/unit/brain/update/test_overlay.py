@@ -125,3 +125,202 @@ def test_release_leaves_a_lock_another_process_now_owns(tmp_path):
     with overlay.overlay_lock(tmp_path):
         (tmp_path / ".lock").write_text("424242", encoding="utf-8")  # someone else took it over
     assert (tmp_path / ".lock").read_text(encoding="utf-8") == "424242"
+
+
+def test_loaded_overlay_is_none_for_the_bundle_brain(tmp_path, monkeypatch):
+    import brain
+
+    monkeypatch.setenv("KINDLED_HOME", str(tmp_path / "home"))
+    pkg = tmp_path / "site-packages" / "brain"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    monkeypatch.setattr(brain, "__file__", str(pkg / "__init__.py"))
+    assert overlay.loaded_overlay() is None
+
+
+def _brain_in_overlay(tmp_path, monkeypatch, stamp):
+    import brain
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("KINDLED_HOME", str(home))
+    folder = overlay.overlay_root() / "abc123def456-0123abcd"
+    (folder / "brain").mkdir(parents=True)
+    (folder / "brain" / "__init__.py").write_text("", encoding="utf-8")
+    if stamp is not None:
+        (folder / "stamp.json").write_text(stamp, encoding="utf-8")
+    monkeypatch.setattr(brain, "__file__", str(folder / "brain" / "__init__.py"))
+
+
+def test_loaded_overlay_reads_the_running_folders_stamp(tmp_path, monkeypatch):
+    _brain_in_overlay(tmp_path, monkeypatch, json.dumps(
+        {"dir": "abc123def456-0123abcd", "commit": "a" * 40, "brain_version": "0.0.43"}))
+    assert overlay.loaded_overlay() == {
+        "dir": "abc123def456-0123abcd", "commit": "a" * 40, "brain_version": "0.0.43",
+        "bundle_match": False}
+
+
+def test_loaded_overlay_without_a_readable_stamp_still_names_the_folder(tmp_path, monkeypatch):
+    _brain_in_overlay(tmp_path, monkeypatch, "{not json")
+    assert overlay.loaded_overlay() == {
+        "dir": "abc123def456-0123abcd", "commit": None, "brain_version": None,
+        "bundle_match": False}
+
+
+def test_loaded_overlay_is_none_when_brain_resolves_to_the_overlay_root(tmp_path, monkeypatch):
+    import brain
+
+    monkeypatch.setenv("KINDLED_HOME", str(tmp_path / "home"))
+    root = overlay.overlay_root()
+    root.mkdir(parents=True)
+    monkeypatch.setattr(brain, "__file__", str(root))
+    assert overlay.loaded_overlay() is None
+
+
+def _bundle(tmp_path, monkeypatch, bundle_id):
+    """Point the running bundle's purelib at a temp dir holding `bundle_id` (None = no file)."""
+    import sysconfig
+
+    from brain.update.overlay_hook import BUNDLE_ID_FILE
+
+    site = tmp_path / "bundle-site"
+    site.mkdir(exist_ok=True)
+    if bundle_id is not None:
+        (site / BUNDLE_ID_FILE).write_text(bundle_id + "\n", encoding="utf-8")
+    real = sysconfig.get_paths
+    monkeypatch.setattr(sysconfig, "get_paths", lambda *a, **k: {**real(*a, **k), "purelib": str(site)})
+
+
+def _stamp(bundle_id=None):
+    s = {"dir": "abc123def456-0123abcd", "commit": "a" * 40, "brain_version": "0.0.43"}
+    if bundle_id is not None:
+        s["bundle_id"] = bundle_id
+    return json.dumps(s)
+
+
+def test_loaded_overlay_matches_when_the_stamp_names_the_running_bundle(tmp_path, monkeypatch):
+    _brain_in_overlay(tmp_path, monkeypatch, _stamp("bundle-1"))
+    _bundle(tmp_path, monkeypatch, "bundle-1")
+    assert overlay.loaded_overlay()["bundle_match"] is True
+
+
+def test_loaded_overlay_does_not_match_another_bundle(tmp_path, monkeypatch):
+    _brain_in_overlay(tmp_path, monkeypatch, _stamp("bundle-1"))
+    _bundle(tmp_path, monkeypatch, "bundle-2")
+    assert overlay.loaded_overlay()["bundle_match"] is False
+
+
+def test_loaded_overlay_without_a_stamp_bundle_id_does_not_match(tmp_path, monkeypatch):
+    _brain_in_overlay(tmp_path, monkeypatch, _stamp())
+    _bundle(tmp_path, monkeypatch, "bundle-1")
+    assert overlay.loaded_overlay()["bundle_match"] is False
+
+
+def test_loaded_overlay_without_a_bundle_id_file_does_not_match(tmp_path, monkeypatch):
+    _brain_in_overlay(tmp_path, monkeypatch, _stamp("bundle-1"))
+    _bundle(tmp_path, monkeypatch, None)
+    assert overlay.loaded_overlay()["bundle_match"] is False
+    assert overlay.current_bundle_id() is None
+
+
+def test_prune_skips_a_folder_a_live_process_still_uses(tmp_path):
+    """#302: a bridge left running on an older overlay (a second persona, or
+    update.sh --no-restart) must not have its folder deleted under it."""
+    for name in ("aaaa", "bbbb"):
+        (tmp_path / name).mkdir()
+    overlay.activate(tmp_path, ENTRY_A)
+    overlay.activate(tmp_path, ENTRY_B)
+    for name, pid in (("cccc", os.getpid()), ("dddd", 999999999)):  # live / no such pid
+        (tmp_path / name / overlay.IN_USE_DIR).mkdir(parents=True)
+        (tmp_path / name / overlay.IN_USE_DIR / str(pid)).write_text("", encoding="utf-8")
+    overlay.prune(tmp_path)
+    assert sorted(p.name for p in tmp_path.iterdir() if p.is_dir()) == ["aaaa", "bbbb", "cccc"]
+
+
+def test_mark_in_use_records_the_overlay_brain_was_loaded_from(tmp_path, monkeypatch):
+    import brain
+
+    folder = tmp_path / "aaaa"
+    (folder / "brain").mkdir(parents=True)
+    monkeypatch.setattr(brain, "__file__", str(folder / "brain" / "__init__.py"))
+    overlay.mark_in_use(tmp_path)
+    assert (folder / overlay.IN_USE_DIR / str(os.getpid())).is_file()
+
+
+def test_mark_in_use_does_nothing_for_the_release_brain(tmp_path):
+    overlay.mark_in_use(tmp_path)  # this checkout's brain is not under tmp_path
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("layout", [
+    ("abc123def456-0123abcd", "brain", "__init__.py"),  # a real overlay import
+    ("stray.py",),  # a file straight in the root: no folder to name
+])
+def test_loaded_overlay_and_mark_in_use_agree_on_the_folder(tmp_path, monkeypatch, layout):
+    """#315: /health.overlay and the prune markers resolve the running folder through
+    one helper, so they name the same folder (or none) for every layout."""
+    import brain
+
+    monkeypatch.setenv("KINDLED_HOME", str(tmp_path / "home"))
+    root = overlay.overlay_root()
+    target = root.joinpath(*layout)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("", encoding="utf-8")
+    monkeypatch.setattr(brain, "__file__", str(target))
+
+    loaded = overlay.loaded_overlay()
+    overlay.mark_in_use()
+    marked = [m.parent.parent.name for m in root.glob(f"*/{overlay.IN_USE_DIR}/{os.getpid()}")]
+    assert (loaded["dir"] if loaded else None) == (marked[0] if marked else None)
+    assert len(marked) <= 1
+
+
+def test_replace_retries_a_transient_permission_error(tmp_path, monkeypatch):
+    """#302: Windows AV (or another interpreter's hook reading current.json) can hold
+    the file briefly; a short bounded retry rides it out."""
+    real, calls = os.replace, []
+
+    def flaky(src, dst):
+        calls.append(dst)
+        if len(calls) < 3:
+            raise PermissionError("in use")
+        real(src, dst)
+
+    monkeypatch.setattr(os, "replace", flaky)
+    monkeypatch.setattr(overlay, "_RETRY_DELAY_S", 0)
+    overlay.activate(tmp_path, ENTRY_A)
+    assert len(calls) == 3
+    assert overlay.read_state(tmp_path)["active"] == ENTRY_A
+
+
+def test_replace_gives_up_after_the_bounded_retries(tmp_path, monkeypatch):
+    def always(src, dst):
+        raise PermissionError("in use")
+
+    monkeypatch.setattr(os, "replace", always)
+    monkeypatch.setattr(overlay, "_RETRY_DELAY_S", 0)
+    with pytest.raises(PermissionError):
+        overlay.activate(tmp_path, ENTRY_A)
+
+
+def test_confirm_marks_only_the_matching_active_overlay(tmp_path):
+    """#335: the app confirms the build it saw running; a commit that is no longer
+    active (another update landed underneath) is left alone."""
+    overlay.activate(tmp_path, {**ENTRY_A, "confirmed": False, "undo": "revert"})
+    overlay.confirm(tmp_path, "f" * 40)
+    assert overlay.read_state(tmp_path)["active"]["confirmed"] is False
+    overlay.confirm(tmp_path, ENTRY_A["commit"])
+    assert overlay.read_state(tmp_path)["active"] == {**ENTRY_A, "confirmed": True, "undo": "revert"}
+
+
+def test_confirm_without_an_active_overlay_is_a_no_op(tmp_path):
+    overlay.confirm(tmp_path, "c" * 40)
+    assert overlay.read_state(tmp_path) == {"active": None, "previous": None}
+    assert not (tmp_path / overlay.STATE_FILE).exists()
+
+
+def test_rollback_keeps_the_restored_entrys_own_flags(tmp_path):
+    a = {**ENTRY_A, "confirmed": True, "undo": "revert"}
+    overlay.activate(tmp_path, a)
+    overlay.activate(tmp_path, {**ENTRY_B, "confirmed": False, "undo": "rollback"})
+    overlay.rollback(tmp_path)
+    assert overlay.read_state(tmp_path)["active"] == a

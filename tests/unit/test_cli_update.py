@@ -24,6 +24,13 @@ def test_status_reports_no_overlay(tmp_path, monkeypatch, capsys):
     assert out["install_kind"] == "source" and out["supported"] is False
 
 
+def test_status_reports_the_running_bundle_id(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
+    monkeypatch.setattr(overlay, "current_bundle_id", lambda: "bundle-1")
+    assert cli.main(["update", "--status"]) == 0
+    assert json.loads(capsys.readouterr().out)["bundle_id"] == "bundle-1"
+
+
 def _entry(d):
     return {"dir": d, "commit": d * 10, "brain_version": "0.0.42", "bundle_id": "b"}
 
@@ -38,6 +45,14 @@ def test_revert_and_rollback(tmp_path, monkeypatch, capsys):
     assert cli.main(["update", "--revert"]) == 0
     assert overlay.read_state(root) == {"active": None, "previous": _entry("aaaa")}
 
+
+
+def test_confirm_marks_the_active_overlay(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
+    root = overlay.overlay_root()
+    overlay.activate(root, {**_entry("a"), "confirmed": False, "undo": "revert"})
+    assert cli.main(["update", "--confirm", "a" * 10]) == 0
+    assert json.loads(capsys.readouterr().out)["active"]["confirmed"] is True
 
 def test_revert_help_mentions_the_no_overlay_escape_hatch(capsys):
     with pytest.raises(SystemExit):

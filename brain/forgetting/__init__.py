@@ -51,21 +51,33 @@ def _persist_forgetting_state(persona_dir: Path, counters: dict[str, int]) -> No
 def _load_soul_linked_ids(persona_dir: Path) -> tuple[set[str], set[str]]:
     """Returns (crystallised_ids, under_review_ids).
 
-    Best-effort: if the soul subsystem isn't reachable, both sets are
-    empty — memories that should have been exempt may fade, but that's
-    safer than crashing the supervisor pass.
+    Fail-soft but loud: if the soul subsystem isn't reachable that set is
+    empty and the pass still runs (a crash would stall every forgetting and
+    narrative tick) — but memories that should have been exempt may fade or
+    be lost, so each failure logs a warning. A silent swallow here hid a
+    never-defined import for the crystallised half (#362).
     """
     try:
-        from brain.soul.audit import list_crystallised_memory_ids
+        from brain.soul.candidates import list_crystallised_memory_ids
 
         crystallised = set(list_crystallised_memory_ids(persona_dir))
     except Exception:
+        log.warning(
+            "forgetting: could not load soul-crystallised memory ids; "
+            "crystallised memories are NOT exempt this pass",
+            exc_info=True,
+        )
         crystallised = set()
     try:
         from brain.soul.candidates import list_under_review_memory_ids
 
         under_review = set(list_under_review_memory_ids(persona_dir))
     except Exception:
+        log.warning(
+            "forgetting: could not load under-review soul candidate ids; "
+            "under-review memories are NOT exempt this pass",
+            exc_info=True,
+        )
         under_review = set()
     return crystallised, under_review
 

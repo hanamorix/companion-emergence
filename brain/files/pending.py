@@ -8,6 +8,8 @@ import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from brain.utils.file_lock import file_lock
+
 logger = logging.getLogger(__name__)
 
 _DIR = "pending_writes"
@@ -21,9 +23,27 @@ def _dir(persona_dir: Path) -> Path:
     return d
 
 
+def _lock(persona_dir: Path):
+    """One store-wide cross-process lock (a single sidecar, not one per record).
+
+    Serialises every read-modify-replace of a record across the bridge, the supervisor thread
+    and the MCP subprocess, so `mark(expect=...)` is a real compare-and-set (#346). Volume is a
+    handful of records, so one lock costs nothing.
+    """
+    return file_lock(_dir(persona_dir) / ".records")
+
+
 def _new_id(resolved_path: str, content: str, now: datetime) -> str:
     h = hashlib.sha256(f"{resolved_path}{now.isoformat()}{content[:64]}".encode()).hexdigest()
     return h[:12]
+
+
+def is_expired(rec: dict, now: datetime) -> bool:
+    """True if a pending record is older than the TTL (whether or not the sweep has run yet)."""
+    try:
+        return now - datetime.fromisoformat(rec["proposed_at"]) > timedelta(hours=_TTL_HOURS)
+    except (ValueError, KeyError, TypeError):
+        return False
 
 
 def count_pending(persona_dir: Path, *, now: datetime) -> int:
@@ -38,8 +58,9 @@ def create(persona_dir: Path, *, op: str, resolved_path: str, content: str,
            "proposed_at": now.isoformat(), "status": "pending", "making_id": making_id}
     p = _dir(persona_dir) / f"{rid}.json"
     tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(rec), encoding="utf-8")
-    tmp.replace(p)
+    with _lock(persona_dir):
+        tmp.write_text(json.dumps(rec), encoding="utf-8")
+        tmp.replace(p)
     return rid
 
 
@@ -95,24 +116,41 @@ def find_duplicate(persona_dir: Path, *, op: str, resolved_path: str,
     return None
 
 
-def mark(persona_dir: Path, rid: str, *, status: str) -> bool:
-    """Set the record's status. Returns True if it took, False if it did not.
+def list_by_status(persona_dir: Path, status: str) -> list[dict]:
+    """Every record currently in `status`, oldest-unspecified order (callers sort)."""
+    return [r for r in _all(persona_dir) if r.get("status") == status]
+
+
+def mark(persona_dir: Path, rid: str, *, status: str, expect: str | None = None,
+         **extra) -> bool:
+    """Set the record's status (and merge `extra` fields). True if it took, False if not.
 
     Returning a bool rather than failing mutely is load-bearing (#101): get()
     swallows OSError/ValueError, so a transient read failure made this a silent
     no-op. commit_write then wrote the file while the record stayed 'pending',
     and its status guard — the thing making the commit idempotent — stopped
     guarding, so a retry appended the block a second time.
+
+    `expect` makes this a compare-and-set (#344): the status is re-read HERE and
+    nothing is written unless it equals `expect`. The read and the replace run under
+    one store-wide cross-process lock (#346), so two claimers cannot both win and the
+    shared `.tmp` can't tear. Readers (`get`/`_all`) stay lock-free: on POSIX `replace` is atomic;
+    on Windows it can raise PermissionError while a lock-free reader has the file open. Every
+    caller already treats a failed mark as 'did not take' (bool / OSError handled), so that recovers.
     """
-    rec = get(persona_dir, rid)
-    if rec is None:
-        return False
-    rec["status"] = status
-    p = _dir(persona_dir) / f"{rid}.json"
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(rec), encoding="utf-8")
-    tmp.replace(p)
-    return True
+    with _lock(persona_dir):
+        rec = get(persona_dir, rid)
+        if rec is None:
+            return False
+        if expect is not None and rec.get("status") != expect:
+            return False
+        rec["status"] = status
+        rec.update(extra)
+        p = _dir(persona_dir) / f"{rid}.json"
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(rec), encoding="utf-8")
+        tmp.replace(p)
+        return True
 
 
 def sweep_expired(persona_dir: Path, *, now: datetime) -> int:
@@ -125,6 +163,7 @@ def sweep_expired(persona_dir: Path, *, now: datetime) -> int:
         except (ValueError, KeyError):
             continue
         if age > timedelta(hours=_TTL_HOURS):
-            mark(persona_dir, r["id"], status="expired")
-            n += 1
+            # expect='pending': a card claimed since the read above is live, not expired (#344).
+            if mark(persona_dir, r["id"], status="expired", expect="pending"):
+                n += 1
     return n

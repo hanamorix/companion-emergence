@@ -38,11 +38,22 @@ vi.mock("@tauri-apps/plugin-updater", () => ({
   Update: class {},
 }));
 
+vi.mock("@tauri-apps/api/app", () => ({
+  getVersion: vi.fn(async () => "0.0.42"),
+}));
+
+vi.mock("./BrainUpdateRow", () => ({
+  BrainUpdateRow: ({ checkToken }: { checkToken: number }) => (
+    <div data-testid="brain-row">token {checkToken}</div>
+  ),
+}));
+
 import { ConnectionPanel } from "./ConnectionPanel";
 import type { PersonaState } from "../../bridge";
 import { getClientPlatform, detectInstallShape } from "../../platform";
 import type { Update } from "@tauri-apps/plugin-updater";
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 
 function baseState(overrides: Partial<PersonaState> = {}): PersonaState {
   return {
@@ -453,3 +464,60 @@ describe("ConnectionPanel — Clean connection section", () => {
     ).toBeInTheDocument();
   });
 });
+
+// ── Brain update row + app version (Task 7) ─────────────────────────
+
+describe("ConnectionPanel — BrainUpdateRow wiring", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getClientPlatform).mockReturnValue("macos");
+    vi.mocked(check).mockReset();
+  });
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("renders BrainUpdateRow at token 0 and bumps it once per Check for updates click", () => {
+    vi.mocked(check).mockImplementation(() => new Promise(() => {}));
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+    expect(screen.getByTestId("brain-row")).toHaveTextContent("token 0");
+
+    fireEvent.click(screen.getByRole("button", { name: /check for updates/i }));
+    expect(screen.getByTestId("brain-row")).toHaveTextContent("token 1");
+  });
+});
+
+// ── App version alongside app-update text (Task 7) ──────────────────
+
+describe("ConnectionPanel — app version in the update-available text", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getClientPlatform).mockReturnValue("macos");
+    vi.mocked(check).mockReset();
+  });
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("shows the app's current version alongside an available update", async () => {
+    vi.mocked(check).mockResolvedValue(fakeUpdate("0.0.43"));
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+    fireEvent.click(screen.getByRole("button", { name: /check for updates/i }));
+    await waitFor(() => {
+      expect(screen.getByText("v0.0.43 available. Current: v0.0.42.")).toBeInTheDocument();
+    });
+  });
+
+  it("omits the current-version clause when getVersion fails", async () => {
+    vi.mocked(getVersion).mockRejectedValueOnce(new Error("no version"));
+    vi.mocked(check).mockResolvedValue(fakeUpdate("0.0.43"));
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+    fireEvent.click(screen.getByRole("button", { name: /check for updates/i }));
+    await waitFor(() => {
+      expect(screen.getByText("v0.0.43 available.")).toBeInTheDocument();
+    });
+  });
+});
+
+
+

@@ -15,6 +15,8 @@ Not a chatbot. Not a productivity tool. An inhabitant — quiet, private, embodi
 
 [**Install**](#install) · [**How it works**](#how-it-works) · [**Features**](#features) · [**FAQ**](#faq) · [**Support the work**](#support-the-work)
 
+https://github.com/user-attachments/assets/9597abcf-e5b4-44ef-9a25-50cf27d72c29
+
 </div>
 
 ---

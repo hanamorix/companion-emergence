@@ -1783,12 +1783,18 @@ def _update_handler(args: argparse.Namespace) -> int:
     if args.status:
         state = overlay.read_state(root)
         print(json.dumps({"supported": kind == "bundled" and (site / BUNDLE_ID_FILE).is_file(),
-                          "install_kind": kind, **state}, indent=2))
+                          "install_kind": kind, "bundle_id": overlay.current_bundle_id(),
+                          **state}, indent=2))
         return 0
     try:
         if args.revert or args.rollback:
             with overlay.overlay_lock(root):
                 (overlay.revert if args.revert else overlay.rollback)(root)
+            print(json.dumps(overlay.read_state(root), indent=2))
+            return 0
+        if args.confirm:
+            with overlay.overlay_lock(root):
+                overlay.confirm(root, args.confirm)
             print(json.dumps(overlay.read_state(root), indent=2))
             return 0
         if kind == "source" and args.wheel is None:
@@ -1818,9 +1824,12 @@ def _update_handler(args: argparse.Namespace) -> int:
 def _paths_for_persona(persona: str) -> dict[str, Path]:
     """Build the key → path map for the given persona."""
     from brain.paths import get_cache_dir, get_log_dir
+    from brain.update.overlay import overlay_root, read_state
 
     home = get_home()
     pd = get_persona_dir(persona)
+    _overlay_root = overlay_root()
+    _active = read_state(_overlay_root)["active"]
     return {
         # Global
         "home": home,
@@ -1851,6 +1860,11 @@ def _paths_for_persona(persona: str) -> dict[str, Path]:
         "dreams_log": pd / "dreams.log.jsonl",
         "heartbeats_log": pd / "heartbeats.log.jsonl",
         "forgotten_memories": pd / "forgotten_memories.jsonl",
+        # #286: the user-writable overlay; overlay_active is the folder current.json
+        # names (what the next start loads) or the bare word "none".
+        "overlay_dir": _overlay_root,
+        "overlay_active": _overlay_root / _active["dir"]
+        if isinstance(_active, dict) and isinstance(_active.get("dir"), str) else Path("none"),
     }
 
 
@@ -1862,7 +1876,7 @@ def _print_paths(persona: str, *, json_mode: bool) -> None:
         return
     width = max(len(k) for k in paths)
     for key, p in paths.items():
-        marker = "  (missing)" if key != "install_kind" and not p.exists() else ""
+        marker = "  (missing)" if key not in ("install_kind", "overlay_active") and not p.exists() else ""
         print(f"{key:<{width}}  {p}{marker}")
 
 
@@ -3345,6 +3359,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "KINDLED_NO_OVERLAY=1 first.",
     )
     update_mode.add_argument("--rollback", action="store_true", help="Go back to the previous overlay.")
+    update_mode.add_argument(
+        "--confirm", metavar="COMMIT",
+        help="Mark the active overlay as proven to run (the app does this after a healthy restart).",
+    )
     update_sub.add_argument("script_args", nargs=argparse.REMAINDER,
                             help="Source installs: arguments passed to scripts/update.sh (after --).")
     update_sub.set_defaults(func=_update_handler)
