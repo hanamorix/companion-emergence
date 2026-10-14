@@ -31,7 +31,6 @@ from brain.chat.prompt import (
     build_static_system_message,
     build_volatile_context,
 )
-from brain.chat.reply_scaffold import strip_scaffold_tail
 from brain.chat.salience import assess_salience
 from brain.chat.session import (
     SessionState,
@@ -351,8 +350,7 @@ def _respond_inner(
         chat_options=chat_options or None,
         session_id=session.session_id,
     )
-    # #227: drop leaked </s> / JSON-wrapper tails before they are stored or replayed.
-    content = strip_scaffold_tail(response.content or "")
+    content = response.content or ""
 
     # 8. Persist turn (best-effort, but surfaced in metadata). The outgoing
     # user text (with any shared-file path line) is persisted as PLAIN TEXT —
