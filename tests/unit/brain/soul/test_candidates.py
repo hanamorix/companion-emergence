@@ -89,6 +89,39 @@ def test_candidate_ids_first_then_direct_links_sorted_deduplicated_revoked_dropp
     assert list_crystallised_memory_ids(tmp_path) == ["m-cand", "m-a", "m-z"]
 
 
+def test_an_unreadable_candidates_file_does_not_drop_the_direct_links(tmp_path, caplog):
+    """Each source fails on its own: a real read failure on soul_candidates.jsonl (a directory where the
+    file should be) must cost only the candidate source, loudly, and leave the direct links protecting."""
+    import logging
+
+    (tmp_path / "soul_candidates.jsonl").mkdir()
+    _link_directly(tmp_path, "m-direct")
+
+    with caplog.at_level(logging.WARNING):
+        assert list_crystallised_memory_ids(tmp_path) == ["m-direct"]
+
+    assert any("crystallised" in r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
+
+
+def test_a_broken_link_table_does_not_drop_the_accepted_candidates(tmp_path, caplog):
+    """The other direction: the new crystallization_sources table is the only thing this reader gained, so a
+    malformed one must not take the accepted-candidate protection (which worked before #371) down with it."""
+    import logging
+
+    _write_candidates(tmp_path, [{"memory_id": "m-cand", "status": "accepted"}])
+    store = SoulStore(str(tmp_path / "crystallizations.db"))
+    try:
+        store._conn.execute("CREATE TABLE crystallization_sources (not_the_real_schema TEXT)")
+        store._conn.commit()
+    finally:
+        store.close()
+
+    with caplog.at_level(logging.WARNING):
+        assert list_crystallised_memory_ids(tmp_path) == ["m-cand"]
+
+    assert any("crystallised" in r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
+
+
 def test_unknown_link_fails_toward_protection(tmp_path):
     """Losing a memory is the worse error: only an affirmative revoke drops the
     protection. A legacy record (no crystallization_id), a dangling id, and no

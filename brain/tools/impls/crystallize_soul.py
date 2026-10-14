@@ -112,9 +112,12 @@ def _link_source_memory(
     # The crystallisation is already committed and permanent: nothing about an optional id may
     # undo it. Any failure here degrades to "saved, not linked" and is logged, never raised.
     try:
-        if store.get(wanted, bump=False) is not None:
+        memory = store.get(wanted, bump=False)
+        if memory is not None:
             soul_store.link_source_memory(crystallization_id, wanted)
             result["source_memory_linked"] = True
+            if memory.state == "fading":
+                result["note"] = _FADING_NOTE
             return
     except Exception:
         logger.warning(
@@ -131,6 +134,13 @@ def _link_source_memory(
 _NOT_LINKED_NOTE = (
     "The crystallisation was saved, but no memory was linked. "
     "Do not repeat it and do not search for the memory."
+)
+
+
+# The exemption stops the forgetting pass touching a memory; it does not un-fade one (#372).
+_FADING_NOTE = (
+    "That memory is already fading. It is now protected from being lost, "
+    "but it is not restored: it stays faded."
 )
 
 

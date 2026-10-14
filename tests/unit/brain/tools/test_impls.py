@@ -646,6 +646,36 @@ _NOT_LINKED_NOTE = (
 )
 
 
+# Linking is true for a fading memory but only half the story: it will not be lost, it is not restored.
+_FADING_NOTE = (
+    "That memory is already fading. It is now protected from being lost, "
+    "but it is not restored: it stays faded."
+)
+
+
+def test_crystallize_soul_links_a_fading_memory_but_says_it_stays_faded(tmp_path: Path) -> None:
+    """The exemption stops the forgetting pass touching a memory; it does not un-fade one (#372). The
+    result must not let the model believe a fading memory was kept whole."""
+    from brain.tools.impls.crystallize_soul import crystallize_soul
+
+    ctx = _ctx(tmp_path)
+    mem = _seed_memory(ctx["store"])
+    ctx["store"].fade(mem.id, summary="a faint summary")
+
+    result = crystallize_soul(
+        moment="the moment she laughed",
+        love_type="romantic",
+        why_it_matters="it was real",
+        source_memory_id=mem.id,
+        **ctx,
+    )
+
+    assert result["created"] is True
+    assert result["source_memory_linked"] is True  # the link is real: the pass will not lose it
+    assert result["note"] == _FADING_NOTE
+    assert _linked_ids(tmp_path) == [mem.id]
+
+
 def test_crystallize_soul_unknown_memory_id_still_crystallises_and_says_not_to_repeat(tmp_path: Path) -> None:
     """#371 C3 / m4: an id no memory has must never block or undo the permanent crystallisation."""
     from brain.tools.impls.crystallize_soul import crystallize_soul
