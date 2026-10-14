@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import contextlib
+import glob
 import json
 import logging
 import os
+import re
+import secrets
 import shutil
 import stat
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -286,70 +291,141 @@ def _copy_for_backup(src: Path, dst: Path) -> bool:
         raise
 
 
+# Per-writer temp files (#389). Two savers of one path used to share one
+# ``<name>.new`` and one ``<name>.bak1.new``, so one could unlink or replace the
+# other's in-flight temp and the loser raised FileNotFoundError. Every save now
+# names its own temps ``<name>.t<pid>-<process nonce>-<random>.new`` (and
+# ``...bak1.new`` for the backup copy). Leftovers of a killed save are found by
+# that pattern and removed without touching a temp another writer is still
+# using: a temp this process has registered as in flight is never removed; one
+# from this process that is not registered, or from a dead process (or an older
+# process that had our pid), is stale; one owned by another live process is left.
+_PROCESS_NONCE = secrets.token_hex(4)
+_INFLIGHT: set[str] = set()
+_INFLIGHT_LOCK = threading.Lock()
+
+
+def _owner_alive(pid: int) -> bool:
+    # Lazy import: bridge sits above health and imports this module. The bridge's
+    # pid check has the Windows-safe branch; a raw os.kill(pid, 0) must not be
+    # used (on Windows signal 0 is a real Ctrl+C).
+    from brain.bridge.state_file import pid_is_alive
+
+    return pid_is_alive(pid)
+
+
+def _remove_stale_temps(path: Path) -> None:
+    """Remove leftover save temps of ``path``; never another writer's live temp."""
+    for legacy in (path.name + ".new", path.name + ".bak1.new"):  # pre-#389 fixed names
+        with contextlib.suppress(OSError):
+            path.with_name(legacy).unlink(missing_ok=True)
+    pattern = re.compile(rf"^{re.escape(path.name)}\.t(\d+)-([0-9a-f]+)-[0-9a-f]+\.(?:bak1\.)?new$")
+    try:
+        found = list(path.parent.glob(f"{glob.escape(path.name)}.t*-*-*.new"))
+    except OSError:
+        return
+    for temp in found:
+        m = pattern.match(temp.name)
+        if m is None:
+            continue
+        pid, nonce = int(m.group(1)), m.group(2)
+        with _INFLIGHT_LOCK:
+            if str(temp) in _INFLIGHT:
+                continue
+        ours = nonce == _PROCESS_NONCE or pid == os.getpid()
+        if ours or not _owner_alive(pid):
+            with contextlib.suppress(OSError):
+                temp.unlink(missing_ok=True)
+
+
+@contextlib.contextmanager
+def _temp_scope(path: Path) -> Iterator[tuple[Path, Path]]:
+    """This save's own temp paths, registered as in flight; stale ones swept first.
+
+    On an Exception (not a kill, which runs no code) the save's own temps are
+    removed. The registration is always dropped."""
+    tag = f"t{os.getpid()}-{_PROCESS_NONCE}-{secrets.token_hex(6)}"
+    new_path = path.with_name(f"{path.name}.{tag}.new")
+    bak1_new = path.with_name(f"{path.name}.{tag}.bak1.new")
+    with _INFLIGHT_LOCK:
+        _INFLIGHT.update((str(new_path), str(bak1_new)))
+    try:
+        _remove_stale_temps(path)
+        yield new_path, bak1_new
+    except Exception:
+        for temp in (new_path, bak1_new):
+            with contextlib.suppress(OSError):
+                temp.unlink(missing_ok=True)
+        raise
+    finally:
+        with _INFLIGHT_LOCK:
+            _INFLIGHT.difference_update((str(new_path), str(bak1_new)))
+
+
 def save_with_backup_text(path: Path, text: str, backup_count: int = 3) -> None:
     """Atomic raw-text save with .bak rotation.
 
     The live path always holds a complete file (#387): the new text is written
-    and fsynced to <path>.new, the live file is COPIED (not renamed) to
-    <path>.bak1.new, the chain is rotated <path>.bak1 → ... → <path>.bak{N}
-    (oldest dropped), <path>.bak1.new becomes <path>.bak1, and only then does
-    one atomic replace put <path>.new at <path>. A kill at any point leaves the
-    old or the new file complete at <path>; stale <path>.new / <path>.bak1.new
-    from a prior crash are unlinked before the next save begins.
+    and fsynced to a per-save temp (<path>.t<id>.new), the live file is COPIED
+    (not renamed) to a second per-save temp (<path>.t<id>.bak1.new), the chain
+    is rotated <path>.bak1 → ... → <path>.bak{N} (oldest dropped), the backup
+    temp becomes <path>.bak1, and only then does one atomic replace put the new
+    temp at <path>. A kill at any point leaves the old or the new file complete
+    at <path>. Temps are named per save so concurrent savers of one path never
+    share one (#389); leftovers of a killed save are removed by pattern at the
+    start of the next save, never another writer's in-flight temp.
 
     The text variant — for callers whose payload is already a string and
     should not be JSON-encoded (markdown bodies, voice.md, work files).
     For JSON dicts, use save_with_backup which delegates here after encoding.
     """
-    new_path = path.with_name(path.name + ".new")
     bak1 = path.with_name(f"{path.name}.bak1")
-    bak1_new = path.with_name(f"{path.name}.bak1.new")
-    for stale in (new_path, bak1_new):
-        stale.unlink(missing_ok=True)  # stale from prior crash; always incomplete
+    with _temp_scope(path) as (new_path, bak1_new):
+        # Same open as Path.write_text (text mode, no newline=) so the bytes
+        # written per platform are unchanged; flushed and fsynced so the data is
+        # on disk before the replace below can publish it.
+        with new_path.open("w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
 
-    # Same open as Path.write_text (text mode, no newline=) so the bytes written
-    # per platform are unchanged; flushed and fsynced so the data is on disk
-    # before the replace below can publish it.
-    with new_path.open("w", encoding="utf-8") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
+        # The slow, failure-prone copy happens before anything is rotated: if it
+        # fails (disk full) the live file and the whole chain are untouched.
+        backed_up = _copy_for_backup(path, bak1_new)
 
-    # The slow, failure-prone copy happens before anything is rotated: if it
-    # fails (disk full) the live file and the whole chain are untouched.
-    backed_up = _copy_for_backup(path, bak1_new)
+        # Rotate: drop oldest first, then walk down toward live. A step whose
+        # source another saver just moved is skipped, not an error.
+        path.with_name(f"{path.name}.bak{backup_count}").unlink(missing_ok=True)
+        for i in range(backup_count - 1, 0, -1):
+            src = path.with_name(f"{path.name}.bak{i}")
+            dst = path.with_name(f"{path.name}.bak{i + 1}")
+            if src.exists():
+                try:
+                    _replace_with_retry(src, dst)
+                except FileNotFoundError:
+                    pass
+        if backed_up:
+            _replace_with_retry(bak1_new, bak1)
 
-    # Rotate: drop oldest first, then walk down toward live.
-    oldest = path.with_name(f"{path.name}.bak{backup_count}")
-    if oldest.exists():
-        oldest.unlink()
-    for i in range(backup_count - 1, 0, -1):
-        src = path.with_name(f"{path.name}.bak{i}")
-        dst = path.with_name(f"{path.name}.bak{i + 1}")
-        if src.exists():
-            _replace_with_retry(src, dst)
-    if backed_up:
-        _replace_with_retry(bak1_new, bak1)
+        _replace_with_retry(new_path, path)
 
-    _replace_with_retry(new_path, path)
-
-    # M-9: fsync the parent directory so the rename is durable, not just
-    # atomic. POSIX guarantees os.replace's atomicity but not that the
-    # directory entry has flushed to disk. On power loss between the
-    # replace and the dir-block flush, the file may revert to the prior
-    # name — the .bak rotation already preserves data, but durability
-    # of the rename itself matters for the chain to behave correctly.
-    if os.name == "posix":
-        try:
-            dir_fd = os.open(str(path.parent), os.O_DIRECTORY)
-        except OSError:
-            return
-        try:
-            os.fsync(dir_fd)
-        except OSError:
-            pass
-        finally:
-            os.close(dir_fd)
+        # M-9: fsync the parent directory so the rename is durable, not just
+        # atomic. POSIX guarantees os.replace's atomicity but not that the
+        # directory entry has flushed to disk. On power loss between the
+        # replace and the dir-block flush, the file may revert to the prior
+        # name — the .bak rotation already preserves data, but durability
+        # of the rename itself matters for the chain to behave correctly.
+        if os.name == "posix":
+            try:
+                dir_fd = os.open(str(path.parent), os.O_DIRECTORY)
+            except OSError:
+                return
+            try:
+                os.fsync(dir_fd)
+            except OSError:
+                pass
+            finally:
+                os.close(dir_fd)
 
 
 def save_with_backup(path: Path, data: Any, backup_count: int = 3) -> None:

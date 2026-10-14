@@ -6,6 +6,7 @@ import ast
 import errno
 import json
 import os
+import re
 import shutil
 import stat
 import sys
@@ -346,6 +347,14 @@ def _fd_name(fd: int, root: Path) -> str:
     return "<unknown>"
 
 
+_TEMP_TAG = re.compile(r"\.t\d+-[0-9a-f]+-[0-9a-f]+(?=\.(?:bak1\.)?new$)")
+
+
+def _norm(name: str) -> str:
+    """x.json.t123-ab12-cd34.bak1.new -> x.json.bak1.new (per-save temp names, #389)."""
+    return "->".join(_TEMP_TAG.sub("", part) for part in name.split("->"))
+
+
 class _Recorder:
     """hook(phase, op, name) runs before and after each mutation under root; it may raise.
 
@@ -356,8 +365,11 @@ class _Recorder:
         self.root = root
         self.hook = hook
         self.events: list[tuple[str, str, str]] = []
+        self.real: dict[str, str] = {}  # normalised name -> the real file name last seen
 
     def _fire(self, phase: str, op: str, name: str) -> None:
+        self.real[_norm(name)] = name
+        name = _norm(name)
         self.events.append((phase, op, name))
         if self.hook is not None:
             self.hook(phase, op, name)
@@ -541,10 +553,10 @@ def test_crash_at_every_step_leaves_a_complete_live_file(tmp_path: Path, monkeyp
         data, anomaly = attempt_heal(p, _default)
         if anomaly is not None or data["v"] != live:
             problems.append(f"{label}: heal saw anomaly={anomaly} data={data}")
-        if (d / "x.json.bak1.new").exists():
+        if list(d.glob("*.bak1.new")):
             left_bak1_new += 1
         save_with_backup_text(p, _payload(7))
-        if (d / "x.json.new").exists() or (d / "x.json.bak1.new").exists():
+        if list(d.glob("*.new")):
             problems.append(f"{label}: next save left a stale temp")
         if _version(p) != 7 or _version(d / "x.json.bak1") != live:
             problems.append(f"{label}: next save chain wrong")
@@ -567,7 +579,7 @@ def test_crash_at_every_step_leaves_a_complete_live_file(tmp_path: Path, monkeyp
         monkeypatch.undo()
         if str(info.value) == "after open x.json.bak1.new":
             # A real kill runs no cleanup code, so the empty temp must still be there.
-            if not (d / "x.json.bak1.new").exists():
+            if not list(d.glob("*.bak1.new")):
                 problems.append(f"crash at #{j}: cleanup ran for a simulated kill")
         check(d, f"crash at #{j} ({info.value})")
 
@@ -621,8 +633,7 @@ def test_backup_chain_matches_model_for_each_count(tmp_path: Path, count: int) -
     for i in range(1, kept + 1):
         assert _version(tmp_path / f"x.json.bak{i}") == n_saves - i
     assert not (tmp_path / f"x.json.bak{kept + 1}").exists()
-    assert not (tmp_path / "x.json.new").exists()
-    assert not (tmp_path / "x.json.bak1.new").exists()
+    assert not list(tmp_path.glob("*.new"))
 
 
 def test_transient_permission_error_at_every_replace_is_retried(
@@ -671,7 +682,7 @@ def test_transient_permission_error_inside_backup_copy_is_retried(
     real_open, real_copystat = os.open, shutil.copystat
 
     def os_open(path, flags, *args, **kwargs):
-        if Path(path).name != "x.json.bak1.new" or fired["n"]:
+        if not Path(path).name.endswith(".bak1.new") or fired["n"]:
             return real_open(path, flags, *args, **kwargs)
         if point == "before_create":
             fired["n"] += 1
@@ -684,7 +695,7 @@ def test_transient_permission_error_inside_backup_copy_is_retried(
         return real_open(path, flags, *args, **kwargs)
 
     def copystat(src, dst, **kwargs):
-        if point == "at_copystat" and not fired["n"] and Path(dst).name == "x.json.bak1.new":
+        if point == "at_copystat" and not fired["n"] and Path(dst).name.endswith(".bak1.new"):
             fired["n"] += 1
             raise PermissionError(32, "busy")
         return real_copystat(src, dst, **kwargs)
@@ -695,7 +706,7 @@ def test_transient_permission_error_inside_backup_copy_is_retried(
     monkeypatch.undo()
     assert fired["n"] == 1, "the injection point was never reached"
     assert _version(p) == 6 and _version(tmp_path / "x.json.bak1") == 5
-    assert not (tmp_path / "x.json.bak1.new").exists()
+    assert not list(tmp_path.glob("*.new"))
 
 
 def test_persistent_failure_of_final_replace_leaves_old_live_and_intact_chain(
@@ -757,7 +768,7 @@ def test_fsync_of_new_file_and_backup_copy_precede_their_replaces(
 
     def hook(phase: str, op: str, name: str) -> None:
         if phase == "before" and op == "fsync" and name.endswith(".new"):
-            seen[name] = (tmp_path / name).read_bytes()
+            seen[name] = (tmp_path / rec.real[name]).read_bytes()
 
     rec = _Recorder(monkeypatch, tmp_path, hook)
     rec.install()
@@ -789,9 +800,9 @@ def test_backup_is_byte_exact_and_keeps_mode_and_mtime(tmp_path: Path, monkeypat
     modes: list[int] = []
 
     def hook(phase: str, op: str, name: str) -> None:
-        tmp = tmp_path / "x.json.bak1.new"
-        if phase == "after" and tmp.exists():
-            modes.append(stat.S_IMODE(tmp.stat().st_mode))
+        if phase == "after":
+            for tmp in tmp_path.glob("*.bak1.new"):
+                modes.append(stat.S_IMODE(tmp.stat().st_mode))
 
     _Recorder(monkeypatch, tmp_path, hook).install()
     old_umask = os.umask(0) if os.name != "nt" else 0  # so a wide creation mode is not masked off
@@ -833,9 +844,9 @@ def test_failed_backup_copy_leaves_chain_untouched(tmp_path: Path, monkeypatch, 
     monkeypatch.undo()
     assert info.value.errno == errno.ENOSPC
     assert {n: (tmp_path / n).read_bytes() for n in names} == before
-    assert not (tmp_path / "x.json.bak1.new").exists()
+    assert not list(tmp_path.glob("*.new"))  # the failed save cleaned its own temps
     save_with_backup_text(p, _payload(6))
-    assert not (tmp_path / "x.json.new").exists()
+    assert not list(tmp_path.glob("*.new"))
     assert _version(p) == 6 and _version(tmp_path / "x.json.bak1") == 5
 
 
@@ -870,7 +881,7 @@ def test_new_file_is_written_in_text_mode_exactly_like_write_text(
     real_open = Path.open
 
     def spy(self, *args, **kwargs):
-        if self.name == "x.json.new":
+        if self.name.endswith(".new") and not self.name.endswith(".bak1.new"):
             calls.append((args, kwargs))
         return real_open(self, *args, **kwargs)
 
@@ -908,4 +919,129 @@ def test_unreadable_live_file_fails_loud_and_changes_nothing(tmp_path: Path, mon
     finally:
         p.chmod(0o644)
     assert {n: (tmp_path / n).read_bytes() for n in names} == before
-    assert not (tmp_path / "x.json.bak1.new").exists()
+    assert not list(tmp_path.glob("*.new"))
+
+
+# ---- #389: concurrent savers of one path must not share a temp file ----
+
+
+def _dead_pid() -> int:
+    import subprocess
+
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return proc.pid
+
+
+def test_stale_temps_are_removed_by_pattern_but_not_a_live_writers_temp(tmp_path: Path) -> None:
+    """C9b: leftovers of dead or older processes (and of this process when not in flight) go;
+    a temp owned by another live process stays; other files' temps are never touched."""
+    p = tmp_path / "x.json"
+    _seed(p)
+    nonce = heal._PROCESS_NONCE
+    stale = [
+        f"x.json.t{_dead_pid()}-aaaa1111-0123456789ab.new",  # dead process
+        f"x.json.t{_dead_pid()}-aaaa1111-0123456789ab.bak1.new",
+        f"x.json.t{os.getpid()}-bbbb2222-0123456789ab.new",  # our pid, older process (pid reused)
+        f"x.json.t{os.getpid()}-{nonce}-0123456789ab.new",  # this process, not in flight
+        "x.json.new",  # pre-#389 fixed names
+        "x.json.bak1.new",
+    ]
+    live_other = f"x.json.t{os.getppid()}-cccc3333-0123456789ab.new"  # another live process
+    untouched = ["y.json.t999999-aaaa1111-0123456789ab.new", "x.json.t1-zz.new", "x.json.keep"]
+    for name in [*stale, live_other, *untouched]:
+        (tmp_path / name).write_text("leftover", encoding="utf-8")
+    save_with_backup_text(p, _payload(6))
+    for name in stale:
+        assert not (tmp_path / name).exists(), name
+    for name in [live_other, *untouched]:
+        assert (tmp_path / name).exists(), name
+    assert _version(p) == 6 and _version(tmp_path / "x.json.bak1") == 5
+
+
+def test_a_second_save_during_a_save_leaves_the_first_ones_temp_alone(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """C15a (deterministic): a whole save of the same path runs while another save has its temp
+    file written but not yet published. The inner save must not remove or reuse that temp, so
+    the outer save completes (the old shared `.new` made it raise FileNotFoundError)."""
+    p = tmp_path / "x.json"
+    _seed(p)
+    state = {"ran": False, "outer_temp_survived": None}
+
+    def hook(phase: str, op: str, name: str) -> None:
+        if state["ran"] or (phase, op, name) != ("after", "fsync", "x.json.new"):
+            return
+        state["ran"] = True
+        outer_temps = {t.name for t in tmp_path.glob("*.new")}
+        save_with_backup_text(p, _payload(7))  # the other writer, start to finish
+        state["outer_temp_survived"] = outer_temps <= {t.name for t in tmp_path.glob("*.new")}
+
+    _Recorder(monkeypatch, tmp_path, hook).install()
+    save_with_backup_text(p, _payload(6))
+    monkeypatch.undo()
+    assert state["ran"] and state["outer_temp_survived"] is True
+    assert _version(p) == 6  # the outer save published last
+    assert not list(tmp_path.glob("*.new"))
+    for i in (1, 2, 3):
+        _version(tmp_path / f"x.json.bak{i}")  # each backup is a complete version
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="on Windows a writer copying the live file makes another writer's replace wait on "
+    "the bounded retry; the deterministic test above carries the property there",
+)
+@pytest.mark.parametrize("run", [1, 2, 3])
+def test_concurrent_savers_of_one_path_raise_nothing_and_never_expose_a_gap(
+    tmp_path: Path, monkeypatch, run
+) -> None:
+    """C15b: 4 threads x 150 saves of one path. No save raises (the old shared temp names made
+    savers raise FileNotFoundError), a polling reader never sees the file missing or partial,
+    and no temp is left behind."""
+    p = tmp_path / "x.json"
+    save_with_backup_text(p, _payload(0))
+    monkeypatch.setattr(os, "fsync", lambda fd: None)  # durability does not change the race
+    errors: list[BaseException] = []
+    stop = threading.Event()
+    stats = {"reads": 0, "missing": 0, "bad": 0}
+
+    def writer(k: int) -> None:
+        try:
+            for n in range(150):
+                save_with_backup_text(p, _payload(k * 1000 + n))
+        except BaseException as exc:  # noqa: BLE001 - the test reports whatever escaped
+            errors.append(exc)
+
+    def poll() -> None:
+        while not stop.is_set():
+            try:
+                json.loads(p.read_text(encoding="utf-8"))["v"]
+                stats["reads"] += 1
+            except FileNotFoundError:
+                stats["missing"] += 1
+            except (ValueError, KeyError, OSError):
+                stats["bad"] += 1
+
+    old_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    reader = threading.Thread(target=poll)
+    reader.start()
+    writers = [threading.Thread(target=writer, args=(k,)) for k in range(1, 5)]
+    try:
+        for t in writers:
+            t.start()
+        for t in writers:
+            t.join()
+    finally:
+        stop.set()
+        reader.join()
+        sys.setswitchinterval(old_interval)
+    assert not errors, [repr(e) for e in errors[:3]]
+    assert stats["reads"] > 100 and stats["missing"] == 0 and stats["bad"] == 0, stats
+    assert not list(tmp_path.glob("*.new"))
+    _version(p)
+    for i in (1, 2, 3):
+        bak = tmp_path / f"x.json.bak{i}"
+        if bak.exists():
+            _version(bak)
