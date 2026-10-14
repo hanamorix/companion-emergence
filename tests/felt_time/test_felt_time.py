@@ -489,3 +489,15 @@ def test_arc_cap_is_stable_and_idempotent_across_ticks(tmp_path):
         ft = FeltTime(persona_dir=tmp_path)
         ft.tick(_neutral_ctx(f"2026-10-01T{minute}:00+00:00"))
         assert [a.label for a in ft.get_state().arc_anchors] == first
+
+
+def test_event_stamped_exactly_at_last_tick_is_not_folded_again(tmp_path):
+    """The anchor scan is strictly newer than the last tick: a row stamped at the
+    last tick was already seen by that tick and must not reset pressure again."""
+    _append_event(tmp_path, "dream", "x", "2026-10-01T10:05:00+00:00")
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-10-01T10:05:00+00:00"))  # folds the dream, zeroes pressure
+    assert ft.get_state().pressure.heartbeats == 0
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-10-01T10:20:00+00:00"))
+    assert ft.get_state().pressure.heartbeats == 1
