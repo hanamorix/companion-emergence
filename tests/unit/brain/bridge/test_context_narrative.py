@@ -463,12 +463,19 @@ def test_c1_a_hostile_role_cannot_add_a_line() -> None:
     assert body.split("\n")[1] == 'A weird role" note: "x"'
 
 
-def test_c4_an_unlocalisable_ts_is_dropped_not_raised() -> None:
-    from brain.bridge.provider import _narrative_time
+def test_c4_an_unlocalisable_ts_is_dropped_not_raised(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ts that parses but has no local equivalent must not crash prompt assembly.
 
-    assert _narrative_time("0001-01-01T00:00:00") == ""
+    Only some host timezones overflow on year 1, so the seam is forced to raise instead of relying on the host.
+    """
+
+    def _boom(_ts: str) -> str:
+        raise OverflowError("date value out of range")
+
+    monkeypatch.setattr(provider, "local_display", _boom)
+    assert provider._narrative_time("2026-05-20T10:00:00Z") == ""
     [line] = _lines(
-        [ChatMessage(role="user", content="a", ts="0001-01-01T00:00:00")], user_name="Hana"
+        [ChatMessage(role="user", content="a", ts="2026-05-20T10:00:00Z")], user_name="Hana"
     )
     assert line == 'Hana said: "a"'
 
