@@ -786,8 +786,11 @@ def _reset_reranker_provider_cache() -> None:
 # as every rerank.
 
 # Clock seam: `rerank_timed` reads elapsed time through this name so tests can
-# inject a scripted clock (criterion C1a). Production: `time.monotonic`.
-_clock: Callable[[], float] = time.monotonic
+# inject a scripted clock (criterion C1a). Production: `time.perf_counter`, not
+# `time.monotonic`: on Windows (Python 3.12) `monotonic` ticks every ~15.6 ms, so a
+# fast scoring call reads 0.00 s, the time fit gets a rate of 0 and the RAM ladder's
+# batch phase never runs. `perf_counter` has a sub-microsecond tick on every OS.
+_clock: Callable[[], float] = time.perf_counter
 
 # Cold-cache timing trap ([[single-shot-timing-cold-cache-trap]]): the first
 # rerank() calls on a freshly-constructed provider pay ONNX session warm-up

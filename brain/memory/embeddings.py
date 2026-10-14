@@ -43,8 +43,10 @@ _DEFAULT_DIM = 256
 
 
 # Clock seam for the in-lock timings (`embed_batch_timed`, `token_lengths_timed`;
-# name-recall fix S108, round-3 N3-1). Production: `time.monotonic`.
-_clock: Callable[[], float] = time.monotonic
+# name-recall fix S108, round-3 N3-1). Production: `time.perf_counter` (not
+# `time.monotonic`, which ticks every ~15.6 ms on Windows under Python 3.12, so a
+# fast call would read 0 s and feed the time model nothing).
+_clock: Callable[[], float] = time.perf_counter
 
 
 class EmbeddingProvider(ABC):

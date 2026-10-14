@@ -923,8 +923,9 @@ def rank_and_gate(
 # results are assembled across paragraphs (`assemble_paragraph_results`).
 
 # Clock seam for the per-message budget (T_m, T_s, the embed calls).
-# Production: `time.monotonic`. Tests script it.
-_clock: Callable[[], float] = time.monotonic
+# Production: `time.perf_counter` (not `time.monotonic`, which ticks every ~15.6 ms
+# on Windows under Python 3.12 and would round the embed timings to 0). Tests script it.
+_clock: Callable[[], float] = time.perf_counter
 
 # The keyword selector's word pattern (`brain.chat.prompt._extract_recall_tokens`,
 # `brain.memory.known_names`): a paragraph's words for the emptiness test.
