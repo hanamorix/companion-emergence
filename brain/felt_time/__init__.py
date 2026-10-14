@@ -134,9 +134,12 @@ class FeltTime:
         # pressure (only the timestamp-newer new_anchors above do).
         arc_anchors = list(self._state.arc_anchors)
         folded_upto = max((i for i in map(_arc_log_index, arc_anchors) if i is not None), default=0)
-        new_arc_anchors = [
-            a for a in all_anchors if a.type == "arc" and (_arc_log_index(a) or 0) > folded_upto
-        ]
+        new_arc_anchors = sorted(
+            (a for a in all_anchors if a.type == "arc" and (_arc_log_index(a) or 0) > folded_upto),
+            key=lambda a: _arc_log_index(a) or 0,  # log order, so the cap evicts the oldest-appended
+        )
+        # Known limit: if arcs.log.jsonl were ever replaced by a shorter log, folding pauses
+        # until it grows past folded_upto. Nothing in brain/ rotates or truncates it.
         arc_anchors.extend(new_arc_anchors)
         if len(arc_anchors) > _ARC_ANCHOR_CAP:
             arc_anchors = arc_anchors[-_ARC_ANCHOR_CAP:]

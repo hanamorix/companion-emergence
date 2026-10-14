@@ -432,19 +432,25 @@ def test_arc_opened_with_seed_time_stamp_is_folded_once(tmp_path):
     ft.tick(_neutral_ctx("2026-10-01T10:15:00+00:00"))
     assert ft.get_state().pressure.heartbeats == 1  # accumulating, no anchor this tick
 
-    # Narrative pass opens the arc later, stamped with the seed's own time.
+    # Narrative pass opens the arc later, stamped with the seed's own time, and a
+    # later close is logged too (both appended after the last tick).
     _write_arc_event(tmp_path, "arc_opened", "Thread A", "2026-10-01T10:00:00+00:00")
+    _write_arc_event(tmp_path, "arc_closed", "Thread A", "2026-10-01T10:12:00+00:00")
 
     ft = FeltTime(persona_dir=tmp_path)
     ft.tick(_neutral_ctx("2026-10-01T10:20:00+00:00"))
     state = ft.get_state()
-    assert [a.label for a in state.arc_anchors] == ["Thread A"]
+    assert [(a.label, a.event_type) for a in state.arc_anchors] == [
+        ("Thread A", "arc_opened"),
+        ("Thread A", "arc_closed"),
+    ]
     assert state.anchors["arc"] == state.arc_anchors[-1]
-    assert state.pressure.heartbeats == 2  # NOT reset by the late arc fold-in
+    # Both rows are stamped before the last tick (10:15), so neither resets pressure.
+    assert state.pressure.heartbeats == 2
 
     ft = FeltTime(persona_dir=tmp_path)
     ft.tick(_neutral_ctx("2026-10-01T10:35:00+00:00"))
-    assert len(ft.get_state().arc_anchors) == 1
+    assert len(ft.get_state().arc_anchors) == 2
     assert ft.get_state().pressure.heartbeats == 3
 
 
@@ -501,3 +507,36 @@ def test_event_stamped_exactly_at_last_tick_is_not_folded_again(tmp_path):
     ft = FeltTime(persona_dir=tmp_path)
     ft.tick(_neutral_ctx("2026-10-01T10:20:00+00:00"))
     assert ft.get_state().pressure.heartbeats == 1
+
+
+def test_arc_event_newer_than_last_tick_resets_pressure(tmp_path):
+    """Unchanged rule, pinned: an arc event stamped after the last tick is a new anchor
+    and zeroes pressure like any other anchor."""
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-10-01T10:00:00+00:00"))
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-10-01T10:15:00+00:00"))
+    assert ft.get_state().pressure.heartbeats == 2
+    _write_arc_event(tmp_path, "arc_closed", "Thread A", "2026-10-01T10:20:00+00:00")
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-10-01T10:30:00+00:00"))
+    assert ft.get_state().pressure == PressureCounters()
+    assert len(ft.get_state().arc_anchors) == 1
+
+
+def test_arc_cap_evicts_by_log_order_even_when_timestamps_disagree(tmp_path):
+    """Selection and eviction follow log position: the last-appended event (stamped
+    oldest) is kept by the cap and not re-folded on the next tick."""
+    for i in range(24):
+        _write_arc_event(
+            tmp_path, "arc_opened", f"Thread {i:02d}", f"2026-09-{i + 1:02d}T10:00:00+00:00"
+        )
+    _write_arc_event(tmp_path, "arc_opened", "LATE", "2026-08-01T10:00:00+00:00")  # 25th, oldest stamp
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-10-01T10:00:00+00:00"))
+    first = [a.label for a in ft.get_state().arc_anchors]
+    assert len(first) == 20
+    assert first[-1] == "LATE"  # newest by log position, last in the list
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-10-01T10:15:00+00:00"))
+    assert [a.label for a in ft.get_state().arc_anchors] == first
