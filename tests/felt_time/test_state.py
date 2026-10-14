@@ -463,3 +463,67 @@ def test_tolerant_reader_still_loads_unknown_and_missing_fields(tmp_path):
     assert recovered is False
     assert loaded.lived_age_hours == 4.0
     assert loaded.anchors["dream"].event_type == ""
+
+
+# ---------------------------------------------------------------------------
+# Missing state file: same read-only backup walk (the save-time rotation window)
+# ---------------------------------------------------------------------------
+
+
+def test_missing_state_uses_good_bak1(tmp_path):
+    """save_with_backup renames live -> .bak1 before the new file lands, so a reader in
+    that window finds no main file and a good .bak1."""
+    _persist_generations(tmp_path, [5.0, 7.0])  # main=7, .bak1=5
+    (tmp_path / "felt_time_state.json").unlink()
+    _dream_log(tmp_path)  # logs exist too: the backup must still win over replay
+    loaded, recovered = load_or_recover(tmp_path)
+    assert loaded.lived_age_hours == 5.0
+    assert recovered is True
+    assert loaded.replayed is False
+
+
+def test_missing_state_walks_past_a_bad_bak1(tmp_path):
+    _persist_generations(tmp_path, [3.0, 5.0, 7.0])
+    (tmp_path / "felt_time_state.json").unlink()
+    _corrupt(tmp_path / "felt_time_state.json.bak1")
+    loaded, _ = load_or_recover(tmp_path)
+    assert loaded.lived_age_hours == 3.0
+
+
+def test_missing_state_with_all_baks_bad_replays_from_logs(tmp_path):
+    _persist_generations(tmp_path, [3.0, 5.0, 7.0])
+    (tmp_path / "felt_time_state.json").unlink()
+    _corrupt(tmp_path / "felt_time_state.json.bak1")
+    _corrupt(tmp_path / "felt_time_state.json.bak2")
+    _dream_log(tmp_path)
+    loaded, recovered = load_or_recover(tmp_path)
+    assert recovered is True and loaded.replayed is True
+    assert loaded.lived_age_hours == 0.0
+    assert loaded.anchors["dream"].label == "from the log"
+
+
+def test_brand_new_persona_without_backups_is_unchanged(tmp_path):
+    loaded, recovered = load_or_recover(tmp_path)  # nothing at all
+    assert (loaded.lived_age_hours, recovered, loaded.replayed) == (0.0, True, False)
+    _dream_log(tmp_path)  # logs but no state and no backups: replay, as before
+    loaded, recovered = load_or_recover(tmp_path)
+    assert recovered is True and loaded.replayed is True
+    assert loaded.anchors["dream"].label == "from the log"
+
+
+def test_missing_state_walk_writes_nothing(tmp_path):
+    from brain.felt_time import FeltTime
+    from brain.felt_time.tool import felt_time_now
+
+    _persist_generations(tmp_path, [5.0, 7.0])
+    (tmp_path / "felt_time_state.json").unlink()
+
+    def snapshot():
+        return {p.name: p.read_bytes() for p in sorted(tmp_path.iterdir())}
+
+    before = snapshot()
+    load_or_recover(tmp_path)
+    FeltTime(persona_dir=tmp_path).get_state()
+    felt_time_now(persona_dir=tmp_path)
+    assert snapshot() == before
+    assert not (tmp_path / "felt_time_state.json").exists()

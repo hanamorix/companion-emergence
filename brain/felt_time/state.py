@@ -219,22 +219,23 @@ def load_or_recover(persona_dir: Path) -> tuple[FeltTimeState, bool]:
 
     - State file parses and is well-typed: loaded as-is. Newer anchor-log rows are
       NOT a reason to discard it; the next FeltTime.tick folds them in (#384).
-    - State file corrupt (unparseable or a wrong-typed field): walk .bak1, .bak2,
-      .bak3 without touching them; the first good one is used as saved. None good:
-      treated as a lost file, below.
-    - State file missing (or lost, per above), anchor logs exist: replayed from the
-      logs (lived age 0.0, the recovery honesty contract).
-    - Nothing to recover from: cold start.
+    - State file missing or corrupt (unparseable or a wrong-typed field): walk .bak1,
+      .bak2, .bak3 without touching them; the first good one is used as saved.
+    - No good state file or backup, anchor logs exist: replayed from the logs (lived
+      age 0.0, the recovery honesty contract).
+    - Nothing to recover from (a brand-new persona): cold start.
     """
     state_file = persona_dir / STATE_FILENAME
-    if state_file.exists():
-        state = _read_state_file(state_file)
-        if state is not None:
-            return state, False
-        for i in range(1, BACKUP_COUNT + 1):
-            bak = state_file.with_name(f"{state_file.name}.bak{i}")
-            if bak.exists() and (state := _read_state_file(bak)) is not None:
-                return state, True
+    # _read_state_file is None for a missing, unreadable or corrupt file alike. A missing
+    # main file is not "no state": save_with_backup renames live -> .bak1 just before the
+    # new file lands, so a reader in that window must still find the backups.
+    state = _read_state_file(state_file)
+    if state is not None:
+        return state, False
+    for i in range(1, BACKUP_COUNT + 1):
+        bak = state_file.with_name(f"{state_file.name}.bak{i}")
+        if (state := _read_state_file(bak)) is not None:
+            return state, True
 
     if _newest_log_ts(persona_dir) is not None:
         from brain.felt_time import _replay_from_logs  # local import avoids cycle
