@@ -1062,7 +1062,7 @@ _FACTOR = dev_constants.RAM_FIT_SAFETY_FACTOR  # the shipped value, read at impo
 @pytest.fixture
 def shipped_factor(monkeypatch) -> float:
     monkeypatch.setattr(dev_constants, "RAM_FIT_SAFETY_FACTOR", _FACTOR)
-    assert 1.0777 <= _FACTOR < 1.0778
+    assert 1.1658 <= _FACTOR < 1.1659
     return _FACTOR
 
 
@@ -1125,7 +1125,7 @@ def test_the_phase_two_rungs_are_sized_by_the_prediction_times_the_factor(tmp_pa
 
     bare = pass_at("bare.db", 1.0, None)
     scaled = pass_at("scaled.db", _FACTOR, None)
-    assert 1.0777 <= _FACTOR < 1.0778 and bare > 0.0 and scaled == pytest.approx(bare * _FACTOR, rel=1e-9)
+    assert 1.1658 <= _FACTOR < 1.1659 and bare > 0.0 and scaled == pytest.approx(bare * _FACTOR, rel=1e-9)
     # the stop is decided on the scaled figure: between the two the first batch rung does not run, at the scaled figure it does
     stopped = pass_at("stop.db", _FACTOR, (bare + scaled) / 2.0)
     assert [pairs for pairs, _length in stopped.timed if pairs > 1] == []

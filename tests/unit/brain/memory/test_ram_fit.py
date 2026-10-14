@@ -321,11 +321,11 @@ _SHIPPED_FACTOR = dev_constants.RAM_FIT_SAFETY_FACTOR  # read at import: the sui
 
 
 def test_the_shipped_factor_is_one_over_one_minus_the_largest_measured_underestimate() -> None:
-    assert dev_constants.RAM_FIT_LARGEST_UNDERESTIMATE == 0.0721
-    assert _SHIPPED_FACTOR == 1.0 / (1.0 - 0.0721)
-    assert 1.0777 <= _SHIPPED_FACTOR < 1.0778
+    assert dev_constants.RAM_FIT_LARGEST_UNDERESTIMATE == 0.14227
+    assert _SHIPPED_FACTOR == 1.0 / (1.0 - 0.14227)
+    assert 1.1658 <= _SHIPPED_FACTOR < 1.1659
     # a prediction scaled by it covers the largest underestimate: measured = predicted / (1 - U) <= predicted * factor
-    assert 100.0 * (1.0 - 0.0721) * _SHIPPED_FACTOR == pytest.approx(100.0)
+    assert 100.0 * (1.0 - 0.14227) * _SHIPPED_FACTOR == pytest.approx(100.0)
 
 
 def test_the_factor_is_a_dev_constant_with_its_measurement_provenance_not_a_tunable() -> None:
@@ -333,7 +333,7 @@ def test_the_factor_is_a_dev_constant_with_its_measurement_provenance_not_a_tuna
 
     source = inspect.getsource(dev_constants)
     block = source[source.index("RAM fit safety factor") : source.index("RAM_FIT_SAFETY_FACTOR: float")]
-    for word in ("2026-10-13", "FRESH process", "78 runs", "6 replicates", "7.21%", "7 pairs x 300 tokens", "S255-REPORT.md", "F37"):
+    for word in ("2026-10-13", "2026-10-14", "FRESH process", "LONG-LIVED process", "78 runs", "6 replicates", "7 replicates", "7.21%", "14.23%", "7 pairs x 300 tokens", "S255-REPORT.md", "S260-REPORT.md", "larger of the two", "1.197"):
         assert word in block, word
     assert not [name for name in tunables._registry if "ram_fit" in name or "safety_factor" in name]  # noqa: SLF001
 

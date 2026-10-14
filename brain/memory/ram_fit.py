@@ -41,9 +41,9 @@ Derived rules (no tuned constants):
   applies to a window that fails those conditions. With the S245 marker rule a window the ladder
   completes always holds such a batch; the cap is the defence for a marked window that does not
   (one recorded by an earlier build, or by any other writer of the marker).
-* A batch is SIZED by `RamFit.sized`, the prediction times a fixed safety factor measured once
-  (`dev_constants.RAM_FIT_SAFETY_FACTOR`, S255): the fit under-predicts some unseen shapes by up to
-  about 7 percent, so a prediction is never compared with the free memory unscaled.
+* A batch is SIZED by `RamFit.sized`, the prediction times a fixed safety factor measured twice, the larger shipped
+  (`dev_constants.RAM_FIT_SAFETY_FACTOR`, S255, S260): the fit under-predicts some unseen shapes by up to
+  about 14 percent, so a prediction is never compared with the free memory unscaled.
 * Arithmetic is exact (`fractions.Fraction`): the design columns reach 1e9 and the normal
   equations are badly conditioned in floating point.
 """
