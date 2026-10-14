@@ -111,33 +111,19 @@ def _newest_log_ts(persona_dir: Path) -> str | None:
     return newest
 
 
-def load_or_recover(persona_dir: Path) -> tuple[FeltTimeState, bool]:
-    """Returns (state, recovered_from_logs).
+def _state_from_data(data: object) -> FeltTimeState:
+    """Build a FeltTimeState from parsed JSON. Raises ValueError, TypeError,
+    AttributeError or KeyError when the data is not a well-typed state (a wrong-typed
+    field counts as corrupt). Pure: touches no files."""
+    if not isinstance(data, dict):
+        raise TypeError("felt-time state is not a JSON object")
+    for key in ("last_tick_ts", "first_tick_ts"):
+        if data.get(key) is not None and not isinstance(data[key], str):
+            raise TypeError(f"{key} is not a string")
+    weather_baselines = data.get("weather_baselines") or {}
+    if not isinstance(weather_baselines, dict):
+        raise TypeError("weather_baselines is not an object")
 
-    - State file parses: loaded as-is, recovered False. Newer anchor-log rows are
-      NOT a reason to discard it; the next FeltTime.tick folds them in.
-    - State file missing, anchor logs exist: replayed from the logs (lived age 0.0,
-      the recovery honesty contract), recovered True.
-    - State file missing with no logs, or unparseable: cold start, recovered True.
-    """
-    state_file = persona_dir / STATE_FILENAME
-    if not state_file.exists():
-        if _newest_log_ts(persona_dir) is not None:
-            from brain.felt_time import _replay_from_logs  # local import avoids cycle
-
-            return _replay_from_logs(persona_dir), True
-        return FeltTimeState.cold_start(), True
-
-    try:
-        data = json.loads(state_file.read_text())
-    except (OSError, json.JSONDecodeError):
-        return FeltTimeState.cold_start(), True
-
-    # A state file that parses is authoritative. Anchor-log rows newer than
-    # last_tick_ts are the NORMAL case between ticks (other subsystems append to
-    # those logs); FeltTime.tick folds them in via scan_since(last_tick_ts).
-    # Replaying here would reset lived age to 0.0 (#384).
-    # Deserialise horizon_pressure
     raw_hp = data.get("horizon_pressure") or {}
     horizon_pressure = {
         k: HorizonBucket(
@@ -148,7 +134,6 @@ def load_or_recover(persona_dir: Path) -> tuple[FeltTimeState, bool]:
         for k, v in raw_hp.items()
     }
 
-    # Deserialise arc_anchors
     raw_arcs = data.get("arc_anchors") or []
     arc_anchors = [from_known_fields(Anchor, a) for a in raw_arcs]
 
@@ -164,8 +149,50 @@ def load_or_recover(persona_dir: Path) -> tuple[FeltTimeState, bool]:
         pressure=from_known_fields(PressureCounters, data.get("pressure") or {}),
         last_tick_ts=data.get("last_tick_ts"),
         first_tick_ts=data.get("first_tick_ts"),
-        weather_baselines=data.get("weather_baselines") or {},
+        weather_baselines=weather_baselines,
         replayed=bool(data.get("replayed", False)),
         horizon_pressure=horizon_pressure,
         arc_anchors=arc_anchors,
-    ), False
+    )
+
+
+def _read_state_file(path: Path) -> FeltTimeState | None:
+    """Read-only: the well-typed state in `path`, or None when it is unreadable,
+    unparseable or wrong-typed."""
+    try:
+        return _state_from_data(json.loads(path.read_text()))
+    except (OSError, ValueError, TypeError, AttributeError, KeyError):
+        return None
+
+
+BACKUP_COUNT = 3  # save_with_backup's default rotation: .bak1 (newest) .. .bak3
+
+
+def load_or_recover(persona_dir: Path) -> tuple[FeltTimeState, bool]:
+    """Returns (state, recovered). recovered is False only for a clean load of the
+    live state file. Read-only: nothing here writes (only FeltTime.tick persists).
+
+    - State file parses and is well-typed: loaded as-is. Newer anchor-log rows are
+      NOT a reason to discard it; the next FeltTime.tick folds them in (#384).
+    - State file corrupt (unparseable or a wrong-typed field): walk .bak1, .bak2,
+      .bak3 without touching them; the first good one is used as saved. None good:
+      treated as a lost file, below.
+    - State file missing (or lost, per above), anchor logs exist: replayed from the
+      logs (lived age 0.0, the recovery honesty contract).
+    - Nothing to recover from: cold start.
+    """
+    state_file = persona_dir / STATE_FILENAME
+    if state_file.exists():
+        state = _read_state_file(state_file)
+        if state is not None:
+            return state, False
+        for i in range(1, BACKUP_COUNT + 1):
+            bak = state_file.with_name(f"{state_file.name}.bak{i}")
+            if bak.exists() and (state := _read_state_file(bak)) is not None:
+                return state, True
+
+    if _newest_log_ts(persona_dir) is not None:
+        from brain.felt_time import _replay_from_logs  # local import avoids cycle
+
+        return _replay_from_logs(persona_dir), True
+    return FeltTimeState.cold_start(), True

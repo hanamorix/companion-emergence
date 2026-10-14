@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from brain.felt_time.state import (
     Anchor,
     FeltTimeState,
@@ -254,3 +256,164 @@ def test_load_seeds_arc_anchors_from_existing_arc_anchor(tmp_path):
     state, _ = load_or_recover(tmp_path)
     assert len(state.arc_anchors) == 1
     assert state.arc_anchors[0].label == "The Long Work"
+
+
+# ---------------------------------------------------------------------------
+# Corrupt state file: read-only .bak walk, then log replay (#384, Planning ruling)
+# ---------------------------------------------------------------------------
+
+
+def _persist_generations(tmp_path, ages):
+    """Persist one state per age, oldest first, so .bak1 is the previous one."""
+    for age in ages:
+        persist(FeltTimeState(lived_age_hours=age, last_tick_ts="2026-05-17T20:00:00+00:00"), tmp_path)
+
+
+def _corrupt(path):
+    path.write_text("{not valid json")
+
+
+def _dream_log(tmp_path):
+    (tmp_path / "dreams.log.jsonl").write_text(
+        '{"ts": "2026-05-17T21:00:00+00:00", "summary": "from the log"}\n'
+    )
+
+
+def test_corrupt_state_uses_good_bak1(tmp_path):
+    _persist_generations(tmp_path, [5.0, 7.0])  # main=7.0, .bak1=5.0
+    _corrupt(tmp_path / "felt_time_state.json")
+    loaded, recovered = load_or_recover(tmp_path)
+    assert loaded.lived_age_hours == 5.0
+    assert recovered is True  # not a clean load of the live file
+    assert loaded.replayed is False  # restored from a backup, not rebuilt from logs
+
+
+def test_corrupt_state_and_bad_bak1_uses_bak2(tmp_path):
+    _persist_generations(tmp_path, [3.0, 5.0, 7.0])  # main=7, .bak1=5, .bak2=3
+    _corrupt(tmp_path / "felt_time_state.json")
+    _corrupt(tmp_path / "felt_time_state.json.bak1")
+    loaded, _ = load_or_recover(tmp_path)
+    assert loaded.lived_age_hours == 3.0
+
+
+def test_corrupt_state_walks_to_bak3(tmp_path):
+    _persist_generations(tmp_path, [1.0, 3.0, 5.0, 7.0])  # .bak3=1
+    for name in ("", ".bak1", ".bak2"):
+        _corrupt(tmp_path / f"felt_time_state.json{name}")
+    loaded, _ = load_or_recover(tmp_path)
+    assert loaded.lived_age_hours == 1.0
+
+
+def test_corrupt_state_with_all_baks_bad_replays_from_logs(tmp_path):
+    _persist_generations(tmp_path, [3.0, 5.0, 7.0])
+    for name in ("", ".bak1", ".bak2"):
+        _corrupt(tmp_path / f"felt_time_state.json{name}")
+    _dream_log(tmp_path)
+    loaded, recovered = load_or_recover(tmp_path)
+    assert recovered is True
+    assert loaded.replayed is True
+    assert loaded.lived_age_hours == 0.0
+    assert loaded.anchors["dream"].label == "from the log"
+
+
+def test_corrupt_state_with_no_baks_and_no_logs_cold_starts(tmp_path):
+    _corrupt(tmp_path / "felt_time_state.json")
+    loaded, recovered = load_or_recover(tmp_path)
+    assert recovered is True
+    assert loaded.lived_age_hours == 0.0
+    assert loaded.anchors == {}
+
+
+def test_corrupt_state_with_no_baks_replays_from_logs(tmp_path):
+    _corrupt(tmp_path / "felt_time_state.json")
+    _dream_log(tmp_path)
+    loaded, recovered = load_or_recover(tmp_path)
+    assert recovered is True
+    assert loaded.replayed is True
+    assert loaded.anchors["dream"].label == "from the log"
+
+
+_WRONG_TYPED = [
+    {"lived_age_hours": None},
+    {"lived_age_hours": "a lot"},
+    {"anchors": {"dream": "not a dict"}},
+    {"anchors": [1, 2]},
+    {"pressure": "x"},
+    {"arc_anchors": [3]},
+    {"arc_anchors": "x"},
+    {"horizon_pressure": {"week": 5}},
+    {"horizon_pressure": [1]},
+    {"last_tick_ts": 12345},
+    {"weather_baselines": [1]},
+]
+
+
+@pytest.mark.parametrize("bad", _WRONG_TYPED, ids=lambda b: next(iter(b)) + "=" + repr(next(iter(b.values())))[:12])
+def test_wrong_typed_field_is_corrupt_not_a_raise(tmp_path, bad):
+    """A parseable file with a wrong-typed field takes the corrupt path: good .bak wins."""
+    _persist_generations(tmp_path, [5.0, 7.0])
+    data = json.loads((tmp_path / "felt_time_state.json").read_text())
+    data.update(bad)
+    (tmp_path / "felt_time_state.json").write_text(json.dumps(data))
+    loaded, _ = load_or_recover(tmp_path)  # must not raise
+    assert loaded.lived_age_hours == 5.0
+
+
+def test_wrong_typed_field_without_baks_falls_back_to_logs_or_cold_start(tmp_path):
+    persist(FeltTimeState(lived_age_hours=7.0), tmp_path)
+    data = json.loads((tmp_path / "felt_time_state.json").read_text())
+    data["lived_age_hours"] = None
+    (tmp_path / "felt_time_state.json").write_text(json.dumps(data))
+    loaded, recovered = load_or_recover(tmp_path)  # no raise, no logs -> cold start
+    assert (loaded.lived_age_hours, recovered) == (0.0, True)
+    _dream_log(tmp_path)
+    loaded, recovered = load_or_recover(tmp_path)  # with logs -> replay
+    assert loaded.replayed is True and recovered is True
+
+
+def test_wrong_typed_field_with_newer_log_row_does_not_raise(tmp_path):
+    """The regression the #384 fix would otherwise introduce: before it, a newer log
+    row sent a parseable-but-wrong-typed file to replay; the fix removed that bypass,
+    so this must not raise on load."""
+    persist(FeltTimeState(lived_age_hours=7.0, last_tick_ts="2026-05-17T20:00:00+00:00"), tmp_path)
+    data = json.loads((tmp_path / "felt_time_state.json").read_text())
+    data["lived_age_hours"] = None
+    (tmp_path / "felt_time_state.json").write_text(json.dumps(data))
+    _dream_log(tmp_path)
+    loaded, recovered = load_or_recover(tmp_path)
+    assert recovered is True and loaded.lived_age_hours == 0.0
+
+
+def test_corrupt_paths_write_nothing(tmp_path):
+    """C13 extended: the .bak walk and the replay fallback are read-only. Every file,
+    including the corrupt ones and the backups, is byte-identical afterwards."""
+    from brain.felt_time import FeltTime
+    from brain.felt_time.tool import felt_time_now
+
+    _persist_generations(tmp_path, [3.0, 5.0, 7.0])
+    _corrupt(tmp_path / "felt_time_state.json")
+    _corrupt(tmp_path / "felt_time_state.json.bak1")
+    _dream_log(tmp_path)
+
+    def snapshot():
+        return {p.name: p.read_bytes() for p in sorted(tmp_path.iterdir())}
+
+    before = snapshot()
+    load_or_recover(tmp_path)
+    FeltTime(persona_dir=tmp_path).get_state()
+    felt_time_now(persona_dir=tmp_path)
+    assert snapshot() == before
+
+
+def test_newest_good_backup_wins_over_older_ones(tmp_path):
+    _persist_generations(tmp_path, [3.0, 5.0, 7.0])  # main=7, .bak1=5, .bak2=3 (both baks good)
+    _corrupt(tmp_path / "felt_time_state.json")
+    loaded, _ = load_or_recover(tmp_path)
+    assert loaded.lived_age_hours == 5.0  # .bak1 before .bak2
+
+
+def test_non_object_json_state_is_corrupt(tmp_path):
+    _persist_generations(tmp_path, [5.0, 7.0])
+    (tmp_path / "felt_time_state.json").write_text("[1, 2, 3]")
+    loaded, _ = load_or_recover(tmp_path)
+    assert loaded.lived_age_hours == 5.0
