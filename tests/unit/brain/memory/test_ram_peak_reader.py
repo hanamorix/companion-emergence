@@ -120,16 +120,21 @@ def test_the_failure_is_warned_once(monkeypatch, tmp_path, caplog) -> None:
 
 
 def _touch(megabytes: int):
-    import numpy as np
+    """Resident memory whose release to the OS is deterministic: an anonymous mapping, touched page
+    by page, that `.close()` unmaps at once. A heap block (numpy, bytearray) is not: whether `free`
+    gives it back depends on the allocator and on how fragmented the process heap already is."""
+    import mmap
 
-    array = np.ones(megabytes * 1024 * 1024 // 8, dtype=np.float64)  # written: pages resident
-    return array
+    mapping = mmap.mmap(-1, megabytes * 1024 * 1024)
+    for offset in range(0, len(mapping), mmap.PAGESIZE):
+        mapping[offset] = 1  # written: the page is resident
+    return mapping
 
 
 @_linux_only
 def test_a_real_allocation_inside_a_call_shows_as_peak_growth_and_not_as_rss_difference() -> None:
     """The old reader (RSS after minus before) reads ~0 for a call that returns its memory:
-    this call allocates and frees 200 MB, like the reranker with the memory pool off."""
+    this call allocates and releases 200 MB, like the reranker with the memory pool off."""
     import psutil
 
     if not peak_rss.available():
@@ -139,7 +144,7 @@ def test_a_real_allocation_inside_a_call_shows_as_peak_growth_and_not_as_rss_dif
     assert before is not None
     rss_before = process.memory_info().rss
     block = _touch(200)
-    del block
+    block.close()  # unmapped: the memory goes straight back to the OS, whatever the heap looks like
     rss_after = process.memory_info().rss
     growth = peak_rss.growth_since(before)
     assert growth is not None
@@ -153,12 +158,12 @@ def test_a_stale_peak_is_reset_by_begin() -> None:
     if not peak_rss.available():
         pytest.skip("the peak counter cannot be reset here")
     old = _touch(300)
-    del old
+    old.close()
     before = peak_rss.begin()
     assert before is not None
     small = _touch(50)
     growth = peak_rss.growth_since(before)
-    del small
+    small.close()
     assert growth is not None
     assert 40 * 1024 * 1024 <= growth < 150 * 1024 * 1024, growth
 
