@@ -28,6 +28,7 @@ from brain.bridge.provider import LLMProvider
 from brain.chat import say_vs_do
 from brain.chat.budget import apply_budget
 from brain.chat.prompt import (
+    _load_user_name,
     build_static_system_message,
     build_volatile_context,
 )
@@ -329,13 +330,17 @@ def _respond_inner(
     # stream turns this threads the per-turn context to the provider so it lands
     # in the stdin tail (after history) instead of the frozen system prompt, and
     # signals the provider to drop the now-relocated clock line from the top of
-    # the JSONL context block (include_block_clock=False). Empty on image turns
+    # the context block (include_block_clock=False). Empty on image turns
     # (volatile stays in the system message) → no behavioural change there.
     chat_options: dict = {}
     if volatile_suffix is not None:
         chat_options["volatile_suffix"] = volatile_suffix
         chat_options["include_block_clock"] = False
         chat_options["session_id"] = session.session_id
+        # #227: history lines name the person Nell is talking to (the human when unset).
+        user_name = _load_user_name(persona_dir)
+        if user_name:
+            chat_options["user_name"] = user_name
 
     response, invocations = run_tool_loop(
         messages,

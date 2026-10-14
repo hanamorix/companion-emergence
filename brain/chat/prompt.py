@@ -405,7 +405,7 @@ def build_volatile_context(
     (its second-person reboot must ride recency over the first-person interior
     above it — see monologue_prompts.build_reply_frame). The ambient clock
     anchor and its elapsed-time explainer travel together as one unit just
-    before it, having moved out of the JSONL context block's top (so the only
+    before it, having moved out of the context block's top (so the only
     per-call-changing byte no longer sits above the whole history).
     """
     persona_name = persona_dir.name
@@ -524,7 +524,7 @@ def build_volatile_context(
     # is now the last directive in the tail, as intended.
 
     # 8b. Ambient clock anchor + elapsed-time explainer (moved here from the top
-    # of the JSONL context block). Worded as ambient context, not an instruction,
+    # of the context block). Worded as ambient context, not an instruction,
     # and kept as one unit just before the reply frame.
     parts.append(_build_ambient_clock_block())
 
@@ -554,19 +554,19 @@ def _build_ambient_clock_block(now=None) -> str:
     """Render the ambient 'now' anchor + elapsed-time explainer for the tail.
 
     Replaces the block-level ``Current time:`` line that used to sit at the top
-    of the JSONL context block (provider._format_claude_context_block). That one
+    of the narrative context block (provider._format_claude_context_block). That one
     line was recomputed every call and, sitting above the whole transcript,
     pushed the cache first-difference point above the entire history. Moved to
-    the volatile tail it stops busting the history prefix. Per-message ``ts``
-    values in the JSONL are unaffected.
+    the volatile tail it stops busting the history prefix. Per-message times
+    in the context lines are unaffected.
     """
     from datetime import UTC, datetime
 
     now_iso = format_local(now or datetime.now(UTC))  # tz-local-display: ambient "[current time: ...]" tail anchor
     return (
         f"[current time: {now_iso}]\n"
-        "Each conversation entry's `ts` above is the wall-clock time that message "
-        "was sent; use it to gauge how much time has passed."
+        "The time at the start of each conversation line above (where shown) is when that "
+        "message was sent; use it to gauge how much time has passed."
     )
 
 

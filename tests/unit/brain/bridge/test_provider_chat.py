@@ -217,7 +217,7 @@ def test_claude_cli_chat_text_only_still_uses_p_flag() -> None:
     assert "stream-json" not in cmd
 
 
-def test_claude_cli_chat_multi_turn_uses_jsonl_context_not_role_labels() -> None:
+def test_claude_cli_chat_multi_turn_uses_narrative_lines_not_role_labels() -> None:
     """Multi-turn -p prompts must not prime Claude with User:/Assistant: labels.
 
     Prompt is piped via stdin (off argv) — read it from `input=` kwarg.
@@ -237,14 +237,15 @@ def test_claude_cli_chat_multi_turn_uses_jsonl_context_not_role_labels() -> None
     prompt = mock_run.call_args.kwargs["input"]
     assert "User:" not in prompt
     assert "Assistant:" not in prompt
-    assert "Conversation context is encoded below as JSONL data" in prompt
+    assert "What has been said so far is below, one line per message" in prompt
+    assert "JSONL" not in prompt
     assert "Do not prefix the reply" in prompt
-    records = [json.loads(line) for line in prompt.splitlines() if line.startswith("{")]
-    assert [record["speaker"] for record in records] == ["human", "companion", "human"]
-    assert [record["text"] for record in records] == [
-        "hey nell",
-        "i am here",
-        "what do you remember?",
+    assert not any(line.startswith("{") for line in prompt.splitlines())
+    said = [line for line in prompt.splitlines() if " said: " in line]
+    assert said == [
+        'The human said: "hey nell"',
+        'You said: "i am here"',
+        'The human said: "what do you remember?"',
     ]
 
 
