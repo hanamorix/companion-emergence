@@ -529,8 +529,10 @@ def test_c12_deliberate_bypass_types_write_direct(persona):
 def test_c14_temp_marker_present():
     from pathlib import Path
 
+    # Anchored to this file, not the working directory: pytest can start anywhere (#377).
+    repo = Path(__file__).resolve().parents[1]
     for f in ("brain/memory/pending.py", "brain/engines/consolidation.py"):
-        text = Path(f).read_text()
+        text = (repo / f).read_text(encoding="utf-8")
         assert "TEMP (Root 2 stopgap" in text
 
 

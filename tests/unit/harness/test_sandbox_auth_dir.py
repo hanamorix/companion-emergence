@@ -153,7 +153,9 @@ def test_synthetic_home_has_no_keychain_link_off_darwin(
 def test_setup_script_logs_in_as_the_synthetic_user() -> None:
     """macOS stores the CLI credential with account=$USER and looks it up by $USER; the sandbox runs
     the CLI as ``SYNTHETIC_USER``, so the one-time login must happen under that name (#236)."""
-    script = Path("scripts/setup_harness_claude_login.sh").read_text(encoding="utf-8")
+    # Anchored to this file (tests/unit/harness/ -> repo root), not the working directory (#377).
+    repo = Path(__file__).resolve().parents[3]
+    script = (repo / "scripts" / "setup_harness_claude_login.sh").read_text(encoding="utf-8")
     assert "from tests.harness.config import SYNTHETIC_USER" in script
     assert 'export USER="$SYN_USER" LOGNAME="$SYN_USER"' in script
     assert script.index("export USER=") < script.index("claude auth login")
