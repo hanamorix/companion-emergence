@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -201,3 +204,86 @@ def test_stale_rotator_does_not_clobber_the_backup(
 
     surviving = "".join(p.read_text(encoding="utf-8") for p in (backup, log_path) if p.exists())
     assert old_rows in surviving
+
+
+def test_rotation_rechecks_size_after_taking_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#357: a writer that waited on the lock must look again before renaming.
+
+    A rotates and a new row lands in a fresh log while B queues for the lock.
+    Once B has the lock the log is small again, so the re-check must skip the
+    rename; without it B renames the fresh log over ``.1`` and the old rows
+    are gone. (The test above only covers the order where B holds the lock
+    first.)
+    """
+    monkeypatch.setattr(audit, "_MAX_LOG_BYTES", 100)
+    log_path = tmp_path / "tool_invocations.log.jsonl"
+    backup = log_path.with_name(log_path.name + ".1")
+    old_rows = "old-row-" + "x" * 200 + "\n"
+    log_path.write_text(old_rows, encoding="utf-8")
+    real_file_lock = audit.file_lock
+
+    @contextmanager
+    def lock_taken_after_peer_rotated(path: Path, **kwargs: Any) -> Iterator[bool]:
+        with real_file_lock(path, **kwargs) as acquired:
+            path.replace(backup)  # what A did before releasing the lock
+            path.write_text("new-row\n", encoding="utf-8")
+            yield acquired
+
+    monkeypatch.setattr(audit, "file_lock", lock_taken_after_peer_rotated)
+
+    audit._rotate_if_needed(log_path)
+
+    assert backup.read_text(encoding="utf-8") == old_rows
+    assert log_path.read_text(encoding="utf-8") == "new-row\n"
+
+
+def test_rotation_still_happens_when_the_lock_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A lock that cannot be taken must not turn rotation off for good.
+
+    On a filesystem where the lock call raises (some network mounts), skipping
+    rotation lets the log grow without bound. The worst case should be the
+    pre-#357 race, not no rotation at all.
+    """
+    monkeypatch.setattr(audit, "_MAX_LOG_BYTES", 100)
+    log_path = tmp_path / "tool_invocations.log.jsonl"
+    backup = log_path.with_name(log_path.name + ".1")
+    old_rows = "old-row-" + "x" * 200 + "\n"
+    log_path.write_text(old_rows, encoding="utf-8")
+
+    @contextmanager
+    def unavailable(path: Path, **kwargs: Any) -> Iterator[bool]:
+        raise OSError(37, "No locks available")
+        yield True  # pragma: no cover - makes this a generator
+
+    monkeypatch.setattr(audit, "file_lock", unavailable)
+
+    with caplog.at_level(logging.WARNING, logger=audit.logger.name):
+        audit._rotate_if_needed(log_path)
+
+    assert backup.read_text(encoding="utf-8") == old_rows
+    assert not log_path.exists()
+    assert "without a lock" in caplog.text
+
+
+def test_failed_rename_under_the_lock_is_still_swallowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Falling back on a lock error must not also retry a rename that failed."""
+    monkeypatch.setattr(audit, "_MAX_LOG_BYTES", 100)
+    log_path = tmp_path / "tool_invocations.log.jsonl"
+    log_path.write_text("x" * 200, encoding="utf-8")
+    renames: list[Path] = []
+
+    def boom(self: Path, target: Any) -> Any:
+        renames.append(self)
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Path, "replace", boom)
+
+    audit._rotate_if_needed(log_path)  # must not raise
+
+    assert len(renames) == 1

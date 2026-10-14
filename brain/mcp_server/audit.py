@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from contextlib import ExitStack
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -77,11 +78,19 @@ def _rotate_if_needed(log_path: Path) -> None:
     under it (#357): a writer that saw an oversize log must not rename the
     fresh one a concurrent rotator left behind over ``.1``. The size check
     first runs unlocked so the common no-rotation append takes no lock.
+
+    If the lock itself cannot be taken (some network filesystems raise from
+    flock), rotate anyway: the worst case is the pre-#357 race, whereas
+    skipping would let the log grow without bound.
     """
     try:
         if not _needs_rotation(log_path):
             return
-        with file_lock(log_path):
+        with ExitStack() as held:
+            try:
+                held.enter_context(file_lock(log_path))
+            except OSError as exc:
+                logger.warning("audit log lock unavailable, rotating without a lock: %s", exc)
             if _needs_rotation(log_path):
                 # replace() overwrites an existing .1 atomically on every OS.
                 log_path.replace(log_path.with_name(f"{log_path.name}.1"))
