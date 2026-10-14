@@ -345,6 +345,21 @@ _WRONG_TYPED = [
     {"horizon_pressure": [1]},
     {"last_tick_ts": 12345},
     {"weather_baselines": [1]},
+    {"first_tick_ts": 7},
+    {"last_tick_ts": "garbage"},
+    {"first_tick_ts": "garbage"},
+    {"lived_age_hours": True},
+    {"lived_age_hours": "5"},
+    {"lived_age_hours": -5.0},
+    {"lived_age_hours": 1e999},  # JSON parses this to inf
+    {"lived_age_hours": 10**400},  # float() overflows
+    {"pressure": {"heartbeats": "a"}},
+    {"pressure": {"heartbeats": None}},
+    {"horizon_pressure": {"week": {"counters": {"heartbeats": "x"}}}},
+    {"horizon_pressure": {"week": {"period_start_ts": 5}}},
+    {"arc_anchors": [{"type": "arc", "ts": "2026-05-17T20:00:00+00:00", "label": "t", "source_ref": None}]},
+    {"arc_anchors": [{"type": "arc", "ts": "2026-05-17T20:00:00+00:00", "label": "t", "source_ref": 3}]},
+    {"anchors": {"dream": {"type": "dream", "ts": 5, "label": "t", "source_ref": "x"}}},
 ]
 
 
@@ -417,3 +432,34 @@ def test_non_object_json_state_is_corrupt(tmp_path):
     (tmp_path / "felt_time_state.json").write_text("[1, 2, 3]")
     loaded, _ = load_or_recover(tmp_path)
     assert loaded.lived_age_hours == 5.0
+
+
+def test_deeply_nested_json_state_is_corrupt_not_a_raise(tmp_path):
+    _persist_generations(tmp_path, [5.0, 7.0])
+    (tmp_path / "felt_time_state.json").write_text("[" * 100000)
+    loaded, _ = load_or_recover(tmp_path)
+    assert loaded.lived_age_hours == 5.0
+
+
+def test_tolerant_reader_still_loads_unknown_and_missing_fields(tmp_path):
+    """#286 tolerance preserved by the stricter validation: unknown extra keys load, missing optional keys default."""
+    persist(FeltTimeState(lived_age_hours=4.0, last_tick_ts="2026-05-17T20:00:00+00:00"), tmp_path)
+    path = tmp_path / "felt_time_state.json"
+    data = json.loads(path.read_text())
+    data["field_from_a_newer_brain"] = {"x": 1}
+    data.pop("horizon_pressure")
+    data.pop("first_tick_ts")
+    data["anchors"] = {
+        "dream": {
+            "type": "dream",
+            "ts": "2026-05-17T19:00:00Z",
+            "label": "l",
+            "source_ref": "d:1",
+            "future_key": 1,
+        }
+    }
+    path.write_text(json.dumps(data))
+    loaded, recovered = load_or_recover(tmp_path)
+    assert recovered is False
+    assert loaded.lived_age_hours == 4.0
+    assert loaded.anchors["dream"].event_type == ""
