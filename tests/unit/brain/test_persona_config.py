@@ -106,12 +106,12 @@ def test_save_round_trip(tmp_path: Path) -> None:
 def test_save_is_atomic(tmp_path: Path) -> None:
     """save() writes via .new + os.replace — no partial file on crash mid-write.
 
-    Verified indirectly: after save() returns, no .new file remains.
+    Verified indirectly: after save() returns, no per-save temp (*.new) file remains.
     """
     path = tmp_path / "persona_config.json"
     PersonaConfig(provider="claude-cli", searcher="ddgs").save(path)
     assert path.exists()
-    assert not path.with_suffix(path.suffix + ".new").exists()
+    assert not list(path.parent.glob("*.new"))
 
 
 # ---- Bug A (audit-3): user_name field ----

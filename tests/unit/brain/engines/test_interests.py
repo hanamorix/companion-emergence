@@ -165,9 +165,9 @@ def test_interestset_save_atomic(tmp_path: Path):
     path = tmp_path / "interests.json"
     s = InterestSet(interests=(Interest.from_dict(_sample_dict()),))
     s.save(path)
-    # File exists + valid JSON + .new tempfile cleaned up
+    # File exists + valid JSON + per-save temp files cleaned up
     assert path.exists()
-    assert not (path.with_suffix(path.suffix + ".new")).exists()
+    assert not list(path.parent.glob("*.new"))
     reloaded = InterestSet.load(path, default_path=DEFAULT_INTERESTS_PATH)
     assert reloaded.interests[0].id == "abc-123"
 

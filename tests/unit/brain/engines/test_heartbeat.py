@@ -290,9 +290,8 @@ def test_heartbeat_state_save_is_atomic(tmp_path: Path) -> None:
     s = HeartbeatState.fresh(trigger="init")
     s.save(path)
     assert path.exists()
-    # .new temp must be cleaned up
-    temp_path = path.with_suffix(path.suffix + ".new")
-    assert not temp_path.exists()
+    # per-save temp files (*.new) must be cleaned up
+    assert not list(path.parent.glob("*.new"))
 
 
 def test_heartbeat_state_save_overwrites_existing(tmp_path: Path) -> None:
@@ -1469,8 +1468,8 @@ def test_heartbeat_config_save_is_atomic(tmp_path: Path) -> None:
     path = tmp_path / "cfg.json"
     HeartbeatConfig(dream_every_hours=12.0, reflex_enabled=False).save(path)
     assert path.exists()
-    # .new temp must not linger after save
-    assert not path.with_suffix(path.suffix + ".new").exists()
+    # per-save temp files (*.new) must not linger after save
+    assert not list(path.parent.glob("*.new"))
     # Reloads cleanly with tuned values preserved
     loaded = HeartbeatConfig.load(path)
     assert loaded.dream_every_hours == 12.0
