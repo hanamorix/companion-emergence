@@ -240,3 +240,141 @@ def test_run_pass_exempts_memory_under_soul_review_through_real_candidates_file(
         "run_pass→soul.candidates composition is broken"
     )
     assert summary["exempt"] >= 1
+
+
+def _old_low_salience_memory(persona_dir) -> str:
+    """An old, emotionless, never-recalled memory: the shape forgetting fades."""
+    persist_felt_time(
+        FeltTimeState(lived_age_hours=100.0, last_tick_ts="2026-05-18T00:00:00+00:00"),
+        persona_dir,
+    )
+    store = MemoryStore(persona_dir / "memories.db")
+    m = Memory.create_new(
+        content="a moment the soul review accepted",
+        memory_type="monologue_soul_candidate",
+        domain="monologue",
+        emotions={},
+    )
+    object.__setattr__(m, "created_at", datetime.now(UTC) - timedelta(days=40))
+    store.create(m)
+    store.close()
+    return m.id
+
+
+def _accept_candidate_for_real(persona_dir, memory_id: str) -> str:
+    """Queue a candidate and accept it through the REAL review code.
+
+    Uses ``queue_soul_candidate`` for the record shape and ``_apply_accept``
+    for the accept (it mutates the record to ``accepted`` and creates the
+    Crystallization), then writes ``soul_candidates.jsonl`` back the way the
+    review pass does. Nothing here injects ids into forgetting. Returns the
+    crystallization id.
+    """
+    import json
+
+    from brain.ingest.soul_queue import queue_soul_candidate
+    from brain.ingest.types import ExtractedItem
+    from brain.soul.review import Decision, _apply_accept
+    from brain.soul.store import SoulStore
+
+    queue_soul_candidate(
+        persona_dir,
+        memory_id=memory_id,
+        item=ExtractedItem(
+            text="a moment the soul review accepted", label="observation", importance=9
+        ),
+        session_id="monologue",
+    )
+    path = persona_dir / "soul_candidates.jsonl"
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+    decision = Decision(
+        candidate_id=memory_id,
+        decision="accept",
+        confidence=9,
+        reasoning="test accept",
+        why_it_matters="test",
+    )
+    soul_store = SoulStore(str(persona_dir / "crystallizations.db"))
+    try:
+        crystallization_id = _apply_accept(records[0], decision, soul_store, dry_run=False)
+    finally:
+        soul_store.close()
+    path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+    assert crystallization_id is not None
+    return crystallization_id
+
+
+def test_run_pass_exempts_soul_crystallised_memory_through_real_files(tmp_path):
+    """CANARY (#362) — pins run_pass → _load_soul_linked_ids → the crystallised
+    leg against a REAL accepted candidate + a REAL active Crystallization.
+
+    History: forgetting imported ``brain.soul.audit.list_crystallised_memory_ids``,
+    which was never defined; the fail-soft ``except Exception`` swallowed the
+    ImportError, so ``crystallised_ids`` was always empty and a memory the soul
+    review accepted faded like any other. ``tests/forgetting/test_policy.py``
+    passes ids in directly, so nothing composed this path.
+    """
+    memory_id = _old_low_salience_memory(tmp_path)
+    _accept_candidate_for_real(tmp_path, memory_id)
+
+    summary = run_pass(tmp_path, event_bus=MagicMock())
+
+    store = MemoryStore(tmp_path / "memories.db")
+    row = store._conn.execute("SELECT state FROM memories WHERE id = ?", (memory_id,)).fetchone()
+    store.close()
+    assert row["state"] == "active", (
+        "a memory the soul review accepted must be exempt from forgetting — "
+        "the run_pass→soul crystallised composition is broken"
+    )
+    assert summary["exempt"] >= 1
+    assert summary["faded"] == 0
+
+
+def test_run_pass_forgets_memory_whose_crystallisation_was_revoked(tmp_path):
+    """#362 decision (2026-10-13): a revoked crystallisation stops protecting its
+    source memory — revoke is Hana ruling "this is not a soul moment", and the
+    under-review docstring already says terminal statuses become forgettable.
+
+    ``revoke_crystallization`` only touches crystallizations.db; the candidate
+    record stays ``accepted`` — so the exemption has to consult the store.
+    """
+    from brain.soul.revoke import revoke_crystallization
+    from brain.soul.store import SoulStore
+
+    memory_id = _old_low_salience_memory(tmp_path)
+    crystallization_id = _accept_candidate_for_real(tmp_path, memory_id)
+    soul_store = SoulStore(str(tmp_path / "crystallizations.db"))
+    try:
+        assert revoke_crystallization(soul_store, crystallization_id, "no longer true") is not None
+    finally:
+        soul_store.close()
+
+    run_pass(tmp_path, event_bus=MagicMock())
+
+    store = MemoryStore(tmp_path / "memories.db")
+    row = store._conn.execute("SELECT state FROM memories WHERE id = ?", (memory_id,)).fetchone()
+    store.close()
+    assert row["state"] == "fading", "a revoked crystallisation must not keep protecting the memory"
+
+
+def test_load_soul_linked_ids_logs_instead_of_swallowing(tmp_path, monkeypatch, caplog):
+    """#362: both fail-soft handlers stay fail-soft (empty set, no crash) but must
+    say so — the silent swallow is what hid the dead crystallised leg."""
+    import logging
+
+    import brain.soul.candidates as candidates
+    from brain.forgetting import _load_soul_linked_ids
+
+    def _boom(_persona_dir):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(candidates, "list_crystallised_memory_ids", _boom)
+    monkeypatch.setattr(candidates, "list_under_review_memory_ids", _boom)
+
+    with caplog.at_level(logging.WARNING, logger="brain.forgetting"):
+        crystallised, under_review = _load_soul_linked_ids(tmp_path)
+
+    assert (crystallised, under_review) == (set(), set())
+    messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("crystallised" in m for m in messages), messages
+    assert any("under-review" in m for m in messages), messages
