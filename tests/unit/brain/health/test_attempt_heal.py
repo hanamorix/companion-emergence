@@ -347,7 +347,9 @@ def _fd_name(fd: int, root: Path) -> str:
 
 
 class _Recorder:
-    """hook(phase, op, name) runs before and after each mutation under root; it may raise."""
+    """hook(phase, op, name) runs before and after each mutation under root; it may raise.
+
+    Path.unlink goes through os.unlink, so wrapping os.unlink/os.remove covers both."""
 
     def __init__(self, monkeypatch, root: Path, hook=None) -> None:
         self.mp = monkeypatch
@@ -368,7 +370,7 @@ class _Recorder:
 
     def install(self) -> None:
         real_replace, real_fsync, real_open = os.replace, os.fsync, os.open
-        real_unlink = Path.unlink
+        real_os_unlink = os.unlink
         rec = self
 
         def replace(src, dst):
@@ -387,12 +389,12 @@ class _Recorder:
             real_fsync(fd)
             rec._fire("after", "fsync", name)
 
-        def unlink(self, missing_ok=False):
-            if not rec._inside(self):
-                return real_unlink(self, missing_ok=missing_ok)
-            rec._fire("before", "unlink", self.name)
-            real_unlink(self, missing_ok=missing_ok)
-            rec._fire("after", "unlink", self.name)
+        def os_unlink(path, *args, **kwargs):
+            if not rec._inside(path):
+                return real_os_unlink(path, *args, **kwargs)
+            rec._fire("before", "unlink", Path(path).name)
+            real_os_unlink(path, *args, **kwargs)
+            rec._fire("after", "unlink", Path(path).name)
 
         def os_open(path, flags, *args, **kwargs):
             writable = flags & (os.O_WRONLY | os.O_RDWR)
@@ -411,7 +413,8 @@ class _Recorder:
         self.mp.setattr(os, "replace", replace)
         self.mp.setattr(os, "fsync", fsync)
         self.mp.setattr(os, "open", os_open)
-        self.mp.setattr(Path, "unlink", unlink)
+        self.mp.setattr(os, "unlink", os_unlink)
+        self.mp.setattr(os, "remove", os_unlink)
 
 
 def _record_one_save(monkeypatch, tmp_path: Path, name: str) -> list[tuple[str, str, str]]:
@@ -643,6 +646,7 @@ def test_transient_permission_error_at_every_replace_is_retried(
             if Path(dst).parent == d:
                 calls["n"] += 1
                 if calls["n"] == n:
+                    calls["fired"] = True
                     raise PermissionError(32, "The process cannot access the file")
             return real_replace(src, dst)
 
@@ -650,6 +654,7 @@ def test_transient_permission_error_at_every_replace_is_retried(
         save_with_backup_text(p, _payload(6))
         monkeypatch.undo()
         monkeypatch.setattr(heal.time, "sleep", lambda _s: None)
+        assert calls.get("fired"), f"replace #{n} was never reached"
         assert _version(p) == 6 and _version(d / "x.json.bak1") == 5, f"replace #{n}"
 
 
@@ -761,7 +766,9 @@ def test_fsync_of_new_file_and_backup_copy_precede_their_replaces(
     order = [(op, name) for phase, op, name in rec.events if phase == "before"]
     assert ("fsync", "x.json.new") in order, order
     assert order.index(("fsync", "x.json.new")) < order.index(("replace", "x.json.new->x.json"))
-    assert seen["x.json.new"] == text.encode("utf-8")
+    ref = tmp_path / "ref.txt"
+    ref.write_text(text, encoding="utf-8")  # text-mode newlines, as on every platform
+    assert seen["x.json.new"] == ref.read_bytes()
     assert ("fsync", "x.json.bak1.new") in order, order
     assert order.index(("fsync", "x.json.bak1.new")) < order.index(
         ("replace", "x.json.bak1.new->x.json.bak1")

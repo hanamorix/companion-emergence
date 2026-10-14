@@ -228,9 +228,10 @@ def _retry_perm(action: Callable[[], Any]) -> Any:
     Windows refuses to rename a file another handle has open (WinError 32).
     The supervisor reads persona_config.json inside its ticks in the same
     process as the settings writer, so a save can collide with a read (#200).
-    Mirrors brain.ingest.buffer._unlink_with_retry: never triggers on POSIX,
-    re-raises after the budget so a real permission problem still fails loud.
-    ``action`` must be safe to run again from the top.
+    Mirrors brain.ingest.buffer._unlink_with_retry: a transient failure is
+    retried, and a persistent one (on POSIX that means a real permission
+    problem, which burns the whole ~1.4 s budget) is re-raised so it still
+    fails loud. ``action`` must be safe to run again from the top.
     """
     for attempt in range(_REPLACE_RETRIES):
         try:
