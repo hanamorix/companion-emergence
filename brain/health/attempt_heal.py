@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
+import stat
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -220,41 +222,101 @@ _REPLACE_RETRIES = 8
 _REPLACE_RETRY_SLEEP_S = 0.05
 
 
-def _replace_with_retry(src: Path, dst: Path) -> None:
-    """os.replace with a short bounded retry on transient PermissionError.
+def _retry_perm(action: Callable[[], Any]) -> Any:
+    """Run ``action`` with a short bounded retry on transient PermissionError.
 
     Windows refuses to rename a file another handle has open (WinError 32).
     The supervisor reads persona_config.json inside its ticks in the same
     process as the settings writer, so a save can collide with a read (#200).
     Mirrors brain.ingest.buffer._unlink_with_retry: never triggers on POSIX,
     re-raises after the budget so a real permission problem still fails loud.
+    ``action`` must be safe to run again from the top.
     """
     for attempt in range(_REPLACE_RETRIES):
         try:
-            os.replace(src, dst)
-            return
+            return action()
         except PermissionError:
             if attempt == _REPLACE_RETRIES - 1:
                 raise
             time.sleep(_REPLACE_RETRY_SLEEP_S * (attempt + 1))
 
 
+def _replace_with_retry(src: Path, dst: Path) -> None:
+    """os.replace with a short bounded retry on transient PermissionError (#200)."""
+    _retry_perm(lambda: os.replace(src, dst))
+
+
+def _copy_for_backup(src: Path, dst: Path) -> bool:
+    """Copy ``src`` to ``dst`` (a temp name) for the backup chain; True if a copy was made.
+
+    The live file is copied, never renamed, so the live path is never absent
+    (#387). The copy keeps the source's mode (it may hold a token) from the
+    moment it is created, and its mtime, as the old rename did; the data is
+    fsynced so a backup is as durable as the file it replaces. Each retry
+    attempt starts from a fresh temp, so a half-made copy cannot make the next
+    attempt fail with something other than PermissionError. A source that has
+    vanished means there is nothing to back up. Any other failure removes the
+    partial temp and re-raises; the caller has not rotated anything yet.
+    """
+
+    def attempt() -> bool:
+        dst.unlink(missing_ok=True)
+        try:
+            src_file = open(src, "rb")
+        except FileNotFoundError:
+            return False
+        with src_file:
+            mode = stat.S_IMODE(os.fstat(src_file.fileno()).st_mode)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0)
+            with os.fdopen(os.open(dst, flags, mode), "wb") as out:
+                shutil.copyfileobj(src_file, out)
+                out.flush()
+                os.fsync(out.fileno())
+        shutil.copystat(src, dst)
+        return True
+
+    try:
+        return _retry_perm(attempt)
+    except Exception:
+        try:
+            dst.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 def save_with_backup_text(path: Path, text: str, backup_count: int = 3) -> None:
     """Atomic raw-text save with .bak rotation.
 
-    Writes <path>.new, rotates existing <path> → <path>.bak1 → ... → <path>.bak{N},
-    drops oldest, then atomically replaces <path>. Stale <path>.new from a prior
-    crash is unlinked before the new write begins.
+    The live path always holds a complete file (#387): the new text is written
+    and fsynced to <path>.new, the live file is COPIED (not renamed) to
+    <path>.bak1.new, the chain is rotated <path>.bak1 → ... → <path>.bak{N}
+    (oldest dropped), <path>.bak1.new becomes <path>.bak1, and only then does
+    one atomic replace put <path>.new at <path>. A kill at any point leaves the
+    old or the new file complete at <path>; stale <path>.new / <path>.bak1.new
+    from a prior crash are unlinked before the next save begins.
 
     The text variant — for callers whose payload is already a string and
     should not be JSON-encoded (markdown bodies, voice.md, work files).
     For JSON dicts, use save_with_backup which delegates here after encoding.
     """
     new_path = path.with_name(path.name + ".new")
-    if new_path.exists():
-        new_path.unlink()  # stale from prior crash; always incomplete
+    bak1 = path.with_name(f"{path.name}.bak1")
+    bak1_new = path.with_name(f"{path.name}.bak1.new")
+    for stale in (new_path, bak1_new):
+        stale.unlink(missing_ok=True)  # stale from prior crash; always incomplete
 
-    new_path.write_text(text, encoding="utf-8")
+    # Same open as Path.write_text (text mode, no newline=) so the bytes written
+    # per platform are unchanged; flushed and fsynced so the data is on disk
+    # before the replace below can publish it.
+    with new_path.open("w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+
+    # The slow, failure-prone copy happens before anything is rotated: if it
+    # fails (disk full) the live file and the whole chain are untouched.
+    backed_up = _copy_for_backup(path, bak1_new)
 
     # Rotate: drop oldest first, then walk down toward live.
     oldest = path.with_name(f"{path.name}.bak{backup_count}")
@@ -265,8 +327,8 @@ def save_with_backup_text(path: Path, text: str, backup_count: int = 3) -> None:
         dst = path.with_name(f"{path.name}.bak{i + 1}")
         if src.exists():
             _replace_with_retry(src, dst)
-    if path.exists():
-        _replace_with_retry(path, path.with_name(f"{path.name}.bak1"))
+    if backed_up:
+        _replace_with_retry(bak1_new, bak1)
 
     _replace_with_retry(new_path, path)
 
