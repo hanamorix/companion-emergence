@@ -112,7 +112,14 @@ def _newest_log_ts(persona_dir: Path) -> str | None:
 
 
 def load_or_recover(persona_dir: Path) -> tuple[FeltTimeState, bool]:
-    """Returns (state, recovered_from_logs)."""
+    """Returns (state, recovered_from_logs).
+
+    - State file parses: loaded as-is, recovered False. Newer anchor-log rows are
+      NOT a reason to discard it; the next FeltTime.tick folds them in.
+    - State file missing, anchor logs exist: replayed from the logs (lived age 0.0,
+      the recovery honesty contract), recovered True.
+    - State file missing with no logs, or unparseable: cold start, recovered True.
+    """
     state_file = persona_dir / STATE_FILENAME
     if not state_file.exists():
         if _newest_log_ts(persona_dir) is not None:
@@ -126,13 +133,10 @@ def load_or_recover(persona_dir: Path) -> tuple[FeltTimeState, bool]:
     except (OSError, json.JSONDecodeError):
         return FeltTimeState.cold_start(), True
 
-    newest_log = _newest_log_ts(persona_dir)
-    last_tick = data.get("last_tick_ts")
-    if newest_log and (last_tick is None or newest_log > last_tick):
-        from brain.felt_time import _replay_from_logs  # local import avoids cycle
-
-        return _replay_from_logs(persona_dir), True
-
+    # A state file that parses is authoritative. Anchor-log rows newer than
+    # last_tick_ts are the NORMAL case between ticks (other subsystems append to
+    # those logs); FeltTime.tick folds them in via scan_since(last_tick_ts).
+    # Replaying here would reset lived age to 0.0 (#384).
     # Deserialise horizon_pressure
     raw_hp = data.get("horizon_pressure") or {}
     horizon_pressure = {

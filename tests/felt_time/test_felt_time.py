@@ -78,20 +78,38 @@ def test_felt_time_replay_rebuilds_state_from_logs(tmp_path):
     assert state.lived_age_hours == 0.0
 
 
-def test_load_or_recover_replays_when_logs_newer_than_state(tmp_path):
+def test_load_or_recover_keeps_saved_state_when_logs_newer_than_state(tmp_path):
     from brain.felt_time.state import persist
 
-    # Persist an old state.
-    persist(FeltTimeState(last_tick_ts="2026-05-17T18:00:00+00:00"), tmp_path)
-    # Now write a newer dream.
+    # Persist a valid saved state with real lived age.
+    persist(
+        FeltTimeState(lived_age_hours=1.25, last_tick_ts="2026-05-17T18:00:00+00:00"),
+        tmp_path,
+    )
+    # A dream is logged after the last tick (the normal case between ticks).
     _write_jsonl(
         tmp_path / "dreams.log.jsonl",
         [{"ts": "2026-05-17T20:00:00+00:00", "summary": "later"}],
     )
 
     loaded, recovered = load_or_recover(tmp_path)
-    assert recovered is True
-    assert loaded.anchors["dream"].label == "later"
+    assert recovered is False  # saved state is authoritative; no replay
+    assert loaded.lived_age_hours == 1.25
+    # The new anchor is folded in by the next tick, not at load time (OQ1).
+    assert "dream" not in loaded.anchors
+
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(
+        TickContext(
+            now_iso="2026-05-17T21:00:00+00:00",
+            heartbeats_in_tick=1,
+            chat_turns_in_tick=0,
+            reflex_firings_in_tick=0,
+            wall_clock_s_in_tick=3600.0,
+            drivers=IntensityDrivers(),
+        )
+    )
+    assert ft.get_state().anchors["dream"].label == "later"
 
 
 def test_replay_marks_state_as_replayed(tmp_path):

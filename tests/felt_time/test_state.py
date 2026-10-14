@@ -67,17 +67,75 @@ def test_load_or_recover_returns_cold_start_when_no_state_file(tmp_path):
     assert recovered is True
 
 
-def test_load_or_recover_triggers_recovery_when_state_older_than_newest_log(tmp_path):
-    # Persist state with last_tick_ts BEFORE a (fake) dream log entry.
+def test_load_or_recover_keeps_state_when_log_entry_is_newer_than_last_tick(tmp_path):
+    # Persist state with last_tick_ts BEFORE a (fake) dream log entry. Log rows newer
+    # than the last tick are the normal case between ticks; they are not staleness.
     persist(
-        FeltTimeState(last_tick_ts="2026-05-17T20:00:00+00:00"),
+        FeltTimeState(lived_age_hours=2.0, last_tick_ts="2026-05-17T20:00:00+00:00"),
         tmp_path,
     )
     dreams_log = tmp_path / "dreams.log.jsonl"
     dreams_log.write_text('{"ts": "2026-05-17T21:00:00+00:00", "summary": "the boat one"}\n')
 
     loaded, recovered = load_or_recover(tmp_path)
-    assert recovered is True  # newer log entry forced re-derivation
+    assert recovered is False
+    assert loaded.lived_age_hours == 2.0
+    assert loaded.replayed is False
+
+
+def test_load_is_read_only_and_keeps_age_when_log_is_newer(tmp_path):
+    persist(FeltTimeState(lived_age_hours=2.0, last_tick_ts="2026-05-17T20:00:00+00:00"), tmp_path)
+    (tmp_path / "dreams.log.jsonl").write_text(
+        '{"ts": "2026-05-17T21:00:00+00:00", "summary": "x"}\n'
+    )
+    state_file = tmp_path / "felt_time_state.json"
+    before = state_file.read_bytes()
+    loaded, _ = load_or_recover(tmp_path)
+    assert loaded.lived_age_hours == 2.0
+    assert state_file.read_bytes() == before
+
+
+def test_saved_state_with_no_last_tick_is_loaded_not_replayed(tmp_path):
+    persist(FeltTimeState(lived_age_hours=2.0, last_tick_ts=None), tmp_path)
+    (tmp_path / "dreams.log.jsonl").write_text(
+        '{"ts": "2026-05-17T21:00:00+00:00", "summary": "x"}\n'
+    )
+    loaded, recovered = load_or_recover(tmp_path)
+    assert recovered is False
+    assert loaded.lived_age_hours == 2.0
+    assert loaded.replayed is False
+
+
+def test_missing_state_file_with_logs_replays(tmp_path):
+    (tmp_path / "dreams.log.jsonl").write_text(
+        '{"ts": "2026-05-17T21:00:00+00:00", "summary": "from the log"}\n'
+    )
+    loaded, recovered = load_or_recover(tmp_path)
+    assert recovered is True
+    assert loaded.replayed is True
+    assert loaded.lived_age_hours == 0.0
+    assert loaded.anchors["dream"].label == "from the log"
+
+
+def test_read_paths_never_write_after_a_replay(tmp_path):
+    """C13: a reader that lands on a missing state file (e.g. the save-time rotation
+    window) gets a replayed 0.0 in memory only. Nothing is written, so it can never
+    overwrite the real state when the file reappears. Only FeltTime.tick persists."""
+    from brain.felt_time import FeltTime
+    from brain.felt_time.tool import felt_time_now
+
+    (tmp_path / "dreams.log.jsonl").write_text(
+        '{"ts": "2026-05-17T21:00:00+00:00", "summary": "x"}\n'
+    )
+    before = sorted(p.name for p in tmp_path.iterdir())
+
+    load_or_recover(tmp_path)
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.get_state()
+    felt_time_now(persona_dir=tmp_path)
+
+    assert sorted(p.name for p in tmp_path.iterdir()) == before
+    assert not (tmp_path / "felt_time_state.json").exists()
 
 
 def test_load_or_recover_treats_corrupt_state_file_as_recovery_trigger(tmp_path):
