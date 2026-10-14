@@ -973,7 +973,13 @@ def test_a_second_save_during_a_save_leaves_the_first_ones_temp_alone(
             return
         state["ran"] = True
         outer_temps = {t.name for t in tmp_path.glob("*.new")}
-        other = Path(os.path.relpath(p)) if spelling == "relative" else p
+        if spelling == "relative":
+            # Build the relative spelling from a cwd on the file's own drive: on Windows the
+            # runner's cwd and tmp_path can sit on different drives, where relpath raises.
+            monkeypatch.chdir(tmp_path)
+            other = Path(os.path.relpath(p))
+        else:
+            other = p
         save_with_backup_text(other, _payload(7))  # the other writer, start to finish
         state["outer_temp_survived"] = outer_temps <= {t.name for t in tmp_path.glob("*.new")}
 
