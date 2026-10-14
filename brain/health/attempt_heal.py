@@ -294,13 +294,13 @@ def _copy_for_backup(src: Path, dst: Path) -> bool:
 # Per-writer temp files (#389). Two savers of one path used to share one
 # ``<name>.new`` and one ``<name>.bak1.new``, so one could unlink or replace the
 # other's in-flight temp and the loser raised FileNotFoundError. Every save now
-# names its own temps ``<name>.t<pid>-<process nonce>-<random>.new`` (and
+# names its own temps ``<name>.t<pid>-<random>.new`` (and
 # ``...bak1.new`` for the backup copy). Leftovers of a killed save are found by
 # that pattern and removed without touching a temp another writer is still
-# using: a temp this process has registered as in flight is never removed; one
-# from this process that is not registered, or from a dead process (or an older
-# process that had our pid), is stale; one owned by another live process is left.
-_PROCESS_NONCE = secrets.token_hex(4)
+# using: a temp registered in this process as in flight (keyed by its unique
+# file name, so the spelling of the path does not matter) is never removed;
+# one from this process that is not registered, or from a dead process, is
+# stale; one owned by another live process is left.
 _INFLIGHT: set[str] = set()
 _INFLIGHT_LOCK = threading.Lock()
 
@@ -309,9 +309,12 @@ def _owner_alive(pid: int) -> bool:
     # Lazy import: bridge sits above health and imports this module. The bridge's
     # pid check has the Windows-safe branch; a raw os.kill(pid, 0) must not be
     # used (on Windows signal 0 is a real Ctrl+C).
-    from brain.bridge.state_file import pid_is_alive
+    try:
+        from brain.bridge.state_file import pid_is_alive
 
-    return pid_is_alive(pid)
+        return pid_is_alive(pid)
+    except Exception:  # housekeeping must never fail a save: unknown means alive, leave it
+        return True
 
 
 def _remove_stale_temps(path: Path) -> None:
@@ -319,21 +322,20 @@ def _remove_stale_temps(path: Path) -> None:
     for legacy in (path.name + ".new", path.name + ".bak1.new"):  # pre-#389 fixed names
         with contextlib.suppress(OSError):
             path.with_name(legacy).unlink(missing_ok=True)
-    pattern = re.compile(rf"^{re.escape(path.name)}\.t(\d+)-([0-9a-f]+)-[0-9a-f]+\.(?:bak1\.)?new$")
+    pattern = re.compile(rf"^{re.escape(path.name)}\.t(\d+)-[0-9a-f]+\.(?:bak1\.)?new$")
     try:
-        found = list(path.parent.glob(f"{glob.escape(path.name)}.t*-*-*.new"))
+        found = list(path.parent.glob(f"{glob.escape(path.name)}.t*-*.new"))
     except OSError:
         return
     for temp in found:
         m = pattern.match(temp.name)
         if m is None:
             continue
-        pid, nonce = int(m.group(1)), m.group(2)
+        pid = int(m.group(1))
         with _INFLIGHT_LOCK:
-            if str(temp) in _INFLIGHT:
+            if temp.name in _INFLIGHT:
                 continue
-        ours = nonce == _PROCESS_NONCE or pid == os.getpid()
-        if ours or not _owner_alive(pid):
+        if pid == os.getpid() or not _owner_alive(pid):
             with contextlib.suppress(OSError):
                 temp.unlink(missing_ok=True)
 
@@ -344,11 +346,11 @@ def _temp_scope(path: Path) -> Iterator[tuple[Path, Path]]:
 
     On an Exception (not a kill, which runs no code) the save's own temps are
     removed. The registration is always dropped."""
-    tag = f"t{os.getpid()}-{_PROCESS_NONCE}-{secrets.token_hex(6)}"
+    tag = f"t{os.getpid()}-{secrets.token_hex(6)}"
     new_path = path.with_name(f"{path.name}.{tag}.new")
     bak1_new = path.with_name(f"{path.name}.{tag}.bak1.new")
     with _INFLIGHT_LOCK:
-        _INFLIGHT.update((str(new_path), str(bak1_new)))
+        _INFLIGHT.update((new_path.name, bak1_new.name))
     try:
         _remove_stale_temps(path)
         yield new_path, bak1_new
@@ -359,7 +361,7 @@ def _temp_scope(path: Path) -> Iterator[tuple[Path, Path]]:
         raise
     finally:
         with _INFLIGHT_LOCK:
-            _INFLIGHT.difference_update((str(new_path), str(bak1_new)))
+            _INFLIGHT.difference_update((new_path.name, bak1_new.name))
 
 
 def save_with_backup_text(path: Path, text: str, backup_count: int = 3) -> None:

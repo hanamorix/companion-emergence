@@ -347,7 +347,7 @@ def _fd_name(fd: int, root: Path) -> str:
     return "<unknown>"
 
 
-_TEMP_TAG = re.compile(r"\.t\d+-[0-9a-f]+-[0-9a-f]+(?=\.(?:bak1\.)?new$)")
+_TEMP_TAG = re.compile(r"\.t\d+-[0-9a-f]+(?=\.(?:bak1\.)?new$)")
 
 
 def _norm(name: str) -> str:
@@ -938,17 +938,15 @@ def test_stale_temps_are_removed_by_pattern_but_not_a_live_writers_temp(tmp_path
     a temp owned by another live process stays; other files' temps are never touched."""
     p = tmp_path / "x.json"
     _seed(p)
-    nonce = heal._PROCESS_NONCE
     stale = [
-        f"x.json.t{_dead_pid()}-aaaa1111-0123456789ab.new",  # dead process
-        f"x.json.t{_dead_pid()}-aaaa1111-0123456789ab.bak1.new",
-        f"x.json.t{os.getpid()}-bbbb2222-0123456789ab.new",  # our pid, older process (pid reused)
-        f"x.json.t{os.getpid()}-{nonce}-0123456789ab.new",  # this process, not in flight
+        f"x.json.t{_dead_pid()}-0123456789ab.new",  # dead process
+        f"x.json.t{_dead_pid()}-0123456789ab.bak1.new",
+        f"x.json.t{os.getpid()}-0123456789ab.new",  # this process, not in flight
         "x.json.new",  # pre-#389 fixed names
         "x.json.bak1.new",
     ]
-    live_other = f"x.json.t{os.getppid()}-cccc3333-0123456789ab.new"  # another live process
-    untouched = ["y.json.t999999-aaaa1111-0123456789ab.new", "x.json.t1-zz.new", "x.json.keep"]
+    live_other = f"x.json.t{os.getppid()}-0123456789ab.new"  # another live process
+    untouched = ["y.json.t999999-0123456789ab.new", "x.json.t1-zz.new", "x.json.keep"]
     for name in [*stale, live_other, *untouched]:
         (tmp_path / name).write_text("leftover", encoding="utf-8")
     save_with_backup_text(p, _payload(6))
@@ -959,8 +957,9 @@ def test_stale_temps_are_removed_by_pattern_but_not_a_live_writers_temp(tmp_path
     assert _version(p) == 6 and _version(tmp_path / "x.json.bak1") == 5
 
 
+@pytest.mark.parametrize("spelling", ["same", "relative"])
 def test_a_second_save_during_a_save_leaves_the_first_ones_temp_alone(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, spelling: str
 ) -> None:
     """C15a (deterministic): a whole save of the same path runs while another save has its temp
     file written but not yet published. The inner save must not remove or reuse that temp, so
@@ -974,7 +973,8 @@ def test_a_second_save_during_a_save_leaves_the_first_ones_temp_alone(
             return
         state["ran"] = True
         outer_temps = {t.name for t in tmp_path.glob("*.new")}
-        save_with_backup_text(p, _payload(7))  # the other writer, start to finish
+        other = Path(os.path.relpath(p)) if spelling == "relative" else p
+        save_with_backup_text(other, _payload(7))  # the other writer, start to finish
         state["outer_temp_survived"] = outer_temps <= {t.name for t in tmp_path.glob("*.new")}
 
     _Recorder(monkeypatch, tmp_path, hook).install()
@@ -1045,3 +1045,35 @@ def test_concurrent_savers_of_one_path_raise_nothing_and_never_expose_a_gap(
         bak = tmp_path / f"x.json.bak{i}"
         if bak.exists():
             _version(bak)
+
+
+def test_a_bad_temp_name_cannot_fail_a_save(tmp_path: Path) -> None:
+    """A leftover whose pid field is absurd is skipped (unknown owner means alive), never an error."""
+    p = tmp_path / "x.json"
+    _seed(p)
+    odd = tmp_path / "x.json.t99999999999999999999-0123456789ab.new"
+    odd.write_text("leftover", encoding="utf-8")
+    save_with_backup_text(p, _payload(6))
+    assert _version(p) == 6
+    assert odd.exists()
+
+
+def test_failure_after_the_backup_copy_removes_both_of_the_saves_own_temps(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The new file and the backup copy both exist when the swap into the chain fails; an
+    Exception (not a kill) must leave neither behind, and live must still be the old version."""
+    p = tmp_path / "x.json"
+    _seed(p)
+
+    def hook(phase: str, op: str, name: str) -> None:
+        if (phase, op, name) == ("before", "replace", "x.json.bak1.new->x.json.bak1"):
+            assert list(tmp_path.glob("*.bak1.new")) and list(tmp_path.glob("*.new"))
+            raise OSError(errno.EIO, "I/O error")
+
+    _Recorder(monkeypatch, tmp_path, hook).install()
+    with pytest.raises(OSError):
+        save_with_backup_text(p, _payload(6))
+    monkeypatch.undo()
+    assert not list(tmp_path.glob("*.new"))
+    assert _version(p) == 5
