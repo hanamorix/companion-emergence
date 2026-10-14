@@ -191,7 +191,7 @@ def _prune_call_sites(root: Path) -> set[str]:
     for path in root.rglob("*.py"):
         if path.name == "recall_diagnostics.py":
             continue
-        tree = ast.parse(path.read_text())
+        tree = ast.parse(path.read_text(encoding="utf-8"))
         modules: set[str] = set()
         functions: set[str] = set()
         for node in ast.walk(tree):
@@ -211,9 +211,9 @@ def _prune_call_sites(root: Path) -> set[str]:
             func = node.func
             if isinstance(func, ast.Attribute) and func.attr == "prune":
                 if isinstance(func.value, ast.Name) and func.value.id in modules:
-                    sites.add(str(path.relative_to(root)))
+                    sites.add(path.relative_to(root).as_posix())
             elif isinstance(func, ast.Name) and func.id in functions:
-                sites.add(str(path.relative_to(root)))
+                sites.add(path.relative_to(root).as_posix())
     return sites
 
 

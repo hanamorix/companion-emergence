@@ -679,11 +679,11 @@ def test_the_emission_helper_is_called_only_from_the_three_call_sites() -> None:
     callers: set[str] = set()
     root = Path(sr.__file__).resolve().parents[1]
     for path in root.rglob("*.py"):
-        tree = ast.parse(path.read_text())
+        tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 func = node.func
                 name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
                 if name == "emit_recall_diagnostics":
-                    callers.add(f"{path.relative_to(root)}")
+                    callers.add(path.relative_to(root).as_posix())
     assert callers == {"memory/semantic_recall.py", "tools/impls/search_memories.py"}

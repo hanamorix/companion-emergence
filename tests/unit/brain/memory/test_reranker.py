@@ -2255,7 +2255,10 @@ def test_j5_v1_on_real_files_the_container_layout_and_a_real_permission_error(
     (own / "memory.limit_in_bytes").write_text(_SENTINEL + "\n")
     (own / "memory.usage_in_bytes").write_text("1\n")
     assert _v1() is None  # the own level exists and is unbounded; the root's use_hierarchy 0 ends the walk
-    if os.geteuid() != 0:
+    # The permission half needs POSIX permission bits and a non-root user: Windows has no `os.geteuid` and
+    # `chmod(0)` there does not deny reads. cgroups are Linux-only, so this is a guard on a facility that only
+    # exists where the bits do; the container-layout half above runs on every OS.
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
         (own / "memory.limit_in_bytes").chmod(0)
         assert _v1() is None  # a permission error is not absence: the root is not promoted to the own level
         (own / "memory.limit_in_bytes").chmod(0o644)
@@ -2748,9 +2751,9 @@ def _rerank_call_sites(root=None) -> dict[tuple[str, str], int]:
     found: dict[tuple[str, str], int] = {}
     for path in sorted((root / "brain").rglob("*.py")):
         finder = _RerankCallFinder()
-        finder.visit(_ast.parse(path.read_text()))
+        finder.visit(_ast.parse(path.read_text(encoding="utf-8")))
         for scope in finder.scopes:
-            key = (str(path.relative_to(root)), scope)
+            key = (path.relative_to(root).as_posix(), scope)
             found[key] = found.get(key, 0) + 1
     return found
 
