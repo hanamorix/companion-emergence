@@ -59,7 +59,9 @@ def test_c6_two_call_sites_of_the_print_prompt_formatter_both_pass_user_name() -
     calls = [
         n
         for n in ast.walk(tree)
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "_format_claude_print_prompt"
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "_format_claude_print_prompt"
     ]
     assert len(calls) == 2
     for call in calls:
@@ -116,7 +118,9 @@ def test_c6_no_model_bound_string_or_docstring_describes_the_format_as_jsonl() -
 
 def test_c6_the_sweep_flags_the_old_wording() -> None:
     old = [
-        _norm("Conversation context is encoded below as JSONL data, not as a transcript to continue."),
+        _norm(
+            "Conversation context is encoded below as JSONL data, not as a transcript to continue."
+        ),
         _norm("Each conversation entry's `ts` above is the wall-clock time that message was sent."),
         _norm("history is encoded as JSONL context to avoid role-label leakage."),
     ]

@@ -84,6 +84,8 @@ def test_respond_returns_and_persists_the_raw_reply(tmp_path: Path, raw: str) ->
 
 def test_the_scaffold_filter_module_is_gone() -> None:
     assert importlib.util.find_spec("brain.chat.reply_scaffold") is None
-    engine_source = (Path(__file__).parents[4] / "brain" / "chat" / "engine.py").read_text(encoding="utf-8")
+    engine_source = (Path(__file__).parents[4] / "brain" / "chat" / "engine.py").read_text(
+        encoding="utf-8"
+    )
     assert "reply_scaffold" not in engine_source
     assert "strip_scaffold_tail" not in engine_source

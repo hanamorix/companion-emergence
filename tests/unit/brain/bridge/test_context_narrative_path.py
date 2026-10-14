@@ -38,20 +38,44 @@ def _persona(tmp_path: Path, *, user_name: str | None) -> Path:
 
 def _seed_history(persona_dir: Path, session_id: str) -> None:
     rows = [
-        {"session_id": session_id, "speaker": "user", "text": "hey nell", "ts": "2026-05-20T10:00:00Z"},
-        {"session_id": session_id, "speaker": "assistant", "text": "i am here", "ts": "2026-05-20T10:00:30Z"},
-        {"session_id": session_id, "speaker": "user", "text": "two\nlines", "ts": "2026-05-20T10:05:00Z"},
-        {"session_id": session_id, "speaker": "assistant", "text": "noted", "ts": "2026-05-20T10:05:20Z"},
+        {
+            "session_id": session_id,
+            "speaker": "user",
+            "text": "hey nell",
+            "ts": "2026-05-20T10:00:00Z",
+        },
+        {
+            "session_id": session_id,
+            "speaker": "assistant",
+            "text": "i am here",
+            "ts": "2026-05-20T10:00:30Z",
+        },
+        {
+            "session_id": session_id,
+            "speaker": "user",
+            "text": "two\nlines",
+            "ts": "2026-05-20T10:05:00Z",
+        },
+        {
+            "session_id": session_id,
+            "speaker": "assistant",
+            "text": "noted",
+            "ts": "2026-05-20T10:05:20Z",
+        },
     ]
     d = persona_dir / "active_conversations"
     d.mkdir(parents=True, exist_ok=True)
-    (d / f"{session_id}.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    (d / f"{session_id}.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8"
+    )
 
 
 def _cli_result() -> MagicMock:
     m = MagicMock()
     m.returncode = 0
-    m.stdout = json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "ok"})
+    m.stdout = json.dumps(
+        {"type": "result", "subtype": "success", "is_error": False, "result": "ok"}
+    )
     m.stderr = ""
     return m
 
@@ -91,8 +115,12 @@ def test_c2a_respond_sends_narrative_lines_named_after_the_configured_user(tmp_p
     assert len(said) == 5  # four seeded turns plus the new user message
     assert re.match(r'^At \S+ Hana said: "hey nell"$', said[0])
     assert re.match(r'^At \S+ you said: "i am here"$', said[1])
-    assert re.match(r'^At \S+ Hana said: "two\\nlines"$', said[2])  # one line: the newline stays escaped
-    assert said[4] == 'Hana said: "what do you remember?"'  # the live message has no time yet (stamped at persist)
+    assert re.match(
+        r'^At \S+ Hana said: "two\\nlines"$', said[2]
+    )  # one line: the newline stays escaped
+    assert (
+        said[4] == 'Hana said: "what do you remember?"'
+    )  # the live message has no time yet (stamped at persist)
     assert not any(line.startswith("{") for line in prompt.split("\n"))
     assert '"speaker"' not in prompt and "JSONL" not in prompt
     assert "`ts`" not in prompt  # the ambient tail no longer describes a field
@@ -122,7 +150,9 @@ class _KeepStdin(io.StringIO):
 class _StreamPopen:
     def __init__(self) -> None:
         self.stdin = _KeepStdin()
-        self.stdout = iter([json.dumps({"type": "result", "is_error": False, "result": "ok"}) + "\n"])
+        self.stdout = iter(
+            [json.dumps({"type": "result", "is_error": False, "result": "ok"}) + "\n"]
+        )
         self.stderr = io.StringIO("")
         self.pid = 4242
 
@@ -151,7 +181,11 @@ def test_c2b_chat_stream_sends_the_same_narrative_lines() -> None:
         list(
             ClaudeCliProvider(model="sonnet").chat_stream(
                 msgs,
-                options={"user_name": "Hana", "volatile_suffix": "SUFFIX", "include_block_clock": False},
+                options={
+                    "user_name": "Hana",
+                    "volatile_suffix": "SUFFIX",
+                    "include_block_clock": False,
+                },
             )
         )
     sent = fake.stdin.final
@@ -168,6 +202,10 @@ def test_c2b_chat_stream_sends_the_same_narrative_lines() -> None:
 def test_c2_blank_names_fall_back_to_the_human(name: str | None) -> None:
     from brain.bridge.provider import _format_claude_print_prompt
 
-    msgs = [ChatMessage(role="user", content="a"), ChatMessage(role="assistant", content="b"), ChatMessage(role="user", content="c")]
+    msgs = [
+        ChatMessage(role="user", content="a"),
+        ChatMessage(role="assistant", content="b"),
+        ChatMessage(role="user", content="c"),
+    ]
     out = _format_claude_print_prompt(msgs, user_name=name)
     assert 'The human said: "a"' in out and 'The human said: "c"' in out

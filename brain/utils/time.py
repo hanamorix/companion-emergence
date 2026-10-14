@@ -17,7 +17,7 @@ Routes through this shared formatter (``format_local()`` / ``local_display()``
 below) — switch the presentation style ONE TIME, here, and all of these
 follow automatically:
   - brain/bridge/provider.py — block-level "Current time:" anchor
-  - brain/bridge/provider.py — per-message `ts` in the JSONL chat context
+  - brain/bridge/provider.py — per-message time in the narrative chat context lines
   - brain/chat/prompt.py — ambient "[current time: ...]" tail anchor
   - brain/initiate/ambient.py — outbound-recall "Recent outbound" row ts
   - brain/initiate/ambient.py — outbound-recall "Pending uncertainty" row ts

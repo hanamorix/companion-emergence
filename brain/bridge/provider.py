@@ -2080,7 +2080,8 @@ def _narrative_name(raw: Any) -> str:
     kept = "".join(
         ch
         for ch in spaced
-        if not unicodedata.category(ch).startswith("C") and unicodedata.category(ch) not in ("Zl", "Zp")
+        if not unicodedata.category(ch).startswith("C")
+        and unicodedata.category(ch) not in ("Zl", "Zp")
     )
     return " ".join(kept.split())[:_NARRATIVE_NAME_MAX].strip()
 
@@ -2094,9 +2095,9 @@ def _narrative_time(ts: str | None) -> str:
         return ""
     try:
         parse_iso_utc(ts)
-    except (ValueError, TypeError):
+        return local_display(ts)  # tz-local-display: per-message time in the narrative chat context
+    except (ValueError, TypeError, OverflowError):  # OverflowError: parses, but has no local equivalent (year 1)
         return ""
-    return local_display(ts)  # tz-local-display: per-message time in the narrative chat context
 
 
 def _claude_context_lines(messages: list[ChatMessage], *, user_name: str | None = None) -> Iterator[str]:
