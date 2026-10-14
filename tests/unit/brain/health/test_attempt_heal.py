@@ -794,7 +794,12 @@ def test_backup_is_byte_exact_and_keeps_mode_and_mtime(tmp_path: Path, monkeypat
             modes.append(stat.S_IMODE(tmp.stat().st_mode))
 
     _Recorder(monkeypatch, tmp_path, hook).install()
-    save_with_backup_text(p, "next\n")
+    old_umask = os.umask(0) if os.name != "nt" else 0  # so a wide creation mode is not masked off
+    try:
+        save_with_backup_text(p, "next\n")
+    finally:
+        if os.name != "nt":
+            os.umask(old_umask)
     monkeypatch.undo()
     bak = tmp_path / "x.json.bak1"
     assert bak.read_bytes() == before
