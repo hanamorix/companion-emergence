@@ -5,7 +5,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::{CLI_FLAG, CWD_ENV, PRODUCT_NAME};
+use crate::{CLI_FLAG, PRODUCT_NAME};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum CliMode {
@@ -150,6 +150,8 @@ pub fn try_run_nell_cli() -> Option<i32> {
 #[cfg(unix)]
 fn run_nell(rest: Vec<OsString>) -> i32 {
     use std::os::unix::process::CommandExt;
+
+    use crate::CWD_ENV;
 
     let exe = match std::env::current_exe() {
         Ok(e) => e,

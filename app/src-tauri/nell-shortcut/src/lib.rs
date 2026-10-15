@@ -552,6 +552,7 @@ fn set_executable(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 pub(crate) fn path_contains_dir(dir: &Path) -> bool {
     std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).any(|e| e == dir))

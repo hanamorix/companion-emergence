@@ -93,7 +93,7 @@ jobs:
 
       - name: cargo test
         working-directory: app/src-tauri
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
 
   # #408: the nell shortcut logic lives in the Tauri-free workspace crate nell_shortcut. This job
   # compiles the Tauri-linked glue on Linux and Windows (cargo check does not link a test binary),
@@ -133,7 +133,7 @@ jobs:
       - name: cargo test (workspace)
         if: runner.os == 'Linux'
         working-directory: app/src-tauri
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
 
       - name: smoke script logic (stub AppImages)
         if: always() && runner.os == 'Linux'
@@ -142,7 +142,7 @@ jobs:
       - name: cargo test (nell_shortcut crate)
         if: runner.os == 'Windows'
         working-directory: app/src-tauri
-        run: cargo test -p nell_shortcut
+        run: cargo test -p nell_shortcut --no-fail-fast
 
   # #290: the built wheel was only exercised in release.yml, after the tag, so
   # a packaging break (missing package data or module, broken entry point)

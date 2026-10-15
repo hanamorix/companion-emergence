@@ -102,14 +102,19 @@ fn missing_value_is_created_as_expand_sz() {
 #[test]
 fn undecodable_value_is_an_error_and_left_byte_identical() {
     let s = Scratch::new();
+    // Compare with what the registry actually stored: it does not hand back an odd-length string
+    // byte for byte (CI: [67, 0, 0] stored for [67, 0, 58]). The product assertion is unchanged:
+    // ensure_user_path fails and does not modify the stored value.
     let odd = vec![0x43, 0x00, 0x3a]; // odd length
-    s.set_raw(REG_EXPAND_SZ, odd.clone());
+    s.set_raw(REG_EXPAND_SZ, odd);
+    let stored_odd = s.get().unwrap().1;
     assert!(ensure_user_path(&s.subkey, DIR).is_err());
-    assert_eq!(s.get().unwrap().1, odd);
+    assert_eq!(s.get().unwrap().1, stored_odd);
     let lone_surrogate = vec![0x00, 0xd8, 0x41, 0x00, 0x00, 0x00];
-    s.set_raw(REG_EXPAND_SZ, lone_surrogate.clone());
+    s.set_raw(REG_EXPAND_SZ, lone_surrogate);
+    let stored_surrogate = s.get().unwrap().1;
     assert!(ensure_user_path(&s.subkey, DIR).is_err());
-    assert_eq!(s.get().unwrap().1, lone_surrogate);
+    assert_eq!(s.get().unwrap().1, stored_surrogate);
 }
 
 #[test]

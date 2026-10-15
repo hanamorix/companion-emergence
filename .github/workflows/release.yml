@@ -203,7 +203,7 @@ jobs:
 
       - name: cargo test
         working-directory: app/src-tauri
-        run: cargo test
+        run: cargo test --no-fail-fast
 
       - name: Wheel/sdist smoke
         run: bash scripts/smoke_test_wheel.sh
