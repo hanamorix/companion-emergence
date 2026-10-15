@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { getClientPlatform, platformLabel, supportsMacOnlyInstallActions, supportsNellCliShortcut, type ClientPlatform } from "./platform";
+import { getClientPlatform, platformLabel, supportsNellCliShortcut, type ClientPlatform } from "./platform";
 
 describe("nell shortcut support (#408)", () => {
   it.each([
@@ -31,14 +31,13 @@ describe("getClientPlatform with real webview user agents (no module mock)", () 
 
 describe("platform helpers", () => {
   it.each([
-    ["macos", true, "macOS"],
-    ["windows", false, "Windows"],
-    ["linux", false, "Linux"],
-    ["other", false, "this platform"],
-  ] as Array<[ClientPlatform, boolean, string]>) (
-    "%s support/label",
-    (platform, supported, label) => {
-      expect(supportsMacOnlyInstallActions(platform)).toBe(supported);
+    ["macos", "macOS"],
+    ["windows", "Windows"],
+    ["linux", "Linux"],
+    ["other", "this platform"],
+  ] as Array<[ClientPlatform, string]>) (
+    "%s label",
+    (platform, label) => {
       expect(platformLabel(platform)).toBe(label);
     },
   );

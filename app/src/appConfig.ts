@@ -259,12 +259,15 @@ export async function installSupervisorService(persona: string): Promise<InitRes
 }
 
 /**
- * Install a symlink at ~/.local/bin/nell pointing at the bundled CLI so
- * the user can run `nell ...` from their Terminal. Mirrors the
- * supervisor-install shape: idempotent, AppTranslocation-guarded,
- * surfaces structured success/error the panel renders inline.
+ * Put `nell` on the user's PATH so they can run `nell ...` from a terminal.
+ * Mirrors the supervisor-install shape: idempotent, never overwrites a user's
+ * own `nell`, surfaces structured success/error the panel renders inline.
  *
- * macOS-only for now (the Tauri command short-circuits on non-Darwin).
+ * The mechanism depends on the install: a symlink at ~/.local/bin/nell on
+ * macOS and the Linux .deb; a small script at ~/.local/bin/nell that runs the
+ * AppImage in CLI mode on a Linux AppImage; nell.cmd in a per-user folder plus
+ * a user PATH entry on Windows. An AppImage running without FUSE gets no
+ * shortcut and an explanation in `stderr` (exit 78).
  */
 export async function installNellCliSymlink(): Promise<InitResult> {
   return await invoke<InitResult>("install_nell_cli_symlink");

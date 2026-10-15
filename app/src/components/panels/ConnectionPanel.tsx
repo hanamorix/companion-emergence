@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import type { ReactNode } from "react";
 import { installNellCliSymlink, installSupervisorService } from "../../appConfig";
 import type { PersonaState, ChatModel, PronounPreset } from "../../bridge";
-import { getClientPlatform, platformLabel, detectInstallShape } from "../../platform";
+import { getClientPlatform, platformLabel, detectInstallShape, supportsNellCliShortcut } from "../../platform";
 import type { InstallShape } from "../../platform";
 import { Divider, PanelShell, SectionLabel, Toggle } from "../ui";
 import { RestartBridgeButton } from "./RestartBridgeButton";
@@ -65,6 +65,7 @@ export function ConnectionPanel({
   const mode = state?.mode ?? "live";
   const platform = getClientPlatform();
   const supervisorSupported = platform === "macos" || platform === "linux" || platform === "windows";
+  const cliShortcutSupported = supportsNellCliShortcut(platform);
   const currentPlatformLabel = platformLabel(platform);
   const [install, setInstall] = useState<InstallState>({ kind: "idle" });
   const [cliInstall, setCliInstall] = useState<InstallState>({ kind: "idle" });
@@ -226,15 +227,16 @@ export function ConnectionPanel({
           letterSpacing: "0.01em",
         }}
       >
-        {platform === "macos"
-          ? <>Add a <code>nell</code> shortcut to ~/.local/bin so you can run commands from Terminal. Idempotent — safe to click again.</>
-          : `The bundled Terminal shortcut installer is not supported on this platform. On ${currentPlatformLabel}, use the packaged app UI; platform-specific CLI wiring can be added later without affecting chat.`}
+        {platform === "macos" && <>Add a <code>nell</code> shortcut to ~/.local/bin so you can run commands from Terminal. Idempotent — safe to click again.</>}
+        {platform === "linux" && <>Add a <code>nell</code> shortcut to ~/.local/bin so you can run commands from a terminal. Idempotent, safe to click again.</>}
+        {platform === "windows" && <>Add a <code>nell</code> shortcut and put its folder on your user PATH so you can run commands from Command Prompt or PowerShell. Idempotent, safe to click again. Open a new terminal window afterwards.</>}
+        {!cliShortcutSupported && `The bundled Terminal shortcut installer is not supported on this platform. On ${currentPlatformLabel}, use the packaged app UI; platform-specific CLI wiring can be added later without affecting chat.`}
       </div>
-      {platform === "macos" ? (
+      {cliShortcutSupported ? (
         <InstallActionButton
           state={cliInstall}
           onClick={onInstallCli}
-          idleLabel="install nell to ~/.local/bin"
+          idleLabel={platform === "windows" ? "install nell to your PATH" : "install nell to ~/.local/bin"}
           runningLabel="installing…"
           successLabel="✓ nell installed"
           errorLabel="retry install"

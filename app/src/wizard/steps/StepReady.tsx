@@ -12,7 +12,11 @@ interface Props {
    *  when the auto-detect verifies the brain is fully alive. */
   onDone: () => void;
   avatar: ReactNode;
-  /** Durable notice about the nell shortcut step (#408). TESTS-FIRST: accepted but not yet used. */
+  /**
+   * Durable notice about the nell shortcut step (#408), set when that step did not succeed on
+   * Linux or Windows. While it is set this step does not auto-advance: the user reads it and
+   * presses Continue.
+   */
   cliNotice?: string | null;
 }
 
@@ -44,7 +48,7 @@ const POLL_INTERVAL_MS = 800;
  * user isn't trapped (the main app's status banner will surface the
  * underlying issue).
  */
-export function StepReady({ step, totalSteps, persona, onDone, avatar }: Props) {
+export function StepReady({ step, totalSteps, persona, onDone, avatar, cliNotice = null }: Props) {
   const [stages, setStages] = useState<Stage[]>([
     { key: "bridge", label: "Bringing the brain online", status: "running" },
     { key: "state", label: "Reading persona state", status: "pending" },
@@ -52,6 +56,9 @@ export function StepReady({ step, totalSteps, persona, onDone, avatar }: Props) 
   ]);
   const [fellThrough, setFellThrough] = useState(false);
   const cancelledRef = useRef(false);
+  // Read through a ref so the notice is not an effect dependency (it must not restart the poll).
+  const noticeRef = useRef<string | null>(cliNotice);
+  noticeRef.current = cliNotice;
 
   function update(key: string, patch: Partial<Stage>) {
     setStages((prev) => prev.map((s) => (s.key === key ? { ...s, ...patch } : s)));
@@ -107,7 +114,7 @@ export function StepReady({ step, totalSteps, persona, onDone, avatar }: Props) 
           }
           // Auto-transition into the main app once state is reachable.
           timeoutId = setTimeout(() => {
-            if (!cancelledRef.current) onDone();
+            if (!cancelledRef.current && noticeRef.current === null) onDone();
           }, 1200);
           return;
         } catch (e) {
@@ -148,12 +155,36 @@ export function StepReady({ step, totalSteps, persona, onDone, avatar }: Props) 
             {fellThrough ? "We hit a snag." : "Almost there…"}
           </span>
           {fellThrough && <WButton onClick={onDone}>Open the app anyway →</WButton>}
+          {!fellThrough && cliNotice !== null && <WButton onClick={onDone}>Continue →</WButton>}
         </>
       }
     >
       {stages.map((s, i) => (
         <Row key={s.key} stage={s} last={i === stages.length - 1} />
       ))}
+
+      {cliNotice !== null && (
+        <>
+          <Divider />
+          <div
+            role="status"
+            style={{
+              padding: "10px 12px",
+              borderRadius: 16,
+              background: "rgba(216,154,88,0.10)",
+              border: "1px solid rgba(216,154,88,0.40)",
+              fontSize: 11,
+              color: "var(--text-mid)",
+              lineHeight: 1.6,
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-word",
+            }}
+          >
+            <div style={{ fontWeight: 600, marginBottom: 4 }}>nell shortcut</div>
+            {cliNotice}
+          </div>
+        </>
+      )}
 
       {fellThrough && (
         <>
