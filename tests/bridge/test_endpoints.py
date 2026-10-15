@@ -318,6 +318,58 @@ def test_stream_round_trip(persona_dir: Path, monkeypatch):
     assert chunked == "hello world from nell"
 
 
+def test_stream_chunks_survive_a_worker_that_finishes_before_the_loop_resumes(
+    persona_dir: Path, monkeypatch
+):
+    """The end-of-reply sentinel must queue BEHIND every chunk the worker thread pushed.
+
+    The proxy pushes chunks with `loop.call_soon_threadsafe(put_nowait, ...)`. When the
+    worker finishes before the loop thread gets back to the `await asyncio.to_thread(...)`
+    (a short reply), the await returns without yielding and those callbacks are still
+    pending in the loop's ready queue; a direct `chunk_q.put_nowait(None)` in the handler's
+    `finally` overtook them, the forwarder stopped early and the client - which builds the
+    reply only from reply_chunk frames - showed a truncated reply (the persisted turn was
+    complete). This forces that ordering: the stand-in runs the worker to completion before
+    it returns, without yielding to the loop.
+    """
+    import asyncio
+    import threading
+
+    monkeypatch.setenv("NELL_STREAM_CHUNK_DELAY_MS", "0")
+    _patch_fake_provider(monkeypatch, reply="hello world from nell")
+
+    async def _to_thread_that_finishes_first(fn, /, *args, **kwargs):
+        box: dict = {}
+
+        def _run() -> None:
+            try:
+                box["result"] = fn(*args, **kwargs)
+            except BaseException as exc:  # noqa: BLE001 - re-raised below, as to_thread would
+                box["error"] = exc
+
+        worker = threading.Thread(target=_run)
+        worker.start()
+        worker.join()  # the loop thread is parked here, so every callback the worker queued is pending
+        if "error" in box:
+            raise box["error"]
+        return box["result"]
+
+    with _make_client(persona_dir) as c:
+        sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
+        monkeypatch.setattr(asyncio, "to_thread", _to_thread_that_finishes_first)
+        with c.websocket_connect(f"/stream/{sid}") as ws:
+            ws.send_json({"message": "hi"})
+            frames = []
+            while True:
+                f = ws.receive_json()
+                frames.append(f)
+                if f.get("type") == "done":
+                    break
+
+    chunked = "".join(f["text"] for f in frames if f.get("type") == "reply_chunk")
+    assert chunked == "hello world from nell", [f.get("type") for f in frames]
+
+
 def test_stream_emits_keepalive_during_silent_provider_stretch(persona_dir: Path, monkeypatch):
     """A silent provider stretch (first-token latency / tool round-trip) must
     produce server keepalive frames so the client's 60s idle timer never fires
