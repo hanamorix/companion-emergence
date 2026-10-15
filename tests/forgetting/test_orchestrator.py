@@ -378,3 +378,23 @@ def test_load_soul_linked_ids_logs_instead_of_swallowing(tmp_path, monkeypatch, 
     messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert any("crystallised" in m for m in messages), messages
     assert any("under-review" in m for m in messages), messages
+
+
+def test_unreadable_candidates_file_is_logged_for_both_legs(tmp_path, caplog):
+    """#370: a REAL read failure (a directory where soul_candidates.jsonl should
+    be) must surface for the under-review leg too. list_under_review_memory_ids
+    used to swallow it and return [], so under-review memories silently lost
+    their exemption with nothing in the log."""
+    import logging
+
+    from brain.forgetting import _load_soul_linked_ids
+
+    (tmp_path / "soul_candidates.jsonl").mkdir()
+
+    with caplog.at_level(logging.WARNING, logger="brain.forgetting"):
+        crystallised, under_review = _load_soul_linked_ids(tmp_path)
+
+    assert (crystallised, under_review) == (set(), set())
+    messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("crystallised" in m for m in messages), messages
+    assert any("under-review" in m for m in messages), messages
