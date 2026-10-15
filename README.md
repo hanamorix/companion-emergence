@@ -193,14 +193,20 @@ Locally-built artefacts inherit your machine's keychain trust so they launch wit
 
 ## Quick start
 
-After install + `claude` CLI on PATH, open the desktop app. Walk through the wizard — it sets up the persona, installs the persistent supervisor under launchd / systemd-user / Task Scheduler, and (on macOS) drops a `nell` symlink into `~/.local/bin` so you can reach the CLI from Terminal.
+After install + `claude` CLI on PATH, open the desktop app. Walk through the wizard — it sets up the persona, installs the persistent supervisor under launchd / systemd-user / Task Scheduler, and puts a `nell` command on your PATH so you can reach the CLI from a terminal (a symlink in `~/.local/bin` on macOS and the Linux `.deb`, a small script in `~/.local/bin` for the Linux AppImage, and a `nell.cmd` in `%LOCALAPPDATA%\CompanionEmergence\bin` on Windows).
 
 If you skipped any step or want to retry, the **Connection** panel surfaces platform-appropriate service actions:
 - **macOS:** install/retry the launchd supervisor and install `nell` to `~/.local/bin`.
 - **Linux:** use `nell service install --persona <name>` for the systemd-user supervisor.
 - **Windows:** the supervisor installs as a per-user **Task Scheduler** task (no admin elevation). Install it from the Connection panel, or with `nell service install --persona <name>`. It starts at logon and restarts on failure, keeping the brain alive after you close the app — the same role launchd plays on macOS and systemd `--user` on Linux.
 
-The `~/.local/bin` CLI symlink button is macOS-only; Windows and Linux users should run the bundled/source `nell` command from their normal install path.
+The Connection panel's **install nell** button (Terminal section) is available on macOS, Linux and Windows:
+
+- **Linux `.deb`:** the same `~/.local/bin/nell` symlink as macOS. A `nell` you installed yourself (a file or a symlink) is never overwritten. On Debian and Ubuntu, `~/.local/bin` joins your PATH at login only if it already existed, so sign out and back in if `nell` is not found.
+- **Linux AppImage:** `~/.local/bin/nell` is a small script that runs your AppImage file in a command-line mode, which hands off to the bundled `nell`. The app refreshes the script on every launch in case you moved the AppImage (refreshed on launch once installed; it is never created without your click). An AppImage that is running without FUSE (extract-and-run mode) gets no shortcut: the app explains why and what to do (install FUSE, `libfuse2` on Debian and Ubuntu, or install the `.deb`).
+- **Windows:** a small `nell.cmd` in `%LOCALAPPDATA%\CompanionEmergence\bin` calls the bundled `nell.bat`, and that folder is added once to your user PATH (no admin rights, no symlinks). Open a new Command Prompt or PowerShell window afterwards. Arguments containing `&`, `^` or `%` are not passed through cmd.exe unchanged, the same limit as the bundled `nell.bat`.
+- Uninstalling the app leaves the shortcut (and its Windows PATH entry) behind. Delete `~/.local/bin/nell`, or on Windows the `CompanionEmergence` folder and its PATH entry, if you want it gone.
+- The AppImage "portable home" mode (a `<file>.home` folder) makes the app see that folder as `$HOME`, so the shortcut is written there.
 
 After that:
 
