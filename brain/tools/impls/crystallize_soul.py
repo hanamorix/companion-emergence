@@ -119,6 +119,11 @@ def _link_source_memory(
             if memory.state == "fading":
                 result["note"] = _FADING_NOTE
             return
+        logger.warning(
+            "crystallize_soul: no memory %s to link crystallization %s to; it was saved without a link",
+            wanted,
+            crystallization_id,
+        )
     except Exception:
         logger.warning(
             "crystallize_soul: could not link crystallization %s to memory %s; it was saved without a link",

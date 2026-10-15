@@ -696,6 +696,29 @@ def test_crystallize_soul_unknown_memory_id_still_crystallises_and_says_not_to_r
     assert _crystal_count(tmp_path) == 1  # really in the soul, not just reported as created
 
 
+def test_crystallize_soul_unknown_memory_id_is_logged(tmp_path: Path, caplog) -> None:
+    """A made-up id is the likeliest way for a link to miss, and the model is only told 'not linked'.
+    Without a log line an operator cannot see how often that happens, which is exactly what the
+    post-merge watch on not-linked results needs."""
+    import logging
+
+    from brain.tools.impls.crystallize_soul import crystallize_soul
+
+    ctx = _ctx(tmp_path)
+    with caplog.at_level(logging.WARNING, logger="brain.tools.impls.crystallize_soul"):
+        result = crystallize_soul(
+            moment="a moment",
+            love_type="romantic",
+            why_it_matters="it mattered",
+            source_memory_id="no-such-memory",
+            **ctx,
+        )
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1, warnings
+    assert result["id"] in warnings[0] and "no-such-memory" in warnings[0], warnings
+
+
 def test_crystallize_soul_non_string_or_blank_id_means_no_link_and_todays_result_keys(tmp_path: Path) -> None:
     """#371 C3 (in-process dispatch): omitted, None, "", "   ", an int and a list all mean 'no link'.
     The result keys are exactly what they were before the parameter existed. (Over MCP the SDK rejects
