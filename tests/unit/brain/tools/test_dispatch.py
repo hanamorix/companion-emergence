@@ -10,11 +10,11 @@ from brain.tools.dispatch import _DISPATCH, _PROVIDER_TOOLS, ToolDispatchError, 
 
 
 def _make_ctx(tmp_path: Path) -> dict:
-    """Build a minimal dispatch context with in-memory store + hebbian."""
+    """Build a minimal dispatch context with a file-backed store (#375) + in-memory hebbian."""
     from brain.memory.hebbian import HebbianMatrix
     from brain.memory.store import MemoryStore
 
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     hebbian = HebbianMatrix(":memory:")
     return {"store": store, "hebbian": hebbian, "persona_dir": tmp_path}
 

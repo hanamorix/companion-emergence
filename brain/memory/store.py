@@ -815,9 +815,12 @@ class MemoryStore:
 
         Function-style writers use this to locate the sibling pending-candidate
         queue (``pending_candidates.jsonl``) without threading persona_dir
-        through every call. Meaningless for an in-memory store (parent of
-        ':memory:'); such stores are test-only and never enqueue.
+        through every call. An in-memory store has no directory (the parent of
+        ':memory:' is the process's working directory, #375), so asking for one
+        raises ValueError instead of pointing a queue at the cwd.
         """
+        if str(self._db_path) == ":memory:":
+            raise ValueError("an in-memory MemoryStore has no persona directory")
         return self._db_path.parent
 
     def create(self, memory: Memory) -> str:
