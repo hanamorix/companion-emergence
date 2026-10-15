@@ -1332,47 +1332,101 @@ fn refresh_shortcut_on_launch(app: &tauri::AppHandle) {
         Ok(b) => b,
         Err(_) => return,
     };
-    let plan = nell_shortcut::plan_shortcut(&shortcut_env(bundled));
-    refresh_plan(&plan);
+    let plan = nell_shortcut::plan_shortcut(&shortcut_env(bundled.clone()));
+    refresh_plan(&plan, bundled.as_deref());
+}
+
+/// Record a shortcut-refresh problem where a user or a bug report can find it: the app's launch
+/// log (`$KINDLED_HOME/launch-failures.log`, the same file spawn failures use), plus stderr for
+/// terminal runs. Best-effort: a read-only home must never affect startup. A Windows release build
+/// has no console, so stderr alone would be invisible.
+fn log_shortcut_problem(detail: &str, bundled: Option<&std::path::Path>) {
+    eprintln!("nell shortcut: {}", detail);
+    let home = match nellbrain_home() {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    let failure = launch_log::LaunchFailure {
+        command: "nell-shortcut-refresh".to_string(),
+        exit_code: None,
+        stdout_tail: String::new(),
+        stderr_tail: detail.to_string(),
+        platform: std::env::consts::OS.to_string(),
+        platform_version: std::env::consts::ARCH.to_string(),
+        bundled_runtime_path: bundled.map(|p| p.to_string_lossy().into_owned()),
+        runtime_path_exists: bundled.map(|p| p.exists()).unwrap_or(false),
+        duration_ms: 0,
+    };
+    let _ = launch_log::append_failure(&home, &failure);
 }
 
 #[cfg(unix)]
-fn refresh_plan(plan: &nell_shortcut::ShortcutPlan) {
+fn refresh_plan(plan: &nell_shortcut::ShortcutPlan, bundled: Option<&std::path::Path>) {
     if let nell_shortcut::ShortcutPlan::AppImageScript { appimage, target, .. } = plan {
+        // Nothing to refresh (and nothing worth logging) unless a shortcut was installed earlier.
+        if target.symlink_metadata().is_err() {
+            return;
+        }
         let derived = match std::env::current_exe() {
             Ok(exe) => nell_shortcut::derive_cli_nell_path(&exe),
             Err(_) => return,
         };
         if !derived.exists() {
-            eprintln!(
-                "nell shortcut: expected the bundled nell at {} but it is missing; not refreshing",
-                derived.display()
+            log_shortcut_problem(
+                &format!(
+                    "expected the bundled nell at {} but it is missing; the shortcut was not refreshed",
+                    derived.display()
+                ),
+                bundled,
             );
             return;
+        }
+        // Defence in depth: the CLI mode finds nell by this layout rule, Tauri by its own resolver.
+        if let Some(b) = bundled {
+            let same = match (derived.canonicalize(), b.canonicalize()) {
+                (Ok(d), Ok(t)) => d == t,
+                _ => true, // cannot compare: do not raise a false alarm
+            };
+            if !same {
+                log_shortcut_problem(
+                    &format!(
+                        "layout mismatch: CLI mode would run {} but the app resolves its runtime at {}",
+                        derived.display(),
+                        b.display()
+                    ),
+                    bundled,
+                );
+            }
         }
         if let Ok(text) = nell_shortcut::render_appimage_script(appimage) {
             let outcome = nell_shortcut::refresh_shim_at(target, &text);
             if !outcome.success {
-                eprintln!("nell shortcut refresh failed: {}", outcome.stderr);
+                log_shortcut_problem(&format!("refresh failed: {}", outcome.stderr), bundled);
             }
         }
     }
 }
 
 #[cfg(windows)]
-fn refresh_plan(plan: &nell_shortcut::ShortcutPlan) {
+fn refresh_plan(plan: &nell_shortcut::ShortcutPlan, _bundled: Option<&std::path::Path>) {
     if let nell_shortcut::ShortcutPlan::WindowsCmd { bundled, cmd_path, win_prefixes, .. } = plan {
-        if let Ok(text) = nell_shortcut::render_windows_cmd(&bundled.to_string_lossy(), win_prefixes) {
-            let outcome = nell_shortcut::refresh_cmd_at(cmd_path, &text);
-            if !outcome.success {
-                eprintln!("nell shortcut refresh failed: {}", outcome.stderr);
+        if cmd_path.symlink_metadata().is_err() {
+            return; // never installed: nothing to refresh
+        }
+        match nell_shortcut::render_windows_cmd(&bundled.to_string_lossy(), win_prefixes) {
+            Ok(text) => {
+                let outcome = nell_shortcut::refresh_cmd_at(cmd_path, &text);
+                if !outcome.success {
+                    log_shortcut_problem(&format!("refresh failed: {}", outcome.stderr), Some(bundled.as_path()));
+                }
             }
+            Err(e) => log_shortcut_problem(&format!("refresh skipped: {}", e), Some(bundled.as_path())),
         }
     }
 }
 
 #[cfg(not(any(unix, windows)))]
-fn refresh_plan(_plan: &nell_shortcut::ShortcutPlan) {}
+fn refresh_plan(_plan: &nell_shortcut::ShortcutPlan, _bundled: Option<&std::path::Path>) {}
 
 /// Pure file-system half of [`install_nell_cli_symlink`]. Extracted so
 /// the FS branches can be unit-tested against tempdirs without spinning
