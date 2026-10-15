@@ -1859,8 +1859,8 @@ def test_generate_exit_detail_for_typed_partless_ndjson_goes_through_the_same_sh
 
 
 def test_every_raw_stdout_snippet_sits_behind_the_frame_shape():
-    """The fix reached 4 of the 5 places that print the head of CLI stdout; `ClaudeCliProvider.generate`
-    keeps its raw snippet on purpose (plain `json` output carries no hook frames). A new or reverted
+    """The fix reached every place that prints the head of CLI stdout (3 live sinks) except
+    `ClaudeCliProvider.generate`, which keeps its raw snippet on purpose (plain `json` output carries no hook frames). A new or reverted
     site that prints `stdout[:N]` bare - the way this bug spread - fails here. Best effort: it
     recognises `stdout[:N]`, `stdout[0:N]` and `<expr>.stdout.strip()[:N]`; a snippet taken through an
     alias variable would escape it, so the behavioural tests above remain the real guard."""
@@ -1923,7 +1923,6 @@ def test_every_raw_stdout_snippet_sits_behind_the_frame_shape():
         "ClaudeCliProvider._chat_with_mcp_tools",
         "ClaudeCliProvider.chat",
         "_claude_failure_detail_text",
-        "_parse_stream_json_result",
     ]
 
 

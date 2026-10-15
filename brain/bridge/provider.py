@@ -1749,7 +1749,6 @@ def _scan_blocking_stream_stdout(
     the terminal `result` frame (the same object `--output-format json` printed),
     or None. Lines split on "\n" only: `str.splitlines()` also breaks on
     U+2028/U+2029/U+0085, which JSON serialisers emit raw inside strings.
-    Not `_parse_stream_json_result`, which is an unrelated (dead) parser below.
     """
     result: dict[str, Any] | None = None
     for raw in (stdout or "").split("\n"):
@@ -2127,71 +2126,6 @@ def _claude_context_jsonl_lines(messages: list[ChatMessage]) -> Iterator[str]:
         if msg.tool_calls:
             record["tool_calls"] = [tc.to_dict() for tc in msg.tool_calls]
         yield json.dumps(record, ensure_ascii=False)
-
-
-def _parse_stream_json_result(stdout: str) -> str:
-    """Extract the final assistant reply from a claude stream-json output.
-
-    The stream emits a sequence of JSON-line events; the canonical reply
-    text lives on the ``{"type": "result", "result": "..."}`` frame
-    emitted last. If no result frame is present, fall back to
-    concatenating any ``{"type":"assistant"}`` content with type "text".
-
-    Raises
-    ------
-    ProviderError("error_max_budget_usd", partial_text)
-        When the result frame carries ``subtype == "error_max_budget_usd"``
-        (the per-turn catastrophe ceiling was hit). The partial text so far
-        is included as the detail so the caller can prepend it to the
-        graceful cut-off message.
-    """
-    result_text: str | None = None
-    result_frame: dict | None = None
-    assistant_chunks: list[str] = []
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            frame = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        ftype = frame.get("type")
-        if ftype == "result" and "result" in frame:
-            result_text = str(frame["result"])
-            result_frame = frame
-        elif ftype == "assistant":
-            content = frame.get("message", {}).get("content") or []
-            for block in content:
-                if block.get("type") == "text":
-                    assistant_chunks.append(str(block.get("text", "")))
-    if result_frame is not None and (
-        result_frame.get("subtype") == "error_max_budget_usd"
-        or (
-            result_frame.get("is_error")
-            and any(
-                "maximum budget" in str(e).lower()
-                for e in result_frame.get("errors", [])
-            )
-        )
-    ):
-        raise ProviderError("error_max_budget_usd", result_text or "")
-    # #119: any OTHER is_error frame is a failure, not a reply. Checked after
-    # the over-budget branch above so that frame keeps its dedicated graceful
-    # path — it carries real partial work. Without this the error text was
-    # returned as the assistant reply and persisted as a companion turn.
-    if result_frame is not None:
-        cli_err = _cli_error_detail(result_frame)
-        if cli_err is not None:
-            raise ProviderError("claude_cli_error", cli_err)
-    if result_text is not None:
-        return result_text
-    if assistant_chunks:
-        return "".join(assistant_chunks)
-    raise ProviderError(
-        "claude_cli_parse",
-        f"no result frame in stream-json output: {_stdout_shape(stdout) or repr(stdout[:300])}",
-    )
 
 
 # ---------------------------------------------------------------------------
