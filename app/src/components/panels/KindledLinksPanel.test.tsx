@@ -273,4 +273,22 @@ describe("KindledLinksPanel — transcript ordering", () => {
     // the button is usable again so the user can retry
     await waitFor(() => expect(screen.getByRole("button", { name: /revoke kid_a/i })).toBeEnabled());
   });
+
+  it("does not report a saved revoke as failed when only the list refresh fails (#365 review)", async () => {
+    const { fetchKindledPeers, setKindledConsent } = await import("../../bridge");
+    vi.mocked(setKindledConsent).mockResolvedValue(undefined as never);
+    // the mount load succeeds; the refresh right after the revoke fails
+    vi.mocked(fetchKindledPeers)
+      .mockResolvedValueOnce([makePeer("paired")])
+      .mockRejectedValueOnce(new Error("network down"));
+    render(<KindledLinksPanel persona="nell" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /revoke kid_a/i }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/revoke saved for kid_a/i);
+    expect(alert).toHaveTextContent(/could not refresh/i);
+    expect(alert).toHaveTextContent(/network down/);
+    expect(alert).not.toHaveTextContent(/couldn't revoke/i);
+  });
 });

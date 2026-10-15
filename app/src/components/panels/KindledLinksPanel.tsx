@@ -174,14 +174,22 @@ export function KindledLinksPanel({ persona }: Props) {
     setConsentBusy((prev) => ({ ...prev, [peerId]: true }));
     setConsentError(null);
     try {
-      await setKindledConsent(persona, peerId, action);
-      // Refresh peer list immediately after consent change
-      const updated = await fetchKindledPeers(persona);
-      setPeers(updated);
-    } catch (e) {
-      // A failed revoke or block is privacy-relevant: say so. (The 10 s refresh cycle
-      // can't, it only reports its own load failures.)
-      setConsentError(`Couldn't ${action} ${peerId}: ${errString(e)}`);
+      try {
+        await setKindledConsent(persona, peerId, action);
+      } catch (e) {
+        // A failed revoke or block is privacy-relevant: say so. (The 10 s refresh cycle
+        // can't, it only reports its own load failures.)
+        setConsentError(`Couldn't ${action} ${peerId}: ${errString(e)}`);
+        return;
+      }
+      // The change is saved. A failing refresh must not read as a failed change (#365 review).
+      try {
+        setPeers(await fetchKindledPeers(persona));
+      } catch (e) {
+        setConsentError(
+          `${ACTION_LABEL[action]} saved for ${peerId}, but the peer list could not refresh: ${errString(e)}`,
+        );
+      }
     } finally {
       setConsentBusy((prev) => ({ ...prev, [peerId]: false }));
     }
