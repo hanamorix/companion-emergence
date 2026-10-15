@@ -12,6 +12,7 @@ import pytest
 
 from brain.bridge import cli_throttle, provider_auth
 from brain.chat import pass2_queue
+from brain.memory import pending
 
 pytest_plugins = ["pytester"]
 
@@ -54,6 +55,30 @@ def _reset_cli_throttle() -> Iterator[None]:
     yield
     cli_throttle.reset()
     provider_auth.reset()
+
+
+@pytest.fixture(autouse=True)
+def _no_cwd_queue_leak() -> Iterator[None]:
+    """Error a test that grows ``pending_candidates.jsonl`` in the cwd it started in (#375).
+
+    An in-memory MemoryStore used to report the working directory as its persona dir, so 17
+    tests appended gated candidates to the repo root on every run, invisibly (it is gitignored)
+    and with later tests able to read the debris back. The path is fixed at setup, so a test
+    that chdirs elsewhere still has its original cwd checked; a file that already exists is
+    fine as long as it does not grow.
+    """
+    queue = Path.cwd() / pending._QUEUE_FILENAME
+
+    def _size() -> int | None:
+        return queue.stat().st_size if queue.exists() else None
+
+    before = _size()
+    yield
+    after = _size()
+    assert after == before, (
+        f"this test wrote to {queue} ({before} -> {after} bytes): a store with no persona "
+        "directory must not enqueue; give it a file-backed store (tmp_path / 'memories.db')"
+    )
 
 
 @pytest.fixture(autouse=True)
