@@ -33,7 +33,10 @@ def list_under_review_memory_ids(persona_dir: Path) -> list[str]:
     under review.  'expired', 'accepted', and 'rejected' candidates are
     terminal — their placeholder memories become forgettable again.
 
-    Fail-soft: corrupt or missing soul_candidates.jsonl → empty list.
+    A missing file → empty list; corrupt lines are skipped by the reader. A real
+    read failure (permissions, I/O) is NOT swallowed here: the caller
+    (``brain.forgetting._load_soul_linked_ids``) owns the fail-soft fallback and
+    logs it (#370).
     """
     from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
 
@@ -41,13 +44,8 @@ def list_under_review_memory_ids(persona_dir: Path) -> list[str]:
     if not candidates_path.exists():
         return []
 
-    try:
-        records = read_jsonl_skipping_corrupt(candidates_path)
-    except Exception:
-        return []
-
     ids: list[str] = []
-    for r in records:
+    for r in read_jsonl_skipping_corrupt(candidates_path):
         status = r.get("status", "auto_pending")
         if status in _UNDER_REVIEW_STATUSES:
             mid = str(r.get("memory_id") or "").strip()
