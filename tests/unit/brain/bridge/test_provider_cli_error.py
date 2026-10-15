@@ -74,3 +74,26 @@ def test_stream_json_parser_raises_on_an_is_error_result_frame():
         "an is_error result frame was returned as the assistant reply, which "
         f"the engine then persists as a companion turn: {exc_info.value!r}"
     )
+
+
+def test_stream_json_parser_no_result_error_names_frame_kinds_not_hook_text():
+    """#358: with no result frame the parse error must not echo the stdout head, which
+    under `--verbose` is hook output."""
+    from brain.bridge.provider import ProviderError, _parse_stream_json_result
+
+    stdout = "\n".join([
+        json.dumps({
+            "type": "system", "subtype": "hook_response", "output": "HOOKPAYLOAD-91c2",
+        }),
+        json.dumps({"type": "system", "subtype": "init", "cwd": "/tmp/HOOKPAYLOAD-91c2"}),
+    ])
+
+    with pytest.raises(ProviderError) as exc_info:
+        _parse_stream_json_result(stdout)
+
+    assert exc_info.value.stage == "claude_cli_parse"
+    assert exc_info.value.detail == (
+        "no result frame in stream-json output: "
+        "2 frame(s), last=system/init: system/hook_response x1, system/init x1"
+    )
+    assert "HOOKPAYLOAD" not in str(exc_info.value)

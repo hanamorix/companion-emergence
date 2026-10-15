@@ -796,7 +796,7 @@ def _claude_failure_detail_text(result: subprocess.CompletedProcess[str]) -> str
                     parts.append(f"stderr={stderr}")
                 return "; ".join(parts)
         if not stderr:
-            return f"stdout={stdout[:500]}"
+            return f"stdout={_stdout_shape(stdout) or stdout[:500]}"
     return stderr
 
 
@@ -995,84 +995,72 @@ class ClaudeCliProvider(LLMProvider):
         # User:/Assistant: labels, because those labels can leak into replies.
         # Prompt → stdin, system_prompt → tempfile + --system-prompt-file
         # keeps both off argv (Windows CreateProcess 32,767-char limit).
+        # #356: with a persona dir the CLI runs `stream-json --verbose`, so its built-in
+        # tool calls (WebSearch, WebFetch) are visible in the output and can be audited.
+        # Without one - run_tool_loop's forced final pass, which passes no persona_dir
+        # on purpose - nothing could be audited, so the argv stays `json`.
+        persona_dir_opt = (options or {}).get("persona_dir")
+        audit_dir = Path(persona_dir_opt) if persona_dir_opt else None
         cmd = [
             "claude",
             "-p",
             "--dangerously-skip-permissions",
             "--output-format",
-            "json",
-            "--model",
-            self._model,
+            "stream-json" if audit_dir else "json",
         ]
+        if audit_dir:
+            cmd.append("--verbose")
+        cmd.extend(["--model", self._model])
         cmd.extend(["--max-budget-usd", str(_MAX_TURN_BUDGET_USD(self._model))])
         _apply_lean_flags(cmd, builtins=_CHAT_BUILTIN_TOOLS)
-        with _system_prompt_tempfile(system_prompt) as sp_path:
-            if sp_path is not None:
-                cmd.extend(["--system-prompt-file", sp_path])
+        builtin_calls: dict[str, dict[str, Any]] = {}
+        try:
+            with _system_prompt_tempfile(system_prompt) as sp_path:
+                if sp_path is not None:
+                    cmd.extend(["--system-prompt-file", sp_path])
+
+                result, payload = self._run_blocking_cli(cmd, flat_prompt, builtin_calls)
 
             try:
-                result = subprocess.run(
-                    cmd,
-                    input=flat_prompt,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=self._timeout,
-                    env=_subprocess_env(),
-                    cwd=_claude_work_dir(),  # #122: memory-free working directory
-                    check=False,
-                    creationflags=_NO_WINDOW,
-                )
-            except subprocess.TimeoutExpired as exc:
+                if payload is None:
+                    raise ValueError("no result frame")
+                if payload.get("subtype") == "error_max_budget_usd" or (
+                    payload.get("is_error")
+                    and any(
+                        "maximum budget" in str(e).lower()
+                        for e in payload.get("errors", [])
+                    )
+                ):
+                    partial = str(payload.get("result", "")).strip()
+                    text = (
+                        f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}" if partial else _BUDGET_EXCEEDED_MSG
+                    )
+                    return ChatResponse(content=text, tool_calls=(), raw=payload)
+                cli_err = _cli_error_detail(payload)
+                if cli_err is not None:
+                    raise ProviderError("claude_cli_error", cli_err)
+                content = str(payload["result"])
+            except (ValueError, KeyError, TypeError) as exc:
                 raise ProviderError(
-                    "claude_cli_timeout",
-                    f"subprocess timed out after {self._timeout}s",
+                    "claude_cli_parse",
+                    "unexpected output format: "
+                    f"{_stdout_shape(result.stdout) or repr(result.stdout[:200])}",
                 ) from exc
 
-        if result.returncode != 0:
-            raise ProviderError(
-                "claude_cli_exit",
-                f"exit {result.returncode}: {_claude_failure_detail(result)}",
+            log_usage(
+                audit_dir,
+                call_type="chat",
+                model=self._model,
+                frame=payload,
             )
 
-        try:
-            payload = json.loads(result.stdout)
-            if payload.get("subtype") == "error_max_budget_usd" or (
-                payload.get("is_error")
-                and any(
-                    "maximum budget" in str(e).lower()
-                    for e in payload.get("errors", [])
-                )
-            ):
-                partial = str(payload.get("result", "")).strip()
-                text = (
-                    f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}" if partial else _BUDGET_EXCEEDED_MSG
-                )
-                return ChatResponse(content=text, tool_calls=(), raw=payload)
-            cli_err = _cli_error_detail(payload)
-            if cli_err is not None:
-                raise ProviderError("claude_cli_error", cli_err)
-            content = str(payload["result"])
-        except (json.JSONDecodeError, KeyError, TypeError) as exc:
-            raise ProviderError(
-                "claude_cli_parse",
-                f"unexpected output format: {result.stdout[:200]!r}",
-            ) from exc
-
-        persona_dir_opt = (options or {}).get("persona_dir")
-        log_usage(
-            Path(persona_dir_opt) if persona_dir_opt else None,
-            call_type="chat",
-            model=self._model,
-            frame=payload,
-        )
-
-        return ChatResponse(
-            content=_truncate_at_role_leak(content),
-            tool_calls=(),
-            raw=None,
-        )
+            return ChatResponse(
+                content=_truncate_at_role_leak(content),
+                tool_calls=(),
+                raw=None,
+            )
+        finally:
+            _flush_builtin_audit(audit_dir, builtin_calls)
 
     def chat_stream(
         self,
@@ -1421,6 +1409,51 @@ class ClaudeCliProvider(LLMProvider):
                 # while the exception unwinds, so the rows are on disk first.
                 _flush_builtin_audit(persona_dir, builtin_calls)
 
+    def _run_blocking_cli(
+        self, cmd: list[str], flat_prompt: str, builtin_calls: dict[str, dict[str, Any]]
+    ) -> tuple[subprocess.CompletedProcess[str], dict[str, Any] | None]:
+        """Run `claude` to completion for the two blocking `chat()` branches.
+
+        Scans stdout for the CLI's built-in tool calls (#273/#330) BEFORE any raise, so
+        the caller's `finally` can flush them after an exit != 0 and, for a timeout
+        (#380), from the partial stdout, which is all there is. Returns the process and
+        the terminal `result` frame (None if the stream had none).
+        """
+        try:
+            result = subprocess.run(
+                cmd,
+                input=flat_prompt,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=self._timeout,
+                env=_subprocess_env(),
+                cwd=_claude_work_dir(),  # #122: memory-free working directory
+                check=False,
+                creationflags=_NO_WINDOW,
+            )
+        except subprocess.TimeoutExpired as exc:
+            try:
+                _scan_blocking_stream_stdout(_partial_stdout_text(exc.stdout), builtin_calls)
+            except Exception as scan_exc:  # noqa: BLE001 — audit must never mask the timeout
+                logger.warning("built-in tool audit scan of a timed-out turn failed: %s", scan_exc)
+            raise ProviderError(
+                "claude_cli_timeout",
+                f"subprocess timed out after {self._timeout}s",
+            ) from exc
+
+        # Scan before the exit-code check so a non-zero exit still flushes the
+        # built-in calls it saw.
+        payload = _scan_blocking_stream_stdout(result.stdout, builtin_calls)
+
+        if result.returncode != 0:
+            raise ProviderError(
+                "claude_cli_exit",
+                f"exit {result.returncode}: {_claude_failure_detail(result)}",
+            )
+        return result, payload
+
     def _chat_with_mcp_tools(
         self,
         flat_prompt: str,
@@ -1525,37 +1558,7 @@ class ClaudeCliProvider(LLMProvider):
             with _system_prompt_tempfile(system_prompt) as sp_path:
                 if sp_path is not None:
                     cmd.extend(["--system-prompt-file", sp_path])
-                try:
-                    result = subprocess.run(
-                        cmd,
-                        input=flat_prompt,
-                        capture_output=True,
-                        env=_subprocess_env(),
-                        cwd=_claude_work_dir(),  # #122: memory-free working directory
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        timeout=self._timeout,
-                        check=False,
-                        creationflags=_NO_WINDOW,
-                    )
-                except subprocess.TimeoutExpired as exc:
-                    # #330 / ledger C12: the partial stdout is not scanned, so built-in
-                    # calls made before a timeout are not audited (the streaming path is).
-                    raise ProviderError(
-                        "claude_cli_timeout",
-                        f"subprocess timed out after {self._timeout}s",
-                    ) from exc
-
-            # Parse before the exit-code check so a non-zero exit still flushes
-            # the built-in calls it saw.
-            payload = _scan_blocking_stream_stdout(result.stdout, builtin_calls)
-
-            if result.returncode != 0:
-                raise ProviderError(
-                    "claude_cli_exit",
-                    f"exit {result.returncode}: {_claude_failure_detail(result)}",
-                )
+                result, payload = self._run_blocking_cli(cmd, flat_prompt, builtin_calls)
 
             try:
                 if payload is None:
@@ -1579,7 +1582,8 @@ class ClaudeCliProvider(LLMProvider):
             except (ValueError, KeyError, TypeError) as exc:
                 raise ProviderError(
                     "claude_cli_parse",
-                    f"unexpected output format: {result.stdout[:200]!r}",
+                    "unexpected output format: "
+                    f"{_stdout_shape(result.stdout) or repr(result.stdout[:200])}",
                 ) from exc
 
             # Log per-call token usage (incl. cache_creation/cache_read) like the
@@ -1677,6 +1681,63 @@ def _tool_result_text(content: Any) -> str:
             for b in content
         )
     return json.dumps(content, default=str, ensure_ascii=False)
+
+
+def _partial_stdout_text(raw: bytes | str | None) -> str:
+    """`TimeoutExpired.stdout` as text (#380).
+
+    Even in text mode it is `bytes` on POSIX (the partial read taken before the kill),
+    `str` on Windows (re-read after the kill), and `None` when nothing arrived. Total:
+    never raises.
+    """
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", errors="replace")
+    return raw if isinstance(raw, str) else ""
+
+
+_FRAME_KIND_RE = re.compile(r"[A-Za-z0-9_.-]{1,20}")
+_SHAPE_MAX_KINDS = 8
+
+
+def _frame_kind_part(value: Any) -> str:
+    """A frame's `type` or `subtype` as it may be printed: only the CLI's own short
+    vocabulary (<= 20 chars of [A-Za-z0-9_.-]); anything else is the fixed `?`."""
+    return value if isinstance(value, str) and _FRAME_KIND_RE.fullmatch(value) else "?"
+
+
+def _stdout_shape(stdout: str | None) -> str | None:
+    """What a stream-json stdout held, as frame kinds and counts, never its text (#358).
+
+    Under `--verbose` the head of stdout is the CLI's configured hook output, so an
+    error detail built from "the first N characters" would carry whatever the user's
+    hooks print into the bridge logs. None when there is no frame, so callers keep
+    their raw snippet for plain-text and untyped-JSON stdout.
+    """
+    counts: dict[str, int] = {}
+    last = ""
+    other = 0
+    for raw in (stdout or "").split("\n"):
+        if not raw.strip():
+            continue
+        try:
+            obj = json.loads(raw)
+        except Exception:  # noqa: BLE001 — an error path must not raise (RecursionError on deep nesting)
+            obj = None
+        if isinstance(obj, dict) and "type" in obj:
+            last = _frame_kind_part(obj["type"])
+            if obj.get("subtype"):
+                last = f"{last}/{_frame_kind_part(obj['subtype'])}"
+            counts[last] = counts.get(last, 0) + 1
+        else:
+            other += 1
+    if not counts:
+        return None
+    listed = list(counts.items())
+    kinds = ", ".join(f"{kind} x{n}" for kind, n in listed[:_SHAPE_MAX_KINDS])
+    if len(listed) > _SHAPE_MAX_KINDS:
+        kinds += f", +{len(listed) - _SHAPE_MAX_KINDS} more"
+    tail = f"; {other} other line(s)" if other else ""
+    return f"{sum(counts.values())} frame(s), last={last}: {kinds}{tail}"
 
 
 def _scan_blocking_stream_stdout(
@@ -2129,7 +2190,7 @@ def _parse_stream_json_result(stdout: str) -> str:
         return "".join(assistant_chunks)
     raise ProviderError(
         "claude_cli_parse",
-        f"no result frame in stream-json output: {stdout[:300]!r}",
+        f"no result frame in stream-json output: {_stdout_shape(stdout) or repr(stdout[:300])}",
     )
 
 
