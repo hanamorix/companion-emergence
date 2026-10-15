@@ -50,17 +50,18 @@ What you can get back depends on how far the memory got:
 
 | State when the bug hit | Original text kept? | How to get it back |
 |---|---|---|
-| `fading` | Yes, in `content_snapshot`. | `MemoryStore.unfade(memory_id)` restores it. There is no command for this, and the forgetting pass will not do it: exempt memories are skipped before any state change, so a faded exempt memory stays faded. Stop the bridge first, for the reason `nell recover` does below. |
-| `lost` (hard-deleted) | No. The graveyard (`forgotten_memories.jsonl`) keeps only the summary written when the memory faded, its emotions and its hebbian neighbours. | `nell recover --persona <name>` restores summary stubs (see below). To get the original text back you need a copy of the persona directory from before the loss: `nell recover --persona <name> --from <that copy>`. |
+| `fading` | Yes, in `content_snapshot`. | With a copy of the persona directory from before the loss, `nell recover --persona <name> --from <that copy>` un-fades a memory that is faded in the live database and present in the copy. Without a copy there is no command: `MemoryStore.unfade(memory_id)` restores it. The forgetting pass will not do it either way: exempt memories are skipped before any state change, so a faded exempt memory stays faded. Stop the bridge first, for the reason `nell recover` does below. |
+| `lost` (hard-deleted) | Usually not. The graveyard (`forgotten_memories.jsonl`) keeps only the summary written when the memory faded, its emotions and its hebbian neighbours. The exception is a memory the dedup sweep removed: its full record is in `consolidation_archive.jsonl` (the `target` field), written before the row was deleted. | `nell recover --persona <name>` restores summary stubs (see below). To get the original text back you need either that archive entry or a copy of the persona directory from before the loss: `nell recover --persona <name> --from <that copy>`. |
 
 ### What `nell recover` does here
 
-The app's Connection panel has a **Recover memories…** button that runs this same command (`nell recover --persona <name> --json`, plus `--from` if you give it a folder). Leave the folder blank to restore from the graveyard.
+The app's Connection panel has a **Recover memories…** button. Opening it runs `nell recover --dry-run` and shows "N memories to restore, N to un-fade"; **Restore now** then runs the real command (`--from` is added if you gave it a folder; leave the folder blank to restore from the graveyard). The button never passes `--force`, and the bridge is running while the app is open, so the real run exits with "Bridge appears to be running". Stop the bridge first, or run `nell recover` from a terminal.
 
 - With no `--from`, it works from the graveyard. It restores a summary stub for **every** graveyard entry that is not in `memories.db` and has a creation timestamp. It cannot be limited to soul-linked memories.
 - Run `--dry-run` first to see the counts. It writes nothing.
 - It refuses to run while the bridge looks live, because it must not race the forgetting pass. `--force` overrides that.
 - Before it writes, it copies `memories.db`, `hebbian.db` and `emotion_vocabulary.json` into `recover-backup-<UTC timestamp>/` in the persona directory.
+- It rewrites `source-manifest.json`: `migrated_at_utc` and `lived_age_hours_at_migration` are set to now. That restarts the import grace, so every memory created before the recovery is exempt from fading for 7 lived days (`IMPORT_GRACE_LIVED_HOURS` in `brain/forgetting/policy.py`), not only the ones it restored. Know that before running it on a live persona.
 - Restoring summary stubs into a live persona changes what she remembers. That is the persona owner's call, so nothing runs it automatically.
 
 ### What does not help
