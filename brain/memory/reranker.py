@@ -27,15 +27,17 @@ Mirrors ``brain/memory/embeddings.py``'s ``FastEmbedProvider`` +
   - ``_reset_reranker_provider_cache()``: test-only reset hook, wired into
     ``tests/conftest.py``'s autouse fixture alongside the embedding one.
 
-Also owns the AUTO-SCALING rerank-width calculation (spec point 3): the
-number of candidates reranked self-derives from a MEASURED warm per-doc
-rerank latency on the actual host vs a fixed latency budget — no per-corpus,
-no per-persona, no operator tuning; only the budget itself
-(``LATENCY_BUDGET_SECONDS``) is an ops tunable. Pre-flip revision Change 3
-adds a second, MEMORY bound alongside the time one: a measured-once-warm-
-and-cached per-doc memory cost vs a cheap per-call, cgroup-aware RAM-
-headroom read — see ``get_rerank_width`` and the "Memory bound" section
-above it.
+Also owns the PER-MESSAGE rerank-width fit (name-recall fix R1, spec §1,
+S4/S23/S24/S32/S62/S67): the hourly width sample (one query's top-5 docs,
+cached ~1 h, diagnosis H8) is gone. Every recall-time rerank is timed and
+feeds a per-process, per-reranker-model cost model (a per-call overhead plus
+a per-token rate over the batch's padded size in reranker tokens, separated by
+least squares over running sums) and a memory model over call shapes
+(``a + b*T + c*B*L^2`` of the peak growth of the same calls, ``ram_fit``); each
+message then fits its own width to the lengths of its own candidates within
+the latency budget (``LATENCY_BUDGET_SECONDS``, the one ops tunable) and the
+measured RAM bound. See the "Per-message rerank width"
+section and ``rerank_for_recall``.
 
 F2a inc2 (#250 §2) originally owned a cached, first-use, on-box fp16-vs-fp32
 accuracy SELF-CHECK here (dual-loading both ONNX exports at first use to
@@ -53,19 +55,24 @@ See ``RERANKER_PRECISION`` (the tunable default, mirroring
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
+import os
 import statistics
 import sys
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Sequence
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from brain import tunables
+from brain.dev_constants import RERANK_MIN_REAL_CANDIDATES
+from brain.memory import cost_series, peak_rss, ram_fit
 from brain.memory.relevance import CANDIDATE_POOL
 
 if TYPE_CHECKING:
@@ -129,7 +136,7 @@ _AVX2_PRESENT = _detect_avx2()
 # Registered here (the owning module) as the DEFAULT only; a manual
 # override in tunables.json wins over this auto-detected value via
 # tunables.get_tunable's existing override-precedence mechanism (see
-# `get_rerank_width` below) — this AVX2-awareness only changes what the
+# `rerank_for_recall` below) — this AVX2-awareness only changes what the
 # default resolves to, never the override behavior itself. Read at call
 # time via tunables.get_tunable so a live override applies with no restart.
 LATENCY_BUDGET_SECONDS: float = tunables.register(
@@ -153,6 +160,23 @@ RERANKER_PRECISION_FP32 = "fp32"
 RERANKER_PRECISION: str = tunables.register("reranker.precision", RERANKER_PRECISION_FP16)
 
 
+class RerankTerminated(Exception):  # noqa: N818 - a control signal, not an error
+    """S223: a scoring call was stopped on purpose (the stop returned by `arm_terminate` was
+    called). Raised only to a thread that armed a stop; the RAM ladder maps it to
+    `RamMeasurementAbandoned`."""
+
+
+class RerankDeferred(Exception):  # noqa: N818 - a control signal, not an error
+    """S247: a rerank batch was held back because it does not fit the RAM bound (no memory model,
+    no way to size it, a known headroom below its predicted growth, or larger than any shape the
+    model has measured). Nothing was scored for it. The caller treats it as "not now" and tries
+    again later (the floor bootstrap's retry, `floor_calibration.get_bootstrap_floor`)."""
+
+
+def _noop() -> None:
+    return None
+
+
 class RerankerProvider(ABC):
     """Abstract reranker provider. Subclasses implement `rerank` and `model_id`."""
 
@@ -168,6 +192,72 @@ class RerankerProvider(ABC):
     def model_id(self) -> str:
         """Stable identifier for the model producing these scores."""
 
+    def arm_terminate(self) -> Callable[[], None]:
+        """S223: prepare to stop the NEXT scoring call(s) made by THIS thread: returns a `stop()`
+        (callable from any thread) that makes that call end early with `RerankTerminated`, until
+        `disarm_terminate()`. The default provider cannot stop a call: it returns a no-op, and the
+        running call simply finishes (S218: only its sample is discarded)."""
+        return _noop
+
+    def disarm_terminate(self) -> None:
+        """S223: end this thread's armed scope (see `arm_terminate`). Default: nothing to do."""
+        return None
+
+    def model_loaded(self) -> bool:
+        """S253: whether this provider's model is already read into memory, so a free-memory
+        check meant for the load has nothing left to guard. Default True: a provider with no
+        model file to read in (the fakes) has nothing to load."""
+        return True
+
+    def rerank_timed(
+        self, query: str, documents: list[str]
+    ) -> tuple[list[float], float, float | None]:
+        """`rerank()` plus the measurements the per-message width fit learns
+        from (name-recall fix R1, plan P-3): `(scores, seconds, peak_growth_bytes)`.
+
+        `seconds` is the wall time of the scoring call, read from the module
+        clock seam `_clock`; the third value is the call's PEAK resident-memory growth
+        in bytes (S220, S222: `peak_rss`; `None` when it cannot be read).
+        With the ONNX memory pool off the call returns its memory, so the RSS difference
+        would read about 0. Only RECALL paths call
+        this (passive recall and `search_memories`, via
+        `normalize_against_anchors`); bootstrap-floor and calibration scoring
+        call plain `rerank()` and so never feed the cost model (S24).
+
+        `CrossEncoderProvider` overrides this to take both readings INSIDE its
+        instance lock, so a concurrent recall waiting on the lock never
+        inflates the measured time."""
+        before = peak_rss.begin()
+        start = _clock()
+        try:
+            scores = list(self.rerank(query, documents))
+        except BaseException:
+            peak_rss.cancel()  # S248: stop the RSS sampler of a call that raised
+            raise
+        seconds = _clock() - start
+        return scores, seconds, peak_rss.growth_since(before)
+
+    def pair_token_lengths_timed(
+        self, query: str, documents: Sequence[str]
+    ) -> tuple[list[int] | None, float | None]:
+        """`pair_token_lengths` plus its seconds measured inside the provider's
+        lock (round-3 N3-1). This default measures nothing (`None`): the caller
+        times the call itself (test doubles hold no lock)."""
+        return self.pair_token_lengths(query, documents), None
+
+    def pair_token_lengths(self, query: str, documents: Sequence[str]) -> list[int] | None:
+        """Per document, the length in reranker TOKENS of the (query, document)
+        pair as the model sees it, after truncation (S62, S75): the cost model's
+        size unit, because the reranker pays per padded token, not per
+        character. `None` means token counts are unavailable.
+
+        This default has no tokenizer, so it counts characters as a stand-in
+        (`len(query) + len(doc)`): a provider with no tokenizer is only a test
+        double, where the unit is whatever the test scripts consistently.
+        `CrossEncoderProvider` overrides it with the loaded model's own
+        tokenizer."""
+        return [len(query) + len(doc) for doc in documents]
+
 
 class CrossEncoderProvider(RerankerProvider):
     """Real local cross-encoder reranker via `fastembed` (ONNX runtime, no torch).
@@ -176,13 +266,22 @@ class CrossEncoderProvider(RerankerProvider):
     (`model_for_tier(TIER_RERANKER)`), never hardcoded here — same
     convention as `FastEmbedProvider` in `embeddings.py`.
 
-    The model file is downloaded once (fastembed's own lazy-download-on-first-
-    use behavior) into `cache_dir` and used fully offline after — no network
-    call happens at rerank() time once the file is cached. Construction
-    itself does NOT download; the download is deferred to fastembed's own
-    internals on first `rerank()` call (`lazy_load=True`), matching
-    `FastEmbedProvider`'s posture.
+    The model file is downloaded once into `cache_dir` and used fully offline
+    after — no network call happens at rerank() time once the file is cached.
+    Construction DOES download it when it is not cached: fastembed's
+    `OnnxTextCrossEncoder.__init__` calls `download_model()` unconditionally,
+    and `lazy_load=True` defers only building the ONNX session to the first
+    `rerank()` call (the same posture as `FastEmbedProvider`). So never
+    construct one just to read its id: use `resolve_reranker_model_id()`.
     """
+
+    _session_checked = False  # S222: the live session's options are read back once (below)
+    # S223 (class defaults: tests build providers without `__init__`): see `__init__`.
+    _want_terminable = False
+    _run_wrapped = False
+    _wrapper_calls = 0
+    _drift_checked = False
+    _install_failed = False
 
     def __init__(self, model_id: str, cache_dir: str | Path) -> None:
         # Imported lazily (module-scoped, not top-level) so importing this
@@ -194,7 +293,21 @@ class CrossEncoderProvider(RerankerProvider):
         from fastembed.rerank.cross_encoder.text_cross_encoder import TextCrossEncoder
 
         self._model_id = model_id
-        self._model = TextCrossEncoder(model_name=model_id, cache_dir=str(cache_dir), lazy_load=True)
+        # S249: construction downloads the model file when it is not cached; remember that this process did.
+        cached = _model_file_cached(model_id, cache_dir)
+        # S222: the ONNX CPU memory pool and the memory-pattern planner are OFF, so the
+        # memory a call needed goes back after the call (the per-call growth is then what
+        # `ram_fit` models). fastembed exposes only the pool option; the pattern option is
+        # added through the options hook below.
+        self._model = TextCrossEncoder(
+            model_name=model_id,
+            cache_dir=str(cache_dir),
+            lazy_load=True,
+            enable_cpu_mem_arena=False,
+        )
+        if cached is False:
+            _note_model_downloaded(model_id)
+        _install_memory_pattern_off(self._model)
         # Same lazy-load check-then-act race FastEmbedProvider.__init__
         # documents (fastembed's OnnxTextModel first-load path has no lock of
         # its own); a shared instance of this provider (the process-wide
@@ -204,13 +317,248 @@ class CrossEncoderProvider(RerankerProvider):
         # rerank() call (construction + inference) behind one instance lock,
         # matching FastEmbedProvider's conservative choice.
         self._rerank_lock = threading.Lock()
+        # S223: stoppable calls. `_local.scope` is the RunOptions armed by the CALLING thread (read
+        # and written only by that thread); `_want_terminable` is set by the first arm and makes
+        # the next scored call wrap the session's `run` (a provider nobody ever armed, such as the
+        # bridge's, never touches the session); `_run_wrapped`, `_wrapper_calls` and
+        # `_drift_checked` are read and written under `_rerank_lock`.
+        self._local = threading.local()
+
+    def arm_terminate(self) -> Callable[[], None]:
+        """S223: see `RerankerProvider.arm_terminate`. Makes a fresh ONNX Runtime `RunOptions` for
+        this thread; the returned `stop()` sets its `terminate` flag, which ORT polls while the
+        call runs (a probe on this host: the production model's call stopped 118-216 ms after
+        the flag, against 6-9 s for the unstopped call). The options belong to THIS thread's call
+        only, so a stop can never reach another thread's call (the floor-bootstrap thread, a
+        reply's own recall rerank). A stop before the call starts makes the call start terminated.
+        `onnxruntime` unavailable: a no-op stop (the S218 fallback)."""
+        if self._install_failed:
+            return _noop  # the session cannot be wrapped (warned once): S218 fallback
+        try:
+            import onnxruntime as ort
+
+            options = ort.RunOptions()
+        except Exception:  # noqa: BLE001
+            log.warning("reranker: cannot make runs stoppable (onnxruntime RunOptions)", exc_info=True)
+            return _noop
+        self._local.scope = options
+        self._want_terminable = True
+
+        def stop() -> None:
+            options.terminate = True
+
+        return stop
+
+    def disarm_terminate(self) -> None:
+        """S223: end this thread's armed scope."""
+        self._local.scope = None
+
+    def _install_terminable_run(self) -> None:
+        """S223: once, before the first scored call after an arm, shadow the loaded session's
+        `run` with a wrapper that hands the calling thread's armed `RunOptions` to ONNX Runtime
+        (fastembed's own call passes none). Caller holds `_rerank_lock`. Without an armed scope on
+        the calling thread (or with options supplied by the caller) the wrapper forwards its
+        arguments untouched, so every other caller sees the original behaviour. A failure to
+        install is warned once and leaves the S218 fallback (the call finishes, its sample is
+        discarded)."""
+        if self._run_wrapped or not self._want_terminable:
+            return
+        self._run_wrapped = True
+        try:
+            inner = self._model.model
+            if getattr(inner, "model", None) is None:
+                inner.load_onnx_model()
+            session = inner.model
+            original = session.run
+            local = self._local
+
+            def terminable_run(output_names: Any, input_feed: Any, run_options: Any = None) -> Any:
+                self._wrapper_calls += 1
+                options = getattr(local, "scope", None)
+                if options is None or run_options is not None:
+                    return original(output_names, input_feed, run_options)
+                try:
+                    return original(output_names, input_feed, options)
+                except Exception as exc:
+                    if options.terminate:
+                        raise RerankTerminated("the scoring call was stopped on purpose") from exc
+                    raise
+
+            session.run = terminable_run
+        except Exception:  # noqa: BLE001 - never break a recall because the stop cannot be installed
+            log.warning(
+                "reranker: could not make the scoring session stoppable; a reply that starts "
+                "during the RAM measurement waits for its call (S223 fallback to S218)",
+                exc_info=True,
+            )
+            self._run_wrapped = False
+            self._want_terminable = False
+            self._install_failed = True  # never retried, never warned again
+
+    def _check_wrapper_reached_once(self, calls_before: int, documents: Sequence[str]) -> None:
+        """S223 drift check: after the first scored call (at least one document) through the
+        wrapper, warn once if the wrapper was never reached (fastembed no longer calls
+        `session.run`, so a stop would do nothing). Caller holds `_rerank_lock`. Never raises."""
+        if not self._run_wrapped or self._drift_checked or not documents:
+            return
+        self._drift_checked = True
+        if self._wrapper_calls == calls_before:
+            log.warning(
+                "reranker: the scoring call did not go through the session's run; the RAM "
+                "measurement cannot be stopped when a reply starts (S223 fallback to S218)"
+            )
 
     def rerank(self, query: str, documents: list[str]) -> list[float]:
         with self._rerank_lock:
-            return list(self._model.rerank(query, documents))
+            self._install_terminable_run()
+            calls_before = self._wrapper_calls
+            scores = list(self._model.rerank(query, documents))
+            self._check_wrapper_reached_once(calls_before, documents)
+            self._check_session_options_once()
+            return scores
+
+    def _check_session_options_once(self) -> None:
+        """S222: after the first call (the session exists), read back the live session's
+        options and warn if the memory pool or the memory patterns are still on (a
+        fastembed release that stopped honouring the hook would otherwise go unnoticed).
+        Caller holds `_rerank_lock`. Never raises."""
+        if self._session_checked:
+            return
+        self._session_checked = True
+        try:
+            options = self._model.model.model.get_session_options()
+            if options.enable_cpu_mem_arena or options.enable_mem_pattern:
+                log.warning(
+                    "reranker: the ONNX session still has the memory pool (%s) or memory patterns (%s) on; "
+                    "the RAM model assumes both off (S222)",
+                    options.enable_cpu_mem_arena,
+                    options.enable_mem_pattern,
+                )
+        except Exception:  # noqa: BLE001 - a diagnostic must never break a recall
+            log.debug("reranker: could not read back the ONNX session options", exc_info=True)
+
+    def rerank_timed(
+        self, query: str, documents: list[str]
+    ) -> tuple[list[float], float, float | None]:
+        """See `RerankerProvider.rerank_timed`. Both readings are taken while
+        holding `_rerank_lock`, so time spent WAITING for another thread's
+        rerank is never counted as this call's cost (plan P-3)."""
+        with self._rerank_lock:
+            self._install_terminable_run()  # before the clock: the install may load the session
+            calls_before = self._wrapper_calls
+            before = peak_rss.begin()
+            start = _clock()
+            try:
+                scores = list(self._model.rerank(query, documents))
+            except BaseException:
+                peak_rss.cancel()  # S248: stop the RSS sampler of a call that raised
+                raise
+            seconds = _clock() - start
+            growth = peak_rss.growth_since(before)
+            self._check_wrapper_reached_once(calls_before, documents)
+            self._check_session_options_once()
+        return scores, seconds, growth
+
+    def pair_token_lengths(self, query: str, documents: Sequence[str]) -> list[int] | None:
+        return self.pair_token_lengths_timed(query, documents)[0]
+
+    def pair_token_lengths_timed(
+        self, query: str, documents: Sequence[str]
+    ) -> tuple[list[int] | None, float | None]:
+        """`pair_token_lengths` with its seconds read inside `_rerank_lock`, so a
+        wait behind another thread's rerank (e.g. the re-measure job's) is
+        never timed as work (round-3 N3-1).
+
+        Surviving pair lengths in tokens (S62, S75, plan P-32): each (query,
+        document) pair is encoded with the loaded model's OWN tokenizer (the
+        same `encode_batch` call fastembed makes before scoring, truncation at
+        the model maximum already enabled on it) and counted with
+        `surviving_pair_token_lengths`. Fail-soft: on any failure the result is
+        `None` (logged), never a character count, so a different unit can never
+        reach the token-based cost model; the caller then does not rerank that
+        query (hand-off "sizes", `rerank_for_recall`): a batch whose size is
+        unknown cannot be held to the latency budget or the RAM bound."""
+        try:
+            with self._rerank_lock:
+                tokenizer = self._pair_tokenizer()
+                start = _clock()
+                encodings = tokenizer.encode_batch([(query, doc) for doc in documents])
+                seconds = _clock() - start
+            return surviving_pair_token_lengths(encodings), seconds
+        except Exception:  # noqa: BLE001 — fail-soft: a length probe must never break recall
+            # Warn with the traceback once per provider; later failures (the
+            # same broken accessor, every message) log at debug level.
+            first = not getattr(self, "_length_probe_failed", False)
+            self._length_probe_failed = True
+            (log.warning if first else log.debug)(
+                "reranker: surviving pair token lengths unavailable — sizing the rerank without them",
+                exc_info=first,
+            )
+            return None, None
+
+    def model_loaded(self) -> bool:
+        """S253: whether the ONNX session is built. fastembed's `lazy_load=True` defers it to the
+        first tokenizer use or rerank, so a constructed provider is not necessarily a loaded one.
+        The same test `_pair_tokenizer` makes before it loads (`getattr(inner, "model", None)`).
+        Any failure to tell counts as not loaded (the free-memory check then applies)."""
+        try:
+            return getattr(self._model.model, "model", None) is not None
+        except Exception:  # noqa: BLE001 - fail safe: not loaded
+            return False
+
+    def _pair_tokenizer(self) -> Any:
+        """The loaded fastembed cross-encoder's tokenizer (a PRIVATE fastembed
+        attribute, `TextCrossEncoder.model.tokenizer`; the same class of
+        coupling as the lazy-load notes above, kept behind this one accessor).
+        The tokenizer only exists once the ONNX model has loaded
+        (`lazy_load=True`), so this loads it the way fastembed's own first
+        `rerank()` would. Caller holds `_rerank_lock` (the same lock that
+        guards fastembed's unlocked first-load path)."""
+        inner = self._model.model
+        if getattr(inner, "model", None) is None:
+            inner.load_onnx_model()
+        tokenizer = inner.tokenizer
+        if tokenizer is None:
+            raise RuntimeError("reranker tokenizer not loaded")
+        return tokenizer
 
     def model_id(self) -> str:
         return self._model_id
+
+
+def _install_memory_pattern_off(text_cross_encoder: Any) -> None:
+    """S222: make the fastembed cross-encoder's session options also turn the memory-pattern
+    planner off. fastembed (0.8) exposes only `enable_cpu_mem_arena`; its `_load_onnx_model`
+    calls `self.add_extra_session_options(options, extra)` on the inner model, so an instance
+    attribute shadows the classmethod: it applies fastembed's own handling, then sets
+    `enable_mem_pattern = False`. A failure to install is warned once and never breaks
+    construction (the pool is still off; `_check_session_options_once` reports the live state)."""
+    try:
+        inner = text_cross_encoder.model
+        original = inner.add_extra_session_options
+
+        def _with_pattern_off(session_options: Any, extra_options: dict[str, Any]) -> None:
+            original(session_options, extra_options)
+            session_options.enable_mem_pattern = False
+
+        inner.add_extra_session_options = _with_pattern_off
+    except Exception:  # noqa: BLE001
+        log.warning("reranker: could not turn the ONNX memory patterns off (S222)", exc_info=True)
+
+
+def surviving_pair_token_lengths(encodings: Sequence[Any]) -> list[int]:
+    """Tokens of each (query, document) pair that the reranker actually runs,
+    counted from each pair encoding after truncation (S62, S75): the tokens
+    the tokenizer kept, special tokens included (the model pays for those
+    too), padding excluded. The encoding's `attention_mask` is 1 for exactly
+    those tokens; the batch's padding to its own longest pair (which the
+    tokenizer adds on `encode_batch`) carries 0, so it is not counted. A
+    pair truncated to the model maximum therefore counts at the maximum, and
+    a short pair at its own length.
+
+    Counted per pair, not per character: the same number of characters is a
+    very different token count in Latin text and in CJK or emoji text."""
+    return [sum(encoding.attention_mask) for encoding in encodings]
 
 
 class FakeRerankerProvider(RerankerProvider):
@@ -250,6 +598,33 @@ _provider_cache: dict[str, RerankerProvider] = {}
 _provider_cache_lock = threading.Lock()
 
 
+# Unrecognised `reranker.precision` values already warned about (the due checks
+# call `resolve_reranker_model_id` on every idle pass: warn once per value).
+_warned_precisions: set[object] = set()
+
+
+def resolve_reranker_model_id() -> str:
+    """The runtime reranker model id (the id `build_reranker_provider()`'s
+    provider reports from `model_id()`): `model_tier.MODEL_RERANKER_FP16` (the
+    pinned default) or `TIER_RERANKER`'s fp32 id when the `reranker.precision`
+    tunable says "fp32". Pure and cheap: builds and loads nothing, so the
+    floor-bootstrap due checks can use it every pass."""
+    from brain.bridge.model_tier import MODEL_RERANKER_FP16, TIER_RERANKER, model_for_tier
+
+    precision = tunables.get_tunable("reranker.precision", RERANKER_PRECISION)
+    if precision == RERANKER_PRECISION_FP32:
+        return model_for_tier(TIER_RERANKER)
+    if precision != RERANKER_PRECISION_FP16 and precision not in _warned_precisions:
+        _warned_precisions.add(precision)
+        log.warning(
+            "reranker: unrecognized reranker.precision override %r — falling back to "
+            "the pinned default %r",
+            precision,
+            RERANKER_PRECISION,
+        )
+    return MODEL_RERANKER_FP16
+
+
 def build_reranker_provider(*, store: MemoryStore | None = None) -> RerankerProvider:
     """The production reranker provider: a `CrossEncoderProvider` pinned to
     `RERANKER_PRECISION`'s resolved id — `model_tier.MODEL_RERANKER_FP16`
@@ -265,9 +640,10 @@ def build_reranker_provider(*, store: MemoryStore | None = None) -> RerankerProv
     constructed per resolved model_id now, never both. `store` is kept as a
     keyword-only parameter purely for call-site compatibility with every
     existing production caller (`semantic_recall.run_semantic_recall`,
-    `search_memories._semantic_top_k`, `supervisor._run_calibration_tick`/
-    `_run_deploy_recalibration_check`, `floor_calibration.py`) — it is no
-    longer read by this function at all.
+    `search_memories._semantic_top_k`) — it is no longer read by this
+    function at all. The supervisor's calibration tick and deploy
+    recalibration job do not build a provider: they read the id from
+    `resolve_reranker_model_id()`.
 
     PROCESS-WIDE CACHING, same rationale as `embeddings.build_embedding_
     provider`: constructing a CrossEncoderProvider builds a real ONNX
@@ -286,19 +662,9 @@ def build_reranker_provider(*, store: MemoryStore | None = None) -> RerankerProv
 
     fp32_model_id = model_for_tier(TIER_RERANKER)
     cache_dir = get_cache_dir()
-    precision = tunables.get_tunable("reranker.precision", RERANKER_PRECISION)
-    if precision == RERANKER_PRECISION_FP32:
-        model_id = fp32_model_id
-    else:
-        if precision != RERANKER_PRECISION_FP16:
-            log.warning(
-                "reranker: unrecognized reranker.precision override %r — falling back to "
-                "the pinned default %r",
-                precision,
-                RERANKER_PRECISION,
-            )
+    model_id = resolve_reranker_model_id()
+    if model_id == MODEL_RERANKER_FP16:
         _register_fp16_reranker_model(MODEL_RERANKER_FP16, fp32_model_id)
-        model_id = MODEL_RERANKER_FP16
 
     provider = _provider_cache.get(model_id)
     if provider is not None:
@@ -334,11 +700,11 @@ def _bootstrap_reranker_provider(model_id: str) -> RerankerProvider:
     `build_reranker_provider` reads/writes, double-checked locking to
     match) so a caller that resolves to this same `model_id` elsewhere in
     the process reuses the already-loaded ONNX session instead of paying
-    for a second one. In practice this is very often a cache HIT: every
-    production call site that ends up asking `get_reranker_floor` a
-    question (`run_semantic_recall`, `_semantic_top_k`) has ALREADY
-    resolved/cached a provider for the exact model_id in question via
-    `build_reranker_provider` by the time it does so.
+    for a second one. In production a cache HIT is the rule: the only
+    caller path, `floor_startup.run_rerank_floor` (first need, the per-message
+    retry, or the next-lull retry job; name-recall fix S91/S92), calls
+    `build_reranker_provider()` first, which registers the fp16 model and
+    caches the provider for the runtime model_id.
     """
     cached = _provider_cache.get(model_id)
     if cached is not None:
@@ -367,321 +733,1349 @@ def _reset_reranker_provider_cache() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Auto-scaling rerank width (spec point 3).
+# Per-message rerank width: the cost model (name-recall fix R1, spec §1).
 # ---------------------------------------------------------------------------
 #
-# The number of candidates actually sent through the (comparatively
-# expensive) reranker self-derives from a MEASURED warm per-doc rerank
-# latency on the actual host vs LATENCY_BUDGET_SECONDS — no per-corpus,
-# per-persona, or operator tuning; a one-time hardware self-calibration,
-# cached and periodically recomputed.
+# Replaces the hourly width measurement (`get_rerank_width` and its
+# `_latency_cache` / `_memory_cache`: one query's top-5 documents, timed once
+# and cached for an hour, diagnosis H8; a message of long monologue traces
+# at the top of the hour pinned every message of that hour to a width of 2
+# to 4). Now EVERY recall-time rerank is a measurement (S24):
+#
+#   - A rerank batch of `pairs` documents whose longest (query, document)
+#     pair is `L` reranker tokens costs `overhead + rate * x` seconds,
+#     x = pairs * L,
+#     because the reranker pads every pair in a batch to the longest one
+#     (fastembed `preprocessor_utils.load_tokenizer` enables padding; S67).
+#   - `overhead` and `rate` are separated by ordinary least squares over the
+#     samples of the recall reranks (and the S100 re-measure job's), per
+#     reranker model id (spec §1). The samples are the last 24 hours' (S146,
+#     S114; `cost_series`), saved in memories.db so a restart continues from
+#     them, with no averaging constant: every sample in the window weighs the
+#     same.
+#   - MEMORY growth by call shape (S32, S220): a call of `pairs` (B) documents padded to
+#     the longest pair `L` needs about a + b*T + c*B*L^2 bytes of peak extra memory
+#     (T = B*L), fitted per machine by `ram_fit` over every measured call of the window and
+#     checked against the live headroom. With the ONNX memory pool and memory patterns off
+#     (S222) the call gives its memory back, so each call's own PEAK growth is the sample
+#     (`peak_rss`); there is no high water and nothing is "already resident".
+#   - The size unit is reranker TOKENS (S75), counted per pair from the
+#     reranker's own tokenizer after truncation (`pair_token_lengths`), not
+#     characters: the reranker pays per padded token, and the same number
+#     of characters is a very different token count in Latin text and in CJK
+#     or emoji text (samples through the shipped tokenizer: about 0.2 tokens
+#     per character in plain English words, about 0.5 in Chinese, about 1.0
+#     in emoji).
+#
+# Only recall reranks feed it (`rerank_timed`, called by
+# `normalize_against_anchors`); the two warm-up reranks a process runs first
+# are discarded, as the hourly measurement discarded them (S24/S32).
+#
+# The time series and the memory samples are rolling 24-hour windows saved in
+# memories.db (S146, S171; see `cost_series`); the warm-up state and the kept fit stay process
+# memory. The first measured recall rerank of a process per model id waits for a usable memory
+# model (S200: measured at a lull by the ladder below; a window with too few shapes or no
+# full-length sample is no model), where the per-call peak is readable (Linux: the exact reset reading; macOS and Windows: an RSS
+# sampling thread, S248; where neither reads, no RAM bound exists, S206 posture). A running process keeps the last usable fit it computed when
+# the window stops giving one (a quiet day; H4b: it never reranks without a RAM bound) and has
+# the next lull refresh it.
+# Stuck-width recovery (S100, S113, S116): the last query that went to the cosine path for lack
+# of budget is kept per model id; while the estimate says its first 5 candidates do not fit the
+# full latency budget (time term), the `rerank_width_remeasure` gated job re-measures them once
+# per chat lull (`stuck_width_due`, `remeasure_stuck_width`), behind the same memory-model gate
+# as every rerank.
+
+# Clock seam: `rerank_timed` reads elapsed time through this name so tests can
+# inject a scripted clock (criterion C1a). Production: `time.perf_counter`, not
+# `time.monotonic`: on Windows (Python 3.12) `monotonic` ticks every ~15.6 ms, so a
+# fast scoring call reads 0.00 s, the time fit gets a rate of 0 and the RAM ladder's
+# batch phase never runs. `perf_counter` has a sub-microsecond tick on every OS.
+_clock: Callable[[], float] = time.perf_counter
 
 # Cold-cache timing trap ([[single-shot-timing-cold-cache-trap]]): the first
-# rerank() call on a freshly-constructed provider pays ONNX session
-# warm-up cost far above steady-state — discard this many calls before
-# starting to time.
+# rerank() calls on a freshly-constructed provider pay ONNX session warm-up
+# cost far above steady state. The first recall rerank of a process (per
+# reranker model id) is preceded by this many single-document reranks whose
+# results and timings are discarded (S24/S32 "two warm-up reranks discarded
+# as today").
 _WARMUP_RERANKS = 2
 
-# Average over this many WARM calls (post-discard) rather than trusting a
-# single sample, a lone reading can still jitter (scheduler noise, a
-# concurrent backfill tick). Must stay >= CALIBRATION_SAMPLE_SIZE below,
-# since `_doc_for`'s index restarts at 0 in each loop (warmup and measured
-# are counted separately), a measured-call count smaller than the sample
-# size would leave the tail of a wider sample never actually measured.
-_MEASURE_RERANKS = 5
 
-# Recompute the cached per-doc figure this often (startup + periodic, spec
-# point 3) rather than trusting a single boot-time measurement forever — a
-# long-lived process could see its host's effective throughput change
-# (thermal throttling, a noisy neighbor). Not an operator tunable: this is
-# an internal self-calibration cadence, not a latency/behavior knob.
-_LATENCY_RECOMPUTE_INTERVAL_SECONDS = 3600.0
+@dataclass(frozen=True)
+class RerankCostEstimate:
+    """The fitted cost model for one reranker model id (see the section
+    header). `ram_fit` is the memory model over call shapes (S220): the window's usable fit, or
+    this process's last usable one (`ram_fit_kept`, H4b: a running process never reranks without
+    a RAM bound), or `None` (the RAM term of the width fit is then skipped, and so is the
+    re-measure job's RAM-headroom check). `measured_batches` = the measurements behind the time
+    fit in effect."""
 
-_MEASURE_QUERY = "warm-up latency calibration query"
-
-# FALLBACK-ONLY synthetic calibration document, used only when no real
-# candidate-pool documents are available to calibrate against (see
-# CALIBRATION_SAMPLE_SIZE below for the preferred path). #231-fix: the
-# ORIGINAL version of this string was a 17-word stub ("a short
-# representative memory sentence used only to measure warm per-doc
-# cross-encoder rerank latency on this host") — a live no-AVX2 run found
-# that stub measures ~7-8ms/doc, while REAL corpus documents reranked in
-# production cost ~128ms/doc: the auto-scale throttle this feeds
-# (`get_rerank_width`) was a structural no-op because the calibration input
-# was not representative of what actually gets reranked. Sized instead to
-# match aggregate content-length stats pulled from a live production memory
-# corpus (mean ~300 chars / ~45 words, median ~175 chars / ~25 words per
-# memory) — this fallback targets the MEAN (the longer of the two), so a
-# measurement that has to fall back to it errs toward under-throttling (a
-# wider width) rather than over-throttling.
-_MEASURE_DOCUMENT = (
-    "a longer representative memory passage, sized to match a typical "
-    "corpus document rather than a short placeholder, used only to measure "
-    "warm per-document cross-encoder rerank latency realistically on this "
-    "host so the auto-scaling width calculation reflects real production "
-    "cost instead of an artificially cheap calibration figure"
-)
-
-# How many REAL candidate-pool documents callers should sample for
-# calibration when they can supply them (the preferred path, see
-# `get_rerank_width`'s `sample_documents` parameter). Calibration runs
-# synchronously in-band on the first recall of the process (see
-# `_warm_per_doc_latency`), so this is a tradeoff, not a free knob: a wider
-# sample makes the measured per-doc figure more representative of the real
-# corpus, but each extra sampled document is roughly one extra rerank() call
-# added to that one-time first-recall calibration cost (kept in lockstep
-# with `_MEASURE_RERANKS` above, see its comment).
-CALIBRATION_SAMPLE_SIZE = 5
-
-# model_id -> (per_doc_seconds, measured_at_monotonic). Process-wide, mirrors
-# the provider cache above — one measurement per model_id, shared across
-# every recall in the process.
-_latency_cache: dict[str, tuple[float, float]] = {}
-_latency_cache_lock = threading.Lock()
+    overhead_seconds: float
+    seconds_per_token: float
+    ram_fit: ram_fit.RamFit | None
+    measured_batches: int
+    ram_fit_kept: bool = False
 
 
-def _measure_warm_per_doc_latency(
-    provider: RerankerProvider, sample_docs: list[str] | None = None
-) -> float:
-    """Time `_MEASURE_RERANKS` single-document rerank() calls AFTER
-    discarding `_WARMUP_RERANKS` cold ones; return the mean seconds/doc.
+@dataclass(frozen=True)
+class _BudgetMiss:
+    """The last query per reranker model id that went to the cosine path for
+    lack of budget (S113): its text, its first `RERANK_MIN_REAL_CANDIDATES`
+    prefix candidates and their pair token sizes, and the anchors' pair sizes.
+    Held until a rerank proves 5 fit (S116 a), the re-measure job clears or
+    drops it (S116), or a newer miss replaces it. Holds one query text (a whole
+    paste on the fallback path) and 5 memory texts per model id."""
 
-    A single-document rerank isolates per-doc cost from batching effects —
-    the width calculation multiplies this back out linearly
-    (`floor(budget / per_doc)`), matching how `get_rerank_width` actually
-    uses the figure.
-
-    #231-fix: `sample_docs`, when non-empty, is REAL candidate-pool document
-    content supplied by the caller (the preferred calibration input — see
-    `get_rerank_width`) and is cycled through across the warmup + measured
-    calls, one document per call, so the mean reflects real corpus document
-    length rather than always the same document. Falls back to the fixed
-    synthetic `_MEASURE_DOCUMENT` (see its own comment) only when no real
-    docs are available — e.g. a caller that hasn't threaded them through, or
-    an empty candidate pool.
-    """
-    docs = list(sample_docs) if sample_docs else [_MEASURE_DOCUMENT]
-
-    def _doc_for(i: int) -> list[str]:
-        return [docs[i % len(docs)]]
-
-    for i in range(_WARMUP_RERANKS):
-        list(provider.rerank(_MEASURE_QUERY, _doc_for(i)))
-
-    samples: list[float] = []
-    for i in range(_MEASURE_RERANKS):
-        start = time.monotonic()
-        list(provider.rerank(_MEASURE_QUERY, _doc_for(i)))
-        samples.append(time.monotonic() - start)
-    return sum(samples) / len(samples)
+    query: str
+    documents: tuple[str, ...]
+    candidate_tokens: tuple[int, ...]
+    anchor_tokens: tuple[int, ...]
 
 
-def _warm_per_doc_latency(
-    provider: RerankerProvider, sample_docs: list[str] | None = None
-) -> float:
-    """Cached warm per-doc latency for `provider`'s model_id, measuring (and
-    caching) on first use or once `_LATENCY_RECOMPUTE_INTERVAL_SECONDS` has
-    elapsed since the last measurement.
+# The memory samples are the saved series `_ram_shapes`; process memory holds the model ids
+# whose warm-up has run, the last query per
+# model id that went to the cosine path for lack of budget (S113), the chat
+# activity marker of each model id's last re-measure (S100), and the "too long"
+# verdicts (S127: remembered until the cost estimate next changes, decided by
+# which samples the window holds, not by comparing fitted floats; saved with the
+# host-keyed series and read back once per process, S179), and the kept memory fits
+# (`_ram_fit_kept`, H4b). One lock
+# guards them all (every read and every read-modify-write), so a concurrent
+# passive recall, `search_memories` call (#297: the tool runs in a bridge
+# worker thread) and the re-measure job never lose an update. The time series
+# itself is `_rerank_cost` (rolling window, memories.db, `cost_series`).
+_rerank_cost = cost_series.CostSeries("rerank")
+# S220: the memory growth of every measured call by shape (pairs, padded length), saved like the
+# time series (host-keyed, 24 h window; `cost_series.RAM_SHAPE_SERIES`). The fit over its window is
+# `ram_fit.fit_ram`; memoised below per (database, model id) so one reply does not refit it at the
+# gate, the width fit and the estimate.
+_ram_shapes = cost_series.CostSeries(cost_series.RAM_SHAPE_SERIES)
+# H4b (S180/S204 in their new form): the last usable fit this running process computed, per
+# (database, model id). It serves the gate and the width fit when the window no longer gives one
+# (the full-length sample aged out after a quiet day). Process memory, never saved; guarded by
+# `_cost_lock` with the memo.
+_ram_fit_kept: dict[tuple[str, str], ram_fit.RamFit] = {}
+_ram_fit_memo: dict[
+    tuple[str, str], tuple[tuple[ram_fit.ShapeGroup, ...], bool, ram_fit.RamFit | None]
+] = {}
+_warmed_model_ids: set[str] = set()
 
-    The first semantic recall of each process pays this calibration cost
-    in-band (the warmup plus measured reranks above run synchronously before
-    that recall's width is known). It is cached after that first call, so
-    every later recall in the process reads the cached value instead —
-    `sample_docs` passed on a later (cache-hit) call is simply ignored, same
-    as it would be if the whole function signature hadn't changed; only the
-    FIRST caller within `_LATENCY_RECOMPUTE_INTERVAL_SECONDS` actually
-    supplies the docs a measurement uses.
+# S249: model ids whose model file this process DOWNLOADED when it built the provider (the file was
+# not in the cache). The RAM fit is never learned in such a process (the download's buffers inflate the
+# resident set the peak is read from), and it does not rerank until it restarts. Cleared only by tests.
+_downloaded_model_ids: set[str] = set()
 
-    Fail-soft: a measurement failure (e.g. the real model errors on the
-    calibration call) logs and returns 0.0 — `get_rerank_width` treats 0.0
-    as "no latency signal, don't throttle by it," capping width by pool size
-    / CANDIDATE_POOL alone instead. Never raises into a recall.
-    """
-    model_id = provider.model_id()
-    now = time.monotonic()
-    with _latency_cache_lock:
-        cached = _latency_cache.get(model_id)
-        if cached is not None and (now - cached[1]) < _LATENCY_RECOMPUTE_INTERVAL_SECONDS:
-            return cached[0]
+# S253: the free-memory conditions already logged (one log line per condition until the check next passes).
+# Guarded by `_cost_lock`; cleared only by tests.
+_memory_wait_logged: set[str] = set()
 
-    # Measure OUTSIDE the lock — a real rerank call can take real time
-    # (seconds), and holding the lock across it would serialize every
-    # concurrent recall behind this one measurement.
+
+def _downloaded_here(model_id: str) -> bool:
+    with _cost_lock:
+        return model_id in _downloaded_model_ids
+
+
+def _note_model_downloaded(model_id: str) -> None:
+    with _cost_lock:
+        _downloaded_model_ids.add(model_id)
+
+
+def _registry_entry(model_id: str) -> dict | None:
+    """S249, S253: fastembed's own description of `model_id` (`model`, `sources.hf`, `model_file`,
+    `size_in_GB`), or `None` when the model is not in its registry. May raise: the callers wrap it."""
+    from fastembed.rerank.cross_encoder.text_cross_encoder import TextCrossEncoder
+
+    for description in TextCrossEncoder.list_supported_models():
+        if description.get("model") == model_id:
+            return description
+    return None
+
+
+def _model_file_cached(model_id: str, cache_dir: str | Path) -> bool | None:
+    """S249: whether fastembed's construction will find the model file in the cache (True) or has to
+    download it (False); `None` when that cannot be decided (the model is not in fastembed's registry, or
+    any error: the caller then counts the model as NOT downloaded and warns once). The repository and the file
+    come from fastembed's own description of the model (`sources.hf`, `model_file`), never from the model id
+    (the registered fp16 export is another file of the fp32 repository). `try_to_load_from_cache` reads the
+    same hub layout fastembed writes (`models--org--name/snapshots/<rev>/<file>`, `refs/main`) and neither
+    downloads nor raises for an uncached file."""
     try:
-        measured = _measure_warm_per_doc_latency(provider, sample_docs)
-    except Exception:  # noqa: BLE001 — fail-soft: never break recall over a calibration failure
-        log.exception("reranker: warm-latency measurement failed — width will not be latency-throttled")
-        measured = 0.0
+        from huggingface_hub import try_to_load_from_cache
 
-    with _latency_cache_lock:
-        _latency_cache[model_id] = (measured, now)
-    return measured
+        description = _registry_entry(model_id)
+        if description is None:
+            return None
+        repo = (description.get("sources") or {}).get("hf")
+        filename = description.get("model_file")
+        if not repo or not filename:
+            return None
+        return isinstance(try_to_load_from_cache(repo, filename, cache_dir=str(cache_dir)), str)
+    except Exception:  # noqa: BLE001 - detection must never break building the provider
+        _warn_ram_figure_once("could not tell whether the reranker model was already cached (S249)", exc_info=True)
+        return None
 
 
-def _reset_latency_cache() -> None:
-    """Test-only: clear the measured-latency cache."""
-    with _latency_cache_lock:
-        _latency_cache.clear()
+def _positive_finite(value: object) -> float | None:
+    """`value` as a float when it is a positive finite number, else `None` (S253: a size of zero, a
+    negative or non-finite one, or a non-number is no size)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) and number > 0.0 else None
+
+
+def _reranker_model_file_bytes(model_id: str, cache_dir: str | Path) -> float | None:
+    """S253: the size in bytes of the ONNX file fastembed loads for `model_id`: the on-disk size of the
+    registered file when it is cached (the same registry lookup and hub layout as `_model_file_cached`, so the
+    registered fp16 export is its own file, not the fp32 one). A file that is not cached yet (this process is
+    about to download it, S249) has no size on disk: the registry's own declared `size_in_GB` (times 1e9) of
+    the same entry stands in for it. `None` when neither gives a positive finite size (no registry entry, an
+    error, a zero size): the caller then does not load (fail safe) and warns once."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        description = _registry_entry(model_id)
+        if description is None:
+            return None
+        repo = (description.get("sources") or {}).get("hf")
+        filename = description.get("model_file")
+        if repo and filename:
+            path = try_to_load_from_cache(repo, filename, cache_dir=str(cache_dir))
+            if isinstance(path, str):
+                size = _positive_finite(os.path.getsize(path))
+                if size is not None:
+                    return size
+        declared = _positive_finite(description.get("size_in_GB"))
+        return None if declared is None else declared * 1e9
+    except Exception:  # noqa: BLE001 - a size probe must never break a job
+        _warn_ram_figure_once("could not read the reranker model file's size (S253)", exc_info=True)
+        return None
+
+
+def _runtime_model_file_bytes(model_id: str) -> float | None:
+    """S253: `_reranker_model_file_bytes` for the runtime reranker in the shared model cache. The pinned fp16
+    export is registered with fastembed first, as `build_reranker_provider` does, because this can run before
+    the provider is ever built (the registry would not know the id yet and the size would read as undetermined)."""
+    try:
+        from brain.bridge.model_tier import MODEL_RERANKER_FP16, TIER_RERANKER, model_for_tier
+        from brain.paths import get_cache_dir
+
+        if model_id == MODEL_RERANKER_FP16:
+            _register_fp16_reranker_model(MODEL_RERANKER_FP16, model_for_tier(TIER_RERANKER))
+        return _reranker_model_file_bytes(model_id, get_cache_dir())
+    except Exception:  # noqa: BLE001 - a size probe must never break a job (the first rung's bound reaches it too)
+        _warn_ram_figure_once("could not read the reranker model file's size (S253)", exc_info=True)
+        return None
+
+
+_budget_misses: dict[str, _BudgetMiss] = {}
+_remeasured_marker: dict[str, object] = {}
+
+
+@dataclass(frozen=True)
+class _Verdict:
+    """S127: the wall time a "too long" verdict was reached at and how many
+    window samples had been taken at or before it. The verdict holds while no
+    sample was taken after that time and those samples are all still in the
+    window."""
+
+    taken_at: float
+    before: int
+
+
+_too_long: dict[str, _Verdict] = {}
+# S179: the (database, model id) pairs whose saved verdict row this process has read
+# (or written), so the row is read once per process, not at every due check.
+_too_long_loaded: set[tuple[str, str]] = set()
+_cost_lock = threading.Lock()
+
+def _window_ram_fit(store: MemoryStore, model_id: str) -> ram_fit.RamFit | None:
+    """The usable fit over the shape series' window (S220), or `None` (not enough distinct
+    shapes, no full-length sample, no finished ladder pass, or the database read failed). A
+    window whose ladder pass did not finish (no completion marker) gives no fit: its single
+    pairs would extrapolate batch sizes (under-predicting them by 17 to 100 percent). One
+    aggregate read per call (a row per distinct shape); the fit is memoised on the exact groups,
+    so repeated calls within a reply cost one read and a tuple comparison. A usable fit is also
+    remembered as the process's kept fit (H4b)."""
+    rows = _ram_shapes.shape_groups(store, model_id)
+    if rows is None:
+        return None
+    groups = tuple(ram_fit.groups_from_rows(rows))
+    complete = ram_fit.ladder_complete(rows)
+    key = (cost_series._store_key(store), model_id)
+    with _cost_lock:
+        memo = _ram_fit_memo.get(key)
+    if memo is not None and memo[0] == groups and memo[1] == complete:
+        return memo[2]
+    fit = ram_fit.fit_ram(groups) if complete else None
+    with _cost_lock:
+        _ram_fit_memo[key] = (groups, complete, fit)
+        if fit is not None:
+            _ram_fit_kept[key] = fit
+    return fit
+
+
+def _ram_fit_for(store: MemoryStore, model_id: str) -> tuple[ram_fit.RamFit | None, bool]:
+    """`(fit, kept)`: the window's usable fit, else this running process's last usable one
+    (`kept` True), else `(None, False)`. The window is read BEFORE the kept fit, and a fit the
+    window gives is stored as the kept one before it is returned, so a reader never sees the
+    window answer and then no kept fit."""
+    fit = _window_ram_fit(store, model_id)
+    if fit is not None:
+        return fit, False
+    with _cost_lock:
+        kept = _ram_fit_kept.get((cost_series._store_key(store), model_id))
+    return (kept, True) if kept is not None else (None, False)
+
+
+def rerank_cost_estimate(model_id: str, store: MemoryStore) -> RerankCostEstimate | None:
+    """The current cost model for `model_id`: the time fit of the last 24
+    hours (S146; saved, so available from the first message after a restart)
+    and the memory model over call shapes (S220: the window's usable fit, else this process's
+    last one). `None` when there is no time estimate (the first startup on this machine: the
+    width is then the S5 minimum, S24). A process with neither a window fit nor a kept fit has
+    `ram_fit = None` and takes the cosine path (S200: `search_paragraphs` and
+    `rerank_for_recall` check `ram_figure_ready` first)."""
+    fit = _rerank_cost.fit(store, model_id)
+    if fit is None:
+        return None
+    ram, kept = _ram_fit_for(store, model_id)
+    return RerankCostEstimate(
+        overhead_seconds=fit.overhead,
+        seconds_per_token=fit.rate,
+        ram_fit=ram,
+        measured_batches=fit.samples,
+        ram_fit_kept=kept,
+    )
+
+
+def _record_rerank_cost(
+    model_id: str,
+    store: MemoryStore,
+    padded_tokens: int,
+    seconds: float,
+    peak_growth_bytes: float | None,
+    *,
+    pairs: int | None = None,
+    longest: int | None = None,
+    full_length: bool = False,
+) -> None:
+    """Add one measured rerank: its time and, when its peak growth could be read, its memory
+    growth by shape `(pairs, longest)` to the buffered series (S164: nothing is written to the
+    database here). Every call is a sample (S220: no high water; with the memory pool off the
+    call's growth is its own). `full_length` marks the ladder's full-input-length pair (H4)."""
+    if peak_growth_bytes is not None and pairs is not None and longest is not None and not _downloaded_here(model_id):
+        x = ram_fit.encode_shape(pairs, longest, full=full_length)
+        if x is None:
+            _warn_ram_figure_once(f"a rerank of {pairs} pairs x {longest} tokens cannot be recorded in the RAM series")
+        else:
+            _ram_shapes.record(store, model_id, x, max(0.0, peak_growth_bytes))
+    _rerank_cost.record(store, model_id, padded_tokens, seconds)
+
+
+def _remember_too_long(model_id: str, store: MemoryStore) -> None:
+    """S127: remember that the job measured the stuck record's 5 candidates
+    over the full budget. The job's own sample is already buffered, so it was
+    taken at or before this moment and counts in the held total; the verdict
+    then ends only when a sample arrives or one of those ages out. A failed read
+    remembers nothing (the job simply runs again at the next lull)."""
+    try:
+        now = cost_series._wall_clock()
+        before, _after = _rerank_cost.window_counts(store, model_id, now)
+    except Exception:  # noqa: BLE001 - fail soft
+        log.warning("rerank width re-measure: could not record a too-long verdict", exc_info=True)
+        return
+    marker = (cost_series._store_key(store), model_id)
+    with _cost_lock:
+        _too_long[model_id] = _Verdict(now, before)
+        _too_long_loaded.add(marker)
+    # S179: saved with the host-keyed series, so a restart does not run the
+    # over-budget rerank again. Written here, by the lull job (never on the reply
+    # path, S164); a failed write leaves the in-process verdict standing.
+    try:
+        _rerank_cost.save_verdict(store, model_id, now, before)
+    except Exception as exc:  # noqa: BLE001 - fail soft; warned once, then debug
+        cost_series._note_failure("verdict save", exc)
+
+
+def _load_saved_verdict(model_id: str, store: MemoryStore) -> _Verdict | None:
+    """The in-process verdict for `model_id`, first reading the saved row once per
+    (database, model id) per process (S179: a verdict reached before a restart).
+    A failed read means no verdict for now (the job may run; the read is tried
+    again at the next consult): there is nothing in this process to keep, and a
+    database that cannot answer here cannot supply the estimate that makes the
+    job due either. The database is read outside `_cost_lock`."""
+    marker = (cost_series._store_key(store), model_id)
+    try:
+        row = _rerank_cost.load_verdict(store, model_id)
+    except Exception:  # noqa: BLE001 - fail soft: no verdict, tried again next time
+        log.debug("rerank width re-measure: saved verdict read failed", exc_info=True)
+        return None
+    with _cost_lock:
+        _too_long_loaded.add(marker)
+        held = _too_long.get(model_id)
+        if held is not None or row is None:
+            return held
+        loaded = _Verdict(row[0], row[1])
+        _too_long[model_id] = loaded
+        return loaded
+
+
+def _end_verdict(model_id: str, store: MemoryStore, verdict: _Verdict) -> None:
+    """The verdict is over (S175): forget it in this process and delete its saved
+    row (only if it is still the one reached at `verdict.taken_at`; best effort)."""
+    with _cost_lock:
+        if _too_long.get(model_id) is verdict:
+            del _too_long[model_id]
+    try:
+        _rerank_cost.clear_verdict(store, model_id, verdict.taken_at)
+    except Exception:  # noqa: BLE001 - fail soft: a stale row only ends again at the next load
+        log.debug("rerank width re-measure: could not delete the saved verdict", exc_info=True)
+
+
+def _too_long_remembered(model_id: str, store: MemoryStore) -> bool:
+    """Whether `model_id` has a remembered S127 "too long" verdict that still
+    holds, in this process or saved by an earlier one on this machine (S179). A
+    verdict whose window changed (a sample arrived after it, or one it counted
+    aged out) is dropped here, when consulted, and its saved row deleted. A failed
+    read of the window keeps the verdict (no over-budget re-run on a database
+    hiccup)."""
+    marker = (cost_series._store_key(store), model_id)  # outside the lock: it resolves a path
+    with _cost_lock:
+        verdict = _too_long.get(model_id)
+        unread = verdict is None and marker not in _too_long_loaded
+    if unread:
+        verdict = _load_saved_verdict(model_id, store)
+    if verdict is None:
+        return False
+    try:
+        before, after = _rerank_cost.window_counts(store, model_id, verdict.taken_at)
+    except Exception:  # noqa: BLE001 - fail soft: keep the verdict
+        log.debug("rerank width re-measure: verdict read failed", exc_info=True)
+        return True
+    if after == 0 and before == verdict.before:
+        return True
+    _end_verdict(model_id, store, verdict)
+    return False
 
 
 # ---------------------------------------------------------------------------
-# Memory bound for auto-scaling rerank width (pre-flip revision, Change 3).
+# S200, S208, S220: no re-scoring until the machine's memory model exists (fixes the S193
+# first-rerank regression). On a machine with no usable memory model a recall turn takes the
+# plain meaning-match (cosine) path and only FLAGS the need; the model is then measured off the
+# reply path (the `rerank_ram_figure` gated job at a chat lull in the bridge, a background thread
+# after the reply under `nell chat --no-bridge`) by a LADDER of single measured calls, in
+# S208's order:
+#   phase 1, lengths: one pair at the model's full input length (the worst case per pair, marked
+#     as such), then one pair at half the shortest length measured, and so on, until the window
+#     holds enough distinct shapes (`ram_fit.enough_shapes`: more shapes than the formula has
+#     parameters, full rank, and the full-length sample);
+#   phase 2, batches of increasing size, never starting with a big one: 2, 4, 8, ... pairs up to
+#     the most a recall sends, each at the longest length the time budget allows for that many
+#     pairs (every real call fits the time budget, so each real call is dominated by one of these
+#     measured shapes), each only when the fit says it fits the live headroom.
+# S245: the live headroom is checked before the model load, the warm-up and EVERY rung (the first
+# included). S253: the model load and the first rung, which nothing measured bounds, need more than
+# a positive headroom: the first rung needs free memory of at least the kept fit's one-pair prediction (times
+# the S255 safety factor) or, with no fit, the model file's size; S257: the model load needs the file size plus
+# that first-rung bound, so a host that could load but never run the first rung does not load; the completion marker is recorded only when the window holds a measured batch of more
+# than one pair, so a pass a starved host stopped runs again at the next lull.
+# The window is read to decide every rung, so a restart or an abandoned pass resumes where the
+# window stands. Real reranks add their own shapes. The ONNX memory pool and memory patterns are
+# off (S222), so a call's memory goes back after it and the sample is the call's PEAK growth
+# (`peak_rss`); `fit_rerank_width` sizes a batch so its predicted growth, times the S255 safety factor
+# (`RamFit.sized`), fits the live headroom.
+# S203/S212/S220 retired the width-5 seeds, the high water, the kept per-token figure and the
+# S182 re-seed; a running process keeps its last usable fit instead (H4b).
 # ---------------------------------------------------------------------------
-#
-# `get_rerank_width` was latency-derived only, memory-blind: fp16's extra
-# speed, with no memory bound to check against, was poured entirely into a
-# wider width and OOM'd at 5.36 GiB under a 5.5G cgroup cap (the fp16
-# natural-width run, Testing 2026-09-23). This section adds a MEASURED
-# memory term as an additional `min()` bound, mirroring the existing
-# measure-once-warm-and-cache `_warm_per_doc_latency` pattern exactly:
-# `per_doc_MEMORY` is measured once per model_id (RSS delta around a warm
-# rerank batch of known size, divided by batch size) and cached, recomputed
-# on the same cadence as the latency figure; `available_RAM_headroom` is a
-# cheap per-call read (cgroup-limit-aware, falling back to host free memory),
-# mirroring the `_detect_avx2` /proc-read shape: cheap, dependency-free,
-# safely degrades on any read/parse error or unsupported platform, never
-# crashes. On any failure to determine either figure, the memory term is
-# SKIPPED entirely (never assume unlimited headroom) — `get_rerank_width`
-# degrades to exactly the pre-Change-3 time-only bound.
 
-# Batch size for the one-time warm RSS-delta memory measurement. Reuses
-# `_MEASURE_RERANKS`'s value (rather than inventing a second, differently-
-# derived integer): the same magnitude reasoning applies — large enough that
-# the RSS delta from reranking the batch clears ordinary allocator/GC noise,
-# small enough that the one-time measurement stays cheap.
-_MEMORY_MEASURE_BATCH_SIZE = _MEASURE_RERANKS
+# Test seam: tests/conftest.py sets this False so the suite's recall tests keep
+# reranking without a seeded model; the S200 tests set it True. Production: True.
+_require_ram_figure = True
+# Reranker model ids a turn found without a RAM model (the job is due only for
+# these) and the chat-activity marker of each id's last attempt (once per lull).
+_ram_figure_needed: set[str] = set()
+_ram_figure_attempt: dict[str, object] = {}
 
-# Recompute the cached per-doc memory figure on the SAME cadence as the
-# per-doc latency figure above (`_LATENCY_RECOMPUTE_INTERVAL_SECONDS`) — a
-# long-lived process's per-doc memory cost can drift for the same class of
-# reasons the latency figure can (allocator fragmentation, a noisy
-# neighbor's memory pressure), so this reuses that cadence rather than
-# introducing a second, arbitrarily-different one.
-_MEMORY_RECOMPUTE_INTERVAL_SECONDS = _LATENCY_RECOMPUTE_INTERVAL_SECONDS
-
-# model_id -> (per_doc_bytes, measured_at_monotonic). Process-wide, mirrors
-# `_latency_cache` above exactly — one measurement per model_id, shared
-# across every recall in the process.
-_memory_cache: dict[str, tuple[float, float]] = {}
-_memory_cache_lock = threading.Lock()
+# The full-length pair is built from this sentence repeated. The text starts at
+# `_PAIR_TEXT_START_CHARS` and doubles up to `_PAIR_TEXT_DOUBLINGS` times until
+# the pair's surviving token count stops growing (the model's input limit
+# truncates it). Any plain-English text of a few thousand characters passes a
+# 1,024-token limit; the doubling is only the search for the limit, not a size.
+_PAIR_SENTENCE = "The quick brown fox jumps over the lazy dog while the river runs past the old stone bridge. "
+_PAIR_TEXT_START_CHARS = 4096
+_PAIR_TEXT_DOUBLINGS = 8
 
 
-def _current_rss_bytes() -> float | None:
-    """This process's current resident set size, in bytes, via
-    `/proc/self/status`'s `VmRSS` line — the same shape as `_detect_avx2`'s
-    `/proc` read (Linux-only; fail-soft to `None` on any read/parse error or
-    an unsupported platform, since there is no `/proc` on macOS/Windows).
-    Never raises."""
-    if sys.platform != "linux":
-        return None
+_ram_figure_warned: set[str] = set()
+
+
+class RamMeasurementAbandoned(Exception):  # noqa: N818 - a control signal, not an error
+    """S218: a chat reply started while a ladder rung ran (`nell chat --no-bridge`), so that
+    rung is abandoned and nothing from it is recorded (earlier rungs' samples stay). Raised only
+    when the caller passed a `watch`; the bridge's lull job never does."""
+
+
+def _warn_ram_figure_once(reason: str, *, exc_info: bool = False) -> None:
+    """A RAM-model refusal (or an unreadable memory probe) can recur at every lull or
+    every message: warn once per reason per process, with the traceback when `exc_info`
+    is set (a probe failure), then debug."""
+    first = reason not in _ram_figure_warned
+    _ram_figure_warned.add(reason)
+    (log.warning if first else log.debug)("reranker: %s", reason, exc_info=exc_info and first)
+
+
+def _ram_bound_applies() -> bool:
+    """Whether a RAM bound exists on this machine at all: the memory model is required (the
+    test seam) and the per-call peak can be read (`peak_rss`: the exact reset reading on Linux,
+    an RSS sampling thread on macOS and Windows, S248). Where it cannot be read
+    nothing holds a turn back and the width is time-bound only (S206 posture); an unreadable
+    measurement is never read as unlimited memory."""
+    return _require_ram_figure and peak_rss.available()
+
+
+def _window_ready(store: MemoryStore, model_id: str) -> bool:
+    """The WINDOW gives a usable memory model (or no RAM bound applies here): what the
+    measuring job needs to know. Cheap: one aggregate read."""
+    if not _ram_bound_applies():
+        return True
+    return _window_ram_fit(store, model_id) is not None
+
+
+def ram_figure_ready(model_id: str, store: MemoryStore) -> bool:
+    """S200, S220: whether a rerank may run for `model_id`. True when no RAM bound applies
+    (the per-call peak is unreadable here: no model can be measured, so the turn is not held
+    back and the width is time-bound only), when the 24-hour window gives a usable memory
+    model (S249: never in a process that downloaded the model file: False until it restarts), or when this running process still holds the last one it computed (H4b: it never
+    reranks without a RAM bound; the need is then flagged so the next lull refreshes the
+    window). A failed database read is no window fit (cosine path unless a fit is kept).
+    Cheap: one aggregate read, no model."""
+    if not _ram_bound_applies():
+        return True
+    if _downloaded_here(model_id):
+        return False  # S249: this process downloaded the model: no rerank until it restarts
+    fit, kept = _ram_fit_for(store, model_id)
+    if fit is None:
+        return False
+    if kept:
+        note_ram_figure_needed(model_id)
+    return True
+
+
+def ram_figure_refresh_wanted(model_id: str) -> bool:
+    """Whether a refresh of the memory model is flagged for `model_id` (a turn found none, or
+    served only a kept one): the direct chat starts its background ladder for it."""
+    with _cost_lock:
+        return model_id in _ram_figure_needed
+
+
+def note_ram_figure_needed(model_id: str) -> None:
+    """S200: a recall turn that would rerank found no usable RAM model (or only a kept one);
+    flag it so the next lull's `rerank_ram_figure` job measures one. Never loads anything."""
+    with _cost_lock:
+        _ram_figure_needed.add(model_id)
+
+
+def ram_figure_due(
+    activity_marker: object, store_factory: Callable[[], AbstractContextManager[MemoryStore]]
+) -> bool:
+    """Whether the `rerank_ram_figure` job is due (S200): a turn flagged the need
+    for the runtime reranker model id, the window gives no usable model yet, and no attempt has
+    run at this chat activity marker (once per lull; no time constant). A flag whose model has
+    since appeared is dropped here. In-memory checks first; the store is opened only past them."""
+    model_id = resolve_reranker_model_id()
+    if _downloaded_here(model_id):
+        return False  # S249: nothing is learned in a process that downloaded the model
+    with _cost_lock:
+        if model_id not in _ram_figure_needed:
+            return False
+        stamp = _ram_figure_attempt.get(model_id, _NEVER)
+    if stamp is not _NEVER and stamp == activity_marker:
+        return False
+    with store_factory() as store:
+        if _window_ready(store, model_id):
+            with _cost_lock:
+                _ram_figure_needed.discard(model_id)
+            return False
+    return True
+
+
+def _full_length_pair(provider: RerankerProvider) -> tuple[str, int] | None:
+    """A text whose (text, text) pair has the model's full input length, and that
+    length in tokens; `None` when the provider cannot count tokens or the count was
+    still growing at the last doubling (the pair would not be full length)."""
+    previous = 0
+    chars = _PAIR_TEXT_START_CHARS
+    for _ in range(_PAIR_TEXT_DOUBLINGS + 1):
+        text = (_PAIR_SENTENCE * (chars // len(_PAIR_SENTENCE) + 1))[:chars]
+        lengths = provider.pair_token_lengths(text, [text])
+        if lengths is None or len(lengths) != 1:
+            return None
+        if lengths[0] <= previous:
+            return text, lengths[0]
+        previous = lengths[0]
+        chars *= 2
+    return None
+
+
+def _text_of_length(provider: RerankerProvider, base: str, target: int) -> tuple[str, int] | None:
+    """The longest prefix of `base` whose (text, text) pair measures at most `target` tokens,
+    and that measured length (at least 1 token). Found by bisecting characters against the provider's own
+    tokenizer: the tokenizer truncates at the model limit, so a length cut in proportion to
+    characters is wrong near it. `None` when no prefix fits or the tokenizer cannot count."""
+    best: tuple[int, int] | None = None
+    low, high = 1, len(base)
+    while low <= high:
+        mid = (low + high) // 2
+        text = base[:mid]
+        lengths = provider.pair_token_lengths(text, [text])
+        if lengths is None or len(lengths) != 1:
+            return None
+        if lengths[0] <= target:
+            best = (mid, lengths[0])
+            low = mid + 1
+        else:
+            high = mid - 1
+    return None if best is None or best[1] < 1 else (base[: best[0]], best[1])
+
+
+def _abandon_if_replying(watch: Callable[[], bool] | None) -> None:
+    """S218: raise `RamMeasurementAbandoned` when the caller's `watch` says a reply has started
+    (or was already in flight when the watch was taken). `None` = no watch: never raises."""
+    if watch is not None and not watch():
+        log.info("reranker: RAM measurement abandoned: a reply started while it ran (S218)")
+        raise RamMeasurementAbandoned("a reply started while the RAM measurement ran")
+
+
+@contextlib.contextmanager
+def _stop_on_reply(provider: RerankerProvider, watch: Callable[[], bool] | None):
+    """S223: while the block runs, a reply that starts stops the call this thread makes on
+    `provider` (`arm_terminate`; the stop is registered with the watch's `on_reply_start`, so it
+    runs on the replying thread the moment the reply starts). On every exit the hook is
+    unregistered and the scope disarmed. No watch (the bridge's lull job), or a watch without
+    `on_reply_start` (a plain callable): nothing is armed and the call simply finishes (S218)."""
+    register = getattr(watch, "on_reply_start", None)
+    if register is None:
+        yield
+        return
+    stop = provider.arm_terminate()
+    unregister = _noop
     try:
-        with open("/proc/self/status", encoding="utf-8") as f:
-            for line in f:
-                if line.startswith("VmRSS:"):
-                    # e.g. "VmRSS:\t   12345 kB\n" -> kB -> bytes.
-                    return float(line.split()[1]) * 1024.0
+        unregister = register(stop)
+        yield
+    finally:
+        unregister()
+        provider.disarm_terminate()
+
+
+@dataclass(frozen=True)
+class _Rung:
+    """One ladder step: `pairs` documents, each pair at most `target` tokens long; `full`
+    marks the model's full-length pair."""
+
+    pairs: int
+    target: int
+    full: bool = False
+
+
+def _window_groups(store: MemoryStore, model_id: str) -> list[ram_fit.ShapeGroup] | None:
+    rows = _ram_shapes.shape_groups(store, model_id)
+    return None if rows is None else ram_fit.groups_from_rows(rows)
+
+
+def _next_length_rung(groups: Sequence[ram_fit.ShapeGroup], cap: int) -> _Rung | None:
+    """Phase 1: the next single-pair rung, or `None` when the lengths are done. The first is the
+    full-length pair; each next one targets half the shortest B=1 length measured, so its shape
+    is new and every rung is dominated by one already measured (until `enough_shapes`)."""
+    if not any(g.full for g in groups):
+        return _Rung(1, cap, True)
+    if ram_fit.enough_shapes(groups):
         return None
-    except Exception:  # noqa: BLE001 — fail-soft: an RSS probe must never break a recall
-        log.exception("reranker: RSS read failed — per-doc memory measurement will be skipped")
+    single = [g.length for g in groups if g.pairs == 1]
+    target = min(single) // 2 if single else 0
+    return _Rung(1, target) if target >= 1 else None
+
+
+def _batch_sizes() -> list[int]:
+    """Phase 2 batch sizes: doubling from 2 up to the most pairs a recall sends (every
+    candidate plus every anchor)."""
+    top = CANDIDATE_POOL + P
+    sizes, size = [], 2
+    while size < top:
+        sizes.append(size)
+        size *= 2
+    sizes.append(top)
+    return sizes
+
+
+def _run_rung(
+    provider: RerankerProvider,
+    store: MemoryStore,
+    model_id: str,
+    base_text: str,
+    rung: _Rung,
+    cap: int,
+    watch: Callable[[], bool] | None,
+) -> bool:
+    """Measure one rung and record its time and its peak growth. Returns False (the pass ends)
+    when the rung cannot be built or its growth cannot be read. An abandon (a reply started)
+    discards this rung's sample and propagates."""
+    if rung.full:
+        built = (base_text, cap)
+    else:
+        built = _text_of_length(provider, base_text, rung.target)
+    if built is None:
+        _warn_ram_figure_once("RAM measurement stopped: a rung could not be built at the wanted length")
+        return False
+    text, length = built
+    _abandon_if_replying(watch)
+    try:
+        with _stop_on_reply(provider, watch):
+            _scores, seconds, growth = provider.rerank_timed(text, [text] * rung.pairs)
+    except RerankTerminated:
+        # S223: a reply started and stopped the call; nothing was measured.
+        log.info("reranker: RAM measurement stopped: a reply started during the call (S223)")
+        raise RamMeasurementAbandoned("a reply started and stopped the RAM measurement's call") from None
+    _abandon_if_replying(watch)  # a reply started after the last node: this sample is discarded
+    if growth is None:
+        _warn_ram_figure_once("RAM measurement stopped: the call's peak growth could not be read")
+        return False
+    _record_rerank_cost(
+        model_id,
+        store,
+        rung.pairs * length,
+        seconds,
+        growth,
+        pairs=rung.pairs,
+        longest=length,
+        full_length=rung.full,
+    )
+    log.info(
+        "reranker: RAM ladder rung %d pairs x %d tokens: peak growth %.0f MB, %.2f s",
+        rung.pairs,
+        length,
+        growth / 1e6,
+        seconds,
+    )
+    return True
+
+
+def _dominating_growth(groups: Sequence[ram_fit.ShapeGroup], pairs: int, length: int) -> float | None:
+    """S245: an upper bound on the growth of a call of `pairs` documents padded to `length` tokens,
+    taken from the window: memory cannot shrink as either dimension grows, so every measured shape
+    with at least that many pairs AND at least that length needed at least as much, and the
+    SMALLEST of their mean growths is the tightest bound. `None` when no measured shape dominates."""
+    bounds = [g.sum_y / g.n for g in groups if g.n > 0 and g.pairs >= pairs and g.length >= length]
+    return min(bounds) if bounds else None
+
+
+def _ladder_headroom_stop(predicted: float | None, what: str) -> bool:
+    """S245: whether the ladder must not run `what` now, judged on a fresh read of the live
+    headroom (`_available_ram_headroom_bytes`, the S241 minimum). True when the headroom is known and
+    is zero or less (a degraded host, S240), or when it is known and the step's PREDICTED growth
+    exceeds it. `predicted` is `None` when nothing measured bounds the step (the model load, the
+    warm-up): then only a headroom of zero stops it. S253, S257: the first rung and the model load are
+    held to more than that, by `_memory_floor_blocks` (the model file's size plus the first rung's bound for
+    the load; the kept fit's one-pair prediction, or the file size, for the first rung); the first rung
+    no longer reaches this function with `None`. S261: a headroom that cannot be read at all (`None`: psutil
+    and every cgroup level unreadable) stops the ladder, the simple safe fallback (it used to proceed, S241/S245)."""
+    headroom = _available_ram_headroom_bytes()
+    if headroom is None:
+        log.info("reranker: RAM ladder stopped before %s: free memory cannot be read (S261)", what)
+        return True
+    if headroom > 0.0 and (predicted is None or predicted <= headroom):
+        return False
+    log.info(
+        "reranker: RAM ladder stopped before %s: headroom %.0f MB, predicted %s",
+        what,
+        headroom / 1e6,
+        "unknown" if predicted is None else f"{predicted / 1e6:.0f} MB",
+    )
+    return True
+
+
+def _memory_wait_clear(condition: str) -> None:
+    with _cost_lock:
+        _memory_wait_logged.discard(condition)
+        _memory_wait_logged.discard(condition + "-size")
+        _memory_wait_logged.discard(condition + "-unread")
+
+
+def _memory_wait_log_once(key: str, other: str, level: int, message: str, *args: object) -> None:
+    """Log `message` unless `key` was already logged and has not passed since (S253: one line per
+    condition, not one per lull). `other` is the same condition's other kind, re-armed by this one."""
+    with _cost_lock:
+        first = key not in _memory_wait_logged
+        _memory_wait_logged.add(key)
+        _memory_wait_logged.discard(other)
+    if first:
+        log.log(level, message, *args)
+
+
+def _memory_floor_blocks(condition: str, what: str, needed: Callable[[], float | None]) -> bool:
+    """S253: whether `what` (the model load, the ladder's first rung) must wait because the free memory
+    (`_available_ram_headroom_bytes`, the S241 minimum, read fresh) is not both positive (S245's
+    zero-headroom stop holds even against a bound of zero) and at least `needed()` bytes. S261: free memory that cannot be read at all (`None`) blocks, the simple safe
+    fallback (it used to pass, S241/S245); logged once as a condition of its own. A bound
+    that cannot be determined (`needed()` returns `None`) blocks: fail safe, nothing is loaded or run on
+    a guess. Logs once per condition until the check next passes (`condition` and `condition-size` are
+    separate conditions). `needed` is called with no lock held and only after the free memory is known to
+    be readable, so a host with no reading touches no disk."""
+    headroom = _available_ram_headroom_bytes()
+    if headroom is None:
+        _memory_wait_log_once(
+            condition + "-unread",
+            condition,
+            logging.WARNING,
+            "reranker: %s waits: free memory cannot be read (S261)",
+            what,
+        )
+        return True
+    if headroom <= 0.0:
+        _memory_wait_log_once(
+            condition,
+            condition + "-size",
+            logging.INFO,
+            "reranker: %s waits: no free memory (%.0f MB); retried at the next lull (S253)",
+            what,
+            headroom / 1e6,
+        )
+        return True
+    bound = needed()
+    if bound is None:
+        _memory_wait_log_once(
+            condition + "-size",
+            condition,
+            logging.WARNING,
+            "reranker: %s waits: its size bound could not be determined (free memory %.0f MB); retried at the next lull (S253)",
+            what,
+            headroom / 1e6,
+        )
+        return True
+    if headroom >= bound:
+        _memory_wait_clear(condition)
+        return False
+    _memory_wait_log_once(
+        condition,
+        condition + "-size",
+        logging.INFO,
+        "reranker: %s waits: free memory %.0f MB is below the %.0f MB it needs; retried at the next lull (S253)",
+        what,
+        headroom / 1e6,
+        bound / 1e6,
+    )
+    return True
+
+
+def _load_bound_parts(model_id: str) -> tuple[float, float] | None:
+    """S253, S257: `(file size, first-rung bound)` in bytes for loading `model_id`, or `None` when the file size
+    cannot be determined. The first-rung bound is what the ladder's first rung (the full-length single pair) will
+    need once the model is loaded: the largest, over the fits this process keeps for the model id, of the one-pair
+    prediction at that fit's longest measured length (the full input length, which a usable fit always holds) times
+    the S255 safety factor (`RamFit.sized`); with no fit it is the file size again (the order's own bound for a first
+    rung with no fit). The kept fits of every store stand in because the floor job has no store; the largest is the
+    safe one."""
+    size = _runtime_model_file_bytes(model_id)
+    if size is None:
         return None
+    return size, max((fit.sized(1, fit.max_length) for fit in _kept_ram_fits(model_id)), default=size)
 
 
-def _measure_warm_per_doc_memory(
-    provider: RerankerProvider, sample_docs: list[str] | None = None
-) -> float:
-    """RSS delta bracketing `_MEMORY_MEASURE_BATCH_SIZE` warm rerank() calls,
-    divided by that batch size — the per-candidate memory cost `get_rerank_
-    width`'s memory bound divides headroom by.
-
-    Each bracketed call is SINGLE-document — one document per `rerank()`
-    call, cycling through `sample_docs` exactly like `_measure_warm_per_doc_
-    latency`'s `_doc_for` helper — rather than one N-document batch call.
-    This mirrors that function's per-doc isolation shape (reusing it, not
-    inventing a second one, per this change's own requirement) AND matters
-    structurally: a caller-facing invariant elsewhere in this codebase
-    (`test_f2b_anchor_wiring.py`'s "exactly one combined rerank() call"
-    checks) identifies the real+anchor call specifically by it being the
-    only MULTI-document `rerank()` call in a turn — a single N-document
-    batch call here would collide with that and be mistaken for a second
-    combined call. Keeping every calibration call length-1 avoids that
-    collision entirely, the same way the existing latency measurement's
-    single-document calls already do.
-
-    `_WARMUP_RERANKS` warmup calls are run first and discarded before the
-    measured sequence, matching `_measure_warm_per_doc_latency`'s
-    cold-cache-trap avoidance ([[single-shot-timing-cold-cache-trap]]) —
-    a cold ONNX session's first calls do real allocation work
-    (session/tensor buffers) unrelated to steady-state per-doc memory cost.
-
-    A negative delta (RSS can legitimately drop between the two reads — a
-    GC pass, another thread freeing memory) or an unreadable RSS clamps to
-    0.0 — the same "no signal" sentinel `_warm_per_doc_latency` uses for a
-    measurement failure, which `get_rerank_width` already treats as "skip
-    this term".
-    """
-    docs = list(sample_docs) if sample_docs else [_MEASURE_DOCUMENT]
-
-    def _doc_for(i: int) -> list[str]:
-        return [docs[i % len(docs)]]
-
-    for i in range(_WARMUP_RERANKS):
-        list(provider.rerank(_MEASURE_QUERY, _doc_for(i)))  # warmup, discarded
-
-    before = _current_rss_bytes()
-    for i in range(_MEMORY_MEASURE_BATCH_SIZE):
-        list(provider.rerank(_MEASURE_QUERY, _doc_for(i)))
-    after = _current_rss_bytes()
-
-    if before is None or after is None:
-        return 0.0
-    delta = after - before
-    if delta <= 0.0:
-        return 0.0
-    return delta / _MEMORY_MEASURE_BATCH_SIZE
+def _load_bound(model_id: str) -> float | None:
+    """S257: the free memory the reranker model's load needs: the model file's size plus the first-rung bound
+    (`_load_bound_parts`), so a host that could load the model but never run the first rung does not load it and
+    hold it unused. `None` when the file size cannot be determined."""
+    parts = _load_bound_parts(model_id)
+    return None if parts is None else parts[0] + parts[1]
 
 
-def _warm_per_doc_memory(
-    provider: RerankerProvider, sample_docs: list[str] | None = None
-) -> float:
-    """Cached warm per-doc memory cost for `provider`'s model_id — mirrors
-    `_warm_per_doc_latency` exactly: measured (and cached) on first use or
-    once `_MEMORY_RECOMPUTE_INTERVAL_SECONDS` has elapsed since the last
-    measurement, measured OUTSIDE the lock (a real rerank batch takes real
-    time, and holding the lock across it would serialize every concurrent
-    recall behind this one measurement), fail-soft to 0.0 (`get_rerank_
-    width` treats 0.0 as "no memory signal, don't throttle by it") on any
-    measurement failure. Never raises into a recall."""
+def model_load_blocked_by_memory() -> bool:
+    """S253, S257: whether the reranker model must not be loaded now: the free memory is not at least the model
+    file's size plus the first-rung bound (`_load_bound`: the file size is `_runtime_model_file_bytes`, its size on
+    disk, else the registry's declared size when the file is yet to be downloaded; the first rung is the kept fit's
+    one-pair prediction for the full-length pair times the safety factor, or the file size again when no fit is
+    kept; a size that cannot be determined blocks). Asked before `build_reranker_provider`
+    by both places that load the model, the RAM lull job (`run_ram_figure`) and the floor job
+    (`floor_startup.run_rerank_floor`). Not asked when this process already holds a provider for the runtime model
+    id whose model is loaded (`model_loaded()`: it is out of the free memory already); a provider that is cached
+    but not yet loaded (fastembed loads lazily) is asked like none. Never raises: an unexpected error blocks
+    and warns once."""
+    try:
+        model_id = resolve_reranker_model_id()
+        provider = _provider_cache.get(model_id)
+        if provider is not None and provider.model_loaded():
+            return False
+        return _memory_floor_blocks("load", "the reranker model load", lambda: _load_bound(model_id))
+    except Exception:  # noqa: BLE001 - fail safe: nothing loads on an unexpected failure
+        _warn_ram_figure_once("the free-memory check before the model load failed; the model is not loaded (S253)", exc_info=True)
+        return True
+
+
+def _first_rung_bytes(fit: ram_fit.RamFit | None, cap: int, model_id: str) -> float | None:
+    """S253, S255: the bound for the ladder's first rung, the full-length single pair (`cap` tokens):
+    the kept fit's one-pair prediction for it times the safety factor (`RamFit.sized`), else (no fit
+    exists) the model file's size (not scaled: it is a size, not a prediction). `None` when there is no
+    fit and the size cannot be determined."""
+    if fit is not None:
+        return fit.sized(1, cap)
+    return _runtime_model_file_bytes(model_id)
+
+
+def _first_rung_bound(store: MemoryStore, model_id: str, cap: int) -> Callable[[], float | None]:
+    """S253: the bound for the ladder's first rung, the full-length single pair (`cap` tokens): this
+    process's kept fit's one-pair prediction for it (S255: times the safety factor), else (no fit exists)
+    the model file's size."""
+    key = (cost_series._store_key(store), model_id)  # noqa: SLF001
+
+    def bound() -> float | None:
+        with _cost_lock:
+            fit = _ram_fit_kept.get(key)
+        return _first_rung_bytes(fit, cap, model_id)
+
+    return bound
+
+
+def measure_ram_figure(
+    provider: RerankerProvider, store: MemoryStore, *, watch: Callable[[], bool] | None = None
+) -> bool:
+    """S200, S208, S220: run the ladder (see the section header) on `provider` until the window
+    gives a usable memory model, one measured call per rung, each recorded like any recall
+    rerank (`_record_rerank_cost`). Returns True iff the window gives a usable model afterwards.
+    The next rung is always decided from the window, so a restart or an abandoned pass resumes
+    where it stands, and no rung repeats a shape. A rung that cannot be built, whose peak growth
+    cannot be read, or that recorded nothing new ends the pass (it is retried at a later lull).
+    A pass that gets through phase 2 (every batch size run, dominated, or stopped by the time
+    budget or the headroom) records the completion marker ONLY IF the window then holds a measured
+    batch of more than one pair (S245); a pass that ends without one records no marker, so the window
+    gives no model and the next lull runs the ladder again (a pass stopped on a starved host must not
+    pin every rerank to the single-pair cap for 24 hours). Only a marked window gives a model for
+    sizing (`_window_ram_fit`), so the first batches are never sized from single pairs alone.
+    S245: the live headroom is checked before the warm-up and before EVERY rung, the first included
+    (`_ladder_headroom_stop`): a known headroom of zero stops the pass, a rung is predicted from the
+    fit times the S255 safety factor (phase 2, `RamFit.sized`) or bounded by the measured shape that dominates
+    it (phase 1; a measurement, not a prediction, so unscaled). S253: the first rung,
+    which nothing measured bounds, needs the free memory to be at least the kept fit's one-pair
+    prediction for the full-length pair (times the S255 safety factor), or the model file's size when no fit
+    exists (`_memory_floor_blocks`); below it nothing runs and the next lull retries. S249: nothing is run (False) in a
+    process that downloaded the model file. Provider exceptions propagate.
+
+    S218: with a `watch` (the direct chat passes `cli_throttle.reply_watch()`), a reply that
+    starts while this runs abandons the rung in progress: `RamMeasurementAbandoned` is raised,
+    checked before the pair-length probe, before and after each call, and that rung's sample is
+    not recorded (earlier rungs' samples stay). S223: the call already running is STOPPED when
+    the reply starts (the watch's `on_reply_start` calls the stop `provider.arm_terminate()`
+    returned: ONNX Runtime's `RunOptions.terminate`, so the reply does not wait for the call and
+    the call's own tail does not overlap the reply); a provider that cannot be stopped (the base
+    `arm_terminate`, or a session that could not be wrapped) lets the call finish and only its
+    SAMPLE is guaranteed not to overlap a reply (S218). With the memory pool off an abandoned
+    call leaves no residue, so the pass simply resumes after the reply. The model load, the
+    one-token warm-up and the tokenizer-only length probe are not stoppable."""
     model_id = provider.model_id()
-    now = time.monotonic()
-    with _memory_cache_lock:
-        cached = _memory_cache.get(model_id)
-        if cached is not None and (now - cached[1]) < _MEMORY_RECOMPUTE_INTERVAL_SECONDS:
-            return cached[0]
+    if _downloaded_here(model_id):
+        log.info("reranker: RAM ladder not run: this process downloaded the model (S249)")
+        return False
+    _abandon_if_replying(watch)
+    if _ladder_headroom_stop(None, "the warm-up"):
+        return _window_ready(store, model_id)
+    pair = _full_length_pair(provider)
+    if pair is None:
+        _warn_ram_figure_once("RAM measurement not done: no full-length pair could be built")
+        return False
+    base_text, cap = pair
+    _abandon_if_replying(watch)
+    _warm_up_once(provider, "warm up", ["warm up"])
+    # Phase 1: lengths.
+    while True:
+        groups = _window_groups(store, model_id)
+        if groups is None:
+            _warn_ram_figure_once("RAM measurement stopped: the saved series could not be read")
+            return False
+        rung = _next_length_rung(groups, cap)
+        if rung is None:
+            break
+        shortest = min((g.length for g in groups if g.pairs == 1), default=None)
+        predicted = _dominating_growth(groups, rung.pairs, rung.target)
+        if predicted is None:
+            # S253: nothing measured bounds the first rung (the full-length pair).
+            stopped = _memory_floor_blocks("rung", "the ladder's first rung", _first_rung_bound(store, model_id, cap))
+        else:
+            stopped = _ladder_headroom_stop(predicted, "a single-pair rung")
+        if stopped:
+            return _window_ready(store, model_id)
+        if not _run_rung(provider, store, model_id, base_text, rung, cap, watch):
+            return _window_ready(store, model_id)
+        after = _window_groups(store, model_id)
+        if after is None or not _rung_made_progress(rung, shortest, after):
+            _warn_ram_figure_once("RAM measurement stopped: a rung recorded nothing new")
+            return _window_ready(store, model_id)
+    # Phase 2: batches of increasing size, at the time-budget frontier. The loop ENDS when every
+    # size has run or been dominated by a measured shape, or when the time budget or the live
+    # headroom stops it at the first size that does not fit: the stop is kept (not skipped past)
+    # because a later size's prediction comes from a fit built from smaller shapes only, which
+    # under-predicts larger batches. The pass is COMPLETE, and records the marker, only if the
+    # window then holds a measured batch of more than one pair (S245); a rung that cannot be built
+    # or read leaves it incomplete, to be retried at a later lull.
+    completed = True
+    for pairs in _batch_sizes():
+        _abandon_if_replying(watch)
+        groups = _window_groups(store, model_id)
+        time_fit = _rerank_cost.fit(store, model_id)
+        fit = None if groups is None else ram_fit.fit_ram(groups)
+        if fit is None or time_fit is None or time_fit.rate <= 0.0:
+            break
+        budget = _full_rerank_budget()
+        if budget <= time_fit.overhead:
+            break
+        length = min(cap, int((budget - time_fit.overhead) / time_fit.rate) // pairs)
+        if length < 1 or ram_fit.dominated(pairs, length, ram_fit.distinct_shapes(groups)):
+            continue
+        if _ladder_headroom_stop(fit.sized(pairs, length), f"a rung of {pairs} pairs x {length} tokens"):
+            break
+        if not _run_rung(provider, store, model_id, base_text, _Rung(pairs, length), cap, watch):
+            completed = False
+            break
+    if completed:
+        final = _window_groups(store, model_id)
+        if final is not None and any(g.pairs > 1 for g in final):
+            _mark_ladder_complete(store, model_id)
+        else:
+            log.info(
+                "reranker: RAM ladder ended without a measured batch of more than one pair: "
+                "no completion marker, it runs again at the next lull (S245)"
+            )
+    return _window_ready(store, model_id)
 
+
+def _rung_made_progress(rung: _Rung, shortest: int | None, after: Sequence[ram_fit.ShapeGroup]) -> bool:
+    """Whether a phase-1 rung left a new shape in the window: the full-length pair its marker, a
+    shorter rung a single-pair length below the shortest one measured before it. A rung that
+    recorded nothing (an unpackable shape, an unreadable series) would otherwise repeat forever."""
+    if rung.full:
+        return any(g.full for g in after)
+    singles = [g.length for g in after if g.pairs == 1]
+    return bool(singles) and shortest is not None and min(singles) < shortest
+
+
+def _mark_ladder_complete(store: MemoryStore, model_id: str) -> None:
+    """Record, once per window, that a ladder pass finished (`ram_fit.COMPLETE_MARKER`)."""
+    rows = _ram_shapes.shape_groups(store, model_id)
+    if rows is None or ram_fit.ladder_complete(rows):
+        return
+    _ram_shapes.record(store, model_id, ram_fit.COMPLETE_MARKER, 0.0)
+
+
+def run_ram_figure(
+    activity_marker: object, store: MemoryStore, *, watch: Callable[[], bool] | None = None
+) -> bool:
+    """The `rerank_ram_figure` job's run (S200): stamp the attempt, then run the ladder on the
+    runtime reranker (building the provider here, at a lull, is what keeps the model load off the
+    reply path). Returns True iff the window then gives a usable memory model; when it already
+    does, nothing is built or measured and the result is False. S245: the live headroom is checked
+    BEFORE the provider is built (a known headroom of zero builds and loads nothing: the attempt
+    stamp stays, so the next chat activity marker retries, and the need flag is kept). S253, S257: so is
+    the model file's size plus the first rung's bound (`model_load_blocked_by_memory`: free memory below it
+    builds and loads nothing, the stamp and the flag stay, the next lull retries). Provider
+    exceptions propagate (the central pass logs them).
+
+    S218: `watch` (the direct chat's `cli_throttle.reply_watch()`, taken by the caller before
+    the due check and the store) is checked before the provider is built and passed to
+    `measure_ram_figure`. `RamMeasurementAbandoned` removes this model's attempt stamp, so the
+    re-run after the reply is not held back by the once-per-marker rule, keeps the need flag and
+    propagates. The bridge's lull job passes no watch."""
+    model_id = resolve_reranker_model_id()
+    if _downloaded_here(model_id):
+        return False  # S249
+    with _cost_lock:
+        _ram_figure_attempt[model_id] = activity_marker
+    if _window_ready(store, model_id):
+        with _cost_lock:
+            _ram_figure_needed.discard(model_id)
+        return False
     try:
-        measured = _measure_warm_per_doc_memory(provider, sample_docs)
-    except Exception:  # noqa: BLE001 — fail-soft: never break recall over a calibration failure
-        log.exception("reranker: warm-memory measurement failed — width will not be memory-throttled")
-        measured = 0.0
+        _abandon_if_replying(watch)
+        if _ladder_headroom_stop(None, "the model load"):
+            return False  # S245: nothing is loaded on a host with no headroom; the next lull retries
+        if model_load_blocked_by_memory():
+            return False  # S253, S257: nor on a host with less free memory than the file plus the first rung; the next lull retries
+        ready = measure_ram_figure(build_reranker_provider(store=store), store, watch=watch)
+    except RamMeasurementAbandoned:
+        with _cost_lock:
+            _ram_figure_attempt.pop(model_id, None)
+        raise
+    if ready:
+        with _cost_lock:
+            _ram_figure_needed.discard(model_id)
+    return ready
 
-    with _memory_cache_lock:
-        _memory_cache[model_id] = (measured, now)
-    return measured
+
+def _reset_rerank_cost_model() -> None:
+    """Test-only: forget every model id's kept fits, memos, warm-up state, budget misses,
+    re-measure markers and "too long" verdicts. The saved series live in the database and
+    the process buffer (`cost_series._reset_pending`)."""
+    with _cost_lock:
+        _ram_figure_needed.clear()
+        _ram_figure_attempt.clear()
+        _ram_figure_warned.clear()
+        _ram_fit_kept.clear()
+        _ram_fit_memo.clear()
+        _warmed_model_ids.clear()
+        _downloaded_model_ids.clear()
+        _memory_wait_logged.clear()
+        _budget_misses.clear()
+        _remeasured_marker.clear()
+        _too_long.clear()
+        _too_long_loaded.clear()
 
 
-def _reset_memory_cache() -> None:
-    """Test-only: clear the measured-memory cache."""
-    with _memory_cache_lock:
-        _memory_cache.clear()
+def _full_rerank_budget() -> float:
+    """The full per-call rerank latency budget (`reranker.latency_budget_seconds`,
+    read now): what "stuck" and the S116 clear are judged against (S113, S116),
+    never a paragraph's share or a message's remainder."""
+    return float(tunables.get_tunable("reranker.latency_budget_seconds", LATENCY_BUDGET_SECONDS))
+
+
+def _is_stuck(miss: _BudgetMiss, estimate: RerankCostEstimate | None) -> bool:
+    """S113: the estimate predicts that fewer than 5 real candidates of the
+    miss fit the full budget (time term only; the RAM bound is not the learned
+    cost), the re-measure job's one trigger (`_needs_remeasure`)."""
+    if estimate is None:
+        return False
+    width = fit_rerank_width(
+        miss.candidate_tokens,
+        miss.anchor_tokens,
+        estimate,
+        _full_rerank_budget(),
+        None,
+        RERANK_MIN_REAL_CANDIDATES,
+    )
+    return width < RERANK_MIN_REAL_CANDIDATES
+
+
+def _needs_remeasure(miss: _BudgetMiss, estimate: RerankCostEstimate | None) -> bool:
+    """Whether the re-measure job should time the miss's 5 candidates (S100, S113): the time
+    term says they are stuck (`_is_stuck`). (The S182 RAM re-seed, a kept per-token figure
+    that blocked the batch, is retired with that figure: S212, S220.)"""
+    return estimate is not None and _is_stuck(miss, estimate)
+
+
+def _drop_miss(model_id: str, miss: _BudgetMiss) -> None:
+    """Remove `model_id`'s miss iff it is still `miss` (a newer one survives,
+    CONC-8)."""
+    with _cost_lock:
+        if _budget_misses.get(model_id) is miss:
+            del _budget_misses[model_id]
+
+
+def _job_state(model_id: str) -> tuple[_BudgetMiss | None, object, bool]:
+    """(miss, the marker of the last re-measure or `_NEVER`, warmed) under the
+    lock."""
+    with _cost_lock:
+        return (
+            _budget_misses.get(model_id),
+            _remeasured_marker.get(model_id, _NEVER),
+            model_id in _warmed_model_ids,
+        )
+
+
+# "No re-measure yet" for a model id: distinct from every chat activity
+# marker value, including the `-inf` of a process that has seen no message.
+_NEVER = object()
+
+# Test-only seam (CONC-8): called by `remeasure_stuck_width` between its
+# measured rerank and its clear/drop. `None` in production.
+_remeasure_hook: Callable[[], None] | None = None
+
+
+def stuck_width_due(
+    activity_marker: object, store_factory: Callable[[], AbstractContextManager[MemoryStore]]
+) -> bool:
+    """Whether the `rerank_width_remeasure` job is due (S100, S113, S180): the
+    runtime reranker model id has a budget miss that is stuck under the
+    current estimate (the time term says fewer than 5 candidates fit: `_needs_remeasure`), the
+    memory model is ready (`ram_figure_ready`: the job never runs an unfitted batch, S220),
+    its warm-up has run in this process and its provider is
+    cached (the job never builds or loads a model), no re-measure has run
+    at this chat activity marker (once per lull), and no "too long" verdict is
+    remembered (S127: the job's own measured 5 candidates exceeded the full
+    budget, and no sample has arrived or aged out since, so a new record does
+    not re-trigger the job until the estimate changes). A miss found not stuck
+    is dropped. The in-memory checks come first; `store_factory` (a context
+    manager yielding a store, opened only past them) supplies the saved series
+    and the saved verdict, which this check may read (once per process) and delete
+    when the verdict has ended (S179: the one write a due check makes; it runs in
+    the lull job, never on the reply path). Takes `_cost_lock` only briefly,
+    never nested."""
+    model_id = resolve_reranker_model_id()
+    miss, stamp, warmed = _job_state(model_id)
+    if miss is None or not warmed or _provider_cache.get(model_id) is None:
+        return False
+    if stamp is not _NEVER and stamp == activity_marker:
+        return False
+    with store_factory() as store:
+        if not ram_figure_ready(model_id, store):
+            return False
+        if _too_long_remembered(model_id, store):
+            return False
+        if not _needs_remeasure(miss, rerank_cost_estimate(model_id, store)):
+            _drop_miss(model_id, miss)
+            return False
+    return True
+
+
+def remeasure_stuck_width(activity_marker: object, store: MemoryStore) -> bool:
+    """The `rerank_width_remeasure` job's run (S100, S113, S116): one timed
+    rerank of the stuck miss's 5 candidates (5 real + `anchor_count(5)`
+    anchors) on the already-loaded provider, added to the cost sums (its shape is a free
+    memory sample too). Then the miss is cleared when the measured seconds are within the
+    full budget (S116 a: 5 fit) and dropped when they exceed it (S116 b: genuinely too
+    long, not stuck), and that verdict is remembered until the estimate next
+    changes (S127: a sample arrives or one it counted ages out). The marker
+    is stamped after the verdict check and before the measurement, so a failing
+    or RAM-skipped run still runs once per lull, while a run skipped by a held
+    verdict stamps nothing. Skipped (miss kept) when the memory model is not ready (S220: the
+    batch is never run unfitted, same gate as every rerank), the miss is no longer
+    stuck (then dropped), a "too long" verdict is remembered, the memory model holds no
+    batch of more than one pair and the batch is larger than any shape measured (S242,
+    `RamFit.within_measured`), or the memory model predicts (S255: times the safety factor) the batch does not fit the current
+    headroom. Returns True iff the rerank ran. Provider
+    exceptions propagate (the central pass logs them)."""
+    model_id = resolve_reranker_model_id()
+    miss, _, warmed = _job_state(model_id)
+    provider = _provider_cache.get(model_id)
+    if miss is None or not warmed or provider is None:
+        return False
+    if not ram_figure_ready(model_id, store):
+        return False
+    if _too_long_remembered(model_id, store):
+        return False
+    with _cost_lock:
+        _remeasured_marker[model_id] = activity_marker
+    estimate = rerank_cost_estimate(model_id, store)
+    if not _needs_remeasure(miss, estimate):
+        _drop_miss(model_id, miss)
+        return False
+    k = anchor_count(len(miss.documents))
+    pairs = len(miss.documents) + k
+    longest = max([*miss.candidate_tokens, *miss.anchor_tokens[:k]])
+    padded = pairs * longest
+    if estimate is not None and estimate.ram_fit is not None:
+        headroom = _available_ram_headroom_bytes()
+        if headroom is None:
+            log.info("rerank width re-measure: skipped, free memory cannot be read (S261)")
+            return False
+        if not estimate.ram_fit.within_measured(pairs, longest):
+            log.info("rerank width re-measure: skipped, the batch is larger than any shape measured (S242)")
+            return False
+        if estimate.ram_fit.sized(pairs, longest) > headroom:
+            log.info("rerank width re-measure: skipped, the batch does not fit the RAM headroom")
+            return False
+    _, seconds = _measured_rerank(
+        provider,
+        model_id,
+        store,
+        miss.query,
+        list(miss.documents),
+        miss.candidate_tokens,
+        miss.anchor_tokens,
+    )
+    if _remeasure_hook is not None:
+        _remeasure_hook()
+    budget = _full_rerank_budget()
+    if seconds is not None:
+        _drop_miss(model_id, miss)
+        if seconds > budget:
+            _remember_too_long(model_id, store)
+    log.info(
+        "rerank width re-measure: model=%s padded_tokens=%d seconds=%s budget=%s -> %s",
+        model_id,
+        padded,
+        seconds,
+        budget,
+        "5 fit" if seconds is not None and seconds <= budget else "too long, dropped",
+    )
+    return True
+
+
+def _measured_rerank(
+    provider: RerankerProvider,
+    model_id: str,
+    store: MemoryStore,
+    query: str,
+    documents: list[str],
+    candidate_tokens: Sequence[int],
+    anchor_tokens: Sequence[int],
+) -> tuple[AnchorNormalizationResult, float | None]:
+    """Rerank `documents` with anchors on top and record the call in the cost
+    model (x = (n + k) x the longest of the n candidates' and k anchors' pair
+    sizes). Shared by `rerank_for_recall` and the re-measure job. Returns the
+    normalization and the measured seconds (`None` when the provider gave
+    none: nothing recorded)."""
+    normalization = normalize_against_anchors(provider, query, documents)
+    if normalization.seconds is None:
+        return normalization, None
+    k = normalization.anchor_count
+    longest = max([*candidate_tokens[: len(documents)], *anchor_tokens[:k]])
+    pairs = len(documents) + k
+    _record_rerank_cost(
+        model_id,
+        store,
+        pairs * longest,
+        normalization.seconds,
+        normalization.peak_growth_bytes,
+        pairs=pairs,
+        longest=longest,
+    )
+    return normalization, normalization.seconds
+
+
+def _warm_up_once(
+    provider: RerankerProvider, query: str, documents: Sequence[str], *, bounded: bool = False
+) -> bool:
+    """Before the first measured recall rerank of this process for the
+    provider's model id: `_WARMUP_RERANKS` single-document reranks on the
+    current candidates' first documents, results and timings discarded
+    (plan P-1). Plain `rerank()`, so nothing here reaches the cost model.
+    Marked done only after they succeed; two threads racing here may both
+    warm up, which costs time but never skews a measurement.
+
+    S247: with `bounded` (the recall callers) each warm-up call is a rerank call site like any
+    other: it runs only when its one-pair batch fits the RAM bound now
+    (`_batch_fits_ram_bound`). When one does not, NO warm-up runs and the model is NOT marked warmed
+    (the next call tries again). S259: the result says whether the caller may go on to probe the pair
+    lengths. It is True except when the gate refused while the model was NOT loaded at the start: the probe
+    would load the model on demand (`CrossEncoderProvider._pair_tokenizer`), which is what the gate refused, so
+    the caller takes the cosine path for this turn and the next turn checks again. A refusal with the model
+    already loaded goes on under the recall's own bounds, the lengths stay available (the real provider starts
+    the probe's clock after any load, so a load is not timed into `T_p`; a test double that reports no seconds
+    is timed by its caller). The ladder's own warm-up is not bounded here (`bounded` False): its
+    headroom check comes first (`measure_ram_figure`)."""
+    model_id = provider.model_id()
+    with _cost_lock:
+        if model_id in _warmed_model_ids:
+            return True
+    chosen = [documents[i % len(documents)] for i in range(_WARMUP_RERANKS)]
+    if bounded:
+        was_loaded = _provider_model_loaded(provider)
+        if not all(_batch_fits_ram_bound(provider, model_id, query, [doc]) for doc in chosen):
+            return was_loaded
+    for doc in chosen:
+        list(provider.rerank(query, [doc]))
+    with _cost_lock:
+        _warmed_model_ids.add(model_id)
+    return True
 
 
 _CGROUP_V2_ROOT = "/sys/fs/cgroup"
 
+_CGROUP_V1_ROOT = "/sys/fs/cgroup/memory"
+
 # The kernel's own "no limit" sentinel for cgroup v1's memory.limit_in_bytes
-# (there is no explicit "unbounded" marker like v2's "max" string) — derived
-# from PAGE_COUNTER_MAX on a 4KiB-page 64-bit kernel. A limit at or above
-# this value is unbounded, never a real cap.
-_CGROUP_V1_UNBOUNDED_SENTINEL = 0x7FFFFFFFFFFFF000
+# (there is no explicit "unbounded" marker like v2's "max"): LONG_MAX rounded down
+# to a page boundary, so 0x7FFFFFFFFFFFF000 on 4 KiB pages, 0x7FFFFFFFFFFFC000 on
+# 16 KiB and 0x7FFFFFFFFFFF0000 on 64 KiB. The constant is the 64 KiB value, so a
+# limit at or above it is unbounded on every page size (S237 review F6); no real
+# cap comes near it. Never a real cap.
+_CGROUP_V1_UNBOUNDED_SENTINEL = 0x7FFFFFFFFFFF0000
 
 
 def _read_proc_self_cgroup_v2_path() -> str | None:
@@ -709,83 +2103,278 @@ def _read_proc_self_cgroup_v2_path() -> str | None:
         return None
 
 
-def _cgroup_v2_ancestor_dirs(cgroup_path: str) -> list[str]:
-    """Every cgroup v2 directory from the process's own cgroup UP TO the
-    root, deepest first. Used to find the EFFECTIVE memory limit: a
-    cgroup's own `memory.max` may read "max" (unbounded) while an
-    ANCESTOR still caps it, so the effective limit is the MIN of every
-    numeric `memory.max` along this chain, not just the process's own
-    level."""
-    segments = [s for s in cgroup_path.split("/") if s]
+def _cgroup_ancestor_dirs(root: str, cgroup_path: str) -> list[str]:
+    """Every cgroup directory from the process's own cgroup UP TO `root` (the v2 mount or the
+    v1 memory-controller mount), deepest first. Used to find the EFFECTIVE memory limit: a
+    cgroup's own limit may read unbounded while an ANCESTOR still caps it, so the effective
+    limit is the tightest one along this chain, not just the process's own level."""
+    segments = [seg for seg in cgroup_path.split("/") if seg]
     dirs = []
     for depth in range(len(segments), -1, -1):
         sub = "/".join(segments[:depth])
-        dirs.append(f"{_CGROUP_V2_ROOT}/{sub}" if sub else _CGROUP_V2_ROOT)
+        dirs.append(f"{root}/{sub}" if sub else root)
     return dirs
 
 
+# S233: the five `memory.stat` lines that say how much of a cgroup's usage is page cache the
+# kernel can give back. v2 names them `file` (all cached file data, tmpfs and shmem included),
+# `file_mapped`, `file_dirty`, `file_writeback`, `shmem`; v1 has the hierarchical `total_`
+# forms. They are matched exactly, never by substring.
+_RECLAIM_KEYS_V2 = ("file", "file_mapped", "file_dirty", "file_writeback", "shmem")
+_RECLAIM_KEYS_V1 = ("total_cache", "total_mapped_file", "total_dirty", "total_writeback", "total_shmem")
+
+
+def _cgroup_reclaimable_file_bytes(stat_path: str, keys: tuple[str, ...]) -> float:
+    """The file cache a cgroup can give back under memory pressure, in bytes, from its
+    `memory.stat`: all cached file data minus what stays counted (S233),
+    `file - file_mapped - file_dirty - file_writeback - shmem` (v1: `total_cache`,
+    `total_mapped_file`, `total_dirty`, `total_writeback`, `total_shmem`, the hierarchical forms
+    that match v1's hierarchical `memory.usage_in_bytes`), floored at 0. `keys` is
+    `_RECLAIM_KEYS_V2` or `_RECLAIM_KEYS_V1`.
+
+    The cgroup's usage counter counts page cache, such as the model files the process read,
+    and the kernel gives back clean cache that no process has mapped when memory is needed,
+    whether the kernel has marked it active or inactive; the headroom readers subtract that
+    part from the usage so it does not read as used. What stays counted: pages some process
+    keeps mapped (`file_mapped`: the loaded model weights), pages not yet written to disk
+    (`file_dirty`, `file_writeback`) and tmpfs/shmem pages (swap-backed: they cannot be given
+    back without swap, and `file` includes them). Mapped shmem sits in both `file_mapped` and
+    `shmem`, so it is taken off twice, which only lowers the figure. Slab (`slab_reclaimable`)
+    is not counted as reclaimable, which is stricter than the host-wide `available` figure.
+
+    Keys are matched exactly (the first whitespace-split token of a line; the first line wins),
+    so `file` never matches `file_mapped` or `total_cache`. Returns 0.0, meaning "subtract
+    nothing" (the figure before S230, the tighter and safer side), when the file is absent
+    (silent: a cgroup without the memory files), unreadable, ANY of the five lines is missing
+    (a missing term would over-read), or a value is not a plain non-negative integer (a sign, an
+    underscore, a non-ASCII digit, nan, inf or a value too large to be finite are all
+    rejected); all of these except the absent file are warned once per process. Never raises,
+    never negative."""
+    try:
+        with open(stat_path, encoding="utf-8") as f:
+            content = f.read()
+    except FileNotFoundError:
+        return 0.0
+    except Exception:  # noqa: BLE001 - fail-soft: a headroom probe must never break a recall
+        _warn_ram_figure_once(
+            "a cgroup memory.stat could not be read: reclaimable file cache is not subtracted from the headroom",
+            exc_info=True,
+        )
+        return 0.0
+    values: dict[str, float] = {}
+    for line in content.splitlines():
+        parts = line.split()
+        if not parts or parts[0] not in keys or parts[0] in values:
+            continue
+        value = _cgroup_plain_bytes(parts[1]) if len(parts) >= 2 else None
+        if value is not None:
+            values[parts[0]] = value
+            continue
+        _warn_ram_figure_once(
+            "a cgroup memory.stat page-cache value is not a plain integer: "
+            "reclaimable file cache is not subtracted from the headroom"
+        )
+        return 0.0
+    if len(values) != len(keys):
+        _warn_ram_figure_once(
+            "a cgroup memory.stat lacks one of the page-cache lines: "
+            "reclaimable file cache is not subtracted from the headroom"
+        )
+        return 0.0
+    cache, mapped, dirty, writeback, shmem = (values[k] for k in keys)
+    return max(0.0, cache - mapped - dirty - writeback - shmem)
+
+
+def _cgroup_plain_bytes(raw: str) -> float | None:
+    """The one strict parse of a cgroup number (S239): ASCII digits only, finite. A sign, a
+    decimal point, an exponent, an underscore, a non-ASCII digit, nan, inf, an empty string, text
+    inside the digits and a value so long it overflows to inf (309+ digits) are all rejected
+    (`None`); only surrounding blanks and the trailing newline are ignored."""
+    text = raw.strip(" \t\r\n")
+    if text.isascii() and text.isdigit():
+        value = float(text)  # a 309-digit value parses to inf: rejected below
+        if math.isfinite(value):
+            return value
+    return None
+
+
+# What a warning about an unusable cgroup file says happens next (S240): a level known to be capped
+# counts as having no headroom, a level not known to be capped is not used.
+_CGROUP_UNUSABLE_NOTE = (
+    "a level known to be capped then counts as having no headroom; a level not known to be capped is not used"
+)
+
+
+def _cgroup_read(
+    path: str, what: str, *, note: str = _CGROUP_UNUSABLE_NOTE
+) -> tuple[str | None, str | None]:
+    """One cgroup file as `(text, None)`, or `(None, "absent")` when it does not exist (silent: the
+    level exposes no such file), or `(None, "unreadable")` for any other failure to read it
+    (warned once per process and file name, with the traceback). `what` is the file's base name.
+    The two failures are told apart because S240 treats them differently: an absent limit file is
+    no limit, an unreadable one is an unknown."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read(), None
+    except FileNotFoundError:
+        return None, "absent"
+    except Exception:  # noqa: BLE001 - fail-soft: a headroom probe must never break a recall
+        _warn_ram_figure_once(f"a cgroup {what} could not be read: {note}", exc_info=True)
+        return None, "unreadable"
+
+
+def _cgroup_read_file(path: str, what: str, *, note: str = _CGROUP_UNUSABLE_NOTE) -> str | None:
+    """The text of one cgroup file, or `None` when it is absent or unreadable (`_cgroup_read`); `note`
+    is what the once-per-process warning says happens next."""
+    return _cgroup_read(path, what, note=note)[0]
+
+
+def _warn_cgroup_not_plain(what: str) -> None:
+    _warn_ram_figure_once(f"a cgroup {what} is not a plain integer: {_CGROUP_UNUSABLE_NOTE}")
+
+
+def _cgroup_counter_bytes(path: str, what: str, *, capped: bool = False) -> float | None:
+    """A one-number cgroup counter (`memory.current`, `memory.usage_in_bytes`) in bytes, or
+    `None` when it cannot be used: absent, unreadable or not a plain non-negative integer
+    (`_cgroup_plain_bytes`; the last two warned once per process and kind). `capped` marks the
+    usage of a level known to be capped (S240): the result is `None` for an absent file either way,
+    but there it is also warned once, because the caller then counts the level as having no
+    headroom."""
+    raw, failure = _cgroup_read(path, what)
+    if raw is None:
+        if failure == "absent" and capped:
+            _warn_ram_figure_once(f"a cgroup {what} is absent on a level that is capped: {_CGROUP_UNUSABLE_NOTE}")
+        return None
+    value = _cgroup_plain_bytes(raw)
+    if value is None:
+        _warn_cgroup_not_plain(what)
+    return value
+
+
+def _cgroup_v2_level_limit(level_dir: str) -> tuple[float | None, bool] | None:
+    """What a cgroup v2 level imposes on its processes and descendants (S239, S240), as
+    `(limit, degraded)`, or `None` when it gives no sign of a cap.
+
+    The limit is the lower of the numeric `memory.max` and `memory.high` (the kernel throttles a
+    cgroup that runs past `memory.high`, so running past it is as unwelcome as running past
+    `memory.max`). "max" and an absent file impose nothing and are silent. A file that is present
+    but unusable (unreadable, or not a plain integer; each warned once) makes the level DEGRADED
+    when the level is known to be capped: its other limit file reads as a number, or reads "max"
+    (a level with a usable limit file and an unusable one is a cgroup whose second limit we cannot
+    see, so it is treated as capped, and its headroom is 0). A level none of whose limit files is
+    usable gives no evidence of a cap and is skipped (`None`, with the warnings for its unusable
+    files): a looser ancestor can then bind there."""
+    numbers: list[float] = []
+    saw_max = False
+    unusable = False
+    for name in ("memory.max", "memory.high"):
+        raw, failure = _cgroup_read(f"{level_dir}/{name}", name)
+        if failure == "unreadable":
+            unusable = True
+            continue
+        if raw is None:
+            continue  # absent: no such limit
+        if raw.strip() == "max":
+            saw_max = True
+            continue
+        value = _cgroup_plain_bytes(raw)
+        if value is None:
+            _warn_cgroup_not_plain(name)
+            unusable = True
+            continue
+        numbers.append(value)
+    if numbers:
+        return min(numbers), unusable
+    if saw_max and unusable:
+        return None, True
+    return None
+
+
+def _cgroup_v1_level_limit(level_dir: str) -> tuple[float, bool] | None:
+    """The limit a cgroup v1 level imposes (`memory.limit_in_bytes`) as `(limit, False)`, or
+    `None` when it has none: the file is absent, unreadable or not a plain integer (the last two
+    warned once), or the value is at or above the kernel's unbounded sentinel
+    (`_CGROUP_V1_UNBOUNDED_SENTINEL`). A level whose only limit file is unusable gives no
+    evidence of a cap and is skipped."""
+    value = _cgroup_counter_bytes(f"{level_dir}/memory.limit_in_bytes", "memory.limit_in_bytes")
+    if value is None or value >= _CGROUP_V1_UNBOUNDED_SENTINEL:
+        return None
+    return value, False
+
+
+def _cgroup_chain_headroom(
+    limited: list[tuple[str, float | None, bool]], usage_name: str, keys: tuple[str, ...]
+) -> float | None:
+    """The headroom of a chain of cgroup levels, the smallest over its levels that are known to be
+    capped (S236, S240), for `limited` = those levels as (directory, limit, degraded), deepest
+    first. A level's headroom is `max(0, limit - (usage - reclaimable))` with THAT level's own
+    usage (`usage_name`, which counts all of its descendants, so the siblings of the process's
+    cgroup too: S235) and its own `memory.stat` (`_cgroup_reclaimable_file_bytes`, capped at that
+    usage); the level that would run out first binds, which is not always the one with the
+    smallest limit.
+
+    A level known to be capped whose figure cannot be measured has headroom 0 (S240), so an
+    unmeasurable capped level can never let a looser ancestor bind: a DEGRADED level (a limit
+    file we cannot read, `_cgroup_v2_level_limit`) and a level whose usage counter is absent,
+    unreadable or not a plain integer both count 0, and neither has its `memory.stat` opened. The
+    process's own usage is never borrowed for an ancestor. `None` when no level is capped (the
+    caller falls back)."""
+    headroom: float | None = None
+    for level_dir, limit, degraded in limited:
+        usage = None if degraded else _cgroup_counter_bytes(f"{level_dir}/{usage_name}", usage_name, capped=True)
+        if degraded or usage is None or limit is None:
+            level_headroom = 0.0
+        else:
+            reclaimable = min(_cgroup_reclaimable_file_bytes(f"{level_dir}/memory.stat", keys), usage)
+            level_headroom = max(0.0, limit - (usage - reclaimable))
+        headroom = level_headroom if headroom is None else min(headroom, level_headroom)
+    return headroom
+
+
 def _cgroup_v2_memory_headroom_bytes() -> float | None:
-    """cgroup v2 memory headroom for the CALLING PROCESS's own cgroup
-    (`effective_memory.max - memory.current`), resolved via `/proc/self/
-    cgroup` (see `_read_proc_self_cgroup_v2_path`) rather than the fixed
-    cgroup2 root — the root has no `memory.max`/`memory.current` of its
-    own, so a root-only read can never see a real per-process cap.
+    """cgroup v2 memory headroom for the CALLING PROCESS, resolved via `/proc/self/cgroup`
+    (see `_read_proc_self_cgroup_v2_path`) rather than the fixed cgroup2 root (the root has no
+    `memory.max`/`memory.current` of its own, so a root-only read can never see a real
+    per-process cap).
 
-    The effective limit WALKS UP the chain from the process's own cgroup
-    to the root (`_cgroup_v2_ancestor_dirs`), taking the MIN of every
-    numeric `memory.max` seen (skipping "max" and any level whose file is
-    absent — an ancestor may not expose the controller file at all),
-    since an ancestor can cap memory even when the process's own cgroup
-    reads "max". Usage is read from the process's OWN cgroup only.
+    The kernel enforces EVERY level's limit on the chain from the process's own cgroup up to the
+    root, against that level's own usage, which counts all of its descendants (the siblings of
+    the process's cgroup too). A level's limit is the lower of its numeric `memory.max` and
+    `memory.high` (S239, `_cgroup_v2_level_limit`). So the headroom is computed per capped
+    level, `max(0, limit - (memory.current - reclaimable))` with that level's own
+    `memory.current` and `memory.stat` (S235), and the result is the MINIMUM over the levels
+    (`_cgroup_chain_headroom`): the level that would run out first binds, which is not always
+    the one with the smallest limit (an ancestor with a larger limit whose siblings have filled
+    it binds first). Levels with no numeric limit impose nothing and are not read further.
+    `reclaimable` is the file cache the kernel can give back (`_cgroup_reclaimable_file_bytes`,
+    S233: `file - file_mapped - file_dirty - file_writeback - shmem`, capped at that level's
+    usage); mapped model pages, dirty and writeback pages and tmpfs stay counted, and so does
+    slab. A level whose `memory.stat` cannot be used subtracts nothing for that level.
 
-    Returns `None` (never a fabricated headroom) when: not Linux,
-    `/proc/self/cgroup` is missing/unparsable, every `memory.max` on the
-    chain is "max"/absent (no cap anywhere -> no need to even read
-    usage), the process's own `memory.current` is missing/unparsable, or
-    any other read/parse error (logged, then degrades to `None`) — every
-    `None` case means "caller falls back to the next source", never
-    "unlimited"."""
+    A level known to be capped whose `memory.current` cannot be used (absent, unreadable, not a
+    plain integer), or one of whose two limit files is present but unusable, has headroom 0
+    (S240), so an unmeasurable capped level can never let a looser ancestor bind; the process's
+    own usage is never borrowed for an ancestor. A level none of whose limit files is usable
+    gives no evidence of a cap and is skipped. Numbers are plain non-negative integers only
+    (`_cgroup_plain_bytes`, S239: no sign, decimal point or exponent). In a container whose
+    cgroup path is absent under the mounted tree (S243) the mount root is the last level of
+    the chain and is read with its own files like any ancestor.
+
+    Returns `None` (never a fabricated headroom) when: not Linux, `/proc/self/cgroup` is
+    missing/unparsable, or no level on the chain has a usable numeric limit (none is known to be
+    capped: no cap anywhere -> no need to even read usage; a different cause from a capped level
+    that cannot be measured, which gives 0.0). `None` means "the caller falls back to the next source" (cgroup v1, then
+    psutil's host-wide available figure), never "unlimited"."""
     if sys.platform != "linux":
         return None
-
     cgroup_path = _read_proc_self_cgroup_v2_path()
     if cgroup_path is None:
         return None
-    dirs = _cgroup_v2_ancestor_dirs(cgroup_path)
-
-    effective_limit: float | None = None
-    for cgroup_dir in dirs:
-        try:
-            with open(f"{cgroup_dir}/memory.max", encoding="utf-8") as f:
-                max_raw = f.read().strip()
-        except FileNotFoundError:
-            continue  # this level exposes no memory controller -> no cap here, keep walking
-        except Exception:  # noqa: BLE001 — fail-soft
-            log.exception("reranker: cgroup v2 memory.max read failed")
-            return None
-
-        if max_raw == "max":
-            continue  # explicitly unbounded at this level -> keep walking up
-
-        try:
-            level_limit = float(max_raw)
-        except Exception:  # noqa: BLE001 — fail-soft
-            log.exception("reranker: cgroup v2 memory.max parse failed")
-            return None
-        effective_limit = level_limit if effective_limit is None else min(effective_limit, level_limit)
-
-    if effective_limit is None:
-        return None  # no numeric cap anywhere on the chain -> caller falls back
-
-    try:
-        with open(f"{dirs[0]}/memory.current", encoding="utf-8") as f:
-            usage = float(f.read().strip())
-    except FileNotFoundError:
-        return None  # process's own cgroup exposes no memory controller
-    except Exception:  # noqa: BLE001 — fail-soft
-        log.exception("reranker: cgroup v2 memory.current read/parse failed")
-        return None
-    return max(0.0, effective_limit - usage)
+    dirs = _cgroup_ancestor_dirs(_CGROUP_V2_ROOT, cgroup_path)
+    limited = [(d, *found) for d in dirs if (found := _cgroup_v2_level_limit(d)) is not None]
+    if not limited:
+        return None  # no level known to be capped on the chain -> caller falls back
+    return _cgroup_chain_headroom(limited, "memory.current", _RECLAIM_KEYS_V2)
 
 
 def _read_proc_self_cgroup_v1_memory_path() -> str | None:
@@ -813,159 +2402,541 @@ def _read_proc_self_cgroup_v1_memory_path() -> str | None:
         return None
 
 
-def _cgroup_v1_memory_headroom_bytes() -> float | None:
-    """cgroup v1 fallback for `_cgroup_v2_memory_headroom_bytes` (older
-    kernels/distros without the unified v2 hierarchy): `memory.limit_in_
-    bytes - memory.usage_in_bytes` read from the CALLING PROCESS's own
-    cgroup path, resolved via `/proc/self/cgroup`'s `memory` controller
-    line (`_read_proc_self_cgroup_v1_memory_path`) rather than the fixed
-    `/sys/fs/cgroup/memory/` root. v1's limit is already hierarchical (a
-    child's own `memory.limit_in_bytes` reflects any ancestor cap), so —
-    unlike v2 — no walk-up is needed here; the process's own path is
-    always the right one to read.
+def _cgroup_v1_walk_dirs(dirs: list[str]) -> list[str]:
+    """The levels of a cgroup v1 chain (`dirs`, the process's own level first) that the kernel
+    charges this cgroup to (S237). v1 charges a cgroup into its parent's counters only when the
+    PARENT has hierarchy accounting on, which the parent's own `memory.use_hierarchy` shows ("1";
+    a cgroup keeps it fixed while it has children). So an ancestor is walked only while its own
+    `memory.use_hierarchy` does not read "0": at a "0" the walk ends there, because that level's
+    usage and limit do not involve this cgroup (nor do those of anything above it). An absent,
+    unreadable or any other value keeps walking (the safe side: more bounds). One read per
+    ancestor level visited, the root included. (From the kernel's memory-controller rules; this
+    VM is cgroup v2 only, so it is tested with synthetic trees.)"""
+    walked = [dirs[0]]
+    for parent in dirs[1:]:
+        raw = _cgroup_read_file(
+            f"{parent}/memory.use_hierarchy",
+            "memory.use_hierarchy",
+            note="the v1 walk keeps going past this level (the safe side: more bounds)",
+        )
+        if raw is not None and raw.strip() == "0":
+            break
+        walked.append(parent)
+    return walked
 
-    An unbounded v1 limit reads back as the kernel's own huge sentinel
-    value (there is no explicit "unbounded" marker like v2's `"max"`); a
-    limit at or above `_CGROUP_V1_UNBOUNDED_SENTINEL` is treated as
-    unbounded -> `None`, the same "caller falls back" signal as every
-    other case here. Same fail-soft posture as the v2 reader: `None` on
-    no v1 controller, unreadable, or unparsable — never a fabricated
-    headroom."""
+
+def _cgroup_file_absent(path: str) -> bool:
+    """True only when `path` does not exist (FileNotFoundError on opening it); any other outcome,
+    a permission error included, is not absence. Nothing is read."""
+    try:
+        with open(path, encoding="utf-8"):
+            return False
+    except FileNotFoundError:
+        return True
+    except Exception:  # noqa: BLE001 - not absence: the level is walked and read normally
+        return False
+
+
+def _cgroup_v1_chain_dirs(cgroup_path: str) -> list[str]:
+    """The levels of the v1 chain to measure (S243, S237), the process's own level first. If the
+    path `/proc/self/cgroup` names is absent under the mounted memory-controller tree (a
+    container without a cgroup namespace view: the mount root IS the container's own cgroup),
+    the chain starts at the first level that exists (the mount root in that layout), and that
+    level is treated as the process's own level; it is not an ancestor, so it is not subject to
+    the `memory.use_hierarchy` rule below. `[]` when no level exists. From there the chain is
+    cut by `_cgroup_v1_walk_dirs`."""
+    all_dirs = _cgroup_ancestor_dirs(_CGROUP_V1_ROOT, cgroup_path)
+    for start, level in enumerate(all_dirs):
+        if not _cgroup_file_absent(f"{level}/memory.limit_in_bytes"):
+            return _cgroup_v1_walk_dirs(all_dirs[start:])
+    return []
+
+
+def _cgroup_v1_memory_headroom_bytes() -> float | None:
+    """cgroup v1 fallback for `_cgroup_v2_memory_headroom_bytes` (older kernels/distros without
+    the unified v2 hierarchy), computed the same way (S237, S240): for every level of the chain
+    from the process's own cgroup up to the memory-controller root, `memory.limit_in_bytes -
+    (memory.usage_in_bytes - reclaimable file cache)` with that level's own usage and
+    `memory.stat`, and the result is the MINIMUM over the levels known to be capped
+    (`_cgroup_chain_headroom`). The reclaimable cache is S233's `total_cache - total_mapped_file
+    - total_dirty - total_writeback - total_shmem` (`_cgroup_reclaimable_file_bytes`, the
+    hierarchical `total_` keys), so clean unmapped cache such as read model files does not read
+    as used; mapped pages, dirty and writeback pages and tmpfs stay counted. The chain is read
+    from the CALLING PROCESS's own cgroup path, resolved via `/proc/self/cgroup`'s `memory`
+    controller line (`_read_proc_self_cgroup_v1_memory_path`) rather than the fixed root; when
+    that path is absent under the mounted tree the first existing level is the process's own
+    (`_cgroup_v1_chain_dirs`, S243).
+
+    In cgroup v1 a cgroup's `memory.limit_in_bytes` is its own setting: the kernel enforces each
+    ancestor's limit separately against that ancestor's usage, which includes this cgroup and its
+    siblings, so each ancestor is read with its own counters, and the walk stops at an ancestor
+    whose own `memory.use_hierarchy` reads "0" (`_cgroup_v1_walk_dirs`: no hierarchical charging,
+    so its counters do not involve this cgroup).
+
+    An unbounded v1 limit reads back as the kernel's own huge sentinel value (there is no
+    explicit "unbounded" marker like v2's `"max"`); a level at or above
+    `_CGROUP_V1_UNBOUNDED_SENTINEL` has no limit and is not read further, and a level whose limit
+    file is unusable gives no evidence of a cap and is skipped. A capped level whose usage cannot
+    be used has headroom 0, as in the v2 reader (S240). `None` on no v1 controller, no level
+    known to be capped on the walked chain - the same "caller falls back" signal as every other
+    case here, never a fabricated headroom."""
     if sys.platform != "linux":
         return None
 
     cgroup_path = _read_proc_self_cgroup_v1_memory_path()
     if cgroup_path is None:
         return None
-    cgroup_dir = f"/sys/fs/cgroup/memory/{cgroup_path}" if cgroup_path else "/sys/fs/cgroup/memory"
+    dirs = _cgroup_v1_chain_dirs(cgroup_path)
+    limited = [(d, *found) for d in dirs if (found := _cgroup_v1_level_limit(d)) is not None]
+    if not limited:
+        return None
+    return _cgroup_chain_headroom(limited, "memory.usage_in_bytes", _RECLAIM_KEYS_V1)
 
+
+def _psutil_available_bytes() -> float | None:
+    """Host-wide free memory: `psutil.virtual_memory().available` (S211: the same call on
+    Linux, macOS and Windows; the kernel's "usable without swapping" estimate), read on every
+    headroom call and taken as the smaller of it and the cgroup figure (S241, see
+    `_available_ram_headroom_bytes`). `None` when psutil cannot read it (warned once per
+    process), never a fabricated figure."""
     try:
-        with open(f"{cgroup_dir}/memory.limit_in_bytes", encoding="utf-8") as f:
-            limit = float(f.read().strip())
-    except FileNotFoundError:
-        return None  # no v1 memory controller for this process's cgroup
-    except Exception:  # noqa: BLE001 — fail-soft
-        log.exception("reranker: cgroup v1 memory.limit_in_bytes read failed")
-        return None
+        import psutil
 
-    if limit >= _CGROUP_V1_UNBOUNDED_SENTINEL:
-        return None  # kernel's "no limit" sentinel -> caller falls back, never treated as unlimited
-
-    try:
-        with open(f"{cgroup_dir}/memory.usage_in_bytes", encoding="utf-8") as f:
-            usage = float(f.read().strip())
-    except Exception:  # noqa: BLE001 — fail-soft
-        log.exception("reranker: cgroup v1 memory.usage_in_bytes read failed")
-        return None
-    return max(0.0, limit - usage)
-
-
-def _proc_meminfo_available_bytes() -> float | None:
-    """Plain host free-memory fallback: `/proc/meminfo`'s `MemAvailable`
-    line (kernel-computed "usable without swapping" estimate) — used only
-    when no cgroup memory limit applies (see `_available_ram_headroom_
-    bytes`). Same `_detect_avx2`-shaped fail-soft posture: `None` on
-    non-Linux or any read/parse error, never a fabricated figure."""
-    if sys.platform != "linux":
-        return None
-    try:
-        with open("/proc/meminfo", encoding="utf-8") as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    return float(line.split()[1]) * 1024.0
-        return None
+        return float(psutil.virtual_memory().available)
     except Exception:  # noqa: BLE001 — fail-soft: a headroom probe must never break a recall
-        log.exception("reranker: /proc/meminfo read failed")
+        _warn_ram_figure_once(
+            "the host free memory could not be read (psutil): the RAM bound's headroom term is skipped",
+            exc_info=True,
+        )
         return None
 
 
 def _available_ram_headroom_bytes() -> float | None:
-    """Cheap, per-call RAM-headroom read for `get_rerank_width`'s memory
-    bound — cadence is a fresh read on every call (not cached like the
-    per-doc TIME/MEMORY figures above), since this is inexpensive (a
+    """Cheap, per-call RAM-headroom read for the width fit's memory
+    bound (`rerank_for_recall`) — a fresh read on every message, since
+    this is inexpensive (a
     handful of small `/proc`-or-`/sys` reads) and lets width react to
     headroom changes mid-session (another process on the box growing), the
     same trade-off the spec's own Open Reconfirmation favors absent a
     concrete reason not to.
 
+    The headroom is the SMALLER of two figures (S241): the cgroup figure and the host-wide
+    available memory read through `psutil`. A cgroup cap above what the machine has free gives no
+    extra memory, so the cap's room alone must never exceed what the host can supply.
+
+    The cgroup figures are limit - (usage - reclaimable file cache) (S233): clean file cache
+    that no process has mapped is given back by the kernel under pressure, so it does not read
+    as used (`file - file_mapped - file_dirty - file_writeback - shmem` of `memory.stat`; v1
+    `total_` forms); mapped model pages, dirty and writeback pages and tmpfs stay counted. The
+    cgroup figure (v2 and v1 alike) is the minimum over the capped levels of the chain, each
+    against its own usage (S235, S237); a level's limit is the lower of `memory.max` and
+    `memory.high` on v2 (S239), and a capped level that cannot be measured counts 0 (S240).
+    The psutil figure also credits mapped pages and slab, which the cgroup figure does not, so
+    the minimum is usually the cgroup one under a cap.
+
     cgroup-limit-aware, per the pre-flip revision's Change-3 requirement:
     Testing's own OOM reproduction ran under an explicit cgroup cap that
-    the host's plain `/proc/meminfo` free-memory reading does NOT reflect,
-    so a host-only read would fail to prevent the exact OOM this change
-    fixes. Tries cgroup v2 first, then v1, then falls back to the host-wide
-    `/proc/meminfo` reading only when no cgroup limit applies (or it's
-    explicitly unbounded). Returns `None` — never a fabricated number —
-    when every source is unavailable/unsupported/errors; `get_rerank_width`
-    treats `None` as "skip the memory term", never as "unlimited
-    headroom"."""
-    headroom = _cgroup_v2_memory_headroom_bytes()
-    if headroom is None:
-        headroom = _cgroup_v1_memory_headroom_bytes()
-    if headroom is None:
-        headroom = _proc_meminfo_available_bytes()
-    return headroom
+    the host's plain free-memory reading does NOT reflect, so a host-only
+    read would fail to prevent the exact OOM this change fixes. Tries cgroup
+    v2 first, then v1 (both Linux only); psutil (S211: the same call on Linux, macOS and
+    Windows) is read on every call and bounds the cgroup figure from above. With no capped
+    level anywhere the cgroup figure is absent and psutil's reading stands alone. One reading
+    absent leaves the other. The one remaining `None` — never a fabricated number — is when
+    neither can be read; the width fit treats `None` as "skip the memory term" and the judge
+    tier guard floors to the safe tier, never as "unlimited headroom". Also imported by
+    `judge_selftune.py`."""
+    cgroup = _cgroup_v2_memory_headroom_bytes()
+    if cgroup is None:
+        cgroup = _cgroup_v1_memory_headroom_bytes()
+    host = _psutil_available_bytes()
+    readings = [r for r in (cgroup, host) if r is not None]
+    return min(readings) if readings else None
 
 
-def get_rerank_width(
-    pool_size: int,
-    provider: RerankerProvider,
-    sample_documents: list[str] | None = None,
-) -> int:
-    """How many of the (cosine-coarse-cut) candidate pool to actually rerank.
+def _kept_ram_fits(model_id: str) -> list[ram_fit.RamFit]:
+    """The memory models this PROCESS holds for `model_id` (`_ram_fit_kept`: the last usable fit
+    of each store it has read, S225/H4b). For a caller that has no store (the floor bootstrap's
+    starters); a recall turn has always read the window before it gets here, so the fit exists."""
+    with _cost_lock:
+        return [fit for (_store, mid), fit in _ram_fit_kept.items() if mid == model_id]
 
-    `= max(1, min(pool_size, CANDIDATE_POOL, floor(LATENCY_BUDGET_SECONDS /
-    per_doc_TIME), floor(available_RAM_headroom / per_doc_MEMORY)))` — the
-    pre-flip revision's Change 3 formula: the original time-only bound plus
-    a MEMORY bound as an additional `min()` term. On fast (AVX2), spacious
-    hardware the measured per-doc latency and memory cost are both small
-    relative to budget/headroom, so both bounds allow a wide rerank; on slow
-    and/or RAM-tight hardware either (or both) narrows automatically,
-    staying within budget AND within a safe memory ceiling — the fp16
-    natural-width OOM (extra speed poured into a wider width with no memory
-    check) is exactly the case a time-only bound could never catch. An
-    auto-scaler computing a width under 50 on a constrained host is intended
-    (not a violation) — the whole point is that the count adapts to the
-    host, not to a fixed target.
 
-    The memory bound is SKIPPED (formula degrades to exactly the pre-
-    Change-3 time-only bound) whenever either input is unavailable: `per_doc
-    _MEMORY <= 0.0` (no measured signal — mirrors `per_doc_TIME`'s identical
-    0.0-means-"don't throttle by it" contract) or `available_RAM_headroom is
-    None` (the cheap per-call read found no usable source — see
-    `_available_ram_headroom_bytes`). This never assumes unlimited headroom;
-    it only ever narrows width when it has a genuine measured reason to.
+def _provider_model_loaded(provider: RerankerProvider) -> bool:
+    """S259: whether `provider`'s model is already in memory; a provider that cannot say counts as NOT loaded
+    (fail safe: the load check then applies)."""
+    try:
+        return bool(provider.model_loaded())
+    except Exception:  # noqa: BLE001
+        return False
 
-    `sample_documents` (#231-fix): a small sample of REAL candidate-pool
-    document content (see `CALIBRATION_SAMPLE_SIZE`), used to calibrate
-    `warm_per_doc` against actual corpus documents instead of a synthetic
-    placeholder — a fixed short stub massively under-measures real
-    cross-encoder cost, which made this auto-scaler a structural no-op (it
-    always computed a budget far in excess of `CANDIDATE_POOL`, so the min()
-    always picked `CANDIDATE_POOL` regardless of true per-doc cost). Optional
-    and purely additive: omitting it (or an empty list) falls back to the
-    original fixed-placeholder calibration, unchanged. The same sample feeds
-    BOTH the time and memory measurements.
 
-    `pool_size <= 0` returns 0 (nothing to rerank — the caller's empty-pool
-    case never reaches here in practice, but this stays well-defined).
-    """
-    if pool_size <= 0:
-        return 0
-    budget = tunables.get_tunable("reranker.latency_budget_seconds", LATENCY_BUDGET_SECONDS)
-    per_doc_time = _warm_per_doc_latency(provider, sample_documents)
-    if per_doc_time <= 0.0:
-        time_width = pool_size
-    else:
-        time_width = math.floor(budget / per_doc_time)
+def _batch_fits_ram_bound(
+    provider: RerankerProvider, model_id: str, query: str, documents: Sequence[str]
+) -> bool:
+    """S247, S259: whether ONE rerank call of `documents` (all scored together, padded to the longest
+    (query, document) pair) may run now. True where no RAM bound applies on this machine
+    (`_ram_bound_applies`: the per-call peak is unreadable there). Otherwise it needs a memory model: with none held by this process the call cannot be sized and
+    does not run, and with some it needs every one of them to allow it (`RamFit.within_measured`:
+    not more pairs or a longer padded length than measured while the model holds single pairs only;
+    and the predicted growth times the S255 safety factor within the headroom). The headroom is read
+    before the pair lengths (which, on the real provider, load the model on demand), so an unreadable
+    headroom costs no tokenizing.
 
-    bounds = [pool_size, CANDIDATE_POOL, time_width]
-
-    per_doc_memory = _warm_per_doc_memory(provider, sample_documents)
+    S259: while the provider's model is NOT loaded yet the load counts too. Before any tokenizing the free memory
+    must cover the S257 load bound (the file size plus the first rung's bound), else nothing is tokenized and so
+    nothing is loaded; once the lengths are known each fit must also have the file size plus the batch's
+    predicted growth (times the factor) within the free memory read BEFORE the load. A model that is loaded is out
+    of the free memory already and adds nothing. The size is looked up only on that path; a size that cannot be
+    determined refuses (fail safe). The refusals before the tokenizing log once per condition. S261: free memory
+    that cannot be read at all refuses (it used to pass)."""
+    if not _ram_bound_applies():
+        return True
+    fits = _kept_ram_fits(model_id)
+    if not fits:
+        log.info("reranker: a rerank batch waits: this process holds no memory model for %s (S247)", model_id)
+        return False
+    loaded = _provider_model_loaded(provider)
     headroom = _available_ram_headroom_bytes()
-    if per_doc_memory > 0.0 and headroom is not None:
-        bounds.append(math.floor(headroom / per_doc_memory))
+    if headroom is None:
+        _memory_wait_log_once(
+            "batch-unread",
+            "batch-load",
+            logging.WARNING,
+            "reranker: a rerank batch waits: free memory cannot be read (S261)",
+        )
+        return False
+    _memory_wait_clear("batch-unread")
+    reserve = 0.0
+    if not loaded:
+        parts = _load_bound_parts(model_id)
+        if parts is None:
+            _memory_wait_log_once(
+                "batch-load-size",
+                "batch-load",
+                logging.WARNING,
+                "reranker: a rerank batch waits: the reranker model is not loaded and its file size could not be "
+                "determined (free memory %.0f MB) (S259)",
+                headroom / 1e6,
+            )
+            return False
+        size, first_rung = parts
+        if headroom < size + first_rung:
+            _memory_wait_log_once(
+                "batch-load",
+                "batch-load-size",
+                logging.INFO,
+                "reranker: a rerank batch waits: the reranker model is not loaded and free memory %.0f MB is below "
+                "the %.0f MB its load needs (S259)",
+                headroom / 1e6,
+                (size + first_rung) / 1e6,
+            )
+            return False
+        _memory_wait_clear("batch-load")
+        reserve = size
+    lengths = provider.pair_token_lengths(query, documents)
+    if not lengths:
+        log.info("reranker: a rerank batch waits: its pair sizes are unavailable (S247)")
+        return False
+    pairs, longest = len(documents), max(lengths)
+    for fit in fits:
+        if not fit.within_measured(pairs, longest) or fit.sized(pairs, longest) + reserve > headroom:
+            log.info(
+                "reranker: a rerank batch of %d pairs x %d tokens waits: it does not fit the memory model "
+                "and the headroom (%.0f MB%s) (S247)",
+                pairs,
+                longest,
+                headroom / 1e6,
+                ", the model load included (S259)" if reserve else "",
+            )
+            return False
+    return True
 
-    return max(1, min(bounds))
+
+def anchor_count(real_width: int) -> int:
+    """Anchors appended ON TOP of `real_width` real candidates (S23):
+    `k = min(P, real_width // ANCHOR_SPLIT_DIVISOR)`, so a rerank sends
+    `real_width + k` documents. With the S5 minimum of real candidates,
+    `k >= K_MIN`."""
+    return min(P, real_width // ANCHOR_SPLIT_DIVISOR)
+
+
+def prefix_cost(estimate: RerankCostEstimate, pairs: int, longest_pair_tokens: int) -> float:
+    """Predicted seconds for one rerank batch of `pairs` documents whose
+    longest (query, document) pair is `longest_pair_tokens` reranker tokens
+    (S67, S75: per-call overhead + per-token rate * padded size). The one
+    place the cost model's shape lives."""
+    return estimate.overhead_seconds + estimate.seconds_per_token * pairs * longest_pair_tokens
+
+
+def fit_rerank_width(
+    candidate_pair_tokens: Sequence[int],
+    anchor_pair_tokens: Sequence[int],
+    estimate: RerankCostEstimate | None,
+    budget_seconds: float,
+    headroom_bytes: float | None,
+    max_real: int = CANDIDATE_POOL,
+    seed_ram_fit: ram_fit.RamFit | None = None,
+) -> int:
+    """How many real candidates to rerank this message (spec §1).
+
+    `candidate_pair_tokens` are the candidates' surviving pair lengths (S62)
+    in the caller's prefix order (genuine first, then monologue-family, each
+    by cosine score, S16/S28); `anchor_pair_tokens` the same for
+    `ANCHOR_POOL` (at least `P` entries). Before the first measurement
+    (`estimate is None`) the width is the S5 minimum (S24). Otherwise it is
+    the longest prefix n <= min(len(candidates), max_real) such that the
+    batch of n real + `anchor_count(n)` anchors fits the budget
+    (`prefix_cost`, padded to its longest pair, anchors included in both
+    factors) and, when a memory model and a headroom reading exist, the
+    peak growth it is predicted to need (`ram_fit.RamFit.sized` of its pair
+    count and longest pair, see the section header: the whole growth times the
+    measured safety factor of S255) fits the headroom (S32, S65: no chunking), and, while the memory model holds no
+    measured batch of more than one pair, it has no more pairs and no longer a padded length
+    than the largest shape measured (`RamFit.within_measured`, S242: such a batch would be
+    extrapolated from single pairs; the cap is part of the RAM term, so a missing headroom
+    reading leaves the width time-bound as before). With no time estimate (`estimate is None`)
+    the width is the S5 minimum, and when the caller passes its memory model (`seed_ram_fit`)
+    and a headroom reading that seed batch has to fit them too, else the width is 0 (S247: the seed
+    rerank is a call site like any other).
+    Both factors of the padded size only grow with n, so the scan stops at
+    the first prefix that does not fit.
+
+    The result may be below the S5 minimum; the caller then does not rerank
+    (S5/S23). Pure: no clock, no I/O."""
+    limit = min(len(candidate_pair_tokens), max_real)
+    if estimate is None:
+        seed = min(RERANK_MIN_REAL_CANDIDATES, limit)
+        if seed_ram_fit is not None and headroom_bytes is not None and seed > 0:
+            # S247: the seed batch is a rerank call like any other. With no time estimate (the time
+            # window aged out) the width is the S5 minimum, but it still has to fit the memory model
+            # and the headroom, and the S242 cap, when the caller holds a memory model.
+            k = anchor_count(seed)
+            pairs = seed + k
+            longest = max([*candidate_pair_tokens[:seed], *anchor_pair_tokens[:k]])
+            if not seed_ram_fit.within_measured(pairs, longest) or seed_ram_fit.sized(pairs, longest) > headroom_bytes:
+                return 0
+        return seed
+    memory = estimate.ram_fit
+    ram_bound = memory is not None and headroom_bytes is not None
+    width = 0
+    longest_real = 0
+    for n in range(1, limit + 1):
+        longest_real = max(longest_real, candidate_pair_tokens[n - 1])
+        k = anchor_count(n)
+        longest = max([longest_real, *anchor_pair_tokens[:k]])
+        pairs = n + k
+        if prefix_cost(estimate, pairs, longest) > budget_seconds:
+            break
+        if ram_bound and (not memory.within_measured(pairs, longest) or memory.sized(pairs, longest) > headroom_bytes):
+            break
+        width = n
+    return width
+
+
+@dataclass(frozen=True)
+class RecallRerank:
+    """What `rerank_for_recall` did for one query.
+
+    `width` — real candidates the fit allowed (the first `width` of the
+    caller's list). `reranked` — True iff the rerank ran and its scores are
+    anchor-normalized; `normalization` then holds them (`scores[i]` belongs
+    to the caller's `i`-th candidate). When `reranked` is False the caller
+    must NOT gate any score (`normalization` is then `None`): `hand_off`
+    says why the no-rerank path takes over — "pool" (fewer than the S5
+    minimum of candidates exist), "budget" (fewer than the minimum fit the latency budget or the RAM
+    bound), "sizes" (the pairs' token lengths could not be read, so no width can be sized; also, S259,
+    the model is not loaded and the free memory does not allow loading it now), or
+    "normalization" (the anchor median could not be taken).
+    `measured` — whether this call added a sample to the cost model."""
+
+    width: int
+    reranked: bool
+    hand_off: str | None
+    normalization: AnchorNormalizationResult | None
+    measured: bool
+
+
+@dataclass(frozen=True)
+class PairSizes:
+    """One query's pair token counts, computed ahead of its rerank
+    (`recall_pair_sizes`) so a caller can time them apart from the rerank
+    itself (name-recall fix R6, plan P-28: the pair-length computation is
+    part of the per-paragraph time `T_p`, not of the rerank budget).
+
+    `lengths` is `provider.pair_token_lengths(query, [*candidates, *ANCHOR_POOL])`
+    over the query's first `CANDIDATE_POOL` candidates, or `None` when the
+    tokenizer probe failed, or (S259) was skipped because the model is not loaded and may not be loaded
+    now (the "sizes" hand-off). `seconds` is the probe's
+    time measured inside the provider's lock (round-3 N3-1), or `None` when
+    the provider measures none (the caller then times the call)."""
+
+    lengths: list[int] | None
+    seconds: float | None = None
+
+
+def warm_up_for_recall(
+    provider: RerankerProvider, query: str, candidate_documents: Sequence[str]
+) -> None:
+    """The two discarded warm-up reranks (plan P-1), run now if this
+    process has not run them yet for the provider's model id. A caller that
+    times its own pair-size probe (`recall_pair_sizes`) calls this first, so
+    the one-time ONNX session load is never timed into `T_p`."""
+    _warm_up_once(provider, query, list(candidate_documents[:CANDIDATE_POOL]), bounded=True)
+
+
+def recall_pair_sizes(
+    provider: RerankerProvider, query: str, candidate_documents: Sequence[str]
+) -> PairSizes:
+    """The pair token counts `rerank_for_recall` would compute for this
+    query, computed now (see `PairSizes`). Warms up first (the real
+    provider's tokenizer exists only once its model is loaded). S259: when the
+    model is not loaded and the free memory does not allow loading it now, the
+    sizes are not probed (the probe would load it): `PairSizes(lengths=None)`, the
+    "sizes" hand-off, the no-rerank path. Raises whatever the provider raises."""
+    pool = list(candidate_documents[:CANDIDATE_POOL])
+    if not _warm_up_once(provider, query, pool, bounded=True):
+        return PairSizes(lengths=None)
+    lengths, seconds = provider.pair_token_lengths_timed(query, [*pool, *ANCHOR_POOL])
+    return PairSizes(lengths=None if lengths is None else list(lengths), seconds=seconds)
+
+
+def rerank_for_recall(
+    provider: RerankerProvider,
+    query: str,
+    candidate_documents: Sequence[str],
+    *,
+    store: MemoryStore,
+    budget_seconds: float | None = None,
+    max_real: int = CANDIDATE_POOL,
+    sizes: PairSizes | None = None,
+) -> RecallRerank:
+    """Fit this query's width, rerank that prefix with anchors on top, and
+    record the call in the cost model (spec §1, S23/S24/S32/S62/S67/S75).
+
+    `candidate_documents` are the query's candidates in prefix order (see
+    `fit_rerank_width`); only the first `CANDIDATE_POOL` are considered.
+    `store` is the caller's memory store: the saved time series is read from
+    it and the measured call is buffered against it (S146, S164).
+    `budget_seconds` defaults to the `reranker.latency_budget_seconds`
+    tunable read now; `max_real` lets a caller give this query less than the
+    design maximum (name-recall fix R6, S58: what is left of the message's
+    50 real candidates; below the S5 minimum the hand-off is "allocation").
+    `sizes`, when given, are this query's pair token counts computed ahead
+    by `recall_pair_sizes` over the same documents (R6 times them into
+    `T_p`); otherwise they are computed here. Raises whatever the provider
+    raises (warm-up, lengths, scoring); callers treat that as a reranker
+    failure."""
+    pool = list(candidate_documents[:CANDIDATE_POOL])
+    cap = min(max_real, CANDIDATE_POOL)
+    if min(len(pool), cap) < RERANK_MIN_REAL_CANDIDATES:
+        return RecallRerank(
+            width=min(len(pool), max(cap, 0)),
+            reranked=False,
+            hand_off="pool" if len(pool) < RERANK_MIN_REAL_CANDIDATES else "allocation",
+            normalization=None,
+            measured=False,
+        )
+
+    if budget_seconds is None:
+        budget_seconds = tunables.get_tunable(
+            "reranker.latency_budget_seconds", LATENCY_BUDGET_SECONDS
+        )
+    model_id = provider.model_id()
+    if not ram_figure_ready(model_id, store):
+        # S203 (a process about to rerank with no usable memory model): no width-5 seeding
+        # batch any more. `search_paragraphs` holds such a turn back before it builds the
+        # reranker (S200); this is the same rule for a model that aged out between that check
+        # and here. Nothing is warmed up or ranked; the need is flagged and the ladder (S208,
+        # S220) makes the model.
+        note_ram_figure_needed(model_id)
+        return RecallRerank(
+            width=0, reranked=False, hand_off="ram_figure", normalization=None, measured=False
+        )
+    if _available_ram_headroom_bytes() is None:
+        # S261: free memory cannot be read at all (psutil and every cgroup level unreadable): the simple safe
+        # fallback is no rerank. Nothing is warmed up, probed or loaded and no miss is recorded.
+        return RecallRerank(width=0, reranked=False, hand_off="budget", normalization=None, measured=False)
+    # Warm up before the length probe, so the one-time ONNX session load is not timed into
+    # the probe. Bounded (S247): when its one-pair batch does not fit the RAM bound it is skipped, and
+    # the probe loads the model on demand. S259: not when the model is not loaded and the free memory
+    # does not allow loading it now: nothing is probed, the "sizes" hand-off serves this query.
+    if not _warm_up_once(provider, query, pool, bounded=True):
+        return RecallRerank(width=0, reranked=False, hand_off="sizes", normalization=None, measured=False)
+    if sizes is None:
+        lengths = provider.pair_token_lengths(query, [*pool, *ANCHOR_POOL])
+    else:
+        lengths = sizes.lengths
+        if lengths is not None and len(lengths) != len(pool) + len(ANCHOR_POOL):
+            raise ValueError(
+                f"rerank_for_recall: {len(lengths)} precomputed pair sizes for "
+                f"{len(pool)} candidates + {len(ANCHOR_POOL)} anchors"
+            )
+    if lengths is None:
+        # Token sizes unavailable (the tokenizer probe failed): a width cannot
+        # be sized against the latency budget or the RAM bound, and a batch of
+        # unknown padded size must not run unbudgeted, so this query is not
+        # reranked (the no-rerank path serves it). No sample is recorded either:
+        # the cost model holds tokens only (S75).
+        return RecallRerank(
+            width=0, reranked=False, hand_off="sizes", normalization=None, measured=False
+        )
+    candidate_tokens, anchor_tokens = lengths[: len(pool)], lengths[len(pool) :]
+    estimate = rerank_cost_estimate(model_id, store)
+    headroom = _available_ram_headroom_bytes()
+    seed_fit = _ram_fit_for(store, model_id)[0] if estimate is None else None
+    width = fit_rerank_width(
+        candidate_tokens, anchor_tokens, estimate, budget_seconds, headroom, cap, seed_ram_fit=seed_fit
+    )
+    if estimate is None and width < RERANK_MIN_REAL_CANDIDATES:
+        # S247: the seed batch does not fit the memory model and the headroom. No time estimate
+        # exists, so there is no time-stuck miss to record or re-measure.
+        return RecallRerank(width=width, reranked=False, hand_off="budget", normalization=None, measured=False)
+
+    if width < RERANK_MIN_REAL_CANDIDATES:
+        # The MEASURED estimate says fewer than the S5 minimum fit this
+        # query's budget, so it is not reranked and adds no measurement. It is
+        # kept as the model id's last budget miss (S113); while the estimate
+        # says its first 5 do not fit the FULL budget, the re-measure job
+        # re-times them at a chat lull (S100), so an inflated estimate cannot
+        # absorb every later message. (The RAM term can land here too, for a
+        # batch whose predicted growth does not fit the headroom, or, while the
+        # memory model holds single pairs only, for a batch larger than any
+        # shape measured (S242); the time-stuck job leaves that miss alone. The
+        # headroom changes by itself, the single-pair model only when the
+        # ladder next measures a batch.)
+        miss = _BudgetMiss(
+            query=query,
+            documents=tuple(pool[:RERANK_MIN_REAL_CANDIDATES]),
+            candidate_tokens=tuple(candidate_tokens[:RERANK_MIN_REAL_CANDIDATES]),
+            anchor_tokens=tuple(anchor_tokens),
+        )
+        with _cost_lock:
+            _budget_misses[model_id] = miss
+        return RecallRerank(
+            width=width, reranked=False, hand_off="budget", normalization=None, measured=False
+        )
+
+    normalization, seconds = _measured_rerank(
+        provider, model_id, store, query, pool[:width], candidate_tokens, anchor_tokens
+    )
+    measured = seconds is not None
+    if measured and seconds <= _full_rerank_budget():
+        # S116 (a): a rerank of 5 or more real candidates ran within the full
+        # budget, which proves 5 fit: the model id is not stuck.
+        with _cost_lock:
+            _budget_misses.pop(model_id, None)
+    if not normalization.did_normalize:
+        # Raw scores: never handed to a caller that could gate them.
+        return RecallRerank(
+            width=width,
+            reranked=False,
+            hand_off="normalization",
+            normalization=None,
+            measured=measured,
+        )
+    return RecallRerank(
+        width=width, reranked=True, hand_off=None, normalization=normalization, measured=measured
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -984,27 +2955,22 @@ def get_rerank_width(
 # so a single anomalous anchor score cannot swing the whole correction, the
 # same robust-statistics posture F2a's own design favors generally.
 #
-# `k = min(P, floor(width / 2))` — the anchor count `k` is HARDWARE-DERIVED
-# from `get_rerank_width`'s own output, never a hand-picked constant [OWNER
+# `k = min(P, real_width // 2)` (`anchor_count`) — the anchor count is
+# derived from the hardware-fitted width, never a hand-picked constant [OWNER
 # 2026-09-22 "that, is a magic number constant. No. Have it scale based on
-# the hardware capability like everything else"]. Anchors are RESERVED OUT
-# OF `width`, never appended on top of it, so the one combined rerank() call
-# scores exactly `real_width + k = width` documents — the same budget-
-# derived count `get_rerank_width` already enforces, never more (I6: zero
-# net latency added over today's one bounded per-turn rerank step).
-#
-# This section builds ONLY the isolated mechanism (helper + anchor pool).
-# Wiring it into `semantic_recall.py` / `search_memories.py`'s floor-gate
-# call sites, re-pointing F2a's calibration-log write at the normalized
-# score, and the deploy-time one-time recalibration are LATER increments
-# (spec §2/§5/§6) — see `~/.claude/plans/f2b-anchor-normalization-spec.md`.
+# the hardware capability like everything else"]. Name-recall fix R1 (S23):
+# anchors now come ON TOP of the real candidates (they were reserved out of
+# the width until R1): width counts real candidates, a rerank sends
+# `real_width + k` documents, and the anchors' cost is inside the width fit
+# (`fit_rerank_width` prices the whole batch, anchors included), so the
+# per-turn rerank stays inside the latency budget (I6).
 
 # The meaningful-median floor: below 2 anchor scores, "median" degenerates
 # (a single value, or an arbitrary pick between two with no robust middle)
 # and offers no protection against one anomalous anchor swinging the whole
 # correction — the same robust-statistics reasoning the median choice above
-# rests on. SIZES the anchor mechanism (I3-clean — same precedent class as
-# `CALIBRATION_SAMPLE_SIZE` above); it is NOT a relevance threshold — no
+# rests on. SIZES the anchor mechanism (I3-clean); it is NOT a relevance
+# threshold — no
 # memory/candidate score is ever compared against `K_MIN`.
 K_MIN = 2
 
@@ -1138,10 +3104,23 @@ def normalize_bundled_pairs_against_anchors(
     Returns one normalized score per pair, positionally aligned with
     `pairs`. Anchor documents/scores are used ONLY to compute each pair's
     median offset and are never returned.
+
+    S247 (the RAM bound): each pair's call runs only when its batch fits the RAM bound NOW
+    (`_batch_fits_ram_bound`: the process's memory model and the live headroom; this caller has no
+    store, so the bound is the process's kept model). When it does not, `RerankDeferred` is raised
+    BEFORE that pair's call and nothing is returned (the pairs already scored are discarded:
+    ten tiny calls); `floor_calibration.get_bootstrap_floor` turns it into a failed attempt, which
+    the lull job and the message retry run again.
     """
     normalized: list[float] = []
+    model_id = provider.model_id()
     for query, doc in pairs:
-        raw_scores = list(provider.rerank(query, [doc, *ANCHOR_POOL]))
+        documents = [doc, *ANCHOR_POOL]
+        if not _batch_fits_ram_bound(provider, model_id, query, documents):
+            raise RerankDeferred(
+                f"a bundled pair's batch of {len(documents)} documents does not fit the RAM bound now"
+            )
+        raw_scores = list(provider.rerank(query, documents))
         real_score, anchor_scores = raw_scores[0], raw_scores[1:]
         normalized.append(_median_normalize([real_score], anchor_scores)[0])
     return normalized
@@ -1149,116 +3128,82 @@ def normalize_bundled_pairs_against_anchors(
 
 @dataclass(frozen=True)
 class AnchorNormalizationResult:
-    """Result of `normalize_against_anchors` — everything a (later-increment)
-    caller needs to map scores back onto real candidate ids.
+    """Result of `normalize_against_anchors`.
 
-    `scores` — one float per ACTUALLY-SCORED real candidate, positionally
-    aligned with the FRONT of the caller's `real_documents` (i.e.
-    `real_documents[:real_width]` — see `real_width`). Median-normalized
+    `scores` — one float per real candidate, positionally aligned with the
+    caller's `real_documents` (all of them are scored). Median-normalized
     (`raw - median(anchor_scores)`) when `did_normalize` is True; raw,
-    unmodified reranker scores when False (the no-op case — F2a-only
-    behaviour for that call).
+    unmodified reranker scores when False (the defensive no-op below), which
+    a caller must never gate against the normalized floor.
 
-    `real_width` — how many of the caller's `real_documents` were actually
-    sent to the reranker (`== len(scores)`). Equals `width` when
-    `did_normalize` is False (no anchors reserved that call) and
-    `width - k` when True.
+    `real_width` — `len(real_documents)` (`== len(scores)`).
 
-    `did_normalize` — False on a near-degenerate `width` (`k < K_MIN`, i.e.
-    `width < 4` at today's `K_MIN`/split values): no anchors were appended,
-    `scores` are RAW. True whenever the median correction actually ran.
+    `did_normalize` — False only when `anchor_count(real_width) < K_MIN`
+    (fewer than 4 real documents): no anchors were appended, `scores` are
+    RAW. Recall callers never get here (they rerank at least the S5 minimum
+    of 5 real candidates, so k >= 2).
+
+    `anchor_count` — anchors appended on top (`0` on the no-op).
+    `seconds` / `peak_growth_bytes` — the scoring call's measurements from
+    `RerankerProvider.rerank_timed` (feed the width fit's cost model).
     """
 
     scores: list[float]
     real_width: int
     did_normalize: bool
+    anchor_count: int = 0
+    seconds: float | None = None
+    peak_growth_bytes: float | None = None
 
 
 def normalize_against_anchors(
     provider: RerankerProvider,
     query: str,
-    real_documents: list[str],
-    width: int,
+    real_documents: Sequence[str],
 ) -> AnchorNormalizationResult:
-    """Per-query anchor-median normalization (F2b, #276) — see the module
-    section header above for the mechanism and the owner ruling that shaped
-    `k`'s derivation.
+    """Per-query anchor-median normalization (F2b, #276), anchors ON TOP
+    (name-recall fix R1, S23) — see the section header above.
 
-    `real_documents` is the caller's coarse-ranked REAL candidate content,
-    already ordered best-first (the same list a caller would otherwise slice
-    to `width` and rerank directly) — this function does its OWN slicing
-    (`real_documents[:real_width]`), so callers should NOT pre-slice to
-    `width` themselves. `width` is exactly what `get_rerank_width(...)`
-    returned for this call.
+    Scores EVERY document in `real_documents` (the caller passes exactly the
+    prefix it fitted, e.g. `rerank_for_recall`'s `width`), plus
+    `k = anchor_count(len(real_documents))` anchors (`ANCHOR_POOL[:k]`)
+    appended after them, in ONE combined `rerank_timed` call; splits the
+    scores positionally back into real vs anchor and returns
+    `raw_real_scores - median(anchor_scores)`. Computed FRESH on every call:
+    the anchor offset is a per-QUERY property, so caching it across calls
+    would defeat the point of the correction.
 
-    Computes `k = min(P, width // ANCHOR_SPLIT_DIVISOR)` (anchors keep at
-    most half the rerank slots, capped at the curated pool size) and, when
-    `k >= K_MIN`, reserves
-    `k` anchors OUT OF `width` (never on top of it — `real_width = width -
-    k`), makes ONE combined `rerank(query, real_documents[:real_width] +
-    ANCHOR_POOL[:k])` call, splits the returned scores positionally back
-    into real vs. anchor, and returns `raw_real_scores - median(anchor_
-    scores)`. Computed FRESH on every call — unlike `_latency_cache` /
-    `_provider_cache` above (which memoize call-STABLE properties: warm
-    per-doc timing, a loaded model), the anchor offset is a per-QUERY
-    property, so caching it across calls would defeat the point of the
-    correction.
-
-    No-ops (raw scores, no anchors appended) when `k < K_MIN` — `width` too
-    small for a meaningful anchor median while still leaving a real
-    candidate slot; see `AnchorNormalizationResult.did_normalize`.
-
-    Total documents ever sent to `provider.rerank()` is exactly `width` in
-    both branches (`real_width + k` when normalizing, `real_width` alone —
-    `== width` — on no-op): never more than the budget-derived count
-    `get_rerank_width` already enforces (I6).
+    Defensive no-op (raw scores, no anchors appended, `did_normalize=False`)
+    when `k < K_MIN`: too few real documents for a meaningful anchor median.
 
     Anchor documents/scores are used ONLY to compute the median offset and
     are NEVER returned — callers must not treat them as candidates.
-
-    Fail-soft guard: in the anchor-reserving branch (`k >= K_MIN`), the
-    invariant `len(real_documents) >= real_width` always holds for
-    correctly-wired callers (`real_documents` is the coarse-ranked pool
-    backing `width = min(pool_size, ...) <= pool_size <= len(real_documents)`,
-    and `real_width <= width`), but is not itself enforced here. A future
-    caller that violates it would otherwise misalign the positional
-    real/anchor split — `real_documents[:real_width]` silently returns fewer
-    than `real_width` documents, so the positional
-    `raw_scores[:real_width]` / `raw_scores[real_width:]` split spills
-    anchor-scored positions into `real_scores` and can leave `anchor_scores`
-    EMPTY, calling `statistics.median([])`, which raises `StatisticsError`
-    and crashes recall. This is hot-path-adjacent, so a violation degrades
-    gracefully instead of raising: it logs a warning (so the real bug stays
-    visible) and no-ops to RAW scores over whatever `real_documents` are
-    actually available (`did_normalize=False`), same shape as the `k <
-    K_MIN` no-op above.
     """
-    k = min(P, width // ANCHOR_SPLIT_DIVISOR)
+    real = list(real_documents)
+    real_width = len(real)
+    k = anchor_count(real_width)
     if k < K_MIN:
-        real_width = width
-        scores = list(provider.rerank(query, real_documents[:real_width]))
-        return AnchorNormalizationResult(scores=scores, real_width=real_width, did_normalize=False)
-
-    real_width = width - k
-    if len(real_documents) < real_width:
-        log.warning(
-            "normalize_against_anchors: invariant len(real_documents) >= "
-            "real_width violated (len(real_documents)=%d, real_width=%d, "
-            "width=%d) — degrading to raw scores over the available "
-            "real_documents, no anchors appended",
-            len(real_documents),
-            real_width,
-            width,
+        scores, seconds, growth = provider.rerank_timed(query, real)
+        return AnchorNormalizationResult(
+            scores=scores,
+            real_width=real_width,
+            did_normalize=False,
+            seconds=seconds,
+            peak_growth_bytes=growth,
         )
-        scores = list(provider.rerank(query, real_documents))
-        return AnchorNormalizationResult(scores=scores, real_width=len(real_documents), did_normalize=False)
 
-    combined = real_documents[:real_width] + ANCHOR_POOL[:k]
-    raw_scores = list(provider.rerank(query, combined))
+    raw_scores, seconds, growth = provider.rerank_timed(query, real + ANCHOR_POOL[:k])
     real_scores = raw_scores[:real_width]
     anchor_scores = raw_scores[real_width:]
     normalized = _median_normalize(real_scores, anchor_scores)
-    return AnchorNormalizationResult(scores=normalized, real_width=real_width, did_normalize=True)
+    return AnchorNormalizationResult(
+        scores=normalized,
+        real_width=real_width,
+        did_normalize=True,
+        anchor_count=k,
+        seconds=seconds,
+        peak_growth_bytes=growth,
+    )
 
 
 # ---------------------------------------------------------------------------

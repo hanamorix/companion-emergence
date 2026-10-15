@@ -112,10 +112,10 @@ def _read_total_ram_bytes() -> float | None:
     RAM-tier detector's raw signal (spec §1: "RAM is the proxy for overall
     capability... an 8 GB box implies a modest CPU, 32 GB a real CPU").
 
-    Mirrors `brain.memory.reranker._proc_meminfo_available_bytes`'s SHAPE
-    exactly (same fail-soft posture: `None` on non-Linux or any read/parse
-    error, never a fabricated figure) but reads `MemTotal`, not
-    `MemAvailable` — tier detection is about the box's overall CAPABILITY
+    Mirrors the SHAPE of the reranker's former `/proc/meminfo` free-memory
+    reader (replaced by `psutil` there, S211): the same fail-soft posture (`None`
+    on non-Linux or any read/parse error, never a fabricated figure), but reads
+    `MemTotal`, not `MemAvailable` — tier detection is about the box's overall CAPABILITY
     CLASS, not this instant's free memory (that is the separate OOM-safety
     guard's job, via `_available_ram_headroom_bytes`, reused unchanged from
     `reranker.py` below). A deliberate near-duplicate of the meminfo read,
@@ -171,20 +171,22 @@ def _downgrade_for_oom_safety(tune_grade: str, effective_headroom_bytes: float |
     the CAPABILITY tier; this pairs it with a cgroup-aware EFFECTIVE-memory
     check — REUSING the corrected `reranker._available_ram_headroom_bytes`
     unchanged (no duplicate cgroup read: that helper already walks
-    `/proc/self/cgroup` to resolve the CALLING PROCESS's own cgroup v2/v1
-    limit, falling back to host-wide `/proc/meminfo` only when no cgroup
-    limit applies) — and downgrades to the largest grade whose FOOTPRINT
-    actually fits, so a cgroup-capped box (host-total RAM looks capable,
-    but the container is capped far below it) never selects a tier that
-    would OOM. Knob-refit's footprint is tiny by construction and always
-    fits, so it is the floor this can never downgrade past.
+    `/proc/self/cgroup` to resolve the CALLING PROCESS's own cgroup chain, v2
+    then v1, takes the tightest headroom along it, and returns the smaller of that
+    and psutil's host-wide available figure, S241) — and
+    downgrades to the largest grade whose FOOTPRINT actually fits, so a
+    cgroup-capped box (host-total RAM looks capable, but the container is
+    capped far below it) never selects a tier that would OOM. Knob-refit's
+    footprint is tiny by construction and always fits, so it is the floor
+    this can never downgrade past.
 
     `effective_headroom_bytes is None` (every headroom source unavailable —
     the same fail-soft contract `_available_ram_headroom_bytes` documents:
-    non-Linux, or every cgroup/meminfo read failed) means there is no
-    signal to downgrade BY, but also no signal to trust the RAM-tier pick
-    WITH — this fails toward the safe floor too, the same posture
-    `_select_tune_grade_by_ram`'s own `None` branch takes, rather than
+    no capped cgroup level exists and psutil could not read the host's
+    free memory either) means there is no signal to downgrade BY, but also
+    no signal to trust the RAM-tier pick WITH — this fails toward the safe
+    floor too, the same posture `_select_tune_grade_by_ram`'s own `None`
+    branch takes, rather than
     treating "unknown" as "unlimited" (exactly the fp16-width OOM
     `_available_ram_headroom_bytes` itself was fixed to prevent).
     """

@@ -258,7 +258,7 @@ def test_calibration_tick_judge_failure_does_not_crash_and_prune_already_committ
 
 def test_calibration_tick_derives_floor_for_the_current_reranker_model_id(monkeypatch):
     """The tick must derive a floor for the CURRENT production reranker's
-    model_id (`build_reranker_provider().model_id()`), not a stale or
+    model_id (`resolve_reranker_model_id()`), not a stale or
     hardcoded one."""
     from brain.bridge.supervisor import _run_calibration_tick
     from brain.memory import floor_calibration as fc_mod
@@ -270,7 +270,7 @@ def test_calibration_tick_derives_floor_for_the_current_reranker_model_id(monkey
     with tempfile.TemporaryDirectory() as d:
         pd = Path(d)
 
-        monkeypatch.setattr(reranker_mod, "build_reranker_provider", lambda **kwargs: FakeRerankerProvider())
+        monkeypatch.setattr(reranker_mod, "resolve_reranker_model_id", lambda: FakeRerankerProvider().model_id())
         scripted = FloorDerivationOutcome(
             accepted=True, floor=1.0, raw_fit_floor=1.0, sample_pairs=200,
             is_cold_start=False, held_for_data_starvation=False,
@@ -304,7 +304,7 @@ def test_calibration_tick_floor_derivation_failure_does_not_crash_the_tick(monke
     with tempfile.TemporaryDirectory() as d:
         pd = Path(d)
 
-        monkeypatch.setattr(reranker_mod, "build_reranker_provider", lambda **kwargs: FakeRerankerProvider())
+        monkeypatch.setattr(reranker_mod, "resolve_reranker_model_id", lambda: FakeRerankerProvider().model_id())
 
         def _raising_derive(store, model_id, **kw):
             raise RuntimeError("simulated floor-derivation failure")

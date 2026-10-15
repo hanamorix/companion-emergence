@@ -10,7 +10,7 @@ was rewritten accordingly: `ema_update`/`stability_gate_accepts`/
 `_bootstrap_ci` no longer exist (see the dead-code test below), and
 `derive_and_persist_floor`'s own cold-start branch (bundled-pair fit,
 unconditionally persisted) is gone, replaced by a data-starvation backstop.
-`get_bootstrap_floor` (the SEPARATE, still-standing hot-path bootstrap) and
+`get_bootstrap_floor` (the SEPARATE, still-standing rerank bootstrap, now computed at process start) and
 `fit_threshold_fbeta` (the raw fit itself) are UNCHANGED by Change 1 and
 keep their existing coverage below.
 
@@ -472,8 +472,14 @@ def test_no_prior_row_and_starved_writes_nothing_no_crash(store: MemoryStore) ->
         assert outcome.raw_fit_floor is None
         assert store.get_persisted_reranker_floor(MODEL_ID) is None, "must write NOTHING, not a placeholder row"
 
+        # S85 (revised): the reply path only peeks the cache; the bootstrap is
+        # computed at process start (`run_rerank_bootstrap`), then served.
+        from brain.memory import floor_calibration
+
+        assert store.get_reranker_floor(MODEL_ID) is None, "the reply path never computes it"
+        assert floor_calibration.run_rerank_bootstrap(MODEL_ID) is not None
         bootstrap_served = store.get_reranker_floor(MODEL_ID)
-        assert bootstrap_served is not None, "recall must still get a served floor via the bootstrap hot path"
+        assert bootstrap_served is not None, "recall gets a served floor once the startup bootstrap ran"
         assert bootstrap_served["is_cold_start"] is True
     finally:
         del reranker_mod._bootstrap_reranker_provider
@@ -715,7 +721,7 @@ def test_cold_start_pairs_uses_the_shared_anchor_normalization_helper() -> None:
 
 # ---------------------------------------------------------------------------
 # get_bootstrap_floor — F2a inc8 (#250 §7 UPDATED, Roy 2026-09-18): the
-# hot-path DEFAULT `get_reranker_floor` serves instead of None when no
+# DEFAULT `get_reranker_floor` serves (from the cache) instead of None when no
 # persisted row exists yet. UNCHANGED by Change 1. All offline via a
 # scripted FakeRerankerProvider monkeypatched onto
 # `reranker._bootstrap_reranker_provider` directly.
@@ -816,13 +822,17 @@ def test_bootstrap_floor_is_computed_once_and_cached_not_per_call(
     monkeypatch.setattr(floor_calibration, "fit_threshold_fbeta", _counting_fit)
 
     store = MemoryStore(db_path=":memory:")
-    results = [store.get_reranker_floor("bootstrap-cache-once-test-model") for _ in range(5)]
+    model_id = "bootstrap-cache-once-test-model"
+    assert store.get_reranker_floor(model_id) is None, "the reply path never computes it (S85)"
+    for _ in range(5):
+        assert floor_calibration.run_rerank_bootstrap(model_id) is not None
+    results = [store.get_reranker_floor(model_id) for _ in range(5)]
 
     assert all(r is not None for r in results)
     assert all(r["floor"] == pytest.approx(results[0]["floor"]) for r in results), (
         "every call must serve the SAME cached value"
     )
-    assert call_count["n"] == 1, "the fit must run exactly once across 5 repeated no-row calls"
+    assert call_count["n"] == 1, "the fit must run exactly once across 5 repeated bootstrap runs"
 
 
 def test_bootstrap_floor_never_touches_torch_or_the_relevance_judge(
@@ -942,11 +952,10 @@ def test_bootstrap_floor_normalization_never_reenters_get_reranker_floor(
 
     monkeypatch.setattr(MemoryStore, "get_reranker_floor", _counting_get_floor)
 
-    store = MemoryStore(db_path=":memory:")
-    result = store.get_reranker_floor("recursion-guard-test-model")
+    result = floor_calibration.run_rerank_bootstrap("recursion-guard-test-model")
 
     assert result is not None
-    assert call_count["n"] == 1, (
+    assert call_count["n"] == 0, (
         "the bootstrap's anchor-normalization must not re-enter get_reranker_floor — a count > 1 "
         "means the normalization routed through a store-touching provider (e.g. "
         "build_reranker_provider) instead of the guarded _bootstrap_reranker_provider"
@@ -989,8 +998,10 @@ def test_ac13c_directional_guard_normalized_floor_correctly_abstains_what_raw_fl
 
     # The candidate's per-call NORMALIZED score, via the REAL gate-path
     # helper (the same one run at recall time, semantic_recall.py §2).
-    real_documents = [candidate_doc, "filler-candidate-1", "filler-candidate-2"]
-    gate_result = normalize_against_anchors(provider, "some real query", real_documents, width=5)
+    # (name-recall fix R1: anchors come on top of the real documents, so the
+    # recall-time minimum of 5 real candidates gets k = 2 anchors.)
+    real_documents = [candidate_doc, *(f"filler-candidate-{i}" for i in range(1, 5))]
+    gate_result = normalize_against_anchors(provider, "some real query", real_documents)
     assert gate_result.did_normalize is True
     normalized_candidate_score = gate_result.scores[0]
 
@@ -1014,3 +1025,97 @@ def test_ac13c_directional_guard_normalized_floor_correctly_abstains_what_raw_fl
         "POST-FIX: comparing the SAME normalized candidate score against the NOW-normalized "
         "bootstrap floor must correctly ABSTAIN it — the exact direction §5b fixes"
     )
+
+
+# ---------------------------------------------------------------------------
+# S247: the bundled-pair scoring is a rerank call site; it runs inside the RAM bound or it waits.
+# ---------------------------------------------------------------------------
+
+
+class _CountingBundleProvider(FakeRerankerProvider):
+    def __init__(self, scores: dict[str, float]) -> None:
+        super().__init__(scores=scores)
+        self.calls = 0
+
+    def rerank(self, query, documents):
+        self.calls += 1
+        return super().rerank(query, documents)
+
+
+def _bounded_bootstrap(monkeypatch: pytest.MonkeyPatch, model_id: str, headroom) -> _CountingBundleProvider:
+    """The RAM bound on (the peak is readable), the provider scripted, the process's kept memory model absent."""
+    from brain.memory import floor_calibration
+    from brain.memory import reranker as reranker_mod
+
+    floor_calibration._reset_bootstrap_floor_cache()
+    provider = _CountingBundleProvider(_bundled_scores(2.5, -3.0))
+    monkeypatch.setattr(reranker_mod, "_require_ram_figure", True)
+    monkeypatch.setattr(reranker_mod.peak_rss, "available", lambda: True)
+    monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: headroom)
+    monkeypatch.setattr(reranker_mod, "_bootstrap_reranker_provider", lambda mid: provider)
+    monkeypatch.setattr(provider, "model_id", lambda: model_id)
+    return provider
+
+
+def _keep_fit(model_id: str, **kw) -> None:
+    from brain.memory import ram_fit
+    from brain.memory import reranker as reranker_mod
+
+    fit = ram_fit.RamFit(
+        a=kw.get("a", 1.0), b=0.0, c=0.0, shapes=5, samples=5, max_pairs=kw.get("max_pairs", 58), max_length=1024
+    )
+    with reranker_mod._cost_lock:  # noqa: SLF001
+        reranker_mod._ram_fit_kept[("store-key", model_id)] = fit  # noqa: SLF001
+
+
+def test_a_deferred_bootstrap_floor_returns_none_caches_nothing_and_is_not_logged_as_an_error(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from brain.memory import floor_calibration
+
+    model_id = "deferred-bootstrap-model"
+    provider = _bounded_bootstrap(monkeypatch, model_id, 5e12)  # no kept memory model: the batch cannot be sized
+    with caplog.at_level("INFO"):
+        assert floor_calibration.get_bootstrap_floor(model_id) is None
+    assert provider.calls == 0, "deferred before any rerank call"
+    assert floor_calibration.peek_bootstrap_floor(model_id) is None
+    assert not [r for r in caplog.records if r.exc_info or r.levelname in ("ERROR", "CRITICAL")]
+    assert any("deferred" in r.getMessage() and r.levelname == "INFO" for r in caplog.records)
+
+
+def test_a_deferred_bootstrap_floor_is_recorded_as_a_failed_attempt_and_computed_once_there_is_room(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from brain.memory import floor_calibration
+
+    model_id = "deferred-then-computed-model"
+    provider = _bounded_bootstrap(monkeypatch, model_id, 5e12)
+    floor_calibration.note_bootstrap_needed("rerank", model_id)
+    assert floor_calibration.run_rerank_bootstrap(model_id, activity_marker="m1") is None
+    assert floor_calibration.bootstrap_failed("rerank", model_id) is True
+    assert floor_calibration.rerank_bootstrap_due(model_id, activity_marker="m1") is False
+    assert floor_calibration.rerank_bootstrap_due(model_id, activity_marker="m2") is True
+    _keep_fit(model_id)  # the process holds a memory model now, and the headroom is ample
+    result = floor_calibration.run_rerank_bootstrap(model_id, activity_marker="m2")
+    assert result is not None and result["is_cold_start"] is True
+    assert provider.calls == len(floor_calibration._bootstrap_labeled_pairs())  # noqa: SLF001
+    assert floor_calibration.bootstrap_failed("rerank", model_id) is False
+    assert floor_calibration.peek_bootstrap_floor(model_id) is not None
+
+
+def test_a_bootstrap_floor_that_fails_for_another_reason_is_still_logged_with_its_traceback(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from brain.memory import floor_calibration
+
+    model_id = "other-failure-model"
+    provider = _bounded_bootstrap(monkeypatch, model_id, 5e12)
+    _keep_fit(model_id)
+
+    def _boom(query, documents):
+        raise RuntimeError("scoring failed")
+
+    monkeypatch.setattr(provider, "rerank", _boom)
+    with caplog.at_level("INFO"):
+        assert floor_calibration.get_bootstrap_floor(model_id) is None
+    assert any(r.exc_info for r in caplog.records)

@@ -23,16 +23,29 @@ from brain.chat.tool_inventory import build_tool_inventory
 from brain.engines.daemon_state import DaemonState, get_residue_context
 from brain.engines.research_ambient import build_research_awareness_block
 from brain.maker.ambient import build_maker_awareness_block
+from brain.memory import keyword_budget
 from brain.memory.recall_open import open_memory
+from brain.memory.recall_stopwords import RECALL_STOPWORDS
 from brain.memory.relevance import (
     FULL_INJECT_IMPORTANCE,
     FULL_INJECT_MAX,
     SNIPPET_COUNT,
     SNIPPET_MODE_ENABLED,
+    lead_with_names,
+    names_in,
+    rank_name_hits,
     snippet_length,
 )
-from brain.memory.semantic_recall import SemanticRecallResult, run_semantic_recall
-from brain.memory.store import MemoryStore
+from brain.memory.semantic_recall import (
+    FULL_INJECT_STANDOUT_MAX,
+    MAX_STANDOUT_COUNT,
+    SemanticRecallResult,
+    genuine_first_memories,
+    is_monologue_family,
+    merge_with_keyword,
+    run_semantic_recall,
+)
+from brain.memory.store import MemoryStore, split_by_raw_query_floor
 from brain.soul.store import SoulStore
 from brain.utils.time import format_local, to_local
 
@@ -811,19 +824,34 @@ def _recall_sort_key(m):
     return (-importance, -ts)
 
 
-def _full_inject_ids(mems: list) -> set[str]:
+def _full_inject_ids(mems: list, quota: int = FULL_INJECT_MAX) -> set[str]:
     """Ids of the candidates rendered in full (untruncated body).
 
     A candidate with ``importance >= FULL_INJECT_IMPORTANCE`` is never gated
     behind a read-call. At most ``FULL_INJECT_MAX`` are full-injected
-    (highest-importance first) so the volatile prompt tail stays bounded (C20);
+    (highest-importance first, genuine before monologue-family) so the
+    volatile prompt tail stays bounded (C20);
     any further imp≥9 candidates fall back to snippets.
     """
     if not SNIPPET_MODE_ENABLED:
         return set()
     hi = [m for m in mems if float(getattr(m, "importance", 0) or 0) >= FULL_INJECT_IMPORTANCE]
-    hi.sort(key=lambda m: -float(getattr(m, "importance", 0) or 0))
-    return {m.id for m in hi[:FULL_INJECT_MAX]}
+    # Highest importance first; a monologue-family memory never takes one of
+    # the few full-inject slots from a genuine one (name-recall fix R4, S16).
+    hi.sort(key=lambda m: (is_monologue_family(m), -float(getattr(m, "importance", 0) or 0)))
+    return {m.id for m in hi[:quota]}
+
+
+def _tiered_full_inject_ids(mems: list, tier2_ids: frozenset[str]) -> set[str]:
+    """`_full_inject_ids` with the quota spent on tier-1 hits first (S79): a
+    tier-2 hit (found only through the extra tokens) can use a full-inject slot
+    only if tier 1 leaves one, so the extra tokens never take a render or a full
+    bump from something today's search already surfaced."""
+    first = _full_inject_ids([m for m in mems if m.id not in tier2_ids])
+    room = FULL_INJECT_MAX - len(first)
+    if room <= 0:
+        return first
+    return first | _full_inject_ids([m for m in mems if m.id in tier2_ids], quota=room)
 
 
 def _recall_snippet(mem, *, full: bool) -> str:
@@ -856,99 +884,178 @@ def _snippet_bump_amount(rank: int, group_size: int) -> float:
     return 0.8 - 0.7 * (rank / (group_size - 1))
 
 
-def _render_semantic_active_lines(
+def _keyword_tiers(tokens: list[str], legacy_tokens: list[str]) -> tuple[str, list[str]]:
+    """Split the selector's tokens into the two keyword-search tiers (name-recall
+    fix R4, spec §5, S79).
+
+    Tier 1 is today's search EXACTLY: the old top-`_RECALL_TOKEN_LIMIT` tokens
+    joined into one raw string, which the store tokenizes with its
+    length floor as it always did, so nothing today's search finds
+    can be lost. Tier 2 is everything tier 1 does not reach: the tokens beyond the
+    old top 10, and any old-top-10 token under the floor (a 2-letter name or
+    acronym the store now admits, S36). Tier 2 only fills the slots tier 1
+    leaves. Returns ``(tier-1 query string, tier-2 token list)``.
+    """
+    reached = set(split_by_raw_query_floor(legacy_tokens)[0])
+    return " ".join(legacy_tokens), [t for t in tokens if t not in reached]
+
+
+def _sort_keyword_tier(ranked: list) -> list:
+    """One tier's ``(memory, score-or-None)`` pairs as memories, deduped, best
+    blended score first (scores are only comparable inside one query), falling
+    back to (-importance, -ts) when the ranker is off."""
+    mems: list = []
+    ids: set[str] = set()
+    scores: dict[str, float] = {}
+    for mem, score in ranked:
+        if mem.id not in ids:
+            ids.add(mem.id)
+            mems.append(mem)
+        if score is not None:
+            scores[mem.id] = max(scores.get(mem.id, score), score)
+    if scores:
+        mems.sort(key=lambda m: -scores.get(m.id, float("-inf")))
+    else:
+        mems.sort(key=_recall_sort_key)
+    return mems
+
+
+def _order_keyword_tiers(*tiers: list) -> list:
+    """Concatenate keyword tiers in order, dropping repeats (a memory keeps the
+    first, highest, tier it appeared in). Order of the arguments = the order of
+    the spec's keyword search (S79): the NAME query's hits first (R5), then
+    today's capped selection, then the remaining tokens."""
+    seen: set[str] = set()
+    out: list = []
+    for tier in tiers:
+        for mem in tier:
+            if mem.id not in seen:
+                seen.add(mem.id)
+                out.append(mem)
+    return out
+
+
+def _assemble_active_entries(
+    semantic_result: SemanticRecallResult | None,
+    keyword_hits: list,
+    *,
+    limit: int,
+    tier2_ids: frozenset[str] = frozenset(),
+) -> list[tuple[object, bool]]:
+    """The "active:" section's memories as ONE ordered list of
+    ``(memory, render_full)`` (name-recall fix R4, spec §3/§5, P-10, P-11).
+
+    Semantic result present (spec §4, S97, S98): the six result groups in the
+    order of ``dev_constants.RECALL_RESULT_GROUP_ORDER`` (by default reranked
+    genuine, reranked monologue-family, cosine-path genuine, keyword genuine,
+    non-reranked monologue-family, keyword monologue-family), each paragraph's
+    guaranteed slot kept first, at most the semantic cap
+    (``MAX_STANDOUT_COUNT`` = 9; ``semantic_recall.merge_with_keyword``). The
+    semantic results keep their own order inside each group (there is no
+    presentation re-sort, P-11); a memory found by both paths appears once, as
+    a semantic result (I4). No slot is reserved for any keyword hit.
+    Full vs snippet is by POSITION across the merged list (the first
+    ``FULL_INJECT_STANDOUT_MAX`` = 5 full; a semantic result only when its own
+    tier was full), except that a keyword hit with
+    importance >= ``FULL_INJECT_IMPORTANCE`` renders full (at most
+    ``FULL_INJECT_MAX`` of them, S80: only hits shown full because of that rule
+    count toward the 3), even when that makes more than 5 full.
+
+    No semantic result (P-12): keyword-only turn under today's lexical caps
+    (``limit``) and full-inject rule, unchanged.
+
+    ``keyword_hits`` is already in final keyword order (tier 1, then tier 2, each
+    by blended score; genuine before monologue-family). ``tier2_ids`` names the
+    hits found only through the extra tokens: they use the importance quota
+    only after tier 1 (S79). ``full`` + ``snippet`` are the one source of
+    truth for WHICH semantic memories and their order; ``hits`` only says
+    which scale surfaced each (its group).
+    """
+    if semantic_result is None:
+        top = keyword_hits[:limit]
+        full_ids = _tiered_full_inject_ids(top, tier2_ids)
+        return [(m, m.id in full_ids) for m in top]
+
+    # Spec §4, S97/S98: the six result groups in `dev_constants.
+    # RECALL_RESULT_GROUP_ORDER` (a non-reranked monologue memory never takes a
+    # slot ahead of a keyword genuine hit), each paragraph's guaranteed slot
+    # kept first, at most the semantic cap.
+    semantic_ids = {m.id for m in (*semantic_result.full, *semantic_result.snippet)}
+    semantic_full_ids = {m.id for m in semantic_result.full}
+    merged = merge_with_keyword(
+        semantic_result.grouped(),
+        keyword_hits,
+        cap=MAX_STANDOUT_COUNT,
+        guaranteed=semantic_result.guaranteed_ids,
+    )
+    # S80: the "up to 3" counts only hits shown full BECAUSE of the importance
+    # rule; a hit already full by position does not use one of the 3.
+    beyond = [
+        m
+        for position, m in enumerate(merged)
+        if m.id not in semantic_ids and position >= FULL_INJECT_STANDOUT_MAX
+    ]
+    promoted = _tiered_full_inject_ids(beyond, tier2_ids)
+    # Full by POSITION (the first five), and a semantic result only if its own
+    # tier was full (a non-reranked monologue memory moved below the keyword
+    # genuine hits past position five renders as a snippet).
+    return [
+        (
+            mem,
+            (mem.id in semantic_full_ids and position < FULL_INJECT_STANDOUT_MAX)
+            if mem.id in semantic_ids
+            else (position < FULL_INJECT_STANDOUT_MAX or mem.id in promoted),
+        )
+        for position, mem in enumerate(merged)
+    ]
+
+
+def _render_active_lines(entries: list[tuple[object, bool]]) -> list[str]:
+    """Render the "  active:" section's lines from assembled entries.
+
+    Stage-3 Defect-3 fix (Roy's Option-1 ruling): this renders ONLY the
+    "  active:" section's lines (no "recall" header, no snippet invitation:
+    `_build_recall_block` owns those once) and the caller always combines them
+    with the fading/lost/not-recognised sections, which run on EVERY turn.
+
+    Presentation reuses the EXACT bullet format the lexical path's "active:"
+    section always used (`- <id>: "<snippet>"`), in the entries' own order
+    (name-recall fix R4, P-11: the semantic snippet tier is no longer re-sorted
+    by importance/recency, so a monologue-family memory can never render above
+    a genuine one).
+    """
+    lines = ["  active:"]
+    for mem, full in entries:
+        snippet = _recall_snippet(mem, full=full)
+        lines.append(f'    - {mem.id}: "{_peer_attributed(mem, snippet)}"')
+    return lines
+
+
+def _bump_active_entries(
     store: MemoryStore,
-    result: SemanticRecallResult,
+    entries: list[tuple[object, bool]],
     *,
     persona_dir: Path,
     seen: set[str],
-    pending_ids: list[str] | None = None,
-) -> list[str]:
-    """Render the "  active:" section lines for a CONCLUSIVE semantic recall
-    result and apply its recall-counter ticks (spec decision 5's "Counter"
-    bullet).
+    pending_ids: list[str],
+    snippet_ids: list[str],
+) -> None:
+    """Apply the recall-counter ticks for the rendered "active:" entries.
 
-    Stage-3 Defect-3 fix (Roy's Option-1 ruling): this used to build and
-    return the ENTIRE recall block (header + active section) and
-    `_build_recall_block` returned it directly, short-circuiting the
-    fading/lost partition, the "not recognised" signal, and the grief-touch
-    breadcrumb below it. Those three pieces must run on EVERY recall turn
-    regardless of semantic conclusiveness — semantic conclusiveness only
-    decides which ACTIVE memories are selected/surfaced. So this function
-    now renders ONLY the "  active:" section's lines (no "recall" header, no
-    snippet invitation — `_build_recall_block` owns those once, for
-    whichever branch fires) and the caller always combines them with the
-    fading/lost/not-recognised sections, which now always run alongside it.
-
-    Presentation reuses the EXACT bullet format the lexical path's
-    "active:" section already uses (`- <id>: "<snippet>"`) so the model
-    sees one consistent recall shape regardless of which retrieval
-    mechanism produced it — nothing downstream needs to special-case
-    semantic vs lexical recall.
-
-    Full tier renders in reranker-SELECTION order (mirrors how the lexical
-    path's importance-based `full_ids` render in their own unsorted
-    selection order). Snippet-tier PRESENTATION is re-ordered by
-    `_recall_sort_key` per the spec's explicit requirement ("the reranker
-    selects the candidates; the normal sort orders the presentation of
-    what's surfaced, not reranker order") — the reranker only decided
-    membership in this tier, not read order.
-
-    Counter ticks (#231 consolidation — the render-loop rule): the bump
-    follows the ACTUAL render. `result.full` rows render full, so each goes
-    through the one `open_memory` door (+1.0, deliberate=False, per-id enqueue
-    when persona_dir is set) — "if it gets opened, it gets the full bump,
-    doesn't matter how it got opened". `snippet_ordered` rows render full ONLY
-    when `SNIPPET_MODE_ENABLED` is off (then `_recall_snippet` returns the
-    untruncated body), in which case they too go through the door; otherwise
-    they are genuine snippets and take the shared rank-weighted fractional bump
-    (`_snippet_bump_amount`: 0.8 top -> 0.1 bottom, linear; a lone snippet ->
-    0.8) plus one batched `enqueue_reappraisals` for the snippet ids.
-
-    `seen` (threaded from the caller) is the ONE per-turn dedup set spanning
-    every tier, so this function no longer keeps its own internal full/snippet
-    dedup. With the flag ON, production behaviour is byte-identical to before
-    the consolidation (full -> +1.0, snippet -> fractional-by-rank, every
-    surfaced id enqueued once); the only delta is on the flag-OFF path, which
-    is now correct by construction (a full-rendered "snippet" is bumped and
-    enqueued through the door instead of being silently skipped).
-
-    `pending_ids` (restored batching, #231 follow-up): threaded straight
-    through to `open_memory` for this tier's full-open ids, so the caller
-    (`_build_recall_block`) collects every full-open id from every tier and
-    flushes them with ONE batched `enqueue_reappraisals` call after the whole
-    passive pass finishes, instead of one enqueue per id.
+    Render-loop rule (#231 consolidation): the bump follows the ACTUAL render.
+    A row rendered FULL goes through the one `open_memory` door (+1.0,
+    deliberate=False, per-id enqueue via ``pending_ids`` when persona_dir is
+    set). A row rendered as a snippet takes the shared rank-weighted
+    fractional bump (`_snippet_bump_amount`: 0.8 top -> 0.1 bottom over the
+    snippet rows in rendered order; a lone snippet -> 0.8) and its id joins
+    ``snippet_ids`` for the caller's one batched enqueue. When
+    `SNIPPET_MODE_ENABLED` is off every row renders full, so every row goes
+    through the door. ``seen`` is the ONE per-turn dedup set across every tier,
+    so a memory is bumped/enqueued once per turn (a memory found by both the
+    semantic and keyword paths is one entry, at its semantic tier: one bump).
     """
-    snippet_ordered = sorted(result.snippet, key=_recall_sort_key)
-
-    lines = ["  active:"]
-    for mem in result.full:
-        snippet = _recall_snippet(mem, full=True)
-        lines.append(f'    - {mem.id}: "{_peer_attributed(mem, snippet)}"')
-    for mem in snippet_ordered:
-        snippet = _recall_snippet(mem, full=False)
-        lines.append(f'    - {mem.id}: "{_peer_attributed(mem, snippet)}"')
-
-    # Render-loop rule (#231 consolidation): the bump follows the ACTUAL render,
-    # not a per-tier flag check. ``result.full`` rows render full (full=True) ->
-    # the +1.0 open through the one door. ``snippet_ordered`` rows render full
-    # ONLY when SNIPPET_MODE_ENABLED is off (then ``_recall_snippet`` returns the
-    # untruncated body) -> the door too; otherwise they are genuine snippets and
-    # take the rank-weighted fractional bump + a batched enqueue, exactly as
-    # before. ``seen`` (threaded from the caller) dedups across every tier this
-    # turn — subsuming this tier's old internal full/snippet dedup.
-    for mem in result.full:
-        open_memory(
-            mem,
-            store=store,
-            persona_dir=persona_dir,
-            deliberate=False,
-            seen=seen,
-            pending_ids=pending_ids,
-        )
-
-    if not SNIPPET_MODE_ENABLED:
-        for mem in snippet_ordered:
+    for mem, full in entries:
+        if full or not SNIPPET_MODE_ENABLED:
             open_memory(
                 mem,
                 store=store,
@@ -957,21 +1064,16 @@ def _render_semantic_active_lines(
                 seen=seen,
                 pending_ids=pending_ids,
             )
-    else:
-        n_snip = len(snippet_ordered)
-        snippet_ids: list[str] = []
-        for i, mem in enumerate(snippet_ordered):
-            if mem.id in seen:
-                continue
-            seen.add(mem.id)
-            store.bump_recall(mem.id, _snippet_bump_amount(i, n_snip))
-            snippet_ids.append(mem.id)
-        if snippet_ids:
-            from brain.memory.pending import PendingQueue
-
-            PendingQueue(persona_dir).enqueue_reappraisals(snippet_ids, source="recall")
-
-    return lines
+    if not SNIPPET_MODE_ENABLED:
+        return
+    snippet_mems = [mem for mem, full in entries if not full]
+    n_snip = len(snippet_mems)
+    for i, mem in enumerate(snippet_mems):
+        if mem.id in seen:
+            continue
+        seen.add(mem.id)
+        store.bump_recall(mem.id, _snippet_bump_amount(i, n_snip))
+        snippet_ids.append(mem.id)
 
 
 def _build_recall_block(
@@ -990,25 +1092,50 @@ def _build_recall_block(
     with a high-importance full-inject bypass, and stop bumping recall_count on
     mere surfacing.
 
+    Name protection (name-recall fix R5, spec §5, S27): the persona's known
+    names found in ``user_input`` (raw words, before the stopword and length
+    rules) run ONE extra keyword query, sent as FTS phrases through the same
+    ranker on the same hebbian handle; its active and fading hits lead the
+    keyword hits (S79, S89: name hits the general search also found, then
+    name-only hits, then the general hits). The same names also feed the graveyard
+    search (S102, S119: whole-word matching, hits first). A listed name is never shown as "not recognised" (S90). A message that is
+    only a known name still recalls.
+
     Strategy: extract salient content tokens from ``user_input`` (drop
-    stopwords/short fragments; select by corpus IDF + proper-noun bonus —
-    Tier-1 recall-query fix), issue ONE combined OR query via a single
-    search_with_loss call (sharing a single per-turn HebbianMatrix handle),
-    render four sections:
-      - active memories (snippet, or full body when importance ≥ FULL_INJECT_IMPORTANCE)
+    stopwords/short fragments; ranked by corpus IDF + proper-noun bonus —
+    Tier-1 recall-query fix; name-recall fix R4: EVERY surviving token is
+    searched, the old 10-token cap is gone), search in two tiers (S79: today's
+    capped query through one search_with_loss call, then the tokens it does not
+    reach, filling only leftover slots; both share a single per-turn
+    HebbianMatrix handle), render four sections:
+      - active memories: the semantic results first, then the keyword hits in
+        the slots the semantic results leave under the cap of 9 (the first 5
+        positions full, later ones snippets, except a keyword hit with
+        importance ≥ FULL_INJECT_IMPORTANCE renders full); with no semantic
+        result, the keyword hits alone under the lexical caps
       - softened memories (fading; original detail gone)
       - lost memories (no longer in active memory; from graveyard)
       - not recognised (searched; no memory found)
+
+    The graveyard search and the "not recognised" list are fed the OLD capped
+    token selection (the first ``_RECALL_TOKEN_LIMIT`` of the ranked tokens),
+    not the uncapped set: the cap removal applies to searching the active and
+    fading memories only (S71). The graveyard search additionally gets the
+    listed names in the message (any length, phrases, hits first, S102, S119),
+    matches whole words of 4+ characters only, drops recall stopwords and
+    contraction fragments (S123, S128), and a grief touch fires only for a
+    forgotten memory shown in the "lost" section (S102).
 
     Falls back to ranked retrieval with no graveyard/hebbian when persona_dir
     is None (e.g. called directly in tests without a dir).
 
     Stage-3 Defect-3 fix (Roy's Option-1 ruling): semantic-PRIMARY recall
-    (below, when persona_dir is not None) decides ONLY the "active:"
-    section's SOURCE — a CONCLUSIVE result surfaces via
-    `_render_semantic_active_lines` (option-4 tiers), an
-    INCONCLUSIVE/None result falls through to the lexical active selection,
-    exactly as before this fix. The fading/lost partition, the "not
+    (below, when persona_dir is not None) decides the "active:" section's
+    LEADING memories — a CONCLUSIVE result's memories come first
+    (`_assemble_active_entries`, option-4 tiers), an INCONCLUSIVE/None result
+    leaves the keyword selection alone. (Name-recall fix R4: the keyword hits
+    are now always merged in below the semantic ones instead of being
+    suppressed by a conclusive result.) The fading/lost partition, the "not
     recognised" signal, and the grief-touch breadcrumb (`handle_recall_touch`
     on graveyard hits) are NOT part of that fork — they run on EVERY recall
     turn regardless of semantic conclusiveness, so a semantically-conclusive
@@ -1019,42 +1146,60 @@ def _build_recall_block(
     Empty input or no matches in any bucket → returns the empty string
     and the block is omitted from the prompt.
     """
+    # The per-message recall clock (S132): "what is left of the budget" for the
+    # extra words (tier 2) is the budget minus the wall time spent from here.
+    started = keyword_budget.now()
     tokens = _extract_recall_tokens(user_input, store)
-    if not tokens:
+    # Name protection (name-recall fix R5, spec §5, S27, S36, S47): the known
+    # names in her words, matched on the RAW words before the stopword and
+    # length rules. A message that is only a known name ("Will", "Al") still
+    # has something to search, so it is not empty. No persona_dir means no
+    # known-names file to read: no protection on that (test-only) path.
+    names = names_in(persona_dir, user_input)
+    if not tokens and not names:
         return ""
+    # The old top-`_RECALL_TOKEN_LIMIT` selection (P-31): still what the
+    # graveyard search and the "not recognised" list are fed (S71; the graveyard also gets the listed names, S102).
+    legacy_tokens = _legacy_capped_tokens(tokens)
 
     if persona_dir is None:
         # Legacy path — no persona_dir → cannot locate hebbian.db or the
-        # graveyard. Ranked retrieval over ONE combined OR query (Tier-1: was
-        # a per-token loop; hebbian=None → w_heb=0), same snippet render as
+        # graveyard. Ranked retrieval over the two keyword tiers (S79; was a
+        # per-token loop; hebbian=None → w_heb=0), same snippet render as
         # the main path, no surfacing bump.
         from brain.memory.relevance import rank_memories
 
-        seen: set = set()
-        candidates: list = []
-        merged: dict[str, float] = {}
+        # Two tiers (S79): today's capped query, then the remaining tokens.
+        capped_query, remainder = _keyword_tiers(tokens, legacy_tokens)
+        tier1 = None
         try:
-            ranked = rank_memories(store, None, " ".join(tokens), limit=limit)
+            ranked, tier1 = keyword_budget.timed_tier1(
+                store,
+                legacy_tokens,
+                lambda: rank_memories(store, None, capped_query, limit=limit, genuine_first=True),
+            )
         except Exception:  # noqa: BLE001
             ranked = []
-        for mem, score in ranked:
-            if mem.id not in seen:
-                seen.add(mem.id)
-                candidates.append(mem)
-                if score is not None:
-                    merged[mem.id] = score
-            elif score is not None:
-                merged[mem.id] = max(merged.get(mem.id, score), score)
+        try:
+            ranked2 = keyword_budget.search_extra_words(
+                store,
+                remainder,
+                started,
+                lambda words: rank_memories(store, None, words, limit=limit, genuine_first=True),
+                tier1,
+            )
+        except Exception:  # noqa: BLE001
+            log.debug("_build_recall_block: tier-2 keyword step failed", exc_info=True)
+            ranked2 = []
+        candidates = _order_keyword_tiers([], _sort_keyword_tier(ranked), _sort_keyword_tier(ranked2))
 
         if not candidates:
             return ""
 
-        if merged:
-            candidates.sort(key=lambda m: -merged.get(m.id, float("-inf")))
-        else:
-            candidates.sort(key=_recall_sort_key)
-        top = candidates[:limit]
-        full_ids = _full_inject_ids(top)
+        top = genuine_first_memories(candidates)[:limit]
+        full_ids = _tiered_full_inject_ids(
+            top, frozenset(m.id for m in _sort_keyword_tier(ranked2)) - {m.id for m in _sort_keyword_tier(ranked)}
+        )
 
         lines = ["── recall (memories matching this turn) ──"]
         if SNIPPET_MODE_ENABLED:
@@ -1082,20 +1227,21 @@ def _build_recall_block(
         return "\n".join(lines)
 
     # Semantic-PRIMARY attempt (Stage 3, local semantic-retrieval build,
-    # decisions 3-5: semantic cosine is PRIMARY, the lexical/blend path
-    # below is the FALLBACK/backstop for the ACTIVE selection only).
+    # decisions 3-5: semantic cosine is PRIMARY; the keyword/blend search
+    # below now ALWAYS runs and fills the slots semantic leaves, name-recall
+    # fix R4, spec §5, S8).
     #
     # Stage-3 Defect-3 fix (Roy's Option-1 ruling): semantic conclusiveness
     # used to return here immediately, skipping the fading/lost partition,
     # the "not recognised" signal, and the grief-touch breadcrumb below —
     # ALL THREE ALWAYS RUN NOW, regardless of this result. A CONCLUSIVE
-    # result (clear standouts) only decides the "active:" section's SOURCE
-    # (rendered further down, forked on `semantic_result`); it no longer
-    # short-circuits this function. An INCONCLUSIVE result (None: bunched
-    # clump, empty/sparse candidate pool — graceful warm-up — or any
-    # embedding-infra failure) means the "active:" section instead comes
-    # from the lexical/importance/hebbian/recency blend below, exactly as
-    # it behaved before Stage 3.
+    # result (clear standouts) supplies the LEADING memories of the "active:"
+    # section (merged with the keyword hits by `_assemble_active_entries`); it
+    # no longer short-circuits this function. An INCONCLUSIVE result (None:
+    # empty/sparse candidate pool — graceful warm-up — nothing clearing a
+    # floor, or any embedding-infra failure) means the "active:" section is
+    # the keyword/importance/hebbian/recency blend alone, exactly as it
+    # behaved before Stage 3.
     try:
         # #231 RERANKER RE-ARCHITECTURE: the old Stage-4 plug-in seam
         # (per-persona cosine floor/gap, loaded here via
@@ -1104,7 +1250,14 @@ def _build_recall_block(
         # live per call (brain/memory/semantic_recall.py; F2a inc8, #250
         # §7/§8 cut it over from a fixed module constant to a per-persona
         # DB-calibrated value), no per-persona calibration FILE to load.
-        semantic_result = run_semantic_recall(store, persona_dir, user_input)
+        # Name-recall fix R6 (spec §3, S34, S53): a paragraph none of whose
+        # words is a keyword token or a word of a known name found in this
+        # message is dropped from the per-paragraph search (tested after name
+        # protection, so a paragraph holding only a known name is kept).
+        keyword_words = frozenset(tokens) | {word for name in names for word in name.split()}
+        semantic_result = run_semantic_recall(
+            store, persona_dir, user_input, keyword_words=keyword_words
+        )
     except Exception:  # noqa: BLE001
         # Defense-in-depth: run_semantic_recall already wraps its own body in
         # a broad except (its docstring's fail-soft contract: ANY failure ->
@@ -1116,47 +1269,119 @@ def _build_recall_block(
         log.exception("_build_recall_block: run_semantic_recall raised — falling back to lexical")
         semantic_result = None
 
-    # Forgetting-aware partition — ALWAYS RUNS NOW (Stage-3 Defect-3 fix):
-    # partitions into active / fading / lost. `active_hits`/`full_ids`
-    # computed below are only actually SURFACED in the "active:" section
-    # when `semantic_result` is None (inconclusive) — see the
-    # active-selection fork further down — but fading/lost/"not
-    # recognised"/grief-touch always use what's computed here.
+    # Forgetting-aware partition — ALWAYS RUNS (Stage-3 Defect-3 fix):
+    # partitions into active / fading / lost. `active_hits` are the KEYWORD
+    # hits of the "active:" section, merged in below the semantic results
+    # (`_assemble_active_entries`); fading/lost/"not recognised"/grief-touch
+    # always use what's computed here.
     from brain.forgetting.recall import search_with_loss
     from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.relevance import rank_memories
+
+    capped_query, remainder = _keyword_tiers(tokens, legacy_tokens)
+    # The contraction stems of the raw message (S126): the graveyard's word feed
+    # drops them (the capped token string no longer holds the apostrophes).
+    from brain.memory.name_rules import contraction_stems
+
+    _lost_fragments = contraction_stems(user_input)
 
     seen_active: set = set()
     seen_fading: set = set()
-    # seen_lost accumulates graveyard hit IDs for two purposes:
-    #   1. Dedup within the (now single) search result (render path below).
-    #   2. Passed to handle_recall_touch as the grief accumulator (see the
-    #      fault-isolated block after this loop). Both paths read the same
-    #      set — no separate copy needed.
+    # seen_lost dedups the (single) graveyard search result by memory id. The
+    # grief touch is fed only the entries actually shown (lost_top, below).
     seen_lost: set = set()
     active_hits: list = []
     fading_hits: list = []
     lost_hits: list = []
+    # The name query's hits (R5), ranked ahead of every general keyword hit.
+    name_active: list = []
+    name_fading: list = []
     # id → best blended score (None-sentinel: an unranked id is simply
     # absent, so the merge falls back to (-importance, -ts) for it).
     merged_score: dict[str, float] = {}
     merged_fading: dict[str, float] = {}
 
     # THE one hebbian open site in all of P2 (spec §2): open exactly one
-    # HebbianMatrix for the turn's single combined search_with_loss call,
-    # close it once. integrity_check=False → no per-turn full-DB scan.
+    # HebbianMatrix for the turn's search_with_loss call (and the tier-2 ranker
+    # call that shares it), close it once. integrity_check=False → no per-turn full-DB scan.
     # Fail-soft: any open error → heb=None (w_heb=0) and the search still runs.
     heb = None
+    tier1 = None
     try:
         try:
             heb = HebbianMatrix(persona_dir / "hebbian.db", integrity_check=False)
         except Exception:  # noqa: BLE001 — hebbian is a tie-breaker; degrade to None
             heb = None
         try:
-            result = search_with_loss(
-                persona_dir, store, " ".join(tokens), limit=limit * 2, hebbian=heb
+            # Tier 1 (spec §5, S79): TODAY's search, the old capped selection
+            # joined into one raw-string query, so nothing it finds is lost. The
+            # graveyard gets the same words minus the message's contraction
+            # fragments (S123) plus the listed names (S102). A message that is
+            # only a known name has no selector token, so the query is empty but
+            # the call still runs for the names (the graveyard never sees an
+            # empty word string with no names: that matches nothing).
+            result, tier1 = keyword_budget.timed_tier1(
+                store,
+                legacy_tokens,
+                lambda: search_with_loss(
+                    persona_dir,
+                    store,
+                    capped_query,
+                    limit=limit * 2,
+                    hebbian=heb,
+                    # Today's 10 words minus the contraction fragments of the raw
+                    # message (its apostrophes are gone from the capped string,
+                    # S123/S126), plus the listed names (S102, S119).
+                    lost_query=" ".join(
+                        t for t in legacy_tokens if t.lower() not in _lost_fragments
+                    ),
+                    lost_names=names,
+                    # The monologue family ranks after every genuine memory in
+                    # the ranker's pool and window (spec §4, S16, Acceptance 8).
+                    genuine_first=True,
+                )
+                if capped_query or names
+                else None,
             )
         except Exception:  # noqa: BLE001
             result = None
+        # Name query (R5, spec §5, S27, S35): ONE extra keyword query for the
+        # message's name words, phrases through the same ranker, active and
+        # fading buckets, sharing this turn's hebbian handle. Its hits rank
+        # ahead of the general keyword hits (merged below). The same names reach
+        # the graveyard through the tier-1 call above (lost_names, S102), not
+        # through this query.
+        if names:
+            try:
+                ranked_names = rank_name_hits(store, heb, names, limit=limit * 2, started=started)
+            except Exception:  # noqa: BLE001
+                ranked_names = []
+            name_active = _sort_keyword_tier([p for p in ranked_names if p[0].state == "active"])
+            name_fading = _sort_keyword_tier([p for p in ranked_names if p[0].state == "fading"])
+        # Tier 2 (S79, S103): the tokens tier 1 does not reach, filling only the
+        # slots tier 1 leaves (they rank after every tier-1 hit). No graveyard.
+        # Runs AFTER tier 1 and the name query so their time counts: it searches
+        # as many of the extra words (the selector's salience order) as fit what
+        # is left of the per-message recall budget, and drops the rest for this
+        # turn (keyword_budget, S131-S134).
+        tier2_active: list = []
+        tier2_fading: list = []
+        if remainder:
+            try:
+                ranked2 = keyword_budget.search_extra_words(
+                    store,
+                    remainder,
+                    started,
+                    lambda words: rank_memories(
+                        store, heb, words, limit=limit * 2, include_fading=True, genuine_first=True
+                    ),
+                    tier1,
+                )
+            except Exception:  # noqa: BLE001
+                log.debug("_build_recall_block: tier-2 keyword step failed", exc_info=True)
+                ranked2 = []
+            tier2_active = _sort_keyword_tier([p for p in ranked2 if p[0].state == "active"])
+            tier2_fading = _sort_keyword_tier([p for p in ranked2 if p[0].state == "fading"])
         if result is not None:
             for mem in result.active:
                 s = result.scores.get(mem.id)
@@ -1195,8 +1420,19 @@ def _build_recall_block(
     # cannot survive a single combined query). Matches the render string's
     # literal claim ("no memory found"). Fail-soft: term_stats() itself
     # returns {} on an empty store or any sqlite error.
-    stats = store.term_stats(tokens)
-    unfamiliar: list[str] = [t for t in tokens if stats.get(t.lower(), (0, 0.0))[0] == 0]
+    # S71 (REVIEW-PENDING): the list keeps today's size and filter: it is
+    # chosen from the tokens the old 10-token selector picked; the tokens
+    # beyond that are searched but never listed.
+    # S90 (R5 follow-up): a word on the known-names list is never "not
+    # recognised", whatever the store holds: a listed name is known by
+    # definition. The words of a matched multi-word name count as listed.
+    stats = store.term_stats(legacy_tokens)
+    listed_words = {w for n in names for w in n.split(" ")}
+    unfamiliar: list[str] = [
+        t
+        for t in legacy_tokens
+        if t not in listed_words and stats.get(t.lower(), (0, 0.0))[0] == 0
+    ]
 
     # B → A fallback: when noise risk is high, keep only proper-noun-shaped tokens.
     # Tokens are already lowercased, so capitalisation is re-read from the raw
@@ -1209,51 +1445,9 @@ def _build_recall_block(
         }
         unfamiliar = [t for t in unfamiliar if t.lower() in capitalised]
 
-    # Stage-3 Defect-3 fix: a CONCLUSIVE semantic result always carries at
-    # least one surfaced candidate (`run_semantic_recall` returns `None` for
-    # every inconclusive/empty case — see its docstring), so this must not
-    # return "" out from under a semantic-conclusive turn just because the
-    # (unused-for-render) lexical active_hits happens to be empty.
-    has_semantic_active = semantic_result is not None and bool(
-        semantic_result.full or semantic_result.snippet
-    )
-    if (
-        not has_semantic_active
-        and not active_hits
-        and not fading_hits
-        and not lost_hits
-        and not unfamiliar
-    ):
-        return ""
-
-    # Fire recall-touch grief breadcrumbs for any graveyard hits — ALWAYS
-    # (Stage-3 Defect-3 fix), regardless of the active-selection fork below.
-    # This is the ONLY call site of handle_recall_touch in this function, so
-    # it fires exactly once per turn: once iff there's a graveyard hit,
-    # never otherwise — on both the semantic-conclusive and inconclusive
-    # branches alike.
-    # handle_recall_touch is internally fault-isolated; this outer try
-    # guards only against import-time failures on brain.grief / brain.felt_time.
-    if seen_lost:
-        try:
-            from brain.felt_time.state import load_or_recover as _load_felt
-            from brain.forgetting import graveyard as _grave
-            from brain.grief import handle_recall_touch
-
-            felt_state, _ = _load_felt(persona_dir)
-            grave_entries = _grave.read_all(persona_dir)
-            handle_recall_touch(
-                touched_ids=sorted(seen_lost),
-                graveyard_entries=grave_entries,
-                persona_dir=persona_dir,
-                store=store,
-                lived_age_hours_now=felt_state.lived_age_hours,
-            )
-        except Exception:  # noqa: BLE001
-            log.exception("grief.handle_recall_touch failed inside _build_recall_block")
-
     # Cross-token merge: sort by the BLENDED score when ranking is on (the
-    # scores map is populated), else fall back to (-importance, -ts).
+    # scores map is populated), else fall back to (-importance, -ts). Then the
+    # monologue family goes after every genuine keyword hit (spec §4, S16/S42).
     if merged_score:
         active_hits.sort(key=lambda m: -merged_score.get(m.id, float("-inf")))
     else:
@@ -1262,21 +1456,77 @@ def _build_recall_block(
         fading_hits.sort(key=lambda m: -merged_fading.get(m.id, float("-inf")))
     else:
         fading_hits.sort(key=_recall_sort_key)
+    # Keyword tiers (S79): name-query hits first (R5), then tier 1 (today's
+    # capped search), then tier 2; the family after every genuine hit. A hit the
+    # name query or tier 1 also found is not a tier-2 extra.
+    tier2_only = (
+        frozenset(m.id for m in tier2_active)
+        - {m.id for m in active_hits}
+        - {m.id for m in name_active}
+    )
+    # S89: name hits the general search (tier 1 then tier 2) also found lead,
+    # then name-only hits, then the general hits; the family after every genuine.
+    active_hits = genuine_first_memories(
+        lead_with_names(
+            name_active,
+            _order_keyword_tiers(active_hits, [m for m in tier2_active if m.id not in seen_fading]),
+            names,
+        )
+    )
+    # The fading hits follow the same order (S16): the family after every genuine hit.
+    fading_hits = genuine_first_memories(
+        lead_with_names(
+            name_fading,
+            _order_keyword_tiers(fading_hits, [m for m in tier2_fading if m.id not in seen_active]),
+            names,
+        )
+    )
 
-    active_top = active_hits[:limit]
+    # The "active:" section: semantic results first, keyword hits in the slots
+    # they leave, tiers by position (P-10). A CONCLUSIVE semantic result always
+    # carries at least one surfaced candidate (`run_semantic_recall` returns
+    # `None` for every inconclusive/empty case), so it alone keeps the block.
+    active_entries = _assemble_active_entries(
+        semantic_result, active_hits, limit=limit, tier2_ids=tier2_only
+    )
+    if not active_entries and not fading_hits and not lost_hits and not unfamiliar:
+        return ""
+
     fading_top = fading_hits[:limit]
     lost_top = lost_hits[:limit]
-    full_ids = _full_inject_ids(active_top)
+
+    # Fire recall-touch grief breadcrumbs ONLY for the forgotten memories shown in
+    # the "lost" section below (S102): a memory that merely matched but was cut by
+    # the render limit writes no grief. Still ONE call per turn, ALWAYS (Stage-3
+    # Defect-3 fix), regardless of the active-selection fork: once iff a lost
+    # memory is shown, never otherwise. handle_recall_touch is internally
+    # fault-isolated; this outer try guards only against import-time failures on
+    # brain.grief / brain.felt_time.
+    shown_lost_ids = sorted({e["memory_id"] for e in lost_top if e.get("memory_id")})
+    if shown_lost_ids:
+        try:
+            from brain.felt_time.state import load_or_recover as _load_felt
+            from brain.grief import handle_recall_touch
+
+            felt_state, _ = _load_felt(persona_dir)
+            handle_recall_touch(
+                touched_ids=shown_lost_ids,
+                graveyard_entries=lost_top,
+                persona_dir=persona_dir,
+                store=store,
+                lived_age_hours_now=felt_state.lived_age_hours,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("grief.handle_recall_touch failed inside _build_recall_block")
 
     # ONE per-turn dedup set threaded through EVERY passive tier (#231
-    # consolidation, reconciliation D): the semantic tier, the fading tier, and
-    # the lexical active tier all consult/extend it, so a memory opened once is
-    # bumped/enqueued once across the whole turn. Created before the
-    # active-selection fork so the semantic branch shares it.
+    # consolidation, reconciliation D): the active tier (semantic + keyword,
+    # merged) and the fading tier both consult/extend it, so a memory opened
+    # once is bumped/enqueued once across the whole turn.
     seen: set[str] = set()
 
     # Collector for every full-open id surfaced this turn, across every tier
-    # (semantic full-inject, fading-rendered-full, lexical-active full_ids).
+    # (active full renders, fading-rendered-full).
     # `open_memory` appends to this instead of enqueuing immediately; flushed
     # with ONE batched `enqueue_reappraisals` call near the end of this
     # function, restoring the pre-consolidation (4c916b24) batched write
@@ -1291,29 +1541,22 @@ def _build_recall_block(
     # reopened a drop-on-exception window that this closes. The finally only
     # guarantees the flush: it never swallows or alters a propagating exception.
     try:
-        # ACTIVE-selection fork (Stage-3 Defect-3 fix) — the ONLY thing semantic
-        # conclusiveness decides. Conclusive → option-4 semantic surfacing
-        # (`_render_semantic_active_lines`: its own bump/enqueue, Defect-4
-        # gated). Inconclusive → today's lexical active selection, rendered and
-        # bumped exactly as before this fix (the CHANGE-1 block further down,
-        # now explicitly scoped to `semantic_result is None`).
+        # The "active:" section: ONE ordered list of (memory, render_full),
+        # semantic first then keyword (`_assemble_active_entries`), rendered in
+        # that order with no re-sort (P-11). Its counter ticks (Defect-4 gated)
+        # follow the actual render: with a semantic result they run here, ahead
+        # of the fading tier; with none, after it (the keyword-only order).
+        has_active = bool(active_entries)
+        active_lines = _render_active_lines(active_entries) if has_active else []
         if semantic_result is not None:
-            active_lines = _render_semantic_active_lines(
+            _bump_active_entries(
                 store,
-                semantic_result,
+                active_entries,
                 persona_dir=persona_dir,
                 seen=seen,
                 pending_ids=full_open_ids,
+                snippet_ids=snippet_enqueue_ids,
             )
-            has_active = has_semantic_active
-        else:
-            has_active = bool(active_top)
-            active_lines = []
-            if active_top:
-                active_lines.append("  active:")
-                for mem in active_top:
-                    snippet = _recall_snippet(mem, full=mem.id in full_ids)
-                    active_lines.append(f'    - {mem.id}: "{_peer_attributed(mem, snippet)}"')
 
         lines = ["recall"]
         if SNIPPET_MODE_ENABLED and has_active:
@@ -1347,8 +1590,8 @@ def _build_recall_block(
         # rendered in FULL goes through the one door (`open_memory`: +1.0,
         # deliberate=False, per-id enqueue when persona_dir is set), a genuine
         # snippet takes the rank-weighted fractional bump and is folded into one
-        # batched enqueue. `seen` (created before the active-selection fork and
-        # already threaded through the semantic tier) dedups every id across every
+        # batched enqueue. `seen` (created before the active tier is rendered and
+        # threaded through it and the fading tier) dedups every id across every
         # tier this turn, so a memory opened once is bumped/enqueued once.
         #
         # Behaviour preservation (SNIPPET_MODE_ENABLED True, production): full-open
@@ -1382,49 +1625,30 @@ def _build_recall_block(
                     pending_ids=full_open_ids,
                 )
 
-        # LEXICAL active tier is surfaced under "active:" ONLY on the inconclusive
-        # branch (on a conclusive turn active_top is computed for the always-run
-        # fading/lost machinery but never rendered, so it must not be bumped — the
-        # semantic branch issues its own opens inside `_render_semantic_active_lines`).
+        # Keyword-only turn: the "active:" rows (keyword hits under the lexical
+        # caps) are bumped here, after the fading tier, as they always were.
+        # Full rows -> the one door, genuine snippets -> the rank-weighted
+        # fractional bump (`_bump_active_entries`).
         if semantic_result is None:
-            # Full-open rows (importance `full_ids`, or every active row when
-            # snippet mode is off) -> the one door. Runs BEFORE the fractional loop
-            # so those ids are already in `seen`.
-            for mem in active_top:
-                if mem.id in full_ids or not SNIPPET_MODE_ENABLED:
-                    open_memory(
-                        mem,
-                        store=store,
-                        persona_dir=persona_dir,
-                        deliberate=False,
-                        seen=seen,
-                        pending_ids=full_open_ids,
-                    )
-            # Genuine snippet rows -> rank-weighted fractional bump. Rank is over the
-            # snippet-only subset in active_top order (the ids not opened above),
-            # exactly as the pre-consolidation `bump_targets` loop computed it.
-            if SNIPPET_MODE_ENABLED:
-                bump_targets = [
-                    mem for mem in active_top if mem.id not in full_ids and mem.id not in seen
-                ]
-                n_bump = len(bump_targets)
-                for i, mem in enumerate(bump_targets):
-                    seen.add(mem.id)
-                    store.bump_recall(mem.id, _snippet_bump_amount(i, n_bump))
-                    snippet_enqueue_ids.append(mem.id)
+            _bump_active_entries(
+                store,
+                active_entries,
+                persona_dir=persona_dir,
+                seen=seen,
+                pending_ids=full_open_ids,
+                snippet_ids=snippet_enqueue_ids,
+            )
     finally:
         # Two batched reappraisal enqueues cover every surfaced id exactly once
         # (restored batching, #231 follow-up matching 4c916b24's single combined
         # write per pass), and now fire even on a mid-pass exception:
         #   - `full_open_ids`: every full-open id from every tier this turn
-        #     (semantic full-inject, fading-rendered-full, lexical-active full_ids),
-        #     collected via `open_memory`'s `pending_ids` sink.
-        #   - `snippet_enqueue_ids`: the genuine-snippet ids (fading on either branch
-        #     + lexical active snippets on the inconclusive branch).
-        # The semantic tier's own snippet ids are enqueued inside
-        # `_render_semantic_active_lines`, so together every surfaced id is enqueued
-        # exactly once; only the call GROUPING changed, not the id set. Order is
-        # preserved (full-open ids first, then snippet ids) to match the happy path.
+        #     (active full renders, fading-rendered-full), collected via
+        #     `open_memory`'s `pending_ids` sink.
+        #   - `snippet_enqueue_ids`: the genuine-snippet ids (active snippets,
+        #     semantic and keyword alike, and the fading tier).
+        # Together every surfaced id is enqueued exactly once. Order: full-open
+        # ids first, then snippet ids.
         # Each flush is guarded so a failure here cannot mask the original
         # exception or crash (fail-soft, matching this module's convention).
         if full_open_ids:
@@ -1502,50 +1726,19 @@ _RECALL_TOKEN_MIN_LEN = 3
 # query regardless of token count. Raised 6 → 10 so the flagship incident
 # message's 8 salient content tokens ("logger, live, first, quick, memory,
 # trigger, garbage, treasure") all survive selection regardless of IDF.
+#
+# Name-recall fix R4 (spec §5, S9/S52/S79): this is NO LONGER a search cap.
+# `_extract_recall_tokens` returns every survivor and every token is searched.
+# The constant now names the size of the LEGACY selection
+# (`_legacy_capped_tokens`): tier 1 of the keyword search (today's query, S79),
+# and what still feeds the graveyard search and the "not recognised" list so
+# those two outputs do not widen (S71; the graveyard also gets the listed names, S102).
 _RECALL_TOKEN_LIMIT = 10
 
-# Conservative closed-class English function words + common discourse
-# interjections/fillers — deliberately EXCLUDES content words ("issue",
-# "first", "quick", "seems", "memory", "trigger", "signal", "logger" etc.),
-# which are demoted by salience ordering, not filtered outright. English-
-# specific (documented limitation). Static frozenset: no NLTK/sklearn
-# dependency for a word list.
-_RECALL_STOPWORDS: frozenset[str] = frozenset(
-    {
-        # articles
-        "a", "an", "the",
-        # pronouns / determiners
-        "i", "me", "my", "mine", "myself",
-        "you", "your", "yours", "yourself", "yourselves",
-        "he", "him", "his", "himself",
-        "she", "her", "hers", "herself",
-        "it", "its", "itself",
-        "we", "us", "our", "ours", "ourselves",
-        "they", "them", "their", "theirs", "themselves",
-        "this", "that", "these", "those",
-        "who", "whom", "whose", "which", "what",
-        "whoever", "whatever", "whichever",
-        "any", "some", "all", "both", "each", "either", "neither",
-        "every", "other", "another", "such", "own", "same", "only", "none",
-        # auxiliaries / modals
-        "am", "is", "are", "was", "were", "be", "been", "being",
-        "have", "has", "had", "having",
-        "do", "does", "did", "doing",
-        "will", "would", "shall", "should", "can", "could", "may", "might", "must",
-        # prepositions
-        "about", "above", "across", "after", "against", "along", "among",
-        "around", "at", "before", "behind", "below", "beside", "between",
-        "by", "down", "during", "except", "for", "from", "in", "into",
-        "near", "of", "off", "on", "out", "over", "since", "through", "to",
-        "towards", "under", "until", "up", "upon", "with", "within", "without",
-        # conjunctions
-        "and", "but", "or", "nor", "so", "yet", "because", "although",
-        "though", "while", "if", "unless", "whether", "than", "as",
-        # common discourse interjections / fillers
-        "alrighty", "okay", "ok", "yeah", "yep", "nope", "hmm", "anyway",
-        "gonna", "wanna", "oh", "hey", "yes", "no", "alright", "hi", "hello",
-    }
-)
+# The stopword set lives in brain.memory.recall_stopwords (moved there so the name
+# rules, ``brain.memory.name_rules``, can use it without importing the chat layer).
+# Alias kept: the selector below and its tests read it under this name.
+_RECALL_STOPWORDS: frozenset[str] = RECALL_STOPWORDS
 
 
 def _extract_recall_tokens(user_input: str, store: MemoryStore | None = None) -> list[str]:
@@ -1575,11 +1768,13 @@ def _extract_recall_tokens(user_input: str, store: MemoryStore | None = None) ->
       dropped.
     - Dedupes on the lowercased form, preserving first-seen index.
     - Ranks survivors by corpus salience, descending
-      ``(in_store, idf, is_capitalized, len(token), -first_seen_index)``,
-      and keeps the top _RECALL_TOKEN_LIMIT. ``in_store`` (whether the store
-      has any memory containing the term at all) is the PRIMARY key: a
-      zero-hit token can retrieve nothing, so it loses to any real token
-      when the cap binds, regardless of its (necessarily high) IDF.
+      ``(in_store, idf, is_capitalized, len(token), -first_seen_index)``, and
+      returns ALL of them (name-recall fix R4: the old top-
+      ``_RECALL_TOKEN_LIMIT`` cut is gone from searching; use
+      `_legacy_capped_tokens` for that legacy selection). ``in_store``
+      (whether the store has any memory containing the term at all) is the
+      PRIMARY key: a zero-hit token ranks below any real token, so the
+      legacy top-``_RECALL_TOKEN_LIMIT`` slice still leads with real tokens.
     - ``store=None`` (degraded path, no vocab available): every token gets
       ``in_store=False, idf=0.0`` and the df-dependent keep/exemption
       clauses are inert, so selection falls back to shape and length alone.
@@ -1587,7 +1782,8 @@ def _extract_recall_tokens(user_input: str, store: MemoryStore | None = None) ->
       at or above the ordinary floor still survive; only the store-backed
       corroboration for a sentence-initial capital is unavailable.
 
-    Returns the selected tokens lowercased (the FTS match tokens).
+    Returns every surviving token lowercased (the FTS match tokens), best
+    salience first.
     """
     if not user_input:
         return []
@@ -1655,7 +1851,18 @@ def _extract_recall_tokens(user_input: str, store: MemoryStore | None = None) ->
         return (df > 0, idf, is_capitalized, len(low), -first_seen_index)
 
     survivors.sort(key=_salience_key, reverse=True)
-    return [low for low, _, _ in survivors[:_RECALL_TOKEN_LIMIT]]
+    return [low for low, _, _ in survivors]
+
+
+def _legacy_capped_tokens(ranked: list[str]) -> list[str]:
+    """The old capped selection: the first ``_RECALL_TOKEN_LIMIT`` of the
+    salience-ranked tokens `_extract_recall_tokens` returns.
+
+    Bit-identical to what the selector returned before the cap was removed
+    (P-31). It is tier 1 of the keyword search (S79), and feeds the graveyard
+    search and the "not recognised" list; the remaining tokens are tier 2.
+    """
+    return ranked[:_RECALL_TOKEN_LIMIT]
 
 
 def _count_soul_candidates(persona_dir: Path) -> int:

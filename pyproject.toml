@@ -20,6 +20,9 @@ dependencies = [
     "tzdata>=2024.1",
     "fastembed>=0.4",
     "pypdf>=6",
+    # S206 (owner ruling 2026-10-09): the process RSS the RAM bound and the RAM-figure
+    # measurement read, on Linux, macOS and Windows alike (no single stdlib call covers all three).
+    "psutil>=5.9",
     # scripts/cache_replay_workload.py parses the yaml fence of guarded-change.companion.md with PyYAML
     # (it was only a transitive dependency; the cache-break check now depends on it directly).
     "pyyaml>=6.0",

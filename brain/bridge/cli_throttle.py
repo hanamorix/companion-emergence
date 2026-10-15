@@ -29,6 +29,7 @@ import json
 import logging
 import threading
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -55,7 +56,16 @@ _lock = threading.Lock()
 # exceed any finite lull.
 _last_message_mono: float = float("-inf")
 _inflight_replies: int = 0
+# S218: replies STARTED in this process (monotone; `reset()` leaves it alone, so a snapshot
+# compared by equality can never be confused by a reset). A reply that starts and ends
+# between two looks is invisible to `_inflight_replies` and visible here.
+_replies_started: int = 0
 _inflight_background = 0
+# S218: signalled by `note_reply_end` (built on `_lock`, so waiting and the counters share it).
+_reply_ended = threading.Condition(_lock)
+# S223: callbacks registered through `ReplyWatch.on_reply_start`, run by `note_user_message` (after
+# its counters changed and OUTSIDE `_lock`). Guarded by `_lock`.
+_start_hooks: list[_StartHook] = []
 
 # Rate-limited error logging state for is_chat_idle (S63; r2 m1 fix: bounded
 # volume under a persistent fault). Guarded by _lock alongside the state above.
@@ -85,6 +95,8 @@ def reset() -> None:  # test helper
         _err_last_key = None
         _err_last_logged_mono = float("-inf")
         _err_suppressed_count = 0
+        _start_hooks.clear()
+        _reply_ended.notify_all()
 
 
 def mark_interactive_active(at: float | None = None) -> None:
@@ -104,10 +116,16 @@ def mark_interactive_active(at: float | None = None) -> None:
 def note_user_message(at: float | None = None) -> None:
     """Call at the start of a chat turn: stamps activity and marks a reply
     in flight (is_chat_idle is False until the matching note_reply_end)."""
-    global _last_message_mono, _inflight_replies
+    global _last_message_mono, _inflight_replies, _replies_started
     with _lock:
         _last_message_mono = time.monotonic() if at is None else at
         _inflight_replies += 1
+        _replies_started += 1
+        hooks = list(_start_hooks)
+    # S223: outside the lock (a callback may call back into this module) and never raising: the
+    # reply path must not break because a measurement's stop callback failed.
+    for hook in hooks:
+        hook.fire()
 
 
 def note_reply_end(at: float | None = None) -> None:
@@ -118,6 +136,85 @@ def note_reply_end(at: float | None = None) -> None:
     with _lock:
         _last_message_mono = time.monotonic() if at is None else at
         _inflight_replies = max(0, _inflight_replies - 1)
+        _reply_ended.notify_all()
+
+
+class _StartHook:
+    """One registration of `ReplyWatch.on_reply_start`: runs its callback at most once."""
+
+    def __init__(self, callback: Callable[[], None]) -> None:
+        self._callback = callback
+        self._fired = False
+        self._guard = threading.Lock()
+
+    def fire(self) -> None:
+        with self._guard:
+            if self._fired:
+                return
+            self._fired = True
+        try:
+            self._callback()
+        except Exception:  # noqa: BLE001 - a stop callback must never break a reply
+            log.warning("cli_throttle: a reply-start callback raised", exc_info=True)
+
+
+class ReplyWatch:
+    """S218: a snapshot of the reply activity. Calling it returns `still_clear()` (see
+    `reply_watch`). S223: `on_reply_start` lets a measurement be told the moment a reply starts."""
+
+    def __init__(self) -> None:
+        with _lock:
+            self._started = _replies_started
+            self._idle = _inflight_replies == 0
+
+    def __call__(self) -> bool:
+        if not self._idle:
+            return False
+        with _lock:
+            return _replies_started == self._started
+
+    def on_reply_start(self, callback: Callable[[], None]) -> Callable[[], None]:
+        """S223: run `callback()` once, on the thread that calls `note_user_message`, when a reply
+        starts (after the counters changed, outside the module lock; an exception it raises is
+        logged and swallowed). If this watch is already not clear (a reply was in flight at the
+        snapshot, or one started since) the callback runs at once, on the calling thread. Returns
+        an idempotent `unregister()`; a callback unregistered before a reply starts never runs.
+        Used by the RAM ladder to stop its running ONNX call (the reply must not wait for it).
+        The callback runs on the REPLY thread, inside `note_user_message`: it must be quick and
+        must not block."""
+        hook = _StartHook(callback)
+        with _lock:
+            _start_hooks.append(hook)
+        if not self():
+            hook.fire()
+
+        def unregister() -> None:
+            with _lock:
+                with contextlib.suppress(ValueError):
+                    _start_hooks.remove(hook)
+
+        return unregister
+
+
+def reply_watch() -> ReplyWatch:
+    """S218: a snapshot of the reply activity, as a callable `still_clear()`.
+
+    `still_clear()` is True while no reply was in flight when the snapshot was taken AND no
+    reply has started since (a reply that started after the snapshot counts even if it has
+    already ended: its allocations may be inside whatever was measured meanwhile). If a reply
+    was in flight at the snapshot, it is False from the start, even after that reply ends.
+    The RAM ladder of `nell chat --no-bridge` abandons the rung in progress when this
+    turns False (the process-wide RSS reading would be inflated by the reply), and (S223)
+    registers `on_reply_start` to stop the rung's running ONNX call at that moment."""
+    return ReplyWatch()
+
+
+def wait_for_no_reply_in_flight() -> None:
+    """S218: return at once when no reply is in flight, else block until the last one ends
+    (`note_reply_end`, which `respond()` calls in a `finally`). No timeout and no polling
+    interval. For a background thread; never call it on the reply path."""
+    with _reply_ended:
+        _reply_ended.wait_for(lambda: _inflight_replies == 0)
 
 
 def reply_in_flight() -> bool:
@@ -284,6 +381,16 @@ def time_since_last_message(*, now: float | None = None) -> float:
     with _lock:
         t = time.monotonic() if now is None else now
         return t - _last_message_mono
+
+
+def chat_activity_marker() -> float:
+    """An opaque token that changes whenever the user chats: the monotonic
+    anchor ``is_chat_idle`` reads (last user message / reply end). Callers
+    compare it for equality only, e.g. the floor-bootstrap retry rule ("retry
+    at the next lull" = once chat has happened since the failed attempt,
+    name-recall fix S85)."""
+    with _lock:
+        return _last_message_mono
 
 
 def _log_is_chat_idle_error(exc: Exception) -> None:

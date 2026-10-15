@@ -21,10 +21,11 @@ from brain import dev_constants
 from brain.bridge import state_file
 from brain.mcp_server.audit import log_invocation
 from brain.memory.hebbian import HebbianMatrix
+from brain.memory.known_names import note_tool_call
 from brain.memory.store import MemoryStore
 from brain.tools import NELL_TOOL_NAMES
 from brain.tools.dispatch import dispatch
-from brain.tools.schemas import build_schemas
+from brain.tools.schemas import ADD_NAME_TOOL_NAME, build_schemas
 
 # Tools dispatched to the running bridge over its local HTTP API instead of
 # in-process (INC-4, S9/S10): the per-turn MCP tool process never builds the
@@ -123,6 +124,10 @@ def register_tools(
             # which is the only consumer of this kwarg.
             session_id = os.environ.get("NELL_MCP_SESSION_ID") or None
             if name in _BRIDGE_ROUTED_TOOLS:
+                # Names increment (S137, S138): the forward counts as her next tool
+                # call even when the bridge never answers (the bridge's own
+                # dispatch() runs the hook again; it is idempotent).
+                note_tool_call(persona_dir, name, arguments, add_tool_name=ADD_NAME_TOOL_NAME)
                 result = _search_via_bridge(persona_dir, arguments)
             else:
                 result = dispatch(

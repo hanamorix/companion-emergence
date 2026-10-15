@@ -15,6 +15,7 @@ Naming: synthetic user = Bob, persona = Canary, model = Claude. No Phoebe.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from unittest import mock
 
 import pytest
 
@@ -25,6 +26,29 @@ from brain.memory.store import Memory
 _CADENCE_HOURS = 6.0
 _TWO_LIVED_YEARS_HOURS = 17_532.0  # per plan's stated anchor
 _MAX_SIM_HOURS = _TWO_LIVED_YEARS_HOURS * 3  # generous ceiling so LOSE has room to appear
+
+
+class _FineClock(datetime):
+    """A `datetime` whose `now()` never returns the same instant twice.
+
+    The simulation creates a memory at "lived-age 0" and then scores it; `salience`
+    reads `datetime.now()` again. Where the OS clock ticks coarsely (Windows under
+    Python 3.12: ~15.6 ms) both reads can land on the same instant, the memory's
+    freshness is then exactly 1.0 instead of just under it, and its salience is
+    exactly 0.10 instead of just under: not `< LOST_THRESHOLD`, so the first
+    pass does not count as low and LOSE comes one cadence later. Whether the two
+    reads straddle a tick is luck, which makes the results non-monotonic in
+    importance. A strictly advancing clock removes the dependence on tick size."""
+
+    _last = datetime.min.replace(tzinfo=UTC)
+
+    @classmethod
+    def now(cls, tz=None):
+        t = datetime.now(tz)
+        if t <= cls._last:
+            t = cls._last + timedelta(microseconds=1)
+        cls._last = t
+        return t
 
 
 def _make_memory(importance: float, emotions: dict[str, float] | None = None) -> Memory:
@@ -57,6 +81,16 @@ def _simulate(
     recency exemption is a SEPARATE, untouched gate (HIST 95315d5d) that in
     production would additionally protect a memory for its first 720 hours.
     """
+    with mock.patch.object(salience, "datetime", _FineClock):
+        return _step(importance, emotions, soul_linked, max_hours)
+
+
+def _step(
+    importance: float,
+    emotions: dict[str, float] | None,
+    soul_linked: bool,
+    max_hours: float,
+) -> tuple[float | None, float | None]:
     mem = _make_memory(importance, emotions)
     state = "active"
     consecutive_low = 0
@@ -70,7 +104,7 @@ def _simulate(
 
     t = 0.0
     while t <= max_hours:
-        object.__setattr__(mem, "created_at", datetime.now(UTC) - timedelta(hours=t))
+        object.__setattr__(mem, "created_at", _FineClock.now(UTC) - timedelta(hours=t))
         object.__setattr__(mem, "state", state)
         s = salience.score(
             mem,

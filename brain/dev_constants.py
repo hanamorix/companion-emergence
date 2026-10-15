@@ -30,6 +30,13 @@ from __future__ import annotations
 # constant is memories.db-specific, not a global sqlite default.
 MEMORIES_DB_BUSY_TIMEOUT_S: float = 30.0
 
+# --- known-names file name (name-recall fix N1, S26) -------------------------
+# The kindled's running list of known name words: its own small SQLite file in
+# the persona directory, NOT memories.db and not keyed to memories (S19, S26).
+# A fixed dev-level file name: nothing reads or overrides it at run time. See
+# `brain.memory.known_names`.
+KNOWN_NAMES_DB_FILENAME: str = "known_names.db"
+
 # --- sqlite store integrity-check transient-error retry (C16 Windows CI
 # flake, INC-10 follow-up, ram-spike-fix; generalized from MemoryStore-only
 # to all 4 sqlite stores per orchestrator directive 2026-09-28) ------------
@@ -101,3 +108,83 @@ PASS2_NOBRIDGE_DRAIN_BUDGET_S: float = 20.0
 # first search on a slow CPU can legitimately take 44-60 s+ (O7/O15) — that is
 # a known, accepted consequence of this bound, not a defect.
 SEARCH_BRIDGE_TIMEOUT_S: float = 45.0
+
+# --- recall diagnostics log file name (name-recall fix D1, S59) -------------
+# One JSONL record per passive recall or `search_memories` call, in the
+# persona directory beside the other persona JSONL logs (NOT memories.db and
+# NOT the calibration log, S30). A file name is a fixed dev-level constant:
+# nothing reads or overrides it at run time. See
+# `brain.memory.recall_diagnostics`.
+RECALL_DIAGNOSTICS_LOG_FILENAME: str = "recall_diagnostics.log.jsonl"
+
+# --- rerank minimum (name-recall fix R1, S5/S23/S24) ------------------------
+# The fewest REAL memory candidates a rerank runs with: when fewer fit the
+# latency budget (or the pool holds fewer), the rerank is skipped and the
+# no-rerank path takes over; it is also the width before the first cost
+# measurement of a process. The owner's number (S5: "if the number of
+# candidates it can score in a given time is lower than 5, just don't rerank
+# them"), not a tuned value. With it, a rerank always carries at least
+# `reranker.K_MIN` anchors (k = min(8, real // 2) = 2 at 5 real).
+RERANK_MIN_REAL_CANDIDATES: int = 5
+
+# --- monologue family (name-recall fix R3, S13/S16) -------------------------
+# The memory types the kindled's own generated inner-monologue machinery
+# writes. In semantic recall they rank AFTER genuine memories within each path
+# and genuine candidates are taken first for rerank slots (spec §4): a
+# structural ordering, never a score multiplier. A fixed dev-level set of the
+# four types the spec names (monologue, monologue_trace, monologue_emotion,
+# monologue_soul_candidate); nothing reads or overrides it at run time. See
+# `brain.memory.semantic_recall.is_monologue_family`.
+MONOLOGUE_FAMILY_TYPES: frozenset[str] = frozenset(
+    {"monologue", "monologue_trace", "monologue_emotion", "monologue_soul_candidate"}
+)
+
+# --- recall result order (name-recall fix, spec §4, S97, S98) ---------------
+# The order of the six result groups of a recall (passive recall and the
+# `search_memories` tool alike): reorder the names on this one line to change
+# the order. The group names are fixed identifiers read by
+# `brain.memory.semantic_recall.order_result_groups`; every name must appear
+# exactly once. Sub-orders inside a group (scores, genuine first, each
+# paragraph's guaranteed slot, name hits first) stay in code. A
+# "cosine_family" memory is a monologue-family memory that was not reranked
+# (gated only by the cosine floor: the cosine path and every reranked
+# paragraph's unreranked tail); S97 puts it below the keyword genuine hits.
+RECALL_RESULT_GROUP_ORDER: tuple[str, ...] = ("reranked_genuine", "reranked_family", "cosine_genuine", "keyword_genuine", "cosine_family", "keyword_family")  # fmt: skip
+
+# --- cost-series window (name-recall fix S146) ------------------------------
+# Every measured cost series (the rerank, paragraph-embed, recall-setup,
+# paragraph-scan, keyword extra-words and name-matching timings) is a rolling
+# average over this window: a sample counts for this long after it was taken,
+# then drops out; there is no daily reset. The owner's number (S146: "a rolling
+# average over the last 24 hours"). See `brain.memory.cost_series`.
+COST_SERIES_WINDOW_S: float = 24 * 60 * 60
+
+# --- RAM fit safety factor (name-recall fix S255, S260) ----------------------
+# Every batch sized from the memory fit (`brain.memory.ram_fit.RamFit`) is sized so that the fit's
+# PREDICTED growth multiplied by this factor fits the free memory (`RamFit.sized`). The largest
+# underestimate the fit made on shapes it was not fitted on is the measured figure; the factor is
+# 1 / (1 - that underestimate), so a prediction scaled by it covers the worst underestimate seen.
+# Measured twice, shipped as one fixed number (not a tunable, not re-measured at run time; a per-machine
+# factor is a follow-up, issue #379). The rule (S260): ship the larger of the two measurements.
+# Both measurements: the dev VM (ONNX Runtime 1.29.0; fp16 jina v2 reranker), memory pool and patterns off,
+# default model cache. The S260 host presented no AVX2 flag (its default latency budget resolved to 4 s, so its
+# ladder rungs differ from S255's) and S260 downloaded nothing inside the measured process. Pre-registered stopping rule for each: settled at
+# the first n >= 6 replicates where the running largest underestimate moves by less than 2.0 percentage points
+# over the last 3 added replicates.
+# (1) FRESH process per measurement (S255), 2026-10-13: 78 runs = 6 replicates x 13 shapes (7 shapes the fit was
+#     fitted on, up to 8 pairs; 6 held out, up to 7 pairs). Settled at n = 6 (7.21 - 5.71 = 1.50 points). Largest
+#     underestimate 7.21% (373 MB predicted against 402 MB measured) at 7 pairs x 300 tokens, replicate 5:
+#     factor 1.0777. Record: name-recall-fix-records/R16/S255-REPORT.md in the owner's plans directory.
+# (2) LONG-LIVED process (S260), 2026-10-14: each replicate is one process that runs the production ladder, takes
+#     the production window fit, then measures the same 6 held-out shapes. 7 replicates, 42 cells. Settled at
+#     n = 7 (14.23 - 14.23 = 0.00 points; n = 6 was 10.39 points, not yet). Largest underestimate 14.23% (371.1 MB
+#     predicted against 432.7 MB measured) at 7 pairs x 300 tokens, replicate 4: factor 1.1659. Record:
+#     name-recall-fix-records/R17/S260-REPORT.md.
+# Shipped: max(1.0777, 1.1659) = 1.1659, so 0.14227 is the long-lived figure ((432.673 - 371.115) / 432.673 =
+# 0.142274, rounded to five places; 1 / (1 - 0.14227) = 1.16587). Flagged and NOT used, per the pre-registered protocol: the
+# secondary cross-replicate pairing analysis (fit of one replicate against the reading of another, 252 pairings) found
+# a largest underestimate of 16.5%, which would give 1.197 (1.1971). Not covered: batches above 7 pairs were not held out;
+# held-out calls did not feed back into the window as real recalls do; a lean process (provider and store only),
+# not the bridge with its other models and caches; the 14.23% rests on one cell (replicate 4).
+RAM_FIT_LARGEST_UNDERESTIMATE: float = 0.14227
+RAM_FIT_SAFETY_FACTOR: float = 1.0 / (1.0 - RAM_FIT_LARGEST_UNDERESTIMATE)  # 1.1659
