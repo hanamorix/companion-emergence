@@ -57,8 +57,9 @@ logger = logging.getLogger(__name__)
 _inflight: set[str] = set()
 _inflight_lock = threading.Lock()
 
-# Test seam: True stops `request_rerank_bootstrap` / `on_incoming_message` from
-# spawning threads (the flag/failure bookkeeping still happens). The test
+# Test seam: True stops `start_background`, `request_rerank_bootstrap` and
+# `on_incoming_message` from spawning threads (the flag/failure bookkeeping
+# still happens). The test
 # suite's autouse fixture sets it so a recall or a `respond()` in an unrelated
 # test never leaks a background thread; production never touches it.
 _background_inhibited = False
@@ -258,11 +259,13 @@ def start_background(
     name: str = "floor-bootstrap",
 ) -> threading.Thread | None:
     """Run `compute_missing_floors` on a daemon thread and return it (started),
-    or `None` when a cosine bootstrap is already in flight. Daemon: never holds
-    up a shutdown; a process that exits mid-compute simply computes again next
-    start. Registers the process's activity-marker source for the background
-    starters."""
+    or `None` when inhibited (tests) or when a cosine bootstrap is already in
+    flight. Daemon: never holds up a shutdown; a process that exits mid-compute
+    simply computes again next start. Registers the process's activity-marker
+    source for the background starters, also when inhibited."""
     set_activity_marker_provider(activity_marker)
+    if _background_inhibited:
+        return None
     # Claim the slot BEFORE the thread exists, so the cadence job can never win
     # a race against the startup computation (`compute_missing_floors` ends it).
     if not try_begin("cosine"):

@@ -409,7 +409,8 @@ def _floor_bootstrap_background_off_by_default(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[None]:
     """Keep the floor bootstraps' background starters (name-recall fix S91/S92:
-    the first-need rerank request and the on-each-message retry) from spawning
+    the process-start thread `start_background`, the first-need rerank request
+    and the on-each-message retry) from spawning
     threads in unrelated tests: a recall without a rerank floor or a `respond()`
     after a failed bootstrap would otherwise leak a daemon thread that computes
     (and caches) a floor after this test's teardown reset. The bookkeeping

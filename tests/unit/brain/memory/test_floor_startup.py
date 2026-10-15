@@ -235,7 +235,9 @@ def test_a_startup_failure_is_not_retried_by_the_job_until_chat_has_happened(
         store.close()
 
 
-def test_start_background_runs_the_computation_on_a_daemon_thread(computes, tmp_path: Path) -> None:
+def test_start_background_runs_the_computation_on_a_daemon_thread(
+    computes, tmp_path: Path, background_on
+) -> None:
     thread = floor_startup.start_background(tmp_path, name="floor-bootstrap-test")
 
     thread.join(timeout=10)
@@ -245,7 +247,7 @@ def test_start_background_runs_the_computation_on_a_daemon_thread(computes, tmp_
 
 
 def test_start_background_forwards_the_activity_marker_to_the_thread(
-    computes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    computes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, background_on
 ) -> None:
     monkeypatch.setattr(floor_calibration, "get_cosine_bootstrap_floor", lambda _id: None)
 
@@ -1138,7 +1140,7 @@ def test_an_unrecognised_precision_override_warns_once_not_on_every_call(
 
 
 def test_start_background_claims_the_cosine_slot_before_the_thread_runs(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, background_on
 ) -> None:
     """The cadence job must never win a race against the startup thread: the
     flag is already set when `start_background` returns, even before the
@@ -1295,7 +1297,7 @@ def test_a_background_attempt_records_the_registered_activity_marker(
 
 
 def test_start_background_registers_the_marker_provider_and_refuses_a_taken_slot(
-    computes, tmp_path: Path
+    computes, tmp_path: Path, background_on
 ) -> None:
     assert floor_startup.try_begin("cosine")
     try:
