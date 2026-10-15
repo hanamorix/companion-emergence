@@ -20,8 +20,10 @@ redteam_context:          # PRIORITY ORDER — read top-down; a cold subagent ca
     note: "Ground truth for tool/file behavior. Note: only request_id groups rows; no session_id, no reply-boundary field — confirm before treating request_id as 'one reply'."
   - path: "the project root/brain"
     note: "The REAL code we edit + test (dev repo source of truth — uv run pytest runs against this). Start at bridge/provider.py and chat/{prompt,engine,tool_loop,salience,tool_recruit}.py for prompt/caching/tool claims."
-  - path: "the project root/docs/superpowers/specs"
-    note: "Design specs (version-control authoritative). Find the relevant version's design before trusting a behavior claim."
+  - path: "the project root/docs/source-spec"
+    note: "Tracked design specs. Find the one for the area you touch before trusting a behavior claim."
+  - path: "the main checkout's docs/guarded-change"
+    note: "Prior runs' spec, criteria, plan, reviews and harness, one folder per change (gitignored, so absent from worktrees: read it from the main checkout). Start with the folder for the area you touch, e.g. builtin-audit-blocking-path/ and provider-audit-356-358-380/ for the CLI provider."
 
 measurement:
   baseline:               # capture the CURRENT version's behavior before a change
@@ -235,6 +237,10 @@ metrics:                  # standing regression metrics (source: the JSONL logs)
   give the cache_read_ratio check the single-call rows it judges): run both arms with the same
   settings, `--no-warmup --no-plain-turns` on both when the OLD tree's script predates them;
   `--compare` prints NOT COMPARABLE on stdout (no deltas, no C8 verdict, exit 11) when they differ.
+  The CLI's prompt cache entries last an hour (ledger row "Server-side prompt caching"), so arms run
+  less than an hour apart cross-warm: the second arm's cold first row can read a prefix the first wrote
+  (creation 9485 / read 0 for OLD vs 1429 / 8062 for NEW, 2026-10-15). Gate on the means without each
+  arm's first row, or space the arms more than an hour apart.
 - **These metrics exist because the v0.0.38 file-tool token-cost regression was only catchable
   via `tool_invocations.log.jsonl`.** Any change touching an un-instrumented area must add
   logging in stage 2 ("instrument before you build").
