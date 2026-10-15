@@ -820,10 +820,10 @@ class ClaudeCliProvider(LLMProvider):
     text surface:
       - The first "system" message → ``--system-prompt``.
       - A single remaining user message is passed verbatim via ``-p``.
-      - Multi-turn history is told as narrative lines (``At <time> Hana said: "..."``),
-        not a ``User:`` / ``Assistant:`` transcript. Those canonical labels make
-        Claude more likely to continue the transcript and leak labels into
-        Nell's reply.
+      - Multi-turn history is told as one line per message (``<time> Hana: ...``),
+        not a ``User:`` / ``Assistant:`` script. That script made Claude more
+        likely to continue the transcript and leak labels into Nell's reply, so
+        each line leads with its local time and the companion is ``you``.
 
     Tool-calling via --mcp-config
     -----------------------------
@@ -1959,12 +1959,12 @@ def _format_claude_print_prompt(
     """Format messages for ``claude -p`` without transcript role labels.
 
     A single text turn stays verbatim to preserve the simple generation shape.
-    Multi-turn history is told as narrative lines (``At <time> Hana said: "..."``),
+    Multi-turn history is told as one line per message (``<time> Hana: ...``),
     one per message. The oldest shape, a ``User:`` / ``Assistant:`` script, primed
     Claude to continue that transcript and leaked role labels into Nell's visible
     reply; the JSONL shape that replaced it was sometimes completed onto a reply
     as ``", "ts": "..."}`` (#227). ``user_name`` is the configured name of the
-    person Nell is talking to (``the human`` when absent).
+    person Nell is talking to (``User`` when absent).
 
     ``volatile_suffix`` (Option A+) is the per-turn ambient context chunk. When
     provided it is appended AFTER the rendered context block in BOTH branches —
@@ -2053,6 +2053,10 @@ def _format_claude_context_block(
 
 _NARRATIVE_NAME_MAX = 40
 _NARRATIVE_LINE_BREAKS = {"\u2028": "\\u2028", "\u2029": "\\u2029", "\u0085": "\\u0085"}
+# Every character that can end a line for ``str.splitlines()`` or a terminal, plus the other C0 controls and DEL.
+# Tab is left alone: it does not start a new line and escaping it only costs readability.
+_NARRATIVE_ESCAPE = re.compile("[\x00-\x08\x0a-\x1f\x7f\x85\u2028\u2029]")
+_NARRATIVE_NAMED_ESCAPES = {"\n": "\\n", "\r": "\\r"}
 
 
 def _one_line(text: str) -> str:
@@ -2065,6 +2069,18 @@ def _one_line(text: str) -> str:
 def _narrative_literal(text: str) -> str:
     """``text`` as a JSON string literal that can never span two physical lines."""
     return _one_line(json.dumps(text, ensure_ascii=False))
+
+
+def _narrative_text(text: str) -> str:
+    """``text`` with every line break and control character escaped, so it can never span two physical lines.
+
+    Quotes and backslashes are left as written. # ponytail: that makes the escape lossy (a typed ``\\n`` and a
+    real line break read the same); the point is that a message cannot forge a line, and the model does not decode
+    it. Escape the backslash too if anything ever needs to parse the line back.
+    """
+    return _NARRATIVE_ESCAPE.sub(
+        lambda m: _NARRATIVE_NAMED_ESCAPES.get(m.group(), f"\\u{ord(m.group()):04x}"), text
+    )
 
 
 def _narrative_name(raw: Any) -> str:
@@ -2101,22 +2117,23 @@ def _narrative_time(ts: str | None) -> str:
 
 
 def _claude_context_lines(messages: list[ChatMessage], *, user_name: str | None = None) -> Iterator[str]:
-    """Yield one narrative line per chat turn: ``At <time> <who> said: "<text>"`` (#227).
+    """Yield one line per chat turn: ``<time> <who>: <text>`` (#227).
 
     The time is the stored UTC ``ts`` rendered as local wall-clock time (issue #217);
     ``msg.ts`` itself is untouched and a missing or unparseable ``ts`` drops the clause.
-    ``<who>`` is the configured user name (``the human`` without one) for ``user``
-    messages and ``you`` for the companion's own. The text is a JSON-string literal, so
-    nothing in a message, a name, an id or a ``ts`` can add, remove or reorder lines.
+    ``<who>`` is the configured user name (``User`` without one, so it cannot be mistaken
+    for a person called "Human") for ``user`` messages and ``you`` for the companion's own.
+    Line breaks inside the text are escaped, so nothing in a message, a name, an id or a
+    ``ts`` can add, remove or reorder lines.
     """
-    name = _narrative_name(user_name) or "the human"
+    name = _narrative_name(user_name) or "User"
     for msg in messages:
         when = _narrative_time(msg.ts)
-        text = _narrative_literal(msg.content_text())
+        text = _narrative_text(msg.content_text())
         if msg.role == "user":
-            body = f"{name} said: {text}"
+            body = f"{name}: {text}"
         elif msg.role == "assistant":
-            body = f"you said: {text}"
+            body = f"you: {text}"
             for tc in msg.tool_calls:
                 args = _one_line(json.dumps(tc.arguments, ensure_ascii=False, default=str))
                 body += (
@@ -2125,15 +2142,15 @@ def _claude_context_lines(messages: list[ChatMessage], *, user_name: str | None 
                 )
         elif msg.role == "tool":
             what = (
-                f"the result of tool call {_narrative_literal(msg.tool_call_id)} came back"
+                f"The result of tool call {_narrative_literal(msg.tool_call_id)} came back"
                 if msg.tool_call_id
-                else "the result of a tool call came back"
+                else "The result of a tool call came back"
             )
             body = f"{what}: {text}"
         else:
             yield f"A {_narrative_name(msg.role) or 'system'} note: {text}"
             continue
-        yield f"At {when} {body}" if when else body[0].upper() + body[1:]
+        yield f"{when} {body}" if when else body
 
 
 def _parse_stream_json_result(stdout: str) -> str:

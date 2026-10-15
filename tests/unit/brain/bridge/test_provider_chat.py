@@ -235,17 +235,16 @@ def test_claude_cli_chat_multi_turn_uses_narrative_lines_not_role_labels() -> No
         )
 
     prompt = mock_run.call_args.kwargs["input"]
-    assert "User:" not in prompt
     assert "Assistant:" not in prompt
     assert "What has been said so far is below, one line per message" in prompt
     assert "JSONL" not in prompt
     assert "Do not prefix the reply" in prompt
     assert not any(line.startswith("{") for line in prompt.splitlines())
-    said = [line for line in prompt.splitlines() if " said: " in line]
+    said = [line for line in prompt.splitlines() if line.startswith(("User: ", "you: "))]
     assert said == [
-        'The human said: "hey nell"',
-        'You said: "i am here"',
-        'The human said: "what do you remember?"',
+        "User: hey nell",
+        "you: i am here",
+        "User: what do you remember?",
     ]
 
 

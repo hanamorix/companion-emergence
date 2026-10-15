@@ -101,9 +101,9 @@ def test_context_block_omits_clock_when_flag_false() -> None:
     # deterministic regardless of it: not the raw 'Z'-suffixed string, and
     # the same underlying instant.
     times = [
-        re.match(r"^At (\S+) (?:the human|you) said: ", line).group(1)
+        re.match(r"^(\d{4}-\d{2}-\d{2}T\S+) (?:User|you): ", line).group(1)
         for line in block.splitlines()
-        if " said: " in line
+        if re.match(r"^(\d{4}-\d{2}-\d{2}T\S+) (?:User|you): ", line)
     ]
     assert times[0] != "2026-05-20T10:00:00Z"
     assert times[1] != "2026-05-20T10:05:00Z"

@@ -60,8 +60,8 @@ def test_per_message_ts_rendered_in_local_zone_not_utc():
     raw_ts = "2026-05-20T17:00:00Z"
     msgs = [ChatMessage(role="user", content="a", ts=raw_ts)]
     block = _format_claude_context_block(msgs, includes_latest_user=True)
-    [line] = [line for line in block.splitlines() if " said: " in line]
-    match = re.match(r"^At (\S+) the human said: ", line)
+    [line] = [line for line in block.splitlines() if line.endswith(" User: a")]
+    match = re.match(r"^(\d{4}-\d{2}-\d{2}T\S+) (?:User|you): ", line)
     assert match is not None
     rendered_ts = match.group(1)
 

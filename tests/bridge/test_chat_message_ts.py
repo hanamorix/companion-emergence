@@ -8,13 +8,13 @@ from datetime import UTC, datetime
 from brain.bridge.chat import ChatMessage
 from brain.bridge.provider import _claude_context_lines
 
-_TIMED = re.compile(r"^At (\S+) the human said: ")
+_TIMED = re.compile(r"^(\d{4}-\d{2}-\d{2}T\S+) (?:User|you): ")
 
 
 def test_message_without_ts_omits_the_time_clause():
     msg = ChatMessage(role="user", content="hi")
     [line] = list(_claude_context_lines([msg]))
-    assert line == 'The human said: "hi"'
+    assert line == "User: hi"
 
 
 def test_message_with_ts_emits_the_time_clause():
@@ -42,7 +42,7 @@ def test_mixed_ts_renders_correctly():
     first, second, third = _TIMED.match(lines[0]), lines[1], _TIMED.match(lines[2])
     assert first is not None and third is not None
     assert datetime.fromisoformat(first.group(1)).astimezone(UTC) == datetime(2026, 5, 20, 10, 0, 0, tzinfo=UTC)
-    assert second == 'You said: "b"'
+    assert second == "you: b"
     assert datetime.fromisoformat(third.group(1)).astimezone(UTC) == datetime(2026, 5, 20, 10, 5, 0, tzinfo=UTC)
 
 

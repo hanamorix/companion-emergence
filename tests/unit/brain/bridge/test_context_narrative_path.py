@@ -111,16 +111,12 @@ def _run_turn(tmp_path: Path, *, user_name: str | None) -> str:
 def test_c2a_respond_sends_narrative_lines_named_after_the_configured_user(tmp_path: Path) -> None:
     prompt = _run_turn(tmp_path, user_name="Hana")
 
-    said = [line for line in prompt.split("\n") if " said: " in line]
+    said = [line for line in prompt.split("\n") if re.match(r"^(?:\S+ )?(?:Hana|you): ", line)]
     assert len(said) == 5  # four seeded turns plus the new user message
-    assert re.match(r'^At \S+ Hana said: "hey nell"$', said[0])
-    assert re.match(r'^At \S+ you said: "i am here"$', said[1])
-    assert re.match(
-        r'^At \S+ Hana said: "two\\nlines"$', said[2]
-    )  # one line: the newline stays escaped
-    assert (
-        said[4] == 'Hana said: "what do you remember?"'
-    )  # the live message has no time yet (stamped at persist)
+    assert re.match(r"^\S+ Hana: hey nell$", said[0])
+    assert re.match(r"^\S+ you: i am here$", said[1])
+    assert re.match(r"^\S+ Hana: two\\nlines$", said[2])  # one line: the newline stays escaped
+    assert said[4] == "Hana: what do you remember?"  # the live message has no time yet (stamped at persist)
     assert not any(line.startswith("{") for line in prompt.split("\n"))
     assert '"speaker"' not in prompt and "JSONL" not in prompt
     assert "`ts`" not in prompt  # the ambient tail no longer describes a field
@@ -130,11 +126,11 @@ def test_c2a_respond_sends_narrative_lines_named_after_the_configured_user(tmp_p
     assert prompt.index("Answer the final human entry directly") < prompt.index(said[0])
 
 
-def test_c2c_without_a_configured_name_the_lines_say_the_human(tmp_path: Path) -> None:
+def test_c2c_without_a_configured_name_the_lines_say_user(tmp_path: Path) -> None:
     prompt = _run_turn(tmp_path, user_name=None)
-    said = [line for line in prompt.split("\n") if " said: " in line]
-    assert said[0].endswith('the human said: "hey nell"')
-    assert said[4] == 'The human said: "what do you remember?"'
+    said = [line for line in prompt.split("\n") if re.match(r"^(?:\S+ )?(?:User|you): ", line)]
+    assert said[0].endswith(" User: hey nell")
+    assert said[4] == "User: what do you remember?"
 
 
 class _KeepStdin(io.StringIO):
@@ -189,17 +185,17 @@ def test_c2b_chat_stream_sends_the_same_narrative_lines() -> None:
             )
         )
     sent = fake.stdin.final
-    said = [line for line in sent.split("\n") if " said: " in line]
+    said = [line for line in sent.split("\n") if re.match(r"^(?:\S+ )?(?:Hana|you): ", line)]
     assert len(said) == 3
-    assert said[0].endswith('Hana said: "hey nell"')
-    assert said[2] == 'Hana said: "and now?"'
+    assert said[0].endswith(" Hana: hey nell") or said[0] == "Hana: hey nell"
+    assert said[2] == "Hana: and now?"
     assert sent.endswith("\n\nSUFFIX")
     assert "SYSTEM" not in sent  # the first system message is split off into the system prompt
     assert "Conversation context is encoded" not in sent
 
 
 @pytest.mark.parametrize("name", [None, "", "   "])
-def test_c2_blank_names_fall_back_to_the_human(name: str | None) -> None:
+def test_c2_blank_names_fall_back_to_user(name: str | None) -> None:
     from brain.bridge.provider import _format_claude_print_prompt
 
     msgs = [
@@ -208,4 +204,4 @@ def test_c2_blank_names_fall_back_to_the_human(name: str | None) -> None:
         ChatMessage(role="user", content="c"),
     ]
     out = _format_claude_print_prompt(msgs, user_name=name)
-    assert 'The human said: "a"' in out and 'The human said: "c"' in out
+    assert "User: a" in out and "User: c" in out

@@ -64,9 +64,9 @@ def test_buffer_timestamps_appear_in_context_block(tmp_path: Path, monkeypatch):
     now = datetime(2026, 5, 20, 7, 30, 0, tzinfo=_LOCAL)
     block = _format_claude_context_block(messages, includes_latest_user=True, now=now)
     times = [
-        re.match(r"^At (\S+) (?:the human|you) said: ", line).group(1)
+        re.match(r"^(\d{4}-\d{2}-\d{2}T\S+) (?:User|you): ", line).group(1)
         for line in block.splitlines()
-        if " said: " in line
+        if re.match(r"^(\d{4}-\d{2}-\d{2}T\S+) (?:User|you): ", line)
     ]
     assert times[0] != "2026-05-20T10:00:00Z"
     assert times[1] != "2026-05-20T10:00:30Z"
@@ -109,5 +109,5 @@ def test_old_buffer_without_ts_loads_cleanly(tmp_path: Path, monkeypatch):
 
     # Context block should still emit correctly — no time clause on the lines
     block = _format_claude_context_block(messages, includes_latest_user=True)
-    lines = [line for line in block.splitlines() if " said: " in line]
-    assert lines == ['The human said: "hi"', 'You said: "hello"']
+    lines = [line for line in block.splitlines() if line.startswith(("User: ", "you: "))]
+    assert lines == ["User: hi", "you: hello"]
