@@ -156,3 +156,48 @@ def test_build_tools_list_uses_companion_name() -> None:
         assert "Nell" not in desc, (
             f"Tool {tool['function']['name']!r} still contains 'Nell': {desc!r}"
         )
+
+
+# The owner-ratified wording for #371 (decisions.md rulings 1-2), pinned EXACTLY. This text is in the cached
+# prompt prefix: any edit to it is a deliberate, reviewed change, not drift.
+_SOURCE_MEMORY_ID_PROPERTY = {
+    "type": "string",
+    "description": (
+        "Optional. The id of an existing memory this moment is about; it is kept from being forgotten for as long "
+        "as this crystallisation stands. Pass an id only if it is already in this conversation: a recalled memory "
+        "line, a search or read result, or the id add_memory just returned. Never search just to find one. If the "
+        "moment is not a memory yet and you want it kept, save it with add_memory first and pass the id it returns."
+    ),
+}
+
+
+def test_crystallize_soul_source_memory_id_property_is_exactly_the_ratified_one() -> None:
+    """#371 C6(b)/(e): one optional string property, last, with the exact ratified wording, and no
+    persona name in the raw static text (build_schemas() templates 'Nell' away, which would hide it)."""
+    schema = SCHEMAS["crystallize_soul"]
+    props = schema["parameters"]["properties"]
+
+    assert list(props) == ["moment", "love_type", "why_it_matters", "who_or_what", "resonance", "source_memory_id"]
+    assert props["source_memory_id"] == _SOURCE_MEMORY_ID_PROPERTY
+    assert "source_memory_id" not in schema["parameters"]["required"]
+    assert "Nell" not in props["source_memory_id"]["description"]
+    assert "Hana" not in props["source_memory_id"]["description"]
+
+
+def test_crystallize_soul_schema_rejects_non_string_ids_the_way_the_mcp_sdk_validates() -> None:
+    """#371 C3 (MCP path) / m1: the MCP SDK runs jsonschema.validate(arguments, inputSchema) BEFORE the tool
+    handler, so null / int / list never reach the impl over MCP; blank and real ids do. This pins the plain
+    ``string`` type (a ["string","null"] union would let null through and change the cached schema)."""
+    import jsonschema
+    import pytest
+
+    from brain.tools.schemas import build_schemas
+
+    params = build_schemas("Companion")["crystallize_soul"]["parameters"]
+    base = {"moment": "m", "love_type": "craft", "why_it_matters": "w"}
+
+    for accepted in ("", "   ", "m-123"):
+        jsonschema.validate({**base, "source_memory_id": accepted}, params)
+    for rejected in (None, 5, ["m-1"]):
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate({**base, "source_memory_id": rejected}, params)

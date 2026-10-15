@@ -11,12 +11,23 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.forgetting.salience import SalienceInputs
 from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
+from brain.memory.name_rules import (
+    WORD_RE as _WORD_RE,
+)
+from brain.memory.name_rules import (
+    contraction_stems,
+    followed_by_apostrophe_t,
+    is_stopword_name,
+    stopword_name_occurrence_ok,
+)
+from brain.memory.recall_stopwords import RECALL_STOPWORDS
 from brain.memory.store import Memory
 from brain.utils.file_lock import file_lock
 
@@ -66,30 +77,123 @@ def append(
             os.fsync(fh.fileno())
 
 
-def search(persona_dir: Path, query: str, *, limit: int = 5) -> list[dict]:
-    """Case-insensitive token search against summary + domain.
+#: Ordinary query words shorter than this are not searched (today's minimum,
+#: S128); listed names are the one exception and match at any length.
+_MIN_WORD_LEN = 4
 
-    Splits multi-word queries into individual tokens and matches any entry
-    containing at least one token. Returns most-recent first. Tolerates
-    corrupt JSONL lines. Respects limit.
+
+def query_words(text: str) -> list[str]:
+    """The ordinary words a forgotten-memory query searches (S102, S123, S128).
+
+    Runs of ``[A-Za-z0-9]`` (the keyword search's split), lower-cased, deduped
+    in order, at least ``_MIN_WORD_LEN`` characters, minus the recall
+    stopwords and the contraction fragments of ``text`` (the stem before
+    n't, 'll, 're, 've, 'd, 'm; ``name_rules.contraction_stems``).
     """
-    import re
+    stems = contraction_stems(text)
+    seen: set[str] = set()
+    out: list[str] = []
+    for word in _WORD_RE.findall(text):
+        low = word.lower()
+        if (
+            len(low) < _MIN_WORD_LEN
+            or low in seen
+            or low in RECALL_STOPWORDS
+            or low in stems
+        ):
+            continue
+        seen.add(low)
+        out.append(low)
+    return out
 
+
+def _split_words(text: str) -> list[tuple[str, int, int]]:
+    """``(lower-cased word, start, end)`` for every word of ``text`` (spans on
+    the ORIGINAL text, so case and punctuation rules can look at it)."""
+    return [(m.group().lower(), m.start(), m.end()) for m in _WORD_RE.finditer(text)]
+
+
+def _field_matches(
+    text: str,
+    words: frozenset[str],
+    names: Sequence[tuple[str, ...]],
+    hints: frozenset[str],
+) -> tuple[bool, bool]:
+    """``(any match, name match)`` of one entry field.
+
+    ``hints`` are the substrings that must occur in the lower-cased text for a
+    whole-word or phrase match to be possible (a cheap prefilter, so most
+    entries are never split into words).
+    """
+    low = text.lower()
+    if not any(h in low for h in hints):
+        return False, False
+    # Words come from the ORIGINAL text, each lower-cased (F12: never offsets or
+    # words taken from a lower-cased copy).
+    word_hit = bool(words) and not words.isdisjoint(w.lower() for w in _WORD_RE.findall(text))
+    if not names or not any(w in low for phrase in names for w in phrase):
+        return word_hit, False
+    split = _split_words(text)
+    entry_words = [w for w, _, _ in split]
+    name_hit = False
+    for name in names:
+        n = len(name)
+        for i in range(len(entry_words) - n + 1):
+            if tuple(entry_words[i : i + n]) != name:
+                continue
+            spans = [(split[j][1], split[j][2]) for j in range(i, i + n)]
+            # S125: a single-word name is not the stem of an n't contraction.
+            if n == 1 and followed_by_apostrophe_t(text, spans[0][1]):
+                continue
+            # S151: a stopword-name only where capitalized (any position).
+            if is_stopword_name(" ".join(name)) and not stopword_name_occurrence_ok(text, spans):
+                continue
+            name_hit = True
+            break
+        if name_hit:
+            break
+    return word_hit or name_hit, name_hit
+
+
+def search(
+    persona_dir: Path,
+    query: str,
+    *,
+    limit: int = 5,
+    names: Sequence[str] = (),
+) -> list[dict]:
+    """Whole-word search of the summary (name-recall fix S102, S119, S123, S128, S150).
+
+    An entry matches when any of the query's words (:func:`query_words`) occurs
+    as a whole word, or any listed name in ``names`` occurs as a phrase of
+    consecutive whole words, in its summary. The domain label is never matched
+    (S150: it is for filtering, not for keyword matching). Names match at any
+    length; a stopword-name only where capitalized (S151) and a single-word name
+    never as the stem of an n't contraction (S125). No words and no names: no
+    hits. Order: name hits first, then the rest, each newest first
+    (``forgotten_at_iso``), then ``limit`` (S119). Tolerates corrupt JSONL lines.
+    """
     path = persona_dir / GRAVEYARD_FILENAME
     if not path.exists():
         return []
-    tokens = [t for t in re.split(r"[^A-Za-z0-9]+", query.lower()) if len(t) >= 4]
-    if not tokens:
-        tokens = [query.lower()]
-    hits: list[dict] = []
+    words = frozenset(query_words(query))
+    name_phrases: list[tuple[str, ...]] = []
+    for name in names:
+        phrase = tuple(w.lower() for w in _WORD_RE.findall(name))
+        if phrase and phrase not in name_phrases:
+            name_phrases.append(phrase)
+    if not words and not name_phrases:
+        return []
+    hints = words | {w for phrase in name_phrases for w in phrase}
+    hits: list[tuple[dict, bool]] = []
     for entry in iter_jsonl_skipping_corrupt(path):
-        summary = (entry.get("summary") or "").lower()
-        domain = (entry.get("domain") or "").lower()
-        if any(t in summary or t in domain for t in tokens):
-            hits.append(entry)
-    # Most-recent first via forgotten_at_iso (ISO 8601 lexicographic order is correct).
-    hits.sort(key=lambda e: e.get("forgotten_at_iso") or "", reverse=True)
-    return hits[:limit]
+        matched, by_name = _field_matches(entry.get("summary") or "", words, name_phrases, hints)
+        if matched:
+            hits.append((entry, by_name))
+    # Newest first (ISO 8601 sorts lexicographically), then name hits first (stable).
+    hits.sort(key=lambda h: h[0].get("forgotten_at_iso") or "", reverse=True)
+    hits.sort(key=lambda h: not h[1])
+    return [entry for entry, _ in hits[:limit]]
 
 
 def read_all(persona_dir: Path) -> list[dict]:

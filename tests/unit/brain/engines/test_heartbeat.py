@@ -717,7 +717,7 @@ def test_heartbeat_runs_reflex_when_enabled(tmp_path: Path) -> None:
     config_path = tmp_path / "heartbeat_config.json"
     HeartbeatConfig(reflex_enabled=True).save(config_path)
 
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     hm = HebbianMatrix(":memory:")
     try:
         store.create(
@@ -1044,7 +1044,7 @@ def test_heartbeat_reflex_wins_tie_over_research(tmp_path: Path) -> None:
         research_emotion_threshold=5.0,
     ).save(config_path)
 
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     hm = HebbianMatrix(":memory:")
     try:
         store.create(
@@ -1308,7 +1308,7 @@ def test_heartbeat_memory_uses_persona_name(
         emit_memory="always",
     ).save(config_path)
 
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     hm = HebbianMatrix(":memory:")
     try:
         store.create(
@@ -2118,7 +2118,7 @@ def test_daemon_state_reflex_entry_written_when_reflex_fires(tmp_path: Path) -> 
     interests_path.write_text(json.dumps({"version": 1, "interests": []}), encoding="utf-8")
     HeartbeatConfig(reflex_enabled=True).save(tmp_path / "heartbeat_config.json")
 
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     hm = HebbianMatrix(":memory:")
     try:
         store.create(

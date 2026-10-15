@@ -19,6 +19,10 @@ import json
 import threading
 from pathlib import Path
 
+# brain.chat.rollover binds cascade_conversation when it is first imported. Import it here, before any test patches
+# brain.chat.compaction.cascade_conversation, or the first import happens under the patch and the fake stays bound
+# there for the rest of the process (it broke test_cascade_rollover_endpoints when this file ran first).
+import brain.chat.rollover  # noqa: F401
 from brain.bridge import job_progress
 
 

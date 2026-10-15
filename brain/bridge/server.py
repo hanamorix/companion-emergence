@@ -73,6 +73,7 @@ from brain.health.alarm import compute_pending_alarms
 from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
 from brain.health.walker import walk_persona
 from brain.ingest.buffer import _SESSION_ID_RE as _BUFFER_SESSION_ID_RE
+from brain.memory import cost_series
 from brain.memory.db_health import run_fts_health_check_once
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
@@ -313,6 +314,20 @@ def _search_memories_blocking(persona_dir: Path, req: SearchMemoriesReq) -> dict
             hebbian=hebbian,
             persona_dir=persona_dir,
         )
+
+
+def _end_chunk_stream(loop: asyncio.AbstractEventLoop, chunk_q: asyncio.Queue) -> None:
+    """Queue the end-of-reply sentinel BEHIND every chunk the worker thread pushed.
+
+    `_StreamingProxy` pushes chunks with `loop.call_soon_threadsafe(put_nowait, ...)`.
+    When the worker finishes before the loop thread resumes its `await asyncio.to_thread(...)`
+    (a short reply), the await returns without yielding, so those callbacks are still
+    pending in the loop's ready queue. A direct `chunk_q.put_nowait(None)` would overtake
+    them: the forwarder would stop before the last chunk(s), and the client, which builds
+    the reply only from reply_chunk frames, would show a truncated reply. `call_soon`
+    appends behind them (FIFO), whatever the timing.
+    """
+    loop.call_soon(chunk_q.put_nowait, None)
 
 
 class _StreamingProxy:
@@ -594,6 +609,35 @@ def _chat_error_code(exc: BaseException) -> str:
     """Stable client code for a failed chat turn (#246): ``auth_expired`` when the
     failing call's own text is an auth failure, else the generic ``provider_failed``."""
     return "auth_expired" if provider_auth.is_auth_failure(str(exc)) else "provider_failed"
+
+
+async def _flush_cost_series_at_stop(persona_dir: Path) -> None:
+    """The bridge's clean stop saves the cost-series samples still buffered in
+    memory (name-recall fix S146, S164: only a crash may lose them; a normal
+    stop must not, or a restart would not continue from the saved timings).
+    Opens its own short-lived store in a worker thread; never raises."""
+
+    def _flush() -> None:
+        store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+        try:
+            cost_series.flush(store)
+        finally:
+            store.close()
+
+    try:
+        await asyncio.to_thread(_flush)
+    except Exception:
+        logger.exception("cost-series flush failed during shutdown")
+    # Name-recall fix S189: the recall diagnostics records buffered while the log's
+    # lock was held are written at a clean stop too (never waits, never raises).
+    try:
+        from brain.memory import recall_diagnostics
+
+        await asyncio.to_thread(
+            recall_diagnostics.flush_pending, recall_diagnostics.diagnostics_path(persona_dir)
+        )
+    except Exception:
+        logger.exception("recall diagnostics flush failed during shutdown")
 
 
 def _run_heartbeat_close(persona_dir: Path, provider: LLMProvider) -> None:
@@ -1083,6 +1127,31 @@ def build_app(
         except Exception as _exc:  # noqa: BLE001 — startup must not break; already fails closed internally
             logger.warning("is-chat-idle seed from active_conversations failed: %s", _exc)
 
+        # Floor bootstraps (name-recall fix S85, revised; spec §2): the cosine
+        # (S91: only the COSINE one) bootstrap floor is computed ONCE per
+        # process, here at process start, on a daemon thread off every reply
+        # path (recall only peeks the caches). Until it finishes, the no-rerank
+        # path renders keyword results only. The RERANK floor bootstraps on
+        # first need in the background; a failed bootstrap is retried in the
+        # background on each incoming message (`respond()`, S92) and at the
+        # next lull by the central cadence jobs. Off with the other
+        # background threads in tests. Fault-isolated: never breaks startup.
+        # Started AFTER the is-chat-idle seed above (the retry rule reads the
+        # same anchor through `chat_activity_marker`, so nothing may read it
+        # before the seed) and before the supervisor thread.
+        if bg:
+            try:
+                from brain.bridge import cli_throttle as _cli_throttle
+                from brain.memory import floor_startup as _floor_startup
+
+                app.state.bridge.floor_bootstrap_thread = _floor_startup.start_background(
+                    persona_dir,
+                    activity_marker=_cli_throttle.chat_activity_marker,
+                    name="floor-bootstrap",
+                )
+            except Exception:  # noqa: BLE001 — startup must not break on the bootstrap thread
+                logger.exception("floor bootstrap startup thread could not be started")
+
         # S84: "bridge start" for the empty-session prune (no message seen yet
         # in this process). Captured here, on this thread, BEFORE the supervisor
         # thread starts and before `yield` lets any /session/new in, so every
@@ -1146,6 +1215,7 @@ def build_app(
             #   2. Drain in-flight chats (best-effort wait, 30s cap)
             #   3. Close all live sessions via ingest pipeline (silence_minutes=0)
             #   4. Stop supervisor thread (180s join cap)
+            #   4b. Flush the buffered cost-series samples to memories.db
             #   5. Heartbeat close-trigger (Reflex Phase 2 growth tick anchor)
             #   6. Publish shutdown event
             #   7. Clear publisher
@@ -1209,6 +1279,10 @@ def build_app(
                 sup_thread.join(timeout=180.0)
                 if sup_thread.is_alive():
                     logger.warning("supervisor thread did not stop within 180s")
+
+            # 4b. Save the buffered cost-series samples (S146, S164) now that
+            #     the supervisor, the only other flusher, has stopped.
+            await _flush_cost_series_at_stop(persona_dir)
 
             # 5. Heartbeat close-trigger — anchor for Reflex Phase 2 weekly growth.
             #    In-process import + run_tick(trigger="close"). Best-effort:
@@ -2870,7 +2944,7 @@ def build_app(
                         reply_to_audit_id,
                     )
                 finally:
-                    chunk_q.put_nowait(None)
+                    _end_chunk_stream(loop, chunk_q)
 
             respond_task = asyncio.create_task(_guarded_respond())
 
