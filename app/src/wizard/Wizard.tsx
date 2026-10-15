@@ -1,7 +1,6 @@
 import { useState } from "react";
 import {
   DEFAULT_INIT_MODEL,
-  installNellCliSymlink,
   installSupervisorService,
   runInit,
   runMigrate,
@@ -145,7 +144,7 @@ export function Wizard({ onDone }: Props) {
     // Linux (.deb), a small script on Linux (AppImage), nell.cmd plus a PATH entry on Windows. When
     // the step does not succeed on Linux/Windows the explanation is kept as `cliNotice`, shown on
     // the final step until the user continues (#408).
-    const cli = await runCliShortcutStep(platform, installNellCliSymlink);
+    const cli = await runCliShortcutStep(platform);
     const cliTrailer = cli.trailer;
 
     return { serviceTrailer, cliTrailer, cliNotice: cli.notice };

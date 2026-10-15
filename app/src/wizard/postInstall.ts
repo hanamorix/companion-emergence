@@ -5,7 +5,7 @@
 // whenever the step did not succeed there, the explanation is also returned as `notice`, which the
 // wizard keeps on the final step until the user continues (the install pane is gone after 1.2 s).
 
-import type { InitResult } from "../appConfig";
+import { installNellCliSymlink, type InitResult } from "../appConfig";
 import { errString } from "../lib/errString";
 import { platformLabel, type ClientPlatform } from "../platform";
 
@@ -23,7 +23,7 @@ function failureResult(trailer: string): CliStepResult {
 
 export async function runCliShortcutStep(
   platform: ClientPlatform,
-  install: () => Promise<InitResult>,
+  install: () => Promise<InitResult> = installNellCliSymlink,
 ): Promise<CliStepResult> {
   if (platform === "other") {
     return {
