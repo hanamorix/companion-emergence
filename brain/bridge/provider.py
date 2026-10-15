@@ -77,6 +77,10 @@ _BUDGET_BY_TIER: tuple[tuple[str, float], ...] = (
 )
 _BUDGET_FALLBACK: float = tunables.register("provider.max_turn_budget_usd.fallback", 1.50)
 
+# What json.loads raises on a line it cannot take: JSONDecodeError and, on a hostile line, a plain ValueError
+# (a 5000-digit run) or RecursionError (nesting beyond the recursion limit). JSONDecodeError is a ValueError.
+_JSON_LINE_ERRORS: tuple[type[BaseException], ...] = (ValueError, RecursionError)
+
 # Graceful message when the CLI hits the per-turn ceiling mid-reply.
 _BUDGET_EXCEEDED_MSG: str = (
     "I reached this turn's work limit before I finished — "
@@ -768,7 +772,7 @@ def _last_result_line(stdout: str) -> dict[str, Any] | None:
     for raw in reversed(stdout.split("\n")):
         try:
             obj = json.loads(raw)
-        except json.JSONDecodeError:
+        except _JSON_LINE_ERRORS:
             continue
         if isinstance(obj, dict) and obj.get("type") == "result":
             return obj
@@ -781,7 +785,7 @@ def _claude_failure_detail_text(result: subprocess.CompletedProcess[str]) -> str
     if stdout:
         try:
             payload = json.loads(stdout)
-        except json.JSONDecodeError:
+        except _JSON_LINE_ERRORS:
             payload = _last_result_line(stdout)  # #330: stream-json NDJSON stdout
         if isinstance(payload, dict):
             parts: list[str] = []
@@ -901,6 +905,8 @@ class ClaudeCliProvider(LLMProvider):
 
         try:
             payload = json.loads(result.stdout)
+            if not isinstance(payload, dict):
+                raise ValueError("not a result object")
             log_usage(persona_dir, call_type="generate", model=self._model, frame=payload)
             # #119: the CLI can exit 0 and report the failure inside the frame,
             # so the returncode guard above never sees it. Without this the error
@@ -911,7 +917,7 @@ class ClaudeCliProvider(LLMProvider):
             if cli_err is not None:
                 raise RuntimeError(f"ClaudeCliProvider: {cli_err}")
             return str(payload["result"])
-        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        except (*_JSON_LINE_ERRORS, KeyError, TypeError) as exc:
             raise RuntimeError(
                 f"ClaudeCliProvider: unexpected output format: {result.stdout[:200]!r}"
             ) from exc
@@ -1297,7 +1303,9 @@ class ClaudeCliProvider(LLMProvider):
                         continue
                     try:
                         obj = json.loads(line)
-                    except json.JSONDecodeError:
+                    except _JSON_LINE_ERRORS:
+                        continue
+                    if not isinstance(obj, dict):
                         continue
 
                     t = obj.get("type")
@@ -1760,7 +1768,7 @@ def _scan_blocking_stream_stdout(
             continue
         try:
             obj = json.loads(line)
-        except json.JSONDecodeError:
+        except _JSON_LINE_ERRORS:
             continue
         if not isinstance(obj, dict):
             continue
@@ -1779,7 +1787,7 @@ def _scan_blocking_stream_stdout(
         # _cli_error_detail would call provider_auth.note_cli_success() on it.
         try:
             whole = json.loads(stdout or "")
-        except json.JSONDecodeError:
+        except _JSON_LINE_ERRORS:
             return None
         if isinstance(whole, dict) and whole.get("type") in (None, "result"):
             return whole
@@ -1877,7 +1885,7 @@ def _read_audit_lines_since(
             continue
         try:
             entry = json.loads(line)
-        except json.JSONDecodeError:
+        except _JSON_LINE_ERRORS:
             malformed += 1
             continue
         if entry.get("origin") == _CLI_BUILTIN_ORIGIN:
