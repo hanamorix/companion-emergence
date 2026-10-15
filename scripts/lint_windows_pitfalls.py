@@ -19,8 +19,12 @@ neutralized globally by cli._harden_std_streams, which points a None stdout/
 stderr at os.devnull at the top of main(). Re-add a targeted check only if that
 hardening is ever removed.)
 
-Advisory by default (exit 0). `--strict` exits 1 on any finding — wire into the
-ruff-clean gate / release_preflight if you want it blocking.
+A finding that was reviewed and is safe (a backend that never runs on Windows, the one
+sanctioned hard-kill helper) carries `# windows-lint: ok -- <reason>` inside the call or on the
+`os.kill(` line, so the exemption and its reason sit at the site, not in this script.
+
+Advisory by default (exit 0). `--strict` exits 1 on any finding. `release_preflight.sh` and
+`tests/unit/scripts/test_lint_windows_pitfalls.py` both enforce a clean tree (#363).
 """
 from __future__ import annotations
 
@@ -29,19 +33,19 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-BRAIN = ROOT / "brain"
+_OK_MARKER = "windows-lint: ok"
 
 _SPAWN_RE = re.compile(r"subprocess\.(?:run|Popen|call|check_output|check_call)\s*\(")
 
 
-def _py_files():
-    return [p for p in BRAIN.rglob("*.py") if "__pycache__" not in p.parts]
+def _py_files(root: Path):
+    return [p for p in (root / "brain").rglob("*.py") if "__pycache__" not in p.parts]
 
 
-def scan() -> list[str]:
+def scan(root: Path = ROOT) -> list[str]:
     findings: list[str] = []
-    for path in _py_files():
-        rel = str(path.relative_to(ROOT))
+    for path in _py_files(root):
+        rel = path.relative_to(root).as_posix()
         text = path.read_text(encoding="utf-8")
         lines = text.splitlines()
 
@@ -52,7 +56,7 @@ def scan() -> list[str]:
             span = text[start : start + 500]  # ~the call's arg list
             lineno = text.count("\n", 0, start) + 1
             uses_text = "text=True" in span or "universal_newlines=True" in span
-            if uses_text and "encoding=" not in span:
+            if uses_text and "encoding=" not in span and _OK_MARKER not in span:
                 findings.append(
                     f"{rel}:{lineno}: text-mode subprocess spawn without encoding= — "
                     f"Windows default is not UTF-8. Pass encoding='utf-8'."
@@ -72,6 +76,8 @@ def scan() -> list[str]:
             before = line[:idx]
             if '"' in before or "'" in before or "#" in before or "``" in line:
                 continue  # docstring / comment / backtick-doc mention
+            if _OK_MARKER in line:
+                continue  # reviewed, with the reason on the line
             if re.search(r"os\.kill\([^,]+,\s*0\s*\)", line[idx:]):
                 if rel.endswith("bridge/state_file.py"):
                     continue  # the sanctioned, os.name-guarded probe

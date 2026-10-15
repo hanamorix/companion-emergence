@@ -211,7 +211,7 @@ def run_systemctl(args: list[str]) -> subprocess.CompletedProcess[str]:
     FileNotFoundError everywhere.
     """
     try:
-        return subprocess.run(  # noqa: S603
+        return subprocess.run(  # noqa: S603  # windows-lint: ok -- systemd is Linux-only
             ["systemctl", "--user", *args],
             capture_output=True,
             text=True,

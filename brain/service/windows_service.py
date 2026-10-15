@@ -383,6 +383,10 @@ def run_schtasks(args: list[str]) -> subprocess.CompletedProcess[str]:
             ["schtasks", *args],
             capture_output=True,
             text=True,
+            # Windows' default subprocess codec is not UTF-8; schtasks writes in the console's
+            # OEM code page, so a strict decode could raise on a non-ASCII task name (#363).
+            encoding="utf-8",
+            errors="replace",
             timeout=15,
             check=False,
         )
