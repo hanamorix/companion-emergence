@@ -61,6 +61,8 @@ export type RestartState =
 export interface UseRestartBridge {
   state: RestartState;
   errorDetail: string | null;
+  /** Why the graceful restart gave up and escalated to a forced one (#365), else null. */
+  fellThrough: string | null;
   restart: () => Promise<boolean>;
   onModeChanged: (mode: PersonaState["mode"]) => void;
 }
@@ -111,9 +113,10 @@ const FAILED_USER_MESSAGE =
 // so its restart is too. `inFlight` is the running restart, which later callers
 // join.
 // ponytail: one bridge per app, so one store; key by persona if that changes.
-let shared: { state: RestartState; errorDetail: string | null } = {
+let shared: { state: RestartState; errorDetail: string | null; fellThrough: string | null } = {
   state: "idle",
   errorDetail: null,
+  fellThrough: null,
 };
 let inFlight: Promise<boolean> | null = null;
 const listeners = new Set<() => void>();
@@ -139,12 +142,12 @@ function setErrorDetail(detail: string | null): void {
 /** Back to idle after a restart nobody pressed (the launch path, #335), so the
  *  Restart button doesn't show its result. A no-op while a restart runs. */
 export function clearRestartState(): void {
-  if (!inFlight) setShared({ state: "idle", errorDetail: null });
+  if (!inFlight) setShared({ state: "idle", errorDetail: null, fellThrough: null });
 }
 
 /** Reset for test isolation — never call in production code. */
 export function _resetRestartBridgeForTests(): void {
-  shared = { state: "idle", errorDetail: null };
+  shared = { state: "idle", errorDetail: null, fellThrough: null };
   inFlight = null;
 }
 
@@ -152,23 +155,39 @@ export function _resetRestartBridgeForTests(): void {
  *  component mounts (the launch path, #335) can call it; the hook wraps it. */
 export function restartBridge(persona: string): Promise<boolean> {
   if (inFlight) return inFlight;
-  setErrorDetail(null);
+  setShared({ errorDetail: null, fellThrough: null });
 
   const run = async (): Promise<boolean> => {
     try {
       // Try graceful snapshot → shutdown → ensureBridgeRunning → health.
       // Any timeout on snapshot escalates to SIGKILL fallback.
       // A second health-poll failure → failed.
+      // Escalating is intended, but the cause used to vanish (#365). Keep it in state (the
+      // button shows it) and in the console, so "graceful is usually a hard kill" can be told
+      // from "the bridge was already dead".
+      const fellThrough = (step: string, e: unknown): false => {
+        const reason = `${step}: ${errString(e)}`;
+        console.warn(`[restartBridge] graceful restart fell through to a forced restart (${reason})`);
+        setShared({ fellThrough: reason });
+        return false;
+      };
+
       const tryGraceful = async (): Promise<boolean> => {
         transition("closing");
+        const snapshotStart = Date.now();
         try {
           await withTimeout(
             snapshotActiveSession(persona),
             TIMEOUT_CLOSE_MS,
             "/sessions/snapshot",
           );
-        } catch {
-          return false;
+          // The snapshot can run an LLM extraction under the session lock; this is the number
+          // that says how close "graceful" runs to its 5 s budget.
+          console.info(
+            `[restartBridge] /sessions/snapshot took ${Date.now() - snapshotStart}ms of ${TIMEOUT_CLOSE_MS}ms`,
+          );
+        } catch (e) {
+          return fellThrough("closing the conversation", e);
         }
 
         transition("shutting_down");
@@ -190,15 +209,15 @@ export function restartBridge(persona: string): Promise<boolean> {
         transition("reconnecting");
         try {
           await ensureBridgeRunning(persona);
-        } catch {
-          return false;
+        } catch (e) {
+          return fellThrough("starting a fresh bridge", e);
         }
 
         transition("waiting_for_health");
         try {
           await pollHealth(persona, Date.now() + TIMEOUT_HEALTH_MS);
-        } catch {
-          return false;
+        } catch (e) {
+          return fellThrough("waiting for the new bridge's /health", e);
         }
         // Bridge is healthy — move to reconnecting so the parent's
         // live-mode flip (onModeChanged / prop-effect) can resolve to success.
@@ -252,7 +271,7 @@ export function useRestartBridge(
   persona: string,
   currentMode: PersonaState["mode"],
 ): UseRestartBridge {
-  const { state, errorDetail } = useSyncExternalStore(subscribe, () => shared);
+  const { state, errorDetail, fellThrough } = useSyncExternalStore(subscribe, () => shared);
 
   const restart = useCallback(() => restartBridge(persona), [persona]);
 
@@ -275,5 +294,5 @@ export function useRestartBridge(
     }
   }, [currentMode, state]);
 
-  return { state, errorDetail, restart, onModeChanged };
+  return { state, errorDetail, fellThrough, restart, onModeChanged };
 }

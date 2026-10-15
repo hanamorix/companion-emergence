@@ -54,6 +54,7 @@ function mockRestart(...results: boolean[]): ReturnType<typeof vi.fn> {
   vi.mocked(useRestartBridgeModule.useRestartBridge).mockReturnValue({
     state: "idle",
     errorDetail: null,
+    fellThrough: null,
     restart,
     onModeChanged: vi.fn(),
   });

@@ -19,10 +19,15 @@ import {
 
 const mockedHook = vi.mocked(useRestartBridge);
 
-function returnState(state: RestartState, errorDetail: string | null = null) {
+function returnState(
+  state: RestartState,
+  errorDetail: string | null = null,
+  fellThrough: string | null = null,
+) {
   return {
     state,
     errorDetail,
+    fellThrough,
     restart: vi.fn(),
     onModeChanged: vi.fn(),
   };
@@ -98,5 +103,15 @@ describe("RestartBridgeButton", () => {
     expect(screen.getByText(/nell service status/i)).toBeInTheDocument();
     // And the button reverts to a retry affordance.
     expect(screen.getByRole("button")).toHaveTextContent(/retry/i);
+  });
+
+  it("(#365) says why the graceful restart gave up while the forced one runs", () => {
+    mockedHook.mockReturnValue(
+      returnState("forcing", null, "closing the conversation: /sessions/snapshot timed out after 5000ms"),
+    );
+    render(<RestartBridgeButton persona="p" currentMode="bridge_down" />);
+    expect(screen.getByText(/graceful restart gave up/i)).toHaveTextContent(
+      /\/sessions\/snapshot timed out after 5000ms/,
+    );
   });
 });

@@ -9,7 +9,13 @@ import { renderHook, act, waitFor, cleanup } from "@testing-library/react";
 
 import * as bridge from "../bridge";
 import * as appConfig from "../appConfig";
-import { _resetRestartBridgeForTests, clearRestartState, restartBridge, useRestartBridge } from "./useRestartBridge";
+import {
+  _resetRestartBridgeForTests,
+  clearRestartState,
+  restartBridge,
+  TIMEOUT_HEALTH_MS,
+  useRestartBridge,
+} from "./useRestartBridge";
 
 const PERSONA = "test-persona";
 
@@ -107,6 +113,93 @@ describe("useRestartBridge", () => {
 
     expect(forceMock).toHaveBeenCalledWith(PERSONA);
     expect(result.current.state).toBe("reconnecting");
+  });
+
+  it("(#365) records why the graceful path fell through, in state and in the console", async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(bridge, "snapshotActiveSession").mockImplementation(
+      () => new Promise<Response>(() => {}),
+    );
+    vi.spyOn(bridge, "invokeForceRestart").mockResolvedValue();
+    vi.spyOn(bridge, "fetchHealth").mockResolvedValue({ liveness: "ok" });
+
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    act(() => {
+      result.current.restart();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5500);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(600);
+    });
+
+    const reason = result.current.fellThrough;
+    expect(reason).toMatch(/snapshot/i);
+    expect(reason).toMatch(/timed out after 5000ms/);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("graceful restart fell through"));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(reason!));
+  });
+
+  it("(#365) records a failure to start a fresh bridge as the reason for escalating", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(bridge, "snapshotActiveSession").mockResolvedValue(jsonResponse(200));
+    vi.spyOn(bridge, "shutdownBridge").mockResolvedValue(jsonResponse(202));
+    vi.spyOn(appConfig, "ensureBridgeRunning").mockRejectedValue(new Error("spawn EACCES"));
+    vi.spyOn(bridge, "invokeForceRestart").mockResolvedValue();
+    vi.spyOn(bridge, "fetchHealth").mockResolvedValue({ liveness: "ok" });
+
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    await act(async () => {
+      await result.current.restart();
+    });
+
+    expect(result.current.fellThrough).toMatch(/starting a fresh bridge: spawn EACCES/);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("spawn EACCES"));
+  });
+
+  it("(#365) records a health poll that never answers as the reason for escalating", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(bridge, "snapshotActiveSession").mockResolvedValue(jsonResponse(200));
+    vi.spyOn(bridge, "shutdownBridge").mockResolvedValue(jsonResponse(202));
+    vi.spyOn(appConfig, "ensureBridgeRunning").mockResolvedValue(undefined);
+    // the graceful poll fails, then the forced restart's poll succeeds
+    let calls = 0;
+    vi.spyOn(bridge, "fetchHealth").mockImplementation(async () => {
+      calls += 1;
+      if (calls <= 70) throw new Error("connection refused");
+      return { liveness: "ok" };
+    });
+    vi.spyOn(bridge, "invokeForceRestart").mockResolvedValue();
+
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    act(() => {
+      result.current.restart();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(TIMEOUT_HEALTH_MS + 1000);
+    });
+
+    expect(result.current.fellThrough).toMatch(/waiting for the new bridge's \/health: \/health poll window expired/);
+  });
+
+  it("(#365) logs how long the snapshot took against its 5 s budget", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    vi.spyOn(bridge, "snapshotActiveSession").mockResolvedValue(jsonResponse(200));
+    vi.spyOn(bridge, "shutdownBridge").mockResolvedValue(jsonResponse(202));
+    vi.spyOn(appConfig, "ensureBridgeRunning").mockResolvedValue(undefined);
+    vi.spyOn(bridge, "fetchHealth").mockResolvedValue({ liveness: "ok" });
+    vi.spyOn(bridge, "invokeForceRestart").mockResolvedValue();
+
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    await act(async () => {
+      await result.current.restart();
+    });
+
+    expect(info).toHaveBeenCalledWith(expect.stringMatching(/\/sessions\/snapshot took \d+ms of 5000ms/));
+    expect(result.current.fellThrough).toBeNull();
   });
 
   it("/supervisor/shutdown timeout escalates to forcing → reconnecting", async () => {

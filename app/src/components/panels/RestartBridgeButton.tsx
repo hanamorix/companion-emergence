@@ -31,7 +31,7 @@ const LABELS: Record<RestartState, string> = {
 };
 
 export function RestartBridgeButton({ persona, currentMode }: Props) {
-  const { state, errorDetail, restart } = useRestartBridge(persona, currentMode);
+  const { state, errorDetail, fellThrough, restart } = useRestartBridge(persona, currentMode);
   const interactive = state === "idle" || state === "failed";
 
   return (
@@ -56,6 +56,19 @@ export function RestartBridgeButton({ persona, currentMode }: Props) {
       >
         {LABELS[state]}
       </button>
+      {(state === "forcing" || state === "failed") && fellThrough && (
+        <div
+          style={{
+            fontSize: 10,
+            color: "var(--text-mute)",
+            marginTop: 6,
+            lineHeight: 1.45,
+            wordBreak: "break-word",
+          }}
+        >
+          Graceful restart gave up: {fellThrough}
+        </div>
+      )}
       {state === "failed" && errorDetail && (
         <div
           style={{

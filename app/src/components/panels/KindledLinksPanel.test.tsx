@@ -258,4 +258,19 @@ describe("KindledLinksPanel — transcript ordering", () => {
     expect(idxOne).toBeLessThan(idxTwo);
     expect(idxTwo).toBeLessThan(idxThree);
   });
+
+  it("shows why a revoke failed instead of leaving the button to re-enable silently (#365)", async () => {
+    const { fetchKindledPeers, setKindledConsent } = await import("../../bridge");
+    vi.mocked(fetchKindledPeers).mockResolvedValue([makePeer("paired")]);
+    vi.mocked(setKindledConsent).mockRejectedValue(new Error("403 forbidden"));
+    render(<KindledLinksPanel persona="nell" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /revoke kid_a/i }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/couldn't revoke kid_a/i);
+    expect(alert).toHaveTextContent(/403 forbidden/);
+    // the button is usable again so the user can retry
+    await waitFor(() => expect(screen.getByRole("button", { name: /revoke kid_a/i })).toBeEnabled());
+  });
 });
