@@ -107,12 +107,15 @@ def test_tools_branch_over_budget_reply_keeps_the_turns_dispatched_invocations(t
     # The budget is the backstop for runaway tool loops, so an overrun turn has nearly always run brain
     # tools. Dropping their records dropped image binding, the pass-2 monologue and the turn's
     # tool_invocations out of run_tool_loop (the streaming proxy reads them whatever the reply says).
-    # The log also holds a row from an EARLIER turn (before the offset) and one carrying a FOREIGN request_id
-    # (another session): only this call's own row may come back, so the read must use the offset and the id.
+    # The log also holds a row from an EARLIER turn and one carrying a FOREIGN request_id (another session): only
+    # this call's own row may come back, so the read must use the offset AND the id. The earlier row has NO
+    # request_id on purpose: that is what the streaming path writes (it never stamps one) and the reader admits
+    # id-less rows, so on a real persona the offset alone keeps them out - a row with an id would be dropped by
+    # the id filter and leave the offset unenforced.
     persona_dir = _persona(tmp_path)
     log = persona_dir / "tool_invocations.log.jsonl"
     log.write_text(
-        json.dumps({"name": "earlier_turn_tool", "arguments": {}, "result_summary": "{}", "request_id": "old"}) + "\n",
+        json.dumps({"name": "earlier_turn_tool", "arguments": {}, "result_summary": "{}"}) + "\n",
         encoding="utf-8",
     )
     ours = _mcp_row_during_run(persona_dir)
@@ -292,15 +295,28 @@ def test_run_tool_loop_keeps_the_invocations_of_an_over_budget_turn(tmp_path):
     assert [i["name"] for i in invocations] == ["search_memories"]
 
 
-def test_text_branch_without_a_persona_dir_is_graceful_and_writes_nothing(tmp_path):
+def test_text_branch_without_a_persona_dir_is_graceful_and_writes_nothing(tmp_path, monkeypatch):
     # run_tool_loop's forced final pass: `json` argv, no persona_dir, so no usage row and no audit rows - and, with
     # the CLI exiting 1 on an overrun, still the graceful reply. Under `json` the CLI prints ONE result object, so
     # the stdout here is the fixture's result line alone (real boundary), not the stream.
+    # The provider never learns `persona_dir` here, so the empty-directory asserts below hold for any code; the
+    # spies pin the real claim: both writers are handed no directory at all, not a default one.
+    from brain.bridge import provider as provider_mod
+
+    dirs: dict[str, list] = {"log_usage": [], "flush": []}
+    real_log_usage, real_flush = provider_mod.log_usage, provider_mod._flush_builtin_audit
+    monkeypatch.setattr(
+        provider_mod, "log_usage", lambda d, *a, **kw: (dirs["log_usage"].append(d), real_log_usage(d, *a, **kw))[1]
+    )
+    monkeypatch.setattr(
+        provider_mod, "_flush_builtin_audit", lambda d, *a, **kw: (dirs["flush"].append(d), real_flush(d, *a, **kw))[1]
+    )
     persona_dir = _persona(tmp_path)
     resp, run, seen = _text_branch(persona_dir, _stdout().strip().split("\n")[-1], returncode=1, options={})
 
     assert run.called and seen["cmd"][seen["cmd"].index("--output-format") + 1] == "json"
     assert "--verbose" not in seen["cmd"]
     assert resp.content == _BUDGET_EXCEEDED_MSG
+    assert dirs == {"log_usage": [None], "flush": [None]}
     assert _usage_rows(persona_dir) == []
     assert _rows(persona_dir) == []
