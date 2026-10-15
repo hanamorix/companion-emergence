@@ -59,9 +59,9 @@ _inflight_lock = threading.Lock()
 
 # Test seam: True stops `start_background`, `request_rerank_bootstrap` and
 # `on_incoming_message` from spawning threads (the flag/failure bookkeeping
-# still happens). The test
-# suite's autouse fixture sets it so a recall or a `respond()` in an unrelated
-# test never leaks a background thread; production never touches it.
+# still happens). The test suite's autouse fixture sets it so a recall or a
+# `respond()` in an unrelated test never leaks a background thread; production
+# never touches it.
 _background_inhibited = False
 
 # The chat-activity marker the background starters record on a failure (the

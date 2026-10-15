@@ -1011,17 +1011,25 @@ def test_the_repl_still_runs_the_floor_bootstrap_on_its_background_thread(
     calls: list[tuple[Path, str, bool, bool, set[str]]] = []
 
     def _record(persona_dir, *, activity_marker=None, _registered=False):
-        me = threading.current_thread()
-        calls.append((persona_dir, me.name, me.daemon, _registered, _schema_state(persona_dir)[1]))
-        ran.set()
+        try:
+            me = threading.current_thread()
+            tables = _schema_state(persona_dir)[1]
+            calls.append((persona_dir, me.name, me.daemon, _registered, tables))
+        finally:
+            ran.set()
+
+    def _exit_once_the_bootstrap_has_run(_prompt: str = "") -> str:
+        # The REPL (and with it the open store) stays up until the thread has read the
+        # database, so that read can never race the store closing.
+        assert ran.wait(10), "the background bootstrap never ran"
+        return "exit"
 
     monkeypatch.setattr(floor_startup, "compute_missing_floors", _record)
     reset_registry()
-    with patch("builtins.input", side_effect=["exit"]):
+    with patch("builtins.input", side_effect=_exit_once_the_bootstrap_has_run):
         assert main(["chat", "--persona", "nell", "--no-bridge"]) == 0
     reset_registry()
 
-    assert ran.wait(10), "the background bootstrap never ran"
     for thread in threading.enumerate():
         if thread.name == "floor-bootstrap-direct-chat":
             thread.join(timeout=10)
