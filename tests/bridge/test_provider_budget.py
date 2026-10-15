@@ -1,8 +1,10 @@
 """Per-reply --max-budget-usd catastrophe backstop (Task 6 / A).
 
-Spike-verified frame: an over-budget run returns (exit 0) a result JSON with
-``"subtype": "error_max_budget_usd"``, ``"is_error": true``,
-``"errors": ["Reached maximum budget ($X)"]``.
+Frame shape (2026-06 spike): a result JSON with ``"subtype": "error_max_budget_usd"``,
+``"is_error": true``, ``"errors": ["Reached maximum budget ($X)"]``. The 2026-06 spike saw it
+at exit 0; claude 2.1.295 / 2.1.300 exit **1** (#399; ledger row "Over-budget stop"), which
+``test_provider_budget_exit.py`` replays with the real frame. The stubs below keep exit 0:
+the graceful path does not depend on the exit code.
 
 Tests added one at a time per the tdd-guard rule.
 """

@@ -81,6 +81,9 @@ _BUDGET_FALLBACK: float = tunables.register("provider.max_turn_budget_usd.fallba
 # (a 5000-digit run) or RecursionError (nesting beyond the recursion limit). JSONDecodeError is a ValueError.
 _JSON_LINE_ERRORS: tuple[type[BaseException], ...] = (ValueError, RecursionError)
 
+# The result-frame subtype the CLI reports when --max-budget-usd stops a turn (exit code 1).
+_BUDGET_SUBTYPE: str = "error_max_budget_usd"
+
 # Graceful message when the CLI hits the per-turn ceiling mid-reply.
 _BUDGET_EXCEEDED_MSG: str = (
     "I reached this turn's work limit before I finished — "
@@ -717,6 +720,20 @@ def _system_prompt_tempfile(text: str | None) -> Iterator[str | None]:
             pass
 
 
+def _is_over_budget_frame(frame: dict) -> bool:
+    """True for the result frame the CLI emits when --max-budget-usd stops a turn.
+
+    The one definition: `subtype == "error_max_budget_usd"`, or an `is_error` frame whose `errors`
+    say "maximum budget". Total: a malformed `errors` (None, a number, a string, a dict) counts as no
+    errors, so a frame can never raise here.
+    """
+    errors = frame.get("errors")
+    return frame.get("subtype") == _BUDGET_SUBTYPE or bool(
+        frame.get("is_error")
+        and any("maximum budget" in str(e).lower() for e in (errors if isinstance(errors, list) else []))
+    )
+
+
 def _cli_error_detail(payload: dict) -> str | None:
     """Detail for a result frame that reports failure, or None if it is fine.
 
@@ -733,9 +750,7 @@ def _cli_error_detail(payload: dict) -> str | None:
     if not payload.get("is_error"):
         provider_auth.note_cli_success()  # #246: a clean frame is the recovery signal
         return None
-    if payload.get("subtype") == "error_max_budget_usd" or any(
-        "maximum budget" in str(e).lower() for e in (payload.get("errors") or [])
-    ):
+    if _is_over_budget_frame(payload):
         return None
     detail = str(payload.get("result") or "").strip()
     detail = detail[:200] if detail else f"is_error with no result text: {payload!r}"[:200]
@@ -1030,17 +1045,13 @@ class ClaudeCliProvider(LLMProvider):
             try:
                 if payload is None:
                     raise ValueError("no result frame")
-                if payload.get("subtype") == "error_max_budget_usd" or (
-                    payload.get("is_error")
-                    and any(
-                        "maximum budget" in str(e).lower()
-                        for e in payload.get("errors", [])
-                    )
-                ):
+                if _is_over_budget_frame(payload):
                     partial = str(payload.get("result", "")).strip()
                     text = (
                         f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}" if partial else _BUDGET_EXCEEDED_MSG
                     )
+                    # #399: the over-budget turn is the costliest one; log it as the streaming path does.
+                    log_usage(audit_dir, call_type="chat", model=self._model, frame=payload)
                     return ChatResponse(content=text, tool_calls=(), raw=payload)
                 cli_err = _cli_error_detail(payload)
                 if cli_err is not None:
@@ -1349,13 +1360,7 @@ class ClaudeCliProvider(LLMProvider):
                         log_usage(persona_dir, call_type="chat", model=self._model, frame=obj)
                         # Over-budget catastrophe backstop: the CLI hit --max-budget-usd.
                         # Flush any partial text already streamed + append the cut-off note.
-                        if obj.get("subtype") == "error_max_budget_usd" or (
-                            obj.get("is_error")
-                            and any(
-                                "maximum budget" in str(e).lower()
-                                for e in obj.get("errors", [])
-                            )
-                        ):
+                        if _is_over_budget_frame(obj):
                             partial = "".join(delta_chunks).strip() or result_text.strip()
                             cutoff = (
                                 f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}"
@@ -1455,7 +1460,12 @@ class ClaudeCliProvider(LLMProvider):
         # built-in calls it saw.
         payload = _scan_blocking_stream_stdout(result.stdout, builtin_calls)
 
-        if result.returncode != 0:
+        # #399: the real CLI exits 1 on a --max-budget-usd overrun (both output formats), with a
+        # result frame saying so. That is the graceful path's input, not a failure: the callers
+        # turn the frame into the budget reply. Keyed on the subtype alone - every real frame
+        # carries it - so no other non-zero exit is swallowed.
+        over_budget = payload is not None and payload.get("subtype") == _BUDGET_SUBTYPE
+        if result.returncode != 0 and not over_budget:
             raise ProviderError(
                 "claude_cli_exit",
                 f"exit {result.returncode}: {_claude_failure_detail(result)}",
@@ -1571,18 +1581,25 @@ class ClaudeCliProvider(LLMProvider):
             try:
                 if payload is None:
                     raise ValueError("no result frame")
-                if payload.get("subtype") == "error_max_budget_usd" or (
-                    payload.get("is_error")
-                    and any(
-                        "maximum budget" in str(e).lower()
-                        for e in payload.get("errors", [])
-                    )
-                ):
+                if _is_over_budget_frame(payload):
                     partial = str(payload.get("result", "")).strip()
                     text = (
                         f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}" if partial else _BUDGET_EXCEEDED_MSG
                     )
-                    return ChatResponse(content=text, tool_calls=(), raw=payload)
+                    # #399: the over-budget turn is the costliest one; log it as the streaming path does.
+                    log_usage(persona_dir, call_type="chat", model=self._model, frame=payload)
+                    # The tools that ran before the stop are real (the budget is the backstop for
+                    # runaway tool loops): keep their records, as the success path does.
+                    return ChatResponse(
+                        content=text,
+                        tool_calls=(),
+                        dispatched_invocations=tuple(
+                            _read_audit_lines_since(
+                                audit_log_path, audit_offset_before, request_id=request_id
+                            )
+                        ),
+                        raw=payload,
+                    )
                 cli_err = _cli_error_detail(payload)
                 if cli_err is not None:
                     raise ProviderError("claude_cli_error", cli_err)
