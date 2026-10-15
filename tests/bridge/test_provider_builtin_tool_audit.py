@@ -1740,32 +1740,56 @@ def test_stdout_shape_prints_only_short_charset_valid_kinds():
 
     frames = [
         {"type": 5},  # not a string
-        {"type": "x" * 21},  # one char over the 20-char cap
+        {"type": "x" * 41},  # one char over the 40-char cap
         {"type": "free text with spaces"},
         {"type": "system", "subtype": "has space"},
         {"type": "system", "subtype": ["hook"]},
         {"type": "system", "subtype": "init"},
-        {"type": "ok", "subtype": "y" * 20},
+        {"type": "ok", "subtype": "y" * 40},  # exactly at the cap: kept
     ]
     shape = _stdout_shape("\n".join(json.dumps(f) for f in frames))
 
     assert shape == (
-        "7 frame(s), last=ok/" + "y" * 20 + ": ? x3, system/? x2, system/init x1, ok/" + "y" * 20 + " x1"
+        "7 frame(s), last=ok/" + "y" * 40 + ": ? x3, system/? x2, system/init x1, ok/" + "y" * 40 + " x1"
     )
+
+
+@pytest.mark.parametrize(
+    "subtype",
+    [
+        "success",
+        "error_max_turns",
+        "error_max_budget_usd",  # 20 chars: the old cap's exact edge
+        "error_during_execution",  # 22: the review of #402 reproduced this one bucketed to `?`
+        "error_max_structured_output_retries",  # 35: the longest the CLI emits (strings of 2.1.300)
+    ],
+)
+def test_stdout_shape_names_every_result_subtype_the_cli_emits(subtype):
+    """The failure detail must keep the one word that names the failure.
+
+    The kind vocabulary is the CLI's own, so a cap picked against the subtypes seen so far
+    silently turned a longer one into `?` (no privacy gain: the charset is already enforced).
+    """
+    from brain.bridge.provider import _stdout_shape
+
+    shape = _stdout_shape(json.dumps({"type": "result", "subtype": subtype, "errors": ["boom"]}))
+
+    assert shape == f"1 frame(s), last=result/{subtype}: result/{subtype} x1"
 
 
 def test_stdout_shape_lists_at_most_eight_kinds_and_stays_bounded():
     from brain.bridge.provider import _stdout_shape
 
-    # 12 distinct max-length (20/20), charset-valid kinds: the review's F3 case.
-    kinds = [(f"t{i:019d}", f"s{i:019d}") for i in range(12)]
+    # 12 distinct max-length (40/40), charset-valid kinds: the review's F3 case.
+    kinds = [(f"t{i:039d}", f"s{i:039d}") for i in range(12)]
     frames = [{"type": t, "subtype": s} for t, s in (kinds[n % 12] for n in range(20_000))]
     shape = _stdout_shape("\n".join(json.dumps(f) for f in frames))
 
     assert shape.startswith("20000 frame(s), last=")
     assert shape.count(" x") == 8  # eight kinds with counts ...
     assert shape.endswith(", +4 more")  # ... and the rest summarised
-    assert len(shape) <= 600
+    # 8 kinds x (40 + "/" + 40 + " x" + a 4-digit count) + separators + the last-kind prefix: ~830 at the cap
+    assert len(shape) <= 900
 
 
 def test_stdout_shape_counts_other_lines_without_printing_them():

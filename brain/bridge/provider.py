@@ -1695,13 +1695,16 @@ def _partial_stdout_text(raw: bytes | str | None) -> str:
     return raw if isinstance(raw, str) else ""
 
 
-_FRAME_KIND_RE = re.compile(r"[A-Za-z0-9_.-]{1,20}")
+# The CLI's own `type`/`subtype` words. 40 covers its longest (`error_max_structured_output_retries`,
+# 35, in 2.1.300) with margin; a cap picked against the subtypes first seen turned
+# `error_during_execution` (22) into `?`. The charset, not the length, is what keeps text out.
+_FRAME_KIND_RE = re.compile(r"[A-Za-z0-9_.-]{1,40}")
 _SHAPE_MAX_KINDS = 8
 
 
 def _frame_kind_part(value: Any) -> str:
     """A frame's `type` or `subtype` as it may be printed: only the CLI's own short
-    vocabulary (<= 20 chars of [A-Za-z0-9_.-]); anything else is the fixed `?`."""
+    vocabulary (<= 40 chars of [A-Za-z0-9_.-]); anything else is the fixed `?`."""
     return value if isinstance(value, str) and _FRAME_KIND_RE.fullmatch(value) else "?"
 
 
