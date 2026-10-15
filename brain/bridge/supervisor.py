@@ -2256,7 +2256,7 @@ def _run_narrative_memory_pass(
     # is only exercised on the (slow) soul-review cadence.
     from brain.felt_time import FeltTime
     from brain.felt_time.anchors import scan_since as anchors_scan_since
-    from brain.forgetting import _load_soul_linked_ids
+    from brain.forgetting import SoulExemptionsUnavailableError, _load_soul_linked_ids
     from brain.forgetting.policy import is_exempt as forgetting_is_exempt
     from brain.forgetting.salience import score as forgetting_salience
     from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
@@ -2360,6 +2360,15 @@ def _run_narrative_memory_pass(
         adapted.sort(key=lambda a: a.ts_iso)
         return adapted
 
+    # Soul-linked ids. Fail closed like the forgetting pass (#392): arcs built on an empty exemption
+    # set would pull soul-linked memories in, so skip. Read before any store is opened so a skip
+    # does no work; the next maintenance run tries again.
+    try:
+        crystallised_ids, under_review_ids = _load_soul_linked_ids(persona_dir)
+    except SoulExemptionsUnavailableError as exc:
+        logger.warning("narrative-memory pass: %s; skipping this pass", exc)
+        return
+
     with ExitStack() as stack:
         store = MemoryStore(persona_dir / "memories.db")
         stack.callback(store.close)
@@ -2370,8 +2379,6 @@ def _run_narrative_memory_pass(
         # FeltTime read — get_state() is cheap, doesn't tick.
         felt_time_state = FeltTime(persona_dir=persona_dir).get_state()
 
-        # Soul-linked ids — best-effort, mirrors forgetting wrapper.
-        crystallised_ids, under_review_ids = _load_soul_linked_ids(persona_dir)
         soul_linked = crystallised_ids | under_review_ids
 
         class _EmbeddingsByMemoryId:

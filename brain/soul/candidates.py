@@ -7,16 +7,12 @@ to an active (under-review) soul candidate.
 
 from __future__ import annotations
 
-import logging
-from collections.abc import Callable
 from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from brain.soul.store import SoulStore
-
-logger = logging.getLogger(__name__)
 
 # Statuses that mean a candidate is actively pending a review decision.
 # ONLY these statuses protect the linked memory from the forgetting engine.
@@ -35,8 +31,7 @@ def list_under_review_memory_ids(persona_dir: Path) -> list[str]:
 
     A missing file → empty list; corrupt lines are skipped by the reader. A real
     read failure (permissions, I/O) is NOT swallowed here: the caller
-    (``brain.forgetting._load_soul_linked_ids``) owns the fail-soft fallback and
-    logs it (#370).
+    (``brain.forgetting._load_soul_linked_ids``) logs it and skips its pass (#370, #392).
     """
     from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
 
@@ -52,20 +47,6 @@ def list_under_review_memory_ids(persona_dir: Path) -> list[str]:
             if mid:
                 ids.append(mid)
     return ids
-
-
-def _one_source(what: str, read: Callable[[], list[str]]) -> list[str]:
-    """Run one source of crystallised ids. A failure is logged and costs only that source."""
-    try:
-        return read()
-    except Exception:
-        logger.warning(
-            "soul-crystallised memory ids: could not read %s; the memories it protects "
-            "are NOT exempt this pass",
-            what,
-            exc_info=True,
-        )
-        return []
 
 
 def _accepted_candidate_ids(persona_dir: Path, store: SoulStore | None) -> list[str]:
@@ -108,11 +89,9 @@ def list_crystallised_memory_ids(persona_dir: Path) -> list[str]:
     Candidate ids come first, then direct links (sorted by memory id), de-duplicated.
     Reading never creates ``crystallizations.db``.
 
-    Each source fails on its own: one that cannot be read is logged and contributes nothing,
-    so a bad link table cannot take the accepted-candidate protection down, nor an unreadable
-    candidates file the direct links. If ``crystallizations.db`` itself cannot be opened the
-    error propagates, and the caller (``brain.forgetting._load_soul_linked_ids``) owns the
-    fail-soft fallback and logs it.
+    A source that cannot be read raises. Returning what the other source found would look like a
+    complete answer, and the caller would run its pass with the missing memories un-exempt, so the
+    caller (``brain.forgetting._load_soul_linked_ids``) logs it and skips the pass instead (#392).
     """
     db_path = persona_dir / "crystallizations.db"
     with ExitStack() as stack:
@@ -121,11 +100,6 @@ def list_crystallised_memory_ids(persona_dir: Path) -> list[str]:
             from brain.soul.store import SoulStore
 
             store = stack.enter_context(SoulStore(db_path))
-        candidate_ids = _one_source(
-            "accepted candidates", lambda: _accepted_candidate_ids(persona_dir, store)
-        )
-        linked = _one_source(
-            "direct crystallisation links",
-            lambda: store.list_active_source_memory_ids() if store else [],
-        )
+        candidate_ids = _accepted_candidate_ids(persona_dir, store)
+        linked = store.list_active_source_memory_ids() if store else []
     return candidate_ids + [mid for mid in linked if mid not in candidate_ids]

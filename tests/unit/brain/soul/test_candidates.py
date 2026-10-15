@@ -4,8 +4,11 @@ protect their memory from forgetting (#362)."""
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
 
 from brain.soul.candidates import list_crystallised_memory_ids
 from brain.soul.crystallization import Crystallization
@@ -89,25 +92,20 @@ def test_candidate_ids_first_then_direct_links_sorted_deduplicated_revoked_dropp
     assert list_crystallised_memory_ids(tmp_path) == ["m-cand", "m-a", "m-z"]
 
 
-def test_an_unreadable_candidates_file_does_not_drop_the_direct_links(tmp_path, caplog):
-    """Each source fails on its own: a real read failure on soul_candidates.jsonl (a directory where the
-    file should be) must cost only the candidate source, loudly, and leave the direct links protecting."""
-    import logging
-
+def test_an_unreadable_candidates_file_raises_rather_than_returning_the_direct_links_alone(tmp_path):
+    """#392: a real read failure on soul_candidates.jsonl (a directory where the file should be) must reach
+    the caller. Returning just the direct links would look like a complete answer, and the caller
+    (brain.forgetting) would run a pass with the accepted candidates un-exempt."""
     (tmp_path / "soul_candidates.jsonl").mkdir()
     _link_directly(tmp_path, "m-direct")
 
-    with caplog.at_level(logging.WARNING):
-        assert list_crystallised_memory_ids(tmp_path) == ["m-direct"]
-
-    assert any("crystallised" in r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
+    with pytest.raises(OSError):
+        list_crystallised_memory_ids(tmp_path)
 
 
-def test_a_broken_link_table_does_not_drop_the_accepted_candidates(tmp_path, caplog):
-    """The other direction: the new crystallization_sources table is the only thing this reader gained, so a
-    malformed one must not take the accepted-candidate protection (which worked before #371) down with it."""
-    import logging
-
+def test_a_broken_link_table_raises_rather_than_returning_the_accepted_candidates_alone(tmp_path):
+    """The other direction: a malformed crystallization_sources table must reach the caller, not be
+    papered over with the accepted candidates alone."""
     _write_candidates(tmp_path, [{"memory_id": "m-cand", "status": "accepted"}])
     store = SoulStore(str(tmp_path / "crystallizations.db"))
     try:
@@ -116,10 +114,23 @@ def test_a_broken_link_table_does_not_drop_the_accepted_candidates(tmp_path, cap
     finally:
         store.close()
 
-    with caplog.at_level(logging.WARNING):
-        assert list_crystallised_memory_ids(tmp_path) == ["m-cand"]
+    with pytest.raises(sqlite3.Error):
+        list_crystallised_memory_ids(tmp_path)
 
-    assert any("crystallised" in r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
+
+def test_a_failing_revoked_read_raises_rather_than_dropping_every_accepted_candidate(tmp_path, monkeypatch):
+    """#392: if the revoked list cannot be read, 'nothing is revoked' is a guess and 'everything is revoked'
+    is a worse one. The reader raises and lets the caller decide."""
+    _write_candidates(tmp_path, [{"memory_id": "m-cand", "status": "accepted", "crystallization_id": "c-1"}])
+    SoulStore(str(tmp_path / "crystallizations.db")).close()
+
+    def _boom(self):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(SoulStore, "list_revoked", _boom)
+
+    with pytest.raises(sqlite3.OperationalError):
+        list_crystallised_memory_ids(tmp_path)
 
 
 def test_unknown_link_fails_toward_protection(tmp_path):
