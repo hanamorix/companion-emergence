@@ -16,3 +16,6 @@
 *.pth binary
 *.ckpt binary
 *.npy binary
+
+# nell.cmd template: keep LF in the working tree so the render step controls line endings (#408)
+app/src-tauri/nell-shortcut/src/nell_cmd.tmpl text eol=lf

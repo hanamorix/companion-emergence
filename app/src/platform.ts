@@ -42,3 +42,8 @@ export function platformLabel(platform: ClientPlatform): string {
 export function supportsMacOnlyInstallActions(platform: ClientPlatform = getClientPlatform()): boolean {
   return platform === "macos";
 }
+
+/** Whether the in-app "nell shortcut" step exists on this platform (#408). TESTS-FIRST STUB. */
+export function supportsNellCliShortcut(_platform: ClientPlatform = getClientPlatform()): boolean {
+  return false;
+}

@@ -5,6 +5,10 @@ description = "Companion-emergence desktop client"
 authors = ["hana"]
 edition = "2021"
 
+[workspace]
+members = ["nell-shortcut"]
+default-members = [".", "nell-shortcut"]
+
 [lib]
 name = "nellface_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -30,6 +34,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 minisign-verify = "0.2"
 sha2 = "0.10"
 base64 = "0.22"
+nell_shortcut = { path = "nell-shortcut" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -12,6 +12,8 @@ interface Props {
    *  when the auto-detect verifies the brain is fully alive. */
   onDone: () => void;
   avatar: ReactNode;
+  /** Durable notice about the nell shortcut step (#408). TESTS-FIRST: accepted but not yet used. */
+  cliNotice?: string | null;
 }
 
 type StageStatus = "pending" | "running" | "ok" | "error";

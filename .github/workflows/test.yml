@@ -93,7 +93,56 @@ jobs:
 
       - name: cargo test
         working-directory: app/src-tauri
-        run: cargo test
+        run: cargo test --workspace
+
+  # #408: the nell shortcut logic lives in the Tauri-free workspace crate nell_shortcut. This job
+  # compiles the Tauri-linked glue on Linux and Windows (cargo check does not link a test binary),
+  # runs the whole workspace's tests on Linux (the same gate release.yml's validate job runs, moved
+  # to PR time) and the crate's tests on Windows. Windows runs ONLY the crate: a test executable of
+  # a Tauri-linked crate does not start on Windows (upstream tauri #13419), and the rest of the
+  # root crate's tests have never run there.
+  tauri-linux-windows:
+    name: tauri (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Linux, install Tauri system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev
+
+      - name: cargo check
+        working-directory: app/src-tauri
+        run: cargo check
+
+      - name: cargo test (workspace)
+        if: runner.os == 'Linux'
+        working-directory: app/src-tauri
+        run: cargo test --workspace
+
+      - name: smoke script logic (stub AppImages)
+        if: always() && runner.os == 'Linux'
+        run: bash scripts/test_appimage_cli_smoke.sh
+
+      - name: cargo test (nell_shortcut crate)
+        if: runner.os == 'Windows'
+        working-directory: app/src-tauri
+        run: cargo test -p nell_shortcut
 
   # #290: the built wheel was only exercised in release.yml, after the tag, so
   # a packaging break (missing package data or module, broken entry point)
