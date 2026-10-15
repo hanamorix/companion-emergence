@@ -41,3 +41,30 @@ Key files to look at:
 - `<persona>/dreams.log.jsonl` — every dream (offline reflection)
 - `<persona>/soul_audit.jsonl` — soul-review decisions (kept forever)
 - `bridge-<persona>.log` — bridge daemon stdout / stderr (in the log dir above)
+
+## Memories forgotten before the #362 fix
+
+Until #369, the forgetting pass treated a memory that soul review had accepted like any other. It could fade the memory, and later drop it, even though a crystallisation was built on it. #369 stops that going forward. It does not bring back what was already lost. In a read-only check of one long-lived persona, about 40% of its soul-accepted memories were already gone and none were mid-fade. The crystallisations themselves are intact. The episodic memories behind them are what went.
+
+What you can get back depends on how far the memory got:
+
+| State when the bug hit | Original text kept? | How to get it back |
+|---|---|---|
+| `fading` | Yes, in `content_snapshot`. | `MemoryStore.unfade(memory_id)` restores it. There is no command for this, and the forgetting pass will not do it: exempt memories are skipped before any state change, so a faded exempt memory stays faded. Stop the bridge first, for the reason `nell recover` does below. |
+| `lost` (hard-deleted) | No. The graveyard (`forgotten_memories.jsonl`) keeps only the summary written when the memory faded, its emotions and its hebbian neighbours. | `nell recover --persona <name>` restores summary stubs (see below). To get the original text back you need a copy of the persona directory from before the loss: `nell recover --persona <name> --from <that copy>`. |
+
+### What `nell recover` does here
+
+- With no `--from`, it works from the graveyard. It restores a summary stub for **every** graveyard entry that is not in `memories.db` and has a creation timestamp. It cannot be limited to soul-linked memories.
+- Run `--dry-run` first to see the counts. It writes nothing.
+- It refuses to run while the bridge looks live, because it must not race the forgetting pass. `--force` overrides that.
+- Before it writes, it copies `memories.db`, `hebbian.db` and `emotion_vocabulary.json` into `recover-backup-<UTC timestamp>/` in the persona directory.
+- Restoring summary stubs into a live persona changes what she remembers. That is the persona owner's call, so nothing runs it automatically.
+
+### What does not help
+
+The accepted candidate in `soul_candidates.jsonl` keeps the text the soul review saw. In the persona that was checked, that text was longer than the graveyard stub in only about 5% of cases, so it rarely recovers more than the stub does.
+
+### Known unknown
+
+Some soul-accepted memory ids are in neither `memories.db` nor the graveyard. `consolidation_archive.jsonl`, which the dedup sweep and the consolidation gate write, did not account for them in the sample checked. The cause has not been identified. It is tracked in #394.
