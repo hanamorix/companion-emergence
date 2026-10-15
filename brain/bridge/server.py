@@ -315,6 +315,20 @@ def _search_memories_blocking(persona_dir: Path, req: SearchMemoriesReq) -> dict
         )
 
 
+def _end_chunk_stream(loop: asyncio.AbstractEventLoop, chunk_q: asyncio.Queue) -> None:
+    """Queue the end-of-reply sentinel BEHIND every chunk the worker thread pushed.
+
+    `_StreamingProxy` pushes chunks with `loop.call_soon_threadsafe(put_nowait, ...)`.
+    When the worker finishes before the loop thread resumes its `await asyncio.to_thread(...)`
+    (a short reply), the await returns without yielding, so those callbacks are still
+    pending in the loop's ready queue. A direct `chunk_q.put_nowait(None)` would overtake
+    them: the forwarder would stop before the last chunk(s), and the client, which builds
+    the reply only from reply_chunk frames, would show a truncated reply. `call_soon`
+    appends behind them (FIFO), whatever the timing.
+    """
+    loop.call_soon(chunk_q.put_nowait, None)
+
+
 class _StreamingProxy:
     """Thin provider wrapper that intercepts chat() to forward TextDelta chunks.
 
@@ -2870,7 +2884,7 @@ def build_app(
                         reply_to_audit_id,
                     )
                 finally:
-                    chunk_q.put_nowait(None)
+                    _end_chunk_stream(loop, chunk_q)
 
             respond_task = asyncio.create_task(_guarded_respond())
 

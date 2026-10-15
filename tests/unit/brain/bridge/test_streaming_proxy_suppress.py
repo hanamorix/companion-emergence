@@ -55,6 +55,7 @@ def test_suppress_stream_buffers_without_pushing_to_queue():
             tools=None,
             options={"suppress_stream": True},
         )
+        await asyncio.sleep(0)  # let call_soon_threadsafe callbacks queued by the worker run
         return resp, _drain(q)
 
     try:
@@ -72,6 +73,7 @@ def test_emit_text_pushes_word_chunks():
         q: asyncio.Queue = asyncio.Queue()
         proxy = _StreamingProxy(_FakeStreamingProvider(), q, asyncio.get_event_loop())
         await asyncio.to_thread(proxy.emit_text, "flush me")
+        await asyncio.sleep(0)  # to_thread can return without yielding; run the queued put_nowait callbacks
         return _drain(q)
 
     try:
