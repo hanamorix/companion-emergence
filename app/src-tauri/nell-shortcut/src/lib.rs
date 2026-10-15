@@ -447,6 +447,38 @@ pub fn classify_existing(existing: &Existing, desired: &Desired) -> Action {
     }
 }
 
+const HEAD_CAP: usize = 4096;
+
+/// Is the regular file at `path` our shim? Reads only the first few KiB, so a user's own large
+/// `nell` binary is never read in full (this runs on every app launch).
+pub fn is_our_shim_file(path: &Path) -> bool {
+    is_our_shim_file_capped(path, HEAD_CAP)
+}
+
+/// Same as [`is_our_shim_file`] with an explicit read cap in bytes (the marker must appear in the
+/// first three lines of the first `cap` bytes).
+pub fn is_our_shim_file_capped(path: &Path, cap: usize) -> bool {
+    use std::io::Read;
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => {}
+        _ => return false,
+    }
+    let mut buf = Vec::new();
+    let read = std::fs::File::open(path).and_then(|f| f.take(cap as u64).read_to_end(&mut buf));
+    if read.is_err() {
+        return false;
+    }
+    match std::str::from_utf8(&buf) {
+        Ok(text) => has_marker(text),
+        // A multi-byte character cut by the cap is fine; real invalid UTF-8 is not our file.
+        Err(e) if e.error_len().is_none() => match std::str::from_utf8(&buf[..e.valid_up_to()]) {
+            Ok(text) => has_marker(text),
+            Err(_) => false,
+        },
+        Err(_) => false,
+    }
+}
+
 /// Refresh on launch only when our own shim exists and is stale or lost its exec bit.
 pub fn refresh_decision(existing: &Existing, desired_text: &str) -> bool {
     match existing {

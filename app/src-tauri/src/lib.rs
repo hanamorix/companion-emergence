@@ -1365,9 +1365,8 @@ fn refresh_plan(plan: &nell_shortcut::ShortcutPlan, bundled: Option<&std::path::
     if let nell_shortcut::ShortcutPlan::AppImageScript { appimage, target, .. } = plan {
         // Nothing to refresh (and nothing worth logging) unless OUR shim was installed earlier: a
         // user's own `nell` at this path must stay silent.
-        match std::fs::read_to_string(target) {
-            Ok(text) if text.lines().take(3).any(|l| l.contains(nell_shortcut::SHIM_MARKER)) => {}
-            _ => return,
+        if !nell_shortcut::is_our_shim_file(target) {
+            return;
         }
         let derived = match std::env::current_exe() {
             Ok(exe) => nell_shortcut::derive_cli_nell_path(&exe),
@@ -1412,9 +1411,8 @@ fn refresh_plan(plan: &nell_shortcut::ShortcutPlan, bundled: Option<&std::path::
 #[cfg(windows)]
 fn refresh_plan(plan: &nell_shortcut::ShortcutPlan, _bundled: Option<&std::path::Path>) {
     if let nell_shortcut::ShortcutPlan::WindowsCmd { bundled, cmd_path, win_prefixes, .. } = plan {
-        match std::fs::read_to_string(cmd_path) {
-            Ok(text) if text.lines().take(3).any(|l| l.contains(nell_shortcut::SHIM_MARKER)) => {}
-            _ => return, // never installed, or not our file: nothing to refresh
+        if !nell_shortcut::is_our_shim_file(cmd_path) {
+            return; // never installed, or not our file: nothing to refresh
         }
         match nell_shortcut::render_windows_cmd(&bundled.to_string_lossy(), win_prefixes) {
             Ok(text) => {
