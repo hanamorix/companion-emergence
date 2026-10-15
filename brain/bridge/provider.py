@@ -744,8 +744,8 @@ def _cli_error_detail(payload: dict) -> str | None:
     system error as something their companion said.
 
     The over-budget frame is excluded deliberately: it also carries
-    ``is_error`` but holds partial work worth keeping, and has its own
-    graceful path at each call site.
+    ``is_error``, but it is a stop, not a failure, and has its own graceful
+    path at each call site.
     """
     if not payload.get("is_error"):
         provider_auth.note_cli_success()  # #246: a clean frame is the recovery signal
@@ -1903,6 +1903,9 @@ def _read_audit_lines_since(
         try:
             entry = json.loads(line)
         except _JSON_LINE_ERRORS:
+            malformed += 1
+            continue
+        if not isinstance(entry, dict):
             malformed += 1
             continue
         if entry.get("origin") == _CLI_BUILTIN_ORIGIN:

@@ -8,8 +8,8 @@ replay the REAL frames at the REAL exit code.
 
 The fixture is the stdout a claude 2.1.300 run produced under a $0.0001 budget (`stream-json --verbose`,
 exit 1): its `assistant` and `result` frames as captured, with the `init` frame (home paths, plugin and
-skill lists of the capturing machine) reduced to the four-key shape `cli_2_1_284_web_tools.ndjson` uses
-and the hook frames dropped. The real `result` frame has `subtype` `error_max_budget_usd`, `is_error`, an
+skill lists of the capturing machine) reduced to `claude_code_version`, `model`, `session_id`, `tools` (the
+shape `cli_2_1_284_web_tools.ndjson` uses, plus model and session id) and the hook frames dropped. The real `result` frame has `subtype` `error_max_budget_usd`, `is_error`, an
 `errors` list, `terminal_reason` `budget_exhausted` and NO `result` key; its `usage` token fields are 0
 (the real numbers are in `modelUsage`) while `total_cost_usd` is exact.
 """
@@ -104,13 +104,27 @@ def test_over_budget_turn_logs_one_usage_row_per_branch(tmp_path):
 
 
 def test_tools_branch_over_budget_reply_keeps_the_turns_dispatched_invocations(tmp_path):
-    # The budget is the backstop for runaway tool loops, so an overrun turn has nearly always already run
-    # brain tools. Dropping their records dropped image binding, the pass-2 monologue and the turn's
+    # The budget is the backstop for runaway tool loops, so an overrun turn has nearly always run brain
+    # tools. Dropping their records dropped image binding, the pass-2 monologue and the turn's
     # tool_invocations out of run_tool_loop (the streaming proxy reads them whatever the reply says).
+    # The log also holds a row from an EARLIER turn (before the offset) and one carrying a FOREIGN request_id
+    # (another session): only this call's own row may come back, so the read must use the offset and the id.
     persona_dir = _persona(tmp_path)
-    resp, _ = _blocking(
-        persona_dir, _stdout(), returncode=1, during=_mcp_row_during_run(persona_dir)
+    log = persona_dir / "tool_invocations.log.jsonl"
+    log.write_text(
+        json.dumps({"name": "earlier_turn_tool", "arguments": {}, "result_summary": "{}", "request_id": "old"}) + "\n",
+        encoding="utf-8",
     )
+    ours = _mcp_row_during_run(persona_dir)
+
+    def _during(cmd):
+        ours(cmd)
+        with log.open("a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps({"name": "foreign_tool", "arguments": {}, "result_summary": "{}", "request_id": "other"}) + "\n"
+            )
+
+    resp, _ = _blocking(persona_dir, _stdout(), returncode=1, during=_during)
 
     assert resp.content == _BUDGET_EXCEEDED_MSG
     assert [d["name"] for d in resp.dispatched_invocations] == ["search_memories"]
@@ -276,3 +290,17 @@ def test_run_tool_loop_keeps_the_invocations_of_an_over_budget_turn(tmp_path):
 
     assert response.content == _BUDGET_EXCEEDED_MSG
     assert [i["name"] for i in invocations] == ["search_memories"]
+
+
+def test_text_branch_without_a_persona_dir_is_graceful_and_writes_nothing(tmp_path):
+    # run_tool_loop's forced final pass: `json` argv, no persona_dir, so no usage row and no audit rows - and, with
+    # the CLI exiting 1 on an overrun, still the graceful reply. Under `json` the CLI prints ONE result object, so
+    # the stdout here is the fixture's result line alone (real boundary), not the stream.
+    persona_dir = _persona(tmp_path)
+    resp, run, seen = _text_branch(persona_dir, _stdout().strip().split("\n")[-1], returncode=1, options={})
+
+    assert run.called and seen["cmd"][seen["cmd"].index("--output-format") + 1] == "json"
+    assert "--verbose" not in seen["cmd"]
+    assert resp.content == _BUDGET_EXCEEDED_MSG
+    assert _usage_rows(persona_dir) == []
+    assert _rows(persona_dir) == []

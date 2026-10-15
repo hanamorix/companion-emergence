@@ -141,3 +141,16 @@ def test_audit_log_reader_skips_a_hostile_line(tmp_path, hostile):
     log.write_text(f"{hostile}\n{good}\n", encoding="utf-8")
 
     assert [r["name"] for r in _read_audit_lines_since(log, 0)] == ["search_memories"]
+
+
+@pytest.mark.parametrize("line", ["null", "[1]", '"text"', "7"], ids=["null", "array", "string", "number"])
+def test_audit_log_reader_skips_a_json_line_that_is_not_an_object(tmp_path, line):
+    # `entry.get("origin")` raised AttributeError out of the reader, and from there out of chat() on the tools
+    # branch; the function's own contract is that telemetry never breaks a chat response.
+    from brain.bridge.provider import _read_audit_lines_since
+
+    log = tmp_path / "tool_invocations.log.jsonl"
+    good = json.dumps({"name": "search_memories", "arguments": {}, "result_summary": "{}"})
+    log.write_text(f"{line}\n{good}\n", encoding="utf-8")
+
+    assert [r["name"] for r in _read_audit_lines_since(log, 0)] == ["search_memories"]
