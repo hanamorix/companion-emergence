@@ -22,8 +22,8 @@ redteam_context:          # PRIORITY ORDER — read top-down; a cold subagent ca
     note: "The REAL code we edit + test (dev repo source of truth — uv run pytest runs against this). Start at bridge/provider.py and chat/{prompt,engine,tool_loop,salience,tool_recruit}.py for prompt/caching/tool claims."
   - path: "the project root/docs/source-spec"
     note: "Tracked design specs. Find the one for the area you touch before trusting a behavior claim."
-  - path: "the main checkout's docs/guarded-change"
-    note: "Prior runs' spec, criteria, plan, reviews and harness, one folder per change (gitignored, so absent from worktrees: read it from the main checkout). Start with the folder for the area you touch, e.g. builtin-audit-blocking-path/ and provider-audit-356-358-380/ for the CLI provider."
+  - path: "the project root/docs/guarded-change"
+    note: "Prior runs' spec, criteria, plan, reviews and harness, one folder per change. Two kinds. Older runs are TRACKED and exist in every checkout: 52 files in kindled-link-*/, persisted-cadence/ and prompt-caching-adopt/, frozen (see the comment in .gitignore, #163). Newer runs are untracked and per-developer: they exist only in the checkout that ran them (builtin-audit-blocking-path/ and provider-audit-356-358-380/ are local to the maintainer's checkout, so a reviewer elsewhere will not find them). Start with the tracked folder nearest the area you touch (prompt-caching-adopt/ for cache and prefix claims, persisted-cadence/ for cadences); treat an untracked folder as context only after checking it is on disk."
 
 measurement:
   baseline:               # capture the CURRENT version's behavior before a change
@@ -237,10 +237,13 @@ metrics:                  # standing regression metrics (source: the JSONL logs)
   give the cache_read_ratio check the single-call rows it judges): run both arms with the same
   settings, `--no-warmup --no-plain-turns` on both when the OLD tree's script predates them;
   `--compare` prints NOT COMPARABLE on stdout (no deltas, no C8 verdict, exit 11) when they differ.
-  The CLI's prompt cache entries last an hour (ledger row "Server-side prompt caching"), so arms run
-  less than an hour apart cross-warm: the second arm's cold first row can read a prefix the first wrote
-  (creation 9485 / read 0 for OLD vs 1429 / 8062 for NEW, 2026-10-15). Gate on the means without each
-  arm's first row, or space the arms more than an hour apart.
+  Observed on claude 2.1.300 under a claude.ai subscription login: the CLI's prompt cache entries are the one-hour tier
+  (ledger row "Server-side prompt caching"), so arms run less than an hour apart cross-warm: the second
+  arm's cold first row can read a prefix the first wrote (creation 9485 / read 0 for OLD vs 1429 / 8062
+  for NEW, 2026-10-15). The TTL is server-side; no code here sets or depends on it. Read the tier fields
+  (`ephemeral_1h_input_tokens` vs `ephemeral_5m_input_tokens`) in a result frame before relying on it for
+  another CLI version or auth type. Gate on the means without each arm's first row, or space the arms
+  more than an hour apart.
 - **These metrics exist because the v0.0.38 file-tool token-cost regression was only catchable
   via `tool_invocations.log.jsonl`.** Any change touching an un-instrumented area must add
   logging in stage 2 ("instrument before you build").
