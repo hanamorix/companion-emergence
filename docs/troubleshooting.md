@@ -55,6 +55,8 @@ What you can get back depends on how far the memory got:
 
 ### What `nell recover` does here
 
+The app's Connection panel has a **Recover memories…** button that runs this same command (`nell recover --persona <name> --json`, plus `--from` if you give it a folder). Leave the folder blank to restore from the graveyard.
+
 - With no `--from`, it works from the graveyard. It restores a summary stub for **every** graveyard entry that is not in `memories.db` and has a creation timestamp. It cannot be limited to soul-linked memories.
 - Run `--dry-run` first to see the counts. It writes nothing.
 - It refuses to run while the bridge looks live, because it must not race the forgetting pass. `--force` overrides that.
