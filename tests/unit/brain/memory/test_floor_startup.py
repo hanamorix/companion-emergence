@@ -15,6 +15,7 @@ markers. Synthetic data only.
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 from pathlib import Path
 from unittest.mock import patch
@@ -942,6 +943,108 @@ def test_a_repl_no_bridge_chat_starts_the_floors_once_per_session_not_per_turn(
 
     assert start.call_count == 1
     assert start.call_args.kwargs == {"blocking": False}
+
+
+def _schema_state(persona_dir: Path) -> tuple[bool, set[str]]:
+    """(does memories.db exist, the names in its sqlite_master), read through a
+    read-only connection so the check itself can never create the file."""
+    db = persona_dir / "memories.db"
+    if not db.exists():
+        return False, set()
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        return True, {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("existing_db", [False, True])
+def test_the_repl_opens_the_memory_store_before_it_starts_the_floor_bootstrap(
+    existing_db: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#414: the bootstrap thread opens memories.db and runs the schema script, so
+    the main thread must create and integrity-check the file alone first. At the
+    moment the REPL starts the bootstrap, the database and its FTS tables exist."""
+    from brain.chat.session import reset_registry
+    from brain.cli import main
+
+    d = _direct_chat_persona(tmp_path, monkeypatch)
+    if existing_db:
+        MemoryStore(d / "memories.db").close()
+    seen: list[tuple[bool, set[str], dict]] = []
+
+    def _spy(persona_dir, **kwargs):
+        seen.append((*_schema_state(persona_dir), kwargs))
+
+    reset_registry()
+    with (
+        patch("brain.cli._start_floor_bootstrap_for_direct_chat", side_effect=_spy),
+        patch("builtins.input", side_effect=["exit"]),
+    ):
+        assert main(["chat", "--persona", "nell", "--no-bridge"]) == 0
+    reset_registry()
+
+    assert len(seen) == 1
+    db_exists, tables, kwargs = seen[0]
+    assert kwargs == {"blocking": False}
+    assert db_exists, "the store was not opened before the bootstrap started"
+    assert {"memories_fts", "memories_vocab"} <= tables
+
+
+@pytest.mark.parametrize("existing_db", [False, True])
+def test_the_repl_still_runs_the_floor_bootstrap_on_its_background_thread(
+    existing_db: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Production REPL mode: with the inhibit off, the real `start_background` runs
+    `compute_missing_floors` once on the daemon thread `floor-bootstrap-direct-chat`,
+    after the store was opened. No turn is driven (a turn would start a rerank bootstrap)."""
+    from brain.chat.session import reset_registry
+    from brain.cli import main
+
+    d = _direct_chat_persona(tmp_path, monkeypatch)
+    if existing_db:
+        MemoryStore(d / "memories.db").close()
+    monkeypatch.setattr(floor_startup, "_background_inhibited", False)
+    ran = threading.Event()
+    calls: list[tuple[Path, str, bool, bool, set[str]]] = []
+
+    def _record(persona_dir, *, activity_marker=None, _registered=False):
+        me = threading.current_thread()
+        calls.append((persona_dir, me.name, me.daemon, _registered, _schema_state(persona_dir)[1]))
+        ran.set()
+
+    monkeypatch.setattr(floor_startup, "compute_missing_floors", _record)
+    reset_registry()
+    with patch("builtins.input", side_effect=["exit"]):
+        assert main(["chat", "--persona", "nell", "--no-bridge"]) == 0
+    reset_registry()
+
+    assert ran.wait(10), "the background bootstrap never ran"
+    for thread in threading.enumerate():
+        if thread.name == "floor-bootstrap-direct-chat":
+            thread.join(timeout=10)
+    assert len(calls) == 1
+    persona_dir, name, daemon, registered, tables = calls[0]
+    assert persona_dir == d
+    assert name == "floor-bootstrap-direct-chat" and daemon and registered
+    assert {"memories_fts", "memories_vocab"} <= tables
+
+
+def test_start_background_honours_the_inhibit_flag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The suite's autouse fixture sets `_background_inhibited`; `start_background`
+    must obey it like `_spawn` does: no thread, no slot claimed, but the activity
+    marker is still registered (the bookkeeping is unchanged)."""
+    assert floor_startup._background_inhibited is True  # noqa: SLF001
+    ran: list[Path] = []
+    monkeypatch.setattr(floor_startup, "compute_missing_floors", lambda *a, **k: ran.append(a[0]))
+
+    assert floor_startup.start_background(tmp_path, activity_marker=lambda: 5.0) is None
+
+    assert ran == []
+    assert not floor_startup.inflight("cosine")
+    assert floor_startup._current_marker() == 5.0  # noqa: SLF001
 
 
 # ---------------------------------------------------------------------------
