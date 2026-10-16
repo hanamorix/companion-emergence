@@ -59,6 +59,8 @@ jobs:
         run: uv sync --all-extras --python 3.13
 
       - name: Run bridge tests
+        env:
+          KINDLED_RUN_STRESS: "1"  # adds the 60s C15(c) write-lock stress test (#421)
         run: uv run --python 3.13 pytest tests/bridge tests/unit/brain/bridge -v --tb=short
 
   # Audit 2026-05-07 P2-5: frontend tests + production build now gate

@@ -10,9 +10,12 @@ C15(c) specifically — the ITEM-level interleaving this increment (INC-10)
 introduces, under real concurrent chat-path writes, for the full 60s+ the
 criterion names.
 
-Local Linux only, real F-bob20k fixture (~20k rows, 107MB, not committed) —
-skips gracefully (not a failure) if the fixture isn't present on this
-machine, mirroring test_search_via_bridge.py's convention. Runs `run_folded`
+Opt-in (#421): runs only with KINDLED_RUN_STRESS=1, because it takes over a
+minute; test.yml's python-313-bridge job sets it. The database is the real
+F-bob20k fixture (~20k rows, 107MB, not committed) when KINDLED_F_BOB20K
+names it, else a synthetic 20k-row memories.db built in a few seconds. (The
+fixture path used to be derived from a worktree layout that no longer
+exists, so the test skipped everywhere.) Runs `run_folded`
 in a background thread for >= 60s wall-clock with the heartbeat and the
 maintenance (forgetting) job firing continuously, while a SEPARATE thread
 hammers `store.bump_recall` on a second connection to the SAME memories.db
@@ -21,27 +24,40 @@ the whole time — the real chat-path write this criterion means by
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
+import os
 import shutil
 import threading
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
-_FIXTURE = (
-    # This file lives at .../.claude/worktrees/ram-spike-fix/tests/unit/brain/bridge/;
-    # parents[4] is the ram-spike-fix worktree root, parents[5] is the shared
-    # .claude/worktrees/ directory that also holds the dragonfly-ram-spike
-    # worktree (a sibling worktree, not nested under ram-spike-fix).
-    Path(__file__).resolve().parents[5]
-    / "dragonfly-ram-spike"
-    / "changes"
-    / "dragonfly-ram-spike"
-    / "persona"
-    / "Bob"
-    / "memories.db"
-)
+_FIXTURE_ENV = os.environ.get("KINDLED_F_BOB20K")
+
+
+def _build_synthetic_bob20k(db_path: Path) -> None:
+    """20k memories spread over a year with nonzero emotions, so the
+    heartbeat's batched decay and the forgetting pass both have real work
+    on every row, as they did on F-bob20k."""
+    from brain.memory.store import Memory, MemoryStore
+
+    now = datetime.now(UTC)
+    store = MemoryStore(str(db_path), integrity_check=False)
+    try:
+        for i in range(20_000):
+            mem = Memory.create_new(
+                f"memory {i}: an ordinary moment worth keeping",
+                "conversation",
+                "us",
+                emotions={"warmth": (i % 9) + 1.0, "longing": (i % 4) * 0.5},
+            )
+            store.create(dataclasses.replace(mem, created_at=now - timedelta(hours=i % 8760)))
+    finally:
+        store.close()
+
 
 _STRESS_DURATION_S = 60.0
 
@@ -85,7 +101,10 @@ class _LockErrorCapture(logging.Handler):
             self.hits.append(text if len(haystacks) > 1 else record.getMessage())
 
 
-@pytest.mark.skipif(not _FIXTURE.exists(), reason=f"F-bob20k fixture not present at {_FIXTURE}; runs nowhere until #421")
+@pytest.mark.skipif(
+    os.environ.get("KINDLED_RUN_STRESS") != "1",
+    reason="60s stress test, opt-in: set KINDLED_RUN_STRESS=1 (run by test.yml's python-313-bridge job; #421)",
+)
 def test_c15c_heartbeat_and_gated_items_60s_with_concurrent_writes_no_lock_errors(
     tmp_path: Path,
 ) -> None:
@@ -97,8 +116,11 @@ def test_c15c_heartbeat_and_gated_items_60s_with_concurrent_writes_no_lock_error
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
     (persona_dir / "active_conversations").mkdir()
-    # I11: copy into tmp_path, never open the fixture itself for write.
-    shutil.copy(_FIXTURE, persona_dir / "memories.db")
+    if _FIXTURE_ENV:
+        # I11: copy into tmp_path, never open the fixture itself for write.
+        shutil.copy(_FIXTURE_ENV, persona_dir / "memories.db")
+    else:
+        _build_synthetic_bob20k(persona_dir / "memories.db")
 
     lock_capture = _LockErrorCapture()
     root_logger = logging.getLogger()
