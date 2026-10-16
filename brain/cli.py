@@ -2052,10 +2052,19 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
 
     provider_name, _ = _resolve_routing(persona_dir, args)
 
-    _start_floor_bootstrap_for_direct_chat(persona_dir, blocking=bool(getattr(args, "message", None)))
+    one_shot = bool(getattr(args, "message", None))
+    if one_shot:
+        # Synchronous: it finishes before the store opens, so nothing overlaps it.
+        _start_floor_bootstrap_for_direct_chat(persona_dir, blocking=True)
 
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
+        if not one_shot:
+            # The REPL's bootstrap runs on a thread that opens memories.db itself and runs the
+            # schema script. Start it only now that the main thread has created and
+            # integrity-checked the file, so the two never create the file and schema at once
+            # (#414).
+            _start_floor_bootstrap_for_direct_chat(persona_dir, blocking=False)
         from brain.emotion.persona_loader import load_persona_vocabulary
 
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
