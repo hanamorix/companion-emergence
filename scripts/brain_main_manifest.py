@@ -4,6 +4,10 @@
 `write`: the manifest the app verifies (signature → manifest → file hashes)
 before it downloads anything.
 
+`envelope`: manifest.json and its signature in one asset, manifest.signed.json.
+Two assets uploaded with `--clobber` are replaced one at a time, so a reader
+could see the new manifest with the old signature (#365); one asset can't.
+
 `should-publish`: CI runs can finish out of order — never replace a published
 build with an older commit.
 
@@ -98,10 +102,25 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--requirements", type=Path, required=True)
     w.add_argument("--commit", required=True)
     w.add_argument("--out", type=Path, required=True)
+    e = sub.add_parser("envelope", help="write manifest.signed.json: manifest + signature in one file")
+    e.add_argument("--manifest", type=Path, required=True)
+    e.add_argument("--sig", type=Path, required=True)
+    e.add_argument("--out", type=Path, required=True)
     s = sub.add_parser("should-publish", help="is --ours newer than the published manifest?")
     s.add_argument("--ours", required=True)
     s.add_argument("--published", type=Path)
     args = p.parse_args(argv)
+
+    if args.cmd == "envelope":
+        # The manifest goes in as a string, never re-serialised: the signature
+        # covers its exact bytes.
+        # Bytes, not read_text: newline translation would change what was signed.
+        envelope = {
+            "manifest": args.manifest.read_bytes().decode("utf-8"),
+            "signature": args.sig.read_bytes().decode("utf-8"),
+        }
+        args.out.write_bytes((json.dumps(envelope, indent=2) + "\n").encode("utf-8"))
+        return 0
 
     if args.cmd == "should-publish":
         ok, why = should_publish(args.ours, _published_commit(args.published), git_is_ancestor)
