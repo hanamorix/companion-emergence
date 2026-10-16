@@ -175,7 +175,9 @@ def _kill_if_alive(pid: int, sig: int) -> bool:
     readiness-timeout orphan-kill path.)
     """
     try:
-        os.kill(pid, sig)
+        # windows-lint: ok -- the one hard-kill helper: an orphan after a failed start, or the
+        # fallback when the graceful shutdown endpoint failed. TerminateProcess is intended there.
+        os.kill(pid, sig)  # windows-lint: ok
         return True
     except ProcessLookupError:
         return False

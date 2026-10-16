@@ -229,7 +229,19 @@ jobs:
             echo "publish=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          gh release download "$TAG" -p manifest.json -O "$RUNNER_TEMP/published.json" 2>/dev/null || true
+          # No release, or no manifest on it, means nothing is published yet: publish. Any other
+          # failure (network, rate limit, auth) must stop the job; should-publish reads a missing
+          # manifest as "nothing published", so publishing on a blip could replace a newer build (#363).
+          if ! gh release download "$TAG" -p manifest.json -O "$RUNNER_TEMP/published.json" 2>"$RUNNER_TEMP/gh-download.err"; then
+            if grep -qE 'release not found|no assets match' "$RUNNER_TEMP/gh-download.err"; then
+              echo "no published manifest on $TAG yet"
+              rm -f "$RUNNER_TEMP/published.json"
+            else
+              cat "$RUNNER_TEMP/gh-download.err" >&2
+              echo "::error::could not read the published manifest on $TAG; not publishing blind"
+              exit 1
+            fi
+          fi
           python3 scripts/brain_main_manifest.py should-publish --ours "$SHA" \
             --published "$RUNNER_TEMP/published.json" >> "$GITHUB_OUTPUT"
 

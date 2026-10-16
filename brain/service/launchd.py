@@ -312,7 +312,7 @@ def launchctl_target(persona: str) -> str:
 
 def run_launchctl(args: list[str]) -> subprocess.CompletedProcess[str]:
     """Run launchctl with captured output. Tests mock this seam."""
-    return subprocess.run(
+    return subprocess.run(  # windows-lint: ok -- launchd is macOS-only
         ["launchctl", *args],
         capture_output=True,
         text=True,
