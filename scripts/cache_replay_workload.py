@@ -4,7 +4,7 @@ The standing project metrics are aggregates over "whatever turns happened to
 run", so they cannot isolate this change's own contribution (a false-regression
 risk — see guarded-change config Notes). This script is the *comparable
 workload* the plan requires: a fixed warm-up turn, two plain micro-acks and a deterministic sequence of N≥6 chat turns fired
-in ONE session, spaced well under the 5-minute cache TTL, runnable identically
+in ONE session, spaced well under the cache TTL (an hour on this CLI, see the ledger), runnable identically
 against the OLD build (clone pre-change) and the NEW build. Diffing the two runs
 is the C8/C9 A/B; the per-run report also evaluates C1 from cache_debug.jsonl.
 
@@ -398,7 +398,7 @@ def run_replay(
                 file=sys.stderr,
             )
             if pos < len(sequence) - 1:
-                time.sleep(gap_s)  # keep turns < 5-min TTL apart but distinct
+                time.sleep(gap_s)  # keep turns well inside the cache TTL but distinct
     finally:
         store.close()
         hebbian.close()
@@ -948,7 +948,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--persona-dir", type=Path, help="isolated persona directory to run against")
     p.add_argument("--scratch", action="store_true", help="create a throwaway persona under a temp dir")
     p.add_argument("--turns", type=int, default=6, help="number of chat turns (≥6 recommended; the warm-up and the two plain turns are extra)")
-    p.add_argument("--gap-s", type=float, default=3.0, help="seconds between turns (keep < 5min TTL)")
+    p.add_argument("--gap-s", type=float, default=3.0, help="seconds between turns (keep well inside the cache TTL)")
     p.add_argument("--provider", default="claude-cli", help="provider name (claude-cli | fake)")
     p.add_argument("--out", type=Path, help="write the metrics JSON to this path")
     p.add_argument(
