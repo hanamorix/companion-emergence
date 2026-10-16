@@ -1262,7 +1262,7 @@ def test_epistemic_instruction_is_proactive():
     not only explain how to read results of a search that already happened."""
     from brain.chat.prompt import _EPISTEMIC_INSTRUCTION
 
-    assert "call search_memories before answering" in _EPISTEMIC_INSTRUCTION
+    assert "call `search_memories` before answering" in _EPISTEMIC_INSTRUCTION
     assert 'Never say "I don\'t remember" without searching first' in _EPISTEMIC_INSTRUCTION
     # The reactive guidance stays.
     assert "not recognised (searched; no memory found)" in _EPISTEMIC_INSTRUCTION
@@ -1351,7 +1351,7 @@ def test_recall_snippet_invitation_wording_is_byte_exact() -> None:
     from brain.chat.prompt import _RECALL_SNIPPET_INVITATION
 
     assert _RECALL_SNIPPET_INVITATION == (
-        "These are fragments of your memories. Use read_full_memory to reach into "
+        "These are fragments of your memories. Use `read_full_memory` to reach into "
         "any that might touch this turn, or spark curiosity in you. Skip only if "
         "you can name why."
     )
