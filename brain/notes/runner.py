@@ -102,6 +102,7 @@ def make_note_and_wire(*, persona_dir: Path, config: Any, provider: Any,
             dreams_summary=dreams_summary,
             emotion_summary=emotion_summary,
             last_session_summary=last_session_summary,
+            persona_dir=persona_dir,
         )
     path = _write.commit_note(persona_dir, folder, note, now=now)
     if path is None:

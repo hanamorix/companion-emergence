@@ -382,6 +382,13 @@ def test_crystallize_reflex_returns_empty_on_malformed_json(persona_dir: Path, s
         persona_pronouns=None,
     )
     assert result == ReflexCrystallizationResult(emergences=[], prunings=[])
+    # #364: the reply that caused the empty result is kept.
+    import json as _json
+
+    from brain.health.parse_failures import PARSE_FAILURE_LOG
+
+    (row,) = [_json.loads(line) for line in (persona_dir / PARSE_FAILURE_LOG).read_text(encoding="utf-8").splitlines()]
+    assert row["site"] == "reflex" and row["raw"].startswith("Sure, I'll think about that.")
 
 
 def test_crystallize_reflex_skips_malformed_proposal_keeps_others(

@@ -271,3 +271,16 @@ def test_retire_unknown_id_ignored(sweep_env_unknown_retire):
     result = run_sweep_tick(**sweep_env_unknown_retire, now=NOW)
     assert result["retired"] == 0
     assert result["error"] is None
+
+
+def test_sweep_records_an_unparseable_reply(sweep_env_garbage_provider):
+    """#364: the garbage reply is kept next to interests.json (the persona dir)."""
+    import json as _json
+
+    from brain.engines.interest_sweep import run_sweep_tick
+    from brain.health.parse_failures import PARSE_FAILURE_LOG
+
+    run_sweep_tick(**sweep_env_garbage_provider, now=NOW)
+    persona_dir = Path(sweep_env_garbage_provider["interests_path"]).parent
+    rows = [_json.loads(line) for line in (persona_dir / PARSE_FAILURE_LOG).read_text(encoding="utf-8").splitlines()]
+    assert [(r["site"], r["raw"]) for r in rows] == [("interest_sweep", "this is not json at all!")]

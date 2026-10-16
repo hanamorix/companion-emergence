@@ -23,6 +23,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from brain.health.parse_failures import record_parse_failure
+
 if TYPE_CHECKING:
     from brain.bridge.provider import LLMProvider
     from brain.memory.store import MemoryStore
@@ -691,6 +693,7 @@ def _review_pending_candidates_locked(
             decision = parse_decision(raw, candidate_id)
             if decision.parse_error:
                 report.parse_failures += 1
+                record_parse_failure(persona_dir, site="soul_review", raw=raw, error=decision.parse_error)
 
             # Confidence rail: low confidence forces defer regardless of decision
             if decision.confidence < confidence_threshold and decision.decision != "defer":
