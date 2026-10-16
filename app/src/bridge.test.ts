@@ -8,6 +8,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 // two distinct credential payloads, asserted both ways.
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async (cmd: string, args: { persona: string }) => {
+    if (cmd === "force_restart_bridge") return undefined;
     if (cmd !== "get_bridge_credentials") throw new Error(`unexpected cmd ${cmd}`);
     if (args.persona === "alice") {
       return { port: 41001, auth_token: "alice-tok" };
@@ -28,11 +29,14 @@ import {
   fetchPersonaFeed,
   fetchPersonaState,
   getBridgeCredentials,
+  invokeForceRestart,
   newSession,
   rejectVoiceEdit,
   resetBridgeCredentialCache,
+  sendChat,
   setPersonaModel,
   setPersonaPronouns,
+  shutdownBridge,
   snapshotSession,
   uploadImage,
 } from "./bridge";
@@ -185,6 +189,58 @@ describe("getBridgeCredentials", () => {
     await expect(uploadImage("alice", file)).resolves.toMatchObject({ media_type: "image/png" });
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(invoke).toHaveBeenCalledTimes(2);
+  });
+
+  // #365: a request that failed in flight may already have reached the
+  // bridge, so a non-idempotent POST must not be sent a second time.
+  it.each([
+    ["sendChat", () => sendChat("alice", "session-1", "hi")],
+    ["newSession", () => newSession("alice")],
+    ["snapshotSession", () => snapshotSession("alice", "session-1")],
+    ["shutdownBridge", () => shutdownBridge("alice")],
+  ])("does not replay %s after a network failure at an unchanged address", async (_name, call) => {
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new TypeError("connection reset"))
+      .mockResolvedValue(new Response(JSON.stringify({ entries: [] }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(call()).rejects.toThrow("connection reset");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // The stale credentials were dropped, so the next call re-reads them.
+    await fetchPersonaFeed("alice");
+    expect(invoke).toHaveBeenCalledTimes(2);
+  });
+
+  it("replays a chat POST when the re-read credentials name a new address (the old bridge is gone)", async () => {
+    await getBridgeCredentials("alice"); // cached: port 41001
+    vi.mocked(invoke).mockImplementationOnce(async () => ({ port: 41009, auth_token: "alice-tok-2" }));
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new TypeError("connection refused"))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ reply: "hi", turn: 1 }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(sendChat("alice", "session-1", "hi")).resolves.toMatchObject({ reply: "hi" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1][0]).toBe("http://127.0.0.1:41009/chat");
+  });
+
+  it("replays a chat POST the bridge rejected with 401 (auth runs before the handler)", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response("invalid token", { status: 401 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ reply: "hi", turn: 1 }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(sendChat("alice", "session-1", "hi")).resolves.toMatchObject({ reply: "hi" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("drops cached credentials when the app force-restarts the bridge", async () => {
+    await getBridgeCredentials("alice");
+    await invokeForceRestart("alice");
+    await getBridgeCredentials("alice");
+    const credentialReads = vi.mocked(invoke).mock.calls.filter(([cmd]) => cmd === "get_bridge_credentials");
+    expect(credentialReads).toHaveLength(2);
   });
 });
 
