@@ -39,6 +39,11 @@ export function platformLabel(platform: ClientPlatform): string {
   }
 }
 
-export function supportsMacOnlyInstallActions(platform: ClientPlatform = getClientPlatform()): boolean {
-  return platform === "macos";
+
+/**
+ * Whether the in-app "nell shortcut" step exists on this platform (#408): a symlink on macOS and
+ * Linux (.deb), a small script on Linux (AppImage), a nell.cmd plus a user PATH entry on Windows.
+ */
+export function supportsNellCliShortcut(platform: ClientPlatform = getClientPlatform()): boolean {
+  return platform === "macos" || platform === "linux" || platform === "windows";
 }

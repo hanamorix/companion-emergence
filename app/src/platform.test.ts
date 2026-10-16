@@ -1,16 +1,43 @@
 import { describe, expect, it, vi } from "vitest";
-import { platformLabel, supportsMacOnlyInstallActions, type ClientPlatform } from "./platform";
+import { getClientPlatform, platformLabel, supportsNellCliShortcut, type ClientPlatform } from "./platform";
+
+describe("nell shortcut support (#408)", () => {
+  it.each([
+    ["macos", true],
+    ["windows", true],
+    ["linux", true],
+    ["other", false],
+  ] as Array<[ClientPlatform, boolean]>)("%s", (platform, supported) => {
+    expect(supportsNellCliShortcut(platform)).toBe(supported);
+  });
+});
+
+describe("getClientPlatform with real webview user agents (no module mock)", () => {
+  const cases: Array<[string, string, string, ClientPlatform]> = [
+    ["WebKitGTK on Linux", "Linux x86_64", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15", "linux"],
+    ["WebView2 on Windows", "Win32", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0", "windows"],
+    ["WKWebView on macOS", "MacIntel", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)", "macos"],
+  ];
+  it.each(cases)("%s", (_label, platform, userAgent, expected) => {
+    vi.stubGlobal("navigator", { platform, userAgent });
+    try {
+      expect(getClientPlatform()).toBe(expected);
+      expect(supportsNellCliShortcut()).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
 
 describe("platform helpers", () => {
   it.each([
-    ["macos", true, "macOS"],
-    ["windows", false, "Windows"],
-    ["linux", false, "Linux"],
-    ["other", false, "this platform"],
-  ] as Array<[ClientPlatform, boolean, string]>) (
-    "%s support/label",
-    (platform, supported, label) => {
-      expect(supportsMacOnlyInstallActions(platform)).toBe(supported);
+    ["macos", "macOS"],
+    ["windows", "Windows"],
+    ["linux", "Linux"],
+    ["other", "this platform"],
+  ] as Array<[ClientPlatform, string]>) (
+    "%s label",
+    (platform, label) => {
       expect(platformLabel(platform)).toBe(label);
     },
   );

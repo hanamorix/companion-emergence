@@ -24,7 +24,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 vi.mock("../../platform", () => ({
   getClientPlatform: vi.fn(() => "macos"),
   platformLabel: (platform: string) => platform === "macos" ? "macOS" : platform === "windows" ? "Windows" : platform === "linux" ? "Linux" : "this platform",
-  supportsMacOnlyInstallActions: (platform: string) => platform === "macos",
+  supportsNellCliShortcut: (platform: string) => platform === "macos" || platform === "linux" || platform === "windows",
   detectInstallShape: vi.fn(async () => "native"),
 }));
 
@@ -145,7 +145,7 @@ describe("ConnectionPanel — StatusBanner (P3-6 + P4-2)", () => {
     ).toBeInTheDocument();
   });
 
-  it("shows the Task Scheduler supervisor button (not launchd) and a calm Terminal unsupported note on Windows", () => {
+  it("shows the Task Scheduler supervisor button (not launchd) and the nell shortcut button on Windows", () => {
     vi.mocked(getClientPlatform).mockReturnValue("windows");
     render(<ConnectionPanel state={baseState()} persona="test" />);
 
@@ -153,9 +153,10 @@ describe("ConnectionPanel — StatusBanner (P3-6 + P4-2)", () => {
     // but the Windows supervisor button IS present.
     expect(screen.queryByRole("button", { name: /install launchd supervisor/i })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /install Task Scheduler supervisor/i })).toBeInTheDocument();
-    // Terminal shortcut installer is still macOS-only.
-    expect(screen.queryByRole("button", { name: /install nell to/i })).not.toBeInTheDocument();
+    // The Terminal shortcut now exists on Windows too (#408).
+    expect(screen.getByRole("button", { name: /install nell to your PATH/i })).toBeInTheDocument();
     expect(screen.queryByText(/macOS-only right now/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/No action needed for normal app use/i)).not.toBeInTheDocument();
   });
 
   it("shows calm unsupported notes instead of macOS install buttons on Linux (supervisor now supported on Linux — this test updated in Phase 3.2)", () => {
@@ -166,6 +167,10 @@ describe("ConnectionPanel — StatusBanner (P3-6 + P4-2)", () => {
     expect(screen.queryByRole("button", { name: /install launchd supervisor/i })).not.toBeInTheDocument();
     // But the systemd button IS present
     expect(screen.getByRole("button", { name: /install systemd supervisor/i })).toBeInTheDocument();
+    // And so is the nell shortcut button, enabled (#408)
+    const cli = screen.getByRole("button", { name: /install nell to ~\/\.local\/bin/i });
+    expect(cli).toBeEnabled();
+    expect(screen.queryByText(/No action needed for normal app use/i)).not.toBeInTheDocument();
   });
 
   it("renders the privacy row marked accent (local-only)", () => {
@@ -521,3 +526,55 @@ describe("ConnectionPanel — app version in the update-available text", () => {
 
 
 
+
+
+// ── nell shortcut button on every supported platform (#408, C14 / C29b) ──────────
+
+const NO_FUSE_TEXT =
+  "This AppImage is running without FUSE (in extract-and-run mode), so the nell shortcut was not installed. A shortcut would re-extract the whole app on every nell command and delete the running app's files when the command ends. To get the shortcut, install FUSE for your distribution (on Debian and Ubuntu the package is libfuse2, called libfuse2t64 on Ubuntu 24.04), start the AppImage normally, and try again. Or install the .deb package instead, which does not need FUSE.";
+
+describe("ConnectionPanel: nell shortcut button", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+  afterEach(() => {
+    cleanup();
+  });
+
+  it.each([
+    ["linux", /install nell to ~\/\.local\/bin/i],
+    ["windows", /install nell to your PATH/i],
+    ["macos", /install nell to ~\/\.local\/bin/i],
+  ] as Array<[string, RegExp]>)("%s: button is shown, enabled and clicking invokes the command once", async (platform, name) => {
+    vi.mocked(getClientPlatform).mockReturnValue(platform as never);
+    vi.mocked(invoke).mockImplementation((async (cmd: string) =>
+      cmd === "install_nell_cli_symlink"
+        ? { success: true, stdout: "nell shortcut installed", stderr: "", exit_code: 0 }
+        : { success: true, stdout: "service installed", stderr: "", exit_code: 0 }) as never);
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+    const btn = screen.getByRole("button", { name });
+    expect(btn).toBeEnabled();
+    fireEvent.click(btn);
+    await waitFor(() => expect(screen.getByText(/nell shortcut installed/i)).toBeInTheDocument());
+    const calls = vi.mocked(invoke).mock.calls.filter((c) => c[0] === "install_nell_cli_symlink");
+    expect(calls).toHaveLength(1);
+  });
+
+  it("other platforms keep the calm note and have no button", () => {
+    vi.mocked(getClientPlatform).mockReturnValue("other" as never);
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+    expect(screen.queryByRole("button", { name: /install nell to/i })).not.toBeInTheDocument();
+    expect(screen.getByText(/No action needed for normal app use/i)).toBeInTheDocument();
+  });
+
+  it("linux: the no-FUSE explanation is shown in full as the error detail", async () => {
+    vi.mocked(getClientPlatform).mockReturnValue("linux" as never);
+    vi.mocked(invoke).mockImplementation((async (cmd: string) =>
+      cmd === "install_nell_cli_symlink"
+        ? { success: false, stdout: "", stderr: NO_FUSE_TEXT, exit_code: 78 }
+        : { success: true, stdout: "", stderr: "", exit_code: 0 }) as never);
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+    fireEvent.click(screen.getByRole("button", { name: /install nell to ~\/\.local\/bin/i }));
+    await waitFor(() => expect(screen.getByText(NO_FUSE_TEXT)).toBeInTheDocument());
+  });
+});

@@ -20,7 +20,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 vi.mock("../../platform", () => ({
   getClientPlatform: vi.fn(() => "macos"),
   platformLabel: (p: string) => p,
-  supportsMacOnlyInstallActions: (p: string) => p === "macos",
+  supportsNellCliShortcut: (p: string) => p === "macos" || p === "linux" || p === "windows",
   detectInstallShape: vi.fn(async () => "native"),
 }));
 

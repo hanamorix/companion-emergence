@@ -1,0 +1,17 @@
+[package]
+name = "nell_shortcut"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Decision logic and file/registry glue for the nell CLI shortcut (no Tauri dependency, so its tests run on every OS)"
+
+[lib]
+name = "nell_shortcut"
+path = "src/lib.rs"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
+[dev-dependencies]
+tempfile = "3"
