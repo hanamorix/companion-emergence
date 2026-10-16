@@ -39,6 +39,7 @@ concern, already exercised offline elsewhere.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import textwrap
@@ -69,13 +70,27 @@ _TIMEOUT_S = 300
 # network to get a real judge", never a false skip of a run that could have
 # gone offline. A machine (this dev box, or the dedicated workflow after its
 # warm step) that already has the model cached still runs these tests.
+#
+# #405 / #363 follow-up (2026-10-16): "skip unless cached" ran this module in
+# the default suite on any dev box with the model cached, where C2's margin is
+# 3-8% of what it measures and fails about 1 run in 4 -- and it let the
+# dedicated workflow pass with zero tests run if its warm step ever left the
+# cache empty. So the module is now opt-in: it runs only with
+# KINDLED_RUN_JUDGE_RSS=1 (set by judge-release-rss.yml, or by hand), and once
+# opted in a missing model is a failure, not a skip. The bound is unchanged.
 _JUDGE_MODEL_ID = model_for_tier(TIER_RELEVANCE_JUDGE)
-if not _hf_cached(_JUDGE_MODEL_ID, get_cache_dir()):
+if os.environ.get("KINDLED_RUN_JUDGE_RSS") != "1":
     pytest.skip(
-        f"{_JUDGE_MODEL_ID!r} not in the local HF cache ({get_cache_dir()}) -- "
-        "skipping without a network request; this module needs the model "
-        "pre-warmed (see .github/workflows/judge-release-rss.yml)",
+        "judge release-RSS tests are opt-in: set KINDLED_RUN_JUDGE_RSS=1 "
+        "(run by .github/workflows/judge-release-rss.yml; see #405)",
         allow_module_level=True,
+    )
+if not _hf_cached(_JUDGE_MODEL_ID, get_cache_dir()):
+    pytest.fail(
+        f"{_JUDGE_MODEL_ID!r} not in the local HF cache ({get_cache_dir()}) -- "
+        "KINDLED_RUN_JUDGE_RSS=1 is set but this module needs the model "
+        "pre-warmed (see .github/workflows/judge-release-rss.yml)",
+        pytrace=False,
     )
 
 
