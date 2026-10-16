@@ -36,6 +36,31 @@ jobs:
       - name: Lint with ruff
         run: uv run ruff check .
 
+  # #363: the shipped runtime is Python 3.13 (app/build_python_runtime.sh) but
+  # the job above runs 3.12. The bridge tests (threads, sockets, streaming, the
+  # past order-dependent flakes) are the ones most likely to behave differently,
+  # so they also run on 3.13. One OS keeps the cost to a few minutes.
+  python-313-bridge:
+    name: python 3.13 bridge tests (shipped runtime)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.13
+        run: uv python install 3.13
+
+      - name: Install dependencies
+        run: uv sync --all-extras --python 3.13
+
+      - name: Run bridge tests
+        run: uv run --python 3.13 pytest tests/bridge tests/unit/brain/bridge -v --tb=short
+
   # Audit 2026-05-07 P2-5: frontend tests + production build now gate
   # PRs the same way Python does. The previous release cycle's biggest
   # regressions were React/Tauri glue (wizard provider field, persona

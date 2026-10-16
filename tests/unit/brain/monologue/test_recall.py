@@ -29,7 +29,7 @@ def test_recall_finds_matching_trace_only(tmp_path):
         "pending-candidate, not a memories.db row, so recall reads it from the queue "
         "and the keep-sharp recall_count bump is a NO-OP (there is no store row to "
         "bump — list_by_type('monologue_trace') is empty). recall-bump deferred to "
-        "Phase 4 (Root 2 stopgap)."
+        "Phase 4 (Root 2 stopgap); tracked in #420."
     ),
     strict=True,
 )

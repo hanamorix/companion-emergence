@@ -85,7 +85,7 @@ class _LockErrorCapture(logging.Handler):
             self.hits.append(text if len(haystacks) > 1 else record.getMessage())
 
 
-@pytest.mark.skipif(not _FIXTURE.exists(), reason=f"F-bob20k fixture not present at {_FIXTURE}")
+@pytest.mark.skipif(not _FIXTURE.exists(), reason=f"F-bob20k fixture not present at {_FIXTURE}; runs nowhere until #421")
 def test_c15c_heartbeat_and_gated_items_60s_with_concurrent_writes_no_lock_errors(
     tmp_path: Path,
 ) -> None:
