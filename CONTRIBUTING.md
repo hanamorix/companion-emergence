@@ -101,6 +101,18 @@ Sometimes one piece of work needs another that isn't merged yet, so you base the
 
 **The rule: a PR only ever merges into main.** Merge the bottom of the stack first. When PR A merges, GitHub deletes its branch (the repo has "automatically delete head branches" turned on) and **retargets PR B to main by itself**. Then B is merged, then C, one at a time, bottom-up. Never merge a PR into another PR's branch.
 
+### After the PR below is squash-merged: rebase the next one
+
+This repo squash-merges, so main gets PR A as one new commit, while PR B's branch still carries A's original commits. Wherever B changed lines that A also changed, B now conflicts with main, even though nothing is actually wrong. Replay only B's own commits onto main:
+
+```bash
+git fetch origin
+git rebase --onto origin/main <A's last head commit> <B's branch>
+git push --force-with-lease origin <B's branch>
+```
+
+`<A's last head commit>` is the commit A's branch pointed at when it merged: `gh pr view <A> --json headRefOid -q .headRefOid` prints it, and the merged PR's page shows it too. The rebase drops everything up to that commit (A's work, already on main as the squash commit) and replays B's commits on top of main. The result has the same content as the old stack. Do this before marking B ready for review. (Found on the #402 → #406 stack, #407.)
+
 ### What helps you follow it
 
 - **The `stack-guard` check** is red on any PR whose base isn't main. Its message says what to do: "merge #N first" while the PR below is open, or "retarget this PR to main" if the PR below has already merged. Once the PR targets main it goes green. A base change re-runs it, and the check reads the PR's current base, so re-running it by hand also works.
