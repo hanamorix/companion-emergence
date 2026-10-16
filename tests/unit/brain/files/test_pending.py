@@ -220,3 +220,76 @@ def test_sweep_does_not_overwrite_a_record_claimed_after_its_read(tmp_path, monk
     monkeypatch.undo()
     assert get(tmp_path, rid)["status"] == "committing"
     assert n == 0, "a sweep whose mark was refused must not count the record"
+
+
+def test_a_corrupt_record_is_reported_not_silently_dropped(tmp_path, monkeypatch, caplog):
+    """#367: an unreadable pending-write record used to vanish with no trace."""
+    import logging
+    from datetime import UTC, datetime
+
+    from brain.files import pending
+
+    _fresh_throttle(monkeypatch)
+    now = datetime(2026, 10, 16, tzinfo=UTC)
+    rid = pending.create(tmp_path, op="create", resolved_path=str(tmp_path / "a.txt"),
+                          content="hi", now=now)
+    record = pending._dir(tmp_path) / f"{rid}.json"
+    record.write_text("{ not json", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="brain.files.pending"):
+        assert pending.get(tmp_path, rid) is None
+        assert pending.list_pending(tmp_path, now=now) == []
+    hits = [r for r in caplog.records if rid in r.getMessage() and r.levelno >= logging.WARNING]
+    assert len(hits) == 1  # warned once; the next poll is debug, not another warning
+
+
+def test_a_missing_record_is_not_reported(tmp_path, caplog):
+    import logging
+
+    from brain.files import pending
+
+    with caplog.at_level(logging.WARNING, logger="brain.files.pending"):
+        assert pending.get(tmp_path, "no-such-id") is None
+    assert caplog.records == []
+
+
+
+def _fresh_throttle(monkeypatch):
+    from brain.utils import log_throttle
+
+    monkeypatch.setattr(log_throttle, "_last", {})
+
+
+def test_a_non_object_record_is_skipped_and_reported(tmp_path, monkeypatch, caplog):
+    """#367 review: `[]` parsed, then `r.get` raised in list_pending, which
+    persona_state turned into an empty list: every pending write vanished."""
+    import logging
+    from datetime import UTC, datetime
+
+    from brain.files import pending
+
+    _fresh_throttle(monkeypatch)
+    now = datetime(2026, 10, 16, tzinfo=UTC)
+    good = pending.create(tmp_path, op="create", resolved_path=str(tmp_path / "a.txt"), content="a", now=now)
+    (pending._dir(tmp_path) / "bogus.json").write_text("[]", encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="brain.files.pending"):
+        assert [r["id"] for r in pending.list_pending(tmp_path, now=now)] == [good]
+    assert any("bogus" in r.getMessage() for r in caplog.records)
+
+
+def test_a_transient_permission_error_is_not_a_warning(tmp_path, monkeypatch, caplog):
+    """Windows: a lock-free read can meet PermissionError while replace() runs."""
+    import logging
+    from pathlib import Path
+
+    from brain.files import pending
+
+    _fresh_throttle(monkeypatch)
+
+    def busy(self, *a, **k):
+        raise PermissionError("in use")
+
+    monkeypatch.setattr(Path, "read_text", busy)
+    with caplog.at_level(logging.WARNING, logger="brain.files.pending"):
+        assert pending.get(tmp_path, "rid") is None
+    assert caplog.records == []

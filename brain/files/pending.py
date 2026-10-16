@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from brain.utils.file_lock import file_lock
+from brain.utils.log_throttle import warn_throttled
 
 logger = logging.getLogger(__name__)
 
@@ -64,22 +65,35 @@ def create(persona_dir: Path, *, op: str, resolved_path: str, content: str,
     return rid
 
 
-def get(persona_dir: Path, rid: str) -> dict | None:
-    p = _dir(persona_dir) / f"{rid}.json"
+def _read(p: Path) -> dict | None:
+    """One record, or None. A missing record is normal; an unreadable one is
+    reported (#367), since it drops out of every listing. Writers replace the
+    file atomically, so a reader never sees a half-written record; on Windows
+    it can briefly meet a PermissionError while the replace runs, which is
+    transient and only logged at debug."""
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        rec = json.loads(p.read_text(encoding="utf-8"))
+    except FileNotFoundError:
         return None
+    except PermissionError:
+        logger.debug("pending write %s is busy; skipped this read", p.stem, exc_info=True)
+        return None
+    except (OSError, ValueError):
+        warn_throttled(logger, f"pending:{p}", "pending write %s is unreadable and is skipped", p.stem)
+        return None
+    if not isinstance(rec, dict):
+        warn_throttled(logger, f"pending:{p}", "pending write %s is a JSON %s, not a record; skipped",
+                       p.stem, type(rec).__name__, exc_info=False)
+        return None
+    return rec
+
+
+def get(persona_dir: Path, rid: str) -> dict | None:
+    return _read(_dir(persona_dir) / f"{rid}.json")
 
 
 def _all(persona_dir: Path) -> list[dict]:
-    out = []
-    for f in _dir(persona_dir).glob("*.json"):
-        try:
-            out.append(json.loads(f.read_text(encoding="utf-8")))
-        except (OSError, ValueError):
-            continue
-    return out
+    return [r for f in _dir(persona_dir).glob("*.json") if (r := _read(f)) is not None]
 
 
 def list_pending(persona_dir: Path, *, now: datetime) -> list[dict]:
