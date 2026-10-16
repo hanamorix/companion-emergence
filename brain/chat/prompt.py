@@ -302,6 +302,7 @@ def build_system_message(
             voice_excerpt=voice_md[:300],
             soul_hints=soul_hints,
             narrative_hints=narrative_hints,
+            sonnet_safe=_sonnet_safe_frame(persona_dir),
         )
     )
 
@@ -390,6 +391,7 @@ def build_static_system_message(persona_dir: Path, *, voice_md: str) -> str:
             voice_excerpt="",
             soul_hints=(),
             narrative_hints=(),
+            sonnet_safe=_sonnet_safe_frame(persona_dir),
         )
     )
 
@@ -545,6 +547,27 @@ def build_volatile_context(
     parts.append(build_reply_frame(persona_name=persona_name, user_name=user_name or "the user"))
 
     return "\n\n".join(parts)
+
+
+def _sonnet_safe_frame(persona_dir: Path) -> bool:
+    """True when this persona runs Sonnet through the Claude CLI (#416, owner ruling).
+
+    Sonnet's reasoning_extraction safeguard refuses most turns under the default monologue
+    directive, so that model alone gets the softened wording. Ollama personas keep the default
+    ``model`` field ("sonnet") but never run Sonnet, hence the provider check. Fail-soft to the
+    defaults (claude-cli + sonnet) like the other PersonaConfig reads here. Constant per persona,
+    so the frozen system prompt stays byte-stable.
+    """
+    try:
+        from brain.persona_config import PersonaConfig
+
+        cfg = PersonaConfig.load(persona_dir / "persona_config.json")
+        provider, model = cfg.provider, cfg.model or ""
+    except Exception:  # noqa: BLE001
+        from brain.persona_config import DEFAULT_MODEL, DEFAULT_PROVIDER
+
+        provider, model = DEFAULT_PROVIDER, DEFAULT_MODEL
+    return provider == "claude-cli" and "sonnet" in model.lower()
 
 
 def _load_user_name(persona_dir: Path) -> str | None:

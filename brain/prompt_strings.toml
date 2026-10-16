@@ -19,7 +19,7 @@
 # segment model without extending the mechanism. Listed here so a later pass
 # finds them without re-scanning the tree:
 #   chat/extractor.py::_build_user_prompt              - optional section + unbounded loop into the output list
-#   chat/monologue_prompts.py::build_monologue_frame   - 4 independent if-appends
+#   chat/monologue_prompts.py::build_monologue_frame   - sonnet_safe branch + 4 if-appends
 #   chat/tool_loop.py (recruit-nudge literal)          - inline, not module-level
 #   initiate/compose.py::compose_tone / compose_decision - state-dependent line selection
 #   kindled_link/privacy_gate.py                       - branch-selected reason/constraint literals
