@@ -327,8 +327,8 @@ def _maybe_recruit_and_rerun(
             ChatMessage(
                 role="user",
                 content=("[The faculty you reached for is now available to you this turn. "
-                         "Call the specific tool you need now (e.g. search_memories, read_file) — "
-                         "do not call reach_for_capability again.]"),
+                         "Call the specific tool you need now (e.g. `search_memories`, `read_file`) — "
+                         "do not call `reach_for_capability` again.]"),
             )
         ]
         rerun = provider.chat(

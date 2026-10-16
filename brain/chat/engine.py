@@ -462,7 +462,7 @@ def _resolve_shared_file_lines(
             logger.warning("skipping shared file sha=%s: %s", short, exc)
             continue
         # #269: name the tool in the line itself; the model tends to forget it has read_file.
-        cue = "Open it with your read_file tool to see what it says."
+        cue = "Open it with your `read_file` tool to see what it says."
         if filename:
             lines.append(f'[the user shared a file "{filename}": {path}. {cue}]')
         else:
