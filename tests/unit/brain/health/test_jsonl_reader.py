@@ -313,3 +313,55 @@ def test_read_last_n_bounded_io_does_not_read_whole_large_file(tmp_path: Path) -
     # The furthest-back seek position reached must stay far from byte 0 —
     # proof the read never walked back anywhere near the whole file.
     assert min(seek_positions) > file_size * 0.9
+
+
+def test_a_line_with_invalid_utf8_is_skipped_not_raised(tmp_path, caplog):
+    """#433: a crash mid-append can cut a multi-byte character; the next append
+    lands on the same line. That merged line is skipped with a warning, like a
+    JSON error (the row appended onto it is lost with it, as for any torn
+    line), and the read goes on; raising instead would stop a fail-closed
+    caller (#392) on every read until a manual repair."""
+    import json
+    import logging
+
+    from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+
+    good = json.dumps({"text": "über"}, ensure_ascii=False).encode("utf-8")
+    torn = good[: good.index("ü".encode()) + 1]  # cut inside the 2-byte ü
+    path = tmp_path / "log.jsonl"
+    path.write_bytes(good + b"\n" + torn + good + b"\n" + good + b"\n")
+
+    with caplog.at_level(logging.WARNING, logger="brain.health.jsonl_reader"):
+        rows = read_jsonl_skipping_corrupt(path)
+
+    assert rows == [{"text": "über"}, {"text": "über"}]
+    (warning,) = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert "line 2" in warning.getMessage() and str(path) in warning.getMessage()
+
+
+def _torn_utf8_bytes() -> bytes:
+    import json
+
+    good = json.dumps({"text": "über"}, ensure_ascii=False).encode("utf-8")
+    torn = good[: good.index("ü".encode()) + 1]
+    return good + b"\n" + torn + good + b"\n" + good + b"\n"
+
+
+def test_streaming_reader_skips_invalid_utf8_plain_and_gzip(tmp_path, caplog):
+    """#433: iter_jsonl_streaming (audit readers over active + .gz archives) had
+    the same raise-out-of-the-loop failure."""
+    import gzip
+    import logging
+
+    from brain.health.jsonl_reader import iter_jsonl_streaming
+
+    plain = tmp_path / "audit.jsonl"
+    plain.write_bytes(_torn_utf8_bytes())
+    gz = tmp_path / "audit.jsonl.1.gz"
+    gz.write_bytes(gzip.compress(_torn_utf8_bytes()))
+    for path in (plain, gz):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="brain.health.jsonl_reader"):
+            rows = list(iter_jsonl_streaming(path))
+        assert rows == [{"text": "über"}, {"text": "über"}], path
+        assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1, path
