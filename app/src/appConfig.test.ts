@@ -69,3 +69,21 @@ describe("revertBrain", () => {
     expect(mockInvoke).toHaveBeenCalledWith("revert_brain");
   });
 });
+
+describe("ensureBridgeRunning", () => {
+  it("drops the persona's cached bridge credentials, since a spawned bridge writes new ones (#365)", async () => {
+    const { getBridgeCredentials, resetBridgeCredentialCache } = await import("./bridge");
+    const { ensureBridgeRunning } = await import("./appConfig");
+    resetBridgeCredentialCache();
+    mockInvoke.mockImplementation(async (cmd) =>
+      cmd === "get_bridge_credentials" ? { port: 41001, auth_token: "tok" } : undefined,
+    );
+
+    await getBridgeCredentials("alice");
+    await ensureBridgeRunning("alice");
+    await getBridgeCredentials("alice");
+
+    const credentialReads = mockInvoke.mock.calls.filter(([cmd]) => cmd === "get_bridge_credentials");
+    expect(credentialReads).toHaveLength(2);
+  });
+});

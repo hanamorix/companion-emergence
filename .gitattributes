@@ -19,3 +19,6 @@
 
 # nell.cmd template: keep LF in the working tree so the render step controls line endings (#408)
 app/src-tauri/nell-shortcut/src/nell_cmd.tmpl text eol=lf
+
+# Signed fixtures: a signature covers exact bytes, so no line-ending conversion (#365).
+app/src-tauri/src/brain_update_fixtures/** -text

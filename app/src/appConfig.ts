@@ -8,6 +8,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import { resetBridgeCredentialCache } from "./bridge";
 import { errString } from "./lib/errString";
 
 export interface AppConfig {
@@ -116,6 +117,9 @@ export async function ensureBridgeRunning(persona: string): Promise<void> {
       return;
     }
     throw e;
+  } finally {
+    // A spawned bridge writes a new port and token to bridge.json (#365).
+    resetBridgeCredentialCache(persona);
   }
 }
 

@@ -78,17 +78,32 @@ function authOnlyHeaders(creds: BridgeCredentials): HeadersInit {
   return creds.authToken ? { Authorization: `Bearer ${creds.authToken}` } : {};
 }
 
+/** Pass to bridgeFetch for a request that is safe to send twice: a GET, or a
+ *  POST whose effect does not stack (a content-addressed upload, a setter
+ *  that writes a value). */
+const REPLAYABLE = { replayOnNetworkError: true } as const;
+
 async function bridgeFetch(
   persona: string,
   makeRequest: (creds: BridgeCredentials) => Promise<Response>,
+  { replayOnNetworkError = false }: { replayOnNetworkError?: boolean } = {},
 ): Promise<Response> {
   const creds = await getBridgeCredentials(persona);
   try {
     const response = await makeRequest(creds);
+    // A 401 comes from the auth dependency, before any handler runs, so the
+    // request had no effect and is always safe to send again.
     if (response.status !== 401 && response.status !== 403) return response;
-  } catch {
-    // Network failures usually mean the bridge restarted and rewrote bridge.json.
-    // Fall through to the single credential refresh below.
+  } catch (e) {
+    // Network failures usually mean the bridge restarted and rewrote
+    // bridge.json. A request that failed in flight may already have reached
+    // the bridge (#365), so a non-replayable one is sent again only when the
+    // fresh credentials name a different address: the old bridge is gone, so
+    // the request was refused, never handled.
+    resetBridgeCredentialCache(persona);
+    const fresh = await getBridgeCredentials(persona);
+    if (!replayOnNetworkError && fresh.url === creds.url) throw e;
+    return await makeRequest(fresh);
   }
 
   resetBridgeCredentialCache(persona);
@@ -227,6 +242,7 @@ export interface FeedEntry {
 async function fetchPersonaStateOnce(persona: string): Promise<PersonaState> {
   const r = await bridgeFetch(persona, (creds) =>
     fetch(`${creds.url}/persona/state`, { headers: authHeaders(creds) }),
+    REPLAYABLE,
   );
   if (!r.ok) throw new Error(`/persona/state ${r.status}`);
   return await r.json();
@@ -239,6 +255,7 @@ export async function fetchPersonaState(persona: string): Promise<PersonaState> 
 export async function fetchPersonaFeed(persona: string): Promise<FeedEntry[]> {
   const r = await bridgeFetch(persona, (creds) =>
     fetch(`${creds.url}/persona/feed`, { headers: authHeaders(creds) }),
+    REPLAYABLE,
   );
   if (!r.ok) throw new Error(`/persona/feed ${r.status}`);
   const data = (await r.json()) as { entries: FeedEntry[] };
@@ -280,6 +297,7 @@ export async function newSession(persona: string): Promise<string> {
 export async function fetchActiveSession(persona: string): Promise<string | null> {
   const r = await bridgeFetch(persona, (creds) =>
     fetch(`${creds.url}/sessions/active`, { headers: authHeaders(creds) }),
+    REPLAYABLE,
   );
   if (!r.ok) throw new Error(`/sessions/active ${r.status}`);
   const data = (await r.json()) as { session_id: string | null };
@@ -333,6 +351,7 @@ export async function uploadImage(persona: string, file: File): Promise<FileUplo
   // Note: don't set Content-Type — fetch will pick the multipart boundary.
   const r = await bridgeFetch(persona, (creds) =>
     fetch(`${creds.url}/upload`, { method: "POST", headers: authOnlyHeaders(creds), body: fd }),
+    REPLAYABLE,
   );
   if (!r.ok) {
     let detail = "";
@@ -533,7 +552,12 @@ export async function shutdownBridge(
  * (older bridges) — the UI shows the message verbatim.
  */
 export async function invokeForceRestart(persona: string): Promise<void> {
-  await invoke<void>("force_restart_bridge", { persona });
+  try {
+    await invoke<void>("force_restart_bridge", { persona });
+  } finally {
+    // The respawned bridge writes a new port and token to bridge.json (#365).
+    resetBridgeCredentialCache(persona);
+  }
 }
 
 // ── Chat history hydration (v0.0.15-alpha.2 Phase 3B) ──────────────────
@@ -584,6 +608,7 @@ export async function fetchChatHistory(
   const qs = params.toString();
   const r = await bridgeFetch(persona, (creds) =>
     fetch(`${creds.url}/chat/history?${qs}`, { headers: authOnlyHeaders(creds) }),
+    REPLAYABLE,
   );
   if (!r.ok) throw new Error(`/chat/history ${r.status}`);
   return (await r.json()) as ChatHistoryResponse;
@@ -612,6 +637,7 @@ export interface BridgeHealth {
 export async function fetchHealth(persona: string): Promise<BridgeHealth> {
   const r = await bridgeFetch(persona, (creds) =>
     fetch(`${creds.url}/health`, { headers: authOnlyHeaders(creds) }),
+    REPLAYABLE,
   );
   if (!r.ok) throw new Error(`/health ${r.status}`);
   return (await r.json()) as BridgeHealth;
@@ -636,6 +662,7 @@ export async function setPersonaModel(persona: string, model: ChatModel): Promis
       headers: authHeaders(creds),
       body: JSON.stringify({ model }),
     }),
+    REPLAYABLE,
   );
   if (!r.ok) throw new Error(`setPersonaModel failed: ${r.status}`);
 }
@@ -666,6 +693,7 @@ export async function setPersonaNotes(
       headers: authHeaders(creds),
       body: JSON.stringify({ enabled }),
     }),
+    REPLAYABLE,
   );
   if (!r.ok) throw new Error(`setPersonaNotes failed: ${r.status}`);
   return (await r.json()) as NotesConfig;
@@ -687,6 +715,7 @@ export async function setKindledLinkEnabled(
       headers: authHeaders(creds),
       body: JSON.stringify({ enabled, relay_url: relayUrl }),
     }),
+    REPLAYABLE,
   );
   if (!r.ok) throw new Error(`setKindledLinkEnabled failed: ${r.status}`);
   return (await r.json()) as KindledLinkConfig;
@@ -708,6 +737,7 @@ export interface KindledLinkStatus {
 export async function fetchKindledLinkStatus(persona: string): Promise<KindledLinkStatus> {
   const r = await bridgeFetch(persona, (creds) =>
     fetch(`${creds.url}/kindled-link/status`, { headers: authHeaders(creds) }),
+    REPLAYABLE,
   );
   if (!r.ok) throw new Error(`/kindled-link/status ${r.status}`);
   return (await r.json()) as KindledLinkStatus;
@@ -726,6 +756,7 @@ export async function setPersonaPronouns(
       headers: authHeaders(creds),
       body: JSON.stringify({ preset }),
     }),
+    REPLAYABLE,
   );
   if (r.status === 404) {
     // Route absent = the running bridge predates the pronouns endpoint
@@ -836,6 +867,7 @@ export interface AttunementPayload {
 export async function fetchAttunement(persona: string): Promise<AttunementPayload> {
   const r = await bridgeFetch(persona, (creds) =>
     fetch(`${creds.url}/persona/attunement`, { headers: authHeaders(creds) }),
+    REPLAYABLE,
   );
   if (!r.ok) throw new Error(`/persona/attunement ${r.status}`);
   return (await r.json()) as AttunementPayload;
@@ -957,6 +989,7 @@ export interface KindledHolds {
 export async function fetchKindledPeers(persona: string): Promise<KindledPeer[]> {
   const r = await bridgeFetch(persona, (creds) =>
     fetch(`${creds.url}/kindled-link/peers`, { headers: authHeaders(creds) }),
+    REPLAYABLE,
   );
   if (!r.ok) throw new Error(`/kindled-link/peers ${r.status}`);
   return ((await r.json()) as { peers: KindledPeer[] }).peers;
@@ -971,6 +1004,7 @@ export async function fetchKindledTranscript(persona: string, peerId: string): P
   const r = await bridgeFetch(persona, (creds) =>
     fetch(`${creds.url}/kindled-link/peers/${encodeURIComponent(peerId)}/transcript`,
       { headers: authHeaders(creds) }),
+    REPLAYABLE,
   );
   if (!r.ok) throw new Error(`/kindled-link/transcript ${r.status}`);
   return ((await r.json()) as { transcript: KindledTranscriptRow[] }).transcript;
@@ -983,6 +1017,7 @@ export async function fetchKindledTranscript(persona: string, peerId: string): P
 export async function fetchKindledHolds(persona: string): Promise<KindledHolds> {
   const r = await bridgeFetch(persona, (creds) =>
     fetch(`${creds.url}/kindled-link/holds`, { headers: authHeaders(creds) }),
+    REPLAYABLE,
   );
   if (!r.ok) throw new Error(`/kindled-link/holds ${r.status}`);
   return (await r.json()) as KindledHolds;
@@ -1069,6 +1104,7 @@ export interface KindledMyCode {
 export async function fetchKindledMyCode(persona: string): Promise<KindledMyCode> {
   const r = await bridgeFetch(persona, (creds) =>
     fetch(`${creds.url}/kindled-link/my-code`, { headers: authHeaders(creds) }),
+    REPLAYABLE,
   );
   if (!r.ok) throw new Error(`/kindled-link/my-code ${r.status}`);
   return (await r.json()) as KindledMyCode;
