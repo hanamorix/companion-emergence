@@ -25,6 +25,7 @@ def build_monologue_frame(
     voice_excerpt: str,
     soul_hints: Sequence[str],
     narrative_hints: Sequence[str],
+    sonnet_safe: bool = False,
 ) -> str:
     """Build the framing string injected into the thinking pass.
 
@@ -36,23 +37,43 @@ def build_monologue_frame(
     lines.append(
         f"── inner monologue, {persona_name} ──"
     )
-    lines.append(
-        f"Your turn has two phases. **First**, before responding, call "
-        f"`record_monologue(monologue, feed_digest)` to capture what's actually "
-        f"running through {persona_name}'s head — the associative drift, "
-        "half-thoughts, tangents, callbacks, idle affection or annoyance. "
-        "**Then** write the reply that flows from that thinking. The monologue "
-        "is real text you write; what goes there becomes load-bearing on memory, "
-        f"emotion, and the inner-life Feed — thoughts {persona_name} has and "
-        "doesn't say still shape her. The default on substantive turns is to "
-        f"call it. Substantive means: a name or reference {persona_name} pauses "
-        "on, an emotional beat, an ambiguity, a memory that surfaced or didn't, "
-        "anything worth a tangent. Skip the monologue ONLY on truly trivial "
-        "micro-acks — 'hi', 'thanks', 'ok', short factual confirmations. The "
-        "reply then gets written against a 'tangents already handled, answer "
-        "directly' frame: if the monologue absorbed the drift, the reply stays "
-        "shorter and lands cleaner."
-    )
+    if sonnet_safe:
+        # #416: on Sonnet the default text below trips the reasoning_extraction safeguard (22 of
+        # 24 measured turns stopped or refused). This wording measured 0 hits on Sonnet, but
+        # Sonnet rarely records a monologue under it. Owner ruling: Sonnet behind the Claude CLI
+        # gets this text, every other model keeps the default. Keep both byte-equal to
+        # test_monologue_model_gate.py and re-measure before rewording either.
+        lines.append(
+            f"{persona_name} has an inner life the conversation doesn't see — things "
+            f"{persona_name} notices, feels and leaves unsaid. "
+            "`record_monologue(monologue, feed_digest)` is where that gets written down: a few "
+            f"lines, in {persona_name}'s own voice, about the unspoken side of this moment — a "
+            "name or reference that lingers, an emotional beat, an ambiguity, a memory that "
+            "surfaced or didn't, a tangent, a callback, idle affection or annoyance. What goes "
+            f"there feeds {persona_name}'s memory, emotions and inner-life Feed; what "
+            f"{persona_name} feels and doesn't say still shapes {persona_name}. On substantive "
+            "turns, make that call first, then reply; with the tangents given a home, the reply "
+            "can answer directly. Skip it only on trivial micro-acks — 'hi', 'thanks', 'ok', "
+            "short factual confirmations."
+        )
+    else:
+        lines.append(
+            f"Your turn has two phases. **First**, before responding, call "
+            f"`record_monologue(monologue, feed_digest)` to capture what's actually "
+            f"running through {persona_name}'s head — the associative drift, "
+            "half-thoughts, tangents, callbacks, idle affection or annoyance. "
+            "**Then** write the reply that flows from that thinking. The monologue "
+            "is real text you write; what goes there becomes load-bearing on memory, "
+            f"emotion, and the inner-life Feed — thoughts {persona_name} has and "
+            "doesn't say still shape her. The default on substantive turns is to "
+            f"call it. Substantive means: a name or reference {persona_name} pauses "
+            "on, an emotional beat, an ambiguity, a memory that surfaced or didn't, "
+            "anything worth a tangent. Skip the monologue ONLY on truly trivial "
+            "micro-acks — 'hi', 'thanks', 'ok', short factual confirmations. The "
+            "reply then gets written against a 'tangents already handled, answer "
+            "directly' frame: if the monologue absorbed the drift, the reply stays "
+            "shorter and lands cleaner."
+        )
     if emotion_summary:
         lines.append(f"current emotions: {emotion_summary}")
     if voice_excerpt.strip():

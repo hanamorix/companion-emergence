@@ -78,7 +78,7 @@ def render_block(state: SelfModelState) -> str | None:
     lines.append("")
     lines.append(
         "You can sit with it, name it, or let it pass. If one of these feels true "
-        "and you want to adjust your own read, reconcile_self_read is there. It's "
+        "and you want to adjust your own read, `reconcile_self_read` is there. It's "
         "yours to revise, no one else's to insist on."
     )
 
