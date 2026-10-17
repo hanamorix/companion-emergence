@@ -19,6 +19,7 @@ from pathlib import Path
 
 from brain.health.attempt_heal import save_with_backup
 from brain.self_model.gap import Gap
+from brain.utils.log_throttle import warn_throttled
 
 logger = logging.getLogger(__name__)
 
@@ -99,11 +100,11 @@ def load_or_recover(persona_dir: Path) -> tuple[SelfModelState, bool]:
 
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return SelfModelState(), True
+    except (OSError, json.JSONDecodeError) as exc:
+        return _recovered(path, f"unreadable: {exc}")
 
     if not isinstance(raw, dict):
-        return SelfModelState(), True
+        return _recovered(path, f"expected an object, got {type(raw).__name__}")
 
     try:
         current_gap: Gap | None = None
@@ -116,8 +117,18 @@ def load_or_recover(persona_dir: Path) -> tuple[SelfModelState, bool]:
             gap_history.append(_gap_from_dict(item))
 
         return SelfModelState(current_gap=current_gap, gap_history=gap_history), False
-    except Exception:
-        return SelfModelState(), True
+    except Exception as exc:  # noqa: BLE001 -- any malformed gap starts fresh
+        return _recovered(path, f"malformed gap: {exc}")
+
+
+def _recovered(path: Path, why: str) -> tuple[SelfModelState, bool]:
+    """Start fresh, and say so: every caller discards the flag (#367)."""
+    # Callers load this every chat turn until the supervisor saves over it.
+    warn_throttled(
+        logger, f"self_model_state:{path}",
+        "self-model state %s %s; starting from an empty gap history", path, why,
+    )
+    return SelfModelState(), True
 
 
 def save(persona_dir: Path, state: SelfModelState) -> None:

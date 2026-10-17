@@ -81,11 +81,12 @@ def _drain_pending_rotation_notices(
                 peer_id=peer_id,
                 now=now,
             )
-        except RelayUnavailableError:
+        except RelayUnavailableError as exc:
             log_transport(
                 persona_dir,
                 event="rotation_notice_queued",
                 peer_id=peer_id,
+                error=str(exc),
                 now=now,
             )
         except Exception:  # noqa: BLE001 -- fault-isolated; leave in queue
