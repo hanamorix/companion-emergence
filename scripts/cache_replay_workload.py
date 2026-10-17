@@ -229,6 +229,12 @@ def _read_run_slice(path: Path, offset: int, boundaries: tuple[int, ...] | list[
     if boundaries and size < boundaries[-1]:
         raise ValueError(f"{path}: the log shrank during the run (last turn boundary {boundaries[-1]}, size {size} after)")
     size = offset + len(data)
+    # The run's own bytes must decode: a measurement over a slice with a damaged row is not a
+    # measurement (the shared reader would skip that line; this check keeps the run UNMEASURED).
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{path}: the run's rows are not valid UTF-8 ({exc})") from exc
     rows: list[dict] = []
     if data:
         with tempfile.TemporaryDirectory(prefix="crw-slice-") as td:
