@@ -140,3 +140,26 @@ def test_voice_reflection_no_longer_accepts_recent_tones(tmp_path: Path) -> None
             tmp_path, provider=_evidence_provider(emit=False),
             crystallizations=[], dreams=[], recent_tones=[],
         )
+
+
+def test_voice_reflection_records_an_unparseable_reply(tmp_path: Path) -> None:
+    """#364: the tick used to drop the reply with only the exception text."""
+    from brain.health.parse_failures import PARSE_FAILURE_LOG
+
+    provider = MagicMock(complete=MagicMock(return_value="I don't think I should change."))
+    run_voice_reflection_tick(tmp_path, provider=provider, crystallizations=[], dreams=[])
+    (row,) = [json.loads(line) for line in (tmp_path / PARSE_FAILURE_LOG).read_text(encoding="utf-8").splitlines()]
+    assert row["site"] == "voice_reflection" and row["raw"] == "I don't think I should change."
+    assert read_candidates(tmp_path) == []
+
+
+def test_voice_reflection_reads_a_fenced_reply(tmp_path: Path) -> None:
+    """#364: the strict json.loads dropped a fenced proposal that every tolerant site reads."""
+    canned = _evidence_provider(emit=True).complete.return_value
+    provider = MagicMock(complete=MagicMock(return_value=f"```json\n{canned}\n```"))
+    run_voice_reflection_tick(
+        tmp_path, provider=provider,
+        crystallizations=[{"id": "c1", "ts": "2026-05-08T00:00:00+00:00"}],
+        dreams=[{"id": "d1", "ts": "2026-05-09T00:00:00+00:00"}],
+    )
+    assert [c.kind for c in read_candidates(tmp_path)] == ["voice_edit_proposal"]

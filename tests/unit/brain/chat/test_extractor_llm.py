@@ -182,3 +182,42 @@ def test_system_prompt_lists_registered_emotion_channels():
     assert "Registered emotion channels" in system
     sample = sorted(e.name for e in list_all())[0]
     assert sample in system
+
+
+# ── #364: the raw reply survives a failed parse ───────────────────────────────
+def _parse_rows(persona_dir):
+    from brain.health.parse_failures import PARSE_FAILURE_LOG
+
+    path = persona_dir / PARSE_FAILURE_LOG
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
+
+
+def test_malformed_reply_is_recorded_with_its_original_text(tmp_path):
+    raw = "```json\nSure! Here are my thoughts\n```"
+    out = extract_from_thinking(
+        provider=_FakeProvider(raw), monologue_blocks=("m",), visible_reply="hi",
+        recent_turn_context=(), persona_dir=tmp_path,
+    )
+    assert out == ExtractorOutput()
+    (row,) = _parse_rows(tmp_path)
+    assert row["site"] == "extractor" and row["raw"] == raw  # before the fence strip
+
+
+def test_schema_violation_is_recorded(tmp_path):
+    raw = json.dumps({"memory_writes": [{"episode": "x", "salience": 99.0}]})
+    extract_from_thinking(
+        provider=_FakeProvider(raw), monologue_blocks=("m",), visible_reply="hi",
+        recent_turn_context=(), persona_dir=tmp_path,
+    )
+    (row,) = _parse_rows(tmp_path)
+    assert row["site"] == "extractor" and row["raw"] == raw
+
+
+def test_pass2_records_a_malformed_extraction_through_the_live_path(tmp_path, monkeypatch):
+    """Through the pass-2 runner the queue drains (DoD: fires through the path)."""
+    import brain.bridge.model_tier as model_tier
+    from brain.chat.tool_loop import run_pass2_monologue
+
+    monkeypatch.setattr(model_tier, "build_tier_provider", lambda *_a, **_k: _FakeProvider("no json here"))
+    run_pass2_monologue(monologue_text="thinking", visible_reply="hi", recent_user_msgs=(), persona_dir=tmp_path)
+    assert [r["site"] for r in _parse_rows(tmp_path)] == ["extractor"]

@@ -19,6 +19,7 @@ from brain.bridge.provider import LLMProvider
 from brain.engines._interests import Interest, InterestSet, spawn_interest
 from brain.engines.research_notes import append_session_notes, read_notes_tail
 from brain.engines.research_session import parse_session_output
+from brain.health.parse_failures import record_parse_failure
 from brain.memory.store import Memory, MemoryStore
 from brain.search.base import WebSearcher
 from brain.utils.emotion import format_emotion_summary
@@ -58,6 +59,7 @@ def _compute_topic_overlap_via_haiku(
     recent_conversation_excerpt: str,
     provider,
     user_name: str,
+    persona_dir: Path | None = None,
 ) -> float:
     """Score how relevant a matured research thread is to recent conversation."""
     system = _TOPIC_OVERLAP_SYSTEM.format(user_name=user_name)
@@ -69,10 +71,13 @@ def _compute_topic_overlap_via_haiku(
 
     try:
         raw = provider.generate(prompt, system=system)
-        data = json.loads(extract_json_object(raw))
-        score = float(data["score"])
-    except (ValueError, KeyError, TypeError, json.JSONDecodeError, OSError) as exc:
+    except (ValueError, KeyError, TypeError, OSError) as exc:
         logger.warning("topic_overlap haiku call failed (%s); returning 0.0", exc)
+        return 0.0
+    try:
+        score = float(json.loads(extract_json_object(raw))["score"])
+    except (ValueError, KeyError, TypeError) as exc:
+        record_parse_failure(persona_dir, site="research_topic_overlap", raw=raw, error=str(exc))
         return 0.0
     return max(0.0, min(1.0, score))
 
@@ -414,6 +419,10 @@ class ResearchEngine:
             raw = self.provider.generate(
                 prompt, system=_SELECT_SYSTEM.format(persona_name=self.persona_name)
             )
+        except (ValueError, KeyError, TypeError, OSError) as exc:
+            logger.warning("research select failed (%s); mechanical fallback", exc)
+            return eligible[0], ""
+        try:
             data = json.loads(extract_json_object(raw))
             why = str(data.get("why", "")).strip()[:280]
             choice = data.get("choice")
@@ -423,8 +432,10 @@ class ResearchEngine:
                 if i.id == str(choice):
                     return i, why
             return top[0], ""  # unknown id -> mechanical fallback
-        except (ValueError, KeyError, TypeError, json.JSONDecodeError, OSError) as exc:
-            logger.warning("research select failed (%s); mechanical fallback", exc)
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            record_parse_failure(
+                self.interests_path.parent, site="research_select", raw=raw, error=str(exc)
+            )
             return eligible[0], ""
 
     def _seed_interests_from_voice(self) -> bool:
@@ -696,6 +707,7 @@ def _emit_research_candidate(
             recent_conversation_excerpt=recent_excerpt,
             provider=provider,
             user_name=user_name,
+            persona_dir=persona_dir,
         )
 
         gate_ok, gate_reason = gate_research_completion(

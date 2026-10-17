@@ -323,6 +323,14 @@ def test_review_parse_failure_becomes_defer(tmp_path: Path) -> None:
     assert report.parse_failures >= 1
     assert report.deferred >= 1
     assert report.decisions[0].parse_error != ""
+    # #364: the reply behind the parse failure is kept, not just its error.
+    import json as _json
+
+    from brain.health.parse_failures import PARSE_FAILURE_LOG
+
+    rows = [_json.loads(line) for line in (tmp_path / PARSE_FAILURE_LOG).read_text(encoding="utf-8").splitlines()]
+    assert [r["site"] for r in rows] == ["soul_review"]
+    assert rows[0]["raw"] == provider.generate("", system="")
 
     store.close()
     soul_store.close()

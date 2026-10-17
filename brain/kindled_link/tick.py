@@ -121,7 +121,8 @@ def run_kindled_link_tick(
         return {"skipped": True}
 
     # 2. Recover half-finished outbound drafts (re-gates each; never blind-resend)
-    engine_kwargs: dict = {"store": store, "identity": identity, "provider": provider}
+    engine_kwargs: dict = {"store": store, "identity": identity, "provider": provider,
+                           "persona_dir": persona_dir}
     if gate is not None:
         engine_kwargs["gate"] = gate
     if throttle is not None:

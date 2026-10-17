@@ -54,12 +54,12 @@ _DEFAULT_STAGE = "stranger"
 
 class SessionEngine:
     def __init__(self, *, store, identity, provider, gate=None,
-                 throttle=_default_throttle) -> None:
+                 throttle=_default_throttle, persona_dir=None) -> None:
         self._store = store
         self._identity = identity
         self._provider = provider
         self._gate = gate if gate is not None else PrivacyGate(
-            provider=provider, store=store
+            provider=provider, store=store, persona_dir=persona_dir
         )
         self._throttle = throttle
 

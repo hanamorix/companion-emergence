@@ -192,3 +192,17 @@ def test_regression_signal_hold_count_regresses_stage(tmp_path):
     )
     # familiar -1 = acquaintance
     assert st.stage == "acquaintance"
+
+
+def test_malformed_reply_is_recorded_in_the_persona_log(tmp_path):
+    """#364: state stays unchanged and the reply is kept."""
+    import json as _json
+
+    from brain.health.parse_failures import PARSE_FAILURE_LOG
+
+    s = KindledLinkStore(tmp_path / "k.db")
+    run_relationship_reflection(store=s, provider=_P("not json"), peer_id="kid_a",
+        transcript="peer: hi", now=NOW, today="2026-06-20", throttle=_Grant(), persona_dir=tmp_path)
+    rows = [_json.loads(line) for line in (tmp_path / PARSE_FAILURE_LOG).read_text(encoding="utf-8").splitlines()]
+    # A peer's words never land in the persona-root log: length only.
+    assert [(r["site"], r["raw"], r["raw_len"]) for r in rows] == [("kindled_relationship", "", len("not json"))]

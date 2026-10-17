@@ -22,6 +22,7 @@ from brain.attunement.schemas import (
     PatternCandidate,
 )
 from brain.attunement.store import BufferTurn
+from brain.health.parse_failures import record_parse_failure
 
 log = logging.getLogger(__name__)
 
@@ -117,8 +118,9 @@ def _call_haiku(
         return ""
 
 
-def _parse_output(raw: str, source_turn_id: str) -> DetectorOutput:
-    """Parse Haiku's JSON output into DetectorOutput. Drops invalid candidates."""
+def _parse_output(raw: str, source_turn_id: str, persona_dir: Path | None = None) -> DetectorOutput:
+    """Parse Haiku's JSON output into DetectorOutput. Drops invalid candidates.
+    A reply that can't be read is kept in the parse-failure log (#364)."""
     # Strip optional markdown code fence — ClaudeCliProvider returns raw text
     # but some models wrap output in ```json ... ```
     stripped = raw.strip()
@@ -132,8 +134,8 @@ def _parse_output(raw: str, source_turn_id: str) -> DetectorOutput:
 
     try:
         payload: dict[str, Any] = json.loads(stripped)
-    except json.JSONDecodeError:
-        log.info("attunement detector: malformed JSON from Haiku")
+    except json.JSONDecodeError as exc:
+        record_parse_failure(persona_dir, site="attunement", raw=raw, error=f"non-JSON: {exc}")
         return _decline_output(source_turn_id)
 
     try:
@@ -150,8 +152,8 @@ def _parse_output(raw: str, source_turn_id: str) -> DetectorOutput:
             predicted_arc_shape=str(cr.get("predicted_arc_shape", "")),
             schema_version=SCHEMA_VERSION,
         )
-    except (TypeError, ValueError) as exc:
-        log.info("attunement detector: invalid current_read shape: %s", exc)
+    except (AttributeError, TypeError, ValueError) as exc:
+        record_parse_failure(persona_dir, site="attunement", raw=raw, error=f"current_read shape: {exc}")
         return _decline_output(source_turn_id)
 
     candidates: list[PatternCandidate] = []
@@ -251,4 +253,4 @@ def run_detector(
     if not raw:
         return _decline_output(source_turn_id)
 
-    return _parse_output(raw, source_turn_id)
+    return _parse_output(raw, source_turn_id, persona_dir)

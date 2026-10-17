@@ -25,6 +25,7 @@ from typing import Any
 from brain.behavioral.log import append_behavioral_event, read_behavioral_log
 from brain.bridge.provider import LLMProvider, ProviderError
 from brain.creative.dna import load_creative_dna, save_creative_dna
+from brain.health.parse_failures import record_parse_failure
 from brain.memory.store import MemoryStore
 from brain.utils.memory import list_conversation_memories
 
@@ -126,6 +127,7 @@ def crystallize_creative_dna(
 
     parsed = _parse_response(raw)
     if parsed is None:
+        record_parse_failure(persona_dir, site="creative_dna", raw=raw, error="not a JSON object")
         return CreativeDnaCrystallizationResult()
 
     accepted_additions: list[dict[str, Any]] = []

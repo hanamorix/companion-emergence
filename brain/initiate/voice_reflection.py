@@ -8,7 +8,6 @@ identity-modification; they earn a higher emission bar.
 
 from __future__ import annotations
 
-import json
 import logging
 import secrets
 from datetime import UTC, datetime
@@ -16,8 +15,10 @@ from pathlib import Path
 from typing import Any
 
 from brain import prompt_strings
+from brain.health.parse_failures import record_parse_failure
 from brain.initiate.emit import emit_initiate_candidate
 from brain.initiate.schemas import SemanticContext
+from brain.utils.llm_output import loads_json_object
 
 logger = logging.getLogger(__name__)
 
@@ -72,12 +73,16 @@ def run_voice_reflection_tick(
 
         try:
             raw = provider.complete(prompt).strip()
-            parsed = json.loads(raw)
         except cli_throttle.ThrottleDeferred as exc:
             logger.info("voice reflection deferred: %s", exc)  # #246: not a failure
             return
-        except (json.JSONDecodeError, Exception) as exc:
-            logger.warning("voice reflection LLM output unparseable: %s", exc)
+        except Exception as exc:  # noqa: BLE001 -- the provider call itself failed
+            logger.warning("voice reflection LLM call failed: %s", exc)
+            return
+        try:
+            parsed = loads_json_object(raw)
+        except ValueError as exc:
+            record_parse_failure(persona_dir, site="voice_reflection", raw=raw, error=str(exc))
             return
 
         if not parsed.get("should_propose"):

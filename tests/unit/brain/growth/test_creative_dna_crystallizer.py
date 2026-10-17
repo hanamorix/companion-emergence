@@ -150,6 +150,11 @@ def test_returns_empty_on_malformed_json(persona_dir, store, hebbian):
         now=datetime.now(UTC),
     )
     assert result == CreativeDnaCrystallizationResult([], [], [])
+    # #364: the reply that caused the empty result is kept.
+    from brain.health.parse_failures import PARSE_FAILURE_LOG
+
+    (row,) = [json.loads(line) for line in (persona_dir / PARSE_FAILURE_LOG).read_text(encoding="utf-8").splitlines()]
+    assert row["site"] == "creative_dna" and row["raw"] == "not valid json prose response"
 
 
 def test_gate_1_invalid_name_rejected(persona_dir, store, hebbian):

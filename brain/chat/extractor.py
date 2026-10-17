@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from brain import prompt_strings
 from brain.bridge.provider import LLMProvider
+from brain.health.parse_failures import record_parse_failure
 
 logger = logging.getLogger(__name__)
 
@@ -216,10 +217,12 @@ def extract_from_thinking(
     monologue_blocks: tuple[str, ...],
     visible_reply: str,
     recent_turn_context: tuple[str, ...],
+    persona_dir: Path | None = None,
 ) -> ExtractorOutput:
     """Run the pass-2 extraction call. Returns empty output on any failure.
 
-    Empty `monologue_blocks` short-circuits without an LLM call.
+    Empty `monologue_blocks` short-circuits without an LLM call. A reply that
+    doesn't parse is kept in the parse-failure log under ``persona_dir`` (#364).
     """
     if not monologue_blocks:
         return ExtractorOutput()
@@ -231,6 +234,7 @@ def extract_from_thinking(
         logger.warning("extractor LLM call failed: %s", exc)
         return ExtractorOutput()
 
+    reply = raw
     # Strip optional markdown code fence. ClaudeCliProvider returns raw text
     # already; OllamaProvider passes through model output verbatim, where
     # ```json\n...\n``` is common.
@@ -247,13 +251,13 @@ def extract_from_thinking(
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
-        logger.warning("extractor returned non-JSON: %s", exc)
+        record_parse_failure(persona_dir, site="extractor", raw=reply, error=f"non-JSON: {exc}")
         return ExtractorOutput()
 
     try:
         return ExtractorOutput.model_validate(data)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("extractor JSON failed schema validation: %s", exc)
+        record_parse_failure(persona_dir, site="extractor", raw=reply, error=f"schema: {exc}")
         return ExtractorOutput()
 
 
