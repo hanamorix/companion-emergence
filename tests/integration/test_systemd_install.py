@@ -89,7 +89,10 @@ def _poll_unit_property(
 def test_install_creates_unit_file_and_systemd_loads_it(tmp_path: Path) -> None:
     """Round-trip: install → assert unit file + systemd loaded it → uninstall."""
     if not _systemd_user_available():
-        pytest.skip("systemd --user not available on this host (expected in CI containers)")
+        pytest.skip(
+            "systemd --user not available on this host (expected in CI containers); "
+            "real-machine run tracked in docs/releases/cross-platform-validation.md"
+        )
 
     # KINDLED_HOME → data dir. The systemd backend writes unit files to
     # the real ~/.config/systemd/user/, not under KINDLED_HOME, so the
