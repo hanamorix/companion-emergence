@@ -98,3 +98,48 @@ def test_displaced_resolved_gap_no_warning(caplog):
     assert not any("unresolved" in r.message.lower() for r in caplog.records)
     # but the displaced gap still lands in history
     assert len(result.gap_history) == 1
+
+
+def test_recovering_from_a_bad_state_file_is_logged(tmp_path, monkeypatch, caplog):
+    """#367: all five callers discard the `recovered` flag, so a corrupt file
+    silently became an empty gap history. The loader now says so itself."""
+    import logging
+
+    from brain.self_model.state import _state_path, load_or_recover
+    from brain.utils import log_throttle
+
+    for bad in ("{ not json", "[1, 2]", '{"gap_history": 7}'):
+        monkeypatch.setattr(log_throttle, "_last", {})
+        _state_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+        _state_path(tmp_path).write_text(bad, encoding="utf-8")
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="brain.self_model.state"):
+            _state, recovered = load_or_recover(tmp_path)
+        assert recovered is True
+        assert any("self-model state" in r.getMessage() for r in caplog.records), bad
+
+
+def test_a_missing_state_file_is_not_logged(tmp_path, caplog):
+    import logging
+
+    from brain.self_model.state import load_or_recover
+
+    with caplog.at_level(logging.WARNING, logger="brain.self_model.state"):
+        assert load_or_recover(tmp_path)[1] is False
+    assert caplog.records == []
+
+
+
+def test_a_corrupt_state_file_warns_once_not_every_turn(tmp_path, monkeypatch, caplog):
+    """#367 review: chat turns load this; a corrupt file must not warn per turn."""
+    import logging
+
+    from brain.self_model.state import _state_path, load_or_recover
+    from brain.utils import log_throttle
+
+    monkeypatch.setattr(log_throttle, "_last", {})
+    _state_path(tmp_path).write_text("{ not json", encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="brain.self_model.state"):
+        for _ in range(3):
+            load_or_recover(tmp_path)
+    assert len([r for r in caplog.records if r.levelno >= logging.WARNING]) == 1
