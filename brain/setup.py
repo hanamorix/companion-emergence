@@ -88,6 +88,8 @@ def write_persona_config(
     if mcp_audit_log_level is not None:
         cfg.mcp_audit_log_level = mcp_audit_log_level
     if model is not None:
+        if model != cfg.model:
+            cfg.derived_unavailable = []  # #441: the list belongs to the chat model it was tested for
         cfg.model = model
     if user_pronouns is not None:
         from brain.pronouns import PRESETS, to_dict

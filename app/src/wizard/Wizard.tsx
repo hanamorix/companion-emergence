@@ -25,6 +25,7 @@ import { StepInstalling } from "./steps/StepInstalling";
 import { StepReady } from "./steps/StepReady";
 import { errString } from "../lib/errString";
 import { computeWizardSteps } from "./wizardStepCounter";
+import { wizardInitModel } from "./chatModel";
 
 export type WizardMode = "fresh" | "migrate";
 export type VoiceTemplate = "default" | "nell-example" | "skip";
@@ -38,6 +39,8 @@ export interface WizardState {
   userName: string;
   userPronouns: string;
   voiceTemplate: VoiceTemplate;
+  /** Optional Claude model (alias or full id); blank = the default. */
+  chatModel: string;
   migrateFromPath: string;
   migrateSource: MigrateSource;
 }
@@ -48,6 +51,7 @@ const INITIAL_STATE: WizardState = {
   userName: "",
   userPronouns: "they/them",
   voiceTemplate: "default",
+  chatModel: "",
   migrateFromPath: "",
   migrateSource: "nellbrain",
 };
@@ -209,7 +213,7 @@ export function Wizard({ onDone }: Props) {
         migrate_from:
           state.mode === "migrate" && !useEmergenceKitMigrator ? state.migrateFromPath : null,
         force: false,
-        model: DEFAULT_INIT_MODEL,
+        model: wizardInitModel(state.chatModel, DEFAULT_INIT_MODEL),
       };
 
       if (useEmergenceKitMigrator) {
@@ -339,6 +343,8 @@ export function Wizard({ onDone }: Props) {
           totalSteps={totalSteps}
           template={state.voiceTemplate}
           onTemplateChange={(t) => update("voiceTemplate", t)}
+          chatModel={state.chatModel}
+          onChatModelChange={(m) => update("chatModel", m)}
           // voice always proceeds to review (migrate step is now earlier in the flow)
           onNext={() => setStep("review")}
           onBack={() => setStep("user")}

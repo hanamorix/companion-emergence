@@ -169,7 +169,7 @@ _TAGGER_SYSTEM_PROMPT = prompt_strings.register("ingest.emotion_backfill.tagger_
 _TAGGER_PROMPT_SEGMENTS = prompt_strings.register_segments("ingest.emotion_backfill.tagger_prompt_segments")
 
 
-def _make_default_tagger(provider: LLMProvider | None) -> Callable:
+def _make_default_tagger(provider: LLMProvider | None, persona_dir: Path | None = None) -> Callable:
     """Return a tagger closure that calls ``provider.generate`` for each memory.
 
     When ``provider`` is None, constructs a ``ClaudeCliProvider`` pointed at
@@ -177,11 +177,11 @@ def _make_default_tagger(provider: LLMProvider | None) -> Callable:
     ``brain/attunement/detector.py``.
     """
     if provider is None:
-        from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER, model_for_tier
+        from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER, resolve_tier_model
         from brain.bridge.provider import ClaudeCliProvider
 
         provider = ClaudeCliProvider(
-            model=model_for_tier(TIER_BACKGROUND_CLASSIFIER),
+            model=resolve_tier_model(persona_dir, TIER_BACKGROUND_CLASSIFIER)[0],
             timeout_seconds=_BACKFILL_TIMEOUT_SECONDS,
         )
 
@@ -344,7 +344,7 @@ def run_emotion_backfill(
     Mirrors ``brain.attunement.backfill.run_backfill``.
     """
     if tagger_fn is None:
-        tagger_fn = _make_default_tagger(provider)
+        tagger_fn = _make_default_tagger(provider, persona_dir)
 
     now_dt = now_dt or _datetime.now(UTC)
     now_iso = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
