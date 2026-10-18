@@ -2012,13 +2012,18 @@ def build_app(
         current = PersonaConfig.load(config_path)
         updated = dc_replace(current, model=req.model)
         updated.save(config_path)
+        model_error.switch(current.model, req.model, keep=set(TIER_MODEL.values()))
+        # Mark (or clear) BEFORE the hot-swap: the provider can only produce a clean reply for the new model
+        # after the swap, and that reply clears the mark. A re-Apply of the model already saved unchecked
+        # goes through here too (switch() ignores old == new), so a passing check clears the old mark.
+        if checked is False:
+            model_error.note_unconfirmed(req.model)  # shown in /persona/state until a clean reply
+        else:
+            model_error.clear_unconfirmed(req.model)
         # Hot-swap: if the live provider exposes _model, update it so the
         # next chat call uses the new model without a bridge restart.
         if hasattr(s.provider, "_model"):
             s.provider._model = req.model
-        model_error.switch(current.model, req.model, keep=set(TIER_MODEL.values()))
-        if checked is False:
-            model_error.note_unconfirmed(req.model)  # shown in /persona/state until a clean reply
         body: dict[str, Any] = {"ok": True, "model": req.model}
         if checked is not None:
             body["checked"] = checked

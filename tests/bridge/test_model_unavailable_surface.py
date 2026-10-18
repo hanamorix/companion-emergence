@@ -223,6 +223,18 @@ def test_unconfirmed_save_is_reported_until_a_clean_reply_arrives(persona_dir: P
         assert c.get("/persona/state").json()["model_unconfirmed"] == []
 
 
+def test_a_passing_recheck_of_the_same_unconfirmed_model_clears_the_mark(persona_dir: Path, monkeypatch):
+    quota = json.dumps({"is_error": True, "api_error_status": 429, "result": "You've hit your session limit"})
+    mode = {"ok": False}
+    run = _Run(lambda m: _proc(0, _ok_json()) if mode["ok"] else _proc(1, quota))
+    with _client(persona_dir, monkeypatch) as c, patch("subprocess.run", run):
+        assert _post_model(c, "claude-sonnet-5").json()["checked"] is False
+        assert c.get("/persona/state").json()["model_unconfirmed"] == ["claude-sonnet-5"]
+        mode["ok"] = True  # the same id again, now the check passes (old == new, so switch() is a no-op)
+        assert _post_model(c, "claude-sonnet-5").json()["checked"] is True
+        assert c.get("/persona/state").json()["model_unconfirmed"] == []
+
+
 def test_confirmed_save_and_alias_leave_nothing_unconfirmed(persona_dir: Path, monkeypatch):
     with _client(persona_dir, monkeypatch) as c, patch("subprocess.run", _Run(lambda m: _proc(0, _ok_json()))):
         _post_model(c, "claude-sonnet-5")

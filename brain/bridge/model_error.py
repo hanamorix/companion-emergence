@@ -148,6 +148,15 @@ def note_unconfirmed(model: str) -> None:
         log.warning("model_error.note_unconfirmed failed (ignored)", exc_info=True)
 
 
+def clear_unconfirmed(model: str) -> None:
+    """A check just confirmed ``model`` (or it needs no check): drop its unconfirmed mark."""
+    try:
+        with _lock:
+            _unconfirmed.discard(model)
+    except Exception:  # noqa: BLE001 - fail open
+        log.warning("model_error.clear_unconfirmed failed (ignored)", exc_info=True)
+
+
 def unconfirmed(only: Iterable[str] | None = None) -> list[str]:
     """Models still saved-but-unconfirmed, sorted; restricted to ``only`` when given."""
     try:

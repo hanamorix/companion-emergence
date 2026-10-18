@@ -273,3 +273,10 @@ def test_unconfirmed_mark_clears_on_same_model_success_and_on_switch(tmp_path):
     assert model_error.unconfirmed() == ["claude-other-1"]
     model_error.switch("claude-other-1", "sonnet", keep=frozenset())
     assert model_error.unconfirmed() == []
+
+
+def test_clear_unconfirmed_drops_only_that_model():
+    model_error.note_unconfirmed("claude-a-1")
+    model_error.note_unconfirmed("claude-b-2")
+    model_error.clear_unconfirmed("claude-a-1")
+    assert model_error.unconfirmed() == ["claude-b-2"]
