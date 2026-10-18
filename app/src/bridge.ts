@@ -12,6 +12,8 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import { modelRejectionMessage } from "./lib/friendlyChatError";
+import { isChatModelAlias } from "./lib/modelId";
 
 export interface BridgeCredentials {
   url: string;        // http base — for fetch() calls
@@ -163,6 +165,10 @@ export interface PersonaState {
    *  state). The app shows the re-authorise offer while this is true.
    *  Optional so older bridge builds without the field degrade gracefully. */
   provider_auth_expired?: boolean;
+  /** Models the Claude CLI rejected (unknown, or not available to this account) among the configured
+   *  chat model and the tier models; [] when none. Nothing in the app renders it yet (#440): it is for
+   *  the log/API. Optional so older bridge builds degrade gracefully. */
+  model_rejections?: Array<{ model: string; since: string; last_at: string; count: number }>;
   /** File writes she has proposed and that await the user's approve/decline.
    *  Each is the consent gate for one guarded write — `propose_write` queued
    *  it (writing nothing); the user commits it to disc or discards it via the
@@ -643,17 +649,20 @@ export async function fetchHealth(persona: string): Promise<BridgeHealth> {
   return (await r.json()) as BridgeHealth;
 }
 
-/** The three model tiers the bridge supports. */
-export type ChatModel = "sonnet" | "opus" | "haiku";
+/** The chat model: an alias ("sonnet" | "opus" | "haiku") or a full model id such as "claude-sonnet-5". */
+export type ChatModel = string;
 
 /**
  * Switch the active LLM model for the given persona.
  *
- * POSTs {model} to POST /persona/config/model. The bridge validates
- * against KNOWN_MODELS, persists to persona_config.json, and hot-swaps
+ * POSTs {model} to POST /persona/config/model. The bridge validates the
+ * alias or full id, persists to persona_config.json, and hot-swaps
  * provider._model so the next chat uses the new model without a restart.
+ * For a full id the bridge first makes one check call to Claude; if Claude
+ * rejects the model nothing is saved and the thrown message says so.
  *
- * Throws on any non-2xx response.
+ * Throws on any non-2xx response. A custom id is NOT replayed after a network
+ * failure: the setter is idempotent, but a replay would run a second check call.
  */
 export async function setPersonaModel(persona: string, model: ChatModel): Promise<void> {
   const r = await bridgeFetch(persona, (creds) =>
@@ -662,9 +671,18 @@ export async function setPersonaModel(persona: string, model: ChatModel): Promis
       headers: authHeaders(creds),
       body: JSON.stringify({ model }),
     }),
-    REPLAYABLE,
+    isChatModelAlias(model) ? REPLAYABLE : {},
   );
-  if (!r.ok) throw new Error(`setPersonaModel failed: ${r.status}`);
+  if (!r.ok) {
+    if (r.status === 400) {
+      const body = await r.json().catch(() => null);
+      if (body && body.error === "model_unavailable") {
+        const rejected = typeof body.model === "string" ? body.model : model;
+        throw new Error(modelRejectionMessage(rejected, "picker"));
+      }
+    }
+    throw new Error(`setPersonaModel failed: ${r.status}`);
+  }
 }
 
 /** Response from POST /persona/config/notes. */

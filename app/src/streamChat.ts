@@ -11,11 +11,23 @@
  *     {type: "reply_chunk", text}
  *     {type: "done", session_id, turn, duration_ms, metadata, at}
  *   on error:
- *     {type: "error", code, detail?, done: true}
+ *     {type: "error", code, detail?, model?, done: true}   (model: only with code "model_unavailable")
  */
 
 import { getBridgeCredentials, resetBridgeCredentialCache } from "./bridge";
 import { errString } from "./lib/errString";
+
+/**
+ * The string handed to `onError` for a bridge error frame. A rejected model arrives as
+ * `{code: "model_unavailable", model}`; it is passed on as `model_unavailable:<model>` so
+ * friendlyChatError can name the model. Every other frame keeps its old text.
+ */
+function streamErrorText(frame: { [key: string]: unknown }): string {
+  if (frame.code === "model_unavailable" && typeof frame.model === "string" && frame.model) {
+    return `model_unavailable:${frame.model}`;
+  }
+  return (frame.detail as string) ?? (frame.code as string) ?? "stream error";
+}
 
 export interface StreamChatHandlers {
   /** Called once when the server confirms it's about to respond. */
@@ -195,7 +207,7 @@ export async function streamChat(
           ws?.close();
           break;
         case "error":
-          fail((frame.detail as string) ?? (frame.code as string) ?? "stream error");
+          fail(streamErrorText(frame));
           break;
         default:
           fail(`unknown stream frame: ${frame.type}`);
