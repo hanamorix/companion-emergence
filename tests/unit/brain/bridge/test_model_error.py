@@ -141,6 +141,11 @@ def test_non_rejection_text_records_nothing():
     assert model_error.state() == []
 
 
+def test_rejection_with_no_parsable_model_records_nothing():
+    model_error.note_failure("There's an issue with the selected model")
+    assert model_error.state() == []
+
+
 def test_warning_names_the_model_and_is_throttled(monkeypatch, caplog):
     t = _clock(monkeypatch)
     with caplog.at_level(logging.WARNING, logger=model_error.log.name):
