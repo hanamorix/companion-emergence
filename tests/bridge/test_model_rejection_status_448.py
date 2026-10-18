@@ -295,7 +295,8 @@ def _hostile_lines() -> list[str]:
     # Every line here makes json.loads raise ValueError / RecursionError or is not an assistant dict.
     return [
         "9" * 5000,
-        "[" * 100000,
+        "[" * 100000,  # over the scan's line cap: skipped without parsing
+        "[" * 65000,  # under the cap: reaches json.loads and raises RecursionError on CPython
         json.dumps([1, 2, 3]),
         json.dumps("a string"),
         '{"type": "assistant", "error": 5}',
@@ -315,6 +316,12 @@ def test_assistant_error_scan_survives_hostile_lines():
     assert provider_mod._assistant_error_code("") is None
     assert provider_mod._assistant_error_code("9" * 5000) is None
     assert provider_mod._assistant_error_code("[" * 100000) is None
+    # a line under the cap that really makes json.loads recurse too deep, before and after the real frame
+    deep = "[" * 65000
+    with pytest.raises(RecursionError):
+        json.loads(deep)  # guard: this interpreter really raises here, so the case below exercises the arm
+    real = _ndjson(_reword(F302))
+    assert provider_mod._assistant_error_code(deep + "\n" + real + deep) == "model_not_found"
 
 
 def test_failure_detail_with_benign_hostile_lines_is_still_a_detected_rejection():
@@ -432,21 +439,31 @@ def test_status_404_prefix_is_outside_the_200_char_cut():
     assert len(body) == 200
 
 
-def test_review_string_classifier_reads_the_same_text_as_before():
+@pytest.mark.parametrize("model_id", ["claude-sonet-5", "claude-sonnet-20250429", "claude-moderate-1", "claude-rate-9"])
+def test_review_string_classifier_reads_the_same_text_as_before(model_id):
     """brain/initiate/review.py maps an exception to a rate limit when its lowercased text contains "429" or
-    "rate". The new tokens must not change that answer for any detail. (The wrapper itself raises TypeError for
-    every non-timeout exception today, because of `except (TimeoutError, TimeoutError.__class__)`: an existing
-    bug outside this change, reported to main.)"""
+    "rate". The new tokens, ``model=<id>`` included, must not change that answer: ids containing "429" or "rate"
+    are exactly the ones that could. (The wrapper itself raises TypeError for every non-timeout exception today,
+    because of `except (TimeoutError, TimeoutError.__class__)`: an existing bug outside this change.)"""
 
     def hit(detail: str) -> bool:
         low = detail.lower()
         return "429" in low or "rate" in low
 
     quota = "You've hit your session limit"
-    in_frame_429 = provider_mod._cli_error_detail({"is_error": True, "api_error_status": 429, "result": quota})
+    in_frame_429 = provider_mod._cli_error_detail({"is_error": True, "api_error_status": 429, "result": quota}, model=model_id)
     assert in_frame_429 == quota and hit(in_frame_429) is hit(quota)
-    rej = provider_mod._cli_error_detail(F302[1], error_code="model_not_found", model=BAD)
-    assert hit(rej) is hit(SENT_302)
+    sentence = f"There's an issue with the selected model ({model_id}). It may not exist or you may not have access to it."
+    rej = provider_mod._cli_error_detail({"is_error": True, "api_error_status": 404, "result": sentence}, error_code="model_not_found", model=model_id)
+    # with the sentence present the id is already in the text: the added tokens contribute nothing of their own
+    assert hit(rej) is hit(sentence), "an added token changed what the review classifier reads"
+    # sentence reworded away: the only new text is the id itself in `model=<id>` (a known, documented limit:
+    # an id that contains "429" or "rate" makes a code-only rejection detail match, in a wrapper that today
+    # raises TypeError for every non-timeout error before any mapping happens)
+    bare = provider_mod._cli_error_detail(
+        {"is_error": True, "api_error_status": 404, "result": "Model unknown."}, error_code="model_not_found", model=model_id
+    )
+    assert hit(bare) is (hit("Model unknown.") or hit(model_id))
 
 
 # --- MB8: fixture hygiene -------------------------------------------------------------------------------------------

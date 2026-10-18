@@ -711,6 +711,28 @@ def _apply_recheck_outcomes(persona_dir: Path, chat_model: str, outcomes: dict[s
     return passed
 
 
+# The start-up re-check leaves a stamp file; a start within the Claude CLI re-probe interval of the previous
+# one does not probe again, so a crash loop, an idle-shutdown relaunch or several app relaunches cannot turn
+# into a probe storm. The interval is provider_auth's existing re-probe cadence (900 s), not a new number; the
+# stamp is a file because the repeats are separate processes.
+_RECHECK_STAMP = "derived_model_recheck.stamp"
+
+
+def _recheck_recent(persona_dir: Path) -> bool:
+    try:
+        age = time.time() - (persona_dir / _RECHECK_STAMP).stat().st_mtime
+    except OSError:
+        return False
+    return 0 <= age < provider_auth._reprobe_s()
+
+
+def _stamp_recheck(persona_dir: Path) -> None:
+    try:
+        (persona_dir / _RECHECK_STAMP).write_text("", encoding="utf-8")
+    except OSError:
+        logger.warning("could not write the derived model re-check stamp", exc_info=True)
+
+
 def _recheck_needed(persona_dir: Path, provider: Any) -> bool:
     """True when the bridge should re-test saved unavailable derived ids at start (#449)."""
     from brain.persona_config import KNOWN_MODELS
@@ -721,7 +743,9 @@ def _recheck_needed(persona_dir: Path, provider: Any) -> bool:
         cfg = PersonaConfig.load(persona_dir / "persona_config.json")
     except Exception:  # noqa: BLE001 - start-up never fails on this
         return False
-    return bool(cfg.derived_unavailable) and cfg.model not in KNOWN_MODELS
+    if not cfg.derived_unavailable or cfg.model in KNOWN_MODELS:
+        return False
+    return not _recheck_recent(persona_dir)
 
 
 async def _recheck_derived_unavailable(persona_dir: Path, lock: asyncio.Lock) -> None:
@@ -1351,6 +1375,7 @@ def build_app(
         # created just before the bridge starts serving), sharing the picker Apply's lock and probe budget.
         recheck_task = None
         if bg and _recheck_needed(persona_dir, provider):
+            _stamp_recheck(persona_dir)  # before the probes: a crash during them still throttles the next start
             recheck_task = asyncio.create_task(_recheck_derived_unavailable(persona_dir, model_check_lock))
         app.state.derived_recheck_task = recheck_task
 

@@ -254,6 +254,12 @@ def test_state_display_value_is_cut_and_cleaned(tmp_path: Path):
     assert shown == "bad[31mvalue" and "\x1b" not in shown and "\n" not in shown
 
 
+def test_state_display_of_a_value_with_only_non_printing_characters_is_not_empty(tmp_path: Path):
+    _write(tmp_path, "\u200b\x07")
+    shown = build_persona_state(tmp_path)["model_unsupported"]
+    assert shown == "(non-printing characters)"
+
+
 def test_state_keeps_every_previous_key(tmp_path: Path):
     _write(tmp_path, "opus")
     keys = set(build_persona_state(tmp_path))

@@ -86,7 +86,7 @@ def _warn_unknown_model_once(value: str) -> None:
         _warned_bad_values.clear()
     _warned_bad_values.add(ident)
     logger.warning(
-        "PersonaConfig: unknown model %r — falling back to %r (supported: %s)", value, DEFAULT_MODEL, MODEL_ID_RULE
+        "PersonaConfig: unknown model %r, falling back to %r (supported: %s)", value, DEFAULT_MODEL, MODEL_ID_RULE
     )
 
 
@@ -178,6 +178,8 @@ class PersonaConfig:
         if raw is None:
             return None
         clean = "".join(ch for ch in raw if ch.isprintable())
+        if not clean:  # only control / non-printing characters: say so rather than show an empty value
+            return "(non-printing characters)"
         return clean if len(clean) <= MODEL_ID_MAX_LENGTH else clean[:MODEL_ID_MAX_LENGTH] + "…"
 
     def touch_last_opened(self) -> None:

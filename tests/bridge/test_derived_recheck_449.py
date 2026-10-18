@@ -409,3 +409,43 @@ def test_each_rechecked_id_is_logged_with_its_outcome(persona_dir: Path, monkeyp
     assert any(DERIVED in m and "ok" in m for m in msgs)
     assert any("claude-haiku-6" in m and "rejected" in m for m in msgs)
     assert not any(persona_dir.name in m for m in msgs if "recheck" in m.lower())
+
+
+# --- restart throttle (no probe storm on a crash loop) -----------------------------------------------------------------
+
+
+def test_a_second_start_within_the_reprobe_interval_does_not_probe_again(persona_dir: Path, monkeypatch, bg_stubs):
+    p = _write(persona_dir)
+    run = _Run(lambda m: _proc(1, _rej_json(m)))  # still rejected: the id stays saved, so a restart would re-probe
+    with patch("subprocess.run", run):
+        with TestClient(_app(persona_dir, monkeypatch)) as c:
+            assert _wait(lambda: _recheck_done(c.app))
+        assert run.calls_for(DERIVED) == 1
+        assert (persona_dir / server_mod._RECHECK_STAMP).exists()
+        for _ in range(3):  # a crash loop
+            with TestClient(_app(persona_dir, monkeypatch)) as c:
+                time.sleep(0.2)
+                assert getattr(c.app.state, "derived_recheck_task", None) is None
+    assert run.calls_for(DERIVED) == 1 and _list(p) == [DERIVED]
+
+
+def test_an_old_stamp_lets_the_recheck_run_again(persona_dir: Path, monkeypatch, bg_stubs):
+    import os
+
+    p = _write(persona_dir)
+    stamp = persona_dir / server_mod._RECHECK_STAMP
+    stamp.write_text("")
+    old = time.time() - provider_auth._reprobe_s() - 5
+    os.utime(stamp, (old, old))
+    run = _Run(lambda m: _proc(0, _ok_json()))
+    with patch("subprocess.run", run), TestClient(_app(persona_dir, monkeypatch)) as c:
+        assert _wait(lambda: _recheck_done(c.app))
+    assert run.calls_for(DERIVED) == 1 and _list(p) == []
+    assert time.time() - stamp.stat().st_mtime < 60  # restamped
+
+
+def test_no_stamp_is_written_when_there_is_nothing_to_recheck(persona_dir: Path, monkeypatch, bg_stubs):
+    _write(persona_dir, unavailable=())
+    with patch("subprocess.run", _Run(lambda m: _proc(0, _ok_json()))), TestClient(_app(persona_dir, monkeypatch)):
+        time.sleep(0.2)
+    assert not (persona_dir / server_mod._RECHECK_STAMP).exists()
