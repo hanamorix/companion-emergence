@@ -8,6 +8,7 @@ recent activity) so it is recovery-robust — no scattered producer hooks.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -36,8 +37,11 @@ def load_charge(persona_dir: Path) -> MakerCharge:
     path = _charge_path(persona_dir)
     raw = read_json(path, default=dict, expect=dict)
     try:
+        charge = float(raw.get("charge", 0.0))
+        if not math.isfinite(charge):  # a legacy NaN/Infinity would make every later save raise: treat as corrupt
+            raise ValueError("non-finite charge")
         return MakerCharge(
-            charge=float(raw.get("charge", 0.0)),
+            charge=charge,
             last_tick_ts=raw.get("last_tick_ts"),
             last_fire_ts=raw.get("last_fire_ts"),
             prior_soul_count=int(raw.get("prior_soul_count", 0)),

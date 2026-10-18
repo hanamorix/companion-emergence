@@ -129,7 +129,7 @@ def read_learned_patterns(persona_dir: Path) -> list[LearnedPattern]:
 
 
 def _append_pattern(persona_dir: Path, pattern: LearnedPattern) -> None:
-    append_jsonl(_learned_patterns_path(persona_dir), asdict(pattern))
+    append_jsonl(_learned_patterns_path(persona_dir), asdict(pattern), nonfinite="null")
 
 
 def _maturity_for_count(count: int) -> str:

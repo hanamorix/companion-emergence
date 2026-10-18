@@ -83,7 +83,7 @@ class PendingQueue:
             "_source": source,
             "_enqueued_at": datetime.now(UTC).isoformat(),
         }
-        append_jsonl(self.path, entry)
+        append_jsonl(self.path, entry, nonfinite="null")
 
     def read_recent(self, memory_type: str, *, limit: int) -> list[Memory]:
         """Return up to `limit` most-recent candidates of `memory_type`.

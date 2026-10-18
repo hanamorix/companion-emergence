@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from brain import paths
-from brain.health.json_io import read_json, write_json
+from brain.health.json_io import Recovery, read_json, write_json
 
 logger = logging.getLogger(__name__)
 
@@ -151,11 +151,13 @@ def write_defaults_section() -> None:
     path = _file_path()
     try:
         # A corrupt file is rebuilt (read_json's default; the module logs it), keeping nothing unreadable.
-        data = read_json(path, default=dict, expect=dict)
+        # CONTENT: a corrupt file is rebuilt, but an unreadable one must not wipe the user's overrides
+        # (the read fault raises into the handler below and the file is left as it is).
+        data = read_json(path, default=dict, recover=Recovery.CONTENT, expect=dict)
         overrides: dict[str, Any] = data["overrides"] if isinstance(data.get("overrides"), dict) else {}
         with _lock:
             defaults = dict(_registry)
         payload = {"_readme": _README, "defaults": defaults, "overrides": overrides}
-        write_json(path, payload, indent=2, sort_keys=True, fsync=False)
+        write_json(path, payload, indent=2, sort_keys=True, fsync=False, nonfinite="null")
     except Exception:  # noqa: BLE001 — never break bridge startup
         logger.exception("tunables: write_defaults_section failed (ignored)")

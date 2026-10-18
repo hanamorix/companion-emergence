@@ -67,6 +67,7 @@ def write_gate_rejection(
     observed_value: float,
 ) -> None:
     """Append one rejection row to gate_rejections.jsonl. Never raises."""
+    persona_dir.mkdir(parents=True, exist_ok=True)  # outside the best-effort write, as before: a mkdir fault propagates
     path = persona_dir / "gate_rejections.jsonl"
     row = {
         "ts": ts.isoformat(),

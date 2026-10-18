@@ -24,27 +24,33 @@ def _no_temp_left(directory: Path) -> None:
     assert not left, left
 
 
-def test_bc1_two_threads_saving_one_budget_file_leave_one_whole_file_and_no_temp(tmp_path: Path) -> None:
-    from brain.maker.budget import consume_budget
+def test_bc1_two_threads_saving_one_file_leave_one_whole_file_and_no_temp(tmp_path: Path) -> None:
+    """Deterministic: no read-modify-write count (that races by design); every write is a whole file, the last
+    surviving file is exactly one of the written payloads, and no temp is left behind."""
+    from dataclasses import asdict
+
+    from brain.maker.charge import MakerCharge, _charge_path, save_charge
 
     errors: list[BaseException] = []
+    written = {n: MakerCharge(charge=float(n), last_tick_ts=None, last_fire_ts=None, prior_soul_count=n) for n in (1, 2)}
+    barrier = threading.Barrier(2)
 
-    def run() -> None:
+    def run(n: int) -> None:
         try:
-            for _ in range(20):
-                consume_budget(tmp_path, now=NOW, cap=10_000)
+            barrier.wait()
+            for _ in range(50):
+                save_charge(tmp_path, written[n])
         except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
 
-    threads = [threading.Thread(target=run) for _ in range(2)]
+    threads = [threading.Thread(target=run, args=(n,)) for n in written]
     [t.start() for t in threads]
     [t.join() for t in threads]
     assert not errors
-    data = json.loads((tmp_path / "maker_budget.json").read_text()) if (tmp_path / "maker_budget.json").exists() else None
-    files = [p for p in tmp_path.iterdir() if p.suffix == ".json"]
-    assert len(files) == 1 and json.loads(files[0].read_text())["count"] >= 20
+    path = _charge_path(tmp_path)
+    assert json.loads(path.read_text()) in [asdict(v) for v in written.values()]
+    assert [p.name for p in path.parent.iterdir() if p.is_file()] == [path.name]
     _no_temp_left(tmp_path)
-    del data
 
 
 def test_bc2_characterization_fsync_is_preserved_per_site(tmp_path: Path, monkeypatch) -> None:

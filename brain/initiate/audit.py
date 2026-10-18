@@ -107,7 +107,7 @@ def update_audit_state(
                 rows.append(row)
             if not found:
                 return
-            if not write_jsonl(path, [r.to_dict() for r in rows], fsync=False, on_error="log"):
+            if not write_jsonl(path, [r.to_dict() for r in rows], fsync=False, on_error="log", nonfinite="null"):
                 return
         if lag_seconds is not None:
             try:

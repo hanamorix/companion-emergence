@@ -126,7 +126,7 @@ def append_event(persona_dir: Path, event: dict[str, Any]) -> None:
     Mirrors the brain.growth.arc_storage.append_removed_arc precedent —
     file_lock for cross-process safety, fsync for durability.
     """
-    append_jsonl(persona_dir / LOG_FILENAME, event, fsync=True)
+    append_jsonl(persona_dir / LOG_FILENAME, event, fsync=True, nonfinite="null")
 
 
 def load_or_recover(persona_dir: Path) -> ArcsState:

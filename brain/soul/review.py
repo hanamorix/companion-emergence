@@ -282,7 +282,7 @@ def _load_soul_candidates(persona_dir: Path) -> list[dict]:
 
 def _save_soul_candidates(persona_dir: Path, records: list[dict]) -> None:
     """Write soul_candidates.jsonl atomically via temp file + rename."""
-    write_jsonl(persona_dir / "soul_candidates.jsonl", records, fsync=False)
+    write_jsonl(persona_dir / "soul_candidates.jsonl", records, fsync=False, nonfinite="null")
 
 
 def _mark_candidate(record: dict, status: str, **extra: object) -> None:

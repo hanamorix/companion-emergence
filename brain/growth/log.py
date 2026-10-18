@@ -64,7 +64,7 @@ def append_growth_event(path: Path, event: GrowthLogEvent) -> None:
     taking the lock costs ~µs on the happy path and gives us
     correct semantics on every platform.
     """
-    append_jsonl(path, _event_to_dict(event), fsync=True)
+    append_jsonl(path, _event_to_dict(event), fsync=True, nonfinite="null")
 
 
 def read_growth_log(path: Path, *, limit: int | None = None) -> list[GrowthLogEvent]:

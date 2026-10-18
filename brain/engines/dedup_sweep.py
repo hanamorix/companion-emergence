@@ -78,13 +78,13 @@ def _archive_preimage(persona_dir: Path, target: Memory) -> None:
         "target": target.to_dict(),
     }
     path = persona_dir / _ARCHIVE_FILENAME
-    append_jsonl(path, rec)
+    append_jsonl(path, rec, nonfinite="null")
 
 
 def _write_report(persona_dir: Path, report: Report) -> None:
     path = persona_dir / _REPORT_FILENAME
     rec = {"run_at": datetime.now(UTC).isoformat(), **report.as_log()}
-    append_jsonl(path, rec)
+    append_jsonl(path, rec, nonfinite="null")
 
 
 def _pick_canonical(members: list[Memory]) -> Memory:

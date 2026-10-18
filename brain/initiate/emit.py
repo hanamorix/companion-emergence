@@ -102,4 +102,4 @@ def remove_candidate(persona_dir: Path, candidate_id: str) -> None:
     # landing between the read and the replace used to be lost.
     with file_lock(queue):
         surviving = [c for c in read_candidates(persona_dir) if c.candidate_id != candidate_id]
-        write_jsonl(queue, [c.to_dict() for c in surviving], fsync=False, on_error="log")
+        write_jsonl(queue, [c.to_dict() for c in surviving], fsync=False, on_error="log", nonfinite="null")

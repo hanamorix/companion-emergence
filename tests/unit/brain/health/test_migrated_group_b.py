@@ -328,7 +328,7 @@ def test_group_b_migrator_cli_vocab_and_interests_use_the_module_writer() -> Non
     """The two atomic writes in _run_migrate_locked go through write_json (no ``.new`` temp of their own)."""
     import ast
 
-    src = Path("brain/migrator/cli.py").read_text()
+    src = (Path(__file__).resolve().parents[4] / "brain" / "migrator" / "cli.py").read_text()
     assert "_vocab_tmp" not in src and "_interests_tmp" not in src
     tree = ast.parse(src)
     names = {n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}

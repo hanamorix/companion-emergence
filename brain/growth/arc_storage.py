@@ -62,7 +62,7 @@ def append_removed_arc(
     # Audit 2026-05-08 cross-platform: wrap with file_lock for
     # Windows correctness — POSIX has atomic O_APPEND but Windows
     # doesn't, so concurrent appenders interleave mid-line there.
-    append_jsonl(path, entry, fsync=True)
+    append_jsonl(path, entry, fsync=True, nonfinite="null")
 
 
 def read_removed_arcs(persona_dir: Path) -> list[dict]:

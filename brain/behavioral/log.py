@@ -84,7 +84,7 @@ def append_behavioral_event(
             "evidence_memory_ids": list(evidence_memory_ids),
         }
 
-    append_jsonl(path, entry)
+    append_jsonl(path, entry, nonfinite="null")
 
 
 def read_behavioral_log(

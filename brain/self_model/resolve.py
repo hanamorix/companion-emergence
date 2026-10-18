@@ -76,7 +76,7 @@ def load_audit(persona_dir: Path) -> dict:
 
 
 def _save_audit(persona_dir: Path, audit: dict) -> None:
-    write_json(_audit_path(persona_dir), audit, indent=None, fsync=False, on_error="log")
+    write_json(_audit_path(persona_dir), audit, indent=None, fsync=False, on_error="log", nonfinite="null")
 
 
 def increment_gaps_surfaced(persona_dir: Path) -> None:

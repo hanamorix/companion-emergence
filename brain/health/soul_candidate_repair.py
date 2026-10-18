@@ -255,4 +255,4 @@ def _build_text(old_text: str, content: str) -> str:
 
 def _save_candidates(candidates_path: Path, records: list[dict]) -> None:
     """Atomic write of soul_candidates.jsonl (the caller holds the file lock)."""
-    write_jsonl(candidates_path, records, fsync=False)
+    write_jsonl(candidates_path, records, fsync=False, nonfinite="null")

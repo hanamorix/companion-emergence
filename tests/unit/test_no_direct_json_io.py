@@ -775,6 +775,31 @@ def test_cs2_h_the_allowlist_end_state_has_only_not_file_io_and_held_entries() -
         assert not entry.permanent, f"{rel}::{kind}: permanent entries are in-site markers now"
     assert not any(k == "indirect" for (_r, k) in allow)
 
+    # A closed set: a new `held:` entry (or a new in-site marker file) is a decision, so it changes this test too.
+    held = {rel for (rel, kind), entry in allow.items() if entry.tag.startswith("held:")}
+    assert held == {
+        "brain/bridge/persona_state.py",
+        "brain/bridge/provider.py",
+        "brain/felt_time/anchors.py",
+        "brain/felt_time/chat_log.py",
+        "brain/felt_time/state.py",
+        "brain/felt_time/weather_shift.py",
+        "brain/health/attempt_heal.py",
+    }, held
+    marked = {
+        p.relative_to(REPO).as_posix()
+        for p in (REPO / "brain").rglob("*.py")
+        if "# json-io: ok --" in p.read_text(encoding="utf-8")
+    }
+    assert marked == {
+        "brain/cli.py",
+        "brain/health/log_rotation.py",
+        "brain/ingest/buffer.py",
+        "brain/migrator/og.py",
+        "brain/tunables_migration.py",
+        "brain/update/overlay_hook.py",
+    }, marked
+
 
 if __name__ == "__main__":  # pragma: no cover
     if "--print" in sys.argv:

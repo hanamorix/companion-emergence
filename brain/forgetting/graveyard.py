@@ -66,7 +66,7 @@ def append(
         "hebbian_neighbors": [[nid, float(w)] for nid, w in (hebbian_neighbors or [])],
     }
     path = persona_dir / GRAVEYARD_FILENAME
-    append_jsonl(path, entry, fsync=True)
+    append_jsonl(path, entry, fsync=True, nonfinite="null")
 
 
 #: Ordinary query words shorter than this are not searched (today's minimum,

@@ -700,7 +700,7 @@ def _archive_preimage(persona_dir: Path, target: Memory, source_id: str) -> None
         "merged_from_candidate": source_id,
     }
     path = persona_dir / _ARCHIVE_FILENAME
-    append_jsonl(path, rec)
+    append_jsonl(path, rec, nonfinite="null")
 
 
 def _dispatch(

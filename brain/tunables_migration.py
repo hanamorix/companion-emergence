@@ -129,7 +129,7 @@ def migrate_idle_keys(home: Path) -> None:
         return
 
     try:
-        write_json(path, new_data, indent=2, sort_keys=True, fsync=False)
+        write_json(path, new_data, indent=2, sort_keys=True, fsync=False, nonfinite="null")
 
         # Re-load via the SAME reader tunables.py uses and verify.
         reloaded = read_json(path, recover=Recovery.RAISE, expect=dict)

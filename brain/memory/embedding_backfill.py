@@ -387,7 +387,7 @@ def _save_cursor(
         {"created_at": cursor[0], "id": cursor[1]} if cursor is not None else None
     )
     payload = {"model_id": current_model_id, "cursor": cursor_payload}
-    write_json(path, payload, indent=None, fsync=False, on_error="log")  # best-effort: a rescan is the cost
+    write_json(path, payload, indent=None, fsync=False, on_error="log", nonfinite="null")  # best-effort: a rescan is the cost
 
 
 def has_embedding_backfill_work(store: MemoryStore) -> bool:

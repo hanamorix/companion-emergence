@@ -1573,4 +1573,4 @@ class HeartbeatEngine:
 
     def _append_log(self, entry: dict) -> None:
         """Append one JSON line to heartbeats.log.jsonl."""
-        append_jsonl(self.heartbeat_log_path, entry)
+        append_jsonl(self.heartbeat_log_path, entry, nonfinite="null")
