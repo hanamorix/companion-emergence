@@ -360,7 +360,9 @@ describe("ConnectionPanel — install shape gating (Phase 2)", () => {
 vi.mock("./ModelPicker", () => ({
   ModelPicker: ({
     onClose,
+    allowReapply,
   }: {
+    allowReapply?: boolean;
     onClose: (
       m?: string,
       info?: {
@@ -370,7 +372,7 @@ vi.mock("./ModelPicker", () => ({
       },
     ) => void;
   }) => (
-    <div data-testid="model-picker">
+    <div data-testid="model-picker" data-allow-reapply={String(allowReapply === true)}>
       <button onClick={() => onClose("opus")}>Apply opus</button>
       <button onClick={() => onClose("claude-sonnet-5", { checked: false })}>Apply unchecked</button>
       <button
@@ -924,9 +926,14 @@ describe("ConnectionPanel — unsupported model setting (#446)", () => {
     expect(screen.queryByText(/is not supported/)).not.toBeInTheDocument();
   });
 
-  it("lets the user apply Sonnet from the picker while the unsupported line is shown", () => {
-    render(<ConnectionPanel state={sonnetState({ model_unsupported: "fable" })} persona="test" />);
+  it("tells the picker to allow re-applying the current model only while the unsupported line is shown", () => {
+    // ModelPicker is mocked in this file; its own allowReapply behaviour is tested in ModelPicker.test.tsx.
+    const { unmount } = render(<ConnectionPanel state={sonnetState({ model_unsupported: "fable" })} persona="test" />);
     fireEvent.click(screen.getByRole("button", { name: /change model/i }));
-    expect(screen.getByRole("button", { name: /^apply$/i })).not.toBeDisabled();
+    expect(screen.getByTestId("model-picker")).toHaveAttribute("data-allow-reapply", "true");
+    unmount();
+    render(<ConnectionPanel state={sonnetState()} persona="test" />);
+    fireEvent.click(screen.getByRole("button", { name: /change model/i }));
+    expect(screen.getByTestId("model-picker")).toHaveAttribute("data-allow-reapply", "false");
   });
 });
