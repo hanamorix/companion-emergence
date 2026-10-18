@@ -661,10 +661,16 @@ export type ChatModel = string;
  * For a full id the bridge first makes one check call to Claude; if Claude
  * rejects the model nothing is saved and the thrown message says so.
  *
+ * Resolves to the bridge's `checked` flag: true when the check call confirmed a custom id, false when
+ * the check could not run (the id was saved anyway), undefined for an alias (no check is made).
+ *
  * Throws on any non-2xx response. A custom id is NOT replayed after a network
  * failure: the setter is idempotent, but a replay would run a second check call.
  */
-export async function setPersonaModel(persona: string, model: ChatModel): Promise<void> {
+export async function setPersonaModel(
+  persona: string,
+  model: ChatModel,
+): Promise<boolean | undefined> {
   const r = await bridgeFetch(persona, (creds) =>
     fetch(`${creds.url}/persona/config/model`, {
       method: "POST",
@@ -683,6 +689,8 @@ export async function setPersonaModel(persona: string, model: ChatModel): Promis
     }
     throw new Error(`setPersonaModel failed: ${r.status}`);
   }
+  const ok = await r.json().catch(() => null);
+  return ok && typeof ok.checked === "boolean" ? ok.checked : undefined;
 }
 
 /** Response from POST /persona/config/notes. */

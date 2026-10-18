@@ -7,6 +7,7 @@ import type { InstallShape } from "../../platform";
 import { Divider, PanelShell, SectionLabel, Toggle } from "../ui";
 import { RestartBridgeButton } from "./RestartBridgeButton";
 import { ModelPicker } from "./ModelPicker";
+import { MODEL_UNCHECKED_MESSAGE, modelRejectedNowMessage } from "../../lib/friendlyChatError";
 import { PronounPicker } from "./PronounPicker";
 import { NotesToggle } from "./NotesToggle";
 import { KindledLinkToggle } from "./KindledLinkToggle";
@@ -81,6 +82,15 @@ export function ConnectionPanel({
   // so the panel reflects the change without waiting for the next /state poll.
   const [localModel, setLocalModel] = useState<ChatModel | null>(null);
   const displayModel = localModel ?? (conn?.model as ChatModel | null | undefined) ?? null;
+  // Set when the last Apply saved a custom model the bridge could not confirm; cleared by the next Apply.
+  const [modelNotice, setModelNotice] = useState<string | null>(null);
+  // Models the Claude CLI rejected while in use (the bridge drops a record when the model changes or a
+  // clean reply arrives). A record for the model the user has since replaced is stale until the next poll.
+  const rejectionLines = (state?.model_rejections ?? []).flatMap((rec) => {
+    if (rec.model === displayModel) return [modelRejectedNowMessage(rec.model, true)];
+    if (rec.model === conn?.model) return [];
+    return [modelRejectedNowMessage(rec.model, false)];
+  });
   const [showPronounPicker, setShowPronounPicker] = useState(false);
   // Local pronoun override — updated optimistically after a successful apply.
   const [localPronouns, setLocalPronouns] = useState<PronounPreset | null>(null);
@@ -299,12 +309,29 @@ export function ConnectionPanel({
         <ModelPicker
           current={displayModel ?? "sonnet"}
           persona={persona}
-          onClose={(newModel) => {
-            if (newModel) setLocalModel(newModel);
+          onClose={(newModel, info) => {
+            if (newModel) {
+              setLocalModel(newModel);
+              setModelNotice(info?.checked === false ? MODEL_UNCHECKED_MESSAGE : null);
+            }
             setShowModelPicker(false);
           }}
         />
       )}
+      {modelNotice && (
+        <div role="status" style={{ fontSize: 10.5, color: "var(--text-mute)", lineHeight: 1.5, marginBottom: 6 }}>
+          {modelNotice}
+        </div>
+      )}
+      {rejectionLines.map((line) => (
+        <div
+          key={line}
+          role="status"
+          style={{ fontSize: 10.5, color: "var(--crimson)", lineHeight: 1.5, marginBottom: 6, wordBreak: "break-word" }}
+        >
+          {line}
+        </div>
+      ))}
 
       <Divider />
       <SectionLabel>Your pronouns</SectionLabel>

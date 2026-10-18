@@ -45,15 +45,21 @@ KNOWN_SEARCHERS = frozenset({"ddgs", "noop"})
 KNOWN_MODELS = frozenset({"sonnet", "opus", "haiku"})
 # A full model id (e.g. claude-sonnet-5), stored and passed to `claude --model` as written.
 # Matched with fullmatch, never `$`: `$` would accept a trailing newline. The picker in
-# app/src/lib/modelId.ts uses the same pattern; keep the two in sync.
+# app/src/lib/modelId.ts uses the same pattern and length cap; keep the two in sync.
 MODEL_ID_PATTERN = re.compile(r"claude-[a-z0-9.-]+")
+# Longest full id accepted on EVERY write path (config load, POST /persona/config/model). Real ids are
+# well under it; the cap keeps an absurd value off the CLI's argv, out of the usage log and out of the
+# UI, and keeps the CLI's rejection sentence (cut at 200 characters by the provider) parseable.
+MODEL_ID_MAX_LENGTH = 64
 
 
 def is_valid_model(value: object) -> bool:
     """True for one of the aliases (sonnet / opus / haiku) or a full ``claude-...`` model id."""
-    return isinstance(value, str) and (
-        value in KNOWN_MODELS or MODEL_ID_PATTERN.fullmatch(value) is not None
-    )
+    if not isinstance(value, str):
+        return False
+    if value in KNOWN_MODELS:
+        return True
+    return len(value) <= MODEL_ID_MAX_LENGTH and MODEL_ID_PATTERN.fullmatch(value) is not None
 
 
 logger = logging.getLogger(__name__)

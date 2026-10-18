@@ -151,7 +151,10 @@ def test_endpoint_accepts_full_model_id(tmp_path: Path, model_id: str):
     assert model_id in (persona_dir / "persona_config.json").read_text()
 
 
-@pytest.mark.parametrize("bad", ["Claude-Sonnet", "gpt-4", "claude-", "claude-sonnet-5\n", "sonnet[1m]"])
+@pytest.mark.parametrize(
+    "bad",
+    ["Claude-Sonnet", "gpt-4", "claude-", "claude-sonnet-5\n", "sonnet[1m]", "claude-" + "a" * 58, "claude-" + "a" * 5000],
+)
 def test_endpoint_rejects_invalid_ids_and_keeps_saved_model(tmp_path: Path, bad: str):
     client, persona_dir, _ = _make_client(tmp_path)
     with client:
@@ -167,3 +170,19 @@ def test_endpoint_rejects_invalid_ids_and_keeps_saved_model(tmp_path: Path, bad:
     from brain.persona_config import PersonaConfig
 
     assert PersonaConfig.load(persona_dir / "persona_config.json").model == "sonnet"
+
+
+def test_endpoint_accepts_a_64_character_id_and_rejects_65(tmp_path: Path):
+    client, persona_dir, _ = _make_client(tmp_path)
+    longest = "claude-" + "a" * 57
+    with client:
+        client.app.state.bridge.provider = _ModelHolder("sonnet")
+        ok = client.post("/persona/config/model", json={"model": longest})
+        too_long = client.post("/persona/config/model", json={"model": longest + "a"})
+    assert ok.status_code == 200, ok.text
+    assert too_long.status_code == 400
+    assert too_long.json()["error"] == "unknown_model"
+
+    from brain.persona_config import PersonaConfig
+
+    assert PersonaConfig.load(persona_dir / "persona_config.json").model == longest

@@ -13,9 +13,9 @@ log = logging.getLogger(__name__)
 def log_usage(persona_dir: Path | None, *, call_type: str, model: str, frame: dict) -> None:
     if persona_dir is None:
         return
-    if not frame.get("is_error"):
-        model_error.note_success(model)  # #440: a clean frame for this model clears its rejection record
     try:
+        if not frame.get("is_error"):
+            model_error.note_success(model)  # #440: a clean frame for this model clears its rejection record
         u = frame.get("usage") or {}
         row = {
             "ts": datetime.now(UTC).isoformat(), "call_type": call_type, "model": model,

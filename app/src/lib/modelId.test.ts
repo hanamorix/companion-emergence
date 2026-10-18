@@ -9,8 +9,14 @@ import {
 } from "./modelId";
 
 // KEEP IN SYNC with FULL_IDS / BAD_IDS in tests/bridge/test_persona_config_model.py
-// (the bridge validates with the same grammar).
-const FULL_IDS = ["claude-sonnet-5", "claude-opus-4-8", "claude-3-5-haiku-20241022", "claude-sonnet-4.5"];
+// (the bridge validates with the same grammar and length cap).
+const FULL_IDS = [
+  "claude-sonnet-5",
+  "claude-opus-4-8",
+  "claude-3-5-haiku-20241022",
+  "claude-sonnet-4.5",
+  "claude-" + "a".repeat(57), // exactly 64 characters: the longest accepted id
+];
 const BAD_IDS = [
   "gpt4",
   "Claude-Sonnet-5",
@@ -25,6 +31,8 @@ const BAD_IDS = [
   "sonnet[1m]",
   "opusplan",
   "claude-sonnet-5[1m]",
+  "claude-" + "a".repeat(58), // 65 characters: one over the cap
+  "claude-" + "a".repeat(5000),
   "",
 ];
 
@@ -41,6 +49,11 @@ describe("modelId", () => {
 
   it.each(BAD_IDS)("rejects %j", (bad) => {
     expect(isValidChatModel(bad)).toBe(false);
+  });
+
+  it("caps a full id at 64 characters", () => {
+    expect(MODEL_ID_MAX_LENGTH).toBe(64);
+    expect("claude-" + "a".repeat(57)).toHaveLength(64);
   });
 
   it("does not accept a trailing newline (no multiline flag)", () => {

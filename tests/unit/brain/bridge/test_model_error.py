@@ -104,6 +104,13 @@ def test_rejected_model_name(text, configured, expected):
     assert model_error.rejected_model_name(text, configured) == expected
 
 
+def test_an_overlong_named_model_is_not_returned():
+    # more than 64 characters is not valid model grammar, so the configured model is used instead
+    long_id = "claude-" + "a" * 58
+    assert model_error.rejected_model_name(SENTENCE.format(model=long_id), "sonnet") == "sonnet"
+    assert model_error.rejected_model_name(SENTENCE.format(model=long_id), None) is None
+
+
 def test_rejected_model_name_only_ever_returns_valid_grammar():
     from brain.persona_config import is_valid_model
 
@@ -236,3 +243,11 @@ def test_public_functions_fail_open(monkeypatch):
         model_error.note_success("claude-sonet-5")
         model_error.switch("a", "b", keep=frozenset())
         assert model_error.state() == []
+
+
+def test_log_usage_never_raises_on_a_non_dict_frame(tmp_path):
+    # the clear-on-success hook sits inside log_usage's fail-safe ("instrumentation must never break a turn")
+    from brain.bridge.usage_log import log_usage
+
+    for bad in (None, "x", 5, [1]):
+        log_usage(tmp_path, call_type="chat", model="sonnet", frame=bad)  # type: ignore[arg-type]

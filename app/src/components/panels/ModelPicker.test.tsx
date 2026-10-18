@@ -247,4 +247,31 @@ describe("ModelPicker", () => {
     expect(customRow.textContent).not.toContain("—");
     expect(screen.getByText(/start with claude-/i).textContent).not.toContain("—");
   });
+
+  it("reports an unconfirmed custom id to the caller (saved, but the bridge could not check it)", async () => {
+    stubFetch(
+      new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: false }), { status: 200 }),
+    );
+    const onClose = vi.fn();
+    render(<ModelPicker current="sonnet" persona="test" onClose={onClose} />);
+    fireEvent.change(idInput(), { target: { value: "claude-sonnet-5" } });
+    fireEvent.click(applyBtn());
+    await waitFor(() => expect(onClose).toHaveBeenCalledWith("claude-sonnet-5", { checked: false }));
+  });
+
+  it("a confirmed or alias apply calls onClose with the model only", async () => {
+    stubFetch(new Response(JSON.stringify({ ok: true, model: "opus" }), { status: 200 }));
+    const onClose = vi.fn();
+    render(<ModelPicker current="sonnet" persona="test" onClose={onClose} />);
+    fireEvent.click(screen.getByLabelText(/opus/i));
+    fireEvent.click(applyBtn());
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+    expect(onClose.mock.calls[0]).toEqual(["opus"]);
+  });
+
+  it("does not accept an id over 64 characters", () => {
+    render(<ModelPicker current="sonnet" persona="test" onClose={() => {}} />);
+    fireEvent.change(idInput(), { target: { value: "claude-" + "a".repeat(58) } });
+    expect(applyBtn()).toBeDisabled();
+  });
 });

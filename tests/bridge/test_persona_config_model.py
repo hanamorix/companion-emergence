@@ -54,14 +54,20 @@ def test_save_round_trips_model(tmp_path: Path):
 
 # ---------------------------------------------------------------------------
 # #440: a full model ID is accepted, stored and passed through as written.
-# KEEP IN SYNC with app/src/lib/modelId.test.ts (the same accept/reject lists).
+# KEEP IN SYNC with app/src/lib/modelId.test.ts (the same accept/reject lists, incl. the 64-character cap).
 # ---------------------------------------------------------------------------
 
 import pytest  # noqa: E402
 
 from brain.persona_config import MODEL_ID_PATTERN, is_valid_model  # noqa: E402
 
-FULL_IDS = ["claude-sonnet-5", "claude-opus-4-8", "claude-3-5-haiku-20241022", "claude-sonnet-4.5"]
+FULL_IDS = [
+    "claude-sonnet-5",
+    "claude-opus-4-8",
+    "claude-3-5-haiku-20241022",
+    "claude-sonnet-4.5",
+    "claude-" + "a" * 57,  # exactly 64 characters: the longest accepted id
+]
 BAD_IDS = [
     "gpt4",
     "Claude-Sonnet-5",
@@ -76,6 +82,8 @@ BAD_IDS = [
     "sonnet[1m]",
     "opusplan",
     "claude-sonnet-5[1m]",
+    "claude-" + "a" * 58,  # 65 characters: one over the cap
+    "claude-" + "a" * 5000,
 ]
 
 
@@ -130,3 +138,12 @@ def test_is_valid_model_rejects(bad):
 def test_pattern_uses_fullmatch_semantics():
     # `$` would accept a trailing newline; fullmatch must not.
     assert MODEL_ID_PATTERN.fullmatch("claude-sonnet-5\n") is None
+
+
+def test_length_cap_is_64_characters():
+    from brain.persona_config import MODEL_ID_MAX_LENGTH
+
+    assert MODEL_ID_MAX_LENGTH == 64
+    assert len("claude-" + "a" * 57) == 64
+    assert is_valid_model("claude-" + "a" * 57) is True
+    assert is_valid_model("claude-" + "a" * 58) is False

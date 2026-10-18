@@ -54,3 +54,19 @@ export function friendlyChatError(raw: string): string {
   }
   return raw;
 }
+
+/** Shown after Apply when the bridge could not run its check call (timeout, expired login, rate limit...). */
+export const MODEL_UNCHECKED_MESSAGE =
+  "Couldn't check that model right now; saved anyway, and any problem will show here.";
+
+/**
+ * The line for a model the Claude CLI rejected while it was in use (from the bridge's
+ * `model_rejections`). `chosen` is true when it is the model the user picked; otherwise it is a model
+ * some background job uses on its own, so changing the chat model would not help.
+ */
+export function modelRejectedNowMessage(model: string, chosen: boolean): string {
+  const name = `the model "${shortenModelId(model)}"`;
+  return chosen
+    ? `Claude rejected ${name}. It may not exist, or your account may not have access to it. Use change to pick another model.`
+    : `Claude rejected ${name}, which some background jobs use on their own. Check that your Claude account can use it.`;
+}

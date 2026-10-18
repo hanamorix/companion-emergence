@@ -327,6 +327,18 @@ describe("setPersonaModel", () => {
     await expect(setPersonaModel("alice", "haiku")).resolves.toBeUndefined();
   });
 
+  it("resolves to the bridge's checked flag for a custom id", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: true }), { status: 200 }),
+    ));
+    await expect(setPersonaModel("alice", "claude-sonnet-5")).resolves.toBe(true);
+
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: false }), { status: 200 }),
+    ));
+    await expect(setPersonaModel("alice", "claude-sonnet-5")).resolves.toBe(false);
+  });
+
   it("throws on a non-2xx response", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ ok: false, error: "unknown_model" }), { status: 400 }),

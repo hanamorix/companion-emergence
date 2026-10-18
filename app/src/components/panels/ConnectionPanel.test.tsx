@@ -358,9 +358,10 @@ describe("ConnectionPanel — install shape gating (Phase 2)", () => {
 // ── Model section (Phase 8.3) ─────────────────────────────────────
 
 vi.mock("./ModelPicker", () => ({
-  ModelPicker: ({ onClose }: { onClose: (m?: string) => void }) => (
+  ModelPicker: ({ onClose }: { onClose: (m?: string, info?: { checked: false }) => void }) => (
     <div data-testid="model-picker">
       <button onClick={() => onClose("opus")}>Apply opus</button>
+      <button onClick={() => onClose("claude-sonnet-5", { checked: false })}>Apply unchecked</button>
       <button onClick={() => onClose()}>Cancel</button>
     </div>
   ),
@@ -403,6 +404,74 @@ describe("ConnectionPanel — Model section (Phase 8.3)", () => {
     });
     // Local model override applied
     expect(screen.getByText(/opus/)).toBeInTheDocument();
+  });
+});
+
+// ── Rejected / unchecked model (#440) ─────────────────────────────
+
+describe("ConnectionPanel — rejected and unchecked models (#440)", () => {
+  const rec = (model: string) => ({
+    model,
+    since: "2026-10-17T12:00:00+00:00",
+    last_at: "2026-10-17T12:05:00+00:00",
+    count: 3,
+  });
+  const sonnetState = (extra: Partial<PersonaState> = {}) =>
+    baseState({
+      connection: { provider: "claude-cli", model: "sonnet", last_heartbeat_at: null },
+      ...extra,
+    });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getClientPlatform).mockReturnValue("macos");
+  });
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("names the chosen model Claude rejected and says what to do", () => {
+    render(<ConnectionPanel state={sonnetState({ model_rejections: [rec("sonnet")] })} persona="test" />);
+    const line = screen.getByText(/Claude rejected the model "sonnet"/);
+    expect(line).toHaveTextContent(/may not exist/i);
+    expect(line).toHaveTextContent(/use change to pick another model/i);
+    expect(line.textContent).not.toContain("—");
+  });
+
+  it("shows nothing when there are no rejections (or the field is missing)", () => {
+    const { rerender } = render(<ConnectionPanel state={sonnetState({ model_rejections: [] })} persona="test" />);
+    expect(screen.queryByText(/Claude rejected/)).not.toBeInTheDocument();
+    rerender(<ConnectionPanel state={sonnetState()} persona="test" />);
+    expect(screen.queryByText(/Claude rejected/)).not.toBeInTheDocument();
+  });
+
+  it("words a rejected background-only model differently (changing the chat model would not help)", () => {
+    render(<ConnectionPanel state={sonnetState({ model_rejections: [rec("claude-tier-9")] })} persona="test" />);
+    const line = screen.getByText(/Claude rejected the model "claude-tier-9"/);
+    expect(line).toHaveTextContent(/background jobs/i);
+    expect(line).not.toHaveTextContent(/pick another model/i);
+  });
+
+  it("drops the line as soon as the user changes the model", async () => {
+    render(<ConnectionPanel state={sonnetState({ model_rejections: [rec("sonnet")] })} persona="test" />);
+    expect(screen.getByText(/Claude rejected the model "sonnet"/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /change model/i }));
+    fireEvent.click(screen.getByRole("button", { name: /apply opus/i }));
+    await waitFor(() => expect(screen.queryByTestId("model-picker")).not.toBeInTheDocument());
+    expect(screen.queryByText(/Claude rejected/)).not.toBeInTheDocument();
+  });
+
+  it("tells the user plainly when a custom model was saved without being checked, and clears it on the next change", async () => {
+    render(<ConnectionPanel state={sonnetState()} persona="test" />);
+    fireEvent.click(screen.getByRole("button", { name: /change model/i }));
+    fireEvent.click(screen.getByRole("button", { name: /apply unchecked/i }));
+    const notice = await screen.findByText(/Couldn't check that model right now/);
+    expect(notice).toHaveTextContent(/saved anyway, and any problem will show here/);
+    expect(notice.textContent).not.toContain("—");
+
+    fireEvent.click(screen.getByRole("button", { name: /change model/i }));
+    fireEvent.click(screen.getByRole("button", { name: /apply opus/i }));
+    await waitFor(() => expect(screen.queryByText(/Couldn't check that model/)).not.toBeInTheDocument());
   });
 });
 

@@ -8,7 +8,12 @@ const CUSTOM = "__custom__";
 interface Props {
   current: ChatModel;
   persona: string;
-  onClose: (newModel?: ChatModel) => void;
+  /** `info.checked === false`: the model was saved but the bridge could not confirm it (#440). */
+  onClose: (newModel?: ChatModel, info?: ModelApplyInfo) => void;
+}
+
+export interface ModelApplyInfo {
+  checked: false;
 }
 
 interface ModelOption {
@@ -53,8 +58,9 @@ export function ModelPicker({ current, persona, onClose }: Props) {
     setBusy(true);
     setError(null);
     try {
-      await setPersonaModel(persona, value);
-      onClose(value);
+      const checked = await setPersonaModel(persona, value);
+      if (checked === false) onClose(value, { checked: false });
+      else onClose(value);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setBusy(false);
