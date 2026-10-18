@@ -402,6 +402,11 @@ def run_folded(
         job runs waits only for that job to return, and the next job waits
         for the whole heartbeat pass (single supervisor thread, S41/S65)."""
         nonlocal last_heartbeat_at, _last_intensity_drivers
+        # Shutdown: never start a heartbeat once stop was requested. A paused-by-stop
+        # job still reaches here through run_central_pass's between_jobs call, and a
+        # heartbeat on a large persona takes many seconds the join would wait out.
+        if stop_event.is_set():
+            return
         # Heartbeat cadence — independent of session-cleanup cadence.
         # Fault-isolated so a heartbeat failure can't take down the
         # session-cleanup loop or cascade into bridge shutdown.
@@ -447,12 +452,16 @@ def run_folded(
         mid-job still runs only between items, never during one, S41/S65),
         then reports whether the job should pause (chat active again,
         S14/S43) — True means "stop here, save progress, return
-        JobOutcome.PAUSED"; the caller does not advance its cadence."""
+        JobOutcome.PAUSED"; the caller does not advance its cadence.
+
+        A requested stop (``stop_event``) also reports pause, so shutdown ends a
+        gated pass at its next item instead of waiting for the whole pass: the
+        job saves its own resume point exactly as for a chat pause."""
         try:
             _maybe_run_heartbeat()
         except Exception:
             logger.exception("supervisor between-items heartbeat hook raised")
-        return not cli_throttle.is_chat_idle()
+        return stop_event.is_set() or not cli_throttle.is_chat_idle()
 
     # The gated jobs, in the S55 order (see brain/bridge/central_cadence.py).
     tick_stats = {"closed_sessions": 0, "pruned_empty_sessions": 0}
