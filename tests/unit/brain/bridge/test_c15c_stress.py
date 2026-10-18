@@ -42,10 +42,12 @@ assertion is proven able to fail, and deleting one fails the default suite.
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import os
 import shutil
 import sqlite3
+import subprocess
 import threading
 import time
 from collections.abc import Callable
@@ -250,6 +252,7 @@ class _StressResult:
     forgetting_state_file: bool = False
     oracle_error: str | None = None
     loop_join_s: float = 0.0
+    subprocess_calls: list[str] = dataclasses.field(default_factory=list)
 
 
 def _read_window_end_oracle(persona_dir: Path, result: _StressResult) -> None:
@@ -363,6 +366,10 @@ def _assert_stress_result(result: _StressResult) -> None:
     )
 
     loop, writer, bus = result.loop, result.writer, result.bus
+    assert result.subprocess_calls == [], (
+        "a real process was started during the stress window (the real Claude CLI "
+        f"provider?): {result.subprocess_calls[:3]}"
+    )
     assert loop.error is None, f"the supervisor loop thread raised {loop.error!r}"
     assert loop.alive_at_window_end, (
         "the supervisor loop thread was not alive at the end of the window"
@@ -407,6 +414,24 @@ def _assert_stress_result(result: _StressResult) -> None:
     assert result.bumps >= 1, "the writer made no successful bump_recall in the window"
 
 
+def _subprocess_blocker(calls: list[str]) -> Callable[..., object]:
+    """A stand-in for `subprocess.Popen` that records the command and refuses.
+    The stress test must never start a real process: the heartbeat, the soul
+    review and every other tick build their provider from the persona's
+    `persona_config.json`, and with the default provider that is the real Claude
+    CLI (a subprocess per call). On a machine with `claude` installed that
+    silently works; on a runner without it every heartbeat raised and the test
+    could not pass. `persona_config.json` now says `fake`, and this blocker makes
+    any regression fail loudly (see `_assert_stress_result`)."""
+
+    def _blocked(*args: object, **_kwargs: object) -> object:
+        command = args[0] if args else "?"
+        calls.append(" ".join(map(str, command)) if isinstance(command, (list, tuple)) else str(command))
+        raise OSError("blocked: the stress test must not start a real process (no real Claude CLI)")
+
+    return _blocked
+
+
 def _stress_body(
     tmp_path: Path,
     *,
@@ -431,6 +456,12 @@ def _stress_body(
     else:
         _build_synthetic_bob20k(persona_dir / "memories.db", rows)
     persist(FeltTimeState(lived_age_hours=_SEEDED_LIVED_AGE_HOURS), persona_dir)
+    # Every tick builds its provider from this file (`build_tier_provider`), not
+    # from the `provider=` argument: without it the default is the real Claude
+    # CLI. `searcher: noop` keeps the heartbeat's research step off the network.
+    (persona_dir / "persona_config.json").write_text(
+        '{"provider": "fake", "searcher": "noop"}', encoding="utf-8"
+    )
 
     loop_kwargs = {
         "stop_event": threading.Event(),
@@ -456,17 +487,21 @@ def _stress_body(
         "notes_enabled": False,
         "kindled_link_enabled": False,
     }
-    result = _run_stress_window(
-        persona_dir,
-        loop_target=loop_target,
-        loop_kwargs=loop_kwargs,
-        writer_target=writer_target,
-        duration_s=duration_s,
-        join_timeout_s=join_timeout_s,
-        writer_join_timeout_s=writer_join_timeout_s,
-        cleanup_join_timeout_s=cleanup_join_timeout_s,
-        settle=settle,
-    )
+    subprocess_calls: list[str] = []
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(subprocess, "Popen", _subprocess_blocker(subprocess_calls))
+        result = _run_stress_window(
+            persona_dir,
+            loop_target=loop_target,
+            loop_kwargs=loop_kwargs,
+            writer_target=writer_target,
+            duration_s=duration_s,
+            join_timeout_s=join_timeout_s,
+            writer_join_timeout_s=writer_join_timeout_s,
+            cleanup_join_timeout_s=cleanup_join_timeout_s,
+            settle=settle,
+        )
+    result.subprocess_calls = subprocess_calls
     _assert_stress_result(result)
     return result
 
@@ -563,6 +598,7 @@ def _stand_in(
     state_file: bool = False,
     fade_row: bool = True,
     swallow_from: str | None = None,
+    spawn_process: bool = False,
 ) -> Callable[..., None]:
     """A stand-in for `run_folded`: publishes what the real loop publishes and
     leaves what forgetting leaves, according to the flags, then waits for
@@ -580,6 +616,14 @@ def _stand_in(
         state, _recovered = load_or_recover(persona_dir)
         if state.lived_age_hours != _SEEDED_LIVED_AGE_HOURS:
             raise AssertionError(f"felt-time seed missing: lived_age_hours={state.lived_age_hours}")
+        config = json.loads((persona_dir / "persona_config.json").read_text(encoding="utf-8"))
+        if config.get("provider") != "fake":
+            raise AssertionError(f"persona_config.json does not select the fake provider: {config}")
+        if spawn_process:
+            try:
+                subprocess.run(["claude", "--version"], check=False)  # the blocker refuses
+            except OSError:
+                pass
         if tick:
             bus.publish({"type": "supervisor_tick"})
         for hb in heartbeats:
@@ -680,6 +724,8 @@ def test_stand_in_clean_finish_shape_passes(tmp_path: Path) -> None:
          "ready", "forgetting wrote no row"),
         ("row_written_but_no_cursor_or_state", {"cursor": False},
          "ready", "neither a resume cursor"),
+        ("loop_starts_a_real_process", {"spawn_process": True},
+         "ready", "real process was started"),
         ("loop_swallows_an_exception", {"swallow_from": "brain.bridge.supervisor"},
          "ready", "swallowed exception"),
         ("forgetting_swallows_an_exception", {"swallow_from": "brain.forgetting"},
