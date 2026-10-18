@@ -117,3 +117,53 @@ def test_endpoint_swaps_live_provider_model_and_state_reflects_it(tmp_path: Path
         assert r2.status_code == 200, r2.text
         state = r2.json()
         assert state["connection"]["model"] == "opus"
+
+
+# ---------------------------------------------------------------------------
+# #440: full model IDs. The hot-swap is observed on a provider double that has a
+# `_model` attribute but is NOT a ClaudeCliProvider, so no save-time check call
+# runs here (the check path is tested in test_model_unavailable_surface.py).
+# ---------------------------------------------------------------------------
+
+import pytest  # noqa: E402
+
+
+class _ModelHolder:
+    def __init__(self, model: str) -> None:
+        self._model = model
+
+
+@pytest.mark.parametrize("model_id", ["claude-sonnet-5", "claude-opus-4-8", "claude-3-5-haiku-20241022"])
+def test_endpoint_accepts_full_model_id(tmp_path: Path, model_id: str):
+    client, persona_dir, _ = _make_client(tmp_path)
+    with client:
+        holder = _ModelHolder("sonnet")
+        client.app.state.bridge.provider = holder
+        r = client.post("/persona/config/model", json={"model": model_id})
+        assert r.status_code == 200, r.text
+        assert r.json() == {"ok": True, "model": model_id}
+        assert holder._model == model_id  # hot-swapped
+        assert client.get("/persona/state").json()["connection"]["model"] == model_id
+
+    from brain.persona_config import PersonaConfig
+
+    assert PersonaConfig.load(persona_dir / "persona_config.json").model == model_id
+    assert model_id in (persona_dir / "persona_config.json").read_text()
+
+
+@pytest.mark.parametrize("bad", ["Claude-Sonnet", "gpt-4", "claude-", "claude-sonnet-5\n", "sonnet[1m]"])
+def test_endpoint_rejects_invalid_ids_and_keeps_saved_model(tmp_path: Path, bad: str):
+    client, persona_dir, _ = _make_client(tmp_path)
+    with client:
+        holder = _ModelHolder("sonnet")
+        client.app.state.bridge.provider = holder
+        r = client.post("/persona/config/model", json={"model": bad})
+    assert r.status_code == 400, r.text
+    body = r.json()
+    assert body["error"] == "unknown_model"
+    assert {"sonnet", "opus", "haiku"} <= set(body["valid"])
+    assert holder._model == "sonnet"
+
+    from brain.persona_config import PersonaConfig
+
+    assert PersonaConfig.load(persona_dir / "persona_config.json").model == "sonnet"
