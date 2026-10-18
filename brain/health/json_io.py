@@ -41,13 +41,16 @@ legacy function and its fifteen callers do not change; it is deleted together wi
 from __future__ import annotations
 
 import enum
+import errno
 import gzip
 import io
 import json
 import logging
 import os
+import shutil
 import time
 import zlib
+from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
@@ -213,7 +216,10 @@ def _check(
         raise _BadContentError("encoding", exc) from exc
     try:
         data = json.loads(text)
-    except (json.JSONDecodeError, RecursionError) as exc:
+    except (
+        ValueError,
+        RecursionError,
+    ) as exc:  # JSONDecodeError, and a >4300-digit integer's plain ValueError
         raise _BadContentError("empty" if not text.strip() else "malformed", exc) from exc
     if expect is not None and not isinstance(data, expect):
         raise _BadContentError("shape", TypeError(f"expected {expect}, got {type(data).__name__}"))
@@ -268,12 +274,14 @@ def read_json_result(
     if recover is not Recovery.RAISE and default is _NO_DEFAULT:
         raise TypeError(f"read_json: recover={recover.name} needs a default factory")
     _check_fallbacks(path, fallbacks)
+    return _read(path, default, recover, expect, validate, fallbacks, waited=False)
+
+
+def _read(path, default, recover, expect, validate, fallbacks, waited: bool) -> JsonRead:
     try:
         raw, sig = _read_bytes(path)
     except FileNotFoundError:
-        if default is _NO_DEFAULT:
-            raise JsonFileNotFound(path, "missing") from None
-        return JsonRead(default(), "missing")
+        return _missing(path, default, recover, expect, validate, fallbacks, waited)
     except OSError as exc:
         if recover is Recovery.DEFAULT:
             _report(path, "io", exc, "using the default")
@@ -288,6 +296,29 @@ def read_json_result(
         if recover is Recovery.RAISE:
             raise JsonFileError(path, bad.kind, _short(bad.cause)) from bad.cause
         return _heal(path, bad, sig, default, recover, expect, validate, fallbacks)
+
+
+def _missing(path, default, recover, expect, validate, fallbacks, waited: bool) -> JsonRead:
+    """The file is not there. For RESTORE and HEAL that may be a heal in progress, not an absence.
+
+    A module heal never makes the path absent, but a legacy ``attempt_heal`` (no sidecar) does, and a
+    crash can. If the heal sidecar exists, wait for a heal in progress to finish and look again. Under
+    RESTORE a valid backup is then restored instead of returning ``default()``: a fail-closed policy must
+    never answer "no data yet" while a good copy exists. HEAL keeps ``attempt_heal``'s meaning (a deleted
+    file is a reset, not a corruption).
+    """
+    if recover in (Recovery.RESTORE, Recovery.HEAL):
+        if not waited and os.path.lexists(path.with_name(path.name + ".heal.lock")):
+            with _heal_guard(path):
+                pass
+            return _read(path, default, recover, expect, validate, fallbacks, waited=True)
+        if recover is Recovery.RESTORE:
+            restored = _restore_missing(path, default, recover, expect, validate, fallbacks)
+            if restored is not None:
+                return restored
+    if default is _NO_DEFAULT:
+        raise JsonFileNotFound(path, "missing") from None
+    return JsonRead(default(), "missing")
 
 
 def _check_fallbacks(path: Path, fallbacks: tuple[Path, ...]) -> None:
@@ -375,17 +406,17 @@ def _mtime(path: Path) -> float:
     return path.stat().st_mtime
 
 
-def _valid(path: Path, expect, validate) -> tuple[bool, bool]:
-    """(readable, valid) for a candidate file."""
+def _valid(path: Path, expect, validate) -> tuple[bool, bool, tuple[int, int, int] | None]:
+    """(readable, valid, signature) for a candidate file."""
     try:
-        raw, _sig = _read_bytes(path)
+        raw, sig = _read_bytes(path)
     except OSError:
-        return False, False
+        return False, False, None
     try:
         _check(raw, expect, validate)
     except _BadContentError:
-        return True, False
-    return True, True
+        return True, False, sig
+    return True, True, sig
 
 
 def _heal(
@@ -418,37 +449,98 @@ def _heal(
             return _after_change(path, expect, validate, bad)
 
 
-def _heal_locked(path, bad, sig, default, recover, expect, validate, fallbacks) -> JsonRead:
-    now = datetime.now(UTC)
-    stamp = _filename_safe_timestamp(now)
-    likely_cause = _classify_cause(path)  # before the live file is moved
-    anomaly_kind = (
-        "json_parse_error" if bad.kind in ("encoding", "empty", "malformed") else "schema_mismatch"
-    )
-    detail = _short_detail(bad.cause)
-
-    # Read-only walk: which backup, and which fallback, would be installed?
-    walked_corrupt: list[Path] = []
+def _pick(path: Path, expect, validate, fallbacks: tuple[Path, ...]):
+    """Read-only walk: (chosen backup, chosen fallback, corrupt backups walked past with their signatures)."""
+    walked: list[tuple[Path, tuple[int, int, int]]] = []
     chosen_bak: tuple[int, Path] | None = None
     for i in (1, 2, 3):
         bak = path.with_name(f"{path.name}.bak{i}")
         if not bak.exists():
             continue
-        readable, ok = _valid(bak, expect, validate)
+        readable, ok, bsig = _valid(bak, expect, validate)
         if ok:
             chosen_bak = (i, bak)
             break
-        if readable:
-            walked_corrupt.append(bak)
+        if readable and bsig is not None:
+            walked.append((bak, bsig))
     chosen_fallback: Path | None = None
     bak_mtime = _mtime(chosen_bak[1]) if chosen_bak else None
     for fb in fallbacks:
         if not fb.exists():
             continue
-        _readable, ok = _valid(fb, expect, validate)
+        _readable, ok, _fsig = _valid(fb, expect, validate)
         if ok and (bak_mtime is None or _mtime(fb) >= bak_mtime):
             chosen_fallback = fb
             break
+    return chosen_bak, chosen_fallback, walked
+
+
+def _install(path: Path, chosen_bak, chosen_fallback, expect, validate, detail: str):
+    """Put the chosen candidate at ``path`` with one atomic replace; returns (data, action, detail)."""
+    try:
+        if chosen_fallback is not None:
+            raw, _sig = _read_bytes(chosen_fallback)
+            data = _check(raw, expect, validate)
+            save_with_backup_text(path, raw.decode("utf-8-sig"), keep_backups=False, newline="\n")
+            chosen_fallback.unlink(missing_ok=True)
+            return (
+                data,
+                "restored_from_bak1",
+                f"{detail} | restored from fallback {chosen_fallback.name}"[:_DETAIL],
+            )
+        index, bak = chosen_bak
+        raw, _sig = _read_bytes(bak)
+        data = _check(raw, expect, validate)
+        _replace_with_retry(bak, path)
+        return data, f"restored_from_bak{index}", detail
+    except (FileNotFoundError, _BadContentError):
+        # the candidate was rotated away or rewritten (a save that took no heal sidecar): someone else acted
+        raise _ChangedError("candidate vanished or changed") from None
+
+
+def _quarantine_copy(path: Path, stamp: str) -> Path:
+    """Keep the corrupt bytes as ``<name>.corrupt-<stamp>`` WITHOUT moving the live file.
+
+    A hard link (a copy where links are unsupported): the live path is never absent during a heal, so a
+    reader that arrives mid-heal sees either the corrupt file (and waits on the heal lock) or the restored
+    one, never "missing", and a failed install leaves the live file where the next read will heal it again.
+    """
+    for attempt in range(100):
+        q = path.with_name(f"{path.name}.corrupt-{stamp}" + (f"-{attempt}" if attempt else ""))
+        try:
+            os.link(path, q)
+            return q
+        except FileExistsError:
+            continue
+        except FileNotFoundError:
+            raise _ChangedError(f"{path} vanished") from None
+        except OSError:
+            pass  # links unsupported or refused: fall back to a copy
+        try:
+            with open(path, "rb") as src, open(q, "xb") as dst:
+                shutil.copyfileobj(src, dst)
+            shutil.copystat(path, q)
+            return q
+        except FileExistsError:
+            continue
+        except FileNotFoundError:
+            q.unlink(missing_ok=True)
+            raise _ChangedError(f"{path} vanished") from None
+        except OSError:
+            q.unlink(missing_ok=True)  # never leave a half-written quarantine file behind
+            raise
+    raise OSError(errno.EEXIST, f"no free quarantine name for {path}")
+
+
+def _heal_locked(path, bad, sig, default, recover, expect, validate, fallbacks) -> JsonRead:
+    now = datetime.now(UTC)
+    stamp = _filename_safe_timestamp(now)
+    likely_cause = _classify_cause(path)
+    anomaly_kind = (
+        "json_parse_error" if bad.kind in ("encoding", "empty", "malformed") else "schema_mismatch"
+    )
+    detail = _short_detail(bad.cause)
+    chosen_bak, chosen_fallback, walked_corrupt = _pick(path, expect, validate, fallbacks)
 
     if chosen_bak is None and chosen_fallback is None and recover is Recovery.RESTORE:
         raise JsonFileError(path, bad.kind, _short(bad.cause)) from bad.cause
@@ -456,55 +548,43 @@ def _heal_locked(path, bad, sig, default, recover, expect, validate, fallbacks) 
     _expect_unchanged(path, sig)
     _seam("before_quarantine", path)
     _expect_unchanged(path, sig)
-    quarantine = path.with_name(f"{path.name}.corrupt-{stamp}")
     try:
-        _replace_with_retry(path, quarantine)
-    except FileNotFoundError:
-        raise _ChangedError(f"{path} vanished") from None
+        quarantine = _quarantine_copy(path, stamp)
     except OSError as exc:
         raise JsonFileError(path, "io", _short(exc)) from exc
     _seam("inside_heal", path)
-    for corrupt in walked_corrupt:
+    # From here to the replace the live path still holds the corrupt file: a failure leaves it for the next heal.
+    try:
+        _seam("before_install", path)
+        _expect_unchanged(path, sig)
+        if chosen_bak is None and chosen_fallback is None:
+            data = default()
+            save_with_backup_text(
+                path,
+                json.dumps(data, indent=2, ensure_ascii=_ENSURE_ASCII) + "\n",
+                keep_backups=False,
+                newline="\n",
+            )
+            action, outcome, detail_out = "reset_to_default", "reset", detail
+        else:
+            data, action, detail_out = _install(
+                path, chosen_bak, chosen_fallback, expect, validate, detail
+            )
+            outcome = "restored"
+    except OSError as exc:
+        raise JsonFileError(path, "io", _short(exc)) from exc
+    for (
+        corrupt,
+        csig,
+    ) in walked_corrupt:  # corrupt backups last, best effort, each only if it is unchanged
         try:
+            _seam("before_quarantine_backup", corrupt)
+            _expect_unchanged(corrupt, csig)
             _replace_with_retry(corrupt, corrupt.with_name(f"{corrupt.name}.corrupt-{stamp}"))
+        except _ChangedError:
+            logger.warning("backup %s changed during the heal; left alone", corrupt)
         except OSError:
             logger.warning("could not quarantine corrupt backup %s", corrupt, exc_info=True)
-
-    if chosen_bak is None and chosen_fallback is None:
-        data = default()
-        _expect_absent(path)
-        save_with_backup_text(
-            path,
-            json.dumps(data, indent=2, ensure_ascii=_ENSURE_ASCII) + "\n",
-            keep_backups=False,
-            newline="\n",
-        )
-        action, outcome = "reset_to_default", "reset"
-        detail_out = detail
-    else:
-        _seam("before_install", path)
-        _expect_absent(path)
-        try:
-            if chosen_fallback is not None:
-                raw, _sig = _read_bytes(chosen_fallback)
-                data = _check(raw, expect, validate)
-                save_with_backup_text(
-                    path, raw.decode("utf-8-sig"), keep_backups=False, newline="\n"
-                )
-                chosen_fallback.unlink(missing_ok=True)
-                action, outcome = "restored_from_bak1", "restored"
-                detail_out = f"{detail} | restored from fallback {chosen_fallback.name}"[:_DETAIL]
-            else:
-                index, bak = chosen_bak
-                raw, _sig = _read_bytes(bak)
-                data = _check(raw, expect, validate)
-                _replace_with_retry(bak, path)
-                action, outcome = f"restored_from_bak{index}", "restored"
-                detail_out = detail
-        except (
-            FileNotFoundError
-        ):  # the backup was rotated away (a save without the heal sidecar): someone else acted
-            raise _ChangedError("candidate vanished") from None
     anomaly = BrainAnomaly(
         timestamp=now,
         file=path.name,
@@ -518,6 +598,45 @@ def _heal_locked(path, bad, sig, default, recover, expect, validate, fallbacks) 
         "%s: %s (%s); %s, quarantined as %s", path, bad.kind, detail, action, quarantine.name
     )
     return JsonRead(data, outcome, bad.kind, anomaly)  # type: ignore[arg-type]
+
+
+def _restore_missing(path, default, recover, expect, validate, fallbacks) -> JsonRead | None:
+    """RESTORE only: the file is absent; install a valid backup or fallback if there is one, else None."""
+    candidates = [path.with_name(f"{path.name}.bak{i}") for i in (1, 2, 3)] + list(fallbacks)
+    if not any(c.exists() for c in candidates):
+        return None  # nothing to restore from; do not create a sidecar (or directories) for a first run
+    retry = False
+    result: JsonRead | None = None
+    with _heal_guard(path):
+        if os.path.lexists(path):
+            retry = True  # someone put it back while we waited for the lock
+        else:
+            chosen_bak, chosen_fallback, _walked = _pick(path, expect, validate, fallbacks)
+            if chosen_bak is not None or chosen_fallback is not None:
+                try:
+                    _expect_absent(path)
+                    data, action, detail = _install(
+                        path, chosen_bak, chosen_fallback, expect, validate, "live file missing"
+                    )
+                except _ChangedError:
+                    retry = True
+                except OSError as exc:
+                    raise JsonFileError(path, "io", _short(exc)) from exc
+                else:
+                    anomaly = BrainAnomaly(
+                        timestamp=datetime.now(UTC),
+                        file=path.name,
+                        kind="json_parse_error",
+                        action=action,  # type: ignore[arg-type]
+                        quarantine_path=None,
+                        likely_cause="unknown",
+                        detail=detail,
+                    )
+                    logger.warning("%s was missing; %s", path, action)
+                    result = JsonRead(data, "restored", "missing", anomaly)
+    if retry:
+        return _read(path, default, recover, expect, validate, fallbacks, waited=True)
+    return result
 
 
 def _short_detail(exc: object) -> str:
@@ -591,20 +710,38 @@ def _save_text(
                 fsync=fsync,
                 newline="\n",
             )
+            if not verify:
+                return True
+            # Verify under the same lock as the save: no module writer can land between them.
+            try:
+                after = _signature(path.stat())
+            except OSError:
+                after = None
+            _seam("after_save", path)
+            return _verify(path, text, backups > 0, after)
     except OSError as exc:
         if on_error == "raise":
             raise
         _report(path, "write", exc, "write skipped")
         return False
-    if verify:
-        return _verify(path, text, backups > 0)
-    return True
 
 
-def _verify(path: Path, text: str, has_backups: bool) -> bool:
+def _verify(path: Path, text: str, has_backups: bool, after_save) -> bool:
+    """Did our write land intact? Restore ``.bak1`` only if the file is damaged in place or unreadable.
+
+    A different file that replaced ours after the save (a new signature: another saver that takes no heal
+    sidecar) is a newer save, not damage: it is left alone and the write counts as done.
+    """
     expected = text.encode("utf-8")
     try:
         if path.read_bytes() == expected:
+            return True
+        try:
+            now = _signature(path.stat())
+        except OSError:
+            now = None
+        if after_save is not None and now is not None and now != after_save:
+            logger.warning("%s was replaced after it was saved; leaving the newer file alone", path)
             return True
         problem = "content differs from what was written"
     except OSError as exc:
@@ -732,12 +869,18 @@ def read_jsonl_tail(
 
     Blank lines do not count toward ``n``. The window is cut on a newline *byte* before any decoding, so a
     multi-byte character split by a chunk boundary costs only the dropped partial first line, and a bad
-    byte is skipped with a warning (or, ``strict=True``, raises) rather than turned into U+FFFD.
+    byte is skipped with a warning (or, ``strict=True``, raises) rather than turned into U+FFFD. The scan is
+    linear in the bytes read, even for one very long line.
+
+    A ``.gz`` path cannot be read backwards: it is streamed through :func:`iter_jsonl` and the last ``n``
+    *records* (after bad lines are skipped) are returned.
     """
     path = Path(path)
     _check_jsonl_recover(recover)
     if n <= 0:
         return []
+    if path.suffix == ".gz":
+        return list(deque(iter_jsonl(path, strict=strict, recover=recover), maxlen=n))
     try:
         lines = _tail_lines(path, n)
     except FileNotFoundError:
@@ -754,24 +897,50 @@ def read_jsonl_tail(
 
 
 def _tail_lines(path: Path, n: int) -> list[bytes]:
+    """The last ``n`` non-blank lines as bytes (CR stripped), in file order. Each byte is looked at once."""
     with open(path, "rb") as f:
-        f.seek(0, os.SEEK_END)
-        remaining = f.tell()
+        remaining = f.seek(0, os.SEEK_END)
         if remaining == 0:
             return []
-        block = b""
-        while True:
+        head: deque[bytes] = (
+            deque()
+        )  # pieces of the partial line at the left edge of what has been read
+        found: list[bytes] = []  # complete non-blank lines, rightmost first
+        while remaining > 0 and len(found) < n:
             size = min(_TAIL_CHUNK, remaining)
             remaining -= size
             f.seek(remaining)
-            block = f.read(size) + block
-            parts = block.split(b"\n")
-            usable = parts if remaining == 0 else parts[1:]  # the first part may be a partial line
-            if remaining == 0 or sum(1 for p in usable if p.strip()) >= n:
-                break
-    if remaining == 0 and block.startswith(_BOM):
-        usable[0] = usable[0][len(_BOM) :]
-    return [p.rstrip(b"\r") for p in usable if p.strip()][-n:]
+            chunk = f.read(size)
+            if b"\n" not in chunk:
+                head.appendleft(chunk)  # the partial line extends further left; do not re-scan it
+                continue
+            parts = chunk.split(b"\n")
+            tail_line = parts[-1] + b"".join(head)  # the newline before it makes it complete
+            head = deque([parts[0]])
+            for line in [tail_line, *parts[-2:0:-1]]:  # rightmost complete line first
+                if line.strip():
+                    found.append(line.rstrip(b"\r"))
+                    if len(found) >= n:
+                        break
+        if remaining == 0 and len(found) < n:  # the head is the first line of the file
+            first = b"".join(head)
+            if first.startswith(_BOM):
+                first = first[len(_BOM) :]
+            if first.strip():
+                found.append(first.rstrip(b"\r"))
+    return found[::-1]
+
+
+def _payload(records) -> bytes:
+    """Encoded records: pass ``encode_jsonl`` output through (it must end a line), encode anything else."""
+    if isinstance(records, (bytes, bytearray)):
+        payload = bytes(records)
+        if payload and not payload.endswith(b"\n"):
+            raise ValueError(
+                "encoded JSONL bytes must end with a newline (a half line would fuse with the next record)"
+            )
+        return payload
+    return encode_jsonl(records)
 
 
 def _tail_is_torn(fh) -> bool:
@@ -796,14 +965,16 @@ def append_jsonl(
     ``records`` is a dict, an iterable of dicts, or the bytes ``encode_jsonl`` returned. Everything is encoded
     before the file is touched. Under the lock, if the file is non-empty and does not end in a newline (a torn
     tail, #434) the same write begins with a newline, so only the torn record is lost. ``lock``: "block" waits
-    for ``file_lock(path)``; "try" returns None if it is busy; "held" takes no lock (the caller holds it). A
-    filesystem that refuses the lock degrades to unlocked with a warning. ``on_error="log"`` turns an OSError
-    into a throttled warning and None.
+    for ``file_lock(path)``; "try" returns None if it is busy; "held" takes no lock (the caller holds it). Under
+    "block" a filesystem that refuses the lock degrades to unlocked with a warning. Under "try" it cannot:
+    ``file_lock(blocking=False)`` reports every flock error as busy, so a refusing filesystem reads as busy
+    and the record is not written (the caller, like the recall path, buffers on None). ``on_error="log"`` turns
+    an OSError into a throttled warning and None.
     """
     path = Path(path)
     if lock not in ("block", "try", "held"):
         raise ValueError(f"lock must be 'block', 'try' or 'held', not {lock!r}")
-    payload = bytes(records) if isinstance(records, (bytes, bytearray)) else encode_jsonl(records)
+    payload = _payload(records)
     if not payload:
         return 0
     try:
@@ -856,7 +1027,7 @@ def write_jsonl(
     on_error: Literal["raise", "log"] = "raise",
 ) -> bool:
     """Atomically replace a JSONL file with ``records`` (same writer as :func:`write_json`)."""
-    payload = bytes(records) if isinstance(records, (bytes, bytearray)) else encode_jsonl(records)
+    payload = _payload(records)
     return _save_text(
         Path(path), payload.decode("utf-8"), backups, fsync, mode, False, False, on_error
     )

@@ -833,15 +833,15 @@ def test_cr8_delta_one_invalid_utf8_is_labelled_a_parse_error_not_a_schema_misma
 
 
 def test_cr8_anomaly_detail_is_capped_at_500_characters(tmp_path: Path) -> None:
+    """A file that PARSES, rejected by a validator with a 900-character message: the cap, not the source, limits it."""
     p = tmp_path / "s.json"
-    p.write_text('{"k": ' + "9" * 3000 + " oops")
-    r = jio.read_json_result(
-        p,
-        default=dict,
-        recover=jio.Recovery.HEAL,
-        validate=lambda d: (_ for _ in ()).throw(ValueError("v" * 900)),
-    )
-    assert len(r.anomaly.detail) <= 500
+    p.write_text('{"k": 1}')
+
+    def reject(_data):
+        raise ValueError("v" * 900)
+
+    r = jio.read_json_result(p, default=dict, recover=jio.Recovery.HEAL, validate=reject)
+    assert r.anomaly is not None and 400 < len(r.anomaly.detail) <= 500
 
 
 def test_cr8_delta_two_the_reset_to_default_is_written_atomically(
@@ -994,22 +994,37 @@ def test_cr9_b_without_revalidation_the_new_content_is_quarantined(
     assert r.data != {"fresh": 1}
 
 
-def test_cr9_c_a_failed_quarantine_rename_raises_and_leaves_the_original(
+def test_cr9_c_a_failed_quarantine_raises_and_leaves_the_original(
     tmp_path: Path, monkeypatch
 ) -> None:
     p = _corrupt_with_backup(tmp_path)
-    real = jio._replace_with_retry
 
-    def failing(src, dst):
-        if ".corrupt-" in str(dst):
-            raise OSError(errno.EIO, "disk")
-        return real(src, dst)
+    def no_link(src, dst, **k):
+        raise OSError(errno.EPERM, "links not supported")
 
-    monkeypatch.setattr(jio, "_replace_with_retry", failing)
+    def no_copy(src, dst, **k):
+        raise OSError(errno.EIO, "disk")
+
+    monkeypatch.setattr(os, "link", no_link)
+    monkeypatch.setattr(jio.shutil, "copyfileobj", no_copy)
     with pytest.raises(jio.JsonFileError) as exc:
         jio.read_json(p, default=dict, recover=jio.Recovery.HEAL)
     assert exc.value.kind == "io"
     assert p.read_bytes() == b"{nope" and (tmp_path / "s.json.bak1").exists()
+
+
+def test_cr9_c_when_hard_links_are_unsupported_the_quarantine_is_a_copy(
+    tmp_path: Path, monkeypatch
+) -> None:
+    p = _corrupt_with_backup(tmp_path)
+
+    def no_link(src, dst, **k):
+        raise OSError(errno.EPERM, "links not supported")
+
+    monkeypatch.setattr(os, "link", no_link)
+    assert jio.read_json(p, default=dict, recover=jio.Recovery.HEAL) == {"restored": True}
+    [q] = tmp_path.glob("s.json.corrupt-*")
+    assert q.read_bytes() == b"{nope"
 
 
 def _in_thread(fn, timeout: float):
@@ -1232,16 +1247,13 @@ def test_cr14_an_oserror_in_the_body_propagates_once_and_the_body_runs_once(
     tmp_path: Path, monkeypatch
 ) -> None:
     p = _corrupt_with_backup(tmp_path)
-    real = jio._replace_with_retry
     calls = {"quarantine": 0}
 
-    def failing(src, dst):
-        if ".corrupt-" in str(dst):
-            calls["quarantine"] += 1
-            raise OSError(errno.EIO, "disk")
-        return real(src, dst)
+    def failing(path, stamp):
+        calls["quarantine"] += 1
+        raise OSError(errno.EIO, "disk")
 
-    monkeypatch.setattr(jio, "_replace_with_retry", failing)
+    monkeypatch.setattr(jio, "_quarantine_copy", failing)
     with pytest.raises(jio.JsonFileError):
         jio.read_json(p, default=dict, recover=jio.Recovery.HEAL)
     assert calls["quarantine"] == 1, (
@@ -2530,3 +2542,358 @@ def test_cr11_no_public_function_opens_a_text_file_without_utf8(
     jio.write_jsonl(tmp_path / "rw.jsonl", [{"a": 1}])
     list(jio.parse_jsonl(b'{"a": 1}\n'))
     assert spy.violations == []
+
+
+# --------------------------------------------------------------------------------------------------------------
+# Code-review round 1 fixes (6-redteam-code.md F1-F10): each test fails on the code before the fix
+# --------------------------------------------------------------------------------------------------------------
+
+import random  # noqa: E402
+
+
+def _start_thread(fn):
+    box: dict = {}
+
+    def run():
+        try:
+            box["result"] = fn()
+        except BaseException as exc:  # noqa: BLE001
+            box["error"] = exc
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    return t, box
+
+
+@pytest.mark.parametrize("policy", ["RESTORE", "HEAL"])
+def test_cr9_f_a_plain_reader_arriving_mid_heal_waits_and_never_gets_the_default(
+    tmp_path: Path, monkeypatch, policy: str
+) -> None:
+    """F1: between the healer's quarantine and its install a plain reader used to see no file and return default()."""
+    p = _corrupt_with_backup(tmp_path, b'{"restored": true}')
+    state: dict = {}
+
+    def reader_arrives(path):
+        t, box = _start_thread(
+            lambda: jio.read_json(path, default=lambda: {"DEFAULT": 1}, recover=_policy(policy))
+        )
+        t.join(0.4)
+        state["thread"], state["box"] = t, box
+        state["waited"] = t.is_alive() or box.get("result") == {"restored": True}
+        state["early"] = box.get("result")
+
+    _seam_hook(monkeypatch, inside_heal=reader_arrives)
+    assert jio.read_json(p, default=lambda: {"DEFAULT": 1}, recover=_policy(policy)) == {
+        "restored": True
+    }
+    state["thread"].join(5)
+    assert state["early"] != {"DEFAULT": 1}, "a reader got default() while a heal was in progress"
+    assert state["box"].get("result") == {"restored": True}
+
+
+def test_cr9_f_stress_no_reader_ever_sees_the_default_while_others_heal(tmp_path: Path) -> None:
+    bad: list[object] = []
+    for rnd in range(40):
+        d = tmp_path / f"r{rnd}"
+        d.mkdir()
+        p = _corrupt_with_backup(d, b'{"good": 1}')
+        gate = threading.Barrier(6)
+
+        def reader(p=p, gate=gate):
+            gate.wait()
+            got = jio.read_json(p, default=lambda: {"DEFAULT": 1}, recover=jio.Recovery.RESTORE)
+            if got != {"good": 1}:
+                bad.append(got)
+
+        threads = [threading.Thread(target=reader) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(20)
+    assert bad == []
+
+
+def test_cr9_f_a_reader_finding_the_file_absent_while_a_heal_lock_is_held_waits_for_it(
+    tmp_path: Path,
+) -> None:
+    """A legacy healer (no sidecar of its own) cannot be waited on, but a module heal in progress can."""
+    from brain.utils.file_lock import file_lock
+
+    p = tmp_path / "s.json"
+    heal_target = p.with_name(p.name + ".heal")
+    acquired, release = threading.Event(), threading.Event()
+
+    def healer():
+        with file_lock(heal_target):
+            acquired.set()
+            release.wait(10)
+            p.write_text('{"restored": true}')
+
+    h = threading.Thread(target=healer, daemon=True)
+    h.start()
+    assert acquired.wait(5)
+    t, box = _start_thread(
+        lambda: jio.read_json(p, default=lambda: {"DEFAULT": 1}, recover=jio.Recovery.RESTORE)
+    )
+    t.join(0.4)
+    assert t.is_alive(), "the reader did not wait for the heal in progress"
+    release.set()
+    t.join(5)
+    h.join(5)
+    assert box.get("result") == {"restored": True}
+
+
+def test_cr15_restore_of_a_missing_file_restores_a_valid_backup_instead_of_the_default(
+    tmp_path: Path,
+) -> None:
+    p = tmp_path / "b.json"
+    (tmp_path / "b.json.bak1").write_bytes(b'{"count": 7}')
+    r = jio.read_json_result(p, default=lambda: {"count": 0}, recover=jio.Recovery.RESTORE)
+    assert (r.data, r.outcome) == ({"count": 7}, "restored")
+    assert json.loads(p.read_text()) == {"count": 7}
+
+
+def test_cr15_a_missing_file_with_no_backup_is_still_the_default_and_heal_keeps_the_legacy_meaning(
+    tmp_path: Path,
+) -> None:
+    p = tmp_path / "b.json"
+    assert (
+        jio.read_json_result(p, default=lambda: {"count": 0}, recover=jio.Recovery.RESTORE).outcome
+        == "missing"
+    )
+    (tmp_path / "b.json.bak1").write_bytes(b'{"count": 7}')
+    # HEAL keeps attempt_heal's meaning for a missing file: a deleted file is a reset, not a corruption
+    assert (
+        jio.read_json_result(p, default=lambda: {"count": 0}, recover=jio.Recovery.HEAL).outcome
+        == "missing"
+    )
+
+
+def test_cr9_f_the_live_path_is_never_absent_during_a_module_heal(
+    tmp_path: Path, monkeypatch
+) -> None:
+    p = _corrupt_with_backup(tmp_path)
+    absent: list[str] = []
+
+    def watch(name, path):
+        if not os.path.lexists(path):
+            absent.append(name)
+
+    monkeypatch.setattr(jio, "_seam", watch)
+    jio.read_json(p, default=dict, recover=jio.Recovery.HEAL)
+    assert absent == []
+
+
+@pytest.mark.parametrize("policy", ["RESTORE", "HEAL"])
+def test_cr9_g_a_failed_install_keeps_the_corrupt_live_file_raises_json_file_error_and_recovers_next_time(
+    tmp_path: Path, monkeypatch, policy: str
+) -> None:
+    """F2: used to leave the live file quarantined and absent, raise a raw PermissionError, then reset on the next read."""
+    p = _corrupt_with_backup(tmp_path, b'{"count": 7}')
+    real = jio._replace_with_retry
+
+    def failing(src, dst):
+        if Path(dst) == p:
+            raise PermissionError(13, "an AV scan holds the backup")
+        return real(src, dst)
+
+    monkeypatch.setattr(jio, "_replace_with_retry", failing)
+    with pytest.raises(jio.JsonFileError) as exc:
+        jio.read_json(p, default=lambda: {"count": 0}, recover=_policy(policy))
+    assert exc.value.kind == "io" and not isinstance(exc.value, PermissionError)
+    assert p.read_bytes() == b"{nope" and (tmp_path / "s.json.bak1").exists()
+    monkeypatch.undo()
+    assert jio.read_json(p, default=lambda: {"count": 0}, recover=_policy(policy)) == {"count": 7}
+
+
+def test_cr9_g_a_failed_reset_save_keeps_the_corrupt_file_and_the_next_heal_resets(
+    tmp_path: Path, monkeypatch
+) -> None:
+    p = tmp_path / "s.json"
+    p.write_bytes(b"{nope")
+
+    def enospc(*a, **k):
+        raise OSError(errno.ENOSPC, "disk full")
+
+    monkeypatch.setattr(jio, "save_with_backup_text", enospc)
+    with pytest.raises(jio.JsonFileError) as exc:
+        jio.read_json(p, default=lambda: {"fresh": 1}, recover=jio.Recovery.HEAL)
+    assert exc.value.kind == "io" and p.read_bytes() == b"{nope"
+    monkeypatch.undo()
+    assert jio.read_json(p, default=lambda: {"fresh": 1}, recover=jio.Recovery.HEAL) == {"fresh": 1}
+
+
+def test_cr14_a_competing_restorer_before_the_reset_save_is_not_overwritten(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """F7: the reset-to-default install is an install too; it needs the same collision check as the restore."""
+    p = tmp_path / "s.json"
+    p.write_bytes(b"{nope")
+    _seam_hook(monkeypatch, before_install=lambda path: path.write_text('{"competitor": 1}'))
+    r = jio.read_json_result(p, default=lambda: {"fresh": 1}, recover=jio.Recovery.HEAL)
+    assert r.data == {"competitor": 1} and json.loads(p.read_text()) == {"competitor": 1}
+
+
+def test_cr14_a_corrupt_backup_that_changed_before_its_quarantine_is_left_alone(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """F6: each corrupt backup is re-stat'ed before it is moved; a changed one is skipped, the heal still succeeds."""
+    p = tmp_path / "s.json"
+    p.write_bytes(b"{nope")
+    (tmp_path / "s.json.bak1").write_bytes(b"garbage")
+    (tmp_path / "s.json.bak2").write_bytes(b'{"good": 1}')
+    _seam_hook(
+        monkeypatch,
+        before_quarantine_backup=lambda path: path.write_text('{"someone": "saved a backup"}'),
+    )
+    assert jio.read_json(p, default=dict, recover=jio.Recovery.HEAL) == {"good": 1}
+    assert (tmp_path / "s.json.bak1").read_text() == '{"someone": "saved a backup"}'
+    assert not list(tmp_path.glob("s.json.bak1.corrupt-*"))
+
+
+def test_cw9_verify_runs_under_the_lock_so_a_concurrent_newer_save_is_not_undone(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """F3: another writer's save used to land between A's save and A's verify; A then restored its own older text over it."""
+    p = tmp_path / "s.json"
+    jio.write_json(p, {"v": "base"}, backups=1)
+    state: dict = {}
+
+    def b_arrives(name, path):
+        if name == "after_save" and "t" not in state:
+            state["t"], state["box"] = _start_thread(
+                lambda: jio.write_json(p, {"v": "B-newer"}, backups=1)
+            )
+            state["t"].join(0.3)
+            state["b_waited"] = state["t"].is_alive()
+
+    monkeypatch.setattr(jio, "_seam", b_arrives)
+    assert jio.write_json(p, {"v": "A"}, backups=1, verify=True) is True
+    state["t"].join(5)
+    assert state["b_waited"], "B's save ran inside A's save-and-verify"
+    assert json.loads(p.read_text()) == {"v": "B-newer"}
+
+
+def test_cw9_a_valid_newer_file_from_an_unlocked_writer_is_never_overwritten_by_the_restore(
+    tmp_path: Path, monkeypatch
+) -> None:
+    p = tmp_path / "s.json"
+    jio.write_json(p, {"v": "base"}, backups=1)
+
+    def legacy_saver(name, path):
+        if name == "after_save":
+            tmp = path.with_name("legacy.tmp")
+            tmp.write_text('{"v": "legacy-newer"}')
+            os.replace(tmp, path)  # a legacy saver takes no heal sidecar
+
+    monkeypatch.setattr(jio, "_seam", legacy_saver)
+    assert jio.write_json(p, {"v": "A"}, backups=1, verify=True) is True  # superseded, not failed
+    assert json.loads(p.read_text()) == {"v": "legacy-newer"}
+
+
+def test_cr2_a_huge_integer_is_malformed_not_a_value_error(tmp_path: Path) -> None:
+    """F5: json.loads raises a plain ValueError past 4300 digits; it leaked out of every policy."""
+    p = tmp_path / "big.json"
+    p.write_text('{"n": ' + "9" * 5000 + "}")
+    for policy in ("DEFAULT", "HEAL"):
+        r = jio.read_json_result(p, default=dict, recover=_policy(policy))
+        assert r.kind == "malformed" and r.data == {}
+        p.write_text('{"n": ' + "9" * 5000 + "}")
+    with pytest.raises(jio.JsonFileError) as exc:
+        jio.read_json(p, default=dict, recover=jio.Recovery.RAISE)
+    assert exc.value.kind == "malformed"
+
+
+def test_ca2_try_mode_cannot_tell_a_refused_lock_from_a_busy_one_and_says_so(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """F4 (documented, not fixed in this phase): file_lock(blocking=False) reports flock errors as 'busy'."""
+    import fcntl
+
+    if not POSIX:
+        pytest.skip("flock is POSIX")
+
+    def refused(fd, op):
+        raise OSError(errno.ENOLCK, "no locks")
+
+    monkeypatch.setattr(fcntl, "flock", refused)
+    p = tmp_path / "log.jsonl"
+    assert jio.append_jsonl(p, {"a": 1}, lock="try") is None
+    assert "busy" in (jio.append_jsonl.__doc__ or "") and "refus" in (
+        jio.append_jsonl.__doc__ or ""
+    )
+
+
+def test_ca1_encoded_bytes_without_a_trailing_newline_are_rejected(tmp_path: Path) -> None:
+    """F10: the 'accepts encode_jsonl output' contract is not a licence to append a half line."""
+    p = tmp_path / "log.jsonl"
+    with pytest.raises(ValueError):
+        jio.append_jsonl(p, b'{"a": 1}')
+    assert not p.exists()
+    p.write_bytes(b'{"x": 1}\n')
+    with pytest.raises(ValueError):
+        jio.write_jsonl(p, b'{"a": 1}')
+
+
+def test_cj4_a_gz_tail_returns_the_last_n_records_not_nothing(tmp_path: Path) -> None:
+    """F10: the tail used to read raw gzip bytes and return [] with warnings."""
+    p = tmp_path / "log.2025.jsonl.gz"
+    with gzip.open(p, "wb") as f:
+        for i in range(10):
+            f.write(json.dumps({"i": i}).encode() + b"\n")
+    assert jio.read_jsonl_tail(p, 3) == [{"i": 7}, {"i": 8}, {"i": 9}]
+
+
+def _reference_tail(data: bytes, n: int) -> list[bytes]:
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]
+    lines = [ln.rstrip(b"\r") for ln in data.split(b"\n") if ln.strip()]
+    return lines[-n:]
+
+
+@pytest.mark.parametrize("chunk", [1, 2, 3, 5, 8, 13, 64])
+def test_cj4_the_tail_matches_a_naive_reference_for_tiny_chunk_sizes(
+    tmp_path: Path, monkeypatch, chunk: int
+) -> None:
+    """F7: with an 8 KiB chunk every small file is one window; tiny chunks force the boundary logic to run."""
+    monkeypatch.setattr(jio, "_TAIL_CHUNK", chunk)
+    rng = random.Random(chunk)
+    pieces = [b'{"a": 1}', '{"é": "ü"}'.encode(), b"", b"   ", b'{"b": 22}\r', b'{"torn": ']
+    for trial in range(120):
+        body = b"\n".join(rng.choice(pieces) for _ in range(rng.randint(0, 9)))
+        if rng.random() < 0.5:
+            body += b"\n"
+        if rng.random() < 0.2:
+            body = b"\xef\xbb\xbf" + body
+        p = tmp_path / f"t{chunk}_{trial}.jsonl"
+        p.write_bytes(body)
+        n = rng.randint(1, 6)
+        assert jio._tail_lines(p, n) == _reference_tail(body, n), (body, n)
+
+
+def test_cj4_a_file_whose_first_line_is_only_a_bom_does_not_count_it_as_a_line(
+    tmp_path: Path,
+) -> None:
+    p = tmp_path / "log.jsonl"
+    p.write_bytes(b'\xef\xbb\xbf\n{"a": 1}\n{"b": 2}\n')
+    assert jio._tail_lines(p, 5) == [b'{"a": 1}', b'{"b": 2}']
+
+
+def test_cj4_the_tail_scan_is_linear_in_the_length_of_one_long_line(tmp_path: Path) -> None:
+    """F9: re-concatenating and re-splitting the whole block per chunk made one long line quadratic."""
+
+    def best(size: int) -> float:
+        p = tmp_path / f"long{size}.jsonl"
+        p.write_bytes(b'{"k": "' + b"x" * size + b'"}\n')
+        times = []
+        for _ in range(3):
+            t0 = time.perf_counter()
+            assert len(jio.read_jsonl_tail(p, 1)) == 1
+            times.append(time.perf_counter() - t0)
+        return min(times)
+
+    small, big = best(1_000_000), best(8_000_000)
+    assert big < small * 32, (
+        small,
+        big,
+    )  # linear is about 8x; quadratic is about 64x (timing noise is allowed for)

@@ -14,13 +14,17 @@ observed count FAILS with a message to lower it, so freed slack can never be reu
 marks a site that never migrates (it is replaced by an in-site ``# json-io: ok -- reason`` marker in the last
 migration PR; the central file exists only because this phase could not edit call sites).
 
-Independent oracle: for every file, ``json.load/loads/dump/dumps`` call nodes <= read + write + not-file-io ceilings
-(plus slack), so a call that is in no category fails.
+Reconciliation: every ``json.load/loads/dump/dumps`` call is put in exactly one category (read, write, not-file-io,
+or ``indirect`` for a json function used as a value or fetched by ``__import__``), and each category has a ceiling, so a
+new call cannot be unaccounted for. This is a ceiling check, not an oracle independent of the scanner.
 
-Known limits: names are followed within one function only; ``json.loads(self._slurp(p))`` (a one-hop helper) is not
-followed; readers that parse through a domain constructor with no ``json`` call in the file
-(``AuditRow.from_jsonl(line)``) are invisible and are listed in the call-site inventory instead; import aliases are
-tracked per scope (a function-local ``import json as _json`` counts). Run ``python tests/unit/test_no_direct_json_io.py
+Known limits (blind spots): names are followed within one function only; ``json.loads(self._slurp(p))`` (a one-hop
+helper) is not followed; readers that parse through a domain constructor with no ``json`` call in the file
+(``AuditRow.from_jsonl(line)``) are invisible and are listed in the call-site inventory instead; ``getattr(json,
+"loads")``, ``from json import *``, ``json.JSONDecoder().decode(...)`` and other JSON libraries are not seen. Import
+aliases are tracked per scope (a function-local ``import json as _json`` counts); a json function passed around as a
+value (``map(json.loads, lines)``, ``loads = json.loads``) or fetched with ``__import__("json")`` /
+``importlib.import_module("json")`` is counted as ``indirect``. Run ``python tests/unit/test_no_direct_json_io.py
 --print`` to regenerate the observed counts in allowlist format.
 """
 
@@ -112,7 +116,7 @@ def _roots(node: ast.AST) -> set[str]:
 
 
 def _derived(node: ast.AST, file_vars: set[str]) -> bool:
-    return _has_read_call(node) or bool(_roots(node) & file_vars)
+    return _has_read_call(node) or _is_open_call(node) or bool(_roots(node) & file_vars)
 
 
 def _is_open_call(node: ast.AST) -> bool:
@@ -135,6 +139,7 @@ class _FileScan(ast.NodeVisitor):
         ]  # per-scope name -> op for `from json import loads as x`
         self.fn_stack: list[ast.AST] = []
         self.bad_markers: list[int] = []
+        self._call_funcs: set[int] = set()
 
     # -- import aliases are tracked per scope -------------------------------------------------------------------
     def visit_Import(self, node: ast.Import) -> None:
@@ -225,7 +230,43 @@ class _FileScan(ast.NodeVisitor):
                     return scope[f.id]
         return None
 
+    def _is_json_value(self, node: ast.AST) -> bool:
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.attr in JSON_OPS
+        ):
+            return any(node.value.id in s for s in self.module_aliases)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            return any(node.id in scope for scope in self.func_aliases)
+        return False
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:  # noqa: N802 - ast.NodeVisitor protocol
+        if id(node) not in self._call_funcs and self._is_json_value(node):
+            self.counts["indirect"] += (
+                1  # json.loads used as a value: map(json.loads, ...), loads = json.loads
+            )
+        self.generic_visit(node)
+
+    def visit_Name(self, node: ast.Name) -> None:  # noqa: N802
+        if id(node) not in self._call_funcs and self._is_json_value(node):
+            self.counts["indirect"] += 1
+        self.generic_visit(node)
+
+    def _dynamic_import_of_json(self, node: ast.Call) -> bool:
+        f = node.func
+        name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None
+        return (
+            name in ("__import__", "import_module")
+            and bool(node.args)
+            and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value == "json"
+        )
+
     def visit_Call(self, node: ast.Call) -> None:
+        self._call_funcs.add(id(node.func))
+        if self._dynamic_import_of_json(node):
+            self.counts["indirect"] += 1
         op = self._json_op(node)
         if op:
             self._classify(node, op)
@@ -467,10 +508,40 @@ def _kinds(source: str, rel: str = "brain/x.py") -> dict[str, int]:
             "import json\ndef outer(p, d):\n    def inner(x):\n        return x\n    p.write_text(json.dumps(d))\n",
             {"write": 1},
         ),
+        # F8 (code review): the first-class and dynamic-import forms, and open() as a direct iteration source
+        (
+            "import json\ndef f(p):\n    return list(map(json.loads, p.read_text().splitlines()))\n",
+            {"indirect": 1},
+        ),
+        (
+            "import json\nloads = json.loads\ndef f(p):\n    return loads(p.read_text())\n",
+            {"indirect": 1},
+        ),
+        (
+            "from json import loads as l\ndef f(p):\n    return list(map(l, p.read_text().splitlines()))\n",
+            {"indirect": 1},
+        ),
+        (
+            "def f(p):\n    j = __import__('json')\n    return j.loads(p.read_text())\n",
+            {"indirect": 1},
+        ),
+        (
+            "import importlib\ndef f():\n    return importlib.import_module('json')\n",
+            {"indirect": 1},
+        ),
+        ("import json\ndef f(p):\n    for l in open(p):\n        json.loads(l)\n", {"read": 1}),
+        ("import json\ndef f(p):\n    return [json.loads(l) for l in open(p)]\n", {"read": 1}),
+        ("import json\ndef f(p):\n    return [json.loads(l) for l in p.open()]\n", {"read": 1}),
     ],
 )
 def test_cs2_b_each_pattern_family_is_classified(source: str, expected: dict[str, int]) -> None:
     assert _kinds(source) == expected
+
+
+def test_cs2_b_the_documented_blind_spots_are_named_in_the_module_doc() -> None:
+    doc = __doc__ or ""
+    for spot in ("getattr(json", "from json import *", "JSONDecoder", "one-hop", "from_jsonl"):
+        assert spot in doc, spot
 
 
 def test_cs2_b_the_legacy_helper_files_do_not_count_their_own_definitions() -> None:
