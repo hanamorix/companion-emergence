@@ -100,7 +100,8 @@ export function ConnectionPanel({
   const [pendingTiersUnchecked, setPendingTiersUnchecked] = useState<string[] | null>(null);
   // Guard against a poll that left BEFORE the last Apply and lands after it: it still reports the old chat
   // model and must not bring back the old lines. It is released by the first poll that reports any other
-  // model (the new one, or one changed elsewhere meanwhile), or after GUARD_RELEASE_MS, whichever is first.
+  // model (the new one, or one changed elsewhere meanwhile), or after GUARD_RELEASE_MS, whichever is first;
+  // when the Apply re-saved the same model, only the timer applies.
   const guardRef = useRef<{ before: string | null; applied: string } | null>(null);
   const guardTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const releaseGuard = () => {
@@ -114,7 +115,8 @@ export function ConnectionPanel({
   useEffect(() => {
     const g = guardRef.current;
     const polled = state?.connection?.model ?? null;
-    if (g === null || polled !== g.before || g.before === g.applied) releaseGuard();
+    // A re-Apply of the same model cannot tell a stale poll from a fresh one: only the timer ends its guard.
+    if (g === null || polled !== g.before) releaseGuard();
   }, [state]);
   useEffect(
     () => () => {

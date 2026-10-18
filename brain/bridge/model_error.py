@@ -220,6 +220,7 @@ def switch(old: str, new: str, keep: Iterable[str] = ()) -> None:
         with _lock:
             _rejected.pop(old, None)
             _unconfirmed.discard(old)
+            _tier_unconfirmed.discard(old)
             if old not in keep_set:
                 _ignored.add(old)
             # An id that is still (or again) in use in some other role must never stay ignored, or a real
