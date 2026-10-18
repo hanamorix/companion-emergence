@@ -256,3 +256,20 @@ def test_log_usage_never_raises_on_a_non_dict_frame(tmp_path):
 
     for bad in (None, "x", 5, [1]):
         log_usage(tmp_path, call_type="chat", model="sonnet", frame=bad)  # type: ignore[arg-type]
+
+
+def test_unconfirmed_mark_clears_on_same_model_success_and_on_switch(tmp_path):
+    from brain.bridge.usage_log import log_usage
+
+    model_error.note_unconfirmed("claude-sonnet-5")
+    model_error.note_unconfirmed("claude-other-1")
+    assert model_error.unconfirmed() == ["claude-other-1", "claude-sonnet-5"]
+    assert model_error.unconfirmed(only={"claude-sonnet-5"}) == ["claude-sonnet-5"]
+    log_usage(tmp_path, call_type="chat", model="haiku", frame={"is_error": False})
+    assert len(model_error.unconfirmed()) == 2  # another model's clean frame does not clear it
+    log_usage(tmp_path, call_type="chat", model="claude-sonnet-5", frame={"is_error": True})
+    assert "claude-sonnet-5" in model_error.unconfirmed()  # an error frame does not clear it
+    log_usage(tmp_path, call_type="chat", model="claude-sonnet-5", frame={"is_error": False})
+    assert model_error.unconfirmed() == ["claude-other-1"]
+    model_error.switch("claude-other-1", "sonnet", keep=frozenset())
+    assert model_error.unconfirmed() == []

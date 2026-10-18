@@ -166,9 +166,13 @@ export interface PersonaState {
    *  Optional so older bridge builds without the field degrade gracefully. */
   provider_auth_expired?: boolean;
   /** Models the Claude CLI rejected (unknown, or not available to this account) among the configured
-   *  chat model and the tier models; [] when none. Nothing in the app renders it yet (#440): it is for
-   *  the log/API. Optional so older bridge builds degrade gracefully. */
+   *  chat model and the tier models; [] when none. The connection panel shows a line for each (#440);
+   *  the bridge drops a record when the model changes or a clean reply arrives for it.
+   *  Optional so older bridge builds degrade gracefully. */
   model_rejections?: Array<{ model: string; since: string; last_at: string; count: number }>;
+  /** The chat model, when it was saved without the Apply-time check being able to confirm it and no clean
+   *  reply has arrived for it since; [] otherwise. The connection panel shows a plain notice (#440). */
+  model_unconfirmed?: string[];
   /** File writes she has proposed and that await the user's approve/decline.
    *  Each is the consent gate for one guarded write — `propose_write` queued
    *  it (writing nothing); the user commits it to disc or discards it via the

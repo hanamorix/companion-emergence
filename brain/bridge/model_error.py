@@ -49,6 +49,9 @@ _rejected: dict[str, dict[str, Any]] = {}
 # Models that were switched away from: an ambient call that read the old id before the hot-swap must
 # not re-record it when it fails later.
 _ignored: set[str] = set()
+# Models saved without the Apply-time check being able to confirm them (a check that timed out, hit a
+# limit or found the login expired). Cleared by a clean frame for that model or by switching away.
+_unconfirmed: set[str] = set()
 _local = threading.local()
 
 
@@ -127,12 +130,36 @@ def note_failure(detail: str) -> None:
 
 
 def note_success(model: str) -> None:
-    """A clean CLI frame for ``model``: its rejection record (if any) is stale."""
+    """A clean CLI frame for ``model``: its rejection record and unconfirmed mark (if any) are stale."""
     try:
         with _lock:
             _rejected.pop(model, None)
+            _unconfirmed.discard(model)
     except Exception:  # noqa: BLE001 - fail open
         log.warning("model_error.note_success failed (ignored)", exc_info=True)
+
+
+def note_unconfirmed(model: str) -> None:
+    """``model`` was saved without the Apply-time check being able to confirm it."""
+    try:
+        with _lock:
+            _unconfirmed.add(model)
+    except Exception:  # noqa: BLE001 - fail open
+        log.warning("model_error.note_unconfirmed failed (ignored)", exc_info=True)
+
+
+def unconfirmed(only: Iterable[str] | None = None) -> list[str]:
+    """Models still saved-but-unconfirmed, sorted; restricted to ``only`` when given."""
+    try:
+        with _lock:
+            out = sorted(_unconfirmed)
+        if only is not None:
+            allowed = frozenset(only)
+            out = [m for m in out if m in allowed]
+        return out
+    except Exception:  # noqa: BLE001 - fail open
+        log.warning("model_error.unconfirmed failed (ignored)", exc_info=True)
+        return []
 
 
 def switch(old: str, new: str, keep: Iterable[str] = ()) -> None:
@@ -147,6 +174,7 @@ def switch(old: str, new: str, keep: Iterable[str] = ()) -> None:
         keep_set = frozenset(keep)
         with _lock:
             _rejected.pop(old, None)
+            _unconfirmed.discard(old)
             if old not in keep_set:
                 _ignored.add(old)
             _ignored.discard(new)
@@ -176,4 +204,5 @@ def reset() -> None:
     with _lock:
         _rejected.clear()
         _ignored.clear()
+        _unconfirmed.clear()
     _local.suppress = False

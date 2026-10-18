@@ -209,6 +209,28 @@ def test_non_rejection_failure_saves_with_checked_false(persona_dir: Path, monke
     assert any("reason=failed" in rec.getMessage() for rec in caplog.records)
 
 
+def test_unconfirmed_save_is_reported_until_a_clean_reply_arrives(persona_dir: Path, monkeypatch):
+    from brain.bridge.usage_log import log_usage
+
+    quota = json.dumps({"is_error": True, "api_error_status": 429, "result": "You've hit your session limit"})
+    with _client(persona_dir, monkeypatch) as c, patch("subprocess.run", _Run(lambda m: _proc(1, quota))):
+        assert _post_model(c, "claude-sonnet-5").json()["checked"] is False
+        assert c.get("/persona/state").json()["model_unconfirmed"] == ["claude-sonnet-5"]
+        # a clean reply for ANOTHER model does not clear it; one for this model does
+        log_usage(persona_dir, call_type="chat", model="haiku", frame={"is_error": False})
+        assert c.get("/persona/state").json()["model_unconfirmed"] == ["claude-sonnet-5"]
+        log_usage(persona_dir, call_type="chat", model="claude-sonnet-5", frame={"is_error": False})
+        assert c.get("/persona/state").json()["model_unconfirmed"] == []
+
+
+def test_confirmed_save_and_alias_leave_nothing_unconfirmed(persona_dir: Path, monkeypatch):
+    with _client(persona_dir, monkeypatch) as c, patch("subprocess.run", _Run(lambda m: _proc(0, _ok_json()))):
+        _post_model(c, "claude-sonnet-5")
+        assert c.get("/persona/state").json()["model_unconfirmed"] == []
+        _post_model(c, "opus")
+        assert c.get("/persona/state").json()["model_unconfirmed"] == []
+
+
 def test_auth_expired_saves_with_checked_false_and_makes_no_call(persona_dir: Path, monkeypatch, caplog):
     run = _Run(lambda m: _proc(0, _ok_json()))
     with _client(persona_dir, monkeypatch) as c, patch("subprocess.run", run):

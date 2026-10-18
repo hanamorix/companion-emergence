@@ -461,6 +461,30 @@ describe("ConnectionPanel — rejected and unchecked models (#440)", () => {
     expect(screen.queryByText(/Claude rejected/)).not.toBeInTheDocument();
   });
 
+  it("keeps the unconfirmed notice while the bridge lists the model, and clears it when a clean reply arrives", () => {
+    const unconfirmed = (models: string[]) =>
+      baseState({
+        connection: { provider: "claude-cli", model: "claude-sonnet-5", last_heartbeat_at: null },
+        model_unconfirmed: models,
+      });
+    const { rerender } = render(<ConnectionPanel state={unconfirmed(["claude-sonnet-5"])} persona="test" />);
+    expect(screen.getByText(/Couldn't check that model right now/)).toBeInTheDocument();
+
+    // a clean reply for the model arrives: the bridge's next state no longer lists it
+    rerender(<ConnectionPanel state={unconfirmed([])} persona="test" />);
+    expect(screen.queryByText(/Couldn't check that model/)).not.toBeInTheDocument();
+  });
+
+  it("does not show the unconfirmed notice for a model that is not the displayed one", () => {
+    render(
+      <ConnectionPanel
+        state={sonnetState({ model_unconfirmed: ["claude-sonnet-5"] })}
+        persona="test"
+      />,
+    );
+    expect(screen.queryByText(/Couldn't check that model/)).not.toBeInTheDocument();
+  });
+
   it("tells the user plainly when a custom model was saved without being checked, and clears it on the next change", async () => {
     render(<ConnectionPanel state={sonnetState()} persona="test" />);
     fireEvent.click(screen.getByRole("button", { name: /change model/i }));

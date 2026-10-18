@@ -82,8 +82,16 @@ export function ConnectionPanel({
   // so the panel reflects the change without waiting for the next /state poll.
   const [localModel, setLocalModel] = useState<ChatModel | null>(null);
   const displayModel = localModel ?? (conn?.model as ChatModel | null | undefined) ?? null;
-  // Set when the last Apply saved a custom model the bridge could not confirm; cleared by the next Apply.
-  const [modelNotice, setModelNotice] = useState<string | null>(null);
+  // Set when the last Apply saved a custom model the bridge could not confirm: shown at once, then the
+  // bridge's `model_unconfirmed` list takes over (it empties when a clean reply arrives for the model).
+  const [pendingNotice, setPendingNotice] = useState(false);
+  useEffect(() => {
+    setPendingNotice(false);
+  }, [state]);
+  const modelNotice =
+    pendingNotice || (displayModel !== null && (state?.model_unconfirmed ?? []).includes(displayModel))
+      ? MODEL_UNCHECKED_MESSAGE
+      : null;
   // Models the Claude CLI rejected while in use (the bridge drops a record when the model changes or a
   // clean reply arrives). A record for the model the user has since replaced is stale until the next poll.
   const rejectionLines = (state?.model_rejections ?? []).flatMap((rec) => {
@@ -312,7 +320,7 @@ export function ConnectionPanel({
           onClose={(newModel, info) => {
             if (newModel) {
               setLocalModel(newModel);
-              setModelNotice(info?.checked === false ? MODEL_UNCHECKED_MESSAGE : null);
+              setPendingNotice(info?.checked === false);
             }
             setShowModelPicker(false);
           }}

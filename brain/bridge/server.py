@@ -2017,6 +2017,8 @@ def build_app(
         if hasattr(s.provider, "_model"):
             s.provider._model = req.model
         model_error.switch(current.model, req.model, keep=set(TIER_MODEL.values()))
+        if checked is False:
+            model_error.note_unconfirmed(req.model)  # shown in /persona/state until a clean reply
         body: dict[str, Any] = {"ok": True, "model": req.model}
         if checked is not None:
             body["checked"] = checked

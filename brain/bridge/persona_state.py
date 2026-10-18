@@ -80,6 +80,9 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
         # #440: models the Claude CLI rejected (unknown, or not available to this account), limited to the
         # configured chat model and the tier models so a refused or stale id is never reported. [] when none.
         "model_rejections": _model_rejections(connection.get("model")),
+        # #440: the chat model when it was saved without the Apply-time check being able to confirm it and no
+        # clean reply has arrived for it since. [] otherwise.
+        "model_unconfirmed": model_error.unconfirmed(only={connection.get("model")}),
         "felt_time_recovered": _felt_time_recovered(persona_dir),
         "narrative_memory_recovered": _narrative_memory_replayed(persona_dir),
         # ram-spike-fix INC-11 (spec §6, S15/S23/S38): gated jobs and/or the
