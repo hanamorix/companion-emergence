@@ -113,10 +113,13 @@ def test_recovering_from_a_bad_state_file_is_logged(tmp_path, monkeypatch, caplo
         _state_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
         _state_path(tmp_path).write_text(bad, encoding="utf-8")
         caplog.clear()
-        with caplog.at_level(logging.WARNING, logger="brain.self_model.state"):
+        with caplog.at_level(logging.WARNING):
             _state, recovered = load_or_recover(tmp_path)
         assert recovered is True
-        assert any("self-model state" in r.getMessage() for r in caplog.records), bad
+        # An unreadable or non-object file is reported by brain.health.json_io; a malformed gap by this module.
+        assert any(
+            "self-model state" in r.getMessage() or "unusable" in r.getMessage() for r in caplog.records
+        ), bad
 
 
 def test_a_missing_state_file_is_not_logged(tmp_path, caplog):

@@ -338,7 +338,9 @@ def _prune(path: Path, *, window_days: float | None, now: datetime | None) -> in
             unagable = 0
             # RAISE (a failed read must not shrink the log) + bad_lines (a line that does not parse is still
             # counted as un-agable and removed, so it cannot live forever).
-            for line, record in iter_jsonl_raw(path, recover=Recovery.RAISE, bad_lines=True):
+            # Read the whole file first (as the byte read did), so the filter below sees one fixed snapshot.
+            rows = list(iter_jsonl_raw(path, recover=Recovery.RAISE, bad_lines=True))
+            for line, record in rows:
                 ts = _record_ts(record)
                 if ts is not None and ts >= cutoff:
                     kept.append(line)

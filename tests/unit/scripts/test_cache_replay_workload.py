@@ -1821,7 +1821,7 @@ def test_k2_a_mid_line_boundary_cannot_cancel_out_bytes_after_the_last_boundary(
     assert consistent is False  # ... but the last boundary is not the end of the file, so no attribution
 
 
-@pytest.mark.parametrize("eol", ["\r\n", "\r", "\n"])
+@pytest.mark.parametrize("eol", ["\r\n", "\n"])
 def test_k2_line_endings_inside_the_runs_own_bytes_are_counted_like_the_reader_does(tmp_path, eol):
     f = tmp_path / "u.jsonl"
     lines = [json.dumps(row(100 + k, 6449, t=k)) + eol for k in range(3)]
@@ -1830,6 +1830,17 @@ def test_k2_line_endings_inside_the_runs_own_bytes_are_counted_like_the_reader_d
     sizes = [len(lines[0]), len(lines[0]) + len(lines[1]), len(blob)]
     rows, skipped, counts, consistent = crw._read_run_slice(f, 0, sizes)
     assert (len(rows), skipped, counts, consistent) == (3, 0, [1, 1, 1], True)
+
+
+def test_k2_a_lone_cr_is_not_a_record_separator_for_the_shared_json_io_reader(tmp_path):
+    """BC9: json_io splits records on \\n only, so a blob of lone-\\r rows is ONE unusable line: it is counted and
+    skipped (never attributed to a turn), exactly the signal the check needs."""
+    f = tmp_path / "u.jsonl"
+    lines = [json.dumps(row(100 + k, 6449, t=k)) + "\r" for k in range(3)]
+    blob = "".join(lines).encode()
+    f.write_bytes(blob)
+    rows, skipped, counts, consistent = crw._read_run_slice(f, 0, [len(blob)])
+    assert (len(rows), skipped, consistent) == (0, 1, False)
 
 
 # --------------------------------------------------------------------------------------

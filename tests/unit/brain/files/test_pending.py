@@ -1,7 +1,6 @@
 # tests/unit/brain/files/test_pending.py
 import hashlib
 from datetime import UTC, datetime, timedelta
-from types import SimpleNamespace
 
 from brain.files.pending import (
     _TTL_HOURS,
@@ -279,40 +278,53 @@ def test_a_non_object_record_is_skipped_and_reported(tmp_path, monkeypatch, capl
 
 
 def test_a_transient_permission_error_is_not_a_warning(tmp_path, monkeypatch, caplog):
-    """Windows: a lock-free read can meet PermissionError while replace() runs."""
+    """Windows: a lock-free read can meet PermissionError while replace() runs; json_io retries it before it reports."""
+    import builtins
     import logging
-    from pathlib import Path
 
     from brain.files import pending
+    from brain.health import json_io
 
     _fresh_throttle(monkeypatch)
-    monkeypatch.setattr(pending, "sys", SimpleNamespace(platform="win32"))  # module-scoped, not the real sys
+    now = datetime(2026, 10, 16, tzinfo=UTC)
+    rid = pending.create(tmp_path, op="create", resolved_path=str(tmp_path / "a.txt"), content="a", now=now)
+    monkeypatch.setattr(json_io, "_IS_WINDOWS", True)
+    monkeypatch.setattr(json_io.time, "sleep", lambda s: None)
+    calls = {"n": 0}
+    real_open = builtins.open
 
-    def busy(self, *a, **k):
-        raise PermissionError("in use")
+    def busy_once(file, *a, **k):
+        if str(file).endswith(f"{rid}.json") and calls["n"] == 0:
+            calls["n"] += 1
+            raise PermissionError("in use")
+        return real_open(file, *a, **k)
 
-    monkeypatch.setattr(Path, "read_text", busy)
-    with caplog.at_level(logging.WARNING, logger="brain.files.pending"):
-        assert pending.get(tmp_path, "rid") is None
-    assert caplog.records == []
+    monkeypatch.setattr(json_io, "open", busy_once, raising=False)  # the module's own `open`, not the builtin
+    with caplog.at_level(logging.WARNING):
+        assert pending.get(tmp_path, rid)["id"] == rid
+    assert calls["n"] == 1 and caplog.records == []
 
 
 def test_a_permission_error_off_windows_is_a_warning(tmp_path, monkeypatch, caplog):
     """#429 review: on Linux/macOS a PermissionError is persistent (wrong owner, a bad
     chmod), so the record would vanish from every listing with no warning."""
+    import builtins
     import logging
-    from pathlib import Path
 
     from brain.files import pending
+    from brain.health import json_io
 
     _fresh_throttle(monkeypatch)
-    monkeypatch.setattr(pending, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(json_io, "_IS_WINDOWS", False)
+    real_open = builtins.open
 
-    def denied(self, *a, **k):
-        raise PermissionError("denied")
+    def denied(file, *a, **k):
+        if "rid-x" in str(file):
+            raise PermissionError("denied")
+        return real_open(file, *a, **k)
 
-    monkeypatch.setattr(Path, "read_text", denied)
-    with caplog.at_level(logging.WARNING, logger="brain.files.pending"):
+    monkeypatch.setattr(json_io, "open", denied, raising=False)
+    with caplog.at_level(logging.WARNING):
         assert pending.get(tmp_path, "rid-x") is None
     assert any("rid-x" in r.getMessage() for r in caplog.records)
 

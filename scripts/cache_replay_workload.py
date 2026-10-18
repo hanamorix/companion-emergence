@@ -192,8 +192,8 @@ def _file_size(path: Path) -> int:
 
 
 def _nonblank_lines(chunk: bytes) -> int:
-    """Non-blank lines of `chunk`, split like the shared reader's text-mode iteration (\n, \r\n, \r)."""
-    return sum(1 for ln in chunk.splitlines() if ln.decode("utf-8", "replace").strip())
+    """Non-blank lines of `chunk`, split like the shared reader (json_io): on \n only (a \r\n ends in \r, which strip drops)."""
+    return sum(1 for ln in chunk.split(b"\n") if ln.decode("utf-8", "replace").strip())
 
 
 def _read_run_slice(path: Path, offset: int, boundaries: tuple[int, ...] | list[int] = ()):
