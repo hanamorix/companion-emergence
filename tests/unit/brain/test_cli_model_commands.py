@@ -32,6 +32,7 @@ def _write(persona_dir: Path, **fields) -> Path:
 
 
 def _run(argv: list[str]) -> int:
+    cli._build_parser()  # warm the lazily-imported service modules before the CLI-call guards go on
     with patch("subprocess.run", side_effect=AssertionError("no CLI call allowed")), patch(
         "subprocess.Popen", side_effect=AssertionError("no CLI call allowed")
     ):

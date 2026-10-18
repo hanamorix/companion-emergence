@@ -16,6 +16,7 @@ def _init(monkeypatch, tmp_path: Path, model: str | None, extra: list[str] | Non
     if inputs is not None:
         it = iter(inputs)
         monkeypatch.setattr("builtins.input", lambda *a, **kw: next(it))
+    cli._build_parser()  # import the lazily-imported service modules first: they probe PATH at import time
     argv = ["init", "--persona", "siren", "--user-name", "Hana", "--fresh", "--voice-template", "default"]
     if model is not None:
         argv += ["--model", model]
@@ -61,6 +62,7 @@ def test_invalid_model_is_refused_and_nothing_is_written(monkeypatch, tmp_path: 
 
 def test_interactive_prompt_accepts_a_typed_full_id(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
+    cli._build_parser()
     answers = iter(["siren", "Hana", "n", "default", "bogus!", "claude-sonnet-5"])  # the first model answer is invalid
     monkeypatch.setattr("builtins.input", lambda *a, **kw: next(answers))
     with patch("subprocess.run", side_effect=AssertionError), patch("subprocess.Popen", side_effect=AssertionError):
