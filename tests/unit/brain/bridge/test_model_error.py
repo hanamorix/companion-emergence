@@ -184,6 +184,7 @@ def test_switch_drops_old_record_and_ignores_a_late_failure(caplog):
     model_error.note_failure(REJ)
     model_error.switch("claude-sonet-5", "sonnet", keep=frozenset())
     assert model_error.state() == []
+    caplog.clear()
     with caplog.at_level(logging.WARNING, logger=model_error.log.name):
         model_error.note_failure(REJ)  # an in-flight ambient call that read the old id
     assert model_error.state() == []
@@ -229,8 +230,9 @@ def test_suppression_is_per_thread():
 
 
 def test_public_functions_fail_open(monkeypatch):
-    monkeypatch.setattr(model_error, "_lock", None)  # any use raises TypeError/AttributeError
-    model_error.note_failure(REJ)
-    model_error.note_success("claude-sonet-5")
-    model_error.switch("a", "b", keep=frozenset())
-    assert model_error.state() == []
+    with monkeypatch.context() as m:
+        m.setattr(model_error, "_lock", None)  # any use raises
+        model_error.note_failure(REJ)
+        model_error.note_success("claude-sonet-5")
+        model_error.switch("a", "b", keep=frozenset())
+        assert model_error.state() == []

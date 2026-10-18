@@ -37,7 +37,7 @@ from brain.body.session_hours import (
 # function moved to brain.body.session_hours so brain.tools.dispatch can
 # import it without crossing into the bridge layer. See the new module's
 # docstring for the migration context.
-from brain.bridge import background_jobs, provider_auth
+from brain.bridge import background_jobs, model_error, provider_auth
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +63,7 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
     if now is None:
         now = datetime.now(UTC)
     persona_name = persona_dir.name
+    connection = _build_connection(persona_dir)
 
     return {
         "persona": persona_name,
@@ -71,11 +72,14 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
         "interior": _build_interior(persona_dir),
         "soul_highlight": _build_soul_highlight(persona_dir),
         "pending_writes": _build_pending_writes(persona_dir),
-        "connection": _build_connection(persona_dir),
+        "connection": connection,
         "mode": "live",
         "recovering": _is_recovering(persona_dir),
         # #246: True while the brain's CLI login is expired (bridge-process state).
         "provider_auth_expired": provider_auth.state()["status"] == "expired",
+        # #440: models the Claude CLI rejected (unknown, or not available to this account), limited to the
+        # configured chat model and the tier models so a refused or stale id is never reported. [] when none.
+        "model_rejections": _model_rejections(connection.get("model")),
         "felt_time_recovered": _felt_time_recovered(persona_dir),
         "narrative_memory_recovered": _narrative_memory_replayed(persona_dir),
         # ram-spike-fix INC-11 (spec §6, S15/S23/S38): gated jobs and/or the
@@ -87,6 +91,15 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
             for name, elapsed in background_jobs.snapshot_with_elapsed()
         ],
     }
+
+
+def _model_rejections(configured_model: str | None) -> list[dict]:
+    from brain.bridge.model_tier import TIER_MODEL
+
+    allowed = set(TIER_MODEL.values())
+    if configured_model:
+        allowed.add(configured_model)
+    return model_error.state(only=allowed)
 
 
 def _is_recovering(persona_dir: Path) -> bool:

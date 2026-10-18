@@ -48,7 +48,7 @@ from pydantic import BaseModel, Field, StrictBool
 
 from brain import __version__ as _brain_version
 from brain import prompt_strings, tunables
-from brain.bridge import events, provider_auth
+from brain.bridge import events, model_error, provider_auth
 from brain.bridge.chat import (
     ChatMessage,
     ChatResponse,
@@ -62,7 +62,7 @@ from brain.bridge.model_tier import (
     build_interactive_chat_provider,
     build_tier_provider,
 )
-from brain.bridge.provider import LLMProvider, ProviderError, _claude_work_dir
+from brain.bridge.provider import ClaudeCliProvider, LLMProvider, ProviderError, _claude_work_dir
 from brain.bridge.shutdown import BridgeShutdownController
 from brain.chat.session import (
     all_sessions,
@@ -607,8 +607,56 @@ def _stream_keepalive_seconds() -> float:
 
 def _chat_error_code(exc: BaseException) -> str:
     """Stable client code for a failed chat turn (#246): ``auth_expired`` when the
-    failing call's own text is an auth failure, else the generic ``provider_failed``."""
-    return "auth_expired" if provider_auth.is_auth_failure(str(exc)) else "provider_failed"
+    failing call's own text is an auth failure, ``model_unavailable`` (#440) when the
+    CLI rejected the model, else the generic ``provider_failed``. Auth wins."""
+    text = str(exc)
+    if provider_auth.is_auth_failure(text):
+        return "auth_expired"
+    if model_error.is_model_rejection(text):
+        return "model_unavailable"
+    return "provider_failed"
+
+
+def _chat_error_model(exc: BaseException, provider: Any) -> str | None:
+    """The model to name in a ``model_unavailable`` error: the one the CLI said it rejected, else
+    the provider's configured model. None for any other error. Always valid model grammar."""
+    text = str(exc)
+    if provider_auth.is_auth_failure(text) or not model_error.is_model_rejection(text):
+        return None
+    return model_error.rejected_model_name(text, getattr(provider, "_model", None))
+
+
+def _chat_error_detail(exc: BaseException, provider: Any) -> str:
+    """HTTP ``detail`` for a failed /chat: the code, plus ``:<model>`` for ``model_unavailable``."""
+    code = _chat_error_code(exc)
+    model = _chat_error_model(exc, provider)
+    return f"{code}:{model}" if model else code
+
+
+# Apply-time check of a custom model id (#440): one tiny real call, so a typo is refused with a specific
+# message instead of failing later inside background jobs. Kept below a typical webview request timeout so
+# the client never aborts and replays while it runs; a rejected id answers in seconds.
+_MODEL_CHECK_TIMEOUT_S = tunables.register("provider.model_check_timeout_seconds", 30.0)
+_MODEL_CHECK_PROMPT = "Reply with the single word OK."
+
+
+def _check_model_blocking(model_id: str) -> tuple[str, str]:
+    """Run ONE ``generate()`` with ``model_id``. Returns ``("ok", "")``, ``("rejected", "")`` or
+    ``("inconclusive", <reason>)``. Never raises. No ``persona_dir`` is passed, so no usage row is written,
+    and the call is suppressed in ``model_error`` so a refused id leaves no record or WARNING."""
+    timeout = int(tunables.get_tunable("provider.model_check_timeout_seconds", _MODEL_CHECK_TIMEOUT_S))
+    try:
+        with model_error.suppressed():
+            ClaudeCliProvider(model=model_id, timeout_seconds=timeout).generate(_MODEL_CHECK_PROMPT)
+        return "ok", ""
+    except provider_auth.ProviderAuthDeferred:
+        return "inconclusive", "auth_deferred"
+    except TimeoutError:
+        return "inconclusive", "timeout"
+    except Exception as exc:  # noqa: BLE001 - any other failure only means "could not check"
+        if model_error.is_model_rejection(str(exc)):
+            return "rejected", ""
+        return "inconclusive", "failed"
 
 
 async def _flush_cost_series_at_stop(persona_dir: Path) -> None:
@@ -1915,22 +1963,28 @@ def build_app(
             return _self_test.run_self_test(persona_dir, http=http)
 
     # ── POST /persona/config/model — live model switching ──────────────────
+    model_check_lock = asyncio.Lock()  # single-flight: one Apply-time check call at a time
+
     @app.post("/persona/config/model", dependencies=[Depends(require_http_auth)])
     async def set_persona_model(req: ModelConfigReq) -> dict:
         """Switch the active LLM model without restarting the bridge.
 
-        Validates `model` against KNOWN_MODELS (sonnet / opus / haiku),
-        persists to persona_config.json, and hot-swaps provider._model so
+        Accepts an alias (sonnet / opus / haiku) or a full model id (``claude-...``), validated by
+        ``is_valid_model``. A FULL id on a claude-cli provider is first checked with one real call (#440):
+        if Claude rejects it the id is NOT saved. Any other check failure (timeout, expired login, rate
+        limit) saves it unchecked. Then persists to persona_config.json and hot-swaps provider._model so
         the next chat uses the new model immediately.
 
-        Returns: {ok: true, model: <new_model>}
+        Returns: {ok: true, model: <new_model>}  (+ ``checked: bool`` when a check was attempted)
         Errors:  400 {ok: false, error: "unknown_model", valid: [...]}
+                 400 {ok: false, error: "model_unavailable", model: <id>}
         """
         from dataclasses import replace as dc_replace
 
-        from brain.persona_config import KNOWN_MODELS, PersonaConfig
+        from brain.bridge.model_tier import TIER_MODEL
+        from brain.persona_config import KNOWN_MODELS, PersonaConfig, is_valid_model
 
-        if req.model not in KNOWN_MODELS:
+        if not is_valid_model(req.model):
             return JSONResponse(
                 status_code=400,
                 content={
@@ -1940,6 +1994,20 @@ def build_app(
                 },
             )
         s: BridgeAppState = app.state.bridge
+        checked: bool | None = None
+        if req.model not in KNOWN_MODELS and isinstance(s.provider, ClaudeCliProvider):
+            async with model_check_lock:
+                outcome, reason = await asyncio.to_thread(_check_model_blocking, req.model)
+            if outcome == "rejected":
+                return JSONResponse(
+                    status_code=400,
+                    content={"ok": False, "error": "model_unavailable", "model": req.model},
+                )
+            checked = outcome == "ok"
+            if not checked:
+                logger.info(
+                    "model check for %s was inconclusive, saved unchecked: reason=%s", req.model, reason
+                )
         config_path = s.persona_dir / "persona_config.json"
         current = PersonaConfig.load(config_path)
         updated = dc_replace(current, model=req.model)
@@ -1948,7 +2016,11 @@ def build_app(
         # next chat call uses the new model without a bridge restart.
         if hasattr(s.provider, "_model"):
             s.provider._model = req.model
-        return {"ok": True, "model": req.model}
+        model_error.switch(current.model, req.model, keep=set(TIER_MODEL.values()))
+        body: dict[str, Any] = {"ok": True, "model": req.model}
+        if checked is not None:
+            body["checked"] = checked
+        return body
 
     # ── POST /persona/config/pronouns — user pronoun persist ──────────────
     @app.post("/persona/config/pronouns", dependencies=[Depends(require_http_auth)])
@@ -2781,7 +2853,7 @@ def build_app(
                 # logs only — clients get a stable code, not stderr or
                 # local paths from the underlying provider/process.
                 # #246: classified from THIS call's text, never from global state.
-                raise HTTPException(status_code=502, detail=_chat_error_code(exc)) from exc
+                raise HTTPException(status_code=502, detail=_chat_error_detail(exc, s.provider)) from exc
             duration_ms = int((datetime.now(UTC) - t0).total_seconds() * 1000)
             s.last_chat_at = datetime.now(UTC)
             events.publish(
@@ -2976,7 +3048,11 @@ def build_app(
                 logger.exception("stream failed session=%s", session_id)
                 # Audit 2026-05-07 P3-2: stable code for clients;
                 # full exception text stays in the log only.
-                await ws.send_json({"type": "error", "code": _chat_error_code(exc), "done": True})
+                error_frame: dict[str, Any] = {"type": "error", "code": _chat_error_code(exc), "done": True}
+                rejected_model = _chat_error_model(exc, s.provider)
+                if rejected_model:
+                    error_frame = {**error_frame, "model": rejected_model}
+                await ws.send_json(error_frame)
                 await ws.close()
                 return
 

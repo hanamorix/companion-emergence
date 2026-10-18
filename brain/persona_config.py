@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -42,6 +43,18 @@ DEFAULT_KINDLED_RELAY_URL = "https://kindled-relay.kindledrelay.workers.dev"
 KNOWN_PROVIDERS = frozenset({"claude-cli", "ollama", "fake"})
 KNOWN_SEARCHERS = frozenset({"ddgs", "noop"})
 KNOWN_MODELS = frozenset({"sonnet", "opus", "haiku"})
+# A full model id (e.g. claude-sonnet-5), stored and passed to `claude --model` as written.
+# Matched with fullmatch, never `$`: `$` would accept a trailing newline. The picker in
+# app/src/lib/modelId.ts uses the same pattern; keep the two in sync.
+MODEL_ID_PATTERN = re.compile(r"claude-[a-z0-9.-]+")
+
+
+def is_valid_model(value: object) -> bool:
+    """True for one of the aliases (sonnet / opus / haiku) or a full ``claude-...`` model id."""
+    return isinstance(value, str) and (
+        value in KNOWN_MODELS or MODEL_ID_PATTERN.fullmatch(value) is not None
+    )
+
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +163,7 @@ class PersonaConfig:
         )
         model_raw = data.get("model", DEFAULT_MODEL)
         model_str = model_raw if isinstance(model_raw, str) and model_raw else DEFAULT_MODEL
-        if model_str in KNOWN_MODELS:
+        if is_valid_model(model_str):
             model = model_str
         else:
             logger.warning(

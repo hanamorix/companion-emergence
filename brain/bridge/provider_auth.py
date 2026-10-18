@@ -27,6 +27,7 @@ import time
 from datetime import UTC, datetime
 
 from brain import tunables
+from brain.bridge import model_error
 from brain.bridge.cli_throttle import ThrottleDeferred
 
 log = logging.getLogger(__name__)
@@ -75,6 +76,8 @@ def is_auth_failure(detail: str) -> bool:
 def note_cli_failure(detail: str) -> None:
     """Record a CLI failure text. Non-auth text is a no-op."""
     global _status, _since, _detail, _failures, _last_probe_monotonic, _weak_first_at
+    # #440: this is the one funnel every CLI failure text passes through; a rejected model is recorded here.
+    model_error.note_failure(detail)
     try:
         if not is_auth_failure(detail):
             return

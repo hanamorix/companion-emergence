@@ -307,8 +307,8 @@ def build_interactive_chat_provider(persona_dir: Path) -> Any:
     This is the one deliberate exception in this module: every other tier's
     model is fully owned by ``TIER_MODEL`` (change the constant, every call
     site follows). Interactive-chat is different because ``persona_config.json``
-    has its own genuinely user-facing ``.model`` field (a validated 3-value
-    enum today: sonnet/opus/haiku — see ``PersonaConfig.KNOWN_MODELS``) that a
+    has its own genuinely user-facing ``.model`` field (validated: an alias
+    sonnet/opus/haiku or a full ``claude-...`` id — see ``PersonaConfig.is_valid_model``) that a
     persona owner can already set independently of any tier default, and this
     is the ONE real call site that honors it. Forcing ``model_override=
     model_for_tier(TIER_INTERACTIVE_CHAT)`` here would silently strip that
