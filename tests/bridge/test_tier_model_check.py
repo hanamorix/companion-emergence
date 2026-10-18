@@ -80,7 +80,11 @@ def _cli_persona(persona_dir: Path, model: str = "sonnet", **extra) -> Path:
 
 
 def _client(persona_dir: Path, monkeypatch) -> TestClient:
-    monkeypatch.setattr("brain.bridge.provider.get_provider", lambda *a, **k: ClaudeCliProvider(model="sonnet"))
+    # honour model_override like the real get_provider, so tier providers carry their resolved model
+    monkeypatch.setattr(
+        "brain.bridge.provider.get_provider",
+        lambda name="claude-cli", persona_dir=None, model_override=None, **k: ClaudeCliProvider(model=model_override or "sonnet"),
+    )
     return TestClient(build_app(persona_dir=persona_dir, client_origin="tests"))
 
 
@@ -117,9 +121,9 @@ def test_rejected_derived_id_is_recorded_as_a_fallback(persona_dir: Path, monkey
 
 def test_refused_chat_id_changes_nothing_on_disk(persona_dir: Path, monkeypatch):
     path = _cli_persona(persona_dir, "sonnet", derived_unavailable=["claude-haiku-5"])
-    before = path.read_bytes()
     run = _Run(lambda m: _rejected(m) if m == "claude-sonnet-5" else _ok())
     with _client(persona_dir, monkeypatch) as c, patch("subprocess.run", run):
+        before = path.read_bytes()  # after the app's own start-up write (last_opened_at)
         r = _post(c, "claude-sonnet-5")
     assert r.status_code == 400 and r.json()["error"] == "model_unavailable"
     assert path.read_bytes() == before

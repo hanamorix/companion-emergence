@@ -186,9 +186,32 @@ def switch(old: str, new: str, keep: Iterable[str] = ()) -> None:
             _unconfirmed.discard(old)
             if old not in keep_set:
                 _ignored.add(old)
+            # An id that is still (or again) in use in some other role must never stay ignored, or a real
+            # rejection of it would be dropped silently (#441).
+            _ignored.difference_update(keep_set)
             _ignored.discard(new)
     except Exception:  # noqa: BLE001 - fail open
         log.warning("model_error.switch failed (ignored)", exc_info=True)
+
+
+def activate(models: Iterable[str]) -> None:
+    """``models`` are in use (again): none of them may stay in the ignore set."""
+    try:
+        ids = frozenset(models)
+        with _lock:
+            _ignored.difference_update(ids)
+    except Exception:  # noqa: BLE001 - fail open
+        log.warning("model_error.activate failed (ignored)", exc_info=True)
+
+
+def rejected_models() -> frozenset[str]:
+    """The models with a rejection record in this process (a snapshot)."""
+    try:
+        with _lock:
+            return frozenset(_rejected)
+    except Exception:  # noqa: BLE001 - fail open
+        log.warning("model_error.rejected_models failed (ignored)", exc_info=True)
+        return frozenset()
 
 
 def state(only: Iterable[str] | None = None) -> list[dict[str, Any]]:

@@ -64,6 +64,9 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
         now = datetime.now(UTC)
     persona_name = persona_dir.name
     connection = _build_connection(persona_dir)
+    from brain.bridge.model_tier import _load_config
+
+    tier_cfg = _load_config(persona_dir)
 
     return {
         "persona": persona_name,
@@ -79,7 +82,9 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
         "provider_auth_expired": provider_auth.state()["status"] == "expired",
         # #440: models the Claude CLI rejected (unknown, or not available to this account), limited to the
         # configured chat model and the tier models so a refused or stale id is never reported. [] when none.
-        "model_rejections": _model_rejections(connection.get("model")),
+        "model_rejections": _model_rejections(connection.get("model"), tier_cfg),
+        # #441: derived tier models being replaced by what those tiers use today, [] when none.
+        "tier_fallbacks": _tier_fallbacks(tier_cfg),
         # #440: the chat model when it was saved without the Apply-time check being able to confirm it and no
         # clean reply has arrived for it since. [] otherwise.
         "model_unconfirmed": model_error.unconfirmed(only={connection.get("model")}),
@@ -96,13 +101,25 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
     }
 
 
-def _model_rejections(configured_model: str | None) -> list[dict]:
-    from brain.bridge.model_tier import TIER_MODEL
+def _model_rejections(configured_model: str | None, cfg: Any = None) -> list[dict]:
+    from brain.bridge.model_tier import TIER_MODEL, candidate_tier_models
 
     allowed = set(TIER_MODEL.values())
+    if cfg is not None:
+        allowed |= candidate_tier_models(cfg)
     if configured_model:
         allowed.add(configured_model)
     return model_error.state(only=allowed)
+
+
+def _tier_fallbacks(cfg: Any) -> list[dict]:
+    from brain.bridge.model_tier import tier_fallbacks
+
+    try:
+        return tier_fallbacks(cfg)
+    except Exception:  # noqa: BLE001 - never breaks /persona/state
+        logger.warning("persona_state: tier_fallbacks failed", exc_info=True)
+        return []
 
 
 def _is_recovering(persona_dir: Path) -> bool:

@@ -2376,6 +2376,28 @@ def _prompt_choice(label: str, choices: list[str], default: str, help: str = "")
         print(f"  (must be one of: {', '.join(choices)})", file=sys.stderr)
 
 
+def _prompt_model(default: str, help: str = "") -> str:
+    """Interactive model prompt: an alias or a full model id; loops until valid (EOF gives the default)."""
+    from brain.persona_config import MODEL_ID_RULE, is_valid_model
+
+    while True:
+        if help:
+            print(help)
+        raw = _prompt("model [sonnet/opus/haiku or a full id]", default=default)
+        if is_valid_model(raw):
+            return raw
+        print(f"  ({MODEL_ID_RULE})", file=sys.stderr)
+
+
+def _model_arg(value: str) -> str:
+    """argparse type for --model: an alias or a full model id (syntax only, no Claude CLI call)."""
+    from brain.persona_config import MODEL_ID_RULE, is_valid_model
+
+    if not is_valid_model(value):
+        raise argparse.ArgumentTypeError(f"{value!r} is not a valid model: {MODEL_ID_RULE}")
+    return value
+
+
 def _init_handler(args: argparse.Namespace) -> int:
     """Set up a new persona — interactive wizard or flag-driven.
 
@@ -2445,17 +2467,16 @@ def _init_handler(args: argparse.Namespace) -> int:
         return 1
 
     if model is None:
-        from brain.persona_config import DEFAULT_MODEL, KNOWN_MODELS
+        from brain.persona_config import DEFAULT_MODEL
 
         print()
-        model = _prompt_choice(
-            "model",
-            choices=sorted(KNOWN_MODELS),
+        model = _prompt_model(
             default=DEFAULT_MODEL,
             help=(
                 "  sonnet — fast, smart, ~$3 per million input tokens (recommended)\n"
                 "  opus   — smartest, ~$15 per million input tokens (best for deep writing)\n"
-                "  haiku  — fastest, cheapest, less capable"
+                "  haiku  — fastest, cheapest, less capable\n"
+                "  or a full model id such as claude-sonnet-5 (checked when first used)"
             ),
         )
 
@@ -2519,6 +2540,10 @@ def _init_handler(args: argparse.Namespace) -> int:
         f"  - {config_path.name}: user_name={user_name!r}, "
         f"user_pronouns={user_pronouns!r}, model={model!r}"
     )
+    from brain.persona_config import KNOWN_MODELS as _ALIASES
+
+    if model not in _ALIASES:
+        print(f"  - model {model} will be checked when first used")
     if voice_path is not None:
         print(f"  - {voice_path.name}: copied from '{voice_template}' template")
         if voice_template == "nell-example":
@@ -2531,6 +2556,57 @@ def _init_handler(args: argparse.Namespace) -> int:
         print(f"  - migrated from {migrate_from}")
     print()
     print(f"next: uv run nell chat --persona {persona}")
+    return 0
+
+
+def _model_cfg_path(persona: str) -> Path:
+    return get_persona_dir(persona) / "persona_config.json"
+
+
+def _model_show_handler(args: argparse.Namespace) -> int:
+    from brain.bridge.model_tier import ROUTED_CLAUDE_TIERS, _resolve
+    from brain.persona_config import PersonaConfig
+
+    cfg = PersonaConfig.load(_model_cfg_path(args.persona))
+    print(f"chat model: {cfg.model}")
+    print("background models (tier: model (source)):")
+    for tier in ROUTED_CLAUDE_TIERS:
+        model, source = _resolve(cfg, tier)
+        print(f"  {tier}: {model} ({source})")
+    if cfg.derived_unavailable:
+        print(
+            "note: "
+            + ", ".join(cfg.derived_unavailable)
+            + " was not available when the chat model was last saved; it is tested again when the chat "
+            "model is re-applied in the picker"
+        )
+    return 0
+
+
+def _model_set_tier_handler(args: argparse.Namespace) -> int:
+    """Syntax-only: no Claude CLI call. A model Claude rejects shows up in the bridge log and in the app."""
+    from brain.persona_config import MODEL_ID_RULE, PersonaConfig, is_valid_model
+
+    if not is_valid_model(args.model):
+        print(f"error: {args.model!r} is not a valid model: {MODEL_ID_RULE}", file=sys.stderr)
+        return 1
+    path = _model_cfg_path(args.persona)
+    cfg = PersonaConfig.load(path)  # read right before the write: the bridge may have saved meanwhile
+    cfg.tier_models = {**cfg.tier_models, args.tier: args.model}
+    cfg.save(path)
+    print(f"{args.tier} now uses {args.model} (checked when first used)")
+    return 0
+
+
+def _model_clear_tier_handler(args: argparse.Namespace) -> int:
+    from brain.persona_config import PersonaConfig
+
+    path = _model_cfg_path(args.persona)
+    cfg = PersonaConfig.load(path)
+    if args.tier in cfg.tier_models:
+        cfg.tier_models = {k: v for k, v in cfg.tier_models.items() if k != args.tier}
+        cfg.save(path)
+    print(f"{args.tier} follows the chat model again")
     return 0
 
 
@@ -2598,9 +2674,10 @@ def _build_parser() -> argparse.ArgumentParser:
     init_sub.add_argument(
         "--model",
         default=None,
-        choices=["haiku", "opus", "sonnet"],
+        type=_model_arg,
         help=(
-            "Claude model to use (sonnet/opus/haiku). Default: sonnet. "
+            "Claude model to use: sonnet, opus, haiku or a full model id such as claude-sonnet-5. "
+            "A full id is not checked now; it is checked when first used. Default: sonnet. "
             "Prompts if omitted and running interactively."
         ),
     )
@@ -3415,6 +3492,35 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Output as JSON array.",
     )
     personas_sub.set_defaults(func=_personas_handler)
+
+    # nell model — which models the background jobs use (#441)
+    from brain.persona_config import ROUTED_TIER_NAMES
+
+    model_sub = subparsers.add_parser(
+        "model",
+        help="Show or set the models the background jobs use (they follow the chat model's version by default).",
+    )
+    model_actions = model_sub.add_subparsers(dest="model_action", required=True)
+
+    m_show = model_actions.add_parser("show", help="Show the chat model and each background tier's model.")
+    m_show.add_argument("--persona", default=None, help="Persona name (defaults to the only installed one).")
+    m_show.set_defaults(func=_model_show_handler)
+
+    m_set = model_actions.add_parser(
+        "set-tier",
+        help="Pin one background tier to a model (an alias or a full id such as claude-haiku-4-5).",
+    )
+    m_set.add_argument("tier", choices=list(ROUTED_TIER_NAMES))
+    m_set.add_argument("model")
+    m_set.add_argument("--persona", default=None, help="Persona name (defaults to the only installed one).")
+    m_set.set_defaults(func=_model_set_tier_handler)
+
+    m_clear = model_actions.add_parser(
+        "clear-tier", help="Remove a tier's pinned model so it follows the chat model again."
+    )
+    m_clear.add_argument("tier", choices=list(ROUTED_TIER_NAMES))
+    m_clear.add_argument("--persona", default=None, help="Persona name (defaults to the only installed one).")
+    m_clear.set_defaults(func=_model_clear_tier_handler)
 
     # nell kindled — Kindled-link identity management (Task 7)
     kindled_sub = subparsers.add_parser(

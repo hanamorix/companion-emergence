@@ -269,6 +269,148 @@ def model_for_tier(tier: str) -> str:
     return TIER_MODEL[tier]
 
 
+# ---------------------------------------------------------------------------
+# Tier models follow the chat model's version (#441)
+# ---------------------------------------------------------------------------
+
+# The Claude tiers whose model comes from this module (dev-cli is deliberately not routed; the
+# embedding / reranker / judge tiers are not Claude models; interactive-chat reads persona_config).
+ROUTED_CLAUDE_TIERS = (
+    TIER_ATTUNEMENT_DETECTOR,
+    TIER_COMPACTION,
+    TIER_SELF_MODEL_ARTICULATE,
+    TIER_BACKGROUND_CLASSIFIER,
+    TIER_BACKGROUND_GENERATIVE,
+    TIER_BACKGROUND_HOUSEKEEPING,
+)
+_FAMILIES = ("sonnet", "opus", "haiku")
+
+
+def tier_family(model: str) -> str | None:
+    """The model family of an alias or a full id: its first dash-separated part that names a family."""
+    if model in _FAMILIES:
+        return model
+    for part in str(model).split("-"):
+        if part in _FAMILIES:
+            return part
+    return None
+
+
+def derive_model(chat_model: str, family: str) -> str | None:
+    """The id in ``family`` that matches the chat model's version, or None.
+
+    None unless ``chat_model`` is a full id that names a family. The same family returns the chat id as it
+    is. Another family swaps the family part and drops a trailing eight-digit date (dated snapshots differ
+    per model, so a copied date would name a snapshot that does not exist). No version is ever looked up:
+    if the derived id does not exist Claude rejects it and the tier uses what it uses today.
+    """
+    import re
+
+    from brain.persona_config import KNOWN_MODELS, is_valid_model
+
+    if chat_model in KNOWN_MODELS or not is_valid_model(chat_model):
+        return None
+    own = tier_family(chat_model)
+    if own is None:
+        return None
+    if own == family:
+        return chat_model
+    parts = chat_model.split("-")
+    parts[next(i for i, part in enumerate(parts) if part in _FAMILIES)] = family
+    derived = re.sub(r"-\d{8}$", "", "-".join(parts))
+    return derived if is_valid_model(derived) else None
+
+
+def _load_config(persona_dir: Any) -> Any:
+    """The persona's PersonaConfig, or None when there is no directory, no file or it cannot be read."""
+    if persona_dir is None:
+        return None
+    try:
+        from brain.persona_config import PersonaConfig
+
+        path = Path(persona_dir) / "persona_config.json"
+        return PersonaConfig.load(path) if path.exists() else None
+    except Exception:  # noqa: BLE001 - a tier model lookup must never fail a background call
+        return None
+
+
+def _resolve(cfg: Any, tier: str) -> tuple[str, str]:
+    from brain.bridge import model_error
+    from brain.persona_config import DEFAULT_PROVIDER
+
+    default = model_for_tier(tier)
+    if cfg is None or tier not in ROUTED_CLAUDE_TIERS:
+        return default, "default"
+    override = cfg.tier_models.get(tier)
+    if override:
+        model_error.activate([override])
+        return override, "override"
+    family = tier_family(default)
+    derived = derive_model(cfg.model, family) if family and cfg.provider == DEFAULT_PROVIDER else None
+    if derived is None:
+        return default, "default"
+    model_error.activate([derived, default])  # an id in use again must never stay ignored
+    if derived in cfg.derived_unavailable or derived in model_error.rejected_models():
+        return default, "fallback"
+    return derived, "derived"
+
+
+def resolve_tier_model(persona_dir: Path | None, tier: str) -> tuple[str, str]:
+    """``(model, source)`` for a tier in this persona; source is override, derived, fallback or default.
+
+    Precedence: the persona's explicit per-tier override, then the id derived from a full-id chat model
+    (replaced by the tier's own default when Claude rejected it, at save time or in this process), then
+    ``model_for_tier(tier)``. An alias chat model, no persona dir or no readable config give the default
+    exactly as before this existed.
+    """
+    return _resolve(_load_config(persona_dir), tier)
+
+
+def candidate_tier_models(cfg: Any) -> set[str]:
+    """Every id a routed tier might run for this config (override, derived, default): the ids whose
+    rejections are reported and that must not be ignored."""
+    out: set[str] = set()
+    for tier in ROUTED_CLAUDE_TIERS:
+        default = model_for_tier(tier)
+        out.add(default)
+        override = cfg.tier_models.get(tier) if cfg is not None else None
+        if override:
+            out.add(override)
+            continue
+        family = tier_family(default)
+        derived = derive_model(cfg.model, family) if cfg is not None and family else None
+        if derived:
+            out.add(derived)
+    return out
+
+
+def tier_fallbacks(cfg: Any) -> list[dict[str, str]]:
+    """Which derived tier ids are being replaced, one entry per distinct (wanted id, replacement) pair.
+
+    Never lists the chat model itself (a rejected chat model has its own notice).
+    """
+    from brain.bridge import model_error
+    from brain.persona_config import DEFAULT_PROVIDER
+
+    if cfg is None or cfg.provider != DEFAULT_PROVIDER:
+        return []
+    gone = set(cfg.derived_unavailable) | set(model_error.rejected_models())
+    out: list[dict[str, str]] = []
+    for tier in ROUTED_CLAUDE_TIERS:
+        if cfg.tier_models.get(tier):
+            continue
+        default = model_for_tier(tier)
+        family = tier_family(default)
+        wanted = derive_model(cfg.model, family) if family else None
+        if wanted is None or wanted == cfg.model or wanted not in gone:
+            continue
+        entry = {"family": family or "", "wanted": wanted, "using": default}
+        if entry not in out:
+            out.append(entry)
+    # plain aliases before a pinned snapshot, so the common case reads first
+    return sorted(out, key=lambda e: (e["wanted"], e["using"].startswith("claude-")))
+
+
 def _resolve_provider_kind(persona_dir: Path) -> str:
     """The persona's provider *kind* (claude-cli / ollama / fake), read from
     ``persona_config.json`` if present, else ``DEFAULT_PROVIDER``.
@@ -288,15 +430,20 @@ def _resolve_provider_kind(persona_dir: Path) -> str:
 
 def build_tier_provider(persona_dir: Path, tier: str) -> Any:
     """The provider a given tier should use: the persona's provider *kind*
-    (claude-cli / ollama / fake) but forced to ``model_for_tier(tier)``.
+    (claude-cli / ollama / fake) but forced to the tier's resolved model.
 
+    The resolved model is ``model_for_tier(tier)`` unless the persona sets a per-tier override or its chat
+    model is a full id, in which case the tier follows that version (``resolve_tier_model``, #441).
     Generalizes ``build_compaction_provider``/``build_self_model_provider`` —
     same shape, parametrized by tier instead of duplicated per call site.
     """
     from brain.bridge.provider import get_provider
+    from brain.persona_config import DEFAULT_PROVIDER
 
-    name = _resolve_provider_kind(persona_dir)
-    return get_provider(name, persona_dir=Path(persona_dir), model_override=model_for_tier(tier))
+    cfg = _load_config(persona_dir)
+    name = cfg.provider if cfg is not None else DEFAULT_PROVIDER
+    model = _resolve(cfg, tier)[0]
+    return get_provider(name, persona_dir=Path(persona_dir), model_override=model)
 
 
 def build_interactive_chat_provider(persona_dir: Path) -> Any:

@@ -1981,7 +1981,14 @@ def build_app(
         """
         from dataclasses import replace as dc_replace
 
-        from brain.bridge.model_tier import TIER_MODEL
+        from brain.bridge.model_tier import (
+            ROUTED_CLAUDE_TIERS,
+            candidate_tier_models,
+            derive_model,
+            model_for_tier,
+            tier_fallbacks,
+            tier_family,
+        )
         from brain.persona_config import KNOWN_MODELS, PersonaConfig, is_valid_model
 
         if not is_valid_model(req.model):
@@ -1994,10 +2001,24 @@ def build_app(
                 },
             )
         s: BridgeAppState = app.state.bridge
+        config_path = s.persona_dir / "persona_config.json"
+        before = PersonaConfig.load(config_path)
         checked: bool | None = None
+        # Derived tier ids that are tested together with the chat id (#441): the ids the routed tiers would
+        # follow, minus the chat id itself and minus families whose every tier has an explicit override.
+        derived_ids: list[str] = []
+        for tier in ROUTED_CLAUDE_TIERS:
+            family = tier_family(model_for_tier(tier))
+            derived = None if before.tier_models.get(tier) or not family else derive_model(req.model, family)
+            if derived and derived != req.model and derived not in derived_ids:
+                derived_ids.append(derived)
+        derived_outcomes: dict[str, str] = {}
         if req.model not in KNOWN_MODELS and isinstance(s.provider, ClaudeCliProvider):
             async with model_check_lock:
-                outcome, reason = await asyncio.to_thread(_check_model_blocking, req.model)
+                results = await asyncio.gather(
+                    *(asyncio.to_thread(_check_model_blocking, m) for m in [req.model, *derived_ids])
+                )
+            outcome, reason = results[0]
             if outcome == "rejected":
                 return JSONResponse(
                     status_code=400,
@@ -2008,11 +2029,23 @@ def build_app(
                 logger.info(
                     "model check for %s was inconclusive, saved unchecked: reason=%s", req.model, reason
                 )
-        config_path = s.persona_dir / "persona_config.json"
+            derived_outcomes = {m: res[0] for m, res in zip(derived_ids, results[1:], strict=True)}
+        # Re-read right before writing, so a change another request made while the checks ran is kept.
         current = PersonaConfig.load(config_path)
-        updated = dc_replace(current, model=req.model)
+        unavailable: list[str] = []
+        if req.model not in KNOWN_MODELS:
+            unavailable = [m for m, o in derived_outcomes.items() if o == "rejected"]
+            # An earlier "rejected" for this same chat id stays when the new check could not tell.
+            unavailable += [
+                m
+                for m in current.derived_unavailable
+                if current.model == req.model
+                and m not in unavailable
+                and (derived_outcomes.get(m) == "inconclusive" or (not derived_outcomes and m in derived_ids))
+            ]
+        updated = dc_replace(current, model=req.model, derived_unavailable=unavailable)
         updated.save(config_path)
-        model_error.switch(current.model, req.model, keep=set(TIER_MODEL.values()))
+        model_error.switch(current.model, req.model, keep=candidate_tier_models(updated))
         # Mark (or clear) BEFORE the hot-swap: the provider can only produce a clean reply for the new model
         # after the swap, and that reply clears the mark. A re-Apply of the model already saved unchecked
         # goes through here too (switch() ignores old == new), so a passing check clears the old mark.
@@ -2027,6 +2060,9 @@ def build_app(
         body: dict[str, Any] = {"ok": True, "model": req.model}
         if checked is not None:
             body["checked"] = checked
+        fallbacks = tier_fallbacks(updated)
+        if fallbacks:
+            body["fallbacks"] = fallbacks
         return body
 
     # ── POST /persona/config/pronouns — user pronoun persist ──────────────
