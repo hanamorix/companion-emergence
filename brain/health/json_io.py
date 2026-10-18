@@ -78,6 +78,8 @@ _IS_WINDOWS = os.name == "nt"
 # attempts than the writer's 8: three attempts, sleeping 0.05 s then 0.10 s (Windows only).
 _READ_ATTEMPTS = 3
 _BOM = b"\xef\xbb\xbf"
+# JSONDecodeError is a ValueError, and so is the error for an integer of more than 4300 digits.
+_JSON_PARSE_ERRORS = (ValueError, RecursionError)
 _TAIL_CHUNK = 8192
 _PREVIEW = 201  # characters of exception text / line preview in a log message
 _DETAIL = 500  # anomaly detail cap (as attempt_heal)
@@ -216,10 +218,7 @@ def _check(
         raise _BadContentError("encoding", exc) from exc
     try:
         data = json.loads(text)
-    except (
-        ValueError,
-        RecursionError,
-    ) as exc:  # JSONDecodeError, and a >4300-digit integer's plain ValueError
+    except _JSON_PARSE_ERRORS as exc:
         raise _BadContentError("empty" if not text.strip() else "malformed", exc) from exc
     if expect is not None and not isinstance(data, expect):
         raise _BadContentError("shape", TypeError(f"expected {expect}, got {type(data).__name__}"))
@@ -573,10 +572,8 @@ def _heal_locked(path, bad, sig, default, recover, expect, validate, fallbacks) 
             outcome = "restored"
     except OSError as exc:
         raise JsonFileError(path, "io", _short(exc)) from exc
-    for (
-        corrupt,
-        csig,
-    ) in walked_corrupt:  # corrupt backups last, best effort, each only if it is unchanged
+    # corrupt backups last, best effort, each only if it is unchanged
+    for corrupt, csig in walked_corrupt:
         try:
             _seam("before_quarantine_backup", corrupt)
             _expect_unchanged(corrupt, csig)
