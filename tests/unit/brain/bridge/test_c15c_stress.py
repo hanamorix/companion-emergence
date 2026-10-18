@@ -282,7 +282,7 @@ def _run_stress_window(
     join_timeout_s: float,
     writer_join_timeout_s: float = 10.0,
     cleanup_join_timeout_s: float = 10.0,
-    settle: Callable[[_ThreadRun, _ThreadRun], None] | None = None,
+    settle: Callable[[_ThreadRun, _ThreadRun, list[int]], None] | None = None,
 ) -> _StressResult:
     """Run the loop and the writer side by side for `duration_s` of real time,
     sample liveness and the window-end oracle, then stop both and join them
@@ -328,7 +328,7 @@ def _run_stress_window(
         # clock — this is a stress test of real contention).
         time.sleep(duration_s)
         if settle is not None:
-            settle(loop, writer)
+            settle(loop, writer, counter)
         writer.sample_alive()
         loop.sample_alive()
         _read_window_end_oracle(persona_dir, result)
@@ -414,7 +414,7 @@ def _stress_body(
     writer_target: Callable[..., object] = _chat_writer,
     writer_join_timeout_s: float = 10.0,
     cleanup_join_timeout_s: float = 10.0,
-    settle: Callable[[_ThreadRun, _ThreadRun], None] | None = None,
+    settle: Callable[[_ThreadRun, _ThreadRun, list[int]], None] | None = None,
 ) -> _StressResult:
     """The whole stress test, with the loop injectable: set up the persona,
     run the window, assert. The opt-in test calls it with the real
@@ -512,25 +512,35 @@ _FAST = {"duration_s": 0.3, "rows": 5, "join_timeout_s": 1.0}
 _FAST_TEARDOWN = {"writer_join_timeout_s": 1.0, "cleanup_join_timeout_s": 0.1}
 
 
-def _after_ready(ready: threading.Event) -> Callable[[_ThreadRun, _ThreadRun], None]:
-    """Wait for the stand-in to say it has published, instead of trusting a bare
-    short sleep on a loaded runner."""
+def _after_ready(
+    ready: threading.Event, *, wait_for_bump: bool = True
+) -> Callable[[_ThreadRun, _ThreadRun, list[int]], None]:
+    """Wait for the stand-in loop to say it has published, and (unless the
+    writer is the thing under test) for the writer to have made its first
+    successful `bump_recall`, instead of trusting a bare short sleep on a
+    loaded runner."""
 
-    def _settle(_loop: _ThreadRun, _writer: _ThreadRun) -> None:
+    def _settle(_loop: _ThreadRun, _writer: _ThreadRun, counter: list[int]) -> None:
         assert ready.wait(5.0), "the stand-in loop never became ready"
+        if wait_for_bump:
+            deadline = time.monotonic() + 5.0
+            while counter[0] < 1 and time.monotonic() < deadline:
+                time.sleep(0.005)
 
     return _settle
 
 
-def _after_loop_ends(loop: _ThreadRun, _writer: _ThreadRun) -> None:
+def _after_loop_ends(loop: _ThreadRun, _writer: _ThreadRun, _counter: list[int]) -> None:
     """For a stand-in loop that is meant to be dead at the sample."""
     loop.thread.join(timeout=5.0)
 
 
-def _after_writer_ends(ready: threading.Event) -> Callable[[_ThreadRun, _ThreadRun], None]:
+def _after_writer_ends(
+    ready: threading.Event,
+) -> Callable[[_ThreadRun, _ThreadRun, list[int]], None]:
     """For a stand-in writer that is meant to be dead at the sample."""
 
-    def _settle(_loop: _ThreadRun, writer: _ThreadRun) -> None:
+    def _settle(_loop: _ThreadRun, writer: _ThreadRun, _counter: list[int]) -> None:
         assert ready.wait(5.0), "the stand-in loop never became ready"
         writer.thread.join(timeout=5.0)
 
@@ -721,7 +731,11 @@ def test_stand_in_writer_failures_are_caught(
             tmp_path,
             loop_target=_stand_in(ready),
             writer_target=writer,
-            settle=_after_writer_ends(ready) if writer_is_dead else _after_ready(ready),
+            settle=(
+                _after_writer_ends(ready)
+                if writer_is_dead
+                else _after_ready(ready, wait_for_bump=False)
+            ),
             **_FAST,
             **_FAST_TEARDOWN,
         )
