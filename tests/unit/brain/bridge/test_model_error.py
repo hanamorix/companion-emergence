@@ -280,3 +280,29 @@ def test_clear_unconfirmed_drops_only_that_model():
     model_error.note_unconfirmed("claude-b-2")
     model_error.clear_unconfirmed("claude-a-1")
     assert model_error.unconfirmed() == ["claude-b-2"]
+
+
+def test_switch_unignores_every_keep_id_and_the_new_id():
+    model_error.switch("claude-a-1", "sonnet", keep=frozenset())  # a-1 ignored
+    model_error.switch("claude-b-2", "sonnet", keep=frozenset())  # b-2 ignored
+    model_error.switch("sonnet", "opus", keep=frozenset({"claude-a-1"}))  # a-1 is a candidate again
+    model_error.note_failure(SENTENCE.format(model="claude-a-1"))
+    model_error.note_failure(SENTENCE.format(model="claude-b-2"))
+    assert [r["model"] for r in model_error.state()] == ["claude-a-1"]
+
+
+def test_activate_unignores_and_rejected_models_is_a_copy():
+    model_error.switch("claude-a-1", "sonnet", keep=frozenset())
+    model_error.activate(["claude-a-1", "claude-never-seen-9"])
+    model_error.note_failure(SENTENCE.format(model="claude-a-1"))
+    rejected = model_error.rejected_models()
+    assert rejected == frozenset({"claude-a-1"})
+    model_error.note_failure(SENTENCE.format(model="claude-b-2"))
+    assert rejected == frozenset({"claude-a-1"})  # a snapshot, not a view
+
+
+def test_activate_and_rejected_models_fail_open(monkeypatch):
+    with monkeypatch.context() as m:
+        m.setattr(model_error, "_lock", None)
+        model_error.activate(["claude-a-1"])
+        assert model_error.rejected_models() == frozenset()

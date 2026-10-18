@@ -147,3 +147,82 @@ def test_length_cap_is_64_characters():
     assert len("claude-" + "a" * 57) == 64
     assert is_valid_model("claude-" + "a" * 57) is True
     assert is_valid_model("claude-" + "a" * 58) is False
+
+
+# ---------------------------------------------------------------------------
+# #441 scope addition: tier_models / derived_unavailable (C25)
+# ---------------------------------------------------------------------------
+
+OLD_KEYS = {
+    "provider", "searcher", "mcp_audit_log_level", "user_name", "model", "last_opened_at",
+    "user_pronouns", "notes_enabled", "notes_folder", "kindled_link_enabled", "kindled_relay_url",
+}
+
+
+def _load(tmp_path: Path, **extra) -> PersonaConfig:
+    p = tmp_path / "persona_config.json"
+    p.write_text(json.dumps({"provider": "claude-cli", "searcher": "noop", "model": "claude-sonnet-5", **extra}))
+    return PersonaConfig.load(p)
+
+
+def test_new_keys_are_written_only_when_non_empty(tmp_path: Path):
+    p = tmp_path / "persona_config.json"
+    PersonaConfig().save(p)
+    assert set(json.loads(p.read_text())) == OLD_KEYS  # byte-identical key set for a default / alias config
+    cfg = PersonaConfig(model="claude-sonnet-5", tier_models={"compaction": "claude-haiku-4-5"}, derived_unavailable=["claude-haiku-5"])
+    cfg.save(p)
+    saved = json.loads(p.read_text())
+    assert saved["tier_models"] == {"compaction": "claude-haiku-4-5"}
+    assert saved["derived_unavailable"] == ["claude-haiku-5"]
+    again = PersonaConfig.load(p)
+    assert again.tier_models == {"compaction": "claude-haiku-4-5"} and again.derived_unavailable == ["claude-haiku-5"]
+    again.tier_models = {}
+    again.derived_unavailable = []
+    again.save(p)
+    assert set(json.loads(p.read_text())) == OLD_KEYS  # emptied again: keys vanish
+
+
+def test_old_files_load_with_empty_defaults(tmp_path: Path):
+    cfg = _load(tmp_path)
+    assert cfg.tier_models == {} and cfg.derived_unavailable == []
+    assert PersonaConfig().tier_models == {} and PersonaConfig().derived_unavailable == []
+
+
+def test_bad_tier_entries_are_dropped_with_one_warning_per_value(tmp_path: Path, caplog, monkeypatch):
+    import brain.persona_config as pc
+
+    monkeypatch.setattr(pc, "_warned_bad_values", set())
+    bad = {
+        "compaction": "gpt4",  # invalid model
+        "not-a-tier": "haiku",  # unknown tier
+        "background-classifier": "claude-" + "a" * 58,  # over the cap
+        "background-generative": "claude-haiku-4-5",  # good
+        "self-model-articulate": 5,  # wrong type
+    }
+    with caplog.at_level(logging.WARNING):
+        cfg = _load(tmp_path, tier_models=bad)
+        first = len(caplog.records)
+        _load(tmp_path, tier_models=bad)  # loaded again (per background call): no new warnings
+    assert cfg.tier_models == {"background-generative": "claude-haiku-4-5"}
+    assert first >= 4
+    assert len(caplog.records) == first
+
+
+@pytest.mark.parametrize("raw", ["x", 5, ["a"], None])
+def test_non_dict_tier_models_become_empty(tmp_path: Path, raw):
+    assert _load(tmp_path, tier_models=raw).tier_models == {}
+
+
+def test_derived_unavailable_keeps_only_valid_unique_full_ids(tmp_path: Path):
+    cfg = _load(tmp_path, derived_unavailable=["claude-haiku-5", "claude-haiku-5", "haiku", "Bad Id", 7, "claude-" + "a" * 58])
+    assert cfg.derived_unavailable == ["claude-haiku-5"]
+    assert _load(tmp_path, derived_unavailable="claude-haiku-5").derived_unavailable == []
+
+
+def test_other_fields_survive_a_save_with_the_new_keys(tmp_path: Path):
+    p = tmp_path / "persona_config.json"
+    cfg = _load(tmp_path, user_name="Bob", notes_enabled=True)
+    cfg.tier_models = {"compaction": "haiku"}
+    cfg.save(p)
+    back = PersonaConfig.load(p)
+    assert back.user_name == "Bob" and back.notes_enabled is True and back.model == "claude-sonnet-5"

@@ -62,8 +62,10 @@ class _NoLock:
         lambda: model_error.note_unconfirmed("claude-sonet-5"),
         lambda: model_error.unconfirmed(),
         lambda: model_error.clear_unconfirmed("claude-sonet-5"),
+        lambda: model_error.rejected_models(),
+        lambda: model_error.activate(["claude-sonet-5"]),
     ],
-    ids=["note_failure", "note_success", "switch", "state", "state_only", "note_unconfirmed", "unconfirmed", "clear_unconfirmed"],
+    ids=["note_failure", "note_success", "switch", "state", "state_only", "note_unconfirmed", "unconfirmed", "clear_unconfirmed", "rejected_models", "activate"],
 )
 def test_each_public_function_takes_the_lock_exactly_once(monkeypatch, call):
     spy = _SpyLock()
