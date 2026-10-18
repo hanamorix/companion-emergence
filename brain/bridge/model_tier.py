@@ -321,8 +321,13 @@ def derive_model(chat_model: str, family: str) -> str | None:
     return derived if is_valid_model(derived) else None
 
 
-def _load_config(persona_dir: Any) -> Any:
-    """The persona's PersonaConfig, or None when there is no directory, no file or it cannot be read."""
+def _load_config(persona_dir: Any, strict: bool = False) -> Any:
+    """The persona's PersonaConfig, or None when there is no directory or no file.
+
+    A read error gives None for a model lookup (it can only pick a model). ``strict=True`` lets it
+    propagate, which ``build_tier_provider`` needs: the provider KIND must never be guessed from an
+    unreadable file (a local-model persona's prompts must not go to Claude on a transient error).
+    """
     if persona_dir is None:
         return None
     try:
@@ -331,6 +336,8 @@ def _load_config(persona_dir: Any) -> Any:
         path = Path(persona_dir) / "persona_config.json"
         return PersonaConfig.load(path) if path.exists() else None
     except Exception:  # noqa: BLE001 - a tier model lookup must never fail a background call
+        if strict:
+            raise
         return None
 
 
@@ -440,7 +447,7 @@ def build_tier_provider(persona_dir: Path, tier: str) -> Any:
     from brain.bridge.provider import get_provider
     from brain.persona_config import DEFAULT_PROVIDER
 
-    cfg = _load_config(persona_dir)
+    cfg = _load_config(persona_dir, strict=True)
     name = cfg.provider if cfg is not None else DEFAULT_PROVIDER
     model = _resolve(cfg, tier)[0]
     return get_provider(name, persona_dir=Path(persona_dir), model_override=model)

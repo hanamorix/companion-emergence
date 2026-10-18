@@ -91,12 +91,13 @@ export function ConnectionPanel({
   // bridge's `model_unconfirmed` list takes over (it empties when a clean reply arrives for the model).
   const [pendingNotice, setPendingNotice] = useState(false);
   // Tier fallbacks the last Apply reported, shown at once until the bridge's own list (state) takes over.
-  const [pendingFallbacks, setPendingFallbacks] = useState<TierFallbackInfo[]>([]);
+  // null = no Apply since the last state; an empty list is a fresh answer: none.
+  const [pendingFallbacks, setPendingFallbacks] = useState<TierFallbackInfo[] | null>(null);
   useEffect(() => {
     setPendingNotice(false);
-    setPendingFallbacks([]);
+    setPendingFallbacks(null);
   }, [state]);
-  const fallbacks = state?.tier_fallbacks && state.tier_fallbacks.length > 0 ? state.tier_fallbacks : pendingFallbacks;
+  const fallbacks = pendingFallbacks ?? state?.tier_fallbacks ?? [];
   const modelNotice =
     pendingNotice || (displayModel !== null && (state?.model_unconfirmed ?? []).includes(displayModel))
       ? MODEL_UNCHECKED_MESSAGE

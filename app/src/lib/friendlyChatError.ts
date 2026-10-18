@@ -82,6 +82,7 @@ export interface TierFallbackInfo {
 export function tierFallbackMessage(f: TierFallbackInfo): string {
   return (
     `Background jobs that use the ${f.family} family are using "${shortenModelId(f.using)}", ` +
-    `because "${shortenModelId(f.wanted)}" is not available to your account.`
+    `because "${shortenModelId(f.wanted)}" could not be used ` +
+    "(it may not exist, or your account may not have access to it)."
   );
 }

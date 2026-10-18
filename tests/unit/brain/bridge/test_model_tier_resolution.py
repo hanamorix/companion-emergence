@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 import pytest
 
-from brain.bridge import model_error
+from brain.bridge import model_error, model_tier
 from brain.bridge.model_tier import (
     ROUTED_CLAUDE_TIERS,
     TIER_ATTUNEMENT_DETECTOR,

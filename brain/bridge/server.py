@@ -2015,21 +2015,26 @@ def build_app(
         derived_outcomes: dict[str, str] = {}
         if req.model not in KNOWN_MODELS and isinstance(s.provider, ClaudeCliProvider):
             async with model_check_lock:
-                results = await asyncio.gather(
-                    *(asyncio.to_thread(_check_model_blocking, m) for m in [req.model, *derived_ids])
-                )
-            outcome, reason = results[0]
-            if outcome == "rejected":
-                return JSONResponse(
-                    status_code=400,
-                    content={"ok": False, "error": "model_unavailable", "model": req.model},
+                outcome, reason = await asyncio.to_thread(_check_model_blocking, req.model)
+                if outcome == "rejected":  # no derived probe is spent on an id that is refused anyway
+                    return JSONResponse(
+                        status_code=400,
+                        content={"ok": False, "error": "model_unavailable", "model": req.model},
+                    )
+                derived_results = await asyncio.gather(
+                    *(asyncio.to_thread(_check_model_blocking, m) for m in derived_ids)
                 )
             checked = outcome == "ok"
             if not checked:
                 logger.info(
                     "model check for %s was inconclusive, saved unchecked: reason=%s", req.model, reason
                 )
-            derived_outcomes = {m: res[0] for m, res in zip(derived_ids, results[1:], strict=True)}
+            derived_outcomes = {m: res[0] for m, res in zip(derived_ids, derived_results, strict=True)}
+            # An id the probe just proved usable is no longer rejected: drop any earlier runtime record, or
+            # the tiers would stay on their fallback and the panel would keep saying it is unavailable.
+            for confirmed in [req.model if checked else None, *(m for m, o in derived_outcomes.items() if o == "ok")]:
+                if confirmed:
+                    model_error.note_success(confirmed)
         # Re-read right before writing, so a change another request made while the checks ran is kept.
         current = PersonaConfig.load(config_path)
         unavailable: list[str] = []

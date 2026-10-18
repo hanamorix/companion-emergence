@@ -202,7 +202,7 @@ def test_no_derived_probe_is_spent_when_the_chat_id_is_rejected(persona_dir: Pat
         r = _post(c, "claude-sonet-5")
     assert r.status_code == 400
     assert run.calls_for("claude-sonet-5") == 1
-    assert run.calls_for("claude-haiku-5") == 0 and run.calls_for("claude-haiku-5") == 0
+    assert run.calls_for("claude-haiku-5") == 0  # the derived id of a sonnet-family chat id
 
 
 def test_a_passing_recheck_clears_a_runtime_rejection_and_the_fallback(persona_dir: Path, monkeypatch):

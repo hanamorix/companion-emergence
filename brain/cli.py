@@ -2559,20 +2559,29 @@ def _init_handler(args: argparse.Namespace) -> int:
     return 0
 
 
-def _model_cfg_path(persona: str) -> Path:
-    return get_persona_dir(persona) / "persona_config.json"
+def _model_cfg_path(persona: str) -> Path | None:
+    """The persona's config path, or None (after printing the error) when the persona does not exist."""
+    persona_dir = get_persona_dir(persona)
+    if not persona_dir.is_dir():
+        print(f"error: persona '{persona}' not found (see: nell personas)", file=sys.stderr)
+        return None
+    return persona_dir / "persona_config.json"
 
 
 def _model_show_handler(args: argparse.Namespace) -> int:
     from brain.bridge.model_tier import ROUTED_CLAUDE_TIERS, _resolve
     from brain.persona_config import PersonaConfig
 
-    cfg = PersonaConfig.load(_model_cfg_path(args.persona))
+    path = _model_cfg_path(args.persona)
+    if path is None:
+        return 1
+    cfg = PersonaConfig.load(path)
     print(f"chat model: {cfg.model}")
     print("background models (tier: model (source)):")
     for tier in ROUTED_CLAUDE_TIERS:
         model, source = _resolve(cfg, tier)
         print(f"  {tier}: {model} ({source})")
+    print("this shows the saved settings; runtime fallbacks appear in the app (connection panel)")
     if cfg.derived_unavailable:
         print(
             "note: "
@@ -2591,6 +2600,8 @@ def _model_set_tier_handler(args: argparse.Namespace) -> int:
         print(f"error: {args.model!r} is not a valid model: {MODEL_ID_RULE}", file=sys.stderr)
         return 1
     path = _model_cfg_path(args.persona)
+    if path is None:
+        return 1
     cfg = PersonaConfig.load(path)  # read right before the write: the bridge may have saved meanwhile
     cfg.tier_models = {**cfg.tier_models, args.tier: args.model}
     cfg.save(path)
@@ -2602,6 +2613,8 @@ def _model_clear_tier_handler(args: argparse.Namespace) -> int:
     from brain.persona_config import PersonaConfig
 
     path = _model_cfg_path(args.persona)
+    if path is None:
+        return 1
     cfg = PersonaConfig.load(path)
     if args.tier in cfg.tier_models:
         cfg.tier_models = {k: v for k, v in cfg.tier_models.items() if k != args.tier}
