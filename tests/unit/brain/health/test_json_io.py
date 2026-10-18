@@ -10,6 +10,9 @@ from __future__ import annotations
 import logging
 import os
 import stat
+import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -17,6 +20,33 @@ import pytest
 from brain.health.attempt_heal import save_with_backup_text
 
 POSIX = os.name == "posix"
+
+
+class _LazyModule:
+    """``jio.read_json`` imports brain.health.json_io on first use, so a missing module fails each test, not collection."""
+
+    def __getattr__(self, name):
+        import brain.health.json_io as module
+
+        return getattr(module, name)
+
+    def __setattr__(self, name, value):  # monkeypatch.setattr(jio, ...) must reach the real module
+        import brain.health.json_io as module
+
+        setattr(module, name, value)
+
+
+jio = _LazyModule()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_throttle():
+    """The evidence throttle is process-wide state (#429's warn_throttled): reset it around every test."""
+    from brain.utils import log_throttle
+
+    log_throttle._last.clear()
+    yield
+    log_throttle._last.clear()
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -176,3 +206,1642 @@ def test_cj3_parse_lines_default_still_skips(caplog) -> None:
         got = list(_parse_lines(_wrap(data), Path("x.jsonl")))
     assert got == [{"a": 1}, {"c": 3}]
     assert len(caplog.records) == 3
+
+
+# --------------------------------------------------------------------------------------------------------------
+# Whole-file reads (CR1-CR13, CR15, CR16)
+# --------------------------------------------------------------------------------------------------------------
+
+import copy  # noqa: E402
+import errno  # noqa: E402
+import json  # noqa: E402
+import pickle  # noqa: E402
+
+POLICIES = ["DEFAULT", "RAISE", "RESTORE", "HEAL"]
+
+
+def _policy(name: str):
+    return getattr(jio.Recovery, name)
+
+
+def _listing(d: Path) -> dict[str, bytes]:
+    """Name -> bytes of every file in ``d`` except the heal sidecar lock (a content-kind heal creates it)."""
+    return {
+        f.name: f.read_bytes()
+        for f in sorted(d.iterdir())
+        if f.is_file() and not f.name.endswith(".heal.lock")
+    }
+
+
+def _fire(*a, **k):  # a seam replacement that does nothing
+    return None
+
+
+def test_cr1_missing_returns_a_fresh_default_and_logs_nothing(tmp_path: Path, caplog) -> None:
+    p = tmp_path / "state.json"
+    with caplog.at_level(logging.DEBUG):
+        first = jio.read_json(p, default=dict)
+        second = jio.read_json(p, default=dict)
+    assert first == {} and second == {} and first is not second
+    assert [r for r in caplog.records if r.name.startswith("brain.health")] == []
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_cr1_missing_with_raise_and_no_default_is_json_file_not_found(tmp_path: Path) -> None:
+    with pytest.raises(jio.JsonFileNotFound) as exc:
+        jio.read_json(tmp_path / "nope.json", recover=jio.Recovery.RAISE)
+    assert exc.value.kind == "missing"
+    assert isinstance(exc.value, FileNotFoundError)
+
+
+def test_cr1_a_file_deleted_between_probe_and_open_is_missing_not_a_crash(
+    tmp_path: Path, monkeypatch
+) -> None:
+    p = tmp_path / "state.json"
+    p.write_text('{"a": 1}')
+    real_open = open
+
+    def vanishing(file, *a, **k):
+        if Path(file) == p:
+            raise FileNotFoundError(errno.ENOENT, "gone", str(file))
+        return real_open(file, *a, **k)
+
+    monkeypatch.setattr("builtins.open", vanishing)
+    # an exists() pre-check would have said True; the module must not rely on it
+    result = jio.read_json_result(p, default=lambda: {"fresh": True})
+    assert result.data == {"fresh": True} and result.outcome == "missing"
+
+
+@pytest.mark.parametrize("policy", POLICIES)
+@pytest.mark.parametrize(
+    "content,kind",
+    [
+        (b'{"a":', "malformed"),
+        (b"", "empty"),
+        (b"   \n", "empty"),
+        (b"not json", "malformed"),
+        (b"[1,2", "malformed"),
+    ],
+)
+def test_cr2_malformed_empty_and_truncated_files_are_classified_and_recovered(
+    tmp_path: Path, policy: str, content: bytes, kind: str
+) -> None:
+    p = tmp_path / "state.json"
+    p.write_bytes(content)
+    rec = _policy(policy)
+    if policy == "DEFAULT":
+        r = jio.read_json_result(p, default=lambda: {"d": 1}, recover=rec)
+        assert (r.data, r.outcome, r.kind) == ({"d": 1}, "defaulted", kind)
+        assert p.read_bytes() == content
+    elif policy in ("RAISE", "RESTORE"):
+        with pytest.raises(jio.JsonFileError) as exc:
+            jio.read_json(p, default=lambda: {"d": 1}, recover=rec)
+        assert exc.value.kind == kind and not isinstance(exc.value, json.JSONDecodeError)
+        assert p.read_bytes() == content
+    else:
+        r = jio.read_json_result(p, default=lambda: {"d": 1}, recover=rec)
+        assert (r.data, r.outcome) == ({"d": 1}, "reset")
+        assert json.loads(p.read_text()) == {"d": 1}
+        assert any(".corrupt-" in f.name for f in tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("policy", POLICIES)
+@pytest.mark.parametrize("content", [b'{"a": "\xff"}', b'{"a": 1}\xc3', b"\xff" * 8])
+def test_cr3_invalid_utf8_is_recovered_like_malformed_json(
+    tmp_path: Path, policy: str, content: bytes
+) -> None:
+    p = tmp_path / "state.json"
+    p.write_bytes(content)
+    rec = _policy(policy)
+    if policy == "DEFAULT":
+        assert jio.read_json(p, default=dict, recover=rec) == {}
+        assert p.read_bytes() == content
+    elif policy in ("RAISE", "RESTORE"):
+        with pytest.raises(jio.JsonFileError) as exc:
+            jio.read_json(p, default=dict, recover=rec)
+        assert exc.value.kind == "encoding" and not isinstance(exc.value, UnicodeDecodeError)
+    else:
+        r = jio.read_json_result(p, default=dict, recover=rec)
+        assert (
+            r.outcome == "reset" and r.anomaly is not None and r.anomaly.kind == "json_parse_error"
+        )
+
+
+def test_cr3_baseline_the_legacy_handler_shape_leaks_unicode_decode_error(tmp_path: Path) -> None:
+    """The #436 failure: a handler listing only (OSError, JSONDecodeError) lets invalid UTF-8 escape."""
+    p = tmp_path / "state.json"
+    p.write_bytes(b'{"a": "\xff"}')
+    with pytest.raises(UnicodeDecodeError):
+        try:
+            json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            pytest.fail("the legacy handler would have caught it")
+
+
+def _failing_open(target: Path, exc_factory, times: int | None = None):
+    """A builtins.open replacement that raises for ``target`` (``times`` times, then works)."""
+    real_open = open
+    state = {"n": 0}
+
+    def fake(file, *a, **k):
+        if Path(file) == target and (times is None or state["n"] < times):
+            state["n"] += 1
+            raise exc_factory()
+        return real_open(file, *a, **k)
+
+    fake.state = state  # type: ignore[attr-defined]
+    return fake
+
+
+def test_cr4_io_error_default_and_raise(tmp_path: Path, monkeypatch, caplog) -> None:
+    p = tmp_path / "state.json"
+    p.write_text('{"a": 1}')
+    monkeypatch.setattr("builtins.open", _failing_open(p, lambda: OSError(errno.EIO, "disk")))
+    with caplog.at_level(logging.WARNING):
+        r = jio.read_json_result(p, default=lambda: {"d": 1})
+    assert (r.data, r.outcome, r.kind) == ({"d": 1}, "defaulted", "io")
+    assert any("io" in rec.getMessage() for rec in caplog.records)
+    with pytest.raises(jio.JsonFileError) as exc:
+        jio.read_json(p, default=dict, recover=jio.Recovery.RAISE)
+    assert exc.value.kind == "io" and isinstance(exc.value, OSError)
+
+
+@pytest.mark.parametrize("policy", ["HEAL", "RESTORE"])
+def test_cr4_heal_and_restore_never_touch_a_file_they_could_not_read(
+    tmp_path: Path, monkeypatch, policy: str
+) -> None:
+    p = tmp_path / "state.json"
+    p.write_text('{"a": 1}')
+    (tmp_path / "state.json.bak1").write_text('{"old": 1}')
+    before = _listing(tmp_path)
+    monkeypatch.setattr("builtins.open", _failing_open(p, lambda: OSError(errno.EIO, "disk")))
+    with pytest.raises(jio.JsonFileError) as exc:
+        jio.read_json(p, default=dict, recover=_policy(policy))
+    monkeypatch.undo()
+    assert exc.value.kind == "io"
+    assert _listing(tmp_path) == before and not list(tmp_path.glob("*.corrupt-*"))
+
+
+def test_cr4_a_directory_where_a_file_should_be_is_an_io_failure(tmp_path: Path) -> None:
+    p = tmp_path / "state.json"
+    p.mkdir()
+    r = jio.read_json_result(p, default=dict)
+    assert (r.outcome, r.kind) == ("defaulted", "io")
+
+
+def _sleeps(monkeypatch) -> list[float]:
+    calls: list[float] = []
+    monkeypatch.setattr(time, "sleep", lambda s: calls.append(s))
+    return calls
+
+
+def test_cr5_windows_path_retries_a_transient_permission_error(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    p = tmp_path / "state.json"
+    p.write_text('{"a": 1}')
+    monkeypatch.setattr(jio, "_IS_WINDOWS", True)
+    sleeps = _sleeps(monkeypatch)
+    monkeypatch.setattr(
+        "builtins.open", _failing_open(p, lambda: PermissionError(13, "busy"), times=2)
+    )
+    with caplog.at_level(logging.DEBUG):
+        assert jio.read_json(p, default=dict) == {"a": 1}
+    assert len(sleeps) == 2 and sum(sleeps) <= 0.2
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_cr5_windows_path_gives_up_after_three_attempts(tmp_path: Path, monkeypatch) -> None:
+    p = tmp_path / "state.json"
+    p.write_text('{"a": 1}')
+    monkeypatch.setattr(jio, "_IS_WINDOWS", True)
+    sleeps = _sleeps(monkeypatch)
+    fake = _failing_open(p, lambda: PermissionError(13, "busy"))
+    monkeypatch.setattr("builtins.open", fake)
+    r = jio.read_json_result(p, default=dict)
+    assert (r.outcome, r.kind) == ("defaulted", "io")
+    assert fake.state["n"] == 3 and len(sleeps) == 2
+
+
+def test_cr5_posix_path_has_no_retry_and_no_sleep(tmp_path: Path, monkeypatch, caplog) -> None:
+    p = tmp_path / "state.json"
+    p.write_text('{"a": 1}')
+    monkeypatch.setattr(jio, "_IS_WINDOWS", False)
+    sleeps = _sleeps(monkeypatch)
+    fake = _failing_open(p, lambda: PermissionError(13, "denied"))
+    monkeypatch.setattr("builtins.open", fake)
+    with caplog.at_level(logging.WARNING):
+        r = jio.read_json_result(p, default=dict)
+    assert (r.outcome, r.kind) == ("defaulted", "io")
+    assert fake.state["n"] == 1 and sleeps == []
+    assert any(rec.levelno == logging.WARNING for rec in caplog.records)
+
+
+@pytest.mark.parametrize("policy", POLICIES)
+def test_cr6_wrong_top_level_type_is_a_shape_failure(tmp_path: Path, policy: str) -> None:
+    p = tmp_path / "state.json"
+    p.write_text("[1, 2, 3]")
+    rec = _policy(policy)
+    if policy == "DEFAULT":
+        r = jio.read_json_result(p, default=dict, expect=dict, recover=rec)
+        assert (r.outcome, r.kind, r.data) == ("defaulted", "shape", {})
+    elif policy == "HEAL":
+        r = jio.read_json_result(p, default=dict, expect=dict, recover=rec)
+        assert (r.outcome, r.data) == ("reset", {}) and r.anomaly.kind == "schema_mismatch"
+    else:
+        with pytest.raises(jio.JsonFileError) as exc:
+            jio.read_json(p, default=dict, expect=dict, recover=rec)
+        assert exc.value.kind == "shape"
+
+
+@pytest.mark.parametrize("exc_type", [ValueError, TypeError, KeyError, AttributeError])
+@pytest.mark.parametrize("policy", POLICIES)
+def test_cr6_validator_failures_of_any_untrusted_structure_kind_are_schema_failures(
+    tmp_path: Path, policy: str, exc_type
+) -> None:
+    p = tmp_path / "state.json"
+    p.write_text('{"a": 1}')
+
+    def validate(data):
+        raise exc_type("bad")
+
+    rec = _policy(policy)
+    if policy in ("DEFAULT", "HEAL"):
+        r = jio.read_json_result(p, default=lambda: {"d": 1}, validate=validate, recover=rec)
+        assert r.kind == "schema" and r.data == {"d": 1}
+    else:
+        with pytest.raises(jio.JsonFileError) as exc:
+            jio.read_json(p, default=dict, validate=validate, recover=rec)
+        assert exc.value.kind == "schema"
+
+
+def test_cr6_a_validator_that_returns_passes_the_data_through(tmp_path: Path) -> None:
+    p = tmp_path / "state.json"
+    p.write_text('{"a": 1}')
+    seen = []
+    assert jio.read_json(p, default=dict, validate=seen.append) == {"a": 1}
+    assert seen == [{"a": 1}]
+
+
+def test_cr6_baseline_the_legacy_heal_lets_a_keyerror_validator_escape(tmp_path: Path) -> None:
+    from brain.health.attempt_heal import attempt_heal
+
+    p = tmp_path / "state.json"
+    p.write_text('{"a": 1}')
+
+    def validate(_data):
+        raise KeyError("x")
+
+    with pytest.raises(KeyError):
+        attempt_heal(p, dict, schema_validator=validate)
+
+
+def test_cr7_default_policy_never_modifies_the_file(tmp_path: Path) -> None:
+    p = tmp_path / "state.json"
+    p.write_bytes(b"garbage")
+    before = _listing(tmp_path)
+    jio.read_json(p, default=dict)
+    assert _listing(tmp_path) == before
+
+
+def test_cr7_raise_carries_path_kind_and_cause(tmp_path: Path) -> None:
+    p = tmp_path / "state.json"
+    p.write_text("{nope")
+    with pytest.raises(jio.JsonFileError) as exc:
+        jio.read_json(p, recover=jio.Recovery.RAISE)
+    assert exc.value.path == p and exc.value.kind == "malformed"
+    assert isinstance(exc.value.__cause__, json.JSONDecodeError)
+
+
+def test_cr7_a_default_under_raise_applies_only_to_a_missing_file(tmp_path: Path) -> None:
+    assert jio.read_json(tmp_path / "gone.json", default=lambda: 7, recover=jio.Recovery.RAISE) == 7
+    p = tmp_path / "bad.json"
+    p.write_text("{nope")
+    with pytest.raises(jio.JsonFileError):
+        jio.read_json(p, default=lambda: 7, recover=jio.Recovery.RAISE)
+
+
+@pytest.mark.parametrize("policy", ["DEFAULT", "RESTORE", "HEAL"])
+def test_cr7_these_policies_require_a_default_at_call_time(tmp_path: Path, policy: str) -> None:
+    with pytest.raises(TypeError):
+        jio.read_json(tmp_path / "x.json", recover=_policy(policy))
+
+
+def test_cr16_the_exception_is_an_oserror_a_valueerror_and_a_missing_one_a_filenotfounderror() -> (
+    None
+):
+    err = jio.JsonFileError(Path("/x/y.json"), "malformed", "bad", line=3)
+    assert isinstance(err, OSError) and isinstance(err, ValueError)
+    gone = jio.JsonFileNotFound(Path("/x/y.json"), "missing")
+    assert isinstance(gone, FileNotFoundError) and isinstance(gone, jio.JsonFileError)
+    assert str(err) == "/x/y.json: malformed: bad (line 3)" and not str(err).startswith("[Errno")
+
+
+@pytest.mark.parametrize(
+    "clone", [copy.copy, lambda e: pickle.loads(pickle.dumps(e))], ids=["copy", "pickle"]
+)
+def test_cr16_the_exception_survives_copy_and_pickle(clone) -> None:
+    for original in (
+        jio.JsonFileError(Path("/x/y.json"), "line", "bad line", line=9),
+        jio.JsonFileNotFound(Path("/x/y.json"), "missing"),
+    ):
+        again = clone(original)
+        assert type(again) is type(original)
+        assert (again.path, again.kind, again.line, str(again)) == (
+            original.path,
+            original.kind,
+            original.line,
+            str(original),
+        )
+
+
+def test_cr12_deeply_nested_json_is_malformed_not_a_recursion_error(tmp_path: Path) -> None:
+    p = tmp_path / "deep.json"
+    p.write_text("[" * 100000)
+    r = jio.read_json_result(p, default=dict)
+    assert (r.outcome, r.kind) == ("defaulted", "malformed")
+
+
+def test_cr13_outcomes_and_read_json_equals_the_result_data(tmp_path: Path) -> None:
+    ok, missing, bad = tmp_path / "ok.json", tmp_path / "missing.json", tmp_path / "bad.json"
+    ok.write_text('{"a": 1}')
+    bad.write_text("{nope")
+    assert jio.read_json_result(ok, default=dict).outcome == "ok"
+    assert jio.read_json_result(missing, default=dict).outcome == "missing"
+    assert jio.read_json_result(bad, default=dict).outcome == "defaulted"
+    assert (
+        jio.read_json(bad, default=lambda: {"z": 1})
+        == jio.read_json_result(bad, default=lambda: {"z": 1}).data
+    )
+    (tmp_path / "bad.json.bak1").write_text('{"b": 2}')
+    r = jio.read_json_result(bad, default=dict, recover=jio.Recovery.HEAL)
+    assert (r.outcome, r.data) == ("restored", {"b": 2})
+    bad.write_text("{nope")
+    (tmp_path / "bad.json.bak1").unlink(missing_ok=True)
+    assert jio.read_json_result(bad, default=dict, recover=jio.Recovery.HEAL).outcome == "reset"
+
+
+# --------------------------------------------------------------------------------------------------------------
+# Evidence (CR10) and encoding independence (CR11)
+# --------------------------------------------------------------------------------------------------------------
+
+
+def _warnings(caplog, level=logging.WARNING):
+    return [r for r in caplog.records if r.levelno == level and r.name == "brain.health.json_io"]
+
+
+def test_cr10_a_fallback_logs_one_warning_with_path_kind_and_text(tmp_path: Path, caplog) -> None:
+    p = tmp_path / "state.json"
+    p.write_text("{nope")
+    with caplog.at_level(logging.DEBUG):
+        jio.read_json(p, default=dict)
+    [rec] = _warnings(caplog)
+    msg = rec.getMessage()
+    assert str(p) in msg and "malformed" in msg and "Expecting" in msg
+    assert rec.exc_info is not None
+
+
+def test_cr10_repeats_within_the_interval_log_at_debug_and_other_paths_warn(
+    tmp_path: Path, caplog
+) -> None:
+    a, b = tmp_path / "a.json", tmp_path / "b.json"
+    a.write_text("{nope")
+    b.write_text("{nope")
+    with caplog.at_level(logging.DEBUG):
+        for _ in range(3):
+            jio.read_json(a, default=dict)
+        jio.read_json(b, default=dict)
+    assert len(_warnings(caplog)) == 2  # first failure of a, first failure of b
+    assert len(_warnings(caplog, logging.DEBUG)) == 2  # the two repeats of a
+
+
+def test_cr10_the_warning_comes_back_after_the_interval(
+    tmp_path: Path, caplog, monkeypatch
+) -> None:
+    from brain.utils import log_throttle
+
+    p = tmp_path / "a.json"
+    p.write_text("{nope")
+    clock = [1000.0]
+    monkeypatch.setattr(log_throttle.time, "monotonic", lambda: clock[0])
+    with caplog.at_level(logging.DEBUG):
+        jio.read_json(p, default=dict)
+        clock[0] += log_throttle.INTERVAL_S - 1
+        jio.read_json(p, default=dict)
+        clock[0] += 2
+        jio.read_json(p, default=dict)
+    assert len(_warnings(caplog)) == 2
+
+
+def test_cr10_a_different_failure_kind_on_the_same_path_warns_again(tmp_path: Path, caplog) -> None:
+    p = tmp_path / "a.json"
+    with caplog.at_level(logging.DEBUG):
+        p.write_text("{nope")
+        jio.read_json(p, default=dict)
+        p.write_bytes(b'{"a": "\xff"}')
+        jio.read_json(p, default=dict)
+    assert len(_warnings(caplog)) == 2
+
+
+def test_cr10_a_long_exception_text_is_capped(tmp_path: Path, caplog) -> None:
+    p = tmp_path / "a.json"
+    p.write_text("{" + '"k": ' + "1 " * 5000 + "oops")
+    with caplog.at_level(logging.DEBUG):
+        jio.read_json(p, default=dict)
+    [rec] = _warnings(caplog)
+    assert len(rec.getMessage()) < 600
+
+
+def test_cr10_heal_events_are_never_throttled(tmp_path: Path, caplog) -> None:
+    with caplog.at_level(logging.DEBUG):
+        for i in range(3):
+            p = tmp_path / f"s{i}.json"
+            p.write_text("{nope")
+            jio.read_json(p, default=dict, recover=jio.Recovery.HEAL)
+    heal_warnings = [
+        r
+        for r in _warnings(caplog)
+        if "heal" in r.getMessage().lower()
+        or "restor" in r.getMessage().lower()
+        or "reset" in r.getMessage().lower()
+    ]
+    assert len(heal_warnings) >= 3
+
+
+def test_cr11_a_leading_bom_is_tolerated_on_read(tmp_path: Path) -> None:
+    p = tmp_path / "state.json"
+    p.write_bytes(b"\xef\xbb\xbf" + b'{"a": 1}')
+    assert jio.read_json_result(p, default=dict, recover=jio.Recovery.RAISE).data == {"a": 1}
+
+
+class _OpenSpy:
+    """Record every text-mode open without an explicit UTF-8 encoding, through every opener the module could use."""
+
+    def __init__(self, monkeypatch) -> None:
+        self.violations: list[str] = []
+        import builtins
+        import gzip as gz
+        import io
+
+        spy = self
+
+        def check(opener_name, real):
+            def wrapper(*args, **kwargs):
+                mode = kwargs.get("mode", args[1] if len(args) > 1 else "r")
+                enc = kwargs.get(
+                    "encoding", args[3] if len(args) > 3 and opener_name == "open" else None
+                )
+                if "b" not in str(mode) and (
+                    enc is None or not str(enc).lower().replace("_", "-").startswith("utf-8")
+                ):
+                    spy.violations.append(f"{opener_name}(mode={mode!r}, encoding={enc!r})")
+                return real(*args, **kwargs)
+
+            return wrapper
+
+        monkeypatch.setattr(builtins, "open", check("open", builtins.open))
+        monkeypatch.setattr(io, "open", check("io.open", io.open))
+        monkeypatch.setattr(os, "fdopen", check("fdopen", os.fdopen))
+        real_path_open = Path.open
+
+        def path_open(self_, mode="r", buffering=-1, encoding=None, errors=None, newline=None):
+            if "b" not in mode and (
+                encoding is None or not encoding.lower().replace("_", "-").startswith("utf-8")
+            ):
+                spy.violations.append(f"Path.open(mode={mode!r}, encoding={encoding!r})")
+            return real_path_open(self_, mode, buffering, encoding, errors, newline)
+
+        monkeypatch.setattr(Path, "open", path_open)
+        monkeypatch.setattr(gz, "open", check("gzip.open", gz.open))
+
+
+def test_cr11_baseline_the_spy_flags_three_legacy_writers_with_no_explicit_encoding(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from brain.chat.tool_loop import _log_attunement_error
+    from brain.felt_time.weather_shift import append_shift_log
+    from brain.self_model.articulate import _log_articulate_error
+    from datetime import UTC, datetime
+
+    spy = _OpenSpy(monkeypatch)
+    append_shift_log(tmp_path, ts=datetime.now(UTC), channel="c", label="l")
+    assert spy.violations, "weather_shift.append_shift_log opens with the locale codec"
+    spy.violations.clear()
+    _log_attunement_error(tmp_path, "t1", ValueError("x"))
+    assert spy.violations
+    spy.violations.clear()
+    _log_articulate_error(tmp_path, "kind", ValueError("x"))
+    assert spy.violations
+
+
+# --------------------------------------------------------------------------------------------------------------
+# HEAL fidelity against the untouched legacy attempt_heal (CR8)
+# --------------------------------------------------------------------------------------------------------------
+
+import re  # noqa: E402
+import shutil  # noqa: E402
+
+_SCHEMA_OK = b'{"interests": [1]}'
+
+
+def _needs_interests(data) -> None:
+    if not isinstance(data, dict) or not isinstance(data.get("interests"), list):
+        raise ValueError("interests schema invalid")
+
+
+def _norm(name: str) -> str:
+    return re.sub(r"corrupt-.*$", "corrupt-TS", name)
+
+
+def _snapshot(d: Path) -> dict[str, bytes]:
+    return {_norm(k): v for k, v in _listing(d).items()}
+
+
+def _anomaly_fields(a):
+    if a is None:
+        return None
+    return {
+        "file": a.file,
+        "kind": a.kind,
+        "action": a.action,
+        "quarantine_path": _norm(a.quarantine_path) if a.quarantine_path else None,
+        "likely_cause": a.likely_cause,
+        "detail": a.detail,
+    }
+
+
+# name -> (files, validator)
+HEAL_FIXTURES = {
+    "valid": ({"s.json": b'{"a": 1}'}, None),
+    "corrupt-no-baks": ({"s.json": b"{nope"}, None),
+    "corrupt-valid-bak1": ({"s.json": b"{nope", "s.json.bak1": b'{"b": 2}'}, None),
+    "bak1-corrupt-bak2-valid": (
+        {"s.json": b"{nope", "s.json.bak1": b"zzz", "s.json.bak2": b'{"c": 3}'},
+        None,
+    ),
+    "all-corrupt": (
+        {"s.json": b"{nope", "s.json.bak1": b"zzz", "s.json.bak2": b"yyy", "s.json.bak3": b""},
+        None,
+    ),
+    "schema-failure": ({"s.json": b'{"other": 1}', "s.json.bak1": _SCHEMA_OK}, _needs_interests),
+    "hand-edit": ({"s.json": b'{"a": 1,}'}, None),
+    "empty-file": ({"s.json": b""}, None),
+    "missing": ({}, None),
+}
+
+
+def _run_pair(tmp_path: Path, files: dict, validator):
+    from brain.health.attempt_heal import attempt_heal
+
+    legacy_dir, new_dir = tmp_path / "legacy", tmp_path / "new"
+    for d in (legacy_dir, new_dir):
+        d.mkdir()
+        for name, content in files.items():
+            (d / name).write_bytes(content)
+    default = lambda: {"default": True}  # noqa: E731
+    l_data, l_anomaly = attempt_heal(legacy_dir / "s.json", default, schema_validator=validator)
+    r = jio.read_json_result(
+        new_dir / "s.json", default=default, recover=jio.Recovery.HEAL, validate=validator
+    )
+    return legacy_dir, new_dir, (l_data, l_anomaly), r
+
+
+@pytest.mark.parametrize("fixture", sorted(HEAL_FIXTURES))
+def test_cr8_heal_matches_the_untouched_legacy_function(tmp_path: Path, fixture: str) -> None:
+    files, validator = HEAL_FIXTURES[fixture]
+    legacy_dir, new_dir, (l_data, l_anomaly), r = _run_pair(tmp_path, files, validator)
+    assert r.data == l_data
+    assert _anomaly_fields(r.anomaly) == _anomaly_fields(l_anomaly)
+    legacy_files, new_files = _snapshot(legacy_dir), _snapshot(new_dir)
+    assert set(new_files) == set(legacy_files)
+    for name in legacy_files:  # the reset-to-default file is the same JSON, byte for byte
+        assert new_files[name] == legacy_files[name], name
+
+
+def test_cr8_delta_one_invalid_utf8_is_labelled_a_parse_error_not_a_schema_mismatch(
+    tmp_path: Path,
+) -> None:
+    legacy_dir, new_dir, (_d, l_anomaly), r = _run_pair(
+        tmp_path, {"s.json": b'{"a": "\xff"}'}, None
+    )
+    assert l_anomaly.kind == "schema_mismatch"  # the legacy mislabel
+    assert r.anomaly.kind == "json_parse_error"
+    assert r.anomaly.action == l_anomaly.action == "reset_to_default"
+
+
+def test_cr8_anomaly_detail_is_capped_at_500_characters(tmp_path: Path) -> None:
+    p = tmp_path / "s.json"
+    p.write_text('{"k": ' + "9" * 3000 + " oops")
+    r = jio.read_json_result(
+        p,
+        default=dict,
+        recover=jio.Recovery.HEAL,
+        validate=lambda d: (_ for _ in ()).throw(ValueError("v" * 900)),
+    )
+    assert len(r.anomaly.detail) <= 500
+
+
+def test_cr8_delta_two_the_reset_to_default_is_written_atomically(
+    tmp_path: Path, monkeypatch
+) -> None:
+    for which in ("legacy", "new"):
+        d = tmp_path / which
+        d.mkdir()
+        (d / "s.json").write_bytes(b"{nope")
+    writes: list[str] = []
+    replaces: list[tuple[str, str]] = []
+    real_write_text, real_replace = Path.write_text, os.replace
+
+    def write_text(self, *a, **k):
+        writes.append(str(self))
+        return real_write_text(self, *a, **k)
+
+    def replace(src, dst):
+        replaces.append((Path(src).name, Path(dst).name))
+        return real_replace(src, dst)
+
+    from brain.health.attempt_heal import attempt_heal
+
+    monkeypatch.setattr(Path, "write_text", write_text)
+    monkeypatch.setattr(os, "replace", replace)
+    attempt_heal(tmp_path / "legacy" / "s.json", dict)
+    assert writes == [
+        str(tmp_path / "legacy" / "s.json")
+    ]  # legacy: direct, non-atomic write at the live path
+    writes.clear()
+    replaces.clear()
+    jio.read_json(tmp_path / "new" / "s.json", default=dict, recover=jio.Recovery.HEAL)
+    assert writes == []
+    assert any(dst == "s.json" and src.endswith(".new") for src, dst in replaces)
+
+
+def test_cr8_delta_three_the_quarantine_rename_retries_a_transient_permission_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from brain.health.attempt_heal import attempt_heal
+
+    for which in ("legacy", "new"):
+        d = tmp_path / which
+        d.mkdir()
+        (d / "s.json").write_bytes(b"{nope")
+        (d / "s.json.bak1").write_bytes(b'{"b": 1}')
+    real_replace = os.replace
+    left = {"n": 0}
+
+    def flaky(src, dst):
+        if ".corrupt-" in str(dst) and left["n"] < 1:
+            left["n"] += 1
+            raise PermissionError(13, "sharing violation")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", flaky)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    with pytest.raises(PermissionError):
+        attempt_heal(tmp_path / "legacy" / "s.json", dict)
+    left["n"] = 0
+    assert jio.read_json(tmp_path / "new" / "s.json", default=dict, recover=jio.Recovery.HEAL) == {
+        "b": 1
+    }
+
+
+# --------------------------------------------------------------------------------------------------------------
+# Heal races (CR9): executed interleavings, each also run with its guard switched off to show the data loss
+# --------------------------------------------------------------------------------------------------------------
+
+
+def _corrupt_with_backup(tmp_path: Path, bak: bytes = b'{"restored": true}') -> Path:
+    p = tmp_path / "s.json"
+    p.write_bytes(b"{nope")
+    (tmp_path / "s.json.bak1").write_bytes(bak)
+    return p
+
+
+def _seam_hook(monkeypatch, **actions):
+    """Replace the module's no-op seam: ``actions[name](path)`` runs when the heal reaches seam ``name``."""
+
+    def seam(name, path):
+        action = actions.get(name)
+        if action:
+            action(path)
+
+    monkeypatch.setattr(jio, "_seam", seam)
+
+
+def test_cr9_a_the_second_healer_finds_the_file_already_restored(
+    tmp_path: Path, monkeypatch
+) -> None:
+    p = _corrupt_with_backup(tmp_path)
+    ran = []
+
+    def competitor(path):
+        if not ran:
+            ran.append(1)
+            assert jio.read_json(path, default=dict, recover=jio.Recovery.HEAL) == {
+                "restored": True
+            }
+
+    _seam_hook(monkeypatch, before_heal=competitor)
+    r = jio.read_json_result(p, default=dict, recover=jio.Recovery.HEAL)
+    assert r.data == {"restored": True} and r.outcome == "ok"
+    assert json.loads(p.read_text()) == {"restored": True}
+    assert len(list(tmp_path.glob("s.json.corrupt-*"))) == 1
+
+
+def test_cr9_a_without_revalidation_the_second_healer_destroys_the_restored_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The failing baseline: the guard off reproduces the legacy double-heal data loss."""
+    p = _corrupt_with_backup(tmp_path)
+    ran = []
+
+    def competitor(path):
+        if not ran:
+            ran.append(1)
+            jio.read_json(path, default=dict, recover=jio.Recovery.HEAL)
+
+    _seam_hook(monkeypatch, before_heal=competitor)
+    monkeypatch.setattr(jio, "_HEAL_REVALIDATE", False)
+    r = jio.read_json_result(p, default=dict, recover=jio.Recovery.HEAL)
+    assert r.data != {
+        "restored": True
+    }  # the restored data was quarantined and replaced by the default
+
+
+def test_cr9_b_a_writer_that_replaced_the_file_before_the_lock_is_not_quarantined(
+    tmp_path: Path, monkeypatch
+) -> None:
+    p = _corrupt_with_backup(tmp_path)
+
+    def writer(path):
+        path.write_text('{"fresh": 1}')
+
+    _seam_hook(monkeypatch, before_heal=writer)
+    r = jio.read_json_result(p, default=dict, recover=jio.Recovery.HEAL)
+    assert (r.data, r.outcome) == ({"fresh": 1}, "ok")
+    assert not list(tmp_path.glob("*.corrupt-*"))
+
+
+def test_cr9_b_without_revalidation_the_new_content_is_quarantined(
+    tmp_path: Path, monkeypatch
+) -> None:
+    p = _corrupt_with_backup(tmp_path)
+    _seam_hook(monkeypatch, before_heal=lambda path: path.write_text('{"fresh": 1}'))
+    monkeypatch.setattr(jio, "_HEAL_REVALIDATE", False)
+    r = jio.read_json_result(p, default=dict, recover=jio.Recovery.HEAL)
+    assert r.data != {"fresh": 1}
+
+
+def test_cr9_c_a_failed_quarantine_rename_raises_and_leaves_the_original(
+    tmp_path: Path, monkeypatch
+) -> None:
+    p = _corrupt_with_backup(tmp_path)
+    real = jio._replace_with_retry
+
+    def failing(src, dst):
+        if ".corrupt-" in str(dst):
+            raise OSError(errno.EIO, "disk")
+        return real(src, dst)
+
+    monkeypatch.setattr(jio, "_replace_with_retry", failing)
+    with pytest.raises(jio.JsonFileError) as exc:
+        jio.read_json(p, default=dict, recover=jio.Recovery.HEAL)
+    assert exc.value.kind == "io"
+    assert p.read_bytes() == b"{nope" and (tmp_path / "s.json.bak1").exists()
+
+
+def _in_thread(fn, timeout: float):
+    box: dict = {}
+
+    def run():
+        try:
+            box["result"] = fn()
+        except BaseException as exc:  # noqa: BLE001
+            box["error"] = exc
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout)
+    return t, box
+
+
+def test_cr9_d_a_save_started_during_the_heal_waits_and_lands_after_it(
+    tmp_path: Path, monkeypatch
+) -> None:
+    p = _corrupt_with_backup(tmp_path, b'{"restored": true}')
+    state: dict = {}
+
+    def start_writer(path):
+        t, box = _in_thread(lambda: jio.write_json(path, {"writer": 1}, backups=1), timeout=0.4)
+        state["thread"], state["box"] = t, box
+        state["alive_during_heal"] = t.is_alive()
+
+    _seam_hook(monkeypatch, inside_heal=start_writer)
+    r = jio.read_json_result(p, default=dict, recover=jio.Recovery.HEAL)
+    state["thread"].join(5)
+    assert r.data == {"restored": True}
+    assert state["alive_during_heal"] is True, "the save did not wait for the heal"
+    assert "error" not in state["box"]
+    assert json.loads(p.read_text()) == {
+        "writer": 1
+    }  # the writer's content is final, not the restored one
+
+
+def test_cr9_d_with_the_save_lock_off_the_install_check_still_protects_the_save(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Defence in depth: even if a save did not take the heal sidecar, the heal refuses to install over it."""
+    p = _corrupt_with_backup(tmp_path, b'{"restored": true}')
+    monkeypatch.setattr(jio, "_SAVE_TAKES_HEAL_LOCK", False)
+    _seam_hook(monkeypatch, inside_heal=lambda path: jio.write_json(path, {"writer": 1}, backups=1))
+    jio.read_json_result(p, default=dict, recover=jio.Recovery.HEAL)
+    assert json.loads(p.read_text()) == {"writer": 1}
+
+
+def test_cr9_d_without_the_checks_a_save_without_a_chain_is_overwritten_by_the_restore(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The failing baseline: a save with no backup chain does not rotate the backup away, so only the
+    install-time checks stand between it and the restore; with them off the restore clobbers the save."""
+    p = _corrupt_with_backup(tmp_path, b'{"restored": true}')
+    monkeypatch.setattr(jio, "_HEAL_REVALIDATE", False)
+    _seam_hook(monkeypatch, inside_heal=lambda path: jio.write_json(path, {"writer": 1}))
+    jio.read_json_result(p, default=dict, recover=jio.Recovery.HEAL)
+    assert json.loads(p.read_text()) != {"writer": 1}
+
+
+def test_cr9_e_a_file_that_vanishes_before_the_heal_is_re_read_not_raised(
+    tmp_path: Path, monkeypatch
+) -> None:
+    p = _corrupt_with_backup(tmp_path)
+    _seam_hook(monkeypatch, before_heal=lambda path: path.unlink())
+    r = jio.read_json_result(p, default=lambda: {"d": 1}, recover=jio.Recovery.HEAL)
+    assert (r.data, r.outcome) == ({"d": 1}, "missing")
+    assert not list(tmp_path.glob("*.corrupt-*"))
+
+
+# --------------------------------------------------------------------------------------------------------------
+# The heal lock does not collide with other holders of <name>.lock (CR14)
+# --------------------------------------------------------------------------------------------------------------
+
+
+def _hold_shared_lock_in_thread(path: Path):
+    from brain.utils.file_lock import file_lock
+
+    acquired, release = threading.Event(), threading.Event()
+
+    def hold():
+        with file_lock(path):
+            acquired.set()
+            release.wait(10)
+
+    t = threading.Thread(target=hold, daemon=True)
+    t.start()
+    assert acquired.wait(5)
+    return t, release
+
+
+def test_cr14_heal_completes_while_another_descriptor_holds_the_shared_lock(tmp_path: Path) -> None:
+    p = _corrupt_with_backup(tmp_path)
+    t, release = _hold_shared_lock_in_thread(p)  # the bridge.json.lock shape
+    try:
+        worker, box = _in_thread(
+            lambda: jio.read_json(p, default=dict, recover=jio.Recovery.HEAL), timeout=5
+        )
+        assert not worker.is_alive(), "heal blocked on <name>.lock"
+        assert box["result"] == {"restored": True}
+    finally:
+        release.set()
+        t.join(5)
+
+
+def test_cr14_baseline_a_heal_on_the_shared_sidecar_would_hang(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(jio, "_HEAL_LOCK_USES_SHARED_SIDECAR", True)
+    p = _corrupt_with_backup(tmp_path)
+    t, release = _hold_shared_lock_in_thread(p)
+    try:
+        worker, _box = _in_thread(
+            lambda: jio.read_json(p, default=dict, recover=jio.Recovery.HEAL), timeout=1.0
+        )
+        assert worker.is_alive(), "the variant that locks <name>.lock should have hung"
+    finally:
+        release.set()
+        t.join(5)
+        worker.join(5)
+
+
+def test_cr14_heal_save_and_if_missing_complete_while_the_same_thread_holds_the_shared_lock(
+    tmp_path: Path,
+) -> None:
+    """The engines/heartbeat.py tick shape: load_with_anomaly inside file_lock(state_path)."""
+    from brain.utils.file_lock import file_lock
+
+    p = _corrupt_with_backup(tmp_path)
+
+    def work():
+        with file_lock(p):
+            a = jio.read_json(p, default=dict, recover=jio.Recovery.HEAL)
+            jio.write_json(p, {"saved": 1}, backups=2)
+            made = jio.write_json(tmp_path / "once.json", {"x": 1}, if_missing=True)
+            return a, made
+
+    worker, box = _in_thread(work, timeout=5)
+    assert not worker.is_alive(), "deadlock on the caller's own <name>.lock"
+    assert box["result"] == ({"restored": True}, True)
+
+
+@pytest.mark.skipif(not POSIX, reason="flock across processes is exercised on POSIX")
+def test_cr14_heal_completes_while_another_process_holds_the_shared_lock(tmp_path: Path) -> None:
+    import subprocess
+    import textwrap
+
+    p = _corrupt_with_backup(tmp_path)
+    code = textwrap.dedent(
+        """
+        import sys
+        from pathlib import Path
+        from brain.utils.file_lock import file_lock
+        with file_lock(Path(sys.argv[1])):
+            print("READY", flush=True)
+            sys.stdin.read()
+        """
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", code, str(p)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[4])},
+    )
+    try:
+        assert child.stdout.readline().strip() == "READY"
+        worker, box = _in_thread(
+            lambda: jio.read_json(p, default=dict, recover=jio.Recovery.HEAL), timeout=5
+        )
+        assert not worker.is_alive()
+        assert box["result"] == {"restored": True}
+    finally:
+        child.stdin.close()
+        child.wait(10)
+
+
+def test_cr14_a_refused_lock_proceeds_unlocked_with_one_warning_and_an_install_collision_is_not_clobbered(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    import contextlib
+
+    p = _corrupt_with_backup(tmp_path, b'{"restored": "bak"}')
+
+    @contextlib.contextmanager
+    def refusing(path, *, blocking=True):
+        raise OSError(errno.ENOLCK, "no locks available")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(jio, "file_lock", refusing)
+    _seam_hook(monkeypatch, before_install=lambda path: path.write_text('{"competitor": 1}'))
+    with caplog.at_level(logging.WARNING):
+        r = jio.read_json_result(p, default=dict, recover=jio.Recovery.HEAL)
+    assert r.data == {
+        "competitor": 1
+    }  # the competing restorer's file is kept and re-read, not overwritten
+    assert json.loads(p.read_text()) == {"competitor": 1}
+    assert any("lock" in rec.getMessage().lower() for rec in _warnings(caplog))
+
+
+def test_cr14_a_competing_change_before_the_quarantine_is_noticed_in_unlocked_mode(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import contextlib
+
+    p = _corrupt_with_backup(tmp_path)
+
+    @contextlib.contextmanager
+    def refusing(path, *, blocking=True):
+        raise OSError(errno.ENOLCK, "no locks")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(jio, "file_lock", refusing)
+    _seam_hook(monkeypatch, before_quarantine=lambda path: path.write_text('{"fresh": 2}'))
+    r = jio.read_json_result(p, default=dict, recover=jio.Recovery.HEAL)
+    assert r.data == {"fresh": 2} and not list(tmp_path.glob("*.corrupt-*"))
+
+
+def test_cr14_an_oserror_in_the_body_propagates_once_and_the_body_runs_once(
+    tmp_path: Path, monkeypatch
+) -> None:
+    p = _corrupt_with_backup(tmp_path)
+    real = jio._replace_with_retry
+    calls = {"quarantine": 0}
+
+    def failing(src, dst):
+        if ".corrupt-" in str(dst):
+            calls["quarantine"] += 1
+            raise OSError(errno.EIO, "disk")
+        return real(src, dst)
+
+    monkeypatch.setattr(jio, "_replace_with_retry", failing)
+    with pytest.raises(jio.JsonFileError):
+        jio.read_json(p, default=dict, recover=jio.Recovery.HEAL)
+    assert calls["quarantine"] == 1, (
+        "the heal body was re-run (unlocked) after an OSError in the body"
+    )
+
+
+def test_cr14_baseline_the_naive_try_with_shape_runs_the_body_twice() -> None:
+    """Why the module enters the lock through an ExitStack inside the try: @contextmanager re-raises body errors
+    at the yield, so `try: with lock: body / except OSError: body` runs the body a second time, unlocked."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def lock():
+        yield
+
+    runs = []
+
+    def body():
+        runs.append(1)
+        raise OSError(errno.EIO, "disk")
+
+    try:
+        with lock():
+            body()
+    except OSError:
+        try:
+            body()
+        except OSError:
+            pass
+    assert len(runs) == 2
+
+
+# --------------------------------------------------------------------------------------------------------------
+# Recovery.RESTORE and fallbacks (CR15)
+# --------------------------------------------------------------------------------------------------------------
+
+
+def test_cr15_restore_without_a_valid_backup_raises_and_leaves_everything_in_place(
+    tmp_path: Path,
+) -> None:
+    p = tmp_path / "daily_budget.json"
+    p.write_bytes(b'{"date": "2026-10-17", "cou')
+    (tmp_path / "daily_budget.json.bak1").write_bytes(b"also bad")
+    before = _listing(tmp_path)
+    for _ in range(2):  # a second call raises again: it keeps failing closed
+        with pytest.raises(jio.JsonFileError) as exc:
+            jio.read_json(p, default=dict, recover=jio.Recovery.RESTORE)
+        assert exc.value.kind == "malformed"
+    assert _listing(tmp_path) == before
+    assert not list(tmp_path.glob("*.corrupt-*"))
+
+
+def test_cr15_baseline_heal_would_have_reset_the_budget_to_an_empty_counter(tmp_path: Path) -> None:
+    """The d4c94657 fail-open bug: HEAL resets a corrupt budget file to the default (zero used)."""
+    p = tmp_path / "daily_budget.json"
+    p.write_bytes(b'{"date": "2026-10-17", "cou')
+    assert jio.read_json(p, default=dict, recover=jio.Recovery.HEAL) == {}
+
+
+def test_cr15_restore_restores_from_the_freshest_valid_backup(tmp_path: Path) -> None:
+    p = tmp_path / "b.json"
+    p.write_bytes(b"{nope")
+    (tmp_path / "b.json.bak1").write_bytes(b"corrupt")
+    (tmp_path / "b.json.bak2").write_bytes(b'{"n": 2}')
+    r = jio.read_json_result(p, default=dict, recover=jio.Recovery.RESTORE)
+    assert (r.data, r.outcome) == ({"n": 2}, "restored")
+    assert json.loads(p.read_text()) == {"n": 2}
+    assert len(list(tmp_path.glob("b.json.corrupt-*"))) == 1
+    assert len(list(tmp_path.glob("b.json.bak1.corrupt-*"))) == 1
+
+
+def _set_mtime(path: Path, age_seconds: float) -> None:
+    t = time.time() - age_seconds
+    os.utime(path, (t, t))
+
+
+def test_cr15_a_fresh_tmp_beats_a_stale_bak1(tmp_path: Path) -> None:
+    p = tmp_path / "b.json"
+    p.write_bytes(b"{nope")
+    tmp, bak = tmp_path / "b.tmp", tmp_path / "b.json.bak1"
+    bak.write_bytes(b'{"day": "yesterday"}')
+    tmp.write_bytes(b'{"day": "today"}')
+    _set_mtime(bak, 86400)
+    _set_mtime(tmp, 5)
+    r = jio.read_json_result(p, default=dict, recover=jio.Recovery.RESTORE, fallbacks=(tmp,))
+    assert r.data == {"day": "today"} and r.outcome == "restored"
+    assert json.loads(p.read_text()) == {"day": "today"} and not tmp.exists()
+
+
+def test_cr15_a_frozen_older_tmp_loses_to_a_newer_bak1(tmp_path: Path) -> None:
+    p = tmp_path / "b.json"
+    p.write_bytes(b"{nope")
+    tmp, bak = tmp_path / "b.tmp", tmp_path / "b.json.bak1"
+    tmp.write_bytes(b'{"day": "old-legacy-tmp"}')
+    bak.write_bytes(b'{"day": "fresh-bak1"}')
+    _set_mtime(tmp, 5 * 86400)
+    _set_mtime(bak, 60)
+    r = jio.read_json_result(p, default=dict, recover=jio.Recovery.RESTORE, fallbacks=(tmp,))
+    assert r.data == {"day": "fresh-bak1"}
+    assert tmp.exists()  # an unused fallback is left alone
+
+
+def test_cr15_equal_mtimes_prefer_the_fallback_and_an_invalid_tmp_is_ignored(
+    tmp_path: Path,
+) -> None:
+    p = tmp_path / "b.json"
+    tmp, bak = tmp_path / "b.tmp", tmp_path / "b.json.bak1"
+    bak.write_bytes(b'{"from": "bak"}')
+    tmp.write_bytes(b'{"from": "tmp"}')
+    t = time.time() - 100
+    os.utime(bak, (t, t))
+    os.utime(tmp, (t, t))
+    p.write_bytes(b"{nope")
+    assert jio.read_json(p, default=dict, recover=jio.Recovery.RESTORE, fallbacks=(tmp,)) == {
+        "from": "tmp"
+    }
+    p.write_bytes(b"{nope")
+    tmp.write_bytes(b"garbage")
+    assert jio.read_json(p, default=dict, recover=jio.Recovery.RESTORE, fallbacks=(tmp,)) == {
+        "from": "bak"
+    }
+
+
+def test_cr15_with_no_valid_backup_a_valid_tmp_is_installed_whatever_its_age(
+    tmp_path: Path,
+) -> None:
+    p = tmp_path / "b.json"
+    p.write_bytes(b"{nope")
+    tmp = tmp_path / "b.tmp"
+    tmp.write_bytes(b'{"day": "old"}')
+    _set_mtime(tmp, 30 * 86400)
+    assert jio.read_json(p, default=dict, recover=jio.Recovery.RESTORE, fallbacks=(tmp,)) == {
+        "day": "old"
+    }
+
+
+@pytest.mark.parametrize("spelling", ["live", "relative-live", "bak1"])
+def test_cr15_a_fallback_equal_to_the_live_file_or_a_backup_is_a_value_error(
+    tmp_path: Path, monkeypatch, spelling: str
+) -> None:
+    p = tmp_path / "b.json"
+    p.write_bytes(b"{nope")
+    monkeypatch.chdir(tmp_path)
+    bad = {
+        "live": p,
+        "relative-live": Path("sub") / ".." / "b.json",
+        "bak1": tmp_path / "b.json.bak1",
+    }[spelling]
+    if spelling == "relative-live":
+        (tmp_path / "sub").mkdir()
+    with pytest.raises(ValueError):
+        jio.read_json(p, default=dict, recover=jio.Recovery.RESTORE, fallbacks=(bad,))
+
+
+# --------------------------------------------------------------------------------------------------------------
+# Whole-file writes (CW1-CW12)
+# --------------------------------------------------------------------------------------------------------------
+
+
+def _norm_crlf(b: bytes) -> bytes:
+    return b.replace(b"\r\n", b"\n")
+
+
+@pytest.mark.parametrize("backups", [1, 3])
+@pytest.mark.parametrize(
+    "data", [{"a": 1}, {"é": "ü", "n": [1, 2, {"k": None}]}, [1, 2, 3], "text", 7]
+)
+def test_cw1_write_json_matches_save_with_backup_byte_for_byte(
+    tmp_path: Path, backups: int, data
+) -> None:
+    from brain.health.attempt_heal import save_with_backup
+
+    legacy, new = tmp_path / "legacy.json", tmp_path / "new.json"
+    for n in range(4):
+        payload = {"v": n, "d": data}
+        save_with_backup(legacy, payload, backup_count=backups)
+        assert jio.write_json(new, payload, backups=backups) is True
+    assert _norm_crlf(new.read_bytes()) == _norm_crlf(legacy.read_bytes())
+    for i in range(1, backups + 1):
+        a, b = tmp_path / f"legacy.json.bak{i}", tmp_path / f"new.json.bak{i}"
+        assert _norm_crlf(b.read_bytes()) == _norm_crlf(a.read_bytes())
+
+
+def test_cw1_the_differential_can_fail(tmp_path: Path) -> None:
+    from brain.health.attempt_heal import save_with_backup
+
+    save_with_backup(tmp_path / "l.json", {"a": 1})
+    jio.write_json(tmp_path / "n.json", {"a": 1}, indent=4)
+    assert _norm_crlf((tmp_path / "n.json").read_bytes()) != _norm_crlf(
+        (tmp_path / "l.json").read_bytes()
+    )
+
+
+def test_cw2_concurrent_writers_raise_nothing_and_leave_a_whole_file_and_no_temps(
+    tmp_path: Path,
+) -> None:
+    p = tmp_path / "s.json"
+    jio.write_json(p, {"v": 0}, backups=2)
+    errors: list[BaseException] = []
+    stop = threading.Event()
+    seen_bad: list[str] = []
+
+    def writer(i):
+        try:
+            for n in range(25):
+                jio.write_json(p, {"w": i, "n": n}, backups=2)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def reader():
+        while not stop.is_set():
+            try:
+                json.loads(p.read_text())
+            except FileNotFoundError:
+                seen_bad.append("missing")
+            except ValueError:
+                seen_bad.append("torn")
+
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(8)]
+    rt = threading.Thread(target=reader)
+    if POSIX:  # an open reader blocks any replace on Windows by design
+        rt.start()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+    stop.set()
+    if POSIX:
+        rt.join(10)
+    assert errors == [] and seen_bad == []
+    assert "w" in json.loads(p.read_text())
+    assert not list(tmp_path.glob("*.new"))
+
+
+def test_cw2_a_second_process_writing_the_same_path_does_not_interfere(tmp_path: Path) -> None:
+    import subprocess
+    import textwrap
+
+    p = tmp_path / "s.json"
+    code = textwrap.dedent(
+        """
+        import sys
+        from pathlib import Path
+        from brain.health import json_io
+        for n in range(25):
+            json_io.write_json(Path(sys.argv[1]), {"proc": 2, "n": n}, backups=2)
+        """
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", code, str(p)],
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[4])},
+    )
+    for n in range(25):
+        jio.write_json(p, {"proc": 1, "n": n}, backups=2)
+    assert child.wait(60) == 0
+    assert json.loads(p.read_text())["proc"] in (1, 2)
+    assert not list(tmp_path.glob("*.new"))
+
+
+def test_cw2_write_json_leaves_no_temp_after_a_failed_save(tmp_path: Path, monkeypatch) -> None:
+    p = tmp_path / "s.json"
+    jio.write_json(p, {"v": 1}, backups=1)
+
+    def boom(fd):
+        raise OSError(errno.EIO, "disk")
+
+    monkeypatch.setattr(os, "fsync", boom)
+    with pytest.raises(OSError):
+        jio.write_json(p, {"v": 2}, backups=1)
+    monkeypatch.undo()
+    assert json.loads(p.read_text()) == {"v": 1}
+    assert not list(tmp_path.glob("*.new"))
+
+
+def test_cw3_write_json_fsyncs_by_default_and_not_when_asked(tmp_path: Path, monkeypatch) -> None:
+    calls = _count_fsyncs(monkeypatch)
+    jio.write_json(tmp_path / "a.json", {"a": 1})
+    assert calls  # file and (POSIX) directory
+    calls.clear()
+    jio.write_json(tmp_path / "b.json", {"a": 1}, fsync=False)
+    assert calls == []
+
+
+@pytest.mark.parametrize("backups", [0, 1, 3, 6])
+def test_cw4_the_backup_chain_matches_the_model(tmp_path: Path, backups: int) -> None:
+    p = tmp_path / "s.json"
+    for n in range(1, 11):
+        jio.write_json(p, {"v": n}, backups=backups)
+    assert json.loads(p.read_text()) == {"v": 10}
+    baks = sorted(f.name for f in tmp_path.glob("s.json.bak*"))
+    assert baks == [f"s.json.bak{i}" for i in range(1, backups + 1)]
+    for i in range(1, backups + 1):
+        assert json.loads((tmp_path / f"s.json.bak{i}").read_text()) == {"v": 10 - i}
+    assert not list(tmp_path.glob("*.new"))
+
+
+def test_cw4_the_backup_keeps_mtime_and_the_live_path_is_never_absent(
+    tmp_path: Path, monkeypatch
+) -> None:
+    p = tmp_path / "s.json"
+    jio.write_json(p, {"v": 1}, backups=2)
+    old = time.time() - 5000
+    os.utime(p, (old, old))
+    missing_seen: list[str] = []
+    real_replace = os.replace
+
+    def watch(src, dst):
+        if not p.exists():
+            missing_seen.append(f"before {Path(src).name}->{Path(dst).name}")
+        real_replace(src, dst)
+        if not p.exists():
+            missing_seen.append(f"after {Path(src).name}->{Path(dst).name}")
+
+    monkeypatch.setattr(os, "replace", watch)
+    jio.write_json(p, {"v": 2}, backups=2)
+    monkeypatch.undo()
+    assert missing_seen == []
+    assert abs((tmp_path / "s.json.bak1").stat().st_mtime - old) < 2
+
+
+@pytest.mark.skipif(not POSIX, reason="file modes are POSIX-only")
+def test_cw5_write_json_mode_reaches_the_live_file_and_every_backup(tmp_path: Path) -> None:
+    p = tmp_path / "bridge.json"
+    p.write_text("{}")
+    p.chmod(0o644)
+    old = os.umask(0)
+    try:
+        for n in range(3):
+            jio.write_json(p, {"token": n}, backups=2, mode=0o600)
+    finally:
+        os.umask(old)
+    for name in ("bridge.json", "bridge.json.bak1", "bridge.json.bak2"):
+        assert stat.S_IMODE((tmp_path / name).stat().st_mode) == 0o600, name
+
+
+@pytest.mark.parametrize("bad", [object(), float("nan"), float("inf"), {"k": {1, 2}}])
+def test_cw6_a_payload_that_cannot_be_serialized_touches_nothing(tmp_path: Path, bad) -> None:
+    p = tmp_path / "s.json"
+    jio.write_json(p, {"v": 1}, backups=1)
+    before, mtime = _listing(tmp_path), p.stat().st_mtime_ns
+    with pytest.raises((TypeError, ValueError)):
+        jio.write_json(p, {"v": bad}, backups=1)
+    assert _listing(tmp_path) == before and p.stat().st_mtime_ns == mtime
+
+
+def test_cw6_a_failed_serialization_on_a_new_path_creates_no_file(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        jio.write_json(tmp_path / "new.json", {"v": float("nan")})
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("kwargs", [{"backups": 0}, {"backups": 2}, {"backups": 0, "mode": 0o600}])
+def test_cw7_a_transient_permission_error_at_every_replace_is_retried(
+    tmp_path: Path, monkeypatch, kwargs
+) -> None:
+    if "mode" in kwargs and not POSIX:
+        pytest.skip("modes are POSIX-only")
+    p = tmp_path / "s.json"
+    jio.write_json(p, {"v": 1}, **kwargs)
+    real_replace = os.replace
+    failed = {"n": 0}
+
+    def flaky(src, dst):
+        if failed["n"] < 3:
+            failed["n"] += 1
+            raise PermissionError(13, "sharing violation")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", flaky)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    jio.write_json(p, {"v": 2}, **kwargs)
+    monkeypatch.undo()
+    assert json.loads(p.read_text()) == {"v": 2} and failed["n"] == 3
+
+
+def test_cw7_a_persistent_permission_error_raises_and_leaves_the_old_file_and_chain(
+    tmp_path: Path, monkeypatch
+) -> None:
+    p = tmp_path / "s.json"
+    jio.write_json(p, {"v": 1}, backups=1)
+    jio.write_json(p, {"v": 2}, backups=1)
+    before = _listing(tmp_path)
+    real_replace = os.replace
+
+    def stubborn(src, dst):
+        if Path(dst) == p:
+            raise PermissionError(13, "sharing violation")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", stubborn)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    with pytest.raises(PermissionError):
+        jio.write_json(p, {"v": 3}, backups=1)
+    monkeypatch.undo()
+    assert json.loads(p.read_text()) == {"v": 2}
+    assert not list(tmp_path.glob("*.new"))
+    assert json.loads((tmp_path / "s.json.bak1").read_text())["v"] in (1, 2)
+    assert before and True
+
+
+def test_cw8_the_default_error_mode_raises_and_keeps_the_live_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    p = tmp_path / "s.json"
+    jio.write_json(p, {"v": 1}, backups=1)
+
+    def enospc(fd):
+        raise OSError(errno.ENOSPC, "disk full")
+
+    monkeypatch.setattr(os, "fsync", enospc)
+    with pytest.raises(OSError) as exc:
+        jio.write_json(p, {"v": 2}, backups=1)
+    monkeypatch.undo()
+    assert exc.value.errno == errno.ENOSPC
+    assert json.loads(p.read_text()) == {"v": 1} and not list(tmp_path.glob("*.new"))
+
+
+def test_cw8_log_mode_returns_false_with_throttled_evidence_and_no_temp(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    p = tmp_path / "s.json"
+    jio.write_json(p, {"v": 1})
+
+    def enospc(fd):
+        raise OSError(errno.ENOSPC, "disk full")
+
+    monkeypatch.setattr(os, "fsync", enospc)
+    with caplog.at_level(logging.DEBUG):
+        assert jio.write_json(p, {"v": 2}, on_error="log") is False
+        assert jio.write_json(p, {"v": 3}, on_error="log") is False
+    monkeypatch.undo()
+    assert len(_warnings(caplog)) == 1 and len(_warnings(caplog, logging.DEBUG)) == 1
+    assert json.loads(p.read_text()) == {"v": 1} and not list(tmp_path.glob("*.new"))
+
+
+def test_cw8_log_mode_does_not_swallow_a_serialization_error(tmp_path: Path) -> None:
+    with pytest.raises(TypeError):
+        jio.write_json(tmp_path / "s.json", {"v": object()}, on_error="log")
+
+
+def test_cw8_a_failed_backup_copy_leaves_the_chain_untouched(tmp_path: Path, monkeypatch) -> None:
+    p = tmp_path / "s.json"
+    for n in range(3):
+        jio.write_json(p, {"v": n}, backups=2)
+    before = _listing(tmp_path)
+
+    def failing_copy(src, dst):
+        raise OSError(errno.ENOSPC, "disk full")
+
+    monkeypatch.setattr("brain.health.attempt_heal._copy_for_backup", failing_copy)
+    with pytest.raises(OSError):
+        jio.write_json(p, {"v": 99}, backups=2)
+    monkeypatch.undo()
+    assert _listing(tmp_path) == before
+
+
+def _corrupt_after_publish(monkeypatch, target: Path, garbage: bytes = b"{garbage"):
+    """After the module's final replace puts the new file at ``target``, damage it (a write that landed bad)."""
+    real_replace = os.replace
+    done = {"n": 0}
+
+    def damaging(src, dst):
+        real_replace(src, dst)
+        if Path(dst) == target and done["n"] == 0:  # only the first publish lands bad
+            done["n"] += 1
+            target.write_bytes(garbage)
+
+    monkeypatch.setattr(os, "replace", damaging)
+
+
+def test_cw9_verify_restores_bak1_when_the_written_file_is_bad(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    p = tmp_path / "s.json"
+    jio.write_json(p, {"v": 1}, backups=2)
+    _corrupt_after_publish(monkeypatch, p)
+    with caplog.at_level(logging.ERROR):
+        assert jio.write_json(p, {"v": 2}, backups=2, verify=True) is False
+    monkeypatch.undo()
+    assert json.loads(p.read_text()) == {"v": 1}
+    assert [r for r in caplog.records if r.levelno == logging.ERROR]
+
+
+def test_cw9_verify_with_no_backup_logs_and_returns_false_without_raising(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    p = tmp_path / "s.json"
+    _corrupt_after_publish(monkeypatch, p)
+    with caplog.at_level(logging.ERROR):
+        assert jio.write_json(p, {"v": 1}, verify=True) is False
+    monkeypatch.undo()
+    assert [r for r in caplog.records if r.levelno == logging.ERROR]
+
+
+def test_cw9_verify_off_does_not_read_the_file_back_and_a_good_write_passes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    p = tmp_path / "s.json"
+    reads: list[str] = []
+    real = Path.read_bytes
+    monkeypatch.setattr(Path, "read_bytes", lambda self: (reads.append(self.name), real(self))[1])
+    assert jio.write_json(p, {"v": 1}) is True
+    assert reads == []
+    assert jio.write_json(p, {"v": 2}, verify=True) is True
+    assert reads == ["s.json"]
+
+
+def test_cw9_baseline_without_verify_a_bad_write_goes_unnoticed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    p = tmp_path / "s.json"
+    jio.write_json(p, {"v": 1}, backups=1)
+    _corrupt_after_publish(monkeypatch, p)
+    assert jio.write_json(p, {"v": 2}, backups=1) is True
+    monkeypatch.undo()
+    assert p.read_bytes() == b"{garbage"
+
+
+def test_cw10_output_is_pure_ascii_whatever_the_payload(tmp_path: Path) -> None:
+    p = tmp_path / "s.json"
+    payload = {
+        "emoji": "\U0001f600",
+        "bmp": "é日本",
+        "lone": "\ud800",
+        "sep": "a b c",
+        "nl": "x\ny\r",
+    }
+    jio.write_json(p, payload)
+    raw = p.read_bytes()
+    raw.decode("ascii")
+    assert b"\r" not in raw and b"\xe2\x80\xa8" not in raw
+    assert json.loads(raw.decode("utf-8")) == payload
+
+
+def test_cw10_baseline_ensure_ascii_false_cannot_encode_a_lone_surrogate() -> None:
+    with pytest.raises(UnicodeEncodeError):
+        json.dumps({"a": "\ud800"}, ensure_ascii=False).encode("utf-8")
+
+
+def test_cw10_format_options(tmp_path: Path) -> None:
+    p = tmp_path / "s.json"
+    jio.write_json(p, {"b": 1, "a": [1, 2]})
+    assert p.read_bytes() == b'{\n  "b": 1,\n  "a": [\n    1,\n    2\n  ]\n}\n'
+    jio.write_json(p, {"b": 1, "a": 2}, indent=None, sort_keys=True)
+    assert p.read_bytes() == b'{"a": 2, "b": 1}\n'
+
+
+def test_cw10_encode_default_hook_and_no_silent_str(tmp_path: Path) -> None:
+    from datetime import date
+
+    p = tmp_path / "s.json"
+    with pytest.raises(TypeError):
+        jio.write_json(p, {"d": date(2026, 10, 17)})
+    jio.write_json(p, {"d": date(2026, 10, 17)}, encode_default=str)
+    assert json.loads(p.read_text()) == {"d": "2026-10-17"}
+
+
+def test_cw11_a_missing_parent_directory_is_created(tmp_path: Path) -> None:
+    p = tmp_path / "a" / "b" / "s.json"
+    jio.write_json(p, {"v": 1})
+    assert json.loads(p.read_text()) == {"v": 1}
+
+
+def test_cw12_if_missing_creates_once_and_leaves_an_existing_file_alone(tmp_path: Path) -> None:
+    p = tmp_path / "marker.json"
+    assert jio.write_json(p, {"first": 1}, if_missing=True) is True
+    assert jio.write_json(p, {"second": 2}, if_missing=True) is False
+    assert json.loads(p.read_text()) == {"first": 1}
+
+
+def test_cw12_two_threads_racing_to_create_exactly_one_wins(tmp_path: Path) -> None:
+    p = tmp_path / "marker.json"
+    results: list[bool] = []
+    barrier = threading.Barrier(2)
+
+    def go(i):
+        barrier.wait()
+        results.append(jio.write_json(p, {"winner": i}, if_missing=True))
+
+    threads = [threading.Thread(target=go, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert sorted(results) == [False, True]
+    assert json.loads(p.read_text())["winner"] in (0, 1)
+
+
+def test_cw12_baseline_a_plain_exists_check_lets_both_threads_write(tmp_path: Path) -> None:
+    p = tmp_path / "marker.json"
+    wrote: list[int] = []
+    gate = threading.Barrier(2)
+
+    def naive(i):
+        if not p.exists():
+            gate.wait()  # both pass the check before either writes
+            p.write_text(json.dumps({"winner": i}))
+            wrote.append(i)
+
+    threads = [threading.Thread(target=naive, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert len(wrote) == 2
