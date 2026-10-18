@@ -89,6 +89,16 @@ def test_preflight_bad_persona_config_json(tmp_path):
     assert any(e["code"] == "bad_persona_config" for e in r["errors"])
 
 
+def test_preflight_unusable_persona_config_is_the_domain_error_not_a_traceback(tmp_path):
+    """C9: JsonFileError is translated to bad_persona_config for every unusable shape: invalid UTF-8 and valid
+    JSON that is not an object used to propagate (UnicodeDecodeError, AttributeError); they are now reported."""
+    for i, payload in enumerate((b"\xff\xfe{", b"[1, 2]", b"")):
+        src = _make_v012_persona(tmp_path / str(i))
+        (src / "persona_config.json").write_bytes(payload)
+        r = preflight_companion_emergence(src)
+        assert any(e["code"] == "bad_persona_config" for e in r["errors"]), payload
+
+
 def test_migrate_copies_dir_and_writes_app_config(tmp_path, monkeypatch):
     src = _make_v012_persona(tmp_path / "src", name="phoebe")
     kindled_home = tmp_path / "home"

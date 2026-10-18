@@ -16,6 +16,7 @@ from typing import Any
 
 from brain.health.json_io import Recovery, append_jsonl, iter_jsonl, read_json, write_json
 from brain.narrative_memory.arc import Arc, ArcMember
+from brain.utils.finite import clamp_nonfinite
 
 # State + log filenames inside persona_dir
 STATE_FILENAME = "arcs_state.json"
@@ -126,7 +127,7 @@ def append_event(persona_dir: Path, event: dict[str, Any]) -> None:
     Mirrors the brain.growth.arc_storage.append_removed_arc precedent —
     file_lock for cross-process safety, fsync for durability.
     """
-    append_jsonl(persona_dir / LOG_FILENAME, event, fsync=True, nonfinite="null")
+    append_jsonl(persona_dir / LOG_FILENAME, clamp_nonfinite(event), fsync=True)  # replay float()s these
 
 
 def load_or_recover(persona_dir: Path) -> ArcsState:

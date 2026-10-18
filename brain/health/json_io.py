@@ -996,10 +996,8 @@ def _stream_raw(binary, source: Path, strict: bool, bad_lines: bool) -> Iterator
             if bad_lines:
                 yield text, record
     finally:
-        try:
+        if not binary.closed:  # an abandoned iterator can be closed after the caller's `with` closed the file
             wrapper.detach()
-        except ValueError:
-            pass  # the caller's `with` already closed the file (an abandoned iterator): nothing left to detach
 
 
 def read_jsonl_tail(

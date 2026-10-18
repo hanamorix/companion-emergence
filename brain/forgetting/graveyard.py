@@ -27,6 +27,7 @@ from brain.memory.name_rules import (
 )
 from brain.memory.recall_stopwords import RECALL_STOPWORDS
 from brain.memory.store import Memory
+from brain.utils.finite import clamp_nonfinite
 
 GRAVEYARD_FILENAME = "forgotten_memories.jsonl"
 
@@ -66,7 +67,7 @@ def append(
         "hebbian_neighbors": [[nid, float(w)] for nid, w in (hebbian_neighbors or [])],
     }
     path = persona_dir / GRAVEYARD_FILENAME
-    append_jsonl(path, entry, fsync=True, nonfinite="null")
+    append_jsonl(path, clamp_nonfinite(entry), fsync=True)  # recovery float()s the neighbour weights
 
 
 #: Ordinary query words shorter than this are not searched (today's minimum,

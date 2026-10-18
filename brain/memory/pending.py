@@ -33,6 +33,7 @@ from pathlib import Path
 from brain.health.json_io import Recovery, append_jsonl, read_jsonl, write_jsonl
 from brain.memory.store import Memory, MemoryStore
 from brain.utils.file_lock import file_lock
+from brain.utils.finite import clamp_nonfinite
 
 logger = logging.getLogger(__name__)
 
@@ -78,12 +79,14 @@ class PendingQueue:
 
     def enqueue(self, mem: Memory, *, source: str) -> None:
         """Append a candidate (the Memory serialised + provenance) under lock."""
-        entry = {
+        # A NaN score or emotion is clamped to 0.0 here, not written as null: the gate parses the row with
+        # Memory.from_dict, whose float() rejects null (a clamped candidate is promoted, as before).
+        entry = clamp_nonfinite({
             **mem.to_dict(),
             "_source": source,
             "_enqueued_at": datetime.now(UTC).isoformat(),
-        }
-        append_jsonl(self.path, entry, nonfinite="null")
+        })
+        append_jsonl(self.path, entry)
 
     def read_recent(self, memory_type: str, *, limit: int) -> list[Memory]:
         """Return up to `limit` most-recent candidates of `memory_type`.

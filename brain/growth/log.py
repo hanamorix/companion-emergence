@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 
 from brain.health.json_io import Recovery, append_jsonl, iter_jsonl
+from brain.utils.finite import clamp_nonfinite
 from brain.utils.time import iso_utc, parse_iso_utc
 
 logger = logging.getLogger(__name__)
@@ -64,7 +65,7 @@ def append_growth_event(path: Path, event: GrowthLogEvent) -> None:
     taking the lock costs ~µs on the happy path and gives us
     correct semantics on every platform.
     """
-    append_jsonl(path, _event_to_dict(event), fsync=True, nonfinite="null")
+    append_jsonl(path, _event_to_dict(event), fsync=True)
 
 
 def read_growth_log(path: Path, *, limit: int | None = None) -> list[GrowthLogEvent]:
@@ -91,10 +92,12 @@ def _event_to_dict(event: GrowthLogEvent) -> dict:
         "type": event.type,
         "name": event.name,
         "description": event.description,
-        "decay_half_life_days": event.decay_half_life_days,
+        # The reader float()s the score and accepts null only for the half-life ("no decay"), so a non-finite
+        # half-life is stored as null and a non-finite score as 0.0.
+        "decay_half_life_days": clamp_nonfinite(event.decay_half_life_days, None),
         "reason": event.reason,
         "evidence_memory_ids": list(event.evidence_memory_ids),
-        "score": event.score,
+        "score": clamp_nonfinite(event.score),
         "relational_context": event.relational_context,
     }
 

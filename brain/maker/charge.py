@@ -38,8 +38,11 @@ def load_charge(persona_dir: Path) -> MakerCharge:
     raw = read_json(path, default=dict, expect=dict)
     try:
         charge = float(raw.get("charge", 0.0))
-        if not math.isfinite(charge):  # a legacy NaN/Infinity would make every later save raise: treat as corrupt
-            raise ValueError("non-finite charge")
+        if not math.isfinite(charge):
+            # A legacy NaN/Infinity would make every later (strict) save raise. Clamp only the charge; the cooldown
+            # timestamps and the soul count are still readable and stay.
+            logger.warning("maker charge in %s is not finite (%r): starting the charge from 0.0", path, charge)
+            charge = 0.0
         return MakerCharge(
             charge=charge,
             last_tick_ts=raw.get("last_tick_ts"),

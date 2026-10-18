@@ -352,4 +352,4 @@ def _write_kit_source_manifest(
             "personality_copied": personality_copied,
         },
     }
-    write_json(path, payload, indent=2, fsync=False, on_error="log", nonfinite="null")
+    write_json(path, payload, indent=2, fsync=False, on_error="log")

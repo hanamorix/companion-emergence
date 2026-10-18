@@ -289,35 +289,96 @@ def test_mut_archive_and_log_appenders_write_a_nan_as_null_instead_of_raising(tm
     assert json.loads((tmp_path / "hb.jsonl").read_text())["elapsed_seconds"] is None
 
 
-def test_mut_pending_enqueue_of_a_nan_memory_is_queued_not_lost(tmp_path: Path) -> None:
+def test_mut_pending_enqueue_of_a_nan_memory_is_promoted_by_the_reader(tmp_path: Path) -> None:
+    """The gate parses the drained row with Memory.from_dict, whose float() rejects null: the NaN is clamped at the
+    producer (0.0), so the candidate that was promoted before the migration still is."""
     from brain.memory.pending import PendingQueue
+    from brain.memory.store import Memory
 
     q = PendingQueue(tmp_path)
-    q.enqueue(_mem_nan(), source="t")
+    mem = _mem_nan()
+    mem.score = float("nan")
+    q.enqueue(mem, source="t")
     (row,) = q.drain()
-    assert row["emotions"]["love"] is None
+    back = Memory.from_dict(row)  # raised TypeError when the row carried null
+    assert back.emotions["love"] == 0.0 and back.score == 0.0 and back.content == "x"
 
 
-def test_mut_behavioral_growth_narrative_appenders_write_nan_as_null(tmp_path: Path) -> None:
-    from brain.behavioral.log import append_behavioral_event
-    from brain.growth.log import GrowthLogEvent, append_growth_event
-    from brain.narrative_memory.state import LOG_FILENAME, append_event
+def test_mut_behavioral_appender_writes_nan_as_null(tmp_path: Path) -> None:
+    from brain.behavioral.log import append_behavioral_event, read_behavioral_log
 
     append_behavioral_event(
         tmp_path / "b.jsonl", kind="journal_entry_added", name="n", timestamp=NOW,
         emotional_state={"love": float("nan")},
     )
-    assert json.loads((tmp_path / "b.jsonl").read_text())["emotional_state"] == {"love": None}
-    append_growth_event(
-        tmp_path / "g.jsonl",
-        GrowthLogEvent(
-            timestamp=NOW, type="emotion_added", name="n", description="d", decay_half_life_days=float("nan"),
-            reason="r", evidence_memory_ids=(), score=0.5, relational_context=None,
-        ),
+    (row,) = read_behavioral_log(tmp_path / "b.jsonl")
+    assert row["emotional_state"] == {"love": None}
+
+
+def test_mut_growth_event_with_nan_is_read_back(tmp_path: Path) -> None:
+    """read_growth_log float()s the score (null would skip the row); a non-finite half-life is stored as the
+    reader's own "no decay" null."""
+    from brain.growth.log import GrowthLogEvent, append_growth_event, read_growth_log
+
+    ev = GrowthLogEvent(
+        timestamp=NOW, type="emotion_added", name="n", description="d", decay_half_life_days=float("nan"),
+        reason="r", evidence_memory_ids=("m",), score=float("nan"), relational_context=None,
     )
-    assert json.loads((tmp_path / "g.jsonl").read_text())["decay_half_life_days"] is None
-    append_event(tmp_path, {"event": "arc_opened", "lived_age_hours": float("inf")})
-    assert json.loads((tmp_path / LOG_FILENAME).read_text())["lived_age_hours"] is None
+    append_growth_event(tmp_path / "g.jsonl", ev)
+    (back,) = read_growth_log(tmp_path / "g.jsonl")
+    assert back.score == 0.0 and back.decay_half_life_days is None and back.name == "n"
+
+
+def test_mut_narrative_event_with_nan_is_replayed(tmp_path: Path) -> None:
+    """_reconstruct_arcs_from_log float()s lived_age_hours; one null used to abort the whole replay."""
+    from brain.narrative_memory.state import LOG_FILENAME, append_event
+    from brain.narrative_memory.tool import _reconstruct_arcs_from_log
+
+    append_event(tmp_path, {"event": "arc_opened", "arc_id": "a1", "title": "t", "ts_iso": NOW.isoformat(),
+                            "lived_age_hours": float("nan")})
+    append_event(tmp_path, {"event": "arc_closed", "arc_id": "a1", "ts_iso": NOW.isoformat(),
+                            "lived_age_hours": float("inf")})
+    arcs = _reconstruct_arcs_from_log(tmp_path / LOG_FILENAME)
+    assert [a.id for a in arcs] == ["a1"]
+
+
+def test_mut_graveyard_entry_with_nan_weight_is_restorable(tmp_path: Path) -> None:
+    """The restore plan float()s every hebbian neighbour weight; one null used to abort the whole plan."""
+    from brain.forgetting.graveyard import append
+    from brain.forgetting.salience import SalienceInputs
+    from brain.recovery.engine import _build_restore_plan
+
+    mem = _mem_nan()
+    inputs = SalienceInputs(emotion=0.1, hebbian=0.1, recall=0.1, soul=0.1, freshness=0.1)
+    append(tmp_path, memory=mem, salience_at_drop=float("nan"), inputs=inputs, lived_age_hours=1.0,
+           reason="fade", hebbian_neighbors=[("n1", float("nan")), ("n2", 0.5)])
+    plan = _build_restore_plan(tmp_path, source_dir=None)
+    assert plan.graveyard_neighbors[mem.id] == [("n1", 0.0), ("n2", 0.5)]
+
+
+def test_mut_float_bearing_logs_without_a_float_reader_write_nan_as_null(tmp_path: Path) -> None:
+    """arc_storage's removed-arc log is read for name and removed_at only; the other writers below carry floats
+    into files nothing parses numerically. A NaN reaches disk as null, not as an exception."""
+    from brain.engines.reflex import ReflexArc
+    from brain.growth.arc_storage import append_removed_arc, read_removed_arcs
+    from brain.health.soul_candidate_repair import _save_candidates
+    from brain.tunables_migration import migrate_idle_keys
+
+    arc = ReflexArc(name="a", description="d", trigger={"love": float("nan")}, days_since_human_min=1.0,
+                    cooldown_hours=1.0, action="x", output_memory_type="reflex", prompt_template="p")
+    append_removed_arc(tmp_path, arc=arc, removed_at=NOW, removed_by="user_edit", reasoning=None)
+    (row,) = read_removed_arcs(tmp_path)
+    assert row["trigger_snapshot"] == {"love": None} and row["name"] == "a"
+
+    _save_candidates(tmp_path / "c.jsonl", [{"memory_id": "m", "importance": float("nan")}])
+    assert json.loads((tmp_path / "c.jsonl").read_text())["importance"] is None
+
+    (tmp_path / "tunables.json").write_text(
+        '{"defaults": {}, "overrides": {"throttle.background_min_idle_seconds": 120.0, "x.y": NaN}}'
+    )
+    migrate_idle_keys(tmp_path)
+    overrides = json.loads((tmp_path / "tunables.json").read_text())["overrides"]
+    assert overrides["x.y"] is None and overrides["chat.idle_lull_seconds"] == 120.0
 
 
 def test_mut_audit_and_queue_rewrites_survive_a_legacy_nan_row(tmp_path: Path) -> None:
@@ -365,16 +426,28 @@ def test_mut_soul_candidate_rewrites_write_nan_as_null(tmp_path: Path) -> None:
     assert json.loads((tmp_path / "soul_candidates.jsonl").read_text())["importance"] is None
 
 
-def test_mut_maker_charge_with_a_legacy_nan_is_a_cold_start_and_saves_again(tmp_path: Path) -> None:
-    from brain.maker.charge import load_charge, save_charge
+def test_mut_maker_charge_with_a_legacy_nan_clamps_only_the_charge(tmp_path: Path, caplog) -> None:
+    import logging
 
-    (tmp_path / "maker_charge.json").write_text('{"charge": NaN}') if (tmp_path / "x").exists() else None
     import brain.maker.charge as mc
 
     p = mc._charge_path(tmp_path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text('{"charge": NaN, "prior_soul_count": 2}')
-    state = load_charge(tmp_path)
-    assert state.charge == 0.0  # non-finite is corrupt: cold default
-    save_charge(tmp_path, state)  # and the next save does not raise
-    assert json.loads(p.read_text())["charge"] == 0.0
+    p.write_text('{"charge": NaN, "last_tick_ts": "t1", "last_fire_ts": "f1", "prior_soul_count": 2}')
+    with caplog.at_level(logging.WARNING, logger="brain.maker.charge"):
+        state = mc.load_charge(tmp_path)
+    assert (state.charge, state.last_tick_ts, state.last_fire_ts, state.prior_soul_count) == (0.0, "t1", "f1", 2)
+    assert any("not finite" in r.getMessage() for r in caplog.records)  # one line of evidence
+    mc.save_charge(tmp_path, state)  # and the next strict save does not raise
+    assert json.loads(p.read_text())["last_fire_ts"] == "f1"
+
+
+def test_mut_stream_raw_closes_quietly_when_the_caller_closed_the_file_first(tmp_path: Path) -> None:
+    """An abandoned iterator can be closed after the caller's `with` closed the file: nothing is left to detach."""
+    p = tmp_path / "s.jsonl"
+    p.write_text('{"a": 1}\n{"a": 2}\n')
+    fh = open(p, "rb")  # noqa: SIM115
+    gen = jio._stream_raw(fh, p, False, False)
+    assert next(gen)[1] == {"a": 1}
+    fh.close()
+    gen.close()  # raised ValueError ("I/O operation on closed file") with an unconditional detach

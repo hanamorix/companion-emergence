@@ -806,7 +806,19 @@ def test_cr8_heal_matches_the_frozen_legacy_output(tmp_path: Path, fixture: str)
     new_dir, r = _run_new(tmp_path, files, validator)
     gold = GOLDEN["heal"][fixture]
     assert r.data == gold["data"]
-    assert _anomaly_fields(r.anomaly) == gold["anomaly"]
+    expected = gold["anomaly"]
+    if expected is not None and expected["kind"] == "json_parse_error":
+        # The detail is the stdlib decoder's message, whose wording differs between Python versions. The gold's
+        # detail was exactly that message for the primary file, so compare against the same message produced live
+        # on this interpreter; every other field stays frozen from the legacy output.
+        try:
+            json.loads(files["s.json"].decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            live_detail = str(exc)
+        else:  # pragma: no cover - a fixture with a parse_error gold must not parse
+            raise AssertionError("the fixture's primary file parses")
+        expected = {**expected, "detail": live_detail}
+    assert _anomaly_fields(r.anomaly) == expected
     new_files = _snapshot(new_dir)
     assert set(new_files) == set(gold["files"])
     for name, text in gold["files"].items():
