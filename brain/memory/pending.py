@@ -80,12 +80,17 @@ class PendingQueue:
     def enqueue(self, mem: Memory, *, source: str) -> None:
         """Append a candidate (the Memory serialised + provenance) under lock."""
         # A NaN score or emotion is clamped to 0.0 here, not written as null: the gate parses the row with
-        # Memory.from_dict, whose float() rejects null (a clamped candidate is promoted, as before).
-        entry = clamp_nonfinite({
-            **mem.to_dict(),
-            "_source": source,
-            "_enqueued_at": datetime.now(UTC).isoformat(),
-        })
+        # Memory.from_dict, whose float() rejects null. Behaviour delta of the migration: before it, a NaN
+        # candidate was queued as the NaN token and then crashed the gate at store.create (SQLite NOT NULL on
+        # score) after the queue had been drained; now it is promoted with 0.0 values and one warning is logged.
+        entry = clamp_nonfinite(
+            {
+                **mem.to_dict(),
+                "_source": source,
+                "_enqueued_at": datetime.now(UTC).isoformat(),
+            },
+            where=f"pending candidate {mem.id}",
+        )
         append_jsonl(self.path, entry)
 
     def read_recent(self, memory_type: str, *, limit: int) -> list[Memory]:

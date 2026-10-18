@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import builtins
 import json
+import logging
 import math
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -289,19 +290,35 @@ def test_mut_archive_and_log_appenders_write_a_nan_as_null_instead_of_raising(tm
     assert json.loads((tmp_path / "hb.jsonl").read_text())["elapsed_seconds"] is None
 
 
-def test_mut_pending_enqueue_of_a_nan_memory_is_promoted_by_the_reader(tmp_path: Path) -> None:
-    """The gate parses the drained row with Memory.from_dict, whose float() rejects null: the NaN is clamped at the
-    producer (0.0), so the candidate that was promoted before the migration still is."""
+def test_mut_pending_enqueue_of_a_nan_memory_is_promoted_by_the_gate(tmp_path: Path, caplog) -> None:
+    """Behaviour delta of the migration, recorded: before it, a NaN candidate was queued as the NaN token, read
+    back by Memory.from_dict, and then crashed the gate at store.create (SQLite NOT NULL on score) after the queue
+    had been drained. Now the NaN is clamped to 0.0 at the producer (with one warning) and the candidate is
+    promoted. The gate's own parse (Memory.from_dict) rejects null, so null would drop it instead."""
+    import logging
+
+    from brain.engines.consolidation import run_consolidation
     from brain.memory.pending import PendingQueue
-    from brain.memory.store import Memory
+    from brain.memory.store import Memory, MemoryStore
 
     q = PendingQueue(tmp_path)
     mem = _mem_nan()
     mem.score = float("nan")
-    q.enqueue(mem, source="t")
-    (row,) = q.drain()
-    back = Memory.from_dict(row)  # raised TypeError when the row carried null
-    assert back.emotions["love"] == 0.0 and back.score == 0.0 and back.content == "x"
+    with caplog.at_level(logging.WARNING, logger="brain.utils.finite"):
+        q.enqueue(mem, source="t")
+    msgs = [r.getMessage() for r in caplog.records if r.name == "brain.utils.finite"]
+    assert len(msgs) == 1 and "pending candidate" in msgs[0] and "emotions.love=nan" in msgs[0] and "score=nan" in msgs[0]
+    back = Memory.from_dict(json.loads(q.path.read_text().splitlines()[0]))  # raised TypeError with null
+    assert back.emotions["love"] == 0.0 and back.score == 0.0
+
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        result = run_consolidation(store, persona_dir=tmp_path)
+        assert result.promoted == 1  # reached store.create without IntegrityError
+        stored = store.get(mem.id, bump=False)
+        assert stored.emotions == {"love": 0.0} and stored.score == 0.0 and stored.content == "x"
+    finally:
+        store.close()
 
 
 def test_mut_behavioral_appender_writes_nan_as_null(tmp_path: Path) -> None:
@@ -315,7 +332,7 @@ def test_mut_behavioral_appender_writes_nan_as_null(tmp_path: Path) -> None:
     assert row["emotional_state"] == {"love": None}
 
 
-def test_mut_growth_event_with_nan_is_read_back(tmp_path: Path) -> None:
+def test_mut_growth_event_with_nan_is_read_back(tmp_path: Path, caplog) -> None:
     """read_growth_log float()s the score (null would skip the row); a non-finite half-life is stored as the
     reader's own "no decay" null."""
     from brain.growth.log import GrowthLogEvent, append_growth_event, read_growth_log
@@ -324,25 +341,31 @@ def test_mut_growth_event_with_nan_is_read_back(tmp_path: Path) -> None:
         timestamp=NOW, type="emotion_added", name="n", description="d", decay_half_life_days=float("nan"),
         reason="r", evidence_memory_ids=("m",), score=float("nan"), relational_context=None,
     )
-    append_growth_event(tmp_path / "g.jsonl", ev)
+    with caplog.at_level(logging.WARNING, logger="brain.utils.finite"):
+        append_growth_event(tmp_path / "g.jsonl", ev)
+    msgs = [r.getMessage() for r in caplog.records if r.name == "brain.utils.finite"]
+    assert len(msgs) == 2 and any("score" in m for m in msgs) and any("decay_half_life_days" in m for m in msgs)
     (back,) = read_growth_log(tmp_path / "g.jsonl")
     assert back.score == 0.0 and back.decay_half_life_days is None and back.name == "n"
 
 
-def test_mut_narrative_event_with_nan_is_replayed(tmp_path: Path) -> None:
+def test_mut_narrative_event_with_nan_is_replayed(tmp_path: Path, caplog) -> None:
     """_reconstruct_arcs_from_log float()s lived_age_hours; one null used to abort the whole replay."""
     from brain.narrative_memory.state import LOG_FILENAME, append_event
     from brain.narrative_memory.tool import _reconstruct_arcs_from_log
 
-    append_event(tmp_path, {"event": "arc_opened", "arc_id": "a1", "title": "t", "ts_iso": NOW.isoformat(),
-                            "lived_age_hours": float("nan")})
+    with caplog.at_level(logging.WARNING, logger="brain.utils.finite"):
+        append_event(tmp_path, {"event": "arc_opened", "arc_id": "a1", "title": "t", "ts_iso": NOW.isoformat(),
+                                "lived_age_hours": float("nan")})
+    assert any("arc log event arc_opened" in r.getMessage() and "lived_age_hours=nan" in r.getMessage()
+               for r in caplog.records)
     append_event(tmp_path, {"event": "arc_closed", "arc_id": "a1", "ts_iso": NOW.isoformat(),
                             "lived_age_hours": float("inf")})
     arcs = _reconstruct_arcs_from_log(tmp_path / LOG_FILENAME)
     assert [a.id for a in arcs] == ["a1"]
 
 
-def test_mut_graveyard_entry_with_nan_weight_is_restorable(tmp_path: Path) -> None:
+def test_mut_graveyard_entry_with_nan_weight_is_restorable(tmp_path: Path, caplog) -> None:
     """The restore plan float()s every hebbian neighbour weight; one null used to abort the whole plan."""
     from brain.forgetting.graveyard import append
     from brain.forgetting.salience import SalienceInputs
@@ -350,8 +373,11 @@ def test_mut_graveyard_entry_with_nan_weight_is_restorable(tmp_path: Path) -> No
 
     mem = _mem_nan()
     inputs = SalienceInputs(emotion=0.1, hebbian=0.1, recall=0.1, soul=0.1, freshness=0.1)
-    append(tmp_path, memory=mem, salience_at_drop=float("nan"), inputs=inputs, lived_age_hours=1.0,
-           reason="fade", hebbian_neighbors=[("n1", float("nan")), ("n2", 0.5)])
+    with caplog.at_level(logging.WARNING, logger="brain.utils.finite"):
+        append(tmp_path, memory=mem, salience_at_drop=float("nan"), inputs=inputs, lived_age_hours=1.0,
+               reason="fade", hebbian_neighbors=[("n1", float("nan")), ("n2", 0.5)])
+    (msg,) = [r.getMessage() for r in caplog.records if r.name == "brain.utils.finite"]
+    assert "graveyard entry" in msg and "hebbian_neighbors[0][1]=nan" in msg and "salience_at_drop=nan" in msg
     plan = _build_restore_plan(tmp_path, source_dir=None)
     assert plan.graveyard_neighbors[mem.id] == [("n1", 0.0), ("n2", 0.5)]
 

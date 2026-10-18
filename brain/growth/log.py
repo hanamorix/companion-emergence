@@ -94,10 +94,10 @@ def _event_to_dict(event: GrowthLogEvent) -> dict:
         "description": event.description,
         # The reader float()s the score and accepts null only for the half-life ("no decay"), so a non-finite
         # half-life is stored as null and a non-finite score as 0.0.
-        "decay_half_life_days": clamp_nonfinite(event.decay_half_life_days, None),
+        "decay_half_life_days": clamp_nonfinite(event.decay_half_life_days, None, where=f"growth event {event.name} decay_half_life_days"),
         "reason": event.reason,
         "evidence_memory_ids": list(event.evidence_memory_ids),
-        "score": clamp_nonfinite(event.score),
+        "score": clamp_nonfinite(event.score, where=f"growth event {event.name} score"),
         "relational_context": event.relational_context,
     }
 

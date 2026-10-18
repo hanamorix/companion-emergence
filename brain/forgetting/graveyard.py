@@ -67,7 +67,7 @@ def append(
         "hebbian_neighbors": [[nid, float(w)] for nid, w in (hebbian_neighbors or [])],
     }
     path = persona_dir / GRAVEYARD_FILENAME
-    append_jsonl(path, clamp_nonfinite(entry), fsync=True)  # recovery float()s the neighbour weights
+    append_jsonl(path, clamp_nonfinite(entry, where=f"graveyard entry {memory.id}"), fsync=True)  # recovery float()s the neighbour weights
 
 
 #: Ordinary query words shorter than this are not searched (today's minimum,
