@@ -165,7 +165,7 @@ def iter_initiate_audit_full(persona_dir: Path) -> Iterator[AuditRow]:
 
     Mirrors brain.soul.audit.iter_audit_full. Walks
     initiate_audit.YYYY.jsonl.gz archives oldest year -> newest year, then
-    the active file. Streaming via iter_jsonl_streaming so memory stays
+    the active file. Streaming via iter_jsonl so memory stays
     bounded.
     """
     if persona_dir.exists():

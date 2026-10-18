@@ -543,3 +543,14 @@ def test_group_c_initiate_schemas_to_dict_matches_the_line_codec_including_condi
         assert type(row).from_dict(row.to_dict()) == row == type(row).from_jsonl(row.to_jsonl())
     with pytest.raises(KeyError):
         AuditRow.from_dict({"audit_id": "a"})
+
+
+def test_group_c_recall_prune_private_returns_the_removed_count(tmp_path: Path) -> None:
+    from brain.memory import recall_diagnostics as rd
+
+    path = tmp_path / "recall.jsonl"
+    path.write_bytes(
+        (json.dumps({"ts": (NOW - timedelta(days=90)).isoformat()}) + "\n" + json.dumps({"ts": NOW.isoformat()}) + "\n").encode()
+    )
+    assert rd._prune(path, window_days=30, now=NOW) == 1
+    assert len(path.read_text().splitlines()) == 1

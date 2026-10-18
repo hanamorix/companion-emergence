@@ -234,7 +234,7 @@ class ReflexLog:
 
     Stored as a single JSON object ``{"version": 1, "fires": [...]}`` —
     atomic-rewrite, not append-only JSONL.  Corruption recovery delegates
-    to ``attempt_heal`` + ``.bak`` rotation; ``save_with_backup`` keeps up
+    to ``read_json_result`` (HEAL) + ``.bak`` rotation; ``write_json`` keeps up
     to three rolling backups for the adaptive-treatment layer.
     """
 

@@ -333,3 +333,19 @@ def test_group_b_migrator_cli_vocab_and_interests_use_the_module_writer() -> Non
     tree = ast.parse(src)
     names = {n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
     assert "write_json" in names
+
+
+def test_group_b_db_health_event_log_appends_ascii_lines_and_never_raises(tmp_path: Path, monkeypatch) -> None:
+    from brain.memory.db_health import _log_health_event
+    from brain.paths import get_log_dir
+
+    monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
+    _log_health_event("p", "ok", None)
+    _log_health_event("p", "could_not_check", "café")
+    log = get_log_dir() / "db-health-p.jsonl"
+    rows = [json.loads(line) for line in log.read_text().splitlines()]
+    assert [r["result"] for r in rows] == ["ok", "could_not_check"] and log.read_bytes().isascii()
+    blocker = tmp_path / "blocked"
+    blocker.write_text("x")
+    monkeypatch.setenv("KINDLED_HOME", str(blocker))  # the log dir cannot be created: a warning, not an error
+    _log_health_event("p", "ok", None)

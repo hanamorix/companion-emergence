@@ -277,7 +277,7 @@ def seed_last_message_from_active_conversations(
     - **A malformed/unparseable saved ``ts``** (missing field, corrupt
       value) — INCLUDING a syntactically corrupt/truncated trailing JSONL
       line (e.g. a crash/OOM mid-append; deliberately NOT silently skipped
-      the way ``read_jsonl_skipping_corrupt`` skips a corrupt line elsewhere
+      the way ``read_jsonl`` skips a corrupt line elsewhere
       — see the strict tail read below, because silently falling back to an
       OLDER good line here would understate how recent the chat really was,
       the wrong direction for a fail-closed idle gate): treated as an

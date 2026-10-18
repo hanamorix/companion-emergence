@@ -17,10 +17,18 @@ import pytest
 
 import brain.health.attempt_heal as heal
 from brain.health.attempt_heal import (
-    attempt_heal,
     save_with_backup,
     save_with_backup_text,
 )
+from brain.health.json_io import Recovery, read_json_result
+
+
+def attempt_heal(path, default_factory, schema_validator=None):
+    """The heal these tests were written against, now served by json_io (the legacy function is gone)."""
+    res = read_json_result(
+        path, default=default_factory, recover=Recovery.HEAL, validate=schema_validator
+    )
+    return res.data, res.anomaly
 
 
 def _default() -> dict:

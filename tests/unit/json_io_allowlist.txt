@@ -23,8 +23,7 @@ brain/felt_time/state.py::read::1   # held: felt-time audit first (Roy 2026-10-1
 brain/felt_time/weather_shift.py::write::1   # held: felt-time audit first (Roy 2026-10-14)
 brain/growth/crystallizers/creative_dna.py::not-file-io::4   # not-file: model-reply
 brain/growth/crystallizers/reflex.py::not-file-io::2   # not-file: model-reply
-brain/health/attempt_heal.py::read::1   # legacy helper (deleted at migration)
-brain/health/attempt_heal.py::write::2   # legacy helper (deleted at migration)
+brain/health/attempt_heal.py::write::1   # held: save_with_backup is kept byte-identical for the held felt-time files
 brain/health/jsonl_reader.py::not-file-io::1   # legacy helper (deleted at migration)
 brain/health/vocab_repair.py::not-file-io::1   # not-file: model-reply
 brain/ingest/emotion_backfill.py::not-file-io::2   # not-file: sqlite-or-wire

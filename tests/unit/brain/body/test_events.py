@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from brain.body.events import record_climax_event
-from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+from brain.health.json_io import read_jsonl
 from brain.memory.store import Memory, MemoryStore
 
 
@@ -96,7 +96,7 @@ def test_emits_behavioral_log_entry(store, persona_dir):
     )
     log_path = persona_dir / "behavioral_log.jsonl"
     assert log_path.exists()
-    entries = list(read_jsonl_skipping_corrupt(log_path))
+    entries = list(read_jsonl(log_path))
     assert len(entries) == 1
     e = entries[0]
     assert e["kind"] == "climax_event"

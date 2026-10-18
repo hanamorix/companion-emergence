@@ -3,7 +3,7 @@
 Spec §4, §9 (R-state + R-cadence Task 3).
 
 Mirrors brain/felt_time/state.py load-or-recover pattern and uses
-brain/health/attempt_heal.py::save_with_backup for atomic persistence.
+brain/health/json_io.py::write_json for atomic persistence.
 
 State file: self_model_state.json in persona_dir.
 

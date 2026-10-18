@@ -94,7 +94,7 @@ def read_behavioral_log(
 ) -> list[dict[str, Any]]:
     """Read all entries (or those at-or-after `since`) oldest-first.
 
-    Corrupt lines are skipped silently via read_jsonl_skipping_corrupt.
+    Corrupt lines are skipped silently via read_jsonl.
     Missing file returns empty list.
     """
     entries = read_jsonl(path, recover=Recovery.RAISE)

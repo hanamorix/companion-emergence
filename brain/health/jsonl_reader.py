@@ -13,10 +13,8 @@ raw text plus the list of split lines).
 
 from __future__ import annotations
 
-import gzip
 import json
 import logging
-import os
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -119,87 +117,4 @@ def iter_jsonl_skipping_corrupt(path: Path) -> Iterator[dict]:
     if not path.exists():
         return
     with open(path, encoding="utf-8", errors="surrogateescape") as fh:
-        yield from _parse_lines(fh, path)
-
-
-def read_jsonl_skipping_corrupt(path: Path) -> list[dict]:
-    """Return parsed lines from ``path`` as a list, skipping malformed ones.
-
-    Thin list-materialising wrapper around
-    :func:`iter_jsonl_skipping_corrupt` so existing callers that want
-    all lines at once keep their shape. The streaming path inside
-    still avoids the previous memory spike.
-    """
-    return list(iter_jsonl_skipping_corrupt(path))
-
-
-def read_last_n_jsonl_lines(path: Path, n: int, *, chunk_size: int = 8192) -> list[str]:
-    """Read the last n raw lines of a JSONL file via a backward seek.
-
-    Bounded I/O: cost scales with n and average line length, not with total
-    file size (#225 — the ignore-streak bounded-window redesign). Reads
-    backward in byte chunks from EOF, accumulating raw BYTES (never decoding
-    per-chunk, so a multi-byte UTF-8 character split across a chunk boundary
-    is never corrupted — only the file's own byte sequence, concatenated
-    back into original order, is ever decoded, and only once, at the end).
-    Stops when either (a) the accumulated buffer contains more than n
-    newlines, or (b) BOF is reached — these are tracked as DISTINCT
-    conditions, not conflated: only case (a) means the read started
-    mid-line (so the leading fragment is a genuine partial line and must be
-    dropped); case (b) means byte 0 of the file was reached, so the first
-    accumulated line is always complete and must be KEPT. Returns raw JSONL
-    text lines (not yet parsed), in original file order, at most n of them
-    (or fewer, if the file itself has fewer than n lines). Caller parses
-    each with the same corrupt-line-skip discipline as
-    ``read_jsonl_skipping_corrupt``.
-
-    Returns ``[]`` immediately for a nonexistent path or ``n <= 0``,
-    matching every other reader in this module's missing-file convention.
-    """
-    if n <= 0:
-        return []
-    if not path.exists():
-        return []
-    with path.open("rb") as f:
-        f.seek(0, os.SEEK_END)
-        remaining = f.tell()
-        block = b""
-        reached_bof = False
-        while block.count(b"\n") <= n:
-            if remaining <= 0:
-                reached_bof = True
-                break
-            read_size = min(chunk_size, remaining)
-            remaining -= read_size
-            f.seek(remaining)
-            block = f.read(read_size) + block
-    # Decode ONCE, on the fully-assembled byte buffer — never per chunk.
-    # errors="replace" (matching brain/bridge/daemon.py:cmd_tail_log's own
-    # convention) so a mangled leading fragment (dropped below when not at
-    # BOF) can't raise and abort an otherwise-good read.
-    text = block.decode("utf-8", errors="replace")
-    lines = text.split("\n")
-    if lines and lines[-1] == "":
-        lines.pop()  # trailing "" from a final trailing newline
-    if not reached_bof and lines:
-        lines.pop(0)  # genuine partial leading fragment — discard
-    return lines[-n:] if len(lines) > n else lines
-
-
-def iter_jsonl_streaming(path: Path) -> Iterator[dict]:
-    """Stream JSONL entries from ``path``, transparently handling ``.gz``.
-
-    Same per-line resilience as :func:`iter_jsonl_skipping_corrupt`: a
-    malformed or non-dict line emits a warning and is skipped, not
-    aborted on. Whether the file is gzipped is detected by the
-    ``.gz`` suffix.
-
-    Returns immediately if the path doesn't exist (no error). Use this
-    when a caller needs to fan out across active + rotated archives.
-    """
-    if not path.exists():
-        return
-    is_gz = path.suffix == ".gz"
-    open_fn = gzip.open if is_gz else open
-    with open_fn(path, "rt", encoding="utf-8", errors="surrogateescape") as fh:
         yield from _parse_lines(fh, path)

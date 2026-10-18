@@ -42,7 +42,7 @@ _OPTIONAL_TEXT_FILES: tuple[str, ...] = ("voicecraft.md",)
 def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
     """Check every persona file. Heal what's healable; report anomalies.
 
-    Iterates atomic-rewrite files via attempt_heal (captures corruption +
+    Iterates atomic-rewrite files via read_json_result (HEAL) (captures corruption +
     repairs in one shot) then opens each SQLite store so the constructor's
     PRAGMA integrity_check runs. Returns an empty list when everything is
     healthy.

@@ -483,19 +483,6 @@ def test_cr6_a_validator_that_returns_passes_the_data_through(tmp_path: Path) ->
     assert seen == [{"a": 1}]
 
 
-def test_cr6_baseline_the_legacy_heal_lets_a_keyerror_validator_escape(tmp_path: Path) -> None:
-    from brain.health.attempt_heal import attempt_heal
-
-    p = tmp_path / "state.json"
-    p.write_text('{"a": 1}')
-
-    def validate(_data):
-        raise KeyError("x")
-
-    with pytest.raises(KeyError):
-        attempt_heal(p, dict, schema_validator=validate)
-
-
 def test_cr7_default_policy_never_modifies_the_file(tmp_path: Path) -> None:
     p = tmp_path / "state.json"
     p.write_bytes(b"garbage")
@@ -721,7 +708,7 @@ class _OpenSpy:
         monkeypatch.setattr(gz, "open", check("gzip.open", gz.open))
 
 
-def test_cr11_baseline_the_spy_flags_three_legacy_writers_with_no_explicit_encoding(
+def test_cr11_baseline_the_spy_flags_the_held_writer_and_the_migrated_ones_are_clean(
     tmp_path: Path, monkeypatch
 ) -> None:
     from datetime import UTC, datetime
@@ -732,17 +719,15 @@ def test_cr11_baseline_the_spy_flags_three_legacy_writers_with_no_explicit_encod
 
     spy = _OpenSpy(monkeypatch)
     append_shift_log(tmp_path, ts=datetime.now(UTC), channel="c", label="l")
-    assert spy.violations, "weather_shift.append_shift_log opens with the locale codec"
+    assert spy.violations, "weather_shift.append_shift_log (held, felt-time audit) still opens with the locale codec"
     spy.violations.clear()
     _log_attunement_error(tmp_path, "t1", ValueError("x"))
-    assert spy.violations
-    spy.violations.clear()
     _log_articulate_error(tmp_path, "kind", ValueError("x"))
-    assert spy.violations
+    assert not spy.violations, "the migrated writers go through json_io (explicit UTF-8, binary append)"
 
 
 # --------------------------------------------------------------------------------------------------------------
-# HEAL fidelity against the untouched legacy attempt_heal (CR8)
+# HEAL fidelity against the frozen output of the legacy attempt_heal (CR8)
 # --------------------------------------------------------------------------------------------------------------
 
 import re  # noqa: E402
@@ -796,46 +781,48 @@ HEAL_FIXTURES = {
 }
 
 
-def _run_pair(tmp_path: Path, files: dict, validator):
-    from brain.health.attempt_heal import attempt_heal
+GOLDEN = json.loads(
+    (Path(__file__).parent / "golden" / "legacy_heal_and_jsonl.json").read_text(encoding="utf-8")
+)  # frozen output of the legacy attempt_heal / JSONL readers, captured before they were deleted (PC3)
 
-    legacy_dir, new_dir = tmp_path / "legacy", tmp_path / "new"
-    for d in (legacy_dir, new_dir):
-        d.mkdir()
-        for name, content in files.items():
-            (d / name).write_bytes(content)
-    default = lambda: {"default": True}  # noqa: E731
-    l_data, l_anomaly = attempt_heal(legacy_dir / "s.json", default, schema_validator=validator)
+
+def _run_new(tmp_path: Path, files: dict, validator):
+    new_dir = tmp_path / "new"
+    new_dir.mkdir()
+    for name, content in files.items():
+        (new_dir / name).write_bytes(content)
     r = jio.read_json_result(
-        new_dir / "s.json", default=default, recover=jio.Recovery.HEAL, validate=validator
+        new_dir / "s.json",
+        default=lambda: {"default": True},
+        recover=jio.Recovery.HEAL,
+        validate=validator,
     )
-    return legacy_dir, new_dir, (l_data, l_anomaly), r
+    return new_dir, r
 
 
 @pytest.mark.parametrize("fixture", sorted(HEAL_FIXTURES))
-def test_cr8_heal_matches_the_untouched_legacy_function(tmp_path: Path, fixture: str) -> None:
+def test_cr8_heal_matches_the_frozen_legacy_output(tmp_path: Path, fixture: str) -> None:
     files, validator = HEAL_FIXTURES[fixture]
-    legacy_dir, new_dir, (l_data, l_anomaly), r = _run_pair(tmp_path, files, validator)
-    assert r.data == l_data
-    assert _anomaly_fields(r.anomaly) == _anomaly_fields(l_anomaly)
-    legacy_files, new_files = _snapshot(legacy_dir), _snapshot(new_dir)
-    assert set(new_files) == set(legacy_files)
-    for name in legacy_files:
-        # The same JSON, byte for byte, except that the legacy writer uses text mode (CRLF on Windows) and the module
+    new_dir, r = _run_new(tmp_path, files, validator)
+    gold = GOLDEN["heal"][fixture]
+    assert r.data == gold["data"]
+    assert _anomaly_fields(r.anomaly) == gold["anomaly"]
+    new_files = _snapshot(new_dir)
+    assert set(new_files) == set(gold["files"])
+    for name, text in gold["files"].items():
+        # The same JSON, byte for byte, except that the legacy writer used text mode (CRLF on Windows) and the module
         # always writes LF (plan P8, CW1): compare after normalising CRLF, and assert the module wrote no CR anywhere.
-        assert _norm_crlf(new_files[name]) == _norm_crlf(legacy_files[name]), name
+        assert _norm_crlf(new_files[name]) == _norm_crlf(text.encode("latin-1")), name
         assert b"\r" not in new_files[name], name
 
 
 def test_cr8_delta_one_invalid_utf8_is_labelled_a_parse_error_not_a_schema_mismatch(
     tmp_path: Path,
 ) -> None:
-    legacy_dir, new_dir, (_d, l_anomaly), r = _run_pair(
-        tmp_path, {"s.json": b'{"a": "\xff"}'}, None
-    )
-    assert l_anomaly.kind == "schema_mismatch"  # the legacy mislabel
-    assert r.anomaly.kind == "json_parse_error"
-    assert r.anomaly.action == l_anomaly.action == "reset_to_default"
+    _new_dir, r = _run_new(tmp_path, {"s.json": b'{"a": "\xff"}'}, None)
+    assert GOLDEN["legacy_deltas"]["invalid_utf8_kind"] == "schema_mismatch"  # the legacy mislabel, frozen
+    assert r.anomaly.kind == "json_parse_error"  # the intended module result
+    assert r.anomaly.action == "reset_to_default"
 
 
 def test_cr8_anomaly_detail_is_capped_at_500_characters(tmp_path: Path) -> None:
@@ -853,10 +840,9 @@ def test_cr8_anomaly_detail_is_capped_at_500_characters(tmp_path: Path) -> None:
 def test_cr8_delta_two_the_reset_to_default_is_written_atomically(
     tmp_path: Path, monkeypatch
 ) -> None:
-    for which in ("legacy", "new"):
-        d = tmp_path / which
-        d.mkdir()
-        (d / "s.json").write_bytes(b"{nope")
+    d = tmp_path / "new"
+    d.mkdir()
+    (d / "s.json").write_bytes(b"{nope")
     writes: list[str] = []
     replaces: list[tuple[str, str]] = []
     real_write_text, real_replace = Path.write_text, os.replace
@@ -869,31 +855,20 @@ def test_cr8_delta_two_the_reset_to_default_is_written_atomically(
         replaces.append((Path(src).name, Path(dst).name))
         return real_replace(src, dst)
 
-    from brain.health.attempt_heal import attempt_heal
-
     monkeypatch.setattr(Path, "write_text", write_text)
     monkeypatch.setattr(os, "replace", replace)
-    attempt_heal(tmp_path / "legacy" / "s.json", dict)
-    assert writes == [
-        str(tmp_path / "legacy" / "s.json")
-    ]  # legacy: direct, non-atomic write at the live path
-    writes.clear()
-    replaces.clear()
-    jio.read_json(tmp_path / "new" / "s.json", default=dict, recover=jio.Recovery.HEAL)
-    assert writes == []
+    jio.read_json(d / "s.json", default=dict, recover=jio.Recovery.HEAL)
+    assert writes == []  # the legacy heal wrote the reset directly, non-atomically, at the live path
     assert any(dst == "s.json" and src.endswith(".new") for src, dst in replaces)
 
 
 def test_cr8_delta_three_the_quarantine_rename_retries_a_transient_permission_error(
     tmp_path: Path, monkeypatch
 ) -> None:
-    from brain.health.attempt_heal import attempt_heal
-
-    for which in ("legacy", "new"):
-        d = tmp_path / which
-        d.mkdir()
-        (d / "s.json").write_bytes(b"{nope")
-        (d / "s.json.bak1").write_bytes(b'{"b": 1}')
+    d = tmp_path / "new"
+    d.mkdir()
+    (d / "s.json").write_bytes(b"{nope")
+    (d / "s.json.bak1").write_bytes(b'{"b": 1}')
     real_replace = os.replace
     left = {"n": 0}
 
@@ -905,12 +880,8 @@ def test_cr8_delta_three_the_quarantine_rename_retries_a_transient_permission_er
 
     monkeypatch.setattr(os, "replace", flaky)
     monkeypatch.setattr(time, "sleep", lambda s: None)
-    with pytest.raises(PermissionError):
-        attempt_heal(tmp_path / "legacy" / "s.json", dict)
-    left["n"] = 0
-    assert jio.read_json(tmp_path / "new" / "s.json", default=dict, recover=jio.Recovery.HEAL) == {
-        "b": 1
-    }
+    # (the legacy heal let this PermissionError escape; the module retries it)
+    assert jio.read_json(d / "s.json", default=dict, recover=jio.Recovery.HEAL) == {"b": 1}
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -1950,13 +1921,15 @@ _DIFFERENTIAL_INPUTS = [
 ]
 
 
-@pytest.mark.parametrize("data", _DIFFERENTIAL_INPUTS)
-def test_cj1_matches_the_legacy_reader_on_the_same_input(tmp_path: Path, data: bytes) -> None:
-    from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
-
+@pytest.mark.parametrize("index", range(len(_DIFFERENTIAL_INPUTS)))
+def test_cj1_matches_the_frozen_legacy_reader_output_on_the_same_input(
+    tmp_path: Path, index: int
+) -> None:
+    gold = GOLDEN["jsonl"][str(index)]
+    assert gold["input"].encode("latin-1") == _DIFFERENTIAL_INPUTS[index]
     p = tmp_path / "log.jsonl"
-    p.write_bytes(data)
-    assert jio.read_jsonl(p) == read_jsonl_skipping_corrupt(p)
+    p.write_bytes(_DIFFERENTIAL_INPUTS[index])
+    assert jio.read_jsonl(p) == gold["records"]
 
 
 def test_cj2_gz_files_are_read_by_suffix(tmp_path: Path) -> None:
@@ -2018,17 +1991,6 @@ def test_cj3_strict_tail_raises_on_an_invalid_utf8_last_line(tmp_path: Path) -> 
     assert jio.read_jsonl_tail(p, 2) == [{"a": 1}]  # non-strict skips it with a warning
 
 
-def test_cj3_baseline_the_legacy_tail_helper_turns_the_bad_byte_into_a_replacement_character(
-    tmp_path: Path,
-) -> None:
-    from brain.health.jsonl_reader import read_last_n_jsonl_lines
-
-    p = tmp_path / "log.jsonl"
-    p.write_bytes(b'{"a": 1}\n{"b": "caf\xff"}\n')
-    [line] = read_last_n_jsonl_lines(p, 1)
-    assert json.loads(line) == {"b": "caf�"}  # silently corrupted data, parsed as valid
-
-
 def test_cj3_strict_raises_on_a_torn_trailing_line_and_on_a_non_object(tmp_path: Path) -> None:
     p = tmp_path / "log.jsonl"
     p.write_bytes(b'{"a": 1}\n{"b":')
@@ -2040,12 +2002,10 @@ def test_cj3_strict_raises_on_a_torn_trailing_line_and_on_a_non_object(tmp_path:
 
 
 def test_cj4_trailing_blank_lines_do_not_count_toward_n(tmp_path: Path) -> None:
-    from brain.health.jsonl_reader import read_last_n_jsonl_lines
-
     p = tmp_path / "log.jsonl"
     p.write_bytes(b'{"a": 1}\n{"b": 2}\n{"c": 3}\n\n\n')
     assert jio.read_jsonl_tail(p, 2) == [{"b": 2}, {"c": 3}]
-    assert read_last_n_jsonl_lines(p, 2) == ["", ""]  # the legacy helper: baseline
+    assert GOLDEN["legacy_deltas"]["tail_trailing_blanks"] == ["", ""]  # the legacy helper counted the blanks
 
 
 def test_cj4_n_zero_and_a_missing_file_give_empty(tmp_path: Path) -> None:
@@ -2161,14 +2121,6 @@ def test_cj6_a_truncated_gz_yields_what_was_read_then_stops_with_evidence(
     with pytest.raises(jio.JsonFileError) as exc:
         jio.read_jsonl(cut, recover=jio.Recovery.RAISE)
     assert exc.value.kind == "io" and not isinstance(exc.value, EOFError)
-
-
-def test_cj6_baseline_the_shared_reader_raises_eoferror_on_the_same_file(tmp_path: Path) -> None:
-    from brain.health.jsonl_reader import iter_jsonl_streaming
-
-    cut = _truncated_gz(tmp_path)
-    with pytest.raises(EOFError):
-        list(iter_jsonl_streaming(cut))
 
 
 def test_cj6_other_recovery_policies_are_rejected_for_jsonl(tmp_path: Path) -> None:
@@ -2399,20 +2351,6 @@ def test_ca3_no_prefix_newline_when_the_file_is_missing_empty_or_already_ends_in
         p.write_bytes(before)
     jio.append_jsonl(p, {"c": 3})
     assert p.read_bytes() == (before or b"") + jio.encode_jsonl({"c": 3})
-
-
-def test_ca3_baseline_without_the_tail_check_the_new_record_fuses_and_is_lost(
-    tmp_path: Path,
-) -> None:
-    from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
-
-    p = tmp_path / "log.jsonl"
-    p.write_bytes(b'{"a": 1}\n{"b": ')
-    with open(p, "ab") as fh:  # what every locked and lock-free appender does today
-        fh.write(b'{"c": 3}\n')
-    assert read_jsonl_skipping_corrupt(p) == [
-        {"a": 1}
-    ]  # #434: the valid record is dropped with the torn one
 
 
 def test_ca4_a_legacy_appender_landing_between_the_check_and_the_write_cannot_cost_our_record(

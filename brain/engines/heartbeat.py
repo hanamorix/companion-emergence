@@ -260,7 +260,7 @@ class HeartbeatState:
         (`_parse_state_data`'s own try/except) turns into the WHOLE state
         being treated as corrupt (`load_with_anomaly` then returns `(None,
         None)` for this case — the outer JSON is structurally valid, so
-        `attempt_heal`'s own quarantine/`.bak` machinery never engages and no
+        the heal's own quarantine/`.bak` machinery never engages and no
         anomaly is logged; round-2 red-team confirmed this by repro). `state
         is None` then hits `run_tick`'s existing first-ever-tick branch,
         which reinitializes via `HeartbeatState.fresh()` — this class's

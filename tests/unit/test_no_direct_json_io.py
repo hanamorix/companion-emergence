@@ -650,16 +650,16 @@ def test_cs2_g_the_call_node_oracle_one_over_fails_and_at_the_ceiling_passes(
     tmp_path: Path,
 ) -> None:
     """A copy of a real file with one more json call than its combined ceiling fails; at the ceiling it passes."""
-    real = (REPO / "brain" / "self_model" / "state.py").read_text(encoding="utf-8")
-    observed_real = scan_source(real, "brain/self_model/state.py")
+    real = (REPO / "brain" / "felt_time" / "state.py").read_text(encoding="utf-8")  # held: still has a direct json call
+    observed_real = scan_source(real, "brain/felt_time/state.py")
     total = sum(v for k, v in observed_real.items() if k in ("read", "write", "not-file-io"))
     allow_text = "".join(
-        f"brain/self_model/state.py::{k}::{v}   # G3\n" for k, v in observed_real.items()
+        f"brain/felt_time/state.py::{k}::{v}   # G3\n" for k, v in observed_real.items()
     )
-    errors, _ = _compare(tmp_path, {"brain/self_model/state.py": real}, allow_text)
+    errors, _ = _compare(tmp_path, {"brain/felt_time/state.py": real}, allow_text)
     assert errors == [] and total >= 1
     bumped = real + "\n\ndef _extra(blob):\n    import json\n    return json.loads(blob)\n"
-    errors, _ = _compare(tmp_path, {"brain/self_model/state.py": bumped}, allow_text)
+    errors, _ = _compare(tmp_path, {"brain/felt_time/state.py": bumped}, allow_text)
     assert errors and "not-file-io" in errors[0]
 
 
@@ -707,6 +707,73 @@ def test_cs6_importing_json_io_first_pulls_in_nothing_from_the_bridge() -> None:
     )
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "[]"
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Phase-2 end state (criteria PC1, PC2 of 1.5-criteria-phase2.md)
+# ---------------------------------------------------------------------------------------------------------------
+
+_DELETED_LEGACY_NAMES = {
+    "attempt_heal",
+    "_heal_from_baks",
+    "_load_and_validate",
+    "read_jsonl_skipping_corrupt",
+    "iter_jsonl_streaming",
+    "read_last_n_jsonl_lines",
+}
+
+# Frozen copies of what the held felt-time files still call, byte for byte (main's rulings, 2026-10-18).
+_KEPT_SAVE_WITH_BACKUP = (
+    "def save_with_backup(path: Path, data: Any, backup_count: int = 3) -> None:\n"
+    '    """Atomic JSON save with .bak rotation. Delegates to save_with_backup_text."""\n'
+    '    save_with_backup_text(path, json.dumps(data, indent=2) + "\\n", backup_count=backup_count)'
+)
+
+
+def _defs(path: Path) -> dict[str, ast.AST]:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    return {
+        n.name: n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+
+
+def test_pc2_legacy_names_are_undefined_and_kept_helpers_are_exact() -> None:
+    for path in sorted((REPO / "brain").rglob("*.py")):
+        defined = {
+            n.name
+            for n in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        assert not (defined & _DELETED_LEGACY_NAMES), (path, defined & _DELETED_LEGACY_NAMES)
+    heal = REPO / "brain" / "health" / "attempt_heal.py"
+    swb = _defs(heal)["save_with_backup"]
+    assert ast.dump(swb) == ast.dump(ast.parse(_KEPT_SAVE_WITH_BACKUP).body[0]), "save_with_backup must stay byte-identical"
+    reader = _defs(REPO / "brain" / "health" / "jsonl_reader.py")
+    assert set(reader) == {"JsonlLineError", "_parse_lines", "iter_jsonl_skipping_corrupt"}
+    # The only brain modules that still call the kept helpers are the held felt-time files.
+    importers = set()
+    for path in sorted((REPO / "brain").rglob("*.py")):
+        rel = path.relative_to(REPO).as_posix()
+        if rel in ("brain/health/attempt_heal.py", "brain/health/jsonl_reader.py", "brain/health/json_io.py"):
+            continue
+        text = path.read_text(encoding="utf-8")
+        if re.search(r"import[^\n]*\b(save_with_backup|iter_jsonl_skipping_corrupt)\b", text):
+            importers.add(rel)
+    assert importers == {
+        "brain/felt_time/state.py",
+        "brain/felt_time/chat_log.py",
+        "brain/felt_time/anchors.py",
+    }, importers
+
+
+def test_cs2_h_the_allowlist_end_state_has_only_not_file_io_and_held_entries() -> None:
+    allow = parse_allowlist(ALLOWLIST.read_text(encoding="utf-8"))
+    for (rel, kind), entry in sorted(allow.items()):
+        if kind == "not-file-io":
+            continue
+        assert entry.tag.startswith("held:"), f"{rel}::{kind} is neither not-file-io nor held: {entry.tag!r}"
+        assert not entry.permanent, f"{rel}::{kind}: permanent entries are in-site markers now"
+    assert not any(k == "indirect" for (_r, k) in allow)
 
 
 if __name__ == "__main__":  # pragma: no cover

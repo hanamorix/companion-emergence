@@ -264,7 +264,7 @@ def save_daemon_state(persona_dir: Path, state: DaemonState) -> None:
 def load_daemon_state(
     persona_dir: Path,
 ) -> tuple[DaemonState, BrainAnomaly | None]:
-    """Load daemon_state.json with self-healing via the attempt_heal pattern.
+    """Load daemon_state.json with self-healing via read_json_result (HEAL).
 
     Returns (state, anomaly).
       - Missing file → (DaemonState(), None) silently (first-ever tick path).

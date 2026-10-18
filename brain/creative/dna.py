@@ -8,7 +8,7 @@ This module owns the file I/O. The crystallizer
 (brain/growth/crystallizers/creative_dna.py) is the only auto-evolution
 caller. Migration imports from OG via brain/migrator/og_journal_dna.py.
 
-Atomic writes via save_with_backup; reads via attempt_heal so corruption
+Atomic writes via write_json; reads via read_json_result (HEAL) so corruption
 falls back to .bak rotation; if all backups corrupt, framework default
 applies (per spec §3.2).
 """
@@ -62,7 +62,7 @@ def load_creative_dna(persona_dir: Path) -> dict[str, Any]:
     path = persona_dir / CREATIVE_DNA_FILENAME
 
     if not path.exists():
-        # Seed the persona dir with the default. Never bypass attempt_heal
+        # Seed the persona dir with the default. Never bypass the heal
         # for live usage — but on first-creation it's a clean copy.
         default = _default_factory()
         save_creative_dna(persona_dir, default)

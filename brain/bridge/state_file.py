@@ -5,8 +5,8 @@ shutdown; `shutdown_clean` flips to True as the very last step. On the next
 `bridge start`, if `shutdown_clean: false` AND the recorded pid is dead, the
 previous bridge crashed — caller should run dirty-shutdown recovery.
 
-Atomic writes go through brain.health.attempt_heal.save_with_backup so
-partial writes don't corrupt state. Reads use attempt_heal so corrupted
+Atomic writes go through brain.health.json_io.write_json so
+partial writes don't corrupt state. Reads use read_json_result (HEAL) so corrupted
 files restore from .bak1.
 
 OG reference: NellBrain/nell_supervisor.py:53-101 (state file machinery,
@@ -62,7 +62,7 @@ def _default_factory() -> dict:
     """Returned when bridge.json is missing AND all .bak files are corrupt.
 
     A "missing" bridge.json (never written) returns None from read() — we
-    only fall through to default_factory in attempt_heal when the file
+    only fall through to default_factory in the heal when the file
     exists but is unrecoverable. In that case we return a stub that
     recovery_needed() sees as 'not running, not dirty'.
     """
@@ -104,7 +104,7 @@ def _protect_state_dir(path: Path) -> None:
 def read(persona_dir: Path) -> BridgeState | None:
     """Read bridge.json. Returns None if file does not exist.
 
-    If the file exists but is corrupt, attempt_heal restores from .bak rotation
+    If the file exists but is corrupt, the heal restores from .bak rotation
     and returns the recovered data. If all backups are corrupt, returns the
     default-factory output (treated as 'not running, clean shutdown').
     """
