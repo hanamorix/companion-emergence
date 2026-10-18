@@ -364,7 +364,16 @@ def _temp_scope(path: Path) -> Iterator[tuple[Path, Path]]:
             _INFLIGHT.difference_update((new_path.name, bak1_new.name))
 
 
-def save_with_backup_text(path: Path, text: str, backup_count: int = 3) -> None:
+def save_with_backup_text(
+    path: Path,
+    text: str,
+    backup_count: int = 3,
+    *,
+    keep_backups: bool = True,
+    mode: int | None = None,
+    fsync: bool = True,
+    newline: str | None = None,
+) -> None:
     """Atomic raw-text save with .bak rotation.
 
     The live path always holds a complete file (#387): the new text is written
@@ -380,36 +389,61 @@ def save_with_backup_text(path: Path, text: str, backup_count: int = 3) -> None:
     The text variant — for callers whose payload is already a string and
     should not be JSON-encoded (markdown bodies, voice.md, work files).
     For JSON dicts, use save_with_backup which delegates here after encoding.
+
+    Keyword-only additions for brain.health.json_io (every default reproduces
+    the behaviour above byte for byte): ``keep_backups=False`` makes no backup
+    copy and leaves any existing chain alone (``backup_count=0`` keeps its old
+    meaning of one backup); ``mode`` creates the new file with that mode and
+    sets it on every rotated backup (a token file must never be wider, even for
+    an instant); ``fsync=False`` skips the new file's fsync and the directory
+    fsync (the backup copy is still fsynced); ``newline`` is passed to the
+    temp file's open (``"\n"`` gives the same bytes on every platform).
     """
     bak1 = path.with_name(f"{path.name}.bak1")
     with _temp_scope(path) as (new_path, bak1_new):
-        # Same open as Path.write_text (text mode, no newline=) so the bytes
-        # written per platform are unchanged; flushed and fsynced so the data is
-        # on disk before the replace below can publish it.
-        with new_path.open("w", encoding="utf-8") as f:
+        # Same open as Path.write_text (text mode; no newline= unless asked) so
+        # the bytes written per platform are unchanged; flushed and fsynced so
+        # the data is on disk before the replace below can publish it.
+        if mode is None:
+            new_file = new_path.open("w", encoding="utf-8", newline=newline)
+        else:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+            new_file = os.fdopen(
+                os.open(new_path, flags, mode), "w", encoding="utf-8", newline=newline
+            )
+        with new_file as f:
             f.write(text)
             f.flush()
-            os.fsync(f.fileno())
+            if fsync:
+                os.fsync(f.fileno())
 
         # The slow, failure-prone copy happens before anything is rotated: if it
         # fails (disk full) the live file and the whole chain are untouched.
-        backed_up = _copy_for_backup(path, bak1_new)
+        backed_up = _copy_for_backup(path, bak1_new) if keep_backups else False
 
         # Rotate: drop oldest first, then walk down toward live. A step whose
         # source another saver just moved is skipped, not an error.
-        path.with_name(f"{path.name}.bak{backup_count}").unlink(missing_ok=True)
-        for i in range(backup_count - 1, 0, -1):
-            src = path.with_name(f"{path.name}.bak{i}")
-            dst = path.with_name(f"{path.name}.bak{i + 1}")
-            if src.exists():
-                try:
-                    _replace_with_retry(src, dst)
-                except FileNotFoundError:
-                    pass
+        if keep_backups:
+            path.with_name(f"{path.name}.bak{backup_count}").unlink(missing_ok=True)
+            for i in range(backup_count - 1, 0, -1):
+                src = path.with_name(f"{path.name}.bak{i}")
+                dst = path.with_name(f"{path.name}.bak{i + 1}")
+                if src.exists():
+                    try:
+                        _replace_with_retry(src, dst)
+                    except FileNotFoundError:
+                        pass
         if backed_up:
             _replace_with_retry(bak1_new, bak1)
 
         _replace_with_retry(new_path, path)
+
+        if mode is not None and keep_backups:
+            for i in range(1, max(backup_count, 1) + 1):
+                try:
+                    os.chmod(path.with_name(f"{path.name}.bak{i}"), mode)
+                except OSError:
+                    pass
 
         # M-9: fsync the parent directory so the rename is durable, not just
         # atomic. POSIX guarantees os.replace's atomicity but not that the
@@ -417,7 +451,7 @@ def save_with_backup_text(path: Path, text: str, backup_count: int = 3) -> None:
         # replace and the dir-block flush, the file may revert to the prior
         # name — the .bak rotation already preserves data, but durability
         # of the rename itself matters for the chain to behave correctly.
-        if os.name == "posix":
+        if fsync and os.name == "posix":
             try:
                 dir_fd = os.open(str(path.parent), os.O_DIRECTORY)
             except OSError:
