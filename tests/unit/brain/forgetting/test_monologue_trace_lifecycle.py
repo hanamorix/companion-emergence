@@ -20,7 +20,7 @@ from brain.monologue.trace import write_trace_memory
 _TRACE_LIFECYCLE_DEFERRED = (
     "trace lifecycle moved to pending queue; DB-fade/recall-bump deferred to "
     "Phase 4 (Root 2 stopgap) — a monologue_trace is now an ephemeral queue "
-    "candidate, not a memories.db row, so the forgetting engine never processes it"
+    "candidate, not a memories.db row, so the forgetting engine never processes it (#420)"
 )
 
 

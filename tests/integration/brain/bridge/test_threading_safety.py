@@ -182,6 +182,33 @@ def test_chat_threaded_round_trip_no_silent_sqlite_drop(
     assert "SQLite objects created in a thread" not in caplog.text
 
 
+def test_closed_session_memory_reaches_the_pending_queue(
+    real_persona_dir: Path,
+    monkeypatch,
+) -> None:
+    """The round-trip's ``enqueued`` counter is derived from the item's label,
+    not from the write, so it cannot see a memory that was counted but never
+    queued (#422). Since #167 every conversation-extraction label goes through
+    the pending gate, so the queue file is where the write must land."""
+    from brain.memory.pending import PendingQueue
+
+    _patch_provider(monkeypatch, _ExtractingFakeProvider())
+    app = build_app(persona_dir=real_persona_dir, client_origin="tests")
+    monkeypatch.setenv("NELL_STREAM_CHUNK_DELAY_MS", "0")
+
+    with TestClient(app) as client:
+        sid = client.post("/session/new", json={"client": "tests"}).json()["session_id"]
+        assert client.post("/chat", json={"session_id": sid, "message": "hello nell"}).status_code == 200
+        body = client.post("/sessions/close", json={"session_id": sid}).json()
+
+    assert body["enqueued"] == 1 and body["committed"] == 0 and body["errors"] == 0, body
+    queue = PendingQueue(real_persona_dir).path
+    queued = queue.read_text(encoding="utf-8") if queue.exists() else ""
+    assert "user said hello to nell" in queued, (
+        f"ingest reported the memory enqueued but the queue file lacks it: {queued[:500]!r}"
+    )
+
+
 def test_session_close_handles_commit_failure_gracefully(
     real_persona_dir: Path,
     monkeypatch,

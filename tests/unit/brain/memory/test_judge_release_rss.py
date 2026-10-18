@@ -39,6 +39,7 @@ concern, already exercised offline elsewhere.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import textwrap
@@ -69,13 +70,27 @@ _TIMEOUT_S = 300
 # network to get a real judge", never a false skip of a run that could have
 # gone offline. A machine (this dev box, or the dedicated workflow after its
 # warm step) that already has the model cached still runs these tests.
+#
+# #405 / #363 follow-up (2026-10-16): "skip unless cached" ran this module in
+# the default suite on any dev box with the model cached, where C2's margin is
+# 3-8% of what it measures and fails about 1 run in 4 -- and it let the
+# dedicated workflow pass with zero tests run if its warm step ever left the
+# cache empty. So the module is now opt-in: it runs only with
+# KINDLED_RUN_JUDGE_RSS=1 (set by judge-release-rss.yml, or by hand), and once
+# opted in a missing model is a failure, not a skip. The bound is unchanged.
 _JUDGE_MODEL_ID = model_for_tier(TIER_RELEVANCE_JUDGE)
-if not _hf_cached(_JUDGE_MODEL_ID, get_cache_dir()):
+if os.environ.get("KINDLED_RUN_JUDGE_RSS") != "1":
     pytest.skip(
-        f"{_JUDGE_MODEL_ID!r} not in the local HF cache ({get_cache_dir()}) -- "
-        "skipping without a network request; this module needs the model "
-        "pre-warmed (see .github/workflows/judge-release-rss.yml)",
+        "judge release-RSS tests are opt-in: set KINDLED_RUN_JUDGE_RSS=1 "
+        "(run by .github/workflows/judge-release-rss.yml; see #405)",
         allow_module_level=True,
+    )
+if not _hf_cached(_JUDGE_MODEL_ID, get_cache_dir()):
+    pytest.fail(
+        f"{_JUDGE_MODEL_ID!r} not in the local HF cache ({get_cache_dir()}) -- "
+        "KINDLED_RUN_JUDGE_RSS=1 is set but this module needs the model "
+        "pre-warmed (see .github/workflows/judge-release-rss.yml)",
+        pytrace=False,
     )
 
 
@@ -209,6 +224,20 @@ _RSS_TRACE_PRELUDE = textwrap.dedent(
 _C2_RETAINED_FRACTION_BOUND = 0.25
 
 
+def _report(arm: str, rss_before: int, peak: int, rss_after: int) -> None:
+    """Print the retained fraction for every run (#405 review): the workflow runs
+    with -s, so its log accumulates the per-platform evidence the 25% bound is
+    judged against, whether the run passes or fails."""
+    load_delta = peak - rss_before
+    retained = rss_after - rss_before
+    frac = retained / load_delta if load_delta else float("nan")
+    print(
+        f"\n[judge-rss] arm={arm} platform={sys.platform} load_delta={load_delta / 1e6:.1f}MB "
+        f"retained={retained / 1e6:.1f}MB retained_fraction={frac:.1%} "
+        f"bound={_C2_RETAINED_FRACTION_BOUND:.0%}"
+    )
+
+
 def test_c2a_calibration_tick_finish_releases_judge_rss() -> None:
     """C2 (calibration finish arm): a real `_run_calibration_tick` call that
     builds the real torch judge (one unlabeled calibration_log row, a clearly
@@ -294,7 +323,7 @@ def test_c2a_calibration_tick_finish_releases_judge_rss() -> None:
     rss_before, peak, rss_after = result["rss_before"], result["peak"], result["rss_after"]
     load_delta = peak - rss_before
     bound = rss_before + _C2_RETAINED_FRACTION_BOUND * load_delta
-    print(f"\nload_delta={load_delta / 1e6:.1f}MB rss_after-rss_before={(rss_after - rss_before) / 1e6:.1f}MB")
+    _report('c2a_calibration_tick_finish', rss_before, peak, rss_after)
     assert load_delta > 200_000_000, (
         f"the judge doesn't look like it actually loaded (load_delta={load_delta / 1e6:.1f}MB) "
         "-- this test would pass vacuously if label_calibration_sample never built the real judge"
@@ -382,6 +411,7 @@ def test_c2c_calibration_tick_pause_releases_judge_rss() -> None:
     rss_before, peak, rss_after = result["rss_before"], result["peak"], result["rss_after"]
     load_delta = peak - rss_before
     bound = rss_before + _C2_RETAINED_FRACTION_BOUND * load_delta
+    _report('c2c_calibration_tick_pause', rss_before, peak, rss_after)
     assert result["ran"] is None, "a mid-tick pause must report None (paused), not True/False"
     assert result["unlabeled_remaining"] == 1, (
         "exactly one row must stay unlabeled -- proves the pause stopped between "
@@ -464,7 +494,7 @@ def test_c2b_weight_retrain_finish_releases_judge_rss() -> None:
     rss_before, peak, rss_after = result["rss_before"], result["peak"], result["rss_after"]
     load_delta = peak - rss_before
     bound = rss_before + _C2_RETAINED_FRACTION_BOUND * load_delta
-    print(f"\nload_delta={load_delta / 1e6:.1f}MB rss_after-rss_before={(rss_after - rss_before) / 1e6:.1f}MB")
+    _report('c2b_weight_retrain_finish', rss_before, peak, rss_after)
     assert load_delta > 200_000_000, (
         f"the champion+challenger don't look like they actually loaded (load_delta={load_delta / 1e6:.1f}MB)"
     )

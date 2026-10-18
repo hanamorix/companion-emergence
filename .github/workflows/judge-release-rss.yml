@@ -89,4 +89,6 @@ jobs:
           "
 
       - name: Judge release RSS tests (C2 finish arms, C3 offline load, C14 3-OS)
+        env:
+          KINDLED_RUN_JUDGE_RSS: "1"  # opt-in; without it the module skips (#405)
         run: uv run pytest -m requires_models tests/unit/brain/memory/test_judge_release_rss.py -v -s
