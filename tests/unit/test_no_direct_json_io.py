@@ -557,7 +557,9 @@ def _compare(tmp_path: Path, files: dict[str, str], allow_text: str):
     for rel, src in files.items():
         f = tmp_path / rel
         f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text(src)
+        f.write_text(
+            src, encoding="utf-8"
+        )  # a real brain/ file holds non-ASCII; the platform codec is not UTF-8
     return compare(tmp_path, scan(tmp_path), _allow(allow_text))
 
 
@@ -635,6 +637,14 @@ def test_cs2_e_allowlist_lines_need_a_tag_and_a_count() -> None:
         parse_allowlist("brain/x.py::read::one   # G3\n")
     with pytest.raises(ValueError):
         parse_allowlist("brain/x.py::read::1   # G3\nbrain/x.py::read::2   # G3\n")
+
+
+def test_cs2_b_a_non_ascii_source_is_scanned_as_utf8(tmp_path: Path) -> None:
+    source = (
+        "# caf\u00e9 \u65e5\u672c\nimport json\ndef f(p):\n    return json.loads(p.read_text())\n"
+    )
+    errors, _ = _compare(tmp_path, {"brain/x.py": source}, "brain/x.py::read::1   # G3\n")
+    assert errors == []
 
 
 def test_cs2_g_the_call_node_oracle_one_over_fails_and_at_the_ceiling_passes(

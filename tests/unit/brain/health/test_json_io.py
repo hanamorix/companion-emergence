@@ -534,7 +534,10 @@ def test_cr16_the_exception_is_an_oserror_a_valueerror_and_a_missing_one_a_filen
     assert isinstance(err, OSError) and isinstance(err, ValueError)
     gone = jio.JsonFileNotFound(Path("/x/y.json"), "missing")
     assert isinstance(gone, FileNotFoundError) and isinstance(gone, jio.JsonFileError)
-    assert str(err) == "/x/y.json: malformed: bad (line 3)" and not str(err).startswith("[Errno")
+    expected = (
+        f"{Path('/x/y.json')}: malformed: bad (line 3)"  # the path spelling is the platform's
+    )
+    assert str(err) == expected and not str(err).startswith("[Errno")
 
 
 @pytest.mark.parametrize(
@@ -817,8 +820,11 @@ def test_cr8_heal_matches_the_untouched_legacy_function(tmp_path: Path, fixture:
     assert _anomaly_fields(r.anomaly) == _anomaly_fields(l_anomaly)
     legacy_files, new_files = _snapshot(legacy_dir), _snapshot(new_dir)
     assert set(new_files) == set(legacy_files)
-    for name in legacy_files:  # the reset-to-default file is the same JSON, byte for byte
-        assert new_files[name] == legacy_files[name], name
+    for name in legacy_files:
+        # The same JSON, byte for byte, except that the legacy writer uses text mode (CRLF on Windows) and the module
+        # always writes LF (plan P8, CW1): compare after normalising CRLF, and assert the module wrote no CR anywhere.
+        assert _norm_crlf(new_files[name]) == _norm_crlf(legacy_files[name]), name
+        assert b"\r" not in new_files[name], name
 
 
 def test_cr8_delta_one_invalid_utf8_is_labelled_a_parse_error_not_a_schema_mismatch(
@@ -2820,15 +2826,21 @@ def test_ca2_try_mode_cannot_tell_a_refused_lock_from_a_busy_one_and_says_so(
     tmp_path: Path, monkeypatch
 ) -> None:
     """F4 (documented, not fixed in this phase): file_lock(blocking=False) reports flock errors as 'busy'."""
-    import fcntl
+    # POSIX locks with fcntl.flock, Windows with msvcrt.locking; both report any OSError of a non-blocking attempt as busy
+    if POSIX:
+        import fcntl
 
-    if not POSIX:
-        pytest.skip("flock is POSIX")
+        def refused(fd, op):
+            raise OSError(errno.ENOLCK, "no locks")
 
-    def refused(fd, op):
-        raise OSError(errno.ENOLCK, "no locks")
+        monkeypatch.setattr(fcntl, "flock", refused)
+    else:
+        import msvcrt
 
-    monkeypatch.setattr(fcntl, "flock", refused)
+        def refused(fd, mode, nbytes):
+            raise OSError(errno.ENOLCK, "no locks")
+
+        monkeypatch.setattr(msvcrt, "locking", refused)
     p = tmp_path / "log.jsonl"
     assert jio.append_jsonl(p, {"a": 1}, lock="try") is None
     assert "busy" in (jio.append_jsonl.__doc__ or "") and "refus" in (
