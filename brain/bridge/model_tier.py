@@ -391,6 +391,20 @@ def candidate_tier_models(cfg: Any) -> set[str]:
     return out
 
 
+def unchecked_tiers(cfg: Any, ids: list[str]) -> list[str]:
+    """``ids`` (derived tier ids an Apply could not probe) minus those already shown as fallbacks.
+
+    The ONE rule for "not checked yet" vs "fallback", used by the Apply response and by /persona/state so
+    the two cannot disagree: an id that is unavailable (saved list or a runtime rejection) is a fallback.
+    """
+    from brain.bridge import model_error
+
+    if cfg is None:
+        return []
+    gone = set(cfg.derived_unavailable) | set(model_error.rejected_models())
+    return [m for m in ids if m not in gone]
+
+
 def tier_fallbacks(cfg: Any) -> list[dict[str, str]]:
     """Which derived tier ids are being replaced, one entry per distinct (wanted id, replacement) pair.
 

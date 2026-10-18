@@ -115,16 +115,11 @@ def _model_rejections(configured_model: str | None, cfg: Any = None) -> list[dic
 
 
 def _tier_unconfirmed(cfg: Any) -> list[str]:
-    from brain.bridge.model_tier import candidate_tier_models
+    from brain.bridge.model_tier import candidate_tier_models, unchecked_tiers
 
     if cfg is None:
         return []
-    # an id that is already a fallback is not also "not checked yet"
-    return [
-        m
-        for m in model_error.tier_unconfirmed(only=candidate_tier_models(cfg))
-        if m not in cfg.derived_unavailable and m not in model_error.rejected_models()
-    ]
+    return unchecked_tiers(cfg, model_error.tier_unconfirmed(only=candidate_tier_models(cfg)))
 
 
 def _tier_fallbacks(cfg: Any) -> list[dict]:

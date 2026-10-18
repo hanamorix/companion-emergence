@@ -1999,6 +1999,7 @@ def build_app(
             model_for_tier,
             tier_fallbacks,
             tier_family,
+            unchecked_tiers,
         )
         from brain.persona_config import KNOWN_MODELS, PersonaConfig, is_valid_model
 
@@ -2067,18 +2068,20 @@ def build_app(
                 and m not in unavailable
                 and (derived_outcomes.get(m) == "inconclusive" or (not derived_outcomes and m in derived_ids))
             ]
-        # Derived ids the probes could not settle are "not checked yet" (told to the user, cleared by a clean
-        # reply for that id). An id kept as unavailable is a fallback, never also "not checked yet".
-        tiers_unchecked: list[str] = []
-        for derived_id, derived_outcome in derived_outcomes.items():
-            if derived_outcome == "inconclusive" and derived_id not in unavailable:
-                model_error.note_tier_unconfirmed(derived_id)
-                tiers_unchecked.append(derived_id)
-            else:
-                model_error.clear_tier_unconfirmed(derived_id)
         updated = dc_replace(current, model=req.model, derived_unavailable=unavailable)
         updated.save(config_path)
         model_error.switch(current.model, req.model, keep=candidate_tier_models(updated))
+        # Derived ids the probes could not settle are "not checked yet" (told to the user, cleared by a clean
+        # reply for that id) unless they are already shown as fallbacks. Marked AFTER switch(), which drops
+        # the old chat id's marks, so a mark set by this very Apply is never wiped by it.
+        tiers_unchecked = unchecked_tiers(
+            updated, [m for m, o in derived_outcomes.items() if o == "inconclusive"]
+        )
+        for derived_id in derived_outcomes:
+            if derived_id in tiers_unchecked:
+                model_error.note_tier_unconfirmed(derived_id)
+            else:
+                model_error.clear_tier_unconfirmed(derived_id)
         # Mark (or clear) BEFORE the hot-swap: the provider can only produce a clean reply for the new model
         # after the swap, and that reply clears the mark. A re-Apply of the model already saved unchecked
         # goes through here too (switch() ignores old == new), so a passing check clears the old mark.
