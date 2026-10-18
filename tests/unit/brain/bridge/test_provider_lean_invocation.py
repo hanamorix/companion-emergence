@@ -7,7 +7,7 @@ Guards that every ClaudeCliProvider argv builder:
    the list decides what she can reach (#71).
 2. Adds ``--strict-mcp-config`` to pin the session to the configured MCP server.
 
-Since #329 all four ``claude -p`` spawn sites apply the posture through
+Since #329 every ``claude -p`` spawn site (five argv builders plus the save-time probe) apply the posture through
 ``_apply_lean_flags``: the CLI's exclusive ``--tools=`` allowlist (WebSearch,WebFetch
 for chat; nothing for background ``generate()``) when the CLI supports it, then the
 disallow list and ``--strict-mcp-config``.
@@ -112,6 +112,8 @@ def _capture_argv(site: str, tmp_path) -> list[str]:
     with patch("brain.bridge.provider.subprocess.run", return_value=done) as run:
         if site == "generate":
             provider.generate("hi")
+        elif site == "probe":  # the save-time model check (#448): stream-json, background posture
+            provider.probe("hi")
         elif site == "chat_text":
             provider.chat(msgs, tools=None)
         else:  # chat_mcp_tools
@@ -119,16 +121,16 @@ def _capture_argv(site: str, tmp_path) -> list[str]:
     return list(run.call_args.args[0])
 
 
-_SITES = ["generate", "chat_text", "chat_stream_tools", "chat_stream_no_tools", "chat_mcp_tools"]
+_SITES = ["generate", "probe", "chat_text", "chat_stream_tools", "chat_stream_no_tools", "chat_mcp_tools"]
 
 
 @pytest.mark.parametrize("site", _SITES)
 def test_every_site_applies_the_posture(site, tmp_path):
-    """C1: background calls get no built-ins at all; every chat path gets
+    """C1: background calls (generate and the save-time probe) get no built-ins at all; every chat path gets
     exactly the web tools. The disallow list and --strict-mcp-config stay on
     as the second layer."""
     argv = _capture_argv(site, tmp_path)
-    expected = "--tools=" if site == "generate" else _CHAT_TOOLS
+    expected = "--tools=" if site in ("generate", "probe") else _CHAT_TOOLS
     assert [a for a in argv if a.startswith("--tools")] == [expected], argv
     assert "--disallowedTools" in argv, argv
     assert "--strict-mcp-config" in argv, argv
