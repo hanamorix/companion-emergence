@@ -547,6 +547,33 @@ describe("ConnectionPanel — rejected and unchecked models (#440)", () => {
     await waitFor(() => expect(screen.queryByText(/using "haiku"/)).not.toBeInTheDocument());
   });
 
+  it("a late pre-Apply poll does not bring back the old lines; the fresh poll takes over", async () => {
+    const staleState = baseState({
+      connection: { provider: "claude-cli", model: "sonnet", last_heartbeat_at: null },
+      tier_fallbacks: [PINNED],
+    });
+    const { rerender } = render(<ConnectionPanel state={staleState} persona="test" />);
+    fireEvent.click(screen.getByRole("button", { name: /change model/i }));
+    fireEvent.click(screen.getByRole("button", { name: /apply with fallback/i })); // applies claude-sonnet-5
+    expect(await screen.findByText(/using "haiku"/)).toBeInTheDocument();
+    // a poll that left before the Apply lands afterwards: still the old chat model, old list
+    rerender(<ConnectionPanel state={{ ...staleState }} persona="test" />);
+    expect(screen.getByText(/using "haiku"\b/)).toBeInTheDocument();
+    expect(screen.queryByText(/using "claude-haiku-4-5-20251001"/)).not.toBeInTheDocument();
+    // the first poll that reports the new chat model carries the bridge's own list
+    rerender(
+      <ConnectionPanel
+        state={baseState({
+          connection: { provider: "claude-cli", model: "claude-sonnet-5", last_heartbeat_at: null },
+          tier_fallbacks: [PINNED],
+        })}
+        persona="test"
+      />,
+    );
+    expect(screen.getByText(/using "claude-haiku-4-5-20251001"/)).toBeInTheDocument();
+    expect(screen.queryByText(/using "haiku"\b/)).not.toBeInTheDocument();
+  });
+
   it("does not repeat a rejection line that a fallback line already explains", () => {
     render(
       <ConnectionPanel

@@ -265,3 +265,67 @@ def test_chat_model_rejection_is_reported_and_has_no_fallback_entry(persona_dir:
         st = c.get("/persona/state").json()
     assert "claude-sonnet-5" in {r["model"] for r in st["model_rejections"]}
     assert st["tier_fallbacks"] == []
+
+
+# --- one shared time budget for all the probes of one Apply -----------------------------------------
+
+
+class _TimedRun:
+    """subprocess.run stand-in with per-model durations that honours the `timeout=` it is given, like the real one."""
+
+    def __init__(self, durations: dict[str, float]):
+        self.durations = durations
+        self.timeouts: dict[str, int] = {}
+        self.calls: list[str] = []
+
+    def __call__(self, cmd, **kw):
+        model = cmd[cmd.index("--model") + 1]
+        self.calls.append(model)
+        timeout = kw.get("timeout")
+        self.timeouts.setdefault(model, timeout)
+        took = self.durations.get(model, 0.0)
+        if timeout is not None and took > timeout:
+            time.sleep(timeout)
+            raise subprocess.TimeoutExpired(cmd="claude", timeout=timeout)
+        time.sleep(took)
+        return _ok()
+
+
+def test_all_probes_of_one_apply_share_one_budget(persona_dir: Path, monkeypatch):
+    # The budget is the whole Apply, not each probe: otherwise a hanging CLI would hold the request for
+    # chat + derived time, past a webview's ~60 s idle limit. Here: budget 3 s, chat probe 1.2 s, derived hang.
+    from brain.bridge import server as server_mod
+
+    monkeypatch.setattr(server_mod, "_MODEL_CHECK_TIMEOUT_S", 3.0)
+    _cli_persona(persona_dir)
+    run = _TimedRun({"claude-sonnet-5": 1.2, "claude-haiku-5": 100.0})
+    with _client(persona_dir, monkeypatch) as c, patch("subprocess.run", run):
+        t0 = time.monotonic()
+        r = _post(c, "claude-sonnet-5")
+        elapsed = time.monotonic() - t0
+    assert r.status_code == 200 and r.json()["checked"] is True
+    assert run.timeouts["claude-sonnet-5"] == 3  # the chat probe may use the whole budget
+    assert run.timeouts["claude-haiku-5"] <= 2  # derived probes only get what is left
+    assert elapsed < 3.0 + 1.0  # never chat + derived: the total stays inside the budget (plus margin)
+    assert _cfg(persona_dir).derived_unavailable == []  # a probe that timed out says nothing: not recorded
+
+
+def test_derived_probes_are_skipped_when_the_chat_probe_used_the_budget(persona_dir: Path, monkeypatch):
+    from brain.bridge import server as server_mod
+
+    monkeypatch.setattr(server_mod, "_MODEL_CHECK_TIMEOUT_S", 2.0)
+    _cli_persona(persona_dir)
+    run = _TimedRun({"claude-sonnet-5": 100.0})  # the chat probe hangs for the whole budget
+    with _client(persona_dir, monkeypatch) as c, patch("subprocess.run", run):
+        t0 = time.monotonic()
+        r = _post(c, "claude-sonnet-5")
+        elapsed = time.monotonic() - t0
+    assert r.status_code == 200 and r.json()["checked"] is False  # saved unchecked
+    assert "claude-haiku-5" not in run.calls  # no budget left: no derived probe was started
+    assert elapsed < 2.0 + 1.0
+
+
+def test_default_budget_is_well_inside_a_60_second_webview_idle_timeout():
+    from brain.bridge import server as server_mod
+
+    assert server_mod._MODEL_CHECK_TIMEOUT_S <= 30.0

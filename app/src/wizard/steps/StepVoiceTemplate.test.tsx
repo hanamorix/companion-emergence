@@ -85,11 +85,30 @@ describe("StepVoiceTemplate — optional Claude model (#441)", () => {
     expect(details).toHaveAttribute("open"); // not collapsed under the user
   });
 
-  it("shows the format error outside the collapsible section, so it is visible even if Advanced is closed", () => {
-    renderStep("Bad Id");
+  it("forces Advanced open when an invalid value is typed, even though it started closed", () => {
+    function Harness() {
+      const [m, setM] = useState("");
+      return (
+        <StepVoiceTemplate
+          step={5}
+          totalSteps={7}
+          template="default"
+          onTemplateChange={vi.fn()}
+          chatModel={m}
+          onChatModelChange={setM}
+          onNext={vi.fn()}
+          onBack={vi.fn()}
+          avatar={null}
+        />
+      );
+    }
+    render(<Harness />);
+    const details = screen.getByText("Advanced").closest("details")!;
+    expect(details).not.toHaveAttribute("open"); // blank: collapsed
+    fireEvent.change(screen.getByLabelText("Claude model"), { target: { value: "Bad Id" } });
+    expect(details).toHaveAttribute("open"); // forced open by the invalid value, not by the initial state
     const alert = screen.getByRole("alert");
     expect(alert).toHaveTextContent(/start with claude-/i);
     expect(alert.closest("details")).toBeNull();
-    expect(screen.getByText("Advanced").closest("details")).toHaveAttribute("open"); // forced open while invalid
   });
 });
