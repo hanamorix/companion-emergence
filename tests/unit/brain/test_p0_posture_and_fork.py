@@ -10,6 +10,7 @@ symbols remain in non-test source, and the engine no longer forks on images.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import brain
@@ -80,4 +81,5 @@ def test_engine_has_no_image_builder_fork() -> None:
     # imported/used by the engine — every turn takes the static+volatile split.
     # (build_static_system_message is the split head and does NOT match this.)
     assert "build_system_message(" not in engine_src
-    assert "from brain.chat.prompt import (\n    build_static_system_message,\n" in engine_src
+    prompt_import = re.search(r"from brain\.chat\.prompt import \(([^)]*)\)", engine_src)
+    assert prompt_import is not None and "build_static_system_message" in prompt_import.group(1)

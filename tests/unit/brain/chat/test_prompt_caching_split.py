@@ -18,7 +18,7 @@ runtime dump is the in-situ cross-check on the real assembled bytes.
 from __future__ import annotations
 
 import hashlib
-import json
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -88,29 +88,29 @@ _VOLATILE_MARKERS = (
 
 def test_context_block_omits_clock_when_flag_false() -> None:
     """include_block_clock=False drops the Current time line AND its explainer
-    from the top of the JSONL block; the JSONL records (and their ts) remain."""
+    from the top of the block; the narrative lines (and their times) remain."""
     msgs = [
         ChatMessage(role="user", content="a", ts="2026-05-20T10:00:00Z"),
         ChatMessage(role="assistant", content="b", ts="2026-05-20T10:05:00Z"),
     ]
     block = _format_claude_context_block(msgs, includes_latest_user=True, include_block_clock=False)
     assert "Current time" not in block
-    # The per-message ts values still ride in the JSONL records, rendered in
+    # The per-message times still ride in the narrative lines, rendered in
     # local wall-clock time (#217) rather than the raw UTC string. Exact
     # offset depends on the CI runner's OS timezone, so assert what's
     # deterministic regardless of it: not the raw 'Z'-suffixed string, and
     # the same underlying instant.
-    records = [json.loads(line) for line in block.splitlines() if line.startswith("{")]
-    assert records[0]["ts"] != "2026-05-20T10:00:00Z"
-    assert records[1]["ts"] != "2026-05-20T10:05:00Z"
-    assert not records[0]["ts"].endswith("Z")
-    assert not records[1]["ts"].endswith("Z")
-    assert datetime.fromisoformat(records[0]["ts"]).astimezone(UTC) == datetime(
-        2026, 5, 20, 10, 0, 0, tzinfo=UTC
-    )
-    assert datetime.fromisoformat(records[1]["ts"]).astimezone(UTC) == datetime(
-        2026, 5, 20, 10, 5, 0, tzinfo=UTC
-    )
+    times = [
+        re.match(r"^(\d{4}-\d{2}-\d{2}T\S+) (?:User|you): ", line).group(1)
+        for line in block.splitlines()
+        if re.match(r"^(\d{4}-\d{2}-\d{2}T\S+) (?:User|you): ", line)
+    ]
+    assert times[0] != "2026-05-20T10:00:00Z"
+    assert times[1] != "2026-05-20T10:05:00Z"
+    assert not times[0].endswith("Z")
+    assert not times[1].endswith("Z")
+    assert datetime.fromisoformat(times[0]).astimezone(UTC) == datetime(2026, 5, 20, 10, 0, 0, tzinfo=UTC)
+    assert datetime.fromisoformat(times[1]).astimezone(UTC) == datetime(2026, 5, 20, 10, 5, 0, tzinfo=UTC)
 
 
 def test_context_block_keeps_clock_by_default() -> None:
@@ -121,7 +121,7 @@ def test_context_block_keeps_clock_by_default() -> None:
 
 
 def test_print_prompt_appends_suffix_multi_message() -> None:
-    """A+: the volatile suffix lands after the JSONL block, with no top clock."""
+    """A+: the volatile suffix lands after the context block, with no top clock."""
     msgs = [
         ChatMessage(role="user", content="hi", ts="2026-05-20T10:00:00Z"),
         ChatMessage(role="assistant", content="hello", ts="2026-05-20T10:01:00Z"),
