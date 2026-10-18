@@ -1097,6 +1097,18 @@ def test_cr9_e_a_file_that_vanishes_before_the_heal_is_re_read_not_raised(
     assert not list(tmp_path.glob("*.corrupt-*"))
 
 
+def test_cr9_e_restore_twin_a_file_that_vanishes_before_the_heal_is_restored_from_the_backup(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """R2-1: a legacy healer (no sidecar) or a manual delete can remove the file between the first read and the heal lock.
+    HEAL keeps its meaning (default); RESTORE must not answer 'no data yet' while a valid backup exists."""
+    p = _corrupt_with_backup(tmp_path, b'{"count": 7}')
+    _seam_hook(monkeypatch, before_heal=lambda path: path.unlink())
+    r = jio.read_json_result(p, default=lambda: {"count": 0}, recover=jio.Recovery.RESTORE)
+    assert (r.data, r.outcome) == ({"count": 7}, "restored")
+    assert json.loads(p.read_text()) == {"count": 7}
+
+
 # --------------------------------------------------------------------------------------------------------------
 # The heal lock does not collide with other holders of <name>.lock (CR14)
 # --------------------------------------------------------------------------------------------------------------

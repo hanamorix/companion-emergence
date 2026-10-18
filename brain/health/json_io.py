@@ -435,6 +435,14 @@ def _heal(
             try:
                 raw, sig = _read_bytes(path)
             except FileNotFoundError:
+                # It vanished between our first read and the lock (a legacy healer, a manual delete). HEAL keeps
+                # attempt_heal's meaning (the default); RESTORE must not say "no data yet" while a good copy exists.
+                if recover is Recovery.RESTORE:
+                    restored, retry = _restore_missing_locked(path, expect, validate, fallbacks)
+                    if restored is not None:
+                        return restored
+                    if retry:
+                        return _after_change(path, expect, validate, bad)
                 return JsonRead(default(), "missing")
             except OSError as exc:
                 raise JsonFileError(path, "io", _short(exc)) from exc
@@ -602,38 +610,40 @@ def _restore_missing(path, default, recover, expect, validate, fallbacks) -> Jso
     candidates = [path.with_name(f"{path.name}.bak{i}") for i in (1, 2, 3)] + list(fallbacks)
     if not any(c.exists() for c in candidates):
         return None  # nothing to restore from; do not create a sidecar (or directories) for a first run
-    retry = False
-    result: JsonRead | None = None
     with _heal_guard(path):
-        if os.path.lexists(path):
-            retry = True  # someone put it back while we waited for the lock
-        else:
-            chosen_bak, chosen_fallback, _walked = _pick(path, expect, validate, fallbacks)
-            if chosen_bak is not None or chosen_fallback is not None:
-                try:
-                    _expect_absent(path)
-                    data, action, detail = _install(
-                        path, chosen_bak, chosen_fallback, expect, validate, "live file missing"
-                    )
-                except _ChangedError:
-                    retry = True
-                except OSError as exc:
-                    raise JsonFileError(path, "io", _short(exc)) from exc
-                else:
-                    anomaly = BrainAnomaly(
-                        timestamp=datetime.now(UTC),
-                        file=path.name,
-                        kind="json_parse_error",
-                        action=action,  # type: ignore[arg-type]
-                        quarantine_path=None,
-                        likely_cause="unknown",
-                        detail=detail,
-                    )
-                    logger.warning("%s was missing; %s", path, action)
-                    result = JsonRead(data, "restored", "missing", anomaly)
-    if retry:
+        result, retry = _restore_missing_locked(path, expect, validate, fallbacks)
+    if retry:  # outside the lock: the normal read path may need it
         return _read(path, default, recover, expect, validate, fallbacks, waited=True)
     return result
+
+
+def _restore_missing_locked(path, expect, validate, fallbacks) -> tuple[JsonRead | None, bool]:
+    """With the heal sidecar held: (restored result or None, whether to read again). Never takes the lock."""
+    if os.path.lexists(path):
+        return None, True  # someone put it back while we waited for the lock
+    chosen_bak, chosen_fallback, _walked = _pick(path, expect, validate, fallbacks)
+    if chosen_bak is None and chosen_fallback is None:
+        return None, False
+    try:
+        _expect_absent(path)
+        data, action, detail = _install(
+            path, chosen_bak, chosen_fallback, expect, validate, "live file missing"
+        )
+    except _ChangedError:
+        return None, True
+    except OSError as exc:
+        raise JsonFileError(path, "io", _short(exc)) from exc
+    anomaly = BrainAnomaly(
+        timestamp=datetime.now(UTC),
+        file=path.name,
+        kind="json_parse_error",
+        action=action,  # type: ignore[arg-type]
+        quarantine_path=None,
+        likely_cause="unknown",
+        detail=detail,
+    )
+    logger.warning("%s was missing; %s", path, action)
+    return JsonRead(data, "restored", "missing", anomaly), False
 
 
 def _short_detail(exc: object) -> str:
