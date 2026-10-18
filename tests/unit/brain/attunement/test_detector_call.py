@@ -206,3 +206,27 @@ def test_detector_threads_companion_name_into_system_prompt(buffer):
 
     assert "between Alex (the user) and the user's companion, Mira" in captured["system_prompt"]
     assert 'never "Claude"' in captured["system_prompt"]
+
+
+def test_detector_records_a_malformed_reply_in_the_parse_failure_log(buffer, tmp_path):
+    """#364: the decline keeps the reply that caused it."""
+    import json as _json
+
+    from brain.health.parse_failures import PARSE_FAILURE_LOG
+
+    with patch("brain.attunement.detector._call_haiku", return_value="I'd rather not {"):
+        run_detector(buffer_slice=buffer, reply_text="anything", persona_dir=tmp_path)
+    (row,) = [_json.loads(line) for line in (tmp_path / PARSE_FAILURE_LOG).read_text(encoding="utf-8").splitlines()]
+    assert row["site"] == "attunement" and row["raw"] == "I'd rather not {"
+
+
+def test_detector_records_an_invalid_current_read_shape(buffer, tmp_path):
+    import json as _json
+
+    from brain.health.parse_failures import PARSE_FAILURE_LOG
+
+    bad = '{"current_read": {"mood_valence": "very"}}'
+    with patch("brain.attunement.detector._call_haiku", return_value=bad):
+        run_detector(buffer_slice=buffer, reply_text="anything", persona_dir=tmp_path)
+    (row,) = [_json.loads(line) for line in (tmp_path / PARSE_FAILURE_LOG).read_text(encoding="utf-8").splitlines()]
+    assert row["site"] == "attunement" and row["raw"] == bad

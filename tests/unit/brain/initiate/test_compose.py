@@ -274,3 +274,60 @@ def test_compose_subject_uses_companion_name_not_nell() -> None:
     prompt_text = args[0]
     assert "Mira" in prompt_text
     assert "Nell" not in prompt_text
+
+
+# ── #364: tolerant parse, and the raw reply survives a failure ────────────────
+def _rows(persona_dir):
+    import json
+
+    from brain.health.parse_failures import PARSE_FAILURE_LOG
+
+    path = persona_dir / PARSE_FAILURE_LOG
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
+
+
+def test_compose_decision_reads_a_fenced_reply() -> None:
+    fenced = '```json\n{"decision": "send_quiet", "reasoning": "fine"}\n```'
+    result = compose_decision(
+        MagicMock(complete=MagicMock(return_value=fenced)), rendered_message="x",
+        recent_send_history=[], current_local_time=datetime(2026, 5, 11, 12, 0, tzinfo=UTC),
+        voice_edit_acceptance_rate=None,
+    )
+    assert result.decision == "send_quiet"
+
+
+def test_compose_decision_records_a_malformed_reply(tmp_path) -> None:
+    result = compose_decision(
+        MagicMock(complete=MagicMock(return_value="I'd hold off.")), rendered_message="x",
+        recent_send_history=[], current_local_time=datetime(2026, 5, 11, 12, 0, tzinfo=UTC),
+        voice_edit_acceptance_rate=None, persona_dir=tmp_path,
+    )
+    assert result.decision == "hold"
+    (row,) = _rows(tmp_path)
+    assert row["site"] == "initiate_compose" and row["raw"] == "I'd hold off."
+
+
+def test_compose_decision_voice_edit_reads_fenced_and_records_malformed(tmp_path) -> None:
+    common = {
+        "proposal": {"old_text": "a", "new_text": "b", "rationale": "r", "evidence": []},
+        "current_voice_template": "v", "recent_voice_evolutions": [],
+        "current_local_time": datetime(2026, 5, 11, 12, 0, tzinfo=UTC), "persona_dir": tmp_path,
+    }
+    fenced = '```json\n{"decision": "drop", "reasoning": "no"}\n```'
+    assert compose_decision_voice_edit(MagicMock(complete=MagicMock(return_value=fenced)), **common).decision == "drop"
+    assert _rows(tmp_path) == []
+    held = compose_decision_voice_edit(MagicMock(complete=MagicMock(return_value="no json")), **common)
+    assert held.decision == "hold"
+    (row,) = _rows(tmp_path)
+    assert row["site"] == "initiate_voice_edit" and row["raw"] == "no json"
+
+
+
+def test_compose_decision_reads_a_reply_whose_reasoning_quotes_a_fenced_object() -> None:
+    raw = '{"decision": "send_quiet", "reasoning": "```\\n{}\\n```"}'
+    result = compose_decision(
+        MagicMock(complete=MagicMock(return_value=raw)), rendered_message="x",
+        recent_send_history=[], current_local_time=datetime(2026, 5, 11, 12, 0, tzinfo=UTC),
+        voice_edit_acceptance_rate=None,
+    )
+    assert result.decision == "send_quiet"

@@ -21,3 +21,21 @@ def test_parse_malformed_raises():
     import pytest
     with pytest.raises(ValueError):
         parse_note("not json")
+
+
+def test_make_note_records_an_unparseable_note(tmp_path):
+    """#364: make_note still raises; the reply is kept."""
+    import pytest
+
+    from brain.health.parse_failures import PARSE_FAILURE_LOG
+    from brain.notes.compose import make_note
+
+    class P:
+        def complete(self, prompt):
+            return "no note today"
+
+    with pytest.raises(ValueError):
+        make_note(P(), persona_name="n", user_name="u", dreams_summary="", emotion_summary="",
+                  last_session_summary=None, persona_dir=tmp_path)
+    (row,) = [json.loads(line) for line in (tmp_path / PARSE_FAILURE_LOG).read_text(encoding="utf-8").splitlines()]
+    assert row["site"] == "notes" and row["raw"] == "no note today"

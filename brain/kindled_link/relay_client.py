@@ -39,7 +39,8 @@ class RelayClient:
             if resp.status_code >= 400:
                 raise RelayUnavailableError(f"relay {path} -> {resp.status_code}")
             return resp
-        raise RelayUnavailableError(str(last_exc))
+        # Some transport errors carry no message; name the type so the audit row says why (#429).
+        raise RelayUnavailableError(str(last_exc) or type(last_exc).__name__)
 
     def register(self) -> None:
         self._post("/mailbox/register",

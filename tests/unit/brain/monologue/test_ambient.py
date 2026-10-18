@@ -25,7 +25,7 @@ def test_renders_active_verbatim(tmp_path):
         "queue and renders them VERBATIM (see test_renders_active_verbatim); a "
         "candidate cannot fade — store.fade(mem_id) raises KeyError since there is no "
         "DB row. The blurred-summary rendering is deferred to Phase 4 (Root 2 "
-        "stopgap)."
+        "stopgap); tracked in #420."
     ),
     strict=True,
 )

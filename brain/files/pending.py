@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from brain.utils.file_lock import file_lock
+from brain.utils.log_throttle import warn_throttled
 
 logger = logging.getLogger(__name__)
 
@@ -64,22 +66,48 @@ def create(persona_dir: Path, *, op: str, resolved_path: str, content: str,
     return rid
 
 
-def get(persona_dir: Path, rid: str) -> dict | None:
-    p = _dir(persona_dir) / f"{rid}.json"
+def _read(p: Path) -> dict | None:
+    """One record, or None. A missing record is normal; an unreadable one is
+    reported (#367), since it drops out of every listing. Writers replace the
+    file atomically, so a reader never sees a half-written record; on Windows
+    it can briefly meet a PermissionError while the replace runs, which is
+    transient and only logged at debug (a persistent denial on Windows is not
+    told apart from a transient one, and stays at debug). Elsewhere a PermissionError persists
+    (wrong owner, a bad chmod), so it is reported like any unreadable record."""
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        rec = json.loads(p.read_text(encoding="utf-8"))
+    except FileNotFoundError:
         return None
+    except (OSError, ValueError) as exc:
+        if isinstance(exc, PermissionError) and sys.platform == "win32":
+            logger.debug("pending write %s is busy; skipped this read", p.stem, exc_info=True)
+        else:
+            warn_throttled(logger, f"pending:{p}", "pending write %s is unreadable and is skipped", p.stem)
+        return None
+    if not isinstance(rec, dict):
+        warn_throttled(logger, f"pending:{p}", "pending write %s is a JSON %s, not a record; skipped",
+                       p.stem, type(rec).__name__, exc_info=False)
+        return None
+    return rec
+
+
+def get(persona_dir: Path, rid: str) -> dict | None:
+    return _read(_dir(persona_dir) / f"{rid}.json")
 
 
 def _all(persona_dir: Path) -> list[dict]:
-    out = []
-    for f in _dir(persona_dir).glob("*.json"):
-        try:
-            out.append(json.loads(f.read_text(encoding="utf-8")))
-        except (OSError, ValueError):
-            continue
-    return out
+    return [r for f in _dir(persona_dir).glob("*.json") if (r := _read(f)) is not None]
+
+
+def _age(r: dict, now: datetime) -> timedelta | None:
+    """How old a record is, or None. A record without a usable ``proposed_at``
+    drops out of every listing and is never expired, so it is reported (#429)."""
+    try:
+        return now - datetime.fromisoformat(r["proposed_at"])
+    except (ValueError, KeyError, TypeError):  # TypeError: null, or a tz-naive stamp
+        warn_throttled(logger, f"pending:{r.get('id')}", "pending write %s has no usable proposed_at; skipped",
+                       r.get("id"), exc_info=False)
+        return None
 
 
 def list_pending(persona_dir: Path, *, now: datetime) -> list[dict]:
@@ -87,9 +115,7 @@ def list_pending(persona_dir: Path, *, now: datetime) -> list[dict]:
     for r in _all(persona_dir):
         if r.get("status") != "pending":
             continue
-        try:
-            age = now - datetime.fromisoformat(r["proposed_at"])
-        except (ValueError, KeyError):
+        if (age := _age(r, now)) is None:
             continue
         if age <= timedelta(hours=_TTL_HOURS):
             fresh.append(r)
@@ -158,9 +184,7 @@ def sweep_expired(persona_dir: Path, *, now: datetime) -> int:
     for r in _all(persona_dir):
         if r.get("status") != "pending":
             continue
-        try:
-            age = now - datetime.fromisoformat(r["proposed_at"])
-        except (ValueError, KeyError):
+        if (age := _age(r, now)) is None:
             continue
         if age > timedelta(hours=_TTL_HOURS):
             # expect='pending': a card claimed since the read above is live, not expired (#344).

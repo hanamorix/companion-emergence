@@ -33,6 +33,7 @@ from brain.growth.proposal import (
     ReflexCrystallizationResult,
     ReflexPruneProposal,
 )
+from brain.health.parse_failures import record_parse_failure
 from brain.memory.store import MemoryStore
 
 logger = logging.getLogger(__name__)
@@ -394,6 +395,7 @@ def crystallize_reflex(
 
     parsed = _parse_response(response_text)
     if parsed is None:
+        record_parse_failure(persona_dir, site="reflex", raw=response_text, error="not a JSON object")
         return ReflexCrystallizationResult(emergences=[], prunings=[])
 
     raw_emergences = parsed.get("emergences", [])

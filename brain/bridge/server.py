@@ -72,6 +72,7 @@ from brain.chat.session import (
 )
 from brain.health.alarm import compute_pending_alarms
 from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
+from brain.health.parse_failures import count_recent as count_recent_parse_failures
 from brain.health.walker import walk_persona
 from brain.ingest.buffer import _SESSION_ID_RE as _BUFFER_SESSION_ID_RE
 from brain.memory import cost_series
@@ -1494,6 +1495,13 @@ def build_app(
             logger.warning("overlay probe failed", exc_info=True)
             running = None
 
+        # #364: replies that failed to parse, per site, so a quiet fallback shows.
+        try:
+            parse_failures = count_recent_parse_failures(s.persona_dir)
+        except OSError:  # the restart health-poll path: must never 500
+            logger.warning("parse-failure count failed", exc_info=True)
+            parse_failures = {}
+
         return {
             "liveness": "ok",
             "version": _brain_version,
@@ -1507,6 +1515,7 @@ def build_app(
             "health_error": health_error,
             "pending_alarms": len(alarms),
             "anomalies": len(anomalies),
+            "parse_failures_24h": parse_failures,
             # #246: the brain's CLI login state — "expired" means background LLM
             # calls are backed off and the app should offer re-authorisation.
             "provider_auth": provider_auth.state(),

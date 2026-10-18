@@ -456,3 +456,34 @@ def test_repair_warns_when_provider_json_matches_no_stub(tmp_path: Path, caplog)
 
     assert report.described == 0
     assert any("matched no stub" in r.getMessage() for r in caplog.records)
+
+
+def test_repair_records_an_unparseable_reply(tmp_path: Path) -> None:
+    """#364: the batch keeps its placeholders, and the reply is kept as evidence."""
+    from brain.health.parse_failures import PARSE_FAILURE_LOG
+    from brain.health.vocab_repair import run_vocab_repair
+
+    _write_vocab(tmp_path, [_stub_entry("body_grief")])
+    store = _make_store(tmp_path)
+    try:
+        run_vocab_repair(tmp_path, store=store, provider=_FakeProvider(response="I can't describe that."))
+    finally:
+        store.close()
+    rows = [json.loads(line) for line in (tmp_path / PARSE_FAILURE_LOG).read_text(encoding="utf-8").splitlines()]
+    assert [(r["site"], r["raw"]) for r in rows] == [("vocab_repair", "I can't describe that.")]
+
+
+def test_repair_records_a_non_object_reply_and_keeps_placeholders(tmp_path: Path) -> None:
+    """#364 review: a JSON list used to parse, then crash on mapping.get outside the batch try."""
+    from brain.health.parse_failures import PARSE_FAILURE_LOG
+    from brain.health.vocab_repair import run_vocab_repair
+
+    _write_vocab(tmp_path, [_stub_entry("body_grief")])
+    store = _make_store(tmp_path)
+    try:
+        report = run_vocab_repair(tmp_path, store=store, provider=_FakeProvider(response='["body_grief"]'))
+    finally:
+        store.close()
+    assert report.described == 0
+    rows = [json.loads(line) for line in (tmp_path / PARSE_FAILURE_LOG).read_text(encoding="utf-8").splitlines()]
+    assert [r["site"] for r in rows] == ["vocab_repair"]

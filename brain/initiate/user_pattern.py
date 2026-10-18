@@ -29,6 +29,7 @@ from pathlib import Path
 from brain.bridge.persisted_cadence import advance, is_due, load_cadence, save_cadence
 from brain.health.jsonl_reader import read_jsonl_skipping_corrupt, read_last_n_jsonl_lines
 from brain.initiate import presence_state
+from brain.utils.log_throttle import warn_throttled
 
 log = logging.getLogger(__name__)
 
@@ -601,6 +602,13 @@ def _run_daily_presence_recompute(persona_dir: Path, *, _now: datetime | None = 
         presence_state.save_presence_state(persona_dir, merged)
 
 
+def _note_failure(what: str) -> None:
+    """#367: these derivations fail soft (permissive defaults), but at DEBUG they
+    never reached runtime-<persona>.log (its handler is INFO). This runs about
+    twice per 15 minutes, so the warning is throttled."""
+    warn_throttled(log, f"user_pattern:{what}", "user_pattern: %s failed", what)
+
+
 def compute_user_presence(persona_dir: Path, *, _now: datetime | None = None) -> UserPresence:
     """Compute current UserPresence from persisted presence state + audit log.
 
@@ -625,12 +633,12 @@ def compute_user_presence(persona_dir: Path, *, _now: datetime | None = None) ->
                 advance(now=now, interval_s=_PRESENCE_DAILY_INTERVAL_S),
             )
     except Exception:
-        log.debug("user_pattern: daily presence recompute failed", exc_info=True)
+        _note_failure("daily presence recompute")
 
     try:
         state = presence_state.load_presence_state(persona_dir)
     except Exception:
-        log.debug("user_pattern: load_presence_state failed", exc_info=True)
+        _note_failure("load_presence_state")
         state = None
 
     try:
@@ -642,13 +650,13 @@ def compute_user_presence(persona_dir: Path, *, _now: datetime | None = None) ->
                 last_seen = last_seen.replace(tzinfo=UTC)
             silence_days = max(0.0, (now - last_seen).total_seconds() / 86400.0)
     except Exception:
-        log.debug("user_pattern: silence_days derivation failed", exc_info=True)
+        _note_failure("silence_days derivation")
         silence_days = 0.0
 
     try:
         ignore_streak = _compute_ignore_streak_bounded(persona_dir)
     except Exception:
-        log.debug("user_pattern: _compute_ignore_streak_bounded failed", exc_info=True)
+        _note_failure("_compute_ignore_streak_bounded")
         ignore_streak = 0
 
     try:
@@ -657,7 +665,7 @@ def compute_user_presence(persona_dir: Path, *, _now: datetime | None = None) ->
         else:
             likely_active = state.hour_counts[now.astimezone().hour] >= state.active_threshold
     except Exception:
-        log.debug("user_pattern: likely_active derivation failed", exc_info=True)
+        _note_failure("likely_active derivation")
         likely_active = True
 
     try:
@@ -666,7 +674,7 @@ def compute_user_presence(persona_dir: Path, *, _now: datetime | None = None) ->
         else:
             response_lag_p50 = state.reply_lag_running_mean
     except Exception:
-        log.debug("user_pattern: response_lag_p50 derivation failed", exc_info=True)
+        _note_failure("response_lag_p50 derivation")
         response_lag_p50 = None
 
     return UserPresence(

@@ -38,8 +38,15 @@ from brain.body.session_hours import (
 # import it without crossing into the bridge layer. See the new module's
 # docstring for the migration context.
 from brain.bridge import background_jobs, model_error, provider_auth
+from brain.utils.log_throttle import warn_throttled
 
 logger = logging.getLogger(__name__)
+
+def _flag_failed(what: str) -> bool:
+    """#367: the recovery-banner flags fail soft (False), but say why. They run
+    on every /persona/state poll, so the warning is throttled."""
+    warn_throttled(logger, f"persona_state:{what}", "recovery flag %s failed; reporting False", what)
+    return False
 
 
 def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> dict[str, Any]:
@@ -174,7 +181,7 @@ def _is_recovering(persona_dir: Path) -> bool:
                 return True
         return False
     except Exception:  # noqa: BLE001
-        return False
+        return _flag_failed("orphan_buffers")
 
 
 def _narrative_memory_replayed(persona_dir: Path) -> bool:
@@ -194,7 +201,7 @@ def _narrative_memory_replayed(persona_dir: Path) -> bool:
 
         return bool(load_or_recover(persona_dir).replayed)
     except Exception:  # noqa: BLE001
-        return False
+        return _flag_failed("narrative_memory_replayed")
 
 
 def _felt_time_recovered(persona_dir: Path) -> bool:
@@ -212,9 +219,9 @@ def _felt_time_recovered(persona_dir: Path) -> bool:
     if not state_file.exists():
         return False
     try:
-        return bool(json.loads(state_file.read_text()).get("replayed", False))
+        return bool(json.loads(state_file.read_text(encoding="utf-8")).get("replayed", False))
     except Exception:  # noqa: BLE001
-        return False
+        return _flag_failed("felt_time_recovered")
 
 
 def _build_pending_writes(persona_dir: Path) -> list[dict]:

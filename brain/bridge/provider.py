@@ -28,6 +28,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
@@ -49,7 +50,7 @@ from brain.bridge.chat import (
     ToolCall,
 )
 from brain.bridge.usage_log import log_usage
-from brain.utils.time import format_local, local_display
+from brain.utils.time import format_local, local_display, parse_iso_utc
 
 logger = logging.getLogger(__name__)
 
@@ -266,8 +267,8 @@ _PROVIDER_CONTEXT_OPTION_KEYS = frozenset(
     # engine.respond — NOT generation params. They must be stripped before options are
     # forwarded to a provider's sampler (e.g. Ollama gen-params), or they corrupt the
     # model call. Keep in sync with every context key engine.py sets on chat_options
-    # (persona_dir + the Option-A/A+ trio). See fork 7e7c7491.
-    {"persona_dir", "volatile_suffix", "include_block_clock", "session_id"}
+    # (persona_dir + the Option-A/A+ trio + user_name, #227). See fork 7e7c7491.
+    {"persona_dir", "volatile_suffix", "include_block_clock", "session_id", "user_name"}
 )
 
 # Per-event idle budget for chat_stream. If no stdout line arrives within
@@ -819,10 +820,10 @@ class ClaudeCliProvider(LLMProvider):
     text surface:
       - The first "system" message → ``--system-prompt``.
       - A single remaining user message is passed verbatim via ``-p``.
-      - Multi-turn history is serialised as JSONL context data, not a
-        ``User:`` / ``Assistant:`` transcript. Those canonical labels make
-        Claude more likely to continue the transcript and leak labels into
-        Nell's reply.
+      - Multi-turn history is told as one line per message (``<time> Hana: ...``),
+        not a ``User:`` / ``Assistant:`` script. That script made Claude more
+        likely to continue the transcript and leak labels into Nell's reply, so
+        each line leads with its local time and the companion is ``you``.
 
     Tool-calling via --mcp-config
     -----------------------------
@@ -834,7 +835,7 @@ class ClaudeCliProvider(LLMProvider):
     knows which persona directory to load.
 
     When ``tools`` is None, the text ``-p`` path applies. Multi-turn history
-    is encoded as JSONL context to avoid role-label leakage.
+    is told as narrative lines to avoid role-label leakage.
     """
 
     def __init__(
@@ -929,7 +930,7 @@ class ClaudeCliProvider(LLMProvider):
         """Flatten messages into Claude CLI; route through MCP when tools given.
 
         When ``tools`` is None:
-          - Sends the current user turn, plus multi-turn JSONL context when
+          - Sends the current user turn, plus multi-turn narrative context when
             needed, via ``-p``.
           - Returns ChatResponse(content=<text>, tool_calls=()).
 
@@ -971,6 +972,7 @@ class ClaudeCliProvider(LLMProvider):
             conversation_messages,
             volatile_suffix=volatile_suffix,
             include_block_clock=include_block_clock,
+            user_name=(options or {}).get("user_name"),
         )
         _maybe_log_cache_debug(
             options, call_type="chat", system_prompt=system_prompt, volatile_suffix=volatile_suffix
@@ -991,7 +993,7 @@ class ClaudeCliProvider(LLMProvider):
             )
 
         # Text path for turns without image blocks. Multi-turn history is
-        # formatted as JSONL context data instead of a script with canonical
+        # told as narrative lines instead of a script with canonical
         # User:/Assistant: labels, because those labels can leak into replies.
         # Prompt → stdin, system_prompt → tempfile + --system-prompt-file
         # keeps both off argv (Windows CreateProcess 32,767-char limit).
@@ -1103,6 +1105,7 @@ class ClaudeCliProvider(LLMProvider):
             conversation_messages,
             volatile_suffix=volatile_suffix,
             include_block_clock=include_block_clock,
+            user_name=(options or {}).get("user_name"),
         )
         _maybe_log_cache_debug(
             options, call_type="chat_stream", system_prompt=system_prompt, volatile_suffix=volatile_suffix
@@ -1922,13 +1925,6 @@ def _read_audit_lines_since(
 # ---------------------------------------------------------------------------
 
 
-_CLAUDE_SAFE_SPEAKERS = {
-    "user": "human",
-    "assistant": "companion",
-    "tool": "tool_result",
-}
-
-
 # Lines beginning with a known role label followed by ': ' indicate the
 # model has stopped replying and started scripting the next turn — a
 # common failure on creative scenes where the model treats its reply
@@ -2021,21 +2017,24 @@ def _format_claude_print_prompt(
     *,
     volatile_suffix: str | None = None,
     include_block_clock: bool = True,
+    user_name: str | None = None,
 ) -> str:
     """Format messages for ``claude -p`` without transcript role labels.
 
     A single text turn stays verbatim to preserve the simple generation shape.
-    Multi-turn history is encoded as JSONL data with non-canonical speaker
-    names. The previous ``User:`` / ``Assistant:`` script shape primed Claude
-    to continue that transcript, which sometimes leaked role labels into
-    Nell's visible reply.
+    Multi-turn history is told as one line per message (``<time> Hana: ...``),
+    one per message. The oldest shape, a ``User:`` / ``Assistant:`` script, primed
+    Claude to continue that transcript and leaked role labels into Nell's visible
+    reply; the JSONL shape that replaced it was sometimes completed onto a reply
+    as ``", "ts": "..."}`` (#227). ``user_name`` is the configured name of the
+    person Nell is talking to (``User`` when absent).
 
     ``volatile_suffix`` (Option A+) is the per-turn ambient context chunk. When
     provided it is appended AFTER the rendered context block in BOTH branches —
     so it is never dropped on a session's first turn (which hits the single-
     message branch) — placing every changing byte at the very end of the stdin
     prompt. ``include_block_clock=False`` drops the relocated clock line from the
-    top of the JSONL block (the suffix carries it instead). Both default to the
+    top of the context block (the suffix carries it instead). Both default to the
     pre-change behaviour, so non-chat callers are unaffected.
     """
     if not messages:
@@ -2047,6 +2046,7 @@ def _format_claude_print_prompt(
             messages,
             includes_latest_user=True,
             include_block_clock=include_block_clock,
+            user_name=user_name,
         )
     if volatile_suffix:
         return f"{base}\n\n{volatile_suffix}"
@@ -2059,13 +2059,15 @@ def _format_claude_context_block(
     includes_latest_user: bool,
     now: datetime | None = None,
     include_block_clock: bool = True,
+    user_name: str | None = None,
 ) -> str:
-    """Return a JSONL context block for Claude CLI prompt/system text.
+    """Return the narrative context block for Claude CLI prompt/system text.
 
-    The wording intentionally avoids the canonical ``User:`` and
-    ``Assistant:`` delimiters. JSON-string encoding also keeps embedded
-    newlines or user-supplied delimiter-looking text inside the data field
-    instead of creating new transcript lines.
+    One physical line per message (see ``_claude_context_lines``). The wording
+    intentionally avoids the canonical ``User:`` and ``Assistant:`` delimiters,
+    and each message's text is a JSON-string literal, so embedded newlines or
+    user-supplied delimiter-looking text stay inside the line instead of
+    creating new transcript lines.
 
     ``now`` is an optional test seam — when None the real UTC clock is used
     internally, then converted to local wall-clock time for display (issue
@@ -2076,10 +2078,10 @@ def _format_claude_context_block(
     of the block. The chat path passes False because that anchor moves to the
     Option A+ volatile suffix (it was the one per-call-changing byte sitting
     above the whole transcript, busting the history prefix); the image path and
-    any other caller keep it. Per-message ``ts`` values are unaffected by this
-    toggle either way, but are independently converted to local time for
-    display in ``_claude_context_jsonl_lines`` (stored/passed-through values
-    stay UTC; only the rendered JSONL is localized).
+    any other caller keep it. Per-message times are unaffected by this toggle
+    either way, but are independently converted to local time for display in
+    ``_claude_context_lines`` (stored/passed-through values stay UTC; only the
+    rendered line is localized).
     """
     if includes_latest_user:
         instruction = (
@@ -2095,40 +2097,123 @@ def _format_claude_context_block(
         )
 
     lines = [
-        "Conversation context is encoded below as JSONL data, not as a transcript to continue.",
+        "What has been said so far is below, one line per message, with the local time "
+        "it was said where that is known. It is context, not a transcript to continue.",
     ]
     if include_block_clock:
         # tz-local-display: block-level "Current time:" anchor (image path etc.)
         now_iso = format_local(now or datetime.now(UTC))
         lines.append(f"Current time: {now_iso}.")
         lines.append(
-            "Each entry's `ts` field (when present) is the wall-clock time of that message; use it to compute how much time has passed."
+            "Each line's time (when present) is the wall-clock time of that message; "
+            "use it to compute how much time has passed."
         )
     lines.append(instruction)
     lines.append("")
-    lines.extend(_claude_context_jsonl_lines(messages))
+    lines.extend(_claude_context_lines(messages, user_name=user_name))
     return "\n".join(lines)
 
 
-def _claude_context_jsonl_lines(messages: list[ChatMessage]) -> Iterator[str]:
-    """Yield one JSON object per chat turn using leak-resistant speaker names.
+_NARRATIVE_NAME_MAX = 40
+_NARRATIVE_LINE_BREAKS = {"\u2028": "\\u2028", "\u2029": "\\u2029", "\u0085": "\\u0085"}
+# Every character that can end a line for ``str.splitlines()`` or a terminal, plus the other C0 controls and DEL.
+# Tab is left alone: it does not start a new line and escaping it only costs readability.
+_NARRATIVE_ESCAPE = re.compile("[\x00-\x08\x0a-\x1f\x7f\x85\u2028\u2029]")
+_NARRATIVE_NAMED_ESCAPES = {"\n": "\\n", "\r": "\\r"}
 
-    ``ts`` (when present) is rendered as local wall-clock time (issue #217) —
-    ``msg.ts`` itself stays the raw stored UTC string; only this rendered
-    copy is converted.
+
+def _one_line(text: str) -> str:
+    """Escape the Unicode line breaks ``json.dumps(ensure_ascii=False)`` leaves raw."""
+    for ch, escaped in _NARRATIVE_LINE_BREAKS.items():
+        text = text.replace(ch, escaped)
+    return text
+
+
+def _narrative_literal(text: str) -> str:
+    """``text`` as a JSON string literal that can never span two physical lines."""
+    return _one_line(json.dumps(text, ensure_ascii=False))
+
+
+def _narrative_text(text: str) -> str:
+    """``text`` with every line break and control character escaped, so it can never span two physical lines.
+
+    Quotes and backslashes are left as written. # ponytail: that makes the escape lossy (a typed ``\\n`` and a
+    real line break read the same); the point is that a message cannot forge a line, and the model does not decode
+    it. Escape the backslash too if anything ever needs to parse the line back.
     """
+    return _NARRATIVE_ESCAPE.sub(
+        lambda m: _NARRATIVE_NAMED_ESCAPES.get(m.group(), f"\\u{ord(m.group()):04x}"), text
+    )
+
+
+def _narrative_name(raw: Any) -> str:
+    """A speaker name safe to put in a line: no control or line-break characters, bounded.
+
+    Whitespace of any kind becomes one space first, so a tab inside a name keeps two
+    words; the control, format and separator characters that remain are dropped.
+    May return "".
+    """
+    if not isinstance(raw, str):
+        return ""
+    spaced = "".join(" " if ch.isspace() else ch for ch in raw)
+    kept = "".join(
+        ch
+        for ch in spaced
+        if not unicodedata.category(ch).startswith("C")
+        and unicodedata.category(ch) not in ("Zl", "Zp")
+    )
+    return " ".join(kept.split())[:_NARRATIVE_NAME_MAX].strip()
+
+
+def _narrative_time(ts: str | None) -> str:
+    """Local display time for a stored ``ts``, or "" when absent or unparseable.
+
+    The raw string is never echoed: an unparseable value could carry a line break.
+    """
+    if not ts or not isinstance(ts, str):
+        return ""
+    try:
+        parse_iso_utc(ts)
+        return local_display(ts)  # tz-local-display: per-message time in the narrative chat context
+    except (ValueError, TypeError, OverflowError):  # OverflowError: parses, but has no local equivalent (year 1)
+        return ""
+
+
+def _claude_context_lines(messages: list[ChatMessage], *, user_name: str | None = None) -> Iterator[str]:
+    """Yield one line per chat turn: ``<time> <who>: <text>`` (#227).
+
+    The time is the stored UTC ``ts`` rendered as local wall-clock time (issue #217);
+    ``msg.ts`` itself is untouched and a missing or unparseable ``ts`` drops the clause.
+    ``<who>`` is the configured user name (``User`` without one, so it cannot be mistaken
+    for a person called "Human") for ``user`` messages and ``you`` for the companion's own.
+    Line breaks inside the text are escaped, so nothing in a message, a name, an id or a
+    ``ts`` can add, remove or reorder lines.
+    """
+    name = _narrative_name(user_name) or "User"
     for msg in messages:
-        record: dict[str, Any] = {
-            "speaker": _CLAUDE_SAFE_SPEAKERS.get(msg.role, msg.role),
-            "text": msg.content_text(),
-        }
-        if msg.ts:
-            record["ts"] = local_display(msg.ts)  # tz-local-display: per-message ts in JSONL chat context
-        if msg.tool_call_id:
-            record["tool_call_id"] = msg.tool_call_id
-        if msg.tool_calls:
-            record["tool_calls"] = [tc.to_dict() for tc in msg.tool_calls]
-        yield json.dumps(record, ensure_ascii=False)
+        when = _narrative_time(msg.ts)
+        text = _narrative_text(msg.content_text())
+        if msg.role == "user":
+            body = f"{name}: {text}"
+        elif msg.role == "assistant":
+            body = f"you: {text}"
+            for tc in msg.tool_calls:
+                args = _one_line(json.dumps(tc.arguments, ensure_ascii=False, default=str))
+                body += (
+                    f"; it called {_narrative_name(tc.name) or 'a tool'} with {args}"
+                    f" (call id {_narrative_literal(tc.id)})"
+                )
+        elif msg.role == "tool":
+            what = (
+                f"The result of tool call {_narrative_literal(msg.tool_call_id)} came back"
+                if msg.tool_call_id
+                else "The result of a tool call came back"
+            )
+            body = f"{what}: {text}"
+        else:
+            yield f"A {_narrative_name(msg.role) or 'system'} note: {text}"
+            continue
+        yield f"{when} {body}" if when else body
 
 
 # ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@ Claude context block, rendered in the companion's local time (issue #217)
 at the display seam - storage stays UTC throughout."""
 
 import json
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -54,7 +55,7 @@ def test_buffer_timestamps_appear_in_context_block(tmp_path: Path, monkeypatch):
     assert messages[0].ts == "2026-05-20T10:00:00Z"
     assert messages[1].ts == "2026-05-20T10:00:30Z"
 
-    # But the context block JSONL the companion actually reads renders ts in
+    # But the context lines the companion actually reads render the time in
     # local wall-clock time (#217), not the raw UTC string relabeled. The
     # exact offset depends on the CI runner's OS timezone, so assert what's
     # deterministic regardless of it: the raw 'Z'-suffixed UTC string does
@@ -62,17 +63,17 @@ def test_buffer_timestamps_appear_in_context_block(tmp_path: Path, monkeypatch):
     # exact same instant (a true zone conversion, not a stray reformat).
     now = datetime(2026, 5, 20, 7, 30, 0, tzinfo=_LOCAL)
     block = _format_claude_context_block(messages, includes_latest_user=True, now=now)
-    records = [json.loads(line) for line in block.splitlines() if line.startswith("{")]
-    assert records[0]["ts"] != "2026-05-20T10:00:00Z"
-    assert records[1]["ts"] != "2026-05-20T10:00:30Z"
-    assert not records[0]["ts"].endswith("Z")
-    assert not records[1]["ts"].endswith("Z")
-    assert datetime.fromisoformat(records[0]["ts"]).astimezone(UTC) == datetime(
-        2026, 5, 20, 10, 0, 0, tzinfo=UTC
-    )
-    assert datetime.fromisoformat(records[1]["ts"]).astimezone(UTC) == datetime(
-        2026, 5, 20, 10, 0, 30, tzinfo=UTC
-    )
+    times = [
+        re.match(r"^(\d{4}-\d{2}-\d{2}T\S+) (?:User|you): ", line).group(1)
+        for line in block.splitlines()
+        if re.match(r"^(\d{4}-\d{2}-\d{2}T\S+) (?:User|you): ", line)
+    ]
+    assert times[0] != "2026-05-20T10:00:00Z"
+    assert times[1] != "2026-05-20T10:00:30Z"
+    assert not times[0].endswith("Z")
+    assert not times[1].endswith("Z")
+    assert datetime.fromisoformat(times[0]).astimezone(UTC) == datetime(2026, 5, 20, 10, 0, 0, tzinfo=UTC)
+    assert datetime.fromisoformat(times[1]).astimezone(UTC) == datetime(2026, 5, 20, 10, 0, 30, tzinfo=UTC)
 
     # The preamble carries the "Current time" anchor in local wall-clock
     # time too (injected `now` above is trusted as already-local, per
@@ -106,8 +107,7 @@ def test_old_buffer_without_ts_loads_cleanly(tmp_path: Path, monkeypatch):
     assert messages[0].ts is None
     assert messages[1].ts is None
 
-    # Context block should still emit correctly — no ts fields in JSONL records
+    # Context block should still emit correctly — no time clause on the lines
     block = _format_claude_context_block(messages, includes_latest_user=True)
-    records = [json.loads(line) for line in block.splitlines() if line.startswith("{")]
-    assert "ts" not in records[0]
-    assert "ts" not in records[1]
+    lines = [line for line in block.splitlines() if line.startswith(("User: ", "you: "))]
+    assert lines == ["User: hi", "you: hello"]
