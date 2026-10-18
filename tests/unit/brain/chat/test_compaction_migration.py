@@ -2,9 +2,11 @@
 
 Maps to changes/compaction-backlog-migration/1.5-criteria.md (C-M1..C-M12).
 
-The headline fixture is a real 328-turn chatlog copy at
-``~/Downloads/30cd3047-3d47-45b9-a48f-e27f9f2a9bee.jsonl`` (buffer format). It is
-skipped-with-reason when absent so CI without the fixture still runs the edge cases.
+The headline fixture was a real 328-turn chatlog copy at
+``~/Downloads/30cd3047-3d47-45b9-a48f-e27f9f2a9bee.jsonl`` (buffer format) that was
+never committed, so the three headline tests skipped everywhere (#363). They now run
+on a synthetic chatlog of the same size and shape, and still use the real copy when
+a machine has it.
 """
 
 from __future__ import annotations
@@ -45,9 +47,29 @@ def _raw(turns: list[dict]) -> list[dict]:
     return [t for t in turns if t.get("speaker") != "summary"]
 
 
+def _synthetic_chatlog() -> list[dict]:
+    """328 alternating turns over five days ending before 2026-06-29, in bursts
+    with idle gaps, so the 24h replay sees several cohorts (as the real log did)."""
+    end = datetime(2026, 6, 29, tzinfo=UTC)
+    rows: list[dict] = []
+    for i in range(328):
+        day, k = divmod(i, 66)  # 66 turns a day, 5 days
+        ts = end - timedelta(days=5 - day) + timedelta(hours=9 + k // 6, minutes=(k % 6) * 7)
+        rows.append({"session_id": FIXTURE_SID,
+                     "speaker": "user" if i % 2 == 0 else "assistant",
+                     "text": f"day {day} turn {k} — “quoted” ünïcode",
+                     "ts": ts.isoformat(timespec="seconds")})
+    return rows
+
+
 def _load_fixture(persona_dir: Path) -> list[dict]:
-    """Copy the real chatlog into active_conversations/, cursor at the last ts."""
-    rows = [json.loads(line) for line in FIXTURE.read_text().splitlines() if line.strip()]
+    """Copy the chatlog (real when present, else synthetic) into
+    active_conversations/, cursor at the last ts."""
+    if FIXTURE.exists():
+        rows = [json.loads(line) for line in FIXTURE.read_text(encoding="utf-8").splitlines()
+                if line.strip()]
+    else:
+        rows = _synthetic_chatlog()
     dest_dir = persona_dir / "active_conversations"
     dest_dir.mkdir(parents=True, exist_ok=True)
     (dest_dir / f"{FIXTURE_SID}.jsonl").write_text(
@@ -72,13 +94,7 @@ def _count_transcript_raw_turns(prompt: str) -> int:
     return n
 
 
-fixture_required = pytest.mark.skipif(
-    not FIXTURE.exists(), reason=f"real chatlog fixture not present: {FIXTURE}"
-)
-
-
 # ---------------------------------------------------------------- C-M2/4/7/10
-@fixture_required
 def test_cm2_cm7_backlog_drained(tmp_path: Path) -> None:
     now = datetime(2026, 6, 30, tzinfo=UTC)  # fixed → deterministic vs the fixture ts
     rows = _load_fixture(tmp_path)
@@ -139,7 +155,6 @@ def test_time_stepping_one_fold_per_24h_cohort(tmp_path: Path) -> None:
     assert session[0]["speaker"] == "summary" and len(_raw(session)) == 40
 
 
-@fixture_required
 def test_cm4_lossless_multiset(tmp_path: Path) -> None:
     rows = _load_fixture(tmp_path)
     original = Counter(_identity(t) for t in _raw(rows))
@@ -153,7 +168,6 @@ def test_cm4_lossless_multiset(tmp_path: Path) -> None:
     assert all(archived[k] <= original[k] for k in archived)  # no dup in archive
 
 
-@fixture_required
 def test_cm10_archive_oldest_first_contiguous(tmp_path: Path) -> None:
     rows = _load_fixture(tmp_path)
     original_raw = _raw(rows)

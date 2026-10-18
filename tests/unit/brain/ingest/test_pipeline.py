@@ -1359,3 +1359,36 @@ def test_snapshot_commit_failure_does_not_evict(
     assert report.errors == 2
     assert report.commit_failures == 2
     assert report.memory_ids == []
+
+
+# ── #364: an unparseable extraction keeps every attempt's reply ───────────────
+def _parse_failure_rows(persona_dir: Path) -> list[dict]:
+    from brain.health.parse_failures import PARSE_FAILURE_LOG
+
+    path = persona_dir / PARSE_FAILURE_LOG
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
+
+
+def test_close_session_records_each_unparseable_extraction_attempt(
+    tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix
+) -> None:
+    ingest_turn(tmp_path, {"session_id": "sess_pf", "speaker": "Hana", "text": "hi"})
+    close_session(
+        tmp_path, "sess_pf", store=store, hebbian=hebbian,
+        provider=_GarbageProvider(), config={"extraction_max_retries": 1},
+    )
+    rows = _parse_failure_rows(tmp_path)
+    assert [(r["site"], r["raw"]) for r in rows] == [("ingest_extract", "absolutely not json {]")] * 2
+
+
+def test_session_snapshot_records_an_unparseable_extraction(
+    tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix
+) -> None:
+    from brain.ingest.pipeline import extract_session_snapshot
+
+    ingest_turn(tmp_path, {"session_id": "sess_pf2", "speaker": "Hana", "text": "hi"})
+    extract_session_snapshot(
+        tmp_path, "sess_pf2", store=store, hebbian=hebbian,
+        provider=_GarbageProvider(), config={"extraction_max_retries": 0},
+    )
+    assert [r["site"] for r in _parse_failure_rows(tmp_path)] == ["ingest_extract"]

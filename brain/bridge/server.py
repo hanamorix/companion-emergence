@@ -27,6 +27,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -48,7 +49,7 @@ from pydantic import BaseModel, Field, StrictBool
 
 from brain import __version__ as _brain_version
 from brain import prompt_strings, tunables
-from brain.bridge import events, provider_auth
+from brain.bridge import events, model_error, provider_auth
 from brain.bridge.chat import (
     ChatMessage,
     ChatResponse,
@@ -62,7 +63,7 @@ from brain.bridge.model_tier import (
     build_interactive_chat_provider,
     build_tier_provider,
 )
-from brain.bridge.provider import LLMProvider, ProviderError, _claude_work_dir
+from brain.bridge.provider import ClaudeCliProvider, LLMProvider, ProviderError, _claude_work_dir
 from brain.bridge.shutdown import BridgeShutdownController
 from brain.chat.session import (
     all_sessions,
@@ -71,6 +72,7 @@ from brain.chat.session import (
 )
 from brain.health.alarm import compute_pending_alarms
 from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
+from brain.health.parse_failures import count_recent as count_recent_parse_failures
 from brain.health.walker import walk_persona
 from brain.ingest.buffer import _SESSION_ID_RE as _BUFFER_SESSION_ID_RE
 from brain.memory import cost_series
@@ -607,8 +609,66 @@ def _stream_keepalive_seconds() -> float:
 
 def _chat_error_code(exc: BaseException) -> str:
     """Stable client code for a failed chat turn (#246): ``auth_expired`` when the
-    failing call's own text is an auth failure, else the generic ``provider_failed``."""
-    return "auth_expired" if provider_auth.is_auth_failure(str(exc)) else "provider_failed"
+    failing call's own text is an auth failure, ``model_unavailable`` (#440) when the
+    CLI rejected the model, else the generic ``provider_failed``. Auth wins."""
+    text = str(exc)
+    if provider_auth.is_auth_failure(text):
+        return "auth_expired"
+    if model_error.is_model_rejection(text):
+        return "model_unavailable"
+    return "provider_failed"
+
+
+def _chat_error_model(exc: BaseException, provider: Any) -> str | None:
+    """The model to name in a ``model_unavailable`` error: the one the CLI said it rejected, else
+    the provider's configured model. None for any other error. Always valid model grammar."""
+    text = str(exc)
+    if provider_auth.is_auth_failure(text) or not model_error.is_model_rejection(text):
+        return None
+    return model_error.rejected_model_name(text, getattr(provider, "_model", None))
+
+
+def _chat_error_detail(exc: BaseException, provider: Any) -> str:
+    """HTTP ``detail`` for a failed /chat: the code, plus ``:<model>`` for ``model_unavailable``."""
+    code = _chat_error_code(exc)
+    model = _chat_error_model(exc, provider)
+    return f"{code}:{model}" if model else code
+
+
+# Apply-time check of a custom model id (#440): a few tiny real calls (the chat id, then the tier ids derived
+# from it), so a typo is refused with a specific message instead of failing later inside background jobs.
+# ONE budget covers the whole Apply, not each probe. The app's request has no timeout of its own (bridge.ts
+# `bridgeFetch` sets no AbortSignal), so the limit that applies is the webview's network stack: WKWebView
+# (macOS) cuts an idle request at about 60 s; WebView2 and WebKitGTK are not known to cut earlier. A custom id
+# is also not replayed, so a cut request would show an error while the bridge still saves. 30 s keeps the
+# worst case (a hanging CLI) at half of that; a rejected id answers in seconds.
+_MODEL_CHECK_TIMEOUT_S = tunables.register("provider.model_check_timeout_seconds", 30.0)
+_MODEL_CHECK_PROMPT = "Reply with the single word OK."
+_MIN_PROBE_S = 1  # a probe given less than this is not started
+
+
+def _check_budget_s() -> float:
+    return float(tunables.get_tunable("provider.model_check_timeout_seconds", _MODEL_CHECK_TIMEOUT_S))
+
+
+def _check_model_blocking(model_id: str, timeout_s: float | None = None) -> tuple[str, str]:
+    """Run ONE ``generate()`` with ``model_id``. Returns ``("ok", "")``, ``("rejected", "")`` or
+    ``("inconclusive", <reason>)``. Never raises. No ``persona_dir`` is passed, so no usage row is written,
+    and the call is suppressed in ``model_error`` so a refused id leaves no record or WARNING.
+    ``timeout_s`` is the time this probe may use (default: the whole Apply budget)."""
+    timeout = max(_MIN_PROBE_S, int(_check_budget_s() if timeout_s is None else timeout_s))
+    try:
+        with model_error.suppressed():
+            ClaudeCliProvider(model=model_id, timeout_seconds=timeout).generate(_MODEL_CHECK_PROMPT)
+        return "ok", ""
+    except provider_auth.ProviderAuthDeferred:
+        return "inconclusive", "auth_deferred"
+    except TimeoutError:
+        return "inconclusive", "timeout"
+    except Exception as exc:  # noqa: BLE001 - any other failure only means "could not check"
+        if model_error.is_model_rejection(str(exc)):
+            return "rejected", ""
+        return "inconclusive", "failed"
 
 
 async def _flush_cost_series_at_stop(persona_dir: Path) -> None:
@@ -1435,6 +1495,13 @@ def build_app(
             logger.warning("overlay probe failed", exc_info=True)
             running = None
 
+        # #364: replies that failed to parse, per site, so a quiet fallback shows.
+        try:
+            parse_failures = count_recent_parse_failures(s.persona_dir)
+        except OSError:  # the restart health-poll path: must never 500
+            logger.warning("parse-failure count failed", exc_info=True)
+            parse_failures = {}
+
         return {
             "liveness": "ok",
             "version": _brain_version,
@@ -1448,6 +1515,7 @@ def build_app(
             "health_error": health_error,
             "pending_alarms": len(alarms),
             "anomalies": len(anomalies),
+            "parse_failures_24h": parse_failures,
             # #246: the brain's CLI login state — "expired" means background LLM
             # calls are backed off and the app should offer re-authorisation.
             "provider_auth": provider_auth.state(),
@@ -1915,22 +1983,36 @@ def build_app(
             return _self_test.run_self_test(persona_dir, http=http)
 
     # ── POST /persona/config/model — live model switching ──────────────────
+    model_check_lock = asyncio.Lock()  # single-flight: one Apply-time check call at a time
+
     @app.post("/persona/config/model", dependencies=[Depends(require_http_auth)])
     async def set_persona_model(req: ModelConfigReq) -> dict:
         """Switch the active LLM model without restarting the bridge.
 
-        Validates `model` against KNOWN_MODELS (sonnet / opus / haiku),
-        persists to persona_config.json, and hot-swaps provider._model so
+        Accepts an alias (sonnet / opus / haiku) or a full model id (``claude-...``), validated by
+        ``is_valid_model``. A FULL id on a claude-cli provider is first checked with one real call (#440):
+        if Claude rejects it the id is NOT saved. Any other check failure (timeout, expired login, rate
+        limit) saves it unchecked. Then persists to persona_config.json and hot-swaps provider._model so
         the next chat uses the new model immediately.
 
-        Returns: {ok: true, model: <new_model>}
+        Returns: {ok: true, model: <new_model>}  (+ ``checked: bool`` when a check was attempted)
         Errors:  400 {ok: false, error: "unknown_model", valid: [...]}
+                 400 {ok: false, error: "model_unavailable", model: <id>}
         """
         from dataclasses import replace as dc_replace
 
-        from brain.persona_config import KNOWN_MODELS, PersonaConfig
+        from brain.bridge.model_tier import (
+            ROUTED_CLAUDE_TIERS,
+            candidate_tier_models,
+            derive_model,
+            model_for_tier,
+            tier_fallbacks,
+            tier_family,
+            unchecked_tiers,
+        )
+        from brain.persona_config import KNOWN_MODELS, PersonaConfig, is_valid_model
 
-        if req.model not in KNOWN_MODELS:
+        if not is_valid_model(req.model):
             return JSONResponse(
                 status_code=400,
                 content={
@@ -1941,14 +2023,94 @@ def build_app(
             )
         s: BridgeAppState = app.state.bridge
         config_path = s.persona_dir / "persona_config.json"
+        before = PersonaConfig.load(config_path)
+        checked: bool | None = None
+        # Derived tier ids that are tested together with the chat id (#441): the ids the routed tiers would
+        # follow, minus the chat id itself and minus families whose every tier has an explicit override.
+        derived_ids: list[str] = []
+        for tier in ROUTED_CLAUDE_TIERS:
+            family = tier_family(model_for_tier(tier))
+            derived = None if before.tier_models.get(tier) or not family else derive_model(req.model, family)
+            if derived and derived != req.model and derived not in derived_ids:
+                derived_ids.append(derived)
+        derived_outcomes: dict[str, str] = {}
+        if req.model not in KNOWN_MODELS and isinstance(s.provider, ClaudeCliProvider):
+            async with model_check_lock:
+                budget = _check_budget_s()
+                started = time.monotonic()
+                outcome, reason = await asyncio.to_thread(_check_model_blocking, req.model, budget)
+                if outcome == "rejected":  # no derived probe is spent on an id that is refused anyway
+                    return JSONResponse(
+                        status_code=400,
+                        content={"ok": False, "error": "model_unavailable", "model": req.model},
+                    )
+                # The derived probes share what is left of the ONE budget (they run together, so the
+                # whole Apply stays inside it); none is started once it is used up.
+                left = budget - (time.monotonic() - started)
+                if derived_ids and left >= _MIN_PROBE_S:
+                    derived_results = await asyncio.gather(
+                        *(asyncio.to_thread(_check_model_blocking, m, left) for m in derived_ids)
+                    )
+                else:
+                    derived_results = [("inconclusive", "budget")] * len(derived_ids)
+            checked = outcome == "ok"
+            if not checked:
+                logger.info(
+                    "model check for %s was inconclusive, saved unchecked: reason=%s", req.model, reason
+                )
+            derived_outcomes = {m: res[0] for m, res in zip(derived_ids, derived_results, strict=True)}
+            # An id the probe just proved usable is no longer rejected: drop any earlier runtime record, or
+            # the tiers would stay on their fallback and the panel would keep saying it is unavailable.
+            for confirmed in [req.model if checked else None, *(m for m, o in derived_outcomes.items() if o == "ok")]:
+                if confirmed:
+                    model_error.note_success(confirmed)
+        # Re-read right before writing, so a change another request made while the checks ran is kept.
         current = PersonaConfig.load(config_path)
-        updated = dc_replace(current, model=req.model)
+        unavailable: list[str] = []
+        if req.model not in KNOWN_MODELS:
+            unavailable = [m for m, o in derived_outcomes.items() if o == "rejected"]
+            # An earlier "rejected" for this same chat id stays when the new check could not tell.
+            unavailable += [
+                m
+                for m in current.derived_unavailable
+                if current.model == req.model
+                and m not in unavailable
+                and (derived_outcomes.get(m) == "inconclusive" or (not derived_outcomes and m in derived_ids))
+            ]
+        updated = dc_replace(current, model=req.model, derived_unavailable=unavailable)
         updated.save(config_path)
+        model_error.switch(current.model, req.model, keep=candidate_tier_models(updated))
+        # Derived ids the probes could not settle are "not checked yet" (told to the user, cleared by a clean
+        # reply for that id) unless they are already shown as fallbacks. Marked AFTER switch(), which drops
+        # the old chat id's marks, so a mark set by this very Apply is never wiped by it.
+        tiers_unchecked = unchecked_tiers(
+            updated, [m for m, o in derived_outcomes.items() if o == "inconclusive"]
+        )
+        for derived_id in derived_outcomes:
+            if derived_id in tiers_unchecked:
+                model_error.note_tier_unconfirmed(derived_id)
+            else:
+                model_error.clear_tier_unconfirmed(derived_id)
+        # Mark (or clear) BEFORE the hot-swap: the provider can only produce a clean reply for the new model
+        # after the swap, and that reply clears the mark. A re-Apply of the model already saved unchecked
+        # goes through here too (switch() ignores old == new), so a passing check clears the old mark.
+        if checked is False:
+            model_error.note_unconfirmed(req.model)  # shown in /persona/state until a clean reply
+        else:
+            model_error.clear_unconfirmed(req.model)
         # Hot-swap: if the live provider exposes _model, update it so the
         # next chat call uses the new model without a bridge restart.
         if hasattr(s.provider, "_model"):
             s.provider._model = req.model
-        return {"ok": True, "model": req.model}
+        body: dict[str, Any] = {"ok": True, "model": req.model}
+        if checked is not None:
+            body["checked"] = checked
+        fallbacks = tier_fallbacks(updated)
+        if fallbacks:
+            body["fallbacks"] = fallbacks
+        if tiers_unchecked:
+            body["tiers_unchecked"] = tiers_unchecked
+        return body
 
     # ── POST /persona/config/pronouns — user pronoun persist ──────────────
     @app.post("/persona/config/pronouns", dependencies=[Depends(require_http_auth)])
@@ -2781,7 +2943,7 @@ def build_app(
                 # logs only — clients get a stable code, not stderr or
                 # local paths from the underlying provider/process.
                 # #246: classified from THIS call's text, never from global state.
-                raise HTTPException(status_code=502, detail=_chat_error_code(exc)) from exc
+                raise HTTPException(status_code=502, detail=_chat_error_detail(exc, s.provider)) from exc
             duration_ms = int((datetime.now(UTC) - t0).total_seconds() * 1000)
             s.last_chat_at = datetime.now(UTC)
             events.publish(
@@ -2976,7 +3138,11 @@ def build_app(
                 logger.exception("stream failed session=%s", session_id)
                 # Audit 2026-05-07 P3-2: stable code for clients;
                 # full exception text stays in the log only.
-                await ws.send_json({"type": "error", "code": _chat_error_code(exc), "done": True})
+                error_frame: dict[str, Any] = {"type": "error", "code": _chat_error_code(exc), "done": True}
+                rejected_model = _chat_error_model(exc, s.provider)
+                if rejected_model:
+                    error_frame = {**error_frame, "model": rejected_model}
+                await ws.send_json(error_frame)
                 await ws.close()
                 return
 

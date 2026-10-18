@@ -96,3 +96,44 @@ def test_prompt_fences_transcript_untrusted():
     assert p.index("BEGIN UNTRUSTED") < p.index("peer says hi") < p.index("END UNTRUSTED")
     low = p.lower()
     assert "approved" in low or "ignore" in low  # in-content auth claims disclaimed
+
+
+def test_malformed_verdict_is_recorded_in_the_persona_log(tmp_path):
+    """#364: the gate holds (fail closed) and keeps the verdict that made it hold."""
+    import json as _json
+
+    from brain.health.parse_failures import PARSE_FAILURE_LOG
+
+    store = KindledLinkStore(tmp_path / "k.db")
+    gate = PrivacyGate(provider=_StubProvider("not json at all"), store=store,
+                       throttle=_GrantThrottle(), persona_dir=tmp_path)
+    assert _review(gate).action == "hold"
+    rows = [_json.loads(line) for line in (tmp_path / PARSE_FAILURE_LOG).read_text(encoding="utf-8").splitlines()]
+    # A peer's words never land in the persona-root log: length only.
+    assert [(r["site"], r["raw"], r["raw_len"]) for r in rows] == [("privacy_gate", "", len("not json at all"))]
+
+
+def test_session_engine_gives_its_default_gate_the_persona_dir(tmp_path):
+    from brain.kindled_link.session_engine import SessionEngine
+
+    store = KindledLinkStore(tmp_path / "k.db")
+    engine = SessionEngine(store=store, identity=None, provider=_StubProvider("{}"), persona_dir=tmp_path)
+    assert engine._gate._persona_dir == tmp_path
+
+
+def test_an_unknown_decision_value_never_reaches_the_log(tmp_path, caplog):
+    """#427 review: a 500-character decision value was stored in full in a
+    keep_raw=False row and written to the runtime log."""
+    import json as _json
+    import logging
+
+    from brain.health.parse_failures import PARSE_FAILURE_LOG
+
+    value = "PEERTEXT" * 60
+    store = KindledLinkStore(tmp_path / "k.db")
+    gate = PrivacyGate(provider=_StubProvider(_json.dumps({"decision": value})), store=store,
+                       throttle=_GrantThrottle(), persona_dir=tmp_path)
+    with caplog.at_level(logging.DEBUG):
+        assert _review(gate).action == "hold"
+    text = (tmp_path / PARSE_FAILURE_LOG).read_text(encoding="utf-8")
+    assert "PEERTEXT" not in text and "PEERTEXT" not in caplog.text

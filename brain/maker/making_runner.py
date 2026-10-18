@@ -41,7 +41,7 @@ def make_and_wire(*, persona_dir: Path, store: Any, provider: Any,
             # failure (no cooldown, no charge penalty, no error log).
             raise _cli_throttle.ThrottleDeferred("throttle deferred")
         making = _maker.make(provider, charge_sources=sources,
-                             emotion_summary=_emotion_summary(store))
+                             emotion_summary=_emotion_summary(store), persona_dir=persona_dir)
 
     works = WorksStore(persona_dir / "works.db")
     try:

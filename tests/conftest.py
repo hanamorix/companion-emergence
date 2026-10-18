@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from brain.bridge import cli_throttle, provider_auth
+from brain.bridge import cli_throttle, model_error, provider_auth
 from brain.chat import pass2_queue
 from brain.memory import pending
 
@@ -52,9 +52,11 @@ def _reset_cli_throttle() -> Iterator[None]:
     """
     cli_throttle.reset()
     provider_auth.reset()  # #246: the auth-expiry hooks live inside the CLI detail helpers
+    model_error.reset()  # #440: process-wide rejected-model records must not leak between tests
     yield
     cli_throttle.reset()
     provider_auth.reset()
+    model_error.reset()
 
 
 @pytest.fixture(autouse=True)

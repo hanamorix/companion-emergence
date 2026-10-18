@@ -12,6 +12,7 @@ Used by:
 
 from __future__ import annotations
 
+import json
 import re
 
 _JSON_FENCE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
@@ -30,3 +31,16 @@ def extract_json_object(raw: str) -> str:
     if loose is None:
         raise ValueError("no JSON object found in response")
     return loose.group(1)
+
+
+def loads_json_object(raw: str) -> dict:
+    """Parse a reply that should be one JSON object: the whole reply first,
+    then the tolerant ``extract_json_object`` scrape. Raises ValueError when no
+    object can be read (#364)."""
+    try:
+        data = json.loads(raw.strip())
+    except ValueError:
+        data = json.loads(extract_json_object(raw))
+    if not isinstance(data, dict):
+        raise ValueError(f"expected a JSON object, got {type(data).__name__}")
+    return data

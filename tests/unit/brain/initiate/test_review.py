@@ -945,3 +945,33 @@ def test_run_initiate_review_tick_reads_voice_md_not_nell_voice_md(tmp_path, mon
     assert templates_seen[0] == "canonical voice", (
         f"Expected 'canonical voice' from voice.md, got {templates_seen[0]!r}"
     )
+
+
+def test_process_one_candidate_keeps_an_unparseable_decision_in_the_persona_log(tmp_path):
+    """#364 through the review path: compose's parse failure lands in this persona's log."""
+    import json
+    from dataclasses import asdict
+
+    from brain.health.parse_failures import PARSE_FAILURE_LOG
+    from brain.initiate.review import _process_one_candidate
+    from brain.initiate.schemas import InitiateCandidate, SemanticContext
+
+    cand = InitiateCandidate(
+        candidate_id="ic_voice",
+        ts="2026-05-28T00:00:00+00:00",
+        kind="voice_edit_proposal",
+        source="voice_reflection",
+        source_id="vr_001",
+        emotional_snapshot=None,
+        semantic_context=SemanticContext(linked_memory_ids=[], topic_tags=[]),
+        proposal={"old_text": "a", "new_text": "b", "rationale": "r", "evidence": []},
+    )
+    (tmp_path / "initiate_queue.jsonl").write_text(json.dumps(asdict(cand)) + "\n")
+
+    _process_one_candidate(
+        tmp_path, cand, provider=MagicMock(complete=MagicMock(return_value="not a decision")),
+        voice_template="warm", now=datetime(2026, 5, 28, 0, 0, tzinfo=UTC),
+    )
+
+    rows = [json.loads(line) for line in (tmp_path / PARSE_FAILURE_LOG).read_text(encoding="utf-8").splitlines()]
+    assert [(r["site"], r["raw"]) for r in rows] == [("initiate_voice_edit", "not a decision")]

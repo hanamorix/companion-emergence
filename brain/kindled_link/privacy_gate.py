@@ -12,8 +12,10 @@ import json
 import logging
 import re
 from datetime import datetime
+from pathlib import Path
 
 from brain.bridge import cli_throttle as _default_throttle
+from brain.health.parse_failures import record_parse_failure
 from brain.kindled_link import limits
 from brain.kindled_link.gate import GateDecision, OutboundPayload
 
@@ -132,14 +134,17 @@ def _build_gate_prompt(*, body: str, relationship_hint_json: str,
     return "\n\n".join(parts)
 
 
-def _parse_verdict(raw: str) -> GateDecision:
-    """Parse the model's JSON verdict; any malformation → hold (fail closed)."""
+def _parse_verdict(raw: str, persona_dir: Path | None = None) -> GateDecision:
+    """Parse the model's JSON verdict; any malformation → hold (fail closed),
+    and the verdict is kept in the parse-failure log (#364)."""
     try:
         start = raw.index("{")
         end = raw.rindex("}") + 1
         data = json.loads(raw[start:end])
         action = data.get("decision")
         if action not in {"send", "revise", "hold", "end_or_pause"}:
+            record_parse_failure(persona_dir, site="privacy_gate", raw=raw,
+                                 error="unknown decision", keep_raw=False)
             return GateDecision(action="hold", reason="gate: unparseable decision")
         # MISSING or malformed texture_score → 1.0 (safe/high): an unknown
         # disclosure magnitude is treated as maximal so the budget depletes
@@ -155,8 +160,8 @@ def _parse_verdict(raw: str) -> GateDecision:
             revision_constraints=data.get("revision_constraints"),
             texture_score=score,
         )
-    except Exception:  # noqa: BLE001 — fail closed
-        log.warning("privacy gate: malformed verdict; holding", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 — fail closed
+        record_parse_failure(persona_dir, site="privacy_gate", raw=raw, error=type(exc).__name__, keep_raw=False)
         return GateDecision(action="hold", reason="gate: malformed verdict")
 
 
@@ -184,10 +189,11 @@ def _apply_budget(decision: GateDecision, *, budget: float) -> GateDecision:
 
 
 class PrivacyGate:
-    def __init__(self, *, provider, store, throttle=_default_throttle):
+    def __init__(self, *, provider, store, throttle=_default_throttle, persona_dir=None):
         self._provider = provider
         self._store = store
         self._throttle = throttle
+        self._persona_dir = persona_dir
 
     @staticmethod
     def _payload_text(payload: OutboundPayload) -> str:
@@ -242,5 +248,5 @@ class PrivacyGate:
             self._store.release_provider_slot(peer_id, today)  # no completed call → refund
             log.warning("privacy gate: provider error; holding", exc_info=True)
             return GateDecision(action="hold", reason="gate: provider error")
-        decision = _parse_verdict(raw)
+        decision = _parse_verdict(raw, self._persona_dir)
         return _apply_budget(decision, budget=budget)

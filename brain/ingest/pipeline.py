@@ -174,6 +174,7 @@ def close_session(
         assistant_name=assistant_name,
         emotion_vocab=emotion_vocab,
         user_pronouns=_load_user_pronouns(persona_dir),
+        persona_dir=persona_dir,
     )
     if extraction.failed:
         report.errors += 1
@@ -348,6 +349,7 @@ def extract_session_snapshot(
         assistant_name=assistant_name,
         emotion_vocab=emotion_vocab,
         user_pronouns=_load_user_pronouns(persona_dir),
+        persona_dir=persona_dir,
     )
     if extraction.failed:
         report.errors += 1

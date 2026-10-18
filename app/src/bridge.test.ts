@@ -35,6 +35,7 @@ import {
   resetBridgeCredentialCache,
   sendChat,
   setPersonaModel,
+  setPersonaModelFull,
   setPersonaPronouns,
   shutdownBridge,
   snapshotSession,
@@ -327,12 +328,86 @@ describe("setPersonaModel", () => {
     await expect(setPersonaModel("alice", "haiku")).resolves.toBeUndefined();
   });
 
+  it("setPersonaModelFull also returns the tier fallbacks", async () => {
+    const fb = [{ family: "haiku", wanted: "claude-haiku-5", using: "haiku" }];
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: true, fallbacks: fb }), { status: 200 }),
+    ));
+    await expect(setPersonaModelFull("alice", "claude-sonnet-5")).resolves.toEqual({ checked: true, fallbacks: fb, tiersUnchecked: [] });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: true, tiers_unchecked: ["claude-haiku-5"] }), { status: 200 }),
+    ));
+    await expect(setPersonaModelFull("alice", "claude-sonnet-5")).resolves.toEqual({ checked: true, fallbacks: [], tiersUnchecked: ["claude-haiku-5"] });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, model: "opus" }), { status: 200 }),
+    ));
+    await expect(setPersonaModelFull("alice", "opus")).resolves.toEqual({ checked: undefined, fallbacks: [], tiersUnchecked: [] });
+  });
+
+  it("resolves to the bridge's checked flag for a custom id", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: true }), { status: 200 }),
+    ));
+    await expect(setPersonaModel("alice", "claude-sonnet-5")).resolves.toBe(true);
+
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: false }), { status: 200 }),
+    ));
+    await expect(setPersonaModel("alice", "claude-sonnet-5")).resolves.toBe(false);
+  });
+
   it("throws on a non-2xx response", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ ok: false, error: "unknown_model" }), { status: 400 }),
     ));
 
     await expect(setPersonaModel("alice", "sonnet")).rejects.toThrow("setPersonaModel failed: 400");
+  });
+
+  // #440: a full id is checked by the bridge before it is saved.
+  it("sends a full model id as written", async () => {
+    const spy = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: true }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", spy);
+
+    await setPersonaModel("alice", "claude-sonnet-5");
+
+    expect(JSON.parse(spy.mock.calls[0]![1]!.body as string)).toEqual({ model: "claude-sonnet-5" });
+  });
+
+  it("turns a refused model into the specific message naming it", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({ ok: false, error: "model_unavailable", model: "claude-sonet-5" }),
+        { status: 400 },
+      ),
+    ));
+
+    const err = await setPersonaModel("alice", "claude-sonet-5").catch((e: Error) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toContain('"claude-sonet-5"');
+    expect((err as Error).message).toMatch(/doesn't recognise/i);
+    expect((err as Error).message).not.toMatch(/setPersonaModel failed/);
+  });
+
+  it("does not replay a custom id after a network failure (a replay would run a second check)", async () => {
+    const spy = vi.fn().mockRejectedValue(new TypeError("Failed to fetch"));
+    vi.stubGlobal("fetch", spy);
+
+    await expect(setPersonaModel("alice", "claude-sonnet-5")).rejects.toThrow("Failed to fetch");
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it("still replays an alias after a network failure", async () => {
+    const spy = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockResolvedValue(new Response(JSON.stringify({ ok: true, model: "opus" }), { status: 200 }));
+    vi.stubGlobal("fetch", spy);
+
+    await expect(setPersonaModel("alice", "opus")).resolves.toBeUndefined();
+    expect(spy).toHaveBeenCalledTimes(2);
   });
 });
 

@@ -832,3 +832,76 @@ def test_compute_topic_overlap_returns_zero_on_provider_error() -> None:
     )
 
     assert score == 0.0
+
+
+# ── #364: the raw reply survives a failed parse ───────────────────────────────
+def _pf_sites(persona_dir: Path) -> list[tuple[str, str]]:
+    import json as _json
+
+    from brain.health.parse_failures import PARSE_FAILURE_LOG
+
+    path = persona_dir / PARSE_FAILURE_LOG
+    if not path.exists():
+        return []
+    return [(r["site"], r["raw"]) for r in map(_json.loads, path.read_text(encoding="utf-8").splitlines())]
+
+
+def test_compute_topic_overlap_records_a_malformed_reply(tmp_path: Path) -> None:
+    from brain.engines.research import _compute_topic_overlap_via_haiku
+
+    class P:
+        def generate(self, prompt, *, system=None):
+            return "not even close to JSON"
+
+    score = _compute_topic_overlap_via_haiku(
+        thread_topic="x", thread_summary="", recent_conversation_excerpt="",
+        provider=P(), user_name="Hana", persona_dir=tmp_path,
+    )
+    assert score == 0.0
+    assert _pf_sites(tmp_path) == [("research_topic_overlap", "not even close to JSON")]
+
+
+def test_compute_topic_overlap_provider_error_is_not_a_parse_failure(tmp_path: Path) -> None:
+    from brain.engines.research import _compute_topic_overlap_via_haiku
+
+    class P:
+        def generate(self, prompt, *, system=None):
+            raise OSError("cli gone")
+
+    assert _compute_topic_overlap_via_haiku(
+        thread_topic="x", thread_summary="", recent_conversation_excerpt="",
+        provider=P(), user_name="Hana", persona_dir=tmp_path,
+    ) == 0.0
+    assert _pf_sites(tmp_path) == []
+
+
+def test_select_parse_failure_is_recorded_in_the_persona_log(tmp_path: Path):
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        provider = ScriptedProvider(
+            [
+                "not json at all, just rambling prose",
+                "NOTES:\nfound stuff\n\nMEMORY:\nSession happened.\n\nVERDICT:\ncontinue",
+            ]
+        )
+        engine = _build_engine(tmp_path, store, provider=provider)
+        engine.run_tick(trigger="manual", days_since_human_override=5.0)
+    finally:
+        store.close()
+    assert ("research_select", "not json at all, just rambling prose") in _pf_sites(tmp_path)
+
+
+def test_compute_topic_overlap_provider_keyerror_still_scores_zero(tmp_path: Path) -> None:
+    """#364 review: the old except covered KeyError/TypeError from the provider call too."""
+    from brain.engines.research import _compute_topic_overlap_via_haiku
+
+    class P:
+        def generate(self, prompt, *, system=None):
+            raise KeyError("model")
+
+    assert _compute_topic_overlap_via_haiku(
+        thread_topic="x", thread_summary="", recent_conversation_excerpt="",
+        provider=P(), user_name="Hana", persona_dir=tmp_path,
+    ) == 0.0
+    assert _pf_sites(tmp_path) == []
