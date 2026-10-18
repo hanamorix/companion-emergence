@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 import pytest
 
-from brain.bridge import model_error, model_tier
+from brain.bridge import model_error
 from brain.bridge.model_tier import (
     ROUTED_CLAUDE_TIERS,
     TIER_ATTUNEMENT_DETECTOR,
@@ -30,8 +30,8 @@ from brain.bridge.model_tier import (
     candidate_tier_models,
     derive_model,
     resolve_tier_model,
-    tier_family,
     tier_fallbacks,
+    tier_family,
 )
 from brain.persona_config import PersonaConfig, is_valid_model
 

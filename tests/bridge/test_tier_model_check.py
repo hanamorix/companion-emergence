@@ -165,7 +165,7 @@ def test_inconclusive_recheck_keeps_an_earlier_rejection_for_the_same_chat_id(pe
 
 
 def test_a_family_whose_tiers_are_all_overridden_is_not_checked(persona_dir: Path, monkeypatch):
-    overrides = {t: "haiku" for t in ("attunement-detector", "compaction", "self-model-articulate", "background-classifier", "background-housekeeping")}
+    overrides = dict.fromkeys(("attunement-detector", "compaction", "self-model-articulate", "background-classifier", "background-housekeeping"), "haiku")
     _cli_persona(persona_dir, tier_models=overrides)
     run = _Run(lambda m: _ok())
     with _client(persona_dir, monkeypatch) as c, patch("subprocess.run", run):
