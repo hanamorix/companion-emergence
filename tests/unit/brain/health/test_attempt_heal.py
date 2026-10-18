@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
+import ast
+import errno
 import json
+import os
+import re
+import shutil
+import stat
+import sys
+import threading
 from pathlib import Path
 
 import pytest
 
+import brain.health.attempt_heal as heal
 from brain.health.attempt_heal import (
     attempt_heal,
     save_with_backup,
@@ -301,3 +310,776 @@ def test_save_with_backup_text_reraises_persistent_permission_error(
 
     with pytest.raises(PermissionError):
         save_with_backup_text(p, "v2")
+
+
+# ---- #387: the live path must never be absent while a save rotates the backups ----
+#
+# One recorder fires a hook before and after every filesystem mutation save_with_backup_text makes
+# (os.replace, os.fsync, Path.unlink, a writable os.open), so the property is checked at every step
+# boundary deterministically instead of hoping a thread lands in a microsecond window.
+
+
+class SimulatedCrash(BaseException):
+    """Stands in for a kill or power loss. Not an Exception: cleanup that a real kill would skip must
+    not run for it, so the temp files a real crash leaves behind are left behind here too."""
+
+
+def _payload(n: int) -> str:
+    return json.dumps({"v": n, "pad": "x" * 2000}) + "\n"
+
+
+def _version(path: Path) -> int:
+    return json.loads(path.read_text(encoding="utf-8"))["v"]
+
+
+def _seed(path: Path, upto: int = 5, count: int = 3) -> None:
+    for n in range(1, upto + 1):
+        save_with_backup_text(path, _payload(n), backup_count=count)
+
+
+def _fd_name(fd: int, root: Path) -> str:
+    ino = os.fstat(fd).st_ino
+    if root.stat().st_ino == ino:
+        return "<dir>"
+    for f in root.iterdir():
+        if f.stat().st_ino == ino:
+            return f.name
+    return "<unknown>"
+
+
+_TEMP_TAG = re.compile(r"\.t\d+-[0-9a-f]+(?=\.(?:bak1\.)?new$)")
+
+
+def _norm(name: str) -> str:
+    """x.json.t123-ab12-cd34.bak1.new -> x.json.bak1.new (per-save temp names, #389)."""
+    return "->".join(_TEMP_TAG.sub("", part) for part in name.split("->"))
+
+
+class _Recorder:
+    """hook(phase, op, name) runs before and after each mutation under root; it may raise.
+
+    Path.unlink goes through os.unlink, so wrapping os.unlink/os.remove covers both."""
+
+    def __init__(self, monkeypatch, root: Path, hook=None) -> None:
+        self.mp = monkeypatch
+        self.root = root
+        self.hook = hook
+        self.events: list[tuple[str, str, str]] = []
+        self.real: dict[str, str] = {}  # normalised name -> the real file name last seen
+
+    def _fire(self, phase: str, op: str, name: str) -> None:
+        self.real[_norm(name)] = name
+        name = _norm(name)
+        self.events.append((phase, op, name))
+        if self.hook is not None:
+            self.hook(phase, op, name)
+
+    def _inside(self, p) -> bool:
+        try:
+            return Path(os.fspath(p)).parent == self.root
+        except TypeError:
+            return False
+
+    def install(self) -> None:
+        real_replace, real_fsync, real_open = os.replace, os.fsync, os.open
+        real_os_unlink = os.unlink
+        rec = self
+
+        def replace(src, dst):
+            if not rec._inside(dst):
+                return real_replace(src, dst)
+            name = f"{Path(src).name}->{Path(dst).name}"
+            rec._fire("before", "replace", name)
+            real_replace(src, dst)
+            rec._fire("after", "replace", name)
+
+        def fsync(fd):
+            name = _fd_name(fd, rec.root)
+            if name == "<unknown>":
+                return real_fsync(fd)
+            rec._fire("before", "fsync", name)
+            real_fsync(fd)
+            rec._fire("after", "fsync", name)
+
+        def os_unlink(path, *args, **kwargs):
+            if not rec._inside(path):
+                return real_os_unlink(path, *args, **kwargs)
+            rec._fire("before", "unlink", Path(path).name)
+            real_os_unlink(path, *args, **kwargs)
+            rec._fire("after", "unlink", Path(path).name)
+
+        def os_open(path, flags, *args, **kwargs):
+            writable = flags & (os.O_WRONLY | os.O_RDWR)
+            if not writable or not rec._inside(path):
+                return real_open(path, flags, *args, **kwargs)
+            name = Path(path).name
+            rec._fire("before", "open", name)
+            fd = real_open(path, flags, *args, **kwargs)
+            try:
+                rec._fire("after", "open", name)
+            except BaseException:
+                os.close(fd)
+                raise
+            return fd
+
+        self.mp.setattr(os, "replace", replace)
+        self.mp.setattr(os, "fsync", fsync)
+        self.mp.setattr(os, "open", os_open)
+        self.mp.setattr(os, "unlink", os_unlink)
+        self.mp.setattr(os, "remove", os_unlink)
+
+
+def _record_one_save(monkeypatch, tmp_path: Path, name: str) -> list[tuple[str, str, str]]:
+    """The event list of one v6 save over a seeded full chain, in a scratch dir."""
+    d = tmp_path / name
+    d.mkdir()
+    p = d / "x.json"
+    _seed(p)
+    rec = _Recorder(monkeypatch, d)
+    rec.install()
+    save_with_backup_text(p, _payload(6))
+    monkeypatch.undo()
+    return rec.events
+
+
+def test_live_path_never_missing_at_any_step_boundary(tmp_path: Path, monkeypatch) -> None:
+    """C1: at every boundary of a save the live path holds a complete payload (old until the final
+    replace has run, new after)."""
+    d = tmp_path / "c1"
+    d.mkdir()
+    p = d / "x.json"
+    _seed(p)
+    state = {"swapped": False}
+    problems: list[str] = []
+
+    def hook(phase: str, op: str, name: str) -> None:
+        if phase == "after" and op == "replace" and name.endswith("->x.json"):
+            state["swapped"] = True
+        want = 6 if state["swapped"] else 5
+        if not p.exists():
+            problems.append(f"live missing at {phase} {op} {name}")
+            return
+        try:
+            got = _version(p)
+        except (ValueError, KeyError) as exc:
+            problems.append(f"live unreadable at {phase} {op} {name}: {exc}")
+            return
+        if got != want:
+            problems.append(f"live v{got}, wanted v{want} at {phase} {op} {name}")
+
+    _Recorder(monkeypatch, d, hook).install()
+    save_with_backup_text(p, _payload(6))
+    monkeypatch.undo()
+    assert not problems, problems
+    assert state["swapped"]
+    assert _version(p) == 6 and _version(d / "x.json.bak1") == 5
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="a reader holding the file open without FILE_SHARE_DELETE makes any replace fail on "
+    "Windows by design (#200); there the deterministic boundary and crash tests carry the property",
+)
+@pytest.mark.parametrize("run", [1, 2, 3])
+def test_concurrent_reader_never_sees_live_path_missing(tmp_path: Path, monkeypatch, run) -> None:
+    """C2: a thread polling the live path through 1500 saves sees no gap, no partial file, and
+    versions that never go backwards."""
+    p = tmp_path / "x.json"
+    save_with_backup_text(p, _payload(0))
+    monkeypatch.setattr(os, "fsync", lambda fd: None)  # durability does not change the race
+    stop = threading.Event()
+    stats = {"reads": 0, "missing": 0, "bad": 0, "backwards": 0}
+
+    def poll() -> None:
+        last = -1
+        while not stop.is_set():
+            try:
+                v = json.loads(p.read_text(encoding="utf-8"))["v"]
+            except FileNotFoundError:
+                stats["missing"] += 1
+                continue
+            except (ValueError, KeyError, OSError):
+                stats["bad"] += 1
+                continue
+            stats["reads"] += 1
+            if v < last:
+                stats["backwards"] += 1
+            last = v
+
+    old_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    t = threading.Thread(target=poll)
+    t.start()
+    try:
+        for n in range(1, 1501):
+            save_with_backup_text(p, _payload(n))
+    finally:
+        stop.set()
+        t.join()
+        sys.setswitchinterval(old_interval)
+    assert stats["reads"] > 100, stats  # the poller really ran
+    assert stats["missing"] == 0 and stats["bad"] == 0 and stats["backwards"] == 0, stats
+
+
+def test_crash_at_every_step_leaves_a_complete_live_file(tmp_path: Path, monkeypatch) -> None:
+    """C3: kill at every before/after boundary of every mutation, and mid-write of the temp file.
+    Live is always one complete version, every backup at a final name is complete, the heal sees
+    no anomaly, and the next save cleans up stale temps and rotates correctly."""
+    total = len(_record_one_save(monkeypatch, tmp_path, "dry"))
+    assert total > 0
+    problems: list[str] = []
+    left_bak1_new = 0
+
+    def check(d: Path, label: str) -> None:
+        nonlocal left_bak1_new
+        p = d / "x.json"
+        if not p.exists():
+            problems.append(f"{label}: live missing")
+            return
+        try:
+            live = _version(p)
+        except (ValueError, KeyError) as exc:
+            problems.append(f"{label}: live unreadable ({exc})")
+            return
+        if live not in (5, 6):
+            problems.append(f"{label}: live is v{live}, neither old nor new")
+        for i in (1, 2, 3):
+            bak = d / f"x.json.bak{i}"
+            if bak.exists():
+                try:
+                    _version(bak)
+                except (ValueError, KeyError) as exc:
+                    problems.append(f"{label}: bak{i} at final name is incomplete ({exc})")
+        data, anomaly = attempt_heal(p, _default)
+        if anomaly is not None or data["v"] != live:
+            problems.append(f"{label}: heal saw anomaly={anomaly} data={data}")
+        if list(d.glob("*.bak1.new")):
+            left_bak1_new += 1
+        save_with_backup_text(p, _payload(7))
+        if list(d.glob("*.new")):
+            problems.append(f"{label}: next save left a stale temp")
+        if _version(p) != 7 or _version(d / "x.json.bak1") != live:
+            problems.append(f"{label}: next save chain wrong")
+
+    for j in range(total):
+        d = tmp_path / f"crash{j}"
+        d.mkdir()
+        _seed(d / "x.json")
+        counter = {"n": 0}
+
+        def hook(phase: str, op: str, name: str, j=j, counter=counter) -> None:
+            if counter["n"] == j:
+                counter["n"] += 1
+                raise SimulatedCrash(f"{phase} {op} {name}")
+            counter["n"] += 1
+
+        _Recorder(monkeypatch, d, hook).install()
+        with pytest.raises(SimulatedCrash) as info:
+            save_with_backup_text(d / "x.json", _payload(6))
+        monkeypatch.undo()
+        if str(info.value) == "after open x.json.bak1.new":
+            # A real kill runs no cleanup code, so the empty temp must still be there.
+            if not list(d.glob("*.bak1.new")):
+                problems.append(f"crash at #{j}: cleanup ran for a simulated kill")
+        check(d, f"crash at #{j} ({info.value})")
+
+    # A write of the temp file that stops half way.
+    d = tmp_path / "half"
+    d.mkdir()
+    _seed(d / "x.json")
+    real_open = Path.open
+
+    class _Half:
+        def __init__(self, f) -> None:
+            self.f = f
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc) -> None:
+            self.f.close()
+
+        def write(self, data: str) -> int:
+            self.f.write(data[: len(data) // 2])
+            self.f.flush()
+            raise SimulatedCrash("half write")
+
+        def __getattr__(self, name: str):
+            return getattr(self.f, name)
+
+    def half_open(self, *args, **kwargs):
+        f = real_open(self, *args, **kwargs)
+        return _Half(f) if self.name.endswith(".new") else f
+
+    monkeypatch.setattr(Path, "open", half_open)
+    with pytest.raises(SimulatedCrash):
+        save_with_backup_text(d / "x.json", _payload(6))
+    monkeypatch.undo()
+    check(d, "half-written temp")
+
+    assert not problems, problems
+    assert left_bak1_new > 0, "no crash point left a stale .bak1.new, so its cleanup went untested"
+
+
+@pytest.mark.parametrize("count", [0, 1, 2, 3, 6])
+def test_backup_chain_matches_model_for_each_count(tmp_path: Path, count: int) -> None:
+    """C4: .bak{i} holds version n-i for i in 1..max(count, 1), nothing older, no temp files."""
+    p = tmp_path / "x.json"
+    n_saves = 10
+    for n in range(1, n_saves + 1):
+        save_with_backup_text(p, _payload(n), backup_count=count)
+    kept = max(count, 1)
+    assert _version(p) == n_saves
+    for i in range(1, kept + 1):
+        assert _version(tmp_path / f"x.json.bak{i}") == n_saves - i
+    assert not (tmp_path / f"x.json.bak{kept + 1}").exists()
+    assert not list(tmp_path.glob("*.new"))
+
+
+def test_transient_permission_error_at_every_replace_is_retried(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """C5a (replaces): a transient WinError-32 style failure at any one replace is absorbed."""
+    total = sum(
+        1 for e in _record_one_save(monkeypatch, tmp_path, "dry") if e[:2] == ("before", "replace")
+    )
+    assert total >= 3
+    monkeypatch.setattr(heal.time, "sleep", lambda _s: None)
+    real_replace = os.replace
+    for n in range(1, total + 1):
+        d = tmp_path / f"r{n}"
+        d.mkdir()
+        p = d / "x.json"
+        _seed(p)
+        calls = {"n": 0}
+
+        def flaky(src, dst, n=n, calls=calls, d=d):
+            if Path(dst).parent == d:
+                calls["n"] += 1
+                if calls["n"] == n:
+                    calls["fired"] = True
+                    raise PermissionError(32, "The process cannot access the file")
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(os, "replace", flaky)
+        save_with_backup_text(p, _payload(6))
+        monkeypatch.undo()
+        monkeypatch.setattr(heal.time, "sleep", lambda _s: None)
+        assert calls.get("fired"), f"replace #{n} was never reached"
+        assert _version(p) == 6 and _version(d / "x.json.bak1") == 5, f"replace #{n}"
+
+
+@pytest.mark.parametrize("point", ["before_create", "after_create", "at_copystat"])
+def test_transient_permission_error_inside_backup_copy_is_retried(
+    tmp_path: Path, monkeypatch, point: str
+) -> None:
+    """C5a (copy): the backup copy retries too, and an attempt that follows a half-made temp
+    does not trip over it (no FileExistsError)."""
+    p = tmp_path / "x.json"
+    _seed(p)
+    monkeypatch.setattr(heal.time, "sleep", lambda _s: None)
+    fired = {"n": 0}
+    real_open, real_copystat = os.open, shutil.copystat
+
+    def os_open(path, flags, *args, **kwargs):
+        if not Path(path).name.endswith(".bak1.new") or fired["n"]:
+            return real_open(path, flags, *args, **kwargs)
+        if point == "before_create":
+            fired["n"] += 1
+            raise PermissionError(32, "busy")
+        if point == "after_create":
+            fd = real_open(path, flags, *args, **kwargs)
+            os.close(fd)
+            fired["n"] += 1
+            raise PermissionError(32, "busy")
+        return real_open(path, flags, *args, **kwargs)
+
+    def copystat(src, dst, **kwargs):
+        if point == "at_copystat" and not fired["n"] and Path(dst).name.endswith(".bak1.new"):
+            fired["n"] += 1
+            raise PermissionError(32, "busy")
+        return real_copystat(src, dst, **kwargs)
+
+    monkeypatch.setattr(os, "open", os_open)
+    monkeypatch.setattr(shutil, "copystat", copystat)
+    save_with_backup_text(p, _payload(6))
+    monkeypatch.undo()
+    assert fired["n"] == 1, "the injection point was never reached"
+    assert _version(p) == 6 and _version(tmp_path / "x.json.bak1") == 5
+    assert not list(tmp_path.glob("*.new"))
+
+
+def test_persistent_failure_of_final_replace_leaves_old_live_and_intact_chain(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """C5b: only new->live keeps failing. The save raises, live is still the complete old version,
+    bak1 holds the old live content and bak2 the previous bak1 (never a missing live file)."""
+    p = tmp_path / "x.json"
+    _seed(p)
+    monkeypatch.setattr(heal.time, "sleep", lambda _s: None)
+    real_replace = os.replace
+
+    def deny_final(src, dst):
+        if Path(dst) == p:
+            raise PermissionError(32, "The process cannot access the file")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", deny_final)
+    with pytest.raises(PermissionError):
+        save_with_backup_text(p, _payload(6))
+    monkeypatch.undo()
+    assert p.exists(), "live file went missing"
+    assert _version(p) == 5
+    assert _version(tmp_path / "x.json.bak1") == 5
+    assert _version(tmp_path / "x.json.bak2") == 4
+
+
+def _function(name: str) -> ast.FunctionDef:
+    tree = ast.parse(Path(heal.__file__).read_text(encoding="utf-8"))
+    return next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
+
+
+def test_save_helper_has_no_bare_replace_or_side_door_rename() -> None:
+    """C5d / C13: every replace in save_with_backup_text goes through _replace_with_retry, and the
+    live file is never moved by another rename API."""
+    forbidden = {"os.replace", "os.rename", "shutil.move", "os.renames"}
+    attr_forbidden = {"rename", "replace"}
+    for node in ast.walk(_function("save_with_backup_text")):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        dotted = ast.unparse(fn)
+        assert dotted not in forbidden, dotted
+        if isinstance(fn, ast.Attribute):
+            assert fn.attr not in attr_forbidden, dotted
+
+
+def test_fsync_of_new_file_and_backup_copy_precede_their_replaces(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """C6 (proxy for power-loss durability, which cannot be simulated here): the temp file is fully
+    on disk and fsynced before the replace that publishes it, for both the new live file and the
+    backup copy."""
+    p = tmp_path / "x.json"
+    _seed(p)
+    old_bytes = p.read_bytes()
+    text = _payload(6)
+    seen: dict[str, bytes] = {}
+
+    def hook(phase: str, op: str, name: str) -> None:
+        if phase == "before" and op == "fsync" and name.endswith(".new"):
+            seen[name] = (tmp_path / rec.real[name]).read_bytes()
+
+    rec = _Recorder(monkeypatch, tmp_path, hook)
+    rec.install()
+    save_with_backup_text(p, text)
+    monkeypatch.undo()
+    order = [(op, name) for phase, op, name in rec.events if phase == "before"]
+    assert ("fsync", "x.json.new") in order, order
+    assert order.index(("fsync", "x.json.new")) < order.index(("replace", "x.json.new->x.json"))
+    ref = tmp_path / "ref.txt"
+    ref.write_text(text, encoding="utf-8")  # text-mode newlines, as on every platform
+    assert seen["x.json.new"] == ref.read_bytes()
+    assert ("fsync", "x.json.bak1.new") in order, order
+    assert order.index(("fsync", "x.json.bak1.new")) < order.index(
+        ("replace", "x.json.bak1.new->x.json.bak1")
+    )
+    assert seen["x.json.bak1.new"] == old_bytes
+
+
+def test_backup_is_byte_exact_and_keeps_mode_and_mtime(tmp_path: Path, monkeypatch) -> None:
+    """C7: the backup carries what the rename used to carry: bytes, mtime, and (POSIX) mode, and the
+    half-made copy is never wider than its source."""
+    p = tmp_path / "x.json"
+    save_with_backup_text(p, "line1\r\nline2\n")
+    os.utime(p, ns=(1_600_000_000_000_000_000, 1_600_000_000_000_000_000))
+    if os.name != "nt":
+        p.chmod(0o640)
+    before = p.read_bytes()
+    before_stat = p.stat()
+    modes: list[int] = []
+
+    def hook(phase: str, op: str, name: str) -> None:
+        if phase == "after":
+            for tmp in tmp_path.glob("*.bak1.new"):
+                modes.append(stat.S_IMODE(tmp.stat().st_mode))
+
+    _Recorder(monkeypatch, tmp_path, hook).install()
+    old_umask = os.umask(0) if os.name != "nt" else 0  # so a wide creation mode is not masked off
+    try:
+        save_with_backup_text(p, "next\n")
+    finally:
+        if os.name != "nt":
+            os.umask(old_umask)
+    monkeypatch.undo()
+    bak = tmp_path / "x.json.bak1"
+    assert bak.read_bytes() == before
+    assert bak.stat().st_mtime_ns == before_stat.st_mtime_ns
+    if os.name != "nt":
+        assert stat.S_IMODE(bak.stat().st_mode) == 0o640
+        assert modes, "the backup temp file was never observed"
+        assert all(m & ~0o640 == 0 for m in modes), [oct(m) for m in modes]
+
+
+@pytest.mark.parametrize("point", ["after_open", "at_fsync"])
+def test_failed_backup_copy_leaves_chain_untouched(tmp_path: Path, monkeypatch, point: str) -> None:
+    """C8: disk full while making the backup copy. Nothing was rotated yet: live and every backup
+    are byte-identical, the half-made copy is removed, and the next save works."""
+    p = tmp_path / "x.json"
+    _seed(p)
+    names = ["x.json", "x.json.bak1", "x.json.bak2", "x.json.bak3"]
+    before = {n: (tmp_path / n).read_bytes() for n in names}
+
+    def hook(phase: str, op: str, name: str) -> None:
+        if name != "x.json.bak1.new":
+            return
+        if (point == "after_open" and (phase, op) == ("after", "open")) or (
+            point == "at_fsync" and (phase, op) == ("before", "fsync")
+        ):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+    _Recorder(monkeypatch, tmp_path, hook).install()
+    with pytest.raises(OSError) as info:
+        save_with_backup_text(p, _payload(6))
+    monkeypatch.undo()
+    assert info.value.errno == errno.ENOSPC
+    assert {n: (tmp_path / n).read_bytes() for n in names} == before
+    assert not list(tmp_path.glob("*.new"))  # the failed save cleaned its own temps
+    save_with_backup_text(p, _payload(6))
+    assert not list(tmp_path.glob("*.new"))
+    assert _version(p) == 6 and _version(tmp_path / "x.json.bak1") == 5
+
+
+def test_stale_temp_files_are_removed_and_never_used(tmp_path: Path) -> None:
+    """C9: leftovers of a killed save are cleaned up and never become a backup or the live file."""
+    p = tmp_path / "x.json"
+    _seed(p)
+    (tmp_path / "x.json.new").write_text("garbage-new", encoding="utf-8")
+    (tmp_path / "x.json.bak1.new").write_text("garbage-bak", encoding="utf-8")
+    save_with_backup_text(p, _payload(6))
+    assert _version(p) == 6 and _version(tmp_path / "x.json.bak1") == 5
+    assert not (tmp_path / "x.json.new").exists()
+    assert not (tmp_path / "x.json.bak1.new").exists()
+
+
+def test_stale_backup_temp_is_removed_even_on_a_first_save(tmp_path: Path) -> None:
+    """C9: with no live file there is no backup to make, but a stale backup temp still goes."""
+    p = tmp_path / "x.json"
+    (tmp_path / "x.json.bak1.new").write_text("garbage-bak", encoding="utf-8")
+    save_with_backup_text(p, _payload(1))
+    assert not (tmp_path / "x.json.bak1.new").exists()
+    assert not (tmp_path / "x.json.bak1").exists()
+
+
+def test_new_file_is_written_in_text_mode_exactly_like_write_text(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """C10: same open mode and encoding, and no newline argument, so Windows keeps its CRLF
+    translation; the bytes equal what Path.write_text produces."""
+    p = tmp_path / "x.json"
+    calls: list[tuple[tuple, dict]] = []
+    real_open = Path.open
+
+    def spy(self, *args, **kwargs):
+        if self.name.endswith(".new") and not self.name.endswith(".bak1.new"):
+            calls.append((args, kwargs))
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", spy)
+    text = "alpha\nbeta \u00e9\n"
+    save_with_backup_text(p, text)
+    monkeypatch.undo()
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    mode = args[0] if args else kwargs.get("mode")
+    assert mode == "w"
+    assert kwargs.get("encoding") == "utf-8"
+    assert kwargs.get("newline") is None
+    ref = tmp_path / "ref.txt"
+    ref.write_text(text, encoding="utf-8")
+    assert p.read_bytes() == ref.read_bytes()
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="needs POSIX permission bits and a non-root user",
+)
+def test_unreadable_live_file_fails_loud_and_changes_nothing(tmp_path: Path, monkeypatch) -> None:
+    """C14: a live file the saver cannot read makes the save raise (a real permission problem fails
+    loud after the retry budget) without touching live, the backups, or leaving a backup temp."""
+    p = tmp_path / "x.json"
+    _seed(p)
+    names = ["x.json", "x.json.bak1", "x.json.bak2", "x.json.bak3"]
+    before = {n: (tmp_path / n).read_bytes() for n in names}
+    monkeypatch.setattr(heal.time, "sleep", lambda _s: None)
+    p.chmod(0)
+    try:
+        with pytest.raises(PermissionError):
+            save_with_backup_text(p, _payload(6))
+    finally:
+        p.chmod(0o644)
+    assert {n: (tmp_path / n).read_bytes() for n in names} == before
+    assert not list(tmp_path.glob("*.new"))
+
+
+# ---- #389: concurrent savers of one path must not share a temp file ----
+
+
+def _dead_pid() -> int:
+    import subprocess
+
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return proc.pid
+
+
+def test_stale_temps_are_removed_by_pattern_but_not_a_live_writers_temp(tmp_path: Path) -> None:
+    """C9b: leftovers of dead or older processes (and of this process when not in flight) go;
+    a temp owned by another live process stays; other files' temps are never touched."""
+    p = tmp_path / "x.json"
+    _seed(p)
+    stale = [
+        f"x.json.t{_dead_pid()}-0123456789ab.new",  # dead process
+        f"x.json.t{_dead_pid()}-0123456789ab.bak1.new",
+        f"x.json.t{os.getpid()}-0123456789ab.new",  # this process, not in flight
+        "x.json.new",  # pre-#389 fixed names
+        "x.json.bak1.new",
+    ]
+    live_other = f"x.json.t{os.getppid()}-0123456789ab.new"  # another live process
+    untouched = ["y.json.t999999-0123456789ab.new", "x.json.t1-zz.new", "x.json.keep"]
+    for name in [*stale, live_other, *untouched]:
+        (tmp_path / name).write_text("leftover", encoding="utf-8")
+    save_with_backup_text(p, _payload(6))
+    for name in stale:
+        assert not (tmp_path / name).exists(), name
+    for name in [live_other, *untouched]:
+        assert (tmp_path / name).exists(), name
+    assert _version(p) == 6 and _version(tmp_path / "x.json.bak1") == 5
+
+
+@pytest.mark.parametrize("spelling", ["same", "relative"])
+def test_a_second_save_during_a_save_leaves_the_first_ones_temp_alone(
+    tmp_path: Path, monkeypatch, spelling: str
+) -> None:
+    """C15a (deterministic): a whole save of the same path runs while another save has its temp
+    file written but not yet published. The inner save must not remove or reuse that temp, so
+    the outer save completes (the old shared `.new` made it raise FileNotFoundError)."""
+    p = tmp_path / "x.json"
+    _seed(p)
+    state = {"ran": False, "outer_temp_survived": None}
+
+    def hook(phase: str, op: str, name: str) -> None:
+        if state["ran"] or (phase, op, name) != ("after", "fsync", "x.json.new"):
+            return
+        state["ran"] = True
+        outer_temps = {t.name for t in tmp_path.glob("*.new")}
+        if spelling == "relative":
+            # Build the relative spelling from a cwd on the file's own drive: on Windows the
+            # runner's cwd and tmp_path can sit on different drives, where relpath raises.
+            monkeypatch.chdir(tmp_path)
+            other = Path(os.path.relpath(p))
+        else:
+            other = p
+        save_with_backup_text(other, _payload(7))  # the other writer, start to finish
+        state["outer_temp_survived"] = outer_temps <= {t.name for t in tmp_path.glob("*.new")}
+
+    _Recorder(monkeypatch, tmp_path, hook).install()
+    save_with_backup_text(p, _payload(6))
+    monkeypatch.undo()
+    assert state["ran"] and state["outer_temp_survived"] is True
+    assert _version(p) == 6  # the outer save published last
+    assert not list(tmp_path.glob("*.new"))
+    for i in (1, 2, 3):
+        _version(tmp_path / f"x.json.bak{i}")  # each backup is a complete version
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="on Windows a writer copying the live file makes another writer's replace wait on "
+    "the bounded retry; the deterministic test above carries the property there",
+)
+@pytest.mark.parametrize("run", [1, 2, 3])
+def test_concurrent_savers_of_one_path_raise_nothing_and_never_expose_a_gap(
+    tmp_path: Path, monkeypatch, run
+) -> None:
+    """C15b: 4 threads x 150 saves of one path. No save raises (the old shared temp names made
+    savers raise FileNotFoundError), a polling reader never sees the file missing or partial,
+    and no temp is left behind."""
+    p = tmp_path / "x.json"
+    save_with_backup_text(p, _payload(0))
+    monkeypatch.setattr(os, "fsync", lambda fd: None)  # durability does not change the race
+    errors: list[BaseException] = []
+    stop = threading.Event()
+    stats = {"reads": 0, "missing": 0, "bad": 0}
+
+    def writer(k: int) -> None:
+        try:
+            for n in range(150):
+                save_with_backup_text(p, _payload(k * 1000 + n))
+        except BaseException as exc:  # noqa: BLE001 - the test reports whatever escaped
+            errors.append(exc)
+
+    def poll() -> None:
+        while not stop.is_set():
+            try:
+                json.loads(p.read_text(encoding="utf-8"))["v"]
+                stats["reads"] += 1
+            except FileNotFoundError:
+                stats["missing"] += 1
+            except (ValueError, KeyError, OSError):
+                stats["bad"] += 1
+
+    old_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    reader = threading.Thread(target=poll)
+    reader.start()
+    writers = [threading.Thread(target=writer, args=(k,)) for k in range(1, 5)]
+    try:
+        for t in writers:
+            t.start()
+        for t in writers:
+            t.join()
+    finally:
+        stop.set()
+        reader.join()
+        sys.setswitchinterval(old_interval)
+    assert not errors, [repr(e) for e in errors[:3]]
+    assert stats["reads"] > 100 and stats["missing"] == 0 and stats["bad"] == 0, stats
+    assert not list(tmp_path.glob("*.new"))
+    _version(p)
+    for i in (1, 2, 3):
+        bak = tmp_path / f"x.json.bak{i}"
+        if bak.exists():
+            _version(bak)
+
+
+def test_a_bad_temp_name_cannot_fail_a_save(tmp_path: Path) -> None:
+    """A leftover whose pid field is absurd is skipped (unknown owner means alive), never an error."""
+    p = tmp_path / "x.json"
+    _seed(p)
+    odd = tmp_path / "x.json.t99999999999999999999-0123456789ab.new"
+    odd.write_text("leftover", encoding="utf-8")
+    save_with_backup_text(p, _payload(6))
+    assert _version(p) == 6
+    assert odd.exists()
+
+
+def test_failure_after_the_backup_copy_removes_both_of_the_saves_own_temps(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The new file and the backup copy both exist when the swap into the chain fails; an
+    Exception (not a kill) must leave neither behind, and live must still be the old version."""
+    p = tmp_path / "x.json"
+    _seed(p)
+
+    def hook(phase: str, op: str, name: str) -> None:
+        if (phase, op, name) == ("before", "replace", "x.json.bak1.new->x.json.bak1"):
+            assert list(tmp_path.glob("*.bak1.new")) and list(tmp_path.glob("*.new"))
+            raise OSError(errno.EIO, "I/O error")
+
+    _Recorder(monkeypatch, tmp_path, hook).install()
+    with pytest.raises(OSError):
+        save_with_backup_text(p, _payload(6))
+    monkeypatch.undo()
+    assert not list(tmp_path.glob("*.new"))
+    assert _version(p) == 5

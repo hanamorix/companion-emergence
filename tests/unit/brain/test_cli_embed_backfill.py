@@ -46,7 +46,17 @@ def _seed_memories(persona_dir: Path, n: int) -> list[str]:
 def _use_fake_provider(monkeypatch: pytest.MonkeyPatch, *, dim: int = 384):
     provider = embeddings_mod.FakeEmbeddingProvider(dim=dim)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+    _pin_tier_id(monkeypatch, provider.model_id())
     return provider
+
+
+def _pin_tier_id(monkeypatch: pytest.MonkeyPatch, model_id: str) -> None:
+    """The CLI and the drain read the current model id from
+    `resolve_embedding_model_id()` (no provider is built for it); point it at
+    the test provider's id."""
+    from brain.bridge import model_tier
+
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, model_id)
 
 
 def test_embed_backfill_embeds_every_row_and_prints_summary(
@@ -126,6 +136,7 @@ def test_embed_backfill_reports_failed_rows_with_nonzero_exit(
             return "fails-on-two-cli-test"
 
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: _FailsOnOne())
+    _pin_tier_id(monkeypatch, "fails-on-two-cli-test")
 
     result = cli.main(["embed", "backfill", "--persona", "nell", "--quiet"])
 
@@ -153,6 +164,31 @@ def test_embed_backfill_empty_backlog_is_a_clean_no_op(
     assert result == 0
     captured = capsys.readouterr()
     assert "already empty" in captured.out
+
+
+def test_embed_backfill_empty_backlog_builds_no_provider(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The command reads the model id only to count the backlog: with nothing
+    to embed no provider is built (constructing one downloads the model when
+    it is not cached)."""
+    persona_dir = _make_persona_dir(tmp_path, monkeypatch)
+    (persona_dir / "memories.db").touch()
+    MemoryStore(persona_dir / "memories.db").close()
+    built: list[str] = []
+
+    def _boom(*_a: object, **_k: object) -> None:
+        built.append("built")
+        raise AssertionError("a provider was constructed to read the model id")
+
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", _boom)
+    monkeypatch.setattr(embeddings_mod.FastEmbedProvider, "__init__", _boom)
+
+    assert cli.main(["embed", "backfill", "--persona", "nell"]) == 0
+    assert built == []
+    assert "already empty" in capsys.readouterr().out
 
 
 def test_embed_backfill_missing_persona_returns_nonzero(

@@ -19,40 +19,74 @@ neutralized globally by cli._harden_std_streams, which points a None stdout/
 stderr at os.devnull at the top of main(). Re-add a targeted check only if that
 hardening is ever removed.)
 
-Advisory by default (exit 0). `--strict` exits 1 on any finding — wire into the
-ruff-clean gate / release_preflight if you want it blocking.
+A finding that was reviewed and is safe (a backend that never runs on Windows, the one
+sanctioned hard-kill helper) carries `# windows-lint: ok -- <reason>` inside the call or on the
+`os.kill(` line, so the exemption and its reason sit at the site, not in this script.
+
+Advisory by default (exit 0). `--strict` exits 1 on any finding. `release_preflight.sh` and
+`tests/unit/scripts/test_lint_windows_pitfalls.py` both enforce a clean tree (#363).
 """
 from __future__ import annotations
 
+import ast
 import re
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-BRAIN = ROOT / "brain"
+_OK_MARKER = "windows-lint: ok"
 
-_SPAWN_RE = re.compile(r"subprocess\.(?:run|Popen|call|check_output|check_call)\s*\(")
-
-
-def _py_files():
-    return [p for p in BRAIN.rglob("*.py") if "__pycache__" not in p.parts]
+_SPAWNERS = {"run", "Popen", "call", "check_output", "check_call"}
 
 
-def scan() -> list[str]:
+def _is_true(node: ast.expr) -> bool:
+    return isinstance(node, ast.Constant) and node.value is True
+
+
+def _spawns_without_encoding(tree: ast.AST, lines: list[str]) -> list[int]:
+    """Line numbers of text-mode `subprocess.<spawner>(...)` calls with no `encoding=` and no
+    reviewed marker. Everything is read from the call's OWN node: a neighbouring call's
+    `encoding=` or marker cannot exempt it (#398 review: the old fixed 500-character window did)."""
+    found = []
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _SPAWNERS
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "subprocess"
+        ):
+            continue
+        kw = {k.arg: k.value for k in node.keywords if k.arg}
+        # only text-mode calls — a bytes-mode spawn legitimately has no encoding
+        uses_text = _is_true(kw.get("text", ast.Constant(False))) or _is_true(
+            kw.get("universal_newlines", ast.Constant(False))
+        )
+        own_lines = "\n".join(lines[node.lineno - 1 : node.end_lineno])
+        if uses_text and "encoding" not in kw and _OK_MARKER not in own_lines:
+            found.append(node.lineno)
+    return found
+
+
+def _py_files(root: Path):
+    return [p for p in (root / "brain").rglob("*.py") if "__pycache__" not in p.parts]
+
+
+def scan(root: Path = ROOT) -> list[str]:
     findings: list[str] = []
-    for path in _py_files():
-        rel = str(path.relative_to(ROOT))
+    for path in _py_files(root):
+        rel = path.relative_to(root).as_posix()
         text = path.read_text(encoding="utf-8")
         lines = text.splitlines()
 
-        # 1. subprocess spawn without encoding= (only for text=/universal_newlines
-        #    calls — a bytes-mode spawn legitimately has no encoding).
-        for m in _SPAWN_RE.finditer(text):
-            start = m.start()
-            span = text[start : start + 500]  # ~the call's arg list
-            lineno = text.count("\n", 0, start) + 1
-            uses_text = "text=True" in span or "universal_newlines=True" in span
-            if uses_text and "encoding=" not in span:
+        # 1. subprocess spawn without encoding= (see _spawns_without_encoding).
+        try:
+            tree = ast.parse(text)
+        except SyntaxError as exc:  # a file the lint cannot read must not pass silently
+            findings.append(f"{rel}:{exc.lineno}: cannot parse, so it was not linted: {exc.msg}")
+            tree = None
+        if tree is not None:
+            for lineno in _spawns_without_encoding(tree, lines):
                 findings.append(
                     f"{rel}:{lineno}: text-mode subprocess spawn without encoding= — "
                     f"Windows default is not UTF-8. Pass encoding='utf-8'."
@@ -81,6 +115,8 @@ def scan() -> list[str]:
                     f"group. Delegate to state_file.pid_is_alive instead."
                 )
                 continue
+            if _OK_MARKER in line:
+                continue  # a reviewed real-signal kill, with the reason on the line; never a probe
             findings.append(
                 f"{rel}:{i + 1}: os.kill() with a signal — TerminateProcess on "
                 f"Windows (no cleanup, no shutdown_clean). Route bridge shutdown "

@@ -408,7 +408,7 @@ def test_dream_system_prompt_uses_persona_name(tmp_path: Path) -> None:
             captured["system"] = system
             return "DREAM: test"
 
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     hm = HebbianMatrix(":memory:")
     try:
         store.create(
@@ -455,7 +455,7 @@ def test_dream_completion_emits_initiate_candidate(tmp_path: Path) -> None:
     persona_dir = tmp_path / "p"
     persona_dir.mkdir()
 
-    store = MemoryStore(db_path=":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     hm = HebbianMatrix(db_path=":memory:")
     try:
         seed = _mem("seed for initiate emit", importance=8.0)
@@ -493,7 +493,7 @@ def test_dream_initiate_candidate_carries_real_emotion_vector(tmp_path: Path) ->
     persona_dir = tmp_path / "p"
     persona_dir.mkdir()
 
-    store = MemoryStore(db_path=":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     hm = HebbianMatrix(db_path=":memory:")
     try:
         # Seed memory with a real emotion so the dream memory inherits it.

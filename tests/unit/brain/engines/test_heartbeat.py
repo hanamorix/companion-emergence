@@ -290,9 +290,8 @@ def test_heartbeat_state_save_is_atomic(tmp_path: Path) -> None:
     s = HeartbeatState.fresh(trigger="init")
     s.save(path)
     assert path.exists()
-    # .new temp must be cleaned up
-    temp_path = path.with_suffix(path.suffix + ".new")
-    assert not temp_path.exists()
+    # per-save temp files (*.new) must be cleaned up
+    assert not list(path.parent.glob("*.new"))
 
 
 def test_heartbeat_state_save_overwrites_existing(tmp_path: Path) -> None:
@@ -717,7 +716,7 @@ def test_heartbeat_runs_reflex_when_enabled(tmp_path: Path) -> None:
     config_path = tmp_path / "heartbeat_config.json"
     HeartbeatConfig(reflex_enabled=True).save(config_path)
 
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     hm = HebbianMatrix(":memory:")
     try:
         store.create(
@@ -1044,7 +1043,7 @@ def test_heartbeat_reflex_wins_tie_over_research(tmp_path: Path) -> None:
         research_emotion_threshold=5.0,
     ).save(config_path)
 
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     hm = HebbianMatrix(":memory:")
     try:
         store.create(
@@ -1308,7 +1307,7 @@ def test_heartbeat_memory_uses_persona_name(
         emit_memory="always",
     ).save(config_path)
 
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     hm = HebbianMatrix(":memory:")
     try:
         store.create(
@@ -1469,8 +1468,8 @@ def test_heartbeat_config_save_is_atomic(tmp_path: Path) -> None:
     path = tmp_path / "cfg.json"
     HeartbeatConfig(dream_every_hours=12.0, reflex_enabled=False).save(path)
     assert path.exists()
-    # .new temp must not linger after save
-    assert not path.with_suffix(path.suffix + ".new").exists()
+    # per-save temp files (*.new) must not linger after save
+    assert not list(path.parent.glob("*.new"))
     # Reloads cleanly with tuned values preserved
     loaded = HeartbeatConfig.load(path)
     assert loaded.dream_every_hours == 12.0
@@ -2118,7 +2117,7 @@ def test_daemon_state_reflex_entry_written_when_reflex_fires(tmp_path: Path) -> 
     interests_path.write_text(json.dumps({"version": 1, "interests": []}), encoding="utf-8")
     HeartbeatConfig(reflex_enabled=True).save(tmp_path / "heartbeat_config.json")
 
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     hm = HebbianMatrix(":memory:")
     try:
         store.create(

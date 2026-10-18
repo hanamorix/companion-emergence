@@ -1,7 +1,6 @@
 import { useState } from "react";
 import {
   DEFAULT_INIT_MODEL,
-  installNellCliSymlink,
   installSupervisorService,
   runInit,
   runMigrate,
@@ -11,7 +10,8 @@ import {
   type InitResult,
   type MigrateSource,
 } from "../appConfig";
-import { getClientPlatform, platformLabel, supportsMacOnlyInstallActions } from "../platform";
+import { getClientPlatform, platformLabel } from "../platform";
+import { runCliShortcutStep } from "./postInstall";
 import { WizardAvatar } from "./Avatar";
 import { StepWelcome } from "./steps/StepWelcome";
 import { StepPrerequisites } from "./steps/StepPrerequisites";
@@ -25,6 +25,7 @@ import { StepInstalling } from "./steps/StepInstalling";
 import { StepReady } from "./steps/StepReady";
 import { errString } from "../lib/errString";
 import { computeWizardSteps } from "./wizardStepCounter";
+import { wizardInitModel } from "./chatModel";
 
 export type WizardMode = "fresh" | "migrate";
 export type VoiceTemplate = "default" | "nell-example" | "skip";
@@ -38,6 +39,8 @@ export interface WizardState {
   userName: string;
   userPronouns: string;
   voiceTemplate: VoiceTemplate;
+  /** Optional Claude model (alias or full id); blank = the default. */
+  chatModel: string;
   migrateFromPath: string;
   migrateSource: MigrateSource;
 }
@@ -48,6 +51,7 @@ const INITIAL_STATE: WizardState = {
   userName: "",
   userPronouns: "they/them",
   voiceTemplate: "default",
+  chatModel: "",
   migrateFromPath: "",
   migrateSource: "nellbrain",
 };
@@ -80,6 +84,9 @@ export function Wizard({ onDone }: Props) {
     output: string;
     error: string;
   } | null>(null);
+  // Explanation from the nell-shortcut step when it did not succeed on Linux/Windows; shown on the
+  // final step so it is not lost when the install pane advances (#408).
+  const [cliNotice, setCliNotice] = useState<string | null>(null);
   // Preflight result for the existing companion-emergence branch.
   // Held here so StepMigrate, StepReview, and runInstall all share the same object.
   const [preflight, setPreflight] = useState<ExistingCePreflight | null>(null);
@@ -109,9 +116,10 @@ export function Wizard({ onDone }: Props) {
 
   // Shared post-install helper — supervisor service + nell CLI symlink.
   // Called from all three install branches so we don't duplicate this logic.
-  async function runPostInstall(personaName: string): Promise<{ serviceTrailer: string; cliTrailer: string }> {
+  async function runPostInstall(
+    personaName: string,
+  ): Promise<{ serviceTrailer: string; cliTrailer: string; cliNotice: string | null }> {
     const platform = getClientPlatform();
-    const macInstallActionsSupported = supportsMacOnlyInstallActions(platform);
     const currentPlatformLabel = platformLabel(platform);
     const supervisorWizardInstall = platform === "macos" || platform === "windows";
 
@@ -136,27 +144,18 @@ export function Wizard({ onDone }: Props) {
       serviceTrailer = `\n\n[service] persistent supervisor install is available from the Connection panel on ${currentPlatformLabel}.`;
     }
 
-    // Plan C — symlink ~/.local/bin/nell so users can reach the CLI from
-    // their Terminal without typing the .app's Resources path. Also
-    // macOS-only for now; skip on Windows/Linux with a reassuring note.
-    let cliTrailer = "";
-    if (macInstallActionsSupported) {
-      try {
-        const cli = await installNellCliSymlink();
-        cliTrailer = cli.success
-          ? `\n\n[cli] nell linked to ~/.local/bin — use \`nell --version\` from Terminal`
-          : `\n\n[cli] symlink reported exit ${cli.exit_code} — Terminal access unavailable. Stderr:\n${cli.stderr}`;
-      } catch (e) {
-        cliTrailer = `\n\n[cli] could not install nell symlink: ${errString(e)}`;
-      }
-    } else {
-      cliTrailer = `\n\n[cli] bundled CLI shortcut install is macOS-only; no action is needed for normal app use on ${currentPlatformLabel}.`;
-    }
+    // Put `nell` on the user's PATH so the CLI is reachable from a terminal: a symlink on macOS and
+    // Linux (.deb), a small script on Linux (AppImage), nell.cmd plus a PATH entry on Windows. When
+    // the step does not succeed on Linux/Windows the explanation is kept as `cliNotice`, shown on
+    // the final step until the user continues (#408).
+    const cli = await runCliShortcutStep(platform);
+    const cliTrailer = cli.trailer;
 
-    return { serviceTrailer, cliTrailer };
+    return { serviceTrailer, cliTrailer, cliNotice: cli.notice };
   }
 
   async function runInstall() {
+    setCliNotice(null);
     setStep("installing");
     // emergence-kit takes the new auto-importer path: ``nell migrate
     // --source emergence-kit --install-as <name>`` builds the persona
@@ -195,7 +194,8 @@ export function Wizard({ onDone }: Props) {
           always_on_top: false,
           reduced_motion: false,
         });
-        const { serviceTrailer, cliTrailer } = await runPostInstall(personaName);
+        const { serviceTrailer, cliTrailer, cliNotice: notice } = await runPostInstall(personaName);
+        setCliNotice(notice);
         setInstallResult({
           ok: true,
           output: result.stdout + serviceTrailer + cliTrailer,
@@ -213,7 +213,7 @@ export function Wizard({ onDone }: Props) {
         migrate_from:
           state.mode === "migrate" && !useEmergenceKitMigrator ? state.migrateFromPath : null,
         force: false,
-        model: DEFAULT_INIT_MODEL,
+        model: wizardInitModel(state.chatModel, DEFAULT_INIT_MODEL),
       };
 
       if (useEmergenceKitMigrator) {
@@ -263,7 +263,8 @@ export function Wizard({ onDone }: Props) {
         always_on_top: false,
         reduced_motion: false,
       });
-      const { serviceTrailer, cliTrailer } = await runPostInstall(state.personaName);
+      const { serviceTrailer, cliTrailer, cliNotice: notice } = await runPostInstall(state.personaName);
+      setCliNotice(notice);
       setInstallResult({
         ok: true,
         output: result.stdout + serviceTrailer + cliTrailer,
@@ -342,6 +343,8 @@ export function Wizard({ onDone }: Props) {
           totalSteps={totalSteps}
           template={state.voiceTemplate}
           onTemplateChange={(t) => update("voiceTemplate", t)}
+          chatModel={state.chatModel}
+          onChatModelChange={(m) => update("chatModel", m)}
           // voice always proceeds to review (migrate step is now earlier in the flow)
           onNext={() => setStep("review")}
           onBack={() => setStep("user")}
@@ -427,6 +430,7 @@ export function Wizard({ onDone }: Props) {
             )
           }
           avatar={avatar}
+          cliNotice={cliNotice}
         />
       );
   }

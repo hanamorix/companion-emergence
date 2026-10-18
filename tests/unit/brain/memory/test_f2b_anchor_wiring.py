@@ -6,9 +6,10 @@ covered, offline, in `test_reranker.py`'s "normalize_against_anchors — F2b"
 section — this file does NOT re-test that arithmetic):
 
   - AC1 (integration): the combined document list a call site hands the
-    reranker provider has length exactly `width` and includes anchor
-    content, at BOTH `run_semantic_recall` (site 1) and `_semantic_top_k`
-    (site 2, driven through `dispatch`).
+    reranker provider is the fitted real candidates with `k` anchors ON TOP
+    (name-recall fix R1, S23: real + k documents, k = min(8, real // 2)), at
+    BOTH `run_semantic_recall` (site 1) and `_semantic_top_k` (site 2,
+    driven through `dispatch`).
   - AC2: an anchor — even one seeded to score astronomically high — never
     appears in the surfaced result, at either site.
   - AC4 (compose-under-the-floor) + AC5 (both sites identical): a raw score
@@ -18,7 +19,7 @@ section — this file does NOT re-test that arithmetic):
     proving both, not just one" AC5 calls for.
   - AC8: `run_semantic_recall`'s calibration-log write (site 1's only log
     write — site 2 has none) records the NORMALIZED score and the
-    `real_width`-sized id list, not the raw score or the full `width` list.
+    fitted real candidates' ids, never an anchor.
   - Fail-soft: a `normalize_against_anchors` failure at either site degrades
     to the lexical fallback (site 1: `run_semantic_recall` returns None;
     site 2: `search_memories(mode="semantic")` falls back to
@@ -55,8 +56,9 @@ _FLOOR = 0.0
 
 
 # ---------------------------------------------------------------------------
-# Shared scaffolding: 4 candidates with strictly descending cosine
-# similarity -> deterministic coarse-cut order -> deterministic width/k.
+# Shared scaffolding: 5 candidates (the S5 rerank minimum) with strictly
+# descending cosine similarity -> deterministic coarse-cut order ->
+# deterministic width/k (first rerank of a process: width 5, k 2).
 # ---------------------------------------------------------------------------
 
 
@@ -151,36 +153,33 @@ class _RecordingProvider(RerankerProvider):
         return "fake-reranker"
 
 
-def _seed_four_candidates(
+def _seed_candidates(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch, query: str
-) -> tuple[Memory, Memory, Memory, Memory]:
-    """Seeds 4 memories with strictly descending cosine similarity to
-    `query` (real-A > real-B > filler-C > filler-D) — `coarse` (and so
-    `rerank_ids`) is therefore deterministically ordered [real-A, real-B,
-    filler-C, filler-D]. With `pool_size=4` and a near-instant
-    `_RecordingProvider`/`FakeRerankerProvider` (measured per-doc latency
-    ~0 -> `get_rerank_width` is uncapped by the latency budget, so it's
-    capped only by `pool_size`/`CANDIDATE_POOL`), `width == 4` ->
-    `k = min(P=8, 4 // ANCHOR_SPLIT_DIVISOR=2) == 2` -> `real_width == 2`:
-    ONLY real-A/real-B are ever actually sent to the reranker. filler-C/D
-    exist purely to pad the coarse-cut pool up to `width == 4` and are
-    NEVER scored — proving, as a side effect of every test that uses this
-    fixture, that anchors are reserved OUT of `width`, never appended on
-    top of it (I6)."""
+) -> tuple[Memory, Memory, Memory, Memory, Memory]:
+    """Seeds 5 memories with strictly descending cosine similarity to
+    `query` (real-A > real-B > filler-C > filler-D > filler-E), so `coarse`
+    is deterministically ordered [real-A, real-B, filler-C, filler-D,
+    filler-E]. Name-recall fix R1: the first rerank of a process runs at the
+    S5 minimum of 5 real candidates (S24), so all 5 are scored, with
+    `k = min(P=8, 5 // 2) == 2` anchors appended ON TOP (7 documents, S23).
+    The fillers are unscripted, so the recording provider scores them at its
+    far-below-any-floor default and they never surface."""
     every_content_shares_this_token = "wiring"  # lets a lexical fallback find these too (fail-soft tests)
     real_a = _mem(store, f"F2b {every_content_shares_this_token} test real candidate A")
     real_b = _mem(store, f"F2b {every_content_shares_this_token} test real candidate B")
     filler_c = _mem(store, f"F2b {every_content_shares_this_token} test filler candidate C")
     filler_d = _mem(store, f"F2b {every_content_shares_this_token} test filler candidate D")
+    filler_e = _mem(store, f"F2b {every_content_shares_this_token} test filler candidate E")
     _patch_query_embedding(monkeypatch, query)
     _seed_row_vector(store, real_a.id, _unit_vec_with_cosine(0.99))
     _seed_row_vector(store, real_b.id, _unit_vec_with_cosine(0.90))
     _seed_row_vector(store, filler_c.id, _unit_vec_with_cosine(0.50))
     _seed_row_vector(store, filler_d.id, _unit_vec_with_cosine(0.40))
-    return real_a, real_b, filler_c, filler_d
+    _seed_row_vector(store, filler_e.id, _unit_vec_with_cosine(0.30))
+    return real_a, real_b, filler_c, filler_d, filler_e
 
 
-_QUERY = "wiring"  # shares a token with every seeded memory (see _seed_four_candidates)
+_QUERY = "wiring"  # shares a token with every seeded memory (see _seed_candidates)
 
 
 def _below_to_above_scores(real_a_content: str, real_b_content: str) -> dict[str, float]:
@@ -210,6 +209,17 @@ def _above_to_below_scores(real_a_content: str, real_b_content: str) -> dict[str
     }
 
 
+def _semantic_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate the semantic selection under test: name-recall fix R4 merges the
+    tool's keyword hits in below the semantic results, and every seeded memory
+    here shares the query token, so without this the keyword side would
+    legitimately surface the very memories these tests assert are gated out.
+    The merge itself is covered in `test_search_memories_keyword_merge.py`."""
+    monkeypatch.setattr(
+        "brain.tools.impls.search_memories._keyword_candidates", lambda *a, **k: []
+    )
+
+
 def _ctx2(tmp_path: Path, store: MemoryStore) -> dict:
     """Site-2 dispatch context (mirrors `test_search_memories_mode.py`'s
     `_ctx`, but takes an already-constructed `store` so callers can seed it
@@ -229,7 +239,7 @@ def test_ac4_run_semantic_recall_floor_follows_normalized_score(
 ) -> None:
     """Site 1 (`run_semantic_recall`) half of AC4/AC5."""
     store = MemoryStore(tmp_path / "memories.db")
-    real_a, real_b, _, _ = _seed_four_candidates(store, monkeypatch, _QUERY)
+    real_a, real_b, *_ = _seed_candidates(store, monkeypatch, _QUERY)
     _seed_floor(store)
 
     if direction == "below_to_above":
@@ -271,7 +281,8 @@ def test_ac5_semantic_top_k_floor_follows_normalized_score_same_as_run_semantic_
     proving both call sites apply IDENTICAL normalize-then-gate composition
     (AC5's explicit "not just one" requirement)."""
     store = MemoryStore(tmp_path / "memories.db")
-    real_a, real_b, _, _ = _seed_four_candidates(store, monkeypatch, _QUERY)
+    real_a, real_b, *_ = _seed_candidates(store, monkeypatch, _QUERY)
+    _semantic_only(monkeypatch)
     _seed_floor(store)
 
     if direction == "below_to_above":
@@ -299,47 +310,42 @@ def test_ac5_semantic_top_k_floor_follows_normalized_score_same_as_run_semantic_
 
 
 # ---------------------------------------------------------------------------
-# AC1 (integration) — the combined document list a call site sends has
-# length == width and includes anchor content; anchors are RESERVED out of
-# width (the dropped filler candidates never reach the reranker at all).
+# AC1 (integration) — the combined document list a call site sends is the
+# fitted real candidates with the k anchors ON TOP (R1, S23).
 # ---------------------------------------------------------------------------
 
 
-def test_ac1_run_semantic_recall_sends_one_combined_call_of_length_width(
+def test_ac1_run_semantic_recall_sends_real_candidates_with_anchors_on_top(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     store = MemoryStore(tmp_path / "memories.db")
-    real_a, real_b, filler_c, filler_d = _seed_four_candidates(store, monkeypatch, _QUERY)
+    real_a, real_b, filler_c, filler_d, filler_e = _seed_candidates(store, monkeypatch, _QUERY)
     _seed_floor(store)
     provider = _RecordingProvider({}, default=0.0)
     monkeypatch.setattr("brain.memory.reranker.build_reranker_provider", lambda **kwargs: provider)
 
     run_semantic_recall(store, tmp_path, _QUERY)
 
-    # The latency-calibration warm-up/measure calls (get_rerank_width) are
-    # all single-document; only the real combined normalize_against_anchors
-    # call sends more than one document at once.
+    # The two process warm-up reranks are single-document; only the real
+    # combined normalize_against_anchors call sends more than one document.
     combined_calls = [c for c in provider.calls if len(c) > 1]
     assert len(combined_calls) == 1, "exactly one combined rerank() call for real+anchor documents"
     (sent_docs,) = combined_calls
-    assert len(sent_docs) == 4, "combined call length must equal width exactly"
-    assert sent_docs[:2] == [real_a.content, real_b.content], (
-        "real candidates (the top real_width by coarse rank) occupy the FRONT of the combined list"
+    real_contents = [m.content for m in (real_a, real_b, filler_c, filler_d, filler_e)]
+    assert len(sent_docs) == 5 + 2, "width 5 real candidates + k = min(8, 5 // 2) = 2 anchors ON TOP"
+    assert sent_docs[:5] == real_contents, (
+        "every fitted real candidate is scored, in coarse rank order, at the FRONT"
     )
-    assert sent_docs[2:] == list(ANCHOR_POOL[:2]), (
+    assert sent_docs[5:] == list(ANCHOR_POOL[:2]), (
         "anchors are the ANCHOR_POOL prefix, appended after the real candidates"
     )
-    assert filler_c.content not in sent_docs and filler_d.content not in sent_docs, (
-        "anchors are RESERVED OUT of width, never appended on top of it — the filler "
-        "candidates dropped by the real_width narrowing never reach the reranker at all"
-    )
 
 
-def test_ac1_semantic_top_k_sends_one_combined_call_of_length_width(
+def test_ac1_semantic_top_k_sends_real_candidates_with_anchors_on_top(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     store = MemoryStore(tmp_path / "memories.db")
-    real_a, real_b, filler_c, filler_d = _seed_four_candidates(store, monkeypatch, _QUERY)
+    real_a, real_b, filler_c, filler_d, filler_e = _seed_candidates(store, monkeypatch, _QUERY)
     _seed_floor(store)
     provider = _RecordingProvider({}, default=0.0)
     monkeypatch.setattr("brain.memory.reranker.build_reranker_provider", lambda **kwargs: provider)
@@ -349,10 +355,10 @@ def test_ac1_semantic_top_k_sends_one_combined_call_of_length_width(
     combined_calls = [c for c in provider.calls if len(c) > 1]
     assert len(combined_calls) == 1, "exactly one combined rerank() call for real+anchor documents"
     (sent_docs,) = combined_calls
-    assert len(sent_docs) == 4
-    assert sent_docs[:2] == [real_a.content, real_b.content]
-    assert sent_docs[2:] == list(ANCHOR_POOL[:2])
-    assert filler_c.content not in sent_docs and filler_d.content not in sent_docs
+    real_contents = [m.content for m in (real_a, real_b, filler_c, filler_d, filler_e)]
+    assert len(sent_docs) == 5 + 2
+    assert sent_docs[:5] == real_contents
+    assert sent_docs[5:] == list(ANCHOR_POOL[:2])
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +385,7 @@ def test_ac2_anchor_never_surfaces_in_run_semantic_recall_even_at_very_high_scor
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     store = MemoryStore(tmp_path / "memories.db")
-    real_a, real_b, _, _ = _seed_four_candidates(store, monkeypatch, _QUERY)
+    real_a, real_b, *_ = _seed_candidates(store, monkeypatch, _QUERY)
     _seed_floor(store)
     scores = _high_anchor_scores(real_a.content, real_b.content)
     monkeypatch.setattr(
@@ -394,8 +400,9 @@ def test_ac2_anchor_never_surfaces_in_run_semantic_recall_even_at_very_high_scor
     assert real_b.id not in surfaced_ids
     returned_contents = {m.content for m in result.full + result.snippet}
     assert not returned_contents & set(ANCHOR_POOL), "no anchor content may ever appear in the surfaced result"
-    assert set(result.scores.keys()) <= {real_a.id, real_b.id}, (
-        "scores must never contain any id beyond the real_width-scored real candidates "
+    seeded_ids = {m.id for m in store.list_active()}
+    assert set(result.scores.keys()) <= seeded_ids, (
+        "scores must never contain any id beyond the scored real candidates "
         "(an anchor has no memory id, so this also catches any content-vs-id confusion)"
     )
 
@@ -404,7 +411,8 @@ def test_ac2_anchor_never_surfaces_in_semantic_top_k_even_at_very_high_score(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     store = MemoryStore(tmp_path / "memories.db")
-    real_a, real_b, _, _ = _seed_four_candidates(store, monkeypatch, _QUERY)
+    real_a, real_b, *_ = _seed_candidates(store, monkeypatch, _QUERY)
+    _semantic_only(monkeypatch)
     _seed_floor(store)
     scores = _high_anchor_scores(real_a.content, real_b.content)
     monkeypatch.setattr(
@@ -423,15 +431,15 @@ def test_ac2_anchor_never_surfaces_in_semantic_top_k_even_at_very_high_score(
 
 # ---------------------------------------------------------------------------
 # AC8 — run_semantic_recall's calibration-log write is re-pointed at the
-# NORMALIZED score + the real_width-sized id list (site 2 has no log write).
+# NORMALIZED score + the scored real ids (site 2 has no log write).
 # ---------------------------------------------------------------------------
 
 
-def test_ac8_calibration_log_records_normalized_score_and_real_width_ids(
+def test_ac8_calibration_log_records_normalized_score_and_scored_real_ids(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     store = MemoryStore(tmp_path / "memories.db")
-    real_a, real_b, filler_c, filler_d = _seed_four_candidates(store, monkeypatch, _QUERY)
+    real_a, real_b, filler_c, filler_d, filler_e = _seed_candidates(store, monkeypatch, _QUERY)
     _seed_floor(store)
     scores = _below_to_above_scores(real_a.content, real_b.content)
     monkeypatch.setattr(
@@ -447,14 +455,14 @@ def test_ac8_calibration_log_records_normalized_score_and_real_width_ids(
     candidate_ids = json.loads(row["candidate_ids"])
     logged_scores = json.loads(row["reranker_scores"])
 
-    assert candidate_ids == [real_a.id, real_b.id], (
-        "logged candidate_ids must be exactly the real_width-scored ids, in scored order — "
-        "never the full width's ids, and never including the dropped filler/anchor ids"
+    assert candidate_ids == [real_a.id, real_b.id, filler_c.id, filler_d.id, filler_e.id], (
+        "logged candidate_ids must be exactly the scored real candidates, in scored order — "
+        "never an anchor"
     )
-    assert filler_c.id not in candidate_ids and filler_d.id not in candidate_ids
-    assert logged_scores == pytest.approx([5.0, -10.0]), (
+    # fillers: raw -1000 (the recording provider's default), anchor median -10.
+    assert logged_scores == pytest.approx([5.0, -10.0, -990.0, -990.0, -990.0]), (
         "logged scores must be the NORMALIZED values (matching what the floor gate actually "
-        "compared), never the pre-normalization raw scores (-5.0, -20.0)"
+        "compared), never the pre-normalization raw scores (-5.0, -20.0, -1000.0 ...)"
     )
     assert row["score_scale"] == "normalized"
 
@@ -466,55 +474,112 @@ def test_ac8_calibration_log_records_normalized_score_and_real_width_ids(
 
 
 # ---------------------------------------------------------------------------
-# Fail-soft: a normalize_against_anchors failure degrades to lexical at
-# BOTH sites, never crashes a turn.
+# Fail-soft: a normalize_against_anchors failure never crashes a turn at
+# BOTH sites. Name-recall fix R2: it makes the turn a cosine-path turn (gated
+# by the cosine floor), not a lexical demotion.
 # ---------------------------------------------------------------------------
 
 
-def test_fail_soft_normalization_error_degrades_run_semantic_recall_to_lexical(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    store = MemoryStore(tmp_path / "memories.db")
-    _seed_four_candidates(store, monkeypatch, _QUERY)
-    _seed_floor(store)
+def _seed_cosine_floor(store: MemoryStore, floor: float) -> None:
+    store.write_cosine_floor(
+        _TEST_MODEL_ID, floor=floor, raw_fit_floor=floor, sample_pairs=10, is_cold_start=False
+    )
 
+
+def _boom_normalize(monkeypatch: pytest.MonkeyPatch) -> None:
     def _boom(*args: object, **kwargs: object) -> None:
         raise RuntimeError("simulated normalize_against_anchors failure")
 
-    # `semantic_recall.py` calls `reranker_mod.normalize_against_anchors(...)`
-    # — a dynamic module-attribute lookup at call time, so patching the
-    # attribute on the reranker module itself is honored (mirrors this
-    # suite's existing `_BoomReranker`/build_reranker_provider patch
-    # pattern in test_semantic_recall.py).
+    # `semantic_recall.py` reaches `reranker_mod.normalize_against_anchors(...)`
+    # through `rerank_for_recall`, a dynamic module-attribute lookup at call
+    # time, so patching the attribute on the reranker module itself is honored.
     monkeypatch.setattr("brain.memory.reranker.normalize_against_anchors", _boom)
+
+
+def test_normalization_error_takes_the_cosine_path_in_run_semantic_recall(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = MemoryStore(tmp_path / "memories.db")
+    real_a, real_b, *_ = _seed_candidates(store, monkeypatch, _QUERY)
+    _seed_floor(store)
+    _seed_cosine_floor(store, 0.6)  # real-A 0.99 and real-B 0.90 clear it; the 0.5, 0.4, 0.3 fillers do not
+    _boom_normalize(monkeypatch)
 
     result = run_semantic_recall(store, tmp_path, _QUERY)
 
-    assert result is None, (
-        "a normalize_against_anchors failure must demote this turn to the lexical fallback, not raise"
-    )
+    assert result is not None and result.path == "cosine", "not raised, not demoted to keyword-only"
+    assert [m.id for m in result.full] == [real_a.id, real_b.id]
 
 
-def test_fail_soft_normalization_error_degrades_semantic_top_k_to_lexical(
+def test_normalization_error_with_no_clearing_cosine_floor_is_the_lexical_fallback(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     store = MemoryStore(tmp_path / "memories.db")
-    real_a, _, _, _ = _seed_four_candidates(store, monkeypatch, _QUERY)
+    _seed_candidates(store, monkeypatch, _QUERY)
     _seed_floor(store)
+    _boom_normalize(monkeypatch)  # the suite default cosine floor (2.0) never clears
 
-    def _boom(*args: object, **kwargs: object) -> None:
-        raise RuntimeError("simulated normalize_against_anchors failure")
+    assert run_semantic_recall(store, tmp_path, _QUERY) is None
 
-    monkeypatch.setattr("brain.memory.reranker.normalize_against_anchors", _boom)
 
-    # `_QUERY` ("wiring") shares a token with every seeded memory's content
-    # (see _seed_four_candidates), so the lexical fallback has something
-    # real to find — proving this returns a usable result, not just an
-    # empty-but-non-erroring response.
+def test_normalization_error_takes_the_cosine_path_at_semantic_top_k(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = MemoryStore(tmp_path / "memories.db")
+    real_a, real_b, *_ = _seed_candidates(store, monkeypatch, _QUERY)
+    _semantic_only(monkeypatch)
+    _seed_floor(store)
+    _seed_cosine_floor(store, 0.6)
+    _boom_normalize(monkeypatch)
+
     res = dispatch("search_memories", {"query": _QUERY, "mode": "semantic"}, **_ctx2(tmp_path, store))
 
-    assert res["mode"] == "lexical", (
-        "a normalize_against_anchors failure must demote this call to the lexical fallback, not raise"
-    )
-    ids = {mm["id"] for mm in res["memories"]}
-    assert real_a.id in ids
+    assert res["mode"] == "semantic"
+    assert [mm["id"] for mm in res["memories"]] == [real_a.id, real_b.id]
+
+
+def test_normalization_error_with_no_clearing_cosine_floor_falls_back_to_lexical_at_semantic_top_k(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = MemoryStore(tmp_path / "memories.db")
+    real_a, *_ = _seed_candidates(store, monkeypatch, _QUERY)
+    _seed_floor(store)
+    _boom_normalize(monkeypatch)
+
+    # `_QUERY` ("wiring") shares a token with every seeded memory's content
+    # (see _seed_candidates), so the lexical fallback has something real to find.
+    res = dispatch("search_memories", {"query": _QUERY, "mode": "semantic"}, **_ctx2(tmp_path, store))
+
+    assert res["mode"] == "lexical"
+    assert real_a.id in {mm["id"] for mm in res["memories"]}
+
+
+@pytest.mark.parametrize("site", ["run_semantic_recall", "search_memories"])
+def test_pool_below_the_minimum_hands_off_at_both_call_sites(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture, site: str
+) -> None:
+    """R1 (S5/S23): fewer than 5 real candidates -> no rerank at all, and the
+    call site takes its explicit hand-off branch (logged at info), not the
+    broad fail-soft `except` (which would log a warning traceback). R2: the
+    branch is the cosine path (`test_no_rerank_cosine_path.py` covers its
+    results); under the suite's never-clearing cosine floor it yields no
+    semantic result here."""
+    import logging
+
+    store = MemoryStore(tmp_path / "memories.db")
+    real_a, *_, filler_e = _seed_candidates(store, monkeypatch, _QUERY)
+    store.deactivate(filler_e.id)  # 4 candidates left in the pool
+    _seed_floor(store)
+    provider = _RecordingProvider({real_a.content: 50.0}, default=0.0)
+    monkeypatch.setattr("brain.memory.reranker.build_reranker_provider", lambda **kwargs: provider)
+
+    with caplog.at_level(logging.INFO):
+        if site == "run_semantic_recall":
+            assert run_semantic_recall(store, tmp_path, _QUERY) is None
+        else:
+            res = dispatch("search_memories", {"query": _QUERY, "mode": "semantic"}, **_ctx2(tmp_path, store))
+            assert res["mode"] == "lexical"
+
+    assert provider.calls == [], "no warm-up and no rerank below the minimum"
+    assert any("no rerank (pool" in r.getMessage() for r in caplog.records), "the explicit hand-off branch ran"
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records), "not the fail-soft except"

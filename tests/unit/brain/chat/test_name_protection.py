@@ -1,0 +1,836 @@
+"""Name-recall fix R5 (spec §5, S27, S35, S36, S47, S79; plan P-14, P-15): name
+protection wired into passive recall.
+
+Covers criterion C5 (passive half): a listed name typed in lower case triggers
+ONE extra keyword query whose hits rank ahead of the general keyword hits in the
+active and fading buckets; a word not in the list triggers no name query and no
+reordering; a listed 2-letter name and a listed name that is also a stopword
+survive the stopword and length rules; a listed "new york" is matched only as
+consecutive raw words and sent as ONE FTS phrase. Also pins the graveyard
+exclusion (P-14: the name query never feeds the lost bucket) and the
+"not recognised" list's use of matched names (P-15).
+
+Every "leads" assertion has its precondition run on a twin world with an empty
+list, so the test cannot pass by the ordering already being that way.
+
+Drives the REAL `_build_recall_block` against a real store and a real
+known-names file. Synthetic data only (user "Bob", persona label "Canary").
+"""
+
+from __future__ import annotations
+
+import re
+import sqlite3
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from brain.chat.prompt import _build_recall_block, _extract_recall_tokens, _legacy_capped_tokens
+from brain.felt_time.state import FeltTimeState
+from brain.felt_time.state import persist as persist_felt_time
+from brain.forgetting import graveyard as gv
+from brain.forgetting.salience import SalienceInputs
+from brain.memory import known_names as kn
+from brain.memory.relevance import names_in
+from brain.memory.semantic_recall import SemanticRecallResult
+from brain.memory.store import FtsPhrases, Memory, MemoryStore, _to_fts_match
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+
+
+def _mem(
+    store: MemoryStore, content: str, *, importance: float = 5.0, memory_type: str = "conversation"
+) -> Memory:
+    m = Memory.create_new(content=content, memory_type=memory_type, domain="us", importance=importance)
+    store.create(m)
+    return m
+
+
+def _fade(store: MemoryStore, mem: Memory) -> None:
+    """A direct state update: `store.fade` would embed and load a model."""
+    store._conn.execute(  # noqa: SLF001
+        "UPDATE memories SET state = 'fading', content_snapshot = content WHERE id = ?", (mem.id,)
+    )
+    store._conn.commit()  # noqa: SLF001
+
+
+def _list_names(persona: Path, *names: str) -> None:
+    """Put names on the list through the real admission function."""
+    admitted = kn.admit_names(persona, list(names), "tool")
+    assert admitted, f"{names} were not admitted"
+
+
+def _list_names_direct(persona: Path, *names: str) -> None:
+    """Write entries straight into the file, bypassing the S70 admission filter
+    (which keeps stopword strings out of the list through every writer): this
+    exercises the matcher and the recall wiring, not the admission."""
+    conn = sqlite3.connect(str(kn.known_names_path(persona)))
+    try:
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.execute(kn._SCHEMA)  # noqa: SLF001
+        conn.executemany(
+            "INSERT OR IGNORE INTO known_names VALUES (?, ?, 'tool', '2026-09-29T00:00:00+00:00')",
+            [(kn.normalize_name(n), n) for n in names],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _rows(block: str) -> list[tuple[str, str]]:
+    """(memory id, rendered body) of the ACTIVE section, in render order."""
+    rows: list[tuple[str, str]] = []
+    in_active = False
+    for line in block.splitlines():
+        stripped = line.strip()
+        if stripped == "active:":
+            in_active = True
+            continue
+        if stripped.startswith(("softened", "lost", "not recognised")):
+            in_active = False
+            continue
+        if in_active:
+            m = re.match(r'^    - (\S+): "(.*)"$', line)
+            if m:
+                rows.append((m.group(1), m.group(2)))
+    return rows
+
+
+def _ids(block: str) -> list[str]:
+    return [r[0] for r in _rows(block)]
+
+
+def _softened(block: str) -> list[str]:
+    out: list[str] = []
+    on = False
+    for line in block.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("softened"):
+            on = True
+            continue
+        if stripped.startswith(("lost", "not recognised")):
+            on = False
+            continue
+        if on:
+            m = re.match(r'^    - "(.*)"  \[state: fading\]$', line)
+            if m:
+                out.append(m.group(1))
+    return out
+
+
+def _not_recognised(block: str) -> list[str]:
+    out: list[str] = []
+    on = False
+    for line in block.splitlines():
+        if line.strip().startswith("not recognised"):
+            on = True
+            continue
+        if on:
+            m = re.match(r"^    - (.+)$", line)
+            if m:
+                out.append(m.group(1))
+    return out
+
+
+def _world(persona: Path) -> SimpleNamespace:
+    """A small kennel. `general` matches two rare words of the messages below
+    (so it out-ranks any name memory on BM25 in the general query); the name
+    memories each match only the name."""
+    persist_felt_time(FeltTimeState(lived_age_hours=48.0), persona)
+    store = MemoryStore(":memory:")
+    general = _mem(store, "zorblax and quixotic vellum ledger kept by the harbour clerk")
+    pretzel = [_mem(store, f"Pretzel is a scruffy terrier mix, walk number {i}") for i in range(3)]
+    al = _mem(store, "Al fixed the ferry engine before the storm")
+    # "Will" mid-sentence: a stopword-name matches only there (S104/S121).
+    will = _mem(store, "then Will brought the lantern to the workshop")
+    for i in range(6):
+        _mem(store, f"unrelated harbour filler line {i} about tides and nothing else")
+    return SimpleNamespace(store=store, general=general, pretzel=pretzel, al=al, will=will)
+
+
+def _render(w: SimpleNamespace, message: str, persona: Path, *, semantic=None, **kwargs) -> str:
+    with patch("brain.chat.prompt.run_semantic_recall", return_value=semantic):
+        return _build_recall_block(w.store, message, persona_dir=persona, **kwargs)
+
+
+def _twin(tmp_path: Path, name: str, message: str, *, list_names=(), direct=(), **kwargs):
+    """Render `message` in a fresh world: (world, block)."""
+    persona = tmp_path / name
+    persona.mkdir()
+    w = _world(persona)
+    if list_names:
+        _list_names(persona, *list_names)
+    if direct:
+        _list_names_direct(persona, *direct)
+    return w, _render(w, message, persona, **kwargs)
+
+
+# --------------------------------------------------------------------------
+# C5: a listed lower-case name triggers the name query; its hits lead
+# --------------------------------------------------------------------------
+
+
+def test_a_listed_lowercase_name_leads_the_general_keyword_hits(tmp_path: Path) -> None:
+    message = "pretzel zorblax quixotic"
+    w0, before = _twin(tmp_path, "empty", message)
+    assert _ids(before)[0] == w0.general.id, "precondition: without the list the rare-word hit leads"
+
+    w1, after = _twin(tmp_path, "listed", message, list_names=["Pretzel"])
+    ids = _ids(after)
+    pretzel_ids = {m.id for m in w1.pretzel}
+    assert set(ids[:3]) == pretzel_ids, "the name's hits rank ahead of every general hit"
+    assert ids[3] == w1.general.id
+    assert len(ids) == len(set(ids)), "a memory found by both queries appears once"
+
+
+def test_the_name_query_hits_lead_in_the_softened_section_too(tmp_path: Path) -> None:
+    message = "pretzel zorblax quixotic"
+
+    def build(name: str, listed: bool):
+        persona = tmp_path / name
+        persona.mkdir()
+        w = _world(persona)
+        f_gen = _mem(w.store, "a faded zorblax quixotic tale of a ledger")
+        f_name = _mem(w.store, "Pretzel faded into the old summer")
+        _fade(w.store, f_gen)
+        _fade(w.store, f_name)
+        if listed:
+            _list_names(persona, "Pretzel")
+        return _render(w, message, persona)
+
+    before = _softened(build("empty", False))
+    assert before[0].startswith("a faded zorblax"), "precondition: the general fading hit leads"
+    after = _softened(build("listed", True))
+    assert after[0].startswith("Pretzel faded"), "the name's fading hit leads the softened section"
+    assert len(after) == len(before) == 2
+
+
+# S16 on the fading keyword hits: the monologue family follows every genuine hit, as in the
+# active section (name-recall fix, small batch).
+
+
+def _fading_block(tmp_path: Path, name: str, items: list[tuple[str, str, float]], message: str, *names: str) -> list[str]:
+    persona = tmp_path / name
+    persona.mkdir()
+    persist_felt_time(FeltTimeState(lived_age_hours=48.0), persona)
+    store = MemoryStore(":memory:")
+    for text, memory_type, importance in items:
+        _fade(store, _mem(store, text, importance=importance, memory_type=memory_type))
+    if names:
+        _list_names(persona, *names)
+    return _softened(_render(SimpleNamespace(store=store), message, persona))
+
+
+def test_a_fading_monologue_family_hit_follows_a_fading_genuine_hit(tmp_path: Path) -> None:
+    out = _fading_block(
+        tmp_path,
+        "p",
+        [
+            ("quokka harbour monologue long since faded away", "monologue", 9.9),
+            ("quokka harbour afternoon long since faded away", "conversation", 1.0),
+        ],
+        "quokka harbour",
+    )
+    assert len(out) == 2
+    assert out[0].startswith("quokka harbour afte") and out[1].startswith("quokka harbour mono")
+
+
+def test_the_fading_family_goes_after_every_genuine_hit_keeping_each_groups_order(tmp_path: Path) -> None:
+    items = [
+        ("quokka harbour F1 faded away", "monologue", 9.9),
+        ("quokka harbour G1 faded away", "conversation", 5.0),
+        ("quokka harbour F2 faded away", "monologue_trace", 9.0),
+        ("quokka harbour G2 faded away", "conversation", 3.0),
+    ]
+    out = _fading_block(tmp_path, "p", items, "quokka harbour")
+    assert [o.split()[2] for o in out] == ["G1", "G2", "F1", "F2"]
+
+
+def test_an_all_genuine_fading_list_keeps_its_order(tmp_path: Path) -> None:
+    items = [
+        ("quokka harbour GA faded away", "conversation", 9.0),
+        ("quokka harbour GB faded away", "conversation", 2.0),
+        ("quokka harbour GC faded away", "episodic", 5.0),
+    ]
+    out = _fading_block(tmp_path, "p", items, "quokka harbour")
+    assert [o.split()[2] for o in out] == ["GA", "GC", "GB"], "importance order, unchanged by the partition"
+
+
+def test_the_render_limit_cuts_the_fading_family_before_any_genuine_hit(tmp_path: Path) -> None:
+    persona = tmp_path / "p"
+    persona.mkdir()
+    persist_felt_time(FeltTimeState(lived_age_hours=48.0), persona)
+    store = MemoryStore(":memory:")
+    for i in range(3):
+        _fade(store, _mem(store, f"quokka harbour family {i} faded away", importance=9.5, memory_type="monologue"))
+    for i in range(3):
+        _fade(store, _mem(store, f"quokka harbour genuine {i} faded away", importance=1.0 + i))
+    out = _softened(_render(SimpleNamespace(store=store), "quokka harbour", persona, limit=3))
+    assert len(out) == 3 and all(o.startswith("quokka harbour genu") for o in out)
+
+
+def test_a_fading_family_name_hit_still_follows_the_genuine_hits_and_the_name_leads_among_genuine(tmp_path: Path) -> None:
+    items = [
+        ("Pretzel monologue drifted through the old summer", "monologue", 9.9),
+        ("a faded zorblax quixotic tale of a ledger", "conversation", 9.0),
+        ("Pretzel faded into the old summer", "conversation", 1.0),
+    ]
+    out = _fading_block(tmp_path, "p", items, "pretzel zorblax quixotic", "Pretzel")
+    assert [o[:12] for o in out] == ["Pretzel fade", "a faded zorb", "Pretzel mono"]
+
+
+def test_name_hits_follow_the_semantic_results_and_lead_the_keyword_hits(tmp_path: Path) -> None:
+    persona = tmp_path / "p"
+    persona.mkdir()
+    w = _world(persona)
+    sem = _mem(w.store, "the sunlit dock where the boats moor at low tide")
+    _list_names(persona, "Pretzel")
+    semantic = SemanticRecallResult(full=[sem], snippet=[], scores={sem.id: 5.0})
+    ids = _ids(_render(w, "pretzel zorblax quixotic", persona, semantic=semantic))
+    assert ids[0] == sem.id, "semantic results stay first (S42)"
+    assert set(ids[1:4]) == {m.id for m in w.pretzel}, "then the name hits (S79), no slot reserved"
+    assert ids[4] == w.general.id
+
+
+def test_a_word_not_in_the_list_triggers_no_name_query_and_no_reordering(tmp_path: Path) -> None:
+    message = "kettle zorblax quixotic"
+    persona_a = tmp_path / "a"
+    persona_a.mkdir()
+    wa = _world(persona_a)
+    _mem(wa.store, "the copper kettle whistles at dawn")
+    baseline = _render(wa, message, persona_a)
+
+    persona_b = tmp_path / "b"
+    persona_b.mkdir()
+    wb = _world(persona_b)
+    _mem(wb.store, "the copper kettle whistles at dawn")
+    _list_names(persona_b, "Pretzel")  # a list exists, but "kettle" is not on it
+    calls: list = []
+    real_search = wb.store.search_fts_scored
+
+    def spy(query, **kw):
+        calls.append(query)
+        return real_search(query, **kw)
+
+    with patch.object(wb.store, "search_fts_scored", spy):
+        block = _render(wb, message, persona_b)
+
+    assert not any(isinstance(q, FtsPhrases) for q in calls), "no name query was issued"
+    assert [r[1] for r in _rows(block)] == [r[1] for r in _rows(baseline)], "no reordering"
+
+
+def test_an_empty_or_missing_list_adds_no_query_at_all(tmp_path: Path) -> None:
+    persona = tmp_path / "p"
+    persona.mkdir()
+    w = _world(persona)
+    with patch("brain.chat.prompt.rank_name_hits") as spy:
+        _render(w, "pretzel zorblax quixotic", persona)
+    # the helper is called only when a name matched
+    spy.assert_not_called()
+
+
+# --------------------------------------------------------------------------
+# C5: the stopword and length rules do not apply to a listed name
+# --------------------------------------------------------------------------
+
+
+def test_a_listed_two_letter_name_leads(tmp_path: Path) -> None:
+    message = "al zorblax quixotic"
+    w0, before = _twin(tmp_path, "empty", message)
+    ids0 = _ids(before)
+    assert ids0[0] == w0.general.id and ids0.index(w0.al.id) > 0, (
+        "precondition: without the list the 2-letter word only follows (tier 2)"
+    )
+    w1, after = _twin(tmp_path, "listed", message, list_names=["Al"])
+    assert _ids(after)[0] == w1.al.id
+
+
+def test_a_listed_name_that_is_also_a_stopword_survives_the_stopword_rule(tmp_path: Path) -> None:
+    # S104/S151: written capitalized (any position).
+    # (A capitalized mid-sentence "Will" is also a selector token, so the general
+    # search finds the memory too; the name query makes it LEAD.)
+    message = "so Will zorblax quixotic"
+    w0, before = _twin(tmp_path, "empty", message)
+    assert _ids(before)[0] == w0.general.id, "precondition: without the list the rare words lead"
+    w1, after = _twin(tmp_path, "listed", message, direct=["will"])
+    ids = _ids(after)
+    assert ids[0] == w1.will.id and ids[1] == w1.general.id
+
+
+def test_a_lowercase_modal_will_is_not_the_listed_name(tmp_path: Path) -> None:
+    # S104 (flipped from the graveyard increment's interim pin): the modal "will"
+    # triggers no name query, so the name memory gets no lead.
+    w1, after = _twin(tmp_path, "listed", "will zorblax quixotic", direct=["will"])
+    assert w1.will.id not in _ids(after)
+
+
+def test_a_capitalized_stopword_name_is_a_name_at_the_message_start_too(tmp_path: Path) -> None:
+    # S151 (supersedes S104's sentence-start rule): "Will" is the name in any
+    # position, the message start included; a lower-case "will" never is.
+    _, block = _twin(tmp_path, "listed-lower", "will", direct=["will"])
+    assert block == ""
+    assert names_in(tmp_path / "listed-lower", "will") == []
+    assert names_in(tmp_path / "listed-lower", "Will") == ["will"]
+    w1, after = _twin(tmp_path, "listed-start", "Will", direct=["will"])
+    assert _ids(after) == [w1.will.id]
+    w2, after = _twin(tmp_path, "listed-mid", "so Will", direct=["will"])
+    assert _ids(after) == [w2.will.id]
+
+
+def test_a_listed_multi_word_name_matches_only_consecutive_words_as_one_phrase(tmp_path: Path) -> None:
+    def build(name: str, listed: bool):
+        persona = tmp_path / name
+        persona.mkdir()
+        w = _world(persona)
+        split = _mem(w.store, "a new dress arrived and a postcard of the York minster too")
+        ny = _mem(w.store, "I moved to New York last spring and never looked back")
+        if listed:
+            _list_names(persona, "New York")
+        return w, split, ny, persona
+
+    w, split, ny, persona = build("empty", False)
+    ids0 = _ids(_render(w, "new york zorblax quixotic", persona))
+    assert ids0[0] == w.general.id, "precondition: without the list the rare-word hit leads"
+
+    w, split, ny, persona = build("listed", True)
+    seen: list = []
+    real = w.store.search_fts_scored
+
+    def spy(query, **kw):
+        out = real(query, **kw)
+        if isinstance(query, FtsPhrases):
+            seen.append((tuple(query), _to_fts_match(query), [m.id for m, _ in out]))
+        return out
+
+    with patch.object(w.store, "search_fts_scored", spy):
+        ids = _ids(_render(w, "new york zorblax quixotic", persona))
+    assert seen == [(("new york",), '"new york"', [ny.id])], "ONE query, ONE phrase, consecutive words only"
+    assert ids[0] == ny.id, "the phrase hit leads"
+    assert ids.index(ny.id) < ids.index(w.general.id)
+
+
+def test_name_words_are_matched_on_the_raw_words_case_insensitively(tmp_path: Path) -> None:
+    w, block = _twin(tmp_path, "listed", "PRETZEL? pretzel! zorblax quixotic", list_names=["pretzel"])
+    assert {m.id for m in w.pretzel} == set(_ids(block)[:3])
+
+
+# --------------------------------------------------------------------------
+# P-14: the name query never feeds the graveyard; one hebbian handle
+# --------------------------------------------------------------------------
+
+
+def _bury(persona: Path, content: str, mem_id: str) -> None:
+    lost = Memory.create_new(content=content, memory_type="episodic", domain="memory", emotions={"joy": 8.5})
+    object.__setattr__(lost, "id", mem_id)
+    gv.append(
+        persona,
+        memory=lost,
+        salience_at_drop=0.6,
+        inputs=SalienceInputs(emotion=0.85, hebbian=0.0, recall=0.0, soul=0.0, freshness=0.1),
+        lived_age_hours=24.0,
+        reason="test-seed",
+    )
+
+
+def test_a_listed_name_is_handed_to_the_graveyard_beside_the_capped_words(tmp_path: Path) -> None:
+    """A listed name the selector drops ('will') is handed to `graveyard.search`
+    as a NAME beside today's capped word string (S102, S119). A stopword-name
+    matches an entry only where capitalized, in any position (S121, S151)."""
+    persona = tmp_path / "p"
+    persona.mkdir()
+    w = _world(persona)
+    _list_names_direct(persona, "will")
+    _bury(persona, "saw Will wave", "mem-lost-will")
+    _bury(persona, "Will you come", "mem-lost-start")
+    _bury(persona, "will you come", "mem-lost-modal")
+    calls: list[tuple[str, list[str]]] = []
+    real = gv.search
+
+    def spy(persona_dir, query, **kw):
+        calls.append((query, list(kw.get("names", ()))))
+        return real(persona_dir, query, **kw)
+
+    with (
+        patch("brain.forgetting.recall.graveyard.search", spy),
+        patch("brain.grief.handle_recall_touch") as touch,
+    ):
+        modal = _render(w, "will zorblax quixotic", persona)
+    legacy = " ".join(_legacy_capped_tokens(_extract_recall_tokens("will zorblax quixotic", w.store)))
+    # S104 (flipped from the interim pin): a lower-case modal "will" is not the name.
+    assert calls == [(legacy, [])]
+    assert "lost (no longer in active memory)" not in modal and touch.call_count == 0
+
+    calls.clear()
+    with (
+        patch("brain.forgetting.recall.graveyard.search", spy),
+        patch("brain.grief.handle_recall_touch") as touch,
+    ):
+        block = _render(w, "so Will zorblax quixotic", persona)
+
+    legacy = " ".join(_legacy_capped_tokens(_extract_recall_tokens("so Will zorblax quixotic", w.store)))
+    assert calls == [(legacy, ["will"])], "today's capped words, and the name beside them"
+    assert "lost (no longer in active memory)" in block and "saw Will wave" in block
+    assert "Will you come" in block, "S151: a capitalized 'Will' at a sentence start is the name"
+    assert "will you come" not in block, "a lower-case modal 'will' is not the name"
+    assert touch.call_args.kwargs["touched_ids"] == ["mem-lost-start", "mem-lost-will"]
+    assert _ids(block)[0] == w.will.id, "the active memory is still found and leads"
+
+
+def test_the_name_query_shares_the_turns_one_hebbian_handle(tmp_path: Path) -> None:
+    persona = tmp_path / "p"
+    persona.mkdir()
+    w = _world(persona)
+    _list_names(persona, "Pretzel")
+    import brain.chat.prompt as prompt_mod  # noqa: PLC0415
+    from brain.memory import hebbian as heb_mod  # noqa: PLC0415
+
+    opened: list = []
+    real_cls = heb_mod.HebbianMatrix
+
+    class Spy(real_cls):
+        def __init__(self, *a, **kw):
+            opened.append(self)
+            super().__init__(*a, **kw)
+
+    handles: list = []
+    real_rank = prompt_mod.rank_name_hits
+
+    def rank_spy(store, hebbian, names, **kw):
+        handles.append(hebbian)
+        return real_rank(store, hebbian, names, **kw)
+
+    with (
+        patch("brain.memory.hebbian.HebbianMatrix", Spy),
+        patch.object(prompt_mod, "rank_name_hits", rank_spy),
+    ):
+        _render(w, "pretzel zorblax quixotic", persona)
+    assert len(opened) == 1, "one HebbianMatrix per turn"
+    assert handles == [opened[0]], "the name query used that same handle"
+
+
+# --------------------------------------------------------------------------
+# S90: a listed name is never shown as "not recognised"
+# --------------------------------------------------------------------------
+
+
+def test_a_listed_name_is_never_shown_as_not_recognised(tmp_path: Path) -> None:
+    # 'zed' (3 letters, df 0) is a selector token, so today it is listed
+    _, before = _twin(tmp_path, "empty", "zed vexillum")
+    assert "zed" in _not_recognised(before), "precondition: an unknown 3-letter word is listed today"
+    _, after = _twin(tmp_path, "listed", "zed vexillum", list_names=["Zed"])
+    assert "zed" not in _not_recognised(after), "a listed name is known by definition"
+    assert "vexillum" in _not_recognised(after), "an ordinary unknown word is still listed"
+
+
+def test_a_listed_name_the_selector_drops_is_not_listed_either(tmp_path: Path) -> None:
+    # 'ed' (2 letters, lower case, df 0) is dropped by the selector: never listed
+    _, block = _twin(tmp_path, "listed", "ed zorblax", list_names=["Ed"])
+    assert "ed" not in _not_recognised(block)
+
+
+def test_a_listed_name_with_memories_is_not_listed(tmp_path: Path) -> None:
+    _, block = _twin(tmp_path, "listed", "will zorblax quixotic", direct=["will"])
+    assert "will" not in _not_recognised(block)
+
+
+def test_the_words_of_a_matched_multi_word_name_are_not_listed(tmp_path: Path) -> None:
+    _, before = _twin(tmp_path, "empty", "glimmer harbour zorblax")
+    assert "glimmer" in _not_recognised(before), "precondition"
+    _, after = _twin(tmp_path, "listed", "glimmer harbour zorblax", list_names=["Glimmer Harbour"])
+    assert "glimmer" not in _not_recognised(after)
+    assert "glimmer harbour" not in _not_recognised(after)
+
+
+def test_a_word_only_part_of_a_listed_name_elsewhere_in_the_message_is_still_listed(
+    tmp_path: Path,
+) -> None:
+    # "new york" is listed but the message says "glimmer new": no match, so 'glimmer' is unknown as usual
+    _, block = _twin(tmp_path, "listed", "glimmer new zorblax", list_names=["New York"])
+    assert "glimmer" in _not_recognised(block)
+    # "york" alone (df 0) while "new york" is listed but does not match: an ordinary unknown word
+    _, block2 = _twin(tmp_path, "york", "york vexillum", list_names=["New York"])
+    assert "york" in _not_recognised(block2)
+
+
+def test_every_word_of_a_matched_multi_word_name_is_excluded_not_only_the_first(tmp_path: Path) -> None:
+    # 'harbour' is in the store (df > 0); 'blorpville' is not, and is the SECOND word
+    _, before = _twin(tmp_path, "empty", "harbour blorpville vexillum")
+    assert "blorpville" in _not_recognised(before), "precondition"
+    _, after = _twin(tmp_path, "listed", "harbour blorpville vexillum", list_names=["Harbour Blorpville"])
+    assert "blorpville" not in _not_recognised(after)
+    assert "vexillum" in _not_recognised(after)
+
+
+# --------------------------------------------------------------------------
+# fail-soft and the no-persona_dir path
+# --------------------------------------------------------------------------
+
+
+def test_a_failing_names_lookup_is_no_protection_not_a_failed_recall(tmp_path: Path) -> None:
+    message = "pretzel zorblax quixotic"
+    w0, baseline = _twin(tmp_path, "empty", message)
+    persona = tmp_path / "boom"
+    persona.mkdir()
+    w1 = _world(persona)
+    _list_names(persona, "Pretzel")
+    with patch("brain.memory.relevance.load_known_names", side_effect=RuntimeError("disk on fire")):
+        block = _render(w1, message, persona)
+    assert [r[1] for r in _rows(block)] == [r[1] for r in _rows(baseline)]
+
+
+def test_a_failing_name_query_leaves_the_rest_of_the_turn_intact(tmp_path: Path) -> None:
+    message = "pretzel zorblax quixotic"
+    persona = tmp_path / "p"
+    persona.mkdir()
+    w = _world(persona)
+    _list_names(persona, "Pretzel")
+    with patch("brain.chat.prompt.rank_name_hits", side_effect=RuntimeError("ranker down")):
+        block = _render(w, message, persona)
+    assert _ids(block)[0] == w.general.id, "the general keyword search still ran"
+
+
+def test_no_persona_dir_means_no_name_protection_and_no_crash(tmp_path: Path) -> None:
+    persona = tmp_path / "p"
+    persona.mkdir()
+    w = _world(persona)
+    _list_names(persona, "Pretzel")
+    # (the no-persona_dir block has a different bullet shape; compare by content)
+    block = _build_recall_block(w.store, "pretzel zorblax quixotic", persona_dir=None)
+    lines = [ln for ln in block.splitlines() if ln.startswith("- [importance")]
+    assert "zorblax" in lines[0], "the general hit still leads: no list is read without a persona_dir"
+
+
+def test_a_name_hit_that_is_also_a_short_word_hit_is_not_demoted_in_the_importance_quota(
+    tmp_path: Path,
+) -> None:
+    """Keyword-only turn: three importance-9 general hits and an importance-9
+    memory the NAME query found ('al', which the general search only reaches as
+    a tier-2 short word). The name hit leads, so it is not a tier-2 extra: it
+    shares the quota of full renders with tier 1 by importance, in list order,
+    and renders in full; only tier-2-only hits wait behind tier 1 for the quota."""
+    message = "al zorblax quixotic vellum"
+
+    def build(name: str, listed: bool):
+        persona = tmp_path / name
+        persona.mkdir()
+        persist_felt_time(FeltTimeState(lived_age_hours=48.0), persona)
+        store = MemoryStore(":memory:")
+        general = [
+            _mem(store, f"zorblax quixotic vellum ledger entry number {i} kept by the clerk", importance=9.0)
+            for i in range(3)
+        ]
+        al = _mem(store, "Al fixed the ferry engine before the storm, a long enough body to cut", importance=9.0)
+        if listed:
+            _list_names(persona, "Al")
+        w = SimpleNamespace(store=store)
+        return w, general, al, persona
+
+    w, general, al, persona = build("empty", False)
+    rows0 = dict(_rows(_render(w, message, persona)))
+    assert al.id in rows0, "precondition: the 2-letter word is searched (tier 2)"
+    w, general, al, persona = build("listed", True)
+    rows = _rows(_render(w, message, persona))
+    assert rows[0][0] == al.id and not rows[0][1].endswith("…"), "the leading name hit renders in full"
+
+
+def test_a_message_that_is_only_a_listed_name_searches_the_graveyard_for_the_name_only(tmp_path: Path) -> None:
+    """The name-only path has no selector token, so the general query is empty.
+    The graveyard is searched ONCE with no query words and the name (never an
+    empty query, which would match everything): only the entry holding the name
+    is shown, the general search is skipped."""
+    persona = tmp_path / "p"
+    persona.mkdir()
+    w = _world(persona)
+    _list_names_direct(persona, "will", "bo")
+    _bury(persona, "A summary of some long forgotten harbour afternoon", "mem-lost-a")
+    _bury(persona, "cheered when Bo came", "mem-lost-b")
+    calls: list[tuple[str, list[str]]] = []
+    real = gv.search
+
+    def spy(persona_dir, query, **kw):
+        calls.append((query, list(kw.get("names", ()))))
+        return real(persona_dir, query, **kw)
+
+    with patch("brain.forgetting.recall.graveyard.search", spy):
+        assert _render(w, "will", persona) == "", "S104: 'will' at the message start is no name"
+    assert calls == [], "no name and no word: the graveyard is not called"
+    # A name-only message needs a listed name the selector drops: a capitalized
+    # mid-sentence "Will" is a selector token (S104 leaves no name-only stopword
+    # message), and a short name in the store is kept, so "bo" (in no active
+    # memory) is used here.
+    with (
+        patch("brain.forgetting.recall.graveyard.search", spy),
+        patch("brain.grief.handle_recall_touch") as touch,
+    ):
+        block = _render(w, "bo", persona)
+    assert calls == [("", ["bo"])], "one graveyard call: no words, the name"
+    assert "lost (no longer in active memory)" in block and "cheered when Bo" in block
+    assert "long forgotten harbour" not in block
+    assert touch.call_args.kwargs["touched_ids"] == ["mem-lost-b"]
+    assert _ids(block) == []
+
+
+def test_name_hits_are_ordered_among_themselves_by_blended_score(tmp_path: Path) -> None:
+    def build(name: str):
+        persona = tmp_path / name
+        persona.mkdir()
+        persist_felt_time(FeltTimeState(lived_age_hours=48.0), persona)
+        store = MemoryStore(":memory:")
+        low = _mem(store, "Pretzel is a scruffy terrier mix, the quiet one", importance=2.0)
+        high = _mem(store, "Pretzel is a scruffy terrier mix, the loud one", importance=8.0)
+        low_f = _mem(store, "Quiet Pretzel faded into the old summer", importance=2.0)
+        high_f = _mem(store, "Loud Pretzel faded into the old summer", importance=8.0)
+        _fade(store, low_f)
+        _fade(store, high_f)
+        _list_names(persona, "Pretzel")
+        w = SimpleNamespace(store=store)
+        return w, low, high, persona
+
+    w, low, high, persona = build("p")
+    block = _render(w, "pretzel", persona)
+    assert _ids(block) == [high.id, low.id], "the better blended score leads within the name hits"
+    softened = _softened(block)
+    assert softened[0].startswith("Loud") and softened[1].startswith("Quiet")
+
+
+# --------------------------------------------------------------------------
+# S89: name hits the general search also found lead, then name-only hits,
+# then the general hits
+# --------------------------------------------------------------------------
+
+
+def _many_pretzels(persona: Path, n: int = 60):
+    persist_felt_time(FeltTimeState(lived_age_hours=48.0), persona)
+    store = MemoryStore(":memory:")
+    target = _mem(
+        store, "Pretzel weighs about thirty pounds and is a scruffy terrier mix, heavier than he looks"
+    )
+    rare = _mem(store, "zorblax quixotic vellum ledger kept by the harbour clerk")
+    others = [_mem(store, f"Pretzel chased the ball across the yard, walk number {i}") for i in range(n)]
+    return SimpleNamespace(store=store, target=target, rare=rare, others=others)
+
+
+def test_a_name_with_many_memories_no_longer_pushes_out_a_memory_matching_the_rest_of_the_message(
+    tmp_path: Path,
+) -> None:
+    """The F1 case: 60 memories of the name, one of which also matches the rest
+    of the message."""
+    message = "how heavy is pretzel, is he a terrier, thirty pounds?"
+    p0 = tmp_path / "empty"
+    p0.mkdir()
+    w0 = _many_pretzels(p0)
+    assert _ids(_render(w0, message, p0))[0] == w0.target.id, "precondition: base ranks it first"
+
+    p1 = tmp_path / "listed"
+    p1.mkdir()
+    w1 = _many_pretzels(p1)
+    _list_names(p1, "Pretzel")
+    ids = _ids(_render(w1, message, p1))
+    assert ids[0] == w1.target.id, "matching the name AND the rest of the message it leads"
+    assert len(ids) == 8
+
+
+def _will_world(persona: Path, *, fade: bool = False):
+    """A = name + the rest of the message, B = name only (ranks ABOVE A in the
+    name query alone), C = the rest of the message only. The lower-case 2-letter
+    'al' is dropped by the selector, so the name query is the only route by which B
+    is found. (Before S104 this world used a lower-case 'will'; a lower-case modal
+    'will' is no longer the name, and a capitalized mid-sentence 'Will' is a
+    selector token, so a short name keeps the test's point.)"""
+    persist_felt_time(FeltTimeState(lived_age_hours=48.0), persona)
+    store = MemoryStore(":memory:")
+    a = _mem(store, "Al noted that zorblax and quixotic vellum stayed in the ledger all through the storm season")
+    b1 = _mem(store, "Al waved from the pier", importance=9.0)
+    b2 = _mem(store, "Al sang on the ferry", importance=8.0)
+    c = _mem(store, "zorblax and quixotic vellum ledger kept by the harbour clerk")
+    if fade:
+        for m in (a, b1, b2, c):
+            _fade(store, m)
+    return SimpleNamespace(store=store, a=a, b1=b1, b2=b2, c=c)
+
+
+def test_name_and_message_hits_lead_then_name_only_then_general(tmp_path: Path) -> None:
+    message = "al zorblax quixotic"
+    p0 = tmp_path / "empty"
+    p0.mkdir()
+    w0 = _will_world(p0)
+    # (A short name that is in the store is a selector token, so the general search
+    # finds the name memories too; without the list the rare-word hit C is not
+    # behind them.)
+    ids0 = _ids(_render(w0, message, p0))
+    assert ids0.index(w0.c.id) < ids0.index(w0.b2.id), "precondition: the list changes the order"
+
+    p1 = tmp_path / "listed"
+    p1.mkdir()
+    w1 = _will_world(p1)
+    _list_names_direct(p1, "al")
+    ids = _ids(_render(w1, message, p1))
+    assert ids == [w1.a.id, w1.b1.id, w1.b2.id, w1.c.id], (
+        "name + rest of the message first, then name-only in the name query's order, then general-only"
+    )
+
+
+def test_the_same_order_holds_in_the_softened_section(tmp_path: Path) -> None:
+    p = tmp_path / "p"
+    p.mkdir()
+    w = _will_world(p, fade=True)
+    _list_names_direct(p, "al")
+    soft = _softened(_render(w, "al zorblax quixotic", p))
+    assert [s[:12] for s in soft] == ["Al noted tha", "Al waved fro", "Al sang on t", "zorblax and "]
+
+
+def test_the_same_order_holds_behind_the_semantic_results(tmp_path: Path) -> None:
+    p = tmp_path / "p"
+    p.mkdir()
+    w = _will_world(p)
+    sem = _mem(w.store, "the sunlit dock where the boats moor at low tide")
+    _list_names_direct(p, "al")
+    semantic = SemanticRecallResult(full=[sem], snippet=[], scores={sem.id: 5.0})
+    ids = _ids(_render(w, "al zorblax quixotic", p, semantic=semantic))
+    assert ids == [sem.id, w.a.id, w.b1.id, w.b2.id, w.c.id]
+
+
+def test_a_general_hit_holding_the_name_leads_even_beyond_the_name_querys_window(tmp_path: Path) -> None:
+    """The name query's ranked window is 2 x limit; a name with far more memories
+    would truncate it. Whether a general hit 'also matches the name' is decided
+    from the hit itself, not from that window."""
+    message = "how heavy is pretzel, is he a terrier, thirty pounds?"
+    p = tmp_path / "p"
+    p.mkdir()
+    w = _many_pretzels(p, n=80)  # more than the ranker's whole FTS pool of 50
+    _list_names(p, "Pretzel")
+    assert _ids(_render(w, message, p))[0] == w.target.id
+    p2 = tmp_path / "q"
+    p2.mkdir()
+    w2 = _many_pretzels(p2, n=80)
+    _list_names(p2, "Pretzel")
+    assert _ids(_render(w2, message, p2, limit=2))[0] == w2.target.id, "also with a tiny render limit"
+
+
+def _tier_two_world(persona: Path, n: int = 60):
+    """A name ('al') and the rest of the message ('ai') are BOTH 2-letter words,
+    so the general search reaches everything through tier 2 only (tier 1's raw
+    string drops both): the S89 'general search' must count tier 2."""
+    persist_felt_time(FeltTimeState(lived_age_hours=48.0), persona)
+    store = MemoryStore(":memory:")
+    target = _mem(
+        store,
+        "Al built an AI notebook about tide tables and kept it on the boat all through the long wet autumn season",
+    )
+    others = [_mem(store, f"Al chased the ball, walk {i}") for i in range(n)]
+    return SimpleNamespace(store=store, target=target, others=others)
+
+
+def test_a_name_plus_message_hit_found_only_through_tier_two_still_leads(tmp_path: Path) -> None:
+    """The reading of S89's 'general search' = tier 1 AND tier 2 (the brief said
+    tier 1): a memory matching the name and another short word of the message is
+    found by the general search only through tier 2, and must not be crowded out
+    by 60 name-only memories."""
+    p = tmp_path / "p"
+    p.mkdir()
+    w = _tier_two_world(p)
+    _list_names(p, "Al")
+    ids = _ids(_render(w, "al ai", p))
+    assert ids[0] == w.target.id

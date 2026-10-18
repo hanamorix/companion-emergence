@@ -357,22 +357,21 @@ def test_fading_bump_matches_across_conclusive_and_inconclusive_turns(tmp_path: 
     assert bump_conclusive == pytest.approx(0.8)
 
 
-def test_active_top_bump_stays_gated_to_inconclusive_branch(tmp_path: Path) -> None:
-    """Guard against over-correcting Fix 1: `active_top` (the lexical
-    active-selection candidates, computed via the always-run
-    `search_with_loss` call but NOT rendered under "active:" on a
-    conclusive turn — only the semantic result is) must still NOT be
-    bumped on a conclusive turn. Only the semantic-active section's own
-    bump (`_render_semantic_active_lines`) and the now-path-independent
-    fading bump apply there.
+def test_keyword_hit_on_a_conclusive_turn_is_merged_rendered_and_bumped_once(tmp_path: Path) -> None:
+    """Name-recall fix R4 (spec §5, S8; replaces the Fix-1 guard that a
+    conclusive turn must not bump the lexical active hits, which described
+    the old "semantic suppresses keyword" rule). A keyword-only active hit on
+    a conclusive turn is now MERGED in below the semantic standout: it is
+    rendered under "active:" after the standout, and, because it is rendered,
+    it is bumped exactly once (full tier: it sits in the first 5 positions).
+    The render-loop rule is intact: the bump follows the actual render, so
+    nothing is bumped that was not shown.
     """
     store, active_mem, fading_mem = _seed_fixture(tmp_path)
 
     # A THIRD memory: stays ACTIVE (never faded), lexically matches
     # "workshop" so search_with_loss's always-run partition puts it in
-    # active_hits/active_top — but it is unrelated to the semantic
-    # standout (`active_mem`), so it is never chosen/rendered on a
-    # conclusive turn.
+    # active_hits — unrelated to the semantic standout (`active_mem`).
     lexical_active_mem = Memory.create_new(
         content="the workshop schedule pinned by the door", memory_type="event", domain="d"
     )
@@ -388,19 +387,15 @@ def test_active_top_bump_stays_gated_to_inconclusive_branch(tmp_path: Path) -> N
     ):
         block = _build_recall_block(store, "workshop rooftop Marcus", persona_dir=tmp_path)
 
-    # The semantic-conclusive standout gets its OWN bump (full-tier, +1,
-    # from _render_semantic_active_lines) — unrelated to the lexical
-    # active_top gating this test is checking.
+    # The semantic-conclusive standout gets its own full-tier bump (+1).
     assert _rc(store, active_mem.id) == pytest.approx(1.0)
-    # fading_mem gets its now-path-independent bump.
+    # fading_mem gets its path-independent bump.
     assert _rc(store, fading_mem.id) > 0
 
-    # The lexical active_top candidate is computed (it lexically matches
-    # "workshop") but never rendered under "active:" on this conclusive
-    # turn, so it must NOT be bumped — bumping an unrendered row would
-    # reinforce a memory the user never actually saw.
-    assert lexical_active_mem.id not in block
-    assert _rc(store, lexical_active_mem.id) == before_lexical
+    # The keyword hit is rendered AFTER the semantic standout and bumped once.
+    assert lexical_active_mem.id in block
+    assert block.index(active_mem.id) < block.index(lexical_active_mem.id)
+    assert _rc(store, lexical_active_mem.id) - before_lexical == pytest.approx(1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -413,7 +408,7 @@ def test_active_top_bump_stays_gated_to_inconclusive_branch(tmp_path: Path) -> N
 # got bumped but was never queued for reappraisal. These tests prove the
 # enqueue now fires on both branches, matching the bump's parity, and that a
 # conclusive turn's fading id is enqueued exactly once (no double-enqueue
-# against `_render_semantic_active_lines`'s own enqueue for the semantic
+# against `_bump_active_entries`'s own enqueue for the semantic
 # active ids).
 # ---------------------------------------------------------------------------
 
@@ -428,7 +423,7 @@ def test_reappraisal_enqueue_fires_on_conclusive_semantic_turn(tmp_path: Path) -
     the enqueue call was gated entirely on `semantic_result is None`.
     Post-fix: the fading id is enqueued here too, exactly once — alongside
     (not instead of) the semantic active id's own enqueue from
-    `_render_semantic_active_lines`."""
+    `_bump_active_entries`."""
     store, active_mem, fading_mem = _seed_fixture(tmp_path)
     PendingQueue(tmp_path).drain()  # clear anything a fixture helper may have queued
 
@@ -450,7 +445,7 @@ def test_reappraisal_enqueue_fires_on_conclusive_semantic_turn(tmp_path: Path) -
     assert reappraisal_ids.count(fading_mem.id) == 1
 
     # The semantic-active standout is ALSO enqueued (its own pre-existing
-    # `_render_semantic_active_lines` enqueue) — both ids present, neither
+    # `_bump_active_entries` enqueue) — both ids present, neither
     # duplicated: no double-enqueue between the two enqueue call sites.
     assert reappraisal_ids.count(active_mem.id) == 1
     assert len(reappraisal_ids) == len(set(reappraisal_ids))

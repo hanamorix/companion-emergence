@@ -1192,10 +1192,12 @@ def test_delete_legacy_embeddings_db_deletes_when_fully_embedded(
     """(a) embeddings.db exists + every active >=MIN_CHARS row already
     carries a current-model embedding -> the file AND its -wal/-shm
     sidecars are deleted."""
+    from brain.bridge import model_tier
     from brain.memory import embeddings as embeddings_mod
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
 
     made = _seed(tmp_path, 2)
     store = _open_store(tmp_path)
@@ -1221,10 +1223,12 @@ def test_delete_legacy_embeddings_db_defers_when_backlog_nonempty(
 ) -> None:
     """(b) embeddings.db exists but some active row is still un-embedded
     under the current model -> NOT deleted, deferred for the next run."""
+    from brain.bridge import model_tier
     from brain.memory import embeddings as embeddings_mod
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
 
     made = _seed(tmp_path, 2)
     store = _open_store(tmp_path)
@@ -1274,10 +1278,12 @@ def test_delete_legacy_embeddings_db_idempotent_rerun(
 ) -> None:
     """(d) a second call after the file is already gone is a clean no-op —
     does not raise, does not re-log a deletion."""
+    from brain.bridge import model_tier
     from brain.memory import embeddings as embeddings_mod
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
 
     made = _seed(tmp_path, 1)
     store = _open_store(tmp_path)
@@ -1300,10 +1306,12 @@ def test_delete_legacy_embeddings_db_delete_error_is_caught_and_logged(
 ) -> None:
     """(e) a delete failure (e.g. a permission error) is caught + logged,
     never raised — a stuck stale file must never crash a startup caller."""
+    from brain.bridge import model_tier
     from brain.memory import embeddings as embeddings_mod
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
 
     made = _seed(tmp_path, 1)
     store = _open_store(tmp_path)
@@ -1324,3 +1332,82 @@ def test_delete_legacy_embeddings_db_delete_error_is_caught_and_logged(
     assert result is False
     assert db_path.exists()  # left in place, not partially removed
     assert "failed to delete legacy embeddings.db" in caplog.text
+
+
+def _trap_provider_construction(
+    monkeypatch: pytest.MonkeyPatch, built: list[str] | None = None
+) -> list[str]:
+    """Make building any embedding provider fail the test: both the cached
+    builder and `FastEmbedProvider.__init__` (which downloads the ~2.1 GB
+    model when it is not cached). Returns the list a call would append to (the
+    given one, so several traps can share it)."""
+    from brain.memory import embeddings as embeddings_mod
+
+    built = [] if built is None else built
+
+    def _boom(*_a: object, **_k: object) -> None:
+        built.append("built")
+        raise AssertionError("an embedding provider was constructed just to read the model id")
+
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", _boom)
+    monkeypatch.setattr(embeddings_mod.FastEmbedProvider, "__init__", _boom)
+    return built
+
+
+def test_delete_legacy_embeddings_db_builds_no_provider_to_read_the_model_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The file-exists path reads the current model id with
+    `resolve_embedding_model_id()`: no provider is built, both when the
+    backlog is empty (deleted) and when it is not (deferred)."""
+    from brain.bridge import model_tier
+    from brain.memory import embeddings as embeddings_mod
+
+    provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    made = _seed(tmp_path, 2)
+    store = _open_store(tmp_path)
+    try:
+        store.embed_row(made[0].id, made[0].content)  # the second row stays backlog
+        db_path = _write_dummy_embeddings_db(tmp_path)
+        built = _trap_provider_construction(monkeypatch)
+        assert delete_legacy_embeddings_db(tmp_path, store) is False  # deferred
+        assert db_path.exists()
+        monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+        store.embed_row(made[1].id, made[1].content)
+        _trap_provider_construction(monkeypatch, built)
+        assert delete_legacy_embeddings_db(tmp_path, store) is True  # deleted
+    finally:
+        store.close()
+    assert built == []
+    assert not db_path.exists()
+
+
+def test_drain_final_count_builds_no_provider_of_its_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each tick and each embedded row look the provider up; the drain's
+    closing backlog count adds no build of its own (it reads the id only)."""
+    from brain.bridge import model_tier
+    from brain.memory import embeddings as embeddings_mod
+
+    provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
+    builds: list[int] = []
+
+    def _counting() -> EmbeddingProvider:
+        builds.append(1)
+        return provider
+
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", _counting)
+    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    _seed(tmp_path, 4)
+    store = _open_store(tmp_path)
+    try:
+        result = run_embedding_backfill_to_completion(tmp_path, store, batch_size=2, scan_cap=2)
+    finally:
+        store.close()
+    assert result.embedded == 4 and result.failed == 0
+    # One build per tick, one per embedded row (`MemoryStore.embed_row`), and
+    # none for the closing count.
+    assert len(builds) == result.ticks + result.embedded

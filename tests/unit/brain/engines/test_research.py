@@ -500,7 +500,7 @@ def test_memory_create_failure_does_not_abort_tick_burns_cooldown(
 
 def test_close_verdict_marks_dormant(tmp_path: Path):
     _write_interests(tmp_path / "interests.json", [_interest_dict()])
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     try:
         provider = ScriptedProvider(
             [
@@ -522,7 +522,7 @@ def test_spawn_verdict_creates_capped_deduped_interests(tmp_path: Path):
     _write_interests(
         tmp_path / "interests.json", [_interest_dict(topic="Marine Bioluminescence")]
     )
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     try:
         provider = ScriptedProvider(
             [
@@ -543,7 +543,7 @@ def test_spawn_verdict_creates_capped_deduped_interests(tmp_path: Path):
 
 def test_select_parse_failure_falls_back_to_mechanical_winner(tmp_path: Path):
     _write_interests(tmp_path / "interests.json", [_interest_dict()])
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     try:
         provider = ScriptedProvider(
             [
@@ -661,7 +661,7 @@ def test_research_fire_emits_initiate_candidate_when_maturity_passes(
     )
 
     _write_interests(tmp_path / "interests.json", [_interest_dict(pull_score=8.0)])
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     try:
         # Scripted: select chooses i1, session returns a real MEMORY section —
         # candidate emission is gated on a memory existing (mem_id is not None).
@@ -716,7 +716,7 @@ def test_research_fire_does_not_emit_candidate_when_maturity_fails(
 
     # pull_score=6.0 → maturity_score=0.60, which is below the default 0.75 threshold
     _write_interests(tmp_path / "interests.json", [_interest_dict(pull_score=6.0)])
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     try:
         # Scripted: select chooses i1, session returns a real MEMORY section —
         # a memory must exist for the gate path (and its rejection write) to run.

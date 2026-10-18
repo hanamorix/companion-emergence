@@ -3,17 +3,29 @@
 from __future__ import annotations
 
 import logging
+import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from brain.memory import embeddings as embeddings_mod
-from brain.memory import reranker as reranker_mod
-from brain.memory.embedding_matrix import build_embedding_matrix
-from brain.memory.embeddings import cosine_similarity
+from brain.memory import keyword_budget, recall_diagnostics
 from brain.memory.hebbian import HebbianMatrix
-from brain.memory.relevance import CANDIDATE_POOL, rank_memories, snippet_length
-from brain.memory.semantic_recall import build_semantic_candidate_pool
-from brain.memory.store import Memory, MemoryStore
+from brain.memory.relevance import (
+    CANDIDATE_POOL,
+    lead_with_names,
+    names_in,
+    rank_memories,
+    rank_name_hits,
+    snippet_length,
+)
+from brain.memory.semantic_recall import (
+    assemble_with_guarantees,
+    emit_recall_diagnostics,
+    genuine_first_memories,
+    merge_with_keyword,
+    search_paragraphs,
+)
+from brain.memory.store import Memory, MemoryStore, split_by_raw_query_floor
 from brain.tools.impls._common import _mem_to_result
 
 logger = logging.getLogger(__name__)
@@ -61,6 +73,66 @@ def _snippet_result(memory) -> dict:
     return result
 
 
+def _keyword_words(query: str, persona_dir: Path | None) -> frozenset[str]:
+    """The tool's keyword token set for the per-paragraph emptiness test (spec
+    §3): the words the store's raw-query builder admits from the kindled's own
+    query (`split_by_raw_query_floor`, today's 3-character floor, no stopword
+    drop, S99), plus the words of the known names in it (tested after name
+    protection, so a paragraph holding only a listed name is kept). A paragraph
+    with none of these words is dropped, exactly the words the keyword side of
+    this call would search."""
+    words = [m.group().lower() for m in re.finditer(r"[A-Za-z0-9]+", query)]
+    kept, _short = split_by_raw_query_floor(words)
+    names = names_in(persona_dir, query)
+    return frozenset(kept) | {word for name in names for word in name.split()}
+
+
+def _keyword_candidates(
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    query: str,
+    *,
+    exclude: frozenset[str],
+    persona_dir: Path | None = None,
+    started: float | None = None,
+) -> list[Memory]:
+    """The tool's keyword search, every candidate best-first (both modes): today's
+    ranker exactly, plus the name query (name-recall fix R4/R5, spec §5/§7, S99).
+
+    The general search is what this tool has always done: the raw ``query``
+    string through ``rank_memories`` (BM25 text-match + importance + hebbian
+    spreading-activation + recency), which the store tokenizes itself (3+
+    character words, OR-joined). No every-word rule, no tiers, no cap change and
+    no short-token admission for the tool (S99: finer kindled control over the
+    tool is its own issue, #319); ``exclude`` ids are removed before ranking.
+    The monologue family ranks after every genuine hit, in the candidate pool
+    and in the result (``genuine_first``, spec §4 / criterion 8, which names the
+    tool; not one of the S81 rules S99 removes).
+
+    Name protection (R5, spec §5, S27, S35), BOTH modes: the known names in her
+    query (matched on the raw words, before any stopword or length rule;
+    ``persona_dir`` locates the list) run ONE extra keyword query, sent as FTS
+    phrases; its hits lead this list (S89: those the general search also found
+    first, then name-only hits, then the general hits). No graveyard is involved
+    here. Without a listed name in her query the result is exactly today's.
+
+    ``started`` (name-recall fix S145, S155, S157): the budget clock reading at
+    the top of the tool call; the name query's continuation walk runs under the
+    per-message recall time budget from it (`rank_name_hits`).
+    """
+    ranked = rank_memories(
+        store, hebbian, query, limit=CANDIDATE_POOL, exclude_ids=exclude, genuine_first=True
+    )
+    general = [m for m, _ in ranked]
+    names = names_in(persona_dir, query)
+    name_ranked = rank_name_hits(
+        store, hebbian, names, limit=CANDIDATE_POOL, exclude_ids=exclude, started=started
+    )
+    # The monologue family follows every genuine hit (spec §4, S16, criterion 8:
+    # "in passive recall and the tool"); a separate rule from the words searched.
+    return genuine_first_memories(lead_with_names([m for m, _ in name_ranked], general, names))
+
+
 def _lexical_candidates(
     store: MemoryStore,
     hebbian: HebbianMatrix,
@@ -68,14 +140,26 @@ def _lexical_candidates(
     *,
     limit: int,
     exclude: frozenset[str],
+    persona_dir: Path | None = None,
+    started: float | None = None,
 ) -> list[Memory]:
-    """Today's keyword ranker: BM25 text-match + importance + hebbian
-    spreading-activation + recency, via ``rank_memories``. Unchanged
-    behavior — this is exactly what ``search_memories`` did before the
-    ``mode`` toggle existed, extracted so both modes share the same
-    emotion-boost/formatting tail below."""
-    ranked = rank_memories(store, hebbian, query, limit=limit, exclude_ids=exclude)
-    return [m for m, _ in ranked]
+    """``mode="lexical"``: today's keyword ranker plus the name query (R5, S99),
+    the first ``limit`` results. Shares the emotion-boost/formatting tail below
+    with the semantic mode."""
+    hits = _keyword_candidates(
+        store, hebbian, query, exclude=exclude, persona_dir=persona_dir, started=started
+    )
+    return hits[:limit]
+
+
+@dataclass(frozen=True)
+class _SemanticTopK:
+    """The semantic side of a call (name-recall fix R6, S97/S98): each
+    result with its result group, in the semantic order, and the guaranteed
+    ids in their S64 order (``semantic_recall.merge_with_keyword`` input)."""
+
+    grouped: list[tuple[Memory, str]]
+    guaranteed: list[str]
 
 
 def _semantic_top_k(
@@ -85,153 +169,103 @@ def _semantic_top_k(
     *,
     limit: int,
     exclude: frozenset[str],
-) -> list[Memory] | None:
-    """Top-K reranked memories for an ACTIVE search call.
+) -> _SemanticTopK | None:
+    """Top-K semantically matched memories for an ACTIVE search call.
 
-    #231 RERANKER RE-ARCHITECTURE (Q1, resolved 2026-09-10): embeds ``query``
-    once via the shared process-cached embedding provider
-    (``build_embedding_provider()``, cached by model_id — no per-call model
-    reload; F1 #259 increment 8: the query embed is transient/never
-    persisted, so it goes straight through the provider with no cache row
-    to write), cosines it against every actively-cached memory vector
-    (Stage 3's ``build_semantic_candidate_pool``: active memories that
-    already have a cached vector under the current model_id — never
-    triggers a new embed for an uncached memory, the same warm-up contract
-    passive recall uses) as a CHEAP COARSE CUT to ``relevance.CANDIDATE_
-    POOL``, then reranks an auto-scaled-width slice of that coarse cut with
-    the cross-encoder (``reranker.build_reranker_provider`` + ``reranker.
-    get_rerank_width``, same auto-scaling ``run_semantic_recall`` uses).
+    #231 RERANKER RE-ARCHITECTURE (Q1, resolved 2026-09-10), per paragraph
+    since name-recall fix R6 (spec §3, S29: "the tool's explicit query is also
+    split by paragraph"): ``semantic_recall.search_paragraphs`` splits
+    ``query`` into paragraphs, embeds them in one batch through the shared
+    process-cached embedding provider, cosines each against every active
+    memory that already has a cached vector under the current model_id (never
+    triggers a new embed for an uncached memory, the warm-up contract passive
+    recall uses; ``exclude`` ids are removed first), cuts each paragraph's
+    pool to the top 50 genuine plus the family in its plain top 50 (spec §4
+    S77), merges the cuts (a memory goes to the paragraph with its best
+    cosine) and scores each paragraph with ``semantic_recall.rank_and_gate``
+    within the one per-message time budget: the SAME path choice, floor and
+    scale passive recall uses (name-recall fix R2, spec §2), a
+    per-paragraph-width cross-encoder rerank gated by the calibrated,
+    anchor-normalized rerank floor when >= 5 real candidates fit its share
+    (F2b #276 §2/§4), otherwise (fewer than 5 fit or exist, or the reranker
+    failed to load/score, or its normalization fell back) the cosine ranking
+    gated by the cosine floor. A reranker failure no longer demotes this call
+    to lexical. This site writes NO calibration row on either path (S56:
+    calibration rows stay passive-recall only, as today).
 
-    F2b (#276 §2/§4): the score compared against the floor is the
-    per-query anchor-median NORMALIZED score (``reranker.normalize_
-    against_anchors``), not the raw cross-encoder score — same mechanism
-    and ordering (normalize THEN gate) as ``run_semantic_recall``'s
-    identical composition. This site has no calibration-log write.
-
-    The reranker here improves ORDERING; the CALIBRATED reranker floor
-    (F2a inc8, #250 §7/§8 cutover — read live via
-    ``store.get_reranker_floor(reranker_provider.model_id())``, replacing
-    the deleted ``RERANK_FLOOR`` module constant) decides semantic-vs-
-    lexical: if NOTHING clears the floor — or no calibrated floor row exists
-    yet for the runtime model_id — this returns ``None`` (the tool's
-    EXISTING empty-semantic→lexical fallback — never returns nothing, never
-    hands back semantic junk that never cleared the floor).
-    Otherwise returns the top ``limit`` floor-clearing memories in
-    reranker-descending order.
+    The CALIBRATED floor of the path taken decides semantic-vs-lexical: if
+    NOTHING clears it — or no cosine gate exists yet (the cosine bootstrap
+    was not computed yet, or failed) — this returns ``None`` (the tool's EXISTING empty-semantic→
+    lexical fallback — never returns nothing, never hands back semantic junk
+    that never cleared a floor). Otherwise returns up to ``limit``
+    floor-clearing memories, each with its result group, and the guaranteed
+    ids, in the spec §4 order across paragraphs
+    (``semantic_recall.assemble_with_guarantees``; the caller merges the
+    keyword hits in with ``merge_with_keyword``, S97/S98): reranked genuine,
+    reranked monologue-family, cosine-path genuine (each cosine-path
+    paragraph's best genuine memory at its head), cosine-scale
+    monologue-family (including every reranked paragraph's cosine tail, S82,
+    S86), each result gated by its own scale's floor only, each paragraph's
+    best genuine memory guaranteed a slot within ``limit`` (S33, S55, S64).
+    That order is what the default ``order="relevance"`` returns;
+    ``order="age"`` still re-sorts the matched set by date (and ``emotion``
+    still boosts) in ``search_memories``' unchanged tail (plan P-21), so a
+    newer monologue-family memory can precede an older genuine one there by
+    the caller's own request.
 
     Deliberately does NOT reuse ``semantic_recall``'s option-4 surfacing
     tiers (≤5 full / 6-9 / cap-at-9) — that machinery decides whether to
     surface an unsolicited passive-recall block at all, and how much of it
     to show in full vs snippet. Here the model explicitly asked for a
-    search, so a plain top-k reranked ranking is the natural "semantic
-    search" behavior, mirroring how the lexical path is a plain top-k
-    relevance ranking too.
+    search, so a plain top-k ranking is the natural "semantic search"
+    behavior, mirroring how the lexical path is a plain top-k relevance
+    ranking too.
 
     Returns ``None`` (never raises) when semantic search cannot run right
-    now — no cached vectors yet, an embedding/reranker-model failure, or any
-    other error anywhere in this path — so the caller falls back to the
-    lexical path. Mirrors ``run_semantic_recall``'s fail-soft posture: the
-    whole body is wrapped so a broken/missing local model or a transient
-    store error only demotes this call to lexical, never breaks the tool —
-    and a reranker failure demotes to lexical too, never to raw cosine
-    ranking (the unreliable signal the reranker replaces).
+    now — no cached vectors yet, an embedding-model failure, or any other
+    error anywhere in this path — so the caller falls back to the lexical
+    path. Mirrors ``run_semantic_recall``'s fail-soft posture: the whole
+    body is wrapped so a broken/missing local model or a transient store
+    error only demotes this call to lexical, never breaks the tool.
     """
+    search = None
     try:
-        matrix = build_embedding_matrix(store.db_path)
-        pool = build_semantic_candidate_pool(store, matrix)
-        if not pool:
-            return None
-        try:
-            # Looked up via the MODULE (not a bare imported name) so a
-            # test's monkeypatch on `embeddings.build_embedding_provider` is
-            # honored — mirrors `run_semantic_recall`'s/`is_duplicate`'s
-            # identical dynamic lookup.
-            query_vec = embeddings_mod.build_embedding_provider().embed(query).astype("float32")
-        except Exception:  # noqa: BLE001 — fail-soft
-            logger.exception(
-                "search_memories(semantic): query embed failed — falling back to lexical"
-            )
-            return None
-
-        cosine_scored = [
-            (mid, cosine_similarity(query_vec, vec))
-            for mid, (_, vec) in pool.items()
-            if mid not in exclude
-        ]
-        if not cosine_scored:
-            return None
-        cosine_scored.sort(key=lambda pair: -pair[1])
-        coarse = cosine_scored[:CANDIDATE_POOL]
-
-        reranker_provider = reranker_mod.build_reranker_provider(store=store)
-        # #231-fix: calibrate on REAL candidate-pool documents (a small
-        # sample off the front of the already cosine-sorted `coarse`
-        # list) rather than a synthetic placeholder — see
-        # reranker.get_rerank_width's docstring.
-        calibration_sample = [
-            pool[mid][0].content
-            for mid, _ in coarse[: reranker_mod.CALIBRATION_SAMPLE_SIZE]
-        ]
-        width = reranker_mod.get_rerank_width(len(coarse), reranker_provider, calibration_sample)
-        to_rerank = coarse[:width]
-        rerank_ids = [mid for mid, _ in to_rerank]
-        real_documents = [pool[mid][0].content for mid in rerank_ids]
-        # F2b (#276 §2/§4): normalize against the anchor median BEFORE the
-        # floor gate below — mirrors `run_semantic_recall`'s identical
-        # wiring (inc1's `normalize_against_anchors` is reused unchanged,
-        # not reimplemented here). `scored_ids` is the PREFIX of
-        # `rerank_ids` actually scored this call (`result.real_width` <=
-        # `width`); `result.scores` is positionally aligned with it 1:1.
-        # This site has no calibration-log write to re-point (confirmed —
-        # only `run_semantic_recall` logs). Anchors never leave the helper,
-        # so they can never enter `scored_ids`/the gate/the returned list.
-        normalization = reranker_mod.normalize_against_anchors(
-            reranker_provider, query, real_documents, width
+        # Name-recall fix R6 (spec §3, S29): her query is searched per
+        # paragraph like passive recall (same split, pool, budget, allocation
+        # and per-paragraph rerank or cosine path; no calibration row, S56).
+        # A paragraph with none of the words this call's keyword side
+        # searches (`_keyword_words`, S99) is dropped.
+        search = search_paragraphs(
+            store,
+            query,
+            keyword_words=_keyword_words(query, persona_dir),
+            exclude=exclude,
+            log_calibration=False,
         )
-        scored_ids = rerank_ids[: normalization.real_width]
-        rerank_scores = normalization.scores
-
-        # F2a inc8 (#250 §7 UPDATED): read the operative floor live, keyed
-        # by the RUNTIME reranker model_id — mirrors `run_semantic_recall`'s
-        # identical lookup. No persisted row yet (daily tick has never
-        # fired for this model_id) no longer means "nothing to read" —
-        # `get_reranker_floor` serves a derived bootstrap instead. `None`
-        # now fires ONLY on the bootstrap's own fail-soft path (a reranker
-        # load/fit failure), which still falls back to lexical here, never
-        # a guessed floor value.
-        floor_row = store.get_reranker_floor(reranker_provider.model_id())
-        if floor_row is None:
-            logger.info(
-                "search_memories(semantic): no floor available (bootstrap computation failed) "
-                "for %s — falling back to lexical",
-                reranker_provider.model_id(),
-            )
+        if search is None:
             return None
-        logger.debug(
-            "search_memories(semantic): floor=%.4f model=%s cold_start=%s "
-            "sample_pairs=%d updated_at=%s",
-            floor_row["floor"],
-            reranker_provider.model_id(),
-            floor_row["is_cold_start"],
-            floor_row["sample_pairs"],
-            floor_row["updated_at"],
+        # The per-paragraph assembly (spec §3/§4, S64): each result faces only
+        # its own scale's floor; guaranteed slots per paragraph within `limit`.
+        assembled, guaranteed = assemble_with_guarantees(search, limit)
+        if not assembled:
+            return None
+        return _SemanticTopK(
+            grouped=[(search.pool[hit.memory_id][0], hit.group) for hit in assembled],
+            guaranteed=guaranteed,
         )
-
-        reranked = [
-            (mid, score)
-            for mid, score in zip(scored_ids, rerank_scores, strict=True)
-            if score >= floor_row["floor"]
-        ]
-        if not reranked:
-            return None
-        reranked.sort(key=lambda pair: -pair[1])
-        return [pool[mid][0] for mid, _ in reranked[:limit]]
     except Exception:  # noqa: BLE001 — fail-soft: ANY failure demotes to lexical, never raises
         logger.warning(
             "search_memories(semantic): semantic path failed — falling back to lexical",
             exc_info=True,
         )
         return None
+    finally:
+        # The ONE diagnostics record of a semantic request (spec section 6, S15,
+        # S56, P-22): `mode` names the stage that ran, so a call that falls back
+        # to lexical keeps this record and writes no second one. Fail-soft.
+        emit_recall_diagnostics(
+            persona_dir, search, source=recall_diagnostics.SOURCE_TOOL, mode="semantic"
+        )
 
 
 def search_memories(
@@ -250,26 +284,36 @@ def search_memories(
 
     ``mode`` picks the retrieval path (default ``"semantic"``):
       - ``"semantic"``: embeds ``query`` once and ranks the persona's cached
-        memory vectors by cosine similarity, top-k (see ``_semantic_top_k``).
-        Meaning-based — catches a paraphrase with no shared keyword. Fails
-        soft to ``"lexical"`` the instant semantic retrieval can't run right
-        now (no cached vectors yet / embedding model unavailable / any embed
-        error) — the returned ``mode`` reflects the path actually used.
+        memory vectors (see ``_semantic_top_k``). Meaning-based — catches a
+        paraphrase with no shared keyword. Name-recall fix R4 (spec §5): the
+        keyword search (below) is merged with the semantic results in the
+        six-group order of ``dev_constants.RECALL_RESULT_GROUP_ORDER`` (spec
+        §4, S97/S98: keyword genuine hits above the non-reranked
+        monologue-family results), under ``limit``; a memory found by both
+        appears once, as a semantic result. Fails soft to
+        ``"lexical"`` the instant semantic retrieval can't run right now (no
+        cached vectors yet / embedding model unavailable / any embed error /
+        nothing clearing a floor) — the returned ``mode`` reflects the path
+        actually used ("semantic" iff at least one semantic result
+        contributed).
       - ``"lexical"``: today's blended keyword ranker — BM25 text-match +
         importance + hebbian spreading-activation + recency, via
-        ``rank_memories`` (see ``_lexical_candidates``). Unchanged from
-        before this mode toggle existed. The raw multi-word query is passed
-        straight through — its tokenize+OR split lives in
-        ``store._to_fts_match`` (so 'Henryk preferences personality' finds
-        memories mentioning ANY token, as a union, not the empty
-        AND-intersection).
+        ``rank_memories`` (see ``_keyword_candidates``). The raw multi-word
+        query is passed straight through, exactly as before this build: its
+        tokenize+OR split lives in ``store._to_fts_match`` (so 'Henryk
+        preferences personality' finds memories mentioning ANY token, as a
+        union, not the empty AND-intersection), including the store's
+        3-character floor (spec §7, S99: finer kindled control over which
+        words this tool searches is its own issue, #319). The one addition is
+        name protection (R5, spec §5): a name on the known-names list (matched
+        on her raw words, before any stopword or length rule) adds the one
+        name query, whose hits lead the keyword results in both modes.
 
     ``order`` picks how the MATCHED set (whichever ``mode`` produced it) is
     ordered before the final ``limit`` slice (#231, Planning-signed-off
     option A):
-      - ``"relevance"`` (default): today's behavior, byte-identical — the
-        matched candidates are fetched at ``limit`` and used as-is, in
-        whatever order ``mode`` already ranked them.
+      - ``"relevance"`` (default): the matched candidates are used as-is
+        (sliced to ``limit``), in whatever order ``mode`` already ranked them.
       - ``"age"``: WIDENS the internal fetch to ``CANDIDATE_POOL`` (today 50)
         for BOTH modes — lexical calls ``rank_memories(..., limit=
         CANDIDATE_POOL)``; semantic reranks up to ``CANDIDATE_POOL``
@@ -284,6 +328,10 @@ def search_memories(
         newest matches, not just the newest of the top few relevance hits.
         Matching still happens FIRST by ``mode``; ``order`` only re-sorts the
         matched set, never changes which memories matched.
+
+    Every call writes ONE recall diagnostics record (name-recall fix R7, spec §6,
+    S15, S56): a semantic request from ``_semantic_top_k`` (also when it falls back
+    to lexical), a lexical request from this function, never a calibration row.
 
     Both modes return at most ``limit`` candidates, already ranked;
     ``exclude_ids`` (already-surfaced + explicitly-rejected ids) are dropped
@@ -319,6 +367,9 @@ def search_memories(
         count          — number of results returned
         memories       — list of snippet-result dicts (``snippet: true`` + id)
     """
+    # The per-call budget clock (S132, S157): what is left of the recall budget
+    # for the name query's continuation is measured from here.
+    started = keyword_budget.now()
     exclude = frozenset(exclude_ids or ())
 
     # #231 Fix 3 (owner ruling — resolved_mode must never lie): normalize
@@ -336,16 +387,48 @@ def search_memories(
     # "age" widens the internal fetch to CANDIDATE_POOL so there is an
     # actually-wide matched set to age-sort before the real `limit` slice;
     # "relevance" fetches exactly `limit`, unchanged from before this
-    # toggle existed — byte-identical default behavior.
+    # toggle existed.
     fetch_limit = CANDIDATE_POOL if resolved_order == "age" else limit
 
+    requested_lexical = resolved_mode == "lexical"
     candidates: list[Memory] | None = None
     if resolved_mode == "semantic":
-        candidates = _semantic_top_k(store, persona_dir, query, limit=fetch_limit, exclude=exclude)
-        if candidates is None:
+        semantic = _semantic_top_k(store, persona_dir, query, limit=fetch_limit, exclude=exclude)
+        if semantic is None:
             resolved_mode = "lexical"
+        else:
+            # Name-recall fix R4 (spec §5, S8/S35, P-21): the keyword search
+            # (today's, plus the name query, S99) merges in below the semantic
+            # results, filling the slots they leave under the fetch limit. The
+            # reported mode stays "semantic": at least one semantic result
+            # contributed.
+            keyword = _keyword_candidates(
+                store, hebbian, query, exclude=exclude, persona_dir=persona_dir, started=started
+            )
+            # Spec §4, S97/S98: the six result groups in the dev-constants
+            # order, each paragraph's guaranteed slot kept first.
+            candidates = merge_with_keyword(
+                semantic.grouped, keyword, cap=fetch_limit, guaranteed=semantic.guaranteed
+            )
     if candidates is None:
-        candidates = _lexical_candidates(store, hebbian, query, limit=fetch_limit, exclude=exclude)
+        try:
+            candidates = _lexical_candidates(
+                store,
+                hebbian,
+                query,
+                limit=fetch_limit,
+                exclude=exclude,
+                persona_dir=persona_dir,
+                started=started,
+            )
+        finally:
+            # A lexical REQUEST has no semantic stage: its one diagnostics record
+            # has no paragraphs (spec section 6, P-22). A semantic request that fell
+            # back already wrote its record in `_semantic_top_k`.
+            if requested_lexical:
+                emit_recall_diagnostics(
+                    persona_dir, None, source=recall_diagnostics.SOURCE_TOOL, mode="lexical"
+                )
 
     if resolved_order == "age":
         candidates = sorted(candidates, key=lambda m: m.created_at, reverse=True)

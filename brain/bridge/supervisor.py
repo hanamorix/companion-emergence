@@ -107,6 +107,7 @@ from brain.ingest.pipeline import (
 )
 from brain.initiate.review import _rest_state_from_energy, run_initiate_review_tick
 from brain.initiate.user_pattern import compute_user_presence
+from brain.memory import cost_series, floor_startup, recall_diagnostics, reranker
 from brain.memory.embedding_backfill import (
     delete_legacy_embeddings_db as _delete_legacy_embeddings_db,
 )
@@ -381,7 +382,7 @@ def run_folded(
     # above) rather than reusing the main loop's per-tick store, since this
     # runs once before that loop starts. Fault-isolated (recipe item 3): the
     # function itself already catches delete errors per-file, and this
-    # try/except is the outer safety net (e.g. a provider-load failure) so
+    # try/except is the outer safety net (e.g. a store open failure) so
     # a stuck stale file can never crash the bridge — worst case, it is
     # just re-checked (and left in place, or deleted) on the next startup.
     try:
@@ -777,9 +778,14 @@ def _build_gated_jobs(
     test/dev disable knob) is left out. Pass 2, session snapshot/prune,
     emotion backfill and embedding backfill have no interval: each runs at
     every idle pass while it has work (S53/S66). Deploy recalibration is due
-    while the stored floor is stale (S70/S73). Self-model articulation keeps
-    its own cadence (S29). Every other job is an interval job whose cadence
-    file the central function owns.
+    while the stored floor is stale (S70/S73). The cosine and rerank floor
+    bootstraps (name-recall fix S85 revised, S91, S92) are the next-lull RETRY
+    path here: due while neither a calibrated row nor the process-cached
+    bootstrap exists, the floor was needed or its last attempt failed (the
+    rerank one is never due just because the process started), chat has
+    happened since the failed attempt, and none is already in flight.
+    Self-model articulation keeps its own cadence (S29). Every other job is an
+    interval job whose cadence file the central function owns.
 
     Each ``run`` closure looks its tick function up by module-global name at
     call time (so tests can monkeypatch them) and returns
@@ -970,6 +976,137 @@ def _build_gated_jobs(
             "embedding_backfill",
             run=_embedding_backfill_job,
             has_work=_embedding_backfill_has_work,
+        )
+    )
+
+    # 4b. floor bootstraps — name-recall fix S85 revised / S91 / S92 (spec §2).
+    # The COSINE bootstrap is computed at process start; the RERANK bootstrap on
+    # first need, in the background (`floor_startup.request_rerank_bootstrap`);
+    # a failed one is retried in the background on each incoming message. These
+    # two jobs are the lull-time RETRY path: a floor is due only while it is
+    # missing (no calibrated row, not cached), it was needed or its last attempt
+    # failed (the rerank floor is never due just because the process started),
+    # chat has happened since the failed attempt (`cli_throttle.
+    # chat_activity_marker`; no time constants), and no bootstrap of that floor
+    # is already in flight. Until a floor exists that path renders keyword
+    # results only.
+    def _floor_bootstrap_due(kind: str, due_fn: Callable[..., bool]) -> bool:
+        if floor_startup.inflight(kind):
+            return False
+        with _tick_store() as store:
+            return due_fn(store, activity_marker=cli_throttle.chat_activity_marker())
+
+    def _floor_bootstrap_job(kind: str, run_fn: Callable[..., object]) -> JobOutcome:
+        with cli_throttle.background_slot() as slot:
+            if not slot:
+                return JobOutcome.SKIPPED
+            ran = floor_startup.run_guarded(
+                kind, run_fn, activity_marker=cli_throttle.chat_activity_marker()
+            )
+            if not ran:
+                return JobOutcome.SKIPPED
+        return JobOutcome.COMPLETED
+
+    jobs.append(
+        GatedJob(
+            "cosine_floor_bootstrap",
+            run=lambda: _floor_bootstrap_job("cosine", floor_startup.run_cosine_floor),
+            has_work=lambda: _floor_bootstrap_due("cosine", floor_startup.cosine_floor_due),
+        )
+    )
+    jobs.append(
+        GatedJob(
+            "rerank_floor_bootstrap",
+            run=lambda: _floor_bootstrap_job("rerank", floor_startup.run_rerank_floor),
+            has_work=lambda: _floor_bootstrap_due("rerank", floor_startup.rerank_floor_due),
+        )
+    )
+
+    # 4c. stuck-width re-measure — name-recall fix S100, S113, S116 (spec §7).
+    # Due while the runtime reranker's last budget miss is stuck (the learned
+    # cost says fewer than 5 of its candidates fit the full latency budget),
+    # the memory model is ready (S220: never an unfitted batch), the reranker is already loaded, and no re-measure has run at this chat
+    # activity marker (once per lull; no time constant). One timed rerank of
+    # 5 candidates on the loaded provider; never loads a model.
+    def _rerank_width_remeasure_job() -> JobOutcome:
+        with cli_throttle.background_slot() as slot:
+            if not slot:
+                return JobOutcome.SKIPPED
+            with _tick_store() as store:
+                reranker.remeasure_stuck_width(cli_throttle.chat_activity_marker(), store)
+        return JobOutcome.COMPLETED
+
+    jobs.append(
+        GatedJob(
+            "rerank_width_remeasure",
+            run=_rerank_width_remeasure_job,
+            has_work=lambda: reranker.stuck_width_due(
+                cli_throttle.chat_activity_marker(), _tick_store
+            ),
+        )
+    )
+
+    # 4c2. RAM ladder — name-recall fix S200, S208, S220 (fixes S193). A recall
+    # turn on a machine with no usable memory model takes the plain meaning-match
+    # path and flags the need; this job then runs the ladder at the next
+    # lull, under the background slot (never while a reply is in flight): single
+    # pairs from the re-scorer's full input length down, then batches of
+    # increasing size, and loads the reranker
+    # here, not on the reply path. Due once per chat activity marker while the
+    # need is flagged and the window gives no usable model. After the re-measure, before the
+    # flush (so its samples are saved the same lull).
+    def _rerank_ram_figure_job() -> JobOutcome:
+        with cli_throttle.background_slot() as slot:
+            if not slot:
+                return JobOutcome.SKIPPED
+            with _tick_store() as store:
+                reranker.run_ram_figure(cli_throttle.chat_activity_marker(), store)
+        return JobOutcome.COMPLETED
+
+    jobs.append(
+        GatedJob(
+            "rerank_ram_figure",
+            run=_rerank_ram_figure_job,
+            has_work=lambda: reranker.ram_figure_due(cli_throttle.chat_activity_marker(), _tick_store),
+        )
+    )
+
+    # 4d. cost-series flush — name-recall fix S146, S164. The measured timings
+    # behind the per-message recall budget are only buffered in memory on the
+    # reply path; this job saves them to memories.db at the next lull. Due
+    # while the process buffer holds samples for this persona's database (no
+    # database is opened to decide that).
+    def _cost_series_flush_run() -> JobOutcome:
+        with _tick_store() as store:
+            cost_series.flush(store)
+        return JobOutcome.COMPLETED
+
+    jobs.append(
+        GatedJob(
+            "cost_series_flush",
+            run=_cost_series_flush_run,
+            has_work=lambda: cost_series.has_pending(persona_dir / "memories.db"),
+        )
+    )
+
+    # 4e. recall diagnostics flush — name-recall fix S189. The diagnostics append
+    # never waits for the log's lock: a record that met it held (a prune) is kept
+    # in memory and written with the next append or here, at the next lull. Due
+    # while this process buffers records for this persona's log (nothing opened
+    # to decide that). Same shape as 4d (S164).
+    def _recall_diagnostics_flush_run() -> JobOutcome:
+        log_path = recall_diagnostics.diagnostics_path(persona_dir)
+        recall_diagnostics.flush_pending(log_path)
+        # The lock was still held (nothing written): not a completed run, the next lull retries.
+        return JobOutcome.SKIPPED if recall_diagnostics.has_pending(log_path) else JobOutcome.COMPLETED
+
+    jobs.append(
+        GatedJob(
+            "recall_diagnostics_flush",
+            run=_recall_diagnostics_flush_run,
+            has_work=lambda: recall_diagnostics.has_pending(
+                recall_diagnostics.diagnostics_path(persona_dir)
+            ),
         )
     )
 
@@ -2119,7 +2256,7 @@ def _run_narrative_memory_pass(
     # is only exercised on the (slow) soul-review cadence.
     from brain.felt_time import FeltTime
     from brain.felt_time.anchors import scan_since as anchors_scan_since
-    from brain.forgetting import _load_soul_linked_ids
+    from brain.forgetting import SoulExemptionsUnavailableError, _load_soul_linked_ids
     from brain.forgetting.policy import is_exempt as forgetting_is_exempt
     from brain.forgetting.salience import score as forgetting_salience
     from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
@@ -2223,6 +2360,15 @@ def _run_narrative_memory_pass(
         adapted.sort(key=lambda a: a.ts_iso)
         return adapted
 
+    # Soul-linked ids. Fail closed like the forgetting pass (#392): arcs built on an empty exemption
+    # set would pull soul-linked memories in, so skip. Read before any store is opened so a skip
+    # does no work; the next maintenance run tries again.
+    try:
+        crystallised_ids, under_review_ids = _load_soul_linked_ids(persona_dir)
+    except SoulExemptionsUnavailableError as exc:
+        logger.warning("narrative-memory pass: %s; skipping this pass", exc)
+        return
+
     with ExitStack() as stack:
         store = MemoryStore(persona_dir / "memories.db")
         stack.callback(store.close)
@@ -2233,8 +2379,6 @@ def _run_narrative_memory_pass(
         # FeltTime read — get_state() is cheap, doesn't tick.
         felt_time_state = FeltTime(persona_dir=persona_dir).get_state()
 
-        # Soul-linked ids — best-effort, mirrors forgetting wrapper.
-        crystallised_ids, under_review_ids = _load_soul_linked_ids(persona_dir)
         soul_linked = crystallised_ids | under_review_ids
 
         class _EmbeddingsByMemoryId:
@@ -2409,7 +2553,7 @@ def _run_calibration_tick(
     **INC7 SCOPE:** floor derivation + persistence (spec Section 7), via
     ``floor_calibration.derive_and_persist_floor`` — runs against the
     CURRENT production reranker's model_id
-    (``reranker.build_reranker_provider().model_id()``), reading whatever
+    (``reranker.resolve_reranker_model_id()``), reading whatever
     labeled ``calibration_log`` pairs the judge pass above has accumulated
     for the MOST RECENTLY COMPLETED DAY for that model_id (pre-flip
     revision Change 1 re-points this from a pooled multi-day read to a
@@ -2422,6 +2566,18 @@ def _run_calibration_tick(
     ``store.get_reranker_floor`` live rather than the deleted
     ``semantic_recall.RERANK_FLOOR`` constant. This tick's own job stays
     unchanged: derive and WRITE the floor to ``memories.db`` (I1).
+
+    **NAME-RECALL FIX R2 SCOPE (spec §2, S25/S38):** the judge-labeling step
+    samples the reranked/legacy and the cosine score scales separately, and
+    a further step derives the COSINE floor
+    (``floor_calibration.derive_and_persist_cosine_floor``, cosine-scale rows
+    only, embedder model id, its own table) after the rerank floor. Floor
+    fits never mix scales.
+
+    **NAME-RECALL FIX R7 SCOPE (spec §6, S48):** right after the calibration log
+    prune, the recall diagnostics log (``recall_diagnostics.log.jsonl`` in the
+    persona directory) is pruned on the same retention window, in its own guard,
+    before the labeling step and its pause return.
 
     Pre-flip revision Change 2 removed the cross-increment step this
     docstring used to describe here: an ACCEPTED floor write no longer
@@ -2483,6 +2639,20 @@ def _run_calibration_tick(
 
         pruned = store.prune_calibration_log()
         logger.info("calibration tick: pruned=%d calibration_log rows outside retention window", pruned)
+
+        # Name-recall fix R7 (spec section 6, S48, plan P-22): the recall
+        # diagnostics log is pruned here, on the calibration log's retention
+        # window, right after the calibration log and before the labeling step and
+        # its pause return; never from a recall path. Its own guard: the prune is
+        # fail-soft itself, the guard covers the path function.
+        try:
+            removed = recall_diagnostics.prune(recall_diagnostics.diagnostics_path(persona_dir))
+            logger.info(
+                "calibration tick: pruned=%d recall diagnostics records outside retention window",
+                removed,
+            )
+        except Exception:  # noqa: BLE001 — a diagnostics prune must not break the tick
+            logger.exception("calibration tick: recall diagnostics prune failed")
 
         try:
             from brain.memory.relevance_judge import label_calibration_sample
@@ -2548,9 +2718,11 @@ def _run_calibration_tick(
 
         try:
             from brain.memory import floor_calibration
-            from brain.memory.reranker import build_reranker_provider
+            from brain.memory.reranker import resolve_reranker_model_id
 
-            current_reranker_model_id = build_reranker_provider(store=store).model_id()
+            # The id only: building a provider to read it would download the
+            # model on an install that has not cached it.
+            current_reranker_model_id = resolve_reranker_model_id()
             outcome = floor_calibration.derive_and_persist_floor(store, current_reranker_model_id)
             logger.info(
                 "calibration tick: floor derivation for %s -> accepted=%s floor=%s "
@@ -2564,6 +2736,33 @@ def _run_calibration_tick(
             )
         except Exception:  # noqa: BLE001 — floor-derivation failure must not crash the tick
             logger.exception("calibration tick: floor-derivation pass raised; continuing")
+
+        # Name-recall fix R2 (spec §2, S25/S38): the COSINE floor, fit from
+        # the cosine-scale rows only and persisted to its own table keyed by
+        # the embedder model id. Its own try/except (mirrors the rerank-floor
+        # step above): a failure here must not undo the rerank floor.
+        try:
+            from brain.memory import embeddings as embeddings_mod
+            from brain.memory import floor_calibration
+
+            # The id only: building a provider to read it downloads and
+            # materializes the whole embedding model when it is not cached (a
+            # fresh install, CI), inside the calibration tick.
+            embedder_model_id = embeddings_mod.resolve_embedding_model_id()
+            cosine_outcome = floor_calibration.derive_and_persist_cosine_floor(
+                store, embedder_model_id
+            )
+            logger.info(
+                "calibration tick: cosine floor derivation for %s -> accepted=%s floor=%s "
+                "held_for_data_starvation=%s sample_pairs=%d",
+                embedder_model_id,
+                cosine_outcome.accepted,
+                cosine_outcome.floor,
+                cosine_outcome.held_for_data_starvation,
+                cosine_outcome.sample_pairs,
+            )
+        except Exception:  # noqa: BLE001 — cosine-floor failure must not crash the tick
+            logger.exception("calibration tick: cosine-floor derivation pass raised; continuing")
     return True
 
 
@@ -2689,9 +2888,9 @@ def _deploy_recalibration_due(persona_dir: Path) -> bool:
         store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
         stack.callback(store.close)
 
-        from brain.memory.reranker import build_reranker_provider
+        from brain.memory.reranker import resolve_reranker_model_id
 
-        current_reranker_model_id = build_reranker_provider(store=store).model_id()
+        current_reranker_model_id = resolve_reranker_model_id()
 
         if not store.reranker_floor_is_stale(current_reranker_model_id):
             logger.debug(
@@ -2731,9 +2930,9 @@ def _run_deploy_recalibration(persona_dir: Path) -> None:
         store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
         stack.callback(store.close)
 
-        from brain.memory.reranker import build_reranker_provider
+        from brain.memory.reranker import resolve_reranker_model_id
 
-        current_reranker_model_id = build_reranker_provider(store=store).model_id()
+        current_reranker_model_id = resolve_reranker_model_id()
         if not store.reranker_floor_is_stale(current_reranker_model_id):
             return
         no_row = store.get_persisted_reranker_floor(current_reranker_model_id) is None

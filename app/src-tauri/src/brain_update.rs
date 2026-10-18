@@ -242,6 +242,8 @@ use std::time::{Duration, Instant};
 
 const MANIFEST_MAX: usize = 64 * 1024;
 const SIG_MAX: usize = 4 * 1024;
+/// The envelope JSON-escapes both, so allow for the quoting on top.
+const ENVELOPE_MAX: usize = 2 * (MANIFEST_MAX + SIG_MAX);
 const WHEEL_MAX: usize = 64 * 1024 * 1024;
 const REQUIREMENTS_MAX: usize = 1024 * 1024;
 const STATUS_TIMEOUT_S: u64 = 30;
@@ -371,39 +373,50 @@ enum FetchError {
     Unsupported,
 }
 
-/// Fetch + verify manifest.json. A bad signature is retried once after 3 s —
-/// manifest and .sig upload in parallel, so they can briefly disagree — then
-/// logged as a security event. Never falls back to installing.
+#[derive(Deserialize)]
+struct Envelope {
+    manifest: String,
+    signature: String,
+}
+
+/// Open manifest.signed.json: check the signature over the manifest it carries
+/// and return the manifest's bytes. A malformed envelope is a fetch problem; a
+/// signature that doesn't verify is a security event.
+fn open_envelope(bytes: &[u8], pubkey: &str) -> Result<Vec<u8>, FetchError> {
+    let env: Envelope = serde_json::from_slice(bytes)
+        .map_err(|e| FetchError::Unreachable(format!("manifest.signed.json: {e}")))?;
+    if env.manifest.len() > MANIFEST_MAX || env.signature.len() > SIG_MAX {
+        return Err(FetchError::Unreachable("manifest.signed.json: a field is over its size cap".into()));
+    }
+    verify_manifest(env.manifest.as_bytes(), &env.signature, pubkey).map_err(FetchError::BadSignature)?;
+    Ok(env.manifest.into_bytes())
+}
+
+/// Fetch + verify the manifest. It comes as one asset, manifest.signed.json,
+/// so the manifest and its signature are always replaced together (#365): a
+/// signature that doesn't verify is never an upload in progress, so there is
+/// no retry. It is logged as a security event. Never falls back to installing.
 async fn fetch_verified_manifest(
     app: &tauri::AppHandle,
     client: &reqwest::Client,
     tag: &str,
 ) -> Result<Manifest, FetchError> {
     let pubkey = updater_pubkey(&app.config().plugins.0).map_err(FetchError::Unreachable)?;
-    let mut last = String::new();
-    for attempt in 0..2 {
-        if attempt == 1 {
-            tokio::time::sleep(Duration::from_secs(3)).await;
+    let bytes = fetch(client, &asset_url(tag, "manifest.signed.json"), ENVELOPE_MAX)
+        .await
+        .map_err(FetchError::Unreachable)?;
+    let manifest = match open_envelope(&bytes, &pubkey) {
+        Ok(m) => m,
+        Err(FetchError::BadSignature(e)) => {
+            log_event(app, "brain update: manifest signature rejected (security)", &e);
+            return Err(FetchError::BadSignature(e));
         }
-        let manifest = fetch(client, &asset_url(tag, "manifest.json"), MANIFEST_MAX)
-            .await
-            .map_err(FetchError::Unreachable)?;
-        let sig = fetch(client, &asset_url(tag, "manifest.json.sig"), SIG_MAX)
-            .await
-            .map_err(FetchError::Unreachable)?;
-        let sig = String::from_utf8_lossy(&sig).into_owned();
-        match verify_manifest(&manifest, &sig, &pubkey) {
-            Ok(()) => {
-                return parse_manifest(&manifest).map_err(|e| match e {
-                    ManifestError::Unsupported => FetchError::Unsupported,
-                    ManifestError::Invalid(e) => FetchError::Unreachable(e),
-                });
-            }
-            Err(e) => last = e,
-        }
-    }
-    log_event(app, "brain update: manifest signature rejected (security)", &last);
-    Err(FetchError::BadSignature(last))
+        Err(e) => return Err(e),
+    };
+    parse_manifest(&manifest).map_err(|e| match e {
+        ManifestError::Unsupported => FetchError::Unsupported,
+        ManifestError::Invalid(e) => FetchError::Unreachable(e),
+    })
 }
 
 fn http_client() -> Result<reqwest::Client, String> {
@@ -582,6 +595,32 @@ mod tests {
         let err = verify_manifest(OTHER, OTHER_SIG, PUB).unwrap_err();
         assert!(err.contains("another file"), "{err}");
         assert!(verify_manifest(MANIFEST, OTHER_SIG, PUB).is_err());
+    }
+
+    const ENVELOPE: &[u8] = include_bytes!("brain_update_fixtures/manifest.signed.json");
+
+    #[test]
+    fn opens_a_signed_envelope_to_the_exact_manifest_bytes() {
+        let manifest = open_envelope(ENVELOPE, PUB).ok().unwrap();
+        assert_eq!(manifest, MANIFEST);
+    }
+
+    #[test]
+    fn an_envelope_whose_halves_disagree_is_a_bad_signature() {
+        // What a reader of two separately replaced assets could see (#365).
+        let env = serde_json::json!({
+            "manifest": String::from_utf8(OTHER.to_vec()).unwrap(),
+            "signature": SIG,
+        });
+        let bytes = serde_json::to_vec(&env).unwrap();
+        assert!(matches!(open_envelope(&bytes, PUB), Err(FetchError::BadSignature(_))));
+    }
+
+    #[test]
+    fn a_malformed_envelope_is_not_reported_as_a_bad_signature() {
+        for bad in [&b"not json"[..], br#"{"manifest": "m"}"#, br#"{"manifest": 1, "signature": "s"}"#] {
+            assert!(matches!(open_envelope(bad, PUB), Err(FetchError::Unreachable(_))));
+        }
     }
 
     #[test]

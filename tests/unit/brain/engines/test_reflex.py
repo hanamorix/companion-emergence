@@ -518,7 +518,7 @@ def test_run_tick_ranks_highest_threshold_excess(tmp_path: Path):
     }
     arcs_path.write_text(json.dumps(payload), encoding="utf-8")
 
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     try:
         _seed_emotion_memory(store, {"love": 6.0, "defiance": 9.0})
         engine = _build_engine(tmp_path, store)
@@ -584,7 +584,7 @@ def test_run_tick_template_missing_key_substitutes_zero(tmp_path: Path):
             captured.append(prompt)
             return "ok"
 
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     try:
         _seed_emotion_memory(store, {"love": 7.0})
         engine = ReflexEngine(

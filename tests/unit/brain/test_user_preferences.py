@@ -84,7 +84,7 @@ def test_save_is_atomic(tmp_path: Path) -> None:
     path = tmp_path / "user_preferences.json"
     UserPreferences(dream_every_hours=12.0).save(path)
     assert path.exists()
-    assert not path.with_suffix(path.suffix + ".new").exists()
+    assert not list(path.parent.glob("*.new"))  # no per-save temp file left behind
 
 
 # ---- read_raw_keys ----

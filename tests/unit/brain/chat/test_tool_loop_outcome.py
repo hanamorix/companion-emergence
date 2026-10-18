@@ -41,7 +41,7 @@ def _run(provider, tmp_path):
         [ChatMessage(role="user", content="write that down")],
         provider=provider,
         tools=build_tools_list("Nell"),
-        store=MemoryStore(":memory:"),
+        store=MemoryStore(tmp_path / "memories.db"),
         hebbian=HebbianMatrix(":memory:"),
         persona_dir=tmp_path,
         companion_name="Nell",

@@ -37,6 +37,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -128,6 +129,20 @@ def paths_for_persona(persona: str) -> WindowsServicePaths:
     )
 
 
+_NELL_CMD_SHIM_MARKER = "companion-emergence-nell-shim"
+
+
+def _is_nell_cmd_shim(path: Path) -> bool:
+    """True for the `nell.cmd` shortcut the desktop app writes (marker in its first lines)."""
+    if path.suffix.lower() != ".cmd":
+        return False
+    try:
+        head = path.read_text(encoding="utf-8", errors="replace").splitlines()[:3]
+    except OSError:
+        return False
+    return any(_NELL_CMD_SHIM_MARKER in line for line in head)
+
+
 def resolve_nell_path(explicit: str | None = None) -> Path:
     """Mirror of launchd.resolve_nell_path / systemd.resolve_nell_path."""
     if explicit:
@@ -139,7 +154,19 @@ def resolve_nell_path(explicit: str | None = None) -> Path:
         return path
     found = shutil.which("nell.exe") or shutil.which("nell")
     if found:
-        return Path(found).resolve()
+        resolved = Path(found).resolve()
+        if _is_nell_cmd_shim(resolved):
+            # The desktop app's `nell.cmd` shortcut is on PATH. Registering it would make Task
+            # Scheduler open a console window at every logon, so use the bundled runtime's own
+            # `Scripts\nell.bat` (the shortcut runs the bundled python, so this interpreter is it).
+            bundled = Path(sys.executable).parent / "Scripts" / "nell.bat"
+            if bundled.is_file():
+                return bundled
+            raise WindowsServiceConfigError(
+                "found the Companion Emergence nell.cmd shortcut on PATH but not the bundled "
+                "nell.bat next to this Python; pass --nell-path C:\\path\\to\\nell.bat"
+            )
+        return resolved
     raise WindowsServiceConfigError(
         "could not resolve 'nell' on PATH; pass --nell-path C:\\path\\to\\nell.exe"
     )
@@ -383,6 +410,10 @@ def run_schtasks(args: list[str]) -> subprocess.CompletedProcess[str]:
             ["schtasks", *args],
             capture_output=True,
             text=True,
+            # Windows' default subprocess codec is not UTF-8; schtasks writes in the console's
+            # OEM code page, so a strict decode could raise on a non-ASCII task name (#363).
+            encoding="utf-8",
+            errors="replace",
             timeout=15,
             check=False,
         )

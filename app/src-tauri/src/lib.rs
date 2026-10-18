@@ -1160,94 +1160,274 @@ async fn install_supervisor_service_impl(
     })
 }
 
-/// Install a symlink at ``~/.local/bin/nell`` pointing at the bundled CLI.
+/// Put a `nell` command on the user's PATH (#408). The command name stays
+/// `install_nell_cli_symlink` for the frontend; the mechanism depends on the install:
 ///
-/// Lets the user run ``nell ...`` from their terminal without having to
-/// type the full ``/Applications/Companion Emergence.app/Contents/...``
-/// path. Mirrors the install-shape of ``install_supervisor_service``:
-/// idempotent, AppTranslocation-guarded, surfaces a structured result the
-/// frontend can format inline.
+/// * macOS and Linux .deb: a symlink at `~/.local/bin/nell` pointing at the bundled CLI
+///   ([`install_symlink_to`], unchanged). On Linux a user's own `nell` (file or symlink) is never
+///   overwritten.
+/// * Linux AppImage: a small script at `~/.local/bin/nell` that runs the AppImage in CLI mode
+///   (`--companion-nell-cli`), which hands off to the bundled `nell` before the GUI starts. The
+///   script is refreshed on every app launch in case the AppImage moved.
+/// * Windows: `nell.cmd` in `%LOCALAPPDATA%\CompanionEmergence\bin` calling the bundled
+///   `nell.bat`, and that folder added once to the user PATH (HKCU).
+/// * An AppImage running without FUSE gets no shortcut and an explanation (owner-ruled).
 ///
-/// `~/.local/bin` is the right target because:
-/// 1. It's user-owned — no sudo prompt, no privileged helper.
-/// 2. Anthropic's ``claude`` installer drops binaries there too, so a
-///    user running this app already has the directory and (almost
-///    certainly) has it on PATH.
-/// 3. It matches the launchd flow's "no escalation" posture.
-///
-/// Behaviour at the target:
-/// * Doesn't exist  → write the symlink.
-/// * Existing symlink pointing at our bundled path → no-op success.
-/// * Existing symlink pointing elsewhere → overwrite (covers app moved /
-///   reinstalled at a different location).
-/// * Existing regular file → refuse with `exit_code=73`. We don't clobber
-///   a user-installed ``nell`` (e.g. ``pip install --user``).
-///
-/// macOS-only for now; Linux desktops have similar layout but the path
-/// validation needs different unstable-path checks (no AppTranslocation,
-/// no /Volumes-shaped DMGs) so we'll add Linux when there's a Linux
-/// `.app` shape to validate against.
+/// Which mechanism applies is decided by the pure `nell_shortcut::plan_shortcut`; this command only
+/// gathers the environment and executes the plan.
 #[tauri::command]
-#[cfg(target_os = "macos")]
 async fn install_nell_cli_symlink(app: tauri::AppHandle) -> Result<InitResult, String> {
-    let bundled = match bundled_nell_path(&app)? {
-        Some(p) => p,
-        None => {
-            return Ok(InitResult {
-                success: false,
-                stdout: String::new(),
-                stderr: "Bundled nell CLI not found in this build. Install from a release DMG."
-                    .to_string(),
-                exit_code: 78,
-            })
-        }
-    };
-
-    if let Some(reason) = unstable_macos_app_path_reason(&bundled) {
-        return Ok(InitResult {
-            success: false,
-            stdout: String::new(),
-            stderr: reason,
-            exit_code: 78,
-        });
-    }
-
-    let home = match std::env::var("HOME") {
-        Ok(h) => PathBuf::from(h),
-        Err(_) => {
-            return Ok(InitResult {
-                success: false,
-                stdout: String::new(),
-                stderr: "HOME env var not set; cannot resolve ~/.local/bin".to_string(),
-                exit_code: 78,
-            })
-        }
-    };
-    let target_dir = home.join(".local").join("bin");
-    let target = target_dir.join("nell");
-    install_symlink_to(&bundled, &target_dir, &target)
+    let bundled = bundled_nell_path(&app)?;
+    let plan = nell_shortcut::plan_shortcut(&shortcut_env(bundled));
+    run_plan(plan).await
 }
 
-/// Non-macOS stub. The Linux + Windows builds compile this; macOS uses
-/// the real implementation above. Returns the unsupported result the
-/// frontend already renders inline. The Linux story (~/.local/bin/nell
-/// from the AppImage / .deb) is achievable but layout-specific
-/// validation differs from macOS — defer to a separate landing.
-///
-/// `#[tauri::command]` is on both halves so `generate_handler!` finds
-/// the companion macros (`__cmd__install_nell_cli_symlink`,
-/// `__tauri_command_name_install_nell_cli_symlink`) on every target.
-#[tauri::command]
-#[cfg(not(target_os = "macos"))]
-#[allow(unused_variables)]
-async fn install_nell_cli_symlink(app: tauri::AppHandle) -> Result<InitResult, String> {
-    Ok(InitResult {
+/// Gather the facts `plan_shortcut` needs. `APPDIR` is canonicalised (the form Tauri's resource dir
+/// uses), so a TMPDIR behind a symlink does not look like a foreign layout.
+fn shortcut_env(bundled: Option<PathBuf>) -> nell_shortcut::ShortcutEnv {
+    let os = nell_shortcut::current_os();
+    let lookup = |key: &str| std::env::var_os(key);
+    let macos_reason = if os == nell_shortcut::Os::MacOs {
+        bundled.as_ref().and_then(|b| unstable_macos_app_path_reason(b))
+    } else {
+        None
+    };
+    let mut env = nell_shortcut::ShortcutEnv::from_lookup(os, &lookup, bundled, macos_reason);
+    env.appdir = env.appdir.map(|d| d.canonicalize().unwrap_or(d));
+    env
+}
+
+#[cfg(windows)]
+async fn run_plan(plan: nell_shortcut::ShortcutPlan) -> Result<InitResult, String> {
+    // The registry and window-broadcast calls block; keep them off the async workers.
+    tokio::task::spawn_blocking(move || execute_plan(&plan))
+        .await
+        .map_err(|e| format!("shortcut task failed: {}", e))
+}
+
+#[cfg(not(windows))]
+async fn run_plan(plan: nell_shortcut::ShortcutPlan) -> Result<InitResult, String> {
+    Ok(execute_plan(&plan))
+}
+
+fn init_result_from(o: nell_shortcut::Outcome) -> InitResult {
+    InitResult { success: o.success, stdout: o.stdout, stderr: o.stderr, exit_code: o.exit_code }
+}
+
+fn unsupported_result(message: &str) -> InitResult {
+    InitResult {
         success: false,
         stdout: String::new(),
-        stderr: "nell-CLI symlink install is currently macOS-only".to_string(),
+        stderr: message.to_string(),
         exit_code: 78,
+    }
+}
+
+/// Carry out a plan. Unavailable plans become the exit-78 result the frontend renders inline.
+fn execute_plan(plan: &nell_shortcut::ShortcutPlan) -> InitResult {
+    use nell_shortcut::ShortcutPlan;
+    match plan {
+        ShortcutPlan::Unavailable { reason } => unsupported_result(reason),
+        ShortcutPlan::Symlink { bundled, target_dir, target } => {
+            execute_symlink(bundled, target_dir, target)
+        }
+        ShortcutPlan::AppImageScript { appimage, target_dir, target } => {
+            execute_script(appimage, target_dir, target)
+        }
+        ShortcutPlan::WindowsCmd { bundled, cmd_dir, cmd_path, win_prefixes } => {
+            execute_windows(bundled, cmd_dir, cmd_path, win_prefixes)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn execute_symlink(
+    bundled: &std::path::Path,
+    target_dir: &std::path::Path,
+    target: &std::path::Path,
+) -> InitResult {
+    // macOS keeps its original behaviour exactly; only Linux gets the stricter "never replace a
+    // user's own nell" pre-check.
+    if nell_shortcut::current_os() != nell_shortcut::Os::MacOs {
+        if let Err(outcome) = nell_shortcut::prepare_linux_symlink(target, bundled) {
+            return init_result_from(outcome);
+        }
+    }
+    install_symlink_to(bundled, target_dir, target).unwrap_or_else(|e| InitResult {
+        success: false,
+        stdout: String::new(),
+        stderr: e,
+        exit_code: 1,
     })
 }
+
+#[cfg(not(unix))]
+fn execute_symlink(
+    _bundled: &std::path::Path,
+    _target_dir: &std::path::Path,
+    _target: &std::path::Path,
+) -> InitResult {
+    unsupported_result("The nell shortcut is not supported on this platform.")
+}
+
+#[cfg(unix)]
+fn execute_script(
+    appimage: &std::path::Path,
+    target_dir: &std::path::Path,
+    target: &std::path::Path,
+) -> InitResult {
+    let nell_path = match std::env::current_exe() {
+        Ok(exe) => nell_shortcut::derive_cli_nell_path(&exe),
+        Err(e) => return unsupported_result(&format!("cannot locate the running app: {}", e)),
+    };
+    init_result_from(nell_shortcut::install_script_shim(
+        target_dir,
+        target,
+        appimage,
+        appimage.is_file(),
+        &nell_path,
+    ))
+}
+
+#[cfg(not(unix))]
+fn execute_script(
+    _appimage: &std::path::Path,
+    _target_dir: &std::path::Path,
+    _target: &std::path::Path,
+) -> InitResult {
+    unsupported_result("The nell shortcut is not supported on this platform.")
+}
+
+#[cfg(windows)]
+fn execute_windows(
+    bundled: &std::path::Path,
+    cmd_dir: &std::path::Path,
+    cmd_path: &std::path::Path,
+    win_prefixes: &[(String, String)],
+) -> InitResult {
+    init_result_from(nell_shortcut::install_windows_cmd(
+        bundled,
+        cmd_dir,
+        cmd_path,
+        win_prefixes,
+        "Environment",
+    ))
+}
+
+#[cfg(not(windows))]
+fn execute_windows(
+    _bundled: &std::path::Path,
+    _cmd_dir: &std::path::Path,
+    _cmd_path: &std::path::Path,
+    _win_prefixes: &[(String, String)],
+) -> InitResult {
+    unsupported_result("The nell shortcut is not supported on this platform.")
+}
+
+/// On every app launch, refresh a shortcut that was installed earlier: the AppImage may have moved
+/// (Linux) or the install folder may have changed (Windows). Never creates a shortcut, never touches
+/// a file that is not ours, never edits the PATH, and never blocks startup.
+fn refresh_shortcut_on_launch(app: &tauri::AppHandle) {
+    let bundled = match bundled_nell_path(app) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let plan = nell_shortcut::plan_shortcut(&shortcut_env(bundled.clone()));
+    refresh_plan(&plan, bundled.as_deref());
+}
+
+/// Record a shortcut-refresh problem where a user or a bug report can find it: the app's launch
+/// log (`$KINDLED_HOME/launch-failures.log`, the same file spawn failures use), plus stderr for
+/// terminal runs. Best-effort: a read-only home must never affect startup. A Windows release build
+/// has no console, so stderr alone would be invisible.
+fn log_shortcut_problem(detail: &str, bundled: Option<&std::path::Path>) {
+    eprintln!("nell shortcut: {}", detail);
+    let home = match nellbrain_home() {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    let failure = launch_log::LaunchFailure {
+        command: "nell-shortcut-refresh".to_string(),
+        exit_code: None,
+        stdout_tail: String::new(),
+        stderr_tail: detail.to_string(),
+        platform: std::env::consts::OS.to_string(),
+        platform_version: std::env::consts::ARCH.to_string(),
+        bundled_runtime_path: bundled.map(|p| p.to_string_lossy().into_owned()),
+        runtime_path_exists: bundled.map(|p| p.exists()).unwrap_or(false),
+        duration_ms: 0,
+    };
+    let _ = launch_log::append_failure(&home, &failure);
+}
+
+#[cfg(unix)]
+fn refresh_plan(plan: &nell_shortcut::ShortcutPlan, bundled: Option<&std::path::Path>) {
+    if let nell_shortcut::ShortcutPlan::AppImageScript { appimage, target, .. } = plan {
+        // Nothing to refresh (and nothing worth logging) unless OUR shim was installed earlier: a
+        // user's own `nell` at this path must stay silent.
+        if !nell_shortcut::is_our_shim_file(target) {
+            return;
+        }
+        let derived = match std::env::current_exe() {
+            Ok(exe) => nell_shortcut::derive_cli_nell_path(&exe),
+            Err(_) => return,
+        };
+        if !derived.exists() {
+            log_shortcut_problem(
+                &format!(
+                    "expected the bundled nell at {} but it is missing; the shortcut was not refreshed",
+                    derived.display()
+                ),
+                bundled,
+            );
+            return;
+        }
+        // Defence in depth: the CLI mode finds nell by this layout rule, Tauri by its own resolver.
+        if let Some(b) = bundled {
+            let same = match (derived.canonicalize(), b.canonicalize()) {
+                (Ok(d), Ok(t)) => d == t,
+                _ => true, // cannot compare: do not raise a false alarm
+            };
+            if !same {
+                log_shortcut_problem(
+                    &format!(
+                        "layout mismatch: CLI mode would run {} but the app resolves its runtime at {}",
+                        derived.display(),
+                        b.display()
+                    ),
+                    bundled,
+                );
+            }
+        }
+        if let Ok(text) = nell_shortcut::render_appimage_script(appimage) {
+            let outcome = nell_shortcut::refresh_shim_at(target, &text);
+            if !outcome.success {
+                log_shortcut_problem(&format!("refresh failed: {}", outcome.stderr), bundled);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn refresh_plan(plan: &nell_shortcut::ShortcutPlan, _bundled: Option<&std::path::Path>) {
+    if let nell_shortcut::ShortcutPlan::WindowsCmd { bundled, cmd_path, win_prefixes, .. } = plan {
+        if !nell_shortcut::is_our_shim_file(cmd_path) {
+            return; // never installed, or not our file: nothing to refresh
+        }
+        match nell_shortcut::render_windows_cmd(&bundled.to_string_lossy(), win_prefixes) {
+            Ok(text) => {
+                let outcome = nell_shortcut::refresh_cmd_at(cmd_path, &text);
+                if !outcome.success {
+                    log_shortcut_problem(&format!("refresh failed: {}", outcome.stderr), Some(bundled.as_path()));
+                }
+            }
+            Err(e) => log_shortcut_problem(&format!("refresh skipped: {}", e), Some(bundled.as_path())),
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn refresh_plan(_plan: &nell_shortcut::ShortcutPlan, _bundled: Option<&std::path::Path>) {}
 
 /// Pure file-system half of [`install_nell_cli_symlink`]. Extracted so
 /// the FS branches can be unit-tested against tempdirs without spinning
@@ -1257,8 +1437,8 @@ async fn install_nell_cli_symlink(app: tauri::AppHandle) -> Result<InitResult, S
 /// On `success=true`, `stdout` holds the user-facing summary; on
 /// `success=false`, `stderr` holds the error text the frontend renders.
 ///
-/// Unix-only — uses [`std::os::unix::fs::symlink`]. The Windows build
-/// stops at the [`install_nell_cli_symlink`] non-macos stub; this
+/// Unix-only — uses [`std::os::unix::fs::symlink`]. Windows uses a
+/// `nell.cmd` shortcut instead (see [`install_nell_cli_symlink`]); this
 /// helper isn't compiled there.
 #[cfg(unix)]
 fn install_symlink_to(
@@ -1363,12 +1543,7 @@ fn path_hint(target_dir: &std::path::Path) -> String {
             std::env::split_paths(&p).any(|entry| entry == target_dir)
         })
         .unwrap_or(false);
-    if on_path {
-        "Open a new Terminal window and run `nell --version`.".to_string()
-    } else {
-        "If `nell` isn't found in Terminal, add `export PATH=\"$HOME/.local/bin:$PATH\"` \
-         to your shell rc (~/.zshrc) and reload.".to_string()
-    }
+    nell_shortcut::path_hint_text(nell_shortcut::current_os(), on_path)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1864,6 +2039,10 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(BrainLoginState::default())
+        .setup(|app| {
+            refresh_shortcut_on_launch(app.handle());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_bridge_credentials,
             read_app_config,
@@ -2063,9 +2242,8 @@ mod tests {
 
     // ── install_symlink_to — Phase 1.A ────────────────────────────────────
     // Unix-only: install_symlink_to is itself #[cfg(unix)] because it
-    // uses std::os::unix::fs::symlink. Windows builds compile only the
-    // non-macos stub of install_nell_cli_symlink and don't have these
-    // helpers at all.
+    // uses std::os::unix::fs::symlink. Windows builds use the nell.cmd
+    // shortcut instead and don't have these helpers at all.
 
     #[cfg(unix)]
     #[test]
@@ -2568,5 +2746,66 @@ mod kindled_home_tests {
                 assert_eq!(home, std::path::PathBuf::from("/tmp/nell-test"));
             },
         );
+    }
+
+    // ── nell shortcut command wiring (#408) ──────────────────────────────
+
+    /// C29: an AppImage running without FUSE gets no shortcut and the exact explanation, and
+    /// nothing is written under HOME.
+    #[cfg(unix)]
+    #[test]
+    fn no_fuse_appimage_gets_the_explanation_and_nothing_is_written() {
+        let home = tempfile::tempdir().unwrap();
+        let env = nell_shortcut::ShortcutEnv {
+            os: nell_shortcut::Os::Linux,
+            bundled: Some(PathBuf::from(
+                "/tmp/appimage_extracted_0123abcd/usr/lib/Companion Emergence/python-runtime/bin/nell",
+            )),
+            home: Some(home.path().to_path_buf()),
+            local_app_data: None,
+            appimage: Some(PathBuf::from("/home/u/CE.AppImage")),
+            appdir: Some(PathBuf::from("/tmp/appimage_extracted_0123abcd")),
+            macos_unstable_reason: None,
+            win_prefixes: vec![],
+        };
+        let result = execute_plan(&nell_shortcut::plan_shortcut(&env));
+        assert!(!result.success);
+        assert_eq!(result.exit_code, 78);
+        assert_eq!(result.stderr, nell_shortcut::NO_FUSE_MESSAGE);
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+    }
+
+    /// Unavailable plans keep the exit-78 shape the frontend renders inline.
+    #[test]
+    fn unavailable_plan_is_an_exit_78_result() {
+        let r = execute_plan(&nell_shortcut::ShortcutPlan::Unavailable { reason: "because".to_string() });
+        assert!(!r.success);
+        assert_eq!(r.exit_code, 78);
+        assert_eq!(r.stderr, "because");
+        assert!(r.stdout.is_empty());
+    }
+
+    /// Linux deb path through the real command code: a user's own `nell` is never overwritten, a
+    /// fresh target gets the symlink (macOS keeps its original behaviour, covered above).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_symlink_refuses_a_users_own_nell_and_links_when_free() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundled = tmp.path().join("usr/lib/Companion Emergence/python-runtime/bin/nell");
+        std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        std::fs::write(&bundled, "#!/bin/sh\nexit 0\n").unwrap();
+        let target_dir = tmp.path().join("home/.local/bin");
+        let target = target_dir.join("nell");
+
+        let ok = execute_symlink(&bundled, &target_dir, &target);
+        assert!(ok.success, "{:?}", ok.stderr);
+        assert_eq!(std::fs::read_link(&target).unwrap(), bundled);
+
+        std::fs::remove_file(&target).unwrap();
+        std::fs::write(&target, "my own nell").unwrap();
+        let refused = execute_symlink(&bundled, &target_dir, &target);
+        assert!(!refused.success);
+        assert_eq!(refused.exit_code, 73);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "my own nell");
     }
 }

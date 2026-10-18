@@ -289,4 +289,37 @@ describe("ensureBridgeCurrent", () => {
     expect(await ensureBridgeCurrent("nell")).toBe("ok");
     expect(invokeForceRestart).not.toHaveBeenCalled();
   });
+
+  it("(#365) says why when the forced replace of a stale bridge fails", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    getVersion.mockResolvedValue("0.0.43");
+    fetchHealth.mockResolvedValue({ liveness: "ok", version: "0.0.30" });
+    invokeForceRestart.mockRejectedValueOnce(new Error("no pid file for nell"));
+
+    expect(await ensureBridgeCurrent("nell")).toBe("version_mismatch_unresolved");
+
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("forced replace failed"));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("no pid file for nell"));
+  });
+
+  it("(#365) says why when the recheck after a replace fails or still disagrees", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    invokeForceRestart.mockResolvedValue(undefined); // an earlier test leaves a rejection in place
+    getVersion.mockResolvedValue("0.0.43");
+    fetchHealth
+      .mockResolvedValueOnce({ liveness: "ok", version: "0.0.30" })
+      .mockRejectedValueOnce(new Error("connection refused"));
+
+    expect(await ensureBridgeCurrent("nell")).toBe("version_mismatch_unresolved");
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("recheck failed: connection refused"));
+
+    _resetForTests();
+    warn.mockClear();
+    fetchHealth
+      .mockResolvedValueOnce({ liveness: "ok", version: "0.0.30" })
+      .mockResolvedValueOnce({ liveness: "ok", version: "0.0.31" });
+
+    expect(await ensureBridgeCurrent("nell")).toBe("version_mismatch_unresolved");
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("recheck still reports 0.0.31"));
+  });
 });

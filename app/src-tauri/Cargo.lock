@@ -2156,6 +2156,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nell_shortcut"
+version = "0.0.0"
+dependencies = [
+ "tempfile",
+ "windows 0.58.0",
+ "winreg",
+]
+
+[[package]]
 name = "nellface"
 version = "0.0.42"
 dependencies = [
@@ -2164,6 +2173,7 @@ dependencies = [
  "dirs 5.0.1",
  "libc",
  "minisign-verify",
+ "nell_shortcut",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

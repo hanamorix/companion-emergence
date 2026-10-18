@@ -1,12 +1,19 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import type { ReactNode } from "react";
 import { installNellCliSymlink, installSupervisorService } from "../../appConfig";
 import type { PersonaState, ChatModel, PronounPreset } from "../../bridge";
-import { getClientPlatform, platformLabel, detectInstallShape } from "../../platform";
+import { getClientPlatform, platformLabel, detectInstallShape, supportsNellCliShortcut } from "../../platform";
 import type { InstallShape } from "../../platform";
 import { Divider, PanelShell, SectionLabel, Toggle } from "../ui";
 import { RestartBridgeButton } from "./RestartBridgeButton";
 import { ModelPicker } from "./ModelPicker";
+import {
+  MODEL_UNCHECKED_MESSAGE,
+  modelRejectedNowMessage,
+  tierFallbackMessage,
+  tiersUncheckedMessage,
+  type TierFallbackInfo,
+} from "../../lib/friendlyChatError";
 import { PronounPicker } from "./PronounPicker";
 import { NotesToggle } from "./NotesToggle";
 import { KindledLinkToggle } from "./KindledLinkToggle";
@@ -19,6 +26,9 @@ import type { Update } from "@tauri-apps/plugin-updater";
 import { BrainUpdateRow } from "./BrainUpdateRow";
 
 const RELEASES_URL = "https://github.com/hanamorix/companion-emergence/releases";
+
+/** How long the pre-Apply poll guard holds when no poll ever reports a different chat model. */
+const GUARD_RELEASE_MS = 15_000;
 
 interface Props {
   state: PersonaState | null;
@@ -65,6 +75,7 @@ export function ConnectionPanel({
   const mode = state?.mode ?? "live";
   const platform = getClientPlatform();
   const supervisorSupported = platform === "macos" || platform === "linux" || platform === "windows";
+  const cliShortcutSupported = supportsNellCliShortcut(platform);
   const currentPlatformLabel = platformLabel(platform);
   const [install, setInstall] = useState<InstallState>({ kind: "idle" });
   const [cliInstall, setCliInstall] = useState<InstallState>({ kind: "idle" });
@@ -80,6 +91,57 @@ export function ConnectionPanel({
   // so the panel reflects the change without waiting for the next /state poll.
   const [localModel, setLocalModel] = useState<ChatModel | null>(null);
   const displayModel = localModel ?? (conn?.model as ChatModel | null | undefined) ?? null;
+  // Set when the last Apply saved a custom model the bridge could not confirm: shown at once, then the
+  // bridge's `model_unconfirmed` list takes over (it empties when a clean reply arrives for the model).
+  const [pendingNotice, setPendingNotice] = useState(false);
+  // Tier fallbacks the last Apply reported, shown at once until the bridge's own list (state) takes over.
+  // null = no Apply since the last state; an empty list is a fresh answer: none.
+  const [pendingFallbacks, setPendingFallbacks] = useState<TierFallbackInfo[] | null>(null);
+  const [pendingTiersUnchecked, setPendingTiersUnchecked] = useState<string[] | null>(null);
+  // Guard against a poll that left BEFORE the last Apply and lands after it: it still reports the old chat
+  // model and must not bring back the old lines. It is released by the first poll that reports any other
+  // model (the new one, or one changed elsewhere meanwhile), or after GUARD_RELEASE_MS, whichever is first;
+  // when the Apply re-saved the same model, only the timer applies.
+  const guardRef = useRef<{ before: string | null; applied: string } | null>(null);
+  const guardTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const releaseGuard = () => {
+    if (guardTimerRef.current !== null) clearTimeout(guardTimerRef.current);
+    guardTimerRef.current = null;
+    guardRef.current = null;
+    setPendingNotice(false);
+    setPendingFallbacks(null);
+    setPendingTiersUnchecked(null);
+  };
+  useEffect(() => {
+    const g = guardRef.current;
+    const polled = state?.connection?.model ?? null;
+    // A re-Apply of the same model cannot tell a stale poll from a fresh one: only the timer ends its guard.
+    if (g === null || polled !== g.before) releaseGuard();
+  }, [state]);
+  useEffect(
+    () => () => {
+      if (guardTimerRef.current !== null) clearTimeout(guardTimerRef.current);
+    },
+    [],
+  );
+  const fallbacks = pendingFallbacks ?? state?.tier_fallbacks ?? [];
+  const modelNotice =
+    pendingNotice || (displayModel !== null && (state?.model_unconfirmed ?? []).includes(displayModel))
+      ? MODEL_UNCHECKED_MESSAGE
+      : null;
+  // Models the Claude CLI rejected while in use (the bridge drops a record when the model changes or a
+  // clean reply arrives). A record for the model the user has since replaced is stale until the next poll.
+  const explainedByFallback = new Set(fallbacks.map((f) => f.wanted));
+  const rejectionLines = (state?.model_rejections ?? []).flatMap((rec) => {
+    // The chat model's own rejection is never hidden, even when a fallback line names the same id.
+    if (rec.model === displayModel) return [modelRejectedNowMessage(rec.model, true)];
+    if (rec.model === conn?.model) return [];
+    if (explainedByFallback.has(rec.model)) return [];
+    return [modelRejectedNowMessage(rec.model, false)];
+  });
+  const fallbackLines = fallbacks.map(tierFallbackMessage);
+  const uncheckedTiers = (pendingTiersUnchecked ?? state?.tier_unconfirmed ?? []).filter((m) => m !== displayModel);
+  const tiersNote = uncheckedTiers.length > 0 ? tiersUncheckedMessage(uncheckedTiers) : null;
   const [showPronounPicker, setShowPronounPicker] = useState(false);
   // Local pronoun override — updated optimistically after a successful apply.
   const [localPronouns, setLocalPronouns] = useState<PronounPreset | null>(null);
@@ -226,15 +288,16 @@ export function ConnectionPanel({
           letterSpacing: "0.01em",
         }}
       >
-        {platform === "macos"
-          ? <>Add a <code>nell</code> shortcut to ~/.local/bin so you can run commands from Terminal. Idempotent — safe to click again.</>
-          : `The bundled Terminal shortcut installer is not supported on this platform. On ${currentPlatformLabel}, use the packaged app UI; platform-specific CLI wiring can be added later without affecting chat.`}
+        {platform === "macos" && <>Add a <code>nell</code> shortcut to ~/.local/bin so you can run commands from Terminal. Idempotent — safe to click again.</>}
+        {platform === "linux" && <>Add a <code>nell</code> shortcut to ~/.local/bin so you can run commands from a terminal. Idempotent, safe to click again.</>}
+        {platform === "windows" && <>Add a <code>nell</code> shortcut and put its folder on your user PATH so you can run commands from Command Prompt or PowerShell. Idempotent, safe to click again. Open a new terminal window afterwards.</>}
+        {!cliShortcutSupported && `The bundled Terminal shortcut installer is not supported on this platform. On ${currentPlatformLabel}, use the packaged app UI; platform-specific CLI wiring can be added later without affecting chat.`}
       </div>
-      {platform === "macos" ? (
+      {cliShortcutSupported ? (
         <InstallActionButton
           state={cliInstall}
           onClick={onInstallCli}
-          idleLabel="install nell to ~/.local/bin"
+          idleLabel={platform === "windows" ? "install nell to your PATH" : "install nell to ~/.local/bin"}
           runningLabel="installing…"
           successLabel="✓ nell installed"
           errorLabel="retry install"
@@ -297,12 +360,48 @@ export function ConnectionPanel({
         <ModelPicker
           current={displayModel ?? "sonnet"}
           persona={persona}
-          onClose={(newModel) => {
-            if (newModel) setLocalModel(newModel);
+          onClose={(newModel, info) => {
+            if (newModel) {
+              setLocalModel(newModel);
+              if (guardTimerRef.current !== null) clearTimeout(guardTimerRef.current);
+              guardRef.current = { before: conn?.model ?? null, applied: newModel };
+              guardTimerRef.current = setTimeout(releaseGuard, GUARD_RELEASE_MS);
+              setPendingNotice(info?.checked === false);
+              setPendingFallbacks(info?.fallbacks ?? []);
+              setPendingTiersUnchecked(info?.tiersUnchecked ?? []);
+            }
             setShowModelPicker(false);
           }}
         />
       )}
+      {modelNotice && (
+        <div role="status" style={{ fontSize: 10.5, color: "var(--text-mute)", lineHeight: 1.5, marginBottom: 6 }}>
+          {modelNotice}
+        </div>
+      )}
+      {tiersNote && (
+        <div role="status" style={{ fontSize: 10.5, color: "var(--text-mute)", lineHeight: 1.5, marginBottom: 6, wordBreak: "break-word" }}>
+          {tiersNote}
+        </div>
+      )}
+      {fallbackLines.map((line) => (
+        <div
+          key={line}
+          role="status"
+          style={{ fontSize: 10.5, color: "var(--text-mute)", lineHeight: 1.5, marginBottom: 6, wordBreak: "break-word" }}
+        >
+          {line}
+        </div>
+      ))}
+      {rejectionLines.map((line) => (
+        <div
+          key={line}
+          role="status"
+          style={{ fontSize: 10.5, color: "var(--crimson)", lineHeight: 1.5, marginBottom: 6, wordBreak: "break-word" }}
+        >
+          {line}
+        </div>
+      ))}
 
       <Divider />
       <SectionLabel>Your pronouns</SectionLabel>

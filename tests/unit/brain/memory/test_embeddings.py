@@ -489,3 +489,187 @@ def test_stub_race_detector_actually_detects_the_race_when_unserialized(tmp_path
         "the race stub itself must race when nothing external serializes calls to it "
         "-- otherwise the serialization test above wouldn't actually be testing anything"
     )
+
+
+# ---------------------------------------------------------------------------
+# E1 (name-recall fix, spec §3): `embed_batch` on the provider interface.
+# ---------------------------------------------------------------------------
+
+_BATCH_TEXTS = ["the cold coffee", "Pretzel is a scruffy terrier mix", "ok", "the cold coffee"]
+
+
+def test_fake_provider_embed_batch_equals_per_text_embed_in_order(
+    provider: FakeEmbeddingProvider,
+) -> None:
+    """The batch is exactly the per-text vectors, order preserved (including a
+    repeated text), one 1-D float64 unit vector per input."""
+    batch = provider.embed_batch(_BATCH_TEXTS)
+    assert isinstance(batch, list)
+    assert len(batch) == len(_BATCH_TEXTS)
+    for text, vec in zip(_BATCH_TEXTS, batch, strict=True):
+        assert vec.shape == (provider.embedding_dim(),)
+        np.testing.assert_array_equal(vec, provider.embed(text))
+    np.testing.assert_array_equal(batch[0], batch[3])
+    assert not np.array_equal(batch[0], batch[1])
+
+
+def test_fake_provider_embed_batch_accepts_any_sequence_and_empty(
+    provider: FakeEmbeddingProvider,
+) -> None:
+    assert provider.embed_batch([]) == []
+    assert provider.embed_batch(()) == []
+    as_tuple = provider.embed_batch(("a", "b"))
+    as_list = provider.embed_batch(["a", "b"])
+    for x, y in zip(as_tuple, as_list, strict=True):
+        np.testing.assert_array_equal(x, y)
+
+
+def test_embed_batch_rejects_a_bare_string_instead_of_embedding_characters(
+    provider: FakeEmbeddingProvider,
+) -> None:
+    with pytest.raises(TypeError):
+        provider.embed_batch("abc")  # type: ignore[arg-type]
+
+
+def test_default_embed_batch_loops_embed_for_providers_that_only_implement_embed() -> None:
+    """A provider that defines only `embed` (every existing test double) gets
+    a working, order-preserving `embed_batch` from the ABC default — one
+    `embed` call per text — and a bare str is rejected there too."""
+    calls: list[str] = []
+
+    class _EmbedOnly(EmbeddingProvider):
+        def embed(self, text: str) -> np.ndarray:
+            calls.append(text)
+            return np.full(4, float(len(text)), dtype=np.float32)
+
+        def embedding_dim(self) -> int:
+            return 4
+
+        def model_id(self) -> str:
+            return "embed-only"
+
+    p = _EmbedOnly()
+    out = p.embed_batch(["a", "bbb", "cc"])
+    assert calls == ["a", "bbb", "cc"]
+    assert [float(v[0]) for v in out] == [1.0, 3.0, 2.0]
+    assert p.embed_batch([]) == []
+    with pytest.raises(TypeError):
+        p.embed_batch("abc")  # type: ignore[arg-type]
+
+
+def test_fastembed_provider_embed_batch_is_one_model_call_for_all_texts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """N texts go to the model in ONE `embed()` call (the whole point of the
+    batch method), returning N float32 vectors in input order."""
+    seen_batches: list[list[str]] = []
+    base_stub = _make_stub_text_embedding(384)
+
+    class _RecordingStub(base_stub):
+        def embed(self, texts):
+            texts = list(texts)
+            seen_batches.append(texts)
+            for t in texts:
+                yield np.full(384, float(len(t)), dtype=np.float32)
+
+    monkeypatch.setattr("fastembed.TextEmbedding", _RecordingStub)
+    provider = FastEmbedProvider(model_id="some/model", cache_dir=tmp_path, dim=384)
+
+    out = provider.embed_batch(("a", "bbb", "cc"))
+
+    assert seen_batches == [["a", "bbb", "cc"]]
+    assert [float(v[0]) for v in out] == [1.0, 3.0, 2.0]
+    for v in out:
+        assert isinstance(v, np.ndarray)
+        assert v.dtype == np.float32
+        assert v.shape == (384,)
+
+
+def test_fastembed_provider_embed_batch_empty_never_touches_the_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls = {"n": 0}
+    base_stub = _make_stub_text_embedding(384)
+
+    class _CountingStub(base_stub):
+        def embed(self, texts):
+            calls["n"] += 1
+            yield from super().embed(texts)
+
+    monkeypatch.setattr("fastembed.TextEmbedding", _CountingStub)
+    provider = FastEmbedProvider(model_id="some/model", cache_dir=tmp_path, dim=384)
+
+    assert provider.embed_batch([]) == []
+    assert calls["n"] == 0
+    with pytest.raises(TypeError):
+        provider.embed_batch("abc")  # type: ignore[arg-type]
+    assert calls["n"] == 0
+
+
+def test_fastembed_provider_embed_batch_establishes_real_dim_and_logs_mismatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The batch path shares the dim bookkeeping with `embed`: a batch as the
+    FIRST embed sets the real dim (so `embedding_dim()` needs no probe) and a
+    stale declared dim is logged loudly there too."""
+    monkeypatch.setattr("fastembed.TextEmbedding", _make_stub_text_embedding(1024))
+    provider = FastEmbedProvider(model_id="some/other-model", cache_dir=tmp_path, dim=384)
+
+    with caplog.at_level(logging.ERROR, logger="brain.memory.embeddings"):
+        provider.embed_batch(["x", "y"])
+
+    assert provider._real_dim == 1024  # noqa: SLF001
+    assert "1024" in caplog.text
+    assert "384" in caplog.text
+
+
+def test_fastembed_provider_embed_batch_raises_if_model_returns_wrong_vector_count(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class _Short(_make_stub_text_embedding(384)):
+        def embed(self, texts):
+            yield np.ones(384, dtype=np.float32)  # always one, whatever was asked
+
+    monkeypatch.setattr("fastembed.TextEmbedding", _Short)
+    provider = FastEmbedProvider(model_id="some/model", cache_dir=tmp_path, dim=384)
+
+    with pytest.raises(RuntimeError, match="1 vectors for 3 texts"):
+        provider.embed_batch(["a", "b", "c"])
+
+
+def test_fastembed_provider_embed_batch_serializes_against_embed_and_other_batches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`embed_batch` takes the same instance lock as `embed`: threads mixing
+    single and batch calls on one shared provider never overlap fastembed's
+    unguarded lazy load (`max_concurrent_loads` stays 1). The control test
+    above (`test_stub_race_detector_actually_detects_the_race_when_unserialized`)
+    shows this stub does race when nothing serializes it."""
+    monkeypatch.setattr("fastembed.TextEmbedding", _LazyLoadRaceStubTextEmbedding)
+    provider = FastEmbedProvider(model_id="some/model", cache_dir=tmp_path, dim=384)
+
+    errors: list[BaseException] = []
+    lens: list[int] = []
+    guard = threading.Lock()
+
+    def worker(i: int) -> None:
+        try:
+            if i % 2:
+                got = provider.embed_batch([f"t{i}-a", f"t{i}-b", f"t{i}-c"])
+            else:
+                got = [provider.embed(f"t{i}")]
+            with guard:
+                lens.append(len(got))
+        except BaseException as exc:  # noqa: BLE001 — captured for the assertion
+            with guard:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert not errors, f"concurrent embed/embed_batch calls raised: {errors}"
+    assert sorted(lens) == [1, 1, 1, 1, 3, 3, 3, 3]
+    assert provider._model.max_concurrent_loads == 1  # noqa: SLF001

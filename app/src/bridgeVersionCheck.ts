@@ -24,6 +24,7 @@ import {
   type BridgeHealth,
   type BridgeOverlay,
 } from "./bridge";
+import { errString } from "./lib/errString";
 
 export type BridgeVersionResult =
   | "ok"
@@ -133,7 +134,9 @@ export async function ensureBridgeCurrent(
   //    draining bridge (the old bridge answers /health 200 for up to 30s).
   try {
     await invokeForceRestart(persona);
-  } catch {
+  } catch (e) {
+    // The result alone ("unresolved") can't say why; keep the cause (#365).
+    console.warn(`[bridgeVersionCheck] forced replace failed: ${errString(e)}`);
     return "version_mismatch_unresolved";
   }
 
@@ -146,8 +149,12 @@ export async function ensureBridgeCurrent(
         return "restarted";
       }
     }
-  } catch {
+    console.warn(
+      `[bridgeVersionCheck] recheck still reports ${recheckHealth.version ?? "no version"}, app is ${appVersion}`,
+    );
+  } catch (e) {
     // fetchHealth failing after restart is still unresolved.
+    console.warn(`[bridgeVersionCheck] recheck failed: ${errString(e)}`);
   }
 
   return "version_mismatch_unresolved";

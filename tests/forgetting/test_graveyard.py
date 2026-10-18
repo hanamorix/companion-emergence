@@ -45,7 +45,7 @@ def test_append_writes_jsonl_row(tmp_path):
     assert entry["graveyard_reason"] == "salience<0.10 for 2 consecutive passes"
 
 
-def test_search_returns_substring_matches(tmp_path):
+def test_search_returns_whole_word_matches(tmp_path):
     for i, content in enumerate(["apple pie", "cherry tart", "apple jam"]):
         append(
             tmp_path,

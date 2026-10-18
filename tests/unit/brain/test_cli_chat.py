@@ -131,6 +131,36 @@ def test_chat_repl_produces_response_for_one_turn(capsys: pytest.CaptureFixture)
     assert "FAKE_CHAT" in captured.out
 
 
+def test_chat_repl_starts_a_requested_ram_measurement_only_after_the_reply_is_printed(
+    capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S210: the RAM ladder a flagged turn asked for starts after that reply is
+    finished and printed, never while it is being built."""
+    from brain.memory import floor_startup
+
+    seen: list[str] = []
+    monkeypatch.setattr(
+        floor_startup, "start_requested_ram_figure", lambda: seen.append(capsys.readouterr().out)
+    )
+    with patch("builtins.input", side_effect=["hello there", "exit"]):
+        assert main(["chat", "--persona", "nell", "--no-bridge"]) == 0
+    assert len(seen) == 1, "once per reply"
+    assert "FAKE_CHAT" in seen[0], "the reply was already printed when the hook ran"
+
+
+def test_chat_repl_turn_goes_through_the_reply_signal_the_ram_measurement_watches() -> None:
+    """S218: the measurement thread abandons when a reply starts, and `respond()` is what
+    starts it: one REPL turn raises the started-replies count by exactly one and leaves no
+    reply in flight."""
+    from brain.bridge import cli_throttle
+
+    before = cli_throttle._replies_started  # noqa: SLF001
+    with patch("builtins.input", side_effect=["hello there", "exit"]):
+        assert main(["chat", "--persona", "nell", "--no-bridge"]) == 0
+    assert cli_throttle._replies_started == before + 1  # noqa: SLF001
+    assert cli_throttle.reply_in_flight() is False
+
+
 # ── Missing persona dir ───────────────────────────────────────────────────────
 
 
@@ -295,3 +325,81 @@ def test_chat_repl_close_flag_calls_close_session() -> None:
     assert exit_code == 0
     assert mock_close.call_count == 1
     assert mock_snap.call_count == 0
+
+
+# ── Cost-series samples are saved at exit (S146, S164; criterion CS17c) ───────
+
+
+def _buffer_cost_samples(persona_dir: Path, n: int = 2) -> None:
+    from brain.memory import cost_series
+    from brain.memory.store import MemoryStore
+
+    store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+    try:
+        series = cost_series.CostSeries("rerank")
+        for i in range(1, n + 1):
+            series.record(store, "m", 1000 * i, 0.1 * i)
+    finally:
+        store.close()
+
+
+def _saved_cost_samples(persona_dir: Path) -> int:
+    import sqlite3
+
+    con = sqlite3.connect(persona_dir / "memories.db")
+    try:
+        return con.execute("SELECT COUNT(*) FROM cost_series_samples").fetchone()[0]
+    finally:
+        con.close()
+
+
+def test_chat_one_shot_saves_the_buffered_cost_series_samples_at_exit(persona_dir: Path) -> None:
+    _buffer_cost_samples(persona_dir)
+    exit_code = main(["chat", "--persona", "nell", "--no-bridge", "hello"])
+    assert exit_code == 0
+    assert _saved_cost_samples(persona_dir) >= 2
+
+
+def test_chat_repl_saves_the_buffered_cost_series_samples_at_exit(persona_dir: Path) -> None:
+    _buffer_cost_samples(persona_dir)
+    with patch("builtins.input", side_effect=["exit"]):
+        exit_code = main(["chat", "--persona", "nell", "--no-bridge"])
+    assert exit_code == 0
+    assert _saved_cost_samples(persona_dir) >= 2
+
+
+@pytest.mark.parametrize("repl", [False, True])
+def test_the_exit_flush_runs_before_the_pass2_drain_and_survives_a_failing_drain(
+    persona_dir: Path, repl: bool
+) -> None:
+    """R4-7: the drain is not wrapped and can run long, so the samples are saved
+    first and a drain that raises cannot lose them."""
+    _buffer_cost_samples(persona_dir)
+    order: list[str] = []
+
+    def boom(_persona_dir):
+        order.append("drain")
+        assert _saved_cost_samples(persona_dir) >= 2, "saved before the drain started"
+        raise RuntimeError("drain failed")
+
+    with patch("brain.cli._drain_pass2_at_exit", boom):
+        args = ["chat", "--persona", "nell", "--no-bridge"] + ([] if repl else ["hello"])
+        with patch("builtins.input", side_effect=["exit"]):
+            with pytest.raises(RuntimeError, match="drain failed"):
+                main(args)
+    assert order == ["drain"]
+    assert _saved_cost_samples(persona_dir) >= 2
+
+
+def test_a_failing_cost_series_flush_never_breaks_the_exit(persona_dir: Path) -> None:
+    _buffer_cost_samples(persona_dir)
+    with patch("brain.memory.cost_series.flush", side_effect=RuntimeError("flush failed")):
+        assert main(["chat", "--persona", "nell", "--no-bridge", "hello"]) == 0
+
+
+def test_a_failing_one_shot_turn_still_saves_the_buffered_cost_series_samples(persona_dir: Path) -> None:
+    _buffer_cost_samples(persona_dir)
+    with patch("brain.chat.engine.respond", side_effect=RuntimeError("provider failed")):
+        with pytest.raises(RuntimeError, match="provider failed"):
+            main(["chat", "--persona", "nell", "--no-bridge", "hello"])
+    assert _saved_cost_samples(persona_dir) >= 2

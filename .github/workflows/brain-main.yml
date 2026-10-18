@@ -159,6 +159,22 @@ jobs:
       - name: Verify the signature against the app's pubkey
         run: bash scripts/verify_update_signature.sh dist/manifest.json dist/manifest.json.sig "$PUBKEY"
 
+      - name: Pack manifest + signature into one asset, and verify what it carries
+        # The app reads only manifest.signed.json: one asset is replaced in one go,
+        # so it can never see a new manifest with the old signature (#365).
+        run: |
+          python3 scripts/brain_main_manifest.py envelope --manifest dist/manifest.json \
+            --sig dist/manifest.json.sig --out dist/manifest.signed.json
+          python3 - "$RUNNER_TEMP" <<'PY'
+          import json, pathlib, sys
+          env = json.loads(pathlib.Path("dist/manifest.signed.json").read_bytes())
+          out = pathlib.Path(sys.argv[1])
+          (out / "env-manifest.json").write_bytes(env["manifest"].encode("utf-8"))
+          (out / "env-manifest.json.sig").write_bytes(env["signature"].encode("utf-8"))
+          PY
+          cmp dist/manifest.json "$RUNNER_TEMP/env-manifest.json"
+          bash scripts/verify_update_signature.sh "$RUNNER_TEMP/env-manifest.json" "$RUNNER_TEMP/env-manifest.json.sig" "$PUBKEY"
+
       - name: A tampered manifest must fail verification (pull_request)
         if: github.event_name == 'pull_request'
         run: |
@@ -179,6 +195,7 @@ jobs:
             dist/requirements.txt
             dist/manifest.json
             dist/manifest.json.sig
+            dist/manifest.signed.json
           if-no-files-found: error
 
   # Least privilege: this is the only job that holds a write token, and no
@@ -229,7 +246,19 @@ jobs:
             echo "publish=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          gh release download "$TAG" -p manifest.json -O "$RUNNER_TEMP/published.json" 2>/dev/null || true
+          # No release, or no manifest on it, means nothing is published yet: publish. Any other
+          # failure (network, rate limit, auth) must stop the job; should-publish reads a missing
+          # manifest as "nothing published", so publishing on a blip could replace a newer build (#363).
+          if ! gh release download "$TAG" -p manifest.json -O "$RUNNER_TEMP/published.json" 2>"$RUNNER_TEMP/gh-download.err"; then
+            if grep -qE 'release not found|no assets match' "$RUNNER_TEMP/gh-download.err"; then
+              echo "no published manifest on $TAG yet"
+              rm -f "$RUNNER_TEMP/published.json"
+            else
+              cat "$RUNNER_TEMP/gh-download.err" >&2
+              echo "::error::could not read the published manifest on $TAG; not publishing blind"
+              exit 1
+            fi
+          fi
           python3 scripts/brain_main_manifest.py should-publish --ours "$SHA" \
             --published "$RUNNER_TEMP/published.json" >> "$GITHUB_OUTPUT"
 
@@ -242,10 +271,12 @@ jobs:
               --notes "Signed brain build from main for in-app brain updates (#286). Not an app release."
           fi
           # data first, manifest last: an app reading the old manifest mid-upload
-          # gets a sha256 mismatch and stops (spec §6), never a mixed install
+          # gets a sha256 mismatch and stops (spec §6), never a mixed install.
+          # manifest.signed.json is what the app reads; the separate pair stays
+          # for 0.0.42/0.0.43 apps and for should-publish above (#365).
           gh release upload "$TAG" dist/companion_emergence-*.whl dist/requirements.txt --clobber
-          gh release upload "$TAG" dist/manifest.json dist/manifest.json.sig --clobber
-          keep="$(cd dist && ls companion_emergence-*.whl requirements.txt manifest.json manifest.json.sig)"
+          gh release upload "$TAG" dist/manifest.json dist/manifest.json.sig dist/manifest.signed.json --clobber
+          keep="$(cd dist && ls companion_emergence-*.whl requirements.txt manifest.json manifest.json.sig manifest.signed.json)"
           gh release view "$TAG" --json assets -q '.assets[].name' | while read -r name; do
             grep -qxF "$name" <<<"$keep" || gh release delete-asset "$TAG" "$name" -y
           done

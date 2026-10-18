@@ -174,6 +174,49 @@ class SoulStore:
             ).fetchone()[0]
         )
 
+    def link_source_memory(self, crystallization_id: str, memory_id: str) -> None:
+        """Record that a crystallization was made about an existing memory (#371).
+
+        The side table is created here, lazily and only by this writer (mirrors
+        ``_ensure_voice_evolution_table``), so no code that merely opens a SoulStore writes
+        anything new. ``CREATE TABLE IF NOT EXISTS`` + ``INSERT OR IGNORE`` make two
+        concurrent first-time linkers and a repeated link harmless.
+        """
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS crystallization_sources (
+                crystallization_id TEXT NOT NULL,
+                memory_id          TEXT NOT NULL,
+                linked_at          TEXT NOT NULL,
+                PRIMARY KEY (crystallization_id, memory_id)
+            )
+            """
+        )
+        self._conn.execute(
+            "INSERT OR IGNORE INTO crystallization_sources (crystallization_id, memory_id, linked_at) "
+            "VALUES (?, ?, ?)",
+            (crystallization_id, memory_id, datetime.now(UTC).isoformat()),
+        )
+        self._conn.commit()
+
+    def list_active_source_memory_ids(self) -> list[str]:
+        """Memory ids linked to a non-revoked crystallization, sorted by id (#371).
+
+        Read-only by design: a database that never had a link has no side table and this
+        returns [] without creating one.
+        """
+        exists = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'crystallization_sources'"
+        ).fetchone()
+        if exists is None:
+            return []
+        rows = self._conn.execute(
+            "SELECT DISTINCT s.memory_id FROM crystallization_sources s "
+            "JOIN crystallizations c ON c.id = s.crystallization_id "
+            "WHERE c.revoked_at IS NULL ORDER BY s.memory_id"
+        ).fetchall()
+        return [str(r[0]) for r in rows]
+
     def _ensure_voice_evolution_table(self) -> None:
         """Create the voice_evolution table lazily on first use."""
         self._conn.execute(

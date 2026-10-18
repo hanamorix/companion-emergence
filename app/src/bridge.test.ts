@@ -8,6 +8,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 // two distinct credential payloads, asserted both ways.
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async (cmd: string, args: { persona: string }) => {
+    if (cmd === "force_restart_bridge") return undefined;
     if (cmd !== "get_bridge_credentials") throw new Error(`unexpected cmd ${cmd}`);
     if (args.persona === "alice") {
       return { port: 41001, auth_token: "alice-tok" };
@@ -28,11 +29,15 @@ import {
   fetchPersonaFeed,
   fetchPersonaState,
   getBridgeCredentials,
+  invokeForceRestart,
   newSession,
   rejectVoiceEdit,
   resetBridgeCredentialCache,
+  sendChat,
   setPersonaModel,
+  setPersonaModelFull,
   setPersonaPronouns,
+  shutdownBridge,
   snapshotSession,
   uploadImage,
 } from "./bridge";
@@ -186,6 +191,58 @@ describe("getBridgeCredentials", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(invoke).toHaveBeenCalledTimes(2);
   });
+
+  // #365: a request that failed in flight may already have reached the
+  // bridge, so a non-idempotent POST must not be sent a second time.
+  it.each([
+    ["sendChat", () => sendChat("alice", "session-1", "hi")],
+    ["newSession", () => newSession("alice")],
+    ["snapshotSession", () => snapshotSession("alice", "session-1")],
+    ["shutdownBridge", () => shutdownBridge("alice")],
+  ])("does not replay %s after a network failure at an unchanged address", async (_name, call) => {
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new TypeError("connection reset"))
+      .mockResolvedValue(new Response(JSON.stringify({ entries: [] }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(call()).rejects.toThrow("connection reset");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // The stale credentials were dropped, so the next call re-reads them.
+    await fetchPersonaFeed("alice");
+    expect(invoke).toHaveBeenCalledTimes(2);
+  });
+
+  it("replays a chat POST when the re-read credentials name a new address (the old bridge is gone)", async () => {
+    await getBridgeCredentials("alice"); // cached: port 41001
+    vi.mocked(invoke).mockImplementationOnce(async () => ({ port: 41009, auth_token: "alice-tok-2" }));
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new TypeError("connection refused"))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ reply: "hi", turn: 1 }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(sendChat("alice", "session-1", "hi")).resolves.toMatchObject({ reply: "hi" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1][0]).toBe("http://127.0.0.1:41009/chat");
+  });
+
+  it("replays a chat POST the bridge rejected with 401 (auth runs before the handler)", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response("invalid token", { status: 401 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ reply: "hi", turn: 1 }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(sendChat("alice", "session-1", "hi")).resolves.toMatchObject({ reply: "hi" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("drops cached credentials when the app force-restarts the bridge", async () => {
+    await getBridgeCredentials("alice");
+    await invokeForceRestart("alice");
+    await getBridgeCredentials("alice");
+    const credentialReads = vi.mocked(invoke).mock.calls.filter(([cmd]) => cmd === "get_bridge_credentials");
+    expect(credentialReads).toHaveLength(2);
+  });
 });
 
 describe("fetchPersonaFeed", () => {
@@ -271,12 +328,86 @@ describe("setPersonaModel", () => {
     await expect(setPersonaModel("alice", "haiku")).resolves.toBeUndefined();
   });
 
+  it("setPersonaModelFull also returns the tier fallbacks", async () => {
+    const fb = [{ family: "haiku", wanted: "claude-haiku-5", using: "haiku" }];
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: true, fallbacks: fb }), { status: 200 }),
+    ));
+    await expect(setPersonaModelFull("alice", "claude-sonnet-5")).resolves.toEqual({ checked: true, fallbacks: fb, tiersUnchecked: [] });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: true, tiers_unchecked: ["claude-haiku-5"] }), { status: 200 }),
+    ));
+    await expect(setPersonaModelFull("alice", "claude-sonnet-5")).resolves.toEqual({ checked: true, fallbacks: [], tiersUnchecked: ["claude-haiku-5"] });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, model: "opus" }), { status: 200 }),
+    ));
+    await expect(setPersonaModelFull("alice", "opus")).resolves.toEqual({ checked: undefined, fallbacks: [], tiersUnchecked: [] });
+  });
+
+  it("resolves to the bridge's checked flag for a custom id", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: true }), { status: 200 }),
+    ));
+    await expect(setPersonaModel("alice", "claude-sonnet-5")).resolves.toBe(true);
+
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: false }), { status: 200 }),
+    ));
+    await expect(setPersonaModel("alice", "claude-sonnet-5")).resolves.toBe(false);
+  });
+
   it("throws on a non-2xx response", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ ok: false, error: "unknown_model" }), { status: 400 }),
     ));
 
     await expect(setPersonaModel("alice", "sonnet")).rejects.toThrow("setPersonaModel failed: 400");
+  });
+
+  // #440: a full id is checked by the bridge before it is saved.
+  it("sends a full model id as written", async () => {
+    const spy = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: true }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", spy);
+
+    await setPersonaModel("alice", "claude-sonnet-5");
+
+    expect(JSON.parse(spy.mock.calls[0]![1]!.body as string)).toEqual({ model: "claude-sonnet-5" });
+  });
+
+  it("turns a refused model into the specific message naming it", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({ ok: false, error: "model_unavailable", model: "claude-sonet-5" }),
+        { status: 400 },
+      ),
+    ));
+
+    const err = await setPersonaModel("alice", "claude-sonet-5").catch((e: Error) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toContain('"claude-sonet-5"');
+    expect((err as Error).message).toMatch(/doesn't recognise/i);
+    expect((err as Error).message).not.toMatch(/setPersonaModel failed/);
+  });
+
+  it("does not replay a custom id after a network failure (a replay would run a second check)", async () => {
+    const spy = vi.fn().mockRejectedValue(new TypeError("Failed to fetch"));
+    vi.stubGlobal("fetch", spy);
+
+    await expect(setPersonaModel("alice", "claude-sonnet-5")).rejects.toThrow("Failed to fetch");
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it("still replays an alias after a network failure", async () => {
+    const spy = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockResolvedValue(new Response(JSON.stringify({ ok: true, model: "opus" }), { status: 200 }));
+    vi.stubGlobal("fetch", spy);
+
+    await expect(setPersonaModel("alice", "opus")).resolves.toBeUndefined();
+    expect(spy).toHaveBeenCalledTimes(2);
   });
 });
 

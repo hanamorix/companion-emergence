@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import shutil
 import sys
@@ -645,7 +646,7 @@ def _embed_backfill_handler(args: argparse.Namespace) -> int:
         MIN_CHARS_TO_EMBED,
         run_embedding_backfill_to_completion,
     )
-    from brain.memory.embeddings import build_embedding_provider
+    from brain.memory.embeddings import resolve_embedding_model_id
 
     # `_open_memory_store_for_cli` is documented as opening for "read-only
     # CLI inspection" (its other 3 call sites only ever read) — `MemoryStore`
@@ -659,9 +660,12 @@ def _embed_backfill_handler(args: argparse.Namespace) -> int:
 
     persona_dir = get_persona_dir(args.persona)
     try:
-        provider = build_embedding_provider()
+        # The id only: no provider is built here (constructing one downloads
+        # the model when uncached, even for an empty backlog); the drain builds
+        # its own when there are rows to embed.
+        model_id = resolve_embedding_model_id()
         total_backlog = store.count_unembedded(
-            current_model_id=provider.model_id(), min_chars=MIN_CHARS_TO_EMBED
+            current_model_id=model_id, min_chars=MIN_CHARS_TO_EMBED
         )
 
         if total_backlog == 0:
@@ -670,7 +674,7 @@ def _embed_backfill_handler(args: argparse.Namespace) -> int:
 
         print(
             f"embedding backfill for '{args.persona}': {total_backlog} row(s) to "
-            f"embed (model={provider.model_id()!r})"
+            f"embed (model={model_id!r})"
         )
 
         start = time.monotonic()
@@ -1933,6 +1937,30 @@ def _personas_handler(args: argparse.Namespace) -> int:
     return 0
 
 
+def _flush_cost_series_at_exit(store: MemoryStore) -> None:
+    """`nell chat --no-bridge` exit (name-recall fix S146, S164): this process
+    has no lull cadence to save the cost-series samples it buffered, so it
+    saves them here, in its own try and BEFORE the pass-2 exit drain (which can
+    run for a while and is not wrapped), so the shared series reaches the bridge
+    and later sessions whatever the drain does. Prints nothing; fail-soft."""
+    try:
+        from brain.memory import cost_series
+
+        cost_series.flush(store)
+    except Exception:  # noqa: BLE001 - never let a timing save break an exit
+        logging.getLogger(__name__).warning("cost-series flush at exit failed", exc_info=True)
+    # Name-recall fix S189: records the diagnostics append buffered while the log's
+    # lock was held (same exit, same reason; the call never waits and never raises).
+    try:
+        from brain.memory import recall_diagnostics
+
+        recall_diagnostics.flush_pending(
+            recall_diagnostics.diagnostics_path(Path(store.db_path).parent)
+        )
+    except Exception:  # noqa: BLE001 - never let a diagnostics save break an exit
+        logging.getLogger(__name__).warning("recall diagnostics flush at exit failed", exc_info=True)
+
+
 def _drain_pass2_at_exit(persona_dir: Path) -> None:
     """`nell chat --no-bridge` exit-drain (S78/S80): this process has no
     later lull to wait for (S78 — the round-3 fix's throttle-gated
@@ -1958,6 +1986,41 @@ def _drain_pass2_at_exit(persona_dir: Path) -> None:
     )
 
 
+def _start_floor_bootstrap_for_direct_chat(persona_dir: Path, *, blocking: bool) -> None:
+    """`nell chat --no-bridge` session start (name-recall fix S85 revised, S91):
+    compute the COSINE bootstrap floor ONCE for this process, off the per-turn
+    path (recall only peeks the caches; there is no supervisor here to run the
+    retry job, so the rerank floor is computed on first need and a failed
+    bootstrap retried on each message, both in the background: `respond()`).
+
+    The interactive REPL starts it on a daemon thread so the prompt appears at
+    once (its first turn may be keyword-only if the thread is still running);
+    the one-shot form (`blocking`) computes before its single turn, because
+    that turn is the only one there will be. Fail-soft: never blocks or breaks
+    the chat."""
+    try:
+        from brain.bridge import cli_throttle
+        from brain.memory import floor_startup
+
+        floor_startup.set_activity_marker_provider(cli_throttle.chat_activity_marker)
+        # S201: this process has no lull cadence, so a turn that would rerank with no usable memory model
+        # measures it in the background (the REPL only: the one-shot form's single turn takes the
+        # cosine path and the process ends, a thread would be cut off mid-measurement).
+        floor_startup.enable_background_ram_figure(None if blocking else persona_dir)
+        if blocking:
+            floor_startup.compute_missing_floors(
+                persona_dir, activity_marker=cli_throttle.chat_activity_marker
+            )
+        else:
+            floor_startup.start_background(
+                persona_dir,
+                activity_marker=cli_throttle.chat_activity_marker,
+                name="floor-bootstrap-direct-chat",
+            )
+    except Exception as exc:  # noqa: BLE001 — never break the chat
+        print(f"note: floor bootstrap not started ({exc})", file=sys.stderr)
+
+
 def _chat_direct_mode(args: argparse.Namespace) -> int:
     """Dispatch `nell chat` to the chat engine (in-process, no bridge).
 
@@ -1971,6 +2034,7 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
     from brain.chat.engine import respond
     from brain.chat.session import create_session
     from brain.ingest.pipeline import close_session, extract_session_snapshot
+    from brain.memory import floor_startup
 
     # #203: default exit is a NON-destructive snapshot (matches the GUI, which
     # only ever calls /sessions/snapshot). close_session deletes the buffer,
@@ -1988,8 +2052,19 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
 
     provider_name, _ = _resolve_routing(persona_dir, args)
 
+    one_shot = bool(getattr(args, "message", None))
+    if one_shot:
+        # Synchronous: it finishes before the store opens, so nothing overlaps it.
+        _start_floor_bootstrap_for_direct_chat(persona_dir, blocking=True)
+
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
+        if not one_shot:
+            # The REPL's bootstrap runs on a thread that opens memories.db itself and runs the
+            # schema script. Start it only now that the main thread has created and
+            # integrity-checked the file, so the two never create the file and schema at once
+            # (#414).
+            _start_floor_bootstrap_for_direct_chat(persona_dir, blocking=False)
         from brain.emotion.persona_loader import load_persona_vocabulary
 
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
@@ -2000,13 +2075,18 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
             # One-shot mode
             message = getattr(args, "message", None)
             if message:
-                result = respond(
-                    persona_dir,
-                    message,
-                    store=store,
-                    hebbian=hebbian,
-                    provider=provider,
-                )
+                try:
+                    result = respond(
+                        persona_dir,
+                        message,
+                        store=store,
+                        hebbian=hebbian,
+                        provider=provider,
+                    )
+                except BaseException:
+                    # A failed turn still saves the timings it buffered (S164).
+                    _flush_cost_series_at_exit(store)
+                    raise
                 print(result.content)
                 # Flush conversation through ingest pipeline (best-effort).
                 # Mirrors the REPL's finally block — without this, every
@@ -2028,6 +2108,7 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
                         RuntimeWarning,
                         stacklevel=1,
                     )
+                _flush_cost_series_at_exit(store)
                 _drain_pass2_at_exit(persona_dir)
                 return 0
 
@@ -2056,6 +2137,9 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
                     print(result.content)
                     print()
                     total_tool_calls += len(result.tool_invocations)
+                    # S210: the reply is finished and printed; only now may the RAM
+                    # ladder (S220) a flagged turn asked for start (its sample never spans a reply, S218).
+                    floor_startup.start_requested_ram_figure()
             finally:
                 # Flush conversation through ingest pipeline (best-effort)
                 try:
@@ -2074,6 +2158,7 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
                         RuntimeWarning,
                         stacklevel=1,
                     )
+                _flush_cost_series_at_exit(store)
                 _drain_pass2_at_exit(persona_dir)
                 # Summary
                 print(
@@ -2291,6 +2376,28 @@ def _prompt_choice(label: str, choices: list[str], default: str, help: str = "")
         print(f"  (must be one of: {', '.join(choices)})", file=sys.stderr)
 
 
+def _prompt_model(default: str, help: str = "") -> str:
+    """Interactive model prompt: an alias or a full model id; loops until valid (EOF gives the default)."""
+    from brain.persona_config import MODEL_ID_RULE, is_valid_model
+
+    while True:
+        if help:
+            print(help)
+        raw = _prompt("model [sonnet/opus/haiku or a full id]", default=default)
+        if is_valid_model(raw):
+            return raw
+        print(f"  ({MODEL_ID_RULE})", file=sys.stderr)
+
+
+def _model_arg(value: str) -> str:
+    """argparse type for --model: an alias or a full model id (syntax only, no Claude CLI call)."""
+    from brain.persona_config import MODEL_ID_RULE, is_valid_model
+
+    if not is_valid_model(value):
+        raise argparse.ArgumentTypeError(f"{value!r} is not a valid model: {MODEL_ID_RULE}")
+    return value
+
+
 def _init_handler(args: argparse.Namespace) -> int:
     """Set up a new persona — interactive wizard or flag-driven.
 
@@ -2360,17 +2467,16 @@ def _init_handler(args: argparse.Namespace) -> int:
         return 1
 
     if model is None:
-        from brain.persona_config import DEFAULT_MODEL, KNOWN_MODELS
+        from brain.persona_config import DEFAULT_MODEL
 
         print()
-        model = _prompt_choice(
-            "model",
-            choices=sorted(KNOWN_MODELS),
+        model = _prompt_model(
             default=DEFAULT_MODEL,
             help=(
                 "  sonnet — fast, smart, ~$3 per million input tokens (recommended)\n"
                 "  opus   — smartest, ~$15 per million input tokens (best for deep writing)\n"
-                "  haiku  — fastest, cheapest, less capable"
+                "  haiku  — fastest, cheapest, less capable\n"
+                "  or a full model id such as claude-sonnet-5 (checked when first used)"
             ),
         )
 
@@ -2434,6 +2540,10 @@ def _init_handler(args: argparse.Namespace) -> int:
         f"  - {config_path.name}: user_name={user_name!r}, "
         f"user_pronouns={user_pronouns!r}, model={model!r}"
     )
+    from brain.persona_config import KNOWN_MODELS as _ALIASES
+
+    if model not in _ALIASES:
+        print(f"  - model {model} will be checked when first used")
     if voice_path is not None:
         print(f"  - {voice_path.name}: copied from '{voice_template}' template")
         if voice_template == "nell-example":
@@ -2446,6 +2556,70 @@ def _init_handler(args: argparse.Namespace) -> int:
         print(f"  - migrated from {migrate_from}")
     print()
     print(f"next: uv run nell chat --persona {persona}")
+    return 0
+
+
+def _model_cfg_path(persona: str) -> Path | None:
+    """The persona's config path, or None (after printing the error) when the persona does not exist."""
+    persona_dir = get_persona_dir(persona)
+    if not persona_dir.is_dir():
+        print(f"error: persona '{persona}' not found (see: nell personas)", file=sys.stderr)
+        return None
+    return persona_dir / "persona_config.json"
+
+
+def _model_show_handler(args: argparse.Namespace) -> int:
+    from brain.bridge.model_tier import ROUTED_CLAUDE_TIERS, _resolve
+    from brain.persona_config import PersonaConfig
+
+    path = _model_cfg_path(args.persona)
+    if path is None:
+        return 1
+    cfg = PersonaConfig.load(path)
+    print(f"chat model: {cfg.model}")
+    print("background models (tier: model (source)):")
+    for tier in ROUTED_CLAUDE_TIERS:
+        model, source = _resolve(cfg, tier)
+        print(f"  {tier}: {model} ({source})")
+    print("this shows the saved settings; runtime fallbacks appear in the app (connection panel)")
+    if cfg.derived_unavailable:
+        print(
+            "note: "
+            + ", ".join(cfg.derived_unavailable)
+            + " was not available when the chat model was last saved; it is tested again when the chat "
+            "model is re-applied in the picker"
+        )
+    return 0
+
+
+def _model_set_tier_handler(args: argparse.Namespace) -> int:
+    """Syntax-only: no Claude CLI call. A model Claude rejects shows up in the bridge log and in the app."""
+    from brain.persona_config import MODEL_ID_RULE, PersonaConfig, is_valid_model
+
+    if not is_valid_model(args.model):
+        print(f"error: {args.model!r} is not a valid model: {MODEL_ID_RULE}", file=sys.stderr)
+        return 1
+    path = _model_cfg_path(args.persona)
+    if path is None:
+        return 1
+    cfg = PersonaConfig.load(path)  # read right before the write: the bridge may have saved meanwhile
+    cfg.tier_models = {**cfg.tier_models, args.tier: args.model}
+    cfg.save(path)
+    print(f"{args.tier} now uses {args.model} (checked when first used)")
+    return 0
+
+
+def _model_clear_tier_handler(args: argparse.Namespace) -> int:
+    from brain.persona_config import PersonaConfig
+
+    path = _model_cfg_path(args.persona)
+    if path is None:
+        return 1
+    cfg = PersonaConfig.load(path)
+    if args.tier in cfg.tier_models:
+        cfg.tier_models = {k: v for k, v in cfg.tier_models.items() if k != args.tier}
+        cfg.save(path)
+    print(f"{args.tier} follows the chat model again")
     return 0
 
 
@@ -2513,9 +2687,10 @@ def _build_parser() -> argparse.ArgumentParser:
     init_sub.add_argument(
         "--model",
         default=None,
-        choices=["haiku", "opus", "sonnet"],
+        type=_model_arg,
         help=(
-            "Claude model to use (sonnet/opus/haiku). Default: sonnet. "
+            "Claude model to use: sonnet, opus, haiku or a full model id such as claude-sonnet-5. "
+            "A full id is not checked now; it is checked when first used. Default: sonnet. "
             "Prompts if omitted and running interactively."
         ),
     )
@@ -3330,6 +3505,35 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Output as JSON array.",
     )
     personas_sub.set_defaults(func=_personas_handler)
+
+    # nell model — which models the background jobs use (#441)
+    from brain.persona_config import ROUTED_TIER_NAMES
+
+    model_sub = subparsers.add_parser(
+        "model",
+        help="Show or set the models the background jobs use (they follow the chat model's version by default).",
+    )
+    model_actions = model_sub.add_subparsers(dest="model_action", required=True)
+
+    m_show = model_actions.add_parser("show", help="Show the chat model and each background tier's model.")
+    m_show.add_argument("--persona", default=None, help="Persona name (defaults to the only installed one).")
+    m_show.set_defaults(func=_model_show_handler)
+
+    m_set = model_actions.add_parser(
+        "set-tier",
+        help="Pin one background tier to a model (an alias or a full id such as claude-haiku-4-5).",
+    )
+    m_set.add_argument("tier", choices=list(ROUTED_TIER_NAMES))
+    m_set.add_argument("model")
+    m_set.add_argument("--persona", default=None, help="Persona name (defaults to the only installed one).")
+    m_set.set_defaults(func=_model_set_tier_handler)
+
+    m_clear = model_actions.add_parser(
+        "clear-tier", help="Remove a tier's pinned model so it follows the chat model again."
+    )
+    m_clear.add_argument("tier", choices=list(ROUTED_TIER_NAMES))
+    m_clear.add_argument("--persona", default=None, help="Persona name (defaults to the only installed one).")
+    m_clear.set_defaults(func=_model_clear_tier_handler)
 
     # nell kindled — Kindled-link identity management (Task 7)
     kindled_sub = subparsers.add_parser(

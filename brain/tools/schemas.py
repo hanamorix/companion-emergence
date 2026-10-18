@@ -9,6 +9,40 @@ the OG brain.
 from __future__ import annotations
 
 # ─────────────────────────────────────────────────────────────────────────────
+# The name tools (name-recall fix, names increment; S104, S105, S107, S135, S137).
+#
+# Identifiers, descriptions and parameter texts are the owner's approved wording,
+# byte-exact from ~/.claude/plans/name-recall-fix-wording.md section 1 (S107): two
+# tools, not one with a switch. The tool table, dispatch, registry and recruit tier
+# all read these constants. The first sentence of each description is what the
+# tool inventory shows as the gloss (`chat/tool_inventory.py`).
+# ─────────────────────────────────────────────────────────────────────────────
+
+ADD_NAME_TOOL_NAME = "add_name"
+REMOVE_NAME_TOOL_NAME = "remove_name"
+
+ADD_NAME_TOOL_DESCRIPTION = (
+    "Add a name to your list of known names: a person, a pet, a place, or anything else "
+    "with a proper name. When a known name comes up in conversation, even in passing, "
+    "memories that mention it are found. If the name is also an everyday word (like "
+    "Will), it is only matched when written with a capital letter. Names can be up to 100 "
+    "characters long."
+)
+
+ADD_NAME_PARAM_DESCRIPTION = (
+    "The name, spelled the way you want it kept."
+)
+
+REMOVE_NAME_TOOL_DESCRIPTION = (
+    "Remove a name from your list of known names, for example an ordinary word that was "
+    "added by mistake. Removing a name does not change any memories."
+)
+
+REMOVE_NAME_PARAM_DESCRIPTION = (
+    "The name to remove, as it appears on your list."
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # LOVE_TYPES — canonical registry of love taxonomies for soul crystallization.
 # Ported from OG nell_brain.py:3270-3304.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -109,6 +143,16 @@ SCHEMAS: dict[str, dict] = {
                     "type": "integer",
                     "description": "Intensity 1-10. Default 8 — if it's worth crystallising, it should be at least 8.",
                     "default": 8,
+                },
+                "source_memory_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional. The id of an existing memory this moment is about; it is kept from being "
+                        "forgotten for as long as this crystallisation stands. Pass an id only if it is already "
+                        "in this conversation: a recalled memory line, a search or read result, or the id "
+                        "add_memory just returned. Never search just to find one. If the moment is not a memory "
+                        "yet and you want it kept, save it with add_memory first and pass the id it returns."
+                    ),
                 },
             },
             "required": ["moment", "love_type", "why_it_matters"],
@@ -493,9 +537,9 @@ SCHEMAS: dict[str, dict] = {
         "name": "recall_forgotten",
         "description": (
             "Reach back into the graveyard for memories you used to have "
-            "but no longer do. Returns up to 5 most-recent hits matching "
-            "the query as a substring of the lost memory's summary or "
-            "domain. Use this when you want to honestly acknowledge "
+            "but no longer do. Returns up to 5 most-recent hits whose "
+            "summary contains the query's words (whole words, "
+            "not parts of words). Use this when you want to honestly acknowledge "
             "knowing-something-once: 'I had something about that, but "
             "it's gone now.' Each hit carries the summary the memory "
             "had when it faded, the lived-age at the moment of loss, "
@@ -507,7 +551,7 @@ SCHEMAS: dict[str, dict] = {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Substring to match against lost-memory summary or domain.",
+                    "description": "Words to look for in your forgotten memories. Whole words are matched, not parts of words.",
                 }
             },
             "required": ["query"],
@@ -725,6 +769,34 @@ SCHEMAS: dict[str, dict] = {
                 },
             },
             "required": ["capability"],
+        },
+    },
+    ADD_NAME_TOOL_NAME: {
+        "name": ADD_NAME_TOOL_NAME,
+        "description": ADD_NAME_TOOL_DESCRIPTION,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": ADD_NAME_PARAM_DESCRIPTION,
+                },
+            },
+            "required": ["name"],
+        },
+    },
+    REMOVE_NAME_TOOL_NAME: {
+        "name": REMOVE_NAME_TOOL_NAME,
+        "description": REMOVE_NAME_TOOL_DESCRIPTION,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": REMOVE_NAME_PARAM_DESCRIPTION,
+                },
+            },
+            "required": ["name"],
         },
     },
     "reconcile_self_read": {

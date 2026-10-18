@@ -6,7 +6,7 @@
 # pnpm test, pnpm build (tsc+vite), cargo — but only AFTER the tag ref exists.
 # Any of five cheap-to-check faults (six-file version drift, a pre-release
 # identifier in a version file, a dirty lockfile, a tsc error vitest doesn't
-# catch, a pytest failure hidden by a truncated tail) forces a
+# catch, a pytest failure or ERROR hidden by a truncated tail) forces a
 # delete-tag → re-tag → re-sync round-trip. This runs the identical checks
 # up front so those become a pre-tag red/green.
 #
@@ -75,20 +75,21 @@ if uv sync --all-extras --locked >"$LOG_DIR/sync.log" 2>&1; then ok "locked sync
 else bad "uv sync --locked failed (see $LOG_DIR/sync.log)"; fi
 
 # ---------------------------------------------------------------------------
-# 3. Backend: full pytest (grep FAILED — never judge from a truncated tail)
+# 3. Backend: full pytest, judged by exit status + FAILED/ERROR lines (#363)
 # ---------------------------------------------------------------------------
-step "backend pytest (full run, checked by grep '^FAILED')"
+step "backend pytest (full run, judged by exit status and FAILED/ERROR lines)"
 uv run pytest -q -p no:randomly >"$LOG_DIR/pytest.log" 2>&1
-if grep -q '^FAILED' "$LOG_DIR/pytest.log"; then
-  bad "pytest failures:"; grep '^FAILED' "$LOG_DIR/pytest.log" | sed 's/^/     /' >&2
-else
-  tail -1 "$LOG_DIR/pytest.log" | grep -q "passed" && ok "$(tail -1 "$LOG_DIR/pytest.log")" \
-    || bad "pytest produced no pass summary (see $LOG_DIR/pytest.log)"
-fi
+pytest_rc=$?
+if verdict=$(bash scripts/pytest_verdict.sh "$LOG_DIR/pytest.log" "$pytest_rc" 2>&1); then ok "$verdict"
+else bad "pytest not green:"; printf '%s\n' "$verdict" | sed 's/^/     /' >&2; fi
 
 step "ruff (uv run ruff check .)"
 if uv run ruff check . >"$LOG_DIR/ruff.log" 2>&1; then ok "ruff clean"
 else bad "ruff findings (see $LOG_DIR/ruff.log)"; fi
+
+step "Windows-pitfall lint (blocking; a reviewed exception carries '# windows-lint: ok -- why')"
+if uv run python scripts/lint_windows_pitfalls.py --strict >"$LOG_DIR/winlint.log" 2>&1; then ok "no unreviewed Windows footguns"
+else bad "Windows-pitfall lint findings (see $LOG_DIR/winlint.log)"; cat "$LOG_DIR/winlint.log" >&2; fi
 
 # ---------------------------------------------------------------------------
 # 4. Frontend: pnpm test + pnpm build (tsc catches what vitest can't)

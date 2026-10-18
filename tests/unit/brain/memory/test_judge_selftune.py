@@ -101,8 +101,8 @@ def test_tune_grade_order_is_weak_to_beefy() -> None:
 
 
 # ---------------------------------------------------------------------------
-# _read_total_ram_bytes — mirrors reranker._proc_meminfo_available_bytes's
-# shape, MemTotal instead of MemAvailable.
+# _read_total_ram_bytes — mirrors the shape of the reranker's former
+# /proc/meminfo free-memory reader, MemTotal instead of MemAvailable.
 # ---------------------------------------------------------------------------
 
 
@@ -217,6 +217,53 @@ def test_oom_guard_downgrades_to_knob_refit_when_only_the_floor_fits() -> None:
     headroom = judge_selftune.JUDGE_TUNE_FOOTPRINT_KNOB_REFIT_BYTES
     result = judge_selftune._downgrade_for_oom_safety(judge_selftune.TUNE_GRADE_FULL_FT, headroom)
     assert result == judge_selftune.TUNE_GRADE_KNOB_REFIT
+
+
+def test_oom_guard_zero_headroom_floors_to_knob_refit() -> None:
+    """A headroom of exactly 0.0 (a cgroup at its memory.high or memory.max) fits nothing but the floor."""
+    result = judge_selftune._downgrade_for_oom_safety(judge_selftune.TUNE_GRADE_FULL_FT, 0.0)
+    assert result == judge_selftune.TUNE_GRADE_KNOB_REFIT
+
+
+def test_oom_guard_docstring_names_the_psutil_fallback_not_meminfo() -> None:
+    """S239: the headroom helper reads psutil's host-wide available figure, not /proc/meminfo."""
+    doc = judge_selftune._downgrade_for_oom_safety.__doc__ or ""
+    assert "psutil" in doc
+    assert "host-wide `/proc/meminfo`" not in doc and "cgroup/meminfo" not in doc
+
+
+def test_oom_guard_docstring_states_the_smaller_of_the_cgroup_and_psutil_figures() -> None:
+    """S241: the helper returns the smaller of the cgroup figure and psutil's, not psutil only when no cgroup
+    level could be measured."""
+    doc = " ".join((judge_selftune._downgrade_for_oom_safety.__doc__ or "").split())
+    assert "smaller of" in doc and "only when no cgroup level could be measured" not in doc
+
+
+def test_oom_guard_through_the_real_headroom_reader_takes_the_smaller_of_cgroup_and_psutil(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S241 through the caller: a cgroup cap far above the host's free memory (200 GB of room) must not keep the
+    beefy tier when the host has 2 GB available; and a cgroup figure below the host's decides when it is smaller.
+    Both readings come through the REAL `_available_ram_headroom_bytes` (only its sources are patched)."""
+    from brain.memory import reranker as reranker_mod
+
+    monkeypatch.setattr(reranker_mod, "_cgroup_v2_memory_headroom_bytes", lambda: 200e9)
+    monkeypatch.setattr(reranker_mod, "_cgroup_v1_memory_headroom_bytes", lambda: None)
+    monkeypatch.setattr(reranker_mod, "_psutil_available_bytes", lambda: 2e9)
+    headroom = judge_selftune._available_ram_headroom_bytes()
+    assert headroom == 2e9
+    assert (
+        judge_selftune._downgrade_for_oom_safety(judge_selftune.TUNE_GRADE_FULL_FT, headroom)
+        == judge_selftune.TUNE_GRADE_KNOB_REFIT
+    )
+    monkeypatch.setattr(reranker_mod, "_cgroup_v2_memory_headroom_bytes", lambda: 8e9)
+    monkeypatch.setattr(reranker_mod, "_psutil_available_bytes", lambda: 64e9)
+    headroom = judge_selftune._available_ram_headroom_bytes()
+    assert headroom == 8e9
+    assert (
+        judge_selftune._downgrade_for_oom_safety(judge_selftune.TUNE_GRADE_FULL_FT, headroom)
+        == judge_selftune.TUNE_GRADE_LORA
+    )
 
 
 def test_oom_guard_none_headroom_fails_toward_knob_refit() -> None:

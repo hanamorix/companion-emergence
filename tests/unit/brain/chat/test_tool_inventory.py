@@ -27,8 +27,10 @@ def test_inventory_renders_full_registry_not_a_subset() -> None:
     inventory's whole job is telling her what exists when it is not in hand, so
     it must never render the recruited subset."""
     out = build_tool_inventory("Nell")
-    assert len(NELL_TOOL_NAMES) == 28
-    assert sum(1 for n in NELL_TOOL_NAMES if f"`{n}`" in out) == 28
+    # 28 before the name-recall fix added the add-name tool (S69), 29 with it, 30 with
+    # remove_name (names increment, S107).
+    assert len(NELL_TOOL_NAMES) == 30
+    assert sum(1 for n in NELL_TOOL_NAMES if f"`{n}`" in out) == 30
 
 
 def test_inventory_carries_the_reach_valve() -> None:
@@ -168,3 +170,15 @@ def test_schema_prose_is_british_but_identifiers_are_not() -> None:
     # the underscore in crystallize_soul denies it one.
     assert "crystallize_soul" in schemas, "the tool's dict key was renamed"
     assert schemas["crystallize_soul"]["name"] == "crystallize_soul"
+
+
+def test_add_name_tool_line_says_what_the_tool_does() -> None:
+    """The inventory gloss is the description's first sentence: it must be the sentence
+    that says what the tool does, not the placeholder marker sentence (N2)."""
+    from brain.tools.schemas import ADD_NAME_TOOL_NAME
+
+    line = next(
+        ln for ln in build_tool_inventory("Nell").splitlines() if f"`{ADD_NAME_TOOL_NAME}`" in ln
+    )
+    assert "Add a name to your list of known names" in line
+    assert "PLACEHOLDER" not in line

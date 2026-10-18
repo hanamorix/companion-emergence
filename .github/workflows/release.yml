@@ -203,7 +203,7 @@ jobs:
 
       - name: cargo test
         working-directory: app/src-tauri
-        run: cargo test
+        run: cargo test --no-fail-fast
 
       - name: Wheel/sdist smoke
         run: bash scripts/smoke_test_wheel.sh
@@ -328,6 +328,19 @@ jobs:
             --fresh
           NELLBRAIN_HOME="$TMP_HOME" "$PY" -c "import os; from pathlib import Path; assert (Path(os.environ['NELLBRAIN_HOME']) / 'personas' / 'smoke_persona' / 'persona_config.json').is_file()"
           NELLBRAIN_HOME="$TMP_HOME" "${NELL[@]}" status --persona smoke_persona
+        shell: bash
+
+      # #408: the Linux "nell" shortcut runs the AppImage with --companion-nell-cli. This is a
+      # RELEASE-time gate (this workflow runs only on a release tag): it checks, with the real
+      # AppImage, that python starts under AppRun's environment, the caller's directory is restored
+      # and the exit status is passed through. It runs before signing and publishing, so a failure
+      # stops this leg's assets. The same script can be run by hand against any built AppImage.
+      - name: Smoke AppImage CLI mode
+        if: runner.os == 'Linux'
+        working-directory: app/src-tauri
+        run: |
+          APPIMAGE="$(ls target/release/bundle/appimage/*.AppImage | head -1)"
+          bash ../../scripts/appimage_cli_smoke.sh "$APPIMAGE"
         shell: bash
 
       - name: Prepare release artifacts and checksums
