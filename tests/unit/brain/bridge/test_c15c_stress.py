@@ -249,6 +249,7 @@ class _StressResult:
     forgetting_cursor: dict = dataclasses.field(default_factory=dict)
     forgetting_state_file: bool = False
     oracle_error: str | None = None
+    loop_join_s: float = 0.0
 
 
 def _read_window_end_oracle(persona_dir: Path, result: _StressResult) -> None:
@@ -335,7 +336,9 @@ def _run_stress_window(
     finally:
         stop_writer.set()
         stop_event.set()
+        joining_since = time.monotonic()
         loop.join(join_timeout_s)
+        result.loop_join_s = time.monotonic() - joining_since
         writer.join(writer_join_timeout_s)
         if not loop.joined:
             cli_throttle.note_user_message()  # cleanup only, after the result is recorded
@@ -493,7 +496,7 @@ def test_c15c_heartbeat_and_gated_items_60s_with_concurrent_writes_no_lock_error
         f"decayed={[hb.get('memories_decayed') for hb in heartbeats]} "
         f"non_active_rows={result.non_active_rows} "
         f"cursor={bool(result.forgetting_cursor)} state_file={result.forgetting_state_file} "
-        f"bumps={result.bumps}"
+        f"bumps={result.bumps} loop_join_s={result.loop_join_s:.2f}"
     )
 
 
