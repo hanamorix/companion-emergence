@@ -105,6 +105,14 @@ def test_other_failures_become_dprovider(original: Exception) -> None:
         "ClaudeCliProvider: unexpected output format: 'accurate and moderate'",
         "ClaudeCliProvider failed (exit 1): wrote 429 bytes, pid 14290",
         "unable to operate; will iterate and migrate",
+        "context limit exceeded",
+        "You've hit your context limit",
+        "limit of 5 items exceeded",
+        "unlimited",
+        # _stdout_shape lists frame kinds in parse-failure details; a routine
+        # rate_limit_event frame must not read as a rate limit.
+        "ClaudeCliProvider failed (exit 1): stdout=4 frame(s), last=assistant: "
+        "system/init x1, assistant x1, rate_limit_event x1, system/post_turn_summary x1",
     ],
 )
 def test_ordinary_words_and_numbers_are_not_rate_limits(text: str) -> None:
@@ -121,6 +129,17 @@ def test_ordinary_words_and_numbers_are_not_rate_limits(text: str) -> None:
         "Rate limit exceeded",
         "rate_limit_error",
         "You've hit your usage limit",
+        # Real texts found in the repo's fixtures (test_provider.py, test_provider_chat.py).
+        "api_error_status=429; is_error=True; You're out of extra usage \u00b7 resets 1:50pm",
+        "You're out of extra usage",
+        # A 429 named as an API error with no limit phrase, and usage-limit wordings.
+        "API Error: 429",
+        "API Error: Request rejected (429)",
+        "5-hour limit reached",
+        "Opus weekly limit reached",
+        "You've hit your limit",
+        "You've reached your usage limit",
+        "rate limiting in effect",
     ],
 )
 def test_real_rate_limits_are_classified(text: str) -> None:

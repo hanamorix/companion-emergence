@@ -580,17 +580,23 @@ def _emit_supervisor_event(event: dict) -> None:
 
 
 # A rate limit is recognised by the structured status the provider formats
-# (`api_error_status=429`), an HTTP 429 phrase, or the CLI's own limit wording.
-# A bare "429" / "rate" substring also matched "generate", "separate" and any
-# number containing 429, and a rate-limit result demotes the whole queue to
-# draft space (see run_initiate_review_tick), so the match is phrase-bound.
+# (`api_error_status=429`), a 429 named as an API/HTTP error, or the CLI's own
+# limit wording ("You've hit your session limit", "You're out of extra usage",
+# "5-hour limit reached"). A bare "429" / "rate" substring also matched "generate",
+# "separate" and any number containing 429, and a rate-limit result demotes the
+# whole queue to draft space (see run_initiate_review_tick), so every match is
+# phrase-bound. `rate_limit_event` is excluded: it is the name of a routine
+# stream frame that `_stdout_shape` lists in unrelated parse-failure details.
 _RATE_LIMIT_RE = re.compile(
     r"api_error_status\s*[=:]\s*429\b"
+    r"|\bapi error\b[^\n]{0,40}?\b429\b"
     r"|\bhttp[ /]*429\b"
     r"|\bstatus[ =:]+429\b"
     r"|\btoo many requests\b"
-    r"|\brate[ _-]?limit(?:ed|s|ing)?(?![a-z])"
-    r"|\b(?:session|usage|weekly) limit\b"
+    r"|\brate[ _-]?limit(?!_event)(?:ed|s|ing)?(?![a-z])"
+    r"|\b(?:session|usage|weekly|daily|monthly|opus|sonnet|haiku|\d+-(?:hour|day)) limit\b"
+    r"|\b(?:hit|reached) your (?:(?:session|usage|weekly|daily|monthly|opus|sonnet) )?limit\b"
+    r"|\bout of (?:extra )?usage\b"
 )
 
 
