@@ -49,7 +49,7 @@ def test_show_lists_the_chat_model_and_each_tier_with_its_source(persona_dir: Pa
     assert f"{TIER_COMPACTION}: claude-haiku-4-5 (override)" in out
     assert f"{TIER_BACKGROUND_CLASSIFIER}: haiku (fallback)" in out
     assert "background-generative: claude-sonnet-5 (derived)" in out
-    assert "again when the chat model is re-applied in the picker" in out
+    assert "when the bridge starts and when the chat model is applied again in the picker" in out
 
 
 def test_show_with_an_alias_chat_model_lists_todays_defaults(persona_dir: Path, capsys):

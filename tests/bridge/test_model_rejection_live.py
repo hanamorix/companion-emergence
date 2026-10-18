@@ -54,6 +54,8 @@ def test_generate_path_rejection_is_recognised_and_matches_the_pinned_sentence()
     assert model_error.is_model_rejection(text), text
     assert _pinned_sentence(BOGUS) in text, text
     assert model_error.rejected_model_name(text, None) == BOGUS
+    # #448: the json argv carries the numeric status (it has no error code, only the stream-json frames do)
+    assert "api_error_status=404" in text, text
 
 
 def test_chat_stream_path_rejection_is_recognised_and_matches_the_pinned_sentence():
@@ -64,3 +66,5 @@ def test_chat_stream_path_rejection_is_recognised_and_matches_the_pinned_sentenc
     assert model_error.is_model_rejection(text), text
     assert _pinned_sentence(BOGUS) in text, text
     assert model_error.rejected_model_name(text, None) == BOGUS
+    # #448: the structured signals reach the detector on the streaming path too
+    assert "api_error_status=404" in text and "error=model_not_found" in text, text

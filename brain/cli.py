@@ -2577,6 +2577,11 @@ def _model_show_handler(args: argparse.Namespace) -> int:
         return 1
     cfg = PersonaConfig.load(path)
     print(f"chat model: {cfg.model}")
+    if cfg.provider == "claude-cli" and cfg.model_unsupported is not None:
+        print(
+            f"warning: the model {cfg.model_unsupported_display()!r} in this persona's settings is not supported, "
+            f"so {cfg.model} is being used instead (supported: sonnet, opus, haiku or a full id such as claude-sonnet-5)"
+        )
     print("background models (tier: model (source)):")
     for tier in ROUTED_CLAUDE_TIERS:
         model, source = _resolve(cfg, tier)
@@ -2586,8 +2591,8 @@ def _model_show_handler(args: argparse.Namespace) -> int:
         print(
             "note: "
             + ", ".join(cfg.derived_unavailable)
-            + " was not available when the chat model was last saved; it is tested again when the chat "
-            "model is re-applied in the picker"
+            + " was not available when the chat model was last saved; it is tested again when the bridge "
+            "starts and when the chat model is applied again in the picker"
         )
     return 0
 

@@ -891,3 +891,42 @@ describe("ConnectionPanel: nell shortcut button", () => {
     await waitFor(() => expect(screen.getByText(NO_FUSE_TEXT)).toBeInTheDocument());
   });
 });
+
+// ── Unsupported model setting (#446) ──────────────────────────────
+
+describe("ConnectionPanel — unsupported model setting (#446)", () => {
+  const sonnetState = (extra: Partial<PersonaState> = {}) =>
+    baseState({
+      connection: { provider: "claude-cli", model: "sonnet", last_heartbeat_at: null },
+      ...extra,
+    });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getClientPlatform).mockReturnValue("macos");
+  });
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("shows a plain line for an unsupported model setting, naming the value and Sonnet", () => {
+    render(<ConnectionPanel state={sonnetState({ model_unsupported: "fable" })} persona="test" />);
+    const line = screen.getByText(/The model "fable" in your settings is not supported/);
+    expect(line).toHaveTextContent(/Sonnet is being used instead/);
+    expect(line).toHaveAttribute("role", "status");
+    expect(line.textContent).not.toContain("—");
+  });
+
+  it("shows no unsupported-model line when the field is null or missing", () => {
+    const { rerender } = render(<ConnectionPanel state={sonnetState({ model_unsupported: null })} persona="test" />);
+    expect(screen.queryByText(/is not supported/)).not.toBeInTheDocument();
+    rerender(<ConnectionPanel state={sonnetState()} persona="test" />);
+    expect(screen.queryByText(/is not supported/)).not.toBeInTheDocument();
+  });
+
+  it("lets the user apply Sonnet from the picker while the unsupported line is shown", () => {
+    render(<ConnectionPanel state={sonnetState({ model_unsupported: "fable" })} persona="test" />);
+    fireEvent.click(screen.getByRole("button", { name: /change model/i }));
+    expect(screen.getByRole("button", { name: /^apply$/i })).not.toBeDisabled();
+  });
+});

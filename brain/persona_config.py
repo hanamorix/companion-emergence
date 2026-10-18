@@ -77,6 +77,19 @@ def _warn_bad_once(key: str, value: object, why: str) -> None:
     logger.warning("PersonaConfig: dropping %s=%r (%s)", key, value, why)
 
 
+def _warn_unknown_model_once(value: str) -> None:
+    """The unsupported-model warning, once per value per process (loads happen per background call)."""
+    ident = ("model", repr(value)[:80])
+    if ident in _warned_bad_values:
+        return
+    if len(_warned_bad_values) >= 64:
+        _warned_bad_values.clear()
+    _warned_bad_values.add(ident)
+    logger.warning(
+        "PersonaConfig: unknown model %r — falling back to %r (supported: %s)", value, DEFAULT_MODEL, MODEL_ID_RULE
+    )
+
+
 MODEL_ID_RULE = (
     "use sonnet, opus or haiku, or a full id that starts with claude- and has only lowercase letters, "
     f"digits, dots and dashes, at most {MODEL_ID_MAX_LENGTH} characters"
@@ -147,6 +160,25 @@ class PersonaConfig:
     # #441: derived tier ids a save-time check found Claude rejecting; those tiers use what they use today.
     # Written only when non-empty; rewritten whenever the chat model is saved.
     derived_unavailable: list = field(default_factory=list)
+    # #446: the raw `model` value a hand edit left in the file when it is not an alias or a valid full id. The
+    # config then runs the default, and this remembers what was replaced so the app and `nell model show` can
+    # say so. In memory only (never its own JSON key): `save()` writes it back into the `model` key while the
+    # object still holds the fallback, so another writer's load -> save does not erase the owner's text. Every
+    # writer that SETS the model goes through `set_model`, which clears it.
+    model_unsupported: str | None = None
+
+    def set_model(self, model: str) -> None:
+        """Set the chat model deliberately: the unsupported value (if any) is no longer being replaced."""
+        self.model = model
+        self.model_unsupported = None
+
+    def model_unsupported_display(self) -> str | None:
+        """The replaced value made safe to show: control characters removed, cut at the id length cap."""
+        raw = self.model_unsupported
+        if raw is None:
+            return None
+        clean = "".join(ch for ch in raw if ch.isprintable())
+        return clean if len(clean) <= MODEL_ID_MAX_LENGTH else clean[:MODEL_ID_MAX_LENGTH] + "…"
 
     def touch_last_opened(self) -> None:
         """Set last_opened_at to current UTC time, ISO8601 with Z suffix."""
@@ -205,15 +237,14 @@ class PersonaConfig:
         )
         model_raw = data.get("model", DEFAULT_MODEL)
         model_str = model_raw if isinstance(model_raw, str) and model_raw else DEFAULT_MODEL
+        model_unsupported: str | None = None
         if is_valid_model(model_str):
             model = model_str
         else:
-            logger.warning(
-                "PersonaConfig: unknown model %r — falling back to %r",
-                model_str,
-                DEFAULT_MODEL,
-            )
+            _warn_unknown_model_once(model_str)
             model = DEFAULT_MODEL
+            if model_str != DEFAULT_MODEL:
+                model_unsupported = model_str
         tier_models: dict[str, str] = {}
         tier_models_raw = data.get("tier_models")
         if isinstance(tier_models_raw, dict):
@@ -252,6 +283,7 @@ class PersonaConfig:
             kindled_relay_url=kindled_relay_url,
             tier_models=tier_models,
             derived_unavailable=derived_unavailable,
+            model_unsupported=model_unsupported,
         )
 
     @classmethod
@@ -288,7 +320,12 @@ class PersonaConfig:
             "searcher": self.searcher,
             "mcp_audit_log_level": self.mcp_audit_log_level,
             "user_name": self.user_name,
-            "model": self.model,
+            # #446: while the object still holds the fallback, the owner's unsupported text stays in the file
+            "model": (
+                self.model_unsupported
+                if self.model_unsupported is not None and self.model == DEFAULT_MODEL
+                else self.model
+            ),
             "last_opened_at": self.last_opened_at,
             "user_pronouns": self.user_pronouns,
             "notes_enabled": self.notes_enabled,

@@ -619,13 +619,15 @@ def _chat_error_code(exc: BaseException) -> str:
     return "provider_failed"
 
 
-def _chat_error_model(exc: BaseException, provider: Any) -> str | None:
-    """The model to name in a ``model_unavailable`` error: the one the CLI said it rejected, else
-    the provider's configured model. None for any other error. Always valid model grammar."""
+def _chat_error_model(exc: BaseException, provider: Any = None) -> str | None:
+    """The model to name in a ``model_unavailable`` error: the one the CLI said it rejected, else the one the
+    subprocess was run with (the ``model=`` token the provider added). Never ``provider._model``: the picker can
+    swap it while a call runs, and the user must not be told the model they just chose is unavailable (#448).
+    None for any other error. Always valid model grammar. ``provider`` is accepted for the existing callers."""
     text = str(exc)
     if provider_auth.is_auth_failure(text) or not model_error.is_model_rejection(text):
         return None
-    return model_error.rejected_model_name(text, getattr(provider, "_model", None))
+    return model_error.rejected_model_name(text, None)
 
 
 def _chat_error_detail(exc: BaseException, provider: Any) -> str:
@@ -669,6 +671,84 @@ def _check_model_blocking(model_id: str, timeout_s: float | None = None) -> tupl
         if model_error.is_model_rejection(str(exc)):
             return "rejected", ""
         return "inconclusive", "failed"
+
+
+# Time source for the Apply / re-check budget arithmetic (a seam so tests can move time without touching
+# the global ``time.monotonic`` that asyncio's own scheduler uses).
+_clock = time.monotonic
+
+
+async def _probe_models(ids: list[str], left: float) -> list[tuple[str, str]]:
+    """Probe ``ids`` together inside the ``left`` seconds that remain of ONE check budget (#441, #449).
+
+    Shared by the picker's Apply (the derived tier ids) and the start-up re-check, so both use the same
+    time-limited check. None is started once less than ``_MIN_PROBE_S`` is left: those come back
+    ``("inconclusive", "budget")``.
+    """
+    if ids and left >= _MIN_PROBE_S:
+        return list(await asyncio.gather(*(asyncio.to_thread(_check_model_blocking, m, left) for m in ids)))
+    return [("inconclusive", "budget")] * len(ids)
+
+
+def _apply_recheck_outcomes(persona_dir: Path, chat_model: str, outcomes: dict[str, str]) -> list[str]:
+    """Remove the ids whose re-check passed from ``derived_unavailable``; returns the removed ids (#449).
+
+    SYNCHRONOUS on purpose: one load -> modify -> save with no ``await`` in between, run on the event loop
+    thread like every async config writer, and the config is re-read here (not carried over from before the
+    probes) so a change made while they ran is kept. Nothing is written when the chat model is no longer the
+    one the probes were run for (an Apply replaced the list) or when no id passed.
+    """
+    from dataclasses import replace as dc_replace
+
+    path = persona_dir / "persona_config.json"
+    cfg = PersonaConfig.load(path)
+    if cfg.model != chat_model:
+        return []
+    passed = [m for m in cfg.derived_unavailable if outcomes.get(m) == "ok"]
+    if not passed:
+        return []
+    dc_replace(cfg, derived_unavailable=[m for m in cfg.derived_unavailable if m not in passed]).save(path)
+    return passed
+
+
+def _recheck_needed(persona_dir: Path, provider: Any) -> bool:
+    """True when the bridge should re-test saved unavailable derived ids at start (#449)."""
+    from brain.persona_config import KNOWN_MODELS
+
+    if not isinstance(provider, ClaudeCliProvider):
+        return False
+    try:
+        cfg = PersonaConfig.load(persona_dir / "persona_config.json")
+    except Exception:  # noqa: BLE001 - start-up never fails on this
+        return False
+    return bool(cfg.derived_unavailable) and cfg.model not in KNOWN_MODELS
+
+
+async def _recheck_derived_unavailable(persona_dir: Path, lock: asyncio.Lock) -> None:
+    """Re-test the saved ``derived_unavailable`` ids once, as the picker's Apply would, and update the list (#449).
+
+    Same probe, one shared budget, single-flight through ``lock`` (the Apply's lock). Runs as a background task
+    so the bridge is ready at once. Removal-only: an id that is available again leaves the list (and its
+    runtime rejection record is cleared); a rejected or inconclusive id stays. Never raises.
+    """
+    try:
+        cfg = PersonaConfig.load(persona_dir / "persona_config.json")
+        ids, chat_model = list(cfg.derived_unavailable), cfg.model
+        if not ids:
+            return
+        async with lock:
+            results = await _probe_models(ids, _check_budget_s())
+        outcomes = {m: res[0] for m, res in zip(ids, results, strict=True)}
+        for m, (outcome, reason) in zip(ids, results, strict=True):
+            logger.info("derived model re-check: %s %s", m, outcome if outcome != "inconclusive" else f"inconclusive:{reason}")
+        removed = _apply_recheck_outcomes(persona_dir, chat_model, outcomes)
+        for m in removed:
+            model_error.note_success(m)
+        logger.info("derived model re-check done: %d of %d available again", len(removed), len(ids))
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - a background re-check must never break the bridge
+        logger.warning("derived model re-check failed (ignored)", exc_info=True)
 
 
 async def _flush_cost_series_at_stop(persona_dir: Path) -> None:
@@ -1267,6 +1347,13 @@ def build_app(
         if idle_shutdown_seconds is not None and idle_shutdown_seconds > 0:
             idle_task = asyncio.create_task(_idle_watcher(app.state.bridge, idle_shutdown_seconds))
 
+        # #449: re-test the saved unavailable derived model ids, off the start-up path (a background task,
+        # created just before the bridge starts serving), sharing the picker Apply's lock and probe budget.
+        recheck_task = None
+        if bg and _recheck_needed(persona_dir, provider):
+            recheck_task = asyncio.create_task(_recheck_derived_unavailable(persona_dir, model_check_lock))
+        app.state.derived_recheck_task = recheck_task
+
         try:
             yield
         finally:
@@ -1279,6 +1366,16 @@ def build_app(
             #   5. Heartbeat close-trigger (Reflex Phase 2 growth tick anchor)
             #   6. Publish shutdown event
             #   7. Clear publisher
+
+            # 0. Cancel the derived-model re-check (a probe thread already running ends by its own timeout)
+            if recheck_task is not None:
+                recheck_task.cancel()
+                try:
+                    await recheck_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.exception("derived model re-check raised during teardown")
 
             # 1. Cancel idle watcher
             if idle_task is not None:
@@ -2035,10 +2132,17 @@ def build_app(
                 derived_ids.append(derived)
         derived_outcomes: dict[str, str] = {}
         if req.model not in KNOWN_MODELS and isinstance(s.provider, ClaudeCliProvider):
+            budget = _check_budget_s()
+            contended = model_check_lock.locked()  # another check (an Apply, the start-up re-check) is running
+            waiting_since = _clock()  # a wait for the lock counts against the budget, so an Apply stays inside it
             async with model_check_lock:
-                budget = _check_budget_s()
-                started = time.monotonic()
-                outcome, reason = await asyncio.to_thread(_check_model_blocking, req.model, budget)
+                waited = (_clock() - waiting_since) if contended else 0.0
+                started = _clock() - waited
+                remaining = budget - waited
+                if remaining >= _MIN_PROBE_S:
+                    outcome, reason = await asyncio.to_thread(_check_model_blocking, req.model, remaining)
+                else:  # the wait behind another check used the budget: save unchecked, as for any inconclusive check
+                    outcome, reason = "inconclusive", "budget"
                 if outcome == "rejected":  # no derived probe is spent on an id that is refused anyway
                     return JSONResponse(
                         status_code=400,
@@ -2046,13 +2150,7 @@ def build_app(
                     )
                 # The derived probes share what is left of the ONE budget (they run together, so the
                 # whole Apply stays inside it); none is started once it is used up.
-                left = budget - (time.monotonic() - started)
-                if derived_ids and left >= _MIN_PROBE_S:
-                    derived_results = await asyncio.gather(
-                        *(asyncio.to_thread(_check_model_blocking, m, left) for m in derived_ids)
-                    )
-                else:
-                    derived_results = [("inconclusive", "budget")] * len(derived_ids)
+                derived_results = await _probe_models(derived_ids, budget - (_clock() - started))
             checked = outcome == "ok"
             if not checked:
                 logger.info(
@@ -2077,7 +2175,8 @@ def build_app(
                 and m not in unavailable
                 and (derived_outcomes.get(m) == "inconclusive" or (not derived_outcomes and m in derived_ids))
             ]
-        updated = dc_replace(current, model=req.model, derived_unavailable=unavailable)
+        updated = dc_replace(current, derived_unavailable=unavailable)
+        updated.set_model(req.model)  # #446: also clears a remembered unsupported value
         updated.save(config_path)
         model_error.switch(current.model, req.model, keep=candidate_tier_models(updated))
         # Derived ids the probes could not settle are "not checked yet" (told to the user, cleared by a clean
