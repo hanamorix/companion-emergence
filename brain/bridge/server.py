@@ -672,6 +672,8 @@ def _check_model_blocking(model_id: str, timeout_s: float | None = None) -> tupl
     except Exception as exc:  # noqa: BLE001 - any other failure only means "could not check"
         if getattr(exc, "stage", None) == "claude_cli_timeout":
             return "inconclusive", "timeout"
+        if provider_auth.is_auth_failure(str(exc)):  # auth wins over a model signal, as in _chat_error_code
+            return "inconclusive", "auth_failed"
         if model_error.is_model_rejection(str(exc)):
             return "rejected", ""
         return "inconclusive", "failed"
@@ -786,6 +788,7 @@ async def _apply_chat_model(
     check: bool,
     lock: asyncio.Lock,
     hot_swap: Callable[[str], None] | None,
+    before_write: Callable[[], None] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Apply a chat model: validate, check it, write the config, switch the live provider. Returns
     ``(status, body)``. The ONE implementation behind the picker's ``POST /persona/config/model`` and
@@ -796,7 +799,8 @@ async def _apply_chat_model(
     stream-json call (#440, #448): if Claude rejects it the id is NOT saved. Any other check failure (timeout,
     expired login, rate limit) saves it unchecked. Then it persists to persona_config.json and calls
     ``hot_swap`` (the running provider's model switch) when given. ``lock`` is the single-flight lock all
-    checks share.
+    checks share. ``before_write`` runs right before the config is re-read and written; it may raise to stop the
+    write (``nell model set`` uses it to refuse writing behind a bridge that started during the check).
 
     Returns (200, {ok: true, model, checked?, fallbacks?, tiers_unchecked?}),
             (400, {ok: false, error: "unknown_model", valid: [...]}) or
@@ -857,6 +861,8 @@ async def _apply_chat_model(
         for confirmed in [model if checked else None, *(m for m, o in derived_outcomes.items() if o == "ok")]:
             if confirmed:
                 model_error.note_success(confirmed)
+    if before_write is not None:
+        before_write()
     # Re-read right before writing, so a change another request made while the checks ran is kept.
     current = PersonaConfig.load(config_path)
     unavailable: list[str] = []

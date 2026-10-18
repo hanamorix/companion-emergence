@@ -229,15 +229,19 @@ class _Resp:
 class _Bridge:
     """Stands in for urllib against a real in-process app: records the request, answers through the TestClient."""
 
-    def __init__(self, client: TestClient):
+    def __init__(self, client: TestClient, forced: tuple[int, bytes] | None = None):
         self.client = client
         self.requests: list[dict] = []
+        self.forced = forced  # (status, body) answered instead of the real endpoint
 
     def urlopen(self, req, timeout=None):
         path = req.full_url.split("127.0.0.1:", 1)[1].split("/", 1)[1]
         self.requests.append(
             {"url": req.full_url, "path": "/" + path, "method": req.get_method(), "auth": req.get_header("Authorization"), "body": json.loads(req.data), "timeout": timeout}
         )
+        if self.forced is not None:
+            status, content = self.forced
+            raise urllib.error.HTTPError(req.full_url, status, "err", {}, io.BytesIO(content))
         resp = self.client.post("/" + path, content=req.data, headers=dict(req.header_items()))
         if resp.status_code >= 400:
             raise urllib.error.HTTPError(req.full_url, resp.status_code, "err", {}, io.BytesIO(resp.content))
@@ -302,6 +306,81 @@ def test_an_unsupported_value_never_reaches_a_running_bridge(monkeypatch, home: 
     assert rc == 1 and MODEL_ID_RULE in capsys.readouterr().err and p.read_bytes() == before
 
 
+def _via_bridge(monkeypatch, home: Path, run: _Run, capsys, model=CHAT, forced=None):
+    cli._build_parser()
+    with patch("subprocess.run", run), patch("subprocess.Popen", side_effect=_no_popen):
+        p, client = _live_bridge(monkeypatch, home, run)
+        with client as c:
+            with patch("urllib.request.urlopen", _Bridge(c, forced).urlopen):
+                rc = cli.main(["model", "set", model, "--persona", "bob"])
+    return rc, p, capsys.readouterr()
+
+
+def test_a_running_bridge_that_could_not_check_prints_the_unchecked_lines(monkeypatch, home: Path, capsys):
+    rc, p, out = _via_bridge(monkeypatch, home, _Run(lambda m: _quota()), capsys)
+    assert rc == 0 and json.loads(p.read_text())["model"] == CHAT
+    assert "saved unchecked" in out.out and "not checked yet" in out.out and DERIVED in out.out
+    assert "the running bridge switched to it now" in out.out and "—" not in out.out
+
+
+def test_a_running_bridge_that_found_a_fallback_prints_the_fallback_line(monkeypatch, home: Path, capsys):
+    rc, p, out = _via_bridge(monkeypatch, home, _Run(lambda m: _reject() if m == DERIVED else _ok()), capsys)
+    assert rc == 0 and json.loads(p.read_text())["derived_unavailable"] == [DERIVED]
+    assert f'"{DERIVED}"' in out.out and "could not be used" in out.out and "family" in out.out
+
+
+@pytest.mark.parametrize(
+    "status,body,expect",
+    [
+        (401, {"detail": "Unauthorized"}, "Unauthorized"),
+        (500, {"detail": "boom"}, "boom"),
+        (422, {"detail": [{"msg": "bad"}]}, "bad"),
+        (500, ["not", "a", "dict"], "not"),
+        (502, "plain text", "plain text"),
+    ],
+)
+def test_a_bridge_error_status_is_reported_as_the_bridges_answer_not_as_an_invalid_model(monkeypatch, home: Path, capsys, status, body, expect):
+    rc, p, out = _via_bridge(monkeypatch, home, _Run(lambda m: _ok()), capsys, forced=(status, json.dumps(body).encode()))
+    assert rc == 1
+    assert f"the bridge answered {status}" in out.err and expect in out.err
+    assert "not a valid model" not in out.err and MODEL_ID_RULE not in out.err
+    assert json.loads(p.read_text())["model"] == "sonnet"  # a bridge error changes nothing
+
+
+def test_an_unreadable_error_body_still_names_the_status(monkeypatch, home: Path, capsys):
+    rc, _, out = _via_bridge(monkeypatch, home, _Run(lambda m: _ok()), capsys, forced=(503, b"<html>down</html>"))
+    assert rc == 1 and "the bridge answered 503" in out.err and "not a valid model" not in out.err
+
+
+def test_a_bridge_that_started_while_the_check_ran_gets_nothing_written_behind_it(monkeypatch, home: Path, capsys):
+    p = _write(home)
+    before = p.read_bytes()
+    states = iter([None, SimpleNamespace(pid=4321, port=51234, auth_token="t")])
+    monkeypatch.setattr("brain.bridge.state_file.read", lambda d: next(states))
+    monkeypatch.setattr("brain.bridge.state_file.pid_is_alive", lambda pid: True)
+    run = _Run(lambda m: _ok())
+    cli._build_parser()
+    with patch("urllib.request.urlopen", side_effect=AssertionError("refuse, do not call")), patch(
+        "subprocess.run", run
+    ), patch("subprocess.Popen", side_effect=_no_popen):
+        rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
+    err = capsys.readouterr().err
+    assert rc == 1 and p.read_bytes() == before
+    assert "started while" in err and "run the command again" in err.lower() and "—" not in err
+    assert run.models  # the check really ran before the second look
+
+
+def test_a_bridge_that_started_before_an_alias_write_is_also_refused(monkeypatch, home: Path, capsys):
+    p = _write(home)
+    before = p.read_bytes()
+    states = iter([None, SimpleNamespace(pid=4321, port=51234, auth_token="t")])
+    monkeypatch.setattr("brain.bridge.state_file.read", lambda d: next(states))
+    monkeypatch.setattr("brain.bridge.state_file.pid_is_alive", lambda pid: True)
+    cli._build_parser()
+    rc = cli.main(["model", "set", "opus", "--persona", "bob"])
+    assert rc == 1 and p.read_bytes() == before and "started while" in capsys.readouterr().err
+
+
 def test_a_stale_state_file_means_not_running(monkeypatch, home: Path, capsys):
     p = _write(home)
     monkeypatch.setattr("brain.bridge.state_file.read", lambda d: SimpleNamespace(pid=999999, port=51234, auth_token="t"))
@@ -325,6 +404,24 @@ def test_a_live_pid_whose_port_refuses_exits_1_and_writes_nothing(monkeypatch, h
         rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
     err = capsys.readouterr().err
     assert rc == 1 and "could not reach" in err and p.read_bytes() == before and run.models == []
+    assert "may still be starting" in err and "try again in a few seconds" in err and "nell service stop" in err
+    assert "—" not in err
+
+
+@pytest.mark.parametrize("how", ["read", "connect"])
+def test_a_client_timeout_says_the_outcome_is_unknown(monkeypatch, home: Path, capsys, how):
+    p = _write(home)
+    before = p.read_bytes()
+    monkeypatch.setattr("brain.bridge.state_file.read", lambda d: SimpleNamespace(pid=4321, port=51234, auth_token="t"))
+    monkeypatch.setattr("brain.bridge.state_file.pid_is_alive", lambda pid: True)
+    cli._build_parser()
+    boom = TimeoutError("timed out") if how == "read" else urllib.error.URLError(TimeoutError("timed out"))
+    with patch("urllib.request.urlopen", side_effect=boom):
+        rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
+    err = capsys.readouterr().err
+    assert rc == 1 and p.read_bytes() == before
+    assert "outcome is unknown" in err and "may still apply" in err and "nell model show" in err
+    assert "may still be starting" not in err and "—" not in err
 
 
 # --- MS7: one implementation ---------------------------------------------------------------------------------------

@@ -495,6 +495,18 @@ def test_apply_check_marks_a_status_and_code_rejection_as_rejected(monkeypatch):
 # --- save-time probe: stream-json, classified from the code (owner decision D15) ---------------------------------------
 
 
+def _conflicting_code() -> list[dict]:
+    frames = _reword(F302)
+    frames[0]["error"] = "authentication_failed"
+    return frames
+
+
+def _auth_and_code() -> list[dict]:
+    frames = _reword(F302)  # keeps error=model_not_found and status 404
+    frames[1]["result"] = "Not logged in · Please run /login"
+    return frames
+
+
 def _probe_run(rc: int, stdout: str, seen: list | None = None):
     def run(cmd, **kw):
         if seen is not None:
@@ -529,8 +541,10 @@ def test_probe_runs_stream_json_without_tools_or_a_usage_row():
         (1, json.dumps({"type": "result", "is_error": True, "api_error_status": 429, "result": "limit"}), ("inconclusive", "failed")),
         (1, json.dumps({"type": "result", "is_error": True, "api_error_status": 404, "result": "Not Found"}), ("inconclusive", "failed")),
         (1, "not json at all", ("inconclusive", "failed")),
+        (1, _ndjson(_conflicting_code()), ("inconclusive", "failed")),  # 404 + a different code: not a rejection
+        (1, _ndjson(_auth_and_code()), ("inconclusive", "auth_failed")),  # auth wins by construction
     ],
-    ids=["real-302", "reworded-with-code", "json-object", "exit0-in-frame", "ok", "quota", "bare-404", "garbage"],
+    ids=["real-302", "reworded-with-code", "json-object", "exit0-in-frame", "ok", "quota", "bare-404", "garbage", "conflicting-code", "auth-beats-code"],
 )
 def test_save_time_check_classifies_from_the_stream_output(rc, stdout, expected):
     with patch("brain.bridge.provider.subprocess.run", _probe_run(rc, stdout)):

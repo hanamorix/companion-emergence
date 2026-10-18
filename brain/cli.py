@@ -2593,7 +2593,7 @@ def _model_show_handler(args: argparse.Namespace) -> int:
             "note: "
             + ", ".join(cfg.derived_unavailable)
             + " was not available when the chat model was last saved; it is tested again when the bridge "
-            "starts and when the chat model is applied again in the picker"
+            "starts and when the chat model is applied again (in the picker or with `nell model set`)"
         )
     return 0
 
@@ -2615,12 +2615,25 @@ def _model_set_tier_handler(args: argparse.Namespace) -> int:
     return 0
 
 
+class _BridgeStartedMidCommandError(Exception):
+    """A bridge for the persona started while `nell model set` was checking the model."""
+
+
+def _bridge_running(persona_dir: Path) -> Any:
+    """The persona's bridge state when its bridge is running (a state file with a live pid and a port), else None."""
+    state = state_file.read(persona_dir)
+    if state and state.pid and state.port and state_file.pid_is_alive(state.pid):
+        return state
+    return None
+
+
 def _model_set_handler(args: argparse.Namespace) -> int:
     """`nell model set <model>`: set the chat model with the picker's rules and the picker's save-time check.
 
     An alias or a full ``claude-`` id (64 cap). With the persona's bridge running the request goes to the picker's
     own settings endpoint (live hot swap, the same single-flight lock); otherwise the check runs here and the
-    config is written (``brain.bridge.server._apply_chat_model`` is the one implementation of both).
+    config is written (``brain.bridge.server._apply_chat_model`` is the one implementation of both). If a bridge
+    starts while the check runs, nothing is written behind it.
     """
     from brain.persona_config import MODEL_ID_RULE, is_valid_model
 
@@ -2631,15 +2644,22 @@ def _model_set_handler(args: argparse.Namespace) -> int:
     if path is None:
         return 1
     persona_dir = path.parent
-    state = state_file.read(persona_dir)
-    running = bool(state and state.pid and state.port and state_file.pid_is_alive(state.pid))
-    if running:
+    state = _bridge_running(persona_dir)
+    if state is not None:
         outcome = _model_set_via_bridge(state, args.model)
         if outcome is None:
             return 1
     else:
-        outcome = _model_set_direct(persona_dir, args.model)
-    return _model_set_report(args.model, outcome[0], outcome[1], via_bridge=running)
+        try:
+            outcome = _model_set_direct(persona_dir, args.model)
+        except _BridgeStartedMidCommandError:
+            print(
+                "error: the persona's bridge started while the model was being checked, so nothing was written. "
+                "Run the command again and it will go through the bridge.",
+                file=sys.stderr,
+            )
+            return 1
+    return _model_set_report(args.model, outcome[0], outcome[1], via_bridge=state is not None)
 
 
 def _model_set_direct(persona_dir: Path, model: str) -> tuple[int, dict]:
@@ -2650,16 +2670,20 @@ def _model_set_direct(persona_dir: Path, model: str) -> tuple[int, dict]:
 
     check = PersonaConfig.load(persona_dir / "persona_config.json").provider == "claude-cli"
 
+    def _no_bridge_now() -> None:
+        if _bridge_running(persona_dir) is not None:
+            raise _BridgeStartedMidCommandError
+
     async def _go() -> tuple[int, dict]:
         return await server_mod._apply_chat_model(
-            persona_dir, model, check=check, lock=asyncio.Lock(), hot_swap=None
+            persona_dir, model, check=check, lock=asyncio.Lock(), hot_swap=None, before_write=_no_bridge_now
         )
 
     return asyncio.run(_go())
 
 
 def _model_set_via_bridge(state: Any, model: str) -> tuple[int, dict] | None:
-    """Bridge running: POST to the picker's settings endpoint. None (after printing why) if it cannot be reached."""
+    """Bridge running: POST to the picker's settings endpoint. None (after printing why) if it gave no usable answer."""
     import urllib.error
     import urllib.request
 
@@ -2680,28 +2704,45 @@ def _model_set_via_bridge(state: Any, model: str) -> tuple[int, dict] | None:
         with urllib.request.urlopen(req, timeout=wait_s) as resp:
             return 200, json.loads(resp.read())
     except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
         try:
-            return exc.code, json.loads(exc.read())
+            return exc.code, json.loads(raw)
         except ValueError:
-            print(f"error: the bridge answered {exc.code}", file=sys.stderr)
-            return None
+            return exc.code, {"detail": raw[:200]}
     except (urllib.error.URLError, OSError) as exc:
-        print(f"error: could not reach the bridge on port {state.port}: {getattr(exc, 'reason', exc)}", file=sys.stderr)
+        reason = getattr(exc, "reason", exc)
+        if isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError):
+            print(
+                f"error: no answer from the bridge within {wait_s:.0f} s, so the outcome is unknown: the bridge may "
+                "still apply the change. Check with `nell model show`.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"error: could not reach the bridge on port {state.port}: {reason}. The bridge may still be "
+                "starting: try again in a few seconds, or stop it with `nell service stop`.",
+                file=sys.stderr,
+            )
         return None
 
 
-def _model_set_report(model: str, status: int, body: dict, *, via_bridge: bool) -> int:
+def _model_set_report(model: str, status: int, body: Any, *, via_bridge: bool) -> int:
     from brain.persona_config import MODEL_ID_RULE
 
+    if not isinstance(body, dict):
+        body = {"detail": body}
     if status != 200:
-        if body.get("error") == "model_unavailable":
+        if status == 400 and body.get("error") == "model_unavailable":
             print(
                 f'error: Claude rejected the model "{model}". It may not exist, or your account may not have '
                 "access to it. Nothing was changed.",
                 file=sys.stderr,
             )
-        else:
+        elif status == 400 and body.get("error") == "unknown_model":
             print(f"error: {model!r} is not a valid model: {MODEL_ID_RULE}", file=sys.stderr)
+        else:
+            detail = body.get("detail", body.get("error", body))
+            print(f"error: the bridge answered {status}: {str(detail)[:200]}", file=sys.stderr)
         return 1
     checked = body.get("checked")
     if checked is False:

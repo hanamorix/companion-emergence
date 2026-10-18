@@ -75,6 +75,7 @@ def test_save_time_probe_receives_the_model_not_found_code():
     with pytest.raises(Exception) as err:
         ClaudeCliProvider(model=BOGUS).probe("hi")
     text = str(err.value)
+    print(f"\nprobe() failure text: {text}")
     assert model_error.is_model_rejection(text), text
     assert "api_error_status=404" in text and "error=model_not_found" in text, text
     assert model_error.rejected_model_name(text, None) == BOGUS
