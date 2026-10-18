@@ -2683,9 +2683,9 @@ def _model_set_direct(persona_dir: Path, model: str) -> tuple[int, dict]:
 
 
 def _bridge_text(value: Any, limit: int = 200) -> str:
-    """Text that came from the bridge, made safe to print: control characters (escape sequences, bells, newlines)
-    removed, cut at ``limit`` characters."""
-    return "".join(ch for ch in str(value) if ch.isprintable())[:limit]
+    """Text that came from the bridge, made safe to print: newlines and tabs become a space, other control
+    characters (escape sequences, bells) are removed, cut at ``limit`` characters."""
+    return "".join(" " if ch in "\n\r\t" else ch for ch in str(value) if ch.isprintable() or ch in "\n\r\t")[:limit]
 
 
 # The most of a bridge answer the command will read: its real answers are a few hundred bytes.
@@ -2694,6 +2694,7 @@ _BRIDGE_ANSWER_MAX_BYTES = 65536
 
 def _model_set_via_bridge(state: Any, model: str, persona: str) -> tuple[int, Any] | None:
     """Bridge running: POST to the picker's settings endpoint. None (after printing why) if it gave no usable answer."""
+    import http.client
     import urllib.error
     import urllib.request
 
@@ -2716,12 +2717,21 @@ def _model_set_via_bridge(state: Any, model: str, persona: str) -> tuple[int, An
     except urllib.error.HTTPError as exc:
         try:
             raw_err = exc.read(_BRIDGE_ANSWER_MAX_BYTES).decode("utf-8", errors="replace")
-        except (OSError, ValueError):
+        except (OSError, ValueError, http.client.HTTPException):
             raw_err = ""
         try:
             return exc.code, json.loads(raw_err)
         except ValueError:
             return exc.code, {"detail": raw_err}
+    except http.client.HTTPException as exc:
+        # The bridge's port answered something that is not a usable HTTP answer (or cut it short): the request
+        # may or may not have been applied.
+        print(
+            f"error: did not understand the bridge's answer ({_bridge_text(type(exc).__name__)}), so the outcome is "
+            "unknown: the bridge may still apply the change. Check with `nell model show`.",
+            file=sys.stderr,
+        )
+        return None
     except (urllib.error.URLError, OSError) as exc:
         reason = getattr(exc, "reason", exc)
         if isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError):

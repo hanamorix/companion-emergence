@@ -11,9 +11,11 @@ urllib); only the Claude subprocess is faked, with the scrubbed real frames from
 
 from __future__ import annotations
 
+import http.client
 import io
 import json
 import shlex
+import socket
 import subprocess
 import threading
 import urllib.error
@@ -244,7 +246,7 @@ class _Bridge:
         if self.forced is not None:
             status, content = self.forced
             if status == 200:
-                return _Resp(content)
+                return _Resp(content) if isinstance(content, bytes) else content
             fp = io.BytesIO(content) if isinstance(content, bytes) else content  # bytes or a file-like object
             raise urllib.error.HTTPError(req.full_url, status, "err", {}, fp)
         resp = self.client.post("/" + path, content=req.data, headers=dict(req.header_items()))
@@ -545,3 +547,156 @@ def test_control_characters_in_a_success_body_are_never_printed(monkeypatch, hom
     rc, _, out = _via_bridge(monkeypatch, home, _Run(lambda m: _ok()), capsys, forced=(200, json.dumps(ok).encode()))
     assert rc == 0 and "\x1b" not in out.out and "\x07" not in out.out
     assert "claude-haiku-5" in out.out
+
+
+# --- round-4 recommendations ------------------------------------------------------------------------------------
+
+
+class _GreedyResp:
+    """A 200 response that records how much the caller asked to read."""
+
+    def __init__(self, data: bytes, fail: Exception | None = None):
+        self._buf = io.BytesIO(data)
+        self.asked: list[int | None] = []
+        self.fail = fail
+
+    def read(self, n=-1):
+        self.asked.append(n if n != -1 else None)
+        if self.fail:
+            raise self.fail
+        return self._buf.read(n)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_a_200_body_is_read_with_a_cap(monkeypatch, home: Path, capsys):
+    resp = _GreedyResp(b'{"ok": true, "model": "' + b"x" * 5_000_000 + b'"}')
+    rc, p, out = _via_bridge(monkeypatch, home, _Run(lambda m: _ok()), capsys, forced=(200, resp))
+    assert resp.asked and all(n is not None and n <= 65536 for n in resp.asked), resp.asked
+    assert rc == 1 and "unexpected body" in out.err and json.loads(p.read_text())["model"] == "sonnet"
+
+
+@pytest.mark.parametrize(
+    "extra,absent",
+    [
+        ({"fallbacks": "boom"}, ["boom"]),
+        ({"fallbacks": {"family": "haiku", "wanted": "w", "using": "u"}}, ["family"]),
+        ({"tiers_unchecked": "abc"}, ["a, b, c", "not checked yet"]),
+        ({"tiers_unchecked": {"x": 1}}, ["not checked yet"]),
+        ({"tiers_unchecked": []}, ["not checked yet"]),
+    ],
+    ids=["fallbacks-string", "fallbacks-dict", "unchecked-string", "unchecked-dict", "unchecked-empty"],
+)
+def test_odd_shapes_for_fallbacks_and_unchecked_ids_are_ignored(monkeypatch, home: Path, capsys, extra, absent):
+    body = json.dumps({"ok": True, "model": CHAT, **extra}).encode()
+    rc, _, out = _via_bridge(monkeypatch, home, _Run(lambda m: _ok()), capsys, forced=(200, body))
+    assert rc == 0 and "chat model is now" in out.out and "Traceback" not in out.err
+    for text in absent:
+        assert text not in out.out, (text, out.out)
+
+
+def test_non_dict_fallback_entries_are_skipped_and_a_good_one_still_prints(monkeypatch, home: Path, capsys):
+    good = {"family": "haiku", "wanted": DERIVED, "using": "haiku"}
+    body = json.dumps({"ok": True, "model": CHAT, "fallbacks": [1, "x", None, ["y"], good]}).encode()
+    rc, _, out = _via_bridge(monkeypatch, home, _Run(lambda m: _ok()), capsys, forced=(200, body))
+    assert rc == 0 and out.out.count("could not be used") == 1 and f'"{DERIVED}"' in out.out
+
+
+@pytest.mark.parametrize("detail", ["\x1b[31mred\x07", "line\x1b]0;t\x07"])
+def test_the_detail_of_an_unexpected_200_is_cleaned(monkeypatch, home: Path, capsys, detail):
+    for content in (json.dumps({"ok": False, "detail": detail}).encode(), json.dumps(detail).encode()):
+        rc, _, out = _via_bridge(monkeypatch, home, _Run(lambda m: _ok()), capsys, forced=(200, content))
+        assert rc == 1 and "unexpected body" in out.err
+        assert "\x1b" not in out.err and "\x07" not in out.err and out.err.count("\n") == 1
+
+
+def test_the_reason_of_an_unreachable_port_is_cleaned(monkeypatch, home: Path, capsys):
+    _write(home)
+    monkeypatch.setattr("brain.bridge.state_file.read", lambda d: SimpleNamespace(pid=4321, port=51234, auth_token="t"))
+    monkeypatch.setattr("brain.bridge.state_file.pid_is_alive", lambda pid: True)
+    cli._build_parser()
+    boom = urllib.error.URLError("refused\x1b[31m\nred\x07")
+    with patch("urllib.request.urlopen", side_effect=boom):
+        rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
+    err = capsys.readouterr().err
+    assert rc == 1 and "could not reach" in err and "\x1b" not in err and "\x07" not in err and err.count("\n") == 1
+
+
+def test_newlines_and_tabs_from_the_bridge_become_spaces(monkeypatch, home: Path, capsys):
+    body = json.dumps({"detail": "first line\nsecond\tthird"}).encode()
+    rc, _, out = _via_bridge(monkeypatch, home, _Run(lambda m: _ok()), capsys, forced=(500, body))
+    assert rc == 1 and "first line second third" in out.err and out.err.count("\n") == 1
+
+
+@pytest.mark.parametrize("exc", [http.client.BadStatusLine("garbage"), http.client.IncompleteRead(b"x"), http.client.ImproperConnectionState("x")])
+def test_a_non_http_answer_is_a_clear_message_not_a_traceback(monkeypatch, home: Path, capsys, exc):
+    p = _write(home)
+    before = p.read_bytes()
+    monkeypatch.setattr("brain.bridge.state_file.read", lambda d: SimpleNamespace(pid=4321, port=51234, auth_token="t"))
+    monkeypatch.setattr("brain.bridge.state_file.pid_is_alive", lambda pid: True)
+    cli._build_parser()
+    with patch("urllib.request.urlopen", side_effect=exc):
+        rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
+    err = capsys.readouterr().err
+    assert rc == 1 and p.read_bytes() == before and "Traceback" not in err
+    assert "did not understand the bridge's answer" in err and "outcome is unknown" in err and "nell model show" in err
+
+
+def test_a_truncated_200_read_is_a_clear_message(monkeypatch, home: Path, capsys):
+    resp = _GreedyResp(b"", fail=http.client.IncompleteRead(b"par"))
+    rc, _, out = _via_bridge(monkeypatch, home, _Run(lambda m: _ok()), capsys, forced=(200, resp))
+    assert rc == 1 and "did not understand the bridge's answer" in out.err and "Traceback" not in out.err
+
+
+def test_an_error_body_whose_read_raises_an_http_exception_still_names_the_status(monkeypatch, home: Path, capsys):
+    class _Truncated(io.BytesIO):
+        def read(self, n=-1):
+            raise http.client.IncompleteRead(b"x")
+
+    rc, _, out = _via_bridge(monkeypatch, home, _Run(lambda m: _ok()), capsys, forced=(500, _Truncated(b"")))
+    assert rc == 1 and "the bridge answered 500" in out.err and "Traceback" not in out.err
+
+
+def _raw_server(payload: bytes):
+    """A one-shot TCP server on a free loopback port that answers any request with ``payload`` and closes."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+
+    def serve():
+        conn, _ = srv.accept()
+        conn.settimeout(5)
+        try:
+            conn.recv(65536)
+            conn.sendall(payload)
+        finally:
+            conn.close()
+            srv.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return srv.getsockname()[1]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [b"NOT HTTP AT ALL\r\n\r\n", b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel"],
+    ids=["not-http", "truncated-chunked"],
+)
+def test_a_real_socket_that_answers_badly_gives_a_clear_message(monkeypatch, home: Path, capsys, payload):
+    p = _write(home)
+    before = p.read_bytes()
+    port = _raw_server(payload)
+    for var in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+    monkeypatch.setattr("brain.bridge.state_file.read", lambda d: SimpleNamespace(pid=4321, port=port, auth_token="t"))
+    monkeypatch.setattr("brain.bridge.state_file.pid_is_alive", lambda pid: True)
+    cli._build_parser()
+    rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
+    err = capsys.readouterr().err
+    assert rc == 1 and p.read_bytes() == before and "Traceback" not in err
+    assert "did not understand the bridge's answer" in err and "nell model show" in err
