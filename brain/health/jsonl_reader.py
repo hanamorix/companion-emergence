@@ -23,7 +23,20 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
-def _parse_lines(fh, path: Path) -> Iterator[dict]:
+class JsonlLineError(ValueError):
+    """A bad line met by ``_parse_lines(..., strict=True)``: carries the 1-based line number.
+
+    Defined here, not in ``brain.health.json_io``, so this module never imports it.
+    """
+
+    def __init__(self, line: int, reason: str, path: Path) -> None:
+        super().__init__(f"{path}: line {line}: {reason}")
+        self.line = line
+        self.reason = reason
+        self.path = path
+
+
+def _parse_lines(fh, path: Path, *, strict: bool = False) -> Iterator[dict]:
     """Parse an open text stream of JSONL, skipping bad lines with a warning.
 
     The stream must be opened with ``errors="surrogateescape"``: a line whose
@@ -32,11 +45,17 @@ def _parse_lines(fh, path: Path) -> Iterator[dict]:
     lone surrogates instead of raising, so it costs only that line, like a JSON
     error (#433). Strict decoding raised out of the loop and failed every read.
     Text mode keeps the line splitting (\n, \r\n, \r) and the streaming read.
+
+    ``strict=True`` (keyword-only, added for brain.health.json_io) raises
+    :class:`JsonlLineError` on the first bad line instead of skipping it, for
+    callers that must fail closed. The default is unchanged.
     """
     for line_index, raw in enumerate(fh, start=1):
         try:
             raw.encode("utf-8")
         except UnicodeEncodeError as exc:
+            if strict:
+                raise JsonlLineError(line_index, f"invalid UTF-8 ({exc.reason})", path) from exc
             logger.warning(
                 "skipping malformed jsonl line %d in %s: invalid UTF-8 (%s) | content: %r",
                 line_index,
@@ -51,6 +70,8 @@ def _parse_lines(fh, path: Path) -> Iterator[dict]:
         try:
             data = json.loads(stripped)
         except json.JSONDecodeError as exc:
+            if strict:
+                raise JsonlLineError(line_index, f"malformed JSON ({exc})", path) from exc
             logger.warning(
                 "skipping malformed jsonl line %d in %s: %s | content: %r",
                 line_index,
@@ -62,6 +83,8 @@ def _parse_lines(fh, path: Path) -> Iterator[dict]:
         if isinstance(data, dict):
             yield data
         else:
+            if strict:
+                raise JsonlLineError(line_index, f"not a JSON object ({type(data).__name__})", path)
             logger.warning(
                 "skipping non-dict jsonl line %d in %s (value type=%s) | content: %r",
                 line_index,
@@ -97,6 +120,7 @@ def iter_jsonl_skipping_corrupt(path: Path) -> Iterator[dict]:
         return
     with open(path, encoding="utf-8", errors="surrogateescape") as fh:
         yield from _parse_lines(fh, path)
+
 
 def read_jsonl_skipping_corrupt(path: Path) -> list[dict]:
     """Return parsed lines from ``path`` as a list, skipping malformed ones.

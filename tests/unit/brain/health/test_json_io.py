@@ -7,6 +7,7 @@ persona directory, the network or the bridge.
 
 from __future__ import annotations
 
+import logging
 import os
 import stat
 from pathlib import Path
@@ -133,3 +134,45 @@ def test_cw10_newline_argument_reaches_the_temp_file(tmp_path: Path, monkeypatch
     monkeypatch.undo()
     assert seen == ["\n"]
     assert p.read_bytes() == b"a\nb\n"
+
+
+# --------------------------------------------------------------------------------------------------------------
+# Helper addition to jsonl_reader._parse_lines: keyword-only strict (the shared line parser)
+# --------------------------------------------------------------------------------------------------------------
+
+
+def _wrap(data: bytes):
+    import io
+
+    return io.TextIOWrapper(
+        io.BytesIO(data), encoding="utf-8", errors="surrogateescape", newline="\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "data,line",
+    [
+        (b'{"a": 1}\nnot json\n{"b": 2}\n', 2),
+        (b'{"a": 1}\n[1, 2]\n', 2),
+        (b'{"a": 1}\n{"b": "caf\xff"}\n', 2),
+    ],
+)
+def test_cj3_parse_lines_strict_raises_with_the_line_number(data: bytes, line: int) -> None:
+    from brain.health.jsonl_reader import JsonlLineError, _parse_lines
+
+    seen: list[dict] = []
+    with pytest.raises(JsonlLineError) as exc:
+        for rec in _parse_lines(_wrap(data), Path("x.jsonl"), strict=True):
+            seen.append(rec)
+    assert exc.value.line == line
+    assert seen == [{"a": 1}]
+
+
+def test_cj3_parse_lines_default_still_skips(caplog) -> None:
+    from brain.health.jsonl_reader import _parse_lines
+
+    data = b'{"a": 1}\nnot json\n[1]\n{"b": "caf\xff"}\n{"c": 3}\n'
+    with caplog.at_level(logging.WARNING):
+        got = list(_parse_lines(_wrap(data), Path("x.jsonl")))
+    assert got == [{"a": 1}, {"c": 3}]
+    assert len(caplog.records) == 3
