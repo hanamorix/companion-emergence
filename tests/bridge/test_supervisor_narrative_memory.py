@@ -200,3 +200,56 @@ def test_embeddings_adapter_reads_the_warm_matrix(
     np.testing.assert_array_equal(embeddings_view.get(embedded.id), vec)
     assert embeddings_view.get(unembedded.id) is None, "an unembedded memory must return None, not compute one"
     assert embeddings_view.get("unknown-memory-id") is None
+
+
+def test_narrative_pass_is_skipped_when_the_soul_exemptions_cannot_be_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#392: the narrative pass shares the forgetting loader. With the exemption sets unreadable it must
+    not build arcs from an empty set, and it must say so once rather than raise a traceback every tick."""
+    import logging
+
+    from brain.forgetting import SoulExemptionsUnavailableError
+
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    store = MemoryStore(persona_dir / "memories.db")
+    store.create(Memory.create_new(content="a memory", memory_type="event", domain="d"))
+    store.close()
+
+    def _unavailable(_persona_dir):
+        raise SoulExemptionsUnavailableError("soul-crystallised memory ids")
+
+    monkeypatch.setattr("brain.forgetting._load_soul_linked_ids", _unavailable)
+    ran: list[bool] = []
+    monkeypatch.setattr(
+        "brain.bridge.supervisor.narrative_memory_run_pass", lambda *a, **k: ran.append(True)
+    )
+
+    with caplog.at_level(logging.WARNING, logger="brain.bridge.supervisor"):
+        _run_narrative_memory_pass(persona_dir, provider=MagicMock(), event_bus=MagicMock())
+
+    assert ran == [], "the narrative pass must not run on an empty exemption set"
+    assert any("narrative" in r.getMessage() and "skipping" in r.getMessage() for r in caplog.records)
+
+
+def test_narrative_pass_is_skipped_when_the_real_exemption_read_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#392: the same skip, but through the REAL loader (a directory where soul_candidates.jsonl should
+    be) rather than a patched one, so the wiring between the loader's error and this wrapper is exercised."""
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    store = MemoryStore(persona_dir / "memories.db")
+    store.create(Memory.create_new(content="a memory", memory_type="event", domain="d"))
+    store.close()
+    (persona_dir / "soul_candidates.jsonl").mkdir()
+    ran: list[bool] = []
+    monkeypatch.setattr(
+        "brain.bridge.supervisor.narrative_memory_run_pass", lambda *a, **k: ran.append(True)
+    )
+
+    _run_narrative_memory_pass(persona_dir, provider=MagicMock(), event_bus=MagicMock())
+
+    assert ran == []
+    assert not (persona_dir / "hebbian.db").exists(), "a skipped pass must not open the stores"

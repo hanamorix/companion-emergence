@@ -37,7 +37,7 @@ from brain.body.session_hours import (
 # function moved to brain.body.session_hours so brain.tools.dispatch can
 # import it without crossing into the bridge layer. See the new module's
 # docstring for the migration context.
-from brain.bridge import background_jobs, provider_auth
+from brain.bridge import background_jobs, model_error, provider_auth
 from brain.utils.log_throttle import warn_throttled
 
 logger = logging.getLogger(__name__)
@@ -70,6 +70,10 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
     if now is None:
         now = datetime.now(UTC)
     persona_name = persona_dir.name
+    connection = _build_connection(persona_dir)
+    from brain.bridge.model_tier import _load_config
+
+    tier_cfg = _load_config(persona_dir)
 
     return {
         "persona": persona_name,
@@ -78,11 +82,21 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
         "interior": _build_interior(persona_dir),
         "soul_highlight": _build_soul_highlight(persona_dir),
         "pending_writes": _build_pending_writes(persona_dir),
-        "connection": _build_connection(persona_dir),
+        "connection": connection,
         "mode": "live",
         "recovering": _is_recovering(persona_dir),
         # #246: True while the brain's CLI login is expired (bridge-process state).
         "provider_auth_expired": provider_auth.state()["status"] == "expired",
+        # #440: models the Claude CLI rejected (unknown, or not available to this account), limited to the
+        # configured chat model and the tier models so a refused or stale id is never reported. [] when none.
+        "model_rejections": _model_rejections(connection.get("model"), tier_cfg),
+        # #441: derived tier models being replaced by what those tiers use today, [] when none.
+        "tier_fallbacks": _tier_fallbacks(tier_cfg),
+        # #441: derived tier ids an Apply could not check yet (budget used up, timeout); [] when none.
+        "tier_unconfirmed": _tier_unconfirmed(tier_cfg),
+        # #440: the chat model when it was saved without the Apply-time check being able to confirm it and no
+        # clean reply has arrived for it since. [] otherwise.
+        "model_unconfirmed": model_error.unconfirmed(only={connection.get("model")}),
         "felt_time_recovered": _felt_time_recovered(persona_dir),
         "narrative_memory_recovered": _narrative_memory_replayed(persona_dir),
         # ram-spike-fix INC-11 (spec §6, S15/S23/S38): gated jobs and/or the
@@ -94,6 +108,35 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
             for name, elapsed in background_jobs.snapshot_with_elapsed()
         ],
     }
+
+
+def _model_rejections(configured_model: str | None, cfg: Any = None) -> list[dict]:
+    from brain.bridge.model_tier import TIER_MODEL, candidate_tier_models
+
+    allowed = set(TIER_MODEL.values())
+    if cfg is not None:
+        allowed |= candidate_tier_models(cfg)
+    if configured_model:
+        allowed.add(configured_model)
+    return model_error.state(only=allowed)
+
+
+def _tier_unconfirmed(cfg: Any) -> list[str]:
+    from brain.bridge.model_tier import candidate_tier_models, unchecked_tiers
+
+    if cfg is None:
+        return []
+    return unchecked_tiers(cfg, model_error.tier_unconfirmed(only=candidate_tier_models(cfg)))
+
+
+def _tier_fallbacks(cfg: Any) -> list[dict]:
+    from brain.bridge.model_tier import tier_fallbacks
+
+    try:
+        return tier_fallbacks(cfg)
+    except Exception:  # noqa: BLE001 - never breaks /persona/state
+        logger.warning("persona_state: tier_fallbacks failed", exc_info=True)
+        return []
 
 
 def _is_recovering(persona_dir: Path) -> bool:

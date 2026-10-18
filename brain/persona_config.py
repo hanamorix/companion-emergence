@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -42,6 +43,54 @@ DEFAULT_KINDLED_RELAY_URL = "https://kindled-relay.kindledrelay.workers.dev"
 KNOWN_PROVIDERS = frozenset({"claude-cli", "ollama", "fake"})
 KNOWN_SEARCHERS = frozenset({"ddgs", "noop"})
 KNOWN_MODELS = frozenset({"sonnet", "opus", "haiku"})
+# A full model id (e.g. claude-sonnet-5), stored and passed to `claude --model` as written.
+# Matched with fullmatch, never `$`: `$` would accept a trailing newline. The picker in
+# app/src/lib/modelId.ts uses the same pattern and length cap; keep the two in sync.
+MODEL_ID_PATTERN = re.compile(r"claude-[a-z0-9.-]+")
+# Longest full id accepted on EVERY write path (config load, POST /persona/config/model). Real ids are
+# well under it; the cap keeps an absurd value off the CLI's argv, out of the usage log and out of the
+# UI, and keeps the CLI's rejection sentence (cut at 200 characters by the provider) parseable.
+MODEL_ID_MAX_LENGTH = 64
+
+
+# The routed Claude tiers whose model can be overridden per persona (`tier_models`). Plain strings: this module
+# must not import brain.bridge.model_tier (import direction); a test pins equality with model_tier's constants.
+ROUTED_TIER_NAMES = (
+    "attunement-detector",
+    "compaction",
+    "self-model-articulate",
+    "background-classifier",
+    "background-generative",
+    "background-housekeeping",
+)
+# Bad hand-edited values warn ONCE per process, not on every load (loads happen per background call).
+_warned_bad_values: set[tuple[str, str]] = set()
+
+
+def _warn_bad_once(key: str, value: object, why: str) -> None:
+    ident = (key, repr(value)[:80])
+    if ident in _warned_bad_values:
+        return
+    if len(_warned_bad_values) >= 64:
+        _warned_bad_values.clear()
+    _warned_bad_values.add(ident)
+    logger.warning("PersonaConfig: dropping %s=%r (%s)", key, value, why)
+
+
+MODEL_ID_RULE = (
+    "use sonnet, opus or haiku, or a full id that starts with claude- and has only lowercase letters, "
+    f"digits, dots and dashes, at most {MODEL_ID_MAX_LENGTH} characters"
+)
+
+
+def is_valid_model(value: object) -> bool:
+    """True for one of the aliases (sonnet / opus / haiku) or a full ``claude-...`` model id."""
+    if not isinstance(value, str):
+        return False
+    if value in KNOWN_MODELS:
+        return True
+    return len(value) <= MODEL_ID_MAX_LENGTH and MODEL_ID_PATTERN.fullmatch(value) is not None
+
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +141,12 @@ class PersonaConfig:
     notes_folder: str | None = None  # resolved cross-platform path, set on enable
     kindled_link_enabled: bool = False
     kindled_relay_url: str | None = None  # relay where this Kindled's mailbox lives; None = not wired
+    # #441: explicit per-tier model overrides ({tier name: alias or full id}); beat the version derived from the
+    # chat model. Written to the file only when non-empty, so alias users' files stay byte-identical.
+    tier_models: dict = field(default_factory=dict)
+    # #441: derived tier ids a save-time check found Claude rejecting; those tiers use what they use today.
+    # Written only when non-empty; rewritten whenever the chat model is saved.
+    derived_unavailable: list = field(default_factory=list)
 
     def touch_last_opened(self) -> None:
         """Set last_opened_at to current UTC time, ISO8601 with Z suffix."""
@@ -150,7 +205,7 @@ class PersonaConfig:
         )
         model_raw = data.get("model", DEFAULT_MODEL)
         model_str = model_raw if isinstance(model_raw, str) and model_raw else DEFAULT_MODEL
-        if model_str in KNOWN_MODELS:
+        if is_valid_model(model_str):
             model = model_str
         else:
             logger.warning(
@@ -159,6 +214,24 @@ class PersonaConfig:
                 DEFAULT_MODEL,
             )
             model = DEFAULT_MODEL
+        tier_models: dict[str, str] = {}
+        tier_models_raw = data.get("tier_models")
+        if isinstance(tier_models_raw, dict):
+            for tier, tier_model in tier_models_raw.items():
+                if tier not in ROUTED_TIER_NAMES:
+                    _warn_bad_once("tier_models", tier, "not a routed tier")
+                elif not is_valid_model(tier_model):
+                    _warn_bad_once(f"tier_models[{tier}]", tier_model, "not an alias or a valid model id")
+                else:
+                    tier_models[tier] = tier_model
+        derived_unavailable: list[str] = []
+        derived_raw = data.get("derived_unavailable")
+        if isinstance(derived_raw, list):
+            for item in derived_raw:
+                if not is_valid_model(item) or item in KNOWN_MODELS:
+                    _warn_bad_once("derived_unavailable", item, "not a valid full model id")
+                elif item not in derived_unavailable:
+                    derived_unavailable.append(item)
         last_opened_at_raw = data.get("last_opened_at")
         last_opened_at = (
             last_opened_at_raw
@@ -177,6 +250,8 @@ class PersonaConfig:
             notes_folder=notes_folder,
             kindled_link_enabled=kindled_link_enabled,
             kindled_relay_url=kindled_relay_url,
+            tier_models=tier_models,
+            derived_unavailable=derived_unavailable,
         )
 
     @classmethod
@@ -221,6 +296,10 @@ class PersonaConfig:
             "kindled_link_enabled": self.kindled_link_enabled,
             "kindled_relay_url": self.kindled_relay_url,
         }
+        if self.tier_models:
+            payload["tier_models"] = dict(self.tier_models)
+        if self.derived_unavailable:
+            payload["derived_unavailable"] = list(self.derived_unavailable)
         treatment = compute_treatment(path.parent, path.name)
         save_with_backup(path, payload, backup_count=treatment.backup_count)
         if treatment.verify_after_write:

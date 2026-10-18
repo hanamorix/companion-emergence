@@ -87,11 +87,11 @@ def _call_haiku(
 
     Returns empty string on any failure so callers can decline cleanly.
     """
-    from brain.bridge.model_tier import TIER_ATTUNEMENT_DETECTOR, model_for_tier
+    from brain.bridge.model_tier import TIER_ATTUNEMENT_DETECTOR, resolve_tier_model
     from brain.bridge.provider import ClaudeCliProvider
 
     provider = ClaudeCliProvider(
-        model=model_for_tier(TIER_ATTUNEMENT_DETECTOR),
+        model=resolve_tier_model(persona_dir, TIER_ATTUNEMENT_DETECTOR)[0],
         timeout_seconds=_DETECTOR_TIMEOUT_SECONDS,
     )
     pd: Path | None = Path(persona_dir) if isinstance(persona_dir, str) else persona_dir

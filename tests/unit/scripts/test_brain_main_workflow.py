@@ -109,8 +109,23 @@ def test_concurrency_is_scoped_to_the_publish_job():
 
 def test_publish_uploads_data_before_the_manifest():
     run = _step(PUBLISH, "Publish")["run"]
-    assert run.index("requirements.txt --clobber") < run.index("manifest.json.sig --clobber")
+    assert run.index("requirements.txt --clobber") < run.index("manifest.signed.json --clobber")
     assert "--prerelease" in run and "delete-asset" in run
+
+
+def test_the_signed_envelope_is_built_verified_shipped_and_kept():
+    """The app reads only manifest.signed.json (#365): the sign job builds it and
+    verifies the manifest it carries, the artifact carries it to publish, and the
+    asset prune keeps it (and the old pair, for 0.0.42/0.0.43 apps)."""
+    pack = _step(SIGN, "Pack manifest + signature into one asset")["run"]
+    assert "brain_main_manifest.py envelope" in pack
+    assert "cmp dist/manifest.json" in pack and "verify_update_signature.sh" in pack
+    upload = next(s for s in SIGN["steps"] if s.get("name") == "Upload signed build")
+    assert "dist/manifest.signed.json" in upload["with"]["path"]
+    run = _step(PUBLISH, "Publish")["run"]
+    keep = next(line for line in run.splitlines() if line.strip().startswith("keep="))
+    for asset in ("manifest.signed.json", "manifest.json", "manifest.json.sig"):
+        assert asset in keep
 
 
 def test_workflow_dispatch_cannot_publish_onto_the_user_channel():

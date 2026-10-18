@@ -77,7 +77,8 @@ Five units. Each can be understood and tested alone.
 
 ### 3.2 App commands (Rust, `app/src-tauri`)
 
-- `check_brain_update` → fetch `manifest.json` + `.sig`, verify with the pubkey the app already
+- `check_brain_update` → fetch `manifest.json` + `.sig` (since #365: the one asset
+  `manifest.signed.json` carrying both; see "Superseded (#365" below), verify with the pubkey the app already
   ships (`minisign-verify`, already in `Cargo.lock` via the updater plugin). Returns
   `{available, commit, brain_version, reason}`. A bad signature is "no update" and is logged as
   a security event, never installed.
@@ -360,6 +361,13 @@ bad signature as a security event (manifest and `.sig` upload in parallel, so th
 disagree); optionally check the trusted comment's `file:manifest.json`; consider a signed
 `"channel": "brain-main"` field so a dry-run manifest cannot be replayed onto `brain-main` (repo
 writers only). Also recorded in the deferred memory.
+
+**Superseded (#365, 2026-10-16):** the retry waited out a publisher ordering problem. The publish
+job now also uploads `manifest.signed.json` (the manifest text and its signature in one asset,
+written by `brain_main_manifest.py envelope`), and the app reads only that, with no retry: one
+asset is replaced in one go, so a signature that doesn't verify is always a security event. The
+separate `manifest.json` + `.sig` pair is still published for 0.0.42/0.0.43 apps and for
+`should-publish`.
 
 **Slice 2 additions (2026-09-27, from its final review):** the hook honours `KINDLED_NO_OVERLAY=1`
 (skip any overlay — the escape hatch for a main brain that starts but can't run `nell update

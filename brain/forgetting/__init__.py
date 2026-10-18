@@ -48,37 +48,42 @@ def _persist_forgetting_state(persona_dir: Path, counters: dict[str, int]) -> No
     save_with_backup(persona_dir / FORGETTING_STATE_FILENAME, counters)
 
 
+class SoulExemptionsUnavailableError(RuntimeError):
+    """The soul-linked memory ids could not be read (#392).
+
+    Raised instead of returning an empty set: an empty set means "nothing is exempt", and acting on
+    that guess can hard-delete a memory the soul depends on. Callers stop before any irreversible step.
+    """
+
+
 def _load_soul_linked_ids(persona_dir: Path) -> tuple[set[str], set[str]]:
     """Returns (crystallised_ids, under_review_ids).
 
-    Fail-soft but loud: if the soul subsystem isn't reachable that set is
-    empty and the pass still runs (a crash would stall every forgetting and
-    narrative tick) — but memories that should have been exempt may fade or
-    be lost, so each failure logs a warning. A silent swallow here hid a
-    never-defined import for the crystallised half (#362).
+    Fails CLOSED (#392): if either set cannot be read this raises ``SoulExemptionsUnavailableError`` and the
+    caller skips its pass. A failed read is not "nothing is exempt", and fading or losing memories on
+    that guess cannot be undone. Both legs are always attempted and each failure is logged with its
+    traceback, so one look at the log shows everything that failed. (Before #392 this fell back to an
+    empty set and the pass ran anyway.)
     """
+    failed: list[str] = []
+    crystallised: set[str] = set()
+    under_review: set[str] = set()
     try:
         from brain.soul.candidates import list_crystallised_memory_ids
 
         crystallised = set(list_crystallised_memory_ids(persona_dir))
     except Exception:
-        log.warning(
-            "forgetting: could not load soul-crystallised memory ids; "
-            "crystallised memories are NOT exempt this pass",
-            exc_info=True,
-        )
-        crystallised = set()
+        log.warning("forgetting: could not load soul-crystallised memory ids", exc_info=True)
+        failed.append("soul-crystallised memory ids")
     try:
         from brain.soul.candidates import list_under_review_memory_ids
 
         under_review = set(list_under_review_memory_ids(persona_dir))
     except Exception:
-        log.warning(
-            "forgetting: could not load under-review soul candidate ids; "
-            "under-review memories are NOT exempt this pass",
-            exc_info=True,
-        )
-        under_review = set()
+        log.warning("forgetting: could not load under-review soul candidate ids", exc_info=True)
+        failed.append("under-review soul candidate ids")
+    if failed:
+        raise SoulExemptionsUnavailableError("could not read " + " and ".join(failed))
     return crystallised, under_review
 
 
@@ -139,11 +144,19 @@ def run_pass(
     start = time.monotonic()
     counters = _load_forgetting_state(persona_dir)
     felt_state, _recovered = load_felt_time(persona_dir)
-    crystallised_ids, under_review_ids = _load_soul_linked_ids(persona_dir)
+    summary: dict[str, int] = {"faded": 0, "unfaded": 0, "lost": 0, "exempt": 0, "total": 0}
+    try:
+        crystallised_ids, under_review_ids = _load_soul_linked_ids(persona_dir)
+    except SoulExemptionsUnavailableError as exc:
+        # Fail closed (#392): without the exemption sets the pass cannot tell which memories the soul
+        # depends on, and losing one is irreversible. Change nothing; the next pass tries again.
+        log.warning("forgetting: %s; skipping this pass so no memory is changed on a guess", exc)
+        summary["exemptions_unavailable"] = 1
+        summary["duration_ms"] = int((time.monotonic() - start) * 1000)
+        event_bus.publish({"type": "forgetting_pass", **summary})
+        return summary
     soul_linked = crystallised_ids | under_review_ids
     migrated_at_utc, lived_at_migration = _load_migration_grace(persona_dir)
-
-    summary: dict[str, int] = {"faded": 0, "unfaded": 0, "lost": 0, "exempt": 0, "total": 0}
 
     db_path = persona_dir / "memories.db"
     if not db_path.exists():
@@ -318,4 +331,4 @@ def run_pass(
     return summary
 
 
-__all__ = ["run_pass", "graveyard", "policy", "salience", "tombstone"]
+__all__ = ["run_pass", "SoulExemptionsUnavailableError", "graveyard", "policy", "salience", "tombstone"]

@@ -23,6 +23,54 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+def _parse_lines(fh, path: Path) -> Iterator[dict]:
+    """Parse an open text stream of JSONL, skipping bad lines with a warning.
+
+    The stream must be opened with ``errors="surrogateescape"``: a line whose
+    bytes are not valid UTF-8 (a crash mid-append can cut a multi-byte
+    character, and the next append lands on the same line) then decodes with
+    lone surrogates instead of raising, so it costs only that line, like a JSON
+    error (#433). Strict decoding raised out of the loop and failed every read.
+    Text mode keeps the line splitting (\n, \r\n, \r) and the streaming read.
+    """
+    for line_index, raw in enumerate(fh, start=1):
+        try:
+            raw.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            logger.warning(
+                "skipping malformed jsonl line %d in %s: invalid UTF-8 (%s) | content: %r",
+                line_index,
+                path,
+                exc.reason,
+                raw.encode("utf-8", "surrogateescape").decode("utf-8", "replace")[:201],
+            )
+            continue
+        stripped = raw.rstrip("\r\n")
+        if not stripped.strip():
+            continue
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "skipping malformed jsonl line %d in %s: %s | content: %r",
+                line_index,
+                path,
+                exc,
+                stripped[:201],
+            )
+            continue
+        if isinstance(data, dict):
+            yield data
+        else:
+            logger.warning(
+                "skipping non-dict jsonl line %d in %s (value type=%s) | content: %r",
+                line_index,
+                path,
+                type(data).__name__,
+                stripped[:201],
+            )
+
+
 def iter_jsonl_skipping_corrupt(path: Path) -> Iterator[dict]:
     """Yield parsed dict lines from ``path``, skipping malformed lines.
 
@@ -47,33 +95,8 @@ def iter_jsonl_skipping_corrupt(path: Path) -> Iterator[dict]:
     """
     if not path.exists():
         return
-    with open(path, encoding="utf-8") as fh:
-        for line_index, raw in enumerate(fh, start=1):
-            stripped = raw.rstrip("\r\n")
-            if not stripped.strip():
-                continue
-            try:
-                data = json.loads(stripped)
-            except json.JSONDecodeError as exc:
-                logger.warning(
-                    "skipping malformed jsonl line %d in %s: %s | content: %r",
-                    line_index,
-                    path,
-                    exc,
-                    stripped[:201],
-                )
-                continue
-            if isinstance(data, dict):
-                yield data
-            else:
-                logger.warning(
-                    "skipping non-dict jsonl line %d in %s (value type=%s) | content: %r",
-                    line_index,
-                    path,
-                    type(data).__name__,
-                    stripped[:201],
-                )
-
+    with open(path, encoding="utf-8", errors="surrogateescape") as fh:
+        yield from _parse_lines(fh, path)
 
 def read_jsonl_skipping_corrupt(path: Path) -> list[dict]:
     """Return parsed lines from ``path`` as a list, skipping malformed ones.
@@ -154,29 +177,5 @@ def iter_jsonl_streaming(path: Path) -> Iterator[dict]:
         return
     is_gz = path.suffix == ".gz"
     open_fn = gzip.open if is_gz else open
-    with open_fn(path, "rt", encoding="utf-8") as fh:
-        for line_index, raw in enumerate(fh, start=1):
-            stripped = raw.rstrip("\r\n")
-            if not stripped.strip():
-                continue
-            try:
-                data = json.loads(stripped)
-            except json.JSONDecodeError as exc:
-                logger.warning(
-                    "skipping malformed jsonl line %d in %s: %s | content: %r",
-                    line_index,
-                    path,
-                    exc,
-                    stripped[:201],
-                )
-                continue
-            if isinstance(data, dict):
-                yield data
-            else:
-                logger.warning(
-                    "skipping non-dict jsonl line %d in %s (value type=%s) | content: %r",
-                    line_index,
-                    path,
-                    type(data).__name__,
-                    stripped[:201],
-                )
+    with open_fn(path, "rt", encoding="utf-8", errors="surrogateescape") as fh:
+        yield from _parse_lines(fh, path)

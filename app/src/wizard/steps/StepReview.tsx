@@ -1,5 +1,6 @@
 import { Divider, SectionLabel, WButton, WizardShell } from "../components";
 import type { WizardState } from "../Wizard";
+import { wizardInitModel } from "../chatModel";
 import type { ExistingCePreflight } from "../../appConfig";
 
 import type { ReactNode } from "react";
@@ -83,6 +84,7 @@ export function StepReview({ step, totalSteps, state, preflight, onInstall, onBa
       <Row label="Persona name" value={state.personaName} mono />
       <Row label="Your name" value={state.userName || "(unset)"} mono />
       <Row label="Voice template" value={state.voiceTemplate} mono />
+      <Row label="Claude model" value={wizardInitModel(state.chatModel)} mono />
       {state.mode === "migrate" && (
         <Row label="OG data path" value={state.migrateFromPath} mono small />
       )}
@@ -151,6 +153,7 @@ function buildEquivalentCli(s: WizardState): string {
   const lines = ["uv run nell init \\"];
   lines.push(`  --persona ${s.personaName} \\`);
   if (s.userName.trim()) lines.push(`  --user-name "${s.userName}" \\`);
+  if (s.chatModel.trim()) lines.push(`  --model ${s.chatModel.trim()} \\`);
   lines.push(`  --voice-template ${s.voiceTemplate}${s.mode === "migrate" ? " \\" : ""}`);
   if (s.mode === "migrate") {
     lines.push(`  --migrate-from ${s.migrateFromPath}`);
