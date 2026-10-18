@@ -41,10 +41,13 @@ legacy function and its fifteen callers do not change; it is deleted together wi
 from __future__ import annotations
 
 import enum
+import gzip
+import io
 import json
 import logging
 import os
 import time
+import zlib
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
@@ -60,6 +63,7 @@ from brain.health.attempt_heal import (
     _replace_with_retry,
     save_with_backup_text,
 )
+from brain.health.jsonl_reader import JsonlLineError, _parse_lines
 from brain.utils.file_lock import file_lock
 from brain.utils.log_throttle import warn_throttled
 
@@ -616,3 +620,243 @@ def _verify(path: Path, text: str, has_backups: bool) -> bool:
         except (OSError, UnicodeDecodeError):
             logger.exception("could not restore %s from %s", path, bak1.name)
     return False
+
+
+# --------------------------------------------------------------------------------------------------
+# JSONL
+# --------------------------------------------------------------------------------------------------
+
+_JSONL_IO_ERRORS = (OSError, EOFError, gzip.BadGzipFile, zlib.error)
+
+
+def encode_jsonl(
+    records: dict | Iterable[dict], *, encode_default: Callable[[Any], Any] | None = None
+) -> bytes:
+    """The one JSONL encoder: one ASCII line per dict, ``\\n`` terminated. Raises before anything is written.
+
+    A record that is not a dict is a TypeError, a NaN a ValueError, an unencodable value a TypeError
+    (unless ``encode_default`` handles it).
+    """
+    rows = [records] if isinstance(records, dict) else list(records)
+    out = []
+    for rec in rows:
+        if not isinstance(rec, dict):
+            raise TypeError(f"a JSONL record must be a dict, got {type(rec).__name__}")
+        out.append(
+            json.dumps(rec, ensure_ascii=_ENSURE_ASCII, allow_nan=False, default=encode_default)
+            + "\n"
+        )
+    return "".join(out).encode("ascii" if _ENSURE_ASCII else "utf-8")
+
+
+def _check_jsonl_recover(recover: Recovery) -> None:
+    if recover not in (Recovery.DEFAULT, Recovery.RAISE):
+        raise ValueError(f"JSONL reads take Recovery.DEFAULT or Recovery.RAISE, not {recover!r}")
+
+
+def parse_jsonl(
+    data: bytes | str, *, source: Path | str = "<memory>", strict: bool = False
+) -> Iterator[dict]:
+    """Parse JSONL text or bytes already read: the one place bad lines are skipped (or, strict, raised)."""
+    raw = data.encode("utf-8", "surrogateescape") if isinstance(data, str) else data
+    src = source if isinstance(source, Path) else Path(source)
+    try:
+        yield from _stream(io.BytesIO(raw), src, strict)
+    except _StrictLineError as exc:
+        raise JsonFileError(exc.path, "line", exc.reason, exc.line) from exc
+
+
+def _stream(binary, source: Path, strict: bool) -> Iterator[dict]:
+    wrapper = io.TextIOWrapper(binary, encoding="utf-8-sig", errors="surrogateescape", newline="\n")
+    try:
+        yield from _parse_lines(wrapper, source, strict=strict)
+    except JsonlLineError as exc:
+        raise _StrictLineError(source, exc.reason, exc.line) from exc
+    finally:
+        wrapper.detach()
+
+
+class _StrictLineError(Exception):
+    """Internal carrier so a strict-line failure is not mistaken for an I/O failure by the readers' handlers."""
+
+    def __init__(self, path: Path, reason: str, line: int) -> None:
+        super().__init__(reason)
+        self.path, self.reason, self.line = path, reason, line
+
+
+def iter_jsonl(
+    path: Path, *, strict: bool = False, recover: Recovery = Recovery.DEFAULT
+) -> Iterator[dict]:
+    """Yield the dict records of a JSONL file (``.gz`` by suffix), skipping bad lines with a warning.
+
+    A missing file yields nothing. ``strict=True`` raises ``JsonFileError(kind="line")`` on the first bad
+    line (after yielding the good ones before it). An I/O failure (including a truncated gz) ends the
+    iteration with a throttled warning (DEFAULT) or raises ``JsonFileError(kind="io")`` (RAISE).
+    """
+    path = Path(path)
+    _check_jsonl_recover(recover)
+    try:
+        opener = gzip.open(path, "rb") if path.suffix == ".gz" else open(path, "rb")
+    except FileNotFoundError:
+        return
+    except _JSONL_IO_ERRORS as exc:
+        yield from _io_stop(path, exc, recover)
+        return
+    try:
+        with opener as fh:
+            yield from _stream(fh, path, strict)
+    except _StrictLineError as exc:
+        raise JsonFileError(exc.path, "line", exc.reason, exc.line) from exc
+    except _JSONL_IO_ERRORS as exc:
+        yield from _io_stop(path, exc, recover)
+
+
+def _io_stop(path: Path, exc: BaseException, recover: Recovery) -> Iterator[dict]:
+    if recover is Recovery.RAISE:
+        raise JsonFileError(path, "io", _short(exc)) from exc
+    _report(path, "io", exc, "stopped reading; returning what was read")
+    return
+    yield  # pragma: no cover - makes this a generator
+
+
+def read_jsonl(
+    path: Path, *, strict: bool = False, recover: Recovery = Recovery.DEFAULT
+) -> list[dict]:
+    return list(iter_jsonl(path, strict=strict, recover=recover))
+
+
+def read_jsonl_tail(
+    path: Path, n: int, *, strict: bool = False, recover: Recovery = Recovery.DEFAULT
+) -> list[dict]:
+    """The records on the last ``n`` non-blank lines, read backwards in byte chunks (bounded I/O).
+
+    Blank lines do not count toward ``n``. The window is cut on a newline *byte* before any decoding, so a
+    multi-byte character split by a chunk boundary costs only the dropped partial first line, and a bad
+    byte is skipped with a warning (or, ``strict=True``, raises) rather than turned into U+FFFD.
+    """
+    path = Path(path)
+    _check_jsonl_recover(recover)
+    if n <= 0:
+        return []
+    try:
+        lines = _tail_lines(path, n)
+    except FileNotFoundError:
+        return []
+    except _JSONL_IO_ERRORS as exc:
+        if recover is Recovery.RAISE:
+            raise JsonFileError(path, "io", _short(exc)) from exc
+        _report(path, "io", exc, "returning no records")
+        return []
+    try:
+        return list(_stream(io.BytesIO(b"\n".join(lines)), path, strict))
+    except _StrictLineError as exc:
+        raise JsonFileError(exc.path, "line", exc.reason, exc.line) from exc
+
+
+def _tail_lines(path: Path, n: int) -> list[bytes]:
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        remaining = f.tell()
+        if remaining == 0:
+            return []
+        block = b""
+        while True:
+            size = min(_TAIL_CHUNK, remaining)
+            remaining -= size
+            f.seek(remaining)
+            block = f.read(size) + block
+            parts = block.split(b"\n")
+            usable = parts if remaining == 0 else parts[1:]  # the first part may be a partial line
+            if remaining == 0 or sum(1 for p in usable if p.strip()) >= n:
+                break
+    if remaining == 0 and block.startswith(_BOM):
+        usable[0] = usable[0][len(_BOM) :]
+    return [p.rstrip(b"\r") for p in usable if p.strip()][-n:]
+
+
+def _tail_is_torn(fh) -> bool:
+    fh.seek(0, os.SEEK_END)
+    size = fh.tell()
+    if size == 0:
+        return False
+    fh.seek(size - 1)
+    return fh.read(1) != b"\n"
+
+
+def append_jsonl(
+    path: Path,
+    records: dict | Iterable[dict] | bytes,
+    *,
+    lock: Literal["block", "try", "held"] = "block",
+    fsync: bool = False,
+    on_error: Literal["raise", "log"] = "raise",
+) -> int | None:
+    """Append dict records as JSONL in ONE write; return the record bytes written, or None if nothing was.
+
+    ``records`` is a dict, an iterable of dicts, or the bytes ``encode_jsonl`` returned. Everything is encoded
+    before the file is touched. Under the lock, if the file is non-empty and does not end in a newline (a torn
+    tail, #434) the same write begins with a newline, so only the torn record is lost. ``lock``: "block" waits
+    for ``file_lock(path)``; "try" returns None if it is busy; "held" takes no lock (the caller holds it). A
+    filesystem that refuses the lock degrades to unlocked with a warning. ``on_error="log"`` turns an OSError
+    into a throttled warning and None.
+    """
+    path = Path(path)
+    if lock not in ("block", "try", "held"):
+        raise ValueError(f"lock must be 'block', 'try' or 'held', not {lock!r}")
+    payload = bytes(records) if isinstance(records, (bytes, bytearray)) else encode_jsonl(records)
+    if not payload:
+        return 0
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stack = ExitStack()
+        acquired = True
+        if lock != "held":
+            try:
+                acquired = stack.enter_context(file_lock(path, blocking=(lock == "block")))
+            except OSError as exc:
+                warn_throttled(
+                    logger,
+                    f"json_io:{path}:lock",
+                    "could not take the lock for %s (%s); continuing without it",
+                    path,
+                    _short(exc),
+                )
+                acquired = True
+        with stack:
+            if not acquired:
+                return None
+            with open(path, "ab+") as fh:
+                prefix = b""
+                if _tail_is_torn(fh):
+                    prefix = b"\n"
+                    logger.warning(
+                        "%s ended in a torn record (no newline); starting a new line before appending",
+                        path,
+                    )
+                _seam("between_check_and_write", path)
+                fh.write(prefix + payload)
+                fh.flush()
+                if fsync:
+                    os.fsync(fh.fileno())
+    except OSError as exc:
+        if on_error == "raise":
+            raise
+        _report(path, "append", exc, "record dropped")
+        return None
+    return len(payload)
+
+
+def write_jsonl(
+    path: Path,
+    records: dict | Iterable[dict] | bytes,
+    *,
+    backups: int = 0,
+    fsync: bool = True,
+    mode: int | None = None,
+    on_error: Literal["raise", "log"] = "raise",
+) -> bool:
+    """Atomically replace a JSONL file with ``records`` (same writer as :func:`write_json`)."""
+    payload = bytes(records) if isinstance(records, (bytes, bytearray)) else encode_jsonl(records)
+    return _save_text(
+        Path(path), payload.decode("utf-8"), backups, fsync, mode, False, False, on_error
+    )

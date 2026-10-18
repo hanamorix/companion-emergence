@@ -689,7 +689,10 @@ class _OpenSpy:
             def wrapper(*args, **kwargs):
                 mode = kwargs.get("mode", args[1] if len(args) > 1 else "r")
                 enc = kwargs.get(
-                    "encoding", args[3] if len(args) > 3 and opener_name == "open" else None
+                    "encoding",
+                    args[3]
+                    if len(args) > 3 and opener_name in ("open", "io.open", "fdopen")
+                    else None,
                 )
                 if "b" not in str(mode) and (
                     enc is None or not str(enc).lower().replace("_", "-").startswith("utf-8")
@@ -1764,7 +1767,7 @@ def test_cw10_output_is_pure_ascii_whatever_the_payload(tmp_path: Path) -> None:
         "emoji": "\U0001f600",
         "bmp": "é日本",
         "lone": "\ud800",
-        "sep": "a b c",
+        "sep": "a\u2028b\u2029c",
         "nl": "x\ny\r",
     }
     jio.write_json(p, payload)
@@ -1845,3 +1848,685 @@ def test_cw12_baseline_a_plain_exists_check_lets_both_threads_write(tmp_path: Pa
     for t in threads:
         t.join(10)
     assert len(wrote) == 2
+
+
+# --------------------------------------------------------------------------------------------------------------
+# JSONL reads (CJ1-CJ6)
+# --------------------------------------------------------------------------------------------------------------
+
+import gzip  # noqa: E402
+
+
+def test_cj1_a_missing_file_yields_nothing(tmp_path: Path) -> None:
+    assert list(jio.iter_jsonl(tmp_path / "nope.jsonl")) == []
+    assert jio.read_jsonl(tmp_path / "nope.jsonl") == []
+
+
+def test_cj1_bad_lines_are_skipped_one_warning_each_and_neighbours_survive(
+    tmp_path: Path, caplog
+) -> None:
+    p = tmp_path / "log.jsonl"
+    long_bad = b'{"k": ' + b"9" * 400 + b" oops"
+    p.write_bytes(
+        b'{"a": 1}\n\n   \nnot json\n[1, 2]\n{"b": "caf\xff"}\n' + long_bad + b'\n{"c": 3}\n'
+    )
+    with caplog.at_level(logging.WARNING):
+        got = jio.read_jsonl(p)
+    assert got == [{"a": 1}, {"c": 3}]
+    msgs = [r.getMessage() for r in caplog.records]
+    assert len(msgs) == 4
+    for needle in ("line 4", "line 5", "line 6", "line 7"):
+        assert any(needle in m and str(p) in m for m in msgs), needle
+    assert all(len(m) < 700 for m in msgs)  # previews are capped at 201 characters
+
+
+def test_cj1_a_bom_on_the_first_line_and_crlf_endings_are_handled(tmp_path: Path) -> None:
+    p = tmp_path / "log.jsonl"
+    p.write_bytes(b'\xef\xbb\xbf{"a": 1}\r\n{"b": 2}\r\n')
+    assert jio.read_jsonl(p) == [{"a": 1}, {"b": 2}]
+
+
+def test_cj1_unicode_line_separators_inside_a_value_do_not_split_a_record(tmp_path: Path) -> None:
+    p = tmp_path / "log.jsonl"
+    value = "x" + chr(0x2028) + "y" + chr(0x2029) + "z" + chr(0x85) + "w"
+    p.write_bytes((json.dumps({"a": value}, ensure_ascii=False) + '\n{"b": 2}\n').encode())
+    assert jio.read_jsonl(p) == [{"a": value}, {"b": 2}]
+
+
+def test_cj1_baseline_splitlines_would_cut_that_record() -> None:
+    text = '{"a": "x\u2028y"}\n{"b": 2}\n'
+    assert (
+        len(text.splitlines()) == 3
+    )  # the bridge/feed.py:407 shape: one record becomes two broken ones
+
+
+def test_cj1_a_lone_carriage_return_is_not_a_record_separator(tmp_path: Path) -> None:
+    """Differs from the legacy text-mode reader on purpose; it cannot occur in files the app writes (JSON escapes \\r)."""
+    p = tmp_path / "log.jsonl"
+    p.write_bytes(b'{"c":3}\r{"d":4}\n')
+    assert jio.read_jsonl(p) == []
+
+
+_DIFFERENTIAL_INPUTS = [
+    b"",
+    b"\n\n",
+    b'{"a": 1}\n',
+    b'{"a": 1}',  # no trailing newline
+    b'{"a": 1}\n{"b": \n{"c": 3}\n',
+    b'{"a": 1}\n[1]\n"s"\n7\nnull\n{"b": 2}\n',
+    b'{"a": "caf\xff"}\n{"b": 2}\n',
+    b'{"a": 1}\r\n{"b": 2}\r\n',
+    '{"é": "ü日本\U0001f600"}\n'.encode(),
+]
+
+
+@pytest.mark.parametrize("data", _DIFFERENTIAL_INPUTS)
+def test_cj1_matches_the_legacy_reader_on_the_same_input(tmp_path: Path, data: bytes) -> None:
+    from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+
+    p = tmp_path / "log.jsonl"
+    p.write_bytes(data)
+    assert jio.read_jsonl(p) == read_jsonl_skipping_corrupt(p)
+
+
+def test_cj2_gz_files_are_read_by_suffix(tmp_path: Path) -> None:
+    p = tmp_path / "log.2025.jsonl.gz"
+    with gzip.open(p, "wb") as f:
+        f.write(b'{"a": 1}\nnot json\n{"b": 2}\n')
+    assert jio.read_jsonl(p) == [{"a": 1}, {"b": 2}]
+
+
+def _peak_bytes(fn) -> int:
+    import tracemalloc
+
+    tracemalloc.start()
+    try:
+        fn()
+        return tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+
+def test_cj2_iteration_is_streaming(tmp_path: Path) -> None:
+    p = tmp_path / "big.jsonl"
+    line = b'{"k": "' + b"x" * 90 + b'"}\n'
+    p.write_bytes(line * 55000)  # about 5 MB
+
+    def first():
+        it = jio.iter_jsonl(p)
+        assert next(it) == {"k": "x" * 90}
+        it.close()
+
+    assert _peak_bytes(first) < 1_000_000
+
+
+def test_cj2_baseline_reading_the_whole_text_peaks_far_higher(tmp_path: Path) -> None:
+    p = tmp_path / "big.jsonl"
+    p.write_bytes((b'{"k": "' + b"x" * 90 + b'"}\n') * 55000)
+    assert _peak_bytes(lambda: p.read_text().splitlines()) > 4_000_000
+
+
+def test_cj3_strict_iteration_raises_on_the_first_bad_line_after_yielding_the_good_ones(
+    tmp_path: Path,
+) -> None:
+    p = tmp_path / "log.jsonl"
+    p.write_bytes(b'{"a": 1}\n{"b": 2}\n{"torn": ')
+    seen = []
+    with pytest.raises(jio.JsonFileError) as exc:
+        for rec in jio.iter_jsonl(p, strict=True):
+            seen.append(rec)
+    assert seen == [{"a": 1}, {"b": 2}]
+    assert exc.value.kind == "line" and exc.value.line == 3 and isinstance(exc.value, OSError)
+
+
+def test_cj3_strict_tail_raises_on_an_invalid_utf8_last_line(tmp_path: Path) -> None:
+    p = tmp_path / "log.jsonl"
+    p.write_bytes(b'{"a": 1}\n{"b": "caf\xff"}\n')
+    with pytest.raises(jio.JsonFileError) as exc:
+        jio.read_jsonl_tail(p, 1, strict=True)
+    assert exc.value.kind == "line"
+    assert jio.read_jsonl_tail(p, 2) == [{"a": 1}]  # non-strict skips it with a warning
+
+
+def test_cj3_baseline_the_legacy_tail_helper_turns_the_bad_byte_into_a_replacement_character(
+    tmp_path: Path,
+) -> None:
+    from brain.health.jsonl_reader import read_last_n_jsonl_lines
+
+    p = tmp_path / "log.jsonl"
+    p.write_bytes(b'{"a": 1}\n{"b": "caf\xff"}\n')
+    [line] = read_last_n_jsonl_lines(p, 1)
+    assert json.loads(line) == {"b": "caf�"}  # silently corrupted data, parsed as valid
+
+
+def test_cj3_strict_raises_on_a_torn_trailing_line_and_on_a_non_object(tmp_path: Path) -> None:
+    p = tmp_path / "log.jsonl"
+    p.write_bytes(b'{"a": 1}\n{"b":')
+    with pytest.raises(jio.JsonFileError):
+        jio.read_jsonl_tail(p, 1, strict=True)
+    p.write_bytes(b'{"a": 1}\n[1]\n')
+    with pytest.raises(jio.JsonFileError):
+        jio.read_jsonl(p, strict=True)
+
+
+def test_cj4_trailing_blank_lines_do_not_count_toward_n(tmp_path: Path) -> None:
+    from brain.health.jsonl_reader import read_last_n_jsonl_lines
+
+    p = tmp_path / "log.jsonl"
+    p.write_bytes(b'{"a": 1}\n{"b": 2}\n{"c": 3}\n\n\n')
+    assert jio.read_jsonl_tail(p, 2) == [{"b": 2}, {"c": 3}]
+    assert read_last_n_jsonl_lines(p, 2) == ["", ""]  # the legacy helper: baseline
+
+
+def test_cj4_n_zero_and_a_missing_file_give_empty(tmp_path: Path) -> None:
+    p = tmp_path / "log.jsonl"
+    p.write_bytes(b'{"a": 1}\n')
+    assert jio.read_jsonl_tail(p, 0) == [] and jio.read_jsonl_tail(p, -3) == []
+    assert jio.read_jsonl_tail(tmp_path / "nope.jsonl", 3) == []
+    p.write_bytes(b"")
+    assert jio.read_jsonl_tail(p, 3) == []
+
+
+def test_cj4_fewer_lines_than_n_keeps_the_first_line(tmp_path: Path) -> None:
+    p = tmp_path / "log.jsonl"
+    p.write_bytes(b'{"a": 1}\n{"b": 2}')  # no trailing newline
+    assert jio.read_jsonl_tail(p, 10) == [{"a": 1}, {"b": 2}]
+
+
+def test_cj4_a_multibyte_character_split_by_a_chunk_boundary_is_decoded_once(
+    tmp_path: Path,
+) -> None:
+    p = tmp_path / "log.jsonl"
+    rows = [{"i": i, "t": "é日\U0001f600" * (1 + i % 7)} for i in range(900)]
+    p.write_bytes(b"".join((json.dumps(r, ensure_ascii=False) + "\n").encode() for r in rows))
+    assert p.stat().st_size > 3 * 8192
+    for n in (1, 5, 37, 400, 900, 1200):
+        assert jio.read_jsonl_tail(p, n) == rows[-n:], n
+
+
+def test_cj4_reads_are_bounded_by_n_not_by_the_file_size(tmp_path: Path, monkeypatch) -> None:
+    p = tmp_path / "big.jsonl"
+    p.write_bytes((b'{"k": "' + b"x" * 90 + b'"}\n') * 200_000)  # about 20 MB
+    read_sizes: list[int] = []
+    real_open = open
+
+    def spy(file, *a, **k):
+        fh = real_open(file, *a, **k)
+        if Path(file) != p or "b" not in (a[0] if a else k.get("mode", "r")):
+            return fh
+
+        class Proxy:
+            def __getattr__(self, name):
+                return getattr(fh, name)
+
+            def __enter__(self):
+                fh.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                return fh.__exit__(*exc)
+
+            def read(self, size=-1):
+                data = fh.read(size)
+                read_sizes.append(len(data))
+                return data
+
+        return Proxy()
+
+    monkeypatch.setattr("builtins.open", spy)
+    assert len(jio.read_jsonl_tail(p, 3)) == 3
+    monkeypatch.undo()
+    assert sum(read_sizes) < 100_000
+
+
+def test_cj4_a_bom_at_the_start_of_the_file_is_stripped_when_the_window_reaches_it(
+    tmp_path: Path,
+) -> None:
+    p = tmp_path / "log.jsonl"
+    p.write_bytes(b'\xef\xbb\xbf{"a": 1}\n{"b": 2}\n{"c": 3}\n')
+    assert jio.read_jsonl_tail(p, 5) == [{"a": 1}, {"b": 2}, {"c": 3}]
+    assert jio.read_jsonl_tail(p, 5, strict=True) == [{"a": 1}, {"b": 2}, {"c": 3}]
+
+
+def test_cj5_parse_jsonl_applies_the_same_rules_to_bytes_and_str(tmp_path: Path) -> None:
+    data = b'\xef\xbb\xbf{"a": 1}\nnot json\n{"b": 2}\n'
+    assert list(jio.parse_jsonl(data)) == [{"a": 1}, {"b": 2}]
+    assert list(jio.parse_jsonl(data.decode("utf-8-sig"))) == [{"a": 1}, {"b": 2}]
+    with pytest.raises(jio.JsonFileError) as exc:
+        list(jio.parse_jsonl(data, source="feed", strict=True))
+    assert exc.value.line == 2 and str(exc.value.path) == "feed"
+
+
+def test_cj6_a_directory_is_an_io_failure_with_the_default_policy(tmp_path: Path, caplog) -> None:
+    p = tmp_path / "log.jsonl"
+    p.mkdir()
+    with caplog.at_level(logging.DEBUG):
+        assert jio.read_jsonl(p) == []
+        assert jio.read_jsonl(p) == []
+    assert len(_warnings(caplog)) == 1  # throttled
+    with pytest.raises(jio.JsonFileError) as exc:
+        jio.read_jsonl(p, recover=jio.Recovery.RAISE)
+    assert exc.value.kind == "io"
+
+
+def _truncated_gz(tmp_path: Path) -> Path:
+    full = tmp_path / "full.gz"
+    with gzip.open(full, "wb") as f:
+        for i in range(2000):
+            f.write(json.dumps({"i": i, "pad": "x" * 50}).encode() + b"\n")
+    data = full.read_bytes()
+    cut = tmp_path / "cut.jsonl.gz"
+    cut.write_bytes(data[: len(data) // 2])
+    return cut
+
+
+def test_cj6_a_truncated_gz_yields_what_was_read_then_stops_with_evidence(
+    tmp_path: Path, caplog
+) -> None:
+    cut = _truncated_gz(tmp_path)
+    with caplog.at_level(logging.WARNING):
+        got = jio.read_jsonl(cut)
+    assert 0 < len(got) < 2000 and got[0] == {"i": 0, "pad": "x" * 50}
+    assert len(_warnings(caplog)) == 1
+    with pytest.raises(jio.JsonFileError) as exc:
+        jio.read_jsonl(cut, recover=jio.Recovery.RAISE)
+    assert exc.value.kind == "io" and not isinstance(exc.value, EOFError)
+
+
+def test_cj6_baseline_the_shared_reader_raises_eoferror_on_the_same_file(tmp_path: Path) -> None:
+    from brain.health.jsonl_reader import iter_jsonl_streaming
+
+    cut = _truncated_gz(tmp_path)
+    with pytest.raises(EOFError):
+        list(iter_jsonl_streaming(cut))
+
+
+def test_cj6_other_recovery_policies_are_rejected_for_jsonl(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        jio.read_jsonl(tmp_path / "x.jsonl", recover=jio.Recovery.HEAL)
+
+
+# --------------------------------------------------------------------------------------------------------------
+# JSONL appends and rewrites (CA1-CA6)
+# --------------------------------------------------------------------------------------------------------------
+
+
+class _WriteCounter:
+    """Count write() calls on binary append handles opened for ``target``."""
+
+    def __init__(self, monkeypatch, target: Path) -> None:
+        self.writes: list[bytes] = []
+        real_open = open
+        counter = self
+
+        def spy(file, *a, **k):
+            fh = real_open(file, *a, **k)
+            mode = a[0] if a else k.get("mode", "r")
+            if Path(file) != target or "a" not in mode:
+                return fh
+
+            class Proxy:
+                def __getattr__(self, name):
+                    return getattr(fh, name)
+
+                def __enter__(self):
+                    fh.__enter__()
+                    return self
+
+                def __exit__(self, *exc):
+                    return fh.__exit__(*exc)
+
+                def write(self, data):
+                    counter.writes.append(bytes(data))
+                    return fh.write(data)
+
+            return Proxy()
+
+        monkeypatch.setattr("builtins.open", spy)
+
+
+def test_ca1_append_creates_the_parent_writes_one_ascii_lf_line_and_returns_its_length(
+    tmp_path: Path, monkeypatch
+) -> None:
+    p = tmp_path / "deep" / "dir" / "log.jsonl"
+    counter = _WriteCounter(monkeypatch, p)
+    n = jio.append_jsonl(p, {"a": "é\U0001f600", "n": 1})
+    monkeypatch.undo()
+    assert len(counter.writes) == 1
+    raw = p.read_bytes()
+    raw.decode("ascii")
+    assert raw.endswith(b"\n") and b"\r" not in raw and raw.count(b"\n") == 1
+    assert n == len(raw) == len(jio.encode_jsonl({"a": "é\U0001f600", "n": 1}))
+    assert jio.read_jsonl(p) == [{"a": "é\U0001f600", "n": 1}]
+
+
+def test_ca1_a_batch_is_one_write_and_one_lock_acquisition(tmp_path: Path, monkeypatch) -> None:
+    p = tmp_path / "log.jsonl"
+    counter = _WriteCounter(monkeypatch, p)
+    locks: list[Path] = []
+    real_lock = jio.file_lock
+
+    def counting_lock(path, **k):
+        locks.append(Path(path))
+        return real_lock(path, **k)
+
+    monkeypatch.setattr(jio, "file_lock", counting_lock)
+    rows = [{"i": i} for i in range(50)]
+    n = jio.append_jsonl(p, rows)
+    monkeypatch.undo()
+    assert len(counter.writes) == 1 and len(locks) == 1
+    assert n == len(jio.encode_jsonl(rows)) and jio.read_jsonl(p) == rows
+
+
+def test_ca1_encoded_bytes_are_accepted_so_a_caller_can_size_a_segment_before_writing(
+    tmp_path: Path,
+) -> None:
+    p = tmp_path / "log.jsonl"
+    payload = jio.encode_jsonl([{"a": 1}, {"b": 2}])
+    assert jio.append_jsonl(p, payload) == len(payload)
+    assert p.read_bytes() == payload
+
+
+def test_ca1_an_empty_batch_returns_zero_and_touches_nothing(tmp_path: Path) -> None:
+    p = tmp_path / "log.jsonl"
+    assert jio.append_jsonl(p, []) == 0
+    assert not p.exists() and list(tmp_path.iterdir()) == []
+
+
+def test_ca2_concurrent_appends_from_threads_and_a_process_lose_nothing(tmp_path: Path) -> None:
+    import subprocess
+    import textwrap
+
+    p = tmp_path / "log.jsonl"
+    code = textwrap.dedent(
+        """
+        import sys
+        from pathlib import Path
+        from brain.health import json_io
+        for n in range(25):
+            json_io.append_jsonl(Path(sys.argv[1]), {"src": "proc", "n": n})
+        """
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", code, str(p)],
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[4])},
+    )
+
+    def work(i):
+        for n in range(25):
+            jio.append_jsonl(p, {"src": f"t{i}", "n": n})
+
+    threads = [threading.Thread(target=work, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+    assert child.wait(60) == 0
+    rows = jio.read_jsonl(p)
+    assert len(rows) == 8 * 25 + 25
+    assert p.read_bytes().count(b"\n") == len(rows)
+
+
+def test_ca2_block_waits_while_another_handle_holds_the_lock(tmp_path: Path) -> None:
+    p = tmp_path / "log.jsonl"
+    holder, release = _hold_shared_lock_in_thread(p)
+    try:
+        worker, box = _in_thread(lambda: jio.append_jsonl(p, {"a": 1}), timeout=0.5)
+        assert worker.is_alive(), "append did not wait for the lock"
+        assert not p.exists() or p.read_bytes() == b""
+    finally:
+        release.set()
+        holder.join(5)
+    worker.join(5)
+    assert box.get("result") == len(jio.encode_jsonl({"a": 1}))
+    assert jio.read_jsonl(p) == [{"a": 1}]
+
+
+def test_ca2_try_returns_none_and_writes_nothing_when_the_lock_is_busy(tmp_path: Path) -> None:
+    p = tmp_path / "log.jsonl"
+    holder, release = _hold_shared_lock_in_thread(p)
+    try:
+        assert jio.append_jsonl(p, {"a": 1}, lock="try") is None
+        assert not p.exists() or p.read_bytes() == b""
+    finally:
+        release.set()
+        holder.join(5)
+    assert jio.append_jsonl(p, {"a": 1}, lock="try") is not None
+
+
+def test_ca2_held_takes_no_lock_so_a_caller_holding_it_does_not_deadlock(tmp_path: Path) -> None:
+    from brain.utils.file_lock import file_lock
+
+    p = tmp_path / "log.jsonl"
+
+    def work():
+        with file_lock(p):
+            return jio.append_jsonl(p, {"a": 1}, lock="held")
+
+    worker, box = _in_thread(work, timeout=5)
+    assert not worker.is_alive(), "lock='held' re-locked and deadlocked"
+    assert box["result"] is not None
+
+
+def test_ca2_baseline_block_while_the_caller_holds_the_lock_would_deadlock(tmp_path: Path) -> None:
+    from brain.utils.file_lock import file_lock
+
+    p = tmp_path / "log.jsonl"
+
+    def work():
+        with file_lock(p):
+            return jio.append_jsonl(p, {"a": 1}, lock="block")
+
+    worker, _box = _in_thread(work, timeout=1.0)
+    assert worker.is_alive()  # a second flock on a new handle in the same process blocks forever
+
+
+def test_ca2_a_refused_lock_still_appends_with_one_warning(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    import contextlib
+
+    @contextlib.contextmanager
+    def refusing(path, *, blocking=True):
+        raise OSError(errno.ENOLCK, "no locks")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(jio, "file_lock", refusing)
+    p = tmp_path / "log.jsonl"
+    with caplog.at_level(logging.WARNING):
+        assert jio.append_jsonl(p, {"a": 1}) is not None
+        assert jio.append_jsonl(p, {"b": 2}) is not None
+    assert jio.read_jsonl(p) == [{"a": 1}, {"b": 2}]
+    assert len(_warnings(caplog)) == 1  # throttled
+
+
+def test_ca3_an_append_after_a_torn_tail_starts_a_new_line(tmp_path: Path, caplog) -> None:
+    p = tmp_path / "log.jsonl"
+    torn = b'{"a": 1}\n{"b": '
+    p.write_bytes(torn)
+    with caplog.at_level(logging.WARNING):
+        jio.append_jsonl(p, {"c": 3})
+    assert p.read_bytes() == torn + b"\n" + jio.encode_jsonl({"c": 3})
+    assert jio.read_jsonl(p) == [{"a": 1}, {"c": 3}]  # only the torn record is lost
+    assert any(
+        str(p) in r.getMessage() and "torn" in r.getMessage().lower() for r in caplog.records
+    )
+
+
+def test_ca3_a_tail_cut_inside_a_multibyte_character_is_handled(tmp_path: Path) -> None:
+    p = tmp_path / "log.jsonl"
+    p.write_bytes(b'{"a": 1}\n{"b": "\xc3')
+    jio.append_jsonl(p, {"c": 3})
+    assert jio.read_jsonl(p) == [{"a": 1}, {"c": 3}]
+
+
+@pytest.mark.parametrize("before", [None, b"", b'{"a": 1}\n', b'{"a": 1}\r\n'])
+def test_ca3_no_prefix_newline_when_the_file_is_missing_empty_or_already_ends_in_one(
+    tmp_path: Path, before
+) -> None:
+    p = tmp_path / "log.jsonl"
+    if before is not None:
+        p.write_bytes(before)
+    jio.append_jsonl(p, {"c": 3})
+    assert p.read_bytes() == (before or b"") + jio.encode_jsonl({"c": 3})
+
+
+def test_ca3_baseline_without_the_tail_check_the_new_record_fuses_and_is_lost(
+    tmp_path: Path,
+) -> None:
+    from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+
+    p = tmp_path / "log.jsonl"
+    p.write_bytes(b'{"a": 1}\n{"b": ')
+    with open(p, "ab") as fh:  # what every locked and lock-free appender does today
+        fh.write(b'{"c": 3}\n')
+    assert read_jsonl_skipping_corrupt(p) == [
+        {"a": 1}
+    ]  # #434: the valid record is dropped with the torn one
+
+
+def test_ca4_a_legacy_appender_landing_between_the_check_and_the_write_cannot_cost_our_record(
+    tmp_path: Path, monkeypatch
+) -> None:
+    p = tmp_path / "log.jsonl"
+    p.write_bytes(b'{"a": 1}\n{"torn": ')
+
+    def legacy_appender(name, path):
+        if name == "between_check_and_write":
+            with open(path, "ab") as fh:  # a lock-free legacy appender, fusing onto the torn tail
+                fh.write(b'{"legacy": 1}\n')
+
+    monkeypatch.setattr(jio, "_seam", legacy_appender)
+    jio.append_jsonl(p, {"ours": 1})
+    monkeypatch.undo()
+    rows = jio.read_jsonl(p)
+    assert {"ours": 1} in rows and {
+        "a": 1
+    } in rows  # the torn bytes and the legacy record may die together; ours may not
+
+
+def test_ca4_a_stale_check_costs_at_most_a_blank_line(tmp_path: Path, monkeypatch) -> None:
+    p = tmp_path / "log.jsonl"
+    p.write_bytes(b'{"a": 1}\n{"b": ')
+
+    def completer(name, path):
+        if name == "between_check_and_write":
+            with open(path, "ab") as fh:  # the slow writer finishes its line after we looked
+                fh.write(b"2}\n")
+
+    monkeypatch.setattr(jio, "_seam", completer)
+    jio.append_jsonl(p, {"ours": 1})
+    monkeypatch.undo()
+    assert jio.read_jsonl(p) == [{"a": 1}, {"b": 2}, {"ours": 1}]
+    assert b"\n\n" in p.read_bytes()  # the blank line the reader skips
+
+
+def test_ca5_fsync_is_opt_in_for_appends(tmp_path: Path, monkeypatch) -> None:
+    calls = _count_fsyncs(monkeypatch)
+    jio.append_jsonl(tmp_path / "a.jsonl", {"a": 1})
+    assert calls == []
+    jio.append_jsonl(tmp_path / "b.jsonl", {"a": 1}, fsync=True)
+    assert calls
+
+
+@pytest.mark.parametrize(
+    "bad,exc",
+    [
+        ([1, 2], TypeError),
+        ("text", TypeError),
+        ({"x": float("nan")}, ValueError),
+        ({"x": object()}, TypeError),
+    ],
+)
+def test_ca5_a_bad_record_raises_before_the_file_is_created_or_touched(
+    tmp_path: Path, bad, exc
+) -> None:
+    p = tmp_path / "log.jsonl"
+    with pytest.raises(exc):
+        jio.append_jsonl(p, bad)
+    assert not p.exists()
+    p.write_bytes(b'{"a": 1}\n')
+    with pytest.raises(exc):
+        jio.append_jsonl(p, [{"ok": 1}, bad])  # one bad record in a batch writes none of it
+    assert p.read_bytes() == b'{"a": 1}\n'
+
+
+def test_ca5_log_mode_returns_none_with_evidence_for_an_oserror_but_never_swallows_a_type_error(
+    tmp_path: Path, caplog
+) -> None:
+    blocker = tmp_path / "blocker"
+    blocker.write_text("i am a file")
+    p = blocker / "sub" / "log.jsonl"  # the parent cannot be created
+    with caplog.at_level(logging.DEBUG):
+        assert jio.append_jsonl(p, {"a": 1}, on_error="log") is None
+        assert jio.append_jsonl(p, {"a": 1}, on_error="log") is None
+    assert len(_warnings(caplog)) == 1
+    with pytest.raises(OSError):
+        jio.append_jsonl(p, {"a": 1})
+    with pytest.raises(TypeError):
+        jio.append_jsonl(tmp_path / "ok.jsonl", [1], on_error="log")
+
+
+def test_ca6_write_jsonl_replaces_atomically_and_writes_ascii_lf(tmp_path: Path) -> None:
+    p = tmp_path / "q.jsonl"
+    assert jio.write_jsonl(p, [{"a": "é"}, {"b": 2}]) is True
+    assert p.read_bytes() == jio.encode_jsonl([{"a": "é"}, {"b": 2}])
+    p.read_bytes().decode("ascii")
+    assert jio.write_jsonl(p, []) is True and p.read_bytes() == b""  # the drain shape
+    assert jio.write_jsonl(p, jio.encode_jsonl({"z": 1})) is True and jio.read_jsonl(p) == [
+        {"z": 1}
+    ]
+
+
+def test_ca6_a_failed_rewrite_leaves_the_old_file_and_no_temp(tmp_path: Path, monkeypatch) -> None:
+    p = tmp_path / "q.jsonl"
+    jio.write_jsonl(p, [{"old": 1}], backups=1)
+    jio.write_jsonl(p, [{"old": 2}], backups=1)
+
+    def boom(fd):
+        raise OSError(errno.EIO, "disk")
+
+    monkeypatch.setattr(os, "fsync", boom)
+    with pytest.raises(OSError):
+        jio.write_jsonl(p, [{"new": 1}], backups=1)
+    monkeypatch.undo()
+    assert jio.read_jsonl(p) == [{"old": 2}] and not list(tmp_path.glob("*.new"))
+
+
+def test_ca6_backups_and_the_heal_sidecar_apply_to_a_rewrite(tmp_path: Path) -> None:
+    p = tmp_path / "q.jsonl"
+    for n in range(3):
+        jio.write_jsonl(p, [{"n": n}], backups=2)
+    assert jio.read_jsonl(tmp_path / "q.jsonl.bak1") == [{"n": 1}]
+    assert jio.read_jsonl(tmp_path / "q.jsonl.bak2") == [{"n": 0}]
+    assert (
+        jio.write_jsonl(tmp_path / "log" / "r.jsonl", [{"a": 1}]) is True
+    )  # missing parent is created
+
+
+def test_ca6_on_error_log_returns_false(tmp_path: Path, monkeypatch) -> None:
+    blocker = tmp_path / "blocker"
+    blocker.write_text("file")
+    assert jio.write_jsonl(blocker / "x.jsonl", [{"a": 1}], on_error="log") is False
+
+
+def test_cr11_no_public_function_opens_a_text_file_without_utf8(
+    tmp_path: Path, monkeypatch
+) -> None:
+    state, log = tmp_path / "state.json", tmp_path / "log.jsonl"
+    state.write_text('{"a": 1}')
+    log.write_text('{"a": 1}\n')
+    (tmp_path / "bad.json").write_text("{nope")
+    (tmp_path / "bad.json.bak1").write_text('{"b": 1}')
+    spy = _OpenSpy(monkeypatch)
+    jio.read_json(state, default=dict)
+    jio.read_json(tmp_path / "bad.json", default=dict, recover=jio.Recovery.HEAL)
+    jio.write_json(tmp_path / "w.json", {"a": "é"}, backups=2)
+    jio.write_json(tmp_path / "v.json", {"a": 1}, verify=True)
+    jio.write_json(tmp_path / "once.json", {"a": 1}, if_missing=True)
+    jio.read_jsonl(log)
+    jio.read_jsonl_tail(log, 3)
+    jio.append_jsonl(log, {"b": "é"})
+    jio.write_jsonl(tmp_path / "rw.jsonl", [{"a": 1}])
+    list(jio.parse_jsonl(b'{"a": 1}\n'))
+    assert spy.violations == []
