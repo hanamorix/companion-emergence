@@ -39,3 +39,20 @@ def test_parse_malformed_raises():
 
     with pytest.raises(ValueError):
         parse_making("not json at all")
+
+
+def test_make_records_an_unparseable_making(tmp_path):
+    """#364: the making still raises (the runner handles that), and the reply is kept."""
+    import pytest
+
+    from brain.health.parse_failures import PARSE_FAILURE_LOG
+    from brain.maker.maker import make
+
+    class P:
+        def complete(self, prompt):
+            return "I'd rather not make anything today."
+
+    with pytest.raises(ValueError):
+        make(P(), charge_sources=["x"], emotion_summary="calm", persona_dir=tmp_path)
+    (row,) = [json.loads(line) for line in (tmp_path / PARSE_FAILURE_LOG).read_text(encoding="utf-8").splitlines()]
+    assert row["site"] == "maker" and row["raw"] == "I'd rather not make anything today."

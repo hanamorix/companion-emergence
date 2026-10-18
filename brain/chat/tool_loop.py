@@ -88,6 +88,7 @@ def run_pass2_monologue(
             monologue_blocks=(monologue_text,),
             visible_reply=visible_reply,
             recent_turn_context=recent_user_msgs,
+            persona_dir=persona_dir,
         )
         apply_side_effects(out, persona_dir=persona_dir)
     except Exception:  # noqa: BLE001

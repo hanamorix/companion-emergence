@@ -20,6 +20,7 @@ from pathlib import Path
 
 from brain import prompt_strings
 from brain.bridge import cli_throttle as _default_throttle
+from brain.health.parse_failures import record_parse_failure
 from brain.kindled_link import limits
 from brain.state_compat import from_known_fields
 
@@ -213,8 +214,10 @@ def run_relationship_reflection(
 
     try:
         data = json.loads(raw[raw.index("{"):raw.rindex("}") + 1])
-    except Exception:  # noqa: BLE001 — malformed → unchanged
-        log.warning("relationship reflection: malformed verdict; state unchanged", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 — malformed → unchanged
+        record_parse_failure(
+            persona_dir, site="kindled_relationship", raw=raw, error=type(exc).__name__, keep_raw=False
+        )
         return state
 
     # hard breach → immediate reset to stranger (the only multi-stage move)

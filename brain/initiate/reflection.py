@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Literal
 
 from brain import prompt_strings
+from brain.health.parse_failures import record_parse_failure
 from brain.initiate.d_call_schema import DCallRow, make_d_call_id
 from brain.initiate.schemas import InitiateCandidate
 from brain.utils.llm_output import extract_json_object
@@ -208,6 +209,8 @@ class ReflectionDeps:
     sonnet_call: LLMCall
     now: datetime
     tick_id: str
+    # #364: where a malformed D reply is kept. None = log line only.
+    persona_dir: Path | None = None
 
 
 def _render_candidate_summary(c: InitiateCandidate, *, now: datetime) -> str:
@@ -298,7 +301,8 @@ def run(
     try:
         haiku_result = parse_structured_response(raw_h)
         haiku_low = any(d.confidence == "low" for d in haiku_result.decisions)
-    except ValueError:
+    except ValueError as exc:
+        record_parse_failure(deps.persona_dir, site="d_reflection_haiku", raw=raw_h, error=str(exc))
         haiku_result = None
         haiku_low = True
 
@@ -346,7 +350,8 @@ def run(
 
     try:
         sonnet_result = parse_structured_response(raw_s)
-    except ValueError:
+    except ValueError as exc:
+        record_parse_failure(deps.persona_dir, site="d_reflection_sonnet", raw=raw_s, error=str(exc))
         # Sonnet also malformed — caller treats this as "promote all" per spec §E.
         return DReflectionResult(decisions=[], tick_note=None), DCallRow(
             d_call_id=make_d_call_id(deps.now),

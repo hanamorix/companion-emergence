@@ -167,6 +167,7 @@ def _process_one_candidate(
                 recent_voice_evolutions=recent_evolutions,
                 current_local_time=now,
                 companion_name=companion_name,
+                persona_dir=persona_dir,
             )
         else:
             # Hydrate semantic memory IDs into content excerpts. The compose
@@ -218,6 +219,7 @@ def _process_one_candidate(
                 current_local_time=now,
                 voice_edit_acceptance_rate=None,
                 companion_name=companion_name,
+                persona_dir=persona_dir,
             )
     except Exception as exc:
         logger.exception("initiate composition failed for candidate %s", candidate.candidate_id)
@@ -415,6 +417,7 @@ def run_initiate_review_tick(
         sonnet_call=_make_sonnet_call(gate_provider),
         now=now,
         tick_id=tick_id,
+        persona_dir=persona_dir,
     )
 
     result, dcall = reflection_run(candidates, deps=deps)

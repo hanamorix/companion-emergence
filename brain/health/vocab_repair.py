@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from brain import prompt_strings
+from brain.health.parse_failures import record_parse_failure
 from brain.utils.llm_output import extract_json_object
 
 if TYPE_CHECKING:
@@ -365,7 +366,11 @@ def _describe_stubs(
                 except TypeError:
                     raw = provider.generate(user_prompt, system=_DESCRIBE_SYSTEM)
                 # #173: Haiku may fence its reply; use the shared tolerant extractor.
-                mapping: dict = json.loads(extract_json_object(raw))
+                try:
+                    mapping: dict = json.loads(extract_json_object(raw))
+                except ValueError as exc:
+                    record_parse_failure(persona_dir, site="vocab_repair", raw=raw, error=str(exc))
+                    raise
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "vocab_repair: provider call or parse failed for batch %r: %s — "

@@ -66,6 +66,19 @@ def test_health_returns_ok(persona_dir: Path):
         assert body["health_error"] is None
 
 
+def test_health_counts_recent_parse_failures_per_site(persona_dir: Path):
+    """#364: the parse-failure log's reader. A site whose replies stop parsing
+    shows up here instead of failing quietly behind its fallback."""
+    from brain.health.parse_failures import record_parse_failure
+
+    record_parse_failure(persona_dir, site="extractor", raw="```json\n{", error="bad")
+    record_parse_failure(persona_dir, site="extractor", raw="nope", error="bad")
+    record_parse_failure(persona_dir, site="attunement", raw="nope", error="bad")
+    with _make_client(persona_dir) as c:
+        body = c.get("/health").json()
+    assert body["parse_failures_24h"] == {"extractor": 2, "attunement": 1}
+
+
 def test_health_reports_scan_failure(persona_dir: Path, monkeypatch):
     import brain.bridge.server as srv
 

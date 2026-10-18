@@ -15,9 +15,11 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 from brain import prompt_strings
 from brain.bridge.provider import LLMProvider
+from brain.health.parse_failures import record_parse_failure
 from brain.ingest.types import ExtractedItem
 
 logger = logging.getLogger(__name__)
@@ -218,8 +220,10 @@ def extract_items_with_status(
     assistant_name: str | None = None,
     emotion_vocab: str = "",
     user_pronouns: object = None,
+    persona_dir: Path | None = None,
 ) -> ExtractionOutcome:
     """Call the provider and distinguish valid-empty from failed-empty.
+    Each unparseable reply is kept in the parse-failure log (#364).
 
     Backward-compatible ``extract_items`` intentionally keeps returning just a
     list. The ingest pipeline uses this richer outcome so provider/parse
@@ -268,7 +272,7 @@ def extract_items_with_status(
             return ExtractionOutcome(items=items)
 
         last_error = f"parse failed on attempt {attempt}/{max_retries}"
-        logger.warning("extract_items: parse failed on attempt %d/%d", attempt, max_retries)
+        record_parse_failure(persona_dir, site="ingest_extract", raw=raw_text or "", error=last_error)
 
     logger.warning("extract_items: gave up after %d retries", max_retries)
     return ExtractionOutcome(
