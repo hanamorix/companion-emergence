@@ -718,10 +718,11 @@ class _OpenSpy:
 def test_cr11_baseline_the_spy_flags_three_legacy_writers_with_no_explicit_encoding(
     tmp_path: Path, monkeypatch
 ) -> None:
+    from datetime import UTC, datetime
+
     from brain.chat.tool_loop import _log_attunement_error
     from brain.felt_time.weather_shift import append_shift_log
     from brain.self_model.articulate import _log_articulate_error
-    from datetime import UTC, datetime
 
     spy = _OpenSpy(monkeypatch)
     append_shift_log(tmp_path, ts=datetime.now(UTC), channel="c", label="l")
@@ -739,7 +740,6 @@ def test_cr11_baseline_the_spy_flags_three_legacy_writers_with_no_explicit_encod
 # --------------------------------------------------------------------------------------------------------------
 
 import re  # noqa: E402
-import shutil  # noqa: E402
 
 _SCHEMA_OK = b'{"interests": [1]}'
 
