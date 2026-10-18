@@ -1,7 +1,6 @@
 """Persistence + grounding gate for the attunement subsystem."""
 from __future__ import annotations
 
-import json
 import logging
 import re
 import unicodedata
@@ -18,7 +17,7 @@ from brain.attunement.schemas import (
     PatternCandidate,
     pattern_id,
 )
-from brain.health.json_io import Recovery, append_jsonl, read_jsonl
+from brain.health.json_io import Recovery, append_jsonl, read_json, read_jsonl, write_json
 from brain.state_compat import from_known_fields
 
 log = logging.getLogger(__name__)
@@ -37,22 +36,20 @@ def _current_read_path(persona_dir: Path) -> Path:
 
 def write_current_read(persona_dir: Path, read: CurrentRead) -> None:
     """Overwrite the current-read snapshot file. Atomic via .tmp + rename."""
-    target = _current_read_path(persona_dir)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_suffix(".tmp")
-    tmp.write_text(json.dumps(asdict(read), indent=2, sort_keys=True))
-    tmp.replace(target)
+    write_json(_current_read_path(persona_dir), asdict(read), indent=2, sort_keys=True, fsync=False)
 
 
 def read_current_read(persona_dir: Path) -> CurrentRead | None:
     """Return the latest current-read snapshot, or None if missing/corrupt."""
-    target = _current_read_path(persona_dir)
-    if not target.exists():
+    # CONTENT: an unreadable file raises (as it always did); a missing or corrupt one is "no snapshot".
+    payload = read_json(
+        _current_read_path(persona_dir), default=lambda: None, recover=Recovery.CONTENT, expect=dict
+    )
+    if payload is None:
         return None
     try:
-        payload = json.loads(target.read_text())
         return from_known_fields(CurrentRead, payload)
-    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+    except (TypeError, ValueError) as exc:
         log.warning("attunement: corrupt current_read.json — treating as missing: %s", exc)
         return None
 

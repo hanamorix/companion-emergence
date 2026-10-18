@@ -19,6 +19,7 @@ from brain.bridge.provider import LLMProvider
 from brain.engines._interests import Interest, InterestSet, spawn_interest
 from brain.engines.research_notes import append_session_notes, read_notes_tail
 from brain.engines.research_session import parse_session_output
+from brain.health.json_io import Recovery, read_json_result, write_json
 from brain.health.parse_failures import record_parse_failure
 from brain.memory.store import Memory, MemoryStore
 from brain.search.base import WebSearcher
@@ -777,8 +778,6 @@ class ResearchLog:
     @classmethod
     def load(cls, path: Path) -> ResearchLog:
         """Load the log; heal from .bak rotation if corrupt, log WARNING."""
-        from brain.health.attempt_heal import attempt_heal
-
         def _default_factory() -> dict:
             return {"version": 1, "fires": []}
 
@@ -786,7 +785,8 @@ class ResearchLog:
             if not isinstance(data, dict) or not isinstance(data.get("fires"), list):
                 raise ValueError("research log schema invalid: missing 'fires' list")
 
-        data, anomaly = attempt_heal(path, _default_factory, schema_validator=_schema_validator)
+        _res = read_json_result(path, default=_default_factory, recover=Recovery.HEAL, validate=_schema_validator)
+        data, anomaly = _res.data, _res.anomaly
         if anomaly is not None:
             logger.warning(
                 "ResearchLog anomaly detected: %s action=%s file=%s",
@@ -798,13 +798,11 @@ class ResearchLog:
         return cls(fires=tuple(ResearchFire.from_dict(f) for f in fires_raw if isinstance(f, dict)))
 
     def save(self, path: Path) -> None:
-        """Atomic save via .bak rotation (save_with_backup)."""
+        """Atomic save via .bak rotation (write_json)."""
         from brain.health.adaptive import compute_treatment
-        from brain.health.attempt_heal import save_with_backup
-
         payload = {"version": 1, "fires": [f.to_dict() for f in self.fires]}
         treatment = compute_treatment(path.parent, path.name)
-        save_with_backup(path, payload, backup_count=treatment.backup_count)
+        write_json(path, payload, backups=treatment.backup_count)
 
     def appended(self, fire: ResearchFire) -> ResearchLog:
         return ResearchLog(fires=self.fires + (fire,))

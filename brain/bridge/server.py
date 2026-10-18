@@ -71,7 +71,7 @@ from brain.chat.session import (
     get_or_hydrate_session,
 )
 from brain.health.alarm import compute_pending_alarms
-from brain.health.json_io import Recovery, iter_jsonl
+from brain.health.json_io import Recovery, iter_jsonl, read_json
 from brain.health.parse_failures import count_recent as count_recent_parse_failures
 from brain.health.walker import walk_persona
 from brain.ingest.buffer import _SESSION_ID_RE as _BUFFER_SESSION_ID_RE
@@ -717,7 +717,7 @@ def _run_heartbeat_close(persona_dir: Path, provider: LLMProvider) -> None:
     state_path = persona_dir / "heartbeat_state.json"
     if state_path.exists():
         try:
-            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state = read_json(state_path, default=dict, expect=dict)
             last_run = state.get("last_close_at") or state.get("last_run")
             if last_run:
                 if last_run.endswith("Z"):
@@ -1679,12 +1679,9 @@ def build_app(
         _maturity_order = {"known": 0, "forming": 1, "immature": 2, "falsified": 3}
         patterns_sorted = sorted(patterns, key=lambda p: _maturity_order.get(p.maturity, 99))
         backfill = None
-        bf_path = persona_dir / "attunement" / "backfill_state.json"
-        if bf_path.exists():
-            try:
-                backfill = json.loads(bf_path.read_text(encoding="utf-8"))
-            except (ValueError, OSError):
-                backfill = None
+        backfill = read_json(
+            persona_dir / "attunement" / "backfill_state.json", default=lambda: None
+        )  # missing, corrupt or unreadable: None
         return {
             "current_read": asdict(current) if current else None,
             "learned_patterns": [asdict(p) for p in patterns_sorted],

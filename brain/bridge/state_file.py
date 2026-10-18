@@ -21,7 +21,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from brain.health.adaptive import compute_treatment
-from brain.health.attempt_heal import attempt_heal, save_with_backup
+from brain.health.json_io import Recovery, read_json_result, write_json
 from brain.state_compat import from_known_fields
 
 logger = logging.getLogger(__name__)
@@ -88,26 +88,17 @@ def write(persona_dir: Path, state: BridgeState) -> None:
     except Exception:
         logger.warning("compute_treatment failed; defaulting to backup_count=3")
         backup_count = 3
-    save_with_backup(path, asdict(state), backup_count=backup_count)
-    _protect_state_files(path, backup_count)
+    # mode=0o600 applies to the file and to every rotated backup (the token must never be wider).
+    write_json(path, asdict(state), backups=backup_count, mode=0o600)
+    _protect_state_dir(path)
 
 
-def _protect_state_files(path: Path, backup_count: int) -> None:
-    """Keep bridge state/token files owner-only after atomic rotation."""
+def _protect_state_dir(path: Path) -> None:
+    """Keep the bridge state directory owner-only (the files get 0o600 from write_json)."""
     try:
         path.parent.chmod(0o700)
     except OSError as exc:
         logger.warning("failed to chmod bridge state dir %s: %s", path.parent, exc)
-    for candidate in [
-        path,
-        *(path.with_name(f"{path.name}.bak{i}") for i in range(1, backup_count + 1)),
-    ]:
-        if not candidate.exists():
-            continue
-        try:
-            candidate.chmod(0o600)
-        except OSError as exc:
-            logger.warning("failed to chmod bridge state file %s: %s", candidate, exc)
 
 
 def read(persona_dir: Path) -> BridgeState | None:
@@ -120,7 +111,8 @@ def read(persona_dir: Path) -> BridgeState | None:
     path = _state_path(persona_dir)
     if not path.exists():
         return None
-    data, anomaly = attempt_heal(path, _default_factory)
+    res = read_json_result(path, default=_default_factory, recover=Recovery.HEAL)
+    data, anomaly = res.data, res.anomaly
     if anomaly is not None:
         logger.warning(
             "bridge.json anomaly: %s (%s) — using recovered/default state",

@@ -1,58 +1,18 @@
 # Allowlist for tests/unit/test_no_direct_json_io.py: today's unmigrated direct JSON file I/O in brain/.
 # path::kind::count   # tag. Format and rules: see that test's docstring. Migration PRs delete or lower entries; nothing is added.
 
-brain/attunement/backfill.py::read::1   # G3
-brain/attunement/backfill.py::write::1   # G5
-brain/attunement/budget.py::read::2   # G4
-brain/attunement/budget.py::write::1   # G5
 brain/attunement/detector.py::not-file-io::1   # not-file: model-reply
-brain/attunement/feed_source.py::read::1   # G3
-brain/attunement/store.py::read::1   # G3
-brain/attunement/store.py::write::1   # G5,G6
 brain/bridge/chat.py::not-file-io::1   # not-file: model-reply
-brain/bridge/job_progress.py::read::1   # G3
-brain/bridge/job_progress.py::write::1   # G5
-brain/bridge/persisted_cadence.py::read::2   # G3
-brain/bridge/persisted_cadence.py::write::1   # G5
-brain/bridge/persona_state.py::read::3   # G3
-brain/bridge/pronoun_nudge.py::read::1   # G3
-brain/bridge/pronoun_nudge.py::write::1   # G5
+brain/bridge/persona_state.py::read::1   # held: felt-time audit first (Roy 2026-10-14)
 brain/bridge/provider.py::not-file-io::14   # not-file: subprocess
 brain/bridge/provider.py::read::1   # held: #406/#417 (Hana's open PRs)
 brain/bridge/provider.py::write::4   # held: #406/#417 (Hana's open PRs)
 brain/bridge/server.py::not-file-io::2   # not-file: sqlite-or-wire
-brain/bridge/server.py::read::2   # G3,G7
-brain/bridge/state_file.py::legacy:attempt_heal::1   # G1
-brain/bridge/state_file.py::legacy:save_with_backup::1   # G2
 brain/chat/extractor.py::not-file-io::1   # not-file: model-reply
-brain/chat/extractor.py::read::1   # G3
-brain/chat/extractor.py::write::1   # G5,G6
-brain/chat/pass2_queue.py::read::1   # G3
-brain/chat/pass2_queue.py::write::1   # G5
-brain/chat/reflection_gate.py::read::1   # G4
-brain/chat/reflection_gate.py::write::1   # G5
 brain/chat/tool_loop.py::not-file-io::3   # not-file: prompt-or-log
 brain/cli.py::not-file-io::11   # not-file: prompt-or-log
-brain/creative/dna.py::legacy:attempt_heal::1   # G1
-brain/creative/dna.py::legacy:save_with_backup::1   # G2
-brain/creative/dna.py::read::1   # G4
-brain/emotion/persona_loader.py::legacy:attempt_heal::1   # G1
-brain/emotion/persona_loader.py::legacy:save_with_backup::3   # G2
-brain/engines/_interests.py::legacy:attempt_heal::1   # G1
-brain/engines/_interests.py::legacy:save_with_backup::1   # G2
-brain/engines/_interests.py::read::2   # G4
 brain/engines/consolidation.py::not-file-io::4   # not-file: model-reply
-brain/engines/daemon_state.py::legacy:attempt_heal::1   # G1
-brain/engines/daemon_state.py::legacy:save_with_backup::2   # G2
-brain/engines/heartbeat.py::legacy:attempt_heal::2   # G1
-brain/engines/heartbeat.py::legacy:save_with_backup::2   # G2
-brain/engines/heartbeat.py::read::2   # G2
 brain/engines/interest_sweep.py::not-file-io::1   # not-file: model-reply
-brain/engines/reflex.py::legacy:attempt_heal::2   # G1
-brain/engines/reflex.py::legacy:save_with_backup::1   # G2
-brain/engines/reflex.py::read::1   # G4
-brain/engines/research.py::legacy:attempt_heal::1   # G1
-brain/engines/research.py::legacy:save_with_backup::1   # G2
 brain/engines/research.py::not-file-io::3   # not-file: model-reply
 brain/felt_time/anchors.py::legacy:iter_jsonl_skipping_corrupt::1   # held: felt-time audit first (Roy 2026-10-14)
 brain/felt_time/chat_log.py::legacy:iter_jsonl_skipping_corrupt::1   # held: felt-time audit first (Roy 2026-10-14)
@@ -61,113 +21,37 @@ brain/felt_time/state.py::legacy:iter_jsonl_skipping_corrupt::1   # held: felt-t
 brain/felt_time/state.py::legacy:save_with_backup::1   # held: felt-time audit first (Roy 2026-10-14)
 brain/felt_time/state.py::read::1   # held: felt-time audit first (Roy 2026-10-14)
 brain/felt_time/weather_shift.py::write::1   # held: felt-time audit first (Roy 2026-10-14)
-brain/files/pending.py::read::1   # G3
-brain/files/pending.py::write::2   # G5
-brain/forgetting/__init__.py::legacy:save_with_backup::1   # G2
-brain/forgetting/__init__.py::read::2   # G3
-brain/growth/arc_storage.py::legacy:attempt_heal::1   # G1
-brain/growth/arc_storage.py::legacy:save_with_backup::1   # G2
 brain/growth/crystallizers/creative_dna.py::not-file-io::4   # not-file: model-reply
 brain/growth/crystallizers/reflex.py::not-file-io::2   # not-file: model-reply
-brain/growth/crystallizers/reflex.py::read::2   # G3
-brain/growth/scheduler.py::legacy:attempt_heal::1   # G1
-brain/growth/scheduler.py::legacy:save_with_backup::1   # G2
-brain/growth/scheduler.py::read::1   # G4
 brain/health/attempt_heal.py::read::1   # legacy helper (deleted at migration)
 brain/health/attempt_heal.py::write::2   # legacy helper (deleted at migration)
 brain/health/jsonl_reader.py::not-file-io::1   # legacy helper (deleted at migration)
-brain/health/soul_candidate_repair.py::read::1   # G3
-brain/health/soul_candidate_repair.py::write::1   # G5,G8
-brain/health/vocab_repair.py::legacy:save_with_backup::1   # G2
 brain/health/vocab_repair.py::not-file-io::1   # not-file: model-reply
-brain/health/vocab_repair.py::read::3   # G3
-brain/health/vocab_repair.py::write::1   # G5
-brain/health/walker.py::legacy:attempt_heal::1   # G1
-brain/ingest/buffer.py::read::3   # G3
-brain/ingest/buffer.py::write::3   # G5,G6,G8
 brain/ingest/emotion_backfill.py::not-file-io::2   # not-file: sqlite-or-wire
-brain/ingest/emotion_backfill.py::read::3   # G3
-brain/ingest/emotion_backfill.py::write::2   # G5
 brain/ingest/extract.py::not-file-io::1   # not-file: model-reply
 brain/initiate/adaptive.py::not-file-io::2   # not-file: string-codec
-brain/initiate/adaptive.py::read::1   # G3
 brain/initiate/d_call_schema.py::not-file-io::2   # not-file: string-codec
-brain/initiate/draft.py::read::1   # G3
-brain/initiate/draft.py::write::1   # G5,G6
-brain/initiate/new_sources.py::read::1   # G3
-brain/initiate/presence_state.py::read::1   # G3
-brain/initiate/presence_state.py::write::1   # G5
 brain/initiate/reflection.py::not-file-io::1   # not-file: model-reply
 brain/initiate/review.py::not-file-io::1   # not-file: prompt-or-log
 brain/initiate/schemas.py::not-file-io::4   # not-file: string-codec
-brain/kindled_link/cadence.py::read::1   # G3
-brain/kindled_link/cadence.py::write::1   # G5
 brain/kindled_link/codec.py::not-file-io::1   # not-file: string-codec
 brain/kindled_link/connect_code.py::not-file-io::1   # not-file: string-codec
 brain/kindled_link/privacy_gate.py::not-file-io::3   # not-file: model-reply
 brain/kindled_link/protocol.py::not-file-io::1   # not-file: string-codec
 brain/kindled_link/relationship.py::not-file-io::9   # not-file: sqlite-or-wire
-brain/kindled_link/relationship.py::read::1   # G3
-brain/kindled_link/relationship.py::write::1   # G6
 brain/kindled_link/session_engine.py::not-file-io::1   # not-file: sqlite-or-wire
 brain/kindled_link/tick.py::not-file-io::3   # not-file: sqlite-or-wire
-brain/maker/budget.py::read::1   # G3
-brain/maker/budget.py::write::1   # G5
-brain/maker/charge.py::read::1   # G3
-brain/maker/charge.py::write::1   # G5
 brain/maker/maker.py::not-file-io::1   # not-file: model-reply
 brain/maker/persist.py::not-file-io::1   # not-file: sqlite-or-wire
 brain/mcp_server/audit.py::not-file-io::2   # not-file: prompt-or-log
 brain/mcp_server/tools.py::not-file-io::2   # not-file: prompt-or-log
-brain/memory/embedding_backfill.py::read::1   # G3
-brain/memory/embedding_backfill.py::write::1   # G5,G8
 brain/memory/relevance_judge.py::not-file-io::1   # not-file: model-reply
-brain/memory/relevance_judge.py::read::1   # G3
 brain/memory/store.py::not-file-io::32   # not-file: sqlite-or-wire
 brain/migrator/cli.py::not-file-io::1   # not-file: prompt-or-log
-brain/migrator/companion_emergence.py::read::2   # G3
-brain/migrator/companion_emergence.py::write::1   # G5
-brain/migrator/emergence_kit.py::read::2   # G3,G4
-brain/migrator/emergence_kit.py::write::1   # G5
-brain/migrator/og.py::read::1   # legacy helper (deleted at migration)
-brain/migrator/og_interests.py::read::2   # G3,G4
-brain/migrator/og_journal_dna.py::read::1   # G3
-brain/migrator/og_reflex.py::read::2   # G3,G4
-brain/migrator/og_reflex.py::write::1   # G5
-brain/migrator/og_reflex_log.py::read::1   # G3
-brain/migrator/og_reflex_log.py::write::1   # G2
-brain/migrator/og_soul.py::read::1   # G3
 brain/migrator/report.py::not-file-io::1   # not-file: string-codec
-brain/narrative_memory/state.py::legacy:save_with_backup::1   # G2
-brain/narrative_memory/state.py::read::1   # G3
 brain/notes/compose.py::not-file-io::1   # not-file: model-reply
-brain/notes/state.py::read::2   # G3
-brain/notes/state.py::write::2   # G5
-brain/persona_config.py::legacy:attempt_heal::1   # G1
-brain/persona_config.py::legacy:save_with_backup::1   # G2
-brain/persona_config.py::read::1   # G2
-brain/recovery/cli.py::read::1   # G3
-brain/recovery/engine.py::read::1   # G3
-brain/recovery/engine.py::write::1   # G5
 brain/recovery/report.py::not-file-io::1   # not-file: string-codec
 brain/recovery/source_reader.py::not-file-io::2   # not-file: sqlite-or-wire
-brain/self_model/articulate.py::read::2   # G4
-brain/self_model/articulate.py::write::1   # G5,G6
-brain/self_model/cadence.py::read::2   # G3
-brain/self_model/cadence.py::write::1   # G5
-brain/self_model/resolve.py::read::1   # G3
-brain/self_model/resolve.py::write::1   # G5
-brain/self_model/state.py::legacy:save_with_backup::1   # G2
-brain/self_model/state.py::read::1   # G3
-brain/soul/cadence.py::read::1   # G3
-brain/soul/cadence.py::write::1   # G5
 brain/soul/review.py::not-file-io::1   # not-file: model-reply
 brain/soul/store.py::not-file-io::2   # not-file: sqlite-or-wire
-brain/update/install.py::read::1   # G3
-brain/update/install.py::write::1   # G5
-brain/update/overlay.py::read::2   # G3
-brain/update/overlay.py::write::1   # G5
-brain/user_preferences.py::legacy:attempt_heal::1   # G1
-brain/user_preferences.py::legacy:save_with_backup::1   # G2
-brain/user_preferences.py::read::2   # G2,G3
 brain/utils/llm_output.py::not-file-io::2   # not-file: model-reply

@@ -7,7 +7,6 @@ evaluation + firing logic lands in Task 2.
 
 from __future__ import annotations
 
-import json
 import logging
 from collections import defaultdict
 from collections.abc import Mapping
@@ -18,6 +17,7 @@ from typing import TYPE_CHECKING, Literal
 
 from brain.bridge.provider import LLMProvider
 from brain.emotion.aggregate import aggregate_state
+from brain.health.json_io import Recovery, read_json, read_json_result, write_json
 from brain.memory.store import Memory, MemoryStore
 from brain.utils.emotion import format_emotion_summary
 from brain.utils.memory import days_since_human
@@ -180,10 +180,9 @@ class ReflexArcSet:
             reset to default_path content.
           - Per-arc validation failures skip that arc, log warning, keep others.
         """
-        from brain.health.attempt_heal import attempt_heal
-
         def _default_factory() -> dict:
-            return json.loads(default_path.read_text(encoding="utf-8"))
+            # The bundled default: an absent or corrupt package file is an install bug, so it raises.
+            return read_json(default_path, recover=Recovery.RAISE)
 
         def _schema_validator(data: object) -> None:
             if (
@@ -201,7 +200,10 @@ class ReflexArcSet:
             data = _default_factory()
             anomaly = None
         else:
-            data, anomaly = attempt_heal(path, _default_factory, schema_validator=_schema_validator)
+            _res = read_json_result(
+                path, default=_default_factory, recover=Recovery.HEAL, validate=_schema_validator
+            )
+            data, anomaly = _res.data, _res.anomaly
 
         arcs: list[ReflexArc] = []
         for raw in data.get("arcs", []):
@@ -241,8 +243,6 @@ class ReflexLog:
     @classmethod
     def load(cls, path: Path) -> ReflexLog:
         """Load the log; heal from .bak rotation if corrupt, log WARNING."""
-        from brain.health.attempt_heal import attempt_heal
-
         def _default_factory() -> dict:
             return {"version": 1, "fires": []}
 
@@ -250,7 +250,8 @@ class ReflexLog:
             if not isinstance(data, dict) or not isinstance(data.get("fires"), list):
                 raise ValueError("reflex log schema invalid: missing 'fires' list")
 
-        data, anomaly = attempt_heal(path, _default_factory, schema_validator=_schema_validator)
+        _res = read_json_result(path, default=_default_factory, recover=Recovery.HEAL, validate=_schema_validator)
+        data, anomaly = _res.data, _res.anomaly
         if anomaly is not None:
             logger.warning(
                 "ReflexLog anomaly detected: %s action=%s file=%s",
@@ -263,16 +264,14 @@ class ReflexLog:
         return cls(fires=fires)
 
     def save(self, path: Path) -> None:
-        """Atomic save via .bak rotation (save_with_backup)."""
+        """Atomic save via .bak rotation (write_json)."""
         from brain.health.adaptive import compute_treatment
-        from brain.health.attempt_heal import save_with_backup
-
         payload = {
             "version": 1,
             "fires": [f.to_dict() for f in self.fires],
         }
         treatment = compute_treatment(path.parent, path.name)
-        save_with_backup(path, payload, backup_count=treatment.backup_count)
+        write_json(path, payload, backups=treatment.backup_count)
 
     def last_fire_for_arc(self, arc_name: str) -> datetime | None:
         """Return the most recent fired_at for the given arc, or None."""

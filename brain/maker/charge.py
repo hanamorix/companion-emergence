@@ -7,11 +7,12 @@ recent activity) so it is recovery-robust — no scattered producer hooks.
 """
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
+
+from brain.health.json_io import read_json, write_json
 
 logger = logging.getLogger(__name__)
 
@@ -33,23 +34,20 @@ def _charge_path(persona_dir: Path) -> Path:
 def load_charge(persona_dir: Path) -> MakerCharge:
     """Load persisted charge; cold default on missing/corrupt (fail-safe)."""
     path = _charge_path(persona_dir)
+    raw = read_json(path, default=dict, expect=dict)
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
         return MakerCharge(
             charge=float(raw.get("charge", 0.0)),
             last_tick_ts=raw.get("last_tick_ts"),
             last_fire_ts=raw.get("last_fire_ts"),
             prior_soul_count=int(raw.get("prior_soul_count", 0)),
         )
-    except (OSError, ValueError, TypeError):
+    except (ValueError, TypeError):
         return MakerCharge(charge=0.0, last_tick_ts=None, last_fire_ts=None, prior_soul_count=0)
 
 
 def save_charge(persona_dir: Path, state: MakerCharge) -> None:
-    path = _charge_path(persona_dir)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(asdict(state)), encoding="utf-8")
-    tmp.replace(path)
+    write_json(_charge_path(persona_dir), asdict(state), indent=None, fsync=False)
 
 
 def _elapsed_hours(last_tick_ts: str | None, now: datetime) -> float:

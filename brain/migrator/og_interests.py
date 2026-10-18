@@ -9,10 +9,10 @@ web-search Hana herself, Jordan, etc). Everything else defaults to
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
+from brain.health.json_io import JsonFileError, Recovery, read_json
 from brain.utils.time import iso_utc, parse_iso_utc
 
 
@@ -28,8 +28,10 @@ def extract_interests_from_og(
         raise FileNotFoundError(f"OG interests file not found: {og_interests_path}")
 
     try:
-        data = json.loads(og_interests_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
+        data = read_json(og_interests_path, recover=Recovery.RAISE, expect=dict)
+    except JsonFileError as exc:
+        if exc.kind == "io":
+            raise  # an unreadable file propagated before; it still does
         raise ValueError(f"Invalid JSON in {og_interests_path}: {exc}") from exc
 
     og_items = data.get("interests", [])
@@ -59,9 +61,9 @@ def extract_soul_names_best_effort(og_dir: Path) -> set[str]:
     ]
     for path in candidates:
         if path.exists():
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
+            # CONTENT: corrupt content is an empty set (best-effort); an unreadable file still raises.
+            data = read_json(path, default=lambda: None, recover=Recovery.CONTENT, expect=dict)
+            if data is None:
                 return set()
             names: set[str] = set()
             for c in data.get("crystallizations", []):

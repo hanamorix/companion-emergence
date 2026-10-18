@@ -8,7 +8,6 @@ template fallback.
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from dataclasses import dataclass
@@ -17,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from brain import prompt_strings
+from brain.health.json_io import read_json, write_json
 
 logger = logging.getLogger(__name__)
 
@@ -161,24 +161,15 @@ def load_draft_review_cursor(persona_dir: Path) -> str:
 
     Returns empty string if the cursor file does not exist or is unreadable.
     """
-    path = persona_dir / _DRAFT_CURSOR_FILE
-    if not path.exists():
-        return ""
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return str(data.get("last_seen", ""))
-    except (OSError, json.JSONDecodeError, ValueError):
-        return ""
+    data = read_json(persona_dir / _DRAFT_CURSOR_FILE, default=dict, expect=dict)
+    return str(data.get("last_seen", ""))
 
 
 def save_draft_review_cursor(persona_dir: Path, iso: str) -> None:
     """Persist *iso* as the last-seen timestamp for the soul-review draft cursor."""
-    path = persona_dir / _DRAFT_CURSOR_FILE
-    try:
-        persona_dir.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"last_seen": iso}, ensure_ascii=False), encoding="utf-8")
-    except OSError as exc:
-        logger.warning("draft review cursor save failed: %s", exc)
+    write_json(
+        persona_dir / _DRAFT_CURSOR_FILE, {"last_seen": iso}, indent=None, fsync=False, on_error="log"
+    )
 
 
 def has_new_drafts_since(persona_dir: Path, last_seen_iso: str) -> bool:

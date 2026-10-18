@@ -10,13 +10,11 @@ newest log event, replay arcs.log.jsonl from beginning to rebuild state.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from brain.health.attempt_heal import save_with_backup
-from brain.health.json_io import Recovery, append_jsonl, iter_jsonl
+from brain.health.json_io import Recovery, append_jsonl, iter_jsonl, read_json, write_json
 from brain.narrative_memory.arc import Arc, ArcMember
 
 # State + log filenames inside persona_dir
@@ -57,7 +55,7 @@ def save_state(persona_dir: Path, state: ArcsState) -> None:
         "recently_closed": [_arc_to_dict(arc) for arc in state.recently_closed],
         "last_pass_ts_iso": state.last_pass_ts_iso,
     }
-    save_with_backup(persona_dir / STATE_FILENAME, payload)
+    write_json(persona_dir / STATE_FILENAME, payload, backups=3)
 
 
 def _arc_to_dict(arc: Arc) -> dict[str, Any]:
@@ -144,15 +142,16 @@ def load_or_recover(persona_dir: Path) -> ArcsState:
     log_path = persona_dir / LOG_FILENAME
 
     loaded_state: ArcsState | None = None
-    if state_path.exists():
+    # CONTENT: an unreadable file raises (as it always did); a missing or corrupt one falls through to the replay.
+    raw = read_json(state_path, default=lambda: None, recover=Recovery.CONTENT, expect=dict)
+    if raw is not None:
         try:
-            raw = json.loads(state_path.read_text())
             loaded_state = ArcsState(
                 open={arc_id: _arc_from_dict(d) for arc_id, d in raw.get("open", {}).items()},
                 recently_closed=[_arc_from_dict(d) for d in raw.get("recently_closed", [])],
                 last_pass_ts_iso=raw.get("last_pass_ts_iso"),
             )
-        except (json.JSONDecodeError, KeyError, TypeError):
+        except (KeyError, TypeError):
             loaded_state = None
 
     if loaded_state is not None and not _log_newer_than_state(log_path, loaded_state):

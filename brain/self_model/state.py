@@ -12,12 +12,11 @@ gap, the displaced gap MUST survive in gap_history AND a WARN log is emitted.
 """
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from brain.health.attempt_heal import save_with_backup
+from brain.health.json_io import read_json_result, write_json
 from brain.self_model.gap import Gap
 from brain.utils.log_throttle import warn_throttled
 
@@ -95,16 +94,13 @@ def load_or_recover(persona_dir: Path) -> tuple[SelfModelState, bool]:
     - Valid file    → (loaded state, False)
     """
     path = _state_path(persona_dir)
-    if not path.exists():
+    # An unreadable, corrupt or non-object file is the module's default (None) and its evidence is logged there.
+    res = read_json_result(path, default=lambda: None, expect=dict)
+    if res.outcome == "missing":
         return SelfModelState(), False
-
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        return _recovered(path, f"unreadable: {exc}")
-
-    if not isinstance(raw, dict):
-        return _recovered(path, f"expected an object, got {type(raw).__name__}")
+    if res.outcome == "defaulted":
+        return SelfModelState(), True
+    raw = res.data
 
     try:
         current_gap: Gap | None = None
@@ -132,13 +128,12 @@ def _recovered(path: Path, why: str) -> tuple[SelfModelState, bool]:
 
 
 def save(persona_dir: Path, state: SelfModelState) -> None:
-    """Atomically persist state via save_with_backup."""
-    persona_dir.mkdir(parents=True, exist_ok=True)
+    """Atomically persist state via write_json."""
     payload = {
         "current_gap": _gap_to_dict(state.current_gap) if state.current_gap is not None else None,
         "gap_history": [_gap_to_dict(g) for g in state.gap_history],
     }
-    save_with_backup(_state_path(persona_dir), payload)
+    write_json(_state_path(persona_dir), payload, backups=3)
 
 
 # ── Gap transition helper ─────────────────────────────────────────────────────

@@ -1,9 +1,10 @@
 """brain.maker.budget — daily making cap (mirrors emotion_backfill budget)."""
 from __future__ import annotations
 
-import json
 from datetime import datetime
 from pathlib import Path
+
+from brain.health.json_io import read_json, write_json
 
 _BUDGET_FILE = "maker_budget.json"
 
@@ -20,17 +21,12 @@ def consume_budget(persona_dir: Path, *, now: datetime, cap: int) -> bool:
     """Return True and decrement if under cap today; False if exhausted.
     Corrupt/missing file resets (fail-safe-permissive)."""
     path = _budget_path(persona_dir)
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    except (json.JSONDecodeError, ValueError, OSError):
-        raw = {}
+    raw = read_json(path, default=dict, expect=dict)
     today = _today_str(now)
     if raw.get("date") != today:
         raw = {"date": today, "count": 0}
     if int(raw.get("count", 0)) >= cap:
         return False
     raw["count"] = int(raw.get("count", 0)) + 1
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(raw), encoding="utf-8")
-    tmp.replace(path)
+    write_json(path, raw, indent=None, fsync=False)
     return True

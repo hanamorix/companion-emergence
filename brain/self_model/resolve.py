@@ -34,10 +34,10 @@ Const:
 """
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 
+from brain.health.json_io import read_json, write_json
 from brain.self_model.gap import Gap
 
 logger = logging.getLogger(__name__)
@@ -65,26 +65,18 @@ def _audit_path(persona_dir: Path) -> Path:
 
 def load_audit(persona_dir: Path) -> dict:
     """Return {gaps_surfaced, reconciles_called}.  Missing file → zeros (fail-open)."""
-    p = _audit_path(persona_dir)
-    if not p.exists():
-        return {"gaps_surfaced": 0, "reconciles_called": 0}
+    raw = read_json(_audit_path(persona_dir), default=dict, expect=dict)
     try:
-        raw = json.loads(p.read_text(encoding="utf-8"))
         return {
             "gaps_surfaced": int(raw.get("gaps_surfaced", 0)),
             "reconciles_called": int(raw.get("reconciles_called", 0)),
         }
-    except Exception:  # noqa: BLE001
+    except (TypeError, ValueError):
         return {"gaps_surfaced": 0, "reconciles_called": 0}
 
 
 def _save_audit(persona_dir: Path, audit: dict) -> None:
-    persona_dir.mkdir(parents=True, exist_ok=True)
-    p = _audit_path(persona_dir)
-    try:
-        p.write_text(json.dumps(audit, ensure_ascii=False), encoding="utf-8")
-    except OSError as exc:  # pragma: no cover
-        logger.warning("self_model: failed to save audit counter: %s", exc)
+    write_json(_audit_path(persona_dir), audit, indent=None, fsync=False, on_error="log")
 
 
 def increment_gaps_surfaced(persona_dir: Path) -> None:

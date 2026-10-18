@@ -5,11 +5,11 @@ Fails open (reflect now) on any state error, logged at WARNING so a persistent
 failure (which would silently disable the debounce) is visible."""
 from __future__ import annotations
 
-import json
 import logging
-import os
 from datetime import UTC, datetime
 from pathlib import Path
+
+from brain.health.json_io import Recovery, read_json, write_json
 
 log = logging.getLogger(__name__)
 
@@ -18,17 +18,12 @@ _MIN_SECONDS_BETWEEN = 90.0  # debounce window (tunable); ~replaces the old 4-tu
 
 
 def _load(persona_dir: Path) -> dict:
-    p = persona_dir / "reflection_state.json"
-    if not p.exists():
-        return {}
-    return json.loads(p.read_text(encoding="utf-8"))  # may raise → caller fails open
+    # RAISE: a corrupt or unreadable file raises, and the caller fails open; a missing one is {}.
+    return read_json(persona_dir / "reflection_state.json", default=dict, recover=Recovery.RAISE)
 
 
 def _atomic_write(persona_dir: Path, state: dict) -> None:
-    persona_dir.mkdir(parents=True, exist_ok=True)
-    tmp = persona_dir / "reflection_state.json.tmp"
-    tmp.write_text(json.dumps(state), encoding="utf-8")
-    os.replace(tmp, persona_dir / "reflection_state.json")  # atomic on POSIX/Windows
+    write_json(persona_dir / "reflection_state.json", state, indent=None, fsync=False)
 
 
 def should_reflect(signal, persona_dir: Path, *, kind: str, now: datetime | None = None) -> bool:

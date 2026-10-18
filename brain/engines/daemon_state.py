@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Literal
 
 from brain.health.anomaly import BrainAnomaly
-from brain.health.attempt_heal import attempt_heal, save_with_backup
+from brain.health.json_io import Recovery, read_json_result, write_json
 from brain.utils.time import iso_utc, parse_iso_utc
 
 logger = logging.getLogger(__name__)
@@ -258,7 +258,7 @@ _STATE_FILENAME = "daemon_state.json"
 def save_daemon_state(persona_dir: Path, state: DaemonState) -> None:
     """Atomic-write a DaemonState to daemon_state.json via save_with_backup."""
     path = persona_dir / _STATE_FILENAME
-    save_with_backup(path, state.to_dict())
+    write_json(path, state.to_dict(), backups=3)
 
 
 def load_daemon_state(
@@ -272,7 +272,8 @@ def load_daemon_state(
         baks are also corrupt, returns (DaemonState(), anomaly).
     """
     path = persona_dir / _STATE_FILENAME
-    raw_dict, anomaly = attempt_heal(path, default_factory=dict, schema_validator=None)
+    _res = read_json_result(path, default=dict, recover=Recovery.HEAL)
+    raw_dict, anomaly = _res.data, _res.anomaly
     if not isinstance(raw_dict, dict):
         raw_dict = {}
     try:
@@ -330,7 +331,7 @@ def update_daemon_state(
     )
 
     path = persona_dir / _STATE_FILENAME
-    save_with_backup(path, updated.to_dict())
+    write_json(path, updated.to_dict(), backups=3)
 
     return updated
 

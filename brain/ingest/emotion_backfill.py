@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from brain import prompt_strings
+from brain.health.json_io import Recovery, read_json, write_json
 from brain.state_compat import from_known_fields
 
 if TYPE_CHECKING:
@@ -78,22 +79,21 @@ def _state_path(persona_dir: Path) -> Path:
 
 
 def _load_state(persona_dir: Path) -> EmotionBackfillState | None:
-    p = _state_path(persona_dir)
-    if not p.exists():
+    # CONTENT: an unreadable file raises (as it always did); a missing or corrupt one is "no state".
+    raw = read_json(
+        _state_path(persona_dir), default=lambda: None, recover=Recovery.CONTENT, expect=dict
+    )
+    if raw is None:
         return None
     try:
-        raw = json.loads(p.read_text(encoding="utf-8"))
         return from_known_fields(EmotionBackfillState, raw)
-    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+    except (TypeError, ValueError) as exc:
         logger.warning("emotion_backfill: corrupt state file: %s", exc)
         return None
 
 
 def _save_state(persona_dir: Path, state: EmotionBackfillState) -> None:
-    p = _state_path(persona_dir)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(asdict(state), indent=2, sort_keys=True), encoding="utf-8")
-    tmp.replace(p)
+    write_json(_state_path(persona_dir), asdict(state), indent=2, sort_keys=True, fsync=False)
 
 
 # ---------------------------------------------------------------------------
@@ -114,19 +114,16 @@ def _today_str(now: _datetime) -> str:
 def _consume_budget(persona_dir: Path, *, now: _datetime, cap: int) -> bool:
     """Return True and decrement if under cap; False if exhausted."""
     path = _budget_path(persona_dir)
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    except (json.JSONDecodeError, ValueError):
-        raw = {}
+    # CONTENT: a missing or corrupt counter starts at zero, but an unreadable file raises, so the daily cost
+    # cap is never reset by a read fault.
+    raw = read_json(path, default=dict, recover=Recovery.CONTENT, expect=dict)
     today = _today_str(now)
     if raw.get("date") != today:
         raw = {"date": today, "count": 0}
     if int(raw.get("count", 0)) >= cap:
         return False
     raw["count"] = int(raw.get("count", 0)) + 1
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(raw), encoding="utf-8")
-    tmp.replace(path)
+    write_json(path, raw, indent=None, fsync=False)
     return True
 
 
@@ -259,11 +256,8 @@ def has_emotion_backfill_work(
         return False
     if existing is not None and existing.status == "deferred_to_next_day":
         now = now or _datetime.now(UTC)
-        try:
-            raw = json.loads(_budget_path(persona_dir).read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            raw = {}
-        if isinstance(raw, dict) and raw.get("date") == _today_str(now):
+        raw = read_json(_budget_path(persona_dir), default=dict, expect=dict)
+        if raw.get("date") == _today_str(now):
             return False
 
     def _scan(s: MemoryStore) -> bool:

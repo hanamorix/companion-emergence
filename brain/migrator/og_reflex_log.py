@@ -19,12 +19,11 @@ See docs/superpowers/specs/2026-05-05-migrator-soul-candidates-and-reflex-log-de
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Any
 
-from brain.health.attempt_heal import save_with_backup_text
+from brain.health.json_io import Recovery, read_json, write_json
 
 logger = logging.getLogger(__name__)
 
@@ -42,13 +41,9 @@ def migrate_reflex_log(
     Returns 0 silently if the OG file is missing or has no fires.
     """
     src = og_data_dir / "nell_reflex_log.json"
-    if not src.exists():
-        return 0
-
-    try:
-        og = json.loads(src.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        logger.warning("nell_reflex_log.json malformed: %s", exc)
+    # CONTENT: a missing or malformed source is 0 fires (the module warns); an unreadable one still raises.
+    og = read_json(src, default=lambda: None, recover=Recovery.CONTENT, expect=dict)
+    if og is None:
         return 0
 
     og_fires = og.get("fires", [])
@@ -71,8 +66,8 @@ def migrate_reflex_log(
         migrated_fires.append(new_fire)
 
     if migrated_fires:
-        dest = persona_dir / "reflex_log.json"
-        payload = {"version": 1, "fires": migrated_fires}
-        save_with_backup_text(dest, json.dumps(payload, ensure_ascii=False, indent=2))
+        write_json(
+            persona_dir / "reflex_log.json", {"version": 1, "fires": migrated_fires}, backups=3
+        )
 
     return len(migrated_fires)

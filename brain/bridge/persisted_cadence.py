@@ -14,13 +14,12 @@ owns its own F-011 extraction backoff). See
 """
 from __future__ import annotations
 
-import contextlib
-import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from brain.health.json_io import read_json, write_json
 from brain.paths import cadence_state_path
 
 logger = logging.getLogger(__name__)
@@ -48,12 +47,7 @@ def _parse_ts(raw: object) -> datetime | None:
 def load_cadence(persona_dir: Path, filename: str) -> CadenceState:
     """Load a persisted cadence. Missing/corrupt → due-now (fail toward running:
     a bad state file must never wedge a cadence into silence)."""
-    try:
-        data = json.loads(_state_path(persona_dir, filename).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return CadenceState(next_at=None)
-    if not isinstance(data, dict):
-        return CadenceState(next_at=None)
+    data = read_json(_state_path(persona_dir, filename), default=dict, expect=dict)
     return CadenceState(next_at=_parse_ts(data.get("next_at")))
 
 
@@ -72,11 +66,8 @@ def load_or_init_cadence(
 
     Returns ``(state, created)``.
     """
-    try:
-        data = json.loads(_state_path(persona_dir, filename).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        data = None
-    next_at = _parse_ts(data.get("next_at")) if isinstance(data, dict) else None
+    data = read_json(_state_path(persona_dir, filename), default=dict, expect=dict)
+    next_at = _parse_ts(data.get("next_at"))
     if next_at is not None:
         return CadenceState(next_at=next_at), False
     state = advance(now=now, interval_s=interval_s)
@@ -95,18 +86,14 @@ def save_cadence(persona_dir: Path, filename: str, state: CadenceState) -> None:
     on a missing/corrupt file), so swallowing the error is strictly safer than
     propagating it. Mirrors ``load_cadence``'s fail-toward-running posture.
     """
-    path = _state_path(persona_dir, filename)
     payload = {"next_at": state.next_at.isoformat() if state.next_at is not None else None}
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps(payload), encoding="utf-8")
-        tmp.replace(path)
-    except OSError:
-        logger.warning("save_cadence: could not persist %s (best-effort)", filename, exc_info=True)
-        with contextlib.suppress(OSError):
-            if tmp.exists():
-                tmp.unlink()
+    write_json(
+        _state_path(persona_dir, filename),
+        payload,
+        indent=None,
+        fsync=False,
+        on_error="log",
+    )
 
 
 def is_due(state: CadenceState, *, now: datetime) -> bool:

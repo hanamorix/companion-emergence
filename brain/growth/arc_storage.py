@@ -23,8 +23,7 @@ from pathlib import Path
 
 from brain.engines.reflex import ReflexArc
 from brain.health.adaptive import compute_treatment
-from brain.health.attempt_heal import attempt_heal, save_with_backup
-from brain.health.json_io import Recovery, append_jsonl, read_jsonl
+from brain.health.json_io import Recovery, append_jsonl, read_json_result, read_jsonl, write_json
 from brain.utils.time import iso_utc
 
 logger = logging.getLogger(__name__)
@@ -110,7 +109,7 @@ def write_arc_snapshot(
         "arcs": [arc.to_dict() for arc in arcs],
     }
     treatment = compute_treatment(persona_dir, SNAPSHOT_FILENAME)
-    save_with_backup(path, payload, backup_count=treatment.backup_count)
+    write_json(path, payload, backups=treatment.backup_count)
 
 
 def read_arc_snapshot(persona_dir: Path) -> list[ReflexArc] | None:
@@ -122,7 +121,8 @@ def read_arc_snapshot(persona_dir: Path) -> list[ReflexArc] | None:
     def _default() -> dict:
         return {"version": 1, "snapshot_at": "", "arcs": []}
 
-    data, anomaly = attempt_heal(path, _default)
+    _res = read_json_result(path, default=_default, recover=Recovery.HEAL)
+    data, anomaly = _res.data, _res.anomaly
     if anomaly is not None:
         logger.warning(
             "arc snapshot at %s anomaly %s (action=%s)",

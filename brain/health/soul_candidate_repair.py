@@ -22,7 +22,6 @@ State file ``<persona_dir>/soul_candidate_repair_state.json`` → idempotent.
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -32,7 +31,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from brain.memory.store import MemoryStore
 
-from brain.health.json_io import Recovery, read_jsonl, write_jsonl
+from brain.health.json_io import Recovery, read_json, read_jsonl, write_json, write_jsonl
 from brain.utils.file_lock import file_lock
 
 logger = logging.getLogger(__name__)
@@ -69,21 +68,14 @@ def _state_path(persona_dir: Path) -> Path:
 
 
 def _load_state(persona_dir: Path) -> dict | None:
-    p = _state_path(persona_dir)
-    if not p.exists():
-        return None
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, ValueError) as exc:
-        logger.warning("soul_candidate_repair: corrupt state file: %s", exc)
-        return None
+    # CONTENT: an unreadable file raises (as it always did); a missing or corrupt one is "no state".
+    return read_json(
+        _state_path(persona_dir), default=lambda: None, recover=Recovery.CONTENT, expect=dict
+    )
 
 
 def _save_state(persona_dir: Path, state: dict) -> None:
-    p = _state_path(persona_dir)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    tmp.replace(p)
+    write_json(_state_path(persona_dir), state, indent=2, fsync=False)
 
 
 def _write_and_return(

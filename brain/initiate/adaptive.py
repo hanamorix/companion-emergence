@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from brain import prompt_strings
-from brain.health.json_io import Recovery, append_jsonl, iter_jsonl
+from brain.health.json_io import Recovery, append_jsonl, iter_jsonl, read_json
 
 logger = logging.getLogger(__name__)
 
@@ -37,14 +37,7 @@ def load_d_mode(persona_dir: Path) -> DMode:
     path = persona_dir / "d_mode.json"
     if not path.exists():
         return "stateless"
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("d_mode.json read failed (%s); falling back to stateless", exc)
-        return "stateless"
-    if not isinstance(raw, dict):
-        logger.warning("d_mode.json is not a JSON object; falling back to stateless")
-        return "stateless"
+    raw = read_json(path, default=dict, expect=dict)  # unreadable/corrupt/non-object: {} (the module warns)
     mode = raw.get("mode")
     if mode not in _VALID_MODES:
         logger.warning("d_mode.json has unknown mode %r; falling back to stateless", mode)

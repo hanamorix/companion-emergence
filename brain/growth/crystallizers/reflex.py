@@ -33,6 +33,7 @@ from brain.growth.proposal import (
     ReflexCrystallizationResult,
     ReflexPruneProposal,
 )
+from brain.health.json_io import read_json
 from brain.health.parse_failures import record_parse_failure
 from brain.memory.store import MemoryStore
 
@@ -70,16 +71,12 @@ def _build_corpus(
     # 1. Fire log — load from reflex_log.json (raw, defensive)
     fire_log_path = persona_dir / "reflex_log.json"
     all_fires: list[ArcFire] = []
-    if fire_log_path.exists():
+    raw = read_json(fire_log_path, default=dict, expect=dict)  # missing/corrupt/unreadable: no fires (module warns)
+    for f in raw.get("fires", []):
         try:
-            raw = json.loads(fire_log_path.read_text(encoding="utf-8"))
-            for f in raw.get("fires", []):
-                try:
-                    all_fires.append(ArcFire.from_dict(f))
-                except (KeyError, ValueError, TypeError):
-                    pass  # skip malformed entries
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("could not read fire log at %s: %s", fire_log_path, exc)
+            all_fires.append(ArcFire.from_dict(f))
+        except (KeyError, ValueError, TypeError):
+            pass  # skip malformed entries
 
     fires_in_window = [f for f in all_fires if f.fired_at >= cutoff]
     fires_by_arc: dict[str, list[ArcFire]] = {}
@@ -768,15 +765,6 @@ def _load_emotion_vocabulary(persona_dir: Path) -> set[str]:
 
     Missing file or corruption → empty set (gate 4 will reject any trigger).
     """
-    path = persona_dir / "emotion_vocabulary.json"
-    if not path.exists():
-        return set()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        emotions = data.get("emotions", [])
-        return {
-            e["name"] for e in emotions if isinstance(e, dict) and isinstance(e.get("name"), str)
-        }
-    except (json.JSONDecodeError, OSError, KeyError) as exc:
-        logger.warning("could not read emotion_vocabulary.json: %s", exc)
-        return set()
+    data = read_json(persona_dir / "emotion_vocabulary.json", default=dict, expect=dict)
+    emotions = data.get("emotions", [])
+    return {e["name"] for e in emotions if isinstance(e, dict) and isinstance(e.get("name"), str)}

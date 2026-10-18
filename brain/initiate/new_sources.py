@@ -12,14 +12,13 @@ with defaults baked in. Operator can tune without code change.
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass, fields
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
-from brain.health.json_io import append_jsonl
+from brain.health.json_io import append_jsonl, read_json
 from brain.initiate.emit import emit_initiate_candidate, read_candidates
 from brain.initiate.schemas import CandidateSource, SemanticContext
 
@@ -51,17 +50,7 @@ def load_gate_thresholds(persona_dir: Path) -> GateThresholds:
     Defaults defined on the dataclass. Persona file overrides any subset
     of fields. Missing file => all defaults.
     """
-    path = persona_dir / "gate_thresholds.json"
-    if not path.exists():
-        return GateThresholds()
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("gate_thresholds.json read failed (%s); using defaults", exc)
-        return GateThresholds()
-    if not isinstance(raw, dict):
-        logger.warning("gate_thresholds.json is not a JSON object; using defaults")
-        return GateThresholds()
+    raw = read_json(persona_dir / "gate_thresholds.json", default=dict, expect=dict)  # else: all defaults
     valid_names = {f.name for f in fields(GateThresholds)}
     overrides: dict[str, Any] = {k: v for k, v in raw.items() if k in valid_names}
     return GateThresholds(**overrides)

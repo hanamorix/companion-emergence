@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
-import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from brain.health.json_io import read_json, write_json
 from brain.utils.file_lock import file_lock
 from brain.utils.log_throttle import warn_throttled
 
@@ -58,37 +57,17 @@ def create(persona_dir: Path, *, op: str, resolved_path: str, content: str,
     rec = {"id": rid, "op": op, "resolved_path": resolved_path, "content": content,
            "content_sha": hashlib.sha256(content.encode()).hexdigest(),
            "proposed_at": now.isoformat(), "status": "pending", "making_id": making_id}
-    p = _dir(persona_dir) / f"{rid}.json"
-    tmp = p.with_suffix(".tmp")
     with _lock(persona_dir):
-        tmp.write_text(json.dumps(rec), encoding="utf-8")
-        tmp.replace(p)
+        write_json(_dir(persona_dir) / f"{rid}.json", rec, indent=None, fsync=False)
     return rid
 
 
 def _read(p: Path) -> dict | None:
-    """One record, or None. A missing record is normal; an unreadable one is
-    reported (#367), since it drops out of every listing. Writers replace the
-    file atomically, so a reader never sees a half-written record; on Windows
-    it can briefly meet a PermissionError while the replace runs, which is
-    transient and only logged at debug (a persistent denial on Windows is not
-    told apart from a transient one, and stays at debug). Elsewhere a PermissionError persists
-    (wrong owner, a bad chmod), so it is reported like any unreadable record."""
-    try:
-        rec = json.loads(p.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return None
-    except (OSError, ValueError) as exc:
-        if isinstance(exc, PermissionError) and sys.platform == "win32":
-            logger.debug("pending write %s is busy; skipped this read", p.stem, exc_info=True)
-        else:
-            warn_throttled(logger, f"pending:{p}", "pending write %s is unreadable and is skipped", p.stem)
-        return None
-    if not isinstance(rec, dict):
-        warn_throttled(logger, f"pending:{p}", "pending write %s is a JSON %s, not a record; skipped",
-                       p.stem, type(rec).__name__, exc_info=False)
-        return None
-    return rec
+    """One record, or None. A missing record is normal; an unreadable or non-record one is reported once
+    per interval by brain.health.json_io (#367), since it drops out of every listing. Writers replace the
+    file atomically, so a reader never sees a half-written record; on Windows the module retries a transient
+    PermissionError while a replace runs before it reports."""
+    return read_json(p, default=lambda: None, expect=dict)
 
 
 def get(persona_dir: Path, rid: str) -> dict | None:
@@ -172,10 +151,7 @@ def mark(persona_dir: Path, rid: str, *, status: str, expect: str | None = None,
             return False
         rec["status"] = status
         rec.update(extra)
-        p = _dir(persona_dir) / f"{rid}.json"
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(rec), encoding="utf-8")
-        tmp.replace(p)
+        write_json(_dir(persona_dir) / f"{rid}.json", rec, indent=None, fsync=False)
         return True
 
 

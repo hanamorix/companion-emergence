@@ -18,7 +18,15 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from brain.health.json_io import Recovery, append_jsonl, encode_jsonl, read_jsonl, write_jsonl
+from brain.health.json_io import (
+    Recovery,
+    append_jsonl,
+    encode_jsonl,
+    read_json,
+    read_jsonl,
+    write_json,
+    write_jsonl,
+)
 
 # session_id grammar: UUIDs (hyphens included) and the `sess_<8 hex>` fallback
 # both fit. Letters / digits / hyphen / underscore only — no slashes, dots, or
@@ -224,25 +232,18 @@ def write_rolled_to(persona_dir: Path, session_id: str, successor_id: str) -> No
     resolves to nothing."""
     _validate_session_id(session_id)
     _validate_session_id(successor_id)
-    path = _rolled_to_path(persona_dir, session_id)
-    tmp = path.with_suffix(".rolled_to.tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump({"successor": successor_id, "at": _now_iso()}, fh)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
+    write_json(
+        _rolled_to_path(persona_dir, session_id),
+        {"successor": successor_id, "at": _now_iso()},
+        indent=None,
+        fsync=True,
+    )
 
 
 def read_rolled_to(persona_dir: Path, session_id: str) -> str | None:
     """Return the successor sid this session rolled over to, or None if absent/malformed."""
-    path = _rolled_to_path(persona_dir, session_id)
-    if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError):
-        return None
-    succ = data.get("successor") if isinstance(data, dict) else None
+    data = read_json(_rolled_to_path(persona_dir, session_id), default=dict, expect=dict)
+    succ = data.get("successor")
     return succ if isinstance(succ, str) and succ else None
 
 
@@ -261,35 +262,26 @@ def _backoff_path(persona_dir: Path, session_id: str) -> Path:
 def read_backoff(persona_dir: Path, session_id: str) -> dict | None:
     """Return the backoff state ({failures: int, first_failure_at: str}) or
     None if the file is missing, empty, or malformed."""
-    path = _backoff_path(persona_dir, session_id)
-    if not path.exists():
+    data = read_json(_backoff_path(persona_dir, session_id), default=lambda: None, expect=dict)
+    if data is None or "failures" not in data or "first_failure_at" not in data:
         return None
     try:
-        text = path.read_text(encoding="utf-8").strip()
-        if not text:
-            return None
-        data = json.loads(text)
-        if not isinstance(data, dict):
-            return None
-        if "failures" not in data or "first_failure_at" not in data:
-            return None
         # Validate ts parses
         datetime.fromisoformat(str(data["first_failure_at"]).replace("Z", "+00:00"))
-        return data
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    except (ValueError, TypeError):
         return None
+    return data
 
 
 def write_backoff(persona_dir: Path, session_id: str, failures: int, first_failure_at: str) -> None:
     """Atomically write the backoff state. Raises ValueError on bad ts."""
     datetime.fromisoformat(first_failure_at.replace("Z", "+00:00"))  # validate
-    path = _backoff_path(persona_dir, session_id)
-    tmp = path.with_suffix(".backoff.tmp")
-    tmp.write_text(
-        json.dumps({"failures": failures, "first_failure_at": first_failure_at}),
-        encoding="utf-8",
+    write_json(
+        _backoff_path(persona_dir, session_id),
+        {"failures": failures, "first_failure_at": first_failure_at},
+        indent=None,
+        fsync=False,
     )
-    os.replace(tmp, path)
 
 
 def delete_backoff(persona_dir: Path, session_id: str) -> None:
@@ -514,7 +506,7 @@ def acquire_compaction_lock(
     (skip). The caller releases via release_compaction_lock in a finally.
     """
     path = _compacting_lock_path(persona_dir, session_id)
-    payload = json.dumps({"pid": os.getpid(), "ts": _now_iso()})
+    payload = json.dumps({"pid": os.getpid(), "ts": _now_iso()})  # json-io: ok -- O_EXCL lock-file payload: a lock protocol, not a state file
     try:
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -523,10 +515,10 @@ def acquire_compaction_lock(
     except FileExistsError:
         # Held — decide whether it is stale and reapable.
         reap = False
+        holder = read_json(path, default=dict, expect=dict)  # empty/torn payload (or unreadable): not alive
         try:
-            holder = json.loads(path.read_text(encoding="utf-8"))
             holder_pid = int(holder.get("pid", -1))
-        except (OSError, ValueError, TypeError):
+        except (TypeError, ValueError):
             holder_pid = -1
         if not _pid_alive(holder_pid):
             reap = True
