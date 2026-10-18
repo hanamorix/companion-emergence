@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import io
 import json
+import shlex
 import subprocess
 import threading
 import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -216,8 +218,8 @@ class _Resp:
     def __init__(self, content: bytes):
         self._content = content
 
-    def read(self) -> bytes:
-        return self._content
+    def read(self, n: int = -1) -> bytes:
+        return self._content if n < 0 else self._content[:n]
 
     def __enter__(self):
         return self
@@ -229,7 +231,7 @@ class _Resp:
 class _Bridge:
     """Stands in for urllib against a real in-process app: records the request, answers through the TestClient."""
 
-    def __init__(self, client: TestClient, forced: tuple[int, bytes] | None = None):
+    def __init__(self, client: TestClient, forced: tuple[int, Any] | None = None):
         self.client = client
         self.requests: list[dict] = []
         self.forced = forced  # (status, body) answered instead of the real endpoint
@@ -241,7 +243,10 @@ class _Bridge:
         )
         if self.forced is not None:
             status, content = self.forced
-            raise urllib.error.HTTPError(req.full_url, status, "err", {}, io.BytesIO(content))
+            if status == 200:
+                return _Resp(content)
+            fp = io.BytesIO(content) if isinstance(content, bytes) else content  # bytes or a file-like object
+            raise urllib.error.HTTPError(req.full_url, status, "err", {}, fp)
         resp = self.client.post("/" + path, content=req.data, headers=dict(req.header_items()))
         if resp.status_code >= 400:
             raise urllib.error.HTTPError(req.full_url, resp.status_code, "err", {}, io.BytesIO(resp.content))
@@ -404,8 +409,15 @@ def test_a_live_pid_whose_port_refuses_exits_1_and_writes_nothing(monkeypatch, h
         rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
     err = capsys.readouterr().err
     assert rc == 1 and "could not reach" in err and p.read_bytes() == before and run.models == []
-    assert "may still be starting" in err and "try again in a few seconds" in err and "nell service stop" in err
+    assert "may still be starting" in err and "try again in a few seconds" in err
+    assert "nell supervisor stop --persona bob" in err and "nell service stop" not in err
     assert "—" not in err
+    # the command the message suggests must be a real one: it parses with the real parser
+    suggested = "nell supervisor stop --persona bob"
+    parsed = cli._build_parser().parse_args(shlex.split(suggested)[1:])
+    from brain.bridge.daemon import cmd_stop
+
+    assert parsed.command == "supervisor" and parsed.persona == "bob" and parsed.func is cmd_stop
 
 
 @pytest.mark.parametrize("how", ["read", "connect"])
@@ -461,3 +473,75 @@ def test_endpoint_and_direct_mode_return_the_same_body(tmp_path: Path, monkeypat
         model_error.reset()
     assert bodies[0] == bodies[1], bodies
     assert bodies[0][0] == (400 if case == "rejected" else 200)
+
+
+# --- hostile or odd bridge answers (round-3 review) ----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "content",
+    [b"not json at all", b"[1, 2]", b'"ok"', b"{}", b'{"ok": false, "model": "claude-sonnet-5"}', b'{"model": "claude-sonnet-5"}', b""],
+    ids=["not-json", "list", "string", "empty-object", "ok-false", "no-ok-key", "empty-body"],
+)
+def test_a_200_that_is_not_the_endpoints_success_body_is_an_error_not_a_success(monkeypatch, home: Path, capsys, content):
+    rc, p, out = _via_bridge(monkeypatch, home, _Run(lambda m: _ok()), capsys, forced=(200, content))
+    assert rc == 1
+    assert "the bridge answered 200" in out.err and "unexpected" in out.err
+    assert "chat model is now" not in out.out and "Traceback" not in out.err
+    assert json.loads(p.read_text())["model"] == "sonnet"
+
+
+def test_a_200_with_ok_true_still_succeeds(monkeypatch, home: Path, capsys):
+    rc, _, out = _via_bridge(monkeypatch, home, _Run(lambda m: _ok()), capsys, forced=(200, b'{"ok": true, "model": "claude-sonnet-5"}'))
+    assert rc == 0 and "chat model is now claude-sonnet-5." in out.out
+
+
+class _GreedyBody(io.BytesIO):
+    """An error body that records how much the caller asked to read, and can fail to read."""
+
+    def __init__(self, data: bytes, fail: bool = False):
+        super().__init__(data)
+        self.asked: list[int | None] = []
+        self.fail = fail
+
+    def read(self, n=-1):
+        self.asked.append(n if n != -1 else None)
+        if self.fail:
+            raise OSError("connection reset")
+        return super().read(n)
+
+
+def test_an_error_body_is_read_with_a_cap(monkeypatch, home: Path, capsys):
+    body = _GreedyBody(b'{"detail": "' + b"x" * 5_000_000 + b'"}')
+    rc, _, out = _via_bridge(monkeypatch, home, _Run(lambda m: _ok()), capsys, forced=(500, body))
+    assert rc == 1 and "the bridge answered 500" in out.err
+    assert body.asked and all(n is not None and n <= 65536 for n in body.asked), body.asked
+    assert len(out.err) < 1000
+
+
+def test_an_error_body_that_cannot_be_read_still_names_the_status(monkeypatch, home: Path, capsys):
+    rc, _, out = _via_bridge(monkeypatch, home, _Run(lambda m: _ok()), capsys, forced=(500, _GreedyBody(b"x", fail=True)))
+    assert rc == 1 and "the bridge answered 500" in out.err and "Traceback" not in out.err
+
+
+def test_control_characters_from_the_bridge_are_never_printed(monkeypatch, home: Path, capsys):
+    hostile = '\x1b[31mred\x07 \x1b]0;title\x07line\nbreak'
+    body = json.dumps({"detail": hostile}).encode()
+    rc, _, out = _via_bridge(monkeypatch, home, _Run(lambda m: _ok()), capsys, forced=(401, body))
+    assert rc == 1 and "the bridge answered 401" in out.err
+    for bad in ("\x1b", "\x07"):
+        assert bad not in out.err
+    assert out.err.count("\n") == 1  # only the final newline of the line itself
+
+
+def test_control_characters_in_a_success_body_are_never_printed(monkeypatch, home: Path, capsys):
+    ok = {
+        "ok": True,
+        "model": CHAT,
+        "checked": True,
+        "fallbacks": [{"family": "ha\x1b[2Jiku", "wanted": "claude-haiku-5\x07", "using": "ha\niku"}],
+        "tiers_unchecked": ["claude-\x1b]0;x\x07haiku-5"],
+    }
+    rc, _, out = _via_bridge(monkeypatch, home, _Run(lambda m: _ok()), capsys, forced=(200, json.dumps(ok).encode()))
+    assert rc == 0 and "\x1b" not in out.out and "\x07" not in out.out
+    assert "claude-haiku-5" in out.out

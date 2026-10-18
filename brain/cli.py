@@ -2646,7 +2646,7 @@ def _model_set_handler(args: argparse.Namespace) -> int:
     persona_dir = path.parent
     state = _bridge_running(persona_dir)
     if state is not None:
-        outcome = _model_set_via_bridge(state, args.model)
+        outcome = _model_set_via_bridge(state, args.model, persona_dir.name)
         if outcome is None:
             return 1
     else:
@@ -2682,7 +2682,17 @@ def _model_set_direct(persona_dir: Path, model: str) -> tuple[int, dict]:
     return asyncio.run(_go())
 
 
-def _model_set_via_bridge(state: Any, model: str) -> tuple[int, dict] | None:
+def _bridge_text(value: Any, limit: int = 200) -> str:
+    """Text that came from the bridge, made safe to print: control characters (escape sequences, bells, newlines)
+    removed, cut at ``limit`` characters."""
+    return "".join(ch for ch in str(value) if ch.isprintable())[:limit]
+
+
+# The most of a bridge answer the command will read: its real answers are a few hundred bytes.
+_BRIDGE_ANSWER_MAX_BYTES = 65536
+
+
+def _model_set_via_bridge(state: Any, model: str, persona: str) -> tuple[int, Any] | None:
     """Bridge running: POST to the picker's settings endpoint. None (after printing why) if it gave no usable answer."""
     import urllib.error
     import urllib.request
@@ -2702,13 +2712,16 @@ def _model_set_via_bridge(state: Any, model: str) -> tuple[int, dict] | None:
     wait_s = server_mod._check_budget_s() * 2
     try:
         with urllib.request.urlopen(req, timeout=wait_s) as resp:
-            return 200, json.loads(resp.read())
+            raw = resp.read(_BRIDGE_ANSWER_MAX_BYTES)
     except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
         try:
-            return exc.code, json.loads(raw)
+            raw_err = exc.read(_BRIDGE_ANSWER_MAX_BYTES).decode("utf-8", errors="replace")
+        except (OSError, ValueError):
+            raw_err = ""
+        try:
+            return exc.code, json.loads(raw_err)
         except ValueError:
-            return exc.code, {"detail": raw[:200]}
+            return exc.code, {"detail": raw_err}
     except (urllib.error.URLError, OSError) as exc:
         reason = getattr(exc, "reason", exc)
         if isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError):
@@ -2719,16 +2732,25 @@ def _model_set_via_bridge(state: Any, model: str) -> tuple[int, dict] | None:
             )
         else:
             print(
-                f"error: could not reach the bridge on port {state.port}: {reason}. The bridge may still be "
-                "starting: try again in a few seconds, or stop it with `nell service stop`.",
+                f"error: could not reach the bridge on port {state.port}: {_bridge_text(reason)}. The bridge may "
+                f"still be starting: try again in a few seconds, or stop it with `nell supervisor stop --persona {persona}`.",
                 file=sys.stderr,
             )
         return None
+    try:
+        return 200, json.loads(raw)
+    except ValueError:
+        return 200, {"detail": "the answer was not JSON"}
 
 
 def _model_set_report(model: str, status: int, body: Any, *, via_bridge: bool) -> int:
     from brain.persona_config import MODEL_ID_RULE
 
+    if status == 200 and not (isinstance(body, dict) and body.get("ok") is True):
+        # The endpoint's success body always carries ok: true. Anything else is not this bridge's answer.
+        detail = body.get("detail", body) if isinstance(body, dict) else body
+        print(f"error: the bridge answered 200 with an unexpected body: {_bridge_text(detail)}", file=sys.stderr)
+        return 1
     if not isinstance(body, dict):
         body = {"detail": body}
     if status != 200:
@@ -2742,7 +2764,7 @@ def _model_set_report(model: str, status: int, body: Any, *, via_bridge: bool) -
             print(f"error: {model!r} is not a valid model: {MODEL_ID_RULE}", file=sys.stderr)
         else:
             detail = body.get("detail", body.get("error", body))
-            print(f"error: the bridge answered {status}: {str(detail)[:200]}", file=sys.stderr)
+            print(f"error: the bridge answered {status}: {_bridge_text(detail)}", file=sys.stderr)
         return 1
     checked = body.get("checked")
     if checked is False:
@@ -2754,15 +2776,20 @@ def _model_set_report(model: str, status: int, body: Any, *, via_bridge: bool) -
         print(f"chat model is now {model} (checked with Claude).")
     else:
         print(f"chat model is now {model}.")
-    for f in body.get("fallbacks", []):
+    fallbacks = body.get("fallbacks")
+    for f in fallbacks if isinstance(fallbacks, list) else []:
+        if not isinstance(f, dict):
+            continue
         print(
-            f'background jobs that use the {f["family"]} family are using "{f["using"]}", because "{f["wanted"]}" '
+            f'background jobs that use the {_bridge_text(f.get("family"))} family are using '
+            f'"{_bridge_text(f.get("using"))}", because "{_bridge_text(f.get("wanted"))}" '
             "could not be used (it may not exist, or your account may not have access to it)."
         )
-    if body.get("tiers_unchecked"):
+    unchecked = body.get("tiers_unchecked")
+    if isinstance(unchecked, list) and unchecked:
         print(
             "some background models were not checked yet ("
-            + ", ".join(body["tiers_unchecked"])
+            + ", ".join(_bridge_text(m) for m in unchecked)
             + "); they are checked when first used."
         )
     print(
