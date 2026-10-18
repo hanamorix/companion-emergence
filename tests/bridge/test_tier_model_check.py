@@ -363,3 +363,25 @@ def test_default_budget_is_well_inside_a_60_second_webview_idle_timeout():
     from brain.bridge import server as server_mod
 
     assert server_mod._MODEL_CHECK_TIMEOUT_S <= 30.0
+
+
+def test_an_id_is_never_both_a_fallback_and_not_checked_yet(persona_dir: Path, monkeypatch):
+    _cli_persona(persona_dir)
+    with _client(persona_dir, monkeypatch) as c:
+        with patch("subprocess.run", _Run(lambda m: _rejected(m) if m == "claude-haiku-5" else _ok())):
+            _post(c, "claude-sonnet-5")  # claude-haiku-5 is rejected: recorded as a fallback
+        # re-Apply: the haiku probe is rate limited now; the earlier rejection is kept
+        with patch("subprocess.run", _Run(lambda m: _proc(1, QUOTA) if m == "claude-haiku-5" else _ok())):
+            body = _post(c, "claude-sonnet-5").json()
+        st = c.get("/persona/state").json()
+    assert "tiers_unchecked" not in body
+    assert {f["wanted"] for f in st["tier_fallbacks"]} == {"claude-haiku-5"}
+    assert st["tier_unconfirmed"] == []  # not also "not checked yet"
+
+
+def test_persona_state_filters_an_id_that_is_a_fallback_even_if_it_was_marked(persona_dir: Path, monkeypatch):
+    _cli_persona(persona_dir, "claude-sonnet-5", derived_unavailable=["claude-haiku-5"])
+    with _client(persona_dir, monkeypatch) as c:
+        model_error.note_tier_unconfirmed("claude-haiku-5")  # a stale mark from an earlier Apply
+        st = c.get("/persona/state").json()
+    assert st["tier_fallbacks"] and st["tier_unconfirmed"] == []

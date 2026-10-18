@@ -627,6 +627,30 @@ describe("ConnectionPanel — rejected and unchecked models (#440)", () => {
     }
   });
 
+  it("holds a same-model re-Apply against a stale poll until the bounded time ends", () => {
+    vi.useFakeTimers();
+    try {
+      const same = baseState({
+        connection: { provider: "claude-cli", model: "claude-sonnet-5", last_heartbeat_at: null },
+        tier_fallbacks: [PINNED],
+      });
+      const { rerender } = render(<ConnectionPanel state={same} persona="test" />);
+      fireEvent.click(screen.getByRole("button", { name: /change model/i }));
+      fireEvent.click(screen.getByRole("button", { name: /apply with fallback/i })); // re-applies claude-sonnet-5
+      expect(screen.getByText(/using "haiku",/)).toBeInTheDocument();
+      rerender(<ConnectionPanel state={{ ...same }} persona="test" />); // a poll that left before the Apply
+      expect(screen.getByText(/using "haiku",/)).toBeInTheDocument(); // still the Apply's answer
+      expect(screen.queryByText(/using "claude-haiku-4-5-20251001"/)).not.toBeInTheDocument();
+      act(() => {
+        vi.advanceTimersByTime(15_000);
+      });
+      expect(screen.queryByText(/using "haiku",/)).not.toBeInTheDocument();
+      expect(screen.getByText(/using "claude-haiku-4-5-20251001"/)).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("says plainly which background models were not checked yet, at once and from the poll, and clears it", async () => {
     const withModel = (extra: Partial<PersonaState>) =>
       baseState({ connection: { provider: "claude-cli", model: "claude-sonnet-5", last_heartbeat_at: null }, ...extra });

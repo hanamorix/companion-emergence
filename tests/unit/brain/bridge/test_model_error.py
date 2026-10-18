@@ -330,3 +330,10 @@ def test_tier_unconfirmed_functions_fail_open(monkeypatch):
         model_error.note_tier_unconfirmed("claude-haiku-5")
         model_error.clear_tier_unconfirmed("claude-haiku-5")
         assert model_error.tier_unconfirmed() == []
+
+
+def test_switch_drops_the_old_ids_tier_unconfirmed_mark_like_the_chat_one():
+    model_error.note_tier_unconfirmed("claude-sonnet-5")
+    model_error.note_tier_unconfirmed("claude-haiku-5")
+    model_error.switch("claude-sonnet-5", "sonnet", keep=frozenset())
+    assert model_error.tier_unconfirmed() == ["claude-haiku-5"]
