@@ -113,3 +113,44 @@ def test_concurrent_writers_lose_no_rows(tmp_path: Path, monkeypatch) -> None:
     for gz in tmp_path.glob(pf.PARSE_FAILURE_LOG + ".*.gz"):
         total += sum(1 for line in gzip.decompress(gz.read_bytes()).decode("utf-8").splitlines() if line)
     assert total == 160
+
+
+def test_error_is_capped(tmp_path: Path) -> None:
+    """#427 review: `error` can carry reply text (pydantic's input_value=...)."""
+    pf.record_parse_failure(tmp_path, site="s", raw="r", error="x" * 5000)
+    (row,) = _rows(tmp_path)
+    assert len(row["error"]) <= pf.ERROR_CHARS
+
+
+def test_keep_raw_false_keeps_only_the_error_class(tmp_path: Path) -> None:
+    """Length-only rows must not smuggle reply text through `error`."""
+    leak = "unknown decision: " + "PEER-TEXT " * 50
+    pf.record_parse_failure(tmp_path, site="privacy_gate", raw="peer reply", error=leak, keep_raw=False)
+    (row,) = _rows(tmp_path)
+    assert "PEER-TEXT" not in row["error"]
+    assert row["error"] == "unknown decision"
+
+
+def test_the_runtime_log_line_carries_no_error_text(tmp_path: Path, caplog) -> None:
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        pf.record_parse_failure(tmp_path, site="extractor", raw="r",
+                                error="schema: input_value='SECRET-REPLY-TEXT'")
+    assert "SECRET-REPLY-TEXT" not in caplog.text and "extractor" in caplog.text
+
+
+def test_keep_raw_false_drops_an_error_that_is_not_a_bare_class(tmp_path: Path) -> None:
+    """#427 cold review: pydantic puts input_value='...' before its first colon,
+    and a colon-free message has no colon at all; neither may reach the row."""
+    for leak in ("1 validation error input_value='PEER-TEXT' For further information visit https://x",
+                 "unknown decision 'PEER-TEXT'"):
+        pf.record_parse_failure(tmp_path, site="privacy_gate", raw="r", error=leak, keep_raw=False)
+    rows = _rows(tmp_path)
+    assert [r["error"] for r in rows] == ["error", "error"]
+
+
+def test_a_non_string_error_does_not_raise(tmp_path: Path) -> None:
+    pf.record_parse_failure(tmp_path, site="s", raw="r", error=None)  # type: ignore[arg-type]
+    (row,) = _rows(tmp_path)
+    assert row["error"] == "None"

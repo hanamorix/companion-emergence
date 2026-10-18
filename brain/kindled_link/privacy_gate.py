@@ -144,7 +144,7 @@ def _parse_verdict(raw: str, persona_dir: Path | None = None) -> GateDecision:
         action = data.get("decision")
         if action not in {"send", "revise", "hold", "end_or_pause"}:
             record_parse_failure(persona_dir, site="privacy_gate", raw=raw,
-                                 error=f"unknown decision {action!r}", keep_raw=False)
+                                 error="unknown decision", keep_raw=False)
             return GateDecision(action="hold", reason="gate: unparseable decision")
         # MISSING or malformed texture_score → 1.0 (safe/high): an unknown
         # disclosure magnitude is treated as maximal so the budget depletes
@@ -161,7 +161,7 @@ def _parse_verdict(raw: str, persona_dir: Path | None = None) -> GateDecision:
             texture_score=score,
         )
     except Exception as exc:  # noqa: BLE001 — fail closed
-        record_parse_failure(persona_dir, site="privacy_gate", raw=raw, error=str(exc), keep_raw=False)
+        record_parse_failure(persona_dir, site="privacy_gate", raw=raw, error=type(exc).__name__, keep_raw=False)
         return GateDecision(action="hold", reason="gate: malformed verdict")
 
 

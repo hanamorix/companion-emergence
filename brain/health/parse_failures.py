@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 from collections import Counter
 from datetime import UTC, datetime, timedelta
@@ -26,6 +27,11 @@ logger = logging.getLogger(__name__)
 
 PARSE_FAILURE_LOG = "parse_failures.jsonl"
 RAW_CHARS = 2_000
+# `error` can carry reply text (pydantic's input_value=..., a model's own value), so it is
+# capped, and reduced to its class when the raw text is not kept (#427 review).
+ERROR_CHARS = 200
+# What a keep_raw=False class may look like: "unknown decision", "JSONDecodeError".
+_ERROR_CLASS = re.compile(r"[A-Za-z_][A-Za-z0-9_ ]{0,39}")
 MAX_BYTES = 1024 * 1024
 ARCHIVE_KEEP = 2
 # Pass-2 worker and supervisor ticks write from different threads; rotation
@@ -39,21 +45,29 @@ def record_parse_failure(
     """Append the failed reply to the persona's parse-failure log. Never raises:
     a failure to record evidence must not fail the caller's fallback.
 
-    ``keep_raw=False`` stores only the length: for replies about another
-    Kindled's words, which stay inside ``kindled_link/``. The runtime log line
-    never carries reply text."""
-    logger.warning("%s: model reply did not parse (%s; %d chars)", site, error, len(raw))
+    ``keep_raw=False`` stores only the length, and only the error's class (the
+    text before its first colon, kept only if it looks like a bare class name,
+    else ``"error"``): for replies about another Kindled's words,
+    which stay inside ``kindled_link/``. The runtime log line carries neither
+    reply nor error text: the row in the file is the evidence."""
+    logger.warning(
+        "%s: model reply did not parse (%d chars); see %s", site, len(raw), PARSE_FAILURE_LOG
+    )
     if persona_dir is None:
         return
     path = Path(persona_dir) / PARSE_FAILURE_LOG
-    row = {
-        "ts": datetime.now(UTC).isoformat(),
-        "site": site,
-        "error": error,
-        "raw": raw[:RAW_CHARS] if keep_raw else "",
-        "raw_len": len(raw),
-    }
     try:
+        error = str(error)
+        if not keep_raw:
+            cls = error.split(":", 1)[0].strip()
+            error = cls if _ERROR_CLASS.fullmatch(cls) else "error"
+        row = {
+            "ts": datetime.now(UTC).isoformat(),
+            "site": site,
+            "error": error[:ERROR_CHARS],
+            "raw": raw[:RAW_CHARS] if keep_raw else "",
+            "raw_len": len(raw),
+        }
         with _WRITE_LOCK:
             rotate_rolling_size(path, MAX_BYTES, ARCHIVE_KEEP)
             with path.open("a", encoding="utf-8") as fh:

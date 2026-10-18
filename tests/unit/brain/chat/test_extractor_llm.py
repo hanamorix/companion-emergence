@@ -221,3 +221,14 @@ def test_pass2_records_a_malformed_extraction_through_the_live_path(tmp_path, mo
     monkeypatch.setattr(model_tier, "build_tier_provider", lambda *_a, **_k: _FakeProvider("no json here"))
     run_pass2_monologue(monologue_text="thinking", visible_reply="hi", recent_user_msgs=(), persona_dir=tmp_path)
     assert [r["site"] for r in _parse_rows(tmp_path)] == ["extractor"]
+
+
+def test_a_schema_failure_keeps_reply_text_out_of_the_runtime_log(tmp_path, caplog):
+    """#427 review: pydantic's message carries input_value='<reply text>'."""
+    import logging
+
+    raw = json.dumps({"memory_writes": [{"episode": "x", "salience": "SECRET-EPISODE-TEXT"}]})
+    with caplog.at_level(logging.DEBUG):
+        extract_from_thinking(provider=_FakeProvider(raw), monologue_blocks=("m",), visible_reply="hi",
+                              recent_turn_context=(), persona_dir=tmp_path)
+    assert "SECRET-EPISODE-TEXT" not in caplog.text

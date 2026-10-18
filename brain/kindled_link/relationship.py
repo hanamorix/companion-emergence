@@ -215,7 +215,9 @@ def run_relationship_reflection(
     try:
         data = json.loads(raw[raw.index("{"):raw.rindex("}") + 1])
     except Exception as exc:  # noqa: BLE001 — malformed → unchanged
-        record_parse_failure(persona_dir, site="kindled_relationship", raw=raw, error=str(exc), keep_raw=False)
+        record_parse_failure(
+            persona_dir, site="kindled_relationship", raw=raw, error=type(exc).__name__, keep_raw=False
+        )
         return state
 
     # hard breach → immediate reset to stranger (the only multi-stage move)
