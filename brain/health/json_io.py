@@ -97,9 +97,62 @@ def _seam(name: str, path: Path) -> None:
 
 _NO_DEFAULT: Any = object()
 
+Nonfinite = Literal["raise", "null"]
+
+
+def _null_nonfinite(obj: Any, default: Callable[[Any], Any] | None, seen: frozenset[int] = frozenset()) -> Any:
+    """Copy ``obj`` with every NaN/Infinity replaced by None, walking dicts, lists and tuples (never text).
+
+    A value ``json`` cannot encode goes through ``default`` first and its result is walked too, so a hook
+    that returns a dict holding a NaN is covered. A cycle raises ValueError like ``json.dumps`` does.
+    """
+    if isinstance(obj, float):
+        return obj if obj - obj == 0.0 else None
+    if obj is None or isinstance(obj, (str, int)):
+        return obj
+    if id(obj) in seen:
+        raise ValueError("Circular reference detected")
+    seen = seen | {id(obj)}
+    if isinstance(obj, dict):
+        return {k: _null_nonfinite(v, default, seen) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_null_nonfinite(v, default, seen) for v in obj]
+    if default is not None:
+        return _null_nonfinite(default(obj), default, seen)
+    return obj  # json.dumps raises its own TypeError for it
+
+
+def _dumps(
+    data: Any,
+    *,
+    indent: int | None,
+    sort_keys: bool,
+    encode_default: Callable[[Any], Any] | None,
+    nonfinite: Nonfinite,
+) -> str:
+    """The one encoder call: strict JSON, ASCII. ``nonfinite="null"`` retries a failed strict encode with NaN/Infinity as null."""
+    kwargs = {
+        "indent": indent,
+        "sort_keys": sort_keys,
+        "ensure_ascii": _ENSURE_ASCII,
+        "allow_nan": False,
+        "default": encode_default,
+    }
+    try:
+        return json.dumps(data, **kwargs)
+    except ValueError:
+        if nonfinite != "null":
+            raise
+        return json.dumps(_null_nonfinite(data, encode_default), **kwargs)
+
 
 class Recovery(enum.Enum):
     DEFAULT = "default"
+    # CONTENT: bad content (empty, malformed, bad encoding, wrong shape or schema) takes the default exactly
+    # as DEFAULT does, but an I/O fault raises JsonFileError(kind="io") exactly as RAISE does. For a caller
+    # whose handler swallowed bad content and let OSError propagate: a migration never widens what a
+    # caller swallows.
+    CONTENT = "content"
     RAISE = "raise"
     RESTORE = "restore"
     HEAL = "heal"
@@ -289,7 +342,7 @@ def _read(path, default, recover, expect, validate, fallbacks, waited: bool) -> 
     try:
         return JsonRead(_check(raw, expect, validate), "ok")
     except _BadContentError as bad:
-        if recover is Recovery.DEFAULT:
+        if recover in (Recovery.DEFAULT, Recovery.CONTENT):
             _report(path, bad.kind, bad.cause, "using the default")
             return JsonRead(default(), "defaulted", bad.kind)
         if recover is Recovery.RAISE:
@@ -668,6 +721,7 @@ def write_json(
     verify: bool = False,
     if_missing: bool = False,
     on_error: Literal["raise", "log"] = "raise",
+    nonfinite: Nonfinite = "raise",
 ) -> bool:
     """Atomically write ``data`` as JSON. True if written, False if skipped or (``on_error="log"``) failed.
 
@@ -677,15 +731,12 @@ def write_json(
     file is created and to every backup. ``verify=True`` re-reads the result and restores ``.bak1`` if it
     is not what was written (never raises). ``if_missing=True`` creates the file only if it does not exist
     (False if it does). ``on_error="log"`` turns an ``OSError`` into a throttled warning and False.
+    ``nonfinite="null"`` writes NaN/Infinity as null instead of raising (for a best-effort writer whose
+    payload can carry a computed float); the default raises ValueError before anything is touched.
     """
     text = (
-        json.dumps(
-            data,
-            indent=indent,
-            sort_keys=sort_keys,
-            ensure_ascii=_ENSURE_ASCII,
-            allow_nan=False,
-            default=encode_default,
+        _dumps(
+            data, indent=indent, sort_keys=sort_keys, encode_default=encode_default, nonfinite=nonfinite
         )
         + "\n"
     )
@@ -774,12 +825,15 @@ _JSONL_IO_ERRORS = (OSError, EOFError, gzip.BadGzipFile, zlib.error)
 
 
 def encode_jsonl(
-    records: dict | Iterable[dict], *, encode_default: Callable[[Any], Any] | None = None
+    records: dict | Iterable[dict],
+    *,
+    encode_default: Callable[[Any], Any] | None = None,
+    nonfinite: Nonfinite = "raise",
 ) -> bytes:
     """The one JSONL encoder: one ASCII line per dict, ``\\n`` terminated. Raises before anything is written.
 
     A record that is not a dict is a TypeError, a NaN a ValueError, an unencodable value a TypeError
-    (unless ``encode_default`` handles it).
+    (unless ``encode_default`` handles it). ``nonfinite="null"`` writes NaN/Infinity as null instead.
     """
     rows = [records] if isinstance(records, dict) else list(records)
     out = []
@@ -787,7 +841,7 @@ def encode_jsonl(
         if not isinstance(rec, dict):
             raise TypeError(f"a JSONL record must be a dict, got {type(rec).__name__}")
         out.append(
-            json.dumps(rec, ensure_ascii=_ENSURE_ASCII, allow_nan=False, default=encode_default)
+            _dumps(rec, indent=None, sort_keys=False, encode_default=encode_default, nonfinite=nonfinite)
             + "\n"
         )
     return "".join(out).encode("ascii" if _ENSURE_ASCII else "utf-8")
@@ -869,6 +923,73 @@ def read_jsonl(
     return list(iter_jsonl(path, strict=strict, recover=recover))
 
 
+def iter_jsonl_raw(
+    path: Path,
+    *,
+    strict: bool = False,
+    recover: Recovery = Recovery.DEFAULT,
+    bad_lines: bool = False,
+) -> Iterator[tuple[str, dict | None]]:
+    """Like :func:`iter_jsonl` but yields ``(line_text, record)``: the line without its terminator, exactly as read.
+
+    For a caller that re-writes the lines it read and must not re-serialise them (log rotation) or that must
+    still see a line it cannot parse (``recall_diagnostics._prune`` removes it). Blank lines are never yielded.
+    With ``bad_lines=True`` a line that cannot be used (malformed, invalid UTF-8, not an object) is yielded as
+    ``(text, None)`` after its usual warning; otherwise it is only skipped. ``strict`` and ``recover`` behave
+    as in :func:`iter_jsonl`.
+    """
+    path = Path(path)
+    _check_jsonl_recover(recover)
+    try:
+        opener = gzip.open(path, "rb") if path.suffix == ".gz" else open(path, "rb")
+    except FileNotFoundError:
+        return
+    except _JSONL_IO_ERRORS as exc:
+        yield from _io_stop(path, exc, recover)  # type: ignore[misc]
+        return
+    try:
+        with opener as fh:
+            yield from _stream_raw(fh, path, strict, bad_lines)
+    except _StrictLineError as exc:
+        raise JsonFileError(exc.path, "line", exc.reason, exc.line) from exc
+    except _JSONL_IO_ERRORS as exc:
+        yield from _io_stop(path, exc, recover)  # type: ignore[misc]
+
+
+def _stream_raw(binary, source: Path, strict: bool, bad_lines: bool) -> Iterator[tuple[str, dict | None]]:
+    wrapper = io.TextIOWrapper(binary, encoding="utf-8-sig", errors="surrogateescape", newline="\n")
+    try:
+        for line_index, raw in enumerate(wrapper, start=1):
+            text = raw.rstrip("\r\n")
+            try:
+                raw.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                reason, shown = f"invalid UTF-8 ({exc.reason})", text.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+                record = None
+            else:
+                if not text.strip():
+                    continue
+                try:
+                    data = json.loads(text)
+                except _JSON_PARSE_ERRORS as exc:
+                    reason, shown, record = f"malformed JSON ({exc})", text, None
+                else:
+                    if isinstance(data, dict):
+                        yield text, data
+                        continue
+                    reason, shown, record = f"not a JSON object ({type(data).__name__})", text, None
+            if strict:
+                raise _StrictLineError(source, reason, line_index)
+            logger.warning(
+                "skipping malformed jsonl line %d in %s: %s | content: %r",
+                line_index, source, reason, shown[:_PREVIEW],
+            )
+            if bad_lines:
+                yield text, record
+    finally:
+        wrapper.detach()
+
+
 def read_jsonl_tail(
     path: Path, n: int, *, strict: bool = False, recover: Recovery = Recovery.DEFAULT
 ) -> list[dict]:
@@ -938,7 +1059,7 @@ def _tail_lines(path: Path, n: int) -> list[bytes]:
     return found[::-1]
 
 
-def _payload(records) -> bytes:
+def _payload(records, nonfinite: Nonfinite = "raise") -> bytes:
     """Encoded records: pass ``encode_jsonl`` output through (it must end a line), encode anything else."""
     if isinstance(records, (bytes, bytearray)):
         payload = bytes(records)
@@ -947,7 +1068,7 @@ def _payload(records) -> bytes:
                 "encoded JSONL bytes must end with a newline (a half line would fuse with the next record)"
             )
         return payload
-    return encode_jsonl(records)
+    return encode_jsonl(records, nonfinite=nonfinite)
 
 
 def _tail_is_torn(fh) -> bool:
@@ -966,6 +1087,7 @@ def append_jsonl(
     lock: Literal["block", "try", "held"] = "block",
     fsync: bool = False,
     on_error: Literal["raise", "log"] = "raise",
+    nonfinite: Nonfinite = "raise",
 ) -> int | None:
     """Append dict records as JSONL in ONE write; return the record bytes written, or None if nothing was.
 
@@ -976,12 +1098,13 @@ def append_jsonl(
     "block" a filesystem that refuses the lock degrades to unlocked with a warning. Under "try" it cannot:
     ``file_lock(blocking=False)`` reports every flock error as busy, so a refusing filesystem reads as busy
     and the record is not written (the caller, like the recall path, buffers on None). ``on_error="log"`` turns
-    an OSError into a throttled warning and None.
+    an OSError into a throttled warning and None. ``nonfinite`` applies only when ``records`` are dicts;
+    pre-encoded bytes are written as given (encode them with ``encode_jsonl(..., nonfinite=...)``).
     """
     path = Path(path)
     if lock not in ("block", "try", "held"):
         raise ValueError(f"lock must be 'block', 'try' or 'held', not {lock!r}")
-    payload = _payload(records)
+    payload = _payload(records, nonfinite)
     if not payload:
         return 0
     try:
@@ -1032,9 +1155,10 @@ def write_jsonl(
     fsync: bool = True,
     mode: int | None = None,
     on_error: Literal["raise", "log"] = "raise",
+    nonfinite: Nonfinite = "raise",
 ) -> bool:
     """Atomically replace a JSONL file with ``records`` (same writer as :func:`write_json`)."""
-    payload = _payload(records)
+    payload = _payload(records, nonfinite)
     return _save_text(
         Path(path), payload.decode("utf-8"), backups, fsync, mode, False, False, on_error
     )

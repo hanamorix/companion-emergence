@@ -70,11 +70,10 @@ NOT_FILE_CLASSES = (
     "prompt-or-log",
     "sqlite-or-wire",
     "string-codec",
-    "one-hop-file",
     "subprocess",
 )
 TAG_OK = re.compile(
-    r"^(G[1-9][\w,/\- ]*|permanent:\s*\S|incoming:\s*#\d+|legacy|not-file:\s*("
+    r"^(G[1-9][\w,/\- ]*|permanent:\s*\S|held:\s*\S|incoming:\s*#\d+|legacy|not-file:\s*("
     + "|".join(NOT_FILE_CLASSES)
     + "))"
 )

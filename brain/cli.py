@@ -1598,7 +1598,7 @@ def _kindled_rotate_handler(args: argparse.Namespace) -> int:
     req = urllib.request.Request(url, data=b"{}", headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read())
+            data = json.loads(resp.read())  # json-io: ok -- HTTP response from the local bridge, not a file
     except urllib.error.HTTPError as exc:
         print(
             f"error: bridge returned {exc.code}: {exc.read().decode('utf-8', errors='replace')}",
@@ -1632,7 +1632,7 @@ def _kindled_my_code_handler(args: argparse.Namespace) -> int:
     req = urllib.request.Request(url, headers=headers, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read())
+            data = json.loads(resp.read())  # json-io: ok -- HTTP response from the local bridge, not a file
     except urllib.error.HTTPError as exc:
         print(
             f"error: bridge returned {exc.code}: {exc.read().decode('utf-8', errors='replace')}",
@@ -1667,7 +1667,7 @@ def _kindled_connect_handler(args: argparse.Namespace) -> int:
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read())
+            data = json.loads(resp.read())  # json-io: ok -- HTTP response from the local bridge, not a file
     except urllib.error.HTTPError as exc:
         print(
             f"error: bridge returned {exc.code}: {exc.read().decode('utf-8', errors='replace')}",
@@ -1701,7 +1701,7 @@ def _kindled_self_test_handler(args: argparse.Namespace) -> int:
     req = urllib.request.Request(url, data=b"{}", headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read())
+            data = json.loads(resp.read())  # json-io: ok -- HTTP response from the local bridge, not a file
     except urllib.error.HTTPError as exc:
         print(f"error: bridge returned {exc.code}: {exc.read().decode('utf-8', errors='replace')}", file=sys.stderr)
         return 1

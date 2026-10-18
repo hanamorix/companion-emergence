@@ -18,7 +18,7 @@ brain/behavioral/log.py::write::1   # G6
 brain/body/session_hours.py::read::1   # G7
 brain/body/words.py::legacy:read_jsonl_skipping_corrupt::1   # G7
 brain/bridge/chat.py::not-file-io::1   # not-file: model-reply
-brain/bridge/cli_throttle.py::not-file-io::1   # not-file: one-hop-file
+brain/bridge/cli_throttle.py::not-file-io::1   # G7
 brain/bridge/feed.py::legacy:read_jsonl_skipping_corrupt::2   # G7
 brain/bridge/feed.py::read::1   # G7
 brain/bridge/job_progress.py::read::1   # G3
@@ -28,9 +28,9 @@ brain/bridge/persisted_cadence.py::write::1   # G5
 brain/bridge/persona_state.py::read::3   # G3
 brain/bridge/pronoun_nudge.py::read::1   # G3
 brain/bridge/pronoun_nudge.py::write::1   # G5
-brain/bridge/provider.py::not-file-io::14   # not-file: subprocess; incoming: #355
-brain/bridge/provider.py::read::1   # G7
-brain/bridge/provider.py::write::4   # G5,G6,G8
+brain/bridge/provider.py::not-file-io::14   # not-file: subprocess
+brain/bridge/provider.py::read::1   # held: #406/#417 (Hana's open PRs)
+brain/bridge/provider.py::write::4   # held: #406/#417 (Hana's open PRs)
 brain/bridge/server.py::legacy:iter_jsonl_skipping_corrupt::1   # G7
 brain/bridge/server.py::not-file-io::2   # not-file: sqlite-or-wire
 brain/bridge/server.py::read::3   # G3,G7
@@ -53,7 +53,6 @@ brain/chat/tool_loop.py::not-file-io::3   # not-file: prompt-or-log
 brain/chat/tool_loop.py::write::1   # G5,G6
 brain/cli.py::legacy:read_jsonl_skipping_corrupt::2   # G7
 brain/cli.py::not-file-io::11   # not-file: prompt-or-log
-brain/cli.py::read::4   # permanent: HTTP responses from the local bridge, not files
 brain/cli.py::write::1   # G5,G6,G8
 brain/creative/dna.py::legacy:attempt_heal::1   # G1
 brain/creative/dna.py::legacy:save_with_backup::1   # G2
@@ -81,15 +80,15 @@ brain/engines/reflex.py::read::1   # G4
 brain/engines/research.py::legacy:attempt_heal::1   # G1
 brain/engines/research.py::legacy:save_with_backup::1   # G2
 brain/engines/research.py::not-file-io::3   # not-file: model-reply
-brain/felt_time/anchors.py::legacy:iter_jsonl_skipping_corrupt::1   # G7
-brain/felt_time/chat_log.py::legacy:iter_jsonl_skipping_corrupt::1   # G7
-brain/felt_time/chat_log.py::write::2   # G5,G6,G8
-brain/felt_time/state.py::legacy:iter_jsonl_skipping_corrupt::1   # G7
-brain/felt_time/state.py::legacy:save_with_backup::1   # G2
-brain/felt_time/state.py::read::1   # G3
-brain/felt_time/weather_shift.py::write::1   # G6
+brain/felt_time/anchors.py::legacy:iter_jsonl_skipping_corrupt::1   # held: felt-time audit first (Roy 2026-10-14)
+brain/felt_time/chat_log.py::legacy:iter_jsonl_skipping_corrupt::1   # held: felt-time audit first (Roy 2026-10-14)
+brain/felt_time/chat_log.py::write::2   # held: felt-time audit first (Roy 2026-10-14)
+brain/felt_time/state.py::legacy:iter_jsonl_skipping_corrupt::1   # held: felt-time audit first (Roy 2026-10-14)
+brain/felt_time/state.py::legacy:save_with_backup::1   # held: felt-time audit first (Roy 2026-10-14)
+brain/felt_time/state.py::read::1   # held: felt-time audit first (Roy 2026-10-14)
+brain/felt_time/weather_shift.py::write::1   # held: felt-time audit first (Roy 2026-10-14)
 brain/files/audit.py::write::1   # G6
-brain/files/pending.py::read::2   # G3; incoming: #429
+brain/files/pending.py::read::1   # G3
 brain/files/pending.py::write::2   # G5
 brain/forgetting/__init__.py::legacy:save_with_backup::1   # G2
 brain/forgetting/__init__.py::read::2   # G3
@@ -135,7 +134,6 @@ brain/initiate/adaptive.py::not-file-io::2   # not-file: string-codec
 brain/initiate/adaptive.py::read::1   # G3
 brain/initiate/audit.py::legacy:iter_jsonl_streaming::2   # G7
 brain/initiate/audit.py::not-file-io::2   # not-file: string-codec
-brain/initiate/compose.py::not-file-io::2   # not-file: model-reply; incoming: #427
 brain/initiate/d_call_schema.py::not-file-io::2   # not-file: string-codec
 brain/initiate/draft.py::read::1   # G3
 brain/initiate/draft.py::write::1   # G5,G6
@@ -150,8 +148,7 @@ brain/initiate/review.py::not-file-io::1   # not-file: prompt-or-log
 brain/initiate/schemas.py::not-file-io::4   # not-file: string-codec
 brain/initiate/user_pattern.py::legacy:read_jsonl_skipping_corrupt::5   # G7
 brain/initiate/user_pattern.py::legacy:read_last_n_jsonl_lines::1   # G7
-brain/initiate/user_pattern.py::not-file-io::1   # not-file: one-hop-file
-brain/initiate/voice_reflection.py::not-file-io::1   # not-file: model-reply; incoming: #427
+brain/initiate/user_pattern.py::not-file-io::1   # G7
 brain/kindled_link/audit.py::write::1   # G6
 brain/kindled_link/cadence.py::read::1   # G3
 brain/kindled_link/cadence.py::write::1   # G5
@@ -180,7 +177,7 @@ brain/memory/embedding_backfill.py::read::1   # G3
 brain/memory/embedding_backfill.py::write::1   # G5,G8
 brain/memory/pending.py::legacy:read_jsonl_skipping_corrupt::2   # G7
 brain/memory/pending.py::write::2   # G6,G8
-brain/memory/recall_diagnostics.py::not-file-io::2   # not-file: one-hop-file
+brain/memory/recall_diagnostics.py::not-file-io::2   # G6,G7,G8
 brain/memory/relevance_judge.py::not-file-io::1   # not-file: model-reply
 brain/memory/relevance_judge.py::read::1   # G3
 brain/memory/store.py::not-file-io::32   # not-file: sqlite-or-wire
@@ -218,7 +215,7 @@ brain/recovery/cli.py::read::1   # G3
 brain/recovery/engine.py::read::1   # G3
 brain/recovery/engine.py::write::1   # G5
 brain/recovery/report.py::not-file-io::1   # not-file: string-codec
-brain/recovery/source_reader.py::not-file-io::2   # not-file: one-hop-file
+brain/recovery/source_reader.py::not-file-io::2   # not-file: sqlite-or-wire
 brain/self_model/articulate.py::read::2   # G4
 brain/self_model/articulate.py::write::2   # G5,G6
 brain/self_model/cadence.py::read::2   # G3
@@ -246,11 +243,10 @@ brain/update/install.py::read::1   # G3
 brain/update/install.py::write::1   # G5
 brain/update/overlay.py::read::2   # G3
 brain/update/overlay.py::write::1   # G5
-brain/update/overlay_hook.py::read::1   # permanent: bootstrap hook, must not import brain
 brain/user_preferences.py::legacy:attempt_heal::1   # G1
 brain/user_preferences.py::legacy:save_with_backup::1   # G2
 brain/user_preferences.py::read::2   # G2,G3
 brain/utils/memory.py::read::1   # G7
-brain/health/parse_failures.py::read::1   # G7; incoming: #427
-brain/health/parse_failures.py::write::1   # G6; incoming: #427
-brain/utils/llm_output.py::not-file-io::2   # not-file: model-reply; incoming: #427
+brain/health/parse_failures.py::read::1   # G7
+brain/health/parse_failures.py::write::1   # G6
+brain/utils/llm_output.py::not-file-io::2   # not-file: model-reply
