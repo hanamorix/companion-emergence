@@ -24,14 +24,13 @@ Fail-open throughout: this module never raises into a turn.
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 import threading
 from pathlib import Path
 from typing import Any
 
 from brain import paths
+from brain.health.json_io import read_json, write_json
 
 logger = logging.getLogger(__name__)
 
@@ -116,18 +115,16 @@ def _load_overrides_locked() -> dict[str, Any]:
         return _overrides_cache
     if mtime == _cache_mtime:
         return _overrides_cache
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        overrides = data.get("overrides", {})
-        if not isinstance(overrides, dict):
-            raise ValueError("'overrides' is not an object")
-        _overrides_cache, _cache_mtime = overrides, mtime
+    # An unreadable or malformed file is read_json's default ({}): the module logs it, fail-open by design.
+    overrides = read_json(path, default=dict, expect=dict).get("overrides", {})
+    if isinstance(overrides, dict):
         _warned_file = False
-    except Exception as exc:  # noqa: BLE001 — fail-open by design
+    else:
         if not _warned_file:
-            logger.warning("tunables: cannot read %s (%s) — using code defaults", path, exc)
+            logger.warning("tunables: %s: 'overrides' is not an object — using code defaults", path)
             _warned_file = True
-        _overrides_cache, _cache_mtime = {}, mtime  # cache the failure until the file changes
+        overrides = {}
+    _overrides_cache, _cache_mtime = overrides, mtime  # cache the result (failures too) until the file changes
     return _overrides_cache
 
 
@@ -153,21 +150,12 @@ def write_defaults_section() -> None:
     """
     path = _file_path()
     try:
-        overrides: dict[str, Any] = {}
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and isinstance(data.get("overrides"), dict):
-                overrides = data["overrides"]
-        except FileNotFoundError:
-            pass
-        except Exception as exc:  # noqa: BLE001 — corrupt file: rebuild, drop nothing readable
-            logger.warning("tunables: %s unreadable at boot (%s) — rebuilding", path, exc)
+        # A corrupt file is rebuilt (read_json's default; the module logs it), keeping nothing unreadable.
+        data = read_json(path, default=dict, expect=dict)
+        overrides: dict[str, Any] = data["overrides"] if isinstance(data.get("overrides"), dict) else {}
         with _lock:
             defaults = dict(_registry)
         payload = {"_readme": _README, "defaults": defaults, "overrides": overrides}
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
+        write_json(path, payload, indent=2, sort_keys=True, fsync=False)
     except Exception:  # noqa: BLE001 — never break bridge startup
         logger.exception("tunables: write_defaults_section failed (ignored)")

@@ -43,6 +43,7 @@ from typing import Any
 from brain import prompt_strings
 from brain.bridge import cli_throttle
 from brain.bridge.usage_log import log_usage
+from brain.health.json_io import append_jsonl
 from brain.self_model.gap import Gap
 
 log = logging.getLogger(__name__)
@@ -135,10 +136,7 @@ def _log_articulate_error(
             "error": str(exc) if exc is not None else None,
             "traceback": traceback.format_exc() if exc is not None else None,
         }
-        path = Path(persona_dir) / _ARTICULATE_ERRORS_FILE
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a") as f:
-            f.write(json.dumps(entry) + "\n")
+        append_jsonl(Path(persona_dir) / _ARTICULATE_ERRORS_FILE, entry, on_error="log", nonfinite="null")
     except Exception:  # noqa: BLE001 — best-effort, never mask the real failure
         pass
 

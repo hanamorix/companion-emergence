@@ -44,9 +44,10 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from pathlib import Path
 from typing import Any
+
+from brain.health.json_io import Recovery, read_json, write_json
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +82,7 @@ def migrate_idle_keys(home: Path) -> None:
         return
 
     try:
-        data = json.loads(original_bytes.decode("utf-8"))
+        data = json.loads(original_bytes.decode("utf-8"))  # json-io: ok -- byte-exact backup needs the original bytes
     except Exception as exc:  # noqa: BLE001 — corrupt file: leave it for tunables.py's own repair
         logger.warning(
             "tunables_migration: %s unreadable (%s) — skipping (not this module's job to repair)",
@@ -128,12 +129,10 @@ def migrate_idle_keys(home: Path) -> None:
         return
 
     try:
-        tmp = path.with_suffix(path.suffix + ".tmp-migrate")
-        tmp.write_text(json.dumps(new_data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
+        write_json(path, new_data, indent=2, sort_keys=True, fsync=False)
 
-        # Re-load via the SAME parser tunables.py uses and verify.
-        reloaded = json.loads(path.read_text(encoding="utf-8"))
+        # Re-load via the SAME reader tunables.py uses and verify.
+        reloaded = read_json(path, recover=Recovery.RAISE, expect=dict)
         reloaded_overrides = reloaded.get("overrides", {})
         for k in retired_keys_present:
             if k in reloaded_overrides:

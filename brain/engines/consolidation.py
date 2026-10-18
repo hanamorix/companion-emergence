@@ -36,6 +36,7 @@ from typing import NamedTuple
 import numpy as np
 
 from brain import prompt_strings
+from brain.health.json_io import append_jsonl
 from brain.memory import embeddings as embeddings_mod
 from brain.memory.embedding_matrix import build_embedding_matrix
 from brain.memory.embeddings import cosine_similarity
@@ -699,9 +700,7 @@ def _archive_preimage(persona_dir: Path, target: Memory, source_id: str) -> None
         "merged_from_candidate": source_id,
     }
     path = persona_dir / _ARCHIVE_FILENAME
-    with file_lock(path):
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    append_jsonl(path, rec)
 
 
 def _dispatch(

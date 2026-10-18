@@ -117,7 +117,7 @@ def test_forced_write_failure_restores_original_bytes_and_logs(
     def _boom(*_a, **_kw):
         raise OSError("simulated disk failure during migration write")
 
-    monkeypatch.setattr("brain.tunables_migration.os.replace", _boom)
+    monkeypatch.setattr("os.replace", _boom)  # json_io (via attempt_heal) replaces through os.replace
 
     with caplog.at_level("WARNING"):
         migrate_idle_keys(tmp_path)  # must not raise
@@ -125,7 +125,7 @@ def test_forced_write_failure_restores_original_bytes_and_logs(
     assert (tmp_path / "tunables.json").read_bytes() == original_bytes
     assert not (tmp_path / "tunables.json.bak-migrate").exists(), "backup must be cleaned up"
     assert any("WARNING" == r.levelname for r in caplog.records)
-    monkeypatch.setattr("brain.tunables_migration.os.replace", real_replace)
+    monkeypatch.setattr("os.replace", real_replace)
 
 
 def test_migration_completes_before_supervisor_loop_pass_ordering_in_lifespan() -> None:

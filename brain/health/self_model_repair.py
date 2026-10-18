@@ -12,10 +12,10 @@ is preserved. Marker-gated → runs at most once per persona.
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 
+from brain.health.json_io import write_json
 from brain.self_model import state as sm_state
 
 logger = logging.getLogger(__name__)
@@ -43,10 +43,4 @@ def run_self_model_repair(persona_dir: Path) -> None:
     except Exception:
         logger.exception("self_model_repair: failed (non-fatal)")
     finally:
-        try:
-            persona_dir.mkdir(parents=True, exist_ok=True)
-            (persona_dir / _MARKER_FILENAME).write_text(
-                json.dumps({"done": True}), encoding="utf-8"
-            )
-        except OSError:
-            logger.exception("self_model_repair: could not write marker")
+        write_json(persona_dir / _MARKER_FILENAME, {"done": True}, indent=None, fsync=False, on_error="log")

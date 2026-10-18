@@ -1,14 +1,12 @@
 # Allowlist for tests/unit/test_no_direct_json_io.py: today's unmigrated direct JSON file I/O in brain/.
 # path::kind::count   # tag. Format and rules: see that test's docstring. Migration PRs delete or lower entries; nothing is added.
 
-brain/app_config.py::write::1   # G5
 brain/attunement/backfill.py::legacy:read_jsonl_skipping_corrupt::1   # G7
 brain/attunement/backfill.py::read::1   # G3
 brain/attunement/backfill.py::write::1   # G5
 brain/attunement/budget.py::read::2   # G4
 brain/attunement/budget.py::write::1   # G5
 brain/attunement/detector.py::not-file-io::1   # not-file: model-reply
-brain/attunement/detector.py::write::1   # G6
 brain/attunement/feed_source.py::read::1   # G3
 brain/attunement/store.py::legacy:read_jsonl_skipping_corrupt::1   # G7
 brain/attunement/store.py::read::1   # G3
@@ -37,20 +35,15 @@ brain/bridge/server.py::read::3   # G3,G7
 brain/bridge/state_file.py::legacy:attempt_heal::1   # G1
 brain/bridge/state_file.py::legacy:save_with_backup::1   # G2
 brain/bridge/supervisor.py::legacy:iter_jsonl_skipping_corrupt::1   # G7
-brain/bridge/usage_log.py::write::1   # G6
-brain/chat/compaction_migration.py::write::2   # G5,G8
 brain/chat/extractor.py::not-file-io::1   # not-file: model-reply
 brain/chat/extractor.py::read::1   # G3
-brain/chat/extractor.py::write::2   # G5,G6
-brain/chat/monologue_capture.py::write::1   # G5,G6
+brain/chat/extractor.py::write::1   # G5,G6
 brain/chat/pass2_queue.py::read::1   # G3
 brain/chat/pass2_queue.py::write::1   # G5
 brain/chat/prompt.py::legacy:read_jsonl_skipping_corrupt::1   # G7
 brain/chat/reflection_gate.py::read::1   # G4
 brain/chat/reflection_gate.py::write::1   # G5
-brain/chat/say_vs_do.py::write::1   # G5,G6
 brain/chat/tool_loop.py::not-file-io::3   # not-file: prompt-or-log
-brain/chat/tool_loop.py::write::1   # G5,G6
 brain/cli.py::legacy:read_jsonl_skipping_corrupt::2   # G7
 brain/cli.py::not-file-io::11   # not-file: prompt-or-log
 brain/cli.py::write::1   # G5,G6,G8
@@ -63,16 +56,13 @@ brain/engines/_interests.py::legacy:attempt_heal::1   # G1
 brain/engines/_interests.py::legacy:save_with_backup::1   # G2
 brain/engines/_interests.py::read::2   # G4
 brain/engines/consolidation.py::not-file-io::4   # not-file: model-reply
-brain/engines/consolidation.py::write::1   # G6,G8
 brain/engines/daemon_state.py::legacy:attempt_heal::1   # G1
 brain/engines/daemon_state.py::legacy:save_with_backup::2   # G2
-brain/engines/dedup_sweep.py::write::2   # G6
 brain/engines/dream.py::read::1   # G7
 brain/engines/dream.py::write::1   # G5,G6
 brain/engines/heartbeat.py::legacy:attempt_heal::2   # G1
 brain/engines/heartbeat.py::legacy:save_with_backup::2   # G2
 brain/engines/heartbeat.py::read::2   # G2
-brain/engines/heartbeat.py::write::1   # G5,G6
 brain/engines/interest_sweep.py::not-file-io::1   # not-file: model-reply
 brain/engines/reflex.py::legacy:attempt_heal::2   # G1
 brain/engines/reflex.py::legacy:save_with_backup::1   # G2
@@ -87,7 +77,6 @@ brain/felt_time/state.py::legacy:iter_jsonl_skipping_corrupt::1   # held: felt-t
 brain/felt_time/state.py::legacy:save_with_backup::1   # held: felt-time audit first (Roy 2026-10-14)
 brain/felt_time/state.py::read::1   # held: felt-time audit first (Roy 2026-10-14)
 brain/felt_time/weather_shift.py::write::1   # held: felt-time audit first (Roy 2026-10-14)
-brain/files/audit.py::write::1   # G6
 brain/files/pending.py::read::1   # G3
 brain/files/pending.py::write::2   # G5
 brain/forgetting/__init__.py::legacy:save_with_backup::1   # G2
@@ -112,7 +101,6 @@ brain/health/attempt_heal.py::read::1   # legacy helper (deleted at migration)
 brain/health/attempt_heal.py::write::2   # legacy helper (deleted at migration)
 brain/health/jsonl_reader.py::not-file-io::1   # legacy helper (deleted at migration)
 brain/health/log_rotation.py::read::1   # G7
-brain/health/self_model_repair.py::write::1   # G5
 brain/health/soul_candidate_repair.py::legacy:read_jsonl_skipping_corrupt::2   # G7
 brain/health/soul_candidate_repair.py::read::1   # G3
 brain/health/soul_candidate_repair.py::write::2   # G5,G8
@@ -140,7 +128,6 @@ brain/initiate/draft.py::write::1   # G5,G6
 brain/initiate/emit.py::legacy:iter_jsonl_skipping_corrupt::2   # G7
 brain/initiate/emit.py::not-file-io::1   # not-file: string-codec
 brain/initiate/new_sources.py::read::1   # G3
-brain/initiate/new_sources.py::write::1   # G6
 brain/initiate/presence_state.py::read::1   # G3
 brain/initiate/presence_state.py::write::1   # G5
 brain/initiate/reflection.py::not-file-io::1   # not-file: model-reply
@@ -149,7 +136,6 @@ brain/initiate/schemas.py::not-file-io::4   # not-file: string-codec
 brain/initiate/user_pattern.py::legacy:read_jsonl_skipping_corrupt::5   # G7
 brain/initiate/user_pattern.py::legacy:read_last_n_jsonl_lines::1   # G7
 brain/initiate/user_pattern.py::not-file-io::1   # G7
-brain/kindled_link/audit.py::write::1   # G6
 brain/kindled_link/cadence.py::read::1   # G3
 brain/kindled_link/cadence.py::write::1   # G5
 brain/kindled_link/codec.py::not-file-io::1   # not-file: string-codec
@@ -159,7 +145,7 @@ brain/kindled_link/privacy_gate.py::not-file-io::3   # not-file: model-reply
 brain/kindled_link/protocol.py::not-file-io::1   # not-file: string-codec
 brain/kindled_link/relationship.py::not-file-io::9   # not-file: sqlite-or-wire
 brain/kindled_link/relationship.py::read::1   # G3
-brain/kindled_link/relationship.py::write::2   # G6
+brain/kindled_link/relationship.py::write::1   # G6
 brain/kindled_link/session_engine.py::not-file-io::1   # not-file: sqlite-or-wire
 brain/kindled_link/tick.py::not-file-io::3   # not-file: sqlite-or-wire
 brain/kindled_link/views.py::legacy:read_jsonl_skipping_corrupt::1   # G7
@@ -170,9 +156,7 @@ brain/maker/charge.py::write::1   # G5
 brain/maker/maker.py::not-file-io::1   # not-file: model-reply
 brain/maker/persist.py::not-file-io::1   # not-file: sqlite-or-wire
 brain/mcp_server/audit.py::not-file-io::2   # not-file: prompt-or-log
-brain/mcp_server/audit.py::write::1   # G5,G6
 brain/mcp_server/tools.py::not-file-io::2   # not-file: prompt-or-log
-brain/memory/db_health.py::write::1   # G6
 brain/memory/embedding_backfill.py::read::1   # G3
 brain/memory/embedding_backfill.py::write::1   # G5,G8
 brain/memory/pending.py::legacy:read_jsonl_skipping_corrupt::2   # G7
@@ -182,7 +166,6 @@ brain/memory/relevance_judge.py::not-file-io::1   # not-file: model-reply
 brain/memory/relevance_judge.py::read::1   # G3
 brain/memory/store.py::not-file-io::32   # not-file: sqlite-or-wire
 brain/migrator/cli.py::not-file-io::1   # not-file: prompt-or-log
-brain/migrator/cli.py::write::2   # G2,G5
 brain/migrator/companion_emergence.py::read::2   # G3
 brain/migrator/companion_emergence.py::write::1   # G5
 brain/migrator/emergence_kit.py::read::2   # G3,G4
@@ -198,7 +181,6 @@ brain/migrator/og_soul.py::read::1   # G3
 brain/migrator/og_soul_candidates.py::read::1   # G7
 brain/migrator/og_soul_candidates.py::write::1   # G2
 brain/migrator/report.py::not-file-io::1   # not-file: string-codec
-brain/migrator/report.py::write::1   # G2,G5
 brain/narrative_memory/state.py::legacy:iter_jsonl_skipping_corrupt::2   # G7
 brain/narrative_memory/state.py::legacy:save_with_backup::1   # G2
 brain/narrative_memory/state.py::read::1   # G3
@@ -207,7 +189,6 @@ brain/narrative_memory/tool.py::legacy:iter_jsonl_skipping_corrupt::1   # G7
 brain/notes/compose.py::not-file-io::1   # not-file: model-reply
 brain/notes/state.py::read::2   # G3
 brain/notes/state.py::write::2   # G5
-brain/notes/write.py::write::1   # G6
 brain/persona_config.py::legacy:attempt_heal::1   # G1
 brain/persona_config.py::legacy:save_with_backup::1   # G2
 brain/persona_config.py::read::1   # G2
@@ -217,7 +198,7 @@ brain/recovery/engine.py::write::1   # G5
 brain/recovery/report.py::not-file-io::1   # not-file: string-codec
 brain/recovery/source_reader.py::not-file-io::2   # not-file: sqlite-or-wire
 brain/self_model/articulate.py::read::2   # G4
-brain/self_model/articulate.py::write::2   # G5,G6
+brain/self_model/articulate.py::write::1   # G5,G6
 brain/self_model/cadence.py::read::2   # G3
 brain/self_model/cadence.py::write::1   # G5
 brain/self_model/resolve.py::read::1   # G3
@@ -234,11 +215,6 @@ brain/soul/review.py::legacy:read_jsonl_skipping_corrupt::1   # G7
 brain/soul/review.py::not-file-io::1   # not-file: model-reply
 brain/soul/review.py::write::1   # G5,G8
 brain/soul/store.py::not-file-io::2   # not-file: sqlite-or-wire
-brain/tools/impls/read_file.py::write::1   # G6
-brain/tunables.py::read::2   # G3
-brain/tunables.py::write::1   # G5
-brain/tunables_migration.py::read::2   # G3
-brain/tunables_migration.py::write::1   # G5,G8
 brain/update/install.py::read::1   # G3
 brain/update/install.py::write::1   # G5
 brain/update/overlay.py::read::2   # G3

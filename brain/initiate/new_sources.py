@@ -19,6 +19,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
+from brain.health.json_io import append_jsonl
 from brain.initiate.emit import emit_initiate_candidate, read_candidates
 from brain.initiate.schemas import CandidateSource, SemanticContext
 
@@ -77,7 +78,6 @@ def write_gate_rejection(
     observed_value: float,
 ) -> None:
     """Append one rejection row to gate_rejections.jsonl. Never raises."""
-    persona_dir.mkdir(parents=True, exist_ok=True)
     path = persona_dir / "gate_rejections.jsonl"
     row = {
         "ts": ts.isoformat(),
@@ -87,11 +87,7 @@ def write_gate_rejection(
         "threshold_value": threshold_value,
         "observed_value": observed_value,
     }
-    try:
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-    except OSError as exc:
-        logger.warning("gate_rejections append failed for %s: %s", path, exc)
+    append_jsonl(path, row, on_error="log", nonfinite="null")
 
 
 def check_shared_meta_gates(

@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from brain import prompt_strings
 from brain.bridge.provider import LLMProvider
+from brain.health.json_io import append_jsonl
 from brain.health.parse_failures import record_parse_failure
 
 logger = logging.getLogger(__name__)
@@ -271,9 +272,7 @@ def _utcnow_iso() -> str:
 
 
 def _append_jsonl(path: Path, entry: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    append_jsonl(path, entry)
 
 
 def _safely(step_name: str, persona_dir: Path, fn) -> None:

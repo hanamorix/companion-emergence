@@ -20,6 +20,7 @@ from pathlib import Path
 
 from brain import prompt_strings
 from brain.bridge import cli_throttle as _default_throttle
+from brain.health.json_io import append_jsonl
 from brain.health.parse_failures import record_parse_failure
 from brain.kindled_link import limits
 from brain.state_compat import from_known_fields
@@ -143,15 +144,12 @@ def _log_rejection(*, persona_dir, peer_id: str, rejected_quote: str,
     if persona_dir is None:
         return
     try:
-        row = json.dumps({
-            "ts": now.isoformat(),
-            "peer_id": peer_id,
-            "rejected_quote": rejected_quote[:500],
-        }, separators=(",", ":"))
-        p = Path(persona_dir) / "kindled_link" / _REFLECTION_REJECTIONS_FILE
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with p.open("a", encoding="utf-8") as f:
-            f.write(row + "\n")
+        append_jsonl(
+            Path(persona_dir) / "kindled_link" / _REFLECTION_REJECTIONS_FILE,
+            {"ts": now.isoformat(), "peer_id": peer_id, "rejected_quote": rejected_quote[:500]},
+            on_error="log",
+            nonfinite="null",
+        )
     except Exception:  # noqa: BLE001 — audit; never raise into caller
         log.warning("reflection rejection log write failed", exc_info=True)
 

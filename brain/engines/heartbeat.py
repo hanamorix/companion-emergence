@@ -31,6 +31,7 @@ from brain.dev_constants import HEARTBEAT_DECAY_BATCH_BUDGET_S
 from brain.engines.daemon_state import update_daemon_state
 from brain.health.alarm import compute_pending_alarms
 from brain.health.anomaly import BrainAnomaly
+from brain.health.json_io import append_jsonl
 from brain.health.walker import walk_persona
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
@@ -1612,5 +1613,4 @@ class HeartbeatEngine:
 
     def _append_log(self, entry: dict) -> None:
         """Append one JSON line to heartbeats.log.jsonl."""
-        with self.heartbeat_log_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
+        append_jsonl(self.heartbeat_log_path, entry)
