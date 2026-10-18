@@ -558,7 +558,7 @@ describe("ConnectionPanel — rejected and unchecked models (#440)", () => {
     expect(await screen.findByText(/using "haiku"/)).toBeInTheDocument();
     // a poll that left before the Apply lands afterwards: still the old chat model, old list
     rerender(<ConnectionPanel state={{ ...staleState }} persona="test" />);
-    expect(screen.getByText(/using "haiku"\b/)).toBeInTheDocument();
+    expect(screen.getByText(/using "haiku",/)).toBeInTheDocument();
     expect(screen.queryByText(/using "claude-haiku-4-5-20251001"/)).not.toBeInTheDocument();
     // the first poll that reports the new chat model carries the bridge's own list
     rerender(
@@ -571,7 +571,7 @@ describe("ConnectionPanel — rejected and unchecked models (#440)", () => {
       />,
     );
     expect(screen.getByText(/using "claude-haiku-4-5-20251001"/)).toBeInTheDocument();
-    expect(screen.queryByText(/using "haiku"\b/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/using "haiku",/)).not.toBeInTheDocument();
   });
 
   it("does not repeat a rejection line that a fallback line already explains", () => {

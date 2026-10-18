@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import type { ReactNode } from "react";
 import { installNellCliSymlink, installSupervisorService } from "../../appConfig";
 import type { PersonaState, ChatModel, PronounPreset } from "../../bridge";
@@ -93,9 +93,15 @@ export function ConnectionPanel({
   // Tier fallbacks the last Apply reported, shown at once until the bridge's own list (state) takes over.
   // null = no Apply since the last state; an empty list is a fresh answer: none.
   const [pendingFallbacks, setPendingFallbacks] = useState<TierFallbackInfo[] | null>(null);
+  // The model the last Apply saved. A poll that left before the Apply still reports the OLD chat model and
+  // must not bring back the old lines; the first poll that reports the new model carries the bridge's own list.
+  const appliedModelRef = useRef<string | null>(null);
   useEffect(() => {
-    setPendingNotice(false);
-    setPendingFallbacks(null);
+    if (appliedModelRef.current === null || state?.connection?.model === appliedModelRef.current) {
+      appliedModelRef.current = null;
+      setPendingNotice(false);
+      setPendingFallbacks(null);
+    }
   }, [state]);
   const fallbacks = pendingFallbacks ?? state?.tier_fallbacks ?? [];
   const modelNotice =
@@ -334,6 +340,7 @@ export function ConnectionPanel({
           onClose={(newModel, info) => {
             if (newModel) {
               setLocalModel(newModel);
+              appliedModelRef.current = newModel;
               setPendingNotice(info?.checked === false);
               setPendingFallbacks(info?.fallbacks ?? []);
             }

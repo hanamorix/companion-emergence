@@ -27,6 +27,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -633,18 +634,28 @@ def _chat_error_detail(exc: BaseException, provider: Any) -> str:
     return f"{code}:{model}" if model else code
 
 
-# Apply-time check of a custom model id (#440): one tiny real call, so a typo is refused with a specific
-# message instead of failing later inside background jobs. Kept below a typical webview request timeout so
-# the client never aborts and replays while it runs; a rejected id answers in seconds.
+# Apply-time check of a custom model id (#440): a few tiny real calls (the chat id, then the tier ids derived
+# from it), so a typo is refused with a specific message instead of failing later inside background jobs.
+# ONE budget covers the whole Apply, not each probe. The app's request has no timeout of its own (bridge.ts
+# `bridgeFetch` sets no AbortSignal), so the limit that applies is the webview's network stack: WKWebView
+# (macOS) cuts an idle request at about 60 s; WebView2 and WebKitGTK are not known to cut earlier. A custom id
+# is also not replayed, so a cut request would show an error while the bridge still saves. 30 s keeps the
+# worst case (a hanging CLI) at half of that; a rejected id answers in seconds.
 _MODEL_CHECK_TIMEOUT_S = tunables.register("provider.model_check_timeout_seconds", 30.0)
 _MODEL_CHECK_PROMPT = "Reply with the single word OK."
+_MIN_PROBE_S = 1  # a probe given less than this is not started
 
 
-def _check_model_blocking(model_id: str) -> tuple[str, str]:
+def _check_budget_s() -> float:
+    return float(tunables.get_tunable("provider.model_check_timeout_seconds", _MODEL_CHECK_TIMEOUT_S))
+
+
+def _check_model_blocking(model_id: str, timeout_s: float | None = None) -> tuple[str, str]:
     """Run ONE ``generate()`` with ``model_id``. Returns ``("ok", "")``, ``("rejected", "")`` or
     ``("inconclusive", <reason>)``. Never raises. No ``persona_dir`` is passed, so no usage row is written,
-    and the call is suppressed in ``model_error`` so a refused id leaves no record or WARNING."""
-    timeout = int(tunables.get_tunable("provider.model_check_timeout_seconds", _MODEL_CHECK_TIMEOUT_S))
+    and the call is suppressed in ``model_error`` so a refused id leaves no record or WARNING.
+    ``timeout_s`` is the time this probe may use (default: the whole Apply budget)."""
+    timeout = max(_MIN_PROBE_S, int(_check_budget_s() if timeout_s is None else timeout_s))
     try:
         with model_error.suppressed():
             ClaudeCliProvider(model=model_id, timeout_seconds=timeout).generate(_MODEL_CHECK_PROMPT)
@@ -2015,15 +2026,23 @@ def build_app(
         derived_outcomes: dict[str, str] = {}
         if req.model not in KNOWN_MODELS and isinstance(s.provider, ClaudeCliProvider):
             async with model_check_lock:
-                outcome, reason = await asyncio.to_thread(_check_model_blocking, req.model)
+                budget = _check_budget_s()
+                started = time.monotonic()
+                outcome, reason = await asyncio.to_thread(_check_model_blocking, req.model, budget)
                 if outcome == "rejected":  # no derived probe is spent on an id that is refused anyway
                     return JSONResponse(
                         status_code=400,
                         content={"ok": False, "error": "model_unavailable", "model": req.model},
                     )
-                derived_results = await asyncio.gather(
-                    *(asyncio.to_thread(_check_model_blocking, m) for m in derived_ids)
-                )
+                # The derived probes share what is left of the ONE budget (they run together, so the
+                # whole Apply stays inside it); none is started once it is used up.
+                left = budget - (time.monotonic() - started)
+                if derived_ids and left >= _MIN_PROBE_S:
+                    derived_results = await asyncio.gather(
+                        *(asyncio.to_thread(_check_model_blocking, m, left) for m in derived_ids)
+                    )
+                else:
+                    derived_results = [("inconclusive", "budget")] * len(derived_ids)
             checked = outcome == "ok"
             if not checked:
                 logger.info(
