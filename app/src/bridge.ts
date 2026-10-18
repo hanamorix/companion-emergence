@@ -12,7 +12,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
-import { modelRejectionMessage } from "./lib/friendlyChatError";
+import { modelRejectionMessage, type TierFallbackInfo } from "./lib/friendlyChatError";
 import { isChatModelAlias } from "./lib/modelId";
 
 export interface BridgeCredentials {
@@ -173,6 +173,9 @@ export interface PersonaState {
   /** The chat model, when it was saved without the Apply-time check being able to confirm it and no clean
    *  reply has arrived for it since; [] otherwise. The connection panel shows a plain notice (#440). */
   model_unconfirmed?: string[];
+  /** Background (tier) models that fell back to what each tier uses today because the model matching the
+   *  chat model's version was rejected; [] when none. The connection panel shows a plain line each (#441). */
+  tier_fallbacks?: TierFallbackInfo[];
   /** File writes she has proposed and that await the user's approve/decline.
    *  Each is the consent gate for one guarded write — `propose_write` queued
    *  it (writing nothing); the user commits it to disc or discards it via the
@@ -671,10 +674,10 @@ export type ChatModel = string;
  * Throws on any non-2xx response. A custom id is NOT replayed after a network
  * failure: the setter is idempotent, but a replay would run a second check call.
  */
-export async function setPersonaModel(
+export async function setPersonaModelFull(
   persona: string,
   model: ChatModel,
-): Promise<boolean | undefined> {
+): Promise<{ checked?: boolean; fallbacks: TierFallbackInfo[] }> {
   const r = await bridgeFetch(persona, (creds) =>
     fetch(`${creds.url}/persona/config/model`, {
       method: "POST",
@@ -694,7 +697,18 @@ export async function setPersonaModel(
     throw new Error(`setPersonaModel failed: ${r.status}`);
   }
   const ok = await r.json().catch(() => null);
-  return ok && typeof ok.checked === "boolean" ? ok.checked : undefined;
+  return {
+    checked: ok && typeof ok.checked === "boolean" ? ok.checked : undefined,
+    fallbacks: ok && Array.isArray(ok.fallbacks) ? (ok.fallbacks as TierFallbackInfo[]) : [],
+  };
+}
+
+/** Like {@link setPersonaModelFull} but resolves to the `checked` flag alone. */
+export async function setPersonaModel(
+  persona: string,
+  model: ChatModel,
+): Promise<boolean | undefined> {
+  return (await setPersonaModelFull(persona, model)).checked;
 }
 
 /** Response from POST /persona/config/notes. */

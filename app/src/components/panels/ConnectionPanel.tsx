@@ -7,7 +7,12 @@ import type { InstallShape } from "../../platform";
 import { Divider, PanelShell, SectionLabel, Toggle } from "../ui";
 import { RestartBridgeButton } from "./RestartBridgeButton";
 import { ModelPicker } from "./ModelPicker";
-import { MODEL_UNCHECKED_MESSAGE, modelRejectedNowMessage } from "../../lib/friendlyChatError";
+import {
+  MODEL_UNCHECKED_MESSAGE,
+  modelRejectedNowMessage,
+  tierFallbackMessage,
+  type TierFallbackInfo,
+} from "../../lib/friendlyChatError";
 import { PronounPicker } from "./PronounPicker";
 import { NotesToggle } from "./NotesToggle";
 import { KindledLinkToggle } from "./KindledLinkToggle";
@@ -85,20 +90,28 @@ export function ConnectionPanel({
   // Set when the last Apply saved a custom model the bridge could not confirm: shown at once, then the
   // bridge's `model_unconfirmed` list takes over (it empties when a clean reply arrives for the model).
   const [pendingNotice, setPendingNotice] = useState(false);
+  // Tier fallbacks the last Apply reported, shown at once until the bridge's own list (state) takes over.
+  const [pendingFallbacks, setPendingFallbacks] = useState<TierFallbackInfo[]>([]);
   useEffect(() => {
     setPendingNotice(false);
+    setPendingFallbacks([]);
   }, [state]);
+  const fallbacks = state?.tier_fallbacks && state.tier_fallbacks.length > 0 ? state.tier_fallbacks : pendingFallbacks;
   const modelNotice =
     pendingNotice || (displayModel !== null && (state?.model_unconfirmed ?? []).includes(displayModel))
       ? MODEL_UNCHECKED_MESSAGE
       : null;
   // Models the Claude CLI rejected while in use (the bridge drops a record when the model changes or a
   // clean reply arrives). A record for the model the user has since replaced is stale until the next poll.
+  const explainedByFallback = new Set(fallbacks.map((f) => f.wanted));
   const rejectionLines = (state?.model_rejections ?? []).flatMap((rec) => {
+    // The chat model's own rejection is never hidden, even when a fallback line names the same id.
     if (rec.model === displayModel) return [modelRejectedNowMessage(rec.model, true)];
     if (rec.model === conn?.model) return [];
+    if (explainedByFallback.has(rec.model)) return [];
     return [modelRejectedNowMessage(rec.model, false)];
   });
+  const fallbackLines = fallbacks.map(tierFallbackMessage);
   const [showPronounPicker, setShowPronounPicker] = useState(false);
   // Local pronoun override — updated optimistically after a successful apply.
   const [localPronouns, setLocalPronouns] = useState<PronounPreset | null>(null);
@@ -321,6 +334,7 @@ export function ConnectionPanel({
             if (newModel) {
               setLocalModel(newModel);
               setPendingNotice(info?.checked === false);
+              setPendingFallbacks(info?.fallbacks ?? []);
             }
             setShowModelPicker(false);
           }}
@@ -331,6 +345,15 @@ export function ConnectionPanel({
           {modelNotice}
         </div>
       )}
+      {fallbackLines.map((line) => (
+        <div
+          key={line}
+          role="status"
+          style={{ fontSize: 10.5, color: "var(--text-mute)", lineHeight: 1.5, marginBottom: 6, wordBreak: "break-word" }}
+        >
+          {line}
+        </div>
+      ))}
       {rejectionLines.map((line) => (
         <div
           key={line}

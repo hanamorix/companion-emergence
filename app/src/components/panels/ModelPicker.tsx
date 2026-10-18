@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { setPersonaModel, type ChatModel } from "../../bridge";
+import { setPersonaModelFull, type ChatModel } from "../../bridge";
+import type { TierFallbackInfo } from "../../lib/friendlyChatError";
 import { MODEL_ID_MAX_LENGTH, isChatModelAlias, isValidChatModel } from "../../lib/modelId";
 
 /** Radio value for the custom-id option; never sent to the bridge (the typed id is). */
@@ -8,12 +9,15 @@ const CUSTOM = "__custom__";
 interface Props {
   current: ChatModel;
   persona: string;
-  /** `info.checked === false`: the model was saved but the bridge could not confirm it (#440). */
+  /** `info` is only passed when the bridge could not confirm the model or some tiers fell back (#440, #441). */
   onClose: (newModel?: ChatModel, info?: ModelApplyInfo) => void;
 }
 
 export interface ModelApplyInfo {
-  checked: false;
+  /** false: the bridge could not confirm the model (it was saved anyway). */
+  checked?: false;
+  /** Background tiers that fell back because the version-matched model was not available. */
+  fallbacks?: TierFallbackInfo[];
 }
 
 interface ModelOption {
@@ -58,8 +62,11 @@ export function ModelPicker({ current, persona, onClose }: Props) {
     setBusy(true);
     setError(null);
     try {
-      const checked = await setPersonaModel(persona, value);
-      if (checked === false) onClose(value, { checked: false });
+      const { checked, fallbacks } = await setPersonaModelFull(persona, value);
+      const info: ModelApplyInfo = {};
+      if (checked === false) info.checked = false;
+      if (fallbacks.length > 0) info.fallbacks = fallbacks;
+      if (Object.keys(info).length > 0) onClose(value, info);
       else onClose(value);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));

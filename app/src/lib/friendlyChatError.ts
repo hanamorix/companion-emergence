@@ -70,3 +70,18 @@ export function modelRejectedNowMessage(model: string, chosen: boolean): string 
     ? `Claude rejected ${name}. It may not exist, or your account may not have access to it. Use change to pick another model.`
     : `Claude rejected ${name}, which some background jobs use on their own. Check that your Claude account can use it.`;
 }
+
+/** One background tier family whose version-matched model was not available (from the bridge). */
+export interface TierFallbackInfo {
+  family: string;
+  wanted: string;
+  using: string;
+}
+
+/** The plain line for a tier model that fell back to what that tier uses today. */
+export function tierFallbackMessage(f: TierFallbackInfo): string {
+  return (
+    `Background jobs that use the ${f.family} family are using "${shortenModelId(f.using)}", ` +
+    `because "${shortenModelId(f.wanted)}" is not available to your account.`
+  );
+}

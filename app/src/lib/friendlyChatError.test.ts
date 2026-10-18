@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { friendlyChatError, modelRejectionMessage } from "./friendlyChatError";
+import { friendlyChatError, modelRejectionMessage, tierFallbackMessage } from "./friendlyChatError";
 
 describe("friendlyChatError", () => {
   it("maps provider_failed to actionable Claude guidance", () => {
@@ -63,6 +63,14 @@ describe("friendlyChatError", () => {
     expect(out).toContain('"claude-sonet-5"');
     expect(out).toMatch(/Check the model ID, or pick Sonnet, Opus or Haiku/);
     expect(out).not.toMatch(/connection panel/i);
+    expect(out).not.toContain("—");
+  });
+
+  it("words a tier fallback plainly, without an em-dash", () => {
+    const out = tierFallbackMessage({ family: "haiku", wanted: "claude-haiku-5", using: "haiku" });
+    expect(out).toBe(
+      'Background jobs that use the haiku family are using "haiku", because "claude-haiku-5" is not available to your account.',
+    );
     expect(out).not.toContain("—");
   });
 });

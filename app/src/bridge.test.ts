@@ -35,6 +35,7 @@ import {
   resetBridgeCredentialCache,
   sendChat,
   setPersonaModel,
+  setPersonaModelFull,
   setPersonaPronouns,
   shutdownBridge,
   snapshotSession,
@@ -325,6 +326,18 @@ describe("setPersonaModel", () => {
     ));
 
     await expect(setPersonaModel("alice", "haiku")).resolves.toBeUndefined();
+  });
+
+  it("setPersonaModelFull also returns the tier fallbacks", async () => {
+    const fb = [{ family: "haiku", wanted: "claude-haiku-5", using: "haiku" }];
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: true, fallbacks: fb }), { status: 200 }),
+    ));
+    await expect(setPersonaModelFull("alice", "claude-sonnet-5")).resolves.toEqual({ checked: true, fallbacks: fb });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, model: "opus" }), { status: 200 }),
+    ));
+    await expect(setPersonaModelFull("alice", "opus")).resolves.toEqual({ checked: undefined, fallbacks: [] });
   });
 
   it("resolves to the bridge's checked flag for a custom id", async () => {

@@ -274,4 +274,16 @@ describe("ModelPicker", () => {
     fireEvent.change(idInput(), { target: { value: "claude-" + "a".repeat(58) } });
     expect(applyBtn()).toBeDisabled();
   });
+
+  it("passes the bridge's tier fallbacks to the caller", async () => {
+    const fb = [{ family: "haiku", wanted: "claude-haiku-5", using: "haiku" }];
+    stubFetch(
+      new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: true, fallbacks: fb }), { status: 200 }),
+    );
+    const onClose = vi.fn();
+    render(<ModelPicker current="sonnet" persona="test" onClose={onClose} />);
+    fireEvent.change(idInput(), { target: { value: "claude-sonnet-5" } });
+    fireEvent.click(applyBtn());
+    await waitFor(() => expect(onClose).toHaveBeenCalledWith("claude-sonnet-5", { fallbacks: fb }));
+  });
 });

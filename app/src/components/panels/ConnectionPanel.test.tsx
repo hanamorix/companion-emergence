@@ -358,10 +358,21 @@ describe("ConnectionPanel — install shape gating (Phase 2)", () => {
 // ── Model section (Phase 8.3) ─────────────────────────────────────
 
 vi.mock("./ModelPicker", () => ({
-  ModelPicker: ({ onClose }: { onClose: (m?: string, info?: { checked: false }) => void }) => (
+  ModelPicker: ({
+    onClose,
+  }: {
+    onClose: (m?: string, info?: { checked?: false; fallbacks?: { family: string; wanted: string; using: string }[] }) => void;
+  }) => (
     <div data-testid="model-picker">
       <button onClick={() => onClose("opus")}>Apply opus</button>
       <button onClick={() => onClose("claude-sonnet-5", { checked: false })}>Apply unchecked</button>
+      <button
+        onClick={() =>
+          onClose("claude-sonnet-5", { fallbacks: [{ family: "haiku", wanted: "claude-haiku-5", using: "haiku" }] })
+        }
+      >
+        Apply with fallback
+      </button>
       <button onClick={() => onClose()}>Cancel</button>
     </div>
   ),
@@ -483,6 +494,76 @@ describe("ConnectionPanel — rejected and unchecked models (#440)", () => {
       />,
     );
     expect(screen.queryByText(/Couldn't check that model/)).not.toBeInTheDocument();
+  });
+
+  const HAIKU = { family: "haiku", wanted: "claude-haiku-5", using: "haiku" };
+  const PINNED = { family: "haiku", wanted: "claude-haiku-5", using: "claude-haiku-4-5-20251001" };
+
+  it("shows a plain line for each background tier that fell back (#441)", () => {
+    render(
+      <ConnectionPanel
+        state={baseState({
+          connection: { provider: "claude-cli", model: "claude-sonnet-5", last_heartbeat_at: null },
+          tier_fallbacks: [HAIKU, PINNED],
+        })}
+        persona="test"
+      />,
+    );
+    const first = screen.getByText(/using "haiku"/);
+    expect(first).toHaveTextContent(/Background jobs that use the haiku family are using "haiku"/);
+    expect(first).toHaveTextContent(/"claude-haiku-5" is not available to your account/);
+    expect(first.textContent).not.toContain("—");
+    expect(screen.getByText(/using "claude-haiku-4-5-20251001"/)).toBeInTheDocument();
+  });
+
+  it("shows the fallbacks the last Apply reported at once, and the bridge's list takes over", async () => {
+    const { rerender } = render(
+      <ConnectionPanel state={baseState({ connection: { provider: "claude-cli", model: "sonnet", last_heartbeat_at: null } })} persona="test" />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /change model/i }));
+    fireEvent.click(screen.getByRole("button", { name: /apply with fallback/i }));
+    expect(await screen.findByText(/using "haiku"/)).toBeInTheDocument();
+    // the next poll arrives without any fallback: the optimistic line goes away
+    rerender(
+      <ConnectionPanel state={baseState({ connection: { provider: "claude-cli", model: "claude-sonnet-5", last_heartbeat_at: null }, tier_fallbacks: [] })} persona="test" />,
+    );
+    expect(screen.queryByText(/using "haiku"/)).not.toBeInTheDocument();
+  });
+
+  it("does not repeat a rejection line that a fallback line already explains", () => {
+    render(
+      <ConnectionPanel
+        state={baseState({
+          connection: { provider: "claude-cli", model: "claude-sonnet-5", last_heartbeat_at: null },
+          tier_fallbacks: [HAIKU],
+          model_rejections: [
+            { model: "claude-haiku-5", since: "t", last_at: "t", count: 2 },
+          ],
+        })}
+        persona="test"
+      />,
+    );
+    expect(screen.getByText(/using "haiku"/)).toBeInTheDocument();
+    expect(screen.queryByText(/Claude rejected the model "claude-haiku-5"/)).not.toBeInTheDocument();
+  });
+
+  it("never hides a rejection of the chat model, even when a fallback names the same id", () => {
+    render(
+      <ConnectionPanel
+        state={baseState({
+          connection: { provider: "claude-cli", model: "claude-sonnet-5", last_heartbeat_at: null },
+          tier_fallbacks: [{ family: "sonnet", wanted: "claude-sonnet-5", using: "sonnet" }],
+          model_rejections: [{ model: "claude-sonnet-5", since: "t", last_at: "t", count: 2 }],
+        })}
+        persona="test"
+      />,
+    );
+    expect(screen.getByText(/Claude rejected the model "claude-sonnet-5"/)).toBeInTheDocument();
+  });
+
+  it("renders nothing for fallbacks when there are none", () => {
+    render(<ConnectionPanel state={sonnetState({ tier_fallbacks: [] })} persona="test" />);
+    expect(screen.queryByText(/Background jobs that use/)).not.toBeInTheDocument();
   });
 
   it("tells the user plainly when a custom model was saved without being checked, and clears it on the next change", async () => {

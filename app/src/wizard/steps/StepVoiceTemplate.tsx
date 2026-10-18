@@ -1,12 +1,15 @@
 import type { ReactNode } from "react";
 import { OptionCard, SectionLabel, WButton, WizardShell } from "../components";
 import type { VoiceTemplate } from "../Wizard";
+import { MODEL_ID_MAX_LENGTH, wizardModelIsValid } from "../chatModel";
 
 interface Props {
   step: number;
   totalSteps: number;
   template: VoiceTemplate;
   onTemplateChange: (t: VoiceTemplate) => void;
+  chatModel: string;
+  onChatModelChange: (m: string) => void;
   onNext: () => void;
   onBack: () => void;
   avatar: ReactNode;
@@ -17,10 +20,13 @@ export function StepVoiceTemplate({
   totalSteps,
   template,
   onTemplateChange,
+  chatModel,
+  onChatModelChange,
   onNext,
   onBack,
   avatar,
 }: Props) {
+  const modelOk = wizardModelIsValid(chatModel);
   return (
     <WizardShell
       step={step}
@@ -33,7 +39,7 @@ export function StepVoiceTemplate({
           <WButton variant="ghost" onClick={onBack} small>
             ← Back
           </WButton>
-          <WButton onClick={onNext}>Continue →</WButton>
+          <WButton onClick={onNext} disabled={!modelOk}>Continue →</WButton>
         </>
       }
     >
@@ -72,6 +78,42 @@ export function StepVoiceTemplate({
         {template === "nell-example" &&
           "After install, open ~/Library/Application Support/companion-emergence/personas/<name>/voice.md and replace the example identity content with your own."}
       </div>
+      <details style={{ marginTop: 14 }} open={chatModel.trim() !== ""}>
+        <summary style={{ fontSize: 11, color: "var(--text-mid)", cursor: "pointer" }}>Advanced</summary>
+        <div style={{ marginTop: 8 }}>
+          <SectionLabel>Claude model (optional)</SectionLabel>
+          <input
+            type="text"
+            aria-label="Claude model"
+            placeholder="sonnet (default)"
+            maxLength={MODEL_ID_MAX_LENGTH}
+            value={chatModel}
+            spellCheck={false}
+            autoCapitalize="off"
+            autoComplete="off"
+            onChange={(e) => onChatModelChange(e.target.value)}
+            style={{
+              width: "100%",
+              padding: "6px 8px",
+              fontSize: 12,
+              fontFamily: "DM Mono, Courier New, monospace",
+              color: "var(--text)",
+              background: "transparent",
+              border: "1px solid var(--hairline)",
+              borderRadius: 8,
+            }}
+          />
+          <div style={{ marginTop: 4, fontSize: 10.5, color: "var(--text-mid)", lineHeight: 1.6 }}>
+            Leave blank for sonnet, or enter opus, haiku or a full model id such as claude-sonnet-5.
+            Checked when first used.
+          </div>
+          {!modelOk && (
+            <div role="alert" style={{ marginTop: 4, fontSize: 10.5, color: "var(--crimson)", lineHeight: 1.5 }}>
+              Model IDs start with claude- and use lowercase letters, digits, dots and dashes.
+            </div>
+          )}
+        </div>
+      </details>
     </WizardShell>
   );
 }
