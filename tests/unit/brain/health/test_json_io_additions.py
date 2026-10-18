@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 import pytest
@@ -188,3 +189,16 @@ def test_pc8_raw_bom_on_the_first_line_is_skipped(tmp_path: Path) -> None:
     p = tmp_path / "a.jsonl"
     p.write_bytes(b'\xef\xbb\xbf{"a": 1}\n')
     assert [r for _, r in jio.iter_jsonl_raw(p)] == [{"a": 1}]
+
+
+def test_pc8_a_simulated_windows_os_name_does_not_make_the_module_build_a_windowspath(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Tests that patch ``os.name`` to "nt" (daemon cmd_stop on Windows) call the migrated state reader: a
+    ``Path(path)`` of a Path would pick WindowsPath there, which cannot be instantiated on POSIX."""
+    p = tmp_path / "state.json"
+    p.write_text('{"a": 1}')
+    monkeypatch.setattr(os, "name", "nt")
+    assert jio.read_json(p, default=dict) == {"a": 1}
+    assert jio.read_json_result(p, default=dict, recover=Recovery.HEAL).data == {"a": 1}
+    assert list(jio.iter_jsonl(tmp_path / "none.jsonl")) == []

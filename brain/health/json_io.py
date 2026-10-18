@@ -13,7 +13,8 @@ Reading a whole file::
     read_json_result(path, default=f, recover=Recovery.HEAL)   # quarantine + restore + anomaly
     read_json(path, default=dict, recover=Recovery.RESTORE)    # restore from a good backup, else raise
 
-Recovery policies: DEFAULT returns ``default()`` and leaves the file; RAISE raises
+Recovery policies: DEFAULT returns ``default()`` and leaves the file (an I/O fault too); CONTENT does the same for bad
+content but raises on an I/O fault; RAISE raises
 :class:`JsonFileError`; RESTORE restores the freshest valid backup (or a valid ``fallbacks``
 sibling) and otherwise raises, leaving the corrupt file exactly where it is (a corrupt budget
 file must keep failing closed, never reset to an empty counter); HEAL is RESTORE that resets
@@ -33,9 +34,11 @@ save of a file with a backup chain use their own sidecar ``<name>.heal.lock``: `
 is held for a bridge's whole life (``bridge.json.lock``) and for a whole heartbeat tick
 (``heartbeat_state.json.lock``), so taking it here would block or deadlock.
 
-The heal is deliberately its own implementation (not ``attempt_heal._heal_from_baks``) so the
-legacy function and its fifteen callers do not change; it is deleted together with
-``attempt_heal`` when the last caller has migrated.
+This module is now the only JSON heal (the legacy ``attempt_heal`` and its fifteen callers are gone). Two legacy
+helpers remain for the held felt-time files only: ``attempt_heal.save_with_backup`` and
+``jsonl_reader.iter_jsonl_skipping_corrupt``; ``jsonl_reader`` also still owns the line parser this module
+imports. ``Recovery.CONTENT`` is for a caller whose handler swallowed bad content but never an I/O fault: a
+migration never widens what a caller swallows.
 """
 
 from __future__ import annotations
@@ -96,6 +99,12 @@ def _seam(name: str, path: Path) -> None:
 
 
 _NO_DEFAULT: Any = object()
+
+
+def _as_path(path: Path | str) -> Path:
+    """``path`` as a Path without constructing one when it already is (a test that patches ``os.name`` to simulate
+    Windows makes ``Path(x)`` pick WindowsPath, which cannot be instantiated on POSIX)."""
+    return path if isinstance(path, Path) else Path(path)
 
 Nonfinite = Literal["raise", "null"]
 
@@ -174,7 +183,7 @@ class JsonFileError(OSError, ValueError):
         if line is not None:
             message += f" (line {line})"
         super().__init__(message)
-        self.path = Path(path)
+        self.path = _as_path(path)
         self.kind = kind
         self.detail = detail
         self.line = line
@@ -321,8 +330,8 @@ def read_json_result(
     the freshest valid backup. A fallback is *removed* when installed, so it must be a throwaway
     sibling (a stray ``.tmp``); one that resolves to the live file or a backup is a ValueError.
     """
-    path = Path(path)
-    fallbacks = tuple(Path(f) for f in fallbacks)
+    path = _as_path(path)
+    fallbacks = tuple(_as_path(f) for f in fallbacks)
     if recover is not Recovery.RAISE and default is _NO_DEFAULT:
         raise TypeError(f"read_json: recover={recover.name} needs a default factory")
     _check_fallbacks(path, fallbacks)
@@ -740,7 +749,7 @@ def write_json(
         )
         + "\n"
     )
-    return _save_text(Path(path), text, backups, fsync, mode, verify, if_missing, on_error)
+    return _save_text(_as_path(path), text, backups, fsync, mode, verify, if_missing, on_error)
 
 
 def _save_text(
@@ -857,7 +866,7 @@ def parse_jsonl(
 ) -> Iterator[dict]:
     """Parse JSONL text or bytes already read: the one place bad lines are skipped (or, strict, raised)."""
     raw = data.encode("utf-8", "surrogateescape") if isinstance(data, str) else data
-    src = source if isinstance(source, Path) else Path(source)
+    src = _as_path(source)
     try:
         yield from _stream(io.BytesIO(raw), src, strict)
     except _StrictLineError as exc:
@@ -891,7 +900,7 @@ def iter_jsonl(
     line (after yielding the good ones before it). An I/O failure (including a truncated gz) ends the
     iteration with a throttled warning (DEFAULT) or raises ``JsonFileError(kind="io")`` (RAISE).
     """
-    path = Path(path)
+    path = _as_path(path)
     _check_jsonl_recover(recover)
     try:
         opener = gzip.open(path, "rb") if path.suffix == ".gz" else open(path, "rb")
@@ -938,7 +947,7 @@ def iter_jsonl_raw(
     ``(text, None)`` after its usual warning; otherwise it is only skipped. ``strict`` and ``recover`` behave
     as in :func:`iter_jsonl`.
     """
-    path = Path(path)
+    path = _as_path(path)
     _check_jsonl_recover(recover)
     try:
         opener = gzip.open(path, "rb") if path.suffix == ".gz" else open(path, "rb")
@@ -1003,7 +1012,7 @@ def read_jsonl_tail(
     A ``.gz`` path cannot be read backwards: it is streamed through :func:`iter_jsonl` and the last ``n``
     *records* (after bad lines are skipped) are returned.
     """
-    path = Path(path)
+    path = _as_path(path)
     _check_jsonl_recover(recover)
     if n <= 0:
         return []
@@ -1101,7 +1110,7 @@ def append_jsonl(
     an OSError into a throttled warning and None. ``nonfinite`` applies only when ``records`` are dicts;
     pre-encoded bytes are written as given (encode them with ``encode_jsonl(..., nonfinite=...)``).
     """
-    path = Path(path)
+    path = _as_path(path)
     if lock not in ("block", "try", "held"):
         raise ValueError(f"lock must be 'block', 'try' or 'held', not {lock!r}")
     payload = _payload(records, nonfinite)
@@ -1160,5 +1169,5 @@ def write_jsonl(
     """Atomically replace a JSONL file with ``records`` (same writer as :func:`write_json`)."""
     payload = _payload(records, nonfinite)
     return _save_text(
-        Path(path), payload.decode("utf-8"), backups, fsync, mode, False, False, on_error
+        _as_path(path), payload.decode("utf-8"), backups, fsync, mode, False, False, on_error
     )

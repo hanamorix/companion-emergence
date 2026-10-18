@@ -329,3 +329,14 @@ def test_group_d_scheduler_appends_to_the_vocabulary_and_raises_on_a_corrupt_one
     vocab.write_bytes(b"\xff{torn")
     with pytest.raises(ValueError):  # RAISE: a corrupt vocabulary is never silently replaced
         _append_to_vocabulary(vocab, prop)
+
+
+def test_group_d_interest_spawn_state_is_read_with_a_fresh_day_fallback_and_written_back(tmp_path: Path) -> None:
+    from brain.chat.extractor import InterestCandidate, _apply_interest_candidate
+
+    state_file = tmp_path / "interest_spawn_state.json"
+    _apply_interest_candidate(InterestCandidate(topic="astronomy", keywords=["stars"], why="loves it"), tmp_path)
+    assert json.loads(state_file.read_text())["count"] == 1
+    state_file.write_bytes(b"\xff{torn")  # corrupt: a fresh day, as before
+    _apply_interest_candidate(InterestCandidate(topic="birdsong", keywords=[], why="w"), tmp_path)
+    assert json.loads(state_file.read_text())["count"] == 1
