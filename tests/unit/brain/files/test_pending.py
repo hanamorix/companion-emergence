@@ -1,6 +1,7 @@
 # tests/unit/brain/files/test_pending.py
 import hashlib
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 from brain.files.pending import (
     _TTL_HOURS,
@@ -285,6 +286,7 @@ def test_a_transient_permission_error_is_not_a_warning(tmp_path, monkeypatch, ca
     from brain.files import pending
 
     _fresh_throttle(monkeypatch)
+    monkeypatch.setattr(pending, "sys", SimpleNamespace(platform="win32"))  # module-scoped, not the real sys
 
     def busy(self, *a, **k):
         raise PermissionError("in use")
@@ -293,3 +295,55 @@ def test_a_transient_permission_error_is_not_a_warning(tmp_path, monkeypatch, ca
     with caplog.at_level(logging.WARNING, logger="brain.files.pending"):
         assert pending.get(tmp_path, "rid") is None
     assert caplog.records == []
+
+
+def test_a_permission_error_off_windows_is_a_warning(tmp_path, monkeypatch, caplog):
+    """#429 review: on Linux/macOS a PermissionError is persistent (wrong owner, a bad
+    chmod), so the record would vanish from every listing with no warning."""
+    import logging
+    from pathlib import Path
+
+    from brain.files import pending
+
+    _fresh_throttle(monkeypatch)
+    monkeypatch.setattr(pending, "sys", SimpleNamespace(platform="linux"))
+
+    def denied(self, *a, **k):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(Path, "read_text", denied)
+    with caplog.at_level(logging.WARNING, logger="brain.files.pending"):
+        assert pending.get(tmp_path, "rid-x") is None
+    assert any("rid-x" in r.getMessage() for r in caplog.records)
+
+
+def test_a_record_with_a_bad_proposed_at_is_reported_not_silently_dropped(tmp_path, monkeypatch, caplog):
+    """#429 review: a readable record whose proposed_at is missing, unparsable or null
+    fell out of list_pending and sweep_expired with no warning (null even crashed)."""
+    import json
+    import logging
+
+    from brain.files import pending
+
+    now = datetime(2026, 10, 16, tzinfo=UTC)
+    for bad in ("not-a-date", None):
+        _fresh_throttle(monkeypatch)
+        caplog.clear()
+        rid = pending.create(tmp_path, op="create", resolved_path=str(tmp_path / "a.txt"),
+                              content=f"hi {bad}", now=now)
+        record = pending._dir(tmp_path) / f"{rid}.json"
+        rec = json.loads(record.read_text(encoding="utf-8"))
+        rec["proposed_at"] = bad
+        record.write_text(json.dumps(rec), encoding="utf-8")
+
+        with caplog.at_level(logging.WARNING, logger="brain.files.pending"):
+            assert all(r["id"] != rid for r in pending.list_pending(tmp_path, now=now))
+        assert any(rid in r.getMessage() for r in caplog.records)
+
+        _fresh_throttle(monkeypatch)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="brain.files.pending"):
+            assert pending.sweep_expired(tmp_path, now=now + timedelta(hours=_TTL_HOURS + 1)) >= 0
+        assert any(rid in r.getMessage() for r in caplog.records)
+        assert pending.get(tmp_path, rid)["status"] == "pending"
+        record.unlink()

@@ -142,3 +142,23 @@ def test_queued_rotation_notice_keeps_the_relay_error(tmp_path):
     rows = [json.loads(line) for line in (tmp_path / "kindled_link" / "transport.jsonl").read_text(encoding="utf-8").splitlines()]
     (row,) = [r for r in rows if r["event"] == "rotation_notice_queued"]
     assert row["error"] == "relay /envelope -> 429"
+
+
+def test_a_transport_error_with_no_message_still_names_itself(monkeypatch):
+    """#429 review: str(httpx error) can be empty, which logged `error: ""`."""
+    import httpx
+
+    from brain.kindled_link.identity import KindledIdentity
+    from brain.kindled_link.relay_client import RelayClient
+
+    def boom(request):
+        raise httpx.ConnectError("")
+
+    client = httpx.Client(transport=httpx.MockTransport(boom), base_url="http://relay.test")
+    rc = RelayClient(client, identity=KindledIdentity.__new__(KindledIdentity), mailbox_id="mb")
+    import brain.kindled_link.relay_client as relay_client_mod
+
+    monkeypatch.setattr(relay_client_mod.time, "sleep", lambda s: None)  # no backoff wait
+    with pytest.raises(RelayUnavailableError) as info:
+        rc.push({"env": 1})
+    assert str(info.value) == "ConnectError"
