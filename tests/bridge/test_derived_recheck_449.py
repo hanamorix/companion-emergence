@@ -449,3 +449,21 @@ def test_no_stamp_is_written_when_there_is_nothing_to_recheck(persona_dir: Path,
     with patch("subprocess.run", _Run(lambda m: _proc(0, _ok_json()))), TestClient(_app(persona_dir, monkeypatch)):
         time.sleep(0.2)
     assert not (persona_dir / server_mod._RECHECK_STAMP).exists()
+
+
+def test_a_reworded_rejection_is_logged_as_rejected_from_the_code(persona_dir: Path, monkeypatch, bg_stubs, caplog):
+    """The re-check uses the stream-json probe, so a rejection whose sentence changed is still `rejected`
+    (not `inconclusive:failed`) and the id stays saved."""
+    p = _write(persona_dir)
+    frames = (
+        json.dumps({"type": "assistant", "error": "model_not_found", "message": {"content": [{"type": "text", "text": "Model unknown."}]}})
+        + "\n"
+        + json.dumps({"type": "result", "is_error": True, "api_error_status": 404, "result": "Model unknown."})
+        + "\n"
+    )
+    run = _Run(lambda m: _proc(1, frames))
+    with caplog.at_level(logging.INFO), patch("subprocess.run", run), TestClient(_app(persona_dir, monkeypatch)) as c:
+        assert _wait(lambda: _recheck_done(c.app))
+    msgs = [r.getMessage() for r in caplog.records if r.name.endswith("server")]
+    assert any(DERIVED in m and "rejected" in m for m in msgs), msgs
+    assert _list(p) == [DERIVED]

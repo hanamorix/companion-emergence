@@ -996,6 +996,40 @@ class ClaudeCliProvider(LLMProvider):
                 f"ClaudeCliProvider: unexpected output format: {result.stdout[:200]!r}"
             ) from exc
 
+    def probe(self, prompt: str) -> str:
+        """One tiny tools-less call whose only job is to find out whether the model is usable (#448).
+
+        Runs ``--output-format stream-json --verbose``, the output chat uses, because only that output carries
+        the ``model_not_found`` code (on the assistant frame; the plain ``json`` output has just the status and
+        the sentence). Parsed by the same functions the blocking chat path uses (``_run_blocking_cli`` /
+        ``_cli_error_detail``), so a rejection is classified from the code. Writes no usage-log row, gives the
+        model no tools, and honours the provider's timeout. Raises ``ProviderAuthDeferred`` while the login is
+        expired (as ``generate`` does) and ``ProviderError`` for any failure, its text carrying the signals.
+        """
+        if provider_auth.should_skip_background():
+            raise provider_auth.ProviderAuthDeferred("provider auth expired — deferred")
+        cmd = [
+            "claude",
+            "-p",
+            "--dangerously-skip-permissions",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--model",
+            self._model,
+        ]
+        _apply_lean_flags(cmd)  # #329: no tools at all
+        result, payload = self._run_blocking_cli(cmd, prompt, {})
+        if payload is None:
+            raise ProviderError(
+                "claude_cli_parse",
+                f"unexpected output format: {_stdout_shape(result.stdout) or 'no result frame'}",
+            )
+        cli_err = _cli_error_detail(payload, model=_argv_model(cmd), stdout=result.stdout)
+        if cli_err is not None:
+            raise ProviderError("claude_cli_error", cli_err)
+        return str(payload.get("result", ""))
+
     def name(self) -> str:
         return f"claude-cli:{self._model}"
 

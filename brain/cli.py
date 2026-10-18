@@ -14,6 +14,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from brain import __version__, prompt_strings
 from brain.bridge import state_file
@@ -2614,6 +2615,123 @@ def _model_set_tier_handler(args: argparse.Namespace) -> int:
     return 0
 
 
+def _model_set_handler(args: argparse.Namespace) -> int:
+    """`nell model set <model>`: set the chat model with the picker's rules and the picker's save-time check.
+
+    An alias or a full ``claude-`` id (64 cap). With the persona's bridge running the request goes to the picker's
+    own settings endpoint (live hot swap, the same single-flight lock); otherwise the check runs here and the
+    config is written (``brain.bridge.server._apply_chat_model`` is the one implementation of both).
+    """
+    from brain.persona_config import MODEL_ID_RULE, is_valid_model
+
+    if not is_valid_model(args.model):
+        print(f"error: {args.model!r} is not a valid model: {MODEL_ID_RULE}", file=sys.stderr)
+        return 1
+    path = _model_cfg_path(args.persona)
+    if path is None:
+        return 1
+    persona_dir = path.parent
+    state = state_file.read(persona_dir)
+    running = bool(state and state.pid and state.port and state_file.pid_is_alive(state.pid))
+    if running:
+        outcome = _model_set_via_bridge(state, args.model)
+        if outcome is None:
+            return 1
+    else:
+        outcome = _model_set_direct(persona_dir, args.model)
+    return _model_set_report(args.model, outcome[0], outcome[1], via_bridge=running)
+
+
+def _model_set_direct(persona_dir: Path, model: str) -> tuple[int, dict]:
+    """No bridge running: run the check here (claude-cli personas only) and write the config."""
+    import asyncio
+
+    from brain.bridge import server as server_mod
+
+    check = PersonaConfig.load(persona_dir / "persona_config.json").provider == "claude-cli"
+
+    async def _go() -> tuple[int, dict]:
+        return await server_mod._apply_chat_model(
+            persona_dir, model, check=check, lock=asyncio.Lock(), hot_swap=None
+        )
+
+    return asyncio.run(_go())
+
+
+def _model_set_via_bridge(state: Any, model: str) -> tuple[int, dict] | None:
+    """Bridge running: POST to the picker's settings endpoint. None (after printing why) if it cannot be reached."""
+    import urllib.error
+    import urllib.request
+
+    from brain.bridge import server as server_mod
+
+    headers = {"Content-Type": "application/json"}
+    if state.auth_token:
+        headers["Authorization"] = f"Bearer {state.auth_token}"
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{state.port}/persona/config/model",
+        data=json.dumps({"model": model}).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    # The endpoint keeps itself inside one check budget (a wait for the lock counts against it); twice that is the margin.
+    wait_s = server_mod._check_budget_s() * 2
+    try:
+        with urllib.request.urlopen(req, timeout=wait_s) as resp:
+            return 200, json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.code, json.loads(exc.read())
+        except ValueError:
+            print(f"error: the bridge answered {exc.code}", file=sys.stderr)
+            return None
+    except (urllib.error.URLError, OSError) as exc:
+        print(f"error: could not reach the bridge on port {state.port}: {getattr(exc, 'reason', exc)}", file=sys.stderr)
+        return None
+
+
+def _model_set_report(model: str, status: int, body: dict, *, via_bridge: bool) -> int:
+    from brain.persona_config import MODEL_ID_RULE
+
+    if status != 200:
+        if body.get("error") == "model_unavailable":
+            print(
+                f'error: Claude rejected the model "{model}". It may not exist, or your account may not have '
+                "access to it. Nothing was changed.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"error: {model!r} is not a valid model: {MODEL_ID_RULE}", file=sys.stderr)
+        return 1
+    checked = body.get("checked")
+    if checked is False:
+        print(
+            f"chat model is now {model}. Couldn't check it right now, so it was saved unchecked; "
+            "any problem will show in the app and the bridge log."
+        )
+    elif checked is True:
+        print(f"chat model is now {model} (checked with Claude).")
+    else:
+        print(f"chat model is now {model}.")
+    for f in body.get("fallbacks", []):
+        print(
+            f'background jobs that use the {f["family"]} family are using "{f["using"]}", because "{f["wanted"]}" '
+            "could not be used (it may not exist, or your account may not have access to it)."
+        )
+    if body.get("tiers_unchecked"):
+        print(
+            "some background models were not checked yet ("
+            + ", ".join(body["tiers_unchecked"])
+            + "); they are checked when first used."
+        )
+    print(
+        "the running bridge switched to it now."
+        if via_bridge
+        else "no bridge is running for this persona; it uses the new model when it starts."
+    )
+    return 0
+
+
 def _model_clear_tier_handler(args: argparse.Namespace) -> int:
     from brain.persona_config import PersonaConfig
 
@@ -3532,6 +3650,14 @@ def _build_parser() -> argparse.ArgumentParser:
     m_set.add_argument("model")
     m_set.add_argument("--persona", default=None, help="Persona name (defaults to the only installed one).")
     m_set.set_defaults(func=_model_set_tier_handler)
+
+    m_chat = model_actions.add_parser(
+        "set",
+        help="Set the chat model (sonnet, opus, haiku or a full id such as claude-sonnet-5), checked like the picker does.",
+    )
+    m_chat.add_argument("model")
+    m_chat.add_argument("--persona", default=None, help="Persona name (defaults to the only installed one).")
+    m_chat.set_defaults(func=_model_set_handler)
 
     m_clear = model_actions.add_parser(
         "clear-tier", help="Remove a tier's pinned model so it follows the chat model again."

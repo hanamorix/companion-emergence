@@ -28,6 +28,7 @@ from brain.bridge import server as server_mod
 from brain.bridge.chat import ChatMessage, StreamError
 from brain.bridge.provider import ClaudeCliProvider, ProviderError
 from brain.bridge.server import build_app
+from brain.persona_config import PersonaConfig
 from brain.utils import log_throttle
 
 FIXDIR = Path(__file__).parent / "fixtures"
@@ -489,3 +490,80 @@ def test_ndjson_fixture_has_only_assistant_and_result_frames():
 def test_apply_check_marks_a_status_and_code_rejection_as_rejected(monkeypatch):
     with patch("subprocess.run", return_value=_proc(1, json.dumps(F302_JSON))):
         assert server_mod._check_model_blocking(BAD, 5) == ("rejected", "")
+
+
+# --- save-time probe: stream-json, classified from the code (owner decision D15) ---------------------------------------
+
+
+def _probe_run(rc: int, stdout: str, seen: list | None = None):
+    def run(cmd, **kw):
+        if seen is not None:
+            seen.append((list(cmd), kw))
+        return _proc(rc, stdout)
+
+    return run
+
+
+def test_probe_runs_stream_json_without_tools_or_a_usage_row():
+    seen: list = []
+    ok = json.dumps({"type": "result", "is_error": False, "result": "OK"})
+    with patch("brain.bridge.provider.subprocess.run", _probe_run(0, ok, seen)), patch(
+        "brain.bridge.provider.log_usage", side_effect=AssertionError("the probe writes no usage row")
+    ):
+        assert ClaudeCliProvider(model="claude-sonnet-5", timeout_seconds=7).probe("hi") == "OK"
+    cmd, kw = seen[0]
+    assert cmd[cmd.index("--output-format") + 1] == "stream-json" and "--verbose" in cmd
+    assert cmd[cmd.index("--model") + 1] == "claude-sonnet-5"
+    assert "--mcp-config" not in cmd and "--allowedTools" not in cmd
+    assert kw["timeout"] == 7
+
+
+@pytest.mark.parametrize(
+    "rc,stdout,expected",
+    [
+        (1, F302_TEXT, ("rejected", "")),  # the real 2.1.302 frames
+        (1, _ndjson(_reword(F302)), ("rejected", "")),  # sentence reworded away: only the code identifies it
+        (1, json.dumps(F302_JSON), ("rejected", "")),  # single object, 404 + sentence
+        (0, _ndjson(_reword(F302)), ("rejected", "")),  # exit 0 with the failure in the frame
+        (0, json.dumps({"type": "result", "is_error": False, "result": "OK"}), ("ok", "")),
+        (1, json.dumps({"type": "result", "is_error": True, "api_error_status": 429, "result": "limit"}), ("inconclusive", "failed")),
+        (1, json.dumps({"type": "result", "is_error": True, "api_error_status": 404, "result": "Not Found"}), ("inconclusive", "failed")),
+        (1, "not json at all", ("inconclusive", "failed")),
+    ],
+    ids=["real-302", "reworded-with-code", "json-object", "exit0-in-frame", "ok", "quota", "bare-404", "garbage"],
+)
+def test_save_time_check_classifies_from_the_stream_output(rc, stdout, expected):
+    with patch("brain.bridge.provider.subprocess.run", _probe_run(rc, stdout)):
+        assert server_mod._check_model_blocking(BAD, 5) == expected
+
+
+def test_save_time_check_timeout_and_expired_login_are_inconclusive():
+    def boom(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd="claude", timeout=1)
+
+    with patch("brain.bridge.provider.subprocess.run", boom):
+        assert server_mod._check_model_blocking(BAD, 5) == ("inconclusive", "timeout")
+    provider_auth.note_cli_failure(AUTH)
+    with patch("brain.bridge.provider.subprocess.run", side_effect=AssertionError("deferred: no call")):
+        assert server_mod._check_model_blocking(BAD, 5) == ("inconclusive", "auth_deferred")
+
+
+def test_apply_refuses_a_reworded_rejection_because_the_check_reads_the_code(persona_dir: Path, monkeypatch):
+    p = persona_dir / "persona_config.json"
+    before = p.read_bytes()
+    monkeypatch.setattr("brain.bridge.provider.get_provider", lambda *a, **k: ClaudeCliProvider(model="sonnet"))
+    with TestClient(build_app(persona_dir=persona_dir, client_origin="tests")) as c:
+        with patch("subprocess.run", _probe_run(1, _ndjson(_reword(F302)))), patch(
+            "subprocess.Popen", side_effect=AssertionError("no streaming Popen for the check")
+        ):
+            r = c.post("/persona/config/model", json={"model": BAD})
+    assert r.status_code == 400 and r.json() == {"ok": False, "error": "model_unavailable", "model": BAD}
+    assert PersonaConfig.load(p).model == "sonnet" and b"claude-sonet" not in p.read_bytes() and before is not None
+
+
+def test_generate_json_argv_is_unaffected_by_the_probe():
+    seen: list = []
+    with patch("brain.bridge.provider.subprocess.run", _probe_run(0, json.dumps({"is_error": False, "result": "x"}), seen)):
+        assert ClaudeCliProvider(model="haiku").generate("hi") == "x"
+    cmd = seen[0][0]
+    assert cmd[cmd.index("--output-format") + 1] == "json" and "--verbose" not in cmd

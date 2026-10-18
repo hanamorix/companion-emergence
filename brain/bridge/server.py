@@ -28,7 +28,7 @@ import re
 import sqlite3
 import threading
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -654,20 +654,24 @@ def _check_budget_s() -> float:
 
 
 def _check_model_blocking(model_id: str, timeout_s: float | None = None) -> tuple[str, str]:
-    """Run ONE ``generate()`` with ``model_id``. Returns ``("ok", "")``, ``("rejected", "")`` or
-    ``("inconclusive", <reason>)``. Never raises. No ``persona_dir`` is passed, so no usage row is written,
-    and the call is suppressed in ``model_error`` so a refused id leaves no record or WARNING.
+    """Run ONE ``probe()`` with ``model_id``. Returns ``("ok", "")``, ``("rejected", "")`` or
+    ``("inconclusive", <reason>)``. Never raises. The probe uses the stream-json output chat uses, so a rejection
+    is classified from the CLI's ``model_not_found`` code and not only from its sentence (#448, owner decision
+    on D8a). No ``persona_dir`` is passed, so no usage row is written, and the call is suppressed in
+    ``model_error`` so a refused id leaves no record or WARNING.
     ``timeout_s`` is the time this probe may use (default: the whole Apply budget)."""
     timeout = max(_MIN_PROBE_S, int(_check_budget_s() if timeout_s is None else timeout_s))
     try:
         with model_error.suppressed():
-            ClaudeCliProvider(model=model_id, timeout_seconds=timeout).generate(_MODEL_CHECK_PROMPT)
+            ClaudeCliProvider(model=model_id, timeout_seconds=timeout).probe(_MODEL_CHECK_PROMPT)
         return "ok", ""
     except provider_auth.ProviderAuthDeferred:
         return "inconclusive", "auth_deferred"
     except TimeoutError:
         return "inconclusive", "timeout"
     except Exception as exc:  # noqa: BLE001 - any other failure only means "could not check"
+        if getattr(exc, "stage", None) == "claude_cli_timeout":
+            return "inconclusive", "timeout"
         if model_error.is_model_rejection(str(exc)):
             return "rejected", ""
         return "inconclusive", "failed"
@@ -773,6 +777,134 @@ async def _recheck_derived_unavailable(persona_dir: Path, lock: asyncio.Lock) ->
         raise
     except Exception:  # noqa: BLE001 - a background re-check must never break the bridge
         logger.warning("derived model re-check failed (ignored)", exc_info=True)
+
+
+async def _apply_chat_model(
+    persona_dir: Path,
+    model: str,
+    *,
+    check: bool,
+    lock: asyncio.Lock,
+    hot_swap: Callable[[str], None] | None,
+) -> tuple[int, dict[str, Any]]:
+    """Apply a chat model: validate, check it, write the config, switch the live provider. Returns
+    ``(status, body)``. The ONE implementation behind the picker's ``POST /persona/config/model`` and
+    ``nell model set`` when no bridge is running.
+
+    Accepts an alias (sonnet / opus / haiku) or a full model id (``claude-...``), validated by
+    ``is_valid_model``. A FULL id with ``check`` true (a claude-cli provider) is first checked with one real
+    stream-json call (#440, #448): if Claude rejects it the id is NOT saved. Any other check failure (timeout,
+    expired login, rate limit) saves it unchecked. Then it persists to persona_config.json and calls
+    ``hot_swap`` (the running provider's model switch) when given. ``lock`` is the single-flight lock all
+    checks share.
+
+    Returns (200, {ok: true, model, checked?, fallbacks?, tiers_unchecked?}),
+            (400, {ok: false, error: "unknown_model", valid: [...]}) or
+            (400, {ok: false, error: "model_unavailable", model: <id>}).
+    """
+    from dataclasses import replace as dc_replace
+
+    from brain.bridge.model_tier import (
+        ROUTED_CLAUDE_TIERS,
+        candidate_tier_models,
+        derive_model,
+        model_for_tier,
+        tier_fallbacks,
+        tier_family,
+        unchecked_tiers,
+    )
+    from brain.persona_config import KNOWN_MODELS, PersonaConfig, is_valid_model
+
+    if not is_valid_model(model):
+        return 400, {"ok": False, "error": "unknown_model", "valid": sorted(KNOWN_MODELS)}
+    config_path = persona_dir / "persona_config.json"
+    before = PersonaConfig.load(config_path)
+    checked: bool | None = None
+    # Derived tier ids that are tested together with the chat id (#441): the ids the routed tiers would
+    # follow, minus the chat id itself and minus families whose every tier has an explicit override.
+    derived_ids: list[str] = []
+    for tier in ROUTED_CLAUDE_TIERS:
+        family = tier_family(model_for_tier(tier))
+        derived = None if before.tier_models.get(tier) or not family else derive_model(model, family)
+        if derived and derived != model and derived not in derived_ids:
+            derived_ids.append(derived)
+    derived_outcomes: dict[str, str] = {}
+    if model not in KNOWN_MODELS and check:
+        budget = _check_budget_s()
+        contended = lock.locked()  # another check (an Apply, the start-up re-check) is running
+        waiting_since = _clock()  # a wait for the lock counts against the budget, so an Apply stays inside it
+        async with lock:
+            waited = (_clock() - waiting_since) if contended else 0.0
+            started = _clock() - waited
+            remaining = budget - waited
+            if remaining >= _MIN_PROBE_S:
+                outcome, reason = await asyncio.to_thread(_check_model_blocking, model, remaining)
+            else:  # the wait behind another check used the budget: save unchecked, as for any inconclusive check
+                outcome, reason = "inconclusive", "budget"
+            if outcome == "rejected":  # no derived probe is spent on an id that is refused anyway
+                return 400, {"ok": False, "error": "model_unavailable", "model": model}
+            # The derived probes share what is left of the ONE budget (they run together, so the
+            # whole Apply stays inside it); none is started once it is used up.
+            derived_results = await _probe_models(derived_ids, budget - (_clock() - started))
+        checked = outcome == "ok"
+        if not checked:
+            logger.info(
+                "model check for %s was inconclusive, saved unchecked: reason=%s", model, reason
+            )
+        derived_outcomes = {m: res[0] for m, res in zip(derived_ids, derived_results, strict=True)}
+        # An id the probe just proved usable is no longer rejected: drop any earlier runtime record, or
+        # the tiers would stay on their fallback and the panel would keep saying it is unavailable.
+        for confirmed in [model if checked else None, *(m for m, o in derived_outcomes.items() if o == "ok")]:
+            if confirmed:
+                model_error.note_success(confirmed)
+    # Re-read right before writing, so a change another request made while the checks ran is kept.
+    current = PersonaConfig.load(config_path)
+    unavailable: list[str] = []
+    if model not in KNOWN_MODELS:
+        unavailable = [m for m, o in derived_outcomes.items() if o == "rejected"]
+        # An earlier "rejected" for this same chat id stays when the new check could not tell.
+        unavailable += [
+            m
+            for m in current.derived_unavailable
+            if current.model == model
+            and m not in unavailable
+            and (derived_outcomes.get(m) == "inconclusive" or (not derived_outcomes and m in derived_ids))
+        ]
+    updated = dc_replace(current, derived_unavailable=unavailable)
+    updated.set_model(model)  # #446: also clears a remembered unsupported value
+    updated.save(config_path)
+    model_error.switch(current.model, model, keep=candidate_tier_models(updated))
+    # Derived ids the probes could not settle are "not checked yet" (told to the user, cleared by a clean
+    # reply for that id) unless they are already shown as fallbacks. Marked AFTER switch(), which drops
+    # the old chat id's marks, so a mark set by this very Apply is never wiped by it.
+    tiers_unchecked = unchecked_tiers(
+        updated, [m for m, o in derived_outcomes.items() if o == "inconclusive"]
+    )
+    for derived_id in derived_outcomes:
+        if derived_id in tiers_unchecked:
+            model_error.note_tier_unconfirmed(derived_id)
+        else:
+            model_error.clear_tier_unconfirmed(derived_id)
+    # Mark (or clear) BEFORE the hot-swap: the provider can only produce a clean reply for the new model
+    # after the swap, and that reply clears the mark. A re-Apply of the model already saved unchecked
+    # goes through here too (switch() ignores old == new), so a passing check clears the old mark.
+    if checked is False:
+        model_error.note_unconfirmed(model)  # shown in /persona/state until a clean reply
+    else:
+        model_error.clear_unconfirmed(model)
+    # Hot-swap: the running bridge updates its live provider so the next chat call uses the new model
+    # without a restart (the command line runs without one).
+    if hot_swap is not None:
+        hot_swap(model)
+    body: dict[str, Any] = {"ok": True, "model": model}
+    if checked is not None:
+        body["checked"] = checked
+    fallbacks = tier_fallbacks(updated)
+    if fallbacks:
+        body["fallbacks"] = fallbacks
+    if tiers_unchecked:
+        body["tiers_unchecked"] = tiers_unchecked
+    return 200, body
 
 
 async def _flush_cost_series_at_stop(persona_dir: Path) -> None:
@@ -2109,132 +2241,28 @@ def build_app(
 
     @app.post("/persona/config/model", dependencies=[Depends(require_http_auth)])
     async def set_persona_model(req: ModelConfigReq) -> dict:
-        """Switch the active LLM model without restarting the bridge.
-
-        Accepts an alias (sonnet / opus / haiku) or a full model id (``claude-...``), validated by
-        ``is_valid_model``. A FULL id on a claude-cli provider is first checked with one real call (#440):
-        if Claude rejects it the id is NOT saved. Any other check failure (timeout, expired login, rate
-        limit) saves it unchecked. Then persists to persona_config.json and hot-swaps provider._model so
-        the next chat uses the new model immediately.
+        """Switch the active LLM model without restarting the bridge (see ``_apply_chat_model``).
 
         Returns: {ok: true, model: <new_model>}  (+ ``checked: bool`` when a check was attempted)
         Errors:  400 {ok: false, error: "unknown_model", valid: [...]}
                  400 {ok: false, error: "model_unavailable", model: <id>}
         """
-        from dataclasses import replace as dc_replace
-
-        from brain.bridge.model_tier import (
-            ROUTED_CLAUDE_TIERS,
-            candidate_tier_models,
-            derive_model,
-            model_for_tier,
-            tier_fallbacks,
-            tier_family,
-            unchecked_tiers,
-        )
-        from brain.persona_config import KNOWN_MODELS, PersonaConfig, is_valid_model
-
-        if not is_valid_model(req.model):
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "ok": False,
-                    "error": "unknown_model",
-                    "valid": sorted(KNOWN_MODELS),
-                },
-            )
         s: BridgeAppState = app.state.bridge
-        config_path = s.persona_dir / "persona_config.json"
-        before = PersonaConfig.load(config_path)
-        checked: bool | None = None
-        # Derived tier ids that are tested together with the chat id (#441): the ids the routed tiers would
-        # follow, minus the chat id itself and minus families whose every tier has an explicit override.
-        derived_ids: list[str] = []
-        for tier in ROUTED_CLAUDE_TIERS:
-            family = tier_family(model_for_tier(tier))
-            derived = None if before.tier_models.get(tier) or not family else derive_model(req.model, family)
-            if derived and derived != req.model and derived not in derived_ids:
-                derived_ids.append(derived)
-        derived_outcomes: dict[str, str] = {}
-        if req.model not in KNOWN_MODELS and isinstance(s.provider, ClaudeCliProvider):
-            budget = _check_budget_s()
-            contended = model_check_lock.locked()  # another check (an Apply, the start-up re-check) is running
-            waiting_since = _clock()  # a wait for the lock counts against the budget, so an Apply stays inside it
-            async with model_check_lock:
-                waited = (_clock() - waiting_since) if contended else 0.0
-                started = _clock() - waited
-                remaining = budget - waited
-                if remaining >= _MIN_PROBE_S:
-                    outcome, reason = await asyncio.to_thread(_check_model_blocking, req.model, remaining)
-                else:  # the wait behind another check used the budget: save unchecked, as for any inconclusive check
-                    outcome, reason = "inconclusive", "budget"
-                if outcome == "rejected":  # no derived probe is spent on an id that is refused anyway
-                    return JSONResponse(
-                        status_code=400,
-                        content={"ok": False, "error": "model_unavailable", "model": req.model},
-                    )
-                # The derived probes share what is left of the ONE budget (they run together, so the
-                # whole Apply stays inside it); none is started once it is used up.
-                derived_results = await _probe_models(derived_ids, budget - (_clock() - started))
-            checked = outcome == "ok"
-            if not checked:
-                logger.info(
-                    "model check for %s was inconclusive, saved unchecked: reason=%s", req.model, reason
-                )
-            derived_outcomes = {m: res[0] for m, res in zip(derived_ids, derived_results, strict=True)}
-            # An id the probe just proved usable is no longer rejected: drop any earlier runtime record, or
-            # the tiers would stay on their fallback and the panel would keep saying it is unavailable.
-            for confirmed in [req.model if checked else None, *(m for m, o in derived_outcomes.items() if o == "ok")]:
-                if confirmed:
-                    model_error.note_success(confirmed)
-        # Re-read right before writing, so a change another request made while the checks ran is kept.
-        current = PersonaConfig.load(config_path)
-        unavailable: list[str] = []
-        if req.model not in KNOWN_MODELS:
-            unavailable = [m for m, o in derived_outcomes.items() if o == "rejected"]
-            # An earlier "rejected" for this same chat id stays when the new check could not tell.
-            unavailable += [
-                m
-                for m in current.derived_unavailable
-                if current.model == req.model
-                and m not in unavailable
-                and (derived_outcomes.get(m) == "inconclusive" or (not derived_outcomes and m in derived_ids))
-            ]
-        updated = dc_replace(current, derived_unavailable=unavailable)
-        updated.set_model(req.model)  # #446: also clears a remembered unsupported value
-        updated.save(config_path)
-        model_error.switch(current.model, req.model, keep=candidate_tier_models(updated))
-        # Derived ids the probes could not settle are "not checked yet" (told to the user, cleared by a clean
-        # reply for that id) unless they are already shown as fallbacks. Marked AFTER switch(), which drops
-        # the old chat id's marks, so a mark set by this very Apply is never wiped by it.
-        tiers_unchecked = unchecked_tiers(
-            updated, [m for m, o in derived_outcomes.items() if o == "inconclusive"]
+
+        def _hot_swap(new_model: str) -> None:
+            if hasattr(s.provider, "_model"):
+                s.provider._model = new_model
+
+        status, result = await _apply_chat_model(
+            s.persona_dir,
+            req.model,
+            check=isinstance(s.provider, ClaudeCliProvider),
+            lock=model_check_lock,
+            hot_swap=_hot_swap,
         )
-        for derived_id in derived_outcomes:
-            if derived_id in tiers_unchecked:
-                model_error.note_tier_unconfirmed(derived_id)
-            else:
-                model_error.clear_tier_unconfirmed(derived_id)
-        # Mark (or clear) BEFORE the hot-swap: the provider can only produce a clean reply for the new model
-        # after the swap, and that reply clears the mark. A re-Apply of the model already saved unchecked
-        # goes through here too (switch() ignores old == new), so a passing check clears the old mark.
-        if checked is False:
-            model_error.note_unconfirmed(req.model)  # shown in /persona/state until a clean reply
-        else:
-            model_error.clear_unconfirmed(req.model)
-        # Hot-swap: if the live provider exposes _model, update it so the
-        # next chat call uses the new model without a bridge restart.
-        if hasattr(s.provider, "_model"):
-            s.provider._model = req.model
-        body: dict[str, Any] = {"ok": True, "model": req.model}
-        if checked is not None:
-            body["checked"] = checked
-        fallbacks = tier_fallbacks(updated)
-        if fallbacks:
-            body["fallbacks"] = fallbacks
-        if tiers_unchecked:
-            body["tiers_unchecked"] = tiers_unchecked
-        return body
+        if status != 200:
+            return JSONResponse(status_code=status, content=result)
+        return result
 
     # ── POST /persona/config/pronouns — user pronoun persist ──────────────
     @app.post("/persona/config/pronouns", dependencies=[Depends(require_http_auth)])
