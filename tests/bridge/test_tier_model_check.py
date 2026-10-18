@@ -385,3 +385,26 @@ def test_persona_state_filters_an_id_that_is_a_fallback_even_if_it_was_marked(pe
         model_error.note_tier_unconfirmed("claude-haiku-5")  # a stale mark from an earlier Apply
         st = c.get("/persona/state").json()
     assert st["tier_fallbacks"] and st["tier_unconfirmed"] == []
+
+
+def test_response_never_lists_a_runtime_rejected_id_as_not_checked_yet(persona_dir: Path, monkeypatch):
+    _cli_persona(persona_dir, "claude-sonnet-5")
+    model_error.note_failure(SENTENCE.format(model="claude-haiku-5"))  # a runtime rejection record (a fallback)
+    with _client(persona_dir, monkeypatch) as c:
+        with patch("subprocess.run", _Run(lambda m: _proc(1, QUOTA) if m == "claude-haiku-5" else _ok())):
+            body = _post(c, "claude-sonnet-5").json()
+        st = c.get("/persona/state").json()
+    assert {f["wanted"] for f in body["fallbacks"]} == {"claude-haiku-5"}
+    assert "tiers_unchecked" not in body  # the same helper filters the response and the state
+    assert st["tier_unconfirmed"] == []
+
+
+def test_a_mark_set_in_an_apply_survives_that_applys_own_switch(persona_dir: Path, monkeypatch):
+    # chat model claude-haiku-5 -> claude-sonnet-5: the old chat id is also the new haiku-family derived id
+    _cli_persona(persona_dir, "claude-haiku-5")
+    with _client(persona_dir, monkeypatch) as c:
+        with patch("subprocess.run", _Run(lambda m: _proc(1, QUOTA) if m == "claude-haiku-5" else _ok())):
+            body = _post(c, "claude-sonnet-5").json()
+        st = c.get("/persona/state").json()
+    assert body["tiers_unchecked"] == ["claude-haiku-5"]
+    assert st["tier_unconfirmed"] == ["claude-haiku-5"]  # not wiped by the switch that ran after the mark
