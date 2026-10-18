@@ -55,7 +55,7 @@ def test_alias_writes_exactly_what_it_wrote_before(monkeypatch, tmp_path: Path, 
 def test_invalid_model_is_refused_and_nothing_is_written(monkeypatch, tmp_path: Path, capsys, bad):
     with pytest.raises(SystemExit) as exc:  # argparse rejects it with the rule in its message
         _init(monkeypatch, tmp_path, bad)
-    assert exc.value.code != 0
+    assert exc.value.code == 2  # argparse's usage-error exit (the old choices= restriction did the same)
     assert "claude-" in capsys.readouterr().err
     assert not (tmp_path / "personas" / "siren").exists()
 

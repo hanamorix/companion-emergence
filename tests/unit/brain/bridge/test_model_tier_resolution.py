@@ -100,7 +100,8 @@ def test_tier_family(model, family):
 
 
 def test_derivation_code_has_no_version_table():
-    src = "\n".join(inspect.getsource(f) for f in (tier_family, derive_model, resolve_tier_model, tier_fallbacks))
+    funcs = (tier_family, derive_model, model_tier._resolve, resolve_tier_model, candidate_tier_models, tier_fallbacks)
+    src = "\n".join(inspect.getsource(f) for f in funcs)
     literals = set(re.findall(r"claude-[a-z0-9.-]+", src))
     assert literals <= set(), literals  # no model-id literal in the derivation/resolution code
 
@@ -286,3 +287,25 @@ def test_derived_id_ignored_after_a_switch_still_falls_back_when_rejected(tmp_pa
         with pytest.raises(RuntimeError):
             build_tier_provider(d, TIER_BACKGROUND_GENERATIVE).generate("tick")
     assert resolve_tier_model(d, TIER_BACKGROUND_GENERATIVE) == ("sonnet", "fallback")
+
+
+def test_a_config_read_error_never_changes_which_provider_a_tier_uses(tmp_path, monkeypatch):
+    # An ollama persona must never have a background prompt sent to Claude because of a transient read error.
+    d = _persona(tmp_path, "claude-sonnet-5", provider="ollama")
+    assert type(build_tier_provider(d, TIER_COMPACTION)).__name__ == "OllamaProvider"
+
+    def _boom(cls, path):
+        raise PermissionError("file is being replaced")
+
+    monkeypatch.setattr(PersonaConfig, "load", classmethod(_boom))
+    with pytest.raises(PermissionError):  # as before this feature: the job fails and retries on its next tick
+        build_tier_provider(d, TIER_COMPACTION)
+    # the model-only lookups stay fail-soft: they can only choose a model, never a provider
+    assert resolve_tier_model(d, TIER_COMPACTION) == (TIER_MODEL[TIER_COMPACTION], "default")
+
+
+def test_rejection_record_is_cleared_when_the_id_is_confirmed_again():
+    model_error.note_failure(SENTENCE.format(model="claude-haiku-5"))
+    assert "claude-haiku-5" in model_error.rejected_models()
+    model_error.note_success("claude-haiku-5")
+    assert "claude-haiku-5" not in model_error.rejected_models()

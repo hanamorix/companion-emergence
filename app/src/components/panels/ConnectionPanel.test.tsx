@@ -511,7 +511,7 @@ describe("ConnectionPanel — rejected and unchecked models (#440)", () => {
     );
     const first = screen.getByText(/using "haiku"/);
     expect(first).toHaveTextContent(/Background jobs that use the haiku family are using "haiku"/);
-    expect(first).toHaveTextContent(/"claude-haiku-5" is not available to your account/);
+    expect(first).toHaveTextContent(/"claude-haiku-5" could not be used \(it may not exist, or your account may not have access to it\)/);
     expect(first.textContent).not.toContain("—");
     expect(screen.getByText(/using "claude-haiku-4-5-20251001"/)).toBeInTheDocument();
   });
@@ -528,6 +528,23 @@ describe("ConnectionPanel — rejected and unchecked models (#440)", () => {
       <ConnectionPanel state={baseState({ connection: { provider: "claude-cli", model: "claude-sonnet-5", last_heartbeat_at: null }, tier_fallbacks: [] })} persona="test" />,
     );
     expect(screen.queryByText(/using "haiku"/)).not.toBeInTheDocument();
+  });
+
+  it("prefers the fresh Apply result over a stale poll", async () => {
+    // the poll still lists a fallback from the previous chat model; Apply reports none: the line goes at once
+    render(
+      <ConnectionPanel
+        state={baseState({
+          connection: { provider: "claude-cli", model: "claude-sonnet-5", last_heartbeat_at: null },
+          tier_fallbacks: [HAIKU],
+        })}
+        persona="test"
+      />,
+    );
+    expect(screen.getByText(/using "haiku"/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /change model/i }));
+    fireEvent.click(screen.getByRole("button", { name: /apply opus/i }));
+    await waitFor(() => expect(screen.queryByText(/using "haiku"/)).not.toBeInTheDocument());
   });
 
   it("does not repeat a rejection line that a fallback line already explains", () => {

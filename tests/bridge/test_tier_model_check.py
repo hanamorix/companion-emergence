@@ -173,13 +173,17 @@ def test_a_family_whose_tiers_are_all_overridden_is_not_checked(persona_dir: Pat
     assert run.calls_for("claude-haiku-5") == 0
 
 
-def test_chat_and_derived_checks_run_together_and_applies_still_serialize(persona_dir: Path, monkeypatch):
+def test_derived_checks_run_together_after_the_chat_check_and_applies_still_serialize(persona_dir: Path, monkeypatch):
     _cli_persona(persona_dir)
-    watch = frozenset({"claude-sonnet-5", "claude-haiku-5", "claude-opus-4-8", "claude-haiku-4-8"})
-    run = _Run(lambda m: _ok(), delay=0.25, watch=watch)
+    # chat claude-opus-4-8 derives two ids (haiku and sonnet family): they are probed at the same time,
+    # but only after the chat id itself was probed
+    watch = frozenset({"claude-opus-4-8", "claude-haiku-4-8", "claude-sonnet-4-8"})
+    order: list[str] = []
+    run = _Run(lambda m: order.append(m) or _ok(), delay=0.25, watch=watch)
     with _client(persona_dir, monkeypatch) as c, patch("subprocess.run", run):
-        _post(c, "claude-sonnet-5")
-        assert run.max_inflight == 2  # chat id and the derived haiku id at the same time
+        assert _post(c, "claude-opus-4-8").status_code == 200
+        assert order[0] == "claude-opus-4-8" and set(order[1:3]) == {"claude-haiku-4-8", "claude-sonnet-4-8"}
+        assert run.max_inflight == 2  # the two derived probes overlap; the chat probe ran alone first
         run.max_inflight = 0
         out: list[int] = []
         ts = [threading.Thread(target=lambda m=m: out.append(_post(c, m).status_code)) for m in ("claude-opus-4-8", "claude-sonnet-5")]
@@ -188,7 +192,35 @@ def test_chat_and_derived_checks_run_together_and_applies_still_serialize(person
         for t in ts:
             t.join()
     assert out == [200, 200]
-    assert run.max_inflight <= 2  # never four: the second Apply waited for the first
+    assert run.max_inflight <= 2  # never overlapping across the two Applies: the second waited for the first
+
+
+def test_no_derived_probe_is_spent_when_the_chat_id_is_rejected(persona_dir: Path, monkeypatch):
+    _cli_persona(persona_dir)
+    run = _Run(lambda m: _rejected(m) if m == "claude-sonet-5" else _ok())
+    with _client(persona_dir, monkeypatch) as c, patch("subprocess.run", run):
+        r = _post(c, "claude-sonet-5")
+    assert r.status_code == 400
+    assert run.calls_for("claude-sonet-5") == 1
+    assert run.calls_for("claude-haiku-5") == 0 and run.calls_for("claude-haiku-5") == 0
+
+
+def test_a_passing_recheck_clears_a_runtime_rejection_and_the_fallback(persona_dir: Path, monkeypatch):
+    _cli_persona(persona_dir, "claude-sonnet-5")
+    with _client(persona_dir, monkeypatch) as c:
+        with patch("subprocess.run", _Run(lambda m: _rejected(m) if m == "claude-haiku-5" else _ok())):
+            try:
+                build_tier_provider(persona_dir, TIER_BACKGROUND_CLASSIFIER).generate("tick")
+            except RuntimeError:
+                pass
+        assert resolve_tier_model(persona_dir, TIER_COMPACTION) == ("haiku", "fallback")
+        with patch("subprocess.run", _Run(lambda m: _ok())):  # the account gained access
+            r = _post(c, "claude-sonnet-5")
+        body = r.json()
+        st = c.get("/persona/state").json()
+    assert "fallbacks" not in body and body["checked"] is True
+    assert resolve_tier_model(persona_dir, TIER_COMPACTION) == ("claude-haiku-5", "derived")
+    assert st["tier_fallbacks"] == [] and st["model_rejections"] == []
 
 
 def test_switch_away_and_back_as_a_derived_id_still_falls_back_when_rejected(persona_dir: Path, monkeypatch):

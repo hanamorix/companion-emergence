@@ -69,7 +69,7 @@ describe("friendlyChatError", () => {
   it("words a tier fallback plainly, without an em-dash", () => {
     const out = tierFallbackMessage({ family: "haiku", wanted: "claude-haiku-5", using: "haiku" });
     expect(out).toBe(
-      'Background jobs that use the haiku family are using "haiku", because "claude-haiku-5" is not available to your account.',
+      'Background jobs that use the haiku family are using "haiku", because "claude-haiku-5" could not be used (it may not exist, or your account may not have access to it).',
     );
     expect(out).not.toContain("—");
   });

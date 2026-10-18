@@ -99,18 +99,17 @@ def test_clear_tier_removes_the_override_and_the_key_when_empty(persona_dir: Pat
     assert _run(["clear-tier", TIER_COMPACTION]) == 0  # clearing nothing is fine
 
 
-def test_set_tier_reads_the_config_right_before_writing(persona_dir: Path, monkeypatch):
-    # a concurrent write by the bridge (here: a changed model) between launch and write must survive
+def test_set_tier_keeps_a_chat_model_change_that_landed_just_before(persona_dir: Path, monkeypatch):
+    # what this shows: a model the bridge saved moments before the CLI's own load is kept, not overwritten
     path = _write(persona_dir)
     from brain import persona_config as pc
 
     original = pc.PersonaConfig.load.__func__
-
     calls = {"n": 0}
 
     def _load(cls, p):
         calls["n"] += 1
-        if calls["n"] == 1:  # the bridge saves a new chat model before the CLI's own load
+        if calls["n"] == 1:
             d = json.loads(Path(p).read_text())
             d["model"] = "claude-opus-4-8"
             Path(p).write_text(json.dumps(d))
@@ -119,3 +118,21 @@ def test_set_tier_reads_the_config_right_before_writing(persona_dir: Path, monke
     monkeypatch.setattr(pc.PersonaConfig, "load", classmethod(_load))
     assert _run(["set-tier", TIER_COMPACTION, "haiku"]) == 0
     assert json.loads(path.read_text())["model"] == "claude-opus-4-8"
+
+
+@pytest.mark.parametrize("argv", [["show"], ["set-tier", TIER_COMPACTION, "haiku"], ["clear-tier", TIER_COMPACTION]])
+def test_unknown_persona_is_a_clear_error_not_a_traceback(tmp_path: Path, monkeypatch, capsys, argv):
+    monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
+    (tmp_path / "personas").mkdir()
+    with patch("subprocess.run", side_effect=AssertionError), patch("subprocess.Popen", side_effect=AssertionError):
+        rc = cli.main(["model", *argv, "--persona", "typo"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "persona 'typo' not found" in err
+    assert not (tmp_path / "personas" / "typo").exists()  # nothing was created
+
+
+def test_show_says_runtime_fallbacks_are_shown_in_the_app(persona_dir: Path, capsys):
+    _write(persona_dir)
+    assert _run(["show"]) == 0
+    assert "runtime fallbacks appear in the app" in capsys.readouterr().out

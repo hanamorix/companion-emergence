@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { cleanup, render, screen, fireEvent } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
@@ -58,5 +59,37 @@ describe("StepVoiceTemplate — optional Claude model (#441)", () => {
     fireEvent.change(screen.getByLabelText("Claude model"), { target: { value: "claude-opus-4-8" } });
     expect(fetchSpy).not.toHaveBeenCalled();
     vi.unstubAllGlobals();
+  });
+
+  it("keeps Advanced open while the user edits, even when the field is emptied", () => {
+    function Harness() {
+      const [m, setM] = useState("claude-sonnet-5");
+      return (
+        <StepVoiceTemplate
+          step={5}
+          totalSteps={7}
+          template="default"
+          onTemplateChange={vi.fn()}
+          chatModel={m}
+          onChatModelChange={setM}
+          onNext={vi.fn()}
+          onBack={vi.fn()}
+          avatar={null}
+        />
+      );
+    }
+    render(<Harness />);
+    const details = screen.getByText("Advanced").closest("details")!;
+    expect(details).toHaveAttribute("open");
+    fireEvent.change(screen.getByLabelText("Claude model"), { target: { value: "" } });
+    expect(details).toHaveAttribute("open"); // not collapsed under the user
+  });
+
+  it("shows the format error outside the collapsible section, so it is visible even if Advanced is closed", () => {
+    renderStep("Bad Id");
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent(/start with claude-/i);
+    expect(alert.closest("details")).toBeNull();
+    expect(screen.getByText("Advanced").closest("details")).toHaveAttribute("open"); // forced open while invalid
   });
 });
