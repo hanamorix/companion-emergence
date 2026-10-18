@@ -286,4 +286,15 @@ describe("ModelPicker", () => {
     fireEvent.click(applyBtn());
     await waitFor(() => expect(onClose).toHaveBeenCalledWith("claude-sonnet-5", { fallbacks: fb }));
   });
+
+  it("passes the tiers the bridge could not check yet to the caller", async () => {
+    stubFetch(
+      new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: true, tiers_unchecked: ["claude-haiku-5"] }), { status: 200 }),
+    );
+    const onClose = vi.fn();
+    render(<ModelPicker current="sonnet" persona="test" onClose={onClose} />);
+    fireEvent.change(idInput(), { target: { value: "claude-sonnet-5" } });
+    fireEvent.click(applyBtn());
+    await waitFor(() => expect(onClose).toHaveBeenCalledWith("claude-sonnet-5", { tiersUnchecked: ["claude-haiku-5"] }));
+  });
 });

@@ -7,7 +7,7 @@
 // update available, error, download, and ready states.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { cleanup, render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
 
 // ── mocks ──────────────────────────────────────────────────────────
@@ -361,7 +361,14 @@ vi.mock("./ModelPicker", () => ({
   ModelPicker: ({
     onClose,
   }: {
-    onClose: (m?: string, info?: { checked?: false; fallbacks?: { family: string; wanted: string; using: string }[] }) => void;
+    onClose: (
+      m?: string,
+      info?: {
+        checked?: false;
+        fallbacks?: { family: string; wanted: string; using: string }[];
+        tiersUnchecked?: string[];
+      },
+    ) => void;
   }) => (
     <div data-testid="model-picker">
       <button onClick={() => onClose("opus")}>Apply opus</button>
@@ -372,6 +379,9 @@ vi.mock("./ModelPicker", () => ({
         }
       >
         Apply with fallback
+      </button>
+      <button onClick={() => onClose("claude-sonnet-5", { tiersUnchecked: ["claude-haiku-5"] })}>
+        Apply with unchecked tiers
       </button>
       <button onClick={() => onClose()}>Cancel</button>
     </div>
@@ -572,6 +582,67 @@ describe("ConnectionPanel — rejected and unchecked models (#440)", () => {
     );
     expect(screen.getByText(/using "claude-haiku-4-5-20251001"/)).toBeInTheDocument();
     expect(screen.queryByText(/using "haiku",/)).not.toBeInTheDocument();
+  });
+
+  it("releases the pre-Apply guard at the first poll that reports a model other than the old one", async () => {
+    const before = baseState({ connection: { provider: "claude-cli", model: "sonnet", last_heartbeat_at: null }, tier_fallbacks: [] });
+    const { rerender } = render(<ConnectionPanel state={before} persona="test" />);
+    fireEvent.click(screen.getByRole("button", { name: /change model/i }));
+    fireEvent.click(screen.getByRole("button", { name: /apply with fallback/i })); // applies claude-sonnet-5
+    expect(await screen.findByText(/using "haiku",/)).toBeInTheDocument();
+    // the model was changed somewhere else meanwhile: the poll reports neither the old nor the applied model
+    rerender(
+      <ConnectionPanel
+        state={baseState({
+          connection: { provider: "claude-cli", model: "claude-opus-4-8", last_heartbeat_at: null },
+          tier_fallbacks: [PINNED],
+        })}
+        persona="test"
+      />,
+    );
+    expect(screen.queryByText(/using "haiku",/)).not.toBeInTheDocument(); // the stale optimistic lines are gone
+    expect(screen.getByText(/using "claude-haiku-4-5-20251001"/)).toBeInTheDocument(); // the bridge's list shows
+  });
+
+  it("releases the guard after a bounded time even if no poll ever reports a new model", async () => {
+    vi.useFakeTimers();
+    try {
+      const stale = baseState({
+        connection: { provider: "claude-cli", model: "sonnet", last_heartbeat_at: null },
+        tier_fallbacks: [PINNED],
+      });
+      const { rerender } = render(<ConnectionPanel state={stale} persona="test" />);
+      fireEvent.click(screen.getByRole("button", { name: /change model/i }));
+      fireEvent.click(screen.getByRole("button", { name: /apply with fallback/i }));
+      expect(screen.getByText(/using "haiku",/)).toBeInTheDocument();
+      rerender(<ConnectionPanel state={{ ...stale }} persona="test" />); // still the old model: guard holds
+      expect(screen.getByText(/using "haiku",/)).toBeInTheDocument();
+      act(() => {
+        vi.advanceTimersByTime(15_000);
+      });
+      expect(screen.queryByText(/using "haiku",/)).not.toBeInTheDocument();
+      expect(screen.getByText(/using "claude-haiku-4-5-20251001"/)).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("says plainly which background models were not checked yet, at once and from the poll, and clears it", async () => {
+    const withModel = (extra: Partial<PersonaState>) =>
+      baseState({ connection: { provider: "claude-cli", model: "claude-sonnet-5", last_heartbeat_at: null }, ...extra });
+    const { rerender } = render(<ConnectionPanel state={sonnetState()} persona="test" />);
+    fireEvent.click(screen.getByRole("button", { name: /change model/i }));
+    fireEvent.click(screen.getByRole("button", { name: /apply with unchecked tiers/i }));
+    const note = await screen.findByText(/were not checked yet/);
+    expect(note).toHaveTextContent(/claude-haiku-5/);
+    expect(note).toHaveTextContent(/checked when first used, and any problem will show here/);
+    expect(note.textContent).not.toContain("—");
+    // the bridge's poll carries it next
+    rerender(<ConnectionPanel state={withModel({ tier_unconfirmed: ["claude-haiku-5"] })} persona="test" />);
+    expect(screen.getByText(/were not checked yet/)).toBeInTheDocument();
+    // a clean reply for that id arrives: the next poll no longer lists it
+    rerender(<ConnectionPanel state={withModel({ tier_unconfirmed: [] })} persona="test" />);
+    expect(screen.queryByText(/were not checked yet/)).not.toBeInTheDocument();
   });
 
   it("does not repeat a rejection line that a fallback line already explains", () => {

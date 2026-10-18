@@ -52,6 +52,9 @@ _ignored: set[str] = set()
 # Models saved without the Apply-time check being able to confirm them (a check that timed out, hit a
 # limit or found the login expired). Cleared by a clean frame for that model or by switching away.
 _unconfirmed: set[str] = set()
+# Derived tier ids an Apply could not probe (budget used up, timeout, expired login): "not checked yet".
+# Cleared by a clean frame for that id, by a later Apply that settles it, or by reset().
+_tier_unconfirmed: set[str] = set()
 _local = threading.local()
 
 
@@ -135,6 +138,7 @@ def note_success(model: str) -> None:
         with _lock:
             _rejected.pop(model, None)
             _unconfirmed.discard(model)
+            _tier_unconfirmed.discard(model)
     except Exception:  # noqa: BLE001 - fail open
         log.warning("model_error.note_success failed (ignored)", exc_info=True)
 
@@ -155,6 +159,38 @@ def clear_unconfirmed(model: str) -> None:
             _unconfirmed.discard(model)
     except Exception:  # noqa: BLE001 - fail open
         log.warning("model_error.clear_unconfirmed failed (ignored)", exc_info=True)
+
+
+def note_tier_unconfirmed(model: str) -> None:
+    """A derived tier id the Apply-time check could not settle."""
+    try:
+        with _lock:
+            _tier_unconfirmed.add(model)
+    except Exception:  # noqa: BLE001 - fail open
+        log.warning("model_error.note_tier_unconfirmed failed (ignored)", exc_info=True)
+
+
+def clear_tier_unconfirmed(model: str) -> None:
+    """The Apply-time check settled this derived tier id (confirmed or rejected)."""
+    try:
+        with _lock:
+            _tier_unconfirmed.discard(model)
+    except Exception:  # noqa: BLE001 - fail open
+        log.warning("model_error.clear_tier_unconfirmed failed (ignored)", exc_info=True)
+
+
+def tier_unconfirmed(only: Iterable[str] | None = None) -> list[str]:
+    """Derived tier ids still "not checked yet", sorted; restricted to ``only`` when given."""
+    try:
+        with _lock:
+            out = sorted(_tier_unconfirmed)
+        if only is not None:
+            allowed = frozenset(only)
+            out = [m for m in out if m in allowed]
+        return out
+    except Exception:  # noqa: BLE001 - fail open
+        log.warning("model_error.tier_unconfirmed failed (ignored)", exc_info=True)
+        return []
 
 
 def unconfirmed(only: Iterable[str] | None = None) -> list[str]:
@@ -237,4 +273,5 @@ def reset() -> None:
         _rejected.clear()
         _ignored.clear()
         _unconfirmed.clear()
+        _tier_unconfirmed.clear()
     _local.suppress = False

@@ -333,11 +333,15 @@ describe("setPersonaModel", () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: true, fallbacks: fb }), { status: 200 }),
     ));
-    await expect(setPersonaModelFull("alice", "claude-sonnet-5")).resolves.toEqual({ checked: true, fallbacks: fb });
+    await expect(setPersonaModelFull("alice", "claude-sonnet-5")).resolves.toEqual({ checked: true, fallbacks: fb, tiersUnchecked: [] });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: true, tiers_unchecked: ["claude-haiku-5"] }), { status: 200 }),
+    ));
+    await expect(setPersonaModelFull("alice", "claude-sonnet-5")).resolves.toEqual({ checked: true, fallbacks: [], tiersUnchecked: ["claude-haiku-5"] });
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ ok: true, model: "opus" }), { status: 200 }),
     ));
-    await expect(setPersonaModelFull("alice", "opus")).resolves.toEqual({ checked: undefined, fallbacks: [] });
+    await expect(setPersonaModelFull("alice", "opus")).resolves.toEqual({ checked: undefined, fallbacks: [], tiersUnchecked: [] });
   });
 
   it("resolves to the bridge's checked flag for a custom id", async () => {

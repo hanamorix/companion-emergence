@@ -306,3 +306,27 @@ def test_activate_and_rejected_models_fail_open(monkeypatch):
         m.setattr(model_error, "_lock", None)
         model_error.activate(["claude-a-1"])
         assert model_error.rejected_models() == frozenset()
+
+
+def test_tier_unconfirmed_marks_clear_on_a_clean_frame_or_a_confirming_probe(tmp_path):
+    from brain.bridge.usage_log import log_usage
+
+    model_error.note_tier_unconfirmed("claude-haiku-5")
+    model_error.note_tier_unconfirmed("claude-other-1")
+    assert model_error.tier_unconfirmed() == ["claude-haiku-5", "claude-other-1"]
+    assert model_error.tier_unconfirmed(only={"claude-haiku-5"}) == ["claude-haiku-5"]
+    assert model_error.unconfirmed() == []  # a separate list from the chat model's
+    log_usage(tmp_path, call_type="generate", model="haiku", frame={"is_error": False})
+    assert len(model_error.tier_unconfirmed()) == 2
+    log_usage(tmp_path, call_type="generate", model="claude-haiku-5", frame={"is_error": False})
+    assert model_error.tier_unconfirmed() == ["claude-other-1"]
+    model_error.clear_tier_unconfirmed("claude-other-1")
+    assert model_error.tier_unconfirmed() == []
+
+
+def test_tier_unconfirmed_functions_fail_open(monkeypatch):
+    with monkeypatch.context() as m:
+        m.setattr(model_error, "_lock", None)
+        model_error.note_tier_unconfirmed("claude-haiku-5")
+        model_error.clear_tier_unconfirmed("claude-haiku-5")
+        assert model_error.tier_unconfirmed() == []

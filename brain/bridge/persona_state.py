@@ -85,6 +85,8 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
         "model_rejections": _model_rejections(connection.get("model"), tier_cfg),
         # #441: derived tier models being replaced by what those tiers use today, [] when none.
         "tier_fallbacks": _tier_fallbacks(tier_cfg),
+        # #441: derived tier ids an Apply could not check yet (budget used up, timeout); [] when none.
+        "tier_unconfirmed": _tier_unconfirmed(tier_cfg),
         # #440: the chat model when it was saved without the Apply-time check being able to confirm it and no
         # clean reply has arrived for it since. [] otherwise.
         "model_unconfirmed": model_error.unconfirmed(only={connection.get("model")}),
@@ -110,6 +112,12 @@ def _model_rejections(configured_model: str | None, cfg: Any = None) -> list[dic
     if configured_model:
         allowed.add(configured_model)
     return model_error.state(only=allowed)
+
+
+def _tier_unconfirmed(cfg: Any) -> list[str]:
+    from brain.bridge.model_tier import candidate_tier_models
+
+    return model_error.tier_unconfirmed(only=candidate_tier_models(cfg) if cfg is not None else ())
 
 
 def _tier_fallbacks(cfg: Any) -> list[dict]:

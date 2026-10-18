@@ -204,7 +204,8 @@ def test_non_rejection_failure_saves_with_checked_false(persona_dir: Path, monke
         with caplog.at_level(logging.INFO):
             r = _post_model(c, "claude-sonnet-5")
     assert r.status_code == 200, r.text
-    assert r.json() == {"ok": True, "model": "claude-sonnet-5", "checked": False}
+    # the derived tier id could not be probed either (same failure), so it is reported as not checked yet
+    assert r.json() == {"ok": True, "model": "claude-sonnet-5", "checked": False, "tiers_unchecked": ["claude-haiku-5"]}
     assert _saved_model(persona_dir) == "claude-sonnet-5"
     assert any("reason=failed" in rec.getMessage() for rec in caplog.records)
 
@@ -249,7 +250,8 @@ def test_auth_expired_saves_with_checked_false_and_makes_no_call(persona_dir: Pa
         provider_auth.note_cli_failure(LIVE)  # flips to expired and starts the probe interval
         with caplog.at_level(logging.INFO):
             r = _post_model(c, "claude-sonnet-5")
-    assert r.json() == {"ok": True, "model": "claude-sonnet-5", "checked": False}
+    # the derived tier id could not be probed either (same failure), so it is reported as not checked yet
+    assert r.json() == {"ok": True, "model": "claude-sonnet-5", "checked": False, "tiers_unchecked": ["claude-haiku-5"]}
     assert run.calls_for("claude-sonnet-5") == 0
     assert any("reason=auth_deferred" in rec.getMessage() for rec in caplog.records)
 
@@ -261,7 +263,8 @@ def test_timeout_saves_with_checked_false(persona_dir: Path, monkeypatch, caplog
     with _client(persona_dir, monkeypatch) as c, patch("subprocess.run", _Run(_boom)):
         with caplog.at_level(logging.INFO):
             r = _post_model(c, "claude-sonnet-5")
-    assert r.json() == {"ok": True, "model": "claude-sonnet-5", "checked": False}
+    # the derived tier id could not be probed either (same failure), so it is reported as not checked yet
+    assert r.json() == {"ok": True, "model": "claude-sonnet-5", "checked": False, "tiers_unchecked": ["claude-haiku-5"]}
     assert any("reason=timeout" in rec.getMessage() for rec in caplog.records)
 
 

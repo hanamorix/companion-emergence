@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { friendlyChatError, modelRejectionMessage, tierFallbackMessage } from "./friendlyChatError";
+import { friendlyChatError, modelRejectionMessage, tierFallbackMessage, tiersUncheckedMessage } from "./friendlyChatError";
 
 describe("friendlyChatError", () => {
   it("maps provider_failed to actionable Claude guidance", () => {
@@ -70,6 +70,14 @@ describe("friendlyChatError", () => {
     const out = tierFallbackMessage({ family: "haiku", wanted: "claude-haiku-5", using: "haiku" });
     expect(out).toBe(
       'Background jobs that use the haiku family are using "haiku", because "claude-haiku-5" could not be used (it may not exist, or your account may not have access to it).',
+    );
+    expect(out).not.toContain("—");
+  });
+
+  it("words the not-checked-yet background models plainly", () => {
+    const out = tiersUncheckedMessage(["claude-haiku-5", "claude-sonnet-4-8"]);
+    expect(out).toBe(
+      "Some background models were not checked yet (claude-haiku-5, claude-sonnet-4-8). They are checked when first used, and any problem will show here.",
     );
     expect(out).not.toContain("—");
   });

@@ -176,6 +176,8 @@ export interface PersonaState {
   /** Background (tier) models that fell back to what each tier uses today because the model matching the
    *  chat model's version was rejected; [] when none. The connection panel shows a plain line each (#441). */
   tier_fallbacks?: TierFallbackInfo[];
+  /** Derived background-model ids an Apply could not check yet (budget used up, timeout); [] when none. */
+  tier_unconfirmed?: string[];
   /** File writes she has proposed and that await the user's approve/decline.
    *  Each is the consent gate for one guarded write — `propose_write` queued
    *  it (writing nothing); the user commits it to disc or discards it via the
@@ -677,7 +679,7 @@ export type ChatModel = string;
 export async function setPersonaModelFull(
   persona: string,
   model: ChatModel,
-): Promise<{ checked?: boolean; fallbacks: TierFallbackInfo[] }> {
+): Promise<{ checked?: boolean; fallbacks: TierFallbackInfo[]; tiersUnchecked: string[] }> {
   const r = await bridgeFetch(persona, (creds) =>
     fetch(`${creds.url}/persona/config/model`, {
       method: "POST",
@@ -700,6 +702,7 @@ export async function setPersonaModelFull(
   return {
     checked: ok && typeof ok.checked === "boolean" ? ok.checked : undefined,
     fallbacks: ok && Array.isArray(ok.fallbacks) ? (ok.fallbacks as TierFallbackInfo[]) : [],
+    tiersUnchecked: ok && Array.isArray(ok.tiers_unchecked) ? (ok.tiers_unchecked as string[]) : [],
   };
 }
 

@@ -11,6 +11,7 @@ import {
   MODEL_UNCHECKED_MESSAGE,
   modelRejectedNowMessage,
   tierFallbackMessage,
+  tiersUncheckedMessage,
   type TierFallbackInfo,
 } from "../../lib/friendlyChatError";
 import { PronounPicker } from "./PronounPicker";
@@ -25,6 +26,9 @@ import type { Update } from "@tauri-apps/plugin-updater";
 import { BrainUpdateRow } from "./BrainUpdateRow";
 
 const RELEASES_URL = "https://github.com/hanamorix/companion-emergence/releases";
+
+/** How long the pre-Apply poll guard holds when no poll ever reports a different chat model. */
+const GUARD_RELEASE_MS = 15_000;
 
 interface Props {
   state: PersonaState | null;
@@ -93,16 +97,31 @@ export function ConnectionPanel({
   // Tier fallbacks the last Apply reported, shown at once until the bridge's own list (state) takes over.
   // null = no Apply since the last state; an empty list is a fresh answer: none.
   const [pendingFallbacks, setPendingFallbacks] = useState<TierFallbackInfo[] | null>(null);
-  // The model the last Apply saved. A poll that left before the Apply still reports the OLD chat model and
-  // must not bring back the old lines; the first poll that reports the new model carries the bridge's own list.
-  const appliedModelRef = useRef<string | null>(null);
+  const [pendingTiersUnchecked, setPendingTiersUnchecked] = useState<string[] | null>(null);
+  // Guard against a poll that left BEFORE the last Apply and lands after it: it still reports the old chat
+  // model and must not bring back the old lines. It is released by the first poll that reports any other
+  // model (the new one, or one changed elsewhere meanwhile), or after GUARD_RELEASE_MS, whichever is first.
+  const guardRef = useRef<{ before: string | null; applied: string } | null>(null);
+  const guardTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const releaseGuard = () => {
+    if (guardTimerRef.current !== null) clearTimeout(guardTimerRef.current);
+    guardTimerRef.current = null;
+    guardRef.current = null;
+    setPendingNotice(false);
+    setPendingFallbacks(null);
+    setPendingTiersUnchecked(null);
+  };
   useEffect(() => {
-    if (appliedModelRef.current === null || state?.connection?.model === appliedModelRef.current) {
-      appliedModelRef.current = null;
-      setPendingNotice(false);
-      setPendingFallbacks(null);
-    }
+    const g = guardRef.current;
+    const polled = state?.connection?.model ?? null;
+    if (g === null || polled !== g.before || g.before === g.applied) releaseGuard();
   }, [state]);
+  useEffect(
+    () => () => {
+      if (guardTimerRef.current !== null) clearTimeout(guardTimerRef.current);
+    },
+    [],
+  );
   const fallbacks = pendingFallbacks ?? state?.tier_fallbacks ?? [];
   const modelNotice =
     pendingNotice || (displayModel !== null && (state?.model_unconfirmed ?? []).includes(displayModel))
@@ -119,6 +138,8 @@ export function ConnectionPanel({
     return [modelRejectedNowMessage(rec.model, false)];
   });
   const fallbackLines = fallbacks.map(tierFallbackMessage);
+  const uncheckedTiers = (pendingTiersUnchecked ?? state?.tier_unconfirmed ?? []).filter((m) => m !== displayModel);
+  const tiersNote = uncheckedTiers.length > 0 ? tiersUncheckedMessage(uncheckedTiers) : null;
   const [showPronounPicker, setShowPronounPicker] = useState(false);
   // Local pronoun override — updated optimistically after a successful apply.
   const [localPronouns, setLocalPronouns] = useState<PronounPreset | null>(null);
@@ -340,9 +361,12 @@ export function ConnectionPanel({
           onClose={(newModel, info) => {
             if (newModel) {
               setLocalModel(newModel);
-              appliedModelRef.current = newModel;
+              if (guardTimerRef.current !== null) clearTimeout(guardTimerRef.current);
+              guardRef.current = { before: conn?.model ?? null, applied: newModel };
+              guardTimerRef.current = setTimeout(releaseGuard, GUARD_RELEASE_MS);
               setPendingNotice(info?.checked === false);
               setPendingFallbacks(info?.fallbacks ?? []);
+              setPendingTiersUnchecked(info?.tiersUnchecked ?? []);
             }
             setShowModelPicker(false);
           }}
@@ -351,6 +375,11 @@ export function ConnectionPanel({
       {modelNotice && (
         <div role="status" style={{ fontSize: 10.5, color: "var(--text-mute)", lineHeight: 1.5, marginBottom: 6 }}>
           {modelNotice}
+        </div>
+      )}
+      {tiersNote && (
+        <div role="status" style={{ fontSize: 10.5, color: "var(--text-mute)", lineHeight: 1.5, marginBottom: 6, wordBreak: "break-word" }}>
+          {tiersNote}
         </div>
       )}
       {fallbackLines.map((line) => (

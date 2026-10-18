@@ -86,3 +86,11 @@ export function tierFallbackMessage(f: TierFallbackInfo): string {
     "(it may not exist, or your account may not have access to it)."
   );
 }
+
+/** Derived background-model ids an Apply could not check (its time budget ran out, a timeout, ...). */
+export function tiersUncheckedMessage(ids: string[]): string {
+  return (
+    `Some background models were not checked yet (${ids.map((m) => shortenModelId(m)).join(", ")}). ` +
+    "They are checked when first used, and any problem will show here."
+  );
+}

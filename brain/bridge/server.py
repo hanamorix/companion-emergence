@@ -2054,6 +2054,15 @@ def build_app(
             for confirmed in [req.model if checked else None, *(m for m, o in derived_outcomes.items() if o == "ok")]:
                 if confirmed:
                     model_error.note_success(confirmed)
+        # Derived ids the probes could not settle are "not checked yet" (told to the user, cleared by a clean
+        # reply for that id); settled ones (ok or rejected) are not.
+        tiers_unchecked: list[str] = []
+        for derived_id, derived_outcome in derived_outcomes.items():
+            if derived_outcome == "inconclusive":
+                model_error.note_tier_unconfirmed(derived_id)
+                tiers_unchecked.append(derived_id)
+            else:
+                model_error.clear_tier_unconfirmed(derived_id)
         # Re-read right before writing, so a change another request made while the checks ran is kept.
         current = PersonaConfig.load(config_path)
         unavailable: list[str] = []
@@ -2087,6 +2096,10 @@ def build_app(
         fallbacks = tier_fallbacks(updated)
         if fallbacks:
             body["fallbacks"] = fallbacks
+        # not listed twice: an earlier "rejected" kept through an inconclusive re-check is already a fallback
+        still_unchecked = [m for m in tiers_unchecked if m not in updated.derived_unavailable]
+        if still_unchecked:
+            body["tiers_unchecked"] = still_unchecked
         return body
 
     # ── POST /persona/config/pronouns — user pronoun persist ──────────────

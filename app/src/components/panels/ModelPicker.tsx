@@ -18,6 +18,8 @@ export interface ModelApplyInfo {
   checked?: false;
   /** Background tiers that fell back because the version-matched model was not available. */
   fallbacks?: TierFallbackInfo[];
+  /** Derived background-model ids the bridge could not check yet (its time budget ran out). */
+  tiersUnchecked?: string[];
 }
 
 interface ModelOption {
@@ -62,10 +64,11 @@ export function ModelPicker({ current, persona, onClose }: Props) {
     setBusy(true);
     setError(null);
     try {
-      const { checked, fallbacks } = await setPersonaModelFull(persona, value);
+      const { checked, fallbacks, tiersUnchecked } = await setPersonaModelFull(persona, value);
       const info: ModelApplyInfo = {};
       if (checked === false) info.checked = false;
       if (fallbacks.length > 0) info.fallbacks = fallbacks;
+      if (tiersUnchecked.length > 0) info.tiersUnchecked = tiersUnchecked;
       if (Object.keys(info).length > 0) onClose(value, info);
       else onClose(value);
     } catch (e) {

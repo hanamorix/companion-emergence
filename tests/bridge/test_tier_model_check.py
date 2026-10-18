@@ -312,6 +312,7 @@ def test_all_probes_of_one_apply_share_one_budget(persona_dir: Path, monkeypatch
 
 def test_derived_probes_are_skipped_when_the_chat_probe_used_the_budget(persona_dir: Path, monkeypatch):
     from brain.bridge import server as server_mod
+    from brain.bridge.usage_log import log_usage
 
     monkeypatch.setattr(server_mod, "_MODEL_CHECK_TIMEOUT_S", 2.0)
     _cli_persona(persona_dir)
@@ -320,9 +321,42 @@ def test_derived_probes_are_skipped_when_the_chat_probe_used_the_budget(persona_
         t0 = time.monotonic()
         r = _post(c, "claude-sonnet-5")
         elapsed = time.monotonic() - t0
-    assert r.status_code == 200 and r.json()["checked"] is False  # saved unchecked
+        st = c.get("/persona/state").json()
+        # the user is told, both in the response and in the state the panel polls
+        assert r.json()["checked"] is False
+        assert r.json()["tiers_unchecked"] == ["claude-haiku-5"]
+        assert st["tier_unconfirmed"] == ["claude-haiku-5"]
+        # a clean reply for that tier id clears it, like the chat model's own notice
+        log_usage(persona_dir, call_type="generate", model="claude-haiku-5", frame={"is_error": False})
+        assert c.get("/persona/state").json()["tier_unconfirmed"] == []
+    assert r.status_code == 200
     assert "claude-haiku-5" not in run.calls  # no budget left: no derived probe was started
     assert elapsed < 2.0 + 1.0
+
+
+def test_a_later_apply_whose_probes_all_pass_leaves_nothing_unchecked(persona_dir: Path, monkeypatch):
+    _cli_persona(persona_dir)
+    with _client(persona_dir, monkeypatch) as c:
+        with patch("subprocess.run", _Run(lambda m: _proc(1, QUOTA) if m == "claude-haiku-5" else _ok())):
+            first = _post(c, "claude-sonnet-5").json()
+        assert first["tiers_unchecked"] == ["claude-haiku-5"]
+        assert c.get("/persona/state").json()["tier_unconfirmed"] == ["claude-haiku-5"]
+        with patch("subprocess.run", _Run(lambda m: _ok())):
+            second = _post(c, "claude-sonnet-5").json()
+        assert "tiers_unchecked" not in second
+        assert c.get("/persona/state").json()["tier_unconfirmed"] == []
+
+
+def test_rejected_derived_ids_and_alias_applies_report_nothing_unchecked(persona_dir: Path, monkeypatch):
+    _cli_persona(persona_dir)
+    with _client(persona_dir, monkeypatch) as c:
+        with patch("subprocess.run", _Run(lambda m: _rejected(m) if m == "claude-haiku-5" else _ok())):
+            body = _post(c, "claude-sonnet-5").json()
+        assert "tiers_unchecked" not in body and body["fallbacks"]  # rejected: a fallback, not "unchecked"
+        with patch("subprocess.run", _Run(lambda m: _ok())):
+            alias = _post(c, "opus").json()
+        assert alias == {"ok": True, "model": "opus"}
+        assert c.get("/persona/state").json()["tier_unconfirmed"] == []
 
 
 def test_default_budget_is_well_inside_a_60_second_webview_idle_timeout():
