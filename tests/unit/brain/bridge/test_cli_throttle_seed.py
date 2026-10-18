@@ -219,11 +219,6 @@ def test_large_buffer_is_read_via_bounded_seek_not_a_full_file_read(tmp_path: Pa
         recent_ts = (now_wall - timedelta(seconds=5)).isoformat()
         fh.write(json.dumps({"session_id": "sess-1", "speaker": "user", "text": "newest", "ts": recent_ts}) + "\n")
 
-    from brain.bridge.cli_throttle import _last_nonempty_raw_line
-
-    line = _last_nonempty_raw_line(path, chunk_size=256)
-    assert json.loads(line)["text"] == "newest"
-
     cli_throttle.seed_last_message_from_active_conversations(
         persona_dir, now_wall=now_wall, now_mono=10_000.0
     )

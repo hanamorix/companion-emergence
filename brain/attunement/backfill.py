@@ -19,7 +19,7 @@ from datetime import datetime as _datetime
 from pathlib import Path
 
 from brain.attunement.store import BufferTurn
-from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+from brain.health.json_io import Recovery, iter_jsonl
 
 _log = logging.getLogger(__name__)
 _STATE_FILE = "backfill_state.json"
@@ -158,7 +158,7 @@ def _read_buffer_turns(persona_dir: Path) -> list[BufferTurn]:
         return []
     rows: list[tuple[str, BufferTurn]] = []
     for jsonl_file in sorted(convs.glob("*.jsonl")):
-        for row in read_jsonl_skipping_corrupt(jsonl_file):
+        for row in iter_jsonl(jsonl_file, recover=Recovery.RAISE):
             if row.get("role") != "user":
                 continue
             tid = str(row.get("id") or row.get("ts") or "")

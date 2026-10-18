@@ -79,6 +79,7 @@ from brain.engines import interest_sweep
 from brain.felt_time import FeltTime, TickContext
 from brain.felt_time.lived_age import IntensityDrivers
 from brain.forgetting import run_pass as forgetting_run_pass
+from brain.health.json_io import Recovery, iter_jsonl
 from brain.health.log_rotation import (
     rotate_age_archive_yearly,
     rotate_rolling_size,
@@ -2259,7 +2260,6 @@ def _run_narrative_memory_pass(
     from brain.forgetting import SoulExemptionsUnavailableError, _load_soul_linked_ids
     from brain.forgetting.policy import is_exempt as forgetting_is_exempt
     from brain.forgetting.salience import score as forgetting_salience
-    from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
 
     # Map felt-time anchor type -> JSONL filename (matches
     # brain.felt_time.anchors._SOURCES; v1 skips weather_shift per spec).
@@ -2334,9 +2334,7 @@ def _run_narrative_memory_pass(
         adapted: list[_AnchorAdapter] = []
         for anchor_type, (filename, _label_key) in anchor_sources.items():
             path = persona_dir / filename
-            if not path.exists():
-                continue
-            for entry_idx, entry in enumerate(iter_jsonl_skipping_corrupt(path), start=1):
+            for entry_idx, entry in enumerate(iter_jsonl(path, recover=Recovery.RAISE), start=1):
                 fa = wanted.get((filename, entry_idx))
                 if fa is None:
                     continue

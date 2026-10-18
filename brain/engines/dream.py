@@ -6,7 +6,6 @@ experiences together. See spec Section 5 for the cycle step-by-step.
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -16,6 +15,7 @@ from typing import Any
 from brain.bridge.provider import LLMProvider
 from brain.emotion.aggregate import aggregate_state
 from brain.engines import dream_seeds
+from brain.health.json_io import Recovery, append_jsonl, iter_jsonl
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 from brain.soul.store import SoulStore
@@ -187,20 +187,13 @@ class DreamEngine:
 
     def _recent_seed_ids(self, window: int) -> list[str]:
         """Seed ids from the last `window` dream-log entries (deterministic)."""
-        if self.log_path is None or not self.log_path.exists():
+        if self.log_path is None:
             return []
         ids: list[str] = []
-        with self.log_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    sid = json.loads(line).get("seed_id")
-                except json.JSONDecodeError:
-                    continue
-                if sid:
-                    ids.append(sid)
+        for rec in iter_jsonl(self.log_path, recover=Recovery.RAISE):
+            sid = rec.get("seed_id")
+            if sid:
+                ids.append(sid)
         return ids[-window:]
 
     def _spread_activate(
@@ -313,8 +306,7 @@ class DreamEngine:
             "dream_id": dream_memory.id,
             "provider": self.provider.name(),
         }
-        with self.log_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
+        append_jsonl(self.log_path, entry)
 
     def _emit_initiate_candidate(
         self,

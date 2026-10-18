@@ -17,13 +17,12 @@ of creative_dna + journal).
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+from brain.health.json_io import Recovery, append_jsonl, read_jsonl
 from brain.utils.time import iso_utc
 
 _VALID_KINDS = frozenset(
@@ -85,9 +84,7 @@ def append_behavioral_event(
             "evidence_memory_ids": list(evidence_memory_ids),
         }
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    append_jsonl(path, entry)
 
 
 def read_behavioral_log(
@@ -100,9 +97,7 @@ def read_behavioral_log(
     Corrupt lines are skipped silently via read_jsonl_skipping_corrupt.
     Missing file returns empty list.
     """
-    if not path.exists():
-        return []
-    entries = list(read_jsonl_skipping_corrupt(path))
+    entries = read_jsonl(path, recover=Recovery.RAISE)
     if since is None:
         return entries
     cutoff_iso = iso_utc(since)

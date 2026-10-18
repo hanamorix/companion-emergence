@@ -11,7 +11,6 @@ must remain accessible.
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 import threading
@@ -19,10 +18,11 @@ from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from brain.health.jsonl_reader import iter_jsonl_streaming
+from brain.health.json_io import Recovery, append_jsonl, iter_jsonl, write_jsonl
 from brain.initiate import presence_state
 from brain.initiate.d_call_schema import DCallRow
 from brain.initiate.schemas import AuditRow, StateName
+from brain.utils.file_lock import file_lock
 
 logger = logging.getLogger(__name__)
 
@@ -49,13 +49,7 @@ _AUDIT_LOCK = threading.Lock()
 
 def append_audit_row(persona_dir: Path, row: AuditRow) -> None:
     """Append one row to initiate_audit.jsonl (creates file lazily)."""
-    persona_dir.mkdir(parents=True, exist_ok=True)
-    path = persona_dir / "initiate_audit.jsonl"
-    try:
-        with path.open("a", encoding="utf-8") as f:
-            f.write(row.to_jsonl() + "\n")
-    except OSError as exc:
-        logger.warning("initiate audit append failed for %s: %s", path, exc)
+    append_jsonl(persona_dir / "initiate_audit.jsonl", row.to_dict(), on_error="log", nonfinite="null")
 
 
 def update_audit_state(
@@ -89,14 +83,14 @@ def update_audit_state(
         rows: list[AuditRow] = []
         found = False
         lag_seconds: float | None = None
-        with path.open("r", encoding="utf-8") as f:
-            for line in f:
-                stripped = line.rstrip("\r\n")
-                if not stripped.strip():
-                    continue
+        # The file lock makes read-and-rewrite one step against the (separate-process or thread) appenders:
+        # an append landing between the read and the replace used to be lost.
+        with file_lock(path):
+            # RAISE: the rows are rewritten below, so a failed read must not look like a short log.
+            for rec in iter_jsonl(path, recover=Recovery.RAISE):
                 try:
-                    row = AuditRow.from_jsonl(stripped)
-                except (json.JSONDecodeError, KeyError) as exc:
+                    row = AuditRow.from_dict(rec)
+                except KeyError as exc:
                     logger.warning("skipping corrupt audit row in %s: %s", path, exc)
                     continue
                 if row.audit_id == audit_id:
@@ -111,18 +105,10 @@ def update_audit_state(
                     ):
                         lag_seconds = _reply_lag_seconds(send_ts_str, at)
                 rows.append(row)
-        if not found:
-            return
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        try:
-            with tmp.open("w", encoding="utf-8") as f:
-                for r in rows:
-                    f.write(r.to_jsonl() + "\n")
-            tmp.replace(path)
-        except OSError as exc:
-            tmp.unlink(missing_ok=True)
-            logger.warning("audit state update failed for %s: %s", path, exc)
-            return
+            if not found:
+                return
+            if not write_jsonl(path, [r.to_dict() for r in rows], fsync=False, on_error="log"):
+                return
         if lag_seconds is not None:
             try:
                 presence_state.fold_reply_lag(persona_dir, lag_seconds)
@@ -159,25 +145,19 @@ def read_recent_audit(
     relative to `now` (defaults to datetime.now(UTC)).
     """
     path = persona_dir / "initiate_audit.jsonl"
-    if not path.exists():
-        return
     now = now or datetime.now(UTC)
     cutoff = now - timedelta(hours=window_hours)
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            stripped = line.rstrip("\r\n")
-            if not stripped.strip():
-                continue
-            try:
-                row = AuditRow.from_jsonl(stripped)
-            except (json.JSONDecodeError, KeyError):
-                continue
-            try:
-                row_ts = datetime.fromisoformat(row.ts)
-            except ValueError:
-                continue
-            if row_ts >= cutoff:
-                yield row
+    for rec in iter_jsonl(path, recover=Recovery.RAISE):
+        try:
+            row = AuditRow.from_dict(rec)
+        except KeyError:
+            continue
+        try:
+            row_ts = datetime.fromisoformat(row.ts)
+        except ValueError:
+            continue
+        if row_ts >= cutoff:
+            yield row
 
 
 def iter_initiate_audit_full(persona_dir: Path) -> Iterator[AuditRow]:
@@ -196,28 +176,22 @@ def iter_initiate_audit_full(persona_dir: Path) -> Iterator[AuditRow]:
                 archives.append((int(m.group(1)), child))
         archives.sort(key=lambda t: t[0])
         for _year, archive_path in archives:
-            for raw in iter_jsonl_streaming(archive_path):
+            for raw in iter_jsonl(archive_path, recover=Recovery.RAISE):
                 try:
-                    yield AuditRow.from_jsonl(json.dumps(raw))
+                    yield AuditRow.from_dict(raw)
                 except (KeyError, TypeError):
                     continue
     active = persona_dir / "initiate_audit.jsonl"
-    for raw in iter_jsonl_streaming(active):
+    for raw in iter_jsonl(active, recover=Recovery.RAISE):
         try:
-            yield AuditRow.from_jsonl(json.dumps(raw))
+            yield AuditRow.from_dict(raw)
         except (KeyError, TypeError):
             continue
 
 
 def append_d_call_row(persona_dir: Path, row: DCallRow) -> None:
     """Append one row to initiate_d_calls.jsonl (creates file lazily)."""
-    persona_dir.mkdir(parents=True, exist_ok=True)
-    path = persona_dir / "initiate_d_calls.jsonl"
-    try:
-        with path.open("a", encoding="utf-8") as f:
-            f.write(row.to_jsonl() + "\n")
-    except OSError as exc:
-        logger.warning("initiate_d_calls append failed for %s: %s", path, exc)
+    append_jsonl(persona_dir / "initiate_d_calls.jsonl", row.to_dict(), on_error="log", nonfinite="null")
 
 
 def read_recent_d_calls(
@@ -228,25 +202,19 @@ def read_recent_d_calls(
 ) -> Iterator[DCallRow]:
     """Yield D-call rows within `window_hours` of `now` (defaults to datetime.now(UTC))."""
     path = persona_dir / "initiate_d_calls.jsonl"
-    if not path.exists():
-        return
     now = now or datetime.now(UTC)
     cutoff = now - timedelta(hours=window_hours)
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            stripped = line.rstrip("\r\n")
-            if not stripped.strip():
-                continue
-            try:
-                row = DCallRow.from_jsonl(stripped)
-            except (json.JSONDecodeError, KeyError):
-                continue
-            try:
-                row_ts = datetime.fromisoformat(row.ts)
-            except ValueError:
-                continue
-            if row_ts >= cutoff:
-                yield row
+    for rec in iter_jsonl(path, recover=Recovery.RAISE):
+        try:
+            row = DCallRow.from_dict(rec)
+        except KeyError:
+            continue
+        try:
+            row_ts = datetime.fromisoformat(row.ts)
+        except ValueError:
+            continue
+        if row_ts >= cutoff:
+            yield row
 
 
 # Decision values that mark D-promoted rows.

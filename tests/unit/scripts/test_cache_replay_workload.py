@@ -815,16 +815,16 @@ def test_cli_fail_closed_does_not_depend_on_logging_configuration(tmp_path, sile
 
 
 def test_cli_uses_the_shared_jsonl_reader(tmp_path, monkeypatch):
-    import brain.health.jsonl_reader as reader
+    import brain.health.json_io as reader
 
     calls = []
-    real = reader.iter_jsonl_skipping_corrupt
+    real = reader.iter_jsonl
 
-    def spy(path):
+    def spy(path, **kw):
         calls.append(Path(path))
-        return real(path)
+        return real(path, **kw)
 
-    monkeypatch.setattr(reader, "iter_jsonl_skipping_corrupt", spy)
+    monkeypatch.setattr(reader, "iter_jsonl", spy)
     f = tmp_path / "u.jsonl"
     _write_rows(f, run(6449, 6449))
     assert _cli(f, "--regression-threshold", "0") == 0
@@ -1284,11 +1284,11 @@ class _CorruptsAt3(_Scripted):
 
 
 def test_k2_a_corrupt_line_inside_the_runs_rows_is_unmeasured_with_one_warning_from_one_parse(tmp_path, monkeypatch, caplog):
-    import brain.health.jsonl_reader as reader
+    import brain.health.json_io as reader
 
     calls = []
-    real = reader.iter_jsonl_skipping_corrupt
-    monkeypatch.setattr(reader, "iter_jsonl_skipping_corrupt", lambda path: (calls.append(Path(path)), real(path))[1])
+    real = reader.iter_jsonl
+    monkeypatch.setattr(reader, "iter_jsonl", lambda path, **kw: (calls.append(Path(path)), real(path, **kw))[1])
     with caplog.at_level(logging.WARNING, logger="brain.health.jsonl_reader"):
         summary, _, _ = _replay(tmp_path, monkeypatch, _HEALTHY_TEXT, with_tools=False, cls=_CorruptsAt3)
     res = summary["cache_break_check"]

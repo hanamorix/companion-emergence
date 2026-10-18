@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
+from brain.health.json_io import iter_jsonl
 from brain.memory.store import Memory, MemoryStore, _row_to_memory
 
 logger = logging.getLogger(__name__)
@@ -129,31 +129,20 @@ def _latest_user_turn_in_buffers(persona_dir: Path) -> datetime | None:
     latest: datetime | None = None
     try:
         for jsonl_path in active_dir.glob("*.jsonl"):
-            try:
-                with jsonl_path.open("r", encoding="utf-8") as fh:
-                    for line in fh:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            turn = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if turn.get("speaker") != "user":
-                            continue
-                        ts_raw = turn.get("ts")
-                        if not ts_raw:
-                            continue
-                        try:
-                            ts = datetime.fromisoformat(ts_raw)
-                        except ValueError:
-                            continue
-                        if ts.tzinfo is None:
-                            ts = ts.replace(tzinfo=UTC)
-                        if latest is None or ts > latest:
-                            latest = ts
-            except OSError:
-                continue
+            for turn in iter_jsonl(jsonl_path):  # an unreadable buffer reads as empty (the module warns)
+                if turn.get("speaker") != "user":
+                    continue
+                ts_raw = turn.get("ts")
+                if not ts_raw:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(ts_raw)
+                except ValueError:
+                    continue
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=UTC)
+                if latest is None or ts > latest:
+                    latest = ts
     except OSError:
         return None
     return latest

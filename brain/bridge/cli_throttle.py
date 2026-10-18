@@ -25,7 +25,6 @@ the last saved message"; see that function's docstring.
 from __future__ import annotations
 
 import contextlib
-import json
 import logging
 import threading
 import time
@@ -34,6 +33,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain import tunables
+from brain.health.json_io import Recovery, read_jsonl_tail
 
 log = logging.getLogger(__name__)
 
@@ -250,52 +250,6 @@ def _parse_saved_ts(raw: object) -> datetime:
     return parsed
 
 
-def _last_nonempty_raw_line(path: Path, *, chunk_size: int = 8192) -> str | None:
-    """Return the LAST non-empty raw line of a jsonl file, or None if the
-    file has no lines (missing, empty, or blank-only).
-
-    Deliberately does NOT go through ``read_jsonl_skipping_corrupt``
-    (``brain/health/jsonl_reader.py``): that reader silently drops a
-    syntactically corrupt line (e.g. one truncated by a crash/OOM
-    mid-append — exactly the kind of event this project's RAM-spike fix
-    targets) and logs only a warning, which would make the seed silently
-    fall back to an OLDER, previously-good turn as "newest". A malformed
-    trailing line must surface as a parse failure here instead, so the
-    caller's fail-closed handling (S63) covers it, rather than silently
-    understating how recent the chat actually was.
-
-    Bounded I/O via a backward seek (same growing-chunk algorithm as this
-    module's sibling ``read_last_n_jsonl_lines``, round-2 red-team MINOR):
-    cost scales with the last line's own length, not the whole file's size —
-    reading the whole buffer just to get its last line would itself be an
-    unbounded read, on a branch whose entire point is fixing exactly that
-    class of RAM spike. NOT reused directly: that helper decodes with
-    ``errors="replace"``, which would silently paper over an invalid-
-    encoding fault instead of raising it into this function's caller's
-    fail-closed handling — this needs a STRICT decode instead.
-    """
-    if not path.exists():
-        return None
-    with path.open("rb") as f:
-        f.seek(0, 2)  # SEEK_END
-        remaining = f.tell()
-        if remaining == 0:
-            return None
-        block = b""
-        while True:
-            read_size = min(chunk_size, remaining)
-            remaining -= read_size
-            f.seek(remaining)
-            block = f.read(read_size) + block
-            if remaining <= 0 or block.count(b"\n") >= 2:
-                break
-    text = block.decode("utf-8")  # strict: a bad byte must fail closed, never be papered over
-    for line in reversed(text.splitlines()):
-        if line.strip():
-            return line
-    return None
-
-
 def seed_last_message_from_active_conversations(
     persona_dir: Path,
     *,
@@ -324,7 +278,7 @@ def seed_last_message_from_active_conversations(
       value) — INCLUDING a syntactically corrupt/truncated trailing JSONL
       line (e.g. a crash/OOM mid-append; deliberately NOT silently skipped
       the way ``read_jsonl_skipping_corrupt`` skips a corrupt line elsewhere
-      — see ``_last_nonempty_raw_line``, because silently falling back to an
+      — see the strict tail read below, because silently falling back to an
       OLDER good line here would understate how recent the chat really was,
       the wrong direction for a fail-closed idle gate): treated as an
       is_chat_idle FAULT per S63's fail-closed rule — logged once at ERROR
@@ -346,11 +300,12 @@ def seed_last_message_from_active_conversations(
         newest: datetime | None = None
         for session_id in list_active_sessions(persona_dir):
             path = persona_dir / "active_conversations" / f"{session_id}.jsonl"
-            raw_line = _last_nonempty_raw_line(path)
-            if raw_line is None:
+            # strict + RAISE: a corrupt, truncated or non-object trailing line (a crash/OOM mid-append) must
+            # raise into the fail-closed handler below, never fall back to an OLDER good turn (S63).
+            tail = read_jsonl_tail(path, 1, strict=True, recover=Recovery.RAISE)
+            if not tail:
                 continue
-            record = json.loads(raw_line)  # raises on a corrupt/truncated trailing line -> fail closed
-            parsed = _parse_saved_ts(record.get("ts"))
+            parsed = _parse_saved_ts(tail[0].get("ts"))
             if newest is None or parsed > newest:
                 newest = parsed
     except Exception as exc:  # noqa: BLE001 — malformed ts or any read fault: fail CLOSED (S63)

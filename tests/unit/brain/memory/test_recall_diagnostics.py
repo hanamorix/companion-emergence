@@ -440,7 +440,7 @@ def _append_inside_prune_window(monkeypatch, path: Path, point: str, *, settle_s
     if point == "after_read":
         monkeypatch.setattr(rd, "_record_ts", record_ts_after_read)
     else:
-        monkeypatch.setattr(rd.os, "replace", replace_after_launch)
+        monkeypatch.setattr(os, "replace", replace_after_launch)  # the rewrite replaces through os.replace (json_io)
     return state
 
 

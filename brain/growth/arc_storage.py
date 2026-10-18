@@ -17,16 +17,14 @@ The graveyard is the source of truth for "did Hana remove this in the last
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from brain.engines.reflex import ReflexArc
 from brain.health.adaptive import compute_treatment
 from brain.health.attempt_heal import attempt_heal, save_with_backup
-from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+from brain.health.json_io import Recovery, append_jsonl, read_jsonl
 from brain.utils.time import iso_utc
 
 logger = logging.getLogger(__name__)
@@ -65,23 +63,13 @@ def append_removed_arc(
     # Audit 2026-05-08 cross-platform: wrap with file_lock for
     # Windows correctness — POSIX has atomic O_APPEND but Windows
     # doesn't, so concurrent appenders interleave mid-line there.
-    from brain.utils.file_lock import file_lock
-
-    line = (json.dumps(entry) + "\n").encode("utf-8")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with file_lock(path):
-        with open(path, "ab") as fh:
-            fh.write(line)
-            fh.flush()
-            os.fsync(fh.fileno())
+    append_jsonl(path, entry, fsync=True)
 
 
 def read_removed_arcs(persona_dir: Path) -> list[dict]:
     """Read all graveyard entries oldest-first. Skips corrupt lines."""
-    path = persona_dir / GRAVEYARD_FILENAME
-    if not path.exists():
-        return []
-    return list(read_jsonl_skipping_corrupt(path))
+    # RAISE: this is the grace gate against re-creating a removed arc; an unreadable file must not read as "none".
+    return read_jsonl(persona_dir / GRAVEYARD_FILENAME, recover=Recovery.RAISE)
 
 
 def recently_removed_names(

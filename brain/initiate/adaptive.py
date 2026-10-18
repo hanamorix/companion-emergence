@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from brain import prompt_strings
+from brain.health.json_io import Recovery, append_jsonl, iter_jsonl
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +67,7 @@ class CalibrationRow:
     filtered_recurred: bool | None
     reason_short: str
 
-    def to_jsonl(self) -> str:
+    def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
             "ts_decision": self.ts_decision,
             "ts_closed": self.ts_closed,
@@ -81,11 +82,13 @@ class CalibrationRow:
             },
             "reason_short": self.reason_short,
         }
-        return json.dumps(d, ensure_ascii=False)
+        return d
+
+    def to_jsonl(self) -> str:
+        return json.dumps(self.to_dict(), ensure_ascii=False)
 
     @classmethod
-    def from_jsonl(cls, line: str) -> CalibrationRow:
-        d = json.loads(line)
+    def from_dict(cls, d: dict) -> CalibrationRow:
         outcome = d.get("outcome", {})
         return cls(
             ts_decision=d["ts_decision"],
@@ -100,16 +103,14 @@ class CalibrationRow:
             reason_short=d.get("reason_short", ""),
         )
 
+    @classmethod
+    def from_jsonl(cls, line: str) -> CalibrationRow:
+        return cls.from_dict(json.loads(line))
+
 
 def append_calibration_row(persona_dir: Path, row: CalibrationRow) -> None:
     """Append one row to d_calibration.jsonl. Creates file lazily; never raises."""
-    persona_dir.mkdir(parents=True, exist_ok=True)
-    path = persona_dir / "d_calibration.jsonl"
-    try:
-        with path.open("a", encoding="utf-8") as f:
-            f.write(row.to_jsonl() + "\n")
-    except OSError as exc:
-        logger.warning("d_calibration.jsonl append failed for %s: %s", path, exc)
+    append_jsonl(persona_dir / "d_calibration.jsonl", row.to_dict(), on_error="log", nonfinite="null")
 
 
 def read_recent_calibration_rows(
@@ -121,19 +122,12 @@ def read_recent_calibration_rows(
 
     Tolerant of missing file (yields nothing) and corrupt rows (skipped).
     """
-    path = persona_dir / "d_calibration.jsonl"
-    if not path.exists():
-        return
     rows: list[CalibrationRow] = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            stripped = line.rstrip("\r\n")
-            if not stripped.strip():
-                continue
-            try:
-                rows.append(CalibrationRow.from_jsonl(stripped))
-            except (json.JSONDecodeError, KeyError):
-                continue
+    for rec in iter_jsonl(persona_dir / "d_calibration.jsonl", recover=Recovery.RAISE):
+        try:
+            rows.append(CalibrationRow.from_dict(rec))
+        except KeyError:
+            continue
     rows.reverse()
     yield from rows[:limit]
 
@@ -194,23 +188,14 @@ class DriftAlert:
 
 def _read_all_d_calls(persona_dir: Path) -> list:
     """Read every row from initiate_d_calls.jsonl without a time filter."""
-    import json as _json
-
     from brain.initiate.d_call_schema import DCallRow
 
-    path = persona_dir / "initiate_d_calls.jsonl"
-    if not path.exists():
-        return []
     rows = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            stripped = line.rstrip("\r\n")
-            if not stripped.strip():
-                continue
-            try:
-                rows.append(DCallRow.from_jsonl(stripped))
-            except (_json.JSONDecodeError, KeyError):
-                continue
+    for rec in iter_jsonl(persona_dir / "initiate_d_calls.jsonl", recover=Recovery.RAISE):
+        try:
+            rows.append(DCallRow.from_dict(rec))
+        except KeyError:
+            continue
     return rows
 
 

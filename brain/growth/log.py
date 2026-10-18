@@ -13,14 +13,12 @@ biography future engineers (and the user, via GUI) can read.
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+from brain.health.json_io import Recovery, append_jsonl, iter_jsonl
 from brain.utils.time import iso_utc, parse_iso_utc
 
 logger = logging.getLogger(__name__)
@@ -66,25 +64,17 @@ def append_growth_event(path: Path, event: GrowthLogEvent) -> None:
     taking the lock costs ~µs on the happy path and gives us
     correct semantics on every platform.
     """
-    from brain.utils.file_lock import file_lock
-
-    line = (json.dumps(_event_to_dict(event)) + "\n").encode("utf-8")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with file_lock(path):
-        with open(path, "ab") as fh:
-            fh.write(line)
-            fh.flush()
-            os.fsync(fh.fileno())
+    append_jsonl(path, _event_to_dict(event), fsync=True)
 
 
 def read_growth_log(path: Path, *, limit: int | None = None) -> list[GrowthLogEvent]:
     """Read events oldest-first. `limit=N` returns the N most-recent events.
 
     Corrupt lines (partial write, hand-edit) are skipped with a warning via
-    `read_jsonl_skipping_corrupt`; well-formed lines around them still parse.
+    `iter_jsonl`; well-formed lines around them still parse.
     """
     events: list[GrowthLogEvent] = []
-    for data in read_jsonl_skipping_corrupt(path):
+    for data in iter_jsonl(path, recover=Recovery.RAISE):
         try:
             events.append(_event_from_dict(data))
         except (KeyError, TypeError, ValueError) as exc:

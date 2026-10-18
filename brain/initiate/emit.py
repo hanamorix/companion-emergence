@@ -9,13 +9,12 @@ contract: every writer reopens (per the v0.0.8 retention contract).
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
+from brain.health.json_io import Recovery, append_jsonl, iter_jsonl, write_jsonl
 from brain.initiate.schemas import (
     CandidateKind,
     CandidateSource,
@@ -24,6 +23,7 @@ from brain.initiate.schemas import (
     SemanticContext,
     make_candidate_id,
 )
+from brain.utils.file_lock import file_lock
 
 logger = logging.getLogger(__name__)
 
@@ -45,11 +45,10 @@ def emit_initiate_candidate(
     Creates the queue file if it doesn't exist. Never raises on disk
     error — logs a warning and continues.
     """
-    persona_dir.mkdir(parents=True, exist_ok=True)
     queue = persona_dir / "initiate_candidates.jsonl"
 
     # Dedupe check against existing queue contents.
-    for existing in iter_jsonl_skipping_corrupt(queue):
+    for existing in iter_jsonl(queue, recover=Recovery.RAISE):
         if (
             existing.get("kind") == kind
             and existing.get("source") == source
@@ -70,20 +69,16 @@ def emit_initiate_candidate(
         proposal=proposal,
     )
 
-    try:
-        with queue.open("a", encoding="utf-8") as f:
-            f.write(candidate.to_jsonl() + "\n")
-    except OSError as exc:
-        logger.warning("initiate candidate emit failed for %s: %s", queue, exc)
+    append_jsonl(queue, candidate.to_dict(), on_error="log", nonfinite="null")
 
 
 def read_candidates(persona_dir: Path) -> list[InitiateCandidate]:
     """Return all queued candidates (oldest first)."""
     queue = persona_dir / "initiate_candidates.jsonl"
     out: list[InitiateCandidate] = []
-    for raw in iter_jsonl_skipping_corrupt(queue):
-        # Reconstruct via from_jsonl roundtrip for type safety.
-        out.append(InitiateCandidate.from_jsonl(json.dumps(raw)))
+    # RAISE: remove_candidate rewrites the queue from this read, so a failed read must not look like an empty queue.
+    for raw in iter_jsonl(queue, recover=Recovery.RAISE):
+        out.append(InitiateCandidate.from_dict(raw))
     return out
 
 
@@ -94,7 +89,7 @@ def remove_candidate(persona_dir: Path, candidate_id: str) -> None:
     candidate has been processed (decision written to audit).
 
     Side effect: corrupt rows already in the queue are dropped during
-    the rewrite. iter_jsonl_skipping_corrupt warns on each at read time;
+    the rewrite. iter_jsonl warns on each at read time;
     no separate audit is written here. For a queue file this is the
     correct behaviour (a corrupt candidate row is unrecoverable), but
     callers should be aware that rewriting the queue is also a cleanup
@@ -103,13 +98,8 @@ def remove_candidate(persona_dir: Path, candidate_id: str) -> None:
     queue = persona_dir / "initiate_candidates.jsonl"
     if not queue.exists():
         return
-    surviving = [c for c in read_candidates(persona_dir) if c.candidate_id != candidate_id]
-    tmp = queue.with_suffix(queue.suffix + ".tmp")
-    try:
-        with tmp.open("w", encoding="utf-8") as f:
-            for c in surviving:
-                f.write(c.to_jsonl() + "\n")
-        tmp.replace(queue)
-    except OSError as exc:
-        tmp.unlink(missing_ok=True)
-        logger.warning("initiate candidate remove failed for %s: %s", queue, exc)
+    # The file lock makes read-and-rewrite one step against emit_initiate_candidate's append: an append
+    # landing between the read and the replace used to be lost.
+    with file_lock(queue):
+        surviving = [c for c in read_candidates(persona_dir) if c.candidate_id != candidate_id]
+        write_jsonl(queue, [c.to_dict() for c in surviving], fsync=False, on_error="log")

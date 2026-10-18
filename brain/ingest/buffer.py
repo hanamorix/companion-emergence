@@ -5,7 +5,7 @@ Each line is a JSON-encoded turn record:
   {session_id, speaker, text, ts}
 
 The append-only JSONL design is faithful to OG nell_conversation_ingest.py.
-Reads tolerate corrupt lines via read_jsonl_skipping_corrupt.
+Reads tolerate corrupt lines via brain.health.json_io.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+from brain.health.json_io import Recovery, append_jsonl, encode_jsonl, read_jsonl, write_jsonl
 
 # session_id grammar: UUIDs (hyphens included) and the `sess_<8 hex>` fallback
 # both fit. Letters / digits / hyphen / underscore only — no slashes, dots, or
@@ -98,9 +98,7 @@ def ingest_turn(persona_dir: Path, turn: dict) -> str:
         # Defensive copy so callers passing tuples or generators end up
         # with a JSON-serialisable list on the record.
         record["image_shas"] = list(image_shas)
-    path = _session_path(persona_dir, session_id)
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    append_jsonl(_session_path(persona_dir, session_id), record)
     return session_id
 
 
@@ -114,8 +112,9 @@ def list_active_sessions(persona_dir: Path) -> list[str]:
 
 def read_session(persona_dir: Path, session_id: str) -> list[dict]:
     """Return the turns from a session buffer, skipping malformed lines."""
-    path = _session_path(persona_dir, session_id)
-    return read_jsonl_skipping_corrupt(path)
+    # RAISE: compaction rewrites the buffer from this read and ingest advances its cursor on it, so a failed
+    # read must raise (as it always did), never look like an empty session.
+    return read_jsonl(_session_path(persona_dir, session_id), recover=Recovery.RAISE)
 
 
 def session_silence_minutes(turns: list[dict]) -> float:
@@ -315,22 +314,7 @@ def rewrite_session_atomic(persona_dir: Path, session_id: str, turns: list[dict]
     budget the error re-raises (the old buffer is intact) and the temp file is
     removed so a repeated collision cannot litter ``active_conversations``.
     """
-    path = _session_path(persona_dir, session_id)
-    tmp = path.with_suffix(".jsonl.tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        for rec in turns:
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        fh.flush()
-        os.fsync(fh.fileno())
-    for attempt in range(_UNLINK_RETRIES):
-        try:
-            os.replace(tmp, path)
-            return
-        except PermissionError:
-            if attempt == _UNLINK_RETRIES - 1:
-                tmp.unlink(missing_ok=True)
-                raise
-            time.sleep(_UNLINK_RETRY_SLEEP_S * (attempt + 1))
+    write_jsonl(_session_path(persona_dir, session_id), turns, fsync=True)
 
 
 # Archive rotation (1d). A single unbounded ``<sid>.jsonl`` grows without limit on
@@ -407,8 +391,7 @@ def append_archive(persona_dir: Path, session_id: str, records: list[dict]) -> i
         return 0
     _validate_session_id(session_id)
     d = _archived_conversations_dir(persona_dir)
-    payload = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records)
-    data = payload.encode("utf-8")
+    data = encode_jsonl(records)
 
     # Choose the active target: the highest existing segment, else a legacy single
     # file if one exists, else a fresh segment 000.
@@ -431,13 +414,10 @@ def append_archive(persona_dir: Path, session_id: str, records: list[dict]) -> i
             active_path = d / f"{session_id}.{next_num:03d}.jsonl"
             is_new_segment = True
 
-    with open(active_path, "a", encoding="utf-8") as fh:
-        fh.write(payload)
-        fh.flush()
-        os.fsync(fh.fileno())
+    written = append_jsonl(active_path, data, fsync=True)
     if is_new_segment:
         _fsync_dir(d)
-    return len(data)
+    return written
 
 
 def read_archive(persona_dir: Path, session_id: str) -> list[dict]:
@@ -446,7 +426,7 @@ def read_archive(persona_dir: Path, session_id: str) -> list[dict]:
     zero-length trailing segment left by a crash mid-roll)."""
     out: list[dict] = []
     for p in _archive_read_order(persona_dir, session_id):
-        out.extend(read_jsonl_skipping_corrupt(p))
+        out.extend(read_jsonl(p, recover=Recovery.RAISE))
     return out
 
 

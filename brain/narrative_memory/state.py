@@ -16,9 +16,8 @@ from pathlib import Path
 from typing import Any
 
 from brain.health.attempt_heal import save_with_backup
-from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
+from brain.health.json_io import Recovery, append_jsonl, iter_jsonl
 from brain.narrative_memory.arc import Arc, ArcMember
-from brain.utils.file_lock import file_lock
 
 # State + log filenames inside persona_dir
 STATE_FILENAME = "arcs_state.json"
@@ -129,15 +128,7 @@ def append_event(persona_dir: Path, event: dict[str, Any]) -> None:
     Mirrors the brain.growth.arc_storage.append_removed_arc precedent —
     file_lock for cross-process safety, fsync for durability.
     """
-    log_path = persona_dir / LOG_FILENAME
-    line = json.dumps(event) + "\n"
-    with file_lock(log_path):
-        with log_path.open("a", encoding="utf-8") as fp:
-            fp.write(line)
-            fp.flush()
-            import os
-
-            os.fsync(fp.fileno())
+    append_jsonl(persona_dir / LOG_FILENAME, event, fsync=True)
 
 
 def load_or_recover(persona_dir: Path) -> ArcsState:
@@ -186,7 +177,7 @@ def _log_newer_than_state(log_path: Path, state: ArcsState) -> bool:
         return True
     state_ts = state.last_pass_ts_iso
     newest_event_ts: str | None = None
-    for event in iter_jsonl_skipping_corrupt(log_path):
+    for event in iter_jsonl(log_path, recover=Recovery.RAISE):
         ts = event.get("ts_iso")
         if isinstance(ts, str) and (newest_event_ts is None or ts > newest_event_ts):
             newest_event_ts = ts
@@ -203,7 +194,7 @@ def _replay_from_log(log_path: Path) -> ArcsState:
     """
     state = ArcsState(replayed=True)
 
-    for event in iter_jsonl_skipping_corrupt(log_path):
+    for event in iter_jsonl(log_path, recover=Recovery.RAISE):
         kind = event.get("event")
         arc_id = event.get("arc_id")
         if kind == "arc_opened" and isinstance(arc_id, str):

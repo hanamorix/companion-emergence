@@ -26,12 +26,11 @@ dedup needs immediate DB visibility) bypass the gate and commit directly.
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
-from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+from brain.health.json_io import Recovery, append_jsonl, read_jsonl, write_jsonl
 from brain.memory.store import Memory, MemoryStore
 from brain.utils.file_lock import file_lock
 
@@ -84,24 +83,20 @@ class PendingQueue:
             "_source": source,
             "_enqueued_at": datetime.now(UTC).isoformat(),
         }
-        line = json.dumps(entry, ensure_ascii=False)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with file_lock(self.path):
-            with open(self.path, "a", encoding="utf-8") as fh:
-                fh.write(line + "\n")
+        append_jsonl(self.path, entry)
 
     def read_recent(self, memory_type: str, *, limit: int) -> list[Memory]:
         """Return up to `limit` most-recent candidates of `memory_type`.
 
         Lock-free read (tolerates a partial last line from a concurrent
-        append via ``read_jsonl_skipping_corrupt``). Newest first — entries
+        append via ``read_jsonl``). Newest first — entries
         are appended oldest→newest, so reversed order is most-recent-first.
         Used by interior-continuity (a DIFFERENT path from recall); returns
         ``Memory`` objects for interface parity with ``store.list_by_type``.
         """
-        if limit <= 0 or not self.path.exists():
+        if limit <= 0:
             return []
-        rows = read_jsonl_skipping_corrupt(self.path)
+        rows = read_jsonl(self.path, recover=Recovery.RAISE)
         out: list[Memory] = []
         for entry in reversed(rows):
             if entry.get("memory_type") != memory_type:
@@ -157,23 +152,17 @@ class PendingQueue:
         if not memory_ids:
             return 0
         now = datetime.now(UTC).isoformat()
-        lines = [
-            json.dumps(
-                {
-                    "_route": "reappraise_importance",
-                    "memory_id": memory_id,
-                    "_source": source,
-                    "_enqueued_at": now,
-                },
-                ensure_ascii=False,
-            )
+        items = [
+            {
+                "_route": "reappraise_importance",
+                "memory_id": memory_id,
+                "_source": source,
+                "_enqueued_at": now,
+            }
             for memory_id in memory_ids
         ]
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with file_lock(self.path):
-            with open(self.path, "a", encoding="utf-8") as fh:
-                fh.write("\n".join(lines) + "\n")
-        return len(lines)
+        append_jsonl(self.path, items)  # one write for the whole batch
+        return len(items)
 
     def drain(self) -> list[dict]:
         """Atomically take the whole queue: read all entries, then truncate.
@@ -188,9 +177,9 @@ class PendingQueue:
         if not self.path.exists():
             return []
         with file_lock(self.path):
-            rows = read_jsonl_skipping_corrupt(self.path)
-            # Truncate the data file in place (the lock sidecar is separate).
-            open(self.path, "w", encoding="utf-8").close()
+            # RAISE: the file is emptied right after this read, so a failed read must raise, not drain nothing.
+            rows = read_jsonl(self.path, recover=Recovery.RAISE)
+            write_jsonl(self.path, [], fsync=False)  # empty the data file (the lock sidecar is separate)
         return rows
 
 

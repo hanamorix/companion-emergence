@@ -25,7 +25,7 @@ from brain.engines.heartbeat import HeartbeatEngine
 from brain.engines.reflex import ReflexEngine
 from brain.engines.research import ResearchEngine
 from brain.health.alarm import compute_pending_alarms
-from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+from brain.health.json_io import Recovery, append_jsonl, iter_jsonl, read_jsonl
 from brain.health.walker import walk_persona
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
@@ -1170,7 +1170,7 @@ def _health_show_handler(args: argparse.Namespace) -> int:
 
     # Collect recent anomaly records from the audit log.
     recent_treatments: list[dict] = []
-    for entry in read_jsonl_skipping_corrupt(audit_path):
+    for entry in iter_jsonl(audit_path, recover=Recovery.RAISE):
         try:
             from brain.utils.time import parse_iso_utc
 
@@ -1288,15 +1288,11 @@ def _health_acknowledge_handler(args: argparse.Namespace) -> int:
         alarms = compute_pending_alarms(persona_dir)
         files_to_ack = [alarm.file for alarm in alarms]
 
-    import json
-
     entry = {
         "timestamp": iso_utc(datetime.now(UTC)),
         "user_acknowledged": files_to_ack,
     }
-    audit_path = persona_dir / "heartbeats.log.jsonl"
-    with audit_path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(entry) + "\n")
+    append_jsonl(persona_dir / "heartbeats.log.jsonl", entry)
 
     n = len(files_to_ack)
     if n == 0:
@@ -1377,10 +1373,8 @@ def _soul_candidates_handler(args: argparse.Namespace) -> int:
             f"No persona directory at {persona_dir}. Persona {args.persona!r} does not exist."
         )
 
-    from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
-
     candidates_path = persona_dir / "soul_candidates.jsonl"
-    records = read_jsonl_skipping_corrupt(candidates_path)
+    records = read_jsonl(candidates_path, recover=Recovery.RAISE)
     pending = [r for r in records if r.get("status", "auto_pending") == "auto_pending"]
 
     limit = getattr(args, "limit", None)
