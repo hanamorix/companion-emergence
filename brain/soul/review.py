@@ -179,21 +179,60 @@ def _build_messages(
 # ── JSON parsing ──────────────────────────────────────────────────────────────
 
 
-def _extract_json_block(text: str) -> str | None:
-    """Find the first {...} JSON block in text. Tolerant of preamble."""
-    start = text.find("{")
-    if start < 0:
-        return None
+def _balanced_block(text: str, start: int) -> str | None:
+    """The `{...}` block that opens at ``start``, counting braces OUTSIDE string literals only (#478), or None if it never closes."""
     depth = 0
+    in_string = False
+    escaped = False
     for i in range(start, len(text)):
         ch = text[i]
-        if ch == "{":
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
             depth += 1
         elif ch == "}":
             depth -= 1
             if depth == 0:
                 return text[start : i + 1]
     return None
+
+
+def _extract_json_block(text: str) -> str | None:
+    """Find the JSON object that is the model's answer in ``text``. Tolerant of preamble and of braces inside strings (#478).
+
+    Tries each ``{`` in turn with ``json.JSONDecoder().raw_decode``: the first object that carries a ``decision`` key wins, else the
+    first object that decodes at all. When no ``{`` starts a decodable object (a malformed reply) it falls back to the first
+    string-aware balanced block, so ``parse_decision`` can still report "json decode failed" rather than "no JSON block"; None
+    when no `{` starts a block that closes.
+    """
+    decoder = json.JSONDecoder()
+    first_object: str | None = None
+    first_balanced: str | None = None
+    start = text.find("{")
+    while start >= 0:
+        try:
+            obj, end = decoder.raw_decode(text, start)
+        except ValueError:
+            obj = None
+        else:
+            if isinstance(obj, dict):
+                block = text[start:end]
+                if "decision" in obj:
+                    return block
+                if first_object is None:
+                    first_object = block
+        if first_balanced is None:
+            first_balanced = _balanced_block(text, start)
+        start = text.find("{", start + 1)
+    return first_object if first_object is not None else first_balanced
 
 
 def parse_decision(raw: str, candidate_id: str) -> Decision:
