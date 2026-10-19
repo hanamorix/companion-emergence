@@ -29,8 +29,17 @@ describe("runCliShortcutStep: macOS is unchanged", () => {
     );
     expect(r).toEqual({
       trailer: "\n\n[cli] symlink reported exit 73 — Terminal access unavailable. Stderr:\nRefusing to overwrite",
-      notice: null,
+      notice: "symlink reported exit 73 — Terminal access unavailable. Stderr:\nRefusing to overwrite",
     });
+  });
+
+  // #413: macOS now refuses a user's own nell (exit 73). The install pane is gone after
+  // 1.2 s, so the explanation must also come back as the durable notice, as on Linux.
+  it("refusal keeps a durable notice", async () => {
+    const r = await runCliShortcutStep("macos", async () =>
+      result({ success: false, exit_code: 73, stderr: "Refusing to overwrite ~/.local/bin/nell" }),
+    );
+    expect(r.notice).toContain("Refusing to overwrite ~/.local/bin/nell");
   });
 
   it("thrown", async () => {

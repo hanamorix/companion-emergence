@@ -2,6 +2,7 @@
 guards the fetch so a relay rejection degrades cleanly (C-12b)."""
 from datetime import UTC, datetime
 
+import httpx
 import pytest
 
 from brain.kindled_link.relay_client import RelayClient, RelayUnavailableError
@@ -162,3 +163,90 @@ def test_a_transport_error_with_no_message_still_names_itself(monkeypatch):
     with pytest.raises(RelayUnavailableError) as info:
         rc.push({"env": 1})
     assert str(info.value) == "ConnectError"
+
+
+# #442: the relay is untrusted, so a 2xx reply with a bad body, or an httpx
+# error that is not a transport error, must also surface as
+# RelayUnavailableError (the only exception every caller catches).
+
+def _mock_client(handler):
+    http = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://relay.test")
+    return RelayClient(http, identity=_Idn(), mailbox_id="m")
+
+
+@pytest.mark.parametrize(
+    "challenge",
+    [
+        httpx.Response(200, text="<html>not json</html>"),
+        httpx.Response(200, json={"detail": "no nonce here"}),
+        httpx.Response(200, json=["nonce"]),
+        httpx.Response(200, json={"nonce": None}),
+        httpx.Response(200, json={"nonce": 5}),
+    ],
+    ids=["non-json", "missing-key", "not-an-object", "null-nonce", "non-str-nonce"],
+)
+def test_442_malformed_2xx_challenge_raises_relay_unavailable(challenge):
+    def handler(request):
+        if request.url.path == "/mailbox/challenge":
+            return challenge
+        return httpx.Response(200, json={"envelopes": []})  # only the challenge is bad
+
+    with pytest.raises(RelayUnavailableError, match="malformed reply"):
+        _mock_client(handler).fetch()
+
+
+@pytest.mark.parametrize(
+    "fetched",
+    [
+        httpx.Response(200, text="not json"),
+        httpx.Response(200, json={"nonce": "n"}),
+        httpx.Response(200, json=None),
+        httpx.Response(200, json={"envelopes": None}),
+        httpx.Response(200, json={"envelopes": {"id": "e1"}}),
+    ],
+    ids=["non-json", "missing-key", "null-body", "null-envelopes", "non-list-envelopes"],
+)
+def test_442_malformed_2xx_fetch_raises_relay_unavailable(fetched):
+    def handler(request):
+        if request.url.path == "/mailbox/challenge":
+            return httpx.Response(200, json={"nonce": "n"})
+        return fetched
+
+    with pytest.raises(RelayUnavailableError, match="malformed reply"):
+        _mock_client(handler).fetch()
+
+
+@pytest.mark.parametrize("exc_type", [httpx.DecodingError, httpx.TooManyRedirects])
+def test_442_non_transport_request_error_raises_relay_unavailable(exc_type, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("brain.kindled_link.relay_client.time.sleep", sleeps.append)
+
+    def handler(request):
+        raise exc_type("boom", request=request)
+
+    with pytest.raises(RelayUnavailableError):
+        _mock_client(handler).push({"relay_mailbox": "m"})
+    assert sleeps == [], "a non-transport error is not transient, so it is not retried"
+
+
+@pytest.mark.parametrize("envelopes", [None, {"id": "e1"}, "e1"], ids=["null", "object", "string"])
+def test_442_poll_and_ingest_degrades_on_a_malformed_200_fetch(tmp_path, envelopes):
+    """#442 through the real path: a relay that answers the fetch with 200 and a
+    non-list `envelopes` must give the degraded relay_error summary, not a TypeError
+    from `len(fetched)` that ends the tick (review on PR #469)."""
+    from brain.kindled_link.identity import KindledIdentity
+    from brain.kindled_link.store import KindledLinkStore
+    from brain.kindled_link.transport import poll_and_ingest
+
+    def handler(request):
+        if request.url.path == "/mailbox/challenge":
+            return httpx.Response(200, json={"nonce": "n"})
+        return httpx.Response(200, json={"envelopes": envelopes})
+
+    idn = KindledIdentity.load_or_create(tmp_path)
+    http = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://relay.test")
+    out = poll_and_ingest(
+        KindledLinkStore(tmp_path / "k.db"), idn, RelayClient(http, identity=idn, mailbox_id="m"),
+        now=datetime(2026, 10, 19, 12, 0, tzinfo=UTC),
+    )
+    assert out == {"accepted": {}, "degraded": [], "relay_error": True}
