@@ -1,6 +1,9 @@
 """Rotation primitives for JSONL audit logs.
 
-Two strategies, each a pure function over a single log path:
+Four policies, each a function over a single log path. Every one of them runs under
+``file_lock(log_path)``, the lock every appender of these logs takes (``append_jsonl``), so a row
+appended while a rotation runs waits for it instead of being truncated or rewritten away (#476).
+The size is re-checked under the lock, since a peer may have rotated while this one waited:
 
 * :func:`rotate_rolling_size` — size-capped rolling archive. The active
   log is renamed once it crosses ``max_bytes``, gzipped to ``.1.gz``,
@@ -14,7 +17,11 @@ Two strategies, each a pure function over a single log path:
   the current year stays in active. Archives are kept forever — the
   soul-audit case where every decision must remain reachable.
 
-Both functions:
+* :func:`rotate_single_backup` — size-capped, one ``.1`` backup (the MCP tool audit log).
+
+* :func:`trim_jsonl_by_age` — drops rows older than a cutoff (the chat tick log).
+
+The rolling-size and yearly functions:
 
 * Are no-ops when the log file doesn't exist (idempotent fresh-install).
 * Open files via streaming iteration so memory stays bounded regardless
@@ -31,12 +38,33 @@ from __future__ import annotations
 import gzip
 import logging
 import shutil
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 
+from brain.health.attempt_heal import _replace_with_retry
 from brain.health.json_io import Recovery, iter_jsonl_raw, write_jsonl
+from brain.utils.file_lock import file_lock
+from brain.utils.time import lenient_utc
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _append_lock(log_path: Path) -> Iterator[None]:
+    """Hold the appenders' lock for ``log_path``; a filesystem that refuses the lock degrades to unlocked.
+
+    Skipping rotation because the lock call raised (some network mounts) would let the log grow
+    without bound, and the worst case without the lock is the pre-#357 race, so proceed with a
+    warning, as ``append_jsonl`` does.
+    """
+    with ExitStack() as held:
+        try:
+            held.enter_context(file_lock(log_path))
+        except OSError as exc:
+            logger.warning("log lock unavailable for %s, rotating without a lock: %s", log_path.name, exc)
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -48,6 +76,8 @@ def rotate_rolling_size(
     log_path: Path,
     max_bytes: int,
     archive_keep: int,
+    *,
+    lock_held: bool = False,
 ) -> Path | None:
     """Rotate ``log_path`` to a gzipped archive if it exceeds ``max_bytes``.
 
@@ -64,15 +94,31 @@ def rotate_rolling_size(
     4. Truncate the active log to zero bytes (writers reopen per
        append, so this is safe).
 
+    ``lock_held=True`` is for a caller that already holds ``file_lock(log_path)`` for its own
+    rotate-then-append step (``parse_failures``): the lock is not reentrant, so taking it again
+    would block forever. The default takes the lock itself.
+
     If step 3 fails mid-way, the active log is left untouched and the
     exception propagates. Better to fail the rotation than to lose
     audit data — the next tick will retry.
     """
-    if not log_path.exists():
+    if not _over(log_path, max_bytes):
         return None
-    if log_path.stat().st_size < max_bytes:
-        return None
+    with nullcontext() if lock_held else _append_lock(log_path):
+        # A peer rotator, or the same tick on another process, may have rotated while this one waited.
+        if not _over(log_path, max_bytes):
+            return None
+        return _rotate_rolling_locked(log_path, archive_keep)
 
+
+def _over(log_path: Path, max_bytes: int) -> bool:
+    try:
+        return log_path.stat().st_size >= max_bytes
+    except FileNotFoundError:
+        return False
+
+
+def _rotate_rolling_locked(log_path: Path, archive_keep: int) -> Path:
     # 1. Shift existing archives up. Iterate from oldest to newest so
     #    we never overwrite a slot before it's been moved.
     for i in range(archive_keep, 0, -1):
@@ -98,12 +144,11 @@ def rotate_rolling_size(
         tmp_archive.unlink(missing_ok=True)
         raise
 
-    # 3. Truncate the active log. Writers reopen per append so this is safe.
+    # 3. Truncate the active log. Appenders wait on the lock held here, so nothing is truncated away.
+    rotated_bytes = log_path.stat().st_size  # before the truncation: the size that went into the archive
     log_path.write_bytes(b"")
 
-    logger.info(
-        "rotated %s (%d bytes) -> %s", log_path.name, log_path.stat().st_size, new_archive.name
-    )
+    logger.info("rotated %s (%d bytes) -> %s", log_path.name, rotated_bytes, new_archive.name)
     return new_archive
 
 
@@ -146,6 +191,13 @@ def rotate_age_archive_yearly(
         return []
 
     now = now or datetime.now(UTC)
+    # Read, archive and rewrite under the appenders' lock: a row appended between the read and
+    # the rewrite would otherwise be replaced away (#476).
+    with _append_lock(log_path):
+        return _rotate_yearly_locked(log_path, now, timestamp_field)
+
+
+def _rotate_yearly_locked(log_path: Path, now: datetime, timestamp_field: str) -> list[Path]:
     current_year = now.year
 
     # Bucket entries by year. We read the whole file once into year buckets;
@@ -163,19 +215,11 @@ def rotate_age_archive_yearly(
     if not cold_years:
         return []
 
-    # Write each cold-year archive atomically (tmp + rename).
+    # Write each cold-year archive atomically; one that already exists is merged into, never replaced.
     new_archives: list[Path] = []
     for year in cold_years:
         archive_path = log_path.parent / f"{log_path.stem}.{year}{log_path.suffix}.gz"
-        tmp_path = archive_path.with_suffix(archive_path.suffix + ".tmp")
-        try:
-            with gzip.open(tmp_path, "wt", encoding="utf-8") as gz:  # json-io: ok -- raw-line gz archive: lines pass through unchanged, json_io has no gz writer
-                for raw in by_year[year]:
-                    gz.write(raw + "\n")
-            tmp_path.rename(archive_path)
-        except Exception:
-            tmp_path.unlink(missing_ok=True)
-            raise
+        _merge_into_year_archive(archive_path, by_year[year])
         new_archives.append(archive_path)
 
     # Rewrite the active log with only current-year (+ future, defensive)
@@ -192,6 +236,96 @@ def rotate_age_archive_yearly(
         len(new_archives),
     )
     return new_archives
+
+
+def _merge_into_year_archive(archive_path: Path, new_lines: list[str]) -> None:
+    """Add ``new_lines`` to the year archive, keeping every row already in it.
+
+    The archive is kept forever, so an existing one is read (its lines verbatim), the new lines are
+    appended, and the whole is written to a temp file and put in place with a retried replace. A
+    failure at any step removes the temp and leaves the existing archive as it was.
+    """
+    existing: list[str] = []
+    if archive_path.exists():
+        with gzip.open(archive_path, "rt", encoding="utf-8") as gz:  # json-io: ok -- raw-line gz archive: existing lines pass through unchanged, json_io has no gz reader that keeps damaged lines
+            existing = [line.rstrip("\n") for line in gz if line.strip()]
+    tmp_path = archive_path.with_suffix(archive_path.suffix + ".tmp")
+    try:
+        with gzip.open(tmp_path, "wt", encoding="utf-8") as gz:  # json-io: ok -- raw-line gz archive: lines pass through unchanged, json_io has no gz writer
+            for raw in (*existing, *new_lines):
+                gz.write(raw + "\n")
+        _replace_with_retry(tmp_path, archive_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Single-backup rotation (size-capped, one .1 backup)
+# ---------------------------------------------------------------------------
+
+
+def rotate_single_backup(log_path: Path, max_bytes: int) -> None:
+    """Move ``log_path`` to ``<name>.1`` (replacing any older backup) once it exceeds ``max_bytes``.
+
+    Every appender may run this, so the check-then-rename is serialised on the appenders' lock and
+    re-checked under it (#357): a writer that saw an oversize log must not rename the fresh one a
+    concurrent rotator left behind over ``.1``. The size check first runs unlocked so the common
+    no-rotation append takes no lock. Raises OSError if the rename fails.
+    """
+    if not _exceeds(log_path, max_bytes):
+        return
+    with _append_lock(log_path):
+        if _exceeds(log_path, max_bytes):
+            # replace() overwrites an existing .1 atomically on every OS.
+            log_path.replace(log_path.with_name(f"{log_path.name}.1"))
+
+
+def _exceeds(log_path: Path, max_bytes: int) -> bool:
+    try:
+        return log_path.stat().st_size > max_bytes
+    except FileNotFoundError:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Age trim
+# ---------------------------------------------------------------------------
+
+
+def trim_jsonl_by_age(
+    log_path: Path,
+    cutoff: datetime,
+    *,
+    timestamp_field: str = "ts",
+    keep_undated: bool = False,
+) -> int:
+    """Drop the rows of ``log_path`` older than ``cutoff``; return how many were dropped.
+
+    The file is read again under the appenders' lock, so a row appended since the caller last read
+    it is kept, and the rest is written back with the lines exactly as read. A row whose timestamp
+    is missing or unreadable is dropped unless ``keep_undated`` (a naive timestamp is read as UTC).
+    Nothing is rewritten when nothing is dropped. Raises OSError on a failed read or write, leaving
+    the log as it was.
+    """
+    if not log_path.exists():
+        return 0
+    with _append_lock(log_path):
+        kept: list[str] = []
+        dropped = 0
+        for line, entry in iter_jsonl_raw(log_path, recover=Recovery.RAISE):
+            when = _entry_time(entry, timestamp_field)
+            if (when is None and keep_undated) or (when is not None and when >= cutoff):
+                kept.append(line)
+            else:
+                dropped += 1
+        if dropped:
+            write_jsonl(log_path, "".join(line + "\n" for line in kept).encode("utf-8"), fsync=False)
+        return dropped
+
+
+def _entry_time(entry: dict | None, field: str) -> datetime | None:
+    return lenient_utc(entry.get(field)) if entry else None
 
 
 def _entry_year(entry: dict, field: str, fallback: int) -> int:

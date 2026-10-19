@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 
+from brain.health import log_rotation
 from brain.mcp_server import audit
 from brain.mcp_server.audit import log_invocation
 
@@ -222,7 +223,7 @@ def test_rotation_rechecks_size_after_taking_the_lock(
     backup = log_path.with_name(log_path.name + ".1")
     old_rows = "old-row-" + "x" * 200 + "\n"
     log_path.write_text(old_rows, encoding="utf-8")
-    real_file_lock = audit.file_lock
+    real_file_lock = log_rotation.file_lock
 
     @contextmanager
     def lock_taken_after_peer_rotated(path: Path, **kwargs: Any) -> Iterator[bool]:
@@ -231,7 +232,7 @@ def test_rotation_rechecks_size_after_taking_the_lock(
             path.write_text("new-row\n", encoding="utf-8")
             yield acquired
 
-    monkeypatch.setattr(audit, "file_lock", lock_taken_after_peer_rotated)
+    monkeypatch.setattr(log_rotation, "file_lock", lock_taken_after_peer_rotated)
 
     audit._rotate_if_needed(log_path)
 
@@ -259,9 +260,9 @@ def test_rotation_still_happens_when_the_lock_is_unavailable(
         raise OSError(37, "No locks available")
         yield True  # pragma: no cover - makes this a generator
 
-    monkeypatch.setattr(audit, "file_lock", unavailable)
+    monkeypatch.setattr(log_rotation, "file_lock", unavailable)
 
-    with caplog.at_level(logging.WARNING, logger=audit.logger.name):
+    with caplog.at_level(logging.WARNING, logger=log_rotation.logger.name):
         audit._rotate_if_needed(log_path)
 
     assert backup.read_text(encoding="utf-8") == old_rows

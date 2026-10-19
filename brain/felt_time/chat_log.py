@@ -10,8 +10,8 @@ import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from brain.health.attempt_heal import save_with_backup_text
 from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
+from brain.health.log_rotation import trim_jsonl_by_age
 from brain.utils.file_lock import file_lock
 
 log = logging.getLogger(__name__)
@@ -70,7 +70,7 @@ def load_recent_samples(
 
     kept = _trim_old_entries(all_entries, cutoff=retain_cutoff)
     if len(all_entries) - len(kept) > 10:
-        kept = _rewrite_log(log_path, retain_cutoff) or kept
+        kept = _trim_log(log_path, retain_cutoff) or kept
 
     window = sorted(
         [(e["ts"], e["turns"]) for e in kept if e["ts"] >= window_cutoff],
@@ -120,21 +120,16 @@ def _read_entries(log_path: Path) -> list[dict]:
     return entries
 
 
-def _rewrite_log(log_path: Path, cutoff: datetime) -> list[dict] | None:
-    """Trim the log to rows at or after ``cutoff`` (lazy GC); return the kept rows, None on failure.
+def _trim_log(log_path: Path, cutoff: datetime) -> list[dict] | None:
+    """Trim the log to rows at or after ``cutoff`` (lazy GC); return the rows now in it, None on failure.
 
-    Under the log's lock the file is read again and rewritten through the shared atomic text
-    writer (unique temp, retried replace, fsync), so a row appended since the caller's read is
-    kept, and a transient Windows PermissionError is retried (#477).
+    The shared age trim (``brain.health.log_rotation``, #476) reads the file again under the
+    appenders' lock and rewrites it through the shared atomic writer, so a row appended since the
+    caller's read is kept and a transient Windows PermissionError is retried (#477).
     """
     try:
-        with file_lock(log_path):
-            kept = _trim_old_entries(_read_entries(log_path), cutoff=cutoff)
-            text = "".join(
-                json.dumps({"ts": e["ts"].isoformat(), "turns": int(e["turns"])}) + "\n" for e in kept
-            )
-            save_with_backup_text(log_path, text, keep_backups=False)
-            return kept
+        trim_jsonl_by_age(log_path, cutoff, timestamp_field="ts")
+        return _read_entries(log_path)
     except OSError:
         log.debug("chat_log: rewrite failed", exc_info=True)
         return None

@@ -14,7 +14,7 @@ brain/engines/interest_sweep.py::not-file-io::1   # not-file: model-reply
 brain/engines/research.py::not-file-io::3   # not-file: model-reply
 brain/felt_time/anchors.py::legacy:iter_jsonl_skipping_corrupt::1   # held: felt-time audit first (Roy 2026-10-14)
 brain/felt_time/chat_log.py::legacy:iter_jsonl_skipping_corrupt::1   # held: felt-time audit first (Roy 2026-10-14)
-brain/felt_time/chat_log.py::write::2   # held: felt-time audit first (Roy 2026-10-14)
+brain/felt_time/chat_log.py::write::1   # held: felt-time audit first (Roy 2026-10-14)
 brain/felt_time/state.py::legacy:iter_jsonl_skipping_corrupt::1   # held: felt-time audit first (Roy 2026-10-14)
 brain/felt_time/state.py::legacy:save_with_backup::1   # held: felt-time audit first (Roy 2026-10-14)
 brain/felt_time/state.py::read::1   # held: felt-time audit first (Roy 2026-10-14)
