@@ -341,9 +341,23 @@ def _load_config(persona_dir: Any, strict: bool = False) -> Any:
         return None
 
 
+def derived_tier_model(cfg: Any, tier: str) -> str | None:
+    """The id derived for this tier from the chat model, or None.
+
+    The ONE rule for "the id derived for this tier", shared by `_resolve`, `candidate_tier_models` and `tier_fallbacks` so they cannot
+    drift (#486): only a persona on the default provider derives tier ids (another provider ignores the model setting), and only a
+    routed tier with a model family has one.
+    """
+    from brain.persona_config import DEFAULT_PROVIDER
+
+    if cfg is None or cfg.provider != DEFAULT_PROVIDER:
+        return None
+    family = tier_family(model_for_tier(tier))
+    return derive_model(cfg.model, family) if family else None
+
+
 def _resolve(cfg: Any, tier: str) -> tuple[str, str]:
     from brain.bridge import model_error
-    from brain.persona_config import DEFAULT_PROVIDER
 
     default = model_for_tier(tier)
     if cfg is None or tier not in ROUTED_CLAUDE_TIERS:
@@ -352,8 +366,7 @@ def _resolve(cfg: Any, tier: str) -> tuple[str, str]:
     if override:
         model_error.activate([override])
         return override, "override"
-    family = tier_family(default)
-    derived = derive_model(cfg.model, family) if family and cfg.provider == DEFAULT_PROVIDER else None
+    derived = derived_tier_model(cfg, tier)
     if derived is None:
         return default, "default"
     model_error.activate([derived, default])  # an id in use again must never stay ignored
@@ -384,8 +397,7 @@ def candidate_tier_models(cfg: Any) -> set[str]:
         if override:
             out.add(override)
             continue
-        family = tier_family(default)
-        derived = derive_model(cfg.model, family) if cfg is not None and family else None
+        derived = derived_tier_model(cfg, tier)
         if derived:
             out.add(derived)
     return out
@@ -422,7 +434,7 @@ def tier_fallbacks(cfg: Any) -> list[dict[str, str]]:
             continue
         default = model_for_tier(tier)
         family = tier_family(default)
-        wanted = derive_model(cfg.model, family) if family else None
+        wanted = derived_tier_model(cfg, tier)
         if wanted is None or wanted == cfg.model or wanted not in gone:
             continue
         entry = {"family": family or "", "wanted": wanted, "using": default}
