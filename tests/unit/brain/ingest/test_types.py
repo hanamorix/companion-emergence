@@ -25,6 +25,15 @@ def test_normalize_drops_non_finite_emotion_strength(raw, caplog) -> None:
     assert "joy" in caplog.text
 
 
+def test_normalize_names_its_source_when_it_drops_a_strength(caplog) -> None:
+    """#466 asked for the rejection to be logged with its source (review on PR #469)."""
+    item = ExtractedItem(text="x", emotions={"joy": float("nan")})
+    with caplog.at_level(logging.WARNING, logger="brain.ingest.types"):
+        item.normalize(source="session=s-123")
+
+    assert "session=s-123" in caplog.text
+
+
 @pytest.mark.parametrize("raw", [float("nan"), float("inf"), float("-inf")], ids=repr)
 def test_create_new_drops_non_finite_emotion_and_keeps_score_finite(raw, caplog) -> None:
     """#466: create_new sums emotions into the score, so one non-finite strength made

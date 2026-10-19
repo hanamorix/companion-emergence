@@ -36,12 +36,17 @@ class ExtractedItem:
     importance: int = 5
     emotions: dict[str, float] = field(default_factory=dict)
 
-    def normalize(self, valid_emotions: set[str] | None = None) -> ExtractedItem:
+    def normalize(
+        self, valid_emotions: set[str] | None = None, *, source: str = ""
+    ) -> ExtractedItem:
         """Coerce label, clamp importance, strip text whitespace, filter emotions.
 
         valid_emotions:
             When provided, emotion names not in this set are dropped.
             Values are coerced to float, clamped to (0, 10]; <= 0 and non-finite dropped.
+        source:
+            Where the item came from (e.g. ``session=<id>``), named in the warning
+            when a non-finite strength is dropped.
 
         Returns self so callers can chain: item.normalize().
         """
@@ -64,7 +69,8 @@ class ExtractedItem:
             if not math.isfinite(value):
                 # NaN slips past `<= 0.0` and +inf would clamp to 10.0 (#466).
                 logger.warning(
-                    "ingest: dropped non-finite emotion strength %s=%r", name, raw_value
+                    "ingest: dropped non-finite emotion strength %s=%r (%s)",
+                    name, raw_value, source or "unknown source",
                 )
                 continue
             if value <= 0.0:
