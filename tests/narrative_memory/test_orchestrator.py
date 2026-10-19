@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pytest
 
 from brain.narrative_memory import run_pass
 from brain.narrative_memory.state import (
@@ -382,3 +384,67 @@ def test_orchestrator_auto_closes_arc_with_all_members_lost(tmp_path: Path):
     log_lines = (tmp_path / LOG_FILENAME).read_text().splitlines()
     closes = [json.loads(line) for line in log_lines if json.loads(line)["event"] == "arc_closed"]
     assert any(e["arc_id"] == "arc_empty" and e["reason"] == "all_members_lost" for e in closes)
+
+
+# A non-finite lived age (from the held felt-time state) is unknown, like a missing one: the arc-state save is strict
+# and used to raise on any tick that stamped it (a member joining, an arc closing with no members).
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")], ids=["nan", "inf", "-inf"])
+def test_orchestrator_member_join_with_a_non_finite_lived_age_saves_and_warns(tmp_path: Path, caplog, bad):
+    anchors = [
+        FakeAnchor("dream", "dream_1", "the boat one", "2026-05-19T10:00:00+00:00", 412.0, ("mem_seed",))
+    ]
+    candidate = FakeMemory(id="mem_c", created_at_iso="2026-05-19T10:30:00+00:00")
+    with caplog.at_level(logging.WARNING, logger="brain.narrative_memory"):
+        run_pass(
+            tmp_path,
+            event_bus=_StubEventBus(),
+            anchor_sweep=_stub_anchor_sweep(anchors),
+            candidate_pool=_stub_candidate_pool([candidate]),
+            salience_score=_stub_salience(0.6),
+            is_exempt=_stub_is_exempt_none,
+            hebbian=_StubHebbian(weights={("mem_c", "mem_seed"): 3.0}),
+            embeddings=_StubEmbeddings(),
+            felt_time_state=FakeFeltTimeState(lived_age_hours=bad),
+        )
+    arc = next(iter(load_or_recover(tmp_path).open.values()))
+    joined = next(m for m in arc.members if m.memory_id == "mem_c")
+    assert joined.lived_age_at_join == 0.0  # the same value a missing age gets
+    assert sum("lived age" in r.getMessage() and "not finite" in r.getMessage() for r in caplog.records) == 1
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")], ids=["nan", "inf", "-inf"])
+def test_orchestrator_no_member_close_with_a_non_finite_lived_age_saves_and_warns(tmp_path: Path, caplog, bad):
+    from brain.narrative_memory.arc import Arc
+
+    save_state(
+        tmp_path,
+        ArcsState(
+            open={
+                "arc_empty": Arc(
+                    id="arc_empty", state="open", seed_anchor_type="dream", seed_anchor_ref="dream_1",
+                    seed_memory_ids=("mem_seed",), title="empty arc", opened_at_iso="2026-05-19T10:00:00+00:00",
+                    lived_age_at_open=412.0, last_extended_at_iso="2026-05-19T11:00:00+00:00", closed_at_iso=None,
+                    lived_age_at_close=None, members=(),
+                )
+            },
+            last_pass_ts_iso="2026-05-19T11:00:00+00:00",
+        ),
+    )
+    with caplog.at_level(logging.WARNING, logger="brain.narrative_memory"):
+        run_pass(
+            tmp_path,
+            event_bus=_StubEventBus(),
+            anchor_sweep=_stub_anchor_sweep([]),
+            candidate_pool=_stub_candidate_pool([]),
+            salience_score=_stub_salience(),
+            is_exempt=_stub_is_exempt_none,
+            hebbian=_StubHebbian(),
+            embeddings=_StubEmbeddings(),
+            felt_time_state=FakeFeltTimeState(lived_age_hours=bad),
+        )
+    state = load_or_recover(tmp_path)
+    (closed,) = [a for a in state.recently_closed if a.id == "arc_empty"]
+    assert closed.lived_age_at_close is None  # unknown, as for a missing felt-time state
+    (event,) = [e for e in _read_arc_events(tmp_path) if e["event"] == "arc_closed"]
+    assert event["lived_age_hours"] == 0.0 and event["reason"] == "all_members_lost"
+    assert sum("lived age" in r.getMessage() and "not finite" in r.getMessage() for r in caplog.records) == 1

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import time
 import uuid
 from collections.abc import Callable
@@ -98,6 +99,11 @@ def run_pass(
 
     counts: dict[str, int] = {"opened": 0, "extended": 0, "closed": 0, "evicted": 0}
     lived_age_now = getattr(felt_time_state, "lived_age_hours", None)
+    if isinstance(lived_age_now, float) and not math.isfinite(lived_age_now):
+        # A NaN/Infinity lived age (from the felt-time state, which is not ours to change) is unknown, exactly like
+        # a missing one: every use below already handles None, and the strict state save would raise on it.
+        _LOG.warning("narrative_memory: felt-time lived age is not finite (%r); treating it as unknown", lived_age_now)
+        lived_age_now = None
     centroid_cache: dict[str, np.ndarray | None] = {}
     # Arcs opened or extended in THIS pass — staleness check skips them
     # so a freshly-touched arc can't close in the same tick.
