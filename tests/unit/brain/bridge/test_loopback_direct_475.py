@@ -1,0 +1,289 @@
+"""#475: every loopback call to the persona's own bridge goes DIRECT, never through an HTTP proxy.
+
+`urllib.request.urlopen` (and httpx, and a websockets client) honour HTTP_PROXY / HTTPS_PROXY / ALL_PROXY. On a machine with a proxy
+configured, the `nell` commands that talk to the persona's bridge on 127.0.0.1 therefore sent their requests, bearer token
+included, to the proxy instead of straight to the bridge. These tests stand up a REAL fake bridge and a REAL fake proxy on
+loopback, set every proxy environment variable to the fake proxy, and assert the call reaches the bridge with its token while the
+proxy sees no connection at all. A final scan keeps a new loopback call from being added the old way.
+
+Synthetic data only.
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+import socket
+import socketserver
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+TOKEN = "secret-token-475"
+_PROXY_VARS = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "WS_PROXY", "ws_proxy"]
+_BRIDGE_ANSWERS = {
+    "/kindled-link/identity/rotate": {"new_key_id": "k2", "fingerprint_phrase": "red wolf"},
+    "/kindled-link/my-code": {"code": "CODE-123", "fingerprint_phrase": "blue heron"},
+    "/kindled-link/connect": {"peer_id": "peer-1", "consent_state": "pending", "relay_url": "https://relay.example"},
+    "/kindled-link/self-test": {"ok": True, "stages": [{"name": "relay", "ok": True}], "relay_url": "https://relay.example"},
+    "/supervisor/shutdown": {"ok": True},
+    "/tools/search_memories": {"memories": [{"id": "m1"}], "mode": "lexical"},
+}
+
+
+class _Proxy(socketserver.ThreadingTCPServer):
+    """Counts every TCP connection it receives; answers 502."""
+
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self):
+        self.connections = 0
+        self.lock = threading.Lock()
+        super().__init__(("127.0.0.1", 0), _ProxyHandler)
+
+
+class _ProxyHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        with self.server.lock:
+            self.server.connections += 1
+        try:
+            self.request.recv(65536)
+            self.request.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        except OSError:
+            pass
+
+
+class _Bridge(HTTPServer):
+    def __init__(self, status: int = 200):
+        self.status = status
+        self.seen: list[dict] = []
+        super().__init__(("127.0.0.1", 0), _BridgeHandler)
+
+
+class _BridgeHandler(BaseHTTPRequestHandler):
+    def _answer(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b""
+        self.server.seen.append(
+            {"method": self.command, "path": self.path, "auth": self.headers.get("Authorization"), "body": body}
+        )
+        status = self.server.status
+        payload = _BRIDGE_ANSWERS.get(self.path, {}) if status < 400 else {"detail": "bridge says no"}
+        raw = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    do_GET = do_POST = _answer  # noqa: N815 — http.server's required method names
+
+    def log_message(self, *args):  # silence
+        pass
+
+
+def _serve(server):
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return t
+
+
+@pytest.fixture
+def world(monkeypatch, tmp_path):
+    """A fake bridge, a fake proxy, and every proxy variable pointing at the proxy."""
+    proxy, bridge = _Proxy(), _Bridge()
+    _serve(proxy)
+    _serve(bridge)
+    for var in _PROXY_VARS:
+        monkeypatch.setenv(var, f"http://127.0.0.1:{proxy.server_address[1]}")
+    for var in ("NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
+    state = SimpleNamespace(port=bridge.server_address[1], auth_token=TOKEN, pid=1)
+    yield SimpleNamespace(proxy=proxy, bridge=bridge, state=state, tmp=tmp_path)
+    proxy.shutdown()
+    bridge.shutdown()
+    proxy.server_close()
+    bridge.server_close()
+
+
+def _closed_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _cli(monkeypatch, state):
+    import brain.cli as cli
+
+    monkeypatch.setattr(cli.state_file, "read", lambda persona_dir: state)
+    return cli
+
+
+_ARGS = {
+    "_kindled_rotate_handler": {"persona": "canary"},
+    "_kindled_my_code_handler": {"persona": "canary"},
+    "_kindled_connect_handler": {"persona": "canary", "code": "CODE-XYZ"},
+    "_kindled_self_test_handler": {"persona": "canary"},
+}
+_PATHS = {
+    "_kindled_rotate_handler": "/kindled-link/identity/rotate",
+    "_kindled_my_code_handler": "/kindled-link/my-code",
+    "_kindled_connect_handler": "/kindled-link/connect",
+    "_kindled_self_test_handler": "/kindled-link/self-test",
+}
+
+
+@pytest.mark.parametrize("handler", sorted(_ARGS))
+def test_each_kindled_command_reaches_the_bridge_directly_with_its_token(world, monkeypatch, capsys, handler):
+    cli = _cli(monkeypatch, world.state)
+
+    rc = getattr(cli, handler)(SimpleNamespace(**_ARGS[handler]))
+
+    assert rc == 0, capsys.readouterr()
+    assert world.proxy.connections == 0  # the proxy was never contacted
+    assert [(s["path"], s["auth"]) for s in world.bridge.seen] == [(_PATHS[handler], f"Bearer {TOKEN}")]
+
+
+def test_the_connect_command_still_sends_its_code_as_json(world, monkeypatch, capsys):
+    cli = _cli(monkeypatch, world.state)
+
+    cli._kindled_connect_handler(SimpleNamespace(persona="canary", code="CODE-XYZ"))
+
+    assert json.loads(world.bridge.seen[0]["body"]) == {"code": "CODE-XYZ"}
+
+
+def test_the_output_of_the_kindled_commands_is_unchanged(world, monkeypatch, capsys):
+    cli = _cli(monkeypatch, world.state)
+
+    cli._kindled_rotate_handler(SimpleNamespace(persona="canary"))
+    cli._kindled_my_code_handler(SimpleNamespace(persona="canary"))
+
+    out = capsys.readouterr().out
+    assert "Key rotated. New key ID: k2" in out and "New fingerprint phrase: red wolf" in out
+    assert "CODE-123" in out and "Fingerprint (optional cross-check): blue heron" in out
+
+
+def test_a_bridge_error_status_is_reported_as_before(world, monkeypatch, capsys):
+    world.bridge.status = 500
+    cli = _cli(monkeypatch, world.state)
+
+    rc = cli._kindled_my_code_handler(SimpleNamespace(persona="canary"))
+
+    err = capsys.readouterr().err
+    assert rc == 1 and "error: bridge returned 500:" in err and "bridge says no" in err
+    assert world.proxy.connections == 0
+
+
+def test_an_unreachable_bridge_is_reported_as_before(world, monkeypatch, capsys):
+    state = SimpleNamespace(port=_closed_port(), auth_token=TOKEN, pid=1)
+    cli = _cli(monkeypatch, state)
+
+    rc = cli._kindled_my_code_handler(SimpleNamespace(persona="canary"))
+
+    assert rc == 1 and "error: could not reach bridge:" in capsys.readouterr().err
+    assert world.proxy.connections == 0
+
+
+def test_the_daemon_shutdown_request_goes_direct(world):
+    from brain.bridge import daemon
+
+    daemon._request_shutdown_via_http(world.state)
+
+    assert world.proxy.connections == 0
+    assert [(s["path"], s["auth"]) for s in world.bridge.seen] == [("/supervisor/shutdown", f"Bearer {TOKEN}")]
+
+
+def test_the_mcp_search_call_goes_direct(world, monkeypatch):
+    import brain.mcp_server.tools as tools
+
+    monkeypatch.setattr(tools.state_file, "read", lambda persona_dir: world.state)
+
+    result = tools._search_via_bridge(world.tmp, {"query": "x", "limit": 3})
+
+    assert result == {"memories": [{"id": "m1"}], "mode": "lexical"}
+    assert world.proxy.connections == 0
+    assert world.bridge.seen[0]["auth"] == f"Bearer {TOKEN}"
+
+
+def test_the_direct_helper_never_reads_proxy_variables(world):
+    from brain.bridge.loopback import direct_request
+
+    status, body = direct_request(
+        "GET", f"http://127.0.0.1:{world.state.port}/kindled-link/my-code", headers={"Authorization": f"Bearer {TOKEN}"}
+    )
+
+    assert status == 200 and json.loads(body)["code"] == "CODE-123" and world.proxy.connections == 0
+
+
+def test_the_direct_websocket_connect_never_uses_a_proxy(world):
+    from brain.bridge.loopback import direct_ws_connect
+    from websockets.sync.server import serve
+
+    def echo(ws):
+        ws.send("hello " + ws.recv())
+
+    with serve(echo, "127.0.0.1", 0) as server:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        port = server.socket.getsockname()[1]
+        with direct_ws_connect(f"ws://127.0.0.1:{port}/events") as ws:
+            ws.send("canary")
+            assert ws.recv() == "hello canary"
+        server.shutdown()
+
+    assert world.proxy.connections == 0
+
+
+# ---------------------------------------------------------------------------
+# A scan, so a new loopback call cannot be added the old way
+# ---------------------------------------------------------------------------
+
+_BRAIN = Path(__file__).resolve().parents[4] / "brain"
+_HTTPX_VERBS = {"get", "post", "put", "patch", "delete", "head", "request", "stream"}
+# provider.py talks to an Ollama host the user configures (possibly remote, possibly behind a proxy on purpose).
+_NOT_LOOPBACK = {"bridge/provider.py"}
+
+
+def _calls():
+    for path in sorted(_BRAIN.rglob("*.py")):
+        rel = path.relative_to(_BRAIN).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                yield rel, node
+
+
+def test_no_brain_code_calls_urlopen():
+    bad = [f"{rel}:{n.lineno}" for rel, n in _calls() if isinstance(n.func, ast.Attribute) and n.func.attr == "urlopen"]
+    assert bad == [], f"urlopen honours proxy variables; use brain.bridge.loopback.direct_request: {bad}"
+
+
+def test_every_module_level_httpx_call_to_the_bridge_ignores_the_environment():
+    bad = []
+    for rel, n in _calls():
+        f = n.func
+        if rel in _NOT_LOOPBACK or not (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)):
+            continue
+        if f.value.id == "httpx" and f.attr in _HTTPX_VERBS:
+            kw = {k.arg: k.value for k in n.keywords}
+            if not (isinstance(kw.get("trust_env"), ast.Constant) and kw["trust_env"].value is False):
+                bad.append(f"{rel}:{n.lineno}")
+    assert bad == [], f"httpx.{{get,post,...}} without trust_env=False reads proxy variables: {bad}"
+
+
+def test_websocket_clients_are_only_built_through_the_direct_helper():
+    offenders = []
+    for path in sorted(_BRAIN.rglob("*.py")):
+        rel = path.relative_to(_BRAIN).as_posix()
+        if rel == "bridge/loopback.py":
+            continue
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("websockets") and any(
+                a.name == "connect" for a in node.names
+            ):
+                offenders.append(f"{rel}:{node.lineno}")
+    assert offenders == [], f"import connect from brain.bridge.loopback (direct_ws_connect) instead: {offenders}"
