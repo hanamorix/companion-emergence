@@ -16,6 +16,7 @@ import io
 import json
 import shlex
 import socket
+import struct
 import subprocess
 import threading
 import urllib.error
@@ -661,24 +662,65 @@ def test_an_error_body_whose_read_raises_an_http_exception_still_names_the_statu
     assert rc == 1 and "the bridge answered 500" in out.err and "Traceback" not in out.err
 
 
-def _raw_server(payload: bytes):
-    """A one-shot TCP server on a free loopback port that answers any request with ``payload`` and closes."""
+def _read_request(conn: socket.socket) -> None:
+    """Read one whole HTTP request (headers and the Content-Length body), so closing later cannot reset the client."""
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = conn.recv(65536)
+        if not chunk:
+            return
+        data += chunk
+    head, _, rest = data.partition(b"\r\n\r\n")
+    length = 0
+    for line in head.split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":", 1)[1])
+    while len(rest) < length:
+        chunk = conn.recv(65536)
+        if not chunk:
+            return
+        rest += chunk
+
+
+def _raw_server(payload: bytes, *, reset: bool = False):
+    """A one-shot TCP server on a free loopback port. It reads the whole request first, so the client has finished
+    sending. Then either (reset=False) it sends ``payload``, shuts down its write side CLEANLY and waits for the
+    client to finish reading and close, so the client sees exactly ``payload`` and then end-of-stream; or
+    (reset=True) it aborts the connection with a TCP reset (SO_LINGER 0) without sending anything."""
     srv = socket.socket()
     srv.bind(("127.0.0.1", 0))
     srv.listen(1)
 
     def serve():
         conn, _ = srv.accept()
-        conn.settimeout(5)
+        conn.settimeout(10)
         try:
-            conn.recv(65536)
+            _read_request(conn)
+            if reset:
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                return
             conn.sendall(payload)
+            conn.shutdown(socket.SHUT_WR)
+            try:
+                while conn.recv(65536):  # wait until the client has read what it wants and closed
+                    pass
+            except OSError:
+                pass
         finally:
             conn.close()
             srv.close()
 
     threading.Thread(target=serve, daemon=True).start()
     return srv.getsockname()[1]
+
+
+def _point_at(monkeypatch, port: int) -> None:
+    for var in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+    monkeypatch.setattr("brain.bridge.state_file.read", lambda d: SimpleNamespace(pid=4321, port=port, auth_token="t"))
+    monkeypatch.setattr("brain.bridge.state_file.pid_is_alive", lambda pid: True)
+    cli._build_parser()
 
 
 @pytest.mark.parametrize(
@@ -689,14 +731,76 @@ def _raw_server(payload: bytes):
 def test_a_real_socket_that_answers_badly_gives_a_clear_message(monkeypatch, home: Path, capsys, payload):
     p = _write(home)
     before = p.read_bytes()
-    port = _raw_server(payload)
-    for var in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
-        monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
-    monkeypatch.setattr("brain.bridge.state_file.read", lambda d: SimpleNamespace(pid=4321, port=port, auth_token="t"))
-    monkeypatch.setattr("brain.bridge.state_file.pid_is_alive", lambda pid: True)
-    cli._build_parser()
+    _point_at(monkeypatch, _raw_server(payload))
     rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
     err = capsys.readouterr().err
     assert rc == 1 and p.read_bytes() == before and "Traceback" not in err
     assert "did not understand the bridge's answer" in err and "nell model show" in err
+    assert "could not reach" not in err
+
+
+def test_a_real_connection_reset_after_the_request_was_sent_is_an_unknown_outcome(monkeypatch, home: Path, capsys):
+    p = _write(home)
+    before = p.read_bytes()
+    _point_at(monkeypatch, _raw_server(b"", reset=True))
+    rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
+    err = capsys.readouterr().err
+    assert rc == 1 and p.read_bytes() == before and "Traceback" not in err
+    assert "outcome is unknown" in err and "may still apply" in err and "nell model show" in err
+    assert "could not reach" not in err and "may still be starting" not in err
+
+
+def test_a_real_closed_port_is_could_not_reach(monkeypatch, home: Path, capsys):
+    p = _write(home)
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()  # nothing listens here now: the connection is refused before any request is sent
+    _point_at(monkeypatch, port)
+    rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
+    err = capsys.readouterr().err
+    assert rc == 1 and "could not reach the bridge" in err and "may still be starting" in err
+    assert "outcome is unknown" not in err and json.loads(p.read_text())["model"] == "sonnet"
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ConnectionResetError(104, "Connection reset by peer"),
+        BrokenPipeError(32, "Broken pipe"),
+        ConnectionAbortedError(103, "aborted"),
+        OSError(5, "I/O error"),
+        urllib.error.URLError(ConnectionResetError(104, "Connection reset by peer")),
+        urllib.error.URLError(BrokenPipeError(32, "Broken pipe")),
+    ],
+    ids=["reset", "broken-pipe", "aborted", "oserror", "urlerror-reset", "urlerror-broken-pipe"],
+)
+def test_an_error_after_the_connection_was_made_is_an_unknown_outcome(monkeypatch, home: Path, capsys, exc):
+    p = _write(home)
+    before = p.read_bytes()
+    _point_at(monkeypatch, 51234)
+    with patch("urllib.request.urlopen", side_effect=exc):
+        rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
+    err = capsys.readouterr().err
+    assert rc == 1 and p.read_bytes() == before
+    assert "outcome is unknown" in err and "nell model show" in err and "could not reach" not in err and "—" not in err
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        urllib.error.URLError(ConnectionRefusedError(111, "Connection refused")),
+        urllib.error.URLError(socket.gaierror(-2, "Name or service not known")),
+        urllib.error.URLError("no host given"),
+        urllib.error.URLError(OSError(101, "Network is unreachable")),
+    ],
+    ids=["refused", "dns", "plain-reason", "unreachable"],
+)
+def test_a_failure_before_the_request_is_sent_is_could_not_reach(monkeypatch, home: Path, capsys, exc):
+    p = _write(home)
+    _point_at(monkeypatch, 51234)
+    with patch("urllib.request.urlopen", side_effect=exc):
+        rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
+    err = capsys.readouterr().err
+    assert rc == 1 and "could not reach the bridge" in err and "outcome is unknown" not in err
+    assert json.loads(p.read_text())["model"] == "sonnet"

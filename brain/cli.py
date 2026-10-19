@@ -2692,6 +2692,24 @@ def _bridge_text(value: Any, limit: int = 200) -> str:
 _BRIDGE_ANSWER_MAX_BYTES = 65536
 
 
+def _failed_before_the_request_was_sent(exc: BaseException) -> bool:
+    """True only for a failure that happens while connecting (so nothing reached the bridge): a refused
+    connection, a name that does not resolve, an unreachable network, or urllib rejecting the URL itself.
+    Anything else (a reset, a broken pipe, a dropped connection) can happen after the request was sent."""
+    import errno
+    import socket
+    import urllib.error
+
+    if not isinstance(exc, urllib.error.URLError):
+        return False  # a bare OSError comes from reading the answer
+    reason = exc.reason
+    if isinstance(reason, str):
+        return True  # urllib's own complaint about the URL, before any connection
+    if isinstance(reason, (ConnectionRefusedError, socket.gaierror)):
+        return True
+    return isinstance(reason, OSError) and reason.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EADDRNOTAVAIL)
+
+
 def _model_set_via_bridge(state: Any, model: str, persona: str) -> tuple[int, Any] | None:
     """Bridge running: POST to the picker's settings endpoint. None (after printing why) if it gave no usable answer."""
     import http.client
@@ -2740,10 +2758,18 @@ def _model_set_via_bridge(state: Any, model: str, persona: str) -> tuple[int, An
                 "still apply the change. Check with `nell model show`.",
                 file=sys.stderr,
             )
-        else:
+        elif _failed_before_the_request_was_sent(exc):
             print(
                 f"error: could not reach the bridge on port {state.port}: {_bridge_text(reason)}. The bridge may "
                 f"still be starting: try again in a few seconds, or stop it with `nell supervisor stop --persona {persona}`.",
+                file=sys.stderr,
+            )
+        else:
+            # The connection was made and the request may have been sent (a reset, a broken pipe, a dropped
+            # connection while waiting for the answer): the bridge may have applied the change.
+            print(
+                f"error: the connection to the bridge broke ({_bridge_text(reason)}), so the outcome is unknown: the "
+                "bridge may still apply the change. Check with `nell model show`.",
                 file=sys.stderr,
             )
         return None
