@@ -15,6 +15,8 @@ disallow list and ``--strict-mcp-config``.
 
 from __future__ import annotations
 
+import io
+
 import pytest
 
 from brain.bridge.provider import _BUILTIN_TOOLS_DISALLOWED
@@ -358,7 +360,9 @@ def _failing_stream(stdout_lines: list[str], stderr: str, tmp_path) -> None:
     from brain.bridge.provider import ClaudeCliProvider
 
     proc = _fake_popen(stdout_lines, exit_code=1)
-    proc.stderr.read.return_value = stderr
+    # stderr is drained incrementally while the process runs (#482), so the fake is a real stream that reaches EOF
+    # (a Mock whose read() returns the text forever never ends).
+    proc.stderr = io.StringIO(stderr)
     with patch("brain.bridge.provider.subprocess.Popen", return_value=proc):
         list(
             ClaudeCliProvider(model="haiku", timeout_seconds=30).chat_stream(

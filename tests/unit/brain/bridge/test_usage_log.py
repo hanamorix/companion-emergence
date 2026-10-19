@@ -131,7 +131,10 @@ def test_chat_stream_logs_usage_on_result_frame(tmp_path):
         def terminate(self) -> None:
             pass
 
-        def wait(self) -> int:
+        def wait(self, timeout=None) -> int:
+            return 0
+
+        def poll(self) -> int:  # the streaming path reaps its child (#482)
             return 0
 
     provider = ClaudeCliProvider(model="sonnet")
