@@ -29,6 +29,7 @@ from brain.ingest.buffer import (
     delete_backoff,
     delete_cursor,
     delete_session_buffer,
+    extract_lock_path,
     list_active_sessions,
     read_backoff,
     read_cursor,
@@ -46,6 +47,7 @@ from brain.ingest.types import IngestReport
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.pending import GATE_BYPASS_TYPES
 from brain.memory.store import MemoryStore
+from brain.utils.file_lock import file_lock
 
 logger = logging.getLogger(__name__)
 
@@ -273,6 +275,37 @@ def close_session(
 
 
 def extract_session_snapshot(
+    persona_dir: Path,
+    session_id: str,
+    *,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    provider: LLMProvider,
+    config: dict | None = None,
+) -> IngestReport:
+    """Run one snapshot extraction of ``session_id``; one extraction per session at a time (#477).
+
+    The periodic sweep, the session rollover, the bridge's snapshot route and the CLI can all
+    reach the same session together. Two concurrent passes extract the same turns twice and race
+    on the cursor write, so a pass that finds another one running skips: the running pass
+    advances the cursor, and the next sweep picks up anything it did not cover. The skip is not
+    an error and counts for nothing.
+    """
+    with file_lock(extract_lock_path(persona_dir, session_id), blocking=False) as acquired:
+        if not acquired:
+            logger.info("conversation_snapshot_busy session=%s — another extraction is running", session_id)
+            return IngestReport(session_id=session_id)
+        return _extract_session_snapshot_locked(
+            persona_dir,
+            session_id,
+            store=store,
+            hebbian=hebbian,
+            provider=provider,
+            config=config,
+        )
+
+
+def _extract_session_snapshot_locked(
     persona_dir: Path,
     session_id: str,
     *,

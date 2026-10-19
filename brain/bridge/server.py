@@ -71,6 +71,7 @@ from brain.chat.session import (
     get_or_hydrate_session,
 )
 from brain.health.alarm import compute_pending_alarms
+from brain.health.attempt_heal import save_with_backup_text
 from brain.health.json_io import Recovery, iter_jsonl, read_json
 from brain.health.parse_failures import count_recent as count_recent_parse_failures
 from brain.health.walker import walk_persona
@@ -2479,9 +2480,7 @@ def build_app(
         # leaves the persona in a recoverable state: audit says
         # "replied_explicit", file unchanged. Hana can re-issue accept
         # after fixing the underlying disk error.
-        tmp = voice_path.with_suffix(voice_path.suffix + ".tmp")
-        tmp.write_text(new_content, encoding="utf-8")
-        tmp.replace(voice_path)
+        save_with_backup_text(voice_path, new_content, keep_backups=False)
 
         # Place 3: SoulStore voice_evolution.
         try:
