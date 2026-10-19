@@ -168,6 +168,13 @@ def run_bridge_foreground(
     # bridge.json/state backups are chmod-hardened by state_file.write().
     auth_token = secrets.token_urlsafe(32)
 
+    from brain import process_identity
+
+    own_token = process_identity.own_token()
+    if own_token is None:
+        logger.error(
+            "bridge identity unavailable on this platform; using the command-line check for liveness and kills"
+        )
     initial_state = state_file.BridgeState(
         persona=persona_dir.name,
         pid=os.getpid(),
@@ -177,6 +184,9 @@ def run_bridge_foreground(
         shutdown_clean=False,
         client_origin=client_origin,
         auth_token=auth_token,
+        pid_token=own_token,
+        identity="token" if own_token else "unavailable",
+        phase="running",
     )
     state_file.write(persona_dir, initial_state)
 

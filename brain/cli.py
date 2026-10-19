@@ -134,7 +134,7 @@ def _status_handler(args: argparse.Namespace) -> int:
 
     state = state_file.read(persona_dir)
     if not persona_exists:
-        _print_bridge_status(state)
+        _print_bridge_status(state, persona_dir)
         return 1
 
     config = PersonaConfig.load(persona_dir / "persona_config.json")
@@ -152,17 +152,32 @@ def _status_handler(args: argparse.Namespace) -> int:
     else:
         print("memories_active: missing")
 
-    _print_bridge_status(state)
+    _print_bridge_status(state, persona_dir)
     return 0
 
 
-def _print_bridge_status(state: state_file.BridgeState | None) -> None:
+def _supervisor_status_handler(args: argparse.Namespace) -> int:
+    """`nell supervisor status`; with --json, one machine-readable object for the desktop app (#456)."""
+    from brain.bridge import daemon
+
+    if getattr(args, "json", False):
+        print(json.dumps(daemon.status_dict(get_persona_dir(args.persona))))  # json-io: ok -- CLI output, not a file
+        return 0
+    return daemon.cmd_status(args)
+
+
+def _print_bridge_status(state: state_file.BridgeState | None, persona_dir: Path) -> None:
     """Print bridge status while never exposing bearer tokens."""
     if state is None or state.pid is None:
         print("bridge: not running")
         return
 
-    if state_file.pid_is_alive(state.pid):
+    live = state_file.bridge_liveness(state, persona_dir)
+    if live == state_file.UNKNOWN:
+        print("bridge: unknown (its process identity could not be read)")
+        print(f"pid: {state.pid}")
+        return
+    if live == state_file.ALIVE:
         print("bridge: running")
         print(f"pid: {state.pid}")
         print(f"port: {state.port or 'unknown'}")
@@ -1911,7 +1926,7 @@ def _personas_handler(args: argparse.Namespace) -> int:
         for n in names:
             pd = get_persona_dir(n)
             st = state_file.read(pd)
-            running = st is not None and st.pid is not None and state_file.pid_is_alive(st.pid)
+            running = st is not None and state_file.bridge_liveness(st, pd) == state_file.ALIVE
             rows.append({"name": n, "bridge_running": running})
         print(json.dumps(rows, indent=2))
         return 0
@@ -1926,7 +1941,7 @@ def _personas_handler(args: argparse.Namespace) -> int:
     for n in names:
         pd = get_persona_dir(n)
         st = state_file.read(pd)
-        running = st is not None and st.pid is not None and state_file.pid_is_alive(st.pid)
+        running = st is not None and state_file.bridge_liveness(st, pd) == state_file.ALIVE
         marker = "running" if running else "not running"
         print(f"{n:<{width}}  {marker}")
     return 0
@@ -3165,7 +3180,6 @@ def _build_parser() -> argparse.ArgumentParser:
         cmd_restart,
         cmd_run,
         cmd_start,
-        cmd_status,
         cmd_stop,
         cmd_tail,
         cmd_tail_log,
@@ -3222,7 +3236,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     s_status = s_actions.add_parser("status", help="Show bridge daemon status.")
     _add_persona_arg(s_status)
-    s_status.set_defaults(func=cmd_status)
+    s_status.add_argument(
+        "--json",
+        action="store_true",
+        help="print the status as one JSON object from the state files and process checks (no HTTP); "
+        "used by the desktop app",
+    )
+    s_status.set_defaults(func=_supervisor_status_handler)
 
     s_restart = s_actions.add_parser(
         "restart",

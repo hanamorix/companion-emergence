@@ -25,6 +25,16 @@ def _isolated_spawned_children(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(daemon, "_spawned_children", {})
 
 
+
+@pytest.fixture(autouse=True)
+def _records_here_prove_they_are_bridges(monkeypatch):
+    """#456 (D22): a token-less bridge.json counts as a live bridge only when the pid's command line proves it is a
+    bridge for the persona. The records in this file stand for live bridges through a patched pid_is_alive, so the
+    command-line proof is patched to match; the identity rules themselves are tested in test_identity_readers.py."""
+    from brain.bridge import state_file
+
+    monkeypatch.setattr(state_file, "prove_bridge_cmdline", lambda *a, **k: True)
+
 def _args(persona: str, **kw) -> argparse.Namespace:
     ns = argparse.Namespace(persona=persona, idle_shutdown=30, client_origin="cli", timeout=180.0)
     for k, v in kw.items():

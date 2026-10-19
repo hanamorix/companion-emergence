@@ -496,12 +496,21 @@ def cmd_stop(args) -> int:
 
     persona_dir = get_persona_dir(args.persona)
     s = state_file.read(persona_dir)
-    if s is None or s.pid is None or not state_file.pid_is_alive(s.pid):
+    if s is None or s.pid is None:
         print("bridge not running")
+        return 0
+    live = state_file.bridge_liveness(s, persona_dir)
+    if live == state_file.GONE:
+        # A stale record (dead pid, a reused pid, or a pre-PR pid that is not a bridge for this persona): never signal.
+        print("bridge not running (stale record)")
+        _clear_stale_record(persona_dir, s)
         return 0
     try:
         _request_shutdown_via_http(s)
     except Exception as exc:
+        if live != state_file.ALIVE:
+            print(f"bridge identity could not be confirmed; not signalling pid {s.pid}: {exc}", file=sys.stderr)
+            return 1
         if os.name == "nt":
             if getattr(args, "force", False):
                 print(
@@ -528,11 +537,53 @@ def cmd_stop(args) -> int:
     deadline = time.time() + args.timeout
     while time.time() < deadline:
         time.sleep(0.2)
-        if not state_file.pid_is_alive(s.pid):
+        if state_file.bridge_liveness(s, persona_dir) == state_file.GONE:
             print(f"bridge stopped (was pid {s.pid})")
             return 0
     print(f"bridge did not stop within {args.timeout}s", file=sys.stderr)
     return 1
+
+
+def _clear_stale_record(persona_dir: Path, s: state_file.BridgeState) -> None:
+    """Clear a stale record's pid/port, only while holding the bridge lock (so no bridge is running or starting)."""
+    fd = acquire_lock(persona_dir)
+    if fd is None:
+        return
+    try:
+        cur = state_file.read(persona_dir)
+        if cur is not None and cur.pid == s.pid:
+            cur.pid = None
+            cur.port = None
+            state_file.write(persona_dir, cur)
+    except Exception:  # noqa: BLE001 - best effort; the record stays stale, which readers already handle
+        logger.warning("could not clear the stale bridge record", exc_info=True)
+    finally:
+        release_lock(persona_dir, fd)
+
+
+def status_dict(persona_dir: Path) -> dict:
+    """The machine-readable bridge status (`nell supervisor status --json`): files and process checks only."""
+    s = state_file.read(persona_dir)
+    live = state_file.bridge_liveness(s, persona_dir) if s is not None else state_file.GONE
+    proven = bool(
+        s is not None
+        and s.pid is not None
+        and not s.pid_token
+        and state_file.prove_bridge_cmdline(s.pid, persona_dir, s.persona or persona_dir.name)
+    )
+    return {
+        "alive": live,
+        "legacy": state_file.is_legacy(s),
+        "proven": proven,
+        "pid": s.pid if s else None,
+        "pid_token": s.pid_token if s else None,
+        "identity": s.identity if s else None,
+        "phase": s.phase if s else None,
+        "stop_reason": s.stop_reason if s else None,
+        "stop_requested_at": s.stop_requested_at if s else None,
+        "client_origin": s.client_origin if s else None,
+        "recovery_needed": state_file.recovery_needed(persona_dir),
+    }
 
 
 def cmd_status(args) -> int:

@@ -23,16 +23,31 @@ class RecoverArgs:
 
 
 def _bridge_is_live(persona_dir: Path) -> bool:
-    """True if a bridge process appears to be running for this persona.
-    Defensive: a missing or malformed bridge.json reads as not-live."""
+    """True if a bridge may be running for this persona, so recovery must not race its forgetting pass.
+
+    Errs toward "live": ALIVE, an UNKNOWN identity, and a pre-PR / identity-unavailable record whose pid is alive but
+    whose command line does not prove it (the user has --force). A missing or unreadable bridge.json reads as
+    not-live."""
+    from brain.bridge import state_file
+
     bridge = persona_dir / "bridge.json"
     if not bridge.is_file():
         return False
     try:
-        pid = int(read_json(bridge, default=dict, expect=dict).get("pid", 0))
+        st = state_file.read(persona_dir)
     except (TypeError, ValueError):
+        # A partial / foreign-shaped bridge.json: fall back to its raw pid and err toward "live".
+        try:
+            pid = int(read_json(bridge, default=dict, expect=dict).get("pid", 0))
+        except (TypeError, ValueError):
+            return False
+        return pid_is_alive(pid)
+    if st is None or st.pid is None:
         return False
-    return pid_is_alive(pid)
+    live = state_file.bridge_liveness(st, persona_dir)
+    if live in (state_file.ALIVE, state_file.UNKNOWN):
+        return True
+    return not st.pid_token and pid_is_alive(st.pid)
 
 
 def run_recover_cli(args: RecoverArgs) -> int:
