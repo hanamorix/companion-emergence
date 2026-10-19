@@ -10,6 +10,7 @@ from pathlib import Path
 from brain.health.json_io import read_json, write_json
 from brain.utils.file_lock import file_lock
 from brain.utils.log_throttle import warn_throttled
+from brain.utils.time import lenient_utc
 
 logger = logging.getLogger(__name__)
 
@@ -41,10 +42,8 @@ def _new_id(resolved_path: str, content: str, now: datetime) -> str:
 
 def is_expired(rec: dict, now: datetime) -> bool:
     """True if a pending record is older than the TTL (whether or not the sweep has run yet)."""
-    try:
-        return now - datetime.fromisoformat(rec["proposed_at"]) > timedelta(hours=_TTL_HOURS)
-    except (ValueError, KeyError, TypeError):
-        return False
+    proposed = lenient_utc(rec.get("proposed_at"))  # a naive stamp is read as UTC, as commit.py does (#485)
+    return proposed is not None and lenient_utc(now) - proposed > timedelta(hours=_TTL_HOURS)
 
 
 def count_pending(persona_dir: Path, *, now: datetime) -> int:
@@ -81,12 +80,12 @@ def _all(persona_dir: Path) -> list[dict]:
 def _age(r: dict, now: datetime) -> timedelta | None:
     """How old a record is, or None. A record without a usable ``proposed_at``
     drops out of every listing and is never expired, so it is reported (#429)."""
-    try:
-        return now - datetime.fromisoformat(r["proposed_at"])
-    except (ValueError, KeyError, TypeError):  # TypeError: null, or a tz-naive stamp
+    proposed = lenient_utc(r.get("proposed_at"))  # a naive stamp is read as UTC, as commit.py does (#485)
+    if proposed is None:
         warn_throttled(logger, f"pending:{r.get('id')}", "pending write %s has no usable proposed_at; skipped",
                        r.get("id"), exc_info=False)
         return None
+    return lenient_utc(now) - proposed
 
 
 def list_pending(persona_dir: Path, *, now: datetime) -> list[dict]:

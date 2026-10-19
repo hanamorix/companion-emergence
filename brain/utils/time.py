@@ -71,6 +71,36 @@ def parse_iso_utc(s: str) -> datetime:
     return dt
 
 
+def lenient_utc(value: object) -> datetime | None:
+    """Any stored timestamp -> an aware UTC datetime, or None. The ONE failure policy for a damaged stamp (#485).
+
+    Takes a datetime or an ISO-8601 string (``Z`` suffix or an offset); a naive value means UTC (the repo's rule, as
+    :func:`parse_iso_utc` already applies to strings); an aware value is converted to UTC. Anything else (None, a number, a
+    list, bytes, text that is not a timestamp) is None. It never raises: the CALLER decides what None means (due now, skip,
+    or refuse), explicitly, instead of each reader choosing a different accident.
+    """
+    try:
+        if isinstance(value, datetime):
+            dt = value
+        elif isinstance(value, str):
+            dt = parse_iso_utc(value)
+        else:
+            return None
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC)
+    except (ValueError, OverflowError):
+        return None
+
+
+def hours_since(value: object, now: datetime) -> float | None:
+    """Hours from the stored stamp ``value`` to ``now`` (never negative), or None when the stamp is unusable (:func:`lenient_utc`)."""
+    then = lenient_utc(value)
+    if then is None:
+        return None
+    return max(0.0, (now - then).total_seconds() / 3600.0)
+
+
 def to_local(dt: datetime) -> datetime:
     """Convert a datetime to local wall-clock time, for anything shown to the
     companion as an absolute "when did/does this happen" reading (issue #217).
