@@ -2692,22 +2692,21 @@ def _bridge_text(value: Any, limit: int = 200) -> str:
 _BRIDGE_ANSWER_MAX_BYTES = 65536
 
 
-def _failed_before_the_request_was_sent(exc: BaseException) -> bool:
-    """True only for a failure that happens while connecting (so nothing reached the bridge): a refused
-    connection, a name that does not resolve, an unreachable network, or urllib rejecting the URL itself.
-    Anything else (a reset, a broken pipe, a dropped connection) can happen after the request was sent."""
-    import errno
-    import socket
-    import urllib.error
+def _bridge_connect_error(port: int, timeout: float) -> OSError | None:
+    """Try to connect to the bridge's port, then hang up without sending anything. None if it accepts the
+    connection, else the error.
 
-    if not isinstance(exc, urllib.error.URLError):
-        return False  # a bare OSError comes from reading the answer
-    reason = exc.reason
-    if isinstance(reason, str):
-        return True  # urllib's own complaint about the URL, before any connection
-    if isinstance(reason, (ConnectionRefusedError, socket.gaierror)):
-        return True
-    return isinstance(reason, OSError) and reason.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EADDRNOTAVAIL)
+    This is how `nell model set` tells "could not reach the bridge" (nothing was sent) from "the outcome is
+    unknown" (the request was written, then something broke): it is decided by WHERE the failure happened, not by
+    an error number, which differs between Linux, macOS and Windows.
+    """
+    import socket
+
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return None
+    except OSError as exc:
+        return exc
 
 
 def _model_set_via_bridge(state: Any, model: str, persona: str) -> tuple[int, Any] | None:
@@ -2729,6 +2728,15 @@ def _model_set_via_bridge(state: Any, model: str, persona: str) -> tuple[int, An
     )
     # The endpoint keeps itself inside one check budget (a wait for the lock counts against it); twice that is the margin.
     wait_s = server_mod._check_budget_s() * 2
+    refused = _bridge_connect_error(state.port, wait_s)
+    if refused is not None:
+        # Nothing was sent: the bridge's port does not accept a connection.
+        print(
+            f"error: could not reach the bridge on port {state.port}: {_bridge_text(refused)}. The bridge may "
+            f"still be starting: try again in a few seconds, or stop it with `nell supervisor stop --persona {persona}`.",
+            file=sys.stderr,
+        )
+        return None
     try:
         with urllib.request.urlopen(req, timeout=wait_s) as resp:
             raw = resp.read(_BRIDGE_ANSWER_MAX_BYTES)
@@ -2758,15 +2766,9 @@ def _model_set_via_bridge(state: Any, model: str, persona: str) -> tuple[int, An
                 "still apply the change. Check with `nell model show`.",
                 file=sys.stderr,
             )
-        elif _failed_before_the_request_was_sent(exc):
-            print(
-                f"error: could not reach the bridge on port {state.port}: {_bridge_text(reason)}. The bridge may "
-                f"still be starting: try again in a few seconds, or stop it with `nell supervisor stop --persona {persona}`.",
-                file=sys.stderr,
-            )
         else:
-            # The connection was made and the request may have been sent (a reset, a broken pipe, a dropped
-            # connection while waiting for the answer): the bridge may have applied the change.
+            # The connection was accepted, so from here on the request may have been sent (a reset, a broken pipe, a
+            # dropped connection while waiting for the answer): the bridge may have applied the change.
             print(
                 f"error: the connection to the bridge broke ({_bridge_text(reason)}), so the outcome is unknown: the "
                 "bridge may still apply the change. Check with `nell model show`.",

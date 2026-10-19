@@ -42,9 +42,15 @@ DERIVED = "claude-haiku-5"
 REWORDED = "Model unknown."
 
 
+_REAL_CONNECT_CHECK = getattr(cli, "_bridge_connect_error", None)
+
+
 @pytest.fixture(autouse=True)
-def _reset():
+def _reset(monkeypatch):
     model_error.reset()
+    # The pre-flight connect to the bridge's port: tests that fake urllib assume the port accepts connections.
+    # Tests that need the real check (real sockets) or a failing one say so (_point_at(real=True), a lambda).
+    monkeypatch.setattr(cli, "_bridge_connect_error", lambda port, timeout: None, raising=False)
     yield
     model_error.reset()
 
@@ -408,7 +414,10 @@ def test_a_live_pid_whose_port_refuses_exits_1_and_writes_nothing(monkeypatch, h
     monkeypatch.setattr("brain.bridge.state_file.pid_is_alive", lambda pid: True)
     cli._build_parser()
     run = _Run(lambda m: _ok())
-    with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("refused")), patch("subprocess.run", run):
+    monkeypatch.setattr(cli, "_bridge_connect_error", lambda port, timeout: ConnectionRefusedError("refused"))
+    with patch("urllib.request.urlopen", side_effect=AssertionError("nothing is sent to a port that refuses")), patch(
+        "subprocess.run", run
+    ):
         rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
     err = capsys.readouterr().err
     assert rc == 1 and "could not reach" in err and p.read_bytes() == before and run.models == []
@@ -620,8 +629,8 @@ def test_the_reason_of_an_unreachable_port_is_cleaned(monkeypatch, home: Path, c
     monkeypatch.setattr("brain.bridge.state_file.read", lambda d: SimpleNamespace(pid=4321, port=51234, auth_token="t"))
     monkeypatch.setattr("brain.bridge.state_file.pid_is_alive", lambda pid: True)
     cli._build_parser()
-    boom = urllib.error.URLError("refused\x1b[31m\nred\x07")
-    with patch("urllib.request.urlopen", side_effect=boom):
+    monkeypatch.setattr(cli, "_bridge_connect_error", lambda port, timeout: OSError("refused\x1b[31m\nred\x07"))
+    with patch("urllib.request.urlopen", side_effect=AssertionError("not reached")):
         rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
     err = capsys.readouterr().err
     assert rc == 1 and "could not reach" in err and "\x1b" not in err and "\x07" not in err and err.count("\n") == 1
@@ -662,13 +671,14 @@ def test_an_error_body_whose_read_raises_an_http_exception_still_names_the_statu
     assert rc == 1 and "the bridge answered 500" in out.err and "Traceback" not in out.err
 
 
-def _read_request(conn: socket.socket) -> None:
-    """Read one whole HTTP request (headers and the Content-Length body), so closing later cannot reset the client."""
+def _read_request(conn: socket.socket) -> bool:
+    """Read one whole HTTP request (headers and the Content-Length body), so closing later cannot reset the client.
+    False if the client hung up without sending anything (the command's pre-flight connect)."""
     data = b""
     while b"\r\n\r\n" not in data:
         chunk = conn.recv(65536)
         if not chunk:
-            return
+            return bool(data)
         data += chunk
     head, _, rest = data.partition(b"\r\n\r\n")
     length = 0
@@ -678,43 +688,55 @@ def _read_request(conn: socket.socket) -> None:
     while len(rest) < length:
         chunk = conn.recv(65536)
         if not chunk:
-            return
+            return True
         rest += chunk
+    return True
 
 
 def _raw_server(payload: bytes, *, reset: bool = False):
-    """A one-shot TCP server on a free loopback port. It reads the whole request first, so the client has finished
-    sending. Then either (reset=False) it sends ``payload``, shuts down its write side CLEANLY and waits for the
-    client to finish reading and close, so the client sees exactly ``payload`` and then end-of-stream; or
-    (reset=True) it aborts the connection with a TCP reset (SO_LINGER 0) without sending anything."""
+    """A TCP server on a free loopback port. A connection that hangs up without sending a request (the command's
+    pre-flight connect) is ignored. For the connection that carries the request it reads the whole request first,
+    so the client has finished sending, then either (reset=False) sends ``payload``, shuts down its write side
+    CLEANLY and waits for the client to finish reading and close, so the client sees exactly ``payload`` and then
+    end-of-stream; or (reset=True) aborts the connection with a TCP reset (SO_LINGER 0) without sending anything."""
     srv = socket.socket()
     srv.bind(("127.0.0.1", 0))
-    srv.listen(1)
+    srv.listen(5)
+    srv.settimeout(10)
 
     def serve():
-        conn, _ = srv.accept()
-        conn.settimeout(10)
         try:
-            _read_request(conn)
-            if reset:
-                conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
-                return
-            conn.sendall(payload)
-            conn.shutdown(socket.SHUT_WR)
-            try:
-                while conn.recv(65536):  # wait until the client has read what it wants and closed
-                    pass
-            except OSError:
-                pass
+            while True:
+                conn, _ = srv.accept()
+                conn.settimeout(10)
+                try:
+                    if not _read_request(conn):
+                        continue  # the pre-flight connect: nothing was sent, wait for the real request
+                    if reset:
+                        conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                        return
+                    conn.sendall(payload)
+                    conn.shutdown(socket.SHUT_WR)
+                    try:
+                        while conn.recv(65536):  # wait until the client has read what it wants and closed
+                            pass
+                    except OSError:
+                        pass
+                    return
+                finally:
+                    conn.close()
+        except OSError:
+            pass
         finally:
-            conn.close()
             srv.close()
 
     threading.Thread(target=serve, daemon=True).start()
     return srv.getsockname()[1]
 
 
-def _point_at(monkeypatch, port: int) -> None:
+def _point_at(monkeypatch, port: int, *, real: bool = False) -> None:
+    if real:  # real sockets: use the real pre-flight connect too
+        monkeypatch.setattr(cli, "_bridge_connect_error", _REAL_CONNECT_CHECK)
     for var in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("NO_PROXY", "127.0.0.1")
@@ -731,7 +753,7 @@ def _point_at(monkeypatch, port: int) -> None:
 def test_a_real_socket_that_answers_badly_gives_a_clear_message(monkeypatch, home: Path, capsys, payload):
     p = _write(home)
     before = p.read_bytes()
-    _point_at(monkeypatch, _raw_server(payload))
+    _point_at(monkeypatch, _raw_server(payload), real=True)
     rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
     err = capsys.readouterr().err
     assert rc == 1 and p.read_bytes() == before and "Traceback" not in err
@@ -742,7 +764,7 @@ def test_a_real_socket_that_answers_badly_gives_a_clear_message(monkeypatch, hom
 def test_a_real_connection_reset_after_the_request_was_sent_is_an_unknown_outcome(monkeypatch, home: Path, capsys):
     p = _write(home)
     before = p.read_bytes()
-    _point_at(monkeypatch, _raw_server(b"", reset=True))
+    _point_at(monkeypatch, _raw_server(b"", reset=True), real=True)
     rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
     err = capsys.readouterr().err
     assert rc == 1 and p.read_bytes() == before and "Traceback" not in err
@@ -756,7 +778,7 @@ def test_a_real_closed_port_is_could_not_reach(monkeypatch, home: Path, capsys):
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
     s.close()  # nothing listens here now: the connection is refused before any request is sent
-    _point_at(monkeypatch, port)
+    _point_at(monkeypatch, port, real=True)
     rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
     err = capsys.readouterr().err
     assert rc == 1 and "could not reach the bridge" in err and "may still be starting" in err
@@ -766,16 +788,20 @@ def test_a_real_closed_port_is_could_not_reach(monkeypatch, home: Path, capsys):
 @pytest.mark.parametrize(
     "exc",
     [
-        ConnectionResetError(104, "Connection reset by peer"),
-        BrokenPipeError(32, "Broken pipe"),
-        ConnectionAbortedError(103, "aborted"),
-        OSError(5, "I/O error"),
-        urllib.error.URLError(ConnectionResetError(104, "Connection reset by peer")),
-        urllib.error.URLError(BrokenPipeError(32, "Broken pipe")),
+        ConnectionResetError("connection reset"),
+        BrokenPipeError("broken pipe"),
+        ConnectionAbortedError("connection aborted"),
+        OSError("input/output error"),
+        urllib.error.URLError(ConnectionResetError("connection reset")),
+        urllib.error.URLError(BrokenPipeError("broken pipe")),
+        urllib.error.URLError(OSError("network unreachable")),
+        urllib.error.URLError("some reason"),
     ],
-    ids=["reset", "broken-pipe", "aborted", "oserror", "urlerror-reset", "urlerror-broken-pipe"],
+    ids=["reset", "broken-pipe", "aborted", "oserror", "urlerror-reset", "urlerror-broken-pipe", "urlerror-oserror", "urlerror-str"],
 )
 def test_an_error_after_the_connection_was_made_is_an_unknown_outcome(monkeypatch, home: Path, capsys, exc):
+    """The pre-flight connect succeeded, so ANY failure inside urllib (whatever its type or OS error number)
+    happens once the bridge may have the request: the outcome is unknown. No OS error numbers are used here."""
     p = _write(home)
     before = p.read_bytes()
     _point_at(monkeypatch, 51234)
@@ -789,18 +815,33 @@ def test_an_error_after_the_connection_was_made_is_an_unknown_outcome(monkeypatc
 @pytest.mark.parametrize(
     "exc",
     [
-        urllib.error.URLError(ConnectionRefusedError(111, "Connection refused")),
-        urllib.error.URLError(socket.gaierror(-2, "Name or service not known")),
-        urllib.error.URLError("no host given"),
-        urllib.error.URLError(OSError(101, "Network is unreachable")),
+        ConnectionRefusedError("connection refused"),
+        socket.gaierror("name not resolved"),
+        OSError("network unreachable"),
+        TimeoutError("connect timed out"),
     ],
-    ids=["refused", "dns", "plain-reason", "unreachable"],
+    ids=["refused", "dns", "unreachable", "connect-timeout"],
 )
-def test_a_failure_before_the_request_is_sent_is_could_not_reach(monkeypatch, home: Path, capsys, exc):
+def test_a_failure_while_connecting_is_could_not_reach_and_nothing_is_sent(monkeypatch, home: Path, capsys, exc):
+    """Decided by WHERE it failed (the pre-flight connect, before any request is written), not by error number."""
     p = _write(home)
     _point_at(monkeypatch, 51234)
-    with patch("urllib.request.urlopen", side_effect=exc):
+    monkeypatch.setattr(cli, "_bridge_connect_error", lambda port, timeout: exc)
+    with patch("urllib.request.urlopen", side_effect=AssertionError("nothing may be sent to a port that cannot be connected")):
         rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
     err = capsys.readouterr().err
     assert rc == 1 and "could not reach the bridge" in err and "outcome is unknown" not in err
     assert json.loads(p.read_text())["model"] == "sonnet"
+
+
+def test_the_preflight_connect_really_connects_and_reports_a_refusal():
+    assert _REAL_CONNECT_CHECK is not None
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    try:
+        assert _REAL_CONNECT_CHECK(port, 5) is None  # something listens: no error
+    finally:
+        srv.close()
+    assert isinstance(_REAL_CONNECT_CHECK(port, 5), OSError)  # nothing listens now
