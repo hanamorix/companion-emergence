@@ -316,3 +316,87 @@ def test_the_overrides_cache_reset_does_not_clear_the_registry(tunables):
     tunables._reset_overrides_cache()
 
     assert tunables._registry["a.b"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# O2: the runtime reload breaking mid-run on a hand edit raises the same notice
+# ---------------------------------------------------------------------------
+
+
+def _touch_later(path: Path, seconds: int) -> None:
+    st = path.stat()
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + seconds * 1_000_000_000))
+
+
+def test_a_hand_edit_that_breaks_the_file_mid_run_raises_the_unreadable_notice(tunables, tmp_path):
+    path = tmp_path / "tunables.json"
+    path.write_text(json.dumps({"overrides": {"a.b": 180.0}}), encoding="utf-8")
+    assert tunables.get_tunable("a.b", 60.0) == 180.0
+    assert tunables.current_notice() is None
+
+    path.write_bytes(b"{broken")  # the user's hand edit, while the bridge runs
+    _touch_later(path, 5)
+
+    assert tunables.get_tunable("a.b", 60.0) == 60.0  # fail-open: code defaults
+    assert tunables.current_notice() == {"kind": "unreadable", "kept_as": None}
+    assert path.read_bytes() == b"{broken" and not _kept(tmp_path)  # the runtime never heals or rewrites the file
+
+    path.write_text(json.dumps({"overrides": {"a.b": 200.0}}), encoding="utf-8")  # the user fixes it
+    _touch_later(path, 10)
+
+    assert tunables.get_tunable("a.b", 60.0) == 200.0  # reloaded by the mtime change
+    assert tunables.current_notice() is None
+
+
+def test_an_overrides_value_that_is_not_an_object_mid_run_raises_the_notice(tunables, tmp_path):
+    path = tmp_path / "tunables.json"
+    path.write_text(json.dumps({"overrides": {"a.b": 180.0}}), encoding="utf-8")
+    tunables.get_tunable("a.b", 60.0)
+
+    path.write_text(json.dumps({"overrides": [1]}), encoding="utf-8")
+    _touch_later(path, 5)
+
+    assert tunables.get_tunable("a.b", 60.0) == 60.0
+    assert tunables.current_notice() == {"kind": "unreadable", "kept_as": None}
+
+
+def test_the_runtime_marker_is_written_once_per_file_change_not_on_every_read(tunables, tmp_path):
+    path = tmp_path / "tunables.json"
+    path.write_bytes(b"{broken")
+    tunables.get_tunable("a.b", 60.0)
+    marker = tmp_path / _NOTICE
+    first = (marker.read_bytes(), marker.stat().st_mtime_ns)
+
+    for _ in range(5):
+        tunables.get_tunable("a.b", 60.0)
+
+    assert (marker.read_bytes(), marker.stat().st_mtime_ns) == first
+
+
+def test_a_valid_or_empty_or_absent_file_writes_no_runtime_marker(tunables, tmp_path):
+    path = tmp_path / "tunables.json"
+    tunables.get_tunable("a.b", 60.0)  # absent
+    path.write_bytes(b"")
+    _touch_later(path, 2)
+    tunables.get_tunable("a.b", 60.0)  # zero-byte: no overrides to lose
+    path.write_text(json.dumps({"overrides": {"a.b": 1.0}}), encoding="utf-8")
+    _touch_later(path, 4)
+    tunables.get_tunable("a.b", 60.0)
+
+    assert not (tmp_path / _NOTICE).exists()
+
+
+def test_the_runtime_marker_write_failing_never_breaks_a_tunable_read(tunables, tmp_path, monkeypatch):
+    real = tunables.write_json
+    monkeypatch.setattr(tunables, "write_json", lambda p, *a, **k: (_ for _ in ()).throw(OSError("read-only")) if Path(p).name == _NOTICE else real(p, *a, **k))
+    (tmp_path / "tunables.json").write_bytes(b"{broken")
+
+    assert tunables.get_tunable("a.b", 60.0) == 60.0
+
+
+def test_a_marker_write_that_hits_a_programming_error_is_not_swallowed(tunables, tmp_path, monkeypatch):
+    # N4: the best-effort marker write catches the filesystem's OSError only, so a bug in building the record shows.
+    monkeypatch.setattr(tunables, "write_json", lambda *a, **k: (_ for _ in ()).throw(TypeError("a bug")))
+
+    with pytest.raises(TypeError):
+        tunables._write_marker({"kind": "reset"})

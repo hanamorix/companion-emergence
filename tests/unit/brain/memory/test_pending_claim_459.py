@@ -210,3 +210,185 @@ def test_no_entry_is_lost_or_claimed_twice_under_an_enqueue_claim_race(tmp_path)
     claimed.extend(_contents(final.entries))
 
     assert len(claimed) == n and len(set(claimed)) == n
+
+
+# ---------------------------------------------------------------------------
+# G3 evidence: a settle record that cannot be written names the entry (code review, part 2)
+# ---------------------------------------------------------------------------
+
+
+def test_a_failed_settle_record_names_the_entry_and_keeps_it_unsettled(tmp_path, monkeypatch, caplog):
+    import logging
+
+    import brain.memory.pending as pending_mod
+
+    q = PendingQueue(tmp_path)
+    q.enqueue(_mem("alpha"), source="dream")
+    batch = q.claim()
+    entry = batch.entries[0]
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(pending_mod, "append_jsonl", boom)
+    with caplog.at_level(logging.WARNING):
+        batch.settle(entry)
+
+    text = caplog.text
+    assert entry["_claim_id"] in text and entry["id"] in text and "disk full" in text
+    monkeypatch.undo()
+    batch.close()
+    assert (tmp_path / _PROCESSING).exists()  # still unsettled: the next claim replays it
+    assert _contents(q.claim().entries) == ["alpha"]
+
+
+# ---------------------------------------------------------------------------
+# O3: a damaged line is kept aside (raw bytes, with evidence), never skipped and then rewritten away
+# ---------------------------------------------------------------------------
+
+_DAMAGED = "pending_candidates.damaged.jsonl"
+_BAD_LINE = b'{"id": "torn", "content": \xff\xfe not json'
+
+
+def _good_line(content: str, claim_id: str | None = None) -> bytes:
+    import json
+
+    entry = {**_mem(content).to_dict(), "_source": "dream", "_enqueued_at": "t"}
+    if claim_id:
+        entry["_claim_id"] = claim_id
+    return json.dumps(entry).encode("utf-8")
+
+
+def _kept_aside(tmp_path) -> list[dict]:
+    p = tmp_path / _DAMAGED
+    return read_jsonl(p) if p.exists() else []
+
+
+def _decoded(record: dict) -> bytes:
+    import base64
+
+    return base64.b64decode(record["raw_b64"])
+
+
+@pytest.mark.parametrize("where", ["processing", "queue"])
+def test_claim_keeps_a_damaged_line_aside_with_evidence(tmp_path, caplog, where):
+    import logging
+
+    q = PendingQueue(tmp_path)
+    body = _good_line("alpha", "c1") + b"\n" + _BAD_LINE + b"\n" + _good_line("beta", "c2") + b"\n"
+    if where == "processing":
+        (tmp_path / _PROCESSING).write_bytes(body)
+    else:
+        q.path.write_bytes(body)
+
+    with caplog.at_level(logging.WARNING):
+        batch = q.claim()
+
+    assert _contents(batch.entries) == ["alpha", "beta"]
+    kept = _kept_aside(tmp_path)
+    assert len(kept) == 1 and _decoded(kept[0]) == _BAD_LINE
+    assert kept[0]["from"] == (_PROCESSING if where == "processing" else "pending_candidates.jsonl")
+    assert kept[0]["kept_at"] and kept[0]["line"] == 2
+    assert _DAMAGED in caplog.text or "damaged" in caplog.text
+
+
+def test_drain_keeps_a_damaged_line_aside_too(tmp_path):
+    q = PendingQueue(tmp_path)
+    q.path.write_bytes(_good_line("alpha") + b"\n" + _BAD_LINE + b"\n")
+
+    got = q.drain()
+
+    assert _contents(got) == ["alpha"]
+    kept = _kept_aside(tmp_path)
+    assert len(kept) == 1 and _decoded(kept[0]) == _BAD_LINE and kept[0]["from"] == "pending_candidates.jsonl"
+
+
+def test_a_keep_aside_write_failure_makes_claim_raise_before_changing_anything(tmp_path, monkeypatch):
+    import brain.memory.pending as pending_mod
+
+    q = PendingQueue(tmp_path)
+    q.path.write_bytes(_good_line("alpha") + b"\n" + _BAD_LINE + b"\n")
+    before = q.path.read_bytes()
+    real = pending_mod.append_jsonl
+
+    def flaky(path, *a, **k):
+        if str(path).endswith(_DAMAGED):
+            raise OSError("read-only")
+        return real(path, *a, **k)
+
+    monkeypatch.setattr(pending_mod, "append_jsonl", flaky)
+
+    with pytest.raises(OSError):
+        q.claim()
+
+    assert q.path.read_bytes() == before and not (tmp_path / _PROCESSING).exists()
+
+
+# ---------------------------------------------------------------------------
+# O4: reappraise items are not piled up
+# ---------------------------------------------------------------------------
+
+
+def _reappraise_ids(entries) -> list[str]:
+    return [e["memory_id"] for e in entries if e.get("_route") == "reappraise_importance"]
+
+
+def test_reappraise_items_are_deduplicated_against_the_queue(tmp_path):
+    q = PendingQueue(tmp_path)
+
+    assert q.enqueue_reappraisals(["m1", "m2", "m1"], source="recall") == 2  # duplicate inside one call
+    assert q.enqueue_reappraisals(["m2", "m3"], source="recall") == 1  # m2 is already queued
+    q.enqueue_reappraisal("m1", source="recall")
+
+    assert _reappraise_ids(read_jsonl(q.path)) == ["m1", "m2", "m3"]
+
+
+def test_reappraise_items_are_deduplicated_against_unsettled_processing_entries(tmp_path):
+    q = PendingQueue(tmp_path)
+    q.enqueue_reappraisals(["m1", "m2"], source="recall")
+    batch = q.claim()
+    batch.settle(batch.entries[0])  # m1 is dealt with; m2 is still held (an outage)
+
+    assert q.enqueue_reappraisals(["m1", "m2"], source="recall") == 1  # m2 is held, m1 is not
+
+    assert _reappraise_ids(read_jsonl(q.path)) == ["m1"]
+
+
+def test_claim_deduplicates_reappraise_items_already_piled_up(tmp_path):
+    q = PendingQueue(tmp_path)
+    lines = b"".join(
+        (b'{"_route": "reappraise_importance", "memory_id": "m1", "_source": "recall", "_enqueued_at": "t"}\n')
+        for _ in range(3)
+    )
+    q.path.write_bytes(lines + _good_line("alpha") + b"\n")
+
+    batch = q.claim()
+
+    assert _reappraise_ids(batch.entries) == ["m1"] and _contents([e for e in batch.entries if "content" in e]) == ["alpha"]
+
+
+# ---------------------------------------------------------------------------
+# N3: claimed candidates are still visible to read_recent while they wait
+# ---------------------------------------------------------------------------
+
+
+def test_read_recent_sees_unsettled_claimed_candidates_but_not_settled_ones(tmp_path):
+    q = PendingQueue(tmp_path)
+    for c in ("held", "done"):
+        q.enqueue(_mem(c), source="dream")
+    batch = q.claim()
+    batch.settle(next(e for e in batch.entries if e["content"] == "done"))
+    q.enqueue(_mem("newest"), source="dream")
+
+    got = [m.content for m in q.read_recent("dream", limit=10)]
+
+    assert got == ["newest", "held"]  # newest first; the settled one is gone, the held one is not invisible
+
+
+def test_read_recent_does_not_list_an_entry_twice_after_a_mid_claim_crash(tmp_path):
+    q = PendingQueue(tmp_path)
+    q.enqueue(_mem("alpha"), source="dream")
+    rows = read_jsonl(q.path)
+    write_jsonl(tmp_path / _PROCESSING, [{**r, "_claim_id": "c1"} for r in rows])  # entries in BOTH files
+
+    assert [m.content for m in q.read_recent("dream", limit=10)] == ["alpha"]

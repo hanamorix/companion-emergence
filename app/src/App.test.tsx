@@ -64,7 +64,7 @@ vi.mock("./appConfig", () => ({
 }));
 
 // ── bridge ────────────────────────────────────────────────────────────────────
-import type { PersonaState } from "./bridge";
+import type { PersonaState, TunablesNotice } from "./bridge";
 
 const { fetchPersonaState, approvePendingWrite, declinePendingWrite } = vi.hoisted(() => {
   const baseState = (): PersonaState => ({
@@ -273,7 +273,8 @@ describe("App pending-write cards", () => {
 });
 
 describe("App tunables notice (#462)", () => {
-  const stateWith = (tunables_notice?: unknown) => ({
+  // Typed as PersonaState (fetchPersonaState resolves to one): `mode` stays the literal "live" and the notice is a TunablesNotice.
+  const stateWith = (tunables_notice?: TunablesNotice | null): PersonaState => ({
     persona: "nell",
     emotions: {},
     body: null,
@@ -298,11 +299,14 @@ describe("App tunables notice (#462)", () => {
 
   afterEach(cleanup);
 
-  it.each([
-    [{ kind: "reset", kept_as: "tunables.json.corrupt-20261019T120000Z" }, /kept as tunables\.json\.corrupt-20261019T120000Z/],
-    [{ kind: "restored", kept_as: "tunables.json.corrupt-20261019T120000Z" }, /older saved copy/],
+  const KEPT = "tunables.json.corrupt-20261019T120000Z";
+  const cases: Array<[TunablesNotice, RegExp]> = [
+    [{ kind: "reset", kept_as: KEPT }, /kept as tunables\.json\.corrupt-20261019T120000Z/],
+    [{ kind: "restored", kept_as: KEPT }, /older saved copy/],
     [{ kind: "unreadable", kept_as: null }, /cannot be read right now/],
-  ])("shows the notice for %j", async (notice, text) => {
+  ];
+
+  it.each(cases)("shows the notice for %j", async (notice, text) => {
     fetchPersonaState.mockReset().mockResolvedValue(stateWith(notice));
     render(<App />);
 
@@ -310,7 +314,7 @@ describe("App tunables notice (#462)", () => {
     expect(el).toHaveTextContent(text);
   });
 
-  it.each([[null], [undefined]])("shows no notice when the field is %s", async (notice) => {
+  it.each<[TunablesNotice | null | undefined]>([[null], [undefined]])("shows no notice when the field is %s", async (notice) => {
     fetchPersonaState.mockReset().mockResolvedValue(stateWith(notice));
     render(<App />);
 

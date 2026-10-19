@@ -19,7 +19,7 @@ from brain.bridge.cli_throttle import ThrottleDeferred
 from brain.bridge.provider_auth import ProviderAuthDeferred
 from brain.health.json_io import JsonFileError
 from brain.memory.store import MemoryStore
-from brain.utils.failure_scope import failure_scope, settle_scope
+from brain.utils.failure_scope import ServiceCallFailed, failure_scope, settle_scope
 
 _ENVIRONMENT = [
     OSError("boom"),
@@ -126,3 +126,15 @@ def test_settle_scope_reclassifies_a_wrong_thread_store_as_environment(store):
     t.join()
 
     assert seen["scope"] == "environment"
+
+
+def test_a_failed_service_call_is_environment_whatever_it_wrapped():
+    # O1 (#473): a call to an outside service that failed for ANY reason depends on the service, not on the item.
+    try:
+        try:
+            raise ValueError("a value error that would read as an item fault by type")
+        except ValueError as inner:
+            raise ServiceCallFailed("classifier call failed") from inner
+    except ServiceCallFailed as exc:
+        assert failure_scope(exc) == "environment"
+        assert settle_scope(exc, _NoProbe()) == "environment"  # no probe for an environment verdict

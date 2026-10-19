@@ -12,6 +12,7 @@ The mapping is by exception TYPE, never by message text. Each branch states why 
 
 - ``ThrottleDeferred`` (an expired login, a shutdown refusal): a refusal that says "not now" (#473). It is a ``RuntimeError``,
   which would otherwise read as an item fault, so it is checked first.
+- ``ServiceCallFailed``: a call to an outside service failed for any reason (see its docstring): environment.
 - ``OSError`` (``PermissionError``, ``FileNotFoundError``, disk full, I/O error, timeout, and ``JsonFileError`` of every kind):
   raised by the filesystem the job reads and writes, not by the item; it recurs for any item and clears when the environment
   does.
@@ -33,6 +34,15 @@ from typing import Literal
 
 Scope = Literal["environment", "item"]
 
+
+class ServiceCallFailed(Exception):  # noqa: N818 — a classification marker, not an error name
+    """A call to an outside service (an LLM provider) failed, for ANY reason.
+
+    What such a call does depends on the service and its environment (a login, the network, the CLI), not on the item that
+    was being sent, so it is an ``"environment"`` failure whatever the underlying exception type: keep the item for a later run
+    instead of acting as if the call had answered. The original exception is the ``__cause__``.
+    """
+
 _ITEM_SQLITE = (sqlite3.IntegrityError, sqlite3.DataError, sqlite3.ProgrammingError, sqlite3.InterfaceError)
 
 
@@ -41,7 +51,7 @@ def failure_scope(exc: BaseException) -> Scope:
     # Imported here: brain.utils must not depend on brain.bridge at import time.
     from brain.bridge.cli_throttle import ThrottleDeferred
 
-    if isinstance(exc, ThrottleDeferred):
+    if isinstance(exc, (ThrottleDeferred, ServiceCallFailed)):
         return "environment"
     if isinstance(exc, OSError):
         return "environment"

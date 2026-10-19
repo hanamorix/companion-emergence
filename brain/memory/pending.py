@@ -22,16 +22,23 @@ value is the *deliberate* ``journal_entry`` — and conversation-ingest's
 ``item.label``): each row self-classifies by its own type. ``journal_entry``
 (deliberate; feeds the weekly self-narrative) and ``initiate_outbound`` (its own
 dedup needs immediate DB visibility) bypass the gate and commit directly.
+
+The gate takes its batch with ``claim`` (not ``drain``): the batch is kept in
+``pending_candidates.processing.jsonl`` until each item is settled (recorded in
+``pending_candidates.settled.jsonl``), so a kill or an exception mid-run loses nothing; the next
+claim recovers what is left. A damaged line found in either file is kept aside in
+``pending_candidates.damaged.jsonl`` (raw bytes, with evidence), never skipped and rewritten away.
 """
 
 from __future__ import annotations
 
+import base64
 import logging
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from brain.health.json_io import Recovery, append_jsonl, read_jsonl, write_jsonl
+from brain.health.json_io import Recovery, append_jsonl, iter_jsonl_raw, read_jsonl, write_jsonl
 from brain.memory.store import Memory, MemoryStore
 from brain.utils.file_lock import file_lock
 from brain.utils.finite import clamp_nonfinite
@@ -41,6 +48,7 @@ logger = logging.getLogger(__name__)
 _QUEUE_FILENAME = "pending_candidates.jsonl"
 _PROCESSING_FILENAME = "pending_candidates.processing.jsonl"
 _SETTLED_FILENAME = "pending_candidates.settled.jsonl"
+_DAMAGED_FILENAME = "pending_candidates.damaged.jsonl"
 
 # Types that BYPASS the gate and are written straight to memories.db. Everything
 # else produced at an automatic write site is enqueued. Denylist (not allowlist)
@@ -81,6 +89,7 @@ class PendingQueue:
         self.path = Path(persona_dir) / _QUEUE_FILENAME
         self.processing_path = Path(persona_dir) / _PROCESSING_FILENAME
         self.settled_path = Path(persona_dir) / _SETTLED_FILENAME
+        self.damaged_path = Path(persona_dir) / _DAMAGED_FILENAME
 
     def enqueue(self, mem: Memory, *, source: str) -> None:
         """Append a candidate (the Memory serialised + provenance) under lock."""
@@ -109,20 +118,72 @@ class PendingQueue:
         """
         if limit <= 0:
             return []
-        rows = read_jsonl(self.path, recover=Recovery.RAISE)
+        # Candidates the gate has CLAIMED but not yet settled (they wait in the processing file, for a whole login outage
+        # when the classifier is deferred) are older than anything in the queue and must not become invisible.
+        rows = [*self._unsettled_processing(), *read_jsonl(self.path, recover=Recovery.RAISE)]
         out: list[Memory] = []
+        seen: set[str] = set()
         for entry in reversed(rows):
             if entry.get("memory_type") != memory_type:
                 continue
             try:
-                out.append(Memory.from_dict(entry))
+                mem = Memory.from_dict(entry)
             except (KeyError, ValueError, TypeError):
                 continue
+            if mem.id in seen:  # an entry present in both files after a mid-claim crash
+                continue
+            seen.add(mem.id)
+            out.append(mem)
             if len(out) >= limit:
                 break
         return out
 
-    def enqueue_reappraisal(self, memory_id: str, *, source: str) -> None:
+    def _unsettled_processing(self) -> list[dict]:
+        """The entries of the processing file that the settled file does not list. A lock-free read that never raises."""
+        if not self.processing_path.exists():
+            return []
+        settled = {r.get("id") for r in read_jsonl(self.settled_path)} if self.settled_path.exists() else set()
+        return [e for e in read_jsonl(self.processing_path) if e.get("_claim_id") not in settled]
+
+    def _read_keeping_damaged(self, path: Path) -> list[dict]:
+        """Read a queue-shaped JSONL file; an I/O fault raises. A damaged line is KEPT ASIDE, not skipped.
+
+        A plain read skips a damaged line, and the caller then rewrites the file without it: the line, the only copy of a
+        claimed entry, would be gone. Here each damaged line is appended to ``pending_candidates.damaged.jsonl`` (its raw bytes
+        base64-encoded, plus the file it came from, its position among the non-blank lines and a timestamp) BEFORE the
+        caller changes anything; if that append fails the read raises and nothing has changed.
+        """
+        entries: list[dict] = []
+        damaged: list[tuple[int, str]] = []
+        for position, (text, record) in enumerate(
+            iter_jsonl_raw(path, recover=Recovery.RAISE, bad_lines=True), start=1
+        ):
+            if record is None:
+                damaged.append((position, text))
+            else:
+                entries.append(record)
+        if damaged:
+            now = datetime.now(UTC).isoformat()
+            records = []
+            for position, text in damaged:
+                raw = text.encode("utf-8", "surrogateescape")
+                records.append(
+                    {
+                        "kept_at": now,
+                        "from": path.name,
+                        "line": position,
+                        "raw": raw.decode("utf-8", "replace"),
+                        "raw_b64": base64.b64encode(raw).decode("ascii"),
+                    }
+                )
+            append_jsonl(self.damaged_path, records, nonfinite="null")
+            logger.warning(
+                "pending queue: %d damaged line(s) in %s kept aside in %s (positions %s)",
+                len(records), path.name, self.damaged_path.name, ", ".join(str(r["line"]) for r in records),
+            )
+        return entries
+
+    def enqueue_reappraisal(self, memory_id: str, *, source: str, include_held: bool = True) -> None:
         """Enqueue an existing-memory importance re-appraise request (P3
         retention rework, Change 3).
 
@@ -141,9 +202,9 @@ class PendingQueue:
         recall hit in one turn); calling this in a loop reacquires the lock
         and reopens the file once per id.
         """
-        self.enqueue_reappraisals([memory_id], source=source)
+        self.enqueue_reappraisals([memory_id], source=source, include_held=include_held)
 
-    def enqueue_reappraisals(self, memory_ids: list[str], *, source: str) -> int:
+    def enqueue_reappraisals(self, memory_ids: list[str], *, source: str, include_held: bool = True) -> int:
         """Enqueue MULTIPLE existing-memory re-appraise requests under a
         SINGLE `file_lock` + single open + single write (P3 retention
         rework, Change 3 hot-path fix).
@@ -159,7 +220,8 @@ class PendingQueue:
         `enqueue_reappraisal` call (`_route`/`memory_id`/`_source`/
         `_enqueued_at`) — only the I/O is batched, not the item schema.
         `drain()` and the consolidation gate see no difference from N
-        individual calls. No-op (returns 0, does not touch the file) on an
+        individual calls, except that an id that already has a re-appraise item
+        (queued, or held unsettled by a claimed run) is not enqueued twice. No-op (returns 0, does not touch the file) on an
         empty list. Returns the number of lines written.
         """
         if not memory_ids:
@@ -174,8 +236,28 @@ class PendingQueue:
             }
             for memory_id in memory_ids
         ]
-        append_jsonl(self.path, items)  # one write for the whole batch
-        return len(items)
+        # No pile-up (#459): an id that already has a re-appraise item in the queue, or held unsettled in the processing
+        # file (an outage keeps them there), is not enqueued again. Duplicates inside this call collapse too. The check is a
+        # lock-free read followed by ONE locked write (the hot path stays at one lock acquisition); two enqueuers racing can
+        # still add the same id twice, which `claim` collapses.
+        # ``include_held=False`` is for the gate putting a CLAIMED item back after an environment failure: that item is itself
+        # unsettled in the processing file (it is settled right after), so it must not be deduplicated against itself.
+        held = self._unsettled_processing() if include_held else []
+        pending = {
+            e.get("memory_id")
+            for e in [*read_jsonl(self.path), *held]
+            if e.get("_route") == "reappraise_importance"
+        }
+        fresh = []
+        for item in items:
+            if item["memory_id"] in pending:
+                continue
+            pending.add(item["memory_id"])
+            fresh.append(item)
+        if not fresh:
+            return 0
+        append_jsonl(self.path, fresh)  # one write for the whole batch
+        return len(fresh)
 
     def drain(self) -> list[dict]:
         """Atomically take the whole queue: read all entries, then truncate.
@@ -191,7 +273,7 @@ class PendingQueue:
             return []
         with file_lock(self.path):
             # RAISE: the file is emptied right after this read, so a failed read must raise, not drain nothing.
-            rows = read_jsonl(self.path, recover=Recovery.RAISE)
+            rows = self._read_keeping_damaged(self.path)
             write_jsonl(self.path, [], fsync=False)  # empty the data file (the lock sidecar is separate)
         return rows
 
@@ -222,12 +304,20 @@ class PendingQueue:
                     else set()
                 )
                 leftovers = [
-                    e
-                    for e in read_jsonl(self.processing_path, recover=Recovery.RAISE)
-                    if e.get("_claim_id") not in settled
+                    e for e in self._read_keeping_damaged(self.processing_path) if e.get("_claim_id") not in settled
                 ]
-            queued = read_jsonl(self.path, recover=Recovery.RAISE) if self.path.exists() else []
-            entries = [{**e, "_claim_id": uuid.uuid4().hex} for e in [*leftovers, *queued]]
+            queued = self._read_keeping_damaged(self.path) if self.path.exists() else []
+            # One re-appraise item per memory id: an outage piles them up (every recall enqueues them) and each tick would
+            # otherwise re-stamp and rewrite the whole pile.
+            seen_ids: set = set()
+            combined = []
+            for e in [*leftovers, *queued]:
+                if e.get("_route") == "reappraise_importance":
+                    if e.get("memory_id") in seen_ids:
+                        continue
+                    seen_ids.add(e.get("memory_id"))
+                combined.append(e)
+            entries = [{**e, "_claim_id": uuid.uuid4().hex} for e in combined]
             if not entries:
                 if had_files:  # everything in them was settled: clear the stale files
                     self.processing_path.unlink(missing_ok=True)
@@ -261,7 +351,9 @@ class ClaimedBatch:
             append_jsonl(self._queue.settled_path, {"id": claim_id}, nonfinite="null")
         except OSError as exc:
             logger.warning(
-                "pending queue: could not record a settled entry (%s); it will be replayed by the next run", exc
+                "pending queue: could not record entry id=%s (claim %s) as settled (%s: %s); it stays unsettled and "
+                "will be replayed by the next run",
+                entry.get("id") or entry.get("memory_id"), claim_id, type(exc).__name__, exc,
             )
             return
         self._settled.add(claim_id)

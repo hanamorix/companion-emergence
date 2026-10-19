@@ -602,17 +602,59 @@ def test_the_result_log_carries_exactly_two_new_keys(persona):
                     "corrections", "continuations", "deferred", "reappraised", "skipped", "failed", "quarantined"}
 
 
-def test_a_classifier_fault_still_promotes_the_candidate(persona):
-    # C459-n / C459-x PIN: "a classifier fault must not lose the batch".
+def test_a_failed_classifier_call_leaves_the_candidate_for_a_later_run(persona, caplog):
+    # O1 / C459-x (amended): a classifier call that fails for ANY reason (not only a deferral) must not promote the candidate
+    # unclassified. It is kept (requeued) and the pass ends, so the cost is one call per tick; the next run classifies it.
     tmp, store, heb, queue = persona
-    _enqueue(queue, A, B)
+    mems = _enqueue(queue, A, B, C)
 
-    def boom(cand):
-        raise RuntimeError("boom")
+    def boom_on_b(cand):
+        if cand.content == B:
+            raise RuntimeError("claude exited with status 1")
+        return Decision("new")
 
-    _run(tmp, store, heb, Clf(boom))
+    clf = Clf(boom_on_b)
+    with caplog.at_level(logging.INFO):
+        result = _run(tmp, store, heb, clf)
 
-    assert _contents(store) == sorted([A, B])
+    assert _contents(store) == [A]  # B and C are NOT promoted unclassified
+    assert [r["content"] for r in _queue_rows(queue)] == [B] and _quarantine(tmp) == []
+    assert [_label(e) for e in _unsettled(tmp)] == [C] and result.failed == 1
+    assert any(mems[B].id in r.getMessage() and "RuntimeError" in r.getMessage() for r in caplog.records)
+
+    healthy = Clf()
+    _run(tmp, store, heb, healthy)
+    assert _contents(store) == sorted([A, B, C])
+    assert sorted(healthy.calls) == sorted([B, C])
+
+
+class _FailingProvider:
+    """generate() fails for prompts mentioning `refuse` with an ordinary error (the one call let through during an expired login)."""
+
+    def __init__(self, refuse: str):
+        self.refuse = refuse
+        self.calls: list[str] = []
+
+    def generate(self, prompt, *, system=None):
+        self.calls.append(prompt)
+        if self.refuse in prompt:
+            raise RuntimeError("ClaudeCliProvider failed (exit 1)")
+        return '{"verdict": "new"}'
+
+
+def test_a_failing_real_haiku_classifier_call_does_not_promote_unclassified(persona):
+    # O1: the real `_make_haiku_classifier`, whose `except Exception` used to return `Decision("new")` for a failed CALL.
+    tmp, store, heb, queue = persona
+    _enqueue(queue, A, B, C)
+    provider = _FailingProvider(refuse="bravo")
+
+    run_consolidation(store, persona_dir=tmp, provider=provider, hebbian=heb, reappraiser=_reappraiser)
+
+    assert _contents(store) == [A]
+    assert [r["content"] for r in _queue_rows(queue)] == [B]
+    provider.refuse = "nothing-matches-this"
+    run_consolidation(store, persona_dir=tmp, provider=provider, hebbian=heb, reappraiser=_reappraiser)
+    assert _contents(store) == sorted([A, B, C])
 
 
 def test_an_in_batch_duplicate_of_a_quarantined_item_survives_only_in_the_quarantine(persona, monkeypatch):
@@ -853,3 +895,54 @@ def test_a_haiku_reply_that_is_not_json_still_promotes(persona):
     run_consolidation(store, persona_dir=tmp, provider=provider, hebbian=heb, reappraiser=_reappraiser)
 
     assert _contents(store) == [A]
+
+
+# ---------------------------------------------------------------------------
+# G3 evidence (code review, part 2): what is logged when keeping an item is itself in trouble
+# ---------------------------------------------------------------------------
+
+
+def test_the_settle_failure_log_carries_the_original_exception_too(persona, monkeypatch, caplog):
+    tmp, store, heb, queue = persona
+    mems = _enqueue(queue, A, B, C)
+    _fail_create(monkeypatch, store, B, ValueError("the original failure text"))
+    monkeypatch.setattr(cons, "settle_scope", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("settling broke")))
+
+    with caplog.at_level(logging.INFO):
+        _run(tmp, store, heb, Clf())
+
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR and mems[B].id in r.getMessage()]
+    assert errors and "ValueError" in errors[0] and "the original failure text" in errors[0]
+    assert any("settling broke" in (r.exc_text or "") or "settling broke" in r.getMessage() for r in caplog.records)
+
+
+def test_a_failed_settle_record_during_a_run_names_the_entry(persona, monkeypatch, caplog):
+    import brain.memory.pending as pending_mod
+
+    tmp, store, heb, queue = persona
+    mems = _enqueue(queue, A)
+    real = pending_mod.append_jsonl
+
+    def flaky(path, *a, **k):
+        if str(path).endswith("settled.jsonl"):
+            raise OSError("disk full")
+        return real(path, *a, **k)
+
+    monkeypatch.setattr(pending_mod, "append_jsonl", flaky)
+    with caplog.at_level(logging.WARNING):
+        _run(tmp, store, heb, Clf())
+
+    assert any(mems[A].id in r.getMessage() and "disk full" in r.getMessage() for r in caplog.records)
+
+
+def test_a_failing_saved_state_probe_logs_the_id_and_the_exception(persona, monkeypatch, caplog):
+    tmp, store, heb, queue = persona
+    b = _enqueue(queue, A, B, C)[B]
+    _fail_create(monkeypatch, store, B, ValueError("bad value"))
+    _fail(monkeypatch, store, "get", lambda mid: mid == b.id, sqlite3.OperationalError("probe is locked"))
+
+    with caplog.at_level(logging.INFO):
+        _run(tmp, store, heb, Clf())
+
+    assert any(b.id in r.getMessage() and "OperationalError" in r.getMessage() and "probe is locked" in r.getMessage()
+               for r in caplog.records)

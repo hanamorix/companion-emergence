@@ -119,8 +119,12 @@ def _load_overrides_locked() -> dict[str, Any]:
         return _overrides_cache
     if mtime == _cache_mtime:
         return _overrides_cache
-    # An unreadable or malformed file is read_json's default ({}): the module logs it, fail-open by design.
-    overrides = read_json(path, default=dict, expect=dict).get("overrides", {})
+    # An unreadable or malformed file is read_json's default ({}): the module logs it, fail-open by design. It is also
+    # persisted as the "unreadable" notice (once per file change), so a hand edit that breaks the file while the bridge runs
+    # is not silently ignored until the next restart (#462). The runtime never heals or rewrites the file.
+    res = read_json_result(path, default=dict, expect=dict)
+    overrides = res.data.get("overrides", {})
+    broken = res.outcome == "defaulted" and res.kind != "empty"  # a zero-byte file carries no overrides
     if isinstance(overrides, dict):
         _warned_file = False
     else:
@@ -128,6 +132,9 @@ def _load_overrides_locked() -> dict[str, Any]:
             logger.warning("tunables: %s: 'overrides' is not an object — using code defaults", path)
             _warned_file = True
         overrides = {}
+        broken = True
+    if broken:
+        _note_unreadable_at_runtime(path)
     _overrides_cache, _cache_mtime = overrides, mtime  # cache the result (failures too) until the file changes
     return _overrides_cache
 
@@ -169,7 +176,7 @@ def _write_marker(record: dict[str, Any]) -> None:
     try:
         with file_lock(path):
             write_json(path, record, indent=2, fsync=False, nonfinite="null")
-    except Exception:  # noqa: BLE001 — telling the user must never break bridge startup
+    except OSError:  # the filesystem (a lock or a write): telling the user must never break bridge startup
         logger.warning(
             "tunables: could not write the notice file %s; the app will not be told about the unreadable tunables.json",
             path, exc_info=True,
@@ -211,6 +218,18 @@ def _record_unreadable(path: Path) -> None:
         "at": datetime.now(UTC).isoformat(),
         "mtime_ns": mtime_ns,
     })
+
+
+def _note_unreadable_at_runtime(path: Path) -> None:
+    """The runtime reload found tunables.json unusable: persist the "unreadable" notice once per file change (best effort)."""
+    try:
+        mtime_ns = path.stat().st_mtime_ns
+        marker = _read_marker()
+        if marker is not None and marker["kind"] == "unreadable" and marker.get("mtime_ns") == mtime_ns:
+            return  # already recorded for this very file state
+        _record_unreadable(path)
+    except OSError:
+        logger.warning("tunables: could not record that %s is unreadable", path, exc_info=True)
 
 
 def _read_marker() -> dict[str, Any] | None:

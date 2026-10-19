@@ -53,7 +53,7 @@ from brain.memory.known_names import (
 from brain.memory.pending import SALIENCE_ELIGIBLE_TYPES, ClaimedBatch, PendingQueue
 from brain.memory.semantic_recall import build_semantic_candidate_pool
 from brain.memory.store import Memory, MemoryStore, clamp_importance
-from brain.utils.failure_scope import settle_scope
+from brain.utils.failure_scope import ServiceCallFailed, settle_scope
 from brain.utils.file_lock import file_lock
 
 logger = logging.getLogger(__name__)
@@ -329,9 +329,11 @@ def _run_locked(
                 decision = classifier(cand, context)
             except ThrottleDeferred:
                 raise  # "not now" (expired login, shutdown): never promote an unclassified candidate (#473)
-            except Exception:  # noqa: BLE001 — a classifier fault must not lose the batch
-                logger.exception("consolidation gate: classifier raised; promoting candidate")
-                decision = Decision("new")
+            except Exception as call_exc:
+                # The classifier call failed for ANY reason (the one call let through during an expired login, a CLI error, a
+                # timeout): the candidate was not classified, so it is NOT promoted. It is kept for a later run and the pass
+                # ends (one call per tick). A reply that arrives but cannot be read still promotes: see `_make_haiku_classifier`.
+                raise ServiceCallFailed(f"classifier call failed: {type(call_exc).__name__}: {call_exc}") from call_exc
             decision = _clean_decision(decision)
             _dispatch(store, pending, hebbian, persona_dir, cand, decision, result, embedded)
             claim.settle(entry)
@@ -368,7 +370,11 @@ def _saved_state(store: MemoryStore, cand: Memory) -> tuple[str, Memory] | None:
     """
     try:
         row = store.get(cand.id, bump=False)
-    except Exception:  # noqa: BLE001 — a failing probe means "not saved"; the classification goes on
+    except Exception as exc:  # noqa: BLE001 — a failing probe means "not saved"; the classification goes on
+        logger.warning(
+            "consolidation gate: could not check whether candidate id=%s was saved (%s: %s); treating it as not saved",
+            cand.id, type(exc).__name__, exc,
+        )
         return None
     if row is None:
         return None
@@ -420,7 +426,8 @@ def _settle_failed_item(
         return _settle_failed_item_inner(store, pending, persona_dir, claim, entry, cand, stage, exc, result, detail)
     except Exception:  # noqa: BLE001 — total by design: the loop must never end with items undone
         logger.exception(
-            "consolidation gate: could not settle a failed item (%s); leaving it for the next run", _item_label(entry, cand)
+            "consolidation gate: could not settle a failed item (%s) after %s: %s; leaving it for the next run",
+            _item_label(entry, cand), type(exc).__name__, str(exc)[:200],
         )
         return True
 
@@ -469,7 +476,7 @@ def _settle_failed_item_inner(
     if cand is not None:
         pending.enqueue(cand, source=source)
     else:
-        pending.enqueue_reappraisal(str(entry.get("memory_id")), source=source)
+        pending.enqueue_reappraisal(str(entry.get("memory_id")), source=source, include_held=False)
     logger.warning(
         "consolidation gate: %s requeued after an environment failure (%s: %s); ending this pass",
         label, type(exc).__name__, str(exc)[:200],
@@ -1004,8 +1011,10 @@ def _make_haiku_classifier(provider) -> Classifier:
         # it (the first-400-character cut is gone, spec §5 item 1, S51), in its
         # fence; each EXISTING memory in its own fence (S106, S136).
         user = _classifier_user_message(cand, context)
+        # The CALL is outside the fail-open try: a call that fails (a deferral, a CLI error, a timeout) means the candidate
+        # was not classified, so the exception goes to the gate, which keeps the candidate for a later run (#473).
+        raw = provider.generate(user, system=prompt)
         try:
-            raw = provider.generate(user, system=prompt)
             data = json.loads(_extract_json(raw))
             verdict = str(data.get("verdict", "new"))
             if verdict not in VERDICTS:
@@ -1016,10 +1025,8 @@ def _make_haiku_classifier(provider) -> Classifier:
                 merged_content=data.get("merged_content") or None,
                 names=_parse_names(data.get("names"), source="gate judge"),
             )
-        except ThrottleDeferred:
-            raise  # "not now" (expired login, shutdown): never promote an unclassified candidate (#473)
-        except Exception:  # noqa: BLE001
-            logger.warning("consolidation Haiku classify failed; promoting candidate")
+        except Exception:  # noqa: BLE001 — a reply that cannot be read keeps the candidate's content (fail-open)
+            logger.warning("consolidation Haiku reply could not be read; promoting candidate")
             return Decision("new")
 
     return _classify
