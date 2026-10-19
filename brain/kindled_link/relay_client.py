@@ -32,6 +32,8 @@ class RelayClient:
                 last_exc = exc
                 time.sleep(_BACKOFF_BASE_S * (2**attempt))
                 continue
+            except httpx.RequestError as exc:  # decoding, redirects: not transient, no retry (#442)
+                raise RelayUnavailableError(f"relay {path}: {type(exc).__name__}: {exc}") from exc
             # #48 C-12: a 4xx/5xx (new relay abuse rejections 413/429/404, or any
             # error) must fail SOFT — raise RelayUnavailableError so callers don't
             # read .json()["nonce"]/["envelopes"] off an error body (KeyError crash).
@@ -42,6 +44,18 @@ class RelayClient:
         # Some transport errors carry no message; name the type so the audit row says why (#429).
         raise RelayUnavailableError(str(last_exc) or type(last_exc).__name__)
 
+    def _field(self, path: str, payload: dict, key: str):
+        """POST and return ``reply[key]``. The relay is untrusted: a 2xx whose body
+        is not a JSON object carrying ``key`` is a relay failure, not a crash (#442)."""
+        resp = self._post(path, payload)
+        try:
+            body = resp.json()
+        except ValueError as exc:
+            raise RelayUnavailableError(f"relay {path}: malformed reply (not JSON)") from exc
+        if not isinstance(body, dict) or key not in body:
+            raise RelayUnavailableError(f"relay {path}: malformed reply (no {key!r})")
+        return body[key]
+
     def register(self) -> None:
         self._post("/mailbox/register",
                    {"mailbox_id": self._mailbox, "identity_pub": self._idn.public_bytes.hex()})
@@ -50,7 +64,7 @@ class RelayClient:
         self._post("/envelope", envelope)
 
     def _auth(self) -> dict:
-        nonce = self._post("/mailbox/challenge", {"mailbox_id": self._mailbox}).json()["nonce"]
+        nonce = self._field("/mailbox/challenge", {"mailbox_id": self._mailbox}, "nonce")
         body = canonical_json({"purpose": "kindled-relay-auth/1",
                                "mailbox": self._mailbox, "nonce": nonce})
         return {"mailbox_id": self._mailbox, "nonce": nonce,
@@ -58,7 +72,7 @@ class RelayClient:
                 "identity_pub": self._idn.public_bytes.hex()}
 
     def fetch(self) -> list[dict]:
-        return self._post("/mailbox/fetch", self._auth()).json()["envelopes"]
+        return self._field("/mailbox/fetch", self._auth(), "envelopes")
 
     def ack(self, envelope_ids: list[str]) -> None:
         self._post("/mailbox/ack", {**self._auth(), "envelope_ids": envelope_ids})
