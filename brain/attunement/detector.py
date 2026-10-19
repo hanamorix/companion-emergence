@@ -8,7 +8,6 @@ project gotchas list). No ANTHROPIC_API_KEY references here.
 """
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -24,6 +23,7 @@ from brain.attunement.schemas import (
 from brain.attunement.store import BufferTurn
 from brain.health.json_io import append_jsonl
 from brain.health.parse_failures import record_parse_failure
+from brain.utils.llm_output import loads_json_object
 
 log = logging.getLogger(__name__)
 
@@ -120,20 +120,11 @@ def _call_haiku(
 def _parse_output(raw: str, source_turn_id: str, persona_dir: Path | None = None) -> DetectorOutput:
     """Parse Haiku's JSON output into DetectorOutput. Drops invalid candidates.
     A reply that can't be read is kept in the parse-failure log (#364)."""
-    # Strip optional markdown code fence — ClaudeCliProvider returns raw text
-    # but some models wrap output in ```json ... ```
-    stripped = raw.strip()
-    if stripped.startswith("```"):
-        first_newline = stripped.find("\n")
-        if first_newline != -1:
-            stripped = stripped[first_newline + 1:]
-        if stripped.endswith("```"):
-            stripped = stripped[: -len("```")]
-        stripped = stripped.strip()
-
+    # One tolerance rule for every reply that should be one JSON object (#479): the whole reply, a fenced block, or an object with
+    # prose before/after it (ClaudeCliProvider returns raw text, but some models wrap or chatter).
     try:
-        payload: dict[str, Any] = json.loads(stripped)
-    except json.JSONDecodeError as exc:
+        payload: dict[str, Any] = loads_json_object(raw)
+    except ValueError as exc:  # JSONDecodeError is a ValueError
         record_parse_failure(persona_dir, site="attunement", raw=raw, error=f"non-JSON: {exc}")
         return _decline_output(source_turn_id)
 

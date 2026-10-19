@@ -7,7 +7,6 @@ Best-effort by design: every step is wrapped so a failure is logged to
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,6 +17,7 @@ from brain import prompt_strings
 from brain.bridge.provider import LLMProvider
 from brain.health.json_io import append_jsonl, read_json, write_json
 from brain.health.parse_failures import record_parse_failure
+from brain.utils.llm_output import loads_json_object
 
 logger = logging.getLogger(__name__)
 
@@ -236,22 +236,12 @@ def extract_from_thinking(
         return ExtractorOutput()
 
     reply = raw
-    # Strip optional markdown code fence. ClaudeCliProvider returns raw text
-    # already; OllamaProvider passes through model output verbatim, where
-    # ```json\n...\n``` is common.
-    raw = raw.strip()
-    if raw.startswith("```"):
-        # Drop opening fence (with optional language tag) + closing fence
-        first_newline = raw.find("\n")
-        if first_newline != -1:
-            raw = raw[first_newline + 1 :]
-        if raw.endswith("```"):
-            raw = raw[: -len("```")]
-        raw = raw.strip()
-
+    # One tolerance rule for every reply that should be one JSON object (#479): `loads_json_object` accepts the whole reply, a
+    # fenced block, or an object with prose before/after it. ClaudeCliProvider returns raw text already; OllamaProvider passes
+    # model output through verbatim, where fences and chatter are common.
     try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
+        data = loads_json_object(raw)
+    except ValueError as exc:  # JSONDecodeError is a ValueError
         record_parse_failure(persona_dir, site="extractor", raw=reply, error=f"non-JSON: {exc}")
         return ExtractorOutput()
 
