@@ -2808,7 +2808,8 @@ mod kindled_home_tests {
     }
 
     /// Linux deb path through the real command code: a user's own `nell` is never overwritten, a
-    /// fresh target gets the symlink (macOS keeps its original behaviour, covered above).
+    /// fresh target gets the symlink. macOS runs the same check since #413
+    /// (`execute_symlink_refuses_to_replace_a_foreign_symlink`).
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_symlink_refuses_a_users_own_nell_and_links_when_free() {
