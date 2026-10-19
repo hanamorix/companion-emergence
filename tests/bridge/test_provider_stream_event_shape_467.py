@@ -103,6 +103,35 @@ def test_a_valid_assistant_message_without_content_still_resets_the_snapshot_as_
 
 
 # ---------------------------------------------------------------------------
+# an assistant text block whose text is not a string (the snapshot join)
+# ---------------------------------------------------------------------------
+
+_BAD_TEXT = pytest.mark.parametrize("bad", [None, 5], ids=["null", "int"])
+
+
+def _assistant_blocks(*texts) -> dict:
+    return {"type": "assistant", "message": {"content": [{"type": "text", "text": t} for t in texts]}}
+
+
+@_BAD_TEXT
+def test_an_assistant_text_block_whose_text_is_not_a_string_contributes_nothing(tmp_path, bad):
+    # C467-j: `"".join([... None ...])` raised TypeError out of the generator. Only string text is kept, as
+    # `_tool_result_text` does; the frame's other blocks still count. EOF with no result frame, so the snapshot is the reply.
+    events = _events(tmp_path, [_INIT, _assistant_blocks("kept ", bad, "on")])
+
+    assert isinstance(events[-1], StreamDone) and events[-1].content == "kept on"
+
+
+@_BAD_TEXT
+def test_a_text_block_with_no_usable_text_after_an_earlier_snapshot_ends_the_stream_normally(tmp_path, bad):
+    # C467-j: no crash after an earlier valid snapshot. The later frame is a VALID message whose only text block has no
+    # usable text, so it replaces the snapshot with "" exactly as a valid message without text does (C467-f).
+    events = _events(tmp_path, [_INIT, _assistant("earlier"), _assistant_blocks(bad)])
+
+    assert isinstance(events[-1], StreamDone) and events[-1].content == ""
+
+
+# ---------------------------------------------------------------------------
 # null text must not become "None" (streaming)
 # ---------------------------------------------------------------------------
 

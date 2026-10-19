@@ -1357,10 +1357,14 @@ class ClaudeCliProvider(LLMProvider):
                                     tool_in_flight = True
                                     tool_name = str(blk.get("name") or "") or None
                                     break
+                            # Only string text counts: a text block whose `text` is null or a number would make the
+                            # join raise TypeError (the same class as the frames above; `_tool_result_text` does this too).
                             parts = [
-                                blk.get("text", "")
+                                blk["text"]
                                 for blk in msg_content
-                                if isinstance(blk, dict) and blk.get("type") == "text"
+                                if isinstance(blk, dict)
+                                and blk.get("type") == "text"
+                                and isinstance(blk.get("text"), str)
                             ]
                             assistant_snapshot = "".join(parts)
                     elif t == "user":
