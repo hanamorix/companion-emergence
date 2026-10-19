@@ -275,7 +275,12 @@ def test_mut_compaction_markers_are_compact_json_with_a_trailing_newline(tmp_pat
 def _mem_nan():
     from brain.memory.store import Memory
 
-    return Memory.create_new(content="x", memory_type="conversation", domain="us", emotions={"love": float("nan")})
+    # The NaN is set after construction, so the helper works whether or not Memory.create_new itself rejects a
+    # non-finite emotion (it may): the tests below are about what the writers do with a record that carries one.
+    mem = Memory.create_new(content="x", memory_type="conversation", domain="us", emotions={"love": 0.5})
+    mem.emotions["love"] = float("nan")
+    mem.score = float("nan")
+    return mem
 
 
 def test_mut_archive_and_log_appenders_write_a_nan_as_null_instead_of_raising(tmp_path: Path) -> None:
@@ -294,7 +299,7 @@ def test_mut_pending_enqueue_of_a_nan_memory_is_promoted_by_the_gate(tmp_path: P
     """Behaviour delta of the migration, recorded: before it, a NaN candidate was queued as the NaN token, read
     back by Memory.from_dict, and then crashed the gate at store.create (SQLite NOT NULL on score) after the queue
     had been drained. Now the NaN is clamped to 0.0 at the producer (with one warning) and the candidate is
-    promoted. The gate's own parse (Memory.from_dict) rejects null, so null would drop it instead."""
+    promoted. Writing null instead would hand the gate's float() parse something that is not a number."""
     import logging
 
     from brain.engines.consolidation import run_consolidation
@@ -303,7 +308,6 @@ def test_mut_pending_enqueue_of_a_nan_memory_is_promoted_by_the_gate(tmp_path: P
 
     q = PendingQueue(tmp_path)
     mem = _mem_nan()
-    mem.score = float("nan")
     with caplog.at_level(logging.WARNING, logger="brain.utils.finite"):
         q.enqueue(mem, source="t")
     msgs = [r.getMessage() for r in caplog.records if r.name == "brain.utils.finite"]
