@@ -107,6 +107,9 @@ class IngestReport:
         errors:          Items that failed the commit step.
         memory_ids:      IDs of newly created memories (both durably committed and
                          enqueued-candidate ids).
+        deferred:        The extraction call was refused as "not now" (#473): nothing was
+                         extracted or failed, and the cursor, buffer and backoff sidecar
+                         are as they were.
     """
 
     session_id: str
@@ -119,3 +122,4 @@ class IngestReport:
     errors: int = 0
     commit_failures: int = 0
     memory_ids: list[str] = field(default_factory=list)
+    deferred: bool = False

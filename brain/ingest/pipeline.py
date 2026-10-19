@@ -178,6 +178,11 @@ def close_session(
         user_pronouns=_load_user_pronouns(persona_dir),
         persona_dir=persona_dir,
     )
+    if extraction.deferred:
+        # #473: "not now" is not a failure: no error, and the buffer stays for the next close.
+        report.deferred = True
+        logger.info("conversation_extract_deferred session=%s turns=%d; retaining buffer", session_id, len(turns))
+        return report
     if extraction.failed:
         report.errors += 1
         logger.warning(
@@ -384,6 +389,14 @@ def _extract_session_snapshot_locked(
         user_pronouns=_load_user_pronouns(persona_dir),
         persona_dir=persona_dir,
     )
+    if extraction.deferred:
+        # #473: "not now" is not a failure. No error, no backoff entry (three of those move the buffer to poison/),
+        # the cursor stays, and the next sweep tries again.
+        report.deferred = True
+        logger.info(
+            "conversation_snapshot_deferred session=%s turns=%d; cursor unchanged", session_id, len(turns)
+        )
+        return report
     if extraction.failed:
         report.errors += 1
         logger.warning(
