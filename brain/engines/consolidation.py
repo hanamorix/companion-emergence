@@ -98,9 +98,10 @@ class Decision:
         "Names are added three ways", item 1). Written to the known-names list by
         `_dispatch` for every verdict except "duplicate" (on "merge" too, from the
         candidate text). Empty when the judge returned none or its `names` field
-        was absent or malformed (a malformed VALUE never costs the verdict; a reply
-        that is not JSON at all still promotes the candidate, the classifier's
-        fail-open-toward-keeping-content rule).
+        was absent or malformed (a malformed VALUE never costs the verdict). A reply with
+        no usable verdict at all (not JSON, no object, a verdict that is missing or outside
+        `VERDICTS`) never reaches a Decision: the gate quarantines the candidate
+        (`UnusableClassifierReply`) and promotes nothing unclassified.
     """
 
     verdict: str
@@ -217,7 +218,9 @@ def run_consolidation(
     (it would fail the same way again), or left alone (already saved). A deferred
     Claude call (expired login) means "not now": nothing is promoted unclassified, the
     item and the rest stay for the next run. A run killed midway is recovered by the
-    next one. ``result.failed`` / ``result.quarantined`` count them.
+    next one. A classifier reply with no usable verdict quarantines the candidate (with
+    the raw reply as evidence) instead of promoting it. ``result.failed`` /
+    ``result.quarantined`` count them.
 
     reappraiser: Change 3's injectable importance re-appraiser. None (default)
         builds the Haiku-backed default when `provider` is given, else
@@ -349,7 +352,8 @@ def _run_locked(
             except Exception as call_exc:
                 # The classifier call failed for ANY reason (the one call let through during an expired login, a CLI error, a
                 # timeout): the candidate was not classified, so it is NOT promoted. It is kept for a later run and the pass
-                # ends (one call per tick). A reply that arrives but cannot be read still promotes: see `_make_haiku_classifier`.
+                # ends (one call per tick). A reply that arrives but gives no usable verdict never gets here: it is
+                # `UnusableClassifierReply`, re-raised above, and the candidate is quarantined.
                 raise ServiceCallFailed(f"classifier call failed: {type(call_exc).__name__}: {call_exc}") from call_exc
             decision = _clean_decision(decision)
             _dispatch(store, pending, hebbian, persona_dir, cand, decision, result, embedded)
@@ -1049,8 +1053,10 @@ def _make_haiku_classifier(provider) -> Classifier:
         if not isinstance(data, dict):
             raise UnusableClassifierReply("the reply JSON is not an object", reply)
         verdict = data.get("verdict")
+        if isinstance(verdict, str):
+            verdict = verdict.strip().lower()  # "New" / "NEW" are the same verdict
         if not isinstance(verdict, str) or verdict not in VERDICTS:
-            raise UnusableClassifierReply(f"no usable verdict (got {str(verdict)[:60]!r})", reply)
+            raise UnusableClassifierReply(f"no usable verdict (got {str(data.get('verdict'))[:60]!r})", reply)
         return Decision(
             verdict=verdict,
             target_id=data.get("target_id") or None,

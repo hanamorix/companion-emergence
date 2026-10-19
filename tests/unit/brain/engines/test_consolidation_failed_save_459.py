@@ -16,6 +16,7 @@ Synthetic names only. The persona is a tmp dir with a real MemoryStore and Pendi
 from __future__ import annotations
 
 import errno
+import json
 import logging
 import sqlite3
 import threading
@@ -963,6 +964,72 @@ def test_a_reply_with_a_usable_verdict_is_dispatched_as_before(persona, reply, f
     # PIN
     tmp, store, heb, queue = persona
     _enqueue(queue, A)
+
+    result = run_consolidation(store, persona_dir=tmp, provider=_ReplyProvider(default=reply), hebbian=heb,
+                               reappraiser=_reappraiser)
+
+    assert getattr(result, field) == 1 and _quarantine(tmp) == []
+
+
+
+# ---------------------------------------------------------------------------
+# G3 evidence (code review, part 2): what is logged when keeping an item is itself in trouble
+# ---------------------------------------------------------------------------
+
+
+def test_the_settle_failure_log_carries_the_original_exception_too(persona, monkeypatch, caplog):
+    tmp, store, heb, queue = persona
+    mems = _enqueue(queue, A, B, C)
+    _fail_create(monkeypatch, store, B, ValueError("the original failure text"))
+    monkeypatch.setattr(cons, "settle_scope", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("settling broke")))
+
+    with caplog.at_level(logging.INFO):
+        _run(tmp, store, heb, Clf())
+
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR and mems[B].id in r.getMessage()]
+    assert errors and "ValueError" in errors[0] and "the original failure text" in errors[0]
+    assert any("settling broke" in (r.exc_text or "") or "settling broke" in r.getMessage() for r in caplog.records)
+
+
+def test_a_failed_settle_record_during_a_run_names_the_entry(persona, monkeypatch, caplog):
+    import brain.memory.pending as pending_mod
+
+    tmp, store, heb, queue = persona
+    mems = _enqueue(queue, A)
+    real = pending_mod.append_jsonl
+
+    def flaky(path, *a, **k):
+        if str(path).endswith("settled.jsonl"):
+            raise OSError("disk full")
+        return real(path, *a, **k)
+
+    monkeypatch.setattr(pending_mod, "append_jsonl", flaky)
+    with caplog.at_level(logging.WARNING):
+        _run(tmp, store, heb, Clf())
+
+    assert any(mems[A].id in r.getMessage() and "disk full" in r.getMessage() for r in caplog.records)
+
+
+def test_a_failing_saved_state_probe_logs_the_id_and_the_exception(persona, monkeypatch, caplog):
+    tmp, store, heb, queue = persona
+    b = _enqueue(queue, A, B, C)[B]
+    _fail_create(monkeypatch, store, B, ValueError("bad value"))
+    _fail(monkeypatch, store, "get", lambda mid: mid == b.id, sqlite3.OperationalError("probe is locked"))
+
+    with caplog.at_level(logging.INFO):
+        _run(tmp, store, heb, Clf())
+
+    assert any(b.id in r.getMessage() and "OperationalError" in r.getMessage() and "probe is locked" in r.getMessage()
+               for r in caplog.records)
+
+
+@pytest.mark.parametrize("verdict, field", [("New", "promoted"), ("NEW", "promoted"), (" distinct \n", "promoted"),
+                                            ("Duplicate", "duplicates")])
+def test_the_verdict_is_read_without_regard_to_case_or_surrounding_space(persona, verdict, field):
+    # A reply of "New" or "NEW" is a usable verdict (it used to map to new silently): normalised with strip().lower().
+    tmp, store, heb, queue = persona
+    _enqueue(queue, A)
+    reply = json.dumps({"verdict": verdict})
 
     result = run_consolidation(store, persona_dir=tmp, provider=_ReplyProvider(default=reply), hebbian=heb,
                                reappraiser=_reappraiser)
