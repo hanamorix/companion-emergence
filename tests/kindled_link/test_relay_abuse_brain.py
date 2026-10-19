@@ -180,13 +180,19 @@ def _mock_client(handler):
         httpx.Response(200, text="<html>not json</html>"),
         httpx.Response(200, json={"detail": "no nonce here"}),
         httpx.Response(200, json=["nonce"]),
+        httpx.Response(200, json={"nonce": None}),
+        httpx.Response(200, json={"nonce": 5}),
     ],
-    ids=["non-json", "missing-key", "not-an-object"],
+    ids=["non-json", "missing-key", "not-an-object", "null-nonce", "non-str-nonce"],
 )
 def test_442_malformed_2xx_challenge_raises_relay_unavailable(challenge):
-    client = _mock_client(lambda request: challenge)
+    def handler(request):
+        if request.url.path == "/mailbox/challenge":
+            return challenge
+        return httpx.Response(200, json={"envelopes": []})  # only the challenge is bad
+
     with pytest.raises(RelayUnavailableError, match="malformed reply"):
-        client.fetch()
+        _mock_client(handler).fetch()
 
 
 @pytest.mark.parametrize(
@@ -195,8 +201,10 @@ def test_442_malformed_2xx_challenge_raises_relay_unavailable(challenge):
         httpx.Response(200, text="not json"),
         httpx.Response(200, json={"nonce": "n"}),
         httpx.Response(200, json=None),
+        httpx.Response(200, json={"envelopes": None}),
+        httpx.Response(200, json={"envelopes": {"id": "e1"}}),
     ],
-    ids=["non-json", "missing-key", "null-body"],
+    ids=["non-json", "missing-key", "null-body", "null-envelopes", "non-list-envelopes"],
 )
 def test_442_malformed_2xx_fetch_raises_relay_unavailable(fetched):
     def handler(request):
