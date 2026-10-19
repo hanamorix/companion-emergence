@@ -112,6 +112,21 @@ class Decision:
 Classifier = Callable[[Memory, list[Memory]], Decision]
 
 
+class UnusableClassifierReply(Exception):  # noqa: N818 — a classification of a failure, not an error name
+    """The classifier ANSWERED but gave no usable verdict (empty, no JSON object, malformed or non-object JSON, a verdict
+    outside the allowed set or missing).
+
+    That depends on this candidate's exchange, not on the store or the service, so it is an ITEM failure: the gate
+    quarantines the candidate with ``reply`` as evidence (the raw reply, kept out of the log) and never promotes it
+    unclassified. ``failure_scope`` reads it as "item" because it is an unknown type.
+    """
+
+    def __init__(self, reason: str, reply: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.reply = reply
+
+
 class Reappraisal(NamedTuple):
     """What a Reappraiser returns for one memory: a fresh importance, the names /
     proper nouns it found in the memory's text (spec §5, item 2), and the listed
@@ -329,6 +344,8 @@ def _run_locked(
                 decision = classifier(cand, context)
             except ThrottleDeferred:
                 raise  # "not now" (expired login, shutdown): never promote an unclassified candidate (#473)
+            except UnusableClassifierReply:
+                raise  # it answered, with nothing usable: an ITEM failure, quarantined by the settle path
             except Exception as call_exc:
                 # The classifier call failed for ANY reason (the one call let through during an expired login, a CLI error, a
                 # timeout): the candidate was not classified, so it is NOT promoted. It is kept for a later run and the pass
@@ -398,6 +415,9 @@ def _quarantine(
     }
     if existing is not None:
         record["existing_content"] = existing.content
+    reply = getattr(exc, "reply", None)
+    if isinstance(reply, str):
+        record["reply"] = reply  # the classifier's raw reply, as evidence (an unusable reply)
     append_jsonl(persona_dir / _QUARANTINE_FILENAME, record, nonfinite="null")
 
 
@@ -1001,8 +1021,10 @@ def _make_haiku_classifier(provider) -> Classifier:
     """Build a Haiku-backed Pass-2 classifier from a generation provider.
 
     Decision QUALITY is advisory (C16, live-only) — the gate mechanism is what
-    the gating criteria verify. On any parse/provider failure the candidate is
-    promoted (fail-open toward keeping content).
+    the gating criteria verify. A failed CALL propagates (the candidate is kept for a
+    later run); a reply that arrives with no usable verdict raises
+    ``UnusableClassifierReply`` (the candidate is quarantined with the reply as evidence).
+    Nothing is promoted unclassified (#473).
     """
     prompt = _CLASSIFIER_PROMPT
 
@@ -1011,23 +1033,30 @@ def _make_haiku_classifier(provider) -> Classifier:
         # it (the first-400-character cut is gone, spec §5 item 1, S51), in its
         # fence; each EXISTING memory in its own fence (S106, S136).
         user = _classifier_user_message(cand, context)
-        # The CALL is outside the fail-open try: a call that fails (a deferral, a CLI error, a timeout) means the candidate
-        # was not classified, so the exception goes to the gate, which keeps the candidate for a later run (#473).
+        # The CALL is outside any try: a call that fails (a deferral, a CLI error, a timeout) means the candidate was not
+        # classified, so the exception goes to the gate, which keeps the candidate for a later run (#473).
         raw = provider.generate(user, system=prompt)
+        reply = raw if isinstance(raw, str) else ""
+        if not reply.strip():
+            raise UnusableClassifierReply("empty reply", reply)
+        match = re.search(r"\{.*\}", reply, re.DOTALL)
+        if match is None:
+            raise UnusableClassifierReply("no JSON object in the reply", reply)
         try:
-            data = json.loads(_extract_json(raw))
-            verdict = str(data.get("verdict", "new"))
-            if verdict not in VERDICTS:
-                verdict = "new"
-            return Decision(
-                verdict=verdict,
-                target_id=data.get("target_id") or None,
-                merged_content=data.get("merged_content") or None,
-                names=_parse_names(data.get("names"), source="gate judge"),
-            )
-        except Exception:  # noqa: BLE001 — a reply that cannot be read keeps the candidate's content (fail-open)
-            logger.warning("consolidation Haiku reply could not be read; promoting candidate")
-            return Decision("new")
+            data = json.loads(match.group(0))
+        except (ValueError, RecursionError) as exc:
+            raise UnusableClassifierReply("the reply is not valid JSON", reply) from exc
+        if not isinstance(data, dict):
+            raise UnusableClassifierReply("the reply JSON is not an object", reply)
+        verdict = data.get("verdict")
+        if not isinstance(verdict, str) or verdict not in VERDICTS:
+            raise UnusableClassifierReply(f"no usable verdict (got {str(verdict)[:60]!r})", reply)
+        return Decision(
+            verdict=verdict,
+            target_id=data.get("target_id") or None,
+            merged_content=data.get("merged_content") or None,
+            names=_parse_names(data.get("names"), source="gate judge"),
+        )
 
     return _classify
 

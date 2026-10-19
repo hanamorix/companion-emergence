@@ -392,3 +392,45 @@ def test_read_recent_does_not_list_an_entry_twice_after_a_mid_claim_crash(tmp_pa
     write_jsonl(tmp_path / _PROCESSING, [{**r, "_claim_id": "c1"} for r in rows])  # entries in BOTH files
 
     assert [m.content for m in q.read_recent("dream", limit=10)] == ["alpha"]
+
+
+# ---------------------------------------------------------------------------
+# NB1: a queue holding only damaged lines is emptied once they are kept aside
+# ---------------------------------------------------------------------------
+
+
+def test_a_queue_with_only_a_damaged_line_is_emptied_and_kept_aside_once(tmp_path):
+    q = PendingQueue(tmp_path)
+    q.path.write_bytes(_BAD_LINE + b"\n")
+
+    for _ in range(5):
+        batch = q.claim()
+        assert batch.entries == []
+
+    assert len(_kept_aside(tmp_path)) == 1 and _decoded(_kept_aside(tmp_path)[0]) == _BAD_LINE
+    assert q.path.read_bytes() == b""  # emptied after the first claim: nothing is re-kept on later ticks
+
+
+def test_leftovers_plus_a_damaged_only_queue_keep_the_line_aside_once(tmp_path):
+    q = PendingQueue(tmp_path)
+    q.enqueue(_mem("held"), source="dream")
+    q.claim()  # "killed": an unsettled leftover in the processing file
+    q.path.write_bytes(_BAD_LINE + b"\n")
+
+    first = q.claim()
+    second = q.claim()
+    third = q.claim()
+
+    assert _contents(first.entries) == ["held"] and _contents(second.entries) == ["held"] and _contents(third.entries) == ["held"]
+    assert len(_kept_aside(tmp_path)) == 1
+    assert q.path.read_bytes() == b""
+
+
+def test_a_processing_file_holding_only_damaged_lines_is_cleared_and_kept_aside_once(tmp_path):
+    q = PendingQueue(tmp_path)
+    (tmp_path / _PROCESSING).write_bytes(_BAD_LINE + b"\n")
+
+    for _ in range(3):
+        assert q.claim().entries == []
+
+    assert len(_kept_aside(tmp_path)) == 1

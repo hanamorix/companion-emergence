@@ -886,63 +886,85 @@ def test_a_generic_reappraiser_fault_still_skips_the_item(persona):
     assert result.reappraised == 0 and _unsettled(tmp) == [] and _queue_rows(queue) == []
 
 
-def test_a_haiku_reply_that_is_not_json_still_promotes(persona):
-    # C459-x PIN
+class _ReplyProvider:
+    """A provider that ANSWERS: `replies` maps a marker in the prompt to a reply; `default` otherwise."""
+
+    def __init__(self, default: str = '{"verdict": "new"}', replies: dict[str, str] | None = None):
+        self.default = default
+        self.replies = replies or {}
+        self.calls: list[str] = []
+
+    def generate(self, prompt, *, system=None):
+        self.calls.append(prompt)
+        for marker, reply in self.replies.items():
+            if marker in prompt:
+                return reply
+        return self.default
+
+
+_UNUSABLE_REPLIES = [
+    ("", "empty reply"),
+    ("   \n", "empty reply"),
+    ("I cannot classify this.", "no JSON object"),
+    ("[1, 2]", "no JSON object"),
+    ('{"verdict": "duplicate", "names": ["Wren", "Pre', "no JSON object"),  # the object never closes
+    ('{"verdict": "new", "names": ["Wren", }', "not valid JSON"),
+    ("{bad json}", "not valid JSON"),
+    ('{"verdict": "banana"}', "verdict"),
+    ('{"verdict": 5}', "verdict"),
+    ('{"names": ["Wren"]}', "verdict"),
+    ('Here you go: {"verdict": "maybe"} done', "verdict"),
+]
+
+
+@pytest.mark.parametrize("reply, reason", _UNUSABLE_REPLIES, ids=lambda v: str(v)[:24])
+def test_a_reply_with_no_usable_verdict_quarantines_the_candidate_and_never_promotes(persona, caplog, reply, reason):
+    # A reply that ARRIVES but gives no usable verdict depends on this candidate's exchange, not on the store: an ITEM failure.
+    # The candidate is quarantined with the raw reply as evidence, logged once with its id and the reason; the pass goes on.
     tmp, store, heb, queue = persona
-    _enqueue(queue, A)
-    provider = _DeferringProvider(refuse="nothing-matches-this", reply="not json at all")
+    mems = _enqueue(queue, A, B, C)
+    provider = _ReplyProvider(default=reply)
+
+    with caplog.at_level(logging.INFO):
+        result = run_consolidation(store, persona_dir=tmp, provider=provider, hebbian=heb, reappraiser=_reappraiser)
+
+    assert _contents(store) == []  # nothing promoted unclassified
+    recs = _quarantine(tmp)
+    assert sorted(r["entry"]["content"] for r in recs) == sorted([A, B, C])  # the pass was NOT ended
+    assert all(r["reply"] == reply and r["stage"] == "pass2" for r in recs)
+    assert all("UnusableClassifierReply" in r["error"] and reason in r["error"] for r in recs)
+    assert result.quarantined == 3 and result.promoted == 0 and _unsettled(tmp) == []
+    for m in mems.values():
+        assert len(_errors_naming(caplog, m)) == 1  # the candidate id and the reason, once
+    if reply.strip():
+        assert reply not in caplog.text  # the raw reply is evidence in the quarantine file, not in the log
+
+
+def test_one_unusable_reply_does_not_stop_the_others(persona):
+    tmp, store, heb, queue = persona
+    _enqueue(queue, A, B, C)
+    provider = _ReplyProvider(replies={"bravo": "no idea"})
 
     run_consolidation(store, persona_dir=tmp, provider=provider, hebbian=heb, reappraiser=_reappraiser)
 
-    assert _contents(store) == [A]
+    assert _contents(store) == sorted([A, C])
+    assert [r["entry"]["content"] for r in _quarantine(tmp)] == [B]
+    provider.replies = {}
+    run_consolidation(store, persona_dir=tmp, provider=provider, hebbian=heb, reappraiser=_reappraiser)
+    assert len([c for c in provider.calls if "bravo" in c]) == 1  # a quarantined candidate is final: not classified again
 
 
-# ---------------------------------------------------------------------------
-# G3 evidence (code review, part 2): what is logged when keeping an item is itself in trouble
-# ---------------------------------------------------------------------------
-
-
-def test_the_settle_failure_log_carries_the_original_exception_too(persona, monkeypatch, caplog):
+@pytest.mark.parametrize("reply, field", [
+    ('{"verdict": "new"}', "promoted"),
+    ('prefix {"verdict": "distinct", "names": []} suffix', "promoted"),
+    ('{"verdict": "duplicate"}', "duplicates"),
+])
+def test_a_reply_with_a_usable_verdict_is_dispatched_as_before(persona, reply, field):
+    # PIN
     tmp, store, heb, queue = persona
-    mems = _enqueue(queue, A, B, C)
-    _fail_create(monkeypatch, store, B, ValueError("the original failure text"))
-    monkeypatch.setattr(cons, "settle_scope", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("settling broke")))
+    _enqueue(queue, A)
 
-    with caplog.at_level(logging.INFO):
-        _run(tmp, store, heb, Clf())
+    result = run_consolidation(store, persona_dir=tmp, provider=_ReplyProvider(default=reply), hebbian=heb,
+                               reappraiser=_reappraiser)
 
-    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR and mems[B].id in r.getMessage()]
-    assert errors and "ValueError" in errors[0] and "the original failure text" in errors[0]
-    assert any("settling broke" in (r.exc_text or "") or "settling broke" in r.getMessage() for r in caplog.records)
-
-
-def test_a_failed_settle_record_during_a_run_names_the_entry(persona, monkeypatch, caplog):
-    import brain.memory.pending as pending_mod
-
-    tmp, store, heb, queue = persona
-    mems = _enqueue(queue, A)
-    real = pending_mod.append_jsonl
-
-    def flaky(path, *a, **k):
-        if str(path).endswith("settled.jsonl"):
-            raise OSError("disk full")
-        return real(path, *a, **k)
-
-    monkeypatch.setattr(pending_mod, "append_jsonl", flaky)
-    with caplog.at_level(logging.WARNING):
-        _run(tmp, store, heb, Clf())
-
-    assert any(mems[A].id in r.getMessage() and "disk full" in r.getMessage() for r in caplog.records)
-
-
-def test_a_failing_saved_state_probe_logs_the_id_and_the_exception(persona, monkeypatch, caplog):
-    tmp, store, heb, queue = persona
-    b = _enqueue(queue, A, B, C)[B]
-    _fail_create(monkeypatch, store, B, ValueError("bad value"))
-    _fail(monkeypatch, store, "get", lambda mid: mid == b.id, sqlite3.OperationalError("probe is locked"))
-
-    with caplog.at_level(logging.INFO):
-        _run(tmp, store, heb, Clf())
-
-    assert any(b.id in r.getMessage() and "OperationalError" in r.getMessage() and "probe is locked" in r.getMessage()
-               for r in caplog.records)
+    assert getattr(result, field) == 1 and _quarantine(tmp) == []

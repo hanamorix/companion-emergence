@@ -145,13 +145,15 @@ class PendingQueue:
         settled = {r.get("id") for r in read_jsonl(self.settled_path)} if self.settled_path.exists() else set()
         return [e for e in read_jsonl(self.processing_path) if e.get("_claim_id") not in settled]
 
-    def _read_keeping_damaged(self, path: Path) -> list[dict]:
+    def _read_keeping_damaged(self, path: Path) -> tuple[list[dict], bool]:
         """Read a queue-shaped JSONL file; an I/O fault raises. A damaged line is KEPT ASIDE, not skipped.
 
         A plain read skips a damaged line, and the caller then rewrites the file without it: the line, the only copy of a
         claimed entry, would be gone. Here each damaged line is appended to ``pending_candidates.damaged.jsonl`` (its raw bytes
         base64-encoded, plus the file it came from, its position among the non-blank lines and a timestamp) BEFORE the
-        caller changes anything; if that append fails the read raises and nothing has changed.
+        caller changes anything; if that append fails the read raises and nothing has changed. Returns the good entries and
+        whether any line was damaged: a file whose only content was damaged lines must still be emptied by the caller once
+        they are kept aside, or every tick would keep the same lines aside again.
         """
         entries: list[dict] = []
         damaged: list[tuple[int, str]] = []
@@ -181,7 +183,7 @@ class PendingQueue:
                 "pending queue: %d damaged line(s) in %s kept aside in %s (positions %s)",
                 len(records), path.name, self.damaged_path.name, ", ".join(str(r["line"]) for r in records),
             )
-        return entries
+        return entries, bool(damaged)
 
     def enqueue_reappraisal(self, memory_id: str, *, source: str, include_held: bool = True) -> None:
         """Enqueue an existing-memory importance re-appraise request (P3
@@ -273,7 +275,7 @@ class PendingQueue:
             return []
         with file_lock(self.path):
             # RAISE: the file is emptied right after this read, so a failed read must raise, not drain nothing.
-            rows = self._read_keeping_damaged(self.path)
+            rows, _ = self._read_keeping_damaged(self.path)
             write_jsonl(self.path, [], fsync=False)  # empty the data file (the lock sidecar is separate)
         return rows
 
@@ -303,10 +305,9 @@ class PendingQueue:
                     if self.settled_path.exists()
                     else set()
                 )
-                leftovers = [
-                    e for e in self._read_keeping_damaged(self.processing_path) if e.get("_claim_id") not in settled
-                ]
-            queued = self._read_keeping_damaged(self.path) if self.path.exists() else []
+                kept, _ = self._read_keeping_damaged(self.processing_path)
+                leftovers = [e for e in kept if e.get("_claim_id") not in settled]
+            queued, queue_damaged = self._read_keeping_damaged(self.path) if self.path.exists() else ([], False)
             # One re-appraise item per memory id: an outage piles them up (every recall enqueues them) and each tick would
             # otherwise re-stamp and rewrite the whole pile.
             seen_ids: set = set()
@@ -322,10 +323,12 @@ class PendingQueue:
                 if had_files:  # everything in them was settled: clear the stale files
                     self.processing_path.unlink(missing_ok=True)
                     self.settled_path.unlink(missing_ok=True)
+                if queue_damaged:  # only damaged lines: kept aside above, so empty the file or the next tick keeps them again
+                    write_jsonl(self.path, [], fsync=False)
                 return ClaimedBatch(self, [])
             write_jsonl(self.processing_path, entries, nonfinite="null")  # durable BEFORE the queue is emptied
             write_jsonl(self.settled_path, [], fsync=False)
-            if queued:
+            if queued or queue_damaged:
                 write_jsonl(self.path, [], fsync=False)  # empty the data file (the lock sidecar is separate)
         return ClaimedBatch(self, entries)
 
