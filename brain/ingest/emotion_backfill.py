@@ -446,7 +446,9 @@ def run_emotion_backfill(
                         "emotion_backfill: throttle slot unavailable — "
                         "deferring; cursor preserved for next pass"
                     )
-                    break
+                    # #487: RETURN, not break: falling through would run the completion tail and mark a run
+                    # that stopped part-way `complete`, leaving the rest untagged forever.
+                    return state
 
                 # #473: check the budget now (read-only); charge it after a tagger call that was not refused.
                 if not _budget_allows(persona_dir, now=now_dt, cap=cap):
