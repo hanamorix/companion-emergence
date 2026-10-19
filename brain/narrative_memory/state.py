@@ -46,7 +46,7 @@ class ArcsState:
 
 
 def save_state(persona_dir: Path, state: ArcsState) -> None:
-    """Atomic JSON save of ArcsState via save_with_backup.
+    """Atomic JSON save of ArcsState via json_io.write_json (.bak rotation).
 
     Arc + ArcMember dataclasses serialise via _arc_to_dict; tuples become
     lists in JSON, deserialised back to tuples on load.

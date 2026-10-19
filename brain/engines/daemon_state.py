@@ -256,7 +256,7 @@ _STATE_FILENAME = "daemon_state.json"
 
 
 def save_daemon_state(persona_dir: Path, state: DaemonState) -> None:
-    """Atomic-write a DaemonState to daemon_state.json via save_with_backup."""
+    """Atomic-write a DaemonState to daemon_state.json via json_io.write_json (.bak rotation)."""
     path = persona_dir / _STATE_FILENAME
     write_json(path, state.to_dict(), backups=3)
 
@@ -298,7 +298,7 @@ def update_daemon_state(
 
     Loads current state, sets last_<daemon_type> to the new fire entry,
     recomputes emotional_residue from this fire, then atomic-writes via
-    save_with_backup. Returns the updated state.
+    json_io.write_json. Returns the updated state.
 
     Residue rules (mirror OG nell_brain.py:2066-2072):
       emotion   = fire.dominant_emotion

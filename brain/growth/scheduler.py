@@ -217,7 +217,7 @@ def _is_valid_name(name: str) -> bool:
 
 
 def _append_to_vocabulary(vocab_path: Path, proposal: EmotionProposal) -> None:
-    """Atomic append to emotion_vocabulary.json via save_with_backup."""
+    """Atomic append to emotion_vocabulary.json via json_io.write_json (.bak rotation)."""
     from brain.health.adaptive import compute_treatment
     data = read_json(vocab_path, default=lambda: {"version": 1, "emotions": []}, recover=Recovery.RAISE)
     data["emotions"].append(

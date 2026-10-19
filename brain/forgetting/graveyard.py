@@ -2,7 +2,7 @@
 
 Mirrors brain/growth/arc_storage.py removed_arcs.jsonl exactly:
   - file_lock + os.fsync atomic append (Windows-safe)
-  - iter_jsonl_skipping_corrupt for tolerant reads
+  - brain.health.json_io read_jsonl/iter_jsonl for reads (a bad line is skipped with a warning)
 
 Spec: docs/superpowers/specs/2026-05-18-forgetting-design.md §5
 """

@@ -117,7 +117,7 @@ def test_forced_write_failure_restores_original_bytes_and_logs(
     def _boom(*_a, **_kw):
         raise OSError("simulated disk failure during migration write")
 
-    monkeypatch.setattr("os.replace", _boom)  # json_io (via attempt_heal) replaces through os.replace
+    monkeypatch.setattr("os.replace", _boom)  # json_io replaces through os.replace
 
     with caplog.at_level("WARNING"):
         migrate_idle_keys(tmp_path)  # must not raise

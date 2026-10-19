@@ -189,7 +189,7 @@ class HeartbeatConfig:
         return cfg
 
     def save(self, path: Path) -> None:
-        """Atomic save via .bak rotation (save_with_backup).
+        """Atomic save via .bak rotation (json_io.write_json).
 
         A crash mid-write leaves either the previous valid file or the new
         valid file — never a partial write that corrupts the user's config.

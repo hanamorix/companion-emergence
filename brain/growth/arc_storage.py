@@ -9,7 +9,7 @@ Two persistent files per persona:
   .last_arc_snapshot.json — single JSON file with the post-tick arc set,
                             read at start of each tick to detect user
                             file-edits via diff. Atomic write via
-                            save_with_backup.
+                            json_io.write_json.
 
 The graveyard is the source of truth for "did Hana remove this in the last
 15 days?" — gate 3 in §6 of the spec consults `recently_removed_names`.
@@ -101,7 +101,7 @@ def write_arc_snapshot(
     arcs: list[ReflexArc],
     snapshot_at: datetime,
 ) -> None:
-    """Atomic write of .last_arc_snapshot.json via save_with_backup."""
+    """Atomic write of .last_arc_snapshot.json via json_io.write_json."""
     path = persona_dir / SNAPSHOT_FILENAME
     payload = {
         "version": 1,

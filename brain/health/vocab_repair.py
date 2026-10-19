@@ -269,7 +269,7 @@ def _merge_variant_entries(data: dict) -> list[tuple[str, str]]:
 
 
 def _atomic_write_vocab(vocab_path: Path, data: dict) -> None:
-    """Atomic JSON write with .bak rotation via save_with_backup."""
+    """Atomic JSON write with .bak rotation via json_io.write_json."""
     write_json(vocab_path, data, backups=3)
 
 

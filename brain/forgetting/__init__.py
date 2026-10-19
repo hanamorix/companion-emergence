@@ -37,7 +37,7 @@ def _load_forgetting_state(persona_dir: Path) -> dict[str, int]:
 
 
 def _persist_forgetting_state(persona_dir: Path, counters: dict[str, int]) -> None:
-    """Atomic save via save_with_backup."""
+    """Atomic save with .bak rotation via json_io.write_json."""
     write_json(persona_dir / FORGETTING_STATE_FILENAME, counters, backups=3)
 
 

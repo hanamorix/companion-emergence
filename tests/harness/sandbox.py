@@ -575,7 +575,7 @@ def _live_bridges(home: Path | None = None) -> list[tuple[int, str]]:
     stage-3 F1). Liveness is decided by the REAL, side-effect-free ``state_file.pid_is_alive``.
 
     **Read-only, deliberately:** we parse ``bridge.json`` bytes directly and never call
-    ``state_file.read()`` — ``read()`` heals-on-read (``attempt_heal`` can ``os.replace`` a ``.bak``
+    ``state_file.read()`` — ``read()`` heals-on-read (json_io's HEAL can ``os.replace`` a ``.bak``
     over a corrupt primary), which would WRITE to the developer's real files. The cost is a known,
     accepted gap: a live bridge whose primary ``bridge.json`` is corrupt-but-``.bak``-recoverable is
     NOT detected here (backstopped by the post-run :class:`SandboxLeak`).
