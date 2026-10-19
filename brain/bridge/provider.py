@@ -82,6 +82,12 @@ _BUDGET_FALLBACK: float = tunables.register("provider.max_turn_budget_usd.fallba
 # (a 5000-digit run) or RecursionError (nesting beyond the recursion limit). JSONDecodeError is a ValueError.
 _JSON_LINE_ERRORS: tuple[type[BaseException], ...] = (ValueError, RecursionError)
 
+
+def _text_only(value: object) -> str:
+    """The value if it is a string, else "". A JSON `null` (or a number) in a text field is not text: `str(None)`
+    would put the literal word "None" into a reply (#467)."""
+    return value if isinstance(value, str) else ""
+
 # The result-frame subtype the CLI reports when --max-budget-usd stops a turn (exit code 1).
 _BUDGET_SUBTYPE: str = "error_max_budget_usd"
 
@@ -932,7 +938,7 @@ class ClaudeCliProvider(LLMProvider):
             cli_err = _cli_error_detail(payload)
             if cli_err is not None:
                 raise RuntimeError(f"ClaudeCliProvider: {cli_err}")
-            return str(payload["result"])
+            return _text_only(payload["result"])
         except (*_JSON_LINE_ERRORS, KeyError, TypeError) as exc:
             raise RuntimeError(
                 f"ClaudeCliProvider: unexpected output format: {result.stdout[:200]!r}"
@@ -1048,7 +1054,7 @@ class ClaudeCliProvider(LLMProvider):
                 if payload is None:
                     raise ValueError("no result frame")
                 if _is_over_budget_frame(payload):
-                    partial = str(payload.get("result", "")).strip()
+                    partial = _text_only(payload.get("result")).strip()
                     text = (
                         f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}" if partial else _BUDGET_EXCEEDED_MSG
                     )
@@ -1058,7 +1064,7 @@ class ClaudeCliProvider(LLMProvider):
                 cli_err = _cli_error_detail(payload)
                 if cli_err is not None:
                     raise ProviderError("claude_cli_error", cli_err)
-                content = str(payload["result"])
+                content = _text_only(payload["result"])
             except (ValueError, KeyError, TypeError) as exc:
                 raise ProviderError(
                     "claude_cli_parse",
@@ -1328,16 +1334,22 @@ class ClaudeCliProvider(LLMProvider):
                     tool_in_flight = False
                     tool_name = None
                     if t == "stream_event":
-                        event = obj.get("event", {})
-                        if event.get("type") == "content_block_delta":
-                            delta = event.get("delta", {})
-                            if delta.get("type") == "text_delta":
-                                text = str(delta.get("text", ""))
-                                delta_chunks.append(text)
-                                yield TextDelta(text=text)
+                        # A frame whose nested value is not an object carries no text: skip it, as the line-level
+                        # non-object skip above does (#467). Only a string is text.
+                        event = obj.get("event")
+                        if isinstance(event, dict) and event.get("type") == "content_block_delta":
+                            delta = event.get("delta")
+                            if isinstance(delta, dict) and delta.get("type") == "text_delta":
+                                text = delta.get("text")
+                                if isinstance(text, str):
+                                    delta_chunks.append(text)
+                                    yield TextDelta(text=text)
                     elif t == "assistant":
                         # Snapshot frame — fallback content when result frame absent.
-                        msg_content = obj.get("message", {}).get("content", [])
+                        # None, not [], for a message that is not an object: a skipped frame must change nothing
+                        # (an empty list would reset `assistant_snapshot` below). Same shape as the blocking scanner.
+                        message = obj.get("message", {})
+                        msg_content = message.get("content", []) if isinstance(message, dict) else None
                         _collect_builtin_calls(msg_content, builtin_calls)
                         if isinstance(msg_content, list):
                             for blk in msg_content:
@@ -1354,7 +1366,7 @@ class ClaudeCliProvider(LLMProvider):
                     elif t == "user":
                         _collect_builtin_results(obj, builtin_calls)
                     elif t == "result":
-                        result_text = str(obj.get("result", ""))
+                        result_text = _text_only(obj.get("result", ""))
                         metadata: dict[str, Any] = {
                             k: obj[k]
                             for k in ("duration_ms", "num_turns", "stop_reason", "is_error")
@@ -1585,7 +1597,7 @@ class ClaudeCliProvider(LLMProvider):
                 if payload is None:
                     raise ValueError("no result frame")
                 if _is_over_budget_frame(payload):
-                    partial = str(payload.get("result", "")).strip()
+                    partial = _text_only(payload.get("result")).strip()
                     text = (
                         f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}" if partial else _BUDGET_EXCEEDED_MSG
                     )
@@ -1606,7 +1618,7 @@ class ClaudeCliProvider(LLMProvider):
                 cli_err = _cli_error_detail(payload)
                 if cli_err is not None:
                     raise ProviderError("claude_cli_error", cli_err)
-                content = str(payload["result"])
+                content = _text_only(payload["result"])
             except (ValueError, KeyError, TypeError) as exc:
                 raise ProviderError(
                     "claude_cli_parse",
