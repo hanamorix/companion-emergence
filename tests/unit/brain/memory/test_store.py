@@ -121,6 +121,18 @@ def test_memory_to_dict_round_trips_last_accessed_and_protected() -> None:
     assert restored.protected is True
 
 
+@pytest.mark.parametrize("field", ["score", "importance"])
+def test_memory_from_dict_treats_null_like_missing(field: str) -> None:
+    """#463: a present-but-null score or importance restores as 0.0, the same as
+    a missing one, instead of raising TypeError (float(None)) and dropping the record."""
+    data = Memory.create_new(content="x", memory_type="meta", domain="work").to_dict()
+    missing = {k: v for k, v in data.items() if k != field}
+    nulled = {**data, field: None}
+
+    assert getattr(Memory.from_dict(nulled), field) == 0.0
+    assert getattr(Memory.from_dict(nulled), field) == getattr(Memory.from_dict(missing), field)
+
+
 def test_memory_from_dict_coerces_naive_timestamps_to_utc() -> None:
     """Naive created_at AND last_accessed_at in JSON both restore as UTC-aware."""
     data = {

@@ -1164,8 +1164,8 @@ async fn install_supervisor_service_impl(
 /// `install_nell_cli_symlink` for the frontend; the mechanism depends on the install:
 ///
 /// * macOS and Linux .deb: a symlink at `~/.local/bin/nell` pointing at the bundled CLI
-///   ([`install_symlink_to`], unchanged). On Linux a user's own `nell` (file or symlink) is never
-///   overwritten.
+///   ([`install_symlink_to`], unchanged). A user's own `nell` (file or symlink) is never
+///   overwritten (Linux #409, macOS #413).
 /// * Linux AppImage: a small script at `~/.local/bin/nell` that runs the AppImage in CLI mode
 ///   (`--companion-nell-cli`), which hands off to the bundled `nell` before the GUI starts. The
 ///   script is refreshed on every app launch in case the AppImage moved.
@@ -1246,12 +1246,10 @@ fn execute_symlink(
     target_dir: &std::path::Path,
     target: &std::path::Path,
 ) -> InitResult {
-    // macOS keeps its original behaviour exactly; only Linux gets the stricter "never replace a
-    // user's own nell" pre-check.
-    if nell_shortcut::current_os() != nell_shortcut::Os::MacOs {
-        if let Err(outcome) = nell_shortcut::prepare_linux_symlink(target, bundled) {
-            return init_result_from(outcome);
-        }
+    // Never replace a user's own nell (a file, or a symlink that doesn't point at a bundled
+    // runtime). Linux since #409, macOS since #413.
+    if let Err(outcome) = nell_shortcut::prepare_linux_symlink(target, bundled) {
+        return init_result_from(outcome);
     }
     install_symlink_to(bundled, target_dir, target).unwrap_or_else(|e| InitResult {
         success: false,
@@ -2327,6 +2325,30 @@ mod tests {
         assert!(body.starts_with("#!/usr/bin/env python"));
     }
 
+    // #413: the shortcut step must not replace a user's own `nell` symlink (for example
+    // one into a source checkout) on any Unix, macOS included. Exit 73, link untouched.
+    #[cfg(unix)]
+    #[test]
+    fn execute_symlink_refuses_to_replace_a_foreign_symlink() {
+        let dir = tempdir().unwrap();
+        let bundled = dir.path().join("app/python-runtime/bin/nell");
+        std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        std::fs::write(&bundled, "x").unwrap();
+        let theirs = dir.path().join("src/companion-emergence/.venv/bin/nell");
+        std::fs::create_dir_all(theirs.parent().unwrap()).unwrap();
+        std::fs::write(&theirs, "x").unwrap();
+
+        let target_dir = dir.path().join("home/.local/bin");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let target = target_dir.join("nell");
+        std::os::unix::fs::symlink(&theirs, &target).unwrap();
+
+        let r = execute_symlink(&bundled, &target_dir, &target);
+        assert!(!r.success, "expected refusal: {:?}", r);
+        assert_eq!(r.exit_code, 73);
+        assert_eq!(std::fs::read_link(&target).unwrap(), theirs);
+    }
+
     #[cfg(unix)]
     #[test]
     fn install_symlink_to_creates_parent_dir_if_missing() {
@@ -2786,7 +2808,8 @@ mod kindled_home_tests {
     }
 
     /// Linux deb path through the real command code: a user's own `nell` is never overwritten, a
-    /// fresh target gets the symlink (macOS keeps its original behaviour, covered above).
+    /// fresh target gets the symlink. macOS runs the same check since #413
+    /// (`execute_symlink_refuses_to_replace_a_foreign_symlink`).
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_symlink_refuses_a_users_own_nell_and_links_when_free() {
