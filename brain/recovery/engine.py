@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.forgetting import graveyard
-from brain.health.json_io import read_json, write_json
+from brain.health.json_io import Recovery, read_json, write_json
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 from brain.recovery.report import RecoveryReport
@@ -166,6 +166,11 @@ def run_recovery(
             edges_repaired=0, edges_pruned_unrecoverable=0,
             backup_path=None, elapsed_seconds=time.monotonic() - started, dry_run=True,
         )
+    # The manifest is read BEFORE anything is changed (#461): it feeds a rewrite below, so a read it could not do must not look
+    # like an empty manifest. HEAL keeps a damaged file aside as source-manifest.json.corrupt-<ts> (or restores a valid
+    # backup) and an I/O fault raises, here, before the backup and the restores. Absent is a normal first write.
+    p_manifest = persona_dir / "source-manifest.json"
+    mdata: dict = read_json(p_manifest, default=dict, recover=Recovery.HEAL, expect=dict)
     # backup
     ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
     backup_dir = persona_dir / f"recover-backup-{ts}"
@@ -184,9 +189,6 @@ def run_recovery(
 
     # grace-refresh
     from brain.felt_time.state import load_or_recover
-    p_manifest = persona_dir / "source-manifest.json"
-    # An absent, corrupt or unreadable manifest starts empty (unchanged); the module warns about the last two.
-    mdata: dict = read_json(p_manifest, default=dict, expect=dict)
     state, _ = load_or_recover(persona_dir)
     now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     mdata["migrated_at_utc"] = now_iso
