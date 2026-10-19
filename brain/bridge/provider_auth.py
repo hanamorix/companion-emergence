@@ -33,7 +33,7 @@ from brain.bridge.cli_throttle import ThrottleDeferred
 log = logging.getLogger(__name__)
 
 _REPROBE_S_DEFAULT = tunables.register("provider_auth.reprobe_seconds", 900.0)
-REPROBE_S = _REPROBE_S_DEFAULT  # read through _reprobe_s() at call time
+REPROBE_S = _REPROBE_S_DEFAULT  # read through reprobe_interval_s() at call time
 WEAK_CONFIRM_S = 60.0
 
 _STRONG = ("oauth session expired",)
@@ -59,7 +59,9 @@ class ProviderAuthDeferred(ThrottleDeferred):
     """
 
 
-def _reprobe_s() -> float:
+def reprobe_interval_s() -> float:
+    """Seconds between re-probes of an expired login (the tunable ``provider_auth.reprobe_seconds``, 900 s). Also
+    the cadence the bridge's start-up model re-check uses, so repeated starts do not become a probe storm."""
     return float(tunables.get_tunable("provider_auth.reprobe_seconds", _REPROBE_S_DEFAULT))
 
 
@@ -100,7 +102,7 @@ def note_cli_failure(detail: str) -> None:
             log.warning(
                 "provider auth EXPIRED — background LLM calls backed off to one probe per "
                 "%.0fs until a call succeeds; re-authorise from the connection panel: %s",
-                _reprobe_s(),
+                reprobe_interval_s(),
                 _detail,
             )
     except Exception:  # noqa: BLE001 — fail open
@@ -134,7 +136,7 @@ def should_skip_background() -> bool:
             if _status != "expired":
                 return False
             now = _monotonic()
-            if (now - _last_probe_monotonic) >= _reprobe_s():
+            if (now - _last_probe_monotonic) >= reprobe_interval_s():
                 _last_probe_monotonic = now
                 return False  # the probe
             return True

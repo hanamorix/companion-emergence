@@ -414,6 +414,11 @@ def test_each_rechecked_id_is_logged_with_its_outcome(persona_dir: Path, monkeyp
 # --- restart throttle (no probe storm on a crash loop) -----------------------------------------------------------------
 
 
+def _stamp_path(persona_dir: Path) -> Path:
+    """Where the stamp must live: under <persona>/cadence/, like every persisted cadence file (#178)."""
+    return persona_dir / "cadence" / server_mod._RECHECK_STAMP
+
+
 def test_a_second_start_within_the_reprobe_interval_does_not_probe_again(persona_dir: Path, monkeypatch, bg_stubs):
     p = _write(persona_dir)
     run = _Run(lambda m: _proc(1, _rej_json(m)))  # still rejected: the id stays saved, so a restart would re-probe
@@ -421,7 +426,7 @@ def test_a_second_start_within_the_reprobe_interval_does_not_probe_again(persona
         with TestClient(_app(persona_dir, monkeypatch)) as c:
             assert _wait(lambda: _recheck_done(c.app))
         assert run.calls_for(DERIVED) == 1
-        assert (persona_dir / server_mod._RECHECK_STAMP).exists()
+        assert _stamp_path(persona_dir).exists()
         for _ in range(3):  # a crash loop
             with TestClient(_app(persona_dir, monkeypatch)) as c:
                 time.sleep(0.2)
@@ -429,13 +434,34 @@ def test_a_second_start_within_the_reprobe_interval_does_not_probe_again(persona
     assert run.calls_for(DERIVED) == 1 and _list(p) == [DERIVED]
 
 
+def test_the_stamp_lands_under_cadence_not_at_the_persona_root(persona_dir: Path, monkeypatch, bg_stubs):
+    _write(persona_dir)
+    with patch("subprocess.run", _Run(lambda m: _proc(1, _rej_json(m)))), TestClient(_app(persona_dir, monkeypatch)) as c:
+        assert _wait(lambda: _recheck_done(c.app))
+    assert _stamp_path(persona_dir).is_file()
+    assert not (persona_dir / server_mod._RECHECK_STAMP).exists()
+
+
+def test_a_legacy_root_stamp_is_migrated_and_honoured(persona_dir: Path, monkeypatch, bg_stubs):
+    _write(persona_dir)
+    legacy = persona_dir / server_mod._RECHECK_STAMP  # what the first version of this change wrote
+    legacy.write_text("")
+    run = _Run(lambda m: _proc(0, _ok_json()))
+    with patch("subprocess.run", run), TestClient(_app(persona_dir, monkeypatch)) as c:
+        time.sleep(0.3)
+        assert getattr(c.app.state, "derived_recheck_task", None) is None  # a fresh legacy stamp still throttles
+    assert run.models == []
+    assert _stamp_path(persona_dir).is_file() and not legacy.exists()  # moved to cadence/
+
+
 def test_an_old_stamp_lets_the_recheck_run_again(persona_dir: Path, monkeypatch, bg_stubs):
     import os
 
     p = _write(persona_dir)
-    stamp = persona_dir / server_mod._RECHECK_STAMP
+    stamp = _stamp_path(persona_dir)
+    stamp.parent.mkdir(parents=True, exist_ok=True)
     stamp.write_text("")
-    old = time.time() - provider_auth._reprobe_s() - 5
+    old = time.time() - provider_auth.reprobe_interval_s() - 5
     os.utime(stamp, (old, old))
     run = _Run(lambda m: _proc(0, _ok_json()))
     with patch("subprocess.run", run), TestClient(_app(persona_dir, monkeypatch)) as c:
@@ -444,11 +470,30 @@ def test_an_old_stamp_lets_the_recheck_run_again(persona_dir: Path, monkeypatch,
     assert time.time() - stamp.stat().st_mtime < 60  # restamped
 
 
+def test_an_old_legacy_stamp_is_migrated_and_the_recheck_runs(persona_dir: Path, monkeypatch, bg_stubs):
+    import os
+
+    _write(persona_dir)
+    legacy = persona_dir / server_mod._RECHECK_STAMP
+    legacy.write_text("")
+    old = time.time() - provider_auth.reprobe_interval_s() - 5
+    os.utime(legacy, (old, old))
+    run = _Run(lambda m: _proc(0, _ok_json()))
+    with patch("subprocess.run", run), TestClient(_app(persona_dir, monkeypatch)) as c:
+        assert _wait(lambda: _recheck_done(c.app))
+    assert run.calls_for(DERIVED) == 1 and not legacy.exists() and _stamp_path(persona_dir).is_file()
+
+
 def test_no_stamp_is_written_when_there_is_nothing_to_recheck(persona_dir: Path, monkeypatch, bg_stubs):
     _write(persona_dir, unavailable=())
     with patch("subprocess.run", _Run(lambda m: _proc(0, _ok_json()))), TestClient(_app(persona_dir, monkeypatch)):
         time.sleep(0.2)
-    assert not (persona_dir / server_mod._RECHECK_STAMP).exists()
+    assert not _stamp_path(persona_dir).exists() and not (persona_dir / server_mod._RECHECK_STAMP).exists()
+
+
+def test_the_reprobe_interval_is_a_public_named_function():
+    assert provider_auth.reprobe_interval_s() == provider_auth.REPROBE_S
+    assert not hasattr(provider_auth, "_reprobe_s")  # no private alias kept: nothing else called it
 
 
 def test_a_reworded_rejection_is_logged_as_rejected_from_the_code(persona_dir: Path, monkeypatch, bg_stubs, caplog):

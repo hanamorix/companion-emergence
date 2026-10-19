@@ -2707,7 +2707,7 @@ def _model_set_via_bridge(state: Any, model: str, persona: str) -> tuple[int, An
     headers = {"Content-Type": "application/json"}
     if state.auth_token:
         headers["Authorization"] = f"Bearer {state.auth_token}"
-    payload = json.dumps({"model": model}).encode("utf-8")
+    payload = json.dumps({"model": model}).encode("utf-8")  # json-io: ok -- HTTP request body to the bridge
     # The endpoint keeps itself inside one check budget (a wait for the lock counts against it); twice that is the margin.
     wait_s = server_mod._check_budget_s() * 2
     conn = http.client.HTTPConnection("127.0.0.1", state.port, timeout=wait_s)
@@ -2758,7 +2758,7 @@ def _model_set_via_bridge(state: Any, model: str, persona: str) -> tuple[int, An
         conn.close()
     text = raw.decode("utf-8", errors="replace")
     try:
-        return status, json.loads(text)
+        return status, json.loads(text)  # json-io: ok -- HTTP response body from the bridge
     except ValueError:
         return status, {"detail": text if status != 200 else "the answer was not JSON"}
 

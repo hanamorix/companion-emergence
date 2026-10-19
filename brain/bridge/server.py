@@ -719,22 +719,30 @@ def _apply_recheck_outcomes(persona_dir: Path, chat_model: str, outcomes: dict[s
 
 # The start-up re-check leaves a stamp file; a start within the Claude CLI re-probe interval of the previous
 # one does not probe again, so a crash loop, an idle-shutdown relaunch or several app relaunches cannot turn
-# into a probe storm. The interval is provider_auth's existing re-probe cadence (900 s), not a new number; the
-# stamp is a file because the repeats are separate processes.
+# into a probe storm. The interval is provider_auth's existing re-probe cadence (900 s), not a new number. The
+# stamp is a persisted cadence file, so it lives where every one does: under <persona>/cadence/, resolved by
+# brain.paths.cadence_state_path (which also moves a legacy root-level file into place). It is a file because the
+# repeats are separate processes.
 _RECHECK_STAMP = "derived_model_recheck.stamp"
 
 
 def _recheck_recent(persona_dir: Path) -> bool:
+    from brain.paths import cadence_state_path
+
     try:
-        age = time.time() - (persona_dir / _RECHECK_STAMP).stat().st_mtime
+        age = time.time() - cadence_state_path(persona_dir, _RECHECK_STAMP).stat().st_mtime
     except OSError:
         return False
-    return 0 <= age < provider_auth._reprobe_s()
+    return 0 <= age < provider_auth.reprobe_interval_s()
 
 
 def _stamp_recheck(persona_dir: Path) -> None:
+    from brain.paths import cadence_state_path
+
     try:
-        (persona_dir / _RECHECK_STAMP).write_text("", encoding="utf-8")
+        stamp = cadence_state_path(persona_dir, _RECHECK_STAMP)
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.write_text("", encoding="utf-8")
     except OSError:
         logger.warning("could not write the derived model re-check stamp", exc_info=True)
 
