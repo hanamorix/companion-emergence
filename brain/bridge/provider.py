@@ -2338,21 +2338,33 @@ class OllamaProvider(LLMProvider):
 
         try:
             data = resp.json()
-        except ValueError as exc:
+        except _JSON_LINE_ERRORS as exc:
             raise ProviderError("ollama_parse", f"invalid json: {exc}") from exc
 
+        # A body or a nested value of the wrong shape is a parse error, not an AttributeError/TypeError out of
+        # chat() (#468). A falsy `message` (null, "", 0, [], false) stays "an empty message", as it always was.
+        if not isinstance(data, dict):
+            raise ProviderError("ollama_parse", f"response is not a JSON object: {type(data).__name__}")
         msg = data.get("message") or {}
-        content: str = msg.get("content", "") or ""
-        raw_tool_calls: list[dict[str, Any]] = msg.get("tool_calls") or []
+        if not isinstance(msg, dict):
+            raise ProviderError("ollama_parse", f"message is not an object: {type(msg).__name__}")
+        content = msg.get("content", "") or ""
+        if not isinstance(content, str):
+            raise ProviderError("ollama_parse", f"message.content is not a string: {type(content).__name__}")
+        raw_tool_calls = msg.get("tool_calls") or []
+        if not isinstance(raw_tool_calls, list):
+            raise ProviderError(
+                "ollama_parse", f"message.tool_calls is not a list: {type(raw_tool_calls).__name__}"
+            )
 
         parsed_tool_calls: list[ToolCall] = []
         for tc_dict in raw_tool_calls:
             try:
                 parsed_tool_calls.append(ToolCall.from_provider_dict(tc_dict))
-            except ValueError as exc:
+            except _JSON_LINE_ERRORS as exc:
                 raise ProviderError(
                     "ollama_parse",
-                    f"malformed tool_call in response: {exc}",
+                    f"malformed tool_call in response: {str(exc)[:200]}",
                 ) from exc
 
         return ChatResponse(
@@ -2437,14 +2449,16 @@ class OllamaProvider(LLMProvider):
                         continue
                     try:
                         frame = json.loads(line)
-                    except json.JSONDecodeError as exc:
+                    except _JSON_LINE_ERRORS as exc:
                         raise ProviderError(
                             "ollama_parse",
                             f"invalid streaming line json: {exc}",
                         ) from exc
+                    if not isinstance(frame, dict):
+                        continue  # valid JSON that is not an object carries no frame (#468)
                     msg = frame.get("message") or {}
-                    chunk = msg.get("content")
-                    if chunk:
+                    chunk = msg.get("content") if isinstance(msg, dict) else None
+                    if chunk and isinstance(chunk, str):
                         yield chunk
                     if frame.get("done"):
                         return

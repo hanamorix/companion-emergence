@@ -22,6 +22,18 @@ _ALLOWED_MEDIA_TYPES = frozenset({"image/png", "image/jpeg", "image/webp", "imag
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
 
+def _short_repr(obj: object, limit: int = 200) -> str:
+    """`repr(obj)` cut to ``limit`` characters, for an error message that must stay short and must not itself raise.
+
+    A model-controlled value can be huge (a 200,000-character string) or nested past the recursion limit, where
+    `repr` raises RecursionError inside the very `except` clause that is building the message.
+    """
+    try:
+        return repr(obj)[:limit]
+    except RecursionError:
+        return f"<{type(obj).__name__}>"
+
+
 @dataclass(frozen=True)
 class TextBlock:
     """Text segment inside a multimodal message."""
@@ -205,7 +217,7 @@ class ToolCall:
             raw_args = func["arguments"]
         except (KeyError, TypeError) as exc:
             raise ValueError(
-                f"ToolCall.from_provider_dict: missing required fields in {d!r}"
+                f"ToolCall.from_provider_dict: missing required fields in {_short_repr(d)}"
             ) from exc
 
         if isinstance(raw_args, dict):
@@ -213,9 +225,9 @@ class ToolCall:
         elif isinstance(raw_args, str):
             try:
                 arguments = json.loads(raw_args)
-            except json.JSONDecodeError as exc:
+            except (ValueError, RecursionError) as exc:  # JSONDecodeError is a ValueError; so is a 5000-digit run
                 raise ValueError(
-                    f"ToolCall.from_provider_dict: cannot parse arguments JSON: {raw_args!r}"
+                    f"ToolCall.from_provider_dict: cannot parse arguments JSON: {_short_repr(raw_args)}"
                 ) from exc
             if not isinstance(arguments, dict):
                 raise ValueError(
