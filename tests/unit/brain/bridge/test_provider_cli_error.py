@@ -11,8 +11,8 @@ the error string was handed back as the call's output and parsed as if it were
 the detector's classification JSON. (A second missed path, the image path's
 stream-json parser, was deleted with the image transport in #401.)
 
-The over-budget frame stays excluded on purpose: it carries real partial work
-and has its own graceful path at each call site.
+The over-budget frame stays excluded on purpose: it is a stop, not a failure, and
+has its own graceful path at each call site.
 """
 from __future__ import annotations
 
