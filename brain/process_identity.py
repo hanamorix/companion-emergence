@@ -167,3 +167,28 @@ def matches(pid: int | None, recorded: str | None) -> str:
     if tok == GONE or tok != recorded:
         return GONE
     return "alive"
+
+
+def holder_alive(pid: int | None, recorded: str | None) -> bool:
+    """Is the holder recorded in a lock or marker file (#472) still alive?
+
+    With a recorded token: alive unless the pid is GONE or carries another token; an UNKNOWN reading counts as alive
+    (never reap a holder that may still run). Without one (a file in the older format): the pid-only check, as before.
+    """
+    if pid is None or pid <= 0:
+        return False
+    if is_token(recorded):
+        tok = token_of(pid)
+        if tok == UNKNOWN:
+            return True
+        return tok == recorded
+    from brain.bridge.state_file import pid_is_alive
+
+    return pid_is_alive(pid)
+
+
+def token_digest(token: str) -> str:
+    """A filename-safe 12-hex digest of a token (the width of the save-temp tag's existing random part)."""
+    import hashlib
+
+    return hashlib.sha1(token.encode("utf-8")).hexdigest()[:12]

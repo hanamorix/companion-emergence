@@ -506,7 +506,9 @@ def acquire_compaction_lock(
     (skip). The caller releases via release_compaction_lock in a finally.
     """
     path = _compacting_lock_path(persona_dir, session_id)
-    payload = json.dumps({"pid": os.getpid(), "ts": _now_iso()})  # json-io: ok -- O_EXCL lock-file payload: a lock protocol, not a state file
+    from brain import process_identity
+
+    payload = json.dumps({"pid": os.getpid(), "ts": _now_iso(), "token": process_identity.own_token()})  # json-io: ok -- O_EXCL lock-file payload: a lock protocol, not a state file
     try:
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -520,7 +522,8 @@ def acquire_compaction_lock(
             holder_pid = int(holder.get("pid", -1))
         except (TypeError, ValueError):
             holder_pid = -1
-        if not _pid_alive(holder_pid):
+        holder_token = holder.get("token") if isinstance(holder.get("token"), str) else None
+        if holder_pid <= 0 or not process_identity.holder_alive(holder_pid, holder_token):
             reap = True
         else:
             try:

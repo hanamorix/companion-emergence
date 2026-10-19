@@ -213,11 +213,19 @@ _INFLIGHT: set[str] = set()
 _INFLIGHT_LOCK = threading.Lock()
 
 
-def _owner_alive(pid: int) -> bool:
+def _owner_alive(pid: int, digest: str | None = None) -> bool:
     # Lazy import: bridge sits above health and imports this module. The bridge's
     # pid check has the Windows-safe branch; a raw os.kill(pid, 0) must not be
-    # used (on Windows signal 0 is a real Ctrl+C).
+    # used (on Windows signal 0 is a real Ctrl+C). A temp named with its writer's identity digest (#472) is judged by
+    # that identity, so a reused pid does not keep a dead writer's temp; an older name, by its pid only.
     try:
+        if digest:
+            from brain import process_identity as pi
+
+            tok = pi.token_of(pid)
+            if tok == pi.UNKNOWN:
+                return True
+            return tok != pi.GONE and pi.token_digest(tok) == digest
         from brain.bridge.state_file import pid_is_alive
 
         return pid_is_alive(pid)
@@ -230,7 +238,7 @@ def _remove_stale_temps(path: Path) -> None:
     for legacy in (path.name + ".new", path.name + ".bak1.new"):  # pre-#389 fixed names
         with contextlib.suppress(OSError):
             path.with_name(legacy).unlink(missing_ok=True)
-    pattern = re.compile(rf"^{re.escape(path.name)}\.t(\d+)-[0-9a-f]+\.(?:bak1\.)?new$")
+    pattern = re.compile(rf"^{re.escape(path.name)}\.t(\d+)-(?:k([0-9a-f]{{12}})-)?[0-9a-f]+\.(?:bak1\.)?new$")
     try:
         found = list(path.parent.glob(f"{glob.escape(path.name)}.t*-*.new"))
     except OSError:
@@ -243,7 +251,7 @@ def _remove_stale_temps(path: Path) -> None:
         with _INFLIGHT_LOCK:
             if temp.name in _INFLIGHT:
                 continue
-        if pid == os.getpid() or not _owner_alive(pid):
+        if pid == os.getpid() or not _owner_alive(pid, m.group(2)):
             with contextlib.suppress(OSError):
                 temp.unlink(missing_ok=True)
 
@@ -254,7 +262,13 @@ def _temp_scope(path: Path) -> Iterator[tuple[Path, Path]]:
 
     On an Exception (not a kill, which runs no code) the save's own temps are
     removed. The registration is always dropped."""
-    tag = f"t{os.getpid()}-{secrets.token_hex(6)}"
+    from brain import process_identity
+
+    own = process_identity.own_token()
+    # #472: the writer's identity digest in the name ("-k<digest>-"), so a reused pid cannot keep a dead writer's temp;
+    # older versions' sweep regex does not match this shape and leaves it alone.
+    ident = f"k{process_identity.token_digest(own)}-" if own else ""
+    tag = f"t{os.getpid()}-{ident}{secrets.token_hex(6)}"
     new_path = path.with_name(f"{path.name}.{tag}.new")
     bak1_new = path.with_name(f"{path.name}.{tag}.bak1.new")
     with _INFLIGHT_LOCK:
