@@ -441,30 +441,39 @@ def test_status_404_prefix_is_outside_the_200_char_cut():
 
 
 @pytest.mark.parametrize("model_id", ["claude-sonet-5", "claude-sonnet-20250429", "claude-moderate-1", "claude-rate-9"])
-def test_review_string_classifier_reads_the_same_text_as_before(model_id):
-    """brain/initiate/review.py maps an exception to a rate limit when its lowercased text contains "429" or
-    "rate". The new tokens, ``model=<id>`` included, must not change that answer: ids containing "429" or "rate"
-    are exactly the ones that could. (The wrapper itself raises TypeError for every non-timeout exception today,
-    because of `except (TimeoutError, TimeoutError.__class__)`: an existing bug outside this change.)"""
+def test_the_review_wrapper_classifies_details_the_same_with_the_new_tokens(model_id):
+    """brain/initiate/review.py maps a provider error to a rate limit by phrase (#453). The new tokens
+    (``api_error_status=404;``, ``error=model_not_found;``, ``model=<id>;``) must never turn a model rejection into
+    a rate limit, and an in-frame 429 must still be one, for any model id (ids containing 429 or rate included).
+    Out of scope by nature: an id spelled like a rate-limit PHRASE (for example one containing "ratelimit") is
+    matched by that classifier wherever the id appears, the CLI's own sentence included, with or without these tokens."""
+    from brain.initiate.review import DProviderError, DRateLimitError, _make_haiku_call
 
-    def hit(detail: str) -> bool:
-        low = detail.lower()
-        return "429" in low or "rate" in low
+    class _Provider:
+        def __init__(self, detail: str):
+            self.detail = detail
+
+        def generate(self, prompt, system=None):
+            raise RuntimeError(self.detail)
+
+    def kind(detail: str) -> type:
+        try:
+            _make_haiku_call(_Provider(detail))(system="s", user="u")
+        except Exception as exc:  # noqa: BLE001
+            return type(exc)
+        raise AssertionError("the wrapper must raise")
 
     quota = "You've hit your session limit"
     in_frame_429 = provider_mod._cli_error_detail({"is_error": True, "api_error_status": 429, "result": quota}, model=model_id)
-    assert in_frame_429 == quota and hit(in_frame_429) is hit(quota)
+    assert in_frame_429 == quota  # no token is added to a 429 frame
+    assert kind(f"ClaudeCliProvider: {in_frame_429}") is DRateLimitError
     sentence = f"There's an issue with the selected model ({model_id}). It may not exist or you may not have access to it."
-    rej = provider_mod._cli_error_detail({"is_error": True, "api_error_status": 404, "result": sentence}, error_code="model_not_found", model=model_id)
-    # with the sentence present the id is already in the text: the added tokens contribute nothing of their own
-    assert hit(rej) is hit(sentence), "an added token changed what the review classifier reads"
-    # sentence reworded away: the only new text is the id itself in `model=<id>` (a known, documented limit:
-    # an id that contains "429" or "rate" makes a code-only rejection detail match, in a wrapper that today
-    # raises TypeError for every non-timeout error before any mapping happens)
-    bare = provider_mod._cli_error_detail(
-        {"is_error": True, "api_error_status": 404, "result": "Model unknown."}, error_code="model_not_found", model=model_id
-    )
-    assert hit(bare) is (hit("Model unknown.") or hit(model_id))
+    for text in (sentence, "Model unknown."):
+        rej = provider_mod._cli_error_detail(
+            {"is_error": True, "api_error_status": 404, "result": text}, error_code="model_not_found", model=model_id
+        )
+        assert "model=" in rej and "error=model_not_found" in rej
+        assert kind(f"ClaudeCliProvider: {rej}") is DProviderError
 
 
 # --- MB8: fixture hygiene -------------------------------------------------------------------------------------------
