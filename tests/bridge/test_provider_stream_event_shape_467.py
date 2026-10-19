@@ -123,12 +123,38 @@ def test_an_assistant_text_block_whose_text_is_not_a_string_contributes_nothing(
 
 
 @_BAD_TEXT
-def test_a_text_block_with_no_usable_text_after_an_earlier_snapshot_ends_the_stream_normally(tmp_path, bad):
-    # C467-j: no crash after an earlier valid snapshot. The later frame is a VALID message whose only text block has no
-    # usable text, so it replaces the snapshot with "" exactly as a valid message without text does (C467-f).
+def test_a_frame_whose_only_text_block_is_malformed_does_not_wipe_an_earlier_snapshot(tmp_path, bad):
+    # C467-j: the snapshot is the fallback reply. A frame whose text comes out empty ONLY because its text block was
+    # malformed is skipped like any malformed frame (same rule as a malformed `message`, C467-e): the earlier text is
+    # the reply. EOF with no result frame.
     events = _events(tmp_path, [_INIT, _assistant("earlier"), _assistant_blocks(bad)])
 
-    assert isinstance(events[-1], StreamDone) and events[-1].content == ""
+    assert isinstance(events[-1], StreamDone) and events[-1].content == "earlier"
+
+
+def test_a_frame_with_a_malformed_block_and_usable_text_replaces_the_snapshot(tmp_path):
+    # C467-j: usable text still counts and replaces the earlier snapshot.
+    events = _events(tmp_path, [_INIT, _assistant("earlier"), _assistant_blocks(None, "newer")])
+
+    assert events[-1].content == "newer"
+
+
+def test_a_text_block_without_a_text_key_is_malformed_too(tmp_path):
+    # C467-j: no `text` key is no usable text; the earlier snapshot stays.
+    frame = {"type": "assistant", "message": {"content": [{"type": "text"}]}}
+
+    events = _events(tmp_path, [_INIT, _assistant("earlier"), frame])
+
+    assert events[-1].content == "earlier"
+
+
+def test_a_message_with_only_tool_use_blocks_still_resets_the_snapshot_as_before(tmp_path):
+    # C467-f PIN (a genuinely valid message with no text blocks): replaces the snapshot with "" as it always did.
+    frame = {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t1", "name": "x", "input": {}}]}}
+
+    events = _events(tmp_path, [_INIT, _assistant("earlier"), frame])
+
+    assert events[-1].content == ""
 
 
 # ---------------------------------------------------------------------------
