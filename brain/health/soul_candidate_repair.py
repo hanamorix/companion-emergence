@@ -31,7 +31,15 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from brain.memory.store import MemoryStore
 
-from brain.health.json_io import Recovery, read_json, read_jsonl, write_json, write_jsonl
+from brain.health.json_io import (
+    JsonFileError,
+    Recovery,
+    read_json,
+    read_jsonl,
+    write_json,
+    write_jsonl,
+)
+from brain.utils.failure_scope import settle_scope
 from brain.utils.file_lock import file_lock
 
 logger = logging.getLogger(__name__)
@@ -165,23 +173,38 @@ def _repair_locked(
     try:
         # RAISE: the records are rewritten below, so a failed read must stop here, not look like a short file.
         records = read_jsonl(candidates_path, recover=Recovery.RAISE)
-    except Exception as exc:  # noqa: BLE001
+    except JsonFileError as exc:
+        # A read it could not do is NOT a completed repair: no state file is written, so the next start tries again (#460).
         logger.warning(
-            "soul_candidate_repair: cannot read candidates: %s — skipping", exc
+            "soul_candidate_repair: cannot read candidates: %s; leaving the repair pending", exc
         )
-        return _write_and_return(persona_dir, repaired=0, expired=0)
+        return SoulCandidateRepairReport(repaired=0, expired=0, status="skipped", completed_at="")
 
     repaired = 0
     expired = 0
+    targets = 0
+    skipped_ids: list[str] = []
 
     for record in records:
         if not _is_target(record):
             continue
+        targets += 1
 
         old_text = str(record.get("text") or "").strip()
         memory_id = str(record.get("memory_id") or "").strip()
 
-        content = _fetch_content(store, memory_id)
+        try:
+            content = _fetch_content(store, memory_id)
+        except Exception as exc:  # noqa: BLE001 — decided by cause below; never swallowed
+            if settle_scope(exc, store) == "environment":
+                raise  # locked / closed / I/O: nothing saved, nothing recorded; the next start retries
+            # A fault of THIS row (it will fail the same way again): leave the record exactly as it was.
+            logger.warning(
+                "soul_candidate_repair: cannot read memory %s (%s: %s); leaving its candidate as it was",
+                memory_id, type(exc).__name__, exc,
+            )
+            skipped_ids.append(memory_id)
+            continue
 
         if content:
             new_text = _build_text(old_text, content)
@@ -205,6 +228,13 @@ def _repair_locked(
                 memory_id,
             )
 
+    if targets and len(skipped_ids) == targets:
+        # Item faults are per row; every target failing is systemic, so this is not a finished repair.
+        logger.warning(
+            "soul_candidate_repair: all %d targets failed to read their memory; not recording the repair as complete", targets
+        )
+        return SoulCandidateRepairReport(repaired=0, expired=0, status="skipped", completed_at="")
+
     if repaired > 0 or expired > 0:
         _save_candidates(candidates_path, records)
 
@@ -220,14 +250,14 @@ def _is_target(record: dict) -> bool:
 
 
 def _fetch_content(store: MemoryStore, memory_id: str) -> str | None:
-    """Fetch memory content for memory_id.  Returns None on any failure."""
+    """Fetch memory content for memory_id.
+
+    Returns None when there is no content to recover: an empty id, a row that does not exist, or empty content. A FAILED
+    read raises (it is not "no content"): the caller decides by cause what to do (#460).
+    """
     if not memory_id:
         return None
-    try:
-        mem = store.get(memory_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("soul_candidate_repair: store.get(%r) raised: %s", memory_id, exc)
-        return None
+    mem = store.get(memory_id)
     if mem is None:
         return None
     content = (mem.content or "").strip()
