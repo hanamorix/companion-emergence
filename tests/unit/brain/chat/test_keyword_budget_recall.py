@@ -24,6 +24,7 @@ Synthetic data only (user "Bob", persona label "Canary").
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -48,6 +49,11 @@ RATE = B / 1024  # the seeded fit's per-word rate
 T1 = 8 * RATE  # scripted seconds of tier 1
 T_NAME = 8 * RATE  # scripted seconds of the name query
 BASE_KWARGS = {"limit": 16, "include_fading": True, "genuine_first": True}
+# Explicit, strictly increasing `created_at` for every fixture memory (see `_mem`): the order of two memories that tie on
+# score must not depend on whether the clock (Windows' is coarse) separates two consecutive inserts. A moment shortly in
+# the past, fixed at import: near enough to "now" to keep the recency term, past so no stamp is in the future.
+_STAMP_BASE = datetime.now(UTC) - timedelta(hours=1)
+_STAMP_STEP = timedelta(milliseconds=10)
 
 
 class Clock:
@@ -63,6 +69,7 @@ class Clock:
 
 def _mem(store: MemoryStore, content: str, *, importance: float = 5.0, memory_type: str = "conversation") -> Memory:
     m = Memory.create_new(content=content, memory_type=memory_type, domain="us", importance=importance)
+    m.created_at = _STAMP_BASE + store.count(active_only=False) * _STAMP_STEP
     store.create(m)
     return m
 
@@ -254,6 +261,19 @@ def _bypass(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         keyword_budget, "search_extra_words", lambda store, words, started, search, seed: search(words)
     )
+
+
+def test_the_fixture_orders_drop_before_keep_and_stamps_each_memory_apart(tmp_path: Path) -> None:
+    """`keep` and `drop` tie on importance and keyword score; `drop` is created after `keep`, so it ranks first on every
+    clock only because the fixture stamps each memory explicitly (`_STAMP_BASE` + 10 ms per memory in the store)."""
+    w = make_world(tmp_path, n=2, unknown=1)
+    ranked = [m.id for m, _ in relevance.rank_memories(w.store, None, ["keepword", "dropword"], limit=8)]
+    assert ranked.index(w.mems.drop.id) < ranked.index(w.mems.keep.id), "rank: drop (created after keep) must come first"
+    created_in_order = [w.mems.t1a, w.mems.t1b, w.mems.bulk, w.mems.keep, w.mems.drop]
+    for i, mem in enumerate(created_in_order):
+        stored = w.store.get(mem.id, bump=False)
+        assert stored is not None
+        assert stored.created_at == _STAMP_BASE + i * _STAMP_STEP, f"stamp: memory #{i} must be base + {i} steps"
 
 
 @pytest.mark.parametrize("variant", ["seeded", "fresh-seed", "frozen-zero"])

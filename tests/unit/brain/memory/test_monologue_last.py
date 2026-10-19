@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -47,6 +48,11 @@ _RERANKER_ID = "fake-reranker"
 _QUERY = "r3 monologue last query"
 
 _FAMILY = ("monologue", "monologue_trace", "monologue_emotion", "monologue_soul_candidate")
+# Explicit, strictly increasing `created_at` for every seeded memory (see `_mem`): an order that follows created_at (the
+# `order="age"` sort) must not depend on whether the clock (Windows' is coarse) separates two consecutive inserts. A moment
+# shortly in the past, fixed at import.
+_STAMP_BASE = datetime.now(UTC) - timedelta(hours=1)
+_STAMP_STEP = timedelta(milliseconds=10)
 
 
 class _Embedder(EmbeddingProvider):
@@ -100,6 +106,7 @@ class _Recording(RerankerProvider):
 
 def _mem(store: MemoryStore, content: str, memory_type: str, cosine: float) -> Memory:
     m = Memory.create_new(content=content, memory_type=memory_type, domain="d")
+    m.created_at = _STAMP_BASE + store.count(active_only=False) * _STAMP_STEP
     store.create(m)
     store._conn.execute(  # noqa: SLF001
         "UPDATE memories SET embedding = ?, embedding_model_id = ? WHERE id = ?",
