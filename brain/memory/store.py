@@ -269,8 +269,8 @@ class Memory:
             created_at=created,
             emotions=dict(data.get("emotions", {})),
             tags=list(data.get("tags", [])),
-            importance=float(data.get("importance", 0.0)),
-            score=float(data.get("score", 0.0)),
+            importance=float(data.get("importance") or 0.0),  # null reads as missing (#463)
+            score=float(data.get("score") or 0.0),
             last_accessed_at=last_accessed,
             active=bool(data.get("active", True)),
             protected=bool(data.get("protected", False)),
