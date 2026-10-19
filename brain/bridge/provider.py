@@ -2419,7 +2419,12 @@ class OllamaProvider(LLMProvider):
         Yields
         ------
         str
-            Each content chunk Ollama emits. Empty chunks are skipped.
+            Each content chunk Ollama emits. Empty chunks are skipped, and so is
+            anything that is not a usable frame: a line that is valid JSON but not
+            an object, and a frame whose ``message`` is not an object or whose
+            ``content`` is not a string contribute no chunk (a ``done`` on such a
+            frame still ends the stream). Unlike :meth:`chat`, which rejects a
+            reply of the wrong shape with ``ollama_parse``, the stream keeps going.
 
         Raises
         ------
@@ -2428,7 +2433,8 @@ class OllamaProvider(LLMProvider):
         ProviderError("ollama_request", ...)
             Network-level failure (connection refused, DNS, etc.).
         ProviderError("ollama_parse", ...)
-            A streamed line could not be JSON-decoded.
+            A streamed line could not be JSON-decoded (including a line nested
+            past the recursion limit or a digit run past the integer limit).
         """
         payload: dict[str, Any] = {
             "model": self._model,

@@ -208,7 +208,7 @@ class ToolCall:
         Raises
         ------
         ValueError
-            If the dict is missing required keys or arguments is not parseable.
+            If the dict is missing required keys, ``id`` or ``name`` is not a string, or arguments is not parseable.
         """
         try:
             call_id: str = d["id"]
@@ -219,6 +219,17 @@ class ToolCall:
             raise ValueError(
                 f"ToolCall.from_provider_dict: missing required fields in {_short_repr(d)}"
             ) from exc
+
+        # Rejected where it is read: a non-string id breaks the pairing of a result with its call and a
+        # non-string name cannot match any tool, and both would otherwise fail later and less clearly (#474).
+        if not isinstance(call_id, str):
+            raise ValueError(
+                f"ToolCall.from_provider_dict: id must be a string, got {type(call_id).__name__}"
+            )
+        if not isinstance(name, str):
+            raise ValueError(
+                f"ToolCall.from_provider_dict: name must be a string, got {type(name).__name__}"
+            )
 
         if isinstance(raw_args, dict):
             arguments = raw_args

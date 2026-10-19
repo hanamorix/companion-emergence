@@ -190,6 +190,18 @@ def test_chat_per_tool_call_handler_catches_a_recursion_error_from_the_parser():
     assert excinfo.value.stage == "ollama_parse"
 
 
+@pytest.mark.parametrize("call", [
+    {"id": 5, "function": {"name": "n", "arguments": {}}},
+    {"id": "c1", "function": {"name": None, "arguments": {}}},
+], ids=["id-int", "name-null"])
+def test_chat_tool_call_with_a_non_string_id_or_name_is_a_parse_error(call):
+    # #474 through chat(): rejected where it is read, as the handled ollama_parse.
+    with pytest.raises(ProviderError) as excinfo:
+        _chat(json.dumps({"message": {"content": "x", "tool_calls": [call]}}))
+
+    assert excinfo.value.stage == "ollama_parse"
+
+
 # ---------------------------------------------------------------------------
 # chat.py: ToolCall.from_provider_dict
 # ---------------------------------------------------------------------------

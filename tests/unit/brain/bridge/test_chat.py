@@ -260,3 +260,31 @@ def test_text_block_basic() -> None:
     block = TextBlock(text="hi")
     assert block.text == "hi"
     assert block.type == "text"
+
+
+# ---------------------------------------------------------------------------
+# from_provider_dict: id and name must be strings (#474)
+# ---------------------------------------------------------------------------
+
+_NOT_A_STRING = pytest.param(5, id="int"), pytest.param(None, id="null"), pytest.param(["x"], id="list"), pytest.param({"a": 1}, id="object")
+
+
+@pytest.mark.parametrize("bad", [p.values[0] for p in _NOT_A_STRING], ids=[p.id for p in _NOT_A_STRING])
+def test_tool_call_from_provider_dict_rejects_a_non_string_id(bad) -> None:
+    """A malformed reply is rejected where it is read, not later in the dispatcher (#474)."""
+    with pytest.raises(ValueError, match="id"):
+        ToolCall.from_provider_dict({"id": bad, "function": {"name": "n", "arguments": {}}})
+
+
+@pytest.mark.parametrize("bad", [p.values[0] for p in _NOT_A_STRING], ids=[p.id for p in _NOT_A_STRING])
+def test_tool_call_from_provider_dict_rejects_a_non_string_name(bad) -> None:
+    """Same for the function name (#474)."""
+    with pytest.raises(ValueError, match="name"):
+        ToolCall.from_provider_dict({"id": "c1", "function": {"name": bad, "arguments": {}}})
+
+
+def test_tool_call_from_provider_dict_still_accepts_string_id_and_name() -> None:
+    """PIN: string values, including an empty name or id, are accepted as before."""
+    tc = ToolCall.from_provider_dict({"id": "", "function": {"name": "n", "arguments": {}}})
+
+    assert tc.id == "" and tc.name == "n"
