@@ -30,7 +30,8 @@ class RelayClient:
                 resp = self._http.post(path, json=payload)
             except httpx.TransportError as exc:  # network errors only — bounded backoff
                 last_exc = exc
-                time.sleep(_BACKOFF_BASE_S * (2**attempt))
+                if attempt < _MAX_RETRIES - 1:  # no sleep after the last attempt: nothing follows it (#481)
+                    time.sleep(_BACKOFF_BASE_S * (2**attempt))
                 continue
             except httpx.RequestError as exc:  # decoding, redirects: not transient, no retry (#442)
                 raise RelayUnavailableError(f"relay {path}: {type(exc).__name__}: {exc}") from exc
