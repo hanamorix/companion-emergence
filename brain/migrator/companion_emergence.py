@@ -15,7 +15,6 @@ What we do:
 """
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import sqlite3
@@ -27,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from brain import app_config
+from brain.health.json_io import JsonFileError, Recovery, read_json, write_json
 from brain.migrator.report import MigrationReport
 from brain.paths import get_persona_dir
 
@@ -73,13 +73,10 @@ def _count_rows(db: Path, table: str) -> int:
 def _read_source_lived_age(input_dir: Path) -> float:
     """Read lived_age_hours from the source's felt_time_state.json without
     mutating it. 0.0 if absent or unreadable (fresh-brain default)."""
-    p = input_dir / "felt_time_state.json"
-    if not p.is_file():
-        return 0.0
+    data = read_json(input_dir / "felt_time_state.json", default=dict, expect=dict)
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
         return float(data.get("lived_age_hours", 0.0))
-    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+    except (TypeError, ValueError):
         return 0.0
 
 
@@ -133,8 +130,8 @@ def preflight_companion_emergence(input_dir: Path) -> dict[str, Any]:
         return result
 
     try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        config = read_json(config_path, recover=Recovery.RAISE, expect=dict)
+    except JsonFileError as exc:
         result["errors"].append({
             "code": "bad_persona_config",
             "message": f"`persona_config.json` is not valid JSON: {exc}",
@@ -187,9 +184,7 @@ def migrate_companion_emergence(args: CompanionEmergenceMigrateArgs) -> Migratio
         "hebbian_edge_count": preflight["hebbian_edge_count"],
         "lived_age_hours_at_migration": _read_source_lived_age(args.input_dir),
     }
-    (target_dir / "source-manifest.json").write_text(
-        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
-    )
+    write_json(target_dir / "source-manifest.json", manifest, indent=2, fsync=False)
 
     app_config.write_if_missing(args.install_as)
 

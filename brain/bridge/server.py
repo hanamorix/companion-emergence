@@ -71,7 +71,7 @@ from brain.chat.session import (
     get_or_hydrate_session,
 )
 from brain.health.alarm import compute_pending_alarms
-from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
+from brain.health.json_io import Recovery, iter_jsonl, read_json
 from brain.health.parse_failures import count_recent as count_recent_parse_failures
 from brain.health.walker import walk_persona
 from brain.ingest.buffer import _SESSION_ID_RE as _BUFFER_SESSION_ID_RE
@@ -232,15 +232,7 @@ def _read_jsonl_lines(path: Path):
     """Yield parsed JSON objects from a JSONL file, skipping corrupt lines."""
     if not path.is_file():
         return
-    with open(path, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                yield json.loads(line)
-            except json.JSONDecodeError:
-                continue
+    yield from iter_jsonl(path, recover=Recovery.RAISE)
 
 
 def _resolve_image_ext(images_dir: Path, sha: str) -> str | None:
@@ -725,7 +717,7 @@ def _run_heartbeat_close(persona_dir: Path, provider: LLMProvider) -> None:
     state_path = persona_dir / "heartbeat_state.json"
     if state_path.exists():
         try:
-            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state = read_json(state_path, default=dict, expect=dict)
             last_run = state.get("last_close_at") or state.get("last_run")
             if last_run:
                 if last_run.endswith("Z"):
@@ -1687,12 +1679,9 @@ def build_app(
         _maturity_order = {"known": 0, "forming": 1, "immature": 2, "falsified": 3}
         patterns_sorted = sorted(patterns, key=lambda p: _maturity_order.get(p.maturity, 99))
         backfill = None
-        bf_path = persona_dir / "attunement" / "backfill_state.json"
-        if bf_path.exists():
-            try:
-                backfill = json.loads(bf_path.read_text(encoding="utf-8"))
-            except (ValueError, OSError):
-                backfill = None
+        backfill = read_json(
+            persona_dir / "attunement" / "backfill_state.json", default=lambda: None
+        )  # missing, corrupt or unreadable: None
         return {
             "current_read": asdict(current) if current else None,
             "learned_patterns": [asdict(p) for p in patterns_sorted],
@@ -2810,7 +2799,7 @@ def build_app(
 
         Reads ``<persona>/active_conversations/<session_id>.jsonl`` line
         by line through the canonical
-        :func:`iter_jsonl_skipping_corrupt`, then yields the latest
+        :func:`iter_jsonl`, then yields the latest
         ``limit`` turns whose ``turn`` index is strictly less than
         ``before_turn`` (when supplied). ``turn`` is the 1-based line
         index — synthetic, since the buffer doesn't store it on disk —
@@ -2880,7 +2869,7 @@ def build_app(
         # generator, and an unclosed reader keeps the buffer file handle
         # alive until GC — on Windows that blocks close_session's unlink
         # (WinError 32). contextlib.closing closes it deterministically.
-        with contextlib.closing(iter_jsonl_skipping_corrupt(path)) as reader:
+        with contextlib.closing(iter_jsonl(path, recover=Recovery.RAISE)) as reader:
             for idx, raw in enumerate(reader, start=1):
                 # ``idx`` is monotonic — once it crosses the cursor we're done
                 # reading; ``break`` avoids paying O(buffer size) per page.

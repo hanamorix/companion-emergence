@@ -234,13 +234,18 @@ def test_c1_no_full_scan_when_daily_cadence_not_due(
     up.compute_user_presence(tmp_path, _now=now0)  # cadence due (first ever call)
 
     calls = {"n": 0}
-    real_reader = up.read_jsonl_skipping_corrupt
+    real_read, real_iter = up.read_jsonl, up.iter_jsonl
 
-    def spy(path):
+    def spy_read(*a, **k):
         calls["n"] += 1
-        return real_reader(path)
+        return real_read(*a, **k)
 
-    monkeypatch.setattr(up, "read_jsonl_skipping_corrupt", spy)
+    def spy_iter(*a, **k):
+        calls["n"] += 1
+        return real_iter(*a, **k)
+
+    monkeypatch.setattr(up, "read_jsonl", spy_read)  # the full-file readers (json_io)
+    monkeypatch.setattr(up, "iter_jsonl", spy_iter)
 
     now1 = now0 + timedelta(hours=1)  # well within the 24h cadence
     up.compute_user_presence(tmp_path, _now=now1)
@@ -261,13 +266,18 @@ def test_c1_self_test_spy_would_catch_the_old_every_call_full_scan(
     _write_turn(conv_dir, speaker="user", ts=datetime.now(UTC) - timedelta(hours=1))
 
     calls = {"n": 0}
-    real_reader = up.read_jsonl_skipping_corrupt
+    real_read, real_iter = up.read_jsonl, up.iter_jsonl
 
-    def spy(path):
+    def spy_read(*a, **k):
         calls["n"] += 1
-        return real_reader(path)
+        return real_read(*a, **k)
 
-    monkeypatch.setattr(up, "read_jsonl_skipping_corrupt", spy)
+    def spy_iter(*a, **k):
+        calls["n"] += 1
+        return real_iter(*a, **k)
+
+    monkeypatch.setattr(up, "read_jsonl", spy_read)  # the full-file readers (json_io)
+    monkeypatch.setattr(up, "iter_jsonl", spy_iter)
 
     # The OLD reference implementation (kept as an oracle, no longer on the
     # hot path) calls the full reader every time it's invoked directly.
@@ -438,7 +448,7 @@ def test_c2h_tied_timestamps_straddling_window_boundary(tmp_path: Path) -> None:
     tie-safe extension must capture the whole cluster; a tie-unaware plain
     cutoff must NOT (ST1.5f self-test, proving this test is discriminating).
     """
-    from brain.health.jsonl_reader import read_last_n_jsonl_lines
+    from brain.health.json_io import read_jsonl_tail
     from brain.initiate.user_pattern import (
         _compute_ignore_streak,
         _compute_ignore_streak_bounded,
@@ -475,8 +485,7 @@ def test_c2h_tied_timestamps_straddling_window_boundary(tmp_path: Path) -> None:
 
     # Self-test: a tie-unaware plain window_n-row cutoff must diverge.
     path = tmp_path / "initiate_audit.jsonl"
-    naive_lines = read_last_n_jsonl_lines(path, window_n)
-    naive_rows = [json.loads(line) for line in naive_lines]
+    naive_rows = read_jsonl_tail(path, window_n)
     naive_value = _ignore_streak_from_rows(naive_rows)
     assert naive_value != oracle, (
         "the naive tie-unaware cutoff must diverge from the oracle here — "
@@ -550,13 +559,18 @@ def test_c19_ignore_streak_bounded_read_does_not_full_scan_large_file(
     _write_audit_rows(tmp_path, rows)
 
     calls = {"n": 0}
-    real_reader = up.read_jsonl_skipping_corrupt
+    real_read, real_iter = up.read_jsonl, up.iter_jsonl
 
-    def spy(path):
+    def spy_read(*a, **k):
         calls["n"] += 1
-        return real_reader(path)
+        return real_read(*a, **k)
 
-    monkeypatch.setattr(up, "read_jsonl_skipping_corrupt", spy)
+    def spy_iter(*a, **k):
+        calls["n"] += 1
+        return real_iter(*a, **k)
+
+    monkeypatch.setattr(up, "read_jsonl", spy_read)  # the full-file readers (json_io)
+    monkeypatch.setattr(up, "iter_jsonl", spy_iter)
 
     result = up._compute_ignore_streak_bounded(tmp_path)
     assert result == 10  # the 10 trailing dismissed rows, stopping at "resolved"

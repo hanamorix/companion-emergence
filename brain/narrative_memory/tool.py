@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
+from brain.health.json_io import Recovery, iter_jsonl
 from brain.narrative_memory.arc import Arc, ArcMember
 from brain.narrative_memory.state import LOG_FILENAME, load_or_recover
 
@@ -149,7 +149,7 @@ def _reconstruct_arcs_from_log(log_path: Path) -> list[Arc]:
     Idempotent member-add; tolerates missing close events (open in state).
     """
     arcs_by_id: dict[str, dict[str, Any]] = {}
-    for event in iter_jsonl_skipping_corrupt(log_path):
+    for event in iter_jsonl(log_path, recover=Recovery.RAISE):
         kind = event.get("event")
         arc_id = event.get("arc_id")
         if not isinstance(arc_id, str):

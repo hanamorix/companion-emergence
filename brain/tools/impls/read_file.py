@@ -3,12 +3,12 @@ from __future__ import annotations
 
 import base64
 import difflib
-import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
 
 from brain import tunables
+from brain.health.json_io import append_jsonl
 from brain.images import media_type_to_ext, save_image_bytes, sniff_media_type
 from brain.tools.impls import _read_cache
 
@@ -161,22 +161,20 @@ def _audit(
     error: str | None = None,
 ) -> None:
     try:
-        persona_dir.mkdir(parents=True, exist_ok=True)
-        with (persona_dir / "file_access.jsonl").open("a", encoding="utf-8") as f:
-            f.write(
-                json.dumps(
-                    {
-                        "ts": datetime.now(UTC).isoformat(),
-                        "tool": tool,
-                        "path": path,
-                        "resolved_path": resolved,
-                        "bytes": bytes_,
-                        "ok": ok,
-                        "error": error,
-                    }
-                )
-                + "\n"
-            )
+        append_jsonl(
+            persona_dir / "file_access.jsonl",
+            {
+                "ts": datetime.now(UTC).isoformat(),
+                "tool": tool,
+                "path": path,
+                "resolved_path": resolved,
+                "bytes": bytes_,
+                "ok": ok,
+                "error": error,
+            },
+            on_error="log",
+            nonfinite="null",
+        )
     except Exception:  # noqa: BLE001
         pass
 

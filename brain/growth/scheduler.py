@@ -17,7 +17,6 @@ biographically. No human approval gate, no candidate queue.
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -30,6 +29,7 @@ from brain.growth.crystallizers.vocabulary import (
 )
 from brain.growth.log import GrowthLogEvent, append_growth_event
 from brain.growth.proposal import EmotionProposal
+from brain.health.json_io import Recovery, read_json, read_json_result, write_json
 from brain.memory.store import MemoryStore
 
 if TYPE_CHECKING:
@@ -185,17 +185,17 @@ def _read_current_vocabulary_names(
     if not vocab_path.exists():
         return set(), None
 
-    from brain.health.attempt_heal import attempt_heal
-
     def _schema_validator(data: object) -> None:
         if not isinstance(data, dict) or not isinstance(data.get("emotions"), list):
             raise ValueError("emotion_vocabulary schema invalid: missing 'emotions' list")
 
-    data, anomaly = attempt_heal(
+    res = read_json_result(
         vocab_path,
-        lambda: {"version": 1, "emotions": []},
-        schema_validator=_schema_validator,
+        default=lambda: {"version": 1, "emotions": []},
+        recover=Recovery.HEAL,
+        validate=_schema_validator,
     )
+    data, anomaly = res.data, res.anomaly
 
     if anomaly is not None:
         logger.warning(
@@ -217,14 +217,9 @@ def _is_valid_name(name: str) -> bool:
 
 
 def _append_to_vocabulary(vocab_path: Path, proposal: EmotionProposal) -> None:
-    """Atomic append to emotion_vocabulary.json via save_with_backup."""
+    """Atomic append to emotion_vocabulary.json via json_io.write_json (.bak rotation)."""
     from brain.health.adaptive import compute_treatment
-    from brain.health.attempt_heal import save_with_backup
-
-    if vocab_path.exists():
-        data = json.loads(vocab_path.read_text(encoding="utf-8"))
-    else:
-        data = {"version": 1, "emotions": []}
+    data = read_json(vocab_path, default=lambda: {"version": 1, "emotions": []}, recover=Recovery.RAISE)
     data["emotions"].append(
         {
             "name": proposal.name,
@@ -235,7 +230,7 @@ def _append_to_vocabulary(vocab_path: Path, proposal: EmotionProposal) -> None:
         }
     )
     treatment = compute_treatment(vocab_path.parent, vocab_path.name)
-    save_with_backup(vocab_path, data, backup_count=treatment.backup_count)
+    write_json(vocab_path, data, backups=treatment.backup_count)
 
 
 def _emit_vocabulary_initiate_candidate(

@@ -174,7 +174,7 @@ def test_c3_3_batch_enqueue_uses_a_single_lock_and_write(tmp_path):
     ids = ["id-a", "id-b", "id-c"]
     queue = PendingQueue(tmp_path)
 
-    with patch("brain.memory.pending.file_lock", wraps=real_file_lock) as mock_lock:
+    with patch("brain.health.json_io.file_lock", wraps=real_file_lock) as mock_lock:
         written = queue.enqueue_reappraisals(ids, source="recall")
 
     assert written == 3

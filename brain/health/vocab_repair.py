@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from brain import prompt_strings
+from brain.health.json_io import Recovery, read_json, write_json
 from brain.health.parse_failures import record_parse_failure
 from brain.utils.llm_output import extract_json_object
 
@@ -64,21 +65,14 @@ def _state_path(persona_dir: Path) -> Path:
 
 
 def _load_state(persona_dir: Path) -> dict | None:
-    p = _state_path(persona_dir)
-    if not p.exists():
-        return None
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, ValueError) as exc:
-        logger.warning("vocab_repair: corrupt state file: %s", exc)
-        return None
+    # CONTENT: an unreadable file raises (as it always did); a missing or corrupt one is "no state".
+    return read_json(
+        _state_path(persona_dir), default=lambda: None, recover=Recovery.CONTENT, expect=dict
+    )
 
 
 def _save_state(persona_dir: Path, state: dict) -> None:
-    p = _state_path(persona_dir)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    tmp.replace(p)
+    write_json(_state_path(persona_dir), state, indent=2, fsync=False)
 
 
 # ---------------------------------------------------------------------------
@@ -95,13 +89,13 @@ def should_run_vocab_repair(persona_dir: Path) -> bool:
     supervisor only asks at startup, so the retry cadence is once per bridge
     start, bounded by _DESCRIBE_BATCH per run.
     """
-    vocab_path = persona_dir / "emotion_vocabulary.json"
-    if not vocab_path.exists():
-        return False
-
-    try:
-        data = json.loads(vocab_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, ValueError):
+    data = read_json(
+        persona_dir / "emotion_vocabulary.json",
+        default=lambda: None,
+        recover=Recovery.CONTENT,
+        expect=dict,
+    )
+    if data is None:  # missing or corrupt
         return False
 
     from brain.health.reconstruct import PLACEHOLDER_DESCRIPTION
@@ -135,13 +129,8 @@ def run_vocab_repair(
     prior_described = int(existing.get("described", 0)) if prior_complete else 0
 
     vocab_path = persona_dir / "emotion_vocabulary.json"
-    if not vocab_path.exists():
-        return _write_and_return(persona_dir, repaired=0, described=0)
-
-    try:
-        data = json.loads(vocab_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, ValueError) as exc:
-        logger.warning("vocab_repair: cannot read vocab: %s — skipping", exc)
+    data = read_json(vocab_path, default=lambda: None, recover=Recovery.CONTENT, expect=dict)
+    if data is None:  # missing, or corrupt (the module logged it): skip, as before
         return _write_and_return(persona_dir, repaired=0, described=0)
 
     # ------------------------------------------------------------------
@@ -280,9 +269,8 @@ def _merge_variant_entries(data: dict) -> list[tuple[str, str]]:
 
 
 def _atomic_write_vocab(vocab_path: Path, data: dict) -> None:
-    """Atomic JSON write with .bak rotation via save_with_backup."""
-    from brain.health.attempt_heal import save_with_backup
-    save_with_backup(vocab_path, data)
+    """Atomic JSON write with .bak rotation via json_io.write_json."""
+    write_json(vocab_path, data, backups=3)
 
 
 def _excerpts_for_name(name: str, store: MemoryStore) -> list[str]:

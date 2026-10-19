@@ -23,12 +23,11 @@ See docs/superpowers/specs/2026-05-05-migrator-soul-candidates-and-reflex-log-de
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Any
 
-from brain.health.attempt_heal import save_with_backup_text
+from brain.health.json_io import Recovery, iter_jsonl, write_jsonl
 
 logger = logging.getLogger(__name__)
 
@@ -52,25 +51,12 @@ def migrate_soul_candidates(
     Returns (0, 0) silently if the OG file is missing.
     """
     src = og_data_dir / "soul_candidates.jsonl"
-    if not src.exists():
-        return (0, 0)
 
     migrated_records: list[dict[str, Any]] = []
     skipped_missing_memory_id = 0
 
-    for line_num, raw in enumerate(src.read_text(encoding="utf-8").splitlines(), start=1):
-        if not raw.strip():
-            continue
-        try:
-            og = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            logger.warning(
-                "soul_candidates.jsonl line %d malformed: %s",
-                line_num,
-                exc,
-            )
-            continue
-
+    # RAISE: an unreadable source must fail the migration, not migrate a short file over the destination.
+    for og in iter_jsonl(src, recover=Recovery.RAISE):
         if not og.get("memory_id"):
             skipped_missing_memory_id += 1
             continue
@@ -79,9 +65,7 @@ def migrate_soul_candidates(
         migrated_records.append(new)
 
     if migrated_records:
-        dest = persona_dir / "soul_candidates.jsonl"
-        text = "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in migrated_records)
-        save_with_backup_text(dest, text)
+        write_jsonl(persona_dir / "soul_candidates.jsonl", migrated_records, backups=3)
 
     return (len(migrated_records), skipped_missing_memory_id)
 

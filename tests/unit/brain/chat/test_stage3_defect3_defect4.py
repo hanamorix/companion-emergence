@@ -630,7 +630,7 @@ def test_lexical_full_open_batches_multiple_ids_into_one_enqueue_call(tmp_path: 
         patch("brain.chat.prompt.run_semantic_recall", return_value=None),
         patch("brain.chat.prompt._extract_recall_tokens", return_value=["lighthouse"]),
         patch("brain.chat.prompt.SNIPPET_MODE_ENABLED", True),
-        patch("brain.memory.pending.file_lock", wraps=real_file_lock) as mock_lock,
+        patch("brain.health.json_io.file_lock", wraps=real_file_lock) as mock_lock,  # the append takes its lock in json_io
     ):
         block = _build_recall_block(store, "lighthouse", persona_dir=tmp_path)
 

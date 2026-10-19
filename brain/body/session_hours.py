@@ -20,9 +20,10 @@ See `docs/superpowers/specs/2026-05-16-body-state-divergence-fix.md`
 
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime
 from pathlib import Path
+
+from brain.health.json_io import Recovery, iter_jsonl
 
 # No activity in the last 5 minutes → the session isn't currently live (0.0).
 # Guards the wholly-idle / orphan-buffer case.
@@ -53,22 +54,14 @@ def _entry_timestamps(buffer: Path) -> list[datetime]:
     """Parsed, tz-aware timestamps for every turn in a buffer, in file (turn)
     order. Unparseable / malformed lines are skipped."""
     stamps: list[datetime] = []
-    with buffer.open("r", encoding="utf-8") as fh:
-        for raw in fh:
-            stripped = raw.strip()
-            if not stripped:
-                continue
-            try:
-                entry = json.loads(stripped)
-            except json.JSONDecodeError:
-                continue
-            # A compaction `summary` row carries a compaction-time ts, not a turn
-            # timestamp — exclude it from live session-age.
-            if entry.get("speaker") == "summary":
-                continue
-            dt = _parse_ts(entry.get("ts") or entry.get("timestamp"))
-            if dt is not None:
-                stamps.append(dt)
+    for entry in iter_jsonl(buffer, recover=Recovery.RAISE):
+        # A compaction `summary` row carries a compaction-time ts, not a turn
+        # timestamp — exclude it from live session-age.
+        if entry.get("speaker") == "summary":
+            continue
+        dt = _parse_ts(entry.get("ts") or entry.get("timestamp"))
+        if dt is not None:
+            stamps.append(dt)
     return stamps
 
 

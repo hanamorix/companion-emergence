@@ -11,13 +11,11 @@ so SP-5 has data to work from when it lands.
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 from datetime import UTC, datetime
 from pathlib import Path
 
-from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+from brain.health.json_io import Recovery, append_jsonl, read_jsonl
 from brain.ingest.types import ExtractedItem
 
 logger = logging.getLogger(__name__)
@@ -59,7 +57,6 @@ def queue_soul_candidate(
                               Absent on records queued before v0.0.34 — treated as 0.
         expired_at:   str   — ISO-8601 UTC, set when status→"expired".
     """
-    persona_dir.mkdir(parents=True, exist_ok=True)
     record = {
         "memory_id": memory_id,
         "text": item.text,
@@ -69,26 +66,14 @@ def queue_soul_candidate(
         "queued_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "status": "auto_pending",
     }
-    path = _soul_candidates_path(persona_dir)
-    try:
-        # Audit 2026-05-07 P2-2: append under the same exclusive lock
-        # the review path uses for its read-modify-rewrite cycle. Without
-        # this, candidates queued between review's read and replace are
-        # silently dropped. fsync remains so a SIGKILL between write and
-        # the next OS buffer flush can't leave a torn line.
-        from brain.utils.file_lock import file_lock
-
-        with file_lock(path):
-            with open(path, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-                fh.flush()
-                os.fsync(fh.fileno())
-        return True
-    except OSError as exc:
-        logger.warning("queue_soul_candidate: failed to write to %s: %s", path, exc)
-        return False
+    # Audit 2026-05-07 P2-2: the append takes the same exclusive file lock the review path holds for its
+    # read-modify-rewrite cycle, so candidates queued between review's read and replace are not dropped;
+    # fsync keeps a SIGKILL from leaving a torn line.
+    return append_jsonl(
+        _soul_candidates_path(persona_dir), record, fsync=True, on_error="log", nonfinite="null"
+    ) is not None
 
 
 def list_soul_candidates(persona_dir: Path) -> list[dict]:
     """Read all candidates from soul_candidates.jsonl, skipping malformed lines."""
-    return read_jsonl_skipping_corrupt(_soul_candidates_path(persona_dir))
+    return read_jsonl(_soul_candidates_path(persona_dir), recover=Recovery.RAISE)

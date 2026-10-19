@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 from brain.emotion import vocabulary
 from brain.emotion.vocabulary import Emotion
+from brain.health.json_io import Recovery, read_json_result, write_json
 from brain.memory.store import MemoryStore
 
 if TYPE_CHECKING:
@@ -47,8 +48,6 @@ def load_persona_vocabulary_with_anomaly(
         empty default. Anomaly set.
       - Healthy file → counts of newly registered emotions, no anomaly.
     """
-    from brain.health.attempt_heal import attempt_heal
-
     if not path.exists():
         if store is not None:
             # Recover-dropped-vocab self-heal: `nell recover` backs up only
@@ -66,9 +65,7 @@ def load_persona_vocabulary_with_anomaly(
                 e for e in recon_data["emotions"] if e["category"] == "persona_extension"
             ]
             if extensions:
-                from brain.health.attempt_heal import save_with_backup
-
-                save_with_backup(path, recon_data)
+                write_json(path, recon_data, backups=3)
                 registered = _register_from_data(recon_data)
                 logger.warning(
                     "emotion_vocabulary.json was missing but memories reference "
@@ -82,9 +79,8 @@ def load_persona_vocabulary_with_anomaly(
                 return registered, None
         return 0, None
 
-    data, anomaly = attempt_heal(
-        path, _default_vocab_factory, schema_validator=_vocab_schema_validator
-    )
+    _res = read_json_result(path, default=_default_vocab_factory, recover=Recovery.HEAL, validate=_vocab_schema_validator)
+    data, anomaly = _res.data, _res.anomaly
 
     # Reconstruct from memories when reset_to_default fires on vocabulary.
     # The default factory writes empty `{"version":1,"emotions":[]}` — that's
@@ -92,11 +88,10 @@ def load_persona_vocabulary_with_anomaly(
     # the brain has been operating with. If we have memory access, the brain
     # can re-learn its own vocabulary from how it has been using emotions.
     if anomaly is not None and anomaly.action == "reset_to_default" and store is not None:
-        from brain.health.attempt_heal import save_with_backup
         from brain.health.reconstruct import reconstruct_vocabulary_from_memories
 
         recon_data = reconstruct_vocabulary_from_memories(store)
-        save_with_backup(path, recon_data)
+        write_json(path, recon_data, backups=3)
         data = recon_data
         # Replace the anomaly with one whose action reflects the reconstruction.
         # Same kind (json_parse_error / schema_mismatch — that's why we needed
@@ -209,7 +204,6 @@ def _heal_referenced_but_unregistered(path: Path, data: dict, store: MemoryStore
     silently skipped). Healing them as persona_extension entries works for
     native and OG personas alike, and persists so the next load is clean.
     """
-    from brain.health.attempt_heal import save_with_backup
     from brain.health.reconstruct import PLACEHOLDER_DECAY_DAYS, PLACEHOLDER_DESCRIPTION
 
     seen: set[str] = set()
@@ -237,7 +231,7 @@ def _heal_referenced_but_unregistered(path: Path, data: dict, store: MemoryStore
 
     healed = _register_from_data({"emotions": new_entries})
     data.setdefault("emotions", []).extend(new_entries)
-    save_with_backup(path, data)
+    write_json(path, data, backups=3)
     logger.warning(
         "emotion_vocabulary.json was missing %d referenced emotion(s) %s — "
         "registered them as persona_extension and appended to %s (extractor-"

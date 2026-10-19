@@ -117,7 +117,7 @@ def test_multiple_session_files_summed(store, tmp_path):
 
 
 def test_returns_zero_on_corrupt_jsonl(store, tmp_path):
-    """Corrupt lines in a session buffer must not raise — read_jsonl_skipping_corrupt
+    """Corrupt lines in a session buffer must not raise — json_io.iter_jsonl
     handles that, and the return is 0 if no clean lines remain."""
     active = tmp_path / "active_conversations"
     active.mkdir()

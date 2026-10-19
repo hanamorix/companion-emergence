@@ -24,7 +24,6 @@ start instead.
 
 from __future__ import annotations
 
-import json
 import logging
 import sqlite3
 import threading
@@ -32,6 +31,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain import dev_constants
+from brain.health.json_io import append_jsonl
 from brain.paths import get_log_dir
 
 logger = logging.getLogger(__name__)
@@ -106,12 +106,7 @@ def _log_health_event(persona: str, result: str, error: str | None) -> None:
         "error": error,
     }
     log_path = get_log_dir() / f"db-health-{persona}.jsonl"
-    try:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(line) + "\n")
-    except OSError as exc:
-        logger.warning("db-health log append failed (result=%s): %s", result, exc)
+    append_jsonl(log_path, line, on_error="log", nonfinite="null")
 
 
 def _end_txn(conn: sqlite3.Connection) -> None:

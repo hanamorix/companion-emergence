@@ -192,8 +192,8 @@ def _file_size(path: Path) -> int:
 
 
 def _nonblank_lines(chunk: bytes) -> int:
-    """Non-blank lines of `chunk`, split like the shared reader's text-mode iteration (\n, \r\n, \r)."""
-    return sum(1 for ln in chunk.splitlines() if ln.decode("utf-8", "replace").strip())
+    """Non-blank lines of `chunk`, split like the shared reader (json_io): on \n only (a \r\n ends in \r, which strip drops)."""
+    return sum(1 for ln in chunk.split(b"\n") if ln.decode("utf-8", "replace").strip())
 
 
 def _read_run_slice(path: Path, offset: int, boundaries: tuple[int, ...] | list[int] = ()):
@@ -208,7 +208,7 @@ def _read_run_slice(path: Path, offset: int, boundaries: tuple[int, ...] | list[
     ValueError. The shared reader has no offset argument, so the appended bytes are parsed from a temporary copy
     (its warnings number lines from 1 at `offset` and name that copy). A decode error is a ValueError too.
     """
-    from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
+    from brain.health.json_io import Recovery, iter_jsonl
 
     last = offset
     for b in boundaries:
@@ -240,7 +240,7 @@ def _read_run_slice(path: Path, offset: int, boundaries: tuple[int, ...] | list[
         with tempfile.TemporaryDirectory(prefix="crw-slice-") as td:
             tmp = Path(td) / "slice.jsonl"
             tmp.write_bytes(data)
-            rows = list(iter_jsonl_skipping_corrupt(tmp))
+            rows = list(iter_jsonl(tmp, recover=Recovery.RAISE))
     skipped = _nonblank_lines(data) - len(rows)
     counts: list[int] = []
     start = offset
@@ -646,13 +646,13 @@ def _read_rows_fail_closed(path: Path) -> list[dict]:
     cross-checks the number of rows it returned against the file's non-blank lines (same line
     iteration), which does not depend on how logging is configured.
     """
-    from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
+    from brain.health.json_io import Recovery, iter_jsonl
 
     if not path.exists():  # a provider that never logs usage (e.g. --provider fake): no rows, not an error
         return []
     with open(path, encoding="utf-8") as fh:
         non_blank = sum(1 for raw in fh if raw.rstrip("\r\n").strip())
-    rows = list(iter_jsonl_skipping_corrupt(path))
+    rows = list(iter_jsonl(path, recover=Recovery.RAISE))
     skipped = non_blank - len(rows)
     if skipped > 0:
         raise ValueError(

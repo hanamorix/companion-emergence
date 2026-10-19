@@ -7,13 +7,13 @@ inside research.py.
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
+from brain.health.json_io import Recovery, read_json, read_json_result, write_json
 from brain.utils.time import iso_utc, parse_iso_utc
 
 if TYPE_CHECKING:
@@ -129,20 +129,18 @@ class InterestSet:
           - Corrupt file → quarantine, restore from .bak1/.bak2/.bak3 or write
             default; parse the result with existing per-entry coercion.
         """
-        from brain.health.attempt_heal import attempt_heal
-
         def _default_factory() -> dict:
-            return json.loads(default_path.read_text(encoding="utf-8"))
+            # The bundled default: an absent or corrupt package file is an install bug, so it raises.
+            return read_json(default_path, recover=Recovery.RAISE)
 
         def _schema_validator(data: object) -> None:
             if not isinstance(data, dict) or not isinstance(data.get("interests"), list):
                 raise ValueError("interests schema invalid: missing 'interests' list")
 
-        if not path.exists():
-            data = _default_factory()
-            anomaly = None
-        else:
-            data, anomaly = attempt_heal(path, _default_factory, schema_validator=_schema_validator)
+        res = read_json_result(
+            path, default=_default_factory, recover=Recovery.HEAL, validate=_schema_validator
+        )
+        data, anomaly = res.data, res.anomaly
 
         out: list[Interest] = []
         for raw in data.get("interests", []):
@@ -162,7 +160,7 @@ class InterestSet:
                 "interests file %s not found, using defaults (created automatically as the persona evolves)",
                 path,
             )
-            data = json.loads(default_path.read_text(encoding="utf-8"))
+            data = read_json(default_path, recover=Recovery.RAISE)
             out: list[Interest] = []
             for raw in data.get("interests", []):
                 try:
@@ -183,13 +181,12 @@ class InterestSet:
         return instance
 
     def save(self, path: Path) -> None:
-        """Atomic save via .bak rotation (save_with_backup)."""
+        """Atomic save via .bak rotation (write_json)."""
         from brain.health.adaptive import compute_treatment
-        from brain.health.attempt_heal import save_with_backup
 
         payload = {"version": 1, "interests": [i.to_dict() for i in self.interests]}
         treatment = compute_treatment(path.parent, path.name)
-        save_with_backup(path, payload, backup_count=treatment.backup_count)
+        write_json(path, payload, backups=treatment.backup_count)
 
     def find_by_topic(self, topic: str) -> Interest | None:
         lower = topic.lower()

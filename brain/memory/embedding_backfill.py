@@ -121,7 +121,6 @@ cursor-reset behavior is what the termination check keys off of.
 
 from __future__ import annotations
 
-import json
 import logging
 import math
 import threading
@@ -130,6 +129,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from brain import tunables
+from brain.health.json_io import read_json, write_json
 from brain.memory.store import MemoryStore
 from brain.paths import cadence_state_path
 
@@ -344,11 +344,8 @@ def _load_cursor(persona_dir, current_model_id: str) -> tuple[str, str] | None: 
     under the current model (they no longer satisfy the backlog predicate).
     """
     path = cadence_state_path(persona_dir, _CURSOR_FILE)
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(raw, dict):
+    raw = read_json(path, default=lambda: None, expect=dict)  # missing/corrupt/unreadable: rescan from the top
+    if raw is None:
         return None
     if raw.get("model_id") != current_model_id:
         # A model swap (or first run under this model) invalidates any prior
@@ -390,13 +387,7 @@ def _save_cursor(
         {"created_at": cursor[0], "id": cursor[1]} if cursor is not None else None
     )
     payload = {"model_id": current_model_id, "cursor": cursor_payload}
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps(payload), encoding="utf-8")
-        tmp.replace(path)
-    except OSError:
-        logger.warning("embedding_backfill: could not persist cursor (best-effort)", exc_info=True)
+    write_json(path, payload, indent=None, fsync=False, on_error="log")  # best-effort: a rescan is the cost
 
 
 def has_embedding_backfill_work(store: MemoryStore) -> bool:

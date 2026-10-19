@@ -11,6 +11,8 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from brain.health.json_io import Recovery, iter_jsonl
+
 if TYPE_CHECKING:
     from brain.soul.store import SoulStore
 
@@ -33,14 +35,11 @@ def list_under_review_memory_ids(persona_dir: Path) -> list[str]:
     read failure (permissions, I/O) is NOT swallowed here: the caller
     (``brain.forgetting._load_soul_linked_ids``) logs it and skips its pass (#370, #392).
     """
-    from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
-
     candidates_path = persona_dir / "soul_candidates.jsonl"
-    if not candidates_path.exists():
-        return []
 
     ids: list[str] = []
-    for r in read_jsonl_skipping_corrupt(candidates_path):
+    # RAISE: a failed read must not read as "no candidates under review" (the forgetting pass fails closed on it).
+    for r in iter_jsonl(candidates_path, recover=Recovery.RAISE):
         status = r.get("status", "auto_pending")
         if status in _UNDER_REVIEW_STATUSES:
             mid = str(r.get("memory_id") or "").strip()
@@ -51,13 +50,9 @@ def list_under_review_memory_ids(persona_dir: Path) -> list[str]:
 
 def _accepted_candidate_ids(persona_dir: Path, store: SoulStore | None) -> list[str]:
     """Memory ids of accepted candidates whose crystallization has not been revoked."""
-    from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
-
     candidates_path = persona_dir / "soul_candidates.jsonl"
-    if not candidates_path.exists():
-        return []
     accepted = [
-        r for r in read_jsonl_skipping_corrupt(candidates_path) if r.get("status") == "accepted"
+        r for r in iter_jsonl(candidates_path, recover=Recovery.RAISE) if r.get("status") == "accepted"
     ]
     revoked = {c.id for c in store.list_revoked()} if accepted and store else set()
 

@@ -151,7 +151,7 @@ def test_reflex_arc_set_load_bad_arc_skipped_good_kept(tmp_path: Path):
     assert "broken" not in names
 
 
-# ---- Health T10: attempt_heal wiring ----
+# ---- Health T10: json_io HEAL wiring ----
 
 
 def test_reflex_arc_set_load_corrupt_quarantines_restores_from_bak(tmp_path: Path):
@@ -186,7 +186,7 @@ def test_reflex_arc_set_load_corrupt_no_bak_uses_defaults(tmp_path: Path):
 
 
 def test_reflex_log_save_with_backup_creates_bak(tmp_path: Path):
-    """save() via save_with_backup creates .bak1 on second write."""
+    """save() via json_io.write_json creates .bak1 on second write."""
     path = tmp_path / "reflex_log.json"
     fire = ArcFire(
         arc_name="test_arc",
@@ -217,7 +217,7 @@ def test_reflex_log_load_corrupt_returns_empty(tmp_path: Path):
 
 
 def test_reflex_log_load_corrupt_quarantines_and_warns(tmp_path: Path, caplog) -> None:
-    """Corrupt file is quarantined and WARNING is emitted (attempt_heal path)."""
+    """Corrupt file is quarantined and WARNING is emitted (json_io HEAL path)."""
     import logging
 
     caplog.set_level(logging.WARNING)

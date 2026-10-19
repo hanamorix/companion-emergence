@@ -6,7 +6,7 @@ from pathlib import Path
 
 from brain.persona_config import DEFAULT_PROVIDER, DEFAULT_SEARCHER, PersonaConfig
 
-# ---- Task 9: attempt_heal wiring ----
+# ---- Task 9: json_io HEAL wiring ----
 
 
 def test_persona_config_load_corrupt_file_quarantines_and_resets(tmp_path: Path) -> None:

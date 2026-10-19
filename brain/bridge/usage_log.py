@@ -1,12 +1,12 @@
 """Per-call token-usage audit log. Best-effort — never breaks a turn."""
 from __future__ import annotations
 
-import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.bridge import model_error
+from brain.health.json_io import append_jsonl
 
 log = logging.getLogger(__name__)
 
@@ -25,8 +25,6 @@ def log_usage(persona_dir: Path | None, *, call_type: str, model: str, frame: di
             "total_cost_usd": frame.get("total_cost_usd"), "num_turns": frame.get("num_turns"),
             "duration_ms": frame.get("duration_ms"), "session_id": frame.get("session_id"),
         }
-        persona_dir.mkdir(parents=True, exist_ok=True)
-        with (persona_dir / "chat_usage.jsonl").open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row) + "\n")
+        append_jsonl(persona_dir / "chat_usage.jsonl", row, on_error="log", nonfinite="null")
     except Exception:  # noqa: BLE001 — instrumentation must never break a turn
         log.debug("log_usage failed", exc_info=True)

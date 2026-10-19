@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from brain.health.json_io import append_jsonl, encode_jsonl
 from brain.utils.file_lock import file_lock
 
 logger = logging.getLogger(__name__)
@@ -220,7 +221,8 @@ def log_invocation(
     log_path = persona_dir / _LOG_FILENAME
     try:
         _rotate_if_needed(log_path)
-        with log_path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
     except OSError as exc:
-        logger.warning("audit log write failed: %s", exc)
+        logger.warning("audit log rotation failed: %s", exc)
+    append_jsonl(
+        log_path, encode_jsonl(record, encode_default=str, nonfinite="null"), on_error="log"
+    )
