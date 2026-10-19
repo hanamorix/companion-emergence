@@ -204,7 +204,13 @@ def should_run_backfill(persona_dir: Path) -> bool:
     existing = _load_state(persona_dir)
     if existing is not None and existing.status == "complete":
         return False
+    if _unfinished_supplementary(existing):
+        return False  # #473: resumed by should_run_supplementary_backfill, never as a full pass
     return True
+
+
+def _unfinished_supplementary(state) -> bool:  # state: BackfillState | None
+    return state is not None and state.pass_kind == "supplementary" and state.status != "complete"
 
 
 def should_run_supplementary_backfill(persona_dir: Path) -> bool:
@@ -218,6 +224,8 @@ def should_run_supplementary_backfill(persona_dir: Path) -> bool:
     from brain.attunement.schemas import SCHEMA_VERSION
 
     existing = _load_state(persona_dir)
+    if _unfinished_supplementary(existing):
+        return True  # #473: a supplementary pass that stopped early (refused, deferred, yielded) resumes
     if existing is None or existing.status != "complete":
         return False
     old, new = _schema_key(existing.schema_version), _schema_key(SCHEMA_VERSION)
@@ -266,6 +274,7 @@ def run_backfill(
     tone/cadence patterns are not double-counted.
     """
     from brain.attunement.budget import consume_call as _attunement_consume_call
+    from brain.attunement.budget import get_remaining as _attunement_budget_remaining
     from brain.attunement.crystallise import check_crystallisations
     from brain.attunement.schemas import (
         DAILY_BUDGET_DEFAULT,
@@ -283,6 +292,22 @@ def run_backfill(
 
     if cap is None:
         cap = DAILY_BUDGET_DEFAULT
+
+    now_dt = now_dt or _datetime.now(UTC)
+    now_iso = _now_iso_str(now_dt)
+
+    existing = _load_state(persona_dir)
+    # Normal path: short-circuit if already complete.
+    # Supplementary path: bypass the early-return — the whole point is to
+    # re-run after a prior completion, starting fresh at cursor=0.
+    if not supplementary and existing is not None and existing.status == "complete":
+        return existing
+
+    # #473: a supplementary pass that stopped early resumes as itself: from its cursor, with the categories it
+    # was started for (never tone / cadence), whatever this call asked for.
+    resuming_supplementary = supplementary and _unfinished_supplementary(existing)
+    if resuming_supplementary and existing.categories:
+        only_categories = frozenset(existing.categories)
 
     if detector_fn is None:
         from brain.attunement.detector import run_detector as _default_detector
@@ -319,35 +344,26 @@ def run_backfill(
                     user_pronouns=_upron,
                 )
 
-    now_dt = now_dt or _datetime.now(UTC)
-    now_iso = _now_iso_str(now_dt)
-
-    existing = _load_state(persona_dir)
-    # Normal path: short-circuit if already complete.
-    # Supplementary path: bypass the early-return — the whole point is to
-    # re-run after a prior completion, starting fresh at cursor=0.
-    if not supplementary and existing is not None and existing.status == "complete":
-        return existing
-
     turns = _read_buffer_turns(persona_dir)
     all_windows = window_buffer(turns)
     sampled = select_sample(all_windows)
 
-    if supplementary:
+    if resuming_supplementary:
+        start_idx = _cursor_index(sampled, existing.last_cursor)
+        last_cursor = existing.last_cursor
+    elif supplementary:
         # Reprocess every window for the new categories (fresh cursor at index 0),
         # but PRESERVE the prior completed record — a supplementary pass augments
         # an existing backfill, it must not clobber the original started_at or
-        # reset patterns_emitted. Counts accumulate; only the cursor resets (the
-        # cursor itself is cleared in the BackfillState construction below).
+        # reset patterns_emitted. Counts accumulate; only the cursor resets.
         start_idx = 0
-        processed_so_far = existing.processed_windows if existing else 0
-        started_at = existing.started_at if existing else now_iso
-        patterns_emitted_so_far = existing.patterns_emitted if existing else 0
+        last_cursor = ""
     else:
         start_idx = _cursor_index(sampled, existing.last_cursor) if existing else 0
-        processed_so_far = existing.processed_windows if existing else 0
-        started_at = existing.started_at if existing else now_iso
-        patterns_emitted_so_far = existing.patterns_emitted if existing else 0
+        last_cursor = existing.last_cursor if existing else ""
+    processed_so_far = existing.processed_windows if existing else 0
+    started_at = existing.started_at if existing else now_iso
+    patterns_emitted_so_far = existing.patterns_emitted if existing else 0
 
     state = BackfillState(
         started_at=started_at,
@@ -356,10 +372,13 @@ def run_backfill(
         processed_windows=processed_so_far,
         patterns_emitted=patterns_emitted_so_far,
         status="running",
-        last_cursor=("" if supplementary else (existing.last_cursor if existing else "")),
+        last_cursor=last_cursor,
         schema_version=SCHEMA_VERSION,
+        pass_kind="supplementary" if supplementary else "full",
+        categories=tuple(sorted(only_categories)) if supplementary and only_categories is not None else None,
     )
-    _save_state(persona_dir, state)
+    # #473: the start-of-run save is deferred to the first window whose detector call was not refused (or to the
+    # budget deferral below), so a run refused at its first window leaves the state file exactly as it was.
 
     # #144: mirror emotion_backfill's zero-tagged guard — count detector
     # outcomes so a run where every call errored is not marked complete.
@@ -398,7 +417,8 @@ def run_backfill(
                 )
                 return state
 
-            if not _attunement_consume_call(persona_dir, now=now_dt, cap=cap):
+            # #473: check the budget now (read-only) and charge it only after a call that was not refused.
+            if _attunement_budget_remaining(persona_dir, now=now_dt, cap=cap) <= 0:
                 state = replace(state, status="deferred_to_next_day")
                 _save_state(persona_dir, state)
                 return state
@@ -406,11 +426,19 @@ def run_backfill(
             attempted_this_run += 1
             try:
                 output = detector_fn(buffer_slice=list(window.turns), reply_text="")
+            except cli_throttle.ThrottleDeferred as exc:
+                # #473: "not now" (login expired, or the bridge is stopping): nothing of this window is written and
+                # no later window runs; the state on disk is as it was before this window's call.
+                _log.info("attunement backfill: detector call refused on %s (%s); stopping this run", window.id, exc)
+                return state
             except Exception as exc:  # noqa: BLE001
+                _attunement_consume_call(persona_dir, now=now_dt, cap=cap)  # a call that failed still cost one
+                _save_state(persona_dir, state)  # the deferred start-of-run save, unchanged otherwise
                 _log.warning(
                     "attunement backfill: detector error on %s: %s", window.id, exc
                 )
                 continue
+            _attunement_consume_call(persona_dir, now=now_dt, cap=cap)
             succeeded_this_run += 1
 
             merge_into_learned(

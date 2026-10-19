@@ -40,7 +40,8 @@ def test_spawn_skips_when_buffer_empty(tmp_path: Path):
 
 
 def test_spawn_defers_when_budget_exhausted(tmp_path: Path):
-    with patch("brain.chat.tool_loop._attunement_consume_call", return_value=False), \
+    # #473: the budget is checked read-only before the call (and charged after it), so exhaustion is seen there.
+    with patch("brain.chat.tool_loop._attunement_budget_remaining", return_value=0), \
          patch("brain.chat.tool_loop.run_detector") as mock_detector:
         _spawn_pass2_attunement(
             tmp_path,

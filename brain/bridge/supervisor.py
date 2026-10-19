@@ -59,7 +59,7 @@ from brain.attunement.backfill import (
 from brain.attunement.backfill import (
     should_run_supplementary_backfill as _attunement_should_run_supplementary_backfill,
 )
-from brain.bridge import central_cadence, cli_throttle, persisted_cadence
+from brain.bridge import central_cadence, cli_throttle, persisted_cadence, provider_auth
 from brain.bridge.central_cadence import GatedJob, JobOutcome
 from brain.bridge.events import EventBus
 from brain.bridge.model_tier import (
@@ -471,6 +471,15 @@ def run_folded(
     # notes). Set for the duration of each loop iteration; None outside it or
     # when the open failed (a job then opens its own short-lived store).
     tick_ctx: dict[str, MemoryStore | None] = {"store": None}
+
+    def _stopping() -> bool:
+        """#456 (D2): a stop was requested (the loop's own stop_event, or the bridge-wide shutdown flag). Checked
+        before every block that would start new work, so nothing new starts after a stop."""
+        return stop_event.is_set() or cli_throttle.shutdown_requested()
+
+    # #456 (D13): the expired-login back-off of refused gated jobs (job name -> monotonic time). Memory only:
+    # a restart forgets it by design (the login state is re-probed at start anyway).
+    deferred_until: dict[str, float] = {}
     gated_jobs = _build_gated_jobs(
         persona_dir=persona_dir,
         provider=provider,
@@ -491,6 +500,7 @@ def run_folded(
         tick_ctx=tick_ctx,
         bridge_started_at=bridge_started_at,
         between_items=_between_items,
+        should_stop=_stopping,
     )
 
     while not stop_event.is_set():
@@ -524,7 +534,11 @@ def run_folded(
             # here.
             try:
                 central_cadence.run_central_pass(
-                    persona_dir, gated_jobs, between_jobs=_maybe_run_heartbeat
+                    persona_dir,
+                    gated_jobs,
+                    between_jobs=_maybe_run_heartbeat,
+                    should_stop=_stopping,
+                    deferred_until=deferred_until,
                 )
             except Exception:
                 logger.exception("supervisor central cadence pass raised")
@@ -556,6 +570,8 @@ def run_folded(
             # interval can't be reset to zero by an app quit/reboot (the defect that
             # let candidates pile up). Self-paces by outcome: backlog → 30-min
             # catch-up; model failures (429) → escalating backoff; clean → 6h.
+            if _stopping():  # #456 (D2): nothing new starts after a stop
+                break
             if soul_review_interval_s is not None and soul_cadence.is_due(
                 soul_cadence_state, now=datetime.now(UTC)
             ):
@@ -567,6 +583,14 @@ def run_folded(
                         build_tier_provider(persona_dir, TIER_BACKGROUND_GENERATIVE),
                         event_bus,
                     )
+                except cli_throttle.ThrottleDeferred as exc:
+                    # #456/#473: "not now" is not a model failure. On a stop, leave the cadence as it is.
+                    logger.info("supervisor soul-review tick deferred: %s", exc)
+                    if _stopping():
+                        break
+                    from brain.soul.review import count_eligible_pending
+
+                    eligible_pending = count_eligible_pending(persona_dir)
                 except Exception:
                     logger.exception("supervisor soul-review tick raised")
                     model_failures = 1  # a crashed tick counts as a failure → backoff
@@ -583,6 +607,8 @@ def run_folded(
             # heartbeats/dreams/emotion_growth don't grow forever; yearly
             # archive for soul_audit (every decision must remain reachable).
             # Fault-isolated per-log inside the tick function.
+            if _stopping():  # #456 (D2): nothing new starts after a stop
+                break
             if log_rotation_cadence_state is not None and persisted_cadence.is_due(
                 log_rotation_cadence_state, now=datetime.now(UTC)
             ):
@@ -603,6 +629,8 @@ def run_folded(
             # this retries the placeholder-describer (and the #174 variant
             # merge) on a persisted wall-clock cadence. Cheap when nothing is
             # pending: should_run is a file scan, no provider is built.
+            if _stopping():  # #456 (D2): nothing new starts after a stop
+                break
             if vocab_repair_cadence_state is not None and persisted_cadence.is_due(
                 vocab_repair_cadence_state, now=datetime.now(UTC)
             ):
@@ -621,6 +649,8 @@ def run_folded(
             # Pending-write reconcile (#346) — its own short persisted cadence, so a write stranded
             # mid-session is recovered without waiting on the maintenance job's throttle-slot /
             # PAUSED / 6h gates. Provider-free; the helper has its own try/except.
+            if _stopping():  # #456 (D2): nothing new starts after a stop
+                break
             if pending_reconcile_cadence_state is not None and persisted_cadence.is_due(
                 pending_reconcile_cadence_state, now=datetime.now(UTC)
             ):
@@ -639,6 +669,8 @@ def run_folded(
             # of crystallizations + dreams + message tones and may emit a
             # voice-edit candidate (gated by >=3 evidence items inside the
             # reflection tick itself). Fault-isolated.
+            if _stopping():  # #456 (D2): nothing new starts after a stop
+                break
             if voice_cadence_state is not None and persisted_cadence.is_due(
                 voice_cadence_state, now=datetime.now(UTC)
             ):
@@ -663,6 +695,8 @@ def run_folded(
             # block only switches the organ on/off. Reuses the per-tick `store`
             # opened at the top of this iteration (the charge readers need it)
             # instead of opening its own separate connection (#132).
+            if _stopping():  # #456 (D2): nothing new starts after a stop
+                break
             if maker_enabled and store is not None:  # default True; gate exists for tests/builds
                 try:
                     _maybe_run_maker_tick(
@@ -682,6 +716,8 @@ def run_folded(
             # iteration (the `store` kwarg is accepted but currently unused by the
             # notes runner itself) instead of opening its own separate connection
             # (#132). Organ DoD — the producer fires on the live path.
+            if _stopping():  # #456 (D2): nothing new starts after a stop
+                break
             if notes_enabled and store is not None:  # default True; gate exists for tests/builds
                 try:
                     _maybe_run_notes_tick(
@@ -723,6 +759,8 @@ def run_folded(
         # being set — checked inside _run_kindled_link_tick. ExitStack store
         # + httpx client ownership live inside that helper. Organ DoD — the
         # producer fires on the live path.
+        if _stopping():  # #456 (D2)
+            break
         if kindled_link_enabled:  # default True; coarse test/build switch
             try:
                 _maybe_run_kindled_link_tick(persona_dir, provider=provider)
@@ -781,6 +819,7 @@ def _build_gated_jobs(
     tick_ctx: dict[str, MemoryStore | None] | None = None,
     bridge_started_at: datetime | None = None,
     between_items: Callable[[], bool] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> list[GatedJob]:
     """The job table of the central cadence function (INC-9, S16/S55/S70).
 
@@ -884,30 +923,33 @@ def _build_gated_jobs(
 
     def _snapshot_prune_run() -> JobOutcome:
         snapshot_paused_out: list[bool] = []
-        with ExitStack() as stack:
-            store = stack.enter_context(_tick_store())
-            hebbian = HebbianMatrix(persona_dir / "hebbian.db", integrity_check=False)
-            stack.callback(hebbian.close)
-            # No per-session age threshold (silence 0): the job only runs on an
-            # idle pass, so every session's last turn is at least the lull old.
-            # Snapshot is NON-destructive — do NOT call remove_session here.
-            reports = snapshot_stale_sessions(
-                persona_dir,
-                silence_minutes=0.0,
-                store=store,
-                hebbian=hebbian,
-                provider=build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING),
-                should_pause=_between_items,
-                paused_out=snapshot_paused_out,
+        try:
+            with ExitStack() as stack:
+                store = stack.enter_context(_tick_store())
+                hebbian = HebbianMatrix(persona_dir / "hebbian.db", integrity_check=False)
+                stack.callback(hebbian.close)
+                # No per-session age threshold (silence 0): the job only runs on an
+                # idle pass, so every session's last turn is at least the lull old.
+                # Snapshot is NON-destructive — do NOT call remove_session here.
+                reports = snapshot_stale_sessions(
+                    persona_dir,
+                    silence_minutes=0.0,
+                    store=store,
+                    hebbian=hebbian,
+                    provider=build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING),
+                    should_pause=_between_items,
+                    paused_out=snapshot_paused_out,
+                )
+        finally:
+            # Prune is indivisible (§4.4) — it always runs once per pass
+            # regardless of whether the snapshot half paused, or was refused
+            # (#456/#473: the refusal still reaches the central pass afterwards).
+            prune_now = datetime.now(UTC)
+            pruned = prune_empty_sessions(
+                older_than_seconds=_prune_age(prune_now), now=prune_now, persona_name=persona_dir.name
             )
-        # Prune is indivisible (§4.4) — it always runs once per pass
-        # regardless of whether the snapshot half paused above.
-        prune_now = datetime.now(UTC)
-        pruned = prune_empty_sessions(
-            older_than_seconds=_prune_age(prune_now), now=prune_now, persona_name=persona_dir.name
-        )
+            tick_stats["pruned_empty_sessions"] += len(pruned)
         tick_stats["closed_sessions"] += len(reports)
-        tick_stats["pruned_empty_sessions"] += len(pruned)
         for r in reports:
             event_bus.publish(
                 {
@@ -1145,6 +1187,10 @@ def _build_gated_jobs(
                     # the whole maintenance job reports PAUSED (no cadence
                     # advance, S36) rather than silently completing them out
                     # of order relative to a still-mid-pass forgetting.
+                    return JobOutcome.PAUSED
+                if should_stop is not None and should_stop():
+                    # #456 (D2): forgetting finished its last item with a stop requested: the narrative pass
+                    # (model calls) does not start; PAUSED keeps the maintenance cadence as it is.
                     return JobOutcome.PAUSED
                 # Narrative-memory arc-update runs AFTER forgetting so a memory
                 # forgetting just dropped doesn't enter an arc born this tick.
@@ -2058,6 +2104,8 @@ def _run_self_model_tick(
         )
         if deferred:
             outcome = "deferred"
+    except (cli_throttle.ShutdownDeferred, provider_auth.ProviderAuthDeferred):
+        raise  # #456/#473: "not now": state and cadence are left as they were
     except Exception:
         logger.exception("supervisor self-model reflect raised")
         outcome = "failure"
@@ -2186,12 +2234,14 @@ def _self_model_reflect(
         new_gap.channel_cooldowns = dict(carried_cooldowns)
         if same_channels and prior_gap:
             new_gap.channel_cooldowns.update(prior_gap.channel_cooldowns)
-        increment_gaps_surfaced(persona_dir)
-
         # ── 5: articulate above threshold (fail-soft inside) ─────────────────
+        # A refusal (ShutdownDeferred / ProviderAuthDeferred) propagates: nothing of this tick is written, so
+        # the audit counter below is bumped only after the articulate step (#473: no pre-call write).
         if new_gap.magnitude >= _SELF_MODEL_ARTICULATE_THRESHOLD:
             try:
                 note = sm_articulate(new_gap, provider=provider, persona_dir=persona_dir)
+            except (cli_throttle.ShutdownDeferred, provider_auth.ProviderAuthDeferred):
+                raise
             except cli_throttle.ThrottleDeferred:
                 # Rare peek-then-lost race (the common case never reaches here —
                 # it's short-circuited by _run_self_model_tick's own pre-flight
@@ -2206,6 +2256,7 @@ def _self_model_reflect(
                 # reconciled/dismissed prior gap's note must not carry forward
                 # even on a channel-set match — see supervisor.py:~1400).
                 new_gap.note = prior_gap.note
+        increment_gaps_surfaced(persona_dir)
 
     # ── 6: resolution downstream (two paths) ────────────────────────────────
     # session_id is informational on the resolved soul candidate; the
@@ -2506,6 +2557,8 @@ def _run_compaction_tick(
                 continue
             try:
                 cascade_conversation(persona_dir, session_id, provider=provider, now=now)
+            except cli_throttle.ThrottleDeferred:
+                raise  # #456/#473: "not now": the session is left as it is and the job is skipped
             except Exception:
                 logger.exception("compaction tick: session=%s raised", session_id)
             # 1c-B weekly rollover (quiet-moment boundary). The is_session_busy belt
@@ -2519,6 +2572,8 @@ def _run_compaction_tick(
                     store=store, hebbian=hebbian,
                     is_session_busy=is_session_busy,
                 )
+            except cli_throttle.ThrottleDeferred:
+                raise
             except Exception:
                 logger.exception("weekly rollover: session=%s raised", session_id)
 
@@ -2695,6 +2750,8 @@ def _run_calibration_tick(
                 progress_out=label_progress,
             )
             logger.info("calibration tick: labeled=%d calibration_log rows this pass", labeled)
+        except cli_throttle.ThrottleDeferred:
+            raise  # #456/#473: "not now": the job is skipped (no cadence advance); unlabeled rows stay
         except Exception:  # noqa: BLE001 — judge/torch/Haiku failure must not crash the tick
             logger.exception("calibration tick: judge-labeling pass raised; continuing")
             label_progress = {}

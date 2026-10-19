@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from brain import prompt_strings
+from brain.bridge.cli_throttle import ThrottleDeferred
 from brain.bridge.provider import LLMProvider
 from brain.health.parse_failures import record_parse_failure
 from brain.ingest.types import ExtractedItem
@@ -260,6 +261,9 @@ def extract_items_with_status(
         raw_text: str | None = None
         try:
             raw_text = provider.generate(prompt)
+        except ThrottleDeferred:
+            # #456/#473: a refusal is "not now", not a failed extraction: no retry, no failure recorded.
+            raise
         except Exception as exc:  # noqa: BLE001
             last_error = f"provider.generate failed on attempt {attempt}: {exc}"
             logger.warning(

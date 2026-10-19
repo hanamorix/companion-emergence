@@ -49,7 +49,7 @@ from pydantic import BaseModel, Field, StrictBool
 
 from brain import __version__ as _brain_version
 from brain import prompt_strings, tunables
-from brain.bridge import events, model_error, provider_auth
+from brain.bridge import cli_throttle, events, model_error, provider_auth
 from brain.bridge.chat import (
     ChatMessage,
     ChatResponse,
@@ -659,6 +659,8 @@ def _check_model_blocking(model_id: str, timeout_s: float | None = None) -> tupl
         return "ok", ""
     except provider_auth.ProviderAuthDeferred:
         return "inconclusive", "auth_deferred"
+    except cli_throttle.ShutdownDeferred:
+        return "inconclusive", "stopping"
     except TimeoutError:
         return "inconclusive", "timeout"
     except Exception as exc:  # noqa: BLE001 - any other failure only means "could not check"
@@ -767,6 +769,8 @@ async def _recheck_derived_unavailable(persona_dir: Path, lock: asyncio.Lock) ->
         if not ids:
             return
         async with lock:
+            if cli_throttle.shutdown_requested():
+                return  # #456: the bridge is stopping; start no probe (the list stays for the next start)
             results = await _probe_models(ids, _check_budget_s())
         outcomes = {m: res[0] for m, res in zip(ids, results, strict=True)}
         for m, (outcome, reason) in zip(ids, results, strict=True):

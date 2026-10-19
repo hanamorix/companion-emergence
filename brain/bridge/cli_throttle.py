@@ -85,6 +85,29 @@ class ThrottleDeferred(RuntimeError):  # noqa: N818 — a control signal, not an
     """
 
 
+class ShutdownDeferred(ThrottleDeferred):  # noqa: N818 — a control signal, not an error
+    """A background Claude call refused because the bridge is stopping (#456).
+
+    "Not now": the caller leaves its work in place (queue record, cursor, candidate, schedule file) for the next
+    run. A subclass of ThrottleDeferred so every handler that already treats a denied slot as a quiet no-op also
+    treats this one so."""
+
+
+# #456: set once when the bridge is told to stop; every background gate then reports "not idle" and every
+# background Claude spawn site refuses with ShutdownDeferred. Never cleared in a running bridge (reset() is a test
+# helper). A threading.Event: set from the stop request's thread or the monitor, never from a signal handler.
+_shutdown = threading.Event()
+
+
+def request_shutdown() -> None:
+    """Mark the process as stopping: no new background work starts from here on."""
+    _shutdown.set()
+
+
+def shutdown_requested() -> bool:
+    return _shutdown.is_set()
+
+
 def reset() -> None:  # test helper
     global _last_message_mono, _inflight_background, _inflight_replies
     global _err_last_key, _err_last_logged_mono, _err_suppressed_count
@@ -97,6 +120,7 @@ def reset() -> None:  # test helper
         _err_suppressed_count = 0
         _start_hooks.clear()
         _reply_ended.notify_all()
+    _shutdown.clear()
 
 
 def mark_interactive_active(at: float | None = None) -> None:
@@ -400,7 +424,12 @@ def is_chat_idle(*, now: float | None = None) -> bool:
 
     Fails CLOSED on any internal error (S63): returns False ("not idle") and
     logs at a rate-limited pace (see ``_log_is_chat_idle_error``) so a
-    persistent fault stays visible without flooding."""
+    persistent fault stays visible without flooding.
+
+    While the bridge is stopping (#456) it reports "not idle", so every gate built on it (``acquire_background``,
+    ``slot_available``, ``should_yield``, the central cadence and the item-loop pauses) lets nothing new start."""
+    if _shutdown.is_set():
+        return False
     try:
         with _lock:
             t = time.monotonic() if now is None else now

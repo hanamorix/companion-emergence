@@ -15,6 +15,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field, field_validator
 
 from brain import prompt_strings
+from brain.bridge.cli_throttle import ThrottleDeferred
 from brain.bridge.provider import LLMProvider
 from brain.health.json_io import append_jsonl, read_json, write_json
 from brain.health.parse_failures import record_parse_failure
@@ -231,6 +232,8 @@ def extract_from_thinking(
     prompt = _build_user_prompt(monologue_blocks, visible_reply, recent_turn_context)
     try:
         raw = provider.generate(prompt, system=_SYSTEM_PROMPT + _vocab_prompt_line())
+    except ThrottleDeferred:
+        raise  # #456/#473: "not now": the pass-2 record stays queued (see pass2_queue.drain_all_locked)
     except Exception as exc:  # noqa: BLE001
         logger.warning("extractor LLM call failed: %s", exc)
         return ExtractorOutput()

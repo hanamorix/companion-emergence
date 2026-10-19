@@ -24,6 +24,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
+from brain.bridge.cli_throttle import ThrottleDeferred
 from brain.bridge.provider import LLMProvider
 from brain.ingest.buffer import (
     delete_backoff,
@@ -529,6 +530,9 @@ def snapshot_stale_sessions(
                     if paused_out is not None:
                         paused_out.append(True)
                     return reports
+        except ThrottleDeferred:
+            # #456/#473: the session stays as it is (cursor, backoff); the job is skipped, not failed.
+            raise
         except Exception:
             logger.exception(
                 "snapshot_stale_sessions: per-session failure session=%s; "
@@ -585,6 +589,9 @@ def finalize_stale_sessions(
                 provider=provider,
                 config=config,
             )
+        except ThrottleDeferred:
+            # #456/#473: not a failure: no backoff counted, the session is left for a later pass.
+            raise
         except Exception:
             logger.exception("finalize_stale_sessions: snapshot failed session=%s", sid)
             report = IngestReport(session_id=sid)

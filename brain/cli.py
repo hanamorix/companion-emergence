@@ -1989,11 +1989,17 @@ def _drain_pass2_at_exit(persona_dir: Path) -> None:
     def _print_progress(done: int, total: int) -> None:
         print(f"pass-2: {done} of {total} done")
 
-    pass2_queue.drain_all_locked(
-        persona_dir,
-        on_progress=_print_progress,
-        time_budget_s=dev_constants.PASS2_NOBRIDGE_DRAIN_BUDGET_S,
-    )
+    from brain.bridge.cli_throttle import ThrottleDeferred
+
+    try:
+        pass2_queue.drain_all_locked(
+            persona_dir,
+            on_progress=_print_progress,
+            time_budget_s=dev_constants.PASS2_NOBRIDGE_DRAIN_BUDGET_S,
+        )
+    except ThrottleDeferred as exc:
+        # #473: a refused call ("not now", e.g. an expired login) leaves the rest queued for a later drain.
+        print(f"pass-2: stopped early ({exc}); the rest stays queued")
 
 
 def _start_floor_bootstrap_for_direct_chat(persona_dir: Path, *, blocking: bool) -> None:

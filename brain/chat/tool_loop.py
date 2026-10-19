@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from brain.attunement.budget import consume_call as _attunement_consume_call
+from brain.attunement.budget import get_remaining as _attunement_budget_remaining
 from brain.attunement.crystallise import check_crystallisations
 from brain.attunement.detector import run_detector, should_run_detector
 from brain.attunement.store import (
@@ -29,6 +30,7 @@ from brain.attunement.store import (
     write_current_read,
 )
 from brain.bridge.chat import ChatMessage, ChatResponse
+from brain.bridge.cli_throttle import ThrottleDeferred
 from brain.bridge.provider import LLMProvider
 from brain.chat import pass2_queue
 from brain.chat.extractor import apply_side_effects, extract_from_thinking
@@ -92,6 +94,8 @@ def run_pass2_monologue(
             persona_dir=persona_dir,
         )
         apply_side_effects(out, persona_dir=persona_dir)
+    except ThrottleDeferred:
+        raise  # #456/#473: the record stays at the queue head for a later drain
     except Exception:  # noqa: BLE001
         logger.exception("pass-2 monologue extraction failed")
 
@@ -153,7 +157,9 @@ def _run_attunement_pass2(
     buffer_slice: list[BufferTurn],
 ) -> None:
     try:
-        if not _attunement_consume_call(persona_dir, now=datetime.now(UTC)):
+        # #473: check the daily budget now (read-only); charge it only after a detector call that was not refused
+        # (success or another failure). The drain lock makes the check-then-charge exclusive.
+        if _attunement_budget_remaining(persona_dir, now=datetime.now(UTC)) <= 0:
             return  # budget exhausted; defer silently
         user_name = ""
         user_pronouns = None
@@ -173,6 +179,7 @@ def _run_attunement_pass2(
             user_pronouns=user_pronouns,
             persona_dir=persona_dir,
         )
+        _attunement_consume_call(persona_dir, now=datetime.now(UTC))
         write_current_read(persona_dir, output.current_read)
         merge_into_learned(
             persona_dir,
@@ -182,6 +189,8 @@ def _run_attunement_pass2(
         )
         mark_addressed(persona_dir, output.addressed_pattern_ids, now_iso=_attunement_now_iso())
         check_crystallisations(persona_dir, now_iso=_attunement_now_iso())
+    except ThrottleDeferred:
+        raise  # #456/#473: no error row; the record stays at the queue head
     except Exception as exc:  # noqa: BLE001 — error isolation by design
         _log_attunement_error(persona_dir, turn_id, exc)
 

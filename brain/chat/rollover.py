@@ -26,6 +26,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from brain.bridge.cli_throttle import ThrottleDeferred
 from brain.bridge.provider import LLMProvider
 from brain.chat.compaction import (
     build_compaction_provider,
@@ -97,6 +98,8 @@ def perform_rollover(
                 store=store, hebbian=hebbian, provider=provider,
                 config=config,
             )
+        except ThrottleDeferred:
+            raise  # #456/#473: "not now": the rollover waits, the old buffer stays as it is
         except Exception:
             logger.exception("rollover: extraction failed session=%s (continuing)", old_sid)
 

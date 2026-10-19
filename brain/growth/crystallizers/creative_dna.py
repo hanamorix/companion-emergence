@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from brain.behavioral.log import append_behavioral_event, read_behavioral_log
+from brain.bridge.cli_throttle import ThrottleDeferred
 from brain.bridge.provider import LLMProvider, ProviderError
 from brain.creative.dna import load_creative_dna, save_creative_dna
 from brain.health.parse_failures import record_parse_failure
@@ -118,6 +119,8 @@ def crystallize_creative_dna(
 
     try:
         raw = provider.generate(prompt)
+    except ThrottleDeferred:
+        raise  # #456: "not now": no growth run is recorded for this tick
     except ProviderError as exc:
         logger.warning("crystallize_creative_dna: provider error: %s", exc)
         return CreativeDnaCrystallizationResult()

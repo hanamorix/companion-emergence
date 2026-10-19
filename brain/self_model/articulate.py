@@ -187,6 +187,20 @@ def _save_budget(persona_dir: Path, state: dict) -> None:
     write_json(_budget_path(persona_dir), state, backups=1, indent=None, fsync=False)
 
 
+def _budget_allows(persona_dir: Path) -> bool:
+    """Read-only budget check (#473: checked before the call, charged after a call that was not refused).
+
+    Same fail-safe-permissive rule as ``_budget_check_and_consume``: a corrupt file allows.
+    """
+    try:
+        state = _load_budget(persona_dir)
+    except ValueError:
+        return True
+    if state.get("date") != _today_local():
+        return True
+    return int(state.get("count", 0)) < _DAILY_ARTICULATE_BUDGET
+
+
 def _budget_check_and_consume(persona_dir: Path) -> bool:
     """Return True (and increment) if a call is permitted; False if cap reached.
 
@@ -244,8 +258,8 @@ def articulate(gap: Gap, *, provider: Any, persona_dir: Path) -> str | None:
     if gap.magnitude < _GAP_THRESHOLD:
         return None
 
-    # 2. Daily budget gate (R-D1).
-    if not _budget_check_and_consume(persona_dir):
+    # 2. Daily budget gate (R-D1). Read-only here; the call is charged below once it was not refused (#473).
+    if not _budget_allows(persona_dir):
         log.debug("self_model articulate: daily budget exhausted — skipping")
         return None
 
@@ -266,13 +280,21 @@ def articulate(gap: Gap, *, provider: Any, persona_dir: Path) -> str | None:
     #    (brain/bridge/supervisor.py's _run_self_model_tick) is what retries, via
     #    the persisted cadence, at zero cost to this function.
     if not cli_throttle.acquire_background():
+        if cli_throttle.shutdown_requested():
+            # #456: the bridge is stopping; a refusal, not a lost slot race (the caller writes nothing).
+            raise cli_throttle.ShutdownDeferred("self_model articulate: bridge is stopping")
         log_self_model_deferred(persona_dir)
         raise cli_throttle.ThrottleDeferred(
             "self_model articulate: throttle slot unavailable"
         )
     try:
         raw = provider.generate(prompt, system=system)
+    except cli_throttle.ThrottleDeferred:
+        # #456/#473: "not now" (login expired, or the bridge is stopping): not charged, nothing logged as a
+        # failure; the caller leaves the self-model state and cadence as they were.
+        raise
     except Exception as exc:  # noqa: BLE001 — fail-soft: gap stands without a note
+        _budget_check_and_consume(persona_dir)  # a call that failed still cost one
         _log_articulate_error(persona_dir, "self_model_articulate_failed", exc)
         log.warning(
             "self_model articulate: provider error — returning None (fail-soft)",
@@ -281,6 +303,7 @@ def articulate(gap: Gap, *, provider: Any, persona_dir: Path) -> str | None:
         return None
     finally:
         cli_throttle.release_background()
+    _budget_check_and_consume(persona_dir)
 
     # log_usage / isinstance / strip checks are OUTSIDE the narrowed try above -
     # a failure here is a distinct bug class (logging/parsing), not a generation

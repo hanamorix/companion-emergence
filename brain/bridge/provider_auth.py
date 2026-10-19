@@ -145,6 +145,12 @@ def should_skip_background() -> bool:
         return False
 
 
+def login_expired() -> bool:
+    """True while the Claude login is marked expired (read-only; no probe is granted)."""
+    with _lock:
+        return _status == "expired"
+
+
 def state() -> dict:
     with _lock:
         return {

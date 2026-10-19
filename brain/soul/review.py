@@ -572,6 +572,7 @@ def _review_pending_candidates_locked(
         pending_at_start=len(pending_indices),
         dry_run=dry_run,
     )
+    refused: BaseException | None = None
 
     if not pending_indices:
         logger.info("soul review: no pending candidates")
@@ -649,6 +650,13 @@ def _review_pending_candidates_locked(
 
             try:
                 raw = provider.generate(user_content, system=system_content)
+            except cli_throttle.ThrottleDeferred as exc:
+                # #456/#473: "not now" is not a model failure: no audit entry, no failure counted, this candidate
+                # untouched. Stop here; the decisions already made this pass are saved below (an accepted
+                # candidate is already crystallised, so it must not stay pending).
+                refused = exc
+                report.examined -= 1
+                break
             except Exception as exc:
                 logger.warning(
                     "soul review: model call failed for candidate %s: %s",
@@ -729,8 +737,10 @@ def _review_pending_candidates_locked(
 
             report.decisions.append(decision)
 
-    if not dry_run:
+    if not dry_run and (refused is None or report.decisions):
         _save_soul_candidates(persona_dir, records)
+    if refused is not None:
+        raise refused
 
     logger.info(
         "soul review complete: accepted=%d rejected=%d deferred=%d parse_failures=%d audit_failures=%d dry_run=%s",
