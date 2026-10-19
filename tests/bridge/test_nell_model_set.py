@@ -6,7 +6,7 @@ id (64 cap), the same stream-json probe within the same budget, the same specifi
 (hot swap, shared single-flight lock); otherwise it runs the check itself and writes the config.
 
 Real files, the real ``brain.cli`` entry and the real endpoint (reached through a TestClient adapter in place of
-urllib); only the Claude subprocess is faked, with the scrubbed real frames from tests/bridge/fixtures.
+http.client); only the Claude subprocess is faked, with the scrubbed real frames from tests/bridge/fixtures.
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ import socket
 import struct
 import subprocess
 import threading
-import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -42,15 +41,9 @@ DERIVED = "claude-haiku-5"
 REWORDED = "Model unknown."
 
 
-_REAL_CONNECT_CHECK = getattr(cli, "_bridge_connect_error", None)
-
-
 @pytest.fixture(autouse=True)
-def _reset(monkeypatch):
+def _reset():
     model_error.reset()
-    # The pre-flight connect to the bridge's port: tests that fake urllib assume the port accepts connections.
-    # Tests that need the real check (real sockets) or a failing one say so (_point_at(real=True), a lambda).
-    monkeypatch.setattr(cli, "_bridge_connect_error", lambda port, timeout: None, raising=False)
     yield
     model_error.reset()
 
@@ -223,43 +216,80 @@ def test_a_full_id_clears_the_unsupported_marker(home: Path, capsys):
 # --- MS6: the bridge is running ----------------------------------------------------------------------------------
 
 
-class _Resp:
-    def __init__(self, content: bytes):
-        self._content = content
+class _FakeResponse:
+    """What HTTPConnection.getresponse() returns: a status and a readable body (bytes, or any object with read(n))."""
+
+    def __init__(self, status: int, content: Any):
+        self.status = status
+        self._fp = io.BytesIO(content) if isinstance(content, (bytes, bytearray)) else content
 
     def read(self, n: int = -1) -> bytes:
-        return self._content if n < 0 else self._content[:n]
+        return self._fp.read(n)
 
-    def __enter__(self):
-        return self
 
-    def __exit__(self, *a):
-        return False
+class _FakeConn:
+    def __init__(self, bridge: _Bridge, host: str, port: int, timeout):
+        self.bridge, self.host, self.port, self.timeout = bridge, host, port, timeout
+
+    def connect(self) -> None:
+        self.bridge.connects += 1
+        if self.bridge.connect_exc is not None:
+            raise self.bridge.connect_exc
+
+    def request(self, method, url, body=None, headers=None) -> None:
+        headers = headers or {}
+        self.bridge.requests.append(
+            {
+                "url": f"http://{self.host}:{self.port}{url}",
+                "path": url,
+                "method": method,
+                "auth": headers.get("Authorization"),
+                "body": json.loads(body),
+                "timeout": self.timeout,
+            }
+        )
+        self._body, self._headers, self._path = body, headers, url
+        if self.bridge.request_exc is not None:
+            raise self.bridge.request_exc
+
+    def getresponse(self) -> _FakeResponse:
+        if self.bridge.response_exc is not None:
+            raise self.bridge.response_exc
+        if self.bridge.forced is not None:
+            return _FakeResponse(*self.bridge.forced)
+        resp = self.bridge.client.post(self._path, content=self._body, headers=self._headers)
+        return _FakeResponse(resp.status_code, resp.content)
+
+    def close(self) -> None:
+        pass
 
 
 class _Bridge:
-    """Stands in for urllib against a real in-process app: records the request, answers through the TestClient."""
+    """Stands in for http.client.HTTPConnection against a real in-process app: records the request, answers
+    through the TestClient (or a forced (status, body)), and can fail at any phase: connect, request, response."""
 
-    def __init__(self, client: TestClient, forced: tuple[int, Any] | None = None):
+    def __init__(
+        self,
+        client: TestClient | None = None,
+        forced: tuple[int, Any] | None = None,
+        *,
+        connect_exc: BaseException | None = None,
+        request_exc: BaseException | None = None,
+        response_exc: BaseException | None = None,
+    ):
         self.client = client
+        self.forced = forced
+        self.connect_exc, self.request_exc, self.response_exc = connect_exc, request_exc, response_exc
         self.requests: list[dict] = []
-        self.forced = forced  # (status, body) answered instead of the real endpoint
+        self.connects = 0
 
-    def urlopen(self, req, timeout=None):
-        path = req.full_url.split("127.0.0.1:", 1)[1].split("/", 1)[1]
-        self.requests.append(
-            {"url": req.full_url, "path": "/" + path, "method": req.get_method(), "auth": req.get_header("Authorization"), "body": json.loads(req.data), "timeout": timeout}
-        )
-        if self.forced is not None:
-            status, content = self.forced
-            if status == 200:
-                return _Resp(content) if isinstance(content, bytes) else content
-            fp = io.BytesIO(content) if isinstance(content, bytes) else content  # bytes or a file-like object
-            raise urllib.error.HTTPError(req.full_url, status, "err", {}, fp)
-        resp = self.client.post("/" + path, content=req.data, headers=dict(req.header_items()))
-        if resp.status_code >= 400:
-            raise urllib.error.HTTPError(req.full_url, resp.status_code, "err", {}, io.BytesIO(resp.content))
-        return _Resp(resp.content)
+    def factory(self, host, port, timeout=None) -> _FakeConn:
+        return _FakeConn(self, host, port, timeout)
+
+
+def _no_bridge_call():
+    """patch() for http.client.HTTPConnection that fails the test if the command makes any bridge connection."""
+    return patch("http.client.HTTPConnection", side_effect=AssertionError("no bridge connection may be made"))
 
 
 def _live_bridge(monkeypatch, home: Path, run: _Run):
@@ -280,7 +310,7 @@ def test_a_running_bridge_gets_the_request_and_switches_live(monkeypatch, home: 
         with client as c:
             bridge = _Bridge(c)
             direct = patch.object(cli, "_model_set_direct", side_effect=AssertionError("must go through the bridge"))
-            with patch("urllib.request.urlopen", bridge.urlopen), direct:
+            with patch("http.client.HTTPConnection", bridge.factory), direct:
                 rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
             hot = c.app.state.bridge.provider._model
     out = capsys.readouterr().out
@@ -301,7 +331,7 @@ def test_a_running_bridge_rejection_is_reported_from_its_400(monkeypatch, home: 
         before = p.read_bytes()
         with client as c:
             bridge = _Bridge(c)
-            with patch("urllib.request.urlopen", bridge.urlopen):
+            with patch("http.client.HTTPConnection", bridge.factory):
                 rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
             after = p.read_bytes()
     err = capsys.readouterr().err
@@ -315,7 +345,7 @@ def test_an_unsupported_value_never_reaches_a_running_bridge(monkeypatch, home: 
     monkeypatch.setattr("brain.bridge.state_file.read", lambda d: SimpleNamespace(pid=4321, port=51234, auth_token="t"))
     monkeypatch.setattr("brain.bridge.state_file.pid_is_alive", lambda pid: True)
     cli._build_parser()
-    with patch("urllib.request.urlopen", side_effect=AssertionError("no bridge call for an invalid value")):
+    with _no_bridge_call():
         rc = cli.main(["model", "set", "Fable", "--persona", "bob"])
     assert rc == 1 and MODEL_ID_RULE in capsys.readouterr().err and p.read_bytes() == before
 
@@ -325,7 +355,7 @@ def _via_bridge(monkeypatch, home: Path, run: _Run, capsys, model=CHAT, forced=N
     with patch("subprocess.run", run), patch("subprocess.Popen", side_effect=_no_popen):
         p, client = _live_bridge(monkeypatch, home, run)
         with client as c:
-            with patch("urllib.request.urlopen", _Bridge(c, forced).urlopen):
+            with patch("http.client.HTTPConnection", _Bridge(c, forced).factory):
                 rc = cli.main(["model", "set", model, "--persona", "bob"])
     return rc, p, capsys.readouterr()
 
@@ -374,7 +404,7 @@ def test_a_bridge_that_started_while_the_check_ran_gets_nothing_written_behind_i
     monkeypatch.setattr("brain.bridge.state_file.pid_is_alive", lambda pid: True)
     run = _Run(lambda m: _ok())
     cli._build_parser()
-    with patch("urllib.request.urlopen", side_effect=AssertionError("refuse, do not call")), patch(
+    with _no_bridge_call(), patch(
         "subprocess.run", run
     ), patch("subprocess.Popen", side_effect=_no_popen):
         rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
@@ -400,24 +430,28 @@ def test_a_stale_state_file_means_not_running(monkeypatch, home: Path, capsys):
     monkeypatch.setattr("brain.bridge.state_file.read", lambda d: SimpleNamespace(pid=999999, port=51234, auth_token="t"))
     monkeypatch.setattr("brain.bridge.state_file.pid_is_alive", lambda pid: False)
     cli._build_parser()
-    with patch("urllib.request.urlopen", side_effect=AssertionError("no bridge call")), patch(
+    with _no_bridge_call(), patch(
         "subprocess.run", _Run(lambda m: _ok())
     ), patch("subprocess.Popen", side_effect=_no_popen):
         rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
     assert rc == 0 and json.loads(p.read_text())["model"] == CHAT
 
 
+def _closed_port() -> int:
+    """A loopback port nothing listens on (the OS refuses connections to it), without any error number."""
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
 def test_a_live_pid_whose_port_refuses_exits_1_and_writes_nothing(monkeypatch, home: Path, capsys):
     p = _write(home)
     before = p.read_bytes()
-    monkeypatch.setattr("brain.bridge.state_file.read", lambda d: SimpleNamespace(pid=4321, port=51234, auth_token="t"))
-    monkeypatch.setattr("brain.bridge.state_file.pid_is_alive", lambda pid: True)
-    cli._build_parser()
+    _point_at(monkeypatch, _closed_port())
     run = _Run(lambda m: _ok())
-    monkeypatch.setattr(cli, "_bridge_connect_error", lambda port, timeout: ConnectionRefusedError("refused"))
-    with patch("urllib.request.urlopen", side_effect=AssertionError("nothing is sent to a port that refuses")), patch(
-        "subprocess.run", run
-    ):
+    with patch("subprocess.run", run):
         rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
     err = capsys.readouterr().err
     assert rc == 1 and "could not reach" in err and p.read_bytes() == before and run.models == []
@@ -432,20 +466,22 @@ def test_a_live_pid_whose_port_refuses_exits_1_and_writes_nothing(monkeypatch, h
     assert parsed.command == "supervisor" and parsed.persona == "bob" and parsed.func is cmd_stop
 
 
-@pytest.mark.parametrize("how", ["read", "connect"])
-def test_a_client_timeout_says_the_outcome_is_unknown(monkeypatch, home: Path, capsys, how):
+@pytest.mark.parametrize("phase", ["request", "response", "read"])
+def test_a_client_timeout_after_connecting_says_the_outcome_is_unknown(monkeypatch, home: Path, capsys, phase):
     p = _write(home)
     before = p.read_bytes()
-    monkeypatch.setattr("brain.bridge.state_file.read", lambda d: SimpleNamespace(pid=4321, port=51234, auth_token="t"))
-    monkeypatch.setattr("brain.bridge.state_file.pid_is_alive", lambda pid: True)
-    cli._build_parser()
-    boom = TimeoutError("timed out") if how == "read" else urllib.error.URLError(TimeoutError("timed out"))
-    with patch("urllib.request.urlopen", side_effect=boom):
+    _point_at(monkeypatch, 51234)
+    boom = TimeoutError("timed out")
+    if phase == "read":
+        bridge = _Bridge(forced=(200, _GreedyResp(b"", fail=boom)))
+    else:
+        bridge = _Bridge(**{"request_exc" if phase == "request" else "response_exc": boom})
+    with patch("http.client.HTTPConnection", bridge.factory):
         rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
     err = capsys.readouterr().err
     assert rc == 1 and p.read_bytes() == before
     assert "outcome is unknown" in err and "may still apply" in err and "nell model show" in err
-    assert "may still be starting" not in err and "—" not in err
+    assert "may still be starting" not in err and "could not reach" not in err and "—" not in err
 
 
 # --- MS7: one implementation ---------------------------------------------------------------------------------------
@@ -629,8 +665,8 @@ def test_the_reason_of_an_unreachable_port_is_cleaned(monkeypatch, home: Path, c
     monkeypatch.setattr("brain.bridge.state_file.read", lambda d: SimpleNamespace(pid=4321, port=51234, auth_token="t"))
     monkeypatch.setattr("brain.bridge.state_file.pid_is_alive", lambda pid: True)
     cli._build_parser()
-    monkeypatch.setattr(cli, "_bridge_connect_error", lambda port, timeout: OSError("refused\x1b[31m\nred\x07"))
-    with patch("urllib.request.urlopen", side_effect=AssertionError("not reached")):
+    bridge = _Bridge(connect_exc=OSError("refused\x1b[31m\nred\x07"))
+    with patch("http.client.HTTPConnection", bridge.factory):
         rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
     err = capsys.readouterr().err
     assert rc == 1 and "could not reach" in err and "\x1b" not in err and "\x07" not in err and err.count("\n") == 1
@@ -649,7 +685,8 @@ def test_a_non_http_answer_is_a_clear_message_not_a_traceback(monkeypatch, home:
     monkeypatch.setattr("brain.bridge.state_file.read", lambda d: SimpleNamespace(pid=4321, port=51234, auth_token="t"))
     monkeypatch.setattr("brain.bridge.state_file.pid_is_alive", lambda pid: True)
     cli._build_parser()
-    with patch("urllib.request.urlopen", side_effect=exc):
+    bridge = _Bridge(response_exc=exc)
+    with patch("http.client.HTTPConnection", bridge.factory):
         rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
     err = capsys.readouterr().err
     assert rc == 1 and p.read_bytes() == before and "Traceback" not in err
@@ -693,9 +730,8 @@ def _read_request(conn: socket.socket) -> bool:
     return True
 
 
-def _raw_server(payload: bytes, *, reset: bool = False):
-    """A TCP server on a free loopback port. A connection that hangs up without sending a request (the command's
-    pre-flight connect) is ignored. For the connection that carries the request it reads the whole request first,
+def _raw_server(payload: bytes, *, reset: bool = False, accepted: list | None = None):
+    """A TCP server on a free loopback port. A connection that hangs up without sending a request is ignored. For the connection that carries the request it reads the whole request first,
     so the client has finished sending, then either (reset=False) sends ``payload``, shuts down its write side
     CLEANLY and waits for the client to finish reading and close, so the client sees exactly ``payload`` and then
     end-of-stream; or (reset=True) aborts the connection with a TCP reset (SO_LINGER 0) without sending anything."""
@@ -708,10 +744,12 @@ def _raw_server(payload: bytes, *, reset: bool = False):
         try:
             while True:
                 conn, _ = srv.accept()
+                if accepted is not None:
+                    accepted.append(1)
                 conn.settimeout(10)
                 try:
                     if not _read_request(conn):
-                        continue  # the pre-flight connect: nothing was sent, wait for the real request
+                        continue  # nothing was sent on this connection: wait for a real request
                     if reset:
                         conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
                         return
@@ -734,9 +772,7 @@ def _raw_server(payload: bytes, *, reset: bool = False):
     return srv.getsockname()[1]
 
 
-def _point_at(monkeypatch, port: int, *, real: bool = False) -> None:
-    if real:  # real sockets: use the real pre-flight connect too
-        monkeypatch.setattr(cli, "_bridge_connect_error", _REAL_CONNECT_CHECK)
+def _point_at(monkeypatch, port: int) -> None:
     for var in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("NO_PROXY", "127.0.0.1")
@@ -753,7 +789,7 @@ def _point_at(monkeypatch, port: int, *, real: bool = False) -> None:
 def test_a_real_socket_that_answers_badly_gives_a_clear_message(monkeypatch, home: Path, capsys, payload):
     p = _write(home)
     before = p.read_bytes()
-    _point_at(monkeypatch, _raw_server(payload), real=True)
+    _point_at(monkeypatch, _raw_server(payload))
     rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
     err = capsys.readouterr().err
     assert rc == 1 and p.read_bytes() == before and "Traceback" not in err
@@ -764,7 +800,7 @@ def test_a_real_socket_that_answers_badly_gives_a_clear_message(monkeypatch, hom
 def test_a_real_connection_reset_after_the_request_was_sent_is_an_unknown_outcome(monkeypatch, home: Path, capsys):
     p = _write(home)
     before = p.read_bytes()
-    _point_at(monkeypatch, _raw_server(b"", reset=True), real=True)
+    _point_at(monkeypatch, _raw_server(b"", reset=True))
     rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
     err = capsys.readouterr().err
     assert rc == 1 and p.read_bytes() == before and "Traceback" not in err
@@ -778,13 +814,14 @@ def test_a_real_closed_port_is_could_not_reach(monkeypatch, home: Path, capsys):
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
     s.close()  # nothing listens here now: the connection is refused before any request is sent
-    _point_at(monkeypatch, port, real=True)
+    _point_at(monkeypatch, port)
     rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
     err = capsys.readouterr().err
     assert rc == 1 and "could not reach the bridge" in err and "may still be starting" in err
     assert "outcome is unknown" not in err and json.loads(p.read_text())["model"] == "sonnet"
 
 
+@pytest.mark.parametrize("phase", ["request", "response", "read"])
 @pytest.mark.parametrize(
     "exc",
     [
@@ -792,23 +829,23 @@ def test_a_real_closed_port_is_could_not_reach(monkeypatch, home: Path, capsys):
         BrokenPipeError("broken pipe"),
         ConnectionAbortedError("connection aborted"),
         OSError("input/output error"),
-        urllib.error.URLError(ConnectionResetError("connection reset")),
-        urllib.error.URLError(BrokenPipeError("broken pipe")),
-        urllib.error.URLError(OSError("network unreachable")),
-        urllib.error.URLError("some reason"),
     ],
-    ids=["reset", "broken-pipe", "aborted", "oserror", "urlerror-reset", "urlerror-broken-pipe", "urlerror-oserror", "urlerror-str"],
+    ids=["reset", "broken-pipe", "aborted", "oserror"],
 )
-def test_an_error_after_the_connection_was_made_is_an_unknown_outcome(monkeypatch, home: Path, capsys, exc):
-    """The pre-flight connect succeeded, so ANY failure inside urllib (whatever its type or OS error number)
-    happens once the bridge may have the request: the outcome is unknown. No OS error numbers are used here."""
+def test_an_error_after_connect_returned_is_an_unknown_outcome(monkeypatch, home: Path, capsys, exc, phase):
+    """connect() succeeded, so a failure in request(), getresponse() or the read (whatever its type or OS error
+    number) happens once the bridge may have the request: the outcome is unknown. No error numbers are used."""
     p = _write(home)
     before = p.read_bytes()
     _point_at(monkeypatch, 51234)
-    with patch("urllib.request.urlopen", side_effect=exc):
+    if phase == "read":
+        bridge = _Bridge(forced=(200, _GreedyResp(b"", fail=exc)))
+    else:
+        bridge = _Bridge(**{"request_exc" if phase == "request" else "response_exc": exc})
+    with patch("http.client.HTTPConnection", bridge.factory):
         rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
     err = capsys.readouterr().err
-    assert rc == 1 and p.read_bytes() == before
+    assert rc == 1 and p.read_bytes() == before and bridge.connects == 1
     assert "outcome is unknown" in err and "nell model show" in err and "could not reach" not in err and "—" not in err
 
 
@@ -822,26 +859,28 @@ def test_an_error_after_the_connection_was_made_is_an_unknown_outcome(monkeypatc
     ],
     ids=["refused", "dns", "unreachable", "connect-timeout"],
 )
-def test_a_failure_while_connecting_is_could_not_reach_and_nothing_is_sent(monkeypatch, home: Path, capsys, exc):
-    """Decided by WHERE it failed (the pre-flight connect, before any request is written), not by error number."""
+def test_a_failure_in_connect_is_could_not_reach_and_nothing_is_sent(monkeypatch, home: Path, capsys, exc):
+    """Decided by WHERE it failed (connect() itself, before any request is written), not by error number."""
     p = _write(home)
     _point_at(monkeypatch, 51234)
-    monkeypatch.setattr(cli, "_bridge_connect_error", lambda port, timeout: exc)
-    with patch("urllib.request.urlopen", side_effect=AssertionError("nothing may be sent to a port that cannot be connected")):
+    bridge = _Bridge(connect_exc=exc)
+    with patch("http.client.HTTPConnection", bridge.factory):
         rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
     err = capsys.readouterr().err
     assert rc == 1 and "could not reach the bridge" in err and "outcome is unknown" not in err
+    assert bridge.connects == 1 and bridge.requests == []  # nothing was written
     assert json.loads(p.read_text())["model"] == "sonnet"
 
 
-def test_the_preflight_connect_really_connects_and_reports_a_refusal():
-    assert _REAL_CONNECT_CHECK is not None
-    srv = socket.socket()
-    srv.bind(("127.0.0.1", 0))
-    srv.listen(1)
-    port = srv.getsockname()[1]
-    try:
-        assert _REAL_CONNECT_CHECK(port, 5) is None  # something listens: no error
-    finally:
-        srv.close()
-    assert isinstance(_REAL_CONNECT_CHECK(port, 5), OSError)  # nothing listens now
+def test_one_real_connection_carries_the_request_and_the_answer(monkeypatch, home: Path, capsys):
+    """The bridge sees exactly ONE connection (no empty probe first) and the command succeeds on its answer."""
+    p = _write(home)
+    body = b'{"ok": true, "model": "claude-sonnet-5", "checked": true}'
+    payload = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(body) + body
+    accepted: list[int] = []
+    _point_at(monkeypatch, _raw_server(payload, accepted=accepted))
+    rc = cli.main(["model", "set", CHAT, "--persona", "bob"])
+    out = capsys.readouterr()
+    assert rc == 0 and "chat model is now claude-sonnet-5 (checked with Claude)." in out.out
+    assert len(accepted) == 1, accepted
+    assert json.loads(p.read_text())["model"] == "sonnet"  # the command asked the bridge; it wrote nothing itself

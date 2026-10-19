@@ -2692,93 +2692,75 @@ def _bridge_text(value: Any, limit: int = 200) -> str:
 _BRIDGE_ANSWER_MAX_BYTES = 65536
 
 
-def _bridge_connect_error(port: int, timeout: float) -> OSError | None:
-    """Try to connect to the bridge's port, then hang up without sending anything. None if it accepts the
-    connection, else the error.
-
-    This is how `nell model set` tells "could not reach the bridge" (nothing was sent) from "the outcome is
-    unknown" (the request was written, then something broke): it is decided by WHERE the failure happened, not by
-    an error number, which differs between Linux, macOS and Windows.
-    """
-    import socket
-
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
-            return None
-    except OSError as exc:
-        return exc
-
-
 def _model_set_via_bridge(state: Any, model: str, persona: str) -> tuple[int, Any] | None:
-    """Bridge running: POST to the picker's settings endpoint. None (after printing why) if it gave no usable answer."""
+    """Bridge running: POST to the picker's settings endpoint. None (after printing why) if it gave no usable answer.
+
+    ONE connection: ``connect()`` is called on its own first. A failure there means nothing was sent ("could not
+    reach the bridge"). Once it has returned, any failure in ``request()``, ``getresponse()`` or the read happens
+    when the bridge may already have the request, so the outcome is unknown. Decided by that phase, not by any
+    error number (they differ between Linux, macOS and Windows).
+    """
     import http.client
-    import urllib.error
-    import urllib.request
 
     from brain.bridge import server as server_mod
 
     headers = {"Content-Type": "application/json"}
     if state.auth_token:
         headers["Authorization"] = f"Bearer {state.auth_token}"
-    req = urllib.request.Request(
-        f"http://127.0.0.1:{state.port}/persona/config/model",
-        data=json.dumps({"model": model}).encode("utf-8"),
-        headers=headers,
-        method="POST",
-    )
+    payload = json.dumps({"model": model}).encode("utf-8")
     # The endpoint keeps itself inside one check budget (a wait for the lock counts against it); twice that is the margin.
     wait_s = server_mod._check_budget_s() * 2
-    refused = _bridge_connect_error(state.port, wait_s)
-    if refused is not None:
-        # Nothing was sent: the bridge's port does not accept a connection.
-        print(
-            f"error: could not reach the bridge on port {state.port}: {_bridge_text(refused)}. The bridge may "
-            f"still be starting: try again in a few seconds, or stop it with `nell supervisor stop --persona {persona}`.",
-            file=sys.stderr,
-        )
-        return None
+    conn = http.client.HTTPConnection("127.0.0.1", state.port, timeout=wait_s)
     try:
-        with urllib.request.urlopen(req, timeout=wait_s) as resp:
-            raw = resp.read(_BRIDGE_ANSWER_MAX_BYTES)
-    except urllib.error.HTTPError as exc:
         try:
-            raw_err = exc.read(_BRIDGE_ANSWER_MAX_BYTES).decode("utf-8", errors="replace")
-        except (OSError, ValueError, http.client.HTTPException):
-            raw_err = ""
+            conn.connect()
+        except OSError as exc:  # also a refused connection, an unresolvable name, a connect timeout
+            print(
+                f"error: could not reach the bridge on port {state.port}: {_bridge_text(exc)}. The bridge may "
+                f"still be starting: try again in a few seconds, or stop it with `nell supervisor stop --persona {persona}`.",
+                file=sys.stderr,
+            )
+            return None
         try:
-            return exc.code, json.loads(raw_err)
-        except ValueError:
-            return exc.code, {"detail": raw_err}
-    except http.client.HTTPException as exc:
-        # The bridge's port answered something that is not a usable HTTP answer (or cut it short): the request
-        # may or may not have been applied.
-        print(
-            f"error: did not understand the bridge's answer ({_bridge_text(type(exc).__name__)}), so the outcome is "
-            "unknown: the bridge may still apply the change. Check with `nell model show`.",
-            file=sys.stderr,
-        )
-        return None
-    except (urllib.error.URLError, OSError) as exc:
-        reason = getattr(exc, "reason", exc)
-        if isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError):
+            conn.request("POST", "/persona/config/model", body=payload, headers=headers)
+            resp = conn.getresponse()
+            status = resp.status
+            if status == 200:
+                raw = resp.read(_BRIDGE_ANSWER_MAX_BYTES)
+            else:
+                try:
+                    raw = resp.read(_BRIDGE_ANSWER_MAX_BYTES)
+                except (OSError, ValueError, http.client.HTTPException):
+                    raw = b""  # the status alone is still worth reporting
+        except TimeoutError:
             print(
                 f"error: no answer from the bridge within {wait_s:.0f} s, so the outcome is unknown: the bridge may "
                 "still apply the change. Check with `nell model show`.",
                 file=sys.stderr,
             )
-        else:
-            # The connection was accepted, so from here on the request may have been sent (a reset, a broken pipe, a
-            # dropped connection while waiting for the answer): the bridge may have applied the change.
+            return None
+        except http.client.HTTPException as exc:
+            # The bridge's port answered something that is not a usable HTTP answer (or cut it short).
             print(
-                f"error: the connection to the bridge broke ({_bridge_text(reason)}), so the outcome is unknown: the "
+                f"error: did not understand the bridge's answer ({_bridge_text(type(exc).__name__)}), so the outcome "
+                "is unknown: the bridge may still apply the change. Check with `nell model show`.",
+                file=sys.stderr,
+            )
+            return None
+        except OSError as exc:
+            print(
+                f"error: the connection to the bridge broke ({_bridge_text(exc)}), so the outcome is unknown: the "
                 "bridge may still apply the change. Check with `nell model show`.",
                 file=sys.stderr,
             )
-        return None
+            return None
+    finally:
+        conn.close()
+    text = raw.decode("utf-8", errors="replace")
     try:
-        return 200, json.loads(raw)
+        return status, json.loads(text)
     except ValueError:
-        return 200, {"detail": "the answer was not JSON"}
+        return status, {"detail": text if status != 200 else "the answer was not JSON"}
 
 
 def _model_set_report(model: str, status: int, body: Any, *, via_bridge: bool) -> int:
