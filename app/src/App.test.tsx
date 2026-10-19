@@ -272,6 +272,53 @@ describe("App pending-write cards", () => {
   });
 });
 
+describe("App tunables notice (#462)", () => {
+  const stateWith = (tunables_notice?: unknown) => ({
+    persona: "nell",
+    emotions: {},
+    body: null,
+    interior: { dream: null, research: null, heartbeat: null, reflex: null },
+    soul_highlight: null,
+    connection: { provider: "claude-cli", model: null, last_heartbeat_at: null },
+    mode: "live",
+    recovering: false,
+    felt_time_recovered: false,
+    ...(tunables_notice === undefined ? {} : { tunables_notice }),
+  });
+
+  beforeEach(() => {
+    readAppConfig.mockReset().mockResolvedValue(baseConfig("nell"));
+    writeAppConfig.mockReset().mockResolvedValue(undefined);
+    listPersonas.mockReset();
+    ensureBridgeRunning.mockReset().mockResolvedValue(undefined);
+    ensureBridgeCurrent.mockReset().mockResolvedValue("ok");
+    setAlwaysOnTop.mockReset().mockResolvedValue(undefined);
+    brainLoginStatus.mockReset().mockResolvedValue({ authorized: true });
+  });
+
+  afterEach(cleanup);
+
+  it.each([
+    [{ kind: "reset", kept_as: "tunables.json.corrupt-20261019T120000Z" }, /kept as tunables\.json\.corrupt-20261019T120000Z/],
+    [{ kind: "restored", kept_as: "tunables.json.corrupt-20261019T120000Z" }, /older saved copy/],
+    [{ kind: "unreadable", kept_as: null }, /cannot be read right now/],
+  ])("shows the notice for %j", async (notice, text) => {
+    fetchPersonaState.mockReset().mockResolvedValue(stateWith(notice));
+    render(<App />);
+
+    const el = await screen.findByTestId("tunables-notice");
+    expect(el).toHaveTextContent(text);
+  });
+
+  it.each([[null], [undefined]])("shows no notice when the field is %s", async (notice) => {
+    fetchPersonaState.mockReset().mockResolvedValue(stateWith(notice));
+    render(<App />);
+
+    await waitFor(() => expect(fetchPersonaState).toHaveBeenCalled());
+    expect(screen.queryByTestId("tunables-notice")).toBeNull();
+  });
+});
+
 describe("App presence column (glass redesign)", () => {
   beforeEach(() => {
     readAppConfig.mockReset().mockResolvedValue(baseConfig("nell"));

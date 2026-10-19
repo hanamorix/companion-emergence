@@ -36,6 +36,7 @@ import { useRestartBridge } from "./hooks/useRestartBridge";
 import { Wizard } from "./wizard/Wizard";
 import { PersonaPicker } from "./wizard/PersonaPicker";
 import { errString } from "./lib/errString";
+import { tunablesNoticeMessage } from "./lib/tunablesNotice";
 
 const STATE_POLL_MS = 5000;
 
@@ -607,6 +608,24 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
               }}
               onDismiss={() => setBrainPromptDismissed(true)}
             />
+          </div>
+        )}
+        {state?.tunables_notice && (
+          <div
+            role="status"
+            data-testid="tunables-notice"
+            style={{
+              border: "1px solid var(--panel-border, rgba(234,222,218,0.18))",
+              borderRadius: 8,
+              padding: 10,
+              background: "var(--panel-bg)",
+              fontSize: 11,
+              lineHeight: 1.5,
+              color: "var(--text-mute)",
+              wordBreak: "break-word",
+            }}
+          >
+            {tunablesNoticeMessage(state.tunables_notice)}
           </div>
         )}
         <ChatPanel
