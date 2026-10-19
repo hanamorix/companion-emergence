@@ -116,9 +116,11 @@ def format_local(dt: datetime) -> str:
 def local_display(ts: str) -> str:
     """Convert a stored UTC ISO-8601 string (``iso_utc()``'s format, or any
     ISO string with a 'Z' suffix or explicit offset) to a local-zone display
-    string. Fails soft to the raw input on a malformed timestamp — a display
-    seam must never break composition over a bad ts."""
+    string. TOTAL: a display seam must never break composition over a bad ts, so
+    anything it cannot render (malformed text, a stamp with no local equivalent
+    such as year 1 in a zone behind UTC, a non-string value) returns the raw input
+    (``""`` for a value that is not text) instead of raising (#480)."""
     try:
         return format_local(parse_iso_utc(ts))
-    except (ValueError, TypeError):
-        return ts
+    except Exception:  # noqa: BLE001 — AttributeError for a non-string, OverflowError for an unconvertible stamp, ...
+        return ts if isinstance(ts, str) else ""

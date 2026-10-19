@@ -495,10 +495,12 @@ def test_c4_an_unlocalisable_ts_is_dropped_not_raised(monkeypatch: pytest.Monkey
     Only some host timezones overflow on year 1, so the seam is forced to raise instead of relying on the host.
     """
 
-    def _boom(_ts: str) -> str:
+    def _boom(_dt) -> str:
         raise OverflowError("date value out of range")
 
-    monkeypatch.setattr(provider, "local_display", _boom)
+    # #480: `local_display` is total now (it returns the raw text instead of raising) and `_narrative_time` never echoes a raw
+    # value, so it renders through `format_local` itself; that is the seam forced to raise here.
+    monkeypatch.setattr(provider, "format_local", _boom)
     assert provider._narrative_time("2026-05-20T10:00:00Z") == ""
     [line] = _lines(
         [ChatMessage(role="user", content="a", ts="2026-05-20T10:00:00Z")], user_name="Hana"

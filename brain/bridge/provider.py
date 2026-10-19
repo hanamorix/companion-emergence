@@ -50,7 +50,7 @@ from brain.bridge.chat import (
     ToolCall,
 )
 from brain.bridge.usage_log import log_usage
-from brain.utils.time import format_local, local_display, parse_iso_utc
+from brain.utils.time import format_local, parse_iso_utc
 
 logger = logging.getLogger(__name__)
 
@@ -2223,9 +2223,10 @@ def _narrative_time(ts: str | None) -> str:
     if not ts or not isinstance(ts, str):
         return ""
     try:
-        parse_iso_utc(ts)
-        return local_display(ts)  # tz-local-display: per-message time in the narrative chat context
-    except (ValueError, TypeError, OverflowError):  # OverflowError: parses, but has no local equivalent (year 1)
+        # tz-local-display: per-message time in the narrative chat context. `local_display` is total and would return the
+        # raw text on failure; this caller never echoes an unparseable value, so it renders directly and returns "" itself.
+        return format_local(parse_iso_utc(ts))
+    except Exception:  # noqa: BLE001 — unparseable, or no local equivalent (year 1 in a zone behind UTC)
         return ""
 
 
