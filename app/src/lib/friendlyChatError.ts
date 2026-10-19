@@ -59,6 +59,15 @@ export function friendlyChatError(raw: string): string {
 export const MODEL_UNCHECKED_MESSAGE =
   "Couldn't check that model right now; saved anyway, and any problem will show here.";
 
+/** The line for a `model` value in the persona's settings that the app does not support (#446). The bridge
+ *  runs Sonnet instead; picking any model in the picker (the current one included) replaces the value. */
+export function modelUnsupportedMessage(value: string): string {
+  return (
+    `The model "${value}" in your settings is not supported, so Sonnet is being used instead. ` +
+    "Use change to pick a model and replace it."
+  );
+}
+
 /**
  * The line for a model the Claude CLI rejected while it was in use (from the bridge's
  * `model_rejections`). `chosen` is true when it is the model the user picked; otherwise it is a model

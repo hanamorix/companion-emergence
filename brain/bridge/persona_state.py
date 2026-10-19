@@ -101,6 +101,8 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
         # #440: the chat model when it was saved without the Apply-time check being able to confirm it and no
         # clean reply has arrived for it since. [] otherwise.
         "model_unconfirmed": model_error.unconfirmed(only={connection.get("model")}),
+        # #446: the hand-edited model value the app does not support (the default is used instead), else None.
+        "model_unsupported": _model_unsupported(tier_cfg),
         "felt_time_recovered": _felt_time_recovered(persona_dir),
         "narrative_memory_recovered": _narrative_memory_replayed(persona_dir),
         # ram-spike-fix INC-11 (spec §6, S15/S23/S38): gated jobs and/or the
@@ -126,6 +128,13 @@ def _model_rejections(configured_model: str | None, cfg: Any = None) -> list[dic
     if configured_model:
         allowed.add(configured_model)
     return model_error.state(only=allowed)
+
+
+def _model_unsupported(cfg: Any) -> str | None:
+    # The model setting only matters for the claude-cli provider; ollama / fake ignore it.
+    if cfg is None or cfg.provider != "claude-cli":
+        return None
+    return cfg.model_unsupported_display()
 
 
 def _tier_unconfirmed(cfg: Any) -> list[str]:
