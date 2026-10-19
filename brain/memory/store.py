@@ -211,6 +211,12 @@ class Memory:
         Importance defaults to score/10.0 (normalised to 0..10 scale).
         """
         emotions = dict(emotions or {})
+        # One non-finite strength makes the score, importance and peak non-finite (#466).
+        for name in [n for n, v in emotions.items() if not math.isfinite(float(v))]:
+            logger.warning(
+                "memory.create_new: dropped non-finite emotion %s=%r (%s/%s)",
+                name, emotions.pop(name), memory_type, domain,
+            )
         tags = list(tags or [])
         score = float(sum(emotions.values()))
         metadata = dict(metadata or {})
@@ -269,8 +275,8 @@ class Memory:
             created_at=created,
             emotions=dict(data.get("emotions", {})),
             tags=list(data.get("tags", [])),
-            importance=float(data.get("importance", 0.0)),
-            score=float(data.get("score", 0.0)),
+            importance=float(data.get("importance") or 0.0),  # null reads as missing (#463)
+            score=float(data.get("score") or 0.0),
             last_accessed_at=last_accessed,
             active=bool(data.get("active", True)),
             protected=bool(data.get("protected", False)),
