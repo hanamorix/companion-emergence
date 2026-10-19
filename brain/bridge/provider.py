@@ -78,6 +78,13 @@ _BUDGET_BY_TIER: tuple[tuple[str, float], ...] = (
 )
 _BUDGET_FALLBACK: float = tunables.register("provider.max_turn_budget_usd.fallback", 1.50)
 
+# What json.loads raises on a line it cannot take: JSONDecodeError and, on a hostile line, a plain ValueError
+# (a 5000-digit run) or RecursionError (nesting beyond the recursion limit). JSONDecodeError is a ValueError.
+_JSON_LINE_ERRORS: tuple[type[BaseException], ...] = (ValueError, RecursionError)
+
+# The result-frame subtype the CLI reports when --max-budget-usd stops a turn (exit code 1).
+_BUDGET_SUBTYPE: str = "error_max_budget_usd"
+
 # Graceful message when the CLI hits the per-turn ceiling mid-reply.
 _BUDGET_EXCEEDED_MSG: str = (
     "I reached this turn's work limit before I finished — "
@@ -745,7 +752,7 @@ def _assistant_error_code(stdout: str) -> str | None:
                 continue
             try:
                 obj = json.loads(raw)
-            except (ValueError, RecursionError):
+            except _JSON_LINE_ERRORS:
                 continue
             if not isinstance(obj, dict) or obj.get("type") != "assistant":
                 continue
@@ -781,6 +788,20 @@ def _with_model_token(detail: str, model: str | None) -> str:
     return detail
 
 
+def _is_over_budget_frame(frame: dict) -> bool:
+    """True for the result frame the CLI emits when --max-budget-usd stops a turn.
+
+    The one definition: `subtype == "error_max_budget_usd"`, or an `is_error` frame whose `errors`
+    say "maximum budget". Total: a malformed `errors` (None, a number, a string, a dict) counts as no
+    errors, so a frame can never raise here.
+    """
+    errors = frame.get("errors")
+    return frame.get("subtype") == _BUDGET_SUBTYPE or bool(
+        frame.get("is_error")
+        and any("maximum budget" in str(e).lower() for e in (errors if isinstance(errors, list) else []))
+    )
+
+
 def _cli_error_detail(
     payload: dict, *, error_code: str | None = None, model: str | None = None, stdout: str | None = None
 ) -> str | None:
@@ -793,8 +814,8 @@ def _cli_error_detail(
     system error as something their companion said.
 
     The over-budget frame is excluded deliberately: it also carries
-    ``is_error`` but holds partial work worth keeping, and has its own
-    graceful path at each call site.
+    ``is_error``, but it is a stop, not a failure, and has its own graceful
+    path at each call site.
 
     #448: a frame with ``api_error_status`` 404 (and, from the streaming loop, the assistant frame's
     ``model_not_found`` code via ``error_code``) gets those signals as a prefix; a detail classified as a model
@@ -804,9 +825,7 @@ def _cli_error_detail(
     if not payload.get("is_error"):
         provider_auth.note_cli_success()  # #246: a clean frame is the recovery signal
         return None
-    if payload.get("subtype") == "error_max_budget_usd" or any(
-        "maximum budget" in str(e).lower() for e in (payload.get("errors") or [])
-    ):
+    if _is_over_budget_frame(payload):
         return None
     detail = str(payload.get("result") or "").strip()
     detail = detail[:200] if detail else f"is_error with no result text: {payload!r}"[:200]
@@ -846,7 +865,7 @@ def _last_result_line(stdout: str) -> dict[str, Any] | None:
     for raw in reversed(stdout.split("\n")):
         try:
             obj = json.loads(raw)
-        except json.JSONDecodeError:
+        except _JSON_LINE_ERRORS:
             continue
         if isinstance(obj, dict) and obj.get("type") == "result":
             return obj
@@ -859,7 +878,7 @@ def _claude_failure_detail_text(result: subprocess.CompletedProcess[str]) -> str
     if stdout:
         try:
             payload = json.loads(stdout)
-        except json.JSONDecodeError:
+        except _JSON_LINE_ERRORS:
             payload = _last_result_line(stdout)  # #330: stream-json NDJSON stdout
         if isinstance(payload, dict):
             parts: list[str] = []
@@ -981,6 +1000,8 @@ class ClaudeCliProvider(LLMProvider):
 
         try:
             payload = json.loads(result.stdout)
+            if not isinstance(payload, dict):
+                raise ValueError("not a result object")
             log_usage(persona_dir, call_type="generate", model=self._model, frame=payload)
             # #119: the CLI can exit 0 and report the failure inside the frame,
             # so the returncode guard above never sees it. Without this the error
@@ -991,7 +1012,7 @@ class ClaudeCliProvider(LLMProvider):
             if cli_err is not None:
                 raise RuntimeError(f"ClaudeCliProvider: {cli_err}")
             return str(payload["result"])
-        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        except (*_JSON_LINE_ERRORS, KeyError, TypeError) as exc:
             raise RuntimeError(
                 f"ClaudeCliProvider: unexpected output format: {result.stdout[:200]!r}"
             ) from exc
@@ -1139,17 +1160,13 @@ class ClaudeCliProvider(LLMProvider):
             try:
                 if payload is None:
                     raise ValueError("no result frame")
-                if payload.get("subtype") == "error_max_budget_usd" or (
-                    payload.get("is_error")
-                    and any(
-                        "maximum budget" in str(e).lower()
-                        for e in payload.get("errors", [])
-                    )
-                ):
+                if _is_over_budget_frame(payload):
                     partial = str(payload.get("result", "")).strip()
                     text = (
                         f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}" if partial else _BUDGET_EXCEEDED_MSG
                     )
+                    # #399: the over-budget turn is the costliest one; log it as the streaming path does.
+                    log_usage(audit_dir, call_type="chat", model=self._model, frame=payload)
                     return ChatResponse(content=text, tool_calls=(), raw=payload)
                 cli_err = _cli_error_detail(payload, model=_argv_model(cmd), stdout=result.stdout)
                 if cli_err is not None:
@@ -1414,7 +1431,9 @@ class ClaudeCliProvider(LLMProvider):
                         continue
                     try:
                         obj = json.loads(line)
-                    except json.JSONDecodeError:
+                    except _JSON_LINE_ERRORS:
+                        continue
+                    if not isinstance(obj, dict):
                         continue
 
                     t = obj.get("type")
@@ -1461,13 +1480,7 @@ class ClaudeCliProvider(LLMProvider):
                         log_usage(persona_dir, call_type="chat", model=self._model, frame=obj)
                         # Over-budget catastrophe backstop: the CLI hit --max-budget-usd.
                         # Flush any partial text already streamed + append the cut-off note.
-                        if obj.get("subtype") == "error_max_budget_usd" or (
-                            obj.get("is_error")
-                            and any(
-                                "maximum budget" in str(e).lower()
-                                for e in obj.get("errors", [])
-                            )
-                        ):
+                        if _is_over_budget_frame(obj):
                             partial = "".join(delta_chunks).strip() or result_text.strip()
                             cutoff = (
                                 f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}"
@@ -1567,7 +1580,12 @@ class ClaudeCliProvider(LLMProvider):
         # built-in calls it saw.
         payload = _scan_blocking_stream_stdout(result.stdout, builtin_calls)
 
-        if result.returncode != 0:
+        # #399: the real CLI exits 1 on a --max-budget-usd overrun (both output formats), with a
+        # result frame saying so. That is the graceful path's input, not a failure: the callers
+        # turn the frame into the budget reply. Keyed on the subtype alone - every real frame
+        # carries it - so no other non-zero exit is swallowed.
+        over_budget = payload is not None and payload.get("subtype") == _BUDGET_SUBTYPE
+        if result.returncode != 0 and not over_budget:
             raise ProviderError(
                 "claude_cli_exit",
                 f"exit {result.returncode}: {_claude_failure_detail(result, model=_argv_model(cmd))}",
@@ -1683,18 +1701,25 @@ class ClaudeCliProvider(LLMProvider):
             try:
                 if payload is None:
                     raise ValueError("no result frame")
-                if payload.get("subtype") == "error_max_budget_usd" or (
-                    payload.get("is_error")
-                    and any(
-                        "maximum budget" in str(e).lower()
-                        for e in payload.get("errors", [])
-                    )
-                ):
+                if _is_over_budget_frame(payload):
                     partial = str(payload.get("result", "")).strip()
                     text = (
                         f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}" if partial else _BUDGET_EXCEEDED_MSG
                     )
-                    return ChatResponse(content=text, tool_calls=(), raw=payload)
+                    # #399: the over-budget turn is the costliest one; log it as the streaming path does.
+                    log_usage(persona_dir, call_type="chat", model=self._model, frame=payload)
+                    # The tools that ran before the stop are real (the budget is the backstop for
+                    # runaway tool loops): keep their records, as the success path does.
+                    return ChatResponse(
+                        content=text,
+                        tool_calls=(),
+                        dispatched_invocations=tuple(
+                            _read_audit_lines_since(
+                                audit_log_path, audit_offset_before, request_id=request_id
+                            )
+                        ),
+                        raw=payload,
+                    )
                 cli_err = _cli_error_detail(payload, model=_argv_model(cmd), stdout=result.stdout)
                 if cli_err is not None:
                     raise ProviderError("claude_cli_error", cli_err)
@@ -1880,7 +1905,7 @@ def _scan_blocking_stream_stdout(
             continue
         try:
             obj = json.loads(line)
-        except json.JSONDecodeError:
+        except _JSON_LINE_ERRORS:
             continue
         if not isinstance(obj, dict):
             continue
@@ -1899,7 +1924,7 @@ def _scan_blocking_stream_stdout(
         # _cli_error_detail would call provider_auth.note_cli_success() on it.
         try:
             whole = json.loads(stdout or "")
-        except json.JSONDecodeError:
+        except _JSON_LINE_ERRORS:
             return None
         if isinstance(whole, dict) and whole.get("type") in (None, "result"):
             return whole
@@ -1997,7 +2022,10 @@ def _read_audit_lines_since(
             continue
         try:
             entry = json.loads(line)
-        except json.JSONDecodeError:
+        except _JSON_LINE_ERRORS:
+            malformed += 1
+            continue
+        if not isinstance(entry, dict):
             malformed += 1
             continue
         if entry.get("origin") == _CLI_BUILTIN_ORIGIN:
