@@ -146,7 +146,7 @@ class OGReader:
         with path.open("rb") as f:
             raw = f.read()
         self._record_manifest(path, raw)
-        return json.loads(raw.decode("utf-8"))
+        return json.loads(raw.decode("utf-8"))  # json-io: ok -- the manifest hashes the exact bytes that are parsed
 
     def _record_manifest(self, path: Path, raw: bytes | None = None) -> None:
         if str(path) in self._manifests:

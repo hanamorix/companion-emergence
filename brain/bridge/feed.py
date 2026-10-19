@@ -14,7 +14,6 @@ source — any one source failing leaves the others usable.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from dataclasses import dataclass
@@ -22,6 +21,7 @@ from pathlib import Path
 from typing import Literal
 
 from brain import prompt_strings
+from brain.health.json_io import iter_jsonl, read_jsonl
 from brain.maker.privacy import is_auto_surfaceable
 
 logger = logging.getLogger(__name__)
@@ -283,17 +283,7 @@ def build_soul_entries(persona_dir: Path, *, limit: int) -> list[FeedEntry]:
     are the marked moments where a candidate became permanent soul.
     Defer / reject / parse_error rows are operational noise.
     """
-    from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
-
-    audit_path = persona_dir / "soul_audit.jsonl"
-    if not audit_path.exists():
-        return []
-
-    try:
-        rows = read_jsonl_skipping_corrupt(audit_path)
-    except Exception:
-        logger.exception("feed: read_jsonl_skipping_corrupt for soul_audit failed")
-        return []
+    rows = read_jsonl(persona_dir / "soul_audit.jsonl")
 
     crystallized = [r for r in rows if r.get("crystallization_id")]
     crystallized.sort(key=lambda r: r.get("ts") or "", reverse=True)
@@ -318,16 +308,7 @@ def build_soul_entries(persona_dir: Path, *, limit: int) -> list[FeedEntry]:
 
 def _read_initiate_audit(persona_dir: Path) -> list[dict]:
     """Shared helper — load initiate_audit.jsonl, fault-isolated."""
-    from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
-
-    audit_path = persona_dir / "initiate_audit.jsonl"
-    if not audit_path.exists():
-        return []
-    try:
-        return read_jsonl_skipping_corrupt(audit_path)
-    except Exception:
-        logger.exception("feed: read_jsonl_skipping_corrupt for initiate_audit failed")
-        return []
+    return read_jsonl(persona_dir / "initiate_audit.jsonl")
 
 
 def _is_delivered(row: dict) -> bool:
@@ -393,23 +374,12 @@ def build_monologue_entries(persona_dir: Path, *, limit: int) -> list[FeedEntry]
     extractor. One JSON object per line: {"ts": ISO8601, "digest": str}.
     Malformed lines are skipped.
     """
-    log_path = persona_dir / "monologue_digest.jsonl"
-    if not log_path.exists():
-        return []
-
-    try:
-        text = log_path.read_text(encoding="utf-8")
-    except OSError:
-        logger.exception("feed: opening monologue digest log failed")
-        return []
-
     entries: list[FeedEntry] = []
-    for line in text.splitlines():
+    for obj in iter_jsonl(persona_dir / "monologue_digest.jsonl"):
         try:
-            obj = json.loads(line)
             digest = str(obj["digest"])
             ts = str(obj["ts"])
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, ValueError):
             continue
         # Tier-3 gate: surfaced (default true for legacy lines) controls Feed
         # visibility. The dev-override env var reveals withheld digests.

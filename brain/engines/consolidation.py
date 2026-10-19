@@ -28,7 +28,7 @@ import logging
 import math
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import NamedTuple
@@ -36,6 +36,8 @@ from typing import NamedTuple
 import numpy as np
 
 from brain import prompt_strings
+from brain.bridge.cli_throttle import ThrottleDeferred
+from brain.health.json_io import append_jsonl
 from brain.memory import embeddings as embeddings_mod
 from brain.memory.embedding_matrix import build_embedding_matrix
 from brain.memory.embeddings import cosine_similarity
@@ -48,9 +50,10 @@ from brain.memory.known_names import (
     normalize_name,
     remove_names,
 )
-from brain.memory.pending import SALIENCE_ELIGIBLE_TYPES, PendingQueue
+from brain.memory.pending import SALIENCE_ELIGIBLE_TYPES, ClaimedBatch, PendingQueue
 from brain.memory.semantic_recall import build_semantic_candidate_pool
 from brain.memory.store import Memory, MemoryStore, clamp_importance
+from brain.utils.failure_scope import ServiceCallFailed, settle_scope
 from brain.utils.file_lock import file_lock
 
 logger = logging.getLogger(__name__)
@@ -73,6 +76,7 @@ _REAPPRAISER_USER_TEMPLATE = prompt_strings.register(
 
 _GATE_LOCK_FILENAME = "consolidation_gate"  # file_lock adds the .lock sidecar
 _ARCHIVE_FILENAME = "consolidation_archive.jsonl"
+_QUARANTINE_FILENAME = "consolidation_quarantine.jsonl"
 
 ASSOC_WEIGHT = 5.0  # hebbian edge weight for corrections/continuations (tune via L-B)
 
@@ -94,9 +98,10 @@ class Decision:
         "Names are added three ways", item 1). Written to the known-names list by
         `_dispatch` for every verdict except "duplicate" (on "merge" too, from the
         candidate text). Empty when the judge returned none or its `names` field
-        was absent or malformed (a malformed VALUE never costs the verdict; a reply
-        that is not JSON at all still promotes the candidate, the classifier's
-        fail-open-toward-keeping-content rule).
+        was absent or malformed (a malformed VALUE never costs the verdict). A reply with
+        no usable verdict at all (not JSON, no object, a verdict that is missing or outside
+        `VERDICTS`) never reaches a Decision: the gate quarantines the candidate
+        (`UnusableClassifierReply`) and promotes nothing unclassified.
     """
 
     verdict: str
@@ -106,6 +111,21 @@ class Decision:
 
 
 Classifier = Callable[[Memory, list[Memory]], Decision]
+
+
+class UnusableClassifierReply(Exception):  # noqa: N818 — a classification of a failure, not an error name
+    """The classifier ANSWERED but gave no usable verdict (empty, no JSON object, malformed or non-object JSON, a verdict
+    outside the allowed set or missing).
+
+    That depends on this candidate's exchange, not on the store or the service, so it is an ITEM failure: the gate
+    quarantines the candidate with ``reply`` as evidence (the raw reply, kept out of the log) and never promotes it
+    unclassified. ``failure_scope`` reads it as "item" because it is an unknown type.
+    """
+
+    def __init__(self, reason: str, reply: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.reply = reply
 
 
 class Reappraisal(NamedTuple):
@@ -141,6 +161,8 @@ class ConsolidationResult:
     continuations: int = 0
     deferred: int = 0
     reappraised: int = 0
+    failed: int = 0  # items whose work raised (requeued, quarantined or already saved), #459
+    quarantined: int = 0  # of those, the ones set aside in the quarantine file
 
     def as_log(self) -> dict:
         return {
@@ -155,6 +177,8 @@ class ConsolidationResult:
             "deferred": self.deferred,
             "reappraised": self.reappraised,
             "skipped": self.skipped,
+            "failed": self.failed,
+            "quarantined": self.quarantined,
         }
 
 
@@ -187,7 +211,16 @@ def run_consolidation(
     """Drain the pending queue and consolidate, under a non-blocking gate lock.
 
     Returns a ConsolidationResult; ``skipped=True`` when a concurrent gate holds
-    the lock. Does not raise on a bad candidate (skips it).
+    the lock. Does not raise on a bad candidate: the batch is CLAIMED (kept in a
+    processing file until each item is settled), and an item whose work raises is
+    requeued (the failure depends on the store or filesystem; the pass then ends and
+    the rest wait for the next run), quarantined in ``consolidation_quarantine.jsonl``
+    (it would fail the same way again), or left alone (already saved). A deferred
+    Claude call (expired login) means "not now": nothing is promoted unclassified, the
+    item and the rest stay for the next run. A run killed midway is recovered by the
+    next one. A classifier reply with no usable verdict quarantines the candidate (with
+    the raw reply as evidence) instead of promoting it. ``result.failed`` /
+    ``result.quarantined`` count them.
 
     reappraiser: Change 3's injectable importance re-appraiser. None (default)
         builds the Haiku-backed default when `provider` is given, else
@@ -234,7 +267,10 @@ def _run_locked(
     reappraiser: Reappraiser | None = None,
 ) -> ConsolidationResult:
     pending = PendingQueue(persona_dir)
-    batch = pending.drain()
+    # Claimed, not drained: the batch stays in a processing file until each item is settled, so an exception or a kill
+    # during the slow per-item work below cannot lose it (#459).
+    claim = pending.claim()
+    batch = claim.entries
 
     # Change 3: split out existing-memory re-appraise items BEFORE the normal
     # Pass-1/Pass-2 candidate pipeline — they are not candidates (no dedup,
@@ -245,61 +281,232 @@ def _run_locked(
     candidate_entries = [e for e in batch if not _is_reappraise_item(e)]
 
     result = ConsolidationResult(batch=len(candidate_entries))
-    if reappraise_entries:
-        _handle_reappraisals(
-            store, persona_dir, reappraise_entries, reappraiser or _noop_reappraiser, result
-        )
+    if reappraise_entries and _handle_reappraisals(
+        store, persona_dir, pending, claim, reappraise_entries, reappraiser or _noop_reappraiser, result
+    ):
+        claim.close()
+        return result
     if not candidate_entries:
+        claim.close()
         return result
 
-    candidates: list[Memory] = []
+    candidates: list[tuple[dict, Memory]] = []
     for entry in candidate_entries:
         try:
-            candidates.append(Memory.from_dict(entry))
+            candidates.append((entry, Memory.from_dict(entry)))
         except (KeyError, ValueError, TypeError):
             logger.warning("consolidation gate: dropping unparseable candidate")
+            claim.settle(entry)  # a deliberate drop (#432), not a failure
 
     # --- Pass 1: exact-dup + (scoped) salience; cluster is implicit per-candidate.
-    survivors: list[Memory] = []
+    survivors: list[tuple[dict, Memory]] = []
     seen_norm: set[str] = set()
-    for cand in candidates:
-        norm = _normalize(cand.content)
-        if norm and norm in seen_norm:  # within-batch exact repeat
-            result.exact_dropped += 1
-            continue
-        if norm and _has_exact_existing(store, cand.content, norm):
-            result.exact_dropped += 1
-            seen_norm.add(norm)
-            continue
-        if (
-            salience_floor is not None
-            and cand.memory_type in SALIENCE_ELIGIBLE_TYPES
-            and float(cand.importance) < salience_floor
-        ):
-            result.salience_dropped += 1
-            continue
-        if norm:
-            seen_norm.add(norm)
-        survivors.append(cand)
+    ended = False
+    for entry, cand in candidates:
+        try:
+            norm = _normalize(cand.content)
+            if norm and norm in seen_norm:  # within-batch exact repeat
+                result.exact_dropped += 1
+                claim.settle(entry)
+                continue
+            if norm and _has_exact_existing(store, cand.content, norm):
+                result.exact_dropped += 1
+                seen_norm.add(norm)
+                claim.settle(entry)
+                continue
+            if (
+                salience_floor is not None
+                and cand.memory_type in SALIENCE_ELIGIBLE_TYPES
+                and float(cand.importance) < salience_floor
+            ):
+                result.salience_dropped += 1
+                claim.settle(entry)
+                continue
+            if norm:
+                seen_norm.add(norm)
+            survivors.append((entry, cand))
+        except Exception as exc:  # noqa: BLE001 — settled per item; never ends the loop with items undone
+            if _settle_failed_item(store, pending, persona_dir, claim, entry, cand, "pass1", exc, result):
+                ended = True
+                break
 
     # --- Pass 2: per-candidate decision against related existing memories.
-    for cand in survivors:
-        # F1 #259 F3: embed the candidate ONCE, here, before the judge runs
-        # (one step earlier than the old "embed at promotion" timing) — the
-        # vector feeds the cosine `_related_existing` retrieval below AND is
-        # reused (never recomputed) at promotion in `_dispatch`. None on a
-        # provider failure (fail-soft): `_related_existing` degrades to its
-        # lexical fallback and `_dispatch` degrades to its own `embed_row`
-        # compute, exactly matching pre-F3 behavior for that one candidate.
-        embedded = _embed_candidate(cand.content)
-        context = _related_existing(store, cand, embedded)
+    for entry, cand in [] if ended else survivors:
+        decision: Decision | None = None
         try:
-            decision = classifier(cand, context)
-        except Exception:  # noqa: BLE001 — a classifier fault must not lose the batch
-            logger.exception("consolidation gate: classifier raised; promoting candidate")
-            decision = Decision("new")
-        _dispatch(store, pending, hebbian, persona_dir, cand, decision, result, embedded)
+            # F1 #259 F3: embed the candidate ONCE, here, before the judge runs
+            # (one step earlier than the old "embed at promotion" timing) — the
+            # vector feeds the cosine `_related_existing` retrieval below AND is
+            # reused (never recomputed) at promotion in `_dispatch`. None on a
+            # provider failure (fail-soft): `_related_existing` degrades to its
+            # lexical fallback and `_dispatch` degrades to its own `embed_row`
+            # compute, exactly matching pre-F3 behavior for that one candidate.
+            embedded = _embed_candidate(cand.content)
+            context = _related_existing(store, cand, embedded)
+            try:
+                decision = classifier(cand, context)
+            except ThrottleDeferred:
+                raise  # "not now" (expired login, shutdown): never promote an unclassified candidate (#473)
+            except UnusableClassifierReply:
+                raise  # it answered, with nothing usable: an ITEM failure, quarantined by the settle path
+            except Exception as call_exc:
+                # The classifier call failed for ANY reason (the one call let through during an expired login, a CLI error, a
+                # timeout): the candidate was not classified, so it is NOT promoted. It is kept for a later run and the pass
+                # ends (one call per tick). A reply that arrives but gives no usable verdict never gets here: it is
+                # `UnusableClassifierReply`, re-raised above, and the candidate is quarantined.
+                raise ServiceCallFailed(f"classifier call failed: {type(call_exc).__name__}: {call_exc}") from call_exc
+            decision = _clean_decision(decision)
+            _dispatch(store, pending, hebbian, persona_dir, cand, decision, result, embedded)
+            claim.settle(entry)
+        except Exception as exc:  # noqa: BLE001 — settled per item; never ends the loop with items undone
+            # The decision's target is named in the log so a link lost to a failed post-save step can be rebuilt.
+            target = f" target_id={decision.target_id}" if decision is not None and decision.target_id else ""
+            if _settle_failed_item(store, pending, persona_dir, claim, entry, cand, "pass2", exc, result, target):
+                break
+    claim.close()
     return result
+
+
+def _clean_decision(decision: Decision) -> Decision:
+    """The Decision with its model-derived ids and text checked before they reach SQLite.
+
+    ``target_id`` and ``merged_content`` come from arbitrary model JSON (the Haiku classifier reads them with ``data.get``). A
+    list or dict ``target_id``, or a non-string ``merged_content``, would be bound as an SQL parameter and raise, and one
+    stochastic reply would then put a good candidate in quarantine. ``None`` already means "defer" (no target) or "fold"
+    (no merged text), so a bad value becomes ``None``.
+    """
+    target = decision.target_id if isinstance(decision.target_id, str) and decision.target_id else None
+    merged = decision.merged_content if isinstance(decision.merged_content, str) else None
+    if target == decision.target_id and merged == decision.merged_content:
+        return decision
+    return replace(decision, target_id=target, merged_content=merged)
+
+
+def _saved_state(store: MemoryStore, cand: Memory) -> tuple[str, Memory] | None:
+    """Is ``cand`` already a row? ``("saved", row)``, ``("conflict", row)`` or None (no row, or the probe itself failed).
+
+    Candidate ids are uuid4, so a row with the same id is a prior save of this candidate. It is SAVED when the row's
+    normalized content equals the candidate's, equals the row's ``content_snapshot`` (a faded row keeps the original
+    there) or contains it (a merged row, the ``_fold`` rule). A same-id row matching none of those is a CONFLICT.
+    """
+    try:
+        row = store.get(cand.id, bump=False)
+    except Exception as exc:  # noqa: BLE001 — a failing probe means "not saved"; the classification goes on
+        logger.warning(
+            "consolidation gate: could not check whether candidate id=%s was saved (%s: %s); treating it as not saved",
+            cand.id, type(exc).__name__, exc,
+        )
+        return None
+    if row is None:
+        return None
+    cand_norm = _normalize(cand.content)
+    row_norm = _normalize(row.content)
+    snapshot_norm = _normalize(row.content_snapshot or "")
+    if cand_norm == row_norm or (snapshot_norm and cand_norm == snapshot_norm) or (cand_norm and cand_norm in row_norm):
+        return "saved", row
+    return "conflict", row
+
+
+def _quarantine(
+    persona_dir: Path, entry: dict, stage: str, exc: BaseException, existing: Memory | None = None
+) -> None:
+    """Append ``entry`` to the quarantine file with the error as evidence. Raises if the append fails."""
+    record: dict = {
+        "quarantined_at": datetime.now(UTC).isoformat(),
+        "stage": stage,
+        "error": f"{type(exc).__name__}: {str(exc)[:500]}",
+        "entry": {k: v for k, v in entry.items() if k != "_claim_id"},
+    }
+    if existing is not None:
+        record["existing_content"] = existing.content
+    reply = getattr(exc, "reply", None)
+    if isinstance(reply, str):
+        record["reply"] = reply  # the classifier's raw reply, as evidence (an unusable reply)
+    append_jsonl(persona_dir / _QUARANTINE_FILENAME, record, nonfinite="null")
+
+
+def _item_label(entry: dict, cand: Memory | None) -> str:
+    return f"id={cand.id} type={cand.memory_type}" if cand is not None else f"memory_id={entry.get('memory_id')}"
+
+
+def _settle_failed_item(
+    store: MemoryStore,
+    pending: PendingQueue,
+    persona_dir: Path,
+    claim: ClaimedBatch,
+    entry: dict,
+    cand: Memory | None,
+    stage: str,
+    exc: Exception,
+    result: ConsolidationResult,
+    detail: str = "",
+) -> bool:
+    """Decide what happens to an item whose work raised. Returns True to END the pass. Total: never raises.
+
+    If settling itself fails (the quarantine file cannot be written, the requeue fails, anything), the entry is left
+    UNSETTLED, so it stays in the processing file and the next run retries it; one ERROR says so, and the pass ends.
+    """
+    try:
+        return _settle_failed_item_inner(store, pending, persona_dir, claim, entry, cand, stage, exc, result, detail)
+    except Exception:  # noqa: BLE001 — total by design: the loop must never end with items undone
+        logger.exception(
+            "consolidation gate: could not settle a failed item (%s) after %s: %s; leaving it for the next run",
+            _item_label(entry, cand), type(exc).__name__, str(exc)[:200],
+        )
+        return True
+
+
+def _settle_failed_item_inner(
+    store: MemoryStore,
+    pending: PendingQueue,
+    persona_dir: Path,
+    claim: ClaimedBatch,
+    entry: dict,
+    cand: Memory | None,
+    stage: str,
+    exc: Exception,
+    result: ConsolidationResult,
+    detail: str = "",
+) -> bool:
+    label = _item_label(entry, cand) + detail
+    if isinstance(exc, ThrottleDeferred):
+        # "not now": not a failure. The item and the rest of the batch stay in the processing file; the next run retries.
+        logger.info("consolidation gate: Claude call deferred (%s); leaving %s and the rest for the next run", exc, label)
+        return True
+    result.failed += 1
+    existing: Memory | None = None
+    if cand is not None:
+        probe = _saved_state(store, cand)
+        if probe is not None and probe[0] == "saved":
+            # A step AFTER the save failed (an edge weight, say): the candidate is a row, nothing is requeued or quarantined.
+            logger.warning(
+                "consolidation gate: %s was saved but a later step failed (%s: %s); not requeued", label, type(exc).__name__, exc
+            )
+            claim.settle(entry)
+            return False
+        if probe is not None:
+            existing = probe[1]
+    scope = "item" if existing is not None else settle_scope(exc, store)
+    if scope == "item":
+        _quarantine(persona_dir, entry, stage, exc, existing)
+        logger.error(
+            "consolidation gate: %s quarantined (%s: %s)", label, type(exc).__name__, str(exc)[:200], exc_info=exc
+        )
+        result.quarantined += 1
+        claim.settle(entry)
+        return False
+    # environment: keep it for later and end the pass (the rest stay in the processing file).
+    source = entry.get("_source") or "gate-retry"
+    if cand is not None:
+        pending.enqueue(cand, source=source)
+    else:
+        pending.enqueue_reappraisal(str(entry.get("memory_id")), source=source, include_held=False)
+    logger.warning(
+        "consolidation gate: %s requeued after an environment failure (%s: %s); ending this pass",
+        label, type(exc).__name__, str(exc)[:200],
+    )
+    claim.settle(entry)
+    return True
 
 
 def _embed_candidate(content: str) -> tuple[np.ndarray, str] | None:
@@ -611,6 +818,8 @@ def _make_haiku_reappraiser(provider, persona_dir: Path | None = None) -> Reappr
             offered = listed_display_forms(persona_dir, memory.content)
             raw = provider.generate(_reappraiser_user_message(memory, offered), system=prompt)
             return _parse_reappraisal(raw, memory.importance)
+        except ThrottleDeferred:
+            raise  # "not now" (expired login, shutdown): the item is retried, not consumed unchanged (#473)
         except Exception:  # noqa: BLE001 — a provider fault must not lose the row
             logger.warning("consolidation Haiku reappraise failed; importance unchanged")
             return Reappraisal(memory.importance)
@@ -621,10 +830,12 @@ def _make_haiku_reappraiser(provider, persona_dir: Path | None = None) -> Reappr
 def _handle_reappraisals(
     store: MemoryStore,
     persona_dir: Path,
+    pending: PendingQueue,
+    claim: ClaimedBatch,
     entries: list[dict],
     reappraiser: Reappraiser,
     result: ConsolidationResult,
-) -> None:
+) -> bool:
     """Process Change-3 existing-memory re-appraise items: load the target
     row, compute a new importance (and names) via the injectable `reappraiser`,
     and UPDATE it in place (never an INSERT — C3.1).
@@ -641,34 +852,49 @@ def _handle_reappraisals(
     in this memory's text (the matcher, entry-side rules), and is not also in its
     ``names``; the write itself never removes a name the kindled added, and puts
     each removed name on the rejects list (S135).
+
+    Each item runs in its own try (#459): a failure is settled by `_settle_failed_item`, and True is returned when the pass
+    must end (an environment failure or a deferred call); the unsettled items stay in the processing file.
     """
     for entry in entries:
-        memory_id = entry.get("memory_id")
-        if not memory_id or not isinstance(memory_id, str):
-            logger.warning("consolidation gate: dropping unparseable reappraise item")
-            continue
-        memory = store.get(memory_id, bump=False)
-        if memory is None:
-            continue  # already gone — no resurrection
         try:
-            appraisal = reappraiser(memory)
-            # Attribute access inside the same try: a reappraiser that returns a
-            # bare number is skipped with a log line, as before.
-            new_importance = appraisal.importance
-            names = appraisal.names
-            not_names = getattr(appraisal, "not_names", ())
-        except Exception:  # noqa: BLE001 — a reappraiser fault must not lose the batch
-            logger.exception("consolidation gate: reappraiser raised; skipping")
-            continue
-        try:
-            store.update(memory_id, importance=clamp_importance(new_importance))
-        except KeyError:
-            # Deleted between the read above and this write — absorbed, not
-            # raised (finding #3).
-            continue
-        result.reappraised += 1
-        _remove_not_names(persona_dir, memory, names, not_names)
-        _admit_extracted_names(persona_dir, names, list_source="reappraiser", label="reappraiser")
+            memory_id = entry.get("memory_id")
+            if not memory_id or not isinstance(memory_id, str):
+                logger.warning("consolidation gate: dropping unparseable reappraise item")
+                claim.settle(entry)
+                continue
+            memory = store.get(memory_id, bump=False)
+            if memory is None:
+                claim.settle(entry)
+                continue  # already gone — no resurrection
+            try:
+                appraisal = reappraiser(memory)
+                # Attribute access inside the same try: a reappraiser that returns a
+                # bare number is skipped with a log line, as before.
+                new_importance = appraisal.importance
+                names = appraisal.names
+                not_names = getattr(appraisal, "not_names", ())
+            except ThrottleDeferred:
+                raise  # "not now": the item is not consumed (#473)
+            except Exception:  # noqa: BLE001 — a reappraiser fault must not lose the batch
+                logger.exception("consolidation gate: reappraiser raised; skipping")
+                claim.settle(entry)
+                continue
+            try:
+                store.update(memory_id, importance=clamp_importance(new_importance))
+            except KeyError:
+                # Deleted between the read above and this write — absorbed, not
+                # raised (finding #3).
+                claim.settle(entry)
+                continue
+            result.reappraised += 1
+            _remove_not_names(persona_dir, memory, names, not_names)
+            _admit_extracted_names(persona_dir, names, list_source="reappraiser", label="reappraiser")
+            claim.settle(entry)
+        except Exception as exc:  # noqa: BLE001 — settled per item
+            if _settle_failed_item(store, pending, persona_dir, claim, entry, None, "reappraise", exc, result):
+                return True
+    return False
 
 
 def _remove_not_names(persona_dir: Path, memory: Memory, names: object, not_names: object) -> None:
@@ -699,9 +925,7 @@ def _archive_preimage(persona_dir: Path, target: Memory, source_id: str) -> None
         "merged_from_candidate": source_id,
     }
     path = persona_dir / _ARCHIVE_FILENAME
-    with file_lock(path):
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    append_jsonl(path, rec, nonfinite="null")
 
 
 def _dispatch(
@@ -801,8 +1025,10 @@ def _make_haiku_classifier(provider) -> Classifier:
     """Build a Haiku-backed Pass-2 classifier from a generation provider.
 
     Decision QUALITY is advisory (C16, live-only) — the gate mechanism is what
-    the gating criteria verify. On any parse/provider failure the candidate is
-    promoted (fail-open toward keeping content).
+    the gating criteria verify. A failed CALL propagates (the candidate is kept for a
+    later run); a reply that arrives with no usable verdict raises
+    ``UnusableClassifierReply`` (the candidate is quarantined with the reply as evidence).
+    Nothing is promoted unclassified (#473).
     """
     prompt = _CLASSIFIER_PROMPT
 
@@ -811,21 +1037,32 @@ def _make_haiku_classifier(provider) -> Classifier:
         # it (the first-400-character cut is gone, spec §5 item 1, S51), in its
         # fence; each EXISTING memory in its own fence (S106, S136).
         user = _classifier_user_message(cand, context)
+        # The CALL is outside any try: a call that fails (a deferral, a CLI error, a timeout) means the candidate was not
+        # classified, so the exception goes to the gate, which keeps the candidate for a later run (#473).
+        raw = provider.generate(user, system=prompt)
+        reply = raw if isinstance(raw, str) else ""
+        if not reply.strip():
+            raise UnusableClassifierReply("empty reply", reply)
+        match = re.search(r"\{.*\}", reply, re.DOTALL)
+        if match is None:
+            raise UnusableClassifierReply("no JSON object in the reply", reply)
         try:
-            raw = provider.generate(user, system=prompt)
-            data = json.loads(_extract_json(raw))
-            verdict = str(data.get("verdict", "new"))
-            if verdict not in VERDICTS:
-                verdict = "new"
-            return Decision(
-                verdict=verdict,
-                target_id=data.get("target_id") or None,
-                merged_content=data.get("merged_content") or None,
-                names=_parse_names(data.get("names"), source="gate judge"),
-            )
-        except Exception:  # noqa: BLE001
-            logger.warning("consolidation Haiku classify failed; promoting candidate")
-            return Decision("new")
+            data = json.loads(match.group(0))
+        except (ValueError, RecursionError) as exc:
+            raise UnusableClassifierReply("the reply is not valid JSON", reply) from exc
+        if not isinstance(data, dict):
+            raise UnusableClassifierReply("the reply JSON is not an object", reply)
+        verdict = data.get("verdict")
+        if isinstance(verdict, str):
+            verdict = verdict.strip().lower()  # "New" / "NEW" are the same verdict
+        if not isinstance(verdict, str) or verdict not in VERDICTS:
+            raise UnusableClassifierReply(f"no usable verdict (got {str(data.get('verdict'))[:60]!r})", reply)
+        return Decision(
+            verdict=verdict,
+            target_id=data.get("target_id") or None,
+            merged_content=data.get("merged_content") or None,
+            names=_parse_names(data.get("names"), source="gate judge"),
+        )
 
     return _classify
 

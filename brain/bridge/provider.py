@@ -82,6 +82,12 @@ _BUDGET_FALLBACK: float = tunables.register("provider.max_turn_budget_usd.fallba
 # (a 5000-digit run) or RecursionError (nesting beyond the recursion limit). JSONDecodeError is a ValueError.
 _JSON_LINE_ERRORS: tuple[type[BaseException], ...] = (ValueError, RecursionError)
 
+
+def _text_only(value: object) -> str:
+    """The value if it is a string, else "". A JSON `null` (or a number) in a text field is not text: `str(None)`
+    would put the literal word "None" into a reply (#467)."""
+    return value if isinstance(value, str) else ""
+
 # The result-frame subtype the CLI reports when --max-budget-usd stops a turn (exit code 1).
 _BUDGET_SUBTYPE: str = "error_max_budget_usd"
 
@@ -932,7 +938,7 @@ class ClaudeCliProvider(LLMProvider):
             cli_err = _cli_error_detail(payload)
             if cli_err is not None:
                 raise RuntimeError(f"ClaudeCliProvider: {cli_err}")
-            return str(payload["result"])
+            return _text_only(payload["result"])
         except (*_JSON_LINE_ERRORS, KeyError, TypeError) as exc:
             raise RuntimeError(
                 f"ClaudeCliProvider: unexpected output format: {result.stdout[:200]!r}"
@@ -1048,7 +1054,7 @@ class ClaudeCliProvider(LLMProvider):
                 if payload is None:
                     raise ValueError("no result frame")
                 if _is_over_budget_frame(payload):
-                    partial = str(payload.get("result", "")).strip()
+                    partial = _text_only(payload.get("result")).strip()
                     text = (
                         f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}" if partial else _BUDGET_EXCEEDED_MSG
                     )
@@ -1058,7 +1064,7 @@ class ClaudeCliProvider(LLMProvider):
                 cli_err = _cli_error_detail(payload)
                 if cli_err is not None:
                     raise ProviderError("claude_cli_error", cli_err)
-                content = str(payload["result"])
+                content = _text_only(payload["result"])
             except (ValueError, KeyError, TypeError) as exc:
                 raise ProviderError(
                     "claude_cli_parse",
@@ -1328,16 +1334,22 @@ class ClaudeCliProvider(LLMProvider):
                     tool_in_flight = False
                     tool_name = None
                     if t == "stream_event":
-                        event = obj.get("event", {})
-                        if event.get("type") == "content_block_delta":
-                            delta = event.get("delta", {})
-                            if delta.get("type") == "text_delta":
-                                text = str(delta.get("text", ""))
-                                delta_chunks.append(text)
-                                yield TextDelta(text=text)
+                        # A frame whose nested value is not an object carries no text: skip it, as the line-level
+                        # non-object skip above does (#467). Only a string is text.
+                        event = obj.get("event")
+                        if isinstance(event, dict) and event.get("type") == "content_block_delta":
+                            delta = event.get("delta")
+                            if isinstance(delta, dict) and delta.get("type") == "text_delta":
+                                text = delta.get("text")
+                                if isinstance(text, str):
+                                    delta_chunks.append(text)
+                                    yield TextDelta(text=text)
                     elif t == "assistant":
                         # Snapshot frame — fallback content when result frame absent.
-                        msg_content = obj.get("message", {}).get("content", [])
+                        # None, not [], for a message that is not an object: a skipped frame must change nothing
+                        # (an empty list would reset `assistant_snapshot` below). Same shape as the blocking scanner.
+                        message = obj.get("message", {})
+                        msg_content = message.get("content", []) if isinstance(message, dict) else None
                         _collect_builtin_calls(msg_content, builtin_calls)
                         if isinstance(msg_content, list):
                             for blk in msg_content:
@@ -1345,16 +1357,26 @@ class ClaudeCliProvider(LLMProvider):
                                     tool_in_flight = True
                                     tool_name = str(blk.get("name") or "") or None
                                     break
-                            parts = [
-                                blk.get("text", "")
-                                for blk in msg_content
-                                if isinstance(blk, dict) and blk.get("type") == "text"
-                            ]
-                            assistant_snapshot = "".join(parts)
+                            # Only string text counts: a text block whose `text` is null, a number or absent would
+                            # make the join raise TypeError (same class as the frames above; `_tool_result_text` does
+                            # this too). The snapshot is the fallback reply, so a frame whose text is empty ONLY
+                            # because its text blocks were malformed leaves it as it was, like a malformed message;
+                            # a genuinely valid message with no text blocks still replaces it.
+                            parts: list[str] = []
+                            dropped_malformed = False
+                            for blk in msg_content:
+                                if isinstance(blk, dict) and blk.get("type") == "text":
+                                    if isinstance(blk.get("text"), str):
+                                        parts.append(blk["text"])
+                                    else:
+                                        dropped_malformed = True
+                            joined = "".join(parts)
+                            if joined or not dropped_malformed:
+                                assistant_snapshot = joined
                     elif t == "user":
                         _collect_builtin_results(obj, builtin_calls)
                     elif t == "result":
-                        result_text = str(obj.get("result", ""))
+                        result_text = _text_only(obj.get("result", ""))
                         metadata: dict[str, Any] = {
                             k: obj[k]
                             for k in ("duration_ms", "num_turns", "stop_reason", "is_error")
@@ -1585,7 +1607,7 @@ class ClaudeCliProvider(LLMProvider):
                 if payload is None:
                     raise ValueError("no result frame")
                 if _is_over_budget_frame(payload):
-                    partial = str(payload.get("result", "")).strip()
+                    partial = _text_only(payload.get("result")).strip()
                     text = (
                         f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}" if partial else _BUDGET_EXCEEDED_MSG
                     )
@@ -1606,7 +1628,7 @@ class ClaudeCliProvider(LLMProvider):
                 cli_err = _cli_error_detail(payload)
                 if cli_err is not None:
                     raise ProviderError("claude_cli_error", cli_err)
-                content = str(payload["result"])
+                content = _text_only(payload["result"])
             except (ValueError, KeyError, TypeError) as exc:
                 raise ProviderError(
                     "claude_cli_parse",
@@ -2338,21 +2360,33 @@ class OllamaProvider(LLMProvider):
 
         try:
             data = resp.json()
-        except ValueError as exc:
+        except _JSON_LINE_ERRORS as exc:
             raise ProviderError("ollama_parse", f"invalid json: {exc}") from exc
 
+        # A body or a nested value of the wrong shape is a parse error, not an AttributeError/TypeError out of
+        # chat() (#468). A falsy `message` (null, "", 0, [], false) stays "an empty message", as it always was.
+        if not isinstance(data, dict):
+            raise ProviderError("ollama_parse", f"response is not a JSON object: {type(data).__name__}")
         msg = data.get("message") or {}
-        content: str = msg.get("content", "") or ""
-        raw_tool_calls: list[dict[str, Any]] = msg.get("tool_calls") or []
+        if not isinstance(msg, dict):
+            raise ProviderError("ollama_parse", f"message is not an object: {type(msg).__name__}")
+        content = msg.get("content", "") or ""
+        if not isinstance(content, str):
+            raise ProviderError("ollama_parse", f"message.content is not a string: {type(content).__name__}")
+        raw_tool_calls = msg.get("tool_calls") or []
+        if not isinstance(raw_tool_calls, list):
+            raise ProviderError(
+                "ollama_parse", f"message.tool_calls is not a list: {type(raw_tool_calls).__name__}"
+            )
 
         parsed_tool_calls: list[ToolCall] = []
         for tc_dict in raw_tool_calls:
             try:
                 parsed_tool_calls.append(ToolCall.from_provider_dict(tc_dict))
-            except ValueError as exc:
+            except _JSON_LINE_ERRORS as exc:
                 raise ProviderError(
                     "ollama_parse",
-                    f"malformed tool_call in response: {exc}",
+                    f"malformed tool_call in response: {str(exc)[:200]}",
                 ) from exc
 
         return ChatResponse(
@@ -2391,7 +2425,12 @@ class OllamaProvider(LLMProvider):
         Yields
         ------
         str
-            Each content chunk Ollama emits. Empty chunks are skipped.
+            Each content chunk Ollama emits. Empty chunks are skipped, and so is
+            anything that is not a usable frame: a line that is valid JSON but not
+            an object, and a frame whose ``message`` is not an object or whose
+            ``content`` is not a string contribute no chunk (a ``done`` on such a
+            frame still ends the stream). Unlike :meth:`chat`, which rejects a
+            reply of the wrong shape with ``ollama_parse``, the stream keeps going.
 
         Raises
         ------
@@ -2400,7 +2439,8 @@ class OllamaProvider(LLMProvider):
         ProviderError("ollama_request", ...)
             Network-level failure (connection refused, DNS, etc.).
         ProviderError("ollama_parse", ...)
-            A streamed line could not be JSON-decoded.
+            A streamed line could not be JSON-decoded (including a line nested
+            past the recursion limit or a digit run past the integer limit).
         """
         payload: dict[str, Any] = {
             "model": self._model,
@@ -2437,14 +2477,16 @@ class OllamaProvider(LLMProvider):
                         continue
                     try:
                         frame = json.loads(line)
-                    except json.JSONDecodeError as exc:
+                    except _JSON_LINE_ERRORS as exc:
                         raise ProviderError(
                             "ollama_parse",
                             f"invalid streaming line json: {exc}",
                         ) from exc
+                    if not isinstance(frame, dict):
+                        continue  # valid JSON that is not an object carries no frame (#468)
                     msg = frame.get("message") or {}
-                    chunk = msg.get("content")
-                    if chunk:
+                    chunk = msg.get("content") if isinstance(msg, dict) else None
+                    if chunk and isinstance(chunk, str):
                         yield chunk
                     if frame.get("done"):
                         return

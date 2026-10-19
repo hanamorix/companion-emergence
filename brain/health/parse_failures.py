@@ -13,7 +13,6 @@ that fails quietly shows up as a count per site.
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 import threading
@@ -21,7 +20,9 @@ from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from brain.health.json_io import append_jsonl, iter_jsonl
 from brain.health.log_rotation import rotate_rolling_size
+from brain.utils.file_lock import file_lock
 
 logger = logging.getLogger(__name__)
 
@@ -68,10 +69,11 @@ def record_parse_failure(
             "raw": raw[:RAW_CHARS] if keep_raw else "",
             "raw_len": len(raw),
         }
-        with _WRITE_LOCK:
+        # The thread lock serialises this process; the file lock makes rotate-then-append one step across
+        # processes too (a rotation truncates the log under the appender otherwise).
+        with _WRITE_LOCK, file_lock(path):
             rotate_rolling_size(path, MAX_BYTES, ARCHIVE_KEEP)
-            with path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+            append_jsonl(path, row, lock="held", nonfinite="null")
     except Exception:  # noqa: BLE001 -- evidence is best-effort by contract
         logger.warning("could not record a %s parse failure to %s", site, path, exc_info=True)
 
@@ -80,21 +82,13 @@ def count_recent(persona_dir: Path, *, hours: float = 24.0, now: datetime | None
     """Failures per site within the last ``hours`` (active log only). Never
     raises: ``/health`` reads it on the restart poll."""
     path = Path(persona_dir) / PARSE_FAILURE_LOG
-    if not path.exists():
-        return {}
     cutoff = (now or datetime.now(UTC)) - timedelta(hours=hours)
     counts: Counter[str] = Counter()
-    try:
-        # Bytes, decoded per line: one bad byte costs its line, not the count.
-        lines = path.read_bytes().splitlines()
-    except OSError:
-        logger.warning("could not read %s", path, exc_info=True)
-        return {}
-    for line in lines:
+    # One bad line costs only itself (the module skips it); an unreadable file reads as empty with a warning.
+    for row in iter_jsonl(path):
         try:
-            row = json.loads(line.decode("utf-8"))
             if row["ts"] and datetime.fromisoformat(row["ts"]) >= cutoff:
                 counts[str(row.get("site", "unknown"))] += 1
         except (KeyError, TypeError, ValueError, AttributeError):
-            continue  # corrupt, non-UTF-8, tz-less or non-dict row
+            continue  # tz-less or otherwise unusable row
     return dict(counts)

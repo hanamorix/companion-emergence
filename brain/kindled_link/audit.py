@@ -7,10 +7,11 @@ must never compound it).
 """
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime
 from pathlib import Path
+
+from brain.health.json_io import append_jsonl
 
 logger = logging.getLogger(__name__)
 
@@ -51,9 +52,8 @@ def log_transport(
         row["error"] = error[:200]  # #367: why the relay failed, not just that it did
 
     try:
-        log_path = Path(persona_dir) / "kindled_link" / "transport.jsonl"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row, separators=(",", ":")) + "\n")
+        append_jsonl(
+            Path(persona_dir) / "kindled_link" / "transport.jsonl", row, on_error="log", nonfinite="null"
+        )
     except Exception:
         logger.exception("transport audit append failed")

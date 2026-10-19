@@ -10,9 +10,10 @@ Both render with soft-rose dot (#c89890) in the frontend TYPE_DOT lookup.
 """
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
+
+from brain.health.json_io import read_json
 
 log = logging.getLogger(__name__)
 
@@ -33,22 +34,19 @@ def build_attunement_entries(persona_dir: Path) -> list:
     entries: list[FeedEntry] = []
 
     # --- backfill_complete ---
-    backfill_path = persona_dir / "attunement" / "backfill_state.json"
-    if backfill_path.exists():
-        try:
-            state = json.loads(backfill_path.read_text(encoding="utf-8"))
-            if state.get("status") == "complete":
-                entries.append(
-                    FeedEntry(
-                        type="attunement_backfill",
-                        ts=state.get("started_at", ""),
-                        opener=TYPE_OPENER["attunement_backfill"],
-                        body="I spent some time thinking about you — patterns are settling.",
-                        audit_id=None,
-                    )
-                )
-        except (json.JSONDecodeError, ValueError, OSError):
-            log.warning("attunement feed: could not read backfill_state.json — skipping")
+    state = read_json(
+        persona_dir / "attunement" / "backfill_state.json", default=dict, expect=dict
+    )  # missing or unreadable: skipped (the module warns)
+    if state.get("status") == "complete":
+        entries.append(
+            FeedEntry(
+                type="attunement_backfill",
+                ts=state.get("started_at", ""),
+                opener=TYPE_OPENER["attunement_backfill"],
+                body="I spent some time thinking about you — patterns are settling.",
+                audit_id=None,
+            )
+        )
 
     # --- crystallisation events ---
     try:

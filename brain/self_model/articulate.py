@@ -33,7 +33,6 @@ Fail-soft: any provider error -> return None. The gap stands without a note;
 """
 from __future__ import annotations
 
-import json
 import logging
 import traceback
 from datetime import UTC, datetime
@@ -43,6 +42,7 @@ from typing import Any
 from brain import prompt_strings
 from brain.bridge import cli_throttle
 from brain.bridge.usage_log import log_usage
+from brain.health.json_io import JsonFileError, Recovery, append_jsonl, read_json, write_json
 from brain.self_model.gap import Gap
 
 log = logging.getLogger(__name__)
@@ -135,10 +135,7 @@ def _log_articulate_error(
             "error": str(exc) if exc is not None else None,
             "traceback": traceback.format_exc() if exc is not None else None,
         }
-        path = Path(persona_dir) / _ARTICULATE_ERRORS_FILE
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a") as f:
-            f.write(json.dumps(entry) + "\n")
+        append_jsonl(Path(persona_dir) / _ARTICULATE_ERRORS_FILE, entry, on_error="log", nonfinite="null")
     except Exception:  # noqa: BLE001 — best-effort, never mask the real failure
         pass
 
@@ -168,26 +165,26 @@ def _today_local() -> str:
 def _load_budget(persona_dir: Path) -> dict:
     """Return raw budget dict. MISSING → {}. CORRUPT → raises ValueError."""
     path = _budget_path(persona_dir)
-    if not path.exists():
-        return {}
     try:
-        return json.loads(path.read_text())
-    except (json.JSONDecodeError, ValueError) as exc:
-        tmp = path.with_suffix(".tmp")
-        if tmp.exists():
-            try:
-                return json.loads(tmp.read_text())
-            except (json.JSONDecodeError, ValueError):
-                pass
+        # RESTORE: a corrupt file is restored from the previous save (or a legacy .tmp sibling); with no good
+        # copy it raises and the caller keeps its fail-safe-permissive policy.
+        return read_json(
+            path,
+            default=dict,
+            recover=Recovery.RESTORE,
+            expect=dict,
+            fallbacks=(path.with_suffix(".tmp"),),
+        )
+    except JsonFileError as exc:
+        if exc.kind == "io":
+            # An unreadable file propagated as an OSError before; JsonFileError is also a ValueError, which
+            # the caller treats as "corrupt: allow", so re-raise the original OSError instead.
+            raise (exc.__cause__ if isinstance(exc.__cause__, OSError) else OSError(str(exc))) from exc
         raise ValueError("corrupt budget file") from exc
 
 
 def _save_budget(persona_dir: Path, state: dict) -> None:
-    path = _budget_path(persona_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state))
-    tmp.replace(path)
+    write_json(_budget_path(persona_dir), state, backups=1, indent=None, fsync=False)
 
 
 def _budget_check_and_consume(persona_dir: Path) -> bool:

@@ -22,6 +22,7 @@ from brain.attunement.schemas import (
     PatternCandidate,
 )
 from brain.attunement.store import BufferTurn
+from brain.health.json_io import append_jsonl
 from brain.health.parse_failures import record_parse_failure
 
 log = logging.getLogger(__name__)
@@ -104,15 +105,13 @@ def _call_haiku(
             try:
                 import traceback as _tb
 
-                pd.mkdir(parents=True, exist_ok=True)
                 entry = {
                     "ts": _now_iso(),
                     "error": str(exc),
                     "kind": "haiku_call_failed",
                     "traceback": _tb.format_exc(),
                 }
-                with (pd / "attunement_errors.jsonl").open("a") as _f:
-                    _f.write(json.dumps(entry) + "\n")
+                append_jsonl(pd / "attunement_errors.jsonl", entry, on_error="log", nonfinite="null")
             except Exception:  # noqa: BLE001
                 pass  # best-effort — never mask the graceful decline
         return ""

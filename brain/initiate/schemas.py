@@ -133,7 +133,7 @@ class InitiateCandidate:
     # Voice-edit-only payload (None for kind="message").
     proposal: dict[str, Any] | None = None
 
-    def to_jsonl(self) -> str:
+    def to_dict(self) -> dict[str, Any]:
         d = {
             "candidate_id": self.candidate_id,
             "ts": self.ts,
@@ -148,11 +148,13 @@ class InitiateCandidate:
         }
         if self.proposal is not None:
             d["proposal"] = self.proposal
-        return json.dumps(d, ensure_ascii=False)
+        return d
+
+    def to_jsonl(self) -> str:
+        return json.dumps(self.to_dict(), ensure_ascii=False)
 
     @classmethod
-    def from_jsonl(cls, line: str) -> InitiateCandidate:
-        d = json.loads(line)
+    def from_dict(cls, d: dict) -> InitiateCandidate:
         snap_raw = d.get("emotional_snapshot")
         snap = EmotionalSnapshot.from_dict(snap_raw) if snap_raw is not None else None
         return cls(
@@ -166,6 +168,10 @@ class InitiateCandidate:
             claimed_at=d.get("claimed_at"),
             proposal=d.get("proposal"),
         )
+
+    @classmethod
+    def from_jsonl(cls, line: str) -> InitiateCandidate:
+        return cls.from_dict(json.loads(line))
 
 
 @dataclass
@@ -197,7 +203,7 @@ class AuditRow:
         if to == "delivered" and self.delivery["delivered_at"] is None:
             self.delivery["delivered_at"] = at
 
-    def to_jsonl(self) -> str:
+    def to_dict(self) -> dict[str, Any]:
         d = {
             "audit_id": self.audit_id,
             "candidate_id": self.candidate_id,
@@ -213,11 +219,13 @@ class AuditRow:
         if self.diff is not None:
             d["diff"] = self.diff
             d["user_modified"] = self.user_modified
-        return json.dumps(d, ensure_ascii=False)
+        return d
+
+    def to_jsonl(self) -> str:
+        return json.dumps(self.to_dict(), ensure_ascii=False)
 
     @classmethod
-    def from_jsonl(cls, line: str) -> AuditRow:
-        d = json.loads(line)
+    def from_dict(cls, d: dict) -> AuditRow:
         return cls(
             audit_id=d["audit_id"],
             candidate_id=d["candidate_id"],
@@ -232,3 +240,7 @@ class AuditRow:
             diff=d.get("diff"),
             user_modified=d.get("user_modified", False),
         )
+
+    @classmethod
+    def from_jsonl(cls, line: str) -> AuditRow:
+        return cls.from_dict(json.loads(line))

@@ -190,10 +190,10 @@ def test_history_early_break_closes_reader_generator(
     )
 
     closed = {"v": False}
-    real_iter = server_mod.iter_jsonl_skipping_corrupt
+    real_iter = server_mod.iter_jsonl
 
-    def tracking_iter(path):
-        gen = real_iter(path)
+    def tracking_iter(path, **kw):
+        gen = real_iter(path, **kw)
 
         class _Wrap:
             def __iter__(self):
@@ -208,7 +208,7 @@ def test_history_early_break_closes_reader_generator(
 
         return _Wrap()
 
-    monkeypatch.setattr(server_mod, "iter_jsonl_skipping_corrupt", tracking_iter)
+    monkeypatch.setattr(server_mod, "iter_jsonl", tracking_iter)
 
     with _make_client(persona_dir) as c:
         r = c.get("/chat/history", params={"session_id": "s_close", "before_turn": 3})

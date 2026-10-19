@@ -10,15 +10,13 @@ newest log event, replay arcs.log.jsonl from beginning to rebuild state.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from brain.health.attempt_heal import save_with_backup
-from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
+from brain.health.json_io import Recovery, append_jsonl, iter_jsonl, read_json, write_json
 from brain.narrative_memory.arc import Arc, ArcMember
-from brain.utils.file_lock import file_lock
+from brain.utils.finite import clamp_nonfinite
 
 # State + log filenames inside persona_dir
 STATE_FILENAME = "arcs_state.json"
@@ -48,7 +46,7 @@ class ArcsState:
 
 
 def save_state(persona_dir: Path, state: ArcsState) -> None:
-    """Atomic JSON save of ArcsState via save_with_backup.
+    """Atomic JSON save of ArcsState via json_io.write_json (.bak rotation).
 
     Arc + ArcMember dataclasses serialise via _arc_to_dict; tuples become
     lists in JSON, deserialised back to tuples on load.
@@ -58,7 +56,7 @@ def save_state(persona_dir: Path, state: ArcsState) -> None:
         "recently_closed": [_arc_to_dict(arc) for arc in state.recently_closed],
         "last_pass_ts_iso": state.last_pass_ts_iso,
     }
-    save_with_backup(persona_dir / STATE_FILENAME, payload)
+    write_json(persona_dir / STATE_FILENAME, payload, backups=3)
 
 
 def _arc_to_dict(arc: Arc) -> dict[str, Any]:
@@ -129,15 +127,7 @@ def append_event(persona_dir: Path, event: dict[str, Any]) -> None:
     Mirrors the brain.growth.arc_storage.append_removed_arc precedent —
     file_lock for cross-process safety, fsync for durability.
     """
-    log_path = persona_dir / LOG_FILENAME
-    line = json.dumps(event) + "\n"
-    with file_lock(log_path):
-        with log_path.open("a", encoding="utf-8") as fp:
-            fp.write(line)
-            fp.flush()
-            import os
-
-            os.fsync(fp.fileno())
+    append_jsonl(persona_dir / LOG_FILENAME, clamp_nonfinite(event, where=f"arc log event {event.get('event')}"), fsync=True)  # replay float()s these
 
 
 def load_or_recover(persona_dir: Path) -> ArcsState:
@@ -153,15 +143,16 @@ def load_or_recover(persona_dir: Path) -> ArcsState:
     log_path = persona_dir / LOG_FILENAME
 
     loaded_state: ArcsState | None = None
-    if state_path.exists():
+    # CONTENT: an unreadable file raises (as it always did); a missing or corrupt one falls through to the replay.
+    raw = read_json(state_path, default=lambda: None, recover=Recovery.CONTENT, expect=dict)
+    if raw is not None:
         try:
-            raw = json.loads(state_path.read_text())
             loaded_state = ArcsState(
                 open={arc_id: _arc_from_dict(d) for arc_id, d in raw.get("open", {}).items()},
                 recently_closed=[_arc_from_dict(d) for d in raw.get("recently_closed", [])],
                 last_pass_ts_iso=raw.get("last_pass_ts_iso"),
             )
-        except (json.JSONDecodeError, KeyError, TypeError):
+        except (KeyError, TypeError):
             loaded_state = None
 
     if loaded_state is not None and not _log_newer_than_state(log_path, loaded_state):
@@ -186,7 +177,7 @@ def _log_newer_than_state(log_path: Path, state: ArcsState) -> bool:
         return True
     state_ts = state.last_pass_ts_iso
     newest_event_ts: str | None = None
-    for event in iter_jsonl_skipping_corrupt(log_path):
+    for event in iter_jsonl(log_path, recover=Recovery.RAISE):
         ts = event.get("ts_iso")
         if isinstance(ts, str) and (newest_event_ts is None or ts > newest_event_ts):
             newest_event_ts = ts
@@ -203,7 +194,7 @@ def _replay_from_log(log_path: Path) -> ArcsState:
     """
     state = ArcsState(replayed=True)
 
-    for event in iter_jsonl_skipping_corrupt(log_path):
+    for event in iter_jsonl(log_path, recover=Recovery.RAISE):
         kind = event.get("event")
         arc_id = event.get("arc_id")
         if kind == "arc_opened" and isinstance(arc_id, str):

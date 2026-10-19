@@ -233,21 +233,22 @@ def test_c13_concurrent_transitions_unguarded_can_lose_an_update(
     append_audit_row(tmp_path, _row("b", "cb"))
 
     monkeypatch.setattr(audit_mod, "_AUDIT_LOCK", _NoOpLock())
+    monkeypatch.setattr(audit_mod, "file_lock", lambda _path: _NoOpLock())  # the cross-process guard too
 
     reached_mid = threading.Event()
     proceed = threading.Event()
     paused_once = threading.Event()
-    real_from_jsonl = AuditRow.from_jsonl
+    real_from_dict = AuditRow.from_dict
 
-    def hooked(line):
-        row = real_from_jsonl(line)
+    def hooked(rec):
+        row = real_from_dict(rec)
         if row.audit_id == "a" and not paused_once.is_set():
             paused_once.set()
             reached_mid.set()
             proceed.wait(timeout=5)
         return row
 
-    monkeypatch.setattr(AuditRow, "from_jsonl", staticmethod(hooked))
+    monkeypatch.setattr(AuditRow, "from_dict", staticmethod(hooked))
 
     def call_a():
         audit_mod.update_audit_state(
@@ -286,17 +287,17 @@ def test_c13_concurrent_transitions_guarded_no_lost_update(
     reached_mid = threading.Event()
     proceed = threading.Event()
     paused_once = threading.Event()
-    real_from_jsonl = AuditRow.from_jsonl
+    real_from_dict = AuditRow.from_dict
 
-    def hooked(line):
-        row = real_from_jsonl(line)
+    def hooked(rec):
+        row = real_from_dict(rec)
         if row.audit_id == "a" and not paused_once.is_set():
             paused_once.set()
             reached_mid.set()
             proceed.wait(timeout=5)
         return row
 
-    monkeypatch.setattr(AuditRow, "from_jsonl", staticmethod(hooked))
+    monkeypatch.setattr(AuditRow, "from_dict", staticmethod(hooked))
 
     def call_a():
         audit_mod.update_audit_state(

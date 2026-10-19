@@ -7,14 +7,14 @@ decision the brain made about its own soul.
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 import re
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from brain.health.json_io import Recovery, append_jsonl, iter_jsonl, read_jsonl
 
 if TYPE_CHECKING:
     from brain.soul.review import Decision
@@ -60,32 +60,20 @@ def append_audit_entry(
         "forced_defer_reason": decision.forced_defer_reason,
     }
 
-    try:
-        audit_path.parent.mkdir(parents=True, exist_ok=True)
-        # fsync after append: the audit trail IS the safety rail. A torn
-        # final line means the brain made a decision and lost the audit
-        # entry that explained it — exactly the failure mode this log
-        # exists to prevent.
-        with open(audit_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-        return True
-    except OSError as exc:
-        logger.warning("soul audit log write failed for %s: %s", audit_path, exc)
-        return False
+    # fsync after append: the audit trail IS the safety rail. A torn
+    # final line means the brain made a decision and lost the audit
+    # entry that explained it — exactly the failure mode this log
+    # exists to prevent.
+    return append_jsonl(audit_path, entry, fsync=True, on_error="log", nonfinite="null") is not None
 
 
 def read_audit_log(persona_dir: Path, *, limit: int | None = None) -> list[dict]:
-    """Read soul_audit.jsonl entries via read_jsonl_skipping_corrupt.
+    """Read soul_audit.jsonl entries via read_jsonl.
 
     Returns entries oldest-first. If limit is provided, returns the last N
     entries (i.e. the most recent N, in chronological order).
     """
-    from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
-
-    audit_path = persona_dir / "soul_audit.jsonl"
-    entries = read_jsonl_skipping_corrupt(audit_path)
+    entries = read_jsonl(persona_dir / "soul_audit.jsonl", recover=Recovery.RAISE)
 
     if limit is not None:
         entries = entries[-limit:]
@@ -106,8 +94,6 @@ def iter_audit_full(persona_dir: Path) -> Iterator[dict]:
     needs the full history. Streaming, so memory stays bounded regardless
     of how many years have accumulated.
     """
-    from brain.health.jsonl_reader import iter_jsonl_streaming
-
     # 1. Yearly archives, oldest first.
     if persona_dir.exists():
         archives: list[tuple[int, Path]] = []
@@ -117,7 +103,7 @@ def iter_audit_full(persona_dir: Path) -> Iterator[dict]:
                 archives.append((int(m.group(1)), child))
         archives.sort(key=lambda t: t[0])
         for _year, archive_path in archives:
-            yield from iter_jsonl_streaming(archive_path)
+            yield from iter_jsonl(archive_path, recover=Recovery.RAISE)
 
     # 2. Active log.
-    yield from iter_jsonl_streaming(persona_dir / "soul_audit.jsonl")
+    yield from iter_jsonl(persona_dir / "soul_audit.jsonl", recover=Recovery.RAISE)

@@ -20,14 +20,13 @@ check the new incremental paths against.
 """
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from brain.bridge.persisted_cadence import advance, is_due, load_cadence, save_cadence
-from brain.health.jsonl_reader import read_jsonl_skipping_corrupt, read_last_n_jsonl_lines
+from brain.health.json_io import Recovery, iter_jsonl, read_jsonl, read_jsonl_tail
 from brain.initiate import presence_state
 from brain.utils.log_throttle import warn_throttled
 
@@ -100,7 +99,7 @@ def _compute_silence_days(persona_dir: Path, *, _now: datetime | None = None) ->
     latest_ts: datetime | None = None
 
     for jsonl_file in conversations_dir.glob("*.jsonl"):
-        for row in read_jsonl_skipping_corrupt(jsonl_file):
+        for row in iter_jsonl(jsonl_file, recover=Recovery.RAISE):
             speaker = str(row.get("speaker", "")).lower()
             if speaker == companion_name:
                 continue
@@ -137,7 +136,7 @@ def _ignore_streak_from_rows(rows: list[dict]) -> int:
 
     Extracted verbatim from what `_compute_ignore_streak` has always done —
     byte-identical walk, operating on plain dicts (matching what
-    read_jsonl_skipping_corrupt/read_last_n_jsonl_lines produce). Shared,
+    read_jsonl/read_jsonl_tail produce). Shared,
     unchanged, between `_compute_ignore_streak`'s full-file oracle and
     `_compute_ignore_streak_bounded`'s bounded production path so exact
     parity holds by construction, not by re-derivation.
@@ -167,36 +166,8 @@ def _compute_ignore_streak(persona_dir: Path) -> int:
     if not audit_path.exists():
         return 0
 
-    rows = read_jsonl_skipping_corrupt(audit_path)
+    rows = read_jsonl(audit_path, recover=Recovery.RAISE)
     return _ignore_streak_from_rows(rows)
-
-
-def _parse_lines_skipping_corrupt(lines: list[str]) -> list[dict]:
-    """Parse raw JSONL text lines with the same skip/log/continue discipline
-    `read_jsonl_skipping_corrupt` uses, for lines already obtained via a
-    bounded tail read (so this never re-reads the file itself)."""
-    rows: list[dict] = []
-    for raw in lines:
-        stripped = raw.rstrip("\r\n")
-        if not stripped.strip():
-            continue
-        try:
-            data = json.loads(stripped)
-        except json.JSONDecodeError as exc:
-            log.warning(
-                "skipping malformed jsonl line in bounded ignore-streak read: %s | content: %r",
-                exc,
-                stripped[:201],
-            )
-            continue
-        if isinstance(data, dict):
-            rows.append(data)
-        else:
-            log.warning(
-                "skipping non-dict jsonl line in bounded ignore-streak read (value type=%s)",
-                type(data).__name__,
-            )
-    return rows
 
 
 def _read_ignore_streak_window(persona_dir: Path, n: int) -> list[dict]:
@@ -213,8 +184,7 @@ def _read_ignore_streak_window(persona_dir: Path, n: int) -> list[dict]:
     included closes that gap by construction.
     """
     path = persona_dir / _COLD_START_STREAK_AUDIT_FILENAME
-    raw_lines = read_last_n_jsonl_lines(path, n + _TIE_MARGIN)
-    rows = _parse_lines_skipping_corrupt(raw_lines)
+    rows = read_jsonl_tail(path, n + _TIE_MARGIN, recover=Recovery.RAISE)
     if len(rows) <= n:
         return rows  # whole read fits inside the nominal window; no tie risk
     # rows are in original file order (oldest first); the naive cutoff would
@@ -316,7 +286,7 @@ def _build_hour_histogram(
     hour_counts: list[int] = [0] * 24
     total = 0
     for jsonl_file in conversations_dir.glob("*.jsonl"):
-        for row in read_jsonl_skipping_corrupt(jsonl_file):
+        for row in iter_jsonl(jsonl_file, recover=Recovery.RAISE):
             speaker = str(row.get("speaker", "")).lower()
             if speaker == persona_dir.name.lower():
                 continue
@@ -375,7 +345,7 @@ def _read_valid_reply_lags(persona_dir: Path) -> list[float]:
         return []
 
     lags: list[float] = []
-    for row in read_jsonl_skipping_corrupt(audit_path):
+    for row in iter_jsonl(audit_path, recover=Recovery.RAISE):
         if row.get("decision") not in _SEND_DECISIONS:
             continue
         delivery = row.get("delivery") or {}
@@ -451,7 +421,7 @@ def _daily_scan_conversations(
     latest_ts: datetime | None = None
 
     for jsonl_file in conversations_dir.glob("*.jsonl"):
-        for row in read_jsonl_skipping_corrupt(jsonl_file):
+        for row in iter_jsonl(jsonl_file, recover=Recovery.RAISE):
             speaker = str(row.get("speaker", "")).lower()
             if speaker == companion_name or speaker == "summary":
                 continue
@@ -488,7 +458,7 @@ def _run_daily_presence_recompute(persona_dir: Path, *, _now: datetime | None = 
     reply-lag bootstrap.
 
     Scan phase runs UNLOCKED (matches today's un-locked full-scan reads —
-    read_jsonl_skipping_corrupt already tolerates a concurrent writer via
+    read_jsonl already tolerates a concurrent writer via
     its corrupt-line-skip discipline). Merge phase is a small,
     presence-lock-guarded, version-reconciled read-merge-write so a live
     event (record_inbound_turn/fold_reply_lag) that fires during the scan

@@ -3,7 +3,7 @@
 voice.md is the persona's authored identity document. It is a plain-text
 Markdown file, not JSON. We extend the health module's healing pattern
 via a new attempt_heal_text helper that handles text files the same way
-attempt_heal handles JSON files.
+json_io's HEAL recovery handles JSON files.
 
 OG reference: NellBrain stored voice via Modelfile SYSTEM block (frozen
 into model weights by regenerate_modelfile.py). In companion-emergence

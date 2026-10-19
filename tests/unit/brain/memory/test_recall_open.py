@@ -108,8 +108,11 @@ def test_no_seen_opens_each_call(tmp_path: Path) -> None:
     open_memory(m, store=store, persona_dir=tmp_path, deliberate=False, seen=None)
     open_memory(m, store=store, persona_dir=tmp_path, deliberate=False, seen=None)
 
+    # Without a seen-set each call is its own open event: recall_count is bumped for EVERY call (the property this test protects).
     assert _rc(store, m.id) == pytest.approx(2.0)
-    assert _reappraisal_ids(PendingQueue(tmp_path).drain()).count(m.id) == 2
+    # The memory is queued for re-appraisal, once: a second open of the same memory does not add a second pending item (#459, the
+    # queue keeps one re-appraise item per memory id so an outage cannot pile them up). One item is all the gate needs.
+    assert _reappraisal_ids(PendingQueue(tmp_path).drain()).count(m.id) == 1
 
 
 # ---------------------------------------------------------------------------

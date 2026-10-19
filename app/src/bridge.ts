@@ -191,6 +191,18 @@ export interface PersonaState {
    *  without the field degrade to no line shown. A paused job is not
    *  included. */
   background_jobs?: BackgroundJob[];
+  /** A damaged `tunables.json` that the brain healed (kind "reset": the damaged file was kept aside and the overrides are
+   *  not in effect; "restored": an older saved copy was put in its place) or could not read at all ("unreadable").
+   *  Persisted beside the file by whichever bridge healed it, so every persona's bridge reports it until the user acts (#462).
+   *  `kept_as` is the kept-aside file name (null for "unreadable"). Null/absent when there is nothing to say. Optional so
+   *  older bridge builds degrade to no notice. */
+  tunables_notice?: TunablesNotice | null;
+}
+
+/** See `PersonaState.tunables_notice`. */
+export interface TunablesNotice {
+  kind: "reset" | "restored" | "unreadable";
+  kept_as: string | null;
 }
 
 /** One entry in `PersonaState.background_jobs` (ram-spike-fix INC-11). */

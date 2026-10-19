@@ -235,8 +235,8 @@ def test_soul_candidate_review_holds_lock_against_concurrent_queue(tmp_path: Pat
     assert queue_finished.is_set(), "queue_soul_candidate didn't finish after lock released"
 
     # Candidate did persist
-    from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+    from brain.health.json_io import read_jsonl
 
-    records = read_jsonl_skipping_corrupt(candidates_path)
+    records = read_jsonl(candidates_path)
     assert len(records) == 1
     assert records[0]["memory_id"] == "m1"

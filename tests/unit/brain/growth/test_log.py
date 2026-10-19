@@ -126,7 +126,7 @@ def test_read_growth_log_skips_corrupt_lines(tmp_path: Path, caplog) -> None:
 
     # Hardening: warning includes line number + content preview so a forensic
     # grep of the logs can find and quarantine the bad line.
-    # The warning is emitted by read_jsonl_skipping_corrupt (shared helper).
+    # The warning is emitted by json_io.iter_jsonl (shared module).
     bad_warnings = [r for r in caplog.records if "malformed jsonl line" in r.message]
     assert len(bad_warnings) == 1
     msg = bad_warnings[0].getMessage()

@@ -390,6 +390,20 @@ def _keyword_budget_reset(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _tunables_overrides_cache_reset() -> Iterator[None]:
+    """#462: forget the cached tunables overrides before and after each test.
+
+    `tunables._load_overrides_locked` caches the overrides (a failed read too) keyed on the file's mtime, and a healed read changes
+    what the cache holds. Only the cache is cleared: the registry that modules fill at import time is left alone.
+    """
+    from brain import tunables
+
+    tunables._reset_overrides_cache()
+    yield
+    tunables._reset_overrides_cache()
+
+
+@pytest.fixture(autouse=True)
 def _cost_series_state_reset(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Cost-series increment (S146, S159, S163, S164): empty the in-process
     sample buffer and the warn-once flags before and after each test, and give
