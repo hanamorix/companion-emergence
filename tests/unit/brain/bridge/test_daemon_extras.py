@@ -228,11 +228,13 @@ def test_cmd_run_converts_idle_shutdown_minutes(
     assert calls["idle_shutdown_seconds"] == 150.0
 
 
-def test_cmd_run_refuses_when_bridge_already_running(
+def test_cmd_run_lets_the_os_lock_decide_over_a_record(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    """#177 S3 / D4 (C27): cmd_run no longer exits 2 on a record. A live bridge holds the lock (that case waits, see
+    tests/bridge/test_cmd_run_lock_wait.py); a record whose process does not hold the lock is not a running bridge."""
     from brain.bridge import state_file
 
     _patch_paths(monkeypatch, tmp_path)
@@ -249,16 +251,13 @@ def test_cmd_run_refuses_when_bridge_already_running(
             client_origin="launchd",
         ),
     )
-
-    def fail_foreground(*args, **kwargs):
-        pytest.fail("cmd_run must not start a second foreground runner")
-
-    monkeypatch.setattr("brain.bridge.runner.run_bridge_foreground", fail_foreground)
+    ran: list[bool] = []
+    monkeypatch.setattr("brain.bridge.runner.run_bridge_foreground", lambda *a, **k: ran.append(True) or 0)
+    monkeypatch.setattr(daemon, "run_recovery_if_needed", lambda _p: None, raising=False)
 
     rc = daemon.cmd_run(_args("nell", idle_shutdown=0, client_origin="launchd"))
 
-    assert rc == 2
-    assert "bridge already running" in capsys.readouterr().err
+    assert rc == 0 and ran == [True]
 
 
 def _tail_args(persona: str, **kw) -> argparse.Namespace:
@@ -1282,23 +1281,29 @@ def test_cmd_run_persona_not_found_returns_1(
     assert "persona directory not found" in err
 
 
-def test_cmd_run_returns_2_when_lock_held(
+def test_cmd_run_waits_for_a_held_lock_instead_of_returning_2(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """is_running=False but acquire_lock=None — surface 2, do not call runner."""
+    """#177 S3 / D4 (C27): the lock is held (a starter, no live record): cmd_run says so and waits (blocking acquire),
+    then runs; it never exits 2, which an OS service would respawn forever."""
     _patch_paths(monkeypatch, tmp_path)
-    monkeypatch.setattr(daemon.state_file, "is_running", lambda _p: False)
-    monkeypatch.setattr(daemon, "acquire_lock", lambda _p: None)
+    calls: list[bool] = []
 
-    def fail_runner(*a, **kw):
-        pytest.fail("cmd_run must not start runner when lock is held")
+    def fake_acquire(_p, *, blocking=False):
+        calls.append(blocking)
+        return 99 if blocking else None
 
-    monkeypatch.setattr("brain.bridge.runner.run_bridge_foreground", fail_runner)
+    monkeypatch.setattr(daemon, "acquire_lock", fake_acquire)
+    monkeypatch.setattr(daemon, "release_lock", lambda _p, _fd: None)
+    monkeypatch.setattr(daemon, "run_recovery_if_needed", lambda _p: None, raising=False)
+    ran: list[bool] = []
+    monkeypatch.setattr("brain.bridge.runner.run_bridge_foreground", lambda *a, **k: ran.append(True) or 0)
     rc = daemon.cmd_run(_args("nell", idle_shutdown=0, client_origin="launchd"))
-    assert rc == 2
-    assert "lockfile held" in capsys.readouterr().err
+    assert rc == 0 and ran == [True]
+    assert calls == [False, True]
+    assert "waiting for the bridge lock" in capsys.readouterr().err
 
 
 # ---------- cmd_stop (lines 310-331) ----------

@@ -100,7 +100,7 @@ def run_recovery_if_needed(persona_dir: Path) -> int | None:
         hebbian.close()
 
 
-def acquire_lock(persona_dir: Path) -> int | None:
+def acquire_lock(persona_dir: Path, *, blocking: bool = False) -> int | None:
     """Take the bridge's OS-level lock for the whole process life.
 
     Same pattern as brain.utils.file_lock: open with O_CREAT (never O_EXCL —
@@ -112,7 +112,9 @@ def acquire_lock(persona_dir: Path) -> int | None:
 
     Returns the open fd (the caller must keep it open for the lock's
     duration and pass it to release_lock) on success, or None if another
-    live process holds the lock.
+    live process holds the lock. With ``blocking=True`` it waits until the lock
+    is free instead (POSIX: a blocking flock; Windows: msvcrt's own 10 x 1 s
+    LK_LOCK retry, repeated), as `nell supervisor run` does for OS services.
 
     The pid is written into the file for information only (S50) — never
     read back to make a decision here. It sits at offset 0 on BOTH
@@ -127,9 +129,17 @@ def acquire_lock(persona_dir: Path) -> int | None:
     try:
         if _IS_WINDOWS:
             os.lseek(fd, _WINDOWS_LOCK_OFFSET, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            if blocking:
+                while True:
+                    try:
+                        msvcrt.locking(fd, msvcrt.LK_LOCK, 1)  # retries 10 x 1 s itself, then raises
+                        break
+                    except OSError:
+                        os.lseek(fd, _WINDOWS_LOCK_OFFSET, os.SEEK_SET)
+            else:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
         else:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (BlockingIOError, OSError):
         os.close(fd)
         return None
@@ -440,18 +450,29 @@ def cmd_run(args) -> int:
         print(f"persona directory not found: {persona_dir}", file=sys.stderr)
         return 1
 
-    if state_file.is_running(persona_dir):
-        cur = state_file.read(persona_dir)
-        print(f"bridge already running on port {cur.port} (pid {cur.pid})", file=sys.stderr)
-        return 2
-
+    # D4 (#177 S3): an OS service must not exit 2 here (systemd / launchd / Task Scheduler read it as a failure and
+    # respawn forever). Whether a live bridge or a starter holds the lock, wait for it, then run.
     fd = acquire_lock(persona_dir)
     if fd is None:
-        print("bridge already starting (lockfile held)", file=sys.stderr)
-        return 2
+        cur = state_file.read(persona_dir)
+        if cur is not None and state_file.bridge_liveness(cur, persona_dir) == state_file.ALIVE:
+            print(f"waiting for the running bridge (pid {cur.pid}) to exit", file=sys.stderr)
+        else:
+            print("waiting for the bridge lock (another start is in progress)", file=sys.stderr)
+        fd = acquire_lock(persona_dir, blocking=True)
+        if fd is None:
+            print("bridge lock unavailable", file=sys.stderr)
+            return 1
 
     try:
         client_origin = getattr(args, "client_origin", "cli")
+        if client_origin == "systemd":
+            try:
+                from brain.service.systemd import refresh_installed_unit
+
+                refresh_installed_unit(args.persona)
+            except Exception:  # noqa: BLE001 - best effort; the unit keeps working without the line
+                logger.warning("systemd unit refresh failed", exc_info=True)
         if client_origin == "launchd":
             try:
                 from brain.service.launchd import truncate_launchd_logs_if_large

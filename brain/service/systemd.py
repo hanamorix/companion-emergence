@@ -26,6 +26,7 @@ those run, this module is the place errors will surface.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
@@ -35,6 +36,8 @@ from pathlib import Path
 from brain.paths import get_log_dir, get_persona_dir
 from brain.service import UnsupportedPlatformError
 from brain.setup import validate_persona_name
+
+logger = logging.getLogger(__name__)
 
 
 def _user_home() -> Path:
@@ -170,6 +173,9 @@ def build_systemd_unit_text(
         "Restart=on-failure\n"
         "RestartSec=2\n"
         "TimeoutStopSec=300\n"
+        # #456: SIGTERM only the bridge on stop, so its in-flight calls (own sessions) finish; systemd SIGKILLs the
+        # rest of the control group only at TimeoutStopSec.
+        "KillMode=mixed\n"
         f"{env_block}\n"
         f"StandardOutput=append:{paths.stdout_path}\n"
         f"StandardError=append:{paths.stderr_path}\n"
@@ -178,6 +184,41 @@ def build_systemd_unit_text(
         "[Install]\n"
         "WantedBy=default.target\n"
     )
+
+
+def refresh_installed_unit(persona: str) -> bool:
+    """Add ``KillMode=mixed`` to OUR already-installed unit for ``persona`` (#456, D14).
+
+    Only the unit at ``paths_for_persona(persona).unit_path`` whose ``Description=`` and ``ExecStart=`` are the ones
+    this module writes is touched, and only when it has no ``KillMode=`` line: the line goes after ``TimeoutStopSec=``,
+    the file is replaced atomically, ``daemon-reload`` runs, and one INFO line is logged. It takes effect from the next
+    start. Returns True when the unit was changed."""
+    path = paths_for_persona(persona).unit_path
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    lines = text.splitlines(keepends=True)
+    ours = any(ln.strip() == f"Description=companion-emergence supervisor ({persona})" for ln in lines) and any(
+        ln.startswith("ExecStart=") and f'supervisor run --persona "{persona}"' in ln for ln in lines
+    )
+    if not ours or any(ln.startswith("KillMode=") for ln in lines):
+        return False
+    out: list[str] = []
+    inserted = False
+    for ln in lines:
+        out.append(ln)
+        if not inserted and ln.startswith("TimeoutStopSec="):
+            out.append("KillMode=mixed\n")
+            inserted = True
+    if not inserted:
+        return False
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("".join(out), encoding="utf-8")
+    os.replace(tmp, path)
+    run_systemctl(["daemon-reload"])
+    logger.info("systemd unit refreshed: KillMode=mixed added to %s (effective from the next start)", path)
+    return True
 
 
 def write_systemd_unit(
