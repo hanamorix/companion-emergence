@@ -448,3 +448,54 @@ def test_orchestrator_no_member_close_with_a_non_finite_lived_age_saves_and_warn
     (event,) = [e for e in _read_arc_events(tmp_path) if e["event"] == "arc_closed"]
     assert event["lived_age_hours"] == 0.0 and event["reason"] == "all_members_lost"
     assert sum("lived age" in r.getMessage() and "not finite" in r.getMessage() for r in caplog.records) == 1
+
+
+# The same for the age an anchor carries (the held felt-time anchors reader can hand over a NaN): it is stamped on the
+# arc and its members, which the strict state save writes.
+def _pass_with(tmp_path: Path, anchors, caplog, *, lived_age: float = 500.0) -> None:
+    with caplog.at_level(logging.WARNING, logger="brain.narrative_memory"):
+        run_pass(
+            tmp_path,
+            event_bus=_StubEventBus(),
+            anchor_sweep=_stub_anchor_sweep(anchors),
+            candidate_pool=_stub_candidate_pool([]),
+            salience_score=_stub_salience(),
+            is_exempt=_stub_is_exempt_none,
+            hebbian=_StubHebbian(),
+            embeddings=_StubEmbeddings(),
+            felt_time_state=FakeFeltTimeState(lived_age_hours=lived_age),
+        )
+
+
+def _anchor_warnings(caplog) -> int:
+    return sum("anchor" in r.getMessage() and "lived age" in r.getMessage() and "not finite" in r.getMessage()
+               for r in caplog.records)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")], ids=["nan", "inf", "-inf"])
+def test_orchestrator_opening_an_arc_from_an_anchor_with_a_non_finite_lived_age_saves_and_warns(
+    tmp_path: Path, caplog, bad
+):
+    anchors = [FakeAnchor("dream", "dream_1", "the boat one", "2026-05-19T10:00:00+00:00", bad, ("mem_seed",))]
+    _pass_with(tmp_path, anchors, caplog)
+    arc = next(iter(load_or_recover(tmp_path).open.values()))
+    assert arc.lived_age_at_open == 0.0 and [m.lived_age_at_join for m in arc.members] == [0.0]
+    assert _anchor_warnings(caplog) == 1
+    assert all(e["lived_age_hours"] == 0.0 for e in _read_arc_events(tmp_path))
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")], ids=["nan", "inf", "-inf"])
+def test_orchestrator_extending_an_arc_from_an_anchor_with_a_non_finite_lived_age_saves_and_warns(
+    tmp_path: Path, caplog, bad
+):
+    first = [FakeAnchor("dream", "dream_1", "the boat one", "2026-05-19T10:00:00+00:00", 412.0, ("mem_seed",))]
+    _pass_with(tmp_path, first, caplog)
+    caplog.clear()
+    second = [
+        FakeAnchor("dream", "dream_2", "same arc", "2026-05-19T11:00:00+00:00", bad, ("mem_seed", "mem_new"))
+    ]
+    _pass_with(tmp_path, second, caplog)
+    arc = next(iter(load_or_recover(tmp_path).open.values()))
+    joined = {m.memory_id: m.lived_age_at_join for m in arc.members}
+    assert joined == {"mem_seed": 412.0, "mem_new": 0.0}  # the earlier member keeps its real age
+    assert _anchor_warnings(caplog) == 1
