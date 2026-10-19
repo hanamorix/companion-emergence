@@ -227,3 +227,26 @@ def test_442_non_transport_request_error_raises_relay_unavailable(exc_type, monk
     with pytest.raises(RelayUnavailableError):
         _mock_client(handler).push({"relay_mailbox": "m"})
     assert sleeps == [], "a non-transport error is not transient, so it is not retried"
+
+
+@pytest.mark.parametrize("envelopes", [None, {"id": "e1"}, "e1"], ids=["null", "object", "string"])
+def test_442_poll_and_ingest_degrades_on_a_malformed_200_fetch(tmp_path, envelopes):
+    """#442 through the real path: a relay that answers the fetch with 200 and a
+    non-list `envelopes` must give the degraded relay_error summary, not a TypeError
+    from `len(fetched)` that ends the tick (review on PR #469)."""
+    from brain.kindled_link.identity import KindledIdentity
+    from brain.kindled_link.store import KindledLinkStore
+    from brain.kindled_link.transport import poll_and_ingest
+
+    def handler(request):
+        if request.url.path == "/mailbox/challenge":
+            return httpx.Response(200, json={"nonce": "n"})
+        return httpx.Response(200, json={"envelopes": envelopes})
+
+    idn = KindledIdentity.load_or_create(tmp_path)
+    http = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://relay.test")
+    out = poll_and_ingest(
+        KindledLinkStore(tmp_path / "k.db"), idn, RelayClient(http, identity=idn, mailbox_id="m"),
+        now=datetime(2026, 10, 19, 12, 0, tzinfo=UTC),
+    )
+    assert out == {"accepted": {}, "degraded": [], "relay_error": True}
