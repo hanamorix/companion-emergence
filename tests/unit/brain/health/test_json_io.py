@@ -454,9 +454,9 @@ def test_cr6_wrong_top_level_type_is_a_shape_failure(tmp_path: Path, policy: str
         assert exc.value.kind == "shape"
 
 
-@pytest.mark.parametrize("exc_type", [ValueError, TypeError, KeyError, AttributeError])
+@pytest.mark.parametrize("exc_type", [ValueError, TypeError])
 @pytest.mark.parametrize("policy", POLICIES)
-def test_cr6_validator_failures_of_any_untrusted_structure_kind_are_schema_failures(
+def test_cr6_validator_rejections_are_schema_failures(
     tmp_path: Path, policy: str, exc_type
 ) -> None:
     p = tmp_path / "state.json"
@@ -473,6 +473,22 @@ def test_cr6_validator_failures_of_any_untrusted_structure_kind_are_schema_failu
         with pytest.raises(jio.JsonFileError) as exc:
             jio.read_json(p, default=dict, validate=validate, recover=rec)
         assert exc.value.kind == "schema"
+
+
+@pytest.mark.parametrize("exc_type", [KeyError, AttributeError])
+@pytest.mark.parametrize("policy", POLICIES)
+def test_cr6_a_validator_bug_is_not_a_schema_failure_and_propagates(tmp_path: Path, policy: str, exc_type) -> None:
+    """Only ValueError/TypeError reject content (the old attempt_heal's rule); a KeyError or AttributeError is the
+    validator's own bug and must not turn a valid file into a default, a restore or a reset."""
+    p = tmp_path / "state.json"
+    p.write_text('{"a": 1}')
+
+    def validate(data):
+        raise exc_type("bug")
+
+    with pytest.raises(exc_type):
+        jio.read_json_result(p, default=dict, validate=validate, recover=_policy(policy))
+    assert p.read_text() == '{"a": 1}'
 
 
 def test_cr6_a_validator_that_returns_passes_the_data_through(tmp_path: Path) -> None:
@@ -2871,3 +2887,54 @@ def test_cj4_the_tail_scan_is_linear_in_the_length_of_one_long_line(tmp_path: Pa
         small,
         big,
     )  # linear is about 8x; quadratic is about 64x (timing noise is allowed for)
+
+
+# ---- review nits: HEAL validator exceptions and the strict reset-to-default write ----
+
+
+def _listing_bytes(d: Path) -> dict[str, bytes]:
+    return {p.name: p.read_bytes() for p in sorted(d.iterdir()) if p.is_file() and not p.name.endswith(".lock")}
+
+
+@pytest.mark.parametrize("exc", [KeyError("k"), AttributeError("a"), RuntimeError("r")], ids=["KeyError", "AttributeError", "RuntimeError"])
+def test_heal_a_validator_bug_propagates_and_leaves_the_valid_file_untouched(tmp_path: Path, exc) -> None:
+    """The old attempt_heal treated only ValueError/TypeError from a validator as a bad file: a buggy validator
+    (KeyError, AttributeError, anything else) must not quarantine and reset a valid file."""
+    p = tmp_path / "s.json"
+    p.write_text('{"a": 1}')
+    (tmp_path / "s.json.bak1").write_text('{"a": 0}')
+    before = _listing_bytes(tmp_path)
+
+    def buggy(_data):
+        raise exc
+
+    with pytest.raises(type(exc)):
+        jio.read_json_result(p, default=dict, recover=jio.Recovery.HEAL, validate=buggy)
+    assert _listing_bytes(tmp_path) == before  # no quarantine, no reset, no new file
+
+
+@pytest.mark.parametrize("exc", [ValueError("bad"), TypeError("bad")], ids=["ValueError", "TypeError"])
+def test_heal_a_validator_that_rejects_with_value_or_type_error_still_heals(tmp_path: Path, exc) -> None:
+    p = tmp_path / "s.json"
+    p.write_text('{"a": 1}')
+
+    def rejects(data):
+        if data == {"a": 1}:
+            raise exc
+
+    r = jio.read_json_result(p, default=lambda: {"fresh": True}, recover=jio.Recovery.HEAL, validate=rejects)
+    assert r.data == {"fresh": True} and r.anomaly is not None and r.anomaly.kind == "schema_mismatch"
+
+
+def test_heal_reset_to_default_writes_strict_json_and_a_nan_default_raises_with_nothing_written(tmp_path: Path) -> None:
+    p = tmp_path / "s.json"
+    p.write_text("{nope")
+    before = _listing_bytes(tmp_path)
+    with pytest.raises(ValueError):
+        jio.read_json_result(p, default=lambda: {"x": float("nan")}, recover=jio.Recovery.HEAL)
+    assert _listing_bytes(tmp_path) == before  # the corrupt file is still in place, nothing was written
+
+    # a finite default is written as plain strict JSON and read back by the stdlib
+    r = jio.read_json_result(p, default=lambda: {"x": 1.5}, recover=jio.Recovery.HEAL)
+    assert r.anomaly is not None and r.anomaly.action == "reset_to_default"
+    assert json.loads(p.read_text()) == {"x": 1.5}

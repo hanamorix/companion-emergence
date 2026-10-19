@@ -287,7 +287,7 @@ def _check(
     if validate is not None:
         try:
             validate(data)
-        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        except (ValueError, TypeError) as exc:  # a validator rejects with these; anything else is its bug and propagates
             raise _BadContentError("schema", exc) from exc
     return data
 
@@ -614,6 +614,13 @@ def _heal_locked(path, bad, sig, default, recover, expect, validate, fallbacks) 
     if chosen_bak is None and chosen_fallback is None and recover is Recovery.RESTORE:
         raise JsonFileError(path, bad.kind, _short(bad.cause)) from bad.cause
 
+    reset_data = reset_text = None
+    if chosen_bak is None and chosen_fallback is None:
+        # Build and strictly encode the default BEFORE anything is quarantined or written: a default holding a NaN
+        # (or a factory that raises) leaves the directory exactly as it was.
+        reset_data = default()
+        reset_text = _dumps(reset_data, indent=2, sort_keys=False, encode_default=None, nonfinite="raise") + "\n"
+
     _expect_unchanged(path, sig)
     _seam("before_quarantine", path)
     _expect_unchanged(path, sig)
@@ -627,13 +634,8 @@ def _heal_locked(path, bad, sig, default, recover, expect, validate, fallbacks) 
         _seam("before_install", path)
         _expect_unchanged(path, sig)
         if chosen_bak is None and chosen_fallback is None:
-            data = default()
-            save_with_backup_text(
-                path,
-                json.dumps(data, indent=2, ensure_ascii=_ENSURE_ASCII) + "\n",
-                keep_backups=False,
-                newline="\n",
-            )
+            data = reset_data
+            save_with_backup_text(path, reset_text, keep_backups=False, newline="\n")
             action, outcome, detail_out = "reset_to_default", "reset", detail
         else:
             data, action, detail_out = _install(
