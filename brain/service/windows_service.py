@@ -41,6 +41,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from brain.health.attempt_heal import save_with_backup_text
 from brain.paths import get_log_dir, get_persona_dir
 from brain.service import UnsupportedPlatformError
 from brain.setup import validate_persona_name
@@ -398,7 +399,7 @@ def write_task_xml(
     paths.xml_path.parent.mkdir(parents=True, exist_ok=True)
     paths.stdout_path.parent.mkdir(parents=True, exist_ok=True)
     # UTF-16 with BOM matches the encoding the XML declaration claims.
-    paths.xml_path.write_text(body, encoding="utf-16")
+    save_with_backup_text(paths.xml_path, body, keep_backups=False, encoding="utf-16")  # atomic (#484)
     return paths.xml_path
 
 
