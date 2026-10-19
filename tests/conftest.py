@@ -41,6 +41,56 @@ def requires_symlinks() -> None:
         pytest.skip("os.symlink needs an elevated shell or Developer Mode on Windows")
 
 
+# The REAL per-user directories, captured at import (before any test patches the platform directories), for the #488 isolation test.
+from brain import paths as _paths_module  # noqa: E402
+
+REAL_PLATFORM_DIRS = {
+    name: Path(getattr(_paths_module._dirs, name)).resolve()
+    for name in ("user_data_path", "user_cache_path", "user_log_path", "user_state_path", "user_config_path")
+}
+
+
+@pytest.fixture(autouse=True)
+def _isolate_user_data_home(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[None]:
+    """#488: no test may write into the real per-user data directory.
+
+    A test that builds the bridge app (its lifespan rewrites ``tunables.json``) or calls ``get_home()`` with neither
+    ``KINDLED_HOME`` nor ``NELLBRAIN_HOME`` set resolved to the platformdirs default, the REAL ``~/.local/share/companion-emergence``
+    of whoever ran the tests, so a run could change real settings and a later test could read what an earlier one left. Every test
+    now gets its own empty root as that default. The directory properties are replaced on the platform's ``PlatformDirs`` class
+    (every OS), so ``brain.paths._dirs`` and any fresh ``PlatformDirs(...)`` (the update overlay hook builds its own, and a parity
+    test holds the two together) agree and both land in the tmp root; the XDG variables point there too (code that reads them
+    directly). A test that sets ``KINDLED_HOME`` / ``NELLBRAIN_HOME`` still wins, as before, and the env-var resolution order is
+    unchanged.
+    """
+    from platformdirs import PlatformDirs
+
+    from brain import paths
+
+    root = tmp_path_factory.mktemp("userdata")
+    # Two classes when something (the update overlay hook drops platformdirs from sys.modules) made a new one after brain.paths
+    # built its instance: patch the one `brain.paths._dirs` is an instance of AND the one `from platformdirs import PlatformDirs` gives now.
+    for cls in {type(paths._dirs), PlatformDirs}:
+        for prop, sub in (
+            ("user_data_dir", "data"),
+            ("user_cache_dir", "cache"),
+            ("user_log_dir", "log"),
+            ("user_state_dir", "state"),
+            ("user_config_dir", "config"),
+        ):
+            # per app name, like the real thing: the harness keeps a SIBLING app dir ("companion-emergence-harness") outside the guarded roots
+            monkeypatch.setattr(cls, prop, property(lambda self, _s=sub: str(root / (self.appname or "app") / _s)))
+    for var, sub in (
+        ("XDG_DATA_HOME", "xdg-data"),
+        ("XDG_CACHE_HOME", "xdg-cache"),
+        ("XDG_STATE_HOME", "xdg-state"),
+    ):
+        monkeypatch.setenv(var, str(root / sub))
+    yield
+
+
 @pytest.fixture(autouse=True)
 def _reset_cli_throttle() -> Iterator[None]:
     """Reset cli_throttle global state before each test.
