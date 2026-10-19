@@ -7,7 +7,11 @@ IngestReport summarises what happened when a session was closed.
 
 from __future__ import annotations
 
+import logging
+import math
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 VALID_LABELS = frozenset({"observation", "feeling", "decision", "question", "fact", "note"})
 
@@ -37,7 +41,7 @@ class ExtractedItem:
 
         valid_emotions:
             When provided, emotion names not in this set are dropped.
-            Values are coerced to float, clamped to (0, 10]; <= 0 dropped.
+            Values are coerced to float, clamped to (0, 10]; <= 0 and non-finite dropped.
 
         Returns self so callers can chain: item.normalize().
         """
@@ -56,6 +60,12 @@ class ExtractedItem:
             try:
                 value = float(raw_value)
             except (TypeError, ValueError):
+                continue
+            if not math.isfinite(value):
+                # NaN slips past `<= 0.0` and +inf would clamp to 10.0 (#466).
+                logger.warning(
+                    "ingest: dropped non-finite emotion strength %s=%r", name, raw_value
+                )
                 continue
             if value <= 0.0:
                 continue
