@@ -423,7 +423,15 @@ def run_schtasks(args: list[str]) -> subprocess.CompletedProcess[str]:
             args=["schtasks", *args],
             returncode=127,
             stdout="",
-            stderr="schtasks not available — Windows host required",
+            stderr="schtasks not available: Windows host required",
+        )
+    except subprocess.TimeoutExpired:
+        # A hung schtasks is a failed call for every caller (the same code timeout(1) and run_systemctl use).
+        return subprocess.CompletedProcess(
+            args=["schtasks", *args],
+            returncode=124,
+            stdout="",
+            stderr="schtasks timed out",
         )
 
 

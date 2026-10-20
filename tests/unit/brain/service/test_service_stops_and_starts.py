@@ -249,3 +249,18 @@ def test_run_systemctl_reports_a_hung_systemctl_as_a_failed_call(monkeypatch):
     monkeypatch.setattr(subprocess, "run", _hang)
     r = systemd.run_systemctl(["start", "x.service"])
     assert r.returncode != 0 and "timed out" in r.stderr
+
+
+def test_run_schtasks_reports_a_hung_schtasks_as_a_failed_call(monkeypatch):
+    """#456 comment: a hung schtasks (TimeoutExpired) comes back as a failed CompletedProcess (code 124), like
+    run_systemctl, so every caller handles it instead of raising."""
+    import subprocess
+
+    from brain.service import windows_service
+
+    def _hang(*a, **k):
+        raise subprocess.TimeoutExpired(cmd=a[0], timeout=15)
+
+    monkeypatch.setattr(subprocess, "run", _hang)
+    r = windows_service.run_schtasks(["/Run", "/TN", "x"])
+    assert r.returncode == 124 and "timed out" in r.stderr
