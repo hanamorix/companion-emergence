@@ -137,3 +137,22 @@ def test_sighup_leaves_the_claude_call_to_finish(tmp_path, bridges):
     b.fake_release.write_text("go")
     assert b.wait_exit(60) == 0
     assert b.record().phase == "stopped"
+
+
+def test_kill_with_calls_in_flight_stores_nothing_and_leaves_no_descendant(tmp_path, bridges, monkeypatch):
+    """C52 (`--kill` leg), C45 (c own kill) on a real bridge: the helper kills the bridge and the fake claude tree; the
+    persona files are as they were before the kill."""
+    from brain.bridge import kill
+
+    monkeypatch.setattr(kill, "service_installed", lambda persona: False)
+    b = Bridge(tmp_path, calls=(CALLS["compaction"], CALLS["pass2"], CALLS["soul"]), provider="claude-cli",
+               prepare=_prepare)
+    bridges.append(b)
+    pids = _wait_calls(b, 3)
+    before = _snapshot(b.pd)
+    r = kill.kill_bridge(b.pd, timeout=10)
+    assert r.outcome == "killed" and not r.survivors
+    assert _all_gone([b.proc.pid, *pids])
+    b.proc.wait(10)
+    assert _snapshot(b.pd) == before
+    assert kill.read_intent(b.pd)["state"] == "committed"
