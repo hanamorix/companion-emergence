@@ -40,7 +40,14 @@ def _record_suppress(reason: str, kind: str, msg: str, *args: object) -> None:
             interval_s=_SUPPRESS_LOG_INTERVAL_S,
         )
     except Exception:  # noqa: BLE001
-        warn_throttled(log, f"reflection_gate:record:{reason}", "reflection_gate: suppress record failed")
+        try:
+            warn_throttled(log, f"reflection_gate:record:{reason}", "reflection_gate: suppress record failed")
+        except Exception:  # noqa: BLE001, S110
+            # #368: last resort. If even the warning fails, logging itself is
+            # broken and there is nowhere left to report; dropping the record
+            # beats failing the chat turn or changing the gate's decision.
+            # Guarded by test_the_suppress_record_cannot_raise_even_when_its_warning_fails.
+            pass
 
 
 def should_reflect(signal, persona_dir: Path, *, kind: str, now: datetime | None = None) -> bool:

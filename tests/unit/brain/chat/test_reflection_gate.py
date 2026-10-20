@@ -131,3 +131,26 @@ def test_a_raising_suppress_record_cannot_flip_the_decision(tmp_path, monkeypatc
     with caplog.at_level(logging.WARNING, logger=GATE_LOG):
         assert should_reflect(sig, tmp_path, kind="attunement", now=now) is False
     assert any(r.exc_info and r.exc_info[0] is RuntimeError for r in _gate_records(caplog, "record failed"))
+
+
+@pytest.mark.parametrize("offset_s", [None, 10])  # None: low salience; 10: too soon
+def test_the_suppress_record_cannot_raise_even_when_its_warning_fails(tmp_path, monkeypatch, fresh_throttle, offset_s):
+    """Regression (#368 review): if count_throttled raised AND the fallback
+    warn_throttled raised too, the error escaped _record_suppress into the chat
+    turn (low-salience path) or past the decision (too-soon path). Logging must
+    never decide or break a turn: the suppressed turn still returns False."""
+    import brain.chat.reflection_gate as gate
+
+    t0 = _t0()
+    if offset_s is None:
+        sig, now = assess_salience("ok"), t0
+    else:
+        sig, now = SalienceSignal.maximal(), t0 + timedelta(seconds=offset_s)
+        assert should_reflect(sig, tmp_path, kind="attunement", now=t0) is True
+
+    def _boom(*a, **kw):
+        raise RuntimeError("logging broke")
+
+    monkeypatch.setattr(gate, "count_throttled", _boom)
+    monkeypatch.setattr(gate, "warn_throttled", _boom)
+    assert should_reflect(sig, tmp_path, kind="attunement", now=now) is False

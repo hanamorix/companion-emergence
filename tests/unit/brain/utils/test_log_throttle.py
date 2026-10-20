@@ -67,3 +67,17 @@ def test_count_throttled_counts_every_firing_and_logs_loudly_once_per_interval(m
     assert [r.levelno for r in recs] == [logging.INFO, logging.DEBUG, logging.INFO, logging.INFO]
     assert recs[-1].getMessage() == "gate x (3 since start)"
     assert all(r.exc_info is None for r in recs)
+
+
+def test_warn_and_count_do_not_cross_throttle_on_the_same_key(caplog):
+    """Regression (#368 review): warn_throttled and count_throttled shared one
+    interval table, so a gate counted under key K silenced a later failure
+    warning under the same K (and vice versa). Each function throttles only itself."""
+    with caplog.at_level(logging.DEBUG, logger=LOG.name):
+        log_throttle.count_throttled(LOG, "k", logging.INFO, "gate")
+        log_throttle.warn_throttled(LOG, "k", "failed", exc_info=False)
+        log_throttle.count_throttled(LOG, "j", logging.INFO, "gate")
+    with caplog.at_level(logging.DEBUG, logger=LOG.name):
+        log_throttle.warn_throttled(LOG, "j2", "failed", exc_info=False)
+        log_throttle.count_throttled(LOG, "j2", logging.INFO, "gate")
+    assert _levels(caplog) == [logging.INFO, logging.WARNING, logging.INFO, logging.WARNING, logging.INFO]

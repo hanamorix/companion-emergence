@@ -97,26 +97,33 @@ class HebbianMatrix:
         """One write transaction: commit on success; on failure roll back and re-raise.
 
         Every write goes through here because, without the rollback, a raising
-        write (found during #368: a trigger, a full disk, a pre-read) left its
-        transaction open, holding the write lock, so every other writer got
-        "database is locked" until this connection next committed or closed
-        (callers such as search_memories swallow the error).
-        Guarded by test_a_failed_write_releases_the_write_lock. Only a transaction opened here is rolled back. If one
-        was already open on this connection (nothing in this class leaves one
-        open, so only a caller using ``_conn`` directly), the failed statement is
-        already undone by SQLite and the caller's earlier work is left for the
-        caller to commit or roll back. On success it is committed, as before.
+        write (found during #368: a trigger, a pre-read, or the COMMIT itself,
+        where a full disk in WAL mode most likely surfaces) left its transaction
+        open, holding the write lock, so every other writer got "database is
+        locked" until this connection next committed or closed (callers such as
+        search_memories swallow the error). The commit is inside the try for
+        that reason. Guarded by test_a_failed_write_releases_the_write_lock and
+        test_a_failed_commit_releases_the_write_lock.
+
+        Only a transaction opened here is rolled back. If one was already open on
+        this connection (nothing in this class leaves one open, so only a caller
+        using ``_conn`` directly), the failed statement is already undone by
+        SQLite and the caller's earlier work is left for the caller to commit or
+        roll back. On success it is committed, as before.
         """
         opened = not self._conn.in_transaction
         if opened:
             self._conn.execute("BEGIN IMMEDIATE")
         try:
             yield
+            self._conn.commit()
         except BaseException:
             if opened:
-                self._conn.rollback()
+                try:
+                    self._conn.rollback()
+                except Exception:  # noqa: BLE001 — never mask the original error
+                    log.warning("hebbian: rollback after a failed write also failed", exc_info=True)
             raise
-        self._conn.commit()
 
     def strengthen(self, a: str, b: str, delta: float = 0.1) -> None:
         """Add `delta` to the weight of edge (a, b), capped at MAX_WEIGHT.

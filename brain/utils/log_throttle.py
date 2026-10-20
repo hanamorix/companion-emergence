@@ -16,6 +16,9 @@ import time
 
 INTERVAL_S = 6 * 3600.0
 
+# Interval table shared by both functions; each namespaces its keys ("warn:" /
+# "count:") so the same caller key cannot throttle the other function's line
+# (#368). Guarded by test_warn_and_count_do_not_cross_throttle_on_the_same_key.
 _last: dict[str, float] = {}
 _counts: dict[str, int] = {}
 _lock = threading.Lock()
@@ -38,7 +41,7 @@ def warn_throttled(
     """Log ``msg % args`` (with the active exception unless ``exc_info=False``):
     WARNING if ``key`` has not warned in the last ``INTERVAL_S``, DEBUG otherwise."""
     with _lock:
-        warn = _due(key, INTERVAL_S)
+        warn = _due("warn:" + key, INTERVAL_S)
     (logger.warning if warn else logger.debug)(msg, *args, exc_info=exc_info)
 
 
@@ -60,6 +63,6 @@ def count_throttled(
     follow-up (#368)."""
     with _lock:
         n = _counts[key] = _counts.get(key, 0) + 1
-        loud = _due(key, interval_s)
+        loud = _due("count:" + key, interval_s)
     logger.log(level if loud else logging.DEBUG, msg + " (%d since start)", *args, n)
     return n
