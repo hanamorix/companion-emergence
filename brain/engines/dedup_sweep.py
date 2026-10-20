@@ -111,7 +111,9 @@ def _load_exempt_ids(persona_dir: Path) -> set[str]:
     from brain.forgetting import _load_soul_linked_ids  # lazy: forgetting is heavier
 
     # Fails closed (#431): an unreadable exemption set raises here, so nothing is deleted, and the
-    # error reaches the CLI as a traceback.
+    # error reaches the CLI as a traceback. The set is a snapshot taken once: a row crystallised
+    # mid-pass is not exempt until the next run, the same accepted window as forgetting (spec U2).
+    # The sweep is a one-shot CLI run, and re-reading per row would cost a soul-file read each time.
     crystallised, under_review = _load_soul_linked_ids(persona_dir, caller="dedup_sweep")
     return crystallised | under_review
 
@@ -137,9 +139,11 @@ def run_dedup_sweep(
     canonical is a soul-linked member if there is one, else the
     highest-importance member (ties: oldest). Every other member that is not
     soul-linked is archived (full pre-image, reason "dedup_sweep") then
-    hard-deleted, and the canonical's importance is raised to the group max if
-    a member scored higher. A group with nothing removable is not counted as
-    merged.
+    hard-deleted, and the canonical's importance is raised to the max of itself
+    and the rows actually merged into it. Each row is re-read first: one that
+    vanished, was deactivated or no longer normalises to the canonical is
+    skipped, and a canonical that vanished ends its group (#505). A group that
+    removed nothing is not counted as merged.
 
     Optional near-dup layer: when ``judge`` is supplied, canonical survivors
     left after the exact-normalize pass are compared pairwise; a "duplicate"
