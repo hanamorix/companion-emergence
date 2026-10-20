@@ -17,7 +17,7 @@ from brain import prompt_strings
 from brain.bridge.provider import LLMProvider
 from brain.health.json_io import append_jsonl, read_json, write_json
 from brain.health.parse_failures import record_parse_failure
-from brain.utils.llm_output import loads_json_object
+from brain.utils.llm_output import loads_json_object_ex
 
 logger = logging.getLogger(__name__)
 
@@ -240,7 +240,11 @@ def extract_from_thinking(
     # fenced block, or an object with prose before/after it. ClaudeCliProvider returns raw text already; OllamaProvider passes
     # model output through verbatim, where fences and chatter are common.
     try:
-        data = loads_json_object(raw)
+        data, in_prose = loads_json_object_ex(raw)
+        if in_prose and not (set(data) & set(ExtractorOutput.model_fields)):
+            # An object found in a sentence is only the answer if it looks like one (any of its fields); the whole reply
+            # being `{}` is still a valid empty answer.
+            raise ValueError("an object in the reply has none of the extractor's fields")
     except ValueError as exc:  # JSONDecodeError is a ValueError
         record_parse_failure(persona_dir, site="extractor", raw=reply, error=f"non-JSON: {exc}")
         return ExtractorOutput()

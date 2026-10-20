@@ -99,3 +99,44 @@ def test_a_reply_whose_object_breaks_the_schema_is_still_a_schema_failure(tmp_pa
     assert out == ExtractorOutput()
     (row,) = _rows(tmp_path)
     assert row["site"] == "extractor" and row["error"].startswith("schema")
+
+
+# --- code review 3b, S5: an unrelated object in prose is not an answer ---------------------------------------------------
+
+
+_UNRELATED = json.dumps({"note": "this is not the answer", "n": 3})
+
+
+@pytest.mark.parametrize("wrap", ["prose-before-fence", "prose-after-fence", "bare-object-with-prose"])
+def test_an_unrelated_object_in_prose_is_recorded_as_a_parse_failure_by_the_extractor(tmp_path, wrap):
+    reply = _WRAPPINGS[wrap](_UNRELATED)
+
+    out = extract_from_thinking(
+        provider=_Provider(reply), monologue_blocks=("m",), visible_reply="hi", recent_turn_context=(), persona_dir=tmp_path
+    )
+
+    assert out == ExtractorOutput()
+    (row,) = _rows(tmp_path)
+    assert row["site"] == "extractor" and row["raw"] == reply and row["error"].startswith("non-JSON")
+
+
+@pytest.mark.parametrize("wrap", ["prose-before-fence", "prose-after-fence", "bare-object-with-prose"])
+def test_an_unrelated_object_in_prose_is_recorded_as_a_parse_failure_by_the_detector(tmp_path, wrap):
+    reply = _WRAPPINGS[wrap](_UNRELATED)
+
+    out = _parse_output(reply, "turn-1", tmp_path)
+
+    assert out.current_read.tone_label == "unknown"
+    (row,) = _rows(tmp_path)
+    assert row["site"] == "attunement" and row["raw"] == reply and row["error"].startswith("non-JSON")
+
+
+@pytest.mark.parametrize("wrap", ["fence-only", "bare-json"])
+def test_an_empty_object_that_is_the_whole_reply_is_still_a_valid_empty_answer(tmp_path, wrap):
+    # PIN: `{}` as the entire reply (bare or fenced) is a legitimate "nothing to extract"; no row, as before.
+    reply = _WRAPPINGS[wrap]("{}")
+    out = extract_from_thinking(
+        provider=_Provider(reply), monologue_blocks=("m",), visible_reply="hi", recent_turn_context=(), persona_dir=tmp_path
+    )
+    assert out == ExtractorOutput()
+    assert _rows(tmp_path) == []
