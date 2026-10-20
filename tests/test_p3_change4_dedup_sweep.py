@@ -447,3 +447,39 @@ def test_431_near_dup_pass_stops_judging_a_cand_that_vanished(tmp_path, caplog):
     assert _active_ids(store) == {c.id}
     assert [(m.canonical_id, m.removed_id) for m in report.merges] == [(c.id, d.id)]
     store.close()
+
+
+def _logging_judge(store: MemoryStore, *, vanish: str | None = None, distinct: set[str] = frozenset()):
+    """A judge that records every (candidate, canonical) call, deletes ``vanish`` from the store during
+    the first call (a concurrent writer), and calls a pair distinct when either id is in ``distinct``."""
+    calls: list[tuple[str, str]] = []
+
+    def _judge(candidate: Memory, canonical: Memory) -> str:
+        calls.append((candidate.id, canonical.id))
+        if vanish is not None and len(calls) == 1:
+            store.hard_delete(vanish)
+        return "distinct" if {candidate.id, canonical.id} & distinct else "duplicate"
+
+    return _judge, calls
+
+
+def test_431_near_dup_pass_keeps_judging_cand_after_a_later_row_vanished(tmp_path, caplog):
+    """#431: the later row C vanishes while the A/C pair is judged. Guards two failures: stopping A's
+    comparisons as if A had gone (D would never be merged into A), and judging the dead C again as a
+    ``cand`` later (one judge call and one warning per remaining row)."""
+    import logging
+
+    store = MemoryStore(tmp_path / "memories.db")
+    a, c, d, e = (_aged(f"Bob counted the {w}.", n) for w, n in (("gulls", 4), ("geese", 3), ("terns", 2), ("crows", 1)))
+    for m in (a, c, d, e):
+        store.create(m)
+    judge, calls = _logging_judge(store, vanish=c.id, distinct={e.id})
+
+    with caplog.at_level(logging.WARNING, logger="brain.engines.dedup_sweep"):
+        report = run_dedup_sweep(store, tmp_path, judge=judge)
+
+    assert calls == [(c.id, a.id), (d.id, a.id), (e.id, a.id)]
+    assert len([r for r in caplog.records if r.levelno >= logging.WARNING]) == 1
+    assert _active_ids(store) == {a.id, e.id}
+    assert [(m.canonical_id, m.removed_id) for m in report.merges] == [(a.id, d.id)]
+    store.close()

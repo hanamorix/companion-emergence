@@ -209,13 +209,15 @@ def _near_dup_pass(
     pair (a judge fault skips that pair, never loses a row). The later of a
     pair is removed, unless it is soul-linked: then the earlier goes instead,
     and a pair of two soul-linked rows is left alone (#431)."""
-    removed: set[str] = set()
+    # Rows this pass deleted, or found deleted under it by another writer (#431). Never judged again:
+    # a gone ``other`` would cost every later ``cand`` a judge call, and a gone ``cand`` can never merge.
+    gone: set[str] = set()
     ordered = sorted(canonicals, key=lambda m: m.created_at)
     for i, cand in enumerate(ordered):
-        if cand.id in removed:
+        if cand.id in gone:
             continue
         for other in ordered[i + 1 :]:
-            if other.id in removed:
+            if other.id in gone:
                 continue
             try:
                 verdict = judge(other, cand)
@@ -232,35 +234,35 @@ def _near_dup_pass(
             # stale copy, deleted or updated: the pair is skipped and logged (#431).
             keep_now = store.get(keep.id, bump=False)
             drop_now = store.get(drop.id, bump=False)
-            if keep_now is None or drop_now is None:
+            vanished = {m.id for m, now in ((keep, keep_now), (drop, drop_now)) if now is None}
+            if vanished:
+                gone |= vanished
                 logger.warning(
                     "dedup_sweep: skipping pair %s / %s: a row vanished mid-pass", keep.id, drop.id
                 )
-                if (keep_now if keep.id == cand.id else drop_now) is None:
-                    # ``cand`` itself is gone (#431): judging it against every later row would cost
-                    # a judge call and a warning per pair for a row that can never merge.
-                    break
-                continue
-            keep, drop = keep_now, drop_now
-            _archive_preimage(persona_dir, drop)
-            store.hard_delete(drop.id)
-            removed.add(drop.id)
-            # Rows merged into ``drop`` earlier now live on in ``keep``; otherwise their records name a
-            # deleted row (#431).
-            for earlier in report.merges:
-                if earlier.canonical_id == drop.id:
-                    earlier.canonical_id = keep.id
-            report.merges.append(
-                MergeRecord(
-                    canonical_id=keep.id,
-                    removed_id=drop.id,
-                    content_preview=drop.content[:120],
-                )
-            )
-            report.rows_removed += 1
-            if float(drop.importance) > float(keep.importance):
-                store.update(keep.id, importance=float(drop.importance))
-            if drop.id == cand.id:
+            else:
+                _merge_pair(store, persona_dir, report, keep=keep_now, drop=drop_now)
+                gone.add(drop.id)
+            if cand.id in gone:
                 # ``cand`` is gone (#431): comparing it further would merge later rows into a deleted
-                # row and lose them.
+                # row and lose them, or judge a row that can never merge.
                 break
+
+
+def _merge_pair(
+    store: MemoryStore, persona_dir: Path, report: Report, *, keep: Memory, drop: Memory
+) -> None:
+    """Archive then delete ``drop`` into ``keep``, carrying the max importance."""
+    _archive_preimage(persona_dir, drop)
+    store.hard_delete(drop.id)
+    # Rows merged into ``drop`` earlier now live on in ``keep``; otherwise their records name a
+    # deleted row (#431).
+    for earlier in report.merges:
+        if earlier.canonical_id == drop.id:
+            earlier.canonical_id = keep.id
+    report.merges.append(
+        MergeRecord(canonical_id=keep.id, removed_id=drop.id, content_preview=drop.content[:120])
+    )
+    report.rows_removed += 1
+    if float(drop.importance) > float(keep.importance):
+        store.update(keep.id, importance=float(drop.importance))
