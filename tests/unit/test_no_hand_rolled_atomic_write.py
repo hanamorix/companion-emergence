@@ -18,8 +18,11 @@ marker is a visible diff. The module that holds the shared writer, ``brain/utils
 skipped. Markers on pure-move sites (a plain rename of a finished file) are main's ruling, not the owner's original
 wording (the owner named the exclusive-create cases).
 
-Not seen (known limits): a ``replace`` fetched with ``getattr``, ``functools.partial(os.replace, ...)``, an aliased
-``import os as _os``, ``os.link`` plus unlink, and a writer that writes straight to the final name.
+Aliased imports (``import os as _os``, ``import shutil as sh``) and the ``.replace(target=...)`` keyword spelling are
+resolved. Not seen (known limits): a ``replace`` fetched with ``getattr``, ``functools.partial(os.replace, ...)``,
+``os.link`` plus unlink, an unbound ``Path.replace(a, b)``, and, by design OUT OF SCOPE, a plain truncating
+``write_text`` / ``write_bytes`` straight to a state file's final name (no replace is involved, so there is nothing to
+flag; the heal defaults of #511 were that kind of write and are fixed at their sites, not by this check).
 """
 
 from __future__ import annotations
@@ -42,11 +45,14 @@ EXPECTED_MARKERS = 21
 def flagged_calls(source: str) -> list[tuple[int, int, str]]:
     """(first line, last line, kind) of each flagged call in ``source``."""
     tree = ast.parse(source)
-    bound: dict[
-        str, str
-    ] = {}  # local name -> flagged kind, for from-imports of os / tempfile / shutil
+    bound: dict[str, str] = {}  # local name -> flagged kind, for from-imports of os / tempfile / shutil
+    module_alias: dict[str, str] = {}  # local name -> "os" / "tempfile" / "shutil" for `import os as _os`
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.asname and a.name in ("os", "tempfile", "shutil"):
+                    module_alias[a.asname] = a.name
+        elif isinstance(node, ast.ImportFrom):
             for a in node.names:
                 local = a.asname or a.name
                 if node.module == "os" and a.name in OS_FUNCS:
@@ -68,6 +74,7 @@ def flagged_calls(source: str) -> list[tuple[int, int, str]]:
                 kind = f"retry-helper:{f.id}"
         elif isinstance(f, ast.Attribute):
             base = f.value.id if isinstance(f.value, ast.Name) else None
+            base = module_alias.get(base, base)
             if base == "os" and f.attr in OS_FUNCS:
                 kind = f"os.{f.attr}"
             elif base == "tempfile" and f.attr == "mkstemp":
@@ -76,16 +83,18 @@ def flagged_calls(source: str) -> list[tuple[int, int, str]]:
                 kind = "shutil.move"
             elif f.attr in RETRY_HELPERS:
                 kind = f"retry-helper:{f.attr}"
-            elif (
-                f.attr in ("replace", "rename")
-                and len(node.args) == 1
-                and not node.keywords
-                and base != "dataclasses"
-            ):
+            elif f.attr in ("replace", "rename") and base != "dataclasses" and _path_form(node):
                 kind = f"path.{f.attr}"
         if kind:
             out.append((node.lineno, node.end_lineno or node.lineno, kind))
     return out
+
+
+def _path_form(call: ast.Call) -> bool:
+    """``X.replace(dst)`` (one positional, no keywords) or ``X.replace(target=dst)`` (the keyword spelling)."""
+    if len(call.args) == 1 and not call.keywords:
+        return True
+    return not call.args and [k.arg for k in call.keywords] == ["target"]
 
 
 def check_source(source: str, rel: str) -> tuple[list[str], int]:
