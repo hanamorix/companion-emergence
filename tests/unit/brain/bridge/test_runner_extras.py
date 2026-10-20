@@ -307,6 +307,9 @@ def test_after_run_with_work_still_running_takes_the_hard_exit_path(tmp_path: Pa
         raise _Exited
 
     monkeypatch.setattr(shutdown_mod, "hard_exit", fake_hard_exit)
+    # The real hard exit never returns, so nothing stops the monitor here: keep its thread from starting, or it would
+    # outlive this test and apply the noted signal (a process-wide stop) during later tests.
+    monkeypatch.setattr(shutdown_mod.Monitor, "start", lambda self: None)
 
     class FakeServer:
         def __init__(self, config):
