@@ -240,32 +240,12 @@ def _norm(path: str | os.PathLike) -> str:
 
 
 def home_from_env(env: dict[str, str], platform: str | None = None) -> str | None:
-    """The companion-emergence home a process with environment ``env`` uses: ``brain.paths.get_home``'s rule
-    (KINDLED_HOME, then the deprecated NELLBRAIN_HOME, then the platform default) applied to that environment.
-    None when the default cannot be computed from it."""
-    import sys
+    """The companion-emergence home a process with environment ``env`` uses (normalised): ``brain.paths.home_for_env``,
+    the one rule ``get_home`` also uses (#456 review S15). None when it cannot be computed from that environment."""
+    from brain import paths
 
-    platform = platform or sys.platform
-    for key in ("KINDLED_HOME", "NELLBRAIN_HOME"):
-        if env.get(key):
-            return _norm(env[key])
-    if platform.startswith("linux"):
-        base = env.get("XDG_DATA_HOME") or (
-            os.path.join(env["HOME"], ".local", "share") if env.get("HOME") else None
-        )
-        return _norm(os.path.join(base, "companion-emergence")) if base else None
-    if platform == "darwin":
-        home = env.get("HOME")
-        return (
-            _norm(os.path.join(home, "Library", "Application Support", "companion-emergence"))
-            if home
-            else None
-        )
-    if platform == "win32":
-        # platformdirs asks the shell-folder API; LOCALAPPDATA is that folder for a normal profile.
-        base = env.get("LOCALAPPDATA")
-        return _norm(os.path.join(base, "hanamorix", "companion-emergence")) if base else None
-    return None
+    home = paths.home_for_env(env, platform)
+    return _norm(home) if home is not None else None
 
 
 def prove_bridge_cmdline(pid: int | None, persona_dir: Path, persona: str) -> bool:

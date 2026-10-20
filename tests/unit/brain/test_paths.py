@@ -235,3 +235,45 @@ def test_kindled_home_propagates_to_log_dir(tmp_path, monkeypatch):
     from brain.paths import get_log_dir
 
     assert get_log_dir() == (kindled / "logs").resolve()
+
+
+# ---- #456 review S15: one home rule for this process and for another process's environment ----
+
+
+def test_the_bridge_proof_reads_another_process_home_through_the_one_rule(monkeypatch):
+    """`state_file.home_from_env` (used to prove a pre-PR bridge's home from its environment) delegates to
+    `paths.home_for_env`, the same rule `get_home` uses."""
+    import os
+
+    from brain import paths
+    from brain.bridge import state_file
+
+    seen: list = []
+    monkeypatch.setattr(paths, "home_for_env", lambda env, platform=None, **kw: seen.append(env) or Path("/x/home"))
+    assert state_file.home_from_env({"HOME": "/h"}) == os.path.normcase(os.path.realpath("/x/home"))
+    assert seen == [{"HOME": "/h"}]
+
+
+def test_the_default_computed_from_an_environment_matches_platformdirs_here(monkeypatch):
+    """Drift guard (runs on every CI platform): with no override, the default this module computes from an
+    environment equals what platformdirs gives this process."""
+    import os
+    import sys
+
+    from brain import paths
+
+    monkeypatch.delenv("KINDLED_HOME", raising=False)
+    monkeypatch.delenv("NELLBRAIN_HOME", raising=False)
+    computed = paths.home_for_env(dict(os.environ), sys.platform)
+    assert computed is not None
+    assert os.path.normcase(os.path.realpath(computed)) == os.path.normcase(
+        os.path.realpath(paths.home_for_env(os.environ, current=True))
+    )
+    assert paths.get_home() == Path(paths.home_for_env(os.environ, current=True)).resolve()
+
+
+def test_home_for_env_honours_the_overrides_in_order(tmp_path):
+    from brain import paths
+
+    assert paths.home_for_env({"KINDLED_HOME": str(tmp_path / "k"), "NELLBRAIN_HOME": "/n"}) == tmp_path / "k"
+    assert paths.home_for_env({"NELLBRAIN_HOME": str(tmp_path / "n")}) == tmp_path / "n"
