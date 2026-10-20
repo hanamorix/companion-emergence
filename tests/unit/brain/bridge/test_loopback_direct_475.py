@@ -247,10 +247,11 @@ _BRAIN = Path(__file__).resolve().parents[4] / "brain"
 _HTTPX_VERBS = {"get", "post", "put", "patch", "delete", "head", "request", "stream"}
 _HTTPX_CLIENTS = {"Client", "AsyncClient"}
 # provider.py talks to an Ollama host the user configures (possibly remote, possibly behind a proxy on purpose).
-# supervisor.py builds the Kindled RELAY poll client (a remote service, no bridge token is sent): its missing trust_env=False is
-# recorded as a found-not-fixed item in the bundle's RESUME-HERE (scope frozen), not accepted as right.
+# The Kindled RELAY poll client in supervisor.py is a remote service (no bridge token is sent): its missing trust_env=False is recorded
+# as a found-not-fixed item in the bundle's RESUME-HERE (scope frozen), not accepted as right. The exemption is that ONE function, so
+# any other httpx.Client in the file (or a second one in that function's neighbours) is still flagged.
 _NOT_LOOPBACK = {"bridge/provider.py"}
-_NOT_LOOPBACK_CLIENT = {"bridge/supervisor.py"}
+_NOT_LOOPBACK_CLIENT = {("bridge/supervisor.py", "_run_kindled_link_tick")}
 _WEBSOCKET_OK_MODULES = {"websockets.exceptions"}  # exception classes only
 
 
@@ -262,6 +263,20 @@ def violations(source: str, rel: str) -> list[str]:
     """Every way the source could reach the bridge through the environment's proxy settings (code review 3b, S1)."""
     out: list[str] = []
     tree = ast.parse(source)
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+
+    def enclosing_function(node: ast.AST) -> str | None:
+        while node in parents:
+            node = parents[node]
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return node.name
+        return None
+
+    # Every name the httpx module is bound to: `import httpx`, `import httpx as h`.
+    httpx_names = {"httpx"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            httpx_names |= {a.asname for a in node.names if a.name == "httpx" and a.asname}
     for node in ast.walk(tree):
         # urlopen in any spelling: urllib.request.urlopen(...), request.urlopen(...), a bare urlopen(...) after a from-import
         if isinstance(node, ast.Attribute) and node.attr == "urlopen":
@@ -286,8 +301,8 @@ def violations(source: str, rel: str) -> list[str]:
                 if a.name in _HTTPX_VERBS | _HTTPX_CLIENTS:
                     out.append(f"{rel}:{node.lineno} from httpx import {a.name}")
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
-            if node.func.value.id == "httpx" and (node.func.attr in _HTTPX_VERBS or node.func.attr in _HTTPX_CLIENTS):
-                if node.func.attr in _HTTPX_CLIENTS and rel in _NOT_LOOPBACK_CLIENT:
+            if node.func.value.id in httpx_names and (node.func.attr in _HTTPX_VERBS or node.func.attr in _HTTPX_CLIENTS):
+                if node.func.attr in _HTTPX_CLIENTS and (rel, enclosing_function(node)) in _NOT_LOOPBACK_CLIENT:
                     continue
                 kw = {k.arg: k.value for k in node.keywords}
                 if not _is_false(kw.get("trust_env")):
@@ -317,6 +332,12 @@ def test_the_scan_catches_every_spelling_it_exists_for():
         "import httpx\nhttpx.Client(trust_env=True)": "without trust_env=False",
         "from httpx import post\npost(u)": "from httpx import post",
         "from httpx import Client": "from httpx import Client",
+        "from httpx import Client as C\nC()": "from httpx import Client",
+        "from httpx import post as p": "from httpx import post",
+        "import httpx as h\nh.post(u)": "without trust_env=False",
+        "import httpx as h\nh.Client(base_url=u)": "without trust_env=False",
+        "import urllib.request as ur\nur.urlopen(u)": "urlopen",
+        "from urllib.request import urlopen as uo\nuo(u)": "from urllib.request import urlopen",
         "from websockets.sync.client import connect": "websockets import",
         "import websockets.sync.client as c\nc.connect(u)": "websockets import",
         "import websockets": "websockets import",
@@ -328,3 +349,16 @@ def test_the_scan_catches_every_spelling_it_exists_for():
     assert violations("from websockets.exceptions import InvalidStatus", "x/y.py") == []
     assert violations("import websockets", "bridge/loopback.py") == []
     assert violations("import httpx\nhttpx.get(u)", "bridge/provider.py") == []
+    assert violations("import httpx as h\nh.post(u, trust_env=False)", "x/y.py") == []
+
+
+def test_the_supervisor_exemption_is_one_function_not_the_file():
+    relay = "import httpx\ndef _run_kindled_link_tick():\n    return httpx.Client(base_url=u)\n"
+    other_function = "import httpx\ndef something_else():\n    return httpx.Client(base_url=u)\n"
+    module_level = "import httpx\nC = httpx.Client(base_url=u)\n"
+    assert violations(relay, "bridge/supervisor.py") == []
+    assert any("httpx.Client" in v for v in violations(other_function, "bridge/supervisor.py"))
+    assert any("httpx.Client" in v for v in violations(module_level, "bridge/supervisor.py"))
+    assert any("httpx.Client" in v for v in violations(relay, "bridge/server.py"))  # the function name alone is not an exemption
+    # and a verb call in the exempted function is still checked (the exemption is for the Client only)
+    assert any("httpx.post" in v for v in violations("import httpx\ndef _run_kindled_link_tick():\n    httpx.post(u)\n", "bridge/supervisor.py"))
