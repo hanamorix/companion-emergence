@@ -503,7 +503,7 @@ def _settle_failed_item_inner(
         # `correction_of` set before the failed `store.create`), and the next run must judge it afresh (#470 review).
         pending.enqueue(Memory.from_dict(entry), source=source)
     else:
-        pending.enqueue_reappraisal(str(entry.get("memory_id")), source=source, include_held=False)
+        pending.enqueue_reappraisal(str(entry.get("memory_id")), source=source)
     logger.warning(
         "consolidation gate: %s requeued after an environment failure (%s: %s); ending this pass",
         label, type(exc).__name__, str(exc)[:200],
