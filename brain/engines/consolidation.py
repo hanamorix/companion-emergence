@@ -55,6 +55,7 @@ from brain.memory.semantic_recall import build_semantic_candidate_pool
 from brain.memory.store import Memory, MemoryStore, clamp_importance
 from brain.utils.failure_scope import ServiceCallFailed, settle_scope
 from brain.utils.file_lock import file_lock
+from brain.utils.llm_output import find_json_object_block
 
 logger = logging.getLogger(__name__)
 
@@ -1043,11 +1044,13 @@ def _make_haiku_classifier(provider) -> Classifier:
         reply = raw if isinstance(raw, str) else ""
         if not reply.strip():
             raise UnusableClassifierReply("empty reply", reply)
-        match = re.search(r"\{.*\}", reply, re.DOTALL)
-        if match is None:
+        # The shared string-aware scan, not a greedy `\{.*\}`: a brace in the prose around a valid verdict must not turn it
+        # into "not valid JSON", because an unusable reply is quarantined for good (#470 review).
+        block = find_json_object_block(reply, prefer_key="verdict")
+        if block is None:
             raise UnusableClassifierReply("no JSON object in the reply", reply)
         try:
-            data = json.loads(match.group(0))
+            data = json.loads(block)
         except (ValueError, RecursionError) as exc:
             raise UnusableClassifierReply("the reply is not valid JSON", reply) from exc
         if not isinstance(data, dict):

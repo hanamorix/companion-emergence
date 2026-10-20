@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 from brain.health.json_io import Recovery, read_jsonl, write_jsonl
 from brain.health.parse_failures import record_parse_failure
+from brain.utils.llm_output import find_json_object_block
 
 if TYPE_CHECKING:
     from brain.bridge.provider import LLMProvider
@@ -179,77 +180,9 @@ def _build_messages(
 # ── JSON parsing ──────────────────────────────────────────────────────────────
 
 
-_OBJECT_START = re.compile(r'\{\s*"')  # the opening of a JSON object with at least one key
-
-
-def _balanced_block(text: str, start: int) -> str | None:
-    """The `{...}` block that opens at ``start``, counting braces OUTSIDE string literals only (#478), or None if it never closes."""
-    depth = 0
-    in_string = False
-    escaped = False
-    for i in range(start, len(text)):
-        ch = text[i]
-        if in_string:
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                in_string = False
-            continue
-        if ch == '"':
-            in_string = True
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : i + 1]
-    return None
-
-
 def _extract_json_block(text: str) -> str | None:
-    """Find the JSON object that is the model's answer in ``text``. Tolerant of preamble and of braces inside strings (#478).
-
-    Tries each ``{`` in turn with ``json.JSONDecoder().raw_decode``: the first object that carries a ``decision`` key wins, else the
-    first object that decodes at all. An object that opens inside a ``{...}`` block that did NOT decode is part of that malformed
-    reply and is not taken as the answer (a decision quoted inside invalid JSON must not be accepted). That includes a TRUNCATED outer object (one that opens
-    like JSON, `{"`, and never closes): everything after it is part of it. When no ``{`` starts a decodable object (a malformed reply) it falls back to the first
-    string-aware balanced block, so ``parse_decision`` can still report "json decode failed" rather than "no JSON block"; None
-    when no `{` starts a block that closes.
-    """
-    decoder = json.JSONDecoder()
-    first_object: str | None = None
-    first_balanced: str | None = None
-    inside_failed_until = 0  # an object that opened inside a block that did not decode belongs to that malformed block
-    start = text.find("{")
-    while start >= 0:
-        if start < inside_failed_until:
-            start = text.find("{", start + 1)
-            continue
-        try:
-            obj, end = decoder.raw_decode(text, start)
-        except ValueError:
-            obj = None
-            balanced = _balanced_block(text, start)
-            if balanced is not None:
-                inside_failed_until = start + len(balanced)
-            elif _OBJECT_START.match(text, start):
-                # An object that opens like JSON (`{"`) and never closes is a truncated reply: everything after it is part of it.
-                # (A `{` that opens prose, such as "I considered { maybe", is not, and does not hide a later answer.)
-                inside_failed_until = len(text)
-        else:
-            balanced = None
-            if isinstance(obj, dict):
-                block = text[start:end]
-                if "decision" in obj:
-                    return block
-                if first_object is None:
-                    first_object = block
-        if first_balanced is None:
-            first_balanced = balanced if balanced is not None else _balanced_block(text, start)
-        start = text.find("{", start + 1)
-    return first_object if first_object is not None else first_balanced
+    """The soul-review answer in ``text``: the shared string-aware scan, preferring an object with a ``decision`` (#478)."""
+    return find_json_object_block(text, prefer_key="decision")
 
 
 def parse_decision(raw: str, candidate_id: str) -> Decision:
