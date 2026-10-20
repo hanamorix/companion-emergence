@@ -373,9 +373,14 @@ def cmd_start(args, *, out: dict | None = None) -> int:
     if _service_installed(args.persona):
         t0 = time.monotonic()
         try:
-            _start_service(args.persona)
+            started = _start_service(args.persona)
         except Exception as exc:  # noqa: BLE001 - reported like any failed start
             print(f"service start failed: {exc}", file=sys.stderr)
+            return 1
+        if started is not None and started.returncode != 0:
+            # Review S12: the manager refused the start; say so now, not after the readiness wait.
+            detail = (started.stderr or started.stdout or "").strip()
+            print(f"service start failed (exit {started.returncode}): {detail}", file=sys.stderr)
             return 1
         return _await_service_readiness(persona_dir, _READINESS_BUDGET_S - (time.monotonic() - t0), out)
     pid = spawn_detached(persona_dir, idle, client_origin, log_path)
@@ -396,10 +401,11 @@ def _service_installed(persona: str) -> bool:
     return kill.service_installed(persona)
 
 
-def _start_service(persona: str) -> None:
+def _start_service(persona: str) -> subprocess.CompletedProcess[str] | None:
+    """The manager's start call; its result carries the manager's return code and message."""
     from brain.service import current_backend
 
-    current_backend().start_service(persona=persona)
+    return current_backend().start_service(persona=persona)
 
 
 def _await_service_readiness(persona_dir: Path, budget_s: float, out: dict | None) -> int:

@@ -244,3 +244,19 @@ def test_cmd_start_clears_the_intent_then_routes_by_service(pd, monkeypatch, ins
     monkeypatch.setattr(daemon, "_await_readiness", lambda *a, **k: 0)
     assert daemon.cmd_start(_start_args()) == 0
     assert seen == [("service" if installed else "spawn", None)]
+
+
+def test_cmd_start_reports_a_failed_service_start_at_once(pd, monkeypatch, capsys):
+    """Review S12: the manager's own failure (kickstart / systemctl start / schtasks /Run non-zero) is reported at once
+    with its message, not after the 50 s readiness wait."""
+    import subprocess
+
+    monkeypatch.setattr(daemon, "_service_installed", lambda persona: True)
+    monkeypatch.setattr(daemon, "_start_service", lambda persona: subprocess.CompletedProcess(
+        args=["systemctl"], returncode=1, stdout="", stderr="Job for the unit failed."))
+    waited: list = []
+    monkeypatch.setattr(daemon, "_await_service_readiness", lambda *a, **k: waited.append(1) or 0)
+    assert daemon.cmd_start(_start_args()) == 1
+    assert waited == []
+    err = capsys.readouterr().err
+    assert "service start failed" in err and "Job for the unit failed." in err
