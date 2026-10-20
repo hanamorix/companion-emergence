@@ -3307,9 +3307,9 @@ def build_app(
     async def supervisor_shutdown(request: Request) -> dict[str, Any]:
         """Trigger graceful shutdown via the shutdown controller.
 
-        Returns 202 immediately. The actual drain (30s in-flight chat wait +
-        supervisor join + buffer snapshot) runs in the FastAPI lifespan
-        teardown triggered by uvicorn server.should_exit via the controller.
+        Returns 202 immediately. The stop itself (#456) runs in the FastAPI
+        lifespan teardown, triggered through the controller: it waits, with no
+        time limit, for every registered task to end, then seals the registry.
 
         Requires a shutdown controller (set by runner.py via build_app). If the
         bridge was started without one (e.g. tests that do not pass a controller),

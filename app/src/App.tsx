@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, useRef } from "react";
+import { useCallback, useEffect, useState, useRef, type ReactNode } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   brainLoginStatus,
@@ -33,6 +33,8 @@ import { BrainLoginPrompt } from "./components/panels/BrainLoginPrompt";
 import { LeftPanel } from "./components/LeftPanel";
 import { useSoulFlash } from "./useSoulFlash";
 import { useRestartBridge } from "./hooks/useRestartBridge";
+import { useBridgeWatchdog } from "./hooks/useBridgeWatchdog";
+import { StopProgress } from "./components/panels/StopProgress";
 import { Wizard } from "./wizard/Wizard";
 import { PersonaPicker } from "./wizard/PersonaPicker";
 import { errString } from "./lib/errString";
@@ -167,9 +169,10 @@ export default function App() {
       );
     }
     return (
-      <BootScreen
-        subtitle={`Starting brain for ${phase.persona}…`}
-      />
+      <BootScreen subtitle={`Starting brain for ${phase.persona}…`}>
+        {/* #456 (C17 h): a bridge still stopping at launch is waited for, with the same display and offer */}
+        <StopProgress persona={phase.persona} currentMode="bridge_down" />
+      </BootScreen>
     );
   }
 
@@ -342,7 +345,7 @@ function BootButton(props: React.ButtonHTMLAttributes<HTMLButtonElement>) {
   );
 }
 
-function BootScreen({ subtitle }: { subtitle: string }) {
+function BootScreen({ subtitle, children }: { subtitle: string; children?: ReactNode }) {
   return (
     <div
       style={{
@@ -376,6 +379,7 @@ function BootScreen({ subtitle }: { subtitle: string }) {
       >
         {subtitle}
       </div>
+      {children}
     </div>
   );
 }
@@ -403,6 +407,8 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
   const [brainAuthorized, setBrainAuthorized] = useState<boolean | null>(null);
   const [brainPromptDismissed, setBrainPromptDismissed] = useState(false);
   const restartBridge = useRestartBridge(persona, state?.mode ?? "live");
+  // #456 (Q4): a bridge that crashed is started again with a growing wait (30 s, 1 min, 5 min, then 10 min).
+  useBridgeWatchdog(persona, stateError ? "bridge_down" : state?.mode);
 
   // #246: the bridge reports an expired CLI login via /persona/state. The offer
   // is DERIVED from that flag OR the Rust probe — never written into

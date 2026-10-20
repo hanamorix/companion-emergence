@@ -553,46 +553,208 @@ async fn ensure_bridge_running(app: tauri::AppHandle, persona: String) -> Result
 const ERR_MISSING_PID: &str =
     "bridge.json missing pid — restart Companion to re-spawn bridge with pid field";
 
-#[cfg(unix)]
-#[tauri::command]
-async fn force_restart_bridge(app: tauri::AppHandle, persona: String) -> Result<(), String> {
-    let creds = get_bridge_credentials(persona.clone())?;
-    let pid = creds.pid.ok_or_else(|| ERR_MISSING_PID.to_string())?;
-    // SIGKILL by PID. Best-effort — process may have already exited.
-    // ESRCH (process gone) is fine; other errors surface to the user.
-    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-    if rc != 0 {
-        #[cfg(target_os = "macos")]
-        let errno = unsafe { *libc::__error() };
-        #[cfg(all(unix, not(target_os = "macos")))]
-        let errno = unsafe { *libc::__errno_location() };
-        if errno != libc::ESRCH {
-            return Err(format!("SIGKILL pid={} failed: errno {}", pid, errno));
-        }
-    }
-    // 500ms grace period for OS-level reap.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    ensure_bridge_running(app, persona).await
+// ── #456: the bridge's stop, watched from the app (Q-A, D6, D10, C17, C35, C48) ──
+//
+// The bridge's HTTP listener closes once a stop begins, so the app follows a stop through files the bridge keeps next to
+// bridge.json (written through brain.health.json_io; formats in tests/fixtures/bridge_watcher_files/), and through
+// `nell supervisor status --json`. A record is believed only when its pid + identity token are the ones bridge.json
+// names (a record left by an earlier process is ignored).
+
+const STOP_PROGRESS_FILE: &str = "bridge_stop_progress.json";
+const HARD_EXIT_REQUEST_FILE: &str = "bridge_hard_exit_request.json";
+/// `nell supervisor status --json` budget (the app's STATUS_TIMEOUT_MS, brainRecovery.ts).
+const STATUS_TIMEOUT_MS: u64 = 5000;
+/// The `--timeout` the app passes to `nell supervisor stop --kill` (the hard-exit offer threshold, owner Q1).
+pub(crate) const KILL_TIMEOUT_S: u64 = 180;
+/// One service-manager call inside the kill helper (brain/bridge/kill.py MANAGER_CAP_S).
+pub(crate) const MANAGER_CAP_S: u64 = 15;
+
+/// The kill helper's stated worst case (brain/bridge/kill.py kill_bound_s): the hard-exit wait (unless skipped) + two
+/// manager calls + the kill poll. Used when `status --json` could not be read.
+pub(crate) fn kill_bound_s(timeout_s: u64, skip_hard_exit_request: bool) -> u64 {
+    (if skip_hard_exit_request { 0 } else { timeout_s }) + 2 * MANAGER_CAP_S + timeout_s
 }
 
-#[cfg(windows)]
-#[tauri::command]
-async fn force_restart_bridge(app: tauri::AppHandle, persona: String) -> Result<(), String> {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{
-        OpenProcess, TerminateProcess, PROCESS_TERMINATE,
-    };
+/// The stop progress record (one golden fixture: tests/fixtures/bridge_watcher_files/progress.json).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BridgeShutdown {
+    #[serde(default)]
+    pub version: Option<u64>,
+    pub pid: i64,
+    #[serde(default)]
+    pub pid_token: Option<String>,
+    #[serde(default)]
+    pub persona: Option<String>,
+    #[serde(default)]
+    pub phase: Option<String>,
+    #[serde(default)]
+    pub requested_at: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub tasks: Vec<String>,
+    #[serde(default)]
+    pub count: Option<u64>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
 
-    let creds = get_bridge_credentials(persona.clone())?;
-    let pid = creds.pid.ok_or_else(|| ERR_MISSING_PID.to_string())?;
-    unsafe {
-        let handle = OpenProcess(PROCESS_TERMINATE, false, pid as u32)
-            .map_err(|e| format!("OpenProcess pid={} failed: {}", pid, e))?;
-        let result = TerminateProcess(handle, 1);
-        let _ = CloseHandle(handle);
-        result.map_err(|e| format!("TerminateProcess pid={} failed: {}", pid, e))?;
+/// (pid, identity token) of the bridge bridge.json names; None when it names none.
+fn bridge_identity_at(bridge_json: &std::path::Path) -> Option<(i64, Option<String>)> {
+    let raw = std::fs::read_to_string(bridge_json).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let pid = parsed.get("pid").and_then(|v| v.as_i64()).filter(|p| *p > 0)?;
+    let token = parsed
+        .get("pid_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    Some((pid, token))
+}
+
+/// The progress record of the bridge bridge.json names, or None (no stop recorded, or a record of another process).
+fn read_bridge_shutdown_at(dir: &std::path::Path) -> Result<Option<BridgeShutdown>, String> {
+    let path = dir.join(STOP_PROGRESS_FILE);
+    if !path.exists() {
+        return Ok(None);
     }
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let rec: BridgeShutdown =
+        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {}", STOP_PROGRESS_FILE, e))?;
+    match bridge_identity_at(&dir.join("bridge.json")) {
+        Some((pid, Some(token))) if rec.pid == pid && rec.pid_token.as_deref() == Some(token.as_str()) => {
+            Ok(Some(rec))
+        }
+        _ => Ok(None),
+    }
+}
+
+#[tauri::command]
+fn read_bridge_shutdown(persona: String) -> Result<Option<BridgeShutdown>, String> {
+    read_bridge_shutdown_at(&persona_dir(&persona)?)
+}
+
+/// Write the hard-exit request for the bridge bridge.json names (pid + token), atomically and owner-only.
+fn write_hard_exit_request_at(dir: &std::path::Path) -> Result<(), String> {
+    let (pid, token) =
+        bridge_identity_at(&dir.join("bridge.json")).ok_or_else(|| ERR_MISSING_PID.to_string())?;
+    let body = serde_json::json!({
+        "version": 1,
+        "pid": pid,
+        "pid_token": token,
+        "requested_at": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6f+00:00").to_string(),
+    });
+    let text = serde_json::to_string_pretty(&body).map_err(|e| format!("encode request: {}", e))?;
+    let tmp = dir.join(format!("{}.tmp-{}", HARD_EXIT_REQUEST_FILE, std::process::id()));
+    std::fs::write(&tmp, text + "\n").map_err(|e| format!("write {}: {}", tmp.display(), e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&tmp, dir.join(HARD_EXIT_REQUEST_FILE))
+        .map_err(|e| format!("replace {}: {}", HARD_EXIT_REQUEST_FILE, e))
+}
+
+#[tauri::command]
+fn request_bridge_hard_exit(persona: String) -> Result<(), String> {
+    write_hard_exit_request_at(&persona_dir(&persona)?)
+}
+
+/// `nell supervisor status --persona <p> --json` (files and process checks only, no HTTP). A timeout or a failure is
+/// reported as `{"alive": "unknown"}` (the caller keeps waiting).
+#[tauri::command]
+async fn bridge_status(app: tauri::AppHandle, persona: String) -> Result<serde_json::Value, String> {
+    validate_persona_name(&persona)?;
+    let unknown = serde_json::json!({ "alive": "unknown" });
+    let std_cmd = match nell_command(&app) {
+        Ok(c) => c,
+        Err(_) => return Ok(unknown),
+    };
+    let mut cmd = tokio::process::Command::from(std_cmd);
+    cmd.args(["supervisor", "status", "--persona", &persona, "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true); // read-only: safe to end on timeout
+    let output = match tokio::time::timeout(
+        std::time::Duration::from_millis(STATUS_TIMEOUT_MS),
+        cmd.output(),
+    )
+    .await
+    {
+        Ok(Ok(out)) if out.status.success() => out,
+        _ => return Ok(unknown),
+    };
+    match serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+        Ok(v) if v.is_object() => Ok(v),
+        _ => Ok(unknown),
+    }
+}
+
+/// The app's forced path (D10): `nell supervisor stop --kill` (identity-checked; the bridge and every process it
+/// started), then the normal start (`ensure_bridge_running`, which routes to an installed service in Python). With
+/// `skip_hard_exit_request` (after a hard exit the bridge ignored) the helper does not ask again. The helper runs
+/// WITHOUT kill_on_drop and with a timeout of its stated bound: on that timeout it is left running (never cut off
+/// mid-kill) and the error is shown.
+#[tauri::command]
+async fn force_restart_bridge(
+    app: tauri::AppHandle,
+    persona: String,
+    skip_hard_exit_request: Option<bool>,
+) -> Result<(), String> {
+    validate_persona_name(&persona)?;
+    let skip = skip_hard_exit_request.unwrap_or(false);
+    let status = bridge_status(app.clone(), persona.clone())
+        .await
+        .unwrap_or_else(|_| serde_json::json!({ "alive": "unknown" }));
+    let bound_s = status
+        .get("kill_bound_s")
+        .and_then(|v| v.as_f64())
+        .filter(|b| *b > 0.0)
+        .unwrap_or(kill_bound_s(KILL_TIMEOUT_S, skip) as f64);
+    let budget = std::time::Duration::from_secs_f64(bound_s)
+        + std::time::Duration::from_millis(STATUS_TIMEOUT_MS);
+
+    let started = std::time::Instant::now();
+    let std_cmd = nell_command(&app)?;
+    let mut cmd = tokio::process::Command::from(std_cmd);
+    let timeout_arg = KILL_TIMEOUT_S.to_string();
+    cmd.args(["supervisor", "stop", "--persona", &persona, "--kill", "--timeout", &timeout_arg]);
+    if skip {
+        cmd.arg("--skip-hard-exit-request");
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = cmd.spawn().map_err(|e| {
+        let msg = format!("spawn nell supervisor stop --kill: {}", e);
+        record_spawn_failure(&app, "nell supervisor stop --kill", None, Some(&msg), started);
+        msg
+    })?;
+    let output = match tokio::time::timeout(budget, child.wait_with_output()).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => return Err(format!("nell supervisor stop --kill: {}", e)),
+        Err(_) => {
+            // Left running on purpose: a kill cut off half-way could leave frozen processes behind.
+            record_spawn_failure(
+                &app,
+                "nell supervisor stop --kill",
+                None,
+                Some("force_restart_timeout"),
+                started,
+            );
+            return Err(
+                "force_restart_timeout: the bridge is still being stopped; try again in a moment".to_string(),
+            );
+        }
+    };
+    if !output.status.success() {
+        record_spawn_failure(&app, "nell supervisor stop --kill", Some(&output), None, started);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!(
+            "supervisor stop --kill failed (exit {}): {}",
+            output.status.code().unwrap_or(-1),
+            if stderr.trim().is_empty() { stdout.trim() } else { stderr.trim() }
+        ));
+    }
     ensure_bridge_running(app, persona).await
 }
 
@@ -2048,6 +2210,9 @@ pub fn run() {
             list_personas,
             ensure_bridge_running,
             force_restart_bridge,
+            read_bridge_shutdown,
+            request_bridge_hard_exit,
+            bridge_status,
             run_init,
             run_migrate,
             preflight_existing_ce,
@@ -2830,5 +2995,114 @@ mod kindled_home_tests {
         assert!(!refused.success);
         assert_eq!(refused.exit_code, 73);
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "my own nell");
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// #456 — the stop watched from the app: golden fixtures (C48), the record checks (C43 a), the forced path (C35)
+// ────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod bridge_stop_tests {
+    use super::*;
+
+    fn fixture(name: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("tests")
+            .join("fixtures")
+            .join("bridge_watcher_files")
+            .join(name);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {}", path.display(), e))
+    }
+
+    const TOKEN: &str = "linux:0b9c2f4e-1111-2222-3333-444455556666:4242:123456";
+
+    fn bridge_json(dir: &std::path::Path, token: &str) {
+        std::fs::write(
+            dir.join("bridge.json"),
+            format!(r#"{{"port": 5000, "auth_token": "t", "pid": 4242, "pid_token": "{}"}}"#, token),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn progress_fixture_parses() {
+        let rec: BridgeShutdown = serde_json::from_str(&fixture("progress.json")).unwrap();
+        assert_eq!(rec.pid, 4242);
+        assert_eq!(rec.pid_token.as_deref(), Some(TOKEN));
+        assert_eq!(rec.tasks, vec!["background job: compaction", "chat reply"]);
+        assert_eq!(rec.count, Some(2));
+        assert_eq!(rec.reason.as_deref(), Some("user_stop"));
+        assert_eq!(rec.phase.as_deref(), Some("stopping"));
+    }
+
+    #[test]
+    fn stop_intent_and_request_fixtures_parse() {
+        for name in ["stop_intent_pending.json", "stop_intent_committed.json", "hard_exit_request.json"] {
+            let v: serde_json::Value = serde_json::from_str(&fixture(name)).unwrap();
+            assert_eq!(v.get("pid").and_then(|p| p.as_i64()), Some(4242), "{}", name);
+            assert_eq!(v.get("pid_token").and_then(|p| p.as_str()), Some(TOKEN), "{}", name);
+        }
+        let committed: serde_json::Value = serde_json::from_str(&fixture("stop_intent_committed.json")).unwrap();
+        assert_eq!(committed.get("state").and_then(|s| s.as_str()), Some("committed"));
+    }
+
+    #[test]
+    fn status_fixture_carries_the_kill_bound_the_formula_gives() {
+        let v: serde_json::Value = serde_json::from_str(&fixture("status.json")).unwrap();
+        let bound = v.get("kill_bound_s").and_then(|b| b.as_f64()).unwrap();
+        assert_eq!(bound as u64, kill_bound_s(KILL_TIMEOUT_S, false));
+        assert_eq!(kill_bound_s(KILL_TIMEOUT_S, true), 2 * MANAGER_CAP_S + KILL_TIMEOUT_S);
+        assert_eq!(v.get("alive").and_then(|a| a.as_str()), Some("alive"));
+        assert!(v.get("stop_intent").and_then(|i| i.get("state")).is_some());
+    }
+
+    #[test]
+    fn a_progress_record_is_read_only_for_the_bridge_bridge_json_names() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(STOP_PROGRESS_FILE), fixture("progress.json")).unwrap();
+        bridge_json(dir.path(), TOKEN);
+        let rec = read_bridge_shutdown_at(dir.path()).unwrap();
+        assert!(rec.is_some());
+        bridge_json(dir.path(), "linux:other:4242:1");
+        assert!(read_bridge_shutdown_at(dir.path()).unwrap().is_none());
+        std::fs::write(dir.path().join("bridge.json"), r#"{"port": 5000, "pid": 4242}"#).unwrap();
+        assert!(read_bridge_shutdown_at(dir.path()).unwrap().is_none()); // a pre-PR bridge has no record
+    }
+
+    #[test]
+    fn hard_exit_request_names_the_current_bridge() {
+        let dir = tempfile::TempDir::new().unwrap();
+        bridge_json(dir.path(), TOKEN);
+        write_hard_exit_request_at(dir.path()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join(HARD_EXIT_REQUEST_FILE)).unwrap()).unwrap();
+        let fx: serde_json::Value = serde_json::from_str(&fixture("hard_exit_request.json")).unwrap();
+        let keys = |x: &serde_json::Value| {
+            let mut k: Vec<String> = x.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        assert_eq!(keys(&v), keys(&fx));
+        assert_eq!(v.get("pid").and_then(|p| p.as_i64()), Some(4242));
+        assert_eq!(v.get("pid_token").and_then(|p| p.as_str()), Some(TOKEN));
+        let empty = tempfile::TempDir::new().unwrap();
+        assert_eq!(write_hard_exit_request_at(empty.path()).unwrap_err(), ERR_MISSING_PID);
+    }
+
+    #[test]
+    fn force_restart_runs_the_kill_helper_and_never_kills_by_pid_itself() {
+        // C35: the forced path is `nell supervisor stop --kill`; no direct signal or TerminateProcess anywhere here.
+        let src = include_str!("lib.rs");
+        let start = src.find("async fn force_restart_bridge(").unwrap();
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        assert!(body.contains("\"--kill\""));
+        assert!(!body.contains("kill_on_drop"));
+        let direct_kill = concat!("libc::", "kill(");
+        let terminate = concat!("Terminate", "Process(");
+        assert!(!src.contains(direct_kill));
+        assert!(!src.contains(terminate));
     }
 }

@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import type { ReactNode } from "react";
 import { installNellCliSymlink, installSupervisorService } from "../../appConfig";
-import type { PersonaState, ChatModel, PronounPreset } from "../../bridge";
+import type { PersonaState, ChatModel, PronounPreset, SupervisorInfo } from "../../bridge";
 import { getClientPlatform, platformLabel, detectInstallShape, supportsNellCliShortcut } from "../../platform";
 import type { InstallShape } from "../../platform";
 import { Divider, PanelShell, SectionLabel, Toggle } from "../ui";
@@ -240,7 +240,7 @@ export function ConnectionPanel({
       <Row label="Heartbeat" value={formatHeartbeat(conn?.last_heartbeat_at)} />
       <Row label="Privacy" value="Local-only" accent />
 
-      <StatusBanner mode={mode} stateError={stateError} persona={persona} />
+      <StatusBanner mode={mode} stateError={stateError} persona={persona} supervisor={state?.supervisor ?? null} />
 
       <Divider />
       <RecoverLauncher persona={persona} />
@@ -682,10 +682,13 @@ function StatusBanner({
   mode,
   stateError,
   persona,
+  supervisor = null,
 }: {
   mode: PersonaState["mode"];
   stateError: string | null;
   persona: string;
+  /** #456 (Q6): the brain's background loop restarted after an error, or stopped after repeated ones. */
+  supervisor?: SupervisorInfo | null;
 }) {
   // Pick the worst signal — bridge_down is more critical than provider_down.
   let kind: "warning" | "error" | null = null;
@@ -709,6 +712,18 @@ function StatusBanner({
     headline = "LLM provider unreachable.";
     detail =
       "Replies will fall back to a local backup voice. Check that `claude` is on PATH for the launchd agent.";
+  } else if (supervisor?.state === "failed") {
+    kind = "warning";
+    headline = "Background work stopped.";
+    detail =
+      "The brain's background work stopped after repeated errors. Chat still works; restart the brain to try again." +
+      (supervisor.last_error ? ` Last error: ${supervisor.last_error}` : "");
+  } else if (supervisor?.state === "restarted") {
+    kind = "warning";
+    headline = "Background work restarted.";
+    detail =
+      "The brain's background work hit an error and started again." +
+      (supervisor.last_error ? ` Error: ${supervisor.last_error}` : "");
   }
 
   if (kind === null) return null;

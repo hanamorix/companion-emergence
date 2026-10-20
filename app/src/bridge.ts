@@ -201,6 +201,8 @@ export interface PersonaState {
    *  `kept_as` is the kept-aside file name (null for "unreadable"). Null/absent when there is nothing to say. Optional so
    *  older bridge builds degrade to no notice. */
   tunables_notice?: TunablesNotice | null;
+  /** #456 (Q6): the supervisor's state ("restarted" with its error, or "failed"); absent on older bridges. */
+  supervisor?: SupervisorInfo | null;
 }
 
 /** See `PersonaState.tunables_notice`. */
@@ -556,38 +558,98 @@ export async function snapshotActiveSession(
 }
 
 /**
- * Trigger bridge graceful shutdown. Returns 202 immediately; the actual
- * 30s drain runs server-side via SIGTERM/lifespan teardown. Returns the
- * raw Response so the caller can distinguish 202 (scheduled) from a
- * network error (bridge already gone — also a valid "shutdown complete"
- * signal per spec §6.4).
+ * Ask the bridge to stop (#456). 202: the stop began. 503 `{"code": "bridge_stopping"}`: it had begun already. The
+ * stop itself waits for everything running to finish (no time limit); follow it with `readBridgeShutdown` and
+ * `bridgeStatus`, never over HTTP (the listener closes once the stop begins). `reason` is "app_restart" for the
+ * app's restarts; none = the bridge records "manual_restart".
  */
 export async function shutdownBridge(
   persona: string,
   signal?: AbortSignal,
+  reason?: "app_restart" | "user_stop",
 ): Promise<Response> {
   return bridgeFetch(persona, (creds) =>
     fetch(`${creds.url}/supervisor/shutdown`, {
       method: "POST",
       headers: authHeaders(creds),
+      body: reason ? JSON.stringify({ reason }) : undefined,
       signal,
     }),
   );
 }
 
 /**
- * Tauri SIGKILL fallback for the restart-bridge flow. Reads pid from
- * bridge.json, sends SIGKILL (or TerminateProcess on Windows), waits
- * 500ms for OS reap, then re-spawns via ensure_bridge_running. Rejects
- * with a structured error string when bridge.json lacks the pid field
- * (older bridges) — the UI shows the message verbatim.
+ * The forced path (#456 D10): `nell supervisor stop --kill` (identity-checked; the bridge and every process it
+ * started), then the normal start, inside Rust. `skipHardExitRequest`: after a hard exit the bridge ignored, do not
+ * ask it again. Rejects with the helper's error (or `force_restart_timeout` when the kill is still running).
  */
-export async function invokeForceRestart(persona: string): Promise<void> {
+export async function invokeForceRestart(persona: string, skipHardExitRequest = false): Promise<void> {
   try {
-    await invoke<void>("force_restart_bridge", { persona });
+    await invoke<void>("force_restart_bridge", { persona, skipHardExitRequest });
   } finally {
     // The respawned bridge writes a new port and token to bridge.json (#365).
     resetBridgeCredentialCache(persona);
+  }
+}
+
+/** The stop progress record of the current bridge (#456; tests/fixtures/bridge_watcher_files/progress.json). */
+export interface BridgeShutdown {
+  version?: number;
+  pid: number;
+  pid_token: string | null;
+  persona?: string | null;
+  phase?: string | null;
+  requested_at?: string | null;
+  reason?: string | null;
+  tasks: string[];
+  count?: number | null;
+  updated_at?: string | null;
+}
+
+/** The progress record of the bridge bridge.json names, or null (no stop recorded, or a record of another process). */
+export async function readBridgeShutdown(persona: string): Promise<BridgeShutdown | null> {
+  return invoke<BridgeShutdown | null>("read_bridge_shutdown", { persona });
+}
+
+/** Ask the current bridge (its pid + identity token) for a hard exit (#456 D17). */
+export async function requestBridgeHardExit(persona: string): Promise<void> {
+  await invoke<void>("request_bridge_hard_exit", { persona });
+}
+
+/** The supervisor's state (#456 Q6): "running" | "restarted" | "failed" | "stopped" | "starting". */
+export interface SupervisorInfo {
+  state: string;
+  restarts: number;
+  last_error: string | null;
+  last_error_at: string | null;
+}
+
+/** `nell supervisor status --json` (#456; tests/fixtures/bridge_watcher_files/status.json). */
+export interface BridgeStatus {
+  alive: "alive" | "gone" | "unknown";
+  legacy?: boolean;
+  proven?: boolean;
+  pid?: number | null;
+  pid_token?: string | null;
+  identity?: string | null;
+  phase?: string | null;
+  stop_reason?: string | null;
+  stop_requested_at?: string | null;
+  stop_intent?: { state: string; pid: number; pid_token: string | null; reason?: string } | null;
+  remaining?: { count: number | null; tasks: string[] | null } | null;
+  client_origin?: string | null;
+  service_installed?: boolean;
+  recovery_needed?: boolean;
+  supervisor?: SupervisorInfo | null;
+  kill_bound_s?: number;
+}
+
+/** The bridge's status from files and process checks only (no HTTP). A timeout or failure is "unknown". */
+export async function bridgeStatus(persona: string): Promise<BridgeStatus> {
+  try {
+    return await invoke<BridgeStatus>("bridge_status", { persona });
+  } catch {
+    return { alive: "unknown" };
   }
 }
 
