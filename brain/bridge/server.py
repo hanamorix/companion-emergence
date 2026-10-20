@@ -1080,6 +1080,8 @@ class BridgeAppState:
     in_flight_locks: dict[str, asyncio.Lock]
     last_chat_at: datetime | None = None
     supervisor_thread: Any | None = None
+    # #456 (Q6): the supervisor's state ("running" / "restarted" / "failed" ...), shown on /health and /persona/state.
+    supervisor_status: Any | None = None
     migration_thread: Any | None = None  # compaction-backlog-migration (None when background threads are off)
     auth_token: str | None = None
     shutdown_controller: BridgeShutdownController | None = None
@@ -1382,7 +1384,7 @@ def build_app(
         bridge_started_at = datetime.now(UTC)
 
         # Spawn supervisor thread (non-daemon — joins on shutdown)
-        from brain.bridge.supervisor import run_folded
+        from brain.bridge import supervisor as _supervisor_mod
 
         def _is_session_busy(sid: str) -> bool:
             """Best-effort cross-thread check: is a request in-flight for ``sid``?
@@ -1412,14 +1414,19 @@ def build_app(
             # #456 (D1): the supervisor is a counted task from before its thread starts until its loop returns.
             sup_handle = shutdown_progress.registry.register("supervisor")
 
+            sup_status = _supervisor_mod.SupervisorStatus()
+            app.state.bridge.supervisor_status = sup_status
+
             def _run_supervisor() -> None:
                 try:
                     if hooks is not None:
                         stop_event.wait()
                         _wait_for_file(hooks["supervisor_hold"])
                         return
-                    run_folded(
-                        stop_event=stop_event,
+                    # #456 (D9): a loop death restarts the loop; a startup death re-runs the startup once.
+                    _supervisor_mod.run_supervised(
+                        stop_event,
+                        status=sup_status,
                         persona_dir=persona_dir,
                         provider=provider,
                         event_bus=bus,
@@ -1670,6 +1677,8 @@ def build_app(
             "sessions_active": len(all_sessions()),
             "last_chat_at": s.last_chat_at.isoformat() if s.last_chat_at else None,
             "supervisor_thread": sup_status,
+            # #456 (Q6): "running" / "restarted" (with the error) / "failed" / "stopped", or None (not started).
+            "supervisor": s.supervisor_status.as_dict() if s.supervisor_status is not None else None,
             "health_scan": health_scan,
             "health_error": health_error,
             "pending_alarms": len(alarms),
@@ -1817,7 +1826,11 @@ def build_app(
         """
         from brain.bridge.persona_state import build_persona_state
 
-        return build_persona_state(persona_dir)
+        state = build_persona_state(persona_dir)
+        sup_state = app.state.bridge.supervisor_status
+        if isinstance(state, dict):
+            state["supervisor"] = sup_state.as_dict() if sup_state is not None else None  # #456 (Q6)
+        return state
 
     # ── /persona/feed — visible inner life journal ──────────────────────────
     @app.get("/persona/feed", dependencies=[Depends(require_http_auth)])
