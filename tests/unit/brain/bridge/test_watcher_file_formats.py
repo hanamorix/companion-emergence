@@ -43,7 +43,9 @@ def test_hard_exit_request_matches_the_fixture():
 def test_stop_intent_matches_the_fixture(state):
     rec = shutdown_progress.stop_intent(pid=4242, pid_token=TOKEN, state=state, nonce="a1b2c3d4e5f60718",
                                         at="2026-10-19T21:04:00.000000+00:00",
-                                        boot="0b9c2f4e-1111-2222-3333-444455556666", legacy=False)
+                                        boot="0b9c2f4e-1111-2222-3333-444455556666", legacy=False,
+                                        helper_pid=5151,
+                                        helper_token="linux:0b9c2f4e-1111-2222-3333-444455556666:5151:654321")
     assert rec == _fixture(f"stop_intent_{state}.json")
 
 

@@ -274,8 +274,10 @@ def hard_exit_request(*, pid: int, pid_token: str | None, requested_at: str) -> 
 
 def stop_intent(
     *, pid: int, pid_token: str | None, state: str, nonce: str, at: str, boot: str | None, legacy: bool,
+    helper_pid: int, helper_token: str | None,
 ) -> dict[str, Any]:
-    """The stop intent (kill helper only): ``state`` "pending" | "committed"; ``boot`` the Linux boot id or None."""
+    """The stop intent (kill helper only): ``state`` "pending" | "committed"; ``boot`` the Linux boot id or None;
+    ``helper_pid`` + ``helper_token`` the helper that wrote it (a committed intent of a helper that is gone is stale)."""
     return {
         "version": FORMAT_VERSION,
         "pid": pid,
@@ -286,6 +288,8 @@ def stop_intent(
         "at": at,
         "boot": boot,
         "legacy": legacy,
+        "helper_pid": helper_pid,
+        "helper_token": helper_token,
     }
 
 

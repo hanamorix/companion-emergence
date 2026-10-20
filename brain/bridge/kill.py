@@ -26,6 +26,7 @@ committed intent (the respawn guard honours it). Stop signals are ignored while 
 from __future__ import annotations
 
 import logging
+import os
 import secrets
 import signal
 import sys
@@ -213,6 +214,26 @@ def _terminate_exit_0(pid: int) -> None:  # pragma: no cover - Windows CI leg
             k32.CloseHandle(handle)
 
 
+def _helper_may_run(intent: dict) -> bool:
+    """May the helper that committed ``intent`` still be running? (review S3) A helper killed after its commit leaves
+    the intent behind; once that helper is gone the intent no longer blocks a new kill. An intent that names no
+    helper (or one whose identity cannot be read) counts as running until it is older than the helper's stated bound."""
+    from brain import process_identity
+
+    hp, ht = intent.get("helper_pid"), intent.get("helper_token")
+    if isinstance(hp, int) and isinstance(ht, str) and ht:
+        live = process_identity.matches(hp, ht)
+        if live == process_identity.GONE:
+            return False
+        if live == "alive":
+            return True
+    try:
+        at = datetime.fromisoformat(str(intent.get("at"))).timestamp()
+    except ValueError:
+        return True
+    return time.time() - at <= kill_bound_s(DEFAULT_TIMEOUT_S)
+
+
 def _other_live_bridge(persona_dir: Path, target_pid: int) -> bool:
     """Has another bridge started for this persona meanwhile? (the record names another ALIVE pid)."""
     st = state_file.read(persona_dir)
@@ -259,6 +280,7 @@ def kill_bridge(
         and cur_intent.get("state") == "committed"
         and cur_intent.get("pid") == st.pid
         and cur_intent.get("pid_token") == st.pid_token
+        and _helper_may_run(cur_intent)
     ):
         # C45 (i): another helper has committed to killing this bridge; never downgrade or delete its intent.
         return KillResult("in_progress", "another kill of this bridge is in progress")
@@ -299,7 +321,8 @@ def kill_bridge(
                 prev[sig] = signal.signal(sig, _raise)
         intent = shutdown_progress.stop_intent(
             pid=st.pid, pid_token=st.pid_token, state="pending", nonce=nonce, at=datetime.now(UTC).isoformat(),
-            boot=process_identity.boot_id(), legacy=legacy,
+            boot=process_identity.boot_id(), legacy=legacy, helper_pid=os.getpid(),
+            helper_token=process_identity.own_token(),
         )
         _write_intent(persona_dir, intent)
 

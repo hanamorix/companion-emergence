@@ -469,3 +469,29 @@ def test_only_the_first_stop_signal_interrupts_the_helper(tmp_path, fake):
     assert seen["second"] == "ignored"
     assert _intent(b.pd) is None
     assert all(s not in ("gone", psutil.STATUS_STOPPED) for s in b.statuses().values())
+
+
+def test_a_committed_intent_whose_helper_is_gone_does_not_block_a_new_kill(tmp_path, fake):
+    """Review S3: a helper killed after its commit leaves a committed intent naming a live bridge; once that helper is
+    gone the intent is stale and a later kill proceeds (and finishes a frozen bridge)."""
+    b = fake()
+    st = state_file.read(b.pd)
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    stale = {"pid": b.pid, "pid_token": st.pid_token, "reason": "user_kill", "state": "committed", "nonce": "bbbb",
+             "at": "2026-10-19T21:04:00.000000+00:00", "boot": None, "legacy": False,
+             "helper_pid": dead.pid, "helper_token": f"linux:gone:{dead.pid}:1"}
+    kill._write_intent(b.pd, stale)
+    psutil.Process(b.pid).suspend()  # the dead helper had frozen it
+    r = kill.kill_bridge(b.pd, timeout=5)
+    assert r.outcome == "killed"
+    assert b.all_gone()
+
+
+def test_the_intent_names_the_helper(tmp_path, fake):
+    """Review S3: the intent carries the helper's own pid + identity token."""
+    b = fake()
+    seen: list = []
+    kill.kill_bridge(b.pd, timeout=10, _hooks={"after_enumeration": lambda: seen.append(_intent(b.pd))})
+    assert seen[0]["helper_pid"] == os.getpid()
+    assert seen[0]["helper_token"] == pi.own_token()
