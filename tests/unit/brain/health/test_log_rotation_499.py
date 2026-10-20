@@ -96,7 +96,7 @@ class Faults:
         monkeypatch.setattr("time.sleep", lambda _s: None)
 
     def fail(self, suffix: str, exc=None, times: int | None = None):
-        self.rules.append((suffix, exc or OSError(28, "disk full"), times))
+        self.rules.append((suffix, exc or OSError(errno.EIO, "I/O error"), times))
 
     def clear(self):
         self.rules.clear()
@@ -107,8 +107,8 @@ def _tick(log: Path, keep: int):
 
 
 def _clean_final(tmp_path: Path, keep: int, present: tuple[int, ...] | None = None) -> dict[str, bytes]:
-    d = tmp_path / "clean"
-    d.mkdir()
+    d = tmp_path.with_name(tmp_path.name + "_clean")
+    d.mkdir(exist_ok=True)
     log = _setup(d, keep, present)
     _tick(log, keep)
     return _state(log)
@@ -150,8 +150,13 @@ def test_g17a_a_failed_archive_write_three_ticks_in_a_row_loses_nothing(tmp_path
     if how == "staging-replace":
         faults.fail(".next.gz")
     else:
+        real_open = gzip.open
+
         def boom(*a, **k):
-            raise OSError(28, "disk full")
+            mode = a[1] if len(a) > 1 else k.get("mode", "rb")
+            if "w" in mode:  # only the compression of the new archive fails; reading archives still works
+                raise OSError(errno.EIO, "I/O error")
+            return real_open(*a, **k)
 
         monkeypatch.setattr(lr.gzip, "open", boom)
     for _ in range(3):
@@ -166,7 +171,7 @@ def test_g17a_a_failed_archive_write_three_ticks_in_a_row_loses_nothing(tmp_path
 # --- (b) the publish fails ---------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("exc", [OSError(28, "disk full"), PermissionError(32, "held")])
+@pytest.mark.parametrize("exc", [OSError(errno.EIO, "I/O error"), PermissionError(32, "held")])
 def test_g17b_a_failed_publish_loses_only_the_one_normal_eviction(tmp_path, monkeypatch, exc):
     log = _setup(tmp_path, 3)
     orig = log.read_bytes()

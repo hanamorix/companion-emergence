@@ -5,10 +5,10 @@ Four policies, each a function over a single log path. Every one of them runs un
 appended while a rotation runs waits for it instead of being truncated or rewritten away (#476).
 The size is re-checked under the lock, since a peer may have rotated while this one waited:
 
-* :func:`rotate_rolling_size` — size-capped rolling archive. The active
-  log is renamed once it crosses ``max_bytes``, gzipped to ``.1.gz``,
-  and older archives shift up (``.1.gz`` → ``.2.gz`` → ...). The oldest
-  beyond ``archive_keep`` is deleted. Used for noisy logs where deep
+* :func:`rotate_rolling_size` — size-capped rolling archive. Once the active
+  log crosses ``max_bytes`` it is gzipped to ``.1.gz`` (written first, to a staging
+  file), and older archives shift up (``.1.gz`` → ``.2.gz`` → ...). The oldest
+  beyond ``archive_keep`` is dropped. Used for noisy logs where deep
   history doesn't carry per-line value (heartbeats, dreams,
   emotion_growth).
 
@@ -35,8 +35,11 @@ Plan: docs/superpowers/plans/2026-05-11-jsonl-log-retention.md
 
 from __future__ import annotations
 
+import errno
 import gzip
+import io
 import logging
+import os
 import shutil
 from collections import Counter
 from collections.abc import Iterator
@@ -45,7 +48,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.health.json_io import Recovery, iter_jsonl_raw, write_jsonl
-from brain.utils.atomic_write import _replace_with_retry
+from brain.utils.atomic_write import _replace_with_retry, save_bytes_atomic
 from brain.utils.file_lock import file_lock
 from brain.utils.time import lenient_utc
 
@@ -85,14 +88,15 @@ def rotate_rolling_size(
     Returns the path of the new ``.1.gz`` archive on rotation, or ``None``
     if no rotation was needed (file missing or below cap).
 
-    Algorithm:
+    Algorithm (#499: the new archive is written before anything is moved or evicted):
 
     1. Stat the file. Below cap → no-op.
-    2. Shift existing archives up: ``.N.gz`` → ``.(N+1).gz`` (delete the
-       oldest beyond ``archive_keep``).
-    3. Gzip the active log to a temp path next to it, then atomically
-       rename to ``.1.gz``.
-    4. Truncate the active log to zero bytes (writers reopen per
+    2. Gzip the active log into memory and write it to the staging file ``<log>.next.gz`` through the shared atomic
+       writer. If that fails, nothing else has been touched.
+    3. Move the existing archives up into the first empty slot (``.N.gz`` → ``.(N+1).gz``; the move into the last
+       slot overwrites the oldest beyond ``archive_keep``, which is the normal eviction).
+    4. Publish the staging file as ``.1.gz``.
+    5. Truncate the active log to zero bytes (writers reopen per
        append, so this is safe).
 
     ``lock_held=True`` is for a caller that already holds ``file_lock(log_path)`` for its own
@@ -120,32 +124,52 @@ def _over(log_path: Path, max_bytes: int) -> bool:
 
 
 def _rotate_rolling_locked(log_path: Path, archive_keep: int) -> Path:
-    # 1. Shift existing archives up. Iterate from oldest to newest so
-    #    we never overwrite a slot before it's been moved.
-    for i in range(archive_keep, 0, -1):
-        src = _archive_path(log_path, i)
-        if not src.exists():
-            continue
-        if i == archive_keep:
-            # Oldest beyond the keep window — evict.
-            src.unlink()
-        else:
-            dst = _archive_path(log_path, i + 1)
-            src.rename(dst)
+    """Archive the active log as ``.1.gz``, losing no retained archive and no log row if anything goes wrong (#499).
 
-    # 2. Gzip the active log to a temp path, then atomic-rename into place.
+    The new archive is written FIRST, to the staging file ``<log>.next.gz``; only when that write succeeded are the
+    old archives moved up, so a full disk or a permission error can no longer cost an archive. The move is
+    gap-aware and re-runnable: it fills the first empty slot instead of assuming ``.1`` is the one to free, and the
+    oldest archive is evicted only by being overwritten by the move that replaces it (never by an explicit delete),
+    so the archives plus the staging file never fall below ``archive_keep`` after the one normal eviction. A failed
+    or killed publish leaves ``.1`` empty and the next rotation just publishes again; a stale staging file is
+    rewritten (its rows are a prefix of the still-untruncated log). The active log is truncated last. The one window
+    left (a kill between the publish and the truncation archives those rows twice on the next rotation) is the one
+    this code has always had.
+    """
     new_archive = _archive_path(log_path, 1)
-    tmp_archive = new_archive.with_suffix(new_archive.suffix + ".tmp")
-    try:
-        with log_path.open("rb") as src, gzip.open(tmp_archive, "wb") as gz:
-            shutil.copyfileobj(src, gz)
-        tmp_archive.rename(new_archive)
-    except Exception:
-        # Clean up partial temp. Leave active log untouched.
-        tmp_archive.unlink(missing_ok=True)
-        raise
+    staging = log_path.with_name(log_path.name + ".next.gz")
 
-    # 3. Truncate the active log. Appenders wait on the lock held here, so nothing is truncated away.
+    # 1. Compress the active log into memory (read as a stream; the buffer holds the compressed result only).
+    buf = io.BytesIO()
+    with log_path.open("rb") as src, gzip.open(buf, "wb") as gz:
+        shutil.copyfileobj(src, gz)
+    data = buf.getvalue()
+
+    # 2. Write the staging file through the shared atomic writer. Nothing else is touched unless this succeeds.
+    try:
+        save_bytes_atomic(staging, data)
+    except OSError as exc:
+        if exc.errno != errno.ENOSPC or not all(_archive_path(log_path, n).exists() for n in range(1, archive_keep + 1)):
+            raise
+        # A full disk with every slot occupied: free the ONE archive a successful rotation would evict anyway, then
+        # try once more. Never more than this per rotation; after it a slot is empty, so a later failing rotation
+        # evicts nothing.
+        logger.warning("rotating %s: disk full; evicting the oldest archive to make room", log_path.name)
+        _archive_path(log_path, archive_keep).unlink(missing_ok=True)
+        save_bytes_atomic(staging, data)
+
+    # 3. Move the archives up into the first empty slot (all slots occupied: the move into the last slot overwrites,
+    #    and so evicts, the oldest).
+    first_empty = next(
+        (n for n in range(1, archive_keep + 1) if not _archive_path(log_path, n).exists()), archive_keep + 1
+    )
+    for i in range(min(first_empty, archive_keep) - 1, 0, -1):
+        os.replace(_archive_path(log_path, i), _archive_path(log_path, i + 1))  # atomic-write: ok -- the rotation's shift is a plain rename of a finished archive up one slot, not a write
+
+    # 4. Publish the staged archive as .1.gz.
+    _replace_with_retry(staging, new_archive)  # atomic-write: ok -- publishes the finished, fsynced staging file by rename (the write above went through the shared writer)
+
+    # 5. Truncate the active log. Appenders wait on the lock held here, so nothing is truncated away.
     rotated_bytes = log_path.stat().st_size  # before the truncation: the size that went into the archive
     log_path.write_bytes(b"")
 
@@ -262,15 +286,13 @@ def _merge_into_year_archive(archive_path: Path, new_lines: list[str]) -> None:
             held[raw] -= 1
         else:
             to_add.append(raw)
-    tmp_path = archive_path.with_suffix(archive_path.suffix + ".tmp")
-    try:
-        with gzip.open(tmp_path, "wt", encoding="utf-8") as gz:  # json-io: ok -- raw-line gz archive: lines pass through unchanged, json_io has no gz writer
-            for raw in (*existing, *to_add):
-                gz.write(raw + "\n")
-        _replace_with_retry(tmp_path, archive_path)
-    except Exception:
-        tmp_path.unlink(missing_ok=True)
-        raise
+    buf = io.BytesIO()
+    with gzip.open(buf, "wt", encoding="utf-8", newline="\n") as gz:  # json-io: ok -- raw-line gz archive: lines pass through unchanged, json_io has no gz writer
+        for raw in (*existing, *to_add):
+            gz.write(raw + "\n")
+    # The shared atomic writer: a unique temp, fsync, one retried replace; a failure at any step removes the temp
+    # and leaves the existing archive as it was.
+    save_bytes_atomic(archive_path, buf.getvalue())
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +313,7 @@ def rotate_single_backup(log_path: Path, max_bytes: int) -> None:
     with _append_lock(log_path):
         if _exceeds(log_path, max_bytes):
             # replace() overwrites an existing .1 atomically on every OS.
-            log_path.replace(log_path.with_name(f"{log_path.name}.1"))
+            log_path.replace(log_path.with_name(f"{log_path.name}.1"))  # atomic-write: ok -- moves the finished log aside to .1 (a rename of a finished file, not a write)
 
 
 def _exceeds(log_path: Path, max_bytes: int) -> bool:
