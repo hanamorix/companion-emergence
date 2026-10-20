@@ -178,6 +178,29 @@ def close_session(
     provider: LLMProvider,
     config: dict | None = None,
 ) -> IngestReport:
+    """Close one session under its extraction lock (#477): a close that finds another extraction running skips (``busy``).
+
+    Without the lock a close extracts and deletes the buffer while the stale sweep, a rollover or the snapshot route is
+    mid-extraction of the same turns: both commit them, and the snapshot then writes a cursor for a deleted session.
+    """
+    with file_lock(extract_lock_path(persona_dir, session_id), blocking=False) as acquired:
+        if not acquired:
+            logger.info("conversation_close_busy session=%s: another extraction is running", session_id)
+            return IngestReport(session_id=session_id, busy=True)
+        return _close_session_locked(
+            persona_dir, session_id, store=store, hebbian=hebbian, provider=provider, config=config
+        )
+
+
+def _close_session_locked(
+    persona_dir: Path,
+    session_id: str,
+    *,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    provider: LLMProvider,
+    config: dict | None = None,
+) -> IngestReport:
     """Run the full 8-stage ingest pipeline on one session and delete its buffer.
 
     Parameters
@@ -696,18 +719,25 @@ def finalize_stale_sessions(
             # doesn't block the finalize loop indefinitely. This is the ONLY
             # buffer-lifecycle action finalize still performs (quarantine of
             # corrupt input); the successful path no longer deletes.
-            src = persona_dir / "active_conversations" / f"{sid}.jsonl"
-            poison_dir = persona_dir / "active_conversations" / "poison"
-            poison_dir.mkdir(parents=True, exist_ok=True)
-            dst = poison_dir / f"{sid}.jsonl"
-            src.rename(dst)
-            delete_cursor(persona_dir, sid)
-            delete_backoff(persona_dir, sid)
-            logger.warning(
-                "conversation_finalize_deadletter session=%s failures=%d — moved to poison/",
-                sid,
-                backoff["failures"],  # type: ignore[index]
-            )
+            # Under the session's extraction lock (#477), non-blocking: a pass that holds it (the busy
+            # snapshot above, a rollover's poison_unextracted_span) must not have the buffer renamed and
+            # the cursor deleted under it; the next finalize tick retries.
+            with file_lock(extract_lock_path(persona_dir, sid), blocking=False) as acquired:
+                if not acquired:
+                    logger.info("conversation_finalize_deadletter_busy session=%s: another extraction holds it", sid)
+                else:
+                    src = persona_dir / "active_conversations" / f"{sid}.jsonl"
+                    poison_dir = persona_dir / "active_conversations" / "poison"
+                    poison_dir.mkdir(parents=True, exist_ok=True)
+                    dst = poison_dir / f"{sid}.jsonl"
+                    src.rename(dst)
+                    delete_cursor(persona_dir, sid)
+                    delete_backoff(persona_dir, sid)
+                    logger.warning(
+                        "conversation_finalize_deadletter session=%s failures=%d — moved to poison/",
+                        sid,
+                        backoff["failures"],  # type: ignore[index]
+                    )
         reports.append(report)
         logger.info(
             "conversation_finalized session=%s silence_hours=%.2f "

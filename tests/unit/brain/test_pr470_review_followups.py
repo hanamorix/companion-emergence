@@ -75,3 +75,130 @@ def test_soul_parse_decision_returns_a_decision_for_a_reply_nested_past_the_recu
     decision = parse_decision(raw, "cand-1")
     assert decision.decision == "defer"
     assert decision.parse_error
+
+
+# --- item 2: one extraction per session (#477): close and finalize -----------------------------------------------------
+
+
+class _CountingProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def name(self):
+        return "stub"
+
+    def healthy(self):
+        return True
+
+    def generate(self, prompt=None, *, system=None, **kw):
+        self.calls += 1
+        return "[]"
+
+
+@pytest.fixture
+def world(tmp_path):
+    import json
+
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import MemoryStore
+
+    persona = tmp_path / "persona"
+    (persona / "active_conversations").mkdir(parents=True)
+    (persona / "persona_config.json").write_text(json.dumps({"provider": "fake", "searcher": "fake"}), encoding="utf-8")
+    store = MemoryStore(persona / "memories.db")
+    hebbian = HebbianMatrix(persona / "hebbian.db")
+    yield persona, store, hebbian
+    store.close()
+    hebbian.close()
+
+
+def _seed(persona, sid):
+    from datetime import UTC, datetime, timedelta
+
+    from brain.ingest.buffer import ingest_turn
+
+    old = datetime(2026, 1, 1, tzinfo=UTC)
+    for i in range(4):
+        ingest_turn(
+            persona,
+            {
+                "session_id": sid,
+                "speaker": "user" if i % 2 == 0 else "assistant",
+                "text": f"turn {i}",
+                "ts": (old + timedelta(minutes=i)).isoformat(),
+            },
+        )
+    return persona / "active_conversations" / f"{sid}.jsonl"
+
+
+def test_close_session_skips_while_another_extraction_holds_the_session(world):
+    # Fails on 584ec8a1: close_session takes no extraction lock, so it extracts and DELETES the buffer while a snapshot pass
+    # (the stale sweep, a rollover, /sessions/snapshot) is mid-extraction of the same turns.
+    from brain.ingest.buffer import extract_lock_path
+    from brain.ingest.pipeline import close_session
+    from brain.utils.file_lock import file_lock
+
+    persona, store, hebbian = world
+    sid = "sess_close_busy"
+    buf = _seed(persona, sid)
+    provider = _CountingProvider()
+    with file_lock(extract_lock_path(persona, sid), blocking=False) as held:
+        assert held
+        report = close_session(persona, sid, store=store, hebbian=hebbian, provider=provider)
+    assert report.busy is True
+    assert provider.calls == 0
+    assert buf.exists()
+
+
+def test_close_session_still_closes_when_nothing_holds_the_session(world):
+    # PIN (passes on 584ec8a1): the lock is only taken, never left held, and a free session closes as before.
+    from brain.ingest.pipeline import close_session
+
+    persona, store, hebbian = world
+    sid = "sess_close_free"
+    buf = _seed(persona, sid)
+    provider = _CountingProvider()
+    report = close_session(persona, sid, store=store, hebbian=hebbian, provider=provider)
+    assert report.busy is False
+    assert provider.calls >= 1
+    assert not buf.exists()
+
+
+def test_finalize_does_not_poison_a_session_another_extraction_holds(world, caplog):
+    # Fails on 584ec8a1: the snapshot reports busy, but finalize still reads the backoff sidecar and renames the buffer into
+    # poison/ (and deletes its cursor) under the pass that holds the session.
+    import logging
+    from datetime import UTC, datetime, timedelta
+
+    from brain.ingest.buffer import extract_lock_path, read_backoff, write_backoff
+    from brain.ingest.pipeline import finalize_stale_sessions
+    from brain.utils.file_lock import file_lock
+
+    persona, store, hebbian = world
+    sid = "sess_finalize_busy"
+    buf = _seed(persona, sid)
+    write_backoff(persona, sid, failures=3, first_failure_at=(datetime.now(UTC) - timedelta(hours=1)).isoformat())
+    with caplog.at_level(logging.INFO), file_lock(extract_lock_path(persona, sid), blocking=False) as held:
+        assert held
+        reports = finalize_stale_sessions(persona, store=store, hebbian=hebbian, provider=_CountingProvider())
+    assert [r.busy for r in reports] == [True]
+    assert buf.exists()
+    assert not (persona / "active_conversations" / "poison" / f"{sid}.jsonl").exists()
+    assert "conversation_finalize_deadletter_busy" in caplog.text
+    assert read_backoff(persona, sid) is not None  # left for the next tick: the failure record is kept too
+
+
+def test_finalize_still_poisons_a_session_nothing_holds(world):
+    # PIN (passes on 584ec8a1): with the lock free the dead-letter move happens as before.
+    from datetime import UTC, datetime
+
+    from brain.ingest.buffer import write_backoff
+    from brain.ingest.pipeline import finalize_stale_sessions
+
+    persona, store, hebbian = world
+    sid = "sess_finalize_free"
+    buf = _seed(persona, sid)
+    write_backoff(persona, sid, failures=3, first_failure_at=datetime.now(UTC).isoformat())  # inside the backoff window: the snapshot is skipped
+    finalize_stale_sessions(persona, store=store, hebbian=hebbian, provider=_CountingProvider())
+    assert not buf.exists()
+    assert (persona / "active_conversations" / "poison" / f"{sid}.jsonl").exists()
