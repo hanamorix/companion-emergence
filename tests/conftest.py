@@ -44,6 +44,9 @@ def requires_symlinks() -> None:
 # The REAL per-user directories, captured at import (before any test patches the platform directories), for the #488 isolation test.
 from brain import paths as _paths_module  # noqa: E402
 
+# The XDG cache variable as the run started (None when unset), for the #488 isolation test: the fixture must leave it alone.
+REAL_XDG_CACHE_HOME = os.environ.get("XDG_CACHE_HOME")
+
 REAL_PLATFORM_DIRS = {
     name: Path(getattr(_paths_module._dirs, name)).resolve()
     for name in ("user_data_path", "user_cache_path", "user_log_path", "user_state_path", "user_config_path")
@@ -73,9 +76,13 @@ def _isolate_user_data_home(
     of whoever ran the tests, so a run could change real settings and a later test could read what an earlier one left. Every test
     now gets its own empty root as that default. The directory properties are replaced on the platform's ``PlatformDirs`` class
     (every OS), so ``brain.paths._dirs`` and any fresh ``PlatformDirs(...)`` (the update overlay hook builds its own, and a parity
-    test holds the two together) agree and both land in the tmp root; the XDG variables point there too (code that reads them
-    directly). A test that sets ``KINDLED_HOME`` / ``NELLBRAIN_HOME`` still wins, as before, and the env-var resolution order is
+    test holds the two together) agree and both land in the tmp root; the XDG data and state variables point there too (so a
+    subprocess a test starts, on Linux and macOS, lands there as well). A test that sets ``KINDLED_HOME`` / ``NELLBRAIN_HOME`` still wins, as before, and the env-var resolution order is
     unchanged.
+
+    The CACHE directory and ``XDG_CACHE_HOME`` are deliberately NOT redirected: the cache is where downloaded models live, not user
+    state. platformdirs reads ``XDG_CACHE_HOME`` on Linux and macOS and huggingface_hub derives ``HF_HOME`` from it on every OS, so
+    moving it made a subprocess a test starts (the judge release RSS job's C3a) find no cached judge, go to the network and fail.
     """
     from platformdirs import PlatformDirs
 
@@ -87,7 +94,6 @@ def _isolate_user_data_home(
     for cls in {type(paths._dirs), PlatformDirs}:
         for prop, sub in (
             ("user_data_dir", "data"),
-            ("user_cache_dir", "cache"),
             ("user_log_dir", "log"),
             ("user_state_dir", "state"),
             ("user_config_dir", "config"),
@@ -95,7 +101,6 @@ def _isolate_user_data_home(
             monkeypatch.setattr(cls, prop, property(lambda self, _s=sub: _isolated_dir(root, self, _s)))
     for var, sub in (
         ("XDG_DATA_HOME", "xdg-data"),
-        ("XDG_CACHE_HOME", "xdg-cache"),
         ("XDG_STATE_HOME", "xdg-state"),
     ):
         monkeypatch.setenv(var, str(root / sub))

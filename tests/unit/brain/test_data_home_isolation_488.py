@@ -10,11 +10,12 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from brain import paths
 from brain.bridge.server import build_app
-from tests.conftest import REAL_PLATFORM_DIRS
+from tests.conftest import REAL_PLATFORM_DIRS, REAL_XDG_CACHE_HOME
 
 
 def _snapshot(root: Path) -> dict[str, tuple[int, int]]:
@@ -34,14 +35,14 @@ def _is_under(path: Path, root: Path) -> bool:
 def test_the_default_home_is_not_the_real_one(monkeypatch):
     monkeypatch.delenv("KINDLED_HOME", raising=False)
     monkeypatch.delenv("NELLBRAIN_HOME", raising=False)
-    for resolved in (paths.get_home(), paths.get_cache_dir(), paths.get_log_dir()):
+    for resolved in (paths.get_home(), paths.get_log_dir()):
         for real in REAL_PLATFORM_DIRS.values():
             assert not _is_under(resolved, real)
     assert "companion-emergence" in str(paths.get_home()).lower()
 
 
 def test_xdg_variables_point_away_from_the_real_home():
-    for var in ("XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"):
+    for var in ("XDG_DATA_HOME", "XDG_STATE_HOME"):
         value = os.environ.get(var)
         assert value, var
         assert not _is_under(Path(value).resolve(), REAL_PLATFORM_DIRS['user_data_path'])
@@ -87,3 +88,36 @@ def test_the_isolated_dirs_keep_the_appauthor_distinction():
     assert with_author != other_author
     assert with_author != without
     assert paths._dirs.user_data_path == with_author  # the engine's own instance
+
+
+# --- the model cache is NOT isolated (CI: judge release RSS, test_c3a) -------------------------------------------------------
+
+
+def test_the_model_cache_stays_where_it_is():
+    """The first version of the fixture also moved the cache directory and XDG_CACHE_HOME. The cache dir is where the downloaded
+    models live (a test that needs a cached model, or a subprocess it starts, looks there), not user state; with it moved the judge
+    release RSS job's C3a found no cached judge in its subprocess, fell back to the network and failed on all three OSes. platformdirs
+    reads XDG_CACHE_HOME on Linux AND macOS, and huggingface_hub derives HF_HOME from it everywhere."""
+    if not (os.environ.get("KINDLED_HOME") or os.environ.get("NELLBRAIN_HOME")):
+        assert paths.get_cache_dir() == REAL_PLATFORM_DIRS["user_cache_path"]
+    assert os.environ.get("XDG_CACHE_HOME") == REAL_XDG_CACHE_HOME
+
+
+def test_a_subprocess_resolves_the_same_model_cache_as_the_run_started_with():
+    """What C3a does: it starts a fresh interpreter that inherits this test's environment and expects `get_cache_dir()` there to be the
+    real cache holding the judge. No model is loaded here."""
+    import subprocess
+    import sys
+
+    if os.environ.get("KINDLED_HOME") or os.environ.get("NELLBRAIN_HOME"):
+        pytest.skip("the run was started with an explicit home override")
+    repo_root = Path(__file__).resolve().parents[3]
+    out = subprocess.run(
+        [sys.executable, "-P", "-c", "from brain.paths import get_cache_dir; print(get_cache_dir())"],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert out.returncode == 0, out.stderr
+    assert Path(out.stdout.strip()).resolve() == REAL_PLATFORM_DIRS["user_cache_path"]
