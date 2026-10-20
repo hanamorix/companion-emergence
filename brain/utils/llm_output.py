@@ -64,3 +64,76 @@ def loads_json_object(raw: str) -> dict:
     then the tolerant ``extract_json_object`` scrape. Raises ValueError when no
     object can be read (#364)."""
     return loads_json_object_ex(raw)[0]
+
+
+_OBJECT_START = re.compile(r'\{\s*"')  # the opening of a JSON object with at least one key
+
+
+def _balanced_block(text: str, start: int) -> str | None:
+    """The `{...}` block that opens at ``start``, counting braces OUTSIDE string literals only (#478; moved here from soul/review so every model-reply reader shares it), or None if it never closes."""
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
+def find_json_object_block(text: str, prefer_key: str | None = None) -> str | None:
+    """Find the JSON object that is the model's answer in ``text``. Tolerant of preamble and of braces inside strings (#478).
+
+    Tries each ``{`` in turn with ``json.JSONDecoder().raw_decode``: the first object that carries ``prefer_key`` wins, else the
+    first object that decodes at all. An object that opens inside a ``{...}`` block that did NOT decode is part of that malformed
+    reply and is not taken as the answer (a decision quoted inside invalid JSON must not be accepted). That includes a TRUNCATED outer object (one that opens
+    like JSON, `{"`, and never closes): everything after it is part of it. When no ``{`` starts a decodable object (a malformed reply) it falls back to the first
+    string-aware balanced block, so a caller can still report "the reply is not valid JSON" rather than "no JSON object"; None
+    when no `{` starts a block that closes.
+    """
+    decoder = json.JSONDecoder()
+    first_object: str | None = None
+    first_balanced: str | None = None
+    inside_failed_until = 0  # an object that opened inside a block that did not decode belongs to that malformed block
+    start = text.find("{")
+    while start >= 0:
+        if start < inside_failed_until:
+            start = text.find("{", start + 1)
+            continue
+        try:
+            obj, end = decoder.raw_decode(text, start)
+        except (ValueError, RecursionError):  # RecursionError: nested past the limit (#406's tuple)
+            obj = None
+            balanced = _balanced_block(text, start)
+            if balanced is not None:
+                inside_failed_until = start + len(balanced)
+            elif _OBJECT_START.match(text, start):
+                # An object that opens like JSON (`{"`) and never closes is a truncated reply: everything after it is part of it.
+                # (A `{` that opens prose, such as "I considered { maybe", is not, and does not hide a later answer.)
+                inside_failed_until = len(text)
+        else:
+            balanced = None
+            if isinstance(obj, dict):
+                block = text[start:end]
+                if prefer_key is not None and prefer_key in obj:
+                    return block
+                if first_object is None:
+                    first_object = block
+        if first_balanced is None:
+            first_balanced = balanced if balanced is not None else _balanced_block(text, start)
+        start = text.find("{", start + 1)
+    return first_object if first_object is not None else first_balanced

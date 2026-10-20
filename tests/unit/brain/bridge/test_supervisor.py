@@ -110,6 +110,17 @@ def test_audit_logs_registered_for_rotation() -> None:
     assert "attunement_errors.jsonl" in registered
 
 
+def test_consolidation_archive_is_never_rotated() -> None:
+    """#430 C6: the forgetting exemption reads every merge row of consolidation_archive.jsonl
+    (``brain.soul.candidates.merge_target_map``). Rotating or archiving it away un-protects merged
+    soul moments, so it must stay out of both rotation tables."""
+    from brain.bridge.supervisor import _YEARLY_ARCHIVE_LOGS
+    from brain.engines.consolidation import _ARCHIVE_FILENAME
+
+    assert _ARCHIVE_FILENAME not in {name for name, _ in _ROLLING_LOG_POLICIES}
+    assert _ARCHIVE_FILENAME not in {name for name, _ in _YEARLY_ARCHIVE_LOGS}
+
+
 def _persona_dir(tmp_path: Path) -> Path:
     """Minimal persona dir for the supervisor to operate against."""
     p = tmp_path / "test-persona"

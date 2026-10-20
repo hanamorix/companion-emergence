@@ -162,3 +162,75 @@ def test_only_accepted_candidates_protect(tmp_path):
         ],
     )
     assert list_crystallised_memory_ids(tmp_path) == ["m-accepted"]
+
+
+# --------------------------------------------------------------------------- #430 merge targets
+def _merge_row(candidate_id: str, target_id: str, content: str = "x") -> dict:
+    """The shape ``consolidation._archive_preimage`` writes."""
+    return {
+        "archived_at": "2026-10-01T00:00:00+00:00",
+        "reason": "consolidation_merge",
+        "target": {"id": target_id, "content": content},
+        "merged_from_candidate": candidate_id,
+    }
+
+
+def _archive_line(rec: dict) -> bytes:
+    return (json.dumps(rec, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def test_430_c4b_torn_archive_lines_are_skipped_with_a_warning(tmp_path, caplog):
+    """#430 C4b: a cut JSON line, and a line cut mid multi-byte character with a later append fused onto
+    it, are skipped with a warning; the other lines still map. The fused row's redirect is lost
+    (expected: spec "Torn tail")."""
+    import logging
+
+    from brain.engines.consolidation import _ARCHIVE_FILENAME
+    from brain.soul.candidates import merge_target_map
+
+    cut_json = _archive_line(_merge_row("cand-a", "target-a"))[:40] + b"\n"
+    cut_char = _archive_line(_merge_row("cand-b", "target-b", "café au lait"))
+    cut_char = cut_char[: cut_char.index("é".encode()) + 1]  # half of the two-byte é, no newline
+    fused = _archive_line(_merge_row("cand-c", "target-c"))  # appended onto the torn line
+    good = _archive_line(_merge_row("cand-d", "target-d", "naïve"))
+    (tmp_path / _ARCHIVE_FILENAME).write_bytes(cut_json + cut_char + fused + good)
+
+    with caplog.at_level(logging.WARNING):
+        got = merge_target_map(tmp_path)
+
+    assert got == {"cand-d": {"target-d"}}
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len([m for m in warnings if "skipping malformed jsonl line" in m]) == 2, warnings
+
+
+def test_430_c4c_only_merge_rows_of_soul_linked_ids_redirect(tmp_path):
+    """#430 C4c: a dedup_sweep row and a merge row for an id nothing soul-links add nothing; one
+    candidate with two merge rows (the first naming a row since deleted, the second a live row) maps to
+    both, so the live target is exempt whichever came first."""
+    from brain.engines.consolidation import _ARCHIVE_FILENAME
+    from brain.forgetting import _load_soul_linked_ids
+    from brain.soul.candidates import merge_target_map
+
+    rows = [
+        {"archived_at": "2026-10-01T00:00:00+00:00", "reason": "dedup_sweep", "target": {"id": "swept"}},
+        _merge_row("unlinked-cand", "unlinked-target"),
+        _merge_row("cand", "deleted-target"),
+        _merge_row("cand", "live-target"),
+    ]
+    (tmp_path / _ARCHIVE_FILENAME).write_bytes(b"".join(_archive_line(r) for r in rows))
+    _write_candidates(tmp_path, [{"memory_id": "cand", "status": "auto_pending"}])
+
+    assert merge_target_map(tmp_path) == {
+        "unlinked-cand": {"unlinked-target"},
+        "cand": {"deleted-target", "live-target"},
+    }
+    crystallised, under_review = _load_soul_linked_ids(tmp_path)
+    assert crystallised == set()
+    assert under_review == {"cand", "deleted-target", "live-target"}
+
+
+def test_430_missing_archive_maps_nothing_and_creates_no_lock_sidecar(tmp_path):
+    from brain.soul.candidates import merge_target_map
+
+    assert merge_target_map(tmp_path) == {}
+    assert list(tmp_path.iterdir()) == []

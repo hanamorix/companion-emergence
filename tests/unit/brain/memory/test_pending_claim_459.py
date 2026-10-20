@@ -325,7 +325,8 @@ def test_a_keep_aside_write_failure_makes_claim_raise_before_changing_anything(t
 
 
 # ---------------------------------------------------------------------------
-# O4: reappraise items are not piled up
+# O4: reappraise items are not piled up. The dedup is in `claim()` ONLY (#470 review item 4): the enqueue on the prompt-build
+# hot path is one locked append that reads nothing.
 # ---------------------------------------------------------------------------
 
 
@@ -333,34 +334,130 @@ def _reappraise_ids(entries) -> list[str]:
     return [e["memory_id"] for e in entries if e.get("_route") == "reappraise_importance"]
 
 
-def test_reappraise_items_are_deduplicated_against_the_queue(tmp_path):
+def _reappraise_line(memory_id: str) -> bytes:
+    return (
+        b'{"_route": "reappraise_importance", "memory_id": "%s", "_source": "recall", "_enqueued_at": "t"}\n'
+        % memory_id.encode()
+    )
+
+
+def test_enqueue_reappraisals_is_one_plain_append_that_does_not_dedupe(tmp_path):
+    # The hot path writes what it is given; the collapse of repeats is the claim's job (#470 review item 4).
     q = PendingQueue(tmp_path)
 
-    assert q.enqueue_reappraisals(["m1", "m2", "m1"], source="recall") == 2  # duplicate inside one call
-    assert q.enqueue_reappraisals(["m2", "m3"], source="recall") == 1  # m2 is already queued
+    assert q.enqueue_reappraisals(["m1", "m2", "m1"], source="recall") == 3
+    assert q.enqueue_reappraisals(["m2", "m3"], source="recall") == 2
     q.enqueue_reappraisal("m1", source="recall")
 
-    assert _reappraise_ids(read_jsonl(q.path)) == ["m1", "m2", "m3"]
+    assert _reappraise_ids(read_jsonl(q.path)) == ["m1", "m2", "m1", "m2", "m3", "m1"]
 
 
-def test_reappraise_items_are_deduplicated_against_unsettled_processing_entries(tmp_path):
+def test_enqueue_reappraisals_reads_neither_the_queue_nor_the_processing_file(tmp_path, monkeypatch):
+    # Fails before the change: the dedup read both files (the cost grew with their size, on every prompt build).
+    import builtins
+    import io
+    import os
+
+    import brain.memory.pending as pending_mod
+
+    q = PendingQueue(tmp_path)
+    q.path.write_bytes(b"".join(_reappraise_line(f"q{i}") for i in range(200)))
+    write_jsonl(tmp_path / _PROCESSING, [{"_route": "reappraise_importance", "memory_id": f"p{i}", "_claim_id": f"c{i}"} for i in range(200)])
+    queue_before = q.path.read_bytes()
+
+    def _boom(*_a, **_k):
+        raise AssertionError("the hot path read a queue file")
+
+    for name in ("read_jsonl", "iter_jsonl_raw"):
+        monkeypatch.setattr(pending_mod, name, _boom)
+    monkeypatch.setattr(PendingQueue, "_unsettled_processing", _boom)
+    monkeypatch.setattr(PendingQueue, "_read_keeping_damaged", _boom)
+
+    reads: list[str] = []
+    real_open = io.open
+
+    def spy(file, mode="r", *args, **kwargs):
+        name = os.fspath(file) if isinstance(file, (str, os.PathLike)) else ""
+        if name.endswith((".jsonl",)) and "r" in mode and "+" not in mode:
+            reads.append(f"{os.path.basename(name)} {mode}")
+        if os.path.basename(name) == _PROCESSING:
+            reads.append(f"{_PROCESSING} {mode}")
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(io, "open", spy)
+    monkeypatch.setattr(builtins, "open", spy)
+
+    assert q.enqueue_reappraisals(["m1", "q3", "p4"], source="recall") == 3
+
+    assert reads == []  # no read-mode open of a queue file, and the processing file is not opened at all
+    assert q.path.read_bytes().startswith(queue_before)  # an append, nothing rewritten
+    assert _reappraise_ids(read_jsonl(q.path))[-3:] == ["m1", "q3", "p4"]
+
+
+def test_claim_collapses_the_duplicates_enqueued_since_an_earlier_claim_and_leaves_one_line_per_id(tmp_path):
+    q = PendingQueue(tmp_path)
+    q.enqueue_reappraisals(["m1", "m2", "m1"], source="recall")
+    q.enqueue_reappraisals(["m2", "m3"], source="recall")
+
+    batch = q.claim()
+
+    assert _reappraise_ids(batch.entries) == ["m1", "m2", "m3"]  # one per memory, first seen order
+    assert _reappraise_ids(read_jsonl(tmp_path / _PROCESSING)) == ["m1", "m2", "m3"]  # the duplicates are in neither file
+    assert read_jsonl(q.path) == []
+
+
+def test_claim_collapses_a_new_duplicate_against_an_unsettled_leftover(tmp_path):
     q = PendingQueue(tmp_path)
     q.enqueue_reappraisals(["m1", "m2"], source="recall")
     batch = q.claim()
     batch.settle(batch.entries[0])  # m1 is dealt with; m2 is still held (an outage)
 
-    assert q.enqueue_reappraisals(["m1", "m2"], source="recall") == 1  # m2 is held, m1 is not
+    q.enqueue_reappraisals(["m1", "m2"], source="recall")  # recall touches both again
+    second = q.claim()
 
-    assert _reappraise_ids(read_jsonl(q.path)) == ["m1"]
+    assert _reappraise_ids(second.entries) == ["m2", "m1"]  # the held m2 once (leftover first), the settled m1 again
+    assert _reappraise_ids(read_jsonl(tmp_path / _PROCESSING)) == ["m2", "m1"]
+    assert read_jsonl(q.path) == []
+
+
+def test_the_files_do_not_grow_with_the_number_of_ticks_in_an_outage(tmp_path):
+    # An outage: every tick the recall enqueues the same ids again and the gate settles none of them.
+    q = PendingQueue(tmp_path)
+    ids = [f"m{i}" for i in range(20)]
+    sizes = []
+    for _ in range(30):
+        q.enqueue_reappraisals(ids, source="recall")
+        q.enqueue_reappraisals(ids[:5], source="recall")  # the second recall pass of the same turn
+        batch = q.claim()
+        assert _reappraise_ids(batch.entries) == ids
+        batch.close()  # nothing settled: both files stay for the next claim
+        sizes.append((len(read_jsonl(q.path)), len(read_jsonl(tmp_path / _PROCESSING))))
+    assert set(sizes) == {(0, 20)}  # queue emptied by each claim; processing file = one line per distinct id, every tick
+    assert read_jsonl(tmp_path / _SETTLED) == []
+
+    final = q.claim()  # the login is back: everything is settled
+    for e in final.entries:
+        final.settle(e)
+    final.close()
+    assert not (tmp_path / _PROCESSING).exists() and not (tmp_path / _SETTLED).exists()
+
+
+def test_a_settled_reappraisal_can_be_enqueued_and_claimed_again(tmp_path):
+    q = PendingQueue(tmp_path)
+    q.enqueue_reappraisal("m1", source="recall")
+    first = q.claim()
+    for e in first.entries:
+        first.settle(e)
+    first.close()
+
+    q.enqueue_reappraisal("m1", source="recall")
+
+    assert _reappraise_ids(q.claim().entries) == ["m1"]
 
 
 def test_claim_deduplicates_reappraise_items_already_piled_up(tmp_path):
     q = PendingQueue(tmp_path)
-    lines = b"".join(
-        (b'{"_route": "reappraise_importance", "memory_id": "m1", "_source": "recall", "_enqueued_at": "t"}\n')
-        for _ in range(3)
-    )
-    q.path.write_bytes(lines + _good_line("alpha") + b"\n")
+    q.path.write_bytes(_reappraise_line("m1") * 3 + _good_line("alpha") + b"\n")
 
     batch = q.claim()
 

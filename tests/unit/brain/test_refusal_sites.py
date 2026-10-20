@@ -174,6 +174,38 @@ def test_session_extraction_refusal_leaves_cursor_and_backoff(persona, kind, swe
     assert read_cursor(persona, sid) is None and read_backoff(persona, sid) is None
 
 
+@pytest.mark.parametrize("kind", REFUSALS)
+@pytest.mark.parametrize("entry", ["close", "snapshot"])
+def test_refusal_inside_the_held_extraction_lock_releases_it(persona, kind, entry):
+    """#470's close_session / extract_session_snapshot hold the session's extraction lock across the model call. A stop
+    refusal raised inside that lock must leave it free (a later pass acquires it) and the session untouched; an auth
+    refusal there is a deferred report, also with the lock free."""
+    from brain.ingest import pipeline
+    from brain.ingest.buffer import extract_lock_path, read_backoff, read_cursor
+    from brain.utils.file_lock import file_lock
+
+    sid = _buffer(persona)
+    buf = persona / "active_conversations" / f"{sid}.jsonl"
+    store, hebbian = _stores(persona)
+    prov = Refusing(kind, persona)
+    run = pipeline.close_session if entry == "close" else pipeline.extract_session_snapshot
+    try:
+        if kind == "shutdown":
+            with pytest.raises(_refused_type(kind)):
+                run(persona, sid, store=store, hebbian=hebbian, provider=prov)
+        else:
+            assert run(persona, sid, store=store, hebbian=hebbian, provider=prov).deferred is True
+    finally:
+        store.close()
+        hebbian.close()
+    assert prov.calls == 1
+    with file_lock(extract_lock_path(persona, sid), blocking=False) as acquired:
+        assert acquired, "the refusal left the session's extraction lock held"
+    assert buf.exists()
+    assert read_cursor(persona, sid) is None and read_backoff(persona, sid) is None
+    _assert_unchanged(prov)
+
+
 # ---------------------------------------------------------------- pass 2: monologue (extractor) and attunement (detector)
 
 

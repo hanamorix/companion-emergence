@@ -185,7 +185,7 @@ class PendingQueue:
             )
         return entries, bool(damaged)
 
-    def enqueue_reappraisal(self, memory_id: str, *, source: str, include_held: bool = True) -> None:
+    def enqueue_reappraisal(self, memory_id: str, *, source: str) -> None:
         """Enqueue an existing-memory importance re-appraise request (P3
         retention rework, Change 3).
 
@@ -204,9 +204,9 @@ class PendingQueue:
         recall hit in one turn); calling this in a loop reacquires the lock
         and reopens the file once per id.
         """
-        self.enqueue_reappraisals([memory_id], source=source, include_held=include_held)
+        self.enqueue_reappraisals([memory_id], source=source)
 
-    def enqueue_reappraisals(self, memory_ids: list[str], *, source: str, include_held: bool = True) -> int:
+    def enqueue_reappraisals(self, memory_ids: list[str], *, source: str) -> int:
         """Enqueue MULTIPLE existing-memory re-appraise requests under a
         SINGLE `file_lock` + single open + single write (P3 retention
         rework, Change 3 hot-path fix).
@@ -222,9 +222,12 @@ class PendingQueue:
         `enqueue_reappraisal` call (`_route`/`memory_id`/`_source`/
         `_enqueued_at`) — only the I/O is batched, not the item schema.
         `drain()` and the consolidation gate see no difference from N
-        individual calls, except that an id that already has a re-appraise item
-        (queued, or held unsettled by a claimed run) is not enqueued twice. No-op (returns 0, does not touch the file) on an
+        individual calls. No-op (returns 0, does not touch the file) on an
         empty list. Returns the number of lines written.
+
+        This reads NOTHING: it is one locked append whatever the size of the queue or of the processing file, because it
+        runs on the prompt-build path twice per chat turn (#470 review). Repeated ids are not removed here: ``claim`` keeps
+        ONE re-appraise item per memory id and drops the rest from both files, so an outage cannot pile them up.
         """
         if not memory_ids:
             return 0
@@ -238,28 +241,8 @@ class PendingQueue:
             }
             for memory_id in memory_ids
         ]
-        # No pile-up (#459): an id that already has a re-appraise item in the queue, or held unsettled in the processing
-        # file (an outage keeps them there), is not enqueued again. Duplicates inside this call collapse too. The check is a
-        # lock-free read followed by ONE locked write (the hot path stays at one lock acquisition); two enqueuers racing can
-        # still add the same id twice, which `claim` collapses.
-        # ``include_held=False`` is for the gate putting a CLAIMED item back after an environment failure: that item is itself
-        # unsettled in the processing file (it is settled right after), so it must not be deduplicated against itself.
-        held = self._unsettled_processing() if include_held else []
-        pending = {
-            e.get("memory_id")
-            for e in [*read_jsonl(self.path), *held]
-            if e.get("_route") == "reappraise_importance"
-        }
-        fresh = []
-        for item in items:
-            if item["memory_id"] in pending:
-                continue
-            pending.add(item["memory_id"])
-            fresh.append(item)
-        if not fresh:
-            return 0
-        append_jsonl(self.path, fresh)  # one write for the whole batch
-        return len(fresh)
+        append_jsonl(self.path, items)  # one write for the whole batch
+        return len(items)
 
     def drain(self) -> list[dict]:
         """Atomically take the whole queue: read all entries, then truncate.
@@ -308,8 +291,10 @@ class PendingQueue:
                 kept, _ = self._read_keeping_damaged(self.processing_path)
                 leftovers = [e for e in kept if e.get("_claim_id") not in settled]
             queued, queue_damaged = self._read_keeping_damaged(self.path) if self.path.exists() else ([], False)
-            # One re-appraise item per memory id: an outage piles them up (every recall enqueues them) and each tick would
-            # otherwise re-stamp and rewrite the whole pile.
+            # One re-appraise item per memory id, here and nowhere else (the hot-path enqueue only appends): an outage piles
+            # them up (every recall enqueues them) and each tick would otherwise re-stamp and rewrite the whole pile. A
+            # duplicate is dropped from the processing file this claim rewrites and from the queue file it empties, so it is
+            # in neither file afterwards and can hold nothing open.
             seen_ids: set = set()
             combined = []
             for e in [*leftovers, *queued]:
