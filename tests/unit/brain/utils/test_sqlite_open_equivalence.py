@@ -14,6 +14,11 @@ Failure paths: a failed open now closes its connection (spec B3, #496), which
 base did not. So on a failure path the golden holds the statement list with the
 `<close>` markers removed, and the closure itself is asserted separately.
 
+Left out of the recording, because they come from SQLite and not from the store: the
+one-line "-- <SQL>" statements SQLite reports for its own FTS5 bookkeeping (see
+SQLITE_OWN_STATEMENT; the set differs between SQLite builds). Paths are recorded with a
+token for the tmp dir and forward slashes, so Windows runs match.
+
 Statements longer than ABBREV characters (the schema DDL) are kept as their
 first 40 characters, the length and a sha1 prefix of the whitespace-collapsed
 text, so the golden stays readable and a one-character change still shows.
@@ -34,9 +39,18 @@ from brain import dev_constants
 
 ABBREV = 80
 PREFIX = 40
-# SQLite's own trace of the shadow tables it creates for an FTS5 table ("-- " plus the
-# generated DDL); it belongs to the SQLite build, not to the store, so it is left out.
-SQLITE_INTERNAL_DDL = "-- CREATE TABLE 'main'."
+# SQLite itself reports some statements it runs for its own purposes (the shadow-table
+# writes behind an FTS5 table, `PRAGMA data_version`, a `SELECT` of the FTS5 config) to
+# the trace callback as ONE line that starts with "-- " and a SQL keyword. Which of them
+# appear depends on the SQLite build (observed: this machine's 3.46.1 reports a
+# `-- PRAGMA 'main'.data_version` that the SQLite on the CI runners does not). They are
+# not statements the store issued, so they are left out. A statement of the store's own
+# that starts with a comment (the schema DDL) always has the comment on its own line,
+# so it is several lines and never matches.
+SQLITE_OWN_STATEMENT = re.compile(
+    r"-- (?:CREATE|DROP|ALTER|INSERT|REPLACE|DELETE|UPDATE|SELECT|PRAGMA|BEGIN|COMMIT|"
+    r"ROLLBACK|SAVEPOINT|RELEASE) [^\n]*"
+)
 CLOSE = "<close>"
 COMMIT = "<commit>"
 NOT_OK_ROWS = [("*** in database main ***",), ("row 1 missing",)]
@@ -106,14 +120,17 @@ class Recorder:
         self.failures.append({"needle": needle, "exc": exc, "remaining": times, "via": via})
 
     def norm(self, value):
-        return str(value).replace(self.tmp_token, "<TMP>")
+        """Replace the tmp dir by a token and give the rest of the path forward slashes
+        (on Windows the same path would otherwise differ from the golden)."""
+        text = str(value).replace(self.tmp_token, "<TMP>")
+        return re.sub(r"<TMP>[^\s:'\"]*", lambda m: m.group(0).replace("\\", "/"), text)
 
     def trace(self, conn, *, keep_close: bool = True) -> list[str]:
         out = []
         for item in conn.trace:
             if item == CLOSE and not keep_close:
                 continue
-            if item.startswith(SQLITE_INTERNAL_DDL):
+            if SQLITE_OWN_STATEMENT.fullmatch(item):
                 continue
             out.append(self.abbrev(item))
         return out
@@ -342,11 +359,6 @@ GOLDEN: dict[str, dict] = {
                 "-- F2c (inc2, red-team fix F-1, spec §2)...[1709:9d93cce1c961]",
                 "-- F2c (inc3, spec §5): per-persona JUDG...[2257:d0a743b01608]",
                 "-- External-content FTS5 shadow index (P...[346:8186965c720b]",
-                "-- REPLACE INTO 'main'.'memories_fts_data'(id, block) VALUES(?,?)",
-                "-- REPLACE INTO 'main'.'memories_fts_data'(id, block) VALUES(?,?)",
-                "-- REPLACE INTO 'main'.'memories_fts_config' VALUES(?,?)",
-                "-- PRAGMA 'main'.data_version",
-                "-- SELECT k, v FROM 'main'.'memories_fts_config'",
                 "-- Tier-1 passive-recall salience: zero-...[421:6025bc9f6f82]",
                 "-- Schema-level sync triggers: they live...[371:0d99e5f474c0]",
                 "CREATE TRIGGER IF NOT EXISTS memories_ft...[178:486cd7592085]",
@@ -391,11 +403,6 @@ GOLDEN: dict[str, dict] = {
                 "-- F2c (inc2, red-team fix F-1, spec §2)...[1709:9d93cce1c961]",
                 "-- F2c (inc3, spec §5): per-persona JUDG...[2257:d0a743b01608]",
                 "-- External-content FTS5 shadow index (P...[346:8186965c720b]",
-                "-- REPLACE INTO 'main'.'memories_fts_data'(id, block) VALUES(?,?)",
-                "-- REPLACE INTO 'main'.'memories_fts_data'(id, block) VALUES(?,?)",
-                "-- REPLACE INTO 'main'.'memories_fts_config' VALUES(?,?)",
-                "-- PRAGMA 'main'.data_version",
-                "-- SELECT k, v FROM 'main'.'memories_fts_config'",
                 "-- Tier-1 passive-recall salience: zero-...[421:6025bc9f6f82]",
                 "-- Schema-level sync triggers: they live...[371:0d99e5f474c0]",
                 "CREATE TRIGGER IF NOT EXISTS memories_ft...[178:486cd7592085]",
@@ -441,11 +448,6 @@ GOLDEN: dict[str, dict] = {
                 "-- F2c (inc2, red-team fix F-1, spec §2)...[1709:9d93cce1c961]",
                 "-- F2c (inc3, spec §5): per-persona JUDG...[2257:d0a743b01608]",
                 "-- External-content FTS5 shadow index (P...[346:8186965c720b]",
-                "-- REPLACE INTO 'main'.'memories_fts_data'(id, block) VALUES(?,?)",
-                "-- REPLACE INTO 'main'.'memories_fts_data'(id, block) VALUES(?,?)",
-                "-- REPLACE INTO 'main'.'memories_fts_config' VALUES(?,?)",
-                "-- PRAGMA 'main'.data_version",
-                "-- SELECT k, v FROM 'main'.'memories_fts_config'",
                 "-- Tier-1 passive-recall salience: zero-...[421:6025bc9f6f82]",
                 "-- Schema-level sync triggers: they live...[371:0d99e5f474c0]",
                 "CREATE TRIGGER IF NOT EXISTS memories_ft...[178:486cd7592085]",
@@ -490,11 +492,6 @@ GOLDEN: dict[str, dict] = {
                 "-- F2c (inc2, red-team fix F-1, spec §2)...[1709:9d93cce1c961]",
                 "-- F2c (inc3, spec §5): per-persona JUDG...[2257:d0a743b01608]",
                 "-- External-content FTS5 shadow index (P...[346:8186965c720b]",
-                "-- REPLACE INTO 'main'.'memories_fts_data'(id, block) VALUES(?,?)",
-                "-- REPLACE INTO 'main'.'memories_fts_data'(id, block) VALUES(?,?)",
-                "-- REPLACE INTO 'main'.'memories_fts_config' VALUES(?,?)",
-                "-- PRAGMA 'main'.data_version",
-                "-- SELECT k, v FROM 'main'.'memories_fts_config'",
                 "-- Tier-1 passive-recall salience: zero-...[421:6025bc9f6f82]",
                 "-- Schema-level sync triggers: they live...[371:0d99e5f474c0]",
                 "CREATE TRIGGER IF NOT EXISTS memories_ft...[178:486cd7592085]",
@@ -894,11 +891,6 @@ GOLDEN: dict[str, dict] = {
                 "-- F2c (inc2, red-team fix F-1, spec §2)...[1709:9d93cce1c961]",
                 "-- F2c (inc3, spec §5): per-persona JUDG...[2257:d0a743b01608]",
                 "-- External-content FTS5 shadow index (P...[346:8186965c720b]",
-                "-- REPLACE INTO 'main'.'memories_fts_data'(id, block) VALUES(?,?)",
-                "-- REPLACE INTO 'main'.'memories_fts_data'(id, block) VALUES(?,?)",
-                "-- REPLACE INTO 'main'.'memories_fts_config' VALUES(?,?)",
-                "-- PRAGMA 'main'.data_version",
-                "-- SELECT k, v FROM 'main'.'memories_fts_config'",
                 "-- Tier-1 passive-recall salience: zero-...[421:6025bc9f6f82]",
                 "-- Schema-level sync triggers: they live...[371:0d99e5f474c0]",
                 "CREATE TRIGGER IF NOT EXISTS memories_ft...[178:486cd7592085]",
@@ -1095,4 +1087,26 @@ def test_c10_integrity_cadence_signatures_are_unchanged() -> None:
 def test_the_path_token_normalisation_is_not_vacuous(tmp_path) -> None:
     rec = Recorder(str(tmp_path))
     assert rec.norm(f"oops at {tmp_path}/x.db") == "oops at <TMP>/x.db"
+    windows = Recorder("C:\\Users\\ci\\tmp")
+    assert windows.norm("C:\\Users\\ci\\tmp\\memory.db") == "<TMP>/memory.db"
+    assert (
+        windows.norm("integrity check failed for C:\\Users\\ci\\tmp\\a.db: not a database")
+        == "integrity check failed for <TMP>/a.db: not a database"
+    )
     assert re.fullmatch(r".{40}\.\.\.\[\d+:[0-9a-f]{12}\]", rec.abbrev("x" * 300))
+
+
+def test_sqlite_own_trace_lines_are_dropped_and_the_stores_own_are_not() -> None:
+    own = [
+        "-- REPLACE INTO 'main'.'memories_fts_data'(id, block) VALUES(?,?)",
+        "-- PRAGMA 'main'.data_version",
+        "-- SELECT k, v FROM 'main'.'memories_fts_config'",
+        "-- CREATE TABLE 'main'.'memories_fts_data'(id INTEGER PRIMARY KEY, block BLOB)",
+    ]
+    theirs = [
+        "-- F1 (#259): per-cluster centroids\nCREATE TABLE IF NOT EXISTS t (x)",
+        "PRAGMA journal_mode = WAL",
+        "CREATE INDEX IF NOT EXISTS idx ON t(x);",
+    ]
+    assert all(SQLITE_OWN_STATEMENT.fullmatch(s) for s in own)
+    assert not any(SQLITE_OWN_STATEMENT.fullmatch(s) for s in theirs)
