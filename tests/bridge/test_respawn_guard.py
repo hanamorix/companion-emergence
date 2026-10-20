@@ -260,3 +260,16 @@ def test_cmd_start_reports_a_failed_service_start_at_once(pd, monkeypatch, capsy
     assert waited == []
     err = capsys.readouterr().err
     assert "service start failed" in err and "Job for the unit failed." in err
+
+
+@pytest.mark.parametrize("origin", ["systemd", "launchd", "task-scheduler"])
+def test_a_crashed_service_bridge_is_not_held_back_by_the_guard(pd, gone_pid, ran, monkeypatch, origin):
+    """Review R2-S1: a crash writes no stop intent, so the service manager's restart (`supervisor run`) runs."""
+    monkeypatch.setattr(respawn_guard, "_platform", lambda: "linux")
+    state_file.write(pd, state_file.BridgeState(
+        persona="nell", pid=gone_pid, port=5, started_at="t", stopped_at=None, shutdown_clean=False,
+        client_origin=origin, pid_token=f"linux:{pi.boot_id()}:{gone_pid}:1", identity="token", phase="hard_exit",
+        stop_reason="crash"))
+    assert respawn_guard.guard_fires(pd) is False
+    assert daemon.cmd_run(_run_args(origin)) == 0
+    assert ran == ["ran"]

@@ -335,7 +335,8 @@ def _kill_descendants() -> None:
 
 
 def hard_exit(persona_dir: Path | None, reason: str = REASON_HARD_EXIT) -> None:
-    """End this bridge at once: exit status 0, bridge.json left not clean with reason "hard_exit" (C14). Never returns.
+    """End this bridge at once: exit status 0 (1 for REASON_CRASH), bridge.json left not clean with ``reason`` (C14).
+    Never returns.
 
     Order (plan I5): the abandoning flag first (no `claude` starts after it and no caller acts on a killed call), the
     record (best-effort: a failure there still exits, C14 g), the progress record, then every descendant killed without
@@ -382,4 +383,6 @@ def hard_exit(persona_dir: Path | None, reason: str = REASON_HARD_EXIT) -> None:
                 pass
         _kill_descendants()
     finally:
-        os._exit(0)
+        # Review R2-S1: an unexpected end (REASON_CRASH) exits non-zero, so systemd (Restart=on-failure), launchd
+        # (SuccessfulExit false) and Task Scheduler restart a service bridge; every deliberate hard exit exits 0 (D17).
+        os._exit(1 if reason == REASON_CRASH else 0)

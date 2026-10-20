@@ -34,7 +34,7 @@ _SCRIPT = textwrap.dedent(
     from brain import process_identity as pi
     from brain.bridge import shutdown, shutdown_progress, state_file
 
-    pd, log, raise_update = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3] == "1"
+    pd, log, raise_update, reason = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3] == "1", sys.argv[4]
 
     def note(line):
         with open(log, "a", encoding="utf-8") as f:
@@ -68,20 +68,20 @@ _SCRIPT = textwrap.dedent(
             raise RuntimeError("disk on fire")
         state_file.update = boom
     note("calling")
-    shutdown.hard_exit(pd, "hard_exit")
+    shutdown.hard_exit(pd, reason)
     note("RETURNED")
     """
 )
 
 
-def _run(tmp_path: Path, raise_update: bool = False):
+def _run(tmp_path: Path, raise_update: bool = False, reason: str = "hard_exit"):
     pd = tmp_path / "nell"
     pd.mkdir()
     log = tmp_path / "log"
     env = dict(os.environ, PYTHONPATH=str(REPO))
     err = tmp_path / "stderr"
     with open(err, "w", encoding="utf-8") as ef:  # a file, not a pipe: a surviving child must not hold the test
-        proc = subprocess.run([sys.executable, "-c", _SCRIPT, str(pd), str(log), "1" if raise_update else "0"],
+        proc = subprocess.run([sys.executable, "-c", _SCRIPT, str(pd), str(log), "1" if raise_update else "0", reason],
                               env=env, timeout=60, stdout=subprocess.DEVNULL, stderr=ef, text=True)
     proc.stderr = err.read_text(encoding="utf-8")
     lines = log.read_text(encoding="utf-8").splitlines()
@@ -174,3 +174,16 @@ def test_abandoning_is_cleared_for_a_new_bridge_app():
     shutdown_progress.reset_for_tests()
     assert not shutdown_progress.abandoning.is_set()
 
+
+def test_a_run_recorded_as_a_crash_exits_non_zero_so_a_service_manager_restarts_it(tmp_path, reap):
+    """Review R2-S1: an unexpected end (reason "crash", S7) exits non-zero, which systemd (Restart=on-failure),
+    launchd (SuccessfulExit false) and Task Scheduler read as a failure and restart; the tree is still killed and the
+    record says "crash". A deliberate hard exit keeps exit 0 (the tests above)."""
+    proc, pd, lines = _run(tmp_path, reason="crash")
+    reap.append(lines)
+    assert proc.returncode != 0, proc.stderr
+    assert "RETURNED" not in lines
+    _, child, grand = next(line for line in lines if line.startswith("pids")).split()
+    assert _gone(int(child)) and _gone(int(grand))
+    st = state_file.read(pd)
+    assert st.shutdown_clean is False and st.stop_reason == "crash"
