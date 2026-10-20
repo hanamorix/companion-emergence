@@ -3276,6 +3276,8 @@ def build_app(
         events.publish(
             "session_snapshot",
             session_id=sid,
+            deferred=report.deferred,
+            busy=report.busy,
             committed=report.committed,
             enqueued=report.enqueued,
             deduped=report.deduped,
@@ -3286,6 +3288,8 @@ def build_app(
         return {
             "session_id": sid,
             "closed": False,
+            "deferred": report.deferred,
+            "busy": report.busy,
             "committed": report.committed,
             "enqueued": report.enqueued,
             "deduped": report.deduped,
@@ -3399,6 +3403,29 @@ def build_app(
                     },
                 )
 
+            if report.deferred or report.busy:
+                # #473, #477: "not now", not a failure. The pass left the buffer and the cursor as they were, so the
+                # session stays registered (it is still on disk, and a retry or the sweep will take it) and the
+                # response says so instead of claiming the close happened.
+                events.publish(
+                    "session_close_deferred",
+                    session_id=sid,
+                    deferred=report.deferred,
+                    busy=report.busy,
+                )
+                return {
+                    "session_id": sid,
+                    "closed": False,
+                    "deferred": report.deferred,
+                    "busy": report.busy,
+                    "committed": report.committed,
+                    "enqueued": report.enqueued,
+                    "deduped": report.deduped,
+                    "soul_candidates": report.soul_candidates,
+                    "soul_queue_errors": report.soul_queue_errors,
+                    "errors": report.errors,
+                }
+
             # H2: clean up registry + lock so sessions_active stays accurate.
             remove_session(sid)
         s.in_flight_locks.pop(sid, None)
@@ -3416,6 +3443,8 @@ def build_app(
         return {
             "session_id": sid,
             "closed": True,
+            "deferred": False,
+            "busy": False,
             "committed": report.committed,
             "enqueued": report.enqueued,
             "deduped": report.deduped,

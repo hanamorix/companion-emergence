@@ -919,6 +919,8 @@ def _build_gated_jobs(
                     "deduped": r.deduped,
                     "soul_candidates": r.soul_candidates,
                     "errors": r.errors,
+                    "deferred": r.deferred,
+                    "busy": r.busy,
                     "at": _now_iso(),
                 }
             )
@@ -3011,7 +3013,9 @@ def _run_finalize_tick(
         )
 
     for r in reports:
-        remove_session(r.session_id)
+        if not (r.deferred or r.busy):
+            # A deferred or busy pass left the buffer as it was (#473, #477): the session stays registered with it.
+            remove_session(r.session_id)
         event_bus.publish(
             {
                 "type": "session_finalized",
@@ -3020,6 +3024,8 @@ def _run_finalize_tick(
                 "enqueued": r.enqueued,
                 "deduped": r.deduped,
                 "errors": r.errors,
+                "deferred": r.deferred,
+                "busy": r.busy,
                 "at": _now_iso(),
             }
         )
