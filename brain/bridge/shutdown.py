@@ -251,9 +251,16 @@ class Monitor:
         self._thread.start()
 
     def stop(self) -> None:
+        """End the monitor, then write the final progress record (review S5): the last task may have ended after the
+        last poll. Only the record: no signal or request is acted on at this point."""
         self._stop.set()
         if self._thread is not None and self._thread is not threading.current_thread():
             self._thread.join(timeout=5 * self.poll_s + 1.0)
+        if self.controller.stopping:
+            try:
+                self._write_progress()
+            except Exception:  # noqa: BLE001 - best effort at the very end
+                logger.warning("could not write the final stop progress record", exc_info=True)
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -285,6 +292,12 @@ class Monitor:
             return
         if c._mark_pending:  # noqa: SLF001 - retry a failed "stopping" mark
             c._mark_stopping()  # noqa: SLF001
+        self._write_progress()
+
+    def _write_progress(self) -> None:
+        from brain.bridge import shutdown_progress
+
+        c = self.controller
         tasks = shutdown_progress.registry.snapshot()
         if tasks != self._last_written:
             record = shutdown_progress.progress_record(

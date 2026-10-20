@@ -95,8 +95,8 @@ def _after_run(persona_dir: Path, app: object, monitor: object) -> None:
     reg = shutdown_progress.registry
     sealed = reg.sealed or reg.seal()
     if sealed and (sup is None or not sup.is_alive()):
+        monitor.stop()  # type: ignore[attr-defined]  # its final progress record names this bridge, then "stopped"
         _write_stopped(persona_dir)
-        monitor.stop()  # type: ignore[attr-defined]
         return
     logger.error("bridge run ended with work still running; hard exit")
     shutdown_mod.hard_exit(persona_dir, shutdown_mod.REASON_HARD_EXIT)

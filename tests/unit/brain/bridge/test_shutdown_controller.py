@@ -327,3 +327,23 @@ def test_a_hard_exit_request_is_honoured_by_a_bridge_that_is_not_stopping(own_re
     )
     m.poll_once()
     assert exits == ["hard_exit"]
+
+
+def test_stopping_the_monitor_writes_the_final_progress_record(own_record):
+    """Review S5: the last task ended after the monitor's last poll; stopping the monitor writes the final record
+    (0 tasks), so the record never ends listing a task that has finished."""
+    c = BridgeShutdownController()
+    c.configure(own_record)
+    c.bind_server(FakeServer())
+    exits: list[str] = []
+    m = _monitor(own_record, c, exits)
+    reg = shutdown_progress.registry
+    h = reg.register("chat reply")
+    c.begin_stop("user_stop")
+    m.poll_once()
+    assert shutdown_progress.read_record(own_record, shutdown_progress.PROGRESS_FILENAME)["count"] == 1
+    reg.unregister(h)
+    m.stop()
+    rec = shutdown_progress.read_record(own_record, shutdown_progress.PROGRESS_FILENAME)
+    assert rec["count"] == 0 and rec["tasks"] == []
+    assert exits == []
