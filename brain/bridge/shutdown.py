@@ -102,6 +102,7 @@ class BridgeShutdownController:
 
         with self._lock:
             if self._requested:
+                cli_throttle.request_shutdown()  # idempotent: re-applies the flag if anything cleared it (review S1)
                 if self._server is not None:
                     self._server.should_exit = True
                 return False

@@ -178,3 +178,14 @@ def test_the_stop_waits_for_a_running_worker_without_a_time_limit(persona_dir: P
     release.set()
     assert exited.wait(30)
     assert shutdown_progress.registry.sealed
+
+
+def test_a_stop_that_began_before_the_lifespan_keeps_the_flag_set(persona_dir: Path):
+    """Review S1 (C1, C4): a signal applied between the runner's start and the lifespan's first lines began the stop;
+    the lifespan must not clear the process-wide flag, or no gate refuses during that stop."""
+    ctrl = _controller(persona_dir)
+    assert ctrl.begin_stop("os_signal") is True
+    assert cli_throttle.shutdown_requested()
+    with _client(persona_dir, ctrl) as c:
+        assert cli_throttle.shutdown_requested()
+        assert c.get("/health").status_code == 200

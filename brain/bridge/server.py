@@ -1192,14 +1192,16 @@ def build_app(
         events.set_publisher(bus.publish)
 
         # #456: one stop per bridge app. A new app in this process (tests) starts unstopped, with a fresh task
-        # registry; the controller is the bridge's single stop entry point (a local one when none is passed).
-        cli_throttle.clear_shutdown()
-        shutdown_progress.reset_for_tests()
+        # registry; the controller is the bridge's single stop entry point (a local one when none is passed). A stop
+        # that already began (a signal before the lifespan, review S1) keeps the process-wide flag set.
         controller = (
             shutdown_controller
             if isinstance(shutdown_controller, BridgeShutdownController)
             else BridgeShutdownController()
         )
+        if not controller.stopping:
+            cli_throttle.clear_shutdown()
+        shutdown_progress.reset_for_tests()
         if controller.persona_dir is None:
             controller.configure(persona_dir)
 
