@@ -674,3 +674,88 @@ def test_505_near_dup_pass_treats_a_row_deactivated_mid_pass_as_vanished(tmp_pat
     warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert len(warnings) == 1 and a.id in warnings[0] and c.id in warnings[0], warnings
     store.close()
+
+
+def _exact_group(store: MemoryStore) -> tuple[Memory, Memory, Memory]:
+    """Three exact duplicates: K (oldest, most important: the canonical), then D2, then D1. The sweep
+    lists newest first, so it removes D1 before D2."""
+    k = _aged("Bob locked the shed.", 3, importance=9.0)
+    d2 = _aged("bob locked the shed.", 2, importance=1.0)
+    d1 = _aged("BOB LOCKED THE SHED.", 1, importance=5.0)
+    for m in (k, d2, d1):
+        store.create(m)
+    return k, d2, d1
+
+
+def _on_first_archive(monkeypatch, action) -> None:
+    """Run ``action`` (another writer) inside the sweep's first archive call, then archive as usual."""
+    import brain.engines.dedup_sweep as sweep
+
+    real = sweep._archive_preimage
+    fired: list[bool] = []
+
+    def _hooked(persona_dir, target):
+        if not fired:
+            fired.append(True)
+            action()
+        real(persona_dir, target)
+
+    monkeypatch.setattr(sweep, "_archive_preimage", _hooked)
+
+
+def _archived_ids(persona_dir) -> list[str]:
+    path = persona_dir / _ARCHIVE_FILENAME
+    return [json.loads(line)["target"]["id"] for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+@pytest.mark.parametrize("how", sorted(_VANISH))
+def test_505_exact_pass_skips_a_duplicate_that_vanished_mid_group(tmp_path, monkeypatch, caplog, how):
+    """#505: the exact pass removes duplicates from its opening ``list_active`` snapshot. Guards against
+    archiving and deleting D2 from that stale copy after another writer deleted it (``hard_delete``
+    KeyError ends the whole sweep) or deactivated it (a row out of play is removed anyway). D2 is
+    skipped with a warning; D1 still merges into K."""
+    import logging
+
+    store = MemoryStore(tmp_path / "memories.db")
+    k, d2, d1 = _exact_group(store)
+    _on_first_archive(monkeypatch, lambda: _VANISH[how](store, d2.id))
+
+    with caplog.at_level(logging.WARNING, logger="brain.engines.dedup_sweep"):
+        report = run_dedup_sweep(store, tmp_path)
+
+    assert (report.groups_merged, report.rows_removed) == (1, 1)
+    assert [(m.canonical_id, m.removed_id) for m in report.merges] == [(k.id, d1.id)]
+    assert _archived_ids(tmp_path) == [d1.id]
+    assert _active_ids(store) == {k.id}
+    assert (store.get(d2.id, bump=False) is None) == (how == "delete"), "a deactivated D2 must not be deleted"
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1 and d2.id in warnings[0], warnings
+    store.close()
+
+
+@pytest.mark.parametrize("how", sorted(_VANISH))
+def test_505_exact_pass_stops_a_group_whose_canonical_vanished(tmp_path, monkeypatch, caplog, how):
+    """#505: K is soul-linked, so it is the canonical though D1 outranks it. Another writer deletes or
+    deactivates K while D1 is being merged into it. Guards against going on to delete D2 in favour of a
+    row that is gone, and against carrying D1's importance onto it (``store.update`` KeyError for a
+    deleted K, a silent write for a deactivated one). D2 stays; a warning names K."""
+    import logging
+
+    store = MemoryStore(tmp_path / "memories.db")
+    k, d2, d1 = _exact_group(store)
+    store.update(k.id, importance=2.0)
+    _crystallise(tmp_path, k.id)
+    _on_first_archive(monkeypatch, lambda: _VANISH[how](store, k.id))
+
+    with caplog.at_level(logging.WARNING, logger="brain.engines.dedup_sweep"):
+        report = run_dedup_sweep(store, tmp_path)
+
+    assert (report.groups_merged, report.rows_removed) == (1, 1)
+    assert [(m.canonical_id, m.removed_id) for m in report.merges] == [(k.id, d1.id)]
+    assert _archived_ids(tmp_path) == [d1.id]
+    assert _active_ids(store) == {d2.id}
+    if how == "deactivate":
+        assert store.get(k.id, bump=False).importance == 2.0, "nothing may be carried onto a gone canonical"
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1 and k.id in warnings[0], warnings
+    store.close()

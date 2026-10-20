@@ -97,6 +97,12 @@ def _pick_canonical(members: list[Memory], exempt: set[str]) -> Memory:
     return ordered[0]
 
 
+def _live_row(store: MemoryStore, memory_id: str) -> Memory | None:
+    """The row as stored now, or None if it was deleted or deactivated (#505). Never a recall."""
+    row = store.get(memory_id, bump=False)
+    return row if row is not None and row.active else None
+
+
 def _load_exempt_ids(persona_dir: Path) -> set[str]:
     """Memory ids the soul depends on (crystallised, under review, and their merge
     targets): the same sets forgetting exempts. The sweep never deletes one (#431).
@@ -171,23 +177,49 @@ def run_dedup_sweep(
         if not removable:
             canonicals.append(canonical)
             continue
-        max_importance = max(float(m.importance) for m in members)
+        removed: list[Memory] = []
         for dup in removable:
-            _archive_preimage(persona_dir, dup)
-            store.hard_delete(dup.id)
+            # Re-read the canonical and this row just before removing it (#505): the group comes from
+            # the opening ``list_active`` snapshot, and another writer may have deleted or deactivated
+            # either since. A gone canonical ends the group (nothing may be merged into it); a gone
+            # duplicate is skipped, never archived from the stale copy or deleted.
+            if _live_row(store, canonical.id) is None:
+                break
+            dup_now = _live_row(store, dup.id)
+            if dup_now is None:
+                logger.warning(
+                    "dedup_sweep: skipping %s (duplicate of %s): it vanished or was deactivated mid-pass",
+                    dup.id,
+                    canonical.id,
+                )
+                continue
+            _archive_preimage(persona_dir, dup_now)
+            store.hard_delete(dup_now.id)
             report.merges.append(
                 MergeRecord(
                     canonical_id=canonical.id,
-                    removed_id=dup.id,
-                    content_preview=dup.content[:120],
+                    removed_id=dup_now.id,
+                    content_preview=dup_now.content[:120],
                 )
             )
             report.rows_removed += 1
-        if max_importance > canonical.importance:
-            store.update(canonical.id, importance=max_importance)
-            canonical = store.get(canonical.id, bump=False) or canonical
-        report.groups_merged += 1
-        canonicals.append(canonical)
+            removed.append(dup_now)
+        if removed:
+            report.groups_merged += 1
+        canonical_now = _live_row(store, canonical.id)
+        if canonical_now is None:
+            logger.warning(
+                "dedup_sweep: skipping the rest of the group of %s: it vanished or was deactivated mid-pass",
+                canonical.id,
+            )
+            continue
+        # Carry the max of the rows actually merged into it (#505: not of rows skipped as gone, nor of
+        # soul-linked rows that stay and keep their own importance).
+        max_importance = max(float(m.importance) for m in [canonical_now, *removed])
+        if max_importance > canonical_now.importance:
+            store.update(canonical_now.id, importance=max_importance)
+            canonical_now = store.get(canonical_now.id, bump=False) or canonical_now
+        canonicals.append(canonical_now)
 
     if judge is not None:
         _near_dup_pass(store, persona_dir, canonicals, judge, report, exempt)
@@ -233,15 +265,10 @@ def _near_dup_pass(
             # a raised canonical again, or drops its max with it, and the archive gets a stale pre-image.
             # A row gone since the pass listed it (a concurrent writer) is never archived from the
             # stale copy, deleted or updated: the pair is skipped and logged (#431).
-            keep_now = store.get(keep.id, bump=False)
-            drop_now = store.get(drop.id, bump=False)
-            # ``store.get`` ignores the ``active`` flag, but the pass only works on active rows: a row
-            # deactivated mid-pass is out of play exactly like a deleted one, never archived or merged (#505).
-            vanished = {
-                m.id
-                for m, now in ((keep, keep_now), (drop, drop_now))
-                if now is None or not now.active
-            }
+            # ``_live_row`` treats a row deactivated mid-pass exactly like a deleted one (#505).
+            keep_now = _live_row(store, keep.id)
+            drop_now = _live_row(store, drop.id)
+            vanished = {m.id for m, now in ((keep, keep_now), (drop, drop_now)) if now is None}
             if vanished:
                 gone |= vanished
                 logger.warning(
