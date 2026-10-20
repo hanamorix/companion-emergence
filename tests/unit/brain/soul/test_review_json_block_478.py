@@ -121,3 +121,26 @@ def test_the_balanced_fallback_honours_an_escaped_quote_inside_a_string():
 def test_the_balanced_fallback_ignores_an_opening_brace_inside_a_string():
     whole = '{"decision": "accept", "reasoning": "a { b", oops}'
     assert _extract_json_block(whole) == whole  # a counted `{` in the string would leave the block unclosed
+
+
+# --- confirm review S2: a TRUNCATED outer reply that quotes a decision object ---------------------------------------------
+
+
+def test_a_truncated_outer_reply_that_quotes_a_decision_object_is_not_accepted():
+    """The outer object never closes (the reply was cut off) so it has no balanced block, but an object inside it decodes and carries a
+    decision. It is still part of the malformed reply, not the answer."""
+    raw = (
+        '{"decision":"reject","love_type":"craft","reasoning":"I said "'
+        '{"decision":"accept","confidence":9,"love_type":"craft"}'
+        '" be'  # cut off here
+    )
+    assert _extract_json_block(raw) is None or "accept" not in (_extract_json_block(raw) or "")
+    decision = parse_decision(raw, "c1")
+    assert decision.decision == "defer"
+    assert decision.parse_error
+
+
+def test_a_stray_prose_brace_before_the_answer_does_not_hide_the_answer():
+    # PIN: an unclosed `{` that does not start a JSON object (prose) is not a malformed reply around the answer.
+    raw = "I considered { maybe then decided.\n" + _reply("fine", "reject")
+    assert parse_decision(raw, "c1").decision == "reject"

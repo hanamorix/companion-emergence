@@ -179,6 +179,9 @@ def _build_messages(
 # ── JSON parsing ──────────────────────────────────────────────────────────────
 
 
+_OBJECT_START = re.compile(r'\{\s*"')  # the opening of a JSON object with at least one key
+
+
 def _balanced_block(text: str, start: int) -> str | None:
     """The `{...}` block that opens at ``start``, counting braces OUTSIDE string literals only (#478), or None if it never closes."""
     depth = 0
@@ -210,7 +213,8 @@ def _extract_json_block(text: str) -> str | None:
 
     Tries each ``{`` in turn with ``json.JSONDecoder().raw_decode``: the first object that carries a ``decision`` key wins, else the
     first object that decodes at all. An object that opens inside a ``{...}`` block that did NOT decode is part of that malformed
-    reply and is not taken as the answer (a decision quoted inside invalid JSON must not be accepted). When no ``{`` starts a decodable object (a malformed reply) it falls back to the first
+    reply and is not taken as the answer (a decision quoted inside invalid JSON must not be accepted). That includes a TRUNCATED outer object (one that opens
+    like JSON, `{"`, and never closes): everything after it is part of it. When no ``{`` starts a decodable object (a malformed reply) it falls back to the first
     string-aware balanced block, so ``parse_decision`` can still report "json decode failed" rather than "no JSON block"; None
     when no `{` starts a block that closes.
     """
@@ -230,6 +234,10 @@ def _extract_json_block(text: str) -> str | None:
             balanced = _balanced_block(text, start)
             if balanced is not None:
                 inside_failed_until = start + len(balanced)
+            elif _OBJECT_START.match(text, start):
+                # An object that opens like JSON (`{"`) and never closes is a truncated reply: everything after it is part of it.
+                # (A `{` that opens prose, such as "I considered { maybe", is not, and does not hide a later answer.)
+                inside_failed_until = len(text)
         else:
             balanced = None
             if isinstance(obj, dict):
