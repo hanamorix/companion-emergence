@@ -253,3 +253,51 @@ def test_narrative_pass_is_skipped_when_the_real_exemption_read_fails(
 
     assert ran == []
     assert not (persona_dir / "hebbian.db").exists(), "a skipped pass must not open the stores"
+
+
+def test_430_c9_merge_target_of_accepted_candidate_stays_out_of_open_arcs(tmp_path: Path) -> None:
+    """#430 C9: the narrative pass shares the forgetting loader, so the merge target of an accepted soul
+    candidate is exempt there too and the candidate sweep skips it (the treatment every crystallised
+    memory already gets). The control row, joined to the same arc by the same hebbian edge, does join."""
+    from datetime import UTC, datetime, timedelta
+
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.narrative_memory.arc import Arc, ArcMember
+    from brain.narrative_memory.state import ArcsState, load_or_recover, save_state
+    from tests.forgetting.test_orchestrator import (
+        _accept_candidate_for_real,
+        _merge_a_candidate_into_a_target,
+    )
+
+    cand_id, target_id, control_id = _merge_a_candidate_into_a_target(tmp_path)
+    _accept_candidate_for_real(tmp_path, cand_id)
+
+    opened = (datetime.now(UTC) - timedelta(days=50)).isoformat()
+    seed = ArcMember(memory_id="seed", joined_at_iso=opened, lived_age_at_join=1.0, salience_at_join=0.9)
+    arc = Arc(
+        id="arc_1",
+        state="open",
+        seed_anchor_type="dream",
+        seed_anchor_ref="dreams.log.jsonl:1",
+        seed_memory_ids=("seed",),
+        title="tea",
+        opened_at_iso=opened,
+        lived_age_at_open=1.0,
+        last_extended_at_iso=datetime.now(UTC).isoformat(),
+        closed_at_iso=None,
+        lived_age_at_close=None,
+        members=(seed,),
+    )
+    save_state(tmp_path, ArcsState(open={"arc_1": arc}, last_pass_ts_iso=datetime.now(UTC).isoformat()))
+    hebbian = HebbianMatrix(tmp_path / "hebbian.db")
+    try:
+        hebbian.set_edge_weight(target_id, "seed", 5.0)
+        hebbian.set_edge_weight(control_id, "seed", 5.0)
+    finally:
+        hebbian.close()
+
+    _run_narrative_memory_pass(tmp_path, provider=MagicMock(), event_bus=MagicMock())
+
+    members = {m.memory_id for m in load_or_recover(tmp_path).open["arc_1"].members}
+    assert control_id in members, "control must join, or the target's absence proves nothing"
+    assert target_id not in members, "an exempt merge target must not join a new arc"
