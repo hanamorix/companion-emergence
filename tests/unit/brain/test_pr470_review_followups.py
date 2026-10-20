@@ -338,3 +338,122 @@ def test_finalize_survives_a_buffer_that_vanishes_during_the_rename(world, monke
     assert sorted(r.session_id for r in reports) == ["sess_a_race", "sess_b_free"]
     assert (persona / "active_conversations" / "poison" / "sess_b_free.jsonl").exists()
     assert read_backoff(persona, "sess_a_race") is None  # gone: nothing left to poison, the record is cleared
+
+
+# --- round-4 S2: find_json_object_block is linear on a reply of many unclosed braces -------------------------------------
+
+
+def _reference_balanced_block(text: str, start: int) -> str | None:
+    """The #478 scan exactly as it was before it was made linear (kept here as the oracle)."""
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
+def _reference_find_json_object_block(text: str, prefer_key: str | None = None) -> str | None:
+    """`find_json_object_block` as it was before (quadratic on many unclosed braces): the oracle for "no result changes"."""
+    import json
+    import re
+
+    object_start = re.compile(r'\{\s*"')
+    decoder = json.JSONDecoder()
+    first_object = None
+    first_balanced = None
+    inside_failed_until = 0
+    start = text.find("{")
+    while start >= 0:
+        if start < inside_failed_until:
+            start = text.find("{", start + 1)
+            continue
+        try:
+            obj, end = decoder.raw_decode(text, start)
+        except (ValueError, RecursionError):
+            obj = None
+            balanced = _reference_balanced_block(text, start)
+            if balanced is not None:
+                inside_failed_until = start + len(balanced)
+            elif object_start.match(text, start):
+                inside_failed_until = len(text)
+        else:
+            balanced = None
+            if isinstance(obj, dict):
+                block = text[start:end]
+                if prefer_key is not None and prefer_key in obj:
+                    return block
+                if first_object is None:
+                    first_object = block
+        if first_balanced is None:
+            first_balanced = balanced if balanced is not None else _reference_balanced_block(text, start)
+        start = text.find("{", start + 1)
+    return first_object if first_object is not None else first_balanced
+
+
+def test_find_json_object_block_gives_the_same_result_as_before_on_every_short_reply():
+    # PIN (passes before and after): every string up to 6 characters over the characters that matter to the scan (braces,
+    # quotes, a backslash, a letter, a colon), for no preferred key and for one that can match.
+    import itertools
+
+    from brain.utils.llm_output import find_json_object_block
+
+    for length in range(1, 7):
+        for chars in itertools.product('{}"\\a:', repeat=length):
+            text = "".join(chars)
+            for key in (None, "a"):
+                assert find_json_object_block(text, key) == _reference_find_json_object_block(text, key), (text, key)
+
+
+def test_find_json_object_block_gives_the_same_result_as_before_on_longer_random_replies():
+    import random
+
+    from brain.utils.llm_output import find_json_object_block
+
+    rng = random.Random(478)
+    pieces = ["{", "}", '"', "\\", "\\\\", '\\"', ":", ",", " ", "a", "1", '"a"', '"decision"', '{"a": 1}', '{"decision": "x"}',
+              "prose ", "[", "]", "{{", "}}", '{"', '"}', "\n", "\t", "\r", "{}", "{ }"]
+    for _ in range(4000):
+        text = "".join(rng.choice(pieces) for _ in range(rng.randint(1, 30)))
+        for key in (None, "a", "decision"):
+            assert find_json_object_block(text, key) == _reference_find_json_object_block(text, key), (text, key)
+
+
+@pytest.mark.parametrize("unit", ["{", "{ ", 'x {"', "{[", '{"a": {', 'say { "'])
+def test_find_json_object_block_is_linear_on_a_reply_of_many_unclosed_braces(unit):
+    # S2 of the round-4 review: each `{` that failed to decode re-scanned to the end of the text, so 8000 braces took 5 s (the
+    # classifier is exposed to a degenerate repetition reply). A generous ceiling, hundreds of times what a linear pass needs
+    # and far under what the quadratic one takes at this size.
+    import time
+
+    from brain.utils.llm_output import find_json_object_block
+
+    text = unit * 10_000
+    started = time.perf_counter()
+    find_json_object_block(text, prefer_key="verdict")
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 1.5, f"{elapsed:.2f}s for {len(text)} chars of {unit!r}"
+
+
+def test_find_json_object_block_still_finds_the_answer_after_many_unclosed_braces():
+    from brain.utils.llm_output import find_json_object_block
+
+    text = "{ " * 5_000 + 'then the answer {"verdict": "new"}'
+    assert find_json_object_block(text, prefer_key="verdict") == '{"verdict": "new"}'

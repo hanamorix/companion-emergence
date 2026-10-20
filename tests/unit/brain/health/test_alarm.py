@@ -113,12 +113,16 @@ def test_fewer_rows_than_the_recurring_threshold_raise_no_alarm(tmp_path: Path, 
 
 
 @pytest.mark.parametrize("name", [_QUARANTINE, _DAMAGED])
-def test_rows_at_the_recurring_threshold_raise_one_alarm_with_the_count(tmp_path: Path, name: str) -> None:
+def test_rows_at_the_recurring_threshold_raise_one_alarm_with_at_least_the_threshold(tmp_path: Path, name: str) -> None:
     stamps = _recent(RECURRING_THRESHOLD + 2)
     _rows(tmp_path, name, stamps)
     alarms = compute_pending_alarms(tmp_path)
-    assert [(a.file, a.kind, a.occurrences_in_window) for a in alarms] == [(name, _KIND[name], len(stamps))]
-    assert abs((alarms[0].first_seen_at - stamps[0]).total_seconds()) < 1  # the oldest counted row
+    # "At least the threshold": the read stops once the alarm has what it needs, so the count is the threshold itself and
+    # first_seen_at is the oldest of those newest rows (not the true first row of the window).
+    assert [(a.file, a.kind, a.occurrences_in_window, a.at_least) for a in alarms] == [
+        (name, _KIND[name], RECURRING_THRESHOLD, True)
+    ]
+    assert abs((alarms[0].first_seen_at - stamps[-RECURRING_THRESHOLD]).total_seconds()) < 1
 
 
 def test_the_threshold_is_the_one_the_anomaly_alarm_already_used() -> None:
@@ -158,7 +162,7 @@ def test_a_damaged_line_inside_the_tail_does_not_hide_the_older_rows(tmp_path: P
     lines = path.read_text(encoding="utf-8").splitlines()
     lines.insert(len(lines) - 2, "{torn")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    assert [a.occurrences_in_window for a in compute_pending_alarms(tmp_path)] == [len(stamps)]
+    assert [a.occurrences_in_window for a in compute_pending_alarms(tmp_path)] == [RECURRING_THRESHOLD]
 
 
 def test_the_read_is_bounded_by_the_window_not_the_history_of_the_file(tmp_path: Path, monkeypatch) -> None:
@@ -250,3 +254,49 @@ def test_damaged_queue_lines_kept_aside_by_a_claim_raise_the_alarm(tmp_path: Pat
     assert [(a.file, a.kind, a.occurrences_in_window) for a in compute_pending_alarms(tmp_path)] == [
         (_DAMAGED, "damaged_queue_lines", RECURRING_THRESHOLD)
     ]
+
+
+def test_an_anomaly_alarm_is_still_an_exact_count(tmp_path: Path) -> None:
+    when = datetime.now(UTC)
+    _seed(tmp_path, [_audit_entry("user_preferences.json", when - timedelta(minutes=i)) for i in range(RECURRING_THRESHOLD + 3)])
+    (alarm,) = compute_pending_alarms(tmp_path)
+    assert (alarm.occurrences_in_window, alarm.at_least) == (RECURRING_THRESHOLD + 3, False)
+
+
+def test_a_huge_window_file_is_read_only_as_far_as_the_alarm_needs(tmp_path: Path, monkeypatch) -> None:
+    # S1 of the round-4 review: a gate bug that quarantines tens of thousands of candidates in the window makes the WINDOW the
+    # whole file, and this runs on every /health poll and heartbeat tick. Count what is read (rows asked for, bytes taken from
+    # the file), not the time: the alarm needs only the threshold's worth of newest rows.
+    from brain.health import json_io
+
+    base = datetime.now(UTC) - timedelta(hours=20)
+    lines = [
+        json.dumps({"quarantined_at": (base + timedelta(seconds=i)).isoformat(), "entry": {"id": f"c{i}", "pad": "x" * 200}})
+        for i in range(50_000)
+    ]
+    path = tmp_path / _QUARANTINE
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    size = path.stat().st_size
+
+    asked: list[int] = []
+    taken: list[int] = []
+    real_tail, real_lines = alarm_mod.read_jsonl_tail, json_io._tail_lines
+
+    def spy_tail(p, n, **kw):
+        asked.append(n)
+        return real_tail(p, n, **kw)
+
+    def spy_lines(p, n):
+        out = real_lines(p, n)
+        taken.append(sum(len(x) for x in out))
+        return out
+
+    monkeypatch.setattr(alarm_mod, "read_jsonl_tail", spy_tail)
+    monkeypatch.setattr(json_io, "_tail_lines", spy_lines)
+    (alarm,) = compute_pending_alarms(tmp_path)
+
+    assert (alarm.file, alarm.kind, alarm.occurrences_in_window, alarm.at_least) == (
+        _QUARANTINE, "quarantined_candidates", RECURRING_THRESHOLD, True
+    )
+    assert max(asked) <= 2 * RECURRING_THRESHOLD  # never the whole window
+    assert sum(taken) < size // 100  # under 1% of the file's bytes

@@ -191,7 +191,7 @@ def test_cli_health_show_lists_a_quarantine_alarm_and_acknowledge_clears_it(monk
     out = capsys.readouterr().out
     assert "Pending alarms: 1" in out
     assert "consolidation_quarantine.jsonl: quarantined_candidates" in out
-    assert "(6 occurrences in window)" in out
+    assert "(at least 6 occurrences in window)" in out
 
     assert main(["health", "acknowledge", "--persona", "testpersona", "--file", "consolidation_quarantine.jsonl"]) == 0
     capsys.readouterr()
