@@ -47,12 +47,9 @@ class BridgeState:
     # committed to git or logged. None for legacy state files (auth disabled
     # for backward compat — runner.py always generates one in real use).
     auth_token: str | None = None
-    # Number of session-ingest errors during the last shutdown drain.
-    # Set by the FastAPI lifespan finally block when reports[i].errors > 0.
-    # `_write_clean_shutdown` honours this: a process with drain_errors > 0
-    # is treated as dirty (shutdown_clean=False) so the next bridge start
-    # re-runs `run_recovery_if_needed` and retries the orphan buffers.
-    # Default 0 for legacy state files written before this field existed.
+    # Ingest errors of the last shutdown drain, written by versions before #456 (no drain any more, Q-B). Kept so an
+    # older file of that shape still reads as "recovery needed" (#471); the next start's first idle pass saves the
+    # sessions either way.
     drain_errors: int = 0
     # Process identity (#456): the token brain.process_identity computes for this bridge at start, so a reused pid
     # is never taken for the bridge. `identity` is "token" when pid_token is set, "unavailable" when this platform
@@ -209,9 +206,10 @@ def pid_is_alive(pid: int) -> bool:
 def recovery_needed(persona_dir: Path) -> bool:
     """True iff the previous bridge process exited dirty and is gone.
 
-    Dirty = ``shutdown_clean`` False, or the last shutdown drain reported ingest errors. A dirty record whose pid was
-    cleared (``_write_clean_shutdown`` clears it on the way out, also after drain errors, #471) is gone by
-    construction; one with a pid is gone when its identity says so (``bridge_liveness``)."""
+    Dirty = ``shutdown_clean`` False, or (in a file written before #456) a shutdown drain that reported ingest
+    errors. A dirty record whose pid was cleared (older versions cleared it on the way out, also after drain errors,
+    #471) is gone by construction; one with a pid is gone when its identity says so (``bridge_liveness``).
+    "Recovery" is the next start's first idle pass (the gated job ``session_snapshot_prune``), not a step at start."""
     state = read(persona_dir)
     if state is None:
         return False

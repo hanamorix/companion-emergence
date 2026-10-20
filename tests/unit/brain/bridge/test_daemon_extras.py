@@ -25,7 +25,6 @@ def _isolated_spawned_children(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(daemon, "_spawned_children", {})
 
 
-
 @pytest.fixture(autouse=True)
 def _records_here_prove_they_are_bridges(monkeypatch):
     """#456 (D22): a token-less bridge.json counts as a live bridge only when the pid's command line proves it is a
@@ -189,7 +188,6 @@ def test_cmd_run_calls_foreground_runner_without_detaching(
         return 0
 
     monkeypatch.setattr(daemon, "spawn_detached", fail_detach)
-    monkeypatch.setattr(daemon, "run_recovery_if_needed", lambda persona_dir: None)
     monkeypatch.setattr("brain.bridge.runner.run_bridge_foreground", fake_foreground)
 
     rc = daemon.cmd_run(_args("nell", idle_shutdown=0, client_origin="launchd"))
@@ -219,7 +217,6 @@ def test_cmd_run_converts_idle_shutdown_minutes(
         calls["idle_shutdown_seconds"] = idle_shutdown_seconds
         return 0
 
-    monkeypatch.setattr(daemon, "run_recovery_if_needed", lambda persona_dir: None)
     monkeypatch.setattr("brain.bridge.runner.run_bridge_foreground", fake_foreground)
 
     rc = daemon.cmd_run(_args("nell", idle_shutdown=2.5, client_origin="cli"))
@@ -253,7 +250,6 @@ def test_cmd_run_lets_the_os_lock_decide_over_a_record(
     )
     ran: list[bool] = []
     monkeypatch.setattr("brain.bridge.runner.run_bridge_foreground", lambda *a, **k: ran.append(True) or 0)
-    monkeypatch.setattr(daemon, "run_recovery_if_needed", lambda _p: None, raising=False)
 
     rc = daemon.cmd_run(_args("nell", idle_shutdown=0, client_origin="launchd"))
 
@@ -569,148 +565,6 @@ def _seed_persona_config(persona_dir: Path) -> None:
         mcp_audit_log_level="info",
         user_name="Hana",
     ).save(persona_dir / "persona_config.json")
-
-
-# ---------- run_recovery_if_needed (lines 52-78) ----------
-
-
-def test_run_recovery_returns_none_when_state_file_missing(
-    tmp_path: Path,
-) -> None:
-    """No bridge.json at all → recovery not needed → returns None."""
-    persona_dir = tmp_path / "persona"
-    persona_dir.mkdir()
-    assert daemon.run_recovery_if_needed(persona_dir) is None
-
-
-def test_run_recovery_returns_none_when_previous_shutdown_clean(
-    tmp_path: Path,
-) -> None:
-    """Previous bridge shutdown_clean=True → recovery not needed → returns None."""
-    from brain.bridge import state_file
-
-    persona_dir = tmp_path / "persona"
-    persona_dir.mkdir()
-    state_file.write(
-        persona_dir,
-        state_file.BridgeState(
-            persona="nell",
-            pid=99999,
-            port=50000,
-            started_at="2026-05-08T00:00:00+00:00",
-            stopped_at="2026-05-08T01:00:00+00:00",
-            shutdown_clean=True,
-            client_origin="cli",
-        ),
-    )
-    assert daemon.run_recovery_if_needed(persona_dir) is None
-
-
-def test_run_recovery_returns_none_when_dirty_but_pid_still_alive(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Dirty shutdown but the recorded pid is still alive → bridge actually
-    running, recovery would clobber it. Must return None."""
-    from brain.bridge import state_file
-
-    persona_dir = tmp_path / "persona"
-    persona_dir.mkdir()
-    state_file.write(
-        persona_dir,
-        state_file.BridgeState(
-            persona="nell",
-            pid=12345,
-            port=50000,
-            started_at="2026-05-08T00:00:00+00:00",
-            stopped_at=None,
-            shutdown_clean=False,
-            client_origin="cli",
-        ),
-    )
-    monkeypatch.setattr(state_file, "pid_is_alive", lambda _pid: True)
-    assert daemon.run_recovery_if_needed(persona_dir) is None
-
-
-def test_run_recovery_runs_drain_when_dirty_with_dead_pid(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Dirty shutdown + dead pid → recovery fires, drains stale sessions,
-    returns the report count."""
-    from brain.bridge import state_file
-
-    persona_dir = tmp_path / "persona"
-    persona_dir.mkdir()
-    _seed_persona_config(persona_dir)
-    state_file.write(
-        persona_dir,
-        state_file.BridgeState(
-            persona="nell",
-            pid=99999,
-            port=50000,
-            started_at="2026-05-08T00:00:00+00:00",
-            stopped_at=None,
-            shutdown_clean=False,
-            client_origin="cli",
-        ),
-    )
-    monkeypatch.setattr(state_file, "pid_is_alive", lambda _pid: False)
-
-    captured: dict[str, object] = {}
-
-    def fake_snapshot_stale(
-        persona_dir_arg,
-        *,
-        silence_minutes,
-        store,
-        hebbian,
-        provider,
-    ):
-        captured["persona_dir"] = persona_dir_arg
-        captured["silence_minutes"] = silence_minutes
-        # Report list of 2 to assert returned count.
-        return [object(), object()]
-
-    monkeypatch.setattr("brain.bridge.daemon.snapshot_stale_sessions", fake_snapshot_stale)
-
-    drained = daemon.run_recovery_if_needed(persona_dir)
-    assert drained == 2
-    assert captured["persona_dir"] == persona_dir
-    assert captured["silence_minutes"] == 0
-
-
-def test_run_recovery_fires_on_drain_errors_even_when_shutdown_clean(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """drain_errors>0 arm: shutdown_clean=True but the last drain failed,
-    so the buffer was retained — recovery must run anyway."""
-    from brain.bridge import state_file
-
-    persona_dir = tmp_path / "persona"
-    persona_dir.mkdir()
-    _seed_persona_config(persona_dir)
-    state_file.write(
-        persona_dir,
-        state_file.BridgeState(
-            persona="nell",
-            pid=99999,
-            port=50000,
-            started_at="2026-05-08T00:00:00+00:00",
-            stopped_at="2026-05-08T01:00:00+00:00",
-            shutdown_clean=True,
-            client_origin="cli",
-            drain_errors=3,
-        ),
-    )
-    monkeypatch.setattr(state_file, "pid_is_alive", lambda _pid: False)
-    monkeypatch.setattr(
-        "brain.bridge.daemon.snapshot_stale_sessions",
-        lambda *a, **kw: [],
-    )
-    drained = daemon.run_recovery_if_needed(persona_dir)
-    assert drained == 0  # ran, but no orphan sessions to snapshot
 
 
 # ---------- acquire_lock / release_lock (lines 81-114) ----------
@@ -1107,98 +961,6 @@ def test_cmd_start_returns_2_when_lock_held(
     assert "lockfile held" in capsys.readouterr().err
 
 
-def test_cmd_start_prints_drain_message_when_recovery_ran(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Recovery returns 2 drained sessions → user-visible message + spawn proceeds."""
-    from brain.bridge import state_file
-
-    log_dir = _patch_paths(monkeypatch, tmp_path)
-    monkeypatch.setattr(state_file, "is_running", lambda _p: False)
-    monkeypatch.setattr(daemon, "run_recovery_if_needed", lambda _p: 2)
-
-    written_pid = 7777
-
-    def fake_spawn(persona_dir_arg, idle, client_origin, log_path):
-        # Write state_file as the runner would so verify loop sees a fresh state.
-        state_file.write(
-            persona_dir_arg,
-            state_file.BridgeState(
-                persona="nell",
-                pid=written_pid,
-                port=51001,
-                started_at="2026-05-08T00:00:00+00:00",
-                stopped_at=None,
-                shutdown_clean=False,
-                client_origin=client_origin,
-                auth_token="tok",
-            ),
-        )
-        return written_pid
-
-    monkeypatch.setattr(daemon, "spawn_detached", fake_spawn)
-
-    class FakeResp:
-        status_code = 200
-
-        def json(self):
-            return {}
-
-    monkeypatch.setattr("httpx.get", lambda *a, **kw: FakeResp())
-
-    rc = daemon.cmd_start(_args("nell"))
-    assert rc == 0
-    captured = capsys.readouterr()
-    assert "snapshotted 2 active sessions" in captured.out
-    assert "bridge started on port 51001" in captured.out
-    assert log_dir.exists()
-
-
-def test_cmd_start_prints_no_drain_message_when_recovery_ran_empty(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Recovery ran but drained 0 sessions → "no orphan sessions to drain" message."""
-    from brain.bridge import state_file
-
-    _patch_paths(monkeypatch, tmp_path)
-    monkeypatch.setattr(state_file, "is_running", lambda _p: False)
-    monkeypatch.setattr(daemon, "run_recovery_if_needed", lambda _p: 0)
-
-    def fake_spawn(persona_dir_arg, idle, client_origin, log_path):
-        state_file.write(
-            persona_dir_arg,
-            state_file.BridgeState(
-                persona="nell",
-                pid=8888,
-                port=51002,
-                started_at="2026-05-08T00:00:00+00:00",
-                stopped_at=None,
-                shutdown_clean=False,
-                client_origin=client_origin,
-            ),
-        )
-        return 8888
-
-    monkeypatch.setattr(daemon, "spawn_detached", fake_spawn)
-
-    class FakeResp:
-        status_code = 200
-
-        def json(self):
-            return {}
-
-    monkeypatch.setattr("httpx.get", lambda *a, **kw: FakeResp())
-
-    rc = daemon.cmd_start(_args("nell"))
-    assert rc == 0
-    out = capsys.readouterr().out
-    assert "no orphan sessions to drain" in out
-
-
 def test_cmd_start_kills_orphan_child_when_health_never_responds(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1212,7 +974,6 @@ def test_cmd_start_kills_orphan_child_when_health_never_responds(
 
     _patch_paths(monkeypatch, tmp_path)
     monkeypatch.setattr(state_file, "is_running", lambda _p: False)
-    monkeypatch.setattr(daemon, "run_recovery_if_needed", lambda _p: None)
 
     orphan_pid = 9090
 
@@ -1297,7 +1058,6 @@ def test_cmd_run_waits_for_a_held_lock_instead_of_returning_2(
 
     monkeypatch.setattr(daemon, "acquire_lock", fake_acquire)
     monkeypatch.setattr(daemon, "release_lock", lambda _p, _fd: None)
-    monkeypatch.setattr(daemon, "run_recovery_if_needed", lambda _p: None, raising=False)
     ran: list[bool] = []
     monkeypatch.setattr("brain.bridge.runner.run_bridge_foreground", lambda *a, **k: ran.append(True) or 0)
     rc = daemon.cmd_run(_args("nell", idle_shutdown=0, client_origin="launchd"))
@@ -2036,7 +1796,6 @@ def test_cmd_start_kills_orphan_via_shared_helper_tolerating_windows_already_dea
 
     _patch_paths(monkeypatch, tmp_path)
     monkeypatch.setattr(state_file, "is_running", lambda _p: False)
-    monkeypatch.setattr(daemon, "run_recovery_if_needed", lambda _p: None)
     monkeypatch.setattr(daemon, "_IS_WINDOWS", True)
     # cmd_start's own pre-flight acquire_lock also takes the (now Windows-
     # shaped) branch; stand in for the real (POSIX-only-here) msvcrt module
@@ -2136,7 +1895,6 @@ def _early_exit_setup(
     from brain.bridge import state_file
 
     _patch_paths(monkeypatch, tmp_path)
-    monkeypatch.setattr(daemon, "run_recovery_if_needed", lambda _p: None)
 
     def fake_spawn(pd, idle, origin, log_path):
         daemon._spawned_children[child.pid] = child

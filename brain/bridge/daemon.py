@@ -1,4 +1,4 @@
-"""SP-7 bridge daemon orchestration — process spawn, stop, status, recovery.
+"""SP-7 bridge daemon orchestration — process spawn, stop, status.
 
 Public surface used by CLI handlers in brain.cli:
   cmd_start(args)    -> int
@@ -10,8 +10,6 @@ Public surface used by CLI handlers in brain.cli:
   cmd_tail_log(args) -> int
 
 Internal:
-  run_recovery_if_needed(persona_dir) — snapshot orphan buffers (non-destructive)
-    if previous bridge exited dirty.
   spawn_detached(persona_dir, idle_shutdown_seconds, client_origin, log_path) -> pid
 """
 
@@ -31,10 +29,6 @@ from pathlib import Path
 import httpx
 
 from brain.bridge import state_file
-from brain.bridge.model_tier import TIER_BACKGROUND_HOUSEKEEPING, build_tier_provider
-from brain.ingest.pipeline import snapshot_stale_sessions
-from brain.memory.hebbian import HebbianMatrix
-from brain.memory.store import MemoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -66,38 +60,6 @@ else:
 # at that offset, and an os.ftruncate() to a smaller size afterward does
 # not release or move the lock (the lock is independent of current EOF).
 _WINDOWS_LOCK_OFFSET = 1 << 20  # 1 MiB
-
-
-def run_recovery_if_needed(persona_dir: Path) -> int | None:
-    """If previous bridge exited dirty, drain orphan buffers.
-
-    Returns:
-        None — recovery was not needed (clean previous shutdown or fresh start)
-        int  — recovery ran; value is the count of drained sessions (may be 0)
-    """
-    if not state_file.recovery_needed(persona_dir):
-        return None
-    prev = state_file.read(persona_dir)
-    logger.warning(
-        "previous bridge exited dirty (pid=%s started_at=%s) — running recovery",
-        prev.pid if prev else "?",
-        prev.started_at if prev else "?",
-    )
-    store = MemoryStore(persona_dir / "memories.db")
-    hebbian = HebbianMatrix(persona_dir / "hebbian.db")
-    provider = build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING)
-    try:
-        reports = snapshot_stale_sessions(
-            persona_dir,
-            silence_minutes=0,
-            store=store,
-            hebbian=hebbian,
-            provider=provider,
-        )
-        return len(reports)
-    finally:
-        store.close()
-        hebbian.close()
 
 
 def acquire_lock(persona_dir: Path, *, blocking: bool = False) -> int | None:
@@ -359,12 +321,8 @@ def cmd_start(args, *, out: dict | None = None) -> int:
         except Exception:
             logger.debug("launchd log truncation skipped", exc_info=True)
 
-    drained = run_recovery_if_needed(persona_dir)
-    if drained is not None:
-        if drained > 0:
-            print(f"recovered from interrupted shutdown - snapshotted {drained} active sessions")
-        else:
-            print("recovered from dirty shutdown (no orphan sessions to drain)")
+    # #456 (D12, Q-B): no synchronous recovery here. The bridge's first idle pass saves every open session through
+    # the gated job session_snapshot_prune (inside the background slot), whatever ended the last bridge.
 
     log_path = get_log_dir() / f"bridge-{persona_dir.name}.log"
     idle = float(args.idle_shutdown) * 60 if args.idle_shutdown > 0 else None
@@ -481,13 +439,7 @@ def cmd_run(args) -> int:
             except Exception:
                 logger.debug("launchd log truncation skipped", exc_info=True)
 
-        drained = run_recovery_if_needed(persona_dir)
-        if drained is not None:
-            if drained > 0:
-                print(f"recovered from interrupted shutdown - snapshotted {drained} active sessions")
-            else:
-                print("recovered from dirty shutdown (no orphan sessions to drain)")
-
+        # #456 (D12): no synchronous recovery; the first idle pass saves the sessions (see cmd_start).
         from brain.bridge.runner import run_bridge_foreground
 
         idle = float(args.idle_shutdown) * 60 if args.idle_shutdown > 0 else None

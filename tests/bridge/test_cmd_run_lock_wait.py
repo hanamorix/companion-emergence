@@ -55,7 +55,6 @@ def _holder(persona_dir: Path, tmp_path: Path):
 def _run_in_thread(monkeypatch, persona_dir):
     ran = threading.Event()
     monkeypatch.setattr("brain.bridge.runner.run_bridge_foreground", lambda pd, **kw: ran.set() or 0)
-    monkeypatch.setattr(daemon, "run_recovery_if_needed", lambda pd: None, raising=False)
     result: dict = {}
     args = SimpleNamespace(persona="nell", idle_shutdown=0, client_origin="tests")
     t = threading.Thread(target=lambda: result.setdefault("rc", daemon.cmd_run(args)), daemon=True)
