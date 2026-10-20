@@ -26,6 +26,7 @@ import stat
 import threading
 import time
 from collections.abc import Callable, Iterator
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -268,6 +269,37 @@ def fsync_dir(directory: Path) -> None:
         os.close(dir_fd)
 
 
+def _write_temp_file(
+    new_path: Path,
+    payload: str | bytes,
+    *,
+    mode: int | None,
+    fsync: bool,
+    encoding: str | None = None,
+    newline: str | None = None,
+) -> None:
+    """Create the save's own temp with ``payload``, flushed and (when ``fsync``) fsynced, so the data is on disk before
+    the replace that publishes it. The one temp-open under the text and the bytes writer.
+
+    A ``str`` payload is written in text mode with ``encoding`` and ``newline`` (the same open as ``Path.write_text``,
+    so the bytes written per platform are unchanged); ``bytes`` are written as they are. With ``mode`` the temp is
+    created exclusively with that mode at ``os.open`` time (a secret is never wider than ``mode`` even for an instant,
+    subject to the umask).
+    """
+    open_mode = "w" if isinstance(payload, str) else "wb"
+    text_options = {"encoding": encoding, "newline": newline} if isinstance(payload, str) else {}
+    if mode is None:
+        new_file = new_path.open(open_mode, **text_options)
+    else:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        new_file = os.fdopen(os.open(new_path, flags, mode), open_mode, **text_options)
+    with new_file as f:
+        f.write(payload)
+        f.flush()
+        if fsync:
+            os.fsync(f.fileno())
+
+
 def save_with_backup_text(
     path: Path,
     text: str,
@@ -305,21 +337,7 @@ def save_with_backup_text(
     temp file's open (``"\n"`` gives the same bytes on every platform);
     ``encoding`` is the text encoding (default utf-8; the Windows task XML is UTF-16).
     """
-    def write_temp(new_path: Path) -> None:
-        # Same open as Path.write_text (text mode; no newline= unless asked) so
-        # the bytes written per platform are unchanged; flushed and fsynced so
-        # the data is on disk before the replace below can publish it.
-        if mode is None:
-            new_file = new_path.open("w", encoding=encoding, newline=newline)
-        else:
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-            new_file = os.fdopen(os.open(new_path, flags, mode), "w", encoding=encoding, newline=newline)
-        with new_file as f:
-            f.write(text)
-            f.flush()
-            if fsync:
-                os.fsync(f.fileno())
-
+    write_temp = partial(_write_temp_file, payload=text, mode=mode, fsync=fsync, encoding=encoding, newline=newline)
     _save_payload(
         path, write_temp, fsync=fsync, keep_backups=keep_backups, backup_count=backup_count, backup_mode=mode
     )
@@ -334,19 +352,7 @@ def save_bytes_atomic(path: Path, data: bytes, *, mode: int | None = None, fsync
     and removes the save's own temp. For binary payloads: the identity key, uploaded blobs, a copied legacy file, a gzip
     archive.
     """
-
-    def write_temp(new_path: Path) -> None:
-        if mode is None:
-            new_file = new_path.open("wb")
-        else:
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-            new_file = os.fdopen(os.open(new_path, flags, mode), "wb")
-        with new_file as f:
-            f.write(data)
-            f.flush()
-            if fsync:
-                os.fsync(f.fileno())
-
+    write_temp = partial(_write_temp_file, payload=data, mode=mode, fsync=fsync)
     _save_payload(path, write_temp, fsync=fsync)
 
 

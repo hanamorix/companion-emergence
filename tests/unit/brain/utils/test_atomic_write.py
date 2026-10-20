@@ -630,3 +630,57 @@ def test_g12_no_mkstemp_anywhere_in_brain():
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
             if isinstance(node, ast.Attribute) and node.attr == "mkstemp":
                 raise AssertionError(path)
+
+
+# --- the one temp-open helper under the text and bytes writers -----------------------------------------------------
+
+
+def test_text_and_bytes_writers_share_one_temp_open_helper(tmp_path, monkeypatch):
+    calls: list[tuple[str, type]] = []
+    real = aw._write_temp_file
+
+    def spy(new_path, payload, **kw):
+        calls.append((new_path.name, type(payload)))
+        return real(new_path, payload, **kw)
+
+    monkeypatch.setattr(aw, "_write_temp_file", spy)
+    save_bytes_atomic(tmp_path / "b.bin", b"x")
+    save_with_backup_text(tmp_path / "t.txt", "x", keep_backups=False)
+    assert [(n.split(".t", 1)[0] if n.startswith("b.bin") else n[:5], t) for n, t in calls] == [
+        ("b.bin", bytes),
+        ("t.txt", str),
+    ]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+@pytest.mark.parametrize("kind", ["text", "bytes"])
+def test_both_writers_apply_the_mode_to_the_temp_and_fsync_the_file_before_publishing(
+    tmp_path, monkeypatch, kind
+):
+    events: list[str] = []
+    modes: list[int] = []
+    real_fsync, real_replace = os.fsync, os.replace
+    monkeypatch.setattr(os, "fsync", lambda fd: (events.append("fsync"), real_fsync(fd))[1])
+
+    def replace(src, dst):
+        modes.append(stat.S_IMODE(os.stat(src).st_mode))
+        events.append("replace")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(aw, "fsync_dir", lambda d: None)
+    p = tmp_path / "f"
+    if kind == "text":
+        save_with_backup_text(p, "secret", keep_backups=False, mode=0o600)
+    else:
+        save_bytes_atomic(p, b"secret", mode=0o600)
+    assert events == ["fsync", "replace"] and modes == [0o600]
+    assert stat.S_IMODE(p.stat().st_mode) == 0o600 and p.read_bytes() == b"secret"
+
+
+def test_text_writer_keeps_its_newline_and_encoding_options(tmp_path):
+    p = tmp_path / "t.txt"
+    save_with_backup_text(p, "a\nb\n", keep_backups=False, newline="\n")
+    assert p.read_bytes() == b"a\nb\n"
+    save_with_backup_text(p, "hé", keep_backups=False, encoding="utf-16")
+    assert p.read_bytes().decode("utf-16") == "hé"
