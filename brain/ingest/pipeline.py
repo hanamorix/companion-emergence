@@ -25,6 +25,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.bridge.provider import LLMProvider
+from brain.health.json_io import append_jsonl
 from brain.ingest.buffer import (
     delete_backoff,
     delete_cursor,
@@ -78,6 +79,42 @@ def _load_emotion_vocab() -> tuple[set[str], str]:
 # on a wedged buffer. Success clears the state.
 _BACKOFF_FAILURE_THRESHOLD = 3
 _BACKOFF_WINDOW_MINUTES = 10.0
+
+
+def extraction_failures_exhausted(persona_dir: Path, session_id: str) -> bool:
+    """True when the session's recorded extraction failures reached the poison threshold (the same one the stale sweep uses)."""
+    state = read_backoff(persona_dir, session_id)
+    return state is not None and state["failures"] >= _BACKOFF_FAILURE_THRESHOLD
+
+
+def poison_unextracted_span(persona_dir: Path, session_id: str) -> int:
+    """Set the session's not-yet-extracted turns aside in ``active_conversations/poison/<sid>.span.jsonl`` and move the cursor past
+    them, so the buffer can be folded and reaped (#477).
+
+    The stale sweep moves a whole buffer to ``poison/`` after the same 3 recorded failures, but only once the session has been silent
+    for 24 hours; a session in daily use with a persistent extraction failure would otherwise grow without bound once the rollover
+    refuses to reap unextracted turns. The turns are KEPT (appended verbatim, never silently lost) and the failure record is cleared
+    so the successor session starts clean. Returns how many turns were set aside; raises OSError when they cannot be written, in which
+    case nothing has been changed (the caller must not reap).
+    """
+    cursor = read_cursor(persona_dir, session_id)
+    turns = [t for t in read_session_after(persona_dir, session_id, cursor) if t.get("speaker") != "summary"]
+    if not turns:
+        delete_backoff(persona_dir, session_id)
+        return 0
+    poison_dir = persona_dir / "active_conversations" / "poison"
+    poison_dir.mkdir(parents=True, exist_ok=True)
+    append_jsonl(poison_dir / f"{session_id}.span.jsonl", turns, fsync=True)
+    last_ts = turns[-1].get("ts")
+    if last_ts:
+        write_cursor(persona_dir, session_id, str(last_ts))
+    delete_backoff(persona_dir, session_id)
+    logger.warning(
+        "conversation_span_poisoned session=%s turns=%d: extraction kept failing; the turns are kept in poison/",
+        session_id,
+        len(turns),
+    )
+    return len(turns)
 
 
 def _load_user_name(persona_dir: Path) -> str | None:

@@ -105,11 +105,23 @@ def perform_rollover(
         # (deferred, e.g. an expired login) and a failed one all leave turns unextracted, and the next cycle tries
         # again with the buffer intact.
         if not report.completed:
-            logger.info(
-                "rollover: extraction did not complete session=%s busy=%s deferred=%s errors=%d; keeping the old buffer",
-                old_sid, report.busy, report.deferred, report.errors,
-            )
-            return None
+            # A persistent FAILURE (not a deferral, not a busy pass) must not hold a live session's buffer forever: after the same
+            # 3 recorded failures the stale sweep uses, the unextracted span is set aside in poison/ (kept, never lost) and the
+            # rollover goes on. If it cannot be set aside, nothing is reaped.
+            from brain.ingest.pipeline import extraction_failures_exhausted, poison_unextracted_span
+
+            if report.errors > 0 and not (report.busy or report.deferred) and extraction_failures_exhausted(persona_dir, old_sid):
+                try:
+                    poison_unextracted_span(persona_dir, old_sid)
+                except Exception:
+                    logger.exception("rollover: could not set the unextracted span aside session=%s; keeping the old buffer", old_sid)
+                    return None
+            else:
+                logger.info(
+                    "rollover: extraction did not complete session=%s busy=%s deferred=%s errors=%d; keeping the old buffer",
+                    old_sid, report.busy, report.deferred, report.errors,
+                )
+                return None
 
     # 2. Fold the old conversation into its post-compaction form. NOTE: this runs
     #    AFTER step-1 extraction advanced the cursor, so it is NOT redundant with
