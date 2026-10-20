@@ -158,6 +158,12 @@ FLAGGED = {
     "retry helper by name": "_replace_with_retry(a, b)\n",
     "retry helper by attribute": "heal._retry_perm(lambda: 1)\n",
     "replace_retrying": "overlay.replace_retrying(a, b)\n",
+    "path.replace(target=...)": "def f(tmp, dst):\n    tmp.replace(target=dst)\n",
+    "path.rename(target=...)": "def f(tmp, dst):\n    tmp.rename(target=dst)\n",
+    "aliased os": "import os as _os\n_os.replace(a, b)\n",
+    "aliased os.rename": "import os as o\no.rename(a, b)\n",
+    "aliased shutil": "import shutil as sh\nsh.move(a, b)\n",
+    "aliased tempfile": "import tempfile as tf\ntf.mkstemp()\n",
 }
 LOOK_ALIKES = {
     "str.replace": "x = s.replace('a', 'b')\n",
@@ -168,6 +174,8 @@ LOOK_ALIKES = {
     "dc_replace alias": "def f(o):\n    from dataclasses import replace as dc_replace\n    return dc_replace(o)\n",
     "os.path.join": "import os\nos.path.join(a, b)\n",
     "os.link": "import os\nos.link(a, b)\n",
+    "aliased os, non-replace call": "import os as _os\n_os.path.join(a, b)\n",
+    "datetime.replace with a target-free keyword": "x = dt.replace(tzinfo=None, microsecond=0)\n",
 }
 
 

@@ -349,13 +349,16 @@ def test_g17f_a_single_enospc_is_retried_once_and_equals_a_clean_rotation(tmp_pa
 
 
 def test_g17f_enospc_while_a_gap_exists_evicts_nothing(tmp_path, monkeypatch):
-    log = _setup(tmp_path, 3, present=(1, 2))
+    # A gap BELOW keep (slot 2 empty, slot 3 = C present): the "evict the oldest" rule must not fire. With the gap
+    # above the last archive (present=(1, 2)) unlinking slot 3 is a no-op and the test could not tell the difference.
+    log = _setup(tmp_path, 3, present=(1, 3))
     faults = Faults(monkeypatch)
     faults.fail(".next.gz", _enospc())
-    with pytest.raises(OSError):
-        _tick(log, 3)
-    state = _state(log)
-    assert {k: v for k, v in state.items() if k != "log"} == {"1": b"A", "2": b"B"}
+    for _ in range(3):
+        with pytest.raises(OSError):
+            _tick(log, 3)
+        state = _state(log)
+        assert {k: v for k, v in state.items() if k != "log"} == {"1": b"A", "3": b"C"}
 
 
 def test_g17f_enospc_with_one_slot_evicts_the_one_archive_once(tmp_path, monkeypatch):
@@ -415,3 +418,28 @@ def test_the_rolling_compress_still_goes_through_gzip_open_and_shutil_copyfileob
     )
     called = {ast.unparse(n.func) for n in ast.walk(fn) if isinstance(n, ast.Call)}
     assert "gzip.open" in called and "shutil.copyfileobj" in called
+
+
+def test_the_directory_is_fsynced_after_the_publish_and_before_the_truncation(
+    tmp_path, monkeypatch
+):
+    """The archive must be crash-durable before the log it came from is emptied (S3 of the code review)."""
+    log = _setup(tmp_path, 3)
+    events: list[str] = []
+    real_replace, real_write_bytes = os.replace, Path.write_bytes
+
+    def replace(src, dst):
+        events.append("replace:" + Path(dst).name)
+        return real_replace(src, dst)
+
+    def write_bytes(self, data):
+        if self == log and data == b"":
+            events.append("truncate")
+        return real_write_bytes(self, data)
+
+    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(Path, "write_bytes", write_bytes)
+    monkeypatch.setattr(lr, "fsync_dir", lambda d: events.append(f"fsync_dir:{Path(d).name}"))
+    _tick(log, 3)
+    publish = events.index("replace:a.jsonl.1.gz")
+    assert events[publish + 1 : publish + 3] == [f"fsync_dir:{log.parent.name}", "truncate"], events
