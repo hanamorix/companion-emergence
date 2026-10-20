@@ -394,7 +394,11 @@ def run_initiate_review_tick(
     except Exception:
         user_name = "you"
 
-    outbound_block = build_outbound_recall_block(persona_dir, now=now) or "(no recent outbound)"
+    try:
+        outbound_block = build_outbound_recall_block(persona_dir, now=now) or "(no recent outbound)"
+    except Exception:  # noqa: BLE001 — a block that cannot be built must never abort the review tick (#480)
+        logger.warning("initiate review: could not build the outbound recall block", exc_info=True)
+        outbound_block = "(no recent outbound)"
     voice_template_path = persona_dir / "voice.md"
     if voice_template_path.exists():
         voice_template = voice_template_path.read_text(encoding="utf-8")

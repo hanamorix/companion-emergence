@@ -17,6 +17,7 @@ from brain.maker import config as _cfg
 from brain.maker.budget import consume_budget
 from brain.maker.charge import accumulate, load_charge, save_charge
 from brain.maker.sources import current_emotional_intensity, dreams_since, soul_pending_count
+from brain.utils.time import hours_since
 
 logger = logging.getLogger(__name__)
 
@@ -61,13 +62,9 @@ def run_maker_tick(
     if state.charge < threshold:
         return
     # cooldown gate
-    if state.last_fire_ts:
-        try:
-            elapsed = (now - datetime.fromisoformat(state.last_fire_ts)).total_seconds() / 3600.0
-            if elapsed < cooldown_hours:
-                return
-        except ValueError:
-            pass
+    elapsed = hours_since(state.last_fire_ts, now)  # None for an unusable stamp: it cannot hold a cooldown (#485)
+    if elapsed is not None and elapsed < cooldown_hours:
+        return
     # Pre-flight throttle gate — a defer must cost NOTHING. Check the slot BEFORE
     # consuming budget or engaging cooldown, so a transient yield doesn't burn the
     # day's making and scream a traceback (Windows v0.0.38 report). The runner's

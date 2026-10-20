@@ -11,13 +11,12 @@ from __future__ import annotations
 import json
 import logging
 import os
-from contextlib import ExitStack
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from brain.health import log_rotation
 from brain.health.json_io import append_jsonl, encode_jsonl
-from brain.utils.file_lock import file_lock
 
 logger = logging.getLogger(__name__)
 
@@ -67,34 +66,15 @@ def _audit_mode(persona_dir: Path) -> str:
     return "redacted"
 
 
-def _needs_rotation(log_path: Path) -> bool:
-    return log_path.exists() and log_path.stat().st_size > _MAX_LOG_BYTES
-
-
 def _rotate_if_needed(log_path: Path) -> None:
-    """Keep the local audit log bounded with a single .1 backup.
+    """Keep the local audit log bounded with a single .1 backup (the shared rotation module, #476).
 
-    Every appender (MCP children, streaming and blocking flushes) runs this,
-    so the check-then-rename is serialised on a sidecar lock and re-checked
-    under it (#357): a writer that saw an oversize log must not rename the
-    fresh one a concurrent rotator left behind over ``.1``. The size check
-    first runs unlocked so the common no-rotation append takes no lock.
-
-    If the lock itself cannot be taken (some network filesystems raise from
-    flock), rotate anyway: the worst case is the pre-#357 race, whereas
-    skipping would let the log grow without bound.
+    Every appender (MCP children, streaming and blocking flushes) runs this; the module serialises
+    the check-then-rename on the appenders' lock and re-checks under it (#357). Rotation is
+    observability housekeeping, so a failure is logged and swallowed.
     """
     try:
-        if not _needs_rotation(log_path):
-            return
-        with ExitStack() as held:
-            try:
-                held.enter_context(file_lock(log_path))
-            except OSError as exc:
-                logger.warning("audit log lock unavailable, rotating without a lock: %s", exc)
-            if _needs_rotation(log_path):
-                # replace() overwrites an existing .1 atomically on every OS.
-                log_path.replace(log_path.with_name(f"{log_path.name}.1"))
+        log_rotation.rotate_single_backup(log_path, _MAX_LOG_BYTES)
     except OSError as exc:
         logger.warning("audit log rotation failed: %s", exc)
 

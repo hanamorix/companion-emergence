@@ -15,6 +15,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
+from brain.utils.file_lock import file_lock
+
 
 def _raw_pub(pub: Ed25519PublicKey) -> bytes:
     return pub.public_bytes(
@@ -62,6 +64,16 @@ class KindledIdentity:
         if key_path.exists():
             return cls(Ed25519PrivateKey.from_private_bytes(key_path.read_bytes()))
         key_path.parent.mkdir(parents=True, exist_ok=True)
+        # Two callers can make the identity for the first time together (the bridge start and the supervisor both do). The
+        # check-and-create runs under the key's lock, and the loser loads the winner's key instead of returning the keypair it
+        # generated, which would not be the one on disk (#483).
+        with file_lock(key_path):
+            if key_path.exists():
+                return cls(Ed25519PrivateKey.from_private_bytes(key_path.read_bytes()))
+            return cls._create_locked(key_path)
+
+    @classmethod
+    def _create_locked(cls, key_path: Path) -> KindledIdentity:
         priv = Ed25519PrivateKey.generate()
         raw = priv.private_bytes(
             serialization.Encoding.Raw,
@@ -109,8 +121,13 @@ class KindledIdentity:
         The key file is overwritten with the same mkstemp→fsync→os.replace
         atomicity as load_or_create (#44). `old` remains valid in memory
         throughout the caller's lifetime — only the on-disk file changes."""
-        old = cls.load_or_create(persona_dir)
+        old = cls.load_or_create(persona_dir)  # before the lock: file_lock is not re-entrant
         key_path = persona_dir / _KEY_DIRNAME / _KEY_FILENAME
+        with file_lock(key_path):
+            return cls._rotate_locked(key_path, old)
+
+    @classmethod
+    def _rotate_locked(cls, key_path: Path, old: KindledIdentity) -> tuple[KindledIdentity, KindledIdentity]:
         priv = Ed25519PrivateKey.generate()
         raw = priv.private_bytes(
             serialization.Encoding.Raw,

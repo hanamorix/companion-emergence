@@ -126,15 +126,16 @@ def test_judge_duplicate_with_a_target_id_still_adds_no_names(persona):
     assert _rows(tmp) == []
 
 
-def test_judge_reply_that_is_not_json_promotes_the_candidate_and_loses_its_names(persona):
-    """A syntax break inside the reply (here a names array that never closes) is a
-    reply-level failure: the classifier's fail-open rule promotes the candidate (never
-    drops it) and no names are written. Pinned so the fail-open rule stays deliberate."""
+def test_judge_reply_that_is_not_json_quarantines_the_candidate_and_writes_no_names(persona):
+    """A syntax break inside the reply (here a names array that never closes) gives no usable verdict.
+    AMENDED (#473, coordinator ruling): this used to pin the fail-open rule (promote the candidate, lose its names). A reply
+    that arrives but cannot be used is now an ITEM failure: the candidate is quarantined with the raw reply as evidence and
+    never promoted unclassified, and no names are written."""
     tmp, store, hebbian, queue = persona
     queue.enqueue(_mem("Bob and Wren walked", "dream"), source="x")
     broken = '{"verdict": "duplicate", "names": ["Wren", "Pre'
     res = _gate(tmp, store, hebbian, FakeProvider(broken))
-    assert res.promoted == 1 and res.duplicates == 0
+    assert res.promoted == 0 and res.duplicates == 0 and res.quarantined == 1
     assert _rows(tmp) == []
 
 
@@ -217,21 +218,25 @@ def test_judge_absent_names_key_is_a_plain_verdict(persona):
     assert _rows(tmp) == []
 
 
-def test_judge_unparseable_reply_still_promotes_with_no_names(persona):
+def test_judge_unparseable_reply_quarantines_the_candidate_and_writes_no_names(persona):
+    # AMENDED (#473, coordinator ruling): this pinned "promotes with no names". A reply with no usable verdict is an ITEM
+    # failure now: the candidate is quarantined with the raw reply as evidence, never promoted unclassified.
     tmp, store, hebbian, queue = persona
     queue.enqueue(_mem("Bob walked", "dream"), source="x")
     res = _gate(tmp, store, hebbian, FakeProvider("no json here at all"))
-    assert res.promoted == 1
+    assert res.promoted == 0 and res.quarantined == 1
     assert _rows(tmp) == []
 
 
-def test_judge_unknown_verdict_falls_to_new_and_still_writes_names(persona):
+def test_judge_unknown_verdict_quarantines_the_candidate_and_writes_no_names(persona):
+    # AMENDED (#473, coordinator ruling): this pinned "falls to new and still writes names". A verdict outside the allowed
+    # set is no usable verdict: the candidate is quarantined (not promoted) and its names are not admitted.
     tmp, store, hebbian, queue = persona
     queue.enqueue(_mem("Bob and Wren", "dream"), source="x")
     reply = json.dumps({"verdict": "sideways", "names": ["Wren"]})
     res = _gate(tmp, store, hebbian, FakeProvider(reply))
-    assert res.promoted == 1
-    assert [r[0] for r in _rows(tmp)] == ["wren"]
+    assert res.promoted == 0 and res.quarantined == 1
+    assert _rows(tmp) == []
 
 
 def test_gate_names_go_through_the_admission_function(persona):

@@ -8,7 +8,6 @@ project gotchas list). No ANTHROPIC_API_KEY references here.
 """
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -24,6 +23,7 @@ from brain.attunement.schemas import (
 from brain.attunement.store import BufferTurn
 from brain.health.json_io import append_jsonl
 from brain.health.parse_failures import record_parse_failure
+from brain.utils.llm_output import loads_json_object_ex
 
 log = logging.getLogger(__name__)
 
@@ -117,23 +117,21 @@ def _call_haiku(
         return ""
 
 
+_DETECTOR_KEYS = frozenset({"current_read", "pattern_candidates", "addressed_pattern_ids"})
+
+
 def _parse_output(raw: str, source_turn_id: str, persona_dir: Path | None = None) -> DetectorOutput:
     """Parse Haiku's JSON output into DetectorOutput. Drops invalid candidates.
     A reply that can't be read is kept in the parse-failure log (#364)."""
-    # Strip optional markdown code fence — ClaudeCliProvider returns raw text
-    # but some models wrap output in ```json ... ```
-    stripped = raw.strip()
-    if stripped.startswith("```"):
-        first_newline = stripped.find("\n")
-        if first_newline != -1:
-            stripped = stripped[first_newline + 1:]
-        if stripped.endswith("```"):
-            stripped = stripped[: -len("```")]
-        stripped = stripped.strip()
-
+    # One tolerance rule for every reply that should be one JSON object (#479): the whole reply, a fenced block, or an object with
+    # prose before/after it (ClaudeCliProvider returns raw text, but some models wrap or chatter).
     try:
-        payload: dict[str, Any] = json.loads(stripped)
-    except json.JSONDecodeError as exc:
+        payload: dict[str, Any]
+        payload, in_prose = loads_json_object_ex(raw)
+        if in_prose and payload and not (set(payload) & _DETECTOR_KEYS):
+            # An object found in a sentence is only the answer if it looks like one; an empty object is a valid empty answer.
+            raise ValueError("an object in the reply has none of the detector's keys")
+    except ValueError as exc:  # JSONDecodeError is a ValueError
         record_parse_failure(persona_dir, site="attunement", raw=raw, error=f"non-JSON: {exc}")
         return _decline_output(source_turn_id)
 

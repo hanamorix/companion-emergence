@@ -15,6 +15,7 @@ from brain.kindled_link import limits, relationship
 from brain.kindled_link.gate import OutboundPayload
 from brain.kindled_link.peer_prompt import build_peer_prompt
 from brain.kindled_link.privacy_gate import PrivacyGate
+from brain.utils.time import lenient_utc
 
 log = logging.getLogger(__name__)
 
@@ -70,7 +71,10 @@ class SessionEngine:
         last = sess.get("last_outbound_at")
         if last is None:
             return True
-        elapsed = (now - datetime.fromisoformat(last)).total_seconds()
+        last_dt = lenient_utc(last)
+        if last_dt is None:  # an unusable stamp cannot hold a send back: due now (as kindled_link/cadence.py does, #485)
+            return True
+        elapsed = (lenient_utc(now) - last_dt).total_seconds()
         return elapsed >= _MIN_OUTBOUND_GAP_SECONDS
 
     def under_session_cap(self, peer_id: str, session_id: str) -> bool:
@@ -99,8 +103,8 @@ class SessionEngine:
         # cooldown: every ended session must be past its cooldown. Use the store's
         # MAX(cooldown_until) helper (not a raw conn reach-in) so a later-ended
         # session with an earlier cooldown can't hide a still-cooling one.
-        cooldown_until = self._store.latest_cooldown_until(peer_id)
-        if cooldown_until and now < datetime.fromisoformat(cooldown_until):
+        cooldown_dt = lenient_utc(self._store.latest_cooldown_until(peer_id))
+        if cooldown_dt is not None and lenient_utc(now) < cooldown_dt:  # an unusable stamp holds nobody back (#485)
             return False
         return True
 

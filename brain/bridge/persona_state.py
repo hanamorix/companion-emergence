@@ -64,6 +64,8 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
       - background_jobs: list[{"name": str, "running_for_seconds": float}] —
         currently-running gated job/heartbeat names (ram-spike-fix INC-11),
         ordered LONGEST-RUNNING FIRST; [] when none are running
+      - tunables_notice: {"kind", "kept_as"} | None — a damaged tunables.json
+        that was healed or could not be read, until the user acts (#462)
 
     Never raises. Each subsystem failure contributes None / {} rather
     than propagating.
@@ -72,6 +74,7 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
         now = datetime.now(UTC)
     persona_name = persona_dir.name
     connection = _build_connection(persona_dir)
+    from brain import tunables
     from brain.bridge.model_tier import _load_config
 
     tier_cfg = _load_config(persona_dir)
@@ -110,6 +113,9 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
             {"name": name, "running_for_seconds": round(elapsed, 3)}
             for name, elapsed in background_jobs.snapshot_with_elapsed()
         ],
+        # #462: a damaged tunables.json that was healed (or could not be read), persisted beside the file so EVERY bridge
+        # reports it until the user acts: {"kind": "reset" | "restored" | "unreadable", "kept_as": <file name> | None}, else None.
+        "tunables_notice": tunables.current_notice(),
     }
 
 

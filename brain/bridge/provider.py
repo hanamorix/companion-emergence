@@ -50,7 +50,7 @@ from brain.bridge.chat import (
     ToolCall,
 )
 from brain.bridge.usage_log import log_usage
-from brain.utils.time import format_local, local_display, parse_iso_utc
+from brain.utils.time import format_local, parse_iso_utc
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +81,12 @@ _BUDGET_FALLBACK: float = tunables.register("provider.max_turn_budget_usd.fallba
 # What json.loads raises on a line it cannot take: JSONDecodeError and, on a hostile line, a plain ValueError
 # (a 5000-digit run) or RecursionError (nesting beyond the recursion limit). JSONDecodeError is a ValueError.
 _JSON_LINE_ERRORS: tuple[type[BaseException], ...] = (ValueError, RecursionError)
+
+
+def _text_only(value: object) -> str:
+    """The value if it is a string, else "". A JSON `null` (or a number) in a text field is not text: `str(None)`
+    would put the literal word "None" into a reply (#467)."""
+    return value if isinstance(value, str) else ""
 
 # The result-frame subtype the CLI reports when --max-budget-usd stops a turn (exit code 1).
 _BUDGET_SUBTYPE: str = "error_max_budget_usd"
@@ -311,6 +317,83 @@ def _stream_first_event_seconds() -> float:
 # when the subprocess closes its stdout (normal exit, error, etc.). Lets
 # the main generator distinguish "reader hit EOF" from a real line.
 _STREAM_EOF = object()
+
+# How long a streaming child gets, at each step, to exit once it has been told to stop or has finished
+# (#482): to leave on its own after its last frame, to answer SIGTERM, to die after SIGKILL, and (a pipe
+# closes when its writer exits) for the stdout reader and the stderr drain to reach EOF after that. One knob,
+# because it is one question: how long may the CLI take to flush its last output and exit? No measurement
+# stands behind 5 seconds: it is the bound this path already used for the reader join before the knob
+# existed, and the steps run one after the other, so the worst case is a small multiple of it. A slow
+# machine raises it in tunables.json (`provider.child_exit_grace_seconds`).
+_CHILD_EXIT_GRACE_SECONDS: float = tunables.register("provider.child_exit_grace_seconds", 5.0)
+
+# stderr kept for the failure detail (the detail uses its first 200 characters; the rest of a full pipe is
+# read and dropped so the child never blocks on a write): 64 KiB is Linux's default pipe capacity.
+_STDERR_KEEP_CHARS = 65536
+# One read of the child's stderr: a page, so a very long line without a newline is read in pieces.
+_STDERR_READ_CHARS = 4096
+
+
+def _child_exit_grace_seconds() -> float:
+    return tunables.get_tunable("provider.child_exit_grace_seconds", _CHILD_EXIT_GRACE_SECONDS)
+
+
+class _StderrDrain:
+    """Read a child's stderr on a thread for the life of the process (#482).
+
+    A pipe nothing reads fills (64 KiB on Linux) and blocks the child's next write, which stops its stdout.
+    Keeps the first ``_STDERR_KEEP_CHARS`` characters for the failure detail and discards the rest.
+    """
+
+    def __init__(self, stream: Any) -> None:
+        self._chunks: list[str] = []
+        self._kept = 0
+        self._thread = threading.Thread(target=self._run, args=(stream,), daemon=True)
+        self._thread.start()
+
+    def _run(self, stream: Any) -> None:
+        try:
+            while True:
+                chunk = stream.readline(_STDERR_READ_CHARS)
+                if not isinstance(chunk, str) or not chunk:
+                    return
+                if self._kept < _STDERR_KEEP_CHARS:
+                    self._chunks.append(chunk)
+                    self._kept += len(chunk)
+        except (OSError, ValueError):
+            return  # the pipe closed under the reader
+
+    def text(self, wait_s: float | None = None) -> str:
+        """What the child wrote to stderr; waits up to ``wait_s`` (default: the child exit grace) for the pipe to reach EOF (the child has exited)."""
+        self._thread.join(timeout=_child_exit_grace_seconds() if wait_s is None else wait_s)
+        return "".join(self._chunks)
+
+
+def _stop_child(proc: Any, *, finished: bool) -> None:
+    """Leave no child behind: a finished one is given a moment to exit on its own, then terminate, wait, kill, wait (#482).
+
+    Every exit of the streaming generator (result frame, idle timeout, error, generator close) ends here so the
+    child is reaped and one that ignores SIGTERM does not keep running. Each wait is bounded; a child that
+    survives SIGKILL is left to the OS and logged. On Windows ``terminate()`` is already a hard kill.
+    """
+    grace = _child_exit_grace_seconds()
+    try:
+        if proc.poll() is None and finished:
+            try:
+                proc.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                pass
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        logger.warning("claude child %s did not exit after SIGKILL", getattr(proc, "pid", "?"))
+    except OSError:
+        pass  # already gone
 
 # ---------------------------------------------------------------------------
 # Lean CLI invocation — strip built-in tool definitions (~14K tok/call saved)
@@ -1011,7 +1094,7 @@ class ClaudeCliProvider(LLMProvider):
             cli_err = _cli_error_detail(payload, model=_argv_model(cmd))
             if cli_err is not None:
                 raise RuntimeError(f"ClaudeCliProvider: {cli_err}")
-            return str(payload["result"])
+            return _text_only(payload["result"])
         except (*_JSON_LINE_ERRORS, KeyError, TypeError) as exc:
             raise RuntimeError(
                 f"ClaudeCliProvider: unexpected output format: {result.stdout[:200]!r}"
@@ -1049,7 +1132,7 @@ class ClaudeCliProvider(LLMProvider):
         cli_err = _cli_error_detail(payload, model=_argv_model(cmd), stdout=result.stdout)
         if cli_err is not None:
             raise ProviderError("claude_cli_error", cli_err)
-        return str(payload.get("result", ""))
+        return _text_only(payload.get("result"))  # #467: a null or non-string result is not text
 
     def name(self) -> str:
         return f"claude-cli:{self._model}"
@@ -1161,7 +1244,7 @@ class ClaudeCliProvider(LLMProvider):
                 if payload is None:
                     raise ValueError("no result frame")
                 if _is_over_budget_frame(payload):
-                    partial = str(payload.get("result", "")).strip()
+                    partial = _text_only(payload.get("result")).strip()
                     text = (
                         f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}" if partial else _BUDGET_EXCEEDED_MSG
                     )
@@ -1171,7 +1254,7 @@ class ClaudeCliProvider(LLMProvider):
                 cli_err = _cli_error_detail(payload, model=_argv_model(cmd), stdout=result.stdout)
                 if cli_err is not None:
                     raise ProviderError("claude_cli_error", cli_err)
-                content = str(payload["result"])
+                content = _text_only(payload["result"])
             except (ValueError, KeyError, TypeError) as exc:
                 raise ProviderError(
                     "claude_cli_parse",
@@ -1367,6 +1450,8 @@ class ClaudeCliProvider(LLMProvider):
 
             reader = threading.Thread(target=_reader, daemon=True)
             reader.start()
+            # #482: stderr is read while the process runs, so a chatty CLI cannot fill the pipe and stall stdout.
+            stderr_drain = _StderrDrain(proc.stderr) if proc.stderr is not None else None
 
             # Send prompt via stdin then close so the subprocess can start.
             try:
@@ -1442,19 +1527,25 @@ class ClaudeCliProvider(LLMProvider):
                     tool_in_flight = False
                     tool_name = None
                     if t == "stream_event":
-                        event = obj.get("event", {})
-                        if event.get("type") == "content_block_delta":
-                            delta = event.get("delta", {})
-                            if delta.get("type") == "text_delta":
-                                text = str(delta.get("text", ""))
-                                delta_chunks.append(text)
-                                yield TextDelta(text=text)
+                        # A frame whose nested value is not an object carries no text: skip it, as the line-level
+                        # non-object skip above does (#467). Only a string is text.
+                        event = obj.get("event")
+                        if isinstance(event, dict) and event.get("type") == "content_block_delta":
+                            delta = event.get("delta")
+                            if isinstance(delta, dict) and delta.get("type") == "text_delta":
+                                text = delta.get("text")
+                                if isinstance(text, str):
+                                    delta_chunks.append(text)
+                                    yield TextDelta(text=text)
                     elif t == "assistant":
                         _code = obj.get("error")
                         if isinstance(_code, str) and _ERROR_CODE_SHAPE.fullmatch(_code):
                             assistant_error = _code
                         # Snapshot frame — fallback content when result frame absent.
-                        msg_content = obj.get("message", {}).get("content", [])
+                        # None, not [], for a message that is not an object: a skipped frame must change nothing
+                        # (an empty list would reset `assistant_snapshot` below). Same shape as the blocking scanner.
+                        message = obj.get("message", {})
+                        msg_content = message.get("content", []) if isinstance(message, dict) else None
                         _collect_builtin_calls(msg_content, builtin_calls)
                         if isinstance(msg_content, list):
                             for blk in msg_content:
@@ -1462,16 +1553,26 @@ class ClaudeCliProvider(LLMProvider):
                                     tool_in_flight = True
                                     tool_name = str(blk.get("name") or "") or None
                                     break
-                            parts = [
-                                blk.get("text", "")
-                                for blk in msg_content
-                                if isinstance(blk, dict) and blk.get("type") == "text"
-                            ]
-                            assistant_snapshot = "".join(parts)
+                            # Only string text counts: a text block whose `text` is null, a number or absent would
+                            # make the join raise TypeError (same class as the frames above; `_tool_result_text` does
+                            # this too). The snapshot is the fallback reply, so a frame whose text is empty ONLY
+                            # because its text blocks were malformed leaves it as it was, like a malformed message;
+                            # a genuinely valid message with no text blocks still replaces it.
+                            parts: list[str] = []
+                            dropped_malformed = False
+                            for blk in msg_content:
+                                if isinstance(blk, dict) and blk.get("type") == "text":
+                                    if isinstance(blk.get("text"), str):
+                                        parts.append(blk["text"])
+                                    else:
+                                        dropped_malformed = True
+                            joined = "".join(parts)
+                            if joined or not dropped_malformed:
+                                assistant_snapshot = joined
                     elif t == "user":
                         _collect_builtin_results(obj, builtin_calls)
                     elif t == "result":
-                        result_text = str(obj.get("result", ""))
+                        result_text = _text_only(obj.get("result", ""))
                         metadata: dict[str, Any] = {
                             k: obj[k]
                             for k in ("duration_ms", "num_turns", "stop_reason", "is_error")
@@ -1516,9 +1617,17 @@ class ClaudeCliProvider(LLMProvider):
 
                 # EOF: emit terminal event if result frame never arrived.
                 if not done_emitted:
-                    rc = proc.wait()
+                    try:
+                        rc = proc.wait(timeout=_child_exit_grace_seconds())
+                    except subprocess.TimeoutExpired:
+                        # stdout closed but the process did not exit (#482): do not hang here; the finally reaps it.
+                        yield StreamError(
+                            stage="claude_cli_exit",
+                            detail="the claude process did not exit after its output ended",
+                        )
+                        return
                     if rc != 0:
-                        stderr_text = proc.stderr.read() if proc.stderr else ""
+                        stderr_text = stderr_drain.text() if stderr_drain is not None else ""
                         # #246: the one exit!=0 site that bypasses _claude_failure_detail.
                         provider_auth.note_cli_failure(stderr_text)
                         if frames_seen == 0:  # #329: failed before any frame, e.g. rejected --tools
@@ -1535,7 +1644,9 @@ class ClaudeCliProvider(LLMProvider):
                 proc.terminate()
                 raise
             finally:
-                reader.join(timeout=5)
+                # Every exit reaps the child (#482); a finished one (result frame) gets a moment to leave on its own.
+                _stop_child(proc, finished=done_emitted)
+                reader.join(timeout=_child_exit_grace_seconds())
                 # One flush for every exit: on success the proxy exhausts this
                 # generator before it reads the audit log; on a StreamError it
                 # raises out of its for-loop and CPython closes the generator
@@ -1702,7 +1813,7 @@ class ClaudeCliProvider(LLMProvider):
                 if payload is None:
                     raise ValueError("no result frame")
                 if _is_over_budget_frame(payload):
-                    partial = str(payload.get("result", "")).strip()
+                    partial = _text_only(payload.get("result")).strip()
                     text = (
                         f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}" if partial else _BUDGET_EXCEEDED_MSG
                     )
@@ -1723,7 +1834,7 @@ class ClaudeCliProvider(LLMProvider):
                 cli_err = _cli_error_detail(payload, model=_argv_model(cmd), stdout=result.stdout)
                 if cli_err is not None:
                     raise ProviderError("claude_cli_error", cli_err)
-                content = str(payload["result"])
+                content = _text_only(payload["result"])
             except (ValueError, KeyError, TypeError) as exc:
                 raise ProviderError(
                     "claude_cli_parse",
@@ -2318,9 +2429,10 @@ def _narrative_time(ts: str | None) -> str:
     if not ts or not isinstance(ts, str):
         return ""
     try:
-        parse_iso_utc(ts)
-        return local_display(ts)  # tz-local-display: per-message time in the narrative chat context
-    except (ValueError, TypeError, OverflowError):  # OverflowError: parses, but has no local equivalent (year 1)
+        # tz-local-display: per-message time in the narrative chat context. `local_display` is total and would return the
+        # raw text on failure; this caller never echoes an unparseable value, so it renders directly and returns "" itself.
+        return format_local(parse_iso_utc(ts))
+    except Exception:  # noqa: BLE001 — unparseable, or no local equivalent (year 1 in a zone behind UTC)
         return ""
 
 
@@ -2455,21 +2567,33 @@ class OllamaProvider(LLMProvider):
 
         try:
             data = resp.json()
-        except ValueError as exc:
+        except _JSON_LINE_ERRORS as exc:
             raise ProviderError("ollama_parse", f"invalid json: {exc}") from exc
 
+        # A body or a nested value of the wrong shape is a parse error, not an AttributeError/TypeError out of
+        # chat() (#468). A falsy `message` (null, "", 0, [], false) stays "an empty message", as it always was.
+        if not isinstance(data, dict):
+            raise ProviderError("ollama_parse", f"response is not a JSON object: {type(data).__name__}")
         msg = data.get("message") or {}
-        content: str = msg.get("content", "") or ""
-        raw_tool_calls: list[dict[str, Any]] = msg.get("tool_calls") or []
+        if not isinstance(msg, dict):
+            raise ProviderError("ollama_parse", f"message is not an object: {type(msg).__name__}")
+        content = msg.get("content", "") or ""
+        if not isinstance(content, str):
+            raise ProviderError("ollama_parse", f"message.content is not a string: {type(content).__name__}")
+        raw_tool_calls = msg.get("tool_calls") or []
+        if not isinstance(raw_tool_calls, list):
+            raise ProviderError(
+                "ollama_parse", f"message.tool_calls is not a list: {type(raw_tool_calls).__name__}"
+            )
 
         parsed_tool_calls: list[ToolCall] = []
         for tc_dict in raw_tool_calls:
             try:
                 parsed_tool_calls.append(ToolCall.from_provider_dict(tc_dict))
-            except ValueError as exc:
+            except _JSON_LINE_ERRORS as exc:
                 raise ProviderError(
                     "ollama_parse",
-                    f"malformed tool_call in response: {exc}",
+                    f"malformed tool_call in response: {str(exc)[:200]}",
                 ) from exc
 
         return ChatResponse(
@@ -2508,7 +2632,12 @@ class OllamaProvider(LLMProvider):
         Yields
         ------
         str
-            Each content chunk Ollama emits. Empty chunks are skipped.
+            Each content chunk Ollama emits. Empty chunks are skipped, and so is
+            anything that is not a usable frame: a line that is valid JSON but not
+            an object, and a frame whose ``message`` is not an object or whose
+            ``content`` is not a string contribute no chunk (a ``done`` on such a
+            frame still ends the stream). Unlike :meth:`chat`, which rejects a
+            reply of the wrong shape with ``ollama_parse``, the stream keeps going.
 
         Raises
         ------
@@ -2517,7 +2646,8 @@ class OllamaProvider(LLMProvider):
         ProviderError("ollama_request", ...)
             Network-level failure (connection refused, DNS, etc.).
         ProviderError("ollama_parse", ...)
-            A streamed line could not be JSON-decoded.
+            A streamed line could not be JSON-decoded (including a line nested
+            past the recursion limit or a digit run past the integer limit).
         """
         payload: dict[str, Any] = {
             "model": self._model,
@@ -2554,14 +2684,16 @@ class OllamaProvider(LLMProvider):
                         continue
                     try:
                         frame = json.loads(line)
-                    except json.JSONDecodeError as exc:
+                    except _JSON_LINE_ERRORS as exc:
                         raise ProviderError(
                             "ollama_parse",
                             f"invalid streaming line json: {exc}",
                         ) from exc
+                    if not isinstance(frame, dict):
+                        continue  # valid JSON that is not an object carries no frame (#468)
                     msg = frame.get("message") or {}
-                    chunk = msg.get("content")
-                    if chunk:
+                    chunk = msg.get("content") if isinstance(msg, dict) else None
+                    if chunk and isinstance(chunk, str):
                         yield chunk
                     if frame.get("done"):
                         return

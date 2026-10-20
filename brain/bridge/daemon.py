@@ -384,6 +384,7 @@ def _await_readiness(persona_dir: Path, pid: int, log_path: Path, out: dict | No
                     f"http://127.0.0.1:{s.port}/health",
                     headers=headers,
                     timeout=1.0,
+                    trust_env=False,  # the loopback bridge is never reached through a proxy (#475)
                 )
                 if r.status_code == 200:
                     print(f"bridge started on port {s.port} (pid {pid})")
@@ -487,6 +488,7 @@ def _request_shutdown_via_http(s: state_file.BridgeState, *, timeout: float = 3.
         f"http://127.0.0.1:{s.port}/supervisor/shutdown",
         headers=headers,
         timeout=timeout,
+        trust_env=False,  # never through a proxy (#475)
     )
     r.raise_for_status()
 
@@ -550,6 +552,7 @@ def cmd_status(args) -> int:
                 f"http://127.0.0.1:{s.port}/health",
                 headers=headers,
                 timeout=1.0,
+                trust_env=False,  # never through a proxy (#475)
             )
             health = r.json()
             print(f"bridge: running pid={s.pid} port={s.port}")
@@ -576,8 +579,7 @@ def cmd_tail(args) -> int:
     config with auth enabled, and (b) leaks the bearer token through
     process listings and proxy logs.
     """
-    from websockets.sync.client import connect
-
+    from brain.bridge.loopback import direct_ws_connect as connect  # never through a proxy (#475)
     from brain.paths import get_persona_dir
 
     persona_dir = get_persona_dir(args.persona)

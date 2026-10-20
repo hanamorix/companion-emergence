@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 from brain.health.json_io import Recovery, read_jsonl, write_jsonl
 from brain.health.parse_failures import record_parse_failure
+from brain.utils.llm_output import find_json_object_block
 
 if TYPE_CHECKING:
     from brain.bridge.provider import LLMProvider
@@ -180,20 +181,8 @@ def _build_messages(
 
 
 def _extract_json_block(text: str) -> str | None:
-    """Find the first {...} JSON block in text. Tolerant of preamble."""
-    start = text.find("{")
-    if start < 0:
-        return None
-    depth = 0
-    for i in range(start, len(text)):
-        ch = text[i]
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : i + 1]
-    return None
+    """The soul-review answer in ``text``: the shared string-aware scan, preferring an object with a ``decision`` (#478)."""
+    return find_json_object_block(text, prefer_key="decision")
 
 
 def parse_decision(raw: str, candidate_id: str) -> Decision:
@@ -216,7 +205,7 @@ def parse_decision(raw: str, candidate_id: str) -> Decision:
 
     try:
         data = json.loads(block)
-    except json.JSONDecodeError as exc:
+    except (ValueError, RecursionError) as exc:  # JSONDecodeError is a ValueError; RecursionError: nested past the limit
         return Decision(
             candidate_id=candidate_id,
             decision="defer",

@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 
 from brain.health.json_io import read_json, write_json
+from brain.utils.time import hours_since
 
 logger = logging.getLogger(__name__)
 
@@ -58,13 +59,8 @@ def save_charge(persona_dir: Path, state: MakerCharge) -> None:
 
 
 def _elapsed_hours(last_tick_ts: str | None, now: datetime) -> float:
-    if not last_tick_ts:
-        return 0.0
-    try:
-        prev = datetime.fromisoformat(last_tick_ts)
-    except ValueError:
-        return 0.0
-    return max(0.0, (now - prev).total_seconds() / 3600.0)
+    hours = hours_since(last_tick_ts, now)  # None for an empty or unusable stamp (#485)
+    return 0.0 if hours is None else hours
 
 
 def accumulate(

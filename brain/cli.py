@@ -1193,7 +1193,7 @@ def _health_show_handler(args: argparse.Namespace) -> int:
         date_str = alarm.first_seen_at.strftime("%Y-%m-%d")
         print(
             f"    {alarm.file}: {alarm.kind} {date_str} "
-            f"({alarm.occurrences_in_window} occurrences in window)"
+            f"({'at least ' if alarm.at_least else ''}{alarm.occurrences_in_window} occurrences in window)"
         )
 
     print(f"  Recent self-treatments (last 7 days): {len(recent_treatments)}")
@@ -1570,38 +1570,49 @@ def _initiate_d_stats_handler(args: argparse.Namespace) -> int:
 
 
 
+def _kindled_call(
+    s, path: str, *, method: str = "POST", payload: dict | None = None, timeout: float = 30.0
+) -> dict | None:
+    """One call to the persona's bridge on the loopback address, straight to it (never through an HTTP proxy, #475).
+
+    Returns the decoded JSON reply, or None after printing the error ("bridge returned <status>" or "could not reach bridge").
+    """
+    import json
+
+    from brain.bridge.loopback import direct_request
+
+    headers = {"Content-Type": "application/json"}
+    if s.auth_token:
+        headers["Authorization"] = f"Bearer {s.auth_token}"
+    body = None if method == "GET" else json.dumps(payload or {}).encode("utf-8")
+    try:
+        status, raw = direct_request(
+            method, f"http://127.0.0.1:{s.port}{path}", headers=headers, body=body, timeout=timeout
+        )
+    except OSError as exc:
+        print(f"error: could not reach bridge: {exc}", file=sys.stderr)
+        return None
+    if status >= 400:
+        print(f"error: bridge returned {status}: {raw.decode('utf-8', errors='replace')}", file=sys.stderr)
+        return None
+    return json.loads(raw)  # json-io: ok -- HTTP response from the local bridge, not a file
+
+
+def _kindled_bridge_state(args: argparse.Namespace):
+    """The running bridge's state for `nell kindled ...`, or None after printing the "not running" error."""
+    s = state_file.read(get_persona_dir(args.persona))
+    if s is None:
+        print("error: bridge is not running. Start it with `nell service start`.", file=sys.stderr)
+    return s
+
+
 def _kindled_rotate_handler(args: argparse.Namespace) -> int:
     """Dispatch `nell kindled rotate-key` — rotate local identity key."""
-    import json
-    import urllib.error
-    import urllib.request
-
-    persona_dir = get_persona_dir(args.persona)
-    s = state_file.read(persona_dir)
+    s = _kindled_bridge_state(args)
     if s is None:
-        print(
-            "error: bridge is not running. Start it with `nell service start`.",
-            file=sys.stderr,
-        )
         return 1
-    port = s.port
-    auth_token = s.auth_token
-    url = f"http://127.0.0.1:{port}/kindled-link/identity/rotate"
-    headers = {"Content-Type": "application/json"}
-    if auth_token:
-        headers["Authorization"] = f"Bearer {auth_token}"
-    req = urllib.request.Request(url, data=b"{}", headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read())  # json-io: ok -- HTTP response from the local bridge, not a file
-    except urllib.error.HTTPError as exc:
-        print(
-            f"error: bridge returned {exc.code}: {exc.read().decode('utf-8', errors='replace')}",
-            file=sys.stderr,
-        )
-        return 1
-    except urllib.error.URLError as exc:
-        print(f"error: could not reach bridge: {exc.reason}", file=sys.stderr)
+    data = _kindled_call(s, "/kindled-link/identity/rotate")
+    if data is None:
         return 1
     print(f"Key rotated. New key ID: {data['new_key_id']}")
     print(f"New fingerprint phrase: {data['fingerprint_phrase']}")
@@ -1611,31 +1622,11 @@ def _kindled_rotate_handler(args: argparse.Namespace) -> int:
 
 def _kindled_my_code_handler(args: argparse.Namespace) -> int:
     """Dispatch `nell kindled my-code` — print this persona's connect-code."""
-    import json
-    import urllib.error
-    import urllib.request
-
-    persona_dir = get_persona_dir(args.persona)
-    s = state_file.read(persona_dir)
+    s = _kindled_bridge_state(args)
     if s is None:
-        print("error: bridge is not running. Start it with `nell service start`.", file=sys.stderr)
         return 1
-    url = f"http://127.0.0.1:{s.port}/kindled-link/my-code"
-    headers = {"Content-Type": "application/json"}
-    if s.auth_token:
-        headers["Authorization"] = f"Bearer {s.auth_token}"
-    req = urllib.request.Request(url, headers=headers, method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read())  # json-io: ok -- HTTP response from the local bridge, not a file
-    except urllib.error.HTTPError as exc:
-        print(
-            f"error: bridge returned {exc.code}: {exc.read().decode('utf-8', errors='replace')}",
-            file=sys.stderr,
-        )
-        return 1
-    except urllib.error.URLError as exc:
-        print(f"error: could not reach bridge: {exc.reason}", file=sys.stderr)
+    data = _kindled_call(s, "/kindled-link/my-code", method="GET")
+    if data is None:
         return 1
     print("Your connect-code (share it with the other person over a channel you trust):\n")
     print(data["code"])
@@ -1645,32 +1636,11 @@ def _kindled_my_code_handler(args: argparse.Namespace) -> int:
 
 def _kindled_connect_handler(args: argparse.Namespace) -> int:
     """Dispatch `nell kindled connect <code>` — pair with a peer via their code."""
-    import json
-    import urllib.error
-    import urllib.request
-
-    persona_dir = get_persona_dir(args.persona)
-    s = state_file.read(persona_dir)
+    s = _kindled_bridge_state(args)
     if s is None:
-        print("error: bridge is not running. Start it with `nell service start`.", file=sys.stderr)
         return 1
-    url = f"http://127.0.0.1:{s.port}/kindled-link/connect"
-    headers = {"Content-Type": "application/json"}
-    if s.auth_token:
-        headers["Authorization"] = f"Bearer {s.auth_token}"
-    body = json.dumps({"code": args.code}).encode("utf-8")
-    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read())  # json-io: ok -- HTTP response from the local bridge, not a file
-    except urllib.error.HTTPError as exc:
-        print(
-            f"error: bridge returned {exc.code}: {exc.read().decode('utf-8', errors='replace')}",
-            file=sys.stderr,
-        )
-        return 1
-    except urllib.error.URLError as exc:
-        print(f"error: could not reach bridge: {exc.reason}", file=sys.stderr)
+    data = _kindled_call(s, "/kindled-link/connect", payload={"code": args.code})
+    if data is None:
         return 1
     print(f"Connected to {data['peer_id']} ({data['consent_state']}).")
     print(f"Relay: {data['relay_url']}")
@@ -1680,28 +1650,11 @@ def _kindled_connect_handler(args: argparse.Namespace) -> int:
 
 def _kindled_self_test_handler(args: argparse.Namespace) -> int:
     """Dispatch `nell kindled self-test` — run the in-process connection self-test."""
-    import json
-    import urllib.error
-    import urllib.request
-
-    persona_dir = get_persona_dir(args.persona)
-    s = state_file.read(persona_dir)
+    s = _kindled_bridge_state(args)
     if s is None:
-        print("error: bridge is not running. Start it with `nell service start`.", file=sys.stderr)
         return 1
-    url = f"http://127.0.0.1:{s.port}/kindled-link/self-test"
-    headers = {"Content-Type": "application/json"}
-    if s.auth_token:
-        headers["Authorization"] = f"Bearer {s.auth_token}"
-    req = urllib.request.Request(url, data=b"{}", headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read())  # json-io: ok -- HTTP response from the local bridge, not a file
-    except urllib.error.HTTPError as exc:
-        print(f"error: bridge returned {exc.code}: {exc.read().decode('utf-8', errors='replace')}", file=sys.stderr)
-        return 1
-    except urllib.error.URLError as exc:
-        print(f"error: could not reach bridge: {exc.reason}", file=sys.stderr)
+    data = _kindled_call(s, "/kindled-link/self-test", timeout=60.0)
+    if data is None:
         return 1
     for st in data.get("stages", []):
         mark = "PASS" if st["ok"] else "FAIL"
@@ -2184,9 +2137,9 @@ def _chat_via_bridge(args: argparse.Namespace, persona_dir: Path, *, readiness=N
 
     import httpx
     from websockets.exceptions import InvalidStatus
-    from websockets.sync.client import connect
 
     from brain.bridge import state_file
+    from brain.bridge.loopback import direct_ws_connect as connect  # never through a proxy (#475)
 
     if readiness is not None:
         port = readiness.port
@@ -2212,6 +2165,7 @@ def _chat_via_bridge(args: argparse.Namespace, persona_dir: Path, *, readiness=N
             f"{base}/session/new",
             json={"client": "cli"},
             headers=http_headers,
+            trust_env=False,  # the loopback bridge is never reached through a proxy (#475)
         ).json()["session_id"]
 
     print(f"chat session {sid} (Ctrl-D to exit)")
@@ -2273,6 +2227,7 @@ def _chat_via_bridge(args: argparse.Namespace, persona_dir: Path, *, readiness=N
             json={"session_id": sid},
             headers=http_headers,
             timeout=120.0,
+            trust_env=False,  # never through a proxy (#475)
         )
     except (httpx.TimeoutException, httpx.HTTPError) as exc:
         # Bridge keeps running; ingest may still complete server-side. We

@@ -195,6 +195,18 @@ export interface PersonaState {
    *  without the field degrade to no line shown. A paused job is not
    *  included. */
   background_jobs?: BackgroundJob[];
+  /** A damaged `tunables.json` that the brain healed (kind "reset": the damaged file was kept aside and the overrides are
+   *  not in effect; "restored": an older saved copy was put in its place) or could not read at all ("unreadable").
+   *  Persisted beside the file by whichever bridge healed it, so every persona's bridge reports it until the user acts (#462).
+   *  `kept_as` is the kept-aside file name (null for "unreadable"). Null/absent when there is nothing to say. Optional so
+   *  older bridge builds degrade to no notice. */
+  tunables_notice?: TunablesNotice | null;
+}
+
+/** See `PersonaState.tunables_notice`. */
+export interface TunablesNotice {
+  kind: "reset" | "restored" | "unreadable";
+  kept_as: string | null;
 }
 
 /** One entry in `PersonaState.background_jobs` (ram-spike-fix INC-11). */
@@ -398,6 +410,13 @@ export interface CloseSessionOptions {
 export interface CloseSessionResponse {
   session_id: string;
   closed: boolean;
+  /**
+   * The bridge refused the model call as "not now" (an expired login, a stopping bridge): nothing was extracted or failed, the buffer is
+   * kept and the session stays registered. A 200 with `deferred` is NOT a saved snapshot or a closed session. Absent on older bridges.
+   */
+  deferred?: boolean;
+  /** Another extraction of the same session was running, so this pass did nothing. A 200 with `busy` is not a saved snapshot either. Absent on older bridges. */
+  busy?: boolean;
   committed: number;
   enqueued: number;
   deduped: number;

@@ -27,6 +27,7 @@ from brain.initiate.new_sources import (
 from brain.initiate.schemas import SemanticContext
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
+from brain.utils.time import iso_utc
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +107,7 @@ class MemoryActivationBaseline:
         Seeds with (mean=current, var=0) if the memory has no row yet.
         """
         existing = self.get(memory_id)
-        now_iso = datetime.now().isoformat()
+        now_iso = iso_utc(datetime.now(UTC))  # aware UTC: the repo reads a naive stamp as UTC (#485)
         if existing is None:
             new_mean = current
             new_var = 0.0

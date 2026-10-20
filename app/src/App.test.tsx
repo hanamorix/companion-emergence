@@ -64,7 +64,7 @@ vi.mock("./appConfig", () => ({
 }));
 
 // ── bridge ────────────────────────────────────────────────────────────────────
-import type { PersonaState } from "./bridge";
+import type { PersonaState, TunablesNotice } from "./bridge";
 
 const { fetchPersonaState, approvePendingWrite, declinePendingWrite } = vi.hoisted(() => {
   const baseState = (): PersonaState => ({
@@ -269,6 +269,57 @@ describe("App pending-write cards", () => {
     await waitFor(() =>
       expect(approvePendingWrite).toHaveBeenCalledWith("nell", "w_1")
     );
+  });
+});
+
+describe("App tunables notice (#462)", () => {
+  // Typed as PersonaState (fetchPersonaState resolves to one): `mode` stays the literal "live" and the notice is a TunablesNotice.
+  const stateWith = (tunables_notice?: TunablesNotice | null): PersonaState => ({
+    persona: "nell",
+    emotions: {},
+    body: null,
+    interior: { dream: null, research: null, heartbeat: null, reflex: null },
+    soul_highlight: null,
+    connection: { provider: "claude-cli", model: null, last_heartbeat_at: null },
+    mode: "live",
+    recovering: false,
+    felt_time_recovered: false,
+    ...(tunables_notice === undefined ? {} : { tunables_notice }),
+  });
+
+  beforeEach(() => {
+    readAppConfig.mockReset().mockResolvedValue(baseConfig("nell"));
+    writeAppConfig.mockReset().mockResolvedValue(undefined);
+    listPersonas.mockReset();
+    ensureBridgeRunning.mockReset().mockResolvedValue(undefined);
+    ensureBridgeCurrent.mockReset().mockResolvedValue("ok");
+    setAlwaysOnTop.mockReset().mockResolvedValue(undefined);
+    brainLoginStatus.mockReset().mockResolvedValue({ authorized: true });
+  });
+
+  afterEach(cleanup);
+
+  const KEPT = "tunables.json.corrupt-20261019T120000Z";
+  const cases: Array<[TunablesNotice, RegExp]> = [
+    [{ kind: "reset", kept_as: KEPT }, /kept as tunables\.json\.corrupt-20261019T120000Z/],
+    [{ kind: "restored", kept_as: KEPT }, /older saved copy/],
+    [{ kind: "unreadable", kept_as: null }, /cannot be read right now/],
+  ];
+
+  it.each(cases)("shows the notice for %j", async (notice, text) => {
+    fetchPersonaState.mockReset().mockResolvedValue(stateWith(notice));
+    render(<App />);
+
+    const el = await screen.findByTestId("tunables-notice");
+    expect(el).toHaveTextContent(text);
+  });
+
+  it.each<[TunablesNotice | null | undefined]>([[null], [undefined]])("shows no notice when the field is %s", async (notice) => {
+    fetchPersonaState.mockReset().mockResolvedValue(stateWith(notice));
+    render(<App />);
+
+    await waitFor(() => expect(fetchPersonaState).toHaveBeenCalled());
+    expect(screen.queryByTestId("tunables-notice")).toBeNull();
   });
 });
 

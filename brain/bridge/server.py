@@ -71,6 +71,7 @@ from brain.chat.session import (
     get_or_hydrate_session,
 )
 from brain.health.alarm import compute_pending_alarms
+from brain.health.attempt_heal import save_with_backup_text
 from brain.health.json_io import Recovery, iter_jsonl, read_json
 from brain.health.parse_failures import count_recent as count_recent_parse_failures
 from brain.health.walker import walk_persona
@@ -2645,9 +2646,7 @@ def build_app(
         # leaves the persona in a recoverable state: audit says
         # "replied_explicit", file unchanged. Hana can re-issue accept
         # after fixing the underlying disk error.
-        tmp = voice_path.with_suffix(voice_path.suffix + ".tmp")
-        tmp.write_text(new_content, encoding="utf-8")
-        tmp.replace(voice_path)
+        save_with_backup_text(voice_path, new_content, keep_backups=False)
 
         # Place 3: SoulStore voice_evolution.
         try:
@@ -3443,6 +3442,8 @@ def build_app(
         events.publish(
             "session_snapshot",
             session_id=sid,
+            deferred=report.deferred,
+            busy=report.busy,
             committed=report.committed,
             enqueued=report.enqueued,
             deduped=report.deduped,
@@ -3453,6 +3454,8 @@ def build_app(
         return {
             "session_id": sid,
             "closed": False,
+            "deferred": report.deferred,
+            "busy": report.busy,
             "committed": report.committed,
             "enqueued": report.enqueued,
             "deduped": report.deduped,
@@ -3566,6 +3569,29 @@ def build_app(
                     },
                 )
 
+            if report.deferred or report.busy:
+                # #473, #477: "not now", not a failure. The pass left the buffer and the cursor as they were, so the
+                # session stays registered (it is still on disk, and a retry or the sweep will take it) and the
+                # response says so instead of claiming the close happened.
+                events.publish(
+                    "session_close_deferred",
+                    session_id=sid,
+                    deferred=report.deferred,
+                    busy=report.busy,
+                )
+                return {
+                    "session_id": sid,
+                    "closed": False,
+                    "deferred": report.deferred,
+                    "busy": report.busy,
+                    "committed": report.committed,
+                    "enqueued": report.enqueued,
+                    "deduped": report.deduped,
+                    "soul_candidates": report.soul_candidates,
+                    "soul_queue_errors": report.soul_queue_errors,
+                    "errors": report.errors,
+                }
+
             # H2: clean up registry + lock so sessions_active stays accurate.
             remove_session(sid)
         s.in_flight_locks.pop(sid, None)
@@ -3583,6 +3609,8 @@ def build_app(
         return {
             "session_id": sid,
             "closed": True,
+            "deferred": False,
+            "busy": False,
             "committed": report.committed,
             "enqueued": report.enqueued,
             "deduped": report.deduped,

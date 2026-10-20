@@ -25,10 +25,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.bridge.provider import LLMProvider
+from brain.health.json_io import append_jsonl
 from brain.ingest.buffer import (
     delete_backoff,
     delete_cursor,
     delete_session_buffer,
+    extract_lock_path,
     list_active_sessions,
     read_backoff,
     read_cursor,
@@ -46,6 +48,7 @@ from brain.ingest.types import IngestReport
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.pending import GATE_BYPASS_TYPES
 from brain.memory.store import MemoryStore
+from brain.utils.file_lock import file_lock
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +81,68 @@ _BACKOFF_FAILURE_THRESHOLD = 3
 _BACKOFF_WINDOW_MINUTES = 10.0
 
 
+def extraction_failures_exhausted(persona_dir: Path, session_id: str) -> bool:
+    """True when the session's recorded extraction failures reached the poison threshold (the same one the stale sweep uses)."""
+    state = read_backoff(persona_dir, session_id)
+    return state is not None and state["failures"] >= _BACKOFF_FAILURE_THRESHOLD
+
+
+def record_extraction_failure(persona_dir: Path, session_id: str) -> None:
+    """Record one failed extraction attempt in the session's backoff sidecar (F-011).
+
+    The first failure in a new window anchors ``first_failure_at`` to now; later ones increment the count without moving the anchor,
+    so the window measures from the *first* failure. Three of them move a silent buffer to ``poison/`` (the stale sweep) and let the
+    rollover set the unextracted span aside. Never call it for a deferral or a busy pass: those are not failures.
+    """
+    existing = read_backoff(persona_dir, session_id)
+    if existing is None:
+        write_backoff(persona_dir, session_id, failures=1, first_failure_at=datetime.now(UTC).isoformat())
+    else:
+        write_backoff(
+            persona_dir,
+            session_id,
+            failures=existing["failures"] + 1,
+            first_failure_at=existing["first_failure_at"],
+        )
+
+
+def poison_unextracted_span(persona_dir: Path, session_id: str) -> int | None:
+    """Set the session's not-yet-extracted turns aside in ``active_conversations/poison/<sid>.span.jsonl`` and move the cursor past
+    them, so the buffer can be folded and reaped (#477).
+
+    The stale sweep moves a whole buffer to ``poison/`` after the same 3 recorded failures, but only once the session has been silent
+    for 24 hours; a session in daily use with a persistent extraction failure would otherwise grow without bound once the rollover
+    refuses to reap unextracted turns. The turns are KEPT (appended verbatim, never silently lost) and the failure record is cleared
+    so the successor session starts clean.
+
+    Runs under the session's non-blocking extraction lock: returns None when another pass holds it (busy: nothing is changed and the
+    caller must not reap); otherwise how many turns were set aside. Raises when they cannot be written, in which case nothing has
+    been changed. A failing CURSOR write happens after the span was appended, so the span may then exist twice after a retry
+    (duplicates, never a loss); the caller still must not reap.
+    """
+    with file_lock(extract_lock_path(persona_dir, session_id), blocking=False) as acquired:
+        if not acquired:
+            return None
+        cursor = read_cursor(persona_dir, session_id)
+        turns = [t for t in read_session_after(persona_dir, session_id, cursor) if t.get("speaker") != "summary"]
+        if not turns:
+            delete_backoff(persona_dir, session_id)
+            return 0
+        poison_dir = persona_dir / "active_conversations" / "poison"
+        poison_dir.mkdir(parents=True, exist_ok=True)
+        append_jsonl(poison_dir / f"{session_id}.span.jsonl", turns, fsync=True)
+        last_ts = turns[-1].get("ts")
+        if last_ts:
+            write_cursor(persona_dir, session_id, str(last_ts))
+        delete_backoff(persona_dir, session_id)
+        logger.warning(
+            "conversation_span_poisoned session=%s turns=%d: extraction kept failing; the turns are kept in poison/",
+            session_id,
+            len(turns),
+        )
+        return len(turns)
+
+
 def _load_user_name(persona_dir: Path) -> str | None:
     """Look up PersonaConfig.user_name; None if missing or unset.
 
@@ -105,6 +170,29 @@ def _load_user_pronouns(persona_dir: Path) -> dict | None:
 
 
 def close_session(
+    persona_dir: Path,
+    session_id: str,
+    *,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    provider: LLMProvider,
+    config: dict | None = None,
+) -> IngestReport:
+    """Close one session under its extraction lock (#477): a close that finds another extraction running skips (``busy``).
+
+    Without the lock a close extracts and deletes the buffer while the stale sweep, a rollover or the snapshot route is
+    mid-extraction of the same turns: both commit them, and the snapshot then writes a cursor for a deleted session.
+    """
+    with file_lock(extract_lock_path(persona_dir, session_id), blocking=False) as acquired:
+        if not acquired:
+            logger.info("conversation_close_busy session=%s: another extraction is running", session_id)
+            return IngestReport(session_id=session_id, busy=True)
+        return _close_session_locked(
+            persona_dir, session_id, store=store, hebbian=hebbian, provider=provider, config=config
+        )
+
+
+def _close_session_locked(
     persona_dir: Path,
     session_id: str,
     *,
@@ -176,6 +264,11 @@ def close_session(
         user_pronouns=_load_user_pronouns(persona_dir),
         persona_dir=persona_dir,
     )
+    if extraction.deferred:
+        # #473: "not now" is not a failure: no error, and the buffer stays for the next close.
+        report.deferred = True
+        logger.info("conversation_extract_deferred session=%s turns=%d; retaining buffer", session_id, len(turns))
+        return report
     if extraction.failed:
         report.errors += 1
         logger.warning(
@@ -281,6 +374,38 @@ def extract_session_snapshot(
     provider: LLMProvider,
     config: dict | None = None,
 ) -> IngestReport:
+    """Run one snapshot extraction of ``session_id``; one extraction per session at a time (#477).
+
+    The periodic sweep, the session rollover, the bridge's snapshot route and the CLI can all
+    reach the same session together. Two concurrent passes extract the same turns twice and race
+    on the cursor write, so a pass that finds another one running skips: the running pass
+    advances the cursor, and the next sweep picks up anything it did not cover. The skip is not
+    an error and counts for nothing, and the report says so (``busy``), so a caller that acts on the
+    result (the rollover) can tell it from a pass that had nothing to do.
+    """
+    with file_lock(extract_lock_path(persona_dir, session_id), blocking=False) as acquired:
+        if not acquired:
+            logger.info("conversation_snapshot_busy session=%s: another extraction is running", session_id)
+            return IngestReport(session_id=session_id, busy=True)
+        return _extract_session_snapshot_locked(
+            persona_dir,
+            session_id,
+            store=store,
+            hebbian=hebbian,
+            provider=provider,
+            config=config,
+        )
+
+
+def _extract_session_snapshot_locked(
+    persona_dir: Path,
+    session_id: str,
+    *,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    provider: LLMProvider,
+    config: dict | None = None,
+) -> IngestReport:
     """Run BUFFER → EXTRACT → SCORE → DEDUPE → COMMIT → SOUL → LOG without
     deleting the buffer.
 
@@ -313,6 +438,7 @@ def extract_session_snapshot(
                 elapsed_min,
             )
             report.errors += 1
+            report.backoff_skipped = True  # no provider call was made: not a failed attempt
             return report
 
     cursor = read_cursor(persona_dir, session_id)
@@ -351,6 +477,14 @@ def extract_session_snapshot(
         user_pronouns=_load_user_pronouns(persona_dir),
         persona_dir=persona_dir,
     )
+    if extraction.deferred:
+        # #473: "not now" is not a failure. No error, no backoff entry (three of those move the buffer to poison/),
+        # the cursor stays, and the next sweep tries again.
+        report.deferred = True
+        logger.info(
+            "conversation_snapshot_deferred session=%s turns=%d; cursor unchanged", session_id, len(turns)
+        )
+        return report
     if extraction.failed:
         report.errors += 1
         logger.warning(
@@ -359,25 +493,7 @@ def extract_session_snapshot(
             len(turns),
             extraction.error or "unknown extraction failure",
         )
-        # F-011 — record failure for backoff tracking. First failure in a
-        # new window anchors first_failure_at to now; subsequent failures
-        # increment the count without moving the anchor (so the window
-        # measures from the *first* failure, not the most recent).
-        existing = read_backoff(persona_dir, session_id)
-        if existing is None:
-            write_backoff(
-                persona_dir,
-                session_id,
-                failures=1,
-                first_failure_at=datetime.now(UTC).isoformat(),
-            )
-        else:
-            write_backoff(
-                persona_dir,
-                session_id,
-                failures=existing["failures"] + 1,
-                first_failure_at=existing["first_failure_at"],
-            )
+        record_extraction_failure(persona_dir, session_id)
         return report
 
     items = [it.normalize(valid_emotions=valid_emotions, source=f"session={session_id}") for it in extraction.items if it.text]
@@ -603,18 +719,42 @@ def finalize_stale_sessions(
             # doesn't block the finalize loop indefinitely. This is the ONLY
             # buffer-lifecycle action finalize still performs (quarantine of
             # corrupt input); the successful path no longer deletes.
-            src = persona_dir / "active_conversations" / f"{sid}.jsonl"
-            poison_dir = persona_dir / "active_conversations" / "poison"
-            poison_dir.mkdir(parents=True, exist_ok=True)
-            dst = poison_dir / f"{sid}.jsonl"
-            src.rename(dst)
-            delete_cursor(persona_dir, sid)
-            delete_backoff(persona_dir, sid)
-            logger.warning(
-                "conversation_finalize_deadletter session=%s failures=%d — moved to poison/",
-                sid,
-                backoff["failures"],  # type: ignore[index]
-            )
+            # Under the session's extraction lock (#477), non-blocking: a pass that holds it (the busy
+            # snapshot above, a rollover's poison_unextracted_span) must not have the buffer renamed and
+            # the cursor deleted under it; the next finalize tick retries.
+            with file_lock(extract_lock_path(persona_dir, sid), blocking=False) as acquired:
+                if not acquired:
+                    logger.info("conversation_finalize_deadletter_busy session=%s: another extraction holds it", sid)
+                else:
+                    src = persona_dir / "active_conversations" / f"{sid}.jsonl"
+                    poison_dir = persona_dir / "active_conversations" / "poison"
+                    dst = poison_dir / f"{sid}.jsonl"
+                    # The backoff above was read BEFORE this lock: a rollover that succeeded in between has reaped the
+                    # buffer, and there is then nothing to poison. Checked under the lock, and the rename is guarded too
+                    # (a reap in that instant), so a vanished buffer can never abort the sweep for the other sessions.
+                    moved = False
+                    if src.exists():
+                        try:
+                            poison_dir.mkdir(parents=True, exist_ok=True)
+                            src.rename(dst)
+                            moved = True
+                        except FileNotFoundError:
+                            pass
+                    if moved:
+                        delete_cursor(persona_dir, sid)
+                        delete_backoff(persona_dir, sid)
+                        logger.warning(
+                            "conversation_finalize_deadletter session=%s failures=%d — moved to poison/",
+                            sid,
+                            backoff["failures"],  # type: ignore[index]
+                        )
+                    else:
+                        delete_backoff(persona_dir, sid)  # nothing left to poison: the failure record is stale
+                        logger.info(
+                            "conversation_finalize_deadletter_gone session=%s: the buffer is already gone "
+                            "(reaped by a rollover); nothing to poison, backoff cleared",
+                            sid,
+                        )
         reports.append(report)
         logger.info(
             "conversation_finalized session=%s silence_hours=%.2f "
