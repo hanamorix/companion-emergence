@@ -27,6 +27,7 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
+from brain.utils.sqlite_open import STRICT_WAL_PROFILE, close_on_error, open_store_connection
 from brain.works import Work
 
 logger = logging.getLogger(__name__)
@@ -101,6 +102,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _works_setup(conn: sqlite3.Connection) -> None:
+    """The works tail of an open: rows by name, foreign keys on."""
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+
+
 class WorksStore:
     """SQLite index over works.
 
@@ -119,7 +126,10 @@ class WorksStore:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         key = str(self._path.resolve())
         if key not in self._INITIALISED_PATHS:
-            with self._connect() as conn:
+            conn = self._connect()
+            # `with conn:` commits or rolls back but never closes; a failed
+            # first-init must not leak the connection (#496).
+            with close_on_error(conn), conn:
                 conn.executescript(_SCHEMA_SQL)
                 conn.commit()
                 # First ALTER migration in the repo. Runs right after the
@@ -129,12 +139,13 @@ class WorksStore:
             self._INITIALISED_PATHS.add(key)
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self._path))
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA busy_timeout = 5000")
-        return conn
+        return open_store_connection(
+            self._path,
+            caller="WorksStore",
+            integrity_check=False,
+            profile=STRICT_WAL_PROFILE,
+            setup=_works_setup,
+        )
 
     @property
     def _conn(self) -> sqlite3.Connection:

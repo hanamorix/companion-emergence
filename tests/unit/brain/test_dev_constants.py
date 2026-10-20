@@ -90,6 +90,7 @@ def test_sqlite_store_busy_timeout_is_five_seconds() -> None:
         "brain.soul.store",
         "brain.kindled_link.store",
         "brain.memory.store",
+        "brain.works.store",
     ],
 )
 def test_migrated_store_modules_no_longer_write_out_the_busy_timeout(module_name: str) -> None:
