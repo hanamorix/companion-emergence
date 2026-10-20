@@ -329,7 +329,7 @@ describe("ensureBridgeCurrent", () => {
 
   it("(#365) says why when the recheck after a replace fails or still disagrees", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    restartBridge.mockResolvedValue(undefined); // an earlier test leaves a rejection in place
+    restartBridge.mockResolvedValue(true); // an earlier test leaves a rejection in place; true = the restart succeeded
     getVersion.mockResolvedValue("0.0.43");
     fetchHealth
       .mockResolvedValueOnce({ liveness: "ok", version: "0.0.30" })

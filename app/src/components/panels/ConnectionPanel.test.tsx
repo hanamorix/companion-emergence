@@ -239,13 +239,14 @@ describe("ConnectionPanel — StatusBanner (P3-6 + P4-2)", () => {
       <ConnectionPanel state={baseState({ mode: "bridge_down" })} persona="test" />,
     );
     const banner = screen.getByRole("alert");
-    expect(banner).toHaveTextContent(/end conversation and restart/i);
+    // #456 (Q-A): the button's idle label is now "Restart the brain" (no session is ended by a restart).
+    expect(banner).toHaveTextContent(/restart the brain/i);
   });
 
   it("does not render RestartBridgeButton when mode is healthy", () => {
     render(<ConnectionPanel state={baseState()} persona="test" />);
     expect(
-      screen.queryByText(/end conversation and restart/i),
+      screen.queryByRole("button", { name: /restart the brain/i }),
     ).not.toBeInTheDocument();
   });
 
@@ -259,7 +260,7 @@ describe("ConnectionPanel — StatusBanner (P3-6 + P4-2)", () => {
     const banner = screen.getByRole("alert");
     expect(banner).toBeInTheDocument();
     expect(
-      screen.queryByText(/end conversation and restart/i),
+      screen.queryByRole("button", { name: /restart the brain/i }),
     ).not.toBeInTheDocument();
   });
 

@@ -13,6 +13,16 @@ import pytest
 from brain.bridge import kill, shutdown_progress, state_file
 
 
+@pytest.fixture(autouse=True)
+def _launchd_uid_where_os_has_none(monkeypatch):
+    """The launchd-logic tests here run on every CI platform with ``platform="darwin"`` (the manager is spied).
+    launchd's domain is ``gui/<uid>`` from ``os.getuid``, which Windows does not have: give it one there only."""
+    import os
+
+    if not hasattr(os, "getuid"):
+        monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
+
+
 def _cp(rc: int = 0, out: str = "") -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess(args=[], returncode=rc, stdout=out, stderr="")
 
@@ -40,7 +50,12 @@ def test_systemd_ownership_is_the_units_main_pid(monkeypatch):
 
 @pytest.mark.parametrize(
     ("out", "owned"),
-    [("state = running\n\tpid = 4242\n", True), ("pid = 4242\npid = 4242\n", False), ("state = waiting\n", False)],
+    [
+        ("state = running\n\tpid = 4242\n", True),
+        ("state = running\r\n\tpid = 4242\r\n", True),  # CRLF line ends parse the same
+        ("pid = 4242\npid = 4242\n", False),
+        ("state = waiting\n", False),
+    ],
 )
 def test_launchd_ownership_needs_exactly_one_matching_pid_line(monkeypatch, out, owned):
     from brain.service import launchd

@@ -77,14 +77,15 @@ def _extraction_allows_rollover(
     It may when the extraction completed, or when the session's extraction has failed persistently and the unextracted span has been
     set aside in ``poison/`` (kept, never lost). It may not, and the buffer stays for the next cycle, when:
     * another pass is running (busy) or the model call was refused as "not now" (deferred; also when it is RAISED): neither is a
-      failure and neither is ever counted;
+      failure and neither is ever counted. A refusal because the bridge is stopping (``ShutdownDeferred``, #456) is
+      re-raised instead, so the caller's job ends with its cadence unchanged;
     * the pass returned inside the backoff window without calling the provider (``backoff_skipped``): no attempt was made, so
       nothing is counted and nothing is set aside;
     * the extraction failed (a failed pass, or an ordinary exception out of it, which is recorded as a failure like a failed pass)
       and the session is still below the 3-failure threshold the stale sweep uses;
     * it is at the threshold but the span could not be set aside, or another pass holds the extraction lock.
     """
-    from brain.bridge.cli_throttle import ThrottleDeferred
+    from brain.bridge.cli_throttle import ShutdownDeferred, ThrottleDeferred
     from brain.ingest.pipeline import (
         extract_session_snapshot,
         extraction_failures_exhausted,
@@ -96,6 +97,10 @@ def _extraction_allows_rollover(
         report = extract_session_snapshot(
             persona_dir, old_sid, store=store, hebbian=hebbian, provider=provider, config=config
         )
+    except ShutdownDeferred:
+        # #456 (C38 d): the bridge is stopping: the refusal ends the caller's job (the compaction tick re-raises it, so
+        # its cadence is not advanced); the old buffer is kept.
+        raise
     except ThrottleDeferred:
         logger.info("rollover: extraction deferred session=%s; keeping the old buffer", old_sid)
         return False

@@ -74,18 +74,26 @@ _REAL_DIR_PROPS = {
 
 
 @pytest.fixture
-def real_platform_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
+def real_platform_dirs(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """For a test that compares the home computed from an environment with platformdirs' own answer (#456 S15, the
-    pre-PR bridge proof): put the platform's real properties back over #488's redirect. The XDG variables #488 set
-    still point into the test's tmp root, so on Linux nothing resolves to the real user directory; the test only
-    compares paths, it writes nothing there."""
+    pre-PR bridge proof): put the platform's real properties back over #488's redirect. For comparing paths ONLY.
+
+    On Linux the XDG variables #488 set still point into the test's tmp root; on macOS and Windows the restored
+    properties resolve to the REAL user directories, so the fixture fails the test if any exposed directory was
+    created, or gained or lost a top-level entry, during the test (tests/real_dirs_guard.py; names only, nothing read;
+    a developer's running bridge writing to its existing files there does not trip it)."""
     from platformdirs import PlatformDirs
 
     from brain import paths
+    from tests.real_dirs_guard import assert_untouched, fingerprint
 
     for cls in {type(paths._dirs), PlatformDirs}:
         for prop, value in _REAL_DIR_PROPS.items():
             monkeypatch.setattr(cls, prop, value)
+    exposed = [Path(getattr(paths._dirs, prop)) for prop in _REAL_DIR_PROPS]
+    before = fingerprint(exposed)
+    yield
+    assert_untouched(before, fingerprint(exposed))
 
 
 @pytest.fixture(autouse=True)

@@ -189,6 +189,8 @@ describe("useRestartBridge: a new bridge (#456)", () => {
     expect(m.hardExit).not.toHaveBeenCalled();
     expect(result.current.offerHardExit).toBe(false);
 
+    // waitFor drains with a setTimeout(0) that vitest's fake timers would never fire: real timers from here on.
+    vi.useRealTimers();
     rerender({ mode: "live" });
     await waitFor(() => expect(result.current.state).toBe("success"));
   });

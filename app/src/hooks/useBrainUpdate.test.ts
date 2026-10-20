@@ -55,7 +55,12 @@ function mockRestart(...results: boolean[]): ReturnType<typeof vi.fn> {
     state: "idle",
     errorDetail: null,
     fellThrough: null,
+    progress: null,
+    offerHardExit: false,
+    offerText: null,
     restart,
+    hardExit: vi.fn(),
+    keepWaiting: vi.fn(),
     onModeChanged: vi.fn(),
   });
   return restart;

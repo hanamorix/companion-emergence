@@ -2614,9 +2614,16 @@ class _BridgeStartedMidCommandError(Exception):
 
 def _bridge_running(persona_dir: Path) -> Any:
     """The persona's bridge state when its bridge is running, else None: a record with a port whose pid is the recorded
-    bridge by its identity token (#456 / #472: a live but reused pid is not a bridge)."""
+    bridge by its identity token (#456 / #472: a live but reused pid is not a bridge). An identity that cannot be read
+    (UNKNOWN) counts as running (review MG-3): the command then goes through the bridge, which fails without writing
+    if nothing answers, so persona_config.json is never written under a bridge that may be live."""
     state = state_file.read(persona_dir)
-    if state and state.pid and state.port and state_file.bridge_liveness(state, persona_dir) == state_file.ALIVE:
+    if (
+        state
+        and state.pid
+        and state.port
+        and state_file.bridge_liveness(state, persona_dir) in (state_file.ALIVE, state_file.UNKNOWN)
+    ):
         return state
     return None
 
