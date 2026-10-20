@@ -8,12 +8,12 @@ Writes bridge.json with pid + chosen port, then runs uvicorn until SIGTERM.
 from __future__ import annotations
 
 import argparse
-import atexit
 import logging
 import os
 import signal
 import socket
 import sys
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -61,39 +61,45 @@ def _allocate_port(max_attempts: int = 3) -> int:
     )
 
 
-def _write_clean_shutdown(persona_dir: Path) -> None:
-    """Mark bridge.json as cleanly stopped. Idempotent — safe to call multiple times.
+def _write_stopped(persona_dir: Path) -> None:
+    """Record the honest end of a normal stop (#456 C11): "stopped", clean, pid/port cleared. Only this bridge's own
+    record is written (``state_file.update``); a failure is logged, never raised."""
 
-    Honours ``drain_errors``: if the FastAPI lifespan recorded ingest
-    errors during the shutdown drain, leave shutdown_clean=False so the
-    next start runs ``run_recovery_if_needed`` and retries the orphan
-    buffers. Without this guard, a clean exit-flow that just-happened
-    to have a failed drain would mask itself as fully clean and the
-    buffers would sit forever.
-    """
+    def _mark(st: state_file.BridgeState) -> None:
+        st.phase = "stopped"
+        st.shutdown_clean = True
+        st.stopped_at = datetime.now(UTC).isoformat()
+        st.pid = None
+        st.port = None
+        st.pid_token = None
+
     try:
-        cur = state_file.read(persona_dir)
-        if cur is None or cur.shutdown_clean is True:
-            return
-        cur.pid = None
-        cur.port = None
-        cur.stopped_at = datetime.now(UTC).isoformat()
-        if cur.drain_errors > 0:
-            # Drain failed; do NOT flip clean=True. Recovery will retry
-            # the buffers on next start. Persist the (still-dirty) state
-            # so callers see the updated stopped_at + cleared pid/port.
-            state_file.write(persona_dir, cur)
-            logger.warning(
-                "shutdown_clean kept False (drain_errors=%d); recovery will fire on next start",
-                cur.drain_errors,
-            )
-            return
-        cur.shutdown_clean = True
-        state_file.write(persona_dir, cur)
+        if not state_file.update(persona_dir, _mark):
+            logger.warning("bridge.json is not this bridge's record; the stopped mark was not written")
     except Exception:
-        # best-effort only; don't re-raise at exit time, but leave a
-        # forensic breadcrumb so silent dirty-shutdowns are debuggable.
-        logger.warning("clean-shutdown write failed", exc_info=True)
+        logger.warning("stopped-mark write failed", exc_info=True)
+
+
+def _after_run(persona_dir: Path, app: object, monitor: object) -> None:
+    """The after-run decision (#456, plan I4): runs whatever way ``server.run()`` ended (normal return, SystemExit
+    from the re-raised SIGTERM, KeyboardInterrupt from the re-raised SIGINT).
+
+    Clean only when nothing is running: the task registry is sealed (or, when the lifespan never ran, empty and
+    sealed now) and the supervisor thread has ended. Anything else is the hard-exit path at once.
+    """
+    from brain.bridge import shutdown as shutdown_mod
+    from brain.bridge import shutdown_progress
+
+    bridge_state = getattr(getattr(app, "state", None), "bridge", None)
+    sup = getattr(bridge_state, "supervisor_thread", None)
+    reg = shutdown_progress.registry
+    sealed = reg.sealed or reg.seal()
+    if sealed and (sup is None or not sup.is_alive()):
+        _write_stopped(persona_dir)
+        monitor.stop()  # type: ignore[attr-defined]
+        return
+    logger.error("bridge run ended with work still running; hard exit")
+    shutdown_mod.hard_exit(persona_dir, shutdown_mod.REASON_HARD_EXIT)
 
 
 _RUNTIME_LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
@@ -162,6 +168,13 @@ def run_bridge_foreground(
 
     _setup_runtime_logging(persona_dir)
 
+    # #456 (C43 a, C55): watcher files (progress record, hard-exit request, stop intent) left by an earlier process
+    # are not this bridge's. Both callers (runner.main, cmd_run) hold the bridge lock here; a runner that lost it has
+    # already exited.
+    from brain.bridge import shutdown_progress
+
+    shutdown_progress.delete_watcher_files(persona_dir)
+
     port = _allocate_port()
     # H-C: ephemeral bearer token persisted in bridge.json. 32 bytes from
     # secrets.token_urlsafe — cryptographically random and subprotocol-safe.
@@ -190,25 +203,16 @@ def run_bridge_foreground(
     )
     state_file.write(persona_dir, initial_state)
 
-    # Register atexit so we mark clean shutdown even if uvicorn calls sys.exit()
-    # directly (which skips try/finally in main but does run atexit handlers).
-    atexit.register(_write_clean_shutdown, persona_dir)
-
-    # Install SIGTERM handler: uvicorn installs its own, but if this process
-    # receives SIGTERM before uvicorn's handler is registered (e.g. immediately
-    # after startup), we want to mark clean shutdown and exit gracefully.
-    # After uvicorn.run() is called, uvicorn owns SIGTERM; our atexit fires on exit.
-    def _sigterm_handler(signum: int, frame: object) -> None:
-        # Only fires in the tiny window between this signal.signal() call
-        # and uvicorn.run() registering its own SIGTERM handler — once
-        # uvicorn is up, this handler is replaced. atexit + the finally
-        # block cover the post-uvicorn paths.
-        _write_clean_shutdown(persona_dir)
-        sys.exit(0)
-
-    signal.signal(signal.SIGTERM, _sigterm_handler)
+    from brain.bridge import shutdown as shutdown_mod
 
     shutdown_controller = BridgeShutdownController()
+    shutdown_controller.configure(persona_dir)
+    server_holder: dict = {}
+    # Before uvicorn installs its own handlers (and after it restores this one): a signal only writes attributes;
+    # uvicorn sees ``should_exit`` at start. After serve() ended, the re-raised SIGTERM ends with status 0 (C15).
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, shutdown_mod.early_signal_handler(shutdown_controller, server_holder))
+
     app = build_app(
         persona_dir=persona_dir,
         client_origin=client_origin,
@@ -223,13 +227,31 @@ def run_bridge_foreground(
         log_level="warning",
         timeout_graceful_shutdown=30,
     )
-    server = uvicorn.Server(config)
+    server = shutdown_mod.make_server_class(uvicorn.Server)(config)
+    server.controller = shutdown_controller
+    server_holder["server"] = server
     shutdown_controller.bind_server(server)
+    if shutdown_controller.signal_count:
+        server.should_exit = True
+    monitor = shutdown_mod.Monitor(
+        shutdown_controller,
+        persona_dir,
+        pid=os.getpid(),
+        pid_token=own_token,
+        hard_exit=lambda reason: shutdown_mod.hard_exit(persona_dir, reason),
+    )
+    monitor.start()
+    rc = 0
     try:
-        server.run()
+        try:
+            server.run()
+        except KeyboardInterrupt:
+            pass  # the re-raised SIGINT after a graceful stop: exit 0 (C42 d)
+        except SystemExit as exc:
+            rc = exc.code if isinstance(exc.code, int) else 0
     finally:
-        _write_clean_shutdown(persona_dir)
-    return 0
+        _after_run(persona_dir, app, monitor)
+    return rc
 
 
 def main(argv: list[str] | None = None) -> int:

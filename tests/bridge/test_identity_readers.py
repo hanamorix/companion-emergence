@@ -71,13 +71,11 @@ def test_unknown_identity_is_not_running_for_starts_but_live_for_recover(
 
 
 def test_471_production_shaped_drain_errors_state_needs_recovery(persona_dir):
-    # C33: the real _write_clean_shutdown after a drain-errors record clears pid and keeps shutdown_clean False.
-    from brain.bridge.runner import _write_clean_shutdown
-
-    _write(persona_dir, pid=os.getpid(), pid_token=pi.own_token(), drain_errors=2)
-    _write_clean_shutdown(persona_dir)
-    after = state_file.read(persona_dir)
-    assert after.pid is None and after.shutdown_clean is False
+    # C33: the state the pre-#456 `_write_clean_shutdown` left after a drain-errors record: pid and port cleared,
+    # stopped_at set, shutdown_clean False. That writer is gone (plan I4: no shutdown drain any more, Q-B), so the
+    # shape is written as the older version left it on disk.
+    _write(persona_dir, pid=None, port=None, stopped_at="2026-10-01T00:00:00+00:00", shutdown_clean=False,
+           drain_errors=2)
     assert state_file.recovery_needed(persona_dir) is True
 
 

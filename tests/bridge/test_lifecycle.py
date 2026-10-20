@@ -70,106 +70,6 @@ def test_supervisor_prunes_old_empty_sessions(
         reset_registry()
 
 
-def test_graceful_shutdown_drains_via_snapshot_and_preserves_buffer(
-    persona_dir: Path,
-    monkeypatch,
-):
-    """Lifespan teardown drains via snapshot_stale_sessions(silence_minutes=0)
-    — non-destructive: memories extract durably, but the buffer + cursor
-    survive on disk so the next bridge start can resume the sticky session.
-    """
-    from tests.bridge.test_endpoints import _patch_fake_provider
-
-    _patch_fake_provider(monkeypatch, reply="bye")
-
-    drained: list = []
-    from brain.ingest import pipeline as ingest_pipeline
-
-    real_snapshot = ingest_pipeline.snapshot_stale_sessions
-
-    def spy(persona_dir, *, silence_minutes, **kw):
-        drained.append(silence_minutes)
-        return real_snapshot(persona_dir, silence_minutes=silence_minutes, **kw)
-
-    monkeypatch.setattr(ingest_pipeline, "snapshot_stale_sessions", spy)
-
-    monkeypatch.setenv("NELL_STREAM_CHUNK_DELAY_MS", "0")
-    with _client(persona_dir) as c:
-        sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
-        c.post("/chat", json={"session_id": sid, "message": "hi"})
-
-        # Sanity: the buffer file exists while the bridge is live.
-        buffer_path = persona_dir / "active_conversations" / f"{sid}.jsonl"
-        assert buffer_path.exists(), "buffer should exist after a /chat"
-
-    # __exit__ has run.
-    # 1. The drain ran with silence_minutes=0 (the shutdown signal).
-    assert 0 in drained or 0.0 in drained, f"silence_minutes=0 not seen; saw: {drained}"
-    # 2. The buffer SURVIVED — sticky-session contract. The 24h
-    #    finalize cadence handles genuinely-stale buffers on a later run.
-    assert buffer_path.exists(), (
-        "buffer must survive graceful shutdown (sticky-session contract); "
-        "snapshot_stale_sessions is non-destructive"
-    )
-
-
-def test_graceful_shutdown_records_dirty_when_snapshot_drain_raises(
-    persona_dir: Path,
-    monkeypatch,
-):
-    """A catastrophic shutdown drain exception must still arm dirty recovery."""
-    from brain.bridge import state_file
-    from tests.bridge.test_endpoints import _patch_fake_provider
-
-    _patch_fake_provider(monkeypatch, reply="bye")
-    state_file.write(
-        persona_dir,
-        state_file.BridgeState(
-            persona=persona_dir.name,
-            pid=12345,
-            port=51234,
-            started_at="2026-05-13T00:00:00Z",
-            stopped_at=None,
-            shutdown_clean=False,
-            client_origin="tests",
-        ),
-    )
-
-    def boom(*args, **kwargs):
-        raise RuntimeError("snapshot exploded")
-
-    monkeypatch.setattr("brain.bridge.server._drain_sessions_blocking", boom)
-
-    with _client(persona_dir) as c:
-        sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
-        c.post("/chat", json={"session_id": sid, "message": "hi"})
-
-    after = state_file.read(persona_dir)
-    assert after is not None
-    assert after.drain_errors >= 1
-    assert after.shutdown_clean is False
-
-
-def test_shutdown_logs_drain_errors_when_snapshot_fails(persona_dir: Path, monkeypatch, caplog):
-    import logging
-
-    from tests.bridge.test_endpoints import _patch_fake_provider
-
-    _patch_fake_provider(monkeypatch, reply="bye")
-
-    def boom(*_a, **_kw):
-        raise RuntimeError("snapshot exploded")
-
-    monkeypatch.setattr("brain.bridge.server._drain_sessions_blocking", boom)
-
-    with caplog.at_level(logging.ERROR, logger="brain.bridge.server"):
-        with _client(persona_dir) as c:
-            sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
-            c.post("/chat", json={"session_id": sid, "message": "hi"})
-
-    assert any("shutdown drain failed" in r.message for r in caplog.records)
-
-
 def test_check_idle_predicate(persona_dir: Path):
     """_check_idle is a pure predicate; no side effects."""
     from brain.bridge.server import _check_idle
@@ -386,66 +286,6 @@ def test_recovery_needed_predicate_drain_errors_arm(tmp_path: Path):
     assert state_file.recovery_needed(persona_dir) is True
 
 
-def test_write_clean_shutdown_keeps_dirty_when_drain_errors(tmp_path: Path):
-    """Phase 1.F: _write_clean_shutdown must NOT flip clean=True when
-    drain_errors > 0. The next bridge start re-runs recovery on the
-    orphan buffers."""
-    from brain.bridge import state_file
-    from brain.bridge.runner import _write_clean_shutdown
-
-    persona_dir = tmp_path
-    persona_dir.mkdir(exist_ok=True)
-    s = state_file.BridgeState(
-        persona=persona_dir.name,
-        pid=12345,
-        port=51234,
-        started_at="2026-04-28T10:00:00Z",
-        stopped_at=None,
-        shutdown_clean=False,
-        client_origin="cli",
-        drain_errors=3,
-    )
-    state_file.write(persona_dir, s)
-
-    _write_clean_shutdown(persona_dir)
-
-    after = state_file.read(persona_dir)
-    assert after is not None
-    assert after.shutdown_clean is False, "must remain dirty when drain_errors > 0"
-    assert after.drain_errors == 3
-    # pid + port still cleared so liveness checks see "not running".
-    assert after.pid is None
-    assert after.port is None
-    assert after.stopped_at is not None
-
-
-def test_write_clean_shutdown_flips_clean_when_drain_errors_zero(tmp_path: Path):
-    """Sanity-check: the no-error path still flips to clean=True."""
-    from brain.bridge import state_file
-    from brain.bridge.runner import _write_clean_shutdown
-
-    persona_dir = tmp_path
-    persona_dir.mkdir(exist_ok=True)
-    s = state_file.BridgeState(
-        persona=persona_dir.name,
-        pid=12345,
-        port=51234,
-        started_at="2026-04-28T10:00:00Z",
-        stopped_at=None,
-        shutdown_clean=False,
-        client_origin="cli",
-        drain_errors=0,
-    )
-    state_file.write(persona_dir, s)
-
-    _write_clean_shutdown(persona_dir)
-
-    after = state_file.read(persona_dir)
-    assert after is not None
-    assert after.shutdown_clean is True
-    assert after.pid is None
-
-
 def test_legacy_state_file_without_drain_errors_field_loads(tmp_path: Path):
     """Backward-compat: a bridge.json written before drain_errors existed
     must still deserialise cleanly. The field defaults to 0."""
@@ -560,12 +400,10 @@ def test_a_failing_cost_series_flush_does_not_stop_the_teardown(persona_dir: Pat
     assert _saved_cost_samples(persona_dir) == 0
 
 
-def test_the_teardown_flush_runs_after_the_supervisor_has_stopped_and_before_the_heartbeat_close(
-    persona_dir: Path, monkeypatch
-) -> None:
+def test_the_teardown_flush_runs_after_the_supervisor_has_stopped(persona_dir: Path, monkeypatch) -> None:
     """S164: the supervisor thread is the only other flusher, so the flush waits
-    for it to stop; the heartbeat close follows."""
-    from brain.bridge import server, supervisor
+    for it to stop. (#456 Q-B: no close heartbeat follows any more.)"""
+    from brain.bridge import supervisor
     from brain.memory import cost_series
 
     order: list[str] = []
@@ -577,7 +415,6 @@ def test_the_teardown_flush_runs_after_the_supervisor_has_stopped_and_before_the
 
     monkeypatch.setattr(supervisor, "run_folded", fake_supervisor)
     monkeypatch.setattr(cost_series, "flush", lambda _store: order.append("flush"))
-    monkeypatch.setattr(server, "_run_heartbeat_close", lambda *a, **k: order.append("heartbeat"))
     with _client(persona_dir, tick_interval_s=3600):
         pass
-    assert order == ["supervisor-stopped", "flush", "heartbeat"]
+    assert order == ["supervisor-stopped", "flush"]

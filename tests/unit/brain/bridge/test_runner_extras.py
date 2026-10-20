@@ -17,6 +17,7 @@ leave a callable scheduled to run at interpreter exit.
 
 from __future__ import annotations
 
+import os
 import socket
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -91,59 +92,43 @@ def test_allocate_port_exhausts_attempts_raises(monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# _write_clean_shutdown
+# _write_stopped (#456: replaces _write_clean_shutdown; written only for this bridge's own record)
 # ---------------------------------------------------------------------------
 
 
-def test_write_clean_shutdown_no_state_file_noop(tmp_path: Path) -> None:
-    """If bridge.json doesn't exist, _write_clean_shutdown returns without
-    writing anything."""
+def test_write_stopped_no_state_file_noop(tmp_path: Path) -> None:
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    # No state file present.
-    runner._write_clean_shutdown(persona_dir)
+    runner._write_stopped(persona_dir)
     assert not (persona_dir / state_file.STATE_FILENAME).exists()
 
 
-def test_write_clean_shutdown_already_clean_noop(tmp_path: Path) -> None:
-    """If shutdown_clean is already True, the function returns without
-    rewriting the file (stopped_at must NOT change)."""
+def test_write_stopped_leaves_another_process_record_alone(tmp_path: Path) -> None:
+    """A record that is not this process's (another bridge took over) is never written (main's ruling, C42 a)."""
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
     original = state_file.BridgeState(
-        persona="persona",
-        pid=None,
-        port=None,
-        started_at="2026-05-10T00:00:00+00:00",
-        stopped_at="2026-05-10T00:00:01+00:00",
-        shutdown_clean=True,
-        client_origin="tests",
-        auth_token="t",
+        persona="persona", pid=os.getpid() + 1, port=1, started_at="2026-05-10T00:00:00+00:00", stopped_at=None,
+        shutdown_clean=False, client_origin="tests", auth_token="t", pid_token="linux:x:1:1", phase="running",
     )
     state_file.write(persona_dir, original)
-
-    runner._write_clean_shutdown(persona_dir)
-
-    after = state_file.read(persona_dir)
-    assert after is not None
-    assert after.shutdown_clean is True
-    assert after.stopped_at == "2026-05-10T00:00:01+00:00"  # unchanged
+    before = (persona_dir / state_file.STATE_FILENAME).read_bytes()
+    runner._write_stopped(persona_dir)
+    assert (persona_dir / state_file.STATE_FILENAME).read_bytes() == before
 
 
-def test_write_clean_shutdown_swallows_exceptions(tmp_path: Path, monkeypatch, caplog) -> None:
-    """If state_file.read raises, the helper logs a warning instead of
-    propagating — exit-path code must never re-raise."""
+def test_write_stopped_swallows_exceptions(tmp_path: Path, monkeypatch, caplog) -> None:
+    """Exit-path code must never re-raise."""
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
 
     def boom(*_a, **_kw):
         raise RuntimeError("disk on fire")
 
-    monkeypatch.setattr(runner.state_file, "read", boom)
+    monkeypatch.setattr(runner.state_file, "update", boom)
     with caplog.at_level("WARNING", logger="brain.bridge.runner"):
-        runner._write_clean_shutdown(persona_dir)  # must not raise
-
-    assert any("clean-shutdown write failed" in r.message for r in caplog.records)
+        runner._write_stopped(persona_dir)  # must not raise
+    assert any("stopped-mark write failed" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -170,14 +155,11 @@ def test_run_bridge_foreground_writes_initial_state_and_runs_uvicorn(
     monkeypatch.setattr(runner, "_setup_runtime_logging", lambda _p: None)
     monkeypatch.setattr(runner, "build_app", lambda **_kw: object())
 
-    # Isolate atexit + signal so we don't touch the pytest process.
-    atexit_captured: list = []
-    monkeypatch.setattr(
-        runner.atexit,
-        "register",
-        lambda fn, *a, **kw: atexit_captured.append((fn, a, kw)),
-    )
+    # Isolate signal handlers so we don't touch the pytest process.
     monkeypatch.setattr(runner.signal, "signal", lambda _sig, _handler: None)
+    from brain.bridge import shutdown_progress
+
+    shutdown_progress.reset_for_tests()
 
     class FakeConfig:
         def __init__(self, app, *, host, port, log_level, timeout_graceful_shutdown):
@@ -219,11 +201,7 @@ def test_run_bridge_foreground_writes_initial_state_and_runs_uvicorn(
     assert final.pid is None
     assert final.port is None
     assert final.stopped_at is not None
-
-    # atexit registration was captured (proves the line ran) but cleaning
-    # ourselves so the bound callable doesn't fire at interpreter exit.
-    assert len(atexit_captured) == 1
-    assert atexit_captured[0][0] is runner._write_clean_shutdown
+    assert final.phase == "stopped"
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +220,6 @@ def test_run_bridge_foreground_binds_shutdown_controller_to_uvicorn_server(
 
     monkeypatch.setattr(runner, "_allocate_port", lambda: 54321)
     monkeypatch.setattr(runner, "_setup_runtime_logging", lambda _p: None)
-    monkeypatch.setattr(runner.atexit, "register", lambda *_a, **_kw: None)
     monkeypatch.setattr(runner.signal, "signal", lambda *_a, **_kw: None)
 
     def fake_build_app(**kwargs):
@@ -273,6 +250,75 @@ def test_run_bridge_foreground_binds_shutdown_controller_to_uvicorn_server(
     assert rc == 0
     assert captured["server"].should_exit is True
     assert captured["config"][4] == 30  # timeout_graceful_shutdown
+
+
+@pytest.mark.parametrize("ending", ["return", "system_exit", "keyboard_interrupt"])
+def test_after_run_decision_runs_however_server_run_ends(tmp_path: Path, monkeypatch, ending) -> None:
+    """C42 (d): the after-run decision runs when server.run() returns, ends by SystemExit (re-raised SIGTERM) or by
+    KeyboardInterrupt (re-raised SIGINT); exit status 0; nothing running -> "stopped"."""
+    from brain.bridge import shutdown_progress
+
+    shutdown_progress.reset_for_tests()
+    persona_dir = tmp_path / "personas" / "nell"
+    persona_dir.mkdir(parents=True)
+    monkeypatch.setattr(runner, "_allocate_port", lambda: 54321)
+    monkeypatch.setattr(runner, "_setup_runtime_logging", lambda _p: None)
+    monkeypatch.setattr(runner, "build_app", lambda **_kw: object())
+    monkeypatch.setattr(runner.signal, "signal", lambda *_a, **_kw: None)
+
+    class FakeServer:
+        def __init__(self, config):
+            self.should_exit = False
+
+        def run(self):
+            if ending == "system_exit":
+                raise SystemExit(0)
+            if ending == "keyboard_interrupt":
+                raise KeyboardInterrupt
+
+    monkeypatch.setattr(runner.uvicorn, "Config", lambda *a, **k: None)
+    monkeypatch.setattr(runner.uvicorn, "Server", FakeServer)
+    assert runner.run_bridge_foreground(persona_dir, client_origin="tests") == 0
+    assert state_file.read(persona_dir).phase == "stopped"
+
+
+def test_after_run_with_work_still_running_takes_the_hard_exit_path(tmp_path: Path, monkeypatch) -> None:
+    """Plan I4 runner: run() ended but a task still runs -> the hard-exit path at once, never "stopped"."""
+    from brain.bridge import shutdown as shutdown_mod
+    from brain.bridge import shutdown_progress
+
+    reg = shutdown_progress.reset_for_tests()
+    persona_dir = tmp_path / "personas" / "nell"
+    persona_dir.mkdir(parents=True)
+    monkeypatch.setattr(runner, "_allocate_port", lambda: 54321)
+    monkeypatch.setattr(runner, "_setup_runtime_logging", lambda _p: None)
+    monkeypatch.setattr(runner, "build_app", lambda **_kw: object())
+    monkeypatch.setattr(runner.signal, "signal", lambda *_a, **_kw: None)
+    exits: list[str] = []
+
+    class _Exited(BaseException):
+        pass
+
+    def fake_hard_exit(pd, reason="hard_exit"):
+        exits.append(reason)
+        raise _Exited
+
+    monkeypatch.setattr(shutdown_mod, "hard_exit", fake_hard_exit)
+
+    class FakeServer:
+        def __init__(self, config):
+            self.should_exit = False
+
+        def run(self):
+            reg.register("stub task")
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(runner.uvicorn, "Config", lambda *a, **k: None)
+    monkeypatch.setattr(runner.uvicorn, "Server", FakeServer)
+    with pytest.raises(_Exited):
+        runner.run_bridge_foreground(persona_dir, client_origin="tests")
+    assert exits == ["hard_exit"]
+    assert state_file.read(persona_dir).phase == "running"
 
 
 # ---------------------------------------------------------------------------

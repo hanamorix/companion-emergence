@@ -53,6 +53,10 @@ def _reset_cli_throttle() -> Iterator[None]:
     cli_throttle.reset()
     provider_auth.reset()  # #246: the auth-expiry hooks live inside the CLI detail helpers
     model_error.reset()  # #440: process-wide rejected-model records must not leak between tests
+    # #456: a bridge app's stop seals the process-wide task registry; a later test in this process starts fresh.
+    from brain.bridge import shutdown_progress
+
+    shutdown_progress.reset_for_tests()
     yield
     cli_throttle.reset()
     provider_auth.reset()

@@ -179,6 +179,7 @@ def run_central_pass(
     between_jobs: Callable[[], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
     deferred_until: dict[str, float] | None = None,
+    on_job: Callable[[str | None], None] | None = None,
 ) -> list[JobDecision]:
     """Run one pass of the central cadence function; return its decisions.
 
@@ -270,6 +271,8 @@ def run_central_pass(
             # INC-11 (S15/S23/S38): publish this job as running for the
             # duration of `run()` only — a paused job has already returned
             # (JobOutcome.PAUSED below) and so is no longer a member.
+            if on_job is not None:
+                on_job(job.name)  # #456: the stop's progress record names the job the supervisor is in
             with background_jobs.running(job.name):
                 outcome = job.run()
         except cli_throttle.ThrottleDeferred as exc:
@@ -309,4 +312,6 @@ def run_central_pass(
             # INC-10 seam: a job that paused for chat ends the sequence (S43).
             break
 
+    if on_job is not None:
+        on_job(None)
     return decisions

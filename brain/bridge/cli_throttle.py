@@ -104,6 +104,12 @@ def request_shutdown() -> None:
     _shutdown.set()
 
 
+def clear_shutdown() -> None:
+    """A new bridge app in this process starts unstopped (#456; one bridge per process in production, several
+    sequential apps in tests)."""
+    _shutdown.clear()
+
+
 def shutdown_requested() -> bool:
     return _shutdown.is_set()
 

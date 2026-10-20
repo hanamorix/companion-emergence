@@ -182,6 +182,7 @@ def run_folded(
     pending_reconcile_interval_s: float | None = 900.0,
     is_session_busy: Callable[[str], bool] | None = None,
     bridge_started_at: datetime | None = None,
+    activity: Callable[[str | None], None] | None = None,
 ) -> None:
     """Run supervisor + heartbeat + soul-review + finalize cadences until stop_event is set.
 
@@ -539,6 +540,7 @@ def run_folded(
                     between_jobs=_maybe_run_heartbeat,
                     should_stop=_stopping,
                     deferred_until=deferred_until,
+                    on_job=activity,
                 )
             except Exception:
                 logger.exception("supervisor central cadence pass raised")

@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -101,6 +103,32 @@ def write(persona_dir: Path, state: BridgeState) -> None:
     # mode=0o600 applies to the file and to every rotated backup (the token must never be wider).
     write_json(path, asdict(state), backups=backup_count, mode=0o600)
     _protect_state_dir(path)
+
+
+# One read-modify-write of bridge.json at a time inside this process (C18 a). `_update_between` is a test hook called
+# between the read and the write.
+_update_lock = threading.Lock()
+_update_between: Callable[[], None] | None = None
+
+
+def update(persona_dir: Path, fn: Callable[[BridgeState], None]) -> bool:
+    """Read-modify-write bridge.json for THIS bridge only (main's ruling: bridge.json is written only by its owner).
+
+    Writes when the record's pid is this process and its token is this process's own token (both None on a platform
+    where identity is unavailable); otherwise skips and returns False. Serialized under a module lock, so two updates
+    in this process never lose each other.
+    """
+    from brain import process_identity
+
+    with _update_lock:
+        cur = read(persona_dir)
+        if cur is None or cur.pid != os.getpid() or cur.pid_token != process_identity.own_token():
+            return False
+        if _update_between is not None:
+            _update_between()
+        fn(cur)
+        write(persona_dir, cur)
+        return True
 
 
 def _protect_state_dir(path: Path) -> None:
