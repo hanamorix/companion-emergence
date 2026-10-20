@@ -272,8 +272,15 @@ def test_the_monitor_survives_write_errors_and_still_honours_a_later_request(own
     c.configure(own_record)
     c.bind_server(FakeServer())
     exits: list[str] = []
+
+    def _hard_exit(reason: str) -> None:
+        # The real hard exit never returns (os._exit). This fake does, so it ends the monitor instead: otherwise the
+        # next poll (the request file is still there) calls it again before the test reaches m.stop() (review R3-S1).
+        exits.append(reason)
+        m._stop.set()  # noqa: SLF001
+
     m = shutdown_mod.Monitor(c, own_record, pid=os.getpid(), pid_token=_pi.own_token(),
-                             hard_exit=lambda reason: exits.append(reason), poll_s=0.02)
+                             hard_exit=_hard_exit, poll_s=0.02)
     real_write = shutdown_progress.write_record
     calls = {"n": 0}
 
