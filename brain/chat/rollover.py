@@ -111,7 +111,7 @@ def _extraction_allows_rollover(
     else:
         if report.completed:
             return True
-        if report.busy or report.deferred or report.backoff_skipped or report.errors == 0:
+        if report.busy or report.deferred or report.backoff_skipped:
             logger.info(
                 "rollover: extraction did not run to the end session=%s busy=%s deferred=%s backoff_skipped=%s; keeping the old buffer",
                 old_sid, report.busy, report.deferred, report.backoff_skipped,

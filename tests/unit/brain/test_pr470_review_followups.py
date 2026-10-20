@@ -249,3 +249,19 @@ def test_environment_requeue_keeps_the_original_entry_not_the_mutated_candidate(
     finally:
         store.close()
         heb.close()
+
+
+# --- item 8: rollover's dead `errors == 0` clause -----------------------------------------------------------------------
+
+
+def test_a_report_that_did_not_complete_with_no_errors_is_always_busy_or_deferred():
+    # PIN (passes before and after; the clause removed from rollover.py changes no behaviour): once `completed` is False,
+    # `errors == 0` can only hold when busy or deferred is already set, and rollover tests those first.
+    import itertools
+
+    from brain.ingest.types import IngestReport
+
+    for busy, deferred, backoff_skipped, errors in itertools.product([False, True], [False, True], [False, True], [0, 1]):
+        report = IngestReport(session_id="s", busy=busy, deferred=deferred, backoff_skipped=backoff_skipped, errors=errors)
+        if not report.completed and report.errors == 0:
+            assert report.busy or report.deferred
