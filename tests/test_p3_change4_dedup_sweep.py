@@ -299,3 +299,46 @@ def test_431_near_dup_pass_stops_comparing_a_row_it_just_dropped(tmp_path):
     assert _active_ids(store) == {b.id}
     assert [(m.canonical_id, m.removed_id) for m in report.merges] == [(b.id, a.id), (b.id, c.id)]
     store.close()
+
+
+def test_near_dup_pass_never_lowers_a_canonical_it_already_raised(tmp_path):
+    """Review finding (pre-existing on main): A (1, oldest) absorbs C (9) and is raised to 9 in the
+    store; the pass then compared D (3) against A's stale in-memory importance of 1 and wrote 3 back,
+    losing the max. The canonical must end at the max of everything merged into it."""
+    store = MemoryStore(tmp_path / "memories.db")
+    a = _aged("Bob baked bread.", 3, importance=1.0)
+    c = _aged("Bob was baking bread.", 2, importance=9.0)
+    d = _aged("Bread, baked by Bob.", 1, importance=3.0)
+    for m in (a, c, d):
+        store.create(m)
+
+    run_dedup_sweep(store, tmp_path, judge=lambda _x, _y: "duplicate")
+
+    assert _active_ids(store) == {a.id}
+    assert store.get(a.id, bump=False).importance == 9.0
+    store.close()
+
+
+def test_431_near_dup_swap_carries_the_max_and_retargets_earlier_merges(tmp_path):
+    """#431 review: A (1, oldest) absorbs C (9), then A is dropped in favour of the soul-linked B (2).
+    B must end at 9, A's archived pre-image must show the 9 it held, and no merge record may name the
+    deleted A as its canonical: C's merge now points at B, where its content survives."""
+    store = MemoryStore(tmp_path / "memories.db")
+    a = _aged("Bob fed the swans.", 3, importance=1.0)
+    c = _aged("Bob was feeding the swans.", 2, importance=9.0)
+    b = _aged("The swans Bob fed.", 1, importance=2.0)
+    for m in (a, c, b):
+        store.create(m)
+    _crystallise(tmp_path, b.id)
+
+    report = run_dedup_sweep(store, tmp_path, judge=lambda _x, _y: "duplicate")
+
+    assert _active_ids(store) == {b.id}
+    assert store.get(b.id, bump=False).importance == 9.0
+    assert [(m.canonical_id, m.removed_id) for m in report.merges] == [(b.id, c.id), (b.id, a.id)]
+    archived = [
+        json.loads(line)["target"]
+        for line in (tmp_path / _ARCHIVE_FILENAME).read_text(encoding="utf-8").splitlines()
+    ]
+    assert [(t["id"], t["importance"]) for t in archived] == [(c.id, 9.0), (a.id, 9.0)]
+    store.close()

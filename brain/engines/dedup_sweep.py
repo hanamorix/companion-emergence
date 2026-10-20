@@ -211,9 +211,16 @@ def _near_dup_pass(
             if verdict != "duplicate" or (other.id in exempt and cand.id in exempt):
                 continue
             keep, drop = (other, cand) if other.id in exempt else (cand, other)
+            # Re-read both: an earlier merge in this pass may have raised either one's importance,
+            # and the in-memory objects never see it.
+            keep = store.get(keep.id, bump=False) or keep
+            drop = store.get(drop.id, bump=False) or drop
             _archive_preimage(persona_dir, drop)
             store.hard_delete(drop.id)
             removed.add(drop.id)
+            for earlier in report.merges:  # rows merged into ``drop`` now live on in ``keep``
+                if earlier.canonical_id == drop.id:
+                    earlier.canonical_id = keep.id
             report.merges.append(
                 MergeRecord(
                     canonical_id=keep.id,
@@ -224,5 +231,5 @@ def _near_dup_pass(
             report.rows_removed += 1
             if float(drop.importance) > float(keep.importance):
                 store.update(keep.id, importance=float(drop.importance))
-            if drop is cand:
+            if drop.id == cand.id:
                 break
