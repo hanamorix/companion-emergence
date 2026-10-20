@@ -591,3 +591,30 @@ def test_a_running_service_bridge_acts_on_the_helpers_request_at_once(tmp_path, 
             except psutil.Error:
                 pass
         proc.wait(5)
+
+
+def test_a_second_ctrl_c_cannot_skip_the_resume_either(tmp_path, fake):
+    """Review R2-S2 (C45 g): Ctrl-C has the same one-shot handler as SIGTERM / SIGHUP, so a second Ctrl-C landing
+    before the finally masks signals cannot skip the resume."""
+    b = fake()
+    before = signal.getsignal(signal.SIGINT)
+    seen: dict = {}
+
+    def _two_ctrl_c():
+        handler = signal.getsignal(signal.SIGINT)
+        try:
+            handler(signal.SIGINT, None)
+        except BaseException as first:  # noqa: BLE001 - whatever the first Ctrl-C raises
+            try:
+                handler(signal.SIGINT, None)
+                seen["second"] = "ignored"
+            except BaseException:  # noqa: BLE001
+                seen["second"] = "raised"
+            raise first
+
+    with pytest.raises((kill._KillInterrupted, KeyboardInterrupt)):
+        kill.kill_bridge(b.pd, timeout=5, _hooks={"after_bridge_suspend": _two_ctrl_c})
+    assert seen["second"] == "ignored"
+    assert _intent(b.pd) is None
+    assert all(s not in ("gone", psutil.STATUS_STOPPED) for s in b.statuses().values())
+    assert signal.getsignal(signal.SIGINT) is before

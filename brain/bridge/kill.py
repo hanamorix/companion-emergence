@@ -307,7 +307,8 @@ def kill_bridge(
         fired.append(signum)
         raise _KillInterrupted(signum)
 
-    stop_signals = [signal.SIGTERM] + ([signal.SIGHUP] if hasattr(signal, "SIGHUP") else [])
+    # Ctrl-C too (review R2-S2): every stop signal gets the one-shot handler.
+    stop_signals = [signal.SIGTERM, signal.SIGINT] + ([signal.SIGHUP] if hasattr(signal, "SIGHUP") else [])
     nonce = secrets.token_hex(8)
 
     remembered: dict[int, object] = {}
@@ -423,7 +424,7 @@ def kill_bridge(
     finally:
         masked: dict[int, object] = {}
         if on_main:
-            for sig in [*stop_signals, signal.SIGINT]:
+            for sig in stop_signals:
                 try:
                     masked[sig] = signal.signal(sig, signal.SIG_IGN)
                 except (ValueError, OSError):
@@ -446,11 +447,6 @@ def kill_bridge(
                 for sig, handler in prev.items():
                     try:
                         signal.signal(sig, handler)  # type: ignore[arg-type]
-                    except (ValueError, OSError):
-                        pass
-                if signal.SIGINT in masked:
-                    try:
-                        signal.signal(signal.SIGINT, masked[signal.SIGINT])  # type: ignore[arg-type]
                     except (ValueError, OSError):
                         pass
 
