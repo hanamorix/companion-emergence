@@ -342,3 +342,20 @@ def test_431_near_dup_swap_carries_the_max_and_retargets_earlier_merges(tmp_path
     ]
     assert [(t["id"], t["importance"]) for t in archived] == [(c.id, 9.0), (a.id, 9.0)]
     store.close()
+
+
+def test_431_failed_exemption_read_during_a_sweep_is_logged_as_the_sweep(tmp_path, caplog):
+    """The shared loader's warnings name the pass that hit them, so a sweep failure is not read as a
+    forgetting failure."""
+    import logging
+
+    from brain.forgetting import SoulExemptionsUnavailableError
+
+    store = MemoryStore(tmp_path / "memories.db")
+    (tmp_path / "soul_candidates.jsonl").mkdir()
+    with caplog.at_level(logging.WARNING), pytest.raises(SoulExemptionsUnavailableError):
+        run_dedup_sweep(store, tmp_path)
+    store.close()
+
+    messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert messages and all(m.startswith("dedup_sweep: ") for m in messages), messages

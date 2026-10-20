@@ -104,7 +104,7 @@ def _load_exempt_ids(persona_dir: Path) -> set[str]:
     row is touched: a failed read is not "nothing is exempt"."""
     from brain.forgetting import _load_soul_linked_ids  # lazy: forgetting is heavier
 
-    crystallised, under_review = _load_soul_linked_ids(persona_dir)
+    crystallised, under_review = _load_soul_linked_ids(persona_dir, caller="dedup_sweep")
     return crystallised | under_review
 
 

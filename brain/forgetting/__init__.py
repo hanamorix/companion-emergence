@@ -49,8 +49,9 @@ class SoulExemptionsUnavailableError(RuntimeError):
     """
 
 
-def _load_soul_linked_ids(persona_dir: Path) -> tuple[set[str], set[str]]:
-    """Returns (crystallised_ids, under_review_ids).
+def _load_soul_linked_ids(persona_dir: Path, *, caller: str = "forgetting") -> tuple[set[str], set[str]]:
+    """Returns (crystallised_ids, under_review_ids). ``caller`` prefixes the warnings (the narrative pass
+    and the dedup sweep share this loader).
 
     Fails CLOSED (#392): if either set cannot be read this raises ``SoulExemptionsUnavailableError`` and the
     caller skips its pass. A failed read is not "nothing is exempt", and fading or losing memories on
@@ -66,14 +67,14 @@ def _load_soul_linked_ids(persona_dir: Path) -> tuple[set[str], set[str]]:
 
         crystallised = set(list_crystallised_memory_ids(persona_dir))
     except Exception:
-        log.warning("forgetting: could not load soul-crystallised memory ids", exc_info=True)
+        log.warning("%s: could not load soul-crystallised memory ids", caller, exc_info=True)
         failed.append("soul-crystallised memory ids")
     try:
         from brain.soul.candidates import list_under_review_memory_ids
 
         under_review = set(list_under_review_memory_ids(persona_dir))
     except Exception:
-        log.warning("forgetting: could not load under-review soul candidate ids", exc_info=True)
+        log.warning("%s: could not load under-review soul candidate ids", caller, exc_info=True)
         failed.append("under-review soul candidate ids")
     merge_targets: dict[str, set[str]] = {}
     try:
@@ -81,7 +82,7 @@ def _load_soul_linked_ids(persona_dir: Path) -> tuple[set[str], set[str]]:
 
         merge_targets = merge_target_map(persona_dir)
     except Exception:
-        log.warning("forgetting: could not load consolidation merge targets", exc_info=True)
+        log.warning("%s: could not load consolidation merge targets", caller, exc_info=True)
         failed.append("consolidation merge targets")
     if failed:
         raise SoulExemptionsUnavailableError("could not read " + " and ".join(failed))
