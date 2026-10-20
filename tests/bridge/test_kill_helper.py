@@ -539,3 +539,55 @@ def test_the_target_holding_its_own_lock_is_not_another_bridge(tmp_path, fake):
     finally:
         holder.kill()
         holder.wait()
+
+
+_MONITOR_BRIDGE = textwrap.dedent(
+    """
+    import os, subprocess, sys, time
+    from pathlib import Path
+    from brain import process_identity as pi
+    from brain.bridge import shutdown, state_file
+    pd = Path(sys.argv[1])
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)", "claude"])
+    state_file.write(pd, state_file.BridgeState(
+        persona="nell", pid=os.getpid(), port=1, started_at="t", stopped_at=None, shutdown_clean=False,
+        client_origin="launchd", pid_token=pi.own_token(), identity="token", phase="running"))
+    c = shutdown.BridgeShutdownController()
+    c.configure(pd)
+    m = shutdown.Monitor(c, pd, pid=os.getpid(), pid_token=pi.own_token(),
+                         hard_exit=lambda reason: shutdown.hard_exit(pd, reason))
+    m.start()
+    print(child.pid, flush=True)
+    while True:
+        time.sleep(0.1)
+    """
+)
+
+
+def test_a_running_service_bridge_acts_on_the_helpers_request_at_once(tmp_path, owned, monkeypatch):
+    """Review M2: the bridge side is the REAL stop monitor of a bridge that was never asked to stop (a running service
+    bridge): it honours the helper's hard-exit request at its next poll, so `--kill` does not wait out `--timeout`, and
+    no manager call is needed."""
+    pd = tmp_path / "nell"
+    pd.mkdir()
+    proc = subprocess.Popen([sys.executable, "-c", _MONITOR_BRIDGE, str(pd)], stdout=subprocess.PIPE, text=True)
+    child = int(proc.stdout.readline())
+    try:
+        monkeypatch.setattr(kill, "manager_stop", lambda persona: owned.append("manager"))
+        t0 = time.monotonic()
+        r = kill.kill_bridge(pd, timeout=30)
+        assert time.monotonic() - t0 < 10
+        assert r.outcome == "killed" and owned == []
+        assert proc.wait(5) == 0
+        assert state_file.read(pd).phase == "hard_exit"
+        deadline = time.monotonic() + 5
+        while psutil.pid_exists(child) and psutil.Process(child).status() != psutil.STATUS_ZOMBIE:
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+    finally:
+        for pid in (proc.pid, child):
+            try:
+                psutil.Process(pid).kill()
+            except psutil.Error:
+                pass
+        proc.wait(5)

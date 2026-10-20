@@ -274,6 +274,13 @@ class Monitor:
             logger.warning("second stop signal: hard exit")
             self.hard_exit(REASON_HARD_EXIT)
             return
+        # D6 (b): a request naming this pid + token is the only condition, whether or not a stop has begun (review
+        # M2: the kill helper writes one for a running service bridge that was never asked to stop).
+        request = shutdown_progress.read_record(self.persona_dir, shutdown_progress.REQUEST_FILENAME)
+        if shutdown_progress.names_this_bridge(request, self.pid, self.pid_token):
+            logger.warning("hard-exit request received")
+            self.hard_exit(REASON_HARD_EXIT)
+            return
         if not c.stopping:
             return
         if c._mark_pending:  # noqa: SLF001 - retry a failed "stopping" mark
@@ -289,10 +296,6 @@ class Monitor:
                 self._last_written = tasks
             except Exception:  # noqa: BLE001 - retried next poll
                 logger.warning("could not write the stop progress record; retrying", exc_info=True)
-        request = shutdown_progress.read_record(self.persona_dir, shutdown_progress.REQUEST_FILENAME)
-        if shutdown_progress.names_this_bridge(request, self.pid, self.pid_token):
-            logger.warning("hard-exit request received")
-            self.hard_exit(REASON_HARD_EXIT)
 
 
 # Test hook (C14 i): called between the hard exit's first and second enumeration of descendants.

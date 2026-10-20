@@ -307,3 +307,23 @@ def test_the_monitor_survives_write_errors_and_still_honours_a_later_request(own
         m.stop()
     assert exits == ["hard_exit"]
     assert calls["n"] >= 3
+
+
+def test_a_hard_exit_request_is_honoured_by_a_bridge_that_is_not_stopping(own_record):
+    """D6 (b), review M2: the request (naming this pid + token) is the only condition; a running bridge acts on it
+    at the next poll (the kill helper writes it for a service bridge that was never asked to stop)."""
+    c = BridgeShutdownController()
+    c.configure(own_record)
+    c.bind_server(FakeServer())
+    exits: list[str] = []
+    m = _monitor(own_record, c, exits)
+    shutdown_progress.write_record(
+        own_record, shutdown_progress.REQUEST_FILENAME, {"pid": os.getpid(), "pid_token": "linux:other:1:1"}
+    )
+    m.poll_once()
+    assert exits == [] and not c.stopping
+    shutdown_progress.write_record(
+        own_record, shutdown_progress.REQUEST_FILENAME, {"pid": os.getpid(), "pid_token": _pi.own_token()}
+    )
+    m.poll_once()
+    assert exits == ["hard_exit"]
