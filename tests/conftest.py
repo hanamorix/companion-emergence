@@ -50,6 +50,18 @@ REAL_PLATFORM_DIRS = {
 }
 
 
+def _isolated_dir(root: Path, dirs: object, sub: str) -> str:
+    """One directory under the per-test root, laid out like the real thing: per app name (the harness keeps a SIBLING app dir,
+    "companion-emergence-harness", outside the guarded roots) and per app author where the platform puts it in the path (Windows,
+    macOS: an explicit author string, or on Windows no author meaning the app name), so ``PlatformDirs(app)`` and the engine's
+    ``PlatformDirs(app, author)`` stay different directories, which a harness guard test depends on."""
+    appname = getattr(dirs, "appname", None) or "app"
+    author = getattr(dirs, "appauthor", None)
+    if not (isinstance(author, str) and author):
+        author = appname if (author is None and os.name == "nt") else None
+    return str(root / author / appname / sub) if author else str(root / appname / sub)
+
+
 @pytest.fixture(autouse=True)
 def _isolate_user_data_home(
     tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
@@ -80,8 +92,7 @@ def _isolate_user_data_home(
             ("user_state_dir", "state"),
             ("user_config_dir", "config"),
         ):
-            # per app name, like the real thing: the harness keeps a SIBLING app dir ("companion-emergence-harness") outside the guarded roots
-            monkeypatch.setattr(cls, prop, property(lambda self, _s=sub: str(root / (self.appname or "app") / _s)))
+            monkeypatch.setattr(cls, prop, property(lambda self, _s=sub: _isolated_dir(root, self, _s)))
     for var, sub in (
         ("XDG_DATA_HOME", "xdg-data"),
         ("XDG_CACHE_HOME", "xdg-cache"),

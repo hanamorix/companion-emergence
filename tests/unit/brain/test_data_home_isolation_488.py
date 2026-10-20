@@ -73,3 +73,17 @@ def test_building_the_app_leaves_the_real_data_home_untouched(tmp_path, monkeypa
     assert _snapshot(real) == before
     # the lifespan did write its tunables file: into the test's own home
     assert (paths.get_home() / "tunables.json").exists()
+
+
+def test_the_isolated_dirs_keep_the_appauthor_distinction():
+    """Code review 3a, NB5: on Windows and macOS the real class puts the app author in the path, and the harness guard test
+    `test_guarded_roots_includes_appauthor_correct_home` exists because `PlatformDirs(app)` (no author) and the engine's
+    `PlatformDirs(app, author)` are DIFFERENT directories there. The fixture must not make them one."""
+    from platformdirs import PlatformDirs
+
+    with_author = PlatformDirs(appname="companion-emergence", appauthor="hanamorix").user_data_path
+    other_author = PlatformDirs(appname="companion-emergence", appauthor="someone-else").user_data_path
+    without = PlatformDirs("companion-emergence").user_data_path
+    assert with_author != other_author
+    assert with_author != without
+    assert paths._dirs.user_data_path == with_author  # the engine's own instance
