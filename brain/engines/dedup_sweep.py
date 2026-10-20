@@ -112,8 +112,9 @@ def _load_exempt_ids(persona_dir: Path) -> set[str]:
 
     # Fails closed (#431): an unreadable exemption set raises here, so nothing is deleted, and the
     # error reaches the CLI as a traceback. The set is a snapshot taken once: a row crystallised
-    # mid-pass is not exempt until the next run, the same accepted window as forgetting (spec U2).
-    # The sweep is a one-shot CLI run, and re-reading per row would cost a soul-file read each time.
+    # mid-pass is not exempt until the next run. Forgetting loads its exemptions once per pass the
+    # same way. The sweep is a one-shot CLI run, and re-reading per row would cost a soul-file read
+    # each time.
     crystallised, under_review = _load_soul_linked_ids(persona_dir, caller="dedup_sweep")
     return crystallised | under_review
 
