@@ -98,21 +98,29 @@ _intent_lock = threading.Lock()
 # ---------------------------------------------------------------- service seams (I5 steps 4, 5; tests spy these)
 
 
-def _service_backend():
+def _service_backend(platform: str | None = None):
+    platform = platform or sys.platform
     try:
-        from brain.service import current_backend
-
-        return current_backend()
+        if platform == "darwin":
+            from brain.service import launchd as backend
+        elif platform == "linux":
+            from brain.service import systemd as backend
+        elif platform.startswith("win"):
+            from brain.service import windows_service as backend
+        else:
+            return None
+        return backend
     except Exception:  # noqa: BLE001 - no backend on this platform: never service-owned
         return None
 
 
-def service_installed(persona: str) -> bool:
-    backend = _service_backend()
+def service_installed(persona: str, platform: str | None = None) -> bool:
+    platform = platform or sys.platform
+    backend = _service_backend(platform)
     if backend is None:
         return False
     try:
-        if sys.platform.startswith("win"):
+        if platform.startswith("win"):
             return bool(backend.service_status(persona=persona).installed)
         paths = backend.paths_for_persona(persona)
         return Path(getattr(paths, "unit_path", None) or paths.plist_path).exists()
@@ -120,36 +128,38 @@ def service_installed(persona: str) -> bool:
         return False
 
 
-def owned_by_service(persona: str, pid: int, client_origin: str | None) -> bool:
+def owned_by_service(persona: str, pid: int, client_origin: str | None, platform: str | None = None) -> bool:
     """Asked only when the service is installed (S6-c): does the manager say this pid is its job?"""
-    backend = _service_backend()
+    platform = platform or sys.platform
+    backend = _service_backend(platform)
     if backend is None:
         return False
     try:
-        if sys.platform == "linux":
+        if platform == "linux":
             r = backend.run_systemctl(["show", "-p", "MainPID", "--value", backend.service_unit_name(persona)])
             return r.returncode == 0 and r.stdout.strip() == str(pid)
-        if sys.platform == "darwin":
+        if platform == "darwin":
             r = backend.run_launchctl(["print", backend.launchctl_target(persona)], timeout=MANAGER_CAP_S)
             lines = [ln.strip() for ln in (r.stdout or "").splitlines()]
             return r.returncode == 0 and lines.count(f"pid = {pid}") == 1
-        if sys.platform.startswith("win"):
+        if platform.startswith("win"):
             return client_origin == "task-scheduler"
     except Exception:  # noqa: BLE001 - an unanswerable question is "not owned"
         return False
     return False
 
 
-def manager_stop(persona: str) -> None:
+def manager_stop(persona: str, platform: str | None = None) -> None:
     """The manager's stop for an owned bridge that did not end on the hard-exit request (15 s cap; any result goes on
     to the helper's own kill)."""
-    backend = _service_backend()
+    platform = platform or sys.platform
+    backend = _service_backend(platform)
     if backend is None:
         return
     try:
-        if sys.platform == "linux":
+        if platform == "linux":
             backend.run_systemctl(["stop", "--no-block", backend.service_unit_name(persona)])
-        elif sys.platform == "darwin":
+        elif platform == "darwin":
             backend.run_launchctl(["bootout", backend.launchctl_target(persona)], timeout=MANAGER_CAP_S)
         # Windows: no manager call; the helper's own kill (exit code 0) ends the task's process.
     except Exception:  # noqa: BLE001 - a failed or timed-out manager call: the helper kills it itself

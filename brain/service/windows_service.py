@@ -435,8 +435,12 @@ def install_service(
 ) -> Path:
     """Write the task XML, then ``schtasks /Create /XML``.
 
-    Idempotent: if the task already exists, ``/F`` overwrites it.
+    Idempotent: if the task already exists, ``/F`` overwrites it. #456: never behind a running bridge's back, and
+    any stop intent is cleared first (``lifecycle.before_install``).
     """
+    from brain.service import lifecycle
+
+    lifecycle.before_install(persona)
     xml_path = write_task_xml(
         persona=persona,
         nell_path=nell_path,
@@ -450,6 +454,14 @@ def install_service(
     # Kick it off immediately so the user doesn't have to log out + back in.
     run_schtasks(["/Run", "/TN", name])
     return xml_path
+
+
+def start_service(*, persona: str) -> subprocess.CompletedProcess[str]:
+    """Run the installed task (#456 D20). Any stop intent is cleared first (D25)."""
+    from brain.service import lifecycle
+
+    lifecycle.clear_stop_intent(persona)
+    return run_schtasks(["/Run", "/TN", task_name(persona)])
 
 
 def uninstall_service(*, persona: str, keep_xml: bool = False) -> Path:

@@ -235,7 +235,10 @@ def _service_backend_errors(backend: object) -> tuple[type[BaseException], ...]:
         if isinstance((exc := getattr(backend, name, None)), type)
         and issubclass(exc, BaseException)
     )
-    return found or (ValueError, RuntimeError)
+    # #456: an install refused while the bridge runs is reported like any other service error.
+    from brain.service.lifecycle import BridgeRunningError
+
+    return (*found, BridgeRunningError) if found else (ValueError, RuntimeError)
 
 
 def _render_service_config(

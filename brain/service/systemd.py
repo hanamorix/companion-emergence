@@ -275,7 +275,13 @@ def install_service(
     env_path: str = DEFAULT_SYSTEMD_PATH,
     nellbrain_home: str | Path | None = None,
 ) -> Path:
-    """Write the unit file, daemon-reload, then enable + start it."""
+    """Write the unit file, daemon-reload, then enable + start it.
+
+    #456: never behind a running bridge's back, and any stop intent is cleared first (``lifecycle.before_install``).
+    """
+    from brain.service import lifecycle
+
+    lifecycle.before_install(persona)
     unit_path = write_systemd_unit(
         persona=persona,
         nell_path=nell_path,
@@ -292,6 +298,15 @@ def install_service(
         raise SystemdCommandError(_format_systemctl_error("enable --now", enable_result))
 
     return unit_path
+
+
+def start_service(*, persona: str) -> subprocess.CompletedProcess[str]:
+    """Start the installed unit (#456 D20: the start path for a persona whose service is installed). Any stop intent
+    is cleared first (D25)."""
+    from brain.service import lifecycle
+
+    lifecycle.clear_stop_intent(persona)
+    return run_systemctl(["start", service_unit_name(persona)])
 
 
 def uninstall_service(*, persona: str, keep_unit: bool = False) -> Path:
