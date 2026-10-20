@@ -529,3 +529,77 @@ def test_431_near_dup_swap_stops_judging_cand_once_it_vanished(tmp_path, caplog)
     assert _active_ids(store) == {b.id}
     assert [(m.canonical_id, m.removed_id) for m in report.merges] == [(b.id, d.id)]
     store.close()
+
+
+def _pair_judge(duplicate_groups: list[set[str]]):
+    """A judge that calls a pair a duplicate only when both ids sit in one of ``duplicate_groups``, and
+    records every (candidate, canonical) call."""
+    calls: list[tuple[str, str]] = []
+
+    def _judge(candidate: Memory, canonical: Memory) -> str:
+        calls.append((candidate.id, canonical.id))
+        pair = {candidate.id, canonical.id}
+        return "duplicate" if any(pair <= g for g in duplicate_groups) else "distinct"
+
+    return _judge, calls
+
+
+def test_431_near_dup_pass_never_judges_a_row_it_already_merged_away(tmp_path, caplog):
+    """#431: D is merged into A while A is ``cand``; when C (alive, distinct from A) becomes ``cand``,
+    D is already gone. Guards against judging C against the deleted D: a wasted judge call and, on a
+    "duplicate" verdict, a spurious vanished-row warning."""
+    import logging
+
+    store = MemoryStore(tmp_path / "memories.db")
+    a, c, d = (_aged(f"Bob {w} the boat.", n) for w, n in (("rowed", 3), ("sold", 2), ("was rowing", 1)))
+    for m in (a, c, d):
+        store.create(m)
+    judge, calls = _pair_judge([{a.id, d.id}, {c.id, d.id}])
+
+    with caplog.at_level(logging.WARNING, logger="brain.engines.dedup_sweep"):
+        report = run_dedup_sweep(store, tmp_path, judge=judge)
+
+    assert calls == [(c.id, a.id), (d.id, a.id)]
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert _active_ids(store) == {a.id, c.id}
+    assert [(m.canonical_id, m.removed_id) for m in report.merges] == [(a.id, d.id)]
+    store.close()
+
+
+def test_431_near_dup_swap_retargets_only_the_merges_into_the_dropped_row(tmp_path):
+    """#431: Y is merged into X, then (separately) A is dropped in favour of the soul-linked B. Guards
+    against retargeting every earlier merge record to B: only records whose canonical was A may move;
+    the X <- Y record must still name X, which is alive and holds Y's content."""
+    store = MemoryStore(tmp_path / "memories.db")
+    x, y, a, b = (_aged(f"Bob {w}.", n) for w, n in (("drew a map", 4), ("was drawing a map", 3), ("lit a fire", 2), ("was lighting a fire", 1)))
+    for m in (x, y, a, b):
+        store.create(m)
+    _crystallise(tmp_path, b.id)
+    judge, _calls = _pair_judge([{x.id, y.id}, {a.id, b.id}])
+
+    report = run_dedup_sweep(store, tmp_path, judge=judge)
+
+    assert _active_ids(store) == {x.id, b.id}
+    assert [(m.canonical_id, m.removed_id) for m in report.merges] == [(x.id, y.id), (b.id, a.id)]
+    store.close()
+
+
+def test_near_dup_pass_skips_a_pair_whose_judge_raised(tmp_path):
+    """A judge fault on one pair must skip that pair, never lose a row or end the sweep. Guards against
+    falling through to the merge with the previous pair's verdict: C is a real duplicate of A and is
+    merged, then the D/A call raises, and D must not be merged on C's "duplicate" verdict."""
+    store = MemoryStore(tmp_path / "memories.db")
+    a, c, d = (_aged(f"Bob {w} the hedge.", n) for w, n in (("cut", 3), ("trimmed", 2), ("planted", 1)))
+    for m in (a, c, d):
+        store.create(m)
+
+    def _judge(candidate: Memory, canonical: Memory) -> str:
+        if candidate.id == d.id:
+            raise RuntimeError("judge fault")
+        return "duplicate"
+
+    report = run_dedup_sweep(store, tmp_path, judge=_judge)
+
+    assert _active_ids(store) == {a.id, d.id}
+    assert [(m.canonical_id, m.removed_id) for m in report.merges] == [(a.id, c.id)]
+    store.close()
