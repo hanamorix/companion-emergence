@@ -222,3 +222,15 @@ def test_install_on_a_stopped_bridge_clears_the_intent_first_and_never_kickstart
     backend.install_service(persona="nell", nell_path=nell)
     assert seen_intent and not any(seen_intent)  # deleted before the first manager call
     assert not any("-k" in c for c in calls)
+
+
+def test_service_installed_reads_the_backend_install_state(tmp_path, monkeypatch):
+    """The real `service_installed` (the root conftest stubs it for every other test)."""
+    from brain.service import systemd
+
+    real = kill._service_installed_check
+
+    monkeypatch.setattr(systemd, "user_unit_dir", lambda: tmp_path)
+    assert real("nell", platform="linux") is False
+    (tmp_path / systemd.service_unit_name("nell")).write_text("[Unit]\n")
+    assert real("nell", platform="linux") is True

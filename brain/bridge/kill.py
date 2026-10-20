@@ -115,6 +115,11 @@ def _service_backend(platform: str | None = None):
 
 
 def service_installed(persona: str, platform: str | None = None) -> bool:
+    """Is the persona's OS service installed? (The seam tests stub; the check itself is below.)"""
+    return _service_installed_check(persona, platform)
+
+
+def _service_installed_check(persona: str, platform: str | None = None) -> bool:
     platform = platform or sys.platform
     backend = _service_backend(platform)
     if backend is None:

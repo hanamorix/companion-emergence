@@ -127,6 +127,14 @@ def _inhibit_bridge_background_threads(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _no_real_service_install(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#456 (D20): `supervisor start` and the kill helper ask whether the persona's OS service is installed, which reads
+    the real user's unit / plist / task. No test may route a start or a kill through a real service manager: every test
+    sees "not installed" unless it patches this itself (the service tests do, with spies)."""
+    monkeypatch.setattr("brain.bridge.kill.service_installed", lambda persona, platform=None: False, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _reset_pass2_queue() -> Iterator[None]:
     """Reset pass2_queue global state before and after each test.
 

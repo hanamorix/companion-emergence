@@ -324,9 +324,25 @@ def cmd_start(args, *, out: dict | None = None) -> int:
     # #456 (D12, Q-B): no synchronous recovery here. The bridge's first idle pass saves every open session through
     # the gated job session_snapshot_prune (inside the background slot), whatever ended the last bridge.
 
+    # #456 (D25, S6-f): an explicit start clears a kill's stop intent, only now (after the ALIVE refusal above, so a
+    # launch check during an in-flight kill leaves it alone).
+    from brain.bridge import shutdown_progress
+
+    shutdown_progress.delete_record(persona_dir, shutdown_progress.INTENT_FILENAME)
+
     log_path = get_log_dir() / f"bridge-{persona_dir.name}.log"
     idle = float(args.idle_shutdown) * 60 if args.idle_shutdown > 0 else None
     release_lock(persona_dir, fd)  # hand the lock to the child runner
+    # #456 (D20, S-h): a persona whose service is installed starts through its manager, so the manager owns the bridge
+    # (and a later stop goes the service way); the readiness wait gets what is left of the same 50 s budget.
+    if _service_installed(args.persona):
+        t0 = time.monotonic()
+        try:
+            _start_service(args.persona)
+        except Exception as exc:  # noqa: BLE001 - reported like any failed start
+            print(f"service start failed: {exc}", file=sys.stderr)
+            return 1
+        return _await_service_readiness(persona_dir, _READINESS_BUDGET_S - (time.monotonic() - t0), out)
     pid = spawn_detached(persona_dir, idle, client_origin, log_path)
     try:
         return _await_readiness(persona_dir, pid, log_path, out)
@@ -334,14 +350,51 @@ def cmd_start(args, *, out: dict | None = None) -> int:
         _spawned_children.pop(pid, None)
 
 
+# Readiness window: Windows cold-boot (recovery + persona load + soul review) routinely exceeds 5s; the old 5s deadline
+# killed a healthy-but-slow bridge. 50s stays inside the Rust caller's 60s outer timeout. (Bug 2b, v0.0.36.)
+_READINESS_BUDGET_S = 50.0
+
+
+def _service_installed(persona: str) -> bool:
+    from brain.bridge import kill
+
+    return kill.service_installed(persona)
+
+
+def _start_service(persona: str) -> None:
+    from brain.service import current_backend
+
+    current_backend().start_service(persona=persona)
+
+
+def _await_service_readiness(persona_dir: Path, budget_s: float, out: dict | None) -> int:
+    """Readiness of a bridge the service manager started (#456 D20): a record of a live bridge (by its token) whose
+    /health answers, within what is left of the 50 s budget."""
+    deadline = time.time() + max(0.0, budget_s)
+    while time.time() < deadline:
+        time.sleep(0.1)
+        s = state_file.read(persona_dir)
+        if s is None or not s.port or state_file.bridge_liveness(s, persona_dir) != state_file.ALIVE:
+            continue
+        try:
+            headers = {"Authorization": f"Bearer {s.auth_token}"} if s.auth_token else {}
+            r = httpx.get(f"http://127.0.0.1:{s.port}/health", headers=headers, timeout=1.0)
+        except httpx.HTTPError:
+            continue
+        if r.status_code == 200:
+            print(f"bridge started by the service on port {s.port} (pid {s.pid})")
+            if out is not None:
+                out["readiness"] = BridgeReadiness(pid=s.pid, port=s.port, auth_token=s.auth_token)
+            return 0
+    print("the service did not bring the bridge up in time; see `nell service status`", file=sys.stderr)
+    return 1
+
+
 def _await_readiness(persona_dir: Path, pid: int, log_path: Path, out: dict | None) -> int:
     """cmd_start's readiness wait for the child it just spawned (see cmd_start)."""
     proc = _spawned_children.get(pid)
 
-    # Readiness window: Windows cold-boot (recovery + persona load + soul review)
-    # routinely exceeds 5s; the old 5s deadline killed a healthy-but-slow bridge.
-    # 50s stays inside the Rust caller's 60s outer timeout. (Bug 2b, v0.0.36.)
-    deadline = time.time() + 50.0
+    deadline = time.time() + _READINESS_BUDGET_S
     while time.time() < deadline:
         time.sleep(0.1)
         s = state_file.read(persona_dir)
@@ -408,6 +461,17 @@ def cmd_run(args) -> int:
         print(f"persona directory not found: {persona_dir}", file=sys.stderr)
         return 1
 
+    from brain.bridge import respawn_guard
+
+    client_origin = getattr(args, "client_origin", "cli")
+    guarded = client_origin in respawn_guard.SERVICE_ORIGINS
+    # #456 (D25): a service respawn after a user kill of this boot does not start (checked before the lock and again
+    # right after acquiring it). An app / CLI run never applies the guard.
+    if guarded and respawn_guard.guard_fires(persona_dir):
+        print("not starting: stopped on request", file=sys.stderr)
+        logger.info("not starting: stopped on request (user kill of this boot)")
+        return 0
+
     # D4 (#177 S3): an OS service must not exit 2 here (systemd / launchd / Task Scheduler read it as a failure and
     # respawn forever). Whether a live bridge or a starter holds the lock, wait for it, then run.
     fd = acquire_lock(persona_dir)
@@ -423,7 +487,11 @@ def cmd_run(args) -> int:
             return 1
 
     try:
-        client_origin = getattr(args, "client_origin", "cli")
+        if guarded and respawn_guard.guard_fires(persona_dir):
+            # Re-checked under the lock, BEFORE run_bridge_foreground deletes the watcher files (S6-a, S7-g).
+            print("not starting: stopped on request", file=sys.stderr)
+            logger.info("not starting: stopped on request (user kill of this boot)")
+            return 0
         if client_origin == "systemd":
             try:
                 from brain.service.systemd import refresh_installed_unit
