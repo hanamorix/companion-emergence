@@ -182,18 +182,60 @@ describe("BridgeWatchdog (#456 C24)", () => {
     expect(deps.start).not.toHaveBeenCalled();
   });
 
-  it("a status read that times out, or a bridge still there, is read again until it is a crash", async () => {
+  it("a status read that times out is read again, and a crash found later is restarted", async () => {
     status = { alive: "unknown" };
     dog.onMode("bridge_down");
-    await advance(60_000);
+    await advance(5_000);
+    expect(deps.status).toHaveBeenCalledTimes(2); // at once, then after STATUS_POLL_MS
+    status = crashed(); // then it is gone without a recorded stop
+    await advance(30_000); // the next read (the ladder's 30 s step) finds the crash
+    expect(deps.status).toHaveBeenCalledTimes(3);
+    await advance(29_999);
     expect(deps.start).not.toHaveBeenCalled();
-    status = { ...crashed(), alive: "alive", phase: "stopping", stop_reason: null }; // hung or stopping
-    await advance(60_000);
-    expect(deps.start).not.toHaveBeenCalled();
-    status = crashed(); // then it died without a recorded stop
-    await advance(10_000);
-    await advance(30_000);
+    await advance(1);
     expect(deps.start).toHaveBeenCalledTimes(1);
+  });
+
+  it("(review S6) a recorded stop is not read again", async () => {
+    status = { ...crashed(), alive: "alive", phase: "stopping", stop_reason: "user_stop" };
+    dog.onMode("bridge_down");
+    await advance(3_600_000);
+    expect(deps.status).toHaveBeenCalledTimes(1);
+    expect(deps.start).not.toHaveBeenCalled();
+  });
+
+  it("(review S6) an inconclusive read backs off: 5 s, then 30 s, 1 min, 5 min, then every 10 min", async () => {
+    status = { alive: "unknown" };
+    dog.onMode("bridge_down");
+    const readsAt = async (t: number, n: number) => {
+      await advance(t - Date.now());
+      expect(deps.status).toHaveBeenCalledTimes(n);
+    };
+    const t0 = Date.now();
+    vi.mocked(deps.status).mockClear();
+    // the first read already happened at t0
+    await readsAt(t0 + 4_999, 0);
+    await readsAt(t0 + 5_000, 1);
+    await readsAt(t0 + 34_999, 1);
+    await readsAt(t0 + 35_000, 2);
+    await readsAt(t0 + 95_000, 3);
+    await readsAt(t0 + 395_000, 4);
+    await readsAt(t0 + 995_000, 5);
+    await readsAt(t0 + 1_595_000, 6);
+    expect(deps.start).not.toHaveBeenCalled();
+  });
+
+  it("(review S6) the back-off starts again when the reading changes", async () => {
+    status = { alive: "unknown" };
+    dog.onMode("bridge_down");
+    const t0 = Date.now();
+    await advance(395_000); // reads at 0, 5 s, 35 s, 95 s, 395 s; the next one is due 10 min later
+    vi.mocked(deps.status).mockClear();
+    status = { ...crashed(), alive: "alive", phase: "running" }; // now the bridge answers status but not /health
+    await advance(t0 + 995_000 - Date.now()); // the read that sees the change
+    expect(deps.status).toHaveBeenCalledTimes(1);
+    await advance(5_000); // from the start of the ladder again
+    expect(deps.status).toHaveBeenCalledTimes(2);
   });
 
   it("stop() cancels a pending restart", async () => {

@@ -7,9 +7,14 @@
  * the bridge again after 30 s, then 60 s, 300 s, then every 600 s, never giving up (owner, 2026-10-19: "first time
  * restart after 30 seconds, second time 1min, then 5min, then 10min repeating. backoff timer resets on success").
  * Success (D7) = healthy, then 600 s healthy (or a recorded stop): the next crash starts again at 30 s. The status
- * and /health are read again right before each attempt. While the bridge is unreachable and the status cannot yet
- * call it a crash (the bridge is still there, or the status read timed out), or a restart is in flight, the status
- * is read again every STATUS_POLL_MS; a bridge gone after a recorded stop is left alone.
+ * and /health are read again right before each attempt.
+ *
+ * While the bridge is unreachable and the status cannot yet call it a crash (the bridge is still there but does not
+ * answer, or the status read timed out), the status is read again: after STATUS_POLL_MS, then on the same ladder as
+ * the crash restarts (30 s, 1 min, 5 min, then every 10 min), back to the start when what it reads changes (review
+ * S6: each read starts a Python process, so a long hang must not keep a core busy). A recorded stop (a stop phase or
+ * reason) is never read again: a bridge that stops on request is not a crash. While a restart or brain update is in
+ * flight only that is checked (no read) every STATUS_POLL_MS.
  */
 
 import { useEffect } from "react";
@@ -29,6 +34,15 @@ const SERVICE_ORIGINS = new Set(["launchd", "systemd", "task-scheduler"]);
 /** The bridge's own record of a run that ended unexpectedly with work still running (brain/bridge/shutdown.py
  *  REASON_CRASH): not a stop. */
 export const CRASH_REASON = "crash";
+
+/** The inconclusive-read ladder (review S6): STATUS_POLL_MS, then the crash restarts' own delays. */
+export const RECHECK_DELAYS_MS = [STATUS_POLL_MS, ...CRASH_RESTART_DELAYS_MS] as const;
+
+/** A recorded stop: the bridge was asked to stop (its phase left "running", or it names why), and not a crash. */
+export function stopRecorded(s: BridgeStatus): boolean {
+  if (s.stop_reason === CRASH_REASON) return false;
+  return Boolean(s.stop_reason) || (s.phase != null && s.phase !== "running");
+}
 
 /** The crash test (C24) on one `nell supervisor status --json` reading. */
 export function isCrash(s: BridgeStatus): boolean {
@@ -78,6 +92,8 @@ export class BridgeWatchdog {
   private attemptTimer: ReturnType<typeof setTimeout> | null = null;
   private resetTimer: ReturnType<typeof setTimeout> | null = null;
   private recheckTimer: ReturnType<typeof setTimeout> | null = null;
+  private recheckStep = 0;
+  private lastSeen: string | null = null;
   private mode: PersonaState["mode"] | null = null;
   private checking = false;
   private stopped = false;
@@ -93,6 +109,10 @@ export class BridgeWatchdog {
 
   onMode(mode: PersonaState["mode"]): void {
     if (this.stopped) return;
+    if (mode !== this.mode) {
+      this.recheckStep = 0; // a change: the inconclusive-read ladder starts again
+      this.lastSeen = null;
+    }
     this.mode = mode;
     if (mode === "live") {
       this.clearRecheck();
@@ -125,13 +145,37 @@ export class BridgeWatchdog {
     this.recheckTimer = null;
   }
 
-  /** Read the status again later while the bridge stays unreachable. */
-  private recheckLater(): void {
+  /** Look again later while the bridge stays unreachable: ``delay`` given, or the next step of the ladder. */
+  private recheckLater(delay?: number): void {
     if (this.stopped || this.recheckTimer !== null || this.mode !== "bridge_down") return;
+    let wait = delay;
+    if (wait === undefined) {
+      wait = RECHECK_DELAYS_MS[Math.min(this.recheckStep, RECHECK_DELAYS_MS.length - 1)];
+      this.recheckStep += 1;
+    }
     this.recheckTimer = setTimeout(() => {
       this.recheckTimer = null;
       if (this.mode === "bridge_down") void this.check();
-    }, STATUS_POLL_MS);
+    }, wait);
+  }
+
+  /** An inconclusive read: look again on the ladder, from its start when the reading changed. */
+  private inconclusive(s: BridgeStatus): void {
+    const seen = `${s.alive}|${s.pid ?? ""}|${s.pid_token ?? ""}|${s.phase ?? ""}|${s.stop_reason ?? ""}`;
+    if (seen !== this.lastSeen) {
+      this.recheckStep = 0;
+      this.lastSeen = seen;
+    }
+    this.recheckLater();
+  }
+
+  /** After a reading that is not a crash: nothing more for a recorded stop or a gone bridge, else the ladder. */
+  private afterNoCrash(s: BridgeStatus): void {
+    if (stopRecorded(s)) {
+      this.attempts = 0; // a recorded stop ends the incident (D7) and is never read again (S6)
+      return;
+    }
+    if (s.alive !== "gone") this.inconclusive(s); // hung, or the read timed out
   }
 
   private async check(): Promise<void> {
@@ -139,13 +183,12 @@ export class BridgeWatchdog {
     this.checking = true;
     try {
       if (this.deps.busy()) {
-        this.recheckLater(); // a restart or brain update in flight: look again once it is over
+        this.recheckLater(STATUS_POLL_MS); // a restart or brain update in flight (no read): look again once it ends
         return;
       }
       const s = await this.deps.status(this.persona);
       if (!isCrash(s)) {
-        if (s.stop_reason) this.attempts = 0; // a recorded stop also ends the incident (D7)
-        if (s.alive !== "gone") this.recheckLater(); // still there (hung or stopping), or the read timed out
+        this.afterNoCrash(s);
         return;
       }
       const delay = CRASH_RESTART_DELAYS_MS[Math.min(this.attempts, CRASH_RESTART_DELAYS_MS.length - 1)];
@@ -159,15 +202,14 @@ export class BridgeWatchdog {
     this.attemptTimer = null;
     if (this.stopped) return;
     if (this.deps.busy()) {
-      this.recheckLater();
+      this.recheckLater(STATUS_POLL_MS);
       return;
     }
     // Re-check right before the attempt: a bridge that came back, or a stop recorded meanwhile, is left alone.
     if (await this.deps.healthy(this.persona)) return;
     const s = await this.deps.status(this.persona);
     if (!isCrash(s)) {
-      if (s.stop_reason) this.attempts = 0; // a recorded stop ends the incident (D7)
-      if (s.alive !== "gone") this.recheckLater();
+      this.afterNoCrash(s);
       return;
     }
     this.attempts += 1;
