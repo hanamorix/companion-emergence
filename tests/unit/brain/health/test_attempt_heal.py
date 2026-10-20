@@ -750,14 +750,17 @@ def test_save_helper_has_no_bare_replace_or_side_door_rename() -> None:
     live file is never moved by another rename API."""
     forbidden = {"os.replace", "os.rename", "shutil.move", "os.renames"}
     attr_forbidden = {"rename", "replace"}
-    for node in ast.walk(_function("save_with_backup_text")):
-        if not isinstance(node, ast.Call):
-            continue
-        fn = node.func
-        dotted = ast.unparse(fn)
-        assert dotted not in forbidden, dotted
-        if isinstance(fn, ast.Attribute):
-            assert fn.attr not in attr_forbidden, dotted
+    # The engine is `_save_payload` (the text and bytes writers delegate to it); walk the delegates too so a bare
+    # replace added to any of them is caught, not only one added to the thin wrapper.
+    for name in ("save_with_backup_text", "save_bytes_atomic", "_save_payload"):
+        for node in ast.walk(_function(name)):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            dotted = ast.unparse(fn)
+            assert dotted not in forbidden, (name, dotted)
+            if isinstance(fn, ast.Attribute):
+                assert fn.attr not in attr_forbidden, (name, dotted)
 
 
 def test_fsync_of_new_file_and_backup_copy_precede_their_replaces(

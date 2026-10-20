@@ -15,7 +15,9 @@ from pathlib import Path
 from typing import Any
 
 from brain.health.anomaly import BrainAnomaly
-from brain.utils.atomic_write import save_with_backup_text  # the one writer, used by save_with_backup below
+from brain.utils.atomic_write import (
+    save_with_backup_text,  # the one writer, used by save_with_backup below
+)
 from brain.utils.time import iso_utc
 
 logger = logging.getLogger(__name__)

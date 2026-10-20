@@ -29,7 +29,6 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
-
 _REPLACE_RETRIES = 8
 _REPLACE_RETRY_SLEEP_S = 0.05
 
@@ -160,8 +159,10 @@ def _remove_stale_temps(path: Path) -> None:
 def _temp_scope(path: Path) -> Iterator[tuple[Path, Path]]:
     """This save's own temp paths, registered as in flight; stale ones swept first.
 
-    On an Exception (not a kill, which runs no code) the save's own temps are
-    removed. The registration is always dropped."""
+    On an Exception, a KeyboardInterrupt or a SystemExit (everything a LIVE process can observe) the save's own temps
+    are removed. A kill runs no code, so a BaseException that models one (``SimulatedCrash`` in the kill-simulation
+    tests) is deliberately NOT caught: its leftovers stay and the next save sweeps them (#389). The registration is
+    always dropped."""
     from brain import process_identity
 
     own = process_identity.own_token()
@@ -176,7 +177,7 @@ def _temp_scope(path: Path) -> Iterator[tuple[Path, Path]]:
     try:
         _remove_stale_temps(path)
         yield new_path, bak1_new
-    except Exception:
+    except (Exception, KeyboardInterrupt, SystemExit):
         for temp in (new_path, bak1_new):
             with contextlib.suppress(OSError):
                 temp.unlink(missing_ok=True)
@@ -184,6 +185,85 @@ def _temp_scope(path: Path) -> Iterator[tuple[Path, Path]]:
     finally:
         with _INFLIGHT_LOCK:
             _INFLIGHT.difference_update((new_path.name, bak1_new.name))
+
+
+def _save_payload(
+    path: Path,
+    write_temp: Callable[[Path], None],
+    backup_count: int,
+    *,
+    keep_backups: bool,
+    mode: int | None,
+    fsync: bool,
+) -> None:
+    """The one save engine under the text and bytes writers.
+
+    ``write_temp(new_path)`` creates the save's own temp with the payload, flushed and (when ``fsync``) fsynced; it
+    is the only part that differs between text and bytes. Everything else is shared: the per-save temp scope, the
+    optional backup copy and ``.bak`` rotation, the retried replace that publishes the temp, the mode of the rotated
+    backups and the directory fsync.
+    """
+    bak1 = path.with_name(f"{path.name}.bak1")
+    with _temp_scope(path) as (new_path, bak1_new):
+        write_temp(new_path)
+
+        # The slow, failure-prone copy happens before anything is rotated: if it
+        # fails (disk full) the live file and the whole chain are untouched.
+        backed_up = _copy_for_backup(path, bak1_new) if keep_backups else False
+
+        # Rotate: drop oldest first, then walk down toward live. A step whose
+        # source another saver just moved is skipped, not an error.
+        if keep_backups:
+            path.with_name(f"{path.name}.bak{backup_count}").unlink(missing_ok=True)
+            for i in range(backup_count - 1, 0, -1):
+                src = path.with_name(f"{path.name}.bak{i}")
+                dst = path.with_name(f"{path.name}.bak{i + 1}")
+                if src.exists():
+                    try:
+                        _replace_with_retry(src, dst)
+                    except FileNotFoundError:
+                        pass
+        if backed_up:
+            _replace_with_retry(bak1_new, bak1)
+
+        _replace_with_retry(new_path, path)
+
+        if mode is not None and keep_backups:
+            for i in range(1, max(backup_count, 1) + 1):
+                try:
+                    os.chmod(path.with_name(f"{path.name}.bak{i}"), mode)
+                except OSError:
+                    pass
+
+        # M-9: fsync the parent directory so the rename is durable, not just
+        # atomic. POSIX guarantees os.replace's atomicity but not that the
+        # directory entry has flushed to disk. On power loss between the
+        # replace and the dir-block flush, the file may revert to the prior
+        # name; the .bak rotation already preserves data, but durability
+        # of the rename itself matters for the chain to behave correctly.
+        if fsync:
+            fsync_dir(path.parent)
+
+
+def fsync_dir(directory: Path) -> None:
+    """fsync a directory so a newly created or renamed entry is durable (M-9, C11).
+
+    POSIX only: Windows has no ``O_DIRECTORY`` and raises, so it is skipped there. Best effort: a directory that
+    cannot be opened or synced is ignored, because durability of the rename is a bonus on top of its atomicity and
+    must never fail a save. The one directory fsync in the app; ``ingest.buffer`` and the writers below call it.
+    """
+    if os.name != "posix":
+        return
+    try:
+        dir_fd = os.open(str(directory), os.O_DIRECTORY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
 
 
 def save_with_backup_text(
@@ -223,8 +303,7 @@ def save_with_backup_text(
     temp file's open (``"\n"`` gives the same bytes on every platform);
     ``encoding`` is the text encoding (default utf-8; the Windows task XML is UTF-16).
     """
-    bak1 = path.with_name(f"{path.name}.bak1")
-    with _temp_scope(path) as (new_path, bak1_new):
+    def write_temp(new_path: Path) -> None:
         # Same open as Path.write_text (text mode; no newline= unless asked) so
         # the bytes written per platform are unchanged; flushed and fsynced so
         # the data is on disk before the replace below can publish it.
@@ -232,57 +311,55 @@ def save_with_backup_text(
             new_file = new_path.open("w", encoding=encoding, newline=newline)
         else:
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-            new_file = os.fdopen(
-                os.open(new_path, flags, mode), "w", encoding=encoding, newline=newline
-            )
+            new_file = os.fdopen(os.open(new_path, flags, mode), "w", encoding=encoding, newline=newline)
         with new_file as f:
             f.write(text)
             f.flush()
             if fsync:
                 os.fsync(f.fileno())
 
-        # The slow, failure-prone copy happens before anything is rotated: if it
-        # fails (disk full) the live file and the whole chain are untouched.
-        backed_up = _copy_for_backup(path, bak1_new) if keep_backups else False
+    _save_payload(path, write_temp, backup_count, keep_backups=keep_backups, mode=mode, fsync=fsync)
 
-        # Rotate: drop oldest first, then walk down toward live. A step whose
-        # source another saver just moved is skipped, not an error.
-        if keep_backups:
-            path.with_name(f"{path.name}.bak{backup_count}").unlink(missing_ok=True)
-            for i in range(backup_count - 1, 0, -1):
-                src = path.with_name(f"{path.name}.bak{i}")
-                dst = path.with_name(f"{path.name}.bak{i + 1}")
-                if src.exists():
-                    try:
-                        _replace_with_retry(src, dst)
-                    except FileNotFoundError:
-                        pass
-        if backed_up:
-            _replace_with_retry(bak1_new, bak1)
 
-        _replace_with_retry(new_path, path)
+def save_bytes_atomic(path: Path, data: bytes, *, mode: int | None = None, fsync: bool = True) -> None:
+    """Atomic raw-bytes save: the bytes variant of :func:`save_with_backup_text` (no backup chain).
 
-        if mode is not None and keep_backups:
-            for i in range(1, max(backup_count, 1) + 1):
-                try:
-                    os.chmod(path.with_name(f"{path.name}.bak{i}"), mode)
-                except OSError:
-                    pass
+    A unique per-save temp in ``path``'s directory is written (created with ``mode`` when given, so a secret is never
+    wider than ``mode`` even for an instant, subject to the umask), flushed and, when ``fsync``, fsynced; one retried
+    atomic replace publishes it and the directory is fsynced. A failure leaves ``path`` as it was (absent stays absent)
+    and removes the save's own temp. For binary payloads: the identity key, uploaded blobs, a copied legacy file, a gzip
+    archive.
+    """
 
-        # M-9: fsync the parent directory so the rename is durable, not just
-        # atomic. POSIX guarantees os.replace's atomicity but not that the
-        # directory entry has flushed to disk. On power loss between the
-        # replace and the dir-block flush, the file may revert to the prior
-        # name — the .bak rotation already preserves data, but durability
-        # of the rename itself matters for the chain to behave correctly.
-        if fsync and os.name == "posix":
-            try:
-                dir_fd = os.open(str(path.parent), os.O_DIRECTORY)
-            except OSError:
-                return
-            try:
-                os.fsync(dir_fd)
-            except OSError:
-                pass
-            finally:
-                os.close(dir_fd)
+    def write_temp(new_path: Path) -> None:
+        if mode is None:
+            new_file = new_path.open("wb")
+        else:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+            new_file = os.fdopen(os.open(new_path, flags, mode), "wb")
+        with new_file as f:
+            f.write(data)
+            f.flush()
+            if fsync:
+                os.fsync(f.fileno())
+
+    _save_payload(path, write_temp, 3, keep_backups=False, mode=mode, fsync=fsync)
+
+
+def save_blob_once(target: Path, data: bytes) -> None:
+    """Write a content-addressed blob once: the one writer shared by ``brain.images`` and ``brain.file_store``.
+
+    The name is the content's hash, so a target that already exists holds these bytes and nothing is written (dedup by
+    name). Otherwise the bytes are saved atomically; if that fails but the target now exists, a concurrent writer of
+    the same content won the race (identical concurrent uploads end with one complete file and no error, b557882d) and
+    this is success; any other failure is re-raised with no temp left behind.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        return
+    try:
+        save_bytes_atomic(target, data)
+    except OSError:
+        if target.exists():
+            return
+        raise
