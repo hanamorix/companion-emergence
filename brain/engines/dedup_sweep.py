@@ -178,13 +178,22 @@ def run_dedup_sweep(
             # Re-read the canonical and this row just before removing it (#505): the group comes from
             # the opening ``list_active`` snapshot, and another writer may have deleted or deactivated
             # either since. A gone canonical ends the group (nothing may be merged into it); a gone
-            # duplicate is skipped, never archived from the stale copy or deleted.
-            if _live_row(store, canonical.id) is None:
+            # duplicate is skipped, never archived from the stale copy or deleted. So is one rewritten
+            # since so that it no longer normalises to the canonical: it is not a duplicate any more.
+            canonical_live = _live_row(store, canonical.id)
+            if canonical_live is None:
                 break
             dup_now = _live_row(store, dup.id)
             if dup_now is None:
                 logger.warning(
                     "dedup_sweep: skipping %s (duplicate of %s): it vanished or was deactivated mid-pass",
+                    dup.id,
+                    canonical.id,
+                )
+                continue
+            if _normalize(dup_now.content) != _normalize(canonical_live.content):
+                logger.warning(
+                    "dedup_sweep: skipping %s: its content changed mid-pass, no longer a duplicate of %s",
                     dup.id,
                     canonical.id,
                 )

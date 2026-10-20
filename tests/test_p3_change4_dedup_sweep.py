@@ -829,3 +829,25 @@ def test_505_near_dup_judge_sees_the_canonical_after_its_exact_merge(tmp_path):
 
     assert seen == {k.id: 5.0}
     store.close()
+
+
+def test_505_exact_pass_skips_a_duplicate_edited_away_mid_group(tmp_path, monkeypatch, caplog):
+    """#505: another writer rewrites D2 while D1 is being merged, so D2 is no longer a duplicate of K.
+    Guards against deleting it on the strength of the opening snapshot's grouping: D2's new content
+    would survive only in the archive. D2 is skipped with a warning and keeps its new content."""
+    import logging
+
+    store = MemoryStore(tmp_path / "memories.db")
+    k, d2, d1 = _exact_group(store)
+    _on_first_archive(monkeypatch, lambda: store.update(d2.id, content="Bob found the shed key."))
+
+    with caplog.at_level(logging.WARNING, logger="brain.engines.dedup_sweep"):
+        report = run_dedup_sweep(store, tmp_path)
+
+    assert [(m.canonical_id, m.removed_id) for m in report.merges] == [(k.id, d1.id)]
+    assert _archived_ids(tmp_path) == [d1.id]
+    assert _active_ids(store) == {k.id, d2.id}
+    assert store.get(d2.id, bump=False).content == "Bob found the shed key."
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1 and d2.id in warnings[0], warnings
+    store.close()
