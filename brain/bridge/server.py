@@ -2475,7 +2475,7 @@ def build_app(
         """Apply an accepted voice-edit proposal — three-place write.
 
         Three writes on accept (all best-effort isolated):
-          1. nell-voice.md — atomic temp+rename, replace old_text with new_text.
+          1. nell-voice.md — atomic (the shared writer), replace old_text with new_text.
           2. initiate_audit.jsonl — record `replied_explicit` transition.
           3. crystallizations.db.voice_evolution — durable record of the edit.
 
@@ -2566,7 +2566,7 @@ def build_app(
             at=now_iso,
         )
 
-        # Place 2: voice template file (atomic via temp+rename).
+        # Place 2: voice template file (atomic via the shared writer).
         # If this raises after the audit update, the 500 propagates and
         # leaves the persona in a recoverable state: audit says
         # "replied_explicit", file unchanged. Hana can re-issue accept

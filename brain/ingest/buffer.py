@@ -236,7 +236,7 @@ def _rolled_to_path(persona_dir: Path, session_id: str) -> Path:
 
 
 def write_rolled_to(persona_dir: Path, session_id: str, successor_id: str) -> None:
-    """Atomically write the successor pointer (tmp + fsync + os.replace). Written
+    """Atomically write the successor pointer (through the shared atomic writer). Written
     under the compaction lock BEFORE the old buffer is deleted, so the old sid never
     resolves to nothing."""
     _validate_session_id(session_id)

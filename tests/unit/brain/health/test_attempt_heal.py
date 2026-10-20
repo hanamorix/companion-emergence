@@ -1,4 +1,6 @@
-"""Tests for brain.health.attempt_heal — core heal + save helpers."""
+"""Tests for the healing readers in brain.health.attempt_heal and for the atomic save helpers they sit beside,
+which live in brain.utils.atomic_write (the ``heal`` alias below). The newer writer tests are in
+tests/unit/brain/utils/test_atomic_write.py."""
 
 from __future__ import annotations
 
