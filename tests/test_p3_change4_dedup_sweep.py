@@ -387,3 +387,31 @@ def test_431_near_dup_pass_skips_a_pair_whose_row_vanished_mid_pass(tmp_path, ca
     warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert any(a.id in m and c.id in m for m in warnings), warnings
     store.close()
+
+
+def test_431_near_dup_pass_skips_a_pair_whose_survivor_vanished_mid_pass(tmp_path, caplog):
+    """#431: the row a pair would keep (here the earlier ``cand``) is deleted by another writer after
+    the pass listed it. Guards against checking only the dropped row: the pass would then archive and
+    delete C and record a merge into the vanished A, so both rows leave the store and C survives only in
+    the archive. C must stay, with no merge record, no archive row and a warning naming both ids."""
+    import logging
+
+    store = MemoryStore(tmp_path / "memories.db")
+    a = _aged("Bob mended the net.", 2, importance=5.0)
+    c = _aged("Bob was mending the net.", 1, importance=1.0)
+    for m in (a, c):
+        store.create(m)
+
+    def _judge_while_a_vanishes(_candidate: Memory, canonical: Memory) -> str:
+        store.hard_delete(canonical.id)  # a concurrent writer removes A, the row that would be kept
+        return "duplicate"
+
+    with caplog.at_level(logging.WARNING, logger="brain.engines.dedup_sweep"):
+        report = run_dedup_sweep(store, tmp_path, judge=_judge_while_a_vanishes)
+
+    assert _active_ids(store) == {c.id}
+    assert (report.rows_removed, report.merges) == (0, [])
+    assert not (tmp_path / _ARCHIVE_FILENAME).exists()
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(a.id in m and c.id in m for m in warnings), warnings
+    store.close()
