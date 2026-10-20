@@ -234,3 +234,18 @@ def test_service_installed_reads_the_backend_install_state(tmp_path, monkeypatch
     assert real("nell", platform="linux") is False
     (tmp_path / systemd.service_unit_name("nell")).write_text("[Unit]\n")
     assert real("nell", platform="linux") is True
+
+
+def test_run_systemctl_reports_a_hung_systemctl_as_a_failed_call(monkeypatch):
+    """Review out-of-scope note: a hung systemctl (TimeoutExpired) comes back as a failed CompletedProcess, so every
+    caller (install, uninstall, status, start) handles it like any other failure instead of raising."""
+    import subprocess
+
+    from brain.service import systemd
+
+    def _hang(*a, **k):
+        raise subprocess.TimeoutExpired(cmd=a[0], timeout=15)
+
+    monkeypatch.setattr(subprocess, "run", _hang)
+    r = systemd.run_systemctl(["start", "x.service"])
+    assert r.returncode != 0 and "timed out" in r.stderr

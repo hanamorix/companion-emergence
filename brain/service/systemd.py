@@ -264,7 +264,15 @@ def run_systemctl(args: list[str]) -> subprocess.CompletedProcess[str]:
             args=["systemctl", "--user", *args],
             returncode=127,
             stdout="",
-            stderr="systemctl not available — Linux user-instance required",
+            stderr="systemctl not available: Linux user-instance required",
+        )
+    except subprocess.TimeoutExpired:
+        # A hung systemctl is a failed call for every caller (the same code timeout(1) uses).
+        return subprocess.CompletedProcess(
+            args=["systemctl", "--user", *args],
+            returncode=124,
+            stdout="",
+            stderr="systemctl timed out",
         )
 
 
