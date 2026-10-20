@@ -20,6 +20,7 @@ import {
   progressLine,
   restartBridge,
   restartInFlight,
+  stopBridgeThen,
   TIMEOUT_HEALTH_MS,
   TIMEOUT_SHUTDOWN_MS,
   useRestartBridge,
@@ -460,6 +461,69 @@ describe("useRestartBridge: time limits (#456 review M1)", () => {
     await expect(run.done()).resolves.toBe(false);
     expect(result.current.state).toBe("failed");
     expect(result.current.errorDetail).toMatch(/Restart failed/);
+  });
+});
+
+describe("stopBridgeThen: the service install's stop (#456 C58 d, review M4)", () => {
+  it("stops through the stop flow, runs the install on the stopped bridge, then starts", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.tasks = ["chat reply"];
+    const m = mocks();
+    const seen: string[] = [];
+    let p: Promise<{ stopped: boolean; error: string | null }> = Promise.resolve({ stopped: false, error: null });
+    act(() => {
+      p = stopBridgeThen(PERSONA, async () => {
+        seen.push(`install while ${w.alive}`);
+      }, { start: true });
+    });
+    await advance(2000);
+    expect(m.shutdown).toHaveBeenCalledWith(PERSONA, expect.any(AbortSignal), "app_restart");
+    expect(seen).toEqual([]); // still stopping: no install yet
+    w.alive = "gone";
+    await advance(6000);
+    await expect(p).resolves.toEqual({ stopped: true, error: null });
+    expect(seen).toEqual(["install while gone"]);
+    expect(m.start).toHaveBeenCalledTimes(1);
+    expect(m.force).not.toHaveBeenCalled();
+  });
+
+  it("a hung bridge is ended without a start of its own (start_after false), then the install runs", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.health = false;
+    const m = mocks();
+    m.force.mockImplementation(async () => {
+      w.alive = "gone";
+    });
+    const seen: string[] = [];
+    let p: Promise<{ stopped: boolean; error: string | null }> = Promise.resolve({ stopped: false, error: null });
+    act(() => {
+      p = stopBridgeThen(PERSONA, async () => {
+        seen.push("install");
+      }, { start: false });
+    });
+    await advance(2000);
+    await expect(p).resolves.toEqual({ stopped: true, error: null });
+    expect(m.force).toHaveBeenCalledWith(PERSONA, true, false);
+    expect(seen).toEqual(["install"]);
+    expect(m.start).not.toHaveBeenCalled();
+  });
+
+  it("an install error is reported and the bridge is still started again", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.alive = "gone";
+    const m = mocks();
+    let p: Promise<{ stopped: boolean; error: string | null }> = Promise.resolve({ stopped: false, error: null });
+    act(() => {
+      p = stopBridgeThen(PERSONA, async () => {
+        throw new Error("schtasks failed");
+      }, { start: true });
+    });
+    await advance(1000);
+    await expect(p).resolves.toEqual({ stopped: true, error: "schtasks failed" });
+    expect(m.start).toHaveBeenCalledTimes(1);
   });
 });
 

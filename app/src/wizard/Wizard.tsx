@@ -11,6 +11,7 @@ import {
   type MigrateSource,
 } from "../appConfig";
 import { getClientPlatform, platformLabel } from "../platform";
+import { stopBridgeThen } from "../hooks/useRestartBridge";
 import { runCliShortcutStep } from "./postInstall";
 import { WizardAvatar } from "./Avatar";
 import { StepWelcome } from "./steps/StepWelcome";
@@ -131,7 +132,18 @@ export function Wizard({ onDone }: Props) {
     let serviceTrailer = "";
     if (supervisorWizardInstall) {
       try {
-        const svc = await installSupervisorService(personaName);
+        // #456 (C58 d, review M4): a running bridge is stopped through the stop flow first (the install refuses a
+        // running one); the app's launch starts the bridge after the wizard.
+        const box: { svc: InitResult | null } = { svc: null };
+        const outcome = await stopBridgeThen(
+          personaName,
+          async () => {
+            box.svc = await installSupervisorService(personaName);
+          },
+          { start: false },
+        );
+        const svc = box.svc;
+        if (!outcome.stopped || svc === null) throw new Error(outcome.error ?? "the brain could not be stopped");
         serviceTrailer = svc.success
           ? `\n\n[service] supervisor installed`
           : `\n\n[service] install reported exit ${svc.exit_code} — supervisor will fall back to the app's lifecycle. Stderr:\n${svc.stderr}`;

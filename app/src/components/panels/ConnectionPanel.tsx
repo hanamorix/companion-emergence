@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import type { ReactNode } from "react";
-import { installNellCliSymlink, installSupervisorService } from "../../appConfig";
+import { installNellCliSymlink, installSupervisorService, type InitResult } from "../../appConfig";
+import { stopBridgeThen } from "../../hooks/useRestartBridge";
 import type { PersonaState, ChatModel, PronounPreset, SupervisorInfo } from "../../bridge";
 import { getClientPlatform, platformLabel, detectInstallShape, supportsNellCliShortcut } from "../../platform";
 import type { InstallShape } from "../../platform";
@@ -192,18 +193,29 @@ export function ConnectionPanel({
 
   async function onInstallSupervisor() {
     setInstall({ kind: "running" });
+    // #456 (C58 d, review M4): the install refuses a running bridge, so the bridge is stopped through the restart's
+    // stop flow first (the same display and hard-exit offer), installed while stopped, then started again (through
+    // the new service).
+    const box: { result: InitResult | null } = { result: null };
     try {
-      const result = await installSupervisorService(persona);
-      if (result.success) {
-        setInstall({
-          kind: "ok",
-          detail: result.stdout.split("\n")[0] || "service installed",
-        });
+      const outcome = await stopBridgeThen(
+        persona,
+        async () => {
+          const result = await installSupervisorService(persona);
+          box.result = result;
+          if (!result.success) throw new Error(result.stderr || `exit ${result.exit_code}`);
+        },
+        { start: true },
+      );
+      const result = box.result;
+      if (!outcome.stopped) {
+        setInstall({ kind: "error", detail: `The brain could not be stopped for the install. ${outcome.error ?? ""}`.trim() });
+      } else if (result?.success && outcome.error) {
+        setInstall({ kind: "error", detail: `Installed, but the brain did not start again: ${outcome.error}` });
+      } else if (result?.success) {
+        setInstall({ kind: "ok", detail: result.stdout.split("\n")[0] || "service installed" });
       } else {
-        setInstall({
-          kind: "error",
-          detail: result.stderr || `exit ${result.exit_code}`,
-        });
+        setInstall({ kind: "error", detail: result?.stderr || outcome.error || `exit ${result?.exit_code}` });
       }
     } catch (e) {
       setInstall({ kind: "error", detail: errString(e) });

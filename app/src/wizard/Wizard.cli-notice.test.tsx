@@ -11,6 +11,18 @@ const NO_FUSE_TEXT =
   "This AppImage is running without FUSE (in extract-and-run mode), so the nell shortcut was not installed. A shortcut would re-extract the whole app on every nell command and delete the running app's files when the command ends. To get the shortcut, install FUSE for your distribution (on Debian and Ubuntu the package is libfuse2, called libfuse2t64 on Ubuntu 24.04), start the AppImage normally, and try again. Or install the .deb package instead, which does not need FUSE.";
 
 const installNellCliSymlink = vi.fn();
+// #456 (C58 d): the install runs inside the stop flow; here the flow just records itself and runs the install.
+const { platformBox, order } = vi.hoisted(() => ({
+  platformBox: { value: "linux" as "linux" | "macos" },
+  order: [] as string[],
+}));
+vi.mock("../hooks/useRestartBridge", () => ({
+  stopBridgeThen: vi.fn(async (_persona: string, action: () => Promise<void>, opts: { start: boolean }) => {
+    order.push(`stop (start after: ${opts.start})`);
+    await action();
+    return { stopped: true, error: null };
+  }),
+}));
 
 vi.mock("../appConfig", async (importOriginal) => {
   const real = await importOriginal<typeof import("../appConfig")>();
@@ -19,7 +31,10 @@ vi.mock("../appConfig", async (importOriginal) => {
     runInit: vi.fn(async () => ({ success: true, stdout: "init ok", stderr: "", exit_code: 0 })),
     runMigrate: vi.fn(async () => ({ success: true, stdout: "", stderr: "", exit_code: 0 })),
     writeAppConfig: vi.fn(async () => undefined),
-    installSupervisorService: vi.fn(async () => ({ success: true, stdout: "", stderr: "", exit_code: 0 })),
+    installSupervisorService: vi.fn(async () => {
+      order.push("install");
+      return { success: true, stdout: "", stderr: "", exit_code: 0 };
+    }),
     installNellCliSymlink: (...a: unknown[]) => installNellCliSymlink(...a),
     ensureBridgeRunning: vi.fn(async () => undefined),
   };
@@ -37,7 +52,7 @@ vi.mock("../bridge", () => ({
 }));
 vi.mock("../platform", async (importOriginal) => {
   const real = await importOriginal<typeof import("../platform")>();
-  return { ...real, getClientPlatform: () => "linux" as const };
+  return { ...real, getClientPlatform: () => platformBox.value };
 });
 vi.mock("./Avatar", () => ({ WizardAvatar: () => <div data-testid="avatar" /> }));
 vi.mock("./steps/StepWelcome", () => ({
@@ -77,6 +92,8 @@ describe("Wizard: the nell-shortcut explanation survives the install step", () =
   beforeEach(() => {
     vi.useFakeTimers();
     installNellCliSymlink.mockReset();
+    platformBox.value = "linux";
+    order.length = 0;
   });
   afterEach(() => {
     cleanup();
@@ -102,5 +119,12 @@ describe("Wizard: the nell-shortcut explanation survives the install step", () =
     await vi.advanceTimersByTimeAsync(8000);
     expect(onDone).toHaveBeenCalledTimes(1);
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
+  it("(#456 C58 d, review M4) macOS: the supervisor install runs on a bridge stopped through the stop flow", async () => {
+    platformBox.value = "macos";
+    installNellCliSymlink.mockResolvedValue({ success: true, stdout: "ok", stderr: "", exit_code: 0 });
+    await driveToInstall(vi.fn());
+    expect(order).toEqual(["stop (start after: false)", "install"]);
   });
 });
