@@ -551,3 +551,129 @@ def test_run_pass_control_the_same_memory_fades_when_the_load_is_healthy_and_emp
     assert "exemptions_unavailable" not in summary
     # ...and a pass that runs does persist counters, which is what makes the canary's "not written" mean something.
     assert (tmp_path / FORGETTING_STATE_FILENAME).exists()
+
+
+# --------------------------------------------------------------------------- #430
+def _old_memory(store, content):
+    m = Memory.create_new(content=content, memory_type="conversation", domain="us", emotions={})
+    object.__setattr__(m, "created_at", datetime.now(UTC) - timedelta(days=40))
+    store.create(m)
+    return m.id
+
+
+def _merge_a_candidate_into_a_target(persona_dir) -> tuple[str, str, str]:
+    """Build a merge through the REAL gate: an old target row, a gated candidate merged into it by
+    ``run_consolidation`` (stub merge classifier), and a control row shaped like a post-merge target
+    (same age, one recall bump from ``store.get``, as the gate's own ``store.get`` gives the target).
+    Returns (candidate_id, target_id, control_id). The candidate id never becomes a row."""
+    from brain.engines.consolidation import Decision, run_consolidation
+    from brain.memory.pending import PendingQueue
+
+    persist_felt_time(
+        FeltTimeState(lived_age_hours=100.0, last_tick_ts="2026-05-18T00:00:00+00:00"),
+        persona_dir,
+    )
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        target_id = _old_memory(store, "Bob likes tea")
+        control_id = _old_memory(store, "Bob walked to the harbour")
+        store.get(control_id)  # the same recall bump the gate gives the target
+        cand = Memory.create_new(
+            content="Bob likes tea with honey", memory_type="dream", domain="us", emotions={}
+        )
+        PendingQueue(persona_dir).enqueue(cand, source="x")
+        res = run_consolidation(
+            store,
+            persona_dir=persona_dir,
+            classifier=lambda c, _ctx: Decision(
+                "merge", target_id=target_id, merged_content="Bob likes tea with honey"
+            ),
+        )
+        assert res.merged == 1
+        assert store.get(cand.id, bump=False) is None  # merged away: never a row
+    finally:
+        store.close()
+    return cand.id, target_id, control_id
+
+
+def _candidate_records(persona_dir) -> list[dict]:
+    import json
+
+    path = persona_dir / "soul_candidates.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+
+def test_430_c1_accepted_candidate_merged_away_protects_its_merge_target(tmp_path):
+    """#430 C1: the soul accepted a candidate whose memory the gate had merged into an existing row.
+    The moment now lives in the merge target, so forgetting must exempt the target. The control row,
+    shaped like a post-merge target but linked to nothing, fades in the same pass."""
+    cand_id, target_id, control_id = _merge_a_candidate_into_a_target(tmp_path)
+    _accept_candidate_for_real(tmp_path, cand_id)
+    records = _candidate_records(tmp_path)
+    assert [(r["memory_id"], r["status"]) for r in records] == [(cand_id, "accepted")]
+
+    run_pass(tmp_path, event_bus=MagicMock())
+
+    assert _state_of(tmp_path, control_id) == "fading", "control must fade, or the target's survival proves nothing"
+    assert _state_of(tmp_path, target_id) == "active", "the merge target of an accepted candidate must be exempt"
+
+
+def test_430_c2_candidate_under_review_merged_away_protects_its_merge_target(tmp_path):
+    """#430 C2: same merge, the candidate still under review (auto_pending): the target is exempt."""
+    from brain.ingest.soul_queue import queue_soul_candidate
+    from brain.ingest.types import ExtractedItem
+
+    cand_id, target_id, control_id = _merge_a_candidate_into_a_target(tmp_path)
+    queue_soul_candidate(
+        tmp_path,
+        memory_id=cand_id,
+        item=ExtractedItem(text="Bob likes tea with honey", label="observation", importance=8),
+        session_id="monologue",
+    )
+    assert [r["status"] for r in _candidate_records(tmp_path)] == ["auto_pending"]
+
+    run_pass(tmp_path, event_bus=MagicMock())
+
+    assert _state_of(tmp_path, control_id) == "fading"
+    assert _state_of(tmp_path, target_id) == "active", "the merge target of a candidate under review must be exempt"
+
+
+def test_430_c3_revoked_crystallisation_does_not_protect_the_merge_target(tmp_path):
+    """#430 C3 (#362 ruling): accepted, merged, then revoked -> the target is forgettable like the control."""
+    from brain.soul.revoke import revoke_crystallization
+    from brain.soul.store import SoulStore
+
+    cand_id, target_id, control_id = _merge_a_candidate_into_a_target(tmp_path)
+    crystallization_id = _accept_candidate_for_real(tmp_path, cand_id)
+    assert [(r["memory_id"], r["status"]) for r in _candidate_records(tmp_path)] == [(cand_id, "accepted")]
+    soul = SoulStore(str(tmp_path / "crystallizations.db"))
+    try:
+        assert revoke_crystallization(soul, crystallization_id, "no longer true") is not None
+    finally:
+        soul.close()
+
+    run_pass(tmp_path, event_bus=MagicMock())
+
+    assert _state_of(tmp_path, control_id) == "fading"
+    assert _state_of(tmp_path, target_id) == "fading", "a revoked crystallisation must not protect its merge target"
+
+
+def test_430_c4a_unreadable_merge_archive_fails_closed(tmp_path, caplog):
+    """#430 C4a (#392 semantics): a directory at the archive path is a real OSError. The loader raises
+    naming the merge-target leg, and run_pass changes no memory."""
+    import logging
+
+    from brain.engines.consolidation import _ARCHIVE_FILENAME
+    from brain.forgetting import SoulExemptionsUnavailableError, _load_soul_linked_ids
+
+    memory_id = _old_low_salience_memory(tmp_path)
+    (tmp_path / _ARCHIVE_FILENAME).mkdir()
+
+    with pytest.raises(SoulExemptionsUnavailableError, match="merge targets"):
+        _load_soul_linked_ids(tmp_path)
+    with caplog.at_level(logging.WARNING, logger="brain.forgetting"):
+        summary = run_pass(tmp_path, event_bus=MagicMock())
+
+    assert summary["exemptions_unavailable"] == 1
+    assert summary["faded"] == summary["lost"] == 0
+    assert _state_of(tmp_path, memory_id) == "active"

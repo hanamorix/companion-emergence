@@ -75,8 +75,19 @@ def _load_soul_linked_ids(persona_dir: Path) -> tuple[set[str], set[str]]:
     except Exception:
         log.warning("forgetting: could not load under-review soul candidate ids", exc_info=True)
         failed.append("under-review soul candidate ids")
+    merge_targets: dict[str, set[str]] = {}
+    try:
+        from brain.soul.candidates import merge_target_map
+
+        merge_targets = merge_target_map(persona_dir)
+    except Exception:
+        log.warning("forgetting: could not load consolidation merge targets", exc_info=True)
+        failed.append("consolidation merge targets")
     if failed:
         raise SoulExemptionsUnavailableError("could not read " + " and ".join(failed))
+    # #430: a soul-linked id the gate merged away lives on in its merge target(s); protect those too.
+    for ids in (crystallised, under_review):
+        ids.update(*(merge_targets[i] for i in list(ids) if i in merge_targets))
     return crystallised, under_review
 
 

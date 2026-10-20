@@ -66,6 +66,40 @@ def _accepted_candidate_ids(persona_dir: Path, store: SoulStore | None) -> list[
     return ids
 
 
+def merge_target_map(persona_dir: Path) -> dict[str, set[str]]:
+    """Map each merged-away candidate id to the row(s) the consolidation gate merged it into (#430).
+
+    When the gate merges a gated memory into an existing row, the candidate id never becomes a row,
+    but a soul candidate queued for it keeps that id. The moment now lives in the merge target, so
+    the forgetting/narrative exemption follows this map. Read from ``consolidation_archive.jsonl``
+    (``reason == "consolidation_merge"`` rows). Set-valued: a candidate re-enqueued after its target
+    was deleted can merge again into another row; a dead target id simply matches no row.
+
+    The forgetting exemption depends on this file: rotating or truncating it un-protects merged
+    moments (a canary keeps it out of the supervisor's rotation tables).
+
+    A missing archive → ``{}`` (checked before the lock, so no ``.lock`` sidecar is created). A torn or
+    corrupt line is skipped with a warning. A real read failure raises: the caller fails closed (#392).
+    """
+    from brain.engines.consolidation import _ARCHIVE_FILENAME  # lazy: one source of the name
+    from brain.utils.file_lock import file_lock
+
+    path = persona_dir / _ARCHIVE_FILENAME
+    if not path.exists():
+        return {}
+    targets: dict[str, set[str]] = {}
+    with file_lock(path):  # the writers append under this lock: no half-written tail
+        for r in iter_jsonl(path, recover=Recovery.RAISE):
+            if r.get("reason") != "consolidation_merge":
+                continue
+            source = r.get("merged_from_candidate")
+            target = r.get("target")
+            target_id = target.get("id") if isinstance(target, dict) else None
+            if isinstance(source, str) and source and isinstance(target_id, str) and target_id:
+                targets.setdefault(source, set()).add(target_id)
+    return targets
+
+
 def list_crystallised_memory_ids(persona_dir: Path) -> list[str]:
     """Return the memory ids protected by a live crystallization, candidate ids first.
 
