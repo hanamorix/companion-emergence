@@ -209,20 +209,29 @@ def _extract_json_block(text: str) -> str | None:
     """Find the JSON object that is the model's answer in ``text``. Tolerant of preamble and of braces inside strings (#478).
 
     Tries each ``{`` in turn with ``json.JSONDecoder().raw_decode``: the first object that carries a ``decision`` key wins, else the
-    first object that decodes at all. When no ``{`` starts a decodable object (a malformed reply) it falls back to the first
+    first object that decodes at all. An object that opens inside a ``{...}`` block that did NOT decode is part of that malformed
+    reply and is not taken as the answer (a decision quoted inside invalid JSON must not be accepted). When no ``{`` starts a decodable object (a malformed reply) it falls back to the first
     string-aware balanced block, so ``parse_decision`` can still report "json decode failed" rather than "no JSON block"; None
     when no `{` starts a block that closes.
     """
     decoder = json.JSONDecoder()
     first_object: str | None = None
     first_balanced: str | None = None
+    inside_failed_until = 0  # an object that opened inside a block that did not decode belongs to that malformed block
     start = text.find("{")
     while start >= 0:
+        if start < inside_failed_until:
+            start = text.find("{", start + 1)
+            continue
         try:
             obj, end = decoder.raw_decode(text, start)
         except ValueError:
             obj = None
+            balanced = _balanced_block(text, start)
+            if balanced is not None:
+                inside_failed_until = start + len(balanced)
         else:
+            balanced = None
             if isinstance(obj, dict):
                 block = text[start:end]
                 if "decision" in obj:
@@ -230,7 +239,7 @@ def _extract_json_block(text: str) -> str | None:
                 if first_object is None:
                     first_object = block
         if first_balanced is None:
-            first_balanced = _balanced_block(text, start)
+            first_balanced = balanced if balanced is not None else _balanced_block(text, start)
         start = text.find("{", start + 1)
     return first_object if first_object is not None else first_balanced
 

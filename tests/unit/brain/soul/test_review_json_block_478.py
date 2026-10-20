@@ -83,3 +83,41 @@ def test_when_no_object_carries_a_decision_the_first_object_is_reported_as_befor
     d = parse_decision('{"hello": "world"}', "c1")
 
     assert d.decision == "defer" and "invalid decision value" in d.parse_error
+
+
+# --- code review 3b ------------------------------------------------------------------------------------------------
+
+
+def test_a_decision_object_embedded_in_a_malformed_outer_reply_is_not_accepted():
+    """S3: the outer object does not decode (unescaped inner quotes) but an object inside it does, and carries a decision. Accepting
+    it would put an accept into the soul from a reply that is not valid JSON; the old finder deferred it with a parse error."""
+    raw = (
+        '{"decision":"reject","love_type":"craft","reasoning":"I said "'
+        '{"decision":"accept","confidence":9,"love_type":"craft"}'
+        '" before"}'
+    )
+    decision = parse_decision(raw, "c1")
+    assert decision.decision == "defer"
+    assert decision.parse_error and decision.parse_error.startswith("json decode failed")
+
+
+def test_a_valid_answer_after_a_malformed_object_in_the_preamble_is_still_found():
+    # a failed `{...}` that is NOT around the answer (it ends before the answer starts) must not hide the answer
+    raw = 'My notes {not json at all} then my verdict: ' + _reply("fine", "reject")
+    assert parse_decision(raw, "c1").decision == "reject"
+
+
+def test_the_balanced_fallback_ignores_a_closing_brace_inside_a_string():
+    """S4: nothing decodes, so the finder returns the balanced block. A `}` inside the string must not end it early."""
+    whole = '{"decision": "accept", "reasoning": "a } b", oops}'
+    assert _extract_json_block("verdict: " + whole) == whole
+
+
+def test_the_balanced_fallback_honours_an_escaped_quote_inside_a_string():
+    whole = '{"decision": "accept", "reasoning": "she said \\" } then", oops}'
+    assert _extract_json_block(whole) == whole
+
+
+def test_the_balanced_fallback_ignores_an_opening_brace_inside_a_string():
+    whole = '{"decision": "accept", "reasoning": "a { b", oops}'
+    assert _extract_json_block(whole) == whole  # a counted `{` in the string would leave the block unclosed
