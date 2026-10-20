@@ -172,11 +172,7 @@ def run_dedup_sweep(
             continue
         canonical = _pick_canonical(members, exempt)
         # A soul-linked row always stays (#431); if every other member is one, nothing merges.
-        # Skip such a group before counting it: counted, it reads as "merged" on every re-run.
         removable = [m for m in members if m.id != canonical.id and m.id not in exempt]
-        if not removable:
-            canonicals.append(canonical)
-            continue
         removed: list[Memory] = []
         for dup in removable:
             # Re-read the canonical and this row just before removing it (#505): the group comes from
@@ -204,6 +200,8 @@ def run_dedup_sweep(
             )
             report.rows_removed += 1
             removed.append(dup_now)
+        # Count only a group that removed a row (#431, #505): a group of soul-linked rows, or one whose
+        # duplicates all vanished, would otherwise read as "merged" on every re-run.
         if removed:
             report.groups_merged += 1
         canonical_now = _live_row(store, canonical.id)
