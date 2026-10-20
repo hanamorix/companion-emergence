@@ -1,7 +1,8 @@
 """KindledLinkStore — SQLite peers + consent state machine + consumed-invite
 ledger. Phase 1 scope: pairing/consent only (sessions/messages/relationship are
-later phases). Connection idiom mirrors brain/memory/store.py (integrity check →
-WAL + 5s busy_timeout → Row → executescript)."""
+later phases). The connection is opened by the shared helper in
+brain/utils/sqlite_open.py (integrity check, WAL, 5s busy_timeout); `_finish_open`
+then sets the Row factory and runs the schema and migrations."""
 from __future__ import annotations
 
 import math

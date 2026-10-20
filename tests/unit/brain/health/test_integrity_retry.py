@@ -6,9 +6,11 @@ generalized from MemoryStore-only to MemoryStore/HebbianMatrix/
 KindledLinkStore/SoulStore per orchestrator directive 2026-09-28).
 
 Tests the mechanism ONCE, directly against a minimal fake connection (not
-through any of the 4 real stores) — each store's own test file only needs a
-thin integration test proving IT calls this helper, not re-proving the
-retry/classify logic itself.
+through any of the 4 real stores). The stores no longer call this helper
+themselves: they reach it through `brain.utils.sqlite_open.check_integrity`
+(via `open_store_connection`), so each store's own test file only needs a thin
+integration test proving its open goes through that shared path, not
+re-proving the retry/classify logic itself.
 """
 
 from __future__ import annotations

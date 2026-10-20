@@ -63,11 +63,11 @@ class HebbianMatrix:
     """
 
     def __init__(self, db_path: str | Path, *, integrity_check: bool = True) -> None:
-        # Mirrors MemoryStore: hot per-turn openers (the recall-path single
-        # open in _build_recall_block) pass integrity_check=False to skip the
-        # full-DB PRAGMA integrity_check and take a lightweight WAL open. The
-        # open sequence (integrity check, WAL, busy_timeout) is shared: see
-        # brain.utils.sqlite_open.
+        # Hot per-turn openers (the recall-path single open in
+        # _build_recall_block) pass integrity_check=False to skip the full-DB
+        # PRAGMA integrity_check and take a lightweight WAL open (the same
+        # parameter MemoryStore has). The open sequence (integrity check, WAL,
+        # busy_timeout) is shared: see brain.utils.sqlite_open.
         self._conn: sqlite3.Connection = open_store_connection(
             db_path,
             caller="HebbianMatrix",

@@ -1,6 +1,8 @@
 """SoulStore — SQLite-backed persistence for Crystallization records.
 
-Follows the same PRAGMA integrity_check + row_factory pattern as MemoryStore.
+Opens through the shared helper in brain/utils/sqlite_open.py (PRAGMA
+integrity_check, WAL, busy_timeout); `_finish_open` sets the Row factory and
+creates the schema.
 Soul crystallizations are permanent — the only mutation is marking revoked,
 which sets revoked_at + revoked_reason but keeps the row in the DB (soft delete).
 """
@@ -64,8 +66,9 @@ class SoulStore:
     Pass `":memory:"` as db_path for in-memory databases (used in tests).
     Any filesystem path creates or opens a persistent database.
 
-    Opens with PRAGMA integrity_check on init — raises BrainIntegrityError
-    if the database is corrupt, matching the MemoryStore pattern.
+    Opens with PRAGMA integrity_check on init (always on, no opt-out), through
+    the shared helper in brain/utils/sqlite_open.py: raises BrainIntegrityError
+    if the database is corrupt.
     """
 
     def __init__(self, db_path: str | Path) -> None:

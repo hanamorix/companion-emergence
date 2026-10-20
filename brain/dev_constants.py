@@ -19,8 +19,10 @@ from __future__ import annotations
 
 # --- memories.db busy timeout (S48, S58) -----------------------------------
 # Applied at BOTH `sqlite3.connect(..., timeout=...)` and
-# `PRAGMA busy_timeout = ...` at the memories.db connect sites
-# (store.py MemoryStore.__init__, embedding_matrix.py's `_load_from_db`).
+# `PRAGMA busy_timeout = ...`. MemoryStore gets it from `memories_profile()` in
+# store.py, which `brain.utils.sqlite_open.open_store_connection` applies at both
+# places; embedding_matrix.py's `_load_from_db` and db_health.py connect directly
+# and apply it themselves.
 # Sized above the longest single memories.db write transaction measured in
 # 2-plan.md §4.3: clustering's `set_cluster_memberships` at 6.7 s on
 # F-bob20k on the dev host; Phoebe-class hardware is 3-30x slower and was
@@ -52,10 +54,10 @@ KNOWN_NAMES_DB_FILENAME: str = "known_names.db"
 # A PRAGMA integrity_check failure whose message matches a KNOWN-transient
 # SQLite error class (see brain.health.integrity_retry
 # .TRANSIENT_INTEGRITY_ERROR_SUBSTRINGS) is retried this many times total,
-# this many seconds apart between attempts, before the calling store's
-# __init__ (MemoryStore, HebbianMatrix, KindledLinkStore, SoulStore — all 4
-# route through the shared brain.health.integrity_retry helper) gives up and
-# raises BrainIntegrityError. Observed cause: Popen.kill() ->
+# this many seconds apart between attempts, before the open gives up and
+# raises BrainIntegrityError. The one caller of the retry helper is
+# brain.utils.sqlite_open.check_integrity, which MemoryStore, HebbianMatrix,
+# KindledLinkStore and SoulStore reach through open_store_connection. Observed cause: Popen.kill() ->
 # TerminateProcess on Windows can leave a killed process's WAL/-shm
 # memory-mapped section released slightly after proc.wait() returns; the
 # next store open against the same file can see a transient "disk I/O
@@ -66,8 +68,8 @@ KNOWN_NAMES_DB_FILENAME: str = "known_names.db"
 # unrecognized -- is never retried; see the classifier). Short enough not to
 # be felt at a bridge start, long enough to clear the observed race; NOT
 # meant to absorb a genuinely broken disk (an error that never clears still
-# raises after the budget, same as today). ONE shared constant pair for all
-# 4 callers so the retry sizing can't drift between stores.
+# raises after the budget, same as today). ONE constant pair, read by the one
+# retry helper, so the retry sizing can't drift between stores.
 SQLITE_INTEGRITY_CHECK_RETRY_ATTEMPTS: int = 3
 SQLITE_INTEGRITY_CHECK_RETRY_DELAY_S: float = 0.1
 

@@ -4,9 +4,12 @@ FENCED (v0.0.30): a tool surface with no autonomous writer/reader/feed —
 kept available but intentionally not wired into the emotional/memory loops
 (pre-Maker). See docs/maturity-manifest.md.
 
-Mirrors brain/memory/store.py conventions:
-- Open per-call (no long-lived connection that crosses threads).
-- WAL mode for concurrent readers + single writer.
+Conventions:
+- Open per-call (no long-lived connection that crosses threads), through the
+  shared helper in brain/utils/sqlite_open.py with its strict-WAL profile and
+  no integrity check.
+- WAL mode for concurrent readers + single writer (a failing WAL pragma
+  raises here, unlike the other stores).
 - Schema versioning via PRAGMA user_version.
 
 The store is the index; the canonical content lives in markdown files
