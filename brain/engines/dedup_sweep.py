@@ -117,18 +117,29 @@ def run_dedup_sweep(
     """One-time sweep merging existing near-duplicates. Run once over a
     persona's corpus (e.g. via the CLI entry).
 
+    Soul exemptions (#431): before any row is touched, the sweep loads the ids
+    forgetting exempts (crystallised, under soul review, and the merge targets
+    of those ids). A soul-linked row is never archived or deleted. If those
+    sets cannot be read, ``SoulExemptionsUnavailableError`` propagates and
+    nothing is archived, deleted or reported (#392: a failed read is not
+    "nothing is exempt").
+
     Primary layer (always on): exact-normalize grouping over ``store.list_active()``
-    rows — zero false-merge risk, deterministic. For each group of size > 1:
-    the highest-importance member (ties: oldest) is kept as canonical; every
-    OTHER member is archived (full pre-image, reason "dedup_sweep") then
-    hard-deleted; the canonical's importance is raised to the group max if a
-    removed member scored higher.
+    rows — zero false-merge risk, deterministic. For each group of size > 1 the
+    canonical is a soul-linked member if there is one, else the
+    highest-importance member (ties: oldest). Every other member that is not
+    soul-linked is archived (full pre-image, reason "dedup_sweep") then
+    hard-deleted, and the canonical's importance is raised to the group max if
+    a member scored higher. A group with nothing removable is not counted as
+    merged.
 
     Optional near-dup layer: when ``judge`` is supplied, canonical survivors
     left after the exact-normalize pass are compared pairwise; a "duplicate"
     verdict merges the later-created of the pair into the earlier the same
-    way (archive-then-delete, carry max importance). Off by default so the
-    sweep needs no provider to be fully deterministic and testable.
+    way (archive-then-delete, carry max importance). If the later one is
+    soul-linked, the earlier one is removed instead; a pair of soul-linked
+    rows is left alone. Off by default so the sweep needs no provider to be
+    fully deterministic and testable.
 
     Returns a Report (groups merged, rows removed, archive path, per-merge
     canonical/removed ids) and appends it to ``dedup_sweep_report.jsonl``.
