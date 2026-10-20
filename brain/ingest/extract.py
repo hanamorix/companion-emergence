@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from brain import prompt_strings
-from brain.bridge.cli_throttle import ThrottleDeferred
+from brain.bridge.cli_throttle import ShutdownDeferred, ThrottleDeferred
 from brain.bridge.provider import LLMProvider
 from brain.health.parse_failures import record_parse_failure
 from brain.ingest.types import ExtractedItem
@@ -47,11 +47,17 @@ class ExtractionOutcome:
     ``items=[]`` is valid when the transcript contained no durable memories.
     ``failed=True`` means provider/parse failures exhausted retries and the
     caller should retain the source buffer for a future retry.
+    ``deferred=True`` means the model call was refused as "not now" (an expired
+    login, a lost slot; a ``ThrottleDeferred``, #473): nothing was tried and
+    nothing failed, so the caller leaves everything as it is, counts no failure
+    and records no backoff. A bridge that is stopping (``ShutdownDeferred``,
+    #456) is raised instead, so the sweep ends.
     """
 
     items: list[ExtractedItem]
     failed: bool = False
     error: str | None = None
+    deferred: bool = False
 
 
 def format_transcript(
@@ -261,9 +267,13 @@ def extract_items_with_status(
         raw_text: str | None = None
         try:
             raw_text = provider.generate(prompt)
-        except ThrottleDeferred:
-            # #456/#473: a refusal is "not now", not a failed extraction: no retry, no failure recorded.
+        except ShutdownDeferred:
+            # #456: the bridge is stopping: the sweep ends here (its callers re-raise), nothing is recorded.
             raise
+        except ThrottleDeferred as exc:
+            # "Not now" (#473): no retry (the next call would be refused too), no failure.
+            logger.info("extract_items: provider.generate deferred: %s", exc)
+            return ExtractionOutcome(items=[], deferred=True, error=str(exc))
         except Exception as exc:  # noqa: BLE001
             last_error = f"provider.generate failed on attempt {attempt}: {exc}"
             logger.warning(

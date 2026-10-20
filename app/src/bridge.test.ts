@@ -619,4 +619,22 @@ describe("acceptVoiceEdit / rejectVoiceEdit", () => {
     );
     expect(r).toMatchObject({ closed: false });
   });
+
+  it("passes the bridge's deferred and busy flags through (a 200 that saved nothing yet)", async () => {
+    const body = { session_id: "session-1", closed: false, committed: 0, deduped: 0, soul_candidates: 0, soul_queue_errors: 0, errors: 0 };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ...body, deferred: true, busy: false }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ...body, deferred: false, busy: true }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(body), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const deferred = await snapshotSession("alice", "session-1");
+    const busy = await snapshotSession("alice", "session-1");
+    const older = await snapshotSession("alice", "session-1"); // a bridge that does not send the flags
+    expect(deferred.deferred).toBe(true);
+    expect(busy.busy).toBe(true);
+    expect(older.deferred).toBeUndefined();
+    expect(older.busy).toBeUndefined();
+  });
 });

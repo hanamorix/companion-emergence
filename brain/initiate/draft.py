@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -44,7 +44,7 @@ def append_draft_fragment(
     try:
         dt = datetime.fromisoformat(timestamp)
     except ValueError:
-        dt = datetime.now()
+        dt = datetime.now(UTC)  # not local time: a naive stamp means UTC in this repo (#485)
     header = f"## {dt.strftime('%Y-%m-%d %H:%M')} ({source})"
 
     # Idempotency check.

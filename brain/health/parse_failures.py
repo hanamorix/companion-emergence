@@ -72,7 +72,7 @@ def record_parse_failure(
         # The thread lock serialises this process; the file lock makes rotate-then-append one step across
         # processes too (a rotation truncates the log under the appender otherwise).
         with _WRITE_LOCK, file_lock(path):
-            rotate_rolling_size(path, MAX_BYTES, ARCHIVE_KEEP)
+            rotate_rolling_size(path, MAX_BYTES, ARCHIVE_KEEP, lock_held=True)
             append_jsonl(path, row, lock="held", nonfinite="null")
     except Exception:  # noqa: BLE001 -- evidence is best-effort by contract
         logger.warning("could not record a %s parse failure to %s", site, path, exc_info=True)

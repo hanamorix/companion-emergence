@@ -413,6 +413,13 @@ export interface CloseSessionOptions {
 export interface CloseSessionResponse {
   session_id: string;
   closed: boolean;
+  /**
+   * The bridge refused the model call as "not now" (an expired login, a stopping bridge): nothing was extracted or failed, the buffer is
+   * kept and the session stays registered. A 200 with `deferred` is NOT a saved snapshot or a closed session. Absent on older bridges.
+   */
+  deferred?: boolean;
+  /** Another extraction of the same session was running, so this pass did nothing. A 200 with `busy` is not a saved snapshot either. Absent on older bridges. */
+  busy?: boolean;
   committed: number;
   enqueued: number;
   deduped: number;

@@ -247,7 +247,7 @@ def test_service_form_needs_the_same_home(persona_dir, tmp_path, monkeypatch):
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="XDG default home")
 def test_service_form_unset_home_matches_our_default_and_xdg_differs(
-    persona_dir, tmp_path, monkeypatch
+    persona_dir, tmp_path, monkeypatch, real_platform_dirs
 ):
     monkeypatch.delenv("KINDLED_HOME", raising=False)
     monkeypatch.delenv("NELLBRAIN_HOME", raising=False)

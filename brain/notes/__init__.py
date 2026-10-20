@@ -9,6 +9,7 @@ from typing import Any
 
 from brain.notes import config as _cfg
 from brain.notes.state import consume_budget, load_notes_state, save_notes_state
+from brain.utils.time import hours_since
 
 logger = logging.getLogger(__name__)
 
@@ -34,13 +35,9 @@ def run_notes_tick(
         return
     now = now or datetime.now(UTC)
     state = load_notes_state(persona_dir)
-    if state.last_note_at:
-        try:
-            elapsed = (now - datetime.fromisoformat(state.last_note_at)).total_seconds() / 3600.0
-            if elapsed < cooldown_hours:
-                return
-        except ValueError:
-            pass
+    elapsed = hours_since(state.last_note_at, now)  # None for an unusable stamp: it cannot hold a cooldown (#485)
+    if elapsed is not None and elapsed < cooldown_hours:
+        return
     # Pre-flight throttle gate — a defer must cost NOTHING. Check the slot BEFORE
     # consuming budget or advancing the cooldown, so a transient yield doesn't
     # burn the day's note and scream a traceback (Windows v0.0.38 report). The

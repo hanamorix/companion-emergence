@@ -18,6 +18,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
+from brain.health.attempt_heal import save_with_backup_text
 from brain.health.json_io import (
     Recovery,
     append_jsonl,
@@ -182,6 +183,14 @@ def _cursor_path(persona_dir: Path, session_id: str) -> Path:
     return _active_conversations_dir(persona_dir) / f"{session_id}.cursor"
 
 
+def extract_lock_path(persona_dir: Path, session_id: str) -> Path:
+    """Resolve <persona>/active_conversations/<session_id>.extract, the path whose ``file_lock``
+    sidecar serialises extraction of one session (#477). The ``.jsonl`` glob of
+    ``list_active_sessions`` never picks it up; ``_validate_session_id`` keeps it inside the dir."""
+    _validate_session_id(session_id)
+    return _active_conversations_dir(persona_dir) / f"{session_id}.extract"
+
+
 def read_cursor(persona_dir: Path, session_id: str) -> str | None:
     """Return the cursor ts (ISO string) for a session.
 
@@ -206,9 +215,9 @@ def write_cursor(persona_dir: Path, session_id: str, ts: str) -> None:
     """Atomically write the cursor file. Raises ValueError on bad ts."""
     datetime.fromisoformat(ts.replace("Z", "+00:00"))
     path = _cursor_path(persona_dir, session_id)
-    tmp = path.with_suffix(".cursor.tmp")
-    tmp.write_text(ts, encoding="utf-8")
-    os.replace(tmp, path)
+    # The shared atomic text writer (#477): a unique temp per save, a bounded retry of a
+    # transient PermissionError on the replace, fsync, and the temp removed on failure.
+    save_with_backup_text(path, ts, keep_backups=False)
 
 
 def delete_cursor(persona_dir: Path, session_id: str) -> None:
@@ -451,17 +460,13 @@ def read_archive_marker(persona_dir: Path, session_id: str) -> str | None:
 
 
 def write_archive_marker(persona_dir: Path, session_id: str, key: str) -> None:
-    """Atomically write the archive commit-marker (temp + os.replace + fsync),
-    mirroring ``write_cursor`` but WITH an fsync — this marker must be durable
+    """Atomically write the archive commit-marker through the shared atomic text writer
+    (unique temp + retried replace + fsync), as ``write_cursor`` does, and fsync the directory
+    for a new marker — this marker must be durable
     across a crash landing immediately after the archive append's own fsync."""
     path = _archive_marker_path(persona_dir, session_id)
     is_new = not path.exists()
-    tmp = path.with_suffix(".archived.tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(key)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
+    save_with_backup_text(path, key, keep_backups=False, fsync=True)
     if is_new:
         # fsync the containing dir so the new sidecar's directory entry is durable
         # (crash-mid-create), matching append_archive's new-segment durability.

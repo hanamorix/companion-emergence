@@ -33,6 +33,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from brain.health.attempt_heal import save_with_backup_text
 from brain.paths import get_log_dir, get_persona_dir
 from brain.service import UnsupportedPlatformError
 from brain.setup import validate_persona_name
@@ -238,7 +239,8 @@ def write_systemd_unit(
     paths = paths_for_persona(persona)
     paths.unit_path.parent.mkdir(parents=True, exist_ok=True)
     paths.stdout_path.parent.mkdir(parents=True, exist_ok=True)
-    paths.unit_path.write_text(body, encoding="utf-8")
+    # Atomic (#484): a crash or a full disk in the middle must not leave a truncated unit for the next systemctl call.
+    save_with_backup_text(paths.unit_path, body, keep_backups=False)
     return paths.unit_path
 
 

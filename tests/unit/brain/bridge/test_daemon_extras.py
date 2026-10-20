@@ -1329,9 +1329,10 @@ def test_cmd_status_running_prints_health_fields(
                 "pending_alarms": 1,
             }
 
-    def fake_get(url, *, headers=None, timeout=None):
+    def fake_get(url, *, headers=None, timeout=None, trust_env=True):
         captured["url"] = url
         captured["headers"] = headers
+        captured["trust_env"] = trust_env
         return FakeResp()
 
     monkeypatch.setattr("httpx.get", fake_get)
@@ -1345,6 +1346,7 @@ def test_cmd_status_running_prints_health_fields(
     assert "supervisor: alive" in out
     assert "pending_alarms: 1" in out
     assert captured["headers"] == {"Authorization": "Bearer tok-status"}
+    assert captured["trust_env"] is False  # the loopback bridge is never reached through a proxy (#475)
 
 
 def test_cmd_status_returns_1_when_health_unreachable(
@@ -1486,8 +1488,8 @@ def test_cmd_stop_posts_shutdown_endpoint_instead_of_sigterm(
     alive = {"value": True}
     calls: list[tuple[str, dict]] = []
 
-    def fake_post(url, *, headers, timeout, json=None):
-        calls.append((url, {"headers": headers, "timeout": timeout, "json": json}))
+    def fake_post(url, *, headers, timeout, json=None, trust_env=True):
+        calls.append((url, {"headers": headers, "timeout": timeout, "json": json, "trust_env": trust_env}))
         alive["value"] = False
 
         class Response:
@@ -1509,7 +1511,8 @@ def test_cmd_stop_posts_shutdown_endpoint_instead_of_sigterm(
     assert calls == [
         (
             "http://127.0.0.1:51000/supervisor/shutdown",
-            {"headers": {"Authorization": "Bearer secret"}, "timeout": 3.0, "json": {"reason": "user_stop"}},
+            {"headers": {"Authorization": "Bearer secret"}, "timeout": 3.0, "json": {"reason": "user_stop"},
+             "trust_env": False},
         )
     ]
     assert "Everything has stopped." in capsys.readouterr().out  # #456: the stop watcher's words

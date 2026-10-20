@@ -107,6 +107,18 @@ class IngestReport:
         errors:          Items that failed the commit step.
         memory_ids:      IDs of newly created memories (both durably committed and
                          enqueued-candidate ids).
+        deferred:        The extraction call was refused as "not now" (#473): nothing was
+                         extracted or failed, and the cursor, buffer and backoff sidecar
+                         are as they were.
+        busy:            Another extraction of the same session was running, so this pass
+                         did nothing (#477): the running pass advances the cursor.
+        backoff_skipped: The session's recorded failures reached the threshold less than the
+                         backoff window ago, so this pass returned without calling the
+                         provider (``errors`` is 1). It is not a failed attempt.
+
+    ``completed`` is the one question a caller that acts on the extraction's result (the
+    rollover, which deletes the buffer) must ask: did this pass extract the session's turns?
+    A busy, a deferred or an errored pass did not.
     """
 
     session_id: str
@@ -119,3 +131,11 @@ class IngestReport:
     errors: int = 0
     commit_failures: int = 0
     memory_ids: list[str] = field(default_factory=list)
+    deferred: bool = False
+    busy: bool = False
+    backoff_skipped: bool = False
+
+    @property
+    def completed(self) -> bool:
+        """True when the pass actually ran to the end for the session's turns (not busy, not deferred, no error)."""
+        return not (self.busy or self.deferred) and self.errors == 0

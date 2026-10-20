@@ -419,7 +419,12 @@ def _await_service_readiness(persona_dir: Path, budget_s: float, out: dict | Non
             continue
         try:
             headers = {"Authorization": f"Bearer {s.auth_token}"} if s.auth_token else {}
-            r = httpx.get(f"http://127.0.0.1:{s.port}/health", headers=headers, timeout=1.0)
+            r = httpx.get(
+                f"http://127.0.0.1:{s.port}/health",
+                headers=headers,
+                timeout=1.0,
+                trust_env=False,  # never through a proxy (#475)
+            )
         except httpx.HTTPError:
             continue
         if r.status_code == 200:
@@ -446,6 +451,7 @@ def _await_readiness(persona_dir: Path, pid: int, log_path: Path, out: dict | No
                     f"http://127.0.0.1:{s.port}/health",
                     headers=headers,
                     timeout=1.0,
+                    trust_env=False,  # the loopback bridge is never reached through a proxy (#475)
                 )
                 if r.status_code == 200:
                     print(f"bridge started on port {s.port} (pid {pid})")
@@ -574,6 +580,7 @@ def _request_shutdown_via_http(
         headers=headers,
         json={"reason": reason} if reason else None,
         timeout=timeout,
+        trust_env=False,  # never through a proxy (#475)
     )
 
 
@@ -810,6 +817,7 @@ def cmd_status(args) -> int:
                 f"http://127.0.0.1:{s.port}/health",
                 headers=headers,
                 timeout=1.0,
+                trust_env=False,  # never through a proxy (#475)
             )
             health = r.json()
             print(f"bridge: running pid={s.pid} port={s.port}")
@@ -837,8 +845,7 @@ def cmd_tail(args) -> int:
     config with auth enabled, and (b) leaks the bearer token through
     process listings and proxy logs.
     """
-    from websockets.sync.client import connect
-
+    from brain.bridge.loopback import direct_ws_connect as connect  # never through a proxy (#475)
     from brain.paths import get_persona_dir
 
     persona_dir = get_persona_dir(args.persona)

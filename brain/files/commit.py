@@ -11,6 +11,7 @@ from pathlib import Path
 from brain.files import pending
 from brain.files.audit import audit
 from brain.files.write_guard import _MAX_RESULT_FILE_BYTES, check_size, check_write_target
+from brain.utils.time import lenient_utc
 
 logger = logging.getLogger(__name__)
 
@@ -177,14 +178,8 @@ def _claim_age(rec: dict, now: datetime) -> timedelta | None:
     Records claimed before #344 have no claimed_at: fall back to proposed_at (owner-ratified).
     A naive timestamp is read as UTC.
     """
-    raw = rec.get("claimed_at") or rec.get("proposed_at")
-    try:
-        ts = datetime.fromisoformat(raw)
-    except (TypeError, ValueError):
-        return None
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=UTC)
-    return now - ts
+    ts = lenient_utc(rec.get("claimed_at") or rec.get("proposed_at"))
+    return None if ts is None else now - ts
 
 
 def _reconcile_one(persona_dir: Path, rec: dict, *, now: datetime, stale_after: timedelta,

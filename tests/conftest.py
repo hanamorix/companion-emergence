@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 import os
 import tempfile
 from collections.abc import Iterator
@@ -39,6 +40,94 @@ def requires_symlinks() -> None:
     """Skip (not fail) a test whose setup creates a symlink, where the host denies it (#262)."""
     if not _symlinks_available():
         pytest.skip("os.symlink needs an elevated shell or Developer Mode on Windows")
+
+
+# The REAL per-user directories, captured at import (before any test patches the platform directories), for the #488 isolation test.
+from brain import paths as _paths_module  # noqa: E402
+
+# The XDG cache variable as the run started (None when unset), for the #488 isolation test: the fixture must leave it alone.
+REAL_XDG_CACHE_HOME = os.environ.get("XDG_CACHE_HOME")
+
+REAL_PLATFORM_DIRS = {
+    name: Path(getattr(_paths_module._dirs, name)).resolve()
+    for name in ("user_data_path", "user_cache_path", "user_log_path", "user_state_path", "user_config_path")
+}
+
+
+def _isolated_dir(root: Path, dirs: object, sub: str) -> str:
+    """One directory under the per-test root, laid out like the real thing: per app name (the harness keeps a SIBLING app dir,
+    "companion-emergence-harness", outside the guarded roots) and per app author where the platform puts it in the path (Windows,
+    macOS: an explicit author string, or on Windows no author meaning the app name), so ``PlatformDirs(app)`` and the engine's
+    ``PlatformDirs(app, author)`` stay different directories, which a harness guard test depends on."""
+    appname = getattr(dirs, "appname", None) or "app"
+    author = getattr(dirs, "appauthor", None)
+    if not (isinstance(author, str) and author):
+        author = appname if (author is None and os.name == "nt") else None
+    return str(root / author / appname / sub) if author else str(root / appname / sub)
+
+
+# The platformdirs directory properties as the platform defines them, captured before #488's fixture redirects them.
+_REAL_DIR_PROPS = {
+    prop: inspect.getattr_static(type(_paths_module._dirs), prop)
+    for prop in ("user_data_dir", "user_log_dir", "user_state_dir", "user_config_dir")
+}
+
+
+@pytest.fixture
+def real_platform_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """For a test that compares the home computed from an environment with platformdirs' own answer (#456 S15, the
+    pre-PR bridge proof): put the platform's real properties back over #488's redirect. The XDG variables #488 set
+    still point into the test's tmp root, so on Linux nothing resolves to the real user directory; the test only
+    compares paths, it writes nothing there."""
+    from platformdirs import PlatformDirs
+
+    from brain import paths
+
+    for cls in {type(paths._dirs), PlatformDirs}:
+        for prop, value in _REAL_DIR_PROPS.items():
+            monkeypatch.setattr(cls, prop, value)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_user_data_home(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[None]:
+    """#488: no test may write into the real per-user data directory.
+
+    A test that builds the bridge app (its lifespan rewrites ``tunables.json``) or calls ``get_home()`` with neither
+    ``KINDLED_HOME`` nor ``NELLBRAIN_HOME`` set resolved to the platformdirs default, the REAL ``~/.local/share/companion-emergence``
+    of whoever ran the tests, so a run could change real settings and a later test could read what an earlier one left. Every test
+    now gets its own empty root as that default. The directory properties are replaced on the platform's ``PlatformDirs`` class
+    (every OS), so ``brain.paths._dirs`` and any fresh ``PlatformDirs(...)`` (the update overlay hook builds its own, and a parity
+    test holds the two together) agree and both land in the tmp root; the XDG data and state variables point there too (so a
+    subprocess a test starts, on Linux and macOS, lands there as well). A test that sets ``KINDLED_HOME`` / ``NELLBRAIN_HOME`` still wins, as before, and the env-var resolution order is
+    unchanged.
+
+    The CACHE directory and ``XDG_CACHE_HOME`` are deliberately NOT redirected: the cache is where downloaded models live, not user
+    state. platformdirs reads ``XDG_CACHE_HOME`` on Linux and macOS and huggingface_hub derives ``HF_HOME`` from it on every OS, so
+    moving it made a subprocess a test starts (the judge release RSS job's C3a) find no cached judge, go to the network and fail.
+    """
+    from platformdirs import PlatformDirs
+
+    from brain import paths
+
+    root = tmp_path_factory.mktemp("userdata")
+    # Two classes when something (the update overlay hook drops platformdirs from sys.modules) made a new one after brain.paths
+    # built its instance: patch the one `brain.paths._dirs` is an instance of AND the one `from platformdirs import PlatformDirs` gives now.
+    for cls in {type(paths._dirs), PlatformDirs}:
+        for prop, sub in (
+            ("user_data_dir", "data"),
+            ("user_log_dir", "log"),
+            ("user_state_dir", "state"),
+            ("user_config_dir", "config"),
+        ):
+            monkeypatch.setattr(cls, prop, property(lambda self, _s=sub: _isolated_dir(root, self, _s)))
+    for var, sub in (
+        ("XDG_DATA_HOME", "xdg-data"),
+        ("XDG_STATE_HOME", "xdg-state"),
+    ):
+        monkeypatch.setenv(var, str(root / sub))
+    yield
 
 
 @pytest.fixture(autouse=True)

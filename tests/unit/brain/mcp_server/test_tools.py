@@ -407,11 +407,12 @@ def test_search_via_bridge_success_posts_and_returns_body(
         def json(self):
             return {"memories": [{"id": "m1"}], "mode": "semantic"}
 
-    def _fake_post(url, *, json, headers, timeout):
+    def _fake_post(url, *, json, headers, timeout, trust_env):
         captured["url"] = url
         captured["json"] = json
         captured["headers"] = headers
         captured["timeout"] = timeout
+        captured["trust_env"] = trust_env
         return _FakeResp()
 
     monkeypatch.setattr(tools_mod.httpx, "post", _fake_post)
@@ -423,6 +424,7 @@ def test_search_via_bridge_success_posts_and_returns_body(
     assert captured["json"] == {"query": "x", "limit": 5}
     assert captured["headers"] == {"Authorization": "Bearer tok-123"}
     assert captured["timeout"] == dev_constants.SEARCH_BRIDGE_TIMEOUT_S
+    assert captured["trust_env"] is False  # the loopback bridge is never reached through a proxy (#475)
 
 
 def test_search_via_bridge_no_state_file_is_unreachable(persona_dir: Path, monkeypatch) -> None:

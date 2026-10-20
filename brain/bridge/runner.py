@@ -38,8 +38,8 @@ def _allocate_port(max_attempts: int = 3) -> int:
     handshake (``cmd_start`` waits for /health 200 and kills orphan
     children on timeout) is what closes the loop if the race does fire.
 
-    Backoff schedule on failed discovery: 10ms, 100ms, 1s — total
-    worst-case ~1.1s before giving up.
+    Backoff schedule on failed discovery: 1ms, then 10ms between attempts
+    (nothing sleeps after the last one, #481), so a failure surfaces at once.
     """
     import time
 
@@ -53,8 +53,8 @@ def _allocate_port(max_attempts: int = 3) -> int:
             return port
         except OSError as exc:
             last_exc = exc
-            backoff_s = (10**attempt) / 1000.0  # 0.01, 0.1, 1.0
-            time.sleep(backoff_s)
+            if attempt < max_attempts - 1:  # no sleep after the last attempt: nothing follows it (#481)
+                time.sleep((10**attempt) / 1000.0)  # 0.001, 0.01, 0.1, ...
     raise RuntimeError(
         f"_allocate_port: failed to bind a free port after {max_attempts} attempts; "
         f"last error: {last_exc}",

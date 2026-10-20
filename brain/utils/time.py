@@ -71,6 +71,40 @@ def parse_iso_utc(s: str) -> datetime:
     return dt
 
 
+def lenient_utc(value: object) -> datetime | None:
+    """Any stored timestamp -> an aware UTC datetime, or None. The ONE failure policy for a damaged stamp (#485).
+
+    Takes a datetime or an ISO-8601 string (``Z`` suffix or an offset); a naive value means UTC (the repo's rule, as
+    :func:`parse_iso_utc` already applies to strings); an aware value is converted to UTC. Anything else (None, a number, a
+    list, bytes, text that is not a timestamp) is None. It never raises: the CALLER decides what None means (due now, skip,
+    or refuse), explicitly, instead of each reader choosing a different accident.
+    """
+    try:
+        if isinstance(value, datetime):
+            dt = value
+        elif isinstance(value, str):
+            dt = parse_iso_utc(value)
+        else:
+            return None
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC)
+    except (ValueError, OverflowError):
+        return None
+
+
+def hours_since(value: object, now: object) -> float | None:
+    """Hours from the stored stamp ``value`` to ``now`` (never negative), or None when either is unusable (:func:`lenient_utc`).
+
+    ``now`` is read the same lenient way (a naive ``now`` means UTC), so a caller cannot crash it with the wrong kind of datetime.
+    """
+    then = lenient_utc(value)
+    current = lenient_utc(now)
+    if then is None or current is None:
+        return None
+    return max(0.0, (current - then).total_seconds() / 3600.0)
+
+
 def to_local(dt: datetime) -> datetime:
     """Convert a datetime to local wall-clock time, for anything shown to the
     companion as an absolute "when did/does this happen" reading (issue #217).
@@ -116,9 +150,11 @@ def format_local(dt: datetime) -> str:
 def local_display(ts: str) -> str:
     """Convert a stored UTC ISO-8601 string (``iso_utc()``'s format, or any
     ISO string with a 'Z' suffix or explicit offset) to a local-zone display
-    string. Fails soft to the raw input on a malformed timestamp — a display
-    seam must never break composition over a bad ts."""
+    string. TOTAL: a display seam must never break composition over a bad ts, so
+    anything it cannot render (malformed text, a stamp with no local equivalent
+    such as year 1 in a zone behind UTC, a non-string value) returns the raw input
+    (``""`` for a value that is not text) instead of raising (#480)."""
     try:
         return format_local(parse_iso_utc(ts))
-    except (ValueError, TypeError):
-        return ts
+    except Exception:  # noqa: BLE001 — AttributeError for a non-string, OverflowError for an unconvertible stamp, ...
+        return ts if isinstance(ts, str) else ""

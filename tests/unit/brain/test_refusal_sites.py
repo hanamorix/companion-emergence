@@ -147,16 +147,23 @@ def test_session_extraction_refusal_leaves_cursor_and_backoff(persona, kind, swe
     sid = _buffer(persona)
     store, hebbian = _stores(persona)
     prov = Refusing(kind, persona)
+    def _sweep() -> None:
+        if sweep == "snapshot":
+            pipeline.snapshot_stale_sessions(persona, silence_minutes=0.0, store=store, hebbian=hebbian, provider=prov)
+        else:
+            pipeline.finalize_stale_sessions(
+                persona, finalize_after_hours=0.0, store=store, hebbian=hebbian, provider=prov
+            )
+
     try:
-        with pytest.raises(_refused_type(kind)):
-            if sweep == "snapshot":
-                pipeline.snapshot_stale_sessions(
-                    persona, silence_minutes=0.0, store=store, hebbian=hebbian, provider=prov
-                )
-            else:
-                pipeline.finalize_stale_sessions(
-                    persona, finalize_after_hours=0.0, store=store, hebbian=hebbian, provider=prov
-                )
+        if kind == "shutdown":
+            # #456: the bridge is stopping: the sweep ends with the refusal.
+            with pytest.raises(_refused_type(kind)):
+                _sweep()
+        else:
+            # #470/#473 (merged): any other refusal is a deferred extraction, "not now": the sweep goes on, nothing kept
+            # changes.
+            _sweep()
     finally:
         store.close()
         hebbian.close()

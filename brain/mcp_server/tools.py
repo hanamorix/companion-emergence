@@ -73,6 +73,7 @@ def _search_via_bridge(persona_dir: Path, arguments: dict[str, Any]) -> dict:
             json=arguments,
             headers=headers,
             timeout=dev_constants.SEARCH_BRIDGE_TIMEOUT_S,
+            trust_env=False,  # the loopback bridge is never reached through a proxy (#475)
         )
     except httpx.TimeoutException:
         return {"error": "bridge timeout"}

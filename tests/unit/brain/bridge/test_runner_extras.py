@@ -87,8 +87,9 @@ def test_allocate_port_exhausts_attempts_raises(monkeypatch) -> None:
     with pytest.raises(RuntimeError, match="failed to bind a free port after 3 attempts"):
         runner._allocate_port(max_attempts=3)
 
-    # Backoff schedule: (10 ** attempt) / 1000.0; attempts 0..2.
-    assert sleeps == [pytest.approx(0.001), pytest.approx(0.01), pytest.approx(0.1)]
+    # Backoff schedule: (10 ** attempt) / 1000.0, slept only BETWEEN attempts (#481: nothing follows the last one, so it
+    # no longer sleeps): attempts 0 and 1 sleep, attempt 2 does not.
+    assert sleeps == [pytest.approx(0.001), pytest.approx(0.01)]
 
 
 # ---------------------------------------------------------------------------

@@ -295,6 +295,7 @@ def save_with_backup_text(
     mode: int | None = None,
     fsync: bool = True,
     newline: str | None = None,
+    encoding: str = "utf-8",
 ) -> None:
     """Atomic raw-text save with .bak rotation.
 
@@ -319,7 +320,8 @@ def save_with_backup_text(
     sets it on every rotated backup (a token file must never be wider, even for
     an instant); ``fsync=False`` skips the new file's fsync and the directory
     fsync (the backup copy is still fsynced); ``newline`` is passed to the
-    temp file's open (``"\n"`` gives the same bytes on every platform).
+    temp file's open (``"\n"`` gives the same bytes on every platform);
+    ``encoding`` is the text encoding (default utf-8; the Windows task XML is UTF-16).
     """
     bak1 = path.with_name(f"{path.name}.bak1")
     with _temp_scope(path) as (new_path, bak1_new):
@@ -327,11 +329,11 @@ def save_with_backup_text(
         # the bytes written per platform are unchanged; flushed and fsynced so
         # the data is on disk before the replace below can publish it.
         if mode is None:
-            new_file = new_path.open("w", encoding="utf-8", newline=newline)
+            new_file = new_path.open("w", encoding=encoding, newline=newline)
         else:
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
             new_file = os.fdopen(
-                os.open(new_path, flags, mode), "w", encoding="utf-8", newline=newline
+                os.open(new_path, flags, mode), "w", encoding=encoding, newline=newline
             )
         with new_file as f:
             f.write(text)

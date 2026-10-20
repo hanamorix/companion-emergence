@@ -254,7 +254,7 @@ def test_the_bridge_proof_reads_another_process_home_through_the_one_rule(monkey
     assert seen == [{"HOME": "/h"}]
 
 
-def test_the_default_computed_from_an_environment_matches_platformdirs_here(monkeypatch):
+def test_the_default_computed_from_an_environment_matches_platformdirs_here(monkeypatch, real_platform_dirs):
     """Drift guard (runs on every CI platform): with no override, the default this module computes from an
     environment equals what platformdirs gives this process."""
     import os
