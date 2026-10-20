@@ -65,7 +65,9 @@ def attempt_heal_text(
     """
     if not path.exists():
         default_text = default_factory()
-        path.write_text(default_text, encoding="utf-8")
+        # The shared atomic writer (#511): a crash mid-write leaves the path absent, never short or empty. No backup
+        # chain: a default write must not rotate the .bak files of a file that went missing.
+        save_with_backup_text(path, default_text, keep_backups=False)
         return default_text, None
 
     content = path.read_text(encoding="utf-8")
@@ -115,7 +117,7 @@ def _heal_text_from_baks(
 
     # All baks corrupt or missing — reset to default.
     default_text = default_factory()
-    path.write_text(default_text, encoding="utf-8")
+    save_with_backup_text(path, default_text, keep_backups=False)  # atomic (#511); the chain is left alone
     return (
         default_text,
         BrainAnomaly(
