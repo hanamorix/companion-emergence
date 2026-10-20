@@ -261,3 +261,49 @@ def test_update_skips_a_record_that_is_not_this_bridge(own_record):
     before = (own_record / "bridge.json").read_bytes()
     assert state_file.update(own_record, lambda s: setattr(s, "phase", "stopping")) is False
     assert (own_record / "bridge.json").read_bytes() == before
+
+
+def test_the_monitor_survives_write_errors_and_still_honours_a_later_request(own_record, monkeypatch):
+    """C44 (a): an injected OSError on the progress-record replace does not stop the monitor, and a later valid request
+    is still honoured (fail-demo: a loop without a per-iteration catch)."""
+    import time as _time
+
+    c = BridgeShutdownController()
+    c.configure(own_record)
+    c.bind_server(FakeServer())
+    exits: list[str] = []
+    m = shutdown_mod.Monitor(c, own_record, pid=os.getpid(), pid_token=_pi.own_token(),
+                             hard_exit=lambda reason: exits.append(reason), poll_s=0.02)
+    real_write = shutdown_progress.write_record
+    calls = {"n": 0}
+
+    def flaky(*a, **k):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise OSError("disk full")
+        return real_write(*a, **k)
+
+    monkeypatch.setattr(shutdown_progress, "write_record", flaky)
+    real_read = shutdown_progress.read_record
+    reads = {"n": 0}
+
+    def flaky_read(*a, **k):
+        reads["n"] += 1
+        if reads["n"] == 1:
+            raise OSError("io error")  # an unexpected error escaping poll_once itself
+        return real_read(*a, **k)
+
+    monkeypatch.setattr(shutdown_progress, "read_record", flaky_read)
+    c.begin_stop("user_stop")
+    m.start()
+    try:
+        deadline = _time.monotonic() + 5
+        while calls["n"] < 3 and _time.monotonic() < deadline:
+            _time.sleep(0.02)
+        real_write(own_record, shutdown_progress.REQUEST_FILENAME, {"pid": os.getpid(), "pid_token": _pi.own_token()})
+        while not exits and _time.monotonic() < deadline:
+            _time.sleep(0.02)
+    finally:
+        m.stop()
+    assert exits == ["hard_exit"]
+    assert calls["n"] >= 3
