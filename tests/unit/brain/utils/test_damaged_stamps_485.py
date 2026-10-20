@@ -181,3 +181,13 @@ def test_resonance_stores_an_aware_utc_stamp(tmp_path):
     parsed = datetime.fromisoformat(row.last_updated_ts.replace("Z", "+00:00"))
     assert parsed.tzinfo is not None and parsed.utcoffset() == timedelta(0)
     assert abs((datetime.now(UTC) - parsed).total_seconds()) < 60
+
+
+def test_hours_since_reads_a_naive_now_as_utc_too():
+    """Code review 3b, S7: every other call site wraps `now` in `lenient_utc`; `hours_since` subtracted it raw, so a naive `now`
+    raised TypeError in the maker, notes and charge paths."""
+    naive_now = datetime(2026, 6, 15, 12, 0, 0)  # the repo's rule: naive means UTC
+    assert hours_since("2026-06-15T10:00:00Z", naive_now) == pytest.approx(2.0)
+    assert hours_since("2026-06-15T10:00:00", naive_now) == pytest.approx(2.0)
+    assert hours_since("not a stamp", naive_now) is None
+    assert hours_since("2026-06-15T10:00:00Z", None) is None  # an unusable `now` is unusable, not a crash

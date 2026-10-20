@@ -93,12 +93,16 @@ def lenient_utc(value: object) -> datetime | None:
         return None
 
 
-def hours_since(value: object, now: datetime) -> float | None:
-    """Hours from the stored stamp ``value`` to ``now`` (never negative), or None when the stamp is unusable (:func:`lenient_utc`)."""
+def hours_since(value: object, now: object) -> float | None:
+    """Hours from the stored stamp ``value`` to ``now`` (never negative), or None when either is unusable (:func:`lenient_utc`).
+
+    ``now`` is read the same lenient way (a naive ``now`` means UTC), so a caller cannot crash it with the wrong kind of datetime.
+    """
     then = lenient_utc(value)
-    if then is None:
+    current = lenient_utc(now)
+    if then is None or current is None:
         return None
-    return max(0.0, (now - then).total_seconds() / 3600.0)
+    return max(0.0, (current - then).total_seconds() / 3600.0)
 
 
 def to_local(dt: datetime) -> datetime:
