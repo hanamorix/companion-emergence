@@ -273,3 +273,29 @@ def test_431_sweep_fails_closed_when_the_soul_exemptions_cannot_be_read(tmp_path
     assert not (tmp_path / _ARCHIVE_FILENAME).exists()
     assert not (tmp_path / "dedup_sweep_report.jsonl").exists()
     store.close()
+
+
+def _aged(content: str, days_ago: int, *, importance: float = 3.0) -> Memory:
+    from datetime import UTC, datetime, timedelta
+
+    m = _mem(content, importance=importance)
+    object.__setattr__(m, "created_at", datetime.now(UTC) - timedelta(days=days_ago))
+    return m
+
+
+def test_431_near_dup_pass_stops_comparing_a_row_it_just_dropped(tmp_path):
+    """#431 review: A plain (oldest), B soul-linked, C plain, all judged duplicates. A is dropped in
+    favour of B; the pass must stop using A, or it merges C into the deleted A and C is lost too."""
+    store = MemoryStore(tmp_path / "memories.db")
+    a = _aged("Bob and the red kite.", 3)
+    b = _aged("The red kite Bob flew.", 2)
+    c = _aged("Bob flew a red kite.", 1)
+    for m in (a, b, c):
+        store.create(m)
+    _crystallise(tmp_path, b.id)
+
+    report = run_dedup_sweep(store, tmp_path, judge=lambda _x, _y: "duplicate")
+
+    assert _active_ids(store) == {b.id}
+    assert [(m.canonical_id, m.removed_id) for m in report.merges] == [(b.id, a.id), (b.id, c.id)]
+    store.close()
