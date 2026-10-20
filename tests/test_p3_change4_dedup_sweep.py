@@ -628,3 +628,34 @@ def test_431_near_dup_merge_does_not_count_as_a_recall_and_previews_the_dropped_
         (a.id, c.id, c.content[:120])
     ]
     store.close()
+
+
+def test_505_near_dup_pass_treats_a_row_deactivated_mid_pass_as_vanished(tmp_path, caplog):
+    """#505: the sweep lists only active rows, but ``store.get`` returns a row whatever its ``active``
+    flag. Guards against archiving and hard-deleting C after another writer deactivated it mid-pass (a
+    deactivated row is out of play, not a duplicate to merge): the pair is skipped with a warning, C
+    is never judged again, and nothing is archived."""
+    import logging
+
+    store = MemoryStore(tmp_path / "memories.db")
+    a, c, d = (_aged(f"Bob {w} the lamp.", n) for w, n in (("lit", 3), ("was lighting", 2), ("fixed", 1)))
+    for m in (a, c, d):
+        store.create(m)
+    calls: list[tuple[str, str]] = []
+
+    def _judge(candidate: Memory, canonical: Memory) -> str:
+        calls.append((candidate.id, canonical.id))
+        if len(calls) == 1:
+            store.deactivate(c.id)  # another writer deactivates C while A/C is judged
+        return "distinct" if d.id in (candidate.id, canonical.id) else "duplicate"
+
+    with caplog.at_level(logging.WARNING, logger="brain.engines.dedup_sweep"):
+        report = run_dedup_sweep(store, tmp_path, judge=_judge)
+
+    assert calls == [(c.id, a.id), (d.id, a.id)]
+    assert (report.rows_removed, report.merges) == (0, [])
+    assert not (tmp_path / _ARCHIVE_FILENAME).exists()
+    assert store.get(c.id, bump=False) is not None, "a deactivated row must not be hard-deleted"
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1 and a.id in warnings[0] and c.id in warnings[0], warnings
+    store.close()

@@ -234,11 +234,19 @@ def _near_dup_pass(
             # stale copy, deleted or updated: the pair is skipped and logged (#431).
             keep_now = store.get(keep.id, bump=False)
             drop_now = store.get(drop.id, bump=False)
-            vanished = {m.id for m, now in ((keep, keep_now), (drop, drop_now)) if now is None}
+            # ``store.get`` ignores the ``active`` flag, but the pass only works on active rows: a row
+            # deactivated mid-pass is out of play exactly like a deleted one, never archived or merged (#505).
+            vanished = {
+                m.id
+                for m, now in ((keep, keep_now), (drop, drop_now))
+                if now is None or not now.active
+            }
             if vanished:
                 gone |= vanished
                 logger.warning(
-                    "dedup_sweep: skipping pair %s / %s: a row vanished mid-pass", keep.id, drop.id
+                    "dedup_sweep: skipping pair %s / %s: a row vanished or was deactivated mid-pass",
+                    keep.id,
+                    drop.id,
                 )
             else:
                 _merge_pair(store, persona_dir, report, keep=keep_now, drop=drop_now)
