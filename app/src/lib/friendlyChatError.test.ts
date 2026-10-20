@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { friendlyChatError, modelRejectionMessage, tierFallbackMessage, tiersUncheckedMessage } from "./friendlyChatError";
+import {
+  friendlyChatError,
+  modelRejectionMessage,
+  modelUnsupportedMessage,
+  tierFallbackMessage,
+  tiersUncheckedMessage,
+} from "./friendlyChatError";
 
 describe("friendlyChatError", () => {
   it("maps provider_failed to actionable Claude guidance", () => {
@@ -80,5 +86,14 @@ describe("friendlyChatError", () => {
       "Some background models were not checked yet (claude-haiku-5, claude-sonnet-4-8). They are checked when first used, and any problem will show here.",
     );
     expect(out).not.toContain("—");
+  });
+
+  it("words the unsupported-model setting plainly, naming the value and Sonnet, without an em-dash", () => {
+    const out = modelUnsupportedMessage("fable");
+    expect(out).toBe(
+      'The model "fable" in your settings is not supported, so Sonnet is being used instead. Use change to pick a model and replace it.',
+    );
+    expect(out).not.toContain("—");
+    expect(out).not.toContain("undefined");
   });
 });

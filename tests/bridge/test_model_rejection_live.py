@@ -54,6 +54,8 @@ def test_generate_path_rejection_is_recognised_and_matches_the_pinned_sentence()
     assert model_error.is_model_rejection(text), text
     assert _pinned_sentence(BOGUS) in text, text
     assert model_error.rejected_model_name(text, None) == BOGUS
+    # #448: the json argv carries the numeric status (it has no error code, only the stream-json frames do)
+    assert "api_error_status=404" in text, text
 
 
 def test_chat_stream_path_rejection_is_recognised_and_matches_the_pinned_sentence():
@@ -63,4 +65,17 @@ def test_chat_stream_path_rejection_is_recognised_and_matches_the_pinned_sentenc
     text = f"[{errors[0].stage}] {errors[0].detail}"
     assert model_error.is_model_rejection(text), text
     assert _pinned_sentence(BOGUS) in text, text
+    assert model_error.rejected_model_name(text, None) == BOGUS
+    # #448: the structured signals reach the detector on the streaming path too
+    assert "api_error_status=404" in text and "error=model_not_found" in text, text
+
+
+def test_save_time_probe_receives_the_model_not_found_code():
+    """Owner decision D15: the picker's / `nell model set`'s check runs stream-json, so it gets the code."""
+    with pytest.raises(Exception) as err:
+        ClaudeCliProvider(model=BOGUS).probe("hi")
+    text = str(err.value)
+    print(f"\nprobe() failure text: {text}")
+    assert model_error.is_model_rejection(text), text
+    assert "api_error_status=404" in text and "error=model_not_found" in text, text
     assert model_error.rejected_model_name(text, None) == BOGUS

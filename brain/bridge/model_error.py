@@ -10,10 +10,13 @@ text the provider raises, names the rejected model, and keeps a small process-wi
 model so a saved model that later stops working is visible (a throttled WARNING and the
 ``model_rejections`` key of ``/persona/state``) instead of failing silently inside background jobs.
 
-Detection is text matching because the provider forwards only the CLI's result frame, and the frame
-carries the sentence but not the CLI's structured ``error: "model_not_found"`` key (that key sits on a
-synthetic assistant frame neither parser reads). Whether the CURRENT CLI still words it this way is
-checked by tests/bridge/test_model_rejection_live.py.
+Detection (#448) reads the CLI's own error signals first and the sentence only as a backup. The provider
+puts them into the failure text it raises with: ``api_error_status=404`` (the result frame's status),
+``error=model_not_found`` (the assistant frame's code) and, for a detail classified as a rejection,
+``model=<id>`` (the model the subprocess was run with). A rejection is the code, or the sentence; a bare 404
+with neither is NOT a rejection (some other 404 must not be told to the user as a model problem) and is logged
+with its status. The 2.1.302 CLI already appended a suffix to the sentence, which is why the sentence cannot be
+the only signal. Whether the CURRENT CLI still sends these is checked by tests/bridge/test_model_rejection_live.py.
 
 Shape mirrors :mod:`brain.bridge.provider_auth`: module globals under one lock, every public function
 fails OPEN (an internal error never blocks a call or a turn), ``reset()`` for tests.
@@ -32,11 +35,16 @@ from typing import Any
 
 from brain import tunables
 from brain.persona_config import is_valid_model
+from brain.utils.log_throttle import warn_throttled
 
 log = logging.getLogger(__name__)
 
-MODEL_REJECTION_MARKER = "issue with the selected model"
+MODEL_REJECTION_MARKER = "issue with the selected model"  # backup signal only
 _NAMED_MODEL = re.compile(r"selected model \(([^)\s]+)\)", re.IGNORECASE)
+# Structured signals, matched with boundaries (never inside a longer word, number or key).
+_STATUS_404 = re.compile(r"(?<![\w=-])api_error_status=404(?!\d)")
+_CODE_MODEL_NOT_FOUND = re.compile(r"(?<![\w=-])error=model_not_found(?![\w-])")
+_MODEL_TOKEN = re.compile(r"(?<![\w=-])model=([^;\s]{1,80});")
 
 # Same cadence as provider_auth's re-probe interval: one WARNING per rejected model per quarter hour.
 WARN_INTERVAL_S: float = tunables.register("model_error.warn_interval_seconds", 900.0)
@@ -59,21 +67,35 @@ _local = threading.local()
 
 
 def is_model_rejection(detail: str) -> bool:
-    """True when ``detail`` (an exception's text) is the CLI rejecting the ``--model`` it was given."""
-    return MODEL_REJECTION_MARKER in (detail or "").lower()
+    """True when ``detail`` (an exception's text) is the CLI rejecting the ``--model`` it was given.
+
+    A rejection is (status 404 AND ``model_not_found``), (status 404 AND the sentence), ``model_not_found``
+    alone, or the sentence alone (the backup). The first two are covered by the last two, so the test is the
+    code OR the sentence; a status of 404 with neither is not enough on its own (D8 in the change records).
+    """
+    text = detail or ""
+    return bool(_CODE_MODEL_NOT_FOUND.search(text)) or MODEL_REJECTION_MARKER in text.lower()
+
+
+def has_status_404(detail: str) -> bool:
+    return bool(_STATUS_404.search(detail or ""))
 
 
 def rejected_model_name(detail: str, configured: str | None) -> str | None:
-    """The model the CLI says it rejected, else ``configured``, else None.
+    """The model that was rejected, else ``configured``, else None.
 
-    The name parsed from the text wins over ``configured``: it is the model that was ACTUALLY rejected
-    (it survives a hot-swap during a turn), whereas ``configured`` is only the fallback. Only text that
-    is valid model grammar (an alias or ``claude-[a-z0-9.-]+``) is ever returned, so no CLI prose is
-    relayed to a client.
+    Order: the name in the CLI's sentence (the model it says it rejected), the ``model=`` token the provider
+    added (the model the subprocess was run with, immune to a hot-swap during the call), then ``configured``.
+    Callers pass None for ``configured`` on the client-facing paths: a rejected model is never named from
+    ``provider._model``. Only valid model grammar (an alias or ``claude-[a-z0-9.-]+``) is ever returned, so no
+    CLI prose is relayed to a client.
     """
     m = _NAMED_MODEL.search(detail or "")
     if m and is_valid_model(m.group(1)):
         return m.group(1)
+    tok = _MODEL_TOKEN.search(detail or "")
+    if tok and is_valid_model(tok.group(1)):
+        return tok.group(1)
     if configured is not None and is_valid_model(configured):
         return configured
     return None
@@ -97,7 +119,17 @@ def suppressed() -> Iterator[None]:
 def note_failure(detail: str) -> None:
     """Record a CLI failure text if it is a model rejection. Anything else is a no-op."""
     try:
-        if getattr(_local, "suppress", False) or not is_model_rejection(detail):
+        if getattr(_local, "suppress", False):
+            return
+        if not is_model_rejection(detail):
+            if has_status_404(detail):  # D8: a bare 404 is a generic error, but say what was seen
+                warn_throttled(
+                    log,
+                    "model_error:status404",
+                    "Claude CLI call failed with api_error_status=404 and neither a model_not_found code nor a "
+                    "model-rejection sentence; treated as a generic error, not a rejected model",
+                    exc_info=False,
+                )
             return
         model = rejected_model_name(detail, None)
         if model is None:

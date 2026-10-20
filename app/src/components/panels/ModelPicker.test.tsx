@@ -297,4 +297,21 @@ describe("ModelPicker", () => {
     fireEvent.click(applyBtn());
     await waitFor(() => expect(onClose).toHaveBeenCalledWith("claude-sonnet-5", { tiersUnchecked: ["claude-haiku-5"] }));
   });
+
+  it("allowReapply lets the user apply the model that is already current (an unsupported setting fell back to it)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, model: "sonnet" }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const onClose = vi.fn();
+    render(<ModelPicker current="sonnet" persona="test" onClose={onClose} allowReapply />);
+    const apply = screen.getByRole("button", { name: /apply/i });
+    expect(apply).not.toBeDisabled();
+    fireEvent.click(apply);
+    await waitFor(() => {
+      expect(onClose).toHaveBeenCalledWith("sonnet");
+    });
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1].body));
+    expect(body).toEqual({ model: "sonnet" });
+  });
 });

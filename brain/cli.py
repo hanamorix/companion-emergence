@@ -14,6 +14,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from brain import __version__, prompt_strings
 from brain.bridge import state_file
@@ -2571,6 +2572,11 @@ def _model_show_handler(args: argparse.Namespace) -> int:
         return 1
     cfg = PersonaConfig.load(path)
     print(f"chat model: {cfg.model}")
+    if cfg.provider == "claude-cli" and cfg.model_unsupported is not None:
+        print(
+            f"warning: the model {cfg.model_unsupported_display()!r} in this persona's settings is not supported, "
+            f"so {cfg.model} is being used instead (supported: sonnet, opus, haiku or a full id such as claude-sonnet-5)"
+        )
     print("background models (tier: model (source)):")
     for tier in ROUTED_CLAUDE_TIERS:
         model, source = _resolve(cfg, tier)
@@ -2580,8 +2586,8 @@ def _model_show_handler(args: argparse.Namespace) -> int:
         print(
             "note: "
             + ", ".join(cfg.derived_unavailable)
-            + " was not available when the chat model was last saved; it is tested again when the chat "
-            "model is re-applied in the picker"
+            + " was not available when the chat model was last saved; it is tested again when the bridge "
+            "starts and when the chat model is applied again (in the picker or with `nell model set`)"
         )
     return 0
 
@@ -2600,6 +2606,211 @@ def _model_set_tier_handler(args: argparse.Namespace) -> int:
     cfg.tier_models = {**cfg.tier_models, args.tier: args.model}
     cfg.save(path)
     print(f"{args.tier} now uses {args.model} (checked when first used)")
+    return 0
+
+
+class _BridgeStartedMidCommandError(Exception):
+    """A bridge for the persona started while `nell model set` was checking the model."""
+
+
+def _bridge_running(persona_dir: Path) -> Any:
+    """The persona's bridge state when its bridge is running (a state file with a live pid and a port), else None."""
+    state = state_file.read(persona_dir)
+    if state and state.pid and state.port and state_file.pid_is_alive(state.pid):
+        return state
+    return None
+
+
+def _model_set_handler(args: argparse.Namespace) -> int:
+    """`nell model set <model>`: set the chat model with the picker's rules and the picker's save-time check.
+
+    An alias or a full ``claude-`` id (64 cap). With the persona's bridge running the request goes to the picker's
+    own settings endpoint (live hot swap, the same single-flight lock); otherwise the check runs here and the
+    config is written (``brain.bridge.server._apply_chat_model`` is the one implementation of both). If a bridge
+    starts while the check runs, nothing is written behind it.
+    """
+    from brain.persona_config import MODEL_ID_RULE, is_valid_model
+
+    if not is_valid_model(args.model):
+        print(f"error: {args.model!r} is not a valid model: {MODEL_ID_RULE}", file=sys.stderr)
+        return 1
+    path = _model_cfg_path(args.persona)
+    if path is None:
+        return 1
+    persona_dir = path.parent
+    state = _bridge_running(persona_dir)
+    if state is not None:
+        outcome = _model_set_via_bridge(state, args.model, persona_dir.name)
+        if outcome is None:
+            return 1
+    else:
+        try:
+            outcome = _model_set_direct(persona_dir, args.model)
+        except _BridgeStartedMidCommandError:
+            print(
+                "error: the persona's bridge started while the model was being checked, so nothing was written. "
+                "Run the command again and it will go through the bridge.",
+                file=sys.stderr,
+            )
+            return 1
+    return _model_set_report(args.model, outcome[0], outcome[1], via_bridge=state is not None)
+
+
+def _model_set_direct(persona_dir: Path, model: str) -> tuple[int, dict]:
+    """No bridge running: run the check here (claude-cli personas only) and write the config."""
+    import asyncio
+
+    from brain.bridge import server as server_mod
+
+    check = PersonaConfig.load(persona_dir / "persona_config.json").provider == "claude-cli"
+
+    def _no_bridge_now() -> None:
+        if _bridge_running(persona_dir) is not None:
+            raise _BridgeStartedMidCommandError
+
+    async def _go() -> tuple[int, dict]:
+        return await server_mod._apply_chat_model(
+            persona_dir, model, check=check, lock=asyncio.Lock(), hot_swap=None, before_write=_no_bridge_now
+        )
+
+    return asyncio.run(_go())
+
+
+def _bridge_text(value: Any, limit: int = 200) -> str:
+    """Text that came from the bridge, made safe to print: newlines and tabs become a space, other control
+    characters (escape sequences, bells) are removed, cut at ``limit`` characters."""
+    return "".join(" " if ch in "\n\r\t" else ch for ch in str(value) if ch.isprintable() or ch in "\n\r\t")[:limit]
+
+
+# The most of a bridge answer the command will read: its real answers are a few hundred bytes.
+_BRIDGE_ANSWER_MAX_BYTES = 65536
+
+
+def _model_set_via_bridge(state: Any, model: str, persona: str) -> tuple[int, Any] | None:
+    """Bridge running: POST to the picker's settings endpoint. None (after printing why) if it gave no usable answer.
+
+    ONE connection: ``connect()`` is called on its own first. A failure there means nothing was sent ("could not
+    reach the bridge"). Once it has returned, any failure in ``request()``, ``getresponse()`` or the read happens
+    when the bridge may already have the request, so the outcome is unknown. Decided by that phase, not by any
+    error number (they differ between Linux, macOS and Windows).
+    """
+    import http.client
+
+    from brain.bridge import server as server_mod
+
+    headers = {"Content-Type": "application/json"}
+    if state.auth_token:
+        headers["Authorization"] = f"Bearer {state.auth_token}"
+    payload = json.dumps({"model": model}).encode("utf-8")  # json-io: ok -- HTTP request body to the bridge
+    # The endpoint keeps itself inside one check budget (a wait for the lock counts against it); twice that is the margin.
+    wait_s = server_mod._check_budget_s() * 2
+    conn = http.client.HTTPConnection("127.0.0.1", state.port, timeout=wait_s)
+    try:
+        try:
+            conn.connect()
+        except OSError as exc:  # also a refused connection, an unresolvable name, a connect timeout
+            print(
+                f"error: could not reach the bridge on port {state.port}: {_bridge_text(exc)}. The bridge may "
+                f"still be starting: try again in a few seconds, or stop it with `nell supervisor stop --persona {persona}`.",
+                file=sys.stderr,
+            )
+            return None
+        try:
+            conn.request("POST", "/persona/config/model", body=payload, headers=headers)
+            resp = conn.getresponse()
+            status = resp.status
+            if status == 200:
+                raw = resp.read(_BRIDGE_ANSWER_MAX_BYTES)
+            else:
+                try:
+                    raw = resp.read(_BRIDGE_ANSWER_MAX_BYTES)
+                except (OSError, ValueError, http.client.HTTPException):
+                    raw = b""  # the status alone is still worth reporting
+        except TimeoutError:
+            print(
+                f"error: no answer from the bridge within {wait_s:.0f} s, so the outcome is unknown: the bridge may "
+                "still apply the change. Check with `nell model show`.",
+                file=sys.stderr,
+            )
+            return None
+        except http.client.HTTPException as exc:
+            # The bridge's port answered something that is not a usable HTTP answer (or cut it short).
+            print(
+                f"error: did not understand the bridge's answer ({_bridge_text(type(exc).__name__)}), so the outcome "
+                "is unknown: the bridge may still apply the change. Check with `nell model show`.",
+                file=sys.stderr,
+            )
+            return None
+        except OSError as exc:
+            print(
+                f"error: the connection to the bridge broke ({_bridge_text(exc)}), so the outcome is unknown: the "
+                "bridge may still apply the change. Check with `nell model show`.",
+                file=sys.stderr,
+            )
+            return None
+    finally:
+        conn.close()
+    text = raw.decode("utf-8", errors="replace")
+    try:
+        return status, json.loads(text)  # json-io: ok -- HTTP response body from the bridge
+    except ValueError:
+        return status, {"detail": text if status != 200 else "the answer was not JSON"}
+
+
+def _model_set_report(model: str, status: int, body: Any, *, via_bridge: bool) -> int:
+    from brain.persona_config import MODEL_ID_RULE
+
+    if status == 200 and not (isinstance(body, dict) and body.get("ok") is True):
+        # The endpoint's success body always carries ok: true. Anything else is not this bridge's answer.
+        detail = body.get("detail", body) if isinstance(body, dict) else body
+        print(f"error: the bridge answered 200 with an unexpected body: {_bridge_text(detail)}", file=sys.stderr)
+        return 1
+    if not isinstance(body, dict):
+        body = {"detail": body}
+    if status != 200:
+        if status == 400 and body.get("error") == "model_unavailable":
+            print(
+                f'error: Claude rejected the model "{model}". It may not exist, or your account may not have '
+                "access to it. Nothing was changed.",
+                file=sys.stderr,
+            )
+        elif status == 400 and body.get("error") == "unknown_model":
+            print(f"error: {model!r} is not a valid model: {MODEL_ID_RULE}", file=sys.stderr)
+        else:
+            detail = body.get("detail", body.get("error", body))
+            print(f"error: the bridge answered {status}: {_bridge_text(detail)}", file=sys.stderr)
+        return 1
+    checked = body.get("checked")
+    if checked is False:
+        print(
+            f"chat model is now {model}. Couldn't check it right now, so it was saved unchecked; "
+            "any problem will show in the app and the bridge log."
+        )
+    elif checked is True:
+        print(f"chat model is now {model} (checked with Claude).")
+    else:
+        print(f"chat model is now {model}.")
+    fallbacks = body.get("fallbacks")
+    for f in fallbacks if isinstance(fallbacks, list) else []:
+        if not isinstance(f, dict):
+            continue
+        print(
+            f'background jobs that use the {_bridge_text(f.get("family"))} family are using '
+            f'"{_bridge_text(f.get("using"))}", because "{_bridge_text(f.get("wanted"))}" '
+            "could not be used (it may not exist, or your account may not have access to it)."
+        )
+    unchecked = body.get("tiers_unchecked")
+    if isinstance(unchecked, list) and unchecked:
+        print(
+            "some background models were not checked yet ("
+            + ", ".join(_bridge_text(m) for m in unchecked)
+            + "); they are checked when first used."
+        )
+    print(
+        "the running bridge switched to it now."
+        if via_bridge
+        else "no bridge is running for this persona; it uses the new model when it starts."
+    )
     return 0
 
 
@@ -3521,6 +3732,14 @@ def _build_parser() -> argparse.ArgumentParser:
     m_set.add_argument("model")
     m_set.add_argument("--persona", default=None, help="Persona name (defaults to the only installed one).")
     m_set.set_defaults(func=_model_set_tier_handler)
+
+    m_chat = model_actions.add_parser(
+        "set",
+        help="Set the chat model (sonnet, opus, haiku or a full id such as claude-sonnet-5), checked like the picker does.",
+    )
+    m_chat.add_argument("model")
+    m_chat.add_argument("--persona", default=None, help="Persona name (defaults to the only installed one).")
+    m_chat.set_defaults(func=_model_set_handler)
 
     m_clear = model_actions.add_parser(
         "clear-tier", help="Remove a tier's pinned model so it follows the chat model again."

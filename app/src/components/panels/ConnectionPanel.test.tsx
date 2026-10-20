@@ -360,7 +360,9 @@ describe("ConnectionPanel — install shape gating (Phase 2)", () => {
 vi.mock("./ModelPicker", () => ({
   ModelPicker: ({
     onClose,
+    allowReapply,
   }: {
+    allowReapply?: boolean;
     onClose: (
       m?: string,
       info?: {
@@ -370,7 +372,7 @@ vi.mock("./ModelPicker", () => ({
       },
     ) => void;
   }) => (
-    <div data-testid="model-picker">
+    <div data-testid="model-picker" data-allow-reapply={String(allowReapply === true)}>
       <button onClick={() => onClose("opus")}>Apply opus</button>
       <button onClick={() => onClose("claude-sonnet-5", { checked: false })}>Apply unchecked</button>
       <button
@@ -889,5 +891,49 @@ describe("ConnectionPanel: nell shortcut button", () => {
     render(<ConnectionPanel state={baseState()} persona="test" />);
     fireEvent.click(screen.getByRole("button", { name: /install nell to ~\/\.local\/bin/i }));
     await waitFor(() => expect(screen.getByText(NO_FUSE_TEXT)).toBeInTheDocument());
+  });
+});
+
+// ── Unsupported model setting (#446) ──────────────────────────────
+
+describe("ConnectionPanel — unsupported model setting (#446)", () => {
+  const sonnetState = (extra: Partial<PersonaState> = {}) =>
+    baseState({
+      connection: { provider: "claude-cli", model: "sonnet", last_heartbeat_at: null },
+      ...extra,
+    });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getClientPlatform).mockReturnValue("macos");
+  });
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("shows a plain line for an unsupported model setting, naming the value and Sonnet", () => {
+    render(<ConnectionPanel state={sonnetState({ model_unsupported: "fable" })} persona="test" />);
+    const line = screen.getByText(/The model "fable" in your settings is not supported/);
+    expect(line).toHaveTextContent(/Sonnet is being used instead/);
+    expect(line).toHaveAttribute("role", "status");
+    expect(line.textContent).not.toContain("—");
+  });
+
+  it("shows no unsupported-model line when the field is null or missing", () => {
+    const { rerender } = render(<ConnectionPanel state={sonnetState({ model_unsupported: null })} persona="test" />);
+    expect(screen.queryByText(/is not supported/)).not.toBeInTheDocument();
+    rerender(<ConnectionPanel state={sonnetState()} persona="test" />);
+    expect(screen.queryByText(/is not supported/)).not.toBeInTheDocument();
+  });
+
+  it("tells the picker to allow re-applying the current model only while the unsupported line is shown", () => {
+    // ModelPicker is mocked in this file; its own allowReapply behaviour is tested in ModelPicker.test.tsx.
+    const { unmount } = render(<ConnectionPanel state={sonnetState({ model_unsupported: "fable" })} persona="test" />);
+    fireEvent.click(screen.getByRole("button", { name: /change model/i }));
+    expect(screen.getByTestId("model-picker")).toHaveAttribute("data-allow-reapply", "true");
+    unmount();
+    render(<ConnectionPanel state={sonnetState()} persona="test" />);
+    fireEvent.click(screen.getByRole("button", { name: /change model/i }));
+    expect(screen.getByTestId("model-picker")).toHaveAttribute("data-allow-reapply", "false");
   });
 });

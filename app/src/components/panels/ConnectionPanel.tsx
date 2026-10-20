@@ -10,6 +10,7 @@ import { ModelPicker } from "./ModelPicker";
 import {
   MODEL_UNCHECKED_MESSAGE,
   modelRejectedNowMessage,
+  modelUnsupportedMessage,
   tierFallbackMessage,
   tiersUncheckedMessage,
   type TierFallbackInfo,
@@ -139,6 +140,10 @@ export function ConnectionPanel({
     if (explainedByFallback.has(rec.model)) return [];
     return [modelRejectedNowMessage(rec.model, false)];
   });
+  // #446: a hand-edited unsupported `model` value (Sonnet runs instead). Hidden at once after the user applies a
+  // model here; the bridge's next poll then reports null.
+  const unsupportedModel = localModel === null ? (state?.model_unsupported ?? null) : null;
+  const unsupportedLine = unsupportedModel ? modelUnsupportedMessage(unsupportedModel) : null;
   const fallbackLines = fallbacks.map(tierFallbackMessage);
   const uncheckedTiers = (pendingTiersUnchecked ?? state?.tier_unconfirmed ?? []).filter((m) => m !== displayModel);
   const tiersNote = uncheckedTiers.length > 0 ? tiersUncheckedMessage(uncheckedTiers) : null;
@@ -360,6 +365,7 @@ export function ConnectionPanel({
         <ModelPicker
           current={displayModel ?? "sonnet"}
           persona={persona}
+          allowReapply={unsupportedModel !== null}
           onClose={(newModel, info) => {
             if (newModel) {
               setLocalModel(newModel);
@@ -373,6 +379,11 @@ export function ConnectionPanel({
             setShowModelPicker(false);
           }}
         />
+      )}
+      {unsupportedLine && (
+        <div role="status" style={{ fontSize: 10.5, color: "var(--crimson)", lineHeight: 1.5, marginBottom: 6, wordBreak: "break-word" }}>
+          {unsupportedLine}
+        </div>
       )}
       {modelNotice && (
         <div role="status" style={{ fontSize: 10.5, color: "var(--text-mute)", lineHeight: 1.5, marginBottom: 6 }}>

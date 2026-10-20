@@ -11,6 +11,8 @@ interface Props {
   persona: string;
   /** `info` is only passed when the bridge could not confirm the model or some tiers fell back (#440, #441). */
   onClose: (newModel?: ChatModel, info?: ModelApplyInfo) => void;
+  /** Let Apply be pressed for the model that is already current (an unsupported setting fell back to it, #446). */
+  allowReapply?: boolean;
 }
 
 export interface ModelApplyInfo {
@@ -46,7 +48,7 @@ const OPTIONS: ModelOption[] = [
   },
 ];
 
-export function ModelPicker({ current, persona, onClose }: Props) {
+export function ModelPicker({ current, persona, onClose, allowReapply = false }: Props) {
   const currentIsAlias = isChatModelAlias(current);
   const [selected, setSelected] = useState<string>(currentIsAlias ? current : CUSTOM);
   const [customText, setCustomText] = useState(currentIsAlias ? "" : current);
@@ -57,7 +59,9 @@ export function ModelPicker({ current, persona, onClose }: Props) {
   // Surrounding whitespace is dropped (a pasted id often has some); the rest is validated as written.
   const value = isCustom ? customText.trim() : selected;
   const valid = isValidChatModel(value);
-  const canApply = !busy && valid && value !== current;
+  // allowReapply: the stored model is the fallback for an unsupported setting, so applying it again is how the
+  // user replaces (and clears) that setting.
+  const canApply = !busy && valid && (value !== current || allowReapply);
   const showFormatHint = isCustom && value !== "" && !valid;
 
   async function onConfirm() {
