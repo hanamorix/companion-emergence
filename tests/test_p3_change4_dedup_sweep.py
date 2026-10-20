@@ -483,3 +483,49 @@ def test_431_near_dup_pass_keeps_judging_cand_after_a_later_row_vanished(tmp_pat
     assert _active_ids(store) == {a.id, e.id}
     assert [(m.canonical_id, m.removed_id) for m in report.merges] == [(a.id, d.id)]
     store.close()
+
+
+def test_431_near_dup_swap_keeps_judging_cand_after_the_soul_linked_row_vanished(tmp_path, caplog):
+    """#431, swapped orientation (the later row B is soul-linked, so B would be kept and the earlier A
+    dropped): B vanishes while A/B is judged. A is still alive, so it must go on to be judged against D
+    and merge it. Guards against treating the vanished kept row as if ``cand`` had gone."""
+    import logging
+
+    store = MemoryStore(tmp_path / "memories.db")
+    a, b, d = (_aged(f"Bob fed the {w}.", n) for w, n in (("ducks", 3), ("drakes", 2), ("ducklings", 1)))
+    for m in (a, b, d):
+        store.create(m)
+    _crystallise(tmp_path, b.id)
+    judge, calls = _logging_judge(store, vanish=b.id)
+
+    with caplog.at_level(logging.WARNING, logger="brain.engines.dedup_sweep"):
+        report = run_dedup_sweep(store, tmp_path, judge=judge)
+
+    assert calls == [(b.id, a.id), (d.id, a.id)]
+    assert len([r for r in caplog.records if r.levelno >= logging.WARNING]) == 1
+    assert _active_ids(store) == {a.id}
+    assert [(m.canonical_id, m.removed_id) for m in report.merges] == [(a.id, d.id)]
+    store.close()
+
+
+def test_431_near_dup_swap_stops_judging_cand_once_it_vanished(tmp_path, caplog):
+    """#431, swapped orientation: B (later) is soul-linked, so ``cand`` A is the row to drop, and A
+    vanishes while A/B is judged. Guards against going on to judge the dead A against D: the pass must
+    move straight to B, which then keeps D's pair."""
+    import logging
+
+    store = MemoryStore(tmp_path / "memories.db")
+    a, b, d = (_aged(f"Bob fed the {w}.", n) for w, n in (("ducks", 3), ("drakes", 2), ("ducklings", 1)))
+    for m in (a, b, d):
+        store.create(m)
+    _crystallise(tmp_path, b.id)
+    judge, calls = _logging_judge(store, vanish=a.id)
+
+    with caplog.at_level(logging.WARNING, logger="brain.engines.dedup_sweep"):
+        report = run_dedup_sweep(store, tmp_path, judge=judge)
+
+    assert calls == [(b.id, a.id), (d.id, b.id)]
+    assert len([r for r in caplog.records if r.levelno >= logging.WARNING]) == 1
+    assert _active_ids(store) == {b.id}
+    assert [(m.canonical_id, m.removed_id) for m in report.merges] == [(b.id, d.id)]
+    store.close()
