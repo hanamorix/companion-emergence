@@ -467,8 +467,8 @@ def start_service(*, persona: str) -> subprocess.CompletedProcess[str]:
 def uninstall_service(*, persona: str, keep_xml: bool = False) -> Path:
     """Remove the scheduled task; optionally keep the cached XML."""
     paths = paths_for_persona(persona)
-    # /End first to stop a running instance (best-effort), then /Delete.
-    run_schtasks(["/End", "/TN", paths.task_name])
+    # #456 (C54): no /End here. The CLI stops a running bridge first through its own request and watcher; /End is only
+    # the kill path's step after an ignored hard exit (it would cut in-flight work).
     run_schtasks(["/Delete", "/TN", paths.task_name, "/F"])
     if not keep_xml and paths.xml_path.exists():
         paths.xml_path.unlink()

@@ -339,6 +339,12 @@ def _service_install_handler(args: argparse.Namespace) -> int:
     if backend is None:
         return 1
 
+    # #456 (C58 d): on a terminal, an install over a running bridge first stops it through the stop watcher.
+    from brain.bridge import daemon as _daemon
+    from brain.service import lifecycle as _lifecycle
+
+    _lifecycle.interactive_stop = lambda persona: _daemon._stop_before_service_change(persona, 180.0)
+
     try:
         nell_path = backend.resolve_nell_path(args.nell_path)
         if args.dry_run:
@@ -367,11 +373,22 @@ def _service_install_handler(args: argparse.Namespace) -> int:
 
 
 def _service_uninstall_handler(args: argparse.Namespace) -> int:
-    """Stop/remove the persona OS service."""
+    """Stop/remove the persona OS service.
+
+    #456 (C54): a running bridge is first asked to stop (the shutdown request and the stop watcher, with the hard-exit
+    offer on a terminal); without a terminal, a bridge still stopping after --timeout leaves the service installed.
+    """
     backend = _service_backend("uninstall")
     if backend is None:
         return 1
 
+    from brain.bridge import daemon as _daemon
+    from brain.service import lifecycle as _lifecycle
+
+    if _lifecycle.bridge_running(args.persona):
+        if not _daemon._stop_before_service_change(args.persona, float(getattr(args, "timeout", 180.0))):
+            print("service uninstall: the bridge is still stopping; the service stays installed", file=sys.stderr)
+            return 1
     try:
         service_path = backend.uninstall_service(persona=args.persona, keep_plist=args.keep_plist)
     except _service_backend_errors(backend) as exc:
@@ -3240,7 +3257,18 @@ def _build_parser() -> argparse.ArgumentParser:
     s_stop = s_actions.add_parser("stop", help="Stop the bridge daemon.")
     _add_persona_arg(s_stop)
     s_stop.add_argument("--timeout", type=float, default=180.0)
-    s_stop.add_argument("--force", action="store_true", help="force-terminate a wedged bridge (Windows last resort; skips cleanup, recovery snapshots on next start)")
+    s_stop.add_argument("--force", action="store_true", help="end a bridge whose stop request fails (Windows last resort; uses the same kill as --kill)")
+    s_stop.add_argument(
+        "--kill",
+        action="store_true",
+        help="end the bridge and every process it started at once (identity-checked; the next start picks up anything "
+        "left unfinished)",
+    )
+    s_stop.add_argument(
+        "--skip-hard-exit-request",
+        action="store_true",
+        help="with --kill: do not ask a service-run bridge for a hard exit first (used after a hard exit was ignored)",
+    )
     s_stop.set_defaults(func=cmd_stop)
 
     s_status = s_actions.add_parser("status", help="Show bridge daemon status.")
@@ -3361,6 +3389,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--keep-plist",
         action="store_true",
         help="Boot out the service but leave the plist file in place.",
+    )
+    svc_uninstall.add_argument(
+        "--timeout",
+        type=float,
+        default=180.0,
+        help="how long to wait for a running bridge to stop before giving up (no terminal) or escalating",
     )
     svc_uninstall.set_defaults(func=_service_uninstall_handler)
 

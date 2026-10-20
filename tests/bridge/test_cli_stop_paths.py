@@ -127,7 +127,7 @@ def test_a_proven_pre_pr_bridge_is_asked_then_killed_with_its_tree(pd, tmp_path,
         (d / "__init__.py").write_text("")
     (stub_root / "runner.py").write_text(_STUB_RUNNER)
     proc = subprocess.Popen([sys.executable, "-m", "brain.bridge.runner", "--persona-dir", str(pd)],
-                            env=dict(os.environ, PYTHONPATH=str(tmp_path / "stubpkg")))
+                            env=dict(os.environ, PYTHONPATH=str(tmp_path / "stubpkg")), cwd=str(tmp_path))
     try:
         deadline = time.monotonic() + 30
         while not (pd / "stub-child").exists():

@@ -33,6 +33,15 @@ def _records_here_prove_they_are_bridges(monkeypatch):
     from brain.bridge import state_file
 
     monkeypatch.setattr(state_file, "prove_bridge_cmdline", lambda *a, **k: True)
+    # #456: a record with an identity token stands for a NEW bridge; its liveness follows the patched pid_is_alive.
+    from brain import process_identity as _pi
+
+    monkeypatch.setattr(_pi, "matches", lambda pid, tok: "alive" if state_file.pid_is_alive(pid) else "gone")
+
+
+def _new(pid: int) -> dict:
+    """The identity fields of a NEW bridge's record (#456: the stop paths below are the new bridge's)."""
+    return {"pid_token": f"linux:test:{pid}:1", "identity": "token"}
 
 def _args(persona: str, **kw) -> argparse.Namespace:
     ns = argparse.Namespace(persona=persona, idle_shutdown=30, client_origin="cli", timeout=180.0)
@@ -1148,6 +1157,7 @@ def test_cmd_stop_falls_back_to_sigterm_on_posix_when_http_fails(
             stopped_at=None,
             shutdown_clean=False,
             client_origin="cli",
+            **_new(33333),
         ),
     )
 
@@ -1177,7 +1187,7 @@ def test_cmd_stop_falls_back_to_sigterm_on_posix_when_http_fails(
     assert killed["pid"] == 33333
     assert killed["sig"] == _signal.SIGTERM
     assert rc == 0
-    assert "bridge stopped" in capsys.readouterr().out
+    assert "Everything has stopped." in capsys.readouterr().out  # #456: the stop watcher's words
 
 
 def test_cmd_stop_returns_1_when_timeout_exceeded(
@@ -1202,20 +1212,31 @@ def test_cmd_stop_returns_1_when_timeout_exceeded(
             stopped_at=None,
             shutdown_clean=False,
             client_origin="cli",
+            **_new(44444),
         ),
     )
 
     # Stays alive forever.
     monkeypatch.setattr(state_file, "pid_is_alive", lambda _pid: True)
     _pin_daemon_posix(monkeypatch, lambda pid, sig: None)
-    monkeypatch.setattr("brain.bridge.daemon.time.sleep", lambda _s: None)
-    # Force the deadline to be exceeded immediately.
-    times = iter([0.0, 10.0, 20.0])
-    monkeypatch.setattr("brain.bridge.daemon.time.time", lambda: next(times))
+    # #456: the stop watcher's clock, advanced 10 s per poll so the --timeout passes at once (no terminal: no prompt).
+    from brain.bridge import stop_watch
+
+    class _FastClock:
+        t = 0.0
+
+        def now(self):
+            return self.t
+
+        def sleep(self, dt):
+            self.t += 10.0
+
+    monkeypatch.setattr(stop_watch, "_clock", _FastClock())
+    monkeypatch.setattr(stop_watch, "_interactive", lambda: False)
 
     rc = daemon.cmd_stop(_args("nell", timeout=1.0))
     assert rc == 1
-    assert "did not stop within" in capsys.readouterr().err
+    assert "still stopping after" in capsys.readouterr().out
 
 
 def test_cmd_stop_handles_processlookuperror_during_kill(
@@ -1241,6 +1262,7 @@ def test_cmd_stop_handles_processlookuperror_during_kill(
             stopped_at=None,
             shutdown_clean=False,
             client_origin="cli",
+            **_new(55555),
         ),
     )
     monkeypatch.setattr(state_file, "pid_is_alive", lambda _pid: True)
@@ -1457,14 +1479,15 @@ def test_cmd_stop_posts_shutdown_endpoint_instead_of_sigterm(
             shutdown_clean=False,
             client_origin="cli",
             auth_token="secret",
+            **_new(33333),
         ),
     )
 
     alive = {"value": True}
     calls: list[tuple[str, dict]] = []
 
-    def fake_post(url, *, headers, timeout):
-        calls.append((url, {"headers": headers, "timeout": timeout}))
+    def fake_post(url, *, headers, timeout, json=None):
+        calls.append((url, {"headers": headers, "timeout": timeout, "json": json}))
         alive["value"] = False
 
         class Response:
@@ -1486,10 +1509,10 @@ def test_cmd_stop_posts_shutdown_endpoint_instead_of_sigterm(
     assert calls == [
         (
             "http://127.0.0.1:51000/supervisor/shutdown",
-            {"headers": {"Authorization": "Bearer secret"}, "timeout": 3.0},
+            {"headers": {"Authorization": "Bearer secret"}, "timeout": 3.0, "json": {"reason": "user_stop"}},
         )
     ]
-    assert "bridge stopped" in capsys.readouterr().out
+    assert "Everything has stopped." in capsys.readouterr().out  # #456: the stop watcher's words
 
 
 def test_cmd_stop_on_windows_does_not_fallback_to_sigterm_when_http_fails(
@@ -1512,6 +1535,7 @@ def test_cmd_stop_on_windows_does_not_fallback_to_sigterm_when_http_fails(
             shutdown_clean=False,
             client_origin="task-scheduler",
             auth_token="secret",
+            **_new(44444),
         ),
     )
 
@@ -1848,7 +1872,7 @@ def test_cmd_stop_on_windows_with_force_terminates(
     persona_dir = tmp_path / "home" / "personas" / "nell"
     state_file.write(persona_dir, state_file.BridgeState(
         persona="nell", pid=44444, port=51000, started_at="2026-05-08T00:00:00+00:00",
-        stopped_at=None, shutdown_clean=False, client_origin="task-scheduler", auth_token="secret"))
+        stopped_at=None, shutdown_clean=False, client_origin="task-scheduler", auth_token="secret", **_new(44444)))
     # Patch get_persona_dir directly so pathlib doesn't try to construct a
     # WindowsPath on Python 3.13 macOS when os.name is patched to "nt".
     monkeypatch.setattr(daemon.os, "name", "nt")
@@ -1857,15 +1881,19 @@ def test_cmd_stop_on_windows_with_force_terminates(
     monkeypatch.setattr(state_file, "pid_is_alive", lambda _pid: alive["v"])
     monkeypatch.setattr("brain.bridge.daemon.httpx.post", lambda *_a, **_kw: (_ for _ in ()).throw(httpx.ConnectError("no route")))
     killed = []
-    def fake_kill(pid, sig):
-        killed.append(pid)
+    # #456 (D10): Windows --force now goes through the identity-checked kill helper (tree, exit code 0).
+    from brain.bridge import kill as kill_mod
+
+    def fake_kill_bridge(pd, persona=None, **kw):
+        killed.append(pd)
         alive["v"] = False
-    monkeypatch.setattr("brain.bridge.daemon.os.kill", fake_kill)
-    monkeypatch.setattr("brain.bridge.daemon.time.sleep", lambda _s: None)
+        return kill_mod.KillResult("killed", "bridge killed")
+
+    monkeypatch.setattr(kill_mod, "kill_bridge", fake_kill_bridge)
     rc = daemon.cmd_stop(_args("nell", timeout=5.0, force=True))
     assert rc == 0
-    assert killed == [44444]
-    assert "forcing Windows termination" in capsys.readouterr().err
+    assert killed == [persona_dir]
+    assert "forcing termination" in capsys.readouterr().err
 
 
 # ---------- cmd_start: early exit when its own child already exited ----------

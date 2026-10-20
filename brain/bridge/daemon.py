@@ -25,6 +25,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 
@@ -520,22 +521,64 @@ def cmd_run(args) -> int:
         release_lock(persona_dir, fd)
 
 
-def _request_shutdown_via_http(s: state_file.BridgeState, *, timeout: float = 3.0) -> None:
+def _request_shutdown_via_http(
+    s: state_file.BridgeState, *, timeout: float = 3.0, reason: str | None = None
+) -> httpx.Response:
+    """POST /supervisor/shutdown. Returns the response (202 = the stop began; 503 ``bridge_stopping`` = it had begun
+    already); raises on a transport failure (the listener closes once a stop is under way)."""
     if s.port is None:
         raise RuntimeError("bridge state missing port")
     headers = {"Authorization": f"Bearer {s.auth_token}"} if s.auth_token else {}
-    r = httpx.post(
+    return httpx.post(
         f"http://127.0.0.1:{s.port}/supervisor/shutdown",
         headers=headers,
+        json={"reason": reason} if reason else None,
         timeout=timeout,
     )
-    r.raise_for_status()
+
+
+# A pre-PR bridge (no identity token, proven by its command line) gets the old request and this long to go before the
+# kill helper ends it with its tree (D22). The value is the app's existing request budget before its kill
+# (TIMEOUT_SHUTDOWN_MS, app/src/hooks/useRestartBridge.ts), so a pre-PR bridge is treated exactly as the app treats it.
+_PRE_PR_REQUEST_BUDGET_S = 3.0
+
+
+def _stop_began(s: state_file.BridgeState, persona_dir: Path, response: httpx.Response | None) -> bool:
+    from brain.bridge import shutdown_progress
+
+    if response is not None:
+        if response.status_code == 202:
+            return True
+        try:
+            if response.status_code == 503 and response.json().get("code") == "bridge_stopping":
+                return True
+        except ValueError:
+            pass
+    rec = shutdown_progress.read_record(persona_dir, shutdown_progress.PROGRESS_FILENAME)
+    if shutdown_progress.names_this_bridge(rec, s.pid, s.pid_token):
+        return True
+    cur = state_file.read(persona_dir)
+    return bool(cur is not None and cur.pid == s.pid and cur.phase == "stopping")
+
+
+def _print_kill_result(result) -> int:  # noqa: ANN001
+    print(result.message)
+    return 0 if result.outcome in ("killed", "not_running") else 1
 
 
 def cmd_stop(args) -> int:
+    """`nell supervisor stop` (#456 Q-A, D16, D22): ask the bridge to stop, then watch until it is gone.
+
+    ``--kill``: the kill helper at once. A pre-PR bridge (no identity token): the old request, then the kill helper
+    after a few seconds. A stale record: "not running". If the request fails and no stop is recorded: POSIX sends
+    SIGTERM when the identity holds; Windows refuses unless ``--force`` (then the kill helper).
+    """
+    from brain.bridge import kill as kill_mod
+    from brain.bridge import stop_watch
     from brain.paths import get_persona_dir
 
     persona_dir = get_persona_dir(args.persona)
+    timeout = float(getattr(args, "timeout", stop_watch.HARD_EXIT_OFFER_AFTER_S))
     s = state_file.read(persona_dir)
     if s is None or s.pid is None:
         print("bridge not running")
@@ -546,43 +589,86 @@ def cmd_stop(args) -> int:
         print("bridge not running (stale record)")
         _clear_stale_record(persona_dir, s)
         return 0
-    try:
-        _request_shutdown_via_http(s)
-    except Exception as exc:
+    if getattr(args, "kill", False):
         if live != state_file.ALIVE:
-            print(f"bridge identity could not be confirmed; not signalling pid {s.pid}: {exc}", file=sys.stderr)
+            print("bridge identity could not be confirmed; not killing", file=sys.stderr)
+            return 1
+        return _print_kill_result(
+            kill_mod.kill_bridge(
+                persona_dir, timeout=timeout, skip_hard_exit_request=bool(getattr(args, "skip_hard_exit_request", False))
+            )
+        )
+    if state_file.is_legacy(s):
+        return _stop_pre_pr(persona_dir, s, timeout)
+
+    response = None
+    try:
+        response = _request_shutdown_via_http(s, reason="user_stop")
+    except Exception as exc:  # noqa: BLE001 - a closed listener: the stop may have begun already (attach)
+        failure = exc
+    else:
+        failure = None
+    if not _stop_began(s, persona_dir, response):
+        if live != state_file.ALIVE:
+            print(f"bridge identity could not be confirmed; not signalling pid {s.pid}: {failure}", file=sys.stderr)
             return 1
         if os.name == "nt":
             if getattr(args, "force", False):
-                print(
-                    "WARNING: forcing Windows termination; Python cleanup will NOT run. "
-                    "Recovery will snapshot active sessions non-destructively on next start.",
-                    file=sys.stderr,
-                )
-                if not _kill_if_alive(s.pid, signal.SIGTERM):  # TerminateProcess on Windows — explicit, logged, dirty by design
-                    print("bridge not running")
-                    return 0
-            else:
-                print(
-                    f"bridge shutdown endpoint unreachable; refusing Windows hard kill because it would bypass cleanup: {exc}\n"
-                    "If the bridge is wedged, re-run with --force to terminate it (recovery will snapshot sessions on next start).",
-                    file=sys.stderr,
-                )
-                return 1
-        else:
-            logger.warning("shutdown endpoint failed; falling back to SIGTERM on POSIX", exc_info=True)
-            if not _kill_if_alive(s.pid, signal.SIGTERM):
-                print("bridge not running")
-                return 0
-
-    deadline = time.time() + args.timeout
-    while time.time() < deadline:
-        time.sleep(0.2)
-        if state_file.bridge_liveness(s, persona_dir) == state_file.GONE:
-            print(f"bridge stopped (was pid {s.pid})")
+                print("WARNING: forcing termination of a bridge that does not answer.", file=sys.stderr)
+                return _print_kill_result(kill_mod.kill_bridge(persona_dir, timeout=timeout))
+            print(
+                f"bridge shutdown endpoint unreachable; not killing it: {failure}\n"
+                "If the bridge is wedged, re-run with --force (or --kill) to end it.",
+                file=sys.stderr,
+            )
+            return 1
+        logger.warning("shutdown endpoint failed; falling back to SIGTERM on POSIX: %s", failure)
+        if not _kill_if_alive(s.pid, signal.SIGTERM):
+            print("bridge not running")
             return 0
-    print(f"bridge did not stop within {args.timeout}s", file=sys.stderr)
-    return 1
+    return stop_watch.watch_stop(
+        persona_dir,
+        pid=s.pid,
+        token=s.pid_token,
+        timeout=timeout,
+        interactive=stop_watch._interactive(),
+        now=stop_watch._clock.now,
+        sleep=stop_watch._clock.sleep,
+        prompt=stop_watch._prompt,
+    )
+
+
+def _stop_pre_pr(persona_dir: Path, s: state_file.BridgeState, timeout: float) -> int:
+    """A proven pre-PR bridge (D22): the old request (skipped when its listener is closed), up to the app's budget,
+    then the kill helper (with its tree). No display, no offer."""
+    from brain.bridge import kill as kill_mod
+
+    try:
+        _request_shutdown_via_http(s)
+    except Exception:  # noqa: BLE001 - listener already closed: go straight to the wait
+        pass
+    deadline = time.time() + _PRE_PR_REQUEST_BUDGET_S
+    while time.time() < deadline:
+        if state_file.bridge_liveness(s, persona_dir) == state_file.GONE:
+            break
+        time.sleep(0.2)
+    if state_file.bridge_liveness(s, persona_dir) == state_file.ALIVE:
+        result = kill_mod.kill_bridge(persona_dir, timeout=timeout)
+        if result.outcome not in ("killed", "not_running"):
+            print(result.message, file=sys.stderr)
+            return 1
+    print("Stopped the previous version of the bridge. The next start will pick up anything left unfinished.")
+    return 0
+
+
+def _stop_before_service_change(persona: str, timeout: float) -> bool:
+    """Stop a running bridge before a service uninstall / install (C54, C58 d): the shutdown request and the watcher.
+    True once it has stopped; False when it is still stopping (no terminal, after ``timeout``)."""
+    rc = cmd_stop(SimpleNamespace(persona=persona, timeout=timeout, force=False, kill=False,
+                                  skip_hard_exit_request=False))
+    from brain.paths import get_persona_dir
+
+    return rc == 0 and state_file.liveness(get_persona_dir(persona)) != state_file.ALIVE
 
 
 def _clear_stale_record(persona_dir: Path, s: state_file.BridgeState) -> None:
@@ -727,20 +813,10 @@ def cmd_tail(args) -> int:
 
 
 def cmd_restart(args) -> int:
-    """Stop the bridge, then start it again. Two-phase, gated on stop success.
+    """Stop the bridge, then start it again, only after the old bridge is gone (#456 C16 h).
 
-    `cmd_stop` uses an endpoint-first stop (POST /supervisor/shutdown) with
-    a POSIX SIGTERM fallback on non-Windows platforms. On Windows, if the
-    shutdown endpoint is unreachable, `--force` is required as an explicit
-    escape hatch (dirty termination via TerminateProcess; recovery will
-    snapshot active sessions non-destructively on next start).
-
-    `cmd_stop` collapses "no bridge was running" and "clean endpoint stop"
-    into exit code 0; it returns 1 only when the bridge could not be stopped
-    (endpoint unreachable on Windows without --force, or poll timeout). Restart
-    proceeds to start ONLY when stop returned 0 — never over a wedged bridge.
-    Restart's exit code is whatever `cmd_start` returned (0/1/2) on the
-    success path, or stop's exit code on the bail path.
+    ``cmd_stop`` returns 0 only once the old bridge (its pid + token) is gone, or when none was running; restart then
+    starts. Any other result (still stopping without a terminal, a refused stop) aborts the restart with that code.
     """
     print("stopping bridge...")
     stop_rc = cmd_stop(args)

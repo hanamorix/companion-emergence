@@ -24,7 +24,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any
 
 from brain.bridge import cli_throttle
@@ -212,7 +212,8 @@ def start_tracked_thread(
 
 
 def path(persona_dir: Path, filename: str) -> Path:
-    return Path(persona_dir) / filename
+    base = persona_dir if isinstance(persona_dir, PurePath) else Path(persona_dir)
+    return base / filename
 
 
 def write_record(persona_dir: Path, filename: str, record: dict[str, Any]) -> None:
