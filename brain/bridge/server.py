@@ -49,7 +49,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, StrictBool
 
 from brain import __version__ as _brain_version
-from brain import prompt_strings, tunables
+from brain import tunables
 from brain.bridge import cli_throttle, events, model_error, provider_auth, shutdown_progress
 from brain.bridge.chat import (
     ChatMessage,
@@ -87,11 +87,6 @@ from brain.tools.dispatch import dispatch
 from brain.update.overlay import loaded_overlay
 
 logger = logging.getLogger(__name__)
-
-# Text externalized to prompt_strings.toml [bridge.server] (issue #129 stage 2b).
-_HEARTBEAT_CLOSE_SYSTEM_PROMPT_SEGMENTS = prompt_strings.register_segments(
-    "bridge.server.heartbeat_close_system_prompt_segments"
-)
 
 # Browser/WebView origins that are allowed to call the localhost bridge.
 # HTTP routes are still bearer-token protected; CORS is only the browser's
