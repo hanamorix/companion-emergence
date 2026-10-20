@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from brain.health.anomaly import AlarmEntry
-from brain.health.json_io import Recovery, iter_jsonl
+from brain.health.json_io import Recovery, iter_jsonl, read_jsonl_tail
 from brain.utils.time import parse_iso_utc
 
 _IDENTITY_FILES = frozenset(
@@ -21,6 +21,51 @@ _IDENTITY_FILES = frozenset(
 )
 
 WINDOW_DAYS = 7
+# This many anomalies (or kept-aside rows) in the window = recurring after adaptation: an alarm.
+RECURRING_THRESHOLD = 6
+
+# The two files the consolidation gate sets rows aside in (#470 review item 5). Nothing else reads them, so without this a
+# gate bug that quarantines every candidate is invisible. The names are the producers' (`engines.consolidation` for the
+# quarantine, `memory.pending` for the damaged lines); a test pins that they are equal. They are literals here, not imports,
+# so `health` does not depend on `memory` and `scripts/organ_wireback_audit.py` (one file at a time) sees the read.
+QUARANTINE_FILENAME = "consolidation_quarantine.jsonl"
+DAMAGED_FILENAME = "pending_candidates.damaged.jsonl"
+
+
+def _recent_stamps(path: Path, field: str, since: datetime) -> list[datetime]:
+    """The newest ``RECURRING_THRESHOLD`` stamps of the rows of an append-only, time-ordered JSONL file that are newer than
+    ``since`` (oldest first); fewer when the window holds fewer rows.
+
+    The alarm needs only to know whether the threshold is reached, so the read stops there: it goes backwards in bounded
+    chunks, starting from the threshold and doubling only to step over rows it cannot use, and quits as soon as it holds the
+    threshold's worth. The cost follows the threshold, not the window (a gate bug that quarantines tens of thousands of rows
+    makes the window the whole file, and this runs on every ``/health`` poll and heartbeat tick) and not the file's history
+    (it has no rotation). It also stops at the first row at or before ``since`` and at the start of the file. A row without a
+    usable stamp, a damaged line and an unreadable file count for nothing and raise nothing (``read_jsonl_tail`` skips and
+    reports them).
+    """
+    n = RECURRING_THRESHOLD
+    previous = -1
+    while True:
+        stamps: list[datetime] = []
+        boundary = False
+        rows = read_jsonl_tail(path, n)
+        for row in rows:
+            try:
+                stamp = parse_iso_utc(row[field])
+            except (KeyError, ValueError, TypeError, AttributeError):
+                continue
+            if stamp > since:
+                stamps.append(stamp)
+            else:
+                boundary = True
+        if len(stamps) >= RECURRING_THRESHOLD:
+            return stamps[-RECURRING_THRESHOLD:]
+        # Stop at the boundary, or when a doubled read found no more records than the last one (the start of the file).
+        if boundary or len(rows) == previous:
+            return stamps
+        previous = len(rows)
+        n *= 2
 
 
 def compute_pending_alarms(persona_dir: Path) -> list[AlarmEntry]:
@@ -31,6 +76,7 @@ def compute_pending_alarms(persona_dir: Path) -> list[AlarmEntry]:
     # First pass: collect all anomalies + acknowledgments in window.
     anomalies: list[dict] = []
     acknowledged_files: set[str] = set()
+    acknowledged_at: dict[str, datetime] = {}  # file name -> the latest acknowledgement in the window
 
     for entry in iter_jsonl(audit_path, recover=Recovery.RAISE):
         try:
@@ -45,6 +91,7 @@ def compute_pending_alarms(persona_dir: Path) -> list[AlarmEntry]:
             for f in ack:
                 if isinstance(f, str):
                     acknowledged_files.add(f)
+                    acknowledged_at[f] = max(ts, acknowledged_at.get(f, ts))
 
         for a in entry.get("anomalies") or []:
             if isinstance(a, dict):
@@ -72,7 +119,7 @@ def compute_pending_alarms(persona_dir: Path) -> list[AlarmEntry]:
                 is_alarm = True
                 break
         # ≥6 anomalies in window = recurring-after-adaptation
-        if len(anoms) >= 6:
+        if len(anoms) >= RECURRING_THRESHOLD:
             is_alarm = True
 
         if is_alarm:
@@ -84,6 +131,26 @@ def compute_pending_alarms(persona_dir: Path) -> list[AlarmEntry]:
                     kind=kind,
                     first_seen_at=first_seen,
                     occurrences_in_window=len(anoms),
+                )
+            )
+
+    # The gate's kept-aside files: an alarm when the rows in the window reach the recurring threshold. An acknowledgement
+    # counts only the rows after it, so a gate bug that keeps quarantining after the user looked raises it again. The count
+    # is "at least the threshold" (see _recent_stamps), and first_seen_at the oldest of the newest rows counted.
+    kept_aside = (  # (file, the field that stamps a row, the alarm kind)
+        (QUARANTINE_FILENAME, "quarantined_at", "quarantined_candidates"),
+        (DAMAGED_FILENAME, "kept_at", "damaged_queue_lines"),
+    )
+    for name, field, kind in kept_aside:
+        stamps = _recent_stamps(persona_dir / name, field, max(cutoff, acknowledged_at.get(name, cutoff)))
+        if len(stamps) >= RECURRING_THRESHOLD:
+            alarms.append(
+                AlarmEntry(
+                    file=name,
+                    kind=kind,
+                    first_seen_at=min(stamps),
+                    occurrences_in_window=len(stamps),
+                    at_least=True,
                 )
             )
 

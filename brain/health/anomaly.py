@@ -61,6 +61,9 @@ class AlarmEntry:
     kind: str
     first_seen_at: datetime
     occurrences_in_window: int
+    # True when ``occurrences_in_window`` is a floor, not the exact count (and ``first_seen_at`` the oldest row counted, not
+    # the oldest in the window): the reader stopped once the alarm had what it needed. Anomaly alarms are exact.
+    at_least: bool = False
 
 
 class BrainIntegrityError(Exception):
