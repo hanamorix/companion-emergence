@@ -32,13 +32,17 @@ QUARANTINE_FILENAME = "consolidation_quarantine.jsonl"
 DAMAGED_FILENAME = "pending_candidates.damaged.jsonl"
 
 
-def _stamps_after(path: Path, field: str, since: datetime) -> list[datetime]:
-    """The stamps of the rows of an append-only, time-ordered JSONL file that are newer than ``since``.
+def _recent_stamps(path: Path, field: str, since: datetime) -> list[datetime]:
+    """The newest ``RECURRING_THRESHOLD`` stamps of the rows of an append-only, time-ordered JSONL file that are newer than
+    ``since`` (oldest first); fewer when the window holds fewer rows.
 
-    Read backwards in bounded chunks, starting from the alarm threshold and doubling, until a row at or before ``since`` turns up
-    or the file is exhausted: the cost follows the rows inside the window, not the history of the file (the quarantine has no
-    rotation and ``/health`` reads this on its restart poll). A row without a usable stamp, a damaged line and an unreadable
-    file count for nothing and raise nothing (``read_jsonl_tail`` skips and reports them).
+    The alarm needs only to know whether the threshold is reached, so the read stops there: it goes backwards in bounded
+    chunks, starting from the threshold and doubling only to step over rows it cannot use, and quits as soon as it holds the
+    threshold's worth. The cost follows the threshold, not the window (a gate bug that quarantines tens of thousands of rows
+    makes the window the whole file, and this runs on every ``/health`` poll and heartbeat tick) and not the file's history
+    (it has no rotation). It also stops at the first row at or before ``since`` and at the start of the file. A row without a
+    usable stamp, a damaged line and an unreadable file count for nothing and raise nothing (``read_jsonl_tail`` skips and
+    reports them).
     """
     n = RECURRING_THRESHOLD
     previous = -1
@@ -55,6 +59,8 @@ def _stamps_after(path: Path, field: str, since: datetime) -> list[datetime]:
                 stamps.append(stamp)
             else:
                 boundary = True
+        if len(stamps) >= RECURRING_THRESHOLD:
+            return stamps[-RECURRING_THRESHOLD:]
         # Stop at the boundary, or when a doubled read found no more records than the last one (the start of the file).
         if boundary or len(rows) == previous:
             return stamps
@@ -129,16 +135,23 @@ def compute_pending_alarms(persona_dir: Path) -> list[AlarmEntry]:
             )
 
     # The gate's kept-aside files: an alarm when the rows in the window reach the recurring threshold. An acknowledgement
-    # counts only the rows after it, so a gate bug that keeps quarantining after the user looked raises it again.
+    # counts only the rows after it, so a gate bug that keeps quarantining after the user looked raises it again. The count
+    # is "at least the threshold" (see _recent_stamps), and first_seen_at the oldest of the newest rows counted.
     kept_aside = (  # (file, the field that stamps a row, the alarm kind)
         (QUARANTINE_FILENAME, "quarantined_at", "quarantined_candidates"),
         (DAMAGED_FILENAME, "kept_at", "damaged_queue_lines"),
     )
     for name, field, kind in kept_aside:
-        stamps = _stamps_after(persona_dir / name, field, max(cutoff, acknowledged_at.get(name, cutoff)))
+        stamps = _recent_stamps(persona_dir / name, field, max(cutoff, acknowledged_at.get(name, cutoff)))
         if len(stamps) >= RECURRING_THRESHOLD:
             alarms.append(
-                AlarmEntry(file=name, kind=kind, first_seen_at=min(stamps), occurrences_in_window=len(stamps))
+                AlarmEntry(
+                    file=name,
+                    kind=kind,
+                    first_seen_at=min(stamps),
+                    occurrences_in_window=len(stamps),
+                    at_least=True,
+                )
             )
 
     return alarms

@@ -1193,7 +1193,7 @@ def _health_show_handler(args: argparse.Namespace) -> int:
         date_str = alarm.first_seen_at.strftime("%Y-%m-%d")
         print(
             f"    {alarm.file}: {alarm.kind} {date_str} "
-            f"({alarm.occurrences_in_window} occurrences in window)"
+            f"({'at least ' if alarm.at_least else ''}{alarm.occurrences_in_window} occurrences in window)"
         )
 
     print(f"  Recent self-treatments (last 7 days): {len(recent_treatments)}")
