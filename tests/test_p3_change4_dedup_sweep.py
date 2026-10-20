@@ -421,10 +421,16 @@ def test_431_near_dup_pass_skips_a_pair_whose_survivor_vanished_mid_pass(tmp_pat
     store.close()
 
 
-def test_431_near_dup_pass_stops_judging_a_cand_that_vanished(tmp_path, caplog):
-    """#431: once the pass finds that ``cand`` (the earlier row of a pair) is gone, it must stop
-    comparing it. Guards against judging the dead row against every remaining row, which costs a judge
-    call and logs another skip warning per pair."""
+# How another writer takes a row out of play mid-pass: deleted (#431) or deactivated (#505).
+_VANISH = {"delete": MemoryStore.hard_delete, "deactivate": MemoryStore.deactivate}
+
+
+@pytest.mark.parametrize("how", sorted(_VANISH))
+def test_431_near_dup_pass_stops_judging_a_cand_that_vanished(tmp_path, caplog, how):
+    """#431/#505: once the pass finds that ``cand`` (the earlier row of a pair) is deleted or
+    deactivated, it must stop comparing it. Guards against judging the dead row against every remaining
+    row, which costs a judge call and logs another skip warning per pair (and, for a deactivated row,
+    could merge later rows into it)."""
     import logging
 
     store = MemoryStore(tmp_path / "memories.db")
@@ -438,7 +444,7 @@ def test_431_near_dup_pass_stops_judging_a_cand_that_vanished(tmp_path, caplog):
     def _judge(candidate: Memory, canonical: Memory) -> str:
         calls.append((candidate.id, canonical.id))
         if len(calls) == 1:
-            store.hard_delete(a.id)  # another writer removes A while its first pair is judged
+            _VANISH[how](store, a.id)  # another writer removes A while its first pair is judged
         return "duplicate"
 
     with caplog.at_level(logging.WARNING, logger="brain.engines.dedup_sweep"):
@@ -452,15 +458,22 @@ def test_431_near_dup_pass_stops_judging_a_cand_that_vanished(tmp_path, caplog):
     store.close()
 
 
-def _logging_judge(store: MemoryStore, *, vanish: str | None = None, distinct: set[str] = frozenset()):
-    """A judge that records every (candidate, canonical) call, deletes ``vanish`` from the store during
-    the first call (a concurrent writer), and calls a pair distinct when either id is in ``distinct``."""
+def _logging_judge(
+    store: MemoryStore,
+    *,
+    vanish: str | None = None,
+    how: str = "delete",
+    distinct: set[str] = frozenset(),
+):
+    """A judge that records every (candidate, canonical) call, takes ``vanish`` out of play during the
+    first call (``how``: deleted or deactivated, as a concurrent writer would), and calls a pair
+    distinct when either id is in ``distinct``."""
     calls: list[tuple[str, str]] = []
 
     def _judge(candidate: Memory, canonical: Memory) -> str:
         calls.append((candidate.id, canonical.id))
         if vanish is not None and len(calls) == 1:
-            store.hard_delete(vanish)
+            _VANISH[how](store, vanish)
         return "distinct" if {candidate.id, canonical.id} & distinct else "duplicate"
 
     return _judge, calls
@@ -488,8 +501,9 @@ def test_431_near_dup_pass_keeps_judging_cand_after_a_later_row_vanished(tmp_pat
     store.close()
 
 
-def test_431_near_dup_swap_keeps_judging_cand_after_the_soul_linked_row_vanished(tmp_path, caplog):
-    """#431, swapped orientation (the later row B is soul-linked, so B would be kept and the earlier A
+@pytest.mark.parametrize("how", sorted(_VANISH))
+def test_431_near_dup_swap_keeps_judging_cand_after_the_soul_linked_row_vanished(tmp_path, caplog, how):
+    """#431/#505 (deleted or deactivated), swapped orientation (the later row B is soul-linked, so B would be kept and the earlier A
     dropped): B vanishes while A/B is judged. A is still alive, so it must go on to be judged against D
     and merge it. Guards against treating the vanished kept row as if ``cand`` had gone."""
     import logging
@@ -499,7 +513,7 @@ def test_431_near_dup_swap_keeps_judging_cand_after_the_soul_linked_row_vanished
     for m in (a, b, d):
         store.create(m)
     _crystallise(tmp_path, b.id)
-    judge, calls = _logging_judge(store, vanish=b.id)
+    judge, calls = _logging_judge(store, vanish=b.id, how=how)
 
     with caplog.at_level(logging.WARNING, logger="brain.engines.dedup_sweep"):
         report = run_dedup_sweep(store, tmp_path, judge=judge)
@@ -511,8 +525,9 @@ def test_431_near_dup_swap_keeps_judging_cand_after_the_soul_linked_row_vanished
     store.close()
 
 
-def test_431_near_dup_swap_stops_judging_cand_once_it_vanished(tmp_path, caplog):
-    """#431, swapped orientation: B (later) is soul-linked, so ``cand`` A is the row to drop, and A
+@pytest.mark.parametrize("how", sorted(_VANISH))
+def test_431_near_dup_swap_stops_judging_cand_once_it_vanished(tmp_path, caplog, how):
+    """#431/#505 (deleted or deactivated), swapped orientation: B (later) is soul-linked, so ``cand`` A is the row to drop, and A
     vanishes while A/B is judged. Guards against going on to judge the dead A against D: the pass must
     move straight to B, which then keeps D's pair."""
     import logging
@@ -522,7 +537,7 @@ def test_431_near_dup_swap_stops_judging_cand_once_it_vanished(tmp_path, caplog)
     for m in (a, b, d):
         store.create(m)
     _crystallise(tmp_path, b.id)
-    judge, calls = _logging_judge(store, vanish=a.id)
+    judge, calls = _logging_judge(store, vanish=a.id, how=how)
 
     with caplog.at_level(logging.WARNING, logger="brain.engines.dedup_sweep"):
         report = run_dedup_sweep(store, tmp_path, judge=judge)
