@@ -1,5 +1,7 @@
 """Self-test of the `real_platform_dirs` guard (#456 merge check): the fixture exposes the platform's real user
-directories, so it fails the test that requested it if any of them is created or changed during that test."""
+directories, so it fails the test that requested it if one of them is created or gains or loses a top-level entry
+during that test. An unrelated live process (a developer's running bridge) that only writes to its existing files
+inside those directories does not trip it (GM-1)."""
 
 from __future__ import annotations
 
@@ -11,10 +13,17 @@ import pytest
 from tests.real_dirs_guard import assert_untouched, fingerprint
 
 
-def test_an_untouched_tree_passes(tmp_path):
+def _tree(tmp_path):
     d = tmp_path / "data"
-    (d / "personas" / "x").mkdir(parents=True)
-    (d / "personas" / "x" / "memories.db").write_bytes(b"1")
+    nested = d / "personas" / "x"
+    nested.mkdir(parents=True)
+    (nested / "memories.db").write_bytes(b"1")
+    (d / "runtime-x.log").write_text("start\n", encoding="utf-8")
+    return d, nested
+
+
+def test_an_untouched_tree_passes(tmp_path):
+    d, _ = _tree(tmp_path)
     before = fingerprint([d, tmp_path / "missing"])
     assert_untouched(before, fingerprint([d, tmp_path / "missing"]))
 
@@ -27,24 +36,31 @@ def test_creating_a_missing_directory_fails(tmp_path):
         assert_untouched(before, fingerprint([missing]))
 
 
-@pytest.mark.parametrize("change", ["new_file", "modified_file", "removed_file"])
-def test_a_change_anywhere_inside_fails(tmp_path, change):
-    d = tmp_path / "data"
-    nested = d / "personas" / "x"
-    nested.mkdir(parents=True)
-    f = nested / "persona_config.json"
-    f.write_text("{}", encoding="utf-8")
-    old = os.stat(f).st_mtime_ns
+@pytest.mark.parametrize("change", ["new_top_level_file", "new_top_level_dir", "removed_top_level_entry"])
+def test_a_new_or_removed_top_level_entry_fails(tmp_path, change):
+    d, _ = _tree(tmp_path)
     before = fingerprint([d])
-    if change == "new_file":
-        (nested / "tunables.json").write_text("{}", encoding="utf-8")
-    elif change == "modified_file":
-        f.write_text('{"model": "sonnet"}', encoding="utf-8")
-        os.utime(f, ns=(old + 10**9, old + 10**9))
+    if change == "new_top_level_file":
+        (d / "tunables.json").write_text("{}", encoding="utf-8")
+    elif change == "new_top_level_dir":
+        (d / "service").mkdir()
     else:
-        f.unlink()
+        (d / "runtime-x.log").unlink()
     with pytest.raises(AssertionError, match="real user directory"):
         assert_untouched(before, fingerprint([d]))
+
+
+def test_a_live_process_writing_to_its_existing_files_does_not_trip_it(tmp_path):
+    """GM-1: a developer's running bridge appends to its log and rewrites state files in place, deep inside."""
+    d, nested = _tree(tmp_path)
+    before = fingerprint([d])
+    with open(d / "runtime-x.log", "a", encoding="utf-8") as f:
+        f.write("a later line\n")
+    (nested / "memories.db").write_bytes(b"22")
+    (nested / "bridge.json").write_text("{}", encoding="utf-8")  # a nested file: below the top level
+    later = os.stat(d / "runtime-x.log").st_mtime_ns + 10**9
+    os.utime(d / "runtime-x.log", ns=(later, later))
+    assert_untouched(before, fingerprint([d]))
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux: #488's XDG variables point into the tmp root")

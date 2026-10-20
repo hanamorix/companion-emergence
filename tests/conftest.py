@@ -80,7 +80,8 @@ def real_platform_dirs(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
     On Linux the XDG variables #488 set still point into the test's tmp root; on macOS and Windows the restored
     properties resolve to the REAL user directories, so the fixture fails the test if any exposed directory was
-    created, or anything inside it changed, during the test (tests/real_dirs_guard.py; stat only, nothing read)."""
+    created, or gained or lost a top-level entry, during the test (tests/real_dirs_guard.py; names only, nothing read;
+    a developer's running bridge writing to its existing files there does not trip it)."""
     from platformdirs import PlatformDirs
 
     from brain import paths

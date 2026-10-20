@@ -2,40 +2,37 @@
 
 That fixture puts the platform's real user-directory properties back over #488's per-test redirect, for the few tests
 that compare paths. On macOS and Windows they resolve to the REAL data directories, so a test that also wrote would
-write there. The fixture takes a stat-only fingerprint of every exposed directory before the test and fails the test
-if any of them was created, or anything inside was added, removed or changed. File contents are never read.
+write there. The fixture records, for every exposed directory, whether it exists and the names of its top-level
+entries, and fails the test if that changed: a test that creates one of the directories, or a file or folder in one.
+
+Only existence and top-level NAMES are compared (GM-1): a developer's running bridge appends to its logs and rewrites
+its existing state files inside these directories during a test run, and must not make the test fail. Nothing is read.
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 Fingerprint = dict[str, object]
 
 
-def _tree(root: Path) -> dict[str, tuple[int, int]]:
-    out: dict[str, tuple[int, int]] = {}
-    for dirpath, dirnames, filenames in os.walk(root):
-        for name in [*dirnames, *filenames]:
-            p = os.path.join(dirpath, name)
-            try:
-                st = os.lstat(p)
-            except OSError:
-                continue
-            out[os.path.relpath(p, root)] = (st.st_mtime_ns, st.st_size)
-    return out
-
-
 def fingerprint(dirs: list[Path]) -> Fingerprint:
-    """For each directory: None when it does not exist, else every entry inside with its mtime and size."""
-    return {str(d): (_tree(d) if d.is_dir() else (None if not d.exists() else "not a directory")) for d in dirs}
+    """For each directory: None when it does not exist, else the sorted names of its top-level entries."""
+    out: Fingerprint = {}
+    for d in dirs:
+        if d.is_dir():
+            try:
+                out[str(d)] = sorted(p.name for p in d.iterdir())
+            except OSError:
+                out[str(d)] = "unreadable"
+        else:
+            out[str(d)] = None if not d.exists() else "not a directory"
+    return out
 
 
 def assert_untouched(before: Fingerprint, after: Fingerprint) -> None:
     for d, was in before.items():
-        now = after.get(d)
-        if now != was:
+        if after.get(d) != was:
             raise AssertionError(
                 f"a test using real_platform_dirs created or changed a real user directory: {d} "
                 "(the fixture is for comparing paths only)"
