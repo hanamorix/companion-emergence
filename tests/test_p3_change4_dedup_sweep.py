@@ -901,3 +901,23 @@ def test_505_exact_pass_carries_no_importance_from_a_soul_linked_row_that_stays(
     assert store.get(k.id, bump=False).importance == 2.0
     assert store.get(s.id, bump=False).importance == 7.0
     store.close()
+
+
+def test_505_exact_pass_stops_merging_into_a_canonical_edited_away_mid_group(tmp_path, monkeypatch, caplog):
+    """#505: another writer rewrites the canonical K while D1 is being merged into it. Guards against
+    judging D2 against K's content as listed at the start: D2 no longer duplicates K as K now stands,
+    so it must not be deleted in K's favour. D2 is skipped with a warning."""
+    import logging
+
+    store = MemoryStore(tmp_path / "memories.db")
+    k, d2, d1 = _exact_group(store)
+    _on_first_archive(monkeypatch, lambda: store.update(k.id, content="Bob locked the shed and the gate."))
+
+    with caplog.at_level(logging.WARNING, logger="brain.engines.dedup_sweep"):
+        report = run_dedup_sweep(store, tmp_path)
+
+    assert [(m.canonical_id, m.removed_id) for m in report.merges] == [(k.id, d1.id)]
+    assert _active_ids(store) == {k.id, d2.id}
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1 and d2.id in warnings[0], warnings
+    store.close()
