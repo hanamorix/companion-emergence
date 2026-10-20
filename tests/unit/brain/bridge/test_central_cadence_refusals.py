@@ -196,3 +196,12 @@ def test_snapshot_refusal_still_runs_the_prune_half_once(tmp_path, monkeypatch, 
     with pytest.raises(type(exc)):
         job.run()
     assert pruned == [1]
+
+
+def test_on_job_names_each_running_job_then_clears(tmp_path):
+    """#456 (plan I4, set_activity): the stop's progress record can name the job the supervisor is in."""
+    ran: list[str] = []
+    seen: list[str | None] = []
+    _due(tmp_path, "maintenance")
+    _pass(tmp_path, [_cadence_job("maintenance", ran), _work_job("finalize", ran)], on_job=seen.append)
+    assert seen == ["finalize", "maintenance", None] or seen == ["maintenance", "finalize", None]
