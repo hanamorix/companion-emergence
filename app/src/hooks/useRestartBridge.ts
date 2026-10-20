@@ -30,7 +30,7 @@ import {
 } from "../bridge";
 import { ensureBridgeRunning } from "../appConfig";
 import { errString } from "../lib/errString";
-import { REQUEST_TIMEOUT_MS } from "../lib/requestTimeout";
+import { HEALTH_POLL_INTERVAL_MS, HEALTH_WAIT_MS, REQUEST_TIMEOUT_MS } from "../lib/requestTimeout";
 
 export type RestartState =
   | "idle"
@@ -64,8 +64,8 @@ export interface UseRestartBridge {
  *  single request this flow sends (the stop request, each /health probe): a wedged bridge can accept the connection
  *  and never answer (review M1). */
 export const TIMEOUT_SHUTDOWN_MS = REQUEST_TIMEOUT_MS;
-export const TIMEOUT_HEALTH_MS = 30000;
-export const HEALTH_POLL_INTERVAL_MS = 500;
+export const TIMEOUT_HEALTH_MS = HEALTH_WAIT_MS;
+export { HEALTH_POLL_INTERVAL_MS };
 /** Owner Q1 (2026-10-19): the hard exit is offered 180 s after the stop was requested (brain/bridge/stop_watch.py
  *  HARD_EXIT_OFFER_AFTER_S). Also how long a bridge that still answers /health gets for the stop request to go
  *  through, and how long an accepted hard exit gets before the kill. */
@@ -340,6 +340,18 @@ async function forced(persona: string, skipHardExitRequest: boolean, start = tru
   return true;
 }
 
+/** Wait for a bridge something else is starting (the service an install started) to answer /health. */
+async function awaitHealth(persona: string): Promise<boolean> {
+  transition("waiting_for_health");
+  try {
+    await pollHealth(persona, Date.now() + TIMEOUT_HEALTH_MS);
+  } catch {
+    setShared({ errorDetail: FAILED_USER_MESSAGE });
+    return false;
+  }
+  return true;
+}
+
 async function startFresh(persona: string): Promise<boolean> {
   transition("starting");
   try {
@@ -538,7 +550,10 @@ export async function stopBridgeThen(
         result.error = errString(e) || "failed";
       }
       if (start) {
-        if (!(await startFresh(persona))) {
+        // Review R2-M1: a successful install already started the service, so wait for its bridge instead of a
+        // second start (which would find the service's start under way); after a failed one, the normal start.
+        const back = result.error === null ? await awaitHealth(persona) : await startFresh(persona);
+        if (!back) {
           result.error = result.error ?? shared.errorDetail ?? FAILED_USER_MESSAGE;
           transition("failed");
           return false;

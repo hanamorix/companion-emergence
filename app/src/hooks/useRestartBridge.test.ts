@@ -483,7 +483,7 @@ describe("useRestartBridge: time limits (#456 review M1)", () => {
 });
 
 describe("stopBridgeThen: the service install's stop (#456 C58 d, review M4)", () => {
-  it("stops through the stop flow, runs the install on the stopped bridge, then starts", async () => {
+  it("stops through the stop flow, runs the install on the stopped bridge, then waits for the service's bridge", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(T0);
     w.tasks = ["chat reply"];
@@ -493,6 +493,7 @@ describe("stopBridgeThen: the service install's stop (#456 C58 d, review M4)", (
     act(() => {
       p = stopBridgeThen(PERSONA, async () => {
         seen.push(`install while ${w.alive}`);
+        w = { ...fresh(), health: false }; // the install starts the service; its bridge is still booting
       }, { start: true });
     });
     await advance(2000);
@@ -500,9 +501,12 @@ describe("stopBridgeThen: the service install's stop (#456 C58 d, review M4)", (
     expect(seen).toEqual([]); // still stopping: no install yet
     w.alive = "gone";
     await advance(6000);
-    await expect(p).resolves.toEqual({ stopped: true, error: null });
     expect(seen).toEqual(["install while gone"]);
-    expect(m.start).toHaveBeenCalledTimes(1);
+    w.health = true; // the service's bridge answers
+    await advance(1000);
+    await expect(p).resolves.toEqual({ stopped: true, error: null });
+    // Review R2-M1: no second start racing the service's own (it would exit 2): the flow waits for /health.
+    expect(m.start).not.toHaveBeenCalled();
     expect(m.force).not.toHaveBeenCalled();
   });
 
