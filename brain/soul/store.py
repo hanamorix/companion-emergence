@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.soul.crystallization import Crystallization
+from brain.utils.sqlite_open import open_store_connection
 
 
 @dataclass
@@ -69,34 +70,19 @@ class SoulStore:
 
     def __init__(self, db_path: str | Path) -> None:
         self._db_path = str(db_path)
-        self._conn = sqlite3.connect(self._db_path)
-
-        # Integrity check BEFORE row_factory — result rows must be plain tuples.
-        from brain.health.integrity_retry import run_integrity_check_with_retry
-
-        result = run_integrity_check_with_retry(
-            self._conn, self._db_path, caller="SoulStore"
+        # The integrity check is always on (no opt-out). The open sequence
+        # (check, WAL, busy_timeout) is shared: see brain.utils.sqlite_open.
+        # Soul crystallizations are durable and accessed concurrently (review
+        # path, autonomous soul acceptance, chat tools), hence WAL.
+        self._conn: sqlite3.Connection = open_store_connection(
+            self._db_path,
+            caller="SoulStore",
+            integrity_check=True,
+            setup=self._finish_open,
         )
 
-        if result != [("ok",)]:
-            detail = "; ".join(str(row[0]) for row in result)
-            self._conn.close()
-            from brain.health.anomaly import BrainIntegrityError
-
-            raise BrainIntegrityError(self._db_path, detail)
-
-        # WAL + 5s busy_timeout — soul crystallizations are durable
-        # and accessed concurrently (review path + autonomous soul
-        # acceptance + chat tools). Without WAL, concurrent writes
-        # surface 'database is locked' more readily than the memory
-        # store. Set AFTER integrity check so corrupt-file probes
-        # surface BrainIntegrityError, not a pragma crash. In-memory
-        # dbs reject WAL silently; same fallback as MemoryStore.
-        try:
-            self._conn.execute("PRAGMA journal_mode = WAL")
-        except sqlite3.OperationalError:
-            pass
-        self._conn.execute("PRAGMA busy_timeout = 5000")
+    def _finish_open(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         self._conn.commit()

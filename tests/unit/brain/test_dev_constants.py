@@ -87,6 +87,7 @@ def test_sqlite_store_busy_timeout_is_five_seconds() -> None:
     "module_name",
     [
         "brain.memory.hebbian",
+        "brain.soul.store",
     ],
 )
 def test_migrated_store_modules_no_longer_write_out_the_busy_timeout(module_name: str) -> None:
