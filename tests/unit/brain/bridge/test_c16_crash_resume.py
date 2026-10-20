@@ -48,6 +48,7 @@ def _persona(tmp_path: Path) -> Path:
 def test_c16_forgetting_sigkill_mid_item_resumes_without_redoing_done(tmp_path: Path) -> None:
     persona_dir = _persona(tmp_path)
     marker = tmp_path / "scored.log"
+    ids_file = tmp_path / "own_ids.txt"
 
     script = textwrap.dedent(
         f"""
@@ -62,6 +63,7 @@ def test_c16_forgetting_sigkill_mid_item_resumes_without_redoing_done(tmp_path: 
 
         persona_dir = Path({str(persona_dir)!r})
         marker = Path({str(marker)!r})
+        ids_file = Path({str(ids_file)!r})
 
         # Fresh test memories are exempt by policy.is_exempt's own "recent
         # buffer" grace -- bypass so the loop actually reaches salience.score.
@@ -78,6 +80,7 @@ def test_c16_forgetting_sigkill_mid_item_resumes_without_redoing_done(tmp_path: 
             ids.append(m.id)
         ids.sort()
         store.close()
+        ids_file.write_text("\\n".join(ids))
 
         calls = {{"n": 0}}
 
@@ -133,7 +136,16 @@ def test_c16_forgetting_sigkill_mid_item_resumes_without_redoing_done(tmp_path: 
     from brain.bridge.events import EventBus
     from brain.forgetting import run_pass
 
+    own_ids = set(ids_file.read_text().split())
+    assert len(own_ids) == 3, "the subprocess must have recorded its 3 memory ids"
+
+    # #445 point 3: record every call, own or not. A scorer call for an id this
+    # test did not create comes from another thread (e.g. a supervisor a
+    # previous test leaked). The resume assertions use only own ids, so the
+    # leak cannot pass for a resume bug; the leak itself still fails the test,
+    # named, below -- filtering it out silently would hide a real defect.
     scored_order: list[str] = []
+    foreign: list[tuple[str, str]] = []
     import brain.forgetting.policy as policy_mod
     import brain.forgetting.salience as salience_mod
 
@@ -141,7 +153,12 @@ def test_c16_forgetting_sigkill_mid_item_resumes_without_redoing_done(tmp_path: 
         return False
 
     def _counting_score(memory, **kw):
-        scored_order.append(memory.id)
+        if memory.id in own_ids:
+            scored_order.append(memory.id)
+        else:
+            import threading
+
+            foreign.append((memory.id, threading.current_thread().name))
         return 5.0
 
     policy_mod.is_exempt = _fake_is_exempt
@@ -157,5 +174,12 @@ def test_c16_forgetting_sigkill_mid_item_resumes_without_redoing_done(tmp_path: 
         importlib.reload(salience_mod)
 
     assert scored_id_1 not in scored_order, "item 1 (already scored+persisted before the kill) must not be redone"
-    assert len(scored_order) == 2, "exactly the 2 remaining items run on resume"
+    assert sorted(scored_order) == sorted(own_ids - {scored_id_1}), (
+        f"exactly the 2 remaining items run on resume, once each; scored {scored_order}"
+    )
     assert job_progress.load_progress(persona_dir, "forgetting") == {}, "a clean finish clears the cursor"
+    assert not foreign, (
+        "resume was correct, but salience.score also ran for memories this test did not "
+        f"create, from (id, thread): {foreign}. Another test leaked a thread running a "
+        "forgetting pass (see #445); find the test that owns that thread."
+    )
