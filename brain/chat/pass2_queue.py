@@ -65,7 +65,6 @@ reset(persona_dir=None) -> None
 """
 from __future__ import annotations
 
-import json
 import logging
 import threading
 import time
@@ -74,6 +73,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from brain.health.json_io import read_json, write_json
 from brain.utils.file_lock import file_lock
 
 log = logging.getLogger(__name__)
@@ -112,20 +112,12 @@ def _queue_path(persona_dir: Path) -> Path:
 def _load_queue_unlocked(persona_dir: Path) -> list[dict[str, Any]]:
     """Read the queue file. Missing/corrupt -> empty list (fail toward no
     backlog rather than wedging a drainer on a bad file)."""
-    try:
-        data = json.loads(_queue_path(persona_dir).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return []
-    return data if isinstance(data, list) else []
+    return read_json(_queue_path(persona_dir), default=list, expect=list)
 
 
 def _save_queue_unlocked(persona_dir: Path, items: list[dict[str, Any]]) -> None:
     """Atomic temp+replace write (never a torn read of a partial file)."""
-    path = _queue_path(persona_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(items), encoding="utf-8")
-    tmp.replace(path)
+    write_json(_queue_path(persona_dir), items, indent=None, fsync=False)
 
 
 def enqueue(record: dict[str, Any], *, persona_dir: Path) -> None:

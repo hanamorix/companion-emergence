@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING, Any
 
 from brain import prompt_strings, tunables
 from brain.bridge.provider import LLMProvider
+from brain.health.json_io import read_json
 
 # F2a inc7 (#250 §7): TYPE_CHECKING-gated, not a runtime top-level import.
 # `MemoryStore` is used here ONLY as a type hint (`from __future__ import
@@ -316,10 +317,9 @@ def _snapshot_complete(snapshot_dir: Path) -> bool:
     revision = snapshot_dir.name
     repo_root = snapshot_dir.parent.parent
     tree_path = repo_root / "trees" / f"{revision}.json"
-    try:
-        manifest = json.loads(tree_path.read_text())
-        files: dict[str, dict[str, Any]] = manifest["files"]
-    except (OSError, ValueError, KeyError):
+    manifest = read_json(tree_path, default=dict, expect=dict)
+    files: dict[str, dict[str, Any]] | None = manifest.get("files")
+    if files is None:  # missing or unreadable manifest (the module warns), or one without a "files" map
         logger.warning(
             "no readable trees/%s.json manifest under %s -- cannot size-verify this "
             "snapshot's completeness, falling back to trusting it (pre-round-3 behavior)",

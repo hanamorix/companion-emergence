@@ -1,9 +1,10 @@
 // The wizard's nell-shortcut step: runs the install and turns the result into the
 // install-pane trailer plus an optional durable notice (#408).
 //
-// macOS wording is byte-identical to what shipped before. Linux and Windows get their own wording;
-// whenever the step did not succeed there, the explanation is also returned as `notice`, which the
-// wizard keeps on the final step until the user continues (the install pane is gone after 1.2 s).
+// macOS wording is byte-identical to what shipped before. Linux and Windows get their own wording.
+// Whenever the step reports failure (on macOS since #413), the explanation is also returned as
+// `notice`, which the wizard keeps on the final step until the user continues (the install pane is
+// gone after 1.2 s).
 
 import { installNellCliSymlink, type InitResult } from "../appConfig";
 import { errString } from "../lib/errString";
@@ -35,12 +36,16 @@ export async function runCliShortcutStep(
   if (platform === "macos") {
     try {
       const cli = await install();
-      return {
-        trailer: cli.success
-          ? `\n\n[cli] nell linked to ~/.local/bin \u2014 use ${VERSION_CMD} from Terminal`
-          : `\n\n[cli] symlink reported exit ${cli.exit_code} \u2014 Terminal access unavailable. Stderr:\n${cli.stderr}`,
-        notice: null,
-      };
+      if (cli.success) {
+        return {
+          trailer: `\n\n[cli] nell linked to ~/.local/bin \u2014 use ${VERSION_CMD} from Terminal`,
+          notice: null,
+        };
+      }
+      // A refusal (exit 73, a user's own nell, #413) must outlast the install pane.
+      return failureResult(
+        `\n\n[cli] symlink reported exit ${cli.exit_code} \u2014 Terminal access unavailable. Stderr:\n${cli.stderr}`,
+      );
     } catch (e) {
       return { trailer: `\n\n[cli] could not install nell symlink: ${errString(e)}`, notice: null };
     }

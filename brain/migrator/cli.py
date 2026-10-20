@@ -14,6 +14,7 @@ from pathlib import Path
 from brain.bridge.state_file import pid_is_alive
 from brain.emotion import vocabulary as _vocabulary
 from brain.health.attempt_heal import save_with_backup_text
+from brain.health.json_io import write_json
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.migrator.og import FileManifest, OGReader
@@ -210,12 +211,7 @@ def _run_migrate_locked(args: MigrateArgs, reader: OGReader) -> MigrationReport:
                 og_memories_for_vocab,
                 framework_baseline_names=framework_baseline_names,
             )
-            _vocab_tmp = vocab_target.with_suffix(vocab_target.suffix + ".new")
-            _vocab_tmp.write_text(
-                json.dumps({"version": 1, "emotions": vocab_entries}, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            os.replace(_vocab_tmp, vocab_target)
+            write_json(vocab_target, {"version": 1, "emotions": vocab_entries}, fsync=False)
             vocabulary_emotions_migrated = len(vocab_entries)
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             vocabulary_skipped_reason = f"migrate_error: {exc}"
@@ -268,12 +264,7 @@ def _run_migrate_locked(args: MigrateArgs, reader: OGReader) -> MigrationReport:
             try:
                 soul_names = extract_soul_names_best_effort(args.input_dir)
                 og_interests = extract_interests_from_og(og_interests_path, soul_names=soul_names)
-                _interests_tmp = interests_target.with_suffix(interests_target.suffix + ".new")
-                _interests_tmp.write_text(
-                    json.dumps({"version": 1, "interests": og_interests}, indent=2) + "\n",
-                    encoding="utf-8",
-                )
-                os.replace(_interests_tmp, interests_target)
+                write_json(interests_target, {"version": 1, "interests": og_interests}, fsync=False)
                 interests_migrated = len(og_interests)
             except (OSError, json.JSONDecodeError, ValueError) as exc:
                 interests_skipped_reason = f"migrate_error: {exc}"

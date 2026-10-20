@@ -190,7 +190,7 @@ def close_session(
     report.extracted = len(items)
 
     # ── SCORE (normalize at the boundary) ────────────────────────────────────
-    items = [it.normalize(valid_emotions=valid_emotions) for it in items if it.text]
+    items = [it.normalize(valid_emotions=valid_emotions, source=f"session={session_id}") for it in items if it.text]
 
     # ── DEDUPE + COMMIT + SOUL ────────────────────────────────────────────────
     dedup_threshold = float(cfg.get("dedup_threshold", DEFAULT_DEDUP_THRESHOLD))
@@ -380,7 +380,7 @@ def extract_session_snapshot(
             )
         return report
 
-    items = [it.normalize(valid_emotions=valid_emotions) for it in extraction.items if it.text]
+    items = [it.normalize(valid_emotions=valid_emotions, source=f"session={session_id}") for it in extraction.items if it.text]
     report.extracted = len(items)
 
     dedup_threshold = float(cfg.get("dedup_threshold", DEFAULT_DEDUP_THRESHOLD))

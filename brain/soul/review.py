@@ -23,6 +23,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from brain.health.json_io import Recovery, read_jsonl, write_jsonl
 from brain.health.parse_failures import record_parse_failure
 
 if TYPE_CHECKING:
@@ -275,28 +276,13 @@ def parse_decision(raw: str, candidate_id: str) -> Decision:
 
 def _load_soul_candidates(persona_dir: Path) -> list[dict]:
     """Read soul_candidates.jsonl, skipping corrupt lines."""
-    from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
-
-    return read_jsonl_skipping_corrupt(persona_dir / "soul_candidates.jsonl")
+    # RAISE: _save_soul_candidates rewrites the file from this read, so a failed read must not look like a short file.
+    return read_jsonl(persona_dir / "soul_candidates.jsonl", recover=Recovery.RAISE)
 
 
 def _save_soul_candidates(persona_dir: Path, records: list[dict]) -> None:
     """Write soul_candidates.jsonl atomically via temp file + rename."""
-    candidates_path = persona_dir / "soul_candidates.jsonl"
-    tmp_path = candidates_path.with_suffix(".jsonl.tmp")
-
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            for record in records:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        tmp_path.replace(candidates_path)
-    except OSError as exc:
-        logger.warning("failed to save soul_candidates.jsonl: %s", exc)
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+    write_jsonl(persona_dir / "soul_candidates.jsonl", records, fsync=False, nonfinite="null")
 
 
 def _mark_candidate(record: dict, status: str, **extra: object) -> None:

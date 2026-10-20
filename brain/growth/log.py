@@ -13,14 +13,13 @@ biography future engineers (and the user, via GUI) can read.
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+from brain.health.json_io import Recovery, append_jsonl, iter_jsonl
+from brain.utils.finite import clamp_nonfinite
 from brain.utils.time import iso_utc, parse_iso_utc
 
 logger = logging.getLogger(__name__)
@@ -66,25 +65,17 @@ def append_growth_event(path: Path, event: GrowthLogEvent) -> None:
     taking the lock costs ~µs on the happy path and gives us
     correct semantics on every platform.
     """
-    from brain.utils.file_lock import file_lock
-
-    line = (json.dumps(_event_to_dict(event)) + "\n").encode("utf-8")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with file_lock(path):
-        with open(path, "ab") as fh:
-            fh.write(line)
-            fh.flush()
-            os.fsync(fh.fileno())
+    append_jsonl(path, _event_to_dict(event), fsync=True)
 
 
 def read_growth_log(path: Path, *, limit: int | None = None) -> list[GrowthLogEvent]:
     """Read events oldest-first. `limit=N` returns the N most-recent events.
 
     Corrupt lines (partial write, hand-edit) are skipped with a warning via
-    `read_jsonl_skipping_corrupt`; well-formed lines around them still parse.
+    `iter_jsonl`; well-formed lines around them still parse.
     """
     events: list[GrowthLogEvent] = []
-    for data in read_jsonl_skipping_corrupt(path):
+    for data in iter_jsonl(path, recover=Recovery.RAISE):
         try:
             events.append(_event_from_dict(data))
         except (KeyError, TypeError, ValueError) as exc:
@@ -101,10 +92,12 @@ def _event_to_dict(event: GrowthLogEvent) -> dict:
         "type": event.type,
         "name": event.name,
         "description": event.description,
-        "decay_half_life_days": event.decay_half_life_days,
+        # The reader float()s the score and accepts null only for the half-life ("no decay"), so a non-finite
+        # half-life is stored as null and a non-finite score as 0.0.
+        "decay_half_life_days": clamp_nonfinite(event.decay_half_life_days, None, where=f"growth event {event.name} decay_half_life_days"),
         "reason": event.reason,
         "evidence_memory_ids": list(event.evidence_memory_ids),
-        "score": event.score,
+        "score": clamp_nonfinite(event.score, where=f"growth event {event.name} score"),
         "relational_context": event.relational_context,
     }
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import time
 import uuid
 from collections.abc import Callable
@@ -67,6 +68,22 @@ def _make_arc_id(seed_anchor_ref: str, ts_iso: str) -> str:
     return f"arc_{yyyymmdd}_{digest}"
 
 
+def _anchor_lived_age(anchor: Any) -> float:
+    """The lived age an anchor carries, or 0.0 when it is not finite.
+
+    The anchors come from the felt-time reader (not ours to change) and the age is stamped on arcs, members and the
+    strict state save, which raise on a NaN/Infinity. 0.0 is what a member joining with an unknown age gets
+    elsewhere in this pass; one warning names the anchor.
+    """
+    age = anchor.lived_age_hours
+    if isinstance(age, float) and not math.isfinite(age):
+        _LOG.warning(
+            "narrative_memory: anchor %s lived age is not finite (%r); treating it as unknown (0.0)", anchor.ref, age
+        )
+        return 0.0
+    return age
+
+
 def run_pass(
     persona_dir: Path,
     *,
@@ -98,6 +115,11 @@ def run_pass(
 
     counts: dict[str, int] = {"opened": 0, "extended": 0, "closed": 0, "evicted": 0}
     lived_age_now = getattr(felt_time_state, "lived_age_hours", None)
+    if isinstance(lived_age_now, float) and not math.isfinite(lived_age_now):
+        # A NaN/Infinity lived age (from the felt-time state, which is not ours to change) is unknown, exactly like
+        # a missing one: every use below already handles None, and the strict state save would raise on it.
+        _LOG.warning("narrative_memory: felt-time lived age is not finite (%r); treating it as unknown", lived_age_now)
+        lived_age_now = None
     centroid_cache: dict[str, np.ndarray | None] = {}
     # Arcs opened or extended in THIS pass — staleness check skips them
     # so a freshly-touched arc can't close in the same tick.
@@ -110,6 +132,7 @@ def run_pass(
             _LOG.warning("anchor %s has no seed memory ids — skipping", anchor.ref)
             continue
 
+        anchor_age = _anchor_lived_age(anchor)
         if should_open(tuple(anchor.seed_memory_ids), open_arcs=state.open):
             arc_id = _make_arc_id(anchor.ref, anchor.ts_iso)
             # Seed-member salience defaults to 0.0 because the seed memory
@@ -122,7 +145,7 @@ def run_pass(
                     ArcMember(
                         memory_id=sid,
                         joined_at_iso=anchor.ts_iso,
-                        lived_age_at_join=anchor.lived_age_hours,
+                        lived_age_at_join=anchor_age,
                         salience_at_join=0.0,
                     )
                 )
@@ -134,7 +157,7 @@ def run_pass(
                 seed_memory_ids=tuple(anchor.seed_memory_ids),
                 title=anchor.label,
                 opened_at_iso=anchor.ts_iso,
-                lived_age_at_open=anchor.lived_age_hours,
+                lived_age_at_open=anchor_age,
                 last_extended_at_iso=anchor.ts_iso,
                 closed_at_iso=None,
                 lived_age_at_close=None,
@@ -152,7 +175,7 @@ def run_pass(
                     "seed_memory_ids": list(anchor.seed_memory_ids),
                     "title": anchor.label,
                     "ts_iso": anchor.ts_iso,
-                    "lived_age_hours": anchor.lived_age_hours,
+                    "lived_age_hours": anchor_age,
                 },
             )
             for sm in seed_members:
@@ -163,7 +186,7 @@ def run_pass(
                         "arc_id": arc_id,
                         "memory_id": sm.memory_id,
                         "ts_iso": anchor.ts_iso,
-                        "lived_age_hours": anchor.lived_age_hours,
+                        "lived_age_hours": anchor_age,
                         "salience_at_join": sm.salience_at_join,
                         "via": "seed",
                     },
@@ -189,7 +212,7 @@ def run_pass(
                 new_member = ArcMember(
                     memory_id=sid,
                     joined_at_iso=anchor.ts_iso,
-                    lived_age_at_join=anchor.lived_age_hours,
+                    lived_age_at_join=anchor_age,
                     salience_at_join=0.0,
                 )
                 new_members.append(new_member)
@@ -202,7 +225,7 @@ def run_pass(
                         "arc_id": target_arc_id,
                         "memory_id": sid,
                         "ts_iso": anchor.ts_iso,
-                        "lived_age_hours": anchor.lived_age_hours,
+                        "lived_age_hours": anchor_age,
                         "salience_at_join": 0.0,
                         "via": "seed",
                     },

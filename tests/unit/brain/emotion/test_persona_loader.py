@@ -133,7 +133,7 @@ def test_load_per_entry_failure_skips_only_bad_entry(tmp_path: Path, caplog):
         _cleanup_emotion("test_good_entry")
 
 
-# ---- Health T10: attempt_heal wiring ----
+# ---- Health T10: json_io HEAL wiring ----
 
 
 def test_load_persona_vocabulary_corrupt_quarantines_restores_from_bak(tmp_path: Path):

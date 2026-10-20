@@ -34,6 +34,7 @@ from brain.chat import pass2_queue
 from brain.chat.extractor import apply_side_effects, extract_from_thinking
 from brain.chat.reflection_gate import should_reflect
 from brain.chat.tool_recruit import tools_for_capability
+from brain.health.json_io import append_jsonl
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.tools import NELL_TOOL_NAMES
@@ -135,16 +136,13 @@ def _attunement_now_iso() -> str:
 
 
 def _log_attunement_error(persona_dir: Path, turn_id: str, exc: BaseException) -> None:
-    path = persona_dir / "attunement_errors.jsonl"
-    path.parent.mkdir(parents=True, exist_ok=True)
     entry = {
         "ts": _attunement_now_iso(),
         "turn_id": turn_id,
         "error": str(exc),
         "traceback": traceback.format_exc(),
     }
-    with path.open("a") as f:
-        f.write(json.dumps(entry) + "\n")
+    append_jsonl(persona_dir / "attunement_errors.jsonl", entry)
 
 
 def _run_attunement_pass2(

@@ -46,7 +46,6 @@ brain doesn't care which kit the data came from.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import shutil
@@ -56,6 +55,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from brain.health.json_io import JsonFileError, Recovery, read_json, write_json
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.migrator.report import MigrationReport
@@ -93,8 +93,10 @@ def _read_emergence_kit_memories(input_dir: Path) -> list[dict[str, Any]]:
         if not path.is_file():
             continue
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
+            data = read_json(path, recover=Recovery.RAISE)
+        except JsonFileError as exc:
+            if exc.kind == "io":
+                raise  # an unreadable file propagated before; it still does
             raise ValueError(
                 f"emergence-kit memory file at {path} is not valid JSON: {exc}"
             ) from exc
@@ -112,14 +114,7 @@ def _read_emergence_kit_memories(input_dir: Path) -> list[dict[str, Any]]:
 
 def _read_emergence_kit_soul(input_dir: Path) -> dict[str, Any] | None:
     """Read ``soul_template.json`` if present."""
-    path = input_dir / "soul_template.json"
-    if not path.is_file():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("emergence-kit: soul_template.json unreadable: %s", exc)
-        return None
+    return read_json(input_dir / "soul_template.json", default=lambda: None)  # missing/unreadable: None
 
 
 def _import_kit_crystallizations(
@@ -357,7 +352,4 @@ def _write_kit_source_manifest(
             "personality_copied": personality_copied,
         },
     }
-    try:
-        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    except OSError as exc:
-        logger.warning("emergence-kit: source-manifest write failed: %s", exc)
+    write_json(path, payload, indent=2, fsync=False, on_error="log")

@@ -84,6 +84,7 @@ _BRAIN_IMPORT_ALLOWLIST = {
     "brain.kindled_link.audit",         # transport audit log — no tool surface
     "brain.kindled_link.identity",      # Ed25519 identity — no tool surface
     "brain.kindled_link.codec",         # canonical JSON — no tool surface
+    "brain.health.json_io",             # the one JSON/JSONL file reader/writer (#438) — no tool surface; the same file-I/O boundary peers had through jsonl_reader
     "brain.health.jsonl_reader",        # streaming JSONL reader — no tool surface (feed_source.py reads transport.jsonl for feed entries)
     "brain.state_compat",               # tolerant dataclass construction — no tool surface (relationship.py Evidence rollback tolerance)
     "brain.health.parse_failures",      # #364 parse-failure evidence log — no tool surface (stdlib + jsonl_reader + log_rotation only; relationship.py and privacy_gate.py keep a malformed verdict)

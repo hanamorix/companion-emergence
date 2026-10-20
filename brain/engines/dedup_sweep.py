@@ -18,7 +18,6 @@ provider unless a judge is explicitly supplied.
 
 from __future__ import annotations
 
-import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -26,8 +25,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.engines.consolidation import _ARCHIVE_FILENAME, _normalize
+from brain.health.json_io import append_jsonl
 from brain.memory.store import Memory, MemoryStore
-from brain.utils.file_lock import file_lock
 
 logger = logging.getLogger(__name__)
 
@@ -79,17 +78,13 @@ def _archive_preimage(persona_dir: Path, target: Memory) -> None:
         "target": target.to_dict(),
     }
     path = persona_dir / _ARCHIVE_FILENAME
-    with file_lock(path):
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    append_jsonl(path, rec, nonfinite="null")
 
 
 def _write_report(persona_dir: Path, report: Report) -> None:
     path = persona_dir / _REPORT_FILENAME
     rec = {"run_at": datetime.now(UTC).isoformat(), **report.as_log()}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    append_jsonl(path, rec)
 
 
 def _pick_canonical(members: list[Memory]) -> Memory:

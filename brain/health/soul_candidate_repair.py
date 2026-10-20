@@ -22,7 +22,6 @@ State file ``<persona_dir>/soul_candidate_repair_state.json`` → idempotent.
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -32,6 +31,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from brain.memory.store import MemoryStore
 
+from brain.health.json_io import Recovery, read_json, read_jsonl, write_json, write_jsonl
 from brain.utils.file_lock import file_lock
 
 logger = logging.getLogger(__name__)
@@ -68,21 +68,14 @@ def _state_path(persona_dir: Path) -> Path:
 
 
 def _load_state(persona_dir: Path) -> dict | None:
-    p = _state_path(persona_dir)
-    if not p.exists():
-        return None
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, ValueError) as exc:
-        logger.warning("soul_candidate_repair: corrupt state file: %s", exc)
-        return None
+    # CONTENT: an unreadable file raises (as it always did); a missing or corrupt one is "no state".
+    return read_json(
+        _state_path(persona_dir), default=lambda: None, recover=Recovery.CONTENT, expect=dict
+    )
 
 
 def _save_state(persona_dir: Path, state: dict) -> None:
-    p = _state_path(persona_dir)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    tmp.replace(p)
+    write_json(_state_path(persona_dir), state, indent=2, fsync=False)
 
 
 def _write_and_return(
@@ -118,17 +111,7 @@ def should_run_soul_candidate_repair(persona_dir: Path) -> bool:
     if existing is not None and existing.get("status") == "complete":
         return False
 
-    candidates_path = persona_dir / _CANDIDATES_FILE
-    if not candidates_path.exists():
-        return False
-
-    try:
-        from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
-
-        records = read_jsonl_skipping_corrupt(candidates_path)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("soul_candidate_repair: cannot read candidates: %s", exc)
-        return False
+    records = read_jsonl(persona_dir / _CANDIDATES_FILE)
 
     return any(
         r.get("status") == _TARGET_STATUS and r.get("session_id") == _TARGET_SESSION_ID
@@ -179,10 +162,9 @@ def _repair_locked(
     store: MemoryStore,
 ) -> SoulCandidateRepairReport:
     """Read-modify-rewrite with the file lock already held by the caller."""
-    from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
-
     try:
-        records = read_jsonl_skipping_corrupt(candidates_path)
+        # RAISE: the records are rewritten below, so a failed read must stop here, not look like a short file.
+        records = read_jsonl(candidates_path, recover=Recovery.RAISE)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "soul_candidate_repair: cannot read candidates: %s — skipping", exc
@@ -272,17 +254,5 @@ def _build_text(old_text: str, content: str) -> str:
 
 
 def _save_candidates(candidates_path: Path, records: list[dict]) -> None:
-    """Atomic write of soul_candidates.jsonl via tmp + replace."""
-    tmp_path = candidates_path.with_suffix(".jsonl.tmp")
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            for record in records:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        tmp_path.replace(candidates_path)
-    except OSError as exc:
-        logger.warning("soul_candidate_repair: failed to save candidates: %s", exc)
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+    """Atomic write of soul_candidates.jsonl (the caller holds the file lock)."""
+    write_jsonl(candidates_path, records, fsync=False, nonfinite="null")

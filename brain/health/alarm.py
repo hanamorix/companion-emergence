@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from brain.health.anomaly import AlarmEntry
-from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+from brain.health.json_io import Recovery, iter_jsonl
 from brain.utils.time import parse_iso_utc
 
 _IDENTITY_FILES = frozenset(
@@ -32,7 +32,7 @@ def compute_pending_alarms(persona_dir: Path) -> list[AlarmEntry]:
     anomalies: list[dict] = []
     acknowledged_files: set[str] = set()
 
-    for entry in read_jsonl_skipping_corrupt(audit_path):
+    for entry in iter_jsonl(audit_path, recover=Recovery.RAISE):
         try:
             ts = parse_iso_utc(entry["timestamp"])
         except (KeyError, ValueError, TypeError):

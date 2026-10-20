@@ -5,7 +5,6 @@ Spec: docs/superpowers/specs/2026-05-18-forgetting-design.md
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from collections.abc import Callable
@@ -18,7 +17,7 @@ from brain.felt_time.lived_age import IntensityDrivers
 from brain.felt_time.state import load_or_recover as load_felt_time
 from brain.forgetting import graveyard, policy, salience, tombstone
 from brain.forgetting.policy import Transition
-from brain.health.attempt_heal import save_with_backup
+from brain.health.json_io import read_json, write_json
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore, _row_to_memory
 
@@ -30,22 +29,16 @@ FORGETTING_STATE_FILENAME = "forgetting_state.json"
 def _load_forgetting_state(persona_dir: Path) -> dict[str, int]:
     """Read consecutive_low_passes counters keyed by memory_id.
     Corrupt file → all-zero counters (defensive)."""
-    p = persona_dir / FORGETTING_STATE_FILENAME
-    if not p.exists():
-        return {}
+    data = read_json(persona_dir / FORGETTING_STATE_FILENAME, default=dict, expect=dict)
     try:
-        data = json.loads(p.read_text())
-        if not isinstance(data, dict):
-            return {}
         return {k: int(v) for k, v in data.items() if isinstance(v, (int, float))}
-    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+    except (TypeError, ValueError):
         return {}
 
 
 def _persist_forgetting_state(persona_dir: Path, counters: dict[str, int]) -> None:
-    """Atomic save via save_with_backup."""
-    persona_dir.mkdir(parents=True, exist_ok=True)
-    save_with_backup(persona_dir / FORGETTING_STATE_FILENAME, counters)
+    """Atomic save with .bak rotation via json_io.write_json."""
+    write_json(persona_dir / FORGETTING_STATE_FILENAME, counters, backups=3)
 
 
 class SoulExemptionsUnavailableError(RuntimeError):
@@ -90,13 +83,7 @@ def _load_soul_linked_ids(persona_dir: Path) -> tuple[set[str], set[str]]:
 def _load_migration_grace(persona_dir: Path) -> tuple[datetime | None, float]:
     """Return (migrated_at_utc, lived_age_hours_at_migration) from source-manifest.json.
     (None, 0.0) when no manifest or fields absent — i.e. no grace (back-compat)."""
-    p = persona_dir / "source-manifest.json"
-    if not p.exists():
-        return None, 0.0
-    try:
-        data = json.loads(p.read_text())
-    except (OSError, json.JSONDecodeError):
-        return None, 0.0
+    data = read_json(persona_dir / "source-manifest.json", default=dict, expect=dict)
     raw = data.get("migrated_at_utc") or data.get("generated_at_utc")
     mig: datetime | None = None
     if isinstance(raw, str):

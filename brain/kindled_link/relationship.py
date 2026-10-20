@@ -20,6 +20,7 @@ from pathlib import Path
 
 from brain import prompt_strings
 from brain.bridge import cli_throttle as _default_throttle
+from brain.health.json_io import append_jsonl, read_json, write_json
 from brain.health.parse_failures import record_parse_failure
 from brain.kindled_link import limits
 from brain.state_compat import from_known_fields
@@ -143,15 +144,12 @@ def _log_rejection(*, persona_dir, peer_id: str, rejected_quote: str,
     if persona_dir is None:
         return
     try:
-        row = json.dumps({
-            "ts": now.isoformat(),
-            "peer_id": peer_id,
-            "rejected_quote": rejected_quote[:500],
-        }, separators=(",", ":"))
-        p = Path(persona_dir) / "kindled_link" / _REFLECTION_REJECTIONS_FILE
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with p.open("a", encoding="utf-8") as f:
-            f.write(row + "\n")
+        append_jsonl(
+            Path(persona_dir) / "kindled_link" / _REFLECTION_REJECTIONS_FILE,
+            {"ts": now.isoformat(), "peer_id": peer_id, "rejected_quote": rejected_quote[:500]},
+            on_error="log",
+            nonfinite="null",
+        )
     except Exception:  # noqa: BLE001 — audit; never raise into caller
         log.warning("reflection rejection log write failed", exc_info=True)
 
@@ -309,12 +307,7 @@ _CADENCE_FILE = "relationship_cadence.json"
 def load_reflection_cadence(persona_dir) -> dict:
     """Load the persisted reflection cadence state. Returns {"last_run": iso|None}."""
     p = Path(persona_dir) / "kindled_link" / _CADENCE_FILE
-    if not p.exists():
-        return {"last_run": None}
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001 — fail-soft, treat as never-run
-        return {"last_run": None}
+    return read_json(p, default=lambda: {"last_run": None}, expect=dict)  # fail-soft: never-run
 
 
 def reflection_is_due(persona_dir, now: datetime, *, interval_hours: float = 24.0) -> bool:
@@ -331,10 +324,12 @@ def reflection_is_due(persona_dir, now: datetime, *, interval_hours: float = 24.
 
 def save_reflection_cadence(persona_dir, now: datetime) -> None:
     """Persist the reflection cadence state (last_run timestamp)."""
-    d = Path(persona_dir) / "kindled_link"
-    d.mkdir(parents=True, exist_ok=True)
-    (d / _CADENCE_FILE).write_text(
-        json.dumps({"last_run": now.isoformat()}), encoding="utf-8")
+    write_json(
+        Path(persona_dir) / "kindled_link" / _CADENCE_FILE,
+        {"last_run": now.isoformat()},
+        indent=None,
+        fsync=False,
+    )
 
 
 # base + per-source accent (mirrors the W8 / maker reach_emotion map shape)

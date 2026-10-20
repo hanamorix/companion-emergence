@@ -1691,7 +1691,7 @@ def test_heartbeat_growth_fault_isolated(tmp_path: Path) -> None:
         hebbian.close()
 
 
-# ---- Task 9: attempt_heal wiring for HeartbeatConfig + HeartbeatState ----
+# ---- Task 9: json_io HEAL wiring for HeartbeatConfig + HeartbeatState ----
 
 
 def test_heartbeat_config_load_corrupt_file_quarantines_and_resets(tmp_path: Path) -> None:

@@ -38,6 +38,7 @@ from brain.body.session_hours import (
 # import it without crossing into the bridge layer. See the new module's
 # docstring for the migration context.
 from brain.bridge import background_jobs, model_error, provider_auth
+from brain.health.json_io import read_json, read_json_result
 from brain.utils.log_throttle import warn_throttled
 
 logger = logging.getLogger(__name__)
@@ -307,13 +308,9 @@ def _build_connection(persona_dir: Path) -> dict[str, Any]:
         out["notes_folder"] = cfg.notes_folder
     except Exception:  # noqa: BLE001
         logger.warning("persona_state: persona_config read failed", exc_info=True)
-    try:
-        hb_path = persona_dir / "heartbeat_state.json"
-        if hb_path.exists():
-            hb = json.loads(hb_path.read_text(encoding="utf-8"))
-            out["last_heartbeat_at"] = hb.get("last_tick_at")
-    except Exception:  # noqa: BLE001
-        logger.warning("persona_state: heartbeat_state read failed", exc_info=True)
+    hb = read_json_result(persona_dir / "heartbeat_state.json", default=dict, expect=dict)
+    if hb.outcome == "ok":  # missing or unreadable: left unset (the module reports an unreadable one)
+        out["last_heartbeat_at"] = hb.data.get("last_tick_at")
     return out
 
 
@@ -476,7 +473,7 @@ def _build_interior(persona_dir: Path) -> dict[str, Any]:
         ds_path = persona_dir / "daemon_state.json"
         if not ds_path.exists():
             return out
-        ds = json.loads(ds_path.read_text(encoding="utf-8"))
+        ds = read_json(ds_path, default=dict, expect=dict)
         if last_dream := ds.get("last_dream"):
             # Prefer the full summary over the 80-char theme slice; theme is
             # a hard-cut headline (``mem.content[:80]``) that lands

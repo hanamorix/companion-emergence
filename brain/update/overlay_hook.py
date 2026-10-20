@@ -49,7 +49,7 @@ def activate(site_dir: Path) -> str | None:
         if os.environ.get("KINDLED_NO_OVERLAY"):
             return None
         root = home() / "brain-overlay"
-        state = json.loads((root / "current.json").read_text(encoding="utf-8"))
+        state = json.loads((root / "current.json").read_text(encoding="utf-8"))  # json-io: ok -- bootstrap hook: runs before brain is importable
         active = state.get("active") if isinstance(state, dict) else None
         if not isinstance(active, dict):
             return None

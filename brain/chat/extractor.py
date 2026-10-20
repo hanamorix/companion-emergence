@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from brain import prompt_strings
 from brain.bridge.provider import LLMProvider
+from brain.health.json_io import append_jsonl, read_json, write_json
 from brain.health.parse_failures import record_parse_failure
 
 logger = logging.getLogger(__name__)
@@ -271,9 +272,7 @@ def _utcnow_iso() -> str:
 
 
 def _append_jsonl(path: Path, entry: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    append_jsonl(path, entry)
 
 
 def _safely(step_name: str, persona_dir: Path, fn) -> None:
@@ -435,12 +434,9 @@ def _apply_interest_candidate(candidate: InterestCandidate, persona_dir: Path) -
     state_path = persona_dir / _INTEREST_SPAWN_STATE
     today = f"{now:%Y-%m-%d}"
     state = {"date": today, "count": 0}
-    try:
-        loaded = json.loads(state_path.read_text(encoding="utf-8"))
-        if loaded.get("date") == today:
-            state = loaded
-    except (OSError, json.JSONDecodeError, AttributeError):
-        pass
+    loaded = read_json(state_path, default=dict, expect=dict)  # missing/corrupt/unreadable: a fresh day
+    if loaded.get("date") == today:
+        state = loaded
     if int(state.get("count", 0)) >= _INTEREST_SPAWN_DAILY_CAP:
         return
 
@@ -458,7 +454,7 @@ def _apply_interest_candidate(candidate: InterestCandidate, persona_dir: Path) -
     if created:
         interests.save(interests_path)
         state["count"] = int(state.get("count", 0)) + 1
-        state_path.write_text(json.dumps(state), encoding="utf-8")
+        write_json(state_path, state, indent=None, fsync=False)
 
 
 def _candidate_text(c: CrystallisationCandidate) -> str:

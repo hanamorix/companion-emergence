@@ -10,7 +10,6 @@ current.json untouched.
 from __future__ import annotations
 
 import importlib.metadata as md
-import json
 import os
 import re
 import shutil
@@ -22,6 +21,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import NamedTuple
 
+from brain.health.json_io import read_json, write_json
 from brain.update import overlay
 from brain.update.overlay_hook import BUNDLE_ID_FILE
 from brain.utils.time import iso_utc
@@ -162,11 +162,8 @@ def apply_update(*, wheel: Path, requirements: Path, commit: str, site_dir: Path
             return folder.name in named or overlay.in_use(folder)
 
         target = root / entry["dir"]
-        try:
-            stamp = json.loads((target / "stamp.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            stamp = {}
-        matches = (isinstance(stamp, dict) and stamp.get("commit") == commit
+        stamp = read_json(target / "stamp.json", default=dict, expect=dict)
+        matches = (stamp.get("commit") == commit
                    and stamp.get("bundle_id") == bundle_id and target.name in named)
         if not matches:
             if target.exists() and protected(target):
@@ -202,7 +199,7 @@ def apply_update(*, wheel: Path, requirements: Path, commit: str, site_dir: Path
                 _run([*_pip(), "--target", str(staging), *pip_extra, str(wheel)])
                 _smoke(staging, smoke_modules, site_dir)
                 stamp = {**entry, "installed_at": iso_utc(datetime.now(UTC))}
-                (staging / "stamp.json").write_text(json.dumps(stamp, indent=2), encoding="utf-8")
+                write_json(staging / "stamp.json", stamp, indent=2, fsync=False)
                 # Checked, not assumed: the protected case above should already have
                 # redirected `target` away from anything named or in use. This is
                 # unreachable in the happy path; it's the guard.

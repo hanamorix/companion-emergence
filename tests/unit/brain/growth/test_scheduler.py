@@ -192,7 +192,7 @@ def test_run_growth_tick_corrupt_vocabulary_logs_warning(
 ) -> None:
     """A corrupt emotion_vocabulary.json is detected and surfaces a WARNING.
 
-    Post-T10 the scheduler routes through attempt_heal, which quarantines the
+    Post-T10 the scheduler routes through json_io (HEAL), which quarantines the
     corrupt file and resets to default. The scheduler still completes (returns
     empty set) but the anomaly surfaces a WARNING so the user / forensic-grep
     has a thread to pull on rather than silent degradation.
@@ -233,7 +233,7 @@ def test_run_growth_tick_invalid_vocabulary_schema_logs_warning(
     result = run_growth_tick(persona_dir, store, datetime.now(UTC))
     assert result.emotions_added == 0
 
-    # Post-T10: schema mismatch goes through attempt_heal; warning message
+    # Post-T10: schema mismatch goes through json_io HEAL; warning message
     # contains "anomaly" and identifies the file.
     schema_warnings = [
         r
@@ -243,7 +243,7 @@ def test_run_growth_tick_invalid_vocabulary_schema_logs_warning(
     assert len(schema_warnings) == 1
 
 
-# ---- Health T10: attempt_heal wiring ----
+# ---- Health T10: json_io HEAL wiring ----
 
 
 def test_read_current_vocabulary_names_corrupt_quarantines_restores_bak(
@@ -289,7 +289,7 @@ def test_read_current_vocabulary_names_corrupt_no_bak_resets_to_default(
     assert names == set()
     assert anomaly is not None
     assert anomaly.action == "reset_to_default"
-    # Some warning surfaced (either from attempt_heal or existing path)
+    # Some warning surfaced (either from json_io or the existing path)
     assert any(r.levelno >= logging.WARNING for r in caplog.records)
 
 

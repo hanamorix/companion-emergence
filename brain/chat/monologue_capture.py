@@ -10,11 +10,11 @@ but does not raise (reply must still ship).
 """
 from __future__ import annotations
 
-import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
+from brain.health.json_io import append_jsonl
 from brain.memory.store import MemoryStore
 from brain.monologue.trace import MONOLOGUE_TRACE_TYPE, write_trace_memory
 
@@ -36,9 +36,7 @@ def _utcnow_iso_z() -> str:
 
 
 def _append_jsonl(path: Path, entry: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    append_jsonl(path, entry)
 
 
 def capture_monologue(

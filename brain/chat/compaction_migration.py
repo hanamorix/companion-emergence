@@ -27,15 +27,14 @@ break bridge startup.
 from __future__ import annotations
 
 import enum
-import json
 import logging
-import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from brain.bridge.provider import LLMProvider
 from brain.chat.compaction import compact_conversation
+from brain.health.json_io import write_json
 from brain.ingest.buffer import (
     acquire_compaction_lock,
     list_active_sessions,
@@ -77,14 +76,7 @@ def _marker_path(persona_dir: Path) -> Path:
 
 def _write_marker(persona_dir: Path, payload: dict) -> None:
     """Atomically write the run-once marker (mkdir parent first, tmp + os.replace)."""
-    path = _marker_path(persona_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
+    write_json(_marker_path(persona_dir), payload, indent=None)
 
 
 def _parse_ts(raw: object) -> datetime | None:
@@ -435,10 +427,4 @@ def run_sections_migration(
 
 def _write_marker_at(path: Path, payload: dict) -> None:
     """Atomically write a run-once marker (mkdir parent, tmp + fsync + os.replace)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
+    write_json(path, payload, indent=None)
