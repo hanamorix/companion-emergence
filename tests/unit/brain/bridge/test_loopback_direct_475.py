@@ -221,8 +221,9 @@ def test_the_direct_helper_never_reads_proxy_variables(world):
 
 
 def test_the_direct_websocket_connect_never_uses_a_proxy(world):
-    from brain.bridge.loopback import direct_ws_connect
     from websockets.sync.server import serve
+
+    from brain.bridge.loopback import direct_ws_connect
 
     def echo(ws):
         ws.send("hello " + ws.recv())
@@ -244,46 +245,86 @@ def test_the_direct_websocket_connect_never_uses_a_proxy(world):
 
 _BRAIN = Path(__file__).resolve().parents[4] / "brain"
 _HTTPX_VERBS = {"get", "post", "put", "patch", "delete", "head", "request", "stream"}
+_HTTPX_CLIENTS = {"Client", "AsyncClient"}
 # provider.py talks to an Ollama host the user configures (possibly remote, possibly behind a proxy on purpose).
+# supervisor.py builds the Kindled RELAY poll client (a remote service, no bridge token is sent): its missing trust_env=False is
+# recorded as a found-not-fixed item in the bundle's RESUME-HERE (scope frozen), not accepted as right.
 _NOT_LOOPBACK = {"bridge/provider.py"}
+_NOT_LOOPBACK_CLIENT = {"bridge/supervisor.py"}
+_WEBSOCKET_OK_MODULES = {"websockets.exceptions"}  # exception classes only
 
 
-def _calls():
-    for path in sorted(_BRAIN.rglob("*.py")):
-        rel = path.relative_to(_BRAIN).as_posix()
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                yield rel, node
+def _is_false(node: ast.AST | None) -> bool:
+    return isinstance(node, ast.Constant) and node.value is False
 
 
-def test_no_brain_code_calls_urlopen():
-    bad = [f"{rel}:{n.lineno}" for rel, n in _calls() if isinstance(n.func, ast.Attribute) and n.func.attr == "urlopen"]
-    assert bad == [], f"urlopen honours proxy variables; use brain.bridge.loopback.direct_request: {bad}"
-
-
-def test_every_module_level_httpx_call_to_the_bridge_ignores_the_environment():
-    bad = []
-    for rel, n in _calls():
-        f = n.func
-        if rel in _NOT_LOOPBACK or not (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)):
+def violations(source: str, rel: str) -> list[str]:
+    """Every way the source could reach the bridge through the environment's proxy settings (code review 3b, S1)."""
+    out: list[str] = []
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        # urlopen in any spelling: urllib.request.urlopen(...), request.urlopen(...), a bare urlopen(...) after a from-import
+        if isinstance(node, ast.Attribute) and node.attr == "urlopen":
+            out.append(f"{rel}:{node.lineno} urlopen")
+        elif isinstance(node, ast.Name) and node.id == "urlopen":
+            out.append(f"{rel}:{node.lineno} urlopen")
+        elif isinstance(node, ast.ImportFrom) and node.module == "urllib.request" and any(a.name == "urlopen" for a in node.names):
+            out.append(f"{rel}:{node.lineno} from urllib.request import urlopen")
+        # websockets clients: any import of the library (not its exception classes) outside the direct helper, aliased or not
+        if rel != "bridge/loopback.py":
+            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("websockets") and node.module not in _WEBSOCKET_OK_MODULES:
+                out.append(f"{rel}:{node.lineno} websockets import")
+            elif isinstance(node, ast.Import):
+                for a in node.names:
+                    if a.name.startswith("websockets") and a.name not in _WEBSOCKET_OK_MODULES:
+                        out.append(f"{rel}:{node.lineno} websockets import")
+        if rel in _NOT_LOOPBACK:
             continue
-        if f.value.id == "httpx" and f.attr in _HTTPX_VERBS:
-            kw = {k.arg: k.value for k in n.keywords}
-            if not (isinstance(kw.get("trust_env"), ast.Constant) and kw["trust_env"].value is False):
-                bad.append(f"{rel}:{n.lineno}")
-    assert bad == [], f"httpx.{{get,post,...}} without trust_env=False reads proxy variables: {bad}"
+        # httpx: names imported straight from the library cannot be checked at the call, so the import is the violation
+        if isinstance(node, ast.ImportFrom) and node.module == "httpx":
+            for a in node.names:
+                if a.name in _HTTPX_VERBS | _HTTPX_CLIENTS:
+                    out.append(f"{rel}:{node.lineno} from httpx import {a.name}")
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+            if node.func.value.id == "httpx" and (node.func.attr in _HTTPX_VERBS or node.func.attr in _HTTPX_CLIENTS):
+                if node.func.attr in _HTTPX_CLIENTS and rel in _NOT_LOOPBACK_CLIENT:
+                    continue
+                kw = {k.arg: k.value for k in node.keywords}
+                if not _is_false(kw.get("trust_env")):
+                    out.append(f"{rel}:{node.lineno} httpx.{node.func.attr} without trust_env=False")
+    return out
 
 
-def test_websocket_clients_are_only_built_through_the_direct_helper():
-    offenders = []
+def _brain_violations() -> list[str]:
+    found: list[str] = []
     for path in sorted(_BRAIN.rglob("*.py")):
-        rel = path.relative_to(_BRAIN).as_posix()
-        if rel == "bridge/loopback.py":
-            continue
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("websockets") and any(
-                a.name == "connect" for a in node.names
-            ):
-                offenders.append(f"{rel}:{node.lineno}")
-    assert offenders == [], f"import connect from brain.bridge.loopback (direct_ws_connect) instead: {offenders}"
+        found += violations(path.read_text(encoding="utf-8"), path.relative_to(_BRAIN).as_posix())
+    return found
+
+
+def test_no_brain_code_reaches_the_bridge_through_the_environments_proxy_settings():
+    assert _brain_violations() == []
+
+
+def test_the_scan_catches_every_spelling_it_exists_for():
+    cases = {
+        "import urllib.request\nurllib.request.urlopen(u)": "urlopen",
+        "from urllib import request\nrequest.urlopen(u)": "urlopen",
+        "from urllib.request import urlopen\nurlopen(u)": "urlopen",
+        "import httpx\nhttpx.post(u)": "without trust_env=False",
+        "import httpx\nhttpx.Client(base_url=u)": "without trust_env=False",
+        "import httpx\nhttpx.AsyncClient()": "without trust_env=False",
+        "import httpx\nhttpx.Client(trust_env=True)": "without trust_env=False",
+        "from httpx import post\npost(u)": "from httpx import post",
+        "from httpx import Client": "from httpx import Client",
+        "from websockets.sync.client import connect": "websockets import",
+        "import websockets.sync.client as c\nc.connect(u)": "websockets import",
+        "import websockets": "websockets import",
+    }
+    for source, expect in cases.items():
+        assert any(expect in v for v in violations(source, "x/y.py")), source
+    # and what is allowed stays allowed
+    assert violations("import httpx\nhttpx.post(u, trust_env=False)\nhttpx.Client(trust_env=False)", "x/y.py") == []
+    assert violations("from websockets.exceptions import InvalidStatus", "x/y.py") == []
+    assert violations("import websockets", "bridge/loopback.py") == []
+    assert violations("import httpx\nhttpx.get(u)", "bridge/provider.py") == []
