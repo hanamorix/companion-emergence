@@ -61,6 +61,8 @@ class BridgeState:
     phase: str | None = None
     stop_reason: str | None = None
     stop_requested_at: str | None = None
+    # The supervisor's state (#456 Q6: SupervisorStatus.as_dict), so `status --json` reports it without HTTP.
+    supervisor: dict | None = None
 
 
 def _state_path(persona_dir: Path) -> Path:

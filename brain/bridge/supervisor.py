@@ -171,6 +171,14 @@ class SupervisorStatus:
     iterations: int = 0
     loop_started: bool = False
     on_iteration: Callable[[], object] | None = None
+    on_change: Callable[[dict[str, object]], object] | None = None
+
+    def _changed(self) -> None:
+        if self.on_change is not None:
+            try:
+                self.on_change(self.as_dict())
+            except Exception:  # noqa: BLE001 - reporting the state never breaks the supervisor
+                logger.warning("supervisor status report failed", exc_info=True)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -187,15 +195,18 @@ class SupervisorStatus:
     def mark_running(self) -> None:
         if self.state in ("starting",):
             self.state = "running"
+            self._changed()
 
     def mark_restarted(self, exc: BaseException) -> None:
         self._note(exc)
         self.restarts += 1
         self.state = "restarted"
+        self._changed()
 
     def mark_failed(self, exc: BaseException) -> None:
         self._note(exc)
         self.state = "failed"
+        self._changed()
 
     def iteration_done(self) -> None:
         self.iterations += 1
@@ -222,6 +233,7 @@ def run_supervised(stop_event: threading.Event, *, status: SupervisorStatus, **k
         break
     if status.state != "failed":
         status.state = "stopped"
+        status._changed()
 
 
 def run_folded(

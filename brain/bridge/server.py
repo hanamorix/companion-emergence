@@ -1416,6 +1416,11 @@ def build_app(
 
             sup_status = _supervisor_mod.SupervisorStatus()
             app.state.bridge.supervisor_status = sup_status
+            from brain.bridge import state_file as _state_file_mod
+
+            sup_status.on_change = lambda d: _state_file_mod.update(
+                persona_dir, lambda st: setattr(st, "supervisor", d)
+            )
 
             def _run_supervisor() -> None:
                 try:

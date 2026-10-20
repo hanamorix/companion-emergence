@@ -280,16 +280,10 @@ class Monitor:
             c._mark_stopping()  # noqa: SLF001
         tasks = shutdown_progress.registry.snapshot()
         if tasks != self._last_written:
-            record = {
-                "pid": self.pid,
-                "pid_token": self.pid_token,
-                "persona": self.persona_dir.name,
-                "requested_at": c.requested_at,
-                "reason": c.reason,
-                "tasks": tasks,
-                "count": len(tasks),
-                "updated_at": _now_iso(),
-            }
+            record = shutdown_progress.progress_record(
+                pid=self.pid, pid_token=self.pid_token, persona=self.persona_dir.name,
+                requested_at=c.requested_at, reason=c.reason, tasks=tasks, updated_at=_now_iso(),
+            )
             try:
                 shutdown_progress.write_record(self.persona_dir, shutdown_progress.PROGRESS_FILENAME, record)
                 self._last_written = tasks
@@ -347,8 +341,11 @@ def hard_exit(persona_dir: Path | None, reason: str = REASON_HARD_EXIT) -> None:
                 rec = shutdown_progress.read_record(persona_dir, shutdown_progress.PROGRESS_FILENAME) or {}
                 from brain import process_identity
 
-                rec.update({"pid": os.getpid(), "pid_token": process_identity.own_token(), "phase": "hard_exit",
-                            "reason": reason, "updated_at": _now_iso()})
+                rec = shutdown_progress.progress_record(
+                    pid=os.getpid(), pid_token=process_identity.own_token(), persona=Path(persona_dir).name,
+                    requested_at=rec.get("requested_at"), reason=reason, tasks=list(rec.get("tasks") or []),
+                    updated_at=_now_iso(), phase="hard_exit",
+                )
                 shutdown_progress.write_record(persona_dir, shutdown_progress.PROGRESS_FILENAME, rec)
             except BaseException:  # noqa: BLE001
                 pass

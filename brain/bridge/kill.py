@@ -275,16 +275,10 @@ def kill_bridge(
         for sig in stop_signals:
             prev[sig] = signal.signal(sig, _raise)
     nonce = secrets.token_hex(8)
-    intent = {
-        "pid": st.pid,
-        "pid_token": st.pid_token,
-        "reason": "user_kill",
-        "state": "pending",
-        "nonce": nonce,
-        "at": datetime.now(UTC).isoformat(),
-        "boot": process_identity.boot_id(),
-        "legacy": legacy,
-    }
+    intent = shutdown_progress.stop_intent(
+        pid=st.pid, pid_token=st.pid_token, state="pending", nonce=nonce, at=datetime.now(UTC).isoformat(),
+        boot=process_identity.boot_id(), legacy=legacy,
+    )
     _write_intent(persona_dir, intent)
 
     remembered: dict[int, object] = {}
@@ -309,7 +303,11 @@ def kill_bridge(
         if service_installed(persona) and owned_by_service(persona, st.pid, st.client_origin):
             if not legacy and not skip_hard_exit_request:
                 shutdown_progress.write_record(
-                    persona_dir, shutdown_progress.REQUEST_FILENAME, {"pid": st.pid, "pid_token": st.pid_token}
+                    persona_dir,
+                    shutdown_progress.REQUEST_FILENAME,
+                    shutdown_progress.hard_exit_request(
+                        pid=st.pid, pid_token=st.pid_token, requested_at=datetime.now(UTC).isoformat()
+                    ),
                 )
                 deadline = time.monotonic() + timeout
                 while time.monotonic() < deadline and _alive(bridge):

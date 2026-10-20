@@ -624,7 +624,45 @@ def status_dict(persona_dir: Path) -> dict:
         "stop_requested_at": s.stop_requested_at if s else None,
         "client_origin": s.client_origin if s else None,
         "recovery_needed": state_file.recovery_needed(persona_dir),
+        # #456 (plan I9, S7-g, C48): the stop intent with its state, what is still running in a stop of THIS bridge,
+        # the service install state, the supervisor's state and the kill helper's stated bound.
+        "stop_intent": _status_intent(persona_dir),
+        "remaining": _status_remaining(persona_dir, s),
+        "service_installed": _status_service_installed(s.persona if s and s.persona else persona_dir.name),
+        "supervisor": s.supervisor if s else None,
+        "kill_bound_s": _kill_bound(),
     }
+
+
+def _status_intent(persona_dir: Path) -> dict | None:
+    from brain.bridge import kill
+
+    return kill.read_intent(persona_dir)
+
+
+def _status_remaining(persona_dir: Path, s: state_file.BridgeState | None) -> dict | None:
+    from brain.bridge import shutdown_progress
+
+    rec = shutdown_progress.read_record(persona_dir, shutdown_progress.PROGRESS_FILENAME)
+    if s is None or not shutdown_progress.names_this_bridge(rec, s.pid, s.pid_token):
+        return None
+    return {"count": rec.get("count"), "tasks": rec.get("tasks"), "phase": rec.get("phase"),
+            "requested_at": rec.get("requested_at"), "reason": rec.get("reason"), "updated_at": rec.get("updated_at")}
+
+
+def _status_service_installed(persona: str) -> bool:
+    from brain.bridge import kill
+
+    try:
+        return kill.service_installed(persona)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _kill_bound() -> float:
+    from brain.bridge import kill
+
+    return kill.kill_bound_s()
 
 
 def cmd_status(args) -> int:

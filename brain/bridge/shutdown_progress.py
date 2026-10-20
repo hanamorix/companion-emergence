@@ -242,6 +242,52 @@ def delete_watcher_files(persona_dir: Path) -> None:
         delete_record(persona_dir, name)
 
 
+# ---- record shapes (C48: one golden fixture set, tests/fixtures/bridge_watcher_files/; Rust / TS readers parse it) ----
+
+FORMAT_VERSION = 1
+
+
+def progress_record(
+    *, pid: int, pid_token: str | None, persona: str, requested_at: str | None, reason: str | None,
+    tasks: list[str], updated_at: str, phase: str = "stopping",
+) -> dict[str, Any]:
+    """The progress record the monitor keeps while the bridge stops (and the hard exit marks)."""
+    return {
+        "version": FORMAT_VERSION,
+        "pid": pid,
+        "pid_token": pid_token,
+        "persona": persona,
+        "phase": phase,
+        "requested_at": requested_at,
+        "reason": reason,
+        "tasks": list(tasks),
+        "count": len(tasks),
+        "updated_at": updated_at,
+    }
+
+
+def hard_exit_request(*, pid: int, pid_token: str | None, requested_at: str) -> dict[str, Any]:
+    """The hard-exit request (CLI / app -> bridge); honoured only when pid + token are the bridge's own."""
+    return {"version": FORMAT_VERSION, "pid": pid, "pid_token": pid_token, "requested_at": requested_at}
+
+
+def stop_intent(
+    *, pid: int, pid_token: str | None, state: str, nonce: str, at: str, boot: str | None, legacy: bool,
+) -> dict[str, Any]:
+    """The stop intent (kill helper only): ``state`` "pending" | "committed"; ``boot`` the Linux boot id or None."""
+    return {
+        "version": FORMAT_VERSION,
+        "pid": pid,
+        "pid_token": pid_token,
+        "reason": "user_kill",
+        "state": state,
+        "nonce": nonce,
+        "at": at,
+        "boot": boot,
+        "legacy": legacy,
+    }
+
+
 def names_this_bridge(record: dict[str, Any] | None, pid: int | None, token: str | None) -> bool:
     """True when ``record`` names exactly the bridge ``pid`` + ``token`` (C43 a: anything else is ignored)."""
     if not isinstance(record, dict) or pid is None or not token:
