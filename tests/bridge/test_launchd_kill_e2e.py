@@ -314,7 +314,7 @@ def test_every_start_path_after_a_kill_reaches_a_healthy_bridge(env_pd, launchd_
             if name != "supervisor start":
                 kill._write_intent(pd, shutdown_progress.stop_intent(
                     pid=999_999, pid_token="linux:x:999999:1", state="committed", nonce="n", at="2026-10-19T00:00:00",
-                    boot=pi.boot_id(), legacy=False))
+                    boot=pi.boot_id(), legacy=False, helper_pid=999_998, helper_token="linux:x:999998:1"))
             assert start() == 0, name
             assert kill.read_intent(pd) is None, name
             verbs = [c[0] for c in fake.calls if c[0] in ("print", "bootstrap", "kickstart")]
