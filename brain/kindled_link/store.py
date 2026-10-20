@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 from brain.kindled_link import limits
+from brain.utils.sqlite_open import open_store_connection
 
 
 def kindled_db_path(persona_dir) -> Path:
@@ -169,24 +170,17 @@ class ConsentTransitionError(ValueError):
 
 class KindledLinkStore:
     def __init__(self, db_path: str | Path, *, integrity_check: bool = True) -> None:
-        self._conn = sqlite3.connect(str(db_path))
-        if integrity_check:
-            from brain.health.integrity_retry import run_integrity_check_with_retry
+        # The open sequence (integrity check, WAL, busy_timeout) is shared: see
+        # brain.utils.sqlite_open.
+        self._conn: sqlite3.Connection = open_store_connection(
+            db_path,
+            caller="KindledLinkStore",
+            integrity_check=integrity_check,
+            setup=self._finish_open,
+        )
 
-            result = run_integrity_check_with_retry(
-                self._conn, db_path, caller="KindledLinkStore"
-            )
-            if result != [("ok",)]:
-                detail = "; ".join(str(row[0]) for row in result)
-                self._conn.close()
-                from brain.health.anomaly import BrainIntegrityError
-
-                raise BrainIntegrityError(str(db_path), detail)
-        try:
-            self._conn.execute("PRAGMA journal_mode = WAL")
-        except sqlite3.OperationalError:
-            pass
-        self._conn.execute("PRAGMA busy_timeout = 5000")
+    def _finish_open(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         self._migrate()
