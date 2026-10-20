@@ -87,11 +87,20 @@ def cancel_failsafe(*, run: Runner = subprocess.run) -> None:
     _try(run, ["systemctl", "--user", "stop", f"{FAILSAFE}.timer"])
 
 
+class FailsafeNotArmedError(RuntimeError):
+    """The fail-safe timer could not be registered, so the test must not install a real unit."""
+
+
 @contextmanager
 def unit_guard(*, run: Runner = subprocess.run, unit_dir: Path | None = None) -> Iterator[None]:
-    """Around the test: sweep a leftover, arm the fail-safe, run the body, then sweep again and disarm (also if the body raises)."""
+    """Around the test: sweep a leftover, arm the fail-safe, run the body, then sweep again and disarm (also if the body raises).
+
+    Raises :class:`FailsafeNotArmedError` (before the body, so nothing is installed) when the timer cannot be registered: without it only the
+    in-process cleanup stands between a killed run and a leftover restarting unit.
+    """
     remove_unit(run=run, unit_dir=unit_dir)
-    schedule_failsafe(run=run, unit_dir=unit_dir)
+    if not schedule_failsafe(run=run, unit_dir=unit_dir):
+        raise FailsafeNotArmedError("could not register the fail-safe timer (systemd-run unavailable or refused); not installing a real unit")
     try:
         yield
     finally:

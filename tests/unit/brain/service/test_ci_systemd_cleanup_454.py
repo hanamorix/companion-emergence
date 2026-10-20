@@ -160,3 +160,21 @@ def test_the_integration_test_runs_inside_the_guard():
         and any("fixture" in ast.dump(d) and "autouse" in ast.dump(d) for d in f.decorator_list)
     ]
     assert fixtures, "an autouse fixture must hold the guard"
+
+
+def test_the_guard_refuses_to_run_the_body_when_the_failsafe_cannot_be_armed(tmp_path):
+    """Code review 3a, NB6: without the fail-safe timer the only thing between a killed run and a leftover restarting unit is the
+    in-process `finally`. The guard must not let the test install a real unit in that case."""
+    body_ran = False
+    for run in (FakeRun(returncode=1), FakeRun(fail={"systemd-run": FileNotFoundError("systemd-run")})):
+        with pytest.raises(sc.FailsafeNotArmedError, match="fail-safe"):
+            with sc.unit_guard(run=run, unit_dir=tmp_path):
+                body_ran = True
+    assert not body_ran
+
+
+def test_the_integration_fixture_skips_when_the_failsafe_cannot_be_armed():
+    tree = ast.parse(_INTEGRATION_TEST.read_text(encoding="utf-8"))
+    names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)} | {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    assert "FailsafeNotArmedError" in names
+    assert "skip" in names

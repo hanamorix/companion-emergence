@@ -41,7 +41,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.integration.systemd_cleanup import unit_guard
+from tests.integration.systemd_cleanup import FailsafeNotArmedError, unit_guard
 
 # The entire module is Linux-only.
 pytestmark = pytest.mark.skipif(
@@ -56,8 +56,12 @@ def _systemd_unit_guard():
     if sys.platform != "linux" or not _systemd_user_available():
         yield
         return
-    with unit_guard():
-        yield
+    try:
+        with unit_guard():
+            yield
+    except FailsafeNotArmedError as exc:
+        # raised before the body: nothing was installed. Without the fail-safe timer a killed run could leave a restarting unit.
+        pytest.skip(str(exc))
 
 
 def _systemd_user_available() -> bool:
