@@ -13,7 +13,6 @@ from pathlib import Path
 
 from brain import process_identity
 from brain.emotion import vocabulary as _vocabulary
-from brain.utils.atomic_write import save_with_backup_text
 from brain.health.json_io import write_json
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
@@ -29,6 +28,7 @@ from brain.migrator.og_vocabulary import extract_persona_vocabulary
 from brain.migrator.report import MigrationReport, format_report, write_source_manifest
 from brain.migrator.transform import SkippedMemory, transform_memory
 from brain.paths import get_persona_dir
+from brain.utils.atomic_write import save_with_backup_text
 
 _MIGRATOR_MARKER_FILES = frozenset({"migration-report.md", "source-manifest.json", "memories.db"})
 

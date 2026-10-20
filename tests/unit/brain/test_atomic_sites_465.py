@@ -442,9 +442,10 @@ def test_append_archive_new_segment_and_new_marker_fsync_the_directory(tmp_path,
     seen.clear()
     buffer.append_archive(tmp_path, "sess1", [{"role": "user", "content": "again", "ts": "2026-06-15T10:00:01+00:00"}])
     assert seen == []  # the segment already exists: no new directory entry
-    (tmp_path / "active_conversations").mkdir(exist_ok=True)
+    marker_dir = buffer._archive_marker_path(tmp_path, "sess1").parent
+    marker_dir.mkdir(parents=True, exist_ok=True)
     buffer.write_archive_marker(tmp_path, "sess1", "key-1")
-    assert len(seen) >= 1 and all(p == tmp_path / "active_conversations" for p in seen)
+    assert len(seen) >= 1 and all(p == marker_dir for p in seen)
 
 
 def test_the_old_private_directory_fsync_is_gone():

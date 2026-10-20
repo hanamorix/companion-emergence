@@ -17,8 +17,8 @@ import pytest
 
 import brain.utils.atomic_write as heal
 from brain.health.attempt_heal import save_with_backup
-from brain.utils.atomic_write import save_with_backup_text
 from brain.health.json_io import Recovery, read_json_result
+from brain.utils.atomic_write import save_with_backup_text
 
 
 def attempt_heal(path, default_factory, schema_validator=None):

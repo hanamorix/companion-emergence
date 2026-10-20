@@ -39,7 +39,6 @@ the trained head (verified by the inc7 merge round-trip tests).
 from __future__ import annotations
 
 import logging
-import os
 import shutil
 import uuid
 from collections.abc import Callable, Sequence
@@ -48,6 +47,7 @@ from typing import Any
 
 from brain import tunables
 from brain.memory.relevance_judge import label_for_score
+from brain.utils.atomic_write import save_with_backup_text
 
 logger = logging.getLogger(__name__)
 
@@ -301,7 +301,7 @@ def build_lora_retrain_fn(
 # versioned subdir (the `adapter-` name prefix is historical: since inc7 no
 # adapter is ever stored) plus a `current` POINTER FILE naming the active
 # subdir. Persist = write a fresh staged subdir, then atomically repoint
-# `current` (write-temp + os.replace on the same filesystem). A mid-tick crash
+# `current` (write-temp + atomic replace on the same filesystem, through brain.utils.atomic_write). A mid-tick crash
 # resolves `current` to the last-known-good checkpoint; an incomplete staged
 # subdir is orphaned scratch, never served, and is reaped by the next tick
 # (`reap_unreferenced`). No per-tier stores, no sibling pointers.
@@ -411,7 +411,7 @@ def staged_adapter_path(champion_root: str | Path) -> Path:
     """A fresh, unique `adapter-<uuid>` subdir under `champion_root` for a
     staged write of a plain checkpoint (NOT yet the champion; the prefix is
     historical). Same filesystem as the `current`
-    pointer (both under `champion_root`), so the later `os.replace` swap is
+    pointer (both under `champion_root`), so the later atomic swap is
     atomic (C22). Creates `champion_root` (parents) but not the subdir
     itself — `CrossEncoder.save_pretrained` creates it."""
     root = Path(champion_root)
@@ -422,15 +422,14 @@ def staged_adapter_path(champion_root: str | Path) -> Path:
 def swap_champion_pointer(champion_root: str | Path, staged_subdir: str | Path) -> None:
     """Atomically repoint `current` at `staged_subdir` (its basename). Writes
     a temp pointer file under `champion_root` (same filesystem) and
-    `os.replace`s it onto `current` — a single atomic rename, so a concurrent
+    publishes it onto `current` through the shared atomic writer (a
+    unique temp, fsync, one retried atomic replace), so a concurrent
     reader of `current` sees either the old or the new complete pointer,
     never a torn one (C12)."""
     root = Path(champion_root)
     root.mkdir(parents=True, exist_ok=True)
     name = Path(staged_subdir).name
-    tmp = root / f".{_CHAMPION_POINTER}.tmp-{uuid.uuid4().hex}"
-    tmp.write_text(name, encoding="utf-8")
-    os.replace(tmp, root / _CHAMPION_POINTER)
+    save_with_backup_text(root / _CHAMPION_POINTER, name, keep_backups=False)
 
 
 def pointer_file(champion_root: str | Path) -> Path:

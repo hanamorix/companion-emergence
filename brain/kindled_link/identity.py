@@ -3,10 +3,8 @@ human-verifiable phrase. Identity keys ONLY sign; they never encrypt bodies
 (crypto-decision doc §2). Private key persisted under the persona dir, 0600."""
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import os
-import tempfile
 from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
@@ -15,6 +13,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
+from brain.utils.atomic_write import save_bytes_atomic
 from brain.utils.file_lock import file_lock
 
 
@@ -80,30 +79,11 @@ class KindledIdentity:
             serialization.PrivateFormat.Raw,
             serialization.NoEncryption(),
         )
-        # Write-then-rename for atomicity (#44): a mid-write failure (e.g. full
-        # disc) orphans only the temp file, leaving key_path absent — never a
-        # truncated key that crashes the next load via from_private_bytes(b'').
-        # mkstemp creates the temp 0600 in the same dir so the secret is never
-        # world-readable even briefly, and os.replace is atomic on POSIX + Windows.
-        fd, tmp_name = tempfile.mkstemp(
-            dir=str(key_path.parent), prefix=".identity-", suffix=".tmp"
-        )
-        try:
-            os.write(fd, raw)
-            os.fsync(fd)  # flush the key bytes to disc before the atomic swap
-            os.close(fd)
-            # os.replace is atomic: key_path ends up whole or absent, never
-            # truncated (the #44 guarantee). Not dir-fsync'd, so a crash in the
-            # instant after replace could lose the rename on some FS — acceptable
-            # for a regenerable 32-byte local key; atomicity (not durability) is
-            # the property #44 needs.
-            os.replace(tmp_name, key_path)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.close(fd)
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_name)
-            raise
+        # The shared atomic bytes writer (#44, #465): a unique temp created 0600 in the key's directory (never
+        # world-readable, even briefly), fsynced, then one retried atomic replace. A mid-write failure (e.g. a full
+        # disc) removes the temp and leaves key_path absent, never a truncated key that crashes the next load via
+        # from_private_bytes(b'').
+        save_bytes_atomic(key_path, raw, mode=0o600)
         try:
             os.chmod(key_path, 0o600)  # best-effort; no-op semantics on Windows
         except OSError:
@@ -118,8 +98,8 @@ class KindledIdentity:
         """Generate a new keypair, write it atomically. Returns (new, old).
 
         The caller MUST use `old` to sign rotation notices before discarding it.
-        The key file is overwritten with the same mkstemp→fsync→os.replace
-        atomicity as load_or_create (#44). `old` remains valid in memory
+        The key file is overwritten through the same shared atomic bytes writer
+        as load_or_create (#44). `old` remains valid in memory
         throughout the caller's lifetime — only the on-disk file changes."""
         old = cls.load_or_create(persona_dir)  # before the lock: file_lock is not re-entrant
         key_path = persona_dir / _KEY_DIRNAME / _KEY_FILENAME
@@ -134,20 +114,7 @@ class KindledIdentity:
             serialization.PrivateFormat.Raw,
             serialization.NoEncryption(),
         )
-        fd, tmp_name = tempfile.mkstemp(
-            dir=str(key_path.parent), prefix=".identity-rotate-", suffix=".tmp"
-        )
-        try:
-            os.write(fd, raw)
-            os.fsync(fd)
-            os.close(fd)
-            os.replace(tmp_name, key_path)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.close(fd)
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_name)
-            raise
+        save_bytes_atomic(key_path, raw, mode=0o600)
         try:
             os.chmod(key_path, 0o600)
         except OSError:

@@ -169,14 +169,14 @@ def test_g17a_a_failed_archive_write_three_ticks_in_a_row_loses_nothing(tmp_path
 @pytest.mark.parametrize("exc", [OSError(28, "disk full"), PermissionError(32, "held")])
 def test_g17b_a_failed_publish_loses_only_the_one_normal_eviction(tmp_path, monkeypatch, exc):
     log = _setup(tmp_path, 3)
-    L = log.read_bytes()
+    orig = log.read_bytes()
     faults = Faults(monkeypatch)
     faults.fail(".1.gz", exc)
     for _ in range(3):
         with pytest.raises(type(exc)):
             _tick(log, 3)
         state = _state(log)
-        assert state["log"] == L and state["2"] == b"A" and state["3"] == b"B" and "1" not in state
+        assert state["log"] == orig and state["2"] == b"A" and state["3"] == b"B" and "1" not in state
     faults.clear()
     _tick(log, 3)
     assert _state(log) == _clean_final(tmp_path, 3)
@@ -201,14 +201,14 @@ def test_g17c_a_failed_first_shift_loses_nothing(tmp_path, monkeypatch):
 
 def test_g17c_a_failed_middle_shift_loses_only_the_one_normal_eviction(tmp_path, monkeypatch):
     log = _setup(tmp_path, 4)
-    L = log.read_bytes()
+    orig = log.read_bytes()
     faults = Faults(monkeypatch)
     faults.fail(".3.gz", times=None)  # the second move of a four-slot shift fails every time
     for tick in range(3):
         with pytest.raises(OSError):
             _tick(log, 4)
         state = _state(log)
-        assert state["log"] == L
+        assert state["log"] == orig
         # tick 1 moved D out of the way (the normal eviction), then stopped; nothing else is ever lost
         assert {k: v for k, v in state.items() if k != "log"} == {"1": b"A", "2": b"B", "4": b"C"}, tick
     faults.clear()
@@ -222,12 +222,12 @@ def test_g17c_a_failed_middle_shift_loses_only_the_one_normal_eviction(tmp_path,
 @pytest.mark.parametrize("kill_at", [1, 2, 3, 4])
 def test_g17d_a_kill_before_each_replace_then_one_clean_tick_equals_a_clean_run(tmp_path, monkeypatch, kill_at):
     log = _setup(tmp_path, 3)
-    L = log.read_bytes()
+    orig = log.read_bytes()
     faults = Faults(monkeypatch)
     faults.kill_at = kill_at
     with pytest.raises(SimulatedKill):
         _tick(log, 3)
-    assert log.read_bytes() == L  # the active log is only truncated after the publish
+    assert log.read_bytes() == orig  # the active log is only truncated after the publish
     faults.kill_at = None
     _tick(log, 3)
     assert _state(log) == _clean_final(tmp_path, 3)
@@ -236,7 +236,7 @@ def test_g17d_a_kill_before_each_replace_then_one_clean_tick_equals_a_clean_run(
 
 def test_g17d_a_kill_inside_the_staging_write_leaves_a_temp_that_the_next_tick_sweeps(tmp_path, monkeypatch):
     log = _setup(tmp_path, 3)
-    L = log.read_bytes()
+    orig = log.read_bytes()
 
     def kill(fd):
         raise SimulatedKill()
@@ -245,7 +245,7 @@ def test_g17d_a_kill_inside_the_staging_write_leaves_a_temp_that_the_next_tick_s
     with pytest.raises(SimulatedKill):
         _tick(log, 3)
     monkeypatch.undo()
-    assert log.read_bytes() == L and {"1", "2", "3"} <= set(_state(log))
+    assert log.read_bytes() == orig and {"1", "2", "3"} <= set(_state(log))
     _tick(log, 3)
     assert _state(log) == _clean_final(tmp_path, 3)
     assert _extras(log) == []
@@ -255,7 +255,7 @@ def test_g17d_a_kill_between_the_publish_and_the_truncation_is_the_named_residua
     """Documented limit accepted by main (2026-10-20 09:20): the rows are archived twice, none is lost, and the
     duplicate displaces the oldest archive one rotation early. The base has the same window."""
     log = _setup(tmp_path, 3)
-    L = log.read_bytes()
+    orig = log.read_bytes()
     real = Path.write_bytes
 
     def kill_on_truncate(self, data):
@@ -267,10 +267,10 @@ def test_g17d_a_kill_between_the_publish_and_the_truncation_is_the_named_residua
     with pytest.raises(SimulatedKill):
         _tick(log, 3)
     monkeypatch.setattr(Path, "write_bytes", real)
-    assert _state(log)["1"] == L and log.read_bytes() == L
+    assert _state(log)["1"] == orig and log.read_bytes() == orig
     _tick(log, 3)
     state = _state(log)
-    assert state["1"] == L and state["2"] == L and state["3"] == b"A" and state["log"] == b""
+    assert state["1"] == orig and state["2"] == orig and state["3"] == b"A" and state["log"] == b""
 
 
 # --- (e) archive_keep=1 -----------------------------------------------------------------------------------------
@@ -300,19 +300,19 @@ def _enospc():
 
 def test_g17f_persistent_enospc_evicts_only_the_one_archive_a_rotation_would_evict(tmp_path, monkeypatch):
     log = _setup(tmp_path, 3)
-    L = log.read_bytes()
+    orig = log.read_bytes()
     faults = Faults(monkeypatch)
     faults.fail(".next.gz", _enospc())
     for tick in range(3):
         with pytest.raises(OSError):
             _tick(log, 3)
         state = _state(log)
-        assert state["log"] == L
+        assert state["log"] == orig
         assert {k: v for k, v in state.items() if k != "log"} == {"1": b"A", "2": b"B"}, tick
     faults.clear()
     _tick(log, 3)
     state = _state(log)
-    assert state["1"] == L and state["2"] == b"A" and state["3"] == b"B"
+    assert state["1"] == orig and state["2"] == b"A" and state["3"] == b"B"
 
 
 def test_g17f_a_single_enospc_is_retried_once_and_equals_a_clean_rotation(tmp_path, monkeypatch):
@@ -348,13 +348,13 @@ def test_g17f_enospc_with_one_slot_evicts_the_one_archive_once(tmp_path, monkeyp
 
 def test_g17g_a_stale_staging_file_is_overwritten_and_never_an_archive(tmp_path):
     log = _setup(tmp_path, 3)
-    L = log.read_bytes()
+    orig = log.read_bytes()
     stale = log.parent / (log.name + ".next.gz")
     stale.write_bytes(b"not a gzip file: left by a killed rotation")
     assert not re.fullmatch(re.escape(log.name) + r"\.\d+\.gz", stale.name)
     _tick(log, 3)
     state = _state(log)
-    assert state["1"] == L and state["2"] == b"A" and state["3"] == b"B"
+    assert state["1"] == orig and state["2"] == b"A" and state["3"] == b"B"
     assert _extras(log) == []  # the staging file was replaced onto .1.gz, none is left
 
 

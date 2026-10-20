@@ -33,10 +33,10 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from brain.utils.atomic_write import save_with_backup_text
 from brain.paths import get_log_dir, get_persona_dir
 from brain.service import UnsupportedPlatformError
 from brain.setup import validate_persona_name
+from brain.utils.atomic_write import save_with_backup_text
 
 logger = logging.getLogger(__name__)
 
@@ -214,9 +214,7 @@ def refresh_installed_unit(persona: str) -> bool:
             inserted = True
     if not inserted:
         return False
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text("".join(out), encoding="utf-8")
-    os.replace(tmp, path)
+    save_with_backup_text(path, "".join(out), keep_backups=False)  # the shared atomic writer, as write_systemd_unit
     run_systemctl(["daemon-reload"])
     logger.info("systemd unit refreshed: KillMode=mixed added to %s (effective from the next start)", path)
     return True

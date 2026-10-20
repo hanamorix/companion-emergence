@@ -74,7 +74,6 @@ from brain.chat.session import (
     get_or_hydrate_session,
 )
 from brain.health.alarm import compute_pending_alarms
-from brain.utils.atomic_write import save_with_backup_text
 from brain.health.json_io import Recovery, iter_jsonl, read_json
 from brain.health.parse_failures import count_recent as count_recent_parse_failures
 from brain.health.walker import walk_persona
@@ -86,6 +85,7 @@ from brain.memory.store import MemoryStore
 from brain.persona_config import PersonaConfig
 from brain.tools.dispatch import dispatch
 from brain.update.overlay import loaded_overlay
+from brain.utils.atomic_write import save_with_backup_text
 
 logger = logging.getLogger(__name__)
 

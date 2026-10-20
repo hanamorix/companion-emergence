@@ -18,7 +18,12 @@ from pathlib import Path
 import pytest
 
 import brain.utils.atomic_write as aw
-from brain.utils.atomic_write import fsync_dir, save_blob_once, save_bytes_atomic, save_with_backup_text
+from brain.utils.atomic_write import (
+    fsync_dir,
+    save_blob_once,
+    save_bytes_atomic,
+    save_with_backup_text,
+)
 
 REPO = Path(__file__).resolve().parents[4]
 TEMP_RE = re.compile(r"\.t\d+-(?:k[0-9a-f]{12}-)?[0-9a-f]+\.(?:bak1\.)?new$")
