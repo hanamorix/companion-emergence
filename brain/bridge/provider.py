@@ -39,7 +39,7 @@ from typing import Any
 import httpx
 
 from brain import tunables
-from brain.bridge import provider_auth
+from brain.bridge import model_error, provider_auth
 from brain.bridge.chat import (
     ChatMessage,
     ChatResponse,
@@ -804,6 +804,73 @@ def _system_prompt_tempfile(text: str | None) -> Iterator[str | None]:
             pass
 
 
+# Longest stdout line the assistant-frame scan will parse (a hostile or runaway line is skipped, not parsed).
+_ASSISTANT_SCAN_MAX_LINE = 64 * 1024
+_ERROR_CODE_SHAPE = re.compile(r"[a-z_]{1,40}")
+
+
+def _argv_model(cmd: list[str]) -> str | None:
+    """The model the subprocess was actually run with: the value after ``--model`` in its argv (#448).
+
+    Read from the argv, never from ``self._model``: the picker can hot-swap ``_model`` while a call runs, and
+    the rejection must name the model that was rejected.
+    """
+    try:
+        return cmd[cmd.index("--model") + 1]
+    except (ValueError, IndexError):
+        return None
+
+
+def _assistant_error_code(stdout: str) -> str | None:
+    """The top-level ``error`` code of the LAST assistant frame in an NDJSON stdout that has one (#448).
+
+    ``model_not_found`` sits on that frame, not on the result frame. Never raises: stdout can hold lines
+    that are hostile to ``json.loads`` (a 5000-digit run raises ValueError, deep nesting RecursionError), and
+    this runs inside the failure path, where an escape would replace the real CLI failure with a crash.
+    """
+    found: str | None = None
+    try:
+        for raw in (stdout or "").split("\n"):
+            if not raw or len(raw) > _ASSISTANT_SCAN_MAX_LINE:
+                continue
+            try:
+                obj = json.loads(raw)
+            except _JSON_LINE_ERRORS:
+                continue
+            if not isinstance(obj, dict) or obj.get("type") != "assistant":
+                continue
+            code = obj.get("error")
+            if isinstance(code, str) and _ERROR_CODE_SHAPE.fullmatch(code):
+                found = code
+    except Exception:  # noqa: BLE001 - the failure path must never raise from a scan
+        return found
+    return found
+
+
+def _failure_tokens(status: object, error_code: str | None) -> str:
+    """The structured signals the model-rejection detector reads, as a prefix of the failure text (#448).
+
+    Only the two signals it reads are emitted (status 404 and the ``model_not_found`` code), so no other
+    failure text changes: string classifiers elsewhere (for example ``"429"`` / ``"rate"`` in
+    ``brain.initiate.review``) see exactly what they saw before.
+    """
+    out = ""
+    if str(status) == "404":
+        out += "api_error_status=404; "
+    if error_code == "model_not_found":
+        out += "error=model_not_found; "
+    return out
+
+
+def _with_model_token(detail: str, model: str | None) -> str:
+    """``model=<id>; `` in front of a detail classified as a model rejection: the id that was executed."""
+    from brain.persona_config import is_valid_model
+
+    if model and is_valid_model(model) and model_error.is_model_rejection(detail):
+        return f"model={model}; {detail}"
+    return detail
+
+
 def _is_over_budget_frame(frame: dict) -> bool:
     """True for the result frame the CLI emits when --max-budget-usd stops a turn.
 
@@ -818,7 +885,9 @@ def _is_over_budget_frame(frame: dict) -> bool:
     )
 
 
-def _cli_error_detail(payload: dict) -> str | None:
+def _cli_error_detail(
+    payload: dict, *, error_code: str | None = None, model: str | None = None, stdout: str | None = None
+) -> str | None:
     """Detail for a result frame that reports failure, or None if it is fine.
 
     The CLI can exit 0 and report the failure *inside* the frame (#92) — e.g.
@@ -830,6 +899,11 @@ def _cli_error_detail(payload: dict) -> str | None:
     The over-budget frame is excluded deliberately: it also carries
     ``is_error``, but it is a stop, not a failure, and has its own graceful
     path at each call site.
+
+    #448: a frame with ``api_error_status`` 404 (and, from the streaming loop, the assistant frame's
+    ``model_not_found`` code via ``error_code``) gets those signals as a prefix; a detail classified as a model
+    rejection also gets ``model=<id the subprocess ran with>``. Frames with any other status are unchanged.
+    ``stdout`` (blocking paths) is scanned for the assistant frame's code, only when the frame is a failure.
     """
     if not payload.get("is_error"):
         provider_auth.note_cli_success()  # #246: a clean frame is the recovery signal
@@ -838,6 +912,9 @@ def _cli_error_detail(payload: dict) -> str | None:
         return None
     detail = str(payload.get("result") or "").strip()
     detail = detail[:200] if detail else f"is_error with no result text: {payload!r}"[:200]
+    if error_code is None and stdout:
+        error_code = _assistant_error_code(stdout)
+    detail = _with_model_token(_failure_tokens(payload.get("api_error_status"), error_code) + detail, model)
     # #246: every is_error frame on every path passes through here — the one place
     # an auth-expired text can be classified without enumerating raise sites.
     # ponytail: side-effect in a formatter, chosen so no site can be missed (#119 lesson).
@@ -845,7 +922,7 @@ def _cli_error_detail(payload: dict) -> str | None:
     return detail
 
 
-def _claude_failure_detail(result: subprocess.CompletedProcess[str]) -> str:
+def _claude_failure_detail(result: subprocess.CompletedProcess[str], *, model: str | None = None) -> str:
     """Return a useful error detail for failed Claude CLI subprocesses.
 
     Claude Code sometimes exits non-zero with an empty stderr but a structured
@@ -855,7 +932,7 @@ def _claude_failure_detail(result: subprocess.CompletedProcess[str]) -> str:
     ``exit 1:`` lines. Prefer the structured result when present, then fall
     back to stderr/stdout snippets.
     """
-    detail = _claude_failure_detail_text(result)
+    detail = _with_model_token(_claude_failure_detail_text(result), model)
     provider_auth.note_cli_failure(detail)  # #246: every exit!=0 text passes through here
     if not (result.stdout or "").strip():  # #329: a pre-execution failure, e.g. a rejected --tools
         _note_tools_flag_rejected(result.stderr or "")
@@ -890,6 +967,8 @@ def _claude_failure_detail_text(result: subprocess.CompletedProcess[str]) -> str
             parts: list[str] = []
             if payload.get("api_error_status") is not None:
                 parts.append(f"api_error_status={payload['api_error_status']}")
+            if _assistant_error_code(stdout) == "model_not_found":  # #448: lives on the assistant frame
+                parts.append("error=model_not_found")
             if payload.get("is_error") is not None:
                 parts.append(f"is_error={payload['is_error']}")
             if payload.get("result"):
@@ -999,7 +1078,7 @@ class ClaudeCliProvider(LLMProvider):
         if result.returncode != 0:
             raise RuntimeError(
                 f"ClaudeCliProvider failed (exit {result.returncode}): "
-                f"{_claude_failure_detail(result)}"
+                f"{_claude_failure_detail(result, model=_argv_model(cmd))}"
             )
 
         try:
@@ -1012,7 +1091,7 @@ class ClaudeCliProvider(LLMProvider):
             # string was returned as the generation itself — and this is the
             # Haiku path, so the attunement detector then parsed "Not logged in
             # · Please run /login" as if it were its classification JSON.
-            cli_err = _cli_error_detail(payload)
+            cli_err = _cli_error_detail(payload, model=_argv_model(cmd))
             if cli_err is not None:
                 raise RuntimeError(f"ClaudeCliProvider: {cli_err}")
             return _text_only(payload["result"])
@@ -1020,6 +1099,40 @@ class ClaudeCliProvider(LLMProvider):
             raise RuntimeError(
                 f"ClaudeCliProvider: unexpected output format: {result.stdout[:200]!r}"
             ) from exc
+
+    def probe(self, prompt: str) -> str:
+        """One tiny tools-less call whose only job is to find out whether the model is usable (#448).
+
+        Runs ``--output-format stream-json --verbose``, the output chat uses, because only that output carries
+        the ``model_not_found`` code (on the assistant frame; the plain ``json`` output has just the status and
+        the sentence). Parsed by the same functions the blocking chat path uses (``_run_blocking_cli`` /
+        ``_cli_error_detail``), so a rejection is classified from the code. Writes no usage-log row, gives the
+        model no tools, and honours the provider's timeout. Raises ``ProviderAuthDeferred`` while the login is
+        expired (as ``generate`` does) and ``ProviderError`` for any failure, its text carrying the signals.
+        """
+        if provider_auth.should_skip_background():
+            raise provider_auth.ProviderAuthDeferred("provider auth expired — deferred")
+        cmd = [
+            "claude",
+            "-p",
+            "--dangerously-skip-permissions",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--model",
+            self._model,
+        ]
+        _apply_lean_flags(cmd)  # #329: no tools at all
+        result, payload = self._run_blocking_cli(cmd, prompt, {})
+        if payload is None:
+            raise ProviderError(
+                "claude_cli_parse",
+                f"unexpected output format: {_stdout_shape(result.stdout) or 'no result frame'}",
+            )
+        cli_err = _cli_error_detail(payload, model=_argv_model(cmd), stdout=result.stdout)
+        if cli_err is not None:
+            raise ProviderError("claude_cli_error", cli_err)
+        return str(payload.get("result", ""))
 
     def name(self) -> str:
         return f"claude-cli:{self._model}"
@@ -1138,7 +1251,7 @@ class ClaudeCliProvider(LLMProvider):
                     # #399: the over-budget turn is the costliest one; log it as the streaming path does.
                     log_usage(audit_dir, call_type="chat", model=self._model, frame=payload)
                     return ChatResponse(content=text, tool_calls=(), raw=payload)
-                cli_err = _cli_error_detail(payload)
+                cli_err = _cli_error_detail(payload, model=_argv_model(cmd), stdout=result.stdout)
                 if cli_err is not None:
                     raise ProviderError("claude_cli_error", cli_err)
                 content = _text_only(payload["result"])
@@ -1350,6 +1463,7 @@ class ClaudeCliProvider(LLMProvider):
 
             delta_chunks: list[str] = []
             assistant_snapshot: str | None = None
+            assistant_error: str | None = None  # #448: last assistant frame's error code (model_not_found)
             done_emitted = False
             timeout = _stream_first_event_seconds()
 
@@ -1424,6 +1538,9 @@ class ClaudeCliProvider(LLMProvider):
                                     delta_chunks.append(text)
                                     yield TextDelta(text=text)
                     elif t == "assistant":
+                        _code = obj.get("error")
+                        if isinstance(_code, str) and _ERROR_CODE_SHAPE.fullmatch(_code):
+                            assistant_error = _code
                         # Snapshot frame — fallback content when result frame absent.
                         # None, not [], for a message that is not an object: a skipped frame must change nothing
                         # (an empty list would reset `assistant_snapshot` below). Same shape as the blocking scanner.
@@ -1476,7 +1593,7 @@ class ClaudeCliProvider(LLMProvider):
                             # #92: an exit-0 frame can still report a failure —
                             # surface it as an error rather than streaming the
                             # CLI's error text as her reply.
-                            cli_err = _cli_error_detail(obj)
+                            cli_err = _cli_error_detail(obj, error_code=assistant_error, model=_argv_model(cmd))
                             if cli_err is not None:
                                 yield StreamError(stage="claude_cli_error", detail=cli_err)
                             else:
@@ -1582,7 +1699,7 @@ class ClaudeCliProvider(LLMProvider):
         if result.returncode != 0 and not over_budget:
             raise ProviderError(
                 "claude_cli_exit",
-                f"exit {result.returncode}: {_claude_failure_detail(result)}",
+                f"exit {result.returncode}: {_claude_failure_detail(result, model=_argv_model(cmd))}",
             )
         return result, payload
 
@@ -1714,7 +1831,7 @@ class ClaudeCliProvider(LLMProvider):
                         ),
                         raw=payload,
                     )
-                cli_err = _cli_error_detail(payload)
+                cli_err = _cli_error_detail(payload, model=_argv_model(cmd), stdout=result.stdout)
                 if cli_err is not None:
                     raise ProviderError("claude_cli_error", cli_err)
                 content = _text_only(payload["result"])

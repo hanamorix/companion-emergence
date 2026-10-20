@@ -170,6 +170,10 @@ export interface PersonaState {
    *  the bridge drops a record when the model changes or a clean reply arrives for it.
    *  Optional so older bridge builds degrade gracefully. */
   model_rejections?: Array<{ model: string; since: string; last_at: string; count: number }>;
+  /** The hand-edited `model` value the app does not support (the bridge runs sonnet instead), shown cut and
+   *  cleaned; null when the setting is supported (or the provider ignores it). The panel shows a plain line (#446).
+   *  Optional so older bridge builds degrade gracefully. */
+  model_unsupported?: string | null;
   /** The chat model, when it was saved without the Apply-time check being able to confirm it and no clean
    *  reply has arrived for it since; [] otherwise. The connection panel shows a plain notice (#440). */
   model_unconfirmed?: string[];

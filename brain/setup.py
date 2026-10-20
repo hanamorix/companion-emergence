@@ -90,7 +90,7 @@ def write_persona_config(
     if model is not None:
         if model != cfg.model:
             cfg.derived_unavailable = []  # #441: the list belongs to the chat model it was tested for
-        cfg.model = model
+        cfg.set_model(model)  # #446: also clears a remembered unsupported value
     if user_pronouns is not None:
         from brain.pronouns import PRESETS, to_dict
 

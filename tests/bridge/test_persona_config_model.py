@@ -59,6 +59,15 @@ def test_save_round_trips_model(tmp_path: Path):
 
 import pytest  # noqa: E402
 
+
+@pytest.fixture(autouse=True)
+def _fresh_once_per_value_warnings(monkeypatch):
+    # #446: the unknown-model warning is logged once per value per process; these tests load the same bad
+    # value in several tests and assert the warning each time, so each test starts with an empty set.
+    import brain.persona_config as pc
+
+    monkeypatch.setattr(pc, "_warned_bad_values", set())
+
 from brain.persona_config import MODEL_ID_PATTERN, is_valid_model  # noqa: E402
 
 FULL_IDS = [
