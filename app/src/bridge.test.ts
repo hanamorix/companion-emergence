@@ -274,10 +274,12 @@ describe("getBridgeCredentials", () => {
   it("(#456 C17 m) the forced path passes skipHardExitRequest to the kill helper command", async () => {
     await invokeForceRestart("alice");
     await invokeForceRestart("alice", true);
+    await invokeForceRestart("alice", true, false);
     const calls = vi.mocked(invoke).mock.calls.filter(([cmd]) => cmd === "force_restart_bridge");
     expect(calls.map(([, args]) => args)).toEqual([
-      { persona: "alice", skipHardExitRequest: false },
-      { persona: "alice", skipHardExitRequest: true },
+      { persona: "alice", skipHardExitRequest: false, startAfter: true },
+      { persona: "alice", skipHardExitRequest: true, startAfter: true },
+      { persona: "alice", skipHardExitRequest: true, startAfter: false }, // #456 review M4: end only, for an install
     ]);
   });
 });

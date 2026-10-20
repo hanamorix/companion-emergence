@@ -633,10 +633,23 @@ fn read_bridge_shutdown(persona: String) -> Result<Option<BridgeShutdown>, Strin
     read_bridge_shutdown_at(&persona_dir(&persona)?)
 }
 
-/// Write the hard-exit request for the bridge bridge.json names (pid + token), atomically and owner-only.
-fn write_hard_exit_request_at(dir: &std::path::Path) -> Result<(), String> {
+/// The error when bridge.json no longer names the bridge the caller is watching (#456 review S8).
+const ERR_BRIDGE_CHANGED: &str = "bridge_changed: another bridge is running now";
+
+/// Write the hard-exit request for the bridge bridge.json names (pid + token), atomically and owner-only. With
+/// `expected` (the bridge the caller is watching), refuse when bridge.json now names another bridge: a request must
+/// never reach a bridge the user was not asked about (review S8).
+fn write_hard_exit_request_at(
+    dir: &std::path::Path,
+    expected: Option<(i64, Option<String>)>,
+) -> Result<(), String> {
     let (pid, token) =
         bridge_identity_at(&dir.join("bridge.json")).ok_or_else(|| ERR_MISSING_PID.to_string())?;
+    if let Some((want_pid, want_token)) = expected {
+        if want_pid != pid || want_token != token {
+            return Err(ERR_BRIDGE_CHANGED.to_string());
+        }
+    }
     let body = serde_json::json!({
         "version": 1,
         "pid": pid,
@@ -656,8 +669,12 @@ fn write_hard_exit_request_at(dir: &std::path::Path) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn request_bridge_hard_exit(persona: String) -> Result<(), String> {
-    write_hard_exit_request_at(&persona_dir(&persona)?)
+fn request_bridge_hard_exit(
+    persona: String,
+    pid: Option<i64>,
+    pid_token: Option<String>,
+) -> Result<(), String> {
+    write_hard_exit_request_at(&persona_dir(&persona)?, pid.map(|p| (p, pid_token)))
 }
 
 /// `nell supervisor status --persona <p> --json` (files and process checks only, no HTTP). A timeout or a failure is
@@ -700,6 +717,7 @@ async fn force_restart_bridge(
     app: tauri::AppHandle,
     persona: String,
     skip_hard_exit_request: Option<bool>,
+    start_after: Option<bool>,
 ) -> Result<(), String> {
     validate_persona_name(&persona)?;
     let skip = skip_hard_exit_request.unwrap_or(false);
@@ -754,6 +772,10 @@ async fn force_restart_bridge(
             output.status.code().unwrap_or(-1),
             if stderr.trim().is_empty() { stdout.trim() } else { stderr.trim() }
         ));
+    }
+    // #456 review M4: a service install only needs the bridge ended; the app starts it after the install.
+    if !start_after.unwrap_or(true) {
+        return Ok(());
     }
     ensure_bridge_running(app, persona).await
 }
@@ -3076,7 +3098,7 @@ mod bridge_stop_tests {
     fn hard_exit_request_names_the_current_bridge() {
         let dir = tempfile::TempDir::new().unwrap();
         bridge_json(dir.path(), TOKEN);
-        write_hard_exit_request_at(dir.path()).unwrap();
+        write_hard_exit_request_at(dir.path(), None).unwrap();
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.path().join(HARD_EXIT_REQUEST_FILE)).unwrap()).unwrap();
         let fx: serde_json::Value = serde_json::from_str(&fixture("hard_exit_request.json")).unwrap();
@@ -3089,7 +3111,20 @@ mod bridge_stop_tests {
         assert_eq!(v.get("pid").and_then(|p| p.as_i64()), Some(4242));
         assert_eq!(v.get("pid_token").and_then(|p| p.as_str()), Some(TOKEN));
         let empty = tempfile::TempDir::new().unwrap();
-        assert_eq!(write_hard_exit_request_at(empty.path()).unwrap_err(), ERR_MISSING_PID);
+        assert_eq!(write_hard_exit_request_at(empty.path(), None).unwrap_err(), ERR_MISSING_PID);
+    }
+
+    #[test]
+    fn hard_exit_request_refuses_when_another_bridge_is_named_now() {
+        // #456 review S8: the app watched bridge 4242 + TOKEN; bridge.json now names another bridge.
+        let dir = tempfile::TempDir::new().unwrap();
+        bridge_json(dir.path(), "linux:0b9c2f4e-1111-2222-3333-444455556666:4242:999999");
+        let err = write_hard_exit_request_at(dir.path(), Some((4242, Some(TOKEN.to_string())))).unwrap_err();
+        assert_eq!(err, ERR_BRIDGE_CHANGED);
+        assert!(!dir.path().join(HARD_EXIT_REQUEST_FILE).exists());
+        bridge_json(dir.path(), TOKEN);
+        write_hard_exit_request_at(dir.path(), Some((4242, Some(TOKEN.to_string())))).unwrap();
+        assert!(dir.path().join(HARD_EXIT_REQUEST_FILE).exists());
     }
 
     #[test]

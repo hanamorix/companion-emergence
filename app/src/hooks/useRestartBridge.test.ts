@@ -36,6 +36,8 @@ function jsonResponse(status: number, body: object = {}): Response {
 }
 
 interface World {
+  pid: number;
+  token: string;
   alive: "alive" | "gone";
   phase: "live" | "stopping";
   legacy: boolean;
@@ -54,6 +56,8 @@ interface World {
 
 function fresh(): World {
   return {
+    pid: 4242,
+    token: "tok-4242",
     alive: "alive",
     phase: "live",
     legacy: false,
@@ -90,6 +94,8 @@ function mocks() {
       if (w.alive === "gone") return { alive: "gone" };
       return {
         alive: "alive",
+        pid: w.pid,
+        pid_token: w.token,
         legacy: w.legacy,
         proven: w.proven,
         phase: w.phase,
@@ -99,7 +105,7 @@ function mocks() {
     read: vi.spyOn(bridge, "readBridgeShutdown").mockImplementation(async () => {
       if (w.readError) throw new Error("read_bridge_shutdown: unreadable");
       if (w.alive !== "alive" || !w.record) return null;
-      return { pid: 4242, pid_token: "tok", phase: "stopping", requested_at: w.requestedAt, tasks: [...w.tasks] };
+      return { pid: w.pid, pid_token: w.token, phase: "stopping", requested_at: w.requestedAt, tasks: [...w.tasks] };
     }),
     shutdown: vi.spyOn(bridge, "shutdownBridge").mockImplementation(async () => {
       if (!w.health) throw new TypeError("fetch failed");
@@ -250,7 +256,7 @@ describe("useRestartBridge: a new bridge (#456)", () => {
 
     act(() => result.current.hardExit());
     await advance(1000);
-    expect(m.hardExit).toHaveBeenCalledWith(PERSONA);
+    expect(m.hardExit).toHaveBeenCalledWith(PERSONA, { pid: 4242, pid_token: "tok-4242" });
     expect(result.current.offerHardExit).toBe(false);
     expect(m.force).not.toHaveBeenCalled();
 
@@ -319,7 +325,7 @@ describe("useRestartBridge: a new bridge (#456)", () => {
     const run = startRestart(() => result.current.restart());
     await advance(2000);
     expect(m.force).toHaveBeenCalledTimes(1);
-    expect(m.force).toHaveBeenCalledWith(PERSONA, true); // (m) --skip-hard-exit-request
+    expect(m.force).toHaveBeenCalledWith(PERSONA, true, true); // (m) --skip-hard-exit-request
     expect(result.current.fellThrough).toMatch(/answered neither/);
     await expect(run.done()).resolves.toBe(true);
     expect(result.current.state).toBe("reconnecting");
@@ -358,8 +364,43 @@ describe("useRestartBridge: a new bridge (#456)", () => {
     await advance(HARD_EXIT_OFFER_AFTER_MS - 2000);
     expect(m.force).not.toHaveBeenCalled();
     await advance(3000);
-    expect(m.force).toHaveBeenCalledWith(PERSONA, true);
+    expect(m.force).toHaveBeenCalledWith(PERSONA, true, true);
     expect(result.current.fellThrough).toMatch(/did not act on the hard exit/);
+    await expect(run.done()).resolves.toBe(true);
+  });
+
+  it("(review S8) the watch follows the bridge it stopped: a new bridge in its place ends the watch, and the accepted hard exit names the old one and never escalates to the new", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.tasks = ["soul review"];
+    const m = mocks();
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    const run = startRestart(() => result.current.restart());
+    await advance(HARD_EXIT_OFFER_AFTER_MS + 1000);
+    act(() => result.current.hardExit());
+    await advance(1000);
+    expect(m.hardExit).toHaveBeenCalledWith(PERSONA, { pid: 4242, pid_token: "tok-4242" });
+
+    // The old bridge ends and another start puts a new bridge in place before the next status read.
+    w = { ...fresh(), pid: 5151, token: "tok-5151" };
+    await advance(HARD_EXIT_OFFER_AFTER_MS + 10_000);
+    expect(m.force).not.toHaveBeenCalled(); // no kill of the new bridge
+    await expect(run.done()).resolves.toBe(true);
+    expect(result.current.progress).toBe(HARD_EXIT_DONE);
+  });
+
+  it("(review S8) a refused request (bridge.json names another bridge now) ends the watch without a kill", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.tasks = ["soul review"];
+    const m = mocks();
+    m.hardExit.mockRejectedValue("bridge_changed: another bridge is running now");
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    const run = startRestart(() => result.current.restart());
+    await advance(HARD_EXIT_OFFER_AFTER_MS + 1000);
+    act(() => result.current.hardExit());
+    await advance(HARD_EXIT_OFFER_AFTER_MS + 10_000);
+    expect(m.force).not.toHaveBeenCalled();
     await expect(run.done()).resolves.toBe(true);
   });
 
@@ -396,7 +437,7 @@ describe("useRestartBridge: time limits (#456 review M1)", () => {
     await advance(TIMEOUT_SHUTDOWN_MS - 100);
     expect(m.force).not.toHaveBeenCalled();
     await advance(TIMEOUT_SHUTDOWN_MS + 200); // the request's limit, then the /health probe's
-    expect(m.force).toHaveBeenCalledWith(PERSONA, true);
+    expect(m.force).toHaveBeenCalledWith(PERSONA, true, true);
     const signal = m.shutdown.mock.calls[0][1] as AbortSignal;
     expect(signal.aborted).toBe(true); // the hung request is cancelled, not left open
     await advance(1000);
@@ -436,7 +477,7 @@ describe("useRestartBridge: a pre-PR bridge (#456 C17 j, k)", () => {
     expect(m.shutdown).toHaveBeenCalledWith(PERSONA, expect.any(AbortSignal));
     expect(m.force).not.toHaveBeenCalled();
     await advance(200);
-    expect(m.force).toHaveBeenCalledWith(PERSONA, false);
+    expect(m.force).toHaveBeenCalledWith(PERSONA, false, true);
     await expect(run.done()).resolves.toBe(true);
     expect(result.current.progress).toBeNull();
     expect(result.current.offerHardExit).toBe(false);
@@ -489,7 +530,7 @@ describe("useRestartBridge: a pre-PR bridge (#456 C17 j, k)", () => {
     await expect(run.done()).resolves.toBe(true);
     expect(m.shutdown).toHaveBeenCalledTimes(1);
     expect(m.shutdown).toHaveBeenCalledWith(PERSONA, expect.any(AbortSignal)); // the old request, not the new-bridge one
-    expect(m.force).toHaveBeenCalledWith(PERSONA, false);
+    expect(m.force).toHaveBeenCalledWith(PERSONA, false, true);
     expect(result.current.offerHardExit).toBe(false);
   });
 
@@ -505,7 +546,7 @@ describe("useRestartBridge: a pre-PR bridge (#456 C17 j, k)", () => {
     const run = startRestart(() => result.current.restart());
     await advance(TIMEOUT_SHUTDOWN_MS + 2000);
     await expect(run.done()).resolves.toBe(true);
-    expect(m.force).toHaveBeenCalledWith(PERSONA, false);
+    expect(m.force).toHaveBeenCalledWith(PERSONA, false, true);
     expect(m.force).toHaveBeenCalledTimes(1);
     expect(result.current.offerHardExit).toBe(false);
   });
@@ -556,7 +597,7 @@ describe("awaitStoppingBridge: the launch check (#456 C17 h, l)", () => {
     });
     await advance(1000);
     await expect(launched).resolves.toBe(true);
-    expect(m.force).toHaveBeenCalledWith(PERSONA, false);
+    expect(m.force).toHaveBeenCalledWith(PERSONA, false, true);
   });
 
   it("(l) a pre-PR bridge that still answers, or a new bridge not stopping, is left alone", async () => {

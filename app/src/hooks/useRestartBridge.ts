@@ -230,30 +230,55 @@ type StopOutcome = "gone" | "legacy" | "forced" | "failed";
  * recorded request time + 180 s, the hard-exit request on acceptance, and the kill if the bridge ignores it for 180 s.
  * A status read that times out ("unknown") keeps waiting; a progress-record read error is retried.
  */
-async function watchStop(persona: string): Promise<StopOutcome> {
+/** The bridge a stop watch follows: its pid + identity token (review S8). */
+interface Pin {
+  pid: number;
+  token: string | null;
+}
+
+function pinOf(s: BridgeStatus): Pin | null {
+  return s.alive === "alive" && typeof s.pid === "number" ? { pid: s.pid, token: s.pid_token ?? null } : null;
+}
+
+function isPinned(pin: Pin, pid: number | null | undefined, token: string | null | undefined): boolean {
+  return pin.pid === pid && pin.token === (token ?? null);
+}
+
+async function watchStop(persona: string, pinned: Pin | null, start = true): Promise<StopOutcome> {
   transition("stopping");
   answer = null;
   const watchStarted = Date.now();
+  let pin = pinned;
   let status: BridgeStatus | null = null;
   let rec: BridgeShutdown | null = null;
   let lastStatusAt = -Infinity;
   let offered = false;
   let acceptedAt: number | null = null;
+  const gone = (): StopOutcome => {
+    setShared({ progress: acceptedAt !== null ? HARD_EXIT_DONE : EVERYTHING_STOPPED, offerHardExit: false,
+      offerText: null });
+    return "gone";
+  };
   setShared({ progress: "Stopping." }); // until the first read says what is still running
   for (;;) {
     if (Date.now() - lastStatusAt >= STATUS_POLL_MS) {
       lastStatusAt = Date.now();
       status = await bridgeStatus(persona);
-      if (status.alive === "gone") {
-        setShared({ progress: acceptedAt !== null ? HARD_EXIT_DONE : EVERYTHING_STOPPED, offerHardExit: false,
-          offerText: null });
-        return "gone";
+      if (status.alive === "gone") return gone();
+      if (status.alive === "alive") {
+        // S8: the watched bridge has ended and another one runs in its place: the watch is over.
+        if (pin !== null && !isPinned(pin, status.pid, status.pid_token)) return gone();
+        pin = pin ?? pinOf(status);
+        if (status.legacy) return "legacy";
       }
-      if (status.alive === "alive" && status.legacy) return "legacy";
     }
     try {
       const next = await readBridgeShutdown(persona);
-      if (next) rec = next;
+      if (next) {
+        if (pin !== null && !isPinned(pin, next.pid, next.pid_token)) return gone(); // a record of another bridge
+        pin = pin ?? { pid: next.pid, token: next.pid_token ?? null };
+        rec = next;
+      }
     } catch {
       // retried at the next poll (f)
     }
@@ -266,29 +291,37 @@ async function watchStop(persona: string): Promise<StopOutcome> {
     if (answer === "hard_exit" && acceptedAt === null) {
       acceptedAt = now;
       try {
-        await requestBridgeHardExit(persona);
+        await requestBridgeHardExit(persona, pin ? { pid: pin.pid, pid_token: pin.token } : undefined);
       } catch (e) {
+        if (errString(e).startsWith("bridge_changed")) return gone(); // never a request to a bridge not asked about
         console.warn(`[restartBridge] hard-exit request failed: ${errString(e)}`);
       }
     }
     if (acceptedAt !== null && now >= acceptedAt + HARD_EXIT_OFFER_AFTER_MS) {
-      // (m) the bridge ignored the hard exit: the identity-checked kill, without asking again
+      // (m) the bridge ignored the hard exit: the identity-checked kill, without asking again, and only while the
+      // watched bridge is still the one running (S8).
+      const latest = await bridgeStatus(persona);
+      if (latest.alive === "gone" || (pin !== null && latest.alive === "alive" && !isPinned(pin, latest.pid, latest.pid_token))) {
+        return gone();
+      }
       setShared({ fellThrough: "the bridge did not act on the hard exit" });
-      return (await forced(persona, true)) ? "forced" : "failed";
+      return (await forced(persona, true, start)) ? "forced" : "failed";
     }
     await sleep(PROGRESS_POLL_MS);
   }
 }
 
-/** The forced path: `nell supervisor stop --kill --skip-hard-exit-request`, then the normal start (Rust). */
-async function forced(persona: string, skipHardExitRequest: boolean): Promise<boolean> {
+/** The forced path: `nell supervisor stop --kill [--skip-hard-exit-request]`, then (``start``) the normal start, in
+ *  Rust. Without ``start`` (a service install, M4) the bridge is only ended. */
+async function forced(persona: string, skipHardExitRequest: boolean, start = true): Promise<boolean> {
   transition("forcing");
   try {
-    await invokeForceRestart(persona, skipHardExitRequest);
+    await invokeForceRestart(persona, skipHardExitRequest, start);
   } catch (e) {
     setShared({ errorDetail: errString(e) || FAILED_USER_MESSAGE });
     return false;
   }
+  if (!start) return true;
   transition("waiting_for_health");
   try {
     await pollHealth(persona, Date.now() + TIMEOUT_HEALTH_MS);
@@ -317,8 +350,9 @@ async function startFresh(persona: string): Promise<boolean> {
   return true;
 }
 
-/** A pre-PR bridge (j, l): the old request, today's short wait, then the kill (with its tree) and the start. */
-async function stopPrePr(persona: string): Promise<boolean> {
+/** A pre-PR bridge (j, l): the old request, today's short wait, then the kill (with its tree) and (``start``) the
+ *  start. */
+async function stopPrePr(persona: string, start = true): Promise<boolean> {
   transition("requesting");
   try {
     await withRequestTimeout((signal) => shutdownBridge(persona, signal), TIMEOUT_SHUTDOWN_MS);
@@ -327,8 +361,8 @@ async function stopPrePr(persona: string): Promise<boolean> {
   }
   await sleep(TIMEOUT_SHUTDOWN_MS);
   const after = await bridgeStatus(persona);
-  if (after.alive === "alive") return forced(persona, false);
-  return startFresh(persona);
+  if (after.alive === "alive") return forced(persona, false, start);
+  return start ? startFresh(persona) : true;
 }
 
 async function readStatusSettled(persona: string): Promise<BridgeStatus> {
@@ -359,7 +393,7 @@ async function stopIsRecorded(persona: string): Promise<boolean> {
 }
 
 /** Ask a new bridge to stop (C17 c, d, g). "stopping" once it began; "forced" after the kill path; "failed". */
-async function requestStop(persona: string): Promise<"stopping" | "forced" | "failed"> {
+async function requestStop(persona: string, start = true): Promise<"stopping" | "forced" | "failed"> {
   transition("requesting");
   const deadline = Date.now() + HARD_EXIT_OFFER_AFTER_MS;
   for (;;) {
@@ -376,7 +410,7 @@ async function requestStop(persona: string): Promise<"stopping" | "forced" | "fa
     if (!(await healthAnswers(persona))) {
       // (g) neither /health nor the request answers and no stop is recorded: the forced path
       setShared({ fellThrough: "the bridge answered neither /health nor the stop request" });
-      return (await forced(persona, true)) ? "forced" : "failed";
+      return (await forced(persona, true, start)) ? "forced" : "failed";
     }
     if (Date.now() >= deadline) {
       setShared({ errorDetail: FAILED_USER_MESSAGE });
@@ -401,7 +435,7 @@ export function awaitStoppingBridge(persona: string): Promise<boolean> {
         return forced(persona, false);
       }
       if (status.phase !== "stopping") return true;
-      const outcome = await watchStop(persona);
+      const outcome = await watchStop(persona, pinOf(status));
       if (outcome === "legacy") return stopPrePr(persona);
       return outcome !== "failed";
     } finally {
@@ -419,7 +453,7 @@ export function restartBridge(persona: string): Promise<boolean> {
 
   const run = async (): Promise<boolean> => {
     try {
-      const ok = await restartOnce(persona);
+      const ok = await stopBridge(persona, true);
       if (!ok) {
         transition("failed");
         return false;
@@ -435,21 +469,78 @@ export function restartBridge(persona: string): Promise<boolean> {
   return inFlight;
 }
 
-async function restartOnce(persona: string): Promise<boolean> {
+/**
+ * Stop the persona's bridge through the same stop flow (display, offer, forced path), and (``start``) start the next
+ * one. True once the old bridge is gone (and, with ``start``, the new one answers).
+ */
+async function stopBridge(persona: string, start: boolean): Promise<boolean> {
+  const finish = (): Promise<boolean> => (start ? startFresh(persona) : Promise.resolve(true));
   const status = await readStatusSettled(persona);
-  if (status.alive === "gone") return startFresh(persona);
+  if (status.alive === "gone") return finish();
   if (status.legacy) {
     // (j) a pre-PR bridge: proven -> the old request and the kill after 3 s; unproven -> the normal start.
-    return status.proven ? stopPrePr(persona) : startFresh(persona);
+    return status.proven ? stopPrePr(persona, start) : finish();
   }
-  const requested = await requestStop(persona);
+  const requested = await requestStop(persona, start);
   if (requested === "forced") return true;
   if (requested === "failed") return false;
-  const outcome = await watchStop(persona);
+  const outcome = await watchStop(persona, pinOf(status), start);
   if (outcome === "forced") return true;
   if (outcome === "failed") return false;
-  if (outcome === "legacy") return stopPrePr(persona);
-  return startFresh(persona); // (i) "Everything has stopped." -> the normal start
+  if (outcome === "legacy") return stopPrePr(persona, start);
+  return finish(); // (i) "Everything has stopped." -> the normal start
+}
+
+export interface StopThenResult {
+  /** The old bridge was stopped (the action ran). */
+  stopped: boolean;
+  /** Why the action, the stop or the start failed; null when all went well. */
+  error: string | null;
+}
+
+/**
+ * C58 (d), review M4: the app's service install. The bridge is stopped through the stop flow first (the install
+ * refuses a running bridge), then ``action`` runs on a stopped bridge, then (``start``) the normal start, which goes
+ * through the newly installed service. Waits for a restart already running. Shares the restart's state and display.
+ */
+export async function stopBridgeThen(
+  persona: string,
+  action: () => Promise<void>,
+  { start }: { start: boolean },
+): Promise<StopThenResult> {
+  while (inFlight) await inFlight.catch(() => false);
+  setShared({ ...IDLE });
+  const result: StopThenResult = { stopped: false, error: null };
+  const run = async (): Promise<boolean> => {
+    try {
+      if (!(await stopBridge(persona, false))) {
+        result.error = shared.errorDetail ?? FAILED_USER_MESSAGE;
+        transition("failed");
+        return false;
+      }
+      result.stopped = true;
+      try {
+        await action();
+      } catch (e) {
+        result.error = errString(e) || "failed";
+      }
+      if (start) {
+        if (!(await startFresh(persona))) {
+          result.error = result.error ?? shared.errorDetail ?? FAILED_USER_MESSAGE;
+          transition("failed");
+          return false;
+        }
+        transition("reconnecting");
+      }
+      return result.error === null;
+    } finally {
+      inFlight = null;
+    }
+  };
+  inFlight = run();
+  await inFlight;
+  if (!start) clearRestartState();
+  return result;
 }
 
 export function useRestartBridge(

@@ -582,11 +582,16 @@ export async function shutdownBridge(
 /**
  * The forced path (#456 D10): `nell supervisor stop --kill` (identity-checked; the bridge and every process it
  * started), then the normal start, inside Rust. `skipHardExitRequest`: after a hard exit the bridge ignored, do not
- * ask it again. Rejects with the helper's error (or `force_restart_timeout` when the kill is still running).
+ * ask it again. `startAfter` false (a service install, #456 review M4): only end the bridge. Rejects with the helper's
+ * error (or `force_restart_timeout` when the kill is still running).
  */
-export async function invokeForceRestart(persona: string, skipHardExitRequest = false): Promise<void> {
+export async function invokeForceRestart(
+  persona: string,
+  skipHardExitRequest = false,
+  startAfter = true,
+): Promise<void> {
   try {
-    await invoke<void>("force_restart_bridge", { persona, skipHardExitRequest });
+    await invoke<void>("force_restart_bridge", { persona, skipHardExitRequest, startAfter });
   } finally {
     // The respawned bridge writes a new port and token to bridge.json (#365).
     resetBridgeCredentialCache(persona);
@@ -612,9 +617,13 @@ export async function readBridgeShutdown(persona: string): Promise<BridgeShutdow
   return invoke<BridgeShutdown | null>("read_bridge_shutdown", { persona });
 }
 
-/** Ask the current bridge (its pid + identity token) for a hard exit (#456 D17). */
-export async function requestBridgeHardExit(persona: string): Promise<void> {
-  await invoke<void>("request_bridge_hard_exit", { persona });
+/** Ask the current bridge (its pid + identity token) for a hard exit (#456 D17). With ``expected`` (the bridge being
+ *  watched) the request is refused with `bridge_changed` when bridge.json names another bridge now (review S8). */
+export async function requestBridgeHardExit(
+  persona: string,
+  expected?: { pid: number; pid_token: string | null },
+): Promise<void> {
+  await invoke<void>("request_bridge_hard_exit", { persona, pid: expected?.pid ?? null, pidToken: expected?.pid_token ?? null });
 }
 
 /** The supervisor's state (#456 Q6): "running" | "restarted" | "failed" | "stopped" | "starting". */
