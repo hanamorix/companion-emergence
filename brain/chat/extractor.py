@@ -241,7 +241,7 @@ def extract_from_thinking(
     # model output through verbatim, where fences and chatter are common.
     try:
         data, in_prose = loads_json_object_ex(raw)
-        if in_prose and not (set(data) & set(ExtractorOutput.model_fields)):
+        if in_prose and data and not (set(data) & set(ExtractorOutput.model_fields)):
             # An object found in a sentence is only the answer if it looks like one (any of its fields); the whole reply
             # being `{}` is still a valid empty answer.
             raise ValueError("an object in the reply has none of the extractor's fields")

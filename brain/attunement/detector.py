@@ -128,8 +128,8 @@ def _parse_output(raw: str, source_turn_id: str, persona_dir: Path | None = None
     try:
         payload: dict[str, Any]
         payload, in_prose = loads_json_object_ex(raw)
-        if in_prose and not (set(payload) & _DETECTOR_KEYS):
-            # An object found in a sentence is only the answer if it looks like one; the whole reply is always taken.
+        if in_prose and payload and not (set(payload) & _DETECTOR_KEYS):
+            # An object found in a sentence is only the answer if it looks like one; an empty object is a valid empty answer.
             raise ValueError("an object in the reply has none of the detector's keys")
     except ValueError as exc:  # JSONDecodeError is a ValueError
         record_parse_failure(persona_dir, site="attunement", raw=raw, error=f"non-JSON: {exc}")

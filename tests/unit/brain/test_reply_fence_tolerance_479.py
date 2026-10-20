@@ -140,3 +140,23 @@ def test_an_empty_object_that_is_the_whole_reply_is_still_a_valid_empty_answer(t
     )
     assert out == ExtractorOutput()
     assert _rows(tmp_path) == []
+
+
+# --- confirm review S5: `{}` with chatter around it is still the valid empty answer ---------------------------------------
+
+
+@pytest.mark.parametrize("wrap", ["prose-before-fence", "prose-after-fence", "prose-both-sides", "bare-object-with-prose"])
+def test_an_empty_object_with_chatter_is_a_valid_empty_answer_for_the_extractor(tmp_path, wrap):
+    reply = _WRAPPINGS[wrap]("{}")
+    out = extract_from_thinking(
+        provider=_Provider(reply), monologue_blocks=("m",), visible_reply="hi", recent_turn_context=(), persona_dir=tmp_path
+    )
+    assert out == ExtractorOutput()
+    assert _rows(tmp_path) == []  # nothing failed: `{}` is what a model says when there is nothing to extract
+
+
+@pytest.mark.parametrize("wrap", ["prose-before-fence", "bare-object-with-prose"])
+def test_an_empty_object_with_chatter_is_not_a_parse_failure_for_the_detector(tmp_path, wrap):
+    out = _parse_output(_WRAPPINGS[wrap]("{}"), "turn-1", tmp_path)
+    assert out.current_read.tone_label == "unknown"
+    assert _rows(tmp_path) == []
