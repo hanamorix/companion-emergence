@@ -550,6 +550,8 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
       }}
     >
       <GlobalStatusDot mode={state?.mode ?? "live"} stateError={stateError} />
+      {/* #456 (review S9): the stop display and the hard-exit offer of any restart, wherever the user is */}
+      <StopProgress persona={persona} currentMode={state?.mode ?? "live"} floating />
       <LeftPanel
         state={state}
         persona={persona}

@@ -13,7 +13,6 @@ import {
   type RestartState,
 } from "../../hooks/useRestartBridge";
 import type { PersonaState } from "../../bridge";
-import { StopProgress } from "./StopProgress";
 
 interface Props {
   persona: string;
@@ -58,7 +57,6 @@ export function RestartBridgeButton({ persona, currentMode }: Props) {
       >
         {LABELS[state]}
       </button>
-      <StopProgress persona={persona} currentMode={currentMode} />
       {(state === "forcing" || state === "failed") && fellThrough && (
         <div
           style={{

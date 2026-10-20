@@ -131,6 +131,22 @@ vi.mock("./bridgeVersionCheck", () => ({
   _resetForTests: vi.fn(),
 }));
 
+// ── useRestartBridge: real, with an optional override of what it returns (#456 review S9) ────────────────────
+const { restartOverride } = vi.hoisted(() => ({
+  restartOverride: { value: null as null | Record<string, unknown> },
+}));
+
+vi.mock("./hooks/useRestartBridge", async (importOriginal) => {
+  const real = await importOriginal<typeof import("./hooks/useRestartBridge")>();
+  return {
+    ...real,
+    useRestartBridge: (persona: string, mode: Parameters<typeof real.useRestartBridge>[1]) => {
+      const r = real.useRestartBridge(persona, mode);
+      return restartOverride.value ? { ...r, ...restartOverride.value } : r;
+    },
+  };
+});
+
 // ── Import App after all mocks are in place ───────────────────────────────────
 import App from "./App";
 import { NOTICE_ROLLED_BACK } from "./brainRecovery";
@@ -204,6 +220,30 @@ describe("App boot routing", () => {
     await waitFor(() =>
       expect(screen.getByText(/different version/i)).toBeInTheDocument()
     );
+  });
+
+  it("(#456 review S9) a restart's stop display and offer show over the main screen, wherever the user is", async () => {
+    readAppConfig.mockResolvedValue(baseConfig("nell"));
+    ensureBridgeRunning.mockResolvedValue(undefined);
+    ensureBridgeCurrent.mockResolvedValue("ok");
+    restartOverride.value = {
+      state: "stopping",
+      progress: "Stopping. Waiting for 1 task to finish: soul review.",
+      offerHardExit: true,
+      offerText: "Still waiting for 1 task after 3 minutes: soul review. Hard exit now?",
+    };
+    try {
+      render(<App />);
+      await waitFor(() => expect(screen.getByTestId("chat-panel")).toBeInTheDocument());
+      // The Connection panel (inside the stubbed LeftPanel) is not open: the display is the app's own.
+      const display = screen.getByTestId("stop-progress");
+      expect(display).toHaveTextContent("Stopping. Waiting for 1 task to finish: soul review.");
+      expect(display).toHaveStyle({ position: "fixed" });
+      expect(screen.getByText("Hard exit")).toBeInTheDocument();
+      expect(screen.getByText("Keep waiting")).toBeInTheDocument();
+    } finally {
+      restartOverride.value = null;
+    }
   });
 
   it("no selection, ≥2 personas → picker shown", async () => {
