@@ -227,8 +227,16 @@ def _near_dup_pass(
             # Re-read both (#431): an earlier merge in this pass may have raised either one's
             # importance and the in-memory objects never see it. Stale, the carry-over below lowers
             # a raised canonical again, or drops its max with it, and the archive gets a stale pre-image.
-            keep = store.get(keep.id, bump=False) or keep
-            drop = store.get(drop.id, bump=False) or drop
+            # A row gone since the pass listed it (a concurrent writer) is never archived from the
+            # stale copy, deleted or updated: the pair is skipped and logged.
+            keep_now = store.get(keep.id, bump=False)
+            drop_now = store.get(drop.id, bump=False)
+            if keep_now is None or drop_now is None:
+                logger.warning(
+                    "dedup_sweep: skipping pair %s / %s: a row vanished mid-pass", keep.id, drop.id
+                )
+                continue
+            keep, drop = keep_now, drop_now
             _archive_preimage(persona_dir, drop)
             store.hard_delete(drop.id)
             removed.add(drop.id)

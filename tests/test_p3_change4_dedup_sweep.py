@@ -360,3 +360,30 @@ def test_431_failed_exemption_read_during_a_sweep_is_logged_as_the_sweep(tmp_pat
 
     messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert messages and all(m.startswith("dedup_sweep: ") for m in messages), messages
+
+
+def test_431_near_dup_pass_skips_a_pair_whose_row_vanished_mid_pass(tmp_path, caplog):
+    """#431: a row deleted after the pass listed it (a concurrent writer) must not be archived from a
+    stale in-memory copy, nor deleted or updated as if it were still there. Guards against falling
+    back to the stale object when the re-read finds nothing: the pair is skipped with a warning."""
+    import logging
+
+    store = MemoryStore(tmp_path / "memories.db")
+    a = _aged("Bob painted the fence.", 2)
+    c = _aged("Bob was painting the fence.", 1)
+    for m in (a, c):
+        store.create(m)
+
+    def _judge_while_c_vanishes(candidate: Memory, _canonical: Memory) -> str:
+        store.hard_delete(candidate.id)  # a concurrent writer removes C between list and re-read
+        return "duplicate"
+
+    with caplog.at_level(logging.WARNING, logger="brain.engines.dedup_sweep"):
+        report = run_dedup_sweep(store, tmp_path, judge=_judge_while_c_vanishes)
+
+    assert _active_ids(store) == {a.id}
+    assert (report.rows_removed, report.merges) == (0, [])
+    assert not (tmp_path / _ARCHIVE_FILENAME).exists()
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(a.id in m and c.id in m for m in warnings), warnings
+    store.close()
