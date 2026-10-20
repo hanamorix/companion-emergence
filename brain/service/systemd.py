@@ -33,7 +33,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from brain.health.attempt_heal import save_with_backup_text
+from brain.utils.atomic_write import save_with_backup_text
 from brain.paths import get_log_dir, get_persona_dir
 from brain.service import UnsupportedPlatformError
 from brain.setup import validate_persona_name

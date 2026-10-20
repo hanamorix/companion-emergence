@@ -44,8 +44,8 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 
-from brain.health.attempt_heal import _replace_with_retry
 from brain.health.json_io import Recovery, iter_jsonl_raw, write_jsonl
+from brain.utils.atomic_write import _replace_with_retry
 from brain.utils.file_lock import file_lock
 from brain.utils.time import lenient_utc
 

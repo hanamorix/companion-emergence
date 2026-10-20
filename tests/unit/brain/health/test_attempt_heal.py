@@ -15,11 +15,9 @@ from pathlib import Path
 
 import pytest
 
-import brain.health.attempt_heal as heal
-from brain.health.attempt_heal import (
-    save_with_backup,
-    save_with_backup_text,
-)
+import brain.utils.atomic_write as heal
+from brain.health.attempt_heal import save_with_backup
+from brain.utils.atomic_write import save_with_backup_text
 from brain.health.json_io import Recovery, read_json_result
 
 
@@ -279,7 +277,7 @@ def test_save_with_backup_text_retries_transient_permission_error(
     """
     import os
 
-    import brain.health.attempt_heal as heal
+    import brain.utils.atomic_write as heal
 
     p = tmp_path / "x.json"
     save_with_backup_text(p, "v1")
@@ -305,7 +303,7 @@ def test_save_with_backup_text_reraises_persistent_permission_error(
     tmp_path: Path, monkeypatch
 ) -> None:
     """A real permission problem must still fail loud after the retry budget."""
-    import brain.health.attempt_heal as heal
+    import brain.utils.atomic_write as heal
 
     p = tmp_path / "x.json"
     save_with_backup_text(p, "v1")

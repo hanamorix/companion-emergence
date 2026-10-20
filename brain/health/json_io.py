@@ -62,14 +62,13 @@ from pathlib import Path
 from typing import Any, Literal
 
 from brain.health.anomaly import BrainAnomaly
-from brain.health.attempt_heal import (
+from brain.health.attempt_heal import _classify_cause, _filename_safe_timestamp
+from brain.health.jsonl_reader import JsonlLineError, _parse_lines
+from brain.utils.atomic_write import (
     _REPLACE_RETRY_SLEEP_S,
-    _classify_cause,
-    _filename_safe_timestamp,
     _replace_with_retry,
     save_with_backup_text,
 )
-from brain.health.jsonl_reader import JsonlLineError, _parse_lines
 from brain.utils.file_lock import file_lock
 from brain.utils.log_throttle import warn_throttled
 

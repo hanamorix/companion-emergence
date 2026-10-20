@@ -157,12 +157,12 @@ def test_overlay_lock_sidecar_rules(tmp_path, sleeper):
             pass
 
 
-# ---- save temps (attempt_heal, #439's site) ----
+# ---- save temps (atomic_write, #439's site) ----
 
 
 @linux_only
 def test_save_temp_of_a_reused_pid_is_removed_live_owner_kept(tmp_path, sleeper):
-    from brain.health import attempt_heal as ah
+    from brain.utils import atomic_write as ah
 
     target = tmp_path / "x.json"
     target.write_text("{}", encoding="utf-8")

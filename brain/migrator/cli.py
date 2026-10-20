@@ -13,7 +13,7 @@ from pathlib import Path
 
 from brain import process_identity
 from brain.emotion import vocabulary as _vocabulary
-from brain.health.attempt_heal import save_with_backup_text
+from brain.utils.atomic_write import save_with_backup_text
 from brain.health.json_io import write_json
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore

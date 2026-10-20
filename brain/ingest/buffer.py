@@ -18,7 +18,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from brain.health.attempt_heal import save_with_backup_text
+from brain.utils.atomic_write import save_with_backup_text
 from brain.health.json_io import (
     Recovery,
     append_jsonl,
