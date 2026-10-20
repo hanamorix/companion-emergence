@@ -177,3 +177,23 @@ def test_cli_health_no_destructive_actions(monkeypatch, tmp_path: Path):
     for forbidden in ("restore", "add", "delete"):
         with pytest.raises(SystemExit):
             main(["health", forbidden, "--persona", "testpersona"])
+
+
+def test_cli_health_show_lists_a_quarantine_alarm_and_acknowledge_clears_it(monkeypatch, tmp_path: Path, capsys):
+    """#470 review item 5: the gate's quarantine file is read, so a flood of quarantined candidates shows in `health show`."""
+    monkeypatch.setenv("NELLBRAIN_HOME", str(tmp_path))
+    persona_dir = _setup_persona(tmp_path / "personas")
+    now = datetime.now(UTC)
+    rows = [json.dumps({"quarantined_at": (now - timedelta(minutes=i)).isoformat(), "entry": {"id": f"c{i}"}}) for i in range(6)]
+    (persona_dir / "consolidation_quarantine.jsonl").write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    assert main(["health", "show", "--persona", "testpersona"]) == 0
+    out = capsys.readouterr().out
+    assert "Pending alarms: 1" in out
+    assert "consolidation_quarantine.jsonl: quarantined_candidates" in out
+    assert "(6 occurrences in window)" in out
+
+    assert main(["health", "acknowledge", "--persona", "testpersona", "--file", "consolidation_quarantine.jsonl"]) == 0
+    capsys.readouterr()
+    assert main(["health", "show", "--persona", "testpersona"]) == 0
+    assert "Pending alarms: 0" in capsys.readouterr().out

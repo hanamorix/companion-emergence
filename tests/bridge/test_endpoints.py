@@ -79,6 +79,20 @@ def test_health_counts_recent_parse_failures_per_site(persona_dir: Path):
     assert body["parse_failures_24h"] == {"extractor": 2, "attunement": 1}
 
 
+def test_health_counts_a_quarantine_flood_as_a_pending_alarm(persona_dir: Path):
+    """#470 review item 5: the gate's quarantine file is read. A gate bug that quarantines everything raises a pending alarm."""
+    import json
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    rows = [json.dumps({"quarantined_at": (now - timedelta(minutes=i)).isoformat(), "entry": {"id": f"c{i}"}}) for i in range(6)]
+    (persona_dir / "consolidation_quarantine.jsonl").write_text("\n".join(rows) + "\n", encoding="utf-8")
+    with _make_client(persona_dir) as c:
+        body = c.get("/health").json()
+    assert body["health_scan"] == "ok"
+    assert body["pending_alarms"] == 1
+
+
 def test_health_reports_scan_failure(persona_dir: Path, monkeypatch):
     import brain.bridge.server as srv
 
