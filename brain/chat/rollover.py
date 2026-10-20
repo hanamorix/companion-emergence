@@ -26,7 +26,6 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from brain.bridge.cli_throttle import ThrottleDeferred
 from brain.bridge.provider import LLMProvider
 from brain.chat.compaction import (
     build_compaction_provider,
