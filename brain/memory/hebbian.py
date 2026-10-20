@@ -107,9 +107,12 @@ class HebbianMatrix:
 
         Only a transaction opened here is rolled back. If one was already open on
         this connection (nothing in this class leaves one open, so only a caller
-        using ``_conn`` directly), the failed statement is already undone by
-        SQLite and the caller's earlier work is left for the caller to commit or
-        roll back. On success it is committed, as before.
+        using ``_conn`` directly), nothing is rolled back here: a failed statement
+        is undone by SQLite, but if the COMMIT itself fails, this write and the
+        caller's earlier work both stay pending in the caller's transaction, for
+        the caller to commit or roll back. On success it is committed, as before.
+        The rollback guard catches only ``Exception``: a KeyboardInterrupt during
+        rollback is left to propagate rather than be swallowed.
         """
         opened = not self._conn.in_transaction
         if opened:

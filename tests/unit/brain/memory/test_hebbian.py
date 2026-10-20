@@ -424,8 +424,12 @@ def test_strengthen_holds_the_write_lock_across_its_pre_read(tmp_path) -> None:
 
     real = m._conn
     m._conn = _ConnProxy(real, on_execute=_try_other_writer)
-    m.strengthen("a", "b", delta=0.5)
-    m._conn = real
-    assert outcome == ["database is locked"]
-    assert m.weight("a", "b") == 0.5
-    m.close()
+    try:
+        m.strengthen("a", "b", delta=0.5)
+    finally:
+        m._conn = real
+    try:
+        assert outcome == ["database is locked"]
+        assert m.weight("a", "b") == 0.5
+    finally:
+        m.close()
