@@ -411,6 +411,9 @@ def test_431_near_dup_pass_skips_a_pair_whose_survivor_vanished_mid_pass(tmp_pat
         report = run_dedup_sweep(store, tmp_path, judge=_judge_while_a_vanishes)
 
     assert _active_ids(store) == {c.id}
+    # The sweep's re-read of C must not count as a recall: an unbumped row keeps the stored values.
+    survivor = store.get(c.id, bump=False)
+    assert (survivor.recall_count, survivor.last_accessed_at) == (0.0, None)
     assert (report.rows_removed, report.merges) == (0, [])
     assert not (tmp_path / _ARCHIVE_FILENAME).exists()
     warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
@@ -602,4 +605,26 @@ def test_near_dup_pass_skips_a_pair_whose_judge_raised(tmp_path):
 
     assert _active_ids(store) == {a.id, d.id}
     assert [(m.canonical_id, m.removed_id) for m in report.merges] == [(a.id, c.id)]
+    store.close()
+
+
+def test_431_near_dup_merge_does_not_count_as_a_recall_and_previews_the_dropped_row(tmp_path):
+    """#431: the near-dup pass re-reads both rows of a pair before merging. Guards two failures: a
+    re-read that bumps recall (``store.get`` without ``bump=False``) raises the survivor's
+    ``recall_count`` and ``last_accessed_at``, so a maintenance sweep skews forgetting salience; and a
+    merge record whose preview shows the kept row's content instead of the removed one."""
+    store = MemoryStore(tmp_path / "memories.db")
+    a = _aged("Bob tuned the old guitar.", 2)
+    c = _aged("Bob was tuning the old guitar.", 1)
+    for m in (a, c):
+        store.create(m)
+
+    report = run_dedup_sweep(store, tmp_path, judge=lambda _x, _y: "duplicate")
+
+    survivor = store.get(a.id, bump=False)
+    assert _active_ids(store) == {a.id}
+    assert (survivor.recall_count, survivor.last_accessed_at) == (0.0, None)
+    assert [(m.canonical_id, m.removed_id, m.content_preview) for m in report.merges] == [
+        (a.id, c.id, c.content[:120])
+    ]
     store.close()
