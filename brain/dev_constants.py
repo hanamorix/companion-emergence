@@ -26,9 +26,18 @@ from __future__ import annotations
 # F-bob20k on the dev host; Phoebe-class hardware is 3-30x slower and was
 # IO-saturated (O15/O23) -> ~20-27 s estimated; 30 s is the next round value
 # above that. Other memories.db writers (this repo only) stay on their own
-# 5 s default (hebbian.db, works.db, soul.db, kindled_link's stores) — this
-# constant is memories.db-specific, not a global sqlite default.
+# 5 s default (hebbian.db, works.db, soul.db, kindled_link's stores), named by
+# SQLITE_STORE_BUSY_TIMEOUT_S below — this constant is memories.db-specific, not
+# a global sqlite default.
 MEMORIES_DB_BUSY_TIMEOUT_S: float = 30.0
+
+# --- busy timeout of the other SQLite stores (consolidation C9) -------------
+# The 5 s that hebbian.db, soul.db, kindled_link's store and works.db have
+# always run on (Python's own default `timeout`), applied at connect and as
+# `PRAGMA busy_timeout` by `brain.utils.sqlite_open.open_store_connection`.
+# Written out as 5000 in each store until the open sequence was consolidated.
+# `brain/initiate/resonance.py` still carries its own literal until it migrates.
+SQLITE_STORE_BUSY_TIMEOUT_S: float = 5.0
 
 # --- known-names file name (name-recall fix N1, S26) -------------------------
 # The kindled's running list of known name words: its own small SQLite file in

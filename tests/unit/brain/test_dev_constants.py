@@ -72,3 +72,9 @@ def test_embedding_matrix_py_sources_busy_timeout_from_dev_constants() -> None:
     source = inspect.getsource(embedding_matrix)
     assert "dev_constants.MEMORIES_DB_BUSY_TIMEOUT_S" in source
     assert "busy_timeout = 5000" not in source
+
+
+def test_sqlite_store_busy_timeout_is_five_seconds() -> None:
+    """C9: the named constant that replaced the written-out 5000 in the migrated stores."""
+    assert dev_constants.SQLITE_STORE_BUSY_TIMEOUT_S == 5.0
+    assert isinstance(dev_constants.SQLITE_STORE_BUSY_TIMEOUT_S, float)
