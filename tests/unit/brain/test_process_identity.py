@@ -123,3 +123,24 @@ def test_own_token_is_cached_and_matches_this_process():
         assert pi.is_token(tok)
         assert pi.matches(os.getpid(), tok) == "alive"
     assert pi.own_token() == tok
+
+
+def test_windows_reader_reads_the_error_saved_by_ctypes_not_a_clobbered_one(monkeypatch):
+    """Review S13: OpenProcess failing with ERROR_INVALID_PARAMETER (no such process) reads as GONE even when a later
+    call has overwritten the thread's last-error value: the reader uses the value ctypes saved (use_last_error)."""
+    import ctypes
+
+    from brain import process_identity as pi
+
+    class _Kernel32:
+        def OpenProcess(self, *_a):  # noqa: N802 - Win32 name
+            return 0
+
+        def GetLastError(self):  # noqa: N802 - Win32 name
+            return 0  # clobbered by something that ran after OpenProcess
+
+    k32 = _Kernel32()
+    monkeypatch.setattr(ctypes, "WinDLL", lambda name, use_last_error=False: k32, raising=False)
+    monkeypatch.setattr(ctypes, "windll", type("W", (), {"kernel32": k32})(), raising=False)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 87, raising=False)
+    assert pi._windows_token(4242) == pi.GONE

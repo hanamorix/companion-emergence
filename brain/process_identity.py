@@ -74,10 +74,12 @@ def _windows_token(pid: int) -> str:  # pragma: no cover - exercised on the Wind
     import ctypes
     from ctypes import wintypes
 
-    kernel32 = ctypes.windll.kernel32
+    # use_last_error (review S13): ctypes saves the error right after each call, so nothing that runs later can
+    # overwrite it before it is read.
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
     handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
     if not handle:
-        err = kernel32.GetLastError()
+        err = ctypes.get_last_error()  # type: ignore[attr-defined]
         return GONE if err == 87 else UNKNOWN  # ERROR_INVALID_PARAMETER: no such process
     try:
         code = wintypes.DWORD()
