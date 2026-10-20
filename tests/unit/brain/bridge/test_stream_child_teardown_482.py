@@ -31,25 +31,19 @@ DELTA = json.dumps(
 RESULT = json.dumps({"type": "result", "result": "hello", "is_error": False})
 
 
-def _alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    # a zombie still answers signal 0; an un-reaped child is exactly the defect, so read its state
-    try:
-        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
-            return fh.read().rsplit(")", 1)[1].split()[0] != "Z"
-    except OSError:
-        return False
+def _alive(proc: subprocess.Popen) -> bool:
+    """True while the child this test spawned is running: the Popen object's own ``poll()`` (portable; there is no /proc on macOS,
+    and a pid alone can be reused). The child has printed its first frame before this is asked, so it has started."""
+    return proc.poll() is None
 
 
-def _reaped(pid: int) -> bool:
-    """True when the pid no longer exists at all (not even as an un-reaped zombie)."""
+def _reaped(proc: subprocess.Popen) -> bool:
+    """True when the child was waited for (its exit status is collected) and the pid no longer exists. The Popen object is the one the
+    provider used, so ``returncode`` is set exactly when the provider reaped it; the pid probe alone could be fooled by a reused pid."""
+    if proc.returncode is None:
+        return False
     try:
-        os.kill(pid, 0)
+        os.kill(proc.pid, 0)
     except ProcessLookupError:
         return True
     return False
@@ -115,7 +109,7 @@ def test_stdout_eof_with_a_child_that_never_exits_does_not_hang_and_reaps_it(chi
     assert time.monotonic() - t0 < 3.5
     assert len(events) == 1 and isinstance(events[0], StreamError)
     assert events[0].stage == "claude_cli_exit"
-    assert _reaped(spawned[0].pid)
+    assert _reaped(spawned[0])
 
 
 def test_an_idle_timeout_kills_and_reaps_a_child_that_ignores_sigterm(child, monkeypatch):
@@ -125,7 +119,7 @@ def test_an_idle_timeout_kills_and_reaps_a_child_that_ignores_sigterm(child, mon
     events = list(run(script))
     assert len(events) == 1 and isinstance(events[0], StreamError)
     assert events[0].stage == "claude_cli_idle_timeout"
-    assert _reaped(spawned[0].pid)
+    assert _reaped(spawned[0])
 
 
 def test_closing_the_generator_kills_and_reaps_the_child(child):
@@ -139,9 +133,9 @@ def test_closing_the_generator_kills_and_reaps_the_child(child):
     gen = run(script)
     first = next(gen)
     assert isinstance(first, TextDelta)
-    assert _alive(spawned[0].pid)
+    assert _alive(spawned[0])
     gen.close()
-    assert _reaped(spawned[0].pid)
+    assert _reaped(spawned[0])
 
 
 def test_a_result_frame_does_not_leave_a_lingering_child_behind(child):
@@ -154,7 +148,7 @@ def test_a_result_frame_does_not_leave_a_lingering_child_behind(child):
     )
     events = list(run(script))
     assert [type(e) for e in events] == [StreamDone]
-    assert _reaped(spawned[0].pid)
+    assert _reaped(spawned[0])
 
 
 def test_a_child_that_exits_on_its_own_after_the_result_frame_is_just_reaped(child):
@@ -181,3 +175,28 @@ def test_the_teardown_waits_are_one_named_value_not_literals():
     assert literal_timeouts == [], literal_timeouts
     drain_text = inspect.signature(provider._StderrDrain.text).parameters["wait_s"]
     assert drain_text.default is None  # None means the grace value, not a second number
+
+
+def test_the_liveness_precondition_does_not_depend_on_proc(monkeypatch):
+    """CI (python macos-latest): `test_closing_the_generator_kills_and_reaps_the_child` failed at `assert _alive(pid)` although the
+    child was running (it had printed its first frame, which the test had just read). The helper decided "is it a zombie?" by reading
+    `/proc/<pid>/stat`; macOS has no /proc, the read raised OSError and the helper answered False for a live process. The probe is
+    the Popen object's own `poll()`, which is portable and exact (the test spawned the child)."""
+    import builtins
+
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    real_open = builtins.open
+
+    def no_proc(file, *a, **k):
+        if str(file).startswith("/proc"):
+            raise FileNotFoundError(file)  # what macOS does
+        return real_open(file, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", no_proc)
+    try:
+        assert _alive(proc)
+    finally:
+        monkeypatch.undo()
+        proc.kill()
+        proc.wait(timeout=5)
+    assert not _alive(proc)  # reaped: not alive
