@@ -282,8 +282,11 @@ def test_after_run_decision_runs_however_server_run_ends(tmp_path: Path, monkeyp
     assert state_file.read(persona_dir).phase == "stopped"
 
 
-def test_after_run_with_work_still_running_takes_the_hard_exit_path(tmp_path: Path, monkeypatch) -> None:
-    """Plan I4 runner: run() ended but a task still runs -> the hard-exit path at once, never "stopped"."""
+@pytest.mark.parametrize("stop_begun", [True, False])
+def test_after_run_with_work_still_running_takes_the_hard_exit_path(tmp_path: Path, monkeypatch, stop_begun) -> None:
+    """Plan I4 runner: run() ended but a task still runs -> the hard-exit path at once, never "stopped". Review S7: a
+    run that ended with no stop begun (no request, no signal) is recorded as a crash, not a deliberate hard exit, so
+    the app's crash watchdog restarts it."""
     from brain.bridge import shutdown as shutdown_mod
     from brain.bridge import shutdown_progress
 
@@ -311,13 +314,16 @@ def test_after_run_with_work_still_running_takes_the_hard_exit_path(tmp_path: Pa
 
         def run(self):
             reg.register("stub task")
-            raise KeyboardInterrupt
+            if stop_begun:
+                self.controller.note_signal()  # the SIGINT that uvicorn re-raises as KeyboardInterrupt
+                raise KeyboardInterrupt
+            raise RuntimeError("uvicorn's loop ended unexpectedly")
 
     monkeypatch.setattr(runner.uvicorn, "Config", lambda *a, **k: None)
     monkeypatch.setattr(runner.uvicorn, "Server", FakeServer)
     with pytest.raises(_Exited):
         runner.run_bridge_foreground(persona_dir, client_origin="tests")
-    assert exits == ["hard_exit"]
+    assert exits == (["hard_exit"] if stop_begun else ["crash"])
     assert state_file.read(persona_dir).phase == "running"
 
 

@@ -133,6 +133,13 @@ describe("BridgeWatchdog (#456 C24)", () => {
     expect(deps.start).not.toHaveBeenCalled();
   });
 
+  it("(review S7) a run the bridge itself recorded as a crash is restarted", async () => {
+    status = crashed({ phase: "hard_exit", stop_reason: "crash" });
+    dog.onMode("bridge_down");
+    await advance(30_000);
+    expect(deps.start).toHaveBeenCalledTimes(1);
+  });
+
   it("a pending intent (a kill that never happened) or another bridge's committed intent does not stop it", async () => {
     status = crashed({ stop_intent: { state: "pending", pid: 4242, pid_token: TOKEN, reason: "user_kill" } });
     dog.onMode("bridge_down");

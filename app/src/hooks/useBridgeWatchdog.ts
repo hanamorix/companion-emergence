@@ -26,11 +26,17 @@ export const HEALTHY_RESET_MS = 600_000;
 
 const SERVICE_ORIGINS = new Set(["launchd", "systemd", "task-scheduler"]);
 
+/** The bridge's own record of a run that ended unexpectedly with work still running (brain/bridge/shutdown.py
+ *  REASON_CRASH): not a stop. */
+export const CRASH_REASON = "crash";
+
 /** The crash test (C24) on one `nell supervisor status --json` reading. */
 export function isCrash(s: BridgeStatus): boolean {
   if (s.alive !== "gone") return false;
-  if (s.phase !== "running") return false; // a stop that was recorded (stopping, stopped, hard exit) is not a crash
-  if (s.stop_reason) return false;
+  if (s.stop_reason !== CRASH_REASON) {
+    if (s.phase !== "running") return false; // a stop that was recorded (stopping, stopped, hard exit) is not a crash
+    if (s.stop_reason) return false;
+  }
   const intent = s.stop_intent;
   if (intent && intent.state === "committed" && intent.pid === s.pid && intent.pid_token === s.pid_token) {
     return false; // a user kill of this bridge

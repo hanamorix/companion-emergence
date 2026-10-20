@@ -98,8 +98,14 @@ def _after_run(persona_dir: Path, app: object, monitor: object) -> None:
         monitor.stop()  # type: ignore[attr-defined]  # its final progress record names this bridge, then "stopped"
         _write_stopped(persona_dir)
         return
-    logger.error("bridge run ended with work still running; hard exit")
-    shutdown_mod.hard_exit(persona_dir, shutdown_mod.REASON_HARD_EXIT)
+    c = getattr(monitor, "controller", None)
+    deliberate = c is not None and (c.stopping or c.requested or c.signal_count > 0)
+    if deliberate:
+        logger.error("bridge run ended with work still running; hard exit")
+        shutdown_mod.hard_exit(persona_dir, shutdown_mod.REASON_HARD_EXIT)
+    else:
+        logger.error("bridge run ended unexpectedly with work still running and no stop requested; recording a crash")
+        shutdown_mod.hard_exit(persona_dir, shutdown_mod.REASON_CRASH)
 
 
 _RUNTIME_LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
