@@ -90,7 +90,7 @@ def test_kill_on_a_running_bridge_uses_the_helper(pd, sleeper, monkeypatch):
     monkeypatch.setattr(kill, "kill_bridge", lambda persona_dir, persona=None, **kw: calls.append(kw)
                         or kill.KillResult("killed", "bridge killed"))
     assert daemon.cmd_stop(_stop_args(kill=True, skip_hard_exit_request=True)) == 0
-    assert calls == [{"timeout": 5.0, "skip_hard_exit_request": True}]
+    assert calls == [{"timeout": 5.0, "skip_hard_exit_request": True, "expect_pid": None, "expect_token": None}]
 
 
 # ---------------------------------------------------------------- C43: pre-PR bridges (D22)
@@ -263,3 +263,28 @@ def test_windows_uninstall_does_not_end_the_task_itself(monkeypatch, tmp_path):
     windows_service.uninstall_service(persona="nell")
     assert all(c[0] != "/End" for c in calls)
 
+
+
+def test_stop_kill_passes_the_expected_bridge_to_the_helper(monkeypatch, tmp_path):
+    """Review S8 pin: `nell supervisor stop --kill --expect-pid P --expect-token T` hands P and T to the kill helper,
+    and a bridge_changed refusal exits 1 with its message."""
+    from brain import cli
+    from brain.bridge import daemon, kill
+
+    seen: dict = {}
+
+    def _fake_kill(persona_dir, persona=None, **kw):
+        seen.update(kw)
+        return kill.KillResult("bridge_changed", "bridge_changed: another bridge runs now; nothing killed")
+
+    monkeypatch.setattr(kill, "kill_bridge", _fake_kill)
+    monkeypatch.setattr(daemon.state_file, "read", lambda pd: daemon.state_file.BridgeState(
+        persona="nell", pid=4242, port=1, started_at="t", stopped_at=None, shutdown_clean=False, client_origin="tauri",
+        pid_token="linux:b:4242:1", identity="token", phase="running"))
+    monkeypatch.setattr(daemon.state_file, "bridge_liveness", lambda st, pd: daemon.state_file.ALIVE)
+    monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
+    rc = cli.main(["supervisor", "stop", "--persona", "nell", "--kill", "--skip-hard-exit-request",
+                   "--expect-pid", "4242", "--expect-token", "linux:b:4242:0"])
+    assert rc == 1
+    assert seen["expect_pid"] == 4242 and seen["expect_token"] == "linux:b:4242:0"
+    assert seen["skip_hard_exit_request"] is True

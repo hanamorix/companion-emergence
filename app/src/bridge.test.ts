@@ -275,11 +275,15 @@ describe("getBridgeCredentials", () => {
     await invokeForceRestart("alice");
     await invokeForceRestart("alice", true);
     await invokeForceRestart("alice", true, false);
+    await invokeForceRestart("alice", true, true, { pid: 4242, pid_token: "linux:b:4242:1" });
     const calls = vi.mocked(invoke).mock.calls.filter(([cmd]) => cmd === "force_restart_bridge");
     expect(calls.map(([, args]) => args)).toEqual([
-      { persona: "alice", skipHardExitRequest: false, startAfter: true },
-      { persona: "alice", skipHardExitRequest: true, startAfter: true },
-      { persona: "alice", skipHardExitRequest: true, startAfter: false }, // #456 review M4: end only, for an install
+      { persona: "alice", skipHardExitRequest: false, startAfter: true, pid: null, pidToken: null },
+      { persona: "alice", skipHardExitRequest: true, startAfter: true, pid: null, pidToken: null },
+      // #456 review M4: end only, for an install
+      { persona: "alice", skipHardExitRequest: true, startAfter: false, pid: null, pidToken: null },
+      // #456 review S8: kill only the watched bridge
+      { persona: "alice", skipHardExitRequest: true, startAfter: true, pid: 4242, pidToken: "linux:b:4242:1" },
     ]);
   });
 });

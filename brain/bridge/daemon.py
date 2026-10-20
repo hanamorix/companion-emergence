@@ -635,7 +635,11 @@ def cmd_stop(args) -> int:
             return 1
         return _print_kill_result(
             kill_mod.kill_bridge(
-                persona_dir, timeout=timeout, skip_hard_exit_request=bool(getattr(args, "skip_hard_exit_request", False))
+                persona_dir,
+                timeout=timeout,
+                skip_hard_exit_request=bool(getattr(args, "skip_hard_exit_request", False)),
+                expect_pid=getattr(args, "expect_pid", None),
+                expect_token=getattr(args, "expect_token", None),
             )
         )
     if state_file.is_legacy(s):

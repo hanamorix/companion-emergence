@@ -305,7 +305,7 @@ async function watchStop(persona: string, pinned: Pin | null, start = true): Pro
         return gone();
       }
       setShared({ fellThrough: "the bridge did not act on the hard exit" });
-      return (await forced(persona, true, start)) ? "forced" : "failed";
+      return (await forced(persona, true, start, pin)) ? "forced" : "failed";
     }
     await sleep(PROGRESS_POLL_MS);
   }
@@ -313,11 +313,19 @@ async function watchStop(persona: string, pinned: Pin | null, start = true): Pro
 
 /** The forced path: `nell supervisor stop --kill [--skip-hard-exit-request]`, then (``start``) the normal start, in
  *  Rust. Without ``start`` (a service install, M4) the bridge is only ended. */
-async function forced(persona: string, skipHardExitRequest: boolean, start = true): Promise<boolean> {
+async function forced(persona: string, skipHardExitRequest: boolean, start = true, pin: Pin | null = null): Promise<boolean> {
   transition("forcing");
   try {
-    await invokeForceRestart(persona, skipHardExitRequest, start);
+    if (pin) {
+      await invokeForceRestart(persona, skipHardExitRequest, start, { pid: pin.pid, pid_token: pin.token });
+    } else {
+      await invokeForceRestart(persona, skipHardExitRequest, start); // a pre-PR bridge has no token to pin
+    }
   } catch (e) {
+    if (errString(e).includes("bridge_changed")) {
+      // Review S8: the watched bridge is already gone and another one runs; nothing was killed.
+      return start ? startFresh(persona) : true;
+    }
     setShared({ errorDetail: errString(e) || FAILED_USER_MESSAGE });
     return false;
   }
@@ -393,7 +401,11 @@ async function stopIsRecorded(persona: string): Promise<boolean> {
 }
 
 /** Ask a new bridge to stop (C17 c, d, g). "stopping" once it began; "forced" after the kill path; "failed". */
-async function requestStop(persona: string, start = true): Promise<"stopping" | "forced" | "failed"> {
+async function requestStop(
+  persona: string,
+  start = true,
+  pin: Pin | null = null,
+): Promise<"stopping" | "forced" | "failed"> {
   transition("requesting");
   const deadline = Date.now() + HARD_EXIT_OFFER_AFTER_MS;
   for (;;) {
@@ -410,7 +422,7 @@ async function requestStop(persona: string, start = true): Promise<"stopping" | 
     if (!(await healthAnswers(persona))) {
       // (g) neither /health nor the request answers and no stop is recorded: the forced path
       setShared({ fellThrough: "the bridge answered neither /health nor the stop request" });
-      return (await forced(persona, true, start)) ? "forced" : "failed";
+      return (await forced(persona, true, start, pin)) ? "forced" : "failed";
     }
     if (Date.now() >= deadline) {
       setShared({ errorDetail: FAILED_USER_MESSAGE });
@@ -481,10 +493,11 @@ async function stopBridge(persona: string, start: boolean): Promise<boolean> {
     // (j) a pre-PR bridge: proven -> the old request and the kill after 3 s; unproven -> the normal start.
     return status.proven ? stopPrePr(persona, start) : finish();
   }
-  const requested = await requestStop(persona, start);
+  const pin = pinOf(status);
+  const requested = await requestStop(persona, start, pin);
   if (requested === "forced") return true;
   if (requested === "failed") return false;
-  const outcome = await watchStop(persona, pinOf(status), start);
+  const outcome = await watchStop(persona, pin, start);
   if (outcome === "forced") return true;
   if (outcome === "failed") return false;
   if (outcome === "legacy") return stopPrePr(persona, start);

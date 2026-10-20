@@ -618,3 +618,19 @@ def test_a_second_ctrl_c_cannot_skip_the_resume_either(tmp_path, fake):
     assert _intent(b.pd) is None
     assert all(s not in ("gone", psutil.STATUS_STOPPED) for s in b.statuses().values())
     assert signal.getsignal(signal.SIGINT) is before
+
+
+def test_an_expected_bridge_that_is_no_longer_named_is_not_killed(tmp_path, fake):
+    """Review S8 pin (main ruling, D16 amended): with --expect-pid / --expect-token the helper refuses with
+    bridge_changed, before writing anything, when the record names another bridge; it kills only the expected one."""
+    b = fake()
+    st = state_file.read(b.pd)
+    r = kill.kill_bridge(b.pd, timeout=5, expect_pid=b.pid, expect_token="linux:watched-earlier:1:1")
+    assert r.outcome == "bridge_changed" and r.message.startswith("bridge_changed")
+    assert _intent(b.pd) is None
+    assert not shutdown_progress.path(b.pd, shutdown_progress.REQUEST_FILENAME).exists()
+    assert all(s not in ("gone", psutil.STATUS_STOPPED) for s in b.statuses().values())
+    r = kill.kill_bridge(b.pd, timeout=5, expect_pid=b.pid + 1, expect_token=st.pid_token)
+    assert r.outcome == "bridge_changed"
+    r = kill.kill_bridge(b.pd, timeout=10, expect_pid=b.pid, expect_token=st.pid_token)
+    assert r.outcome == "killed" and b.all_gone()

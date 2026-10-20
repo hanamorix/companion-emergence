@@ -3272,6 +3272,17 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="with --kill: do not ask a service-run bridge for a hard exit first (used after a hard exit was ignored)",
     )
+    s_stop.add_argument(
+        "--expect-pid",
+        type=int,
+        default=None,
+        help="with --kill: end the bridge only if it is still this pid (with --expect-token); used by the desktop app",
+    )
+    s_stop.add_argument(
+        "--expect-token",
+        default=None,
+        help="with --kill and --expect-pid: the identity token the bridge must still carry",
+    )
     s_stop.set_defaults(func=cmd_stop)
 
     s_status = s_actions.add_parser("status", help="Show bridge daemon status.")

@@ -326,7 +326,7 @@ describe("useRestartBridge: a new bridge (#456)", () => {
     const run = startRestart(() => result.current.restart());
     await advance(2000);
     expect(m.force).toHaveBeenCalledTimes(1);
-    expect(m.force).toHaveBeenCalledWith(PERSONA, true, true); // (m) --skip-hard-exit-request
+    expect(m.force).toHaveBeenCalledWith(PERSONA, true, true, { pid: 4242, pid_token: "tok-4242" }); // (m) --skip-hard-exit-request
     expect(result.current.fellThrough).toMatch(/answered neither/);
     await expect(run.done()).resolves.toBe(true);
     expect(result.current.state).toBe("reconnecting");
@@ -365,7 +365,7 @@ describe("useRestartBridge: a new bridge (#456)", () => {
     await advance(HARD_EXIT_OFFER_AFTER_MS - 2000);
     expect(m.force).not.toHaveBeenCalled();
     await advance(3000);
-    expect(m.force).toHaveBeenCalledWith(PERSONA, true, true);
+    expect(m.force).toHaveBeenCalledWith(PERSONA, true, true, { pid: 4242, pid_token: "tok-4242" });
     expect(result.current.fellThrough).toMatch(/did not act on the hard exit/);
     await expect(run.done()).resolves.toBe(true);
   });
@@ -405,6 +405,24 @@ describe("useRestartBridge: a new bridge (#456)", () => {
     await expect(run.done()).resolves.toBe(true);
   });
 
+  it("(review S8) a forced kill the helper refuses with bridge_changed kills nothing and goes on to the normal start", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.health = false;
+    const m = mocks();
+    m.force.mockImplementation(async () => {
+      w = { ...fresh(), pid: 5151, token: "tok-5151" }; // another bridge took its place; the helper refused
+      throw "supervisor stop --kill failed (exit 1): bridge_changed: another bridge is running now; nothing killed";
+    });
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    const run = startRestart(() => result.current.restart());
+    await advance(10_000);
+    expect(m.force).toHaveBeenCalledWith(PERSONA, true, true, { pid: 4242, pid_token: "tok-4242" });
+    await expect(run.done()).resolves.toBe(true);
+    expect(m.start).toHaveBeenCalledTimes(1);
+    expect(result.current.state).toBe("reconnecting");
+  });
+
   it("(m) a forced kill that errors (e.g. force_restart_timeout) shows the error and fails", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(T0);
@@ -438,7 +456,7 @@ describe("useRestartBridge: time limits (#456 review M1)", () => {
     await advance(TIMEOUT_SHUTDOWN_MS - 100);
     expect(m.force).not.toHaveBeenCalled();
     await advance(TIMEOUT_SHUTDOWN_MS + 200); // the request's limit, then the /health probe's
-    expect(m.force).toHaveBeenCalledWith(PERSONA, true, true);
+    expect(m.force).toHaveBeenCalledWith(PERSONA, true, true, { pid: 4242, pid_token: "tok-4242" });
     const signal = m.shutdown.mock.calls[0][1] as AbortSignal;
     expect(signal.aborted).toBe(true); // the hung request is cancelled, not left open
     await advance(1000);
@@ -505,7 +523,7 @@ describe("stopBridgeThen: the service install's stop (#456 C58 d, review M4)", (
     });
     await advance(2000);
     await expect(p).resolves.toEqual({ stopped: true, error: null });
-    expect(m.force).toHaveBeenCalledWith(PERSONA, true, false);
+    expect(m.force).toHaveBeenCalledWith(PERSONA, true, false, { pid: 4242, pid_token: "tok-4242" });
     expect(seen).toEqual(["install"]);
     expect(m.start).not.toHaveBeenCalled();
   });

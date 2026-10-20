@@ -707,6 +707,28 @@ async fn bridge_status(app: tauri::AppHandle, persona: String) -> Result<serde_j
     }
 }
 
+/// `nell supervisor stop --kill` arguments. With `expect` (the bridge the app is watching: pid + identity token), the
+/// helper kills only that bridge and otherwise refuses with `bridge_changed` (#456 review S8, D16 amended).
+pub(crate) fn stop_kill_args(persona: &str, skip_hard_exit_request: bool, expect: Option<(i64, Option<String>)>) -> Vec<String> {
+    let mut args: Vec<String> = ["supervisor", "stop", "--persona", persona, "--kill", "--timeout"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    args.push(KILL_TIMEOUT_S.to_string());
+    if skip_hard_exit_request {
+        args.push("--skip-hard-exit-request".to_string());
+    }
+    if let Some((pid, token)) = expect {
+        args.push("--expect-pid".to_string());
+        args.push(pid.to_string());
+        if let Some(token) = token {
+            args.push("--expect-token".to_string());
+            args.push(token);
+        }
+    }
+    args
+}
+
 /// The app's forced path (D10): `nell supervisor stop --kill` (identity-checked; the bridge and every process it
 /// started), then the normal start (`ensure_bridge_running`, which routes to an installed service in Python). With
 /// `skip_hard_exit_request` (after a hard exit the bridge ignored) the helper does not ask again. The helper runs
@@ -718,6 +740,8 @@ async fn force_restart_bridge(
     persona: String,
     skip_hard_exit_request: Option<bool>,
     start_after: Option<bool>,
+    pid: Option<i64>,
+    pid_token: Option<String>,
 ) -> Result<(), String> {
     validate_persona_name(&persona)?;
     let skip = skip_hard_exit_request.unwrap_or(false);
@@ -735,11 +759,7 @@ async fn force_restart_bridge(
     let started = std::time::Instant::now();
     let std_cmd = nell_command(&app)?;
     let mut cmd = tokio::process::Command::from(std_cmd);
-    let timeout_arg = KILL_TIMEOUT_S.to_string();
-    cmd.args(["supervisor", "stop", "--persona", &persona, "--kill", "--timeout", &timeout_arg]);
-    if skip {
-        cmd.arg("--skip-hard-exit-request");
-    }
+    cmd.args(stop_kill_args(&persona, skip, pid.map(|p| (p, pid_token))));
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = cmd.spawn().map_err(|e| {
         let msg = format!("spawn nell supervisor stop --kill: {}", e);
@@ -3128,12 +3148,29 @@ mod bridge_stop_tests {
     }
 
     #[test]
+    fn stop_kill_args_pass_the_watched_bridge() {
+        // #456 review S8: the helper is told which bridge it may kill.
+        let with_pin = stop_kill_args("nell", true, Some((4242, Some(TOKEN.to_string()))));
+        assert_eq!(
+            with_pin,
+            vec![
+                "supervisor", "stop", "--persona", "nell", "--kill", "--timeout", "180",
+                "--skip-hard-exit-request", "--expect-pid", "4242", "--expect-token", TOKEN,
+            ]
+        );
+        let no_pin = stop_kill_args("nell", false, None);
+        assert_eq!(no_pin, vec!["supervisor", "stop", "--persona", "nell", "--kill", "--timeout", "180"]);
+        assert!(!no_pin.iter().any(|a| a.starts_with("--expect")));
+    }
+
+    #[test]
     fn force_restart_runs_the_kill_helper_and_never_kills_by_pid_itself() {
         // C35: the forced path is `nell supervisor stop --kill`; no direct signal or TerminateProcess anywhere here.
         let src = include_str!("lib.rs");
         let start = src.find("async fn force_restart_bridge(").unwrap();
         let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
-        assert!(body.contains("\"--kill\""));
+        assert!(body.contains("stop_kill_args("));
+        assert!(stop_kill_args("p", false, None).contains(&"--kill".to_string()));
         assert!(!body.contains("kill_on_drop"));
         let direct_kill = concat!("libc::", "kill(");
         let terminate = concat!("Terminate", "Process(");

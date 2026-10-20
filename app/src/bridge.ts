@@ -582,16 +582,24 @@ export async function shutdownBridge(
 /**
  * The forced path (#456 D10): `nell supervisor stop --kill` (identity-checked; the bridge and every process it
  * started), then the normal start, inside Rust. `skipHardExitRequest`: after a hard exit the bridge ignored, do not
- * ask it again. `startAfter` false (a service install, #456 review M4): only end the bridge. Rejects with the helper's
+ * ask it again. `startAfter` false (a service install, #456 review M4): only end the bridge. `expected` (the watched
+ * bridge, review S8): the helper kills only that bridge, else rejects with `bridge_changed`. Rejects with the helper's
  * error (or `force_restart_timeout` when the kill is still running).
  */
 export async function invokeForceRestart(
   persona: string,
   skipHardExitRequest = false,
   startAfter = true,
+  expected?: { pid: number; pid_token: string | null },
 ): Promise<void> {
   try {
-    await invoke<void>("force_restart_bridge", { persona, skipHardExitRequest, startAfter });
+    await invoke<void>("force_restart_bridge", {
+      persona,
+      skipHardExitRequest,
+      startAfter,
+      pid: expected?.pid ?? null,
+      pidToken: expected?.pid_token ?? null,
+    });
   } finally {
     // The respawned bridge writes a new port and token to bridge.json (#365).
     resetBridgeCredentialCache(persona);

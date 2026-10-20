@@ -259,9 +259,14 @@ def kill_bridge(
     *,
     timeout: float = DEFAULT_TIMEOUT_S,
     skip_hard_exit_request: bool = False,
+    expect_pid: int | None = None,
+    expect_token: str | None = None,
     _hooks: dict | None = None,
 ) -> KillResult:
-    """Kill the persona's bridge and its tree (module docstring). ``_hooks`` are test seams (named step callbacks)."""
+    """Kill the persona's bridge and its tree (module docstring). ``_hooks`` are test seams (named step callbacks).
+
+    ``expect_pid`` + ``expect_token`` (the app's watched bridge; review S8, D16 amended): when given, the record must
+    name exactly that bridge, or nothing is written or killed (outcome ``bridge_changed``)."""
     import psutil
 
     from brain import process_identity
@@ -270,6 +275,8 @@ def kill_bridge(
     persona_dir = Path(persona_dir)
     persona = persona or persona_dir.name
     st = state_file.read(persona_dir)
+    if expect_pid is not None and (st is None or st.pid != expect_pid or st.pid_token != expect_token):
+        return KillResult("bridge_changed", "bridge_changed: another bridge is running now; nothing killed")
     live = state_file.bridge_liveness(st, persona_dir)
     if live == state_file.UNKNOWN:
         return KillResult("unknown_identity", "bridge identity could not be confirmed; not killing")
