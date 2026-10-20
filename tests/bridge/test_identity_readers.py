@@ -327,3 +327,15 @@ def test_nell_model_set_judges_the_bridge_by_its_identity_not_a_live_pid(persona
     _write(persona_dir, pid=sleeper.pid, port=51234, pid_token=pi.token_of(sleeper.pid), identity="token")
     st = cli._bridge_running(persona_dir)
     assert st is not None and st.pid == sleeper.pid
+
+
+def test_nell_model_set_treats_an_unreadable_identity_as_a_running_bridge(persona_dir, sleeper, monkeypatch):
+    """Review MG-3: when the recorded pid's identity cannot be read (UNKNOWN), `nell model set` takes the cautious
+    side and goes through the bridge (which fails without writing if nothing answers), never writing
+    persona_config.json under a bridge that may be live."""
+    from brain import cli
+
+    _write(persona_dir, pid=sleeper.pid, port=51234, pid_token="linux:x:1", identity="token")
+    monkeypatch.setattr(pi, "token_of", lambda pid: pi.UNKNOWN)
+    st = cli._bridge_running(persona_dir)
+    assert st is not None and st.pid == sleeper.pid
