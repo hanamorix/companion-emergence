@@ -112,11 +112,11 @@ _INFLIGHT_LOCK = threading.Lock()
 
 
 def _owner_alive(pid: int, digest: str | None = None) -> bool:
-    # Lazy import: the bridge sits above this module (its state_file imports health, which imports this module), so a
-    # module-level import would be a cycle. The bridge's
-    # pid check has the Windows-safe branch; a raw os.kill(pid, 0) must not be
-    # used (on Windows signal 0 is a real Ctrl+C). A temp named with its writer's identity digest (#472) is judged by
-    # that identity, so a reused pid does not keep a dead writer's temp; an older name, by its pid only.
+    # Lazy import: the bridge sits above this module (its state_file imports health, which imports this module), so
+    # a module-level import would be a cycle. The bridge's pid check has the Windows-safe branch; a raw
+    # os.kill(pid, 0) must not be used (on Windows signal 0 is a real Ctrl+C). A temp named with its writer's identity
+    # digest (#472) is judged by that identity, so a reused pid does not keep a dead writer's temp; an older name,
+    # by its pid only.
     try:
         if digest:
             from brain import process_identity as pi
@@ -190,18 +190,20 @@ def _temp_scope(path: Path) -> Iterator[tuple[Path, Path]]:
 def _save_payload(
     path: Path,
     write_temp: Callable[[Path], None],
-    backup_count: int,
     *,
-    keep_backups: bool,
-    mode: int | None,
     fsync: bool,
+    keep_backups: bool = False,
+    backup_count: int = 3,
+    backup_mode: int | None = None,
 ) -> None:
     """The one save engine under the text and bytes writers.
 
     ``write_temp(new_path)`` creates the save's own temp with the payload, flushed and (when ``fsync``) fsynced; it
-    is the only part that differs between text and bytes. Everything else is shared: the per-save temp scope, the
-    optional backup copy and ``.bak`` rotation, the retried replace that publishes the temp, the mode of the rotated
-    backups and the directory fsync.
+    is the only part that differs between text and bytes (and it applies the file's own ``mode``). Everything else is
+    shared: the per-save temp scope, the retried replace that publishes the temp and the directory fsync. The backup
+    chain is optional: with ``keep_backups`` the live file is copied and ``.bak1`` .. ``.bak{backup_count}`` are
+    rotated before the publish, and ``backup_mode`` (when given) is set on every rotated backup (a token file's
+    backups must never be wider than the file). The bytes writer uses none of the chain.
     """
     bak1 = path.with_name(f"{path.name}.bak1")
     with _temp_scope(path) as (new_path, bak1_new):
@@ -228,10 +230,10 @@ def _save_payload(
 
         _replace_with_retry(new_path, path)
 
-        if mode is not None and keep_backups:
+        if backup_mode is not None and keep_backups:
             for i in range(1, max(backup_count, 1) + 1):
                 try:
-                    os.chmod(path.with_name(f"{path.name}.bak{i}"), mode)
+                    os.chmod(path.with_name(f"{path.name}.bak{i}"), backup_mode)
                 except OSError:
                     pass
 
@@ -318,7 +320,9 @@ def save_with_backup_text(
             if fsync:
                 os.fsync(f.fileno())
 
-    _save_payload(path, write_temp, backup_count, keep_backups=keep_backups, mode=mode, fsync=fsync)
+    _save_payload(
+        path, write_temp, fsync=fsync, keep_backups=keep_backups, backup_count=backup_count, backup_mode=mode
+    )
 
 
 def save_bytes_atomic(path: Path, data: bytes, *, mode: int | None = None, fsync: bool = True) -> None:
@@ -343,7 +347,7 @@ def save_bytes_atomic(path: Path, data: bytes, *, mode: int | None = None, fsync
             if fsync:
                 os.fsync(f.fileno())
 
-    _save_payload(path, write_temp, 3, keep_backups=False, mode=mode, fsync=fsync)
+    _save_payload(path, write_temp, fsync=fsync)
 
 
 def save_blob_once(target: Path, data: bytes) -> None:
