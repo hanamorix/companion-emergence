@@ -125,6 +125,57 @@ describe("ConnectionPanel — StatusBanner (P3-6 + P4-2)", () => {
     expect(banner.textContent).toMatch(/provider unreachable/i);
   });
 
+  it("(#456 C25) says the background work restarted, with the error", () => {
+    render(
+      <ConnectionPanel
+        state={baseState({
+          supervisor: {
+            state: "restarted",
+            restarts: 1,
+            last_error: "RuntimeError: tick failed",
+            last_error_at: "2026-10-19T12:00:00+00:00",
+          },
+        })}
+        persona="test"
+      />,
+    );
+    const banner = screen.getByRole("alert");
+    expect(banner.textContent).toMatch(/background work restarted/i);
+    expect(banner.textContent).toMatch(/RuntimeError: tick failed/);
+  });
+
+  it("(#456 C25) says the background work stopped after repeated errors, chat still works", () => {
+    render(
+      <ConnectionPanel
+        state={baseState({
+          supervisor: {
+            state: "failed",
+            restarts: 1,
+            last_error: "RuntimeError: again",
+            last_error_at: "2026-10-19T12:00:00+00:00",
+          },
+        })}
+        persona="test"
+      />,
+    );
+    const banner = screen.getByRole("alert");
+    expect(banner.textContent).toMatch(/background work stopped/i);
+    expect(banner.textContent).toMatch(/chat still works/i);
+    expect(banner.textContent).toMatch(/RuntimeError: again/);
+  });
+
+  it("(#456 C25) shows no banner while the background work runs normally", () => {
+    render(
+      <ConnectionPanel
+        state={baseState({
+          supervisor: { state: "running", restarts: 0, last_error: null, last_error_at: null },
+        })}
+        persona="test"
+      />,
+    );
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
   it("surfaces stateError even when mode is live", () => {
     render(
       <ConnectionPanel

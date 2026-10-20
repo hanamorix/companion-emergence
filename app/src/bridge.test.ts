@@ -243,6 +243,16 @@ describe("getBridgeCredentials", () => {
     const credentialReads = vi.mocked(invoke).mock.calls.filter(([cmd]) => cmd === "get_bridge_credentials");
     expect(credentialReads).toHaveLength(2);
   });
+
+  it("(#456 C17 m) the forced path passes skipHardExitRequest to the kill helper command", async () => {
+    await invokeForceRestart("alice");
+    await invokeForceRestart("alice", true);
+    const calls = vi.mocked(invoke).mock.calls.filter(([cmd]) => cmd === "force_restart_bridge");
+    expect(calls.map(([, args]) => args)).toEqual([
+      { persona: "alice", skipHardExitRequest: false },
+      { persona: "alice", skipHardExitRequest: true },
+    ]);
+  });
 });
 
 describe("fetchPersonaFeed", () => {

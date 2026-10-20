@@ -24,6 +24,7 @@ vi.mock("./bridgeVersionCheck", () => ({ ensureBridgeCurrent: vi.fn(async () => 
 vi.mock("./hooks/useRestartBridge", () => ({
   restartBridge: vi.fn(async () => true),
   clearRestartState: vi.fn(),
+  awaitStoppingBridge: vi.fn(async () => true),
 }));
 
 const P = "nell";
@@ -68,6 +69,22 @@ afterEach(() => {
 });
 
 describe("launchBrain (#335)", () => {
+  it("(#456 C17 h, i) waits for a bridge still stopping, then calls the normal start", async () => {
+    status(NONE);
+    const order: string[] = [];
+    vi.mocked(restartModule.awaitStoppingBridge).mockImplementationOnce(async () => {
+      order.push("wait");
+      return true;
+    });
+    vi.mocked(appConfig.ensureBridgeRunning).mockImplementationOnce(async () => {
+      order.push("start");
+    });
+    expect((await launchBrain(P)).kind).toBe("ready");
+    expect(order).toEqual(["wait", "start"]);
+    expect(restartModule.awaitStoppingBridge).toHaveBeenCalledWith(P);
+    expect(restartModule.clearRestartState).toHaveBeenCalled(); // a wait nobody pressed leaves no button state
+  });
+
   it("no active overlay: unchanged launch", async () => {
     status(NONE);
     expect(await launchBrain(P)).toEqual({ kind: "ready", versionMismatch: false, notice: null });

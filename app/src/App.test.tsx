@@ -89,6 +89,8 @@ vi.mock("./bridge", () => ({
   fetchPersonaState,
   approvePendingWrite,
   declinePendingWrite,
+  // #456: the launch check and the crash watchdog read the bridge's status (no bridge in the way here).
+  bridgeStatus: vi.fn(async () => ({ alive: "gone" })),
 }));
 
 // ── Heavy UI components that spawn their own effects ─────────────────────────

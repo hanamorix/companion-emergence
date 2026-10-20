@@ -17,6 +17,17 @@ vi.mock("./bridge", () => ({
   invokeForceRestart,
 }));
 
+// #456 (Q-A): the replace goes through the app's restart (stop, wait with the display and offer, then start).
+const { restartBridge, clearRestartState } = vi.hoisted(() => ({
+  restartBridge: vi.fn(async (_persona: string) => true),
+  clearRestartState: vi.fn(),
+}));
+
+vi.mock("./hooks/useRestartBridge", () => ({
+  restartBridge,
+  clearRestartState,
+}));
+
 const { ensureBridgeRunning } = vi.hoisted(() => ({
   ensureBridgeRunning: vi.fn(async () => undefined),
 }));
@@ -56,22 +67,36 @@ describe("ensureBridgeCurrent", () => {
     expect(result).toBe("ok");
     expect(shutdownBridge).not.toHaveBeenCalled();
     expect(ensureBridgeRunning).not.toHaveBeenCalled();
-    expect(invokeForceRestart).not.toHaveBeenCalled();
+    expect(restartBridge).not.toHaveBeenCalled();
   });
 
-  it('version mismatch then match → "restarted", invokeForceRestart called once, no shutdownBridge/ensureBridgeRunning', async () => {
+  it('version mismatch then match → "restarted", restartBridge called once, no shutdownBridge/ensureBridgeRunning', async () => {
     getVersion.mockResolvedValue("0.0.34");
     fetchHealth
       .mockResolvedValueOnce({ liveness: "ok", version: "0.0.33" }) // stale
-      .mockResolvedValueOnce({ liveness: "ok", version: "0.0.34" }); // after force-restart
+      .mockResolvedValueOnce({ liveness: "ok", version: "0.0.34" }); // after restart
 
     const result = await ensureBridgeCurrent("nell");
 
     expect(result).toBe("restarted");
-    expect(invokeForceRestart).toHaveBeenCalledTimes(1);
-    expect(invokeForceRestart).toHaveBeenCalledWith("nell");
+    expect(restartBridge).toHaveBeenCalledTimes(1);
+    expect(restartBridge).toHaveBeenCalledWith("nell");
+    expect(invokeForceRestart).not.toHaveBeenCalled(); // no kill of its own (#456 D10)
+    expect(clearRestartState).toHaveBeenCalled(); // a launch-time restart nobody pressed (#335)
     expect(shutdownBridge).not.toHaveBeenCalled();
     expect(ensureBridgeRunning).not.toHaveBeenCalled();
+  });
+
+  it('(#456) a restart that does not bring a bridge back → "version_mismatch_unresolved", no recheck', async () => {
+    getVersion.mockResolvedValue("0.0.34");
+    fetchHealth.mockResolvedValue({ liveness: "ok", version: "0.0.33" });
+    restartBridge.mockResolvedValueOnce(false);
+
+    const result = await ensureBridgeCurrent("nell");
+
+    expect(result).toBe("version_mismatch_unresolved");
+    expect(fetchHealth).toHaveBeenCalledTimes(1);
+    expect(clearRestartState).toHaveBeenCalled();
   });
 
   it('persistent mismatch after restart → "version_mismatch_unresolved", one attempt only', async () => {
@@ -81,12 +106,12 @@ describe("ensureBridgeCurrent", () => {
     const result = await ensureBridgeCurrent("nell");
 
     expect(result).toBe("version_mismatch_unresolved");
-    expect(invokeForceRestart).toHaveBeenCalledTimes(1);
+    expect(restartBridge).toHaveBeenCalledTimes(1);
     expect(shutdownBridge).not.toHaveBeenCalled();
     expect(ensureBridgeRunning).not.toHaveBeenCalled();
   });
 
-  it("second call after mismatch_unresolved → no further force-restarts", async () => {
+  it("second call after mismatch_unresolved → no further restarts", async () => {
     getVersion.mockResolvedValue("0.0.34");
     fetchHealth.mockResolvedValue({ liveness: "ok", version: "0.0.33" });
 
@@ -98,7 +123,7 @@ describe("ensureBridgeCurrent", () => {
     const result = await ensureBridgeCurrent("nell");
 
     expect(result).toBe("version_mismatch_unresolved");
-    expect(invokeForceRestart).not.toHaveBeenCalled();
+    expect(restartBridge).not.toHaveBeenCalled();
     expect(shutdownBridge).not.toHaveBeenCalled();
     expect(ensureBridgeRunning).not.toHaveBeenCalled();
   });
@@ -119,10 +144,10 @@ describe("ensureBridgeCurrent", () => {
 
     expect(result).toBe("skipped");
     expect(shutdownBridge).not.toHaveBeenCalled();
-    expect(invokeForceRestart).not.toHaveBeenCalled();
+    expect(restartBridge).not.toHaveBeenCalled();
   });
 
-  it('health.version undefined → treats as mismatch, calls invokeForceRestart', async () => {
+  it('health.version undefined → treats as mismatch, calls restartBridge', async () => {
     fetchHealth
       .mockResolvedValueOnce({ liveness: "ok" })                     // no version field
       .mockResolvedValueOnce({ liveness: "ok", version: "0.0.33" }); // after restart
@@ -130,7 +155,7 @@ describe("ensureBridgeCurrent", () => {
     const result = await ensureBridgeCurrent("nell");
 
     expect(result).toBe("restarted");
-    expect(invokeForceRestart).toHaveBeenCalledTimes(1);
+    expect(restartBridge).toHaveBeenCalledTimes(1);
     expect(shutdownBridge).not.toHaveBeenCalled();
     expect(ensureBridgeRunning).not.toHaveBeenCalled();
   });
@@ -149,43 +174,43 @@ describe("ensureBridgeCurrent", () => {
 
     expect(result).toBe("ok");
     expect(shutdownBridge).not.toHaveBeenCalled();
-    expect(invokeForceRestart).not.toHaveBeenCalled();
+    expect(restartBridge).not.toHaveBeenCalled();
   });
 
   // ── New test 1: dev-build skip ────────────────────────────────────────────
 
-  it('appVersion "0.0.0" (dev build) → "skipped", no force-restart', async () => {
+  it('appVersion "0.0.0" (dev build) → "skipped", no restart', async () => {
     getVersion.mockResolvedValue("0.0.0");
     fetchHealth.mockResolvedValue({ liveness: "ok", version: "0.0.33" });
 
     const result = await ensureBridgeCurrent("nell");
 
     expect(result).toBe("skipped");
-    expect(invokeForceRestart).not.toHaveBeenCalled();
+    expect(restartBridge).not.toHaveBeenCalled();
   });
 
   // ── New test 2: non-semver appVersion → skipped ───────────────────────────
 
-  it('appVersion non-semver ("xyz") → "skipped", no force-restart', async () => {
+  it('appVersion non-semver ("xyz") → "skipped", no restart', async () => {
     getVersion.mockResolvedValue("xyz");
     fetchHealth.mockResolvedValue({ liveness: "ok", version: "0.0.33" });
 
     const result = await ensureBridgeCurrent("nell");
 
     expect(result).toBe("skipped");
-    expect(invokeForceRestart).not.toHaveBeenCalled();
+    expect(restartBridge).not.toHaveBeenCalled();
   });
 
   // ── New test 3: garbage health.version → skipped ─────────────────────────
 
-  it('health.version present but garbage ("weird") → "skipped", no force-restart', async () => {
+  it('health.version present but garbage ("weird") → "skipped", no restart', async () => {
     getVersion.mockResolvedValue("0.0.34");
     fetchHealth.mockResolvedValue({ liveness: "ok", version: "weird" });
 
     const result = await ensureBridgeCurrent("nell");
 
     expect(result).toBe("skipped");
-    expect(invokeForceRestart).not.toHaveBeenCalled();
+    expect(restartBridge).not.toHaveBeenCalled();
   });
 
   // ── New test 4: 4-part version normalises equal → "ok" ───────────────────
@@ -197,20 +222,20 @@ describe("ensureBridgeCurrent", () => {
     const result = await ensureBridgeCurrent("nell");
 
     expect(result).toBe("ok");
-    expect(invokeForceRestart).not.toHaveBeenCalled();
+    expect(restartBridge).not.toHaveBeenCalled();
   });
 
-  // ── New test 5: invokeForceRestart throws → immediate unresolved ──────────
+  // ── New test 5: restartBridge throws → immediate unresolved ──────────
 
-  it('invokeForceRestart throws → "version_mismatch_unresolved" immediately, no recheck fetchHealth', async () => {
+  it('restartBridge throws → "version_mismatch_unresolved" immediately, no recheck fetchHealth', async () => {
     getVersion.mockResolvedValue("0.0.34");
     fetchHealth.mockResolvedValue({ liveness: "ok", version: "0.0.33" });
-    invokeForceRestart.mockRejectedValue(new Error("pid not found"));
+    restartBridge.mockRejectedValue(new Error("pid not found"));
 
     const result = await ensureBridgeCurrent("nell");
 
     expect(result).toBe("version_mismatch_unresolved");
-    // fetchHealth should not be called again — no recheck after failed force-restart
+    // fetchHealth should not be called again — no recheck after failed restart
     expect(fetchHealth).toHaveBeenCalledTimes(1);
   });
 
@@ -227,10 +252,10 @@ describe("ensureBridgeCurrent", () => {
     const result = await ensureBridgeCurrent("nell");
 
     expect(result).toBe("ok");
-    expect(invokeForceRestart).not.toHaveBeenCalled();
+    expect(restartBridge).not.toHaveBeenCalled();
   });
 
-  it('app "0.0.43", overlay present but health.version OLDER than app → force-restart path', async () => {
+  it('app "0.0.43", overlay present but health.version OLDER than app → restart path', async () => {
     getVersion.mockResolvedValue("0.0.43");
     fetchHealth.mockResolvedValue({
       liveness: "ok",
@@ -240,19 +265,19 @@ describe("ensureBridgeCurrent", () => {
 
     await ensureBridgeCurrent("nell");
 
-    expect(invokeForceRestart).toHaveBeenCalledTimes(1);
+    expect(restartBridge).toHaveBeenCalledTimes(1);
   });
 
-  it('app "0.0.43", NEWER health.version but no overlay → force-restart path (unchanged rule)', async () => {
+  it('app "0.0.43", NEWER health.version but no overlay → restart path (unchanged rule)', async () => {
     getVersion.mockResolvedValue("0.0.43");
     fetchHealth.mockResolvedValue({ liveness: "ok", version: "0.0.44" });
 
     await ensureBridgeCurrent("nell");
 
-    expect(invokeForceRestart).toHaveBeenCalledTimes(1);
+    expect(restartBridge).toHaveBeenCalledTimes(1);
   });
 
-  it('app "0.0.43", EQUAL version but overlay built for another bundle → force-restart path', async () => {
+  it('app "0.0.43", EQUAL version but overlay built for another bundle → restart path', async () => {
     getVersion.mockResolvedValue("0.0.43");
     fetchHealth.mockResolvedValue({
       liveness: "ok",
@@ -262,10 +287,10 @@ describe("ensureBridgeCurrent", () => {
 
     await ensureBridgeCurrent("nell");
 
-    expect(invokeForceRestart).toHaveBeenCalledTimes(1);
+    expect(restartBridge).toHaveBeenCalledTimes(1);
   });
 
-  it('app "0.0.43", NEWER overlay built for another bundle → force-restart path', async () => {
+  it('app "0.0.43", NEWER overlay built for another bundle → restart path', async () => {
     getVersion.mockResolvedValue("0.0.43");
     fetchHealth.mockResolvedValue({
       liveness: "ok",
@@ -275,7 +300,7 @@ describe("ensureBridgeCurrent", () => {
 
     await ensureBridgeCurrent("nell");
 
-    expect(invokeForceRestart).toHaveBeenCalledTimes(1);
+    expect(restartBridge).toHaveBeenCalledTimes(1);
   });
 
   it('app "0.0.43", NEWER overlay built for this bundle → "ok", no restart', async () => {
@@ -287,14 +312,14 @@ describe("ensureBridgeCurrent", () => {
     });
 
     expect(await ensureBridgeCurrent("nell")).toBe("ok");
-    expect(invokeForceRestart).not.toHaveBeenCalled();
+    expect(restartBridge).not.toHaveBeenCalled();
   });
 
   it("(#365) says why when the forced replace of a stale bridge fails", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     getVersion.mockResolvedValue("0.0.43");
     fetchHealth.mockResolvedValue({ liveness: "ok", version: "0.0.30" });
-    invokeForceRestart.mockRejectedValueOnce(new Error("no pid file for nell"));
+    restartBridge.mockRejectedValueOnce(new Error("no pid file for nell"));
 
     expect(await ensureBridgeCurrent("nell")).toBe("version_mismatch_unresolved");
 
@@ -304,7 +329,7 @@ describe("ensureBridgeCurrent", () => {
 
   it("(#365) says why when the recheck after a replace fails or still disagrees", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    invokeForceRestart.mockResolvedValue(undefined); // an earlier test leaves a rejection in place
+    restartBridge.mockResolvedValue(undefined); // an earlier test leaves a rejection in place
     getVersion.mockResolvedValue("0.0.43");
     fetchHealth
       .mockResolvedValueOnce({ liveness: "ok", version: "0.0.30" })
