@@ -181,8 +181,9 @@ def test_431_exact_pass_keeps_the_crystallised_duplicate(tmp_path):
 
 
 def test_431_exact_pass_deletes_neither_when_both_duplicates_are_soul_linked(tmp_path):
-    """#431: one crystallised, one under soul review: both stay, and a group the sweep could not merge
-    is not reported as merged (a re-run must still look like a no-op)."""
+    """#431: one crystallised, one under soul review: both stay. Guards the group count too: a group
+    the sweep could not merge must not be reported as merged, or every re-run reports a merge that
+    never happened instead of a no-op."""
     from brain.ingest.soul_queue import queue_soul_candidate
     from brain.ingest.types import ExtractedItem
 
@@ -284,7 +285,7 @@ def _aged(content: str, days_ago: int, *, importance: float = 3.0) -> Memory:
 
 
 def test_431_near_dup_pass_stops_comparing_a_row_it_just_dropped(tmp_path):
-    """#431 review: A plain (oldest), B soul-linked, C plain, all judged duplicates. A is dropped in
+    """#431: A plain (oldest), B soul-linked, C plain, all judged duplicates. A is dropped in
     favour of B; the pass must stop using A, or it merges C into the deleted A and C is lost too."""
     store = MemoryStore(tmp_path / "memories.db")
     a = _aged("Bob and the red kite.", 3)
@@ -302,9 +303,9 @@ def test_431_near_dup_pass_stops_comparing_a_row_it_just_dropped(tmp_path):
 
 
 def test_near_dup_pass_never_lowers_a_canonical_it_already_raised(tmp_path):
-    """Review finding (pre-existing on main): A (1, oldest) absorbs C (9) and is raised to 9 in the
-    store; the pass then compared D (3) against A's stale in-memory importance of 1 and wrote 3 back,
-    losing the max. The canonical must end at the max of everything merged into it."""
+    """#431: A (1, oldest) absorbs C (9) and is raised to 9 in the store. Guards against comparing D (3)
+    with A's stale in-memory importance of 1, which writes 3 back and loses the max. The canonical must
+    end at the max of everything merged into it."""
     store = MemoryStore(tmp_path / "memories.db")
     a = _aged("Bob baked bread.", 3, importance=1.0)
     c = _aged("Bob was baking bread.", 2, importance=9.0)
@@ -320,7 +321,7 @@ def test_near_dup_pass_never_lowers_a_canonical_it_already_raised(tmp_path):
 
 
 def test_431_near_dup_swap_carries_the_max_and_retargets_earlier_merges(tmp_path):
-    """#431 review: A (1, oldest) absorbs C (9), then A is dropped in favour of the soul-linked B (2).
+    """#431: A (1, oldest) absorbs C (9), then A is dropped in favour of the soul-linked B (2).
     B must end at 9, A's archived pre-image must show the 9 it held, and no merge record may name the
     deleted A as its canonical: C's merge now points at B, where its content survives."""
     store = MemoryStore(tmp_path / "memories.db")

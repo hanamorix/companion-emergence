@@ -104,6 +104,7 @@ def _load_exempt_ids(persona_dir: Path) -> set[str]:
     row is touched: a failed read is not "nothing is exempt"."""
     from brain.forgetting import _load_soul_linked_ids  # lazy: forgetting is heavier
 
+    # Fails closed; the CLI shows the raw traceback by design until cli.py can be touched (#458/#470).
     crystallised, under_review = _load_soul_linked_ids(persona_dir, caller="dedup_sweep")
     return crystallised | under_review
 
@@ -164,6 +165,7 @@ def run_dedup_sweep(
             continue
         canonical = _pick_canonical(members, exempt)
         # A soul-linked row always stays (#431); if every other member is one, nothing merges.
+        # Skip such a group before counting it: counted, it reads as "merged" on every re-run.
         removable = [m for m in members if m.id != canonical.id and m.id not in exempt]
         if not removable:
             canonicals.append(canonical)
@@ -222,14 +224,17 @@ def _near_dup_pass(
             if verdict != "duplicate" or (other.id in exempt and cand.id in exempt):
                 continue
             keep, drop = (other, cand) if other.id in exempt else (cand, other)
-            # Re-read both: an earlier merge in this pass may have raised either one's importance,
-            # and the in-memory objects never see it.
+            # Re-read both (#431): an earlier merge in this pass may have raised either one's
+            # importance and the in-memory objects never see it. Stale, the carry-over below lowers
+            # a raised canonical again, or drops its max with it, and the archive gets a stale pre-image.
             keep = store.get(keep.id, bump=False) or keep
             drop = store.get(drop.id, bump=False) or drop
             _archive_preimage(persona_dir, drop)
             store.hard_delete(drop.id)
             removed.add(drop.id)
-            for earlier in report.merges:  # rows merged into ``drop`` now live on in ``keep``
+            # Rows merged into ``drop`` earlier now live on in ``keep``; otherwise their records name a
+            # deleted row (#431).
+            for earlier in report.merges:
                 if earlier.canonical_id == drop.id:
                     earlier.canonical_id = keep.id
             report.merges.append(
@@ -243,4 +248,6 @@ def _near_dup_pass(
             if float(drop.importance) > float(keep.importance):
                 store.update(keep.id, importance=float(drop.importance))
             if drop.id == cand.id:
+                # ``cand`` is gone (#431): comparing it further would merge later rows into a deleted
+                # row and lose them.
                 break

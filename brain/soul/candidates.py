@@ -75,8 +75,10 @@ def merge_target_map(persona_dir: Path) -> dict[str, set[str]]:
     (``reason == "consolidation_merge"`` rows). Set-valued: a candidate re-enqueued after its target
     was deleted can merge again into another row; a dead target id simply matches no row.
 
-    The forgetting exemption depends on this file: rotating or truncating it un-protects merged
-    moments (a canary keeps it out of the supervisor's rotation tables).
+    The forgetting exemption (and the narrative pass and dedup sweep, which share its loader) reads
+    this archive. Rotating, archiving away or truncating it silently drops protection from every
+    merged soul moment, with no error. ``test_consolidation_archive_is_never_rotated`` keeps it out of
+    the supervisor's rotation tables.
 
     A missing archive → ``{}`` (checked before the lock, so no ``.lock`` sidecar is created). A torn or
     corrupt line is skipped with a warning. A real read failure raises: the caller fails closed (#392).
