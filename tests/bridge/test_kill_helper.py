@@ -402,3 +402,26 @@ def test_an_unsuspendable_descendant_does_not_make_the_freeze_loop_spin(tmp_path
     while not b.all_gone() and time.monotonic() < deadline:
         time.sleep(0.05)
     assert b.all_gone()
+
+
+def test_a_bridge_that_exits_just_before_its_suspend_still_has_its_tree_killed(tmp_path, fake, monkeypatch):
+    """Review S4: the bridge ends between the liveness check and suspend(); the helper treats it as gone, kills the
+    remembered descendants and keeps its committed intent (no traceback)."""
+    b = fake()
+    real_suspend = psutil.Process.suspend
+
+    def _suspend(self):
+        if self.pid == b.pid:
+            os.kill(b.pid, signal.SIGKILL)
+            b.proc.wait(5)
+            raise psutil.NoSuchProcess(self.pid)
+        return real_suspend(self)
+
+    monkeypatch.setattr(psutil.Process, "suspend", _suspend)
+    r = kill.kill_bridge(b.pd, timeout=5)
+    assert r.outcome == "killed"
+    deadline = time.monotonic() + 10
+    while not b.all_gone() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert b.all_gone()
+    assert _intent(b.pd)["state"] == "committed"

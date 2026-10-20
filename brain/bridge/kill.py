@@ -332,8 +332,14 @@ def kill_bridge(
             return KillResult("other_bridge", "another bridge is now running; nothing killed")
         _hook("committed")
 
+        frozen = False
         if _alive(bridge):
-            bridge.suspend()
+            try:
+                bridge.suspend()
+                frozen = True
+            except psutil.NoSuchProcess:
+                pass  # it ended between the check and the suspend (review S4): the "already gone" branch below
+        if frozen:
             suspended.append(bridge)
             _hook("after_bridge_suspend")
             # Every pid tried is remembered, suspended or not (review M3): a descendant whose suspend() fails and
