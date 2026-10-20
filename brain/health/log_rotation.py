@@ -48,7 +48,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.health.json_io import Recovery, iter_jsonl_raw, write_jsonl
-from brain.utils.atomic_write import _replace_with_retry, save_bytes_atomic
+from brain.utils.atomic_write import _replace_with_retry, fsync_dir, save_bytes_atomic
 from brain.utils.file_lock import file_lock
 from brain.utils.time import lenient_utc
 
@@ -96,16 +96,16 @@ def rotate_rolling_size(
     3. Move the existing archives up into the first empty slot (``.N.gz`` → ``.(N+1).gz``; the move into the last
        slot overwrites the oldest beyond ``archive_keep``, which is the normal eviction).
     4. Publish the staging file as ``.1.gz``.
-    5. Truncate the active log to zero bytes (writers reopen per
-       append, so this is safe).
+    5. fsync the directory so the archive is crash-durable, then truncate the active log to zero bytes (writers
+       reopen per append, so this is safe).
 
     ``lock_held=True`` is for a caller that already holds ``file_lock(log_path)`` for its own
     rotate-then-append step (``parse_failures``): the lock is not reentrant, so taking it again
     would block forever. The default takes the lock itself.
 
-    If step 3 fails mid-way, the active log is left untouched and the
-    exception propagates. Better to fail the rotation than to lose
-    audit data — the next tick will retry.
+    If any of steps 2 to 4 fails (or the process is killed there), the active log is left untouched, no retained
+    archive is lost beyond the one normal eviction, and the exception propagates. Better to fail the rotation than
+    to lose audit data; the next tick will retry.
     """
     if not _over(log_path, max_bytes):
         return None
@@ -169,7 +169,10 @@ def _rotate_rolling_locked(log_path: Path, archive_keep: int) -> Path:
     # 4. Publish the staged archive as .1.gz.
     _replace_with_retry(staging, new_archive)  # atomic-write: ok -- publishes the finished, fsynced staging file by rename (the write above went through the shared writer)
 
-    # 5. Truncate the active log. Appenders wait on the lock held here, so nothing is truncated away.
+    # 5. Make the archive crash-durable (the shift and the publish are renames), THEN truncate the active log, so a
+    #    power cut cannot leave the log emptied and the archive's directory entry not yet on disk.
+    fsync_dir(log_path.parent)
+    # 6. Truncate the active log. Appenders wait on the lock held here, so nothing is truncated away.
     rotated_bytes = log_path.stat().st_size  # before the truncation: the size that went into the archive
     log_path.write_bytes(b"")
 
@@ -267,8 +270,9 @@ def _merge_into_year_archive(archive_path: Path, new_lines: list[str]) -> None:
     """Add ``new_lines`` to the year archive, keeping every row already in it, and adding only rows it does not already hold.
 
     The archive is kept forever, so an existing one is read (its lines verbatim), the lines it does not
-    already hold are appended, and the whole is written to a temp file and put in place with a retried
-    replace. A failure at any step removes the temp and leaves the existing archive as it was.
+    already hold are appended, and the whole is compressed in memory and written through the shared atomic
+    writer (a unique temp, fsync, one retried replace). A failure at any step removes the temp and leaves the
+    existing archive as it was.
 
     Idempotent: the active log is rewritten AFTER this merge, so a failed or interrupted rewrite leaves
     the cold rows in the active log and the next tick offers them again; a row the archive already holds
