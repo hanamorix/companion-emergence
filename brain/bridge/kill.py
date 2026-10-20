@@ -263,23 +263,22 @@ def kill_bridge(
         # C45 (i): another helper has committed to killing this bridge; never downgrade or delete its intent.
         return KillResult("in_progress", "another kill of this bridge is in progress")
 
-    # Step 2: handlers first, then the pending intent.
+    # Step 2: handlers first, then the pending intent, both inside the try (review S2): a signal in between still
+    # reaches the finally, which deletes our intent (a no-op before it was written) and restores the handlers.
     prev: dict[int, object] = {}
     on_main = threading.current_thread() is threading.main_thread()
+    fired: list[int] = []
 
     def _raise(signum, frame):  # noqa: ANN001
+        # One-shot (review S2): only the first stop signal interrupts; a second one, arriving before the finally
+        # has masked signals, must not skip the resume.
+        if fired:
+            return
+        fired.append(signum)
         raise _KillInterrupted(signum)
 
     stop_signals = [signal.SIGTERM] + ([signal.SIGHUP] if hasattr(signal, "SIGHUP") else [])
-    if on_main:
-        for sig in stop_signals:
-            prev[sig] = signal.signal(sig, _raise)
     nonce = secrets.token_hex(8)
-    intent = shutdown_progress.stop_intent(
-        pid=st.pid, pid_token=st.pid_token, state="pending", nonce=nonce, at=datetime.now(UTC).isoformat(),
-        boot=process_identity.boot_id(), legacy=legacy,
-    )
-    _write_intent(persona_dir, intent)
 
     remembered: dict[int, object] = {}
     suspended: list = []
@@ -295,6 +294,15 @@ def kill_bridge(
             cb()
 
     try:
+        if on_main:
+            for sig in stop_signals:
+                prev[sig] = signal.signal(sig, _raise)
+        intent = shutdown_progress.stop_intent(
+            pid=st.pid, pid_token=st.pid_token, state="pending", nonce=nonce, at=datetime.now(UTC).isoformat(),
+            boot=process_identity.boot_id(), legacy=legacy,
+        )
+        _write_intent(persona_dir, intent)
+
         # Step 3: read-only enumeration.
         _remember(_children(bridge))
         _hook("after_enumeration")

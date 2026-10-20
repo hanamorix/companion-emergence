@@ -425,3 +425,47 @@ def test_a_bridge_that_exits_just_before_its_suspend_still_has_its_tree_killed(t
         time.sleep(0.05)
     assert b.all_gone()
     assert _intent(b.pd)["state"] == "committed"
+
+
+def test_a_signal_while_the_pending_intent_is_written_deletes_it_and_restores_the_handlers(tmp_path, fake, monkeypatch):
+    """C45 (a), review S2: a signal in the window between the handlers and the try leaves no intent behind and the
+    previous handlers back in place."""
+    b = fake()
+    before = signal.getsignal(signal.SIGTERM)
+    real_write = kill._write_intent
+
+    def _write_then_signal(pd, intent):
+        real_write(pd, intent)
+        os.kill(os.getpid(), signal.SIGTERM)
+        time.sleep(0.2)
+
+    monkeypatch.setattr(kill, "_write_intent", _write_then_signal)
+    with pytest.raises(kill._KillInterrupted):
+        kill.kill_bridge(b.pd, timeout=5)
+    assert _intent(b.pd) is None
+    assert signal.getsignal(signal.SIGTERM) is before
+    assert all(s not in ("gone", psutil.STATUS_STOPPED) for s in b.statuses().values())
+
+
+def test_only_the_first_stop_signal_interrupts_the_helper(tmp_path, fake):
+    """C45 (g), review S2: a second signal arriving before the finally masks signals cannot skip the resume."""
+    b = fake()
+    seen: dict = {}
+
+    def _two_signals():
+        handler = signal.getsignal(signal.SIGTERM)
+        try:
+            handler(signal.SIGTERM, None)
+        except kill._KillInterrupted as first:
+            try:
+                handler(signal.SIGTERM, None)
+                seen["second"] = "ignored"
+            except kill._KillInterrupted:
+                seen["second"] = "raised"
+            raise first
+
+    with pytest.raises(kill._KillInterrupted):
+        kill.kill_bridge(b.pd, timeout=5, _hooks={"after_bridge_suspend": _two_signals})
+    assert seen["second"] == "ignored"
+    assert _intent(b.pd) is None
+    assert all(s not in ("gone", psutil.STATUS_STOPPED) for s in b.statuses().values())
