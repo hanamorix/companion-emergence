@@ -376,3 +376,29 @@ def test_kill_bound_matches_the_stated_formula():
     assert kill.kill_bound_s(180) == 180 + 2 * 15 + 180
     assert kill.kill_bound_s(180, skip_hard_exit_request=True) == 2 * 15 + 180
 
+
+
+def test_an_unsuspendable_descendant_does_not_make_the_freeze_loop_spin(tmp_path, fake, monkeypatch):
+    """C45 (d), review M3: a descendant whose suspend() raises stays listed; the freeze still ends (every pid tried is
+    remembered), the bridge is killed first and the descendant is killed with the tree."""
+    import threading
+
+    b = fake()
+    real_suspend = psutil.Process.suspend
+
+    def _suspend(self):
+        if self.pid == b.child:
+            raise psutil.AccessDenied(self.pid)
+        return real_suspend(self)
+
+    monkeypatch.setattr(psutil.Process, "suspend", _suspend)
+    out: dict = {}
+    t = threading.Thread(target=lambda: out.setdefault("r", kill.kill_bridge(b.pd, timeout=5)), daemon=True)
+    t.start()
+    t.join(30)
+    assert not t.is_alive(), "the freeze loop never ended"
+    assert out["r"].outcome == "killed"
+    deadline = time.monotonic() + 10
+    while not b.all_gone() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert b.all_gone()

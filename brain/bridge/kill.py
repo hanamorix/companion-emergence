@@ -336,11 +336,15 @@ def kill_bridge(
             bridge.suspend()
             suspended.append(bridge)
             _hook("after_bridge_suspend")
+            # Every pid tried is remembered, suspended or not (review M3): a descendant whose suspend() fails and
+            # that stays listed cannot keep this loop going; it is killed with the tree below.
+            tried = {bridge.pid}
             while True:
-                new = [p for p in _children(bridge) if p.pid not in {s.pid for s in suspended}]
+                new = [p for p in _children(bridge) if p.pid not in tried]
                 if not new:
                     break
                 for p in new:
+                    tried.add(p.pid)
                     try:
                         p.suspend()
                         suspended.append(p)
