@@ -265,3 +265,76 @@ def test_a_report_that_did_not_complete_with_no_errors_is_always_busy_or_deferre
         report = IngestReport(session_id="s", busy=busy, deferred=deferred, backoff_skipped=backoff_skipped, errors=errors)
         if not report.completed and report.errors == 0:
             assert report.busy or report.deferred
+
+
+# --- finalize's dead-letter move when the buffer is already gone (a rollover reaped it) --------------------------------
+
+
+def _at_threshold(persona, sid):
+    from datetime import UTC, datetime
+
+    from brain.ingest.buffer import write_backoff
+
+    write_backoff(persona, sid, failures=3, first_failure_at=datetime.now(UTC).isoformat())  # inside the window: no new attempt
+
+
+def test_finalize_skips_the_dead_letter_move_when_the_buffer_is_already_gone(world, monkeypatch, caplog):
+    # Fails on the head before this change: the backoff is read before the lock is taken; a successful rollover that reaped the
+    # buffer in between leaves `src.rename` raising FileNotFoundError, which escapes the per-session handling and aborts the
+    # tick's sweep (the next session is never finalized).
+    import logging
+
+    import brain.ingest.pipeline as pipeline
+    from brain.ingest.buffer import read_backoff
+    from brain.ingest.types import IngestReport
+
+    persona, store, hebbian = world
+    gone = _seed(persona, "sess_a_gone")
+    free = _seed(persona, "sess_b_free")
+    _at_threshold(persona, "sess_a_gone")
+    _at_threshold(persona, "sess_b_free")
+    real = pipeline.extract_session_snapshot
+
+    def snapshot(persona_dir, sid, **kw):
+        if sid == "sess_a_gone":  # the rollover finished and reaped this buffer after finalize listed it
+            gone.unlink()
+            return IngestReport(session_id=sid)
+        return real(persona_dir, sid, **kw)
+
+    monkeypatch.setattr(pipeline, "extract_session_snapshot", snapshot)
+    with caplog.at_level(logging.INFO):
+        reports = pipeline.finalize_stale_sessions(persona, store=store, hebbian=hebbian, provider=_CountingProvider())
+
+    assert sorted(r.session_id for r in reports) == ["sess_a_gone", "sess_b_free"]  # the sweep went on
+    poison = persona / "active_conversations" / "poison"
+    assert not (poison / "sess_a_gone.jsonl").exists()  # nothing to poison
+    assert read_backoff(persona, "sess_a_gone") is None  # the stale failure record is cleared
+    assert "conversation_finalize_deadletter_gone" in caplog.text
+    assert (poison / "sess_b_free.jsonl").exists() and not free.exists()  # the other session was still poisoned as before
+
+
+def test_finalize_survives_a_buffer_that_vanishes_during_the_rename(world, monkeypatch):
+    # The buffer exists at the check and is gone at the rename (a reap in that instant): FileNotFoundError must not escape.
+    import pathlib
+
+    import brain.ingest.pipeline as pipeline
+    from brain.ingest.buffer import read_backoff
+
+    persona, store, hebbian = world
+    _seed(persona, "sess_a_race")
+    _seed(persona, "sess_b_free")
+    _at_threshold(persona, "sess_a_race")
+    _at_threshold(persona, "sess_b_free")
+    real_rename = pathlib.Path.rename
+
+    def rename(self, target):
+        if self.name == "sess_a_race.jsonl":
+            raise FileNotFoundError(2, "No such file or directory", str(self))
+        return real_rename(self, target)
+
+    monkeypatch.setattr(pathlib.Path, "rename", rename)
+    reports = pipeline.finalize_stale_sessions(persona, store=store, hebbian=hebbian, provider=_CountingProvider())
+
+    assert sorted(r.session_id for r in reports) == ["sess_a_race", "sess_b_free"]
+    assert (persona / "active_conversations" / "poison" / "sess_b_free.jsonl").exists()
+    assert read_backoff(persona, "sess_a_race") is None  # gone: nothing left to poison, the record is cleared

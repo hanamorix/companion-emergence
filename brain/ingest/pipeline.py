@@ -728,16 +728,33 @@ def finalize_stale_sessions(
                 else:
                     src = persona_dir / "active_conversations" / f"{sid}.jsonl"
                     poison_dir = persona_dir / "active_conversations" / "poison"
-                    poison_dir.mkdir(parents=True, exist_ok=True)
                     dst = poison_dir / f"{sid}.jsonl"
-                    src.rename(dst)
-                    delete_cursor(persona_dir, sid)
-                    delete_backoff(persona_dir, sid)
-                    logger.warning(
-                        "conversation_finalize_deadletter session=%s failures=%d — moved to poison/",
-                        sid,
-                        backoff["failures"],  # type: ignore[index]
-                    )
+                    # The backoff above was read BEFORE this lock: a rollover that succeeded in between has reaped the
+                    # buffer, and there is then nothing to poison. Checked under the lock, and the rename is guarded too
+                    # (a reap in that instant), so a vanished buffer can never abort the sweep for the other sessions.
+                    moved = False
+                    if src.exists():
+                        try:
+                            poison_dir.mkdir(parents=True, exist_ok=True)
+                            src.rename(dst)
+                            moved = True
+                        except FileNotFoundError:
+                            pass
+                    if moved:
+                        delete_cursor(persona_dir, sid)
+                        delete_backoff(persona_dir, sid)
+                        logger.warning(
+                            "conversation_finalize_deadletter session=%s failures=%d — moved to poison/",
+                            sid,
+                            backoff["failures"],  # type: ignore[index]
+                        )
+                    else:
+                        delete_backoff(persona_dir, sid)  # nothing left to poison: the failure record is stale
+                        logger.info(
+                            "conversation_finalize_deadletter_gone session=%s: the buffer is already gone "
+                            "(reaped by a rollover); nothing to poison, backoff cleared",
+                            sid,
+                        )
         reports.append(report)
         logger.info(
             "conversation_finalized session=%s silence_hours=%.2f "
