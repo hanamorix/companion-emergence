@@ -294,12 +294,13 @@ def extract_session_snapshot(
     reach the same session together. Two concurrent passes extract the same turns twice and race
     on the cursor write, so a pass that finds another one running skips: the running pass
     advances the cursor, and the next sweep picks up anything it did not cover. The skip is not
-    an error and counts for nothing.
+    an error and counts for nothing, and the report says so (``busy``), so a caller that acts on the
+    result (the rollover) can tell it from a pass that had nothing to do.
     """
     with file_lock(extract_lock_path(persona_dir, session_id), blocking=False) as acquired:
         if not acquired:
-            logger.info("conversation_snapshot_busy session=%s — another extraction is running", session_id)
-            return IngestReport(session_id=session_id)
+            logger.info("conversation_snapshot_busy session=%s: another extraction is running", session_id)
+            return IngestReport(session_id=session_id, busy=True)
         return _extract_session_snapshot_locked(
             persona_dir,
             session_id,

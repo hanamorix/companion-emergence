@@ -79,26 +79,37 @@ def perform_rollover(
     None if there is nothing to seed / the session is busy.
 
     ``seed_mode`` is ``"summary_only"`` (1c-A) or ``"tiers_plus_tail"`` (1c-B).
-    Memory extraction of the old buffer runs first (best-effort) when ``store`` +
-    ``hebbian`` are supplied — the seed is the immediate recap, memory is long-term
-    recall.
+    Memory extraction of the old buffer runs first when ``store`` + ``hebbian`` are supplied,
+    and the rollover goes on only if it completed (a busy, deferred or failed extraction returns
+    None with the buffer kept). The seed is the immediate recap, memory is long-term recall.
     """
     now = now or datetime.now(UTC)
     persona_dir = Path(persona_dir)
 
-    # 1. Final memory extraction of the old buffer (best-effort). Advances the
+    # 1. Final memory extraction of the old buffer. Advances the
     #    cursor so the carried tail's extraction state is current (C18).
     if store is not None and hebbian is not None and provider is not None:
         try:
             from brain.ingest.pipeline import extract_session_snapshot
 
-            extract_session_snapshot(
+            report = extract_session_snapshot(
                 persona_dir, old_sid,
                 store=store, hebbian=hebbian, provider=provider,
                 config=config,
             )
         except Exception:
-            logger.exception("rollover: extraction failed session=%s (continuing)", old_sid)
+            logger.exception("rollover: extraction failed session=%s; keeping the old buffer", old_sid)
+            return None
+        # The rollover folds and DELETES the old buffer, so it goes on only when the extraction actually ran for
+        # the session's turns (#477, #473): a pass that found another extraction running (busy), a refused call
+        # (deferred, e.g. an expired login) and a failed one all leave turns unextracted, and the next cycle tries
+        # again with the buffer intact.
+        if not report.completed:
+            logger.info(
+                "rollover: extraction did not complete session=%s busy=%s deferred=%s errors=%d; keeping the old buffer",
+                old_sid, report.busy, report.deferred, report.errors,
+            )
+            return None
 
     # 2. Fold the old conversation into its post-compaction form. NOTE: this runs
     #    AFTER step-1 extraction advanced the cursor, so it is NOT redundant with

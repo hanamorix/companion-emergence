@@ -162,3 +162,21 @@ def test_voice_accept_retries_a_transient_permission_error(tmp_path, monkeypatch
     assert not [p.name for p in persona.iterdir() if p.name.startswith("voice.md.")]
     row = next(r for r in iter_initiate_audit_full(persona) if r.audit_id == "ia_ve_477")
     assert row.delivery["current_state"] == "replied_explicit"
+
+
+def test_the_tick_appender_waits_for_the_logs_lock(tmp_path):
+    """Code review 3a: removing the lock from `append_chat_tick` was caught by no test. A trim holds the log's lock while it rewrites;
+    an appender that does not wait for it appends to the file the trim is about to replace, and the row is lost."""
+    from brain.utils.file_lock import file_lock
+
+    log_path = tmp_path / CHAT_TURNS_LOG_FILENAME
+    done = threading.Event()
+    with file_lock(log_path):
+        t = threading.Thread(
+            target=lambda: (append_chat_tick(tmp_path, ts=datetime.now(UTC), turns=3), done.set()), daemon=True
+        )
+        t.start()
+        assert not done.wait(timeout=0.4), "the append did not wait for the log's lock"
+    assert done.wait(timeout=5)
+    t.join(timeout=5)
+    assert log_path.read_text(encoding="utf-8").count("\n") == 1

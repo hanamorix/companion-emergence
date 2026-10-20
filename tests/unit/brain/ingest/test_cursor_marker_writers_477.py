@@ -132,6 +132,7 @@ def test_a_second_extraction_of_a_session_in_flight_skips_without_error(tmp_path
         )
     assert provider.calls == 0
     assert report.errors == 0 and report.committed == 0
+    assert report.busy is True and report.completed is False  # explicit, not "nothing to do"
     assert read_cursor(tmp_path, "s1") is None
 
 
