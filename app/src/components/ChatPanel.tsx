@@ -250,8 +250,16 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
       sessionRef.current = null;
       if (sid) {
         void snapshotSession(persona, sid, { keepalive })
-          .then(() => {
-            if (!keepalive && mountedRef.current) setMemorySaveWarning(null);
+          .then((r) => {
+            if (!keepalive && mountedRef.current) {
+              // A 200 can still mean nothing was saved yet: the bridge answers `deferred` (login expired, bridge stopping) or
+              // `busy` (another extraction of the session is running) with the buffer kept. Clear the warning only on a real success.
+              setMemorySaveWarning(
+                r?.deferred || r?.busy
+                  ? "Memory snapshot pending for the previous chat: it will be saved when the memory service is available."
+                  : null,
+              );
+            }
           })
           .catch((e) => {
             // Page unload remains best-effort. In-app persona changes keep the

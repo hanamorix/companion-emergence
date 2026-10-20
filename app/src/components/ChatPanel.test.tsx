@@ -814,6 +814,38 @@ describe("ChatPanel — snapshot on unmount (Task 6)", () => {
     );
     expect(mockedClose).not.toHaveBeenCalled();
   });
+
+  // A 200 from /sessions/snapshot can still mean nothing was saved yet (deferred: login expired or bridge stopping; busy: another
+  // extraction running). The pending warning must follow the response, not the status code.
+  async function snapshotOnPersonaChange(response: Record<string, unknown>) {
+    mockedNew.mockResolvedValueOnce("22222222-2222-4222-8222-222222222222");
+    mockedSnapshot.mockResolvedValue(response);
+
+    const { rerender } = render(<ChatPanel persona="nell" />);
+    fireEvent.change(screen.getByPlaceholderText(/write to/i), { target: { value: "hi" } });
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+    await waitFor(() => expect(mockedNew).toHaveBeenCalled());
+
+    // Changing persona keeps the component mounted and snapshots the previous chat.
+    rerender(<ChatPanel persona="other" />);
+    await waitFor(() => expect(mockedSnapshot).toHaveBeenCalled());
+  }
+
+  it.each([
+    ["deferred", { closed: false, errors: 0, deferred: true, busy: false }],
+    ["busy", { closed: false, errors: 0, deferred: false, busy: true }],
+  ])("keeps the memory-pending warning when the snapshot answered %s", async (_name, response) => {
+    await snapshotOnPersonaChange(response);
+    expect(await screen.findByText(/Memory snapshot pending for the previous chat/i)).toBeTruthy();
+  });
+
+  it("shows no memory-pending warning when the snapshot really succeeded", async () => {
+    await snapshotOnPersonaChange({ closed: false, errors: 0, deferred: false, busy: false });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.queryByText(/Memory snapshot pending/i)).toBeNull();
+  });
 });
 
 // ── Task 2: reach-out card reply merges into transcript ──────────────────
