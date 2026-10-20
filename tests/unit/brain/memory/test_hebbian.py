@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from brain.memory.hebbian import MAX_WEIGHT, HebbianMatrix
+from brain.utils import log_throttle
+
+HEBB_LOG = "brain.memory.hebbian"
 
 
 @pytest.fixture
@@ -235,3 +240,45 @@ def test_ensure_edge_inserts_once_no_weight_inflation(tmp_path):
         assert h.neighbors("x") == []
     finally:
         h.close()
+
+
+@pytest.fixture
+def fresh_throttle(monkeypatch):
+    monkeypatch.setattr(log_throttle, "_last", {})
+    monkeypatch.setattr(log_throttle, "_counts", {}, raising=False)
+
+
+def _cap_records(caplog):
+    return [r for r in caplog.records if r.name == HEBB_LOG and "MAX_WEIGHT" in r.getMessage()]
+
+
+def test_strengthen_records_when_the_cap_binds(matrix, caplog, fresh_throttle) -> None:
+    # #368: the cap used to bind silently. It only bites a pathological edge,
+    # so the first firing warns; later ones log at DEBUG with the count.
+    with caplog.at_level(logging.DEBUG, logger=HEBB_LOG):
+        matrix.strengthen("a", "b", delta=9.5)  # 9.5: below the cap, no record
+        assert _cap_records(caplog) == []
+        matrix.strengthen("a", "b", delta=0.5)  # exactly 10.0: reaches, does not exceed
+        assert _cap_records(caplog) == []
+        matrix.strengthen("b", "a", delta=0.5)  # 10.5 -> 10.0: binds
+        matrix.strengthen("x", "y", delta=MAX_WEIGHT + 5.0)  # fresh edge, binds on INSERT
+    recs = _cap_records(caplog)
+    assert [r.levelno for r in recs] == [logging.WARNING, logging.DEBUG]
+    assert "a-b" in recs[0].getMessage() and "10.500" in recs[0].getMessage()
+    assert "2 since start" in recs[1].getMessage()
+    # Behaviour unchanged: stored weights still saturate at the cap.
+    assert matrix.weight("a", "b") == MAX_WEIGHT
+    assert matrix.weight("x", "y") == MAX_WEIGHT
+
+
+def test_set_edge_weight_records_when_the_cap_binds(matrix, caplog, fresh_throttle) -> None:
+    with caplog.at_level(logging.DEBUG, logger=HEBB_LOG):
+        matrix.set_edge_weight("a", "b", MAX_WEIGHT)  # at the cap: no record
+        assert _cap_records(caplog) == []
+        matrix.set_edge_weight("d", "c", MAX_WEIGHT + 2.0)  # binds
+    (rec,) = _cap_records(caplog)
+    assert rec.levelno == logging.WARNING
+    assert "c-d" in rec.getMessage() and "12.000" in rec.getMessage() and "set_edge_weight" in rec.getMessage()
+    # Behaviour unchanged.
+    assert matrix.weight("a", "b") == MAX_WEIGHT
+    assert matrix.weight("c", "d") == MAX_WEIGHT

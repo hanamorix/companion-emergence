@@ -15,6 +15,7 @@ LOG = logging.getLogger("tests.log_throttle")
 @pytest.fixture(autouse=True)
 def _fresh(monkeypatch):
     monkeypatch.setattr(log_throttle, "_last", {})
+    monkeypatch.setattr(log_throttle, "_counts", {})
 
 
 def _levels(caplog):
@@ -48,3 +49,21 @@ def test_the_warning_carries_the_active_traceback(caplog):
             log_throttle.warn_throttled(LOG, "k", "failed")
     (rec,) = caplog.records
     assert rec.exc_info and rec.exc_info[0] is RuntimeError
+
+
+def test_count_throttled_counts_every_firing_and_logs_loudly_once_per_interval(monkeypatch, caplog):
+    # #368: a routine cap/gate firing is counted every time; the loud line
+    # (at the caller's level, no traceback) carries the running count.
+    t = [1000.0]
+    monkeypatch.setattr(log_throttle.time, "monotonic", lambda: t[0])
+    with caplog.at_level(logging.DEBUG, logger=LOG.name):
+        assert log_throttle.count_throttled(LOG, "g", logging.INFO, "gate %s", "x", interval_s=60) == 1
+        t[0] += 30
+        assert log_throttle.count_throttled(LOG, "g", logging.INFO, "gate %s", "x", interval_s=60) == 2
+        assert log_throttle.count_throttled(LOG, "h", logging.INFO, "other", interval_s=60) == 1
+        t[0] += 60
+        assert log_throttle.count_throttled(LOG, "g", logging.INFO, "gate %s", "x", interval_s=60) == 3
+    recs = [r for r in caplog.records if r.name == LOG.name]
+    assert [r.levelno for r in recs] == [logging.INFO, logging.DEBUG, logging.INFO, logging.INFO]
+    assert recs[-1].getMessage() == "gate x (3 since start)"
+    assert all(r.exc_info is None for r in recs)

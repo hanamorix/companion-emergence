@@ -17,7 +17,19 @@ import time
 INTERVAL_S = 6 * 3600.0
 
 _last: dict[str, float] = {}
+_counts: dict[str, int] = {}
 _lock = threading.Lock()
+
+
+def _due(key: str, interval_s: float) -> bool:
+    """True (and restart the interval) if ``key`` has not logged loudly within ``interval_s``.
+    Caller holds ``_lock``."""
+    now = time.monotonic()
+    last = _last.get(key)
+    if last is None or now - last >= interval_s:
+        _last[key] = now
+        return True
+    return False
 
 
 def warn_throttled(
@@ -25,10 +37,28 @@ def warn_throttled(
 ) -> None:
     """Log ``msg % args`` (with the active exception unless ``exc_info=False``):
     WARNING if ``key`` has not warned in the last ``INTERVAL_S``, DEBUG otherwise."""
-    now = time.monotonic()
     with _lock:
-        last = _last.get(key)
-        warn = last is None or now - last >= INTERVAL_S
-        if warn:
-            _last[key] = now
+        warn = _due(key, INTERVAL_S)
     (logger.warning if warn else logger.debug)(msg, *args, exc_info=exc_info)
+
+
+def count_throttled(
+    logger: logging.Logger,
+    key: str,
+    level: int,
+    msg: str,
+    *args: object,
+    interval_s: float = INTERVAL_S,
+) -> int:
+    """Count one firing of a cap or gate under ``key`` (#368) and log ``msg % args``
+    with the running count: at ``level`` if ``key`` has not logged at that level in
+    the last ``interval_s``, DEBUG otherwise. Returns the count since process start.
+
+    For events that are expected, not failures, so there is no traceback. The count
+    lives in memory and resets on restart; firings after the last loud line show
+    only at DEBUG until the next interval."""
+    with _lock:
+        n = _counts[key] = _counts.get(key, 0) + 1
+        loud = _due(key, interval_s)
+    logger.log(level if loud else logging.DEBUG, msg + " (%d since start)", *args, n)
+    return n

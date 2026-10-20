@@ -1,8 +1,14 @@
 """Tests for brain.chat.reflection_gate — time-based debounce for background pass-2 spawns."""
+import logging
 from datetime import UTC, datetime, timedelta
+
+import pytest
 
 from brain.chat.reflection_gate import _MIN_SECONDS_BETWEEN, _SALIENCE_THRESHOLD, should_reflect
 from brain.chat.salience import SalienceSignal, assess_salience
+from brain.utils import log_throttle
+
+GATE_LOG = "brain.chat.reflection_gate"
 
 
 def _t0() -> datetime:
@@ -59,3 +65,45 @@ def test_unicode_state_roundtrips(tmp_path):
 def test_quiet_emotional_turn_reflects(tmp_path):
     s = assess_salience("Hey love. I'm back — long day of editing, my eyes are sandpaper.")
     assert should_reflect(s, tmp_path, kind="attunement", now=_t0()) is True
+
+
+@pytest.fixture
+def fresh_throttle(monkeypatch):
+    monkeypatch.setattr(log_throttle, "_last", {})
+    monkeypatch.setattr(log_throttle, "_counts", {}, raising=False)
+
+
+def _gate_records(caplog, needle):
+    return [r for r in caplog.records if r.name == GATE_LOG and needle in r.getMessage()]
+
+
+def test_low_salience_suppress_is_recorded_with_a_count(tmp_path, caplog, fresh_throttle):
+    # #368: the suppress path used to leave no record. It is routine, so INFO
+    # once per interval with a running count, DEBUG in between.
+    with caplog.at_level(logging.DEBUG, logger=GATE_LOG):
+        for _ in range(3):
+            assert should_reflect(assess_salience("ok"), tmp_path, kind="attunement", now=_t0()) is False
+    recs = _gate_records(caplog, "low salience")
+    assert [r.levelno for r in recs] == [logging.INFO, logging.DEBUG, logging.DEBUG]
+    assert "kind=attunement" in recs[0].getMessage()
+    assert "3 since start" in recs[-1].getMessage()
+    # Behaviour unchanged: a suppressed turn writes no state.
+    assert not (tmp_path / "reflection_state.json").exists()
+
+
+def test_too_soon_suppress_is_recorded_and_keeps_the_cursor(tmp_path, caplog, fresh_throttle):
+    sig = SalienceSignal.maximal()
+    t0 = _t0()
+    assert should_reflect(sig, tmp_path, kind="attunement", now=t0) is True
+    state_before = (tmp_path / "reflection_state.json").read_text()
+    with caplog.at_level(logging.DEBUG, logger=GATE_LOG):
+        assert should_reflect(sig, tmp_path, kind="attunement", now=t0 + timedelta(seconds=10)) is False
+        assert should_reflect(sig, tmp_path, kind="attunement", now=t0 + timedelta(seconds=20)) is False
+    recs = _gate_records(caplog, "too soon")
+    assert [r.levelno for r in recs] == [logging.INFO, logging.DEBUG]
+    assert "kind=attunement" in recs[0].getMessage()
+    assert "2 since start" in recs[-1].getMessage()
+    # Behaviour unchanged: a debounced turn does not move the cursor, so the
+    # window still runs from t0.
+    assert (tmp_path / "reflection_state.json").read_text() == state_before
+    assert should_reflect(sig, tmp_path, kind="attunement", now=t0 + timedelta(seconds=_MIN_SECONDS_BETWEEN + 1)) is True

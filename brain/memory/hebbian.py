@@ -16,9 +16,14 @@ Hebbian work.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from collections.abc import Iterable
 from pathlib import Path
+
+from brain.utils.log_throttle import count_throttled
+
+log = logging.getLogger(__name__)
 
 # Ceiling on any single edge weight. strengthen() saturates at this value so
 # no edge can grow unbounded, which would let a sustained reinforcement loop
@@ -27,6 +32,16 @@ from pathlib import Path
 # (co-activation reinforces at 0.5/event; strong bonds reach low single digits
 # even before decay), so the cap only ever bites a pathological edge.
 MAX_WEIGHT = 10.0
+
+
+def _note_cap(lo: str, hi: str, raw: float, where: str) -> None:
+    """#368: record that MAX_WEIGHT bound. It should only bite a pathological edge,
+    so the first firing per interval warns and the rest log at DEBUG, with a count."""
+    count_throttled(
+        log, "hebbian:max_weight", logging.WARNING,
+        "hebbian: edge %s-%s capped at MAX_WEIGHT %.1f (raw %.3f) in %s",
+        lo, hi, MAX_WEIGHT, raw, where,
+    )
 
 
 class HebbianMatrix:
@@ -90,6 +105,17 @@ class HebbianMatrix:
         if delta <= 0.0:
             raise ValueError(f"delta must be positive, got {delta!r}")
         lo, hi = _canonical(a, b)
+        # Read the pre-weight in the same write transaction as the UPSERT, so
+        # "did the cap bind" is exact under concurrent writers. One primary-key
+        # lookup: measured ~65 -> ~70 us per call on a WAL file db (the commit
+        # dominates). The UPSERT took this write lock anyway, just later.
+        if not self._conn.in_transaction:
+            self._conn.execute("BEGIN IMMEDIATE")
+        row = self._conn.execute(
+            "SELECT weight FROM hebbian_edges WHERE memory_a = ? AND memory_b = ?",
+            (lo, hi),
+        ).fetchone()
+        raw = (float(row[0]) if row else 0.0) + delta
         # Cap in both UPSERT branches. The INSERT stores min(delta, MAX_WEIGHT);
         # on conflict excluded.weight is that same capped value, and
         # MIN(weight + excluded.weight, MAX_WEIGHT) == MIN(weight + delta,
@@ -105,6 +131,8 @@ class HebbianMatrix:
             (lo, hi, delta, MAX_WEIGHT, MAX_WEIGHT),
         )
         self._conn.commit()
+        if raw > MAX_WEIGHT:
+            _note_cap(lo, hi, raw, "strengthen")
 
     def weight(self, a: str, b: str) -> float:
         """Return the weight of edge (a, b). Zero if no edge."""
@@ -211,6 +239,8 @@ class HebbianMatrix:
             (lo, hi, capped),
         )
         self._conn.commit()
+        if weight > MAX_WEIGHT:
+            _note_cap(lo, hi, weight, "set_edge_weight")
 
     def activation_count(self, memory_id: str) -> int:
         """Return the count of edges incident on this memory id."""
