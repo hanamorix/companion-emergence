@@ -33,9 +33,13 @@ def _post(client, results, key, which):
 
 
 @pytest.mark.parametrize("which", ["image", "file"])
-def test_upload_does_not_block_the_event_loop_and_the_worker_is_counted(persona_dir: Path, monkeypatch, which):
+def test_upload_does_not_block_the_event_loop_and_the_worker_is_counted(
+    persona_dir: Path, monkeypatch, which
+):
     started, release = threading.Event(), threading.Event()
-    target = "brain.images.save_image_bytes" if which == "image" else "brain.file_store.save_file_bytes"
+    target = (
+        "brain.images.save_image_bytes" if which == "image" else "brain.file_store.save_file_bytes"
+    )
     import importlib
 
     module_name, attr = target.rsplit(".", 1)
@@ -54,7 +58,9 @@ def test_upload_does_not_block_the_event_loop_and_the_worker_is_counted(persona_
         uploader.start()
         try:
             assert started.wait(10), "the upload never reached the save"
-            prober = threading.Thread(target=lambda: results.__setitem__("health", client.get("/health")))
+            prober = threading.Thread(
+                target=lambda: results.__setitem__("health", client.get("/health"))
+            )
             prober.start()
             prober.join(timeout=5)
             # (a) the second request completes while the first is still blocked in the save

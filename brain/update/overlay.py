@@ -98,7 +98,7 @@ def replace_retrying(src: Path, dst: Path) -> None:
     start-up (#302). Anything else, or a lock that outlasts the retries, raises."""
     for attempt in range(_RETRY_ATTEMPTS):
         try:
-            os.replace(src, dst)
+            os.replace(src, dst)  # atomic-write: ok -- replace_retrying is the C3 retried-rename helper that C3 folds into the shared one; a rename of a finished file, not a write
             return
         except PermissionError:
             if attempt == _RETRY_ATTEMPTS - 1:

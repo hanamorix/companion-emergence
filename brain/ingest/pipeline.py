@@ -707,7 +707,7 @@ def finalize_stale_sessions(
             poison_dir = persona_dir / "active_conversations" / "poison"
             poison_dir.mkdir(parents=True, exist_ok=True)
             dst = poison_dir / f"{sid}.jsonl"
-            src.rename(dst)
+            src.rename(dst)  # atomic-write: ok -- moves a poisoned buffer to poison/, a rename of a finished file, not a write
             delete_cursor(persona_dir, sid)
             delete_backoff(persona_dir, sid)
             logger.warning(

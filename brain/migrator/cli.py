@@ -427,9 +427,9 @@ def _run_migrate_locked(args: MigrateArgs, reader: OGReader) -> MigrationReport:
         if finalise_target.exists():
             ts = datetime.now(UTC).strftime("%Y-%m-%dT%H%M%S")
             backup = finalise_target.with_name(f"{finalise_target.name}.backup-{ts}")
-            os.rename(finalise_target, backup)
+            os.rename(finalise_target, backup)  # atomic-write: ok -- installs a persona directory (a directory rename), not a file write
         finalise_target.parent.mkdir(parents=True, exist_ok=True)
-        os.rename(work_dir, finalise_target)
+        os.rename(work_dir, finalise_target)  # atomic-write: ok -- installs a persona directory (a directory rename), not a file write
 
     return report
 

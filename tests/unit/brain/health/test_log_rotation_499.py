@@ -106,7 +106,9 @@ def _tick(log: Path, keep: int):
     return lr.rotate_rolling_size(log, max_bytes=CAP, archive_keep=keep)
 
 
-def _clean_final(tmp_path: Path, keep: int, present: tuple[int, ...] | None = None) -> dict[str, bytes]:
+def _clean_final(
+    tmp_path: Path, keep: int, present: tuple[int, ...] | None = None
+) -> dict[str, bytes]:
     d = tmp_path.with_name(tmp_path.name + "_clean")
     d.mkdir(exist_ok=True)
     log = _setup(d, keep, present)
@@ -154,7 +156,9 @@ def test_g17a_a_failed_archive_write_three_ticks_in_a_row_loses_nothing(tmp_path
 
         def boom(*a, **k):
             mode = a[1] if len(a) > 1 else k.get("mode", "rb")
-            if "w" in mode:  # only the compression of the new archive fails; reading archives still works
+            if (
+                "w" in mode
+            ):  # only the compression of the new archive fails; reading archives still works
                 raise OSError(errno.EIO, "I/O error")
             return real_open(*a, **k)
 
@@ -181,7 +185,9 @@ def test_g17b_a_failed_publish_loses_only_the_one_normal_eviction(tmp_path, monk
         with pytest.raises(type(exc)):
             _tick(log, 3)
         state = _state(log)
-        assert state["log"] == orig and state["2"] == b"A" and state["3"] == b"B" and "1" not in state
+        assert (
+            state["log"] == orig and state["2"] == b"A" and state["3"] == b"B" and "1" not in state
+        )
     faults.clear()
     _tick(log, 3)
     assert _state(log) == _clean_final(tmp_path, 3)
@@ -215,7 +221,11 @@ def test_g17c_a_failed_middle_shift_loses_only_the_one_normal_eviction(tmp_path,
         state = _state(log)
         assert state["log"] == orig
         # tick 1 moved D out of the way (the normal eviction), then stopped; nothing else is ever lost
-        assert {k: v for k, v in state.items() if k != "log"} == {"1": b"A", "2": b"B", "4": b"C"}, tick
+        assert {k: v for k, v in state.items() if k != "log"} == {
+            "1": b"A",
+            "2": b"B",
+            "4": b"C",
+        }, tick
     faults.clear()
     _tick(log, 4)
     assert _state(log) == _clean_final(tmp_path, 4)
@@ -225,7 +235,9 @@ def test_g17c_a_failed_middle_shift_loses_only_the_one_normal_eviction(tmp_path,
 
 
 @pytest.mark.parametrize("kill_at", [1, 2, 3, 4])
-def test_g17d_a_kill_before_each_replace_then_one_clean_tick_equals_a_clean_run(tmp_path, monkeypatch, kill_at):
+def test_g17d_a_kill_before_each_replace_then_one_clean_tick_equals_a_clean_run(
+    tmp_path, monkeypatch, kill_at
+):
     log = _setup(tmp_path, 3)
     orig = log.read_bytes()
     faults = Faults(monkeypatch)
@@ -239,7 +251,9 @@ def test_g17d_a_kill_before_each_replace_then_one_clean_tick_equals_a_clean_run(
     assert _extras(log) == []
 
 
-def test_g17d_a_kill_inside_the_staging_write_leaves_a_temp_that_the_next_tick_sweeps(tmp_path, monkeypatch):
+def test_g17d_a_kill_inside_the_staging_write_leaves_a_temp_that_the_next_tick_sweeps(
+    tmp_path, monkeypatch
+):
     log = _setup(tmp_path, 3)
     orig = log.read_bytes()
 
@@ -256,7 +270,9 @@ def test_g17d_a_kill_inside_the_staging_write_leaves_a_temp_that_the_next_tick_s
     assert _extras(log) == []
 
 
-def test_g17d_a_kill_between_the_publish_and_the_truncation_is_the_named_residual(tmp_path, monkeypatch):
+def test_g17d_a_kill_between_the_publish_and_the_truncation_is_the_named_residual(
+    tmp_path, monkeypatch
+):
     """Documented limit accepted by main (2026-10-20 09:20): the rows are archived twice, none is lost, and the
     duplicate displaces the oldest archive one rotation early. The base has the same window."""
     log = _setup(tmp_path, 3)
@@ -282,7 +298,9 @@ def test_g17d_a_kill_between_the_publish_and_the_truncation_is_the_named_residua
 
 
 @pytest.mark.parametrize("suffix", [".next.gz", ".1.gz"])
-def test_g17e_with_one_slot_a_failed_write_or_publish_keeps_the_single_archive(tmp_path, monkeypatch, suffix):
+def test_g17e_with_one_slot_a_failed_write_or_publish_keeps_the_single_archive(
+    tmp_path, monkeypatch, suffix
+):
     log = _setup(tmp_path, 1)
     start = _state(log)
     faults = Faults(monkeypatch)
@@ -303,7 +321,9 @@ def _enospc():
     return OSError(errno.ENOSPC, "No space left on device")
 
 
-def test_g17f_persistent_enospc_evicts_only_the_one_archive_a_rotation_would_evict(tmp_path, monkeypatch):
+def test_g17f_persistent_enospc_evicts_only_the_one_archive_a_rotation_would_evict(
+    tmp_path, monkeypatch
+):
     log = _setup(tmp_path, 3)
     orig = log.read_bytes()
     faults = Faults(monkeypatch)
@@ -371,7 +391,10 @@ def test_the_year_archive_is_written_with_lf_and_keeps_every_row(tmp_path):
     from datetime import UTC, datetime
 
     log = tmp_path / "soul_audit.jsonl"
-    rows = [{"ts": "2025-12-01T00:00:00+00:00", "i": 1}, {"ts": "2026-02-01T00:00:00+00:00", "i": 2}]
+    rows = [
+        {"ts": "2025-12-01T00:00:00+00:00", "i": 1},
+        {"ts": "2026-02-01T00:00:00+00:00", "i": 2},
+    ]
     log.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
     lr.rotate_age_archive_yearly(log, now=datetime(2026, 6, 14, tzinfo=UTC), timestamp_field="ts")
     raw = _gz_bytes(tmp_path / "soul_audit.2025.jsonl.gz")
@@ -385,6 +408,10 @@ def test_the_rolling_compress_still_goes_through_gzip_open_and_shutil_copyfileob
 
     src = Path(lr.__file__).read_text(encoding="utf-8")
     tree = ast.parse(src)
-    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_rotate_rolling_locked")
+    fn = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_rotate_rolling_locked"
+    )
     called = {ast.unparse(n.func) for n in ast.walk(fn) if isinstance(n, ast.Call)}
     assert "gzip.open" in called and "shutil.copyfileobj" in called

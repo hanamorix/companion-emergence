@@ -120,7 +120,9 @@ def test_g1d_fsync_order_file_then_replace_then_directory(tmp_path, monkeypatch)
     assert events == ["replace"]
 
 
-def test_g1e_transient_permission_errors_are_retried_and_a_persistent_one_is_raised(tmp_path, monkeypatch):
+def test_g1e_transient_permission_errors_are_retried_and_a_persistent_one_is_raised(
+    tmp_path, monkeypatch
+):
     p = tmp_path / "k.bin"
     state = _flaky_replace(monkeypatch, "k.bin", 2)
     save_bytes_atomic(p, b"ok")
@@ -137,7 +139,9 @@ def test_g1e_transient_permission_errors_are_retried_and_a_persistent_one_is_rai
 
 
 @pytest.mark.parametrize("exc", [OSError("disk full"), KeyboardInterrupt(), SystemExit(1)])
-def test_g1f_failure_during_the_write_leaves_destination_unchanged_and_no_temp(tmp_path, monkeypatch, exc):
+def test_g1f_failure_during_the_write_leaves_destination_unchanged_and_no_temp(
+    tmp_path, monkeypatch, exc
+):
     p = tmp_path / "k.bin"
     p.write_bytes(b"old")
     absent = tmp_path / "absent.bin"
@@ -153,7 +157,9 @@ def test_g1f_failure_during_the_write_leaves_destination_unchanged_and_no_temp(t
     assert _temps(tmp_path) == []
 
 
-def test_g1f_a_kill_stand_in_runs_no_cleanup_and_the_next_save_sweeps_the_leftover(tmp_path, monkeypatch):
+def test_g1f_a_kill_stand_in_runs_no_cleanup_and_the_next_save_sweeps_the_leftover(
+    tmp_path, monkeypatch
+):
     p = tmp_path / "k.bin"
     p.write_bytes(b"old")
 
@@ -192,7 +198,9 @@ def test_g1g_a_dead_writers_temp_is_swept_and_a_live_other_process_temp_is_left(
 
 
 @pytest.mark.parametrize("exc", [KeyboardInterrupt(), SystemExit(1)])
-def test_g2_text_writer_removes_its_temp_on_keyboard_interrupt_and_system_exit(tmp_path, monkeypatch, exc):
+def test_g2_text_writer_removes_its_temp_on_keyboard_interrupt_and_system_exit(
+    tmp_path, monkeypatch, exc
+):
     p = tmp_path / "t.txt"
     p.write_text("old", encoding="utf-8")
 
@@ -243,12 +251,16 @@ def test_g4_blob_written_once_then_deduped_with_no_write_and_no_temp(tmp_path, m
     assert target.read_bytes() == b"data" and _temps(target.parent) == []
     calls: list[Path] = []
     real = aw.save_bytes_atomic
-    monkeypatch.setattr(aw, "save_bytes_atomic", lambda p, d, **k: (calls.append(p), real(p, d, **k))[1])
+    monkeypatch.setattr(
+        aw, "save_bytes_atomic", lambda p, d, **k: (calls.append(p), real(p, d, **k))[1]
+    )
     save_blob_once(target, b"data")
     assert calls == []
 
 
-def test_g4d_blob_failure_with_the_target_absent_propagates_and_leaves_no_temp(tmp_path, monkeypatch):
+def test_g4d_blob_failure_with_the_target_absent_propagates_and_leaves_no_temp(
+    tmp_path, monkeypatch
+):
     target = tmp_path / "abc"
     real = os.replace
 
@@ -262,7 +274,9 @@ def test_g4d_blob_failure_with_the_target_absent_propagates_and_leaves_no_temp(t
     assert not target.exists() and _temps(tmp_path) == []
 
 
-def test_g4e_blob_failure_with_the_target_present_means_a_concurrent_writer_won(tmp_path, monkeypatch):
+def test_g4e_blob_failure_with_the_target_present_means_a_concurrent_writer_won(
+    tmp_path, monkeypatch
+):
     target = tmp_path / "abc"
     real = os.replace
     monkeypatch.setattr("time.sleep", lambda _s: None)
@@ -451,7 +465,10 @@ def test_g20a_the_new_module_holds_the_writers_and_attempt_heal_holds_none_of_th
     ]
     assert imports_from_new == ["save_with_backup_text"]
     assert "__all__" not in heal_defs
-    assert not any(isinstance(n, ast.ImportFrom) and any(a.name == "*" for a in n.names) for n in ast.walk(tree))
+    assert not any(
+        isinstance(n, ast.ImportFrom) and any(a.name == "*" for a in n.names)
+        for n in ast.walk(tree)
+    )
 
 
 def _py_files():
@@ -492,7 +509,11 @@ def _fresh(code: str, repo: Path = REPO) -> subprocess.CompletedProcess:
     another checkout, and -I would ignore PYTHONPATH, so the path is inserted explicitly)."""
     prelude = f"import sys\nsys.path.insert(0, {str(repo)!r})\n"
     return subprocess.run(
-        [sys.executable, "-c", prelude + code], capture_output=True, text=True, cwd=str(repo), timeout=120
+        [sys.executable, "-c", prelude + code],
+        capture_output=True,
+        text=True,
+        cwd=str(repo),
+        timeout=120,
     )
 
 
@@ -507,7 +528,9 @@ def test_g20c_importing_the_new_module_pulls_in_nothing_from_health():
     assert out.stdout.strip() == "[]"
 
 
-@pytest.mark.parametrize("module", ["brain.health.json_io", "brain.health.attempt_heal", "brain.health.log_rotation"])
+@pytest.mark.parametrize(
+    "module", ["brain.health.json_io", "brain.health.attempt_heal", "brain.health.log_rotation"]
+)
 def test_g20c_each_health_module_imports_cleanly_in_a_fresh_interpreter(module):
     out = _fresh(
         f"import {module} as m\n"
@@ -518,7 +541,9 @@ def test_g20c_each_health_module_imports_cleanly_in_a_fresh_interpreter(module):
 
 
 def test_g20c_the_check_can_fail_with_the_wrong_tree_or_a_cycle(tmp_path):
-    wrong = _fresh("import brain\nimport os\nassert os.path.realpath(brain.__file__).startswith('/nonexistent')\n")
+    wrong = _fresh(
+        "import brain\nimport os\nassert os.path.realpath(brain.__file__).startswith('/nonexistent')\n"
+    )
     assert wrong.returncode != 0  # the __file__ assertion is real
     fake = tmp_path / "brain" / "utils"
     fake.mkdir(parents=True)

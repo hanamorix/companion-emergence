@@ -559,7 +559,7 @@ def _install(path: Path, chosen_bak, chosen_fallback, expect, validate, detail: 
         index, bak = chosen_bak
         raw, _sig = _read_bytes(bak)
         data = _check(raw, expect, validate)
-        _replace_with_retry(bak, path)
+        _replace_with_retry(bak, path)  # atomic-write: ok -- restores a finished backup file over the live one, a rename of a finished file (the heal), not a write
         return data, f"restored_from_bak{index}", detail
     except (FileNotFoundError, _BadContentError):
         # the candidate was rotated away or rewritten (a save that took no heal sidecar): someone else acted
@@ -648,7 +648,7 @@ def _heal_locked(path, bad, sig, default, recover, expect, validate, fallbacks) 
         try:
             _seam("before_quarantine_backup", corrupt)
             _expect_unchanged(corrupt, csig)
-            _replace_with_retry(corrupt, corrupt.with_name(f"{corrupt.name}.corrupt-{stamp}"))
+            _replace_with_retry(corrupt, corrupt.with_name(f"{corrupt.name}.corrupt-{stamp}"))  # atomic-write: ok -- moves a corrupt backup aside to a .corrupt name, a rename of a finished file (the heal), not a write
         except _ChangedError:
             logger.warning("backup %s changed during the heal; left alone", corrupt)
         except OSError:

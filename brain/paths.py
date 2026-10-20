@@ -200,7 +200,7 @@ def cadence_state_path(persona_dir: Path, filename: str) -> Path:
     if not new.exists() and legacy.is_file():
         try:
             new.parent.mkdir(parents=True, exist_ok=True)
-            legacy.replace(new)
+            legacy.replace(new)  # atomic-write: ok -- one-time move of a cadence file into its subdirectory (a rename of a finished file), not a write
         except OSError:
             warnings.warn(
                 f"cadence_state_path: could not migrate {legacy} → {new}; "

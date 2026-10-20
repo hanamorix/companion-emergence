@@ -1061,8 +1061,8 @@ def _rename_aside(path: Path) -> bool:
     journal = path.with_name(path.name + "-journal")
     try:
         if journal.exists():
-            os.replace(journal, target.with_name(target.name + "-journal"))
-        os.replace(path, target)
+            os.replace(journal, target.with_name(target.name + "-journal"))  # atomic-write: ok -- moves a corrupt database's journal aside, a rename of a finished file, not a write
+        os.replace(path, target)  # atomic-write: ok -- moves a corrupt database aside, a rename of a finished file, not a write
     except OSError as exc:
         logger.warning(
             "known names: could not rename corrupt %s aside (%s); write skipped", path, exc

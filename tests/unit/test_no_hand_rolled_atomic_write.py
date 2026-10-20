@@ -42,7 +42,9 @@ EXPECTED_MARKERS = 21
 def flagged_calls(source: str) -> list[tuple[int, int, str]]:
     """(first line, last line, kind) of each flagged call in ``source``."""
     tree = ast.parse(source)
-    bound: dict[str, str] = {}  # local name -> flagged kind, for from-imports of os / tempfile / shutil
+    bound: dict[
+        str, str
+    ] = {}  # local name -> flagged kind, for from-imports of os / tempfile / shutil
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             for a in node.names:
@@ -74,7 +76,12 @@ def flagged_calls(source: str) -> list[tuple[int, int, str]]:
                 kind = "shutil.move"
             elif f.attr in RETRY_HELPERS:
                 kind = f"retry-helper:{f.attr}"
-            elif f.attr in ("replace", "rename") and len(node.args) == 1 and not node.keywords and base != "dataclasses":
+            elif (
+                f.attr in ("replace", "rename")
+                and len(node.args) == 1
+                and not node.keywords
+                and base != "dataclasses"
+            ):
                 kind = f"path.{f.attr}"
         if kind:
             out.append((node.lineno, node.end_lineno or node.lineno, kind))
@@ -100,7 +107,9 @@ def check_source(source: str, rel: str) -> tuple[list[str], int]:
         if own and marker_lines[own[0]]:
             covered.update(own)
         else:
-            errors.append(f"{rel}:{first}: {kind} outside the shared writer needs an atomic-write marker")
+            errors.append(
+                f"{rel}:{first}: {kind} outside the shared writer needs an atomic-write marker"
+            )
     for ln, reason in marker_lines.items():
         if reason and ln not in covered:
             errors.append(f"{rel}:{ln}: stale atomic-write marker (no flagged call on its lines)")

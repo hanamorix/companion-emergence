@@ -58,7 +58,11 @@ def _boom_fsync(monkeypatch):
 
 
 def _leftovers(directory: Path) -> list[str]:
-    return sorted(p.name for p in directory.iterdir() if p.name.endswith((".tmp", ".new")) or ".tmp-" in p.name)
+    return sorted(
+        p.name
+        for p in directory.iterdir()
+        if p.name.endswith((".tmp", ".new")) or ".tmp-" in p.name
+    )
 
 
 # --- S1/S2: identity key ------------------------------------------------------------------------------------------
@@ -187,7 +191,10 @@ def test_legacy_copy_is_byte_identical_and_leaves_no_temp(tmp_path):
     preserved, _missing, issues = migrate_legacy_files(og_data_dir=og, persona_dir=persona)
     assert preserved == ["nell_journal.json"] and issues == []
     dest = persona / "legacy" / "nell_journal.json"
-    assert hashlib.sha256(dest.read_bytes()).digest() == hashlib.sha256((og / "nell_journal.json").read_bytes()).digest()
+    assert (
+        hashlib.sha256(dest.read_bytes()).digest()
+        == hashlib.sha256((og / "nell_journal.json").read_bytes()).digest()
+    )
     assert _leftovers(dest.parent) == []
 
 
@@ -272,7 +279,9 @@ def test_blob_is_fsynced_before_it_is_published(tmp_path, monkeypatch, which):
 
 
 @pytest.mark.parametrize("which", ["image", "file"])
-def test_blob_failure_with_the_target_absent_raises_and_leaves_no_temp(tmp_path, monkeypatch, which):
+def test_blob_failure_with_the_target_absent_raises_and_leaves_no_temp(
+    tmp_path, monkeypatch, which
+):
     def boom(src, dst):
         raise OSError("disk full")
 
@@ -284,7 +293,9 @@ def test_blob_failure_with_the_target_absent_raises_and_leaves_no_temp(tmp_path,
 
 
 @pytest.mark.parametrize("which", ["image", "file"])
-def test_blob_failure_with_the_target_present_means_a_concurrent_writer_won(tmp_path, monkeypatch, which):
+def test_blob_failure_with_the_target_present_means_a_concurrent_writer_won(
+    tmp_path, monkeypatch, which
+):
     """b557882d: identical concurrent uploads end with one complete file and no error."""
     real = os.replace
     monkeypatch.setattr("time.sleep", lambda _s: None)
@@ -344,7 +355,9 @@ def test_launchd_plist_is_the_built_xml_mode_0644_and_leaves_no_temp(launchd_env
     from brain.service import launchd
 
     path = launchd.write_launchd_plist(persona="nell", nell_path=launchd_env)
-    assert path.read_text(encoding="utf-8") == launchd.build_launchd_plist_xml(persona="nell", nell_path=launchd_env)
+    assert path.read_text(encoding="utf-8") == launchd.build_launchd_plist_xml(
+        persona="nell", nell_path=launchd_env
+    )
     if os.name != "nt":
         assert stat.S_IMODE(path.stat().st_mode) == 0o644
     assert _leftovers(path.parent) == []
@@ -392,7 +405,9 @@ def unit_env(tmp_path, monkeypatch):
     monkeypatch.setattr(systemd, "run_systemctl", lambda args: None)
     path = unit_dir / systemd.service_unit_name("nell")
     path.write_text(
-        systemd.build_systemd_unit_text(persona="nell", nell_path=nell).replace("KillMode=mixed\n", ""),
+        systemd.build_systemd_unit_text(persona="nell", nell_path=nell).replace(
+            "KillMode=mixed\n", ""
+        ),
         encoding="utf-8",
     )
     return systemd, path
@@ -436,11 +451,15 @@ def test_append_archive_new_segment_and_new_marker_fsync_the_directory(tmp_path,
 
     seen: list[Path] = []
     monkeypatch.setattr(buffer, "fsync_dir", lambda d: seen.append(Path(d)))
-    buffer.append_archive(tmp_path, "sess1", [{"role": "user", "content": "hi", "ts": "2026-06-15T10:00:00+00:00"}])
+    buffer.append_archive(
+        tmp_path, "sess1", [{"role": "user", "content": "hi", "ts": "2026-06-15T10:00:00+00:00"}]
+    )
     archive_dir = buffer._archived_conversations_dir(tmp_path)
     assert seen == [archive_dir]
     seen.clear()
-    buffer.append_archive(tmp_path, "sess1", [{"role": "user", "content": "again", "ts": "2026-06-15T10:00:01+00:00"}])
+    buffer.append_archive(
+        tmp_path, "sess1", [{"role": "user", "content": "again", "ts": "2026-06-15T10:00:01+00:00"}]
+    )
     assert seen == []  # the segment already exists: no new directory entry
     marker_dir = buffer._archive_marker_path(tmp_path, "sess1").parent
     marker_dir.mkdir(parents=True, exist_ok=True)
