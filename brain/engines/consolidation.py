@@ -499,7 +499,9 @@ def _settle_failed_item_inner(
     # environment: keep it for later and end the pass (the rest stay in the processing file).
     source = entry.get("_source") or "gate-retry"
     if cand is not None:
-        pending.enqueue(cand, source=source)
+        # Rebuilt from the ORIGINAL entry, not `cand`: `_dispatch` may already have changed the in-memory candidate (a
+        # `correction_of` set before the failed `store.create`), and the next run must judge it afresh (#470 review).
+        pending.enqueue(Memory.from_dict(entry), source=source)
     else:
         pending.enqueue_reappraisal(str(entry.get("memory_id")), source=source, include_held=False)
     logger.warning(

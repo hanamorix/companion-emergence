@@ -202,3 +202,50 @@ def test_finalize_still_poisons_a_session_nothing_holds(world):
     finalize_stale_sessions(persona, store=store, hebbian=hebbian, provider=_CountingProvider())
     assert not buf.exists()
     assert (persona / "active_conversations" / "poison" / f"{sid}.jsonl").exists()
+
+
+# --- item 3: the environment requeue keeps the ORIGINAL entry -----------------------------------------------------------
+
+
+def test_environment_requeue_keeps_the_original_entry_not_the_mutated_candidate(tmp_path, monkeypatch):
+    # Fails on 584ec8a1: `_dispatch` sets `correction_of` on the in-memory candidate before `store.create`; when the create
+    # hits a locked database the gate requeues that MUTATED Memory.
+    import sqlite3
+
+    import brain.engines.consolidation as cons
+    from brain.engines.consolidation import Decision, run_consolidation
+    from brain.health.json_io import read_jsonl
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.pending import PendingQueue
+    from brain.memory.store import MemoryStore
+
+    store = MemoryStore(tmp_path / "memories.db")
+    heb = HebbianMatrix(tmp_path / "hebbian.db")
+    try:
+        target = Memory.create_new(content="an existing memory", memory_type="dream", domain="us", emotions={})
+        store.create(target)
+        queue = PendingQueue(tmp_path)
+        queue.enqueue(_cand(), source="dream")
+        original = read_jsonl(queue.path)[0]
+        real_create = store.create
+
+        def locked_create(mem):
+            if mem.id == original["id"]:
+                raise sqlite3.OperationalError("database is locked")
+            return real_create(mem)
+
+        monkeypatch.setattr(store, "create", locked_create)
+        monkeypatch.setattr(cons, "_embed_candidate", lambda _c: None)
+        result = run_consolidation(
+            store,
+            persona_dir=tmp_path,
+            hebbian=heb,
+            classifier=lambda _c, _ctx: Decision("correction", target_id=target.id),
+        )
+        assert result.failed == 1
+        requeued = [r for r in read_jsonl(queue.path) if r.get("id") == original["id"]]
+        assert len(requeued) == 1
+        assert "correction_of" not in (requeued[0].get("metadata") or {})
+    finally:
+        store.close()
+        heb.close()
