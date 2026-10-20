@@ -759,3 +759,73 @@ def test_505_exact_pass_stops_a_group_whose_canonical_vanished(tmp_path, monkeyp
     warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert len(warnings) == 1 and k.id in warnings[0], warnings
     store.close()
+
+
+def test_505_exact_pass_archives_the_row_as_it_was_when_removed(tmp_path, monkeypatch):
+    """#505: another writer raises D2's importance while D1 is being archived. Guards against archiving
+    D2 from the opening ``list_active`` snapshot: the archive is the only copy left of a removed row, so
+    it must hold the row as it was deleted, and the canonical must carry that current importance."""
+    store = MemoryStore(tmp_path / "memories.db")
+    k, d2, d1 = _exact_group(store)
+    _on_first_archive(monkeypatch, lambda: store.update(d2.id, importance=10.0))
+
+    run_dedup_sweep(store, tmp_path)
+
+    lines = (tmp_path / _ARCHIVE_FILENAME).read_text(encoding="utf-8").splitlines()
+    archived = {t["id"]: t["importance"] for t in (json.loads(line)["target"] for line in lines)}
+    assert archived == {d1.id: 5.0, d2.id: 10.0}
+    assert store.get(k.id, bump=False).importance == 10.0
+    store.close()
+
+
+def test_505_exact_group_whose_duplicates_all_vanished_is_not_counted_as_merged(tmp_path, monkeypatch, caplog):
+    """#505: D vanishes after the group is formed and before anything is removed. Guards against
+    counting the group as merged when it removed no row (a report claiming a merge that never
+    happened)."""
+    import logging
+
+    import brain.engines.dedup_sweep as sweep
+
+    store = MemoryStore(tmp_path / "memories.db")
+    k = _aged("Bob shut the gate.", 2, importance=9.0)
+    d = _aged("bob shut the gate.", 1, importance=1.0)
+    for m in (k, d):
+        store.create(m)
+    real_pick = sweep._pick_canonical
+
+    def _pick_then_vanish(members, exempt):
+        picked = real_pick(members, exempt)
+        store.hard_delete(d.id)  # another writer, between grouping and removal
+        return picked
+
+    monkeypatch.setattr(sweep, "_pick_canonical", _pick_then_vanish)
+    with caplog.at_level(logging.WARNING, logger="brain.engines.dedup_sweep"):
+        report = run_dedup_sweep(store, tmp_path)
+
+    assert (report.groups_merged, report.rows_removed, report.merges) == (0, 0, [])
+    assert not (tmp_path / _ARCHIVE_FILENAME).exists()
+    assert len([r for r in caplog.records if r.levelno >= logging.WARNING]) == 1
+    store.close()
+
+
+def test_505_near_dup_judge_sees_the_canonical_after_its_exact_merge(tmp_path):
+    """#505: the exact pass hands its canonicals to the near-dup judge. Guards against handing over the
+    opening snapshot: after D1 (5) merges into K, the judge must see K as it now is (importance 5), not
+    as it was listed (1)."""
+    store = MemoryStore(tmp_path / "memories.db")
+    k = _aged("Bob wound the clock.", 3, importance=1.0)
+    d1 = _aged("bob wound the clock.", 2, importance=5.0)
+    other = _aged("Bob oiled the hinges.", 1)
+    for m in (k, d1, other):
+        store.create(m)
+    _crystallise(tmp_path, k.id)  # K stays canonical although D1 outranks it
+    seen: dict[str, float] = {}
+
+    def _judge(candidate: Memory, canonical: Memory) -> str:
+        seen[canonical.id] = canonical.importance
+        return "distinct"
+
+    run_dedup_sweep(store, tmp_path, judge=_judge)
+
+    assert seen == {k.id: 5.0}
+    store.close()
