@@ -310,14 +310,23 @@ def launchctl_target(persona: str) -> str:
     return f"{launchctl_domain()}/{service_label(persona)}"
 
 
-def run_launchctl(args: list[str]) -> subprocess.CompletedProcess[str]:
-    """Run launchctl with captured output. Tests mock this seam."""
-    return subprocess.run(  # windows-lint: ok -- launchd is macOS-only
-        ["launchctl", *args],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+def run_launchctl(args: list[str], *, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+    """Run launchctl with captured output. Tests mock this seam.
+
+    ``timeout`` (#456): a capped call (the kill path's ``bootout`` / ``print``, 15 s) returns a synthetic result with
+    exit code 124 when the cap is reached, so callers treat it like any failed call."""
+    try:
+        return subprocess.run(  # windows-lint: ok -- launchd is macOS-only
+            ["launchctl", *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            args=["launchctl", *args], returncode=124, stdout="", stderr=f"launchctl timed out after {timeout}s"
+        )
 
 
 def install_service(
