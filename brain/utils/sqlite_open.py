@@ -22,6 +22,7 @@ connect raises, the connection is closed and the same exception propagates.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -30,6 +31,8 @@ from pathlib import Path
 
 from brain import dev_constants
 from brain.health import integrity_retry
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -53,7 +56,8 @@ def close_on_error(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     `BaseException`, so a KeyboardInterrupt during an open releases the handle too.
     A second `close()` on a closed sqlite3 connection does nothing, so this is safe
     after a path that already closed it. A `sqlite3.Error` from the close itself is
-    swallowed so it cannot replace the exception being propagated.
+    swallowed (and logged at debug, so a leaked handle can be found) so it cannot
+    replace the exception being propagated.
     """
     try:
         yield conn
@@ -61,7 +65,7 @@ def close_on_error(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         try:
             conn.close()
         except sqlite3.Error:
-            pass
+            logger.debug("closing the connection after a failed open also failed", exc_info=True)
         raise
 
 

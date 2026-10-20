@@ -93,6 +93,36 @@ def test_wal_failure_is_swallowed_by_the_default_profile(tmp_path, monkeypatch) 
     conn.close()
 
 
+def test_only_operational_error_is_swallowed_on_the_wal_pragma(tmp_path, monkeypatch) -> None:
+    """Base caught `sqlite3.OperationalError` only: any other DatabaseError from the
+    WAL pragma (a non-database file opened without the integrity check) propagates."""
+    rec = install(monkeypatch, tmp_path)
+    exc = sqlite3.DatabaseError("file is not a database")
+    rec.fail_on("PRAGMA journal_mode = WAL", exc)
+    with pytest.raises(sqlite3.DatabaseError) as raised:
+        open_store_connection(
+            tmp_path / "a.db", caller="TestStore", integrity_check=False, profile=DEFAULT_PROFILE
+        )
+    assert raised.value is exc
+    assert CLOSE in rec.conns[0].trace
+    assert not any("busy_timeout" in s for s in rec.conns[0].trace)
+
+
+def test_a_fractional_timeout_reaches_connect_and_the_pragma_unrounded(
+    tmp_path, monkeypatch
+) -> None:
+    rec = install(monkeypatch, tmp_path)
+    conn = open_store_connection(
+        tmp_path / "a.db",
+        caller="TestStore",
+        integrity_check=False,
+        profile=OpenProfile(busy_timeout_s=0.5),
+    )
+    assert rec.connects[0]["kwargs"]["timeout"] == 0.5
+    assert "PRAGMA busy_timeout = 500" in conn.trace
+    conn.close()
+
+
 def test_wal_failure_propagates_and_closes_under_the_strict_profile(tmp_path, monkeypatch) -> None:
     rec = install(monkeypatch, tmp_path)
     exc = sqlite3.OperationalError("no WAL")

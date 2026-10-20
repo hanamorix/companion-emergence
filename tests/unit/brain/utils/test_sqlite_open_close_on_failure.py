@@ -217,15 +217,17 @@ def test_close_on_error_second_close_is_harmless(tmp_path) -> None:
     assert raised.value is exc
 
 
-def test_close_on_error_a_failing_close_does_not_mask_the_original() -> None:
+def test_close_on_error_a_failing_close_does_not_mask_the_original(caplog) -> None:
     from brain.utils.sqlite_open import close_on_error
 
     conn = _FakeConn(close_error=sqlite3.OperationalError("close failed"))
     exc = RuntimeError("the original")
-    with pytest.raises(RuntimeError) as raised, close_on_error(conn):
-        raise exc
+    with caplog.at_level("DEBUG", logger="brain.utils.sqlite_open"):
+        with pytest.raises(RuntimeError) as raised, close_on_error(conn):
+            raise exc
     assert raised.value is exc
     assert conn.closed == 1
+    assert any("also failed" in r.getMessage() for r in caplog.records)
 
 
 def test_close_on_error_catches_base_exception() -> None:
