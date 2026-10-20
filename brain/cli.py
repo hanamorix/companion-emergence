@@ -170,6 +170,9 @@ def _print_bridge_status(state: state_file.BridgeState | None, persona_dir: Path
     """Print bridge status while never exposing bearer tokens."""
     if state is None or state.pid is None:
         print("bridge: not running")
+        if state is not None and state_file.recovery_needed(persona_dir):
+            # C33 (#471): a record whose pid was cleared but whose stop was not clean.
+            print("recovery: needed on next bridge start")
         return
 
     live = state_file.bridge_liveness(state, persona_dir)

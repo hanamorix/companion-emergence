@@ -811,7 +811,8 @@ def cmd_status(args) -> int:
             print(f"bridge: pid {s.pid} alive but /health unreachable: {e}", file=sys.stderr)
             return 1
     elif state_file.recovery_needed(persona_dir):
-        print(f"bridge: previous process crashed dirty (pid {s.pid}) — next start will recover")
+        pid_note = f" (pid {s.pid})" if s.pid is not None else ""
+        print(f"bridge: previous process crashed dirty{pid_note}. The next start will recover.")
     else:
         print(f"bridge: stopped cleanly at {s.stopped_at}")
     return 0

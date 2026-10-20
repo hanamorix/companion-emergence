@@ -79,6 +79,42 @@ def test_471_production_shaped_drain_errors_state_needs_recovery(persona_dir):
     assert state_file.recovery_needed(persona_dir) is True
 
 
+def test_471_shape_nell_status_says_recovery_needed(persona_dir, capsys):
+    """C33 `nell status` leg (review M5): the #471 record (pid cleared, not clean, drain errors) says recovery is
+    needed, not just "not running"."""
+    from brain import cli
+
+    _write(persona_dir, pid=None, port=None, stopped_at="2026-10-01T00:00:00+00:00", shutdown_clean=False,
+           drain_errors=2)
+    cli._print_bridge_status(state_file.read(persona_dir), persona_dir)
+    out = capsys.readouterr().out
+    assert "bridge: not running" in out
+    assert "recovery: needed on next bridge start" in out
+
+
+def test_clean_stopped_record_nell_status_says_no_recovery(persona_dir, capsys):
+    from brain import cli
+
+    _write(persona_dir, pid=None, port=None, shutdown_clean=True)
+    cli._print_bridge_status(state_file.read(persona_dir), persona_dir)
+    assert "recovery" not in capsys.readouterr().out
+
+
+def test_471_shape_supervisor_status_names_no_pid_and_uses_plain_punctuation(persona_dir, capsys, monkeypatch):
+    """Review out-of-scope note: `nell supervisor status` on a record with no pid does not print "pid None", and the
+    line has no em-dash."""
+    import brain.paths
+    from brain.bridge import daemon
+
+    monkeypatch.setattr(brain.paths, "get_persona_dir", lambda _name: persona_dir)
+    _write(persona_dir, pid=None, port=None, stopped_at="2026-10-01T00:00:00+00:00", shutdown_clean=False,
+           drain_errors=2)
+    assert daemon.cmd_status(SimpleNamespace(persona=persona_dir.name)) == 0
+    out = capsys.readouterr().out
+    assert "previous process crashed dirty" in out
+    assert "pid None" not in out and "\u2014" not in out
+
+
 def test_471_older_version_file_shape_needs_recovery(persona_dir):
     _write(persona_dir, pid=None, shutdown_clean=False, drain_errors=1)
     assert state_file.recovery_needed(persona_dir) is True
