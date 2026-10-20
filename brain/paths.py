@@ -85,8 +85,8 @@ def home_for_env(
     1. KINDLED_HOME if set (supports ~ expansion)
     2. NELLBRAIN_HOME (deprecated; warns for this process; back-compat fallback retained)
     3. the platform default: platformdirs' user_data_path for this process; for another environment the same
-       default computed from that environment (Linux XDG_DATA_HOME or ~/.local/share, macOS ~/Library/Application
-       Support, Windows LOCALAPPDATA\\<author>), None when ``env`` lacks what it needs. A test checks the computed
+       default computed from that environment (Linux and macOS: a non-blank XDG_DATA_HOME, else ~/.local/share or
+       ~/Library/Application Support; Windows LOCALAPPDATA\\<author>), None when ``env`` lacks what it needs. A test checks the computed
        default against platformdirs on every platform (#456 review S15: one rule, no drift).
     """
     override = _override_from(env, warn=current)
@@ -95,12 +95,17 @@ def home_for_env(
     if current:
         return _dirs.user_data_path
     platform = platform or sys.platform
-    if platform.startswith("linux"):
-        base = env.get("XDG_DATA_HOME") or (os.path.join(env["HOME"], ".local", "share") if env.get("HOME") else None)
-        return Path(base, _APP_NAME) if base else None
-    if platform == "darwin":
+    if platform.startswith("linux") or platform == "darwin":
+        # platformdirs' XDG mixin (Linux AND macOS): a non-blank $XDG_DATA_HOME wins over the platform default.
+        xdg = (env.get("XDG_DATA_HOME") or "").strip()
+        if xdg:
+            return Path(xdg, _APP_NAME)
         home = env.get("HOME")
-        return Path(home, "Library", "Application Support", _APP_NAME) if home else None
+        if not home:
+            return None
+        if platform == "darwin":
+            return Path(home, "Library", "Application Support", _APP_NAME)
+        return Path(home, ".local", "share", _APP_NAME)
     if platform == "win32":
         base = env.get("LOCALAPPDATA")
         return Path(base, _APP_AUTHOR, _APP_NAME) if base else None

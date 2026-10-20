@@ -277,3 +277,20 @@ def test_home_for_env_honours_the_overrides_in_order(tmp_path):
 
     assert paths.home_for_env({"KINDLED_HOME": str(tmp_path / "k"), "NELLBRAIN_HOME": "/n"}) == tmp_path / "k"
     assert paths.home_for_env({"NELLBRAIN_HOME": str(tmp_path / "n")}) == tmp_path / "n"
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_home_for_env_honours_xdg_data_home_like_platformdirs_on_linux_and_macos(platform):
+    """CI macOS (#456): platformdirs reads $XDG_DATA_HOME first on macOS too (its XDG mixin; a blank value is ignored),
+    so the home computed for another process's environment must as well, or a pre-PR bridge's home is misjudged."""
+    from brain import paths
+
+    env = {"HOME": "/h", "XDG_DATA_HOME": "/x/data"}
+    assert paths.home_for_env(env, platform) == Path("/x/data", "companion-emergence")
+    blank = {"HOME": "/h", "XDG_DATA_HOME": "  "}
+    default = (
+        Path("/h", ".local", "share", "companion-emergence")
+        if platform == "linux"
+        else Path("/h", "Library", "Application Support", "companion-emergence")
+    )
+    assert paths.home_for_env(blank, platform) == default
