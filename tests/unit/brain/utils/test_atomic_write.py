@@ -583,3 +583,50 @@ def test_g20d_every_importer_takes_its_writers_from_the_new_module():
             for a in n.names
         }
         assert name in got, rel
+
+
+# --- G3(b), G4(a), G12: no second implementation by hand ----------------------------------------------------------
+
+
+def test_g3b_the_directory_fsync_flag_is_named_in_exactly_one_place():
+    uses = []
+    for path in sorted((REPO / "brain").rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Attribute) and node.attr == "O_DIRECTORY":
+                uses.append(path.relative_to(REPO).as_posix())
+    assert uses == ["brain/utils/atomic_write.py"], uses
+
+
+@pytest.mark.parametrize("rel", ["brain/images.py", "brain/file_store.py"])
+def test_g4a_the_blob_modules_hold_no_replace_uuid_or_new_temp_name_in_code(rel):
+    tree = ast.parse((REPO / rel).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            assert ast.unparse(node) not in {"os.replace", "uuid.uuid4"}, (rel, ast.unparse(node))
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            names = [a.name for a in node.names] + [getattr(node, "module", None) or ""]
+            assert "uuid" not in names, rel
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and not _is_docstring(tree, node)
+        ):
+            assert ".new" not in node.value, (rel, node.value)
+    called = {ast.unparse(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+    assert "save_blob_once" in called, rel
+
+
+def _is_docstring(tree: ast.Module, node: ast.Constant) -> bool:
+    for parent in ast.walk(tree):
+        if isinstance(parent, (ast.Module, ast.FunctionDef, ast.ClassDef, ast.AsyncFunctionDef)):
+            body = parent.body
+            if body and isinstance(body[0], ast.Expr) and body[0].value is node:
+                return True
+    return False
+
+
+def test_g12_no_mkstemp_anywhere_in_brain():
+    for path in sorted((REPO / "brain").rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Attribute) and node.attr == "mkstemp":
+                raise AssertionError(path)
