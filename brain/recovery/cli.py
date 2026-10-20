@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 from brain.bridge.state_file import pid_is_alive
+from brain.health.json_io import read_json
 from brain.paths import get_persona_dir
 from brain.recovery.engine import run_recovery
 from brain.recovery.report import format_report
@@ -29,8 +29,8 @@ def _bridge_is_live(persona_dir: Path) -> bool:
     if not bridge.is_file():
         return False
     try:
-        pid = int(json.loads(bridge.read_text()).get("pid", 0))
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pid = int(read_json(bridge, default=dict, expect=dict).get("pid", 0))
+    except (TypeError, ValueError):
         return False
     return pid_is_alive(pid)
 

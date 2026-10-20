@@ -9,13 +9,11 @@ _MILESTONE_STAGES = ("acquaintance", "familiar", "friend", "close")
 
 def peer_key_rotated_entries(persona_dir: Path, *, limit: int = 10) -> list[dict]:
     """Return most recent peer-key-rotation events from transport.jsonl."""
-    from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
+    from brain.health.json_io import Recovery, iter_jsonl
 
     log_path = Path(persona_dir) / "kindled_link" / "transport.jsonl"
-    if not log_path.exists():
-        return []
     rows = [
-        r for r in iter_jsonl_skipping_corrupt(log_path)
+        r for r in iter_jsonl(log_path, recover=Recovery.RAISE)
         if r.get("event") == "peer_key_rotated"
     ]
     rows.sort(key=lambda r: r.get("ts", ""), reverse=True)

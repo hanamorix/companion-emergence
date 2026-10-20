@@ -10,7 +10,6 @@ readable by older and newer brains (#286 §7).
 from __future__ import annotations
 
 import contextlib
-import json
 import os
 import shutil
 import sysconfig
@@ -19,6 +18,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from brain.bridge.state_file import pid_is_alive
+from brain.health.json_io import read_json, write_json
 from brain.paths import get_home
 from brain.update.overlay_hook import BUNDLE_ID_FILE
 
@@ -39,12 +39,7 @@ def overlay_root() -> Path:
 
 
 def read_state(root: Path) -> dict:
-    try:
-        data = json.loads((root / STATE_FILE).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {"active": None, "previous": None}
-    if not isinstance(data, dict):
-        return {"active": None, "previous": None}
+    data = read_json(root / STATE_FILE, default=dict, expect=dict)
     return {"active": data.get("active") or None, "previous": data.get("previous") or None}
 
 
@@ -80,12 +75,7 @@ def loaded_overlay() -> dict | None:
     folder = _loaded_folder(root)
     if folder is None:
         return None
-    try:
-        stamp = json.loads((root / folder / "stamp.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        stamp = None
-    if not isinstance(stamp, dict):
-        stamp = {}
+    stamp = read_json(root / folder / "stamp.json", default=dict, expect=dict)
     stamp_bundle = stamp.get("bundle_id")
     return {
         "dir": folder,
@@ -99,10 +89,7 @@ def loaded_overlay() -> dict | None:
 
 
 def _write_state(root: Path, active: dict | None, previous: dict | None) -> None:
-    root.mkdir(parents=True, exist_ok=True)
-    tmp = root / f"{STATE_FILE}.tmp"
-    tmp.write_text(json.dumps({"active": active, "previous": previous}, indent=2), encoding="utf-8")
-    replace_retrying(tmp, root / STATE_FILE)
+    write_json(root / STATE_FILE, {"active": active, "previous": previous}, indent=2, fsync=False)
 
 
 def replace_retrying(src: Path, dst: Path) -> None:

@@ -21,10 +21,10 @@ Each crystallization (per OG nell_brain.py:crystallize_soul):
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 
+from brain.health.json_io import Recovery, read_json
 from brain.soul.crystallization import Crystallization
 from brain.soul.love_types import LOVE_TYPES
 from brain.utils.time import parse_iso_utc
@@ -46,16 +46,11 @@ def extract_crystallizations_from_og(
     Missing nell_soul.json file → ([], []) silently. Caller decides whether
     that's an anomaly.
     """
-    soul_path = og_data_dir / "nell_soul.json"
-    if not soul_path.exists():
-        return [], []
-    try:
-        data = json.loads(soul_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        logger.warning("og_soul: nell_soul.json is corrupt JSON: %s", exc)
-        return [], []
-
-    if not isinstance(data, dict):
+    # CONTENT: a missing, corrupt or non-object file is ([], []) (the module warns); an unreadable one raises.
+    data = read_json(
+        og_data_dir / "nell_soul.json", default=lambda: None, recover=Recovery.CONTENT, expect=dict
+    )
+    if data is None:
         return [], []
 
     crystals_raw = data.get("crystallizations") or []

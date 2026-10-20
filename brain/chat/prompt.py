@@ -22,6 +22,7 @@ from brain.chat.monologue_prompts import build_monologue_frame, build_reply_fram
 from brain.chat.tool_inventory import build_tool_inventory
 from brain.engines.daemon_state import DaemonState, get_residue_context
 from brain.engines.research_ambient import build_research_awareness_block
+from brain.health.json_io import read_jsonl
 from brain.maker.ambient import build_maker_awareness_block
 from brain.memory import keyword_budget
 from brain.memory.recall_open import open_memory
@@ -1867,14 +1868,8 @@ def _legacy_capped_tokens(ranked: list[str]) -> list[str]:
 
 def _count_soul_candidates(persona_dir: Path) -> int:
     """Count pending soul_candidates.jsonl entries. Zero if file missing."""
-    try:
-        from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
-
-        path = persona_dir / "soul_candidates.jsonl"
-        records = read_jsonl_skipping_corrupt(path)
-        return sum(1 for r in records if r.get("status", "auto_pending") == "auto_pending")
-    except Exception:  # noqa: BLE001
-        return 0
+    records = read_jsonl(persona_dir / "soul_candidates.jsonl")
+    return sum(1 for r in records if r.get("status", "auto_pending") == "auto_pending")
 
 
 def _build_recent_journal_block(store: MemoryStore, *, window_days: int = 7, user_name: str = "the user") -> str:

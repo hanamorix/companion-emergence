@@ -29,11 +29,12 @@ Plan: docs/superpowers/plans/2026-05-11-jsonl-log-retention.md
 from __future__ import annotations
 
 import gzip
-import json
 import logging
 import shutil
 from datetime import UTC, datetime
 from pathlib import Path
+
+from brain.health.json_io import Recovery, iter_jsonl_raw, write_jsonl
 
 logger = logging.getLogger(__name__)
 
@@ -151,26 +152,12 @@ def rotate_age_archive_yearly(
     # for soul_audit (low volume) this is fine, and the alternative
     # (multi-pass) is more complex than the file is worth.
     by_year: dict[int, list[str]] = {}
-    with log_path.open("r", encoding="utf-8") as f:
-        for line_index, raw in enumerate(f, start=1):
-            stripped = raw.rstrip("\r\n")
-            if not stripped:
-                continue
-            try:
-                entry = json.loads(stripped)
-            except json.JSONDecodeError as exc:
-                logger.warning(
-                    "rotate_age_archive_yearly: skipping corrupt line %d in %s (%s): %.200s",
-                    line_index,
-                    log_path,
-                    exc,
-                    stripped,
-                )
-                continue
-            if not isinstance(entry, dict):
-                continue
-            year = _entry_year(entry, timestamp_field, fallback=current_year)
-            by_year.setdefault(year, []).append(raw)
+    # RAISE: the active log is rewritten below from what was read, so a failed read must stop the
+    # rotation (and leave the log alone), never rewrite it with only the prefix. Corrupt lines are
+    # skipped with a warning by the module; the line text is kept exactly as read.
+    for line, entry in iter_jsonl_raw(log_path, recover=Recovery.RAISE):
+        year = _entry_year(entry, timestamp_field, fallback=current_year)
+        by_year.setdefault(year, []).append(line)
 
     cold_years = sorted(y for y in by_year if y < current_year)
     if not cold_years:
@@ -182,9 +169,9 @@ def rotate_age_archive_yearly(
         archive_path = log_path.parent / f"{log_path.stem}.{year}{log_path.suffix}.gz"
         tmp_path = archive_path.with_suffix(archive_path.suffix + ".tmp")
         try:
-            with gzip.open(tmp_path, "wt", encoding="utf-8") as gz:
+            with gzip.open(tmp_path, "wt", encoding="utf-8") as gz:  # json-io: ok -- raw-line gz archive: lines pass through unchanged, json_io has no gz writer
                 for raw in by_year[year]:
-                    gz.write(raw if raw.endswith("\n") else raw + "\n")
+                    gz.write(raw + "\n")
             tmp_path.rename(archive_path)
         except Exception:
             tmp_path.unlink(missing_ok=True)
@@ -195,16 +182,8 @@ def rotate_age_archive_yearly(
     # entries. We do this atomically via a tmp file so a crash mid-write
     # can't lose entries.
     keep_years = sorted(y for y in by_year if y >= current_year)
-    tmp_active = log_path.with_suffix(log_path.suffix + ".rewriting")
-    try:
-        with tmp_active.open("w", encoding="utf-8") as f:
-            for year in keep_years:
-                for raw in by_year[year]:
-                    f.write(raw if raw.endswith("\n") else raw + "\n")
-        tmp_active.replace(log_path)
-    except Exception:
-        tmp_active.unlink(missing_ok=True)
-        raise
+    kept = "".join(raw + "\n" for year in keep_years for raw in by_year[year])
+    write_jsonl(log_path, kept.encode("utf-8"), fsync=False)
 
     logger.info(
         "yearly-archived %s for years %s -> %d new archive(s)",

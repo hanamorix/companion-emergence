@@ -228,8 +228,14 @@ def test_log_recall_never_raises_on_bad_input_and_writes_nothing(tmp_path, caplo
 
 def test_append_never_raises_on_an_unserialisable_record(tmp_path):
     path = rd.diagnostics_path(tmp_path)
-    assert rd.append_record(path, {"ts": NOW.isoformat(), "x": float("nan")}) is False
-    assert not path.exists() or path.read_bytes() == b""
+    # A NaN used to drop the whole record; json_io writes it as null (BC4: telemetry is never lost to a float).
+    assert rd.append_record(path, {"ts": NOW.isoformat(), "x": float("nan")}) is True
+    assert _read_records(path)[0]["x"] is None
+    other = rd.diagnostics_path(tmp_path / "second")
+    cyclic: dict = {"ts": NOW.isoformat()}
+    cyclic["self"] = cyclic
+    assert rd.append_record(other, cyclic) is False  # a genuinely unencodable record is still dropped, never raised
+    assert not other.exists() or other.read_bytes() == b""
 
 
 def test_append_is_fail_soft_when_the_write_itself_raises(tmp_path, monkeypatch, caplog):
@@ -238,7 +244,9 @@ def test_append_is_fail_soft_when_the_write_itself_raises(tmp_path, monkeypatch,
     def boom(*a, **k):
         raise OSError("disk full")
 
-    monkeypatch.setattr(rd, "open", boom, raising=False)
+    from brain.health import json_io
+
+    monkeypatch.setattr(json_io, "open", boom, raising=False)  # the module's own `open`, used by the append
     with caplog.at_level(logging.WARNING, logger=rd.logger.name):
         assert rd.log_recall(path, **_kwargs()) is False
     assert any("append" in r.getMessage() for r in caplog.records)
@@ -275,7 +283,7 @@ def test_prune_boundary_record_exactly_at_the_cutoff_is_kept(tmp_path):
 def test_prune_with_nothing_to_remove_does_not_rewrite(tmp_path, monkeypatch):
     path = rd.diagnostics_path(tmp_path)
     original = _write(path, [_rec_line(NOW - timedelta(hours=1))])
-    monkeypatch.setattr(rd.os, "replace", lambda *a: pytest.fail("rewrote an unchanged file"))
+    monkeypatch.setattr(os, "replace", lambda *a: pytest.fail("rewrote an unchanged file"))
     assert rd.prune(path, window_days=2.0, now=NOW) == 0
     assert path.read_bytes() == original
 
@@ -390,7 +398,7 @@ def test_prune_survives_os_replace_raising_and_leaves_the_original_intact(
     def boom(src, dst):
         raise exc
 
-    monkeypatch.setattr(rd.os, "replace", boom)
+    monkeypatch.setattr(os, "replace", boom)
     with caplog.at_level(logging.ERROR, logger=rd.logger.name):
         assert rd.prune(path, window_days=2.0, now=NOW) == 0
     assert path.read_bytes() == original
@@ -440,7 +448,7 @@ def _append_inside_prune_window(monkeypatch, path: Path, point: str, *, settle_s
     if point == "after_read":
         monkeypatch.setattr(rd, "_record_ts", record_ts_after_read)
     else:
-        monkeypatch.setattr(rd.os, "replace", replace_after_launch)
+        monkeypatch.setattr(os, "replace", replace_after_launch)  # the rewrite replaces through os.replace (json_io)
     return state
 
 

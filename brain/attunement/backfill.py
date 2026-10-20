@@ -9,7 +9,6 @@ add the sampling, state-resume, trigger, and orchestration logic.
 """
 from __future__ import annotations
 
-import json
 import logging
 import re
 import time
@@ -19,7 +18,7 @@ from datetime import datetime as _datetime
 from pathlib import Path
 
 from brain.attunement.store import BufferTurn
-from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+from brain.health.json_io import Recovery, iter_jsonl, read_json, write_json
 
 _log = logging.getLogger(__name__)
 _STATE_FILE = "backfill_state.json"
@@ -133,22 +132,21 @@ def _load_state(persona_dir: Path):  # -> BackfillState | None
     from brain.attunement.schemas import BackfillState
     from brain.state_compat import from_known_fields
 
-    p = _state_path(persona_dir)
-    if not p.exists():
+    # CONTENT: an unreadable file still raises (as it always did); a missing or corrupt one is "no state".
+    raw = read_json(
+        _state_path(persona_dir), default=lambda: None, recover=Recovery.CONTENT, expect=dict
+    )
+    if raw is None:
         return None
     try:
-        return from_known_fields(BackfillState, json.loads(p.read_text()))
-    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        return from_known_fields(BackfillState, raw)
+    except (TypeError, ValueError) as exc:
         _log.warning("attunement backfill: corrupt state file: %s", exc)
         return None
 
 
 def _save_state(persona_dir: Path, state) -> None:  # state: BackfillState
-    p = _state_path(persona_dir)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(asdict(state), indent=2, sort_keys=True))
-    tmp.replace(p)
+    write_json(_state_path(persona_dir), asdict(state), indent=2, sort_keys=True, fsync=False)
 
 
 def _read_buffer_turns(persona_dir: Path) -> list[BufferTurn]:
@@ -158,7 +156,7 @@ def _read_buffer_turns(persona_dir: Path) -> list[BufferTurn]:
         return []
     rows: list[tuple[str, BufferTurn]] = []
     for jsonl_file in sorted(convs.glob("*.jsonl")):
-        for row in read_jsonl_skipping_corrupt(jsonl_file):
+        for row in iter_jsonl(jsonl_file, recover=Recovery.RAISE):
             if row.get("role") != "user":
                 continue
             tid = str(row.get("id") or row.get("ts") or "")

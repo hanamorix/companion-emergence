@@ -5,7 +5,7 @@ Each line is a JSON-encoded turn record:
   {session_id, speaker, text, ts}
 
 The append-only JSONL design is faithful to OG nell_conversation_ingest.py.
-Reads tolerate corrupt lines via read_jsonl_skipping_corrupt.
+Reads tolerate corrupt lines via brain.health.json_io.
 """
 
 from __future__ import annotations
@@ -18,7 +18,15 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+from brain.health.json_io import (
+    Recovery,
+    append_jsonl,
+    encode_jsonl,
+    read_json,
+    read_jsonl,
+    write_json,
+    write_jsonl,
+)
 
 # session_id grammar: UUIDs (hyphens included) and the `sess_<8 hex>` fallback
 # both fit. Letters / digits / hyphen / underscore only — no slashes, dots, or
@@ -98,9 +106,7 @@ def ingest_turn(persona_dir: Path, turn: dict) -> str:
         # Defensive copy so callers passing tuples or generators end up
         # with a JSON-serialisable list on the record.
         record["image_shas"] = list(image_shas)
-    path = _session_path(persona_dir, session_id)
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    append_jsonl(_session_path(persona_dir, session_id), record)
     return session_id
 
 
@@ -114,8 +120,9 @@ def list_active_sessions(persona_dir: Path) -> list[str]:
 
 def read_session(persona_dir: Path, session_id: str) -> list[dict]:
     """Return the turns from a session buffer, skipping malformed lines."""
-    path = _session_path(persona_dir, session_id)
-    return read_jsonl_skipping_corrupt(path)
+    # RAISE: compaction rewrites the buffer from this read and ingest advances its cursor on it, so a failed
+    # read must raise (as it always did), never look like an empty session.
+    return read_jsonl(_session_path(persona_dir, session_id), recover=Recovery.RAISE)
 
 
 def session_silence_minutes(turns: list[dict]) -> float:
@@ -225,25 +232,18 @@ def write_rolled_to(persona_dir: Path, session_id: str, successor_id: str) -> No
     resolves to nothing."""
     _validate_session_id(session_id)
     _validate_session_id(successor_id)
-    path = _rolled_to_path(persona_dir, session_id)
-    tmp = path.with_suffix(".rolled_to.tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump({"successor": successor_id, "at": _now_iso()}, fh)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
+    write_json(
+        _rolled_to_path(persona_dir, session_id),
+        {"successor": successor_id, "at": _now_iso()},
+        indent=None,
+        fsync=True,
+    )
 
 
 def read_rolled_to(persona_dir: Path, session_id: str) -> str | None:
     """Return the successor sid this session rolled over to, or None if absent/malformed."""
-    path = _rolled_to_path(persona_dir, session_id)
-    if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError):
-        return None
-    succ = data.get("successor") if isinstance(data, dict) else None
+    data = read_json(_rolled_to_path(persona_dir, session_id), default=dict, expect=dict)
+    succ = data.get("successor")
     return succ if isinstance(succ, str) and succ else None
 
 
@@ -262,35 +262,26 @@ def _backoff_path(persona_dir: Path, session_id: str) -> Path:
 def read_backoff(persona_dir: Path, session_id: str) -> dict | None:
     """Return the backoff state ({failures: int, first_failure_at: str}) or
     None if the file is missing, empty, or malformed."""
-    path = _backoff_path(persona_dir, session_id)
-    if not path.exists():
+    data = read_json(_backoff_path(persona_dir, session_id), default=lambda: None, expect=dict)
+    if data is None or "failures" not in data or "first_failure_at" not in data:
         return None
     try:
-        text = path.read_text(encoding="utf-8").strip()
-        if not text:
-            return None
-        data = json.loads(text)
-        if not isinstance(data, dict):
-            return None
-        if "failures" not in data or "first_failure_at" not in data:
-            return None
         # Validate ts parses
         datetime.fromisoformat(str(data["first_failure_at"]).replace("Z", "+00:00"))
-        return data
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    except (ValueError, TypeError):
         return None
+    return data
 
 
 def write_backoff(persona_dir: Path, session_id: str, failures: int, first_failure_at: str) -> None:
     """Atomically write the backoff state. Raises ValueError on bad ts."""
     datetime.fromisoformat(first_failure_at.replace("Z", "+00:00"))  # validate
-    path = _backoff_path(persona_dir, session_id)
-    tmp = path.with_suffix(".backoff.tmp")
-    tmp.write_text(
-        json.dumps({"failures": failures, "first_failure_at": first_failure_at}),
-        encoding="utf-8",
+    write_json(
+        _backoff_path(persona_dir, session_id),
+        {"failures": failures, "first_failure_at": first_failure_at},
+        indent=None,
+        fsync=False,
     )
-    os.replace(tmp, path)
 
 
 def delete_backoff(persona_dir: Path, session_id: str) -> None:
@@ -315,22 +306,7 @@ def rewrite_session_atomic(persona_dir: Path, session_id: str, turns: list[dict]
     budget the error re-raises (the old buffer is intact) and the temp file is
     removed so a repeated collision cannot litter ``active_conversations``.
     """
-    path = _session_path(persona_dir, session_id)
-    tmp = path.with_suffix(".jsonl.tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        for rec in turns:
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        fh.flush()
-        os.fsync(fh.fileno())
-    for attempt in range(_UNLINK_RETRIES):
-        try:
-            os.replace(tmp, path)
-            return
-        except PermissionError:
-            if attempt == _UNLINK_RETRIES - 1:
-                tmp.unlink(missing_ok=True)
-                raise
-            time.sleep(_UNLINK_RETRY_SLEEP_S * (attempt + 1))
+    write_jsonl(_session_path(persona_dir, session_id), turns, fsync=True)
 
 
 # Archive rotation (1d). A single unbounded ``<sid>.jsonl`` grows without limit on
@@ -407,8 +383,7 @@ def append_archive(persona_dir: Path, session_id: str, records: list[dict]) -> i
         return 0
     _validate_session_id(session_id)
     d = _archived_conversations_dir(persona_dir)
-    payload = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records)
-    data = payload.encode("utf-8")
+    data = encode_jsonl(records)
 
     # Choose the active target: the highest existing segment, else a legacy single
     # file if one exists, else a fresh segment 000.
@@ -431,13 +406,10 @@ def append_archive(persona_dir: Path, session_id: str, records: list[dict]) -> i
             active_path = d / f"{session_id}.{next_num:03d}.jsonl"
             is_new_segment = True
 
-    with open(active_path, "a", encoding="utf-8") as fh:
-        fh.write(payload)
-        fh.flush()
-        os.fsync(fh.fileno())
+    written = append_jsonl(active_path, data, fsync=True)
     if is_new_segment:
         _fsync_dir(d)
-    return len(data)
+    return written
 
 
 def read_archive(persona_dir: Path, session_id: str) -> list[dict]:
@@ -446,7 +418,7 @@ def read_archive(persona_dir: Path, session_id: str) -> list[dict]:
     zero-length trailing segment left by a crash mid-roll)."""
     out: list[dict] = []
     for p in _archive_read_order(persona_dir, session_id):
-        out.extend(read_jsonl_skipping_corrupt(p))
+        out.extend(read_jsonl(p, recover=Recovery.RAISE))
     return out
 
 
@@ -534,7 +506,7 @@ def acquire_compaction_lock(
     (skip). The caller releases via release_compaction_lock in a finally.
     """
     path = _compacting_lock_path(persona_dir, session_id)
-    payload = json.dumps({"pid": os.getpid(), "ts": _now_iso()})
+    payload = json.dumps({"pid": os.getpid(), "ts": _now_iso()})  # json-io: ok -- O_EXCL lock-file payload: a lock protocol, not a state file
     try:
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -543,10 +515,10 @@ def acquire_compaction_lock(
     except FileExistsError:
         # Held — decide whether it is stale and reapable.
         reap = False
+        holder = read_json(path, default=dict, expect=dict)  # empty/torn payload (or unreadable): not alive
         try:
-            holder = json.loads(path.read_text(encoding="utf-8"))
             holder_pid = int(holder.get("pid", -1))
-        except (OSError, ValueError, TypeError):
+        except (TypeError, ValueError):
             holder_pid = -1
         if not _pid_alive(holder_pid):
             reap = True

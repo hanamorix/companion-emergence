@@ -25,14 +25,13 @@ tighten a downstream gate.
 """
 from __future__ import annotations
 
-import contextlib
 import dataclasses
-import json
 import logging
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 
+from brain.health.json_io import read_json, write_json
 from brain.paths import presence_state_path
 
 log = logging.getLogger(__name__)
@@ -83,12 +82,8 @@ def _state_path(persona_dir: Path) -> Path:
 def load_presence_state(persona_dir: Path) -> PresenceState:
     """Load the persisted presence state; fail-open to the cold sentinel on
     any missing/corrupt/malformed file."""
-    path = _state_path(persona_dir)
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return _SENTINEL
-    if not isinstance(raw, dict):
+    raw = read_json(_state_path(persona_dir), default=lambda: None, expect=dict)
+    if raw is None:
         return _SENTINEL
     try:
         hour_counts_raw = raw.get("hour_counts")
@@ -125,16 +120,7 @@ def save_presence_state(persona_dir: Path, state: PresenceState) -> None:
         "bootstrapped": state.bootstrapped,
         "version": state.version,
     }
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps(payload), encoding="utf-8")
-        tmp.replace(path)
-    except OSError:
-        log.warning("save_presence_state: could not persist %s (best-effort)", path, exc_info=True)
-        with contextlib.suppress(OSError):
-            if tmp.exists():
-                tmp.unlink()
+    write_json(path, payload, indent=None, fsync=False, on_error="log", nonfinite="null")
 
 
 # ---------------------------------------------------------------------------

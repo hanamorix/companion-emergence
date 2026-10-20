@@ -111,7 +111,7 @@ def test_interestset_load_missing_logs_info_not_warning(tmp_path: Path, caplog) 
         )
 
 
-# ---- Health T10: attempt_heal wiring ----
+# ---- Health T10: json_io HEAL wiring ----
 
 
 def test_interestset_load_corrupt_quarantines_restores_from_bak(tmp_path: Path):

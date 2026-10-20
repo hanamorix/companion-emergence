@@ -15,7 +15,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+from brain.health.json_io import iter_jsonl
 from brain.memory.store import MemoryStore
 
 
@@ -49,7 +49,7 @@ def count_words_in_session(
         if not active_dir.exists():
             return 0
         for jsonl_path in active_dir.glob("*.jsonl"):
-            for turn in read_jsonl_skipping_corrupt(jsonl_path):
+            for turn in iter_jsonl(jsonl_path):
                 if turn.get("speaker") != "assistant":
                     continue
                 ts_raw = turn.get("ts")

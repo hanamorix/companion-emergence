@@ -2,22 +2,20 @@
 
 Mirrors brain/growth/arc_storage.py removed_arcs.jsonl exactly:
   - file_lock + os.fsync atomic append (Windows-safe)
-  - iter_jsonl_skipping_corrupt for tolerant reads
+  - brain.health.json_io read_jsonl/iter_jsonl for reads (a bad line is skipped with a warning)
 
 Spec: docs/superpowers/specs/2026-05-18-forgetting-design.md §5
 """
 
 from __future__ import annotations
 
-import json
-import os
 from collections.abc import Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.forgetting.salience import SalienceInputs
-from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
+from brain.health.json_io import Recovery, append_jsonl, iter_jsonl, read_jsonl
 from brain.memory.name_rules import (
     WORD_RE as _WORD_RE,
 )
@@ -29,7 +27,7 @@ from brain.memory.name_rules import (
 )
 from brain.memory.recall_stopwords import RECALL_STOPWORDS
 from brain.memory.store import Memory
-from brain.utils.file_lock import file_lock
+from brain.utils.finite import clamp_nonfinite
 
 GRAVEYARD_FILENAME = "forgotten_memories.jsonl"
 
@@ -69,12 +67,7 @@ def append(
         "hebbian_neighbors": [[nid, float(w)] for nid, w in (hebbian_neighbors or [])],
     }
     path = persona_dir / GRAVEYARD_FILENAME
-    line = (json.dumps(entry) + "\n").encode("utf-8")
-    with file_lock(path):
-        with open(path, "ab") as fh:
-            fh.write(line)
-            fh.flush()
-            os.fsync(fh.fileno())
+    append_jsonl(path, clamp_nonfinite(entry, where=f"graveyard entry {memory.id}"), fsync=True)  # recovery float()s the neighbour weights
 
 
 #: Ordinary query words shorter than this are not searched (today's minimum,
@@ -174,8 +167,6 @@ def search(
     (``forgotten_at_iso``), then ``limit`` (S119). Tolerates corrupt JSONL lines.
     """
     path = persona_dir / GRAVEYARD_FILENAME
-    if not path.exists():
-        return []
     words = frozenset(query_words(query))
     name_phrases: list[tuple[str, ...]] = []
     for name in names:
@@ -186,7 +177,7 @@ def search(
         return []
     hints = words | {w for phrase in name_phrases for w in phrase}
     hits: list[tuple[dict, bool]] = []
-    for entry in iter_jsonl_skipping_corrupt(path):
+    for entry in iter_jsonl(path, recover=Recovery.RAISE):
         matched, by_name = _field_matches(entry.get("summary") or "", words, name_phrases, hints)
         if matched:
             hits.append((entry, by_name))
@@ -202,7 +193,4 @@ def read_all(persona_dir: Path) -> list[dict]:
     Used by the ambient prompt block to count recent losses. Pure read —
     no mutation, no sorting. Returns empty list if file absent.
     """
-    path = persona_dir / GRAVEYARD_FILENAME
-    if not path.exists():
-        return []
-    return list(iter_jsonl_skipping_corrupt(path))
+    return read_jsonl(persona_dir / GRAVEYARD_FILENAME, recover=Recovery.RAISE)

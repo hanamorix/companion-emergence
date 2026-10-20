@@ -21,10 +21,11 @@ exempts under-review soul-linked memories regardless of pass order).
 """
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+from brain.health.json_io import read_json, write_json
 
 _STATE_FILENAME = "soul_review_state.json"
 
@@ -64,12 +65,7 @@ def load_cadence_state(persona_dir: Path) -> ReviewCadenceState:
     Self-healing: a bad state file must never wedge the review (fail-safe
     toward running, not toward silence).
     """
-    try:
-        data = json.loads(_state_path(persona_dir).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return ReviewCadenceState(next_review_at=None, consecutive_failures=0)
-    if not isinstance(data, dict):
-        return ReviewCadenceState(next_review_at=None, consecutive_failures=0)
+    data = read_json(_state_path(persona_dir), default=dict, expect=dict)
     cf = data.get("consecutive_failures", 0)
     if not isinstance(cf, int) or cf < 0:
         cf = 0
@@ -81,17 +77,13 @@ def load_cadence_state(persona_dir: Path) -> ReviewCadenceState:
 
 def save_cadence_state(persona_dir: Path, state: ReviewCadenceState) -> None:
     """Atomically persist the cadence (temp file + rename)."""
-    path = _state_path(persona_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "next_review_at": (
             state.next_review_at.isoformat() if state.next_review_at is not None else None
         ),
         "consecutive_failures": state.consecutive_failures,
     }
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload), encoding="utf-8")
-    tmp.replace(path)
+    write_json(_state_path(persona_dir), payload, indent=None, fsync=False)
 
 
 def is_due(state: ReviewCadenceState, *, now: datetime) -> bool:

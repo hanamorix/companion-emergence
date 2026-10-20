@@ -5,12 +5,12 @@ without failing the reply path.
 """
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime
 from pathlib import Path
 
 from brain.attunement.schemas import DAILY_BUDGET_DEFAULT
+from brain.health.json_io import JsonFileError, Recovery, read_json, write_json
 
 log = logging.getLogger(__name__)
 
@@ -38,28 +38,26 @@ def _load(persona_dir: Path) -> dict:
     _BudgetCorruptError so callers fail CLOSED rather than silently resetting.
     """
     path = _budget_path(persona_dir)
-    if not path.exists():
-        return {}
     try:
-        return json.loads(path.read_text())
-    except (json.JSONDecodeError, ValueError) as exc:
-        # Try the atomic .tmp sibling written by _save before rename
-        tmp = path.with_suffix(".tmp")
-        if tmp.exists():
-            try:
-                return json.loads(tmp.read_text())
-            except (json.JSONDecodeError, ValueError):
-                pass
+        # RESTORE: a corrupt file is restored from the previous save (or a legacy .tmp sibling) instead of
+        # failing closed forever; with no good copy it raises, and the caller still fails CLOSED. A missing
+        # file with no backup is "no record yet".
+        return read_json(
+            path,
+            default=dict,
+            recover=Recovery.RESTORE,
+            expect=dict,
+            fallbacks=(path.with_suffix(".tmp"),),
+        )
+    except JsonFileError as exc:
+        if exc.kind == "io":
+            raise  # an unreadable file propagated before; it still does
         log.warning("attunement budget: corrupt file — failing closed (deny) for today")
         raise _BudgetCorruptError() from exc
 
 
 def _save(persona_dir: Path, state: dict) -> None:
-    path = _budget_path(persona_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state))
-    tmp.replace(path)
+    write_json(_budget_path(persona_dir), state, backups=1, indent=None, fsync=False)
 
 
 def get_remaining(

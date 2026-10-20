@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+from brain.health.json_io import Recovery, iter_jsonl
 from brain.utils.time import parse_iso_utc
 
 WINDOW_DAYS = 7
@@ -27,7 +27,7 @@ def compute_treatment(persona_dir: Path, file: str) -> FileTreatment:
     cutoff = datetime.now(UTC) - timedelta(days=WINDOW_DAYS)
 
     count = 0
-    for entry in read_jsonl_skipping_corrupt(audit_path):
+    for entry in iter_jsonl(audit_path, recover=Recovery.RAISE):
         for a in entry.get("anomalies") or []:
             if not isinstance(a, dict):
                 continue

@@ -1,13 +1,13 @@
 """brain.notes.write — the autonomous, folder-bounded note write (create-only)."""
 from __future__ import annotations
 
-import json
 import logging
 import re
 from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.files.write_guard import check_write_target, is_within_authorized
+from brain.health.json_io import append_jsonl
 from brain.notes.compose import Note
 
 logger = logging.getLogger(__name__)
@@ -20,12 +20,12 @@ def _slug(s: str) -> str:
 
 
 def _audit(persona_dir: Path, *, path: str, ok: bool, error: str | None = None) -> None:
-    try:
-        with (persona_dir / "notes_audit.jsonl").open("a", encoding="utf-8") as f:
-            f.write(json.dumps({"ts": datetime.now(UTC).isoformat(),
-                                "path": path, "ok": ok, "error": error}) + "\n")
-    except OSError:
-        logger.warning("notes audit append failed", exc_info=True)
+    append_jsonl(
+        persona_dir / "notes_audit.jsonl",
+        {"ts": datetime.now(UTC).isoformat(), "path": path, "ok": ok, "error": error},
+        on_error="log",
+        nonfinite="null",
+    )
 
 
 def commit_note(persona_dir: Path, folder: Path, note: Note, *, now: datetime | None = None) -> str | None:

@@ -10,7 +10,7 @@ from brain.user_preferences import (
     read_raw_keys,
 )
 
-# ---- Task 9: attempt_heal wiring ----
+# ---- Task 9: json_io HEAL wiring ----
 
 
 def test_user_preferences_load_corrupt_file_quarantines_and_resets(tmp_path: Path) -> None:

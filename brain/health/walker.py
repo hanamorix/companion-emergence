@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.health.anomaly import BrainAnomaly, BrainIntegrityError
-from brain.health.attempt_heal import attempt_heal
+from brain.health.json_io import Recovery, read_json_result
 
 # Atomic-rewrite files this walker checks. Each entry: filename -> default dict.
 #
@@ -42,7 +42,7 @@ _OPTIONAL_TEXT_FILES: tuple[str, ...] = ("voicecraft.md",)
 def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
     """Check every persona file. Heal what's healable; report anomalies.
 
-    Iterates atomic-rewrite files via attempt_heal (captures corruption +
+    Iterates atomic-rewrite files via read_json_result (HEAL) (captures corruption +
     repairs in one shot) then opens each SQLite store so the constructor's
     PRAGMA integrity_check runs. Returns an empty list when everything is
     healthy.
@@ -53,7 +53,8 @@ def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
     # to avoid Python's late-binding closure gotcha.
     for name, default in _DEFAULTS.items():
         path = persona_dir / name
-        _, anomaly = attempt_heal(path, default_factory=lambda d=default: d)
+        _res = read_json_result(path, default=lambda d=default: d, recover=Recovery.HEAL)
+        _, anomaly = _res.data, _res.anomaly
         if anomaly is not None:
             anomalies.append(anomaly)
 

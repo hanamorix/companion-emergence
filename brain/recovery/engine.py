@@ -1,7 +1,6 @@
 """Recovery engine."""
 from __future__ import annotations
 
-import json
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -9,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.forgetting import graveyard
+from brain.health.json_io import read_json, write_json
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 from brain.recovery.report import RecoveryReport
@@ -185,18 +185,14 @@ def run_recovery(
     # grace-refresh
     from brain.felt_time.state import load_or_recover
     p_manifest = persona_dir / "source-manifest.json"
-    mdata: dict = {}
-    if p_manifest.exists():
-        try:
-            mdata = json.loads(p_manifest.read_text())
-        except (OSError, json.JSONDecodeError):
-            mdata = {}
+    # An absent, corrupt or unreadable manifest starts empty (unchanged); the module warns about the last two.
+    mdata: dict = read_json(p_manifest, default=dict, expect=dict)
     state, _ = load_or_recover(persona_dir)
     now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     mdata["migrated_at_utc"] = now_iso
     mdata["lived_age_hours_at_migration"] = float(state.lived_age_hours)
     mdata["recovered_at"] = now_iso
-    p_manifest.write_text(json.dumps(mdata, indent=2) + "\n", encoding="utf-8")
+    write_json(p_manifest, mdata, indent=2, fsync=False)
 
     return RecoveryReport(
         persona=persona_dir.name, mode=plan.mode,

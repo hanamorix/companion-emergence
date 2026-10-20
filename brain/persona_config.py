@@ -13,14 +13,14 @@ See `docs/superpowers/audits/2026-04-25-principle-alignment-audit.md`
 
 from __future__ import annotations
 
-import json
 import logging
 import re
-import shutil
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from brain.health.json_io import Recovery, read_json_result, write_json
 
 if TYPE_CHECKING:
     from brain.health.anomaly import BrainAnomaly
@@ -36,7 +36,7 @@ DEFAULT_MODEL = "sonnet"
 DEFAULT_KINDLED_RELAY_URL = "https://kindled-relay.kindledrelay.workers.dev"
 
 # Allowlists for hand-edited or migrated config files. A value outside
-# the set degrades to the default with an attempt_heal anomaly logged
+# the set degrades to the default with a json_io HEAL anomaly logged
 # rather than letting an invalid choice surface as a runtime crash at
 # bridge startup or heartbeat-close time. Keep these in sync with
 # brain/bridge/provider.py:get_provider and brain/search/factory.py.
@@ -261,10 +261,8 @@ class PersonaConfig:
         Returns (instance, anomaly_or_None). Missing file → defaults, no anomaly.
         Corrupt file → quarantine + restore from .bak1/.bak2/.bak3 or reset.
         """
-        from brain.health.attempt_heal import attempt_heal
-
-        data, anomaly = attempt_heal(path, _default_persona_config_dict)
-        return cls._parse_data(data), anomaly
+        res = read_json_result(path, default=_default_persona_config_dict, recover=Recovery.HEAL)
+        return cls._parse_data(res.data), res.anomaly
 
     @classmethod
     def load(cls, path: Path) -> PersonaConfig:
@@ -279,9 +277,8 @@ class PersonaConfig:
         return instance
 
     def save(self, path: Path) -> None:
-        """Atomic save via .bak rotation (save_with_backup)."""
+        """Atomic save via .bak rotation (write_json)."""
         from brain.health.adaptive import compute_treatment
-        from brain.health.attempt_heal import save_with_backup
 
         payload = {
             "provider": self.provider,
@@ -301,20 +298,5 @@ class PersonaConfig:
         if self.derived_unavailable:
             payload["derived_unavailable"] = list(self.derived_unavailable)
         treatment = compute_treatment(path.parent, path.name)
-        save_with_backup(path, payload, backup_count=treatment.backup_count)
-        if treatment.verify_after_write:
-            self._verify_after_write(path)
+        write_json(path, payload, backups=treatment.backup_count, verify=treatment.verify_after_write)
 
-    def _verify_after_write(self, path: Path) -> None:
-        """Re-read the written file; if corrupt, restore from .bak1."""
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                raise ValueError("non-dict payload after write")
-        except (json.JSONDecodeError, ValueError, OSError):
-            logger.error(
-                "PersonaConfig verify_after_write failed for %s; restoring from .bak1", path
-            )
-            bak1 = path.with_name(path.name + ".bak1")
-            if bak1.exists():
-                shutil.copy2(bak1, path)

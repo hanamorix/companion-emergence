@@ -588,7 +588,7 @@ def test_research_log_load_missing_returns_empty(tmp_path: Path) -> None:
 
 
 def test_research_log_load_corrupt_returns_empty(tmp_path: Path) -> None:
-    """Corrupt file is healed to empty via attempt_heal; fires == ()."""
+    """Corrupt file is healed to empty via json_io's HEAL recovery; fires == ()."""
     from brain.engines.research import ResearchLog
 
     path = tmp_path / "research_log.json"

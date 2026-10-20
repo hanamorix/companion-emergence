@@ -39,10 +39,8 @@ the one strict piece (it validates), and ``log_recall`` catches its errors.
 
 from __future__ import annotations
 
-import json
 import logging
 import math
-import os
 import threading
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -51,6 +49,7 @@ from pathlib import Path
 from typing import Any
 
 from brain import dev_constants
+from brain.health.json_io import Recovery, append_jsonl, encode_jsonl, iter_jsonl_raw, write_jsonl
 from brain.utils.file_lock import file_lock
 
 logger = logging.getLogger(__name__)
@@ -187,10 +186,9 @@ def _take_pending(key: str) -> list[bytes]:
 
 
 def _write_lines(path: Path, lines: list[bytes]) -> None:
-    # No fsync: this runs on the recall path (I6) and the data is
-    # diagnostic; the lock, not a sync, is what makes concurrent appends safe.
-    with open(path, "ab") as fh:
-        fh.write(b"".join(lines))
+    # No fsync: this runs on the recall path (I6) and the data is diagnostic. The caller holds the
+    # non-blocking file lock (never-wait contract, S189), so the append takes none of its own.
+    append_jsonl(path, b"".join(lines), lock="held", fsync=False)
 
 
 def append_record(path: Path, record: dict[str, Any]) -> bool:
@@ -198,9 +196,9 @@ def append_record(path: Path, record: dict[str, Any]) -> bool:
     busy (S189: never waits). Returns True if the record was written or buffered,
     False if it was dropped; never raises (a failure is logged)."""
     try:
-        # ensure_ascii (the default) keeps every line pure ASCII, so no exotic
-        # separator (U+2028) can split a line for a `str.splitlines()` reader.
-        line = (json.dumps(record, allow_nan=False, default=str) + "\n").encode("utf-8")
+        # encode_jsonl keeps every line pure ASCII, so no exotic separator (U+2028) can split a line for a
+        # `str.splitlines()` reader; a NaN is written as null (it used to drop the whole record).
+        line = encode_jsonl(record, encode_default=str, nonfinite="null")
         key = str(path)
         with file_lock(path, blocking=False) as acquired:
             if not acquired:
@@ -280,15 +278,14 @@ def log_recall(
     return append_record(path, record)
 
 
-def _record_ts(raw_line: bytes) -> datetime | None:
-    """The record's ``ts`` as an aware UTC datetime, or None if the line is not
-    a JSON object with a parseable ``ts``."""
+def _record_ts(record: dict | None) -> datetime | None:
+    """The record's ``ts`` as an aware UTC datetime, or None if the line did not parse to a
+    JSON object or its ``ts`` is not parseable."""
+    if record is None:
+        return None
     try:
-        obj = json.loads(raw_line)
-        if not isinstance(obj, dict):
-            return None
-        return _utc(datetime.fromisoformat(obj["ts"]))
-    except Exception:  # noqa: BLE001 — any line that cannot be aged (bad JSON, RecursionError, an out-of-range ts's OverflowError) is un-agable
+        return _utc(datetime.fromisoformat(record["ts"]))
+    except Exception:  # noqa: BLE001 — any ts that cannot be aged (missing, wrong type, an out-of-range ts's OverflowError) is un-agable
         return None
 
 
@@ -319,7 +316,7 @@ def _prune(path: Path, *, window_days: float | None, now: datetime | None) -> in
     """Delete records older than the retention window; return how many were
     removed (0 if none, or on any failure). Never raises.
 
-    The whole read -> filter -> temp write -> ``os.replace`` runs under the
+    The whole read -> filter -> atomic rewrite runs under the
     same ``file_lock`` the appends take, so an append attempted in the window
     finds the lock held, is buffered and lands after the rewrite (CONC-3, S189). A record is kept iff its
     ``ts`` is at or after ``now - window_days``. A line that is not a JSON
@@ -335,21 +332,16 @@ def _prune(path: Path, *, window_days: float | None, now: datetime | None) -> in
         if not path.exists():
             return 0  # nothing to prune; do not create a lock sidecar for a log that does not exist
         cutoff = _utc(now) - timedelta(days=window_days)
-        tmp = path.with_suffix(path.suffix + ".tmp")
         with file_lock(path):
-            try:
-                with open(path, "rb") as fh:
-                    raw = fh.read()
-            except FileNotFoundError:
-                return 0
-            kept: list[bytes] = []
+            kept: list[str] = []
             removed = 0
             unagable = 0
-            for line in raw.split(b"\n"):
-                line = line.rstrip(b"\r")
-                if not line.strip():
-                    continue
-                ts = _record_ts(line)
+            # RAISE (a failed read must not shrink the log) + bad_lines (a line that does not parse is still
+            # counted as un-agable and removed, so it cannot live forever).
+            # Read the whole file first (as the byte read did), so the filter below sees one fixed snapshot.
+            rows = list(iter_jsonl_raw(path, recover=Recovery.RAISE, bad_lines=True))
+            for line, record in rows:
+                ts = _record_ts(record)
                 if ts is not None and ts >= cutoff:
                     kept.append(line)
                 else:
@@ -364,19 +356,7 @@ def _prune(path: Path, *, window_days: float | None, now: datetime | None) -> in
                     unagable,
                     path,
                 )
-            try:
-                with open(tmp, "wb") as out:
-                    for line in kept:
-                        out.write(line + b"\n")
-                    out.flush()
-                    os.fsync(out.fileno())
-                os.replace(tmp, path)
-            except BaseException:
-                try:
-                    tmp.unlink(missing_ok=True)
-                except OSError:
-                    logger.warning("recall diagnostics: could not remove temp file %s", tmp)
-                raise
+            write_jsonl(path, "".join(line + "\n" for line in kept).encode("utf-8"))
         return removed
     except Exception:  # noqa: BLE001 — prune runs in the calibration tick; must not break it
         logger.exception("recall diagnostics: prune of %s failed; file left as it was", path)

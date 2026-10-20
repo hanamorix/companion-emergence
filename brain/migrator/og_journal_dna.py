@@ -12,13 +12,13 @@ Both idempotent: re-running on already-migrated data is a no-op.
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from brain.creative.dna import save_creative_dna
+from brain.health.json_io import read_json
 from brain.memory.store import MemoryStore
 
 logger = logging.getLogger(__name__)
@@ -35,10 +35,8 @@ def migrate_creative_dna(*, persona_dir: Path, og_root: Path) -> bool:
     og_path = og_root / "data" / "nell_creative_dna.json"
     if not og_path.exists():
         return False
-    try:
-        og = json.loads(og_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("og creative_dna read failed: %s", exc)
+    og = read_json(og_path, default=lambda: None, expect=dict)  # unreadable or corrupt: None (the module warns)
+    if og is None:
         return False
 
     style = og.get("writing_style", {})
