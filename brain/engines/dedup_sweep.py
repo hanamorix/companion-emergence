@@ -87,11 +87,25 @@ def _write_report(persona_dir: Path, report: Report) -> None:
     append_jsonl(path, rec)
 
 
-def _pick_canonical(members: list[Memory]) -> Memory:
-    """Keep the highest-importance member; ties broken by oldest created_at
-    (the longest-standing record wins a tie)."""
-    ordered = sorted(members, key=lambda m: (-float(m.importance), m.created_at))
+def _pick_canonical(members: list[Memory], exempt: set[str]) -> Memory:
+    """Keep a soul-linked member if there is one (#431), then the highest
+    importance; ties broken by oldest created_at (the longest-standing record
+    wins a tie)."""
+    ordered = sorted(
+        members, key=lambda m: (m.id not in exempt, -float(m.importance), m.created_at)
+    )
     return ordered[0]
+
+
+def _load_exempt_ids(persona_dir: Path) -> set[str]:
+    """Memory ids the soul depends on (crystallised, under review, and their merge
+    targets): the same sets forgetting exempts. The sweep never deletes one (#431).
+    Raises ``SoulExemptionsUnavailableError`` when they cannot be read, before any
+    row is touched: a failed read is not "nothing is exempt"."""
+    from brain.forgetting import _load_soul_linked_ids  # lazy: forgetting is heavier
+
+    crystallised, under_review = _load_soul_linked_ids(persona_dir)
+    return crystallised | under_review
 
 
 def run_dedup_sweep(
@@ -120,6 +134,7 @@ def run_dedup_sweep(
     canonical/removed ids) and appends it to ``dedup_sweep_report.jsonl``.
     """
     persona_dir = Path(persona_dir)
+    exempt = _load_exempt_ids(persona_dir)
     memories = store.list_active()
 
     groups: dict[str, list[Memory]] = {}
@@ -136,11 +151,14 @@ def run_dedup_sweep(
         if len(members) < 2:
             canonicals.append(members[0])
             continue
-        canonical = _pick_canonical(members)
+        canonical = _pick_canonical(members, exempt)
+        # A soul-linked row always stays (#431); if every other member is one, nothing merges.
+        removable = [m for m in members if m.id != canonical.id and m.id not in exempt]
+        if not removable:
+            canonicals.append(canonical)
+            continue
         max_importance = max(float(m.importance) for m in members)
-        for dup in members:
-            if dup.id == canonical.id:
-                continue
+        for dup in removable:
             _archive_preimage(persona_dir, dup)
             store.hard_delete(dup.id)
             report.merges.append(
@@ -158,7 +176,7 @@ def run_dedup_sweep(
         canonicals.append(canonical)
 
     if judge is not None:
-        _near_dup_pass(store, persona_dir, canonicals, judge, report)
+        _near_dup_pass(store, persona_dir, canonicals, judge, report, exempt)
 
     _write_report(persona_dir, report)
     return report
@@ -170,10 +188,13 @@ def _near_dup_pass(
     canonicals: list[Memory],
     judge: Judge,
     report: Report,
+    exempt: set[str],
 ) -> None:
     """Optional near-dup layer (off by default): pairwise-judge the exact-dedup
     survivors and merge any pair the judge calls "duplicate". Fail-open per
-    pair (a judge fault skips that pair, never loses a row)."""
+    pair (a judge fault skips that pair, never loses a row). The later of a
+    pair is removed, unless it is soul-linked: then the earlier goes instead,
+    and a pair of two soul-linked rows is left alone (#431)."""
     removed: set[str] = set()
     ordered = sorted(canonicals, key=lambda m: m.created_at)
     for i, cand in enumerate(ordered):
@@ -187,18 +208,21 @@ def _near_dup_pass(
             except Exception:  # noqa: BLE001 — a judge fault must not lose a row
                 logger.exception("dedup_sweep: near-dup judge raised; skipping pair")
                 continue
-            if verdict != "duplicate":
+            if verdict != "duplicate" or (other.id in exempt and cand.id in exempt):
                 continue
-            _archive_preimage(persona_dir, other)
-            store.hard_delete(other.id)
-            removed.add(other.id)
+            keep, drop = (other, cand) if other.id in exempt else (cand, other)
+            _archive_preimage(persona_dir, drop)
+            store.hard_delete(drop.id)
+            removed.add(drop.id)
             report.merges.append(
                 MergeRecord(
-                    canonical_id=cand.id,
-                    removed_id=other.id,
-                    content_preview=other.content[:120],
+                    canonical_id=keep.id,
+                    removed_id=drop.id,
+                    content_preview=drop.content[:120],
                 )
             )
             report.rows_removed += 1
-            if float(other.importance) > float(cand.importance):
-                store.update(cand.id, importance=float(other.importance))
+            if float(drop.importance) > float(keep.importance):
+                store.update(keep.id, importance=float(drop.importance))
+            if drop is cand:
+                break

@@ -147,3 +147,129 @@ def test_c4_1_no_judge_leaves_near_dups_untouched(tmp_path):
     assert report.rows_removed == 0
     assert store.count(active_only=True) == 2
     store.close()
+
+
+# --------------------------------------------------------------------------- #431
+def _crystallise(persona_dir, memory_id: str) -> str:
+    """Accept a soul candidate for ``memory_id`` through the real review code (the forgetting tests' helper)."""
+    from tests.forgetting.test_orchestrator import _accept_candidate_for_real
+
+    return _accept_candidate_for_real(persona_dir, memory_id)
+
+
+def _active_ids(store: MemoryStore) -> set[str]:
+    return {m.id for m in store.list_active()}
+
+
+def test_431_exact_pass_keeps_the_crystallised_duplicate(tmp_path):
+    """#431: a soul-crystallised memory must never leave memories.db through the sweep. Its exact
+    duplicate scores higher, so on importance alone the crystallised row would be the one deleted; the
+    sweep keeps it as canonical instead and removes the plain duplicate."""
+    store = MemoryStore(tmp_path / "memories.db")
+    soul = _mem("Bob held my hand at the harbour.", importance=2.0)
+    plain = _mem("bob held my hand at the harbour.", importance=8.0)
+    for m in (soul, plain):
+        store.create(m)
+    _crystallise(tmp_path, soul.id)
+
+    report = run_dedup_sweep(store, tmp_path)
+
+    assert _active_ids(store) == {soul.id}
+    assert [(m.canonical_id, m.removed_id) for m in report.merges] == [(soul.id, plain.id)]
+    assert store.get(soul.id, bump=False).importance == 8.0  # the group max still carries over
+    store.close()
+
+
+def test_431_exact_pass_deletes_neither_when_both_duplicates_are_soul_linked(tmp_path):
+    """#431: one crystallised, one under soul review: both stay, and a group the sweep could not merge
+    is not reported as merged (a re-run must still look like a no-op)."""
+    from brain.ingest.soul_queue import queue_soul_candidate
+    from brain.ingest.types import ExtractedItem
+
+    store = MemoryStore(tmp_path / "memories.db")
+    a = _mem("Bob read me the letter.", importance=2.0)
+    b = _mem("bob read me the letter.", importance=5.0)
+    for m in (a, b):
+        store.create(m)
+    _crystallise(tmp_path, a.id)
+    queue_soul_candidate(
+        tmp_path,
+        memory_id=b.id,
+        item=ExtractedItem(text="Bob read me the letter.", label="observation", importance=8),
+        session_id="monologue",
+    )
+
+    report = run_dedup_sweep(store, tmp_path)
+
+    assert _active_ids(store) == {a.id, b.id}
+    assert (report.groups_merged, report.rows_removed, report.merges) == (0, 0, [])
+    assert not (tmp_path / _ARCHIVE_FILENAME).exists()
+    store.close()
+
+
+def test_431_near_dup_pass_keeps_the_crystallised_member_of_a_pair(tmp_path):
+    """#431, near-dup layer: the pass removes the LATER of a duplicate pair. When the later one is
+    crystallised it stays and the earlier, plain one goes instead."""
+    from datetime import UTC, datetime, timedelta
+
+    store = MemoryStore(tmp_path / "memories.db")
+    plain = _mem("Bob and I watched the boats.", importance=6.0)
+    soul = _mem("We watched the boats with Bob.", importance=2.0)
+    object.__setattr__(plain, "created_at", datetime.now(UTC) - timedelta(days=2))
+    object.__setattr__(soul, "created_at", datetime.now(UTC) - timedelta(days=1))
+    for m in (plain, soul):
+        store.create(m)
+    _crystallise(tmp_path, soul.id)
+
+    report = run_dedup_sweep(store, tmp_path, judge=lambda _a, _b: "duplicate")
+
+    assert _active_ids(store) == {soul.id}
+    assert [(m.canonical_id, m.removed_id) for m in report.merges] == [(soul.id, plain.id)]
+    assert store.get(soul.id, bump=False).importance == 6.0
+    store.close()
+
+
+def test_431_near_dup_pass_leaves_a_pair_of_soul_linked_rows_alone(tmp_path):
+    """#431, near-dup layer: one crystallised, one under soul review -> neither is deleted."""
+    from brain.ingest.soul_queue import queue_soul_candidate
+    from brain.ingest.types import ExtractedItem
+
+    store = MemoryStore(tmp_path / "memories.db")
+    a = _mem("Bob sang in the kitchen.")
+    b = _mem("Bob was singing in the kitchen.")
+    for m in (a, b):
+        store.create(m)
+    _crystallise(tmp_path, a.id)
+    queue_soul_candidate(
+        tmp_path,
+        memory_id=b.id,
+        item=ExtractedItem(text="Bob was singing in the kitchen.", label="observation", importance=8),
+        session_id="monologue",
+    )
+
+    report = run_dedup_sweep(store, tmp_path, judge=lambda _a, _b: "duplicate")
+
+    assert _active_ids(store) == {a.id, b.id}
+    assert report.rows_removed == 0
+    store.close()
+
+
+def test_431_sweep_fails_closed_when_the_soul_exemptions_cannot_be_read(tmp_path):
+    """#431 with #392 semantics: a real read failure (a directory where soul_candidates.jsonl should be)
+    raises before any row is touched; nothing is archived, deleted or reported."""
+    from brain.forgetting import SoulExemptionsUnavailableError
+
+    store = MemoryStore(tmp_path / "memories.db")
+    a = _mem("Bob fixed the gate.")
+    b = _mem("bob fixed the gate.")
+    for m in (a, b):
+        store.create(m)
+    (tmp_path / "soul_candidates.jsonl").mkdir()
+
+    with pytest.raises(SoulExemptionsUnavailableError):
+        run_dedup_sweep(store, tmp_path)
+
+    assert _active_ids(store) == {a.id, b.id}
+    assert not (tmp_path / _ARCHIVE_FILENAME).exists()
+    assert not (tmp_path / "dedup_sweep_report.jsonl").exists()
+    store.close()
