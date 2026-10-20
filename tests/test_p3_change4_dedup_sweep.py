@@ -363,9 +363,10 @@ def test_431_failed_exemption_read_during_a_sweep_is_logged_as_the_sweep(tmp_pat
 
 
 def test_431_near_dup_pass_skips_a_pair_whose_row_vanished_mid_pass(tmp_path, caplog):
-    """#431: a row deleted after the pass listed it (a concurrent writer) must not be archived from a
-    stale in-memory copy, nor deleted or updated as if it were still there. Guards against falling
-    back to the stale object when the re-read finds nothing: the pair is skipped with a warning."""
+    """#431: the row a pair would drop (here the later C) is deleted by another writer after the pass
+    listed it. Guards against using the stale in-memory copy: that archives C's stale pre-image and
+    then crashes the whole sweep with KeyError from hard_delete. The pair is skipped with a warning
+    instead, and nothing is archived."""
     import logging
 
     store = MemoryStore(tmp_path / "memories.db")
@@ -414,4 +415,35 @@ def test_431_near_dup_pass_skips_a_pair_whose_survivor_vanished_mid_pass(tmp_pat
     assert not (tmp_path / _ARCHIVE_FILENAME).exists()
     warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert any(a.id in m and c.id in m for m in warnings), warnings
+    store.close()
+
+
+def test_431_near_dup_pass_stops_judging_a_cand_that_vanished(tmp_path, caplog):
+    """#431: once the pass finds that ``cand`` (the earlier row of a pair) is gone, it must stop
+    comparing it. Guards against judging the dead row against every remaining row, which costs a judge
+    call and logs another skip warning per pair."""
+    import logging
+
+    store = MemoryStore(tmp_path / "memories.db")
+    a = _aged("Bob swept the porch.", 3)
+    c = _aged("Bob was sweeping the porch.", 2)
+    d = _aged("The porch, swept by Bob.", 1)
+    for m in (a, c, d):
+        store.create(m)
+    calls: list[tuple[str, str]] = []
+
+    def _judge(candidate: Memory, canonical: Memory) -> str:
+        calls.append((candidate.id, canonical.id))
+        if len(calls) == 1:
+            store.hard_delete(a.id)  # another writer removes A while its first pair is judged
+        return "duplicate"
+
+    with caplog.at_level(logging.WARNING, logger="brain.engines.dedup_sweep"):
+        report = run_dedup_sweep(store, tmp_path, judge=_judge)
+
+    assert calls == [(c.id, a.id), (d.id, c.id)]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1, warnings
+    assert _active_ids(store) == {c.id}
+    assert [(m.canonical_id, m.removed_id) for m in report.merges] == [(c.id, d.id)]
     store.close()

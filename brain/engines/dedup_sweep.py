@@ -236,6 +236,10 @@ def _near_dup_pass(
                 logger.warning(
                     "dedup_sweep: skipping pair %s / %s: a row vanished mid-pass", keep.id, drop.id
                 )
+                if (keep_now if keep.id == cand.id else drop_now) is None:
+                    # ``cand`` itself is gone (#431): judging it against every later row would cost
+                    # a judge call and a warning per pair for a row that can never merge.
+                    break
                 continue
             keep, drop = keep_now, drop_now
             _archive_preimage(persona_dir, drop)
