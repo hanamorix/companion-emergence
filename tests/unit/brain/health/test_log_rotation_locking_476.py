@@ -280,3 +280,37 @@ def test_parse_failure_recording_rotates_without_deadlocking(tmp_path, monkeypat
     t.join(timeout=15)
     assert not t.is_alive(), "recording a parse failure deadlocked in the rotation"
     assert (tmp_path / "parse_failures.jsonl.1.gz").exists()
+
+
+# --- the yearly pass is idempotent (code review 3a, NB1) ----------------------------------------------------------
+
+
+def test_a_retry_after_a_failed_active_log_rewrite_does_not_duplicate_archived_rows(tmp_path, monkeypatch):
+    log = tmp_path / "soul_audit.jsonl"
+    _write(log, [{"ts": "2025-03-01T00:00:00+00:00", "i": 1}, {"ts": "2025-04-01T00:00:00+00:00", "i": 2},
+                 {"ts": "2026-02-01T00:00:00+00:00", "i": 3}])
+    real_write = lr.write_jsonl
+
+    def fail_the_rewrite(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(lr, "write_jsonl", fail_the_rewrite)
+    with pytest.raises(OSError):
+        lr.rotate_age_archive_yearly(log, now=NOW, timestamp_field="ts")  # the archive merge happened, the rewrite did not
+    assert [r["i"] for r in _read_gz(tmp_path / "soul_audit.2025.jsonl.gz")] == [1, 2]
+    monkeypatch.setattr(lr, "write_jsonl", real_write)
+    lr.rotate_age_archive_yearly(log, now=NOW, timestamp_field="ts")  # the next tick
+    assert [r["i"] for r in _read_gz(tmp_path / "soul_audit.2025.jsonl.gz")] == [1, 2]
+    assert [r["i"] for r in _rows(log)] == [3]
+
+
+def test_the_merge_is_count_aware_identical_rows_survive(tmp_path):
+    archive = tmp_path / "soul_audit.2025.jsonl.gz"
+    same = json.dumps({"ts": "2025-03-01T00:00:00+00:00", "i": "same"})
+    other = json.dumps({"ts": "2025-03-02T00:00:00+00:00", "i": "other"})
+    with gzip.open(archive, "wt", encoding="utf-8") as gz:
+        gz.write(same + "\n")
+    lr._merge_into_year_archive(archive, [same, same, other])  # the archive holds ONE copy: one is new
+    assert [r["i"] for r in _read_gz(archive)] == ["same", "same", "other"]
+    lr._merge_into_year_archive(archive, [same, same, other])  # a replay of the same rows adds nothing
+    assert [r["i"] for r in _read_gz(archive)] == ["same", "same", "other"]

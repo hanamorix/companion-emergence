@@ -38,6 +38,7 @@ from __future__ import annotations
 import gzip
 import logging
 import shutil
+from collections import Counter
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import UTC, datetime
@@ -239,20 +240,32 @@ def _rotate_yearly_locked(log_path: Path, now: datetime, timestamp_field: str) -
 
 
 def _merge_into_year_archive(archive_path: Path, new_lines: list[str]) -> None:
-    """Add ``new_lines`` to the year archive, keeping every row already in it.
+    """Add ``new_lines`` to the year archive, keeping every row already in it, and adding only rows it does not already hold.
 
-    The archive is kept forever, so an existing one is read (its lines verbatim), the new lines are
-    appended, and the whole is written to a temp file and put in place with a retried replace. A
-    failure at any step removes the temp and leaves the existing archive as it was.
+    The archive is kept forever, so an existing one is read (its lines verbatim), the lines it does not
+    already hold are appended, and the whole is written to a temp file and put in place with a retried
+    replace. A failure at any step removes the temp and leaves the existing archive as it was.
+
+    Idempotent: the active log is rewritten AFTER this merge, so a failed or interrupted rewrite leaves
+    the cold rows in the active log and the next tick offers them again; a row the archive already holds
+    is skipped. The skip is count-aware: a line offered twice is added twice unless the archive already
+    holds two copies, so genuinely identical rows survive.
     """
     existing: list[str] = []
     if archive_path.exists():
         with gzip.open(archive_path, "rt", encoding="utf-8") as gz:  # json-io: ok -- raw-line gz archive: existing lines pass through unchanged, json_io has no gz reader that keeps damaged lines
             existing = [line.rstrip("\n") for line in gz if line.strip()]
+    held = Counter(existing)
+    to_add: list[str] = []
+    for raw in new_lines:
+        if held[raw] > 0:
+            held[raw] -= 1
+        else:
+            to_add.append(raw)
     tmp_path = archive_path.with_suffix(archive_path.suffix + ".tmp")
     try:
         with gzip.open(tmp_path, "wt", encoding="utf-8") as gz:  # json-io: ok -- raw-line gz archive: lines pass through unchanged, json_io has no gz writer
-            for raw in (*existing, *new_lines):
+            for raw in (*existing, *to_add):
                 gz.write(raw + "\n")
         _replace_with_retry(tmp_path, archive_path)
     except Exception:
