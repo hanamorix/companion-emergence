@@ -209,8 +209,9 @@ def _near_dup_pass(
     pair (a judge fault skips that pair, never loses a row). The later of a
     pair is removed, unless it is soul-linked: then the earlier goes instead,
     and a pair of two soul-linked rows is left alone (#431)."""
-    # Rows this pass deleted, or found deleted under it by another writer (#431). Never judged again:
-    # a gone ``other`` would cost every later ``cand`` a judge call, and a gone ``cand`` can never merge.
+    # Rows this pass deleted, or found deleted (#431) or deactivated (#505) under it by another writer.
+    # Never judged again: a gone ``other`` would cost every later ``cand`` a judge call, and a gone
+    # ``cand`` can never merge.
     gone: set[str] = set()
     ordered = sorted(canonicals, key=lambda m: m.created_at)
     for i, cand in enumerate(ordered):
