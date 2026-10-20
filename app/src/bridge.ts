@@ -14,6 +14,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { modelRejectionMessage, type TierFallbackInfo } from "./lib/friendlyChatError";
 import { isChatModelAlias } from "./lib/modelId";
+import { REQUEST_TIMEOUT_MS } from "./lib/requestTimeout";
 
 export interface BridgeCredentials {
   url: string;        // http base — for fetch() calls
@@ -727,13 +728,21 @@ export interface BridgeHealth {
 /** Lightweight /health probe used by the restart hook's poll loop and the
  *  boot-time version handshake.  The `version` field is present from v0.0.33+
  *  (bridge V2 handshake); older bridges omit it. */
-export async function fetchHealth(persona: string): Promise<BridgeHealth> {
-  const r = await bridgeFetch(persona, (creds) =>
-    fetch(`${creds.url}/health`, { headers: authOnlyHeaders(creds) }),
-    REPLAYABLE,
-  );
-  if (!r.ok) throw new Error(`/health ${r.status}`);
-  return (await r.json()) as BridgeHealth;
+export async function fetchHealth(persona: string, signal?: AbortSignal): Promise<BridgeHealth> {
+  // #456 review: a wedged bridge can accept the connection and never answer; without a caller's signal the probe is
+  // cut after REQUEST_TIMEOUT_MS.
+  const own = signal ? null : new AbortController();
+  const timer = own ? setTimeout(() => own.abort(), REQUEST_TIMEOUT_MS) : undefined;
+  try {
+    const r = await bridgeFetch(persona, (creds) =>
+      fetch(`${creds.url}/health`, { headers: authOnlyHeaders(creds), signal: signal ?? own?.signal }),
+      REPLAYABLE,
+    );
+    if (!r.ok) throw new Error(`/health ${r.status}`);
+    return (await r.json()) as BridgeHealth;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** The chat model: an alias ("sonnet" | "opus" | "haiku") or a full model id such as "claude-sonnet-5". */

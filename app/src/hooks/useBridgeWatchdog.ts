@@ -14,9 +14,9 @@
 
 import { useEffect } from "react";
 import type { BridgeStatus, PersonaState } from "../bridge";
-import { bridgeStatus, fetchHealth } from "../bridge";
+import { bridgeStatus } from "../bridge";
 import { ensureBridgeRunning } from "../appConfig";
-import { restartInFlight, STATUS_POLL_MS } from "./useRestartBridge";
+import { probeHealth, restartInFlight, STATUS_POLL_MS } from "./useRestartBridge";
 import { brainUpdateInFlight } from "./useBrainUpdate";
 
 /** Owner Q4 (2026-10-19): 30 s, 1 min, 5 min, then 10 min repeating. */
@@ -62,7 +62,7 @@ const defaultDeps: WatchdogDeps = {
   },
   healthy: async (persona) => {
     try {
-      await fetchHealth(persona);
+      await probeHealth(persona); // bounded: a wedged bridge must not hang the watchdog (review M1)
       return true;
     } catch {
       return false;

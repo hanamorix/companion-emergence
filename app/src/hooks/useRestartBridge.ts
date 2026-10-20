@@ -30,6 +30,7 @@ import {
 } from "../bridge";
 import { ensureBridgeRunning } from "../appConfig";
 import { errString } from "../lib/errString";
+import { REQUEST_TIMEOUT_MS } from "../lib/requestTimeout";
 
 export type RestartState =
   | "idle"
@@ -59,8 +60,10 @@ export interface UseRestartBridge {
   onModeChanged: (mode: PersonaState["mode"]) => void;
 }
 
-/** The pre-PR request budget before its kill (unchanged from the earlier restart flow). */
-export const TIMEOUT_SHUTDOWN_MS = 3000;
+/** The pre-PR request budget before its kill (unchanged from the earlier restart flow). Also the time limit on each
+ *  single request this flow sends (the stop request, each /health probe): a wedged bridge can accept the connection
+ *  and never answer (review M1). */
+export const TIMEOUT_SHUTDOWN_MS = REQUEST_TIMEOUT_MS;
 export const TIMEOUT_HEALTH_MS = 30000;
 export const HEALTH_POLL_INTERVAL_MS = 500;
 /** Owner Q1 (2026-10-19): the hard exit is offered 180 s after the stop was requested (brain/bridge/stop_watch.py
@@ -96,10 +99,32 @@ const FAILED_USER_MESSAGE =
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+/** Run one request with a time limit: past ``ms`` it is aborted and the call rejects (review M1). */
+export async function withRequestTimeout<T>(run: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
+  const ac = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      ac.abort();
+      reject(new Error(`no answer within ${ms} ms`));
+    }, ms);
+  });
+  try {
+    return await Promise.race([run(ac.signal), expired]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** One /health probe, bounded by TIMEOUT_SHUTDOWN_MS. */
+export function probeHealth(persona: string): Promise<unknown> {
+  return withRequestTimeout((signal) => fetchHealth(persona, signal), TIMEOUT_SHUTDOWN_MS);
+}
+
 async function pollHealth(persona: string, deadline: number): Promise<void> {
   while (Date.now() < deadline) {
     try {
-      await fetchHealth(persona);
+      await probeHealth(persona);
       return;
     } catch {
       await sleep(HEALTH_POLL_INTERVAL_MS);
@@ -110,7 +135,7 @@ async function pollHealth(persona: string, deadline: number): Promise<void> {
 
 async function healthAnswers(persona: string): Promise<boolean> {
   try {
-    await fetchHealth(persona);
+    await probeHealth(persona);
     return true;
   } catch {
     return false;
@@ -296,9 +321,9 @@ async function startFresh(persona: string): Promise<boolean> {
 async function stopPrePr(persona: string): Promise<boolean> {
   transition("requesting");
   try {
-    await shutdownBridge(persona);
+    await withRequestTimeout((signal) => shutdownBridge(persona, signal), TIMEOUT_SHUTDOWN_MS);
   } catch {
-    // its listener may be closed already
+    // its listener may be closed already, or it did not answer in time
   }
   await sleep(TIMEOUT_SHUTDOWN_MS);
   const after = await bridgeStatus(persona);
@@ -339,7 +364,10 @@ async function requestStop(persona: string): Promise<"stopping" | "forced" | "fa
   const deadline = Date.now() + HARD_EXIT_OFFER_AFTER_MS;
   for (;;) {
     try {
-      const r = await shutdownBridge(persona, undefined, "app_restart");
+      const r = await withRequestTimeout(
+        (signal) => shutdownBridge(persona, signal, "app_restart"),
+        TIMEOUT_SHUTDOWN_MS,
+      );
       if (await stopBegan(r)) return "stopping";
     } catch {
       // the request did not get through; decide below

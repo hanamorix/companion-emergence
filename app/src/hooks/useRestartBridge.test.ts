@@ -20,6 +20,7 @@ import {
   progressLine,
   restartBridge,
   restartInFlight,
+  TIMEOUT_HEALTH_MS,
   TIMEOUT_SHUTDOWN_MS,
   useRestartBridge,
 } from "./useRestartBridge";
@@ -158,7 +159,7 @@ describe("useRestartBridge: a new bridge (#456)", () => {
     const run = startRestart(() => result.current.restart());
     await advance(1000);
 
-    expect(m.shutdown).toHaveBeenCalledWith(PERSONA, undefined, "app_restart");
+    expect(m.shutdown).toHaveBeenCalledWith(PERSONA, expect.any(AbortSignal), "app_restart");
     expect(result.current.state).toBe("stopping");
     expect(result.current.progress).toBe(
       "Stopping. Waiting for 2 tasks to finish: chat reply, background job: compaction.",
@@ -377,6 +378,50 @@ describe("useRestartBridge: a new bridge (#456)", () => {
   });
 });
 
+describe("useRestartBridge: time limits (#456 review M1)", () => {
+  it("(C17 d, g) a wedged bridge whose stop request and /health never answer: each is cut at 3 s, then the forced path", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const m = mocks();
+    const never = () => new Promise<never>(() => {});
+    m.shutdown.mockImplementation(never);
+    m.health.mockImplementation(never);
+    m.force.mockImplementation(async () => {
+      w = fresh();
+      m.health.mockImplementation(async () => ({ liveness: "ok" }) as never);
+    });
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    const run = startRestart(() => result.current.restart());
+
+    await advance(TIMEOUT_SHUTDOWN_MS - 100);
+    expect(m.force).not.toHaveBeenCalled();
+    await advance(TIMEOUT_SHUTDOWN_MS + 200); // the request's limit, then the /health probe's
+    expect(m.force).toHaveBeenCalledWith(PERSONA, true);
+    const signal = m.shutdown.mock.calls[0][1] as AbortSignal;
+    expect(signal.aborted).toBe(true); // the hung request is cancelled, not left open
+    await advance(1000);
+    await expect(run.done()).resolves.toBe(true);
+    expect(result.current.fellThrough).toMatch(/answered neither/);
+  });
+
+  it("a /health poll after the start that never answers ends in the restart-failed message, not a hang", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.alive = "gone";
+    const m = mocks();
+    m.start.mockImplementation(async () => {
+      w = fresh();
+      m.health.mockImplementation(() => new Promise<never>(() => {}));
+    });
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    const run = startRestart(() => result.current.restart());
+    await advance(TIMEOUT_HEALTH_MS + TIMEOUT_SHUTDOWN_MS + 1000);
+    await expect(run.done()).resolves.toBe(false);
+    expect(result.current.state).toBe("failed");
+    expect(result.current.errorDetail).toMatch(/Restart failed/);
+  });
+});
+
 describe("useRestartBridge: a pre-PR bridge (#456 C17 j, k)", () => {
   it("(j) proven: the old request, then stop --kill 3 s later if still alive, no display, no offer, then the start", async () => {
     vi.useFakeTimers();
@@ -388,7 +433,7 @@ describe("useRestartBridge: a pre-PR bridge (#456 C17 j, k)", () => {
     const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
     const run = startRestart(() => result.current.restart());
     await advance(TIMEOUT_SHUTDOWN_MS - 100);
-    expect(m.shutdown).toHaveBeenCalledWith(PERSONA);
+    expect(m.shutdown).toHaveBeenCalledWith(PERSONA, expect.any(AbortSignal));
     expect(m.force).not.toHaveBeenCalled();
     await advance(200);
     expect(m.force).toHaveBeenCalledWith(PERSONA, false);
@@ -443,7 +488,7 @@ describe("useRestartBridge: a pre-PR bridge (#456 C17 j, k)", () => {
     await advance(TIMEOUT_SHUTDOWN_MS + 500);
     await expect(run.done()).resolves.toBe(true);
     expect(m.shutdown).toHaveBeenCalledTimes(1);
-    expect(m.shutdown).toHaveBeenCalledWith(PERSONA); // the old request, not the new-bridge one
+    expect(m.shutdown).toHaveBeenCalledWith(PERSONA, expect.any(AbortSignal)); // the old request, not the new-bridge one
     expect(m.force).toHaveBeenCalledWith(PERSONA, false);
     expect(result.current.offerHardExit).toBe(false);
   });
