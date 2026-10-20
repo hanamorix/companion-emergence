@@ -41,7 +41,8 @@ def test_statements_run_in_the_documented_order(tmp_path, monkeypatch) -> None:
     ]
     assert rec.connects == [
         {
-            "args": [str(tmp_path / "a.db").replace(str(tmp_path), "<TMP>")],
+            # the recorder gives paths a tmp token and forward slashes, on every OS
+            "args": ["<TMP>/a.db"],
             "kwargs": {"timeout": 5.0},
         }
     ]
