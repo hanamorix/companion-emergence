@@ -319,12 +319,19 @@ def _stream_first_event_seconds() -> float:
 _STREAM_EOF = object()
 
 # How long a streaming child gets, at each step, to exit once it has been told to stop or has finished
-# (#482): to leave on its own after its last frame, to answer SIGTERM, and to die after SIGKILL. One knob:
-# the steps run one after the other, each bounded by it.
+# (#482): to leave on its own after its last frame, to answer SIGTERM, to die after SIGKILL, and (a pipe
+# closes when its writer exits) for the stdout reader and the stderr drain to reach EOF after that. One knob,
+# because it is one question: how long may the CLI take to flush its last output and exit? No measurement
+# stands behind 5 seconds: it is the bound this path already used for the reader join before the knob
+# existed, and the steps run one after the other, so the worst case is a small multiple of it. A slow
+# machine raises it in tunables.json (`provider.child_exit_grace_seconds`).
 _CHILD_EXIT_GRACE_SECONDS: float = tunables.register("provider.child_exit_grace_seconds", 5.0)
 
-# stderr kept for the failure detail; anything past it is read and dropped so the pipe never fills.
+# stderr kept for the failure detail (the detail uses its first 200 characters; the rest of a full pipe is
+# read and dropped so the child never blocks on a write): 64 KiB is Linux's default pipe capacity.
 _STDERR_KEEP_CHARS = 65536
+# One read of the child's stderr: a page, so a very long line without a newline is read in pieces.
+_STDERR_READ_CHARS = 4096
 
 
 def _child_exit_grace_seconds() -> float:
@@ -347,7 +354,7 @@ class _StderrDrain:
     def _run(self, stream: Any) -> None:
         try:
             while True:
-                chunk = stream.readline(4096)
+                chunk = stream.readline(_STDERR_READ_CHARS)
                 if not isinstance(chunk, str) or not chunk:
                     return
                 if self._kept < _STDERR_KEEP_CHARS:
@@ -356,9 +363,9 @@ class _StderrDrain:
         except (OSError, ValueError):
             return  # the pipe closed under the reader
 
-    def text(self, wait_s: float = 2.0) -> str:
-        """What the child wrote to stderr; waits up to ``wait_s`` for the pipe to reach EOF (the child has exited)."""
-        self._thread.join(timeout=wait_s)
+    def text(self, wait_s: float | None = None) -> str:
+        """What the child wrote to stderr; waits up to ``wait_s`` (default: the child exit grace) for the pipe to reach EOF (the child has exited)."""
+        self._thread.join(timeout=_child_exit_grace_seconds() if wait_s is None else wait_s)
         return "".join(self._chunks)
 
 
@@ -1522,7 +1529,7 @@ class ClaudeCliProvider(LLMProvider):
             finally:
                 # Every exit reaps the child (#482); a finished one (result frame) gets a moment to leave on its own.
                 _stop_child(proc, finished=done_emitted)
-                reader.join(timeout=5)
+                reader.join(timeout=_child_exit_grace_seconds())
                 # One flush for every exit: on success the proxy exhausts this
                 # generator before it reads the audit log; on a StreamError it
                 # raises out of its for-loop and CPython closes the generator

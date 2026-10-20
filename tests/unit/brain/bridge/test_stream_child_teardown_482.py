@@ -163,3 +163,21 @@ def test_a_child_that_exits_on_its_own_after_the_result_frame_is_just_reaped(chi
     events = list(run(script))
     assert [type(e) for e in events] == [StreamDone]
     assert spawned[0].returncode == 0
+
+
+def test_the_teardown_waits_are_one_named_value_not_literals():
+    """Code review 3a: `child_exit_grace_seconds = 5.0` duplicated a hard-coded `reader.join(timeout=5)`. Every bound in the teardown
+    (the wait for the child, the reader thread's join, the stderr drain's join) comes from the one tunable."""
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(provider))
+    literal_timeouts = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in ("join", "wait"):
+            for kw in node.keywords:
+                if kw.arg == "timeout" and isinstance(kw.value, ast.Constant):
+                    literal_timeouts.append((node.func.attr, kw.value.value, node.lineno))
+    assert literal_timeouts == [], literal_timeouts
+    drain_text = inspect.signature(provider._StderrDrain.text).parameters["wait_s"]
+    assert drain_text.default is None  # None means the grace value, not a second number
