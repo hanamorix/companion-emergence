@@ -29,13 +29,19 @@ START_TIMEOUT_S = 60.0
 
 class Bridge:
     def __init__(self, tmp: Path, *, tasks: int = 0, hold_supervisor: bool = False, idle_s: float | None = None,
-                 sighup_ignored: bool = False):
+                 sighup_ignored: bool = False, calls: tuple[str, ...] = (), provider: str = "fake",
+                 new_group: bool = False, prepare=None):
         self.home = tmp / "home"
         self.pd = self.home / "personas" / "nell"
         (self.pd / "active_conversations").mkdir(parents=True, exist_ok=True)
         cfg = self.pd / "persona_config.json"
         if not cfg.exists():
-            cfg.write_text(json.dumps({"provider": "fake", "searcher": "noop"}), encoding="utf-8")
+            cfg.write_text(json.dumps({"provider": provider, "searcher": "noop"}), encoding="utf-8")
+        if prepare is not None:
+            prepare(self.pd)
+        self.fake_dir = tmp / "fake-claude"
+        self.fake_dir.mkdir(exist_ok=True)
+        self.fake_release = tmp / "fake-claude-release"
         self.stub_dir = tmp / "stub"
         self.stub_dir.mkdir(exist_ok=True)
         self.hold = tmp / "supervisor-release"
@@ -47,6 +53,10 @@ class Bridge:
             "KINDLED_TEST_STUB_TASKS": str(tasks),
             "KINDLED_TEST_STUB_DIR": str(self.stub_dir),
             "KINDLED_TEST_SUPERVISOR_HOLD": str(self.hold) if hold_supervisor else "",
+            "KINDLED_TEST_CALLS": ",".join(calls),
+            "PATH": str(REPO / "tests" / "bridge" / "fake_claude") + os.pathsep + os.environ.get("PATH", ""),
+            "FAKE_CLAUDE_DIR": str(self.fake_dir),
+            "FAKE_CLAUDE_RELEASE": str(self.fake_release),
         })
         argv = [sys.executable, "-m", "brain.bridge.runner", "--persona-dir", str(self.pd), "--client-origin", "tests"]
         if idle_s is not None:
@@ -56,7 +66,7 @@ class Bridge:
             if sighup_ignored:
                 signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
-        self.proc = subprocess.Popen(argv, env=env, cwd=str(tmp), preexec_fn=_pre,
+        self.proc = subprocess.Popen(argv, env=env, cwd=str(tmp), preexec_fn=_pre, start_new_session=new_group,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.state = self._wait_ready()
 
@@ -87,6 +97,7 @@ class Bridge:
         for i in range(n):
             self.release(i)
         self.hold.write_text("go")
+        self.fake_release.write_text("go")
 
     def record(self) -> state_file.BridgeState | None:
         return state_file.read(self.pd)
@@ -106,10 +117,23 @@ class Bridge:
     def wait_exit(self, timeout: float = 60.0) -> int:
         return self.proc.wait(timeout=timeout)
 
+    def fake_pids(self) -> list[int]:
+        pids: list[int] = []
+        for f in self.fake_dir.glob("pids-*"):
+            pids += [int(x) for x in f.read_text().split()]
+        return pids
+
     def kill(self) -> None:
         if self.proc.poll() is None:
             self.proc.kill()
             self.proc.wait(10)
+        import psutil
+
+        for pid in self.fake_pids():
+            try:
+                psutil.Process(pid).kill()
+            except psutil.NoSuchProcess:
+                pass
 
 
 @pytest.fixture
