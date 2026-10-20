@@ -205,3 +205,52 @@ def test_on_job_names_each_running_job_then_clears(tmp_path):
     _due(tmp_path, "maintenance")
     _pass(tmp_path, [_cadence_job("maintenance", ran), _work_job("finalize", ran)], on_job=seen.append)
     assert seen == ["finalize", "maintenance", None] or seen == ["maintenance", "finalize", None]
+
+
+def test_a_stop_refusing_a_rollover_extraction_ends_the_compaction_job_with_its_cadence_unchanged(tmp_path, monkeypatch):
+    """C38 (d), review MG-1: the compaction tick reaches a weekly rollover whose final extraction is refused because the
+    bridge began stopping. The refusal ends the job (it is not COMPLETED): compaction_cadence.json stays byte-identical
+    and the old buffer is kept, so the rollover runs at the next pass, not a full interval later."""
+    import json
+    from datetime import timedelta
+
+    import brain.bridge.supervisor as sup
+    import brain.chat.compaction as compaction
+    from brain.bridge.events import EventBus
+    from brain.bridge.provider import FakeProvider
+    from brain.ingest.buffer import ingest_turn, list_active_sessions
+
+    pd = tmp_path / "nell"
+    (pd / "active_conversations").mkdir(parents=True)
+    (pd / "persona_config.json").write_text(json.dumps({"provider": "fake", "searcher": "fake"}), encoding="utf-8")
+    sid = "a1b2c3d4-0000-4000-8000-000000000001"
+    base = datetime.now(UTC) - timedelta(hours=3)
+    for i in range(4):
+        ingest_turn(pd, {"session_id": sid, "speaker": "user" if i % 2 == 0 else "assistant", "text": f"turn {i}",
+                         "ts": (base + timedelta(minutes=i)).isoformat(timespec="seconds")})
+
+    class _StopsDuringExtraction(FakeProvider):
+        def generate(self, prompt=None, *, system=None, **kw):
+            if "extracting durable memories" in (prompt or ""):
+                cli_throttle.request_shutdown()  # the stop arrives as the rollover's extraction is asked for
+                raise cli_throttle.ShutdownDeferred("the bridge is stopping")
+            return super().generate(prompt, system=system, **kw)
+
+    monkeypatch.setattr(compaction, "_WEEKLY_ROLLOVER_AGE", timedelta(0))
+    monkeypatch.setattr(compaction, "_ROLLOVER_QUIET_GAP", timedelta(0))
+    monkeypatch.setattr(compaction, "cascade_conversation", lambda *a, **k: None)  # nothing to fold: no model call
+    monkeypatch.setattr(compaction, "build_compaction_provider", lambda *_a, **_k: _StopsDuringExtraction())
+    jobs = sup._build_gated_jobs(
+        persona_dir=pd, provider=FakeProvider(), event_bus=EventBus(), is_session_busy=None,
+        finalize_after_hours=24.0, finalize_interval_s=None, initiate_review_interval_s=None,
+        maintenance_interval_s=None, self_model_interval_s=None, compaction_interval_s=3600.0,
+        calibration_interval_s=None, interest_sweep_interval_s=None, judge_selftune_interval_s=None,
+        clustering_interval_s=None, intensity_drivers=lambda: None,
+        tick_stats={"closed_sessions": 0, "pruned_empty_sessions": 0},
+    )
+    job = next(j for j in jobs if j.name == "compaction")
+    cadence = _due(pd, "compaction")
+    before = cadence.read_bytes()
+    _pass(pd, [job])
+    assert cadence.read_bytes() == before
+    assert list(list_active_sessions(pd)) == [sid]  # the old buffer is kept for the next pass
