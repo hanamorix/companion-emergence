@@ -1103,14 +1103,26 @@ def _test_hooks() -> dict[str, Any] | None:
     """#456 test hooks for the real-process stop tests (``tests/bridge/test_shutdown_e2e.py``), read only when
     ``KINDLED_TEST_HOOKS=1``: the supervisor is a stub that, after the stop, waits for ``KINDLED_TEST_SUPERVISOR_HOLD``
     (a file path) to exist; ``KINDLED_TEST_STUB_TASKS`` counted stub tasks each end when ``<KINDLED_TEST_STUB_DIR>/
-    release-<i>`` exists; no other background thread starts. Never set in production."""
+    release-<i>`` exists; ``KINDLED_TEST_CALLS`` ("module:function,...") runs each function with the persona dir as a
+    counted task (a call in flight during the stop); no other background thread starts. Never set in production."""
     if os.environ.get("KINDLED_TEST_HOOKS") != "1":
         return None
     return {
         "supervisor_hold": os.environ.get("KINDLED_TEST_SUPERVISOR_HOLD") or None,
         "tasks": int(os.environ.get("KINDLED_TEST_STUB_TASKS") or 0),
         "stub_dir": os.environ.get("KINDLED_TEST_STUB_DIR") or None,
+        "calls": [c for c in (os.environ.get("KINDLED_TEST_CALLS") or "").split(",") if c],
     }
+
+
+def _run_test_call(spec: str, persona_dir: Path) -> None:
+    import importlib
+
+    module, _, name = spec.partition(":")
+    try:
+        getattr(importlib.import_module(module), name)(persona_dir)
+    except Exception:  # noqa: BLE001 - a test hook never takes the bridge down
+        logger.exception("test hook call %s raised", spec)
 
 
 def _wait_for_file(path: str | None) -> None:
@@ -1433,6 +1445,10 @@ def build_app(
                     release = str(Path(hooks["stub_dir"]) / f"release-{i}") if hooks["stub_dir"] else None
                     shutdown_progress.start_tracked_thread(
                         f"stub task {i}", lambda r=release: _wait_for_file(r), name=f"stub-task-{i}"
+                    )
+                for spec in hooks["calls"]:
+                    shutdown_progress.start_tracked_thread(
+                        spec.rpartition(":")[2], lambda sp=spec: _run_test_call(sp, persona_dir), name=f"call-{spec}"
                     )
 
         # Idle-shutdown watcher (only if requested)

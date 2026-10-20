@@ -21,6 +21,7 @@ import asyncio
 import contextvars
 import logging
 import threading
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -111,10 +112,24 @@ class TaskRegistry:
 # The process-wide registry (one bridge per process).
 registry = TaskRegistry()
 
+# #456 (D17): set ONLY by the hard-exit path. Every `claude` spawn site checks it before spawning and after the
+# subprocess returns, and then blocks until the process exits: no new `claude` starts and no caller sees a killed
+# call as an answer (C14 f, C52).
+abandoning = threading.Event()
+
+
+def abandon_gate() -> None:
+    """Block forever once the hard exit has begun (the process is about to end with ``os._exit``)."""
+    if abandoning.is_set():
+        while True:
+            time.sleep(1)
+
 
 def reset_for_tests() -> TaskRegistry:
+    """A new bridge app in this process (tests): a fresh registry, not abandoning."""
     global registry
     registry = TaskRegistry()
+    abandoning.clear()
     return registry
 
 

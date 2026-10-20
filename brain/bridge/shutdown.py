@@ -301,23 +301,68 @@ class Monitor:
             self.hard_exit(REASON_HARD_EXIT)
 
 
-def hard_exit(persona_dir: Path | None, reason: str = REASON_HARD_EXIT) -> None:
-    """End this bridge at once, exit status 0, bridge.json left not clean (C14 c, d). Never returns.
+# Test hook (C14 i): called between the hard exit's first and second enumeration of descendants.
+_between_enumerations: Callable[[], None] | None = None
 
-    The record write is best-effort (C14 g): a failure there still exits. Plan increment I5 extends this path (the
-    abandoning flag and the descendant kill run before ``os._exit``).
+
+def _kill_descendants() -> None:
+    """Kill every descendant of this process (no wait: C14 e)."""
+    import psutil
+
+    try:
+        children = psutil.Process().children(recursive=True)
+    except Exception:  # noqa: BLE001 - the exit must happen whatever the enumeration does
+        return
+    for child in children:
+        try:
+            child.kill()
+        except Exception:  # noqa: BLE001 - gone already, or not ours to kill any more
+            pass
+
+
+def hard_exit(persona_dir: Path | None, reason: str = REASON_HARD_EXIT) -> None:
+    """End this bridge at once: exit status 0, bridge.json left not clean with reason "hard_exit" (C14). Never returns.
+
+    Order (plan I5): the abandoning flag first (no `claude` starts after it and no caller acts on a killed call), the
+    record (best-effort: a failure there still exits, C14 g), the progress record, then every descendant killed without
+    waiting (C14 e), logs flushed, a second enumeration for anything that started meanwhile (S5-d), ``os._exit(0)``.
     """
     try:
+        from brain.bridge import shutdown_progress
+
+        shutdown_progress.abandoning.set()
         if persona_dir is not None:
-            from brain.bridge import state_file
+            try:
+                from brain.bridge import state_file
 
-            def _mark(st: state_file.BridgeState) -> None:
-                st.phase = "hard_exit"
-                st.shutdown_clean = False
-                st.stop_reason = reason
+                def _mark(st: state_file.BridgeState) -> None:
+                    st.phase = "hard_exit"
+                    st.shutdown_clean = False
+                    st.stop_reason = reason
 
-            state_file.update(persona_dir, _mark)
-    except BaseException:  # noqa: BLE001 - the exit must happen whatever the record does
-        pass
+                state_file.update(persona_dir, _mark)
+            except BaseException:  # noqa: BLE001
+                logger.warning("hard exit: bridge.json not updated", exc_info=True)
+            try:
+                rec = shutdown_progress.read_record(persona_dir, shutdown_progress.PROGRESS_FILENAME) or {}
+                from brain import process_identity
+
+                rec.update({"pid": os.getpid(), "pid_token": process_identity.own_token(), "phase": "hard_exit",
+                            "reason": reason, "updated_at": _now_iso()})
+                shutdown_progress.write_record(persona_dir, shutdown_progress.PROGRESS_FILENAME, rec)
+            except BaseException:  # noqa: BLE001
+                pass
+        _kill_descendants()
+        try:
+            for handler in logging.getLogger().handlers:
+                handler.flush()
+        except BaseException:  # noqa: BLE001
+            pass
+        if _between_enumerations is not None:
+            try:
+                _between_enumerations()
+            except BaseException:  # noqa: BLE001
+                pass
+        _kill_descendants()
     finally:
         os._exit(0)
