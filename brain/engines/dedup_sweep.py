@@ -104,7 +104,8 @@ def _load_exempt_ids(persona_dir: Path) -> set[str]:
     row is touched: a failed read is not "nothing is exempt"."""
     from brain.forgetting import _load_soul_linked_ids  # lazy: forgetting is heavier
 
-    # Fails closed; the CLI shows the raw traceback by design until cli.py can be touched (#458/#470).
+    # Fails closed (#431): an unreadable exemption set raises here, so nothing is deleted, and the
+    # error reaches the CLI as a traceback.
     crystallised, under_review = _load_soul_linked_ids(persona_dir, caller="dedup_sweep")
     return crystallised | under_review
 
@@ -228,7 +229,7 @@ def _near_dup_pass(
             # importance and the in-memory objects never see it. Stale, the carry-over below lowers
             # a raised canonical again, or drops its max with it, and the archive gets a stale pre-image.
             # A row gone since the pass listed it (a concurrent writer) is never archived from the
-            # stale copy, deleted or updated: the pair is skipped and logged.
+            # stale copy, deleted or updated: the pair is skipped and logged (#431).
             keep_now = store.get(keep.id, bump=False)
             drop_now = store.get(drop.id, bump=False)
             if keep_now is None or drop_now is None:

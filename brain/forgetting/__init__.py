@@ -50,8 +50,8 @@ class SoulExemptionsUnavailableError(RuntimeError):
 
 
 def _load_soul_linked_ids(persona_dir: Path, *, caller: str = "forgetting") -> tuple[set[str], set[str]]:
-    """Returns (crystallised_ids, under_review_ids). ``caller`` prefixes the warnings (the narrative pass
-    and the dedup sweep share this loader).
+    """Returns (crystallised_ids, under_review_ids). ``caller`` prefixes the warnings: the dedup sweep
+    passes its own name; the narrative pass keeps the default until supervisor.py can be edited.
 
     Fails CLOSED (#392): if either set cannot be read this raises ``SoulExemptionsUnavailableError`` and the
     caller skips its pass. A failed read is not "nothing is exempt", and fading or losing memories on

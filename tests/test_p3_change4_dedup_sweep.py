@@ -302,7 +302,7 @@ def test_431_near_dup_pass_stops_comparing_a_row_it_just_dropped(tmp_path):
     store.close()
 
 
-def test_near_dup_pass_never_lowers_a_canonical_it_already_raised(tmp_path):
+def test_431_near_dup_pass_never_lowers_a_canonical_it_already_raised(tmp_path):
     """#431: A (1, oldest) absorbs C (9) and is raised to 9 in the store. Guards against comparing D (3)
     with A's stale in-memory importance of 1, which writes 3 back and loses the max. The canonical must
     end at the max of everything merged into it."""
@@ -346,8 +346,8 @@ def test_431_near_dup_swap_carries_the_max_and_retargets_earlier_merges(tmp_path
 
 
 def test_431_failed_exemption_read_during_a_sweep_is_logged_as_the_sweep(tmp_path, caplog):
-    """The shared loader's warnings name the pass that hit them, so a sweep failure is not read as a
-    forgetting failure."""
+    """#431: the shared loader's warnings name the pass that hit them. Guards against a failed read in
+    a sweep being logged as "forgetting:", which sends the reader to the wrong pass."""
     import logging
 
     from brain.forgetting import SoulExemptionsUnavailableError
