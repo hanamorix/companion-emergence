@@ -253,9 +253,11 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
           .then((r) => {
             if (!keepalive && mountedRef.current) {
               // A 200 can still mean nothing was saved yet: the bridge answers `deferred` (login expired, bridge stopping) or
-              // `busy` (another extraction of the session is running) with the buffer kept. Clear the warning only on a real success.
+              // `busy` (another extraction of the session is running) with the buffer kept, and `errors > 0` when the pass failed
+              // or hit its backoff window. Clear the warning only on a real success.
+              const notSaved = Boolean(r?.deferred || r?.busy) || (r?.errors ?? 0) > 0;
               setMemorySaveWarning(
-                r?.deferred || r?.busy
+                notSaved
                   ? "Memory snapshot pending for the previous chat: it will be saved when the memory service is available."
                   : null,
               );

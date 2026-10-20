@@ -834,6 +834,7 @@ describe("ChatPanel — snapshot on unmount (Task 6)", () => {
   it.each([
     ["deferred", { closed: false, errors: 0, deferred: true, busy: false }],
     ["busy", { closed: false, errors: 0, deferred: false, busy: true }],
+    ["a failed pass (errors > 0)", { closed: false, errors: 2, deferred: false, busy: false }],
   ])("keeps the memory-pending warning when the snapshot answered %s", async (_name, response) => {
     await snapshotOnPersonaChange(response);
     expect(await screen.findByText(/Memory snapshot pending for the previous chat/i)).toBeTruthy();
