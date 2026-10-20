@@ -54,9 +54,10 @@ def count_throttled(
     with the running count: at ``level`` if ``key`` has not logged at that level in
     the last ``interval_s``, DEBUG otherwise. Returns the count since process start.
 
-    For events that are expected, not failures, so there is no traceback. The count
-    lives in memory and resets on restart; firings after the last loud line show
-    only at DEBUG until the next interval."""
+    For events that are expected, not failures, so there is no traceback. Counts are
+    in-process only and reset on restart; firings after the last loud line show
+    only at DEBUG until the next interval. Surfacing the counts in /health is a
+    follow-up (#368)."""
     with _lock:
         n = _counts[key] = _counts.get(key, 0) + 1
         loud = _due(key, interval_s)

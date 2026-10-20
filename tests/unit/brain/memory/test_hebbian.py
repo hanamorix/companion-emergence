@@ -282,3 +282,45 @@ def test_set_edge_weight_records_when_the_cap_binds(matrix, caplog, fresh_thrott
     # Behaviour unchanged.
     assert matrix.weight("a", "b") == MAX_WEIGHT
     assert matrix.weight("c", "d") == MAX_WEIGHT
+
+
+_WRITES = {
+    "strengthen": lambda m: m.strengthen("p", "q", delta=0.5),
+    "set_edge_weight": lambda m: m.set_edge_weight("p", "q", 1.0),
+    "ensure_edge": lambda m: m.ensure_edge("p", "q", 1.0),
+    "decay_all": lambda m: m.decay_all(0.1),
+    "garbage_collect": lambda m: m.garbage_collect(5.0),
+    "remove_memory": lambda m: m.remove_memory("a"),
+}
+
+
+@pytest.mark.parametrize("write", sorted(_WRITES))
+def test_a_failed_write_releases_the_write_lock(tmp_path, write) -> None:
+    """Regression (found during #368): a HebbianMatrix write that raised left its
+    transaction open, holding the SQLite write lock. search_memories swallows the
+    error, so every other writer then failed with "database is locked" until this
+    connection committed or closed. Every write must roll back what it opened."""
+    import sqlite3
+
+    db = tmp_path / "h.db"
+    m = HebbianMatrix(db, integrity_check=False)
+    m.strengthen("a", "b", delta=1.0)
+    m._conn.executescript(
+        """
+        CREATE TABLE probe (x INTEGER);
+        CREATE TRIGGER no_ins BEFORE INSERT ON hebbian_edges BEGIN SELECT RAISE(ABORT, 'boom'); END;
+        CREATE TRIGGER no_upd BEFORE UPDATE ON hebbian_edges BEGIN SELECT RAISE(ABORT, 'boom'); END;
+        CREATE TRIGGER no_del BEFORE DELETE ON hebbian_edges BEGIN SELECT RAISE(ABORT, 'boom'); END;
+        """
+    )
+    with pytest.raises(sqlite3.DatabaseError, match="boom"):
+        _WRITES[write](m)
+    assert not m._conn.in_transaction
+    other = sqlite3.connect(db, timeout=0.2)
+    try:
+        other.execute("INSERT INTO probe VALUES (1)")  # fails fast if still locked
+        other.commit()
+    finally:
+        other.close()
+    assert m.weight("a", "b") == 1.0  # the failed write changed nothing
+    m.close()

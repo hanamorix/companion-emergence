@@ -80,7 +80,7 @@ def test_c16_forgetting_sigkill_mid_item_resumes_without_redoing_done(tmp_path: 
             ids.append(m.id)
         ids.sort()
         store.close()
-        ids_file.write_text("\\n".join(ids))
+        ids_file.write_text("\\n".join(ids), encoding="utf-8")
 
         calls = {{"n": 0}}
 
@@ -136,7 +136,7 @@ def test_c16_forgetting_sigkill_mid_item_resumes_without_redoing_done(tmp_path: 
     from brain.bridge.events import EventBus
     from brain.forgetting import run_pass
 
-    own_ids = set(ids_file.read_text().split())
+    own_ids = set(ids_file.read_text(encoding="utf-8").split())
     assert len(own_ids) == 3, "the subprocess must have recorded its 3 memory ids"
 
     # #445 point 3: record every call, own or not. A scorer call for an id this
@@ -178,6 +178,10 @@ def test_c16_forgetting_sigkill_mid_item_resumes_without_redoing_done(tmp_path: 
         f"exactly the 2 remaining items run on resume, once each; scored {scored_order}"
     )
     assert job_progress.load_progress(persona_dir, "forgetting") == {}, "a clean finish clears the cursor"
+    # A foreign scored id means another test leaked a live supervisor thread
+    # still running a forgetting pass (#445). Look at the thread name below and
+    # at tests that start run_folded threads, first test_c15c_stress.py's joins
+    # (its `loop.joined` / `writer.joined` assertions must stay).
     assert not foreign, (
         "resume was correct, but salience.score also ran for memories this test did not "
         f"create, from (id, thread): {foreign}. Another test leaked a thread running a "

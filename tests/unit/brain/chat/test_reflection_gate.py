@@ -107,3 +107,27 @@ def test_too_soon_suppress_is_recorded_and_keeps_the_cursor(tmp_path, caplog, fr
     # window still runs from t0.
     assert (tmp_path / "reflection_state.json").read_text() == state_before
     assert should_reflect(sig, tmp_path, kind="attunement", now=t0 + timedelta(seconds=_MIN_SECONDS_BETWEEN + 1)) is True
+
+
+@pytest.mark.parametrize("offset_s", [None, 10])  # None: low salience; 10: too soon
+def test_a_raising_suppress_record_cannot_flip_the_decision(tmp_path, monkeypatch, caplog, fresh_throttle, offset_s):
+    """Regression (#368): the too-soon record sat inside the fail-open try, so a
+    raising record turned a debounced turn into True, and on the low-salience path
+    it propagated into the chat turn. A suppressed turn must stay False whatever
+    the record does, and the record's failure must still be warned."""
+    import brain.chat.reflection_gate as gate
+
+    t0 = _t0()
+    if offset_s is None:
+        sig, now = assess_salience("ok"), t0
+    else:
+        sig, now = SalienceSignal.maximal(), t0 + timedelta(seconds=offset_s)
+        assert should_reflect(sig, tmp_path, kind="attunement", now=t0) is True
+
+    def _boom(*a, **kw):
+        raise RuntimeError("record broke")
+
+    monkeypatch.setattr(gate, "count_throttled", _boom)
+    with caplog.at_level(logging.WARNING, logger=GATE_LOG):
+        assert should_reflect(sig, tmp_path, kind="attunement", now=now) is False
+    assert any(r.exc_info and r.exc_info[0] is RuntimeError for r in _gate_records(caplog, "record failed"))
