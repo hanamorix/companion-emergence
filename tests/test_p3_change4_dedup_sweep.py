@@ -851,3 +851,53 @@ def test_505_exact_pass_skips_a_duplicate_edited_away_mid_group(tmp_path, monkey
     warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert len(warnings) == 1 and d2.id in warnings[0], warnings
     store.close()
+
+
+def test_505_exact_pass_carries_no_importance_from_a_duplicate_skipped_as_gone(tmp_path, monkeypatch):
+    """#505: K is soul-linked (so canonical) at 2; D2 at 8 vanishes while D1 (5) is merged. Guards
+    against carrying the stale importance of a row that was never merged: K must end at the max of
+    itself and the rows actually merged into it (5), not 8."""
+    store = MemoryStore(tmp_path / "memories.db")
+    k, d2, d1 = _exact_group(store)
+    store.update(k.id, importance=2.0)
+    store.update(d2.id, importance=8.0)
+    _crystallise(tmp_path, k.id)
+    _on_first_archive(monkeypatch, lambda: store.hard_delete(d2.id))
+
+    run_dedup_sweep(store, tmp_path)
+
+    assert store.get(k.id, bump=False).importance == 5.0
+    store.close()
+
+
+def test_505_exact_pass_carries_no_importance_from_a_soul_linked_row_that_stays(tmp_path, monkeypatch):
+    """#431/#505: K and S are both soul-linked, so both stay; D (1) is merged into K. Another writer
+    lowers K to 2 mid-pass. Guards against counting the rows that stay in the carry-over: K must end
+    at the max of its current importance and D's (2), not at S's 7 or its own listed 9. S keeps 7.
+
+    The writer is needed: without it the canonical is the most important soul-linked row, so no row
+    that stays can outrank it and the two rules agree."""
+    store = MemoryStore(tmp_path / "memories.db")
+    k = _aged("Bob hung the lantern.", 3, importance=9.0)
+    s = _aged("bob hung the lantern.", 2, importance=7.0)
+    d = _aged("BOB HUNG THE LANTERN.", 1, importance=1.0)
+    for m in (k, s, d):
+        store.create(m)
+    _crystallise(tmp_path, k.id)
+    from brain.ingest.soul_queue import queue_soul_candidate
+    from brain.ingest.types import ExtractedItem
+
+    queue_soul_candidate(
+        tmp_path,
+        memory_id=s.id,
+        item=ExtractedItem(text="bob hung the lantern.", label="observation", importance=8),
+        session_id="monologue",
+    )
+    _on_first_archive(monkeypatch, lambda: store.update(k.id, importance=2.0))
+
+    report = run_dedup_sweep(store, tmp_path)
+
+    assert [(m.canonical_id, m.removed_id) for m in report.merges] == [(k.id, d.id)]
+    assert store.get(k.id, bump=False).importance == 2.0
+    assert store.get(s.id, bump=False).importance == 7.0
+    store.close()
