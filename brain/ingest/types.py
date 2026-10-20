@@ -112,6 +112,9 @@ class IngestReport:
                          are as they were.
         busy:            Another extraction of the same session was running, so this pass
                          did nothing (#477): the running pass advances the cursor.
+        backoff_skipped: The session's recorded failures reached the threshold less than the
+                         backoff window ago, so this pass returned without calling the
+                         provider (``errors`` is 1). It is not a failed attempt.
 
     ``completed`` is the one question a caller that acts on the extraction's result (the
     rollover, which deletes the buffer) must ask: did this pass extract the session's turns?
@@ -130,6 +133,7 @@ class IngestReport:
     memory_ids: list[str] = field(default_factory=list)
     deferred: bool = False
     busy: bool = False
+    backoff_skipped: bool = False
 
     @property
     def completed(self) -> bool:

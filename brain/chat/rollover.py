@@ -63,6 +63,75 @@ def _split_summary_and_raw(turns: list[dict]) -> tuple[dict | None, list[dict]]:
     return summary, raw
 
 
+def _extraction_allows_rollover(
+    persona_dir: Path,
+    old_sid: str,
+    *,
+    store,
+    hebbian,
+    provider,
+    config: dict | None,
+) -> bool:
+    """Run the final extraction of the old buffer; True only when the rollover may go on to fold and DELETE it (#477, #473).
+
+    It may when the extraction completed, or when the session's extraction has failed persistently and the unextracted span has been
+    set aside in ``poison/`` (kept, never lost). It may not, and the buffer stays for the next cycle, when:
+    * another pass is running (busy) or the model call was refused as "not now" (deferred; also when it is RAISED): neither is a
+      failure and neither is ever counted;
+    * the pass returned inside the backoff window without calling the provider (``backoff_skipped``): no attempt was made, so
+      nothing is counted and nothing is set aside;
+    * the extraction failed (a failed pass, or an ordinary exception out of it, which is recorded as a failure like a failed pass)
+      and the session is still below the 3-failure threshold the stale sweep uses;
+    * it is at the threshold but the span could not be set aside, or another pass holds the extraction lock.
+    """
+    from brain.bridge.cli_throttle import ThrottleDeferred
+    from brain.ingest.pipeline import (
+        extract_session_snapshot,
+        extraction_failures_exhausted,
+        poison_unextracted_span,
+        record_extraction_failure,
+    )
+
+    try:
+        report = extract_session_snapshot(
+            persona_dir, old_sid, store=store, hebbian=hebbian, provider=provider, config=config
+        )
+    except ThrottleDeferred:
+        logger.info("rollover: extraction deferred session=%s; keeping the old buffer", old_sid)
+        return False
+    except Exception:
+        # An ordinary exception out of the extraction (a locked store, a malformed turn) counts like a failed pass, so a
+        # persistent one reaches the same threshold instead of holding the buffer forever.
+        logger.exception("rollover: extraction raised session=%s; counted as a failure, keeping the old buffer", old_sid)
+        try:
+            record_extraction_failure(persona_dir, old_sid)
+        except Exception:
+            logger.exception("rollover: could not record the failure session=%s", old_sid)
+            return False
+    else:
+        if report.completed:
+            return True
+        if report.busy or report.deferred or report.backoff_skipped or report.errors == 0:
+            logger.info(
+                "rollover: extraction did not run to the end session=%s busy=%s deferred=%s backoff_skipped=%s; keeping the old buffer",
+                old_sid, report.busy, report.deferred, report.backoff_skipped,
+            )
+            return False
+        # a real attempt that failed: its failure is already recorded in the sidecar by the pass
+    if not extraction_failures_exhausted(persona_dir, old_sid):
+        logger.info("rollover: extraction failed session=%s below the poison threshold; keeping the old buffer", old_sid)
+        return False
+    try:
+        set_aside = poison_unextracted_span(persona_dir, old_sid)
+    except Exception:
+        logger.exception("rollover: could not set the unextracted span aside session=%s; keeping the old buffer", old_sid)
+        return False
+    if set_aside is None:
+        logger.info("rollover: another extraction holds the session session=%s; keeping the old buffer", old_sid)
+        return False
+    return True
+
+
 def perform_rollover(
     persona_dir: Path,
     old_sid: str,
@@ -89,39 +158,10 @@ def perform_rollover(
     # 1. Final memory extraction of the old buffer. Advances the
     #    cursor so the carried tail's extraction state is current (C18).
     if store is not None and hebbian is not None and provider is not None:
-        try:
-            from brain.ingest.pipeline import extract_session_snapshot
-
-            report = extract_session_snapshot(
-                persona_dir, old_sid,
-                store=store, hebbian=hebbian, provider=provider,
-                config=config,
-            )
-        except Exception:
-            logger.exception("rollover: extraction failed session=%s; keeping the old buffer", old_sid)
+        if not _extraction_allows_rollover(
+            persona_dir, old_sid, store=store, hebbian=hebbian, provider=provider, config=config
+        ):
             return None
-        # The rollover folds and DELETES the old buffer, so it goes on only when the extraction actually ran for
-        # the session's turns (#477, #473): a pass that found another extraction running (busy), a refused call
-        # (deferred, e.g. an expired login) and a failed one all leave turns unextracted, and the next cycle tries
-        # again with the buffer intact.
-        if not report.completed:
-            # A persistent FAILURE (not a deferral, not a busy pass) must not hold a live session's buffer forever: after the same
-            # 3 recorded failures the stale sweep uses, the unextracted span is set aside in poison/ (kept, never lost) and the
-            # rollover goes on. If it cannot be set aside, nothing is reaped.
-            from brain.ingest.pipeline import extraction_failures_exhausted, poison_unextracted_span
-
-            if report.errors > 0 and not (report.busy or report.deferred) and extraction_failures_exhausted(persona_dir, old_sid):
-                try:
-                    poison_unextracted_span(persona_dir, old_sid)
-                except Exception:
-                    logger.exception("rollover: could not set the unextracted span aside session=%s; keeping the old buffer", old_sid)
-                    return None
-            else:
-                logger.info(
-                    "rollover: extraction did not complete session=%s busy=%s deferred=%s errors=%d; keeping the old buffer",
-                    old_sid, report.busy, report.deferred, report.errors,
-                )
-                return None
 
     # 2. Fold the old conversation into its post-compaction form. NOTE: this runs
     #    AFTER step-1 extraction advanced the cursor, so it is NOT redundant with

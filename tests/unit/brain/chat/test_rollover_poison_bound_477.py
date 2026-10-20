@@ -55,8 +55,8 @@ def _seed(persona: Path, sid: str, start: int, stop: int) -> None:
 
 
 class _Provider:
-    def __init__(self, exc: Exception):
-        self.exc = exc
+    def __init__(self, exc: Exception | None = None):
+        self.exc = exc  # None: answers fine
         self.calls = 0
 
     def name(self):
@@ -72,6 +72,8 @@ class _Provider:
         prompt = prompt if prompt is not None else kw.get("prompt", "")
         if "extracting durable memories" in prompt:
             self.calls += 1
+            if self.exc is None:
+                return "[]"
             raise self.exc
         return "I remember this."
 
@@ -106,7 +108,9 @@ def test_a_session_in_daily_use_with_a_persistent_extraction_failure_ends_with_a
     for _ in range(3):  # the 5-minute sweep fails three times: the poison threshold
         extract_session_snapshot(persona, "sess_old", store=store, hebbian=hebbian, provider=provider)
     assert read_backoff(persona, "sess_old")["failures"] == 3
-    _seed(persona, "sess_old", 10, 14)  # and the conversation goes on
+    # the 10-minute window after the first failure passes while the conversation goes on (inside it a pass is skipped, not attempted)
+    write_backoff(persona, "sess_old", failures=3, first_failure_at=(datetime.now(UTC) - timedelta(minutes=30)).isoformat())
+    _seed(persona, "sess_old", 10, 14)
 
     new_sid = _roll(world, provider)
 
@@ -176,3 +180,127 @@ def test_if_the_span_cannot_be_set_aside_nothing_is_reaped(world, monkeypatch):
     assert _roll(world, _Provider(RuntimeError("down"))) is None
     assert "sess_old" in list_active_sessions(persona)
     assert len(read_session(persona, "sess_old")) == 10
+
+
+# --- confirm review 2: poison only after a real attempt, count a raise, hold the lock ------------------------------------------
+
+
+def _exhausted(persona: Path, *, first_failure_minutes_ago: float) -> None:
+    write_backoff(
+        persona,
+        "sess_old",
+        failures=3,
+        first_failure_at=(datetime.now(UTC) - timedelta(minutes=first_failure_minutes_ago)).isoformat(),
+    )
+
+
+def test_inside_the_backoff_window_nothing_is_attempted_and_nothing_is_poisoned(world):
+    """S1-a: three failures recorded a minute ago make the pass return early WITHOUT calling the provider (errors + 1). That is not a
+    failed attempt: poisoning on it would set turns aside that a provider which answers fine was never asked about."""
+    persona, store, hebbian = world
+    _seed(persona, "sess_old", 0, 10)
+    write_cursor(persona, "sess_old", _ts(3))
+    _exhausted(persona, first_failure_minutes_ago=1)
+    provider = _Provider()  # would answer
+
+    assert _roll(world, provider) is None
+
+    assert provider.calls == 0
+    assert _poisoned_texts(persona) == []
+    assert "sess_old" in list_active_sessions(persona)
+    assert len(read_session(persona, "sess_old")) == 10
+    assert read_backoff(persona, "sess_old")["failures"] == 3  # unchanged: no attempt, no failure
+
+
+def test_after_the_window_a_real_failing_attempt_poisons(world):
+    persona, store, hebbian = world
+    _seed(persona, "sess_old", 0, 10)
+    write_cursor(persona, "sess_old", _ts(3))
+    _exhausted(persona, first_failure_minutes_ago=30)
+    provider = _Provider(RuntimeError("down"))
+
+    assert _roll(world, provider) is not None
+    assert provider.calls >= 1
+    assert _poisoned_texts(persona) == [f"turn {i}" for i in range(4, 10)]
+
+
+def test_after_the_window_a_provider_that_answers_just_extracts(world):
+    persona, store, hebbian = world
+    _seed(persona, "sess_old", 0, 10)
+    write_cursor(persona, "sess_old", _ts(3))
+    _exhausted(persona, first_failure_minutes_ago=30)
+
+    assert _roll(world, _Provider()) is not None  # the attempt succeeded: a normal rollover
+    assert _poisoned_texts(persona) == []
+
+
+def test_a_raising_extraction_is_counted_and_the_third_one_poisons(world, monkeypatch):
+    """S1-b: an exception out of the extraction (a locked store, a malformed turn) left no trace, so the counter never reached the
+    threshold and the buffer grew without bound. A raise now records a failure like a failed pass."""
+    persona, store, hebbian = world
+    _seed(persona, "sess_old", 0, 10)
+    write_cursor(persona, "sess_old", _ts(3))
+
+    def boom(*a, **k):
+        raise RuntimeError("the store is locked")
+
+    monkeypatch.setattr("brain.ingest.pipeline.extract_session_snapshot", boom)
+    assert _roll(world, _Provider()) is None
+    assert read_backoff(persona, "sess_old")["failures"] == 1
+    assert _roll(world, _Provider()) is None
+    assert read_backoff(persona, "sess_old")["failures"] == 2
+    assert _poisoned_texts(persona) == []
+    assert "sess_old" in list_active_sessions(persona)
+
+    assert _roll(world, _Provider()) is not None  # the third raise reaches the threshold: set aside, then rolled over
+    assert _poisoned_texts(persona) == [f"turn {i}" for i in range(4, 10)]
+    assert "sess_old" not in list_active_sessions(persona)
+
+
+@pytest.mark.parametrize("which", ["throttle", "provider_auth"])
+def test_a_raised_deferral_is_never_counted(world, monkeypatch, which):
+    from brain.bridge.provider_auth import ProviderAuthDeferred
+
+    persona, store, hebbian = world
+    _seed(persona, "sess_old", 0, 10)
+    write_cursor(persona, "sess_old", _ts(3))
+    exc = ThrottleDeferred("not now") if which == "throttle" else ProviderAuthDeferred("login expired")
+
+    def refused(*a, **k):
+        raise exc
+
+    monkeypatch.setattr("brain.ingest.pipeline.extract_session_snapshot", refused)
+    for _ in range(5):
+        assert _roll(world, _Provider()) is None
+    assert read_backoff(persona, "sess_old") is None
+    assert _poisoned_texts(persona) == []
+    assert "sess_old" in list_active_sessions(persona)
+
+
+def test_the_poison_step_needs_the_extraction_lock(world, monkeypatch):
+    """S1-c: the rollover's extraction lock is released when its pass returns; a sweep could start a real pass while the span is read
+    and moved. The step takes the non-blocking lock; not acquired means busy: nothing poisoned, nothing reaped."""
+    from brain.ingest.buffer import extract_lock_path
+    from brain.ingest.pipeline import poison_unextracted_span
+    from brain.ingest.types import IngestReport
+    from brain.utils.file_lock import file_lock
+
+    persona, store, hebbian = world
+    _seed(persona, "sess_old", 0, 10)
+    write_cursor(persona, "sess_old", _ts(3))
+    _exhausted(persona, first_failure_minutes_ago=30)
+
+    with file_lock(extract_lock_path(persona, "sess_old")):
+        assert poison_unextracted_span(persona, "sess_old") is None  # busy, not 0
+        # and through the rollover: its own pass is a (non-busy) failure, the poison step then finds the lock held
+        monkeypatch.setattr(
+            "brain.ingest.pipeline.extract_session_snapshot",
+            lambda *a, **k: IngestReport(session_id="sess_old", errors=1),
+        )
+        assert _roll(world, _Provider()) is None
+    assert _poisoned_texts(persona) == []
+    assert "sess_old" in list_active_sessions(persona)
+    assert len(read_session(persona, "sess_old")) == 10
+    assert read_cursor(persona, "sess_old") == _ts(3)
+
+    assert poison_unextracted_span(persona, "sess_old") == 6  # lock free again
