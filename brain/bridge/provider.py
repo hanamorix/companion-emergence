@@ -1132,7 +1132,7 @@ class ClaudeCliProvider(LLMProvider):
         cli_err = _cli_error_detail(payload, model=_argv_model(cmd), stdout=result.stdout)
         if cli_err is not None:
             raise ProviderError("claude_cli_error", cli_err)
-        return str(payload.get("result", ""))
+        return _text_only(payload.get("result"))  # #467: a null or non-string result is not text
 
     def name(self) -> str:
         return f"claude-cli:{self._model}"
