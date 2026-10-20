@@ -2613,9 +2613,10 @@ class _BridgeStartedMidCommandError(Exception):
 
 
 def _bridge_running(persona_dir: Path) -> Any:
-    """The persona's bridge state when its bridge is running (a state file with a live pid and a port), else None."""
+    """The persona's bridge state when its bridge is running, else None: a record with a port whose pid is the recorded
+    bridge by its identity token (#456 / #472: a live but reused pid is not a bridge)."""
     state = state_file.read(persona_dir)
-    if state and state.pid and state.port and state_file.pid_is_alive(state.pid):
+    if state and state.pid and state.port and state_file.bridge_liveness(state, persona_dir) == state_file.ALIVE:
         return state
     return None
 
