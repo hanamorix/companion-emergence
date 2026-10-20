@@ -2750,7 +2750,8 @@ def build_app(
                     status_code=422,
                     detail=(f"declared {declared_media_type!r} but bytes look like {sniffed!r}"),
                 )
-            record = save_image_bytes(s.persona_dir, raw, sniffed)
+            # Off the event loop and counted as a request worker (#456): the write fsyncs up to the 20 MB cap.
+            record = await tracked_to_thread("upload", save_image_bytes, s.persona_dir, raw, sniffed)
             return {
                 "kind": "image",
                 "sha": record.sha,
@@ -2759,7 +2760,7 @@ def build_app(
             }
         # Non-image path (#43). The on-disk name is the content sha only; the
         # client filename is returned as display metadata, never a path part.
-        frecord = file_store.save_file_bytes(s.persona_dir, raw)
+        frecord = await tracked_to_thread("upload", file_store.save_file_bytes, s.persona_dir, raw)
         return {
             "kind": "file",
             "sha": frecord.sha,
