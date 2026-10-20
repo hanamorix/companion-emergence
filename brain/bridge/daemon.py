@@ -113,6 +113,40 @@ def acquire_lock(persona_dir: Path, *, blocking: bool = False) -> int | None:
     return fd
 
 
+def lock_holder(persona_dir: Path) -> int | None:
+    """The pid written in the bridge lock while another process holds it, else None (free, or a holder whose pid
+    cannot be read). A probe for the kill helper (C45 i): a non-blocking lock attempt on its own fd, released at
+    once; it never writes the file."""
+    path = persona_dir / LOCKFILE
+    try:
+        fd = os.open(str(path), os.O_RDWR)
+    except OSError:
+        return None
+    try:
+        try:
+            if _IS_WINDOWS:
+                os.lseek(fd, _WINDOWS_LOCK_OFFSET, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                os.lseek(fd, _WINDOWS_LOCK_OFFSET, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            return None  # nobody holds it
+        except OSError:
+            pass  # held by another process
+        os.lseek(fd, 0, os.SEEK_SET)
+        raw = os.read(fd, 32)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    try:
+        return int(raw.decode("ascii", "replace").strip())
+    except ValueError:
+        return None
+
+
 def release_lock(persona_dir: Path, fd: int) -> None:
     """Unlock and close the fd. Never unlinks the file (S56) — unlinking
 

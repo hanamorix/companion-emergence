@@ -235,7 +235,15 @@ def _helper_may_run(intent: dict) -> bool:
 
 
 def _other_live_bridge(persona_dir: Path, target_pid: int) -> bool:
-    """Has another bridge started for this persona meanwhile? (the record names another ALIVE pid)."""
+    """Has another bridge started for this persona meanwhile? (C45 i: the bridge lock is held by a pid other than the
+    target's, or the record names another ALIVE pid)."""
+    import psutil
+
+    from brain.bridge.daemon import lock_holder
+
+    holder = lock_holder(persona_dir)
+    if holder is not None and holder != target_pid and psutil.pid_exists(holder):
+        return True
     st = state_file.read(persona_dir)
     if st is None or st.pid is None or st.pid == target_pid:
         return False

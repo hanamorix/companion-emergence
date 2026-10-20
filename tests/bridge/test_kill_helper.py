@@ -495,3 +495,47 @@ def test_the_intent_names_the_helper(tmp_path, fake):
     kill.kill_bridge(b.pd, timeout=10, _hooks={"after_enumeration": lambda: seen.append(_intent(b.pd))})
     assert seen[0]["helper_pid"] == os.getpid()
     assert seen[0]["helper_token"] == pi.own_token()
+
+
+def test_no_commit_when_another_process_holds_the_bridge_lock(tmp_path, fake):
+    """C45 (i) lock clause, review S10: the record still names the target, but another process took the persona's
+    bridge lock meanwhile: no commit, the pending intent is deleted, nothing killed."""
+    b = fake()
+    holder = subprocess.Popen(
+        [sys.executable, "-c",
+         "import sys, time; from pathlib import Path; from brain.bridge.daemon import acquire_lock; "
+         "fd = acquire_lock(Path(sys.argv[1])); print('held' if fd is not None else 'free', flush=True); "
+         "time.sleep(600)", str(b.pd)],
+        stdout=subprocess.PIPE, text=True)
+    try:
+        holder_ready: dict = {}
+
+        def _taken():
+            holder_ready["line"] = holder.stdout.readline().strip()
+
+        r = kill.kill_bridge(b.pd, timeout=2, _hooks={"after_enumeration": _taken})
+        assert holder_ready["line"] == "held"
+        assert r.outcome == "other_bridge"
+        assert _intent(b.pd) is None
+        assert all(s not in ("gone", psutil.STATUS_STOPPED) for s in b.statuses().values())
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_the_target_holding_its_own_lock_is_not_another_bridge(tmp_path, fake):
+    """C45 (i): the lock held by the target's own pid does not stop the kill."""
+    b = fake()
+    (b.pd / "bridge.json.lock").write_text(str(b.pid))
+    holder = subprocess.Popen(
+        [sys.executable, "-c",
+         "import fcntl, os, sys, time; fd = os.open(sys.argv[1], os.O_RDWR); fcntl.flock(fd, fcntl.LOCK_EX); "
+         "print('held', flush=True); time.sleep(600)", str(b.pd / "bridge.json.lock")],
+        stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        r = kill.kill_bridge(b.pd, timeout=10)
+        assert r.outcome == "killed" and b.all_gone()
+    finally:
+        holder.kill()
+        holder.wait()
