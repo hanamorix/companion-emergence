@@ -34,7 +34,11 @@ def test_a_missing_file_gets_its_default_atomically(tmp_path):
     p = tmp_path / "voice.md"
     text, anomaly = attempt_heal_text(p, default_factory=lambda: "default voice \u2014 \u00e9\n")
     assert anomaly is None and text == "default voice \u2014 \u00e9\n"
-    assert p.read_bytes() == "default voice \u2014 \u00e9\n".encode()
+    # Exactly the bytes the old truncating `write_text` produced on THIS platform: text mode, so "\n" is "\r\n" on
+    # Windows. The writer keeps that (newline=None, the same open as write_text); forcing "\n" would change Windows.
+    reference = tmp_path / "reference.md"
+    reference.write_text("default voice \u2014 \u00e9\n", encoding="utf-8")
+    assert p.read_bytes() == reference.read_bytes()
     assert _temps(tmp_path) == []
 
 
