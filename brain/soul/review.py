@@ -205,7 +205,7 @@ def parse_decision(raw: str, candidate_id: str) -> Decision:
 
     try:
         data = json.loads(block)
-    except json.JSONDecodeError as exc:
+    except (ValueError, RecursionError) as exc:  # JSONDecodeError is a ValueError; RecursionError: nested past the limit
         return Decision(
             candidate_id=candidate_id,
             decision="defer",

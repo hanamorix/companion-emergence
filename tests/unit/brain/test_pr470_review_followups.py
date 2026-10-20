@@ -61,3 +61,17 @@ def test_find_json_object_block_prefers_the_given_key_and_catches_recursion():
     assert find_json_object_block("no braces at all") is None
     deep = '{"x": ' + "[" * 200_000 + "]" * 200_000 + "}"
     assert find_json_object_block(deep, prefer_key="verdict") == deep  # the balanced fallback; the caller's loads reports it
+
+
+# --- item 1b: soul review's parse_decision always returns a Decision ----------------------------------------------------
+
+
+def test_soul_parse_decision_returns_a_decision_for_a_reply_nested_past_the_recursion_limit():
+    # On 584ec8a1 the #478 scan catches only ValueError, so RecursionError escapes `parse_decision` (documented as "Always
+    # returns a Decision") and ends the whole soul-review pass at its unguarded call.
+    from brain.soul.review import parse_decision
+
+    raw = '{"decision": "accept", "x": ' + "[" * 200_000 + "]" * 200_000 + "}"
+    decision = parse_decision(raw, "cand-1")
+    assert decision.decision == "defer"
+    assert decision.parse_error
