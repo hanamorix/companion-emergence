@@ -50,12 +50,14 @@ class SoulExemptionsUnavailableError(RuntimeError):
 
 
 def _load_soul_linked_ids(persona_dir: Path, *, caller: str = "forgetting") -> tuple[set[str], set[str]]:
-    """Returns (crystallised_ids, under_review_ids). ``caller`` prefixes the warnings: the dedup sweep
-    passes its own name; the narrative pass keeps the default until supervisor.py can be edited.
+    """Returns (crystallised_ids, under_review_ids), each extended with the consolidation merge targets
+    of its ids (#430). ``caller`` prefixes the warnings: the dedup sweep passes its own name; the
+    narrative pass keeps the default until supervisor.py can be edited.
 
-    Fails CLOSED (#392): if either set cannot be read this raises ``SoulExemptionsUnavailableError`` and the
-    caller skips its pass. A failed read is not "nothing is exempt", and fading or losing memories on
-    that guess cannot be undone. Both legs are always attempted and each failure is logged with its
+    Three legs are read: crystallised ids, under-review ids and the merge-target map. Fails CLOSED
+    (#392): if any leg cannot be read this raises ``SoulExemptionsUnavailableError`` and the caller
+    skips its pass. A failed read is not "nothing is exempt", and fading or losing memories on
+    that guess cannot be undone. All three legs are always attempted and each failure is logged with its
     traceback, so one look at the log shows everything that failed. (Before #392 this fell back to an
     empty set and the pass ran anyway.)
     """
