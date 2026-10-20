@@ -16,9 +16,15 @@ Hebbian work.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
+
+from brain.utils.log_throttle import count_throttled
+
+log = logging.getLogger(__name__)
 
 # Ceiling on any single edge weight. strengthen() saturates at this value so
 # no edge can grow unbounded, which would let a sustained reinforcement loop
@@ -27,6 +33,16 @@ from pathlib import Path
 # (co-activation reinforces at 0.5/event; strong bonds reach low single digits
 # even before decay), so the cap only ever bites a pathological edge.
 MAX_WEIGHT = 10.0
+
+
+def _note_cap(lo: str, hi: str, raw: float, where: str) -> None:
+    """#368: record that MAX_WEIGHT bound. It should only bite a pathological edge,
+    so the first firing per interval warns and the rest log at DEBUG, with a count."""
+    count_throttled(
+        log, "hebbian:max_weight", logging.WARNING,
+        "hebbian: edge %s-%s capped at MAX_WEIGHT %.1f (raw %.3f) in %s",
+        lo, hi, MAX_WEIGHT, raw, where,
+    )
 
 
 class HebbianMatrix:
@@ -76,6 +92,42 @@ class HebbianMatrix:
     def close(self) -> None:
         self._conn.close()
 
+    @contextmanager
+    def _write(self) -> Iterator[None]:
+        """One write transaction: commit on success; on failure roll back and re-raise.
+
+        Every write goes through here because, without the rollback, a raising
+        write (found during #368: a trigger, a pre-read, or the COMMIT itself,
+        where a full disk in WAL mode most likely surfaces) left its transaction
+        open, holding the write lock, so every other writer got "database is
+        locked" until this connection next committed or closed (callers such as
+        search_memories swallow the error). The commit is inside the try for
+        that reason. Guarded by test_a_failed_write_releases_the_write_lock and
+        test_a_failed_commit_releases_the_write_lock.
+
+        Only a transaction opened here is rolled back. If one was already open on
+        this connection (nothing in this class leaves one open, so only a caller
+        using ``_conn`` directly), nothing is rolled back here: a failed statement
+        is undone by SQLite, but if the COMMIT itself fails, this write and the
+        caller's earlier work both stay pending in the caller's transaction, for
+        the caller to commit or roll back. On success it is committed, as before.
+        The rollback guard catches only ``Exception``: a KeyboardInterrupt during
+        rollback is left to propagate rather than be swallowed.
+        """
+        opened = not self._conn.in_transaction
+        if opened:
+            self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+            self._conn.commit()
+        except BaseException:
+            if opened:
+                try:
+                    self._conn.rollback()
+                except Exception:  # noqa: BLE001 — never mask the original error
+                    log.warning("hebbian: rollback after a failed write also failed", exc_info=True)
+            raise
+
     def strengthen(self, a: str, b: str, delta: float = 0.1) -> None:
         """Add `delta` to the weight of edge (a, b), capped at MAX_WEIGHT.
 
@@ -90,21 +142,32 @@ class HebbianMatrix:
         if delta <= 0.0:
             raise ValueError(f"delta must be positive, got {delta!r}")
         lo, hi = _canonical(a, b)
-        # Cap in both UPSERT branches. The INSERT stores min(delta, MAX_WEIGHT);
-        # on conflict excluded.weight is that same capped value, and
-        # MIN(weight + excluded.weight, MAX_WEIGHT) == MIN(weight + delta,
-        # MAX_WEIGHT) for all delta >= 0.
-        self._conn.execute(
-            """
-            INSERT INTO hebbian_edges (memory_a, memory_b, weight)
-            VALUES (?, ?, MIN(?, ?))
-            ON CONFLICT(memory_a, memory_b)
-                DO UPDATE SET weight = MIN(weight + excluded.weight, ?),
-                              last_strengthened_at = CURRENT_TIMESTAMP
-            """,
-            (lo, hi, delta, MAX_WEIGHT, MAX_WEIGHT),
-        )
-        self._conn.commit()
+        # Read the pre-weight in the same write transaction as the UPSERT, so
+        # "did the cap bind" is exact under concurrent writers. One primary-key
+        # lookup: measured ~65 -> ~70 us per call on a WAL file db (the commit
+        # dominates). The UPSERT took this write lock anyway, just later.
+        with self._write():
+            row = self._conn.execute(
+                "SELECT weight FROM hebbian_edges WHERE memory_a = ? AND memory_b = ?",
+                (lo, hi),
+            ).fetchone()
+            raw = (float(row[0]) if row else 0.0) + delta
+            # Cap in both UPSERT branches. The INSERT stores min(delta, MAX_WEIGHT);
+            # on conflict excluded.weight is that same capped value, and
+            # MIN(weight + excluded.weight, MAX_WEIGHT) == MIN(weight + delta,
+            # MAX_WEIGHT) for all delta >= 0.
+            self._conn.execute(
+                """
+                INSERT INTO hebbian_edges (memory_a, memory_b, weight)
+                VALUES (?, ?, MIN(?, ?))
+                ON CONFLICT(memory_a, memory_b)
+                    DO UPDATE SET weight = MIN(weight + excluded.weight, ?),
+                                  last_strengthened_at = CURRENT_TIMESTAMP
+                """,
+                (lo, hi, delta, MAX_WEIGHT, MAX_WEIGHT),
+            )
+        if raw > MAX_WEIGHT:
+            _note_cap(lo, hi, raw, "strengthen")
 
     def weight(self, a: str, b: str) -> float:
         """Return the weight of edge (a, b). Zero if no edge."""
@@ -138,13 +201,13 @@ class HebbianMatrix:
         """
         if rate < 0.0:
             raise ValueError(f"decay rate must be non-negative, got {rate!r}")
-        self._conn.execute("UPDATE hebbian_edges SET weight = MAX(weight - ?, 0.0)", (rate,))
-        self._conn.commit()
+        with self._write():
+            self._conn.execute("UPDATE hebbian_edges SET weight = MAX(weight - ?, 0.0)", (rate,))
 
     def garbage_collect(self, threshold: float = 0.01) -> int:
         """Remove edges with weight < threshold. Returns the count removed."""
-        cursor = self._conn.execute("DELETE FROM hebbian_edges WHERE weight < ?", (threshold,))
-        self._conn.commit()
+        with self._write():
+            cursor = self._conn.execute("DELETE FROM hebbian_edges WHERE weight < ?", (threshold,))
         return cursor.rowcount
 
     def remove_memory(self, memory_id: str) -> int:
@@ -154,11 +217,11 @@ class HebbianMatrix:
         dangling edge survives — edge endpoints must always resolve to a row
         in memories.db. Idempotent: a memory with no edges removes 0.
         """
-        cur = self._conn.execute(
-            "DELETE FROM hebbian_edges WHERE memory_a = ? OR memory_b = ?",
-            (memory_id, memory_id),
-        )
-        self._conn.commit()
+        with self._write():
+            cur = self._conn.execute(
+                "DELETE FROM hebbian_edges WHERE memory_a = ? OR memory_b = ?",
+                (memory_id, memory_id),
+            )
         return cur.rowcount
 
     def ensure_edge(self, a: str, b: str, weight: float) -> bool:
@@ -171,15 +234,15 @@ class HebbianMatrix:
         if a == b:
             return False
         lo, hi = _canonical(a, b)
-        cur = self._conn.execute(
-            """
-            INSERT INTO hebbian_edges (memory_a, memory_b, weight)
-            VALUES (?, ?, ?)
-            ON CONFLICT(memory_a, memory_b) DO NOTHING
-            """,
-            (lo, hi, weight),
-        )
-        self._conn.commit()
+        with self._write():
+            cur = self._conn.execute(
+                """
+                INSERT INTO hebbian_edges (memory_a, memory_b, weight)
+                VALUES (?, ?, ?)
+                ON CONFLICT(memory_a, memory_b) DO NOTHING
+                """,
+                (lo, hi, weight),
+            )
         return cur.rowcount > 0
 
     def set_edge_weight(self, a: str, b: str, weight: float) -> None:
@@ -200,17 +263,19 @@ class HebbianMatrix:
             raise ValueError(f"weight must be positive, got {weight!r}")
         capped = min(weight, MAX_WEIGHT)
         lo, hi = _canonical(a, b)
-        self._conn.execute(
-            """
-            INSERT INTO hebbian_edges (memory_a, memory_b, weight)
-            VALUES (?, ?, ?)
-            ON CONFLICT(memory_a, memory_b)
-                DO UPDATE SET weight = MAX(weight, excluded.weight),
-                              last_strengthened_at = CURRENT_TIMESTAMP
-            """,
-            (lo, hi, capped),
-        )
-        self._conn.commit()
+        with self._write():
+            self._conn.execute(
+                """
+                INSERT INTO hebbian_edges (memory_a, memory_b, weight)
+                VALUES (?, ?, ?)
+                ON CONFLICT(memory_a, memory_b)
+                    DO UPDATE SET weight = MAX(weight, excluded.weight),
+                                  last_strengthened_at = CURRENT_TIMESTAMP
+                """,
+                (lo, hi, capped),
+            )
+        if weight > MAX_WEIGHT:
+            _note_cap(lo, hi, weight, "set_edge_weight")
 
     def activation_count(self, memory_id: str) -> int:
         """Return the count of edges incident on this memory id."""

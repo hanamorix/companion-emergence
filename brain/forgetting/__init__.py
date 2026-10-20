@@ -49,12 +49,15 @@ class SoulExemptionsUnavailableError(RuntimeError):
     """
 
 
-def _load_soul_linked_ids(persona_dir: Path) -> tuple[set[str], set[str]]:
-    """Returns (crystallised_ids, under_review_ids).
+def _load_soul_linked_ids(persona_dir: Path, *, caller: str = "forgetting") -> tuple[set[str], set[str]]:
+    """Returns (crystallised_ids, under_review_ids), each extended with the consolidation merge targets
+    of its ids (#430). ``caller`` prefixes the warnings: the dedup sweep passes its own name; the
+    narrative pass keeps the default until supervisor.py can be edited.
 
-    Fails CLOSED (#392): if either set cannot be read this raises ``SoulExemptionsUnavailableError`` and the
-    caller skips its pass. A failed read is not "nothing is exempt", and fading or losing memories on
-    that guess cannot be undone. Both legs are always attempted and each failure is logged with its
+    Three legs are read: crystallised ids, under-review ids and the merge-target map. Fails CLOSED
+    (#392): if any leg cannot be read this raises ``SoulExemptionsUnavailableError`` and the caller
+    skips its pass. A failed read is not "nothing is exempt", and fading or losing memories on
+    that guess cannot be undone. All three legs are always attempted and each failure is logged with its
     traceback, so one look at the log shows everything that failed. (Before #392 this fell back to an
     empty set and the pass ran anyway.)
     """
@@ -66,17 +69,28 @@ def _load_soul_linked_ids(persona_dir: Path) -> tuple[set[str], set[str]]:
 
         crystallised = set(list_crystallised_memory_ids(persona_dir))
     except Exception:
-        log.warning("forgetting: could not load soul-crystallised memory ids", exc_info=True)
+        log.warning("%s: could not load soul-crystallised memory ids", caller, exc_info=True)
         failed.append("soul-crystallised memory ids")
     try:
         from brain.soul.candidates import list_under_review_memory_ids
 
         under_review = set(list_under_review_memory_ids(persona_dir))
     except Exception:
-        log.warning("forgetting: could not load under-review soul candidate ids", exc_info=True)
+        log.warning("%s: could not load under-review soul candidate ids", caller, exc_info=True)
         failed.append("under-review soul candidate ids")
+    merge_targets: dict[str, set[str]] = {}
+    try:
+        from brain.soul.candidates import merge_target_map
+
+        merge_targets = merge_target_map(persona_dir)
+    except Exception:
+        log.warning("%s: could not load consolidation merge targets", caller, exc_info=True)
+        failed.append("consolidation merge targets")
     if failed:
         raise SoulExemptionsUnavailableError("could not read " + " and ".join(failed))
+    # #430: a soul-linked id the gate merged away lives on in its merge target(s); protect those too.
+    for ids in (crystallised, under_review):
+        ids.update(*(merge_targets[i] for i in list(ids) if i in merge_targets))
     return crystallised, under_review
 
 
