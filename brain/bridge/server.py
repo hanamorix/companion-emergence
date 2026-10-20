@@ -1484,7 +1484,8 @@ def build_app(
             #   3. flush the cost series and recall diagnostics
             #   4. publish the shutdown event
             #   5. clear the publisher
-            controller.begin_stop("unknown")
+            # A signal the monitor has not applied yet keeps its reason (review R2-S3, C13).
+            controller.begin_stop(controller.signal_reason or "unknown")
 
             # 1. Cancel the derived-model re-check (a probe thread already running is a counted task)
             if recheck_task is not None:

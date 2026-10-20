@@ -189,3 +189,13 @@ def test_a_stop_that_began_before_the_lifespan_keeps_the_flag_set(persona_dir: P
     with _client(persona_dir, ctrl) as c:
         assert cli_throttle.shutdown_requested()
         assert c.get("/health").status_code == 200
+
+
+def test_the_lifespan_backstop_keeps_a_pending_signal_as_the_reason(persona_dir: Path):
+    """Review R2-S3 (C13): an OS signal noted but not yet applied by the monitor when the lifespan's backstop stop runs
+    is recorded as "os_signal", not "unknown"."""
+    ctrl = _controller(persona_dir)
+    with _client(persona_dir, ctrl) as c:
+        assert c.get("/health").status_code == 200
+        ctrl.note_signal()  # the signal handler ran; the monitor has not polled yet
+    assert ctrl.reason == "os_signal"
