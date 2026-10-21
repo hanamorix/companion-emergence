@@ -162,7 +162,7 @@ def _run_all(persona, store, hebbian, stub, limit: int = 200) -> None:
 
 
 def _arm(persona, mode) -> dict:
-    ok, msg = eb.arm(persona, mode)
+    _outcome, msg = eb.arm(persona, mode)
     state = eb.load_state(persona)
     assert state is not None and state["mode"] == mode, msg
     return state
@@ -451,8 +451,8 @@ def test_b6_restart_is_refused_while_a_run_holds_the_runner_lock(kestrel) -> Non
     _arm(persona, "all")
     before = eb.state_path(persona).read_bytes()
     with file_lock(persona / eb._RUNNER_LOCK):
-        ok, msg = eb.restart(persona, "all")
-    assert not ok and "in progress" in msg
+        outcome, msg = eb.restart(persona, "all")
+    assert outcome == "refused" and "in progress" in msg
     assert eb.state_path(persona).read_bytes() == before
 
 

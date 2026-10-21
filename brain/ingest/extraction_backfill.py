@@ -684,11 +684,10 @@ def run_foreground(
 # ---------------------------------------------------------------------------
 
 
-def arm(persona_dir: Path, mode: str) -> tuple[bool, str]:
-    """Create the plan (mode ``mode``) or resume the existing one; (True, message) when there is work to run.
-
-    A plan keeps its mode: the other mode needs ``--restart``. A stopped plan is armed again. A complete plan is reported
-    and nothing is armed."""
+def arm(persona_dir: Path, mode: str) -> tuple[str, str]:
+    """Create the plan (mode ``mode``) or resume the existing one. Returns (outcome, message), outcome ``armed`` (there is
+    work to run), ``complete`` (nothing to run: the plan is done or empty) or ``refused`` (the existing plan has the other
+    mode, which needs ``--restart``). A stopped plan is armed again."""
     message: list[str] = []
 
     def fn(cur: dict | None) -> dict | None:
@@ -713,18 +712,21 @@ def arm(persona_dir: Path, mode: str) -> tuple[bool, str]:
 
     update_state(persona_dir, fn)
     state = load_state(persona_dir)
-    ok = state is not None and state.get("mode") == mode and state.get("status") == "armed"
-    return ok, message[0] if message else ""
+    if state is None or state.get("mode") != mode:
+        outcome = "refused"
+    else:
+        outcome = "armed" if state.get("status") == "armed" else "complete"
+    return outcome, message[0] if message else ""
 
 
-def restart(persona_dir: Path, mode: str) -> tuple[bool, str]:
-    """Discard the existing plan and plan afresh (the cutoff moves to now). Refused, changing nothing, while a run holds
-    the runner lock."""
+def restart(persona_dir: Path, mode: str) -> tuple[str, str]:
+    """Discard the existing plan and plan afresh (the cutoff moves to now). Returns (outcome, message) like ``arm``;
+    ``refused``, changing nothing, while a run holds the runner lock."""
     with _runner_lock(persona_dir) as free:
         if not free:
-            return False, "a backfill run is in progress; stop it (or wait for it) before --restart"
+            return "refused", "a backfill run is in progress; stop it (or wait for it) before --restart"
         new = update_state(persona_dir, lambda _cur: _new_state(persona_dir, mode))
-    return new is not None and new["status"] == "armed", f"planned {len(new['targets'])} target(s), mode {mode}"
+    return new["status"] if new["status"] == "armed" else "complete", f"planned {len(new['targets'])} target(s), mode {mode}"
 
 
 def stop(persona_dir: Path) -> str:
