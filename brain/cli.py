@@ -2567,7 +2567,8 @@ def _model_show_handler(args: argparse.Namespace) -> int:
     if pending_legacy():
         print(
             "note: a persona still holds a model from before this setting was shared; it is moved into the "
-            "shared setting the next time `nell model set`, `set-tier`, `clear-tier` or `init` runs, or a bridge starts"
+            "shared setting (where none is set yet) the next time `nell model set`, `set-tier`, `clear-tier` or "
+            "`init` runs, or that persona's bridge starts"
         )
     return 0
 

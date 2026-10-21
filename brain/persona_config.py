@@ -91,11 +91,11 @@ class PersonaConfig:
     notes_folder: str | None = None  # resolved cross-platform path, set on enable
     kindled_link_enabled: bool = False
     kindled_relay_url: str | None = None  # relay where this Kindled's mailbox lives; None = not wired
-    # TRANSITIONAL (remove the release after `brain.model_migration` ships): the raw values of the retired per-persona
-    # model keys (`model`, `tier_models`, `derived_unavailable`) exactly as the file holds them, never interpreted.
-    # `save()` rebuilds the file from this dataclass, and the bridge's first config touch is a load -> save, so
-    # without this field an upgrade would erase a saved model before the migration reads it. Re-emitted by `save()`
-    # while non-empty; the migration clears it once the value has been dealt with.
+    # PERMANENT backward compatibility (an install can upgrade from any earlier version, now or later): the raw values
+    # of the retired per-persona model keys (`model`, `tier_models`, `derived_unavailable`) exactly as the file holds
+    # them, never interpreted. `save()` rebuilds the file from this dataclass, and the bridge's first config touch is
+    # a load -> save, so without this field a saved model would be erased before `brain.model_migration` reads it.
+    # Re-emitted by `save()` while non-empty; the migration removes the keys from the file once it has dealt with them.
     legacy_model_settings: dict = field(default_factory=dict)
 
     def touch_last_opened(self) -> None:
@@ -212,7 +212,7 @@ class PersonaConfig:
             "kindled_link_enabled": self.kindled_link_enabled,
             "kindled_relay_url": self.kindled_relay_url,
         }
-        payload.update(self.legacy_model_settings)  # transitional pass-through, see the field's comment
+        payload.update(self.legacy_model_settings)  # permanent pass-through, see the field's comment
         treatment = compute_treatment(path.parent, path.name)
         write_json(path, payload, backups=treatment.backup_count, verify=treatment.verify_after_write)
 

@@ -179,7 +179,7 @@ def test_a_non_claude_persona_never_decides_the_install_model() -> None:
     _persona("local", model="opus", opened="2026-09-01T00:00:00Z", provider="ollama")
     _persona("fake-one", model="claude-opus-4-9", opened="2026-09-02T00:00:00Z", provider="fake")
     _persona("claude-one", model="claude-sonnet-4-6", opened="2026-01-01T00:00:00Z")
-    assert pending_legacy(_home())
+    assert pending_legacy()
     migrate_persona_models(_home(), None)
     assert _overrides()[_CHAT] == "claude-sonnet-4-6"
     assert json.loads(_marker().read_text())["source_persona"] == "claude-one"
@@ -187,7 +187,7 @@ def test_a_non_claude_persona_never_decides_the_install_model() -> None:
 
 def test_with_only_non_claude_personas_nothing_is_decided() -> None:
     _persona("local", model="opus", opened="2026-09-01T00:00:00Z", provider="ollama")
-    assert not pending_legacy(_home())
+    assert not pending_legacy()
     migrate_persona_models(_home(), None)
     assert _overrides() == {} and not _marker().exists()
 
@@ -240,17 +240,69 @@ def test_the_launching_persona_loses_its_legacy_keys_and_the_others_keep_theirs_
     assert _overrides()[_CHAT] == "claude-opus-5"
 
 
-def test_a_persona_started_after_the_decision_is_cleared_without_changing_the_install_line(caplog) -> None:
+def test_a_persona_found_after_the_decision_keeps_the_install_chat_line_and_applies_only_missing_jobs(caplog) -> None:
+    """Backward compatibility is permanent: an old config that turns up later is applied the same way, where the install
+    has no setting; where it does, the install's setting stays and the old value is discarded with a log."""
     _persona("first", model="opus", opened="2026-02-01T00:00:00Z")
     migrate_persona_models(_home(), None)
     late = _persona("late", model="claude-sonnet-4-6", tiers={"compaction": "claude-haiku-4-5"}, opened="2026-09-01T00:00:00Z")
     other_before = json.loads((late / "persona_config.json").read_text())
     with caplog.at_level(logging.INFO):
         migrate_persona_models(_home(), late)
-    assert _overrides() == {_CHAT: "claude-opus-5"}  # not applied
+    assert _overrides() == {_CHAT: "claude-opus-5", "model.compaction": "claude-haiku-4-5"}
     cfg = _cfg("late")
     assert {k: v for k, v in other_before.items() if k not in ("model", "tier_models", "derived_unavailable")} == cfg
-    assert "discarded" in caplog.text and "claude-sonnet-4-6" in caplog.text
+    assert "discarded" in caplog.text and "claude-sonnet-4-6" in caplog.text  # the chat value, not applied
+
+
+def test_a_persona_found_after_a_decision_that_wrote_no_chat_line_sets_it() -> None:
+    """The first decision saw only a saved `sonnet` (the shipped default, so no line). A later old config holding `opus`
+    finds the install without a chat line and its model goes in."""
+    _persona("first", model="sonnet", opened="2026-02-01T00:00:00Z")
+    migrate_persona_models(_home(), None)
+    assert _marker().exists() and _CHAT not in _overrides()
+    late = _persona("late", model="opus", opened="2026-09-01T00:00:00Z")
+    migrate_persona_models(_home(), late)
+    assert _overrides()[_CHAT] == "claude-opus-5"
+    assert "model" not in _cfg("late")
+
+
+def test_the_loser_of_the_first_decision_does_not_overwrite_the_winner_when_it_starts(caplog) -> None:
+    """The persona is not a late one: the decision considered it. Newest wins; the loser's value, applied
+    with only_missing against an install that holds no line (the winner saved the default), would reverse that."""
+    _persona("newer", model="sonnet", opened="2026-05-01T00:00:00Z")
+    older = _persona("older", model="opus", opened="2026-01-01T00:00:00Z")
+    with caplog.at_level(logging.INFO):
+        migrate_persona_models(_home(), older)
+    assert _CHAT not in _overrides()
+    assert "model" not in _cfg("older") and _marker().exists()
+
+
+def test_a_late_persona_on_another_provider_kind_is_cleared_not_applied() -> None:
+    _persona("first", model="sonnet", opened="2026-02-01T00:00:00Z")
+    migrate_persona_models(_home(), None)
+    local = _persona("local", model="opus", opened="2026-09-01T00:00:00Z", provider="ollama")
+    migrate_persona_models(_home(), local)
+    assert _CHAT not in _overrides() and "model" not in _cfg("local")
+
+
+def test_a_late_persona_is_not_cleared_when_its_values_could_not_be_written(monkeypatch, caplog) -> None:
+    _persona("first", model="sonnet", opened="2026-02-01T00:00:00Z")
+    migrate_persona_models(_home(), None)
+    late = _persona("late", model="opus", opened="2026-09-01T00:00:00Z")
+
+    def refuse(*a, **kw):
+        raise tunables.TunablesWriteError("locked")
+
+    real = model_migration.set_job_models
+    monkeypatch.setattr(model_migration, "set_job_models", refuse)
+    with caplog.at_level(logging.WARNING):
+        migrate_persona_models(_home(), late)
+    assert _cfg("late")["model"] == "opus"  # nothing lost: the next start retries
+    assert "late" in caplog.text
+    monkeypatch.setattr(model_migration, "set_job_models", real)
+    migrate_persona_models(_home(), late)
+    assert _overrides()[_CHAT] == "claude-opus-5" and "model" not in _cfg("late")
 
 
 def test_legacy_keys_that_reappear_after_a_backup_restore_are_cleared_and_never_applied() -> None:
@@ -542,4 +594,6 @@ def test_pending_legacy_reports_without_migrating() -> None:
     assert pending_legacy()
     assert not _marker().exists() and not tunables._file_path().exists()
     migrate_persona_models(_home(), None)
+    assert pending_legacy()  # the persona still holds its keys until its own start clears them
+    migrate_persona_models(_home(), paths.get_persona_dir("a"))
     assert not pending_legacy()

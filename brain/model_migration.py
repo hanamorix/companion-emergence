@@ -1,9 +1,10 @@
-"""One-time fold of the retired per-persona model settings into the install-wide tunables lines (#529).
+"""Folding the retired per-persona model settings into the install-wide tunables lines (#529). Permanent backward compatibility.
 
 Before this change each persona's ``persona_config.json`` held a chat ``model`` and optional ``tier_models`` /
 ``derived_unavailable``. The model is now one install-wide setting per job in ``tunables.json``
-(``brain.bridge.model_tier``), so a model a persona saved has to move there once or an upgrade would silently put
-a saved Opus back on the shipped default.
+(``brain.bridge.model_tier``). There is no way to know which version an install is upgrading from, now or later, so
+this module stays: whenever a persona config in the old format is found, it is brought forward the first time it is
+seen, and an old file that turns up later (an imported or restored persona) is handled the same way.
 
 ``migrate_persona_models(home, persona_dir)`` runs (a) in the bridge lifespan after the tunables defaults rewrite and
 before ``touch_last_opened``, and (b) at the start of the CLI write commands. It has two steps.
@@ -11,24 +12,28 @@ before ``touch_last_opened``, and (b) at the start of the CLI write commands. It
 1. DECISION (only while the marker ``<home>/model_migration.done`` is absent). Every persona's config is read
    read-only BEFORE the migration lock is taken (a damaged file is skipped with a log, never healed). Candidates are
    personas on the Claude provider kind with a valid saved ``model`` or valid ``tier_models`` (a persona on another
-   provider kind never chose a Claude model, so its saved value is never applied). With no candidate nothing is written and NO marker
-   is written, so a persona imported later is still migrated. Otherwise the candidate with the newest ``last_opened_at``
-   wins (the file's mtime only when that field is absent or unusable; a tie goes to the first name alphabetically) and
-   its values are written with ``set_job_models(..., only_missing=True)`` (a setting the user already made is never
-   overwritten); a value equal to the job's shipped default is not written, so a saved ``sonnet`` follows the
-   shipped default. "Most recently used" is not "model most recently changed"; the decision runs before the launching
-   persona's ``last_opened_at`` is touched, so a more recently used OTHER persona can win. That is the stated rule.
-2. CLEARING (for the launching persona, on EVERY start until its legacy keys are gone, marker or not). Once a decision
-   exists, the persona's own legacy keys are removed from its own file, and every saved model text removed is logged
-   (an unusable text at WARNING, a valid one at INFO), so no saved value ever disappears without a trace. Other
-   personas' files are never rewritten by this process; each clears on its own start, but a valid saved model is
-   cleared only once a decision exists. While no Claude-provider persona is a candidate (for example only non-Claude
-   personas are installed) no decision is made, so those personas keep their legacy keys (harmless: they are never
-   applied) until a decision is made; an unusable (typo) text is cleared on any start.
+   provider kind never chose a Claude model, so its saved value is never applied). With no candidate nothing is written
+   and NO marker is written, so a persona imported later still goes through the decision. Otherwise the candidate with
+   the newest ``last_opened_at`` wins (the file's mtime only when that field is absent or unusable; a tie goes to the
+   first name alphabetically) and its values are written with ``set_job_models(..., only_missing=True)`` (a setting
+   the user already made is never overwritten); a value equal to the job's shipped default is not written, so a saved
+   ``sonnet`` follows the shipped default. "Most recently used" is not "model most recently changed"; the decision
+   runs before the launching persona's ``last_opened_at`` is touched, so a more recently used OTHER persona can win.
+   That is the stated rule.
+2. CLEARING (for the launching persona, on EVERY start until its legacy keys are gone, marker or not). A persona the
+   decision above did not consider (its config appeared after the decision, or it was skipped by the scan) has its valid
+   Claude values applied the same way: written with ``only_missing=True``, so an install that has no setting for the job
+   yet takes the persona's value, and an install that already has one keeps it and the persona's value is discarded
+   with a log line. If that write cannot be made nothing is cleared (the next start retries). Then the persona's own
+   legacy keys are removed from its own file, and every saved model text removed without being applied is logged (an
+   unusable text at WARNING, a valid one at INFO), so no saved value ever disappears without a trace. The cost per
+   start is one read of the launching persona's own file and a key-presence test. Other personas' files are never
+   rewritten by this process; each clears on its own start.
 
 Lock order: this module's lock (``model_migration.done.lock``) is taken first and only around the short write section;
-inside it ``set_job_models`` takes the tunables lock. Both waits are bounded; on a timeout this logs and returns (no
-marker, no clearing), and the next start retries. It never raises into startup.
+inside it ``set_job_models`` takes the tunables lock (the late write of step 2 takes only the tunables lock). Both waits
+are bounded; on a timeout the decision logs and returns (no marker, no clearing), and the next start retries. It never
+raises into startup.
 """
 
 from __future__ import annotations
@@ -146,25 +151,29 @@ def _marker_path(home: Path) -> Path:
     return home / MARKER_NAME
 
 
-def _decide(home: Path) -> bool:
-    """The decision step. True when a decision now exists (this call made it, or the marker is there)."""
+def _decide(home: Path) -> tuple[bool, frozenset[str]]:
+    """The decision step: (a decision exists now, the personas THIS call's decision considered).
+
+    The second item is empty when the marker was already there (an earlier call decided) or nothing was decided.
+    """
     marker = _marker_path(home)
     if marker.exists():
-        return True
+        return True, frozenset()
     skipped: list[str] = []
     candidates = _scan_candidates(skipped)  # BEFORE the lock: the hold below stays short by construction
     if not candidates:
-        return False  # nothing to decide; no marker, so a persona imported later is still migrated
+        return False, frozenset()  # nothing to decide; no marker, so a persona imported later is still migrated
     for cand in candidates:
         logger.info(
             "model migration: candidate %s: chat=%r tier_models=%r (%s %s)",
             cand.name, cand.chat, cand.tiers, cand.signal, cand.stamp.isoformat(),
         )
     updates = _winner_updates(candidates)
+    considered = frozenset(c.name for c in candidates)
     try:
         with locked_within(marker, dev_constants.SETTINGS_FILE_LOCK_WAIT_S):
             if marker.exists():
-                return True  # another process decided while this one was reading
+                return True, frozenset()  # another process decided while this one was reading
             written = set_job_models(dict(updates), only_missing=True) if updates else {}
             skipped_existing = sorted(set(updates) - set(written))
             if skipped_existing:
@@ -181,19 +190,40 @@ def _decide(home: Path) -> bool:
                 fsync=False,
             )
             logger.info("model migration: decided; wrote %s", sorted(written) or "nothing (all equal the defaults)")
-            return True
+            return True, considered
     except LockTimeoutError:
         logger.warning("model migration: another process holds the migration lock; retried at the next start")
     except TunablesWriteError as exc:
         logger.warning("model migration: could not write the model settings (%s); retried at the next start", exc)
     except OSError as exc:
         logger.warning("model migration: could not record the decision (%s); retried at the next start", exc)
-    return False
+    return False, frozenset()
 
 
-def _clear_persona(persona_dir: Path, decision_exists: bool, marker_existed: bool) -> None:
+def _apply_late(name: str, chat: str | None, tiers: dict[str, str]) -> bool:
+    """Apply a persona's valid saved values that the decision did not consider: written only where the install has no
+    setting yet, otherwise discarded with a log. False when the write could not be made (nothing may be cleared)."""
+    cand = _Candidate(name, chat, tiers, datetime.fromtimestamp(0, UTC), "late")
+    updates = _winner_updates([cand])
+    try:
+        written = set_job_models(dict(updates), only_missing=True) if updates else {}
+    except (TunablesWriteError, LockTimeoutError, OSError) as exc:
+        logger.warning("model migration: could not apply persona %s's saved model (%s); retried at the next start", name, exc)
+        return False
+    if written:
+        logger.info("model migration: persona %s's saved model applied to %s (the install had no setting)", name, sorted(written))
+    for job in sorted(set(updates) - set(written)):
+        logger.info(
+            "model migration: persona %s's saved model %s for %s was not applied (the install already has a setting) and is discarded",
+            name, updates[job], job,
+        )
+    return True
+
+
+def _clear_persona(persona_dir: Path, decision_exists: bool, considered: frozenset[str]) -> None:
     """The clearing step for ONE persona's own file: its legacy keys come out, every other key stays exactly as it is
-    (the file is edited as parsed JSON, not rebuilt from the dataclass, so nothing else is normalised)."""
+    (the file is edited as parsed JSON, not rebuilt from the dataclass, so nothing else is normalised). A Claude persona
+    the decision did not consider has its valid values applied first (``_apply_late``)."""
     from brain.health.adaptive import compute_treatment
 
     path = persona_dir / "persona_config.json"
@@ -205,17 +235,18 @@ def _clear_persona(persona_dir: Path, decision_exists: bool, marker_existed: boo
         return
     chat, tiers = _valid_legacy(legacy)
     has_valid = chat is not None or bool(tiers)
-    if has_valid and not decision_exists:
+    applicable = has_valid and _provider_kind(data) == _CLAUDE_PROVIDER
+    if applicable and not decision_exists:
         return  # the decision failed: nothing is lost, the next start retries
-    if has_valid and marker_existed:
-        logger.info(
-            "model migration: persona %s still held a saved model (%r, %r) after the decision; it was not "
-            "applied and is discarded",
-            persona_dir.name, chat, tiers,
-        )
-    elif "model" in legacy or "tier_models" in legacy:
-        # An unusable text (a typo), or a valid one the decision above did not scan (the persona's file was skipped
-        # by the scan): either way the text is removed from the file, so the log is where it stays visible.
+    applied = False
+    if applicable and persona_dir.name not in considered:
+        if not _apply_late(persona_dir.name, chat, tiers):
+            return
+        applied = True
+    if not applied and ("model" in legacy or "tier_models" in legacy):
+        # An unusable text (a typo), a value the decision above already dealt with (its winner was written, a loser is
+        # logged there), or a persona on another provider kind: the text is removed from the file, so the log is where
+        # it stays visible.
         shown = ", ".join(f"{key}={unsupported_display(legacy[key])}" for key in ("model", "tier_models") if key in legacy)
         logger.log(
             logging.INFO if has_valid else logging.WARNING,
@@ -235,19 +266,16 @@ def _clear_persona(persona_dir: Path, decision_exists: bool, marker_existed: boo
 def migrate_persona_models(home: Path, persona_dir: Path | None) -> None:
     """Run the decision step and, for ``persona_dir`` (None for a CLI call), the clearing step. Never raises."""
     try:
-        marker_existed = _marker_path(home).exists()
-        decision_exists = _decide(home)
+        decision_exists, considered = _decide(home)
         if persona_dir is not None:
-            _clear_persona(Path(persona_dir), decision_exists, marker_existed)
+            _clear_persona(Path(persona_dir), decision_exists, considered)
     except Exception:  # noqa: BLE001 - startup and the CLI must never fail on this
         logger.warning("model migration failed (ignored; retried at the next start)", exc_info=True)
 
 
-def pending_legacy(home: Path | None = None) -> bool:
-    """Read-only: True while no decision exists and some persona still holds a valid saved model."""
-    root = paths.get_home() if home is None else home
-    if _marker_path(root).exists():
-        return False
+def pending_legacy() -> bool:
+    """Read-only: True while some Claude persona's config still holds a valid saved model (applied or discarded when
+    that persona next starts, or by the first decision)."""
     try:
         return bool(_scan_candidates([]))
     except Exception:  # noqa: BLE001
