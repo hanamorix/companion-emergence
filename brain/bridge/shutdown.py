@@ -354,7 +354,7 @@ def hard_exit(persona_dir: Path | None, reason: str = REASON_HARD_EXIT) -> None:
 
         shutdown_progress.abandoning.set()
         if persona_dir is not None and reason != REASON_CRASH:
-            # D26 / D7: a recorded stop (every hard exit but a crash) is a success for the start back-off.
+            # D26 / D7: a recorded stop (every hard exit but a crash) deletes the start back-off record.
             try:
                 from brain.bridge import start_backoff
 

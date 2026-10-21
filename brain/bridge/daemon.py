@@ -614,7 +614,7 @@ def cmd_run(args) -> int:
         from brain.bridge.runner import run_bridge_foreground
 
         if guarded:
-            start_backoff.note_start(persona_dir)  # D26: unproven until the bridge has stayed up (SuccessWatch)
+            start_backoff.note_start(persona_dir)  # D26: stays until a recorded stop; SuccessWatch restarts the ladder
 
         idle = float(args.idle_shutdown) * 60 if args.idle_shutdown > 0 else None
         return run_bridge_foreground(

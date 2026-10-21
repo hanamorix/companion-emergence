@@ -256,22 +256,70 @@ class FakeServer:
         self.started = started
 
 
-def test_the_watch_resets_only_600_s_after_the_server_started(pd, clock):
+def test_the_watch_marks_the_run_healthy_only_600_s_after_the_server_started(pd, clock):
+    """D7's success: the record is NOT deleted (only a clean stop, a non-crash hard exit or an explicit start deletes it):
+    it stays as "the last run was healthy", so a crash afterwards is seen by the next start (review of D26 ruling)."""
     start_backoff.note_start(pd)
     srv = FakeServer(started=False)
     mono = Clock(50.0)
     w = start_backoff.SuccessWatch(pd, srv, clock=mono.now)
     mono.t += 5000
     w.poll_once()  # the server never started: no clock runs
-    assert start_backoff.read(pd).unproven_starts == 1
+    assert start_backoff.read(pd) == start_backoff.Record(1, clock.t)
     srv.started = True
     w.poll_once()  # started now
     mono.t += start_backoff.HEALTHY_RESET_S - 1
     w.poll_once()
-    assert start_backoff.read(pd).unproven_starts == 1
+    assert start_backoff.read(pd).after_healthy is False
     mono.t += 1
     w.poll_once()
-    assert not (pd / start_backoff.FILENAME).exists()
+    rec = start_backoff.read(pd)
+    assert rec.after_healthy is True and rec.unproven_starts == 1
+    assert json.loads((pd / start_backoff.FILENAME).read_text(encoding="utf-8"))["after_healthy"] is True
+
+
+def test_a_crash_after_a_healthy_run_makes_the_next_start_wait_the_first_step(pd, clock, monkeypatch):
+    """Review of D26 (main's ruling): the app waits 30 s after ANY crash. A run that stayed healthy and then ended with
+    no recorded stop leaves its record; the next start waits the whole first step from its own start, even though the
+    recorded time is long past (the step is not anchored to a start time that says nothing about the crash)."""
+    from brain.bridge.shutdown import POLL_S
+
+    start_backoff.note_start(pd)
+    srv = FakeServer(started=True)
+    mono = Clock(0.0)
+    w = start_backoff.SuccessWatch(pd, srv, clock=mono.now)
+    w.poll_once()
+    mono.t += start_backoff.HEALTHY_RESET_S
+    w.poll_once()
+    clock.t += 5000  # the run lived on, then crashed; the manager restarts it much later than the recorded time
+    monkeypatch.setattr(start_backoff, "_sleep", _bounded_sleep(clock, 30 + 5 * POLL_S))
+    t0 = clock.t
+    assert start_backoff.wait_before_start(pd, interrupted=lambda: False) is True
+    assert clock.t - t0 == pytest.approx(30, abs=POLL_S + 1e-6)
+
+
+def test_a_clean_stop_after_a_healthy_run_leaves_nothing_to_wait_for(pd, clock, monkeypatch):
+    start_backoff.note_start(pd)
+    mono = Clock(0.0)
+    w = start_backoff.SuccessWatch(pd, FakeServer(started=True), clock=mono.now)
+    w.poll_once()
+    mono.t += start_backoff.HEALTHY_RESET_S
+    w.poll_once()
+    start_backoff.reset(pd)  # _write_stopped / a non-crash hard exit
+    monkeypatch.setattr(start_backoff, "_sleep", lambda s: pytest.fail("slept"))
+    assert start_backoff.wait_before_start(pd, interrupted=lambda: False) is True
+
+
+def test_the_start_after_a_healthy_run_is_counted_so_the_ladder_goes_on_at_60_s(pd, clock):
+    """The healthy run counts as the series' first start (as the first start of a fresh install does): the start that
+    follows its crash is the second, so a quick failure of that one is followed by the 60 s step, as the app's second
+    delay is."""
+    start_backoff.note_start(pd)
+    (pd / start_backoff.FILENAME).write_text(
+        json.dumps({"unproven_starts": 1, "at": clock.t, "after_healthy": True}), encoding="utf-8"
+    )
+    start_backoff.note_start(pd)
+    assert start_backoff.read(pd) == start_backoff.Record(2, clock.t, False)
 
 
 def test_the_watch_thread_ends_with_the_run(pd, clock):

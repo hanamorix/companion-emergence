@@ -78,7 +78,7 @@ def _write_stopped(persona_dir: Path) -> None:
             logger.warning("bridge.json is not this bridge's record; the stopped mark was not written")
     except Exception:
         logger.warning("stopped-mark write failed", exc_info=True)
-    start_backoff.reset(persona_dir)  # D26 / D7: a recorded stop is a success: the next start does not wait
+    start_backoff.reset(persona_dir)  # D26 / D7: a recorded stop deletes the record: the next start does not wait
 
 
 def _after_run(persona_dir: Path, app: object, monitor: object) -> None:
@@ -259,7 +259,8 @@ def run_bridge_foreground(
         hard_exit=lambda reason: shutdown_mod.hard_exit(persona_dir, reason),
     )
     monitor.start()
-    # D26 / D7: a service-run start counts as failed until the server has stayed up 600 s (or a stop is recorded).
+    # D26 / D7: after the server has stayed up 600 s the ladder starts over (the record stays: a crash after it still
+    # makes the next start wait the first step); only a recorded stop deletes it.
     watch = None
     if client_origin in respawn_guard.SERVICE_ORIGINS:
         watch = start_backoff.SuccessWatch(persona_dir, server)

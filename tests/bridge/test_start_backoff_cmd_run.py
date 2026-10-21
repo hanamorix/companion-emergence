@@ -430,15 +430,37 @@ def test_a_bridge_that_never_starts_is_spaced_on_the_apps_ladder_forever(pd, clo
         assert sum(1 for x in starts[i:] if x - s < 10) <= 2
 
 
-def test_a_healthy_run_resets_and_the_next_failure_waits_30_s_again(pd, clock, monkeypatch):
+def test_a_crash_after_a_healthy_run_waits_30_s_and_the_ladder_goes_on(pd, clock, monkeypatch):
+    """Main's ruling after the D26 review: after a healthy run the app still waits 30 s after a crash, and a quick
+    second failure is followed by its 60 s."""
     runs = [{"lived": 4}, {"lived": 4}, {"lived": 4}, {"lived": 700, "healthy": True}, {"lived": 4}, {"lived": 4}]
     starts = _manager_loop(pd, clock, monkeypatch, runs)
     gaps = [b - a for a, b in zip(starts, starts[1:], strict=False)]
     tol = POLL_S + 1e-6
     assert gaps[0] == pytest.approx(30, abs=tol) and gaps[1] == pytest.approx(60, abs=tol)
     assert gaps[2] == pytest.approx(300, abs=tol)
-    assert gaps[3] == pytest.approx(700 + 2, abs=tol)  # the healthy run reset it: no wait before the next start
-    assert gaps[4] == pytest.approx(30, abs=tol)  # and the next failure is spaced 30 s again, not 600
+    assert gaps[3] == pytest.approx(700 + 2 + 30, abs=tol)  # healthy 700 s, crash, 2 s restart, then the first step
+    assert gaps[4] == pytest.approx(60, abs=tol)  # the quick failure of that start: the second step, not 600
+
+
+def test_a_clean_stop_after_a_healthy_run_means_no_wait_at_the_next_start(pd, clock, monkeypatch):
+    starts: list[float] = []
+
+    def run(persona_dir, **kw):
+        starts.append(clock.t)
+        mono = SimpleNamespace(t=0.0)
+        watch = start_backoff.SuccessWatch(persona_dir, _Server(True), clock=lambda: mono.t)
+        watch.poll_once()
+        mono.t += start_backoff.HEALTHY_RESET_S
+        watch.poll_once()
+        clock.t += 700
+        start_backoff.reset(persona_dir)  # the clean stop's _write_stopped
+        return 0
+
+    monkeypatch.setattr("brain.bridge.runner.run_bridge_foreground", run)
+    for _ in range(2):
+        daemon.cmd_run(_args("systemd"))
+    assert clock.slept == [] and len(starts) == 2
 
 
 def test_a_run_that_crashes_after_20_s_is_spaced_from_its_start(pd, clock, monkeypatch):

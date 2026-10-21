@@ -6,12 +6,17 @@ app's watchdog uses for the bridges it spawns (``app/src/hooks/useBridgeWatchdog
 for every later start, back to the start after success (D7). Only a service-origin ``nell supervisor run`` uses it; an
 app-spawned or terminal bridge is the app watchdog's or the person's.
 
-The record, ``bridge_start_backoff.json`` beside ``bridge.json`` (through ``json_io``): how many starts since the last
-success have not been proven, and when the last one began. A start counts as unproven until the bridge has run healthy
-for ``HEALTHY_RESET_S`` or has ended on a recorded stop, so every way a start can fail is counted, including the ones
-that run no code of ours (SIGKILL, out of memory, power loss). The next start waits until ``at`` plus the step for the
-count: a failing bridge is never started twice within a step. Explicit starts (``nell supervisor start``, the app,
-the service start and install paths) delete the record, which also ends a wait in progress.
+The record, ``bridge_start_backoff.json`` beside ``bridge.json`` (through ``json_io``): how many starts in this series
+have not ended cleanly, and when the last one began. The record exists from a start until the run ends on a recorded
+stop (the clean "stopped" end, any hard exit but a crash) or an explicit start deletes it (``nell supervisor start``,
+the app, the service start and install paths; that also ends a wait in progress). So every way a run can end badly
+leaves it, including the ones that run no code of ours (SIGKILL, out of memory, power loss), and the next service start
+waits: until ``at`` plus the step for the count (a failing bridge is never started twice within a step).
+
+After ``HEALTHY_RESET_S`` of healthy running (D7's success) the ladder starts over but the record STAYS, marked
+``after_healthy`` with a count of 1 (the healthy run is the series' first start): the app waits 30 s after any crash,
+even after a long healthy run, so the start that follows such a crash waits the whole first step from its own start (the
+recorded time says nothing about when the crash happened) and counts as the second start of the series.
 """
 
 from __future__ import annotations
@@ -45,6 +50,7 @@ class Record:
 
     unproven_starts: int = 0
     at: float = 0.0
+    after_healthy: bool = False  # the run stayed healthy for HEALTHY_RESET_S; `at` is then no anchor for the wait
 
 
 def _now() -> float:
@@ -75,7 +81,7 @@ def read(persona_dir: Path) -> Record:
     count, at = raw.get("unproven_starts"), raw.get("at")
     if not _valid_count(count) or isinstance(at, bool) or not isinstance(at, (int, float)) or not math.isfinite(at):
         return Record()
-    return Record(count, float(at))
+    return Record(count, float(at), raw.get("after_healthy") is True)
 
 
 def step_s(unproven_starts: int) -> int:
@@ -87,8 +93,11 @@ def step_s(unproven_starts: int) -> int:
 
 def remaining_wait_s(record: Record, now: float) -> float:
     """How much of the step is left at ``now``: 0 once it has passed, never more than the step (a wall clock that was
-    set backwards cannot make a wait longer than the ladder says)."""
+    set backwards cannot make a wait longer than the ladder says). After a healthy run the whole step: the recorded time
+    is the end of the healthy stretch's first start, no anchor for a crash that came later."""
     step = step_s(record.unproven_starts)
+    if record.after_healthy:
+        return float(step)
     return min(float(step), max(0.0, record.at + step - now))
 
 
@@ -102,8 +111,20 @@ def note_start(persona_dir: Path) -> None:
         logger.warning("start back-off: could not record this start; it will not be backed off", exc_info=True)
 
 
+def mark_healthy(persona_dir: Path) -> None:
+    """D7's success (healthy for ``HEALTHY_RESET_S``): the ladder starts over, but the record stays: a service start
+    that finds it knows the run did not end on a recorded stop (a crash, a kill) and waits the first step, as the app
+    does after any crash. The healthy run counts as the series' first start (count 1)."""
+    try:
+        write_json(
+            _path(persona_dir), {"unproven_starts": 1, "at": _now(), "after_healthy": True}, mode=0o600
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("start back-off: could not mark the run healthy", exc_info=True)
+
+
 def reset(persona_dir: Path) -> None:
-    """Success, a recorded stop or an explicit start: the next start does not wait."""
+    """A recorded stop or an explicit start: the next start does not wait."""
     try:
         _path(persona_dir).unlink(missing_ok=True)
     except OSError:
@@ -147,10 +168,11 @@ def wait_before_start(persona_dir: Path, *, interrupted: Callable[[], bool]) -> 
 
 
 class SuccessWatch:
-    """Deletes the record once the server has been started for ``HEALTHY_RESET_S`` (D7: healthy, then 600 s).
+    """Marks the run healthy (``mark_healthy``) once the server has been started for ``HEALTHY_RESET_S`` (D7: healthy,
+    then 600 s).
 
     ``poll_once`` is driven by its own thread (``start``), at ``shutdown.POLL_S``, until it has reset or ``stop`` is
-    called at the end of the run. A server that never started never resets."""
+    called at the end of the run. A server that never started never marks."""
 
     def __init__(self, persona_dir: Path, server: Any, *, clock: Callable[[], float] = time.monotonic) -> None:
         self.persona_dir = Path(persona_dir)
@@ -170,7 +192,7 @@ class SuccessWatch:
             self._started_at = self._clock()
             return
         if self._clock() - self._started_at >= HEALTHY_RESET_S:
-            reset(self.persona_dir)
+            mark_healthy(self.persona_dir)
             self._done = True
 
     def start(self) -> None:
