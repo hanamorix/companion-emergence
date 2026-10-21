@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import functools
 import os
+import subprocess
+import sys
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 
 import pytest
@@ -679,3 +682,43 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     ]:
         monkeypatch.delenv(key, raising=False)
     yield
+
+
+_WEDGED_HOLDER = """
+import sys
+sys.path.insert(0, {root!r})
+from pathlib import Path
+from brain.utils.file_lock import file_lock
+with file_lock(Path(sys.argv[1])):
+    print("READY", flush=True)
+    sys.stdin.read()
+"""
+
+
+@pytest.fixture
+def wedged_lock(repo_root: Path) -> Callable[[Path], AbstractContextManager[None]]:
+    """Hold ``file_lock(path)`` in ANOTHER process for the length of a ``with`` block (a wedged lock holder).
+
+    Used by the lock-timeout tests: the holder never releases until the block ends, so a bounded wait must give up
+    and a caller must not write.
+    """
+
+    @contextmanager
+    def _hold(path: Path) -> Iterator[None]:
+        code = _WEDGED_HOLDER.format(root=str(repo_root))
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code, str(path)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert proc.stdout is not None
+            assert proc.stdout.readline().strip() == "READY"
+            yield
+        finally:
+            if proc.stdin is not None:
+                proc.stdin.close()
+            proc.wait(timeout=20)
+
+    return _hold
