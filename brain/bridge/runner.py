@@ -19,7 +19,7 @@ from pathlib import Path
 
 import uvicorn
 
-from brain.bridge import state_file
+from brain.bridge import respawn_guard, start_backoff, state_file
 from brain.bridge.server import build_app
 from brain.bridge.shutdown import BridgeShutdownController
 
@@ -78,6 +78,7 @@ def _write_stopped(persona_dir: Path) -> None:
             logger.warning("bridge.json is not this bridge's record; the stopped mark was not written")
     except Exception:
         logger.warning("stopped-mark write failed", exc_info=True)
+    start_backoff.reset(persona_dir)  # D26 / D7: a recorded stop is a success: the next start does not wait
 
 
 def _after_run(persona_dir: Path, app: object, monitor: object) -> None:
@@ -88,7 +89,8 @@ def _after_run(persona_dir: Path, app: object, monitor: object) -> None:
     ("unknown") is not a request: it only means uvicorn ended for its own reasons. A run that ended with no stop asked
     for (a lifespan startup that raised, after which uvicorn's run() returns normally; a bind failure; an internal
     error) is a crash: the hard-exit path with reason "crash" (not clean, non-zero exit), so the app's crash watchdog
-    and the service managers restart it (#177 point 1).
+    and the service managers restart it (#177 point 1); a service run that keeps failing to start is spaced by the
+    start back-off (D26), not restarted at once.
 
     Otherwise "stopped" only when nothing is running: the task registry is sealed (or, when the lifespan never ran,
     empty and sealed now) and the supervisor thread has ended. Work still running is the hard-exit path at once.
@@ -255,6 +257,11 @@ def run_bridge_foreground(
         hard_exit=lambda reason: shutdown_mod.hard_exit(persona_dir, reason),
     )
     monitor.start()
+    # D26 / D7: a service-run start counts as failed until the server has stayed up 600 s (or a stop is recorded).
+    watch = None
+    if client_origin in respawn_guard.SERVICE_ORIGINS:
+        watch = start_backoff.SuccessWatch(persona_dir, server)
+        watch.start()
     rc = 0
     try:
         try:
@@ -264,6 +271,8 @@ def run_bridge_foreground(
         except SystemExit as exc:
             rc = exc.code if isinstance(exc.code, int) else 0
     finally:
+        if watch is not None:
+            watch.stop()
         _after_run(persona_dir, app, monitor)
     return rc
 

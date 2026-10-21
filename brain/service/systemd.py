@@ -171,6 +171,9 @@ def build_systemd_unit_text(
         "Type=simple\n"
         f'ExecStart="{nell_path}" supervisor run --persona "{persona}" '
         "--client-origin systemd --idle-shutdown 0\n"
+        # D26: a bridge that keeps failing to start spaces its own restarts (30 s up to 10 min,
+        # brain/bridge/start_backoff.py), so the default start limit (5 starts in 10 s) cannot trip and no
+        # StartLimit or RestartSteps setting is needed.
         "Restart=on-failure\n"
         "RestartSec=2\n"
         "TimeoutStopSec=300\n"
@@ -287,7 +290,8 @@ def install_service(
 ) -> Path:
     """Write the unit file, daemon-reload, then enable + start it.
 
-    #456: never behind a running bridge's back, and any stop intent is cleared first (``lifecycle.before_install``).
+    #456: never behind a running bridge's back, and any stop intent and start back-off record are cleared first
+    (``lifecycle.before_install``).
     """
     from brain.service import lifecycle
 
@@ -312,10 +316,10 @@ def install_service(
 
 def start_service(*, persona: str) -> subprocess.CompletedProcess[str]:
     """Start the installed unit (#456 D20: the start path for a persona whose service is installed). Any stop intent
-    is cleared first (D25)."""
+    and the start back-off record are cleared first (D25, D26)."""
     from brain.service import lifecycle
 
-    lifecycle.clear_stop_intent(persona)
+    lifecycle.note_explicit_start(persona)
     return run_systemctl(["start", service_unit_name(persona)])
 
 

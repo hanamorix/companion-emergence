@@ -34,7 +34,9 @@ against a real Windows session is pending validation by a Windows user.
 
 from __future__ import annotations
 
+import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -46,7 +48,16 @@ from brain.paths import get_log_dir, get_persona_dir
 from brain.service import UnsupportedPlatformError
 from brain.setup import validate_persona_name
 
+logger = logging.getLogger(__name__)
+
 TASK_PREFIX = "CompanionEmergence"
+
+# RestartOnFailure (D26): the bridge's own runner spaces the restarts of a bridge that keeps failing (30 s up to 10 min,
+# ``brain/bridge/start_backoff.py``), so the scheduler only has to keep restarting, as soon and as often as it allows:
+# the shortest interval it accepts (1 minute) and the largest count (255); MS-TSCH gives Count as 1 to 255 and has no
+# "unlimited". After 255 failed restarts in a row it stops until the next logon or an explicit start.
+RESTART_INTERVAL = "PT1M"
+RESTART_COUNT = 255
 DEFAULT_WINDOWS_PATH = (
     "%LOCALAPPDATA%\\Programs\\claude;%USERPROFILE%\\.local\\bin;C:\\Windows\\System32;C:\\Windows"
 )
@@ -279,9 +290,10 @@ def build_task_xml(
         principal (#260); ``user_id`` overrides the environment-derived account,
         and the node is omitted when neither resolves.
       * ``<RegistrationInfo><Author>`` — for diagnostic tracing.
-      * ``<Settings><RestartOnFailure>`` — restart on crash with a
-        2-minute interval, up to 3 times (matches launchd KeepAlive
-        + systemd Restart=on-failure).
+      * ``<Settings><RestartOnFailure>`` — restart on crash every minute,
+        up to 255 times (the scheduler's limits, ``RESTART_INTERVAL`` and
+        ``RESTART_COUNT``); the bridge itself spaces repeated start failures
+        (matches launchd KeepAlive + systemd Restart=on-failure).
       * ``<Actions><Exec>`` — supervisor entry point; for bundled Windows
         installs uses ``pythonw.exe`` (windowless) instead of ``nell.bat``
         (which would open a cmd.exe console at logon).
@@ -366,8 +378,8 @@ def build_task_xml(
         "    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n"
         "    <Priority>7</Priority>\n"
         "    <RestartOnFailure>\n"
-        "      <Interval>PT2M</Interval>\n"
-        "      <Count>3</Count>\n"
+        f"      <Interval>{RESTART_INTERVAL}</Interval>\n"
+        f"      <Count>{RESTART_COUNT}</Count>\n"
         "    </RestartOnFailure>\n"
         "  </Settings>\n"
         '  <Actions Context="Author">\n'
@@ -445,7 +457,8 @@ def install_service(
     """Write the task XML, then ``schtasks /Create /XML``.
 
     Idempotent: if the task already exists, ``/F`` overwrites it. #456: never behind a running bridge's back, and
-    any stop intent is cleared first (``lifecycle.before_install``).
+    any stop intent and start back-off record are cleared first
+    (``lifecycle.before_install``).
     """
     from brain.service import lifecycle
 
@@ -465,11 +478,59 @@ def install_service(
     return xml_path
 
 
+_RESTART_BLOCK = re.compile(
+    r"(<RestartOnFailure>\s*<Interval>)([^<]*)(</Interval>\s*<Count>)([^<]*)(</Count>)"
+)
+
+
+def refresh_installed_task(persona: str) -> bool:
+    """Raise the restart settings of OUR already-installed task for ``persona`` (D26, the D14 pattern).
+
+    Reads the registered XML (``schtasks /Query /XML``); a task whose command is not the one this module writes is left
+    alone; when ``RestartOnFailure`` is not ``RESTART_INTERVAL`` / ``RESTART_COUNT``, only those two values change and the
+    task is registered again with ``/Create /XML /F`` (the cached XML is rewritten too). One INFO line; idempotent;
+    a failure is a WARNING and returns False. Microsoft documents that editing a task leaves a running instance alone
+    for ``Set-ScheduledTask``; for this call that is an inference, not yet checked on Windows. Returns True when the
+    task was changed."""
+    name = task_name(persona)
+    queried = run_schtasks(["/Query", "/TN", name, "/XML"])
+    if queried.returncode != 0:
+        return False
+    xml = queried.stdout or ""
+    ours = re.search(
+        rf"<Arguments>[^<]*supervisor run --persona (?:&quot;|\")?{re.escape(persona)}(?:&quot;|\")?[^<]*</Arguments>", xml
+    )
+    block = _RESTART_BLOCK.search(xml)
+    if ours is None or block is None or (block.group(2), block.group(4)) == (RESTART_INTERVAL, str(RESTART_COUNT)):
+        return False
+    new_xml = (
+        xml[: block.start()]
+        + f"{block.group(1)}{RESTART_INTERVAL}{block.group(3)}{RESTART_COUNT}{block.group(5)}"
+        + xml[block.end() :]
+    )
+    xml_path = paths_for_persona(persona).xml_path
+    try:
+        xml_path.parent.mkdir(parents=True, exist_ok=True)
+        save_with_backup_text(xml_path, new_xml, keep_backups=False, encoding="utf-16")  # atomic (#484)
+    except OSError:
+        logger.warning("task scheduler task not refreshed: could not write %s", xml_path, exc_info=True)
+        return False
+    created = run_schtasks(["/Create", "/XML", str(xml_path), "/TN", name, "/F"])
+    if created.returncode != 0:
+        logger.warning("task scheduler task not refreshed: %s", _format_schtasks_error("/Create", created))
+        return False
+    logger.info(
+        "task scheduler task refreshed: restart every %s up to %s times (was every %s, %s times)",
+        RESTART_INTERVAL, RESTART_COUNT, block.group(2), block.group(4),
+    )
+    return True
+
+
 def start_service(*, persona: str) -> subprocess.CompletedProcess[str]:
-    """Run the installed task (#456 D20). Any stop intent is cleared first (D25)."""
+    """Run the installed task (#456 D20). Any stop intent and start back-off record are cleared first (D25, D26)."""
     from brain.service import lifecycle
 
-    lifecycle.clear_stop_intent(persona)
+    lifecycle.note_explicit_start(persona)
     return run_schtasks(["/Run", "/TN", task_name(persona)])
 
 

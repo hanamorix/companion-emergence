@@ -38,7 +38,7 @@ REASON_HARD_EXIT = "hard_exit"
 # A run that ended with no stop asked for (no request, no signal): work still running at the end (review S7), or a
 # lifespan startup that raised, a bind failure or a uvicorn-internal end with nothing running (pre-merge review O-1).
 # A crash: not clean, exit 1, so the app's crash watchdog and the service managers restart it (a deliberate hard exit
-# is never restarted).
+# is never restarted; a service run that keeps failing to start waits out the start back-off first, D26).
 REASON_CRASH = "crash"
 REASON_UNKNOWN = "unknown"
 
@@ -353,6 +353,14 @@ def hard_exit(persona_dir: Path | None, reason: str = REASON_HARD_EXIT) -> None:
         from brain.bridge import shutdown_progress
 
         shutdown_progress.abandoning.set()
+        if persona_dir is not None and reason != REASON_CRASH:
+            # D26 / D7: a recorded stop (every hard exit but a crash) is a success for the start back-off.
+            try:
+                from brain.bridge import start_backoff
+
+                start_backoff.reset(persona_dir)
+            except BaseException:  # noqa: BLE001 - never delays the exit
+                pass
         if persona_dir is not None:
             try:
                 from brain.bridge import state_file

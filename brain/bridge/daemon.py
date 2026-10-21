@@ -374,6 +374,11 @@ def cmd_start(args, *, out: dict | None = None) -> int:
     from brain.bridge import shutdown_progress
 
     shutdown_progress.delete_record(persona_dir, shutdown_progress.INTENT_FILENAME)
+    # D26: an explicit start does not wait and starts the start back-off over (a service run already waiting ends its
+    # wait at once, and the service run this start causes is the first of a new series).
+    from brain.bridge import start_backoff
+
+    start_backoff.reset(persona_dir)
 
     log_path = get_log_dir() / f"bridge-{persona_dir.name}.log"
     idle = float(args.idle_shutdown) * 60 if args.idle_shutdown > 0 else None
@@ -525,6 +530,10 @@ def cmd_run(args) -> int:
     running bridge does not start when that bridge ended on a plain ``nell
     supervisor stop`` (see ``_ended_on_a_requested_stop``); after a restart's
     stop, a hard exit, an idle stop, an OS signal or a crash it starts.
+
+    A service run that follows starts which never proved themselves first waits out the next step of the start
+    back-off (``start_backoff``, D26), before the lock and without holding anything; a start it makes is noted under
+    the lock, right before the bridge runs.
     """
     from brain.paths import get_persona_dir
 
@@ -533,7 +542,7 @@ def cmd_run(args) -> int:
         print(f"persona directory not found: {persona_dir}", file=sys.stderr)
         return 1
 
-    from brain.bridge import respawn_guard
+    from brain.bridge import respawn_guard, start_backoff
 
     client_origin = getattr(args, "client_origin", "cli")
     guarded = client_origin in respawn_guard.SERVICE_ORIGINS
@@ -543,6 +552,20 @@ def cmd_run(args) -> int:
         print("not starting: stopped on request", file=sys.stderr)
         logger.info("not starting: stopped on request (user kill of this boot)")
         return 0
+    if guarded:
+        # D26: spaced restarts of a bridge that keeps failing to start. Before the lock (nothing held, no watcher file
+        # written, so every other command sees no bridge and no starter) and interruptible: an explicit start deletes
+        # the record, a user kill fires the guard. SIGTERM and Task Scheduler's end act at once (no handler yet).
+        try:
+            go_on = start_backoff.wait_before_start(
+                persona_dir, interrupted=lambda: respawn_guard.guard_fires(persona_dir)
+            )
+        except KeyboardInterrupt:
+            return 0
+        if not go_on:
+            print("not starting: stopped on request", file=sys.stderr)
+            logger.info("not starting: stopped on request (user kill of this boot)")
+            return 0
 
     # D4 (#177 S3): an OS service must not exit 2 here (systemd / launchd / Task Scheduler read it as a failure and
     # respawn forever). Whether a live bridge or a starter holds the lock, wait for it, then run.
@@ -586,9 +609,19 @@ def cmd_run(args) -> int:
                 truncate_launchd_logs_if_large(args.persona)
             except Exception:
                 logger.debug("launchd log truncation skipped", exc_info=True)
+        if client_origin == "task-scheduler":
+            try:
+                from brain.service.windows_service import refresh_installed_task
+
+                refresh_installed_task(args.persona)
+            except Exception:  # noqa: BLE001 - best effort; the task keeps working with its old restart count
+                logger.warning("task scheduler task refresh failed", exc_info=True)
 
         # #456 (D12): no synchronous recovery; the first idle pass saves the sessions (see cmd_start).
         from brain.bridge.runner import run_bridge_foreground
+
+        if guarded:
+            start_backoff.note_start(persona_dir)  # D26: unproven until the bridge has stayed up (SuccessWatch)
 
         idle = float(args.idle_shutdown) * 60 if args.idle_shutdown > 0 else None
         return run_bridge_foreground(
