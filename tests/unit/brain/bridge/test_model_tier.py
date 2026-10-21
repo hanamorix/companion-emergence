@@ -57,7 +57,7 @@ _EXPECTED_JOBS = {
     TIER_BACKGROUND_HOUSEKEEPING: ("model.background_housekeeping", "haiku"),
     TIER_COMPACTION: ("model.compaction", "haiku"),
     TIER_SELF_MODEL_ARTICULATE: ("model.self_model_articulate", "haiku"),
-    TIER_ATTUNEMENT_DETECTOR: ("model.attunement_detector", "claude-haiku-4-5-20251001"),
+    TIER_ATTUNEMENT_DETECTOR: ("model.attunement_detector", "claude-haiku-4-5"),
 }
 
 
@@ -239,8 +239,13 @@ def test_local_tiers_are_repointable_in_this_module_only(monkeypatch) -> None:
     assert model_for_tier(TIER_BACKGROUND_CLASSIFIER) == "haiku"
 
 
-def test_the_detector_keeps_its_pinned_snapshot_not_an_alias() -> None:
-    assert model_for_tier(TIER_ATTUNEMENT_DETECTOR) == "claude-haiku-4-5-20251001"
+def test_the_detector_stays_on_haiku_4_5_by_its_dateless_id_not_the_haiku_alias() -> None:
+    """Owner ruling 2026-10-21: the dateless id (the CLI accepts it and it follows the newest 4.5 snapshot) replaces the
+    dated snapshot id; the `haiku` alias would move the detector off 4.5 when a newer Haiku ships."""
+    from brain.bridge.model_tier import is_valid_model
+
+    assert model_for_tier(TIER_ATTUNEMENT_DETECTOR) == "claude-haiku-4-5"
+    assert is_valid_model("claude-haiku-4-5")
 
 
 # ---------------------------------------------------------------------------

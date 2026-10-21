@@ -61,7 +61,7 @@ G1_ALLOW: tuple[tuple[str, str, str], ...] = (
     # the job table is the DEFINITION of the code defaults, not a copy of them
     ("bridge/model_tier.py", "claude-sonnet-5", "register_default"),
     ("bridge/model_tier.py", "haiku", "register_default"),
-    ("bridge/model_tier.py", "claude-haiku-4-5-20251001", "register_default"),
+    ("bridge/model_tier.py", "claude-haiku-4-5", "register_default"),
     ("bridge/model_tier.py", "claude-opus-5", "opus_choice"),
     # the model grammar's three alias words
     ("bridge/model_tier.py", "sonnet", "known_models"),

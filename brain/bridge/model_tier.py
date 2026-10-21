@@ -101,7 +101,7 @@ _CLAUDE_JOBS: dict[str, tuple[str, str]] = {
     TIER_BACKGROUND_HOUSEKEEPING: ("model.background_housekeeping", tunables.register("model.background_housekeeping", "haiku")),  # background upkeep that never speaks to the user: closing sessions, interest sweeps, finalize ticks, initiate reviews, daemon snapshots, draft fragments
     TIER_COMPACTION: ("model.compaction", tunables.register("model.compaction", "haiku")),  # summarising old chat history into a short digest when a session is rolled over
     TIER_SELF_MODEL_ARTICULATE: ("model.self_model_articulate", tunables.register("model.self_model_articulate", "haiku")),  # putting the kindled's measured self-model into plain sentences
-    TIER_ATTUNEMENT_DETECTOR: ("model.attunement_detector", tunables.register("model.attunement_detector", "claude-haiku-4-5-20251001")),  # reading recent turns for the user's current state and recurring patterns (the attunement detector); a pinned snapshot id so an alias bump cannot silently change it
+    TIER_ATTUNEMENT_DETECTOR: ("model.attunement_detector", tunables.register("model.attunement_detector", "claude-haiku-4-5")),  # reading recent turns for the user's current state and recurring patterns (the attunement detector); stays on Haiku 4.5 (not the haiku alias, which moves to newer Haiku generations); the dateless id follows the newest 4.5 snapshot
 }
 CLAUDE_TIERS: tuple[str, ...] = tuple(_CLAUDE_JOBS)
 

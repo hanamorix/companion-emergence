@@ -194,7 +194,7 @@ def test_show_lists_each_job_with_default_or_setting(capsys) -> None:
     assert "interactive-chat: claude-opus-5 (your setting)" in out
     assert "compaction: claude-haiku-4-5 (your setting)" in out
     assert "background-generative: claude-sonnet-5 (shipped default)" in out
-    assert "attunement-detector: claude-haiku-4-5-20251001 (shipped default)" in out
+    assert "attunement-detector: claude-haiku-4-5 (shipped default)" in out
     assert "runtime fallbacks appear in the app" in out
     assert "every persona on this install" in out
 

@@ -46,19 +46,21 @@ _DEFAULTS = {
     TIER_BACKGROUND_HOUSEKEEPING: "haiku",
     TIER_COMPACTION: "haiku",
     TIER_SELF_MODEL_ARTICULATE: "haiku",
-    TIER_ATTUNEMENT_DETECTOR: "claude-haiku-4-5-20251001",
+    TIER_ATTUNEMENT_DETECTOR: "claude-haiku-4-5",
 }
 
 # `--model` values captured on origin/main (4d5a9381) with the same capture (a fake `claude` answering a clean frame),
-# recorded once for C27: the four Haiku jobs and the detector must run exactly what they ran there. The chat and
+# recorded once for C27: the four Haiku jobs must run exactly what they ran there (the detector: see below). The chat and
 # background-generative jobs ran the alias "sonnet" there and run the pinned Sonnet id now (D1, on purpose).
 _ORIGIN_MAIN_UNCHANGED = {
     TIER_BACKGROUND_CLASSIFIER: "haiku",
     TIER_BACKGROUND_HOUSEKEEPING: "haiku",
     TIER_COMPACTION: "haiku",
     TIER_SELF_MODEL_ARTICULATE: "haiku",
-    TIER_ATTUNEMENT_DETECTOR: "claude-haiku-4-5-20251001",
 }
+# The detector ran the dated snapshot id there; the owner replaced it with the dateless `claude-haiku-4-5` (2026-10-21,
+# C27 amended): still Haiku 4.5, a different spelling, on purpose.
+_ORIGIN_MAIN_DETECTOR = "claude-haiku-4-5-20251001"
 
 _KEYS = {tier: "model." + tier.replace("-", "_") for tier in CLAUDE_TIERS}
 
@@ -135,8 +137,16 @@ def test_the_save_time_probe_pins_the_id_it_checks(capture_claude_argv) -> None:
     assert capture_claude_argv.last_model == "claude-opus-9"
 
 
-def test_haiku_jobs_and_the_detector_run_what_they_ran_on_origin_main(persona_dir, capture_claude_argv) -> None:
-    """C27: argv equality with the recorded origin/main capture, for every path that builds argv."""
+def test_the_detector_runs_the_dateless_haiku_4_5_id_not_the_origin_main_snapshot(
+    persona_dir, capture_claude_argv
+) -> None:
+    for path in _PATHS:
+        _call(ClaudeCliProvider(TIER_ATTUNEMENT_DETECTOR), path, persona_dir)
+        assert capture_claude_argv.last_model == "claude-haiku-4-5" != _ORIGIN_MAIN_DETECTOR, path
+
+
+def test_haiku_jobs_run_what_they_ran_on_origin_main(persona_dir, capture_claude_argv) -> None:
+    """C27: argv equality with the recorded origin/main capture (the four Haiku jobs), for every path that builds argv."""
     for tier, was in _ORIGIN_MAIN_UNCHANGED.items():
         for path in _PATHS:
             _call(ClaudeCliProvider(tier), path, persona_dir)
