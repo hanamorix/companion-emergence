@@ -3227,8 +3227,9 @@ def _build_parser() -> argparse.ArgumentParser:
     s_stop.add_argument(
         "--kill",
         action="store_true",
-        help="end the bridge and every process it started at once (identity-checked; the next start picks up anything "
-        "left unfinished)",
+        help="end the bridge and every process it started without waiting for running work (identity-checked; a "
+        "bridge run by an OS service is first asked to hard-exit and given up to --timeout seconds before its service "
+        "manager stops it; the next start picks up anything left unfinished)",
     )
     s_stop.add_argument(
         "--skip-hard-exit-request",

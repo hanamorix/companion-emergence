@@ -346,7 +346,7 @@ def kill_bridge(
         _remember(_children(bridge))
         _hook("after_enumeration")
 
-        # Steps 4-5: service ownership and the graceful service path.
+        # Steps 4-5: service ownership; an owned bridge gets the hard-exit request, then the manager's stop.
         if service_installed(persona) and owned_by_service(persona, st.pid, st.client_origin):
             if not legacy and not skip_hard_exit_request:
                 shutdown_progress.write_record(
