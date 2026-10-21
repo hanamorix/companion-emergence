@@ -216,14 +216,14 @@ def clean_workdir(tmp_path: Path, monkeypatch) -> str:
 def test_generate_spawns_in_neutral_cwd(clean_workdir):
     run = MagicMock(return_value=_ok_run())
     with patch("subprocess.run", run):
-        ClaudeCliProvider(model="haiku").generate("x")
+        ClaudeCliProvider(probe_model="haiku").generate("x")
     assert run.call_args.kwargs["cwd"] == clean_workdir
 
 
 def test_chat_spawns_in_neutral_cwd(clean_workdir):
     run = MagicMock(return_value=_ok_run())
     with patch("subprocess.run", run):
-        ClaudeCliProvider(model="sonnet").chat(MSGS)
+        ClaudeCliProvider(probe_model="sonnet").chat(MSGS)
     assert run.call_args.kwargs["cwd"] == clean_workdir
 
 
@@ -231,7 +231,7 @@ def test_chat_stream_spawns_in_neutral_cwd(clean_workdir):
     fake = _FakePopen([json.dumps({"type": "result", "is_error": False, "result": "hello"}) + "\n"])
     popen = MagicMock(return_value=fake)
     with patch("subprocess.Popen", popen):
-        list(ClaudeCliProvider(model="sonnet").chat_stream(MSGS))
+        list(ClaudeCliProvider(probe_model="sonnet").chat_stream(MSGS))
     assert popen.call_args.kwargs["cwd"] == clean_workdir
 
 
@@ -239,7 +239,7 @@ def test_mcp_tools_path_spawns_in_neutral_cwd(clean_workdir, tmp_path: Path):
     run = MagicMock(return_value=_ok_run())
     tools = [{"name": "noop", "description": "d", "parameters": {"type": "object", "properties": {}}}]
     with patch("subprocess.run", run):
-        ClaudeCliProvider(model="sonnet").chat(MSGS, tools=tools, options={"persona_dir": str(tmp_path)})
+        ClaudeCliProvider(probe_model="sonnet").chat(MSGS, tools=tools, options={"persona_dir": str(tmp_path)})
     assert run.call_args.kwargs["cwd"] == clean_workdir
 
 
@@ -252,5 +252,5 @@ def test_spawn_without_neutral_dir_keeps_status_quo(tmp_path: Path, monkeypatch)
     monkeypatch.setenv("KINDLED_HOME", str(home))
     run = MagicMock(return_value=_ok_run())
     with patch("subprocess.run", run):
-        ClaudeCliProvider(model="haiku").generate("x")
+        ClaudeCliProvider(probe_model="haiku").generate("x")
     assert run.call_args.kwargs.get("cwd") is None

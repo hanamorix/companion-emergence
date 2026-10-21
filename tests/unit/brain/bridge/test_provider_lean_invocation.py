@@ -90,7 +90,7 @@ def _capture_argv(site: str, tmp_path) -> list[str]:
     from brain.bridge.chat import ChatMessage
     from brain.bridge.provider import ClaudeCliProvider
 
-    provider = ClaudeCliProvider(model="haiku", timeout_seconds=30)
+    provider = ClaudeCliProvider(probe_model="haiku", timeout_seconds=30)
     msgs = [ChatMessage(role="user", content="hi")]
     persona = tmp_path / "persona"
     persona.mkdir(exist_ok=True)
@@ -352,7 +352,7 @@ def _failing_generate(stdout: str, stderr: str) -> None:
     done = subprocess.CompletedProcess(args=[], returncode=1, stdout=stdout, stderr=stderr)
     with patch("brain.bridge.provider.subprocess.run", return_value=done):
         with pytest.raises(RuntimeError, match="exit 1"):
-            ClaudeCliProvider(model="haiku", timeout_seconds=30).generate("hi")
+            ClaudeCliProvider(probe_model="haiku", timeout_seconds=30).generate("hi")
 
 
 def _failing_stream(stdout_lines: list[str], stderr: str, tmp_path) -> None:
@@ -367,7 +367,7 @@ def _failing_stream(stdout_lines: list[str], stderr: str, tmp_path) -> None:
     proc.stderr = io.StringIO(stderr)
     with patch("brain.bridge.provider.subprocess.Popen", return_value=proc):
         list(
-            ClaudeCliProvider(model="haiku", timeout_seconds=30).chat_stream(
+            ClaudeCliProvider(probe_model="haiku", timeout_seconds=30).chat_stream(
                 [ChatMessage(role="user", content="hi")],
                 tools=None,
                 options={"persona_dir": str(tmp_path)},

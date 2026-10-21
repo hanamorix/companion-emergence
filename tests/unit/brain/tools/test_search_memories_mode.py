@@ -126,7 +126,7 @@ def _patch_provider(monkeypatch: pytest.MonkeyPatch, vectors: dict[str, np.ndarr
     # stamped on the rows; otherwise the first matrix read reloads from disk
     # filtered to the real production model id, finds nothing, and silently
     # discards the seeded vectors.
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, _SCRIPTED_MODEL_ID)
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, _SCRIPTED_MODEL_ID)
 
 
 def _patch_reranker(monkeypatch: pytest.MonkeyPatch, scores: dict[str, float]) -> None:
@@ -387,7 +387,7 @@ def test_semantic_falls_back_to_lexical_when_query_embed_raises(
     # `_patch_provider`'s docstring for why (this test scripts its own
     # provider directly rather than going through `_patch_provider`, so it
     # must do the alignment itself).
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, _SCRIPTED_MODEL_ID)
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, _SCRIPTED_MODEL_ID)
 
     class _BoomProvider(_ScriptedProvider):
         def embed(self, text: str) -> np.ndarray:

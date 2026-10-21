@@ -295,14 +295,14 @@ def test_build_embedding_provider_resolves_model_id_from_model_tier(
 def test_build_embedding_provider_repointed_by_reassigning_model_tier_constant(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """N-model-extensible: repointing MODEL_EMBEDDING (or TIER_MODEL's
+    """N-model-extensible: repointing MODEL_EMBEDDING (or LOCAL_MODEL_IDS's
     embedding entry) is a model_tier.py-only edit — build_embedding_provider
     picks it up with no change to embeddings.py itself."""
     from brain.bridge import model_tier
 
     monkeypatch.setattr("fastembed.TextEmbedding", _StubTextEmbedding)
     monkeypatch.setattr("brain.paths.get_cache_dir", lambda: tmp_path)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, "some/other-model")
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, "some/other-model")
 
     provider = build_embedding_provider()
     assert provider.model_id() == "some/other-model"
@@ -354,7 +354,7 @@ def test_build_embedding_provider_cache_is_keyed_by_model_id(
     monkeypatch.setattr("brain.paths.get_cache_dir", lambda: tmp_path)
 
     first = build_embedding_provider()
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, "some/other-model")
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, "some/other-model")
     second = build_embedding_provider()
 
     assert first is not second

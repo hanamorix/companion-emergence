@@ -185,7 +185,7 @@ def test_embeddings_adapter_reads_the_warm_matrix(
 
     from brain.bridge import model_tier
 
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, "test-model")
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, "test-model")
 
     captured: dict[str, object] = {}
 

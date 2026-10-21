@@ -281,7 +281,7 @@ def test_run_tool_loop_keeps_the_invocations_of_an_over_budget_turn(tmp_path):
         with patch("brain.bridge.provider.subprocess.run", side_effect=_run):
             response, invocations = run_tool_loop(
                 [ChatMessage(role="system", content="SYS"), ChatMessage(role="user", content="hi")],
-                provider=ClaudeCliProvider(model="haiku", timeout_seconds=60),
+                provider=ClaudeCliProvider(probe_model="haiku", timeout_seconds=60),
                 tools=build_tools_list(),
                 store=store,
                 hebbian=hebbian,

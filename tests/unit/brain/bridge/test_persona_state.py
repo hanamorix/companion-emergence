@@ -237,9 +237,8 @@ def test_build_persona_state_does_not_raise_on_corrupt_dbs(tmp_path: Path) -> No
 
 
 def test_build_persona_state_connection_block(tmp_path: Path) -> None:
-    """Connection block reads provider from persona_config and model from
-    the provider→default-model map. last_heartbeat_at comes from
-    heartbeat_state.json."""
+    """Connection block reads provider from persona_config and the model from the chat job's tunables line
+    (the id it runs now, plus the picker word it means). last_heartbeat_at comes from heartbeat_state.json."""
     from brain.persona_config import PersonaConfig
 
     persona_dir = tmp_path / "nell"
@@ -252,7 +251,7 @@ def test_build_persona_state_connection_block(tmp_path: Path) -> None:
     state = build_persona_state(persona_dir)
     conn = state["connection"]
     assert conn["provider"] == "claude-cli"
-    assert conn["model"] == "sonnet"
+    assert conn["model"] == "claude-sonnet-5" and conn["model_choice"] == "sonnet"
     assert conn["last_heartbeat_at"] == "2026-05-06T13:00:00Z"
 
 
@@ -266,7 +265,7 @@ def test_build_persona_state_connection_block_missing_files_safe(tmp_path: Path)
     # PersonaConfig.load returns defaults when missing; provider is the
     # default ("claude-cli" per DEFAULT_PROVIDER).
     assert conn["provider"] == "claude-cli"  # default
-    assert conn["model"] == "sonnet"
+    assert conn["model"] == "claude-sonnet-5"
     assert conn["last_heartbeat_at"] is None
 
 

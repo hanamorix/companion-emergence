@@ -56,7 +56,7 @@ def _pin_tier_id(monkeypatch: pytest.MonkeyPatch, model_id: str) -> None:
     the test provider's id."""
     from brain.bridge import model_tier
 
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, model_id)
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, model_id)
 
 
 def test_embed_backfill_embeds_every_row_and_prints_summary(

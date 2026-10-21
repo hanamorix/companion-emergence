@@ -709,12 +709,12 @@ def test_build_embedding_matrix_model_id_comes_from_model_tier(
     """Model id is sourced from `model_tier.model_for_tier(TIER_EMBEDDING)`
     (I7 — model ids live in model_tier.py, never hardcoded) — looked up
     through the `model_tier` MODULE so a test monkeypatching
-    `model_tier.TIER_MODEL` is honored, mirroring
+    `model_tier.LOCAL_MODEL_IDS` is honored, mirroring
     `build_embedding_provider`'s own dynamic `model_for_tier` lookup."""
     from brain.bridge import model_tier
     from brain.memory.embedding_matrix import build_embedding_matrix
 
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, "a-test-model-id")
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, "a-test-model-id")
     matrix = build_embedding_matrix(seeded_db)
     assert matrix.model_id == "a-test-model-id"
 

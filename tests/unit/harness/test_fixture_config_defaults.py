@@ -20,7 +20,6 @@ from pathlib import Path
 import pytest
 
 from tests.harness import (
-    DEFAULT_MODELS,
     PERSONA_NAME,
     SYNTHETIC_USER,
     PersonaSpec,
@@ -39,7 +38,6 @@ _DEFAULT_CONFIG_KEYS = frozenset(
         "searcher",
         "mcp_audit_log_level",
         "user_name",
-        "model",
         "last_opened_at",
         "user_pronouns",
         "notes_enabled",
@@ -87,7 +85,6 @@ def test_default_config_byte_identical(
         "searcher": "ddgs",
         "mcp_audit_log_level": "redacted",
         "user_name": SYNTHETIC_USER,
-        "model": DEFAULT_MODELS.canary,
         "last_opened_at": None,
         "user_pronouns": None,
         "notes_enabled": False,

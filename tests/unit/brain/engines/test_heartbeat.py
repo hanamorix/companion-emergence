@@ -2287,12 +2287,12 @@ def test_emotion_spike_draft_compose_resolves_haiku_via_the_tier_accessor(
 ) -> None:
     """C6/C7 oracle for the OTHER newly-decided Haiku tier (#154): the
     emotion-spike draft-compose call must run on Haiku, not whatever model the
-    persona's own persona_config.json specifies for its Sonnet tiers.
+    the chat model's own tunables line says for the Sonnet tiers.
 
     Oracle: monkeypatches ClaudeCliProvider.generate to return a model-
     conditional marker (raises for any model other than "haiku"), against a
-    REAL persona_config.json pinning provider="claude-cli", model="sonnet" —
-    so it fails against the pre-#154-completion source (self.provider, i.e.
+    REAL persona_config.json pinning provider="claude-cli" and a chat model
+    line set to Opus — so it fails against the pre-#154-completion source (self.provider, i.e.
     whatever ambient model the engine holds) and passes only once the
     emotion-spike path routes through build_tier_provider(...,
     TIER_BACKGROUND_HOUSEKEEPING). Restores the real build_tier_provider for
@@ -2306,17 +2306,18 @@ def test_emotion_spike_draft_compose_resolves_haiku_via_the_tier_accessor(
     monkeypatch.setattr("brain.engines.heartbeat.build_tier_provider", _real_build_tier_provider)
 
     def _model_conditional_generate(self, prompt, *, system=None):
-        if self._model != "haiku":
-            raise AssertionError(f"expected haiku, draft-compose ran on {self._model!r}")
+        if self._cli_model() != "haiku":
+            raise AssertionError(f"expected haiku, draft-compose ran on {self._cli_model()!r}")
         return "a quiet fragment"
 
     monkeypatch.setattr(ClaudeCliProvider, "generate", _model_conditional_generate)
 
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    (persona_dir / "persona_config.json").write_text(
-        '{"provider": "claude-cli", "model": "sonnet"}'
-    )
+    (persona_dir / "persona_config.json").write_text('{"provider": "claude-cli"}')
+    from brain.bridge.model_tier import TIER_INTERACTIVE_CHAT, set_job_models
+
+    set_job_models({TIER_INTERACTIVE_CHAT: "opus"})  # the chat model is NOT what the housekeeping job runs
     store = MemoryStore(persona_dir / "memories.db")
     hm = HebbianMatrix(":memory:")
     engine = HeartbeatEngine(

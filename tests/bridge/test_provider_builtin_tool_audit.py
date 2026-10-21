@@ -82,7 +82,7 @@ def _rows(persona_dir: Path) -> list[dict]:
 
 
 def _stream(persona_dir: Path | None, stdout, *, tools=_TOOLS, exit_code: int = 0) -> list:
-    provider = ClaudeCliProvider(model="haiku", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="haiku", timeout_seconds=60)
     options = {"persona_dir": str(persona_dir)} if persona_dir is not None else None
     with patch(
         "brain.bridge.provider.subprocess.Popen",
@@ -121,7 +121,7 @@ def test_web_search_and_fetch_each_logged_once(tmp_path, tools):
 def _via_proxy(persona_dir: Path, stdout, *, exit_code: int = 0) -> ChatResponse:
     """Drive the real `_StreamingProxy.chat` (the live WS path and the real
     audit reader) over the real provider."""
-    provider = ClaudeCliProvider(model="haiku", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="haiku", timeout_seconds=60)
     loop = asyncio.new_event_loop()
 
     async def _go() -> ChatResponse:
@@ -323,7 +323,7 @@ def test_rows_on_disk_before_provider_error_propagates(tmp_path):
 
 
 def _run_direct(persona_dir: Path | None, frames: list[dict]) -> list:
-    provider = ClaudeCliProvider(model="haiku", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="haiku", timeout_seconds=60)
     with patch(
         "brain.bridge.provider.subprocess.Popen",
         return_value=_fake_popen(iter(_lines(frames))),
@@ -464,7 +464,7 @@ _EXPECTED_STDIN = "hi\n\nVS"
 def _capture_argv_and_stdin(tmp_path, monkeypatch) -> tuple[list[str], str]:
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path / "home"))
     persona_dir = _persona(tmp_path)
-    provider = ClaudeCliProvider(model="haiku", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="haiku", timeout_seconds=60)
     proc = _fake_popen(iter(_lines(_frames()[-1:])))
     with patch("brain.bridge.provider.subprocess.Popen", return_value=proc) as popen:
         list(
@@ -529,7 +529,7 @@ def _blocking(
     """Drive the real `ClaudeCliProvider.chat(tools=...)` with `subprocess.run`
     stubbed. Returns (response, run_mock); callers assert the mock was called.
     `during(cmd)` runs inside the stub, i.e. while the "subprocess" is alive."""
-    provider = ClaudeCliProvider(model="haiku", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="haiku", timeout_seconds=60)
     completed = subprocess.CompletedProcess(["claude"], returncode, stdout, stderr)
 
     def _run(cmd, **kwargs):
@@ -889,7 +889,7 @@ def _plain_json_failure() -> str:
 def test_generate_plain_json_failure_detail_and_auth_state_unchanged():
     from brain.bridge import provider_auth
 
-    provider = ClaudeCliProvider(model="haiku", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="haiku", timeout_seconds=60)
     failed = subprocess.CompletedProcess(["claude"], 1, _plain_json_failure(), "")
     with patch("brain.bridge.provider.subprocess.run", return_value=failed) as run:
         with pytest.raises(RuntimeError) as excinfo:  # generate() raises RuntimeError
@@ -903,7 +903,7 @@ def test_generate_plain_json_failure_detail_and_auth_state_unchanged():
 def test_tools_less_chat_plain_json_failure_detail_and_auth_state_unchanged(tmp_path):
     from brain.bridge import provider_auth
 
-    provider = ClaudeCliProvider(model="haiku", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="haiku", timeout_seconds=60)
     failed = subprocess.CompletedProcess(["claude"], 1, _plain_json_failure(), "")
     with patch("brain.bridge.provider.subprocess.run", return_value=failed) as run:
         with pytest.raises(ProviderError) as excinfo:
@@ -949,7 +949,7 @@ def test_blocking_path_argv_differs_from_origin_main_only_in_the_output_format(t
         seen["cmd"] = list(cmd)
         seen["system"] = Path(cmd[cmd.index("--system-prompt-file") + 1]).read_text(encoding="utf-8")
 
-    provider = ClaudeCliProvider(model="haiku", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="haiku", timeout_seconds=60)
     completed = subprocess.CompletedProcess(["claude"], 0, _ndjson(_frames()), "")
 
     def _run(cmd, **kwargs):
@@ -996,7 +996,7 @@ _SHAPES_WITH_A_RESULT_LINE = {
 def test_generate_failure_with_a_result_line_among_other_text_gets_structured_detail(stdout):
     from brain.bridge import provider_auth
 
-    provider = ClaudeCliProvider(model="haiku", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="haiku", timeout_seconds=60)
     failed = subprocess.CompletedProcess(["claude"], 1, stdout, "")
     with patch("brain.bridge.provider.subprocess.run", return_value=failed) as run:
         with pytest.raises(RuntimeError) as excinfo:
@@ -1013,7 +1013,7 @@ def test_tools_less_chat_failure_with_a_result_line_among_other_text_gets_struct
 ):
     from brain.bridge import provider_auth
 
-    provider = ClaudeCliProvider(model="haiku", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="haiku", timeout_seconds=60)
     failed = subprocess.CompletedProcess(["claude"], 1, stdout, "")
     with patch("brain.bridge.provider.subprocess.run", return_value=failed) as run:
         with pytest.raises(ProviderError) as excinfo:
@@ -1029,7 +1029,7 @@ def test_tools_less_chat_failure_with_a_result_line_among_other_text_gets_struct
 
 
 def test_plain_text_failure_stdout_keeps_its_old_detail_on_both_plain_json_callers(tmp_path):
-    provider = ClaudeCliProvider(model="haiku", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="haiku", timeout_seconds=60)
     failed = subprocess.CompletedProcess(["claude"], 1, "segfault: something broke\n", "")
     with patch("brain.bridge.provider.subprocess.run", return_value=failed) as run:
         with pytest.raises(RuntimeError) as generate_exc:
@@ -1088,7 +1088,7 @@ def _partial_stream(*, cut_last: bool = True) -> bytes:
 
 def _timing_out(persona_dir: Path, partial, *, tools: bool, timeout: int = 60) -> ProviderError:
     """Drive the real `chat()` with `subprocess.run` raising TimeoutExpired(partial stdout)."""
-    provider = ClaudeCliProvider(model="haiku", timeout_seconds=timeout)
+    provider = ClaudeCliProvider(probe_model="haiku", timeout_seconds=timeout)
 
     def _run(cmd, **kwargs):
         raise subprocess.TimeoutExpired(cmd, timeout, output=partial)
@@ -1187,7 +1187,7 @@ _SHAPE = (
 
 
 def _either_branch(persona_dir: Path, stdout: str, *, tools: bool, returncode: int = 0, stderr: str = ""):
-    provider = ClaudeCliProvider(model="haiku", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="haiku", timeout_seconds=60)
     completed = subprocess.CompletedProcess(["claude"], returncode, stdout, stderr)
     with patch("brain.bridge.provider.subprocess.run", return_value=completed) as run:
         with pytest.raises(ProviderError) as excinfo:
@@ -1226,7 +1226,7 @@ def test_no_result_ndjson_exit_detail_names_frame_kinds_not_hook_text(tmp_path, 
 def _text_branch(persona_dir, stdout, *, returncode: int = 0, stderr: str = "", options=None):
     """Drive the real `ClaudeCliProvider.chat(tools=None)` with `subprocess.run` stubbed.
     Returns (response, run_mock, seen) where `seen` holds the argv, stdin and system file."""
-    provider = ClaudeCliProvider(model="haiku", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="haiku", timeout_seconds=60)
     completed = subprocess.CompletedProcess(["claude"], returncode, stdout, stderr)
     seen: dict = {}
 
@@ -1645,7 +1645,7 @@ def test_forced_final_pass_runs_the_json_text_branch_and_writes_nothing(tmp_path
         with patch("brain.bridge.provider.subprocess.run", side_effect=_run) as run:
             response, _ = run_tool_loop(
                 [ChatMessage(role="system", content="SYS"), ChatMessage(role="user", content="hi")],
-                provider=_CappedProvider(model="haiku", timeout_seconds=60),
+                provider=_CappedProvider(probe_model="haiku", timeout_seconds=60),
                 tools=build_tools_list(),
                 store=store,
                 hebbian=hebbian,
@@ -1703,7 +1703,7 @@ def test_real_subprocess_timeout_audits_what_the_killed_cli_had_printed(tmp_path
     monkeypatch.setenv("PATH", f"{fake.parent}{os.pathsep}{os.environ['PATH']}")
     persona_dir = _persona(tmp_path)
 
-    provider = ClaudeCliProvider(model="haiku", timeout_seconds=3)
+    provider = ClaudeCliProvider(probe_model="haiku", timeout_seconds=3)
     with pytest.raises(ProviderError) as excinfo:
         provider.chat(
             [ChatMessage(role="user", content="hi")],
@@ -1867,7 +1867,7 @@ def test_generate_exit_detail_for_typed_partless_ndjson_goes_through_the_same_sh
     # generate() runs `--output-format json`, which has no hook frames; its parse snippet is
     # unchanged by decision. Its exit detail is the shared _claude_failure_detail_text, so a
     # typed, partless NDJSON stdout (impossible under `json`) would get the shape too.
-    provider = ClaudeCliProvider(model="haiku", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="haiku", timeout_seconds=60)
     failed = subprocess.CompletedProcess(["claude"], 1, _hooked_ndjson(), "")
     with patch("brain.bridge.provider.subprocess.run", return_value=failed):
         with pytest.raises(RuntimeError) as excinfo:

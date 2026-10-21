@@ -40,7 +40,7 @@ def test_mcp_tools_path_raises_on_cli_error_frame(tmp_path, monkeypatch):
 
     persona = tmp_path / "persona"
     persona.mkdir()
-    p = ClaudeCliProvider(model="claude-sonnet-4-6")
+    p = ClaudeCliProvider(probe_model="claude-sonnet-4-6")
 
     with pytest.raises(ProviderError) as exc:
         p.chat(
@@ -72,7 +72,7 @@ def test_chat_stream_yields_error_not_done_on_cli_error_frame(monkeypatch):
     proc.stderr = MagicMock()
     proc.stderr.read.return_value = ""
 
-    provider = ClaudeCliProvider(model="claude-sonnet-4-6")
+    provider = ClaudeCliProvider(probe_model="claude-sonnet-4-6")
     with patch("brain.bridge.provider.subprocess.Popen", return_value=proc):
         events = list(provider.chat_stream([ChatMessage(role="user", content="hi")]))
 

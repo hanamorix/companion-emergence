@@ -16,7 +16,7 @@ from brain.bridge.provider import ClaudeCliProvider
 def _probe_with_result_frame(monkeypatch, frame: dict) -> str:
     done = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
     monkeypatch.setattr(ClaudeCliProvider, "_run_blocking_cli", lambda self, cmd, prompt, calls: (done, frame))
-    return ClaudeCliProvider(model="haiku", timeout_seconds=30).probe("ping")
+    return ClaudeCliProvider(probe_model="haiku", timeout_seconds=30).probe("ping")
 
 
 @pytest.mark.parametrize("value", [None, 5, 1.5, ["a"], {"x": 1}, True])

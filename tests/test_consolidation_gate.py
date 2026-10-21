@@ -177,7 +177,7 @@ def test_embed_on_write_promoted_memory_has_row_embedding_and_matrix_entry(
     #      `_align_embedding_tier` for the identical need). Align the two.
     fake_provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: fake_provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, fake_provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, fake_provider.model_id())
 
     content = "a memory that should be embedded immediately at promotion"
     m = _mem(content, "dream")

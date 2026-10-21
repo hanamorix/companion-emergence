@@ -71,35 +71,35 @@ def _stream_result_line(is_error: bool, text: str) -> str:
 def test_generate_exit_nonzero_marks_expired():
     with patch("subprocess.run", return_value=_run_result(1, _auth_frame())):
         with pytest.raises(RuntimeError):
-            ClaudeCliProvider(model="haiku").generate("x")
+            ClaudeCliProvider(probe_model="haiku").generate("x")
     assert provider_auth.state()["status"] == "expired"
 
 
 def test_generate_is_error_frame_marks_expired():
     with patch("subprocess.run", return_value=_run_result(0, _auth_frame())):
         with pytest.raises(RuntimeError):
-            ClaudeCliProvider(model="haiku").generate("x")
+            ClaudeCliProvider(probe_model="haiku").generate("x")
     assert provider_auth.state()["status"] == "expired"
 
 
 def test_chat_exit_nonzero_marks_expired():
     with patch("subprocess.run", return_value=_run_result(1, _auth_frame())):
         with pytest.raises(ProviderError):
-            ClaudeCliProvider(model="sonnet").chat(MSGS)
+            ClaudeCliProvider(probe_model="sonnet").chat(MSGS)
     assert provider_auth.state()["status"] == "expired"
 
 
 def test_chat_is_error_frame_marks_expired():
     with patch("subprocess.run", return_value=_run_result(0, _auth_frame())):
         with pytest.raises(ProviderError):
-            ClaudeCliProvider(model="sonnet").chat(MSGS)
+            ClaudeCliProvider(probe_model="sonnet").chat(MSGS)
     assert provider_auth.state()["status"] == "expired"
 
 
 def test_chat_stream_is_error_frame_marks_expired():
     fake = _FakePopen([_stream_result_line(True, LIVE)], rc=0)
     with patch("subprocess.Popen", return_value=fake):
-        events = list(ClaudeCliProvider(model="sonnet").chat_stream(MSGS))
+        events = list(ClaudeCliProvider(probe_model="sonnet").chat_stream(MSGS))
     assert any(isinstance(e, StreamError) for e in events)
     assert provider_auth.state()["status"] == "expired"
 
@@ -107,7 +107,7 @@ def test_chat_stream_is_error_frame_marks_expired():
 def test_chat_stream_exit_nonzero_stderr_only_marks_expired():
     fake = _FakePopen([], rc=1, stderr=LIVE)
     with patch("subprocess.Popen", return_value=fake):
-        events = list(ClaudeCliProvider(model="sonnet").chat_stream(MSGS))
+        events = list(ClaudeCliProvider(probe_model="sonnet").chat_stream(MSGS))
     assert any(isinstance(e, StreamError) for e in events)
     assert provider_auth.state()["status"] == "expired"
 
@@ -120,14 +120,14 @@ def test_generate_success_clears_expired(monkeypatch):
     provider_auth.note_cli_failure(LIVE)
     t["now"] += provider_auth.REPROBE_S + 1  # the probe is granted
     with patch("subprocess.run", return_value=_run_result(0, _ok_frame())):
-        assert ClaudeCliProvider(model="haiku").generate("x") == "hello"
+        assert ClaudeCliProvider(probe_model="haiku").generate("x") == "hello"
     assert provider_auth.state()["status"] == "ok"
 
 
 def test_chat_success_clears_expired():
     provider_auth.note_cli_failure(LIVE)
     with patch("subprocess.run", return_value=_run_result(0, _ok_frame())):
-        ClaudeCliProvider(model="sonnet").chat(MSGS)
+        ClaudeCliProvider(probe_model="sonnet").chat(MSGS)
     assert provider_auth.state()["status"] == "ok"
 
 
@@ -135,7 +135,7 @@ def test_chat_stream_success_clears_expired():
     provider_auth.note_cli_failure(LIVE)
     fake = _FakePopen([_stream_result_line(False, "hello")], rc=0)
     with patch("subprocess.Popen", return_value=fake):
-        events = list(ClaudeCliProvider(model="sonnet").chat_stream(MSGS))
+        events = list(ClaudeCliProvider(probe_model="sonnet").chat_stream(MSGS))
     assert any(isinstance(e, StreamDone) for e in events)
     assert provider_auth.state()["status"] == "ok"
 
@@ -149,7 +149,7 @@ def test_generate_gate_one_probe_per_interval(monkeypatch):
     t["now"] += provider_auth.REPROBE_S + 1
     run = MagicMock(return_value=_run_result(1, _auth_frame()))
     with patch("subprocess.run", run):
-        p = ClaudeCliProvider(model="haiku")
+        p = ClaudeCliProvider(probe_model="haiku")
         deferred = 0
         for _ in range(10):
             try:
@@ -168,15 +168,15 @@ def test_generate_gate_next_call_after_transition_is_deferred(monkeypatch):
     provider_auth.note_cli_failure(LIVE)
     run = MagicMock()
     with patch("subprocess.run", run), pytest.raises(provider_auth.ProviderAuthDeferred):
-        ClaudeCliProvider(model="haiku").generate("x")
+        ClaudeCliProvider(probe_model="haiku").generate("x")
     assert run.call_count == 0
 
 
 def test_chat_and_chat_stream_are_never_gated(monkeypatch):
     provider_auth.note_cli_failure(LIVE)
     with patch("subprocess.run", return_value=_run_result(0, _ok_frame())):
-        ClaudeCliProvider(model="sonnet").chat(MSGS)  # no ProviderAuthDeferred
+        ClaudeCliProvider(probe_model="sonnet").chat(MSGS)  # no ProviderAuthDeferred
     provider_auth.note_cli_failure(LIVE)
     fake = _FakePopen([_stream_result_line(False, "hello")], rc=0)
     with patch("subprocess.Popen", return_value=fake):
-        list(ClaudeCliProvider(model="sonnet").chat_stream(MSGS))
+        list(ClaudeCliProvider(probe_model="sonnet").chat_stream(MSGS))

@@ -722,3 +722,127 @@ def wedged_lock(repo_root: Path) -> Callable[[Path], AbstractContextManager[None
             proc.wait(timeout=20)
 
     return _hold
+
+
+_OK_FRAME = (
+    '{"type": "result", "subtype": "success", "is_error": false, "result": "OK", "duration_ms": 1, "num_turns": 1}\n'
+)
+
+
+def _rejection_frame(model: str) -> str:
+    import json
+
+    return (
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": True,
+                "api_error_status": 404,
+                "result": f"There's an issue with the selected model ({model}). It may not exist or you may not have "
+                "access to it.",
+            }
+        )
+        + "\n"
+    )
+
+
+class ClaudeArgvCapture:
+    """Every ``claude`` argv the provider spawned, and the answer each one got (#529 test instrument).
+
+    ``reject(id)`` makes the CLI answer that model id with its real rejection frame (exit 1, status 404, the
+    "issue with the selected model" sentence); every other id gets a clean frame. The seam is the subprocess call the
+    provider tests already patch, so the argv is built by the real provider code.
+    """
+
+    def __init__(self) -> None:
+        self.argvs: list[list[str]] = []
+        self.rejected: set[str] = set()
+
+    def reject(self, *models: str) -> None:
+        self.rejected.update(models)
+
+    def accept(self, *models: str) -> None:
+        self.rejected.difference_update(models)
+
+    @staticmethod
+    def model_of(argv: list[str]) -> str:
+        return argv[argv.index("--model") + 1]
+
+    @property
+    def models(self) -> list[str]:
+        """The ``--model`` value of every spawn, in order."""
+        return [self.model_of(a) for a in self.argvs]
+
+    @property
+    def last_model(self) -> str:
+        return self.models[-1]
+
+    def _answer(self, cmd: list[str]) -> tuple[int, str]:
+        self.argvs.append(list(cmd))
+        model = self.model_of(cmd)
+        if model in self.rejected:
+            return 1, _rejection_frame(model)
+        return 0, _OK_FRAME
+
+
+@pytest.fixture
+def capture_claude_argv(monkeypatch: pytest.MonkeyPatch) -> ClaudeArgvCapture:
+    """Patch the provider's subprocess seam (run and Popen) and record every argv (see ``ClaudeArgvCapture``)."""
+    import io
+
+    from brain.bridge import provider as provider_mod
+
+    cap = ClaudeArgvCapture()
+    real_run, real_popen = subprocess.run, subprocess.Popen  # `subprocess` is one module: only `claude` is faked
+
+    def fake_run(cmd, *args, **kwargs):
+        if not (isinstance(cmd, list) and cmd and cmd[0] == "claude"):
+            return real_run(cmd, *args, **kwargs)
+        rc, out = cap._answer(cmd)
+        return subprocess.CompletedProcess(args=cmd, returncode=rc, stdout=out, stderr="")
+
+    class FakePopen(real_popen):  # type: ignore[misc, valid-type]
+        def __new__(cls, cmd, *args, **kwargs):
+            if not (isinstance(cmd, list) and cmd and cmd[0] == "claude"):
+                return real_popen(cmd, *args, **kwargs)
+            return super().__new__(cls)
+
+        def __init__(self, cmd, *args, **kwargs):
+            self._rc, out = cap._answer(cmd)
+            self.stdin = io.StringIO()
+            self.stdout = iter(out.splitlines(keepends=True))
+            self.stderr = io.StringIO("")
+            self.pid = 4242
+
+        def wait(self, timeout=None):
+            return self._rc
+
+        def poll(self):
+            return self._rc
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(provider_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(provider_mod.subprocess, "Popen", FakePopen)
+    return cap
+
+
+@pytest.fixture
+def model_override() -> Callable[[str, str | None], None]:
+    """Set (or with ``None`` clear) one job's model in the sandbox home's tunables file, through the one writer.
+
+    ``model_override(tier, value)`` is ``set_job_models({tier: value})`` under the per-test home, so the write rule
+    applies (a word that means the job's default removes the line, a full id is written as given). Replaces the old
+    ``monkeypatch.setitem(TIER_MODEL, ...)``.
+    """
+    from brain.bridge.model_tier import set_job_models
+
+    def _set(tier: str, value: str | None) -> None:
+        set_job_models({tier: value})
+
+    return _set

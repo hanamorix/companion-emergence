@@ -24,7 +24,6 @@ from fastapi.testclient import TestClient
 from brain.bridge import model_error, provider_auth
 from brain.bridge.provider import ClaudeCliProvider
 from brain.bridge.server import build_app
-from brain.persona_config import PersonaConfig
 
 FIXTURE = Path(__file__).parent / "fixtures" / "cli_2_1_219_model_not_found.ndjson"
 FRAMES = [json.loads(x) for x in FIXTURE.read_text(encoding="utf-8").splitlines() if x.strip()]
@@ -64,7 +63,7 @@ def _ok_json() -> str:
 
 
 def _client(persona_dir: Path, monkeypatch, model: str = "sonnet") -> TestClient:
-    monkeypatch.setattr("brain.bridge.provider.get_provider", lambda *a, **k: ClaudeCliProvider(model=model))
+    monkeypatch.setattr("brain.bridge.provider.get_provider", lambda *a, **k: ClaudeCliProvider(probe_model=model))
     return TestClient(build_app(persona_dir=persona_dir, client_origin="tests"))
 
 
@@ -143,8 +142,8 @@ def test_chat_error_code_classification_and_precedence():
     # auth wins, 429 stays generic, as before
     assert server_mod._chat_error_code(RuntimeError(f"{LIVE}; {rej}")) == "auth_expired"
     assert server_mod._chat_error_code(RuntimeError("[claude_cli_exit] exit 1: api_error_status=429")) == "provider_failed"
-    assert server_mod._chat_error_model(RuntimeError(rej), ClaudeCliProvider(model="sonnet")) == BAD
-    assert server_mod._chat_error_model(RuntimeError("[claude_cli_exit] exit 1: api_error_status=429"), ClaudeCliProvider(model="sonnet")) is None
+    assert server_mod._chat_error_model(RuntimeError(rej), ClaudeCliProvider(probe_model="sonnet")) == BAD
+    assert server_mod._chat_error_model(RuntimeError("[claude_cli_exit] exit 1: api_error_status=429"), ClaudeCliProvider(probe_model="sonnet")) is None
 
 
 # --- C14: check on save -------------------------------------------------------------------------
@@ -154,21 +153,22 @@ def _post_model(c: TestClient, model: str):
     return c.post("/persona/config/model", json={"model": model})
 
 
-def _saved_model(persona_dir: Path) -> str:
-    return PersonaConfig.load(persona_dir / "persona_config.json").model
+def _saved_model(persona_dir: Path) -> str | None:
+    """The chat model line the user saved in the install-wide tunables file (None: no line, the shipped default)."""
+    from brain import tunables
+
+    return tunables.get_override("model.interactive_chat")
 
 
 def test_rejected_custom_id_is_refused_and_leaves_no_trace(persona_dir: Path, monkeypatch, caplog):
     run = _Run(_respond_reject_bad)
     with _client(persona_dir, monkeypatch) as c, patch("subprocess.run", run):
-        provider = c.app.state.bridge.provider
         with caplog.at_level(logging.WARNING):
             r = _post_model(c, BAD)
         state = c.get("/persona/state").json()
         assert r.status_code == 400, r.text
         assert r.json() == {"ok": False, "error": "model_unavailable", "model": BAD}
-        assert _saved_model(persona_dir) == "sonnet"
-        assert provider._model == "sonnet"
+        assert _saved_model(persona_dir) is None
         # C14h: nothing recorded or logged for an id that was never saved
         assert state["model_rejections"] == []
         assert model_error.state() == []
@@ -176,14 +176,12 @@ def test_rejected_custom_id_is_refused_and_leaves_no_trace(persona_dir: Path, mo
     assert run.calls_for(BAD) == 1  # C14g: exactly one check call
 
 
-def test_accepted_custom_id_is_saved_hot_swapped_and_marked_checked(persona_dir: Path, monkeypatch):
+def test_accepted_custom_id_is_saved_and_marked_checked(persona_dir: Path, monkeypatch):
     run = _Run(lambda m: _proc(0, _ok_json()))
     with _client(persona_dir, monkeypatch) as c, patch("subprocess.run", run):
-        provider = c.app.state.bridge.provider
         r = _post_model(c, "claude-sonnet-5")
         assert r.status_code == 200, r.text
         assert r.json() == {"ok": True, "model": "claude-sonnet-5", "checked": True}
-        assert provider._model == "claude-sonnet-5"
     assert _saved_model(persona_dir) == "claude-sonnet-5"
     assert run.calls_for("claude-sonnet-5") >= 1
 
@@ -204,8 +202,7 @@ def test_non_rejection_failure_saves_with_checked_false(persona_dir: Path, monke
         with caplog.at_level(logging.INFO):
             r = _post_model(c, "claude-sonnet-5")
     assert r.status_code == 200, r.text
-    # the derived tier id could not be probed either (same failure), so it is reported as not checked yet
-    assert r.json() == {"ok": True, "model": "claude-sonnet-5", "checked": False, "tiers_unchecked": ["claude-haiku-5"]}
+    assert r.json() == {"ok": True, "model": "claude-sonnet-5", "checked": False}
     assert _saved_model(persona_dir) == "claude-sonnet-5"
     assert any("reason=failed" in rec.getMessage() for rec in caplog.records)
 
@@ -240,7 +237,7 @@ def test_confirmed_save_and_alias_leave_nothing_unconfirmed(persona_dir: Path, m
     with _client(persona_dir, monkeypatch) as c, patch("subprocess.run", _Run(lambda m: _proc(0, _ok_json()))):
         _post_model(c, "claude-sonnet-5")
         assert c.get("/persona/state").json()["model_unconfirmed"] == []
-        _post_model(c, "opus")
+        _post_model(c, "haiku")
         assert c.get("/persona/state").json()["model_unconfirmed"] == []
 
 
@@ -250,8 +247,7 @@ def test_auth_expired_saves_with_checked_false_and_makes_no_call(persona_dir: Pa
         provider_auth.note_cli_failure(LIVE)  # flips to expired and starts the probe interval
         with caplog.at_level(logging.INFO):
             r = _post_model(c, "claude-sonnet-5")
-    # the derived tier id could not be probed either (same failure), so it is reported as not checked yet
-    assert r.json() == {"ok": True, "model": "claude-sonnet-5", "checked": False, "tiers_unchecked": ["claude-haiku-5"]}
+    assert r.json() == {"ok": True, "model": "claude-sonnet-5", "checked": False}
     assert run.calls_for("claude-sonnet-5") == 0
     assert any("reason=auth_deferred" in rec.getMessage() for rec in caplog.records)
 
@@ -263,26 +259,28 @@ def test_timeout_saves_with_checked_false(persona_dir: Path, monkeypatch, caplog
     with _client(persona_dir, monkeypatch) as c, patch("subprocess.run", _Run(_boom)):
         with caplog.at_level(logging.INFO):
             r = _post_model(c, "claude-sonnet-5")
-    # the derived tier id could not be probed either (same failure), so it is reported as not checked yet
-    assert r.json() == {"ok": True, "model": "claude-sonnet-5", "checked": False, "tiers_unchecked": ["claude-haiku-5"]}
+    assert r.json() == {"ok": True, "model": "claude-sonnet-5", "checked": False}
     assert any("reason=timeout" in rec.getMessage() for rec in caplog.records)
 
 
-def test_alias_is_never_checked_and_body_is_unchanged(persona_dir: Path, monkeypatch):
+def test_the_haiku_alias_is_never_checked_and_opus_is_checked_as_its_id(persona_dir: Path, monkeypatch):
     run = _Run(lambda m: _proc(0, _ok_json()))
     with _client(persona_dir, monkeypatch) as c, patch("subprocess.run", run):
+        r = _post_model(c, "haiku")
+        assert r.json() == {"ok": True, "model": "haiku"}
+        assert run.calls_for("haiku") == 0
         r = _post_model(c, "opus")
-    assert r.json() == {"ok": True, "model": "opus"}
-    assert run.calls_for("opus") == 0
+        assert r.json() == {"ok": True, "model": "claude-opus-5", "checked": True}
+    assert run.calls_for("claude-opus-5") == 1
 
 
-def test_non_claude_provider_saves_unchecked(persona_dir: Path):
+def test_non_claude_provider_is_refused_and_nothing_is_saved_or_checked(persona_dir: Path):
     run = _Run(lambda m: _proc(0, _ok_json()))
     app = build_app(persona_dir=persona_dir, client_origin="tests")  # persona_config says provider: fake
     with TestClient(app) as c, patch("subprocess.run", run):
         r = _post_model(c, "claude-sonnet-5")
-    assert r.json() == {"ok": True, "model": "claude-sonnet-5"}
-    assert run.calls_for("claude-sonnet-5") == 0
+    assert r.status_code == 400 and r.json() == {"ok": False, "error": "model_not_applicable"}
+    assert run.calls_for("claude-sonnet-5") == 0 and _saved_model(persona_dir) is None
 
 
 def test_concurrent_applies_run_their_checks_one_at_a_time(persona_dir: Path, monkeypatch):
@@ -307,7 +305,10 @@ def test_concurrent_applies_run_their_checks_one_at_a_time(persona_dir: Path, mo
 
 
 def _persona_with_model(persona_dir: Path, model: str) -> None:
-    (persona_dir / "persona_config.json").write_text(json.dumps({"provider": "fake", "searcher": "fake", "model": model}))
+    """The chat job is configured with ``model`` (the install-wide tunables line)."""
+    from brain import tunables
+
+    tunables.set_overrides({"model.interactive_chat": model})
 
 
 def test_ambient_generate_failure_is_remembered_and_shown_in_persona_state(persona_dir: Path, monkeypatch):
@@ -315,7 +316,7 @@ def test_ambient_generate_failure_is_remembered_and_shown_in_persona_state(perso
     with TestClient(build_app(persona_dir=persona_dir, client_origin="tests")) as c:
         with patch("subprocess.run", return_value=_proc(1, REJECT_RESULT)):
             with pytest.raises(RuntimeError):
-                ClaudeCliProvider(model=BAD).generate("tick")
+                ClaudeCliProvider(probe_model=BAD).generate("tick")
         recs = c.get("/persona/state").json()["model_rejections"]
     assert [r["model"] for r in recs] == [BAD]
     assert recs[0]["count"] == 1
@@ -325,7 +326,7 @@ def test_rejection_of_an_unrelated_model_is_not_returned(persona_dir: Path):
     with TestClient(build_app(persona_dir=persona_dir, client_origin="tests")) as c:
         with patch("subprocess.run", return_value=_proc(1, REJECT_RESULT)):
             with pytest.raises(RuntimeError):
-                ClaudeCliProvider(model=BAD).generate("tick")  # configured model is the default, BAD is not it
+                ClaudeCliProvider(probe_model=BAD).generate("tick")  # configured model is the default, BAD is not it
         assert model_error.state() != []
         assert c.get("/persona/state").json()["model_rejections"] == []
 

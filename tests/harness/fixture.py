@@ -157,6 +157,7 @@ def build_persona(
     ``provider`` is injected only when ``spec.incident`` is set (the incident builder needs a
     compaction provider; a fake keeps the build token-free). Returns a :class:`LiveEnv`.
     """
+    from brain.bridge.model_tier import TIER_INTERACTIVE_CHAT, set_job_models
     from brain.memory.store import Memory, MemoryStore
     from brain.setup import write_persona_config
 
@@ -164,7 +165,10 @@ def build_persona(
     persona_dir = handle.persona_dir(spec.name)
     persona_dir.mkdir(parents=True, exist_ok=True)
 
-    write_persona_config(persona_dir, user_name=spec.user_name, provider="claude-cli", model=model)
+    write_persona_config(persona_dir, user_name=spec.user_name, provider="claude-cli")
+    # The chat model is an install-wide tunables line, and the sandbox IS the install (it sets KINDLED_HOME): write
+    # it through the one writer. A word that means the shipped default writes nothing.
+    set_job_models({TIER_INTERACTIVE_CHAT: model})
     _apply_persona_config_overrides(persona_dir, spec)
     (persona_dir / "voice.md").write_text(spec.voice)
     (persona_dir / "active_conversations").mkdir(exist_ok=True)

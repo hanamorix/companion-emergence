@@ -127,7 +127,7 @@ def _seed(
     """Genuine memories then monologue-family memories (family types
     cycle), each with the scripted cosine to the query."""
     monkeypatch.setattr("brain.memory.embeddings.build_embedding_provider", lambda: _Embedder())
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, _EMBEDDER_ID)
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, _EMBEDDER_ID)
     genuine = [
         _mem(store, f"r3 genuine memory {i}", genuine_type, c) for i, c in enumerate(genuine_cosines)
     ]

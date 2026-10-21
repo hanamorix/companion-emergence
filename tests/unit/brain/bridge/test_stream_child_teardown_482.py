@@ -68,7 +68,7 @@ def child(monkeypatch):
 
     def run(script: str):
         box["script"] = script
-        return ClaudeCliProvider(model="sonnet").chat_stream(MSGS)
+        return ClaudeCliProvider(probe_model="sonnet").chat_stream(MSGS)
 
     yield run, spawned
     for proc in spawned:  # never leave a stand-in running

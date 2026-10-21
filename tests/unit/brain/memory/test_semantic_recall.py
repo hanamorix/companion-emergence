@@ -97,7 +97,7 @@ def _align_embedding_tier(monkeypatch: pytest.MonkeyPatch, model_id: str = _TEST
     rows — otherwise the first `matrix.get`/`snapshot()` reloads from disk
     filtered to the (unrelated) real production model id, finds nothing, and
     silently discards whatever this test put there."""
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, model_id)
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, model_id)
 
 
 def _mem(store: MemoryStore, content: str, *, state: str = "active") -> Memory:

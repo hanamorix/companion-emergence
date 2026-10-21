@@ -95,7 +95,7 @@ def _run_turn(tmp_path: Path, *, user_name: str | None) -> str:
                 "what do you remember?",
                 store=store,
                 hebbian=hebbian,
-                provider=ClaudeCliProvider(model="sonnet"),
+                provider=ClaudeCliProvider(probe_model="sonnet"),
                 session=session,
                 voice_md_override="# Nell",
             )
@@ -175,7 +175,7 @@ def test_c2b_chat_stream_sends_the_same_narrative_lines() -> None:
     ]
     with patch("subprocess.Popen", return_value=fake):
         list(
-            ClaudeCliProvider(model="sonnet").chat_stream(
+            ClaudeCliProvider(probe_model="sonnet").chat_stream(
                 msgs,
                 options={
                     "user_name": "Hana",

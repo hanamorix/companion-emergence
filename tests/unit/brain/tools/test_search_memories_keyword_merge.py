@@ -110,7 +110,7 @@ def _semantic_setup(
         filler = _mem(store, f"zzfiller{i} qqpadding")
         _set_vec(store, filler.id, 0.05)
     monkeypatch.setattr("brain.memory.embeddings.build_embedding_provider", lambda: _Scripted(vectors))
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, _MODEL_ID)
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, _MODEL_ID)
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
         lambda **kw: FakeRerankerProvider(scores=scripted),

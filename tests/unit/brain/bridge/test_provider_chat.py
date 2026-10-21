@@ -167,7 +167,7 @@ def test_claude_cli_chat_calls_subprocess_with_p_flag() -> None:
     with patch(
         "brain.bridge.provider.subprocess.run", return_value=_make_claude_result()
     ) as mock_run:
-        p = ClaudeCliProvider(model="sonnet")
+        p = ClaudeCliProvider(probe_model="sonnet")
         p.chat([ChatMessage(role="user", content="hello")])
 
     cmd = mock_run.call_args[0][0]
@@ -210,7 +210,7 @@ def test_claude_cli_chat_text_only_still_uses_p_flag() -> None:
     with patch(
         "brain.bridge.provider.subprocess.run", return_value=_make_claude_result()
     ) as mock_run:
-        p = ClaudeCliProvider(model="sonnet")
+        p = ClaudeCliProvider(probe_model="sonnet")
         p.chat([ChatMessage(role="user", content="hello")])
     cmd = mock_run.call_args[0][0]
     assert "-p" in cmd
@@ -225,7 +225,7 @@ def test_claude_cli_chat_multi_turn_uses_narrative_lines_not_role_labels() -> No
     with patch(
         "brain.bridge.provider.subprocess.run", return_value=_make_claude_result()
     ) as mock_run:
-        p = ClaudeCliProvider(model="sonnet")
+        p = ClaudeCliProvider(probe_model="sonnet")
         p.chat(
             [
                 ChatMessage(role="user", content="hey nell"),
@@ -355,7 +355,7 @@ def test_claude_cli_chat_mcp_tools_pipes_prompt_via_stdin(tmp_path) -> None:
     persona_dir.mkdir()
     recorder = _make_recording_run()
     with patch("brain.bridge.provider.subprocess.run", side_effect=recorder) as mock_run:
-        p = ClaudeCliProvider(model="sonnet")
+        p = ClaudeCliProvider(probe_model="sonnet")
         p.chat(
             [
                 ChatMessage(role="system", content="voice persona"),
@@ -389,7 +389,7 @@ def test_claude_cli_chat_mcp_tools_tempfile_cleaned_up_on_error(tmp_path) -> Non
     recorder = _make_recording_run(failed)
 
     with patch("brain.bridge.provider.subprocess.run", side_effect=recorder):
-        p = ClaudeCliProvider(model="sonnet")
+        p = ClaudeCliProvider(probe_model="sonnet")
         with pytest.raises(ProviderError):
             p.chat(
                 [
@@ -1189,7 +1189,7 @@ def test_chat_with_mcp_tools_calls_log_usage(persona_dir: Path) -> None:
     """
     from unittest.mock import patch as _patch
 
-    provider = ClaudeCliProvider(model="sonnet")
+    provider = ClaudeCliProvider(probe_model="sonnet")
 
     with _patch(
         "brain.bridge.provider.subprocess.run",

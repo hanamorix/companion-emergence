@@ -15,7 +15,7 @@ from dataclasses import dataclass
 class ModelConfig:
     """Which model each actor uses. Overridable per-run / per-persona / per-arm.
 
-    - ``canary`` — the persona under test (threads to ``write_persona_config(model=...)``).
+    - ``canary`` — the persona under test (threads to the sandbox home's tunables line for the chat model).
     - ``bob`` — the LLM-simulated human (threads to DumbBob's ``claude -p --model``).
     - ``watchdog`` — the usage-reset ping model (cheap; threads to the watchdog).
     """
