@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from brain.bridge import cli_throttle, shutdown_progress
+from brain.bridge import shutdown_progress
 from brain.bridge.server import build_app
 
 _PNG = bytes.fromhex(
@@ -84,6 +84,8 @@ def test_upload_after_the_registry_is_sealed_is_refused_and_writes_nothing(perso
     app = build_app(persona_dir=persona_dir, client_origin="tests", auth_token=None)
     with TestClient(app) as client:
         assert shutdown_progress.registry.seal() is True
-        with pytest.raises(cli_throttle.ShutdownDeferred):
-            client.post("/upload", files={"file": ("photo.png", _PNG, "image/png")})
+        resp = client.post("/upload", files={"file": ("photo.png", _PNG, "image/png")})
+    # after #458's N1 change a sealed route answers 503 bridge_stopping
+    assert resp.status_code == 503
+    assert resp.json()["code"] == "bridge_stopping"
     assert not (persona_dir / "images").exists() or list((persona_dir / "images").iterdir()) == []
