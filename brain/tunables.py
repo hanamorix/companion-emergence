@@ -24,6 +24,7 @@ Fail-open throughout: this module never raises into a turn.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from collections.abc import Callable
@@ -343,6 +344,14 @@ def _drop_inactive_marker() -> None:
         logger.warning("tunables: could not clear the notice file", exc_info=True)
 
 
+def _same_content(a: Any, b: Any) -> bool:
+    """True when two JSON-able values serialise identically (key order ignored, ``1`` and ``True`` kept apart)."""
+    try:
+        return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+    except (TypeError, ValueError):
+        return False
+
+
 def write_defaults_section() -> None:
     """Rewrite the defaults section from the registry; preserve overrides.
 
@@ -352,6 +361,10 @@ def write_defaults_section() -> None:
     The whole read-modify-write runs under the file's cross-process lock (the same one ``set_overrides`` takes), waiting at
     most ``dev_constants.SETTINGS_FILE_LOCK_WAIT_S``; if another process holds it that long the rewrite is skipped with a
     log line (nothing is written) and happens at the next start.
+
+    A file that already holds exactly this payload is not rewritten, so its mtime stays put: the rejected-model fallback
+    (``brain.bridge.model_tier``) trusts a rejection record only while it is newer than this file, and a rewrite at
+    every boot would un-trust every other running bridge's records each time one more bridge started.
 
     A damaged tunables.json is healed, not silently rebuilt (#462): HEAL keeps the damaged bytes as
     ``tunables.json.corrupt-<ts>`` (or restores a valid backup), and the fact is persisted in ``tunables.notice.json``
@@ -376,7 +389,10 @@ def write_defaults_section() -> None:
             payload = {"_readme": _README, "defaults": defaults, "overrides": overrides}
             if _LOCKED_WINDOW_HOOK is not None:
                 _LOCKED_WINDOW_HOOK()
-            write_json(path, payload, indent=2, sort_keys=True, fsync=False, nonfinite="null")
+            if res.outcome == "ok" and res.anomaly is None and _same_content(data, payload):
+                logger.debug("tunables: %s already holds the current defaults; not rewritten", path)
+            else:
+                write_json(path, payload, indent=2, sort_keys=True, fsync=False, nonfinite="null")
             _drop_inactive_marker()
     except LockTimeoutError:
         logger.warning(

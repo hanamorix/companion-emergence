@@ -102,3 +102,50 @@ def test_write_defaults_survives_corrupt_file(tunables, tmp_path):
     data = json.loads((tmp_path / "tunables.json").read_text(encoding="utf-8"))
     assert data["defaults"] == {"a.b": 60.0}
     assert data["overrides"] == {}
+
+
+def _age(path):
+    """Set the file's mtime well in the past and return it, so any later write shows as a changed mtime."""
+    old = time.time() - 3600
+    os.utime(path, (old, old))
+    return path.stat().st_mtime_ns
+
+
+def test_write_defaults_leaves_an_unchanged_file_alone(tunables, tmp_path):
+    """A boot whose payload equals the file must not rewrite it: the rejected-model fallback trusts a record only while
+    it is newer than this file's mtime, so a rewrite on every boot would un-trust every running bridge's records."""
+    tunables.register("a.b", 60.0)
+    _write(tmp_path, {"user.key": 7})
+    tunables.write_defaults_section()  # first call: the file lacks the defaults and the readme, so it is rewritten
+    path = tmp_path / "tunables.json"
+    before_text = path.read_bytes()
+    mtime = _age(path)
+    tunables.write_defaults_section()
+    tunables.write_defaults_section()
+    assert path.stat().st_mtime_ns == mtime
+    assert path.read_bytes() == before_text
+
+
+def test_write_defaults_still_rewrites_when_a_default_changes(tunables, tmp_path):
+    tunables.register("a.b", 60.0)
+    tunables.write_defaults_section()
+    path = tmp_path / "tunables.json"
+    mtime = _age(path)
+    tunables._reset_for_tests()
+    tunables.register("a.b", 180.0)
+    tunables.write_defaults_section()
+    assert path.stat().st_mtime_ns != mtime
+    assert json.loads(path.read_text(encoding="utf-8"))["defaults"] == {"a.b": 180.0}
+
+
+def test_write_defaults_rewrites_when_the_content_matches_but_a_value_differs_in_type(tunables, tmp_path):
+    """1 == True == 1.0 in Python; a changed default type is still a change."""
+    tunables.register("a.b", 1)
+    tunables.write_defaults_section()
+    path = tmp_path / "tunables.json"
+    mtime = _age(path)
+    tunables._reset_for_tests()
+    tunables.register("a.b", True)
+    tunables.write_defaults_section()
+    assert path.stat().st_mtime_ns != mtime
+    assert json.loads(path.read_text(encoding="utf-8"))["defaults"] == {"a.b": True}
