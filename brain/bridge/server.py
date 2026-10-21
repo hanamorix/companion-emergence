@@ -199,7 +199,10 @@ async def _idle_watcher(state: BridgeAppState, idle_shutdown_seconds: float) -> 
         await asyncio.sleep(min(idle_shutdown_seconds, 60))
         if _check_idle(state, idle_shutdown_seconds):
             logger.info("idle shutdown firing — no traffic for >%ss", idle_shutdown_seconds)
-            if state.shutdown_controller is None or not state.shutdown_controller.request("idle_timeout"):
+            # Off the event loop: the request writes the bridge.json "stopping" mark (review O-6).
+            if state.shutdown_controller is None or not await asyncio.to_thread(
+                state.shutdown_controller.request, "idle_timeout"
+            ):
                 logger.error("idle shutdown could not request controller shutdown")
             return
 
@@ -1468,7 +1471,8 @@ def build_app(
             #   5. clear the publisher
             # A signal the monitor has not applied yet keeps its reason (review R2-S3, C13). "unknown" means no stop was
             # asked for (uvicorn ended for its own reasons); the runner's after-run decision records that as a crash.
-            controller.begin_stop(controller.signal_reason or _STOP_REASON_UNKNOWN)
+            # Off the event loop: a first stop writes the bridge.json mark (review O-6).
+            await asyncio.to_thread(controller.begin_stop, controller.signal_reason or _STOP_REASON_UNKNOWN)
 
             # 1. Cancel the derived-model re-check (a probe thread already running is a counted task)
             if recheck_task is not None:
@@ -3317,7 +3321,9 @@ def build_app(
             body = None
         if isinstance(body, dict) and body.get("reason") in ("user_stop", "app_restart"):
             reason = body["reason"]
-        ok = s.shutdown_controller.request(reason)
+        # Off the event loop (review O-6): the request writes the bridge.json "stopping" mark, which can fsync; it is
+        # still on disk before the 202 (C6).
+        ok = await asyncio.to_thread(s.shutdown_controller.request, reason)
         if not ok:
             logger.error("manual restart could not request controller shutdown")
         return {"status": "shutting_down"}

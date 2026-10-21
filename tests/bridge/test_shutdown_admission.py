@@ -199,3 +199,69 @@ def test_the_lifespan_backstop_keeps_a_pending_signal_as_the_reason(persona_dir:
         assert c.get("/health").status_code == 200
         ctrl.note_signal()  # the signal handler ran; the monitor has not polled yet
     assert ctrl.reason == "os_signal"
+
+
+def _on_event_loop() -> bool:
+    import asyncio
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+def test_the_stop_request_writes_its_mark_off_the_event_loop(persona_dir: Path, monkeypatch):
+    """Pre-merge review O-6: the "stopping" mark (a bridge.json write that can fsync) does not run on the event loop;
+    it is still on disk before the 202 (C6)."""
+    import os
+
+    from brain import process_identity
+    from brain.bridge import state_file
+
+    state_file.write(
+        persona_dir,
+        state_file.BridgeState(
+            persona=persona_dir.name, pid=os.getpid(), port=5000, started_at="t", stopped_at=None,
+            shutdown_clean=False, client_origin="tests", pid_token=process_identity.own_token(), identity="token",
+            phase="running",
+        ),
+    )
+    ctrl = _controller(persona_dir)
+    seen: list[bool] = []
+    real_update = state_file.update
+
+    def spy(pd, fn, *a, **k):
+        seen.append(_on_event_loop())
+        return real_update(pd, fn, *a, **k)
+
+    monkeypatch.setattr(state_file, "update", spy)
+    with _client(persona_dir, ctrl) as c:
+        seen.clear()
+        assert c.post("/supervisor/shutdown", json={"reason": "user_stop"}).status_code == 202
+        marks = list(seen)
+        assert state_file.read(persona_dir).phase == "stopping"
+    assert marks and not any(marks), marks
+
+
+def test_the_idle_stop_writes_its_mark_off_the_event_loop(persona_dir: Path):
+    """Pre-merge review O-6 (idle half): the idle watcher asks for the stop from a worker thread, not the loop."""
+    import asyncio
+    from datetime import UTC, datetime, timedelta
+    from types import SimpleNamespace
+
+    import brain.bridge.server as srv
+
+    calls: list[bool] = []
+
+    class _Ctrl:
+        def request(self, reason: str) -> bool:
+            calls.append(_on_event_loop())
+            return True
+
+    state = SimpleNamespace(
+        last_chat_at=None, started_at=datetime.now(UTC) - timedelta(hours=1), in_flight_locks={},
+        shutdown_controller=_Ctrl(),
+    )
+    asyncio.run(asyncio.wait_for(srv._idle_watcher(state, 0.01), timeout=10))
+    assert calls == [False]
