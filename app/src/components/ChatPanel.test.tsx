@@ -53,7 +53,7 @@ vi.mock("../expressions", () => ({
 }));
 
 import { ChatPanel } from "./ChatPanel";
-import { acceptVoiceEdit, rejectVoiceEdit, fetchActiveSession, newSession, closeSession, snapshotSession, uploadImage } from "../bridge";
+import { acceptVoiceEdit, rejectVoiceEdit, fetchActiveSession, fetchChatHistory, newSession, closeSession, snapshotSession, uploadImage } from "../bridge";
 import { streamChat } from "../streamChat";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -266,6 +266,93 @@ describe("ChatPanel — sticky-session reattach on first send (F-201)", () => {
       unknown,
     ];
     expect(sessionId).toBe("fresh-sess-after-throw");
+  });
+});
+
+describe("ChatPanel — a send while the mount call is still pending (#523 C15)", () => {
+  // A launch rollover (GET /sessions/active) can take minutes now; the user may send before the mount
+  // call returns. The send joins the same rollover and streams its reply; when the mount call then
+  // resolves, it must not wipe the sent message and the reply, nor replace the send's session id.
+  const mockedFetchActive = fetchActiveSession as unknown as ReturnType<typeof vi.fn>;
+  const mockedFetchHistory = fetchChatHistory as unknown as ReturnType<typeof vi.fn>;
+  const mockedNewSession = newSession as unknown as ReturnType<typeof vi.fn>;
+  const mockedStreamChat = streamChat as unknown as ReturnType<typeof vi.fn>;
+  const history = {
+    messages: [{ role: "user", content: "an older plumbrick line", turn: 1, ts: "2026-10-01T10:00:00Z" }],
+    next_before_turn: null,
+  };
+
+  beforeEach(() => {
+    mockedFetchActive.mockReset();
+    mockedFetchHistory.mockReset();
+    mockedNewSession.mockReset();
+    mockedStreamChat.mockReset();
+    mockedFetchHistory.mockResolvedValue(history);
+    mockedStreamChat.mockImplementation(
+      async (
+        _persona: string,
+        _sid: string,
+        _text: string,
+        handlers: { onChunk: (t: string) => void; onDone: () => void },
+      ) => {
+        handlers.onChunk("hello back from Kestrel");
+        handlers.onDone();
+        return () => undefined;
+      },
+    );
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  async function sendWhileMountPending(mountSid: string) {
+    let resolveMount: (sid: string | null) => void = () => undefined;
+    mockedFetchActive
+      .mockImplementationOnce(() => new Promise<string | null>((r) => (resolveMount = r)))
+      .mockResolvedValue("s_rolled");
+    render(<ChatPanel persona="kestrel" />);
+    const textarea = screen.getByPlaceholderText(/^Write to/) as HTMLTextAreaElement;
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: "hello from Bob" } });
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+    });
+    await waitFor(() => expect(mockedStreamChat).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText("hello back from Kestrel")).toBeInTheDocument();
+    await act(async () => {
+      resolveMount(mountSid);
+    });
+    await waitFor(() => expect(mockedFetchHistory).toHaveBeenCalled());
+  }
+
+  it("keeps the sent message and the streamed reply when the mount call resolves after the send", async () => {
+    await sendWhileMountPending("s_rolled");
+    expect(screen.getByText("hello from Bob")).toBeInTheDocument();
+    expect(screen.getByText("hello back from Kestrel")).toBeInTheDocument();
+    expect(screen.queryByText("an older plumbrick line")).toBeNull();
+  });
+
+  it("keeps the send's session id when the mount call resolves later", async () => {
+    await sendWhileMountPending("s_other");
+    const textarea = screen.getByPlaceholderText(/^Write to/) as HTMLTextAreaElement;
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: "a second line" } });
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+    });
+    await waitFor(() => expect(mockedStreamChat).toHaveBeenCalledTimes(2));
+    const [, secondSid] = mockedStreamChat.mock.calls[1] as [string, string, string, unknown];
+    expect(secondSid).toBe("s_rolled");
+  });
+
+  it("still hydrates the history when the mount call resolves before any send", async () => {
+    mockedFetchActive.mockResolvedValue("s_rolled");
+    render(<ChatPanel persona="kestrel" />);
+    expect(await screen.findByText("an older plumbrick line")).toBeInTheDocument();
+    expect(mockedNewSession).not.toHaveBeenCalled();
   });
 });
 

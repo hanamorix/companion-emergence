@@ -264,9 +264,10 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
             }
           })
           .catch((e) => {
-            // Page unload remains best-effort. In-app persona changes keep the
-            // component mounted, so surface the retryable failure instead of
-            // silently discarding the user's expectation that memory was saved.
+            // Page unload remains best-effort. Only a cleanup that runs while the
+            // panel stays mounted can show this warning; App.tsx remounts the panel
+            // on a persona change (it rebuilds Ready through starting-bridge), so
+            // today this is a guard for a future in-place persona switch.
             if (!keepalive && mountedRef.current) {
               setMemorySaveWarning(
                 `Memory snapshot pending for the previous chat: ${errString(e)}`,
@@ -295,12 +296,15 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
   // session creation (deferred until first send) stays the default when
   // no active session exists — we don't eagerly mint an empty one.
   //
-  // Race note: hydration only writes to setMessages BEFORE any send() can
-  // possibly have appended a new turn — sessionRef.current is null until
-  // the user types and clicks send, and we set it here before any visible
-  // affordance reveals the hydrated state. The cancelled guard ensures a
-  // late resolution after persona switch / unmount doesn't clobber the
-  // new panel's empty state.
+  // Race note (#523): /sessions/active can take minutes when it rolls a stale
+  // session over (it extracts the whole stale buffer first), so the user may
+  // send before this call returns. The send path asks /sessions/active itself,
+  // joins the same rollover on the bridge and sets sessionRef. When this call
+  // then resolves it must not undo that: it sets sessionRef only while it is
+  // still unset, and hydrates only an empty message list (a send already in the
+  // list keeps the list; that session's earlier history then shows on the next
+  // load). The cancelled guard ensures a late resolution after persona switch /
+  // unmount doesn't clobber the new panel's empty state.
   useEffect(() => {
     let cancelled = false;
     void (async () => {
@@ -312,22 +316,24 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
         return;
       }
       if (cancelled || !sid) return;
-      sessionRef.current = sid;
+      if (!sessionRef.current) sessionRef.current = sid;
       try {
         const { messages: history } = await fetchChatHistory(persona, sid, 200);
         if (cancelled) return;
-        setMessages(
-          history.map((h) => ({
-            id: h.turn,
-            from: h.role === "assistant" ? "nell" : "hana",
-            text: h.content,
-            time: h.ts
-              ? new Date(h.ts).toLocaleTimeString("en", {
-                  hour: "numeric",
-                  minute: "2-digit",
-                })
-              : "",
-          })),
+        setMessages((prev) =>
+          prev.length
+            ? prev
+            : history.map((h) => ({
+                id: h.turn,
+                from: h.role === "assistant" ? "nell" : "hana",
+                text: h.content,
+                time: h.ts
+                  ? new Date(h.ts).toLocaleTimeString("en", {
+                      hour: "numeric",
+                      minute: "2-digit",
+                    })
+                  : "",
+              })),
         );
       } catch {
         // Non-fatal: empty messages array is the legitimate fresh-session
