@@ -597,20 +597,23 @@ _STREAM_KEEPALIVE_FLOOR_SECONDS = 1.0
 
 
 def _stream_keepalive_seconds() -> float:
-    """The keepalive interval: the override when usable, else the default. Zero, a negative or a non-finite override would make
+    """The keepalive interval: a ``tunables.json`` override when usable, else the default. Zero, a negative or a non-finite override would make
     the streams send frames or spaces in a tight loop: it is ignored (one warning) for the default; a positive value below
     ``_STREAM_KEEPALIVE_FLOOR_SECONDS`` is raised to it. A bool is rejected by ``get_tunable`` (wrong type)."""
-    value = float(tunables.get_tunable("bridge.stream_keepalive_seconds", _STREAM_KEEPALIVE_SECONDS))
+    default = _STREAM_KEEPALIVE_SECONDS
+    value = float(tunables.get_tunable("bridge.stream_keepalive_seconds", default))
+    if value == default:
+        return default  # the code's own value (tests may set it smaller to run fast); the checks below are for overrides
     if not math.isfinite(value) or value <= 0:
         warn_throttled(
             logger,
             "bridge.stream_keepalive_seconds",
             "tunables: override 'bridge.stream_keepalive_seconds'=%r is not a positive number; using %s",
             value,
-            _STREAM_KEEPALIVE_SECONDS,
+            default,
             exc_info=False,
         )
-        return _STREAM_KEEPALIVE_SECONDS
+        return default
     return max(value, _STREAM_KEEPALIVE_FLOOR_SECONDS)
 
 
