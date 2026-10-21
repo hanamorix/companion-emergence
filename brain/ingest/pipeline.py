@@ -1,24 +1,29 @@
-"""SP-4 pipeline driver — orchestrates all 8 ingest stages.
+"""SP-4 pipeline driver: extracts a session's conversation rows into memories.
 
-close_session()             — run all 8 stages for one session, delete its buffer + cursor.
-extract_session_snapshot()  — non-destructive variant; uses cursor sidecar to extract only new turns.
-close_stale_sessions()      — destructive sweep; retained for explicit close/finalize callers (NOT used by shutdown or recovery).
-snapshot_stale_sessions()   — non-destructive sweep used by periodic supervision, shutdown, and recovery.
-finalize_stale_sessions()   — real-close sweep (24h silence); final snapshot + buffer delete + cursor delete.
+close_session()             extract every row after the cursor, chunk by chunk, then delete the buffer, cursor and backoff.
+extract_session_snapshot()  non-destructive: extract the rows after the cursor sidecar, chunk by chunk; the buffer stays.
+close_stale_sessions()      destructive sweep (close_session for every silent session); for explicit close callers only.
+snapshot_stale_sessions()   non-destructive sweep of the supervisor's session-snapshot job, one chunk per session per pass.
+finalize_stale_sessions()   24h extraction-only sweep, one chunk per session per run; dead-letters a buffer that keeps failing.
 
-Stage flow:
-  BUFFER  → read turns from <persona_dir>/active_conversations/<session_id>.jsonl
-  CLOSE   → guard: if no turns, unlink buffer and return empty report
-  EXTRACT → format transcript, call LLM, get ExtractedItems
+Stage flow of one pass:
+  BUFFER  → read the rows after the cursor from <persona_dir>/active_conversations/<session_id>.jsonl (summary rows dropped)
+  CHUNK   → split them, oldest first, into chunks of whole rows no larger than ``ingest.extraction_chunk_chars``
+            (brain.ingest.ingest_utils.chunk_turns, #523)
+  then per chunk, in ``run_chunk_stages``:
+  EXTRACT → format the chunk's transcript, call the LLM, get ExtractedItems
   SCORE   → normalize each item (label coercion, importance clamp, text strip)
   DEDUPE  → cosine similarity against row/warm-matrix vectors (always attempted, fail-soft)
   COMMIT  → direct write to MemoryStore + auto-Hebbian
   SOUL    → queue high-importance items to soul_candidates.jsonl
-  LOG     → emit structured log event with counts
+  and after a chunk whose commits all succeeded, the cursor moves to that chunk's end, so a pass that stops early (a
+  deferral, a failure, a chunk limit) resumes at the next chunk and no row is skipped.
+  LOG     → emit structured log events with counts
 """
 
 from __future__ import annotations
 
+import enum
 import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -43,13 +48,15 @@ from brain.ingest.buffer import (
 )
 from brain.ingest.commit import commit_item
 from brain.ingest.dedupe import DEFAULT_DEDUP_THRESHOLD, is_duplicate
-from brain.ingest.extract import extract_items_with_status, format_transcript
+from brain.ingest.extract import extract_items_with_status
+from brain.ingest.ingest_utils import chunk_turns, extraction_chunk_chars
 from brain.ingest.soul_queue import DEFAULT_SOUL_THRESHOLD, queue_soul_candidate
 from brain.ingest.types import IngestReport
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.pending import GATE_BYPASS_TYPES
 from brain.memory.store import MemoryStore
 from brain.utils.file_lock import file_lock
+from brain.utils.log_throttle import count_throttled
 
 logger = logging.getLogger(__name__)
 
@@ -74,8 +81,8 @@ def _load_emotion_vocab() -> tuple[set[str], str]:
         return set(), ""
 
 
-# F-011 — extraction backoff knobs. After this many consecutive
-# `conversation_snapshot_failed` events for a given session, pause
+# F-011 — extraction backoff knobs. After this many recorded extraction
+# failures for a given session (record_extraction_failure), pause
 # extraction for `_BACKOFF_WINDOW_MINUTES` so we stop burning LLM calls
 # on a wedged buffer. Success clears the state.
 _BACKOFF_FAILURE_THRESHOLD = 3
@@ -93,7 +100,7 @@ def record_extraction_failure(persona_dir: Path, session_id: str) -> None:
 
     The first failure in a new window anchors ``first_failure_at`` to now; later ones increment the count without moving the anchor,
     so the window measures from the *first* failure. Three of them move a silent buffer to ``poison/`` (the stale sweep) and let the
-    rollover set the unextracted span aside. Never call it for a deferral or a busy pass: those are not failures.
+    rollover set the failing chunk aside. Never call it for a deferral or a busy pass: those are not failures.
     """
     existing = read_backoff(persona_dir, session_id)
     if existing is None:
@@ -108,17 +115,19 @@ def record_extraction_failure(persona_dir: Path, session_id: str) -> None:
 
 
 def poison_unextracted_span(persona_dir: Path, session_id: str) -> int | None:
-    """Set the session's not-yet-extracted turns aside in ``active_conversations/poison/<sid>.span.jsonl`` and move the cursor past
-    them, so the buffer can be folded and reaped (#477).
+    """Set aside the chunk whose extraction keeps failing in ``active_conversations/poison/<sid>.span.jsonl`` and move the cursor
+    past it, so the rest of the buffer can be extracted and the buffer folded and reaped (#477, #523).
 
-    The stale sweep moves a whole buffer to ``poison/`` after the same 3 recorded failures, but only once the session has been silent
-    for 24 hours; a session in daily use with a persistent extraction failure would otherwise grow without bound once the rollover
-    refuses to reap unextracted turns. The turns are KEPT (appended verbatim, never silently lost) and the failure record is cleared
-    so the successor session starts clean.
+    Only the FIRST chunk after the cursor is set aside: it is the one whose failures reached the threshold (a pass stops at its
+    first failing chunk, and the chunking is deterministic for the same rows and limit). The chunks after it were never tried
+    and stay in the buffer after the moved cursor for the next pass. The stale sweep moves a whole buffer to ``poison/`` after
+    the same 3 recorded failures, but only once the session has been silent for 24 hours; a session in daily use with a
+    persistent extraction failure would otherwise grow without bound once the rollover refuses to reap unextracted turns. The
+    rows are KEPT (appended verbatim, never silently lost) and the failure record is cleared.
 
     Runs under the session's non-blocking extraction lock: returns None when another pass holds it (busy: nothing is changed and the
-    caller must not reap); otherwise how many turns were set aside. Raises when they cannot be written, in which case nothing has
-    been changed. A failing CURSOR write happens after the span was appended, so the span may then exist twice after a retry
+    caller must not reap); otherwise how many rows were set aside. Raises when they cannot be written, in which case nothing has
+    been changed. A failing CURSOR write happens after the rows were appended, so they may then exist twice after a retry
     (duplicates, never a loss); the caller still must not reap.
     """
     with file_lock(extract_lock_path(persona_dir, session_id), blocking=False) as acquired:
@@ -129,26 +138,31 @@ def poison_unextracted_span(persona_dir: Path, session_id: str) -> int | None:
         if not turns:
             delete_backoff(persona_dir, session_id)
             return 0
+        failing = chunk_turns(
+            turns,
+            max_chars=extraction_chunk_chars(),
+            user_name=_load_user_name(persona_dir),
+            assistant_name=persona_dir.name,
+        )[0]
         poison_dir = persona_dir / "active_conversations" / "poison"
         poison_dir.mkdir(parents=True, exist_ok=True)
-        append_jsonl(poison_dir / f"{session_id}.span.jsonl", turns, fsync=True)
-        last_ts = turns[-1].get("ts")
-        if last_ts:
-            write_cursor(persona_dir, session_id, str(last_ts))
+        append_jsonl(poison_dir / f"{session_id}.span.jsonl", list(failing.turns), fsync=True)
+        if failing.cursor_ts:
+            write_cursor(persona_dir, session_id, failing.cursor_ts)
         delete_backoff(persona_dir, session_id)
         logger.warning(
-            "conversation_span_poisoned session=%s turns=%d: extraction kept failing; the turns are kept in poison/",
+            "conversation_span_poisoned session=%s turns=%d: extraction of this chunk kept failing; the turns are kept in poison/",
             session_id,
-            len(turns),
+            len(failing.turns),
         )
-        return len(turns)
+        return len(failing.turns)
 
 
 def _load_user_name(persona_dir: Path) -> str | None:
     """Look up PersonaConfig.user_name; None if missing or unset.
 
     Best-effort — never raises. PersonaConfig is the home for the
-    user's name; we read it here once per session close. If the
+    user's name; we read it here once per extraction pass. If the
     config file is corrupt or the field is missing, the extractor
     falls back to the legacy "user:" / "assistant:" prompt path.
     """
@@ -168,6 +182,221 @@ def _load_user_pronouns(persona_dir: Path) -> dict | None:
         return PersonaConfig.load(persona_dir / "persona_config.json").user_pronouns
     except Exception:  # noqa: BLE001
         return None
+
+
+class ChunkResult(enum.Enum):
+    """What ``run_chunk_stages`` did with one chunk."""
+
+    OK = "ok"  # extracted, and every item deduped or committed
+    DEFERRED = "deferred"  # the model call was refused as "not now" (#473): nothing tried, nothing failed
+    FAILED = "failed"  # the extraction failed (provider or parse failures exhausted the retries)
+    COMMIT_FAILED = "commit_failed"  # extracted, but at least one item could not be committed
+
+
+def run_chunk_stages(
+    persona_dir: Path,
+    session_id: str,
+    transcript: str,
+    *,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    provider: LLMProvider,
+    cfg: dict,
+    report: IngestReport,
+    user_name: str | None,
+    assistant_name: str | None,
+    valid_emotions: set[str],
+    emotion_vocab: str,
+    user_pronouns: dict | None,
+    queue_soul: bool = True,
+    extra_metadata: dict | None = None,
+    created_at: datetime | None = None,
+) -> ChunkResult:
+    """EXTRACT → SCORE → DEDUPE → COMMIT → SOUL for one chunk's transcript; the one copy of these stages (#523).
+
+    Called per chunk by the snapshot, by ``close_session`` and by the extraction backfill. Adds its counts to ``report``
+    (``chunks`` += 1 for the extraction call). Never touches the cursor, the buffer or the backoff sidecar: the caller decides
+    what the result means for them.
+
+    ``cfg`` knobs: ``extraction_max_retries`` (1), ``dedup_threshold`` (0.88), ``crystallize_threshold`` (8).
+    ``queue_soul``: queue high-importance items as soul candidates (the backfill turns it off under ``--all``).
+    ``extra_metadata`` / ``created_at``: passed to ``commit_item`` (the backfill's source marker and back-date).
+    A bridge that is stopping (``ShutdownDeferred``) is raised out of the extraction, not returned.
+    """
+    report.chunks += 1
+    extraction = extract_items_with_status(
+        transcript,
+        provider=provider,
+        max_retries=int(cfg.get("extraction_max_retries", 1)),
+        user_name=user_name,
+        assistant_name=assistant_name,
+        emotion_vocab=emotion_vocab,
+        user_pronouns=user_pronouns,
+        persona_dir=persona_dir,
+    )
+    if extraction.deferred:
+        return ChunkResult.DEFERRED
+    if extraction.failed:
+        report.errors += 1
+        logger.warning(
+            "conversation_extract_failed session=%s chars=%d error=%s",
+            session_id,
+            len(transcript),
+            extraction.error or "unknown extraction failure",
+        )
+        return ChunkResult.FAILED
+
+    items = [it.normalize(valid_emotions=valid_emotions, source=f"session={session_id}") for it in extraction.items if it.text]
+    report.extracted += len(items)
+
+    dedup_threshold = float(cfg.get("dedup_threshold", DEFAULT_DEDUP_THRESHOLD))
+    crystallize_threshold = int(cfg.get("crystallize_threshold", DEFAULT_SOUL_THRESHOLD))
+    commit_failures_before = report.commit_failures
+
+    for item in items:
+        # DEDUPE
+        if is_duplicate(item.text, store=store, threshold=dedup_threshold):
+            report.deduped += 1
+            continue
+
+        # COMMIT
+        mem_id = commit_item(
+            item, session_id=session_id, store=store, hebbian=hebbian, extra_metadata=extra_metadata, created_at=created_at
+        )
+        if mem_id is None:
+            report.errors += 1
+            report.commit_failures += 1
+            continue
+
+        # #167: route_write() (called inside commit_item) returns a non-None id
+        # from BOTH its durable (store.create) and queue-only (PendingQueue.enqueue)
+        # branches, so mem_id alone can't tell them apart. Re-derive the same
+        # classification route_write itself used: it branches on
+        # mem.memory_type in GATE_BYPASS_TYPES, and commit_item always sets
+        # memory_type=item.label, so item.label in GATE_BYPASS_TYPES is the
+        # identical predicate. Real conversation-extraction labels are always
+        # in VALID_LABELS, which is disjoint from GATE_BYPASS_TYPES, so this
+        # branch is a correctness/consistency guarantee rather than something
+        # conversation-ingest can trigger today — see IngestReport.committed's
+        # docstring.
+        if item.label in GATE_BYPASS_TYPES:
+            report.committed += 1
+        else:
+            report.enqueued += 1
+        report.memory_ids.append(mem_id)
+
+        # SOUL
+        if queue_soul and item.importance >= crystallize_threshold:
+            queued = queue_soul_candidate(
+                persona_dir,
+                memory_id=mem_id,
+                item=item,
+                session_id=session_id,
+            )
+            if queued:
+                report.soul_candidates += 1
+            else:
+                report.soul_queue_errors += 1
+
+    return ChunkResult.COMMIT_FAILED if report.commit_failures > commit_failures_before else ChunkResult.OK
+
+
+def _run_chunks(
+    persona_dir: Path,
+    session_id: str,
+    turns: list[dict],
+    *,
+    store: MemoryStore,
+    hebbian: HebbianMatrix,
+    provider: LLMProvider,
+    cfg: dict,
+    report: IngestReport,
+    record_failures: bool,
+    max_chunks: int | None,
+) -> None:
+    """Extract ``turns`` (the non-summary rows after the cursor) chunk by chunk, oldest first, under the caller's extraction lock.
+
+    After each chunk whose commits all succeed the cursor moves to that chunk's end (``chunk.cursor_ts``), so a pass that stops
+    resumes at the next chunk with no row skipped or repeated. Stops at the first chunk that is deferred (``report.deferred``,
+    nothing counted, #473), fails or has a commit failure (the cursor stays before that chunk), or when ``max_chunks`` chunks
+    were run with chunks left. Sets ``report.reached_end`` only when every chunk committed.
+
+    ``record_failures`` (the snapshot): a failed chunk or a commit failure is recorded through ``record_extraction_failure``
+    (F-011), and a committed chunk clears the backoff sidecar. ``close_session`` passes False: it keeps its rule of no
+    backoff accounting.
+    """
+    user_name = _load_user_name(persona_dir)
+    assistant_name = persona_dir.name
+    valid_emotions, emotion_vocab = _load_emotion_vocab()
+    user_pronouns = _load_user_pronouns(persona_dir)
+    max_chars = extraction_chunk_chars()
+    chunks = chunk_turns(turns, max_chars=max_chars, user_name=user_name, assistant_name=assistant_name)
+    for index, chunk in enumerate(chunks):
+        if max_chunks is not None and index >= max_chunks:
+            return
+        if chunk.oversize:
+            count_throttled(
+                logger,
+                "conversation_extract_oversize_unit",
+                logging.WARNING,
+                "conversation_extract_oversize_unit session=%s chars=%d max_chars=%d: one exchange longer than the limit, sent whole",
+                session_id,
+                len(chunk.text),
+                max_chars,
+            )
+        result = run_chunk_stages(
+            persona_dir,
+            session_id,
+            chunk.text,
+            store=store,
+            hebbian=hebbian,
+            provider=provider,
+            cfg=cfg,
+            report=report,
+            user_name=user_name,
+            assistant_name=assistant_name,
+            valid_emotions=valid_emotions,
+            emotion_vocab=emotion_vocab,
+            user_pronouns=user_pronouns,
+        )
+        if result is ChunkResult.DEFERRED:
+            # #473: "not now" is not a failure. No error, no backoff entry (three of those move the buffer to poison/),
+            # the cursor stays after the last committed chunk, and the next pass tries again from there.
+            report.deferred = True
+            logger.info(
+                "conversation_extract_deferred session=%s chunk=%d/%d; cursor unchanged from here", session_id, index + 1, len(chunks)
+            )
+            return
+        if result is not ChunkResult.OK:
+            # Extraction failed, or a commit failed: the cursor stays before this chunk, so the next pass retries it and
+            # never skips its un-committed rows.
+            if result is ChunkResult.COMMIT_FAILED:
+                logger.warning(
+                    "conversation_extract_commit_failed session=%s chunk=%d/%d commit_failures=%d; cursor unchanged from here",
+                    session_id,
+                    index + 1,
+                    len(chunks),
+                    report.commit_failures,
+                )
+            if record_failures:
+                record_extraction_failure(persona_dir, session_id)
+            return
+        if record_failures:
+            # F-011: success clears any prior backoff state so the next failure starts a fresh window.
+            delete_backoff(persona_dir, session_id)
+        if chunk.cursor_ts:
+            try:
+                write_cursor(persona_dir, session_id, chunk.cursor_ts)
+            except (OSError, ValueError):
+                logger.warning("conversation_extract_cursor_write_failed session=%s ts=%s", session_id, chunk.cursor_ts)
+    report.reached_end = True
+    if len(chunks) > 1:
+        logger.info(
+            "conversation_extract_chunked session=%s chunks=%d chars=%d",
+            session_id,
+            report.chunks,
+            sum(len(c.text) for c in chunks),
+        )
 
 
 def close_session(
@@ -193,6 +422,10 @@ def close_session(
         )
 
 
+def _row_key(turn: dict) -> tuple:
+    return (turn.get("ts"), turn.get("speaker"), turn.get("text"))
+
+
 def _close_session_locked(
     persona_dir: Path,
     session_id: str,
@@ -202,168 +435,83 @@ def _close_session_locked(
     provider: LLMProvider,
     config: dict | None = None,
 ) -> IngestReport:
-    """Run the full 8-stage ingest pipeline on one session and delete its buffer.
+    """Extract every row after the session's cursor, chunk by chunk, then delete its buffer, cursor and backoff.
 
-    Parameters
-    ----------
-    persona_dir:
-        Root directory for this persona (contains active_conversations/, etc.)
-    session_id:
-        The session to close and process.
-    store:
-        SQLite-backed MemoryStore to commit new memories into.
-    hebbian:
-        HebbianMatrix to strengthen connections between related memories.
-    provider:
-        LLMProvider used for EXTRACT stage (generate() surface).
-    config:
-        Optional dict of pipeline knobs:
-          extraction_max_retries: int = 1
-          max_transcript_tokens: int = 6000
-          dedup_threshold: float = 0.88
-          crystallize_threshold: int = 8
+    Reads only the rows after the cursor (summary rows dropped), like the snapshot, so a buffer a snapshot already extracted
+    in part is not extracted twice, and runs the chunk loop to the end with a cursor write per committed chunk: a close that
+    stops (a deferral #473, a failed chunk, a commit failure) keeps the buffer, and the next close resumes after the last
+    committed chunk. No backoff accounting here (unchanged rule): retries of a held buffer are the snapshot sweep's.
 
-    Returns
-    -------
-    IngestReport with counts of what happened.
+    Before deleting, the rows after the cursor are read again: a row that arrived during the pass (it was never extracted)
+    keeps the buffer, logged ``conversation_close_late_rows``, and the report does not reach the end. Nothing after the
+    cursor at the start: the buffer is deleted and the report reaches the end.
+
+    ``config`` knobs: see ``run_chunk_stages``.
     """
     cfg = config or {}
     report = IngestReport(session_id=session_id)
 
-    # ── BUFFER: read the session turns ──────────────────────────────────────
-    turns = read_session(persona_dir, session_id)
-
-    # ── CLOSE guard: empty session ───────────────────────────────────────────
-    if not turns:
-        delete_session_buffer(persona_dir, session_id)
-        delete_cursor(persona_dir, session_id)
-        delete_backoff(persona_dir, session_id)
-        report.reached_end = True
-        return report
-
-    # ── EXTRACT ──────────────────────────────────────────────────────────────
-    # Bug A (audit-3): pass speaker names so the LLM extractor can
-    # disambiguate the current user from historical figures the assistant
-    # may reference. user_name comes from PersonaConfig.user_name (None
-    # when unset → legacy unnamed prompt). assistant_name is the persona
-    # name (always known — it's the persona dir's basename).
-    user_name = _load_user_name(persona_dir)
-    assistant_name = persona_dir.name
-    transcript = format_transcript(
-        turns,
-        user_name=user_name,
-        assistant_name=assistant_name,
-    )
-    valid_emotions, emotion_vocab = _load_emotion_vocab()
-    extraction = extract_items_with_status(
-        transcript,
-        provider=provider,
-        max_retries=int(cfg.get("extraction_max_retries", 1)),
-        user_name=user_name,
-        assistant_name=assistant_name,
-        emotion_vocab=emotion_vocab,
-        user_pronouns=_load_user_pronouns(persona_dir),
-        persona_dir=persona_dir,
-    )
-    if extraction.deferred:
-        # #473: "not now" is not a failure: no error, and the buffer stays for the next close.
-        report.deferred = True
-        logger.info("conversation_extract_deferred session=%s turns=%d; retaining buffer", session_id, len(turns))
-        return report
-    if extraction.failed:
-        report.errors += 1
-        logger.warning(
-            "conversation_extract_failed session=%s turns=%d error=%s; retaining buffer for retry",
+    cursor = read_cursor(persona_dir, session_id)
+    turns = [t for t in read_session_after(persona_dir, session_id, cursor) if t.get("speaker") != "summary"]
+    if turns:
+        _run_chunks(
+            persona_dir,
+            session_id,
+            turns,
+            store=store,
+            hebbian=hebbian,
+            provider=provider,
+            cfg=cfg,
+            report=report,
+            record_failures=False,
+            max_chunks=None,
+        )
+        logger.info(
+            "conversation_ingested session=%s turns=%d chunks=%d extracted=%d committed=%d enqueued=%d "
+            "deduped=%d soul_candidates=%d soul_queue_errors=%d errors=%d",
             session_id,
             len(turns),
-            extraction.error or "unknown extraction failure",
+            report.chunks,
+            report.extracted,
+            report.committed,
+            report.enqueued,
+            report.deduped,
+            report.soul_candidates,
+            report.soul_queue_errors,
+            report.errors,
+        )
+    else:
+        report.reached_end = True
+
+    if not report.reached_end:
+        logger.warning(
+            "conversation_close_held session=%s deferred=%s errors=%d commit_failures=%d; buffer retained, cursor after the "
+            "last committed chunk",
+            session_id,
+            report.deferred,
+            report.errors,
+            report.commit_failures,
         )
         return report
 
-    items = extraction.items
-    report.extracted = len(items)
-
-    # ── SCORE (normalize at the boundary) ────────────────────────────────────
-    items = [it.normalize(valid_emotions=valid_emotions, source=f"session={session_id}") for it in items if it.text]
-
-    # ── DEDUPE + COMMIT + SOUL ────────────────────────────────────────────────
-    dedup_threshold = float(cfg.get("dedup_threshold", DEFAULT_DEDUP_THRESHOLD))
-    crystallize_threshold = int(cfg.get("crystallize_threshold", DEFAULT_SOUL_THRESHOLD))
-
-    for item in items:
-        # DEDUPE
-        if is_duplicate(item.text, store=store, threshold=dedup_threshold):
-            report.deduped += 1
-            continue
-
-        # COMMIT
-        mem_id = commit_item(item, session_id=session_id, store=store, hebbian=hebbian)
-        if mem_id is None:
-            report.errors += 1
-            report.commit_failures += 1
-            continue
-
-        # #167: route_write() (called inside commit_item) returns a non-None id
-        # from BOTH its durable (store.create) and queue-only (PendingQueue.enqueue)
-        # branches, so mem_id alone can't tell them apart. Re-derive the same
-        # classification route_write itself used: it branches on
-        # mem.memory_type in GATE_BYPASS_TYPES, and commit_item always sets
-        # memory_type=item.label, so item.label in GATE_BYPASS_TYPES is the
-        # identical predicate. Real conversation-extraction labels are always
-        # in VALID_LABELS, which is disjoint from GATE_BYPASS_TYPES, so this
-        # branch is a correctness/consistency guarantee rather than something
-        # conversation-ingest can trigger today — see IngestReport.committed's
-        # docstring.
-        if item.label in GATE_BYPASS_TYPES:
-            report.committed += 1
-        else:
-            report.enqueued += 1
-        report.memory_ids.append(mem_id)
-
-        # SOUL
-        if item.importance >= crystallize_threshold:
-            queued = queue_soul_candidate(
-                persona_dir,
-                memory_id=mem_id,
-                item=item,
-                session_id=session_id,
-            )
-            if queued:
-                report.soul_candidates += 1
-            else:
-                report.soul_queue_errors += 1
-
-    # ── LOG ──────────────────────────────────────────────────────────────────
-    logger.info(
-        "conversation_ingested session=%s turns=%d extracted=%d committed=%d enqueued=%d "
-        "deduped=%d soul_candidates=%d soul_queue_errors=%d errors=%d",
-        session_id,
-        len(turns),
-        report.extracted,
-        report.committed,
-        report.enqueued,
-        report.deduped,
-        report.soul_candidates,
-        report.soul_queue_errors,
-        report.errors,
-    )
-
-    # ── DELETE buffer ─────────────────────────────────────────────────────────
-    if report.commit_failures == 0:
-        delete_session_buffer(persona_dir, session_id)
-        delete_cursor(persona_dir, session_id)
-        delete_backoff(persona_dir, session_id)
-        report.reached_end = True
-    else:
-        # close_session only holds + logs. Backoff escalation toward dead-letter
-        # is owned by the extract_session_snapshot sweep (5-min and 24-h cadences),
-        # not by close_session — the supervisor drives retry, not this call site.
+    # S2 (#523): the pass took one or more model calls; a row persisted meanwhile is after the cursor and was never
+    # extracted. The rows the pass itself extracted are excluded by identity, so a failed cursor write cannot hold a buffer.
+    seen = {_row_key(t) for t in turns}
+    late = [
+        t
+        for t in read_session_after(persona_dir, session_id, read_cursor(persona_dir, session_id))
+        if t.get("speaker") != "summary" and _row_key(t) not in seen
+    ]
+    if late:
+        report.reached_end = False
         logger.warning(
-            "conversation_close_held session=%s commit_failures=%d — buffer retained for retry",
-            session_id,
-            report.commit_failures,
+            "conversation_close_late_rows session=%s rows=%d: rows arrived during the close; buffer retained", session_id, len(late)
         )
+        return report
 
+    delete_session_buffer(persona_dir, session_id)
+    delete_cursor(persona_dir, session_id)
+    delete_backoff(persona_dir, session_id)
     return report
 
 
@@ -375,6 +523,7 @@ def extract_session_snapshot(
     hebbian: HebbianMatrix,
     provider: LLMProvider,
     config: dict | None = None,
+    max_chunks: int | None = None,
 ) -> IngestReport:
     """Run one snapshot extraction of ``session_id``; one extraction per session at a time (#477).
 
@@ -384,6 +533,10 @@ def extract_session_snapshot(
     advances the cursor, and the next sweep picks up anything it did not cover. The skip is not
     an error and counts for nothing, and the report says so (``busy``), so a caller that acts on the
     result (the rollover) can tell it from a pass that had nothing to do.
+
+    ``max_chunks`` (#523): at most this many chunks (model calls) in this pass; None runs to the end. Callers that do not
+    need the whole span extracted (the sweep, finalize, the snapshot route) pass 1, so they make no more calls per run than
+    before chunking; the rest is taken by the next pass. The extraction lock is held across the whole pass.
     """
     with file_lock(extract_lock_path(persona_dir, session_id), blocking=False) as acquired:
         if not acquired:
@@ -396,6 +549,7 @@ def extract_session_snapshot(
             hebbian=hebbian,
             provider=provider,
             config=config,
+            max_chunks=max_chunks,
         )
 
 
@@ -407,14 +561,14 @@ def _extract_session_snapshot_locked(
     hebbian: HebbianMatrix,
     provider: LLMProvider,
     config: dict | None = None,
+    max_chunks: int | None = None,
 ) -> IngestReport:
-    """Run BUFFER → EXTRACT → SCORE → DEDUPE → COMMIT → SOUL → LOG without
-    deleting the buffer.
+    """Extract the rows after the session's cursor, chunk by chunk, without deleting the buffer.
 
-    Uses a per-session cursor sidecar to extract only turns added since the
-    previous successful snapshot. On a successful pass, advances the cursor
-    to the ts of the last extracted turn. On extraction failure, the cursor
-    is unchanged so the next pass retries the same turns.
+    The cursor sidecar records how far extraction got: after each chunk whose commits all succeed it moves to that chunk's
+    end. A deferral stops the pass with nothing counted (#473); a failed chunk or a commit failure stops it with one failure
+    recorded in the backoff sidecar (F-011) and the cursor before that chunk, so the next pass retries it. ``max_chunks``:
+    see ``extract_session_snapshot``. The report reaches the end only when no row is left after the cursor.
 
     Returns an IngestReport with the same shape as close_session.
     """
@@ -423,7 +577,7 @@ def _extract_session_snapshot_locked(
 
     # F-011 — backoff guard: if we've failed N consecutive times within the
     # window, skip extraction entirely until the window expires. Stops the
-    # 5-min snapshot sweep from burning LLM calls on a wedged buffer.
+    # snapshot sweep from burning LLM calls on a wedged buffer.
     backoff_state = read_backoff(persona_dir, session_id)
     if backoff_state is not None and backoff_state["failures"] >= _BACKOFF_FAILURE_THRESHOLD:
         first_failure_dt = datetime.fromisoformat(
@@ -445,11 +599,11 @@ def _extract_session_snapshot_locked(
 
     cursor = read_cursor(persona_dir, session_id)
     turns = read_session_after(persona_dir, session_id, cursor)
-    # Drop compaction `summary` blocks before transcription AND before the cursor
-    # advance below — a faded summary must never be re-extracted as memory, and
+    # Drop compaction `summary` blocks before chunking AND before any cursor
+    # advance — a faded summary must never be re-extracted as memory, and
     # its compaction-time ts must not move the ingest cursor past un-extracted
-    # turns. Only the new summary type is excluded (arbitrary name-speakers, e.g.
-    # "Hana", remain valid conversation turns).
+    # turns. Only the new summary type is excluded (arbitrary name-speakers
+    # remain valid conversation turns).
     turns = [t for t in turns if t.get("speaker") != "summary"]
 
     if not turns:
@@ -461,130 +615,32 @@ def _extract_session_snapshot_locked(
         report.reached_end = True
         return report
 
-    user_name = _load_user_name(persona_dir)
-    assistant_name = persona_dir.name
-    transcript = format_transcript(
+    _run_chunks(
+        persona_dir,
+        session_id,
         turns,
-        user_name=user_name,
-        assistant_name=assistant_name,
-    )
-    valid_emotions, emotion_vocab = _load_emotion_vocab()
-    extraction = extract_items_with_status(
-        transcript,
+        store=store,
+        hebbian=hebbian,
         provider=provider,
-        max_retries=int(cfg.get("extraction_max_retries", 1)),
-        user_name=user_name,
-        assistant_name=assistant_name,
-        emotion_vocab=emotion_vocab,
-        user_pronouns=_load_user_pronouns(persona_dir),
-        persona_dir=persona_dir,
+        cfg=cfg,
+        report=report,
+        record_failures=True,
+        max_chunks=max_chunks,
     )
-    if extraction.deferred:
-        # #473: "not now" is not a failure. No error, no backoff entry (three of those move the buffer to poison/),
-        # the cursor stays, and the next sweep tries again.
-        report.deferred = True
-        logger.info(
-            "conversation_snapshot_deferred session=%s turns=%d; cursor unchanged", session_id, len(turns)
-        )
-        return report
-    if extraction.failed:
-        report.errors += 1
-        logger.warning(
-            "conversation_snapshot_failed session=%s turns=%d error=%s; cursor unchanged",
-            session_id,
-            len(turns),
-            extraction.error or "unknown extraction failure",
-        )
-        record_extraction_failure(persona_dir, session_id)
-        return report
-
-    items = [it.normalize(valid_emotions=valid_emotions, source=f"session={session_id}") for it in extraction.items if it.text]
-    report.extracted = len(items)
-
-    dedup_threshold = float(cfg.get("dedup_threshold", DEFAULT_DEDUP_THRESHOLD))
-    crystallize_threshold = int(cfg.get("crystallize_threshold", DEFAULT_SOUL_THRESHOLD))
-
-    for item in items:
-        if is_duplicate(item.text, store=store, threshold=dedup_threshold):
-            report.deduped += 1
-            continue
-        mem_id = commit_item(item, session_id=session_id, store=store, hebbian=hebbian)
-        if mem_id is None:
-            report.errors += 1
-            report.commit_failures += 1
-            continue
-        # #167: see the identical comment in close_session above.
-        if item.label in GATE_BYPASS_TYPES:
-            report.committed += 1
-        else:
-            report.enqueued += 1
-        report.memory_ids.append(mem_id)
-
-        if item.importance >= crystallize_threshold:
-            queued = queue_soul_candidate(
-                persona_dir,
-                memory_id=mem_id,
-                item=item,
-                session_id=session_id,
-            )
-            if queued:
-                report.soul_candidates += 1
-            else:
-                report.soul_queue_errors += 1
-
-    # F-011 — backoff accounting at end of pass.
-    # Commit failures: bump the sidecar so finalize_stale_sessions can
-    # dead-letter after _BACKOFF_FAILURE_THRESHOLD repeated failures. Mirrors
-    # the extraction-failure backoff above — first failure anchors
-    # first_failure_at; subsequent failures increment without moving the anchor.
-    # Success: clear any prior backoff state so the next failure starts fresh.
-    if report.commit_failures > 0:
-        existing = read_backoff(persona_dir, session_id)
-        if existing is None:
-            write_backoff(
-                persona_dir,
-                session_id,
-                failures=1,
-                first_failure_at=datetime.now(UTC).isoformat(),
-            )
-        else:
-            write_backoff(
-                persona_dir,
-                session_id,
-                failures=existing["failures"] + 1,
-                first_failure_at=existing["first_failure_at"],
-            )
-    else:
-        # F-011 — success clears any prior backoff state so the next failure
-        # starts a fresh window. The wedge (if there was one) is past.
-        delete_backoff(persona_dir, session_id)
-
-    # Advance cursor only when all commits succeeded. If any commit failed,
-    # the buffer is held for retry — advancing the cursor would cause the
-    # next pass to skip the un-committed turns permanently.
-    last_ts = turns[-1].get("ts")
-    report.reached_end = report.commit_failures == 0
-    if report.commit_failures == 0 and last_ts:
-        try:
-            write_cursor(persona_dir, session_id, str(last_ts))
-        except (OSError, ValueError):
-            logger.warning(
-                "conversation_snapshot_cursor_write_failed session=%s ts=%s",
-                session_id,
-                last_ts,
-            )
 
     logger.info(
-        "conversation_snapshot session=%s turns=%d extracted=%d committed=%d enqueued=%d "
+        "conversation_snapshot session=%s turns=%d chunks=%d reached_end=%s extracted=%d committed=%d enqueued=%d "
         "deduped=%d soul_candidates=%d cursor=%s",
         session_id,
         len(turns),
+        report.chunks,
+        report.reached_end,
         report.extracted,
         report.committed,
         report.enqueued,
         report.deduped,
         report.soul_candidates,
-        last_ts,
+        read_cursor(persona_dir, session_id),
     )
     return report
 
@@ -600,7 +656,11 @@ def snapshot_stale_sessions(
     should_pause: Callable[[], bool] | None = None,
     paused_out: list[bool] | None = None,
 ) -> list[IngestReport]:
-    """Iterate active sessions; snapshot any whose last turn is past silence_minutes.
+    """Iterate active sessions; snapshot any whose last turn is past silence_minutes, ONE chunk per session per call.
+
+    Bounded per pass (#523): each session's snapshot makes at most one extraction call (``max_chunks=1``), as before
+    chunking. A longer backlog keeps the session-snapshot job's "has work" probe true (rows left after the cursor), so the
+    next idle pass of the central cadence takes the next chunk, and the other gated jobs run in between.
 
     Non-destructive: buffer files and the in-memory _SESSIONS registry are
     left intact. The caller (supervisor) should NOT call remove_session()
@@ -639,6 +699,7 @@ def snapshot_stale_sessions(
                     hebbian=hebbian,
                     provider=provider,
                     config=config,
+                    max_chunks=1,
                 )
                 reports.append(report)
                 if should_pause is not None and should_pause():
@@ -674,7 +735,9 @@ def finalize_stale_sessions(
     """Iterate active sessions; finalize any whose last turn is past
     ``finalize_after_hours``.
 
-    "Finalize" = run one last snapshot extraction. It is now **extraction-only**
+    "Finalize" = run one snapshot extraction of ONE chunk per session (#523: ``max_chunks=1``, so a run makes no more model
+    calls per session than before chunking and has no long uninterrupted stretch; the snapshot sweep takes the rest at the
+    next lulls). It is now **extraction-only**
     (cascade-compaction 1c, stage-3 L2): it NO LONGER deletes conversation buffers —
     the rollover path (brain/chat/rollover.perform_rollover) owns buffer deletion, so
     a rolled-over buffer is reaped exactly once and a still-live session's buffer is
@@ -706,6 +769,7 @@ def finalize_stale_sessions(
                 hebbian=hebbian,
                 provider=provider,
                 config=config,
+                max_chunks=1,
             )
         except ThrottleDeferred:
             # #456/#473: not a failure: no backoff counted, the session is left for a later pass.
@@ -799,14 +863,12 @@ def close_stale_sessions(
 ) -> list[IngestReport]:
     """Iterate active sessions; close any whose last turn is older than silence_minutes.
 
-    Destructive — runs the full close_session pipeline (extract + delete buffer +
-    delete cursor sidecar) for every match. Retained for explicit close/finalize
-    callers only. NOT used by bridge shutdown or dirty-start recovery (both now
-    call ``snapshot_stale_sessions`` which is non-destructive).
+    Destructive — runs the full close_session pipeline (extract every chunk after the
+    cursor + delete buffer + delete cursor sidecar) for every match. Retained for
+    explicit close callers only; bridge shutdown and recovery do not call it.
 
-    For the periodic non-destructive 5-minute sweep, startup recovery, or graceful
-    shutdown drain, use ``snapshot_stale_sessions`` instead.
-    For the 24h real-close cadence, use ``finalize_stale_sessions``.
+    For the periodic non-destructive sweep, use ``snapshot_stale_sessions`` instead.
+    For the 24h extraction-only cadence, use ``finalize_stale_sessions``.
 
     Empty sessions (no turns) are cleaned up silently without running the
     full pipeline.
