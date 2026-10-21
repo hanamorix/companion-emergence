@@ -15,6 +15,7 @@ Internal:
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import signal
@@ -62,6 +63,9 @@ else:
 # not release or move the lock (the lock is independent of current EOF).
 _WINDOWS_LOCK_OFFSET = 1 << 20  # 1 MiB
 
+# msvcrt.locking(LK_LOCK) raises OSError with this errno when the byte is still locked after its own 10 tries.
+_EDEADLOCK = getattr(errno, "EDEADLOCK", errno.EDEADLK)
+
 
 def acquire_lock(persona_dir: Path, *, blocking: bool = False) -> int | None:
     """Take the bridge's OS-level lock for the whole process life.
@@ -77,7 +81,8 @@ def acquire_lock(persona_dir: Path, *, blocking: bool = False) -> int | None:
     duration and pass it to release_lock) on success, or None if another
     live process holds the lock. With ``blocking=True`` it waits until the lock
     is free instead (POSIX: a blocking flock; Windows: msvcrt's own 10 x 1 s
-    LK_LOCK retry, repeated), as `nell supervisor run` does for OS services.
+    LK_LOCK retry, repeated while the lock is still held; any other lock error
+    returns None), as `nell supervisor run` does for OS services.
 
     The pid is written into the file for information only (S50) — never
     read back to make a decision here. It sits at offset 0 on BOTH
@@ -97,7 +102,11 @@ def acquire_lock(persona_dir: Path, *, blocking: bool = False) -> int | None:
                     try:
                         msvcrt.locking(fd, msvcrt.LK_LOCK, 1)  # retries 10 x 1 s itself, then raises
                         break
-                    except OSError:
+                    except OSError as exc:
+                        # Only "still held after its 10 tries" (EDEADLOCK) is contention; any other error (a bad fd,
+                        # an access error) would repeat forever, so it ends the wait (review O-3).
+                        if exc.errno != _EDEADLOCK:
+                            raise
                         os.lseek(fd, _WINDOWS_LOCK_OFFSET, os.SEEK_SET)
             else:
                 msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)

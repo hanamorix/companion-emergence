@@ -1729,6 +1729,55 @@ def test_acquire_lock_windows_path_locks_far_offset_pid_stays_at_zero(
     assert unlock_pos == daemon._WINDOWS_LOCK_OFFSET
 
 
+class _FakeBlockingMsvcrt:
+    """msvcrt for the Windows blocking path: LK_LOCK raises the queued OSErrors in turn, then succeeds. More calls
+    than queued + 5 means the caller is spinning: raise a non-OSError so the test fails instead of hanging."""
+
+    LK_LOCK = 1
+    LK_NBLCK = 2
+    LK_UNLCK = 0
+
+    def __init__(self, errors: list[int]) -> None:
+        self.errors = list(errors)
+        self.lock_calls = 0
+        self._limit = len(errors) + 5
+
+    def locking(self, fd: int, mode: int, nbytes: int) -> None:
+        if mode != self.LK_LOCK:
+            return
+        self.lock_calls += 1
+        if self.lock_calls > self._limit:
+            raise RuntimeError("acquire_lock kept retrying a lock error that is not contention")
+        if self.errors:
+            code = self.errors.pop(0)
+            raise OSError(code, os.strerror(code))
+
+
+def test_acquire_lock_windows_blocking_retries_only_on_contention(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pre-merge review O-3: LK_LOCK gives up after its own 10 x 1 s with EDEADLOCK while another process holds the
+    lock; that is retried. Any other error (a bad fd, an access error) is not contention: no retry, None."""
+    import errno
+
+    deadlock = getattr(errno, "EDEADLOCK", errno.EDEADLK)
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    monkeypatch.setattr(daemon, "_IS_WINDOWS", True)
+
+    waits = _FakeBlockingMsvcrt([deadlock, deadlock])
+    monkeypatch.setattr(daemon, "msvcrt", waits, raising=False)
+    fd = daemon.acquire_lock(persona_dir, blocking=True)
+    assert fd is not None and waits.lock_calls == 3
+    os.close(fd)
+
+    for code in (errno.EBADF, errno.EACCES, errno.EINVAL):
+        broken = _FakeBlockingMsvcrt([code] * 50)
+        monkeypatch.setattr(daemon, "msvcrt", broken, raising=False)
+        assert daemon.acquire_lock(persona_dir, blocking=True) is None
+        assert broken.lock_calls == 1
+
+
 def test_kill_if_alive_signals_a_live_pid(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[int, int]] = []
     monkeypatch.setattr(daemon.os, "kill", lambda pid, sig: calls.append((pid, sig)))
