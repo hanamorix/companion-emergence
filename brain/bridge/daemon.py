@@ -494,13 +494,22 @@ def _await_readiness(persona_dir: Path, pid: int, log_path: Path, out: dict | No
     return 1
 
 
+def _ended_on_a_requested_stop(st: state_file.BridgeState | None) -> bool:
+    """The record says its bridge ended on a stop someone asked for (a user or app stop, an OS signal, an idle stop or
+    a hard exit), not a crash: it left "running" and names a reason other than "crash" / "unknown"."""
+    from brain.bridge.shutdown import REASON_CRASH, REASON_UNKNOWN
+
+    return st is not None and st.phase != "running" and st.stop_reason not in (None, "", REASON_CRASH, REASON_UNKNOWN)
+
+
 def cmd_run(args) -> int:
     """Run the bridge in the foreground for OS service managers.
 
     Unlike ``cmd_start``, this does not fork or detach. The current process is
     the bridge process until uvicorn exits, which is exactly what launchd wants
-    to supervise. A per-persona lock is held for the lifetime of the process so
-    parallel starts fail cleanly and stale locks can be recovered by pid.
+    to supervise. A per-persona lock is held for the lifetime of the process; a
+    run that finds it held waits for it (D4). A service run that waited for a
+    running bridge does not start when that bridge ended on a requested stop.
     """
     from brain.paths import get_persona_dir
 
@@ -523,9 +532,11 @@ def cmd_run(args) -> int:
     # D4 (#177 S3): an OS service must not exit 2 here (systemd / launchd / Task Scheduler read it as a failure and
     # respawn forever). Whether a live bridge or a starter holds the lock, wait for it, then run.
     fd = acquire_lock(persona_dir)
+    waited_for_a_bridge = False
     if fd is None:
         cur = state_file.read(persona_dir)
         if cur is not None and state_file.bridge_liveness(cur, persona_dir) == state_file.ALIVE:
+            waited_for_a_bridge = True
             print(f"waiting for the running bridge (pid {cur.pid}) to exit", file=sys.stderr)
         else:
             print("waiting for the bridge lock (another start is in progress)", file=sys.stderr)
@@ -539,6 +550,12 @@ def cmd_run(args) -> int:
             # Re-checked under the lock, BEFORE run_bridge_foreground deletes the watcher files (S6-a, S7-g).
             print("not starting: stopped on request", file=sys.stderr)
             logger.info("not starting: stopped on request (user kill of this boot)")
+            return 0
+        if guarded and waited_for_a_bridge and _ended_on_a_requested_stop(state_file.read(persona_dir)):
+            # Pre-merge review O-2: a service run queued behind a running bridge does not undo that bridge's
+            # requested stop (exit 0: success to every service manager, so nothing restarts it).
+            print("not starting: the running bridge was stopped on request", file=sys.stderr)
+            logger.info("not starting: the bridge this run waited for was stopped on request")
             return 0
         if client_origin == "systemd":
             try:

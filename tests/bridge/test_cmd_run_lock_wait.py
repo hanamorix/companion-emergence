@@ -52,11 +52,11 @@ def _holder(persona_dir: Path, tmp_path: Path):
     return p, go
 
 
-def _run_in_thread(monkeypatch, persona_dir):
+def _run_in_thread(monkeypatch, persona_dir, client_origin: str = "tests"):
     ran = threading.Event()
     monkeypatch.setattr("brain.bridge.runner.run_bridge_foreground", lambda pd, **kw: ran.set() or 0)
     result: dict = {}
-    args = SimpleNamespace(persona="nell", idle_shutdown=0, client_origin="tests")
+    args = SimpleNamespace(persona="nell", idle_shutdown=0, client_origin=client_origin)
     t = threading.Thread(target=lambda: result.setdefault("rc", daemon.cmd_run(args)), daemon=True)
     t.start()
     return t, ran, result
@@ -103,3 +103,76 @@ def test_cmd_run_over_a_stale_reused_pid_record_runs_at_once(home, tmp_path, mon
     finally:
         sleeper.kill()
         sleeper.wait()
+
+
+def _live_record(persona_dir: Path, holder) -> None:
+    state_file.write(
+        persona_dir,
+        state_file.BridgeState(
+            persona="nell", pid=holder.pid, port=51234, started_at="t", stopped_at=None, shutdown_clean=False,
+            client_origin="cli", pid_token=pi.token_of(holder.pid), identity="token", phase="running",
+        ),
+    )
+
+
+def _stopped_on_request(persona_dir: Path, reason: str) -> None:
+    """What the bridge it waited for writes at the end of a requested stop (runner._write_stopped)."""
+
+    def _mark(st: state_file.BridgeState) -> None:
+        st.phase, st.stop_reason, st.shutdown_clean = "stopped", reason, True
+        st.pid = st.port = st.pid_token = None
+
+    cur = state_file.read(persona_dir)
+    _mark(cur)
+    state_file.write(persona_dir, cur)
+
+
+@pytest.mark.parametrize("reason", ["user_stop", "hard_exit"])
+def test_a_service_run_waiting_for_a_bridge_does_not_undo_its_requested_stop(home, tmp_path, monkeypatch, reason):
+    """Pre-merge review O-2: a service-origin `nell supervisor run` queued behind a running bridge must not start a new
+    bridge once that bridge has ended on a requested stop (`nell supervisor stop`, or a hard exit the user chose):
+    it exits 0 (success to every service manager, so nothing restarts it) without running."""
+    holder, go = _holder(home, tmp_path)
+    try:
+        _live_record(home, holder)
+        t, ran, result = _run_in_thread(monkeypatch, home, client_origin="task-scheduler")
+        t.join(timeout=1.5)
+        assert t.is_alive(), f"cmd_run returned {result.get('rc')} instead of waiting for the lock"
+        _stopped_on_request(home, reason)
+        go.write_text("go")
+        t.join(timeout=30)
+        assert not t.is_alive()
+        assert result["rc"] == 0 and not ran.is_set()
+    finally:
+        go.write_text("go")
+        holder.wait(timeout=30)
+
+
+@pytest.mark.parametrize(
+    "origin, ended",
+    [("task-scheduler", "crash"), ("task-scheduler", "died"), ("tests", "user_stop")],
+    ids=["service-after-crash", "service-after-death", "terminal-run-after-stop"],
+)
+def test_a_waiting_run_still_starts_after_a_crash_or_when_run_by_hand(home, tmp_path, monkeypatch, origin, ended):
+    """The other side of O-2: a bridge that crashed (reason "crash") or died with its record still "running" is
+    replaced by the waiting service run (#177); a run started by hand in a terminal is an explicit start and runs
+    after the stop it waited for."""
+    holder, go = _holder(home, tmp_path)
+    try:
+        _live_record(home, holder)
+        t, ran, result = _run_in_thread(monkeypatch, home, client_origin=origin)
+        t.join(timeout=1.5)
+        assert t.is_alive()
+        if ended == "crash":
+            st = state_file.read(home)
+            st.phase, st.stop_reason = "hard_exit", "crash"
+            state_file.write(home, st)
+        elif ended == "user_stop":
+            _stopped_on_request(home, "user_stop")
+        go.write_text("go")
+        t.join(timeout=30)
+        assert not t.is_alive()
+        assert result["rc"] == 0 and ran.is_set()
+    finally:
+        go.write_text("go")
+        holder.wait(timeout=30)
