@@ -486,12 +486,18 @@ _RESTART_BLOCK = re.compile(
 def refresh_installed_task(persona: str) -> bool:
     """Raise the restart settings of OUR already-installed task for ``persona`` (D26, the D14 pattern).
 
-    Reads the registered XML (``schtasks /Query /XML``); a task whose command is not the one this module writes is left
-    alone; when ``RestartOnFailure`` is not ``RESTART_INTERVAL`` / ``RESTART_COUNT``, only those two values change and the
-    task is registered again with ``/Create /XML /F`` (the cached XML is rewritten too). One INFO line; idempotent;
-    a failure is a WARNING and returns False. Microsoft documents that editing a task leaves a running instance alone
-    for ``Set-ScheduledTask``; for this call that is an inference, not yet checked on Windows. Returns True when the
-    task was changed."""
+    Called by ``start_service`` only: a path that runs outside any task instance (an instance replacing its own
+    definition is not something we can test or document). Reads the registered XML (``schtasks /Query /XML``) and,
+    for a task whose command is the one this module writes and whose ``RestartOnFailure`` is not ``RESTART_INTERVAL`` /
+    ``RESTART_COUNT``, changes only those two values and registers the text again with ``/Create /XML /F`` (the cached
+    XML is rewritten too).
+
+    Never from text that may have been damaged: ``run_schtasks`` decodes schtasks' console output as UTF-8 with
+    replacement, so a non-ASCII character (a profile path with an accented letter, which comes back as U+FFFD or as
+    another letter) or a NUL (UTF-16 output) would be written back wrong and break the task's command. Any non-ASCII
+    character or NUL in the queried XML skips the refresh with one WARNING: that task keeps its old settings until its
+    next ``nell service install``. One INFO line on success; idempotent; a failure is a WARNING and returns False.
+    Returns True when the task was changed."""
     name = task_name(persona)
     queried = run_schtasks(["/Query", "/TN", name, "/XML"])
     if queried.returncode != 0:
@@ -502,6 +508,12 @@ def refresh_installed_task(persona: str) -> bool:
     )
     block = _RESTART_BLOCK.search(xml)
     if ours is None or block is None or (block.group(2), block.group(4)) == (RESTART_INTERVAL, str(RESTART_COUNT)):
+        return False
+    if not xml.isascii() or "\x00" in xml:
+        logger.warning(
+            "task scheduler task not refreshed: its registered XML cannot be read back without loss "
+            "(non-ASCII text); it keeps its old restart settings until `nell service install` is run again"
+        )
         return False
     new_xml = (
         xml[: block.start()]
@@ -527,10 +539,15 @@ def refresh_installed_task(persona: str) -> bool:
 
 
 def start_service(*, persona: str) -> subprocess.CompletedProcess[str]:
-    """Run the installed task (#456 D20). Any stop intent and start back-off record are cleared first (D25, D26)."""
+    """Run the installed task (#456 D20). Any stop intent and start back-off record are cleared first (D25, D26), and
+    the task's restart settings are brought up to date (``refresh_installed_task``)."""
     from brain.service import lifecycle
 
     lifecycle.note_explicit_start(persona)
+    try:
+        refresh_installed_task(persona)  # outside any instance; before /Run, so an instance it ends is started again
+    except Exception:  # noqa: BLE001 - best effort; the task keeps working with its old restart settings
+        logger.warning("task scheduler task refresh failed", exc_info=True)
     return run_schtasks(["/Run", "/TN", task_name(persona)])
 
 

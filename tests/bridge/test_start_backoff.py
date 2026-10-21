@@ -41,6 +41,7 @@ class Clock:
 def clock(monkeypatch) -> Clock:
     c = Clock()
     monkeypatch.setattr(start_backoff, "_now", c.now)
+    monkeypatch.setattr(start_backoff, "_monotonic", c.now)
     monkeypatch.setattr(start_backoff, "_sleep", c.sleep)
     return c
 
@@ -102,7 +103,8 @@ def test_the_record_is_not_a_watcher_file_and_survives_the_start_cleanup(pd, clo
 @pytest.mark.parametrize(
     "content",
     [b"{not json", b"[1, 2]", b'"text"', b'{"unproven_starts": "two", "at": 1}', b'{"unproven_starts": -3, "at": 1}',
-     b'{"unproven_starts": 2}', b'{"unproven_starts": true, "at": 1}', b"\xff\xfe\x00bad"],
+     b'{"unproven_starts": 2}', b'{"unproven_starts": true, "at": 1}', b"\xff\xfe\x00bad",
+     b'{"unproven_starts": 1, "at": Infinity}', b'{"unproven_starts": 1, "at": NaN}'],
 )
 def test_unreadable_or_invalid_content_reads_as_zero_failures(pd, content):
     (pd / start_backoff.FILENAME).write_bytes(content)
@@ -174,6 +176,76 @@ def test_the_wait_ends_when_interrupted_and_says_not_to_start(pd, clock, monkeyp
 def test_no_record_means_the_wait_does_not_sleep(pd, clock, monkeypatch):
     monkeypatch.setattr(start_backoff, "_sleep", lambda s: pytest.fail("slept"))
     assert start_backoff.wait_before_start(pd, interrupted=lambda: False) is True
+
+
+def _bounded_sleep(clock, limit_s: float):
+    """A fake sleep that fails the test when the wait outlasts ``limit_s`` of simulated time (a wedge)."""
+    start = clock.t
+
+    def sleep(s):
+        assert clock.t - start <= limit_s, f"still waiting after {clock.t - start:.0f} s of simulated time"
+        clock.sleep(s)
+
+    return sleep
+
+
+@pytest.mark.parametrize("ahead_s", [3600, 30 * 86400])
+def test_a_start_noted_in_the_future_waits_at_most_one_step(pd, clock, monkeypatch, ahead_s):
+    """Review of D26 (MF1): the recorded start time is ahead of the wall clock (the clock was corrected backwards after
+    the start was noted). The wait takes ONE monotonic deadline of at most the step; it does not wait for the wall clock
+    to catch up with the record."""
+    from brain.bridge.shutdown import POLL_S
+
+    (pd / start_backoff.FILENAME).write_text(
+        json.dumps({"unproven_starts": 1, "at": clock.t + ahead_s}), encoding="utf-8"
+    )
+    monkeypatch.setattr(start_backoff, "_sleep", _bounded_sleep(clock, 30 + 5 * POLL_S))
+    t0 = clock.t
+    assert start_backoff.wait_before_start(pd, interrupted=lambda: False) is True
+    assert clock.t - t0 == pytest.approx(30, abs=POLL_S + 1e-6)
+
+
+def test_a_wall_clock_step_during_the_wait_does_not_change_its_length(pd, clock, monkeypatch):
+    """The deadline is monotonic: the wall clock jumping back during the wait neither extends nor shortens it."""
+    from brain.bridge.shutdown import POLL_S
+
+    start_backoff.note_start(pd)  # 30 s
+    mono = Clock(10.0)
+    wall = {"t": clock.t}
+    monkeypatch.setattr(start_backoff, "_now", lambda: wall["t"])
+    monkeypatch.setattr(start_backoff, "_monotonic", mono.now)
+    calls = {"n": 0}
+
+    def sleep(s):
+        calls["n"] += 1
+        mono.t += s
+        wall["t"] += s
+        if calls["n"] == 100:
+            wall["t"] -= 7 * 86400  # NTP corrects the clock a week back
+        assert mono.t < 10 + 30 + 5 * POLL_S, "waited past the step"
+
+    monkeypatch.setattr(start_backoff, "_sleep", sleep)
+    assert start_backoff.wait_before_start(pd, interrupted=lambda: False) is True
+    assert mono.t - 10 == pytest.approx(30, abs=POLL_S + 1e-6)
+
+
+def test_a_record_rewritten_during_the_wait_takes_a_new_deadline(pd, clock, monkeypatch):
+    from brain.bridge.shutdown import POLL_S
+
+    start_backoff.note_start(pd)
+    calls = {"n": 0}
+    real = clock.sleep
+
+    def sleep(s):
+        calls["n"] += 1
+        real(s)
+        if calls["n"] == 100:  # 10 s in: another start is noted (a second failure): the step is now 60 s from now
+            start_backoff.note_start(pd)
+
+    monkeypatch.setattr(start_backoff, "_sleep", sleep)
+    t0 = clock.t
+    assert start_backoff.wait_before_start(pd, interrupted=lambda: False) is True
+    assert clock.t - t0 == pytest.approx(10 + 60, abs=2 * POLL_S)
 
 
 # ---- C68 (a): the success watch ------------------------------------------------------------------------------------

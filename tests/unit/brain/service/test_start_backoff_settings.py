@@ -148,7 +148,28 @@ def test_a_failing_create_is_a_warning_not_an_error(env, monkeypatch, caplog):
     assert any("task" in r.message and r.levelno == logging.WARNING for r in caplog.records)
 
 
-def test_the_refresh_runs_for_the_task_scheduler_origin_only_under_the_lock_before_the_run(tmp_path, monkeypatch):
+def test_a_registered_task_with_non_ascii_text_is_never_re_registered(env, monkeypatch, caplog):
+    """Review of D26 (MF2): schtasks' output is decoded as UTF-8 with replacement, so a profile path with a non-ASCII
+    letter would come back mangled, and re-registering that text would silently break the task's command path. Any
+    non-ASCII (U+FFFD included) or NUL in the queried XML skips the refresh and logs one WARNING."""
+    old = _old_task(env)
+    for bad in (
+        old.replace("<Arguments>", "<WorkingDirectory>C:\\Users\\Jos\u00e9</WorkingDirectory><Arguments>", 1),
+        old.replace("<Arguments>", "<WorkingDirectory>C:\\Users\\Jos\ufffd</WorkingDirectory><Arguments>", 1),
+        old.replace("<Count>3</Count>", "<Count>3\x00</Count>"),
+    ):
+        sch = Schtasks(bad)
+        monkeypatch.setattr(windows_service, "run_schtasks", sch)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="brain.service.windows_service"):
+            assert windows_service.refresh_installed_task("nell") is False
+        assert not [c for c in sch.calls if c[0] == "/Create"]
+        assert sum(r.levelno == logging.WARNING for r in caplog.records) == 1
+
+
+def test_cmd_run_never_refreshes_the_task_from_inside_a_running_instance(tmp_path, monkeypatch):
+    """Review of D26 (MF2): no origin's `supervisor run` refreshes the Task Scheduler task (the instance would be
+    replacing its own definition); the refresh belongs to the paths that run outside any instance."""
     from types import SimpleNamespace
 
     from brain.bridge import daemon
@@ -156,41 +177,70 @@ def test_the_refresh_runs_for_the_task_scheduler_origin_only_under_the_lock_befo
     pd = tmp_path / "home" / "personas" / "nell"
     pd.mkdir(parents=True)
     monkeypatch.setattr("brain.paths.get_persona_dir", lambda name: pd)
-    order: list[str] = []
-
-    def refresh(persona):
-        fd = daemon.acquire_lock(pd)
-        order.append("refresh:lock-held" if fd is None else "refresh:lock-FREE")
-        if fd is not None:
-            daemon.release_lock(pd, fd)
-        return False
-
-    monkeypatch.setattr("brain.service.windows_service.refresh_installed_task", refresh)
+    monkeypatch.setattr(
+        "brain.service.windows_service.refresh_installed_task", lambda persona: pytest.fail("refreshed in a run")
+    )
+    monkeypatch.setattr("brain.service.windows_service.run_schtasks", lambda args: pytest.fail("schtasks in a run"))
     monkeypatch.setattr("brain.service.systemd.refresh_installed_unit", lambda persona: False)
     monkeypatch.setattr("brain.service.launchd.truncate_launchd_logs_if_large", lambda persona: None)
-    monkeypatch.setattr("brain.bridge.runner.run_bridge_foreground", lambda p, **kw: order.append("run") or 0)
+    monkeypatch.setattr("brain.bridge.runner._setup_runtime_logging", lambda p: None)
+    ran: list[int] = []
+    monkeypatch.setattr("brain.bridge.runner.run_bridge_foreground", lambda p, **kw: ran.append(1) or 0)
     for origin in ("systemd", "launchd", "cli", "task-scheduler"):
         assert daemon.cmd_run(SimpleNamespace(persona="nell", idle_shutdown=0, client_origin=origin)) == 0
-    assert order == ["run", "run", "run", "refresh:lock-held", "run"]
+    assert ran == [1, 1, 1, 1]
 
 
-def test_a_refresh_that_raises_never_stops_the_start(tmp_path, monkeypatch):
-    from types import SimpleNamespace
+def test_start_service_refreshes_the_installed_task_before_it_runs_it(env, tmp_path, monkeypatch):
+    """Review of D26 (MF2): `start_service` runs outside any instance; the refresh comes before `/Run`, so an instance
+    the scheduler might end on an update is started again right after."""
+    monkeypatch.setattr("brain.paths.get_persona_dir", lambda name: tmp_path / "home" / "personas" / name)
+    (tmp_path / "home" / "personas" / "nell").mkdir(parents=True)
+    sch = Schtasks(_old_task(env))
+    real_call = sch.__call__
 
-    from brain.bridge import daemon
+    def with_run(args):
+        if args[0] == "/Run":
+            sch.calls.append(list(args))
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        return real_call(args)
 
-    pd = tmp_path / "home" / "personas" / "nell"
-    pd.mkdir(parents=True)
-    monkeypatch.setattr("brain.paths.get_persona_dir", lambda name: pd)
+    monkeypatch.setattr(windows_service, "run_schtasks", with_run)
+    windows_service.start_service(persona="nell")
+    assert [c[0] for c in sch.calls] == ["/Query", "/Create", "/Run"]
+    sch.calls.clear()
+    windows_service.start_service(persona="nell")  # already current
+    assert [c[0] for c in sch.calls] == ["/Query", "/Run"]
+
+
+def test_a_refresh_that_raises_never_stops_start_service(env, tmp_path, monkeypatch):
+    monkeypatch.setattr("brain.paths.get_persona_dir", lambda name: tmp_path / "home" / "personas" / name)
+    (tmp_path / "home" / "personas" / "nell").mkdir(parents=True)
+    ran: list[list[str]] = []
 
     def boom(persona):
         raise RuntimeError("schtasks exploded")
 
-    monkeypatch.setattr("brain.service.windows_service.refresh_installed_task", boom)
-    ran: list[int] = []
-    monkeypatch.setattr("brain.bridge.runner.run_bridge_foreground", lambda p, **kw: ran.append(1) or 0)
-    assert daemon.cmd_run(SimpleNamespace(persona="nell", idle_shutdown=0, client_origin="task-scheduler")) == 0
-    assert ran == [1]
+    monkeypatch.setattr(windows_service, "refresh_installed_task", boom)
+    monkeypatch.setattr(
+        windows_service, "run_schtasks", lambda args: ran.append(list(args)) or subprocess.CompletedProcess(args, 0, "", "")
+    )
+    windows_service.start_service(persona="nell")
+    assert ran == [["/Run", "/TN", "CompanionEmergence-nell"]]
+
+
+def test_install_writes_fresh_xml_and_does_not_round_trip_the_registered_one(env, tmp_path, monkeypatch):
+    """An install regenerates the task from `build_task_xml`; it never queries and patches the registered text."""
+    from brain.service import lifecycle
+
+    monkeypatch.setattr(lifecycle, "before_install", lambda persona: None)
+    monkeypatch.setattr("brain.paths.get_persona_dir", lambda name: tmp_path / "home" / "personas" / name)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        windows_service, "run_schtasks", lambda args: calls.append(list(args)) or subprocess.CompletedProcess(args, 0, "", "")
+    )
+    windows_service.install_service(persona="nell", nell_path=env)
+    assert [c[0] for c in calls] == ["/Create", "/Run"]
 
 
 # ---- explicit starts through the service layer reset the record ---------------------------------------------------------

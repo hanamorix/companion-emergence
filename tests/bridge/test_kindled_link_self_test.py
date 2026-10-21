@@ -82,16 +82,25 @@ def _endpoint(app, path: str, method: str):
 
 def test_every_sync_route_but_health_is_a_counted_stop_task(tmp_path: Path):
     """Review of #458 (M2): GET /sessions/active runs a rollover (final extraction, memory writes, buffer deletion) and
-    GET /kindled-link/my-code writes, in worker threads. Every synchronous route is counted except GET /health."""
+    GET /kindled-link/my-code writes, in worker threads. Every synchronous route is counted except GET /health;
+    looping over the app's routes covers a sync route added later."""
+    import inspect
+
+    from fastapi.routing import APIRoute
+
     client, _ = _client(tmp_path)
-    app = client.app
-    assert hasattr(_endpoint(app, "/sessions/active", "GET"), "__wrapped__")
-    assert hasattr(_endpoint(app, "/kindled-link/my-code", "GET"), "__wrapped__")
-    assert not hasattr(_endpoint(app, "/health", "GET"), "__wrapped__")
+    routes = [r for r in client.app.routes if isinstance(r, APIRoute)]
+    sync = [r for r in routes if not inspect.iscoroutinefunction(r.endpoint)]
+    uncounted = {r.path for r in sync if not hasattr(r.endpoint, "__wrapped__")}
+    assert len(sync) > 5 and uncounted == {"/health"}, uncounted
+    assert {"/sessions/active", "/kindled-link/my-code"} <= {r.path for r in sync}
 
 
 def test_a_sessions_active_rollover_is_a_counted_stop_task_while_it_runs(tmp_path: Path, monkeypatch):
     """Review of #458 (M2): a stop arriving while the rollover runs waits for it (the registry is not empty)."""
+    import brain.chat.rollover  # noqa: F401  # imported first: it binds `read_session` at import, and a patch made
+
+    # before the first import would stay bound in its namespace after this test (order-dependent failures elsewhere)
     from brain.bridge import shutdown_progress
 
     seen: list[list[str]] = []

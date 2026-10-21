@@ -17,9 +17,13 @@ from types import SimpleNamespace
 import pytest
 
 from brain.bridge import daemon, respawn_guard, shutdown, start_backoff, state_file
+from brain.bridge import runner as _runner
 from brain.bridge.shutdown import POLL_S
 
 SERVICE_ORIGINS = ("systemd", "launchd", "task-scheduler")
+
+
+real_setup_runtime_logging = _runner._setup_runtime_logging  # captured before any fixture patches it
 
 
 class Clock:
@@ -39,6 +43,7 @@ class Clock:
 def clock(monkeypatch) -> Clock:
     c = Clock()
     monkeypatch.setattr(start_backoff, "_now", c.now)
+    monkeypatch.setattr(start_backoff, "_monotonic", c.now)
     monkeypatch.setattr(start_backoff, "_sleep", c.sleep)
     return c
 
@@ -51,7 +56,7 @@ def pd(tmp_path, monkeypatch) -> Path:
     # The service-origin extras of cmd_run (the unit refresh, the launchd log truncation) are not under test here.
     monkeypatch.setattr("brain.service.systemd.refresh_installed_unit", lambda persona: False)
     monkeypatch.setattr("brain.service.launchd.truncate_launchd_logs_if_large", lambda persona: None)
-    monkeypatch.setattr("brain.service.windows_service.refresh_installed_task", lambda persona: False, raising=False)
+    monkeypatch.setattr("brain.bridge.runner._setup_runtime_logging", lambda p: None)  # the real one: logging tests
     return p
 
 
@@ -488,3 +493,45 @@ def test_sigterm_during_the_wait_ends_the_process_at_once_with_nothing_held(tmp_
     assert fd is not None
     daemon.release_lock(persona, fd)
     assert start_backoff.read(persona).unproven_starts == 4
+
+
+# ---- the back-off lines reach the bridge log (review of D26, SF6) ------------------------------------------------------
+
+
+@pytest.fixture
+def root_handlers():
+    import logging
+
+    root = logging.getLogger()
+    before = list(root.handlers)
+    level = root.level
+    yield root
+    for h in list(root.handlers):
+        if h not in before:
+            root.removeHandler(h)
+            h.close()
+    root.setLevel(level)
+
+
+def test_the_wait_line_reaches_the_runtime_log(pd, clock, monkeypatch, tmp_path, root_handlers):
+    """The runtime log is set up before the wait, so its INFO line (and the unit refresh's) is not lost."""
+    log_dir = tmp_path / "logs"
+    monkeypatch.setattr("brain.paths.get_log_dir", lambda: log_dir)
+    monkeypatch.setattr("brain.bridge.runner._setup_runtime_logging", real_setup_runtime_logging)  # the real one
+    _record(pd, 1, clock)
+    _fake_run(monkeypatch)
+    assert daemon.cmd_run(_args("systemd")) == 0
+    for h in root_handlers.handlers:
+        h.flush()
+    text = (log_dir / "runtime-nell.log").read_text(encoding="utf-8")
+    assert "start back-off: waiting" in text
+
+
+def test_setting_up_the_runtime_log_twice_adds_one_handler(pd, monkeypatch, tmp_path, root_handlers):
+    from logging.handlers import RotatingFileHandler
+
+    monkeypatch.setattr("brain.paths.get_log_dir", lambda: tmp_path / "logs")
+    n0 = sum(isinstance(h, RotatingFileHandler) for h in root_handlers.handlers)
+    real_setup_runtime_logging(pd)
+    real_setup_runtime_logging(pd)
+    assert sum(isinstance(h, RotatingFileHandler) for h in root_handlers.handlers) == n0 + 1

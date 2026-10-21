@@ -134,7 +134,7 @@ def _setup_runtime_logging(persona_dir: Path) -> None:
     stderr files become a secondary catch-all for unhandled exceptions
     and uvicorn boot noise; those stay tiny in steady state.
 
-    Path: ``<log_dir>/runtime-<persona>.log``. Best-effort — failures
+    Idempotent: a second call for the same log file adds nothing. Path: ``<log_dir>/runtime-<persona>.log``. Best-effort — failures
     here must NOT prevent bridge startup, so any exception is swallowed
     after a stderr breadcrumb.
     """
@@ -146,6 +146,9 @@ def _setup_runtime_logging(persona_dir: Path) -> None:
         log_dir = get_log_dir()
         log_dir.mkdir(parents=True, exist_ok=True)
         path = log_dir / f"runtime-{persona_dir.name}.log"
+        root = logging.getLogger()
+        if any(isinstance(h, RotatingFileHandler) and h.baseFilename == str(path.resolve()) for h in root.handlers):
+            return  # already set up (``supervisor run`` sets it up before the start back-off wait, D26)
         handler = RotatingFileHandler(
             path,
             maxBytes=_RUNTIME_LOG_MAX_BYTES,
@@ -159,7 +162,6 @@ def _setup_runtime_logging(persona_dir: Path) -> None:
             )
         )
         handler.setLevel(logging.INFO)
-        root = logging.getLogger()
         if root.level == logging.NOTSET or root.level > logging.INFO:
             root.setLevel(logging.INFO)
         root.addHandler(handler)

@@ -17,6 +17,8 @@ the service start and install paths) delete the record, which also ends a wait i
 from __future__ import annotations
 
 import logging
+import math
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -24,6 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from brain.bridge.shutdown import POLL_S
 from brain.health.json_io import read_json, write_json
 
 logger = logging.getLogger(__name__)
@@ -48,6 +51,10 @@ def _now() -> float:
     return time.time()
 
 
+def _monotonic() -> float:
+    return time.monotonic()
+
+
 def _sleep(seconds: float) -> None:
     time.sleep(seconds)
 
@@ -66,7 +73,7 @@ def read(persona_dir: Path) -> Record:
     if not isinstance(raw, dict):
         return Record()
     count, at = raw.get("unproven_starts"), raw.get("at")
-    if not _valid_count(count) or isinstance(at, bool) or not isinstance(at, (int, float)):
+    if not _valid_count(count) or isinstance(at, bool) or not isinstance(at, (int, float)) or not math.isfinite(at):
         return Record()
     return Record(count, float(at))
 
@@ -105,30 +112,38 @@ def reset(persona_dir: Path) -> None:
 
 def wait_before_start(persona_dir: Path, *, interrupted: Callable[[], bool]) -> bool:
     """Wait out the step for the recorded failures; True when the start may go ahead, False when ``interrupted()``
-    (the respawn guard) says not to start. Each poll (every ``shutdown.POLL_S``) re-reads the record, so an explicit
-    start that deleted it ends the wait at once. Holds no lock and writes nothing."""
-    from brain.bridge.shutdown import POLL_S
+    (the respawn guard) says not to start.
 
+    The wait is a countdown, not a comparison with the wall clock: when the record is first seen (or seen changed),
+    the remaining time is worked out once from the wall clock (at most one step) and turned into a MONOTONIC deadline.
+    A wall clock that is stepped afterwards, or a record stamped ahead of a clock that was later corrected, can neither
+    extend nor cut the wait. Each poll (every ``shutdown.POLL_S``) re-reads the record: an explicit start that deleted
+    it ends the wait at once, and one that rewrote it starts a new countdown. Holds no lock and writes nothing."""
+    seen: Record | None = None
+    deadline = 0.0
     announced = False
     while True:
         record = read(persona_dir)
-        remaining = remaining_wait_s(record, _now())
-        if remaining <= 0:
+        if record != seen:
+            seen = record
+            remaining = remaining_wait_s(record, _now())
+            if remaining <= 0:
+                return True
+            deadline = _monotonic() + remaining
+        left = deadline - _monotonic()
+        if left <= 0:
             return True
         if interrupted():
             return False
         if not announced:
             announced = True
-            import sys
-
             print(
-                f"waiting {int(remaining)} s before starting: the bridge has not stayed up through "
-                f"{record.unproven_starts} start(s) in a row",
+                f"waiting {int(left)} s before starting: {record.unproven_starts} earlier start(s) did not stay up",
                 file=sys.stderr,
                 flush=True,
             )
-            logger.info("start back-off: waiting %.0f s (%d unproven starts)", remaining, record.unproven_starts)
-        _sleep(min(POLL_S, remaining))
+            logger.info("start back-off: waiting %.0f s (%d unproven starts)", left, record.unproven_starts)
+        _sleep(min(POLL_S, left))
 
 
 class SuccessWatch:
@@ -163,15 +178,11 @@ class SuccessWatch:
         self._thread.start()
 
     def stop(self) -> None:
-        from brain.bridge.shutdown import POLL_S
-
         self._stop.set()
         if self._thread is not None and self._thread is not threading.current_thread():
             self._thread.join(timeout=5 * POLL_S + 1.0)
 
     def _loop(self) -> None:
-        from brain.bridge.shutdown import POLL_S
-
         while not self._stop.is_set() and not self._done:
             try:
                 self.poll_once()
