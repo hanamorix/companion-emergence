@@ -55,6 +55,7 @@ from brain.ingest.ingest_utils import (
     load_emotion_vocab,
     load_user_name,
     load_user_pronouns,
+    mark_chunked_extraction,
 )
 from brain.ingest.soul_queue import DEFAULT_SOUL_THRESHOLD, queue_soul_candidate
 from brain.ingest.types import IngestReport
@@ -285,6 +286,7 @@ def _run_chunks(
     (F-011), and a committed chunk clears the backoff sidecar. ``close_session`` passes False: it keeps its rule of no
     backoff accounting.
     """
+    mark_chunked_extraction(persona_dir)  # main ruling M4: the backfill never plans text extracted from here on
     user_name = load_user_name(persona_dir)
     assistant_name = persona_dir.name
     valid_emotions, emotion_vocab = load_emotion_vocab()

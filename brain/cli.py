@@ -659,6 +659,9 @@ def _memory_backfill_extraction_handler(args: argparse.Namespace) -> int:
         print(f"No persona directory at {persona_dir}.", file=sys.stderr)
         return 1
     mode = "all" if args.all else "heads"
+    if args.restart and (args.status or args.stop or args.dry_run):
+        print("--restart cannot be combined with --status, --stop or --dry-run", file=sys.stderr)
+        return 2
     if args.status:
         print(eb.status_text(persona_dir))
         return 0

@@ -23,12 +23,40 @@ _CHUNK = 600
 _OLD = datetime(2026, 8, 3, 19, 0, 0, tzinfo=UTC)
 
 
+class _RunawayLoopError(AssertionError):
+    """Raised by the hard bounds below, so a broken stop rule FAILS the test at once instead of looping until the CI job times
+    out. The pass bound raises from the wrapper around ``run_central_pass``, outside every handler of the code under test; the
+    call bound is a second net (inside the extractor it counts as a failed call)."""
+
+
+_CALL_LIMIT = 60
+_PASS_LIMIT = 60
+
+
+@pytest.fixture(autouse=True)
+def _bounded_central_passes(monkeypatch):
+    from brain.bridge import central_cadence
+
+    real = central_cadence.run_central_pass
+    passes = {"n": 0}
+
+    def _bounded(*a, **k):
+        passes["n"] += 1
+        if passes["n"] > _PASS_LIMIT:
+            raise _RunawayLoopError(f"more than {_PASS_LIMIT} central passes: a stop rule is broken")
+        return real(*a, **k)
+
+    monkeypatch.setattr(central_cadence, "run_central_pass", _bounded)
+
+
 class _Stub(LLMProvider):
     def __init__(self):
         self.prompts: list[str] = []
 
     def generate(self, prompt: str, *, system: str | None = None) -> str:
         self.prompts.append(prompt)
+        if len(self.prompts) > _CALL_LIMIT:
+            raise _RunawayLoopError(f"more than {_CALL_LIMIT} model calls: a stop rule is broken")
         return "[]"
 
     def name(self) -> str:
@@ -176,3 +204,27 @@ def test_c11e_the_cli_exit_flush_makes_every_call(persona, monkeypatch) -> None:
     monkeypatch.setattr(engine, "respond", lambda *a, **k: SimpleNamespace(content="ok", session_id=sid, tool_invocations=[]))
     assert cli.main(["chat", "--persona", "Kestrel", "--no-bridge", "hello"]) == 0
     assert len(stub.prompts) == 3
+
+
+@pytest.mark.parametrize("flag", ["--status", "--stop", "--dry-run"])
+def test_restart_with_a_read_or_stop_action_is_an_error(persona, stub, capsys, flag) -> None:
+    _archived_history(persona)
+    assert _nell("--restart", flag) == 2
+    assert "--restart cannot be combined" in capsys.readouterr().err
+    assert not eb.state_path(persona).exists()
+
+
+def test_stop_with_no_plan_creates_nothing(persona, capsys) -> None:
+    before = sorted(p.name for p in persona.iterdir())
+    assert _nell("--stop") == 0
+    assert "no backfill plan" in capsys.readouterr().out
+    assert sorted(p.name for p in persona.iterdir()) == before
+
+
+def test_restart_of_a_plan_with_done_targets_says_they_are_extracted_again(persona, stub, capsys) -> None:
+    _archived_history(persona)
+    assert _nell("--all") == 0  # runs to complete in the foreground
+    capsys.readouterr()
+    assert _nell("--restart", "--all", "--background") == 0
+    out = capsys.readouterr().out
+    assert "done" in out and "extracted again" in out

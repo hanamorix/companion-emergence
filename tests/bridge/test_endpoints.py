@@ -253,7 +253,7 @@ def test_sessions_close_with_report_errors_stays_retryable(persona_dir: Path, mo
     def fake_close(*args, **kwargs):
         nonlocal calls
         calls += 1
-        report = IngestReport(session_id=args[1])
+        report = IngestReport(session_id=args[1], reached_end=True)  # #523: a completed close reaches the end
         if calls == 1:
             report.errors = 1
             # #167 C5 (dynamic-error): a distinct, non-zero value chosen so a
@@ -290,7 +290,7 @@ def test_sessions_close_exception_stays_retryable(persona_dir: Path, monkeypatch
             raise RuntimeError("extractor exploded")
         from brain.ingest.types import IngestReport
 
-        return IngestReport(session_id=args[1])
+        return IngestReport(session_id=args[1], reached_end=True)  # #523: a completed close reaches the end
 
     monkeypatch.setattr("brain.bridge.server._close_session_blocking", fake_close)
 

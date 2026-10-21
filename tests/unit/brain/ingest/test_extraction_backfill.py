@@ -18,11 +18,12 @@ from brain.ingest import extraction_backfill as eb
 from brain.ingest.buffer import append_archive, ingest_turn, write_cursor
 from brain.ingest.commit import commit_item
 from brain.ingest.extract import format_turn_line
-from brain.ingest.ingest_utils import chunk_turns, parse_turn_ts
+from brain.ingest.ingest_utils import chunk_turns
 from brain.ingest.types import ExtractedItem
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.persona_config import PersonaConfig
+from brain.utils.time import lenient_utc
 
 _PROMOTE_ALL = lambda _cand, _ctx: Decision("new")  # noqa: E731
 
@@ -77,6 +78,32 @@ _CHUNK = 600
 _USER = "Bob"
 
 
+class _RunawayLoopError(AssertionError):
+    """Raised by the hard bounds below, so a broken stop rule FAILS the test at once instead of looping until the CI job times
+    out. The pass bound raises from the wrapper around ``run_central_pass``, outside every handler of the code under test; the
+    call bound is a second net (inside the extractor it counts as a failed call)."""
+
+
+_CALL_LIMIT = 60
+_PASS_LIMIT = 60
+
+
+@pytest.fixture(autouse=True)
+def _bounded_central_passes(monkeypatch):
+    from brain.bridge import central_cadence
+
+    real = central_cadence.run_central_pass
+    passes = {"n": 0}
+
+    def _bounded(*a, **k):
+        passes["n"] += 1
+        if passes["n"] > _PASS_LIMIT:
+            raise _RunawayLoopError(f"more than {_PASS_LIMIT} central passes: a stop rule is broken")
+        return real(*a, **k)
+
+    monkeypatch.setattr(central_cadence, "run_central_pass", _bounded)
+
+
 class _Stub(LLMProvider):
     """Records every extraction prompt; ``plan(n, prompt)`` may return "defer", "fail", "kbint" or a callable to run first.
     Answers one distinct fact per call (importance ``importance``) unless ``items`` is False."""
@@ -88,6 +115,8 @@ class _Stub(LLMProvider):
     def generate(self, prompt: str, *, system: str | None = None) -> str:
         self.prompts.append(prompt)
         n = len(self.prompts)
+        if len(self.prompts) > _CALL_LIMIT:
+            raise _RunawayLoopError(f"more than {_CALL_LIMIT} model calls: a stop rule is broken")
         action = self._plan(n, prompt) if self._plan else None
         if callable(action):
             action()
@@ -183,8 +212,8 @@ def _model_passes(rows: list[dict]) -> list[list[dict]]:
     pending: list[dict] = []
     for i, row in enumerate(rows):
         pending.append(row)
-        ts = parse_turn_ts(row["ts"])
-        nxt = parse_turn_ts(rows[i + 1]["ts"]) if i + 1 < len(rows) else None
+        ts = lenient_utc(row["ts"])
+        nxt = lenient_utc(rows[i + 1]["ts"]) if i + 1 < len(rows) else None
         tick = ts.replace(second=0) + timedelta(minutes=1)
         while nxt is None or tick < nxt:
             lull = 300 if tick < eb._LULL_BOUNDARY else 600
@@ -221,7 +250,7 @@ def _b1_history(persona) -> tuple[str, list[dict]]:
     sid = "sess_b1"
     # last row of the first part at ss = 25, so the ticks fall at +35, +95, ..., +275, +335: none in [300, 330)
     a1 = _rows(sid, datetime(2026, 9, 1, 18, 0, 25, tzinfo=UTC) - timedelta(seconds=60 * 13), 14, gap_s=60, lag_s=0, tag="a")
-    last_a1 = parse_turn_ts(a1[-1]["ts"])
+    last_a1 = lenient_utc(a1[-1]["ts"])
     assert last_a1.second == 25
     a2 = _rows(sid, last_a1 + timedelta(seconds=330), 10, gap_s=60, lag_s=0, tag="b")
     b = _rows(sid, datetime(2026, 9, 20, 18, 0, 0, tzinfo=UTC), 24, gap_s=60, tag="c")
@@ -230,31 +259,48 @@ def _b1_history(persona) -> tuple[str, list[dict]]:
     return sid, rows
 
 
-def test_b1_the_heads_plan_covers_every_row_the_model_says_was_cut(kestrel, monkeypatch) -> None:
-    persona, _, _ = kestrel
-    PersonaConfig(user_name="Bob Quillamore-Vantrexley").save(persona / "persona_config.json")
+_LONG_USER = "Bob Quillamore-Vantrexley"  # the configured user name in force for the B1 history: longer than "user"
+
+
+def _b1_world(persona, monkeypatch) -> tuple[str, list[dict], list[dict]]:
+    """The B1 fixture (amended B1, main ruling M3): the cut replayed with the labels IN FORCE (the configured user name and the
+    persona dir name), and the fixture's own check that this set is strictly larger than the shortest-label set."""
+    PersonaConfig(user_name=_LONG_USER).save(persona / "persona_config.json")
     monkeypatch.setattr(eb, "_HISTORICAL_CAP_CHARS", 2_500)
     sid, rows = _b1_history(persona)
-    cut = _never_shown(_model_passes(rows), "user", "Kestrel", 2_500)  # the SHORTEST labels, per the criterion
-    assert cut, "the fixture must exercise the cut"
+    passes = _model_passes(rows)
+    in_force = _never_shown(passes, _LONG_USER, "Kestrel", 2_500)
+    shortest = _never_shown(passes, "user", min(("assistant", "Kestrel"), key=len), 2_500)
+    assert {r["text"] for r in shortest} < {r["text"] for r in in_force}, "the fixture must make the labels matter"
+    return sid, rows, in_force
+
+
+def _covered(persona, sid, rows_cut) -> list[dict]:
     targets = eb.plan_heads(persona, datetime.now(UTC).isoformat())
-    covered = [(parse_turn_ts(t["from_ts"]), parse_turn_ts(t["to_ts"])) for t in targets if t["sid"] == sid]
-    for r in cut:
-        ts = parse_turn_ts(r["ts"])
-        assert any(lo <= ts <= hi for lo, hi in covered), r["text"][:12]
+    spans = [(lenient_utc(t["from_ts"]), lenient_utc(t["to_ts"])) for t in targets if t["sid"] == sid]
+    return [r for r in rows_cut if not any(lo <= lenient_utc(r["ts"]) <= hi for lo, hi in spans)]
+
+
+def test_b1_the_heads_plan_covers_every_row_the_model_says_was_cut(kestrel, monkeypatch) -> None:
+    persona, _, _ = kestrel
+    sid, _rows_, in_force = _b1_world(persona, monkeypatch)
+    assert _covered(persona, sid, in_force) == []
 
 
 def test_b1_oracle_catches_a_planner_with_the_300_s_rule(kestrel, monkeypatch) -> None:
     """Fail-first kept executable: with the pre-boundary lull at 300 s the 330 s gap splits the span and its head is missed."""
     persona, _, _ = kestrel
-    monkeypatch.setattr(eb, "_HISTORICAL_CAP_CHARS", 2_500)
-    sid, rows = _b1_history(persona)
-    cut = _never_shown(_model_passes(rows), "user", "Kestrel", 2_500)
+    sid, _rows_, in_force = _b1_world(persona, monkeypatch)
     monkeypatch.setattr(eb, "_PRE_LULL_UPPER_S", 300)
-    targets = eb.plan_heads(persona, datetime.now(UTC).isoformat())
-    covered = [(parse_turn_ts(t["from_ts"]), parse_turn_ts(t["to_ts"])) for t in targets if t["sid"] == sid]
-    missed = [r for r in cut if not any(lo <= parse_turn_ts(r["ts"]) <= hi for lo, hi in covered)]
-    assert missed
+    assert _covered(persona, sid, in_force) != []
+
+
+def test_b1_oracle_catches_a_planner_with_the_shortest_labels(kestrel, monkeypatch) -> None:
+    """Fail-first kept executable (amended B1): a planner measuring with the shortest labels misses rows of the in-force cut."""
+    persona, _, _ = kestrel
+    sid, _rows_, in_force = _b1_world(persona, monkeypatch)
+    monkeypatch.setattr(eb, "_plan_labels", lambda p: ("user", min(("assistant", "Kestrel"), key=len)))
+    assert _covered(persona, sid, in_force) != []
 
 
 # ---------------------------------------------------------------------------
@@ -520,7 +566,7 @@ def test_b8_a_deferral_ends_the_foreground_run_after_one_call(kestrel) -> None:
     persona, store, hebbian = kestrel
     _archive(persona, "sess_b8d", _rows("sess_b8d", _OLD, 8))
     _arm(persona, "all")
-    stub, outputs = _Stub(plan=lambda n, p: "kbint" if n > 3 else "defer"), []
+    stub, outputs = _Stub(plan=lambda n, p: "defer"), []  # a broken stop rule hits the pass bound and fails
     assert _foreground(persona, store, hebbian, stub, outputs) == "not advanced"
     assert len(stub.prompts) == 1
     assert "refused for now" in outputs[-1] and "Progress is kept" in outputs[-1]
@@ -728,7 +774,7 @@ def _b15_history(persona) -> list[dict]:
     """Archived only, so the time since the user spoke is read from memories; every reply is stamped after its user row,
     the last one by minutes."""
     rows = _rows("sess_b15", datetime.now(UTC) - timedelta(days=5), 9, gap_s=60, lag_s=20)
-    last_user = parse_turn_ts(rows[-2]["ts"])
+    last_user = lenient_utc(rows[-2]["ts"])
     rows[-1]["ts"] = (last_user + timedelta(minutes=4)).isoformat(timespec="seconds")
     _archive(persona, "sess_b15", rows)
     return rows
@@ -752,7 +798,7 @@ def test_b15_each_memory_is_dated_at_its_chunks_last_user_turn(kestrel) -> None:
         result = real(persona_dir, sid, transcript, **kw)
         users = [r for r in rows if r["speaker"] == "user" and _line(r) in transcript]
         for mid in kw["report"].memory_ids:
-            created[mid] = parse_turn_ts(users[-1]["ts"])
+            created[mid] = lenient_utc(users[-1]["ts"])
         return result
 
     eb.run_chunk_stages = _spy
@@ -764,7 +810,7 @@ def test_b15_each_memory_is_dated_at_its_chunks_last_user_turn(kestrel) -> None:
     assert created
     for mid, expect in created.items():
         assert store.get(mid).created_at == expect
-    newest_user = parse_turn_ts(rows[-2]["ts"])
+    newest_user = lenient_utc(rows[-2]["ts"])
     now = datetime.now(UTC)
     assert _silence_read_at(store, now) <= newest_user + timedelta(seconds=1)
 
@@ -791,7 +837,7 @@ def test_b15_a_chunk_with_no_user_row(kestrel) -> None:
     rows = _b15_history(persona)
     now = datetime.now(UTC)
     opener = ({"session_id": "s", "speaker": "assistant", "text": "hello", "ts": rows[-1]["ts"]},)
-    assert eb._backdate(persona, opener, rows[-1]["ts"], now) == parse_turn_ts(rows[-2]["ts"])  # the newest user turn
+    assert eb._backdate(persona, opener, rows[-1]["ts"], now) == lenient_utc(rows[-2]["ts"])  # the newest user turn
 
 
 @pytest.mark.parametrize("variant", ["chunk-end", "dated-now"])
@@ -800,9 +846,9 @@ def test_b15_oracle_catches_the_wrong_dates(kestrel, monkeypatch, variant) -> No
 
     persona, store, hebbian = kestrel
     rows = _b15_history(persona)
-    newest_user = parse_turn_ts(rows[-2]["ts"])
+    newest_user = lenient_utc(rows[-2]["ts"])
     if variant == "chunk-end":
-        monkeypatch.setattr(eb, "_backdate", lambda p, r, cursor_ts, now: min(parse_turn_ts(cursor_ts), now))
+        monkeypatch.setattr(eb, "_backdate", lambda p, r, cursor_ts, now: min(lenient_utc(cursor_ts), now))
     else:
         monkeypatch.setattr(eb, "_backdate", lambda p, r, cursor_ts, now: None)
     _arm(persona, "all")
@@ -971,3 +1017,43 @@ def test_b8_oracle_catches_a_job_that_loops(kestrel, monkeypatch) -> None:
     stub = _Stub()
     _pass_with_a_later_job(persona, stub, monkeypatch, is_idle=lambda: True, slot_available=lambda: True)
     assert len(stub.prompts) == 3
+
+
+# ---------------------------------------------------------------------------
+# B17: the plan stops where chunked extraction began (main ruling M4)
+# ---------------------------------------------------------------------------
+
+
+def _b17_world(persona, monkeypatch, marker: datetime) -> tuple[list[dict], list[dict]]:
+    monkeypatch.setattr(eb, "_HISTORICAL_CAP_CHARS", 2_500)
+    before = _rows("sess_b17a", marker - timedelta(days=3), 20, gap_s=30, tag="p")
+    after = _rows("sess_b17b", marker + timedelta(days=2), 20, gap_s=30, tag="q")
+    assert len("\n".join(_line(r) for r in after)) > 2_500  # over the (patched) historical cap: a "lost head" by the model
+    _archive(persona, "sess_b17a", before)
+    _archive(persona, "sess_b17b", after)
+    (persona / "extraction_chunked_since.json").write_text(json.dumps({"since": marker.isoformat()}), encoding="utf-8")
+    return before, after
+
+
+@pytest.mark.parametrize("mode", ["heads", "all"])
+def test_b17_text_after_the_chunked_extraction_marker_is_not_planned(kestrel, monkeypatch, mode) -> None:
+    persona, _, _ = kestrel
+    marker = datetime.now(UTC) - timedelta(days=10)
+    _b17_world(persona, monkeypatch, marker)
+    state = _arm(persona, mode)
+    sids = {t["sid"] for t in state["targets"]}
+    assert "sess_b17b" not in sids
+    assert "sess_b17a" in sids
+    assert lenient_utc(state["cutoff_ts"]) == marker
+    assert all(lenient_utc(t["to_ts"]) <= marker for t in state["targets"])
+    assert "sess_b17b" not in eb.dry_run_text(persona)
+
+
+def test_b17_without_a_marker_the_cutoff_is_the_plan_time(kestrel, monkeypatch) -> None:
+    persona, _, _ = kestrel
+    marker = datetime.now(UTC) - timedelta(days=10)
+    _b17_world(persona, monkeypatch, marker)
+    (persona / "extraction_chunked_since.json").unlink()
+    state = _arm(persona, "heads")
+    assert lenient_utc(state["cutoff_ts"]) > datetime.now(UTC) - timedelta(minutes=1)
+    assert "sess_b17b" in {t["sid"] for t in state["targets"]}

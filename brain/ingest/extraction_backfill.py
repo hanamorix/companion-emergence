@@ -27,7 +27,9 @@ by an old chunk. One runner at a time (a non-blocking ``file_lock`` on ``extract
 It runs through the central cadence function (owner answer 3): ``backfill_gated_job`` is the ``extraction_backfill`` job of
 the bridge's job table, and the CLI's foreground mode (no bridge running) calls ``run_central_pass`` with the same job in its
 own process. One chunk (one model call) per pass. It never touches a session's cursor, buffer, backoff or extraction lock.
-Reading for a plan or a dry run creates no directory, no file and no lock.
+Reading for a plan or a dry run creates no directory, no file and no lock. A plan's cutoff is the earlier of its creation
+and the time chunked extraction began for the persona (the marker the pipeline writes on its first chunked pass), so text the
+chunked pipeline extracted in full is never planned (main ruling M4).
 """
 
 from __future__ import annotations
@@ -47,16 +49,17 @@ from brain.health.json_io import read_json, read_jsonl, write_json
 from brain.ingest.extract import format_turn_line
 from brain.ingest.ingest_utils import (
     chunk_turns,
+    chunked_extraction_since,
     extraction_chunk_chars,
     load_emotion_vocab,
     load_user_pronouns,
-    parse_turn_ts,
 )
 from brain.ingest.pipeline import _BACKOFF_FAILURE_THRESHOLD, ChunkResult, run_chunk_stages
 from brain.ingest.types import IngestReport
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.utils.file_lock import file_lock
+from brain.utils.time import lenient_utc
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +116,7 @@ def _read_cursor(persona_dir: Path, sid: str) -> datetime | None:
     if not path.is_file():
         return None
     try:
-        return parse_turn_ts(path.read_text(encoding="utf-8").strip())
+        return lenient_utc(path.read_text(encoding="utf-8").strip())
     except OSError:
         return None
 
@@ -149,18 +152,18 @@ def _rows_of(persona_dir: Path, sid: str, cutoff: datetime) -> list[dict]:
         rows.extend(_read_rows(path))
     if cursor is not None:
         for row in _read_rows(_active_dir(persona_dir) / f"{sid}.jsonl"):
-            ts = parse_turn_ts(row.get("ts"))
+            ts = lenient_utc(row.get("ts"))
             if ts is not None and ts <= cursor:
                 rows.append(row)
     seen: set[tuple] = set()
     out = []
     for row in rows:
-        ts = parse_turn_ts(row.get("ts"))
+        ts = lenient_utc(row.get("ts"))
         if row.get("speaker") == "summary" or ts is None or ts > cutoff or _row_key(row) in seen:
             continue
         seen.add(_row_key(row))
         out.append(row)
-    out.sort(key=lambda r: parse_turn_ts(r.get("ts")))
+    out.sort(key=lambda r: lenient_utc(r.get("ts")))
     return out
 
 
@@ -195,9 +198,9 @@ def _historical_spans(rows: list[dict]) -> list[list[dict]]:
     """Split a session's rows where the silence was long enough that a pass had run (per the era's lull upper bound)."""
     spans: list[list[dict]] = []
     for row in rows:
-        ts = parse_turn_ts(row.get("ts"))
+        ts = lenient_utc(row.get("ts"))
         if spans:
-            prev = parse_turn_ts(spans[-1][-1].get("ts"))
+            prev = lenient_utc(spans[-1][-1].get("ts"))
             if (ts - prev).total_seconds() <= _lull_upper_s(prev):
                 spans[-1].append(row)
                 continue
@@ -236,28 +239,33 @@ def _target(sid: str, rows: list[dict]) -> dict:
     }
 
 
+def _plan_labels(persona_dir: Path) -> tuple[str, str]:
+    """The labels the heads planner measures with: the LONGEST plausible ones (the longer of ``user`` and the configured user
+    name; of ``assistant`` and the persona dir name). Longer labels only lengthen every suffix, so the set of rows "cut" can
+    only grow."""
+    user_name, assistant_name = _labels(persona_dir)
+    return max(("user", user_name or ""), key=len), max(("assistant", assistant_name), key=len)
+
+
 def plan_heads(persona_dir: Path, cutoff_ts: str) -> list[dict]:
     """Mode ``heads``: one target per inferred historical span whose head the old cap cut (see the module docstring)."""
-    cutoff = parse_turn_ts(cutoff_ts)
-    user_name, assistant_name = _labels(persona_dir)
-    # The longest plausible labels: longer labels only lengthen every suffix, so the set of rows "cut" can only grow.
-    user_label = max(("user", user_name or ""), key=len)
-    assistant_label = max(("assistant", assistant_name), key=len)
+    cutoff = lenient_utc(cutoff_ts)
+    user_label, assistant_label = _plan_labels(persona_dir)
     targets = []
     for sid in _session_ids(persona_dir):
         for span in _historical_spans(_rows_of(persona_dir, sid, cutoff)):
             cut = _cut_rows(span, user_label, assistant_label)
             if cut:
                 targets.append(_target(sid, cut))
-    targets.sort(key=lambda t: parse_turn_ts(t["from_ts"]))
+    targets.sort(key=lambda t: lenient_utc(t["from_ts"]))
     return targets
 
 
 def plan_all(persona_dir: Path, cutoff_ts: str) -> list[dict]:
     """Mode ``all``: one target per session holding every extractable row (archived, and active at or behind its cursor)."""
-    cutoff = parse_turn_ts(cutoff_ts)
+    cutoff = lenient_utc(cutoff_ts)
     targets = [_target(sid, rows) for sid in _session_ids(persona_dir) if (rows := _rows_of(persona_dir, sid, cutoff))]
-    targets.sort(key=lambda t: parse_turn_ts(t["from_ts"]))
+    targets.sort(key=lambda t: lenient_utc(t["from_ts"]))
     return targets
 
 
@@ -270,9 +278,9 @@ def _plan(persona_dir: Path, mode: str, cutoff_ts: str) -> list[dict]:
 def _target_rows(persona_dir: Path, target: dict, cutoff_ts: str) -> list[dict]:
     """The rows of ``target`` not yet extracted, looked up under its sid and then along the ``rolled_to`` chain (a rollover
     carries the last rows into the successor with the same ts); a row found twice counts once."""
-    cutoff = parse_turn_ts(cutoff_ts)
-    lo, hi = parse_turn_ts(target["from_ts"]), parse_turn_ts(target["to_ts"])
-    done = parse_turn_ts(target.get("done_through_ts"))
+    cutoff = lenient_utc(cutoff_ts)
+    lo, hi = lenient_utc(target["from_ts"]), lenient_utc(target["to_ts"])
+    done = lenient_utc(target.get("done_through_ts"))
     rows: list[dict] = []
     seen: set[tuple] = set()
     sid: str | None = target["sid"]
@@ -280,13 +288,13 @@ def _target_rows(persona_dir: Path, target: dict, cutoff_ts: str) -> list[dict]:
     while sid is not None and sid not in visited:
         visited.add(sid)
         for row in _rows_of(persona_dir, sid, cutoff):
-            ts = parse_turn_ts(row.get("ts"))
+            ts = lenient_utc(row.get("ts"))
             key = _row_key(row)
             if lo <= ts <= hi and (done is None or ts > done) and key not in seen:
                 seen.add(key)
                 rows.append(row)
         sid = _rolled_to(persona_dir, sid)
-    rows.sort(key=lambda r: parse_turn_ts(r.get("ts")))
+    rows.sort(key=lambda r: lenient_utc(r.get("ts")))
     return rows
 
 
@@ -323,16 +331,25 @@ def update_state(
         return new
 
 
+def _cutoff(persona_dir: Path, now: datetime) -> str:
+    """A plan's cutoff (main ruling M4): the earlier of ``now`` (its creation) and the time chunked extraction began for
+    this persona (``ingest_utils.chunked_extraction_since``). Text after that time was extracted in full by the chunked
+    pipeline: neither mode plans it (a heads plan would re-extract it with soul candidates on)."""
+    since = chunked_extraction_since(persona_dir)
+    return (since if since is not None and since < now else now).isoformat()
+
+
 def _new_state(persona_dir: Path, mode: str) -> dict:
-    now = datetime.now(UTC).isoformat(timespec="seconds")
-    targets = _plan(persona_dir, mode, now)
+    now = datetime.now(UTC)
+    cutoff = _cutoff(persona_dir, now)
+    targets = _plan(persona_dir, mode, cutoff)
     return {
         "schema_version": _SCHEMA_VERSION,
         "plan_id": uuid.uuid4().hex,
         "status": "armed" if targets else "complete",
         "mode": mode,
-        "cutoff_ts": now,
-        "created_at": now,
+        "cutoff_ts": cutoff,
+        "created_at": now.isoformat(timespec="seconds"),
         "targets": targets,
         "counters": dict.fromkeys(_COUNTERS, 0),
     }
@@ -373,7 +390,7 @@ def _newest_user_ts(persona_dir: Path) -> datetime | None:
     newest = None
     for sid in _session_ids(persona_dir):
         for row in _all_rows(persona_dir, sid):
-            ts = parse_turn_ts(row.get("ts")) if row.get("speaker") == "user" else None
+            ts = lenient_utc(row.get("ts")) if row.get("speaker") == "user" else None
             if ts is not None and (newest is None or ts > newest):
                 newest = ts
     return newest
@@ -385,13 +402,13 @@ def _backdate(persona_dir: Path, rows: tuple[dict, ...], cursor_ts: str | None, 
     than the user's last turn; the user row's ts cannot. A chunk with no user row (only rows before a session's first user
     turn) takes the earliest of its end, the newest user turn of the persona's sessions, and now. Either way a back-dated
     memory is never newer than the real newest user turn, so the time since the user last spoke never moves past it."""
-    users = [parse_turn_ts(r.get("ts")) for r in rows if r.get("speaker") == "user"]
+    users = [lenient_utc(r.get("ts")) for r in rows if r.get("speaker") == "user"]
     users = [u for u in users if u is not None]
     if users:
         return min(max(users), now)
     candidates = [now]
     if cursor_ts is not None:
-        candidates.append(parse_turn_ts(cursor_ts))
+        candidates.append(lenient_utc(cursor_ts))
     newest_user = _newest_user_ts(persona_dir)
     if newest_user is not None:
         candidates.append(newest_user)
@@ -720,17 +737,36 @@ def arm(persona_dir: Path, mode: str) -> tuple[str, str]:
 
 
 def restart(persona_dir: Path, mode: str) -> tuple[str, str]:
-    """Discard the existing plan and plan afresh (the cutoff moves to now). Returns (outcome, message) like ``arm``;
-    ``refused``, changing nothing, while a run holds the runner lock."""
+    """Discard the existing plan, armed, stopped or complete (main ruling M5), and plan afresh (the cutoff is recomputed).
+    Returns (outcome, message) like ``arm``; the message says when targets the replaced plan had done are extracted again.
+    ``refused``, changing nothing, while a run holds the runner lock (so no chunk is in flight when the plan is replaced)."""
     with _runner_lock(persona_dir) as free:
         if not free:
             return "refused", "a backfill run is in progress; stop it (or wait for it) before --restart"
-        new = update_state(persona_dir, lambda _cur: _new_state(persona_dir, mode))
-    return new["status"] if new["status"] == "armed" else "complete", f"planned {len(new['targets'])} target(s), mode {mode}"
+        replaced: list[dict] = []
+
+        def fn(cur: dict | None) -> dict:
+            if cur is not None:
+                replaced.append(cur)
+            return _new_state(persona_dir, mode)
+
+        new = update_state(persona_dir, fn)
+    message = f"planned {len(new['targets'])} target(s), mode {mode}"
+    done = sum(1 for t in (replaced[0]["targets"] if replaced else []) if t.get("status") == "done")
+    if done:
+        message += (
+            f"; the replaced plan had {done} target(s) done: their text is extracted again (dedup catches most of it"
+            + ("; soul candidates are queued again" if mode == "heads" else "")
+            + ")"
+        )
+    return ("armed" if new["status"] == "armed" else "complete"), message
 
 
 def stop(persona_dir: Path) -> str:
-    """Set the plan ``stopped``: the job does nothing from its next run; progress is kept."""
+    """Set the plan ``stopped``: the job does nothing from its next run; progress is kept. With no plan nothing is created
+    (not even the state lock's sidecar)."""
+    if load_state(persona_dir) is None:
+        return "there is no backfill plan"
 
     def fn(cur: dict | None) -> dict | None:
         if cur is None or cur.get("status") != "armed":
@@ -762,7 +798,7 @@ def status_text(persona_dir: Path) -> str:
 def dry_run_text(persona_dir: Path) -> str:
     """Both modes' plans, built in memory: per session the targets, characters, chunks (= model calls) and date range.
     No model call, no file or directory created, no lock taken."""
-    cutoff = datetime.now(UTC).isoformat(timespec="seconds")
+    cutoff = _cutoff(persona_dir, datetime.now(UTC))
     user_name, assistant_name = _labels(persona_dir)
     max_chars = extraction_chunk_chars()
     lines = [f"dry run (cutoff {cutoff}, chunk size {max_chars} chars); nothing is written and no model is called"]

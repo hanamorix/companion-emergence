@@ -521,3 +521,30 @@ def test_c14_oracle_on_loop_variant_blocks_health(persona, stub, monkeypatch, ra
 
     loop_thread, health_s = _run(main())
     assert loop_thread in scan_threads and health_s >= 1.0
+
+
+# ---------------------------------------------------------------------------
+# C7 at the route (stage-6 MF1, main ruling M1): a close that kept the buffer is not reported as a close
+# ---------------------------------------------------------------------------
+
+
+def test_sessions_close_with_a_late_row_answers_not_closed(persona, stub, monkeypatch):
+    rows = _seed(persona, _FRESH, 6, age_hours=0.5)
+    last_line = _line(rows[-1])
+    published: list[str] = []
+    monkeypatch.setattr(server.events, "publish", lambda event_type, **payload: published.append(event_type))
+
+    def _late(n):
+        if any(last_line in p for p in stub.prompts[n - 1 : n]):
+            ingest_turn(persona, {"session_id": _FRESH, "speaker": "user", "text": "late zibbit row",
+                                  "ts": (datetime.now(UTC) + timedelta(seconds=5)).isoformat(timespec="seconds")})
+
+    stub.on_call = _late
+    with TestClient(server.build_app(persona_dir=persona, client_origin="tests")) as c:
+        r = c.post("/sessions/close", json={"session_id": _FRESH})
+        state = c.get(f"/state/{_FRESH}")
+    assert r.status_code == 200
+    assert r.json()["closed"] is False
+    assert _FRESH in list_active_sessions(persona)
+    assert "session_closed" not in published
+    assert state.status_code == 200  # still registered

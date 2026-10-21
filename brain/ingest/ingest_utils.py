@@ -1,9 +1,10 @@
 """Ingest-area helpers shared by the extraction pipeline and the extraction backfill (#523).
 
 ``chunk_turns`` splits a run of buffer rows into extraction chunks no larger than ``extraction_chunk_chars()``
-characters of formatted transcript, cutting only where the extraction cursor can safely stop; it and ``parse_turn_ts``
-are pure (no file, no lock, no model call). The ``load_*`` helpers read what an extraction call needs from the persona
-(the user's name and pronouns from ``persona_config.json``, the registered emotion names).
+characters of formatted transcript, cutting only where the extraction cursor can safely stop; it is pure (no file, no
+lock, no model call). The ``load_*`` helpers read what an extraction call needs from the persona
+(the user's name and pronouns from ``persona_config.json``, the registered emotion names). ``mark_chunked_extraction`` /
+``chunked_extraction_since`` keep the per-persona record of when chunked extraction began, which bounds the backfill.
 """
 
 from __future__ import annotations
@@ -15,8 +16,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain import tunables
-from brain.ingest.extract import format_turn_line
+from brain.health.json_io import read_json, write_json
+from brain.ingest.extract import format_transcript, format_turn_line
 from brain.utils.log_throttle import warn_throttled
+from brain.utils.time import lenient_utc
 
 logger = logging.getLogger(__name__)
 
@@ -49,23 +52,12 @@ def extraction_chunk_chars() -> int:
     return _CHUNK_CHARS_DEFAULT
 
 
-def parse_turn_ts(raw: object) -> datetime | None:
-    """A buffer row's ``ts`` as an aware datetime (naive = UTC), or None when it is missing or does not parse."""
-    if not raw:
-        return None
-    try:
-        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-    except (ValueError, TypeError):
-        return None
-    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
-
-
 @dataclass(frozen=True)
 class TurnChunk:
     """One extraction chunk.
 
-    ``turns``: the chunk's rows, in buffer order. ``text``: their formatted transcript, byte-identical to
-    ``format_transcript(turns, user_name=..., assistant_name=...)``. ``cursor_ts``: the value the session cursor may take
+    ``turns``: the chunk's rows, in buffer order. ``text``: their formatted transcript, built by
+    ``format_transcript(turns, user_name=..., assistant_name=...)`` (the extraction's one formatter). ``cursor_ts``: the value the session cursor may take
     once this chunk's commits succeed (the raw ``ts`` of the newest row up to the chunk's end; None when none of those rows
     has a parseable ts). ``oversize``: the chunk is a single unit longer than the limit, sent whole.
     """
@@ -133,7 +125,7 @@ def chunk_turns(
     user_label = user_name if user_name else "user"
     assistant_label = assistant_name if assistant_name else "assistant"
     lines = [format_turn_line(t, user_label, assistant_label) or "" for t in rows]
-    stamps = [parse_turn_ts(t.get("ts")) for t in rows]
+    stamps = [lenient_utc(t.get("ts")) for t in rows]
     missing = sum(1 for s in stamps if s is None)
     if missing:
         logger.warning("conversation_extract_ts_missing rows=%d: kept with the row before them, never a chunk boundary", missing)
@@ -158,10 +150,11 @@ def chunk_turns(
         for j in group:
             if stamps[j] is not None and (newest is None or stamps[j] > newest):
                 newest, newest_raw = stamps[j], str(rows[j].get("ts"))
-        text = "\n".join(lines[j] for j in group)
+        group_rows = [rows[j] for j in group]
+        text = format_transcript(group_rows, user_name=user_name, assistant_name=assistant_name)
         chunks.append(
             TurnChunk(
-                turns=tuple(rows[j] for j in group),
+                turns=tuple(group_rows),
                 text=text,
                 cursor_ts=newest_raw,
                 oversize=len(text) > max_chars,
@@ -214,3 +207,28 @@ def load_emotion_vocab() -> tuple[set[str], str]:
     except Exception:  # noqa: BLE001
         logger.warning("load_emotion_vocab: failed to load vocabulary; emotions will be empty")
         return set(), ""
+
+
+# When chunked extraction began for a persona (main ruling M4 of the #523 run): text chatted after this time is extracted in
+# full by the chunked pipeline, so the extraction backfill never plans it. Written once, never moved.
+CHUNKED_SINCE_FILE = "extraction_chunked_since.json"
+
+
+def mark_chunked_extraction(persona_dir: Path) -> None:
+    """Record, once per persona, that chunked extraction runs from now on (a no-op once the marker exists). Best-effort: a
+    failed write is logged and the next pass tries again."""
+    path = persona_dir / CHUNKED_SINCE_FILE
+    if path.exists():
+        return
+    try:
+        write_json(path, {"since": datetime.now(UTC).isoformat()}, if_missing=True)
+    except OSError:
+        logger.warning("could not record when chunked extraction began (%s); retrying on the next pass", path, exc_info=True)
+
+
+def chunked_extraction_since(persona_dir: Path) -> datetime | None:
+    """The marker's time, or None when there is no marker (or it is unreadable). Read-only: writes nothing."""
+    path = persona_dir / CHUNKED_SINCE_FILE
+    if not path.is_file():
+        return None
+    return lenient_utc(read_json(path, default=dict, expect=dict).get("since"))

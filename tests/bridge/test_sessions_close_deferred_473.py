@@ -24,7 +24,7 @@ def test_a_deferred_close_is_reported_as_deferred_and_the_session_stays(persona_
     def fake_close(*args, **kwargs):
         nonlocal calls
         calls += 1
-        return IngestReport(session_id=args[1], deferred=(calls == 1))
+        return IngestReport(session_id=args[1], deferred=(calls == 1), reached_end=(calls != 1))  # #523: completed = reached the end
 
     monkeypatch.setattr("brain.bridge.server._close_session_blocking", fake_close)
     with _client(persona_dir) as c:

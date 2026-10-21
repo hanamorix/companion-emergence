@@ -3562,8 +3562,9 @@ def build_app(
                     errors=report.errors,
                 )
                 # Extraction failures AND commit failures deliberately retain
-                # the JSONL buffer for retry (close_session gates the delete
-                # on report.commit_failures == 0). Do not remove the in-memory
+                # the JSONL buffer for retry (close_session deletes it only when
+                # report.reached_end: every chunk committed and no row arrived
+                # during the pass, #523). Do not remove the in-memory
                 # session or drop its lock entry, otherwise the retry path
                 # turns into 404 while the client was told nothing actionable.
                 raise HTTPException(
@@ -3581,10 +3582,11 @@ def build_app(
                     },
                 )
 
-            if report.deferred or report.busy:
-                # #473, #477: "not now", not a failure. The pass left the buffer and the cursor as they were, so the
-                # session stays registered (it is still on disk, and a retry or the sweep will take it) and the
-                # response says so instead of claiming the close happened.
+            if report.deferred or report.busy or not report.reached_end:
+                # #473, #477: "not now", not a failure. The pass left the buffer on disk (a deferral or a busy pass; or,
+                # #523, rows arrived while the close ran, so the buffer was kept with them after the cursor), so the
+                # session stays registered (a retry or the sweep will take it) and the response says so instead of
+                # claiming the close happened.
                 events.publish(
                     "session_close_deferred",
                     session_id=sid,

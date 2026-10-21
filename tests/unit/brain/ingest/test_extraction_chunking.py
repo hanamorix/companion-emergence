@@ -15,6 +15,7 @@ import pytest
 from brain.ingest import ingest_utils
 from brain.ingest.extract import format_transcript, format_turn_line
 from brain.ingest.ingest_utils import TurnChunk, chunk_turns, extraction_chunk_chars
+from brain.utils.time import lenient_utc
 
 _T0 = datetime(2026, 10, 1, 20, 0, 0, tzinfo=UTC)
 
@@ -39,8 +40,8 @@ def _boundary_ts_violations(chunks: list[TurnChunk]) -> list[int]:
     """C3(a): indexes k where a row of chunk k shares (or exceeds) a ts of a row in a later chunk."""
     bad = []
     for k in range(len(chunks) - 1):
-        before = [ingest_utils.parse_turn_ts(t.get("ts")) for c in chunks[: k + 1] for t in c.turns]
-        after = [ingest_utils.parse_turn_ts(t.get("ts")) for c in chunks[k + 1 :] for t in c.turns]
+        before = [lenient_utc(t.get("ts")) for c in chunks[: k + 1] for t in c.turns]
+        after = [lenient_utc(t.get("ts")) for c in chunks[k + 1 :] for t in c.turns]
         before = [b for b in before if b is not None]
         after = [a for a in after if a is not None]
         if before and after and max(before) >= min(after):
@@ -53,15 +54,38 @@ def _reply_openers(chunks: list[TurnChunk]) -> list[int]:
     return [k for k, c in enumerate(chunks) if k > 0 and c.turns[0].get("speaker") in ("assistant", "image")]
 
 
+def _allowed_cuts(rows: list[dict]) -> set[int]:
+    """The rule, written out again independently of ``ingest_utils``: a chunk may start at row i (i > 0) only at a ``user`` row
+    whose ts is parseable and every earlier row is strictly older than every row from i on."""
+    stamps = [lenient_utc(r.get("ts")) for r in rows]
+    cuts = set()
+    for i in range(1, len(rows)):
+        before = [t for t in stamps[:i] if t is not None]
+        after = [t for t in stamps[i:] if t is not None]
+        if rows[i].get("speaker") == "user" and stamps[i] is not None and before and after and max(before) < min(after):
+            cuts.add(i)
+    return cuts
+
+
 def _chunk_text_problems(chunks: list[TurnChunk], max_chars: int) -> list[str]:
-    """C2 at the chunker: each chunk's text is exactly its whole rows formatted, within the limit unless oversize."""
+    """C2 at the chunker: each chunk's text is exactly its whole rows formatted, and its length (joining newlines included,
+    measured here, not taken from the chunk) is within the limit unless the chunk is one unit, i.e. has no allowed cut point
+    inside it. The ``oversize`` flag must agree with that measured length."""
     problems = []
+    rows = [t for c in chunks for t in c.turns]
+    cuts = _allowed_cuts(rows)
+    start = 0
     for k, c in enumerate(chunks):
         expected = "\n".join(format_turn_line(t, "Bob", "Kestrel") for t in c.turns)
         if c.text != expected or c.text != format_transcript(list(c.turns), user_name="Bob", assistant_name="Kestrel"):
             problems.append(f"chunk {k}: text is not its whole rows")
-        if len(c.text) > max_chars and not c.oversize:
-            problems.append(f"chunk {k}: {len(c.text)} > {max_chars} and not oversize")
+        length = sum(len(format_turn_line(t, "Bob", "Kestrel")) for t in c.turns) + len(c.turns) - 1
+        inner_cuts = [i for i in cuts if start < i < start + len(c.turns)]
+        if length > max_chars and inner_cuts:
+            problems.append(f"chunk {k}: {length} > {max_chars} although it could be cut at rows {inner_cuts}")
+        if c.oversize != (length > max_chars):
+            problems.append(f"chunk {k}: oversize={c.oversize} but the measured length is {length}")
+        start += len(c.turns)
     return problems
 
 
@@ -148,13 +172,40 @@ def test_oracles_catch_broken_chunker_variants(monkeypatch, variant, history, or
     assert oracle(chunks) != []
 
 
+def test_two_units_exactly_at_the_limit_share_a_chunk_and_one_more_char_splits_them() -> None:
+    """The joining newline counts: two one-row units of length L fit a limit of 2L + 1 and do not fit 2L."""
+    rows = [_row("user", "q" * 40, 0), _row("user", "r" * 40, 60)]
+    line = len(format_turn_line(rows[0], "Bob", "Kestrel"))
+    exact = chunk_turns(rows, max_chars=2 * line + 1, user_name="Bob", assistant_name="Kestrel")
+    over = chunk_turns(rows, max_chars=2 * line, user_name="Bob", assistant_name="Kestrel")
+    assert [len(c.turns) for c in exact] == [2] and not exact[0].oversize
+    assert [len(c.turns) for c in over] == [1, 1]
+    assert _chunk_text_problems(exact, 2 * line + 1) == [] and _chunk_text_problems(over, 2 * line) == []
+
+
+def test_cursor_ts_is_the_newest_row_even_when_a_later_row_is_older() -> None:
+    """A row stamped before an earlier row of the same unit (a hand-edited buffer shape): the cursor takes the NEWEST ts up to
+    the chunk end, not the last row's."""
+    rows = [
+        _row("user", "u" * 60, 0),
+        _row("assistant", "a" * 60, 100),
+        _row("image", "i" * 60, 40),  # older than the reply before it
+        _row("user", "v" * 60, 200),
+        _row("assistant", "b" * 60, 201),
+    ]
+    chunks = chunk_turns(rows, max_chars=150, user_name="Bob", assistant_name="Kestrel")
+    assert [len(c.turns) for c in chunks] == [3, 2]
+    assert chunks[0].cursor_ts == _ts(100)
+    assert chunks[1].cursor_ts == _ts(201)
+
+
 def test_cursor_ts_is_the_newest_row_up_to_the_chunk_end() -> None:
     rows = _straddling_pairs_history()
     chunks = chunk_turns(rows, max_chars=300, user_name="Bob", assistant_name="Kestrel")
     seen: list[dict] = []
     for c in chunks:
         seen += list(c.turns)
-        newest = max(seen, key=lambda t: ingest_utils.parse_turn_ts(t["ts"]))
+        newest = max(seen, key=lambda t: lenient_utc(t["ts"]))
         assert c.cursor_ts == newest["ts"]
 
 
@@ -815,3 +866,18 @@ def test_c11a_three_central_passes_extract_the_three_chunks(world, monkeypatch) 
         assert len(stub.prompts) == k
         assert read_cursor(persona, "sess_c1p") == chunks[k - 1].cursor_ts
     assert supervisor._snapshot_has_work(persona) is False
+
+
+def test_b17_the_first_chunked_pass_writes_the_marker_once(world) -> None:
+    """Main ruling M4: the pipeline records when chunked extraction began for this persona, once, and never moves it."""
+    persona, _, _, _ = world
+    marker = persona / "extraction_chunked_since.json"
+    _seed(persona, "sess_m1", 2)
+    assert not marker.exists()
+    before = datetime.now(UTC).replace(microsecond=0)
+    _snapshot(world, "sess_m1", _Stub())
+    first = marker.read_bytes()
+    assert lenient_utc(json.loads(first)["since"]) >= before
+    _seed(persona, "sess_m2", 2)
+    _snapshot(world, "sess_m2", _Stub())
+    assert marker.read_bytes() == first
