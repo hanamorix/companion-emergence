@@ -18,6 +18,7 @@ leave a callable scheduled to run at interpreter exit.
 from __future__ import annotations
 
 import os
+import signal
 import socket
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -286,7 +287,8 @@ def test_after_run_decision_runs_however_server_run_ends(tmp_path: Path, monkeyp
             if ending == "return":
                 self.controller.begin_stop("user_stop")  # /supervisor/shutdown, then uvicorn's loop ends
                 return
-            self.controller.note_signal()  # the signal uvicorn re-raises after serve() ended
+            # The signal uvicorn re-raises after serve() ended: SIGTERM as SystemExit, SIGINT as KeyboardInterrupt.
+            self.controller.note_signal(signal.SIGTERM if ending == "system_exit" else signal.SIGINT)
             if ending == "system_exit":
                 raise SystemExit(0)
             raise KeyboardInterrupt
@@ -385,7 +387,7 @@ def test_after_run_with_work_still_running_takes_the_hard_exit_path(tmp_path: Pa
         def run(self):
             reg.register("stub task")
             if stop_begun:
-                self.controller.note_signal()  # the SIGINT that uvicorn re-raises as KeyboardInterrupt
+                self.controller.note_signal(signal.SIGINT)  # the SIGINT that uvicorn re-raises as KeyboardInterrupt
                 raise KeyboardInterrupt
             raise RuntimeError("uvicorn's loop ended unexpectedly")
 

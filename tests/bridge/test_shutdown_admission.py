@@ -3,6 +3,7 @@ D1, D21, Q-B)."""
 
 from __future__ import annotations
 
+import signal
 import threading
 import time
 from pathlib import Path
@@ -197,7 +198,7 @@ def test_the_lifespan_backstop_keeps_a_pending_signal_as_the_reason(persona_dir:
     ctrl = _controller(persona_dir)
     with _client(persona_dir, ctrl) as c:
         assert c.get("/health").status_code == 200
-        ctrl.note_signal()  # the signal handler ran; the monitor has not polled yet
+        ctrl.note_signal(signal.SIGTERM)  # the signal handler ran; the monitor has not polled yet
     assert ctrl.reason == "os_signal"
 
 

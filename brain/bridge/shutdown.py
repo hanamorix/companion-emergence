@@ -161,7 +161,7 @@ class BridgeShutdownController:
 
     # ---------------------------------------------------------------- signal path (C6: attribute writes only)
 
-    def note_signal(self, sig: int | None = None) -> None:
+    def note_signal(self, sig: int) -> None:
         """Called from a signal handler with the signal number: plain attribute writes, nothing else."""
         self.signal_count += 1
         if sig == signal.SIGINT:

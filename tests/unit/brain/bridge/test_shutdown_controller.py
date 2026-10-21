@@ -43,6 +43,7 @@ def test_request_without_server_returns_false() -> None:
 # ---------------------------------------------------------------- #456: begin_stop, the signal path, the monitor
 
 import os  # noqa: E402
+import signal as _signal_mod  # noqa: E402
 import threading  # noqa: E402
 from pathlib import Path  # noqa: E402
 
@@ -175,7 +176,7 @@ def test_monitor_applies_a_signal_within_one_poll(own_record):
     c.bind_server(FakeServer())
     exits: list[str] = []
     m = _monitor(own_record, c, exits)
-    c.note_signal()
+    c.note_signal(_signal_mod.SIGTERM)
     m.poll_once()
     assert c.stopping and c.reason == "os_signal" and cli_throttle.shutdown_requested()
     assert state_file.read(own_record).phase == "stopping"
