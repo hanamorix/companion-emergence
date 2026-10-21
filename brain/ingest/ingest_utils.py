@@ -64,7 +64,9 @@ class TurnChunk:
     replies) longer than the limit. ``pieces``: the texts sent to the extractor, one call each, every one within the limit:
     ``(text,)`` for a normal chunk; for an oversize one, its rows packed whole where they fit and a longer row split at line
     boundaries, then at character boundaries, each piece opening with its speaker label. The cursor moves past the chunk only
-    after its last piece commits.
+    after its last piece commits. The one exception to "within the limit": a limit no longer than a speaker label (only a
+    hand-set, tiny ``ingest.extraction_chunk_chars``) leaves no room for text, so each piece of that row carries one character
+    and is longer than the limit by the label's length (see ``_split_line``).
     """
 
     turns: tuple[dict, ...]
@@ -75,9 +77,12 @@ class TurnChunk:
 
 
 def _split_line(line: str, max_chars: int) -> list[str]:
-    """One formatted row longer than ``max_chars`` as segments of at most ``max_chars`` (when the label leaves room), each
-    opening with the row's ``"label: "``: whole body lines packed together, a body line longer than the room split at
-    character boundaries."""
+    """One formatted row longer than ``max_chars`` as segments of at most ``max_chars``, each opening with the row's
+    ``"label: "``: whole body lines packed together, a body line longer than the room split at character boundaries.
+
+    When ``max_chars`` is no longer than the label (only a hand-set, tiny ``ingest.extraction_chunk_chars``), there is no room
+    for text: the room is floored at one character, so every segment is the label plus one character and longer than
+    ``max_chars``. Nothing is dropped and the split still ends; the setting is only required to be a positive int."""
     head, sep, body = line.partition(": ")
     prefix = head + sep if sep else ""
     room = max(1, max_chars - len(prefix))
@@ -160,7 +165,8 @@ def chunk_turns(
     Rows between two allowed cut points (see ``_cut_allowed``) form a unit; a chunk is a run of whole units whose text
     stays within ``max_chars``. A single unit longer than ``max_chars`` is its own chunk (``oversize``): one step for the
     cursor, but sent to the extractor in ``pieces`` within the limit (a row split at line, then character, boundaries if it
-    must be), so no prompt exceeds the limit and nothing of it is dropped.
+    must be), so no prompt exceeds the limit (unless the limit is shorter than a speaker label, see ``_split_line``) and
+    nothing of it is dropped.
     Compaction ``summary`` rows are dropped first: they are never extracted and their ts must never move the cursor.
     Rows with a missing or unparseable ts are kept (they join the unit before them) and logged as
     ``conversation_extract_ts_missing``.

@@ -246,6 +246,15 @@ def test_a_long_multi_line_message_is_split_at_line_boundaries() -> None:
     assert rebuilt == body.split("\n")
 
 
+
+def test_a_limit_shorter_than_the_label_still_ends_and_drops_nothing() -> None:
+    """The documented exception: a limit no longer than "Kestrel: " leaves no room for text, so each piece is the label plus
+    one character (over the limit by the label's length). The split must still end and keep every character."""
+    rows = [_row("user", "hi", 0), _row("assistant", "plonk", 1)]
+    (chunk,) = chunk_turns(rows, max_chars=4, user_name="Bob", assistant_name="Kestrel")
+    assert chunk.oversize
+    assert chunk.pieces == ("Bob: h", "Bob: i", "Kestrel: p", "Kestrel: l", "Kestrel: o", "Kestrel: n", "Kestrel: k")
+
 def test_rows_without_a_ts_join_the_row_before_and_are_logged(caplog) -> None:
     rows = [_row("user", "a" * 60, 0), _row("assistant", "b" * 60, 1), _row("user", "c" * 60, None), _row("user", "d" * 60, 90)]
     with caplog.at_level(logging.WARNING, logger="brain.ingest.ingest_utils"):
