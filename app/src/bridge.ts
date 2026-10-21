@@ -324,9 +324,9 @@ export async function newSession(persona: string): Promise<string> {
  * treats a throw the same as null (transient network flake).
  *
  * Part of the F-201 sticky-session reattach: combined with the
- * server-side hydration path and the non-destructive shutdown drain,
- * this lets Cmd-Q + reopen pick up mid-thread instead of starting a
- * fresh session every cold start.
+ * server-side hydration path (a bridge stop leaves the session buffers
+ * on disk), this lets Cmd-Q + reopen pick up mid-thread instead of
+ * starting a fresh session every cold start.
  */
 export async function fetchActiveSession(persona: string): Promise<string | null> {
   const r = await bridgeFetch(persona, (creds) =>

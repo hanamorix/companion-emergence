@@ -3,7 +3,8 @@
 close_session()             — run all 8 stages for one session, delete its buffer + cursor.
 extract_session_snapshot()  — non-destructive variant; uses cursor sidecar to extract only new turns.
 close_stale_sessions()      — destructive sweep; retained for explicit close/finalize callers (NOT used by shutdown or recovery).
-snapshot_stale_sessions()   — non-destructive sweep used by periodic supervision, shutdown, and recovery.
+snapshot_stale_sessions()   — non-destructive sweep used by the supervisor's periodic snapshot job (which also saves
+                              open conversations at the first idle pass after a start; a stop runs no sweep).
 finalize_stale_sessions()   — real-close sweep (24h silence); final snapshot + buffer delete + cursor delete.
 
 Stage flow:
@@ -799,11 +800,11 @@ def close_stale_sessions(
 
     Destructive — runs the full close_session pipeline (extract + delete buffer +
     delete cursor sidecar) for every match. Retained for explicit close/finalize
-    callers only. NOT used by bridge shutdown or dirty-start recovery (both now
-    call ``snapshot_stale_sessions`` which is non-destructive).
+    callers only. A bridge stop runs no session sweep at all (#456, Q-B): open
+    conversations are saved by the supervisor's snapshot job at the first idle
+    pass after the next start.
 
-    For the periodic non-destructive 5-minute sweep, startup recovery, or graceful
-    shutdown drain, use ``snapshot_stale_sessions`` instead.
+    For that periodic non-destructive sweep, use ``snapshot_stale_sessions``.
     For the 24h real-close cadence, use ``finalize_stale_sessions``.
 
     Empty sessions (no turns) are cleaned up silently without running the

@@ -212,10 +212,9 @@ def _check_idle(state: Any, idle_shutdown_seconds: float) -> bool:
 
     Bridge startup counts as activity so a freshly launched app has the
     full idle window before the watcher fires. Without that fallback,
-    ``last_chat_at is None`` collapsed to "idle" and the bridge SIGTERM'd
-    itself ~60s after every launch — which then triggered the
-    close-heartbeat (decay + dream + reflex + growth) on every relaunch,
-    looking from the UI like the brain was 'flooding'.
+    ``last_chat_at is None`` collapsed to "idle" and the bridge stopped
+    itself ~60s after every launch, so every relaunch was followed by an
+    idle stop.
     """
     now = datetime.now(UTC)
     last_activity = state.last_chat_at or state.started_at

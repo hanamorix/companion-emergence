@@ -24,7 +24,8 @@ from typing import Protocol
 
 logger = logging.getLogger(__name__)
 
-# Monitor poll interval: the same 0.1 s the lifespan's own waits use (server.py `_wait_for_in_flight_drain`).
+# Monitor poll interval: 0.1 s, the existing interval of the pre-#456 lifespan's in-flight chat wait (spec D6); the
+# lifespan's stop waits poll at it too (server.py `_STOP_POLL_S`).
 POLL_S = 0.1
 
 # Stop reasons recorded in bridge.json and the progress record (C13).

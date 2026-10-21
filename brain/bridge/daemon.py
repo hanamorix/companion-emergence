@@ -336,10 +336,11 @@ def cmd_start(args, *, out: dict | None = None) -> int:
     if state_file.is_running(persona_dir):
         return _refuse_already_running(persona_dir, out)
 
-    # Hold the lock through recovery (so two concurrent starters can't both
-    # recover), then RELEASE it right before spawning. The bridge PROCESS — the
-    # detached runner (see runner.main) — re-acquires it and holds it for its
-    # lifetime, so pid-based stale recovery works. cmd_start must NOT hold the
+    # Hold the lock through the start-up steps below (so a concurrent starter
+    # gets "lock held" instead of starting a second bridge), then RELEASE it
+    # right before spawning. The bridge PROCESS (the detached runner, see
+    # runner.main) re-acquires it and holds it for its lifetime, so a stale
+    # record is told apart from a live bridge. cmd_start must NOT hold the
     # lock across the spawn, or the child can't acquire it and dies (Bug 2a,
     # v0.0.36). The runner's lifetime lock is the real guard against two bridges.
     fd = acquire_lock(persona_dir)
@@ -390,7 +391,7 @@ def cmd_start(args, *, out: dict | None = None) -> int:
         _spawned_children.pop(pid, None)
 
 
-# Readiness window: Windows cold-boot (recovery + persona load + soul review) routinely exceeds 5s; the old 5s deadline
+# Readiness window: Windows cold-boot (persona load + soul review; before #456 also recovery) routinely exceeds 5s; the old 5s deadline
 # killed a healthy-but-slow bridge. 50s stays inside the Rust caller's 60s outer timeout. (Bug 2b, v0.0.36.)
 _READINESS_BUDGET_S = 50.0
 

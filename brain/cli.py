@@ -3266,7 +3266,7 @@ def _build_parser() -> argparse.ArgumentParser:
     s_restart.add_argument("--idle-shutdown", type=float, default=30)
     s_restart.add_argument("--client-origin", default="cli", choices=client_origin_choices)
     s_restart.add_argument("--timeout", type=float, default=180.0)
-    s_restart.add_argument("--force", action="store_true", help="force-terminate a wedged bridge (Windows last resort; skips cleanup, recovery snapshots on next start)")
+    s_restart.add_argument("--force", action="store_true", help="end a bridge whose stop request fails (Windows last resort; uses the same kill as --kill)")
     s_restart.set_defaults(func=cmd_restart)
 
     s_tail_events = s_actions.add_parser("tail-events", help="Tail /events as JSON lines.")
