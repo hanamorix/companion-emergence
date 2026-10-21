@@ -46,6 +46,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field, StrictBool
 
 from brain import __version__ as _brain_version
@@ -1118,6 +1119,34 @@ _background_threads_inhibited: bool = False
 _lifespan_test_hooks: dict[str, Any] | None = None
 
 
+class _TrackedSyncRoute(APIRoute):
+    """A synchronous non-GET endpoint is a counted stop task while its worker thread runs (review of #458).
+
+    The count is taken inside the thread, so uvicorn cancelling the request task after its 30 s graceful window does
+    not uncount work that is still running (the same rule as ``tracked_to_thread``). GET routes (``/health`` among
+    them) are reads and stay untracked."""
+
+    def __init__(self, path: str, endpoint: Callable[..., Any], **kwargs: Any) -> None:
+        if set(kwargs.get("methods") or ()) - {"GET"} and not asyncio.iscoroutinefunction(endpoint):
+            endpoint = _tracked_sync(f"request {path}", endpoint)
+        super().__init__(path, endpoint, **kwargs)
+
+
+def _tracked_sync(label: str, fn: Callable[..., Any]) -> Callable[..., Any]:
+    import functools
+
+    @functools.wraps(fn)  # FastAPI reads the endpoint's signature through __wrapped__
+    def _run(*args: Any, **kwargs: Any) -> Any:
+        # Sealed: ShutdownDeferred, which the app's handler answers with the admission middleware's 503 body.
+        handle = shutdown_progress.registry.register(label)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            shutdown_progress.registry.unregister(handle)
+
+    return _run
+
+
 def build_app(
     persona_dir: Path,
     client_origin: str = "cli",
@@ -1510,6 +1539,7 @@ def build_app(
             logger.info("bridge stopped persona=%s", persona_dir.name)
 
     app = FastAPI(title="companion-emergence bridge", version="0.1.0", lifespan=lifespan)
+    app.router.route_class = _TrackedSyncRoute
 
     # CORS — narrowly scoped to the same allowed_origins used for WS auth,
     # plus localhost dev origins (Tauri devUrl + Vite default ports). Bearer
@@ -1528,6 +1558,12 @@ def build_app(
                 status_code=503, content={"code": "bridge_stopping", "message": "the bridge is stopping"}
             )
         return await call_next(request)
+
+    # A request admitted just before the stop whose worker registers after the seal (tracked_to_thread) is refused the
+    # same way as one that arrives after it, not with a 500 (review of #458).
+    @app.exception_handler(cli_throttle.ShutdownDeferred)
+    async def _stopping(_request: Request, _exc: cli_throttle.ShutdownDeferred) -> JSONResponse:
+        return JSONResponse(status_code=503, content={"code": "bridge_stopping", "message": "the bridge is stopping"})
 
     from fastapi.middleware.cors import CORSMiddleware
 

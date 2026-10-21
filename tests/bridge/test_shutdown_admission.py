@@ -266,3 +266,18 @@ def test_the_idle_stop_writes_its_mark_off_the_event_loop(persona_dir: Path):
     )
     asyncio.run(asyncio.wait_for(srv._idle_watcher(state, 0.01), timeout=10))
     assert calls == [False]
+
+
+def test_a_request_whose_worker_registers_after_the_seal_gets_bridge_stopping(persona_dir: Path):
+    """Review of #458: a request admitted before the stop flag, whose tracked worker registers after the registry
+    sealed, is refused like any request after the stop (503 bridge_stopping), not a 500."""
+    ctrl = _controller(persona_dir)
+    client = TestClient(
+        build_app(persona_dir=persona_dir, client_origin="tests", shutdown_controller=ctrl),
+        raise_server_exceptions=False,
+    )
+    with client as c:
+        assert shutdown_progress.registry.seal() is True
+        r = c.post("/tools/search_memories", json={"query": "anything"})
+    assert r.status_code == 503, r.status_code
+    assert r.json()["code"] == "bridge_stopping"

@@ -194,22 +194,30 @@ def _alive(proc) -> bool:
 def _kill_proc(proc) -> None:
     try:
         if sys.platform.startswith("win"):  # pragma: no cover - Windows CI leg
-            _terminate_exit_0(proc.pid)
+            _terminate_exit_0(proc)
         else:
             proc.kill()
     except Exception:  # noqa: BLE001 - gone already
         pass
 
 
-def _terminate_exit_0(pid: int) -> None:  # pragma: no cover - Windows CI leg
-    """Windows: end the process with exit code 0, so Task Scheduler does not treat the end as a failure."""
+def _kernel32():  # pragma: no cover - Windows CI leg
     import ctypes
 
-    k32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-    handle = k32.OpenProcess(0x0001, False, pid)  # PROCESS_TERMINATE
+    return ctypes.windll.kernel32  # type: ignore[attr-defined]
+
+
+def _terminate_exit_0(proc) -> None:  # noqa: ANN001
+    """Windows: end the process with exit code 0, so Task Scheduler does not treat the end as a failure.
+
+    The open handle pins the pid, so once ``proc.is_running()`` (psutil's create-time check) confirms the pid is
+    still the remembered process, the handle cannot reach another one (review of #458: a bare pid could)."""
+    k32 = _kernel32()
+    handle = k32.OpenProcess(0x0001, False, proc.pid)  # PROCESS_TERMINATE
     if handle:
         try:
-            k32.TerminateProcess(handle, 0)
+            if proc.is_running():
+                k32.TerminateProcess(handle, 0)
         finally:
             k32.CloseHandle(handle)
 
@@ -321,6 +329,7 @@ def kill_bridge(
     remembered: dict[int, object] = {}
     suspended: list = []
     kill_returned = False
+    request_written = False
 
     def _remember(procs) -> None:
         for p in procs:
@@ -356,6 +365,7 @@ def kill_bridge(
                         pid=st.pid, pid_token=st.pid_token, requested_at=datetime.now(UTC).isoformat()
                     ),
                 )
+                request_written = True
                 deadline = time.monotonic() + timeout
                 while time.monotonic() < deadline and _alive(bridge):
                     _hook("hard_exit_wait")
@@ -445,6 +455,12 @@ def kill_bridge(
                     except Exception:  # noqa: BLE001
                         pass
                 _cas_intent(persona_dir, nonce, lambda _cur: None)
+                # A kill called off before it killed withdraws its hard-exit request too (review of #458): the bridge
+                # still runs and would act on it later, after the user cancelled.
+                if request_written and shutdown_progress.names_this_bridge(
+                    shutdown_progress.read_record(persona_dir, shutdown_progress.REQUEST_FILENAME), st.pid, st.pid_token
+                ):
+                    shutdown_progress.delete_record(persona_dir, shutdown_progress.REQUEST_FILENAME)
             else:
                 for p in [*suspended[1:], *remembered.values()]:
                     if _alive(p):

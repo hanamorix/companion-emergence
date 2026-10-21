@@ -93,6 +93,16 @@ def test_kill_on_a_running_bridge_uses_the_helper(pd, sleeper, monkeypatch):
     assert calls == [{"timeout": 5.0, "skip_hard_exit_request": True, "expect_pid": None, "expect_token": None}]
 
 
+def test_kill_with_survivors_exits_nonzero(pd, sleeper, monkeypatch, capsys):
+    # Review of #458 (finding 1): a kill that leaves processes running is not a success. Exit 0 here made the app's
+    # force restart and `restart` start a new bridge beside the old tree.
+    _write(pd, pid=sleeper.pid, pid_token=pi.token_of(sleeper.pid), identity="token")
+    monkeypatch.setattr(kill, "kill_bridge", lambda persona_dir, persona=None, **kw: kill.KillResult(
+        "killed", "processes still running after the kill: [4242]", [4242], True))
+    assert daemon.cmd_stop(_stop_args(kill=True)) == 1
+    assert "[4242]" in capsys.readouterr().out
+
+
 # ---------------------------------------------------------------- C43: pre-PR bridges (D22)
 
 _STUB_RUNNER = textwrap.dedent(

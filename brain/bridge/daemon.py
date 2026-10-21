@@ -648,9 +648,14 @@ def _stop_began(s: state_file.BridgeState, persona_dir: Path, response: httpx.Re
     return bool(cur is not None and cur.pid == s.pid and cur.phase == "stopping")
 
 
+def _kill_succeeded(result) -> bool:  # noqa: ANN001
+    # A kill that left processes running is not a success (review of #458): the callers start a new bridge on exit 0.
+    return result.outcome in ("killed", "not_running") and not result.survivors
+
+
 def _print_kill_result(result) -> int:  # noqa: ANN001
     print(result.message)
-    return 0 if result.outcome in ("killed", "not_running") else 1
+    return 0 if _kill_succeeded(result) else 1
 
 
 def cmd_stop(args) -> int:
@@ -746,7 +751,7 @@ def _stop_pre_pr(persona_dir: Path, s: state_file.BridgeState, timeout: float) -
         time.sleep(0.2)
     if state_file.bridge_liveness(s, persona_dir) == state_file.ALIVE:
         result = kill_mod.kill_bridge(persona_dir, timeout=timeout)
-        if result.outcome not in ("killed", "not_running"):
+        if not _kill_succeeded(result):
             print(result.message, file=sys.stderr)
             return 1
     print("Stopped the previous version of the bridge. The next start will pick up anything left unfinished.")
