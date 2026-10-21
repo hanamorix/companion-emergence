@@ -307,7 +307,7 @@ def test_c14a_keepalive_spaces_while_the_rollover_runs(persona, stub, raw_app):
 def test_c14a_the_fast_path_sends_the_json_first(persona, stub, monkeypatch, raw_app):
     _seed(persona, _STALE, 6, age_hours=30)
     ingest_turn(persona, {"session_id": _FRESH, "speaker": "user", "text": "hello", "ts": datetime.now(UTC).isoformat(timespec="seconds")})
-    monkeypatch.setattr(server, "_stream_keepalive_seconds", lambda: 2.0)  # N-c: a slow host cannot fail this
+    monkeypatch.setattr(server, "_stream_keepalive_seconds", lambda: 2.0)  # a long interval, so a slow host cannot fail this
 
     async def main():
         d = _Driver(raw_app)
@@ -401,40 +401,55 @@ def test_c14d_a_failed_rollover_answers_null(persona, stub, monkeypatch, raw_app
     assert not any("exception was never retrieved" in r.getMessage() for r in caplog.records)
 
 
-def test_c14e_the_event_loop_stays_free_and_the_scan_runs_off_it(persona, stub, monkeypatch, raw_app):
+def _scan_blocked_until_health(monkeypatch, scan_threads: list[int], order: list[str], release, timeout_s: float):
+    """Patch the buffer scan to record its thread, then block until ``release`` is set (or ``timeout_s``, a deadlock breaker
+    for the on-loop variant), recording ``scan done`` in ``order``. Ordering, not wall-clock time, is the oracle."""
     import brain.ingest.buffer as buffer
 
-    _seed(persona, _STALE, 6, age_hours=30)
     real_list = buffer.list_active_sessions
-    scan_threads: list[int] = []
 
-    def _slow_list(persona_dir):
+    def _blocked_list(persona_dir):
         scan_threads.append(threading.get_ident())
-        time.sleep(0.5)
+        release.wait(timeout=timeout_s)
+        order.append("scan done")
         return real_list(persona_dir)
 
-    monkeypatch.setattr(buffer, "list_active_sessions", _slow_list)
+    monkeypatch.setattr(buffer, "list_active_sessions", _blocked_list)
+
+
+def test_c14e_the_event_loop_stays_free_and_the_scan_runs_off_it(persona, stub, monkeypatch, raw_app):
+    """While the launch decision's buffer scan is blocked, ``/health`` on the same loop completes; only then is the scan let go.
+    So /health finishing first proves the loop was free; the scan's thread is not the loop's."""
+    _seed(persona, _STALE, 6, age_hours=30)
+    scan_threads: list[int] = []
+    order: list[str] = []
+    release = threading.Event()
+    _scan_blocked_until_health(monkeypatch, scan_threads, order, release, timeout_s=30)
 
     async def main():
         d = _Driver(raw_app)
         await d.start()
         scan_threads.clear()  # the lifespan's own idle-anchor seed lists the buffers at startup, on the loop
+        order.clear()
         loop_thread = threading.get_ident()
         try:
-            t0 = time.monotonic()
             active = asyncio.ensure_future(d.get("/sessions/active"))
+            while not scan_threads:  # the scan has started (in its worker thread) and is now blocked
+                await asyncio.sleep(0.01)
             health = await d.get("/health")
-            health_s = time.monotonic() - t0
+            order.append("health done")
+            release.set()
             for g in stub.gates:
                 g.set()
             await active
         finally:
+            release.set()
             await d.stop()
-        return loop_thread, health, health_s
+        return loop_thread, health
 
-    loop_thread, health, health_s = _run(main())
+    loop_thread, health = _run(main())
     assert _status(health)[0] == 200
-    assert health_s < 1.0
+    assert order == ["health done", "scan done"]
     assert scan_threads and all(t != loop_thread for t in scan_threads)
 
 
@@ -486,41 +501,39 @@ def test_c14_oracle_no_shared_task_variant_answers_null_to_the_second_call(perso
 
 
 def test_c14_oracle_on_loop_variant_blocks_health(persona, stub, monkeypatch, raw_app):
-    import brain.ingest.buffer as buffer
-
+    """Fail-first kept executable: with the decision run on the loop, the blocked scan holds the loop, so /health can only finish
+    after the scan (here released by its deadlock-breaking timeout), and the scan's thread is the loop's."""
     _seed(persona, _STALE, 6, age_hours=30)
     stub.gated = False
-    real_list = buffer.list_active_sessions
     scan_threads: list[int] = []
-
-    def _slow_list(persona_dir):
-        scan_threads.append(threading.get_ident())
-        time.sleep(1.2)
-        return real_list(persona_dir)
+    order: list[str] = []
+    release = threading.Event()
+    _scan_blocked_until_health(monkeypatch, scan_threads, order, release, timeout_s=1.0)
 
     async def _on_loop(label, fn, *a, **k):
         return fn(*a, **k)
 
-    monkeypatch.setattr(buffer, "list_active_sessions", _slow_list)
     monkeypatch.setattr(server, "tracked_to_thread", _on_loop)
 
     async def main():
         d = _Driver(raw_app)
         await d.start()
         scan_threads.clear()  # the lifespan's own idle-anchor seed lists the buffers at startup, on the loop
+        order.clear()
         loop_thread = threading.get_ident()
         try:
-            t0 = time.monotonic()
             active = asyncio.ensure_future(d.get("/sessions/active"))
             await d.get("/health")
-            health_s = time.monotonic() - t0
+            order.append("health done")
+            release.set()
             await active
         finally:
+            release.set()
             await d.stop()
-        return loop_thread, health_s
+        return loop_thread
 
-    loop_thread, health_s = _run(main())
-    assert loop_thread in scan_threads and health_s >= 1.0
+    loop_thread = _run(main())
+    assert loop_thread in scan_threads and order == ["scan done", "health done"]
 
 
 # ---------------------------------------------------------------------------

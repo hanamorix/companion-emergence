@@ -438,7 +438,11 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
     }
   }
 
+  // A banner given back after a failed card reply mounts again; its message was already read, so "read" is posted once per id.
+  const readPostedRef = useRef<Set<string>>(new Set());
   const onBannerMounted = (auditId: string) => {
+    if (readPostedRef.current.has(auditId)) return;
+    readPostedRef.current.add(auditId);
     void postInitiateState(auditId, "read");
   };
   const onBannerDismiss = (auditId: string) => {

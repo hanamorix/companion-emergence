@@ -482,6 +482,75 @@ describe("ChatPanel — a send whose session cannot be had is rolled back (#523)
   });
 });
 
+describe("ChatPanel — a banner given back after a failed card reply is not read twice (#523)", () => {
+  const mockedFetchActive = fetchActiveSession as unknown as ReturnType<typeof vi.fn>;
+  const mockedNewSession = newSession as unknown as ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    mockedFetchActive.mockReset();
+    mockedNewSession.mockReset();
+    mockedFetchActive.mockResolvedValue(null);
+    mockedNewSession.mockRejectedValue(new Error("bridge down"));
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("posts read once per audit id", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const handlers = new Set<(e: Record<string, unknown> & { type: string }) => void>();
+      const stream = {
+        subscribe(h: (e: Record<string, unknown> & { type: string }) => void) {
+          handlers.add(h);
+          return () => handlers.delete(h);
+        },
+      };
+      render(<ChatPanel persona="kestrel" eventStream={stream} />);
+      await act(async () => {
+        for (const h of handlers)
+          h({
+            type: "initiate_delivered",
+            audit_id: "ia_once",
+            body: "a note about the snorvel lamp",
+            urgency: "quiet",
+            state: "delivered",
+            timestamp: "2026-10-12T09:00:00+00:00",
+          });
+      });
+      await act(async () => {
+        vi.advanceTimersByTime(2100);
+      });
+      const readPosts = () =>
+        fetchSpy.mock.calls.filter(([url, init]: [RequestInfo | URL, RequestInit?]) => {
+          const u = typeof url === "string" ? url : url.toString();
+          return u.includes("/initiate/state") && String(init?.body ?? "").includes('"new_state":"read"');
+        }).length;
+      await waitFor(() => expect(readPosts()).toBe(1));
+      const cardTextarea = (await screen.findByLabelText(/^Reply to Kestrel$/i)) as HTMLTextAreaElement;
+      await act(async () => {
+        fireEvent.change(cardTextarea, { target: { value: "and the glow?" } });
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: /Send reply/i }));
+      });
+      await waitFor(() => expect(mockedNewSession).toHaveBeenCalled());
+      expect(((await screen.findByLabelText(/^Reply to Kestrel$/i)) as HTMLTextAreaElement).value).toBe("and the glow?");
+      await act(async () => {
+        vi.advanceTimersByTime(2100);
+      });
+      expect(readPosts()).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("ChatPanel — recovery banner (Phase 3.B)", () => {
   afterEach(() => {
     cleanup();

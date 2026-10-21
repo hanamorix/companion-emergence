@@ -23,6 +23,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -87,6 +88,7 @@ from brain.memory.store import MemoryStore
 from brain.persona_config import PersonaConfig
 from brain.tools.dispatch import dispatch
 from brain.update.overlay import loaded_overlay
+from brain.utils.log_throttle import warn_throttled
 
 logger = logging.getLogger(__name__)
 
@@ -589,8 +591,27 @@ def _snapshot_session_blocking(
 _STREAM_KEEPALIVE_SECONDS = tunables.register("bridge.stream_keepalive_seconds", 15.0)
 
 
+# The smallest keepalive interval an override may set: a frame or a space more often than once a second only keeps the event
+# loop busy, and the idle cuts it guards against are about a minute (the client's 60 s WS budget, WKWebView's ~60 s idle cut).
+_STREAM_KEEPALIVE_FLOOR_SECONDS = 1.0
+
+
 def _stream_keepalive_seconds() -> float:
-    return tunables.get_tunable("bridge.stream_keepalive_seconds", _STREAM_KEEPALIVE_SECONDS)
+    """The keepalive interval: the override when usable, else the default. Zero, a negative or a non-finite override would make
+    the streams send frames or spaces in a tight loop: it is ignored (one warning) for the default; a positive value below
+    ``_STREAM_KEEPALIVE_FLOOR_SECONDS`` is raised to it. A bool is rejected by ``get_tunable`` (wrong type)."""
+    value = float(tunables.get_tunable("bridge.stream_keepalive_seconds", _STREAM_KEEPALIVE_SECONDS))
+    if not math.isfinite(value) or value <= 0:
+        warn_throttled(
+            logger,
+            "bridge.stream_keepalive_seconds",
+            "tunables: override 'bridge.stream_keepalive_seconds'=%r is not a positive number; using %s",
+            value,
+            _STREAM_KEEPALIVE_SECONDS,
+            exc_info=False,
+        )
+        return _STREAM_KEEPALIVE_SECONDS
+    return max(value, _STREAM_KEEPALIVE_FLOOR_SECONDS)
 
 
 # GET /sessions/active: a session whose last turn is younger than this is attach-eligible. 24 hours mirrors the supervisor's
