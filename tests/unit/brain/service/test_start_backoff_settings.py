@@ -8,6 +8,7 @@ installed tasks are refreshed in place like the systemd KillMode migration (C47)
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -28,6 +29,8 @@ def env(tmp_path, monkeypatch):
     nell.chmod(0o755)
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    if not hasattr(os, "getuid"):  # launchd's domain is gui/<uid>; Windows has no os.getuid
+        monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
     return nell
 
 
@@ -93,7 +96,9 @@ class Schtasks:
         if args[0] == "/Query":
             return subprocess.CompletedProcess(args, self.query_rc, stdout=self.registered or "", stderr="")
         if args[0] == "/Create":
-            self.created_xml = Path(args[2]).read_bytes().decode("utf-16")
+            # Text mode: the refresh writes the file like the install path does (the platform's newline), and the
+            # scheduler does not care which; what matters is that only the two values differ.
+            self.created_xml = Path(args[2]).read_text(encoding="utf-16")
             self.registered = self.created_xml
             return subprocess.CompletedProcess(args, self.create_rc, stdout="", stderr="denied" if self.create_rc else "")
         raise AssertionError(args)

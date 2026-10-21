@@ -538,10 +538,21 @@ def root_handlers():
     root.setLevel(level)
 
 
-def _open_log_handles(path: Path) -> list[str]:
+def _log_held_open(path: Path) -> bool:
+    """Does this process keep ``path`` open? POSIX: psutil's open files. Windows: `open_files()` is denied there, but an
+    open handle (Python opens without FILE_SHARE_DELETE) is exactly what makes a rename fail, which is what a running
+    bridge's log rotation would hit, so try the rename (and put it back)."""
+    if sys.platform == "win32":
+        moved = path.with_name(path.name + ".moved")
+        try:
+            os.replace(path, moved)
+        except OSError:
+            return True
+        os.replace(moved, path)
+        return False
     import psutil
 
-    return [f.path for f in psutil.Process().open_files() if Path(f.path).resolve() == path.resolve()]
+    return any(Path(f.path).resolve() == path.resolve() for f in psutil.Process().open_files())
 
 
 def test_the_wait_line_reaches_the_runtime_log_without_holding_it_open(pd, clock, monkeypatch, tmp_path, root_handlers):
@@ -554,12 +565,12 @@ def test_the_wait_line_reaches_the_runtime_log_without_holding_it_open(pd, clock
     monkeypatch.setattr("brain.bridge.runner._setup_runtime_logging", real_setup_runtime_logging)
     monkeypatch.setattr("brain.bridge.runner._attach_transient_runtime_log", real_attach_transient_log)
     _record(pd, 1, clock)
-    open_during_wait: list[list[str]] = []
+    held_during_wait: list[bool] = []
     real_sleep = clock.sleep
 
     def sleep(s):
         if log.exists():
-            open_during_wait.append(_open_log_handles(log))
+            held_during_wait.append(_log_held_open(log))
         real_sleep(s)
 
     monkeypatch.setattr(start_backoff, "_sleep", sleep)
@@ -575,7 +586,7 @@ def test_the_wait_line_reaches_the_runtime_log_without_holding_it_open(pd, clock
     monkeypatch.setattr(daemon, "acquire_lock", acquire)
     _fake_run(monkeypatch)
     assert daemon.cmd_run(_args("systemd")) == 0
-    assert open_during_wait and all(h == [] for h in open_during_wait), open_during_wait
+    assert held_during_wait and not any(held_during_wait), held_during_wait
     assert seen_at_lock == [False]  # no persistent handler before the lock
     assert "start back-off: waiting" in log.read_text(encoding="utf-8")
     from logging.handlers import RotatingFileHandler
