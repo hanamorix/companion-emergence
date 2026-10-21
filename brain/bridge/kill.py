@@ -18,9 +18,11 @@ The sequence (plan I5 steps 1-7):
    before the first suspend or kill; then freeze the bridge and its tree, kill the bridge first, then the frozen tree.
 7. Poll "gone" over the bridge and everything remembered for ``timeout``; kill any survivor once more; report.
 
-The ``finally``: while the bridge's kill call has not returned, resume everything suspended and delete the intent
-(only if it still holds this nonce); after it has returned, kill the frozen and remembered descendants and keep the
-committed intent (the respawn guard honours it). Stop signals are ignored while the ``finally`` runs.
+The ``finally``: while the bridge's kill call has not returned, resume everything suspended, delete the intent
+(only if it still holds this nonce) and withdraw the hard-exit request this call wrote (only if it names this bridge),
+so an interrupted kill leaves nothing that could still end the bridge; after it has returned, kill the frozen and
+remembered descendants and keep the committed intent (the respawn guard honours it). Stop signals are ignored while
+the ``finally`` runs.
 """
 
 from __future__ import annotations
@@ -62,6 +64,13 @@ class KillResult:
     message: str
     survivors: list[int] = field(default_factory=list)
     committed: bool = False
+
+    @property
+    def succeeded(self) -> bool:
+        """The one success rule every caller uses (``cmd_stop``, the pre-PR stop, the terminal watcher): no bridge
+        is left and nothing it started is still running. A caller that goes on to start a new bridge on success must
+        never do so beside a survivor (review of #458)."""
+        return self.outcome in ("killed", "not_running") and not self.survivors
 
 
 # ---------------------------------------------------------------- the stop intent (D6 c, D25)
@@ -194,22 +203,30 @@ def _alive(proc) -> bool:
 def _kill_proc(proc) -> None:
     try:
         if sys.platform.startswith("win"):  # pragma: no cover - Windows CI leg
-            _terminate_exit_0(proc.pid)
+            _terminate_exit_0(proc)
         else:
             proc.kill()
     except Exception:  # noqa: BLE001 - gone already
         pass
 
 
-def _terminate_exit_0(pid: int) -> None:  # pragma: no cover - Windows CI leg
-    """Windows: end the process with exit code 0, so Task Scheduler does not treat the end as a failure."""
+def _kernel32():  # pragma: no cover - Windows CI leg
     import ctypes
 
-    k32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-    handle = k32.OpenProcess(0x0001, False, pid)  # PROCESS_TERMINATE
+    return ctypes.windll.kernel32  # type: ignore[attr-defined]
+
+
+def _terminate_exit_0(proc) -> None:  # noqa: ANN001
+    """Windows: end the process with exit code 0, so Task Scheduler does not treat the end as a failure.
+
+    The open handle pins the pid, so once ``proc.is_running()`` (psutil's create-time check) confirms the pid is
+    still the remembered process, the handle cannot reach another one (review of #458: a bare pid could)."""
+    k32 = _kernel32()
+    handle = k32.OpenProcess(0x0001, False, proc.pid)  # PROCESS_TERMINATE
     if handle:
         try:
-            k32.TerminateProcess(handle, 0)
+            if proc.is_running():
+                k32.TerminateProcess(handle, 0)
         finally:
             k32.CloseHandle(handle)
 
@@ -321,6 +338,7 @@ def kill_bridge(
     remembered: dict[int, object] = {}
     suspended: list = []
     kill_returned = False
+    request_written = False
 
     def _remember(procs) -> None:
         for p in procs:
@@ -356,6 +374,7 @@ def kill_bridge(
                         pid=st.pid, pid_token=st.pid_token, requested_at=datetime.now(UTC).isoformat()
                     ),
                 )
+                request_written = True
                 deadline = time.monotonic() + timeout
                 while time.monotonic() < deadline and _alive(bridge):
                     _hook("hard_exit_wait")
@@ -445,6 +464,12 @@ def kill_bridge(
                     except Exception:  # noqa: BLE001
                         pass
                 _cas_intent(persona_dir, nonce, lambda _cur: None)
+                # A kill called off before it killed withdraws its hard-exit request too (review of #458): the bridge
+                # still runs and would act on it later, after the user cancelled.
+                if request_written and shutdown_progress.names_this_bridge(
+                    shutdown_progress.read_record(persona_dir, shutdown_progress.REQUEST_FILENAME), st.pid, st.pid_token
+                ):
+                    shutdown_progress.delete_record(persona_dir, shutdown_progress.REQUEST_FILENAME)
             else:
                 for p in [*suspended[1:], *remembered.values()]:
                     if _alive(p):

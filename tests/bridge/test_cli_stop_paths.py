@@ -93,7 +93,35 @@ def test_kill_on_a_running_bridge_uses_the_helper(pd, sleeper, monkeypatch):
     assert calls == [{"timeout": 5.0, "skip_hard_exit_request": True, "expect_pid": None, "expect_token": None}]
 
 
+def test_kill_with_survivors_exits_nonzero(pd, sleeper, monkeypatch, capsys):
+    # Review of #458 (finding 1): a kill that leaves processes running is not a success. Exit 0 here made the app's
+    # force restart and `restart` start a new bridge beside the old tree.
+    _write(pd, pid=sleeper.pid, pid_token=pi.token_of(sleeper.pid), identity="token")
+    monkeypatch.setattr(kill, "kill_bridge", lambda persona_dir, persona=None, **kw: kill.KillResult(
+        "killed", "processes still running after the kill: [4242]", [4242], True))
+    assert daemon.cmd_stop(_stop_args(kill=True)) == 1
+    assert "[4242]" in capsys.readouterr().out
+
+
 # ---------------------------------------------------------------- C43: pre-PR bridges (D22)
+
+
+@posix
+def test_a_pre_pr_kill_that_leaves_survivors_is_not_a_success(pd, sleeper, monkeypatch, capsys):
+    """Review of #458 (M1): the pre-PR path shares the kill helper's one success rule (the old bridge's tree is the
+    survivor). Exit 1 and no "Stopped the previous version" line."""
+    _write(pd, pid=sleeper.pid, pid_token=None, identity=None)
+    assert state_file.is_legacy(state_file.read(pd))
+    monkeypatch.setattr(state_file, "bridge_liveness", lambda s, persona_dir: state_file.ALIVE)
+    monkeypatch.setattr(daemon, "_request_shutdown_via_http", lambda s, **k: (_ for _ in ()).throw(OSError("down")))
+    monkeypatch.setattr(daemon, "_PRE_PR_REQUEST_BUDGET_S", 0.0)
+    monkeypatch.setattr(kill, "kill_bridge", lambda persona_dir, persona=None, **kw: kill.KillResult(
+        "killed", "processes still running after the kill: [4242]", [4242], True))
+    assert daemon.cmd_stop(_stop_args()) == 1
+    cap = capsys.readouterr()
+    assert "Stopped the previous version" not in cap.out
+    assert "[4242]" in cap.err + cap.out
+
 
 _STUB_RUNNER = textwrap.dedent(
     """
@@ -288,3 +316,13 @@ def test_stop_kill_passes_the_expected_bridge_to_the_helper(monkeypatch, tmp_pat
     assert rc == 1
     assert seen["expect_pid"] == 4242 and seen["expect_token"] == "linux:b:4242:0"
     assert seen["skip_hard_exit_request"] is True
+
+
+def test_restart_asks_for_a_restart_not_a_plain_stop(pd, monkeypatch):
+    """Maintainer's Q1: `nell supervisor restart`'s stop is recorded as a restart (no reason -> "manual_restart"),
+    not as a plain stop (user_stop), so a service run queued behind the bridge starts instead of skipping."""
+    reasons: list = []
+    monkeypatch.setattr(daemon, "cmd_stop", lambda args, *, reason="user_stop": reasons.append(reason) or 0)
+    monkeypatch.setattr(daemon, "cmd_start", lambda args: 0)
+    assert daemon.cmd_restart(_stop_args()) == 0
+    assert reasons == [None]

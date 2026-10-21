@@ -59,7 +59,7 @@ def test_cmd_restart_calls_stop_then_start_when_running(
     """Happy path: stop returns 0, start returns 0, restart returns 0 with two-phase output."""
     calls: list[str] = []
 
-    def fake_stop(args):
+    def fake_stop(args, **_kw):
         calls.append("stop")
         return 0
 
@@ -89,7 +89,7 @@ def test_cmd_restart_bails_when_stop_timed_out_on_wedged_bridge(
     """
     calls: list[str] = []
 
-    def fake_stop(args):
+    def fake_stop(args, **_kw):
         calls.append("stop")
         return 1
 
@@ -114,7 +114,7 @@ def test_cmd_restart_bails_when_stop_returns_unexpected_high_code(
     """Stop returns 2 (lock held) — restart must NOT call start; returns stop's code."""
     calls: list[str] = []
 
-    def fake_stop(args):
+    def fake_stop(args, **_kw):
         calls.append("stop")
         return 2
 
@@ -137,18 +137,28 @@ def test_cmd_restart_propagates_start_failure_code(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Stop succeeds but start returns 1 — restart returns 1, not coerced."""
-    monkeypatch.setattr(daemon, "cmd_stop", lambda a: 0)
+    monkeypatch.setattr(daemon, "cmd_stop", lambda a, **_kw: 0)
     monkeypatch.setattr(daemon, "cmd_start", lambda a: 1)
     assert daemon.cmd_restart(_args("nell")) == 1
 
 
-def test_cmd_restart_propagates_start_already_running_code(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(("ready_rc", "expected"), [(0, 0), (1, 1)])
+def test_cmd_restart_waits_for_a_start_already_under_way(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, ready_rc: int, expected: int
 ) -> None:
-    """Stop succeeds but start returns 2 (race: another process spawned) — restart returns 2."""
-    monkeypatch.setattr(daemon, "cmd_stop", lambda a: 0)
+    """Review of #458 (S3): start returns 2 (a queued service run woke at the old bridge's death and holds the lock,
+    so its bridge is coming up). Restart waits for that bridge, as the app does, and returns the wait's result."""
+    persona_dir = tmp_path / "personas" / "nell"
+    persona_dir.mkdir(parents=True)
+    monkeypatch.setattr("brain.paths.get_persona_dir", lambda name: persona_dir)
+    waited: list = []
+    monkeypatch.setattr(daemon, "cmd_stop", lambda a, **_kw: 0)
     monkeypatch.setattr(daemon, "cmd_start", lambda a: 2)
-    assert daemon.cmd_restart(_args("nell")) == 2
+    monkeypatch.setattr(
+        daemon, "_await_service_readiness", lambda pd, budget, out: waited.append((pd, budget)) or ready_rc
+    )
+    assert daemon.cmd_restart(_args("nell")) == expected
+    assert waited == [(persona_dir, daemon._READINESS_BUDGET_S)]
 
 
 # ---------- cmd_tail_log ----------

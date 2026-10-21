@@ -361,6 +361,20 @@ def test_a_signal_during_the_wait_or_the_manager_call_freezes_nothing_and_delete
     assert all(s not in ("gone", psutil.STATUS_STOPPED) for s in b.statuses().values())
 
 
+def test_a_signal_during_the_hard_exit_wait_withdraws_the_request(tmp_path, fake, owned):
+    """Review of #458 (finding 2): a kill called off during the wait leaves no hard-exit request behind; the bridge,
+    still running, would otherwise act on it later (an unrecorded hard exit after the user cancelled)."""
+    b = fake()
+
+    def _signal(*_a):
+        os.kill(os.getpid(), signal.SIGINT)
+        time.sleep(0.2)
+
+    with pytest.raises((kill._KillInterrupted, KeyboardInterrupt)):
+        kill.kill_bridge(b.pd, timeout=5, _hooks={"hard_exit_wait": _signal})
+    assert not shutdown_progress.path(b.pd, shutdown_progress.REQUEST_FILENAME).exists()
+
+
 def test_skip_hard_exit_request_sends_none_and_waits_not(tmp_path, fake, owned, monkeypatch):
     """C45 (d): with --skip-hard-exit-request there is no request and no first wait."""
     b = fake()
@@ -634,3 +648,49 @@ def test_an_expected_bridge_that_is_no_longer_named_is_not_killed(tmp_path, fake
     assert r.outcome == "bridge_changed"
     r = kill.kill_bridge(b.pd, timeout=10, expect_pid=b.pid, expect_token=st.pid_token)
     assert r.outcome == "killed" and b.all_gone()
+
+
+class _FakeKernel32:
+    def __init__(self):
+        self.terminated: list = []
+
+    def OpenProcess(self, access, inherit, pid):  # noqa: N802 - the Win32 name
+        return 7
+
+    def TerminateProcess(self, handle, code):  # noqa: N802
+        self.terminated.append((handle, code))
+
+    def CloseHandle(self, handle):  # noqa: N802
+        pass
+
+
+class _ReusedPid:
+    """A remembered process that has exited; its pid now belongs to another process."""
+
+    pid = 4242
+
+    def is_running(self):
+        return False
+
+
+def test_windows_kill_never_ends_a_process_that_reused_the_pid(monkeypatch):
+    """Review of #458 (finding 3): the Windows exit-0 terminate opens the pid, then confirms it is still the remembered
+    process (psutil's create-time check) before ending it."""
+    k32 = _FakeKernel32()
+    monkeypatch.setattr(kill.sys, "platform", "win32")
+    monkeypatch.setattr(kill, "_kernel32", lambda: k32)
+    kill._kill_proc(_ReusedPid())
+    assert k32.terminated == []
+
+
+def test_windows_kill_ends_the_remembered_process_with_exit_code_0(monkeypatch):
+    k32 = _FakeKernel32()
+    monkeypatch.setattr(kill.sys, "platform", "win32")
+    monkeypatch.setattr(kill, "_kernel32", lambda: k32)
+
+    class _Same(_ReusedPid):
+        def is_running(self):
+            return True
+
+    kill._kill_proc(_Same())
+    assert k32.terminated == [(7, 0)]

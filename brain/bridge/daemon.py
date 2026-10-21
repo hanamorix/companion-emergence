@@ -30,7 +30,8 @@ from types import SimpleNamespace
 
 import httpx
 
-from brain.bridge import state_file
+from brain.bridge import respawn_guard, start_backoff, state_file
+from brain.bridge.shutdown import REASON_USER_STOP
 
 logger = logging.getLogger(__name__)
 
@@ -374,6 +375,9 @@ def cmd_start(args, *, out: dict | None = None) -> int:
     from brain.bridge import shutdown_progress
 
     shutdown_progress.delete_record(persona_dir, shutdown_progress.INTENT_FILENAME)
+    # D26: an explicit start does not wait and starts the start back-off over (a service run already waiting ends its
+    # wait at once, and the service run this start causes is the first of a new series).
+    start_backoff.reset(persona_dir)
 
     log_path = get_log_dir() / f"bridge-{persona_dir.name}.log"
     idle = float(args.idle_shutdown) * 60 if args.idle_shutdown > 0 else None
@@ -503,23 +507,14 @@ def _await_readiness(persona_dir: Path, pid: int, log_path: Path, out: dict | No
     return 1
 
 
-def _ended_on_a_requested_stop(st: state_file.BridgeState | None) -> bool:
-    """The record says its bridge ended on a stop a person asked for through nell or the app: ``nell supervisor
-    stop`` (user_stop), an app restart (app_restart), a stop request with no reason (manual_restart), or a hard exit
-    the user chose (hard_exit). Not an idle stop (nobody asked for anything), not an OS signal (it cannot tell a user's
-    kill from a logout or a service manager's stop), not a crash. A kill is the respawn guard's (D25), not this."""
-    from brain.bridge.shutdown import (
-        REASON_APP_RESTART,
-        REASON_HARD_EXIT,
-        REASON_MANUAL_RESTART,
-        REASON_USER_STOP,
-    )
-
-    return (
-        st is not None
-        and st.phase != "running"
-        and st.stop_reason in (REASON_USER_STOP, REASON_APP_RESTART, REASON_MANUAL_RESTART, REASON_HARD_EXIT)
-    )
+def _ended_on_a_plain_stop(st: state_file.BridgeState | None) -> bool:
+    """The record says its bridge ended on a plain ``nell supervisor stop`` (user_stop): a person asked for no bridge.
+    Not a restart's stop (app_restart; manual_restart, which ``nell supervisor restart`` records) nor a hard exit
+    (it may end a restart): a start follows those, and a queued service run that skipped would leave the restart's
+    own start facing a held lock or an exiting service job, so no bridge (maintainer's Q1). Not an idle stop (nobody
+    asked for anything), not an OS signal (it cannot tell a user's kill from a logout or a service manager's stop),
+    not a crash. A kill is the respawn guard's (D25), not this."""
+    return st is not None and st.phase != "running" and st.stop_reason == REASON_USER_STOP
 
 
 def cmd_run(args) -> int:
@@ -529,9 +524,13 @@ def cmd_run(args) -> int:
     the bridge process until uvicorn exits, which is exactly what launchd wants
     to supervise. A per-persona lock is held for the lifetime of the process; a
     run that finds it held waits for it (D4). A service run that waited for a
-    running bridge does not start when a person stopped that bridge through nell
-    or the app (see ``_ended_on_a_requested_stop``); after an idle stop, an OS
-    signal or a crash it starts.
+    running bridge does not start when that bridge ended on a plain ``nell
+    supervisor stop`` (see ``_ended_on_a_plain_stop``); after a restart's
+    stop, a hard exit, an idle stop, an OS signal or a crash it starts.
+
+    A service run that follows starts which never proved themselves first waits out the next step of the start
+    back-off (``start_backoff``, D26), before the lock and without holding anything; a start it makes is noted under
+    the lock, right before the bridge runs.
     """
     from brain.paths import get_persona_dir
 
@@ -539,8 +538,6 @@ def cmd_run(args) -> int:
     if not persona_dir.exists():
         print(f"persona directory not found: {persona_dir}", file=sys.stderr)
         return 1
-
-    from brain.bridge import respawn_guard
 
     client_origin = getattr(args, "client_origin", "cli")
     guarded = client_origin in respawn_guard.SERVICE_ORIGINS
@@ -550,6 +547,27 @@ def cmd_run(args) -> int:
         print("not starting: stopped on request", file=sys.stderr)
         logger.info("not starting: stopped on request (user kill of this boot)")
         return 0
+    if guarded:
+        # D26: spaced restarts of a bridge that keeps failing to start. Before the lock (nothing held, no watcher file
+        # written, so every other command sees no bridge and no starter) and interruptible: an explicit start deletes
+        # the record, a user kill fires the guard. SIGTERM and Task Scheduler's end act at once (no handler yet).
+        # The wait's log lines reach the runtime log through a handler that keeps no file open (a run that waits or is
+        # queued must not block the running bridge's log rotation); the persistent handler comes after the lock.
+        from brain.bridge import runner
+
+        transient_log = runner._attach_transient_runtime_log(persona_dir)  # noqa: SLF001
+        try:
+            go_on = start_backoff.wait_before_start(
+                persona_dir, interrupted=lambda: respawn_guard.guard_fires(persona_dir)
+            )
+        except KeyboardInterrupt:
+            return 0
+        finally:
+            runner._detach_runtime_log(transient_log)  # noqa: SLF001
+        if not go_on:
+            print("not starting: stopped on request", file=sys.stderr)
+            logger.info("not starting: stopped on request (user kill of this boot)")
+            return 0
 
     # D4 (#177 S3): an OS service must not exit 2 here (systemd / launchd / Task Scheduler read it as a failure and
     # respawn forever). Whether a live bridge or a starter holds the lock, wait for it, then run.
@@ -568,14 +586,20 @@ def cmd_run(args) -> int:
             return 1
 
     try:
+        if guarded:
+            # The persistent runtime log, now that the lock is held (so the unit refresh below logs to it too;
+            # run_bridge_foreground sets it up again later and adds nothing).
+            from brain.bridge import runner
+
+            runner._setup_runtime_logging(persona_dir)  # noqa: SLF001 - shared with run_bridge_foreground
         if guarded and respawn_guard.guard_fires(persona_dir):
             # Re-checked under the lock, BEFORE run_bridge_foreground deletes the watcher files (S6-a, S7-g).
             print("not starting: stopped on request", file=sys.stderr)
             logger.info("not starting: stopped on request (user kill of this boot)")
             return 0
-        if guarded and waited_for_a_bridge and _ended_on_a_requested_stop(state_file.read(persona_dir)):
-            # Pre-merge review O-2: a service run queued behind a running bridge does not undo a stop a person asked
-            # for through nell or the app (exit 0: success to every service manager, so nothing restarts it).
+        if guarded and waited_for_a_bridge and _ended_on_a_plain_stop(state_file.read(persona_dir)):
+            # Pre-merge review O-2: a service run queued behind a running bridge does not undo a plain `nell
+            # supervisor stop` (exit 0: success to every service manager, so nothing restarts it).
             print("not starting: the running bridge was stopped on request", file=sys.stderr)
             logger.info("not starting: the bridge this run waited for was stopped on request")
             return 0
@@ -596,6 +620,9 @@ def cmd_run(args) -> int:
 
         # #456 (D12): no synchronous recovery; the first idle pass saves the sessions (see cmd_start).
         from brain.bridge.runner import run_bridge_foreground
+
+        if guarded:
+            start_backoff.note_start(persona_dir)  # D26: stays until a recorded stop; SuccessWatch restarts the ladder
 
         idle = float(args.idle_shutdown) * 60 if args.idle_shutdown > 0 else None
         return run_bridge_foreground(
@@ -650,16 +677,20 @@ def _stop_began(s: state_file.BridgeState, persona_dir: Path, response: httpx.Re
 
 def _print_kill_result(result) -> int:  # noqa: ANN001
     print(result.message)
-    return 0 if result.outcome in ("killed", "not_running") else 1
+    return 0 if result.succeeded else 1
 
 
-def cmd_stop(args) -> int:
+def cmd_stop(args, *, reason: str | None = REASON_USER_STOP) -> int:
     """`nell supervisor stop` (#456 Q-A, D16, D22): ask the bridge to stop, then watch until it is gone.
 
+    ``reason`` is what the stop request tells the bridge to record: ``"user_stop"`` for a plain stop, ``None`` for a
+    restart's stop (recorded as ``manual_restart``).
+
     ``--kill``: the kill helper (a bridge run by an OS service first gets the hard-exit request and up to
-    ``--timeout`` to go, then its service manager's stop; any other bridge is killed at once). A pre-PR bridge (no identity token): the old request, then the kill helper
-    after a few seconds. A stale record: "not running". If the request fails and no stop is recorded: POSIX sends
-    SIGTERM when the identity holds; Windows refuses unless ``--force`` (then the kill helper).
+    ``--timeout`` to go, then its service manager's stop; any other bridge is killed at once). A kill that leaves a
+    process running exits 1 (``KillResult.succeeded``). A pre-PR bridge (no identity token): the old request, then
+    the kill helper after a few seconds. A stale record: "not running". If the request fails and no stop is recorded:
+    POSIX sends SIGTERM when the identity holds; Windows refuses unless ``--force`` (then the kill helper).
     """
     from brain.bridge import kill as kill_mod
     from brain.bridge import stop_watch
@@ -695,7 +726,7 @@ def cmd_stop(args) -> int:
 
     response = None
     try:
-        response = _request_shutdown_via_http(s, reason="user_stop")
+        response = _request_shutdown_via_http(s, reason=reason)
     except Exception as exc:  # noqa: BLE001 - a closed listener: the stop may have begun already (attach)
         failure = exc
     else:
@@ -746,7 +777,7 @@ def _stop_pre_pr(persona_dir: Path, s: state_file.BridgeState, timeout: float) -
         time.sleep(0.2)
     if state_file.bridge_liveness(s, persona_dir) == state_file.ALIVE:
         result = kill_mod.kill_bridge(persona_dir, timeout=timeout)
-        if result.outcome not in ("killed", "not_running"):
+        if not result.succeeded:
             print(result.message, file=sys.stderr)
             return 1
     print("Stopped the previous version of the bridge. The next start will pick up anything left unfinished.")
@@ -909,15 +940,25 @@ def cmd_restart(args) -> int:
     """Stop the bridge, then start it again, only after the old bridge is gone (#456 C16 h).
 
     ``cmd_stop`` returns 0 only once the old bridge (its pid + token) is gone, or when none was running; restart then
-    starts. Any other result (still stopping without a terminal, a refused stop) aborts the restart with that code.
+    starts. Any other result (still stopping without a terminal, a refused stop) aborts the restart with that code. A
+    start that finds another one already under way (exit 2) waits for that bridge to answer.
     """
     print("stopping bridge...")
-    stop_rc = cmd_stop(args)
+    # No reason: the bridge records "manual_restart", so a service run queued behind it starts (see
+    # _ended_on_a_plain_stop); a plain stop records "user_stop".
+    stop_rc = cmd_stop(args, reason=None)
     if stop_rc != 0:
         print(f"restart aborted: stop failed (exit {stop_rc})", file=sys.stderr)
         return stop_rc
     print("starting bridge...")
-    return cmd_start(args)
+    rc = cmd_start(args)
+    if rc == 2:
+        # A start is already under way: a service run queued behind the old bridge woke at its death and holds the
+        # lock, so its bridge is coming up. Wait for that bridge, as the app does (exit 2 is its "start under way").
+        from brain.paths import get_persona_dir
+
+        return _await_service_readiness(get_persona_dir(args.persona), _READINESS_BUDGET_S, None)
+    return rc
 
 
 # Test seam: setting this Event from a test allows the follow-mode loop

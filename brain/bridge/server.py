@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import math
@@ -47,6 +48,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field, StrictBool
 
 from brain import __version__ as _brain_version
@@ -67,8 +69,14 @@ from brain.bridge.model_tier import (
 )
 from brain.bridge.provider import ClaudeCliProvider, LLMProvider, ProviderError, _claude_work_dir
 from brain.bridge.shutdown import POLL_S as _STOP_POLL_S
+from brain.bridge.shutdown import (
+    REASON_APP_RESTART,
+    REASON_IDLE,
+    REASON_MANUAL_RESTART,
+    REASON_USER_STOP,
+    BridgeShutdownController,
+)
 from brain.bridge.shutdown import REASON_UNKNOWN as _STOP_REASON_UNKNOWN
-from brain.bridge.shutdown import BridgeShutdownController
 from brain.bridge.shutdown_progress import tracked_to_thread
 from brain.chat.session import (
     all_sessions,
@@ -203,7 +211,7 @@ async def _idle_watcher(state: BridgeAppState, idle_shutdown_seconds: float) -> 
             logger.info("idle shutdown firing — no traffic for >%ss", idle_shutdown_seconds)
             # Off the event loop: the request writes the bridge.json "stopping" mark (review O-6).
             if state.shutdown_controller is None or not await asyncio.to_thread(
-                state.shutdown_controller.request, "idle_timeout"
+                state.shutdown_controller.request, REASON_IDLE
             ):
                 logger.error("idle shutdown could not request controller shutdown")
             return
@@ -1281,6 +1289,38 @@ _background_threads_inhibited: bool = False
 _lifespan_test_hooks: dict[str, Any] | None = None
 
 
+class _TrackedSyncRoute(APIRoute):
+    """Every synchronous endpoint but ``GET /health`` is a counted stop task while its worker thread runs (review of
+    #458).
+
+    The count is taken inside the thread, so uvicorn cancelling the request task after its 30 s graceful window does
+    not uncount work that is still running (the same rule as ``tracked_to_thread``). A GET is not always a read:
+    ``GET /sessions/active`` rolls a stale buffer over (a final extraction, memory writes, the buffer's deletion) and
+    ``GET /kindled-link/my-code`` writes its identity files. Only ``/health``, which a stop must keep answering, is
+    left uncounted."""
+
+    def __init__(self, path: str, endpoint: Callable[..., Any], **kwargs: Any) -> None:
+        is_health = path == "/health" and set(kwargs.get("methods") or ()) == {"GET"}
+        if not inspect.iscoroutinefunction(endpoint) and not is_health:
+            endpoint = _tracked_sync(f"request {path}", endpoint)
+        super().__init__(path, endpoint, **kwargs)
+
+
+def _tracked_sync(label: str, fn: Callable[..., Any]) -> Callable[..., Any]:
+    import functools
+
+    @functools.wraps(fn)  # FastAPI reads the endpoint's signature through __wrapped__
+    def _run(*args: Any, **kwargs: Any) -> Any:
+        # Sealed: ShutdownDeferred, which the app's handler answers with the admission middleware's 503 body.
+        handle = shutdown_progress.registry.register(label)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            shutdown_progress.registry.unregister(handle)
+
+    return _run
+
+
 def build_app(
     persona_dir: Path,
     client_origin: str = "cli",
@@ -1673,6 +1713,7 @@ def build_app(
             logger.info("bridge stopped persona=%s", persona_dir.name)
 
     app = FastAPI(title="companion-emergence bridge", version="0.1.0", lifespan=lifespan)
+    app.router.route_class = _TrackedSyncRoute
 
     # CORS — narrowly scoped to the same allowed_origins used for WS auth,
     # plus localhost dev origins (Tauri devUrl + Vite default ports). Bearer
@@ -1691,6 +1732,12 @@ def build_app(
                 status_code=503, content={"code": "bridge_stopping", "message": "the bridge is stopping"}
             )
         return await call_next(request)
+
+    # A request admitted just before the stop whose worker registers after the seal (tracked_to_thread) is refused the
+    # same way as one that arrives after it, not with a 500 (review of #458).
+    @app.exception_handler(cli_throttle.ShutdownDeferred)
+    async def _stopping(_request: Request, _exc: cli_throttle.ShutdownDeferred) -> JSONResponse:
+        return JSONResponse(status_code=503, content={"code": "bridge_stopping", "message": "the bridge is stopping"})
 
     from fastapi.middleware.cors import CORSMiddleware
 
@@ -3402,12 +3449,12 @@ def build_app(
             )
 
         # #456 (C13): an optional body names why: {"reason": "user_stop" | "app_restart"}; none = "manual_restart".
-        reason = "manual_restart"
+        reason = REASON_MANUAL_RESTART
         try:
             body = await request.json()
         except Exception:  # noqa: BLE001 - no body, or not JSON: the default reason
             body = None
-        if isinstance(body, dict) and body.get("reason") in ("user_stop", "app_restart"):
+        if isinstance(body, dict) and body.get("reason") in (REASON_USER_STOP, REASON_APP_RESTART):
             reason = body["reason"]
         # Off the event loop (review O-6): the request writes the bridge.json "stopping" mark, which can fsync; it is
         # still on disk before the 202 (C6).

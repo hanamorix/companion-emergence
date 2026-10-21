@@ -1,10 +1,11 @@
 """What every service backend does around a start or an install (#456: D20, D25, S-k, S5-i, must-fix 1 (c)).
 
-- A service start (``start_service``) first deletes any stop intent: an explicit start means the user wants the bridge
-  running, so a kill's "do not respawn" mark must not stop it (D25).
+- A service start (``start_service``) first deletes any stop intent and the start back-off record
+  (``note_explicit_start``): an explicit start means the user wants the bridge running, so a kill's "do not respawn"
+  mark must not stop it (D25) and the service run it causes must not wait out earlier failures (D26).
 - An install never replaces a running bridge behind its back: with a terminal it first runs the normal stop and waits
   (the terminal watcher, plan I9); without one it refuses at once and changes nothing. On a stopped bridge it deletes
-  any stop intent, then the backend writes and starts the service.
+  any stop intent and the start back-off record, then the backend writes and starts the service.
 """
 
 from __future__ import annotations
@@ -24,10 +25,13 @@ def persona_dir_for(persona: str) -> Path:
     return Path(get_persona_dir(persona))
 
 
-def clear_stop_intent(persona: str) -> None:
-    from brain.bridge import shutdown_progress
+def note_explicit_start(persona: str) -> None:
+    """An explicit start or install: delete the stop intent (D25) and the start back-off record (D26)."""
+    from brain.bridge import shutdown_progress, start_backoff
 
-    shutdown_progress.delete_record(persona_dir_for(persona), shutdown_progress.INTENT_FILENAME)
+    persona_dir = persona_dir_for(persona)
+    shutdown_progress.delete_record(persona_dir, shutdown_progress.INTENT_FILENAME)
+    start_backoff.reset(persona_dir)
 
 
 def bridge_running(persona: str) -> bool:
@@ -55,4 +59,4 @@ def before_install(persona: str) -> None:
             pass
         else:
             raise BridgeRunningError("the bridge is running; stop it first")
-    clear_stop_intent(persona)
+    note_explicit_start(persona)

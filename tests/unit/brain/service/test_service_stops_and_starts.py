@@ -171,7 +171,9 @@ def test_windows_start_service_runs_the_task(home, monkeypatch):
     monkeypatch.setattr(windows_service, "run_schtasks", lambda args: calls.append(args) or _cp(0))
     windows_service.start_service(persona="nell")
     assert not shutdown_progress.path(home, shutdown_progress.INTENT_FILENAME).exists()
-    assert calls == [["/Run", "/TN", windows_service.task_name("nell")]]
+    # D26: the installed task's restart settings are looked at first (nothing to change in an empty answer).
+    name = windows_service.task_name("nell")
+    assert calls == [["/Query", "/TN", name, "/XML"], ["/Run", "/TN", name]]
 
 
 # ---------------------------------------------------------------- installs (C58 d, S-k, S5-i)

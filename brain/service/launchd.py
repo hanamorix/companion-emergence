@@ -338,8 +338,8 @@ def install_service(
 ) -> Path:
     """Write, bootstrap, and kickstart the persona LaunchAgent.
 
-    #456: never behind a running bridge's back, any stop intent cleared first (``lifecycle.before_install``), and a
-    plain ``kickstart`` (never ``-k``, which would kill a running job: S-k).
+    #456: never behind a running bridge's back, any stop intent and start back-off record cleared first
+    (``lifecycle.before_install``), and a plain ``kickstart`` (never ``-k``, which would kill a running job: S-k).
     """
     from brain.service import lifecycle
 
@@ -370,11 +370,11 @@ def install_service(
 
 def start_service(*, persona: str) -> subprocess.CompletedProcess[str]:
     """Start the installed LaunchAgent (#456 D20): bootstrap it when it is not loaded (a kill's ``bootout`` unloaded
-    it), then a plain ``kickstart`` (a no-op when ``RunAtLoad`` already started it). Any stop intent is cleared first
-    (D25). Each call is capped at 15 s."""
+    it), then a plain ``kickstart`` (a no-op when ``RunAtLoad`` already started it). Any stop intent and the
+    start back-off record are cleared first (D25, D26). Each call is capped at 15 s."""
     from brain.service import lifecycle
 
-    lifecycle.clear_stop_intent(persona)
+    lifecycle.note_explicit_start(persona)
     if run_launchctl(["print", launchctl_target(persona)], timeout=15).returncode != 0:
         run_launchctl(["bootstrap", launchctl_domain(), str(paths_for_persona(persona).plist_path)], timeout=15)
     return run_launchctl(["kickstart", launchctl_target(persona)], timeout=15)

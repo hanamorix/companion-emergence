@@ -19,7 +19,7 @@ from pathlib import Path
 
 import uvicorn
 
-from brain.bridge import state_file
+from brain.bridge import respawn_guard, start_backoff, state_file
 from brain.bridge.server import build_app
 from brain.bridge.shutdown import BridgeShutdownController
 
@@ -78,6 +78,7 @@ def _write_stopped(persona_dir: Path) -> None:
             logger.warning("bridge.json is not this bridge's record; the stopped mark was not written")
     except Exception:
         logger.warning("stopped-mark write failed", exc_info=True)
+    start_backoff.reset(persona_dir)  # D26 / D7: a recorded stop deletes the record: the next start does not wait
 
 
 def _after_run(persona_dir: Path, app: object, monitor: object) -> None:
@@ -88,7 +89,8 @@ def _after_run(persona_dir: Path, app: object, monitor: object) -> None:
     ("unknown") is not a request: it only means uvicorn ended for its own reasons. A run that ended with no stop asked
     for (a lifespan startup that raised, after which uvicorn's run() returns normally; a bind failure; an internal
     error) is a crash: the hard-exit path with reason "crash" (not clean, non-zero exit), so the app's crash watchdog
-    and the service managers restart it (#177 point 1).
+    and the service managers restart it (#177 point 1); a service run that keeps failing to start is spaced by the
+    start back-off (D26), not restarted at once.
 
     Otherwise "stopped" only when nothing is running: the task registry is sealed (or, when the lifespan never ran,
     empty and sealed now) and the supervisor thread has ended. Work still running is the hard-exit path at once.
@@ -118,6 +120,8 @@ def _after_run(persona_dir: Path, app: object, monitor: object) -> None:
 
 _RUNTIME_LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
 _RUNTIME_LOG_BACKUPS = 3
+_RUNTIME_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+_RUNTIME_LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S%z"
 
 
 def _setup_runtime_logging(persona_dir: Path) -> None:
@@ -132,9 +136,9 @@ def _setup_runtime_logging(persona_dir: Path) -> None:
     stderr files become a secondary catch-all for unhandled exceptions
     and uvicorn boot noise; those stay tiny in steady state.
 
-    Path: ``<log_dir>/runtime-<persona>.log``. Best-effort — failures
-    here must NOT prevent bridge startup, so any exception is swallowed
-    after a stderr breadcrumb.
+    Idempotent: a second call for the same log file adds nothing. Path: ``<log_dir>/runtime-<persona>.log``.
+    Best-effort — failures here must NOT prevent bridge startup, so any exception is swallowed after a stderr
+    breadcrumb.
     """
     try:
         from logging.handlers import RotatingFileHandler
@@ -144,6 +148,9 @@ def _setup_runtime_logging(persona_dir: Path) -> None:
         log_dir = get_log_dir()
         log_dir.mkdir(parents=True, exist_ok=True)
         path = log_dir / f"runtime-{persona_dir.name}.log"
+        root = logging.getLogger()
+        if any(isinstance(h, RotatingFileHandler) and h.baseFilename == str(path.resolve()) for h in root.handlers):
+            return  # already set up (``supervisor run`` sets it up before the start back-off wait, D26)
         handler = RotatingFileHandler(
             path,
             maxBytes=_RUNTIME_LOG_MAX_BYTES,
@@ -151,18 +158,55 @@ def _setup_runtime_logging(persona_dir: Path) -> None:
             encoding="utf-8",
         )
         handler.setFormatter(
-            logging.Formatter(
-                "%(asctime)s %(levelname)s %(name)s: %(message)s",
-                datefmt="%Y-%m-%dT%H:%M:%S%z",
-            )
+            logging.Formatter(_RUNTIME_LOG_FORMAT, datefmt=_RUNTIME_LOG_DATEFMT)
         )
         handler.setLevel(logging.INFO)
-        root = logging.getLogger()
         if root.level == logging.NOTSET or root.level > logging.INFO:
             root.setLevel(logging.INFO)
         root.addHandler(handler)
     except Exception as exc:  # noqa: BLE001
         print(f"runtime logging setup failed: {exc}", file=sys.stderr)
+
+
+class _AppendThenCloseHandler(logging.FileHandler):
+    """Appends a record and closes the file again, so nothing holds the log open between records (on Windows an open
+    handle blocks the running bridge's log rotation)."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            super().emit(record)
+        finally:
+            if self.stream is not None:
+                self.stream.close()
+                self.stream = None
+
+
+def _attach_transient_runtime_log(persona_dir: Path) -> logging.Handler | None:
+    """For a service run that is waiting or queued (D26): a root handler on the runtime log that opens, appends and
+    closes per record, so the back-off's lines reach the log while nothing keeps it open. The caller removes it before
+    ``_setup_runtime_logging`` attaches the persistent one (once the bridge lock is held). Best-effort."""
+    try:
+        from brain.paths import get_log_dir
+
+        log_dir = get_log_dir()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        handler = _AppendThenCloseHandler(log_dir / f"runtime-{persona_dir.name}.log", encoding="utf-8", delay=True)
+        handler.setFormatter(logging.Formatter(_RUNTIME_LOG_FORMAT, datefmt=_RUNTIME_LOG_DATEFMT))
+        handler.setLevel(logging.INFO)
+        root = logging.getLogger()
+        if root.level == logging.NOTSET or root.level > logging.INFO:
+            root.setLevel(logging.INFO)
+        root.addHandler(handler)
+        return handler
+    except Exception as exc:  # noqa: BLE001
+        print(f"runtime logging setup failed: {exc}", file=sys.stderr)
+        return None
+
+
+def _detach_runtime_log(handler: logging.Handler | None) -> None:
+    if handler is not None:
+        logging.getLogger().removeHandler(handler)
+        handler.close()
 
 
 def run_bridge_foreground(
@@ -255,6 +299,12 @@ def run_bridge_foreground(
         hard_exit=lambda reason: shutdown_mod.hard_exit(persona_dir, reason),
     )
     monitor.start()
+    # D26 / D7: after the server has stayed up 600 s the ladder starts over (the record stays: a crash after it still
+    # makes the next start wait the first step); only a recorded stop deletes it.
+    watch = None
+    if client_origin in respawn_guard.SERVICE_ORIGINS:
+        watch = start_backoff.SuccessWatch(persona_dir, server)
+        watch.start()
     rc = 0
     try:
         try:
@@ -264,6 +314,8 @@ def run_bridge_foreground(
         except SystemExit as exc:
             rc = exc.code if isinstance(exc.code, int) else 0
     finally:
+        if watch is not None:
+            watch.stop()
         _after_run(persona_dir, app, monitor)
     return rc
 
