@@ -140,11 +140,56 @@ def test_an_existing_setting_is_never_overwritten() -> None:
 
 
 def test_an_invalid_saved_model_is_dropped_with_a_log_and_not_written(caplog) -> None:
-    _persona("a", model="banana", tiers={"compaction": "nope", "not-a-job": "claude-haiku-4-5"}, opened="2026-01-01T00:00:00Z")
+    d = _persona("typo-persona", model="banana", tiers={"compaction": "nope", "not-a-job": "claude-haiku-4-5"}, opened="2026-01-01T00:00:00Z")
     with caplog.at_level(logging.INFO):
-        migrate_persona_models(_home(), None)
+        migrate_persona_models(_home(), d)
     assert _overrides() == {}
     assert not _marker().exists()  # no valid candidate: nothing decided, a persona imported later still migrates
+    assert not {"model", "tier_models"} & set(_cfg("typo-persona"))
+    discarded = [r for r in caplog.records if "typo-persona" in r.getMessage() and "banana" in r.getMessage()]
+    assert discarded, "the discarded invalid text is logged with the persona's name"
+    assert all(r.levelno >= logging.WARNING for r in discarded)
+    assert "nope" in discarded[0].getMessage()  # the per-job text is named too
+
+
+def test_a_discarded_invalid_text_is_shown_safely(caplog) -> None:
+    d = _persona("odd", model="bad\x1b[31mtext\n", opened="2026-01-01T00:00:00Z")
+    with caplog.at_level(logging.INFO):
+        migrate_persona_models(_home(), d)
+    assert "\x1b" not in caplog.text and "bad[31mtext" in caplog.text
+
+
+def test_a_valid_value_the_decision_never_scanned_is_logged_when_it_is_discarded(caplog) -> None:
+    """A persona directory outside the name grammar is not scanned (list_persona_names skips it), so its valid saved
+    model plays no part in the decision made by another persona in the same call. Clearing it must not be silent."""
+    _persona("good", model="opus", opened="2026-02-01T00:00:00Z")
+    stray = _home() / "personas" / "bad name"
+    stray.mkdir(parents=True)
+    (stray / "persona_config.json").write_text(json.dumps({"provider": "claude-cli", "model": "claude-sonnet-4-6"}), encoding="utf-8")
+    with caplog.at_level(logging.INFO):
+        migrate_persona_models(_home(), stray)
+    assert _overrides()[_CHAT] == "claude-opus-5"  # decided by "good"
+    assert "model" not in json.loads((stray / "persona_config.json").read_text())
+    assert any("bad name" in r.getMessage() and "claude-sonnet-4-6" in r.getMessage() for r in caplog.records)
+
+
+def test_a_non_claude_persona_never_decides_the_install_model() -> None:
+    """The saved model of a persona on another provider kind was never a Claude choice; it must not set the Claude
+    jobs' model for every other persona, however recently that persona was used."""
+    _persona("local", model="opus", opened="2026-09-01T00:00:00Z", provider="ollama")
+    _persona("fake-one", model="claude-opus-4-9", opened="2026-09-02T00:00:00Z", provider="fake")
+    _persona("claude-one", model="claude-sonnet-4-6", opened="2026-01-01T00:00:00Z")
+    assert pending_legacy(_home())
+    migrate_persona_models(_home(), None)
+    assert _overrides()[_CHAT] == "claude-sonnet-4-6"
+    assert json.loads(_marker().read_text())["source_persona"] == "claude-one"
+
+
+def test_with_only_non_claude_personas_nothing_is_decided() -> None:
+    _persona("local", model="opus", opened="2026-09-01T00:00:00Z", provider="ollama")
+    assert not pending_legacy(_home())
+    migrate_persona_models(_home(), None)
+    assert _overrides() == {} and not _marker().exists()
 
 
 # ---------------------------------------------------------------------------

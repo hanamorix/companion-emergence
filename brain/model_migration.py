@@ -10,7 +10,8 @@ before ``touch_last_opened``, and (b) at the start of the CLI write commands. It
 
 1. DECISION (only while the marker ``<home>/model_migration.done`` is absent). Every persona's config is read
    read-only BEFORE the migration lock is taken (a damaged file is skipped with a log, never healed). Candidates are
-   personas with a valid saved ``model`` or valid ``tier_models``. With no candidate nothing is written and NO marker
+   personas on the Claude provider kind with a valid saved ``model`` or valid ``tier_models`` (a persona on another
+   provider kind never chose a Claude model, so its saved value is never applied). With no candidate nothing is written and NO marker
    is written, so a persona imported later is still migrated. Otherwise the candidate with the newest ``last_opened_at``
    wins (the file's mtime only when that field is absent or unusable; a tie goes to the first name alphabetically) and
    its values are written with ``set_job_models(..., only_missing=True)`` (a setting the user already made is never
@@ -18,9 +19,9 @@ before ``touch_last_opened``, and (b) at the start of the CLI write commands. It
    shipped default. "Most recently used" is not "model most recently changed"; the decision runs before the launching
    persona's ``last_opened_at`` is touched, so a more recently used OTHER persona can win. That is the stated rule.
 2. CLEARING (for the launching persona, on EVERY start until its legacy keys are gone, marker or not). Once a decision
-   exists, the persona's own legacy keys are removed from its own file; a valid value that was not applied (a persona
-   imported or restored after the decision) is logged at INFO. Other personas' files are never rewritten by this
-   process; each clears on its own start.
+   exists, the persona's own legacy keys are removed from its own file, and every saved model text removed is logged
+   (an unusable text at WARNING, a valid one at INFO), so no saved value ever disappears without a trace. Other
+   personas' files are never rewritten by this process; each clears on its own start.
 
 Lock order: this module's lock (``model_migration.done.lock``) is taken first and only around the short write section;
 inside it ``set_job_models`` takes the tunables lock. Both waits are bounded; on a timeout this logs and returns (no
@@ -42,9 +43,10 @@ from brain.bridge.model_tier import (
     resolve_choice,
     set_job_models,
     shipped_default,
+    unsupported_display,
 )
 from brain.health.json_io import JsonFileError, Recovery, read_json, read_json_result, write_json
-from brain.persona_config import LEGACY_MODEL_KEYS
+from brain.persona_config import DEFAULT_PROVIDER, KNOWN_PROVIDERS, LEGACY_MODEL_KEYS
 from brain.tunables import TunablesWriteError
 from brain.utils.file_lock import LockTimeoutError, locked_within
 from brain.utils.time import lenient_utc
@@ -54,6 +56,7 @@ logger = logging.getLogger(__name__)
 MARKER_NAME = "model_migration.done"
 _STALE_STAMP = "derived_model_recheck.stamp"
 _CHAT = "interactive-chat"
+_CLAUDE_PROVIDER = "claude-cli"
 
 
 @dataclass(frozen=True)
@@ -78,6 +81,12 @@ def _valid_legacy(settings: dict[str, Any]) -> tuple[str | None, dict[str, str]]
     return chat, tiers
 
 
+def _provider_kind(data: dict[str, Any]) -> str:
+    """The persona's provider kind as ``PersonaConfig`` reads it: an unknown or absent value is the default kind."""
+    raw = data.get("provider")
+    return raw if isinstance(raw, str) and raw in KNOWN_PROVIDERS else DEFAULT_PROVIDER
+
+
 def _scan_candidates(skipped: list[str]) -> list[_Candidate]:
     """Read every persona's config read-only; the personas worth considering, newest first."""
     found: list[_Candidate] = []
@@ -95,6 +104,8 @@ def _scan_candidates(skipped: list[str]) -> list[_Candidate]:
             continue
         if res.outcome != "ok":
             continue  # no config file: nothing to migrate
+        if _provider_kind(res.data) != _CLAUDE_PROVIDER:
+            continue  # its saved model was never a Claude choice
         chat, tiers = _valid_legacy({k: res.data[k] for k in LEGACY_MODEL_KEYS if k in res.data})
         if chat is None and not tiers:
             continue
@@ -198,6 +209,15 @@ def _clear_persona(persona_dir: Path, decision_exists: bool, marker_existed: boo
             "model migration: persona %s still held a saved model (%r, %r) after the decision; it was not "
             "applied and is discarded",
             persona_dir.name, chat, tiers,
+        )
+    elif "model" in legacy or "tier_models" in legacy:
+        # An unusable text (a typo), or a valid one the decision above did not scan (the persona's file was skipped
+        # by the scan): either way the text is removed from the file, so the log is where it stays visible.
+        shown = ", ".join(f"{key}={unsupported_display(legacy[key])}" for key in ("model", "tier_models") if key in legacy)
+        logger.log(
+            logging.INFO if has_valid else logging.WARNING,
+            "model migration: removed the retired saved model settings from persona %s's file (%s)%s",
+            persona_dir.name, shown, "" if has_valid else "; the text was not a usable model and is not applied",
         )
     for key in legacy:
         del data[key]
