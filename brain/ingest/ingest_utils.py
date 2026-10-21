@@ -58,15 +58,60 @@ class TurnChunk:
     """One extraction chunk.
 
     ``turns``: the chunk's rows, in buffer order. ``text``: their formatted transcript, built by
-    ``format_transcript(turns, user_name=..., assistant_name=...)`` (the extraction's one formatter). ``cursor_ts``: the value the session cursor may take
-    once this chunk's commits succeed (the raw ``ts`` of the newest row up to the chunk's end; None when none of those rows
-    has a parseable ts). ``oversize``: the chunk is a single unit longer than the limit, sent whole.
+    ``format_transcript(turns, user_name=..., assistant_name=...)`` (the extraction's one formatter). ``cursor_ts``: the
+    value the session cursor may take once this chunk's commits succeed (the raw ``ts`` of the newest row up to the chunk's
+    end; None when none of those rows has a parseable ts). ``oversize``: the chunk is a single unit (a message and its
+    replies) longer than the limit. ``pieces``: the texts sent to the extractor, one call each, every one within the limit:
+    ``(text,)`` for a normal chunk; for an oversize one, its rows packed whole where they fit and a longer row split at line
+    boundaries, then at character boundaries, each piece opening with its speaker label. The cursor moves past the chunk only
+    after its last piece commits.
     """
 
     turns: tuple[dict, ...]
     text: str
     cursor_ts: str | None
     oversize: bool
+    pieces: tuple[str, ...]
+
+
+def _split_line(line: str, max_chars: int) -> list[str]:
+    """One formatted row longer than ``max_chars`` as segments of at most ``max_chars`` (when the label leaves room), each
+    opening with the row's ``"label: "``: whole body lines packed together, a body line longer than the room split at
+    character boundaries."""
+    head, sep, body = line.partition(": ")
+    prefix = head + sep if sep else ""
+    room = max(1, max_chars - len(prefix))
+    segments: list[str] = []
+    current: str | None = None
+    for body_line in (body if sep else line).split("\n"):
+        parts = [body_line[i : i + room] for i in range(0, len(body_line), room)] or [""]
+        for part in parts:
+            if current is not None and len(current) + 1 + len(part) <= room and len(parts) == 1:
+                current += "\n" + part
+                continue
+            if current is not None:
+                segments.append(prefix + current)
+            current = part
+    if current is not None:
+        segments.append(prefix + current)
+    return segments
+
+
+def _pieces(lines: list[str], max_chars: int) -> tuple[str, ...]:
+    """The texts of an oversize unit: rows packed whole where they fit, a row longer than ``max_chars`` split (``_split_line``)."""
+    pieces: list[str] = []
+    current: str | None = None
+    for line in lines:
+        for segment in [line] if len(line) <= max_chars else _split_line(line, max_chars):
+            if current is not None and len(current) + 1 + len(segment) <= max_chars:
+                current += "\n" + segment
+            else:
+                if current is not None:
+                    pieces.append(current)
+                current = segment
+    if current is not None:
+        pieces.append(current)
+    return tuple(pieces)
 
 
 def _cut_allowed(speaker: object, ts: datetime | None, prefix_max: datetime | None, suffix_min: datetime | None) -> bool:
@@ -113,7 +158,9 @@ def chunk_turns(
     """Split ``turns`` into extraction chunks, oldest first, never cutting inside a row.
 
     Rows between two allowed cut points (see ``_cut_allowed``) form a unit; a chunk is a run of whole units whose text
-    stays within ``max_chars``. A single unit longer than ``max_chars`` is its own chunk, sent whole (``oversize``).
+    stays within ``max_chars``. A single unit longer than ``max_chars`` is its own chunk (``oversize``): one step for the
+    cursor, but sent to the extractor in ``pieces`` within the limit (a row split at line, then character, boundaries if it
+    must be), so no prompt exceeds the limit and nothing of it is dropped.
     Compaction ``summary`` rows are dropped first: they are never extracted and their ts must never move the cursor.
     Rows with a missing or unparseable ts are kept (they join the unit before them) and logged as
     ``conversation_extract_ts_missing``.
@@ -153,12 +200,14 @@ def chunk_turns(
                 newest, newest_raw = stamps[j], str(rows[j].get("ts"))
         group_rows = [rows[j] for j in group]
         text = format_transcript(group_rows, user_name=user_name, assistant_name=assistant_name)
+        oversize = len(text) > max_chars
         chunks.append(
             TurnChunk(
                 turns=tuple(group_rows),
                 text=text,
                 cursor_ts=newest_raw,
-                oversize=len(text) > max_chars,
+                oversize=oversize,
+                pieces=_pieces([lines[j] for j in group], max_chars) if oversize else (text,),
             )
         )
     return chunks

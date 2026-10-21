@@ -305,26 +305,34 @@ def _run_chunks(
                 logger,
                 "conversation_extract_oversize_unit",
                 logging.WARNING,
-                "conversation_extract_oversize_unit session=%s chars=%d max_chars=%d: one exchange longer than the limit, sent whole",
+                "conversation_extract_oversize_unit session=%s chars=%d max_chars=%d pieces=%d: one exchange longer than the "
+                "limit, sent in pieces",
                 session_id,
                 len(chunk.text),
                 max_chars,
+                len(chunk.pieces),
             )
-        result = run_chunk_stages(
-            persona_dir,
-            session_id,
-            chunk.text,
-            store=store,
-            hebbian=hebbian,
-            provider=provider,
-            cfg=cfg,
-            report=report,
-            user_name=user_name,
-            assistant_name=assistant_name,
-            valid_emotions=valid_emotions,
-            emotion_vocab=emotion_vocab,
-            user_pronouns=user_pronouns,
-        )
+        # One call per piece (one for a normal chunk). The cursor moves past the chunk only after its LAST piece commits, so a
+        # stop on any piece leaves it before the chunk and the next pass sends every piece again (dedup meets the repeats).
+        result = ChunkResult.OK
+        for piece in chunk.pieces:
+            result = run_chunk_stages(
+                persona_dir,
+                session_id,
+                piece,
+                store=store,
+                hebbian=hebbian,
+                provider=provider,
+                cfg=cfg,
+                report=report,
+                user_name=user_name,
+                assistant_name=assistant_name,
+                valid_emotions=valid_emotions,
+                emotion_vocab=emotion_vocab,
+                user_pronouns=user_pronouns,
+            )
+            if result is not ChunkResult.OK:
+                break
         if result is ChunkResult.DEFERRED:
             # #473: "not now" is not a failure. No error, no backoff entry (three of those move the buffer to poison/),
             # the cursor stays after the last committed chunk, and the next pass tries again from there.

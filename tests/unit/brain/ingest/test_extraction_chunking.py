@@ -143,9 +143,10 @@ def test_same_ts_rows_are_never_split() -> None:
     chunks = chunk_turns(_same_ts_pairs_history(), max_chars=120, user_name="Bob", assistant_name="Kestrel")
     assert len(chunks) > 3
     assert _boundary_ts_violations(chunks) == []
-    # the four rows of one second stay in one chunk even though the group holds a second user row
+    # the four rows of one second stay in one chunk even though the group holds a second user row (sent in pieces)
     group = [c for c in chunks if any("plimsy" in t["text"] for t in c.turns)]
     assert len(group) == 1 and len(group[0].turns) == 4 and group[0].oversize
+    assert all(len(p) <= 120 for p in group[0].pieces)
 
 
 def test_no_chunk_opens_with_a_reply_even_when_the_pair_straddles_a_second() -> None:
@@ -209,13 +210,40 @@ def test_cursor_ts_is_the_newest_row_up_to_the_chunk_end() -> None:
         assert c.cursor_ts == newest["ts"]
 
 
-def test_a_unit_larger_than_the_limit_is_sent_whole() -> None:
-    rows = [_row("user", "short " * 3, 0), _row("assistant", "grumvex " * 400, 1), _row("user", "after", 60)]
+def _strip_labels(pieces: tuple[str, ...]) -> str:
+    """The text of a split row's pieces with every speaker label and every newline removed (for a coverage check)."""
+    out = []
+    for piece in pieces:
+        for ln in piece.split("\n"):
+            out.append(ln.split(": ", 1)[1] if ln.startswith(("Bob: ", "Kestrel: ")) else ln)
+    return "".join(out)
+
+
+def test_a_unit_larger_than_the_limit_is_kept_together_but_sent_in_pieces() -> None:
+    """Pre-merge review M1: a unit (a message and its reply) longer than the limit is never cut for the CURSOR, but its text goes
+    to the extractor in pieces of at most the limit: whole rows where they fit, a longer row split at line boundaries, then at
+    character boundaries, every piece starting with a speaker label. Nothing is dropped."""
+    long_reply = "grumvex " * 400  # one line, 3200 chars: split at character boundaries
+    rows = [_row("user", "short " * 3, 0), _row("assistant", long_reply, 1), _row("user", "after", 60)]
     chunks = chunk_turns(rows, max_chars=500, user_name="Bob", assistant_name="Kestrel")
     assert [len(c.turns) for c in chunks] == [2, 1]
     assert chunks[0].oversize and len(chunks[0].text) > 500
-    assert "grumvex " * 400 in chunks[0].text  # whole, never cut mid-row
-    assert not chunks[1].oversize
+    assert long_reply in chunks[0].text  # the chunk's text is still the whole rows
+    assert len(chunks[0].pieces) > 1
+    assert all(len(p) <= 500 and p.startswith(("Bob: ", "Kestrel: ")) for p in chunks[0].pieces)
+    assert _strip_labels(chunks[0].pieces) == "short " * 3 + long_reply
+    assert chunks[1].pieces == (chunks[1].text,) and not chunks[1].oversize
+
+
+def test_a_long_multi_line_message_is_split_at_line_boundaries() -> None:
+    body = "\n".join(f"line {i} " + "x" * 60 for i in range(40))  # ~2,800 chars over 40 lines
+    rows = [_row("user", body, 0)]
+    (chunk,) = chunk_turns(rows, max_chars=600, user_name="Bob", assistant_name="Kestrel")
+    assert chunk.oversize and len(chunk.pieces) > 1
+    for piece in chunk.pieces:
+        assert len(piece) <= 600 and piece.startswith("Bob: line ")  # cut only between lines; each piece opens with the label
+    rebuilt = [ln for p in chunk.pieces for ln in p[len("Bob: "):].split("\n")]
+    assert rebuilt == body.split("\n")
 
 
 def test_rows_without_a_ts_join_the_row_before_and_are_logged(caplog) -> None:
@@ -455,8 +483,12 @@ def test_c2_each_transcript_is_whole_turns_within_the_limit(world, monkeypatch, 
     with caplog.at_level(logging.DEBUG):
         report = _snapshot(world, "sess_c02", _Stub())
     lines = [_line(r) for r in rows]
+    oversize_line = lines[-1] if limit == _CHUNK else None
+    whole = [t for t in transcripts if oversize_line is None or "zx big line" not in t and not t.startswith("Bob: big line")]
     for text in transcripts:
         assert text.startswith(("Bob: ", "Kestrel: "))
+        assert len(text) <= limit  # every prompt within the limit, the over-long message included (sent in pieces)
+    for text in whole:
         # the transcript is exactly a run of whole formatted turns (a multi-line body counts as one turn)
         k = next(i for i, ln in enumerate(lines) if text.startswith(ln))
         j = k
@@ -465,12 +497,15 @@ def test_c2_each_transcript_is_whole_turns_within_the_limit(world, monkeypatch, 
             j += 1
             assert j < len(lines), "transcript is not a run of whole turns"
             rebuilt += "\n" + lines[j]
-        if len(text) > limit:
-            assert j == k  # only a single over-long turn may exceed the limit
-    assert "\n".join(transcripts) == "\n".join(lines)
-    assert report.completed
-    if limit == _CHUNK:
+    if oversize_line is not None:
+        pieces = [t for t in transcripts if t not in whole]
+        assert len(pieces) > 1
+        assert [ln for p in pieces for ln in p[len("Bob: "):].split("\n")] == oversize_line[len("Bob: "):].split("\n")
+        assert "\n".join(whole) == "\n".join(lines[:-1])
         assert any("conversation_extract_oversize_unit" in r.getMessage() for r in caplog.records)
+    else:
+        assert "\n".join(transcripts) == "\n".join(lines)
+    assert report.completed
 
 
 def test_c3c_a_deferral_resumes_at_the_next_chunk_with_nothing_skipped_or_repeated(world) -> None:
@@ -934,3 +969,26 @@ def test_finalize_sets_aside_only_the_failing_chunk_and_the_rest_is_extracted_la
     later = _snapshot(world, "sess_fin", _Stub())
     assert later.completed
     assert "\n".join(transcripts) == "\n".join(c.text for c in chunks[3:])
+
+
+
+def test_an_oversize_message_moves_the_cursor_only_after_its_last_piece(world) -> None:
+    """Pre-merge review M1: the pieces of one over-long message are one chunk for the cursor: a failure on a later piece leaves
+    the cursor before the message, so the next pass sends every piece again (nothing is recorded as extracted that was not)."""
+    persona, _, _, transcripts = world
+    rows = _seed(persona, "sess_ovr", 2)
+    ingest_turn(persona, {"session_id": "sess_ovr", "speaker": "user", "text": "\n".join(f"wobble {i} " + "q" * 70 for i in range(30)),
+                          "ts": datetime.now(UTC).isoformat(timespec="seconds")})
+    rows = read_session(persona, "sess_ovr")
+    chunks = _expected_chunks(rows)
+    big = chunks[-1]
+    assert big.oversize and len(big.pieces) >= 3
+    second_piece = big.pieces[1]
+    report = _snapshot(world, "sess_ovr", _Stub(plan=lambda n, p: "fail" if second_piece in p else None))
+    assert not report.completed
+    assert read_cursor(persona, "sess_ovr") == chunks[-2].cursor_ts  # before the message
+    transcripts.clear()
+    again = _snapshot(world, "sess_ovr", _Stub())
+    assert again.completed
+    assert transcripts == list(big.pieces)
+    assert read_cursor(persona, "sess_ovr") == big.cursor_ts

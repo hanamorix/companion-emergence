@@ -472,25 +472,32 @@ def run_one_chunk(
     marker = {"extraction_backfill": {"from": chunk.turns[0]["ts"], "to": chunk.turns[-1]["ts"]}}
     report = IngestReport(session_id=target["sid"])
     valid_emotions, emotion_vocab = load_emotion_vocab()
+    user_pronouns = load_user_pronouns(persona_dir)
     try:
-        result = run_chunk_stages(
-            persona_dir,
-            target["sid"],
-            chunk.text,
-            store=store,
-            hebbian=hebbian,
-            provider=provider,
-            cfg={},
-            report=report,
-            user_name=user_name,
-            assistant_name=assistant_name,
-            valid_emotions=valid_emotions,
-            emotion_vocab=emotion_vocab,
-            user_pronouns=load_user_pronouns(persona_dir),
-            queue_soul=mode == "heads",
-            extra_metadata=marker,
-            created_at=created_at,
-        )
+        # One call per piece (one for a normal chunk; an over-long single exchange goes in pieces within the limit, all in
+        # this run). Progress is written only after the last piece commits.
+        result = ChunkResult.OK
+        for piece in chunk.pieces:
+            result = run_chunk_stages(
+                persona_dir,
+                target["sid"],
+                piece,
+                store=store,
+                hebbian=hebbian,
+                provider=provider,
+                cfg={},
+                report=report,
+                user_name=user_name,
+                assistant_name=assistant_name,
+                valid_emotions=valid_emotions,
+                emotion_vocab=emotion_vocab,
+                user_pronouns=user_pronouns,
+                queue_soul=mode == "heads",
+                extra_metadata=marker,
+                created_at=created_at,
+            )
+            if result is not ChunkResult.OK:
+                break
     except cli_throttle.ShutdownDeferred:
         raise
     except Exception:  # noqa: BLE001 - a store or commit fault counts as a failed attempt, so it cannot retry forever
@@ -828,7 +835,9 @@ def dry_run_text(persona_dir: Path) -> str:
         for target in _plan(persona_dir, mode, cutoff, session_cutoffs):
             rows = _target_rows(persona_dir, target, cutoff)
             text = "\n".join(format_turn_line(r, user_name or "user", assistant_name) for r in rows)
-            calls = len(chunk_turns(rows, max_chars=max_chars, user_name=user_name, assistant_name=assistant_name))
+            calls = sum(
+                len(c.pieces) for c in chunk_turns(rows, max_chars=max_chars, user_name=user_name, assistant_name=assistant_name)
+            )
             entry = per_sid.setdefault(target["sid"], [0, 0, 0, target["from_ts"], target["to_ts"]])
             entry[0] += 1
             entry[1] += len(text)

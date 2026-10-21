@@ -120,10 +120,11 @@ class IngestReport:
         backoff_skipped: The session's recorded failures reached the threshold less than the
                          backoff window ago, so this pass returned without calling the
                          provider (``errors`` is 1). It is not a failed attempt.
-        chunks:          Chunks of the span after the cursor this pass sent to the extractor
-                         (#523; a span longer than ``ingest.extraction_chunk_chars`` is extracted
-                         in several chunks, oldest first). One model call each, plus the
-                         extractor's own retry when a reply does not parse or the call fails.
+        chunks:          Extraction calls this pass made: one per chunk of the span after the
+                         cursor (a span longer than ``ingest.extraction_chunk_chars`` is extracted
+                         in several chunks, oldest first), and one per piece of a single exchange
+                         longer than that limit. The extractor's own retry of a call whose reply
+                         does not parse or that fails is not counted separately.
         reached_end:     The pass committed every chunk up to the end of the span it read, so
                          the cursor reached the buffer's end as the pass saw it. False by default:
                          a report from any path that did not say so is not completed.
