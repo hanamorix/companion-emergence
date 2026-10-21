@@ -3061,7 +3061,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Re-extract everything archived, not only the lost starts (more calls; no soul candidates).",
     )
     memory_backfill.add_argument(
-        "--restart", action="store_true", help="Discard the existing plan and plan afresh (the cutoff moves to now)."
+        "--restart",
+        action="store_true",
+        help="Discard the existing plan and plan afresh (the cutoff is recomputed; done targets are extracted again).",
     )
     backfill_action = memory_backfill.add_mutually_exclusive_group()
     backfill_action.add_argument(

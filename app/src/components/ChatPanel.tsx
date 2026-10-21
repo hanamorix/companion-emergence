@@ -621,8 +621,10 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
         try {
           sessionId = await newSession(persona);
         } catch (e) {
-          // Nothing was sent: take the pending bubble back (onFailed gives the text back to the composer).
-          setMessages((m) => m.filter((b) => b.id !== userMsg.id));
+          // Nothing was sent: take back the pending bubble and any reach-out bubble shown with it (onFailed gives the text
+          // back to the composer).
+          const shown = new Set([userMsg.id, ...prepend.map((b) => b.id)]);
+          setMessages((m) => m.filter((b) => !shown.has(b.id)));
           setResolvingSession(false);
           setErrorSafe(`Bridge unreachable: ${errString(e)}`);
           onFailed?.();

@@ -411,6 +411,74 @@ describe("ChatPanel — a send while its own session lookup is pending (#523, ma
   });
 });
 
+describe("ChatPanel — a send whose session cannot be had is rolled back (#523 follow-up)", () => {
+  const mockedFetchActive = fetchActiveSession as unknown as ReturnType<typeof vi.fn>;
+  const mockedNewSession = newSession as unknown as ReturnType<typeof vi.fn>;
+  const mockedStreamChat = streamChat as unknown as ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    mockedFetchActive.mockReset();
+    mockedNewSession.mockReset();
+    mockedStreamChat.mockReset();
+    mockedStreamChat.mockImplementation(async () => () => undefined);
+    mockedFetchActive.mockResolvedValue(null);
+    mockedNewSession.mockRejectedValue(new Error("bridge down"));
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("removes the pending bubble, gives the text back and re-enables sending", async () => {
+    render(<ChatPanel persona="kestrel" />);
+    const textarea = screen.getByPlaceholderText(/^Write to/) as HTMLTextAreaElement;
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: "a glimmet that never left" } });
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+    });
+    await waitFor(() => expect(mockedNewSession).toHaveBeenCalled());
+    await waitFor(() => expect(textarea.value).toBe("a glimmet that never left"));
+    expect(screen.queryByText("a glimmet that never left", { selector: "div, span, p" })).toBeNull();
+    expect(screen.getByRole("button", { name: /^send$/i })).toBeEnabled();
+    expect(mockedStreamChat).not.toHaveBeenCalled();
+  });
+
+  it("also removes the reach-out bubble a card reply showed with it", async () => {
+    const handlers = new Set<(e: Record<string, unknown> & { type: string }) => void>();
+    const stream = {
+      subscribe(h: (e: Record<string, unknown> & { type: string }) => void) {
+        handlers.add(h);
+        return () => handlers.delete(h);
+      },
+    };
+    render(<ChatPanel persona="kestrel" eventStream={stream} />);
+    await act(async () => {
+      for (const h of handlers)
+        h({
+          type: "initiate_delivered",
+          audit_id: "ia_rollback",
+          body: "a thought about the quorble tree",
+          urgency: "quiet",
+          state: "delivered",
+          timestamp: "2026-10-12T09:00:00+00:00",
+        });
+    });
+    const cardTextarea = (await screen.findByLabelText(/^Reply to Kestrel$/i)) as HTMLTextAreaElement;
+    await act(async () => {
+      fireEvent.change(cardTextarea, { target: { value: "tell me more" } });
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Send reply/i }));
+    });
+    await waitFor(() => expect(mockedNewSession).toHaveBeenCalled());
+    await waitFor(() => expect(screen.queryByText("tell me more")).toBeNull());
+    expect(screen.queryByText("a thought about the quorble tree")).toBeNull();
+    expect(mockedStreamChat).not.toHaveBeenCalled();
+  });
+});
+
 describe("ChatPanel — recovery banner (Phase 3.B)", () => {
   afterEach(() => {
     cleanup();

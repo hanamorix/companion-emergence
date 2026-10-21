@@ -64,6 +64,7 @@ from brain.memory.pending import GATE_BYPASS_TYPES
 from brain.memory.store import MemoryStore
 from brain.utils.file_lock import file_lock
 from brain.utils.log_throttle import count_throttled
+from brain.utils.time import lenient_utc
 
 logger = logging.getLogger(__name__)
 
@@ -286,7 +287,9 @@ def _run_chunks(
     (F-011), and a committed chunk clears the backoff sidecar. ``close_session`` passes False: it keeps its rule of no
     backoff accounting.
     """
-    mark_chunked_extraction(persona_dir)  # main ruling M4: the backfill never plans text extracted from here on
+    # Main ruling M4 / follow-up R-a: the backfill never plans text the chunked code extracts; its first pass starts here.
+    stamps = [ts for t in turns if (ts := lenient_utc(t.get("ts"))) is not None]
+    mark_chunked_extraction(persona_dir, min(stamps) if stamps else None)
     user_name = load_user_name(persona_dir)
     assistant_name = persona_dir.name
     valid_emotions, emotion_vocab = load_emotion_vocab()

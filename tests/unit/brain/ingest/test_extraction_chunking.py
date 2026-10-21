@@ -872,12 +872,35 @@ def test_b17_the_first_chunked_pass_writes_the_marker_once(world) -> None:
     """Main ruling M4: the pipeline records when chunked extraction began for this persona, once, and never moves it."""
     persona, _, _, _ = world
     marker = persona / "extraction_chunked_since.json"
-    _seed(persona, "sess_m1", 2)
+    rows = _seed(persona, "sess_m1", 2)
     assert not marker.exists()
-    before = datetime.now(UTC).replace(microsecond=0)
     _snapshot(world, "sess_m1", _Stub())
     first = marker.read_bytes()
-    assert lenient_utc(json.loads(first)["since"]) >= before
+    assert lenient_utc(json.loads(first)["since"]) == lenient_utc(rows[0]["ts"])
     _seed(persona, "sess_m2", 2)
     _snapshot(world, "sess_m2", _Stub())
     assert marker.read_bytes() == first
+
+
+def test_b17_the_marker_is_the_first_row_the_first_chunked_pass_extracts(world) -> None:
+    """Follow-up R-a: rows still pending when the chunked code took over are extracted in full by its first pass, so the
+    marker is the start of that pass's span (its oldest row), not the time of the pass; everything the chunked code extracted
+    lies at or after the backfill's cutoff."""
+    persona, _, _, _ = world
+    rows = _seed(persona, "sess_m3", 3, start=datetime.now(UTC) - timedelta(days=2))
+    _snapshot(world, "sess_m3", _Stub())
+    since = lenient_utc(json.loads((persona / "extraction_chunked_since.json").read_text())["since"])
+    assert since == lenient_utc(rows[0]["ts"])
+
+
+@pytest.mark.parametrize("damage", ["", "not json", "[1, 2]", '{"since": "yesterday"}'])
+def test_b17_a_damaged_marker_is_rewritten(world, damage) -> None:
+    """Follow-up R-b: a marker that exists but does not parse is written again by the next chunked pass."""
+    from brain.ingest.ingest_utils import chunked_extraction_since
+
+    persona, _, _, _ = world
+    marker = persona / "extraction_chunked_since.json"
+    marker.write_text(damage, encoding="utf-8")
+    rows = _seed(persona, "sess_m4", 2)
+    _snapshot(world, "sess_m4", _Stub())
+    assert chunked_extraction_since(persona) == lenient_utc(rows[0]["ts"])

@@ -209,19 +209,25 @@ def load_emotion_vocab() -> tuple[set[str], str]:
         return set(), ""
 
 
-# When chunked extraction began for a persona (main ruling M4 of the #523 run): text chatted after this time is extracted in
-# full by the chunked pipeline, so the extraction backfill never plans it. Written once, never moved.
+# Where chunked extraction began for a persona (main ruling M4 of the #523 run, follow-up R-a): the ts of the first row the first
+# chunked pass extracted. Text from there on is extracted in full by the chunked pipeline, so the extraction backfill never plans
+# it. Written once and never moved (only a damaged marker is written again).
 CHUNKED_SINCE_FILE = "extraction_chunked_since.json"
 
 
-def mark_chunked_extraction(persona_dir: Path) -> None:
-    """Record, once per persona, that chunked extraction runs from now on (a no-op once the marker exists). Best-effort: a
-    failed write is logged and the next pass tries again."""
+def mark_chunked_extraction(persona_dir: Path, first_row: datetime | None) -> None:
+    """Record, once per persona, where chunked extraction began: ``first_row``, the ts of the first row the first chunked pass
+    extracts (the start of the span after its cursor; now when no row has a parseable ts). Rows pending when the chunked code
+    took over are extracted in full by that pass, so everything the chunked code extracts lies at or after the marker.
+    A no-op once a readable marker exists; a marker that exists but does not parse is written again (it would otherwise read as
+    "no marker" for good). Best-effort: a failed write is logged and the next pass tries again."""
     path = persona_dir / CHUNKED_SINCE_FILE
-    if path.exists():
+    exists = path.exists()
+    if exists and chunked_extraction_since(persona_dir) is not None:
         return
+    since = (first_row or datetime.now(UTC)).isoformat()
     try:
-        write_json(path, {"since": datetime.now(UTC).isoformat()}, if_missing=True)
+        write_json(path, {"since": since}, if_missing=not exists)
     except OSError:
         logger.warning("could not record when chunked extraction began (%s); retrying on the next pass", path, exc_info=True)
 

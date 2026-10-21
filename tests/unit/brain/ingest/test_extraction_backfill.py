@@ -260,19 +260,24 @@ def _b1_history(persona) -> tuple[str, list[dict]]:
 
 
 _LONG_USER = "Bob Quillamore-Vantrexley"  # the configured user name in force for the B1 history: longer than "user"
+_LONG_PERSONA = "Kestrelwingfeather-Quillamoor-Vantrexhollow"  # the persona dir name for B1: longer than "assistant", so both label halves matter
 
 
-def _b1_world(persona, monkeypatch) -> tuple[str, list[dict], list[dict]]:
+def _b1_world(persona, monkeypatch) -> tuple[object, str, list[dict], list[dict]]:
     """The B1 fixture (amended B1, main ruling M3): the cut replayed with the labels IN FORCE (the configured user name and the
-    persona dir name), and the fixture's own check that this set is strictly larger than the shortest-label set."""
-    PersonaConfig(user_name=_LONG_USER).save(persona / "persona_config.json")
+    persona dir name), and the fixture's own checks that this set is strictly larger than the shortest-label set and than each
+    half alone (follow-up: with a persona name shorter than "assistant" the assistant half could not fail)."""
+    b1 = persona.parent / _LONG_PERSONA
+    b1.mkdir()
+    PersonaConfig(user_name=_LONG_USER).save(b1 / "persona_config.json")
     monkeypatch.setattr(eb, "_HISTORICAL_CAP_CHARS", 2_500)
-    sid, rows = _b1_history(persona)
+    sid, rows = _b1_history(b1)
     passes = _model_passes(rows)
-    in_force = _never_shown(passes, _LONG_USER, "Kestrel", 2_500)
-    shortest = _never_shown(passes, "user", min(("assistant", "Kestrel"), key=len), 2_500)
-    assert {r["text"] for r in shortest} < {r["text"] for r in in_force}, "the fixture must make the labels matter"
-    return sid, rows, in_force
+    in_force = {r["text"] for r in _never_shown(passes, _LONG_USER, _LONG_PERSONA, 2_500)}
+    for user_label, assistant_label in (("user", "assistant"), ("user", _LONG_PERSONA), (_LONG_USER, "assistant")):
+        weaker = {r["text"] for r in _never_shown(passes, user_label, assistant_label, 2_500)}
+        assert weaker < in_force, f"the fixture must make the labels matter: {user_label!r}, {assistant_label!r}"
+    return b1, sid, rows, [r for r in rows if r["text"] in in_force]
 
 
 def _covered(persona, sid, rows_cut) -> list[dict]:
@@ -283,24 +288,30 @@ def _covered(persona, sid, rows_cut) -> list[dict]:
 
 def test_b1_the_heads_plan_covers_every_row_the_model_says_was_cut(kestrel, monkeypatch) -> None:
     persona, _, _ = kestrel
-    sid, _rows_, in_force = _b1_world(persona, monkeypatch)
-    assert _covered(persona, sid, in_force) == []
+    b1, sid, _rows_, in_force = _b1_world(persona, monkeypatch)
+    assert _covered(b1, sid, in_force) == []
 
 
 def test_b1_oracle_catches_a_planner_with_the_300_s_rule(kestrel, monkeypatch) -> None:
     """Fail-first kept executable: with the pre-boundary lull at 300 s the 330 s gap splits the span and its head is missed."""
     persona, _, _ = kestrel
-    sid, _rows_, in_force = _b1_world(persona, monkeypatch)
+    b1, sid, _rows_, in_force = _b1_world(persona, monkeypatch)
     monkeypatch.setattr(eb, "_PRE_LULL_UPPER_S", 300)
-    assert _covered(persona, sid, in_force) != []
+    assert _covered(b1, sid, in_force) != []
 
 
-def test_b1_oracle_catches_a_planner_with_the_shortest_labels(kestrel, monkeypatch) -> None:
-    """Fail-first kept executable (amended B1): a planner measuring with the shortest labels misses rows of the in-force cut."""
+@pytest.mark.parametrize(
+    "labels",
+    [("user", "assistant"), ("user", _LONG_PERSONA), (_LONG_USER, "assistant")],
+    ids=["both-shortest", "shortest-user", "shortest-assistant"],
+)
+def test_b1_oracle_catches_a_planner_with_the_shortest_labels(kestrel, monkeypatch, labels) -> None:
+    """Fail-first kept executable (amended B1): a planner measuring with the shortest labels, or the shortest of either half,
+    misses rows of the in-force cut."""
     persona, _, _ = kestrel
-    sid, _rows_, in_force = _b1_world(persona, monkeypatch)
-    monkeypatch.setattr(eb, "_plan_labels", lambda p: ("user", min(("assistant", "Kestrel"), key=len)))
-    assert _covered(persona, sid, in_force) != []
+    b1, sid, _rows_, in_force = _b1_world(persona, monkeypatch)
+    monkeypatch.setattr(eb, "_plan_labels", lambda p: labels)
+    assert _covered(b1, sid, in_force) != []
 
 
 # ---------------------------------------------------------------------------
