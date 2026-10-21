@@ -41,6 +41,12 @@ from brain.ingest.buffer import (
 
 
 def _build(persona_dir: Path) -> tuple[FastAPI, TestClient]:
+    # Each app built here stands for a new bridge process (#458: the bridge never resets the process's task registry; a test
+    # that builds several apps in one process does). Without it a second app's tracked work (#523: GET /sessions/active runs
+    # in a tracked worker thread) is refused by the first app's sealed registry.
+    from brain.bridge import shutdown_progress
+
+    shutdown_progress.reset_for_tests()
     app = build_app(persona_dir=persona_dir, client_origin="tests")
     return app, TestClient(app)
 
