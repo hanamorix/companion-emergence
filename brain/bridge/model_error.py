@@ -34,7 +34,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from brain import tunables
-from brain.persona_config import is_valid_model
+from brain.bridge.model_tier import is_valid_model
 from brain.utils.log_throttle import warn_throttled
 
 log = logging.getLogger(__name__)
@@ -54,15 +54,12 @@ _monotonic = time.monotonic
 
 _lock = threading.Lock()
 _rejected: dict[str, dict[str, Any]] = {}
-# Models that were switched away from: an ambient call that read the old id before the hot-swap must
+# Models that were switched away from: an in-flight call that read the old id before the change must
 # not re-record it when it fails later.
 _ignored: set[str] = set()
 # Models saved without the Apply-time check being able to confirm them (a check that timed out, hit a
 # limit or found the login expired). Cleared by a clean frame for that model or by switching away.
 _unconfirmed: set[str] = set()
-# Derived tier ids an Apply could not probe (budget used up, timeout, expired login): "not checked yet".
-# Cleared by a clean frame for that id, by a later Apply that settles it, or by reset().
-_tier_unconfirmed: set[str] = set()
 _local = threading.local()
 
 
@@ -85,9 +82,9 @@ def rejected_model_name(detail: str, configured: str | None) -> str | None:
     """The model that was rejected, else ``configured``, else None.
 
     Order: the name in the CLI's sentence (the model it says it rejected), the ``model=`` token the provider
-    added (the model the subprocess was run with, immune to a hot-swap during the call), then ``configured``.
+    added (the model the subprocess was run with, immune to a settings change during the call), then ``configured``.
     Callers pass None for ``configured`` on the client-facing paths: a rejected model is never named from
-    ``provider._model``. Only valid model grammar (an alias or ``claude-[a-z0-9.-]+``) is ever returned, so no
+    a provider's own model attribute. Only valid model grammar (an alias or ``claude-[a-z0-9.-]+``) is ever returned, so no
     CLI prose is relayed to a client.
     """
     m = _NAMED_MODEL.search(detail or "")
@@ -138,27 +135,39 @@ def note_failure(detail: str) -> None:
         interval = float(tunables.get_tunable("model_error.warn_interval_seconds", WARN_INTERVAL_S))
         now = _monotonic()
         stamp = datetime.now(UTC).isoformat()
+        epoch = time.time()
         warn = False
         with _lock:
             if model in _ignored:
                 return
             rec = _rejected.get(model)
             if rec is None:
-                rec = {"since": stamp, "last_at": stamp, "count": 0, "warned": None}
+                rec = {"since": stamp, "last_at": stamp, "last_epoch": 0.0, "count": 0, "warned": None}
                 _rejected[model] = rec
             rec["count"] += 1
             rec["last_at"] = stamp
+            rec["last_epoch"] = epoch
             if rec["warned"] is None or (now - rec["warned"]) >= interval:
                 rec["warned"] = now
                 warn = True
             count = rec["count"]
         if warn:  # log outside the lock so a slow handler never stalls state() readers
+            from brain.bridge import (
+                model_tier,  # function-scoped: model_tier imports this module only inside functions
+            )
+
+            consequence = (
+                "It is the shipped default of some jobs, which keep failing until the Claude CLI is updated or "
+                "the model setting is changed."
+                if model_tier.is_shipped_default(model)
+                else "Jobs set to it now run their shipped default until the model setting is changed."
+            )
             log.warning(
                 "Claude rejected the model %r (it may not exist, or this account may not have access to it): "
-                "%d failed call(s) so far. Chat and background jobs using it keep failing until the model "
-                "is changed in the connection panel.",
+                "%d failed call(s) so far. %s",
                 model,
                 count,
+                consequence,
             )
     except Exception:  # noqa: BLE001 - fail open
         log.warning("model_error.note_failure failed (ignored)", exc_info=True)
@@ -170,7 +179,6 @@ def note_success(model: str) -> None:
         with _lock:
             _rejected.pop(model, None)
             _unconfirmed.discard(model)
-            _tier_unconfirmed.discard(model)
     except Exception:  # noqa: BLE001 - fail open
         log.warning("model_error.note_success failed (ignored)", exc_info=True)
 
@@ -193,38 +201,6 @@ def clear_unconfirmed(model: str) -> None:
         log.warning("model_error.clear_unconfirmed failed (ignored)", exc_info=True)
 
 
-def note_tier_unconfirmed(model: str) -> None:
-    """A derived tier id the Apply-time check could not settle."""
-    try:
-        with _lock:
-            _tier_unconfirmed.add(model)
-    except Exception:  # noqa: BLE001 - fail open
-        log.warning("model_error.note_tier_unconfirmed failed (ignored)", exc_info=True)
-
-
-def clear_tier_unconfirmed(model: str) -> None:
-    """The Apply-time check settled this derived tier id (confirmed or rejected)."""
-    try:
-        with _lock:
-            _tier_unconfirmed.discard(model)
-    except Exception:  # noqa: BLE001 - fail open
-        log.warning("model_error.clear_tier_unconfirmed failed (ignored)", exc_info=True)
-
-
-def tier_unconfirmed(only: Iterable[str] | None = None) -> list[str]:
-    """Derived tier ids still "not checked yet", sorted; restricted to ``only`` when given."""
-    try:
-        with _lock:
-            out = sorted(_tier_unconfirmed)
-        if only is not None:
-            allowed = frozenset(only)
-            out = [m for m in out if m in allowed]
-        return out
-    except Exception:  # noqa: BLE001 - fail open
-        log.warning("model_error.tier_unconfirmed failed (ignored)", exc_info=True)
-        return []
-
-
 def unconfirmed(only: Iterable[str] | None = None) -> list[str]:
     """Models still saved-but-unconfirmed, sorted; restricted to ``only`` when given."""
     try:
@@ -243,7 +219,7 @@ def switch(old: str, new: str, keep: Iterable[str] = ()) -> None:
     """The saved model changed from ``old`` to ``new``.
 
     Drops ``old``'s record and ignores any later failure for it (an in-flight call that read the old
-    id), unless ``old`` is in ``keep`` (a model some tier uses on its own). ``new`` is un-ignored.
+    id), unless ``old`` is in ``keep`` (a model some job is configured with). ``new`` is un-ignored.
     """
     try:
         if old == new:
@@ -252,10 +228,9 @@ def switch(old: str, new: str, keep: Iterable[str] = ()) -> None:
         with _lock:
             _rejected.pop(old, None)
             _unconfirmed.discard(old)
-            _tier_unconfirmed.discard(old)
             if old not in keep_set:
                 _ignored.add(old)
-            # An id that is still (or again) in use in some other role must never stay ignored, or a real
+            # An id that is still (or again) in use by some job must never stay ignored, or a real
             # rejection of it would be dropped silently (#441).
             _ignored.difference_update(keep_set)
             _ignored.discard(new)
@@ -273,14 +248,22 @@ def activate(models: Iterable[str]) -> None:
         log.warning("model_error.activate failed (ignored)", exc_info=True)
 
 
-def rejected_models() -> frozenset[str]:
-    """The models with a rejection record in this process (a snapshot)."""
+def is_rejected(model: str, since_epoch: float | None = None) -> bool:
+    """True when ``model`` has a rejection record in this process.
+
+    With ``since_epoch`` the record counts only if its last failure is NEWER than that time (epoch seconds): the
+    settings file's last write. A write after the failure (``nell model set`` after the user updated the CLI, a hand
+    edit) means the id may have been fixed, so it is tried again; if it still fails the failing call records it anew.
+    """
     try:
         with _lock:
-            return frozenset(_rejected)
+            rec = _rejected.get(model)
+            if rec is None:
+                return False
+            return since_epoch is None or rec["last_epoch"] > since_epoch
     except Exception:  # noqa: BLE001 - fail open
-        log.warning("model_error.rejected_models failed (ignored)", exc_info=True)
-        return frozenset()
+        log.warning("model_error.is_rejected failed (ignored)", exc_info=True)
+        return False
 
 
 def state(only: Iterable[str] | None = None) -> list[dict[str, Any]]:
@@ -306,5 +289,4 @@ def reset() -> None:
         _rejected.clear()
         _ignored.clear()
         _unconfirmed.clear()
-        _tier_unconfirmed.clear()
     _local.suppress = False

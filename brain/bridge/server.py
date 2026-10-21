@@ -28,7 +28,7 @@ import re
 import sqlite3
 import threading
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -60,7 +60,7 @@ from brain.bridge.chat import (
 from brain.bridge.events import EventBus
 from brain.bridge.model_tier import (
     TIER_BACKGROUND_HOUSEKEEPING,
-    build_interactive_chat_provider,
+    TIER_INTERACTIVE_CHAT,
     build_tier_provider,
 )
 from brain.bridge.provider import ClaudeCliProvider, LLMProvider, ProviderError, _claude_work_dir
@@ -614,8 +614,9 @@ def _chat_error_code(exc: BaseException) -> str:
 
 def _chat_error_model(exc: BaseException, provider: Any = None) -> str | None:
     """The model to name in a ``model_unavailable`` error: the one the CLI said it rejected, else the one the
-    subprocess was run with (the ``model=`` token the provider added). Never ``provider._model``: the picker can
-    swap it while a call runs, and the user must not be told the model they just chose is unavailable (#448).
+    subprocess was run with (the ``model=`` token the provider added). Never a fresh lookup of the configured
+    model: a settings change can land while a call runs, and the user must not be told the model they just chose
+    is unavailable (#448).
     None for any other error. Always valid model grammar. ``provider`` is accepted for the existing callers."""
     text = str(exc)
     if provider_auth.is_auth_failure(text) or not model_error.is_model_rejection(text):
@@ -630,9 +631,8 @@ def _chat_error_detail(exc: BaseException, provider: Any) -> str:
     return f"{code}:{model}" if model else code
 
 
-# Apply-time check of a custom model id (#440): a few tiny real calls (the chat id, then the tier ids derived
-# from it), so a typo is refused with a specific message instead of failing later inside background jobs.
-# ONE budget covers the whole Apply, not each probe. The app's request has no timeout of its own (bridge.ts
+# Save-time check of a newly chosen model id (#440): one tiny real call, so a typo is refused with a specific
+# message instead of failing later inside the jobs that use it. The budget is for the whole save. The app's request has no timeout of its own (bridge.ts
 # `bridgeFetch` sets no AbortSignal), so the limit that applies is the webview's network stack: WKWebView
 # (macOS) cuts an idle request at about 60 s; WebView2 and WebKitGTK are not known to cut earlier. A custom id
 # is also not replayed, so a cut request would show an error while the bridge still saves. 30 s keeps the
@@ -656,7 +656,7 @@ def _check_model_blocking(model_id: str, timeout_s: float | None = None) -> tupl
     timeout = max(_MIN_PROBE_S, int(_check_budget_s() if timeout_s is None else timeout_s))
     try:
         with model_error.suppressed():
-            ClaudeCliProvider(model=model_id, timeout_seconds=timeout).probe(_MODEL_CHECK_PROMPT)
+            ClaudeCliProvider(probe_model=model_id, timeout_seconds=timeout).probe(_MODEL_CHECK_PROMPT)
         return "ok", ""
     except provider_auth.ProviderAuthDeferred:
         return "inconclusive", "auth_deferred"
@@ -672,245 +672,80 @@ def _check_model_blocking(model_id: str, timeout_s: float | None = None) -> tupl
         return "inconclusive", "failed"
 
 
-# Time source for the Apply / re-check budget arithmetic (a seam so tests can move time without touching
+# Time source for the save-time check's budget arithmetic (a seam so tests can move time without touching
 # the global ``time.monotonic`` that asyncio's own scheduler uses).
 _clock = time.monotonic
 
 
-async def _probe_models(ids: list[str], left: float) -> list[tuple[str, str]]:
-    """Probe ``ids`` together inside the ``left`` seconds that remain of ONE check budget (#441, #449).
+async def _apply_chat_model(model: str, *, check: bool, lock: asyncio.Lock) -> tuple[int, dict[str, Any]]:
+    """Set the chat model: validate, check it, write the install's tunables file. Returns ``(status, body)``.
 
-    Shared by the picker's Apply (the derived tier ids) and the start-up re-check, so both use the same
-    time-limited check. None is started once less than ``_MIN_PROBE_S`` is left: those come back
-    ``("inconclusive", "budget")``.
+    The ONE implementation behind the picker's ``POST /persona/config/model`` and ``nell model set``. The chat model
+    is the install-wide ``model.interactive_chat`` line of ``tunables.json`` (every bridge reads it on every call, so
+    there is no live provider to switch). ``model`` is what the user chose, a word (sonnet / opus / haiku) or a
+    full id, applied with the one write rule of ``brain.bridge.model_tier.set_job_models``: a word equal to the
+    chat job's shipped default REMOVES the override (no probe: nothing new is chosen), ``opus`` writes the Opus id,
+    ``haiku`` writes the alias, a full id is written exactly as typed. A value that is about to be written and is
+    not an alias word is first checked with one real stream-json call (#440, #448) when ``check`` is true: if
+    Claude rejects it nothing is written; any other check failure (timeout, expired login, rate limit) saves it
+    unchecked. ``lock`` is the single-flight lock all checks share.
+
+    Returns (200, {ok: true, model: <the id the chat job runs after the write>, checked?}),
+            (400, {ok: false, error: "unknown_model", valid: [...]}),
+            (400, {ok: false, error: "model_unavailable", model: <id>}) or
+            (500, {ok: false, error: "tunables_unwritable", detail}).
     """
-    if ids and left >= _MIN_PROBE_S:
-        return list(await asyncio.gather(*(asyncio.to_thread(_check_model_blocking, m, left) for m in ids)))
-    return [("inconclusive", "budget")] * len(ids)
-
-
-def _apply_recheck_outcomes(persona_dir: Path, chat_model: str, outcomes: dict[str, str]) -> list[str]:
-    """Remove the ids whose re-check passed from ``derived_unavailable``; returns the removed ids (#449).
-
-    SYNCHRONOUS on purpose: one load -> modify -> save with no ``await`` in between, run on the event loop
-    thread like every async config writer, and the config is re-read here (not carried over from before the
-    probes) so a change made while they ran is kept. Nothing is written when the chat model is no longer the
-    one the probes were run for (an Apply replaced the list) or when no id passed.
-    """
-    from dataclasses import replace as dc_replace
-
-    path = persona_dir / "persona_config.json"
-    cfg = PersonaConfig.load(path)
-    if cfg.model != chat_model:
-        return []
-    passed = [m for m in cfg.derived_unavailable if outcomes.get(m) == "ok"]
-    if not passed:
-        return []
-    dc_replace(cfg, derived_unavailable=[m for m in cfg.derived_unavailable if m not in passed]).save(path)
-    return passed
-
-
-# The start-up re-check leaves a stamp file; a start within the Claude CLI re-probe interval of the previous
-# one does not probe again, so a crash loop, an idle-shutdown relaunch or several app relaunches cannot turn
-# into a probe storm. The interval is provider_auth's existing re-probe cadence (900 s), not a new number. The
-# stamp is a persisted cadence file, so it lives where every one does: under <persona>/cadence/, resolved by
-# brain.paths.cadence_state_path (which also moves a legacy root-level file into place). It is a file because the
-# repeats are separate processes.
-_RECHECK_STAMP = "derived_model_recheck.stamp"
-
-
-def _recheck_recent(persona_dir: Path) -> bool:
-    from brain.paths import cadence_state_path
-
-    try:
-        age = time.time() - cadence_state_path(persona_dir, _RECHECK_STAMP).stat().st_mtime
-    except OSError:
-        return False
-    return 0 <= age < provider_auth.reprobe_interval_s()
-
-
-def _stamp_recheck(persona_dir: Path) -> None:
-    from brain.paths import cadence_state_path
-
-    try:
-        stamp = cadence_state_path(persona_dir, _RECHECK_STAMP)
-        stamp.parent.mkdir(parents=True, exist_ok=True)
-        stamp.write_text("", encoding="utf-8")
-    except OSError:
-        logger.warning("could not write the derived model re-check stamp", exc_info=True)
-
-
-def _recheck_needed(persona_dir: Path, provider: Any) -> bool:
-    """True when the bridge should re-test saved unavailable derived ids at start (#449)."""
-    from brain.persona_config import KNOWN_MODELS
-
-    if not isinstance(provider, ClaudeCliProvider):
-        return False
-    try:
-        cfg = PersonaConfig.load(persona_dir / "persona_config.json")
-    except Exception:  # noqa: BLE001 - start-up never fails on this
-        return False
-    if not cfg.derived_unavailable or cfg.model in KNOWN_MODELS:
-        return False
-    return not _recheck_recent(persona_dir)
-
-
-async def _recheck_derived_unavailable(persona_dir: Path, lock: asyncio.Lock) -> None:
-    """Re-test the saved ``derived_unavailable`` ids once, as the picker's Apply would, and update the list (#449).
-
-    Same probe, one shared budget, single-flight through ``lock`` (the Apply's lock). Runs as a background task
-    so the bridge is ready at once. Removal-only: an id that is available again leaves the list (and its
-    runtime rejection record is cleared); a rejected or inconclusive id stays. Never raises.
-    """
-    try:
-        cfg = PersonaConfig.load(persona_dir / "persona_config.json")
-        ids, chat_model = list(cfg.derived_unavailable), cfg.model
-        if not ids:
-            return
-        async with lock:
-            results = await _probe_models(ids, _check_budget_s())
-        outcomes = {m: res[0] for m, res in zip(ids, results, strict=True)}
-        for m, (outcome, reason) in zip(ids, results, strict=True):
-            logger.info("derived model re-check: %s %s", m, outcome if outcome != "inconclusive" else f"inconclusive:{reason}")
-        removed = _apply_recheck_outcomes(persona_dir, chat_model, outcomes)
-        for m in removed:
-            model_error.note_success(m)
-        logger.info("derived model re-check done: %d of %d available again", len(removed), len(ids))
-    except asyncio.CancelledError:
-        raise
-    except Exception:  # noqa: BLE001 - a background re-check must never break the bridge
-        logger.warning("derived model re-check failed (ignored)", exc_info=True)
-
-
-async def _apply_chat_model(
-    persona_dir: Path,
-    model: str,
-    *,
-    check: bool,
-    lock: asyncio.Lock,
-    hot_swap: Callable[[str], None] | None,
-    before_write: Callable[[], None] | None = None,
-) -> tuple[int, dict[str, Any]]:
-    """Apply a chat model: validate, check it, write the config, switch the live provider. Returns
-    ``(status, body)``. The ONE implementation behind the picker's ``POST /persona/config/model`` and
-    ``nell model set`` when no bridge is running.
-
-    Accepts an alias (sonnet / opus / haiku) or a full model id (``claude-...``), validated by
-    ``is_valid_model``. A FULL id with ``check`` true (a claude-cli provider) is first checked with one real
-    stream-json call (#440, #448): if Claude rejects it the id is NOT saved. Any other check failure (timeout,
-    expired login, rate limit) saves it unchecked. Then it persists to persona_config.json and calls
-    ``hot_swap`` (the running provider's model switch) when given. ``lock`` is the single-flight lock all
-    checks share. ``before_write`` runs right before the config is re-read and written; it may raise to stop the
-    write (``nell model set`` uses it to refuse writing behind a bridge that started during the check).
-
-    Returns (200, {ok: true, model, checked?, fallbacks?, tiers_unchecked?}),
-            (400, {ok: false, error: "unknown_model", valid: [...]}) or
-            (400, {ok: false, error: "model_unavailable", model: <id>}).
-    """
-    from dataclasses import replace as dc_replace
-
     from brain.bridge.model_tier import (
-        ROUTED_CLAUDE_TIERS,
-        candidate_tier_models,
-        derive_model,
+        KNOWN_MODELS,
+        configured_job_models,
+        is_valid_model,
         model_for_tier,
-        tier_fallbacks,
-        tier_family,
-        unchecked_tiers,
+        resolve_choice,
+        set_job_models,
+        shipped_default,
     )
-    from brain.persona_config import KNOWN_MODELS, PersonaConfig, is_valid_model
+    from brain.tunables import TunablesWriteError
 
     if not is_valid_model(model):
         return 400, {"ok": False, "error": "unknown_model", "valid": sorted(KNOWN_MODELS)}
-    config_path = persona_dir / "persona_config.json"
-    before = PersonaConfig.load(config_path)
+    resolved = resolve_choice(model)
+    removal = model in KNOWN_MODELS and resolved == shipped_default(TIER_INTERACTIVE_CHAT)
+    to_write = None if removal else resolved
     checked: bool | None = None
-    # Derived tier ids that are tested together with the chat id (#441): the ids the routed tiers would
-    # follow, minus the chat id itself and minus families whose every tier has an explicit override.
-    derived_ids: list[str] = []
-    for tier in ROUTED_CLAUDE_TIERS:
-        family = tier_family(model_for_tier(tier))
-        derived = None if before.tier_models.get(tier) or not family else derive_model(model, family)
-        if derived and derived != model and derived not in derived_ids:
-            derived_ids.append(derived)
-    derived_outcomes: dict[str, str] = {}
-    if model not in KNOWN_MODELS and check:
+    if check and to_write is not None and to_write not in KNOWN_MODELS:
         budget = _check_budget_s()
-        contended = lock.locked()  # another check (an Apply, the start-up re-check) is running
-        waiting_since = _clock()  # a wait for the lock counts against the budget, so an Apply stays inside it
+        contended = lock.locked()  # another check is running
+        waiting_since = _clock()  # a wait for the lock counts against the budget, so a save stays inside it
         async with lock:
             waited = (_clock() - waiting_since) if contended else 0.0
-            started = _clock() - waited
             remaining = budget - waited
             if remaining >= _MIN_PROBE_S:
-                outcome, reason = await asyncio.to_thread(_check_model_blocking, model, remaining)
+                outcome, reason = await asyncio.to_thread(_check_model_blocking, to_write, remaining)
             else:  # the wait behind another check used the budget: save unchecked, as for any inconclusive check
                 outcome, reason = "inconclusive", "budget"
-            if outcome == "rejected":  # no derived probe is spent on an id that is refused anyway
-                return 400, {"ok": False, "error": "model_unavailable", "model": model}
-            # The derived probes share what is left of the ONE budget (they run together, so the
-            # whole Apply stays inside it); none is started once it is used up.
-            derived_results = await _probe_models(derived_ids, budget - (_clock() - started))
+        if outcome == "rejected":
+            return 400, {"ok": False, "error": "model_unavailable", "model": to_write}
         checked = outcome == "ok"
         if not checked:
-            logger.info(
-                "model check for %s was inconclusive, saved unchecked: reason=%s", model, reason
-            )
-        derived_outcomes = {m: res[0] for m, res in zip(derived_ids, derived_results, strict=True)}
-        # An id the probe just proved usable is no longer rejected: drop any earlier runtime record, or
-        # the tiers would stay on their fallback and the panel would keep saying it is unavailable.
-        for confirmed in [model if checked else None, *(m for m, o in derived_outcomes.items() if o == "ok")]:
-            if confirmed:
-                model_error.note_success(confirmed)
-    if before_write is not None:
-        before_write()
-    # Re-read right before writing, so a change another request made while the checks ran is kept.
-    current = PersonaConfig.load(config_path)
-    unavailable: list[str] = []
-    if model not in KNOWN_MODELS:
-        unavailable = [m for m, o in derived_outcomes.items() if o == "rejected"]
-        # An earlier "rejected" for this same chat id stays when the new check could not tell.
-        unavailable += [
-            m
-            for m in current.derived_unavailable
-            if current.model == model
-            and m not in unavailable
-            and (derived_outcomes.get(m) == "inconclusive" or (not derived_outcomes and m in derived_ids))
-        ]
-    updated = dc_replace(current, derived_unavailable=unavailable)
-    updated.set_model(model)  # #446: also clears a remembered unsupported value
-    updated.save(config_path)
-    model_error.switch(current.model, model, keep=candidate_tier_models(updated))
-    # Derived ids the probes could not settle are "not checked yet" (told to the user, cleared by a clean
-    # reply for that id) unless they are already shown as fallbacks. Marked AFTER switch(), which drops
-    # the old chat id's marks, so a mark set by this very Apply is never wiped by it.
-    tiers_unchecked = unchecked_tiers(
-        updated, [m for m, o in derived_outcomes.items() if o == "inconclusive"]
-    )
-    for derived_id in derived_outcomes:
-        if derived_id in tiers_unchecked:
-            model_error.note_tier_unconfirmed(derived_id)
-        else:
-            model_error.clear_tier_unconfirmed(derived_id)
-    # Mark (or clear) BEFORE the hot-swap: the provider can only produce a clean reply for the new model
-    # after the swap, and that reply clears the mark. A re-Apply of the model already saved unchecked
-    # goes through here too (switch() ignores old == new), so a passing check clears the old mark.
+            logger.info("model check for %s was inconclusive, saved unchecked: reason=%s", to_write, reason)
+        if checked:
+            # An id the probe just proved usable is no longer rejected: drop any earlier runtime record.
+            model_error.note_success(to_write)
+    old_chat = configured_job_models()[TIER_INTERACTIVE_CHAT]
+    try:
+        await asyncio.to_thread(set_job_models, {TIER_INTERACTIVE_CHAT: model})
+    except TunablesWriteError as exc:
+        return 500, {"ok": False, "error": "tunables_unwritable", "detail": str(exc)}
+    after = configured_job_models()
+    new_chat = after[TIER_INTERACTIVE_CHAT]
+    model_error.switch(old_chat, new_chat, keep=after.values())
     if checked is False:
-        model_error.note_unconfirmed(model)  # shown in /persona/state until a clean reply
+        model_error.note_unconfirmed(new_chat)  # shown in /persona/state until a clean reply
     else:
-        model_error.clear_unconfirmed(model)
-    # Hot-swap: the running bridge updates its live provider so the next chat call uses the new model
-    # without a restart (the command line runs without one).
-    if hot_swap is not None:
-        hot_swap(model)
-    body: dict[str, Any] = {"ok": True, "model": model}
+        model_error.clear_unconfirmed(new_chat)
+    body: dict[str, Any] = {"ok": True, "model": model_for_tier(TIER_INTERACTIVE_CHAT)}
     if checked is not None:
         body["checked"] = checked
-    fallbacks = tier_fallbacks(updated)
-    if fallbacks:
-        body["fallbacks"] = fallbacks
-    if tiers_unchecked:
-        body["tiers_unchecked"] = tiers_unchecked
     return 200, body
 
 
@@ -1270,13 +1105,10 @@ def build_app(
         # persona_dir. The lifespan only constructs the provider (stateless),
         # the EventBus, the supervisor thread, and the idle watcher.
         #
-        # TIER_INTERACTIVE_CHAT (#154) — routed through the model-tier accessor,
-        # but via `build_interactive_chat_provider` specifically (not the plain
-        # `build_tier_provider` every other tier uses): this is the one real
-        # call site that must keep honoring a persona's own `persona_config.json`
-        # `.model` field rather than forcing the tier's nominal model — see
-        # `brain/bridge/model_tier.py`'s docstring on that function for why.
-        provider = build_interactive_chat_provider(persona_dir)
+        # The chat job (#154) is built like every other job: the persona's provider kind, and the model its
+        # install-wide `model.interactive_chat` tunables line names, looked up on every call (nothing is
+        # held on this provider, so a settings change reaches the next turn without a restart).
+        provider = build_tier_provider(persona_dir, TIER_INTERACTIVE_CHAT)
 
         bus = EventBus()
         bus.bind_loop(asyncio.get_running_loop())
@@ -1317,6 +1149,18 @@ def build_app(
             write_defaults_section()
         except Exception as _exc:  # noqa: BLE001
             logger.warning("tunables boot rewrite skipped: %s", _exc)
+
+        # Fold a saved per-persona model into the install-wide setting (once per install; this persona's own legacy
+        # keys are cleared every start until gone). After the defaults rewrite above (a damaged tunables.json is
+        # healed first) and BEFORE the touch below, so the decision sees every persona's PREVIOUS open time.
+        # Fail-soft: model_migration never raises, and a failure leaves the saved model in place for the next start.
+        try:
+            from brain import paths as _paths
+            from brain.model_migration import migrate_persona_models
+
+            migrate_persona_models(_paths.get_home(), persona_dir)
+        except Exception as _exc:  # noqa: BLE001
+            logger.warning("model migration skipped: %s", _exc)
 
         # Touch last_opened_at so PersonaPicker can sort by recency (v0.0.18+)
         try:
@@ -1381,7 +1225,7 @@ def build_app(
                 # the tolerant reader + next cascade tick self-heal either way.
                 run_sections_migration(persona_dir)
 
-                # Migration folds with COMPACTION_MODEL (haiku), not the chat model.
+                # Migration folds with the compaction job's model, not the chat model.
                 run_backlog_migration(
                     persona_dir, provider=build_compaction_provider(persona_dir)
                 )
@@ -1510,14 +1354,6 @@ def build_app(
         if idle_shutdown_seconds is not None and idle_shutdown_seconds > 0:
             idle_task = asyncio.create_task(_idle_watcher(app.state.bridge, idle_shutdown_seconds))
 
-        # #449: re-test the saved unavailable derived model ids, off the start-up path (a background task,
-        # created just before the bridge starts serving), sharing the picker Apply's lock and probe budget.
-        recheck_task = None
-        if bg and _recheck_needed(persona_dir, provider):
-            _stamp_recheck(persona_dir)  # before the probes: a crash during them still throttles the next start
-            recheck_task = asyncio.create_task(_recheck_derived_unavailable(persona_dir, model_check_lock))
-        app.state.derived_recheck_task = recheck_task
-
         try:
             yield
         finally:
@@ -1530,16 +1366,6 @@ def build_app(
             #   5. Heartbeat close-trigger (Reflex Phase 2 growth tick anchor)
             #   6. Publish shutdown event
             #   7. Clear publisher
-
-            # 0. Cancel the derived-model re-check (a probe thread already running ends by its own timeout)
-            if recheck_task is not None:
-                recheck_task.cancel()
-                try:
-                    await recheck_task
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    logger.exception("derived model re-check raised during teardown")
 
             # 1. Cancel idle watcher
             if idle_task is not None:
@@ -2245,25 +2071,22 @@ def build_app(
 
     @app.post("/persona/config/model", dependencies=[Depends(require_http_auth)])
     async def set_persona_model(req: ModelConfigReq) -> dict:
-        """Switch the active LLM model without restarting the bridge (see ``_apply_chat_model``).
+        """Set the chat model for the whole install (see ``_apply_chat_model``).
 
-        Returns: {ok: true, model: <new_model>}  (+ ``checked: bool`` when a check was attempted)
+        The chat model is the install-wide ``model.interactive_chat`` line of the tunables file; every bridge reads it
+        on every call, so nothing is switched live. A persona on another provider (ollama, fake) is refused: its
+        picker must not change every Claude persona's line.
+
+        Returns: {ok: true, model: <the id the chat job runs now>}  (+ ``checked: bool`` when a check was attempted)
         Errors:  400 {ok: false, error: "unknown_model", valid: [...]}
                  400 {ok: false, error: "model_unavailable", model: <id>}
+                 400 {ok: false, error: "model_not_applicable"}
+                 500 {ok: false, error: "tunables_unwritable", detail}
         """
         s: BridgeAppState = app.state.bridge
-
-        def _hot_swap(new_model: str) -> None:
-            if hasattr(s.provider, "_model"):
-                s.provider._model = new_model
-
-        status, result = await _apply_chat_model(
-            s.persona_dir,
-            req.model,
-            check=isinstance(s.provider, ClaudeCliProvider),
-            lock=model_check_lock,
-            hot_swap=_hot_swap,
-        )
+        if not isinstance(s.provider, ClaudeCliProvider):
+            return JSONResponse(status_code=400, content={"ok": False, "error": "model_not_applicable"})
+        status, result = await _apply_chat_model(req.model, check=True, lock=model_check_lock)
         if status != 200:
             return JSONResponse(status_code=status, content=result)
         return result

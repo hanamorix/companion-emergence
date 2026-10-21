@@ -61,17 +61,11 @@ _DAILY_ARTICULATE_BUDGET: int = 50   # Haiku calls / persona / day
 _BUDGET_FILE = "daily_articulate_budget.json"
 _ARTICULATE_ERRORS_FILE = "self_model_articulate_errors.jsonl"
 
-# The self-model tick's articulate note is cheap housekeeping — one short
-# sentence, not a chat reply — so it must not inherit the (larger, costlier)
-# persona chat model. Mirrors brain/chat/compaction.py's COMPACTION_MODEL /
-# build_compaction_provider: change this one string to swap the model; the
-# future model-agnostic refactor replaces the whole seam.
-SELF_MODEL_MODEL: str = "haiku"
-
-
 def build_self_model_provider(persona_dir: Path) -> Any:
     """The provider self-model articulation should use — the persona's
-    provider *kind* but forced to SELF_MODEL_MODEL. For a ``fake`` persona
+    provider *kind*, running the model of the self-model-articulate job (its own
+    line in the tunables; a small cheap model by default, because the articulate
+    note is cheap housekeeping, one short sentence, not a chat reply). For a ``fake`` persona
     (tests) this resolves to a FakeProvider, so no real CLI is shelled.
     Call site: brain/bridge/supervisor.py's self-model cadence block, which
     passes the result into ``_run_self_model_tick`` in place of the persona
@@ -79,9 +73,7 @@ def build_self_model_provider(persona_dir: Path) -> Any:
     that tick is this module's ``articulate()``, so scoping the whole tick to
     this provider is safe.
 
-    Thin wrapper over the centralized model-tier accessor (#154) —
-    ``TIER_SELF_MODEL_ARTICULATE``'s model is ``SELF_MODEL_MODEL`` ("haiku"),
-    so this is a routing-only change with no model-value difference."""
+    Thin wrapper over the centralized model-tier accessor (#154)."""
     from brain.bridge.model_tier import TIER_SELF_MODEL_ARTICULATE, build_tier_provider
 
     return build_tier_provider(persona_dir, TIER_SELF_MODEL_ARTICULATE)
@@ -90,13 +82,10 @@ def build_self_model_provider(persona_dir: Path) -> Any:
 def _provider_model_label(provider: Any) -> str:
     """Best-effort ACTUAL model label for the usage log.
 
-    Prefers the provider's own recorded model (``ClaudeCliProvider`` and
-    ``OllamaProvider`` both set ``._model`` from the ``model_override`` passed
-    to ``get_provider``), so the label reflects what really ran. Falls back to
-    SELF_MODEL_MODEL — the constant ``build_self_model_provider`` forces every
-    real call site to use — for providers with no such attribute (e.g.
-    ``FakeProvider`` in tests). Either way this can no longer drift from the
-    model that was actually invoked.
+    Prefers the provider's own live model (``ClaudeCliProvider`` looks it up
+    from the tunables, ``OllamaProvider`` holds its own), so the label reflects
+    what really ran. Falls back to the self-model-articulate job's model for
+    providers with neither (e.g. ``FakeProvider`` in tests).
 
     Thin wrapper over the centralized ``model_label_for_provider`` (#154) —
     kept as a named, module-local function (rather than inlined at the one

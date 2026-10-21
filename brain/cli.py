@@ -14,7 +14,6 @@ import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Any
 
 from brain import __version__, prompt_strings
 from brain.bridge import state_file
@@ -2326,22 +2325,26 @@ def _prompt_choice(label: str, choices: list[str], default: str, help: str = "")
         print(f"  (must be one of: {', '.join(choices)})", file=sys.stderr)
 
 
-def _prompt_model(default: str, help: str = "") -> str:
-    """Interactive model prompt: an alias or a full model id; loops until valid (EOF gives the default)."""
-    from brain.persona_config import MODEL_ID_RULE, is_valid_model
+def _prompt_model(current: str, help: str = "") -> str:
+    """Interactive model prompt: a word or a full model id; loops until valid.
+
+    Blank (or EOF) returns "": the model setting is left as it is. ``current`` is the id the chat job runs now,
+    shown so the user knows what blank keeps.
+    """
+    from brain.bridge.model_tier import MODEL_ID_RULE, is_valid_model
 
     while True:
         if help:
             print(help)
-        raw = _prompt("model [sonnet/opus/haiku or a full id]", default=default)
-        if is_valid_model(raw):
+        raw = _prompt(f"model [sonnet/opus/haiku or a full id; blank keeps {current}]")
+        if not raw or is_valid_model(raw):
             return raw
         print(f"  ({MODEL_ID_RULE})", file=sys.stderr)
 
 
 def _model_arg(value: str) -> str:
-    """argparse type for --model: an alias or a full model id (syntax only, no Claude CLI call)."""
-    from brain.persona_config import MODEL_ID_RULE, is_valid_model
+    """argparse type for --model: a word or a full model id (syntax only, no Claude CLI call)."""
+    from brain.bridge.model_tier import MODEL_ID_RULE, is_valid_model
 
     if not is_valid_model(value):
         raise argparse.ArgumentTypeError(f"{value!r} is not a valid model: {MODEL_ID_RULE}")
@@ -2386,6 +2389,7 @@ def _init_handler(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    _run_model_migration()  # a saved per-persona model moves into the install-wide setting before anything changes it
 
     if user_name is None:  # explicit empty string allowed (means "leave unset")
         user_name = (
@@ -2417,16 +2421,17 @@ def _init_handler(args: argparse.Namespace) -> int:
         return 1
 
     if model is None:
-        from brain.persona_config import DEFAULT_MODEL
+        from brain.bridge.model_tier import TIER_INTERACTIVE_CHAT, model_for_tier
 
         print()
         model = _prompt_model(
-            default=DEFAULT_MODEL,
+            current=model_for_tier(TIER_INTERACTIVE_CHAT),
             help=(
                 "  sonnet — fast, smart, ~$3 per million input tokens (recommended)\n"
                 "  opus   — smartest, ~$15 per million input tokens (best for deep writing)\n"
                 "  haiku  — fastest, cheapest, less capable\n"
-                "  or a full model id such as claude-sonnet-5 (checked when first used)"
+                "  or a full model id (a full id starts with claude-; it is checked when first used)\n"
+                "  This setting is shared by every persona on this install."
             ),
         )
 
@@ -2473,9 +2478,7 @@ def _init_handler(args: argparse.Namespace) -> int:
 
     # ----- always: write persona_config + voice.md -----
     persona_dir.mkdir(parents=True, exist_ok=True)
-    config_path = write_persona_config(
-        persona_dir, user_name=user_name, user_pronouns=user_pronouns, model=model
-    )
+    config_path = write_persona_config(persona_dir, user_name=user_name, user_pronouns=user_pronouns)
     voice_path = install_voice_template(persona_dir, voice_template)
 
     from brain import app_config as _app_config
@@ -2486,14 +2489,10 @@ def _init_handler(args: argparse.Namespace) -> int:
     # GitHub Actions Windows caught this: a leading "✓" raised
     # UnicodeEncodeError during bundled `nell init` smoke.
     print(f"OK persona '{persona}' ready at {persona_dir}")
-    print(
-        f"  - {config_path.name}: user_name={user_name!r}, "
-        f"user_pronouns={user_pronouns!r}, model={model!r}"
-    )
-    from brain.persona_config import KNOWN_MODELS as _ALIASES
-
-    if model not in _ALIASES:
-        print(f"  - model {model} will be checked when first used")
+    print(f"  - {config_path.name}: user_name={user_name!r}, user_pronouns={user_pronouns!r}")
+    model_saved = True
+    if model:
+        model_saved = _init_save_model(model)
     if voice_path is not None:
         print(f"  - {voice_path.name}: copied from '{voice_template}' template")
         if voice_template == "nell-example":
@@ -2506,222 +2505,150 @@ def _init_handler(args: argparse.Namespace) -> int:
         print(f"  - migrated from {migrate_from}")
     print()
     print(f"next: uv run nell chat --persona {persona}")
-    return 0
+    return 0 if model_saved else 1
 
 
-def _model_cfg_path(persona: str) -> Path | None:
-    """The persona's config path, or None (after printing the error) when the persona does not exist."""
-    persona_dir = get_persona_dir(persona)
-    if not persona_dir.is_dir():
-        print(f"error: persona '{persona}' not found (see: nell personas)", file=sys.stderr)
-        return None
-    return persona_dir / "persona_config.json"
+def _init_save_model(model: str) -> bool:
+    """`nell init --model`: write the install-wide chat model setting (no Claude call, so a full id is checked when
+    first used). A word follows the one write rule; a full id is always written exactly as given. False after
+    printing why when the settings file could not be changed."""
+    from brain.bridge.model_tier import TIER_INTERACTIVE_CHAT, model_for_tier, set_job_models
+    from brain.tunables import TunablesWriteError
+
+    try:
+        set_job_models({TIER_INTERACTIVE_CHAT: model})
+    except TunablesWriteError as exc:
+        print(f"error: the model setting could not be saved: {exc}", file=sys.stderr)
+        return False
+    print(f"  - chat model for this install: {model_for_tier(TIER_INTERACTIVE_CHAT)} (shared by every persona)")
+    return True
+
+
+def _model_tier_arg(value: str) -> str:
+    """argparse type for a job name: the job's name with dashes or underscores (``background-generative``)."""
+    from brain.bridge.model_tier import CLAUDE_TIERS
+
+    name = value.replace("_", "-")
+    if name not in CLAUDE_TIERS:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a job: choose one of {', '.join(CLAUDE_TIERS)}")
+    return name
 
 
 def _model_show_handler(args: argparse.Namespace) -> int:
-    from brain.bridge.model_tier import ROUTED_CLAUDE_TIERS, _resolve
-    from brain.persona_config import PersonaConfig
+    """Read-only: the model each job is configured with, whether that is the shipped default or the user's setting."""
+    from brain.bridge.model_tier import (
+        CLAUDE_TIERS,
+        configured_job_models,
+        has_override,
+        model_for_tier,
+        override_text,
+        shipped_default,
+    )
 
-    path = _model_cfg_path(args.persona)
-    if path is None:
-        return 1
-    cfg = PersonaConfig.load(path)
-    print(f"chat model: {cfg.model}")
-    if cfg.provider == "claude-cli" and cfg.model_unsupported is not None:
-        print(
-            f"warning: the model {cfg.model_unsupported_display()!r} in this persona's settings is not supported, "
-            f"so {cfg.model} is being used instead (supported: sonnet, opus, haiku or a full id such as claude-sonnet-5)"
-        )
-    print("background models (tier: model (source)):")
-    for tier in ROUTED_CLAUDE_TIERS:
-        model, source = _resolve(cfg, tier)
-        print(f"  {tier}: {model} ({source})")
+    configured = configured_job_models()
+    print("models by job (job: model, shipped default or your setting); one setting for every persona on this install:")
+    for tier in CLAUDE_TIERS:
+        default = shipped_default(tier)
+        source = "your setting" if has_override(tier) and configured[tier] != default else "shipped default"
+        line = f"  {tier}: {configured[tier]} ({source})"
+        running = model_for_tier(tier)
+        if running != configured[tier]:
+            line += f"; running {running} now, because Claude rejected {configured[tier]}"
+        print(line)
+        invalid = override_text(tier)
+        if invalid is not None:
+            print(
+                f"warning: the setting {invalid!r} for {tier} in tunables.json is not a usable model, so "
+                f"{default} is used instead"
+            )
     print("this shows the saved settings; runtime fallbacks appear in the app (connection panel)")
-    if cfg.derived_unavailable:
+    from brain.model_migration import pending_legacy
+
+    if pending_legacy():
         print(
-            "note: "
-            + ", ".join(cfg.derived_unavailable)
-            + " was not available when the chat model was last saved; it is tested again when the bridge "
-            "starts and when the chat model is applied again (in the picker or with `nell model set`)"
+            "note: a persona still holds a model from before this setting was shared; it is moved into the "
+            "shared setting the next time `nell model set`, `set-tier`, `clear-tier` or `init` runs, or a bridge starts"
         )
     return 0
+
+
+def _run_model_migration() -> None:
+    """Fold a persona's saved model into the install-wide setting before a write command changes it (once)."""
+    from brain.model_migration import migrate_persona_models
+    from brain.paths import get_home
+
+    migrate_persona_models(get_home(), None)
+
+
+def _model_write(updates: dict[str, str | None]) -> dict[str, str | None] | None:
+    """Run the migration, then ``set_job_models``. None (after printing why, exit non-zero) when the file cannot be
+    changed."""
+    from brain.bridge.model_tier import set_job_models
+    from brain.tunables import TunablesWriteError
+
+    _run_model_migration()
+    try:
+        return set_job_models(updates)
+    except TunablesWriteError as exc:
+        from brain import tunables
+
+        print(f"error: the model setting could not be saved: {exc} (file: {tunables._file_path()})", file=sys.stderr)
+        return None
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return None
 
 
 def _model_set_tier_handler(args: argparse.Namespace) -> int:
     """Syntax-only: no Claude CLI call. A model Claude rejects shows up in the bridge log and in the app."""
-    from brain.persona_config import MODEL_ID_RULE, PersonaConfig, is_valid_model
+    from brain.bridge.model_tier import (
+        MODEL_ID_RULE,
+        is_valid_model,
+        model_for_tier,
+        shipped_default,
+    )
 
     if not is_valid_model(args.model):
         print(f"error: {args.model!r} is not a valid model: {MODEL_ID_RULE}", file=sys.stderr)
         return 1
-    path = _model_cfg_path(args.persona)
-    if path is None:
+    if _model_write({args.tier: args.model}) is None:
         return 1
-    cfg = PersonaConfig.load(path)  # read right before the write: the bridge may have saved meanwhile
-    cfg.tier_models = {**cfg.tier_models, args.tier: args.model}
-    cfg.save(path)
-    print(f"{args.tier} now uses {args.model} (checked when first used)")
+    running = model_for_tier(args.tier)
+    suffix = "following the shipped default" if running == shipped_default(args.tier) else "checked when first used"
+    print(f"{args.tier} now uses {running} ({suffix})")
     return 0
-
-
-class _BridgeStartedMidCommandError(Exception):
-    """A bridge for the persona started while `nell model set` was checking the model."""
-
-
-def _bridge_running(persona_dir: Path) -> Any:
-    """The persona's bridge state when its bridge is running (a state file with a live pid and a port), else None."""
-    state = state_file.read(persona_dir)
-    if state and state.pid and state.port and state_file.pid_is_alive(state.pid):
-        return state
-    return None
 
 
 def _model_set_handler(args: argparse.Namespace) -> int:
     """`nell model set <model>`: set the chat model with the picker's rules and the picker's save-time check.
 
-    An alias or a full ``claude-`` id (64 cap). With the persona's bridge running the request goes to the picker's
-    own settings endpoint (live hot swap, the same single-flight lock); otherwise the check runs here and the
-    config is written (``brain.bridge.server._apply_chat_model`` is the one implementation of both). If a bridge
-    starts while the check runs, nothing is written behind it.
+    A word (sonnet, opus, haiku) or a full ``claude-`` id (64 cap). The setting is install-wide: it is written to
+    the tunables file directly (no bridge round trip: every bridge reads the file on every call), after the same
+    one-call check the picker runs on a newly chosen id (``brain.bridge.server._apply_chat_model`` is the one
+    implementation of both).
     """
-    from brain.persona_config import MODEL_ID_RULE, is_valid_model
+    import asyncio
+
+    from brain.bridge import server as server_mod
+    from brain.bridge.model_tier import MODEL_ID_RULE, is_valid_model
 
     if not is_valid_model(args.model):
         print(f"error: {args.model!r} is not a valid model: {MODEL_ID_RULE}", file=sys.stderr)
         return 1
-    path = _model_cfg_path(args.persona)
-    if path is None:
-        return 1
-    persona_dir = path.parent
-    state = _bridge_running(persona_dir)
-    if state is not None:
-        outcome = _model_set_via_bridge(state, args.model, persona_dir.name)
-        if outcome is None:
-            return 1
-    else:
-        try:
-            outcome = _model_set_direct(persona_dir, args.model)
-        except _BridgeStartedMidCommandError:
-            print(
-                "error: the persona's bridge started while the model was being checked, so nothing was written. "
-                "Run the command again and it will go through the bridge.",
-                file=sys.stderr,
-            )
-            return 1
-    return _model_set_report(args.model, outcome[0], outcome[1], via_bridge=state is not None)
+    _run_model_migration()
+    status, body = asyncio.run(server_mod._apply_chat_model(args.model, check=True, lock=asyncio.Lock()))
+    return _model_set_report(args.model, status, body)
 
 
-def _model_set_direct(persona_dir: Path, model: str) -> tuple[int, dict]:
-    """No bridge running: run the check here (claude-cli personas only) and write the config."""
-    import asyncio
+def _model_set_report(model: str, status: int, body: dict) -> int:
+    from brain.bridge.model_tier import (
+        KNOWN_MODELS,
+        MODEL_ID_RULE,
+        TIER_INTERACTIVE_CHAT,
+        resolve_choice,
+        shipped_default,
+    )
 
-    from brain.bridge import server as server_mod
-
-    check = PersonaConfig.load(persona_dir / "persona_config.json").provider == "claude-cli"
-
-    def _no_bridge_now() -> None:
-        if _bridge_running(persona_dir) is not None:
-            raise _BridgeStartedMidCommandError
-
-    async def _go() -> tuple[int, dict]:
-        return await server_mod._apply_chat_model(
-            persona_dir, model, check=check, lock=asyncio.Lock(), hot_swap=None, before_write=_no_bridge_now
-        )
-
-    return asyncio.run(_go())
-
-
-def _bridge_text(value: Any, limit: int = 200) -> str:
-    """Text that came from the bridge, made safe to print: newlines and tabs become a space, other control
-    characters (escape sequences, bells) are removed, cut at ``limit`` characters."""
-    return "".join(" " if ch in "\n\r\t" else ch for ch in str(value) if ch.isprintable() or ch in "\n\r\t")[:limit]
-
-
-# The most of a bridge answer the command will read: its real answers are a few hundred bytes.
-_BRIDGE_ANSWER_MAX_BYTES = 65536
-
-
-def _model_set_via_bridge(state: Any, model: str, persona: str) -> tuple[int, Any] | None:
-    """Bridge running: POST to the picker's settings endpoint. None (after printing why) if it gave no usable answer.
-
-    ONE connection: ``connect()`` is called on its own first. A failure there means nothing was sent ("could not
-    reach the bridge"). Once it has returned, any failure in ``request()``, ``getresponse()`` or the read happens
-    when the bridge may already have the request, so the outcome is unknown. Decided by that phase, not by any
-    error number (they differ between Linux, macOS and Windows).
-    """
-    import http.client
-
-    from brain.bridge import server as server_mod
-
-    headers = {"Content-Type": "application/json"}
-    if state.auth_token:
-        headers["Authorization"] = f"Bearer {state.auth_token}"
-    payload = json.dumps({"model": model}).encode("utf-8")  # json-io: ok -- HTTP request body to the bridge
-    # The endpoint keeps itself inside one check budget (a wait for the lock counts against it); twice that is the margin.
-    wait_s = server_mod._check_budget_s() * 2
-    conn = http.client.HTTPConnection("127.0.0.1", state.port, timeout=wait_s)
-    try:
-        try:
-            conn.connect()
-        except OSError as exc:  # also a refused connection, an unresolvable name, a connect timeout
-            print(
-                f"error: could not reach the bridge on port {state.port}: {_bridge_text(exc)}. The bridge may "
-                f"still be starting: try again in a few seconds, or stop it with `nell supervisor stop --persona {persona}`.",
-                file=sys.stderr,
-            )
-            return None
-        try:
-            conn.request("POST", "/persona/config/model", body=payload, headers=headers)
-            resp = conn.getresponse()
-            status = resp.status
-            if status == 200:
-                raw = resp.read(_BRIDGE_ANSWER_MAX_BYTES)
-            else:
-                try:
-                    raw = resp.read(_BRIDGE_ANSWER_MAX_BYTES)
-                except (OSError, ValueError, http.client.HTTPException):
-                    raw = b""  # the status alone is still worth reporting
-        except TimeoutError:
-            print(
-                f"error: no answer from the bridge within {wait_s:.0f} s, so the outcome is unknown: the bridge may "
-                "still apply the change. Check with `nell model show`.",
-                file=sys.stderr,
-            )
-            return None
-        except http.client.HTTPException as exc:
-            # The bridge's port answered something that is not a usable HTTP answer (or cut it short).
-            print(
-                f"error: did not understand the bridge's answer ({_bridge_text(type(exc).__name__)}), so the outcome "
-                "is unknown: the bridge may still apply the change. Check with `nell model show`.",
-                file=sys.stderr,
-            )
-            return None
-        except OSError as exc:
-            print(
-                f"error: the connection to the bridge broke ({_bridge_text(exc)}), so the outcome is unknown: the "
-                "bridge may still apply the change. Check with `nell model show`.",
-                file=sys.stderr,
-            )
-            return None
-    finally:
-        conn.close()
-    text = raw.decode("utf-8", errors="replace")
-    try:
-        return status, json.loads(text)  # json-io: ok -- HTTP response body from the bridge
-    except ValueError:
-        return status, {"detail": text if status != 200 else "the answer was not JSON"}
-
-
-def _model_set_report(model: str, status: int, body: Any, *, via_bridge: bool) -> int:
-    from brain.persona_config import MODEL_ID_RULE
-
-    if status == 200 and not (isinstance(body, dict) and body.get("ok") is True):
-        # The endpoint's success body always carries ok: true. Anything else is not this bridge's answer.
-        detail = body.get("detail", body) if isinstance(body, dict) else body
-        print(f"error: the bridge answered 200 with an unexpected body: {_bridge_text(detail)}", file=sys.stderr)
-        return 1
-    if not isinstance(body, dict):
-        body = {"detail": body}
     if status != 200:
         if status == 400 and body.get("error") == "model_unavailable":
             print(
@@ -2732,54 +2659,34 @@ def _model_set_report(model: str, status: int, body: Any, *, via_bridge: bool) -
         elif status == 400 and body.get("error") == "unknown_model":
             print(f"error: {model!r} is not a valid model: {MODEL_ID_RULE}", file=sys.stderr)
         else:
+            from brain import tunables
+
             detail = body.get("detail", body.get("error", body))
-            print(f"error: the bridge answered {status}: {_bridge_text(detail)}", file=sys.stderr)
+            print(f"error: the model setting could not be saved: {detail} (file: {tunables._file_path()})", file=sys.stderr)
         return 1
-    checked = body.get("checked")
-    if checked is False:
+    effective = body.get("model")
+    following = model in KNOWN_MODELS and resolve_choice(model) == shipped_default(TIER_INTERACTIVE_CHAT)
+    if body.get("checked") is False:
         print(
-            f"chat model is now {model}. Couldn't check it right now, so it was saved unchecked; "
+            f"chat model is now {effective}. Couldn't check it right now, so it was saved unchecked; "
             "any problem will show in the app and the bridge log."
         )
-    elif checked is True:
-        print(f"chat model is now {model} (checked with Claude).")
+    elif body.get("checked") is True:
+        print(f"chat model is now {effective} (checked with Claude).")
+    elif following:
+        print(f"chat model is now {effective}, following the shipped default.")
     else:
-        print(f"chat model is now {model}.")
-    fallbacks = body.get("fallbacks")
-    for f in fallbacks if isinstance(fallbacks, list) else []:
-        if not isinstance(f, dict):
-            continue
-        print(
-            f'background jobs that use the {_bridge_text(f.get("family"))} family are using '
-            f'"{_bridge_text(f.get("using"))}", because "{_bridge_text(f.get("wanted"))}" '
-            "could not be used (it may not exist, or your account may not have access to it)."
-        )
-    unchecked = body.get("tiers_unchecked")
-    if isinstance(unchecked, list) and unchecked:
-        print(
-            "some background models were not checked yet ("
-            + ", ".join(_bridge_text(m) for m in unchecked)
-            + "); they are checked when first used."
-        )
-    print(
-        "the running bridge switched to it now."
-        if via_bridge
-        else "no bridge is running for this persona; it uses the new model when it starts."
-    )
+        print(f"chat model is now {effective}.")
+    print("this is the setting for every persona on this install; running bridges use it from their next call.")
     return 0
 
 
 def _model_clear_tier_handler(args: argparse.Namespace) -> int:
-    from brain.persona_config import PersonaConfig
+    from brain.bridge.model_tier import model_for_tier
 
-    path = _model_cfg_path(args.persona)
-    if path is None:
+    if _model_write({args.tier: None}) is None:
         return 1
-    cfg = PersonaConfig.load(path)
-    if args.tier in cfg.tier_models:
-        cfg.tier_models = {k: v for k, v in cfg.tier_models.items() if k != args.tier}
-        cfg.save(path)
-    print(f"{args.tier} follows the chat model again")
+    print(f"{args.tier} uses its shipped default again ({model_for_tier(args.tier)})")
     return 0
 
 
@@ -2849,9 +2756,9 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         type=_model_arg,
         help=(
-            "Claude model to use: sonnet, opus, haiku or a full model id such as claude-sonnet-5. "
-            "A full id is not checked now; it is checked when first used. Default: sonnet. "
-            "Prompts if omitted and running interactively."
+            "Claude model for the chat (a setting shared by every persona on this install): sonnet, opus, haiku "
+            "or a full model id that starts with claude-. A full id is not checked now; it is checked when first "
+            "used. Omitted or blank keeps the current setting. Prompts if omitted and running interactively."
         ),
     )
     init_sub.add_argument(
@@ -3666,41 +3573,35 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     personas_sub.set_defaults(func=_personas_handler)
 
-    # nell model — which models the background jobs use (#441)
-    from brain.persona_config import ROUTED_TIER_NAMES
-
+    # nell model: which model each job runs (one install-wide setting per job, in the tunables file)
     model_sub = subparsers.add_parser(
         "model",
-        help="Show or set the models the background jobs use (they follow the chat model's version by default).",
+        help="Show or set the model each job runs (one setting for every persona on this install).",
     )
     model_actions = model_sub.add_subparsers(dest="model_action", required=True)
 
-    m_show = model_actions.add_parser("show", help="Show the chat model and each background tier's model.")
-    m_show.add_argument("--persona", default=None, help="Persona name (defaults to the only installed one).")
+    m_show = model_actions.add_parser("show", help="Show the model each job is configured with.")
     m_show.set_defaults(func=_model_show_handler)
 
     m_set = model_actions.add_parser(
         "set-tier",
-        help="Pin one background tier to a model (an alias or a full id such as claude-haiku-4-5).",
+        help="Set one job's model (sonnet, opus, haiku or a full id that starts with claude-).",
     )
-    m_set.add_argument("tier", choices=list(ROUTED_TIER_NAMES))
+    m_set.add_argument("tier", type=_model_tier_arg, help="The job, for example background-generative.")
     m_set.add_argument("model")
-    m_set.add_argument("--persona", default=None, help="Persona name (defaults to the only installed one).")
     m_set.set_defaults(func=_model_set_tier_handler)
 
     m_chat = model_actions.add_parser(
         "set",
-        help="Set the chat model (sonnet, opus, haiku or a full id such as claude-sonnet-5), checked like the picker does.",
+        help="Set the chat model (sonnet, opus, haiku or a full id that starts with claude-), checked like the picker does.",
     )
     m_chat.add_argument("model")
-    m_chat.add_argument("--persona", default=None, help="Persona name (defaults to the only installed one).")
     m_chat.set_defaults(func=_model_set_handler)
 
     m_clear = model_actions.add_parser(
-        "clear-tier", help="Remove a tier's pinned model so it follows the chat model again."
+        "clear-tier", help="Remove a job's setting so it uses its shipped default again."
     )
-    m_clear.add_argument("tier", choices=list(ROUTED_TIER_NAMES))
-    m_clear.add_argument("--persona", default=None, help="Persona name (defaults to the only installed one).")
+    m_clear.add_argument("tier", type=_model_tier_arg, help="The job, for example interactive-chat.")
     m_clear.set_defaults(func=_model_clear_tier_handler)
 
     # nell kindled — Kindled-link identity management (Task 7)

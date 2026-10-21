@@ -355,7 +355,7 @@ def run_replay(
     usage_offset = _file_size(usage_path)
     debug_offset = _file_size(debug_path)
 
-    provider = get_provider(provider_name, persona_dir=persona_dir)
+    provider = get_provider(provider_name)
     if force_text_path:
         provider = _TextPathProvider(provider)  # route every turn through the logging text path
     store = MemoryStore(persona_dir / "memories.db")

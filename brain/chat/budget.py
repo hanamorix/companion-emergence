@@ -88,7 +88,7 @@ def apply_budget(
             emergency_fold_24h(
                 persona_dir,
                 session_id,
-                # Compaction always folds with COMPACTION_MODEL, not the chat model.
+                # Compaction always folds with the compaction job's model, not the chat model.
                 provider=build_compaction_provider(persona_dir),
                 min_keep_tail=preserve_tail_msgs,
             )

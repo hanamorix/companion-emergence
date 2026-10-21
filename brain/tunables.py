@@ -97,6 +97,17 @@ def get_tunable(key: str, default: Any) -> Any:
     return value
 
 
+def get_override(key: str) -> Any:
+    """The raw override for *key* exactly as the file holds it (any type), or None when there is none.
+
+    No type guard and no default: for a caller that must tell the user what text is in the file (a model setting that
+    fails its grammar). A JSON null counts as no override, as it does for ``set_overrides``.
+    """
+    with _lock:
+        overrides = _load_overrides_locked()
+    return overrides.get(key)
+
+
 def _type_ok(default: Any, value: Any) -> bool:
     # bool is an int subclass — check it first and strictly, both directions.
     if isinstance(default, bool):

@@ -49,6 +49,7 @@ from brain.bridge.chat import (
     TextDelta,
     ToolCall,
 )
+from brain.bridge.model_tier import TIER_INTERACTIVE_CHAT, model_for_tier
 from brain.bridge.usage_log import log_usage
 from brain.utils.time import format_local, parse_iso_utc
 
@@ -812,8 +813,8 @@ _ERROR_CODE_SHAPE = re.compile(r"[a-z_]{1,40}")
 def _argv_model(cmd: list[str]) -> str | None:
     """The model the subprocess was actually run with: the value after ``--model`` in its argv (#448).
 
-    Read from the argv, never from ``self._model``: the picker can hot-swap ``_model`` while a call runs, and
-    the rejection must name the model that was rejected.
+    Read from the argv, never looked up again: a settings change can land while a call runs, and the rejection
+    must name the model that was rejected.
     """
     try:
         return cmd[cmd.index("--model") + 1]
@@ -864,7 +865,7 @@ def _failure_tokens(status: object, error_code: str | None) -> str:
 
 def _with_model_token(detail: str, model: str | None) -> str:
     """``model=<id>; `` in front of a detail classified as a model rejection: the id that was executed."""
-    from brain.persona_config import is_valid_model
+    from brain.bridge.model_tier import is_valid_model
 
     if model and is_valid_model(model) and model_error.is_model_rejection(detail):
         return f"model={model}; {detail}"
@@ -1021,11 +1022,21 @@ class ClaudeCliProvider(LLMProvider):
 
     def __init__(
         self,
-        model: str = "sonnet",
+        tier: str = TIER_INTERACTIVE_CHAT,
+        *,
+        probe_model: str | None = None,
         timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
-        self._model = model
+        """``tier`` is the JOB this provider does (a name from ``brain.bridge.model_tier``, not a model id): the
+        model is looked up from the user's tunables at every call, so a settings change reaches a provider that is
+        already built. ``probe_model`` pins one id for the save-time probe of a newly chosen model only."""
+        self._tier = tier
+        self._probe_model = probe_model
         self._timeout = timeout_seconds
+
+    def _cli_model(self) -> str:
+        """The id passed to ``claude --model`` for the next call: the probe's pin, else the job's model right now."""
+        return self._probe_model if self._probe_model is not None else model_for_tier(self._tier)
 
     def generate(
         self,
@@ -1042,6 +1053,7 @@ class ClaudeCliProvider(LLMProvider):
         # Prompt piped via stdin; system prompt via --system-prompt-file.
         # Keeps both heavy payloads off argv (Windows CreateProcess 32,767-char
         # limit — WinError 206). See _system_prompt_tempfile for context.
+        model = self._cli_model()
         cmd = [
             "claude",
             "-p",
@@ -1049,7 +1061,7 @@ class ClaudeCliProvider(LLMProvider):
             "--output-format",
             "json",
             "--model",
-            self._model,
+            model,
         ]
         _apply_lean_flags(cmd)  # #329: background calls get no tools at all
         with _system_prompt_tempfile(system) as sp_path:
@@ -1085,7 +1097,7 @@ class ClaudeCliProvider(LLMProvider):
             payload = json.loads(result.stdout)
             if not isinstance(payload, dict):
                 raise ValueError("not a result object")
-            log_usage(persona_dir, call_type="generate", model=self._model, frame=payload)
+            log_usage(persona_dir, call_type="generate", model=model, frame=payload)
             # #119: the CLI can exit 0 and report the failure inside the frame,
             # so the returncode guard above never sees it. Without this the error
             # string was returned as the generation itself — and this is the
@@ -1112,6 +1124,7 @@ class ClaudeCliProvider(LLMProvider):
         """
         if provider_auth.should_skip_background():
             raise provider_auth.ProviderAuthDeferred("provider auth expired — deferred")
+        model = self._cli_model()
         cmd = [
             "claude",
             "-p",
@@ -1120,7 +1133,7 @@ class ClaudeCliProvider(LLMProvider):
             "stream-json",
             "--verbose",
             "--model",
-            self._model,
+            model,
         ]
         _apply_lean_flags(cmd)  # #329: no tools at all
         result, payload = self._run_blocking_cli(cmd, prompt, {})
@@ -1135,7 +1148,7 @@ class ClaudeCliProvider(LLMProvider):
         return _text_only(payload.get("result"))  # #467: a null or non-string result is not text
 
     def name(self) -> str:
-        return f"claude-cli:{self._model}"
+        return f"claude-cli:{self._cli_model()}"
 
     def chat(
         self,
@@ -1229,8 +1242,9 @@ class ClaudeCliProvider(LLMProvider):
         ]
         if audit_dir:
             cmd.append("--verbose")
-        cmd.extend(["--model", self._model])
-        cmd.extend(["--max-budget-usd", str(_MAX_TURN_BUDGET_USD(self._model))])
+        model = self._cli_model()
+        cmd.extend(["--model", model])
+        cmd.extend(["--max-budget-usd", str(_MAX_TURN_BUDGET_USD(model))])
         _apply_lean_flags(cmd, builtins=_CHAT_BUILTIN_TOOLS)
         builtin_calls: dict[str, dict[str, Any]] = {}
         try:
@@ -1249,7 +1263,7 @@ class ClaudeCliProvider(LLMProvider):
                         f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}" if partial else _BUDGET_EXCEEDED_MSG
                     )
                     # #399: the over-budget turn is the costliest one; log it as the streaming path does.
-                    log_usage(audit_dir, call_type="chat", model=self._model, frame=payload)
+                    log_usage(audit_dir, call_type="chat", model=model, frame=payload)
                     return ChatResponse(content=text, tool_calls=(), raw=payload)
                 cli_err = _cli_error_detail(payload, model=_argv_model(cmd), stdout=result.stdout)
                 if cli_err is not None:
@@ -1265,7 +1279,7 @@ class ClaudeCliProvider(LLMProvider):
             log_usage(
                 audit_dir,
                 call_type="chat",
-                model=self._model,
+                model=model,
                 frame=payload,
             )
 
@@ -1324,6 +1338,7 @@ class ClaudeCliProvider(LLMProvider):
             options, call_type="chat_stream", system_prompt=system_prompt, volatile_suffix=volatile_suffix
         )
 
+        model = self._cli_model()
         cmd = [
             "claude",
             "-p",
@@ -1332,9 +1347,9 @@ class ClaudeCliProvider(LLMProvider):
             "stream-json",
             "--verbose",
             "--model",
-            self._model,
+            model,
         ]
-        cmd.extend(["--max-budget-usd", str(_MAX_TURN_BUDGET_USD(self._model))])
+        cmd.extend(["--max-budget-usd", str(_MAX_TURN_BUDGET_USD(model))])
 
         # MCP tools path — write a temp config and extend argv.
         tmp_mcp_path: str | None = None
@@ -1410,7 +1425,7 @@ class ClaudeCliProvider(LLMProvider):
         system_prompt: str | None,
         persona_dir: Path | None = None,
     ) -> Iterator[ChatStreamEvent]:
-        """Core Popen + queue-based streaming loop.
+        """Core Popen + queue-based streaming loop. The usage log names the model ``cmd`` was built with.
 
         Separated from chat_stream() so the generator's finally-block can
         clean up the MCP tempfile after the inner generator is exhausted
@@ -1578,7 +1593,7 @@ class ClaudeCliProvider(LLMProvider):
                             for k in ("duration_ms", "num_turns", "stop_reason", "is_error")
                             if k in obj
                         }
-                        log_usage(persona_dir, call_type="chat", model=self._model, frame=obj)
+                        log_usage(persona_dir, call_type="chat", model=_argv_model(cmd) or "", frame=obj)
                         # Over-budget catastrophe backstop: the CLI hit --max-budget-usd.
                         # Flush any partial text already streamed + append the cut-off note.
                         if _is_over_budget_frame(obj):
@@ -1789,6 +1804,7 @@ class ClaudeCliProvider(LLMProvider):
             # even after a long session has grown voice.md + buffer into the
             # tens of KB. This is the exact code path that surfaced WinError
             # 206 in the field.
+            model = self._cli_model()
             cmd = [
                 "claude",
                 "-p",
@@ -1797,12 +1813,12 @@ class ClaudeCliProvider(LLMProvider):
                 "stream-json",
                 "--verbose",
                 "--model",
-                self._model,
+                model,
             ]
             cmd.extend(["--mcp-config", tmp_path])
             cmd.extend(["--allowedTools", *allowed_mcp])
             _apply_lean_flags(cmd, builtins=_CHAT_BUILTIN_TOOLS)
-            cmd.extend(["--max-budget-usd", str(_MAX_TURN_BUDGET_USD(self._model))])
+            cmd.extend(["--max-budget-usd", str(_MAX_TURN_BUDGET_USD(model))])
 
             with _system_prompt_tempfile(system_prompt) as sp_path:
                 if sp_path is not None:
@@ -1818,7 +1834,7 @@ class ClaudeCliProvider(LLMProvider):
                         f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}" if partial else _BUDGET_EXCEEDED_MSG
                     )
                     # #399: the over-budget turn is the costliest one; log it as the streaming path does.
-                    log_usage(persona_dir, call_type="chat", model=self._model, frame=payload)
+                    log_usage(persona_dir, call_type="chat", model=model, frame=payload)
                     # The tools that ran before the stop are real (the budget is the backstop for
                     # runaway tool loops): keep their records, as the success path does.
                     return ChatResponse(
@@ -1848,7 +1864,7 @@ class ClaudeCliProvider(LLMProvider):
             log_usage(
                 persona_dir,
                 call_type="chat",
-                model=self._model,
+                model=model,
                 frame=payload,
             )
 
@@ -2720,42 +2736,24 @@ class OllamaProvider(LLMProvider):
 # ---------------------------------------------------------------------------
 
 
-def get_provider(
-    name: str,
-    *,
-    persona_dir: Path | None = None,
-    model_override: str | None = None,
-) -> LLMProvider:
+def get_provider(name: str, *, tier: str = TIER_INTERACTIVE_CHAT) -> LLMProvider:
     """Resolve a provider identifier to an instance.
 
     Parameters
     ----------
     name:
-        Provider name — "claude-cli", "ollama", or "fake".
-    persona_dir:
-        Optional path to the persona directory. When provided and the
-        provider is "claude-cli", the model is read from the persona's
-        persona_config.json (if present). Ignored for non-claude-cli providers.
-    model_override:
-        Explicit model name that wins over both persona_config and the
-        default. Useful for CLI --model flags. Ignored for non-claude-cli
-        providers.
+        Provider name: "claude-cli", "ollama", or "fake".
+    tier:
+        The JOB the provider will do (a ``brain.bridge.model_tier`` name). The "claude-cli" provider looks its model
+        up from the user's tunables for that job at every call. Ignored for "ollama" and "fake", which run their own
+        model.
 
     Raises ValueError on unknown name.
     """
     if name == "fake":
         return FakeProvider()
     if name == "claude-cli":
-        from brain.persona_config import DEFAULT_MODEL, PersonaConfig
-
-        model = model_override
-        if model is None and persona_dir is not None:
-            cfg_path = persona_dir / "persona_config.json"
-            if cfg_path.exists():
-                model = PersonaConfig.load(cfg_path).model
-        if model is None:
-            model = DEFAULT_MODEL
-        return ClaudeCliProvider(model=model)
+        return ClaudeCliProvider(tier)
     if name == "ollama":
         return OllamaProvider()
     raise ValueError(f"Unknown provider: {name!r}")

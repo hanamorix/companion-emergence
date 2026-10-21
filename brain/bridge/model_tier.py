@@ -1,76 +1,116 @@
-"""Model-tier accessor — the ONE indirection point for which model backs a given
-LLM call (#129 spirit; fixes #154's Sonnet/Haiku mislabeling).
+"""Which model backs each LLM call: one tunables line per job type, and the ONE accessor that reads it.
 
-Every model-selection site whose EFFECTIVE MODEL genuinely differs from a
-shared/ambient provider it would otherwise inherit resolves that model through
-``model_for_tier(tier)`` (or the convenience builder ``build_tier_provider``),
-rather than hand-rolling its own ``model_override=`` literal.
+Every model a Claude call runs on is chosen here and nowhere else. A call site declares the JOB it is doing (a "tier"
+name below, which has always meant job type) and asks ``model_for_tier(tier)`` (or builds a provider with
+``build_tier_provider``); it never holds a model id. There are no size tiers: each job type has its own key in the
+user's tunables file (``$KINDLED_HOME/tunables.json``, section ``overrides``), registered once on one commented line
+of ``_CLAUDE_JOBS`` below. To change the model for a job, change that one line (the shipped default) or add one line to
+the user's overrides (this install only). Both are read on EVERY call, so a change reaches a running bridge with no
+restart.
 
-``dev-cli`` (``brain/cli.py``) is the one tier that intentionally does NOT call
-through this module: its handlers support a developer ``--provider`` CLI-flag
-override (``_resolve_routing``) this accessor cannot replicate (it always
-reads ``persona_config.json`` directly, with no flag-override channel) —
-routing it would silently drop that override, a real capability regression.
-Left as ``get_provider(provider_name)``, unchanged; see
-``changes/fix-154-model-tier-accessor/decisions.md`` for the full history.
+Pinning a default is one line: edit the id on the job's ``tunables.register`` line. The words the UI offers (Sonnet,
+Opus, Haiku) are vocabulary for the picker, ``nell model set`` and the setup wizard (``resolve_choice``); the tunables
+file holds ids, never the words, and a word that means the job's own default REMOVES the override instead of writing
+a copy, so a user who picked the word follows every later change of the shipped default (``set_job_models``).
 
-Every other tier — including ``interactive-chat`` and ``background-generative``
-— DOES route through this module (``build_tier_provider`` or, for
-``interactive-chat`` specifically, ``build_interactive_chat_provider`` below).
-An earlier attempt at this (#154's first pass) tried routing them through
-plain ``build_tier_provider`` and reverted after it broke a wide swath of
-pre-existing tests — not because routing itself was wrong, but because two
-FIXABLE test-seam gaps hadn't been closed yet (real ``claude`` CLI subprocess
-spawns from unit tests using bare ``tmp_path`` personas with no
-``persona_config.json``, and a ``get_provider``-patching test seam bypassed by
-this module's function-scoped import). Both are closed as of the pass that
-finished this migration; see ``changes/154-complete-model-tier-routing/`` for
-that work's spec/plan/decisions log. Two levels of indirection for every site
-that routes through here:
+A configured id is checked against the model grammar (``is_valid_model``); a value that fails it is ignored with one
+warning and the shipped default runs, and the bad text stays in the file untouched. A configured id that Claude
+REJECTED (it may not exist, or the account may not have access) makes that job run its shipped default from the next
+call on, with the rejection notice kept (``brain.bridge.model_error``); the record is trusted only while it is newer
+than the last write to the tunables file, so editing the file ends the fallback without a restart. Limits: when the
+rejected id IS the shipped default (an old ``claude`` that does not know it) there is nothing to fall back to, and
+exactly one call per process fails before the fallback engages.
 
-  MODEL_LITTLE / MODEL_MEDIUM (MODEL_BIGGEST reserved) — the concrete model
-    strings. Change ONE of these constants to re-point every tier that uses it
-    (e.g. swap MODEL_LITTLE to a newer Haiku snapshot).
-  TIER_MODEL — which named tier uses which model. Adding a new size (e.g. Opus
-    for a future "biggest" tier) is one new MODEL_* constant plus reassigning
-    the tiers that should use it in TIER_MODEL — no call site is touched, FOR
-    EVERY TIER EXCEPT ``TIER_INTERACTIVE_CHAT`` (see its own comment in
-    TIER_MODEL below, and ``build_interactive_chat_provider``'s docstring):
-    that one tier's real model comes from the persona's own
-    ``persona_config.json`` field, not from this dict, so reassigning its
-    TIER_MODEL entry is deliberately decorative there — a documented, tested
-    exception (see ``test_model_tier.py``), not an oversight.
+The embedder, reranker and relevance judge are not Claude models: their ids are plain constants below, resolved by
+the same ``model_for_tier`` through ``LOCAL_MODEL_IDS``.
 
-Config-ready (#129): TIER_MODEL is the single mapping a future external config
-surface points at instead of this hardcoded dict; call sites only ever ask
-``model_for_tier(TIER_X)``, never read TIER_MODEL directly, so externalizing
-it later (e.g. via ``brain.tunables``) is a change internal to this module
-only — again, for every tier except ``TIER_INTERACTIVE_CHAT``, whose real
-model is sourced from persona config, not this module (see above).
-
-Generalizes the pattern already used by ``build_compaction_provider``
-(``brain/chat/compaction.py``) and ``build_self_model_provider``
-(``brain/self_model/articulate.py``): resolve the provider *kind* from
-``persona_config.json``, then ``get_provider(kind, persona_dir=...,
-model_override=<pinned model>)``.
+Generalizes the pattern already used by ``build_compaction_provider`` (``brain/chat/compaction.py``) and
+``build_self_model_provider`` (``brain/self_model/articulate.py``): resolve the provider *kind* from
+``persona_config.json``, then build the provider for the job.
 """
 
 from __future__ import annotations
 
+import logging
+import re
 from pathlib import Path
 from typing import Any
 
-# ---------------------------------------------------------------------------
-# Model-size constants — the concrete models. One constant, many tiers.
-# ---------------------------------------------------------------------------
-MODEL_LITTLE = "haiku"  # cheap/fast: classifiers, housekeeping, cheap ticks
-MODEL_MEDIUM = "sonnet"  # persona-quality generation: chat, background-generative
-# MODEL_BIGGEST is reserved for a future top tier (e.g. Opus). Introducing it:
-#   MODEL_BIGGEST = "opus"
-#   then reassign e.g. TIER_MODEL[TIER_BACKGROUND_GENERATIVE] = MODEL_BIGGEST
-# No call-site changes are required for that tier (or any tier EXCEPT
-# TIER_INTERACTIVE_CHAT — see that constant's own TIER_MODEL comment below).
+from brain import tunables
+from brain.utils.log_throttle import warn_throttled
 
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# The model grammar: what a model setting may look like
+# ---------------------------------------------------------------------------
+# The three words the picker, `nell model set` and the wizard accept as a CHOICE (resolved by resolve_choice).
+KNOWN_MODELS = frozenset({"sonnet", "opus", "haiku"})
+# A full model id, stored and passed to `claude --model` as written. Matched with fullmatch, never `$`: `$` would
+# accept a trailing newline. The picker in app/src/lib/modelId.ts uses the same pattern and length cap; keep the two
+# in sync (a shared table of accept/reject strings is asserted on both sides).
+MODEL_ID_PATTERN = re.compile(r"claude-[a-z0-9.-]+")
+# Longest full id accepted on EVERY write path (tunables read, the picker endpoint, the CLI). Real ids are well under
+# it; the cap keeps an absurd value off the CLI's argv, out of the usage log and out of the UI, and keeps the CLI's
+# rejection sentence (cut at 200 characters by the provider) parseable.
+MODEL_ID_MAX_LENGTH = 64
+MODEL_ID_RULE = (
+    "use sonnet, opus or haiku, or a full id that starts with claude- and has only lowercase letters, "
+    f"digits, dots and dashes, at most {MODEL_ID_MAX_LENGTH} characters"
+)
+
+
+def is_valid_model(value: object) -> bool:
+    """True for one of the three words (sonnet / opus / haiku) or a full ``claude-...`` model id."""
+    if not isinstance(value, str):
+        return False
+    if value in KNOWN_MODELS:
+        return True
+    return len(value) <= MODEL_ID_MAX_LENGTH and MODEL_ID_PATTERN.fullmatch(value) is not None
+
+
+def unsupported_display(raw: object) -> str:
+    """A rejected setting's text made safe to show: control characters removed, cut at the id length cap."""
+    clean = "".join(ch for ch in str(raw) if ch.isprintable())
+    if not clean:  # only control / non-printing characters: say so rather than show an empty value
+        return "(non-printing characters)"
+    return clean if len(clean) <= MODEL_ID_MAX_LENGTH else clean[:MODEL_ID_MAX_LENGTH] + "…"
+
+
+# ---------------------------------------------------------------------------
+# Job types (the "tier" names every model-selection call site declares)
+# ---------------------------------------------------------------------------
+TIER_INTERACTIVE_CHAT = "interactive-chat"
+TIER_ATTUNEMENT_DETECTOR = "attunement-detector"
+TIER_COMPACTION = "compaction"
+TIER_SELF_MODEL_ARTICULATE = "self-model-articulate"
+TIER_BACKGROUND_CLASSIFIER = "background-classifier"
+TIER_BACKGROUND_GENERATIVE = "background-generative"
+TIER_BACKGROUND_HOUSEKEEPING = "background-housekeeping"
+
+# ---------------------------------------------------------------------------
+# The Claude jobs: ONE tunables line each. (job type) -> (tunables key, shipped default model)
+# ---------------------------------------------------------------------------
+# This table is the DEFINITION of the shipped defaults, read by model_for_tier on every call. Nothing else in the code
+# holds a model id. The comment on each line says what the job IS.
+_CLAUDE_JOBS: dict[str, tuple[str, str]] = {
+    TIER_INTERACTIVE_CHAT: ("model.interactive_chat", tunables.register("model.interactive_chat", "claude-sonnet-5")),  # the live chat turn: every reply the kindled gives in conversation
+    TIER_BACKGROUND_GENERATIVE: ("model.background_generative", tunables.register("model.background_generative", "claude-sonnet-5")),  # background writing in the kindled's own voice: dreams, reflexes, research, soul review, voice reflection and the maker
+    TIER_BACKGROUND_CLASSIFIER: ("model.background_classifier", tunables.register("model.background_classifier", "haiku")),  # cheap background judgments that tag or classify: emotion tagging, memory consolidation tie-breaks, vocabulary repair, creative-DNA crystallization, tool-loop monologue extraction
+    TIER_BACKGROUND_HOUSEKEEPING: ("model.background_housekeeping", tunables.register("model.background_housekeeping", "haiku")),  # background upkeep that never speaks to the user: closing sessions, interest sweeps, finalize ticks, initiate reviews, daemon snapshots, draft fragments
+    TIER_COMPACTION: ("model.compaction", tunables.register("model.compaction", "haiku")),  # summarising old chat history into a short digest when a session is rolled over
+    TIER_SELF_MODEL_ARTICULATE: ("model.self_model_articulate", tunables.register("model.self_model_articulate", "haiku")),  # putting the kindled's measured self-model into plain sentences
+    TIER_ATTUNEMENT_DETECTOR: ("model.attunement_detector", tunables.register("model.attunement_detector", "claude-haiku-4-5-20251001")),  # reading recent turns for the user's current state and recurring patterns (the attunement detector); a pinned snapshot id so an alias bump cannot silently change it
+}
+CLAUDE_TIERS: tuple[str, ...] = tuple(_CLAUDE_JOBS)
+
+# What the picker's, `nell model set`'s and the wizard's "Opus" choice means. No job runs Opus by default.
+OPUS_CHOICE = "claude-opus-5"
+
+
+# ---------------------------------------------------------------------------
+# Non-Claude models (O1: not part of the one-line-per-job rule)
+# ---------------------------------------------------------------------------
 # Mini-model swaps (embedder, reranker, relevance-judge): model ids can be
 # swapped by changing the constant here, but ONLY as a same-interface drop-in.
 # A replacement with a different task-shape or I/O contract (for example, an
@@ -151,7 +191,7 @@ MODEL_RERANKER = "jinaai/jina-reranker-v2-base-multilingual"  # ONNX cross-encod
 # TextCrossEncoder registry (only the fp32 onnx/model.onnx export above
 # is). brain/memory/reranker.py registers this id via TextCrossEncoder.
 # add_custom_model() pointing at that file — never read directly via
-# model_for_tier/TIER_MODEL, so it stays a plain companion constant here
+# model_for_tier/LOCAL_MODEL_IDS, so it stays a plain companion constant here
 # rather than its own tier (same non-tier treatment MODEL_EMBEDDING_DIM
 # gets above).
 #
@@ -201,23 +241,6 @@ MODEL_RERANKER_FP16 = "jinaai/jina-reranker-v2-base-multilingual-fp16"
 # — but that latency is irrelevant here, offline and once-daily).
 MODEL_RELEVANCE_JUDGE = "BAAI/bge-reranker-v2-m3"
 
-# attunement-detector keeps its own pre-existing PINNED snapshot id verbatim
-# (not the bare "haiku" alias) — this predates #154 and substituting the alias
-# could silently repoint it to a different snapshot over time. Moved here from
-# brain/attunement/detector.py's former _DETECTOR_MODEL constant.
-_ATTUNEMENT_DETECTOR_MODEL = "claude-haiku-4-5-20251001"
-
-# ---------------------------------------------------------------------------
-# Tier names — the categories every model-selection call site declares.
-# ---------------------------------------------------------------------------
-TIER_INTERACTIVE_CHAT = "interactive-chat"
-TIER_ATTUNEMENT_DETECTOR = "attunement-detector"
-TIER_COMPACTION = "compaction"
-TIER_SELF_MODEL_ARTICULATE = "self-model-articulate"
-TIER_BACKGROUND_CLASSIFIER = "background-classifier"
-TIER_BACKGROUND_GENERATIVE = "background-generative"
-TIER_BACKGROUND_HOUSEKEEPING = "background-housekeeping"
-TIER_DEV_CLI = "dev-cli"
 # Embedding is not a Claude-LLM tier — it never goes through get_provider/
 # build_tier_provider (those are Claude-scoped: claude-cli/ollama/fake
 # provider *kinds*, Claude model aliases). It's registered here anyway so the
@@ -238,280 +261,225 @@ TIER_RERANKER = "reranker"
 # why this tier loads via torch instead of the ONNX path the other two use.
 TIER_RELEVANCE_JUDGE = "relevance-judge"
 
-TIER_MODEL: dict[str, str] = {
-    # NOMINAL/DEFAULT ONLY — decorative for this one tier (future "biggest"
-    # slot when reassigned). build_interactive_chat_provider() below never
-    # reads this entry; the live /chat route's real model always comes from
-    # the persona's own persona_config.json `.model` field (falling back to
-    # PersonaConfig.DEFAULT_MODEL, which happens to equal MODEL_MEDIUM today).
-    # Reassigning this line does NOT change what interactive-chat runs on —
-    # see build_interactive_chat_provider's docstring + test_model_tier.py.
-    TIER_INTERACTIVE_CHAT: MODEL_MEDIUM,
-    TIER_ATTUNEMENT_DETECTOR: _ATTUNEMENT_DETECTOR_MODEL,  # pinned snapshot, preserved
-    TIER_COMPACTION: MODEL_LITTLE,
-    TIER_SELF_MODEL_ARTICULATE: MODEL_LITTLE,
-    TIER_BACKGROUND_CLASSIFIER: MODEL_LITTLE,
-    TIER_BACKGROUND_GENERATIVE: MODEL_MEDIUM,
-    TIER_BACKGROUND_HOUSEKEEPING: MODEL_LITTLE,
-    TIER_DEV_CLI: MODEL_MEDIUM,
+# The non-Claude tiers' model ids (embedder, reranker, relevance judge): plain constants, no tunables line.
+LOCAL_MODEL_IDS: dict[str, str] = {
     TIER_EMBEDDING: MODEL_EMBEDDING,
     TIER_RERANKER: MODEL_RERANKER,
     TIER_RELEVANCE_JUDGE: MODEL_RELEVANCE_JUDGE,
 }
 
 
-def model_for_tier(tier: str) -> str:
-    """The model string a given tier should run.
+# ---------------------------------------------------------------------------
+# Resolution
+# ---------------------------------------------------------------------------
 
-    Raises ``KeyError`` on an unknown tier — fail loud, not silently default;
-    a typo'd tier name is a bug, not a fallback case.
+
+def _configured(key: str, default: str) -> str:
+    """The job's configured id: the user's override when it is a valid model setting, else the shipped default.
+
+    ``tunables.get_tunable`` already ignores a value of the wrong type (a number, a list) with its own one-time
+    warning. A string that fails the model grammar is ignored here with ONE throttled warning per distinct bad value;
+    the text stays in ``tunables.json`` untouched (#446).
     """
-    return TIER_MODEL[tier]
+    value = tunables.get_tunable(key, default)
+    if is_valid_model(value):
+        return value
+    warn_throttled(
+        logger,
+        f"model_tier:invalid:{key}:{unsupported_display(value)}",
+        "model_tier: the setting %s=%r is not a usable model (%s); the shipped default %s runs instead. "
+        "The setting in tunables.json was left as it is.",
+        key,
+        unsupported_display(value),
+        MODEL_ID_RULE,
+        default,
+        exc_info=False,
+    )
+    return default
+
+
+def model_for_tier(tier: str) -> str:
+    """The model id a job runs RIGHT NOW. Read on every call, so a tunables edit reaches a running bridge.
+
+    Claude jobs: the configured id (``_configured``), unless Claude rejected that id since the settings file was last
+    written, in which case the job's shipped default (the rejection notice stays). Non-Claude tiers return their
+    constant. Raises ``KeyError`` on an unknown tier: fail loud, a typo'd tier name is a bug, not a fallback case.
+    """
+    job = _CLAUDE_JOBS.get(tier)
+    if job is None:
+        return LOCAL_MODEL_IDS[tier]
+    from brain.bridge import (
+        model_error,  # function-scoped: model_error imports this module's grammar at top
+    )
+
+    key, default = job
+    configured = _configured(key, default)
+    # An id in use again must never stay ignored (`switch` ignores the id a user moved away from; a CLI write or a hand
+    # edit can configure it again without this process seeing the change), or a real rejection would be dropped silently.
+    model_error.activate([configured])
+    if configured != default and model_error.is_rejected(configured, since_epoch=tunables.overrides_mtime()):
+        warn_throttled(
+            logger,
+            f"model_tier:fallback:{key}:{configured}",
+            "model_tier: Claude rejected %s for the %s job, so it runs its shipped default %s until the settings file "
+            "is changed or the app is restarted",
+            configured,
+            tier,
+            default,
+            exc_info=False,
+        )
+        return default
+    return configured
+
+
+def configured_job_models() -> dict[str, str]:
+    """Each Claude job's CONFIGURED id (a valid override, else the shipped default), whatever Claude accepted.
+
+    The allow-list for the rejection notice and the ``keep`` set of ``model_error.switch``: a rejected id must not
+    drop out of the notice the moment the fallback starts, so these are not the effective ids.
+    """
+    return {tier: _configured(key, default) for tier, (key, default) in _CLAUDE_JOBS.items()}
+
+
+def override_text(tier: str) -> str | None:
+    """The user's override for a Claude job when it is NOT a usable model setting (display-safe), else None."""
+    key, _default = _CLAUDE_JOBS[tier]
+    raw = tunables.get_override(key)
+    if raw is None or is_valid_model(raw):
+        return None
+    return unsupported_display(raw)
+
+
+def has_override(tier: str) -> bool:
+    """True when the user's tunables file holds a setting (valid or not) for this Claude job."""
+    return tunables.get_override(_CLAUDE_JOBS[tier][0]) is not None
+
+
+def shipped_default(tier: str) -> str:
+    """The job's shipped default id (the registered default, ignoring any override)."""
+    return _CLAUDE_JOBS[tier][1]
+
+
+def is_shipped_default(model: str) -> bool:
+    """True when ``model`` is the shipped default of at least one Claude job."""
+    return any(default == model for _key, default in _CLAUDE_JOBS.values())
 
 
 # ---------------------------------------------------------------------------
-# Tier models follow the chat model's version (#441)
+# The words the UI offers, and writing the settings file
 # ---------------------------------------------------------------------------
 
-# The Claude tiers whose model comes from this module (dev-cli is deliberately not routed; the
-# embedding / reranker / judge tiers are not Claude models; interactive-chat reads persona_config).
-ROUTED_CLAUDE_TIERS = (
-    TIER_ATTUNEMENT_DETECTOR,
-    TIER_COMPACTION,
-    TIER_SELF_MODEL_ARTICULATE,
-    TIER_BACKGROUND_CLASSIFIER,
-    TIER_BACKGROUND_GENERATIVE,
-    TIER_BACKGROUND_HOUSEKEEPING,
-)
-_FAMILIES = ("sonnet", "opus", "haiku")
 
+def resolve_choice(value: str) -> str | None:
+    """The id a picker word or a typed value means, else None when it is not a usable model setting.
 
-def tier_family(model: str) -> str | None:
-    """The model family of an alias or a full id: its first dash-separated part that names a family."""
-    if model in _FAMILIES:
-        return model
-    for part in str(model).split("-"):
-        if part in _FAMILIES:
-            return part
+    ``sonnet`` is the chat job's shipped default (read from the job table, no second literal), ``opus`` is
+    ``OPUS_CHOICE``, ``haiku`` stays the alias ``haiku``, any other valid value is itself. Pure: reads no file.
+    """
+    if value == "sonnet":
+        return _CLAUDE_JOBS[TIER_INTERACTIVE_CHAT][1]
+    if value == "opus":
+        return OPUS_CHOICE
+    if is_valid_model(value):
+        return value
     return None
 
 
-def derive_model(chat_model: str, family: str) -> str | None:
-    """The id in ``family`` that matches the chat model's version, or None.
+def choice_for(model: str | None) -> str | None:
+    """The picker word whose meaning is exactly ``model``, else None (a custom id highlights no radio)."""
+    if model is None:
+        return None
+    for word in ("sonnet", "opus", "haiku"):
+        if resolve_choice(word) == model:
+            return word
+    return None
 
-    None unless ``chat_model`` is a full id that names a family. The same family returns the chat id as it
-    is. Another family swaps the family part and drops a trailing eight-digit date (dated snapshots differ
-    per model, so a copied date would name a snapshot that does not exist). No version is ever looked up:
-    if the derived id does not exist Claude rejects it and the tier uses what it uses today.
+
+def set_job_models(updates: dict[str, str | None], *, only_missing: bool = False) -> dict[str, str | None]:
+    """Write the model setting of one or more jobs; the ONLY caller of ``tunables.set_overrides`` for model keys.
+
+    ``updates`` maps a job type to the RAW value the user gave (a word or a full id) or ``None`` to clear the override.
+    The write rule, per job: a WORD that means that job's shipped default REMOVES the override (so the user keeps
+    following the product's pin); ``opus`` writes ``OPUS_CHOICE``; ``haiku`` writes ``haiku`` unless that is the job's
+    default; a FULL ID is always written exactly as given, even when it equals the default (a deliberate pin).
+    Raises ``ValueError`` for a value that is not a usable model setting and ``KeyError`` for an unknown job;
+    ``tunables.TunablesWriteError`` when the file cannot be changed (nothing is written).
+
+    After the write the rejection record of every id written AND every id removed is dropped, so a stale record
+    cannot outlive the pick. Returns ``{job: written id, or None for a removal}`` for the settings actually changed.
     """
-    import re
+    from brain.bridge import (
+        model_error,  # function-scoped: model_error imports this module's grammar at top
+    )
 
-    from brain.persona_config import KNOWN_MODELS, is_valid_model
-
-    if chat_model in KNOWN_MODELS or not is_valid_model(chat_model):
-        return None
-    own = tier_family(chat_model)
-    if own is None:
-        return None
-    if own == family:
-        return chat_model
-    parts = chat_model.split("-")
-    parts[next(i for i, part in enumerate(parts) if part in _FAMILIES)] = family
-    derived = re.sub(r"-\d{8}$", "", "-".join(parts))
-    return derived if is_valid_model(derived) else None
-
-
-def _load_config(persona_dir: Any, strict: bool = False) -> Any:
-    """The persona's PersonaConfig, or None when there is no directory or no file.
-
-    A read error gives None for a model lookup (it can only pick a model). ``strict=True`` lets it
-    propagate, which ``build_tier_provider`` needs: the provider KIND must never be guessed from an
-    unreadable file (a local-model persona's prompts must not go to Claude on a transient error).
-    """
-    if persona_dir is None:
-        return None
-    try:
-        from brain.persona_config import PersonaConfig
-
-        path = Path(persona_dir) / "persona_config.json"
-        return PersonaConfig.load(path) if path.exists() else None
-    except Exception:  # noqa: BLE001 - a tier model lookup must never fail a background call
-        if strict:
-            raise
-        return None
-
-
-def derived_tier_model(cfg: Any, tier: str) -> str | None:
-    """The id derived for this tier from the chat model, or None.
-
-    The ONE rule for "the id derived for this tier", shared by `_resolve`, `candidate_tier_models` and `tier_fallbacks` so they cannot
-    drift (#486): only a persona on the default provider derives tier ids (another provider ignores the model setting), and only a
-    routed tier with a model family has one.
-    """
-    from brain.persona_config import DEFAULT_PROVIDER
-
-    if cfg is None or cfg.provider != DEFAULT_PROVIDER:
-        return None
-    family = tier_family(model_for_tier(tier))
-    return derive_model(cfg.model, family) if family else None
-
-
-def _resolve(cfg: Any, tier: str) -> tuple[str, str]:
-    from brain.bridge import model_error
-
-    default = model_for_tier(tier)
-    if cfg is None or tier not in ROUTED_CLAUDE_TIERS:
-        return default, "default"
-    override = cfg.tier_models.get(tier)
-    if override:
-        model_error.activate([override])
-        return override, "override"
-    derived = derived_tier_model(cfg, tier)
-    if derived is None:
-        return default, "default"
-    model_error.activate([derived, default])  # an id in use again must never stay ignored
-    if derived in cfg.derived_unavailable or derived in model_error.rejected_models():
-        return default, "fallback"
-    return derived, "derived"
-
-
-def resolve_tier_model(persona_dir: Path | None, tier: str) -> tuple[str, str]:
-    """``(model, source)`` for a tier in this persona; source is override, derived, fallback or default.
-
-    Precedence: the persona's explicit per-tier override, then the id derived from a full-id chat model
-    (replaced by the tier's own default when Claude rejected it, at save time or in this process), then
-    ``model_for_tier(tier)``. An alias chat model, no persona dir or no readable config give the default
-    exactly as before this existed.
-    """
-    return _resolve(_load_config(persona_dir), tier)
-
-
-def candidate_tier_models(cfg: Any) -> set[str]:
-    """Every id a routed tier might run for this config (override, derived, default): the ids whose
-    rejections are reported and that must not be ignored."""
-    out: set[str] = set()
-    for tier in ROUTED_CLAUDE_TIERS:
-        default = model_for_tier(tier)
-        out.add(default)
-        override = cfg.tier_models.get(tier) if cfg is not None else None
-        if override:
-            out.add(override)
+    keys: dict[str, str] = {}
+    mapped: dict[str, str | None] = {}
+    previous: dict[str, Any] = {}
+    for tier, raw in updates.items():
+        key, default = _CLAUDE_JOBS[tier]
+        keys[key] = tier
+        previous[key] = tunables.get_override(key)
+        if raw is None:
+            mapped[key] = None
             continue
-        derived = derived_tier_model(cfg, tier)
-        if derived:
-            out.add(derived)
-    return out
-
-
-def unchecked_tiers(cfg: Any, ids: list[str]) -> list[str]:
-    """``ids`` (derived tier ids an Apply could not probe) minus those already shown as fallbacks.
-
-    The ONE rule for "not checked yet" vs "fallback", used by the Apply response and by /persona/state so
-    the two cannot disagree: an id that is unavailable (saved list or a runtime rejection) is a fallback.
-    """
-    from brain.bridge import model_error
-
-    if cfg is None:
-        return []
-    gone = set(cfg.derived_unavailable) | set(model_error.rejected_models())
-    return [m for m in ids if m not in gone]
-
-
-def tier_fallbacks(cfg: Any) -> list[dict[str, str]]:
-    """Which derived tier ids are being replaced, one entry per distinct (wanted id, replacement) pair.
-
-    Never lists the chat model itself (a rejected chat model has its own notice).
-    """
-    from brain.bridge import model_error
-    from brain.persona_config import DEFAULT_PROVIDER
-
-    if cfg is None or cfg.provider != DEFAULT_PROVIDER:
-        return []
-    gone = set(cfg.derived_unavailable) | set(model_error.rejected_models())
-    out: list[dict[str, str]] = []
-    for tier in ROUTED_CLAUDE_TIERS:
-        if cfg.tier_models.get(tier):
+        if not is_valid_model(raw):
+            raise ValueError(f"{raw!r} is not a usable model setting ({MODEL_ID_RULE})")
+        if raw in KNOWN_MODELS:
+            resolved = resolve_choice(raw)
+            mapped[key] = None if resolved == default else resolved
+        else:
+            mapped[key] = raw
+    written = tunables.set_overrides(mapped, only_missing=only_missing)
+    # Picking an id again clears what Claude said about it, even when the file already held that exact value; an id
+    # the pick replaces or removes is forgotten too. (Not the ids of keys `only_missing` left alone.)
+    for key, value in mapped.items():
+        if only_missing and key not in written:
             continue
-        default = model_for_tier(tier)
-        family = tier_family(default)
-        wanted = derived_tier_model(cfg, tier)
-        if wanted is None or wanted == cfg.model or wanted not in gone:
-            continue
-        entry = {"family": family or "", "wanted": wanted, "using": default}
-        if entry not in out:
-            out.append(entry)
-    # plain aliases before a pinned snapshot, so the common case reads first
-    return sorted(out, key=lambda e: (e["wanted"], e["using"].startswith("claude-")))
+        for forgotten in (value, previous[key]):
+            if isinstance(forgotten, str):
+                model_error.note_success(forgotten)
+    return {keys[key]: value for key, value in written.items()}
 
 
-def _resolve_provider_kind(persona_dir: Path) -> str:
-    """The persona's provider *kind* (claude-cli / ollama / fake), read from
-    ``persona_config.json`` if present, else ``DEFAULT_PROVIDER``.
+# ---------------------------------------------------------------------------
+# Providers
+# ---------------------------------------------------------------------------
 
-    Shared by ``build_tier_provider`` and ``build_interactive_chat_provider`` so
-    the two builders can never silently drift in how they resolve provider
-    *kind* (as distinct from *model*, which they resolve differently — see
-    ``build_interactive_chat_provider``'s docstring).
+
+def _provider_kind(persona_dir: Path) -> str:
+    """The persona's provider *kind* (claude-cli / ollama / fake), read STRICTLY from ``persona_config.json``.
+
+    The kind is never guessed from an unreadable file (a local-model persona's prompts must not go to Claude on a
+    transient error), so a read error propagates. No file means the default kind. The persona file no longer holds a
+    model: the model comes from the job's tunables line.
     """
     from brain.persona_config import DEFAULT_PROVIDER, PersonaConfig
 
     cfg = Path(persona_dir) / "persona_config.json"
-    if cfg.exists():
-        return PersonaConfig.load(cfg).provider
-    return DEFAULT_PROVIDER
+    return PersonaConfig.load(cfg).provider if cfg.exists() else DEFAULT_PROVIDER
 
 
 def build_tier_provider(persona_dir: Path, tier: str) -> Any:
-    """The provider a given tier should use: the persona's provider *kind*
-    (claude-cli / ollama / fake) but forced to the tier's resolved model.
+    """The provider a given job should use: the persona's provider *kind* (claude-cli / ollama / fake), running the
+    model the job's tunables line names (resolved at every call, not at construction).
 
-    The resolved model is ``model_for_tier(tier)`` unless the persona sets a per-tier override or its chat
-    model is a full id, in which case the tier follows that version (``resolve_tier_model``, #441).
-    Generalizes ``build_compaction_provider``/``build_self_model_provider`` —
-    same shape, parametrized by tier instead of duplicated per call site.
-    """
-    from brain.bridge.provider import get_provider
-    from brain.persona_config import DEFAULT_PROVIDER
-
-    cfg = _load_config(persona_dir, strict=True)
-    name = cfg.provider if cfg is not None else DEFAULT_PROVIDER
-    model = _resolve(cfg, tier)[0]
-    return get_provider(name, persona_dir=Path(persona_dir), model_override=model)
-
-
-def build_interactive_chat_provider(persona_dir: Path) -> Any:
-    """The provider ``TIER_INTERACTIVE_CHAT`` (the live ``/chat`` route) should
-    use: the persona's provider *kind*, exactly like ``build_tier_provider``,
-    but WITHOUT forcing ``model_override``.
-
-    This is the one deliberate exception in this module: every other tier's
-    model is fully owned by ``TIER_MODEL`` (change the constant, every call
-    site follows). Interactive-chat is different because ``persona_config.json``
-    has its own genuinely user-facing ``.model`` field (validated: an alias
-    sonnet/opus/haiku or a full ``claude-...`` id — see ``brain.persona_config.is_valid_model``) that a
-    persona owner can already set independently of any tier default, and this
-    is the ONE real call site that honors it. Forcing ``model_override=
-    model_for_tier(TIER_INTERACTIVE_CHAT)`` here would silently strip that
-    per-persona choice for anyone not on the tier's nominal model — an
-    unintended behavior change this function exists specifically to avoid.
-    ``TIER_MODEL[TIER_INTERACTIVE_CHAT]`` therefore stays nominal/default-only
-    for this tier (see its own comment there); reassigning it does not change
-    what this function returns — ``test_model_tier.py`` asserts exactly that.
+    Generalizes ``build_compaction_provider``/``build_self_model_provider``: same shape, parametrized by job type.
+    The function-scoped import of ``get_provider`` is the #154 test seam (a test that patches
+    ``brain.bridge.provider.get_provider`` is not bypassed by a module-level binding here).
     """
     from brain.bridge.provider import get_provider
 
-    name = _resolve_provider_kind(persona_dir)
-    return get_provider(name, persona_dir=Path(persona_dir))
+    return get_provider(_provider_kind(persona_dir), tier=tier)
 
 
 def model_label_for_provider(provider: Any, tier: str) -> str:
-    """Best-effort ACTUAL model label for usage logs.
+    """Best-effort ACTUAL model label for usage logs: what the provider would run now, else the job's own model.
 
-    Prefers the provider's own recorded ``._model`` (set from the
-    ``model_override`` passed to ``get_provider``), so the label reflects what
-    really ran. Falls back to the tier's nominal model only for a provider type
-    with no such attribute (e.g. ``FakeProvider`` in tests). Mirrors
-    ``self_model/articulate.py``'s ``_provider_model_label``; centralized here
-    so no site hardcodes a label string.
+    A Claude provider answers with its live id (``_cli_model``); another provider type reports its own ``_model``;
+    a provider with neither (``FakeProvider`` in tests) falls back to ``model_for_tier(tier)``. Centralized so no
+    site hardcodes a label string.
     """
+    live = getattr(provider, "_cli_model", None)
+    if callable(live):
+        return live()
     return getattr(provider, "_model", None) or model_for_tier(tier)
