@@ -217,8 +217,11 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
   };
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [activeBanners, setActiveBanners] = useState<InitiateMessage[]>([]);
-  // #523: a card reply whose send could not get a session gives its banner back, with the typed reply (by audit id).
-  const [bannerDrafts, setBannerDrafts] = useState<Record<string, string>>({});
+  // #523: a card reply whose send could not get a session gives its banner back, with the typed reply (by audit id). `n`
+  // counts the give-backs and is part of the banner's key, so the banner given back is always a NEW instance that starts
+  // from the reply: its removal and its return can be rendered in one batch (React may never unmount it in between), and a
+  // reused instance would keep the draft it cleared when it sent.
+  const [bannerDrafts, setBannerDrafts] = useState<Record<string, { text: string; n: number }>>({});
   const [activeVoiceEdits, setActiveVoiceEdits] = useState<VoiceEditProposal[]>([]);
   const sessionRef = useRef<string | null>(null);
   const cancelRef = useRef<(() => void) | null>(null);
@@ -822,7 +825,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
       // #523: no session could be had, so nothing was sent: the banner comes back with the reply the user typed.
       onRolledBack: () => {
         if (!banner) return;
-        setBannerDrafts((d) => ({ ...d, [auditId]: text }));
+        setBannerDrafts((d) => ({ ...d, [auditId]: { text, n: (d[auditId]?.n ?? 0) + 1 } }));
         setActiveBanners((prev) => (prev.some((b) => b.auditId === auditId) ? prev : [...prev, banner]));
       },
     });
@@ -964,14 +967,14 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
         >
           {activeBanners.map((b) => (
             <InitiateBanner
-              key={b.auditId}
+              key={`${b.auditId}:${bannerDrafts[b.auditId]?.n ?? 0}`}
               message={b}
               companionName={capitalize(persona)}
               onSendReply={onCardSendReply}
               onDismiss={onBannerDismiss}
               onMounted={onBannerMounted}
               isStreaming={streaming}
-              initialDraft={bannerDrafts[b.auditId]}
+              initialDraft={bannerDrafts[b.auditId]?.text}
             />
           ))}
         </div>
