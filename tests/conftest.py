@@ -69,9 +69,7 @@ def _isolated_dir(root: Path, dirs: object, sub: str) -> str:
 
 
 @pytest.fixture(autouse=True)
-def _isolate_user_data_home(
-    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
-) -> Iterator[None]:
+def _isolate_user_data_home(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
     """#488: no test may write into the real per-user data directory.
 
     A test that builds the bridge app (its lifespan rewrites ``tunables.json``) or calls ``get_home()`` with neither
@@ -86,12 +84,17 @@ def _isolate_user_data_home(
     The CACHE directory and ``XDG_CACHE_HOME`` are deliberately NOT redirected: the cache is where downloaded models live, not user
     state. platformdirs reads ``XDG_CACHE_HOME`` on Linux and macOS and huggingface_hub derives ``HF_HOME`` from it on every OS, so
     moving it made a subprocess a test starts (the judge release RSS job's C3a) find no cached judge, go to the network and fail.
+
+    The patches are held by this fixture's OWN ``MonkeyPatch``, not the test's: a test that calls ``monkeypatch.undo()`` reverts
+    only what it patched itself. With the test's instance, an ``undo()`` put the platform default back and the next
+    ``set_job_models`` wrote a model line into the real install's ``tunables.json`` (#530).
     """
     from platformdirs import PlatformDirs
 
     from brain import paths
 
     root = tmp_path_factory.mktemp("userdata")
+    monkeypatch = pytest.MonkeyPatch()
     # Two classes when something (the update overlay hook drops platformdirs from sys.modules) made a new one after brain.paths
     # built its instance: patch the one `brain.paths._dirs` is an instance of AND the one `from platformdirs import PlatformDirs` gives now.
     for cls in {type(paths._dirs), PlatformDirs}:
@@ -107,7 +110,10 @@ def _isolate_user_data_home(
         ("XDG_STATE_HOME", "xdg-state"),
     ):
         monkeypatch.setenv(var, str(root / sub))
-    yield
+    try:
+        yield
+    finally:
+        monkeypatch.undo()
 
 
 @pytest.fixture(autouse=True)

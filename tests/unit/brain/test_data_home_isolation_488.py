@@ -121,3 +121,29 @@ def test_a_subprocess_resolves_the_same_model_cache_as_the_run_started_with():
     )
     assert out.returncode == 0, out.stderr
     assert Path(out.stdout.strip()).resolve() == REAL_PLATFORM_DIRS["user_cache_path"]
+
+
+# --- a test's own monkeypatch.undo() must not reopen the real home (#530) ---------------------------------------------------
+
+
+def test_a_tests_monkeypatch_undo_does_not_put_back_the_real_data_home(monkeypatch):
+    """The fixture's patches are held by its own MonkeyPatch. A test of the model setter called ``monkeypatch.undo()`` and then
+    ``set_job_models``, which wrote ``model.interactive_chat`` into the real install's ``tunables.json``. After an ``undo()`` the
+    default home must still be the test's own, a write must land there, and the real file must be byte-for-byte what it was."""
+    from brain.bridge.model_tier import TIER_INTERACTIVE_CHAT, set_job_models
+
+    real_file = REAL_PLATFORM_DIRS["user_data_path"] / "tunables.json"
+    before = real_file.read_bytes() if real_file.exists() else None
+    monkeypatch.delenv("KINDLED_HOME", raising=False)
+    monkeypatch.delenv("NELLBRAIN_HOME", raising=False)
+    monkeypatch.undo()
+    monkeypatch.delenv("KINDLED_HOME", raising=False)
+    monkeypatch.delenv("NELLBRAIN_HOME", raising=False)
+    home = paths.get_home()
+    assert not _is_under(home, REAL_PLATFORM_DIRS["user_data_path"])
+    for var in ("XDG_DATA_HOME", "XDG_STATE_HOME"):
+        assert not _is_under(Path(os.environ[var]).resolve(), REAL_PLATFORM_DIRS["user_data_path"])
+    set_job_models({TIER_INTERACTIVE_CHAT: "claude-sonnet-5"})
+    assert (home / "tunables.json").exists()
+    after = real_file.read_bytes() if real_file.exists() else None
+    assert after == before
