@@ -24,7 +24,6 @@ Fail-open throughout: this module never raises into a turn.
 
 from __future__ import annotations
 
-import json
 import logging
 import threading
 from collections.abc import Callable
@@ -345,11 +344,13 @@ def _drop_inactive_marker() -> None:
 
 
 def _same_content(a: Any, b: Any) -> bool:
-    """True when two JSON-able values serialise identically (key order ignored, ``1`` and ``True`` kept apart)."""
-    try:
-        return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
-    except (TypeError, ValueError):
-        return False
+    """True when two JSON-shaped values are equal with their types (``1``, ``1.0`` and ``True`` differ; a list and a
+    tuple are the same; dict key order is ignored). No serialising: a ``json`` call here would be a second JSON site."""
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(_same_content(a[k], b[k]) for k in a)
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        return len(a) == len(b) and all(_same_content(x, y) for x, y in zip(a, b, strict=True))
+    return type(a) is type(b) and a == b
 
 
 def write_defaults_section() -> None:

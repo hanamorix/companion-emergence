@@ -149,3 +149,11 @@ def test_write_defaults_rewrites_when_the_content_matches_but_a_value_differs_in
     tunables.write_defaults_section()
     assert path.stat().st_mtime_ns != mtime
     assert json.loads(path.read_text(encoding="utf-8"))["defaults"] == {"a.b": True}
+
+
+def test_same_content_compares_values_with_their_types_and_ignores_key_order_and_list_vs_tuple(tunables):
+    same = tunables._same_content
+    assert same({"a": 1, "b": [1, {"c": 2.5}]}, {"b": [1, {"c": 2.5}], "a": 1})
+    assert same([1, 2], (1, 2))
+    assert not same(1, True) and not same(1, 1.0) and not same("1", 1)
+    assert not same({"a": 1}, {"a": 1, "b": 2}) and not same([1], [1, 2]) and not same({"a": [1]}, {"a": [True]})
