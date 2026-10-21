@@ -314,7 +314,9 @@ def _run_chunks(
                 len(chunk.pieces),
             )
         # One call per piece (one for a normal chunk). The cursor moves past the chunk only after its LAST piece commits, so a
-        # stop on any piece leaves it before the chunk and the next pass sends every piece again (dedup meets the repeats).
+        # stop on any piece leaves it before the chunk and the next pass sends every piece again. The earlier pieces' items are
+        # then extracted twice: the extraction dedup compares only against stored memories, so a repeat of a queued item meets
+        # the consolidation gate instead (its first pass drops exact repeats; a reworded one goes to the gate's judge).
         result = ChunkResult.OK
         for piece in chunk.pieces:
             result = run_chunk_stages(
