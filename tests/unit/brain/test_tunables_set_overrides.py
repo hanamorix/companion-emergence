@@ -75,6 +75,12 @@ def test_only_missing_skips_existing_keys_and_returns_only_what_it_wrote(t, tmp_
     assert _read(tmp_path)["overrides"] == {"a": 1, "b": 3}
 
 
+def test_only_missing_does_not_delete_an_existing_key_either(t, tmp_path) -> None:
+    _file(tmp_path).write_text(json.dumps({"overrides": {"a": 1}}), encoding="utf-8")
+    assert t.set_overrides({"a": None}, only_missing=True) == {}
+    assert _read(tmp_path)["overrides"] == {"a": 1}
+
+
 def test_a_zero_byte_file_is_no_overrides_for_the_reader_and_the_writer(t, tmp_path) -> None:
     _file(tmp_path).write_bytes(b"")
     assert t.get_tunable("a", 7) == 7

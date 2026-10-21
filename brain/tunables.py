@@ -410,8 +410,8 @@ def set_overrides(updates: dict[str, Any], *, only_missing: bool = False) -> dic
     nothing may call this while holding the tunables lock) it re-reads the file, changes only the named keys inside
     ``overrides`` (``_readme``, ``defaults`` and every other override stay as parsed, an invalid model text in a key
     survives), creates the file with the standard skeleton when it is absent, writes atomically and resets this process's
-    cache. With ``only_missing=True`` a key that already holds an override is left alone (the check and the write share
-    the lock window). A value equal to the current one, and a deletion of an absent key, write nothing and are not
+    cache. With ``only_missing=True`` a key that already holds an override is left alone, whether the update would
+    change it or delete it (the check and the write share the lock window). A value equal to the current one, and a deletion of an absent key, write nothing and are not
     returned (a deletion-only call on an absent key does not even take the lock).
 
     Raises ``TunablesWriteError`` and writes nothing when the file is damaged or unreadable (never healed here), cannot be
@@ -433,7 +433,7 @@ def set_overrides(updates: dict[str, Any], *, only_missing: bool = False) -> dic
             for key, value in updates.items():
                 present = key in overrides
                 if value is None:
-                    if present:
+                    if present and not only_missing:  # only_missing leaves an existing setting alone, a deletion included
                         del overrides[key]
                         written[key] = None
                     continue
