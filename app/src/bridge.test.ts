@@ -328,20 +328,31 @@ describe("setPersonaModel", () => {
     await expect(setPersonaModel("alice", "haiku")).resolves.toBeUndefined();
   });
 
-  it("setPersonaModelFull also returns the tier fallbacks", async () => {
-    const fb = [{ family: "haiku", wanted: "claude-haiku-5", using: "haiku" }];
+  it("setPersonaModelFull resolves to the checked flag alone (no fallbacks or unchecked-tier fields any more)", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: true, fallbacks: fb }), { status: 200 }),
+      new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: true }), { status: 200 }),
     ));
-    await expect(setPersonaModelFull("alice", "claude-sonnet-5")).resolves.toEqual({ checked: true, fallbacks: fb, tiersUnchecked: [] });
+    await expect(setPersonaModelFull("alice", "claude-sonnet-5")).resolves.toEqual({ checked: true });
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: true, tiers_unchecked: ["claude-haiku-5"] }), { status: 200 }),
+      new Response(JSON.stringify({ ok: true, model: "claude-opus-5" }), { status: 200 }),
     ));
-    await expect(setPersonaModelFull("alice", "claude-sonnet-5")).resolves.toEqual({ checked: true, fallbacks: [], tiersUnchecked: ["claude-haiku-5"] });
+    await expect(setPersonaModelFull("alice", "opus")).resolves.toEqual({ checked: undefined });
+  });
+
+  it("explains a refusal for a persona that does not use Claude", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ ok: true, model: "opus" }), { status: 200 }),
+      new Response(JSON.stringify({ ok: false, error: "model_not_applicable" }), { status: 400 }),
     ));
-    await expect(setPersonaModelFull("alice", "opus")).resolves.toEqual({ checked: undefined, fallbacks: [], tiersUnchecked: [] });
+    await expect(setPersonaModel("alice", "opus")).rejects.toThrow(/does not use Claude/);
+  });
+
+  it("explains a settings file that could not be saved", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: false, error: "tunables_unwritable", detail: "x" }), { status: 500 }),
+    ));
+    const err = await setPersonaModel("alice", "opus").catch((e: Error) => e);
+    expect((err as Error).message).toMatch(/settings file/);
+    expect((err as Error).message).not.toContain("\u2014");
   });
 
   it("resolves to the bridge's checked flag for a custom id", async () => {
