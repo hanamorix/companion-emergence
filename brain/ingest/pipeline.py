@@ -88,8 +88,9 @@ def record_extraction_failure(persona_dir: Path, session_id: str) -> None:
     """Record one failed extraction attempt in the session's backoff sidecar (F-011).
 
     The first failure in a new window anchors ``first_failure_at`` to now; later ones increment the count without moving the anchor,
-    so the window measures from the *first* failure. Three of them move a silent buffer to ``poison/`` (the stale sweep) and let the
-    rollover set the failing chunk aside. Never call it for a deferral or a busy pass: those are not failures.
+    so the window measures from the *first* failure. Three of them let the rollover, or the stale sweep once the session has been
+    silent for 24 hours, set the failing chunk aside in ``poison/`` (the buffer stays). Never call it for a deferral or a busy
+    pass: those are not failures.
     """
     existing = read_backoff(persona_dir, session_id)
     if existing is None:
@@ -109,10 +110,10 @@ def poison_unextracted_span(persona_dir: Path, session_id: str) -> int | None:
 
     Only the FIRST chunk after the cursor is set aside: it is the one whose failures reached the threshold (a pass stops at its
     first failing chunk, and the chunking is deterministic for the same rows and limit). The chunks after it were never tried
-    and stay in the buffer after the moved cursor for the next pass. The stale sweep moves a whole buffer to ``poison/`` after
-    the same 3 recorded failures, but only once the session has been silent for 24 hours; a session in daily use with a
-    persistent extraction failure would otherwise grow without bound once the rollover refuses to reap unextracted turns. The
-    rows are KEPT (appended verbatim, never silently lost) and the failure record is cleared.
+    and stay in the buffer after the moved cursor for the next pass. Both the rollover and the stale sweep (once the session has
+    been silent for 24 hours) call this after the same 3 recorded failures; without it, a session with a persistent extraction
+    failure would keep its unextracted turns forever, since the rollover refuses to reap them. The rows are KEPT (appended
+    verbatim, never silently lost) and the failure record is cleared.
 
     Runs under the session's non-blocking extraction lock: returns None when another pass holds it (busy: nothing is changed and the
     caller must not reap); otherwise how many rows were set aside. Raises when they cannot be written, in which case nothing has
@@ -334,8 +335,8 @@ def _run_chunks(
             if result is not ChunkResult.OK:
                 break
         if result is ChunkResult.DEFERRED:
-            # #473: "not now" is not a failure. No error, no backoff entry (three of those move the buffer to poison/),
-            # the cursor stays after the last committed chunk, and the next pass tries again from there.
+            # #473: "not now" is not a failure. No error, no backoff entry (three of those set the failing chunk aside in
+            # poison/), the cursor stays after the last committed chunk, and the next pass tries again from there.
             report.deferred = True
             logger.info(
                 "conversation_extract_deferred session=%s chunk=%d/%d; cursor unchanged from here", session_id, index + 1, len(chunks)
