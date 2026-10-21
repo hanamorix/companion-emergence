@@ -205,7 +205,7 @@ def test_attach_to_a_stop_already_in_progress_offers_at_the_recorded_time(pd, br
 def test_restart_starts_only_after_the_old_bridge_is_gone(pd, bridge, monkeypatch):
     """C16 (h)."""
     order: list[str] = []
-    monkeypatch.setattr(daemon, "cmd_stop", lambda args: order.append("stopped") or 0)
+    monkeypatch.setattr(daemon, "cmd_stop", lambda args, **_kw: order.append("stopped") or 0)
     monkeypatch.setattr(daemon, "cmd_start", lambda args: order.append("started") or 0)
     assert daemon.cmd_restart(SimpleNamespace(persona="nell")) == 0
     assert order == ["stopped", "started"]

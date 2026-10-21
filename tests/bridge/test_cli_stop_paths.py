@@ -298,3 +298,13 @@ def test_stop_kill_passes_the_expected_bridge_to_the_helper(monkeypatch, tmp_pat
     assert rc == 1
     assert seen["expect_pid"] == 4242 and seen["expect_token"] == "linux:b:4242:0"
     assert seen["skip_hard_exit_request"] is True
+
+
+def test_restart_asks_for_a_restart_not_a_plain_stop(pd, monkeypatch):
+    """Maintainer's Q1: `nell supervisor restart`'s stop is recorded as a restart (no reason -> "manual_restart"),
+    not as a plain stop (user_stop), so a service run queued behind the bridge starts instead of skipping."""
+    reasons: list = []
+    monkeypatch.setattr(daemon, "cmd_stop", lambda args, *, reason="user_stop": reasons.append(reason) or 0)
+    monkeypatch.setattr(daemon, "cmd_start", lambda args: 0)
+    assert daemon.cmd_restart(_stop_args()) == 0
+    assert reasons == [None]

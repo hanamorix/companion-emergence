@@ -504,22 +504,15 @@ def _await_readiness(persona_dir: Path, pid: int, log_path: Path, out: dict | No
 
 
 def _ended_on_a_requested_stop(st: state_file.BridgeState | None) -> bool:
-    """The record says its bridge ended on a stop a person asked for through nell or the app: ``nell supervisor
-    stop`` (user_stop), an app restart (app_restart), a stop request with no reason (manual_restart), or a hard exit
-    the user chose (hard_exit). Not an idle stop (nobody asked for anything), not an OS signal (it cannot tell a user's
-    kill from a logout or a service manager's stop), not a crash. A kill is the respawn guard's (D25), not this."""
-    from brain.bridge.shutdown import (
-        REASON_APP_RESTART,
-        REASON_HARD_EXIT,
-        REASON_MANUAL_RESTART,
-        REASON_USER_STOP,
-    )
+    """The record says its bridge ended on a plain ``nell supervisor stop`` (user_stop): a person asked for no bridge.
+    Not a restart's stop (app_restart; manual_restart, which ``nell supervisor restart`` records) nor a hard exit
+    (it may end a restart): a start follows those, and a queued service run that skipped would leave the restart's
+    own start facing a held lock or an exiting service job, so no bridge (maintainer's Q1). Not an idle stop (nobody
+    asked for anything), not an OS signal (it cannot tell a user's kill from a logout or a service manager's stop),
+    not a crash. A kill is the respawn guard's (D25), not this."""
+    from brain.bridge.shutdown import REASON_USER_STOP
 
-    return (
-        st is not None
-        and st.phase != "running"
-        and st.stop_reason in (REASON_USER_STOP, REASON_APP_RESTART, REASON_MANUAL_RESTART, REASON_HARD_EXIT)
-    )
+    return st is not None and st.phase != "running" and st.stop_reason == REASON_USER_STOP
 
 
 def cmd_run(args) -> int:
@@ -529,9 +522,9 @@ def cmd_run(args) -> int:
     the bridge process until uvicorn exits, which is exactly what launchd wants
     to supervise. A per-persona lock is held for the lifetime of the process; a
     run that finds it held waits for it (D4). A service run that waited for a
-    running bridge does not start when a person stopped that bridge through nell
-    or the app (see ``_ended_on_a_requested_stop``); after an idle stop, an OS
-    signal or a crash it starts.
+    running bridge does not start when that bridge ended on a plain ``nell
+    supervisor stop`` (see ``_ended_on_a_requested_stop``); after a restart's
+    stop, a hard exit, an idle stop, an OS signal or a crash it starts.
     """
     from brain.paths import get_persona_dir
 
@@ -574,8 +567,8 @@ def cmd_run(args) -> int:
             logger.info("not starting: stopped on request (user kill of this boot)")
             return 0
         if guarded and waited_for_a_bridge and _ended_on_a_requested_stop(state_file.read(persona_dir)):
-            # Pre-merge review O-2: a service run queued behind a running bridge does not undo a stop a person asked
-            # for through nell or the app (exit 0: success to every service manager, so nothing restarts it).
+            # Pre-merge review O-2: a service run queued behind a running bridge does not undo a plain `nell
+            # supervisor stop` (exit 0: success to every service manager, so nothing restarts it).
             print("not starting: the running bridge was stopped on request", file=sys.stderr)
             logger.info("not starting: the bridge this run waited for was stopped on request")
             return 0
@@ -658,12 +651,12 @@ def _print_kill_result(result) -> int:  # noqa: ANN001
     return 0 if _kill_succeeded(result) else 1
 
 
-def cmd_stop(args) -> int:
+def cmd_stop(args, *, reason: str | None = "user_stop") -> int:
     """`nell supervisor stop` (#456 Q-A, D16, D22): ask the bridge to stop, then watch until it is gone.
 
     ``--kill``: the kill helper (a bridge run by an OS service first gets the hard-exit request and up to
-    ``--timeout`` to go, then its service manager's stop; any other bridge is killed at once). A pre-PR bridge (no identity token): the old request, then the kill helper
-    after a few seconds. A stale record: "not running". If the request fails and no stop is recorded: POSIX sends
+    ``--timeout`` to go, then its service manager's stop; any other bridge is killed at once). A pre-PR bridge (no
+    identity token): the old request, then the kill helper after a few seconds. A stale record: "not running". If the request fails and no stop is recorded: POSIX sends
     SIGTERM when the identity holds; Windows refuses unless ``--force`` (then the kill helper).
     """
     from brain.bridge import kill as kill_mod
@@ -700,7 +693,7 @@ def cmd_stop(args) -> int:
 
     response = None
     try:
-        response = _request_shutdown_via_http(s, reason="user_stop")
+        response = _request_shutdown_via_http(s, reason=reason)
     except Exception as exc:  # noqa: BLE001 - a closed listener: the stop may have begun already (attach)
         failure = exc
     else:
@@ -917,7 +910,9 @@ def cmd_restart(args) -> int:
     starts. Any other result (still stopping without a terminal, a refused stop) aborts the restart with that code.
     """
     print("stopping bridge...")
-    stop_rc = cmd_stop(args)
+    # No reason: the bridge records "manual_restart", so a service run queued behind it starts (see
+    # _ended_on_a_requested_stop); a plain stop records "user_stop".
+    stop_rc = cmd_stop(args, reason=None)
     if stop_rc != 0:
         print(f"restart aborted: stop failed (exit {stop_rc})", file=sys.stderr)
         return stop_rc
