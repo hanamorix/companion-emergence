@@ -189,7 +189,7 @@ def test_finalize_does_not_poison_a_session_another_extraction_holds(world, capl
 
 
 def test_finalize_still_poisons_a_session_nothing_holds(world):
-    # PIN (passes on 584ec8a1): with the lock free the dead-letter happens. #523 (pre-merge review MF1): only the failing chunk
+    # PIN (passes on 584ec8a1): with the lock free the dead-letter happens. #523: only the failing chunk
     # (here the whole short span) is set aside in poison/<sid>.span.jsonl; the buffer stays.
     from datetime import UTC, datetime
 
@@ -322,7 +322,7 @@ def test_finalize_skips_the_dead_letter_move_when_the_buffer_is_already_gone(wor
 
 
 def test_finalize_survives_a_fault_while_setting_a_chunk_aside(world, monkeypatch):
-    # #523 (pre-merge review MF1): finalize no longer renames the buffer; it sets the failing chunk aside through
+    # #523: finalize no longer renames the buffer; it sets the failing chunk aside through
     # poison_unextracted_span. A fault there for one session (here a buffer that vanished mid-way) must not escape and abort the
     # sweep for the others.
     import brain.ingest.pipeline as pipeline

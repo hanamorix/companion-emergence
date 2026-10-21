@@ -600,12 +600,13 @@ _ATTACH_MAX_AGE_HOURS = 24.0
 
 
 def _sessions_active_blocking(persona_dir: Path, persona: str, provider: LLMProvider) -> dict[str, str | None]:
-    """The whole launch decision of ``GET /sessions/active`` (#523, spec §3.6.1): blocks; run in a worker thread.
+    """The whole launch decision of ``GET /sessions/active`` (#523): blocks; run in a worker thread.
 
     Returns ``{"session_id": <the most-recent-turn session that is still attach-eligible>}``. When there is none but a stale
     buffer exists (its last turn is older than ``_ATTACH_MAX_AGE_HOURS``), the most-recently-active stale buffer (tie-break:
-    the lexicographically-largest sid, stage-3 A1-b) is rolled over (1c-A, owner-ratified): its extraction runs to the end,
-    chunk by chunk (owner decision D6: a slower launch is accepted), then everything is folded and archived, the old buffer is
+    the lexicographically-largest sid, so the choice is deterministic) is rolled over (1c-A): its extraction runs to the end,
+    chunk by chunk (a launch after a long never-extracted evening is slower, so that the new session still opens with the
+    summary of the old one), then everything is folded and archived, the old buffer is
     deleted, and the NEW session id (seeded with the summary alone) is returned. Otherwise ``{"session_id": None}``.
 
     Everything that reads a file or opens SQLite happens here, off the event loop; the memory store and Hebbian matrix are
@@ -683,7 +684,7 @@ def _sessions_active_task_done(state: BridgeAppState, task: asyncio.Future) -> N
 
 
 def _shared_sessions_active_task(state: BridgeAppState) -> asyncio.Future:
-    """The ONE in-flight launch decision for this persona: the running task, or a new one (#523, spec §3.6.1 item 2).
+    """The ONE in-flight launch decision for this persona: the running task, or a new one (#523).
 
     A second ``GET /sessions/active`` while a rollover runs (the app's one replay after a cut connection, the panel's
     send-time call, a second panel) awaits the same task and gets the same answer instead of finding the extraction lock
@@ -1837,7 +1838,7 @@ def build_app(
         """Return the session the app should attach to on launch: ``{"session_id": "<uuid>"}`` or ``{"session_id": null}``.
 
         The decision (``_sessions_active_blocking``: the attach-eligible session, or the rollover of a stale buffer, whose
-        extraction runs to the end, #523 owner decision D6) runs in a worker thread as ONE shared task per persona
+        extraction runs to the end, #523) runs in a worker thread as ONE shared task per persona
         (``_shared_sessions_active_task``): a request that arrives while it runs waits for the same answer. On the event loop
         this route only looks the task up and streams: one space every ``bridge.stream_keepalive_seconds`` until the task is
         done, then the JSON (``_sessions_active_body``), so a launch rollover that takes minutes is not cut as idle. Always

@@ -259,7 +259,7 @@ def load_emotion_vocab() -> tuple[set[str], str]:
         return set(), ""
 
 
-# Where chunked extraction began, PER SESSION (main ruling M4 of the #523 run and its follow-ups): for each session, the ts of the
+# Where chunked extraction began, PER SESSION: for each session, the ts of the
 # first row the chunked code extracted in that session. Rows from there on in that session are extracted in full by the chunked
 # pipeline, so the extraction backfill never plans them; everything before it, and every session the chunked code has not touched
 # yet, may hold heads the old code cut. Per session, not per persona: another session's old-code cut can lie after one session's

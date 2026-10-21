@@ -191,7 +191,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
     setInput(v);
   };
   const [streaming, setStreaming] = useState(false);
-  // #523 (main ruling M7): a send is resolving its session (GET /sessions/active can take minutes while a stale session
+  // #523: a send is resolving its session (GET /sessions/active can take minutes while a stale session
   // rolls over). Its bubble is already shown, pending; no other send may start until it resolves.
   const [resolvingSession, setResolvingSession] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -608,7 +608,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
     let sessionId = sessionRef.current;
     const resolving = !sessionId;
     if (!sessionId) {
-      // #523 (main ruling M7): the lookup below can take minutes during a launch rollover, so the message is shown now,
+      // #523: the lookup below can take minutes during a launch rollover, so the message is shown now,
       // pending, and no other send starts until the session is known.
       setMessages((m) => [...m, ...prepend, { ...userMsg, pending: true }]);
       setResolvingSession(true);

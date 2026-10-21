@@ -1,8 +1,8 @@
 """#523 at the bridge: the real app's routes with stub providers.
 
-C10/C11(b): ``/sessions/snapshot`` makes one call for a 3-chunk backlog and reports ``chunks`` (response and event).
-C11(c): ``GET /sessions/active`` with a stale 3-chunk buffer extracts every chunk in ONE request, then rolls over.
-C14: the launch rollover survives a slow or cut request and never blocks the event loop. Driven as raw ASGI on ONE event loop
+``/sessions/snapshot`` makes one call for a 3-chunk backlog and reports ``chunks`` (response and event).
+``GET /sessions/active`` with a stale 3-chunk buffer extracts every chunk in ONE request, then rolls over.
+The launch rollover survives a slow or cut request and never blocks the event loop. Driven as raw ASGI on ONE event loop
 (the app's lifespan run first; every ``send`` message recorded with ``time.monotonic()``; ``receive`` delivers the request then
 blocks until the test injects ``http.disconnect``), because ``TestClient`` returns only the whole body.
 Synthetic persona only (persona Kestrel, user Bob, made-up words).
@@ -103,7 +103,7 @@ def _line(row: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# C10 / C11(b): /sessions/snapshot
+# /sessions/snapshot
 # ---------------------------------------------------------------------------
 
 
@@ -158,7 +158,7 @@ def _job_table_kwargs(persona: Path, bus) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# C11(c): the launch rollover extracts to the end in one request (owner D6)
+# The launch rollover extracts to the end in one request (a slower launch keeps the summary)
 # ---------------------------------------------------------------------------
 
 
@@ -179,7 +179,7 @@ def test_sessions_active_extracts_every_chunk_then_rolls_over(persona, stub):
 
 
 # ---------------------------------------------------------------------------
-# C14: raw-ASGI driver on one loop
+# The launch rollover under a slow or cut request: raw-ASGI driver on one loop
 # ---------------------------------------------------------------------------
 
 
@@ -418,7 +418,7 @@ def test_c14e_the_event_loop_stays_free_and_the_scan_runs_off_it(persona, stub, 
     async def main():
         d = _Driver(raw_app)
         await d.start()
-        scan_threads.clear()  # the lifespan's own idle-anchor seed (S82) lists the buffers at startup, on the loop
+        scan_threads.clear()  # the lifespan's own idle-anchor seed lists the buffers at startup, on the loop
         loop_thread = threading.get_ident()
         try:
             t0 = time.monotonic()
@@ -507,7 +507,7 @@ def test_c14_oracle_on_loop_variant_blocks_health(persona, stub, monkeypatch, ra
     async def main():
         d = _Driver(raw_app)
         await d.start()
-        scan_threads.clear()  # the lifespan's own idle-anchor seed (S82) lists the buffers at startup, on the loop
+        scan_threads.clear()  # the lifespan's own idle-anchor seed lists the buffers at startup, on the loop
         loop_thread = threading.get_ident()
         try:
             t0 = time.monotonic()
@@ -524,7 +524,7 @@ def test_c14_oracle_on_loop_variant_blocks_health(persona, stub, monkeypatch, ra
 
 
 # ---------------------------------------------------------------------------
-# C7 at the route (stage-6 MF1, main ruling M1): a close that kept the buffer is not reported as a close
+# At the route: a close that kept the buffer is not reported as a close
 # ---------------------------------------------------------------------------
 
 

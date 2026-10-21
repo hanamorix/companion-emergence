@@ -1,5 +1,5 @@
 """#523: the extraction backfill (`nell memory backfill-extraction`) re-extracts conversation text the old tail cut never
-showed the extractor. Synthetic persona only (persona Kestrel, user Bob, made-up words). Criteria B1-B16 of the #523 run.
+showed the extractor. Synthetic persona only (persona Kestrel, user Bob, made-up words).
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ def stores(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# commit_item: the back-date and the marker survive the pending queue and the gate (B9/B15 plumbing)
+# commit_item: the back-date and the marker survive the pending queue and the gate
 # ---------------------------------------------------------------------------
 
 
@@ -201,7 +201,7 @@ _OLD = datetime(2026, 8, 3, 19, 0, 0, tzinfo=UTC)
 
 
 # ---------------------------------------------------------------------------
-# B1 [H]: the heads planner covers what the lull MODEL says the old cap cut
+# The heads planner covers what the lull MODEL says the old cap cut
 # ---------------------------------------------------------------------------
 
 
@@ -259,14 +259,14 @@ def _b1_history(persona) -> tuple[str, list[dict]]:
     return sid, rows
 
 
-_LONG_USER = "Bob Quillamore-Vantrexley"  # the configured user name in force for the B1 history: longer than "user"
-_LONG_PERSONA = "Kestrelwingfeather-Quillamoor-Vantrexhollow"  # the persona dir name for B1: longer than "assistant", so both label halves matter
+_LONG_USER = "Bob Quillamore-Vantrexley"  # the configured user name in force for the heads-planner history: longer than "user"
+_LONG_PERSONA = "Kestrelwingfeather-Quillamoor-Vantrexhollow"  # the persona dir name for the heads-planner history: longer than "assistant", so both label halves matter
 
 
 def _b1_world(persona, monkeypatch) -> tuple[object, str, list[dict], list[dict]]:
-    """The B1 fixture (amended B1, main ruling M3): the cut replayed with the labels IN FORCE (the configured user name and the
+    """The heads-planner fixture: the cut replayed with the labels IN FORCE (the configured user name and the
     persona dir name), and the fixture's own checks that this set is strictly larger than the shortest-label set and than each
-    half alone (follow-up: with a persona name shorter than "assistant" the assistant half could not fail)."""
+    half alone (with a persona name shorter than "assistant" the assistant half could not fail)."""
     b1 = persona.parent / _LONG_PERSONA
     b1.mkdir()
     PersonaConfig(user_name=_LONG_USER).save(b1 / "persona_config.json")
@@ -306,7 +306,7 @@ def test_b1_oracle_catches_a_planner_with_the_300_s_rule(kestrel, monkeypatch) -
     ids=["both-shortest", "shortest-user", "shortest-assistant"],
 )
 def test_b1_oracle_catches_a_planner_with_the_shortest_labels(kestrel, monkeypatch, labels) -> None:
-    """Fail-first kept executable (amended B1): a planner measuring with the shortest labels, or the shortest of either half,
+    """Fail-first kept executable: a planner measuring with the shortest labels, or the shortest of either half,
     misses rows of the in-force cut."""
     persona, _, _ = kestrel
     b1, sid, _rows_, in_force = _b1_world(persona, monkeypatch)
@@ -315,7 +315,7 @@ def test_b1_oracle_catches_a_planner_with_the_shortest_labels(kestrel, monkeypat
 
 
 # ---------------------------------------------------------------------------
-# B2 [A]: the everything planner
+# The everything planner
 # ---------------------------------------------------------------------------
 
 
@@ -334,7 +334,7 @@ def test_b2_every_row_behind_the_cursor_is_in_exactly_one_target(kestrel) -> Non
 
 
 # ---------------------------------------------------------------------------
-# B3: dry run writes nothing and calls nothing
+# Dry run writes nothing and calls nothing
 # ---------------------------------------------------------------------------
 
 
@@ -366,7 +366,7 @@ def test_b3_oracle_catches_a_reader_that_creates_the_archive_dir(kestrel, monkey
 
 
 # ---------------------------------------------------------------------------
-# B4: resume after a kill
+# Resume after a kill
 # ---------------------------------------------------------------------------
 
 
@@ -424,7 +424,7 @@ def test_b4_oracle_catches_progress_saved_before_the_commits(kestrel, monkeypatc
 
 
 # ---------------------------------------------------------------------------
-# B5: no lost update on the state file
+# No lost update on the state file
 # ---------------------------------------------------------------------------
 
 
@@ -469,7 +469,7 @@ def test_b5_oracle_catches_a_missing_state_lock(kestrel, monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# B6: plan identity
+# Plan identity
 # ---------------------------------------------------------------------------
 
 
@@ -514,7 +514,7 @@ def test_b6_restart_is_refused_while_a_run_holds_the_runner_lock(kestrel) -> Non
 
 
 # ---------------------------------------------------------------------------
-# B7: one runner
+# One runner
 # ---------------------------------------------------------------------------
 
 
@@ -538,7 +538,7 @@ def test_b7_a_held_runner_lock_skips_the_job_and_ends_the_foreground_run(kestrel
 
 
 # ---------------------------------------------------------------------------
-# B8 (foreground half): through run_central_pass, and the stop rule
+# Through run_central_pass, and the stop rule
 # ---------------------------------------------------------------------------
 
 
@@ -619,7 +619,7 @@ def test_b8_oracle_catches_a_loop_that_stops_only_without_a_lull(kestrel, monkey
 
 
 # ---------------------------------------------------------------------------
-# B9: dedup and the marker; B10: the live session is left alone
+# Dedup and the marker; the live session is left alone
 # ---------------------------------------------------------------------------
 
 
@@ -666,7 +666,7 @@ def test_b10_the_live_session_files_are_untouched(kestrel) -> None:
 
 
 # ---------------------------------------------------------------------------
-# B11: rows carried by a rollover; a row that exists nowhere
+# Rows carried by a rollover; a row that exists nowhere
 # ---------------------------------------------------------------------------
 
 
@@ -725,7 +725,7 @@ def test_b11_a_row_that_exists_nowhere_is_counted_missing(kestrel) -> None:
 
 
 # ---------------------------------------------------------------------------
-# B12: failures and deferrals
+# Failures and deferrals
 # ---------------------------------------------------------------------------
 
 
@@ -757,7 +757,7 @@ def test_b12_a_deferral_counts_nothing(kestrel) -> None:
 
 
 # ---------------------------------------------------------------------------
-# B13 [A]: gate load is observable
+# Gate load is observable
 # ---------------------------------------------------------------------------
 
 
@@ -777,7 +777,7 @@ def test_b13_status_reports_counts_and_enqueued_matches_the_queue(kestrel) -> No
 
 
 # ---------------------------------------------------------------------------
-# B15: back-dated, and the silence clock never moves past the real newest user turn
+# Back-dated, and the silence clock never moves past the real newest user turn
 # ---------------------------------------------------------------------------
 
 
@@ -884,7 +884,7 @@ def test_b15_the_pipeline_still_dates_at_creation(kestrel) -> None:
 
 
 # ---------------------------------------------------------------------------
-# B16: soul candidates by mode
+# Soul candidates by mode
 # ---------------------------------------------------------------------------
 
 
@@ -927,7 +927,7 @@ def test_b16_oracle_catches_soul_on_under_all(kestrel, monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# B8 (bridge half): the supervisor's job table and one central pass
+# The supervisor's job table and one central pass
 # ---------------------------------------------------------------------------
 
 
@@ -1031,7 +1031,7 @@ def test_b8_oracle_catches_a_job_that_loops(kestrel, monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# B17: the plan stops where chunked extraction began (main ruling M4)
+# The plan stops where chunked extraction began, per session
 # ---------------------------------------------------------------------------
 
 
@@ -1073,7 +1073,7 @@ def test_b17_without_a_marker_the_cutoff_is_the_plan_time(kestrel, monkeypatch) 
 
 
 def test_b17_another_sessions_old_code_cut_after_the_first_marker_is_still_planned(kestrel, monkeypatch) -> None:
-    """Per-session marker (main's follow-up ruling): session A's first chunked pass extracts rows pending since tA; session B's
+    """Per-session marker: session A's first chunked pass extracts rows pending since tA; session B's
     over-cap span, cut by the OLD code after tA and archived before the upgrade, must still be planned (a per-persona marker at tA
     put it after the cutoff, a lost head never re-extracted)."""
     from brain.ingest.pipeline import extract_session_snapshot
@@ -1093,7 +1093,7 @@ def test_b17_another_sessions_old_code_cut_after_the_first_marker_is_still_plann
 
 @pytest.mark.parametrize("mode", ["heads", "all"])
 def test_b17_no_planned_row_is_at_or_after_its_sessions_marker(kestrel, monkeypatch, mode) -> None:
-    """Re-check R39-R40: the marker IS the first row the chunked code extracted in the session, so that row and every later one
+    """The marker IS the first row the chunked code extracted in the session, so that row and every later one
     of the session are out of the plan (``ts >= marker``), while the session's older old-code rows stay in it."""
     from brain.ingest.ingest_utils import chunked_extraction_since
     from brain.ingest.pipeline import extract_session_snapshot

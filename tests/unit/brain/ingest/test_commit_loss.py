@@ -364,7 +364,7 @@ def test_finalize_deadletters_after_max_retry(tmp_path: Path):
     assert len(reports) == 1
     original_buf = persona_dir / "active_conversations" / f"{sid}.jsonl"
     poison_span = persona_dir / "active_conversations" / "poison" / f"{sid}.span.jsonl"
-    # #523 (pre-merge review MF1): only the failing chunk (here the whole short span) is set aside; the buffer stays, with the
+    # #523: only the failing chunk (here the whole short span) is set aside; the buffer stays, with the
     # cursor past the set-aside rows, so nothing after them is lost.
     assert poison_span.exists(), "the failing chunk must appear in poison/"
     assert original_buf.exists(), "the buffer stays in active_conversations/"

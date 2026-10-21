@@ -1,4 +1,4 @@
-"""#523: `nell memory backfill-extraction` (B14, the CLI half of B8) and the CLI chat's exit flush (C11e).
+"""#523: `nell memory backfill-extraction` and the CLI chat's exit flush.
 
 Synthetic persona only (persona Kestrel, user Bob, made-up words); stub providers, no model call.
 """
@@ -185,7 +185,7 @@ def test_b8_background_says_what_happens_without_a_bridge(persona, stub, capsys)
 
 
 # ---------------------------------------------------------------------------
-# C11(e): the CLI chat's exit flush extracts every chunk
+# the CLI chat's exit flush extracts every chunk
 # ---------------------------------------------------------------------------
 
 

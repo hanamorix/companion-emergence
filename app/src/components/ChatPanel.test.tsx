@@ -269,7 +269,7 @@ describe("ChatPanel — sticky-session reattach on first send (F-201)", () => {
   });
 });
 
-describe("ChatPanel — a send while the mount call is still pending (#523 C15)", () => {
+describe("ChatPanel — a send while the mount call is still pending (#523)", () => {
   // A launch rollover (GET /sessions/active) can take minutes now; the user may send before the mount
   // call returns. The send joins the same rollover and streams its reply; when the mount call then
   // resolves, it must not wipe the sent message and the reply, nor replace the send's session id.
@@ -356,7 +356,7 @@ describe("ChatPanel — a send while the mount call is still pending (#523 C15)"
   });
 });
 
-describe("ChatPanel — a send while its own session lookup is pending (#523, main ruling M7)", () => {
+describe("ChatPanel — a send while its own session lookup is pending (#523)", () => {
   // The send path asks /sessions/active itself; during a slow launch rollover that call can take minutes. The user's
   // message must show at once (pending) and a second send must not be possible until the session resolves.
   const mockedFetchActive = fetchActiveSession as unknown as ReturnType<typeof vi.fn>;
@@ -411,7 +411,7 @@ describe("ChatPanel — a send while its own session lookup is pending (#523, ma
   });
 });
 
-describe("ChatPanel — a send whose session cannot be had is rolled back (#523 follow-up)", () => {
+describe("ChatPanel — a send whose session cannot be had is rolled back (#523)", () => {
   const mockedFetchActive = fetchActiveSession as unknown as ReturnType<typeof vi.fn>;
   const mockedNewSession = newSession as unknown as ReturnType<typeof vi.fn>;
   const mockedStreamChat = streamChat as unknown as ReturnType<typeof vi.fn>;

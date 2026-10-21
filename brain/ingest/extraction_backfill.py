@@ -5,32 +5,35 @@ the cursor to the span's end, so the head of every longer span was recorded as e
 itself is kept: in ``archived_conversations/`` (compaction archives only rows behind the cursor) and in the active buffers
 behind their cursor. This module plans which of it to re-extract and runs the plan one chunk at a time.
 
-Two modes (owner decision D1):
+Two modes. The default re-extracts only the starts the old cut lost (as the lull model reconstructs them), the cheaper run;
+``--all`` re-extracts everything archived:
 
 * ``heads`` (the default, "lost starts"): rebuild the historical passes with the historical lull per era and take, for
   every inferred span whose formatted length exceeds the historical cap, the rows that were cut. Built to be a superset of
   what the lull MODEL says was cut (longest plausible speaker labels, the upper bound of each era's lull), NOT proven a
   superset of what the code cut: a span that ran longer because the bridge was not running, or because a pass was deferred
-  or failed, is not seen (``1-spec.md`` §3.8 of the #523 run lists what the model misses).
+  or failed, is not seen; neither is a lull the user had tuned, or a user name that used to be longer than both candidates.
 * ``all``: every archived row and every active row behind its cursor, oldest first.
 
 Backfilled memories carry ``metadata.extraction_backfill = {"from": <first row ts>, "to": <last row ts>}`` and
-``source_summary = "conversation:<sid>"``, and are BACK-DATED to the chunk's last user turn (owner decision D2), so the time
-since the user last spoke never moves past the real newest user turn. Soul candidates are queued in ``heads`` mode only
-(owner decision D5).
+``source_summary = "conversation:<sid>"``, and are BACK-DATED to the chunk's last user turn: a memory dated now and sourced
+``conversation:<sid>`` would reset the time since the user last spoke (``days_since_human``), which the body state and the
+reach-out gates read; back-dated, that clock never moves past the real newest user turn. Soul candidates are queued in
+``heads`` mode only: that text was never extracted, so it never had its chance at the soul queue, while most ``--all`` text was
+extracted once already and the soul queue has no dedup (an accepted candidate becomes a permanent crystallisation).
 
 The plan and its progress live in ``<persona>/extraction_backfill_state.json``; every read-modify-write holds
 ``file_lock(<state>)`` and never spans a model call. A chunk's progress is written only after its commits, and only if the
 plan it started under is still the plan (``plan_id``), so a stop or a kill loses nothing and a restart cannot be overwritten
 by an old chunk. One runner at a time (a non-blocking ``file_lock`` on ``extraction_backfill.run``).
 
-It runs through the central cadence function (owner answer 3): ``backfill_gated_job`` is the ``extraction_backfill`` job of
+It runs through the central cadence function, the one place background work waits for a lull: ``backfill_gated_job`` is the ``extraction_backfill`` job of
 the bridge's job table, and the CLI's foreground mode (no bridge running) calls ``run_central_pass`` with the same job in its
-own process. One chunk (one model call) per pass. It never touches a session's cursor, buffer, backoff or extraction lock.
+own process. One chunk per pass (one model call; an over-long single message, one per piece). It never touches a session's cursor, buffer, backoff or extraction lock.
 Reading for a plan or a dry run creates no directory, no file and no lock. Each session is planned up to its own cutoff: the
 earlier of the plan's creation and the first row the chunked code extracted in THAT session (the per-session marker the pipeline
 writes on a session's first chunked pass), so text the chunked pipeline extracted in full is never planned while every head the
-old code cut, in any session, still is (main ruling M4 and follow-ups).
+old code cut, in any session, still is (a single persona-wide marker could lie after another session's old-code cut).
 """
 
 from __future__ import annotations
@@ -346,7 +349,7 @@ def update_state(
 
 
 def _session_cutoffs(persona_dir: Path, now: datetime) -> dict[str, str]:
-    """Each session's cutoff (main ruling M4 and follow-ups): the earlier of ``now`` (the plan's creation) and the ts of the first
+    """Each session's cutoff: the earlier of ``now`` (the plan's creation) and the ts of the first
     row the chunked code extracted in that session (``ingest_utils.chunked_extraction_since``). That session's rows from there on
     were extracted in full: neither mode plans them. A session the chunked code has not touched is planned up to ``now``."""
     return {sid: (since if since < now else now).isoformat() for sid, since in chunked_extraction_since(persona_dir).items()}
@@ -412,7 +415,7 @@ def _newest_user_ts(persona_dir: Path) -> datetime | None:
 
 
 def _backdate(persona_dir: Path, rows: tuple[dict, ...], cursor_ts: str | None, now: datetime) -> datetime:
-    """The creation time of a chunk's memories (owner decision D2): the ts of the chunk's last ``user`` row, clamped to now.
+    """The creation time of a chunk's memories (back-dated, see the module docstring): the ts of the chunk's last ``user`` row, clamped to now.
     A reply row is stamped after its user row (seconds, or minutes on a tool-using turn), so the chunk's end could be later
     than the user's last turn; the user row's ts cannot. A chunk with no user row (only rows before a session's first user
     turn) takes the earliest of its end, the newest user turn of the persona's sessions, and now. Either way a back-dated
@@ -549,7 +552,7 @@ def run_one_chunk(
     return step[0]
 
 
-# Test seam for B5 (a hook INSIDE the progress read-modify-write); never set in production.
+# Test seam: a hook INSIDE the progress read-modify-write (the lost-update test races a stop against it); never set in production.
 _TEST_SEAMS: dict[str, Callable[[], None]] = {}
 
 
@@ -596,9 +599,9 @@ def backfill_gated_job(
     provider_factory: Callable[[], LLMProvider],
     outcomes: list[Step] | None = None,
 ) -> GatedJob:
-    """The ``extraction_backfill`` job of the central cadence function (spec §3.8): due while an armed plan has an open
+    """The ``extraction_backfill`` job of the central cadence function: due while an armed plan has an open
     target; each run takes the runner lock and the background slot (either busy: SKIPPED), and runs EXACTLY ONE chunk (one
-    model call), then returns COMPLETED so the pass goes on to the later jobs. ``outcomes`` collects each run's ``Step``."""
+    model call, or one per piece of an over-long message), then returns COMPLETED so the pass goes on to the later jobs. ``outcomes`` collects each run's ``Step``."""
 
     def _note(step: Step) -> None:
         if outcomes is not None:
@@ -673,7 +676,7 @@ def run_foreground(
     """Run the armed plan in this process through ``run_central_pass`` (the CLI with no bridge running), one chunk per pass.
 
     Before each pass: a bridge that has started takes over (stop, say so); this process's idle anchor is re-seeded from the
-    saved buffers (the bridge's start rule, S82), so ``run_central_pass``'s own ``is_chat_idle`` check applies. The loop ends
+    saved buffers (the rule the bridge applies at start), so ``run_central_pass``'s own ``is_chat_idle`` check applies. The loop ends
     after any pass that advanced no target (a deferral, no lull, the slot or the runner lock busy, the plan stopped or
     replaced from another terminal, a failed attempt), naming why; progress is kept, and running the command again resumes.
     Returns a short reason code.
@@ -759,7 +762,8 @@ def arm(persona_dir: Path, mode: str) -> tuple[str, str]:
 
 
 def restart(persona_dir: Path, mode: str) -> tuple[str, str]:
-    """Discard the existing plan, armed, stopped or complete (main ruling M5), and plan afresh (the cutoff is recomputed).
+    """Discard the existing plan, armed, stopped or complete (an armed one too, so a mode switch, which ``arm`` refuses with a
+    message naming ``--restart``, can be made), and plan afresh (the cutoff is recomputed).
     Returns (outcome, message) like ``arm``; the message says when targets the replaced plan had done are extracted again.
     ``refused``, changing nothing, while a run holds the runner lock (so no chunk is in flight when the plan is replaced)."""
     with _runner_lock(persona_dir) as free:

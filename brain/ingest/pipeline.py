@@ -288,7 +288,7 @@ def _run_chunks(
     (F-011), and a committed chunk clears the backoff sidecar. ``close_session`` passes False: it keeps its rule of no
     backoff accounting.
     """
-    # Main ruling M4 and follow-ups: the backfill never plans text the chunked code extracts; in this session it starts here.
+    # The extraction backfill never plans text the chunked code extracts in full; in this session that starts here.
     stamps = [ts for t in turns if (ts := lenient_utc(t.get("ts"))) is not None]
     mark_chunked_extraction(persona_dir, session_id, min(stamps) if stamps else None)
     user_name = load_user_name(persona_dir)
@@ -468,7 +468,7 @@ def _close_session_locked(
         )
         return report
 
-    # S2 (#523): the pass took one or more model calls; a row persisted meanwhile is after the cursor and was never
+    # The pass took one or more model calls; a row persisted meanwhile is after the cursor and was never
     # extracted. The rows the pass itself extracted are excluded by identity, so a failed cursor write cannot hold a buffer.
     seen = {_row_key(t) for t in turns}
     late = [

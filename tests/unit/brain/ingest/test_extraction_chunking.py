@@ -1,7 +1,7 @@
 """#523: chunked memory extraction. The whole since-cursor span reaches the extractor, oldest first, in chunks no larger
 than ``ingest.extraction_chunk_chars``, and the cursor advances per committed chunk.
 
-Synthetic persona only (persona Kestrel, user Bob, made-up words). Criteria: ``1.5-criteria.md`` of the #523 run (C1-C12).
+Synthetic persona only (persona Kestrel, user Bob, made-up words).
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ def _row(speaker: str, text: str, seconds: float | None) -> dict:
 
 
 def _boundary_ts_violations(chunks: list[TurnChunk]) -> list[int]:
-    """C3(a): indexes k where a row of chunk k shares (or exceeds) a ts of a row in a later chunk."""
+    """Indexes k where a row of chunk k shares (or exceeds) a ts of a row in a later chunk."""
     bad = []
     for k in range(len(chunks) - 1):
         before = [lenient_utc(t.get("ts")) for c in chunks[: k + 1] for t in c.turns]
@@ -50,7 +50,7 @@ def _boundary_ts_violations(chunks: list[TurnChunk]) -> list[int]:
 
 
 def _reply_openers(chunks: list[TurnChunk]) -> list[int]:
-    """C3(b): indexes of chunks after the first that open with an assistant or image row."""
+    """Indexes of chunks after the first that open with an assistant or image row."""
     return [k for k, c in enumerate(chunks) if k > 0 and c.turns[0].get("speaker") in ("assistant", "image")]
 
 
@@ -68,7 +68,7 @@ def _allowed_cuts(rows: list[dict]) -> set[int]:
 
 
 def _chunk_text_problems(chunks: list[TurnChunk], max_chars: int) -> list[str]:
-    """C2 at the chunker: each chunk's text is exactly its whole rows formatted, and its length (joining newlines included,
+    """At the chunker: each chunk's text is exactly its whole rows formatted, and its length (joining newlines included,
     measured here, not taken from the chunk) is within the limit unless the chunk is one unit, i.e. has no allowed cut point
     inside it. The ``oversize`` flag must agree with that measured length."""
     problems = []
@@ -127,7 +127,7 @@ def _ts_rule_only(speaker, ts, prefix_max, suffix_min):  # noqa: ANN001 - varian
 
 
 # ---------------------------------------------------------------------------
-# The chunker (C2, C3 a/b at the chunker; the pipeline halves are below)
+# The chunker (the pipeline halves of these checks are below)
 # ---------------------------------------------------------------------------
 
 
@@ -166,7 +166,7 @@ def test_no_chunk_opens_with_a_reply_even_when_the_pair_straddles_a_second() -> 
     ids=["any-boundary-splits-same-ts", "any-boundary-opens-with-reply", "no-exchange-rule-opens-with-reply"],
 )
 def test_oracles_catch_broken_chunker_variants(monkeypatch, variant, history, oracle) -> None:
-    """Fail-first kept executable (C3): the oracles above fail on a chunker that cuts at any row boundary, and on one
+    """Fail-first kept executable: the oracles above fail on a chunker that cuts at any row boundary, and on one
     without the exchange rule."""
     monkeypatch.setattr(ingest_utils, "_cut_allowed", variant)
     chunks = chunk_turns(history(), max_chars=80, user_name="Bob", assistant_name="Kestrel")
@@ -220,7 +220,7 @@ def _strip_labels(pieces: tuple[str, ...]) -> str:
 
 
 def test_a_unit_larger_than_the_limit_is_kept_together_but_sent_in_pieces() -> None:
-    """Pre-merge review M1: a unit (a message and its reply) longer than the limit is never cut for the CURSOR, but its text goes
+    """A unit (a message and its reply) longer than the limit is never cut for the CURSOR, but its text goes
     to the extractor in pieces of at most the limit: whole rows where they fit, a longer row split at line boundaries, then at
     character boundaries, every piece starting with a speaker label. Nothing is dropped."""
     long_reply = "grumvex " * 400  # one line, 3200 chars: split at character boundaries
@@ -262,7 +262,7 @@ def test_summary_rows_are_dropped() -> None:
 
 
 # ---------------------------------------------------------------------------
-# C12: the named limit, validated
+# The named limit, validated
 # ---------------------------------------------------------------------------
 
 
@@ -306,7 +306,7 @@ def test_a_positive_override_changes_the_chunk_size(tunables_home) -> None:
 
 
 # ---------------------------------------------------------------------------
-# C5: `completed` means the cursor reached the end of the span
+# `completed` means the cursor reached the end of the span
 # ---------------------------------------------------------------------------
 
 
@@ -323,7 +323,7 @@ def test_a_bare_report_is_not_completed() -> None:
 
 
 # ---------------------------------------------------------------------------
-# The pipeline (C1-C11): a real persona dir, real buffer/cursor/pending queue, a recording stub provider
+# The pipeline: a real persona dir, real buffer/cursor/pending queue, a recording stub provider
 # ---------------------------------------------------------------------------
 
 from brain.bridge.chat import ChatMessage, ChatResponse  # noqa: E402
@@ -351,7 +351,7 @@ class _Stub(LLMProvider):
     """Records every prompt; ``plan(n, prompt)`` may return "defer", "fail", "kbint", or a callable run before answering.
 
     Answers one distinct fact per call (``items=True``) or an empty array. ``cursor_at_call`` records the session cursor
-    each call saw (C4: the cursor after chunk k is read at call k+1)."""
+    each call saw (the cursor after chunk k is read at call k+1)."""
 
     def __init__(self, persona=None, sid=None, plan=None, items=False, importance=5):
         self.prompts: list[str] = []
@@ -720,7 +720,7 @@ def test_c11d_finalize_makes_one_call_per_run(world) -> None:
 
 
 def _unbounded(monkeypatch) -> None:
-    """The broken variant for C11: every caller's snapshot runs to the end (``max_chunks`` ignored)."""
+    """The broken variant: every caller's snapshot runs to the end (``max_chunks`` ignored)."""
     real = pipeline.extract_session_snapshot
 
     def _ignore_bound(*a, max_chunks=None, **kw):
@@ -730,7 +730,7 @@ def _unbounded(monkeypatch) -> None:
 
 
 def test_c11_oracle_catches_unbounded_sweep_and_finalize(world, monkeypatch) -> None:
-    """Fail-first kept executable (C11 a/d): with the bound removed the sweep and finalize make all three calls."""
+    """Fail-first kept executable: with the bound removed the sweep and finalize make all three calls."""
     persona, store, hebbian, _ = world
     _unbounded(monkeypatch)
     _seed(persona, "sess_c1u", 6)
@@ -752,7 +752,7 @@ def test_c11e_close_makes_every_call(world) -> None:
     assert len(stub.prompts) == 3
 
 
-# ---- fail-first variant kept executable (C8): a cursor written to the span end before the loop ----
+# ---- fail-first variant kept executable: a cursor written to the span end before the loop ----
 
 
 def test_c8_oracle_catches_a_cursor_written_before_the_loop(world, monkeypatch) -> None:
@@ -785,7 +785,7 @@ def test_c8_oracle_catches_a_cursor_written_before_the_loop(world, monkeypatch) 
 
 
 # ---------------------------------------------------------------------------
-# The rollover (C6, C9 second half, C11e weekly): real perform_rollover, compaction provider stubbed
+# The rollover: real perform_rollover, compaction provider stubbed
 # ---------------------------------------------------------------------------
 
 
@@ -908,7 +908,7 @@ def _marker_entries(persona) -> dict:
 
 
 def test_b17_the_first_chunked_pass_writes_the_marker_once(world) -> None:
-    """Main ruling M4 and follow-ups: the pipeline records, per session, where chunked extraction began, once, and never moves
+    """The pipeline records, per session, where chunked extraction began, once, and never moves
     it; another session gets its own entry."""
     persona, _, _, _ = world
     marker = persona / "extraction_chunked_since.json"
@@ -928,7 +928,7 @@ def test_b17_the_first_chunked_pass_writes_the_marker_once(world) -> None:
 
 
 def test_b17_the_marker_is_the_first_row_the_first_chunked_pass_extracts(world) -> None:
-    """Follow-up R-a: rows still pending when the chunked code took over are extracted in full by the session's first pass, so
+    """Rows still pending when the chunked code took over are extracted in full by the session's first pass, so
     its marker is the start of that pass's span (its oldest row), not the time of the pass."""
     persona, _, _, _ = world
     rows = _seed(persona, "sess_m3", 3, start=datetime.now(UTC) - timedelta(days=2))
@@ -938,7 +938,7 @@ def test_b17_the_marker_is_the_first_row_the_first_chunked_pass_extracts(world) 
 
 @pytest.mark.parametrize("damage", ["", "not json", "[1, 2]", '{"sessions": 3}', '{"sessions": {"sess_m4": "yesterday"}}'])
 def test_b17_a_damaged_marker_is_rewritten(world, damage) -> None:
-    """Follow-up R-b: a marker file (or the session's entry) that exists but does not parse is written again."""
+    """A marker file (or the session's entry) that exists but does not parse is written again."""
     from brain.ingest.ingest_utils import chunked_extraction_since
 
     persona, _, _, _ = world
@@ -949,7 +949,7 @@ def test_b17_a_damaged_marker_is_rewritten(world, damage) -> None:
 
 
 def test_finalize_sets_aside_only_the_failing_chunk_and_the_rest_is_extracted_later(world) -> None:
-    """Pre-merge review MF1: a stale session whose third chunk keeps failing loses only that chunk to ``poison/``; chunks 4 and 5,
+    """A stale session whose third chunk keeps failing loses only that chunk to ``poison/``; chunks 4 and 5,
     never tried, stay in the buffer after the moved cursor and a later pass extracts them (the finalize dead-letter used to
     rename the WHOLE buffer)."""
     persona, store, hebbian, transcripts = world
@@ -973,7 +973,7 @@ def test_finalize_sets_aside_only_the_failing_chunk_and_the_rest_is_extracted_la
 
 
 def test_an_oversize_message_moves_the_cursor_only_after_its_last_piece(world) -> None:
-    """Pre-merge review M1: the pieces of one over-long message are one chunk for the cursor: a failure on a later piece leaves
+    """The pieces of one over-long message are one chunk for the cursor: a failure on a later piece leaves
     the cursor before the message, so the next pass sends every piece again (nothing is recorded as extracted that was not)."""
     persona, _, _, transcripts = world
     rows = _seed(persona, "sess_ovr", 2)
