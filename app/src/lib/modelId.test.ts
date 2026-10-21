@@ -3,7 +3,9 @@ import { describe, expect, it } from "vitest";
 import {
   CHAT_MODEL_ID_PATTERN,
   MODEL_ID_MAX_LENGTH,
+  CHECK_FREE_ALIASES,
   isChatModelAlias,
+  isCheckFreeAlias,
   isValidChatModel,
   shortenModelId,
 } from "./modelId";
@@ -50,6 +52,14 @@ describe("modelId", () => {
 
   it.each(BAD_IDS)("rejects %j", (bad) => {
     expect(isValidChatModel(bad)).toBe(false);
+  });
+
+  it("names the two words that never run a check call: sonnet and haiku, not opus and not a full id", () => {
+    expect([...CHECK_FREE_ALIASES]).toEqual(["sonnet", "haiku"]);
+    expect(isCheckFreeAlias("sonnet")).toBe(true);
+    expect(isCheckFreeAlias("haiku")).toBe(true);
+    expect(isCheckFreeAlias("opus")).toBe(false);
+    expect(isCheckFreeAlias("claude-sonnet-5")).toBe(false);
   });
 
   it("caps a full id at 64 characters", () => {

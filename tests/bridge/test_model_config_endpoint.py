@@ -77,6 +77,26 @@ def test_haiku_writes_the_alias_with_no_probe(tmp_path, capture_claude_argv) -> 
     assert _overrides()[_CHAT] == "haiku" and capture_claude_argv.argvs == []
 
 
+@pytest.mark.parametrize("word", ["sonnet", "opus", "haiku"])
+def test_the_apps_check_free_words_are_exactly_the_words_the_bridge_never_probes(
+    tmp_path, capture_claude_argv, word
+) -> None:
+    """app/src/lib/modelId.ts CHECK_FREE_ALIASES decides which picker saves the app may replay after a network failure
+    (a replay of a request that runs a check call would run a second one). It must name exactly the words this
+    endpoint answers without a probe."""
+    import re
+
+    ts = (Path(__file__).resolve().parents[2] / "app" / "src" / "lib" / "modelId.ts").read_text(encoding="utf-8")
+    listed = re.search(r"CHECK_FREE_ALIASES = \[(.*?)\] as const", ts, re.S)
+    assert listed, "CHECK_FREE_ALIASES not found in modelId.ts"
+    check_free = re.findall(r'"([a-z]+)"', listed.group(1))
+    client, _ = _make_client(tmp_path)
+    with client:
+        assert _post(client, word).status_code == 200
+    probed = bool(capture_claude_argv.argvs)
+    assert probed == (word not in check_free), f"{word}: probed={probed}, listed check-free={check_free}"
+
+
 def test_a_full_id_is_written_verbatim_even_when_it_equals_the_default(tmp_path, capture_claude_argv) -> None:
     client, _ = _make_client(tmp_path)
     with client:

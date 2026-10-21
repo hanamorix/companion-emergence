@@ -410,15 +410,23 @@ describe("setPersonaModel", () => {
     expect(spy).toHaveBeenCalledTimes(1);
   });
 
-  it("still replays an alias after a network failure", async () => {
+  it.each(["sonnet", "haiku"])("still replays the check-free word %s after a network failure", async (word) => {
     const spy = vi
       .fn()
       .mockRejectedValueOnce(new TypeError("Failed to fetch"))
-      .mockResolvedValue(new Response(JSON.stringify({ ok: true, model: "opus" }), { status: 200 }));
+      .mockResolvedValue(new Response(JSON.stringify({ ok: true, model: word }), { status: 200 }));
     vi.stubGlobal("fetch", spy);
 
-    await expect(setPersonaModel("alice", "opus")).resolves.toBeUndefined();
+    await expect(setPersonaModel("alice", word)).resolves.toBeUndefined();
     expect(spy).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not replay opus after a network failure (it is checked like a full id, so a replay would run a second check)", async () => {
+    const spy = vi.fn().mockRejectedValue(new TypeError("Failed to fetch"));
+    vi.stubGlobal("fetch", spy);
+
+    await expect(setPersonaModel("alice", "opus")).rejects.toThrow("Failed to fetch");
+    expect(spy).toHaveBeenCalledTimes(1);
   });
 });
 

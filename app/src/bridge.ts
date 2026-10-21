@@ -13,7 +13,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { modelRejectionMessage, type ModelFallbackInfo } from "./lib/friendlyChatError";
-import { isChatModelAlias } from "./lib/modelId";
+import { isCheckFreeAlias } from "./lib/modelId";
 
 export interface BridgeCredentials {
   url: string;        // http base — for fetch() calls
@@ -698,8 +698,9 @@ export type ChatModel = string;
  * Resolves to the bridge's `checked` flag: true when the check call confirmed the id, false when the check
  * could not run (the id was saved anyway), undefined when no check was made.
  *
- * Throws on any non-2xx response. A request that runs a check is NOT replayed after a network failure: the
- * setter is idempotent, but a replay would run a second check call.
+ * Throws on any non-2xx response. A request that runs a check (`opus` and every full id) is NOT replayed after a
+ * network failure: the setter is idempotent, but a replay would run a second check call. `sonnet` and `haiku` never
+ * run one, so those two are replayed.
  */
 export async function setPersonaModelFull(
   persona: string,
@@ -711,7 +712,7 @@ export async function setPersonaModelFull(
       headers: authHeaders(creds),
       body: JSON.stringify({ model }),
     }),
-    isChatModelAlias(model) ? REPLAYABLE : {},
+    isCheckFreeAlias(model) ? REPLAYABLE : {},
   );
   if (!r.ok) {
     const body = await r.json().catch(() => null);
