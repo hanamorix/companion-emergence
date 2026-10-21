@@ -62,7 +62,7 @@ def _default_persona_config_dict() -> dict:
 
 @dataclass
 class PersonaConfig:
-    """Per-persona routing config — currently provider + searcher. The model is NOT here: which model runs a job
+    """Per-persona routing config (currently provider + searcher). The model is NOT here: which model runs a job
     is an install-wide setting in the tunables file (``brain.bridge.model_tier``).
 
     Future fields (face, body, voice presets) will land here too — the

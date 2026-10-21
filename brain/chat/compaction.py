@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 # worth of text — bounded, not growing.
 
 def build_compaction_provider(persona_dir):
-    """The provider compaction should use — the persona's provider *kind*, running
+    """The provider compaction should use: the persona's provider *kind*, running
     the model of the compaction job (its own line in the tunables, a small cheap
     model by default: plenty for memory folding, and it keeps the cost off the
     larger chat model). For a ``fake`` persona (tests) this resolves to a

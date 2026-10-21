@@ -71,7 +71,7 @@ def _read_state(path: Path) -> tuple[bytes, dict[str, Any], dict[str, Any]] | No
     try:
         original_bytes = path.read_bytes()
     except FileNotFoundError:
-        return None  # nothing to migrate — a fresh persona has no old keys
+        return None  # nothing to migrate: a fresh persona has no old keys
     except OSError as exc:
         logger.warning("tunables_migration: cannot read %s (%s) — skipping", path, exc)
         return None
@@ -123,7 +123,7 @@ def migrate_idle_keys(home: Path) -> None:
             _rewrite(path, *state)
     except LockTimeoutError:
         logger.warning(
-            "tunables_migration: another process held the lock on %s for %.1f s — skipping (retried at the next start)",
+            "tunables_migration: another process held the lock on %s for %.1f s, so the migration was skipped (retried at the next start)",
             path, dev_constants.SETTINGS_FILE_LOCK_WAIT_S,
         )
 
@@ -190,7 +190,7 @@ def _rewrite(path: Path, original_bytes: bytes, data: dict[str, Any], overrides:
         except OSError:
             pass
 
-    # the file's signature changed under tunables.py's own cache — the next get_tunable()
+    # the file's signature changed under tunables.py's own cache: the next get_tunable()
     # call re-reads (tunables.py:_load_overrides_locked), no extra reset needed.
     logger.info(
         "tunables_migration: migrated %s (%d retired key(s) removed%s)",

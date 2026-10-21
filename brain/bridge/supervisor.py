@@ -2467,7 +2467,7 @@ def _run_compaction_tick(
     live-turn persist (see brain/chat/rollover.py + session.persist_turns_following_
     successor).
 
-    Provider is the compaction job's model via build_compaction_provider — cost
+    Provider is the compaction job's model via build_compaction_provider: cost
     stays off the chat model. Called only by the central cadence function's
     compaction job (daily default, persisted cadence per #21; ram-spike-fix
     INC-9 removed the startup catch-up call — an overdue cascade runs at the
