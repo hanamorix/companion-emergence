@@ -59,8 +59,9 @@ export function friendlyChatError(raw: string): string {
 export const MODEL_UNCHECKED_MESSAGE =
   "Couldn't check that model right now; saved anyway, and any problem will show here.";
 
-/** The line for a `model` value in the persona's settings that the app does not support (#446). The bridge
- *  runs Sonnet instead; picking any model in the picker (the current one included) replaces the value. */
+/** The line for a chat model setting in the install's settings file that the app does not support (#446). The
+ *  bridge runs the shipped default (Sonnet) instead; picking any model in the picker (the current one included)
+ *  replaces the value. */
 export function modelUnsupportedMessage(value: string): string {
   return (
     `The model "${value}" in your settings is not supported, so Sonnet is being used instead. ` +
@@ -70,36 +71,41 @@ export function modelUnsupportedMessage(value: string): string {
 
 /**
  * The line for a model the Claude CLI rejected while it was in use (from the bridge's
- * `model_rejections`). `chosen` is true when it is the model the user picked; otherwise it is a model
- * some background job uses on its own, so changing the chat model would not help.
+ * `model_rejections`). `chosen` is true when it is the chat model's setting; otherwise it is a model some
+ * background job is set to. `jobsOnDefault` is true when the bridge reports that the jobs set to this id now run
+ * their shipped default instead (`model_fallbacks`); when it is false the rejected id IS the shipped default of
+ * those jobs, so there is nothing to fall back to and they keep failing until Claude Code is updated or the model
+ * setting is changed.
  */
-export function modelRejectedNowMessage(model: string, chosen: boolean): string {
+export function modelRejectedNowMessage(model: string, chosen: boolean, jobsOnDefault: boolean): string {
   const name = `the model "${shortenModelId(model)}"`;
-  return chosen
-    ? `Claude rejected ${name}. It may not exist, or your account may not have access to it. Use change to pick another model.`
-    : `Claude rejected ${name}, which some background jobs use on their own. Check that your Claude account can use it.`;
-}
-
-/** One background tier family whose version-matched model was not available (from the bridge). */
-export interface TierFallbackInfo {
-  family: string;
-  wanted: string;
-  using: string;
-}
-
-/** The plain line for a tier model that fell back to what that tier uses today. */
-export function tierFallbackMessage(f: TierFallbackInfo): string {
+  if (jobsOnDefault) {
+    return (
+      `Claude rejected ${name}. It may not exist, or your account may not have access to it. ` +
+      (chosen
+        ? "Chat now runs the default model instead. Use change to pick another model."
+        : "Some background jobs now run the default model instead.")
+    );
+  }
   return (
-    `Background jobs that use the ${f.family} family are using "${shortenModelId(f.using)}", ` +
-    `because "${shortenModelId(f.wanted)}" could not be used ` +
-    "(it may not exist, or your account may not have access to it)."
+    `Claude rejected ${name}, which is the default model. ` +
+    (chosen
+      ? "Chat keeps failing until Claude Code is updated or you pick another model with change."
+      : "Some background jobs keep failing until Claude Code is updated or the model setting is changed.")
   );
 }
 
-/** Derived background-model ids an Apply could not check (its time budget ran out, a timeout, ...). */
-export function tiersUncheckedMessage(ids: string[]): string {
+/** One job that now runs its shipped default because the model it is set to was rejected (from the bridge). */
+export interface ModelFallbackInfo {
+  job: string;
+  configured: string;
+  using: string;
+}
+
+/** The plain line for a job that fell back to its shipped default model. */
+export function modelFallbackMessage(f: ModelFallbackInfo): string {
   return (
-    `Some background models were not checked yet (${ids.map((m) => shortenModelId(m)).join(", ")}). ` +
-    "They are checked when first used, and any problem will show here."
+    `The ${f.job.replace(/-/g, " ")} job is using "${shortenModelId(f.using)}" instead of ` +
+    `"${shortenModelId(f.configured)}", which Claude rejected.`
   );
 }

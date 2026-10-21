@@ -9,12 +9,11 @@ import { RestartBridgeButton } from "./RestartBridgeButton";
 import { ModelPicker } from "./ModelPicker";
 import {
   MODEL_UNCHECKED_MESSAGE,
+  modelFallbackMessage,
   modelRejectedNowMessage,
   modelUnsupportedMessage,
-  tierFallbackMessage,
-  tiersUncheckedMessage,
-  type TierFallbackInfo,
 } from "../../lib/friendlyChatError";
+import { isChatModelAlias } from "../../lib/modelId";
 import { PronounPicker } from "./PronounPicker";
 import { NotesToggle } from "./NotesToggle";
 import { KindledLinkToggle } from "./KindledLinkToggle";
@@ -95,10 +94,6 @@ export function ConnectionPanel({
   // Set when the last Apply saved a custom model the bridge could not confirm: shown at once, then the
   // bridge's `model_unconfirmed` list takes over (it empties when a clean reply arrives for the model).
   const [pendingNotice, setPendingNotice] = useState(false);
-  // Tier fallbacks the last Apply reported, shown at once until the bridge's own list (state) takes over.
-  // null = no Apply since the last state; an empty list is a fresh answer: none.
-  const [pendingFallbacks, setPendingFallbacks] = useState<TierFallbackInfo[] | null>(null);
-  const [pendingTiersUnchecked, setPendingTiersUnchecked] = useState<string[] | null>(null);
   // Guard against a poll that left BEFORE the last Apply and lands after it: it still reports the old chat
   // model and must not bring back the old lines. It is released by the first poll that reports any other
   // model (the new one, or one changed elsewhere meanwhile), or after GUARD_RELEASE_MS, whichever is first;
@@ -110,8 +105,6 @@ export function ConnectionPanel({
     guardTimerRef.current = null;
     guardRef.current = null;
     setPendingNotice(false);
-    setPendingFallbacks(null);
-    setPendingTiersUnchecked(null);
   };
   useEffect(() => {
     const g = guardRef.current;
@@ -125,28 +118,30 @@ export function ConnectionPanel({
     },
     [],
   );
-  const fallbacks = pendingFallbacks ?? state?.tier_fallbacks ?? [];
+  const fallbacks = state?.model_fallbacks ?? [];
   const modelNotice =
     pendingNotice || (displayModel !== null && (state?.model_unconfirmed ?? []).includes(displayModel))
       ? MODEL_UNCHECKED_MESSAGE
       : null;
   // Models the Claude CLI rejected while in use (the bridge drops a record when the model changes or a
   // clean reply arrives). A record for the model the user has since replaced is stale until the next poll.
-  const explainedByFallback = new Set(fallbacks.map((f) => f.wanted));
+  // `model_fallbacks` says which jobs run their shipped default now because of it; a record with no fallback
+  // names the shipped default itself, which keeps failing until Claude Code is updated.
   const rejectionLines = (state?.model_rejections ?? []).flatMap((rec) => {
-    // The chat model's own rejection is never hidden, even when a fallback line names the same id.
-    if (rec.model === displayModel) return [modelRejectedNowMessage(rec.model, true)];
-    if (rec.model === conn?.model) return [];
-    if (explainedByFallback.has(rec.model)) return [];
-    return [modelRejectedNowMessage(rec.model, false)];
+    const jobs = fallbacks.filter((f) => f.configured === rec.model);
+    const chosen = rec.model === displayModel || jobs.some((f) => f.job === "interactive-chat");
+    if (rec.model !== displayModel && rec.model === conn?.model && localModel !== null) return [];
+    return [modelRejectedNowMessage(rec.model, chosen, jobs.length > 0)];
   });
   // #446: a hand-edited unsupported `model` value (Sonnet runs instead). Hidden at once after the user applies a
   // model here; the bridge's next poll then reports null.
   const unsupportedModel = localModel === null ? (state?.model_unsupported ?? null) : null;
   const unsupportedLine = unsupportedModel ? modelUnsupportedMessage(unsupportedModel) : null;
-  const fallbackLines = fallbacks.map(tierFallbackMessage);
-  const uncheckedTiers = (pendingTiersUnchecked ?? state?.tier_unconfirmed ?? []).filter((m) => m !== displayModel);
-  const tiersNote = uncheckedTiers.length > 0 ? tiersUncheckedMessage(uncheckedTiers) : null;
+  const fallbackLines = fallbacks.map(modelFallbackMessage);
+  // The picker is for a Claude persona only (another provider runs its own model), and only once the model is known.
+  const claudePersona = conn?.provider === "claude-cli";
+  const pickerChoice =
+    localModel !== null ? (isChatModelAlias(localModel) ? localModel : null) : (conn?.model_choice ?? null);
   const [showPronounPicker, setShowPronounPicker] = useState(false);
   // Local pronoun override — updated optimistically after a successful apply.
   const [localPronouns, setLocalPronouns] = useState<PronounPreset | null>(null);
@@ -329,8 +324,8 @@ export function ConnectionPanel({
           See docs/superpowers/specs/2026-05-30-inner-monologue-tool-call-design.md §6. */}
 
       <Divider />
-      <SectionLabel>Model</SectionLabel>
-      {!showModelPicker ? (
+      {claudePersona && <SectionLabel>Model</SectionLabel>}
+      {claudePersona && !showModelPicker ? (
         <div
           style={{
             fontSize: 10.5,
@@ -346,6 +341,7 @@ export function ConnectionPanel({
           .{" "}
           <button
             aria-label="change model"
+            disabled={displayModel === null}
             onClick={() => setShowModelPicker(true)}
             style={{
               background: "none",
@@ -361,9 +357,10 @@ export function ConnectionPanel({
             change
           </button>
         </div>
-      ) : (
+      ) : claudePersona && displayModel !== null ? (
         <ModelPicker
-          current={displayModel ?? "sonnet"}
+          current={displayModel}
+          choice={pickerChoice}
           persona={persona}
           allowReapply={unsupportedModel !== null}
           onClose={(newModel, info) => {
@@ -373,13 +370,11 @@ export function ConnectionPanel({
               guardRef.current = { before: conn?.model ?? null, applied: newModel };
               guardTimerRef.current = setTimeout(releaseGuard, GUARD_RELEASE_MS);
               setPendingNotice(info?.checked === false);
-              setPendingFallbacks(info?.fallbacks ?? []);
-              setPendingTiersUnchecked(info?.tiersUnchecked ?? []);
             }
             setShowModelPicker(false);
           }}
         />
-      )}
+      ) : null}
       {unsupportedLine && (
         <div role="status" style={{ fontSize: 10.5, color: "var(--crimson)", lineHeight: 1.5, marginBottom: 6, wordBreak: "break-word" }}>
           {unsupportedLine}
@@ -388,11 +383,6 @@ export function ConnectionPanel({
       {modelNotice && (
         <div role="status" style={{ fontSize: 10.5, color: "var(--text-mute)", lineHeight: 1.5, marginBottom: 6 }}>
           {modelNotice}
-        </div>
-      )}
-      {tiersNote && (
-        <div role="status" style={{ fontSize: 10.5, color: "var(--text-mute)", lineHeight: 1.5, marginBottom: 6, wordBreak: "break-word" }}>
-          {tiersNote}
         </div>
       )}
       {fallbackLines.map((line) => (

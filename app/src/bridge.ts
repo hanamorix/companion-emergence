@@ -12,7 +12,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
-import { modelRejectionMessage, type TierFallbackInfo } from "./lib/friendlyChatError";
+import { modelRejectionMessage, type ModelFallbackInfo } from "./lib/friendlyChatError";
 import { isChatModelAlias } from "./lib/modelId";
 
 export interface BridgeCredentials {
@@ -134,7 +134,12 @@ export interface PersonaState {
   soul_highlight: SoulHighlight | null;
   connection: {
     provider: string | null;
+    /** The model the chat job runs right now (the install-wide setting, or its shipped default after a rejection),
+     *  for a claude-cli persona; null for any other provider (its own model is not a Claude id). */
     model: string | null;
+    /** The picker word that model means (one of the three words the picker offers), or null for a custom id or another provider.
+     *  Optional so older bridge builds degrade to no highlighted word. */
+    model_choice?: string | null;
     last_heartbeat_at: string | null;
     /** Preset key from backend preset_key_for — "she/her" | "he/him" | "they/them" | null.
      *  Null means unset (defaults to she/her in the UI). */
@@ -165,23 +170,21 @@ export interface PersonaState {
    *  state). The app shows the re-authorise offer while this is true.
    *  Optional so older bridge builds without the field degrade gracefully. */
   provider_auth_expired?: boolean;
-  /** Models the Claude CLI rejected (unknown, or not available to this account) among the configured
-   *  chat model and the tier models; [] when none. The connection panel shows a line for each (#440);
+  /** Models the Claude CLI rejected (unknown, or not available to this account) among the models the jobs are
+   *  CONFIGURED with (not the ones they run now); [] when none. The connection panel shows a line for each (#440);
    *  the bridge drops a record when the model changes or a clean reply arrives for it.
    *  Optional so older bridge builds degrade gracefully. */
   model_rejections?: Array<{ model: string; since: string; last_at: string; count: number }>;
-  /** The hand-edited `model` value the app does not support (the bridge runs sonnet instead), shown cut and
-   *  cleaned; null when the setting is supported (or the provider ignores it). The panel shows a plain line (#446).
-   *  Optional so older bridge builds degrade gracefully. */
+  /** The chat model setting in the install's settings file that the app does not support (the bridge runs the
+   *  shipped default instead), shown cut and cleaned; null when the setting is supported (or the provider ignores
+   *  it). The panel shows a plain line (#446). Optional so older bridge builds degrade gracefully. */
   model_unsupported?: string | null;
   /** The chat model, when it was saved without the Apply-time check being able to confirm it and no clean
    *  reply has arrived for it since; [] otherwise. The connection panel shows a plain notice (#440). */
   model_unconfirmed?: string[];
-  /** Background (tier) models that fell back to what each tier uses today because the model matching the
-   *  chat model's version was rejected; [] when none. The connection panel shows a plain line each (#441). */
-  tier_fallbacks?: TierFallbackInfo[];
-  /** Derived background-model ids an Apply could not check yet (budget used up, timeout); [] when none. */
-  tier_unconfirmed?: string[];
+  /** Jobs that now run their shipped default model because the model they are set to was rejected; [] when none.
+   *  The connection panel shows a plain line each. */
+  model_fallbacks?: ModelFallbackInfo[];
   /** File writes she has proposed and that await the user's approve/decline.
    *  Each is the consent gate for one guarded write — `propose_write` queued
    *  it (writing nothing); the user commits it to disc or discards it via the
@@ -681,28 +684,27 @@ export async function fetchHealth(persona: string): Promise<BridgeHealth> {
   return (await r.json()) as BridgeHealth;
 }
 
-/** The chat model: an alias ("sonnet" | "opus" | "haiku") or a full model id such as "claude-sonnet-5". */
+/** The chat model: one of the picker's words or a full model id (it starts with "claude-"). */
 export type ChatModel = string;
 
 /**
- * Switch the active LLM model for the given persona.
+ * Set the chat model for the whole install (every persona shares it).
  *
- * POSTs {model} to POST /persona/config/model. The bridge validates the
- * alias or full id, persists to persona_config.json, and hot-swaps
- * provider._model so the next chat uses the new model without a restart.
- * For a full id the bridge first makes one check call to Claude; if Claude
- * rejects the model nothing is saved and the thrown message says so.
+ * POSTs {model} to POST /persona/config/model. The bridge validates the word (sonnet / opus / haiku) or the full
+ * id and writes the install's tunables file; nothing is switched live, because every bridge reads the file on
+ * every call. For a newly chosen id that is not the haiku word the bridge first makes one check call to Claude;
+ * if Claude rejects the model nothing is saved and the thrown message says so.
  *
- * Resolves to the bridge's `checked` flag: true when the check call confirmed a custom id, false when
- * the check could not run (the id was saved anyway), undefined for an alias (no check is made).
+ * Resolves to the bridge's `checked` flag: true when the check call confirmed the id, false when the check
+ * could not run (the id was saved anyway), undefined when no check was made.
  *
- * Throws on any non-2xx response. A custom id is NOT replayed after a network
- * failure: the setter is idempotent, but a replay would run a second check call.
+ * Throws on any non-2xx response. A request that runs a check is NOT replayed after a network failure: the
+ * setter is idempotent, but a replay would run a second check call.
  */
 export async function setPersonaModelFull(
   persona: string,
   model: ChatModel,
-): Promise<{ checked?: boolean; fallbacks: TierFallbackInfo[]; tiersUnchecked: string[] }> {
+): Promise<{ checked?: boolean }> {
   const r = await bridgeFetch(persona, (creds) =>
     fetch(`${creds.url}/persona/config/model`, {
       method: "POST",
@@ -712,21 +714,24 @@ export async function setPersonaModelFull(
     isChatModelAlias(model) ? REPLAYABLE : {},
   );
   if (!r.ok) {
-    if (r.status === 400) {
-      const body = await r.json().catch(() => null);
-      if (body && body.error === "model_unavailable") {
-        const rejected = typeof body.model === "string" ? body.model : model;
-        throw new Error(modelRejectionMessage(rejected, "picker"));
-      }
+    const body = await r.json().catch(() => null);
+    if (r.status === 400 && body && body.error === "model_unavailable") {
+      const rejected = typeof body.model === "string" ? body.model : model;
+      throw new Error(modelRejectionMessage(rejected, "picker"));
+    }
+    if (r.status === 400 && body && body.error === "model_not_applicable") {
+      throw new Error("This persona does not use Claude, so there is no Claude model to choose.");
+    }
+    if (r.status === 500 && body && body.error === "tunables_unwritable") {
+      throw new Error(
+        "The model setting could not be saved because the settings file is damaged or locked. " +
+          "See the settings-file notice in the app, then try again.",
+      );
     }
     throw new Error(`setPersonaModel failed: ${r.status}`);
   }
   const ok = await r.json().catch(() => null);
-  return {
-    checked: ok && typeof ok.checked === "boolean" ? ok.checked : undefined,
-    fallbacks: ok && Array.isArray(ok.fallbacks) ? (ok.fallbacks as TierFallbackInfo[]) : [],
-    tiersUnchecked: ok && Array.isArray(ok.tiers_unchecked) ? (ok.tiers_unchecked as string[]) : [],
-  };
+  return { checked: ok && typeof ok.checked === "boolean" ? ok.checked : undefined };
 }
 
 /** Like {@link setPersonaModelFull} but resolves to the `checked` flag alone. */

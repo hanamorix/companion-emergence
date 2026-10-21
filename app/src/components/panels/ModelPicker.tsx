@@ -1,15 +1,18 @@
 import { useState } from "react";
 import { setPersonaModelFull, type ChatModel } from "../../bridge";
-import type { TierFallbackInfo } from "../../lib/friendlyChatError";
 import { MODEL_ID_MAX_LENGTH, isChatModelAlias, isValidChatModel } from "../../lib/modelId";
 
 /** Radio value for the custom-id option; never sent to the bridge (the typed id is). */
 const CUSTOM = "__custom__";
 
 interface Props {
+  /** The model the chat job runs now (the bridge's effective id). */
   current: ChatModel;
+  /** The word that model means (the bridge's `model_choice`): highlights its radio; null for a custom id, which
+   *  opens the custom field instead. */
+  choice: string | null;
   persona: string;
-  /** `info` is only passed when the bridge could not confirm the model or some tiers fell back (#440, #441). */
+  /** `info` is only passed when the bridge could not confirm the model (#440). */
   onClose: (newModel?: ChatModel, info?: ModelApplyInfo) => void;
   /** Let Apply be pressed for the model that is already current (an unsupported setting fell back to it, #446). */
   allowReapply?: boolean;
@@ -18,10 +21,6 @@ interface Props {
 export interface ModelApplyInfo {
   /** false: the bridge could not confirm the model (it was saved anyway). */
   checked?: false;
-  /** Background tiers that fell back because the version-matched model was not available. */
-  fallbacks?: TierFallbackInfo[];
-  /** Derived background-model ids the bridge could not check yet (its time budget ran out). */
-  tiersUnchecked?: string[];
 }
 
 interface ModelOption {
@@ -48,10 +47,10 @@ const OPTIONS: ModelOption[] = [
   },
 ];
 
-export function ModelPicker({ current, persona, onClose, allowReapply = false }: Props) {
-  const currentIsAlias = isChatModelAlias(current);
-  const [selected, setSelected] = useState<string>(currentIsAlias ? current : CUSTOM);
-  const [customText, setCustomText] = useState(currentIsAlias ? "" : current);
+export function ModelPicker({ current, choice, persona, onClose, allowReapply = false }: Props) {
+  const choiceIsWord = choice !== null && isChatModelAlias(choice);
+  const [selected, setSelected] = useState<string>(choiceIsWord ? choice : CUSTOM);
+  const [customText, setCustomText] = useState(choiceIsWord ? "" : current);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -59,21 +58,19 @@ export function ModelPicker({ current, persona, onClose, allowReapply = false }:
   // Surrounding whitespace is dropped (a pasted id often has some); the rest is validated as written.
   const value = isCustom ? customText.trim() : selected;
   const valid = isValidChatModel(value);
-  // allowReapply: the stored model is the fallback for an unsupported setting, so applying it again is how the
-  // user replaces (and clears) that setting.
-  const canApply = !busy && valid && (value !== current || allowReapply);
+  // allowReapply: the shown model is the fallback for an unsupported setting, so applying it again is how the
+  // user replaces (and clears) that setting. A word equal to the highlighted choice is no change; a typed id
+  // is a change unless the model is already pinned to that very id (typing the id of a word's model pins it).
+  const unchanged = isCustom ? choice === null && value === current : value === choice;
+  const canApply = !busy && valid && (!unchanged || allowReapply);
   const showFormatHint = isCustom && value !== "" && !valid;
 
   async function onConfirm() {
     setBusy(true);
     setError(null);
     try {
-      const { checked, fallbacks, tiersUnchecked } = await setPersonaModelFull(persona, value);
-      const info: ModelApplyInfo = {};
-      if (checked === false) info.checked = false;
-      if (fallbacks.length > 0) info.fallbacks = fallbacks;
-      if (tiersUnchecked.length > 0) info.tiersUnchecked = tiersUnchecked;
-      if (Object.keys(info).length > 0) onClose(value, info);
+      const { checked } = await setPersonaModelFull(persona, value);
+      if (checked === false) onClose(value, { checked: false });
       else onClose(value);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
