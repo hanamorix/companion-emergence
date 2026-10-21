@@ -4,8 +4,8 @@ import {
   friendlyChatError,
   modelRejectionMessage,
   modelUnsupportedMessage,
-  tierFallbackMessage,
-  tiersUncheckedMessage,
+  modelFallbackMessage,
+  modelRejectedNowMessage,
 } from "./friendlyChatError";
 
 describe("friendlyChatError", () => {
@@ -72,20 +72,35 @@ describe("friendlyChatError", () => {
     expect(out).not.toContain("—");
   });
 
-  it("words a tier fallback plainly, without an em-dash", () => {
-    const out = tierFallbackMessage({ family: "haiku", wanted: "claude-haiku-5", using: "haiku" });
+  it("words a job that fell back to its default plainly, without an em-dash", () => {
+    const out = modelFallbackMessage({ job: "background-classifier", configured: "claude-haiku-5", using: "haiku" });
     expect(out).toBe(
-      'Background jobs that use the haiku family are using "haiku", because "claude-haiku-5" could not be used (it may not exist, or your account may not have access to it).',
+      'The background classifier job is using "haiku" instead of "claude-haiku-5", which Claude rejected.',
     );
     expect(out).not.toContain("—");
   });
 
-  it("words the not-checked-yet background models plainly", () => {
-    const out = tiersUncheckedMessage(["claude-haiku-5", "claude-sonnet-4-8"]);
+  it("says the jobs now run the default model when a configured id was rejected", () => {
+    const chat = modelRejectedNowMessage("claude-sonet-5", true, true);
+    expect(chat).toBe(
+      'Claude rejected the model "claude-sonet-5". It may not exist, or your account may not have access to it. Chat now runs the default model instead. Use change to pick another model.',
+    );
+    const bg = modelRejectedNowMessage("claude-haiku-5", false, true);
+    expect(bg).toContain("Some background jobs now run the default model instead.");
+    expect(chat).not.toContain("—");
+    expect(bg).not.toContain("—");
+  });
+
+  it("says the job keeps failing when the rejected id is the default itself", () => {
+    const out = modelRejectedNowMessage("claude-sonnet-5", true, false);
     expect(out).toBe(
-      "Some background models were not checked yet (claude-haiku-5, claude-sonnet-4-8). They are checked when first used, and any problem will show here.",
+      'Claude rejected the model "claude-sonnet-5", which is the default model. Chat keeps failing until Claude Code is updated or you pick another model with change.',
     );
     expect(out).not.toContain("—");
+    expect(modelRejectedNowMessage("claude-sonnet-5", false, false)).toContain(
+      "keep failing until Claude Code is updated or the model setting is changed.",
+    );
+    expect(modelRejectedNowMessage("claude-sonnet-5", true, false)).not.toContain("default model instead");
   });
 
   it("words the unsupported-model setting plainly, naming the value and Sonnet, without an em-dash", () => {

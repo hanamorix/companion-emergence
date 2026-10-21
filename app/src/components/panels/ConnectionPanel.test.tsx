@@ -361,30 +361,22 @@ vi.mock("./ModelPicker", () => ({
   ModelPicker: ({
     onClose,
     allowReapply,
+    current,
+    choice,
   }: {
     allowReapply?: boolean;
-    onClose: (
-      m?: string,
-      info?: {
-        checked?: false;
-        fallbacks?: { family: string; wanted: string; using: string }[];
-        tiersUnchecked?: string[];
-      },
-    ) => void;
+    current: string;
+    choice: string | null;
+    onClose: (m?: string, info?: { checked?: false }) => void;
   }) => (
-    <div data-testid="model-picker" data-allow-reapply={String(allowReapply === true)}>
+    <div
+      data-testid="model-picker"
+      data-allow-reapply={String(allowReapply === true)}
+      data-current={current}
+      data-choice={String(choice)}
+    >
       <button onClick={() => onClose("opus")}>Apply opus</button>
       <button onClick={() => onClose("claude-sonnet-5", { checked: false })}>Apply unchecked</button>
-      <button
-        onClick={() =>
-          onClose("claude-sonnet-5", { fallbacks: [{ family: "haiku", wanted: "claude-haiku-5", using: "haiku" }] })
-        }
-      >
-        Apply with fallback
-      </button>
-      <button onClick={() => onClose("claude-sonnet-5", { tiersUnchecked: ["claude-haiku-5"] })}>
-        Apply with unchecked tiers
-      </button>
       <button onClick={() => onClose()}>Cancel</button>
     </div>
   ),
@@ -453,11 +445,33 @@ describe("ConnectionPanel — rejected and unchecked models (#440)", () => {
     cleanup();
   });
 
-  it("names the chosen model Claude rejected and says what to do", () => {
-    render(<ConnectionPanel state={sonnetState({ model_rejections: [rec("sonnet")] })} persona="test" />);
-    const line = screen.getByText(/Claude rejected the model "sonnet"/);
+  const CHAT_FALLBACK = { job: "interactive-chat", configured: "claude-sonet-5", using: "claude-sonnet-5" };
+  const BG_FALLBACK = { job: "background-classifier", configured: "claude-haiku-5", using: "haiku" };
+  const effective = (extra: Partial<PersonaState> = {}) =>
+    baseState({
+      connection: { provider: "claude-cli", model: "claude-sonnet-5", model_choice: "sonnet", last_heartbeat_at: null },
+      ...extra,
+    });
+
+  it("names the chat model Claude rejected, says chat runs the default now, and what to do", () => {
+    render(
+      <ConnectionPanel
+        state={effective({ model_rejections: [rec("claude-sonet-5")], model_fallbacks: [CHAT_FALLBACK] })}
+        persona="test"
+      />,
+    );
+    const line = screen.getByText(/Claude rejected the model "claude-sonet-5"/);
     expect(line).toHaveTextContent(/may not exist/i);
+    expect(line).toHaveTextContent(/Chat now runs the default model instead/);
     expect(line).toHaveTextContent(/use change to pick another model/i);
+    expect(line.textContent).not.toContain("—");
+    expect(screen.getByText(/The interactive chat job is using "claude-sonnet-5" instead of "claude-sonet-5"/)).toBeInTheDocument();
+  });
+
+  it("says the job keeps failing when the rejected id is the default itself (nothing to fall back to)", () => {
+    render(<ConnectionPanel state={effective({ model_rejections: [rec("claude-sonnet-5")] })} persona="test" />);
+    const line = screen.getByText(/Claude rejected the model "claude-sonnet-5", which is the default model/);
+    expect(line).toHaveTextContent(/Chat keeps failing until Claude Code is updated/);
     expect(line.textContent).not.toContain("—");
   });
 
@@ -468,11 +482,22 @@ describe("ConnectionPanel — rejected and unchecked models (#440)", () => {
     expect(screen.queryByText(/Claude rejected/)).not.toBeInTheDocument();
   });
 
-  it("words a rejected background-only model differently (changing the chat model would not help)", () => {
-    render(<ConnectionPanel state={sonnetState({ model_rejections: [rec("claude-tier-9")] })} persona="test" />);
-    const line = screen.getByText(/Claude rejected the model "claude-tier-9"/);
-    expect(line).toHaveTextContent(/background jobs/i);
+  it("words a rejected background-only model differently and names the job that fell back", () => {
+    render(
+      <ConnectionPanel
+        state={effective({ model_rejections: [rec("claude-haiku-5")], model_fallbacks: [BG_FALLBACK] })}
+        persona="test"
+      />,
+    );
+    const line = screen.getByText(/Claude rejected the model "claude-haiku-5"/);
+    expect(line).toHaveTextContent(/Some background jobs now run the default model instead/);
     expect(line).not.toHaveTextContent(/pick another model/i);
+    expect(screen.getByText(/The background classifier job is using "haiku" instead of "claude-haiku-5"/)).toBeInTheDocument();
+  });
+
+  it("renders nothing for fallbacks when there are none", () => {
+    render(<ConnectionPanel state={sonnetState({ model_fallbacks: [] })} persona="test" />);
+    expect(screen.queryByText(/job is using/)).not.toBeInTheDocument();
   });
 
   it("drops the line as soon as the user changes the model", async () => {
@@ -508,205 +533,6 @@ describe("ConnectionPanel — rejected and unchecked models (#440)", () => {
     expect(screen.queryByText(/Couldn't check that model/)).not.toBeInTheDocument();
   });
 
-  const HAIKU = { family: "haiku", wanted: "claude-haiku-5", using: "haiku" };
-  const PINNED = { family: "haiku", wanted: "claude-haiku-5", using: "claude-haiku-4-5-20251001" };
-
-  it("shows a plain line for each background tier that fell back (#441)", () => {
-    render(
-      <ConnectionPanel
-        state={baseState({
-          connection: { provider: "claude-cli", model: "claude-sonnet-5", last_heartbeat_at: null },
-          tier_fallbacks: [HAIKU, PINNED],
-        })}
-        persona="test"
-      />,
-    );
-    const first = screen.getByText(/using "haiku"/);
-    expect(first).toHaveTextContent(/Background jobs that use the haiku family are using "haiku"/);
-    expect(first).toHaveTextContent(/"claude-haiku-5" could not be used \(it may not exist, or your account may not have access to it\)/);
-    expect(first.textContent).not.toContain("—");
-    expect(screen.getByText(/using "claude-haiku-4-5-20251001"/)).toBeInTheDocument();
-  });
-
-  it("shows the fallbacks the last Apply reported at once, and the bridge's list takes over", async () => {
-    const { rerender } = render(
-      <ConnectionPanel state={baseState({ connection: { provider: "claude-cli", model: "sonnet", last_heartbeat_at: null } })} persona="test" />,
-    );
-    fireEvent.click(screen.getByRole("button", { name: /change model/i }));
-    fireEvent.click(screen.getByRole("button", { name: /apply with fallback/i }));
-    expect(await screen.findByText(/using "haiku"/)).toBeInTheDocument();
-    // the next poll arrives without any fallback: the optimistic line goes away
-    rerender(
-      <ConnectionPanel state={baseState({ connection: { provider: "claude-cli", model: "claude-sonnet-5", last_heartbeat_at: null }, tier_fallbacks: [] })} persona="test" />,
-    );
-    expect(screen.queryByText(/using "haiku"/)).not.toBeInTheDocument();
-  });
-
-  it("prefers the fresh Apply result over a stale poll", async () => {
-    // the poll still lists a fallback from the previous chat model; Apply reports none: the line goes at once
-    render(
-      <ConnectionPanel
-        state={baseState({
-          connection: { provider: "claude-cli", model: "claude-sonnet-5", last_heartbeat_at: null },
-          tier_fallbacks: [HAIKU],
-        })}
-        persona="test"
-      />,
-    );
-    expect(screen.getByText(/using "haiku"/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /change model/i }));
-    fireEvent.click(screen.getByRole("button", { name: /apply opus/i }));
-    await waitFor(() => expect(screen.queryByText(/using "haiku"/)).not.toBeInTheDocument());
-  });
-
-  it("a late pre-Apply poll does not bring back the old lines; the fresh poll takes over", async () => {
-    const staleState = baseState({
-      connection: { provider: "claude-cli", model: "sonnet", last_heartbeat_at: null },
-      tier_fallbacks: [PINNED],
-    });
-    const { rerender } = render(<ConnectionPanel state={staleState} persona="test" />);
-    fireEvent.click(screen.getByRole("button", { name: /change model/i }));
-    fireEvent.click(screen.getByRole("button", { name: /apply with fallback/i })); // applies claude-sonnet-5
-    expect(await screen.findByText(/using "haiku"/)).toBeInTheDocument();
-    // a poll that left before the Apply lands afterwards: still the old chat model, old list
-    rerender(<ConnectionPanel state={{ ...staleState }} persona="test" />);
-    expect(screen.getByText(/using "haiku",/)).toBeInTheDocument();
-    expect(screen.queryByText(/using "claude-haiku-4-5-20251001"/)).not.toBeInTheDocument();
-    // the first poll that reports the new chat model carries the bridge's own list
-    rerender(
-      <ConnectionPanel
-        state={baseState({
-          connection: { provider: "claude-cli", model: "claude-sonnet-5", last_heartbeat_at: null },
-          tier_fallbacks: [PINNED],
-        })}
-        persona="test"
-      />,
-    );
-    expect(screen.getByText(/using "claude-haiku-4-5-20251001"/)).toBeInTheDocument();
-    expect(screen.queryByText(/using "haiku",/)).not.toBeInTheDocument();
-  });
-
-  it("releases the pre-Apply guard at the first poll that reports a model other than the old one", async () => {
-    const before = baseState({ connection: { provider: "claude-cli", model: "sonnet", last_heartbeat_at: null }, tier_fallbacks: [] });
-    const { rerender } = render(<ConnectionPanel state={before} persona="test" />);
-    fireEvent.click(screen.getByRole("button", { name: /change model/i }));
-    fireEvent.click(screen.getByRole("button", { name: /apply with fallback/i })); // applies claude-sonnet-5
-    expect(await screen.findByText(/using "haiku",/)).toBeInTheDocument();
-    // the model was changed somewhere else meanwhile: the poll reports neither the old nor the applied model
-    rerender(
-      <ConnectionPanel
-        state={baseState({
-          connection: { provider: "claude-cli", model: "claude-opus-4-8", last_heartbeat_at: null },
-          tier_fallbacks: [PINNED],
-        })}
-        persona="test"
-      />,
-    );
-    expect(screen.queryByText(/using "haiku",/)).not.toBeInTheDocument(); // the stale optimistic lines are gone
-    expect(screen.getByText(/using "claude-haiku-4-5-20251001"/)).toBeInTheDocument(); // the bridge's list shows
-  });
-
-  it("releases the guard after a bounded time even if no poll ever reports a new model", async () => {
-    vi.useFakeTimers();
-    try {
-      const stale = baseState({
-        connection: { provider: "claude-cli", model: "sonnet", last_heartbeat_at: null },
-        tier_fallbacks: [PINNED],
-      });
-      const { rerender } = render(<ConnectionPanel state={stale} persona="test" />);
-      fireEvent.click(screen.getByRole("button", { name: /change model/i }));
-      fireEvent.click(screen.getByRole("button", { name: /apply with fallback/i }));
-      expect(screen.getByText(/using "haiku",/)).toBeInTheDocument();
-      rerender(<ConnectionPanel state={{ ...stale }} persona="test" />); // still the old model: guard holds
-      expect(screen.getByText(/using "haiku",/)).toBeInTheDocument();
-      act(() => {
-        vi.advanceTimersByTime(15_000);
-      });
-      expect(screen.queryByText(/using "haiku",/)).not.toBeInTheDocument();
-      expect(screen.getByText(/using "claude-haiku-4-5-20251001"/)).toBeInTheDocument();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("holds a same-model re-Apply against a stale poll until the bounded time ends", () => {
-    vi.useFakeTimers();
-    try {
-      const same = baseState({
-        connection: { provider: "claude-cli", model: "claude-sonnet-5", last_heartbeat_at: null },
-        tier_fallbacks: [PINNED],
-      });
-      const { rerender } = render(<ConnectionPanel state={same} persona="test" />);
-      fireEvent.click(screen.getByRole("button", { name: /change model/i }));
-      fireEvent.click(screen.getByRole("button", { name: /apply with fallback/i })); // re-applies claude-sonnet-5
-      expect(screen.getByText(/using "haiku",/)).toBeInTheDocument();
-      rerender(<ConnectionPanel state={{ ...same }} persona="test" />); // a poll that left before the Apply
-      expect(screen.getByText(/using "haiku",/)).toBeInTheDocument(); // still the Apply's answer
-      expect(screen.queryByText(/using "claude-haiku-4-5-20251001"/)).not.toBeInTheDocument();
-      act(() => {
-        vi.advanceTimersByTime(15_000);
-      });
-      expect(screen.queryByText(/using "haiku",/)).not.toBeInTheDocument();
-      expect(screen.getByText(/using "claude-haiku-4-5-20251001"/)).toBeInTheDocument();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("says plainly which background models were not checked yet, at once and from the poll, and clears it", async () => {
-    const withModel = (extra: Partial<PersonaState>) =>
-      baseState({ connection: { provider: "claude-cli", model: "claude-sonnet-5", last_heartbeat_at: null }, ...extra });
-    const { rerender } = render(<ConnectionPanel state={sonnetState()} persona="test" />);
-    fireEvent.click(screen.getByRole("button", { name: /change model/i }));
-    fireEvent.click(screen.getByRole("button", { name: /apply with unchecked tiers/i }));
-    const note = await screen.findByText(/were not checked yet/);
-    expect(note).toHaveTextContent(/claude-haiku-5/);
-    expect(note).toHaveTextContent(/checked when first used, and any problem will show here/);
-    expect(note.textContent).not.toContain("—");
-    // the bridge's poll carries it next
-    rerender(<ConnectionPanel state={withModel({ tier_unconfirmed: ["claude-haiku-5"] })} persona="test" />);
-    expect(screen.getByText(/were not checked yet/)).toBeInTheDocument();
-    // a clean reply for that id arrives: the next poll no longer lists it
-    rerender(<ConnectionPanel state={withModel({ tier_unconfirmed: [] })} persona="test" />);
-    expect(screen.queryByText(/were not checked yet/)).not.toBeInTheDocument();
-  });
-
-  it("does not repeat a rejection line that a fallback line already explains", () => {
-    render(
-      <ConnectionPanel
-        state={baseState({
-          connection: { provider: "claude-cli", model: "claude-sonnet-5", last_heartbeat_at: null },
-          tier_fallbacks: [HAIKU],
-          model_rejections: [
-            { model: "claude-haiku-5", since: "t", last_at: "t", count: 2 },
-          ],
-        })}
-        persona="test"
-      />,
-    );
-    expect(screen.getByText(/using "haiku"/)).toBeInTheDocument();
-    expect(screen.queryByText(/Claude rejected the model "claude-haiku-5"/)).not.toBeInTheDocument();
-  });
-
-  it("never hides a rejection of the chat model, even when a fallback names the same id", () => {
-    render(
-      <ConnectionPanel
-        state={baseState({
-          connection: { provider: "claude-cli", model: "claude-sonnet-5", last_heartbeat_at: null },
-          tier_fallbacks: [{ family: "sonnet", wanted: "claude-sonnet-5", using: "sonnet" }],
-          model_rejections: [{ model: "claude-sonnet-5", since: "t", last_at: "t", count: 2 }],
-        })}
-        persona="test"
-      />,
-    );
-    expect(screen.getByText(/Claude rejected the model "claude-sonnet-5"/)).toBeInTheDocument();
-  });
-
-  it("renders nothing for fallbacks when there are none", () => {
-    render(<ConnectionPanel state={sonnetState({ tier_fallbacks: [] })} persona="test" />);
-    expect(screen.queryByText(/Background jobs that use/)).not.toBeInTheDocument();
-  });
-
   it("tells the user plainly when a custom model was saved without being checked, and clears it on the next change", async () => {
     render(<ConnectionPanel state={sonnetState()} persona="test" />);
     fireEvent.click(screen.getByRole("button", { name: /change model/i }));
@@ -718,6 +544,65 @@ describe("ConnectionPanel — rejected and unchecked models (#440)", () => {
     fireEvent.click(screen.getByRole("button", { name: /change model/i }));
     fireEvent.click(screen.getByRole("button", { name: /apply opus/i }));
     await waitFor(() => expect(screen.queryByText(/Couldn't check that model/)).not.toBeInTheDocument());
+  });
+
+  it("holds the unchecked notice against a stale poll until the bounded time ends", () => {
+    vi.useFakeTimers();
+    try {
+      const same = effective();
+      const { rerender } = render(<ConnectionPanel state={same} persona="test" />);
+      fireEvent.click(screen.getByRole("button", { name: /change model/i }));
+      fireEvent.click(screen.getByRole("button", { name: /apply unchecked/i })); // re-applies claude-sonnet-5
+      expect(screen.getByText(/Couldn't check that model right now/)).toBeInTheDocument();
+      rerender(<ConnectionPanel state={{ ...same }} persona="test" />); // a poll that left before the Apply
+      expect(screen.getByText(/Couldn't check that model right now/)).toBeInTheDocument(); // still the Apply's answer
+      act(() => {
+        vi.advanceTimersByTime(15_000);
+      });
+      expect(screen.queryByText(/Couldn't check that model/)).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("hands the picker the effective id and the word the bridge says it means", () => {
+    render(<ConnectionPanel state={effective()} persona="test" />);
+    fireEvent.click(screen.getByRole("button", { name: /change model/i }));
+    const picker = screen.getByTestId("model-picker");
+    expect(picker).toHaveAttribute("data-current", "claude-sonnet-5");
+    expect(picker).toHaveAttribute("data-choice", "sonnet");
+  });
+
+  it("opens the picker on the custom option when the model means no word", () => {
+    render(
+      <ConnectionPanel
+        state={baseState({ connection: { provider: "claude-cli", model: "claude-sonnet-4-6", model_choice: null, last_heartbeat_at: null } })}
+        persona="test"
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /change model/i }));
+    expect(screen.getByTestId("model-picker")).toHaveAttribute("data-choice", "null");
+  });
+
+  it("does not show the model picker for a persona that does not use Claude", () => {
+    render(
+      <ConnectionPanel
+        state={baseState({ connection: { provider: "ollama", model: null, model_choice: null, last_heartbeat_at: null } })}
+        persona="test"
+      />,
+    );
+    expect(screen.queryByRole("button", { name: /change model/i })).not.toBeInTheDocument();
+  });
+
+  it("does not offer a model change until the bridge has reported the model (no invented default)", () => {
+    render(
+      <ConnectionPanel
+        state={baseState({ connection: { provider: "claude-cli", model: null, last_heartbeat_at: null } })}
+        persona="test"
+      />,
+    );
+    expect(screen.getByRole("button", { name: /change model/i })).toBeDisabled();
+    expect(screen.getAllByText(/loading/).length).toBeGreaterThan(0);
   });
 });
 

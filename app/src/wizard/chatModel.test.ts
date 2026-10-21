@@ -1,14 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { DEFAULT_WIZARD_MODEL, wizardInitModel, wizardModelIsValid } from "./chatModel";
+import { wizardInitModel, wizardModelIsValid } from "./chatModel";
 
 describe("wizard model field", () => {
-  it("blank (or spaces) means the default", () => {
+  it("blank (or spaces) sends no model: the install keeps its current setting", () => {
     expect(wizardModelIsValid("")).toBe(true);
     expect(wizardModelIsValid("   ")).toBe(true);
-    expect(wizardInitModel("")).toBe(DEFAULT_WIZARD_MODEL);
-    expect(wizardInitModel("  ")).toBe("sonnet");
-    expect(wizardInitModel("", "haiku")).toBe("haiku");
+    expect(wizardInitModel("")).toBeNull();
+    expect(wizardInitModel("  ")).toBeNull();
   });
 
   it.each(["sonnet", "opus", "haiku", "claude-sonnet-5", "claude-3-5-haiku-20241022", " claude-opus-4-8 "])(

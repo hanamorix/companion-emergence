@@ -8,10 +8,11 @@ import {
   shortenModelId,
 } from "./modelId";
 
-// KEEP IN SYNC with FULL_IDS / BAD_IDS in tests/bridge/test_persona_config_model.py
-// (the bridge validates with the same grammar and length cap).
+// KEEP IN SYNC with FULL_IDS / BAD_IDS in tests/unit/brain/bridge/test_model_tier.py (a Python test reads these two
+// arrays out of this file and fails when they differ; the bridge validates with the same grammar and length cap).
 const FULL_IDS = [
   "claude-sonnet-5",
+  "claude-cli",
   "claude-opus-4-8",
   "claude-3-5-haiku-20241022",
   "claude-sonnet-4.5",
