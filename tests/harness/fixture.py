@@ -157,10 +157,18 @@ def build_persona(
     ``provider`` is injected only when ``spec.incident`` is set (the incident builder needs a
     compaction provider; a fake keeps the build token-free). Returns a :class:`LiveEnv`.
     """
+    from brain import paths
     from brain.bridge.model_tier import TIER_INTERACTIVE_CHAT, set_job_models
     from brain.memory.store import Memory, MemoryStore
     from brain.setup import write_persona_config
 
+    # The chat model below is written to the install-wide tunables of the CURRENT process's home. That is only the
+    # sandbox when this runs inside ``with sandbox()``; anywhere else it would be a real install (never a fixture).
+    if paths.get_home().resolve() != handle.root.resolve():
+        raise RuntimeError(
+            f"build_persona must run inside the sandbox: the engine home is {paths.get_home()}, "
+            f"not the sandbox root {handle.root}"
+        )
     model = spec.model or models.canary
     persona_dir = handle.persona_dir(spec.name)
     persona_dir.mkdir(parents=True, exist_ok=True)
