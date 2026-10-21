@@ -335,7 +335,7 @@ def test_works_store_connect_sets_busy_timeout(
 
     def low_default_connect(*args, **kwargs):  # type: ignore[no-untyped-def]
         # Force a tiny default so a missing PRAGMA leaves busy_timeout low.
-        kwargs.setdefault("timeout", 0.001)
+        kwargs["timeout"] = 0.001
         return original_connect(*args, **kwargs)
 
     monkeypatch.setattr(_sqlite3, "connect", low_default_connect)

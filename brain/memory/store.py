@@ -30,6 +30,7 @@ import numpy as np
 from brain import dev_constants, tunables
 from brain.memory import cost_series
 from brain.memory.floor_calibration import RETENTION_WINDOW_DAYS_DEFAULT
+from brain.utils.sqlite_open import OpenProfile, open_store_connection
 
 logger = logging.getLogger(__name__)
 
@@ -826,6 +827,15 @@ def _ordering_sql(sql: str) -> str:
     return "SELECT m.id, " + sql[len(_WIDE_SELECT) :]
 
 
+def memories_profile() -> OpenProfile:
+    """The open profile of memories.db: the long busy timeout (S48, S58).
+
+    Built on every open, not once at import, because the constant is read at each
+    construction (tests and tuning change it).
+    """
+    return OpenProfile(busy_timeout_s=dev_constants.MEMORIES_DB_BUSY_TIMEOUT_S)
+
+
 class MemoryStore:
     """SQLite-backed store for Memory records.
 
@@ -835,40 +845,21 @@ class MemoryStore:
 
     def __init__(self, db_path: str | Path, *, integrity_check: bool = True) -> None:
         self._db_path = Path(db_path)
-        self._conn = sqlite3.connect(
-            str(db_path), timeout=dev_constants.MEMORIES_DB_BUSY_TIMEOUT_S
+        # The open sequence is shared (brain.utils.sqlite_open): connect, integrity
+        # check, WAL, busy_timeout, then `_finish_open` (row factory, schema,
+        # migrations). Hot request paths may pass integrity_check=False and leave
+        # deep checks to health. The busy timeout is the long memories.db one: see
+        # `memories_profile` and `dev_constants` for its sizing.
+        self._conn: sqlite3.Connection = open_store_connection(
+            db_path,
+            caller="MemoryStore",
+            integrity_check=integrity_check,
+            profile=memories_profile(),
+            setup=self._finish_open,
         )
-        # Run integrity check BEFORE setting row_factory so result rows are
-        # plain tuples — the comparison [("ok",)] is unambiguous. Hot request
-        # paths may pass integrity_check=False and leave deep checks to health.
-        if integrity_check:
-            from brain.health.integrity_retry import run_integrity_check_with_retry
 
-            result = run_integrity_check_with_retry(
-                self._conn, db_path, caller="MemoryStore"
-            )
-            if result != [("ok",)]:
-                detail = "; ".join(str(row[0]) for row in result)
-                self._conn.close()
-                from brain.health.anomaly import BrainIntegrityError
-
-                raise BrainIntegrityError(str(db_path), detail)
-        # WAL + a busy_timeout well above the longest single memories.db
-        # write transaction (dev_constants.MEMORIES_DB_BUSY_TIMEOUT_S; see
-        # that module for the sizing basis, S48/S58) — the bridge runs
-        # concurrent writers (chat tool calls, supervisor stale-close
-        # sweep, heartbeat, growth). Without WAL these can surface as
-        # `database is locked` under realistic desktop timing. In-memory
-        # dbs reject WAL; the fallback keeps tests using `:memory:`
-        # working. We set these AFTER the integrity check so a corrupt-file
-        # probe still surfaces BrainIntegrityError instead of a pragma crash.
-        try:
-            self._conn.execute("PRAGMA journal_mode = WAL")
-        except sqlite3.OperationalError:
-            pass
-        self._conn.execute(
-            f"PRAGMA busy_timeout = {int(dev_constants.MEMORIES_DB_BUSY_TIMEOUT_S * 1000)}"
-        )
+    def _finish_open(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         # Idempotent column migration for upgraded personas — _SCHEMA's
