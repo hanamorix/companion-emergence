@@ -786,3 +786,32 @@ def test_c11e_the_weekly_rollover_makes_every_call(rollover_world) -> None:
     )
     assert len(stub.prompts) == 3
     assert new_sid is not None
+
+
+def test_c11a_three_central_passes_extract_the_three_chunks(world, monkeypatch) -> None:
+    """The sweep as the supervisor runs it: the real job table through ``run_central_pass``, one chunk per idle pass."""
+    from brain.bridge import central_cadence, supervisor
+
+    persona, _, _, _ = world
+    rows = _seed(persona, "sess_c1p", 6)
+    chunks = _expected_chunks(rows)
+    assert len(chunks) == 3
+    stub = _Stub()
+    monkeypatch.setattr(supervisor, "build_tier_provider", lambda persona_dir, tier: stub)
+
+    class _Bus:
+        def publish(self, event):
+            pass
+
+    jobs = supervisor._build_gated_jobs(
+        persona_dir=persona, provider=stub, event_bus=_Bus(), is_session_busy=None, finalize_after_hours=24.0,
+        finalize_interval_s=None, initiate_review_interval_s=None, maintenance_interval_s=None, self_model_interval_s=None,
+        compaction_interval_s=None, calibration_interval_s=None, interest_sweep_interval_s=None,
+        judge_selftune_interval_s=None, clustering_interval_s=None, intensity_drivers=lambda: None,
+        tick_stats={"pruned_empty_sessions": 0, "closed_sessions": 0},
+    )
+    for k in range(1, 4):
+        central_cadence.run_central_pass(persona, jobs, is_idle=lambda: True, slot_available=lambda: True)
+        assert len(stub.prompts) == k
+        assert read_cursor(persona, "sess_c1p") == chunks[k - 1].cursor_ts
+    assert supervisor._snapshot_has_work(persona) is False

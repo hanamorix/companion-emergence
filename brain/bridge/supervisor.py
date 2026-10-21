@@ -1083,6 +1083,7 @@ def _build_gated_jobs(
                     "type": "session_snapshot",
                     "session_id": r.session_id,
                     "extracted_since_cursor": r.extracted,
+                    "chunks": r.chunks,
                     "committed": r.committed,
                     "enqueued": r.enqueued,
                     "deduped": r.deduped,
