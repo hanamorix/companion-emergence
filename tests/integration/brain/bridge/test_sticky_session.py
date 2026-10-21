@@ -163,9 +163,15 @@ def test_sticky_session_survives_snapshot_sweep(tmp_path: Path) -> None:
         },
     )
     t.start()
-    time.sleep(0.5)
+    # Wait for the sweep's own event rather than a fixed 0.5 s: a slow first pass (a Windows runner importing and
+    # opening everything cold) can outlast any short fixed sleep, and the stop then lands before the job reports.
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline and not any(
+        e.get("type") == "session_snapshot" for e in list(bus.events)
+    ):
+        time.sleep(0.05)
     stop.set()
-    t.join(timeout=2.0)
+    t.join(timeout=10.0)
 
     # Session still alive, buffer intact.
     assert get_session(sid) is not None, "session evicted from _SESSIONS"
