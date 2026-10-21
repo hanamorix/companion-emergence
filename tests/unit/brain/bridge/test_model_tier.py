@@ -131,9 +131,27 @@ def _source_files():
                 yield path
 
 
+# Tests that name removed identifiers ON PURPOSE (to assert they are gone, or to feed the guard a violating fixture).
+_TESTS_NAMING_REMOVED_NAMES = (
+    "tests/unit/brain/bridge/test_model_tier.py",
+    "tests/unit/brain/bridge/test_model_tier_resolution.py",
+    "tests/unit/brain/bridge/test_model_guard.py",
+)
+# In tests, `model_override` is the live conftest fixture's name; only the removed KEYWORD form is a leftover.
+_REMOVED_KWARG = re.compile(r"(?<![\w])model_override\s*=(?!=)")
+
+
+def _test_files():
+    for path in sorted((_REPO_ROOT / "tests").rglob("*.py")):
+        if path.relative_to(_REPO_ROOT).as_posix() not in _TESTS_NAMING_REMOVED_NAMES:
+            yield path
+
+
 def test_removed_names_exist_nowhere_in_code_or_comments() -> None:
-    """C2 and C20: every removed name has zero hits, code AND comments/docstrings, in brain, the app and scripts."""
+    """C2 and C20: every removed name has zero hits, code AND comments/docstrings, in brain, the app, scripts and tests."""
+    names = [n for n in _REMOVED_EVERYWHERE if n != "model_override"]
     pattern = re.compile(r"(?<![\w])(" + "|".join(map(re.escape, _REMOVED_EVERYWHERE)) + r")(?![\w])")
+    test_pattern = re.compile(r"(?<![\w])(" + "|".join(map(re.escape, names)) + r")(?![\w])")
     legacy = re.compile(r"(?<![\w])(" + "|".join(_LEGACY_KEYS) + r")(?![\w])")
     hits: list[str] = []
     for path in _source_files():
@@ -143,7 +161,19 @@ def test_removed_names_exist_nowhere_in_code_or_comments() -> None:
                 hits.append(f"{rel}:{lineno}: {line.strip()[:90]}")
             if legacy.search(line) and rel not in _LEGACY_OWNERS:
                 hits.append(f"{rel}:{lineno}: {line.strip()[:90]}")
+    for path in _test_files():
+        rel = path.relative_to(_REPO_ROOT).as_posix()
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if test_pattern.search(line) or _REMOVED_KWARG.search(line):
+                hits.append(f"{rel}:{lineno}: {line.strip()[:90]}")
     assert hits == [], "removed names still present:\n" + "\n".join(hits)
+
+
+def test_the_tests_scan_catches_a_removed_keyword_and_a_removed_name_in_a_comment() -> None:
+    """The M1 class (a test calling a removed parameter) must be visible to the scan."""
+    assert _REMOVED_KWARG.search('get_provider("claude-cli", model_override="haiku")')
+    assert not _REMOVED_KWARG.search("def test_x(persona_dir, model_override) -> None:")
+    assert not _REMOVED_KWARG.search("model_override(TIER_COMPACTION, 'x')")
 
 
 def test_removed_attributes_do_not_exist() -> None:

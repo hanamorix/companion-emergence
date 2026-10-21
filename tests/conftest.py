@@ -837,8 +837,7 @@ def model_override() -> Callable[[str, str | None], None]:
     """Set (or with ``None`` clear) one job's model in the sandbox home's tunables file, through the one writer.
 
     ``model_override(tier, value)`` is ``set_job_models({tier: value})`` under the per-test home, so the write rule
-    applies (a word that means the job's default removes the line, a full id is written as given). Replaces the old
-    ``monkeypatch.setitem(TIER_MODEL, ...)``.
+    applies (a word that means the job's default removes the line, a full id is written as given).
     """
     from brain.bridge.model_tier import set_job_models
 

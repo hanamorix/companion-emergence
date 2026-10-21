@@ -44,6 +44,7 @@ from pathlib import Path
 import pytest
 
 from brain.bridge.chat import ChatMessage
+from brain.bridge.model_tier import TIER_COMPACTION
 from brain.chat.budget import _COMPACTION_SUMMARY_PREFIX, apply_budget
 from brain.chat.compaction import (
     _CONDENSE_PROMPT,
@@ -833,7 +834,7 @@ def test_condense_prompt_realmodel(tmp_path: Path) -> None:
         target_words=target_words, target_pct=target_pct,
     )
 
-    provider = get_provider("claude-cli", model_override="haiku")
+    provider = get_provider("claude-cli", tier=TIER_COMPACTION)
     out = _generate_validated_fold(provider, prompt)
 
     assert out is not None, "the real model's output was rejected by _validate_fold_output"

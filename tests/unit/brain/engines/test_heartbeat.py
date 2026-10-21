@@ -1368,7 +1368,7 @@ def test_emit_heartbeat_memory_resolves_haiku_via_the_tier_accessor(
     # This test is specifically ABOUT the real tier-routing mechanism (the
     # whole point of the C6/C7 oracle) — undo the file's default autouse
     # FakeProvider stand-in (see _safe_tier_provider_default above) so the
-    # REAL build_tier_provider (and hence the real haiku model_override) runs.
+    # REAL build_tier_provider (and hence the real haiku job model) runs.
     monkeypatch.setattr("brain.engines.heartbeat.build_tier_provider", _real_build_tier_provider)
     monkeypatch.setattr(ClaudeCliProvider, "generate", lambda self, *a, **k: "HEARTBEAT: tended")
 

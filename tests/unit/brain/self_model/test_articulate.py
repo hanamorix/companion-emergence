@@ -157,8 +157,8 @@ def test_build_self_model_provider_forces_haiku_regardless_of_chat_model(tmp_pat
 
 class _ModelledProvider:
     """Provider stub that, unlike _CountingProvider, exposes ._model — the
-    attribute real providers (ClaudeCliProvider/OllamaProvider) set from
-    model_override, so the usage-log label can be derived from it."""
+    attribute real providers (ClaudeCliProvider/OllamaProvider) set, so the
+    usage-log label can be derived from it."""
 
     def __init__(self, model: str, *, response: str = "Something shifts.") -> None:
         self._model = model
