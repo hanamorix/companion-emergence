@@ -24,7 +24,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from brain.bridge import runner, state_file
+from brain.bridge import cli_throttle, runner, state_file
+from brain.bridge import shutdown as shutdown_mod
 
 # ---------------------------------------------------------------------------
 # _allocate_port
@@ -137,8 +138,15 @@ def test_write_stopped_swallows_exceptions(tmp_path: Path, monkeypatch, caplog) 
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def clear_stop_flag():
+    """A stop begun in-process sets the process-wide shutdown flag; later tests must start without it."""
+    yield
+    cli_throttle.clear_shutdown()
+
+
 def test_run_bridge_foreground_writes_initial_state_and_runs_uvicorn(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, clear_stop_flag
 ) -> None:
     """End-to-end contract for run_bridge_foreground:
     - initial BridgeState written with pid/port/persona before uvicorn starts
@@ -175,6 +183,7 @@ def test_run_bridge_foreground_writes_initial_state_and_runs_uvicorn(
             # Snapshot what's persisted at the moment the server would begin serving.
             st = state_file.read(persona_dir)
             captured["state_at_uvicorn"] = st
+            self.controller.begin_stop("user_stop")  # a normal run ends after a stop request
 
     monkeypatch.setattr(runner.uvicorn, "Config", FakeConfig)
     monkeypatch.setattr(runner.uvicorn, "Server", FakeServer)
@@ -254,9 +263,11 @@ def test_run_bridge_foreground_binds_shutdown_controller_to_uvicorn_server(
 
 
 @pytest.mark.parametrize("ending", ["return", "system_exit", "keyboard_interrupt"])
-def test_after_run_decision_runs_however_server_run_ends(tmp_path: Path, monkeypatch, ending) -> None:
+def test_after_run_decision_runs_however_server_run_ends(tmp_path: Path, monkeypatch, ending, clear_stop_flag) -> None:
     """C42 (d): the after-run decision runs when server.run() returns, ends by SystemExit (re-raised SIGTERM) or by
-    KeyboardInterrupt (re-raised SIGINT); exit status 0; nothing running -> "stopped"."""
+    KeyboardInterrupt (re-raised SIGINT); exit status 0; nothing running -> "stopped". Each ending follows the stop
+    that causes it in a real run (an HTTP stop request, or the signal uvicorn re-raises): a run that ends with no
+    stop at all is a crash (the test below)."""
     from brain.bridge import shutdown_progress
 
     shutdown_progress.reset_for_tests()
@@ -272,15 +283,70 @@ def test_after_run_decision_runs_however_server_run_ends(tmp_path: Path, monkeyp
             self.should_exit = False
 
         def run(self):
+            if ending == "return":
+                self.controller.begin_stop("user_stop")  # /supervisor/shutdown, then uvicorn's loop ends
+                return
+            self.controller.note_signal()  # the signal uvicorn re-raises after serve() ended
             if ending == "system_exit":
                 raise SystemExit(0)
-            if ending == "keyboard_interrupt":
-                raise KeyboardInterrupt
+            raise KeyboardInterrupt
 
     monkeypatch.setattr(runner.uvicorn, "Config", lambda *a, **k: None)
     monkeypatch.setattr(runner.uvicorn, "Server", FakeServer)
+    # The monitor would apply the noted signal process-wide after this test; the after-run decision does not need it.
+    monkeypatch.setattr(shutdown_mod.Monitor, "start", lambda self: None)
     assert runner.run_bridge_foreground(persona_dir, client_origin="tests") == 0
     assert state_file.read(persona_dir).phase == "stopped"
+
+
+@pytest.mark.parametrize("ending", ["startup_failed", "lifespan_belt_only", "server_exit_1"])
+def test_a_run_that_ends_with_no_stop_requested_is_recorded_as_a_crash(
+    tmp_path: Path, monkeypatch, ending, clear_stop_flag
+) -> None:
+    """#177 point 1 (pre-merge review O-1): with nothing running, a run that ended without any stop being asked for
+    is a crash, not a stop: uvicorn's run() returns normally when the lifespan startup raised ("startup_failed"); the
+    lifespan's own belt records only reason "unknown" when uvicorn ended for its own reasons ("lifespan_belt_only");
+    uvicorn ends with SystemExit(1) after the lifespan ran when it cannot bind ("server_exit_1"). Each takes the
+    crash path (bridge.json not clean, reason "crash", non-zero exit), so the crash watchdog and the service managers
+    restart it; never "stopped"."""
+    from brain.bridge import shutdown_progress
+
+    shutdown_progress.reset_for_tests()
+    persona_dir = tmp_path / "personas" / "nell"
+    persona_dir.mkdir(parents=True)
+    monkeypatch.setattr(runner, "_allocate_port", lambda: 54321)
+    monkeypatch.setattr(runner, "_setup_runtime_logging", lambda _p: None)
+    monkeypatch.setattr(runner, "build_app", lambda **_kw: object())
+    monkeypatch.setattr(runner.signal, "signal", lambda *_a, **_kw: None)
+    monkeypatch.setattr(shutdown_mod.Monitor, "start", lambda self: None)
+    exits: list[str] = []
+
+    class _Exited(BaseException):
+        pass
+
+    def fake_hard_exit(pd, reason="hard_exit"):
+        exits.append(reason)
+        raise _Exited
+
+    monkeypatch.setattr(shutdown_mod, "hard_exit", fake_hard_exit)
+
+    class FakeServer:
+        def __init__(self, config):
+            self.should_exit = False
+
+        def run(self):
+            if ending == "startup_failed":
+                return
+            self.controller.begin_stop(self.controller.signal_reason or "unknown")  # the lifespan's belt
+            if ending == "server_exit_1":
+                raise SystemExit(1)
+
+    monkeypatch.setattr(runner.uvicorn, "Config", lambda *a, **k: None)
+    monkeypatch.setattr(runner.uvicorn, "Server", FakeServer)
+    with pytest.raises(_Exited):
+        runner.run_bridge_foreground(persona_dir, client_origin="tests")
+    assert exits == ["crash"]
+    assert state_file.read(persona_dir).phase != "stopped"
 
 
 @pytest.mark.parametrize("stop_begun", [True, False])

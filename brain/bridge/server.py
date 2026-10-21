@@ -66,6 +66,7 @@ from brain.bridge.model_tier import (
 )
 from brain.bridge.provider import ClaudeCliProvider, LLMProvider, ProviderError, _claude_work_dir
 from brain.bridge.shutdown import POLL_S as _STOP_POLL_S
+from brain.bridge.shutdown import REASON_UNKNOWN as _STOP_REASON_UNKNOWN
 from brain.bridge.shutdown import BridgeShutdownController
 from brain.bridge.shutdown_progress import tracked_to_thread
 from brain.chat.session import (
@@ -1494,8 +1495,9 @@ def build_app(
             #   3. flush the cost series and recall diagnostics
             #   4. publish the shutdown event
             #   5. clear the publisher
-            # A signal the monitor has not applied yet keeps its reason (review R2-S3, C13).
-            controller.begin_stop(controller.signal_reason or "unknown")
+            # A signal the monitor has not applied yet keeps its reason (review R2-S3, C13). "unknown" means no stop was
+            # asked for (uvicorn ended for its own reasons); the runner's after-run decision records that as a crash.
+            controller.begin_stop(controller.signal_reason or _STOP_REASON_UNKNOWN)
 
             # 1. Cancel the derived-model re-check (a probe thread already running is a counted task)
             if recheck_task is not None:

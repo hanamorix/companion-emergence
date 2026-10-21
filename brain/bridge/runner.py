@@ -84,12 +84,26 @@ def _after_run(persona_dir: Path, app: object, monitor: object) -> None:
     """The after-run decision (#456, plan I4): runs whatever way ``server.run()`` ended (normal return, SystemExit
     from the re-raised SIGTERM, KeyboardInterrupt from the re-raised SIGINT).
 
-    Clean only when nothing is running: the task registry is sealed (or, when the lifespan never ran, empty and
-    sealed now) and the supervisor thread has ended. Anything else is the hard-exit path at once.
+    A stop was asked for when a signal was noted or a stop path recorded its reason; the lifespan's own belt reason
+    ("unknown") is not a request: it only means uvicorn ended for its own reasons. A run that ended with no stop asked
+    for (a lifespan startup that raised, after which uvicorn's run() returns normally; a bind failure; an internal
+    error) is a crash: the hard-exit path with reason "crash" (not clean, non-zero exit), so the app's crash watchdog
+    and the service managers restart it (#177 point 1).
+
+    Otherwise "stopped" only when nothing is running: the task registry is sealed (or, when the lifespan never ran,
+    empty and sealed now) and the supervisor thread has ended. Work still running is the hard-exit path at once.
     """
     from brain.bridge import shutdown as shutdown_mod
     from brain.bridge import shutdown_progress
 
+    c = getattr(monitor, "controller", None)
+    deliberate = c is not None and (
+        c.signal_count > 0 or (c.requested and c.reason not in (None, shutdown_mod.REASON_UNKNOWN))
+    )
+    if not deliberate:
+        logger.error("bridge run ended with no stop requested (startup failure or server error); recording a crash")
+        shutdown_mod.hard_exit(persona_dir, shutdown_mod.REASON_CRASH)
+        return
     bridge_state = getattr(getattr(app, "state", None), "bridge", None)
     sup = getattr(bridge_state, "supervisor_thread", None)
     reg = shutdown_progress.registry
@@ -98,14 +112,8 @@ def _after_run(persona_dir: Path, app: object, monitor: object) -> None:
         monitor.stop()  # type: ignore[attr-defined]  # its final progress record names this bridge, then "stopped"
         _write_stopped(persona_dir)
         return
-    c = getattr(monitor, "controller", None)
-    deliberate = c is not None and (c.stopping or c.requested or c.signal_count > 0)
-    if deliberate:
-        logger.error("bridge run ended with work still running; hard exit")
-        shutdown_mod.hard_exit(persona_dir, shutdown_mod.REASON_HARD_EXIT)
-    else:
-        logger.error("bridge run ended unexpectedly with work still running and no stop requested; recording a crash")
-        shutdown_mod.hard_exit(persona_dir, shutdown_mod.REASON_CRASH)
+    logger.error("bridge run ended with work still running; hard exit")
+    shutdown_mod.hard_exit(persona_dir, shutdown_mod.REASON_HARD_EXIT)
 
 
 _RUNTIME_LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
