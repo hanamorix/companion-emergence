@@ -43,6 +43,7 @@ def test_request_without_server_returns_false() -> None:
 # ---------------------------------------------------------------- #456: begin_stop, the signal path, the monitor
 
 import os  # noqa: E402
+import signal as _signal_mod  # noqa: E402
 import threading  # noqa: E402
 from pathlib import Path  # noqa: E402
 
@@ -175,24 +176,49 @@ def test_monitor_applies_a_signal_within_one_poll(own_record):
     c.bind_server(FakeServer())
     exits: list[str] = []
     m = _monitor(own_record, c, exits)
-    c.note_signal()
+    c.note_signal(_signal_mod.SIGTERM)
     m.poll_once()
     assert c.stopping and c.reason == "os_signal" and cli_throttle.shutdown_requested()
     assert state_file.read(own_record).phase == "stopping"
     assert exits == []
 
 
-def test_a_second_signal_is_a_hard_exit(own_record):
+_SIGHUP = getattr(__import__("signal"), "SIGHUP", None)
+
+
+@pytest.mark.parametrize(
+    "signals, hard_exit",
+    [
+        (("SIGINT", "SIGINT"), True),
+        (("SIGHUP", "SIGTERM"), False),
+        (("SIGTERM", "SIGTERM"), False),
+        (("SIGTERM", "SIGINT"), False),
+        (("SIGINT", "SIGTERM"), False),
+    ],
+    ids=["ctrl-c-twice", "hup-then-term", "term-twice", "term-then-ctrl-c", "ctrl-c-then-term"],
+)
+def test_only_a_second_ctrl_c_is_a_hard_exit(own_record, signals, hard_exit):
+    """P2 / D19 / C42 (c): a second Ctrl-C (SIGINT) during a stop hard-exits. Pre-merge review O-4: two different OS
+    signals in one stop (a closing terminal's SIGHUP then a session manager's SIGTERM), or a repeated SIGTERM, are not
+    a user's second Ctrl-C: the graceful stop goes on. Signals arrive through the server's real handler."""
+    import signal as _signal
+
+    import uvicorn
+
+    if "SIGHUP" in signals and _SIGHUP is None:
+        pytest.skip("no SIGHUP on this platform")
     c = BridgeShutdownController()
     c.configure(own_record)
-    c.bind_server(FakeServer())
+    server = _server_class()(uvicorn.Config(app=lambda *a: None))
+    server.controller = c
+    c.bind_server(server)
     exits: list[str] = []
     m = _monitor(own_record, c, exits)
-    c.note_signal()
-    m.poll_once()
-    c.note_signal()
-    m.poll_once()
-    assert exits == ["hard_exit"]
+    for name in signals:
+        server.handle_exit(getattr(_signal, name), None)
+        m.poll_once()
+    assert c.stopping
+    assert exits == (["hard_exit"] if hard_exit else [])
 
 
 def test_progress_record_follows_the_tasks_and_names_this_bridge(own_record):
@@ -354,3 +380,33 @@ def test_stopping_the_monitor_writes_the_final_progress_record(own_record):
     rec = shutdown_progress.read_record(own_record, shutdown_progress.PROGRESS_FILENAME)
     assert rec["count"] == 0 and rec["tasks"] == []
     assert exits == []
+
+
+def test_uvicorn_still_re_raises_the_signals_our_server_captures(monkeypatch):
+    """Pre-merge review O-8: make_server_class relies on uvicorn's PRIVATE ``Server._captured_signals`` and
+    ``capture_signals`` (pyproject allows ``uvicorn>=0.30``): our ``handle_exit`` records a signal there instead of
+    calling uvicorn's, and uvicorn re-raises it after serve() so a SIGTERM still ends the process with status 0 (C15)
+    through the runner. If an upgrade renames or drops either, this fails here, naming the reason, instead of the stop
+    silently changing behaviour."""
+    import signal as _signal
+    import threading as _threading
+
+    import uvicorn
+
+    if _threading.current_thread() is not _threading.main_thread():
+        pytest.skip("uvicorn installs signal handlers only from the main thread")
+    server = _server_class()(uvicorn.Config(app=lambda *a: None))
+    assert isinstance(getattr(server, "_captured_signals", None), list), (
+        "uvicorn.Server no longer has the private _captured_signals list that shutdown.make_server_class appends to"
+    )
+    c = BridgeShutdownController()
+    server.controller = c
+    raised: list[int] = []
+    monkeypatch.setattr(_signal, "raise_signal", raised.append)
+    before = _signal.getsignal(_signal.SIGTERM)
+    with server.capture_signals():
+        assert _signal.getsignal(_signal.SIGTERM) == server.handle_exit, "uvicorn no longer installs Server.handle_exit"
+        server.handle_exit(_signal.SIGTERM, None)
+    assert raised == [_signal.SIGTERM], "uvicorn no longer re-raises the signals in _captured_signals after serve()"
+    assert _signal.getsignal(_signal.SIGTERM) == before
+    assert c.serve_finished and c.signal_count == 1

@@ -14,7 +14,7 @@ Public API:
     close_session(persona_dir, session_id, *, store, hebbian, provider, ...) -> IngestReport
         Extracts every chunk after the cursor, then deletes the buffer (CLI --close, /sessions/close).
     close_stale_sessions(persona_dir, *, silence_minutes, store, ...) -> list[IngestReport]
-        Destructive sweep (close_session per silent session); explicit close callers only.
+        Destructive sweep (close_session per silent session); explicit close callers only (a bridge stop runs no sweep).
     extract_session_snapshot(persona_dir, session_id, *, store, hebbian, provider, ...) -> IngestReport
         Non-destructive cursor-driven snapshot — leaves the buffer intact; ``max_chunks`` bounds a pass.
     snapshot_stale_sessions(persona_dir, *, silence_minutes, store, ...) -> list[IngestReport]

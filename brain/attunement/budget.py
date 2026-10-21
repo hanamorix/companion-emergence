@@ -6,11 +6,14 @@ without failing the reply path.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
 from brain.attunement.schemas import DAILY_BUDGET_DEFAULT
 from brain.health.json_io import JsonFileError, Recovery, read_json, write_json
+from brain.utils.file_lock import file_lock
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +61,16 @@ def _load(persona_dir: Path) -> dict:
 
 def _save(persona_dir: Path, state: dict) -> None:
     write_json(_budget_path(persona_dir), state, backups=1, indent=None, fsync=False)
+
+
+@contextmanager
+def lock(persona_dir: Path) -> Iterator[None]:
+    """Hold the budget across one model call, from the read-only check (``get_remaining``) to the charge
+    (``consume_call``) after a call that was not refused (#473, D24): no other caller, in this process or another,
+    can check and charge in between, so the day's cap cannot be overshot. Not re-entrant: take it once, and call
+    ``get_remaining`` / ``consume_call`` inside it."""
+    with file_lock(_budget_path(persona_dir)):
+        yield
 
 
 def get_remaining(

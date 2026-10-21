@@ -3335,8 +3335,9 @@ def _build_parser() -> argparse.ArgumentParser:
     s_stop.add_argument(
         "--kill",
         action="store_true",
-        help="end the bridge and every process it started at once (identity-checked; the next start picks up anything "
-        "left unfinished)",
+        help="end the bridge and every process it started without waiting for running work (identity-checked; a "
+        "bridge run by an OS service is first asked to hard-exit and given up to --timeout seconds before its service "
+        "manager stops it; the next start picks up anything left unfinished)",
     )
     s_stop.add_argument(
         "--skip-hard-exit-request",
@@ -3374,7 +3375,7 @@ def _build_parser() -> argparse.ArgumentParser:
     s_restart.add_argument("--idle-shutdown", type=float, default=30)
     s_restart.add_argument("--client-origin", default="cli", choices=client_origin_choices)
     s_restart.add_argument("--timeout", type=float, default=180.0)
-    s_restart.add_argument("--force", action="store_true", help="force-terminate a wedged bridge (Windows last resort; skips cleanup, recovery snapshots on next start)")
+    s_restart.add_argument("--force", action="store_true", help="end a bridge whose stop request fails (Windows last resort; uses the same kill as --kill)")
     s_restart.set_defaults(func=cmd_restart)
 
     s_tail_events = s_actions.add_parser("tail-events", help="Tail /events as JSON lines.")

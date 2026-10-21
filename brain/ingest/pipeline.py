@@ -3,7 +3,8 @@
 close_session()             extract every row after the cursor, chunk by chunk, then delete the buffer, cursor and backoff.
 extract_session_snapshot()  non-destructive: extract the rows after the cursor sidecar, chunk by chunk; the buffer stays.
 close_stale_sessions()      destructive sweep (close_session for every silent session); for explicit close callers only.
-snapshot_stale_sessions()   non-destructive sweep of the supervisor's session-snapshot job, one chunk per session per pass.
+snapshot_stale_sessions()   non-destructive sweep of the supervisor's session-snapshot job, one chunk per session per pass
+                            (the job also saves open conversations at the first idle pass after a start; a stop runs no sweep).
 finalize_stale_sessions()   24h extraction-only sweep, one chunk per session per run; dead-letters a buffer that keeps failing.
 
 Stage flow of one pass:
@@ -830,9 +831,11 @@ def close_stale_sessions(
 
     Destructive — runs the full close_session pipeline (extract every chunk after the
     cursor + delete buffer + delete cursor sidecar) for every match. Retained for
-    explicit close callers only; bridge shutdown and recovery do not call it.
+    explicit close callers only. A bridge stop runs no session sweep at all (#456,
+    Q-B): open conversations are saved by the supervisor's snapshot job at the
+    first idle pass after the next start.
 
-    For the periodic non-destructive sweep, use ``snapshot_stale_sessions`` instead.
+    For that periodic non-destructive sweep, use ``snapshot_stale_sessions``.
     For the 24h extraction-only cadence, use ``finalize_stale_sessions``.
 
     Empty sessions (no turns) are cleaned up silently without running the

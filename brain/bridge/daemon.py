@@ -15,6 +15,7 @@ Internal:
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import signal
@@ -62,6 +63,9 @@ else:
 # not release or move the lock (the lock is independent of current EOF).
 _WINDOWS_LOCK_OFFSET = 1 << 20  # 1 MiB
 
+# msvcrt.locking(LK_LOCK) raises OSError with this errno when the byte is still locked after its own 10 tries.
+_EDEADLOCK = getattr(errno, "EDEADLOCK", errno.EDEADLK)
+
 
 def acquire_lock(persona_dir: Path, *, blocking: bool = False) -> int | None:
     """Take the bridge's OS-level lock for the whole process life.
@@ -77,7 +81,8 @@ def acquire_lock(persona_dir: Path, *, blocking: bool = False) -> int | None:
     duration and pass it to release_lock) on success, or None if another
     live process holds the lock. With ``blocking=True`` it waits until the lock
     is free instead (POSIX: a blocking flock; Windows: msvcrt's own 10 x 1 s
-    LK_LOCK retry, repeated), as `nell supervisor run` does for OS services.
+    LK_LOCK retry, repeated while the lock is still held; any other lock error
+    returns None), as `nell supervisor run` does for OS services.
 
     The pid is written into the file for information only (S50) — never
     read back to make a decision here. It sits at offset 0 on BOTH
@@ -97,7 +102,11 @@ def acquire_lock(persona_dir: Path, *, blocking: bool = False) -> int | None:
                     try:
                         msvcrt.locking(fd, msvcrt.LK_LOCK, 1)  # retries 10 x 1 s itself, then raises
                         break
-                    except OSError:
+                    except OSError as exc:
+                        # Only "still held after its 10 tries" (EDEADLOCK) is contention; any other error (a bad fd,
+                        # an access error) would repeat forever, so it ends the wait (review O-3).
+                        if exc.errno != _EDEADLOCK:
+                            raise
                         os.lseek(fd, _WINDOWS_LOCK_OFFSET, os.SEEK_SET)
             else:
                 msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
@@ -336,10 +345,11 @@ def cmd_start(args, *, out: dict | None = None) -> int:
     if state_file.is_running(persona_dir):
         return _refuse_already_running(persona_dir, out)
 
-    # Hold the lock through recovery (so two concurrent starters can't both
-    # recover), then RELEASE it right before spawning. The bridge PROCESS — the
-    # detached runner (see runner.main) — re-acquires it and holds it for its
-    # lifetime, so pid-based stale recovery works. cmd_start must NOT hold the
+    # Hold the lock through the start-up steps below (so a concurrent starter
+    # gets "lock held" instead of starting a second bridge), then RELEASE it
+    # right before spawning. The bridge PROCESS (the detached runner, see
+    # runner.main) re-acquires it and holds it for its lifetime, so a stale
+    # record is told apart from a live bridge. cmd_start must NOT hold the
     # lock across the spawn, or the child can't acquire it and dies (Bug 2a,
     # v0.0.36). The runner's lifetime lock is the real guard against two bridges.
     fd = acquire_lock(persona_dir)
@@ -390,7 +400,7 @@ def cmd_start(args, *, out: dict | None = None) -> int:
         _spawned_children.pop(pid, None)
 
 
-# Readiness window: Windows cold-boot (recovery + persona load + soul review) routinely exceeds 5s; the old 5s deadline
+# Readiness window: Windows cold-boot (persona load + soul review; before #456 also recovery) routinely exceeds 5s; the old 5s deadline
 # killed a healthy-but-slow bridge. 50s stays inside the Rust caller's 60s outer timeout. (Bug 2b, v0.0.36.)
 _READINESS_BUDGET_S = 50.0
 
@@ -493,13 +503,35 @@ def _await_readiness(persona_dir: Path, pid: int, log_path: Path, out: dict | No
     return 1
 
 
+def _ended_on_a_requested_stop(st: state_file.BridgeState | None) -> bool:
+    """The record says its bridge ended on a stop a person asked for through nell or the app: ``nell supervisor
+    stop`` (user_stop), an app restart (app_restart), a stop request with no reason (manual_restart), or a hard exit
+    the user chose (hard_exit). Not an idle stop (nobody asked for anything), not an OS signal (it cannot tell a user's
+    kill from a logout or a service manager's stop), not a crash. A kill is the respawn guard's (D25), not this."""
+    from brain.bridge.shutdown import (
+        REASON_APP_RESTART,
+        REASON_HARD_EXIT,
+        REASON_MANUAL_RESTART,
+        REASON_USER_STOP,
+    )
+
+    return (
+        st is not None
+        and st.phase != "running"
+        and st.stop_reason in (REASON_USER_STOP, REASON_APP_RESTART, REASON_MANUAL_RESTART, REASON_HARD_EXIT)
+    )
+
+
 def cmd_run(args) -> int:
     """Run the bridge in the foreground for OS service managers.
 
     Unlike ``cmd_start``, this does not fork or detach. The current process is
     the bridge process until uvicorn exits, which is exactly what launchd wants
-    to supervise. A per-persona lock is held for the lifetime of the process so
-    parallel starts fail cleanly and stale locks can be recovered by pid.
+    to supervise. A per-persona lock is held for the lifetime of the process; a
+    run that finds it held waits for it (D4). A service run that waited for a
+    running bridge does not start when a person stopped that bridge through nell
+    or the app (see ``_ended_on_a_requested_stop``); after an idle stop, an OS
+    signal or a crash it starts.
     """
     from brain.paths import get_persona_dir
 
@@ -522,9 +554,11 @@ def cmd_run(args) -> int:
     # D4 (#177 S3): an OS service must not exit 2 here (systemd / launchd / Task Scheduler read it as a failure and
     # respawn forever). Whether a live bridge or a starter holds the lock, wait for it, then run.
     fd = acquire_lock(persona_dir)
+    waited_for_a_bridge = False
     if fd is None:
         cur = state_file.read(persona_dir)
         if cur is not None and state_file.bridge_liveness(cur, persona_dir) == state_file.ALIVE:
+            waited_for_a_bridge = True
             print(f"waiting for the running bridge (pid {cur.pid}) to exit", file=sys.stderr)
         else:
             print("waiting for the bridge lock (another start is in progress)", file=sys.stderr)
@@ -538,6 +572,12 @@ def cmd_run(args) -> int:
             # Re-checked under the lock, BEFORE run_bridge_foreground deletes the watcher files (S6-a, S7-g).
             print("not starting: stopped on request", file=sys.stderr)
             logger.info("not starting: stopped on request (user kill of this boot)")
+            return 0
+        if guarded and waited_for_a_bridge and _ended_on_a_requested_stop(state_file.read(persona_dir)):
+            # Pre-merge review O-2: a service run queued behind a running bridge does not undo a stop a person asked
+            # for through nell or the app (exit 0: success to every service manager, so nothing restarts it).
+            print("not starting: the running bridge was stopped on request", file=sys.stderr)
+            logger.info("not starting: the bridge this run waited for was stopped on request")
             return 0
         if client_origin == "systemd":
             try:
@@ -616,7 +656,8 @@ def _print_kill_result(result) -> int:  # noqa: ANN001
 def cmd_stop(args) -> int:
     """`nell supervisor stop` (#456 Q-A, D16, D22): ask the bridge to stop, then watch until it is gone.
 
-    ``--kill``: the kill helper at once. A pre-PR bridge (no identity token): the old request, then the kill helper
+    ``--kill``: the kill helper (a bridge run by an OS service first gets the hard-exit request and up to
+    ``--timeout`` to go, then its service manager's stop; any other bridge is killed at once). A pre-PR bridge (no identity token): the old request, then the kill helper
     after a few seconds. A stale record: "not running". If the request fails and no stop is recorded: POSIX sends
     SIGTERM when the identity holds; Windows refuses unless ``--force`` (then the kill helper).
     """

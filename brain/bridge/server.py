@@ -66,6 +66,7 @@ from brain.bridge.model_tier import (
 )
 from brain.bridge.provider import ClaudeCliProvider, LLMProvider, ProviderError, _claude_work_dir
 from brain.bridge.shutdown import POLL_S as _STOP_POLL_S
+from brain.bridge.shutdown import REASON_UNKNOWN as _STOP_REASON_UNKNOWN
 from brain.bridge.shutdown import BridgeShutdownController
 from brain.bridge.shutdown_progress import tracked_to_thread
 from brain.chat.session import (
@@ -198,7 +199,10 @@ async def _idle_watcher(state: BridgeAppState, idle_shutdown_seconds: float) -> 
         await asyncio.sleep(min(idle_shutdown_seconds, 60))
         if _check_idle(state, idle_shutdown_seconds):
             logger.info("idle shutdown firing — no traffic for >%ss", idle_shutdown_seconds)
-            if state.shutdown_controller is None or not state.shutdown_controller.request("idle_timeout"):
+            # Off the event loop: the request writes the bridge.json "stopping" mark (review O-6).
+            if state.shutdown_controller is None or not await asyncio.to_thread(
+                state.shutdown_controller.request, "idle_timeout"
+            ):
                 logger.error("idle shutdown could not request controller shutdown")
             return
 
@@ -212,10 +216,9 @@ def _check_idle(state: Any, idle_shutdown_seconds: float) -> bool:
 
     Bridge startup counts as activity so a freshly launched app has the
     full idle window before the watcher fires. Without that fallback,
-    ``last_chat_at is None`` collapsed to "idle" and the bridge SIGTERM'd
-    itself ~60s after every launch — which then triggered the
-    close-heartbeat (decay + dream + reflex + growth) on every relaunch,
-    looking from the UI like the brain was 'flooding'.
+    ``last_chat_at is None`` collapsed to "idle" and the bridge stopped
+    itself ~60s after every launch, so every relaunch was followed by an
+    idle stop.
     """
     now = datetime.now(UTC)
     last_activity = state.last_chat_at or state.started_at
@@ -1245,35 +1248,12 @@ class BridgeAppState:
 _background_threads_inhibited: bool = False
 
 
-def _test_hooks() -> dict[str, Any] | None:
-    """#456 test hooks for the real-process stop tests (``tests/bridge/test_shutdown_e2e.py``), read only when
-    ``KINDLED_TEST_HOOKS=1``: the supervisor is a stub that, after the stop, waits for ``KINDLED_TEST_SUPERVISOR_HOLD``
-    (a file path) to exist; ``KINDLED_TEST_STUB_TASKS`` counted stub tasks each end when ``<KINDLED_TEST_STUB_DIR>/
-    release-<i>`` exists; ``KINDLED_TEST_CALLS`` ("module:function,...") runs each function with the persona dir as a
-    counted task (a call in flight during the stop); no other background thread starts. Never set in production."""
-    if os.environ.get("KINDLED_TEST_HOOKS") != "1":
-        return None
-    return {
-        "supervisor_hold": os.environ.get("KINDLED_TEST_SUPERVISOR_HOLD") or None,
-        "tasks": int(os.environ.get("KINDLED_TEST_STUB_TASKS") or 0),
-        "stub_dir": os.environ.get("KINDLED_TEST_STUB_DIR") or None,
-        "calls": [c for c in (os.environ.get("KINDLED_TEST_CALLS") or "").split(",") if c],
-    }
-
-
-def _run_test_call(spec: str, persona_dir: Path) -> None:
-    import importlib
-
-    module, _, name = spec.partition(":")
-    try:
-        getattr(importlib.import_module(module), name)(persona_dir)
-    except Exception:  # noqa: BLE001 - a test hook never takes the bridge down
-        logger.exception("test hook call %s raised", spec)
-
-
-def _wait_for_file(path: str | None) -> None:
-    while path and not Path(path).exists():
-        time.sleep(0.05)
+# #456 test seam for the real-process stop tests (spec section 8: test-only hooks). Set ONLY in-process, by the test
+# launcher ``tests/bridge/_hooked_bridge.py`` before the runner starts; never from an environment variable, so nothing
+# outside a test can start a bridge with a stub supervisor (pre-merge review O-5). None in production. When set:
+# ``supervisor(stop_event)`` runs in place of the supervisor loop, ``start_tasks(persona_dir)`` starts the test's
+# counted tasks, and no other background thread starts.
+_lifespan_test_hooks: dict[str, Any] | None = None
 
 
 def build_app(
@@ -1310,7 +1290,7 @@ def build_app(
             if background_threads is not None
             else not _background_threads_inhibited
         )
-        hooks = _test_hooks()
+        hooks = _lifespan_test_hooks
         if hooks is not None:
             logger.warning("bridge lifespan: TEST HOOKS ON (stub supervisor and stub tasks)")
         if not bg:
@@ -1335,9 +1315,10 @@ def build_app(
         bus.bind_loop(asyncio.get_running_loop())
         events.set_publisher(bus.publish)
 
-        # #456: one stop per bridge app. A new app in this process (tests) starts unstopped, with a fresh task
-        # registry; the controller is the bridge's single stop entry point (a local one when none is passed). A stop
-        # that already began (a signal before the lifespan, review S1) keeps the process-wide flag set.
+        # #456: one stop per bridge app. A new app in this process (tests) starts unstopped; the controller is the
+        # bridge's single stop entry point (a local one when none is passed). A stop that already began (a signal
+        # before the lifespan, review S1) keeps the process-wide flag set. The task registry is the process's own (a
+        # bridge process runs one app); tests that build several apps reset it themselves.
         controller = (
             shutdown_controller
             if isinstance(shutdown_controller, BridgeShutdownController)
@@ -1345,7 +1326,6 @@ def build_app(
         )
         if not controller.stopping:
             cli_throttle.clear_shutdown()
-        shutdown_progress.reset_for_tests()
         if controller.persona_dir is None:
             controller.configure(persona_dir)
 
@@ -1571,8 +1551,7 @@ def build_app(
             def _run_supervisor() -> None:
                 try:
                     if hooks is not None:
-                        stop_event.wait()
-                        _wait_for_file(hooks["supervisor_hold"])
+                        hooks["supervisor"](stop_event)
                         return
                     # #456 (D9): a loop death restarts the loop; a startup death re-runs the startup once.
                     _supervisor_mod.run_supervised(
@@ -1599,15 +1578,7 @@ def build_app(
                 raise
             app.state.bridge.supervisor_thread = sup_thread
             if hooks is not None:
-                for i in range(hooks["tasks"]):
-                    release = str(Path(hooks["stub_dir"]) / f"release-{i}") if hooks["stub_dir"] else None
-                    shutdown_progress.start_tracked_thread(
-                        f"stub task {i}", lambda r=release: _wait_for_file(r), name=f"stub-task-{i}"
-                    )
-                for spec in hooks["calls"]:
-                    shutdown_progress.start_tracked_thread(
-                        spec.rpartition(":")[2], lambda sp=spec: _run_test_call(sp, persona_dir), name=f"call-{spec}"
-                    )
+                hooks["start_tasks"](persona_dir)
 
         # Idle-shutdown watcher (only if requested)
         idle_task = None
@@ -1633,8 +1604,10 @@ def build_app(
             #   3. flush the cost series and recall diagnostics
             #   4. publish the shutdown event
             #   5. clear the publisher
-            # A signal the monitor has not applied yet keeps its reason (review R2-S3, C13).
-            controller.begin_stop(controller.signal_reason or "unknown")
+            # A signal the monitor has not applied yet keeps its reason (review R2-S3, C13). "unknown" means no stop was
+            # asked for (uvicorn ended for its own reasons); the runner's after-run decision records that as a crash.
+            # Off the event loop: a first stop writes the bridge.json mark (review O-6).
+            await asyncio.to_thread(controller.begin_stop, controller.signal_reason or _STOP_REASON_UNKNOWN)
 
             # 1. Cancel the derived-model re-check (a probe thread already running is a counted task)
             if recheck_task is not None:
@@ -3411,7 +3384,9 @@ def build_app(
             body = None
         if isinstance(body, dict) and body.get("reason") in ("user_stop", "app_restart"):
             reason = body["reason"]
-        ok = s.shutdown_controller.request(reason)
+        # Off the event loop (review O-6): the request writes the bridge.json "stopping" mark, which can fsync; it is
+        # still on disk before the 202 (C6).
+        ok = await asyncio.to_thread(s.shutdown_controller.request, reason)
         if not ok:
             logger.error("manual restart could not request controller shutdown")
         return {"status": "shutting_down"}
