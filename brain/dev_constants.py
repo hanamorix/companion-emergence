@@ -199,3 +199,24 @@ COST_SERIES_WINDOW_S: float = 24 * 60 * 60
 # not the bridge with its other models and caches; the 14.23% rests on one cell (replicate 4).
 RAM_FIT_LARGEST_UNDERESTIMATE: float = 0.14227
 RAM_FIT_SAFETY_FACTOR: float = 1.0 / (1.0 - RAM_FIT_LARGEST_UNDERESTIMATE)  # 1.1659
+
+# --- settings-file lock wait (#529) ------------------------------------------
+# How long a writer of $KINDLED_HOME/tunables.json (the install-wide settings file: the picker, `nell model`, the
+# bridge boot rewrite, the migrations) waits for the file's cross-process lock before it gives up and does not write
+# (`brain.utils.file_lock.locked_within`). One constant serves the tunables lock and the model migration's own lock.
+# It is DERIVED from constants that already exist, not sampled: the longest the holder itself can keep the lock is
+# R_read + (K + 1) * R_replace, where
+#   R_replace = _REPLACE_RETRY_SLEEP_S * (1 + 2 + ... + (_REPLACE_RETRIES - 1))        brain/health/attempt_heal.py
+#             = 0.05 * 28 = 1.4 s (a replace that keeps failing with PermissionError, Windows)
+#   R_read    = the same sum over json_io._READ_ATTEMPTS = 0.05 * (1 + 2) = 0.15 s (Windows only; 0 elsewhere)
+#   K         = the most replaces one `write_defaults_section` heal makes while it holds the lock: the heal's own
+#               install (1) + the corrupt backups it quarantines (3 at most) + the notice file it writes (1) = 5;
+#               the "+ 1" is the payload write that follows.
+# 0.15 + 6 * 1.4 = 8.55 s, rounded up to 8.6. Upper bound against the real budgets: the picker request first spends
+# the 30 s model probe (`provider.model_check_timeout_seconds`) and THEN waits for this lock, and the webview cuts a
+# request at about 60 s (see `brain/bridge/server.py`, the model-check comment), so the wait must stay well under 30 s.
+# The test that holds the line (tests/unit/brain/test_locked_within.py) recomputes the bound from the LIVE retry
+# constants, so changing them without re-deriving this one fails.
+SETTINGS_FILE_LOCK_WAIT_S: float = 8.6
+# How often the bounded wait retries the non-blocking lock attempt. A poll costs one open and one flock call.
+SETTINGS_FILE_LOCK_POLL_S: float = 0.02

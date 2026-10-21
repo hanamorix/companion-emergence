@@ -28,26 +28,23 @@ Idempotent: if none of the retired keys are present, this is a no-op (no
 write at all, not even a no-op rewrite) — running it twice produces
 byte-identical files.
 
-Known residual risk (round-2 code red-team MINOR, accepted, not fixed):
-this migration runs against the shared, cross-persona KINDLED_HOME/
-tunables.json (S74 only scoped the FTS health check to bridge-only, not
-this migration). Two bridge processes for DIFFERENT personas starting at
-the same instant could both read the same original bytes before either
-writes, racing on the shared `.bak-migrate` sidecar. The write itself stays
-safe (atomic temp+os.replace, never a torn file) and the migration is
-idempotent (a lost/overwritten write just re-runs identically at the next
-bridge start), so the blast radius is self-healing, not data-corrupting —
-accepted as a low-probability, bounded residual rather than adding a new
-cross-process lock for a one-time startup migration.
+Concurrency (#529): this migration reads and rewrites the shared, cross-persona KINDLED_HOME/tunables.json, and so
+do ``tunables.set_overrides`` and ``tunables.write_defaults_section``. The rewrite (read, write, verify and restore)
+therefore runs under the same cross-process lock they take, with a bounded wait; the file is re-read inside the lock.
+The pre-check for a retired key runs outside the lock, so an ordinary boot never locks. The shared ``.bak-migrate``
+sidecar is only touched while the lock is held.
 """
 from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from brain import dev_constants
 from brain.health.json_io import Recovery, read_json, write_json
+from brain.utils.file_lock import LockTimeoutError, locked_within
 
 logger = logging.getLogger(__name__)
 
@@ -65,21 +62,19 @@ _DROP_ONLY_KEYS = (
     "judge_selftune.gate_handful_decisions",
 )
 
+# Test seam: called inside the locked window, after the re-read and just before the write (deterministic interleaving).
+_LOCKED_WINDOW_HOOK: Callable[[], None] | None = None
 
-def migrate_idle_keys(home: Path) -> None:
-    """Migrate ``home/tunables.json``'s retired idle-tuning keys in place.
 
-    No-op (no read past the initial stat/parse, no write) when the file is
-    absent or none of the retired keys are present in its ``overrides``.
-    """
-    path = home / _FILE_NAME
+def _read_state(path: Path) -> tuple[bytes, dict[str, Any], dict[str, Any]] | None:
+    """``(original bytes, parsed file, overrides)``, or None when there is nothing to migrate or the file is unusable."""
     try:
         original_bytes = path.read_bytes()
     except FileNotFoundError:
-        return  # nothing to migrate — a fresh persona has no old keys
+        return None  # nothing to migrate — a fresh persona has no old keys
     except OSError as exc:
         logger.warning("tunables_migration: cannot read %s (%s) — skipping", path, exc)
-        return
+        return None
 
     try:
         data = json.loads(original_bytes.decode("utf-8"))  # json-io: ok -- byte-exact backup needs the original bytes
@@ -88,19 +83,54 @@ def migrate_idle_keys(home: Path) -> None:
             "tunables_migration: %s unreadable (%s) — skipping (not this module's job to repair)",
             path, exc,
         )
-        return
+        return None
 
     if not isinstance(data, dict):
         logger.warning("tunables_migration: %s is not a JSON object — skipping", path)
-        return
+        return None
 
     overrides = data.get("overrides")
     if not isinstance(overrides, dict):
         overrides = {}
+    return original_bytes, data, overrides
 
-    retired_keys_present = [_OLD_THROTTLE_KEY, *_DROP_ONLY_KEYS]
-    if not any(k in overrides for k in retired_keys_present):
+
+_RETIRED_KEYS_PRESENT = [_OLD_THROTTLE_KEY, *_DROP_ONLY_KEYS]
+
+
+def migrate_idle_keys(home: Path) -> None:
+    """Migrate ``home/tunables.json``'s retired idle-tuning keys in place.
+
+    No-op (no lock, no write) when the file is absent or none of the retired keys are present in its ``overrides``: that
+    cheap pre-check runs OUTSIDE the lock, so an ordinary boot pays no lock round trip. When a retired key is present the
+    file is locked (the same cross-process lock ``tunables.set_overrides`` takes, bounded wait) and RE-READ inside the
+    lock; the lock covers the whole read, write, verify and restore sequence, so a concurrent ``set_overrides`` can
+    neither be overwritten by the write nor clobbered by the restore. The bytes written back are always the ones read
+    inside the lock. If another process holds the lock for the whole wait the migration is skipped (retried at the next
+    start).
+    """
+    path = home / _FILE_NAME
+    state = _read_state(path)
+    if state is None or not any(k in state[2] for k in _RETIRED_KEYS_PRESENT):
         return  # idempotent no-op — nothing to migrate, no write at all
+    try:
+        with locked_within(path, dev_constants.SETTINGS_FILE_LOCK_WAIT_S):
+            state = _read_state(path)
+            if state is None or not any(k in state[2] for k in _RETIRED_KEYS_PRESENT):
+                return  # another process migrated it between the pre-check and the lock
+            if _LOCKED_WINDOW_HOOK is not None:
+                _LOCKED_WINDOW_HOOK()
+            _rewrite(path, *state)
+    except LockTimeoutError:
+        logger.warning(
+            "tunables_migration: another process held the lock on %s for %.1f s — skipping (retried at the next start)",
+            path, dev_constants.SETTINGS_FILE_LOCK_WAIT_S,
+        )
+
+
+def _rewrite(path: Path, original_bytes: bytes, data: dict[str, Any], overrides: dict[str, Any]) -> None:
+    """Rewrite the file without the retired keys. Called with the file lock held. Never raises."""
+    retired_keys_present = _RETIRED_KEYS_PRESENT
 
     new_overrides: dict[str, Any] = {
         k: v for k, v in overrides.items() if k not in retired_keys_present
@@ -160,7 +190,7 @@ def migrate_idle_keys(home: Path) -> None:
         except OSError:
             pass
 
-    # mtime changed under tunables.py's own cache — the next get_tunable()
+    # the file's signature changed under tunables.py's own cache — the next get_tunable()
     # call re-reads (tunables.py:_load_overrides_locked), no extra reset needed.
     logger.info(
         "tunables_migration: migrated %s (%d retired key(s) removed%s)",
