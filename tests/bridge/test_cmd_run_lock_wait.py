@@ -127,7 +127,7 @@ def _stopped_on_request(persona_dir: Path, reason: str) -> None:
     state_file.write(persona_dir, cur)
 
 
-@pytest.mark.parametrize("reason", ["user_stop", "hard_exit"])
+@pytest.mark.parametrize("reason", ["user_stop", "app_restart", "manual_restart", "hard_exit"])
 def test_a_service_run_waiting_for_a_bridge_does_not_undo_its_requested_stop(home, tmp_path, monkeypatch, reason):
     """Pre-merge review O-2: a service-origin `nell supervisor run` queued behind a running bridge must not start a new
     bridge once that bridge has ended on a requested stop (`nell supervisor stop`, or a hard exit the user chose):
@@ -150,13 +150,22 @@ def test_a_service_run_waiting_for_a_bridge_does_not_undo_its_requested_stop(hom
 
 @pytest.mark.parametrize(
     "origin, ended",
-    [("task-scheduler", "crash"), ("task-scheduler", "died"), ("tests", "user_stop")],
-    ids=["service-after-crash", "service-after-death", "terminal-run-after-stop"],
+    [
+        ("task-scheduler", "crash"),
+        ("task-scheduler", "died"),
+        ("task-scheduler", "idle_timeout"),
+        ("task-scheduler", "os_signal"),
+        ("tests", "user_stop"),
+    ],
+    ids=["service-after-crash", "service-after-death", "service-after-idle-stop", "service-after-os-signal",
+         "terminal-run-after-stop"],
 )
 def test_a_waiting_run_still_starts_after_a_crash_or_when_run_by_hand(home, tmp_path, monkeypatch, origin, ended):
     """The other side of O-2: a bridge that crashed (reason "crash") or died with its record still "running" is
-    replaced by the waiting service run (#177); a run started by hand in a terminal is an explicit start and runs
-    after the stop it waited for."""
+    replaced by the waiting service run (#177). An idle stop is nobody's request to keep the service down (an
+    always-on service bridge queued behind the app's bridge must start when that bridge idles out, fix-check
+    must-fix 1), and neither is an OS signal, which cannot tell a user's kill from a logout or a manager's stop. A run
+    started by hand in a terminal is an explicit start and runs after the stop it waited for."""
     holder, go = _holder(home, tmp_path)
     try:
         _live_record(home, holder)
@@ -167,8 +176,8 @@ def test_a_waiting_run_still_starts_after_a_crash_or_when_run_by_hand(home, tmp_
             st = state_file.read(home)
             st.phase, st.stop_reason = "hard_exit", "crash"
             state_file.write(home, st)
-        elif ended == "user_stop":
-            _stopped_on_request(home, "user_stop")
+        elif ended in ("user_stop", "idle_timeout", "os_signal"):
+            _stopped_on_request(home, ended)
         go.write_text("go")
         t.join(timeout=30)
         assert not t.is_alive()

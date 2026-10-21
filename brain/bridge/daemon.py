@@ -504,11 +504,22 @@ def _await_readiness(persona_dir: Path, pid: int, log_path: Path, out: dict | No
 
 
 def _ended_on_a_requested_stop(st: state_file.BridgeState | None) -> bool:
-    """The record says its bridge ended on a stop someone asked for (a user or app stop, an OS signal, an idle stop or
-    a hard exit), not a crash: it left "running" and names a reason other than "crash" / "unknown"."""
-    from brain.bridge.shutdown import REASON_CRASH, REASON_UNKNOWN
+    """The record says its bridge ended on a stop a person asked for through nell or the app: ``nell supervisor
+    stop`` (user_stop), an app restart (app_restart), a stop request with no reason (manual_restart), or a hard exit
+    the user chose (hard_exit). Not an idle stop (nobody asked for anything), not an OS signal (it cannot tell a user's
+    kill from a logout or a service manager's stop), not a crash. A kill is the respawn guard's (D25), not this."""
+    from brain.bridge.shutdown import (
+        REASON_APP_RESTART,
+        REASON_HARD_EXIT,
+        REASON_MANUAL_RESTART,
+        REASON_USER_STOP,
+    )
 
-    return st is not None and st.phase != "running" and st.stop_reason not in (None, "", REASON_CRASH, REASON_UNKNOWN)
+    return (
+        st is not None
+        and st.phase != "running"
+        and st.stop_reason in (REASON_USER_STOP, REASON_APP_RESTART, REASON_MANUAL_RESTART, REASON_HARD_EXIT)
+    )
 
 
 def cmd_run(args) -> int:
@@ -518,7 +529,9 @@ def cmd_run(args) -> int:
     the bridge process until uvicorn exits, which is exactly what launchd wants
     to supervise. A per-persona lock is held for the lifetime of the process; a
     run that finds it held waits for it (D4). A service run that waited for a
-    running bridge does not start when that bridge ended on a requested stop.
+    running bridge does not start when a person stopped that bridge through nell
+    or the app (see ``_ended_on_a_requested_stop``); after an idle stop, an OS
+    signal or a crash it starts.
     """
     from brain.paths import get_persona_dir
 
@@ -561,8 +574,8 @@ def cmd_run(args) -> int:
             logger.info("not starting: stopped on request (user kill of this boot)")
             return 0
         if guarded and waited_for_a_bridge and _ended_on_a_requested_stop(state_file.read(persona_dir)):
-            # Pre-merge review O-2: a service run queued behind a running bridge does not undo that bridge's
-            # requested stop (exit 0: success to every service manager, so nothing restarts it).
+            # Pre-merge review O-2: a service run queued behind a running bridge does not undo a stop a person asked
+            # for through nell or the app (exit 0: success to every service manager, so nothing restarts it).
             print("not starting: the running bridge was stopped on request", file=sys.stderr)
             logger.info("not starting: the bridge this run waited for was stopped on request")
             return 0
@@ -643,7 +656,8 @@ def _print_kill_result(result) -> int:  # noqa: ANN001
 def cmd_stop(args) -> int:
     """`nell supervisor stop` (#456 Q-A, D16, D22): ask the bridge to stop, then watch until it is gone.
 
-    ``--kill``: the kill helper at once. A pre-PR bridge (no identity token): the old request, then the kill helper
+    ``--kill``: the kill helper (a bridge run by an OS service first gets the hard-exit request and up to
+    ``--timeout`` to go, then its service manager's stop; any other bridge is killed at once). A pre-PR bridge (no identity token): the old request, then the kill helper
     after a few seconds. A stale record: "not running". If the request fails and no stop is recorded: POSIX sends
     SIGTERM when the identity holds; Windows refuses unless ``--force`` (then the kill helper).
     """
