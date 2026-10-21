@@ -21,7 +21,10 @@ before ``touch_last_opened``, and (b) at the start of the CLI write commands. It
 2. CLEARING (for the launching persona, on EVERY start until its legacy keys are gone, marker or not). Once a decision
    exists, the persona's own legacy keys are removed from its own file, and every saved model text removed is logged
    (an unusable text at WARNING, a valid one at INFO), so no saved value ever disappears without a trace. Other
-   personas' files are never rewritten by this process; each clears on its own start.
+   personas' files are never rewritten by this process; each clears on its own start, but a valid saved model is
+   cleared only once a decision exists. While no Claude-provider persona is a candidate (for example only non-Claude
+   personas are installed) no decision is made, so those personas keep their legacy keys (harmless: they are never
+   applied) until a decision is made; an unusable (typo) text is cleared on any start.
 
 Lock order: this module's lock (``model_migration.done.lock``) is taken first and only around the short write section;
 inside it ``set_job_models`` takes the tunables lock. Both waits are bounded; on a timeout this logs and returns (no
