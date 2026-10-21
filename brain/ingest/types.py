@@ -2,7 +2,7 @@
 
 These are the boundary types for the 8-stage conversation ingest pipeline.
 ExtractedItem represents one candidate memory pulled from a transcript.
-IngestReport summarises what happened when a session was closed.
+IngestReport summarises what one extraction pass over a session did.
 """
 
 from __future__ import annotations
@@ -86,10 +86,10 @@ class ExtractedItem:
 
 @dataclass
 class IngestReport:
-    """Summary of what happened when one conversation session was closed.
+    """Summary of what one extraction pass (snapshot, close, rollover) did for one conversation session.
 
     Attributes:
-        session_id:      The closed session's identifier.
+        session_id:      The session's identifier.
         extracted:       Total candidate items returned by the LLM.
         committed:       Items durably written to memories.db (bypasses the pending-candidate
                          gate — memory_type/label in brain.memory.pending.GATE_BYPASS_TYPES).
@@ -115,10 +115,17 @@ class IngestReport:
         backoff_skipped: The session's recorded failures reached the threshold less than the
                          backoff window ago, so this pass returned without calling the
                          provider (``errors`` is 1). It is not a failed attempt.
+        chunks:          Extraction calls this pass made: one per chunk of the span after the
+                         cursor (#523; a span longer than ``ingest.extraction_chunk_chars`` is
+                         extracted in several chunks, oldest first).
+        reached_end:     The pass committed every chunk up to the end of the span it read, so
+                         the cursor reached the buffer's end as the pass saw it. False by default:
+                         a report from any path that did not say so is not completed.
 
     ``completed`` is the one question a caller that acts on the extraction's result (the
-    rollover, which deletes the buffer) must ask: did this pass extract the session's turns?
-    A busy, a deferred or an errored pass did not.
+    rollover, which deletes the buffer) must ask: did the cursor reach the end of the
+    session's turns? A pass stopped at any chunk (deferred, failed, a commit failure, a
+    chunk limit), a busy pass and an errored pass did not.
     """
 
     session_id: str
@@ -134,8 +141,10 @@ class IngestReport:
     deferred: bool = False
     busy: bool = False
     backoff_skipped: bool = False
+    chunks: int = 0
+    reached_end: bool = False
 
     @property
     def completed(self) -> bool:
-        """True when the pass actually ran to the end for the session's turns (not busy, not deferred, no error)."""
-        return not (self.busy or self.deferred) and self.errors == 0
+        """True only when the pass reached the end of the span (``reached_end``), was neither busy nor deferred, and had no error."""
+        return self.reached_end and not (self.busy or self.deferred) and self.errors == 0

@@ -224,3 +224,20 @@ def test_a_bad_override_is_ignored_with_one_warning(tunables_home, caplog, bad) 
 def test_a_positive_override_changes_the_chunk_size(tunables_home) -> None:
     _write_tunables(tunables_home, {"ingest.extraction_chunk_chars": 120})
     assert extraction_chunk_chars() == 120
+
+
+# ---------------------------------------------------------------------------
+# C5: `completed` means the cursor reached the end of the span
+# ---------------------------------------------------------------------------
+
+
+def test_a_bare_report_is_not_completed() -> None:
+    """A report from any path that did not say it reached the end is not completed (fail-safe toward keeping the buffer)."""
+    from brain.ingest.types import IngestReport
+
+    assert IngestReport(session_id="s").completed is False
+    assert IngestReport(session_id="s", chunks=1).completed is False  # stopped after chunk 1 with no error
+    assert IngestReport(session_id="s", reached_end=True).completed is True
+    assert IngestReport(session_id="s", reached_end=True, busy=True).completed is False
+    assert IngestReport(session_id="s", reached_end=True, deferred=True).completed is False
+    assert IngestReport(session_id="s", reached_end=True, errors=1).completed is False

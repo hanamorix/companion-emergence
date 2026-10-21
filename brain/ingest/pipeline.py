@@ -238,6 +238,7 @@ def _close_session_locked(
         delete_session_buffer(persona_dir, session_id)
         delete_cursor(persona_dir, session_id)
         delete_backoff(persona_dir, session_id)
+        report.reached_end = True
         return report
 
     # ── EXTRACT ──────────────────────────────────────────────────────────────
@@ -352,6 +353,7 @@ def _close_session_locked(
         delete_session_buffer(persona_dir, session_id)
         delete_cursor(persona_dir, session_id)
         delete_backoff(persona_dir, session_id)
+        report.reached_end = True
     else:
         # close_session only holds + logs. Backoff escalation toward dead-letter
         # is owned by the extract_session_snapshot sweep (5-min and 24-h cadences),
@@ -456,6 +458,7 @@ def _extract_session_snapshot_locked(
             session_id,
             cursor,
         )
+        report.reached_end = True
         return report
 
     user_name = _load_user_name(persona_dir)
@@ -560,6 +563,7 @@ def _extract_session_snapshot_locked(
     # the buffer is held for retry — advancing the cursor would cause the
     # next pass to skip the un-committed turns permanently.
     last_ts = turns[-1].get("ts")
+    report.reached_end = report.commit_failures == 0
     if report.commit_failures == 0 and last_ts:
         try:
             write_cursor(persona_dir, session_id, str(last_ts))

@@ -261,10 +261,16 @@ def test_a_report_that_did_not_complete_with_no_errors_is_always_busy_or_deferre
 
     from brain.ingest.types import IngestReport
 
-    for busy, deferred, backoff_skipped, errors in itertools.product([False, True], [False, True], [False, True], [0, 1]):
-        report = IngestReport(session_id="s", busy=busy, deferred=deferred, backoff_skipped=backoff_skipped, errors=errors)
+    # #523: a pass can now also stop before the end of its span with no error (a chunk limit); `reached_end` says so, and the
+    # rollover's extraction is never bounded, so for it this case cannot arise.
+    for busy, deferred, backoff_skipped, errors, reached_end in itertools.product(
+        [False, True], [False, True], [False, True], [0, 1], [False, True]
+    ):
+        report = IngestReport(
+            session_id="s", busy=busy, deferred=deferred, backoff_skipped=backoff_skipped, errors=errors, reached_end=reached_end
+        )
         if not report.completed and report.errors == 0:
-            assert report.busy or report.deferred
+            assert report.busy or report.deferred or not report.reached_end
 
 
 # --- finalize's dead-letter move when the buffer is already gone (a rollover reaped it) --------------------------------
