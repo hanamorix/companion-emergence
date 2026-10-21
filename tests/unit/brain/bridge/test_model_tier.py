@@ -513,3 +513,4 @@ def test_the_unsupported_display_is_cut_and_cleaned() -> None:
     assert unsupported_display("x" * 200) == "x" * MODEL_ID_MAX_LENGTH + "…"
     assert unsupported_display("a\x1b[31m\nb") == "a[31mb"
     assert unsupported_display("​\x07") == "(non-printing characters)"
+    assert unsupported_display("") == "(empty)"  # an empty text is not "non-printing characters"

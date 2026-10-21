@@ -1245,9 +1245,10 @@ def build_app(
         # retires the pre-lull idle-tuning keys into the single
         # chat.idle_lull_seconds key. Synchronous, BEFORE the supervisor thread
         # starts (C12: ordering asserted here) so no code — including the
-        # supervisor's first loop pass — can ever read a stale key. Fail-safe
-        # internally (never raises); the try/except here is belt-and-suspenders
-        # matching every other non-essential startup step in this function.
+        # supervisor's first loop pass — can ever read a stale key. The rewrite
+        # is fail-safe internally; opening the lock's sidecar file can still
+        # raise OSError, which the try/except here catches (as it does for every
+        # other non-essential startup step in this function).
         try:
             from brain import paths
             from brain.tunables_migration import migrate_idle_keys

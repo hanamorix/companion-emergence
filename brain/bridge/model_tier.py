@@ -10,7 +10,8 @@ restart.
 
 Pinning a default is one line: edit the id on the job's ``tunables.register`` line. The words the UI offers (Sonnet,
 Opus, Haiku) are vocabulary for the picker, ``nell model set`` and the setup wizard (``resolve_choice``); the tunables
-file holds ids, never the words, and a word that means the job's own default REMOVES the override instead of writing
+file written by those paths holds ids, never the words (a word typed into the file by hand is accepted and handed to
+the CLI as the CLI's own alias, not as the pinned id), and a word that means the job's own default REMOVES the override instead of writing
 a copy, so a user who picked the word follows every later change of the shipped default (``set_job_models``).
 
 A configured id is checked against the model grammar (``is_valid_model``); a value that fails it is ignored with one
@@ -72,8 +73,8 @@ def is_valid_model(value: object) -> bool:
 def unsupported_display(raw: object) -> str:
     """A rejected setting's text made safe to show: control characters removed, cut at the id length cap."""
     clean = "".join(ch for ch in str(raw) if ch.isprintable())
-    if not clean:  # only control / non-printing characters: say so rather than show an empty value
-        return "(non-printing characters)"
+    if not clean:  # nothing printable: say what it was rather than show an empty value
+        return "(non-printing characters)" if str(raw) else "(empty)"
     return clean if len(clean) <= MODEL_ID_MAX_LENGTH else clean[:MODEL_ID_MAX_LENGTH] + "…"
 
 

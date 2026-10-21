@@ -23,7 +23,8 @@ read the (possibly still-old) file.
 
 Fail-safe: any error during the rewrite restores the original file from the
 backup taken just before writing (if the on-disk file was touched at all)
-and logs a WARNING — this module must never raise into bridge startup.
+and logs a WARNING. The rewrite itself never raises; opening the lock's sidecar file can raise ``OSError``, which the
+bridge lifespan's call site catches (this module must never break bridge startup).
 Idempotent: if none of the retired keys are present, this is a no-op (no
 write at all, not even a no-op rewrite) — running it twice produces
 byte-identical files.
@@ -95,7 +96,7 @@ def _read_state(path: Path) -> tuple[bytes, dict[str, Any], dict[str, Any]] | No
     return original_bytes, data, overrides
 
 
-_RETIRED_KEYS_PRESENT = [_OLD_THROTTLE_KEY, *_DROP_ONLY_KEYS]
+_RETIRED_KEYS = [_OLD_THROTTLE_KEY, *_DROP_ONLY_KEYS]
 
 
 def migrate_idle_keys(home: Path) -> None:
@@ -111,12 +112,12 @@ def migrate_idle_keys(home: Path) -> None:
     """
     path = home / _FILE_NAME
     state = _read_state(path)
-    if state is None or not any(k in state[2] for k in _RETIRED_KEYS_PRESENT):
+    if state is None or not any(k in state[2] for k in _RETIRED_KEYS):
         return  # idempotent no-op — nothing to migrate, no write at all
     try:
         with locked_within(path, dev_constants.SETTINGS_FILE_LOCK_WAIT_S):
             state = _read_state(path)
-            if state is None or not any(k in state[2] for k in _RETIRED_KEYS_PRESENT):
+            if state is None or not any(k in state[2] for k in _RETIRED_KEYS):
                 return  # another process migrated it between the pre-check and the lock
             if _LOCKED_WINDOW_HOOK is not None:
                 _LOCKED_WINDOW_HOOK()
@@ -130,10 +131,8 @@ def migrate_idle_keys(home: Path) -> None:
 
 def _rewrite(path: Path, original_bytes: bytes, data: dict[str, Any], overrides: dict[str, Any]) -> None:
     """Rewrite the file without the retired keys. Called with the file lock held. Never raises."""
-    retired_keys_present = _RETIRED_KEYS_PRESENT
-
     new_overrides: dict[str, Any] = {
-        k: v for k, v in overrides.items() if k not in retired_keys_present
+        k: v for k, v in overrides.items() if k not in _RETIRED_KEYS
     }
 
     if _NEW_LULL_KEY not in overrides and _OLD_THROTTLE_KEY in overrides:
@@ -164,7 +163,7 @@ def _rewrite(path: Path, original_bytes: bytes, data: dict[str, Any], overrides:
         # Re-load via the SAME reader tunables.py uses and verify.
         reloaded = read_json(path, recover=Recovery.RAISE, expect=dict)
         reloaded_overrides = reloaded.get("overrides", {})
-        for k in retired_keys_present:
+        for k in _RETIRED_KEYS:
             if k in reloaded_overrides:
                 raise ValueError(f"retired key {k!r} still present after migration")
         if _NEW_LULL_KEY in new_overrides:
@@ -195,7 +194,7 @@ def _rewrite(path: Path, original_bytes: bytes, data: dict[str, Any], overrides:
     logger.info(
         "tunables_migration: migrated %s (%d retired key(s) removed%s)",
         path,
-        len(retired_keys_present),
+        len(_RETIRED_KEYS),
         f", chat.idle_lull_seconds={new_overrides[_NEW_LULL_KEY]!r} carried forward"
         if _NEW_LULL_KEY in new_overrides
         else "",

@@ -18,6 +18,9 @@ with neither is NOT a rejection (some other 404 must not be told to the user as 
 with its status. The 2.1.302 CLI already appended a suffix to the sentence, which is why the sentence cannot be
 the only signal. Whether the CURRENT CLI still sends these is checked by tests/bridge/test_model_rejection_live.py.
 
+The records also drive the fallback: ``brain.bridge.model_tier.model_for_tier`` runs a job's shipped default instead
+of a configured id while that id has a rejection record newer than the settings file (``is_rejected(since_epoch=...)``).
+
 Shape mirrors :mod:`brain.bridge.provider_auth`: module globals under one lock, every public function
 fails OPEN (an internal error never blocks a call or a turn), ``reset()`` for tests.
 """
