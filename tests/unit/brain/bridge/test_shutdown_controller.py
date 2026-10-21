@@ -379,3 +379,33 @@ def test_stopping_the_monitor_writes_the_final_progress_record(own_record):
     rec = shutdown_progress.read_record(own_record, shutdown_progress.PROGRESS_FILENAME)
     assert rec["count"] == 0 and rec["tasks"] == []
     assert exits == []
+
+
+def test_uvicorn_still_re_raises_the_signals_our_server_captures(monkeypatch):
+    """Pre-merge review O-8: make_server_class relies on uvicorn's PRIVATE ``Server._captured_signals`` and
+    ``capture_signals`` (pyproject allows ``uvicorn>=0.30``): our ``handle_exit`` records a signal there instead of
+    calling uvicorn's, and uvicorn re-raises it after serve() so a SIGTERM still ends the process with status 0 (C15)
+    through the runner. If an upgrade renames or drops either, this fails here, naming the reason, instead of the stop
+    silently changing behaviour."""
+    import signal as _signal
+    import threading as _threading
+
+    import uvicorn
+
+    if _threading.current_thread() is not _threading.main_thread():
+        pytest.skip("uvicorn installs signal handlers only from the main thread")
+    server = _server_class()(uvicorn.Config(app=lambda *a: None))
+    assert isinstance(getattr(server, "_captured_signals", None), list), (
+        "uvicorn.Server no longer has the private _captured_signals list that shutdown.make_server_class appends to"
+    )
+    c = BridgeShutdownController()
+    server.controller = c
+    raised: list[int] = []
+    monkeypatch.setattr(_signal, "raise_signal", raised.append)
+    before = _signal.getsignal(_signal.SIGTERM)
+    with server.capture_signals():
+        assert _signal.getsignal(_signal.SIGTERM) == server.handle_exit, "uvicorn no longer installs Server.handle_exit"
+        server.handle_exit(_signal.SIGTERM, None)
+    assert raised == [_signal.SIGTERM], "uvicorn no longer re-raises the signals in _captured_signals after serve()"
+    assert _signal.getsignal(_signal.SIGTERM) == before
+    assert c.serve_finished and c.signal_count == 1
