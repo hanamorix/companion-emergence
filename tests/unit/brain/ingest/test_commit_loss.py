@@ -312,7 +312,7 @@ def test_snapshot_retry_after_commit_failure_is_not_self_deduped(tmp_path: Path)
 
 
 def test_finalize_deadletters_after_max_retry(tmp_path: Path):
-    """finalize_stale_sessions must dead-letter a buffer after
+    """finalize_stale_sessions must dead-letter the failing chunk after
     _BACKOFF_FAILURE_THRESHOLD consecutive snapshot calls all fail with
     commit errors.  The sidecar must climb naturally — no pre-seeding.
     """
@@ -363,9 +363,11 @@ def test_finalize_deadletters_after_max_retry(tmp_path: Path):
 
     assert len(reports) == 1
     original_buf = persona_dir / "active_conversations" / f"{sid}.jsonl"
-    poison_buf = persona_dir / "active_conversations" / "poison" / f"{sid}.jsonl"
-    assert not original_buf.exists(), "original buffer must be moved out of active_conversations/"
-    assert poison_buf.exists(), "dead-lettered buffer must appear in poison/"
+    poison_span = persona_dir / "active_conversations" / "poison" / f"{sid}.span.jsonl"
+    # #523 (pre-merge review MF1): only the failing chunk (here the whole short span) is set aside; the buffer stays, with the
+    # cursor past the set-aside rows, so nothing after them is lost.
+    assert poison_span.exists(), "the failing chunk must appear in poison/"
+    assert original_buf.exists(), "the buffer stays in active_conversations/"
 
 
 # ---------------------------------------------------------------------------

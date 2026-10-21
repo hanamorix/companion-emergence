@@ -911,3 +911,26 @@ def test_b17_a_damaged_marker_is_rewritten(world, damage) -> None:
     rows = _seed(persona, "sess_m4", 2)
     _snapshot(world, "sess_m4", _Stub())
     assert chunked_extraction_since(persona)["sess_m4"] == lenient_utc(rows[0]["ts"])
+
+
+def test_finalize_sets_aside_only_the_failing_chunk_and_the_rest_is_extracted_later(world) -> None:
+    """Pre-merge review MF1: a stale session whose third chunk keeps failing loses only that chunk to ``poison/``; chunks 4 and 5,
+    never tried, stay in the buffer after the moved cursor and a later pass extracts them (the finalize dead-letter used to
+    rename the WHOLE buffer)."""
+    persona, store, hebbian, transcripts = world
+    rows = _seed(persona, "sess_fin", 10, start=datetime.now(UTC) - timedelta(days=2))
+    chunks = _expected_chunks(rows)
+    assert len(chunks) == 5
+    write_cursor(persona, "sess_fin", chunks[1].cursor_ts)  # chunks 1-2 committed earlier
+    write_backoff(persona, "sess_fin", failures=2, first_failure_at=(datetime.now(UTC) - timedelta(minutes=30)).isoformat())
+    third = _line(chunks[2].turns[0])
+    failing = _Stub(plan=lambda n, p: "fail" if third in p else None)
+    pipeline.finalize_stale_sessions(persona, finalize_after_hours=24.0, store=store, hebbian=hebbian, provider=failing)
+    poisoned = (persona / "active_conversations" / "poison" / "sess_fin.span.jsonl").read_text().splitlines()
+    assert [json.loads(x)["text"] for x in poisoned] == [r["text"] for r in chunks[2].turns]
+    assert "sess_fin" in list_active_sessions(persona)
+    assert read_cursor(persona, "sess_fin") == chunks[2].cursor_ts
+    transcripts.clear()
+    later = _snapshot(world, "sess_fin", _Stub())
+    assert later.completed
+    assert "\n".join(transcripts) == "\n".join(c.text for c in chunks[3:])

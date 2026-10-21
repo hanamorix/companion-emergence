@@ -5,7 +5,7 @@ extract_session_snapshot()  non-destructive: extract the rows after the cursor s
 close_stale_sessions()      destructive sweep (close_session for every silent session); for explicit close callers only.
 snapshot_stale_sessions()   non-destructive sweep of the supervisor's session-snapshot job, one chunk per session per pass
                             (the job also saves open conversations at the first idle pass after a start; a stop runs no sweep).
-finalize_stale_sessions()   24h extraction-only sweep, one chunk per session per run; dead-letters a buffer that keeps failing.
+finalize_stale_sessions()   24h extraction-only sweep, one chunk per session per run; sets aside a chunk that keeps failing.
 
 Stage flow of one pass:
   BUFFER  → read the rows after the cursor from <persona_dir>/active_conversations/<session_id>.jsonl (summary rows dropped)
@@ -709,8 +709,8 @@ def finalize_stale_sessions(
     a rolled-over buffer is reaped exactly once and a still-live session's buffer is
     left intact (bounded by the daily cascade + 1d segmentation, and becomes
     rollover-eligible at the 24h-idle or weekly boundary). The empty-buffer branch's
-    delete is removed too. Only the poison-move path (corrupt input) still quarantines
-    a buffer out of the active set. Caller (supervisor) follows up with
+    delete is removed too. A session whose extraction keeps failing has only its failing
+    chunk set aside in poison/ (``poison_unextracted_span``); the buffer stays. Caller (supervisor) follows up with
     remove_session() for each returned report.session_id (registry-cache eviction; a
     still-live session re-hydrates from disk on next access).
 
@@ -754,46 +754,34 @@ def finalize_stale_sessions(
             backoff is not None and backoff["failures"] >= _BACKOFF_FAILURE_THRESHOLD
         )
         if at_threshold:
-            # Buffer has failed >= threshold times — move to poison queue so it
-            # doesn't block the finalize loop indefinitely. This is the ONLY
-            # buffer-lifecycle action finalize still performs (quarantine of
-            # corrupt input); the successful path no longer deletes.
-            # Under the session's extraction lock (#477), non-blocking: a pass that holds it (the busy
-            # snapshot above, a rollover's poison_unextracted_span) must not have the buffer renamed and
-            # the cursor deleted under it; the next finalize tick retries.
-            with file_lock(extract_lock_path(persona_dir, sid), blocking=False) as acquired:
-                if not acquired:
-                    logger.info("conversation_finalize_deadletter_busy session=%s: another extraction holds it", sid)
-                else:
-                    src = persona_dir / "active_conversations" / f"{sid}.jsonl"
-                    poison_dir = persona_dir / "active_conversations" / "poison"
-                    dst = poison_dir / f"{sid}.jsonl"
-                    # The backoff above was read BEFORE this lock: a rollover that succeeded in between has reaped the
-                    # buffer, and there is then nothing to poison. Checked under the lock, and the rename is guarded too
-                    # (a reap in that instant), so a vanished buffer can never abort the sweep for the other sessions.
-                    moved = False
-                    if src.exists():
-                        try:
-                            poison_dir.mkdir(parents=True, exist_ok=True)
-                            src.rename(dst)
-                            moved = True
-                        except FileNotFoundError:
-                            pass
-                    if moved:
-                        delete_cursor(persona_dir, sid)
-                        delete_backoff(persona_dir, sid)
-                        logger.warning(
-                            "conversation_finalize_deadletter session=%s failures=%d — moved to poison/",
-                            sid,
-                            backoff["failures"],  # type: ignore[index]
-                        )
-                    else:
-                        delete_backoff(persona_dir, sid)  # nothing left to poison: the failure record is stale
-                        logger.info(
-                            "conversation_finalize_deadletter_gone session=%s: the buffer is already gone "
-                            "(reaped by a rollover); nothing to poison, backoff cleared",
-                            sid,
-                        )
+            # The session's extraction has failed the threshold number of times: set the failing chunk aside in poison/ so
+            # it cannot block the session for good, exactly as the rollover does. Only that chunk goes (the first one after
+            # the cursor, the one that kept failing); the chunks after it were never tried and stay in the buffer, after the
+            # moved cursor, for the next passes. The buffer itself is never moved or deleted here (the rollover owns that).
+            # poison_unextracted_span takes the session's extraction lock non-blocking (#477): None = another pass holds it,
+            # the next finalize tick retries; 0 = nothing left after the cursor (a rollover reaped the buffer in between),
+            # and the stale failure record is cleared.
+            try:
+                set_aside = poison_unextracted_span(persona_dir, sid)
+            except Exception:  # noqa: BLE001 - one session's fault must not abort the sweep for the others
+                logger.exception("conversation_finalize_deadletter_failed session=%s: could not set the chunk aside", sid)
+                set_aside = None
+            if set_aside is None:
+                logger.info("conversation_finalize_deadletter_busy session=%s: another extraction holds it", sid)
+            elif set_aside == 0:
+                logger.info(
+                    "conversation_finalize_deadletter_gone session=%s: nothing left after the cursor (the buffer was "
+                    "reaped by a rollover); nothing to poison, backoff cleared",
+                    sid,
+                )
+            else:
+                logger.warning(
+                    "conversation_finalize_deadletter session=%s failures=%d turns=%d: the failing chunk moved to poison/; "
+                    "the rest of the buffer stays for later passes",
+                    sid,
+                    backoff["failures"],  # type: ignore[index]
+                    set_aside,
+                )
         reports.append(report)
         logger.info(
             "conversation_finalized session=%s silence_hours=%.2f "
