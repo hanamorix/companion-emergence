@@ -548,20 +548,22 @@ def cmd_run(args) -> int:
         logger.info("not starting: stopped on request (user kill of this boot)")
         return 0
     if guarded:
-        # The runtime log first, so the lines below (the wait, the unit refresh) reach it (run_bridge_foreground sets
-        # it up again later; the second call adds nothing).
-        from brain.bridge import runner
-
-        runner._setup_runtime_logging(persona_dir)  # noqa: SLF001 - the one setup, shared with run_bridge_foreground
         # D26: spaced restarts of a bridge that keeps failing to start. Before the lock (nothing held, no watcher file
         # written, so every other command sees no bridge and no starter) and interruptible: an explicit start deletes
         # the record, a user kill fires the guard. SIGTERM and Task Scheduler's end act at once (no handler yet).
+        # The wait's log lines reach the runtime log through a handler that keeps no file open (a run that waits or is
+        # queued must not block the running bridge's log rotation); the persistent handler comes after the lock.
+        from brain.bridge import runner
+
+        transient_log = runner._attach_transient_runtime_log(persona_dir)  # noqa: SLF001
         try:
             go_on = start_backoff.wait_before_start(
                 persona_dir, interrupted=lambda: respawn_guard.guard_fires(persona_dir)
             )
         except KeyboardInterrupt:
             return 0
+        finally:
+            runner._detach_runtime_log(transient_log)  # noqa: SLF001
         if not go_on:
             print("not starting: stopped on request", file=sys.stderr)
             logger.info("not starting: stopped on request (user kill of this boot)")
@@ -584,6 +586,12 @@ def cmd_run(args) -> int:
             return 1
 
     try:
+        if guarded:
+            # The persistent runtime log, now that the lock is held (so the unit refresh below logs to it too;
+            # run_bridge_foreground sets it up again later and adds nothing).
+            from brain.bridge import runner
+
+            runner._setup_runtime_logging(persona_dir)  # noqa: SLF001 - shared with run_bridge_foreground
         if guarded and respawn_guard.guard_fires(persona_dir):
             # Re-checked under the lock, BEFORE run_bridge_foreground deletes the watcher files (S6-a, S7-g).
             print("not starting: stopped on request", file=sys.stderr)

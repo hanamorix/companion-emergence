@@ -13,7 +13,8 @@ from pathlib import Path
 
 import pytest
 
-from brain.bridge import daemon, shutdown_progress, start_backoff
+from brain import process_identity
+from brain.bridge import daemon, respawn_guard, shutdown_progress, start_backoff
 
 REPO = Path(__file__).resolve().parents[2]
 WATCHDOG_TS = REPO / "app" / "src" / "hooks" / "useBridgeWatchdog.ts"
@@ -24,6 +25,9 @@ def pd(tmp_path) -> Path:
     p = tmp_path / "personas" / "nell"
     p.mkdir(parents=True)
     return p
+
+
+REAL_SAME_BOOT = start_backoff._same_boot  # captured before any fixture patches it
 
 
 class Clock:
@@ -42,6 +46,7 @@ def clock(monkeypatch) -> Clock:
     c = Clock()
     monkeypatch.setattr(start_backoff, "_now", c.now)
     monkeypatch.setattr(start_backoff, "_monotonic", c.now)
+    monkeypatch.setattr(start_backoff, "_same_boot", lambda boot, at: True)  # the boot tests use the real rule
     monkeypatch.setattr(start_backoff, "_sleep", c.sleep)
     return c
 
@@ -248,6 +253,100 @@ def test_a_record_rewritten_during_the_wait_takes_a_new_deadline(pd, clock, monk
     assert clock.t - t0 == pytest.approx(10 + 60, abs=2 * POLL_S)
 
 
+# ---- the boot rule: a healthy record of an EARLIER boot causes no wait (review of D26, ruling 1) ------------------------
+
+
+def _healthy_record(pd: Path, *, at: float, boot) -> None:  # noqa: ANN001
+    (pd / start_backoff.FILENAME).write_text(
+        json.dumps({"unproven_starts": 1, "at": at, "after_healthy": True, "boot": boot}), encoding="utf-8"
+    )
+
+
+@pytest.fixture
+def real_boot_rule(monkeypatch):
+    monkeypatch.setattr(start_backoff, "_same_boot", REAL_SAME_BOOT)
+
+
+@pytest.mark.parametrize(
+    ("record_boot", "current_boot", "same"),
+    [("boot-now", "boot-now", True), ("boot-old", "boot-now", False), (None, "boot-now", False),
+     ("boot-now", None, False)],
+)
+def test_linux_a_healthy_record_counts_only_within_its_boot(pd, clock, real_boot_rule, monkeypatch, record_boot,
+                                                            current_boot, same):
+    """The rule of the respawn guard's stop intent (D25): on Linux the boot id; an unreadable or missing id is "not this
+    boot" (never wait on a guess)."""
+    from brain.bridge.shutdown import POLL_S
+
+    monkeypatch.setattr(respawn_guard, "_platform", lambda: "linux")
+    monkeypatch.setattr(process_identity, "boot_id", lambda: current_boot)
+    _healthy_record(pd, at=clock.t - 5000, boot=record_boot)
+    rec = start_backoff.read(pd)
+    assert rec.after_healthy is same
+    t0 = clock.t
+    if same:
+        monkeypatch.setattr(start_backoff, "_sleep", _bounded_sleep(clock, 30 + 5 * POLL_S))
+        assert start_backoff.wait_before_start(pd, interrupted=lambda: False) is True
+        assert clock.t - t0 == pytest.approx(30, abs=POLL_S + 1e-6)
+    else:
+        monkeypatch.setattr(start_backoff, "_sleep", lambda s: pytest.fail("slept"))
+        assert start_backoff.wait_before_start(pd, interrupted=lambda: False) is True
+        # and the next start begins a fresh series
+        start_backoff.note_start(pd)
+        assert start_backoff.read(pd).unproven_starts == 1
+
+
+@pytest.mark.parametrize("platform", ["darwin", "win32"])
+@pytest.mark.parametrize(("offset", "same"), [(100.0, True), (-100.0, False)])
+def test_mac_and_windows_a_healthy_record_counts_only_after_the_boot_time(pd, clock, real_boot_rule, monkeypatch,
+                                                                          platform, offset, same):
+    import psutil
+
+    boot_time = 1_700_000_000.0
+    monkeypatch.setattr(respawn_guard, "_platform", lambda: platform)
+    monkeypatch.setattr(psutil, "boot_time", lambda: boot_time)
+    _healthy_record(pd, at=boot_time + offset, boot=None)
+    assert start_backoff.read(pd).after_healthy is same
+
+
+def test_a_boot_time_that_cannot_be_read_is_not_this_boot(pd, clock, real_boot_rule, monkeypatch):
+    import psutil
+
+    def boom():
+        raise OSError("no boot time")
+
+    monkeypatch.setattr(respawn_guard, "_platform", lambda: "darwin")
+    monkeypatch.setattr(psutil, "boot_time", boom)
+    _healthy_record(pd, at=clock.t, boot=None)
+    assert start_backoff.read(pd).after_healthy is False
+
+
+def test_mark_healthy_records_the_boot_id(pd, clock, monkeypatch):
+    monkeypatch.setattr(process_identity, "boot_id", lambda: "boot-now")
+    start_backoff.mark_healthy(pd)
+    assert json.loads((pd / start_backoff.FILENAME).read_text(encoding="utf-8"))["boot"] == "boot-now"
+
+
+# ---- the watch does not mark a run that is being stopped (review of D26, ruling 2) -------------------------------------
+
+
+@pytest.mark.parametrize("how", ["abandoning", "shutdown_requested"])
+def test_the_watch_does_not_mark_a_run_whose_stop_is_under_way(pd, clock, how):
+    from brain.bridge import cli_throttle
+
+    start_backoff.note_start(pd)
+    mono = Clock(0.0)
+    w = start_backoff.SuccessWatch(pd, FakeServer(started=True), clock=mono.now)
+    w.poll_once()
+    mono.t += start_backoff.HEALTHY_RESET_S
+    if how == "abandoning":
+        shutdown_progress.abandoning.set()  # hard_exit's first step; the root conftest resets it per test
+    else:
+        cli_throttle.request_shutdown()
+    w.poll_once()
+    assert start_backoff.read(pd) == start_backoff.Record(1, clock.t)  # untouched, not marked
+
+
 # ---- C68 (a): the success watch ------------------------------------------------------------------------------------
 
 
@@ -314,10 +413,7 @@ def test_the_start_after_a_healthy_run_is_counted_so_the_ladder_goes_on_at_60_s(
     """The healthy run counts as the series' first start (as the first start of a fresh install does): the start that
     follows its crash is the second, so a quick failure of that one is followed by the 60 s step, as the app's second
     delay is."""
-    start_backoff.note_start(pd)
-    (pd / start_backoff.FILENAME).write_text(
-        json.dumps({"unproven_starts": 1, "at": clock.t, "after_healthy": True}), encoding="utf-8"
-    )
+    start_backoff.mark_healthy(pd)
     start_backoff.note_start(pd)
     assert start_backoff.read(pd) == start_backoff.Record(2, clock.t, False)
 

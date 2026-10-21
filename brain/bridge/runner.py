@@ -120,6 +120,8 @@ def _after_run(persona_dir: Path, app: object, monitor: object) -> None:
 
 _RUNTIME_LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
 _RUNTIME_LOG_BACKUPS = 3
+_RUNTIME_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+_RUNTIME_LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S%z"
 
 
 def _setup_runtime_logging(persona_dir: Path) -> None:
@@ -134,9 +136,9 @@ def _setup_runtime_logging(persona_dir: Path) -> None:
     stderr files become a secondary catch-all for unhandled exceptions
     and uvicorn boot noise; those stay tiny in steady state.
 
-    Idempotent: a second call for the same log file adds nothing. Path: ``<log_dir>/runtime-<persona>.log``. Best-effort — failures
-    here must NOT prevent bridge startup, so any exception is swallowed
-    after a stderr breadcrumb.
+    Idempotent: a second call for the same log file adds nothing. Path: ``<log_dir>/runtime-<persona>.log``.
+    Best-effort — failures here must NOT prevent bridge startup, so any exception is swallowed after a stderr
+    breadcrumb.
     """
     try:
         from logging.handlers import RotatingFileHandler
@@ -156,10 +158,7 @@ def _setup_runtime_logging(persona_dir: Path) -> None:
             encoding="utf-8",
         )
         handler.setFormatter(
-            logging.Formatter(
-                "%(asctime)s %(levelname)s %(name)s: %(message)s",
-                datefmt="%Y-%m-%dT%H:%M:%S%z",
-            )
+            logging.Formatter(_RUNTIME_LOG_FORMAT, datefmt=_RUNTIME_LOG_DATEFMT)
         )
         handler.setLevel(logging.INFO)
         if root.level == logging.NOTSET or root.level > logging.INFO:
@@ -167,6 +166,47 @@ def _setup_runtime_logging(persona_dir: Path) -> None:
         root.addHandler(handler)
     except Exception as exc:  # noqa: BLE001
         print(f"runtime logging setup failed: {exc}", file=sys.stderr)
+
+
+class _AppendThenCloseHandler(logging.FileHandler):
+    """Appends a record and closes the file again, so nothing holds the log open between records (on Windows an open
+    handle blocks the running bridge's log rotation)."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            super().emit(record)
+        finally:
+            if self.stream is not None:
+                self.stream.close()
+                self.stream = None
+
+
+def _attach_transient_runtime_log(persona_dir: Path) -> logging.Handler | None:
+    """For a service run that is waiting or queued (D26): a root handler on the runtime log that opens, appends and
+    closes per record, so the back-off's lines reach the log while nothing keeps it open. The caller removes it before
+    ``_setup_runtime_logging`` attaches the persistent one (once the bridge lock is held). Best-effort."""
+    try:
+        from brain.paths import get_log_dir
+
+        log_dir = get_log_dir()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        handler = _AppendThenCloseHandler(log_dir / f"runtime-{persona_dir.name}.log", encoding="utf-8", delay=True)
+        handler.setFormatter(logging.Formatter(_RUNTIME_LOG_FORMAT, datefmt=_RUNTIME_LOG_DATEFMT))
+        handler.setLevel(logging.INFO)
+        root = logging.getLogger()
+        if root.level == logging.NOTSET or root.level > logging.INFO:
+            root.setLevel(logging.INFO)
+        root.addHandler(handler)
+        return handler
+    except Exception as exc:  # noqa: BLE001
+        print(f"runtime logging setup failed: {exc}", file=sys.stderr)
+        return None
+
+
+def _detach_runtime_log(handler: logging.Handler | None) -> None:
+    if handler is not None:
+        logging.getLogger().removeHandler(handler)
+        handler.close()
 
 
 def run_bridge_foreground(

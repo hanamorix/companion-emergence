@@ -24,6 +24,7 @@ SERVICE_ORIGINS = ("systemd", "launchd", "task-scheduler")
 
 
 real_setup_runtime_logging = _runner._setup_runtime_logging  # captured before any fixture patches it
+real_attach_transient_log = _runner._attach_transient_runtime_log
 
 
 class Clock:
@@ -44,6 +45,7 @@ def clock(monkeypatch) -> Clock:
     c = Clock()
     monkeypatch.setattr(start_backoff, "_now", c.now)
     monkeypatch.setattr(start_backoff, "_monotonic", c.now)
+    monkeypatch.setattr(start_backoff, "_same_boot", lambda boot, at: True)  # the boot tests use the real rule
     monkeypatch.setattr(start_backoff, "_sleep", c.sleep)
     return c
 
@@ -57,6 +59,7 @@ def pd(tmp_path, monkeypatch) -> Path:
     monkeypatch.setattr("brain.service.systemd.refresh_installed_unit", lambda persona: False)
     monkeypatch.setattr("brain.service.launchd.truncate_launchd_logs_if_large", lambda persona: None)
     monkeypatch.setattr("brain.bridge.runner._setup_runtime_logging", lambda p: None)  # the real one: logging tests
+    monkeypatch.setattr("brain.bridge.runner._attach_transient_runtime_log", lambda p: None)
     return p
 
 
@@ -535,18 +538,50 @@ def root_handlers():
     root.setLevel(level)
 
 
-def test_the_wait_line_reaches_the_runtime_log(pd, clock, monkeypatch, tmp_path, root_handlers):
-    """The runtime log is set up before the wait, so its INFO line (and the unit refresh's) is not lost."""
+def _open_log_handles(path: Path) -> list[str]:
+    import psutil
+
+    return [f.path for f in psutil.Process().open_files() if Path(f.path).resolve() == path.resolve()]
+
+
+def test_the_wait_line_reaches_the_runtime_log_without_holding_it_open(pd, clock, monkeypatch, tmp_path, root_handlers):
+    """Review of D26 (ruling 3): a service run queued or waiting must not hold the runtime log open (on Windows that
+    blocks the running bridge's rotation). The wait's INFO line still reaches the log, through a handler that opens,
+    appends and closes per record; the persistent handler is attached only once the lock is held."""
     log_dir = tmp_path / "logs"
+    log = log_dir / "runtime-nell.log"
     monkeypatch.setattr("brain.paths.get_log_dir", lambda: log_dir)
-    monkeypatch.setattr("brain.bridge.runner._setup_runtime_logging", real_setup_runtime_logging)  # the real one
+    monkeypatch.setattr("brain.bridge.runner._setup_runtime_logging", real_setup_runtime_logging)
+    monkeypatch.setattr("brain.bridge.runner._attach_transient_runtime_log", real_attach_transient_log)
     _record(pd, 1, clock)
+    open_during_wait: list[list[str]] = []
+    real_sleep = clock.sleep
+
+    def sleep(s):
+        if log.exists():
+            open_during_wait.append(_open_log_handles(log))
+        real_sleep(s)
+
+    monkeypatch.setattr(start_backoff, "_sleep", sleep)
+    seen_at_lock: list[bool] = []
+    real_acquire = daemon.acquire_lock
+
+    def acquire(*a, **k):
+        from logging.handlers import RotatingFileHandler
+
+        seen_at_lock.append(any(isinstance(h, RotatingFileHandler) for h in root_handlers.handlers))
+        return real_acquire(*a, **k)
+
+    monkeypatch.setattr(daemon, "acquire_lock", acquire)
     _fake_run(monkeypatch)
     assert daemon.cmd_run(_args("systemd")) == 0
-    for h in root_handlers.handlers:
-        h.flush()
-    text = (log_dir / "runtime-nell.log").read_text(encoding="utf-8")
-    assert "start back-off: waiting" in text
+    assert open_during_wait and all(h == [] for h in open_during_wait), open_during_wait
+    assert seen_at_lock == [False]  # no persistent handler before the lock
+    assert "start back-off: waiting" in log.read_text(encoding="utf-8")
+    from logging.handlers import RotatingFileHandler
+
+    assert sum(isinstance(h, RotatingFileHandler) for h in root_handlers.handlers) == 1  # persistent, after the lock
+    assert not any(type(h).__name__ == "_AppendThenCloseHandler" for h in root_handlers.handlers)  # transient gone
 
 
 def test_setting_up_the_runtime_log_twice_adds_one_handler(pd, monkeypatch, tmp_path, root_handlers):

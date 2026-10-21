@@ -28,9 +28,12 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from brain import process_identity
+from brain.bridge import cli_throttle, respawn_guard, shutdown_progress
 from brain.bridge.shutdown import POLL_S
 from brain.health.json_io import read_json, write_json
 
@@ -57,6 +60,15 @@ def _now() -> float:
     return time.time()
 
 
+def _same_boot(boot: object, at: float) -> bool:
+    """Was a record with this ``boot`` id and write time ``at`` (epoch seconds) written during THIS boot? The stop
+    intent's rule (``respawn_guard.this_boot``); unknowable (including an ``at`` out of range) is "no"."""
+    try:
+        return respawn_guard.this_boot({"boot": boot, "at": datetime.fromtimestamp(at, UTC).isoformat()})
+    except (OverflowError, OSError, ValueError):
+        return False
+
+
 def _monotonic() -> float:
     return time.monotonic()
 
@@ -81,7 +93,12 @@ def read(persona_dir: Path) -> Record:
     count, at = raw.get("unproven_starts"), raw.get("at")
     if not _valid_count(count) or isinstance(at, bool) or not isinstance(at, (int, float)) or not math.isfinite(at):
         return Record()
-    return Record(count, float(at), raw.get("after_healthy") is True)
+    healthy = raw.get("after_healthy") is True
+    if healthy and not _same_boot(raw.get("boot"), float(at)):
+        # A healthy run of an EARLIER boot that the OS ended with no chance to record a stop (a logoff, a shutdown past
+        # the manager's exit timeout) is no crash: no wait, and the next start begins a fresh series.
+        return Record()
+    return Record(count, float(at), healthy)
 
 
 def step_s(unproven_starts: int) -> int:
@@ -117,7 +134,9 @@ def mark_healthy(persona_dir: Path) -> None:
     does after any crash. The healthy run counts as the series' first start (count 1)."""
     try:
         write_json(
-            _path(persona_dir), {"unproven_starts": 1, "at": _now(), "after_healthy": True}, mode=0o600
+            _path(persona_dir),
+            {"unproven_starts": 1, "at": _now(), "after_healthy": True, "boot": process_identity.boot_id()},
+            mode=0o600,
         )
     except Exception:  # noqa: BLE001
         logger.warning("start back-off: could not mark the run healthy", exc_info=True)
@@ -192,6 +211,11 @@ class SuccessWatch:
             self._started_at = self._clock()
             return
         if self._clock() - self._started_at >= HEALTHY_RESET_S:
+            if shutdown_progress.abandoning.is_set() or cli_throttle.shutdown_requested():
+                # A stop is under way: the run ends on a recorded stop (which deletes the record) and a write now could
+                # land after a hard exit's delete (the Monitor's hard exit sets ``abandoning`` first).
+                self._done = True
+                return
             mark_healthy(self.persona_dir)
             self._done = True
 

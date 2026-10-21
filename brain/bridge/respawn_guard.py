@@ -30,7 +30,10 @@ def _platform() -> str:
     return sys.platform
 
 
-def _this_boot(intent: dict) -> bool:
+def this_boot(intent: dict) -> bool:
+    """Was the record ``intent`` (``boot``: the Linux boot id; ``at``: an ISO time) written during THIS boot? One rule for
+    the stop intent (D25) and the start back-off's healthy record (D26): Linux compares boot ids; elsewhere ``at`` must
+    not be earlier than ``psutil.boot_time()``; anything unknowable is "not this boot" (never act on a guess)."""
     platform = _platform()
     if platform.startswith("linux"):
         from brain import process_identity
@@ -70,6 +73,6 @@ def guard_fires(persona_dir: Path) -> bool:
         return False
     if intent.get("state") != "committed" or intent.get("reason") != "user_kill":
         return False
-    if not _this_boot(intent):
+    if not this_boot(intent):
         return False
     return _killed_bridge_gone(intent, Path(persona_dir))
