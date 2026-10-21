@@ -6,7 +6,7 @@ brain/bridge/persona_state.py::read::1   # held: felt-time audit first (Roy 2026
 brain/bridge/provider.py::not-file-io::15   # not-file: subprocess
 brain/bridge/provider.py::read::1   # held: #406/#417 (Hana's open PRs)
 brain/bridge/provider.py::write::4   # held: #406/#417 (Hana's open PRs)
-brain/bridge/server.py::not-file-io::2   # not-file: sqlite-or-wire
+brain/bridge/server.py::not-file-io::3   # not-file: sqlite-or-wire
 brain/chat/tool_loop.py::not-file-io::3   # not-file: prompt-or-log
 brain/cli.py::not-file-io::11   # not-file: prompt-or-log
 brain/engines/consolidation.py::not-file-io::4   # not-file: model-reply

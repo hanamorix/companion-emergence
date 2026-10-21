@@ -638,9 +638,9 @@ def snapshot_stale_sessions(
     ``should_pause`` (INC-10, S14/S32/S41/S65): checked only after a session
     was actually snapshotted (a skipped/fresh/ghost session isn't the S32
     table's "one session" item). Progress is each session's own extraction
-    cursor (already persisted by ``extract_session_snapshot``), so resuming
-    just re-lists active sessions — a session already snapshotted this pass
-    is a no-op (nothing new past its cursor yet).
+    cursor (persisted per chunk by ``extract_session_snapshot``), so resuming
+    just re-lists active sessions: a session already snapshotted takes its
+    next chunk, if any, and nothing is extracted twice.
     """
     reports: list[IngestReport] = []
     for sid in list_active_sessions(persona_dir):
@@ -802,8 +802,8 @@ def finalize_stale_sessions(
         # INC-10 (S14/S32/S41/S65): item unit = one finalized session; checked
         # only after a session was actually finalized (a skipped/too-fresh
         # session isn't an "item"). Resuming re-lists active sessions and
-        # re-applies the same age gate, which is a no-op for a session this
-        # pass already finalized (its buffer's cursor already advanced).
+        # re-applies the same age gate; a session already finalized takes its
+        # next chunk, if any (its cursor advanced per chunk, so nothing repeats).
         if should_pause is not None and should_pause():
             logger.info("finalize_stale_sessions: pausing between sessions for chat (INC-10)")
             if paused_out is not None:

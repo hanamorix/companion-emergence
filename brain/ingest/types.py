@@ -90,7 +90,8 @@ class IngestReport:
 
     Attributes:
         session_id:      The session's identifier.
-        extracted:       Total candidate items returned by the LLM.
+        extracted:       Candidate items the LLM returned across the pass's chunks (items
+                         with empty text dropped).
         committed:       Items durably written to memories.db (bypasses the pending-candidate
                          gate — memory_type/label in brain.memory.pending.GATE_BYPASS_TYPES).
                          #167: for conversation-ingest specifically this is currently always 0
@@ -104,20 +105,25 @@ class IngestReport:
                          used to (incorrectly) count for every conversation-ingest item; #167.
         deduped:         Items skipped because they matched an existing memory.
         soul_candidates: Items queued to soul_candidates.jsonl (importance >= threshold).
-        errors:          Items that failed the commit step.
+        soul_queue_errors: Items whose soul-candidate append failed.
+        errors:          Failed attempts: one per chunk whose extraction failed, one per item that
+                         failed the commit step, or 1 for a pass skipped in the backoff window.
+        commit_failures: Items that failed the commit step (also counted in ``errors``).
         memory_ids:      IDs of newly created memories (both durably committed and
                          enqueued-candidate ids).
-        deferred:        The extraction call was refused as "not now" (#473): nothing was
-                         extracted or failed, and the cursor, buffer and backoff sidecar
-                         are as they were.
+        deferred:        A chunk's extraction call was refused as "not now" (#473): it and the
+                         chunks after it were not tried and nothing failed; the cursor stays
+                         after the last committed chunk, the buffer stays, and no backoff is
+                         recorded.
         busy:            Another extraction of the same session was running, so this pass
                          did nothing (#477): the running pass advances the cursor.
         backoff_skipped: The session's recorded failures reached the threshold less than the
                          backoff window ago, so this pass returned without calling the
                          provider (``errors`` is 1). It is not a failed attempt.
-        chunks:          Extraction calls this pass made: one per chunk of the span after the
-                         cursor (#523; a span longer than ``ingest.extraction_chunk_chars`` is
-                         extracted in several chunks, oldest first).
+        chunks:          Chunks of the span after the cursor this pass sent to the extractor
+                         (#523; a span longer than ``ingest.extraction_chunk_chars`` is extracted
+                         in several chunks, oldest first). One model call each, plus the
+                         extractor's own retry when a reply does not parse or the call fails.
         reached_end:     The pass committed every chunk up to the end of the span it read, so
                          the cursor reached the buffer's end as the pass saw it. False by default:
                          a report from any path that did not say so is not completed.
