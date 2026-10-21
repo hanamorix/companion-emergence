@@ -116,6 +116,12 @@ def abandon_gate() -> None:
             time.sleep(1)
 
 
+def registry_in_use() -> bool:
+    """True when this process already ran a bridge app: the registry is sealed or holds tasks, or a hard exit began.
+    A bridge process runs one app, so on a real start this is False."""
+    return registry.sealed or registry.count() > 0 or abandoning.is_set()
+
+
 def reset_for_tests() -> TaskRegistry:
     """A new bridge app in this process (tests): a fresh registry, not abandoning."""
     global registry

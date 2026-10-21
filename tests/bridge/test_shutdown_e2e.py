@@ -1,9 +1,10 @@
-"""Real-process stop tests: a real `python -m brain.bridge.runner` on a synthetic persona (#456: C10-C13, C15, C42,
-C55).
+"""Real-process stop tests: a real bridge runner (`brain.bridge.runner.main`) on a synthetic persona (#456: C10-C13,
+C15, C42, C55).
 
-The runner starts with KINDLED_TEST_HOOKS=1: its supervisor is a stub, and N counted stub tasks each run until the test
-creates their release file, so "work still running during the stop" is deterministic. KINDLED_HOME is sandboxed under
-the test's tmp dir; the persona's provider is the fake one, so nothing can reach a real model.
+The runner starts through the test-only launcher `tests/bridge/_hooked_bridge.py`: its supervisor is a stub, and N
+counted stub tasks each run until the test creates their release file, so "work still running during the stop" is
+deterministic. KINDLED_HOME is sandboxed under the test's tmp dir; the persona's provider is the fake one, so nothing
+can reach a real model.
 """
 
 from __future__ import annotations
@@ -49,7 +50,6 @@ class Bridge:
         env.update({
             "KINDLED_HOME": str(self.home),
             "PYTHONPATH": str(REPO),
-            "KINDLED_TEST_HOOKS": "1",
             "KINDLED_TEST_STUB_TASKS": str(tasks),
             "KINDLED_TEST_STUB_DIR": str(self.stub_dir),
             "KINDLED_TEST_SUPERVISOR_HOLD": str(self.hold) if hold_supervisor else "",
@@ -58,7 +58,8 @@ class Bridge:
             "FAKE_CLAUDE_DIR": str(self.fake_dir),
             "FAKE_CLAUDE_RELEASE": str(self.fake_release),
         })
-        argv = [sys.executable, "-m", "brain.bridge.runner", "--persona-dir", str(self.pd), "--client-origin", "tests"]
+        argv = [sys.executable, "-m", "tests.bridge._hooked_bridge", "--persona-dir", str(self.pd),
+                "--client-origin", "tests"]
         if idle_s is not None:
             argv += ["--idle-shutdown-seconds", str(idle_s)]
 
@@ -279,11 +280,11 @@ def test_a_waiting_cmd_run_keeps_its_fresh_record(tmp_path, bridges):
     lock keeps the record it writes when it takes over."""
     b = Bridge(tmp_path, tasks=1)
     bridges.append(b)
-    env = dict(os.environ, KINDLED_HOME=str(b.home), PYTHONPATH=str(REPO), KINDLED_TEST_HOOKS="1",
-               KINDLED_TEST_STUB_TASKS="0")
+    env = dict(os.environ, KINDLED_HOME=str(b.home), PYTHONPATH=str(REPO), KINDLED_TEST_STUB_TASKS="0")
     waiter = subprocess.Popen(
         [sys.executable, "-c",
-         "import sys; from types import SimpleNamespace; from brain.bridge import daemon; "
+         "import sys; from types import SimpleNamespace; import tests.bridge._hooked_bridge as h; h.install(); "
+         "from brain.bridge import daemon; "
          "sys.exit(daemon.cmd_run(SimpleNamespace(persona='nell', idle_shutdown=0, client_origin='tests')))"],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )

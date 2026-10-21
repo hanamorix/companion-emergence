@@ -1107,35 +1107,12 @@ class BridgeAppState:
 _background_threads_inhibited: bool = False
 
 
-def _test_hooks() -> dict[str, Any] | None:
-    """#456 test hooks for the real-process stop tests (``tests/bridge/test_shutdown_e2e.py``), read only when
-    ``KINDLED_TEST_HOOKS=1``: the supervisor is a stub that, after the stop, waits for ``KINDLED_TEST_SUPERVISOR_HOLD``
-    (a file path) to exist; ``KINDLED_TEST_STUB_TASKS`` counted stub tasks each end when ``<KINDLED_TEST_STUB_DIR>/
-    release-<i>`` exists; ``KINDLED_TEST_CALLS`` ("module:function,...") runs each function with the persona dir as a
-    counted task (a call in flight during the stop); no other background thread starts. Never set in production."""
-    if os.environ.get("KINDLED_TEST_HOOKS") != "1":
-        return None
-    return {
-        "supervisor_hold": os.environ.get("KINDLED_TEST_SUPERVISOR_HOLD") or None,
-        "tasks": int(os.environ.get("KINDLED_TEST_STUB_TASKS") or 0),
-        "stub_dir": os.environ.get("KINDLED_TEST_STUB_DIR") or None,
-        "calls": [c for c in (os.environ.get("KINDLED_TEST_CALLS") or "").split(",") if c],
-    }
-
-
-def _run_test_call(spec: str, persona_dir: Path) -> None:
-    import importlib
-
-    module, _, name = spec.partition(":")
-    try:
-        getattr(importlib.import_module(module), name)(persona_dir)
-    except Exception:  # noqa: BLE001 - a test hook never takes the bridge down
-        logger.exception("test hook call %s raised", spec)
-
-
-def _wait_for_file(path: str | None) -> None:
-    while path and not Path(path).exists():
-        time.sleep(0.05)
+# #456 test seam for the real-process stop tests (spec section 8: test-only hooks). Set ONLY in-process, by the test
+# launcher ``tests/bridge/_hooked_bridge.py`` before the runner starts; never from an environment variable, so nothing
+# outside a test can start a bridge with a stub supervisor (pre-merge review O-5). None in production. When set:
+# ``supervisor(stop_event)`` runs in place of the supervisor loop, ``start_tasks(persona_dir)`` starts the test's
+# counted tasks, and no other background thread starts.
+_lifespan_test_hooks: dict[str, Any] | None = None
 
 
 def build_app(
@@ -1172,7 +1149,7 @@ def build_app(
             if background_threads is not None
             else not _background_threads_inhibited
         )
-        hooks = _test_hooks()
+        hooks = _lifespan_test_hooks
         if hooks is not None:
             logger.warning("bridge lifespan: TEST HOOKS ON (stub supervisor and stub tasks)")
         if not bg:
@@ -1207,7 +1184,10 @@ def build_app(
         )
         if not controller.stopping:
             cli_throttle.clear_shutdown()
-        shutdown_progress.reset_for_tests()
+        if shutdown_progress.registry_in_use():
+            # Only a process that already ran a bridge app (tests build many); a bridge process runs one app, whose
+            # registry is still fresh here.
+            shutdown_progress.reset_for_tests()
         if controller.persona_dir is None:
             controller.configure(persona_dir)
 
@@ -1433,8 +1413,7 @@ def build_app(
             def _run_supervisor() -> None:
                 try:
                     if hooks is not None:
-                        stop_event.wait()
-                        _wait_for_file(hooks["supervisor_hold"])
+                        hooks["supervisor"](stop_event)
                         return
                     # #456 (D9): a loop death restarts the loop; a startup death re-runs the startup once.
                     _supervisor_mod.run_supervised(
@@ -1461,15 +1440,7 @@ def build_app(
                 raise
             app.state.bridge.supervisor_thread = sup_thread
             if hooks is not None:
-                for i in range(hooks["tasks"]):
-                    release = str(Path(hooks["stub_dir"]) / f"release-{i}") if hooks["stub_dir"] else None
-                    shutdown_progress.start_tracked_thread(
-                        f"stub task {i}", lambda r=release: _wait_for_file(r), name=f"stub-task-{i}"
-                    )
-                for spec in hooks["calls"]:
-                    shutdown_progress.start_tracked_thread(
-                        spec.rpartition(":")[2], lambda sp=spec: _run_test_call(sp, persona_dir), name=f"call-{spec}"
-                    )
+                hooks["start_tasks"](persona_dir)
 
         # Idle-shutdown watcher (only if requested)
         idle_task = None

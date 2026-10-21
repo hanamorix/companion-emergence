@@ -87,7 +87,8 @@ class FakeLaunchd:
                                     env=self.env, start_new_session=True)
 
     def _start_real(self) -> None:
-        code = ("import sys; from types import SimpleNamespace; from brain.bridge import daemon; "
+        code = ("import sys; from types import SimpleNamespace; import tests.bridge._hooked_bridge as h; h.install(); "
+                "from brain.bridge import daemon; "
                 "sys.exit(daemon.cmd_run(SimpleNamespace(persona='nell', idle_shutdown=0, client_origin='launchd')))")
         self.job = subprocess.Popen([sys.executable, "-c", code], env=self.env, start_new_session=True,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -176,8 +177,7 @@ def env_pd(tmp_path, monkeypatch):
     (pd / "active_conversations").mkdir(parents=True)
     (pd / "persona_config.json").write_text('{"provider": "fake", "searcher": "noop"}', encoding="utf-8")
     monkeypatch.setenv("KINDLED_HOME", str(home))
-    env = dict(os.environ, KINDLED_HOME=str(home), PYTHONPATH=str(REPO), KINDLED_TEST_HOOKS="1",
-               KINDLED_TEST_STUB_TASKS="0")
+    env = dict(os.environ, KINDLED_HOME=str(home), PYTHONPATH=str(REPO), KINDLED_TEST_STUB_TASKS="0")
     return env, pd
 
 
