@@ -51,3 +51,11 @@ def test_read_file_cap_override(tunables_home):
     from brain.tools.impls import read_file
 
     assert read_file._file_read_max_bytes() == 1024
+
+
+def test_extraction_chunk_chars_override(tunables_home):
+    """#523 C12: the extraction chunk size is read from tunables.json (``ingest.extraction_chunk_chars``)."""
+    _write(tunables_home, {"ingest.extraction_chunk_chars": 1500})
+    from brain.ingest import ingest_utils
+
+    assert ingest_utils.extraction_chunk_chars() == 1500

@@ -60,6 +60,35 @@ class ExtractionOutcome:
     deferred: bool = False
 
 
+def format_turn_line(turn: dict, user_label: str, assistant_label: str) -> str | None:
+    """Format one buffer row as its ``"speaker: text"`` transcript line, or None for a compaction ``summary`` row.
+
+    A ``summary`` row is a faded recap of the conversation, NOT a turn to extract: returning None here (the single
+    chokepoint feeding the extractor) means no extraction path ever re-ingests a summary as memory.
+
+    ``user_label`` / ``assistant_label`` replace the generic ``user`` / ``assistant`` speakers (Bug A in the 2026-05-05
+    audit-3: naming both speakers stops the extractor attributing the user's statements to people the assistant's replies
+    mention). Any other speaker keeps its own name. Attached images become inline ``[image: <first 8 hex>]`` markers so the
+    extractor records that an image was shared (commit.py matches the marker back to the row's ``image_shas``); bytes are
+    never inlined. A row body may span several physical lines.
+    """
+    speaker = turn.get("speaker", "?")
+    if speaker == "summary":
+        return None
+    if speaker == "user":
+        label = user_label
+    elif speaker == "assistant":
+        label = assistant_label
+    else:
+        label = speaker
+    body = turn.get("text", "")
+    shas = turn.get("image_shas") or []
+    if shas:
+        markers = " ".join(f"[image: {s[:8]}]" for s in shas)
+        body = f"{markers} {body}".strip() if body else markers
+    return f"{label}: {body}"
+
+
 def format_transcript(
     turns: list[dict],
     max_tokens: int = 6000,
@@ -82,31 +111,7 @@ def format_transcript(
     """
     user_label = user_name if user_name else "user"
     assistant_label = assistant_name if assistant_name else "assistant"
-    lines = []
-    for t in turns:
-        speaker = t.get("speaker", "?")
-        # A compaction `summary` row is a faded recap of the conversation, NOT a
-        # turn to extract — skip it here (the single chokepoint feeding the
-        # extractor) so NO extraction path (extract_session_snapshot OR
-        # close_session) ever re-ingests the summary as memory.
-        if speaker == "summary":
-            continue
-        if speaker == "user":
-            label = user_label
-        elif speaker == "assistant":
-            label = assistant_label
-        else:
-            label = speaker
-        body = t.get("text", "")
-        # Surface attached images as inline markers so the extractor
-        # records that an image was shared in this turn — the marker
-        # carries the first 8 hex of the sha so commit.py can match
-        # back to the buffer's image_shas list. Bytes never inline.
-        shas = t.get("image_shas") or []
-        if shas:
-            markers = " ".join(f"[image: {s[:8]}]" for s in shas)
-            body = f"{markers} {body}".strip() if body else markers
-        lines.append(f"{label}: {body}")
+    lines = [line for t in turns if (line := format_turn_line(t, user_label, assistant_label)) is not None]
     text = "\n".join(lines)
     cap = max_tokens * 4
     if len(text) > cap:
