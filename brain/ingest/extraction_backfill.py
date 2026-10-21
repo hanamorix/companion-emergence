@@ -27,9 +27,10 @@ by an old chunk. One runner at a time (a non-blocking ``file_lock`` on ``extract
 It runs through the central cadence function (owner answer 3): ``backfill_gated_job`` is the ``extraction_backfill`` job of
 the bridge's job table, and the CLI's foreground mode (no bridge running) calls ``run_central_pass`` with the same job in its
 own process. One chunk (one model call) per pass. It never touches a session's cursor, buffer, backoff or extraction lock.
-Reading for a plan or a dry run creates no directory, no file and no lock. A plan's cutoff is the earlier of its creation
-and the time chunked extraction began for the persona (the marker the pipeline writes on its first chunked pass), so text the
-chunked pipeline extracted in full is never planned (main ruling M4).
+Reading for a plan or a dry run creates no directory, no file and no lock. Each session is planned up to its own cutoff: the
+earlier of the plan's creation and the first row the chunked code extracted in THAT session (the per-session marker the pipeline
+writes on a session's first chunked pass), so text the chunked pipeline extracted in full is never planned while every head the
+old code cut, in any session, still is (main ruling M4 and follow-ups).
 """
 
 from __future__ import annotations
@@ -226,9 +227,10 @@ def _cut_rows(span: list[dict], user_label: str, assistant_label: str) -> list[d
     return cut
 
 
-def _target(sid: str, rows: list[dict]) -> dict:
+def _target(sid: str, rows: list[dict], cutoff_ts: str | None = None) -> dict:
     return {
         "sid": sid,
+        "cutoff_ts": cutoff_ts,
         "from_ts": rows[0]["ts"],
         "to_ts": rows[-1]["ts"],
         "rows": len(rows),
@@ -247,38 +249,49 @@ def _plan_labels(persona_dir: Path) -> tuple[str, str]:
     return max(("user", user_name or ""), key=len), max(("assistant", assistant_name), key=len)
 
 
-def plan_heads(persona_dir: Path, cutoff_ts: str) -> list[dict]:
-    """Mode ``heads``: one target per inferred historical span whose head the old cap cut (see the module docstring)."""
-    cutoff = lenient_utc(cutoff_ts)
+def _session_cutoff(cutoff_ts: str, session_cutoffs: dict[str, str] | None, sid: str) -> str:
+    return (session_cutoffs or {}).get(sid, cutoff_ts)
+
+
+def plan_heads(persona_dir: Path, cutoff_ts: str, session_cutoffs: dict[str, str] | None = None) -> list[dict]:
+    """Mode ``heads``: one target per inferred historical span whose head the old cap cut (see the module docstring). A
+    session's rows are planned up to its own cutoff (``session_cutoffs``, else ``cutoff_ts``)."""
     user_label, assistant_label = _plan_labels(persona_dir)
     targets = []
     for sid in _session_ids(persona_dir):
-        for span in _historical_spans(_rows_of(persona_dir, sid, cutoff)):
+        cutoff = _session_cutoff(cutoff_ts, session_cutoffs, sid)
+        for span in _historical_spans(_rows_of(persona_dir, sid, lenient_utc(cutoff))):
             cut = _cut_rows(span, user_label, assistant_label)
             if cut:
-                targets.append(_target(sid, cut))
+                targets.append(_target(sid, cut, cutoff))
     targets.sort(key=lambda t: lenient_utc(t["from_ts"]))
     return targets
 
 
-def plan_all(persona_dir: Path, cutoff_ts: str) -> list[dict]:
-    """Mode ``all``: one target per session holding every extractable row (archived, and active at or behind its cursor)."""
-    cutoff = lenient_utc(cutoff_ts)
-    targets = [_target(sid, rows) for sid in _session_ids(persona_dir) if (rows := _rows_of(persona_dir, sid, cutoff))]
+def plan_all(persona_dir: Path, cutoff_ts: str, session_cutoffs: dict[str, str] | None = None) -> list[dict]:
+    """Mode ``all``: one target per session holding every extractable row (archived, and active at or behind its cursor), up to
+    the session's own cutoff (``session_cutoffs``, else ``cutoff_ts``)."""
+    targets = []
+    for sid in _session_ids(persona_dir):
+        cutoff = _session_cutoff(cutoff_ts, session_cutoffs, sid)
+        rows = _rows_of(persona_dir, sid, lenient_utc(cutoff))
+        if rows:
+            targets.append(_target(sid, rows, cutoff))
     targets.sort(key=lambda t: lenient_utc(t["from_ts"]))
     return targets
 
 
-def _plan(persona_dir: Path, mode: str, cutoff_ts: str) -> list[dict]:
+def _plan(persona_dir: Path, mode: str, cutoff_ts: str, session_cutoffs: dict[str, str] | None = None) -> list[dict]:
     if mode not in MODES:
         raise ValueError(f"unknown backfill mode {mode!r}")
-    return plan_heads(persona_dir, cutoff_ts) if mode == "heads" else plan_all(persona_dir, cutoff_ts)
+    planner = plan_heads if mode == "heads" else plan_all
+    return planner(persona_dir, cutoff_ts, session_cutoffs)
 
 
 def _target_rows(persona_dir: Path, target: dict, cutoff_ts: str) -> list[dict]:
     """The rows of ``target`` not yet extracted, looked up under its sid and then along the ``rolled_to`` chain (a rollover
     carries the last rows into the successor with the same ts); a row found twice counts once."""
-    cutoff = lenient_utc(cutoff_ts)
+    cutoff = lenient_utc(target.get("cutoff_ts") or cutoff_ts)  # the session's own cutoff when the plan recorded one
     lo, hi = lenient_utc(target["from_ts"]), lenient_utc(target["to_ts"])
     done = lenient_utc(target.get("done_through_ts"))
     rows: list[dict] = []
@@ -331,18 +344,17 @@ def update_state(
         return new
 
 
-def _cutoff(persona_dir: Path, now: datetime) -> str:
-    """A plan's cutoff (main ruling M4): the earlier of ``now`` (its creation) and the time chunked extraction began for
-    this persona (``ingest_utils.chunked_extraction_since``). Text after that time was extracted in full by the chunked
-    pipeline: neither mode plans it (a heads plan would re-extract it with soul candidates on)."""
-    since = chunked_extraction_since(persona_dir)
-    return (since if since is not None and since < now else now).isoformat()
+def _session_cutoffs(persona_dir: Path, now: datetime) -> dict[str, str]:
+    """Each session's cutoff (main ruling M4 and follow-ups): the earlier of ``now`` (the plan's creation) and the ts of the first
+    row the chunked code extracted in that session (``ingest_utils.chunked_extraction_since``). That session's rows from there on
+    were extracted in full: neither mode plans them. A session the chunked code has not touched is planned up to ``now``."""
+    return {sid: (since if since < now else now).isoformat() for sid, since in chunked_extraction_since(persona_dir).items()}
 
 
 def _new_state(persona_dir: Path, mode: str) -> dict:
     now = datetime.now(UTC)
-    cutoff = _cutoff(persona_dir, now)
-    targets = _plan(persona_dir, mode, cutoff)
+    cutoff = now.isoformat()
+    targets = _plan(persona_dir, mode, cutoff, _session_cutoffs(persona_dir, now))
     return {
         "schema_version": _SCHEMA_VERSION,
         "plan_id": uuid.uuid4().hex,
@@ -798,13 +810,18 @@ def status_text(persona_dir: Path) -> str:
 def dry_run_text(persona_dir: Path) -> str:
     """Both modes' plans, built in memory: per session the targets, characters, chunks (= model calls) and date range.
     No model call, no file or directory created, no lock taken."""
-    cutoff = _cutoff(persona_dir, datetime.now(UTC))
+    now = datetime.now(UTC)
+    cutoff = now.isoformat()
+    session_cutoffs = _session_cutoffs(persona_dir, now)
     user_name, assistant_name = _labels(persona_dir)
     max_chars = extraction_chunk_chars()
-    lines = [f"dry run (cutoff {cutoff}, chunk size {max_chars} chars); nothing is written and no model is called"]
+    lines = [
+        f"dry run (cutoff {cutoff}; {len(session_cutoffs)} session(s) stop earlier, where chunked extraction began in them; "
+        f"chunk size {max_chars} chars); nothing is written and no model is called"
+    ]
     for mode in MODES:
         per_sid: dict[str, list[int | str]] = {}
-        for target in _plan(persona_dir, mode, cutoff):
+        for target in _plan(persona_dir, mode, cutoff, session_cutoffs):
             rows = _target_rows(persona_dir, target, cutoff)
             text = "\n".join(format_turn_line(r, user_name or "user", assistant_name) for r in rows)
             calls = len(chunk_turns(rows, max_chars=max_chars, user_name=user_name, assistant_name=assistant_name))

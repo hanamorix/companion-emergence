@@ -1042,7 +1042,9 @@ def _b17_world(persona, monkeypatch, marker: datetime) -> tuple[list[dict], list
     assert len("\n".join(_line(r) for r in after)) > 2_500  # over the (patched) historical cap: a "lost head" by the model
     _archive(persona, "sess_b17a", before)
     _archive(persona, "sess_b17b", after)
-    (persona / "extraction_chunked_since.json").write_text(json.dumps({"since": marker.isoformat()}), encoding="utf-8")
+    (persona / "extraction_chunked_since.json").write_text(
+        json.dumps({"sessions": {"sess_b17a": marker.isoformat(), "sess_b17b": marker.isoformat()}}), encoding="utf-8"
+    )
     return before, after
 
 
@@ -1055,7 +1057,7 @@ def test_b17_text_after_the_chunked_extraction_marker_is_not_planned(kestrel, mo
     sids = {t["sid"] for t in state["targets"]}
     assert "sess_b17b" not in sids
     assert "sess_b17a" in sids
-    assert lenient_utc(state["cutoff_ts"]) == marker
+    assert all(lenient_utc(t["cutoff_ts"]) == marker for t in state["targets"])
     assert all(lenient_utc(t["to_ts"]) <= marker for t in state["targets"])
     assert "sess_b17b" not in eb.dry_run_text(persona)
 
@@ -1066,5 +1068,24 @@ def test_b17_without_a_marker_the_cutoff_is_the_plan_time(kestrel, monkeypatch) 
     _b17_world(persona, monkeypatch, marker)
     (persona / "extraction_chunked_since.json").unlink()
     state = _arm(persona, "heads")
-    assert lenient_utc(state["cutoff_ts"]) > datetime.now(UTC) - timedelta(minutes=1)
     assert "sess_b17b" in {t["sid"] for t in state["targets"]}
+    assert all(lenient_utc(t["cutoff_ts"]) > datetime.now(UTC) - timedelta(minutes=1) for t in state["targets"])
+
+
+def test_b17_another_sessions_old_code_cut_after_the_first_marker_is_still_planned(kestrel, monkeypatch) -> None:
+    """Per-session marker (main's follow-up ruling): session A's first chunked pass extracts rows pending since tA; session B's
+    over-cap span, cut by the OLD code after tA and archived before the upgrade, must still be planned (a per-persona marker at tA
+    put it after the cutoff, a lost head never re-extracted)."""
+    from brain.ingest.pipeline import extract_session_snapshot
+
+    persona, store, hebbian = kestrel
+    monkeypatch.setattr(eb, "_HISTORICAL_CAP_CHARS", 2_500)
+    t_a = datetime.now(UTC) - timedelta(days=6)
+    _active(persona, "sess_b17pa", _rows("sess_b17pa", t_a, 2), cursor_at=None)  # pending at the upgrade since tA
+    b_rows = _rows("sess_b17pb", t_a + timedelta(days=2), 20, gap_s=30, tag="g")  # old-code span after tA, over the cap
+    assert len("\n".join(_line(r) for r in b_rows)) > 2_500
+    _archive(persona, "sess_b17pb", b_rows)
+    extract_session_snapshot(persona, "sess_b17pa", store=store, hebbian=hebbian, provider=_Stub(items=False))  # new code
+    for mode in ("heads", "all"):
+        targets = eb._new_state(persona, mode)["targets"]
+        assert "sess_b17pb" in {t["sid"] for t in targets}, mode

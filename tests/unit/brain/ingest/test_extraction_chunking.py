@@ -868,39 +868,46 @@ def test_c11a_three_central_passes_extract_the_three_chunks(world, monkeypatch) 
     assert supervisor._snapshot_has_work(persona) is False
 
 
+def _marker_entries(persona) -> dict:
+    return json.loads((persona / "extraction_chunked_since.json").read_text(encoding="utf-8"))["sessions"]
+
+
 def test_b17_the_first_chunked_pass_writes_the_marker_once(world) -> None:
-    """Main ruling M4: the pipeline records when chunked extraction began for this persona, once, and never moves it."""
+    """Main ruling M4 and follow-ups: the pipeline records, per session, where chunked extraction began, once, and never moves
+    it; another session gets its own entry."""
     persona, _, _, _ = world
     marker = persona / "extraction_chunked_since.json"
     rows = _seed(persona, "sess_m1", 2)
     assert not marker.exists()
     _snapshot(world, "sess_m1", _Stub())
-    first = marker.read_bytes()
-    assert lenient_utc(json.loads(first)["since"]) == lenient_utc(rows[0]["ts"])
-    _seed(persona, "sess_m2", 2)
+    first = _marker_entries(persona)
+    assert lenient_utc(first["sess_m1"]) == lenient_utc(rows[0]["ts"])
+    _seed(persona, "sess_m1", 1, start=datetime.now(UTC) - timedelta(minutes=30))
+    _snapshot(world, "sess_m1", _Stub())
+    assert _marker_entries(persona)["sess_m1"] == first["sess_m1"]  # never moved
+    other = _seed(persona, "sess_m2", 2, start=datetime.now(UTC) - timedelta(days=1))
     _snapshot(world, "sess_m2", _Stub())
-    assert marker.read_bytes() == first
+    entries = _marker_entries(persona)
+    assert entries["sess_m1"] == first["sess_m1"]
+    assert lenient_utc(entries["sess_m2"]) == lenient_utc(other[0]["ts"])
 
 
 def test_b17_the_marker_is_the_first_row_the_first_chunked_pass_extracts(world) -> None:
-    """Follow-up R-a: rows still pending when the chunked code took over are extracted in full by its first pass, so the
-    marker is the start of that pass's span (its oldest row), not the time of the pass; everything the chunked code extracted
-    lies at or after the backfill's cutoff."""
+    """Follow-up R-a: rows still pending when the chunked code took over are extracted in full by the session's first pass, so
+    its marker is the start of that pass's span (its oldest row), not the time of the pass."""
     persona, _, _, _ = world
     rows = _seed(persona, "sess_m3", 3, start=datetime.now(UTC) - timedelta(days=2))
     _snapshot(world, "sess_m3", _Stub())
-    since = lenient_utc(json.loads((persona / "extraction_chunked_since.json").read_text())["since"])
-    assert since == lenient_utc(rows[0]["ts"])
+    assert lenient_utc(_marker_entries(persona)["sess_m3"]) == lenient_utc(rows[0]["ts"])
 
 
-@pytest.mark.parametrize("damage", ["", "not json", "[1, 2]", '{"since": "yesterday"}'])
+@pytest.mark.parametrize("damage", ["", "not json", "[1, 2]", '{"sessions": 3}', '{"sessions": {"sess_m4": "yesterday"}}'])
 def test_b17_a_damaged_marker_is_rewritten(world, damage) -> None:
-    """Follow-up R-b: a marker that exists but does not parse is written again by the next chunked pass."""
+    """Follow-up R-b: a marker file (or the session's entry) that exists but does not parse is written again."""
     from brain.ingest.ingest_utils import chunked_extraction_since
 
     persona, _, _, _ = world
-    marker = persona / "extraction_chunked_since.json"
-    marker.write_text(damage, encoding="utf-8")
+    (persona / "extraction_chunked_since.json").write_text(damage, encoding="utf-8")
     rows = _seed(persona, "sess_m4", 2)
     _snapshot(world, "sess_m4", _Stub())
-    assert chunked_extraction_since(persona) == lenient_utc(rows[0]["ts"])
+    assert chunked_extraction_since(persona)["sess_m4"] == lenient_utc(rows[0]["ts"])

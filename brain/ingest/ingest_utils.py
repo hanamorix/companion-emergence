@@ -4,7 +4,7 @@
 characters of formatted transcript, cutting only where the extraction cursor can safely stop; it is pure (no file, no
 lock, no model call). The ``load_*`` helpers read what an extraction call needs from the persona
 (the user's name and pronouns from ``persona_config.json``, the registered emotion names). ``mark_chunked_extraction`` /
-``chunked_extraction_since`` keep the per-persona record of when chunked extraction began, which bounds the backfill.
+``chunked_extraction_since`` keep the per-session record of where chunked extraction began, which bounds the backfill.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from pathlib import Path
 from brain import tunables
 from brain.health.json_io import read_json, write_json
 from brain.ingest.extract import format_transcript, format_turn_line
+from brain.utils.file_lock import file_lock
 from brain.utils.log_throttle import warn_throttled
 from brain.utils.time import lenient_utc
 
@@ -209,32 +210,45 @@ def load_emotion_vocab() -> tuple[set[str], str]:
         return set(), ""
 
 
-# Where chunked extraction began for a persona (main ruling M4 of the #523 run, follow-up R-a): the ts of the first row the first
-# chunked pass extracted. Text from there on is extracted in full by the chunked pipeline, so the extraction backfill never plans
-# it. Written once and never moved (only a damaged marker is written again).
+# Where chunked extraction began, PER SESSION (main ruling M4 of the #523 run and its follow-ups): for each session, the ts of the
+# first row the chunked code extracted in that session. Rows from there on in that session are extracted in full by the chunked
+# pipeline, so the extraction backfill never plans them; everything before it, and every session the chunked code has not touched
+# yet, may hold heads the old code cut. Per session, not per persona: another session's old-code cut can lie after one session's
+# first chunked row. An entry is written once and never moved (only a damaged file or entry is written again).
 CHUNKED_SINCE_FILE = "extraction_chunked_since.json"
 
 
-def mark_chunked_extraction(persona_dir: Path, first_row: datetime | None) -> None:
-    """Record, once per persona, where chunked extraction began: ``first_row``, the ts of the first row the first chunked pass
-    extracts (the start of the span after its cursor; now when no row has a parseable ts). Rows pending when the chunked code
-    took over are extracted in full by that pass, so everything the chunked code extracts lies at or after the marker.
-    A no-op once a readable marker exists; a marker that exists but does not parse is written again (it would otherwise read as
-    "no marker" for good). Best-effort: a failed write is logged and the next pass tries again."""
+def _chunked_since_entries(path: Path) -> dict[str, str] | None:
+    """The raw ``{"sessions": {sid: iso}}`` map, or None when the file is missing or damaged."""
+    data = read_json(path, default=lambda: None, expect=dict) if path.is_file() else None
+    sessions = data.get("sessions") if isinstance(data, dict) else None
+    return sessions if isinstance(sessions, dict) else None
+
+
+def mark_chunked_extraction(persona_dir: Path, session_id: str, first_row: datetime | None) -> None:
+    """Record, once per session, where chunked extraction began in it: ``first_row``, the ts of the first row the session's
+    first chunked pass extracts (the start of the span after its cursor; now when no row has a parseable ts). A no-op once the
+    session has a readable entry. A damaged file or entry is written again (it would otherwise read as "no marker" for good).
+    The read-modify-write holds ``file_lock(<marker>)`` (passes of different sessions can run at once) and the write is atomic.
+    Best-effort: a failed write is logged and the next pass tries again."""
     path = persona_dir / CHUNKED_SINCE_FILE
-    exists = path.exists()
-    if exists and chunked_extraction_since(persona_dir) is not None:
+    entries = _chunked_since_entries(path)
+    if entries is not None and lenient_utc(entries.get(session_id)) is not None:
         return
     since = (first_row or datetime.now(UTC)).isoformat()
     try:
-        write_json(path, {"since": since}, if_missing=not exists)
+        with file_lock(path):
+            entries = _chunked_since_entries(path) or {}
+            if lenient_utc(entries.get(session_id)) is not None:
+                return
+            entries[session_id] = since
+            write_json(path, {"sessions": entries})
     except OSError:
-        logger.warning("could not record when chunked extraction began (%s); retrying on the next pass", path, exc_info=True)
+        logger.warning("could not record where chunked extraction began (%s); retrying on the next pass", path, exc_info=True)
 
 
-def chunked_extraction_since(persona_dir: Path) -> datetime | None:
-    """The marker's time, or None when there is no marker (or it is unreadable). Read-only: writes nothing."""
-    path = persona_dir / CHUNKED_SINCE_FILE
-    if not path.is_file():
-        return None
-    return lenient_utc(read_json(path, default=dict, expect=dict).get("since"))
+def chunked_extraction_since(persona_dir: Path) -> dict[str, datetime]:
+    """Each session's marker time (sessions with an unreadable entry, or all of them when the file is missing or damaged, are
+    absent). Read-only: writes nothing, takes no lock."""
+    entries = _chunked_since_entries(persona_dir / CHUNKED_SINCE_FILE) or {}
+    return {sid: ts for sid, raw in entries.items() if isinstance(sid, str) and (ts := lenient_utc(raw)) is not None}

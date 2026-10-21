@@ -287,9 +287,9 @@ def _run_chunks(
     (F-011), and a committed chunk clears the backoff sidecar. ``close_session`` passes False: it keeps its rule of no
     backoff accounting.
     """
-    # Main ruling M4 / follow-up R-a: the backfill never plans text the chunked code extracts; its first pass starts here.
+    # Main ruling M4 and follow-ups: the backfill never plans text the chunked code extracts; in this session it starts here.
     stamps = [ts for t in turns if (ts := lenient_utc(t.get("ts"))) is not None]
-    mark_chunked_extraction(persona_dir, min(stamps) if stamps else None)
+    mark_chunked_extraction(persona_dir, session_id, min(stamps) if stamps else None)
     user_name = load_user_name(persona_dir)
     assistant_name = persona_dir.name
     valid_emotions, emotion_vocab = load_emotion_vocab()
