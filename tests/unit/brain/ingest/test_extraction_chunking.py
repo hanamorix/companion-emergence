@@ -696,3 +696,93 @@ def test_c8_oracle_catches_a_cursor_written_before_the_loop(world, monkeypatch) 
     stub._plan = lambda n, p: _between if n == 2 else None
     _snapshot(world, "sess_c8v", stub)
     assert unprompted != []
+
+
+# ---------------------------------------------------------------------------
+# The rollover (C6, C9 second half, C11e weekly): real perform_rollover, compaction provider stubbed
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def rollover_world(world, monkeypatch):
+    import brain.chat.rollover as rollover
+
+    monkeypatch.setattr(rollover, "build_compaction_provider", lambda persona_dir: _SummaryStub())
+    return world
+
+
+def _roll(world_, sid, provider, **kw):
+    from brain.chat.rollover import perform_rollover
+
+    persona, store, hebbian, _ = world_
+    return perform_rollover(persona, sid, "Kestrel", seed_mode="summary_only", provider=provider, store=store, hebbian=hebbian, **kw)
+
+
+def test_c6_the_rollover_extracts_every_chunk_before_deleting(rollover_world, monkeypatch) -> None:
+    persona, _, _, _ = rollover_world
+    monkeypatch.setattr(pipeline, "extraction_chunk_chars", lambda: 24_000, raising=False)
+    rows = _seed(persona, "sess_c06", 300, gap_s=30)
+    assert len(chunk_turns(rows, max_chars=24_000, user_name="Bob", assistant_name="Kestrel")) == 3
+    buffer_present: list[bool] = []
+    stub = _Stub(plan=lambda n, p: (lambda: buffer_present.append("sess_c06" in list_active_sessions(persona))))
+    new_sid = _roll(rollover_world, "sess_c06", stub)
+    for r in rows:
+        assert sum(_line(r) in p for p in stub.prompts) == 1, r["text"][:12]
+    assert new_sid is not None and "sess_c06" not in list_active_sessions(persona)
+    assert buffer_present == [True, True, True]
+
+
+def test_c6_a_deferral_at_chunk_2_keeps_the_old_buffer(rollover_world) -> None:
+    persona, _, _, _ = rollover_world
+    rows = _seed(persona, "sess_c6d", 6)
+    chunks = _expected_chunks(rows)
+    assert len(chunks) == 3
+    assert _roll(rollover_world, "sess_c6d", _Stub(plan=lambda n, p: "defer" if n == 2 else None)) is None
+    assert "sess_c6d" in list_active_sessions(persona)
+    assert read_cursor(persona, "sess_c6d") == chunks[0].cursor_ts
+
+
+@pytest.mark.parametrize("rerun_ok", [True, False])
+def test_c9_after_a_poison_the_rollover_extracts_the_rest_or_keeps_the_buffer(rollover_world, rerun_ok) -> None:
+    persona, _, _, _ = rollover_world
+    rows = _seed(persona, "sess_c9r", 8)
+    chunks = _expected_chunks(rows)
+    assert len(chunks) == 4
+    write_cursor(persona, "sess_c9r", chunks[0].cursor_ts)  # chunk 1 committed earlier
+    write_backoff(persona, "sess_c9r", failures=2, first_failure_at=(datetime.now(UTC) - timedelta(minutes=30)).isoformat())
+    second = _line(chunks[1].turns[0])
+    later = [_line(c.turns[0]) for c in chunks[2:]]
+
+    def plan(n, p):
+        if second in p:
+            return "fail"  # chunk 2 fails: its third recorded failure
+        if not rerun_ok and any(h in p for h in later):
+            return "fail"
+        return None
+
+    stub = _Stub(plan=plan)
+    new_sid = _roll(rollover_world, "sess_c9r", stub)
+    poisoned = (persona / "active_conversations" / "poison" / "sess_c9r.span.jsonl").read_text().splitlines()
+    assert [json.loads(x)["text"] for x in poisoned] == [r["text"] for r in chunks[1].turns]
+    if rerun_ok:
+        assert new_sid is not None and "sess_c9r" not in list_active_sessions(persona)
+        for c in chunks[2:]:
+            assert all(any(_line(r) in p for p in stub.prompts) for r in c.turns)
+    else:
+        assert new_sid is None and "sess_c9r" in list_active_sessions(persona)
+        assert read_cursor(persona, "sess_c9r") == chunks[1].cursor_ts
+
+
+def test_c11e_the_weekly_rollover_makes_every_call(rollover_world) -> None:
+    from brain.chat.rollover import maybe_weekly_rollover
+
+    persona, store, hebbian, _ = rollover_world
+    rows = _seed(persona, "sess_c1w", 6, start=datetime.now(UTC) - timedelta(days=8))
+    assert len(_expected_chunks(rows)) == 3
+    stub = _Stub()
+    new_sid = maybe_weekly_rollover(
+        persona, "sess_c1w", "Kestrel", weekly_age=timedelta(days=7), quiet_gap=timedelta(minutes=10),
+        provider=stub, store=store, hebbian=hebbian,
+    )
+    assert len(stub.prompts) == 3
+    assert new_sid is not None
