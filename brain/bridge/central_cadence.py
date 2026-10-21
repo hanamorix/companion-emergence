@@ -8,7 +8,8 @@ background job whether it runs now. A gated job runs only when BOTH:
   reached wait for the next lull), and
 * the job is due: an interval job's persisted ``next_at`` has passed
   (S23/S34), or a no-interval job has work (pass 2, session snapshot/prune,
-  emotion backfill, embedding backfill: S53/S66), or a predicate job's own
+  emotion backfill, embedding backfill: S53/S66; the extraction backfill,
+  #523: an armed plan with an open target), or a predicate job's own
   condition holds (deploy recalibration: the stored floor is stale, S70/S73;
   self-model articulation: its own cadence module, S29).
 
@@ -74,8 +75,9 @@ logger = logging.getLogger(__name__)
 # measurement (S200, S220: the RAM ladder when a turn found no usable memory model),
 # then the cost-series flush (S146, S164: the buffered timing samples are saved to memories.db, after
 # the re-measure and the RAM figure so their samples are saved the same lull), then the recall
-# diagnostics flush (S189: records buffered while the log's lock was held). Names are the job
-# table's keys and the log's `job=` values.
+# diagnostics flush (S189: records buffered while the log's lock was held), then the extraction
+# backfill (#523: one chunk per pass, after embedding backfill so the vectors its dedup reads are
+# current). Names are the job table's keys and the log's `job=` values.
 GATED_JOB_ORDER: tuple[str, ...] = (
     "pass2",
     "session_snapshot_prune",
@@ -87,6 +89,7 @@ GATED_JOB_ORDER: tuple[str, ...] = (
     "rerank_ram_figure",
     "cost_series_flush",
     "recall_diagnostics_flush",
+    "extraction_backfill",
     "maintenance",
     "interest_sweep",
     "self_model_articulation",

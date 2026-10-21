@@ -49,7 +49,13 @@ from brain.ingest.buffer import (
 from brain.ingest.commit import commit_item
 from brain.ingest.dedupe import DEFAULT_DEDUP_THRESHOLD, is_duplicate
 from brain.ingest.extract import extract_items_with_status
-from brain.ingest.ingest_utils import chunk_turns, extraction_chunk_chars
+from brain.ingest.ingest_utils import (
+    chunk_turns,
+    extraction_chunk_chars,
+    load_emotion_vocab,
+    load_user_name,
+    load_user_pronouns,
+)
 from brain.ingest.soul_queue import DEFAULT_SOUL_THRESHOLD, queue_soul_candidate
 from brain.ingest.types import IngestReport
 from brain.memory.hebbian import HebbianMatrix
@@ -59,26 +65,6 @@ from brain.utils.file_lock import file_lock
 from brain.utils.log_throttle import count_throttled
 
 logger = logging.getLogger(__name__)
-
-
-def _load_emotion_vocab() -> tuple[set[str], str]:
-    """Return (names_set, comma_separated_sorted_string) for all registered emotions.
-
-    Reads the in-process vocabulary registry (baseline + any persona extensions
-    registered at engine startup). Falls back to empty on any error — the
-    pipeline must never fail because of a vocabulary load issue.
-
-    Returns a tuple so callers get both forms cheaply (set for normalize(),
-    string for the prompt).
-    """
-    try:
-        from brain.emotion.vocabulary import list_all
-
-        names = {e.name for e in list_all()}
-        return names, ",".join(sorted(names))
-    except Exception:  # noqa: BLE001
-        logger.warning("_load_emotion_vocab: failed to load vocabulary; emotions will be empty")
-        return set(), ""
 
 
 # F-011 — extraction backoff knobs. After this many recorded extraction
@@ -141,7 +127,7 @@ def poison_unextracted_span(persona_dir: Path, session_id: str) -> int | None:
         failing = chunk_turns(
             turns,
             max_chars=extraction_chunk_chars(),
-            user_name=_load_user_name(persona_dir),
+            user_name=load_user_name(persona_dir),
             assistant_name=persona_dir.name,
         )[0]
         poison_dir = persona_dir / "active_conversations" / "poison"
@@ -156,32 +142,6 @@ def poison_unextracted_span(persona_dir: Path, session_id: str) -> int | None:
             len(failing.turns),
         )
         return len(failing.turns)
-
-
-def _load_user_name(persona_dir: Path) -> str | None:
-    """Look up PersonaConfig.user_name; None if missing or unset.
-
-    Best-effort — never raises. PersonaConfig is the home for the
-    user's name; we read it here once per extraction pass. If the
-    config file is corrupt or the field is missing, the extractor
-    falls back to the legacy "user:" / "assistant:" prompt path.
-    """
-    try:
-        from brain.persona_config import PersonaConfig
-
-        return PersonaConfig.load(persona_dir / "persona_config.json").user_name
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def _load_user_pronouns(persona_dir: Path) -> dict | None:
-    """PersonaConfig.user_pronouns; None if missing/unset. Best-effort."""
-    try:
-        from brain.persona_config import PersonaConfig
-
-        return PersonaConfig.load(persona_dir / "persona_config.json").user_pronouns
-    except Exception:  # noqa: BLE001
-        return None
 
 
 class ChunkResult(enum.Enum):
@@ -325,10 +285,10 @@ def _run_chunks(
     (F-011), and a committed chunk clears the backoff sidecar. ``close_session`` passes False: it keeps its rule of no
     backoff accounting.
     """
-    user_name = _load_user_name(persona_dir)
+    user_name = load_user_name(persona_dir)
     assistant_name = persona_dir.name
-    valid_emotions, emotion_vocab = _load_emotion_vocab()
-    user_pronouns = _load_user_pronouns(persona_dir)
+    valid_emotions, emotion_vocab = load_emotion_vocab()
+    user_pronouns = load_user_pronouns(persona_dir)
     max_chars = extraction_chunk_chars()
     chunks = chunk_turns(turns, max_chars=max_chars, user_name=user_name, assistant_name=assistant_name)
     for index, chunk in enumerate(chunks):

@@ -1,8 +1,9 @@
 """Ingest-area helpers shared by the extraction pipeline and the extraction backfill (#523).
 
 ``chunk_turns`` splits a run of buffer rows into extraction chunks no larger than ``extraction_chunk_chars()``
-characters of formatted transcript, cutting only where the extraction cursor can safely stop. Pure functions: no file,
-no lock, no model call.
+characters of formatted transcript, cutting only where the extraction cursor can safely stop; it and ``parse_turn_ts``
+are pure (no file, no lock, no model call). The ``load_*`` helpers read what an extraction call needs from the persona
+(the user's name and pronouns from ``persona_config.json``, the registered emotion names).
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import logging
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 
 from brain import tunables
 from brain.ingest.extract import format_turn_line
@@ -166,3 +168,49 @@ def chunk_turns(
             )
         )
     return chunks
+
+
+def load_user_name(persona_dir: Path) -> str | None:
+    """Look up PersonaConfig.user_name; None if missing or unset.
+
+    Best-effort — never raises. PersonaConfig is the home for the
+    user's name; the pipeline reads it once per extraction pass. If the
+    config file is corrupt or the field is missing, the extractor
+    falls back to the legacy "user:" / "assistant:" prompt path.
+    """
+    try:
+        from brain.persona_config import PersonaConfig
+
+        return PersonaConfig.load(persona_dir / "persona_config.json").user_name
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def load_user_pronouns(persona_dir: Path) -> dict | None:
+    """PersonaConfig.user_pronouns; None if missing/unset. Best-effort."""
+    try:
+        from brain.persona_config import PersonaConfig
+
+        return PersonaConfig.load(persona_dir / "persona_config.json").user_pronouns
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def load_emotion_vocab() -> tuple[set[str], str]:
+    """Return (names_set, comma_separated_sorted_string) for all registered emotions.
+
+    Reads the in-process vocabulary registry (baseline + any persona extensions
+    registered at engine startup). Falls back to empty on any error — an
+    extraction must never fail because of a vocabulary load issue.
+
+    Returns a tuple so callers get both forms cheaply (set for normalize(),
+    string for the prompt).
+    """
+    try:
+        from brain.emotion.vocabulary import list_all
+
+        names = {e.name for e in list_all()}
+        return names, ",".join(sorted(names))
+    except Exception:  # noqa: BLE001
+        logger.warning("load_emotion_vocab: failed to load vocabulary; emotions will be empty")
+        return set(), ""
