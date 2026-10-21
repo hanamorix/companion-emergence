@@ -79,16 +79,20 @@ def test_a_stray_test_hooks_env_var_does_not_stub_a_real_bridge(persona_dir: Pat
     assert ran == ["supervisor"]
 
 
-def test_a_real_start_keeps_its_fresh_task_registry(persona_dir: Path) -> None:
-    """Pre-merge review O-5: the test-only registry reset runs only when an earlier app in this process left the
-    registry in use (sealed, abandoning, or with tasks); a bridge process's one app keeps the fresh registry."""
+def test_the_lifespan_never_calls_the_test_registry_reset(persona_dir: Path, monkeypatch) -> None:
+    """Pre-merge review O-5 and its fix-check: ``shutdown_progress.reset_for_tests()`` is test code and the production
+    lifespan never calls it, not even after an earlier app in the process sealed the registry. Tests get a fresh
+    registry from the root conftest (per test) or call the reset themselves between two apps."""
     from brain.bridge import shutdown_progress
 
     fresh = shutdown_progress.reset_for_tests()
+    fresh.seal()  # as an earlier app's stop leaves it
+    calls: list[int] = []
+    monkeypatch.setattr(shutdown_progress, "reset_for_tests", lambda: calls.append(1))
     app = server.build_app(persona_dir=persona_dir, client_origin="tests")
-    with TestClient(app):
-        assert shutdown_progress.registry is fresh
-    assert fresh.sealed
-    # An earlier app's sealed registry is replaced for the next app in the same process (tests build many).
-    with TestClient(server.build_app(persona_dir=persona_dir, client_origin="tests")):
-        assert shutdown_progress.registry is not fresh and not shutdown_progress.registry.sealed
+    try:
+        with TestClient(app):
+            pass
+    except Exception:  # noqa: BLE001 - a sealed registry may refuse the app's own work; only the reset is asserted
+        pass
+    assert calls == []

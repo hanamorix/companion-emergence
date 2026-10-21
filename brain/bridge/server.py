@@ -1177,9 +1177,10 @@ def build_app(
         bus.bind_loop(asyncio.get_running_loop())
         events.set_publisher(bus.publish)
 
-        # #456: one stop per bridge app. A new app in this process (tests) starts unstopped, with a fresh task
-        # registry; the controller is the bridge's single stop entry point (a local one when none is passed). A stop
-        # that already began (a signal before the lifespan, review S1) keeps the process-wide flag set.
+        # #456: one stop per bridge app. A new app in this process (tests) starts unstopped; the controller is the
+        # bridge's single stop entry point (a local one when none is passed). A stop that already began (a signal
+        # before the lifespan, review S1) keeps the process-wide flag set. The task registry is the process's own (a
+        # bridge process runs one app); tests that build several apps reset it themselves.
         controller = (
             shutdown_controller
             if isinstance(shutdown_controller, BridgeShutdownController)
@@ -1187,10 +1188,6 @@ def build_app(
         )
         if not controller.stopping:
             cli_throttle.clear_shutdown()
-        if shutdown_progress.registry_in_use():
-            # Only a process that already ran a bridge app (tests build many); a bridge process runs one app, whose
-            # registry is still fresh here.
-            shutdown_progress.reset_for_tests()
         if controller.persona_dir is None:
             controller.configure(persona_dir)
 
