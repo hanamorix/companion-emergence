@@ -6,6 +6,7 @@ real-subprocess SIGTERM case, which ends the sleeping process at once.
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import sys
@@ -555,6 +556,32 @@ def _log_held_open(path: Path) -> bool:
     return any(Path(f.path).resolve() == path.resolve() for f in psutil.Process().open_files())
 
 
+def _log_held_open_between_records(path: Path) -> bool:
+    """`_log_held_open`, taken BETWEEN records: the transient handler opens the log for one record and closes it again
+    under its own lock, and any thread's record goes through it while it is attached (a background thread another test
+    leaked logs into the root logger), so a probe made while such an append is in flight sees a handle that is open for
+    that record only. Holding the handler's lock makes the probe wait for the append to finish and keeps the next one out.
+    This was the flake of the first version of this test (reproduced with a thread logging every half millisecond)."""
+    handlers = [h for h in logging.getLogger().handlers if isinstance(h, _runner._AppendThenCloseHandler)]
+    for h in handlers:
+        h.acquire()
+    try:
+        return _log_held_open(path)
+    finally:
+        for h in reversed(handlers):
+            h.release()
+
+
+def _persistent_handlers_for(path: Path) -> list[logging.Handler]:
+    """The rotating handlers on the root logger for THIS log file (another test may have left one for another file)."""
+    from logging.handlers import RotatingFileHandler
+
+    return [
+        h for h in logging.getLogger().handlers
+        if isinstance(h, RotatingFileHandler) and h.baseFilename == str(path.resolve())
+    ]
+
+
 def test_the_wait_line_reaches_the_runtime_log_without_holding_it_open(pd, clock, monkeypatch, tmp_path, root_handlers):
     """Review of D26 (ruling 3): a service run queued or waiting must not hold the runtime log open (on Windows that
     blocks the running bridge's rotation). The wait's INFO line still reaches the log, through a handler that opens,
@@ -570,7 +597,7 @@ def test_the_wait_line_reaches_the_runtime_log_without_holding_it_open(pd, clock
 
     def sleep(s):
         if log.exists():
-            held_during_wait.append(_log_held_open(log))
+            held_during_wait.append(_log_held_open_between_records(log))
         real_sleep(s)
 
     monkeypatch.setattr(start_backoff, "_sleep", sleep)
@@ -578,9 +605,7 @@ def test_the_wait_line_reaches_the_runtime_log_without_holding_it_open(pd, clock
     real_acquire = daemon.acquire_lock
 
     def acquire(*a, **k):
-        from logging.handlers import RotatingFileHandler
-
-        seen_at_lock.append(any(isinstance(h, RotatingFileHandler) for h in root_handlers.handlers))
+        seen_at_lock.append(bool(_persistent_handlers_for(log)))
         return real_acquire(*a, **k)
 
     monkeypatch.setattr(daemon, "acquire_lock", acquire)
@@ -589,10 +614,8 @@ def test_the_wait_line_reaches_the_runtime_log_without_holding_it_open(pd, clock
     assert held_during_wait and not any(held_during_wait), held_during_wait
     assert seen_at_lock == [False]  # no persistent handler before the lock
     assert "start back-off: waiting" in log.read_text(encoding="utf-8")
-    from logging.handlers import RotatingFileHandler
-
-    assert sum(isinstance(h, RotatingFileHandler) for h in root_handlers.handlers) == 1  # persistent, after the lock
-    assert not any(type(h).__name__ == "_AppendThenCloseHandler" for h in root_handlers.handlers)  # transient gone
+    assert len(_persistent_handlers_for(log)) == 1  # persistent, after the lock
+    assert not any(isinstance(h, _runner._AppendThenCloseHandler) for h in root_handlers.handlers)  # transient gone
 
 
 def test_setting_up_the_runtime_log_twice_adds_one_handler(pd, monkeypatch, tmp_path, root_handlers):
