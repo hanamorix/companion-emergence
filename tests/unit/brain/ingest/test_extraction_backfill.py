@@ -757,6 +757,57 @@ def test_b12_a_deferral_counts_nothing(kestrel) -> None:
 
 
 # ---------------------------------------------------------------------------
+# A single message longer than the limit goes in pieces (C2), in the backfill too
+# ---------------------------------------------------------------------------
+
+
+def _over_long_history(sid: str) -> list[dict]:
+    """One exchange whose user message is several times the chunk limit (multi-line, so line and character splits both
+    happen), then two ordinary exchanges."""
+    body = "\n".join(f"zvq{i:02d} " + "p" * 230 for i in range(8))
+    big = [
+        {"session_id": sid, "speaker": "user", "text": body, "ts": _OLD.isoformat(timespec="seconds")},
+        {"session_id": sid, "speaker": "assistant", "text": "zvqreply " + "r" * 80,
+         "ts": (_OLD + timedelta(seconds=1)).isoformat(timespec="seconds")},
+    ]
+    return big + _rows(sid, _OLD + timedelta(minutes=5), 2, tag="t")
+
+
+def test_an_over_long_message_is_sent_in_pieces_and_progress_moves_after_the_last(kestrel) -> None:
+    persona, store, hebbian = kestrel
+    rows = _over_long_history("sess_pc")
+    _archive(persona, "sess_pc", rows)
+    _arm(persona, "all")
+    first = chunk_turns(rows, max_chars=_CHUNK, user_name=_USER, assistant_name="Kestrel")[0]
+    assert first.oversize and len(first.pieces) >= 3 and all(len(piece) <= _CHUNK for piece in first.pieces)
+
+    failing = _Stub(plan=lambda n, p: "fail" if first.pieces[1] in p else None)  # a middle piece fails (every attempt)
+    assert _run(persona, store, hebbian, failing).advanced is False
+    assert sum(first.pieces[0] in p for p in failing.prompts) == 1
+    assert not any(piece in p for piece in first.pieces[2:] for p in failing.prompts)  # the pieces after it are not sent
+    assert eb.load_state(persona)["targets"][0]["done_through_ts"] is None  # no progress before the last piece
+
+    ok = _Stub()
+    assert _run(persona, store, hebbian, ok).advanced is True
+    assert len(ok.prompts) == len(first.pieces)  # one call per piece, all in this run
+    for piece, prompt in zip(first.pieces, ok.prompts, strict=True):
+        assert piece in prompt
+        assert first.text not in prompt  # never the whole over-long exchange in one call
+    assert eb.load_state(persona)["targets"][0]["done_through_ts"] == first.cursor_ts
+
+
+def test_the_dry_run_counts_one_call_per_piece(kestrel) -> None:
+    persona, _, _ = kestrel
+    rows = _over_long_history("sess_pd")
+    _archive(persona, "sess_pd", rows)
+    chunks = chunk_turns(rows, max_chars=_CHUNK, user_name=_USER, assistant_name="Kestrel")
+    calls = sum(len(c.pieces) for c in chunks)
+    assert calls > len(chunks)
+    line = next(ln for ln in eb.dry_run_text(persona).splitlines() if ln.startswith("mode all:"))
+    assert f"calls={calls}" in line
+
+
+# ---------------------------------------------------------------------------
 # Gate load is observable
 # ---------------------------------------------------------------------------
 
