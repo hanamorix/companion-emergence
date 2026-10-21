@@ -35,8 +35,10 @@ REASON_MANUAL_RESTART = "manual_restart"
 REASON_IDLE = "idle_timeout"
 REASON_OS_SIGNAL = "os_signal"
 REASON_HARD_EXIT = "hard_exit"
-# Review S7: the run ended with work still running and no stop begun (no request, no signal): a crash, which the
-# app's crash watchdog restarts (a deliberate hard exit is never restarted).
+# A run that ended with no stop asked for (no request, no signal): work still running at the end (review S7), or a
+# lifespan startup that raised, a bind failure or a uvicorn-internal end with nothing running (pre-merge review O-1).
+# A crash: not clean, exit 1, so the app's crash watchdog and the service managers restart it (a deliberate hard exit
+# is never restarted).
 REASON_CRASH = "crash"
 REASON_UNKNOWN = "unknown"
 

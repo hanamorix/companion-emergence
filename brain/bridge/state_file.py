@@ -1,9 +1,11 @@
 """Bridge daemon state file — bridge.json.
 
 The file is persistent across restarts. `pid`/`port` get cleared on graceful
-shutdown; `shutdown_clean` flips to True as the very last step. On the next
-`bridge start`, if `shutdown_clean: false` AND the recorded pid is dead, the
-previous bridge crashed — caller should run dirty-shutdown recovery.
+shutdown; `shutdown_clean` flips to True as the very last step. A record left
+with `shutdown_clean: false` whose bridge is gone (identity token, not the bare
+pid) is a dirty end: `recovery_needed` reports it (status output only). Nothing
+runs at start to recover it; the next bridge's first idle pass saves the open
+conversations whatever ended the last one (#456 D12).
 
 Atomic writes go through brain.health.json_io.write_json so
 partial writes don't corrupt state. Reads use read_json_result (HEAL) so corrupted

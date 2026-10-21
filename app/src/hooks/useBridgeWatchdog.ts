@@ -31,8 +31,8 @@ export const HEALTHY_RESET_MS = 600_000;
 
 const SERVICE_ORIGINS = new Set(["launchd", "systemd", "task-scheduler"]);
 
-/** The bridge's own record of a run that ended unexpectedly with work still running (brain/bridge/shutdown.py
- *  REASON_CRASH): not a stop. */
+/** The bridge's own record of a run that ended with no stop asked for (brain/bridge/shutdown.py REASON_CRASH): work
+ *  still running at the end, or a startup failure, bind failure or server error with nothing running. Not a stop. */
 export const CRASH_REASON = "crash";
 
 /** The inconclusive-read ladder (review S6): STATUS_POLL_MS, then the crash restarts' own delays. */
