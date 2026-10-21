@@ -275,6 +275,7 @@ def run_backfill(
     """
     from brain.attunement.budget import consume_call as _attunement_consume_call
     from brain.attunement.budget import get_remaining as _attunement_budget_remaining
+    from brain.attunement.budget import lock as _attunement_budget_lock
     from brain.attunement.crystallise import check_crystallisations
     from brain.attunement.schemas import (
         DAILY_BUDGET_DEFAULT,
@@ -417,28 +418,33 @@ def run_backfill(
                 )
                 return state
 
-            # #473: check the budget now (read-only) and charge it only after a call that was not refused.
-            if _attunement_budget_remaining(persona_dir, now=now_dt, cap=cap) <= 0:
-                state = replace(state, status="deferred_to_next_day")
-                _save_state(persona_dir, state)
-                return state
+            # #473: check the budget now (read-only) and charge it only after a call that was not refused. The budget
+            # lock is held from the check to the charge, so pass-2 attunement (or another process) cannot check and
+            # charge in between and push the day over its cap (review O-7).
+            with _attunement_budget_lock(persona_dir):
+                if _attunement_budget_remaining(persona_dir, now=now_dt, cap=cap) <= 0:
+                    state = replace(state, status="deferred_to_next_day")
+                    _save_state(persona_dir, state)
+                    return state
 
-            attempted_this_run += 1
-            try:
-                output = detector_fn(buffer_slice=list(window.turns), reply_text="")
-            except cli_throttle.ThrottleDeferred as exc:
-                # #473: "not now" (login expired, or the bridge is stopping): nothing of this window is written and
-                # no later window runs; the state on disk is as it was before this window's call.
-                _log.info("attunement backfill: detector call refused on %s (%s); stopping this run", window.id, exc)
-                return state
-            except Exception as exc:  # noqa: BLE001
-                _attunement_consume_call(persona_dir, now=now_dt, cap=cap)  # a call that failed still cost one
-                _save_state(persona_dir, state)  # the deferred start-of-run save, unchanged otherwise
-                _log.warning(
-                    "attunement backfill: detector error on %s: %s", window.id, exc
-                )
-                continue
-            _attunement_consume_call(persona_dir, now=now_dt, cap=cap)
+                attempted_this_run += 1
+                try:
+                    output = detector_fn(buffer_slice=list(window.turns), reply_text="")
+                except cli_throttle.ThrottleDeferred as exc:
+                    # #473: "not now" (login expired, or the bridge is stopping): nothing of this window is written
+                    # and no later window runs; the state on disk is as it was before this window's call.
+                    _log.info(
+                        "attunement backfill: detector call refused on %s (%s); stopping this run", window.id, exc
+                    )
+                    return state
+                except Exception as exc:  # noqa: BLE001
+                    _attunement_consume_call(persona_dir, now=now_dt, cap=cap)  # a call that failed still cost one
+                    _save_state(persona_dir, state)  # the deferred start-of-run save, unchanged otherwise
+                    _log.warning(
+                        "attunement backfill: detector error on %s: %s", window.id, exc
+                    )
+                    continue
+                _attunement_consume_call(persona_dir, now=now_dt, cap=cap)
             succeeded_this_run += 1
 
             merge_into_learned(
