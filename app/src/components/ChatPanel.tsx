@@ -217,6 +217,8 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
   };
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [activeBanners, setActiveBanners] = useState<InitiateMessage[]>([]);
+  // #523: a card reply whose send could not get a session gives its banner back, with the typed reply (by audit id).
+  const [bannerDrafts, setBannerDrafts] = useState<Record<string, string>>({});
   const [activeVoiceEdits, setActiveVoiceEdits] = useState<VoiceEditProposal[]>([]);
   const sessionRef = useRef<string | null>(null);
   const cancelRef = useRef<(() => void) | null>(null);
@@ -584,8 +586,9 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
     imageThumb?: string;
     prepend?: Message[];
     onFailed?: () => void;
+    onRolledBack?: () => void;
   }): Promise<void> {
-    const { text: outboundText, replyToAuditId, sharedFiles, imageThumb, prepend = [], onFailed } = opts;
+    const { text: outboundText, replyToAuditId, sharedFiles, imageThumb, prepend = [], onFailed, onRolledBack } = opts;
 
     const userMsg: Message = {
       id: nextBubbleId(),
@@ -621,12 +624,14 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
         try {
           sessionId = await newSession(persona);
         } catch (e) {
-          // Nothing was sent: take back the pending bubble and any reach-out bubble shown with it (onFailed gives the text
-          // back to the composer).
+          // Nothing was sent: take back the pending bubble and any reach-out bubble shown with it, and give everything back
+          // where it came from (onFailed: the composer's text; onRolledBack: a card reply's banner and its reply text), so
+          // nothing the user saw or typed vanishes.
           const shown = new Set([userMsg.id, ...prepend.map((b) => b.id)]);
           setMessages((m) => m.filter((b) => !shown.has(b.id)));
           setResolvingSession(false);
           setErrorSafe(`Bridge unreachable: ${errString(e)}`);
+          onRolledBack?.();
           onFailed?.();
           return;
         }
@@ -810,7 +815,17 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
       ? [{ id: nextBubbleId(), from: "nell", text: banner.body, time: formatTime(), reachedOut: true }]
       : [];
     // fire-and-forget: streamTurn owns its own error surfacing (failure bubble + setErrorSafe)
-    void streamTurn({ text, replyToAuditId: auditId, prepend });
+    void streamTurn({
+      text,
+      replyToAuditId: auditId,
+      prepend,
+      // #523: no session could be had, so nothing was sent: the banner comes back with the reply the user typed.
+      onRolledBack: () => {
+        if (!banner) return;
+        setBannerDrafts((d) => ({ ...d, [auditId]: text }));
+        setActiveBanners((prev) => (prev.some((b) => b.auditId === auditId) ? prev : [...prev, banner]));
+      },
+    });
   };
 
   function stopStreaming() {
@@ -956,6 +971,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
               onDismiss={onBannerDismiss}
               onMounted={onBannerMounted}
               isStreaming={streaming}
+              initialDraft={bannerDrafts[b.auditId]}
             />
           ))}
         </div>

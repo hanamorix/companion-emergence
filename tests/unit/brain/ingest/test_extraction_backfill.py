@@ -1089,3 +1089,35 @@ def test_b17_another_sessions_old_code_cut_after_the_first_marker_is_still_plann
     for mode in ("heads", "all"):
         targets = eb._new_state(persona, mode)["targets"]
         assert "sess_b17pb" in {t["sid"] for t in targets}, mode
+
+
+@pytest.mark.parametrize("mode", ["heads", "all"])
+def test_b17_no_planned_row_is_at_or_after_its_sessions_marker(kestrel, monkeypatch, mode) -> None:
+    """Re-check R39-R40: the marker IS the first row the chunked code extracted in the session, so that row and every later one
+    of the session are out of the plan (``ts >= marker``), while the session's older old-code rows stay in it."""
+    from brain.ingest.ingest_utils import chunked_extraction_since
+    from brain.ingest.pipeline import extract_session_snapshot
+
+    persona, store, hebbian = kestrel
+    monkeypatch.setattr(eb, "_HISTORICAL_CAP_CHARS", 300)
+    old = _rows("sess_b17m", datetime.now(UTC) - timedelta(days=4), 6, gap_s=30, tag="o")
+    _archive(persona, "sess_b17m", old)  # extracted by the old code (its head was cut)
+    pending = _rows("sess_b17m", datetime.now(UTC) - timedelta(days=1), 3, gap_s=30, tag="n")
+    _active(persona, "sess_b17m", pending, cursor_at=None)
+    extract_session_snapshot(persona, "sess_b17m", store=store, hebbian=hebbian, provider=_Stub(items=False))
+    marker = chunked_extraction_since(persona)["sess_b17m"]
+    assert marker == lenient_utc(pending[0]["ts"])
+    state = eb._new_state(persona, mode)
+    planned = [r for t in state["targets"] for r in eb._target_rows(persona, t, state["cutoff_ts"])]
+    assert planned, "the old rows must still be planned"
+    assert all(lenient_utc(r["ts"]) < marker for r in planned)
+    assert all(lenient_utc(t["to_ts"]) < marker for t in state["targets"])
+
+
+def test_status_shows_that_cutoffs_are_per_session(kestrel, monkeypatch) -> None:
+    persona, _, _ = kestrel
+    marker = datetime.now(UTC) - timedelta(days=10)
+    _b17_world(persona, monkeypatch, marker)
+    _arm(persona, "all")
+    text = eb.status_text(persona)
+    assert "2 session(s) stop earlier" in text

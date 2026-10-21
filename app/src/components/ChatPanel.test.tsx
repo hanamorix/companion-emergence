@@ -445,7 +445,7 @@ describe("ChatPanel — a send whose session cannot be had is rolled back (#523 
     expect(mockedStreamChat).not.toHaveBeenCalled();
   });
 
-  it("also removes the reach-out bubble a card reply showed with it", async () => {
+  it("gives a card reply's banner back, with the typed reply, and leaves no reach-out bubble", async () => {
     const handlers = new Set<(e: Record<string, unknown> & { type: string }) => void>();
     const stream = {
       subscribe(h: (e: Record<string, unknown> & { type: string }) => void) {
@@ -473,8 +473,11 @@ describe("ChatPanel — a send whose session cannot be had is rolled back (#523 
       fireEvent.click(screen.getByRole("button", { name: /Send reply/i }));
     });
     await waitFor(() => expect(mockedNewSession).toHaveBeenCalled());
-    await waitFor(() => expect(screen.queryByText("tell me more")).toBeNull());
-    expect(screen.queryByText("a thought about the quorble tree")).toBeNull();
+    // The banner is back with the reply the user typed; its body shows once (in the banner, not as a reach-out bubble too).
+    const restored = (await screen.findByLabelText(/^Reply to Kestrel$/i)) as HTMLTextAreaElement;
+    expect(restored.value).toBe("tell me more");
+    expect(screen.getAllByText("a thought about the quorble tree")).toHaveLength(1);
+    expect(screen.getByRole("region", { name: /Kestrel reached out/i })).toBeInTheDocument();
     expect(mockedStreamChat).not.toHaveBeenCalled();
   });
 });

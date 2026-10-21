@@ -146,7 +146,7 @@ def _row_key(row: dict) -> tuple:
 
 def _rows_of(persona_dir: Path, sid: str, cutoff: datetime) -> list[dict]:
     """``sid``'s extractable rows held under its own id: archived rows, then active rows at or behind its cursor; no summary
-    rows, nothing after ``cutoff``, nothing without a parseable ts; a row present twice (same ts, speaker and text) once."""
+    rows, nothing at or after ``cutoff`` (a session's marker cutoff IS the first row the chunked code extracted), nothing without a parseable ts; a row present twice (same ts, speaker and text) once."""
     cursor = _read_cursor(persona_dir, sid)
     rows = []
     for path in _archive_files(persona_dir, sid):
@@ -160,7 +160,7 @@ def _rows_of(persona_dir: Path, sid: str, cutoff: datetime) -> list[dict]:
     out = []
     for row in rows:
         ts = lenient_utc(row.get("ts"))
-        if row.get("speaker") == "summary" or ts is None or ts > cutoff or _row_key(row) in seen:
+        if row.get("speaker") == "summary" or ts is None or ts >= cutoff or _row_key(row) in seen:
             continue
         seen.add(_row_key(row))
         out.append(row)
@@ -250,6 +250,7 @@ def _plan_labels(persona_dir: Path) -> tuple[str, str]:
 
 
 def _session_cutoff(cutoff_ts: str, session_cutoffs: dict[str, str] | None, sid: str) -> str:
+    """The session's own cutoff when it has one (its marker), else the plan's (its creation time). Rows at or after it are out."""
     return (session_cutoffs or {}).get(sid, cutoff_ts)
 
 
@@ -354,13 +355,15 @@ def _session_cutoffs(persona_dir: Path, now: datetime) -> dict[str, str]:
 def _new_state(persona_dir: Path, mode: str) -> dict:
     now = datetime.now(UTC)
     cutoff = now.isoformat()
-    targets = _plan(persona_dir, mode, cutoff, _session_cutoffs(persona_dir, now))
+    session_cutoffs = _session_cutoffs(persona_dir, now)
+    targets = _plan(persona_dir, mode, cutoff, session_cutoffs)
     return {
         "schema_version": _SCHEMA_VERSION,
         "plan_id": uuid.uuid4().hex,
         "status": "armed" if targets else "complete",
         "mode": mode,
         "cutoff_ts": cutoff,
+        "sessions_cut_earlier": len(session_cutoffs),
         "created_at": now.isoformat(timespec="seconds"),
         "targets": targets,
         "counters": dict.fromkeys(_COUNTERS, 0),
@@ -802,6 +805,7 @@ def status_text(persona_dir: Path) -> str:
     c = state.get("counters", {})
     return (
         f"status={state.get('status')} mode={state.get('mode')} cutoff={state.get('cutoff_ts')} "
+        f"({state.get('sessions_cut_earlier', 0)} session(s) stop earlier, where chunked extraction began in them) "
         f"targets: open={count['open']} done={count['done']} failed={count['failed']}\n"
         + " ".join(f"{k}={c.get(k, 0)}" for k in _COUNTERS)
     )
