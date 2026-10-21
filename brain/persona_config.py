@@ -38,7 +38,7 @@ DEFAULT_KINDLED_RELAY_URL = "https://kindled-relay.kindledrelay.workers.dev"
 # Allowlists for hand-edited or migrated config files. A value outside
 # the set degrades to the default with a json_io HEAL anomaly logged
 # rather than letting an invalid choice surface as a runtime crash at
-# bridge startup or heartbeat-close time. Keep these in sync with
+# bridge startup or in a heartbeat. Keep these in sync with
 # brain/bridge/provider.py:get_provider and brain/search/factory.py.
 KNOWN_PROVIDERS = frozenset({"claude-cli", "ollama", "fake"})
 KNOWN_SEARCHERS = frozenset({"ddgs", "noop"})

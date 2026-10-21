@@ -101,7 +101,7 @@ She is not waiting for you. She is living, and you join the conversation.
 
 **Persistent supervisor.** A user-scoped service (launchd on macOS, systemd-user on Linux, Task Scheduler on Windows) keeps the brain alive even when the desktop app is closed. Reboot the machine, log back in, the brain resumes.
 
-The app asks the bridge to shut down through its local `/supervisor/shutdown` endpoint before restarting it. Forced kills are reserved for wedged processes and may trigger recovery on next launch; recovery snapshots active chats without deleting the replay buffer.
+The app asks the bridge to stop through its local `/supervisor/shutdown` endpoint before restarting it, then waits while the work already running finishes, showing what is left; after three minutes it offers a hard exit. Only a bridge that answers neither `/health` nor the stop request is killed. Open conversations are saved at the first idle pass after the next start, without deleting the replay buffer.
 
 **Soul module.** Permanent memories the persona crystallises herself when something proves load-bearing across many turns. Reviewable, revokable, but never silently mutated.
 

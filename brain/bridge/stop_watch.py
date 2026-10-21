@@ -165,8 +165,8 @@ def watch_stop(
         if request_sent_at is not None and t >= request_sent_at + timeout:
             out("The bridge did not act on the hard exit; killing it.")
             result = kill(persona_dir=persona_dir, timeout=timeout, skip_hard_exit_request=True)
-            out(getattr(result, "message", "") or "")
-            return 0 if getattr(result, "outcome", "") in ("killed", "not_running") else 1
+            out(result.message)
+            return 0 if result.succeeded else 1
         if not interactive and t >= started + timeout:
             out(f"The bridge is still stopping after {int(timeout)} s.")
             return 1

@@ -59,7 +59,7 @@ def test_cmd_restart_calls_stop_then_start_when_running(
     """Happy path: stop returns 0, start returns 0, restart returns 0 with two-phase output."""
     calls: list[str] = []
 
-    def fake_stop(args):
+    def fake_stop(args, **_kw):
         calls.append("stop")
         return 0
 
@@ -89,7 +89,7 @@ def test_cmd_restart_bails_when_stop_timed_out_on_wedged_bridge(
     """
     calls: list[str] = []
 
-    def fake_stop(args):
+    def fake_stop(args, **_kw):
         calls.append("stop")
         return 1
 
@@ -114,7 +114,7 @@ def test_cmd_restart_bails_when_stop_returns_unexpected_high_code(
     """Stop returns 2 (lock held) — restart must NOT call start; returns stop's code."""
     calls: list[str] = []
 
-    def fake_stop(args):
+    def fake_stop(args, **_kw):
         calls.append("stop")
         return 2
 
@@ -137,18 +137,28 @@ def test_cmd_restart_propagates_start_failure_code(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Stop succeeds but start returns 1 — restart returns 1, not coerced."""
-    monkeypatch.setattr(daemon, "cmd_stop", lambda a: 0)
+    monkeypatch.setattr(daemon, "cmd_stop", lambda a, **_kw: 0)
     monkeypatch.setattr(daemon, "cmd_start", lambda a: 1)
     assert daemon.cmd_restart(_args("nell")) == 1
 
 
-def test_cmd_restart_propagates_start_already_running_code(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(("ready_rc", "expected"), [(0, 0), (1, 1)])
+def test_cmd_restart_waits_for_a_start_already_under_way(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, ready_rc: int, expected: int
 ) -> None:
-    """Stop succeeds but start returns 2 (race: another process spawned) — restart returns 2."""
-    monkeypatch.setattr(daemon, "cmd_stop", lambda a: 0)
+    """Review of #458 (S3): start returns 2 (a queued service run woke at the old bridge's death and holds the lock,
+    so its bridge is coming up). Restart waits for that bridge, as the app does, and returns the wait's result."""
+    persona_dir = tmp_path / "personas" / "nell"
+    persona_dir.mkdir(parents=True)
+    monkeypatch.setattr("brain.paths.get_persona_dir", lambda name: persona_dir)
+    waited: list = []
+    monkeypatch.setattr(daemon, "cmd_stop", lambda a, **_kw: 0)
     monkeypatch.setattr(daemon, "cmd_start", lambda a: 2)
-    assert daemon.cmd_restart(_args("nell")) == 2
+    monkeypatch.setattr(
+        daemon, "_await_service_readiness", lambda pd, budget, out: waited.append((pd, budget)) or ready_rc
+    )
+    assert daemon.cmd_restart(_args("nell")) == expected
+    assert waited == [(persona_dir, daemon._READINESS_BUDGET_S)]
 
 
 # ---------- cmd_tail_log ----------
@@ -1727,6 +1737,55 @@ def test_acquire_lock_windows_path_locks_far_offset_pid_stays_at_zero(
     assert unlock_mode == fake.LK_UNLCK
     assert unlock_nbytes == 1
     assert unlock_pos == daemon._WINDOWS_LOCK_OFFSET
+
+
+class _FakeBlockingMsvcrt:
+    """msvcrt for the Windows blocking path: LK_LOCK raises the queued OSErrors in turn, then succeeds. More calls
+    than queued + 5 means the caller is spinning: raise a non-OSError so the test fails instead of hanging."""
+
+    LK_LOCK = 1
+    LK_NBLCK = 2
+    LK_UNLCK = 0
+
+    def __init__(self, errors: list[int]) -> None:
+        self.errors = list(errors)
+        self.lock_calls = 0
+        self._limit = len(errors) + 5
+
+    def locking(self, fd: int, mode: int, nbytes: int) -> None:
+        if mode != self.LK_LOCK:
+            return
+        self.lock_calls += 1
+        if self.lock_calls > self._limit:
+            raise RuntimeError("acquire_lock kept retrying a lock error that is not contention")
+        if self.errors:
+            code = self.errors.pop(0)
+            raise OSError(code, os.strerror(code))
+
+
+def test_acquire_lock_windows_blocking_retries_only_on_contention(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pre-merge review O-3: LK_LOCK gives up after its own 10 x 1 s with EDEADLOCK while another process holds the
+    lock; that is retried. Any other error (a bad fd, an access error) is not contention: no retry, None."""
+    import errno
+
+    deadlock = getattr(errno, "EDEADLOCK", errno.EDEADLK)
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    monkeypatch.setattr(daemon, "_IS_WINDOWS", True)
+
+    waits = _FakeBlockingMsvcrt([deadlock, deadlock])
+    monkeypatch.setattr(daemon, "msvcrt", waits, raising=False)
+    fd = daemon.acquire_lock(persona_dir, blocking=True)
+    assert fd is not None and waits.lock_calls == 3
+    os.close(fd)
+
+    for code in (errno.EBADF, errno.EACCES, errno.EINVAL):
+        broken = _FakeBlockingMsvcrt([code] * 50)
+        monkeypatch.setattr(daemon, "msvcrt", broken, raising=False)
+        assert daemon.acquire_lock(persona_dir, blocking=True) is None
+        assert broken.lock_calls == 1
 
 
 def test_kill_if_alive_signals_a_live_pid(monkeypatch: pytest.MonkeyPatch) -> None:

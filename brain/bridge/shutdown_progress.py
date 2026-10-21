@@ -22,8 +22,7 @@ import contextvars
 import logging
 import threading
 import time
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from pathlib import Path, PurePath
 from typing import Any
 
@@ -74,14 +73,6 @@ class TaskRegistry:
         with self._lock:
             self._tasks.pop(handle, None)
 
-    @contextmanager
-    def track(self, label: str, *, spawner: bool = False) -> Iterator[int]:
-        handle = self.register(label, spawner=spawner)
-        try:
-            yield handle
-        finally:
-            self.unregister(handle)
-
     def set_activity(self, handle: int, label: str) -> None:
         with self._lock:
             if handle in self._tasks:
@@ -126,7 +117,8 @@ def abandon_gate() -> None:
 
 
 def reset_for_tests() -> TaskRegistry:
-    """A new bridge app in this process (tests): a fresh registry, not abandoning."""
+    """Tests only (the root conftest, per test, and tests that build several bridge apps in one process): a fresh
+    registry, not abandoning. Never called by the bridge itself."""
     global registry
     registry = TaskRegistry()
     abandoning.clear()

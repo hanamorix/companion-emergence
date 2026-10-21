@@ -7,7 +7,7 @@ instance, and API/idle/CLI paths request shutdown by setting ``server.should_exi
 bridge-wide shutdown flag and every registered stop event, marks bridge.json "stopping", and asks uvicorn to exit.
 HTTP and idle stops call it directly. An OS signal only sets plain attributes in the signal handler (no lock, Event or
 file I/O there: C6); the monitor thread applies them within one poll. While stopping, the monitor keeps the progress
-record current and honours a hard-exit request that names this bridge; a second OS signal is a hard exit (P2).
+record current and honours a hard-exit request that names this bridge; a second Ctrl-C (SIGINT) is a hard exit (P2).
 """
 
 from __future__ import annotations
@@ -24,7 +24,8 @@ from typing import Protocol
 
 logger = logging.getLogger(__name__)
 
-# Monitor poll interval: the same 0.1 s the lifespan's own waits use (server.py `_wait_for_in_flight_drain`).
+# Monitor poll interval: 0.1 s, the existing interval of the pre-#456 lifespan's in-flight chat wait (spec D6); the
+# lifespan's stop waits poll at it too (server.py `_STOP_POLL_S`).
 POLL_S = 0.1
 
 # Stop reasons recorded in bridge.json and the progress record (C13).
@@ -34,8 +35,10 @@ REASON_MANUAL_RESTART = "manual_restart"
 REASON_IDLE = "idle_timeout"
 REASON_OS_SIGNAL = "os_signal"
 REASON_HARD_EXIT = "hard_exit"
-# Review S7: the run ended with work still running and no stop begun (no request, no signal): a crash, which the
-# app's crash watchdog restarts (a deliberate hard exit is never restarted).
+# A run that ended with no stop asked for (no request, no signal): work still running at the end (review S7), or a
+# lifespan startup that raised, a bind failure or a uvicorn-internal end with nothing running (pre-merge review O-1).
+# A crash: not clean, exit 1, so the app's crash watchdog and the service managers restart it (a deliberate hard exit
+# is never restarted; a service run that keeps failing to start waits out the start back-off first, D26).
 REASON_CRASH = "crash"
 REASON_UNKNOWN = "unknown"
 
@@ -61,6 +64,9 @@ class BridgeShutdownController:
         self._stop_events: list[threading.Event] = []
         # Written ONLY by the signal handler (main thread), read by the monitor: plain attributes, single writer.
         self.signal_count = 0
+        # SIGINTs only (Ctrl-C): the second one during a stop is the hard exit (P2). Other signals (a closing
+        # terminal's SIGHUP, a session manager's SIGTERM) start or continue the graceful stop (review O-4).
+        self.interrupt_count = 0
         self.signal_reason: str | None = None
         # Set by the runner's server once uvicorn's serve() has ended (its re-raised signal is not a new signal).
         self.serve_finished = False
@@ -155,9 +161,11 @@ class BridgeShutdownController:
 
     # ---------------------------------------------------------------- signal path (C6: attribute writes only)
 
-    def note_signal(self) -> None:
-        """Called from a signal handler: plain attribute writes, nothing else."""
+    def note_signal(self, sig: int) -> None:
+        """Called from a signal handler with the signal number: plain attribute writes, nothing else."""
         self.signal_count += 1
+        if sig == signal.SIGINT:
+            self.interrupt_count += 1
         if self.signal_reason is None:
             self.signal_reason = REASON_OS_SIGNAL
 
@@ -178,7 +186,7 @@ def make_server_class(base: type) -> type:
         def handle_exit(self, sig: int, frame: object) -> None:
             if sig != getattr(signal, "SIGHUP", None) and sig not in self._captured_signals:
                 self._captured_signals.append(sig)
-            self.controller.note_signal()
+            self.controller.note_signal(sig)
             self.should_exit = True
 
         @contextlib.contextmanager
@@ -214,7 +222,7 @@ def early_signal_handler(controller: BridgeShutdownController, server_holder: di
     def _handler(signum: int, frame: object) -> None:
         if controller.serve_finished:
             raise SystemExit(0)
-        controller.note_signal()
+        controller.note_signal(signum)
         server = server_holder.get("server")
         if server is not None:
             server.should_exit = True
@@ -226,7 +234,7 @@ class Monitor:
     """The bridge's watcher thread (D6): applies OS signals, writes the progress record, honours a hard-exit request.
 
     Polls every ``POLL_S``; each poll is fault-isolated; never dies while the bridge runs. ``hard_exit`` is called on a
-    second OS signal (P2) or a hard-exit request naming this bridge.
+    second Ctrl-C (SIGINT, P2) or a hard-exit request naming this bridge.
     """
 
     def __init__(
@@ -278,11 +286,10 @@ class Monitor:
         from brain.bridge import shutdown_progress
 
         c = self.controller
-        count = c.signal_count
-        if count >= 1 and not c.stopping:
+        if c.signal_count >= 1 and not c.stopping:
             c.begin_stop(c.signal_reason or REASON_OS_SIGNAL)
-        if count >= 2:
-            logger.warning("second stop signal: hard exit")
+        if c.interrupt_count >= 2:
+            logger.warning("second Ctrl-C: hard exit")
             self.hard_exit(REASON_HARD_EXIT)
             return
         # D6 (b): a request naming this pid + token is the only condition, whether or not a stop has begun (review
@@ -346,6 +353,14 @@ def hard_exit(persona_dir: Path | None, reason: str = REASON_HARD_EXIT) -> None:
         from brain.bridge import shutdown_progress
 
         shutdown_progress.abandoning.set()
+        if persona_dir is not None and reason != REASON_CRASH:
+            # D26 / D7: a recorded stop (every hard exit but a crash) deletes the start back-off record.
+            try:
+                from brain.bridge import start_backoff
+
+                start_backoff.reset(persona_dir)
+            except BaseException:  # noqa: BLE001 - never delays the exit
+                pass
         if persona_dir is not None:
             try:
                 from brain.bridge import state_file

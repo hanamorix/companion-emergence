@@ -1,9 +1,10 @@
-"""Real-process stop tests: a real `python -m brain.bridge.runner` on a synthetic persona (#456: C10-C13, C15, C42,
-C55).
+"""Real-process stop tests: a real bridge runner (`brain.bridge.runner.main`) on a synthetic persona (#456: C10-C13,
+C15, C42, C55).
 
-The runner starts with KINDLED_TEST_HOOKS=1: its supervisor is a stub, and N counted stub tasks each run until the test
-creates their release file, so "work still running during the stop" is deterministic. KINDLED_HOME is sandboxed under
-the test's tmp dir; the persona's provider is the fake one, so nothing can reach a real model.
+The runner starts through the test-only launcher `tests/bridge/_hooked_bridge.py`: its supervisor is a stub, and N
+counted stub tasks each run until the test creates their release file, so "work still running during the stop" is
+deterministic. KINDLED_HOME is sandboxed under the test's tmp dir; the persona's provider is the fake one, so nothing
+can reach a real model.
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ START_TIMEOUT_S = 60.0
 class Bridge:
     def __init__(self, tmp: Path, *, tasks: int = 0, hold_supervisor: bool = False, idle_s: float | None = None,
                  sighup_ignored: bool = False, calls: tuple[str, ...] = (), provider: str = "fake",
-                 new_group: bool = False, prepare=None):
+                 new_group: bool = False, prepare=None, ready: bool = True):
         self.home = tmp / "home"
         self.pd = self.home / "personas" / "nell"
         (self.pd / "active_conversations").mkdir(parents=True, exist_ok=True)
@@ -49,7 +50,6 @@ class Bridge:
         env.update({
             "KINDLED_HOME": str(self.home),
             "PYTHONPATH": str(REPO),
-            "KINDLED_TEST_HOOKS": "1",
             "KINDLED_TEST_STUB_TASKS": str(tasks),
             "KINDLED_TEST_STUB_DIR": str(self.stub_dir),
             "KINDLED_TEST_SUPERVISOR_HOLD": str(self.hold) if hold_supervisor else "",
@@ -58,7 +58,8 @@ class Bridge:
             "FAKE_CLAUDE_DIR": str(self.fake_dir),
             "FAKE_CLAUDE_RELEASE": str(self.fake_release),
         })
-        argv = [sys.executable, "-m", "brain.bridge.runner", "--persona-dir", str(self.pd), "--client-origin", "tests"]
+        argv = [sys.executable, "-m", "tests.bridge._hooked_bridge", "--persona-dir", str(self.pd),
+                "--client-origin", "tests"]
         if idle_s is not None:
             argv += ["--idle-shutdown-seconds", str(idle_s)]
 
@@ -68,7 +69,7 @@ class Bridge:
 
         self.proc = subprocess.Popen(argv, env=env, cwd=str(tmp), preexec_fn=_pre, start_new_session=new_group,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.state = self._wait_ready()
+        self.state = self._wait_ready() if ready else None
 
     def _wait_ready(self) -> state_file.BridgeState:
         deadline = time.monotonic() + START_TIMEOUT_S
@@ -279,11 +280,11 @@ def test_a_waiting_cmd_run_keeps_its_fresh_record(tmp_path, bridges):
     lock keeps the record it writes when it takes over."""
     b = Bridge(tmp_path, tasks=1)
     bridges.append(b)
-    env = dict(os.environ, KINDLED_HOME=str(b.home), PYTHONPATH=str(REPO), KINDLED_TEST_HOOKS="1",
-               KINDLED_TEST_STUB_TASKS="0")
+    env = dict(os.environ, KINDLED_HOME=str(b.home), PYTHONPATH=str(REPO), KINDLED_TEST_STUB_TASKS="0")
     waiter = subprocess.Popen(
         [sys.executable, "-c",
-         "import sys; from types import SimpleNamespace; from brain.bridge import daemon; "
+         "import sys; from types import SimpleNamespace; import tests.bridge._hooked_bridge as h; h.install(); "
+         "from brain.bridge import daemon; "
          "sys.exit(daemon.cmd_run(SimpleNamespace(persona='nell', idle_shutdown=0, client_origin='tests')))"],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
@@ -329,3 +330,21 @@ def test_a_runner_started_with_sighup_ignored_keeps_ignoring_it(tmp_path, bridge
     assert b.proc.poll() is None and b.record().phase == "running"
     assert b.post("/supervisor/shutdown", {"reason": "user_stop"}).status_code == 202
     assert b.wait_exit() == 0
+
+
+def test_a_run_whose_startup_fails_is_recorded_as_a_crash_and_exits_non_zero(tmp_path, bridges):
+    """#177 point 1 (pre-merge review O-1): a bridge whose lifespan startup raises (here an unreadable memories.db)
+    never served and was never asked to stop. uvicorn's run() returns normally after "Application startup failed",
+    so the after-run decision must not record a requested stop: the record says "crash" (not clean) and the exit
+    status is non-zero, so the app's crash watchdog and the service managers restart it."""
+
+    def corrupt_db(pd: Path) -> None:
+        (pd / "memories.db").write_bytes(b"this is not an sqlite database " * 200)
+
+    b = Bridge(tmp_path, prepare=corrupt_db, ready=False)
+    bridges.append(b)
+    rc = b.wait_exit(START_TIMEOUT_S)
+    assert rc not in (0, 2), rc  # 2 is the runner's "already running" refusal
+    st = b.record()
+    assert st is not None and st.pid == b.proc.pid
+    assert st.stop_reason == "crash" and st.shutdown_clean is False and st.phase != "stopped"

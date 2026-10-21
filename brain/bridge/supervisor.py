@@ -39,6 +39,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
+from dataclasses import replace as dc_replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -673,6 +674,7 @@ def run_folded(
                 ):
                     model_failures = 0
                     eligible_pending = 0
+                    soul_deferred = False
                     try:
                         model_failures, eligible_pending = _run_soul_review_tick(
                             persona_dir,
@@ -687,16 +689,23 @@ def run_folded(
                         from brain.soul.review import count_eligible_pending
 
                         eligible_pending = count_eligible_pending(persona_dir)
+                        soul_deferred = True
                     except Exception:
                         logger.exception("supervisor soul-review tick raised")
                         model_failures = 1  # a crashed tick counts as a failure → backoff
+                    prev_soul_failures = soul_cadence_state.consecutive_failures
                     soul_cadence_state = soul_cadence.compute_next_state(
                         now=datetime.now(UTC),
                         model_failures=model_failures,
                         eligible_pending=eligible_pending,
                         normal_interval_s=soul_review_interval_s,
-                        prev_failures=soul_cadence_state.consecutive_failures,
+                        prev_failures=prev_soul_failures,
                     )
+                    if soul_deferred:
+                        # Neither a failure nor a clean pass (review of #458): keep the 429 back-off count.
+                        soul_cadence_state = dc_replace(
+                            soul_cadence_state, consecutive_failures=prev_soul_failures
+                        )
                     try:
                         soul_cadence.save_cadence_state(persona_dir, soul_cadence_state)
                     except OSError:

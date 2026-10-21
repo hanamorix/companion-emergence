@@ -21,6 +21,7 @@ from typing import Any
 
 from brain.attunement.budget import consume_call as _attunement_consume_call
 from brain.attunement.budget import get_remaining as _attunement_budget_remaining
+from brain.attunement.budget import lock as _attunement_budget_lock
 from brain.attunement.crystallise import check_crystallisations
 from brain.attunement.detector import run_detector, should_run_detector
 from brain.attunement.store import (
@@ -157,10 +158,6 @@ def _run_attunement_pass2(
     buffer_slice: list[BufferTurn],
 ) -> None:
     try:
-        # #473: check the daily budget now (read-only); charge it only after a detector call that was not refused
-        # (success or another failure). The drain lock makes the check-then-charge exclusive.
-        if _attunement_budget_remaining(persona_dir, now=datetime.now(UTC)) <= 0:
-            return  # budget exhausted; defer silently
         user_name = ""
         user_pronouns = None
         try:  # same fail-soft PersonaConfig read as build_system_message
@@ -171,15 +168,20 @@ def _run_attunement_pass2(
             user_pronouns = cfg.user_pronouns
         except Exception:  # noqa: BLE001
             pass
-        output = run_detector(
-            buffer_slice=buffer_slice,
-            reply_text=reply_text,
-            companion_name=persona_dir.name,
-            user_name=user_name,
-            user_pronouns=user_pronouns,
-            persona_dir=persona_dir,
-        )
-        _attunement_consume_call(persona_dir, now=datetime.now(UTC))
+        # #473: check the daily budget now (read-only); charge it only after a detector call that was not refused
+        # (success or another failure). The budget lock makes the check-then-charge one step (review O-7).
+        with _attunement_budget_lock(persona_dir):
+            if _attunement_budget_remaining(persona_dir, now=datetime.now(UTC)) <= 0:
+                return  # budget exhausted; defer silently
+            output = run_detector(
+                buffer_slice=buffer_slice,
+                reply_text=reply_text,
+                companion_name=persona_dir.name,
+                user_name=user_name,
+                user_pronouns=user_pronouns,
+                persona_dir=persona_dir,
+            )
+            _attunement_consume_call(persona_dir, now=datetime.now(UTC))
         write_current_read(persona_dir, output.current_read)
         merge_into_learned(
             persona_dir,

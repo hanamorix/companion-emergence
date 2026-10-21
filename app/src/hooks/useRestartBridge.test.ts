@@ -124,8 +124,25 @@ function mocks() {
     start: vi.spyOn(appConfig, "ensureBridgeRunning").mockImplementation(async () => {
       w = fresh();
     }),
-    snapshot: vi.spyOn(bridge, "snapshotActiveSession").mockResolvedValue(jsonResponse(200)),
+    // Every HTTP request that is not one of the mocked helpers above reaches fetch (outside Tauri the credentials
+    // fall back to the dev URL); its URL is kept for (a). The bridge reports an open session, so a pre-stop save
+    // (the old flow: GET /sessions/active, then POST /sessions/snapshot) would reach the snapshot request; anything
+    // else is refused like a closed port.
+    fetch: vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      if (requestPath(input) === "/sessions/active") return jsonResponse(200, { session_id: "s-open" });
+      throw new TypeError("fetch failed");
+    }),
   };
+}
+
+function requestPath(input: unknown): string {
+  const url = input instanceof Request ? input.url : String(input);
+  return new URL(url, "http://127.0.0.1").pathname;
+}
+
+/** The paths of every request that reached fetch. */
+function requestedPaths(fetchSpy: { mock: { calls: unknown[][] } }): string[] {
+  return fetchSpy.mock.calls.map(([input]) => requestPath(input));
 }
 
 async function advance(ms: number): Promise<void> {
@@ -184,7 +201,7 @@ describe("useRestartBridge: a new bridge (#456)", () => {
     await expect(run.done()).resolves.toBe(true);
     expect(result.current.state).toBe("reconnecting");
 
-    expect(m.snapshot).not.toHaveBeenCalled(); // (a)
+    expect(requestedPaths(m.fetch)).not.toContain("/sessions/snapshot"); // (a) no pre-stop save
     expect(m.force).not.toHaveBeenCalled(); // (b) nothing writes a stop intent on a graceful stop
     expect(m.hardExit).not.toHaveBeenCalled();
     expect(result.current.offerHardExit).toBe(false);

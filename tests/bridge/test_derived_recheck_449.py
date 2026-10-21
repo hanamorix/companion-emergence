@@ -21,7 +21,7 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
-from brain.bridge import model_error, provider_auth
+from brain.bridge import model_error, provider_auth, shutdown_progress
 from brain.bridge import server as server_mod
 from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER, resolve_tier_model
 from brain.bridge.provider import ClaudeCliProvider
@@ -428,6 +428,7 @@ def test_a_second_start_within_the_reprobe_interval_does_not_probe_again(persona
         assert run.calls_for(DERIVED) == 1
         assert _stamp_path(persona_dir).exists()
         for _ in range(3):  # a crash loop
+            shutdown_progress.reset_for_tests()  # each start is a new bridge process in production
             with TestClient(_app(persona_dir, monkeypatch)) as c:
                 time.sleep(0.2)
                 assert getattr(c.app.state, "derived_recheck_task", None) is None

@@ -324,9 +324,9 @@ export async function newSession(persona: string): Promise<string> {
  * treats a throw the same as null (transient network flake).
  *
  * Part of the F-201 sticky-session reattach: combined with the
- * server-side hydration path and the non-destructive shutdown drain,
- * this lets Cmd-Q + reopen pick up mid-thread instead of starting a
- * fresh session every cold start.
+ * server-side hydration path (a bridge stop leaves the session buffers
+ * on disk), this lets Cmd-Q + reopen pick up mid-thread instead of
+ * starting a fresh session every cold start.
  */
 export async function fetchActiveSession(persona: string): Promise<string | null> {
   const r = await bridgeFetch(persona, (creds) =>
@@ -464,51 +464,13 @@ export async function closeSession(
   return (await r.json()) as CloseSessionResponse;
 }
 
-// ── Bridge restart support (v0.0.14) ───────────────────────────────────
-
-/**
- * Close whichever session the bridge currently has open.
- *
- * Used by the restart-bridge flow as the "safe path" step: looks up the
- * active session, closes it (commits buffer + snapshots memories), then
- * returns. Returns a synthetic 204 when there's nothing to close so the
- * caller can treat "no active session" the same as a successful close
- * without parsing a body. Per spec §6.2 the restart hook treats any 4xx
- * from the underlying close as success too — only 5xx + timeouts force
- * escalation — so this helper deliberately resolves rather than throws
- * on non-2xx, returning the raw Response for the hook to inspect.
- */
-export async function closeActiveSession(
-  persona: string,
-  signal?: AbortSignal,
-): Promise<Response> {
-  let sessionId: string | null = null;
-  try {
-    sessionId = await fetchActiveSession(persona);
-  } catch {
-    // Bridge can't tell us — fall through, hook proceeds to shutdown.
-    return new Response(null, { status: 204 });
-  }
-  if (sessionId === null) {
-    return new Response(null, { status: 204 });
-  }
-  return bridgeFetch(persona, (creds) =>
-    fetch(`${creds.url}/sessions/close`, {
-      method: "POST",
-      headers: authHeaders(creds),
-      body: JSON.stringify({ session_id: sessionId }),
-      signal,
-    }),
-  );
-}
-
 /**
  * Extract memories from a session's live buffer without deleting the buffer.
  *
  * Non-destructive variant of closeSession: uses a cursor sidecar to extract
  * only turns added since the previous snapshot. The raw replay buffer is
  * preserved on disk so a future close or finalise pass can still commit it.
- * Use this wherever replay buffer preservation is required (app close, restart).
+ * Use this wherever replay buffer preservation is required (app close).
  */
 export async function snapshotSession(
   persona: string,
@@ -534,36 +496,7 @@ export async function snapshotSession(
   return (await r.json()) as CloseSessionResponse;
 }
 
-/**
- * Snapshot whichever session the bridge currently has open, without closing it.
- *
- * Non-destructive variant of closeActiveSession: looks up the active session
- * and snapshots it (buffer preserved). Returns a synthetic 204 when there is
- * nothing to snapshot so the caller can treat "no active session" identically
- * to a successful snapshot.
- */
-export async function snapshotActiveSession(
-  persona: string,
-  signal?: AbortSignal,
-): Promise<Response> {
-  let sessionId: string | null = null;
-  try {
-    sessionId = await fetchActiveSession(persona);
-  } catch {
-    return new Response(null, { status: 204 });
-  }
-  if (sessionId === null) {
-    return new Response(null, { status: 204 });
-  }
-  return bridgeFetch(persona, (creds) =>
-    fetch(`${creds.url}/sessions/snapshot`, {
-      method: "POST",
-      headers: authHeaders(creds),
-      body: JSON.stringify({ session_id: sessionId }),
-      signal,
-    }),
-  );
-}
+// ── Bridge restart support (v0.0.14) ───────────────────────────────────
 
 /**
  * Ask the bridge to stop (#456). 202: the stop began. 503 `{"code": "bridge_stopping"}`: it had begun already. The
