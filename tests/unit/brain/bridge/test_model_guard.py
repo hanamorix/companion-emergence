@@ -223,6 +223,20 @@ def _shape_of(p: Parsed, node: ast.Constant) -> str | None:
     return None
 
 
+def _is_assembly_piece(p: Parsed, node: ast.Constant) -> bool:
+    """A string starting ``claude-`` that is one piece of a larger string: an f-string part, a ``+`` or ``%`` operand,
+    or the template of ``.format(...)``. Such a piece completes to a model id at run time, which G1's whole-literal
+    match cannot see."""
+    if not node.value.startswith("claude-") or node.value.startswith("claude-cli"):  # claude-cli is the provider name
+        return False
+    parent = p.parents.get(id(node))
+    if isinstance(parent, ast.JoinedStr):
+        return True
+    if isinstance(parent, ast.BinOp) and isinstance(parent.op, (ast.Add, ast.Mod)):
+        return True
+    return isinstance(parent, ast.Attribute) and parent.attr == "format" and isinstance(p.parents.get(id(parent)), ast.Call)
+
+
 def _is_model_literal(value: str) -> bool:
     return value in ALIAS_WORDS or bool(ID_FULL.fullmatch(value)) or bool(ID_PROSE.search(value))
 
@@ -233,6 +247,9 @@ def check_g1(source: str, relpath: str, allow=G1_ALLOW, used: set | None = None)
     out: list[str] = []
     for node in ast.walk(p.tree):
         if not (isinstance(node, ast.Constant) and isinstance(node.value, str)) or id(node) in docs:
+            continue
+        if _is_assembly_piece(p, node):
+            out.append(f"G1 {relpath}:{node.lineno}: model id assembled from pieces ({node.value[:60]!r})")
             continue
         if not _is_model_literal(node.value):
             continue
@@ -599,6 +616,10 @@ _VIOLATING = {
     "full_id_literal": "X = 'claude-sonnet-5'\n",
     "full_id_with_version_digits": "X = 'claude-3-5-sonnet-20241022'\n",
     "full_id_in_prose": "X = 'use a full id such as claude-opus-5 here'\n",
+    "id_assembled_in_an_fstring": "def f(fam):\n    return f'claude-{fam}-5'\n",
+    "id_assembled_by_concatenation": "def f(fam):\n    return 'claude-' + fam + '-5'\n",
+    "id_assembled_by_percent_format": "def f(fam):\n    return 'claude-%s-5' % fam\n",
+    "id_assembled_by_format_call": "def f(fam):\n    return 'claude-{}-5'.format(fam)\n",
 }
 
 
@@ -633,6 +654,11 @@ def test_fixture_g1_allow_entry_is_shape_specific() -> None:
 def test_fixture_g1_does_not_flag_unrelated_claude_words() -> None:
     src = "A = 'claude-cli'\nB = 'claude-config'\nC = 'claude-work'\nD = 'claude-tool'\nE = 'the claude CLI'\n"
     assert check_g1(src, "x.py") == []
+    # a "claude-" prefix TEST is not id assembly; a prefix piece that a variable completes is
+    assert check_g1("def f(v):\n    return v.startswith('claude-')\n", "x.py") == []
+    assert check_g1("def f(n):\n    return f'claude-{n}'\n", "x.py") != []  # a prefix a variable completes can build any id
+    assert check_g1("def f(n):\n    return f'the claude CLI {n}'\n", "x.py") == []
+    assert check_g1("def f(m):\n    return 'claude-cli:' + m\n", "x.py") == []  # the provider label is not a model id
 
 
 # ---------------------------------------------------------------------------

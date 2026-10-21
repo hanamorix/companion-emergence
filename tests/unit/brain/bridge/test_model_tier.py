@@ -8,7 +8,10 @@ guard that nothing outside this module chooses a model is in test_model_guard.py
 from __future__ import annotations
 
 import io
+import json
 import re
+import subprocess
+import sys
 import tokenize
 from pathlib import Path
 
@@ -71,9 +74,20 @@ def _claude_cli_persona(tmp_path: Path) -> Path:
 
 
 def test_the_seven_jobs_are_registered_with_their_defaults() -> None:
-    """The registry after importing model_tier holds exactly these seven model keys with these defaults."""
-    registered = {k: v for k, v in tunables._registry.items() if k.startswith("model.")}
-    assert registered == dict(_EXPECTED_JOBS.values())
+    """A fresh process that imports model_tier registers exactly these seven model keys with these defaults.
+
+    A subprocess, not the live registry: the registry is process-global and other tests clear it
+    (``tunables._reset_for_tests``), so reading it here depended on which tests ran earlier in the same process (the shipped-runtime
+    CI job runs a subset in which a clearing test comes first).
+    """
+    code = (
+        "import json, brain.tunables as t; import brain.bridge.model_tier; "
+        "print(json.dumps({k: v for k, v in t._registry.items() if k.startswith('model.')}))"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], cwd=_REPO_ROOT, capture_output=True, text=True, check=True, timeout=120
+    ).stdout
+    assert json.loads(out.strip().splitlines()[-1]) == dict(_EXPECTED_JOBS.values())
     assert set(CLAUDE_TIERS) == set(_EXPECTED_JOBS)
     for tier, (_key, default) in _EXPECTED_JOBS.items():
         assert shipped_default(tier) == default
