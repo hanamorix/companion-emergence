@@ -326,6 +326,7 @@ def test_finalize_survives_a_fault_while_setting_a_chunk_aside(world, monkeypatc
     # poison_unextracted_span. A fault there for one session (here a buffer that vanished mid-way) must not escape and abort the
     # sweep for the others.
     import brain.ingest.pipeline as pipeline
+    from brain.ingest.buffer import read_backoff
 
     persona, store, hebbian = world
     _seed(persona, "sess_a_race")
@@ -344,6 +345,10 @@ def test_finalize_survives_a_fault_while_setting_a_chunk_aside(world, monkeypatc
 
     assert sorted(r.session_id for r in reports) == ["sess_a_race", "sess_b_free"]
     assert (persona / "active_conversations" / "poison" / "sess_b_free.span.jsonl").exists()
+    assert read_backoff(persona, "sess_b_free") is None  # its chunk was set aside: the failure record is cleared
+    # The faulted session keeps its failure record, so the next tick tries to set its chunk aside again.
+    kept = read_backoff(persona, "sess_a_race")
+    assert kept is not None and kept["failures"] >= 3
 
 
 # --- round-4 S2: find_json_object_block is linear on a reply of many unclosed braces -------------------------------------
