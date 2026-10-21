@@ -356,6 +356,61 @@ describe("ChatPanel — a send while the mount call is still pending (#523 C15)"
   });
 });
 
+describe("ChatPanel — a send while its own session lookup is pending (#523, main ruling M7)", () => {
+  // The send path asks /sessions/active itself; during a slow launch rollover that call can take minutes. The user's
+  // message must show at once (pending) and a second send must not be possible until the session resolves.
+  const mockedFetchActive = fetchActiveSession as unknown as ReturnType<typeof vi.fn>;
+  const mockedNewSession = newSession as unknown as ReturnType<typeof vi.fn>;
+  const mockedStreamChat = streamChat as unknown as ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    mockedFetchActive.mockReset();
+    mockedNewSession.mockReset();
+    mockedStreamChat.mockReset();
+    mockedStreamChat.mockImplementation(async () => () => undefined);
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("shows the message at once and blocks a second send until the session resolves", async () => {
+    let resolveSend: (sid: string | null) => void = () => undefined;
+    mockedFetchActive
+      .mockResolvedValueOnce(null) // the mount call: no active session
+      .mockImplementationOnce(() => new Promise<string | null>((r) => (resolveSend = r))); // the send's own call: pending
+    render(<ChatPanel persona="kestrel" />);
+    await waitFor(() => expect(mockedFetchActive).toHaveBeenCalledTimes(1));
+    const textarea = screen.getByPlaceholderText(/^Write to/) as HTMLTextAreaElement;
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: "first wobblet line" } });
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+    });
+    // Shown at once, while the session lookup is still pending.
+    expect(screen.getByText("first wobblet line")).toBeInTheDocument();
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: "second wobblet line" } });
+    });
+    const sendBtn = screen.getByRole("button", { name: /^send$/i });
+    expect(sendBtn).toBeDisabled();
+    await act(async () => {
+      fireEvent.click(sendBtn);
+      fireEvent.keyDown(textarea, { key: "Enter" });
+    });
+    expect(mockedFetchActive).toHaveBeenCalledTimes(2); // no second session lookup: the second send did not start
+    await act(async () => {
+      resolveSend("s_rolled");
+    });
+    await waitFor(() => expect(mockedStreamChat).toHaveBeenCalledTimes(1));
+    const [, sid, text] = mockedStreamChat.mock.calls[0] as [string, string, string, unknown];
+    expect(sid).toBe("s_rolled");
+    expect(text).toBe("first wobblet line");
+    expect(mockedNewSession).not.toHaveBeenCalled();
+  });
+});
+
 describe("ChatPanel — recovery banner (Phase 3.B)", () => {
   afterEach(() => {
     cleanup();

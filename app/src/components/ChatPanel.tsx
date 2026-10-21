@@ -42,6 +42,8 @@ interface Message {
   imageThumb?: string;
   /** Initiate reach-out bubble — renders a ✶ marker. */
   reachedOut?: boolean;
+  /** Sent, but the session it goes to is still being resolved (a slow launch rollover, #523): shown dimmed. */
+  pending?: boolean;
 }
 
 interface StagedFile {
@@ -189,6 +191,9 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
     setInput(v);
   };
   const [streaming, setStreaming] = useState(false);
+  // #523 (main ruling M7): a send is resolving its session (GET /sessions/active can take minutes while a stale session
+  // rolls over). Its bubble is already shown, pending; no other send may start until it resolves.
+  const [resolvingSession, setResolvingSession] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Phase 4 (v0.0.15-alpha.2): map empty/whitespace-only strings to a
   // fixed user-facing copy so the error banner never renders blank
@@ -582,9 +587,25 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
   }): Promise<void> {
     const { text: outboundText, replyToAuditId, sharedFiles, imageThumb, prepend = [], onFailed } = opts;
 
+    const userMsg: Message = {
+      id: nextBubbleId(),
+      from: "hana",
+      text: outboundText,
+      time: formatTime(),
+      imageThumb,
+    };
+    // The bubble holds onto the previewUrl until unmount — track it so
+    // the unmount cleanup revokes it. Don't revoke here.
+    if (userMsg.imageThumb) trackedUrlsRef.current.add(userMsg.imageThumb);
+
     // Session resolve: reattach or create.
     let sessionId = sessionRef.current;
+    const resolving = !sessionId;
     if (!sessionId) {
+      // #523 (main ruling M7): the lookup below can take minutes during a launch rollover, so the message is shown now,
+      // pending, and no other send starts until the session is known.
+      setMessages((m) => [...m, ...prepend, { ...userMsg, pending: true }]);
+      setResolvingSession(true);
       // Phase B sticky-session reattach (F-201): if the bridge has a
       // recent session for this persona (younger than the finalise
       // threshold), pick up where we left off instead of creating a
@@ -600,24 +621,17 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
         try {
           sessionId = await newSession(persona);
         } catch (e) {
+          // Nothing was sent: take the pending bubble back (onFailed gives the text back to the composer).
+          setMessages((m) => m.filter((b) => b.id !== userMsg.id));
+          setResolvingSession(false);
           setErrorSafe(`Bridge unreachable: ${errString(e)}`);
           onFailed?.();
           return;
         }
       }
       sessionRef.current = sessionId;
+      setResolvingSession(false);
     }
-
-    const userMsg: Message = {
-      id: nextBubbleId(),
-      from: "hana",
-      text: outboundText,
-      time: formatTime(),
-      imageThumb,
-    };
-    // The bubble holds onto the previewUrl until unmount — track it so
-    // the unmount cleanup revokes it. Don't revoke here.
-    if (userMsg.imageThumb) trackedUrlsRef.current.add(userMsg.imageThumb);
 
     const replyId = nextBubbleId();
     const replyStub: Message = {
@@ -628,7 +642,11 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
       streaming: true,
     };
 
-    setMessages((m) => [...m, ...prepend, userMsg, replyStub]);
+    setMessages((m) =>
+      resolving
+        ? [...m.map((b) => (b.id === userMsg.id ? { ...b, pending: false } : b)), replyStub]
+        : [...m, ...prepend, userMsg, replyStub],
+    );
     setStreaming(true);
 
     // Every failed end of this turn: the error, a visible failure marker in place
@@ -730,7 +748,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
   async function send() {
     const text = input.trim();
     const ready = stagedFiles.filter((f) => f.status === "ready" && !!f.sha);
-    if ((!text && ready.length === 0) || streaming) return;
+    if ((!text && ready.length === 0) || streaming || resolvingSession) return;
     if (stagedFiles.some((f) => f.status === "uploading")) return;
     // Default text when nothing is typed (#268, #270): one image, one file,
     // or several of any kind. Persona-facing; wording is the owner's call.
@@ -783,7 +801,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
   // Prepends the reach-out body as a ✶-marked nell bubble, then sends
   // the reply through streamTurn with replyToAuditId threaded.
   const onCardSendReply = (auditId: string, text: string) => {
-    if (streaming || !text.trim()) return;   // don't double-stream; don't send empty
+    if (streaming || resolvingSession || !text.trim()) return;   // don't double-stream; don't send empty
     const banner = activeBanners.find((b) => b.auditId === auditId);
     setActiveBanners((prev) => prev.filter((b) => b.auditId !== auditId));
     const prepend: Message[] = banner
@@ -841,7 +859,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
 
   const hasReadyFile = stagedFiles.some((f) => f.status === "ready" && !!f.sha);
   const anyUploading = stagedFiles.some((f) => f.status === "uploading");
-  const sendDisabled = !streaming && ((!input.trim() && !hasReadyFile) || anyUploading);
+  const sendDisabled = resolvingSession || (!streaming && ((!input.trim() && !hasReadyFile) || anyUploading));
 
   return (
     <div
@@ -1445,6 +1463,7 @@ function Bubble({
           lineHeight: 1.4,
           whiteSpace: "pre-wrap",
           wordBreak: "break-word",
+          opacity: msg.pending ? 0.6 : 1,
         }}
       >
         {msg.imageThumb && (
