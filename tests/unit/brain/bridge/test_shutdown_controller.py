@@ -182,17 +182,42 @@ def test_monitor_applies_a_signal_within_one_poll(own_record):
     assert exits == []
 
 
-def test_a_second_signal_is_a_hard_exit(own_record):
+_SIGHUP = getattr(__import__("signal"), "SIGHUP", None)
+
+
+@pytest.mark.parametrize(
+    "signals, hard_exit",
+    [
+        (("SIGINT", "SIGINT"), True),
+        (("SIGHUP", "SIGTERM"), False),
+        (("SIGTERM", "SIGTERM"), False),
+        (("SIGTERM", "SIGINT"), False),
+        (("SIGINT", "SIGTERM"), False),
+    ],
+    ids=["ctrl-c-twice", "hup-then-term", "term-twice", "term-then-ctrl-c", "ctrl-c-then-term"],
+)
+def test_only_a_second_ctrl_c_is_a_hard_exit(own_record, signals, hard_exit):
+    """P2 / D19 / C42 (c): a second Ctrl-C (SIGINT) during a stop hard-exits. Pre-merge review O-4: two different OS
+    signals in one stop (a closing terminal's SIGHUP then a session manager's SIGTERM), or a repeated SIGTERM, are not
+    a user's second Ctrl-C: the graceful stop goes on. Signals arrive through the server's real handler."""
+    import signal as _signal
+
+    import uvicorn
+
+    if "SIGHUP" in signals and _SIGHUP is None:
+        pytest.skip("no SIGHUP on this platform")
     c = BridgeShutdownController()
     c.configure(own_record)
-    c.bind_server(FakeServer())
+    server = _server_class()(uvicorn.Config(app=lambda *a: None))
+    server.controller = c
+    c.bind_server(server)
     exits: list[str] = []
     m = _monitor(own_record, c, exits)
-    c.note_signal()
-    m.poll_once()
-    c.note_signal()
-    m.poll_once()
-    assert exits == ["hard_exit"]
+    for name in signals:
+        server.handle_exit(getattr(_signal, name), None)
+        m.poll_once()
+    assert c.stopping
+    assert exits == (["hard_exit"] if hard_exit else [])
 
 
 def test_progress_record_follows_the_tasks_and_names_this_bridge(own_record):

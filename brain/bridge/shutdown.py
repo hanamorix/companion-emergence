@@ -7,7 +7,7 @@ instance, and API/idle/CLI paths request shutdown by setting ``server.should_exi
 bridge-wide shutdown flag and every registered stop event, marks bridge.json "stopping", and asks uvicorn to exit.
 HTTP and idle stops call it directly. An OS signal only sets plain attributes in the signal handler (no lock, Event or
 file I/O there: C6); the monitor thread applies them within one poll. While stopping, the monitor keeps the progress
-record current and honours a hard-exit request that names this bridge; a second OS signal is a hard exit (P2).
+record current and honours a hard-exit request that names this bridge; a second Ctrl-C (SIGINT) is a hard exit (P2).
 """
 
 from __future__ import annotations
@@ -62,6 +62,9 @@ class BridgeShutdownController:
         self._stop_events: list[threading.Event] = []
         # Written ONLY by the signal handler (main thread), read by the monitor: plain attributes, single writer.
         self.signal_count = 0
+        # SIGINTs only (Ctrl-C): the second one during a stop is the hard exit (P2). Other signals (a closing
+        # terminal's SIGHUP, a session manager's SIGTERM) start or continue the graceful stop (review O-4).
+        self.interrupt_count = 0
         self.signal_reason: str | None = None
         # Set by the runner's server once uvicorn's serve() has ended (its re-raised signal is not a new signal).
         self.serve_finished = False
@@ -156,9 +159,11 @@ class BridgeShutdownController:
 
     # ---------------------------------------------------------------- signal path (C6: attribute writes only)
 
-    def note_signal(self) -> None:
-        """Called from a signal handler: plain attribute writes, nothing else."""
+    def note_signal(self, sig: int | None = None) -> None:
+        """Called from a signal handler with the signal number: plain attribute writes, nothing else."""
         self.signal_count += 1
+        if sig == signal.SIGINT:
+            self.interrupt_count += 1
         if self.signal_reason is None:
             self.signal_reason = REASON_OS_SIGNAL
 
@@ -179,7 +184,7 @@ def make_server_class(base: type) -> type:
         def handle_exit(self, sig: int, frame: object) -> None:
             if sig != getattr(signal, "SIGHUP", None) and sig not in self._captured_signals:
                 self._captured_signals.append(sig)
-            self.controller.note_signal()
+            self.controller.note_signal(sig)
             self.should_exit = True
 
         @contextlib.contextmanager
@@ -215,7 +220,7 @@ def early_signal_handler(controller: BridgeShutdownController, server_holder: di
     def _handler(signum: int, frame: object) -> None:
         if controller.serve_finished:
             raise SystemExit(0)
-        controller.note_signal()
+        controller.note_signal(signum)
         server = server_holder.get("server")
         if server is not None:
             server.should_exit = True
@@ -227,7 +232,7 @@ class Monitor:
     """The bridge's watcher thread (D6): applies OS signals, writes the progress record, honours a hard-exit request.
 
     Polls every ``POLL_S``; each poll is fault-isolated; never dies while the bridge runs. ``hard_exit`` is called on a
-    second OS signal (P2) or a hard-exit request naming this bridge.
+    second Ctrl-C (SIGINT, P2) or a hard-exit request naming this bridge.
     """
 
     def __init__(
@@ -279,11 +284,10 @@ class Monitor:
         from brain.bridge import shutdown_progress
 
         c = self.controller
-        count = c.signal_count
-        if count >= 1 and not c.stopping:
+        if c.signal_count >= 1 and not c.stopping:
             c.begin_stop(c.signal_reason or REASON_OS_SIGNAL)
-        if count >= 2:
-            logger.warning("second stop signal: hard exit")
+        if c.interrupt_count >= 2:
+            logger.warning("second Ctrl-C: hard exit")
             self.hard_exit(REASON_HARD_EXIT)
             return
         # D6 (b): a request naming this pid + token is the only condition, whether or not a stop has begun (review
