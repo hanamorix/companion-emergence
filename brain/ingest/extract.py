@@ -91,32 +91,21 @@ def format_turn_line(turn: dict, user_label: str, assistant_label: str) -> str |
 
 def format_transcript(
     turns: list[dict],
-    max_tokens: int = 6000,
     *,
     user_name: str | None = None,
     assistant_name: str | None = None,
 ) -> str:
-    """Format turns as "speaker: text" lines, capped to max_tokens*4 chars.
+    """Format turns as ``"speaker: text"`` lines (``format_turn_line``) joined by newlines; summary rows are skipped.
 
-    The crude 4-chars-per-token estimate matches the OG implementation.
-    When the transcript is too long, the *tail* is kept — recent context
-    is more relevant for extraction.
+    Formatting only, never a cut: the size of one extraction call is bounded by the chunker
+    (``brain.ingest.ingest_utils.chunk_turns``), which splits a span on row boundaries so every row reaches the extractor.
 
-    user_name / assistant_name: when provided, replace the generic
-    "user:" / "assistant:" speaker labels with the actual names. This
-    disambiguates extraction when the assistant's replies reference
-    historical figures by name (Bug A in the 2026-05-05 audit-3:
-    Hana's framework work was attributed to Jordan because Jordan was
-    mentioned in the assistant's soul-context lines).
+    user_name / assistant_name: when provided, replace the generic "user" / "assistant" speaker labels (each falls back
+    to the generic label on its own when unset; see ``format_turn_line``).
     """
     user_label = user_name if user_name else "user"
     assistant_label = assistant_name if assistant_name else "assistant"
-    lines = [line for t in turns if (line := format_turn_line(t, user_label, assistant_label)) is not None]
-    text = "\n".join(lines)
-    cap = max_tokens * 4
-    if len(text) > cap:
-        text = text[-cap:]
-    return text
+    return "\n".join(line for t in turns if (line := format_turn_line(t, user_label, assistant_label)) is not None)
 
 
 def parse_extraction(raw: str | None) -> list[ExtractedItem] | None:

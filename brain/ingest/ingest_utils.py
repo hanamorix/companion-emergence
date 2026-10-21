@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 # The most characters of formatted transcript that one extraction call is given; a longer span is extracted in several
 # calls, oldest first. 24,000 is the per-call input bound every extraction has used since fb55643d (2026-04-26), where it
-# was written ``max_tokens=6000`` times a 4-chars-per-token guess. Keeping the value keeps each call's prompt size and
+# was written as a token budget times a 4-chars-per-token guess. Keeping the value keeps each call's prompt size and
 # per-call behaviour as they were, so chunking changes only how much of a span reaches the extractor. An ops bound on one
 # background call's input (like ``files.read_max_bytes``), not physiology. Measured in characters, the unit it bounds.
 _CHUNK_CHARS_DEFAULT: int = tunables.register("ingest.extraction_chunk_chars", 24_000)

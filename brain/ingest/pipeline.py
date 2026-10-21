@@ -250,7 +250,6 @@ def _close_session_locked(
     assistant_name = persona_dir.name
     transcript = format_transcript(
         turns,
-        max_tokens=int(cfg.get("max_transcript_tokens", 6000)),
         user_name=user_name,
         assistant_name=assistant_name,
     )
@@ -463,7 +462,6 @@ def _extract_session_snapshot_locked(
     assistant_name = persona_dir.name
     transcript = format_transcript(
         turns,
-        max_tokens=int(cfg.get("max_transcript_tokens", 6000)),
         user_name=user_name,
         assistant_name=assistant_name,
     )
