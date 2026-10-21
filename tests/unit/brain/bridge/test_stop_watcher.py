@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from brain.bridge import daemon, shutdown_progress, state_file, stop_watch
+from brain.bridge.kill import KillResult
 
 PID, TOKEN = 4242, "linux:b:4242:7"
 T0 = 1_000_000.0
@@ -81,7 +82,7 @@ def _watch(pd, clock, *, interactive=True, answer=None, timeout=180.0, kill=None
 
     rc = stop_watch.watch_stop(
         pd, pid=PID, token=TOKEN, timeout=timeout, interactive=interactive, now=clock.now, sleep=clock.sleep,
-        prompt=prompt, out=out.append, kill=kill or (lambda **k: SimpleNamespace(outcome="killed", survivors=[])),
+        prompt=prompt, out=out.append, kill=kill or (lambda **k: KillResult("killed", "bridge killed")),
     )
     answered.set()
     return rc, out
@@ -159,10 +160,25 @@ def test_an_ignored_hard_exit_escalates_to_the_kill_helper_after_the_timeout(pd,
     def fake_kill(**kw):
         kills.append(kw)
         bridge.alive = False
-        return SimpleNamespace(outcome="killed", survivors=[])
+        return KillResult("killed", "bridge killed")
 
     rc, out = _watch(pd, clock, answer="y", timeout=30, kill=fake_kill)
     assert rc == 0 and len(kills) == 1 and kills[0]["skip_hard_exit_request"] is True
+
+
+def test_an_escalation_kill_that_leaves_survivors_is_not_a_success(pd, bridge):
+    """Review of #458 (M1): the terminal watcher shares the kill helper's one success rule. A kill that left a
+    descendant running returns 1, so `restart` and an install do not go on to start a second bridge beside it."""
+    clock = Clock()
+    bridge.record(["stuck"])
+
+    def fake_kill(**kw):
+        bridge.alive = False
+        return KillResult("killed", "processes still running after the kill: [4242]", [4242], True)
+
+    rc, out = _watch(pd, clock, answer="y", timeout=30, kill=fake_kill)
+    assert rc == 1
+    assert "[4242]" in "\n".join(out)
 
 
 def test_a_record_of_another_bridge_is_ignored(pd, bridge):

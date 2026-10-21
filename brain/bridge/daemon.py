@@ -508,7 +508,7 @@ def _await_readiness(persona_dir: Path, pid: int, log_path: Path, out: dict | No
     return 1
 
 
-def _ended_on_a_requested_stop(st: state_file.BridgeState | None) -> bool:
+def _ended_on_a_plain_stop(st: state_file.BridgeState | None) -> bool:
     """The record says its bridge ended on a plain ``nell supervisor stop`` (user_stop): a person asked for no bridge.
     Not a restart's stop (app_restart; manual_restart, which ``nell supervisor restart`` records) nor a hard exit
     (it may end a restart): a start follows those, and a queued service run that skipped would leave the restart's
@@ -528,7 +528,7 @@ def cmd_run(args) -> int:
     to supervise. A per-persona lock is held for the lifetime of the process; a
     run that finds it held waits for it (D4). A service run that waited for a
     running bridge does not start when that bridge ended on a plain ``nell
-    supervisor stop`` (see ``_ended_on_a_requested_stop``); after a restart's
+    supervisor stop`` (see ``_ended_on_a_plain_stop``); after a restart's
     stop, a hard exit, an idle stop, an OS signal or a crash it starts.
 
     A service run that follows starts which never proved themselves first waits out the next step of the start
@@ -589,7 +589,7 @@ def cmd_run(args) -> int:
             print("not starting: stopped on request", file=sys.stderr)
             logger.info("not starting: stopped on request (user kill of this boot)")
             return 0
-        if guarded and waited_for_a_bridge and _ended_on_a_requested_stop(state_file.read(persona_dir)):
+        if guarded and waited_for_a_bridge and _ended_on_a_plain_stop(state_file.read(persona_dir)):
             # Pre-merge review O-2: a service run queued behind a running bridge does not undo a plain `nell
             # supervisor stop` (exit 0: success to every service manager, so nothing restarts it).
             print("not starting: the running bridge was stopped on request", file=sys.stderr)
@@ -674,23 +674,22 @@ def _stop_began(s: state_file.BridgeState, persona_dir: Path, response: httpx.Re
     return bool(cur is not None and cur.pid == s.pid and cur.phase == "stopping")
 
 
-def _kill_succeeded(result) -> bool:  # noqa: ANN001
-    # A kill that left processes running is not a success (review of #458): the callers start a new bridge on exit 0.
-    return result.outcome in ("killed", "not_running") and not result.survivors
-
-
 def _print_kill_result(result) -> int:  # noqa: ANN001
     print(result.message)
-    return 0 if _kill_succeeded(result) else 1
+    return 0 if result.succeeded else 1
 
 
 def cmd_stop(args, *, reason: str | None = "user_stop") -> int:
     """`nell supervisor stop` (#456 Q-A, D16, D22): ask the bridge to stop, then watch until it is gone.
 
+    ``reason`` is what the stop request tells the bridge to record: ``"user_stop"`` for a plain stop, ``None`` for a
+    restart's stop (recorded as ``manual_restart``).
+
     ``--kill``: the kill helper (a bridge run by an OS service first gets the hard-exit request and up to
-    ``--timeout`` to go, then its service manager's stop; any other bridge is killed at once). A pre-PR bridge (no
-    identity token): the old request, then the kill helper after a few seconds. A stale record: "not running". If the request fails and no stop is recorded: POSIX sends
-    SIGTERM when the identity holds; Windows refuses unless ``--force`` (then the kill helper).
+    ``--timeout`` to go, then its service manager's stop; any other bridge is killed at once). A kill that leaves a
+    process running exits 1 (``KillResult.succeeded``). A pre-PR bridge (no identity token): the old request, then
+    the kill helper after a few seconds. A stale record: "not running". If the request fails and no stop is recorded:
+    POSIX sends SIGTERM when the identity holds; Windows refuses unless ``--force`` (then the kill helper).
     """
     from brain.bridge import kill as kill_mod
     from brain.bridge import stop_watch
@@ -777,7 +776,7 @@ def _stop_pre_pr(persona_dir: Path, s: state_file.BridgeState, timeout: float) -
         time.sleep(0.2)
     if state_file.bridge_liveness(s, persona_dir) == state_file.ALIVE:
         result = kill_mod.kill_bridge(persona_dir, timeout=timeout)
-        if not _kill_succeeded(result):
+        if not result.succeeded:
             print(result.message, file=sys.stderr)
             return 1
     print("Stopped the previous version of the bridge. The next start will pick up anything left unfinished.")
@@ -940,17 +939,25 @@ def cmd_restart(args) -> int:
     """Stop the bridge, then start it again, only after the old bridge is gone (#456 C16 h).
 
     ``cmd_stop`` returns 0 only once the old bridge (its pid + token) is gone, or when none was running; restart then
-    starts. Any other result (still stopping without a terminal, a refused stop) aborts the restart with that code.
+    starts. Any other result (still stopping without a terminal, a refused stop) aborts the restart with that code. A
+    start that finds another one already under way (exit 2) waits for that bridge to answer.
     """
     print("stopping bridge...")
     # No reason: the bridge records "manual_restart", so a service run queued behind it starts (see
-    # _ended_on_a_requested_stop); a plain stop records "user_stop".
+    # _ended_on_a_plain_stop); a plain stop records "user_stop".
     stop_rc = cmd_stop(args, reason=None)
     if stop_rc != 0:
         print(f"restart aborted: stop failed (exit {stop_rc})", file=sys.stderr)
         return stop_rc
     print("starting bridge...")
-    return cmd_start(args)
+    rc = cmd_start(args)
+    if rc == 2:
+        # A start is already under way: a service run queued behind the old bridge woke at its death and holds the
+        # lock, so its bridge is coming up. Wait for that bridge, as the app does (exit 2 is its "start under way").
+        from brain.paths import get_persona_dir
+
+        return _await_service_readiness(get_persona_dir(args.persona), _READINESS_BUDGET_S, None)
+    return rc
 
 
 # Test seam: setting this Event from a test allows the follow-mode loop

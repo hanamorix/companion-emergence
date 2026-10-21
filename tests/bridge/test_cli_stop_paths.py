@@ -105,6 +105,24 @@ def test_kill_with_survivors_exits_nonzero(pd, sleeper, monkeypatch, capsys):
 
 # ---------------------------------------------------------------- C43: pre-PR bridges (D22)
 
+
+@posix
+def test_a_pre_pr_kill_that_leaves_survivors_is_not_a_success(pd, sleeper, monkeypatch, capsys):
+    """Review of #458 (M1): the pre-PR path shares the kill helper's one success rule (the old bridge's tree is the
+    survivor). Exit 1 and no "Stopped the previous version" line."""
+    _write(pd, pid=sleeper.pid, pid_token=None, identity=None)
+    assert state_file.is_legacy(state_file.read(pd))
+    monkeypatch.setattr(state_file, "bridge_liveness", lambda s, persona_dir: state_file.ALIVE)
+    monkeypatch.setattr(daemon, "_request_shutdown_via_http", lambda s, **k: (_ for _ in ()).throw(OSError("down")))
+    monkeypatch.setattr(daemon, "_PRE_PR_REQUEST_BUDGET_S", 0.0)
+    monkeypatch.setattr(kill, "kill_bridge", lambda persona_dir, persona=None, **kw: kill.KillResult(
+        "killed", "processes still running after the kill: [4242]", [4242], True))
+    assert daemon.cmd_stop(_stop_args()) == 1
+    cap = capsys.readouterr()
+    assert "Stopped the previous version" not in cap.out
+    assert "[4242]" in cap.err + cap.out
+
+
 _STUB_RUNNER = textwrap.dedent(
     """
     # A pre-PR bridge stand-in: writes an old-format bridge.json (no pid_token), answers the shutdown request with 202

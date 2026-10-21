@@ -74,3 +74,37 @@ def test_a_sync_route_after_the_seal_gets_the_same_bridge_stopping_body(tmp_path
         r = client.post("/kindled-link/self-test", headers=_AUTH)
     assert r.status_code == 503 and r.json()["code"] == "bridge_stopping", r.text
     assert ran == []
+
+
+def _endpoint(app, path: str, method: str):
+    return next(r.endpoint for r in app.routes if getattr(r, "path", None) == path and method in r.methods)
+
+
+def test_every_sync_route_but_health_is_a_counted_stop_task(tmp_path: Path):
+    """Review of #458 (M2): GET /sessions/active runs a rollover (final extraction, memory writes, buffer deletion) and
+    GET /kindled-link/my-code writes, in worker threads. Every synchronous route is counted except GET /health."""
+    client, _ = _client(tmp_path)
+    app = client.app
+    assert hasattr(_endpoint(app, "/sessions/active", "GET"), "__wrapped__")
+    assert hasattr(_endpoint(app, "/kindled-link/my-code", "GET"), "__wrapped__")
+    assert not hasattr(_endpoint(app, "/health", "GET"), "__wrapped__")
+
+
+def test_a_sessions_active_rollover_is_a_counted_stop_task_while_it_runs(tmp_path: Path, monkeypatch):
+    """Review of #458 (M2): a stop arriving while the rollover runs waits for it (the registry is not empty)."""
+    from brain.bridge import shutdown_progress
+
+    seen: list[list[str]] = []
+    monkeypatch.setattr("brain.ingest.buffer.list_active_sessions", lambda persona_dir: ["stale"])
+    monkeypatch.setattr("brain.ingest.buffer.read_session", lambda persona_dir, sid: [{"ts": "2020-01-01T00:00:00Z"}])
+
+    def _fake_rollover(*_a, **_k):
+        seen.append(shutdown_progress.registry.snapshot())
+        return "new-session"
+
+    monkeypatch.setattr("brain.chat.rollover.perform_rollover", _fake_rollover)
+    client, _ = _client(tmp_path)
+    with client:
+        r = client.get("/sessions/active", headers=_AUTH)
+    assert r.status_code == 200 and r.json() == {"session_id": "new-session"}, r.text
+    assert any("/sessions/active" in label for label in seen[0]), seen

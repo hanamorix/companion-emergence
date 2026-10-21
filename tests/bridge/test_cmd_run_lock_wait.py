@@ -127,8 +127,7 @@ def _stopped_on_request(persona_dir: Path, reason: str) -> None:
     state_file.write(persona_dir, cur)
 
 
-@pytest.mark.parametrize("reason", ["user_stop"])
-def test_a_service_run_waiting_for_a_bridge_does_not_undo_its_requested_stop(home, tmp_path, monkeypatch, reason):
+def test_a_service_run_waiting_for_a_bridge_does_not_undo_its_plain_stop(home, tmp_path, monkeypatch):
     """Pre-merge review O-2: a service-origin `nell supervisor run` queued behind a running bridge must not start a new
     bridge once that bridge has ended on a plain `nell supervisor stop` (user_stop): it exits 0 (success to every
     service manager, so nothing restarts it) without running."""
@@ -138,7 +137,7 @@ def test_a_service_run_waiting_for_a_bridge_does_not_undo_its_requested_stop(hom
         t, ran, result = _run_in_thread(monkeypatch, home, client_origin="task-scheduler")
         t.join(timeout=1.5)
         assert t.is_alive(), f"cmd_run returned {result.get('rc')} instead of waiting for the lock"
-        _stopped_on_request(home, reason)
+        _stopped_on_request(home, "user_stop")
         go.write_text("go")
         t.join(timeout=30)
         assert not t.is_alive()

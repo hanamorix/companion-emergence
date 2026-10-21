@@ -18,9 +18,11 @@ The sequence (plan I5 steps 1-7):
    before the first suspend or kill; then freeze the bridge and its tree, kill the bridge first, then the frozen tree.
 7. Poll "gone" over the bridge and everything remembered for ``timeout``; kill any survivor once more; report.
 
-The ``finally``: while the bridge's kill call has not returned, resume everything suspended and delete the intent
-(only if it still holds this nonce); after it has returned, kill the frozen and remembered descendants and keep the
-committed intent (the respawn guard honours it). Stop signals are ignored while the ``finally`` runs.
+The ``finally``: while the bridge's kill call has not returned, resume everything suspended, delete the intent
+(only if it still holds this nonce) and withdraw the hard-exit request this call wrote (only if it names this bridge),
+so an interrupted kill leaves nothing that could still end the bridge; after it has returned, kill the frozen and
+remembered descendants and keep the committed intent (the respawn guard honours it). Stop signals are ignored while
+the ``finally`` runs.
 """
 
 from __future__ import annotations
@@ -62,6 +64,13 @@ class KillResult:
     message: str
     survivors: list[int] = field(default_factory=list)
     committed: bool = False
+
+    @property
+    def succeeded(self) -> bool:
+        """The one success rule every caller uses (``cmd_stop``, the pre-PR stop, the terminal watcher): no bridge
+        is left and nothing it started is still running. A caller that goes on to start a new bridge on success must
+        never do so beside a survivor (review of #458)."""
+        return self.outcome in ("killed", "not_running") and not self.survivors
 
 
 # ---------------------------------------------------------------- the stop intent (D6 c, D25)

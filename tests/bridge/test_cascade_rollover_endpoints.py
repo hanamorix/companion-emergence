@@ -41,6 +41,11 @@ from brain.ingest.buffer import (
 
 
 def _build(persona_dir: Path) -> tuple[FastAPI, TestClient]:
+    from brain.bridge import shutdown_progress
+
+    # Each app is a new bridge process in production; a GET is a counted stop task now (C73), and an earlier app's
+    # teardown sealed the process-wide registry (the derived-recheck test resets between its apps the same way).
+    shutdown_progress.reset_for_tests()
     app = build_app(persona_dir=persona_dir, client_origin="tests")
     return app, TestClient(app)
 
