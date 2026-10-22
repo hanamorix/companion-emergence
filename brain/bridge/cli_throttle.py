@@ -37,7 +37,10 @@ from brain.health.json_io import Recovery, read_jsonl_tail
 
 log = logging.getLogger(__name__)
 
-_MAX_CONCURRENT_BACKGROUND = tunables.register("throttle.max_concurrent_background", 1)
+_MAX_CONCURRENT_BACKGROUND = tunables.register(
+    "throttle.max_concurrent_background", 1,
+    description="How many background Claude calls may run at the same time.",
+)
 
 
 def _max_concurrent_background() -> int:

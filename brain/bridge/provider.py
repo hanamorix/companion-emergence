@@ -73,11 +73,23 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # Matched by substring of the model id so short aliases ("sonnet") and
 # fully-qualified ids ("claude-sonnet-4-6") both resolve.
 _BUDGET_BY_TIER: tuple[tuple[str, float], ...] = (
-    ("haiku", tunables.register("provider.max_turn_budget_usd.haiku", 0.30)),
-    ("sonnet", tunables.register("provider.max_turn_budget_usd.sonnet", 0.75)),
-    ("opus", tunables.register("provider.max_turn_budget_usd.opus", 3.00)),
+    ("haiku", tunables.register(
+        "provider.max_turn_budget_usd.haiku", 0.30,
+        description="Safety cap on what one chat turn on a Haiku model may cost, in US dollars.",
+    )),
+    ("sonnet", tunables.register(
+        "provider.max_turn_budget_usd.sonnet", 0.75,
+        description="Safety cap on what one chat turn on a Sonnet model may cost, in US dollars.",
+    )),
+    ("opus", tunables.register(
+        "provider.max_turn_budget_usd.opus", 3.00,
+        description="Safety cap on what one chat turn on an Opus model may cost, in US dollars.",
+    )),
 )
-_BUDGET_FALLBACK: float = tunables.register("provider.max_turn_budget_usd.fallback", 1.50)
+_BUDGET_FALLBACK: float = tunables.register(
+    "provider.max_turn_budget_usd.fallback", 1.50,
+    description="Safety cap on what one chat turn on any other model may cost, in US dollars.",
+)
 
 # What json.loads raises on a line it cannot take: JSONDecodeError and, on a hostile line, a plain ValueError
 # (a 5000-digit run) or RecursionError (nesting beyond the recursion limit). JSONDecodeError is a ValueError.
@@ -291,7 +303,8 @@ _PROVIDER_CONTEXT_OPTION_KEYS = frozenset(
 # is deliberately not bounded by total wall-clock duration — long Opus
 # runs can take time. Overridable via $KINDLED_HOME/tunables.json (#55).
 _STREAM_PER_EVENT_IDLE_SECONDS: float = tunables.register(
-    "provider.stream_per_event_idle_seconds", 60.0
+    "provider.stream_per_event_idle_seconds", 60.0,
+    description="Seconds of silence from Claude in the middle of a reply before the reply is treated as stuck.",
 )
 
 # First-event budget. Wider than the per-event budget because Opus can
@@ -299,7 +312,8 @@ _STREAM_PER_EVENT_IDLE_SECONDS: float = tunables.register(
 # initial subprocess spawn +
 # system-prompt-file write + MCP server boot.
 _STREAM_FIRST_EVENT_SECONDS: float = tunables.register(
-    "provider.stream_first_event_seconds", 120.0
+    "provider.stream_first_event_seconds", 120.0,
+    description="Seconds to wait for Claude to begin a reply before the reply is treated as stuck.",
 )
 
 
@@ -326,7 +340,10 @@ _STREAM_EOF = object()
 # stands behind 5 seconds: it is the bound this path already used for the reader join before the knob
 # existed, and the steps run one after the other, so the worst case is a small multiple of it. A slow
 # machine raises it in tunables.json (`provider.child_exit_grace_seconds`).
-_CHILD_EXIT_GRACE_SECONDS: float = tunables.register("provider.child_exit_grace_seconds", 5.0)
+_CHILD_EXIT_GRACE_SECONDS: float = tunables.register(
+    "provider.child_exit_grace_seconds", 5.0,
+    description="Seconds the Claude program gets to finish its output and exit before it is stopped.",
+)
 
 # stderr kept for the failure detail (the detail uses its first 200 characters; the rest of a full pipe is
 # read and dropped so the child never blocks on a write): 64 KiB is Linux's default pipe capacity.

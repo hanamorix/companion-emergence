@@ -593,7 +593,10 @@ _CLOSE_HEARTBEAT_DEBOUNCE_S = 300.0
 # The client (app/src/streamChat.ts) kills the WS after 60s with no frame, so
 # the forward loop emits a `keepalive` frame on each silent interval to reset
 # that idle timer. 15s gives a 4x margin under the client's 60s budget.
-_STREAM_KEEPALIVE_SECONDS = tunables.register("bridge.stream_keepalive_seconds", 15.0)
+_STREAM_KEEPALIVE_SECONDS = tunables.register(
+    "bridge.stream_keepalive_seconds", 15.0,
+    description="Seconds of silence in a chat reply before the app is sent a keep-alive signal.",
+)
 
 
 def _stream_keepalive_seconds() -> float:
@@ -637,7 +640,10 @@ def _chat_error_detail(exc: BaseException, provider: Any) -> str:
 # (macOS) cuts an idle request at about 60 s; WebView2 and WebKitGTK are not known to cut earlier. A custom id
 # is also not replayed, so a cut request would show an error while the bridge still saves. 30 s keeps the
 # worst case (a hanging CLI) at half of that; a rejected id answers in seconds.
-_MODEL_CHECK_TIMEOUT_S = tunables.register("provider.model_check_timeout_seconds", 30.0)
+_MODEL_CHECK_TIMEOUT_S = tunables.register(
+    "provider.model_check_timeout_seconds", 30.0,
+    description="Seconds to wait when checking that a newly chosen model works.",
+)
 _MODEL_CHECK_PROMPT = "Reply with the single word OK."
 _MIN_PROBE_S = 1  # a probe given less than this is not started
 

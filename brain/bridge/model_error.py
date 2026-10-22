@@ -50,7 +50,10 @@ _CODE_MODEL_NOT_FOUND = re.compile(r"(?<![\w=-])error=model_not_found(?![\w-])")
 _MODEL_TOKEN = re.compile(r"(?<![\w=-])model=([^;\s]{1,80});")
 
 # Same cadence as provider_auth's re-probe interval: one WARNING per rejected model per quarter hour.
-WARN_INTERVAL_S: float = tunables.register("model_error.warn_interval_seconds", 900.0)
+WARN_INTERVAL_S: float = tunables.register(
+    "model_error.warn_interval_seconds", 900.0,
+    description="Seconds between repeated log warnings about the same rejected model.",
+)
 
 # Module-level clock so tests inject time.
 _monotonic = time.monotonic
