@@ -631,7 +631,7 @@ def test_b9_items_are_deduplicated_and_marked(kestrel, monkeypatch) -> None:
     persona, store, hebbian = kestrel
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
     known = "Bob keeps three snorvel buttons in a blue jar"
     m = Memory.create_new(content=known, memory_type="fact", domain="brain", emotions={})
     store.create(m)

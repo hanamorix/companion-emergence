@@ -405,11 +405,12 @@ def test_stream_emits_keepalive_during_silent_provider_stretch(persona_dir: Path
     from brain import paths
     from brain.bridge.chat import ChatResponse
 
-    # Tiny keepalive interval so the test doesn't sleep for the real 15s. The settings file holds every setting, so the
-    # interval is set the way a user would set it (in the file), not by patching the code default.
+    # Short keepalive interval so the test doesn't sleep for the real 15s. The settings file holds every setting, so the
+    # interval is set the way a user would set it (in the file), not by patching the code default. One second is the
+    # smallest interval an override may set (#524 raises anything lower to it), so the silent stretch below is longer.
     from tests.tunables_file import write_values
 
-    write_values(paths.get_home(), {"bridge.stream_keepalive_seconds": 0.05})
+    write_values(paths.get_home(), {"bridge.stream_keepalive_seconds": 1.0})
     monkeypatch.setenv("NELL_STREAM_CHUNK_DELAY_MS", "0")
 
     class _SlowFake:
@@ -419,7 +420,7 @@ def test_stream_emits_keepalive_during_silent_provider_stretch(persona_dir: Path
         def chat(self, messages, *, tools=None, options=None):
             # Simulate the model going silent (no streamed deltas) for well
             # over the keepalive interval before the reply lands.
-            _time.sleep(0.3)
+            _time.sleep(1.5)
             return ChatResponse(content="late reply", tool_calls=[])
 
         def generate(self, prompt, *, system=None):

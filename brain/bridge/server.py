@@ -608,7 +608,7 @@ _STREAM_KEEPALIVE_FLOOR_SECONDS = 1.0
 
 
 def _stream_keepalive_seconds() -> float:
-    """The keepalive interval: a ``tunables.json`` override when usable, else the default. Zero, a negative or a non-finite override would make
+    """The keepalive interval: a ``tunables.toml`` override when usable, else the default. Zero, a negative or a non-finite override would make
     the streams send frames or spaces in a tight loop: it is ignored (one warning) for the default; a positive value below
     ``_STREAM_KEEPALIVE_FLOOR_SECONDS`` is raised to it. A bool is rejected by ``get_tunable`` (wrong type)."""
     default = _STREAM_KEEPALIVE_SECONDS

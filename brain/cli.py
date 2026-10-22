@@ -641,6 +641,22 @@ def _memory_show_handler(args: argparse.Namespace) -> int:
     return 0
 
 
+def _live_bridge_state(persona_dir: Path) -> state_file.BridgeState | None:
+    """The persona's bridge state when its bridge is running, else None: a record with a port whose pid is the recorded
+    bridge by its identity token (#456 / #472: a live but reused pid is not a bridge). An identity that cannot be read
+    (UNKNOWN) counts as running (review MG-3): a caller that would spend model calls or write behind a bridge that may be
+    live defers to the bridge instead."""
+    state = state_file.read(persona_dir)
+    if (
+        state
+        and state.pid
+        and state.port
+        and state_file.bridge_liveness(state, persona_dir) in (state_file.ALIVE, state_file.UNKNOWN)
+    ):
+        return state
+    return None
+
+
 def _memory_backfill_extraction_handler(args: argparse.Namespace) -> int:
     """`nell memory backfill-extraction` (#523): re-extract conversation text the old extraction's tail cut never showed.
 
@@ -701,7 +717,7 @@ def _memory_backfill_extraction_handler(args: argparse.Namespace) -> int:
             f"({restart_note})."
         )
         return 0
-    if _bridge_running(persona_dir) is not None:
+    if _live_bridge_state(persona_dir) is not None:
         print(
             "the persona's bridge is running, so the plan is armed for it: it runs one chunk per lull "
             f"({restart_note})."
@@ -722,7 +738,7 @@ def _memory_backfill_extraction_handler(args: argparse.Namespace) -> int:
                 store=store,
                 hebbian=hebbian,
                 provider=build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING),
-                bridge_running=lambda: _bridge_running(persona_dir) is not None,
+                bridge_running=lambda: _live_bridge_state(persona_dir) is not None,
             )
         except KeyboardInterrupt:
             print("\ninterrupted: progress is kept (written after each chunk); run the command again to continue.")

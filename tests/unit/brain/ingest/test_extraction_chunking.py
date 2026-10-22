@@ -16,6 +16,7 @@ from brain.ingest import ingest_utils
 from brain.ingest.extract import format_transcript, format_turn_line
 from brain.ingest.ingest_utils import TurnChunk, chunk_turns, extraction_chunk_chars
 from brain.utils.time import lenient_utc
+from tests.tunables_file import write_values
 
 _T0 = datetime(2026, 10, 1, 20, 0, 0, tzinfo=UTC)
 
@@ -289,7 +290,7 @@ def tunables_home(tmp_path, monkeypatch):
 
 
 def _write_tunables(home, overrides) -> None:
-    (home / "tunables.json").write_text(json.dumps({"defaults": {}, "overrides": overrides}), encoding="utf-8")
+    write_values(home, overrides)
 
 
 def test_chunk_chars_default_is_registered_with_its_value(tunables_home) -> None:
