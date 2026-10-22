@@ -478,6 +478,56 @@ def _tunables_values_cache_reset() -> Iterator[None]:
     tunables._reset_values_cache()
 
 
+_REAL_TUNABLE_KEYS: frozenset[str] | None = None
+
+
+def _real_tunable_keys() -> frozenset[str]:
+    """Every literal key a ``tunables.register`` call in brain/ declares (an AST scan, once per session)."""
+    global _REAL_TUNABLE_KEYS
+    if _REAL_TUNABLE_KEYS is None:
+        import ast
+
+        keys: set[str] = set()
+        for path in (Path(__file__).resolve().parents[1] / "brain").rglob("*.py"):
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if (
+                    isinstance(node, ast.Call)
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[0].value, str)
+                    and (
+                        (isinstance(node.func, ast.Attribute) and node.func.attr == "register"
+                         and isinstance(node.func.value, ast.Name) and node.func.value.id == "tunables")
+                        or (path.name == "tunables.py" and isinstance(node.func, ast.Name) and node.func.id == "register")
+                    )
+                ):
+                    keys.add(node.args[0].value)
+        _REAL_TUNABLE_KEYS = frozenset(keys)
+    return _REAL_TUNABLE_KEYS
+
+
+@pytest.fixture(autouse=True)
+def _tunables_registry_restore() -> Iterator[None]:
+    """A test may clear the tunables registry (``_reset_for_tests``) or register throwaway keys. The registry that modules fill
+    at import time must survive for the tests after it, so restore it: the state before the test, plus any real brain key the
+    test's own imports registered (a module imported for the first time inside a test stays imported)."""
+    from brain import tunables
+
+    with tunables._lock:
+        saved = (dict(tunables._registry), dict(tunables._descriptions))
+    yield
+    real = _real_tunable_keys()
+    with tunables._lock:
+        kept = {k: v for k, v in tunables._registry.items() if k in real}
+        kept_desc = {k: v for k, v in tunables._descriptions.items() if k in real}
+        tunables._registry.clear()
+        tunables._registry.update(saved[0])
+        tunables._registry.update(kept)
+        tunables._descriptions.clear()
+        tunables._descriptions.update(saved[1])
+        tunables._descriptions.update(kept_desc)
+
+
 @pytest.fixture(autouse=True)
 def _cost_series_state_reset(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Cost-series increment (S146, S159, S163, S164): empty the in-process

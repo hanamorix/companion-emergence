@@ -142,6 +142,12 @@ def get_raw(key: str) -> Any:
     return values.get(key)
 
 
+def registered_keys() -> frozenset[str]:
+    """The keys registered in THIS process so far (a CLI process knows only the modules it imported; the bridge imports all)."""
+    with _lock:
+        return frozenset(_registry)
+
+
 def _type_ok(default: Any, value: Any) -> bool:
     # bool is an int subclass — check it first and strictly, both directions.
     if isinstance(default, bool):

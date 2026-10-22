@@ -1,7 +1,7 @@
 """Folding the retired per-persona model settings into the install-wide tunables lines (#529). Permanent backward compatibility.
 
 Before this change each persona's ``persona_config.json`` held a chat ``model`` and optional ``tier_models`` /
-``derived_unavailable``. The model is now one install-wide setting per job in ``tunables.json``
+``derived_unavailable``. The model is now one install-wide setting per job in ``tunables.toml``
 (``brain.bridge.model_tier``). There is no way to know which version an install is upgrading from, now or later, so
 this module stays: whenever a persona config in the old format is found, it is brought forward the first time it is
 seen, and an old file that turns up later (an imported or restored persona) is handled the same way.
@@ -15,15 +15,15 @@ before ``touch_last_opened``, and (b) at the start of the CLI write commands. It
    provider kind never chose a Claude model, so its saved value is never applied). With no candidate nothing is written
    and NO marker is written, so a persona imported later still goes through the decision. Otherwise the candidate with
    the newest ``last_opened_at`` wins (the file's mtime only when that field is absent or unusable; a tie goes to the
-   first name alphabetically) and its values are written with ``set_job_models(..., only_missing=True)`` (a setting
-   the user already made is never overwritten); a value equal to the job's shipped default is not written, so a saved
+   first name alphabetically) and its values are written with ``set_job_models(..., only_if_default=True)`` (a job whose
+   value already differs from its shipped default was changed by the user and is never overwritten); a value equal to the job's shipped default is not written, so a saved
    ``sonnet`` follows the shipped default. "Most recently used" is not "model most recently changed"; the decision
    runs before the launching persona's ``last_opened_at`` is touched, so a more recently used OTHER persona can win.
    That is the stated rule.
 2. CLEARING (for the launching persona, on EVERY start until its legacy keys are gone, marker or not). A persona the
    decision above did not consider (its config appeared after the decision, or it was skipped by the scan) has its valid
-   Claude values applied the same way: written with ``only_missing=True``, so an install that has no setting for the job
-   yet takes the persona's value, and an install that already has one keeps it and the persona's value is discarded
+   Claude values applied the same way: written with ``only_if_default=True``, so an install whose value for the job still
+   equals the shipped default takes the persona's value, and an install that has changed it keeps it and the persona's value is discarded
    with a log line. If that write cannot be made nothing is cleared (the next start retries). Then the persona's own
    legacy keys are removed from its own file, and every saved model text removed without being applied is logged (an
    unusable text at WARNING, a valid one at INFO), so no saved value ever disappears without a trace. The cost per
@@ -174,7 +174,7 @@ def _decide(home: Path) -> tuple[bool, frozenset[str]]:
         with locked_within(marker, dev_constants.SETTINGS_FILE_LOCK_WAIT_S):
             if marker.exists():
                 return True, frozenset()  # another process decided while this one was reading
-            written = set_job_models(dict(updates), only_missing=True) if updates else {}
+            written = set_job_models(dict(updates), only_if_default=True) if updates else {}
             skipped_existing = sorted(set(updates) - set(written))
             if skipped_existing:
                 logger.info("model migration: %s already hold a setting; left as they are", skipped_existing)
@@ -201,12 +201,12 @@ def _decide(home: Path) -> tuple[bool, frozenset[str]]:
 
 
 def _apply_late(name: str, chat: str | None, tiers: dict[str, str]) -> bool:
-    """Apply a persona's valid saved values that the decision did not consider: written only where the install has no
-    setting yet, otherwise discarded with a log. False when the write could not be made (nothing may be cleared)."""
+    """Apply a persona's valid saved values that the decision did not consider: written only where the install's value still equals the
+    shipped default, otherwise discarded with a log. False when the write could not be made (nothing may be cleared)."""
     cand = _Candidate(name, chat, tiers, datetime.fromtimestamp(0, UTC), "late")
     updates = _winner_updates([cand])
     try:
-        written = set_job_models(dict(updates), only_missing=True) if updates else {}
+        written = set_job_models(dict(updates), only_if_default=True) if updates else {}
     except (TunablesWriteError, LockTimeoutError, OSError) as exc:
         logger.warning("model migration: could not apply persona %s's saved model (%s); retried at the next start", name, exc)
         return False
@@ -214,7 +214,7 @@ def _apply_late(name: str, chat: str | None, tiers: dict[str, str]) -> bool:
         logger.info("model migration: persona %s's saved model applied to %s (the install had no setting)", name, sorted(written))
     for job in sorted(set(updates) - set(written)):
         logger.info(
-            "model migration: persona %s's saved model %s for %s was not applied (the install already has a setting) and is discarded",
+            "model migration: persona %s's saved model %s for %s was not applied (the install's value was already changed) and is discarded",
             name, updates[job], job,
         )
     return True

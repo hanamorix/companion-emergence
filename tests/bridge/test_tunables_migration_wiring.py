@@ -65,30 +65,39 @@ def test_a_second_boot_does_nothing_to_the_settings_file(persona_dir: Path) -> N
     assert toml.read_bytes() == before and toml.stat().st_mtime_ns == mtime
 
 
-def test_the_persona_models_land_in_the_toml_through_the_real_lifespan(persona_dir: Path) -> None:
+def _claude_persona(name: str, model: str) -> Path:
+    """A throwaway persona under the sandbox home (the migration scans personas there) with a saved model."""
+    from brain import paths
+
+    d = paths.get_persona_dir(name)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "active_conversations").mkdir(exist_ok=True)
+    (d / "persona_config.json").write_text(
+        json.dumps({"provider": "claude-cli", "searcher": "noop", "model": model}), encoding="utf-8"
+    )
+    return d
+
+
+def test_the_persona_models_land_in_the_toml_through_the_real_lifespan() -> None:
     kindled_home = Path(os.environ["KINDLED_HOME"])
-    cfg = persona_dir / "persona_config.json"
-    data = json.loads(cfg.read_text(encoding="utf-8")) if cfg.exists() else {}
-    data.update({"provider": "claude-cli", "searcher": "noop", "model": "opus"})
-    cfg.write_text(json.dumps(data), encoding="utf-8")
-    with TestClient(build_app(persona_dir=persona_dir, client_origin="tests")):
+    persona = _claude_persona("wirer", "opus")
+    with TestClient(build_app(persona_dir=persona, client_origin="tests")):
         pass
     assert _values(kindled_home)["model.interactive_chat"] == "claude-opus-5"
-    assert "model" not in json.loads(cfg.read_text(encoding="utf-8"))
+    assert "model" not in json.loads((persona / "persona_config.json").read_text(encoding="utf-8"))
 
 
-def test_the_boot_with_an_old_json_and_a_saved_persona_model_leaves_the_toml_holding_the_chat_value(persona_dir: Path) -> None:
+def test_the_boot_with_an_old_json_and_a_saved_persona_model_leaves_the_toml_holding_the_chat_value() -> None:
     """C53 (j): old JSON with a model.interactive_chat entry plus a throwaway persona with a saved model, one real boot."""
     kindled_home = Path(os.environ["KINDLED_HOME"])
+    kindled_home.mkdir(parents=True, exist_ok=True)
     (kindled_home / "tunables.json").write_text(
         json.dumps({"overrides": {"model.interactive_chat": "claude-opus-5"}}), encoding="utf-8"
     )
-    cfg = persona_dir / "persona_config.json"
-    data = json.loads(cfg.read_text(encoding="utf-8")) if cfg.exists() else {}
-    data.update({"provider": "claude-cli", "searcher": "noop", "model": "claude-sonnet-4-6"})
-    cfg.write_text(json.dumps(data), encoding="utf-8")
-    with TestClient(build_app(persona_dir=persona_dir, client_origin="tests")):
+    persona = _claude_persona("wirer", "claude-sonnet-4-6")
+    with TestClient(build_app(persona_dir=persona, client_origin="tests")):
         pass
-    assert _values(kindled_home)["model.interactive_chat"] == "claude-opus-5"  # the old file's setting is the install's; the persona's is discarded
-    assert "model" not in json.loads(cfg.read_text(encoding="utf-8"))
+    # the old file's setting is the install's; the persona's saved model is discarded (the install's value was already changed)
+    assert _values(kindled_home)["model.interactive_chat"] == "claude-opus-5"
+    assert "model" not in json.loads((persona / "persona_config.json").read_text(encoding="utf-8"))
     assert not (kindled_home / "tunables.json").exists()

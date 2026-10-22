@@ -634,6 +634,17 @@ def _chat_error_detail(exc: BaseException, provider: Any) -> str:
     return f"{code}:{model}" if model else code
 
 
+# Modules the bridge loads lazily that register settings (see the boot pass in the lifespan).
+_SETTING_MODULES: tuple[str, ...] = (
+    "brain.file_store",
+    "brain.memory.embedding_backfill",
+    "brain.memory.judge_eval",
+    "brain.memory.judge_full_ft",
+    "brain.memory.judge_lora",
+    "brain.memory.judge_selftune",
+    "brain.memory.relevance_judge",
+)
+
 # Save-time check of a newly chosen model id (#440): one tiny real call, so a typo is refused with a specific
 # message instead of failing later inside the jobs that use it. The budget is for the whole save. The app's request has no timeout of its own (bridge.ts
 # `bridgeFetch` sets no AbortSignal), so the limit that applies is the webview's network stack: WKWebView
@@ -1146,19 +1157,40 @@ def build_app(
         except Exception:
             logger.warning("could not mark the brain overlay in use", exc_info=True)
 
-        # Rewrite the ops-tunables defaults section (spec 2026-07-04). Fail-soft:
-        # write_defaults_section swallows its own errors; belt-and-braces here so
-        # an import problem can't block startup either.
+        # The settings file boot pass (spec 2026-07-04, reshaped in #529): create tunables.toml with every registered
+        # setting, add the ones a new version registered, move a value that still equals its old default onto the new
+        # default. Fail-soft: sync_file swallows its own errors; belt-and-braces here so an import problem can't block
+        # startup either. An unreadable file is left alone and reported with its line.
         try:
-            from brain.tunables import write_defaults_section
+            import importlib
 
-            write_defaults_section()
+            from brain.tunables import sync_file
+
+            # Importing a module is what registers its settings, and the pass writes only what is registered in THIS
+            # process. These modules are otherwise loaded lazily (by the supervisor, an upload, a weekly tick), so import
+            # them first: the file then lists every setting from the first boot (a test compares it with a scan of every
+            # register call, so a module missing here fails it).
+            for _module in _SETTING_MODULES:
+                importlib.import_module(_module)
+            sync_file()
         except Exception as _exc:  # noqa: BLE001
-            logger.warning("tunables boot rewrite skipped: %s", _exc)
+            logger.warning("tunables boot pass skipped: %s", _exc)
+
+        # Backward compatibility, permanent: an old tunables.json at KINDLED_HOME (NOT under this persona's directory:
+        # stage-6 BLOCKER of the earlier idle-key migration was passing persona_dir) is folded into tunables.toml and
+        # renamed. After the boot pass, before the persona-model fold below, and before the supervisor thread starts, so
+        # no code can read a stale key. The bridge imports every module, so it folds the whole file.
+        try:
+            from brain import paths as _home_paths
+            from brain.tunables_migration import migrate_legacy_json
+
+            migrate_legacy_json(_home_paths.get_home(), complete_registry=True)
+        except Exception as _exc:  # noqa: BLE001 - startup must not break on the fold
+            logger.warning("tunables.json fold skipped: %s", _exc)
 
         # Fold a saved per-persona model into the install-wide setting (once per install; this persona's own legacy
-        # keys are cleared every start until gone). After the defaults rewrite above (a damaged tunables.json is
-        # healed first) and BEFORE the touch below, so the decision sees every persona's PREVIOUS open time.
+        # keys are cleared every start until gone). After the boot pass and the JSON fold above and BEFORE the touch
+        # below, so the decision sees every persona's PREVIOUS open time.
         # Fail-soft: model_migration never raises, and a failure leaves the saved model in place for the next start.
         try:
             from brain import paths as _paths
@@ -1247,30 +1279,10 @@ def build_app(
             mig_thread.start()
             app.state.bridge.migration_thread = mig_thread
 
-        # One-time tunables migration (ram-spike-fix INC-6, S25/S30/S37/S52/S71):
-        # retires the pre-lull idle-tuning keys into the single
-        # chat.idle_lull_seconds key. Synchronous, BEFORE the supervisor thread
-        # starts (C12: ordering asserted here) so no code — including the
-        # supervisor's first loop pass — can ever read a stale key. The rewrite
-        # is fail-safe internally; opening the lock's sidecar file can still
-        # raise OSError, which the try/except here catches (as it does for every
-        # other non-essential startup step in this function).
-        try:
-            from brain import paths
-            from brain.tunables_migration import migrate_idle_keys
-
-            # tunables.json lives at KINDLED_HOME (paths.get_home()), NOT under
-            # this persona's own directory (get_home()/"personas"/<name>) —
-            # passing persona_dir here would silently migrate a file that
-            # doesn't exist (stage-6 code red-team BLOCKER, caught before ship).
-            migrate_idle_keys(paths.get_home())
-        except Exception as _exc:  # noqa: BLE001 — startup must not break on the migration
-            logger.warning("tunables idle-key migration failed: %s", _exc)
-
         # S82: seed is_chat_idle's anchor from the newest message timestamp
         # already saved in THIS persona's active_conversations/ buffers —
         # BEFORE the supervisor thread starts (same ordering rationale as the
-        # tunables migration above: no reader of the anchor may run first).
+        # tunables fold above: no reader of the anchor may run first).
         # No new persisted file; the function itself fails closed internally
         # on a malformed saved timestamp (S63), so this try/except is
         # belt-and-suspenders matching every other non-essential startup step.

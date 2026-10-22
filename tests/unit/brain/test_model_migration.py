@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 
 from brain import dev_constants, model_migration, paths, tunables
 from brain.bridge import model_error
+from brain.bridge.model_tier import set_job_models
 from brain.bridge.server import build_app
 from brain.health.json_io import JsonFileError
 from brain.model_migration import MARKER_NAME, migrate_persona_models, pending_legacy
@@ -124,7 +125,7 @@ def test_without_last_opened_at_the_file_mtime_decides_and_a_tie_goes_to_the_fir
     migrate_persona_models(_home(), None)
     assert _overrides()[_CHAT] == "claude-sonnet-4-6"  # beta is newer by mtime
     _marker().unlink()
-    tunables.set_values({_CHAT: None})
+    set_job_models({"interactive-chat": None})  # back to the shipped default
     os.utime(b / "persona_config.json", (1_700_000_000, 1_700_000_000))  # tie
     migrate_persona_models(_home(), None)
     assert _overrides()[_CHAT] == "claude-opus-5"  # alphabetical: alpha wins the tie
@@ -498,7 +499,7 @@ def test_the_migration_clears_the_rejection_record_of_the_id_it_writes_c30e(capt
     tunables.set_values({_CHAT: "claude-sonnet-4-9"})
     with pytest.raises(Exception):  # noqa: B017
         ClaudeCliProvider(TIER_INTERACTIVE_CHAT).generate("x")
-    tunables.set_values({_CHAT: None})
+    tunables.set_values({_CHAT: "claude-sonnet-5"})  # back to the shipped default, by a path that does not forget the record
     assert model_error.is_rejected("claude-sonnet-4-9")
     _persona("a", model="claude-sonnet-4-9", opened="2026-01-01T00:00:00Z")
     migrate_persona_models(_home(), None)

@@ -1,201 +1,188 @@
-"""One-time, idempotent migration of the pre-lull idle-tuning tunable keys
-into the single ``chat.idle_lull_seconds`` key (ram-spike-fix INC-6, spec §7,
-ledger S25/S30/S37/S52/S71).
+"""Backward compatibility for the old JSON settings file (#529). Permanent: there is no way to know which version an install
+is upgrading from, now or later.
 
-Retired keys (ram-spike-fix INC-6, C4):
-  - ``throttle.background_min_idle_seconds`` (old default 300.0) — carried
-    forward as ``chat.idle_lull_seconds``'s override IFF its value differs
-    from the old default (a genuine user customization); a plain-default
-    override (300.0, indistinguishable from "never customized") is dropped,
-    landing on the new code default (600.0) instead of carrying a stale
-    number forward as if it were still meaningful.
-  - ``chat.pass2_min_idle_seconds`` — removed, value not carried (pass 2 now
-    shares the one lull like every other caller).
-  - ``self_model.articulate_min_idle_seconds`` — removed, value not carried
-    (same reason).
-  - ``judge_selftune.gate_handful_decisions`` (S71) — removed, value not
-    carried (this key moved to ``brain/dev_constants.py`` in INC-1 and must
-    not be a registered tunable at all, C13/C26).
+Before ``tunables.toml`` the install's settings lived in ``$KINDLED_HOME/tunables.json`` (an ``overrides`` object next to a
+``defaults`` section that was only documentation). ``migrate_legacy_json(home, complete_registry=...)`` brings such a file
+forward the first time it is seen, and a JSON that turns up later (a restored backup, a copied install, imported data) is
+folded the same way:
 
-Called synchronously in the bridge lifespan BEFORE the supervisor thread
-starts (server.py, S37) — the migration must complete before any code can
-read the (possibly still-old) file.
+1. No JSON file: nothing happens (no lock, no write).
+2. ``tunables.sync_file()`` runs first, so the TOML exists with every default and its recorded default.
+3. The JSON is read with ``Recovery.RAISE``. One that cannot be read (syntax error, not UTF-8, a persisting I/O fault) is
+   LEFT ALONE exactly like an unreadable TOML (owner ruling E9): not repaired, not renamed, one throttled WARNING per start
+   naming the line that failed; the next start tries again. A zero-byte file or one with nothing in ``overrides`` carries
+   nothing and is renamed without a warning.
+4. The older retirement of the pre-lull idle keys is applied (below), then every value the TOML cannot hold (null, NaN or
+   Infinity, a string with a lone surrogate, a nested object) is skipped by key with a log, so one poison value never blocks
+   the others or the rename.
+5. The bridge (``complete_registry=True``: it imports every module) applies each registered key with
+   ``tunables.set_values(..., only_if_default=True)``: a key whose TOML value still equals its default takes the old value, a
+   key the user already changed keeps its value and the old one is logged and discarded. A key this process does not register
+   is retired code: logged and DISCARDED, never inserted. A CLI process (``complete_registry=False``) registers only the keys
+   it imported, so it folds ALL-OR-NOTHING: if every key is registered it folds exactly as the bridge does, otherwise it
+   applies nothing, leaves the JSON and logs once at INFO that the bridge will fold it. A CLI that had applied the keys it
+   could would later re-apply them over a change the user made in between.
+6. The JSON is renamed ``tunables.json.migrated-<UTC stamp>`` (the cheap backup, never deleted by the app) after step 5
+   completed. A crash between 5 and 6 makes the next run re-apply with ``only_if_default`` (values already equal: a no-op) and
+   rename. If step 5 raises (lock timeout, unreadable TOML) the JSON is not renamed and the next start retries.
 
-Fail-safe: any error during the rewrite restores the original file from the
-backup taken just before writing (if the on-disk file was touched at all)
-and logs a WARNING. The rewrite itself never raises; opening the lock's sidecar file can raise ``OSError``, which the
-bridge lifespan's call site catches (this module must never break bridge startup).
-Idempotent: if none of the retired keys are present, this is a no-op (no
-write at all, not even a no-op rewrite) — running it twice produces
-byte-identical files.
+Retired keys, kept from the earlier retirement (ram-spike-fix INC-6): ``throttle.background_min_idle_seconds`` (old default
+300.0) carries to ``chat.idle_lull_seconds`` iff its value differs from 300.0; ``chat.pass2_min_idle_seconds``,
+``self_model.articulate_min_idle_seconds`` and ``judge_selftune.gate_handful_decisions`` are discarded.
 
-Concurrency (#529): this migration reads and rewrites the shared, cross-persona KINDLED_HOME/tunables.json, and so
-do ``tunables.set_overrides`` and ``tunables.write_defaults_section``. The rewrite (read, write, verify and restore)
-therefore runs under the same cross-process lock they take, with a bounded wait; the file is re-read inside the lock.
-The pre-check for a retired key runs outside the lock, so an ordinary boot never locks. The shared ``.bak-migrate``
-sidecar is only touched while the lock is held.
+Concurrency: the JSON is read before any lock and never modified, only renamed; every write goes through
+``tunables.set_values`` (the tunables lock, bounded wait), so a concurrent ``set_values`` lands before or after the fold's
+write and is never lost, and the fold never rewrites the whole file. Nothing here raises into startup.
 """
 from __future__ import annotations
 
-import json
 import logging
-from collections.abc import Callable
+import math
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from brain import dev_constants
-from brain.health.json_io import Recovery, read_json, write_json
-from brain.utils.file_lock import LockTimeoutError, locked_within
+from brain import tunables
+from brain.health.json_io import JsonFileError, Recovery, read_json_result
+from brain.utils import toml_io
+from brain.utils.log_throttle import warn_throttled
 
 logger = logging.getLogger(__name__)
 
-_FILE_NAME = "tunables.json"
-_BACKUP_SUFFIX = ".bak-migrate"
+_LEGACY_NAME = "tunables.json"
 
 _OLD_THROTTLE_KEY = "throttle.background_min_idle_seconds"
 _OLD_THROTTLE_DEFAULT = 300.0
 _NEW_LULL_KEY = "chat.idle_lull_seconds"
 
-# Keys whose VALUE is never carried forward — only ever removed.
+# Keys whose VALUE is never carried forward, only ever dropped.
 _DROP_ONLY_KEYS = (
     "chat.pass2_min_idle_seconds",
     "self_model.articulate_min_idle_seconds",
     "judge_selftune.gate_handful_decisions",
 )
-
-# Test seam: called inside the locked window, after the re-read and just before the write (deterministic interleaving).
-_LOCKED_WINDOW_HOOK: Callable[[], None] | None = None
-
-
-def _read_state(path: Path) -> tuple[bytes, dict[str, Any], dict[str, Any]] | None:
-    """``(original bytes, parsed file, overrides)``, or None when there is nothing to migrate or the file is unusable."""
-    try:
-        original_bytes = path.read_bytes()
-    except FileNotFoundError:
-        return None  # nothing to migrate: a fresh persona has no old keys
-    except OSError as exc:
-        logger.warning("tunables_migration: cannot read %s (%s) — skipping", path, exc)
-        return None
-
-    try:
-        data = json.loads(original_bytes.decode("utf-8"))  # json-io: ok -- byte-exact backup needs the original bytes
-    except Exception as exc:  # noqa: BLE001 — corrupt file: leave it for tunables.py's own repair
-        logger.warning(
-            "tunables_migration: %s unreadable (%s) — skipping (not this module's job to repair)",
-            path, exc,
-        )
-        return None
-
-    if not isinstance(data, dict):
-        logger.warning("tunables_migration: %s is not a JSON object — skipping", path)
-        return None
-
-    overrides = data.get("overrides")
-    if not isinstance(overrides, dict):
-        overrides = {}
-    return original_bytes, data, overrides
-
-
 _RETIRED_KEYS = [_OLD_THROTTLE_KEY, *_DROP_ONLY_KEYS]
 
 
-def migrate_idle_keys(home: Path) -> None:
-    """Migrate ``home/tunables.json``'s retired idle-tuning keys in place.
-
-    No-op (no lock, no write) when the file is absent or none of the retired keys are present in its ``overrides``: that
-    cheap pre-check runs OUTSIDE the lock, so an ordinary boot pays no lock round trip. When a retired key is present the
-    file is locked (the same cross-process lock ``tunables.set_overrides`` takes, bounded wait) and RE-READ inside the
-    lock; the lock covers the whole read, write, verify and restore sequence, so a concurrent ``set_overrides`` can
-    neither be overwritten by the write nor clobbered by the restore. The bytes written back are always the ones read
-    inside the lock. If another process holds the lock for the whole wait the migration is skipped (retried at the next
-    start).
-    """
-    path = home / _FILE_NAME
-    state = _read_state(path)
-    if state is None or not any(k in state[2] for k in _RETIRED_KEYS):
-        return  # idempotent no-op — nothing to migrate, no write at all
-    try:
-        with locked_within(path, dev_constants.SETTINGS_FILE_LOCK_WAIT_S):
-            state = _read_state(path)
-            if state is None or not any(k in state[2] for k in _RETIRED_KEYS):
-                return  # another process migrated it between the pre-check and the lock
-            if _LOCKED_WINDOW_HOOK is not None:
-                _LOCKED_WINDOW_HOOK()
-            _rewrite(path, *state)
-    except LockTimeoutError:
-        logger.warning(
-            "tunables_migration: another process held the lock on %s for %.1f s, so the migration was skipped (retried at the next start)",
-            path, dev_constants.SETTINGS_FILE_LOCK_WAIT_S,
-        )
-
-
-def _rewrite(path: Path, original_bytes: bytes, data: dict[str, Any], overrides: dict[str, Any]) -> None:
-    """Rewrite the file without the retired keys. Called with the file lock held. Never raises."""
-    new_overrides: dict[str, Any] = {
-        k: v for k, v in overrides.items() if k not in _RETIRED_KEYS
-    }
-
+def _after_retirements(overrides: dict[str, Any]) -> dict[str, Any]:
+    """The overrides without the retired idle keys; the old throttle value carries to the lull key when it was customized."""
+    carried = {k: v for k, v in overrides.items() if k not in _RETIRED_KEYS}
     if _NEW_LULL_KEY not in overrides and _OLD_THROTTLE_KEY in overrides:
-        old_val = overrides[_OLD_THROTTLE_KEY]
-        if isinstance(old_val, (int, float)) and not isinstance(old_val, bool) and old_val != _OLD_THROTTLE_DEFAULT:
-            new_overrides[_NEW_LULL_KEY] = float(old_val)
-        # else: old value equals the old default (or is malformed) — treated
-        # as "never customized"; the new code default (600.0) applies, no
-        # override key written.
+        old = overrides[_OLD_THROTTLE_KEY]
+        if isinstance(old, (int, float)) and not isinstance(old, bool) and old != _OLD_THROTTLE_DEFAULT:
+            carried[_NEW_LULL_KEY] = float(old)
+        # else: the old default (or malformed) means "never customized": the new code default applies.
+    return carried
 
-    new_data = dict(data)
-    new_data["overrides"] = new_overrides
 
-    backup_path = path.with_name(path.name + _BACKUP_SUFFIX)
+def _nonfinite(value: Any) -> bool:
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, (list, tuple)):
+        return any(_nonfinite(v) for v in value)
+    return False
+
+
+def _cannot_hold(value: Any) -> str | None:
+    """Why the TOML cannot hold this value, or None when it can."""
+    if value is None:
+        return "null"
+    if isinstance(value, dict):
+        return "a nested object"
+    if _nonfinite(value):
+        return "not a finite number"
     try:
-        backup_path.write_bytes(original_bytes)
+        toml_io.dumps_value(value)
+    except toml_io.TomlFileError as exc:
+        return exc.reason or "not a value the file can hold"
+    return None
+
+
+def _archive(legacy: Path) -> None:
+    """Rename the folded JSON to ``tunables.json.migrated-<stamp>``; never overwrites an earlier copy."""
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    target = legacy.with_name(f"{legacy.name}.migrated-{stamp}")
+    n = 1
+    while target.exists():
+        target = legacy.with_name(f"{legacy.name}.migrated-{stamp}-{n}")
+        n += 1
+    try:
+        legacy.rename(target)
+    except FileNotFoundError:
+        return  # another bridge folded it first
     except OSError as exc:
-        logger.warning(
-            "tunables_migration: could not write backup %s (%s) — skipping migration "
-            "(original left untouched)",
-            backup_path, exc,
-        )
+        logger.warning("tunables_migration: could not rename %s (%s); its values are already in tunables.toml", legacy, exc)
         return
+    logger.info("tunables_migration: folded %s into tunables.toml; the old file was kept as %s", legacy.name, target.name)
 
+
+def _fold(legacy: Path, complete_registry: bool) -> None:
+    tunables.sync_file()  # the TOML exists with every default and its recorded default before anything is applied
     try:
-        write_json(path, new_data, indent=2, sort_keys=True, fsync=False, nonfinite="null")
-
-        # Re-load via the SAME reader tunables.py uses and verify.
-        reloaded = read_json(path, recover=Recovery.RAISE, expect=dict)
-        reloaded_overrides = reloaded.get("overrides", {})
-        for k in _RETIRED_KEYS:
-            if k in reloaded_overrides:
-                raise ValueError(f"retired key {k!r} still present after migration")
-        if _NEW_LULL_KEY in new_overrides:
-            if reloaded_overrides.get(_NEW_LULL_KEY) != new_overrides[_NEW_LULL_KEY]:
-                raise ValueError("migrated chat.idle_lull_seconds value did not round-trip")
-    except Exception as exc:  # noqa: BLE001 — fail-safe: restore original, never raise
-        logger.warning(
-            "tunables_migration: migration of %s failed (%s) — restoring original", path, exc,
+        res = read_json_result(legacy, default=dict, recover=Recovery.RAISE, expect=dict)
+    except JsonFileError as exc:
+        if exc.kind == "missing":
+            return  # folded by another process meanwhile
+        if exc.kind == "empty":
+            _archive(legacy)  # a zero-byte file carries nothing
+            return
+        where = f" at line {exc.line}" if exc.line is not None else ""
+        warn_throttled(
+            logger,
+            f"tunables_migration:unreadable:{legacy}",
+            "tunables_migration: %s could not be read%s (%s); it was left as it is and is tried again at the next start",
+            legacy, where, exc.detail or exc.kind,
+            exc_info=False,
         )
-        try:
-            if path.read_bytes() != original_bytes:
-                path.write_bytes(original_bytes)
-        except OSError as restore_exc:  # noqa: BLE001 — last-resort log only
-            logger.error(
-                "tunables_migration: could not restore original %s after a failed "
-                "migration (%s) — the file may be in a partially-migrated state",
-                path, restore_exc,
-            )
         return
-    finally:
-        try:
-            backup_path.unlink(missing_ok=True)
-        except OSError:
-            pass
 
-    # the file's signature changed under tunables.py's own cache: the next get_tunable()
-    # call re-reads (tunables.py:_load_overrides_locked), no extra reset needed.
-    logger.info(
-        "tunables_migration: migrated %s (%d retired key(s) removed%s)",
-        path,
-        len(_RETIRED_KEYS),
-        f", chat.idle_lull_seconds={new_overrides[_NEW_LULL_KEY]!r} carried forward"
-        if _NEW_LULL_KEY in new_overrides
-        else "",
-    )
+    raw = res.data.get("overrides")
+    overrides = raw if isinstance(raw, dict) else {}
+    carried: dict[str, Any] = {}
+    for key, value in _after_retirements(overrides).items():
+        reason = _cannot_hold(value)
+        if reason is not None:
+            logger.info("tunables_migration: %s in %s skipped (%s); the other settings are still carried", key, legacy.name, reason)
+            continue
+        carried[key] = value
+
+    registered = tunables.registered_keys()
+    known = {k: v for k, v in carried.items() if k in registered}
+    unknown = sorted(set(carried) - set(known))
+    if unknown and not complete_registry:
+        logger.info(
+            "tunables_migration: %s holds settings this command cannot place (%s); nothing was applied and the bridge folds it "
+            "at its next start",
+            legacy.name, ", ".join(unknown),
+        )
+        return
+    for key in unknown:
+        logger.info("tunables_migration: %s in %s is no longer a setting and is discarded", key, legacy.name)
+    if known:
+        try:
+            written = tunables.set_values(known, only_if_default=True)
+        except tunables.TunablesWriteError as exc:
+            logger.warning("tunables_migration: could not fold %s (%s); tried again at the next start", legacy.name, exc)
+            return
+        for key, value in known.items():
+            if key not in written and not toml_io.same_value(tunables.get_raw(key), value):
+                logger.info(
+                    "tunables_migration: %s was changed in tunables.toml already, so the old value %r in %s is discarded",
+                    key, value, legacy.name,
+                )
+    _archive(legacy)
+
+
+def migrate_legacy_json(home: Path, *, complete_registry: bool) -> None:
+    """Fold ``home/tunables.json`` into ``tunables.toml`` (see the module docstring). Never raises.
+
+    ``complete_registry`` is True where every module that registers a setting has been imported (the bridge) and False for
+    a CLI process, which folds all-or-nothing.
+    """
+    legacy = home / _LEGACY_NAME
+    if not legacy.exists():
+        return  # one exists() call per start; no lock, no write
+    try:
+        _fold(legacy, complete_registry)
+    except Exception:  # noqa: BLE001 - startup and the CLI must never fail on this
+        logger.warning("tunables_migration: folding %s failed (ignored; tried again at the next start)", legacy, exc_info=True)

@@ -1,24 +1,24 @@
-"""Which model backs each LLM call: one tunables line per job type, and the ONE accessor that reads it.
+"""Which model backs each LLM call: one setting per job type, and the ONE accessor that reads it.
 
 Every model a Claude call runs on is chosen here and nowhere else. A call site declares the JOB it is doing (a "tier"
 name below, which has always meant job type) and asks ``model_for_tier(tier)`` (or builds a provider with
 ``build_tier_provider``); it never holds a model id. There are no size tiers: each job type has its own key in the
-user's tunables file (``$KINDLED_HOME/tunables.json``, section ``overrides``), registered once on one commented line
-of ``_CLAUDE_JOBS`` below. To change the model for a job, change that one line (the shipped default) or add one line to
-the user's overrides (this install only). Both are read on EVERY call, so a change reaches a running bridge with no
-restart.
+install's settings file (``$KINDLED_HOME/tunables.toml``), registered once on one line of ``_CLAUDE_JOBS`` below. To
+change the model for a job, change that one line (the shipped default; installs whose value still equals the old default
+follow it at their next boot) or change the value on one line of the file (this install only). Both are read on EVERY
+call, so a change reaches a running bridge with no restart.
 
 Pinning a default is one line: edit the id on the job's ``tunables.register`` line. The words the UI offers (Sonnet,
-Opus, Haiku) are vocabulary for the picker, ``nell model set`` and the setup wizard (``resolve_choice``); the tunables
+Opus, Haiku) are vocabulary for the picker, ``nell model set`` and the setup wizard (``resolve_choice``); the settings
 file written by those paths holds ids, never the words (a word typed into the file by hand is accepted and handed to
-the CLI as the CLI's own alias, not as the pinned id), and a word that means the job's own default REMOVES the override instead of writing
-a copy, so a user who picked the word follows every later change of the shipped default (``set_job_models``).
+the CLI as the CLI's own alias, not as the pinned id). A pick WRITES its id as the value (``set_job_models``); a value
+equal to the job's current shipped default follows later changes of that default.
 
 A configured id is checked against the model grammar (``is_valid_model``); a value that fails it is ignored with one
 warning and the shipped default runs, and the bad text stays in the file untouched. A configured id that Claude
 REJECTED (it may not exist, or the account may not have access) makes that job run its shipped default from the next
 call on, with the rejection notice kept (``brain.bridge.model_error``); the record is trusted only while it is newer
-than the last write to the tunables file, so editing the file ends the fallback without a restart. Limits: when the
+than the last write to the settings file, so editing the file ends the fallback without a restart. Limits: when the
 rejected id IS the shipped default (an old ``claude`` that does not know it) there is nothing to fall back to, and
 exactly one call per process fails before the fallback engages.
 
@@ -300,11 +300,11 @@ LOCAL_MODEL_IDS: dict[str, str] = {
 
 
 def _configured(key: str, default: str) -> str:
-    """The job's configured id: the user's override when it is a valid model setting, else the shipped default.
+    """The job's configured id: the value in the settings file when it is a valid model setting, else the shipped default.
 
     ``tunables.get_tunable`` already ignores a value of the wrong type (a number, a list) with its own one-time
     warning. A string that fails the model grammar is ignored here with ONE throttled warning per distinct bad value;
-    the text stays in ``tunables.json`` untouched (#446).
+    the text stays in ``tunables.toml`` untouched (#446).
     """
     value = tunables.get_tunable(key, default)
     if is_valid_model(value):
@@ -313,7 +313,7 @@ def _configured(key: str, default: str) -> str:
         logger,
         f"model_tier:invalid:{key}:{unsupported_display(value)}",
         "model_tier: the setting %s=%r is not a usable model (%s); the shipped default %s runs instead. "
-        "The setting in tunables.json was left as it is.",
+        "The setting in tunables.toml was left as it is.",
         key,
         unsupported_display(value),
         MODEL_ID_RULE,
@@ -342,7 +342,7 @@ def model_for_tier(tier: str) -> str:
     # An id in use again must never stay ignored (`switch` ignores the id a user moved away from; a CLI write or a hand
     # edit can configure it again without this process seeing the change), or a real rejection would be dropped silently.
     model_error.activate([configured])
-    if configured != default and model_error.is_rejected(configured, since_epoch=tunables.overrides_mtime()):
+    if configured != default and model_error.is_rejected(configured, since_epoch=tunables.file_mtime()):
         warn_throttled(
             logger,
             f"model_tier:fallback:{key}:{configured}",
@@ -358,7 +358,7 @@ def model_for_tier(tier: str) -> str:
 
 
 def configured_job_models() -> dict[str, str]:
-    """Each Claude job's CONFIGURED id (a valid override, else the shipped default), whatever Claude accepted.
+    """Each Claude job's CONFIGURED id (the valid value in the settings file, else the shipped default), whatever Claude accepted.
 
     The allow-list for the rejection notice and the ``keep`` set of ``model_error.switch``: a rejected id must not
     drop out of the notice the moment the fallback starts, so these are not the effective ids.
@@ -366,22 +366,17 @@ def configured_job_models() -> dict[str, str]:
     return {tier: _configured(key, default) for tier, (key, default) in _CLAUDE_JOBS.items()}
 
 
-def override_text(tier: str) -> str | None:
-    """The user's override for a Claude job when it is NOT a usable model setting (display-safe), else None."""
+def unusable_setting_text(tier: str) -> str | None:
+    """The text in the settings file for a Claude job when it is NOT a usable model setting (display-safe), else None."""
     key, _default = _CLAUDE_JOBS[tier]
-    raw = tunables.get_override(key)
+    raw = tunables.get_raw(key)
     if raw is None or is_valid_model(raw):
         return None
     return unsupported_display(raw)
 
 
-def has_override(tier: str) -> bool:
-    """True when the user's tunables file holds a setting (valid or not) for this Claude job."""
-    return tunables.get_override(_CLAUDE_JOBS[tier][0]) is not None
-
-
 def shipped_default(tier: str) -> str:
-    """The job's shipped default id (the registered default, ignoring any override)."""
+    """The job's shipped default id (the registered default, whatever the settings file holds)."""
     return _CLAUDE_JOBS[tier][1]
 
 
@@ -420,49 +415,51 @@ def choice_for(model: str | None) -> str | None:
     return None
 
 
-def set_job_models(updates: dict[str, str | None], *, only_missing: bool = False) -> dict[str, str | None]:
-    """Write the model setting of one or more jobs; the ONLY caller of ``tunables.set_overrides`` for model keys.
+def set_job_models(updates: dict[str, str | None], *, only_if_default: bool = False) -> dict[str, str]:
+    """Write the model setting of one or more jobs IN PLACE; the ONLY caller of ``tunables.set_values`` for model keys.
 
-    ``updates`` maps a job type to the RAW value the user gave (a word or a full id) or ``None`` to clear the override.
-    The write rule, per job: a WORD that means that job's shipped default REMOVES the override (so the user keeps
-    following the product's pin); ``opus`` writes ``OPUS_CHOICE``; ``haiku`` writes ``haiku`` unless that is the job's
-    default; a FULL ID is always written exactly as given, even when it equals the default (a deliberate pin).
+    ``updates`` maps a job type to the RAW value the user gave (a word or a full id) or ``None`` to reset the job to its
+    shipped default. The words resolve as in ``resolve_choice`` (``sonnet`` is the chat job's shipped default id, ``opus`` is
+    ``OPUS_CHOICE``, ``haiku`` is ``haiku``) and the id is WRITTEN as the entry's value; a full id is written exactly as
+    given. Nothing is ever removed from the file. A value equal to the current one writes nothing. A setting equal to the
+    shipped default follows later default changes at the next boot (owner decision), whether it was picked, typed or reset.
+    With ``only_if_default=True`` a job whose value already differs from its shipped default is left alone (the migrations).
     Raises ``ValueError`` for a value that is not a usable model setting and ``KeyError`` for an unknown job;
     ``tunables.TunablesWriteError`` when the file cannot be changed (nothing is written).
 
-    After the write the rejection record of every id written AND every id removed is dropped, so a stale record
-    cannot outlive the pick. Returns ``{job: written id, or None for a removal}`` for the settings actually changed.
+    After the write the rejection record of every id written, and of every id a pick replaced, is dropped, so a stale record
+    cannot outlive the pick. Returns ``{job: id}`` for the settings actually changed.
     """
     from brain.bridge import (
         model_error,  # function-scoped: model_error imports this module's grammar at top
     )
 
     keys: dict[str, str] = {}
-    mapped: dict[str, str | None] = {}
+    mapped: dict[str, str] = {}
     previous: dict[str, Any] = {}
     for tier, raw in updates.items():
         key, default = _CLAUDE_JOBS[tier]
         keys[key] = tier
-        previous[key] = tunables.get_override(key)
+        previous[key] = tunables.get_raw(key)
         if raw is None:
-            mapped[key] = None
+            mapped[key] = default
             continue
-        if not is_valid_model(raw):
+        resolved = resolve_choice(raw)
+        if resolved is None:
             raise ValueError(f"{raw!r} is not a usable model setting ({MODEL_ID_RULE})")
-        if raw in KNOWN_MODELS:
-            resolved = resolve_choice(raw)
-            mapped[key] = None if resolved == default else resolved
-        else:
-            mapped[key] = raw
-    written = tunables.set_overrides(mapped, only_missing=only_missing)
-    # Picking an id again clears what Claude said about it, even when the file already held that exact value; an id
-    # the pick replaces or removes is forgotten too. (Not the ids of keys `only_missing` left alone.)
-    for key, value in mapped.items():
-        if only_missing and key not in written:
+        mapped[key] = resolved
+    written = tunables.set_values(mapped, only_if_default=only_if_default)
+    # Picking an id again clears what Claude said about it, even when the file already held that exact value; an id the
+    # pick replaces is forgotten too. (Not the ids of keys `only_if_default` left alone. A reset forgets the id it
+    # replaces, not the shipped default it returns to.)
+    for tier, raw in updates.items():
+        key = _CLAUDE_JOBS[tier][0]
+        if only_if_default and key not in written:
             continue
-        for forgotten in (value, previous[key]):
-            if isinstance(forgotten, str):
-                model_error.note_success(forgotten)
+        forgotten = [previous[key]] if raw is None else [mapped[key], previous[key]]
+        for model in forgotten:
+            if isinstance(model, str):
+                model_error.note_success(model)
     return {keys[key]: value for key, value in written.items()}
 
 

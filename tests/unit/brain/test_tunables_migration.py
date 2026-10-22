@@ -315,6 +315,8 @@ def test_a_set_values_landing_between_the_json_read_and_the_write_survives(t, tm
     finished_inside: list[bool] = []
 
     def hook() -> None:
+        if not (tmp_path / FILE_NAME).exists():
+            return  # the boot pass creating the file; the fold's own write window is the one under test
         competitor.start()
         competitor.join(timeout=1.0)
         finished_inside.append(not competitor.is_alive())
