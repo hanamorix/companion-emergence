@@ -56,7 +56,7 @@ jobs:
         run: uv run pytest -v --tb=short
 
       # Manual run only. The input reaches the shell as an environment variable (never
-      # spliced into the script), is split on whitespace without glob expansion, and
+      # spliced into the script), is split on all whitespace (newlines included) with globbing switched off, and
       # every word is passed to pytest as one quoted argument. `shell: bash` so the
       # same script runs on all three OSes (Windows would otherwise use pwsh).
       - name: Run pytest (selected tests)
@@ -65,7 +65,9 @@ jobs:
         env:
           TESTS: ${{ inputs.tests }}
         run: |
-          read -r -a selected <<< "$TESTS"
+          set -f
+          selected=($TESTS)
+          set +f
           for word in "${selected[@]}"; do
             case "$word" in
               -*) echo "::error::refusing '$word': pass test paths or node ids only, not pytest options"; exit 1 ;;
