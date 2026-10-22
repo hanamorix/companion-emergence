@@ -399,6 +399,56 @@ def test_a_saved_opus_survives_a_config_save_by_another_path_before_the_migratio
     assert "model" not in _cfg("only")
 
 
+def test_an_upgrade_after_a_downgrade_keeps_the_settings_and_folds_what_the_older_brain_wrote(caplog) -> None:
+    """The rollback contract of the migration spec (docs/source-spec/2026-10-22-model-settings-migration.md): after an in-app
+    revert the older brain ignores tunables.toml and runs on its defaults; the values stay in the file and are used again
+    on the next upgrade; a ``tunables.json`` the older brain wrote meanwhile is folded by the legacy-JSON rule (only into a
+    setting still at its default); a model the older brain saved in a persona the decision considered is cleared, not
+    applied (it never overwrites the install's setting)."""
+    from brain.tunables_migration import migrate_legacy_json
+    from tests.tunables_file import read_values
+
+    def old_brain_writes_settings(overrides: dict) -> None:
+        (_home() / "tunables.json").write_text(json.dumps({"overrides": overrides}), encoding="utf-8")
+
+    tunables.register("rt.kept", 1.0, description="Kept across the round trip.")
+    tunables.register("rt.changed_by_user", 1.0, description="Changed in the upgraded app.")
+    tunables.register("rt.new_while_down", 1.0, description="Set only while downgraded.")
+    _home().mkdir(parents=True, exist_ok=True)
+
+    # Upgrade 1: an old install (JSON settings, a persona with a saved model).
+    old_brain_writes_settings({"rt.kept": 7.0})
+    alpha = _persona("alpha", model="opus", opened="2026-05-01T00:00:00Z")
+    migrate_legacy_json(_home(), complete_registry=True)
+    migrate_persona_models(_home(), alpha)
+    assert read_values(_home())["rt.kept"] == 7.0 and _overrides()[_CHAT] == "claude-opus-5"
+    assert not (_home() / "tunables.json").exists() and "model" not in _cfg("alpha")
+
+    # The upgraded app: the user changes a setting and picks a model (only tunables.toml is written).
+    set_job_models({_CHAT_JOB: "haiku"})
+    tunables.set_values({"rt.changed_by_user": 5.0})
+
+    # Downgrade: the older brain never reads tunables.toml. It writes its own files.
+    assert read_values(_home())["rt.kept"] == 7.0  # nothing the older brain does touches the file's values
+    old_brain_writes_settings({"rt.new_while_down": 9.0, "rt.changed_by_user": 2.0, "rt.kept": 3.0})
+    cfg_path = alpha / "persona_config.json"
+    data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    data["model"] = "claude-opus-4-1"  # the older brain's own picker saves the model in the persona file
+    cfg_path.write_text(json.dumps(data), encoding="utf-8")
+
+    # Upgrade 2.
+    with caplog.at_level(logging.INFO):
+        migrate_legacy_json(_home(), complete_registry=True)
+        migrate_persona_models(_home(), alpha)
+    values = read_values(_home())
+    assert values["rt.kept"] == 7.0  # the upgraded value is intact: the older brain's 3.0 was not folded over it
+    assert values["rt.changed_by_user"] == 5.0  # a setting the user changed since is never overwritten
+    assert values["rt.new_while_down"] == 9.0  # a setting still at its default takes the older brain's value
+    assert values[_CHAT] == "haiku"  # the model pick survives
+    assert not (_home() / "tunables.json").exists() and len(list(_home().glob("tunables.json.migrated-*"))) == 2
+    assert "model" not in _cfg("alpha")  # cleared, never applied
+
+
 def test_the_pass_through_field_holds_raw_values_and_save_reemits_them_only_while_non_empty(tmp_path) -> None:
     p = tmp_path / "persona_config.json"
     p.write_text(json.dumps({"provider": "claude-cli", "model": "banana", "tier_models": {"x": 1}}))
