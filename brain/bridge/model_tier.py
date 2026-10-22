@@ -405,6 +405,16 @@ def resolve_choice(value: str) -> str | None:
     return None
 
 
+def needs_probe(value: str) -> bool:
+    """Is this picker value checked with one real Claude call before it is written?
+
+    ``sonnet`` and ``haiku`` are not: the ids they mean were verified when they were pinned. ``opus`` and any typed full
+    id are, including a typed id that equals a shipped default (a typo of it would otherwise slip through).
+    ``app/src/lib/modelId.ts`` ``CHECK_FREE_ALIASES`` lists the same two words; a test holds the two together.
+    """
+    return value not in ("sonnet", "haiku")
+
+
 def choice_for(model: str | None) -> str | None:
     """The picker word whose meaning is exactly ``model``, else None (a custom id highlights no radio)."""
     if model is None:

@@ -695,17 +695,17 @@ _clock = time.monotonic
 
 
 async def _apply_chat_model(model: str, *, check: bool, lock: asyncio.Lock) -> tuple[int, dict[str, Any]]:
-    """Set the chat model: validate, check it, write the install's tunables file. Returns ``(status, body)``.
+    """Set the chat model: validate, check it, write the install's settings file. Returns ``(status, body)``.
 
     The ONE implementation behind the picker's ``POST /persona/config/model`` and ``nell model set``. The chat model
-    is the install-wide ``model.interactive_chat`` line of ``tunables.json`` (every bridge reads it on every call, so
+    is the install-wide ``model.interactive_chat`` entry of ``tunables.toml`` (every bridge reads it on every call, so
     there is no live provider to switch). ``model`` is what the user chose, a word (sonnet / opus / haiku) or a
-    full id, applied with the one write rule of ``brain.bridge.model_tier.set_job_models``: a word equal to the
-    chat job's shipped default REMOVES the override (no probe: nothing new is chosen), ``opus`` writes the Opus id,
-    ``haiku`` writes the alias, a full id is written exactly as typed. A value that is about to be written and is
-    not an alias word is first checked with one real stream-json call (#440, #448) when ``check`` is true: if
-    Claude rejects it nothing is written; any other check failure (timeout, expired login, rate limit) saves it
-    unchecked. ``lock`` is the single-flight lock all checks share.
+    full id, applied with the one write rule of ``brain.bridge.model_tier.set_job_models``: the pick WRITES its id as
+    the entry's value (``sonnet`` the chat job's shipped default id, ``opus`` the Opus id, ``haiku`` the alias, a full
+    id exactly as typed). The words ``sonnet`` and ``haiku`` are not probed (the shipped ids were verified); ``opus``
+    and any full id, including one equal to the default, are first checked with one real stream-json call (#440, #448)
+    when ``check`` is true: if Claude rejects it nothing is written; any other check failure (timeout, expired login,
+    rate limit) saves it unchecked. ``lock`` is the single-flight lock all checks share.
 
     Returns (200, {ok: true, model: <the id the chat job runs after the write>, checked?}),
             (400, {ok: false, error: "unknown_model", valid: [...]}),
@@ -717,19 +717,17 @@ async def _apply_chat_model(model: str, *, check: bool, lock: asyncio.Lock) -> t
         configured_job_models,
         is_valid_model,
         model_for_tier,
+        needs_probe,
         resolve_choice,
         set_job_models,
-        shipped_default,
     )
     from brain.tunables import TunablesWriteError
 
     if not is_valid_model(model):
         return 400, {"ok": False, "error": "unknown_model", "valid": sorted(KNOWN_MODELS)}
-    resolved = resolve_choice(model)
-    removal = model in KNOWN_MODELS and resolved == shipped_default(TIER_INTERACTIVE_CHAT)
-    to_write = None if removal else resolved
+    to_write = resolve_choice(model)
     checked: bool | None = None
-    if check and to_write is not None and to_write not in KNOWN_MODELS:
+    if check and to_write is not None and needs_probe(model):
         budget = _check_budget_s()
         contended = lock.locked()  # another check is running
         waiting_since = _clock()  # a wait for the lock counts against the budget, so a save stays inside it
@@ -2092,9 +2090,9 @@ def build_app(
     async def set_persona_model(req: ModelConfigReq) -> dict:
         """Set the chat model for the whole install (see ``_apply_chat_model``).
 
-        The chat model is the install-wide ``model.interactive_chat`` line of the tunables file; every bridge reads it
+        The chat model is the install-wide ``model.interactive_chat`` entry of the settings file; every bridge reads it
         on every call, so nothing is switched live. A persona on another provider (ollama, fake) is refused: its
-        picker must not change every Claude persona's line.
+        picker must not change every Claude persona's setting.
 
         Returns: {ok: true, model: <the id the chat job runs now>}  (+ ``checked: bool`` when a check was attempted)
         Errors:  400 {ok: false, error: "unknown_model", valid: [...]}

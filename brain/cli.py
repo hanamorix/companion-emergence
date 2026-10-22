@@ -1783,9 +1783,9 @@ def _paths_for_persona(persona: str) -> dict[str, Path]:
         "cache": get_cache_dir(),
         "logs": get_log_dir(),
         "personas_root": home / "personas",
-        # The only ops-override surface, and it lives under the platformdirs
+        # The settings file, the only ops-settings surface, and it lives under the platformdirs
         # home — undiscoverable unless `paths` says where it is (#63).
-        "tunables": home / "tunables.json",
+        "tunables": home / "tunables.toml",
         # Code location (#179) — an updater must find the install, not just the data.
         # install_kind is a bare word wrapped in Path so the str()/exists() plumbing
         # below stays uniform; its "exists" is meaningless and always False.
@@ -2510,8 +2510,8 @@ def _init_handler(args: argparse.Namespace) -> int:
 
 def _init_save_model(model: str) -> bool:
     """`nell init --model`: write the install-wide chat model setting (no Claude call, so a full id is checked when
-    first used). A word follows the one write rule; a full id is always written exactly as given. False after
-    printing why when the settings file could not be changed."""
+    first used). The pick is written as the entry's value: a word as the id it means, a full id exactly as given (nothing
+    is written when the value already equals it). False after printing why when the settings file could not be changed."""
     from brain.bridge.model_tier import TIER_INTERACTIVE_CHAT, model_for_tier, set_job_models
     from brain.tunables import TunablesWriteError
 
@@ -2539,51 +2539,61 @@ def _model_show_handler(args: argparse.Namespace) -> int:
     from brain.bridge.model_tier import (
         CLAUDE_TIERS,
         configured_job_models,
-        has_override,
         model_for_tier,
-        override_text,
         shipped_default,
+        unusable_setting_text,
     )
 
     configured = configured_job_models()
     print("models by job (job: model, shipped default or your setting); one setting for every persona on this install:")
     for tier in CLAUDE_TIERS:
         default = shipped_default(tier)
-        source = "your setting" if has_override(tier) and configured[tier] != default else "shipped default"
+        source = "your setting" if configured[tier] != default else "shipped default"
         line = f"  {tier}: {configured[tier]} ({source})"
         running = model_for_tier(tier)
         if running != configured[tier]:
             line += f"; running {running} now, because Claude rejected {configured[tier]}"
         print(line)
-        invalid = override_text(tier)
+        invalid = unusable_setting_text(tier)
         if invalid is not None:
             print(
-                f"warning: the setting {invalid!r} for {tier} in tunables.json is not a usable model, so "
+                f"warning: the setting {invalid!r} for {tier} in tunables.toml is not a usable model, so "
                 f"{default} is used instead"
             )
     print("this shows the saved settings; runtime fallbacks appear in the app (connection panel)")
     from brain.model_migration import pending_legacy
+    from brain.paths import get_home
 
+    if (get_home() / "tunables.json").exists():
+        print(
+            "note: an old tunables.json is still in the data folder; it is folded into tunables.toml the next time a "
+            "bridge starts or `nell model set`, `set-tier`, `clear-tier` or `init` runs"
+        )
     if pending_legacy():
         print(
             "note: a persona still holds a model from before this setting was shared; it is moved into the "
-            "shared setting (where none is set yet) the next time `nell model set`, `set-tier`, `clear-tier` or "
-            "`init` runs, or that persona's bridge starts"
+            "shared setting (where the setting still equals the shipped default) the next time `nell model set`, "
+            "`set-tier`, `clear-tier` or `init` runs, or that persona's bridge starts"
         )
     return 0
 
 
 def _run_model_migration() -> None:
-    """Fold a persona's saved model into the install-wide setting before a write command changes it (once)."""
+    """Bring older settings forward before a write command changes anything (each step is a no-op once done): an old
+    tunables.json is folded into tunables.toml (all-or-nothing from here: this command registers only the keys it
+    imported, so the bridge finishes a fold this command cannot), then a persona's saved model moves into the
+    install-wide setting."""
     from brain.model_migration import migrate_persona_models
     from brain.paths import get_home
+    from brain.tunables_migration import migrate_legacy_json
 
+    migrate_legacy_json(get_home(), complete_registry=False)
     migrate_persona_models(get_home(), None)
 
 
-def _model_write(updates: dict[str, str | None]) -> dict[str, str | None] | None:
-    """Run the migration, then ``set_job_models``. None (after printing why, exit non-zero) when the file cannot be
-    changed."""
+def _model_write(updates: dict[str, str | None]) -> dict[str, str] | None:
+    """Run the migrations, then ``set_job_models``. The ids written (empty when nothing changed), or None (after
+    printing why, exit non-zero) when the file cannot be changed."""
     from brain.bridge.model_tier import set_job_models
     from brain.tunables import TunablesWriteError
 
@@ -2612,11 +2622,15 @@ def _model_set_tier_handler(args: argparse.Namespace) -> int:
     if not is_valid_model(args.model):
         print(f"error: {args.model!r} is not a valid model: {MODEL_ID_RULE}", file=sys.stderr)
         return 1
-    if _model_write({args.tier: args.model}) is None:
+    written = _model_write({args.tier: args.model})
+    if written is None:
         return 1
     running = model_for_tier(args.tier)
-    suffix = "following the shipped default" if running == shipped_default(args.tier) else "checked when first used"
-    print(f"{args.tier} now uses {running} ({suffix})")
+    is_default = running == shipped_default(args.tier)
+    if args.tier in written:
+        print(f"{args.tier} now uses {running} ({'the shipped default' if is_default else 'checked when first used'})")
+    else:
+        print(f"{args.tier} already uses {running}" + (", which is already the default" if is_default else ""))
     return 0
 
 
@@ -2624,31 +2638,31 @@ def _model_set_handler(args: argparse.Namespace) -> int:
     """`nell model set <model>`: set the chat model with the picker's rules and the picker's save-time check.
 
     A word (sonnet, opus, haiku) or a full ``claude-`` id (64 cap). The setting is install-wide: it is written to
-    the tunables file directly (no bridge round trip: every bridge reads the file on every call), after the same
+    the settings file directly (no bridge round trip: every bridge reads the file on every call), after the same
     one-call check the picker runs on a newly chosen id (``brain.bridge.server._apply_chat_model`` is the one
     implementation of both).
     """
     import asyncio
 
     from brain.bridge import server as server_mod
-    from brain.bridge.model_tier import MODEL_ID_RULE, is_valid_model
+    from brain.bridge.model_tier import (
+        MODEL_ID_RULE,
+        TIER_INTERACTIVE_CHAT,
+        is_valid_model,
+        model_for_tier,
+    )
 
     if not is_valid_model(args.model):
         print(f"error: {args.model!r} is not a valid model: {MODEL_ID_RULE}", file=sys.stderr)
         return 1
     _run_model_migration()
+    before = model_for_tier(TIER_INTERACTIVE_CHAT)
     status, body = asyncio.run(server_mod._apply_chat_model(args.model, check=True, lock=asyncio.Lock()))
-    return _model_set_report(args.model, status, body)
+    return _model_set_report(args.model, status, body, unchanged=body.get("model") == before)
 
 
-def _model_set_report(model: str, status: int, body: dict) -> int:
-    from brain.bridge.model_tier import (
-        KNOWN_MODELS,
-        MODEL_ID_RULE,
-        TIER_INTERACTIVE_CHAT,
-        resolve_choice,
-        shipped_default,
-    )
+def _model_set_report(model: str, status: int, body: dict, *, unchanged: bool = False) -> int:
+    from brain.bridge.model_tier import MODEL_ID_RULE, TIER_INTERACTIVE_CHAT, shipped_default
 
     if status != 200:
         if status == 400 and body.get("error") == "model_unavailable":
@@ -2666,7 +2680,6 @@ def _model_set_report(model: str, status: int, body: dict) -> int:
             print(f"error: the model setting could not be saved: {detail} (file: {tunables._file_path()})", file=sys.stderr)
         return 1
     effective = body.get("model")
-    following = model in KNOWN_MODELS and resolve_choice(model) == shipped_default(TIER_INTERACTIVE_CHAT)
     if body.get("checked") is False:
         print(
             f"chat model is now {effective}. Couldn't check it right now, so it was saved unchecked; "
@@ -2674,8 +2687,10 @@ def _model_set_report(model: str, status: int, body: dict) -> int:
         )
     elif body.get("checked") is True:
         print(f"chat model is now {effective} (checked with Claude).")
-    elif following:
-        print(f"chat model is now {effective}, following the shipped default.")
+    elif unchanged and effective == shipped_default(TIER_INTERACTIVE_CHAT):
+        print(f"chat model is already the default ({effective}).")
+    elif unchanged:
+        print(f"chat model is already {effective}.")
     else:
         print(f"chat model is now {effective}.")
     print("this is the setting for every persona on this install; running bridges use it from their next call.")
@@ -3574,7 +3589,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     personas_sub.set_defaults(func=_personas_handler)
 
-    # nell model: which model each job runs (one install-wide setting per job, in the tunables file)
+    # nell model: which model each job runs (one install-wide setting per job, in tunables.toml)
     model_sub = subparsers.add_parser(
         "model",
         help="Show or set the model each job runs (one setting for every persona on this install).",
@@ -3600,7 +3615,7 @@ def _build_parser() -> argparse.ArgumentParser:
     m_chat.set_defaults(func=_model_set_handler)
 
     m_clear = model_actions.add_parser(
-        "clear-tier", help="Remove a job's setting so it uses its shipped default again."
+        "clear-tier", help="Put a job back on its shipped default model."
     )
     m_clear.add_argument("tier", type=_model_tier_arg, help="The job, for example interactive-chat.")
     m_clear.set_defaults(func=_model_clear_tier_handler)

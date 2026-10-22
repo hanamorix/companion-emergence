@@ -64,8 +64,9 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
       - background_jobs: list[{"name": str, "running_for_seconds": float}] —
         currently-running gated job/heartbeat names (ram-spike-fix INC-11),
         ordered LONGEST-RUNNING FIRST; [] when none are running
-      - tunables_notice: {"kind", "kept_as"} | None — a damaged tunables.json
-        that was healed or could not be read, until the user acts (#462)
+      - tunables_notice: {"kind", "line", "column", "reason"} | None — a
+        tunables.toml that could not be read and was left as it is, until the
+        user fixes it (#462)
 
     Never raises. Each subsystem failure contributes None / {} rather
     than propagating.
@@ -98,7 +99,7 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
         # #440: the chat model (as configured) when it was saved without the save-time check being able to confirm
         # it and no clean reply has arrived for it since. [] otherwise.
         "model_unconfirmed": _model_unconfirmed(),
-        # #446: the model setting in tunables.json that is not a usable model (the shipped default runs instead),
+        # #446: the model setting in tunables.toml that is not a usable model (the shipped default runs instead),
         # shown display-safe, else None. Only for a claude-cli persona.
         "model_unsupported": _model_unsupported(connection),
         "felt_time_recovered": _felt_time_recovered(persona_dir),
@@ -111,8 +112,8 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
             {"name": name, "running_for_seconds": round(elapsed, 3)}
             for name, elapsed in background_jobs.snapshot_with_elapsed()
         ],
-        # #462: a damaged tunables.json that was healed (or could not be read), persisted beside the file so EVERY bridge
-        # reports it until the user acts: {"kind": "reset" | "restored" | "unreadable", "kept_as": <file name> | None}, else None.
+        # #462: a tunables.toml that could not be read, left as it is and persisted beside the file so EVERY bridge reports
+        # it until the user fixes it: {"kind": "unreadable", "line": <int | None>, "column": <int | None>, "reason": <text>}, else None.
         "tunables_notice": tunables.current_notice(),
     }
 
@@ -149,11 +150,11 @@ def _model_unconfirmed() -> list[str]:
 
 def _model_unsupported(connection: dict[str, Any]) -> str | None:
     # The model setting only matters for the claude-cli provider; ollama / fake ignore it.
-    from brain.bridge.model_tier import TIER_INTERACTIVE_CHAT, override_text
+    from brain.bridge.model_tier import TIER_INTERACTIVE_CHAT, unusable_setting_text
 
     if connection.get("provider") != "claude-cli":
         return None
-    return override_text(TIER_INTERACTIVE_CHAT)
+    return unusable_setting_text(TIER_INTERACTIVE_CHAT)
 
 
 def _is_recovering(persona_dir: Path) -> bool:
@@ -286,7 +287,7 @@ def _build_connection(persona_dir: Path) -> dict[str, Any]:
 
     Provider comes from persona_config (the operator-tier choice).
     Model: for a claude-cli persona, the id the chat job runs right now (the
-    install-wide ``model.interactive_chat`` tunables line, or its fallback to the
+    install-wide ``model.interactive_chat`` setting, or its fallback to the
     shipped default after a rejection) and ``model_choice``, the picker word that
     id means (sonnet / opus / haiku) or None for a custom id; both are None for
     any other provider (its own model is not a Claude id).
