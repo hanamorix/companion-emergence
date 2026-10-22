@@ -1,6 +1,6 @@
 /**
  * The chat model setting: one of three words (sonnet / opus / haiku, the picker's vocabulary) or a full model id
- * (it starts with `claude-`), stored in the install's tunables file and passed to `claude --model` as written.
+ * (it starts with `claude-`), stored in the install's settings file (tunables.toml) and passed to `claude --model` as written.
  * The app holds no model id of its own: the brain resolves the words.
  *
  * KEEP IN SYNC with brain/bridge/model_tier.py (`KNOWN_MODELS`, `MODEL_ID_PATTERN`, `MODEL_ID_MAX_LENGTH`). The pattern is
