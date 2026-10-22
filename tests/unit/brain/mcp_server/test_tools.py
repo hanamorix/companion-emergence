@@ -568,3 +568,51 @@ def test_mcp_server_tools_module_never_imports_model_building_modules() -> None:
             f"brain/mcp_server/tools.py must never import {forbidden!r} — that would let the "
             "MCP child build a model in-process for a bridge-routed tool"
         )
+
+
+def _listed_tools(persona_dir: Path, fake_stores):
+    from mcp.server import Server
+
+    from brain.mcp_server.tools import register_tools
+
+    store, hebbian = fake_stores
+    server = Server("brain-tools")
+    register_tools(server, persona_dir=persona_dir, store=store, hebbian=hebbian)
+    list_handler = server.request_handlers[
+        __import__("mcp.types", fromlist=["ListToolsRequest"]).ListToolsRequest
+    ]
+    return asyncio.run(list_handler(MagicMock())).root.tools
+
+
+def test_always_loaded_tools_is_record_monologue_only() -> None:
+    """#525: the always-load set is what usage_selection.py chose from nell's logs."""
+    from brain.mcp_server.tools import ALWAYS_LOADED_TOOLS
+    from brain.tools import NELL_TOOL_NAMES
+
+    assert ALWAYS_LOADED_TOOLS == ("record_monologue",)
+    assert set(ALWAYS_LOADED_TOOLS) <= set(NELL_TOOL_NAMES)
+
+
+def test_list_tools_marks_only_the_always_loaded_tools(persona_dir: Path, fake_stores) -> None:
+    """#525: hot tools carry _meta anthropic/alwaysLoad so the CLI never defers them.
+
+    Every other brain tool must carry no such key, or it would be loaded up front
+    on every chat call and the deferral saving would be lost.
+    """
+    from brain.mcp_server.tools import ALWAYS_LOADED_TOOLS
+
+    tools = _listed_tools(persona_dir, fake_stores)
+    by_name = {t.name: t for t in tools}
+    for name in ALWAYS_LOADED_TOOLS:
+        assert by_name[name].meta == {"anthropic/alwaysLoad": True}
+    for t in tools:
+        if t.name not in ALWAYS_LOADED_TOOLS:
+            assert not (t.meta or {}).get("anthropic/alwaysLoad"), t.name
+
+
+def test_always_load_meta_reaches_the_wire(persona_dir: Path, fake_stores) -> None:
+    """#525: the key must serialise as `_meta` (the field the CLI reads), not `meta`."""
+    tools = _listed_tools(persona_dir, fake_stores)
+    wire = {t.name: t.model_dump(by_alias=True, exclude_none=True) for t in tools}
+    assert wire["record_monologue"]["_meta"] == {"anthropic/alwaysLoad": True}
+    assert "_meta" not in wire["search_memories"]
