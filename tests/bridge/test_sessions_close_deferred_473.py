@@ -69,3 +69,24 @@ def test_the_snapshot_route_reports_deferred_and_busy(persona_dir: Path, monkeyp
         sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
         bodies = [c.post("/sessions/snapshot", json={"session_id": sid}).json() for _ in range(3)]
     assert [(b["deferred"], b["busy"]) for b in bodies] == [(True, False), (False, True), (False, False)]
+
+
+def test_a_close_or_snapshot_refused_because_the_bridge_is_stopping_is_deferred_not_failed(persona_dir: Path, monkeypatch):
+    """#456 x #470 merge: a close or snapshot admitted before a stop whose extraction call is then refused
+    (ShutdownDeferred, raised so the background sweeps end) is reported like any other deferral: 200, deferred, the
+    session and its buffer kept; not a 502."""
+    from brain.bridge.cli_throttle import ShutdownDeferred
+
+    def _refused(*_a, **_k):
+        raise ShutdownDeferred("the bridge is stopping")
+
+    monkeypatch.setattr("brain.ingest.pipeline.close_session", _refused)
+    monkeypatch.setattr("brain.ingest.pipeline.extract_session_snapshot", _refused)
+    with _client(persona_dir) as c:
+        sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
+        snap = c.post("/sessions/snapshot", json={"session_id": sid})
+        assert snap.status_code == 200 and snap.json()["deferred"] is True
+        close = c.post("/sessions/close", json={"session_id": sid})
+        assert close.status_code == 200
+        assert close.json()["deferred"] is True and close.json()["closed"] is False
+        assert c.get(f"/state/{sid}").status_code == 200

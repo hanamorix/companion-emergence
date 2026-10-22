@@ -116,13 +116,14 @@ def test_maintenance_fires_from_persisted_due_time_on_fresh_process(
         )
     )
     _neutralise(monkeypatch)
-    monkeypatch.setattr("brain.bridge.supervisor._run_narrative_memory_pass", lambda *a, **k: None)
     calls = [0]
     stop = threading.Event()
+    # #456 (C3): a stop requested during forgetting pauses the maintenance job (no narrative pass, no advance), so
+    # the loop is ended from the narrative pass, which runs after forgetting when no stop is pending.
+    monkeypatch.setattr("brain.bridge.supervisor._run_narrative_memory_pass", lambda *a, **k: stop.set())
 
     def _counter(*a, **k):
         calls[0] += 1
-        stop.set()
         return {}
 
     monkeypatch.setattr("brain.bridge.supervisor.forgetting_run_pass", _counter)
@@ -242,13 +243,13 @@ def test_maintenance_advances_even_when_forgetting_raises(
         json.dumps({"next_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat()})
     )
     _neutralise(monkeypatch)
-    monkeypatch.setattr("brain.bridge.supervisor._run_narrative_memory_pass", lambda *a, **k: None)
     stop = threading.Event()
+    # #456 (C3): end the loop from the narrative pass (see the test above), not from inside forgetting.
+    monkeypatch.setattr("brain.bridge.supervisor._run_narrative_memory_pass", lambda *a, **k: stop.set())
     raised = [0]
 
     def _raiser(*a, **k):
         raised[0] += 1
-        stop.set()
         raise RuntimeError("boom")
 
     monkeypatch.setattr("brain.bridge.supervisor.forgetting_run_pass", _raiser)

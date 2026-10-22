@@ -24,6 +24,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from brain.bridge.cli_throttle import ThrottleDeferred
 from brain.bridge.provider import LLMProvider, ProviderError
 from brain.engines.reflex import ArcFire, ReflexArc
 from brain.growth.arc_storage import read_removed_arcs
@@ -383,6 +384,8 @@ def crystallize_reflex(
     # Provider call — never raise out of this function
     try:
         response_text = provider.generate(prompt)
+    except ThrottleDeferred:
+        raise  # #456: "not now": no growth run is recorded for this tick
     except ProviderError as exc:
         logger.warning("crystallize_reflex: provider failed: %s", exc)
         return ReflexCrystallizationResult(emergences=[], prunings=[])

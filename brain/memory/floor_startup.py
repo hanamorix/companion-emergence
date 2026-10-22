@@ -270,25 +270,53 @@ def start_background(
     # a race against the startup computation (`compute_missing_floors` ends it).
     if not try_begin("cosine"):
         return None
-    thread = threading.Thread(
-        target=compute_missing_floors,
-        args=(persona_dir,),
-        kwargs={"activity_marker": activity_marker, "_registered": True},
-        name=name,
-        daemon=True,
-    )
+    handle = _register_task("floor bootstrap (cosine)")
+    if handle is None:
+        end("cosine")
+        return None
+
+    def _run() -> None:
+        try:
+            compute_missing_floors(persona_dir, activity_marker=activity_marker, _registered=True)
+        finally:
+            _unregister_task(handle)
+
+    thread = threading.Thread(target=_run, name=name, daemon=True)
     try:
         thread.start()
     except Exception:
+        _unregister_task(handle)
         end("cosine")
         raise
     return thread
+
+
+def _register_task(label: str) -> int | None:
+    """#456 (C9): a floor computation is a counted bridge task while it runs, and none starts once the bridge is
+    stopping (None = do not start)."""
+    from brain.bridge import cli_throttle, shutdown_progress
+
+    try:
+        return shutdown_progress.registry.register(label, spawner=True)
+    except cli_throttle.ShutdownDeferred:
+        logger.info("floor_startup: %s not started, the bridge is stopping", label)
+        return None
+
+
+def _unregister_task(handle: int) -> None:
+    from brain.bridge import shutdown_progress
+
+    shutdown_progress.registry.unregister(handle)
 
 
 def _spawn(kind: str, body: Callable[[], object], *, name: str) -> threading.Thread | None:
     """Start `body` on a daemon thread under the `kind` in-flight slot; `None`
     when inhibited (tests) or another `kind` bootstrap is already in flight."""
     if _background_inhibited or not try_begin(kind):
+        return None
+    handle = _register_task(f"floor {kind}")
+    if handle is None:
+        end(kind)
         return None
 
     def _run() -> None:
@@ -298,11 +326,13 @@ def _spawn(kind: str, body: Callable[[], object], *, name: str) -> threading.Thr
             logger.exception("floor_startup: background %s bootstrap raised", kind)
         finally:
             end(kind)
+            _unregister_task(handle)
 
     thread = threading.Thread(target=_run, name=name, daemon=True)
     try:
         thread.start()
     except Exception:
+        _unregister_task(handle)
         end(kind)
         raise
     return thread

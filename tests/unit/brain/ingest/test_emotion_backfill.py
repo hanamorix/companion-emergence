@@ -573,3 +573,31 @@ def test_caller_supplied_store_is_used_and_left_open(tmp_path):
         assert reopened.get(m.id).emotions.get("loneliness") == 7.0
     finally:
         reopened.close()
+
+
+def test_run_that_loses_the_slot_after_tagging_some_is_not_marked_complete(tmp_path, monkeypatch):
+    """#487: a run that tagged some memories and then lost the throttle slot must end without recording completion,
+    so the untagged rest is picked up by a later pass (it used to break into the completion tail)."""
+    from contextlib import contextmanager
+
+    from brain.bridge import cli_throttle
+    from brain.ingest import emotion_backfill
+    from brain.ingest.emotion_backfill import run_emotion_backfill, should_run_emotion_backfill
+
+    store = _make_store(tmp_path)
+    for _ in range(3):
+        _create_memory(store, has_emotions=False)
+    store.close()
+    grants = iter([True])
+
+    @contextmanager
+    def _slot_then_lost(*_a, **_k):
+        yield next(grants, False)
+
+    monkeypatch.setattr(cli_throttle, "background_slot", _slot_then_lost)
+    state = run_emotion_backfill(tmp_path, tagger_fn=_stub_tagger, cap=50, delay_s=0)
+    assert state.tagged_memories == 1
+    assert state.status != "complete"
+    saved = emotion_backfill._load_state(tmp_path)
+    assert saved is not None and saved.status != "complete"
+    assert should_run_emotion_backfill(tmp_path)

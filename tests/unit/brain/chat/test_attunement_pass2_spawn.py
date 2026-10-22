@@ -40,7 +40,8 @@ def test_spawn_skips_when_buffer_empty(tmp_path: Path):
 
 
 def test_spawn_defers_when_budget_exhausted(tmp_path: Path):
-    with patch("brain.chat.tool_loop._attunement_consume_call", return_value=False), \
+    # #473: the budget is checked read-only before the call (and charged after it), so exhaustion is seen there.
+    with patch("brain.chat.tool_loop._attunement_budget_remaining", return_value=0), \
          patch("brain.chat.tool_loop.run_detector") as mock_detector:
         _spawn_pass2_attunement(
             tmp_path,
@@ -175,3 +176,66 @@ def test_pass2_threads_user_name_from_persona_config(tmp_path: Path):
         )
         _wait_for_attunement_threads(tmp_path)
     assert mock_detector.call_args.kwargs["user_name"] == "Alex"
+
+
+def test_two_attunement_calls_at_once_cannot_overshoot_the_daily_cap(tmp_path: Path):
+    """Pre-merge review O-7: the budget is checked before the call and charged after it (D24), so the check and the
+    charge must be one critical section: two callers with one call left must not both pass the check. The first
+    detector call waits (up to 2 s) for a second caller to reach its own call; with the lock, the second waits at the
+    check instead and then finds the day's budget spent."""
+    import threading
+    from datetime import UTC, datetime
+
+    from brain.attunement import budget
+    from brain.attunement.schemas import (
+        DAILY_BUDGET_DEFAULT,
+        SCHEMA_VERSION,
+        CurrentRead,
+        DetectorOutput,
+    )
+    from brain.chat.tool_loop import _run_attunement_pass2
+
+    now = datetime.now(UTC)
+    for _ in range(DAILY_BUDGET_DEFAULT - 1):
+        assert budget.consume_call(tmp_path, now=now)
+    assert budget.get_remaining(tmp_path, now=now) == 1
+
+    fake_read = CurrentRead(
+        ts="2026-06-02T10:00:00Z", source_turn_id="t1", tone_label="warm", tone_justification="open",
+        cadence_label="flowing", cadence_justification="long", mood_valence=0.5, mood_intensity=0.5,
+        predicted_arc_shape="steady", schema_version=SCHEMA_VERSION,
+    )
+    calls: list[int] = []
+    second_entered = threading.Event()
+    lock = threading.Lock()
+
+    def detector(**_kw):
+        with lock:
+            calls.append(1)
+            n = len(calls)
+        if n == 1:
+            second_entered.wait(timeout=2.0)
+        else:
+            second_entered.set()
+        return DetectorOutput(current_read=fake_read, pattern_candidates=[], addressed_pattern_ids=[])
+
+    def run():
+        _run_attunement_pass2(
+            tmp_path, turn_id="t1", user_message="I had a long day today, love.", reply_text="Tell me about it.",
+            buffer_slice=[BufferTurn(id="t1", content="I had a long day today, love.")],
+        )
+
+    with (
+        patch("brain.chat.tool_loop.run_detector", side_effect=detector),
+        patch("brain.chat.tool_loop.merge_into_learned"),
+        patch("brain.chat.tool_loop.write_current_read"),
+        patch("brain.chat.tool_loop.check_crystallisations"),
+        patch("brain.chat.tool_loop.mark_addressed"),
+    ):
+        threads = [threading.Thread(target=run) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+    assert len(calls) == 1
+    assert budget._load(tmp_path)["count"] == DAILY_BUDGET_DEFAULT

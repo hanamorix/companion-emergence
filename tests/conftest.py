@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 import os
 import tempfile
 from collections.abc import Iterator
@@ -65,6 +66,36 @@ def _isolated_dir(root: Path, dirs: object, sub: str) -> str:
     return str(root / author / appname / sub) if author else str(root / appname / sub)
 
 
+# The platformdirs directory properties as the platform defines them, captured before #488's fixture redirects them.
+_REAL_DIR_PROPS = {
+    prop: inspect.getattr_static(type(_paths_module._dirs), prop)
+    for prop in ("user_data_dir", "user_log_dir", "user_state_dir", "user_config_dir")
+}
+
+
+@pytest.fixture
+def real_platform_dirs(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """For a test that compares the home computed from an environment with platformdirs' own answer (#456 S15, the
+    pre-PR bridge proof): put the platform's real properties back over #488's redirect. For comparing paths ONLY.
+
+    On Linux the XDG variables #488 set still point into the test's tmp root; on macOS and Windows the restored
+    properties resolve to the REAL user directories, so the fixture fails the test if any exposed directory was
+    created, or gained or lost a top-level entry, during the test (tests/real_dirs_guard.py; names only, nothing read;
+    a developer's running bridge writing to its existing files there does not trip it)."""
+    from platformdirs import PlatformDirs
+
+    from brain import paths
+    from tests.real_dirs_guard import assert_untouched, fingerprint
+
+    for cls in {type(paths._dirs), PlatformDirs}:
+        for prop, value in _REAL_DIR_PROPS.items():
+            monkeypatch.setattr(cls, prop, value)
+    exposed = [Path(getattr(paths._dirs, prop)) for prop in _REAL_DIR_PROPS]
+    before = fingerprint(exposed)
+    yield
+    assert_untouched(before, fingerprint(exposed))
+
+
 @pytest.fixture(autouse=True)
 def _isolate_user_data_home(
     tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
@@ -119,6 +150,10 @@ def _reset_cli_throttle() -> Iterator[None]:
     cli_throttle.reset()
     provider_auth.reset()  # #246: the auth-expiry hooks live inside the CLI detail helpers
     model_error.reset()  # #440: process-wide rejected-model records must not leak between tests
+    # #456: a bridge app's stop seals the process-wide task registry; a later test in this process starts fresh.
+    from brain.bridge import shutdown_progress
+
+    shutdown_progress.reset_for_tests()
     yield
     cli_throttle.reset()
     provider_auth.reset()
@@ -186,6 +221,14 @@ def _inhibit_bridge_background_threads(monkeypatch: pytest.MonkeyPatch) -> None:
 
     # raising=False: a bisect onto a pre-flag commit must not error every test at setup.
     monkeypatch.setattr(server, "_background_threads_inhibited", True, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_service_install(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#456 (D20): `supervisor start` and the kill helper ask whether the persona's OS service is installed, which reads
+    the real user's unit / plist / task. No test may route a start or a kill through a real service manager: every test
+    sees "not installed" unless it patches this itself (the service tests do, with spies)."""
+    monkeypatch.setattr("brain.bridge.kill.service_installed", lambda persona, platform=None: False, raising=False)
 
 
 @pytest.fixture(autouse=True)

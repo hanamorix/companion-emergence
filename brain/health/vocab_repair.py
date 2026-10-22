@@ -196,6 +196,10 @@ def run_vocab_repair(
                 provider=provider,
             )
         except Exception as exc:  # noqa: BLE001
+            from brain.bridge.cli_throttle import ThrottleDeferred
+
+            if isinstance(exc, ThrottleDeferred):
+                raise
             logger.warning(
                 "vocab_repair: Step 2 description derivation failed (kept placeholders): %s", exc
             )
@@ -359,6 +363,8 @@ def _describe_stubs(
                 except ValueError as exc:
                     record_parse_failure(persona_dir, site="vocab_repair", raw=raw, error=str(exc))
                     raise
+            except _cli_throttle.ThrottleDeferred:
+                raise  # #456/#473: "not now": nothing more is written this run (no state rewrite either)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "vocab_repair: provider call or parse failed for batch %r: %s — "

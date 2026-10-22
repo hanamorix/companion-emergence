@@ -482,23 +482,6 @@ def _compacting_lock_path(persona_dir: Path, session_id: str) -> Path:
     return _active_conversations_dir(persona_dir) / f"{session_id}.compacting"
 
 
-def _pid_alive(pid: int) -> bool:
-    """True if a process with ``pid`` exists.
-
-    Delegates to state_file.pid_is_alive, which carries the Windows-safe
-    branch. NEVER use a raw ``os.kill(pid, 0)`` probe here: on Windows,
-    signal 0 is CTRL_C_EVENT, and probing a bogus pid delivers a real
-    Ctrl+C to our OWN console group (this aborted the whole pytest session
-    on windows-latest CI, and in production would interrupt whatever
-    console hosts the bridge). Lazy import: ingest is a lower layer than
-    bridge, so the dependency stays function-local."""
-    if pid <= 0:
-        return False
-    from brain.bridge.state_file import pid_is_alive
-
-    return pid_is_alive(pid)
-
-
 def acquire_compaction_lock(
     persona_dir: Path, session_id: str, *, stale_s: float = 600.0
 ) -> bool:
@@ -511,7 +494,9 @@ def acquire_compaction_lock(
     (skip). The caller releases via release_compaction_lock in a finally.
     """
     path = _compacting_lock_path(persona_dir, session_id)
-    payload = json.dumps({"pid": os.getpid(), "ts": _now_iso()})  # json-io: ok -- O_EXCL lock-file payload: a lock protocol, not a state file
+    from brain import process_identity
+
+    payload = json.dumps({"pid": os.getpid(), "ts": _now_iso(), "token": process_identity.own_token()})  # json-io: ok -- O_EXCL lock-file payload: a lock protocol, not a state file
     try:
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -525,7 +510,8 @@ def acquire_compaction_lock(
             holder_pid = int(holder.get("pid", -1))
         except (TypeError, ValueError):
             holder_pid = -1
-        if not _pid_alive(holder_pid):
+        holder_token = holder.get("token") if isinstance(holder.get("token"), str) else None
+        if holder_pid <= 0 or not process_identity.holder_alive(holder_pid, holder_token):
             reap = True
         else:
             try:

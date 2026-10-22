@@ -39,7 +39,7 @@ from typing import Any
 import httpx
 
 from brain import tunables
-from brain.bridge import model_error, provider_auth
+from brain.bridge import cli_throttle, model_error, provider_auth, shutdown_progress
 from brain.bridge.chat import (
     ChatMessage,
     ChatResponse,
@@ -61,6 +61,10 @@ logger = logging.getLogger(__name__)
 # Windows, so off-platform this is 0 (a no-op). stdout/stderr capture is
 # unaffected. Passed as creationflags= on every `claude` spawn below.
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+# #456 (D23): every `claude` child starts in its own session on POSIX, so a terminal Ctrl-C on `nell supervisor run`
+# reaches the bridge (which stops gracefully) and not its in-flight calls. Windows children are already detached from
+# the console (CREATE_NO_WINDOW); subprocess ignores the flag there.
+_OWN_SESSION = os.name != "nt"
 
 # ---------------------------------------------------------------------------
 # Per-turn budget backstop (Task 6 / A)
@@ -468,6 +472,14 @@ _TOOLS_REJECTED_RE = re.compile(r"(?<![\w-])--tools\b(?!-)")
 
 
 def _run_tools_probe(argv: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+    shutdown_progress.abandon_gate()  # #456 (D17): nothing new starts once the hard exit has begun
+    try:
+        return _run_tools_probe_spawn(argv)
+    finally:
+        shutdown_progress.abandon_gate()
+
+
+def _run_tools_probe_spawn(argv: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         list(argv),
         capture_output=True,
@@ -480,6 +492,7 @@ def _run_tools_probe(argv: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
         timeout=_TOOLS_PROBE_TIMEOUT_S,
         check=False,
         creationflags=_NO_WINDOW,
+        start_new_session=_OWN_SESSION,  # #456 D23: a terminal Ctrl-C reaches the bridge only
     )
 
 
@@ -1034,6 +1047,11 @@ class ClaudeCliProvider(LLMProvider):
         system: str | None = None,
         persona_dir: Path | None = None,
     ) -> str:
+        # #456 (D17): once the hard exit has begun, block (no spawn, no answer from a killed call).
+        shutdown_progress.abandon_gate()
+        # #456: a stopping bridge starts no new background call ("not now"; the caller keeps its work).
+        if cli_throttle.shutdown_requested():
+            raise cli_throttle.ShutdownDeferred("bridge is stopping")
         # #246: every background LLM call funnels through generate() (engines call it;
         # initiate's complete() delegates to it). While the login is expired, defer all
         # but one probe per interval so the autonomic layer stops spawning failing CLIs.
@@ -1057,19 +1075,23 @@ class ClaudeCliProvider(LLMProvider):
                 cmd.extend(["--system-prompt-file", sp_path])
 
             try:
-                result = subprocess.run(
-                    cmd,
-                    input=prompt,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=self._timeout,
-                    env=_subprocess_env(),
-                    cwd=_claude_work_dir(),  # #122: memory-free working directory
-                    check=False,
-                    creationflags=_NO_WINDOW,
-                )
+                try:
+                    result = subprocess.run(
+                        cmd,
+                        input=prompt,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=self._timeout,
+                        env=_subprocess_env(),
+                        cwd=_claude_work_dir(),  # #122: memory-free working directory
+                        check=False,
+                        creationflags=_NO_WINDOW,
+                        start_new_session=_OWN_SESSION,  # #456 D23: a terminal Ctrl-C reaches the bridge only
+                    )
+                finally:
+                    shutdown_progress.abandon_gate()
             except subprocess.TimeoutExpired as exc:
                 raise TimeoutError(
                     f"ClaudeCliProvider: subprocess timed out after {self._timeout}s"
@@ -1110,6 +1132,9 @@ class ClaudeCliProvider(LLMProvider):
         model no tools, and honours the provider's timeout. Raises ``ProviderAuthDeferred`` while the login is
         expired (as ``generate`` does) and ``ProviderError`` for any failure, its text carrying the signals.
         """
+        shutdown_progress.abandon_gate()  # #456 (D17)
+        if cli_throttle.shutdown_requested():  # #456: no new background call while the bridge stops
+            raise cli_throttle.ShutdownDeferred("bridge is stopping")
         if provider_auth.should_skip_background():
             raise provider_auth.ProviderAuthDeferred("provider auth expired — deferred")
         cmd = [
@@ -1423,6 +1448,7 @@ class ClaudeCliProvider(LLMProvider):
             if sp_path is not None:
                 cmd = list(cmd) + ["--system-prompt-file", sp_path]
 
+            shutdown_progress.abandon_gate()  # #456 (D17)
             try:
                 proc = subprocess.Popen(
                     cmd,
@@ -1435,6 +1461,7 @@ class ClaudeCliProvider(LLMProvider):
                     env=_subprocess_env(),
                     cwd=_claude_work_dir(),  # #122: memory-free working directory
                     creationflags=_NO_WINDOW,
+                    start_new_session=_OWN_SESSION,  # #456 D23: a terminal Ctrl-C reaches the bridge only
                 )
             except OSError as exc:
                 yield StreamError(stage="claude_cli_spawn", detail=str(exc))
@@ -1484,6 +1511,7 @@ class ClaudeCliProvider(LLMProvider):
                     try:
                         item = q.get(timeout=timeout)
                     except _queue_mod.Empty:
+                        shutdown_progress.abandon_gate()
                         proc.terminate()
                         _log_stream_timeout(
                             persona_dir,
@@ -1506,6 +1534,7 @@ class ClaudeCliProvider(LLMProvider):
                         )
                         return
 
+                    shutdown_progress.abandon_gate()  # #456 (D17): no frame of a killed call is acted on
                     if item is _STREAM_EOF:
                         break
 
@@ -1656,6 +1685,16 @@ class ClaudeCliProvider(LLMProvider):
     def _run_blocking_cli(
         self, cmd: list[str], flat_prompt: str, builtin_calls: dict[str, dict[str, Any]]
     ) -> tuple[subprocess.CompletedProcess[str], dict[str, Any] | None]:
+        """#456 (D17): no spawn once the hard exit has begun, and no answer from a call it killed."""
+        shutdown_progress.abandon_gate()
+        try:
+            return self._run_blocking_cli_inner(cmd, flat_prompt, builtin_calls)
+        finally:
+            shutdown_progress.abandon_gate()
+
+    def _run_blocking_cli_inner(
+        self, cmd: list[str], flat_prompt: str, builtin_calls: dict[str, dict[str, Any]]
+    ) -> tuple[subprocess.CompletedProcess[str], dict[str, Any] | None]:
         """Run `claude` to completion for the two blocking `chat()` branches.
 
         Scans stdout for the CLI's built-in tool calls (#273/#330) BEFORE any raise, so
@@ -1676,6 +1715,7 @@ class ClaudeCliProvider(LLMProvider):
                 cwd=_claude_work_dir(),  # #122: memory-free working directory
                 check=False,
                 creationflags=_NO_WINDOW,
+                start_new_session=_OWN_SESSION,  # #456 D23: a terminal Ctrl-C reaches the bridge only
             )
         except subprocess.TimeoutExpired as exc:
             try:
@@ -2707,6 +2747,9 @@ class OllamaProvider(LLMProvider):
         lives in one place.  This is the first working Ollama generate() path
         in companion-emergence — previously this raised NotImplementedError.
         """
+        shutdown_progress.abandon_gate()  # #456 (D17)
+        if cli_throttle.shutdown_requested():  # #456: no new background call while the bridge stops
+            raise cli_throttle.ShutdownDeferred("bridge is stopping")
         messages: list[ChatMessage] = []
         if system:
             messages.append(ChatMessage(role="system", content=system))

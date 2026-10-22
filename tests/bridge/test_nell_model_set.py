@@ -298,7 +298,7 @@ def _live_bridge(monkeypatch, home: Path, run: _Run):
     client = TestClient(build_app(persona_dir=home, client_origin="tests"))
     state = SimpleNamespace(pid=4321, port=51234, auth_token="tok-123")
     monkeypatch.setattr("brain.bridge.state_file.read", lambda d: state)
-    monkeypatch.setattr("brain.bridge.state_file.pid_is_alive", lambda pid: pid == 4321)
+    monkeypatch.setattr("brain.bridge.state_file.bridge_liveness", lambda st, d: "alive" if st.pid == 4321 else "gone")
     return p, client
 
 
@@ -343,7 +343,7 @@ def test_an_unsupported_value_never_reaches_a_running_bridge(monkeypatch, home: 
     p = _write(home)
     before = p.read_bytes()
     monkeypatch.setattr("brain.bridge.state_file.read", lambda d: SimpleNamespace(pid=4321, port=51234, auth_token="t"))
-    monkeypatch.setattr("brain.bridge.state_file.pid_is_alive", lambda pid: True)
+    monkeypatch.setattr("brain.bridge.state_file.bridge_liveness", lambda st, d: "alive")
     cli._build_parser()
     with _no_bridge_call():
         rc = cli.main(["model", "set", "Fable", "--persona", "bob"])
@@ -401,7 +401,7 @@ def test_a_bridge_that_started_while_the_check_ran_gets_nothing_written_behind_i
     before = p.read_bytes()
     states = iter([None, SimpleNamespace(pid=4321, port=51234, auth_token="t")])
     monkeypatch.setattr("brain.bridge.state_file.read", lambda d: next(states))
-    monkeypatch.setattr("brain.bridge.state_file.pid_is_alive", lambda pid: True)
+    monkeypatch.setattr("brain.bridge.state_file.bridge_liveness", lambda st, d: "alive")
     run = _Run(lambda m: _ok())
     cli._build_parser()
     with _no_bridge_call(), patch(
@@ -419,7 +419,7 @@ def test_a_bridge_that_started_before_an_alias_write_is_also_refused(monkeypatch
     before = p.read_bytes()
     states = iter([None, SimpleNamespace(pid=4321, port=51234, auth_token="t")])
     monkeypatch.setattr("brain.bridge.state_file.read", lambda d: next(states))
-    monkeypatch.setattr("brain.bridge.state_file.pid_is_alive", lambda pid: True)
+    monkeypatch.setattr("brain.bridge.state_file.bridge_liveness", lambda st, d: "alive")
     cli._build_parser()
     rc = cli.main(["model", "set", "opus", "--persona", "bob"])
     assert rc == 1 and p.read_bytes() == before and "started while" in capsys.readouterr().err
@@ -428,7 +428,7 @@ def test_a_bridge_that_started_before_an_alias_write_is_also_refused(monkeypatch
 def test_a_stale_state_file_means_not_running(monkeypatch, home: Path, capsys):
     p = _write(home)
     monkeypatch.setattr("brain.bridge.state_file.read", lambda d: SimpleNamespace(pid=999999, port=51234, auth_token="t"))
-    monkeypatch.setattr("brain.bridge.state_file.pid_is_alive", lambda pid: False)
+    monkeypatch.setattr("brain.bridge.state_file.bridge_liveness", lambda st, d: "gone")
     cli._build_parser()
     with _no_bridge_call(), patch(
         "subprocess.run", _Run(lambda m: _ok())
@@ -663,7 +663,7 @@ def test_the_detail_of_an_unexpected_200_is_cleaned(monkeypatch, home: Path, cap
 def test_the_reason_of_an_unreachable_port_is_cleaned(monkeypatch, home: Path, capsys):
     _write(home)
     monkeypatch.setattr("brain.bridge.state_file.read", lambda d: SimpleNamespace(pid=4321, port=51234, auth_token="t"))
-    monkeypatch.setattr("brain.bridge.state_file.pid_is_alive", lambda pid: True)
+    monkeypatch.setattr("brain.bridge.state_file.bridge_liveness", lambda st, d: "alive")
     cli._build_parser()
     bridge = _Bridge(connect_exc=OSError("refused\x1b[31m\nred\x07"))
     with patch("http.client.HTTPConnection", bridge.factory):
@@ -683,7 +683,7 @@ def test_a_non_http_answer_is_a_clear_message_not_a_traceback(monkeypatch, home:
     p = _write(home)
     before = p.read_bytes()
     monkeypatch.setattr("brain.bridge.state_file.read", lambda d: SimpleNamespace(pid=4321, port=51234, auth_token="t"))
-    monkeypatch.setattr("brain.bridge.state_file.pid_is_alive", lambda pid: True)
+    monkeypatch.setattr("brain.bridge.state_file.bridge_liveness", lambda st, d: "alive")
     cli._build_parser()
     bridge = _Bridge(response_exc=exc)
     with patch("http.client.HTTPConnection", bridge.factory):
@@ -777,7 +777,7 @@ def _point_at(monkeypatch, port: int) -> None:
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("NO_PROXY", "127.0.0.1")
     monkeypatch.setattr("brain.bridge.state_file.read", lambda d: SimpleNamespace(pid=4321, port=port, auth_token="t"))
-    monkeypatch.setattr("brain.bridge.state_file.pid_is_alive", lambda pid: True)
+    monkeypatch.setattr("brain.bridge.state_file.bridge_liveness", lambda st, d: "alive")
     cli._build_parser()
 
 

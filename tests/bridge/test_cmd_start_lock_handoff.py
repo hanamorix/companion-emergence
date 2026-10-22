@@ -36,7 +36,6 @@ def test_cmd_start_leaves_lock_free_for_child_runner(tmp_path, monkeypatch):
         return 4242
 
     monkeypatch.setattr(daemon, "spawn_detached", _fake_spawn)
-    monkeypatch.setattr(daemon, "run_recovery_if_needed", lambda pd: None)
 
     # Make the readiness probe succeed immediately so cmd_start returns fast.
     ready = SimpleNamespace(pid=4242, port=51999, auth_token="t", shutdown_clean=True)
@@ -108,7 +107,6 @@ def test_c19a_two_cmd_starts_forced_into_handoff_window(tmp_path, monkeypatch, c
     # state_file.is_running is REAL here (no persona has a bridge.json until
     # role-b's child writes one), so the loser's report picks the applicable
     # S57 wording from real state.
-    monkeypatch.setattr(daemon, "run_recovery_if_needed", lambda pd: None)
     monkeypatch.setattr("brain.paths.get_log_dir", lambda: tmp_path / "logs")
 
     # No real uvicorn server ever runs; only the HTTP hop of cmd_start's

@@ -151,27 +151,10 @@ def test_delete_session_buffer_retries_transient_permission_error(
     assert not path.exists()
 
 
-def test_pid_alive_delegates_to_windows_safe_probe(monkeypatch) -> None:
-    """Windows CI regression: the compaction lock's dead-pid probe used a raw
-    ``os.kill(pid, 0)`` — on Windows signal 0 is CTRL_C_EVENT, and probing a
-    bogus pid delivers a REAL Ctrl+C to our own console group (this aborted
-    the whole pytest session at ~42% on windows-latest). The probe must
-    delegate to state_file.pid_is_alive, which carries the Windows-safe
-    branch — and brain/ingest must contain no direct os.kill at all."""
-    from brain.bridge import state_file
-    from brain.ingest import buffer as buffer_mod
-
-    # Through-path: the delegate is what answers.
-    sentinel_calls = []
-    monkeypatch.setattr(
-        state_file, "pid_is_alive", lambda pid: sentinel_calls.append(pid) or True
-    )
-    assert buffer_mod._pid_alive(4242) is True
-    assert sentinel_calls == [4242]
-    # pid <= 0 short-circuits without touching the delegate.
-    assert buffer_mod._pid_alive(0) is False
-    assert sentinel_calls == [4242]
-
+def test_brain_ingest_makes_no_direct_os_kill_call() -> None:
+    """Windows CI regression: a raw ``os.kill(pid, 0)`` probe on Windows delivers a REAL Ctrl+C (signal 0 is
+    CTRL_C_EVENT) to our own console group (this once aborted the whole pytest session on windows-latest). Holder
+    liveness goes through ``process_identity`` (#472); brain/ingest must contain no direct os.kill at all."""
     # Source-pin: no direct os.kill CALLS anywhere in brain/ingest (the footgun
     # class). Doc mentions (backtick-quoted) are allowed. Scanned in-process —
     # shelling out to ``grep`` failed on stock Windows (#262).

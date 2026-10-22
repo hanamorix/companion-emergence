@@ -82,6 +82,7 @@ def main() -> int:
         # bridge.json / bound a port" without doing either.
         Path(args.marker).write_text(str(os.getpid()), encoding="utf-8")
         if args.write_state_port is not None:
+            from brain import process_identity
             from brain.bridge import state_file
 
             state_file.write(
@@ -94,6 +95,9 @@ def main() -> int:
                     stopped_at=None,
                     shutdown_clean=False,
                     client_origin=client_origin,
+                    # #456: a bridge from this PR on records its identity token; readers check it.
+                    pid_token=process_identity.own_token(),
+                    identity="token",
                 ),
             )
         stop_path = Path(args.stop_file)

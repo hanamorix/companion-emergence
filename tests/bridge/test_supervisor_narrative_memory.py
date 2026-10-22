@@ -255,6 +255,72 @@ def test_narrative_pass_is_skipped_when_the_real_exemption_read_fails(
     assert not (persona_dir / "hebbian.db").exists(), "a skipped pass must not open the stores"
 
 
+def test_a_stop_after_forgetting_skips_the_narrative_pass_and_keeps_the_cadence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C3 (#456, D2): forgetting finishes its last item with the stop already requested. The narrative pass (model
+    calls) must not start, the maintenance job reports PAUSED, and its cadence file is unchanged."""
+    from brain.bridge import central_cadence, cli_throttle
+    from brain.paths import cadence_state_path
+
+    cli_throttle.reset()
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    cadence = cadence_state_path(persona_dir, "maintenance_cadence.json")
+    cadence.parent.mkdir(parents=True, exist_ok=True)
+    cadence.write_text('{"next_at": "2026-01-01T00:00:00+00:00"}', encoding="utf-8")
+    before = cadence.read_bytes()
+    stop_event = threading.Event()
+    calls: list[str] = []
+    decisions: list = []
+
+    def _forgetting_whose_last_item_sees_the_stop(persona_dir, *, event_bus, should_pause, progress_out, **_):
+        calls.append("forgetting")
+        stop_event.set()  # requested while the last item ran; the pass then ends normally, not paused
+        return {"faded": 0, "lost": 0, "total": 1, "exempt": 0, "unfaded": 0, "duration_ms": 0}
+
+    real_pass = central_cadence.run_central_pass
+
+    def _recording_pass(*a, **kw):
+        out = real_pass(*a, **kw)
+        decisions.extend(out)
+        return out
+
+    monkeypatch.setattr("brain.bridge.supervisor.forgetting_run_pass", _forgetting_whose_last_item_sees_the_stop)
+    monkeypatch.setattr(
+        "brain.bridge.supervisor._run_narrative_memory_pass", lambda *a, **k: calls.append("narrative")
+    )
+    monkeypatch.setattr("brain.bridge.supervisor.central_cadence.run_central_pass", _recording_pass)
+    monkeypatch.setattr("brain.bridge.supervisor._run_soul_review_tick", lambda *a, **k: (0, 0))
+    monkeypatch.setattr("brain.bridge.supervisor._run_voice_reflection_tick", lambda *a, **k: None)
+    try:
+        run_folded(
+            stop_event,
+            persona_dir=persona_dir,
+            provider=MagicMock(),
+            event_bus=MagicMock(),
+            tick_interval_s=0.05,
+            heartbeat_interval_s=None,
+            soul_review_interval_s=3600.0,
+            finalize_interval_s=None,
+            interest_sweep_interval_s=None,
+            initiate_review_interval_s=None,
+            self_model_interval_s=None,
+            compaction_interval_s=None,
+            calibration_interval_s=None,
+            judge_selftune_interval_s=None,
+            clustering_interval_s=None,
+            maker_enabled=False,
+            notes_enabled=False,
+            kindled_link_enabled=False,
+        )
+    finally:
+        cli_throttle.reset()
+    assert calls == ["forgetting"]
+    assert ("maintenance", "paused") in {(d.job, d.action) for d in decisions}
+    assert cadence.read_bytes() == before
+
+
 def test_430_c9_merge_target_of_accepted_candidate_stays_out_of_open_arcs(tmp_path: Path) -> None:
     """#430 C9: the narrative pass shares the forgetting loader, so the merge target of an accepted soul
     candidate is exempt there too and the candidate sweep skips it (the treatment every crystallised

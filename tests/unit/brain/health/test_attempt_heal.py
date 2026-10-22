@@ -355,7 +355,7 @@ def _fd_name(fd: int, root: Path) -> str:
     return "<unknown>"
 
 
-_TEMP_TAG = re.compile(r"\.t\d+-[0-9a-f]+(?=\.(?:bak1\.)?new$)")
+_TEMP_TAG = re.compile(r"\.t\d+-(?:k[0-9a-f]{12}-)?[0-9a-f]+(?=\.(?:bak1\.)?new$)")  # #472: optional identity digest
 
 
 def _norm(name: str) -> str:

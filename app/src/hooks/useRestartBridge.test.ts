@@ -1,8 +1,8 @@
-// Vitest coverage for the v0.0.14 bridge-restart hook. Mocks the four
-// bridge.ts call sites and walks the state machine through happy path,
-// both HTTP-step timeouts, and the post-force health-poll failure.
+// Vitest coverage for the bridge restart (#456 C17 a-m, Q-A, D7, D10, D18, D21, D22) and the one-restart-app-wide
+// behaviour (#310, #335, #365).
 //
-// Spec: docs/superpowers/specs/2026-05-17-bridge-restart-button-design.md §5–6.
+// The bridge is a small in-memory "world": its liveness, stop phase, progress record and /health, as the app reads
+// them through the mocked Tauri / HTTP calls. Time is fake: the 180 s offer and the 500 ms / 5 s polls are advanced.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { renderHook, act, waitFor, cleanup } from "@testing-library/react";
@@ -11,13 +11,23 @@ import * as bridge from "../bridge";
 import * as appConfig from "../appConfig";
 import {
   _resetRestartBridgeForTests,
+  awaitStoppingBridge,
   clearRestartState,
+  EVERYTHING_STOPPED,
+  HARD_EXIT_DONE,
+  HARD_EXIT_OFFER_AFTER_MS,
+  offerLine,
+  progressLine,
   restartBridge,
+  restartInFlight,
+  stopBridgeThen,
   TIMEOUT_HEALTH_MS,
+  TIMEOUT_SHUTDOWN_MS,
   useRestartBridge,
 } from "./useRestartBridge";
 
 const PERSONA = "test-persona";
+const T0 = new Date("2026-10-19T21:00:00.000Z");
 
 function jsonResponse(status: number, body: object = {}): Response {
   return new Response(JSON.stringify(body), {
@@ -26,9 +36,133 @@ function jsonResponse(status: number, body: object = {}): Response {
   });
 }
 
+interface World {
+  pid: number;
+  token: string;
+  alive: "alive" | "gone";
+  phase: "live" | "stopping";
+  legacy: boolean;
+  proven: boolean;
+  /** /health answers (the listener closes once a stop begins). */
+  health: boolean;
+  /** A progress record of this bridge exists. */
+  record: boolean;
+  tasks: string[];
+  requestedAt: string | null;
+  /** The next N `status --json` reads time out ("unknown"). */
+  unknownReads: number;
+  statusUnknown: boolean;
+  readError: boolean;
+}
+
+function fresh(): World {
+  return {
+    pid: 4242,
+    token: "tok-4242",
+    alive: "alive",
+    phase: "live",
+    legacy: false,
+    proven: false,
+    health: true,
+    record: false,
+    tasks: [],
+    requestedAt: null,
+    unknownReads: 0,
+    statusUnknown: false,
+    readError: false,
+  };
+}
+
+let w: World = fresh();
+
+/** The bridge begins its stop now: listener closed, record written, the request time recorded. */
+function beginStop(tasks: string[] = w.tasks): void {
+  w.phase = "stopping";
+  w.health = false;
+  w.record = true;
+  w.tasks = tasks;
+  w.requestedAt = new Date(Date.now()).toISOString();
+}
+
+function mocks() {
+  return {
+    status: vi.spyOn(bridge, "bridgeStatus").mockImplementation(async () => {
+      if (w.unknownReads > 0) {
+        w.unknownReads -= 1;
+        return { alive: "unknown" };
+      }
+      if (w.statusUnknown) return { alive: "unknown" };
+      if (w.alive === "gone") return { alive: "gone" };
+      return {
+        alive: "alive",
+        pid: w.pid,
+        pid_token: w.token,
+        legacy: w.legacy,
+        proven: w.proven,
+        phase: w.phase,
+        stop_requested_at: w.requestedAt,
+      };
+    }),
+    read: vi.spyOn(bridge, "readBridgeShutdown").mockImplementation(async () => {
+      if (w.readError) throw new Error("read_bridge_shutdown: unreadable");
+      if (w.alive !== "alive" || !w.record) return null;
+      return { pid: w.pid, pid_token: w.token, phase: "stopping", requested_at: w.requestedAt, tasks: [...w.tasks] };
+    }),
+    shutdown: vi.spyOn(bridge, "shutdownBridge").mockImplementation(async () => {
+      if (!w.health) throw new TypeError("fetch failed");
+      beginStop();
+      return jsonResponse(202, { status: "stopping" });
+    }),
+    health: vi.spyOn(bridge, "fetchHealth").mockImplementation(async () => {
+      if (w.alive === "alive" && w.health) return { liveness: "ok" } as never;
+      throw new Error("/health unreachable");
+    }),
+    hardExit: vi.spyOn(bridge, "requestBridgeHardExit").mockResolvedValue(),
+    force: vi.spyOn(bridge, "invokeForceRestart").mockImplementation(async () => {
+      w = fresh(); // Rust: `stop --kill`, then the normal start
+    }),
+    start: vi.spyOn(appConfig, "ensureBridgeRunning").mockImplementation(async () => {
+      w = fresh();
+    }),
+    // Every HTTP request that is not one of the mocked helpers above reaches fetch (outside Tauri the credentials
+    // fall back to the dev URL); its URL is kept for (a). The bridge reports an open session, so a pre-stop save
+    // (the old flow: GET /sessions/active, then POST /sessions/snapshot) would reach the snapshot request; anything
+    // else is refused like a closed port.
+    fetch: vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      if (requestPath(input) === "/sessions/active") return jsonResponse(200, { session_id: "s-open" });
+      throw new TypeError("fetch failed");
+    }),
+  };
+}
+
+function requestPath(input: unknown): string {
+  const url = input instanceof Request ? input.url : String(input);
+  return new URL(url, "http://127.0.0.1").pathname;
+}
+
+/** The paths of every request that reached fetch. */
+function requestedPaths(fetchSpy: { mock: { calls: unknown[][] } }): string[] {
+  return fetchSpy.mock.calls.map(([input]) => requestPath(input));
+}
+
+async function advance(ms: number): Promise<void> {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(ms);
+  });
+}
+
+function startRestart(restart: () => Promise<boolean>): { done: () => Promise<boolean> } {
+  let p: Promise<boolean> = Promise.resolve(false);
+  act(() => {
+    p = restart();
+  });
+  return { done: () => p };
+}
+
 beforeEach(() => {
   vi.restoreAllMocks();
   _resetRestartBridgeForTests();
+  w = fresh();
 });
 
 afterEach(() => {
@@ -36,505 +170,686 @@ afterEach(() => {
   cleanup();
 });
 
-describe("useRestartBridge", () => {
-  it("happy path: idle → closing → shutting_down → reconnecting → waiting_for_health → reconnecting → success", async () => {
-    vi.spyOn(bridge, "snapshotActiveSession").mockResolvedValue(jsonResponse(200));
-    vi.spyOn(bridge, "shutdownBridge").mockResolvedValue(jsonResponse(202));
-    vi.spyOn(appConfig, "ensureBridgeRunning").mockResolvedValue(undefined);
-    vi.spyOn(bridge, "fetchHealth").mockResolvedValue({ liveness: "ok" });
-    const forceMock = vi.spyOn(bridge, "invokeForceRestart").mockResolvedValue();
-
+describe("useRestartBridge: a new bridge (#456)", () => {
+  it("(a, b, c, e, i) asks for the stop, shows what runs, says Everything has stopped, then starts normally", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.tasks = ["chat reply", "background job: compaction"];
+    const m = mocks();
     const { result, rerender } = renderHook(
-      ({ mode }: { mode: "live" | "bridge_down" }) =>
-        useRestartBridge(PERSONA, mode),
+      ({ mode }: { mode: "live" | "bridge_down" }) => useRestartBridge(PERSONA, mode),
       { initialProps: { mode: "bridge_down" } },
     );
-    expect(result.current.state).toBe("idle");
+    const run = startRestart(() => result.current.restart());
+    await advance(1000);
 
-    act(() => {
-      result.current.restart();
-    });
+    expect(m.shutdown).toHaveBeenCalledWith(PERSONA, expect.any(AbortSignal), "app_restart");
+    expect(result.current.state).toBe("stopping");
+    expect(result.current.progress).toBe(
+      "Stopping. Waiting for 2 tasks to finish: chat reply, background job: compaction.",
+    );
 
-    await waitFor(() => expect(result.current.state).toBe("reconnecting"));
-    expect(forceMock).not.toHaveBeenCalled();
+    w.tasks = ["background job: compaction"];
+    await advance(1000);
+    expect(result.current.progress).toBe(progressLine(["background job: compaction"]));
+    expect(m.start).not.toHaveBeenCalled();
 
-    // Parent's /state poll flips back to "live" → reconnecting → success.
+    w.alive = "gone"; // the last task ended and the bridge exited
+    await advance(6000);
+    expect(result.current.progress).toBe(EVERYTHING_STOPPED);
+    expect(m.start).toHaveBeenCalledWith(PERSONA); // (i) the normal start, after the old bridge is gone
+    await expect(run.done()).resolves.toBe(true);
+    expect(result.current.state).toBe("reconnecting");
+
+    expect(requestedPaths(m.fetch)).not.toContain("/sessions/snapshot"); // (a) no pre-stop save
+    expect(m.force).not.toHaveBeenCalled(); // (b) nothing writes a stop intent on a graceful stop
+    expect(m.hardExit).not.toHaveBeenCalled();
+    expect(result.current.offerHardExit).toBe(false);
+
+    // waitFor drains with a setTimeout(0) that vitest's fake timers would never fire: real timers from here on.
+    vi.useRealTimers();
     rerender({ mode: "live" });
     await waitFor(() => expect(result.current.state).toBe("success"));
   });
 
-  it("4xx from /sessions/snapshot is treated as success — snapshotActiveSession returns the Response", async () => {
-    // Spec §6.2: only 5xx + timeouts escalate. Our snapshotActiveSession
-    // never throws on 4xx — it returns the raw Response and the hook
-    // moves forward to shutdown.
-    vi.spyOn(bridge, "snapshotActiveSession").mockResolvedValue(jsonResponse(404));
-    vi.spyOn(bridge, "shutdownBridge").mockResolvedValue(jsonResponse(202));
-    vi.spyOn(appConfig, "ensureBridgeRunning").mockResolvedValue(undefined);
-    vi.spyOn(bridge, "fetchHealth").mockResolvedValue({ liveness: "ok" });
-    const forceMock = vi.spyOn(bridge, "invokeForceRestart").mockResolvedValue();
-
-    const { result } = renderHook(() =>
-      useRestartBridge(PERSONA, "bridge_down"),
-    );
-    act(() => {
-      result.current.restart();
+  it("(c) a 503 bridge_stopping means the stop already began", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const m = mocks();
+    m.shutdown.mockImplementation(async () => {
+      beginStop(["soul review"]);
+      return jsonResponse(503, { code: "bridge_stopping", message: "the bridge is stopping" });
     });
-
-    await waitFor(() => expect(result.current.state).toBe("reconnecting"));
-    expect(forceMock).not.toHaveBeenCalled();
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    startRestart(() => result.current.restart());
+    await advance(1000);
+    expect(result.current.state).toBe("stopping");
+    expect(m.shutdown).toHaveBeenCalledTimes(1);
+    expect(m.force).not.toHaveBeenCalled();
+    expect(result.current.progress).toBe(progressLine(["soul review"]));
+    w.alive = "gone";
+    await advance(6000);
+    expect(m.start).toHaveBeenCalledTimes(1);
   });
 
-  it("/sessions/snapshot timeout escalates to forcing → reconnecting", async () => {
+  it("(d) while /health answers and no stop is recorded, the request is retried every 500 ms for 180 s, then fails without a kill", async () => {
     vi.useFakeTimers();
-    // Hang the snapshot call past its 5s timeout.
-    vi.spyOn(bridge, "snapshotActiveSession").mockImplementation(
-      () => new Promise<Response>(() => {}),
-    );
-    const forceMock = vi
-      .spyOn(bridge, "invokeForceRestart")
-      .mockResolvedValue();
-    vi.spyOn(bridge, "fetchHealth").mockResolvedValue({ liveness: "ok" });
+    vi.setSystemTime(T0);
+    const m = mocks();
+    m.shutdown.mockImplementation(async () => jsonResponse(500, { detail: "internal" }));
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    const run = startRestart(() => result.current.restart());
 
-    const { result } = renderHook(() =>
-      useRestartBridge(PERSONA, "bridge_down"),
-    );
-    act(() => {
-      result.current.restart();
-    });
+    await advance(10_000);
+    const after10s = m.shutdown.mock.calls.length;
+    expect(after10s).toBeGreaterThanOrEqual(19);
+    expect(after10s).toBeLessThanOrEqual(21);
+    expect(result.current.state).toBe("requesting");
 
-    // Trip the close timeout, then let the forcing + health-poll
-    // microtask chain settle on subsequent timer flushes.
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(5500);
-    });
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(600);
-    });
+    await advance(HARD_EXIT_OFFER_AFTER_MS - 10_000 + 1000);
+    await expect(run.done()).resolves.toBe(false);
+    expect(result.current.state).toBe("failed");
+    expect(result.current.errorDetail).toMatch(/Restart failed/);
+    expect(m.shutdown.mock.calls.length).toBeLessThanOrEqual(HARD_EXIT_OFFER_AFTER_MS / 500 + 2);
+    expect(m.force).not.toHaveBeenCalled();
+    expect(m.start).not.toHaveBeenCalled();
+  });
 
-    expect(forceMock).toHaveBeenCalledWith(PERSONA);
+  it("(e) offers the hard exit at the recorded request + 180 s, kills nothing before acceptance, then asks the bridge", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.tasks = ["heartbeat (Claude call)"];
+    const m = mocks();
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    const run = startRestart(() => result.current.restart());
+
+    await advance(HARD_EXIT_OFFER_AFTER_MS - 1000);
+    expect(result.current.offerHardExit).toBe(false);
+    await advance(2000);
+    expect(result.current.offerHardExit).toBe(true);
+    expect(result.current.offerText).toBe(offerLine(["heartbeat (Claude call)"]));
+
+    await advance(600_000); // no answer: the bridge keeps waiting, nothing is killed or asked
+    expect(m.force).not.toHaveBeenCalled();
+    expect(m.hardExit).not.toHaveBeenCalled();
+    expect(result.current.state).toBe("stopping");
+
+    act(() => result.current.hardExit());
+    await advance(1000);
+    expect(m.hardExit).toHaveBeenCalledWith(PERSONA, { pid: 4242, pid_token: "tok-4242" });
+    expect(result.current.offerHardExit).toBe(false);
+    expect(m.force).not.toHaveBeenCalled();
+
+    w.alive = "gone"; // the bridge acted on the request
+    await advance(6000);
+    expect(result.current.progress).toBe(HARD_EXIT_DONE);
+    expect(m.start).toHaveBeenCalledWith(PERSONA);
+    await expect(run.done()).resolves.toBe(true);
+    expect(m.force).not.toHaveBeenCalled();
+  });
+
+  it("(e) Keep waiting hides the offer and never kills", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.tasks = ["soul review"];
+    const m = mocks();
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    startRestart(() => result.current.restart());
+    await advance(HARD_EXIT_OFFER_AFTER_MS + 1000);
+    expect(result.current.offerHardExit).toBe(true);
+    act(() => result.current.keepWaiting());
+    expect(result.current.offerHardExit).toBe(false);
+    await advance(1_000_000);
+    expect(result.current.offerHardExit).toBe(false); // offered once
+    expect(m.hardExit).not.toHaveBeenCalled();
+    expect(m.force).not.toHaveBeenCalled();
+    expect(result.current.state).toBe("stopping");
+    w.alive = "gone";
+    await advance(6000);
+    expect(result.current.progress).toBe(EVERYTHING_STOPPED);
+  });
+
+  it("(f) a status read that times out keeps waiting and a progress-record read error is retried", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.tasks = ["chat reply"];
+    const m = mocks();
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    startRestart(() => result.current.restart());
+    await advance(1000);
+    expect(result.current.state).toBe("stopping");
+
+    w.statusUnknown = true;
+    w.readError = true;
+    const readsBefore = m.read.mock.calls.length;
+    await advance(60_000);
+    expect(m.read.mock.calls.length - readsBefore).toBeGreaterThanOrEqual(100); // retried every 500 ms
+    expect(result.current.state).toBe("stopping");
+    expect(m.start).not.toHaveBeenCalled();
+    expect(m.force).not.toHaveBeenCalled();
+
+    w.statusUnknown = false;
+    w.readError = false;
+    w.alive = "gone";
+    await advance(6000);
+    expect(m.start).toHaveBeenCalledTimes(1);
+    expect(m.force).not.toHaveBeenCalled();
+  });
+
+  it("(g, m) kills only when /health and the request both fail and no stop is recorded", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.health = false; // hung: no /health, the request does not get through, nothing recorded
+    const m = mocks();
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    const run = startRestart(() => result.current.restart());
+    await advance(2000);
+    expect(m.force).toHaveBeenCalledTimes(1);
+    expect(m.force).toHaveBeenCalledWith(PERSONA, true, true, { pid: 4242, pid_token: "tok-4242" }); // (m) --skip-hard-exit-request
+    expect(result.current.fellThrough).toMatch(/answered neither/);
+    await expect(run.done()).resolves.toBe(true);
     expect(result.current.state).toBe("reconnecting");
   });
 
-  it("(#365) records why the graceful path fell through, in state and in the console", async () => {
+  it("(g) a failed request with a stop recorded is a stop in progress, not a kill", async () => {
     vi.useFakeTimers();
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    vi.spyOn(bridge, "snapshotActiveSession").mockImplementation(
-      () => new Promise<Response>(() => {}),
-    );
-    vi.spyOn(bridge, "invokeForceRestart").mockResolvedValue();
-    vi.spyOn(bridge, "fetchHealth").mockResolvedValue({ liveness: "ok" });
-
+    vi.setSystemTime(T0);
+    w.tasks = ["chat reply"];
+    beginStop(); // another client asked first; the listener is closed
+    const m = mocks();
     const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
-    act(() => {
-      result.current.restart();
-    });
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(5500);
-    });
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(600);
-    });
-
-    const reason = result.current.fellThrough;
-    expect(reason).toMatch(/snapshot/i);
-    expect(reason).toMatch(/timed out after 5000ms/);
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("graceful restart fell through"));
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining(reason!));
+    startRestart(() => result.current.restart());
+    await advance(30_000);
+    expect(m.force).not.toHaveBeenCalled();
+    expect(result.current.state).toBe("stopping");
+    expect(result.current.progress).toBe(progressLine(["chat reply"]));
+    w.alive = "gone";
+    await advance(6000);
+    expect(m.start).toHaveBeenCalledTimes(1);
+    expect(m.force).not.toHaveBeenCalled();
   });
 
-  it("(#365) records a failure to start a fresh bridge as the reason for escalating", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    vi.spyOn(bridge, "snapshotActiveSession").mockResolvedValue(jsonResponse(200));
-    vi.spyOn(bridge, "shutdownBridge").mockResolvedValue(jsonResponse(202));
-    vi.spyOn(appConfig, "ensureBridgeRunning").mockRejectedValue(new Error("spawn EACCES"));
-    vi.spyOn(bridge, "invokeForceRestart").mockResolvedValue();
-    vi.spyOn(bridge, "fetchHealth").mockResolvedValue({ liveness: "ok" });
-
-    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
-    await act(async () => {
-      await result.current.restart();
-    });
-
-    expect(result.current.fellThrough).toMatch(/starting a fresh bridge: spawn EACCES/);
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("spawn EACCES"));
-  });
-
-  it("(#365) records a health poll that never answers as the reason for escalating", async () => {
+  it("(m) a hard exit the bridge ignores for 180 s escalates to stop --kill --skip-hard-exit-request", async () => {
     vi.useFakeTimers();
-    vi.spyOn(console, "warn").mockImplementation(() => {});
-    vi.spyOn(bridge, "snapshotActiveSession").mockResolvedValue(jsonResponse(200));
-    vi.spyOn(bridge, "shutdownBridge").mockResolvedValue(jsonResponse(202));
-    vi.spyOn(appConfig, "ensureBridgeRunning").mockResolvedValue(undefined);
-    // the graceful poll fails, then the forced restart's poll succeeds
-    let calls = 0;
-    vi.spyOn(bridge, "fetchHealth").mockImplementation(async () => {
-      calls += 1;
-      if (calls <= 70) throw new Error("connection refused");
-      return { liveness: "ok" };
-    });
-    vi.spyOn(bridge, "invokeForceRestart").mockResolvedValue();
-
+    vi.setSystemTime(T0);
+    w.tasks = ["heartbeat (Claude call)"];
+    const m = mocks();
     const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
-    act(() => {
-      result.current.restart();
-    });
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(TIMEOUT_HEALTH_MS + 1000);
-    });
+    const run = startRestart(() => result.current.restart());
+    await advance(HARD_EXIT_OFFER_AFTER_MS + 1000);
+    act(() => result.current.hardExit());
+    await advance(1000);
+    expect(m.hardExit).toHaveBeenCalledTimes(1);
 
-    expect(result.current.fellThrough).toMatch(/waiting for the new bridge's \/health: \/health poll window expired/);
+    await advance(HARD_EXIT_OFFER_AFTER_MS - 2000);
+    expect(m.force).not.toHaveBeenCalled();
+    await advance(3000);
+    expect(m.force).toHaveBeenCalledWith(PERSONA, true, true, { pid: 4242, pid_token: "tok-4242" });
+    expect(result.current.fellThrough).toMatch(/did not act on the hard exit/);
+    await expect(run.done()).resolves.toBe(true);
   });
 
-  it("(#365) logs how long the snapshot took against its 5 s budget", async () => {
-    const info = vi.spyOn(console, "info").mockImplementation(() => {});
-    vi.spyOn(bridge, "snapshotActiveSession").mockResolvedValue(jsonResponse(200));
-    vi.spyOn(bridge, "shutdownBridge").mockResolvedValue(jsonResponse(202));
-    vi.spyOn(appConfig, "ensureBridgeRunning").mockResolvedValue(undefined);
-    vi.spyOn(bridge, "fetchHealth").mockResolvedValue({ liveness: "ok" });
-    vi.spyOn(bridge, "invokeForceRestart").mockResolvedValue();
-
-    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
-    await act(async () => {
-      await result.current.restart();
-    });
-
-    expect(info).toHaveBeenCalledWith(expect.stringMatching(/\/sessions\/snapshot took \d+ms of 5000ms/));
-    expect(result.current.fellThrough).toBeNull();
-  });
-
-  it("/supervisor/shutdown timeout escalates to forcing → reconnecting", async () => {
+  it("(review S8) the watch follows the bridge it stopped: a new bridge in its place ends the watch, and the accepted hard exit names the old one and never escalates to the new", async () => {
     vi.useFakeTimers();
-    vi.spyOn(bridge, "snapshotActiveSession").mockResolvedValue(jsonResponse(200));
-    vi.spyOn(bridge, "shutdownBridge").mockImplementation(
-      () => new Promise<Response>(() => {}),
-    );
-    vi.spyOn(appConfig, "ensureBridgeRunning").mockResolvedValue(undefined);
-    const forceMock = vi
-      .spyOn(bridge, "invokeForceRestart")
-      .mockResolvedValue();
-    vi.spyOn(bridge, "fetchHealth").mockResolvedValue({ liveness: "ok" });
+    vi.setSystemTime(T0);
+    w.tasks = ["soul review"];
+    const m = mocks();
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    const run = startRestart(() => result.current.restart());
+    await advance(HARD_EXIT_OFFER_AFTER_MS + 1000);
+    act(() => result.current.hardExit());
+    await advance(1000);
+    expect(m.hardExit).toHaveBeenCalledWith(PERSONA, { pid: 4242, pid_token: "tok-4242" });
 
-    const { result } = renderHook(() =>
-      useRestartBridge(PERSONA, "bridge_down"),
-    );
-    act(() => {
-      result.current.restart();
-    });
+    // The old bridge ends and another start puts a new bridge in place before the next status read.
+    w = { ...fresh(), pid: 5151, token: "tok-5151" };
+    await advance(HARD_EXIT_OFFER_AFTER_MS + 10_000);
+    expect(m.force).not.toHaveBeenCalled(); // no kill of the new bridge
+    await expect(run.done()).resolves.toBe(true);
+    expect(result.current.progress).toBe(HARD_EXIT_DONE);
+  });
 
-    // Close resolves immediately on the next microtask flush.
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(0);
-    });
-    // Trip the 3s shutdown timeout.
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(3500);
-    });
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(600);
-    });
+  it("(review S8) a refused request (bridge.json names another bridge now) ends the watch without a kill", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.tasks = ["soul review"];
+    const m = mocks();
+    m.hardExit.mockRejectedValue("bridge_changed: another bridge is running now");
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    const run = startRestart(() => result.current.restart());
+    await advance(HARD_EXIT_OFFER_AFTER_MS + 1000);
+    act(() => result.current.hardExit());
+    await advance(HARD_EXIT_OFFER_AFTER_MS + 10_000);
+    expect(m.force).not.toHaveBeenCalled();
+    await expect(run.done()).resolves.toBe(true);
+  });
 
-    // Spec §6.4: shutdown failures don't escalate by themselves — the
-    // health poll runs first. Here the bridge is "alive" (fetchHealth
-    // resolves), so we should land in reconnecting without ever forcing.
+  it("(review S8) a forced kill the helper refuses with bridge_changed kills nothing and goes on to the normal start", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.health = false;
+    const m = mocks();
+    m.force.mockImplementation(async () => {
+      w = { ...fresh(), pid: 5151, token: "tok-5151" }; // another bridge took its place; the helper refused
+      throw "supervisor stop --kill failed (exit 1): bridge_changed: another bridge is running now; nothing killed";
+    });
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    const run = startRestart(() => result.current.restart());
+    await advance(10_000);
+    expect(m.force).toHaveBeenCalledWith(PERSONA, true, true, { pid: 4242, pid_token: "tok-4242" });
+    await expect(run.done()).resolves.toBe(true);
+    expect(m.start).toHaveBeenCalledTimes(1);
     expect(result.current.state).toBe("reconnecting");
-    expect(forceMock).not.toHaveBeenCalled();
   });
 
-  it("post-force health poll exhaustion → failed with user-readable error", async () => {
+  it("(m) a forced kill that errors (e.g. force_restart_timeout) shows the error and fails", async () => {
     vi.useFakeTimers();
-    vi.spyOn(bridge, "snapshotActiveSession").mockResolvedValue(jsonResponse(200));
-    vi.spyOn(bridge, "shutdownBridge").mockResolvedValue(jsonResponse(202));
-    vi.spyOn(appConfig, "ensureBridgeRunning").mockResolvedValue(undefined);
-    // Health never comes back during either window.
-    vi.spyOn(bridge, "fetchHealth").mockRejectedValue(new Error("dead"));
-    vi.spyOn(bridge, "invokeForceRestart").mockResolvedValue();
-
-    const { result } = renderHook(() =>
-      useRestartBridge(PERSONA, "bridge_down"),
-    );
-    act(() => {
-      result.current.restart();
-    });
-
-    // Two 30s health windows + a sliver of overhead.
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(70000);
-    });
-
+    vi.setSystemTime(T0);
+    w.health = false;
+    const m = mocks();
+    m.force.mockRejectedValue("force_restart_timeout: the bridge is still being stopped; try again in a moment");
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    const run = startRestart(() => result.current.restart());
+    await advance(2000);
+    await expect(run.done()).resolves.toBe(false);
     expect(result.current.state).toBe("failed");
-    expect(result.current.errorDetail).toMatch(/nell service status/i);
+    expect(result.current.errorDetail).toMatch(/force_restart_timeout/);
   });
+});
 
-  it("invokeForceRestart rejecting with a pid-missing message surfaces as errorDetail", async () => {
+describe("useRestartBridge: time limits (#456 review M1)", () => {
+  it("(C17 d, g) a wedged bridge whose stop request and /health never answer: each is cut at 3 s, then the forced path", async () => {
     vi.useFakeTimers();
-    vi.spyOn(bridge, "snapshotActiveSession").mockImplementation(
-      () => new Promise<Response>(() => {}),
-    );
-    vi.spyOn(bridge, "invokeForceRestart").mockRejectedValue(
-      new Error(
-        "bridge.json missing pid — restart Companion to re-spawn bridge with pid field",
-      ),
-    );
-
-    const { result } = renderHook(() =>
-      useRestartBridge(PERSONA, "bridge_down"),
-    );
-    act(() => {
-      result.current.restart();
+    vi.setSystemTime(T0);
+    const m = mocks();
+    const never = () => new Promise<never>(() => {});
+    m.shutdown.mockImplementation(never);
+    m.health.mockImplementation(never);
+    m.force.mockImplementation(async () => {
+      w = fresh();
+      m.health.mockImplementation(async () => ({ liveness: "ok" }) as never);
     });
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    const run = startRestart(() => result.current.restart());
 
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(5500);
-    });
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(100);
-    });
-
-    expect(result.current.state).toBe("failed");
-    expect(result.current.errorDetail).toMatch(/missing pid/i);
+    await advance(TIMEOUT_SHUTDOWN_MS - 100);
+    expect(m.force).not.toHaveBeenCalled();
+    await advance(TIMEOUT_SHUTDOWN_MS + 200); // the request's limit, then the /health probe's
+    expect(m.force).toHaveBeenCalledWith(PERSONA, true, true, { pid: 4242, pid_token: "tok-4242" });
+    const signal = m.shutdown.mock.calls[0][1] as AbortSignal;
+    expect(signal.aborted).toBe(true); // the hung request is cancelled, not left open
+    await advance(1000);
+    await expect(run.done()).resolves.toBe(true);
+    expect(result.current.fellThrough).toMatch(/answered neither/);
   });
 
-  it("re-entry guard: clicking restart while in flight is a no-op", async () => {
-    // A controllable deferred, not a permanent hang — held open just long
-    // enough to prove the re-entry guard, then released so the restart's
-    // real 5s withTimeout timer never outlives this test.
-    let releaseSnapshot!: () => void;
-    const snapshotMock = vi
-      .spyOn(bridge, "snapshotActiveSession")
-      .mockImplementation(
-        () =>
-          new Promise<Response>((resolve) => {
-            releaseSnapshot = () => resolve(jsonResponse(200));
-          }),
-      );
-    vi.spyOn(bridge, "shutdownBridge").mockResolvedValue(jsonResponse(202));
-    vi.spyOn(appConfig, "ensureBridgeRunning").mockResolvedValue(undefined);
-    vi.spyOn(bridge, "fetchHealth").mockResolvedValue({ liveness: "ok" });
-
-    const { result } = renderHook(() =>
-      useRestartBridge(PERSONA, "bridge_down"),
-    );
-    let firstRestart: Promise<boolean> = Promise.resolve(false);
-    act(() => {
-      firstRestart = result.current.restart();
-      result.current.restart();
-      result.current.restart();
-    });
-
-    // Only one snapshot call should be in flight despite three click attempts.
-    await waitFor(() => expect(snapshotMock).toHaveBeenCalledTimes(1));
-
-    // Drain the first restart so no state update or timer outlives this test.
-    await act(async () => {
-      releaseSnapshot();
-      await firstRestart;
-    });
-  });
-
-  it("snapshots then shuts down then ensures a fresh bridge", async () => {
-    vi.spyOn(bridge, "snapshotActiveSession").mockResolvedValue(jsonResponse(200));
-    vi.spyOn(bridge, "shutdownBridge").mockResolvedValue(jsonResponse(202));
-    vi.spyOn(appConfig, "ensureBridgeRunning").mockResolvedValue(undefined);
-    vi.spyOn(bridge, "fetchHealth").mockResolvedValue({ ok: true } as never);
-    vi.spyOn(bridge, "invokeForceRestart").mockResolvedValue();
-
-    const { result } = renderHook(() => useRestartBridge(PERSONA, "live"));
-
-    let restartPromise: Promise<boolean> = Promise.resolve(false);
-    act(() => {
-      restartPromise = result.current.restart();
-    });
-
-    await waitFor(() => expect(appConfig.ensureBridgeRunning).toHaveBeenCalledWith(PERSONA));
-    expect(bridge.snapshotActiveSession).toHaveBeenCalledWith(PERSONA);
-    expect(bridge.invokeForceRestart).not.toHaveBeenCalled();
-
-    // Drain the restart lifecycle so no state update lands after this test
-    // (and its cleanup()) tears the component down.
-    await act(async () => {
-      await restartPromise;
-    });
-  });
-
-  it("restart() resolves true when the graceful path succeeds", async () => {
-    vi.spyOn(bridge, "snapshotActiveSession").mockResolvedValue(jsonResponse(200));
-    vi.spyOn(bridge, "shutdownBridge").mockResolvedValue(jsonResponse(202));
-    vi.spyOn(appConfig, "ensureBridgeRunning").mockResolvedValue(undefined);
-    vi.spyOn(bridge, "fetchHealth").mockResolvedValue({ liveness: "ok" });
-
-    const { result } = renderHook(() =>
-      useRestartBridge(PERSONA, "bridge_down"),
-    );
-
-    let resolved: boolean | undefined;
-    await act(async () => {
-      resolved = await result.current.restart();
-    });
-
-    expect(resolved).toBe(true);
-  });
-
-  it("restart() resolves false when snapshot times out and the forced restart also fails", async () => {
+  it("a /health poll after the start that never answers ends in the restart-failed message, not a hang", async () => {
     vi.useFakeTimers();
-    vi.spyOn(bridge, "snapshotActiveSession").mockImplementation(
-      () => new Promise<Response>(() => {}),
-    );
-    vi.spyOn(bridge, "invokeForceRestart").mockRejectedValue(new Error("boom"));
-
-    const { result } = renderHook(() =>
-      useRestartBridge(PERSONA, "bridge_down"),
-    );
-
-    let resolved: boolean | undefined;
-    await act(async () => {
-      const pending = result.current.restart();
-      await vi.advanceTimersByTimeAsync(5500);
-      resolved = await pending;
+    vi.setSystemTime(T0);
+    w.alive = "gone";
+    const m = mocks();
+    m.start.mockImplementation(async () => {
+      w = fresh();
+      m.health.mockImplementation(() => new Promise<never>(() => {}));
     });
-
-    expect(resolved).toBe(false);
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    const run = startRestart(() => result.current.restart());
+    await advance(TIMEOUT_HEALTH_MS + TIMEOUT_SHUTDOWN_MS + 1000);
+    await expect(run.done()).resolves.toBe(false);
     expect(result.current.state).toBe("failed");
+    expect(result.current.errorDetail).toMatch(/Restart failed/);
+  });
+});
+
+describe("stopBridgeThen: the service install's stop (#456 C58 d, review M4)", () => {
+  it("stops through the stop flow, runs the install on the stopped bridge, then waits for the service's bridge", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.tasks = ["chat reply"];
+    const m = mocks();
+    const seen: string[] = [];
+    let p: Promise<{ stopped: boolean; error: string | null }> = Promise.resolve({ stopped: false, error: null });
+    act(() => {
+      p = stopBridgeThen(PERSONA, async () => {
+        seen.push(`install while ${w.alive}`);
+        w = { ...fresh(), health: false }; // the install starts the service; its bridge is still booting
+      }, { start: true });
+    });
+    await advance(2000);
+    expect(m.shutdown).toHaveBeenCalledWith(PERSONA, expect.any(AbortSignal), "app_restart");
+    expect(seen).toEqual([]); // still stopping: no install yet
+    w.alive = "gone";
+    await advance(6000);
+    expect(seen).toEqual(["install while gone"]);
+    w.health = true; // the service's bridge answers
+    await advance(1000);
+    await expect(p).resolves.toEqual({ stopped: true, error: null });
+    // Review R2-M1: no second start racing the service's own (it would exit 2): the flow waits for /health.
+    expect(m.start).not.toHaveBeenCalled();
+    expect(m.force).not.toHaveBeenCalled();
+  });
+
+  it("a hung bridge is ended without a start of its own (start_after false), then the install runs", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.health = false;
+    const m = mocks();
+    m.force.mockImplementation(async () => {
+      w.alive = "gone";
+    });
+    const seen: string[] = [];
+    let p: Promise<{ stopped: boolean; error: string | null }> = Promise.resolve({ stopped: false, error: null });
+    act(() => {
+      p = stopBridgeThen(PERSONA, async () => {
+        seen.push("install");
+      }, { start: false });
+    });
+    await advance(2000);
+    await expect(p).resolves.toEqual({ stopped: true, error: null });
+    expect(m.force).toHaveBeenCalledWith(PERSONA, true, false, { pid: 4242, pid_token: "tok-4242" });
+    expect(seen).toEqual(["install"]);
+    expect(m.start).not.toHaveBeenCalled();
+  });
+
+  it("an install error is reported and the bridge is still started again", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.alive = "gone";
+    const m = mocks();
+    let p: Promise<{ stopped: boolean; error: string | null }> = Promise.resolve({ stopped: false, error: null });
+    act(() => {
+      p = stopBridgeThen(PERSONA, async () => {
+        throw new Error("schtasks failed");
+      }, { start: true });
+    });
+    await advance(1000);
+    await expect(p).resolves.toEqual({ stopped: true, error: "schtasks failed" });
+    expect(m.start).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("useRestartBridge: a pre-PR bridge (#456 C17 j, k)", () => {
+  it("(j) proven: the old request, then stop --kill 3 s later if still alive, no display, no offer, then the start", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.legacy = true;
+    w.proven = true;
+    const m = mocks();
+    m.shutdown.mockImplementation(async () => jsonResponse(202)); // accepts, keeps running
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    const run = startRestart(() => result.current.restart());
+    await advance(TIMEOUT_SHUTDOWN_MS - 100);
+    expect(m.shutdown).toHaveBeenCalledWith(PERSONA, expect.any(AbortSignal));
+    expect(m.force).not.toHaveBeenCalled();
+    await advance(200);
+    expect(m.force).toHaveBeenCalledWith(PERSONA, false, true);
+    await expect(run.done()).resolves.toBe(true);
+    expect(result.current.progress).toBeNull();
+    expect(result.current.offerHardExit).toBe(false);
+  });
+
+  it("(j) proven and gone within 3 s: the normal start, no kill", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.legacy = true;
+    w.proven = true;
+    const m = mocks();
+    m.shutdown.mockImplementation(async () => {
+      w.alive = "gone";
+      return jsonResponse(202);
+    });
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    const run = startRestart(() => result.current.restart());
+    await advance(TIMEOUT_SHUTDOWN_MS + 100);
+    await expect(run.done()).resolves.toBe(true);
+    expect(m.force).not.toHaveBeenCalled();
+    expect(m.start).toHaveBeenCalledWith(PERSONA);
+  });
+
+  it("(j) an unproven pre-PR record takes the normal start at once", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.legacy = true;
+    w.proven = false;
+    const m = mocks();
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    const run = startRestart(() => result.current.restart());
+    await advance(100);
+    await expect(run.done()).resolves.toBe(true);
+    expect(m.start).toHaveBeenCalledWith(PERSONA);
+    expect(m.shutdown).not.toHaveBeenCalled();
+    expect(m.force).not.toHaveBeenCalled();
+  });
+
+  it("(k) an unknown first status is read again before deciding: a pre-PR bridge takes (j)", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.legacy = true;
+    w.proven = true;
+    w.unknownReads = 1;
+    const m = mocks();
+    m.shutdown.mockImplementation(async () => jsonResponse(202));
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    const run = startRestart(() => result.current.restart());
+    await advance(TIMEOUT_SHUTDOWN_MS + 500);
+    await expect(run.done()).resolves.toBe(true);
+    expect(m.shutdown).toHaveBeenCalledTimes(1);
+    expect(m.shutdown).toHaveBeenCalledWith(PERSONA, expect.any(AbortSignal)); // the old request, not the new-bridge one
+    expect(m.force).toHaveBeenCalledWith(PERSONA, false, true);
+    expect(result.current.offerHardExit).toBe(false);
+  });
+
+  it("(k) a later status naming a pre-PR bridge switches the wait to (j)", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.legacy = true;
+    w.proven = true;
+    w.unknownReads = 2; // both first reads time out
+    const m = mocks();
+    m.shutdown.mockImplementation(async () => jsonResponse(202)); // an old bridge also answers 202
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    const run = startRestart(() => result.current.restart());
+    await advance(TIMEOUT_SHUTDOWN_MS + 2000);
+    await expect(run.done()).resolves.toBe(true);
+    expect(m.force).toHaveBeenCalledWith(PERSONA, false, true);
+    expect(m.force).toHaveBeenCalledTimes(1);
+    expect(result.current.offerHardExit).toBe(false);
+  });
+});
+
+describe("awaitStoppingBridge: the launch check (#456 C17 h, l)", () => {
+  it("(h) a bridge found stopping: the same display, the offer at the recorded request + 180 s, no request sent", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.tasks = ["saving 1 conversation"];
+    beginStop();
+    w.requestedAt = new Date(T0.getTime() - 100_000).toISOString(); // asked 100 s ago
+    const m = mocks();
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    let launched: Promise<boolean> = Promise.resolve(false);
+    act(() => {
+      launched = awaitStoppingBridge(PERSONA);
+    });
+    await advance(1000);
+    expect(restartInFlight()).toBe(true);
+    expect(result.current.state).toBe("stopping");
+    expect(result.current.progress).toBe(progressLine(["saving 1 conversation"]));
+    await advance(78_000);
+    expect(result.current.offerHardExit).toBe(false);
+    await advance(2000); // 80 s after the launch check
+    expect(result.current.offerHardExit).toBe(true);
+    expect(m.shutdown).not.toHaveBeenCalled();
+
+    w.alive = "gone";
+    await advance(6000);
+    await expect(launched).resolves.toBe(true);
+    expect(result.current.progress).toBe(EVERYTHING_STOPPED);
+    expect(m.start).not.toHaveBeenCalled(); // the caller starts (brainRecovery.launchBrain)
+    expect(m.force).not.toHaveBeenCalled();
+    expect(restartInFlight()).toBe(false);
+  });
+
+  it("(l) a proven pre-PR bridge whose /health is closed is killed", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.legacy = true;
+    w.proven = true;
+    w.health = false;
+    const m = mocks();
+    let launched: Promise<boolean> = Promise.resolve(false);
+    act(() => {
+      launched = awaitStoppingBridge(PERSONA);
+    });
+    await advance(1000);
+    await expect(launched).resolves.toBe(true);
+    expect(m.force).toHaveBeenCalledWith(PERSONA, false, true);
+  });
+
+  it("(l) a pre-PR bridge that still answers, or a new bridge not stopping, is left alone", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.legacy = true;
+    w.proven = true;
+    const m = mocks();
+    await act(async () => {
+      await expect(awaitStoppingBridge(PERSONA)).resolves.toBe(true);
+    });
+    w = fresh();
+    await act(async () => {
+      await expect(awaitStoppingBridge(PERSONA)).resolves.toBe(true);
+    });
+    expect(m.force).not.toHaveBeenCalled();
+    expect(m.shutdown).not.toHaveBeenCalled();
+    expect(m.read).not.toHaveBeenCalled();
+  });
+});
+
+describe("useRestartBridge: one restart app-wide (#310, #335)", () => {
+  /** Hold the stop request open until released; on release the bridge exits at once. */
+  function holdRequest(m: ReturnType<typeof mocks>): () => void {
+    let release!: () => void;
+    m.shutdown.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          release = () => {
+            w.alive = "gone";
+            resolve(jsonResponse(202));
+          };
+        }),
+    );
+    return () => release();
+  }
+
+  it("re-entry guard: clicking restart while in flight sends one request", async () => {
+    const m = mocks();
+    const release = holdRequest(m);
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    let first: Promise<boolean> = Promise.resolve(false);
+    act(() => {
+      first = result.current.restart();
+      result.current.restart();
+      result.current.restart();
+    });
+    await waitFor(() => expect(m.shutdown).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      release();
+      await first;
+    });
+    expect(m.shutdown).toHaveBeenCalledTimes(1);
   });
 
   it("a second restart() while one is in flight joins it and resolves with its result", async () => {
-    // Controllable deferred (see re-entry guard test above) so the first
-    // restart's real 5s withTimeout timer never outlives this test.
-    let releaseSnapshot!: () => void;
-    const snapshotMock = vi.spyOn(bridge, "snapshotActiveSession").mockImplementation(
-      () =>
-        new Promise<Response>((resolve) => {
-          releaseSnapshot = () => resolve(jsonResponse(200));
-        }),
-    );
-    vi.spyOn(bridge, "shutdownBridge").mockResolvedValue(jsonResponse(202));
-    vi.spyOn(appConfig, "ensureBridgeRunning").mockResolvedValue(undefined);
-    vi.spyOn(bridge, "fetchHealth").mockResolvedValue({ liveness: "ok" });
-
-    const { result } = renderHook(() =>
-      useRestartBridge(PERSONA, "bridge_down"),
-    );
-
+    const m = mocks();
+    const release = holdRequest(m);
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
     let first: Promise<boolean> = Promise.resolve(false);
     let second: Promise<boolean> = Promise.resolve(false);
     act(() => {
       first = result.current.restart();
       second = result.current.restart();
     });
-
+    await waitFor(() => expect(m.shutdown).toHaveBeenCalledTimes(1));
     await act(async () => {
-      releaseSnapshot();
+      release();
       await first;
     });
     expect(await second).toBe(true);
-    expect(snapshotMock).toHaveBeenCalledTimes(1);
+    expect(m.start).toHaveBeenCalledTimes(1);
   });
 
   it("(#310) separate hook instances share one restart and one state", async () => {
-    let releaseSnapshot!: () => void;
-    const snapshotMock = vi.spyOn(bridge, "snapshotActiveSession").mockImplementation(
-      () =>
-        new Promise<Response>((resolve) => {
-          releaseSnapshot = () => resolve(jsonResponse(200));
-        }),
-    );
-    vi.spyOn(bridge, "shutdownBridge").mockResolvedValue(jsonResponse(202));
-    vi.spyOn(appConfig, "ensureBridgeRunning").mockResolvedValue(undefined);
-    vi.spyOn(bridge, "fetchHealth").mockResolvedValue({ liveness: "ok" });
-
-    // e.g. useBrainUpdate's instance and the Restart button's instance
+    const m = mocks();
+    const release = holdRequest(m);
     const a = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
     const b = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
-
     let fromA: Promise<boolean> = Promise.resolve(false);
     act(() => {
       fromA = a.result.current.restart();
     });
-    // B sees A's restart in progress (the button would render non-interactive)
-    await waitFor(() => expect(b.result.current.state).toBe("closing"));
-
+    await waitFor(() => expect(b.result.current.state).toBe("requesting"));
     let fromB: Promise<boolean> = Promise.resolve(false);
     act(() => {
       fromB = b.result.current.restart();
     });
     await act(async () => {
-      releaseSnapshot();
+      release();
       await fromA;
     });
-
     expect(await fromB).toBe(true);
-    expect(snapshotMock).toHaveBeenCalledTimes(1);
+    expect(m.shutdown).toHaveBeenCalledTimes(1);
     expect(b.result.current.state).toBe("reconnecting");
   });
 
   it("(#335) restartBridge() outside React drives the same shared restart", async () => {
-    let releaseSnapshot!: () => void;
-    const snapshotMock = vi.spyOn(bridge, "snapshotActiveSession").mockImplementation(
-      () =>
-        new Promise<Response>((resolve) => {
-          releaseSnapshot = () => resolve(jsonResponse(200));
-        }),
-    );
-    vi.spyOn(bridge, "shutdownBridge").mockResolvedValue(jsonResponse(202));
-    vi.spyOn(appConfig, "ensureBridgeRunning").mockResolvedValue(undefined);
-    vi.spyOn(bridge, "fetchHealth").mockResolvedValue({ liveness: "ok" });
-
+    const m = mocks();
+    const release = holdRequest(m);
     const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
     let fromLaunch: Promise<boolean> = Promise.resolve(false);
     act(() => {
       fromLaunch = restartBridge(PERSONA);
     });
-    await waitFor(() => expect(result.current.state).toBe("closing"));
+    await waitFor(() => expect(result.current.state).toBe("requesting"));
     let fromHook: Promise<boolean> = Promise.resolve(false);
     act(() => {
       fromHook = result.current.restart();
     });
     await act(async () => {
-      releaseSnapshot();
+      release();
       await fromLaunch;
     });
     expect(await fromHook).toBe(true);
-    expect(snapshotMock).toHaveBeenCalledTimes(1);
+    expect(m.shutdown).toHaveBeenCalledTimes(1);
   });
 
   it("(#335) clearRestartState() hides a restart nobody pressed, but never one in flight", async () => {
-    let releaseSnapshot!: () => void;
-    vi.spyOn(bridge, "snapshotActiveSession").mockImplementation(
-      () =>
-        new Promise<Response>((resolve) => {
-          releaseSnapshot = () => resolve(jsonResponse(200));
-        }),
-    );
-    vi.spyOn(bridge, "shutdownBridge").mockResolvedValue(jsonResponse(202));
-    vi.spyOn(appConfig, "ensureBridgeRunning").mockResolvedValue(undefined);
-    vi.spyOn(bridge, "fetchHealth").mockResolvedValue({ liveness: "ok" });
-
+    const m = mocks();
+    const release = holdRequest(m);
     const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
     let pending: Promise<boolean> = Promise.resolve(false);
     act(() => {
       pending = restartBridge(PERSONA);
     });
-    await waitFor(() => expect(result.current.state).toBe("closing"));
+    await waitFor(() => expect(result.current.state).toBe("requesting"));
     act(() => clearRestartState());
-    expect(result.current.state).toBe("closing"); // in flight: untouched
-
+    expect(result.current.state).toBe("requesting"); // in flight: untouched
     await act(async () => {
-      releaseSnapshot();
+      release();
       await pending;
     });
     expect(result.current.state).toBe("reconnecting");
     act(() => clearRestartState());
     expect(result.current.state).toBe("idle");
+    expect(m.start).toHaveBeenCalledTimes(1);
   });
 
   it("(#310) a shared success goes back to idle when the bridge drops again", async () => {
-    vi.spyOn(bridge, "snapshotActiveSession").mockResolvedValue(jsonResponse(200));
-    vi.spyOn(bridge, "shutdownBridge").mockResolvedValue(jsonResponse(202));
-    vi.spyOn(appConfig, "ensureBridgeRunning").mockResolvedValue(undefined);
-    vi.spyOn(bridge, "fetchHealth").mockResolvedValue({ liveness: "ok" });
-
+    const m = mocks();
+    m.shutdown.mockImplementation(async () => {
+      w.alive = "gone";
+      return jsonResponse(202);
+    });
     const { result, rerender } = renderHook(
-      ({ mode }: { mode: "live" | "bridge_down" }) =>
-        useRestartBridge(PERSONA, mode),
+      ({ mode }: { mode: "live" | "bridge_down" }) => useRestartBridge(PERSONA, mode),
       { initialProps: { mode: "bridge_down" } },
     );
     await act(async () => {
@@ -542,12 +857,9 @@ describe("useRestartBridge", () => {
     });
     rerender({ mode: "live" });
     await waitFor(() => expect(result.current.state).toBe("success"));
-
-    // A later outage: the banner's button (a fresh instance) must be clickable,
-    // not stuck on the last incident's "Restarted ✓".
     rerender({ mode: "bridge_down" });
     await waitFor(() => expect(result.current.state).toBe("idle"));
-    const fresh = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
-    expect(fresh.result.current.state).toBe("idle");
+    const freshHook = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    expect(freshHook.result.current.state).toBe("idle");
   });
 });

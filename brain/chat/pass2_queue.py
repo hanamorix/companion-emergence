@@ -185,6 +185,7 @@ def _dispatch(record: dict[str, Any], *, persona_dir: Path) -> None:
     safe because by the time any record is dispatched ``tool_loop`` has
     already finished loading.
     """
+    from brain.bridge.cli_throttle import ThrottleDeferred
     from brain.chat import tool_loop
 
     kind = record.get("kind")
@@ -196,6 +197,8 @@ def _dispatch(record: dict[str, Any], *, persona_dir: Path) -> None:
                 recent_user_msgs=tuple(record.get("recent_user_msgs", ())),
                 persona_dir=persona_dir,
             )
+        except ThrottleDeferred:
+            raise  # #456/#473: "not now": stop the drain before the pop; the record stays at the head
         except Exception:  # noqa: BLE001 — an item failure must not kill the drain
             log.error(
                 "pass2_queue item failed (id=%s, kind=monologue); continuing",
@@ -217,6 +220,8 @@ def _dispatch(record: dict[str, Any], *, persona_dir: Path) -> None:
                 record["reply_text"],
                 buffer_slice,
             )
+        except ThrottleDeferred:
+            raise  # #456/#473: as above
         except Exception:  # noqa: BLE001 — an item failure must not kill the drain
             log.error(
                 "pass2_queue item failed (id=%s, kind=attunement); continuing",
@@ -276,6 +281,8 @@ def drain_all_locked(
             item = _peek_head_locked(persona_dir)
             if item is None:
                 break
+            # A refusal from the item ("not now", #456/#473) propagates out of _dispatch before the pop below,
+            # so the item stays at the head of the saved queue for a later drain.
             _dispatch(item, persona_dir=persona_dir)
             # PASS2-AT-LEAST-ONCE: if the process dies between _dispatch()
             # returning (the item's effects already applied) and this

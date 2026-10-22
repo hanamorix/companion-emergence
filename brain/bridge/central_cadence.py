@@ -56,12 +56,13 @@ from __future__ import annotations
 
 import enum
 import logging
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from brain.bridge import background_jobs, cli_throttle, persisted_cadence
+from brain.bridge import background_jobs, cli_throttle, persisted_cadence, provider_auth
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +177,9 @@ def run_central_pass(
     slot_available: Callable[[], bool] = cli_throttle.slot_available,
     now_wall: Callable[[], datetime] = lambda: datetime.now(UTC),
     between_jobs: Callable[[], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
+    deferred_until: dict[str, float] | None = None,
+    on_job: Callable[[str | None], None] | None = None,
 ) -> list[JobDecision]:
     """Run one pass of the central cadence function; return its decisions.
 
@@ -183,6 +187,13 @@ def run_central_pass(
     here). ``is_idle``/``slot_available``/``now_wall`` are injectable for
     deterministic tests; production uses the cli_throttle functions and the
     wall clock. ``between_jobs`` is the heartbeat hook (see module docstring).
+
+    #456 (D13): ``should_stop`` (the supervisor's stop request) ends the pass before the next job. A job that raises a
+    refusal (``ThrottleDeferred`` family: "not now") is never recorded as done, so its schedule is not advanced: with the
+    shutdown flag set (or ``should_stop``) the pass ends; an expired-login refusal skips the job and, through the
+    caller-owned ``deferred_until`` map (job name -> monotonic time, memory only), keeps it skipped until the login
+    re-probe interval has passed or the login is back; any other refusal (a lost slot race) skips it for this pass
+    only (the S20 rule). The pass continues after a skipped job.
     """
     persona_dir = Path(persona_dir)
     decisions: list[JobDecision] = []
@@ -217,6 +228,16 @@ def run_central_pass(
             _decide(job.name, "init-cadence")
 
     for job in ordered:
+        if should_stop is not None and should_stop():
+            _decide(job.name, "skip-stopping")
+            break
+        if (
+            deferred_until is not None
+            and deferred_until.get(job.name, float("-inf")) > time.monotonic()
+            and provider_auth.login_expired()
+        ):
+            _decide(job.name, "skip-deferred")
+            continue
         # S43: ask is-chat-idle again before EVERY job; the first "not idle"
         # ends the sequence — the rest wait for the next lull.
         if not is_idle():
@@ -250,8 +271,21 @@ def run_central_pass(
             # INC-11 (S15/S23/S38): publish this job as running for the
             # duration of `run()` only — a paused job has already returned
             # (JobOutcome.PAUSED below) and so is no longer a member.
+            if on_job is not None:
+                on_job(job.name)  # #456: the stop's progress record names the job the supervisor is in
             with background_jobs.running(job.name):
                 outcome = job.run()
+        except cli_throttle.ThrottleDeferred as exc:
+            # #456 (D13): "not now" is not "done": no schedule advance.
+            if cli_throttle.shutdown_requested() or (should_stop is not None and should_stop()):
+                _decide(job.name, "paused")
+                break
+            if isinstance(exc, provider_auth.ProviderAuthDeferred) and deferred_until is not None:
+                deferred_until[job.name] = time.monotonic() + provider_auth.reprobe_interval_s()
+                logger.info("job %s backed off until the next login re-probe", job.name)
+            _decide(job.name, "skip-deferred")
+            logger.info("job %s deferred (not now), continuing", job.name)
+            continue
         except Exception:  # noqa: BLE001 — S44: a job that raises still advances
             logger.exception("central cadence: job=%s raised", job.name)
             outcome = JobOutcome.COMPLETED
@@ -278,4 +312,6 @@ def run_central_pass(
             # INC-10 seam: a job that paused for chat ends the sequence (S43).
             break
 
+    if on_job is not None:
+        on_job(None)
     return decisions

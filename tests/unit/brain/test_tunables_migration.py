@@ -145,7 +145,8 @@ def test_migration_completes_before_supervisor_loop_pass_ordering_in_lifespan() 
     # import line) to find the actual CALL site.
     import_idx = src.index("import migrate_idle_keys")
     call_idx = src.index("migrate_idle_keys(", import_idx)
-    supervisor_idx = src.index("from brain.bridge.supervisor import run_folded")
+    # #456: the lifespan runs the supervisor through supervisor.run_supervised (restart on error).
+    supervisor_idx = src.index("from brain.bridge import supervisor as _supervisor_mod")
     assert call_idx < supervisor_idx, (
         "migrate_idle_keys must run before the supervisor thread is spawned"
     )

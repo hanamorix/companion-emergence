@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import warnings
+from collections.abc import Mapping
 from pathlib import Path
 
 from platformdirs import PlatformDirs
@@ -46,40 +48,75 @@ def validate_persona_name(name: str) -> None:
 _dirs = PlatformDirs(appname=_APP_NAME, appauthor=_APP_AUTHOR)
 
 
-def _resolve_home_override() -> str | None:
-    """Return the env-var override for the home directory, or None.
+def _override_from(env: Mapping[str, str], *, warn: bool) -> str | None:
+    """The env-var override for the home directory in ``env``, or None.
 
     Priority (v0.0.13 transition):
       1. KINDLED_HOME — the canonical var as of v0.0.13.
-      2. NELLBRAIN_HOME — backwards-compat fallback, emits
-         DeprecationWarning. Deprecated; back-compat fallback retained.
-      3. None — caller uses platformdirs default.
+      2. NELLBRAIN_HOME — backwards-compat fallback, emits DeprecationWarning (``warn``). Deprecated; back-compat
+         fallback retained.
+      3. None — caller uses the platform default.
     """
-    if v := os.environ.get("KINDLED_HOME"):
+    if v := env.get("KINDLED_HOME"):
         return v
-    if v := os.environ.get("NELLBRAIN_HOME"):
-        warnings.warn(
-            "NELLBRAIN_HOME is deprecated; use KINDLED_HOME. "
-            "Backwards-compat fallback is retained but may be removed in a future release.",
-            DeprecationWarning,
-            stacklevel=3,
-        )
+    if v := env.get("NELLBRAIN_HOME"):
+        if warn:
+            warnings.warn(
+                "NELLBRAIN_HOME is deprecated; use KINDLED_HOME. "
+                "Backwards-compat fallback is retained but may be removed in a future release.",
+                DeprecationWarning,
+                stacklevel=4,
+            )
         return v
     return None
 
 
-def get_home() -> Path:
-    """Root directory for all companion-emergence state.
+def _resolve_home_override() -> str | None:
+    """This process's home override (see :func:`_override_from`)."""
+    return _override_from(os.environ, warn=True)
+
+
+def home_for_env(
+    env: Mapping[str, str], platform: str | None = None, *, current: bool = False
+) -> Path | None:
+    """THE home rule, for this process (``current=True``) or for another process whose environment is ``env``.
 
     Resolution order:
-    1. KINDLED_HOME env var if set (supports ~ expansion)
-    2. NELLBRAIN_HOME env var (deprecated, warns; back-compat fallback retained)
-    3. platformdirs user_data_path for the current OS
+    1. KINDLED_HOME if set (supports ~ expansion)
+    2. NELLBRAIN_HOME (deprecated; warns for this process; back-compat fallback retained)
+    3. the platform default: platformdirs' user_data_path for this process; for another environment the same
+       default computed from that environment (Linux and macOS: a non-blank XDG_DATA_HOME, else ~/.local/share or
+       ~/Library/Application Support; Windows LOCALAPPDATA\\<author>), None when ``env`` lacks what it needs. A test checks the computed
+       default against platformdirs on every platform (#456 review S15: one rule, no drift).
     """
-    override = _resolve_home_override()
+    override = _override_from(env, warn=current)
     if override:
-        return Path(override).expanduser().resolve()
-    return _dirs.user_data_path.resolve()
+        return Path(override).expanduser()
+    if current:
+        return _dirs.user_data_path
+    platform = platform or sys.platform
+    if platform.startswith("linux") or platform == "darwin":
+        # platformdirs' XDG mixin (Linux AND macOS): a non-blank $XDG_DATA_HOME wins over the platform default.
+        xdg = (env.get("XDG_DATA_HOME") or "").strip()
+        if xdg:
+            return Path(xdg, _APP_NAME)
+        home = env.get("HOME")
+        if not home:
+            return None
+        if platform == "darwin":
+            return Path(home, "Library", "Application Support", _APP_NAME)
+        return Path(home, ".local", "share", _APP_NAME)
+    if platform == "win32":
+        base = env.get("LOCALAPPDATA")
+        return Path(base, _APP_AUTHOR, _APP_NAME) if base else None
+    return None
+
+
+def get_home() -> Path:
+    """Root directory for all companion-emergence state: :func:`home_for_env` for this process."""
+    home = home_for_env(os.environ, current=True)
+    assert home is not None  # current=True always yields a path
+    return home.resolve()
 
 
 def get_persona_dir(name: str) -> Path:

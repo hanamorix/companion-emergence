@@ -109,6 +109,11 @@ class BackfillState:
     status: str
     last_cursor: str
     schema_version: str
+    # #473: which pass this state belongs to, so an unfinished supplementary pass resumes as itself (with only the
+    # categories it was started for) instead of reading as an unfinished FULL backfill. Additive with defaults: a
+    # record without them is a full pass (state_compat rules).
+    pass_kind: str = "full"
+    categories: tuple[str, ...] | None = None
 
 
 def pattern_id(category: str, canonical_key: str) -> str:

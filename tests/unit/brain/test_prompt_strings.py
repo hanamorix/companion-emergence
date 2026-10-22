@@ -88,3 +88,28 @@ def test_get_segments_on_list_with_non_string_element_raises(prompt_strings, mon
     monkeypatch.setattr(prompt_strings, "_file_path", lambda: toml_path)
     with pytest.raises(prompt_strings.PromptStringError):
         prompt_strings.get_segments("bad.segments")
+
+
+def test_the_bridge_server_registers_no_prompt_it_does_not_use():
+    """Review S14 (#456): the close heartbeat is gone, so its persona prompt must not stay registered (or in the
+    TOML) as a dead string. Every prompt the bridge server registers is used in that module."""
+    import ast
+    from pathlib import Path
+
+    import brain.bridge.server as server
+
+    tree = ast.parse(Path(server.__file__).read_text(encoding="utf-8"))
+    registered = [
+        t.id
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+        and node.value.func.attr in ("register", "register_segments")
+        for t in node.targets
+        if isinstance(t, ast.Name)
+    ]
+    used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+    assert [n for n in registered if n not in used] == []
+    toml = (Path(server.__file__).parents[1] / "prompt_strings.toml").read_text(encoding="utf-8")
+    assert "heartbeat_close_system_prompt_segments" not in toml

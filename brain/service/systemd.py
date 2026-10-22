@@ -26,6 +26,7 @@ those run, this module is the place errors will surface.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
@@ -36,6 +37,8 @@ from brain.health.attempt_heal import save_with_backup_text
 from brain.paths import get_log_dir, get_persona_dir
 from brain.service import UnsupportedPlatformError
 from brain.setup import validate_persona_name
+
+logger = logging.getLogger(__name__)
 
 
 def _user_home() -> Path:
@@ -168,9 +171,15 @@ def build_systemd_unit_text(
         "Type=simple\n"
         f'ExecStart="{nell_path}" supervisor run --persona "{persona}" '
         "--client-origin systemd --idle-shutdown 0\n"
+        # D26: a bridge that keeps failing to start spaces its own restarts (30 s up to 10 min,
+        # brain/bridge/start_backoff.py), so the default start limit (5 starts in 10 s) cannot trip and no
+        # StartLimit or RestartSteps setting is needed.
         "Restart=on-failure\n"
         "RestartSec=2\n"
         "TimeoutStopSec=300\n"
+        # #456: SIGTERM only the bridge on stop, so its in-flight calls (own sessions) finish; systemd SIGKILLs the
+        # rest of the control group only at TimeoutStopSec.
+        "KillMode=mixed\n"
         f"{env_block}\n"
         f"StandardOutput=append:{paths.stdout_path}\n"
         f"StandardError=append:{paths.stderr_path}\n"
@@ -179,6 +188,41 @@ def build_systemd_unit_text(
         "[Install]\n"
         "WantedBy=default.target\n"
     )
+
+
+def refresh_installed_unit(persona: str) -> bool:
+    """Add ``KillMode=mixed`` to OUR already-installed unit for ``persona`` (#456, D14).
+
+    Only the unit at ``paths_for_persona(persona).unit_path`` whose ``Description=`` and ``ExecStart=`` are the ones
+    this module writes is touched, and only when it has no ``KillMode=`` line: the line goes after ``TimeoutStopSec=``,
+    the file is replaced atomically, ``daemon-reload`` runs, and one INFO line is logged. It takes effect from the next
+    start. Returns True when the unit was changed."""
+    path = paths_for_persona(persona).unit_path
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    lines = text.splitlines(keepends=True)
+    ours = any(ln.strip() == f"Description=companion-emergence supervisor ({persona})" for ln in lines) and any(
+        ln.startswith("ExecStart=") and f'supervisor run --persona "{persona}"' in ln for ln in lines
+    )
+    if not ours or any(ln.startswith("KillMode=") for ln in lines):
+        return False
+    out: list[str] = []
+    inserted = False
+    for ln in lines:
+        out.append(ln)
+        if not inserted and ln.startswith("TimeoutStopSec="):
+            out.append("KillMode=mixed\n")
+            inserted = True
+    if not inserted:
+        return False
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("".join(out), encoding="utf-8")
+    os.replace(tmp, path)
+    run_systemctl(["daemon-reload"])
+    logger.info("systemd unit refreshed: KillMode=mixed added to %s (effective from the next start)", path)
+    return True
 
 
 def write_systemd_unit(
@@ -225,7 +269,15 @@ def run_systemctl(args: list[str]) -> subprocess.CompletedProcess[str]:
             args=["systemctl", "--user", *args],
             returncode=127,
             stdout="",
-            stderr="systemctl not available — Linux user-instance required",
+            stderr="systemctl not available: Linux user-instance required",
+        )
+    except subprocess.TimeoutExpired:
+        # A hung systemctl is a failed call for every caller (the same code timeout(1) uses).
+        return subprocess.CompletedProcess(
+            args=["systemctl", "--user", *args],
+            returncode=124,
+            stdout="",
+            stderr="systemctl timed out",
         )
 
 
@@ -236,7 +288,14 @@ def install_service(
     env_path: str = DEFAULT_SYSTEMD_PATH,
     nellbrain_home: str | Path | None = None,
 ) -> Path:
-    """Write the unit file, daemon-reload, then enable + start it."""
+    """Write the unit file, daemon-reload, then enable + start it.
+
+    #456: never behind a running bridge's back, and any stop intent and start back-off record are cleared first
+    (``lifecycle.before_install``).
+    """
+    from brain.service import lifecycle
+
+    lifecycle.before_install(persona)
     unit_path = write_systemd_unit(
         persona=persona,
         nell_path=nell_path,
@@ -253,6 +312,15 @@ def install_service(
         raise SystemdCommandError(_format_systemctl_error("enable --now", enable_result))
 
     return unit_path
+
+
+def start_service(*, persona: str) -> subprocess.CompletedProcess[str]:
+    """Start the installed unit (#456 D20: the start path for a persona whose service is installed). Any stop intent
+    and the start back-off record are cleared first (D25, D26)."""
+    from brain.service import lifecycle
+
+    lifecycle.note_explicit_start(persona)
+    return run_systemctl(["start", service_unit_name(persona)])
 
 
 def uninstall_service(*, persona: str, keep_unit: bool = False) -> Path:
