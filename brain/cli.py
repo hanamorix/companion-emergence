@@ -651,6 +651,11 @@ def _memory_backfill_extraction_handler(args: argparse.Namespace) -> int:
     same central-cadence job until done or until it stops (chat active, a deferral, ...); with a bridge running, arm it for the
     bridge (this process cannot see the bridge's chat state). ``--status``, ``--stop``. See
     ``brain/ingest/extraction_backfill.py``.
+
+    Every path that starts spending model calls (foreground, ``--background``, and arming for a running bridge, which spends at
+    lulls with no further prompt) prints the number of calls still to make and starts only with ``--yes``; without it nothing is
+    planned or armed and the exit code is 1. A plan with nothing to run (already complete, or the other mode, which is refused)
+    needs no ``--yes``, nor do ``--status``, ``--stop`` and ``--dry-run``.
     """
     from brain.ingest import extraction_backfill as eb
 
@@ -671,6 +676,17 @@ def _memory_backfill_extraction_handler(args: argparse.Namespace) -> int:
     if args.dry_run:
         print(eb.dry_run_text(persona_dir))
         return 0
+
+    calls = eb.planned_calls(persona_dir, mode, restart=args.restart)
+    if calls:
+        print(f"mode {mode}: about {calls} model call(s) to make, one per chunk of extracted text.")
+        if not args.yes:
+            print(
+                "Not started: this spends model calls. Run the same command again with --yes to start "
+                "(--dry-run shows what each mode would extract).",
+                file=sys.stderr,
+            )
+            return 1
 
     restart_note = "a bridge started before this update must be restarted to have the backfill job"
     outcome, message = eb.restart(persona_dir, mode) if args.restart else eb.arm(persona_dir, mode)
@@ -697,6 +713,9 @@ def _memory_backfill_extraction_handler(args: argparse.Namespace) -> int:
 
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
+        # No bridge is running here, so nothing has registered the persona's own emotions in this process: without this the
+        # extraction would drop every emotion that is not in the baseline vocabulary (524-1).
+        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
         hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
         try:
             eb.run_foreground(
@@ -3047,7 +3066,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "backfill-extraction",
         help=(
             "Re-extract conversation text that older versions never extracted (the starts of long stretches; "
-            "--all for everything). Runs one chunk at a time during lulls; resumable; --dry-run to see the size first."
+            "--all for everything). Runs one chunk at a time during lulls; resumable; --dry-run to see the size first; "
+            "prints the number of model calls and starts only with --yes."
         ),
     )
     memory_backfill.add_argument(
@@ -3064,6 +3084,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--restart",
         action="store_true",
         help="Discard the existing plan and plan afresh (the cutoff is recomputed; done targets are extracted again).",
+    )
+    memory_backfill.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm the model calls the plan will make; without it the command prints the count and does not start.",
     )
     backfill_action = memory_backfill.add_mutually_exclusive_group()
     backfill_action.add_argument(

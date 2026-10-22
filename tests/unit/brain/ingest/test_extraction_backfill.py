@@ -978,6 +978,51 @@ def test_b16_oracle_catches_soul_on_under_all(kestrel, monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 524-3: a killed run re-queues the same soul candidates on retry (the retry mints a new memory id)
+# ---------------------------------------------------------------------------
+
+
+def _kill_after_commits(persona) -> None:
+    """The state a kill between a chunk's commits and its progress write leaves: the chunk is committed, the plan has not moved."""
+
+    def _undo(cur):
+        for t in cur["targets"]:
+            t["done_through_ts"], t["seen"], t["status"] = None, 0, "open"
+        cur["status"] = "armed"
+        cur["counters"] = dict.fromkeys(cur["counters"], 0)
+        return cur
+
+    eb.update_state(persona, _undo)
+
+
+def test_524_3_a_retried_chunk_does_not_queue_the_same_soul_candidate_again(kestrel, monkeypatch) -> None:
+    persona, store, hebbian = kestrel
+    monkeypatch.setattr(eb, "_HISTORICAL_CAP_CHARS", 300)
+    _archive(persona, "sess_524", _rows("sess_524", _OLD, 2))
+    _arm(persona, "heads")
+    same = _Stub(importance=9, text="Bob keeps the last quorble button in the blue tin")
+    assert _run(persona, store, hebbian, same).advanced
+    assert _soul_count(persona) == 1
+    first_id = json.loads((persona / "soul_candidates.jsonl").read_text().splitlines()[0])["memory_id"]
+    _kill_after_commits(persona)
+    assert _run(persona, store, hebbian, same).advanced  # the retry re-extracts: a NEW memory id for the same text
+    assert _soul_count(persona) == 1
+    assert json.loads((persona / "soul_candidates.jsonl").read_text().splitlines()[0])["memory_id"] == first_id
+
+
+def test_524_3_the_dedup_is_per_session_and_per_text(kestrel, monkeypatch) -> None:
+    persona, store, hebbian = kestrel
+    monkeypatch.setattr(eb, "_HISTORICAL_CAP_CHARS", 300)
+    _archive(persona, "sess_a24", _rows("sess_a24", _OLD, 2))
+    _archive(persona, "sess_b24", _rows("sess_b24", _OLD + timedelta(days=1), 2))
+    _arm(persona, "heads")
+    # the same text in two sessions is two candidates; a different text in a session is another one
+    _run_all(persona, store, hebbian, _Stub(importance=9, text="Bob keeps the last quorble button in the blue tin"))
+    assert _soul_count(persona) == 2
+    assert {json.loads(x)["session_id"] for x in (persona / "soul_candidates.jsonl").read_text().splitlines()} == {"sess_a24", "sess_b24"}
+
+
+# ---------------------------------------------------------------------------
 # The supervisor's job table and one central pass
 # ---------------------------------------------------------------------------
 

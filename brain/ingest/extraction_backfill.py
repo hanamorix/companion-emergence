@@ -20,7 +20,9 @@ Backfilled memories carry ``metadata.extraction_backfill = {"from": <first row t
 ``conversation:<sid>`` would reset the time since the user last spoke (``days_since_human``), which the body state and the
 reach-out gates read; back-dated, that clock never moves past the real newest user turn. Soul candidates are queued in
 ``heads`` mode only: that text was never extracted, so it never had its chance at the soul queue, while most ``--all`` text was
-extracted once already and the soul queue has no dedup (an accepted candidate becomes a permanent crystallisation).
+extracted once already and the soul queue has no dedup (an accepted candidate becomes a permanent crystallisation). A chunk
+that runs again after a kill (its commits done, its progress not saved) does not queue a candidate twice: the pipeline's soul
+stage skips a candidate whose session id and text are already queued (a retry mints a new memory id, so the id cannot tell).
 
 The plan and its progress live in ``<persona>/extraction_backfill_state.json``; every read-modify-write holds
 ``file_lock(<state>)`` and never spans a model call. A chunk's progress is written only after its commits, and only if the
@@ -822,6 +824,31 @@ def status_text(persona_dir: Path) -> str:
     )
 
 
+def _calls_for_rows(persona_dir: Path, rows: list[dict]) -> int:
+    """Model calls it takes to extract ``rows``: one per piece of each chunk (the run makes exactly these)."""
+    user_name, assistant_name = _labels(persona_dir)
+    return sum(
+        len(c.pieces)
+        for c in chunk_turns(rows, max_chars=extraction_chunk_chars(), user_name=user_name, assistant_name=assistant_name)
+    )
+
+
+def planned_calls(persona_dir: Path, mode: str, *, restart: bool = False) -> int:
+    """The model calls ``arm(persona_dir, mode)`` (or ``restart``) would make, counted without writing anything: the calls
+    still to make for an existing plan that ``arm`` would resume (armed or stopped, same mode), else for a fresh plan of
+    ``mode``. 0 when ``arm`` would run nothing (a complete plan, or the other mode, which it refuses). No model call, no file,
+    no lock."""
+    state = None if restart else load_state(persona_dir)
+    if state is not None:
+        if state.get("mode") != mode or state.get("status") not in ("armed", "stopped"):
+            return 0
+        return sum(_calls_for_rows(persona_dir, _target_rows(persona_dir, t, state["cutoff_ts"])) for t in _open_targets(state))
+    now = datetime.now(UTC)
+    cutoff = now.isoformat()
+    targets = _plan(persona_dir, mode, cutoff, _session_cutoffs(persona_dir, now))
+    return sum(_calls_for_rows(persona_dir, _target_rows(persona_dir, t, cutoff)) for t in targets)
+
+
 def dry_run_text(persona_dir: Path) -> str:
     """Both modes' plans, built in memory: per session the targets, characters, chunks (= model calls) and date range.
     No model call, no file or directory created, no lock taken."""
@@ -839,9 +866,7 @@ def dry_run_text(persona_dir: Path) -> str:
         for target in _plan(persona_dir, mode, cutoff, session_cutoffs):
             rows = _target_rows(persona_dir, target, cutoff)
             text = "\n".join(format_turn_line(r, user_name or "user", assistant_name) for r in rows)
-            calls = sum(
-                len(c.pieces) for c in chunk_turns(rows, max_chars=max_chars, user_name=user_name, assistant_name=assistant_name)
-            )
+            calls = _calls_for_rows(persona_dir, rows)
             entry = per_sid.setdefault(target["sid"], [0, 0, 0, target["from_ts"], target["to_ts"]])
             entry[0] += 1
             entry[1] += len(text)

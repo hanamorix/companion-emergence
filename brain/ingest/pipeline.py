@@ -58,7 +58,11 @@ from brain.ingest.ingest_utils import (
     load_user_pronouns,
     mark_chunked_extraction,
 )
-from brain.ingest.soul_queue import DEFAULT_SOUL_THRESHOLD, queue_soul_candidate
+from brain.ingest.soul_queue import (
+    DEFAULT_SOUL_THRESHOLD,
+    is_soul_candidate_queued,
+    queue_soul_candidate,
+)
 from brain.ingest.types import IngestReport
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.pending import GATE_BYPASS_TYPES
@@ -84,8 +88,11 @@ def extraction_failures_exhausted(persona_dir: Path, session_id: str) -> bool:
     return state is not None and state["failures"] >= _BACKOFF_FAILURE_THRESHOLD
 
 
-def record_extraction_failure(persona_dir: Path, session_id: str) -> None:
+def record_extraction_failure(persona_dir: Path, session_id: str, *, failing_end_ts: str | None = None) -> None:
     """Record one failed extraction attempt in the session's backoff sidecar (F-011).
+
+    ``failing_end_ts``: the end of the chunk that failed (the latest failure's end replaces an earlier one; None keeps what is
+    recorded), so ``poison_unextracted_span`` sets aside only the rows that chunk carried.
 
     The first failure in a new window anchors ``first_failure_at`` to now; later ones increment the count without moving the anchor,
     so the window measures from the *first* failure. Three of them let the rollover, or the stale sweep once the session has been
@@ -94,13 +101,16 @@ def record_extraction_failure(persona_dir: Path, session_id: str) -> None:
     """
     existing = read_backoff(persona_dir, session_id)
     if existing is None:
-        write_backoff(persona_dir, session_id, failures=1, first_failure_at=datetime.now(UTC).isoformat())
+        write_backoff(
+            persona_dir, session_id, failures=1, first_failure_at=datetime.now(UTC).isoformat(), failing_end_ts=failing_end_ts
+        )
     else:
         write_backoff(
             persona_dir,
             session_id,
             failures=existing["failures"] + 1,
             first_failure_at=existing["first_failure_at"],
+            failing_end_ts=failing_end_ts or existing.get("failing_end_ts"),
         )
 
 
@@ -110,7 +120,9 @@ def poison_unextracted_span(persona_dir: Path, session_id: str) -> int | None:
 
     Only the FIRST chunk after the cursor is set aside: it is the one whose failures reached the threshold (a pass stops at its
     first failing chunk, and the chunking is deterministic for the same rows and limit). The chunks after it were never tried
-    and stay in the buffer after the moved cursor for the next pass. Both the rollover and the stale sweep (once the session has
+    and stay in the buffer after the moved cursor for the next pass. The chunks are recomputed here, so rows that arrived after
+    the failing attempt would join a failing LAST chunk: the failure record carries that chunk's end (``failing_end_ts``) and
+    only rows at or before it are considered; a record without it (an older brain's) bounds nothing. Both the rollover and the stale sweep (once the session has
     been silent for 24 hours) call this after the same 3 recorded failures; without it, a session with a persistent extraction
     failure would keep its unextracted turns forever, since the rollover refuses to reap them. The rows are KEPT (appended
     verbatim, never silently lost) and the failure record is cleared.
@@ -125,6 +137,11 @@ def poison_unextracted_span(persona_dir: Path, session_id: str) -> int | None:
             return None
         cursor = read_cursor(persona_dir, session_id)
         turns = [t for t in read_session_after(persona_dir, session_id, cursor) if t.get("speaker") != "summary"]
+        failing_end = lenient_utc((read_backoff(persona_dir, session_id) or {}).get("failing_end_ts"))
+        if failing_end is not None:
+            # Rows newer than the failing chunk were never tried: they stay in the buffer for the next pass. A row whose ts
+            # cannot be read is kept in the span (it sits among the rows the chunk carried).
+            turns = [t for t in turns if (ts := lenient_utc(t.get("ts"))) is None or ts <= failing_end]
         if not turns:
             delete_backoff(persona_dir, session_id)
             return 0
@@ -183,7 +200,8 @@ def run_chunk_stages(
     what the result means for them.
 
     ``cfg`` knobs: ``extraction_max_retries`` (1), ``dedup_threshold`` (0.88), ``crystallize_threshold`` (8).
-    ``queue_soul``: queue high-importance items as soul candidates (the backfill turns it off under ``--all``).
+    ``queue_soul``: queue high-importance items as soul candidates (the backfill turns it off under ``--all``); one whose session
+    id and text are already queued is skipped (a chunk that runs again mints new memory ids for the same text).
     ``extra_metadata`` / ``created_at``: passed to ``commit_item`` (the backfill's source marker and back-date).
     A bridge that is stopping (``ShutdownDeferred``) is raised out of the extraction, not returned.
     """
@@ -251,6 +269,11 @@ def run_chunk_stages(
 
         # SOUL
         if queue_soul and item.importance >= crystallize_threshold:
+            # A chunk that runs again (a run killed after its commits, before its progress was saved) extracts the same text
+            # under a new memory id, and the soul queue itself has no dedup: skip a candidate already queued for this session.
+            if is_soul_candidate_queued(persona_dir, session_id=session_id, text=item.text):
+                logger.info("conversation_soul_candidate_repeat session=%s: already queued, not queued again", session_id)
+                continue
             queued = queue_soul_candidate(
                 persona_dir,
                 memory_id=mem_id,
@@ -356,7 +379,7 @@ def _run_chunks(
                     report.commit_failures,
                 )
             if record_failures:
-                record_extraction_failure(persona_dir, session_id)
+                record_extraction_failure(persona_dir, session_id, failing_end_ts=chunk.cursor_ts)
             return
         if record_failures:
             # F-011: success clears any prior backoff state so the next failure starts a fresh window.
@@ -770,8 +793,9 @@ def finalize_stale_sessions(
             # the cursor, the one that kept failing); the chunks after it were never tried and stay in the buffer, after the
             # moved cursor, for the next passes. The buffer itself is never moved or deleted here (the rollover owns that).
             # poison_unextracted_span takes the session's extraction lock non-blocking (#477): None = another pass holds it,
-            # the next finalize tick retries; 0 = nothing left after the cursor (a rollover reaped the buffer in between),
-            # and the stale failure record is cleared.
+            # the next finalize tick retries; 0 = nothing to set aside (nothing left after the cursor because a rollover reaped the
+            # buffer in between, or only rows newer than the failing chunk, which stay for the next pass), and the stale failure
+            # record is cleared.
             try:
                 set_aside = poison_unextracted_span(persona_dir, sid)
             except Exception:  # noqa: BLE001 - one session's fault must not abort the sweep for the others
@@ -781,8 +805,8 @@ def finalize_stale_sessions(
                 logger.info("conversation_finalize_deadletter_busy session=%s: another extraction holds it", sid)
             elif set_aside == 0:
                 logger.info(
-                    "conversation_finalize_deadletter_gone session=%s: nothing left after the cursor (the buffer was "
-                    "reaped by a rollover); nothing to poison, backoff cleared",
+                    "conversation_finalize_deadletter_gone session=%s: nothing to set aside (the buffer was reaped by a "
+                    "rollover, or only rows newer than the failing chunk remain); backoff cleared",
                     sid,
                 )
             else:

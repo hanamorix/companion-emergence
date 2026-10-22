@@ -690,6 +690,67 @@ def test_c9_poison_sets_aside_only_the_failing_chunk(world) -> None:
     assert [r["text"] for r in after] == [r["text"] for c in chunks[2:] for r in c.turns]
 
 
+def _fail_three_times(world, sid: str) -> None:
+    for _ in range(3):
+        _snapshot(world, sid, _Stub(plan=lambda n, p: "fail"))
+
+
+def test_524_4_rows_that_arrived_after_the_failing_last_chunk_are_not_set_aside_untried(world) -> None:
+    """The failing chunk was the LAST one; rows appended since join it when the chunks are recomputed at poison time. Only the
+    rows the failing attempts carried go to ``poison/``; the newer ones stay for the next pass, which extracts them."""
+    persona, _, _, transcripts = world
+    rows = _seed(persona, "sess_p24", 8)
+    chunks = _expected_chunks(rows)
+    assert len(chunks) >= 3
+    last = chunks[-1]
+    write_cursor(persona, "sess_p24", chunks[-2].cursor_ts)  # every chunk before the last was committed
+    _fail_three_times(world, "sess_p24")
+    assert read_backoff(persona, "sess_p24")["failures"] == 3
+    assert read_backoff(persona, "sess_p24")["failing_end_ts"] == last.cursor_ts  # the failure record names the chunk's end
+    later = datetime.now(UTC) + timedelta(seconds=30)
+    for who, text in (("user", "wzzzq fresh question " + "p" * 10), ("assistant", "wzzzr fresh answer " + "r" * 10)):
+        ingest_turn(persona, {"session_id": "sess_p24", "speaker": who, "text": text, "ts": later.isoformat(timespec="seconds")})
+        later += timedelta(seconds=1)
+    fresh = [r for r in read_session(persona, "sess_p24") if r["ts"] > last.cursor_ts]
+    assert len(fresh) == 2
+    # premise: the recomputed chunks would put the new rows into the failing chunk, as a bounded-nothing poison would
+    assert len(_expected_chunks(list(last.turns) + fresh)) == 1
+
+    assert pipeline.poison_unextracted_span(persona, "sess_p24") == len(last.turns)
+    poisoned = (persona / "active_conversations" / "poison" / "sess_p24.span.jsonl").read_text().splitlines()
+    assert [json.loads(x)["text"] for x in poisoned] == [r["text"] for r in last.turns]
+    assert read_cursor(persona, "sess_p24") == last.cursor_ts
+    assert read_backoff(persona, "sess_p24") is None
+    transcripts.clear()
+    again = _snapshot(world, "sess_p24", _Stub())
+    assert again.completed
+    assert "\n".join(transcripts) == "\n".join(_line(r) for r in fresh)  # the never-tried rows are extracted, not poisoned
+
+
+def test_524_4_a_failure_record_from_an_older_brain_still_sets_the_first_chunk_aside(world) -> None:
+    """A sidecar with no ``failing_end_ts`` (written by an older brain) keeps the earlier behaviour: the first chunk after the cursor."""
+    persona, _, _, _ = world
+    rows = _seed(persona, "sess_p25", 8)
+    chunks = _expected_chunks(rows)
+    write_cursor(persona, "sess_p25", chunks[0].cursor_ts)
+    write_backoff(persona, "sess_p25", failures=3, first_failure_at=datetime.now(UTC).isoformat())
+    assert read_backoff(persona, "sess_p25").get("failing_end_ts") is None
+    assert pipeline.poison_unextracted_span(persona, "sess_p25") == len(chunks[1].turns)
+
+
+def test_524_4_each_failure_replaces_the_recorded_end(world) -> None:
+    persona, _, _, _ = world
+    rows = _seed(persona, "sess_p26", 8)
+    chunks = _expected_chunks(rows)
+    write_cursor(persona, "sess_p26", chunks[0].cursor_ts)
+    _snapshot(world, "sess_p26", _Stub(plan=lambda n, p: "fail"))
+    assert read_backoff(persona, "sess_p26")["failing_end_ts"] == chunks[1].cursor_ts
+    # a failure whose chunk end is not known (the rollover's exception path) keeps what is recorded
+    pipeline.record_extraction_failure(persona, "sess_p26")
+    state = read_backoff(persona, "sess_p26")
+    assert state["failures"] == 2 and state["failing_end_ts"] == chunks[1].cursor_ts
+
+
 def test_c10_a_chunked_pass_says_so(world, caplog) -> None:
     persona, _, _, _ = world
     _seed(persona, "sess_c10", 12)
