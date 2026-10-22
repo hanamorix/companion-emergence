@@ -441,7 +441,7 @@ _EXPECTED_ARGV = [
     "<TMP>",
     "--allowedTools",
     "<ALLOWED>",
-    "--tools=WebSearch,WebFetch",  # #332: the exclusive built-in allowlist
+    "--tools=WebSearch,WebFetch,ToolSearch",  # #332: the exclusive built-in allowlist
     "--disallowedTools",
     "Bash",
     "Read",
@@ -932,7 +932,7 @@ def _old_main_argv() -> list[str]:
         "--model", "haiku",
         "--mcp-config", "<TMPFILE>",
         "--allowedTools", *[f"mcp__brain-tools__{n}" for n in NELL_TOOL_NAMES],
-        "--tools=WebSearch,WebFetch",
+        "--tools=WebSearch,WebFetch,ToolSearch",
         "--disallowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "Task",
         "TodoWrite", "NotebookEdit", "BashOutput", "KillShell",
         "--strict-mcp-config",
@@ -1570,7 +1570,7 @@ def _old_text_argv() -> list[str]:
         "--output-format", "json",
         "--model", "haiku",
         "--max-budget-usd", str(_MAX_TURN_BUDGET_USD("haiku")),
-        "--tools=WebSearch,WebFetch",
+        "--tools=WebSearch,WebFetch,ToolSearch",
         "--disallowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "Task",
         "TodoWrite", "NotebookEdit", "BashOutput", "KillShell",
         "--strict-mcp-config",
