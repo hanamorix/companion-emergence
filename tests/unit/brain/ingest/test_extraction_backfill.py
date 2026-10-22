@@ -1016,7 +1016,7 @@ def test_524_3_the_dedup_is_per_session_and_per_text(kestrel, monkeypatch) -> No
     _archive(persona, "sess_a24", _rows("sess_a24", _OLD, 2))
     _archive(persona, "sess_b24", _rows("sess_b24", _OLD + timedelta(days=1), 2))
     _arm(persona, "heads")
-    # the same text in two sessions is two candidates; a different text in a session is another one
+    # the same text in two different sessions is two candidates (the lookup's "different text" half is pinned in test_soul_queue.py)
     _run_all(persona, store, hebbian, _Stub(importance=9, text="Bob keeps the last quorble button in the blue tin"))
     assert _soul_count(persona) == 2
     assert {json.loads(x)["session_id"] for x in (persona / "soul_candidates.jsonl").read_text().splitlines()} == {"sess_a24", "sess_b24"}

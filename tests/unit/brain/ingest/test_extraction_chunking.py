@@ -742,13 +742,22 @@ def test_524_4_each_failure_replaces_the_recorded_end(world) -> None:
     persona, _, _, _ = world
     rows = _seed(persona, "sess_p26", 8)
     chunks = _expected_chunks(rows)
-    write_cursor(persona, "sess_p26", chunks[0].cursor_ts)
+    last = chunks[-1]
+    write_cursor(persona, "sess_p26", chunks[-2].cursor_ts)  # the failing chunk is the last one, so rows that arrive grow it
     _snapshot(world, "sess_p26", _Stub(plan=lambda n, p: "fail"))
-    assert read_backoff(persona, "sess_p26")["failing_end_ts"] == chunks[1].cursor_ts
+    assert read_backoff(persona, "sess_p26")["failing_end_ts"] == last.cursor_ts
+    later = datetime.now(UTC) + timedelta(seconds=30)
+    ingest_turn(persona, {"session_id": "sess_p26", "speaker": "user", "text": "wzzzq fresh question " + "p" * 10,
+                          "ts": later.isoformat(timespec="seconds")})
+    _snapshot(world, "sess_p26", _Stub(plan=lambda n, p: "fail"))
+    state = read_backoff(persona, "sess_p26")
+    new_end = later.isoformat(timespec="seconds")
+    assert new_end > last.cursor_ts
+    assert state["failures"] == 2 and state["failing_end_ts"] == new_end  # the second, different end replaced the first
     # a failure whose chunk end is not known (the rollover's exception path) keeps what is recorded
     pipeline.record_extraction_failure(persona, "sess_p26")
     state = read_backoff(persona, "sess_p26")
-    assert state["failures"] == 2 and state["failing_end_ts"] == chunks[1].cursor_ts
+    assert state["failures"] == 3 and state["failing_end_ts"] == new_end
 
 
 def test_c10_a_chunked_pass_says_so(world, caplog) -> None:

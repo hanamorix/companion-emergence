@@ -20,9 +20,10 @@ Backfilled memories carry ``metadata.extraction_backfill = {"from": <first row t
 ``conversation:<sid>`` would reset the time since the user last spoke (``days_since_human``), which the body state and the
 reach-out gates read; back-dated, that clock never moves past the real newest user turn. Soul candidates are queued in
 ``heads`` mode only: that text was never extracted, so it never had its chance at the soul queue, while most ``--all`` text was
-extracted once already and the soul queue has no dedup (an accepted candidate becomes a permanent crystallisation). A chunk
-that runs again after a kill (its commits done, its progress not saved) does not queue a candidate twice: the pipeline's soul
-stage skips a candidate whose session id and text are already queued (a retry mints a new memory id, so the id cannot tell).
+extracted once already, and the soul queue itself has no dedup (an accepted candidate becomes a permanent crystallisation). The
+pipeline's soul stage skips only an exact repeat: a candidate whose session id and text are already queued, so a chunk that runs
+again after a kill (its commits done, its progress not saved) does not queue the same candidate twice (a retry mints a new
+memory id, so the id cannot tell). Text that was extracted before and comes back reworded is not an exact repeat and is queued.
 
 The plan and its progress live in ``<persona>/extraction_backfill_state.json``; every read-modify-write holds
 ``file_lock(<state>)`` and never spans a model call. A chunk's progress is written only after its commits, and only if the
@@ -784,7 +785,7 @@ def restart(persona_dir: Path, mode: str) -> tuple[str, str]:
     if done:
         message += (
             f"; the replaced plan had {done} target(s) done: their text is extracted again (dedup catches most of it"
-            + ("; soul candidates are queued again" if mode == "heads" else "")
+            + ("; reworded soul candidates are queued again (an exact repeat of a queued one is skipped)" if mode == "heads" else "")
             + ")"
         )
     return ("armed" if new["status"] == "armed" else "complete"), message
@@ -824,9 +825,9 @@ def status_text(persona_dir: Path) -> str:
     )
 
 
-def _calls_for_rows(persona_dir: Path, rows: list[dict]) -> int:
-    """Model calls it takes to extract ``rows``: one per piece of each chunk (the run makes exactly these)."""
-    user_name, assistant_name = _labels(persona_dir)
+def _calls_for_rows(rows: list[dict], user_name: str | None, assistant_name: str) -> int:
+    """Model calls it takes to extract ``rows``: one per piece of each chunk (an over-long exchange is several pieces in one
+    chunk), which is what the run makes."""
     return sum(
         len(c.pieces)
         for c in chunk_turns(rows, max_chars=extraction_chunk_chars(), user_name=user_name, assistant_name=assistant_name)
@@ -838,15 +839,16 @@ def planned_calls(persona_dir: Path, mode: str, *, restart: bool = False) -> int
     still to make for an existing plan that ``arm`` would resume (armed or stopped, same mode), else for a fresh plan of
     ``mode``. 0 when ``arm`` would run nothing (a complete plan, or the other mode, which it refuses). No model call, no file,
     no lock."""
+    labels = _labels(persona_dir)
     state = None if restart else load_state(persona_dir)
     if state is not None:
         if state.get("mode") != mode or state.get("status") not in ("armed", "stopped"):
             return 0
-        return sum(_calls_for_rows(persona_dir, _target_rows(persona_dir, t, state["cutoff_ts"])) for t in _open_targets(state))
+        return sum(_calls_for_rows(_target_rows(persona_dir, t, state["cutoff_ts"]), *labels) for t in _open_targets(state))
     now = datetime.now(UTC)
     cutoff = now.isoformat()
     targets = _plan(persona_dir, mode, cutoff, _session_cutoffs(persona_dir, now))
-    return sum(_calls_for_rows(persona_dir, _target_rows(persona_dir, t, cutoff)) for t in targets)
+    return sum(_calls_for_rows(_target_rows(persona_dir, t, cutoff), *labels) for t in targets)
 
 
 def dry_run_text(persona_dir: Path) -> str:
@@ -866,7 +868,7 @@ def dry_run_text(persona_dir: Path) -> str:
         for target in _plan(persona_dir, mode, cutoff, session_cutoffs):
             rows = _target_rows(persona_dir, target, cutoff)
             text = "\n".join(format_turn_line(r, user_name or "user", assistant_name) for r in rows)
-            calls = _calls_for_rows(persona_dir, rows)
+            calls = _calls_for_rows(rows, user_name, assistant_name)
             entry = per_sid.setdefault(target["sid"], [0, 0, 0, target["from_ts"], target["to_ts"]])
             entry[0] += 1
             entry[1] += len(text)

@@ -679,7 +679,7 @@ def _memory_backfill_extraction_handler(args: argparse.Namespace) -> int:
 
     calls = eb.planned_calls(persona_dir, mode, restart=args.restart)
     if calls:
-        print(f"mode {mode}: about {calls} model call(s) to make, one per chunk of extracted text.")
+        print(f"mode {mode}: about {calls} model call(s) to make (one per chunk of extracted text; an over-long exchange takes several).")
         if not args.yes:
             print(
                 "Not started: this spends model calls. Run the same command again with --yes to start "
