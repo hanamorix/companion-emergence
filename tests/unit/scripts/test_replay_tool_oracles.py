@@ -147,7 +147,9 @@ def test_b3_passes_identical_and_fails_a_cost_rise():
 def test_b3_creation_only_failure_asks_for_the_human():
     old = [_cost_run(0.10) for _ in range(3)]
     res = rto.b3(old, [_cost_run(0.10, creation=1500) for _ in range(3)])
-    assert res["verdict"] == "FAIL" and res["stop_for_human"] is True
+    # Not a FAIL (that routes back to stage 2): criteria Rev 4 sends a creation-only failure to the human.
+    assert res["verdict"] == "STOP_FOR_HUMAN" and res["stop_for_human"] is True
+    assert rto.exit_code({"gates": {"B3": res}}) == 11
 
 
 def test_b3_a_noisy_old_arm_is_unmeasured():
@@ -160,7 +162,20 @@ def test_b3_a_cache_break_in_new_fails():
     assert rto.b3(old, [_cost_run(0.10), _cost_run(0.10, cache="FAIL"), _cost_run(0.10)])["verdict"] == "FAIL"
 
 
+@pytest.mark.parametrize("status", ["UNMEASURED", "NOT_APPLICABLE", None])
+def test_b3_an_unjudged_cache_check_is_unmeasured_not_a_fail(status):
+    old = [_cost_run(0.10) for _ in range(3)]
+    res = rto.b3(old, [_cost_run(0.10), _cost_run(0.10, cache=status), _cost_run(0.10)])
+    assert res["metrics"]["cache_read_ratio"]["verdict"] == "UNMEASURED"
+    assert res["verdict"] == "UNMEASURED"
+
+
 # ---- B8, B9 -----------------------------------------------------------------------------
+
+
+def test_b8_with_no_replies_is_unmeasured():
+    # Scanning nothing is not a pass (gate 7 L-1b).
+    assert rto.b8([])["verdict"] == "UNMEASURED"
 
 
 def test_b8_flags_scaffolding_in_a_reply():
@@ -177,14 +192,59 @@ def test_b9_reports_reply_lengths():
 # ---- CLI ---------------------------------------------------------------------------------
 
 
-def test_cli_exit_codes(tmp_path):
-    rm = mcp("record_monologue")
-    old = tmp_path / "old.json"
-    new = tmp_path / "new.json"
-    old.write_text(json.dumps(run("default", hits(18, 24, rm))), encoding="utf-8")
-    new.write_text(json.dumps(run("default", hits(6, 24, rm))), encoding="utf-8")
-    assert rto.main(["--old", str(old), "--new", str(new), "--always-load", "record_monologue"]) == 10
-    assert rto.main(["--old", str(old), "--new", str(old), "--always-load", "record_monologue"]) in (0, 11)
+def _write(tmp_path, name, metrics, replies=None):
+    path = tmp_path / f"{name}.json"
+    path.write_text(json.dumps(metrics), encoding="utf-8")
+    if replies is not None:
+        path.with_suffix(".replies.json").write_text(json.dumps(replies), encoding="utf-8")
+    return str(path)
+
+
+def _arm(tmp_path, arm, rm_hits, reply="fine"):
+    """One file per prompt set, each with its sibling replies (as --dump-replies writes them)."""
+    rm, rf, ls, ts = mcp("record_monologue"), mcp("read_full_memory"), mcp("list_directory"), builtin("ToolSearch")
+    replies = [{"turn": k, "prompt": "p", "reply": reply} for k in range(0, 25)]
+    reach_turns = [[ls, ts] if arm == "new" else [ls] for _ in range(12)] + [[] for _ in range(9)]
+    return [
+        _write(tmp_path, f"{arm}-default", run("default", hits(rm_hits, 24, rm)), replies),
+        _write(tmp_path, f"{arm}-reach", run("reach", reach_turns), replies[:22]),
+        _write(tmp_path, f"{arm}-recall", run("recall", hits(10, 18, rf)), replies[:19]),
+    ]
+
+
+def test_cli_scores_every_gate_and_exits_by_the_worst(tmp_path):
+    old = _arm(tmp_path, "old", 18)
+    new = _arm(tmp_path, "new", 18)
+    out = tmp_path / "report.json"
+    assert rto.main(["--old", *old, "--new", *new, "--always-load", "record_monologue", "--out", str(out)]) == 0
+    report = json.loads(out.read_text(encoding="utf-8"))
+    assert set(report["gates"]) == {"B1", "B2", "B2b", "B3", "B8"}
+    assert report["always_load"] == ["record_monologue"]
+    assert set(report["advisory"]["B9"]) == {"old", "new"}  # per arm, default replies (gate 7 M-2)
+    drop = _arm(tmp_path, "drop", 6)
+    assert rto.main(["--old", *old, "--new", *drop, "--always-load", "record_monologue"]) == 10
+
+
+def test_cli_a_missing_prompt_set_is_unmeasured_not_a_pass(tmp_path):
+    old = _arm(tmp_path, "old", 18)
+    report = rto.evaluate([json.loads(Path(old[0]).read_text())], [json.loads(Path(old[0]).read_text())], {"record_monologue"}, [], [])
+    assert {g: report["gates"][g]["verdict"] for g in ("B2", "B2b", "B8")} == dict.fromkeys(("B2", "B2b", "B8"), "UNMEASURED")
+    assert rto.main(["--old", old[0], "--new", old[0], "--always-load", "record_monologue"]) == 11
+
+
+def test_cli_scans_the_replies_of_every_new_file_for_leaks(tmp_path):
+    old = _arm(tmp_path, "old", 18)
+    new = _arm(tmp_path, "new", 18)
+    Path(new[2]).with_suffix(".replies.json").write_text(json.dumps([{"turn": 3, "reply": "via ToolSearch"}]), encoding="utf-8")
+    assert rto.main(["--old", *old, "--new", *new, "--always-load", "record_monologue"]) == 10
+
+
+def test_cli_requires_the_always_load_set(tmp_path):
+    # Without it record_monologue would count as "deferred" and B2 would measure a proxy (gate 7 L-1c).
+    old = _arm(tmp_path, "old", 18)
+    with pytest.raises(SystemExit) as exc:
+        rto.main(["--old", *old, "--new", *old])
+    assert exc.value.code == 2
 
 
 def test_self_test_passes():

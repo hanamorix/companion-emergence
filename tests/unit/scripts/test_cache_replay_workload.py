@@ -1960,3 +1960,31 @@ def test_525_cli_parses_the_new_options():
     a = crw.parse_args(["--scratch", "--model", "haiku", "--prompt-set", "recall", "--render-only"])
     assert (a.model, a.prompt_set, a.render_only) == ("haiku", "recall", True)
     assert crw.parse_args(["--scratch"]).prompt_set == "default"
+
+
+def _turn_window_case(tmp_path, late_offset_s):
+    from datetime import UTC, datetime, timedelta
+
+    t0 = datetime(2026, 10, 22, 12, 0, tzinfo=UTC)
+    starts = [t0, t0 + timedelta(seconds=10)]
+    ends = [t0 + timedelta(seconds=5), t0 + timedelta(seconds=15)]
+    first = json.dumps({"name": "record_monologue", "timestamp": (t0 + timedelta(seconds=2)).isoformat()}) + "\n"
+    second = json.dumps({"name": "search_memories", "timestamp": (t0 + timedelta(seconds=late_offset_s)).isoformat()}) + "\n"
+    log = tmp_path / "tool_invocations.log.jsonl"
+    log.write_text(first + second, encoding="utf-8")
+    bounds = [len(first.encode()), len((first + second).encode())]
+    usage = ([{"call_type": "chat"}, {"call_type": "chat"}], 0, [1, 1], True)
+    return crw._per_turn([1, 2], ["a", "b"], usage, None, log, 0, bounds, ends, turn_starts=starts)
+
+
+def test_525_a_late_tool_row_from_the_previous_turn_leaves_per_turn_unmeasured(tmp_path):
+    # Stamped after turn 1 ended but before turn 2 began, then flushed into turn 2's window: it belongs to
+    # turn 1 and would be miscounted (gate 7 F-1). The check against the turn's own end can never see it.
+    per_turn, err = _turn_window_case(tmp_path, late_offset_s=6)
+    assert per_turn is None and "late" in err
+
+
+def test_525_a_row_stamped_inside_its_turn_is_attributed_to_it(tmp_path):
+    per_turn, err = _turn_window_case(tmp_path, late_offset_s=12)
+    assert err is None
+    assert [r["name"] for r in per_turn[1]["tool_rows"]] == ["search_memories"]

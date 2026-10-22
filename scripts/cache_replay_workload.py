@@ -429,6 +429,7 @@ def run_replay(
     replies: list[dict] = []
     boundaries: list[int] = []  # usage-file size after each turn: attributes the appended rows to their turns
     tool_boundaries: list[int] = []  # the same for the tool log (#525 per-turn attribution)
+    turn_starts: list[datetime] = []
     turn_ends: list[datetime] = []
     print(
         f"# cache replay — {turns} turns{' + warm-up' if warmup else ''}{' + 2 plain turns' if plain_turns else ''}, "
@@ -438,6 +439,7 @@ def run_replay(
     try:
         for pos, (i, prompt) in enumerate(sequence):
             t0 = time.monotonic()
+            turn_starts.append(datetime.now(UTC))
             result = respond(
                 persona_dir,
                 prompt,
@@ -508,7 +510,7 @@ def run_replay(
     summary["model"] = model
     summary["per_turn"], summary["per_turn_error"] = _per_turn(
         [i for i, _ in sequence], [pr for _, pr in sequence], usage_parse, rows_error,
-        tool_path, tool_offset, tool_boundaries, turn_ends,
+        tool_path, tool_offset, tool_boundaries, turn_ends, turn_starts=turn_starts,
     )
     summary["warmup_turn"] = warmup
     summary["plain_turns"] = plain_turns
@@ -516,12 +518,13 @@ def run_replay(
     return summary, replies
 
 
-def _per_turn(ids, prompts, usage_parse, usage_error, tool_path, tool_offset, tool_boundaries, turn_ends):
+def _per_turn(ids, prompts, usage_parse, usage_error, tool_path, tool_offset, tool_boundaries, turn_ends, turn_starts=None):
     """Per-turn usage and tool rows for the #525 behaviour oracles (scripts/replay_tool_oracles.py).
 
     Returns (per_turn, None), or (None, reason) when the rows cannot be mapped 1:1 to turns: a log shrank or
-    was rotated, a line was skipped, or a tool row is stamped after its turn ended (a late write would be
-    counted in the wrong turn). Only names, origins and outcomes are kept, never tool arguments.
+    was rotated, a line was skipped, or a tool row's timestamp falls outside its turn: stamped before the turn
+    began (a late write from an earlier turn, flushed into this window) or after it ended. Only names, origins
+    and outcomes are kept, never tool arguments.
     """
     if usage_parse is None:
         return None, usage_error or "the usage rows could not be read"
@@ -540,6 +543,8 @@ def _per_turn(ids, prompts, usage_parse, usage_error, tool_path, tool_offset, to
         t_at += t_counts[k] if tools else 0
         for r in t_rows:
             ts = _parse_ts(r.get("timestamp"))
+            if ts is not None and turn_starts is not None and ts < turn_starts[k]:
+                return None, f"a tool row ({r.get('name')}) in turn {tid!r}'s window is stamped before it began: a late write"
             if ts is not None and ts > turn_ends[k]:
                 return None, f"a tool row ({r.get('name')}) is stamped after turn {tid!r} ended: a late write"
         out.append(

@@ -40,8 +40,8 @@ _BRIDGE_ROUTED_TOOLS = frozenset({"search_memories"})
 # CLI turns per chat / tokens of one lookup hop). Over nell's 168 chat turns
 # (2026-06-08..09-12) only record_monologue qualified (69.6% of turns, lower
 # bound 62.3% vs 3.7%). Re-run the rule when #417 or #418 changes the monologue
-# directive, or when read_full_memory use shows up in the logs. The rule script
-# lives with the change record (docs/guarded-change/issue-525-fix-deferral/).
+# directive, or when read_full_memory use shows up in the logs:
+# scripts/select_always_loaded_tools.py prints the set.
 ALWAYS_LOADED_TOOLS: tuple[str, ...] = ("record_monologue",)
 
 # Must match brain.mcp_server.audit._RESULT_SUMMARY_MAX_CHARS — both

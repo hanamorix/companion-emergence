@@ -21,7 +21,11 @@ bridge still counts); `bare` = a cli_builtin row named like a brain tool (a fail
 A share gate FAILs only when NEW < OLD and a one-sided Fisher exact test gives p < 0.05, and counts only when
 OLD has at least 5 qualifying turns (below that even NEW = 0 cannot reach p < 0.05): else UNMEASURED.
 
-Exit 0 all gates PASS, 10 any FAIL, 11 any UNMEASURED (and none FAIL), 2 bad arguments.
+Every gate is always reported: a prompt set missing from either arm, or no replies to scan, makes that gate
+UNMEASURED, never a pass. Replies are read from each metrics file's `<name>.replies.json` sibling (written by
+`--dump-replies`): B8 scans every NEW reply, B9 compares the arms on default-set replies.
+
+Exit 0 all gates PASS, 10 any FAIL, 11 any UNMEASURED or STOP_FOR_HUMAN (and none FAIL), 2 bad arguments.
 """
 
 from __future__ import annotations
@@ -43,7 +47,7 @@ _LEAK = re.compile(r"toolsearch|tool_reference|tool search|deferred tool", re.IG
 def _nell_tool_names() -> frozenset[str]:
     try:
         from brain.tools import NELL_TOOL_NAMES
-    except ImportError:  # run outside the repo env: bare-name detection degrades to "any non-built-in"
+    except ImportError:  # run outside the repo env: no bare-name attempts are detected (advisory only)
         return frozenset()
     return frozenset(NELL_TOOL_NAMES)
 
@@ -188,8 +192,12 @@ def b3(old_runs, new_runs) -> dict:
         else:
             entry["verdict"] = "PASS" if n <= o + 1 else "FAIL"
         metrics[m] = entry
-    breaks = [r.get("cache_break_check", {}).get("status") for r in new_runs]
-    metrics["cache_read_ratio"] = {"new": breaks, "verdict": "PASS" if all(b == "PASS" for b in breaks) else "FAIL"}
+    breaks = [(r.get("cache_break_check") or {}).get("status") for r in new_runs]
+    if "FAIL" in breaks:
+        ratio = "FAIL"
+    else:  # a check the harness could not judge (UNMEASURED, NOT_APPLICABLE, absent) is not a pass
+        ratio = "PASS" if all(b == "PASS" for b in breaks) else "UNMEASURED"
+    metrics["cache_read_ratio"] = {"new": breaks, "verdict": ratio}
     verdicts = {m: e["verdict"] for m, e in metrics.items()}
     failed = {m for m, v in verdicts.items() if v == "FAIL"}
     verdict = "FAIL" if failed else ("UNMEASURED" if "UNMEASURED" in verdicts.values() else "PASS")
@@ -198,6 +206,8 @@ def b3(old_runs, new_runs) -> dict:
     stop = failed == {"cache_creation_per_chat_call"} and all(
         verdicts[c] == "PASS" for c in ("cost_per_user_turn", "cost_per_chat_call")
     )
+    if stop:
+        verdict = "STOP_FOR_HUMAN"
     tails = {
         "num_turns_max": {
             "old": max((x for v in old_v for x in v["num_turns_per_user_turn"]), default=None),
@@ -208,6 +218,8 @@ def b3(old_runs, new_runs) -> dict:
 
 
 def b8(replies: list[dict]) -> dict:
+    if not replies:
+        return {"verdict": "UNMEASURED", "reason": "no NEW replies to scan (run with --dump-replies)"}
     leaks = [r["turn"] for r in replies if _LEAK.search(r.get("reply") or "")]
     return {"verdict": "FAIL" if leaks else "PASS", "leaking_turns": leaks}
 
@@ -241,22 +253,40 @@ def _load(paths) -> list[dict]:
     return [json.loads(Path(p).read_text(encoding="utf-8")) for p in paths or []]
 
 
+def _load_replies(paths) -> list[dict]:
+    """The `<metrics>.replies.json` siblings, each reply tagged with its file's prompt set."""
+    out = []
+    for p in paths or []:
+        sib = Path(p).with_suffix(".replies.json")
+        if not sib.exists():
+            continue
+        prompt_set = json.loads(Path(p).read_text(encoding="utf-8")).get("prompt_set", "default")
+        out += [{**row, "prompt_set": prompt_set} for row in json.loads(sib.read_text(encoding="utf-8"))]
+    return out
+
+
 def _by_set(runs, name):
     return [r for r in runs if r.get("prompt_set", "default") == name]
 
 
-def evaluate(old_runs, new_runs, always_load, new_replies=None) -> dict:
-    report = {"gates": {}, "advisory": {}}
-    if _by_set(old_runs, "default") and _by_set(new_runs, "default"):
-        report["gates"]["B1"] = b1(_by_set(old_runs, "default"), _by_set(new_runs, "default"))
-        report["gates"]["B3"] = b3(_by_set(old_runs, "default"), _by_set(new_runs, "default"))
-    if _by_set(old_runs, "reach") and _by_set(new_runs, "reach"):
-        report["gates"]["B2"] = b2(_by_set(old_runs, "reach"), _by_set(new_runs, "reach"), always_load)
-    if _by_set(old_runs, "recall") and _by_set(new_runs, "recall"):
-        report["gates"]["B2b"] = b2b(_by_set(old_runs, "recall"), _by_set(new_runs, "recall"))
-    if new_replies is not None:
-        report["gates"]["B8"] = b8(new_replies)
-        report["advisory"]["B9_new"] = b9(new_replies)
+def _missing(name) -> dict:
+    return {"verdict": "UNMEASURED", "reason": f"no {name} runs for one arm or both"}
+
+
+def evaluate(old_runs, new_runs, always_load, old_replies=(), new_replies=()) -> dict:
+    report = {"always_load": sorted(always_load), "gates": {}, "advisory": {}}
+    old_d, new_d = _by_set(old_runs, "default"), _by_set(new_runs, "default")
+    have = lambda s: bool(_by_set(old_runs, s) and _by_set(new_runs, s))  # noqa: E731
+    g = report["gates"]
+    g["B1"] = b1(old_d, new_d) if have("default") else _missing("default")
+    g["B2"] = b2(_by_set(old_runs, "reach"), _by_set(new_runs, "reach"), always_load) if have("reach") else _missing("reach")
+    g["B2b"] = b2b(_by_set(old_runs, "recall"), _by_set(new_runs, "recall")) if have("recall") else _missing("recall")
+    g["B3"] = b3(old_d, new_d) if have("default") else _missing("default")
+    g["B8"] = b8(list(new_replies))
+    report["advisory"]["B9"] = {
+        arm: b9([r for r in reps if r.get("prompt_set", "default") == "default"])
+        for arm, reps in (("old", old_replies), ("new", new_replies))
+    }
     report["advisory"]["counts_old"] = advisory_counts(old_runs, always_load)
     report["advisory"]["counts_new"] = advisory_counts(new_runs, always_load)
     return report
@@ -266,7 +296,7 @@ def exit_code(report: dict) -> int:
     verdicts = [g["verdict"] for g in report["gates"].values()]
     if "FAIL" in verdicts:
         return 10
-    if "UNMEASURED" in verdicts or not verdicts:
+    if "UNMEASURED" in verdicts or "STOP_FOR_HUMAN" in verdicts or not verdicts:
         return 11
     return 0
 
@@ -294,20 +324,20 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--old", nargs="+", type=Path, help="OLD arm metrics JSON files (any prompt sets)")
     p.add_argument("--new", nargs="+", type=Path, help="NEW arm metrics JSON files")
-    p.add_argument("--new-replies", nargs="*", type=Path, help="NEW arm <out>.replies.json files (B8, B9)")
-    p.add_argument("--always-load", nargs="*", default=[], help="NEW's always-loaded brain tools (not deferred)")
+    p.add_argument(
+        "--always-load", nargs="+", help="NEW's always-loaded brain tools, never deferred (required: without it B2 "
+        "would count them as deferred)"
+    )
     p.add_argument("--out", type=Path, help="write the report JSON here")
     p.add_argument("--self-test", action="store_true")
     args = p.parse_args(argv)
     if args.self_test:
         return self_test()
-    if not args.old or not args.new:
-        p.print_usage(sys.stderr)
-        return 2
-    replies = None
-    if args.new_replies is not None:
-        replies = [row for path in args.new_replies for row in json.loads(path.read_text(encoding="utf-8"))]
-    report = evaluate(_load(args.old), _load(args.new), set(args.always_load), replies)
+    if not args.old or not args.new or not args.always_load:
+        p.error("--old, --new and --always-load are required")
+    report = evaluate(
+        _load(args.old), _load(args.new), set(args.always_load), _load_replies(args.old), _load_replies(args.new)
+    )
     text = json.dumps(report, indent=2)
     if args.out:
         args.out.write_text(text, encoding="utf-8")
