@@ -133,7 +133,7 @@ def test_a_rejected_probe_writes_nothing(tmp_path, capture_claude_argv) -> None:
     capture_claude_argv.reject("claude-sonet-5")
     client, _ = _make_client(tmp_path)
     with client:
-        before = tunables._file_path().read_bytes()  # after the start-up rewrite of the defaults section
+        before = tunables._file_path().read_bytes()  # after the start-up boot pass
         r = _post(client, "claude-sonet-5")
         assert tunables._file_path().read_bytes() == before
     assert r.status_code == 400

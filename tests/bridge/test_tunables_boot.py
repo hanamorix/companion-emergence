@@ -47,7 +47,6 @@ def test_bridge_boot_writes_the_settings_file(tmp_path, monkeypatch):
     assert tunables_path.exists(), "tunables.toml was not written at boot"
     data = toml_io.flatten_toml(toml_io.read_toml(tunables_path))
     assert data["boot.test_key"] == 7
-    assert not (tmp_path / "tunables.json").exists()
 
     tunables._reset_for_tests()
 

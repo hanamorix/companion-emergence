@@ -72,7 +72,7 @@ def _isolated_dir(root: Path, dirs: object, sub: str) -> str:
 def _isolate_user_data_home(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
     """#488: no test may write into the real per-user data directory.
 
-    A test that builds the bridge app (its lifespan rewrites ``tunables.json``) or calls ``get_home()`` with neither
+    A test that builds the bridge app (its lifespan syncs the settings file) or calls ``get_home()`` with neither
     ``KINDLED_HOME`` nor ``NELLBRAIN_HOME`` set resolved to the platformdirs default, the REAL ``~/.local/share/companion-emergence``
     of whoever ran the tests, so a run could change real settings and a later test could read what an earlier one left. Every test
     now gets its own empty root as that default. The directory properties are replaced on the platform's ``PlatformDirs`` class
@@ -87,7 +87,7 @@ def _isolate_user_data_home(tmp_path_factory: pytest.TempPathFactory) -> Iterato
 
     The patches are held by this fixture's OWN ``MonkeyPatch``, not the test's: a test that calls ``monkeypatch.undo()`` reverts
     only what it patched itself. With the test's instance, an ``undo()`` put the platform default back and the next
-    ``set_job_models`` wrote a model line into the real install's ``tunables.json`` (#530).
+    ``set_job_models`` wrote a model line into the real install's settings file (#530).
     """
     from platformdirs import PlatformDirs
 

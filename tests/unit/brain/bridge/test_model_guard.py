@@ -472,7 +472,7 @@ def check_g5(source: str, relpath: str) -> list[str]:
             out.append(f"G5 {relpath}:{node.lineno}: model. key literal {node.value!r} outside model_tier.py")
         if isinstance(node, ast.Call) and _call_name(p, node) == "set_values" and relpath != "tunables.py":
             fn = _enclosing_function(p, node)
-            # The legacy-file fold writes whatever keys an old tunables.json held, naming none of them: it is key-agnostic,
+            # The legacy-file fold writes whatever keys an old JSON settings file held, naming none of them: it is key-agnostic,
             # so it cannot know a model key (nothing to leak). Every model-specific writer goes through set_job_models.
             if relpath == "tunables_migration.py":
                 continue

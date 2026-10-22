@@ -576,7 +576,7 @@ def test_an_unreadable_settings_file_is_left_alone_and_the_next_boot_after_the_f
     _boot("a")
     assert tunables._file_path().read_text() == "a = = 1\n"
     assert not _marker().exists() and _cfg("a")["model"] == "opus"
-    assert not list(_home().glob("tunables.json.corrupt-*")) and not list(_home().glob("tunables.toml.*corrupt*"))
+    assert not [p for p in _home().iterdir() if "corrupt" in p.name or "quarantine" in p.name]  # nothing is set aside
     tunables._file_path().write_text('"other.key" = 1\n')
     _boot("a")
     assert _overrides()[_CHAT] == "claude-opus-5"

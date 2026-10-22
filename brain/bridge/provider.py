@@ -301,7 +301,7 @@ _PROVIDER_CONTEXT_OPTION_KEYS = frozenset(
 # this many seconds, the subprocess is treated as wedged: it gets terminated
 # and the stream yields StreamError(stage="claude_cli_idle_timeout"). This
 # is deliberately not bounded by total wall-clock duration — long Opus
-# runs can take time. Overridable via $KINDLED_HOME/tunables.json (#55).
+# runs can take time. Changeable in tunables.toml (#55).
 _STREAM_PER_EVENT_IDLE_SECONDS: float = tunables.register(
     "provider.stream_per_event_idle_seconds", 60.0,
     description="Seconds of silence from Claude in the middle of a reply before the reply is treated as stuck.",
@@ -339,7 +339,7 @@ _STREAM_EOF = object()
 # because it is one question: how long may the CLI take to flush its last output and exit? No measurement
 # stands behind 5 seconds: it is the bound this path already used for the reader join before the knob
 # existed, and the steps run one after the other, so the worst case is a small multiple of it. A slow
-# machine raises it in tunables.json (`provider.child_exit_grace_seconds`).
+# machine raises it in tunables.toml (`provider.child_exit_grace_seconds`).
 _CHILD_EXIT_GRACE_SECONDS: float = tunables.register(
     "provider.child_exit_grace_seconds", 5.0,
     description="Seconds the Claude program gets to finish its output and exit before it is stopped.",
@@ -1318,7 +1318,7 @@ class ClaudeCliProvider(LLMProvider):
         """Yield ChatStreamEvent values as the claude subprocess streams.
 
         Per-event idle timeout: _stream_per_event_idle_seconds() (default 60s,
-        overridable via tunables key provider.stream_per_event_idle_seconds).
+        changeable via tunables key provider.stream_per_event_idle_seconds).
         First-event timeout: _stream_first_event_seconds() (default 120s,
         key provider.stream_first_event_seconds).
         Both can be monkeypatched in tests for fast verification.

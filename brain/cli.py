@@ -2563,10 +2563,11 @@ def _model_show_handler(args: argparse.Namespace) -> int:
     print("this shows the saved settings; runtime fallbacks appear in the app (connection panel)")
     from brain.model_migration import pending_legacy
     from brain.paths import get_home
+    from brain.tunables_migration import LEGACY_FILE_NAME
 
-    if (get_home() / "tunables.json").exists():
+    if (get_home() / LEGACY_FILE_NAME).exists():
         print(
-            "note: an old tunables.json is still in the data folder; it is folded into tunables.toml the next time a "
+            f"note: an old {LEGACY_FILE_NAME} is still in the data folder; it is folded into tunables.toml the next time a "
             "bridge starts or `nell model set`, `set-tier`, `clear-tier` or `init` runs"
         )
     if pending_legacy():
@@ -2579,8 +2580,8 @@ def _model_show_handler(args: argparse.Namespace) -> int:
 
 
 def _run_model_migration() -> None:
-    """Bring older settings forward before a write command changes anything (each step is a no-op once done): an old
-    tunables.json is folded into tunables.toml (all-or-nothing from here: this command registers only the keys it
+    """Bring older settings forward before a write command changes anything (each step is a no-op once done): the old
+    JSON settings file, if there is one, is folded into tunables.toml (all-or-nothing from here: this command registers only the keys it
     imported, so the bridge finishes a fold this command cannot), then a persona's saved model moves into the
     install-wide setting."""
     from brain.model_migration import migrate_persona_models

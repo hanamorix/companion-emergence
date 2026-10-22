@@ -147,8 +147,8 @@ def _read_total_ram_bytes() -> float | None:
 
 def _select_tune_grade_by_ram(total_ram_bytes: float | None) -> str:
     """RAM tier -> tune-grade select (spec §1 table), evaluated against the
-    CURRENT tunable thresholds (re-read every call, so a live tunables.json
-    override takes effect on the very next tick).
+    CURRENT tunable thresholds (re-read every call, so a live tunables.toml
+    value takes effect on the very next tick).
 
     `total_ram_bytes is None` (detection failed / non-Linux) fails toward
     the always-safe floor — knob-refit — never toward a grade that might

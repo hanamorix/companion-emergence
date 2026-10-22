@@ -47,8 +47,8 @@ logger = logging.getLogger(__name__)
 # derivation, imported here as `RETENTION_WINDOW_DAYS_DEFAULT`. The
 # derivation's one home stays in floor_calibration.py; this module keeps
 # owning the tunable KEY (`calibration.retention_window_days`) and `prune_
-# calibration_log`'s contract, unchanged from inc5. An operator override via
-# tunables.json is unaffected by this swap from a flat default to a derived
+# calibration_log`'s contract, unchanged from inc5. A value an operator set in
+# tunables.toml is unaffected by this swap from a flat default to a derived
 # one.
 CALIBRATION_LOG_RETENTION_WINDOW_DAYS: float = tunables.register(
     "calibration.retention_window_days", RETENTION_WINDOW_DAYS_DEFAULT,
@@ -1365,7 +1365,7 @@ class MemoryStore:
         `window_days` defaults to the live `calibration.retention_window_days`
         tunable (see `CALIBRATION_LOG_RETENTION_WINDOW_DAYS` above) when not
         passed explicitly — read at call time via `tunables.get_tunable` so an
-        operator override applies with no restart, mirroring
+        operator's change applies with no restart, mirroring
         `brain/memory/reranker.py`'s `LATENCY_BUDGET_SECONDS` pattern. The
         window itself is PROVISIONAL (see the tunable's own comment) — its
         full derivation is finalized in F2a inc7 once the calibration sample

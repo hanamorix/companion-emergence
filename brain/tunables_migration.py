@@ -49,7 +49,7 @@ from brain.utils.log_throttle import warn_throttled
 
 logger = logging.getLogger(__name__)
 
-_LEGACY_NAME = "tunables.json"
+LEGACY_FILE_NAME = "tunables.json"  # the old settings file this module folds; the one place the name is spelled
 
 _OLD_THROTTLE_KEY = "throttle.background_min_idle_seconds"
 _OLD_THROTTLE_DEFAULT = 300.0
@@ -179,7 +179,7 @@ def migrate_legacy_json(home: Path, *, complete_registry: bool) -> None:
     ``complete_registry`` is True where every module that registers a setting has been imported (the bridge) and False for
     a CLI process, which folds all-or-nothing.
     """
-    legacy = home / _LEGACY_NAME
+    legacy = home / LEGACY_FILE_NAME
     if not legacy.exists():
         return  # one exists() call per start; no lock, no write
     try:

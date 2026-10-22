@@ -131,7 +131,7 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Tunables (I7/I3) — every numeric literal below is either registered here
-# (operator-overridable via tunables.json, mirroring relevance_judge.py's
+# (operator-changeable in tunables.toml, mirroring relevance_judge.py's
 # CALIBRATION_SAMPLE_ROWS/AMBIGUOUS_BAND_HALF_WIDTH pattern) or derived from
 # one of these at call time.
 # ---------------------------------------------------------------------------

@@ -238,10 +238,10 @@ def challenger_not_worse(
     re-hardcoding the numbers here — ONE source of truth for the default
     value, no duplicate magic number (mirrors `fit_platt_knob`'s sibling
     pure functions in `judge_selftune.py`, which also take plain
-    parameters and leave TUNABLE-OVERRIDE RESOLUTION to the caller: this
+    parameters and leave SETTING RESOLUTION to the caller: this
     function itself never calls `tunables.get_tunable` — an orchestrating
     caller like `run_champion_challenger` below resolves the live
-    tunables.json override and passes the resolved value in, so this stays
+    tunables.toml value and passes the resolved value in, so this stays
     a pure, deterministically-testable function of its arguments alone).
     """
     n = len(champion_correct)
@@ -354,10 +354,10 @@ def run_champion_challenger(
     once, before the eval loop starts).
 
     `alpha`/`min_n` default to `None`, meaning "read the live
-    `tunables.json` override (falling back to this module's registered
+    `tunables.toml` value (falling back to this module's registered
     default) at call time" — this is the ORCHESTRATION layer, so unlike
     `challenger_not_worse`'s own plain-parameter pure-function contract,
-    THIS function is where a tunables override actually takes effect
+    THIS function is where a tunables value actually takes effect
     (mirrors `judge_selftune._run_judge_selftune_tick` resolving its own
     tunables via `tunables.get_tunable` right before calling the pure
     fit function it wraps).

@@ -75,7 +75,7 @@ logger = logging.getLogger(__name__)
 _HAIKU_TIEBREAK_PROMPT = prompt_strings.register("memory.relevance_judge.haiku_tiebreak_prompt")
 
 # ---------------------------------------------------------------------------
-# Tunables (I7/I3) — derived defaults, operator-overridable via tunables.json.
+# Tunables (I7/I3) — derived defaults, operator-changeable in tunables.toml.
 # ---------------------------------------------------------------------------
 
 # How many calibration_log ROWS the daily tick judges (not every logged row —

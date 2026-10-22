@@ -200,7 +200,7 @@ MODEL_EMBEDDING_DIM = 1024
 # external weights). fp16 export (~2x faster) is a LATER increment — see
 # MODEL_RERANKER_FP16 below, now the PINNED default per the pre-flip
 # revision's Change 2 (this constant, MODEL_RERANKER, is the fp32 fallback
-# an operator override can still select). Score type: raw, unbounded logit
+# an operator can still select). Score type: raw, unbounded logit
 # (same shape as the outgoing ms-marco score, but a DIFFERENT SCALE) — AS OF THIS commit (inc1)
 # the abstention floor was still the old hardcoded MiniLM-scaled constant, a
 # known/expected scale mismatch; F2a's later increments replace it with a
@@ -230,7 +230,7 @@ MODEL_RERANKER = "jinaai/jina-reranker-v2-base-multilingual"  # ONNX cross-encod
 # something a per-box runtime probe needs to establish. `reranker.
 # RERANKER_PRECISION`'s tunable default resolves to this id;
 # `reranker.build_reranker_provider()` resolves back to MODEL_RERANKER
-# (fp32) only on an explicit "reranker.precision"="fp32" operator override.
+# (fp32) only on an explicit "reranker.precision"="fp32" operator setting.
 # 8-bit quantization was explicitly ruled out (a 278M model has less
 # redundancy to absorb an 8-bit accuracy hit than a larger model would);
 # fp16 is the one quantization lever here.

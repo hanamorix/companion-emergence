@@ -284,7 +284,7 @@ def _create_machine_id(path: Path) -> str:
 def machine_id() -> str:
     """This machine's random id (S163): kept in `paths.get_home() /
     "machine_id"`, the app's per-user directory (it also holds `app_config.json`
-    and `tunables.json`; it is outside every persona folder; `KINDLED_HOME` is
+    and `tunables.toml`; it is outside every persona folder; `KINDLED_HOME` is
     honoured), created once, read once per process. Unreadable or unwritable:
     a process-lifetime random id and one warning (this process's samples then
     read as another machine's)."""

@@ -1174,8 +1174,8 @@ def build_app(
         except Exception as _exc:  # noqa: BLE001
             logger.warning("tunables boot pass skipped: %s", _exc)
 
-        # Backward compatibility, permanent: an old tunables.json at KINDLED_HOME (NOT under this persona's directory:
-        # stage-6 BLOCKER of the earlier idle-key migration was passing persona_dir) is folded into tunables.toml and
+        # Backward compatibility, permanent: an old JSON settings file at KINDLED_HOME (NOT under this persona's directory:
+        # an earlier version of this call passed persona_dir and silently migrated nothing) is folded into tunables.toml and
         # renamed. After the boot pass, before the persona-model fold below, and before the supervisor thread starts, so
         # no code can read a stale key. The bridge imports every module, so it folds the whole file.
         try:
@@ -1184,7 +1184,7 @@ def build_app(
 
             migrate_legacy_json(_home_paths.get_home(), complete_registry=True)
         except Exception as _exc:  # noqa: BLE001 - startup must not break on the fold
-            logger.warning("tunables.json fold skipped: %s", _exc)
+            logger.warning("old settings file fold skipped: %s", _exc)
 
         # Fold a saved per-persona model into the install-wide setting (once per install; this persona's own legacy
         # keys are cleared every start until gone). After the boot pass and the JSON fold above and BEFORE the touch
@@ -1221,7 +1221,7 @@ def build_app(
         # on a lock timeout). The per-turn MCP child, CLI commands,
         # `nell chat --no-bridge` and cmd_start's recovery never call this.
         # Fail-soft like every other non-essential step in this function
-        # (write_defaults_section, the last_opened_at touch, the pronoun
+        # (the settings boot pass, the last_opened_at touch, the pronoun
         # nudge above/below): a bug in this brand-new module must never be
         # the reason a bridge fails to start (code-red-team pass 1, M1).
         try:

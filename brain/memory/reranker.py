@@ -133,12 +133,12 @@ _AVX2_PRESENT = _detect_avx2()
 # throughput setting), unlike the reranker abstention floor (physiology,
 # fenced into semantic_recall.py/the DB-backed calibration table per
 # tunables.py's own "physiology fenced out" rule, NOT a tunables.py entry).
-# Registered here (the owning module) as the DEFAULT only; a manual
-# override in tunables.json wins over this auto-detected value via
-# tunables.get_tunable's existing override-precedence mechanism (see
+# Registered here (the owning module) as the DEFAULT only; a value set by hand
+# in tunables.toml wins over this auto-detected value via
+# tunables.get_tunable's read of the file (see
 # `rerank_for_recall` below) — this AVX2-awareness only changes what the
-# default resolves to, never the override behavior itself. Read at call
-# time via tunables.get_tunable so a live override applies with no restart.
+# default resolves to, never how a value in the file is read. Read at call
+# time via tunables.get_tunable so a live change to the file applies with no restart.
 LATENCY_BUDGET_SECONDS: float = tunables.register(
     "reranker.latency_budget_seconds", _default_latency_budget_seconds(_AVX2_PRESENT),
     description="Seconds one memory re-ranking may take. Set from your computer's speed unless you change it.",
@@ -155,7 +155,7 @@ LATENCY_BUDGET_SECONDS: float = tunables.register(
 # a tunable DEFAULT, mirroring `LATENCY_BUDGET_SECONDS`'s override shape
 # immediately above (I7: never hardcoded inline in `build_reranker_
 # provider`) — an operator can still force fp32 by setting
-# "reranker.precision" in tunables.json's "overrides" to "fp32".
+# "reranker.precision" to "fp32" in tunables.toml.
 RERANKER_PRECISION_FP16 = "fp16"
 RERANKER_PRECISION_FP32 = "fp32"
 RERANKER_PRECISION: str = tunables.register(
@@ -633,8 +633,8 @@ def build_reranker_provider(*, store: MemoryStore | None = None) -> RerankerProv
     """The production reranker provider: a `CrossEncoderProvider` pinned to
     `RERANKER_PRECISION`'s resolved id — `model_tier.MODEL_RERANKER_FP16`
     (the pinned default) or `model_tier.TIER_RERANKER`'s fp32 id (only when
-    an operator override sets `reranker.precision` to `"fp32"` in
-    tunables.json) — caching the model file in the shared `get_cache_dir()`
+    an operator sets `reranker.precision` to `"fp32"` in
+    tunables.toml) — caching the model file in the shared `get_cache_dir()`
     (one download across every persona on the box — the model isn't
     persona-specific data, same reasoning as the embedding model).
 

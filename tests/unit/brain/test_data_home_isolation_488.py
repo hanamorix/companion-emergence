@@ -1,6 +1,6 @@
 """#488: no test may write into the real per-user data directory.
 
-At least one test (any that builds the bridge app: its lifespan rewrites `tunables.toml`) resolved the data home to the platformdirs
+At least one test (any that builds the bridge app: its lifespan syncs the settings file) resolved the data home to the platformdirs
 default, the real `~/.local/share/companion-emergence` of whoever ran the suite. The autouse fixture `_isolate_user_data_home`
 (tests/conftest.py) now gives every test its own empty default.
 """
@@ -131,8 +131,9 @@ def test_a_tests_monkeypatch_undo_does_not_put_back_the_real_data_home(monkeypat
     ``set_job_models``, which wrote ``model.interactive_chat`` into the real install's ``tunables.toml``. After an ``undo()`` the
     default home must still be the test's own, a write must land there, and the real file must be byte-for-byte what it was."""
     from brain.bridge.model_tier import TIER_INTERACTIVE_CHAT, set_job_models
+    from brain.tunables_migration import LEGACY_FILE_NAME
 
-    real_files = [REAL_PLATFORM_DIRS["user_data_path"] / name for name in ("tunables.toml", "tunables.json")]
+    real_files = [REAL_PLATFORM_DIRS["user_data_path"] / name for name in ("tunables.toml", LEGACY_FILE_NAME)]
     before = [f.read_bytes() if f.exists() else None for f in real_files]
     monkeypatch.delenv("KINDLED_HOME", raising=False)
     monkeypatch.delenv("NELLBRAIN_HOME", raising=False)

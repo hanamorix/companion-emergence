@@ -41,7 +41,7 @@ _UPLOAD_MAX_BYTES = tunables.register(
 
 
 def upload_max_bytes() -> int:
-    """Current general-file upload byte cap (tunable-overridable)."""
+    """Current general-file upload byte cap (a tunable)."""
     return tunables.get_tunable("files.upload_max_bytes", _UPLOAD_MAX_BYTES)
 
 

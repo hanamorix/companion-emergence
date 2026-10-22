@@ -84,7 +84,7 @@ def test_the_bridge_startup_sequence_keeps_the_raw_value_on_disk(tmp_path: Path)
     d = _persona(tmp_path)
     tunables.set_values({_KEY: "fable"})
     with TestClient(build_app(persona_dir=d, client_origin="tests")):
-        pass  # the lifespan rewrites the defaults section and touches the persona file
+        pass  # the lifespan runs the settings boot pass and touches the persona file
     assert tunables.get_raw(_KEY) == "fable"
 
 
