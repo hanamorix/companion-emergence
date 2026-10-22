@@ -93,15 +93,39 @@ TIER_BACKGROUND_HOUSEKEEPING = "background-housekeeping"
 # The Claude jobs: ONE tunables line each. (job type) -> (tunables key, shipped default model)
 # ---------------------------------------------------------------------------
 # This table is the DEFINITION of the shipped defaults, read by model_for_tier on every call. Nothing else in the code
-# holds a model id. The comment on each line says what the job IS.
+# holds a model id. The `description=` on each line says what the job IS: it is what a person reads above the setting in
+# tunables.toml (one source, so the file and the code cannot drift).
 _CLAUDE_JOBS: dict[str, tuple[str, str]] = {
-    TIER_INTERACTIVE_CHAT: ("model.interactive_chat", tunables.register("model.interactive_chat", "claude-sonnet-5")),  # the live chat turn: every reply the kindled gives in conversation
-    TIER_BACKGROUND_GENERATIVE: ("model.background_generative", tunables.register("model.background_generative", "claude-sonnet-5")),  # background writing in the kindled's own voice: dreams, reflexes, research, soul review, voice reflection and the maker
-    TIER_BACKGROUND_CLASSIFIER: ("model.background_classifier", tunables.register("model.background_classifier", "haiku")),  # cheap background judgments that tag or classify: emotion tagging, memory consolidation tie-breaks, vocabulary repair, creative-DNA crystallization, tool-loop monologue extraction
-    TIER_BACKGROUND_HOUSEKEEPING: ("model.background_housekeeping", tunables.register("model.background_housekeeping", "haiku")),  # background upkeep that never speaks to the user: closing sessions, interest sweeps, finalize ticks, initiate reviews, daemon snapshots, draft fragments
-    TIER_COMPACTION: ("model.compaction", tunables.register("model.compaction", "haiku")),  # summarising old chat history into a short digest when a session is rolled over
-    TIER_SELF_MODEL_ARTICULATE: ("model.self_model_articulate", tunables.register("model.self_model_articulate", "haiku")),  # putting the kindled's measured self-model into plain sentences
-    TIER_ATTUNEMENT_DETECTOR: ("model.attunement_detector", tunables.register("model.attunement_detector", "claude-haiku-4-5")),  # reading recent turns for the user's current state and recurring patterns (the attunement detector); stays on Haiku 4.5 (not the haiku alias, which moves to newer Haiku generations); the dateless id follows the newest 4.5 snapshot
+    TIER_INTERACTIVE_CHAT: ("model.interactive_chat", tunables.register(
+        "model.interactive_chat", "claude-sonnet-5",
+        description="The model that answers you in chat.",
+    )),
+    TIER_BACKGROUND_GENERATIVE: ("model.background_generative", tunables.register(
+        "model.background_generative", "claude-sonnet-5",
+        description="The model for the kindled's own writing: dreams, research, reflections and maker projects.",
+    )),
+    TIER_BACKGROUND_CLASSIFIER: ("model.background_classifier", tunables.register(
+        "model.background_classifier", "haiku",
+        description="The model for quick background judgments, such as tagging emotions and sorting memories.",
+    )),
+    TIER_BACKGROUND_HOUSEKEEPING: ("model.background_housekeeping", tunables.register(
+        "model.background_housekeeping", "haiku",
+        description="The model for background upkeep that never speaks to you, such as closing sessions.",
+    )),
+    TIER_COMPACTION: ("model.compaction", tunables.register(
+        "model.compaction", "haiku",
+        description="The model that summarizes old chat history when a session is rolled over.",
+    )),
+    TIER_SELF_MODEL_ARTICULATE: ("model.self_model_articulate", tunables.register(
+        "model.self_model_articulate", "haiku",
+        description="The model that puts the kindled's measured self-model into plain sentences.",
+    )),
+    # The detector stays on Haiku 4.5, not the `haiku` alias (the alias moves to newer Haiku generations). The dateless id
+    # follows the newest 4.5 snapshot.
+    TIER_ATTUNEMENT_DETECTOR: ("model.attunement_detector", tunables.register(
+        "model.attunement_detector", "claude-haiku-4-5",
+        description="The model that reads recent turns to notice your current state and recurring patterns.",
+    )),
 }
 CLAUDE_TIERS: tuple[str, ...] = tuple(_CLAUDE_JOBS)
 

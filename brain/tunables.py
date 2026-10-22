@@ -107,7 +107,10 @@ def register(key: str, default: Any, description: str = "") -> Any:
 # the chat-idle lull duration. Read in exactly one place —
 # brain/bridge/cli_throttle.py's private `_lull_seconds()`, called only from
 # `is_chat_idle` (C4(b)) — never re-exported or read elsewhere.
-CHAT_IDLE_LULL_SECONDS: float = register("chat.idle_lull_seconds", 600.0)
+CHAT_IDLE_LULL_SECONDS: float = register(
+    "chat.idle_lull_seconds", 600.0,
+    description="Seconds of quiet after your last message before the kindled starts background work.",
+)
 
 
 def get_tunable(key: str, default: Any) -> Any:
