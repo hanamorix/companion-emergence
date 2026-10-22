@@ -98,6 +98,7 @@ from brain.health.vocab_repair import (
 from brain.health.vocab_repair import (
     should_run_vocab_repair as _vocab_repair_should_run,
 )
+from brain.ingest import extraction_backfill
 from brain.ingest.emotion_backfill import (
     has_emotion_backfill_work as _emotion_backfill_has_work,
 )
@@ -961,8 +962,9 @@ def _build_gated_jobs(
 
     One ``GatedJob`` per gated job; a job whose ``*_interval_s`` is None (the
     test/dev disable knob) is left out. Pass 2, session snapshot/prune,
-    emotion backfill and embedding backfill have no interval: each runs at
-    every idle pass while it has work (S53/S66). Deploy recalibration is due
+    emotion backfill, embedding backfill and the extraction backfill (#523)
+    have no interval: each runs at every idle pass while it has work (S53/S66;
+    the extraction backfill takes one chunk per pass). Deploy recalibration is due
     while the stored floor is stale (S70/S73). The cosine and rerank floor
     bootstraps (name-recall fix S85 revised, S91, S92) are the next-lull RETRY
     path here: due while neither a calibrated row nor the process-cached
@@ -1092,6 +1094,7 @@ def _build_gated_jobs(
                     "type": "session_snapshot",
                     "session_id": r.session_id,
                     "extracted_since_cursor": r.extracted,
+                    "chunks": r.chunks,
                     "committed": r.committed,
                     "enqueued": r.enqueued,
                     "deduped": r.deduped,
@@ -1297,6 +1300,26 @@ def _build_gated_jobs(
             has_work=lambda: recall_diagnostics.has_pending(
                 recall_diagnostics.diagnostics_path(persona_dir)
             ),
+        )
+    )
+
+    # 4f. extraction backfill — #523: an armed `nell memory backfill-extraction` plan, one chunk (one
+    # model call) per pass, on the snapshot job's provider tier. The same job runs the CLI's foreground
+    # mode in its own process (brain/ingest/extraction_backfill.py).
+    @contextmanager
+    def _backfill_hebbian() -> Iterator[HebbianMatrix]:
+        hebbian = HebbianMatrix(persona_dir / "hebbian.db", integrity_check=False)
+        try:
+            yield hebbian
+        finally:
+            hebbian.close()
+
+    jobs.append(
+        extraction_backfill.backfill_gated_job(
+            persona_dir,
+            store_ctx=_tick_store,
+            hebbian_ctx=_backfill_hebbian,
+            provider_factory=lambda: build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING),
         )
     )
 

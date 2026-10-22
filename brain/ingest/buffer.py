@@ -269,8 +269,8 @@ def _backoff_path(persona_dir: Path, session_id: str) -> Path:
 
 
 def read_backoff(persona_dir: Path, session_id: str) -> dict | None:
-    """Return the backoff state ({failures: int, first_failure_at: str}) or
-    None if the file is missing, empty, or malformed."""
+    """Return the backoff state ({failures: int, first_failure_at: str}, plus ``failing_end_ts`` when the failing chunk's end
+    was recorded) or None if the file is missing, empty, or malformed."""
     data = read_json(_backoff_path(persona_dir, session_id), default=lambda: None, expect=dict)
     if data is None or "failures" not in data or "first_failure_at" not in data:
         return None
@@ -282,15 +282,20 @@ def read_backoff(persona_dir: Path, session_id: str) -> dict | None:
     return data
 
 
-def write_backoff(persona_dir: Path, session_id: str, failures: int, first_failure_at: str) -> None:
-    """Atomically write the backoff state. Raises ValueError on bad ts."""
+def write_backoff(
+    persona_dir: Path, session_id: str, failures: int, first_failure_at: str, failing_end_ts: str | None = None
+) -> None:
+    """Atomically write the backoff state. Raises ValueError on bad ts.
+
+    ``failing_end_ts``: the end (the ``cursor_ts``) of the chunk whose extraction failed, so that setting it aside in
+    ``poison/`` takes only the rows that attempt carried. Optional: the key is left out when unknown, and a reader that does
+    not know it (an older brain) ignores it.
+    """
     datetime.fromisoformat(first_failure_at.replace("Z", "+00:00"))  # validate
-    write_json(
-        _backoff_path(persona_dir, session_id),
-        {"failures": failures, "first_failure_at": first_failure_at},
-        indent=None,
-        fsync=False,
-    )
+    state = {"failures": failures, "first_failure_at": first_failure_at}
+    if failing_end_ts is not None:
+        state["failing_end_ts"] = failing_end_ts
+    write_json(_backoff_path(persona_dir, session_id), state, indent=None, fsync=False)
 
 
 def delete_backoff(persona_dir: Path, session_id: str) -> None:

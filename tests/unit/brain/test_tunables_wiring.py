@@ -45,3 +45,22 @@ def test_read_file_cap_override(tunables_home):
     from brain.tools.impls import read_file
 
     assert read_file._file_read_max_bytes() == 1024
+
+
+def test_extraction_chunk_chars_override(tunables_home):
+    """#523: the extraction chunk size is read from tunables.json (``ingest.extraction_chunk_chars``)."""
+    _write(tunables_home, {"ingest.extraction_chunk_chars": 1500})
+    from brain.ingest import ingest_utils
+
+    assert ingest_utils.extraction_chunk_chars() == 1500
+
+
+
+@pytest.mark.parametrize(("override", "expected"), [(0, 15.0), (-3.0, 15.0), (True, 15.0), (0.2, 1.0), (2.5, 2.5)])
+def test_keepalive_override_has_a_positive_floor(tunables_home, override, expected):
+    """A keepalive of 0 (or a negative, or a bool) would make the streamed bodies spin spaces: it falls back to the default; a
+    positive value below one second is raised to one second."""
+    _write(tunables_home, {"bridge.stream_keepalive_seconds": override})
+    from brain.bridge import server
+
+    assert server._stream_keepalive_seconds() == expected

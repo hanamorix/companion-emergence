@@ -72,10 +72,12 @@ def _extraction_allows_rollover(
     provider,
     config: dict | None,
 ) -> bool:
-    """Run the final extraction of the old buffer; True only when the rollover may go on to fold and DELETE it (#477, #473).
+    """Run the final extraction of the old buffer; True only when the rollover may go on to fold and DELETE it (#477, #473, #523).
 
-    It may when the extraction completed, or when the session's extraction has failed persistently and the unextracted span has been
-    set aside in ``poison/`` (kept, never lost). It may not, and the buffer stays for the next cycle, when:
+    The extraction runs to the end of the buffer, chunk by chunk (no rollover bounds it). It may go on when that extraction
+    completed (the cursor reached the buffer's end), or when the session's extraction has failed persistently: the failing chunk
+    is set aside in ``poison/`` (kept, never lost), and the extraction then runs once more over the chunks after it, which were
+    never tried; the rollover goes on only if that pass completes. It may not, and the buffer stays for the next cycle, when:
     * another pass is running (busy) or the model call was refused as "not now" (deferred; also when it is RAISED): neither is a
       failure and neither is ever counted. A refusal because the bridge is stopping (``ShutdownDeferred``, #456) is
       re-raised instead, so the caller's job ends with its cadence unchanged;
@@ -83,7 +85,9 @@ def _extraction_allows_rollover(
       nothing is counted and nothing is set aside;
     * the extraction failed (a failed pass, or an ordinary exception out of it, which is recorded as a failure like a failed pass)
       and the session is still below the 3-failure threshold the stale sweep uses;
-    * it is at the threshold but the span could not be set aside, or another pass holds the extraction lock.
+    * it is at the threshold but the failing chunk could not be set aside, or another pass holds the extraction lock;
+    * the extraction after the set-aside did not complete (deferred, failed again, busy, or raised): the remaining chunks are
+      extractable and stay in the buffer for the next cycle.
     """
     from brain.bridge.cli_throttle import ShutdownDeferred, ThrottleDeferred
     from brain.ingest.pipeline import (
@@ -129,12 +133,36 @@ def _extraction_allows_rollover(
     try:
         set_aside = poison_unextracted_span(persona_dir, old_sid)
     except Exception:
-        logger.exception("rollover: could not set the unextracted span aside session=%s; keeping the old buffer", old_sid)
+        logger.exception("rollover: could not set the failing chunk aside session=%s; keeping the old buffer", old_sid)
         return False
     if set_aside is None:
         logger.info("rollover: another extraction holds the session session=%s; keeping the old buffer", old_sid)
         return False
-    return True
+    # #523: only the failing chunk was set aside; the chunks after it were never tried. Extract them before the fold and
+    # the delete, and go on only if that pass reaches the end.
+    try:
+        again = extract_session_snapshot(
+            persona_dir, old_sid, store=store, hebbian=hebbian, provider=provider, config=config
+        )
+    except ShutdownDeferred:
+        raise
+    except ThrottleDeferred:
+        logger.info("rollover: extraction after the set-aside deferred session=%s; keeping the old buffer", old_sid)
+        return False
+    except Exception:
+        logger.exception("rollover: extraction after the set-aside raised session=%s; counted as a failure, keeping the old buffer", old_sid)
+        try:
+            record_extraction_failure(persona_dir, old_sid)
+        except Exception:
+            logger.exception("rollover: could not record the failure session=%s", old_sid)
+        return False
+    if again.completed:
+        return True
+    logger.info(
+        "rollover: extraction after the set-aside did not reach the end session=%s busy=%s deferred=%s errors=%d; keeping the old buffer",
+        old_sid, again.busy, again.deferred, again.errors,
+    )
+    return False
 
 
 def perform_rollover(
@@ -153,9 +181,11 @@ def perform_rollover(
     None if there is nothing to seed / the session is busy.
 
     ``seed_mode`` is ``"summary_only"`` (1c-A) or ``"tiers_plus_tail"`` (1c-B).
-    Memory extraction of the old buffer runs first when ``store`` + ``hebbian`` are supplied,
-    and the rollover goes on only if it completed (a busy, deferred or failed extraction returns
-    None with the buffer kept). The seed is the immediate recap, memory is long-term recall.
+    Memory extraction of the old buffer runs first when ``store`` + ``hebbian`` are supplied: every
+    chunk after the cursor, to the end (#523; a long unextracted buffer makes one model call per
+    chunk), and the rollover goes on only if it completed (a busy, deferred or failed extraction
+    returns None with the buffer kept and the cursor after the last committed chunk). The seed is
+    the immediate recap, memory is long-term recall.
     """
     now = now or datetime.now(UTC)
     persona_dir = Path(persona_dir)

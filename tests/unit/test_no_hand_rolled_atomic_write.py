@@ -37,10 +37,11 @@ MARKER = re.compile(r"#\s*atomic-write:\s*ok\b(?:\s*--\s*(\S.*?)?)?\s*$")
 RETRY_HELPERS = {"_replace_with_retry", "replace_retrying", "_retry_perm"}
 OS_FUNCS = {"replace", "rename", "renames"}
 
-# The exact number of markers in brain/ (1-spec.md section 3): 15 from the base scan, the staging publish, the two
-# shutil.move directory moves, and the three heal moves in attempt_heal.py; plus one for the settings migration, which
-# renames the finished old tunables.json aside as its backup (#529).
-EXPECTED_MARKERS = 22
+# The exact number of markers in brain/ (1-spec.md section 3): 14 from the base scan, the staging publish, the two
+# shutil.move directory moves, and the three heal moves in attempt_heal.py. (The base scan had 15 until #524 replaced the
+# whole-buffer poison rename in brain/ingest/pipeline.py with a span-only append, which has no rename to mark.) Plus one
+# for the settings migration, which renames the finished old tunables.json aside as its backup (#529).
+EXPECTED_MARKERS = 21
 
 
 def flagged_calls(source: str) -> list[tuple[int, int, str]]:

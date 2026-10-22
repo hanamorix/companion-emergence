@@ -189,7 +189,8 @@ def test_finalize_does_not_poison_a_session_another_extraction_holds(world, capl
 
 
 def test_finalize_still_poisons_a_session_nothing_holds(world):
-    # PIN (passes on 584ec8a1): with the lock free the dead-letter move happens as before.
+    # PIN (passes on 584ec8a1): with the lock free the dead-letter happens. #523: only the failing chunk
+    # (here the whole short span) is set aside in poison/<sid>.span.jsonl; the buffer stays.
     from datetime import UTC, datetime
 
     from brain.ingest.buffer import write_backoff
@@ -200,8 +201,8 @@ def test_finalize_still_poisons_a_session_nothing_holds(world):
     buf = _seed(persona, sid)
     write_backoff(persona, sid, failures=3, first_failure_at=datetime.now(UTC).isoformat())  # inside the backoff window: the snapshot is skipped
     finalize_stale_sessions(persona, store=store, hebbian=hebbian, provider=_CountingProvider())
-    assert not buf.exists()
-    assert (persona / "active_conversations" / "poison" / f"{sid}.jsonl").exists()
+    assert buf.exists()
+    assert (persona / "active_conversations" / "poison" / f"{sid}.span.jsonl").exists()
 
 
 # --- item 3: the environment requeue keeps the ORIGINAL entry -----------------------------------------------------------
@@ -261,10 +262,16 @@ def test_a_report_that_did_not_complete_with_no_errors_is_always_busy_or_deferre
 
     from brain.ingest.types import IngestReport
 
-    for busy, deferred, backoff_skipped, errors in itertools.product([False, True], [False, True], [False, True], [0, 1]):
-        report = IngestReport(session_id="s", busy=busy, deferred=deferred, backoff_skipped=backoff_skipped, errors=errors)
+    # #523: a pass can now also stop before the end of its span with no error (a chunk limit); `reached_end` says so, and the
+    # rollover's extraction is never bounded, so for it this case cannot arise.
+    for busy, deferred, backoff_skipped, errors, reached_end in itertools.product(
+        [False, True], [False, True], [False, True], [0, 1], [False, True]
+    ):
+        report = IngestReport(
+            session_id="s", busy=busy, deferred=deferred, backoff_skipped=backoff_skipped, errors=errors, reached_end=reached_end
+        )
         if not report.completed and report.errors == 0:
-            assert report.busy or report.deferred
+            assert report.busy or report.deferred or not report.reached_end
 
 
 # --- finalize's dead-letter move when the buffer is already gone (a rollover reaped it) --------------------------------
@@ -307,16 +314,17 @@ def test_finalize_skips_the_dead_letter_move_when_the_buffer_is_already_gone(wor
 
     assert sorted(r.session_id for r in reports) == ["sess_a_gone", "sess_b_free"]  # the sweep went on
     poison = persona / "active_conversations" / "poison"
-    assert not (poison / "sess_a_gone.jsonl").exists()  # nothing to poison
+    assert not (poison / "sess_a_gone.span.jsonl").exists()  # nothing to poison
     assert read_backoff(persona, "sess_a_gone") is None  # the stale failure record is cleared
     assert "conversation_finalize_deadletter_gone" in caplog.text
-    assert (poison / "sess_b_free.jsonl").exists() and not free.exists()  # the other session was still poisoned as before
+    # The other session's failing chunk was still set aside (#523: only the chunk; its buffer stays).
+    assert (poison / "sess_b_free.span.jsonl").exists() and free.exists()
 
 
-def test_finalize_survives_a_buffer_that_vanishes_during_the_rename(world, monkeypatch):
-    # The buffer exists at the check and is gone at the rename (a reap in that instant): FileNotFoundError must not escape.
-    import pathlib
-
+def test_finalize_survives_a_fault_while_setting_a_chunk_aside(world, monkeypatch):
+    # #523: finalize no longer renames the buffer; it sets the failing chunk aside through
+    # poison_unextracted_span. A fault there for one session (here a buffer that vanished mid-way) must not escape and abort the
+    # sweep for the others.
     import brain.ingest.pipeline as pipeline
     from brain.ingest.buffer import read_backoff
 
@@ -325,19 +333,22 @@ def test_finalize_survives_a_buffer_that_vanishes_during_the_rename(world, monke
     _seed(persona, "sess_b_free")
     _at_threshold(persona, "sess_a_race")
     _at_threshold(persona, "sess_b_free")
-    real_rename = pathlib.Path.rename
+    real = pipeline.poison_unextracted_span
 
-    def rename(self, target):
-        if self.name == "sess_a_race.jsonl":
-            raise FileNotFoundError(2, "No such file or directory", str(self))
-        return real_rename(self, target)
+    def poison(persona_dir, sid):
+        if sid == "sess_a_race":
+            raise FileNotFoundError(2, "No such file or directory", sid)
+        return real(persona_dir, sid)
 
-    monkeypatch.setattr(pathlib.Path, "rename", rename)
+    monkeypatch.setattr(pipeline, "poison_unextracted_span", poison)
     reports = pipeline.finalize_stale_sessions(persona, store=store, hebbian=hebbian, provider=_CountingProvider())
 
     assert sorted(r.session_id for r in reports) == ["sess_a_race", "sess_b_free"]
-    assert (persona / "active_conversations" / "poison" / "sess_b_free.jsonl").exists()
-    assert read_backoff(persona, "sess_a_race") is None  # gone: nothing left to poison, the record is cleared
+    assert (persona / "active_conversations" / "poison" / "sess_b_free.span.jsonl").exists()
+    assert read_backoff(persona, "sess_b_free") is None  # its chunk was set aside: the failure record is cleared
+    # The faulted session keeps its failure record, so the next tick tries to set its chunk aside again.
+    kept = read_backoff(persona, "sess_a_race")
+    assert kept is not None and kept["failures"] >= 3
 
 
 # --- round-4 S2: find_json_object_block is linear on a reply of many unclosed braces -------------------------------------

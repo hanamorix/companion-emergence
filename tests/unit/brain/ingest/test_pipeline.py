@@ -1124,7 +1124,9 @@ def test_snapshot_backoff_increments_anchor_stays(
     )
 
     state = read_backoff(tmp_path, sid)
-    assert state == {"failures": 2, "first_failure_at": anchor}
+    assert state is not None
+    assert (state["failures"], state["first_failure_at"]) == (2, anchor)
+    assert state["failing_end_ts"]  # 524-4: the failing chunk's end rides along with the count
 
 
 def test_snapshot_backoff_skips_after_threshold_within_window(

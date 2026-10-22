@@ -42,6 +42,8 @@ interface Message {
   imageThumb?: string;
   /** Initiate reach-out bubble — renders a ✶ marker. */
   reachedOut?: boolean;
+  /** Sent, but the session it goes to is still being resolved (a slow launch rollover, #523): shown dimmed. */
+  pending?: boolean;
 }
 
 interface StagedFile {
@@ -189,6 +191,9 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
     setInput(v);
   };
   const [streaming, setStreaming] = useState(false);
+  // #523: a send is resolving its session (GET /sessions/active can take minutes while a stale session
+  // rolls over). Its bubble is already shown, pending; no other send may start until it resolves.
+  const [resolvingSession, setResolvingSession] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Phase 4 (v0.0.15-alpha.2): map empty/whitespace-only strings to a
   // fixed user-facing copy so the error banner never renders blank
@@ -212,6 +217,11 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
   };
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [activeBanners, setActiveBanners] = useState<InitiateMessage[]>([]);
+  // #523: a card reply whose send could not get a session gives its banner back, with the typed reply (by audit id). `n`
+  // counts the give-backs and is part of the banner's key, so the banner given back is always a NEW instance that starts
+  // from the reply: its removal and its return can be rendered in one batch (React may never unmount it in between), and a
+  // reused instance would keep the draft it cleared when it sent.
+  const [bannerDrafts, setBannerDrafts] = useState<Record<string, { text: string; n: number }>>({});
   const [activeVoiceEdits, setActiveVoiceEdits] = useState<VoiceEditProposal[]>([]);
   const sessionRef = useRef<string | null>(null);
   const cancelRef = useRef<(() => void) | null>(null);
@@ -264,9 +274,10 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
             }
           })
           .catch((e) => {
-            // Page unload remains best-effort. In-app persona changes keep the
-            // component mounted, so surface the retryable failure instead of
-            // silently discarding the user's expectation that memory was saved.
+            // Page unload remains best-effort. Only a cleanup that runs while the
+            // panel stays mounted can show this warning; App.tsx remounts the panel
+            // on a persona change (it rebuilds Ready through starting-bridge), so
+            // today this is a guard for a future in-place persona switch.
             if (!keepalive && mountedRef.current) {
               setMemorySaveWarning(
                 `Memory snapshot pending for the previous chat: ${errString(e)}`,
@@ -295,12 +306,15 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
   // session creation (deferred until first send) stays the default when
   // no active session exists — we don't eagerly mint an empty one.
   //
-  // Race note: hydration only writes to setMessages BEFORE any send() can
-  // possibly have appended a new turn — sessionRef.current is null until
-  // the user types and clicks send, and we set it here before any visible
-  // affordance reveals the hydrated state. The cancelled guard ensures a
-  // late resolution after persona switch / unmount doesn't clobber the
-  // new panel's empty state.
+  // Race note (#523): /sessions/active can take minutes when it rolls a stale
+  // session over (it extracts the whole stale buffer first), so the user may
+  // send before this call returns. The send path asks /sessions/active itself,
+  // joins the same rollover on the bridge and sets sessionRef. When this call
+  // then resolves it must not undo that: it sets sessionRef only while it is
+  // still unset, and hydrates only an empty message list (a send already in the
+  // list keeps the list; that session's earlier history then shows on the next
+  // load). The cancelled guard ensures a late resolution after persona switch /
+  // unmount doesn't clobber the new panel's empty state.
   useEffect(() => {
     let cancelled = false;
     void (async () => {
@@ -312,22 +326,24 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
         return;
       }
       if (cancelled || !sid) return;
-      sessionRef.current = sid;
+      if (!sessionRef.current) sessionRef.current = sid;
       try {
         const { messages: history } = await fetchChatHistory(persona, sid, 200);
         if (cancelled) return;
-        setMessages(
-          history.map((h) => ({
-            id: h.turn,
-            from: h.role === "assistant" ? "nell" : "hana",
-            text: h.content,
-            time: h.ts
-              ? new Date(h.ts).toLocaleTimeString("en", {
-                  hour: "numeric",
-                  minute: "2-digit",
-                })
-              : "",
-          })),
+        setMessages((prev) =>
+          prev.length
+            ? prev
+            : history.map((h) => ({
+                id: h.turn,
+                from: h.role === "assistant" ? "nell" : "hana",
+                text: h.content,
+                time: h.ts
+                  ? new Date(h.ts).toLocaleTimeString("en", {
+                      hour: "numeric",
+                      minute: "2-digit",
+                    })
+                  : "",
+              })),
         );
       } catch {
         // Non-fatal: empty messages array is the legitimate fresh-session
@@ -422,7 +438,11 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
     }
   }
 
+  // A banner given back after a failed card reply mounts again; its message was already read, so "read" is posted once per id.
+  const readPostedRef = useRef<Set<string>>(new Set());
   const onBannerMounted = (auditId: string) => {
+    if (readPostedRef.current.has(auditId)) return;
+    readPostedRef.current.add(auditId);
     void postInitiateState(auditId, "read");
   };
   const onBannerDismiss = (auditId: string) => {
@@ -573,12 +593,29 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
     imageThumb?: string;
     prepend?: Message[];
     onFailed?: () => void;
+    onRolledBack?: () => void;
   }): Promise<void> {
-    const { text: outboundText, replyToAuditId, sharedFiles, imageThumb, prepend = [], onFailed } = opts;
+    const { text: outboundText, replyToAuditId, sharedFiles, imageThumb, prepend = [], onFailed, onRolledBack } = opts;
+
+    const userMsg: Message = {
+      id: nextBubbleId(),
+      from: "hana",
+      text: outboundText,
+      time: formatTime(),
+      imageThumb,
+    };
+    // The bubble holds onto the previewUrl until unmount — track it so
+    // the unmount cleanup revokes it. Don't revoke here.
+    if (userMsg.imageThumb) trackedUrlsRef.current.add(userMsg.imageThumb);
 
     // Session resolve: reattach or create.
     let sessionId = sessionRef.current;
+    const resolving = !sessionId;
     if (!sessionId) {
+      // #523: the lookup below can take minutes during a launch rollover, so the message is shown now,
+      // pending, and no other send starts until the session is known.
+      setMessages((m) => [...m, ...prepend, { ...userMsg, pending: true }]);
+      setResolvingSession(true);
       // Phase B sticky-session reattach (F-201): if the bridge has a
       // recent session for this persona (younger than the finalise
       // threshold), pick up where we left off instead of creating a
@@ -594,24 +631,21 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
         try {
           sessionId = await newSession(persona);
         } catch (e) {
+          // Nothing was sent: take back the pending bubble and any reach-out bubble shown with it, and give everything back
+          // where it came from (onFailed: the composer's text; onRolledBack: a card reply's banner and its reply text), so
+          // nothing the user saw or typed vanishes.
+          const shown = new Set([userMsg.id, ...prepend.map((b) => b.id)]);
+          setMessages((m) => m.filter((b) => !shown.has(b.id)));
+          setResolvingSession(false);
           setErrorSafe(`Bridge unreachable: ${errString(e)}`);
+          onRolledBack?.();
           onFailed?.();
           return;
         }
       }
       sessionRef.current = sessionId;
+      setResolvingSession(false);
     }
-
-    const userMsg: Message = {
-      id: nextBubbleId(),
-      from: "hana",
-      text: outboundText,
-      time: formatTime(),
-      imageThumb,
-    };
-    // The bubble holds onto the previewUrl until unmount — track it so
-    // the unmount cleanup revokes it. Don't revoke here.
-    if (userMsg.imageThumb) trackedUrlsRef.current.add(userMsg.imageThumb);
 
     const replyId = nextBubbleId();
     const replyStub: Message = {
@@ -622,7 +656,11 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
       streaming: true,
     };
 
-    setMessages((m) => [...m, ...prepend, userMsg, replyStub]);
+    setMessages((m) =>
+      resolving
+        ? [...m.map((b) => (b.id === userMsg.id ? { ...b, pending: false } : b)), replyStub]
+        : [...m, ...prepend, userMsg, replyStub],
+    );
     setStreaming(true);
 
     // Every failed end of this turn: the error, a visible failure marker in place
@@ -724,7 +762,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
   async function send() {
     const text = input.trim();
     const ready = stagedFiles.filter((f) => f.status === "ready" && !!f.sha);
-    if ((!text && ready.length === 0) || streaming) return;
+    if ((!text && ready.length === 0) || streaming || resolvingSession) return;
     if (stagedFiles.some((f) => f.status === "uploading")) return;
     // Default text when nothing is typed (#268, #270): one image, one file,
     // or several of any kind. Persona-facing; wording is the owner's call.
@@ -777,14 +815,24 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
   // Prepends the reach-out body as a ✶-marked nell bubble, then sends
   // the reply through streamTurn with replyToAuditId threaded.
   const onCardSendReply = (auditId: string, text: string) => {
-    if (streaming || !text.trim()) return;   // don't double-stream; don't send empty
+    if (streaming || resolvingSession || !text.trim()) return;   // don't double-stream; don't send empty
     const banner = activeBanners.find((b) => b.auditId === auditId);
     setActiveBanners((prev) => prev.filter((b) => b.auditId !== auditId));
     const prepend: Message[] = banner
       ? [{ id: nextBubbleId(), from: "nell", text: banner.body, time: formatTime(), reachedOut: true }]
       : [];
     // fire-and-forget: streamTurn owns its own error surfacing (failure bubble + setErrorSafe)
-    void streamTurn({ text, replyToAuditId: auditId, prepend });
+    void streamTurn({
+      text,
+      replyToAuditId: auditId,
+      prepend,
+      // #523: no session could be had, so nothing was sent: the banner comes back with the reply the user typed.
+      onRolledBack: () => {
+        if (!banner) return;
+        setBannerDrafts((d) => ({ ...d, [auditId]: { text, n: (d[auditId]?.n ?? 0) + 1 } }));
+        setActiveBanners((prev) => (prev.some((b) => b.auditId === auditId) ? prev : [...prev, banner]));
+      },
+    });
   };
 
   function stopStreaming() {
@@ -835,7 +883,7 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
 
   const hasReadyFile = stagedFiles.some((f) => f.status === "ready" && !!f.sha);
   const anyUploading = stagedFiles.some((f) => f.status === "uploading");
-  const sendDisabled = !streaming && ((!input.trim() && !hasReadyFile) || anyUploading);
+  const sendDisabled = resolvingSession || (!streaming && ((!input.trim() && !hasReadyFile) || anyUploading));
 
   return (
     <div
@@ -923,13 +971,14 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
         >
           {activeBanners.map((b) => (
             <InitiateBanner
-              key={b.auditId}
+              key={`${b.auditId}:${bannerDrafts[b.auditId]?.n ?? 0}`}
               message={b}
               companionName={capitalize(persona)}
               onSendReply={onCardSendReply}
               onDismiss={onBannerDismiss}
               onMounted={onBannerMounted}
               isStreaming={streaming}
+              initialDraft={bannerDrafts[b.auditId]?.text}
             />
           ))}
         </div>
@@ -1439,6 +1488,7 @@ function Bubble({
           lineHeight: 1.4,
           whiteSpace: "pre-wrap",
           wordBreak: "break-word",
+          opacity: msg.pending ? 0.6 : 1,
         }}
       >
         {msg.imageThumb && (

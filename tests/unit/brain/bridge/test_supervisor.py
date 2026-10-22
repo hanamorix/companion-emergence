@@ -789,10 +789,19 @@ def test_supervisor_startup_defers_legacy_embeddings_db_deletion_with_backlog(
 
 
 def test_supervisor_finalize_cadence_drops_old_sessions(tmp_path: Path) -> None:
-    """The hourly finalize cadence at 24h silence runs, deletes the buffer
-    + cursor, evicts from _SESSIONS, and publishes session_finalized."""
+    """The hourly finalize cadence at 24h silence runs, evicts the session from _SESSIONS and publishes
+    session_finalized. Finalize is extraction-only: it never deletes or moves the buffer (the rollover owns that). Here
+    the fake provider's reply never parses, so after three recorded failures finalize sets the failing chunk aside in
+    poison/ and moves the cursor past it; the buffer, now fully dealt with, stays until a rollover reaps it, which the
+    weekly rollover does once its oldest turn is a week old."""
+    import json as _json
+
+    from brain.chat.compaction import _ROLLOVER_QUIET_GAP, _WEEKLY_ROLLOVER_AGE
+    from brain.chat.rollover import maybe_weekly_rollover
     from brain.chat.session import create_session, get_session, reset_registry
-    from brain.ingest.buffer import ingest_turn
+    from brain.ingest.buffer import ingest_turn, read_backoff, read_cursor
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import MemoryStore
 
     reset_registry()
     persona_dir = _persona_dir(tmp_path)
@@ -822,14 +831,35 @@ def test_supervisor_finalize_cadence_drops_old_sessions(tmp_path: Path) -> None:
     )
     t.start()
     buf = persona_dir / "active_conversations" / f"{sid}.jsonl"
-    _wait_until(lambda: not buf.exists())
+    span = persona_dir / "active_conversations" / "poison" / f"{sid}.span.jsonl"
+    _wait_until(lambda: span.exists() and read_cursor(persona_dir, sid) is not None)
     stop.set()
     t.join(timeout=30.0)
 
-    assert not buf.exists(), "finalize must delete the buffer"
+    set_aside = [_json.loads(line) for line in span.read_text(encoding="utf-8").splitlines()]
+    assert [r["text"] for r in set_aside] == ["ancient"], "finalize must set the failing chunk aside"
+    assert read_cursor(persona_dir, sid) == old_ts, "the cursor moves past the chunk set aside"
+    assert read_backoff(persona_dir, sid) is None, "the failure record is cleared"
+    assert buf.exists(), "finalize never deletes or moves the buffer; the rollover reaps it"
     assert get_session(sid) is None, "finalize must remove from _SESSIONS"
     types = [e.get("type") for e in bus.events]
     assert "session_finalized" in types
+
+    # The buffer does not stay forever: once its oldest turn is a week old, the weekly rollover (the daily compaction job)
+    # reaps it, with nothing left to extract.
+    store = MemoryStore(persona_dir / "memories.db")
+    hebbian = HebbianMatrix(persona_dir / "hebbian.db")
+    try:
+        new_sid = maybe_weekly_rollover(
+            persona_dir, sid, persona_dir.name,
+            weekly_age=_WEEKLY_ROLLOVER_AGE, quiet_gap=_ROLLOVER_QUIET_GAP,
+            now=datetime.now(UTC) + _WEEKLY_ROLLOVER_AGE, provider=FakeProvider(),
+            store=store, hebbian=hebbian,
+        )
+    finally:
+        store.close()
+        hebbian.close()
+    assert new_sid is not None and not buf.exists(), "the weekly rollover reaps the old buffer"
     reset_registry()
 
 

@@ -53,7 +53,7 @@ vi.mock("../expressions", () => ({
 }));
 
 import { ChatPanel } from "./ChatPanel";
-import { acceptVoiceEdit, rejectVoiceEdit, fetchActiveSession, newSession, closeSession, snapshotSession, uploadImage } from "../bridge";
+import { acceptVoiceEdit, rejectVoiceEdit, fetchActiveSession, fetchChatHistory, newSession, closeSession, snapshotSession, uploadImage } from "../bridge";
 import { streamChat } from "../streamChat";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -266,6 +266,288 @@ describe("ChatPanel — sticky-session reattach on first send (F-201)", () => {
       unknown,
     ];
     expect(sessionId).toBe("fresh-sess-after-throw");
+  });
+});
+
+describe("ChatPanel — a send while the mount call is still pending (#523)", () => {
+  // A launch rollover (GET /sessions/active) can take minutes now; the user may send before the mount
+  // call returns. The send joins the same rollover and streams its reply; when the mount call then
+  // resolves, it must not wipe the sent message and the reply, nor replace the send's session id.
+  const mockedFetchActive = fetchActiveSession as unknown as ReturnType<typeof vi.fn>;
+  const mockedFetchHistory = fetchChatHistory as unknown as ReturnType<typeof vi.fn>;
+  const mockedNewSession = newSession as unknown as ReturnType<typeof vi.fn>;
+  const mockedStreamChat = streamChat as unknown as ReturnType<typeof vi.fn>;
+  const history = {
+    messages: [{ role: "user", content: "an older plumbrick line", turn: 1, ts: "2026-10-01T10:00:00Z" }],
+    next_before_turn: null,
+  };
+
+  beforeEach(() => {
+    mockedFetchActive.mockReset();
+    mockedFetchHistory.mockReset();
+    mockedNewSession.mockReset();
+    mockedStreamChat.mockReset();
+    mockedFetchHistory.mockResolvedValue(history);
+    mockedStreamChat.mockImplementation(
+      async (
+        _persona: string,
+        _sid: string,
+        _text: string,
+        handlers: { onChunk: (t: string) => void; onDone: () => void },
+      ) => {
+        handlers.onChunk("hello back from Kestrel");
+        handlers.onDone();
+        return () => undefined;
+      },
+    );
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  async function sendWhileMountPending(mountSid: string) {
+    let resolveMount: (sid: string | null) => void = () => undefined;
+    mockedFetchActive
+      .mockImplementationOnce(() => new Promise<string | null>((r) => (resolveMount = r)))
+      .mockResolvedValue("s_rolled");
+    render(<ChatPanel persona="kestrel" />);
+    const textarea = screen.getByPlaceholderText(/^Write to/) as HTMLTextAreaElement;
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: "hello from Bob" } });
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+    });
+    await waitFor(() => expect(mockedStreamChat).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText("hello back from Kestrel")).toBeInTheDocument();
+    await act(async () => {
+      resolveMount(mountSid);
+    });
+    await waitFor(() => expect(mockedFetchHistory).toHaveBeenCalled());
+  }
+
+  it("keeps the sent message and the streamed reply when the mount call resolves after the send", async () => {
+    await sendWhileMountPending("s_rolled");
+    expect(screen.getByText("hello from Bob")).toBeInTheDocument();
+    expect(screen.getByText("hello back from Kestrel")).toBeInTheDocument();
+    expect(screen.queryByText("an older plumbrick line")).toBeNull();
+  });
+
+  it("keeps the send's session id when the mount call resolves later", async () => {
+    await sendWhileMountPending("s_other");
+    const textarea = screen.getByPlaceholderText(/^Write to/) as HTMLTextAreaElement;
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: "a second line" } });
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+    });
+    await waitFor(() => expect(mockedStreamChat).toHaveBeenCalledTimes(2));
+    const [, secondSid] = mockedStreamChat.mock.calls[1] as [string, string, string, unknown];
+    expect(secondSid).toBe("s_rolled");
+  });
+
+  it("still hydrates the history when the mount call resolves before any send", async () => {
+    mockedFetchActive.mockResolvedValue("s_rolled");
+    render(<ChatPanel persona="kestrel" />);
+    expect(await screen.findByText("an older plumbrick line")).toBeInTheDocument();
+    expect(mockedNewSession).not.toHaveBeenCalled();
+  });
+});
+
+describe("ChatPanel — a send while its own session lookup is pending (#523)", () => {
+  // The send path asks /sessions/active itself; during a slow launch rollover that call can take minutes. The user's
+  // message must show at once (pending) and a second send must not be possible until the session resolves.
+  const mockedFetchActive = fetchActiveSession as unknown as ReturnType<typeof vi.fn>;
+  const mockedNewSession = newSession as unknown as ReturnType<typeof vi.fn>;
+  const mockedStreamChat = streamChat as unknown as ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    mockedFetchActive.mockReset();
+    mockedNewSession.mockReset();
+    mockedStreamChat.mockReset();
+    mockedStreamChat.mockImplementation(async () => () => undefined);
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("shows the message at once and blocks a second send until the session resolves", async () => {
+    let resolveSend: (sid: string | null) => void = () => undefined;
+    mockedFetchActive
+      .mockResolvedValueOnce(null) // the mount call: no active session
+      .mockImplementationOnce(() => new Promise<string | null>((r) => (resolveSend = r))); // the send's own call: pending
+    render(<ChatPanel persona="kestrel" />);
+    await waitFor(() => expect(mockedFetchActive).toHaveBeenCalledTimes(1));
+    const textarea = screen.getByPlaceholderText(/^Write to/) as HTMLTextAreaElement;
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: "first wobblet line" } });
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+    });
+    // Shown at once, while the session lookup is still pending.
+    expect(screen.getByText("first wobblet line")).toBeInTheDocument();
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: "second wobblet line" } });
+    });
+    const sendBtn = screen.getByRole("button", { name: /^send$/i });
+    expect(sendBtn).toBeDisabled();
+    await act(async () => {
+      fireEvent.click(sendBtn);
+      fireEvent.keyDown(textarea, { key: "Enter" });
+    });
+    expect(mockedFetchActive).toHaveBeenCalledTimes(2); // no second session lookup: the second send did not start
+    await act(async () => {
+      resolveSend("s_rolled");
+    });
+    await waitFor(() => expect(mockedStreamChat).toHaveBeenCalledTimes(1));
+    const [, sid, text] = mockedStreamChat.mock.calls[0] as [string, string, string, unknown];
+    expect(sid).toBe("s_rolled");
+    expect(text).toBe("first wobblet line");
+    expect(mockedNewSession).not.toHaveBeenCalled();
+  });
+});
+
+describe("ChatPanel — a send whose session cannot be had is rolled back (#523)", () => {
+  const mockedFetchActive = fetchActiveSession as unknown as ReturnType<typeof vi.fn>;
+  const mockedNewSession = newSession as unknown as ReturnType<typeof vi.fn>;
+  const mockedStreamChat = streamChat as unknown as ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    mockedFetchActive.mockReset();
+    mockedNewSession.mockReset();
+    mockedStreamChat.mockReset();
+    mockedStreamChat.mockImplementation(async () => () => undefined);
+    mockedFetchActive.mockResolvedValue(null);
+    mockedNewSession.mockRejectedValue(new Error("bridge down"));
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("removes the pending bubble, gives the text back and re-enables sending", async () => {
+    render(<ChatPanel persona="kestrel" />);
+    const textarea = screen.getByPlaceholderText(/^Write to/) as HTMLTextAreaElement;
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: "a glimmet that never left" } });
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+    });
+    await waitFor(() => expect(mockedNewSession).toHaveBeenCalled());
+    await waitFor(() => expect(textarea.value).toBe("a glimmet that never left"));
+    expect(screen.queryByText("a glimmet that never left", { selector: "div, span, p" })).toBeNull();
+    expect(screen.getByRole("button", { name: /^send$/i })).toBeEnabled();
+    expect(mockedStreamChat).not.toHaveBeenCalled();
+  });
+
+  it("gives a card reply's banner back, with the typed reply, and leaves no reach-out bubble", async () => {
+    const handlers = new Set<(e: Record<string, unknown> & { type: string }) => void>();
+    const stream = {
+      subscribe(h: (e: Record<string, unknown> & { type: string }) => void) {
+        handlers.add(h);
+        return () => handlers.delete(h);
+      },
+    };
+    render(<ChatPanel persona="kestrel" eventStream={stream} />);
+    await act(async () => {
+      for (const h of handlers)
+        h({
+          type: "initiate_delivered",
+          audit_id: "ia_rollback",
+          body: "a thought about the quorble tree",
+          urgency: "quiet",
+          state: "delivered",
+          timestamp: "2026-10-12T09:00:00+00:00",
+        });
+    });
+    const cardTextarea = (await screen.findByLabelText(/^Reply to Kestrel$/i)) as HTMLTextAreaElement;
+    await act(async () => {
+      fireEvent.change(cardTextarea, { target: { value: "tell me more" } });
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Send reply/i }));
+    });
+    await waitFor(() => expect(mockedNewSession).toHaveBeenCalled());
+    // The banner is back with the reply the user typed; its body shows once (in the banner, not as a reach-out bubble too).
+    const restored = (await screen.findByLabelText(/^Reply to Kestrel$/i)) as HTMLTextAreaElement;
+    expect(restored.value).toBe("tell me more");
+    expect(screen.getAllByText("a thought about the quorble tree")).toHaveLength(1);
+    expect(screen.getByRole("region", { name: /Kestrel reached out/i })).toBeInTheDocument();
+    expect(mockedStreamChat).not.toHaveBeenCalled();
+  });
+});
+
+describe("ChatPanel — a banner given back after a failed card reply is not read twice (#523)", () => {
+  const mockedFetchActive = fetchActiveSession as unknown as ReturnType<typeof vi.fn>;
+  const mockedNewSession = newSession as unknown as ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    mockedFetchActive.mockReset();
+    mockedNewSession.mockReset();
+    mockedFetchActive.mockResolvedValue(null);
+    mockedNewSession.mockRejectedValue(new Error("bridge down"));
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("posts read once per audit id", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const handlers = new Set<(e: Record<string, unknown> & { type: string }) => void>();
+      const stream = {
+        subscribe(h: (e: Record<string, unknown> & { type: string }) => void) {
+          handlers.add(h);
+          return () => handlers.delete(h);
+        },
+      };
+      render(<ChatPanel persona="kestrel" eventStream={stream} />);
+      await act(async () => {
+        for (const h of handlers)
+          h({
+            type: "initiate_delivered",
+            audit_id: "ia_once",
+            body: "a note about the snorvel lamp",
+            urgency: "quiet",
+            state: "delivered",
+            timestamp: "2026-10-12T09:00:00+00:00",
+          });
+      });
+      await act(async () => {
+        vi.advanceTimersByTime(2100);
+      });
+      const readPosts = () =>
+        fetchSpy.mock.calls.filter(([url, init]: [RequestInfo | URL, RequestInit?]) => {
+          const u = typeof url === "string" ? url : url.toString();
+          return u.includes("/initiate/state") && String(init?.body ?? "").includes('"new_state":"read"');
+        }).length;
+      await waitFor(() => expect(readPosts()).toBe(1));
+      const cardTextarea = (await screen.findByLabelText(/^Reply to Kestrel$/i)) as HTMLTextAreaElement;
+      await act(async () => {
+        fireEvent.change(cardTextarea, { target: { value: "and the glow?" } });
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: /Send reply/i }));
+      });
+      await waitFor(() => expect(mockedNewSession).toHaveBeenCalled());
+      expect(((await screen.findByLabelText(/^Reply to Kestrel$/i)) as HTMLTextAreaElement).value).toBe("and the glow?");
+      await act(async () => {
+        vi.advanceTimersByTime(2100);
+      });
+      expect(readPosts()).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
