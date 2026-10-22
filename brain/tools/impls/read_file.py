@@ -12,18 +12,28 @@ from brain.health.json_io import append_jsonl
 from brain.images import media_type_to_ext, save_image_bytes, sniff_media_type
 from brain.tools.impls import _read_cache
 
-_FILE_READ_MAX_BYTES = tunables.register("files.read_max_bytes", 256 * 1024)
+_FILE_READ_MAX_BYTES = tunables.register(
+    "files.read_max_bytes", 256 * 1024,
+    description="Largest text file the kindled will open, in bytes. Larger files are refused.",
+)
 # Viewable-image support. The image branch runs BEFORE the 256KB text cap so
 # a real photo (>256KB text cap, <= image_max_bytes) is returned as a viewable
 # image rather than refused by the text cap (P0 red-team F-1 cap-ordering).
 # image_max_bytes defaults >= the 20MB /upload cap so there is no
 # upload-succeeds-but-read-refuses dead zone.
 _FILE_IMAGE_TYPES = tunables.register(
-    "files.image_types", ["image/png", "image/jpeg", "image/webp", "image/gif"]
+    "files.image_types", ["image/png", "image/jpeg", "image/webp", "image/gif"],
+    description="Kinds of image the kindled can look at when it opens an image file.",
 )
-_FILE_IMAGE_MAX_BYTES = tunables.register("files.image_max_bytes", 20 * 1024 * 1024)
+_FILE_IMAGE_MAX_BYTES = tunables.register(
+    "files.image_max_bytes", 20 * 1024 * 1024,
+    description="Largest image the kindled will look at, in bytes.",
+)
 # #126: PDFs are read as extracted text (pypdf, pure-Python). Cap matches /upload.
-_FILE_PDF_MAX_BYTES = tunables.register("files.pdf_max_bytes", 20 * 1024 * 1024)
+_FILE_PDF_MAX_BYTES = tunables.register(
+    "files.pdf_max_bytes", 20 * 1024 * 1024,
+    description="Largest PDF the kindled will read, in bytes.",
+)
 _PDF_MAGIC = b"%PDF-"
 _SUGGEST_MAX = 10
 _DEFAULT_HEAD_LINES = 400
