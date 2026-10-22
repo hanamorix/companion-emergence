@@ -48,8 +48,18 @@ def _persona(name: str, *, model=None, tiers=None, opened: str | None = None, ex
 
 
 def _overrides() -> dict:
+    """The settings that differ from their shipped default (the file lists every setting now): a model job whose value is not
+    the job's default, plus any ``other.*`` key a test wrote. The defaults come from the job table, not the registry (other
+    tests clear the registry)."""
+    from brain.bridge.model_tier import _CLAUDE_JOBS
+    from brain.utils import toml_io
+
     p = tunables._file_path()
-    return json.loads(p.read_text(encoding="utf-8")).get("overrides", {}) if p.exists() else {}
+    if not p.exists():
+        return {}
+    defaults = dict(_CLAUDE_JOBS.values())
+    values = toml_io.flatten_toml(toml_io.read_toml(p))
+    return {k: v for k, v in values.items() if (k in defaults and v != defaults[k]) or k.startswith("other.")}
 
 
 def _marker() -> Path:
@@ -114,7 +124,7 @@ def test_without_last_opened_at_the_file_mtime_decides_and_a_tie_goes_to_the_fir
     migrate_persona_models(_home(), None)
     assert _overrides()[_CHAT] == "claude-sonnet-4-6"  # beta is newer by mtime
     _marker().unlink()
-    tunables.set_overrides({_CHAT: None})
+    tunables.set_values({_CHAT: None})
     os.utime(b / "persona_config.json", (1_700_000_000, 1_700_000_000))  # tie
     migrate_persona_models(_home(), None)
     assert _overrides()[_CHAT] == "claude-opus-5"  # alphabetical: alpha wins the tie
@@ -131,7 +141,7 @@ def test_tier_models_fold_per_job_with_the_newest_holder_winning() -> None:
 
 
 def test_an_existing_setting_is_never_overwritten() -> None:
-    tunables.set_overrides({_CHAT: "claude-opus-4-9"})
+    tunables.set_values({_CHAT: "claude-opus-4-9"})
     _persona("only", model="claude-sonnet-4-6", tiers={"compaction": "claude-haiku-4-5"}, opened="2026-01-01T00:00:00Z")
     migrate_persona_models(_home(), None)
     assert _overrides()[_CHAT] == "claude-opus-4-9"  # the user already chose
@@ -199,7 +209,7 @@ def test_with_only_non_claude_personas_nothing_is_decided() -> None:
 
 def test_with_no_legacy_keys_nothing_is_written_and_no_marker() -> None:
     _persona("clean")
-    tunables.set_overrides({"other.key": 1})
+    tunables.set_values({"other.key": 1})
     before = tunables._file_path().stat().st_mtime_ns
     migrate_persona_models(_home(), paths.get_persona_dir("clean"))
     assert tunables._file_path().stat().st_mtime_ns == before
@@ -240,7 +250,7 @@ def test_the_launching_persona_loses_its_legacy_keys_and_the_others_keep_theirs_
     assert _overrides()[_CHAT] == "claude-opus-5"
 
 
-def test_a_persona_found_after_the_decision_keeps_the_install_chat_line_and_applies_only_missing_jobs(caplog) -> None:
+def test_a_persona_found_after_the_decision_keeps_the_install_chat_line_and_applies_only_if_default_jobs(caplog) -> None:
     """Backward compatibility is permanent: an old config that turns up later is applied the same way, where the install
     has no setting; where it does, the install's setting stays and the old value is discarded with a log."""
     _persona("first", model="opus", opened="2026-02-01T00:00:00Z")
@@ -269,7 +279,7 @@ def test_a_persona_found_after_a_decision_that_wrote_no_chat_line_sets_it() -> N
 
 def test_the_loser_of_the_first_decision_does_not_overwrite_the_winner_when_it_starts(caplog) -> None:
     """The persona is not a late one: the decision considered it. Newest wins; the loser's value, applied
-    with only_missing against an install that holds no line (the winner saved the default), would reverse that."""
+    with only_if_default against an install that holds no line (the winner saved the default), would reverse that."""
     _persona("newer", model="sonnet", opened="2026-05-01T00:00:00Z")
     older = _persona("older", model="opus", opened="2026-01-01T00:00:00Z")
     with caplog.at_level(logging.INFO):
@@ -439,17 +449,17 @@ def test_the_lock_order_is_the_migration_lock_then_the_tunables_lock(monkeypatch
     monkeypatch.setattr(tunables, "locked_within", recording)
     _persona("a", model="opus", opened="2026-01-01T00:00:00Z")
     migrate_persona_models(_home(), None)
-    assert order == [MARKER_NAME, "tunables.json"]
+    assert order == [MARKER_NAME, "tunables.toml"]
 
 
 def test_an_external_write_between_the_scan_and_the_write_survives(monkeypatch) -> None:
-    """C33 (atomicity of only_missing): a chat model the user sets right after the scan is not overwritten."""
+    """C33 (atomicity of only_if_default): a chat model the user sets right after the scan is not overwritten."""
     _persona("a", model="opus", opened="2026-01-01T00:00:00Z")
     real_scan = model_migration._scan_candidates
 
     def scan_then_external_write(skipped):
         found = real_scan(skipped)
-        tunables.set_overrides({_CHAT: "claude-sonnet-4-6"})  # lands after the migration read, before it writes
+        tunables.set_values({_CHAT: "claude-sonnet-4-6"})  # lands after the migration read, before it writes
         return found
 
     monkeypatch.setattr(model_migration, "_scan_candidates", scan_then_external_write)
@@ -485,10 +495,10 @@ def test_the_migration_clears_the_rejection_record_of_the_id_it_writes_c30e(capt
     from brain.bridge.provider import ClaudeCliProvider
 
     capture_claude_argv.reject("claude-sonnet-4-9")
-    tunables.set_overrides({_CHAT: "claude-sonnet-4-9"})
+    tunables.set_values({_CHAT: "claude-sonnet-4-9"})
     with pytest.raises(Exception):  # noqa: B017
         ClaudeCliProvider(TIER_INTERACTIVE_CHAT).generate("x")
-    tunables.set_overrides({_CHAT: None})
+    tunables.set_values({_CHAT: None})
     assert model_error.is_rejected("claude-sonnet-4-9")
     _persona("a", model="claude-sonnet-4-9", opened="2026-01-01T00:00:00Z")
     migrate_persona_models(_home(), None)
@@ -516,7 +526,7 @@ def test_a_wedged_tunables_lock_leaves_no_marker_either(wedged_lock, monkeypatch
     monkeypatch.setattr(dev_constants, "SETTINGS_FILE_LOCK_WAIT_S", 0.3)
     a = _persona("a", model="opus", opened="2026-01-01T00:00:00Z")
     before = (a / "persona_config.json").read_bytes()
-    tunables.set_overrides({"other.key": 1})
+    tunables.set_values({"other.key": 1})
     with wedged_lock(tunables._file_path()):
         migrate_persona_models(_home(), a)
     assert not _marker().exists() and (a / "persona_config.json").read_bytes() == before
@@ -526,10 +536,10 @@ def test_a_wedged_tunables_lock_leaves_no_marker_either(wedged_lock, monkeypatch
 def test_a_damaged_settings_file_means_no_marker_and_nothing_cleared() -> None:
     a = _persona("a", model="opus", opened="2026-01-01T00:00:00Z")
     before = (a / "persona_config.json").read_bytes()
-    tunables._file_path().write_text("{not json")
+    tunables._file_path().write_text("a = = 1\n")
     migrate_persona_models(_home(), a)
     assert not _marker().exists() and (a / "persona_config.json").read_bytes() == before
-    assert tunables._file_path().read_text() == "{not json"
+    assert tunables._file_path().read_text() == "a = = 1\n"  # an unreadable settings file is left alone, never repaired
 
 
 # ---------------------------------------------------------------------------
@@ -537,30 +547,40 @@ def test_a_damaged_settings_file_means_no_marker_and_nothing_cleared() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_the_lifespan_runs_the_defaults_rewrite_then_the_migration_then_the_touch(monkeypatch) -> None:
+def test_the_lifespan_runs_sync_then_the_json_fold_then_the_persona_migration_then_the_touch(monkeypatch) -> None:
     """C37: the order is asserted from the calls the REAL lifespan makes, not from a re-implementation of it."""
+    import brain.tunables_migration as tm
+
     _persona("a", model="opus", opened="2026-01-01T00:00:00Z")
     calls: list[str] = []
-    real_write = tunables.write_defaults_section
+    real_sync = tunables.sync_file
+    real_fold = tm.migrate_legacy_json
     real_migrate = model_migration.migrate_persona_models
     real_touch = PersonaConfig.touch_last_opened
 
-    monkeypatch.setattr(tunables, "write_defaults_section", lambda: (calls.append("defaults"), real_write())[1])
+    monkeypatch.setattr(tunables, "sync_file", lambda: (calls.append("sync"), real_sync())[1])
+    monkeypatch.setattr(tm, "migrate_legacy_json", lambda h, **kw: (calls.append("fold"), real_fold(h, **kw))[1])
     monkeypatch.setattr(model_migration, "migrate_persona_models", lambda h, p: (calls.append("migrate"), real_migrate(h, p))[1])
     monkeypatch.setattr(PersonaConfig, "touch_last_opened", lambda self: (calls.append("touch"), real_touch(self))[1])
     _boot("a")
-    assert calls[:3] == ["defaults", "migrate", "touch"]
+    assert calls[:4] == ["sync", "fold", "migrate", "touch"]
     assert _overrides()[_CHAT] == "claude-opus-5"
 
 
-def test_a_damaged_settings_file_is_healed_first_and_the_migration_succeeds_in_the_same_boot() -> None:
-    """C14 (e): the heal happens before the migration, so a saved Opus is not left on Sonnet for that session."""
-    _persona("a", model="opus", opened="2026-01-01T00:00:00Z")
-    tunables._file_path().write_text("{not json")
+def test_an_unreadable_settings_file_is_left_alone_and_the_next_boot_after_the_fix_migrates() -> None:
+    """C14 (e), reshaped by owner ruling E9: nothing repairs an unreadable settings file, so the saved Opus stays in the
+    persona's file (nothing is lost) and is folded in at the first boot after the user fixes the file."""
+    a = _persona("a", model="opus", opened="2026-01-01T00:00:00Z")
+    tunables._file_path().write_text("a = = 1\n")
+    _boot("a")
+    assert tunables._file_path().read_text() == "a = = 1\n"
+    assert not _marker().exists() and _cfg("a")["model"] == "opus"
+    assert not list(_home().glob("tunables.json.corrupt-*")) and not list(_home().glob("tunables.toml.*corrupt*"))
+    tunables._file_path().write_text('"other.key" = 1\n')
     _boot("a")
     assert _overrides()[_CHAT] == "claude-opus-5"
     assert _marker().exists() and "model" not in _cfg("a")
-    assert list(_home().glob("tunables.json.corrupt-*"))  # the damaged bytes were kept aside by the heal
+    assert a.exists()
 
 
 def test_the_decision_competes_with_the_launching_personas_previous_open_time() -> None:
