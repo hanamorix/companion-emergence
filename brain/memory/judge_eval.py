@@ -76,7 +76,10 @@ logger = logging.getLogger(__name__)
 # 2026-09-24): "a standard significance convention... not a model-pinned
 # magic number" — a documented, widely-used default, not hand-picked for
 # this codebase.
-JUDGE_EVAL_ALPHA_DEFAULT: float = tunables.register("judge_selftune.eval_alpha", 0.05)
+JUDGE_EVAL_ALPHA_DEFAULT: float = tunables.register(
+    "judge_selftune.eval_alpha", 0.05,
+    description="Strictness of the weekly test that decides whether a retrained memory judge replaces the old one.",
+)
 
 # Held-out test-set size floor (spec §4 "DEGENERATE FLOOR"): below this,
 # there is too little data to evaluate the challenger at all, so the
@@ -85,7 +88,10 @@ JUDGE_EVAL_ALPHA_DEFAULT: float = tunables.register("judge_selftune.eval_alpha",
 # JUDGE_TUNE_GATE_HANDFUL_DECISIONS`'s own docstring: not hardware-derived,
 # so a dry-run doesn't set it either) — 30 is the conventional rule-of-thumb
 # floor for a binomial-family test to have any meaningful power at all.
-JUDGE_EVAL_MIN_TEST_N_DEFAULT: int = tunables.register("judge_selftune.eval_min_test_n", 30)
+JUDGE_EVAL_MIN_TEST_N_DEFAULT: int = tunables.register(
+    "judge_selftune.eval_min_test_n", 30,
+    description="Fewest held-back examples needed before a retrained memory judge is tested at all.",
+)
 
 
 # ---------------------------------------------------------------------------

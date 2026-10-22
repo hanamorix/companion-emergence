@@ -140,7 +140,8 @@ _AVX2_PRESENT = _detect_avx2()
 # default resolves to, never the override behavior itself. Read at call
 # time via tunables.get_tunable so a live override applies with no restart.
 LATENCY_BUDGET_SECONDS: float = tunables.register(
-    "reranker.latency_budget_seconds", _default_latency_budget_seconds(_AVX2_PRESENT)
+    "reranker.latency_budget_seconds", _default_latency_budget_seconds(_AVX2_PRESENT),
+    description="Seconds one memory re-ranking may take. Set from your computer's speed unless you change it.",
 )
 
 # fp16-vs-fp32 reranker precision (pre-flip revision Change 2 — supersedes
@@ -157,7 +158,10 @@ LATENCY_BUDGET_SECONDS: float = tunables.register(
 # "reranker.precision" in tunables.json's "overrides" to "fp32".
 RERANKER_PRECISION_FP16 = "fp16"
 RERANKER_PRECISION_FP32 = "fp32"
-RERANKER_PRECISION: str = tunables.register("reranker.precision", RERANKER_PRECISION_FP16)
+RERANKER_PRECISION: str = tunables.register(
+    "reranker.precision", RERANKER_PRECISION_FP16,
+    description="Number format used for memory re-ranking. The other accepted choice is fp32.",
+)
 
 
 class RerankTerminated(Exception):  # noqa: N818 - a control signal, not an error

@@ -51,7 +51,8 @@ logger = logging.getLogger(__name__)
 # tunables.json is unaffected by this swap from a flat default to a derived
 # one.
 CALIBRATION_LOG_RETENTION_WINDOW_DAYS: float = tunables.register(
-    "calibration.retention_window_days", RETENTION_WINDOW_DAYS_DEFAULT
+    "calibration.retention_window_days", RETENTION_WINDOW_DAYS_DEFAULT,
+    description="Days of recall history kept for tuning the memory score cutoff. The app works out the default.",
 )
 
 # F2b (#276 §5): the score scale every `calibration_log` row `log_

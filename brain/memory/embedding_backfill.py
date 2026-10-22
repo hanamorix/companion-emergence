@@ -162,10 +162,12 @@ _CURSOR_FILE = "embedding_backfill_cursor.json"
 # leaves ~half of `tick_interval_seconds` as headroom so a slow entry (or a
 # tick that ran a little long already) still fits inside one supervisor tick.
 _BATCH_BUDGET_SECONDS_DEFAULT = tunables.register(
-    "embedding_backfill.batch_budget_seconds", 30.0
+    "embedding_backfill.batch_budget_seconds", 30.0,
+    description="Seconds one background pass may spend preparing older memories for search.",
 )
 _TICK_INTERVAL_SECONDS_DEFAULT = tunables.register(
-    "embedding_backfill.tick_interval_seconds", 60.0
+    "embedding_backfill.tick_interval_seconds", 60.0,
+    description="How often, in seconds, the app assumes its background passes run. Used to size each batch.",
 )
 
 

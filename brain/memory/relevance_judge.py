@@ -100,7 +100,10 @@ _HAIKU_TIEBREAK_PROMPT = prompt_strings.register("memory.relevance_judge.haiku_t
 #       rows actually logged.
 # Operator-tunable (`calibration.judge_sample_rows`) for a box where either
 # side of this balance needs shifting.
-CALIBRATION_SAMPLE_ROWS: int = tunables.register("calibration.judge_sample_rows", 100)
+CALIBRATION_SAMPLE_ROWS: int = tunables.register(
+    "calibration.judge_sample_rows", 100,
+    description="How many recent recalls the memory judge re-checks each day.",
+)
 
 # Half-width of the self-contained AMBIGUOUS BAND around the judge's own
 # sigmoid decision boundary (p=0.5 — where a sigmoid's classification
@@ -113,7 +116,8 @@ CALIBRATION_SAMPLE_ROWS: int = tunables.register("calibration.judge_sample_rows"
 # region where the judge's own confidence is genuinely lowest.
 # Operator-tunable (`calibration.judge_ambiguous_band_half_width`).
 AMBIGUOUS_BAND_HALF_WIDTH: float = tunables.register(
-    "calibration.judge_ambiguous_band_half_width", 0.05
+    "calibration.judge_ambiguous_band_half_width", 0.05,
+    description="How close to undecided a memory-judge score must be to get a second opinion from Claude.",
 )
 
 
