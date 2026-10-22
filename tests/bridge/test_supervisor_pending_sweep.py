@@ -14,6 +14,18 @@ import pytest
 
 from brain.bridge.supervisor import run_folded
 
+# Failure-path ceiling only: every test stops the loop itself the moment its expected effect lands, so a
+# passing run never waits on this. It is generous because a Windows runner's first supervisor pass (cold
+# imports, first DB opens) can take several seconds; a short ceiling stops the loop before that pass reports.
+_WATCHDOG_S = 60.0
+
+
+def _watchdog(stop_event: threading.Event) -> threading.Timer:
+    timer = threading.Timer(_WATCHDOG_S, stop_event.set)
+    timer.daemon = True
+    timer.start()
+    return timer
+
 
 def test_supervisor_sweeps_expired_pending_writes_on_maintenance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -44,9 +56,9 @@ def test_supervisor_sweeps_expired_pending_writes_on_maintenance(
         "brain.bridge.supervisor._run_voice_reflection_tick", lambda *a, **k: None
     )
 
-    # Watchdog: if the sweep never fires, stop the loop after a short window so
+    # Watchdog: if the sweep never fires, stop the loop after a generous window so
     # the test fails on the assertion below rather than hanging forever.
-    threading.Timer(3.0, stop_event.set).start()
+    watchdog = _watchdog(stop_event)
 
     run_folded(
         stop_event,
@@ -66,6 +78,7 @@ def test_supervisor_sweeps_expired_pending_writes_on_maintenance(
         # call returns.
         interest_sweep_interval_s=None,
     )
+    watchdog.cancel()
 
     assert len(sweep_calls) >= 1
 
@@ -160,7 +173,7 @@ def _spy_reconcile(monkeypatch, stop_event, stage):
         return n
 
     monkeypatch.setattr(commit_mod, "reconcile_stale_commits", spy)
-    threading.Timer(8.0, stop_event.set).start()  # watchdog: fail on the assertion, don't hang
+    _watchdog(stop_event)  # failure-path ceiling: fail on the assertion, don't hang
     return seen
 
 
@@ -293,7 +306,7 @@ def test_a_raising_reconcile_never_stops_startup_or_the_maintenance_tick(
 
     monkeypatch.setattr(commit_mod, "reconcile_stale_commits", boom)
     monkeypatch.setattr("brain.health.sidecar_sweep.sweep_stale_sidecars", sidecar_sweep)
-    threading.Timer(8.0, stop_event.set).start()
+    _watchdog(stop_event)
     _run(persona_dir, stop_event)
 
     assert len(boom_calls) >= 2, "reconcile should have been attempted at startup AND on maintenance"
@@ -327,7 +340,7 @@ def test_reconcile_has_its_own_persisted_cadence_independent_of_maintenance(
         return n
 
     monkeypatch.setattr(commit_mod, "reconcile_stale_commits", spy)
-    threading.Timer(8.0, stop_event.set).start()
+    _watchdog(stop_event)
     _run(persona_dir, stop_event, soul_review_interval_s=None, pending_reconcile_interval_s=0.05)
 
     assert pending.get(persona_dir, staged["rid"])["status"] == "error"
