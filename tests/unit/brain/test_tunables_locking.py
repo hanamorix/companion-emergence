@@ -100,7 +100,9 @@ def test_two_processes_writing_different_keys_lose_nothing(tmp_path, repo_root) 
     for p in procs:
         assert p.wait(timeout=120) == 0
     values = read_values(tmp_path)
-    assert {f"a{i}" for i in range(50)} | {f"b{i}" for i in range(50)} == set(values)
+    # the creating write also carries the registered keys (the lull key), so check inclusion, not equality
+    assert {f"a{i}" for i in range(50)} | {f"b{i}" for i in range(50)} <= set(values)
+    assert {k for k in values if k not in {f"a{i}" for i in range(50)} | {f"b{i}" for i in range(50)}} == {"chat.idle_lull_seconds"}
 
 
 # ---------------------------------------------------------------------------
