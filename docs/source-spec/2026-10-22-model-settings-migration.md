@@ -32,7 +32,10 @@ Folding rules (code: `brain/tunables_migration.py`, `brain/model_migration.py`):
   - a fresh `tunables.json` is folded by the rule above: a setting still at its default takes the value the older brain
     saved, a setting the user changed since keeps the TOML value;
   - a persona `model` the older brain saved in a persona the decision considered is cleared and not applied (a pick made
-    in the older brain is not carried over; the user picks the model again if they want a different one).
+    in the older brain is not carried over; the user picks the model again if they want a different one);
+  - a persona created while downgraded (so not named in the marker) that saved a `model` is treated like a persona
+    imported later (section 1): its model is applied only if the install's setting for that job is still the shipped
+    default, and is discarded with a log line otherwise; either way the `model` key is removed from the persona's file.
 - A user who wants the older brain to run with their values re-sets them there; there is no automatic copy back (the
   migration is one way).
 

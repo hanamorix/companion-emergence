@@ -399,12 +399,19 @@ def test_a_saved_opus_survives_a_config_save_by_another_path_before_the_migratio
     assert "model" not in _cfg("only")
 
 
-def test_an_upgrade_after_a_downgrade_keeps_the_settings_and_folds_what_the_older_brain_wrote(caplog) -> None:
+@pytest.mark.parametrize("pick", ["sonnet", "haiku"])
+def test_an_upgrade_after_a_downgrade_keeps_the_settings_and_folds_what_the_older_brain_wrote(caplog, pick) -> None:
     """The rollback contract of the migration spec (docs/source-spec/2026-10-22-model-settings-migration.md): after an in-app
     revert the older brain ignores tunables.toml and runs on its defaults; the values stay in the file and are used again
     on the next upgrade; a ``tunables.json`` the older brain wrote meanwhile is folded by the legacy-JSON rule (only into a
     setting still at its default); a model the older brain saved in a persona the decision considered is cleared, not
-    applied (it never overwrites the install's setting)."""
+    applied (it never overwrites the install's setting).
+
+    ``pick`` is the model the user chose in the upgraded app. ``sonnet`` is the chat job's SHIPPED DEFAULT id: the case the
+    "considered persona is only cleared" rule exists for, because a late apply (``only_if_default``) would take the older
+    brain's ``claude-opus-4-1`` over a setting that merely equals the default and this test would then fail. ``haiku`` is a
+    pick that differs from the default (the old late-apply path discards that one too, so it proves less on its own)."""
+    from brain.bridge.model_tier import resolve_choice, shipped_default
     from brain.tunables_migration import migrate_legacy_json
     from tests.tunables_file import read_values
 
@@ -425,8 +432,10 @@ def test_an_upgrade_after_a_downgrade_keeps_the_settings_and_folds_what_the_olde
     assert not (_home() / "tunables.json").exists() and "model" not in _cfg("alpha")
 
     # The upgraded app: the user changes a setting and picks a model (only tunables.toml is written).
-    set_job_models({_CHAT_JOB: "haiku"})
+    set_job_models({_CHAT_JOB: pick})
     tunables.set_values({"rt.changed_by_user": 5.0})
+    picked = resolve_choice(pick)
+    assert picked == (shipped_default(_CHAT_JOB) if pick == "sonnet" else "haiku")  # the case under test is what it says
 
     # Downgrade: the older brain never reads tunables.toml. It writes its own files.
     assert read_values(_home())["rt.kept"] == 7.0  # nothing the older brain does touches the file's values
@@ -444,7 +453,7 @@ def test_an_upgrade_after_a_downgrade_keeps_the_settings_and_folds_what_the_olde
     assert values["rt.kept"] == 7.0  # the upgraded value is intact: the older brain's 3.0 was not folded over it
     assert values["rt.changed_by_user"] == 5.0  # a setting the user changed since is never overwritten
     assert values["rt.new_while_down"] == 9.0  # a setting still at its default takes the older brain's value
-    assert values[_CHAT] == "haiku"  # the model pick survives
+    assert values[_CHAT] == picked  # the model pick survives, a default-valued one included
     assert not (_home() / "tunables.json").exists() and len(list(_home().glob("tunables.json.migrated-*"))) == 2
     assert "model" not in _cfg("alpha")  # cleared, never applied
 

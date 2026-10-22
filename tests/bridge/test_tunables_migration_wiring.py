@@ -101,3 +101,43 @@ def test_the_boot_with_an_old_json_and_a_saved_persona_model_leaves_the_toml_hol
     assert _values(kindled_home)["model.interactive_chat"] == "claude-opus-5"
     assert "model" not in json.loads((persona / "persona_config.json").read_text(encoding="utf-8"))
     assert not (kindled_home / "tunables.json").exists()
+
+
+def test_the_lifespan_folds_every_settings_source_before_the_supervisor_thread_starts(monkeypatch) -> None:
+    """The order pin: the boot pass, the old-JSON fold and the persona-model fold all finish before the supervisor starts, so
+    no background code can read a stale key or an unfolded model. Real lifespan, real call sites; each step is wrapped to
+    note when it ran and the supervisor loop is replaced by a note (nothing else about the bridge is stubbed)."""
+    import threading
+
+    from brain import model_migration, tunables, tunables_migration
+    from brain.bridge import supervisor as supervisor_mod
+
+    events: list[str] = []
+
+    def spy(owner, name: str, label: str) -> None:
+        real = getattr(owner, name)
+
+        def wrapper(*args, **kwargs):
+            result = real(*args, **kwargs)
+            events.append(label)  # noted when the step has FINISHED
+            return result
+
+        monkeypatch.setattr(owner, name, wrapper)
+
+    spy(tunables, "sync_file", "boot pass")
+    spy(tunables_migration, "migrate_legacy_json", "json fold")
+    spy(model_migration, "migrate_persona_models", "persona-model fold")
+
+    started = threading.Event()
+
+    def fake_run_supervised(stop_event, **_kw):
+        events.append("supervisor")  # noted when its thread begins running
+        started.set()
+        stop_event.wait()
+
+    monkeypatch.setattr(supervisor_mod, "run_supervised", fake_run_supervised)
+    persona = _claude_persona("orderer", "opus")
+    with TestClient(build_app(persona_dir=persona, client_origin="tests", background_threads=True)):
+        assert started.wait(10), "the supervisor never started"
+    folds = ["boot pass", "json fold", "persona-model fold"]
+    assert [e for e in events if e in folds + ["supervisor"]][: len(folds) + 1] == [*folds, "supervisor"]
