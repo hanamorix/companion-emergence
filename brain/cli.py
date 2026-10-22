@@ -642,6 +642,98 @@ def _memory_show_handler(args: argparse.Namespace) -> int:
     return 0
 
 
+def _memory_backfill_extraction_handler(args: argparse.Namespace) -> int:
+    """`nell memory backfill-extraction` (#523): re-extract conversation text the old extraction's tail cut never showed.
+
+    Default mode: the lost starts of long spans (``heads``); ``--all``: everything archived (no soul candidates). A plan keeps
+    its mode; the other mode needs ``--restart``. ``--dry-run`` prints both modes' sizes and writes nothing. ``--background``
+    arms the plan for the bridge, which runs one chunk per lull pass. Default: with no bridge running, run it here through the
+    same central-cadence job until done or until it stops (chat active, a deferral, ...); with a bridge running, arm it for the
+    bridge (this process cannot see the bridge's chat state). ``--status``, ``--stop``. See
+    ``brain/ingest/extraction_backfill.py``.
+
+    Every path that starts spending model calls (foreground, ``--background``, and arming for a running bridge, which spends at
+    lulls with no further prompt) prints the number of calls still to make and starts only with ``--yes``; without it nothing is
+    planned or armed and the exit code is 1. A plan with nothing to run (already complete, or the other mode, which is refused)
+    needs no ``--yes``, nor do ``--status``, ``--stop`` and ``--dry-run``.
+    """
+    from brain.ingest import extraction_backfill as eb
+
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        print(f"No persona directory at {persona_dir}.", file=sys.stderr)
+        return 1
+    mode = "all" if args.all else "heads"
+    if args.restart and (args.status or args.stop or args.dry_run):
+        print("--restart cannot be combined with --status, --stop or --dry-run", file=sys.stderr)
+        return 2
+    if args.status:
+        print(eb.status_text(persona_dir))
+        return 0
+    if args.stop:
+        print(eb.stop(persona_dir))
+        return 0
+    if args.dry_run:
+        print(eb.dry_run_text(persona_dir))
+        return 0
+
+    calls = eb.planned_calls(persona_dir, mode, restart=args.restart)
+    if calls:
+        print(f"mode {mode}: about {calls} model call(s) to make (one per chunk of extracted text; an over-long exchange takes several).")
+        if not args.yes:
+            print(
+                "Not started: this spends model calls. Run the same command again with --yes to start "
+                "(--dry-run shows what each mode would extract).",
+                file=sys.stderr,
+            )
+            return 1
+
+    restart_note = "a bridge started before this update must be restarted to have the backfill job"
+    outcome, message = eb.restart(persona_dir, mode) if args.restart else eb.arm(persona_dir, mode)
+    print(message)
+    if outcome == "refused":
+        return 1
+    if outcome == "complete":
+        return 0  # nothing to run: the plan is done (or planned nothing)
+
+    if args.background:
+        print(
+            "armed: the bridge runs it one chunk per lull; with no bridge running nothing happens until one runs "
+            f"({restart_note})."
+        )
+        return 0
+    if _bridge_running(persona_dir) is not None:
+        print(
+            "the persona's bridge is running, so the plan is armed for it: it runs one chunk per lull "
+            f"({restart_note})."
+        )
+        return 0
+
+    from brain.bridge.model_tier import TIER_BACKGROUND_HOUSEKEEPING, build_tier_provider
+
+    store = MemoryStore(db_path=persona_dir / "memories.db")
+    try:
+        # No bridge is running here, so nothing has registered the persona's own emotions in this process: without this the
+        # extraction would drop every emotion that is not in the baseline vocabulary (524-1).
+        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
+        try:
+            eb.run_foreground(
+                persona_dir,
+                store=store,
+                hebbian=hebbian,
+                provider=build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING),
+                bridge_running=lambda: _bridge_running(persona_dir) is not None,
+            )
+        except KeyboardInterrupt:
+            print("\ninterrupted: progress is kept (written after each chunk); run the command again to continue.")
+        finally:
+            hebbian.close()
+    finally:
+        store.close()
+    return 0
+
+
 def _format_backfill_eta(seconds: float | None) -> str:
     """Format a remaining-time estimate for the backfill ticker. `None`
     means "not yet estimable" (no completed embeds to derive a rate from
@@ -2967,6 +3059,47 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Persona name. If omitted and exactly one is installed, that one is used.",
     )
     memory_show.set_defaults(func=_memory_show_handler)
+
+    # nell memory backfill-extraction — #523: re-extract conversation text the old extraction cut never
+    # showed the extractor. See _memory_backfill_extraction_handler's docstring.
+    memory_backfill = memory_actions.add_parser(
+        "backfill-extraction",
+        help=(
+            "Re-extract conversation text that older versions never extracted (the starts of long stretches; "
+            "--all for everything). Runs one chunk at a time during lulls; resumable; --dry-run to see the size first; "
+            "prints the number of model calls and starts only with --yes."
+        ),
+    )
+    memory_backfill.add_argument(
+        "--persona",
+        default=None,
+        help="Persona name. If omitted and exactly one is installed, that one is used.",
+    )
+    memory_backfill.add_argument(
+        "--all",
+        action="store_true",
+        help="Re-extract everything archived, not only the lost starts (more calls; no soul candidates).",
+    )
+    memory_backfill.add_argument(
+        "--restart",
+        action="store_true",
+        help="Discard the existing plan and plan afresh (the cutoff is recomputed; done targets are extracted again).",
+    )
+    memory_backfill.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm the model calls the plan will make; without it the command prints the count and does not start.",
+    )
+    backfill_action = memory_backfill.add_mutually_exclusive_group()
+    backfill_action.add_argument(
+        "--dry-run", action="store_true", help="Print what each mode would extract; write nothing, call no model."
+    )
+    backfill_action.add_argument(
+        "--background", action="store_true", help="Arm the plan for the bridge, which runs it during lulls, and return."
+    )
+    backfill_action.add_argument("--status", action="store_true", help="Print the plan's state and counters.")
+    backfill_action.add_argument("--stop", action="store_true", help="Stop the plan; progress is kept.")
+    memory_backfill.set_defaults(func=_memory_backfill_extraction_handler)
 
     # nell embed backfill — F1 #259 increment 6: the manual one-go backfill
     # CLI (spec §5b / S12), the operator escape hatch for the idle-gated

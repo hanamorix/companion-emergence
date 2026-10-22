@@ -47,7 +47,7 @@ INTERVAL_JOBS: dict[str, tuple[str, float]] = {
     "finalize": ("finalize_cadence.json", 3600.0),
     "initiate_review": ("initiate_review_cadence.json", 900.0),
 }
-NO_INTERVAL_JOBS = ("pass2", "session_snapshot_prune", "emotion_backfill", "embedding_backfill")
+NO_INTERVAL_JOBS = ("pass2", "session_snapshot_prune", "emotion_backfill", "embedding_backfill", "extraction_backfill")
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +250,14 @@ def stubs(monkeypatch):
     monkeypatch.setattr(supervisor, "_run_judge_selftune_tick", rec("weekly_selftune"))
     monkeypatch.setattr(supervisor, "_run_finalize_tick", rec("finalize"))
     monkeypatch.setattr(supervisor, "_run_initiate_review_tick", rec("initiate_review"))
+    # #523: the extraction backfill job stays real down to its one-chunk leaf.
+    monkeypatch.setattr(supervisor.extraction_backfill, "has_work", lambda _pd: work["extraction_backfill"])
+    monkeypatch.setattr(supervisor.extraction_backfill, "load_state", lambda _pd: {"status": "armed"})
+    monkeypatch.setattr(
+        supervisor.extraction_backfill,
+        "run_one_chunk",
+        lambda *_a, **_k: (order.append("extraction_backfill"), supervisor.extraction_backfill.Step(True, "chunk"))[1],
+    )
     return SimpleNamespace(order=order, work=work)
 
 
@@ -273,10 +281,10 @@ def _fake_jobs(names, log, *, due=True):
 # ---------------------------------------------------------------------------
 
 
-def test_job_table_is_the_20_gated_jobs_in_the_s55_order(tmp_path):
+def test_job_table_is_the_21_gated_jobs_in_the_s55_order(tmp_path):
     names = [j.name for j in _real_jobs(_persona(tmp_path))]
     assert names == list(GATED_JOB_ORDER)
-    assert len(names) == 20
+    assert len(names) == 21  # #523: the extraction backfill joined after the recall diagnostics flush
     # S85 (revised): the two floor-bootstrap RETRY jobs follow embedding backfill;
     # name-recall fix S100: the stuck-width re-measure follows them, and S164's
     # cost-series flush follows that (the re-measure's own sample is saved the
@@ -393,7 +401,7 @@ def test_c5_no_gated_job_starts_inside_the_lull_then_all_start_after(tmp_path, s
         assert stubs.order == [], f"a gated job started inside the lull (t-t0={t - t0})"
 
     _pass(persona_dir, jobs, idle=lambda: cli_throttle.is_chat_idle(now=t0 + lull))
-    assert stubs.order == list(GATED_JOB_ORDER), "all 20 due jobs start at the first pass after"
+    assert stubs.order == list(GATED_JOB_ORDER), "all 21 due jobs start at the first pass after"
 
 
 def test_c5_reply_in_flight_blocks_even_past_the_lull(tmp_path, stubs):
@@ -505,7 +513,7 @@ def test_c6_skip_leaves_every_cadence_file_byte_identical_and_still_due(tmp_path
     assert stubs.order == []
     assert _snapshot_bytes(persona_dir) == before
     if deny == "slot":
-        assert [d.action for d in decisions if d.action != "init-cadence"] == ["skip-slot"] * 20
+        assert [d.action for d in decisions if d.action != "init-cadence"] == ["skip-slot"] * 21
 
     _pass(persona_dir, jobs)  # next pass, idle + slot: every job still due
     assert stubs.order == list(GATED_JOB_ORDER)
@@ -513,8 +521,8 @@ def test_c6_skip_leaves_every_cadence_file_byte_identical_and_still_due(tmp_path
 
 def test_c6_inner_slot_denial_is_a_skip_not_a_run(tmp_path, stubs, monkeypatch):
     """Jobs holding their own authoritative slot (pass 2, embedding backfill,
-    maintenance, interest sweep, self-tune) that lose the race after the
-    central peek report SKIPPED: no work, no cadence advance."""
+    the extraction backfill, maintenance, interest sweep, self-tune) that lose
+    the race after the central peek report SKIPPED: no work, no cadence advance."""
     persona_dir = _persona(tmp_path)
     _seed_all_overdue(persona_dir)
     monkeypatch.setattr(supervisor.cli_throttle, "background_slot", _denying_slot)
@@ -528,6 +536,7 @@ def test_c6_inner_slot_denial_is_a_skip_not_a_run(tmp_path, stubs, monkeypatch):
         "rerank_floor_bootstrap",
         "rerank_width_remeasure",
         "rerank_ram_figure",
+        "extraction_backfill",
         "maintenance",
         "interest_sweep",
         "weekly_selftune",

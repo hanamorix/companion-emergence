@@ -16,6 +16,7 @@ memories (by keyword overlap) and strengthen each pair.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 
 from brain.ingest.types import ExtractedItem
 from brain.memory.hebbian import HebbianMatrix
@@ -33,6 +34,8 @@ def commit_item(
     store: MemoryStore,
     hebbian: HebbianMatrix,
     image_shas: list[str] | None = None,
+    extra_metadata: dict | None = None,
+    created_at: datetime | None = None,
 ) -> str | None:
     """Create a Memory from an ExtractedItem and write it to the store.
 
@@ -51,6 +54,16 @@ def commit_item(
         gains an ``image_shas`` field so search and recall surfaces can
         find image-bearing memories without re-walking the buffer.
 
+    extra_metadata:
+        Optional keys merged into the memory's metadata (the extraction backfill's
+        ``extraction_backfill`` source time-range marker, #523).
+
+    created_at:
+        Optional creation time for the memory instead of now: the extraction backfill
+        back-dates a memory to the conversation it came from (#523), so it does not reset
+        the time since the user last spoke. It survives the pending queue and the gate
+        (``Memory.to_dict`` / ``from_dict``). The pipeline passes neither argument.
+
     Returns the new memory's id, or None if creation fails.
     """
     try:
@@ -66,6 +79,10 @@ def commit_item(
             emotions=dict(item.emotions) if item.emotions else {},
             metadata=metadata,
         )
+        if extra_metadata:
+            memory.metadata.update(extra_metadata)
+        if created_at is not None:
+            memory.created_at = created_at
         from brain.memory.pending import route_write
 
         # route_write self-classifies by item.label (variable memory_type):

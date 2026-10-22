@@ -150,7 +150,8 @@ def test_without_a_store_no_extraction_is_attempted_and_the_rollover_proceeds(wo
 
 
 def test_the_report_says_whether_the_extraction_completed():
-    assert IngestReport(session_id="s").completed is True
+    assert IngestReport(session_id="s", reached_end=True).completed is True
+    assert IngestReport(session_id="s").completed is False  # #523: a report that did not reach the end is not completed
     assert IngestReport(session_id="s", busy=True).completed is False
     assert IngestReport(session_id="s", deferred=True).completed is False
     assert IngestReport(session_id="s", errors=1).completed is False

@@ -93,7 +93,10 @@ def test_every_sync_route_but_health_is_a_counted_stop_task(tmp_path: Path):
     sync = [r for r in routes if not inspect.iscoroutinefunction(r.endpoint)]
     uncounted = {r.path for r in sync if not hasattr(r.endpoint, "__wrapped__")}
     assert len(sync) > 5 and uncounted == {"/health"}, uncounted
-    assert {"/sessions/active", "/kindled-link/my-code"} <= {r.path for r in sync}
+    assert "/kindled-link/my-code" in {r.path for r in sync}
+    # #523: GET /sessions/active is a coroutine route (it streams keep-alive bytes), so the route class does not wrap it;
+    # its rollover is counted by `tracked_to_thread("sessions active", ...)`, pinned by the next test.
+    assert "/sessions/active" in {r.path for r in routes if inspect.iscoroutinefunction(r.endpoint)}
 
 
 def test_a_sessions_active_rollover_is_a_counted_stop_task_while_it_runs(tmp_path: Path, monkeypatch):
@@ -116,4 +119,5 @@ def test_a_sessions_active_rollover_is_a_counted_stop_task_while_it_runs(tmp_pat
     with client:
         r = client.get("/sessions/active", headers=_AUTH)
     assert r.status_code == 200 and r.json() == {"session_id": "new-session"}, r.text
-    assert any("/sessions/active" in label for label in seen[0]), seen
+    # the label of the worker thread the route starts through `tracked_to_thread` (#523), not a route-class label
+    assert any("sessions active" in label for label in seen[0]), seen

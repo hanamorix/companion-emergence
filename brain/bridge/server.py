@@ -24,6 +24,7 @@ import contextlib
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -46,7 +47,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field, StrictBool
 
@@ -95,6 +96,7 @@ from brain.persona_config import PersonaConfig
 from brain.tools.dispatch import dispatch
 from brain.update.overlay import loaded_overlay
 from brain.utils.atomic_write import save_with_backup_text
+from brain.utils.log_throttle import warn_throttled
 
 logger = logging.getLogger(__name__)
 
@@ -561,6 +563,8 @@ def _snapshot_session_blocking(
 
     Non-destructive: the replay buffer is NOT deleted after extraction.
     Uses a cursor sidecar to extract only turns added since the last snapshot.
+    One chunk per call (#523, ``max_chunks=1``): this request holds the session's in-flight lock and uses the chat-tier
+    provider, so it makes no more model calls than before chunking; the snapshot sweep takes the rest at the next lull.
     Same per-call store pattern as _close_session_blocking.
     """
     from contextlib import ExitStack
@@ -580,6 +584,7 @@ def _snapshot_session_blocking(
                 store=store,
                 hebbian=hebbian,
                 provider=provider,
+                max_chunks=1,
             )
         except cli_throttle.ShutdownDeferred:
             return IngestReport(session_id=session_id, deferred=True)  # #456 x #473: see _close_session_blocking
@@ -594,8 +599,164 @@ def _snapshot_session_blocking(
 _STREAM_KEEPALIVE_SECONDS = tunables.register("bridge.stream_keepalive_seconds", 15.0)
 
 
+# The smallest keepalive interval an override may set: a frame or a space more often than once a second only keeps the event
+# loop busy, and the idle cuts it guards against are about a minute (the client's 60 s WS budget, WKWebView's ~60 s idle cut).
+_STREAM_KEEPALIVE_FLOOR_SECONDS = 1.0
+
+
 def _stream_keepalive_seconds() -> float:
-    return tunables.get_tunable("bridge.stream_keepalive_seconds", _STREAM_KEEPALIVE_SECONDS)
+    """The keepalive interval: a ``tunables.json`` override when usable, else the default. Zero, a negative or a non-finite override would make
+    the streams send frames or spaces in a tight loop: it is ignored (one warning) for the default; a positive value below
+    ``_STREAM_KEEPALIVE_FLOOR_SECONDS`` is raised to it. A bool is rejected by ``get_tunable`` (wrong type)."""
+    default = _STREAM_KEEPALIVE_SECONDS
+    value = float(tunables.get_tunable("bridge.stream_keepalive_seconds", default))
+    if value == default:
+        return default  # the code's own value (tests may set it smaller to run fast); the checks below are for overrides
+    if not math.isfinite(value) or value <= 0:
+        warn_throttled(
+            logger,
+            "bridge.stream_keepalive_seconds",
+            "tunables: override 'bridge.stream_keepalive_seconds'=%r is not a positive number; using %s",
+            value,
+            default,
+            exc_info=False,
+        )
+        return default
+    return max(value, _STREAM_KEEPALIVE_FLOOR_SECONDS)
+
+
+# GET /sessions/active: a session whose last turn is younger than this is attach-eligible. 24 hours mirrors the supervisor's
+# ``finalize_after_hours`` default (deliberately hardcoded rather than wired through a config knob): an older buffer is rolled
+# over instead of attached, so the renderer never attaches to a session the finalize tick is about to act on.
+_ATTACH_MAX_AGE_HOURS = 24.0
+
+
+def _sessions_active_blocking(persona_dir: Path, persona: str, provider: LLMProvider) -> dict[str, str | None]:
+    """The whole launch decision of ``GET /sessions/active`` (#523): blocks; run in a worker thread.
+
+    Returns ``{"session_id": <the most-recent-turn session that is still attach-eligible>}``. When there is none but a stale
+    buffer exists (its last turn is older than ``_ATTACH_MAX_AGE_HOURS``), the most-recently-active stale buffer (tie-break:
+    the lexicographically-largest sid, so the choice is deterministic) is rolled over (1c-A): its extraction runs to the end,
+    chunk by chunk (a launch after a long never-extracted evening is slower, so that the new session still opens with the
+    summary of the old one), then everything is folded and archived, the old buffer is
+    deleted, and the NEW session id (seeded with the summary alone) is returned. Otherwise ``{"session_id": None}``.
+
+    Everything that reads a file or opens SQLite happens here, off the event loop; the memory store and Hebbian matrix are
+    opened and closed in this thread (no SQLite object crosses threads). Any exception, ``ShutdownDeferred`` and
+    ``ThrottleDeferred`` included, is answered ``{"session_id": None}``: the app then starts a fresh session.
+    """
+    from contextlib import ExitStack
+
+    from brain.chat.rollover import perform_rollover
+    from brain.ingest.buffer import list_active_sessions, read_session
+
+    stale_sid: str | None = None
+    try:
+        now = datetime.now(UTC)
+        best_sid: str | None = None
+        best_ts: datetime | None = None
+        stale_ts: datetime | None = None
+        for sid in list_active_sessions(persona_dir):
+            try:
+                turns = read_session(persona_dir, sid)
+            except (ValueError, OSError):
+                # Defensive: a malformed session_id on disk or unreadable
+                # file shouldn't take the endpoint down. Skip and move on.
+                continue
+            if not turns:
+                continue
+            raw_ts = turns[-1].get("ts")
+            if not raw_ts:
+                # Defensive — ingest_turn always writes a ts, so this
+                # should not happen in practice. Skip.
+                continue
+            try:
+                last = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=UTC)
+            except (ValueError, TypeError):
+                continue
+            age_hours = (now - last).total_seconds() / 3600.0
+            if age_hours >= _ATTACH_MAX_AGE_HOURS:
+                if stale_ts is None or last > stale_ts or (last == stale_ts and sid > (stale_sid or "")):
+                    stale_ts = last
+                    stale_sid = sid
+                continue
+            if best_ts is None or last > best_ts:
+                best_ts = last
+                best_sid = sid
+
+        if best_sid is not None:
+            return {"session_id": best_sid}
+        if stale_sid is None:
+            return {"session_id": None}
+        with ExitStack() as stack:
+            store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+            stack.callback(store.close)
+            hebbian = HebbianMatrix(persona_dir / "hebbian.db")
+            stack.callback(hebbian.close)
+            new_sid = perform_rollover(
+                persona_dir, stale_sid, persona,
+                seed_mode="summary_only", now=now, provider=provider,
+                store=store, hebbian=hebbian,
+            )
+        return {"session_id": new_sid}
+    except Exception:
+        logger.exception("sessions_active: launch decision failed stale_sid=%s", stale_sid)
+        return {"session_id": None}
+
+
+def _sessions_active_task_done(state: BridgeAppState, task: asyncio.Future) -> None:
+    """Done-callback of the shared launch-decision task: frees the slot (only if it still holds this task) and always
+    retrieves the task's exception, so a task whose every client went away never logs "exception was never retrieved"."""
+    if state.sessions_active_task is task:
+        state.sessions_active_task = None
+    if not task.cancelled():
+        task.exception()
+
+
+def _shared_sessions_active_task(state: BridgeAppState) -> asyncio.Future:
+    """The ONE in-flight launch decision for this persona: the running task, or a new one (#523).
+
+    A second ``GET /sessions/active`` while a rollover runs (the app's one replay after a cut connection, the panel's
+    send-time call, a second panel) awaits the same task and gets the same answer instead of finding the extraction lock
+    held and answering null. The task is not any request's own, so a client that goes away does not cancel the work;
+    ``tracked_to_thread`` counts it for the shutdown (#456/#458). Runs on the event loop with no ``await`` between the lookup
+    and the create, so two requests cannot both create one. A done task counts as absent (its done-callback is scheduled with
+    ``call_soon``, so it may not have cleared the slot yet); the slot is cleared only by that callback.
+    """
+    task = state.sessions_active_task
+    if task is not None and not task.done():
+        return task
+    task = asyncio.ensure_future(
+        tracked_to_thread(
+            "sessions active", _sessions_active_blocking, state.persona_dir, state.persona, state.provider
+        )
+    )
+    state.sessions_active_task = task
+    task.add_done_callback(lambda t: _sessions_active_task_done(state, t))
+    return task
+
+
+async def _sessions_active_body(task: asyncio.Future) -> AsyncIterator[bytes]:
+    """The streamed body of ``GET /sessions/active``: one space every ``bridge.stream_keepalive_seconds`` while the launch
+    decision runs, then its JSON (leading whitespace is valid JSON, so ``r.json()`` parses it unchanged). The spaces keep a
+    long launch rollover from being cut as idle (WKWebView cuts an idle request at about 60 s; see ``_MODEL_CHECK_TIMEOUT_S``).
+    A fast decision's JSON is the first and only body message. The status (200) is sent before the first byte, so a failure
+    after that, including a refused ``tracked_to_thread`` registration landing on the task, is answered with
+    ``{"session_id": null}`` here, never a cut body."""
+    interval = _stream_keepalive_seconds()
+    while True:
+        try:
+            result = await asyncio.wait_for(asyncio.shield(task), timeout=interval)
+            break
+        except TimeoutError:
+            yield b" "
+        except Exception:
+            logger.warning("sessions_active: the launch decision raised; answering null", exc_info=True)
+            result = {"session_id": None}
+            break
+    yield json.dumps(result).encode()
 
 
 def _chat_error_code(exc: BaseException) -> str:
@@ -1102,6 +1263,8 @@ class BridgeAppState:
     migration_thread: Any | None = None  # compaction-backlog-migration (None when background threads are off)
     auth_token: str | None = None
     shutdown_controller: BridgeShutdownController | None = None
+    # #523: the one in-flight launch decision of GET /sessions/active (``_shared_sessions_active_task``); None when idle.
+    sessions_active_task: asyncio.Future | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1742,90 +1905,18 @@ def build_app(
         )
 
     @app.get("/sessions/active", dependencies=[Depends(require_http_auth)])
-    def sessions_active_endpoint() -> dict[str, str | None]:
-        """Return the most-recent-turn session_id that's still attach-eligible.
+    async def sessions_active_endpoint() -> StreamingResponse:
+        """Return the session the app should attach to on launch: ``{"session_id": "<uuid>"}`` or ``{"session_id": null}``.
 
-        "Attach-eligible" = the session's last turn is younger than the
-        24h finalize threshold (matches the supervisor's
-        ``finalize_after_hours`` default in brain.bridge.supervisor —
-        deliberately hardcoded rather than wired through a config knob).
-        Older buffers will be cleaned up by the next supervisor finalize
-        tick; returning them would invite a race where the renderer
-        attaches and then immediately has the session deleted.
-
-        Response: ``{"session_id": "<uuid>"}`` or ``{"session_id": null}``.
+        The decision (``_sessions_active_blocking``: the attach-eligible session, or the rollover of a stale buffer, whose
+        extraction runs to the end, #523) runs in a worker thread as ONE shared task per persona
+        (``_shared_sessions_active_task``): a request that arrives while it runs waits for the same answer. On the event loop
+        this route only looks the task up and streams: one space every ``bridge.stream_keepalive_seconds`` until the task is
+        done, then the JSON (``_sessions_active_body``), so a launch rollover that takes minutes is not cut as idle. Always
+        200 ``application/json``; the fast paths answer in milliseconds with the JSON as the only body message.
         """
-        from contextlib import ExitStack
-
-        from brain.chat.rollover import perform_rollover
-        from brain.ingest.buffer import list_active_sessions, read_session
-
         s: BridgeAppState = app.state.bridge
-        now = datetime.now(UTC)
-        # 24 hours mirrors supervisor.finalize_after_hours default — sessions
-        # older than this are eligible for finalize and may disappear on
-        # the next sweep, so don't advertise them as attachable.
-        _ATTACH_MAX_AGE_HOURS = 24.0  # noqa: N806 — local frozen constant
-        best_sid: str | None = None
-        best_ts: datetime | None = None
-        # Stale (idle > threshold) selection for the 1c-A rollover: roll over the
-        # MOST-RECENTLY-ACTIVE stale buffer (the one the user most plausibly
-        # continues); tie-break the lexicographically-largest sid (stage-3 A1-b).
-        stale_sid: str | None = None
-        stale_ts: datetime | None = None
-        for sid in list_active_sessions(s.persona_dir):
-            try:
-                turns = read_session(s.persona_dir, sid)
-            except (ValueError, OSError):
-                # Defensive: a malformed session_id on disk or unreadable
-                # file shouldn't take the endpoint down. Skip and move on.
-                continue
-            if not turns:
-                continue
-            raw_ts = turns[-1].get("ts")
-            if not raw_ts:
-                # Defensive — ingest_turn always writes a ts, so this
-                # should not happen in practice. Skip.
-                continue
-            try:
-                last = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
-                if last.tzinfo is None:
-                    last = last.replace(tzinfo=UTC)
-            except (ValueError, TypeError):
-                continue
-            age_hours = (now - last).total_seconds() / 3600.0
-            if age_hours >= _ATTACH_MAX_AGE_HOURS:
-                if stale_ts is None or last > stale_ts or (last == stale_ts and sid > (stale_sid or "")):
-                    stale_ts = last
-                    stale_sid = sid
-                continue
-            if best_ts is None or last > best_ts:
-                best_ts = last
-                best_sid = sid
-
-        if best_sid is not None:
-            return {"session_id": best_sid}
-
-        # No attach-eligible session — if a stale buffer exists, SYNC-roll it over
-        # (extract → fold everything → archive → delete old buffer → seed a
-        # summary-only head) and return the NEW session id (1c-A, owner-ratified).
-        if stale_sid is not None:
-            try:
-                with ExitStack() as stack:
-                    store = MemoryStore(s.persona_dir / "memories.db", integrity_check=False)
-                    stack.callback(store.close)
-                    hebbian = HebbianMatrix(s.persona_dir / "hebbian.db")
-                    stack.callback(hebbian.close)
-                    new_sid = perform_rollover(
-                        s.persona_dir, stale_sid, s.persona,
-                        seed_mode="summary_only", now=now, provider=s.provider,
-                        store=store, hebbian=hebbian,
-                    )
-                return {"session_id": new_sid}
-            except Exception:
-                logger.exception("sessions_active: stale rollover failed sid=%s", stale_sid)
-                return {"session_id": None}
-        return {"session_id": None}
+        return StreamingResponse(_sessions_active_body(_shared_sessions_active_task(s)), media_type="application/json")
 
     @app.get("/state/{session_id}", dependencies=[Depends(require_http_auth)])
     def state_endpoint(session_id: str) -> dict[str, Any]:
@@ -3416,12 +3507,14 @@ def build_app(
             soul_candidates=report.soul_candidates,
             soul_queue_errors=report.soul_queue_errors,
             errors=report.errors,
+            chunks=report.chunks,
         )
         return {
             "session_id": sid,
             "closed": False,
             "deferred": report.deferred,
             "busy": report.busy,
+            "chunks": report.chunks,
             "committed": report.committed,
             "enqueued": report.enqueued,
             "deduped": report.deduped,
@@ -3517,8 +3610,9 @@ def build_app(
                     errors=report.errors,
                 )
                 # Extraction failures AND commit failures deliberately retain
-                # the JSONL buffer for retry (close_session gates the delete
-                # on report.commit_failures == 0). Do not remove the in-memory
+                # the JSONL buffer for retry (close_session deletes it only when
+                # report.reached_end: every chunk committed and no row arrived
+                # during the pass, #523). Do not remove the in-memory
                 # session or drop its lock entry, otherwise the retry path
                 # turns into 404 while the client was told nothing actionable.
                 raise HTTPException(
@@ -3536,10 +3630,11 @@ def build_app(
                     },
                 )
 
-            if report.deferred or report.busy:
-                # #473, #477: "not now", not a failure. The pass left the buffer and the cursor as they were, so the
-                # session stays registered (it is still on disk, and a retry or the sweep will take it) and the
-                # response says so instead of claiming the close happened.
+            if report.deferred or report.busy or not report.reached_end:
+                # #473, #477: "not now", not a failure. The pass left the buffer on disk (a deferral or a busy pass; or,
+                # #523, rows arrived while the close ran, so the buffer was kept with them after the cursor), so the
+                # session stays registered (a retry or the sweep will take it) and the response says so instead of
+                # claiming the close happened.
                 events.publish(
                     "session_close_deferred",
                     session_id=sid,

@@ -241,8 +241,16 @@ def test_a_raising_extraction_is_counted_and_the_third_one_poisons(world, monkey
     _seed(persona, "sess_old", 0, 10)
     write_cursor(persona, "sess_old", _ts(3))
 
+    real = extract_session_snapshot
+    raised = {"n": 0}
+
     def boom(*a, **k):
-        raise RuntimeError("the store is locked")
+        # #523: the first three extractions raise; the extraction the rollover runs after the set-aside (over the chunks after
+        # the failing one, none here) is the real one, so the rollover can go on.
+        if raised["n"] < 3:
+            raised["n"] += 1
+            raise RuntimeError("the store is locked")
+        return real(*a, **k)
 
     monkeypatch.setattr("brain.ingest.pipeline.extract_session_snapshot", boom)
     assert _roll(world, _Provider()) is None

@@ -776,6 +776,7 @@ const JOB_DESCRIPTORS: Record<string, string> = {
   rerank_width_remeasure: "re-scoring cost check",
   cosine_floor_bootstrap: "similarity pass mark setup",
   rerank_floor_bootstrap: "re-scoring pass mark setup",
+  extraction_backfill: "conversation memory backfill",
   maintenance: "maintenance",
   interest_sweep: "interest review",
   self_model_articulation: "self-description update",

@@ -112,4 +112,5 @@ def test_a_real_failure_still_reaches_the_poison_queue(parts):
     provider = _Broken(RuntimeError("boom"))
     for _ in range(6):
         finalize_stale_sessions(persona, store=store, hebbian=hebbian, provider=provider)
-    assert (persona / "active_conversations" / "poison" / "s1.jsonl").exists()
+    # #523: finalize sets aside the failing chunk (here the whole one-row span) in poison/<sid>.span.jsonl; the buffer stays.
+    assert (persona / "active_conversations" / "poison" / "s1.span.jsonl").exists()

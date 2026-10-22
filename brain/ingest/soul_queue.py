@@ -74,6 +74,19 @@ def queue_soul_candidate(
     ) is not None
 
 
+def is_soul_candidate_queued(persona_dir: Path, *, session_id: str, text: str) -> bool:
+    """True when a candidate with this session id and text is already in the queue, whatever its status or memory id.
+
+    The memory id cannot tell a repeat apart: an extraction that runs again over the same rows (a run killed after its commits
+    but before its progress was saved) mints a new id for the same text. Tolerates a malformed line and a missing file.
+    """
+    return any(
+        rec.get("session_id") == session_id and rec.get("text") == text
+        for rec in read_jsonl(_soul_candidates_path(persona_dir))
+        if isinstance(rec, dict)
+    )
+
+
 def list_soul_candidates(persona_dir: Path) -> list[dict]:
     """Read all candidates from soul_candidates.jsonl, skipping malformed lines."""
     return read_jsonl(_soul_candidates_path(persona_dir), recover=Recovery.RAISE)
