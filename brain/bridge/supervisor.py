@@ -550,7 +550,7 @@ def run_folded(
             # This tick, and voice-reflection/maker/notes below, each build their
             # OWN `background-generative` tier provider (#154) rather than reusing
             # the bare ambient `provider`, so the job runs the model of its own
-            # tunables line (`model.background_generative`), not the chat model's.
+            # setting (`model.background_generative`), not the chat model's.
             # Soul-review cadence — PERSISTED + self-pacing. Unlike the monotonic
             # timers, soul_review_state.json survives restart/sleep, so the 6h
             # interval can't be reset to zero by an app quit/reboot (the defect that

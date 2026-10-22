@@ -170,7 +170,7 @@ def _make_default_tagger(provider: LLMProvider | None, persona_dir: Path | None 
     """Return a tagger closure that calls ``provider.generate`` for each memory.
 
     When ``provider`` is None, constructs a ``ClaudeCliProvider`` for the
-    background-classifier job (the model its tunables line names), mirroring the
+    background-classifier job (the model its setting in tunables.toml names), mirroring the
     ``_call_haiku`` pattern in ``brain/attunement/detector.py``.
     """
     if provider is None:

@@ -976,7 +976,7 @@ class HeartbeatEngine:
 
         dream is `background-generative` tier (routed through the model-tier
         accessor, #154): it runs the model of the `model.background_generative`
-        tunables line, not the chat model's. Same applies to `_try_fire_reflex`
+        setting, not the chat model's. Same applies to `_try_fire_reflex`
         and `_try_fire_research` below. See `brain/bridge/model_tier.py`'s
         module docstring."""
         # Lazy import to avoid module-level circular dependency with dream.py

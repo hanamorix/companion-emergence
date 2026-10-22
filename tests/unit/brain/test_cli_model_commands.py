@@ -59,6 +59,37 @@ def test_set_sonnet_when_the_value_already_is_the_default_says_so_and_leaves_the
     assert "already the default" in capsys.readouterr().out
 
 
+def test_set_the_default_over_an_unusable_text_says_now_not_already_the_default(capture_claude_argv, capsys) -> None:
+    """Rev-4 review S5: the file held text that is no model; the job ran the default, but picking the default changed the file."""
+    tunables.set_values({_CHAT: "banana"})
+    assert _run(["set", "sonnet"]) == 0
+    assert tunables.get_raw(_CHAT) == "claude-sonnet-5"
+    out = capsys.readouterr().out
+    assert "chat model is now claude-sonnet-5." in out and "already" not in out
+
+
+def test_set_the_default_over_a_rejected_id_says_now_not_already_the_default(capture_claude_argv, capsys) -> None:
+    from brain.bridge.model_tier import TIER_INTERACTIVE_CHAT
+    from brain.bridge.provider import ClaudeCliProvider
+
+    capture_claude_argv.reject("claude-sonnet-4-9")
+    tunables.set_values({_CHAT: "claude-sonnet-4-9"})
+    with pytest.raises(Exception):  # noqa: B017 - the rejection is what starts the fallback
+        ClaudeCliProvider(TIER_INTERACTIVE_CHAT).generate("x")
+    capsys.readouterr()
+    assert _run(["set", "sonnet"]) == 0
+    assert tunables.get_raw(_CHAT) == "claude-sonnet-5"
+    out = capsys.readouterr().out
+    assert "chat model is now claude-sonnet-5." in out and "already" not in out
+
+
+def test_set_a_value_the_file_already_holds_still_says_already(capture_claude_argv, capsys) -> None:
+    tunables.set_values({_CHAT: "haiku"})
+    capsys.readouterr()
+    assert _run(["set", "haiku"]) == 0
+    assert "chat model is already haiku." in capsys.readouterr().out
+
+
 def test_set_opus_writes_the_opus_id_after_one_probe(capture_claude_argv, capsys) -> None:
     assert _run(["set", "opus"]) == 0
     assert _overrides()[_CHAT] == "claude-opus-5"

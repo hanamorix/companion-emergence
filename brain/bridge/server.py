@@ -645,6 +645,27 @@ _SETTING_MODULES: tuple[str, ...] = (
     "brain.memory.relevance_judge",
 )
 
+
+def _import_setting_modules() -> list[str]:
+    """Import every module of ``_SETTING_MODULES`` one at a time and return the names that failed.
+
+    Each import is its own ``try``: one module that cannot be imported (a missing optional dependency, a broken file) must
+    not stop the others from registering their settings, nor the boot pass from running. The failure is logged here.
+    """
+    import importlib
+
+    failed: list[str] = []
+    for name in _SETTING_MODULES:
+        try:
+            importlib.import_module(name)
+        except Exception as exc:  # noqa: BLE001 - any failure of one import; the rest still load
+            failed.append(name)
+            logger.warning(
+                "tunables boot pass: could not import %s (%s); its settings are not in the file until a process that imports it syncs",
+                name, exc,
+            )
+    return failed
+
 # Save-time check of a newly chosen model id (#440): one tiny real call, so a typo is refused with a specific
 # message instead of failing later inside the jobs that use it. The budget is for the whole save. The app's request has no timeout of its own (bridge.ts
 # `bridgeFetch` sets no AbortSignal), so the limit that applies is the webview's network stack: WKWebView
@@ -1121,7 +1142,7 @@ def build_app(
         # the EventBus, the supervisor thread, and the idle watcher.
         #
         # The chat job (#154) is built like every other job: the persona's provider kind, and the model its
-        # install-wide `model.interactive_chat` tunables line names, looked up on every call (nothing is
+        # install-wide `model.interactive_chat` setting names, looked up on every call (nothing is
         # held on this provider, so a settings change reaches the next turn without a restart).
         provider = build_tier_provider(persona_dir, TIER_INTERACTIVE_CHAT)
 
@@ -1159,30 +1180,31 @@ def build_app(
         # setting, add the ones a new version registered, move a value that still equals its old default onto the new
         # default. Fail-soft: sync_file swallows its own errors; belt-and-braces here so an import problem can't block
         # startup either. An unreadable file is left alone and reported with its line.
+        _registry_complete = False
         try:
-            import importlib
-
             from brain.tunables import sync_file
 
             # Importing a module is what registers its settings, and the pass writes only what is registered in THIS
             # process. These modules are otherwise loaded lazily (by the supervisor, an upload, a weekly tick), so import
             # them first: the file then lists every setting from the first boot (a test compares it with a scan of every
-            # register call, so a module missing here fails it).
-            for _module in _SETTING_MODULES:
-                importlib.import_module(_module)
+            # register call, so a module missing here fails it). Each import is isolated, so one that fails is logged and
+            # the pass still runs; the old-file fold below then treats the registry as incomplete.
+            _registry_complete = not _import_setting_modules()
             sync_file()
         except Exception as _exc:  # noqa: BLE001
+            _registry_complete = False
             logger.warning("tunables boot pass skipped: %s", _exc)
 
         # Backward compatibility, permanent: an old JSON settings file at KINDLED_HOME (NOT under this persona's directory:
         # an earlier version of this call passed persona_dir and silently migrated nothing) is folded into tunables.toml and
         # renamed. After the boot pass, before the persona-model fold below, and before the supervisor thread starts, so
-        # no code can read a stale key. The bridge imports every module, so it folds the whole file.
+        # no code can read a stale key. The bridge imports every module, so it folds the whole file; when a module could not
+        # be imported above, the registry is incomplete and the fold waits (all-or-nothing), so no setting is discarded for it.
         try:
             from brain import paths as _home_paths
             from brain.tunables_migration import migrate_legacy_json
 
-            migrate_legacy_json(_home_paths.get_home(), complete_registry=True)
+            migrate_legacy_json(_home_paths.get_home(), complete_registry=_registry_complete)
         except Exception as _exc:  # noqa: BLE001 - startup must not break on the fold
             logger.warning("old settings file fold skipped: %s", _exc)
 

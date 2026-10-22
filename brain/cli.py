@@ -2650,16 +2650,18 @@ def _model_set_handler(args: argparse.Namespace) -> int:
         MODEL_ID_RULE,
         TIER_INTERACTIVE_CHAT,
         is_valid_model,
-        model_for_tier,
+        setting_would_change,
     )
 
     if not is_valid_model(args.model):
         print(f"error: {args.model!r} is not a valid model: {MODEL_ID_RULE}", file=sys.stderr)
         return 1
     _run_model_migration()
-    before = model_for_tier(TIER_INTERACTIVE_CHAT)
+    # Judged on what the settings file holds, not on the model that runs now: a file holding a rejected or unusable id runs
+    # the shipped default, and picking that default is still a change.
+    unchanged = not setting_would_change(TIER_INTERACTIVE_CHAT, args.model)
     status, body = asyncio.run(server_mod._apply_chat_model(args.model, check=True, lock=asyncio.Lock()))
-    return _model_set_report(args.model, status, body, unchanged=body.get("model") == before)
+    return _model_set_report(args.model, status, body, unchanged=unchanged)
 
 
 def _model_set_report(model: str, status: int, body: dict, *, unchanged: bool = False) -> int:

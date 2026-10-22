@@ -485,23 +485,9 @@ def _real_tunable_keys() -> frozenset[str]:
     """Every literal key a ``tunables.register`` call in brain/ declares (an AST scan, once per session)."""
     global _REAL_TUNABLE_KEYS
     if _REAL_TUNABLE_KEYS is None:
-        import ast
+        from tests.tunables_file import registered_literal_keys
 
-        keys: set[str] = set()
-        for path in (Path(__file__).resolve().parents[1] / "brain").rglob("*.py"):
-            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-                if (
-                    isinstance(node, ast.Call)
-                    and node.args
-                    and isinstance(node.args[0], ast.Constant)
-                    and isinstance(node.args[0].value, str)
-                    and (
-                        (isinstance(node.func, ast.Attribute) and node.func.attr == "register"
-                         and isinstance(node.func.value, ast.Name) and node.func.value.id == "tunables")
-                        or (path.name == "tunables.py" and isinstance(node.func, ast.Name) and node.func.id == "register")
-                    )
-                ):
-                    keys.add(node.args[0].value)
+        keys = registered_literal_keys(Path(__file__).resolve().parents[1])
         _REAL_TUNABLE_KEYS = frozenset(keys)
     return _REAL_TUNABLE_KEYS
 

@@ -90,7 +90,7 @@ TIER_BACKGROUND_GENERATIVE = "background-generative"
 TIER_BACKGROUND_HOUSEKEEPING = "background-housekeeping"
 
 # ---------------------------------------------------------------------------
-# The Claude jobs: ONE tunables line each. (job type) -> (tunables key, shipped default model)
+# The Claude jobs: ONE setting in tunables.toml each. (job type) -> (tunables key, shipped default model)
 # ---------------------------------------------------------------------------
 # This table is the DEFINITION of the shipped defaults, read by model_for_tier on every call. Nothing else in the code
 # holds a model id. The `description=` on each line says what the job IS: it is what a person reads above the setting in
@@ -286,7 +286,7 @@ TIER_RERANKER = "reranker"
 # why this tier loads via torch instead of the ONNX path the other two use.
 TIER_RELEVANCE_JUDGE = "relevance-judge"
 
-# The non-Claude tiers' model ids (embedder, reranker, relevance judge): plain constants, no tunables line.
+# The non-Claude tiers' model ids (embedder, reranker, relevance judge): plain constants, no setting in tunables.toml.
 LOCAL_MODEL_IDS: dict[str, str] = {
     TIER_EMBEDDING: MODEL_EMBEDDING,
     TIER_RERANKER: MODEL_RERANKER,
@@ -425,6 +425,21 @@ def choice_for(model: str | None) -> str | None:
     return None
 
 
+def setting_would_change(tier: str, value: str) -> bool:
+    """Would picking ``value`` change what the settings file holds for this job? A pure read.
+
+    Compares the FILE's setting (an absent entry counts as the shipped default), not the model the job runs now: a job whose
+    file holds an unusable or Claude-rejected id runs its shipped default, yet picking that default still changes the file.
+    ``value`` is a picker word or a typed id; one that is not a usable model setting raises ``ValueError``.
+    """
+    key, default = _CLAUDE_JOBS[tier]
+    wanted = resolve_choice(value)
+    if wanted is None:
+        raise ValueError(f"{value!r} is not a usable model setting ({MODEL_ID_RULE})")
+    raw = tunables.get_raw(key)
+    return (default if raw is None else raw) != wanted
+
+
 def set_job_models(updates: dict[str, str | None], *, only_if_default: bool = False) -> dict[str, str]:
     """Write the model setting of one or more jobs IN PLACE; the ONLY caller of ``tunables.set_values`` for model keys.
 
@@ -483,7 +498,7 @@ def _provider_kind(persona_dir: Path) -> str:
 
     The kind is never guessed from an unreadable file (a local-model persona's prompts must not go to Claude on a
     transient error), so a read error propagates. No file means the default kind. The persona file no longer holds a
-    model: the model comes from the job's tunables line.
+    model: the model comes from the job's setting in tunables.toml.
     """
     from brain.persona_config import DEFAULT_PROVIDER, PersonaConfig
 
@@ -493,7 +508,7 @@ def _provider_kind(persona_dir: Path) -> str:
 
 def build_tier_provider(persona_dir: Path, tier: str) -> Any:
     """The provider a given job should use: the persona's provider *kind* (claude-cli / ollama / fake), running the
-    model the job's tunables line names (resolved at every call, not at construction).
+    model the job's setting in tunables.toml names (resolved at every call, not at construction).
 
     Generalizes ``build_compaction_provider``/``build_self_model_provider``: same shape, parametrized by job type.
     The function-scoped import of ``get_provider`` is the #154 test seam (a test that patches

@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.tunables_file import register_calls, register_calls_in_source
+
 REPO = Path(__file__).resolve().parents[3]
 BRAIN = REPO / "brain"
 
@@ -26,21 +28,8 @@ MODEL_ID = re.compile(r"claude-[a-z0-9.-]*\d")
 
 
 def _register_calls() -> list[tuple[str, int, ast.Call]]:
-    """Every ``tunables.register(...)`` call under brain/, plus the bare ``register(...)`` call inside tunables.py."""
-    found: list[tuple[str, int, ast.Call]] = []
-    for path in sorted(BRAIN.rglob("*.py")):
-        if "__pycache__" in path.parts:
-            continue
-        rel = path.relative_to(REPO).as_posix()
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            if not isinstance(node, ast.Call):
-                continue
-            f = node.func
-            if isinstance(f, ast.Attribute) and f.attr == "register" and isinstance(f.value, ast.Name) and f.value.id == "tunables":
-                found.append((rel, node.lineno, node))
-            elif rel == "brain/tunables.py" and isinstance(f, ast.Name) and f.id == "register":
-                found.append((rel, node.lineno, node))
-    return found
+    """Every call of ``brain.tunables.register`` under brain/, however the module or the function was imported (rev-4 S7)."""
+    return register_calls(REPO)
 
 
 def _has_description(call: ast.Call) -> bool:
@@ -61,6 +50,53 @@ def test_the_scan_finds_the_registrations_at_all() -> None:
 def test_every_register_call_passes_a_description() -> None:
     missing = [f"{rel}:{line}" for rel, line, call in _register_calls() if not _has_description(call)]
     assert not missing, "tunables.register(...) without description=:\n  " + "\n  ".join(missing)
+
+
+_ALIASED = {
+    "module imported under another name": "from brain import tunables as t\nX = t.register('zz.a', 1, description='A.')\n",
+    "dotted module import with an alias": "import brain.tunables as bt\nX = bt.register('zz.a', 1, description='A.')\n",
+    "dotted module import, full path call": "import brain.tunables\nX = brain.tunables.register('zz.a', 1, description='A.')\n",
+    "function imported by name": "from brain.tunables import register\nX = register('zz.a', 1, description='A.')\n",
+    "function imported under another name": "from brain.tunables import register as reg\nX = reg('zz.a', 1, description='A.')\n",
+    "relative module import": "from .. import tunables\nX = tunables.register('zz.a', 1, description='A.')\n",
+    "relative function import": "from ..tunables import register\nX = register('zz.a', 1, description='A.')\n",
+    "star import": "from brain.tunables import *\nX = register('zz.a', 1, description='A.')\n",
+    "function-local import": "def f():\n    from brain import tunables as t\n    return t.register('zz.a', 1, description='A.')\n",
+    "the usual shape": "from brain import tunables\nX = tunables.register('zz.a', 1, description='A.')\n",
+}
+
+_NOT_REGISTERS = {
+    "another module's register": "from brain import prompt_strings\nX = prompt_strings.register('zz.a')\n",
+    "a local function called register": "def register(k):\n    return k\nX = register('zz.a')\n",
+    "an unrelated object": "import atexit\natexit.register(print)\n",
+    "tunables.get_tunable": "from brain import tunables\nX = tunables.get_tunable('zz.a', 1)\n",
+}
+
+
+@pytest.mark.parametrize("name", sorted(_ALIASED))
+def test_the_scan_finds_a_register_call_however_it_was_imported(name: str) -> None:
+    found = register_calls_in_source(_ALIASED[name], "brain/memory/zz_mod.py")
+    assert len(found) == 1 and found[0].args[0].value == "zz.a", name
+
+
+@pytest.mark.parametrize("name", sorted(_NOT_REGISTERS))
+def test_the_scan_ignores_a_register_that_is_not_the_tunables_one(name: str) -> None:
+    assert register_calls_in_source(_NOT_REGISTERS[name], "brain/memory/zz_mod.py") == [], name
+
+
+def test_the_scan_reads_the_bare_register_inside_tunables_py_itself() -> None:
+    found = register_calls_in_source("def register(k, d):\n    return d\nX = register('zz.a', 1)\n", "brain/tunables.py")
+    assert len(found) == 1
+
+
+def test_a_planted_aliased_registration_in_brain_is_found_by_the_real_scan(tmp_path: Path) -> None:
+    """The mutation: a module that registers through an alias used to be invisible to every register scan."""
+    (tmp_path / "brain" / "memory").mkdir(parents=True)
+    (tmp_path / "brain" / "memory" / "zz_planted.py").write_text(
+        "from brain import tunables as t\nZ = t.register('zz.planted', 1)\n", encoding="utf-8"
+    )
+    found = register_calls(tmp_path)
+    assert [(rel, c.args[0].value, _has_description(c)) for rel, _l, c in found] == [("brain/memory/zz_planted.py", "zz.planted", False)]
 
 
 def test_a_register_call_without_a_description_would_be_caught(tmp_path: Path) -> None:

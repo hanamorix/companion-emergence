@@ -1,4 +1,4 @@
-"""Folding the retired per-persona model settings into the install-wide tunables lines (#529). Permanent backward compatibility.
+"""Folding the retired per-persona model settings into the install-wide model settings in tunables.toml (#529). Permanent backward compatibility.
 
 Before this change each persona's ``persona_config.json`` held a chat ``model`` and optional ``tier_models`` /
 ``derived_unavailable``. The model is now one install-wide setting per job in ``tunables.toml``

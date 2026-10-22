@@ -18,7 +18,7 @@ export function isChatModelAlias(value: string): boolean {
   return (CHAT_MODEL_ALIASES as readonly string[]).includes(value);
 }
 
-/** The words a save runs NO check call for: `sonnet` removes the override (the chat job's shipped default) and `haiku`
+/** The words a save runs NO check call for: `sonnet` is written as the chat job's shipped default id and `haiku`
  *  is written as the alias. `opus` is written as its full id and every full id is written as typed, so both are
  *  checked first (brain/server.py `_apply_chat_model`). KEEP IN SYNC with that rule. */
 export const CHECK_FREE_ALIASES = ["sonnet", "haiku"] as const;

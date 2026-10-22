@@ -60,7 +60,8 @@ export function ModelPicker({ current, choice, persona, onClose, allowReapply = 
   const valid = isValidChatModel(value);
   // allowReapply: the shown model is the fallback for an unsupported setting, so applying it again is how the
   // user replaces (and clears) that setting. A word equal to the highlighted choice is no change; a typed id
-  // is a change unless the model is already pinned to that very id (typing the id of a word's model pins it).
+  // is a change unless the setting already holds that very id. While a word is highlighted, typing the id of its model still counts
+  // as a change, so the save-time check runs; a value equal to the shipped default follows later default changes.
   const unchanged = isCustom ? choice === null && value === current : value === choice;
   const canApply = !busy && valid && (!unchanged || allowReapply);
   const showFormatHint = isCustom && value !== "" && !valid;

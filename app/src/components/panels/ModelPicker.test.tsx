@@ -275,7 +275,7 @@ describe("ModelPicker", () => {
     expect(applyBtn()).toBeDisabled();
   });
 
-  it("typing the id of the highlighted word's model is a change: it pins that id", async () => {
+  it("typing the id of the highlighted word's model is a change: it is checked and saved as that id", async () => {
     stubFetch(new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: true }), { status: 200 }));
     const onClose = vi.fn();
     render(<ModelPicker current="claude-sonnet-5" choice="sonnet" persona="test" onClose={onClose} />);
@@ -285,7 +285,7 @@ describe("ModelPicker", () => {
     await waitFor(() => expect(onClose).toHaveBeenCalledWith("claude-sonnet-5"));
   });
 
-  it("an unchanged word stays disabled, and a pinned custom id highlights no word", () => {
+  it("an unchanged word stays disabled, and a custom id highlights no word", () => {
     render(<ModelPicker current="claude-sonnet-4-6" choice={null} persona="test" onClose={() => {}} />);
     expect(screen.getByLabelText(/sonnet/i)).not.toBeChecked();
     expect(screen.getByLabelText(/opus/i)).not.toBeChecked();

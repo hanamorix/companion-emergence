@@ -55,6 +55,8 @@ ENV_MODEL_NAMES = re.compile(r"ANTHROPIC_MODEL|ANTHROPIC_DEFAULT_[A-Z_]*MODEL")
 CACHE_DECORATORS = frozenset({"cache", "lru_cache"})
 SINK_CALL_NAMES = frozenset({"setattr", "partial", "append", "add", "setdefault"})
 PROBE_SITE = ("bridge/server.py", "_check_model_blocking")
+# The one function outside set_job_models that may call set_values: the old-file fold, which names no key (G5).
+MIGRATION_FOLD_SITE = ("tunables_migration.py", "_fold")
 
 # (file relative to brain/, literal, shape): each entry must still match something at that shape (C19).
 G1_ALLOW: tuple[tuple[str, str, str], ...] = (
@@ -473,10 +475,12 @@ def check_g5(source: str, relpath: str) -> list[str]:
         if isinstance(node, ast.Call) and _call_name(p, node) == "set_values" and relpath != "tunables.py":
             fn = _enclosing_function(p, node)
             # The legacy-file fold writes whatever keys an old JSON settings file held, naming none of them: it is key-agnostic,
-            # so it cannot know a model key (nothing to leak). Every model-specific writer goes through set_job_models.
-            if relpath == "tunables_migration.py":
+            # so it cannot know a model key (nothing to leak). The exemption is that ONE function, not its file: a second
+            # caller there is flagged. Every model-specific writer goes through set_job_models.
+            fn_name = getattr(fn, "name", None)
+            if (relpath, fn_name) == MIGRATION_FOLD_SITE:
                 continue
-            if not (owner and getattr(fn, "name", None) == "set_job_models"):
+            if not (owner and fn_name == "set_job_models"):
                 out.append(f"G5 {relpath}:{node.lineno}: set_values called outside set_job_models")
     return out
 
@@ -636,6 +640,19 @@ def test_fixture_conforming_source_passes_every_rule(name: str) -> None:
 def test_fixture_violating_source_is_flagged(name: str) -> None:
     flagged = check_all(_VIOLATING[name], "some/module.py")
     assert flagged, f"fixture {name!r} was not flagged by any rule"
+
+
+def test_fixture_g5_exempts_the_fold_function_only_not_the_file() -> None:
+    """Rev-4 review S2: a second ``set_values`` caller inside tunables_migration.py is flagged; the fold itself passes."""
+    fold = "from brain import tunables\ndef _fold(legacy, complete):\n    tunables.set_values({'a': 1}, only_if_default=True)\n"
+    second = "from brain import tunables\ndef _another(u):\n    tunables.set_values(u)\n"
+    nested = "from brain import tunables\ndef _fold(l, c):\n    def inner(u):\n        tunables.set_values(u)\n    return inner\n"
+    module_level = "from brain import tunables\ntunables.set_values({})\n"
+    assert check_g5(fold, "tunables_migration.py") == []
+    assert check_g5(second, "tunables_migration.py") != []
+    assert check_g5(nested, "tunables_migration.py") != []
+    assert check_g5(module_level, "tunables_migration.py") != []
+    assert check_g5(fold, "other.py") != []  # the same function name elsewhere is not exempt
 
 
 def test_fixture_the_one_probe_site_may_use_probe_model() -> None:
