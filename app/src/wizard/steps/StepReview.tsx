@@ -84,7 +84,7 @@ export function StepReview({ step, totalSteps, state, preflight, onInstall, onBa
       <Row label="Persona name" value={state.personaName} mono />
       <Row label="Your name" value={state.userName || "(unset)"} mono />
       <Row label="Voice template" value={state.voiceTemplate} mono />
-      <Row label="Claude model" value={wizardInitModel(state.chatModel) ?? "(keep the default)"} mono />
+      <Row label="Claude model" value={wizardInitModel(state.chatModel) ?? "(keep the current setting)"} mono />
       {state.mode === "migrate" && (
         <Row label="OG data path" value={state.migrateFromPath} mono small />
       )}

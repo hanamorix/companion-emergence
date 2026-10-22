@@ -111,7 +111,7 @@ export function StepVoiceTemplate({
             }}
           />
           <div style={{ marginTop: 4, fontSize: 10.5, color: "var(--text-mid)", lineHeight: 1.6 }}>
-            Leave blank to keep the default, or enter sonnet, opus, haiku or a full model id (it starts with claude-).
+            Leave blank to keep the current setting, or enter sonnet, opus, haiku or a full model id (it starts with claude-).
             Checked when first used. This setting is shared by every persona on this install.
           </div>
         </div>
