@@ -56,8 +56,11 @@ def test_set_values_while_sync_file_holds_its_window_both_survive(t, tmp_path) -
     write_text(tmp_path, '"seed" = 1\n')
     competitor = _Competitor(t, {"competitor": 2})
     finished_inside: list[bool] = []
+    window_owner = threading.get_ident()
 
     def hook() -> None:
+        if threading.get_ident() != window_owner:
+            return  # the competitor reaches the same hook once it gets in; only the sync's window is under test
         finished_inside.append(competitor.start_and_wait_briefly())
 
     t._LOCKED_WINDOW_HOOK = hook

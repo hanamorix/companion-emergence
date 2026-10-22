@@ -592,8 +592,11 @@ def test_a_cli_write_during_the_migration_and_the_migration_both_survive(monkeyp
     _persona("a", model="opus", opened="2026-01-01T00:00:00Z")
     cli_thread = threading.Thread(target=lambda: set_job_models({TIER_COMPACTION: "claude-haiku-4-5"}))
     inside = []
+    window_owner = threading.get_ident()
 
     def hook() -> None:
+        if threading.get_ident() != window_owner:
+            return  # the competing write reaches the same hook once it gets in; only the migration's window is under test
         cli_thread.start()
         cli_thread.join(timeout=0.8)
         inside.append(cli_thread.is_alive())

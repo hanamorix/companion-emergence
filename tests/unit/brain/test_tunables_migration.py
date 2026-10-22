@@ -313,8 +313,11 @@ def test_a_set_values_landing_between_the_json_read_and_the_write_survives(t, tm
     _write_legacy(tmp_path, {"a.one": 5.0})
     competitor = threading.Thread(target=lambda: t.set_values({"a.three": 99}))
     finished_inside: list[bool] = []
+    window_owner = threading.get_ident()
 
     def hook() -> None:
+        if threading.get_ident() != window_owner:
+            return  # the competitor reaches the same hook once it gets in; only the fold's window is under test
         if not (tmp_path / FILE_NAME).exists():
             return  # the boot pass creating the file; the fold's own write window is the one under test
         competitor.start()
