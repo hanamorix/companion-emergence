@@ -5,6 +5,25 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Manual run of chosen tests on a chosen OS (only the `python` job runs; see below).
+  workflow_dispatch:
+    inputs:
+      tests:
+        description: >-
+          Test paths or node ids, separated by spaces (default: the whole suite).
+          Example: tests/bridge/test_x.py::test_y
+        type: string
+        required: false
+        default: ""
+      os:
+        description: Which OS to run on
+        type: choice
+        options:
+          - all
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+        default: all
 
 jobs:
   python:
@@ -12,7 +31,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Push and pull_request: all three OSes. A manual run narrows this to the
+        # chosen OS (`os` is a choice input, so only the four listed values exist).
+        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.os != 'all' && format('["{0}"]', inputs.os) || '["ubuntu-latest","macos-latest","windows-latest"]') }}
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -31,9 +52,29 @@ jobs:
         run: uv sync --all-extras
 
       - name: Run pytest
+        if: github.event_name != 'workflow_dispatch'
         run: uv run pytest -v --tb=short
 
+      # Manual run only. The input reaches the shell as an environment variable (never
+      # spliced into the script), is split on whitespace without glob expansion, and
+      # every word is passed to pytest as one quoted argument. `shell: bash` so the
+      # same script runs on all three OSes (Windows would otherwise use pwsh).
+      - name: Run pytest (selected tests)
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          TESTS: ${{ inputs.tests }}
+        run: |
+          read -r -a selected <<< "$TESTS"
+          for word in "${selected[@]}"; do
+            case "$word" in
+              -*) echo "::error::refusing '$word': pass test paths or node ids only, not pytest options"; exit 1 ;;
+            esac
+          done
+          uv run pytest -v --tb=short "${selected[@]}"
+
       - name: Lint with ruff
+        if: github.event_name != 'workflow_dispatch'
         run: uv run ruff check .
 
   # #363: the shipped runtime is Python 3.13 (app/build_python_runtime.sh) but
@@ -42,6 +83,7 @@ jobs:
   # so they also run on 3.13. One OS keeps the cost to a few minutes.
   python-313-bridge:
     name: python 3.13 bridge tests (shipped runtime)
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -70,6 +112,7 @@ jobs:
   # caught by the python-only matrix.
   frontend:
     name: frontend (vitest + vite build)
+    if: github.event_name != 'workflow_dispatch'
     runs-on: macos-latest
     steps:
       - name: Checkout
@@ -106,6 +149,7 @@ jobs:
   # time or on first user double-click.
   tauri:
     name: tauri (cargo check + test)
+    if: github.event_name != 'workflow_dispatch'
     runs-on: macos-latest
     steps:
       - name: Checkout
@@ -130,6 +174,7 @@ jobs:
   # root crate's tests have never run there.
   tauri-linux-windows:
     name: tauri (${{ matrix.os }})
+    if: github.event_name != 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
@@ -178,6 +223,7 @@ jobs:
   # sized there even on a uv without UV_TORCH_BACKEND.
   wheel-smoke:
     name: wheel smoke (build + clean install)
+    if: github.event_name != 'workflow_dispatch'
     runs-on: macos-latest
     steps:
       - name: Checkout

@@ -170,3 +170,4 @@ If it's a decision that affects the code or the plan, it belongs in an issue or 
 | Claim an issue | Assign yourself in the right sidebar of the issue |
 | Close an issue with a PR | One `Closes #N` line per issue, in the PR description (squash-merge ignores commit-message keywords) |
 | Merge a stack of PRs | Bottom-up, one at a time, each into main; GitHub retargets the next one (the `stack-guard` check flags a PR that isn't targeting main) |
+| Re-run one test on one OS (e.g. a Windows-only failure) | `gh workflow run test.yml --ref <branch> -f tests="tests/x.py::test_y" -f os=windows-latest` (`os`: `all` by default; `tests`: space-separated paths or node ids, no options; runs only the Python test job) |
