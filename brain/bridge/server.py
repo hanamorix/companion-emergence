@@ -83,7 +83,6 @@ from brain.chat.session import (
     get_or_hydrate_session,
 )
 from brain.health.alarm import compute_pending_alarms
-from brain.health.attempt_heal import save_with_backup_text
 from brain.health.json_io import Recovery, iter_jsonl, read_json
 from brain.health.parse_failures import count_recent as count_recent_parse_failures
 from brain.health.walker import walk_persona
@@ -95,6 +94,7 @@ from brain.memory.store import MemoryStore
 from brain.persona_config import PersonaConfig
 from brain.tools.dispatch import dispatch
 from brain.update.overlay import loaded_overlay
+from brain.utils.atomic_write import save_with_backup_text
 
 logger = logging.getLogger(__name__)
 
@@ -2495,7 +2495,7 @@ def build_app(
         """Apply an accepted voice-edit proposal — three-place write.
 
         Three writes on accept (all best-effort isolated):
-          1. nell-voice.md — atomic temp+rename, replace old_text with new_text.
+          1. nell-voice.md — atomic (the shared writer), replace old_text with new_text.
           2. initiate_audit.jsonl — record `replied_explicit` transition.
           3. crystallizations.db.voice_evolution — durable record of the edit.
 
@@ -2586,7 +2586,7 @@ def build_app(
             at=now_iso,
         )
 
-        # Place 2: voice template file (atomic via temp+rename).
+        # Place 2: voice template file (atomic via the shared writer).
         # If this raises after the audit update, the 500 propagates and
         # leaves the persona in a recoverable state: audit says
         # "replied_explicit", file unchanged. Hana can re-issue accept
@@ -2770,7 +2770,8 @@ def build_app(
                     status_code=422,
                     detail=(f"declared {declared_media_type!r} but bytes look like {sniffed!r}"),
                 )
-            record = save_image_bytes(s.persona_dir, raw, sniffed)
+            # Off the event loop and counted as a request worker (#456): the write fsyncs up to the 20 MB cap.
+            record = await tracked_to_thread("upload", save_image_bytes, s.persona_dir, raw, sniffed)
             return {
                 "kind": "image",
                 "sha": record.sha,
@@ -2779,7 +2780,7 @@ def build_app(
             }
         # Non-image path (#43). The on-disk name is the content sha only; the
         # client filename is returned as display metadata, never a path part.
-        frecord = file_store.save_file_bytes(s.persona_dir, raw)
+        frecord = await tracked_to_thread("upload", file_store.save_file_bytes, s.persona_dir, raw)
         return {
             "kind": "file",
             "sha": frecord.sha,

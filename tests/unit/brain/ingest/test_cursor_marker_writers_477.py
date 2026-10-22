@@ -13,7 +13,7 @@ import os
 
 import pytest
 
-import brain.health.attempt_heal as heal
+import brain.utils.atomic_write as heal
 from brain.bridge.chat import ChatMessage, ChatResponse
 from brain.bridge.provider import LLMProvider
 from brain.ingest.buffer import (

@@ -206,7 +206,7 @@ def _materialize_symlinked_files(directory: Path) -> Path:
             os.link(real_src, tmp_dest)  # same filesystem: instant, no extra disk
         except OSError:
             shutil.copy2(real_src, tmp_dest)  # cross-filesystem fallback
-        os.replace(tmp_dest, dest)
+        os.replace(tmp_dest, dest)  # atomic-write: ok -- model blob materialisation: a hard link or copy of an already downloaded model file into a .materialized directory (a link/exclusive-create case), not a state-file write
     return materialized
 
 

@@ -19,6 +19,7 @@ from pathlib import Path
 
 from brain.paths import get_home, get_log_dir, get_persona_dir
 from brain.setup import validate_persona_name
+from brain.utils.atomic_write import save_with_backup_text
 
 LABEL_PREFIX = "com.companion-emergence.supervisor"
 
@@ -267,10 +268,9 @@ def write_launchd_plist(
     )
     paths.plist_path.parent.mkdir(parents=True, exist_ok=True)
     paths.stdout_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = paths.plist_path.with_suffix(paths.plist_path.suffix + ".tmp")
-    tmp.write_text(xml, encoding="utf-8")
-    tmp.chmod(0o644)
-    os.replace(tmp, paths.plist_path)
+    # The shared atomic text writer (#465): a unique temp created 0644, fsynced, one retried atomic replace; a failed
+    # write keeps the previous plist and removes the temp. The explicit chmod keeps the final mode exact under a umask.
+    save_with_backup_text(paths.plist_path, xml, keep_backups=False, mode=0o644)
     paths.plist_path.chmod(0o644)
     return paths.plist_path
 

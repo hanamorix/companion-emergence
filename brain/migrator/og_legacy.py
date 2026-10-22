@@ -19,9 +19,10 @@ See docs/superpowers/specs/2026-05-04-migrator-legacy-preservation-design.md.
 from __future__ import annotations
 
 import hashlib
-import os
 from dataclasses import dataclass
 from pathlib import Path
+
+from brain.utils.atomic_write import save_bytes_atomic
 
 
 @dataclass(frozen=True)
@@ -101,14 +102,10 @@ def migrate_legacy_files(
             missing.append(name)
             continue
         dest = legacy_dir / name
-        # Atomic copy via .new + os.replace so a torn read/write doesn't
-        # leave a half-copied legacy artifact (years-deep biographical data).
-        new_path = dest.with_name(dest.name + ".new")
-        if new_path.exists():
-            new_path.unlink()
+        # Atomic copy through the shared bytes writer (a unique temp, fsync, one retried replace) so a torn
+        # read/write doesn't leave a half-copied legacy artifact (years-deep biographical data).
         src_bytes = src.read_bytes()
-        new_path.write_bytes(src_bytes)
-        os.replace(new_path, dest)
+        save_bytes_atomic(dest, src_bytes)
         # Integrity diagnostic: hash both. Same-byte-content is the normal
         # case; a mismatch implicates the copy itself (FS short-read,
         # disk-full mid-write, etc.) — not the source's design intent.

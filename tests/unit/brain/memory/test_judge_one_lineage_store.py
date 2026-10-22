@@ -75,6 +75,8 @@ def test_reap_keeps_only_the_pointer_named_dir(tmp_path: Path) -> None:
     leftover = _place(root, point=False)
     served = _place(root)
     (root / "full").mkdir()  # a legacy per-tier sub-root: not prefixed, never touched
+    # a pre-#465 leftover temp name (the pointer is now written through the shared writer, as `current.t<pid>-<hex>.new`);
+    # either shape is a non-adapter entry that the reap must leave alone
     (root / ".current.tmp-x").write_text("tmp", encoding="utf-8")
     judge_lora.reap_unreferenced(root)
     assert not leftover.exists()

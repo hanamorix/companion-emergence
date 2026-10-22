@@ -19,7 +19,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 import brain.felt_time.chat_log as chat_log
-import brain.health.attempt_heal as heal
+import brain.utils.atomic_write as heal
 from brain.bridge.server import build_app
 from brain.engines.research_notes import append_session_notes, notes_path
 from brain.felt_time.chat_log import (

@@ -34,18 +34,16 @@ def test_key_write_is_atomic_no_truncated_file_on_failure(tmp_path, monkeypatch)
     # final path that crashes the next load with from_private_bytes(b'') (#44).
     # Write-then-rename: a failed write orphans only the temp, leaving the final
     # path absent so the next load regenerates cleanly.
-    import brain.kindled_link.identity as idmod
+    real_fsync = os.fsync
 
-    real_write = os.write
-
-    def _boom(fd, data):
+    def _boom(fd):
         raise OSError("disk full")
 
-    monkeypatch.setattr(idmod.os, "write", _boom)
+    monkeypatch.setattr(os, "fsync", _boom)
     with pytest.raises(OSError):
         KindledIdentity.load_or_create(tmp_path)
     assert not (tmp_path / _KEY_REL).exists(), "no truncated key file may remain"
 
-    monkeypatch.setattr(idmod.os, "write", real_write)
+    monkeypatch.setattr(os, "fsync", real_fsync)
     idn = KindledIdentity.load_or_create(tmp_path)  # regenerates cleanly
     assert idn.key_id.startswith("kid_")

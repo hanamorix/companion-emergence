@@ -169,7 +169,7 @@ def migrate_companion_emergence(args: CompanionEmergenceMigrateArgs) -> Migratio
         backup = target_dir.with_name(
             f"{target_dir.name}.backup-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S')}"
         )
-        shutil.move(str(target_dir), str(backup))
+        shutil.move(str(target_dir), str(backup))  # atomic-write: ok -- moves a persona directory aside to a backup (a directory move), not a file write
 
     shutil.copytree(args.input_dir, target_dir, dirs_exist_ok=False)
 

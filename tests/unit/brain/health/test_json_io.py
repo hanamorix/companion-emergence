@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from brain.health.attempt_heal import save_with_backup_text
+from brain.utils.atomic_write import save_with_backup_text
 
 POSIX = os.name == "posix"
 
@@ -50,7 +50,7 @@ def _fresh_throttle():
 
 
 # --------------------------------------------------------------------------------------------------------------
-# Helper additions to attempt_heal.save_with_backup_text (keyword-only; defaults reproduce today's behaviour)
+# Helper additions to atomic_write.save_with_backup_text (keyword-only; defaults reproduce today's behaviour)
 # --------------------------------------------------------------------------------------------------------------
 
 
@@ -1721,7 +1721,7 @@ def test_cw8_a_failed_backup_copy_leaves_the_chain_untouched(tmp_path: Path, mon
     def failing_copy(src, dst):
         raise OSError(errno.ENOSPC, "disk full")
 
-    monkeypatch.setattr("brain.health.attempt_heal._copy_for_backup", failing_copy)
+    monkeypatch.setattr("brain.utils.atomic_write._copy_for_backup", failing_copy)
     with pytest.raises(OSError):
         jio.write_json(p, {"v": 99}, backups=2)
     monkeypatch.undo()

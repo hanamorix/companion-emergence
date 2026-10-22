@@ -19,10 +19,11 @@ Validation:
 from __future__ import annotations
 
 import hashlib
-import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+
+from brain.utils.atomic_write import save_blob_once
 
 _ALLOWED_MEDIA_TYPES = frozenset({"image/png", "image/jpeg", "image/webp", "image/gif"})
 _MEDIA_TYPE_TO_EXT = {
@@ -94,9 +95,9 @@ def save_image_bytes(
 ) -> ImageRecord:
     """Save ``data`` content-addressably under ``persona_dir/images/``.
 
-    Atomic via ``.new`` + ``os.replace``. If the target already exists with
-    matching sha (deduplication), no write is performed and the existing
-    record is returned.
+    Atomic through :func:`brain.utils.atomic_write.save_blob_once`. If the target
+    already exists with matching sha (deduplication), no write is performed and
+    the existing record is returned.
 
     Raises
     ------
@@ -122,28 +123,10 @@ def save_image_bytes(
         raise ValueError(f"declared media_type {media_type!r} but bytes' signature is {sniffed!r}")
     sha = compute_sha(data)
     target = image_path(persona_dir, sha, media_type)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if target.exists():
-        return ImageRecord(sha=sha, media_type=media_type, size_bytes=len(data))
-    # Unique tmp path per writer so identical concurrent uploads of the
-    # same sha don't race on a shared `<sha>.<ext>.new` file. The pid +
-    # uuid suffix is enough to disambiguate threads + processes; final
-    # `os.replace` is atomic so the target reflects exactly one writer.
-    import uuid
-
-    tmp = target.with_suffix(f"{target.suffix}.{os.getpid()}.{uuid.uuid4().hex[:8]}.new")
-    try:
-        tmp.write_bytes(data)
-        os.replace(tmp, target)
-    except (FileNotFoundError, OSError):
-        # If a concurrent writer beat us to the punch, the target should
-        # now exist with the same sha (content-addressed). Fall through
-        # to a final-state check before re-raising.
-        if target.exists():
-            tmp.unlink(missing_ok=True)
-            return ImageRecord(sha=sha, media_type=media_type, size_bytes=len(data))
-        tmp.unlink(missing_ok=True)
-        raise
+    # The shared content-addressed blob writer: dedup by name (the sha is the name), a unique temp per writer so
+    # identical concurrent uploads cannot clobber each other, fsync, a retried atomic replace, and a final-state check
+    # when a concurrent writer wins the race (b557882d).
+    save_blob_once(target, data)
     return ImageRecord(sha=sha, media_type=media_type, size_bytes=len(data))
 
 

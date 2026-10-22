@@ -744,7 +744,7 @@ def finalize_stale_sessions(
                     if src.exists():
                         try:
                             poison_dir.mkdir(parents=True, exist_ok=True)
-                            src.rename(dst)
+                            src.rename(dst)  # atomic-write: ok -- moves a poisoned buffer to poison/, a rename of a finished file, not a write
                             moved = True
                         except FileNotFoundError:
                             pass
