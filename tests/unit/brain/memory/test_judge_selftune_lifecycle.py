@@ -251,7 +251,7 @@ def test_accept_swaps_in_plain_checkpoint_rescores_knob_and_consumes_doc_having_
         replaced.append((str(src), str(dst)))
         return real_replace(src, dst)
 
-    monkeypatch.setattr(judge_lora.os, "replace", spy_replace)
+    monkeypatch.setattr(os, "replace", spy_replace)
 
     result = _tick(store, tmp_path)
 

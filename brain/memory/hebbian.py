@@ -23,6 +23,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from brain.utils.log_throttle import count_throttled
+from brain.utils.sqlite_open import open_store_connection
 
 log = logging.getLogger(__name__)
 
@@ -62,30 +63,20 @@ class HebbianMatrix:
     """
 
     def __init__(self, db_path: str | Path, *, integrity_check: bool = True) -> None:
-        self._conn = sqlite3.connect(str(db_path))
-        # Mirrors MemoryStore: hot per-turn openers (the recall-path single
-        # open in _build_recall_block) pass integrity_check=False to skip the
-        # full-DB PRAGMA integrity_check and take a lightweight WAL open.
-        if integrity_check:
-            from brain.health.integrity_retry import run_integrity_check_with_retry
+        # Hot per-turn openers (the recall-path single open in
+        # _build_recall_block) pass integrity_check=False to skip the full-DB
+        # PRAGMA integrity_check and take a lightweight WAL open (the same
+        # parameter MemoryStore has). The open sequence (integrity check, WAL,
+        # busy_timeout) is shared: see brain.utils.sqlite_open.
+        self._conn: sqlite3.Connection = open_store_connection(
+            db_path,
+            caller="HebbianMatrix",
+            integrity_check=integrity_check,
+            setup=self._finish_open,
+        )
 
-            result = run_integrity_check_with_retry(
-                self._conn, db_path, caller="HebbianMatrix"
-            )
-            if result != [("ok",)]:
-                detail = "; ".join(str(row[0]) for row in result)
-                self._conn.close()
-                from brain.health.anomaly import BrainIntegrityError
-
-                raise BrainIntegrityError(str(db_path), detail)
-        # WAL + 5s busy_timeout — set AFTER the integrity check so a
-        # corrupt-file probe surfaces BrainIntegrityError, not a pragma
-        # crash. In-memory dbs reject WAL; fallback keeps `:memory:` ok.
-        try:
-            self._conn.execute("PRAGMA journal_mode = WAL")
-        except sqlite3.OperationalError:
-            pass
-        self._conn.execute("PRAGMA busy_timeout = 5000")
+    def _finish_open(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
         self._conn.executescript(self._SCHEMA)
         self._conn.commit()
 

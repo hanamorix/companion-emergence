@@ -13,7 +13,10 @@ numbers live" half of C27.
 
 from __future__ import annotations
 
+import importlib
 import inspect
+
+import pytest
 
 from brain import dev_constants
 
@@ -72,3 +75,27 @@ def test_embedding_matrix_py_sources_busy_timeout_from_dev_constants() -> None:
     source = inspect.getsource(embedding_matrix)
     assert "dev_constants.MEMORIES_DB_BUSY_TIMEOUT_S" in source
     assert "busy_timeout = 5000" not in source
+
+
+def test_sqlite_store_busy_timeout_is_five_seconds() -> None:
+    """C9: the named constant that replaced the written-out 5000 in the migrated stores."""
+    assert dev_constants.SQLITE_STORE_BUSY_TIMEOUT_S == 5.0
+    assert isinstance(dev_constants.SQLITE_STORE_BUSY_TIMEOUT_S, float)
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    [
+        "brain.memory.hebbian",
+        "brain.soul.store",
+        "brain.kindled_link.store",
+        "brain.memory.store",
+        "brain.works.store",
+    ],
+)
+def test_migrated_store_modules_no_longer_write_out_the_busy_timeout(module_name: str) -> None:
+    """C9: the open sequence lives in `brain.utils.sqlite_open`; a migrated store
+    module does not carry its own `busy_timeout = 5000` any more. (A module is added
+    to this list in the commit that migrates it.)"""
+    module = importlib.import_module(module_name)
+    assert "busy_timeout = 5000" not in inspect.getsource(module)

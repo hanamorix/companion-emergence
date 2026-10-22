@@ -279,8 +279,8 @@ def migrate_emergence_kit(args: EmergenceKitMigrateArgs) -> MigrationReport:
             backup = finalise_target.with_name(
                 f"{finalise_target.name}.backup-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S')}"
             )
-            shutil.move(str(finalise_target), str(backup))
-        os.replace(work_dir, finalise_target)
+            shutil.move(str(finalise_target), str(backup))  # atomic-write: ok -- moves a persona directory aside to a backup (a directory move), not a file write
+        os.replace(work_dir, finalise_target)  # atomic-write: ok -- installs a persona directory (a directory rename), not a file write
         result_dir = finalise_target
     else:
         result_dir = work_dir

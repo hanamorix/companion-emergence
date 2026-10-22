@@ -24,6 +24,11 @@ the retry loop live, so the four stores can't drift out of sync with each
 other (each used to carry an independent, easy-to-diverge copy of the same
 try/except block).
 
+Callers: since the open sequence itself was consolidated (#465 C9), the one
+caller of this helper is `brain.utils.sqlite_open.check_integrity`, which the
+four stores above reach through `open_store_connection`; they no longer import
+this module themselves.
+
 Design note (why a small, POSITIVE allowlist, not a negative one): retrying
 only a few independently-verified known-transient message substrings is
 deliberately much narrower than "retry anything not explicitly known to be
