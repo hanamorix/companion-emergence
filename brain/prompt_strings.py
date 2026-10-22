@@ -12,9 +12,10 @@ directly — there is no separate "read at call time" step, because (unlike
     text = _MY_PROMPT.format(...)
 
 This is the DEV-facing sibling of ``brain/tunables.py`` (the USER-facing
-ops-tunables mechanism, backed by ``$KINDLED_HOME/tunables.json`` with an
+ops-tunables mechanism, backed by ``$KINDLED_HOME/tunables.toml`` with an
 in-code default as a delete-guard fallback). The two are deliberately
-separate, parallel mechanisms:
+separate, parallel mechanisms (both read TOML only through
+``brain.utils.toml_io``):
 
   * ``tunables.py``      — user-editable, has an in-code fallback default,
                             fails open (a missing/corrupt file silently
@@ -27,24 +28,22 @@ separate, parallel mechanisms:
                             break here should be immediately obvious, not
                             silently patched over.
 
-The "setter" is editing ``prompt_strings.toml`` by hand — code never writes
-this file (same as ``tunables.py``'s "defaults" section is documentation,
-not this file's whole purpose).
+The "setter" is editing ``prompt_strings.toml`` by hand; code never writes
+this file.
 """
 
 from __future__ import annotations
 
 import threading
-import tomllib
 from pathlib import Path
 from typing import Any
+
+from brain.utils import toml_io
 
 _FILE_NAME = "prompt_strings.toml"
 
 _lock = threading.Lock()
 _registry: set[str] = set()
-_cache: dict[str, Any] | None = None
-_cache_mtime: float | None = None
 
 
 def _file_path() -> Path:
@@ -59,24 +58,12 @@ class PromptStringError(RuntimeError):
 
 
 def _load_locked() -> dict[str, Any]:
-    """Return the parsed TOML document, re-parsing only when the file's
-    mtime changes. Any read/parse failure raises PromptStringError — no
-    fail-open behavior (see module docstring)."""
-    global _cache, _cache_mtime
-    path = _file_path()
+    """Return the parsed TOML document (``toml_io`` re-parses only when the file changes). Any read or parse failure raises
+    PromptStringError, naming the file and the failing line: no fail-open behavior (see module docstring)."""
     try:
-        mtime = path.stat().st_mtime
-    except OSError as exc:
-        raise PromptStringError(f"prompt_strings: cannot stat {path}: {exc}") from exc
-    if _cache is not None and mtime == _cache_mtime:
-        return _cache
-    try:
-        with path.open("rb") as fh:
-            data = tomllib.load(fh)
-    except Exception as exc:  # noqa: BLE001 — re-raised as our own type below
-        raise PromptStringError(f"prompt_strings: cannot parse {path}: {exc}") from exc
-    _cache, _cache_mtime = data, mtime
-    return _cache
+        return toml_io.read_toml_cached(_file_path())
+    except toml_io.TomlFileError as exc:
+        raise PromptStringError(f"prompt_strings: cannot read {exc}") from exc
 
 
 def get(key: str) -> str:
@@ -156,7 +143,5 @@ def register_segments(key: str) -> list[str]:
 
 
 def _reset_for_tests() -> None:
-    global _cache, _cache_mtime
     with _lock:
         _registry.clear()
-        _cache, _cache_mtime = None, None
