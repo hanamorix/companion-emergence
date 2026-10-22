@@ -87,16 +87,18 @@ def test_an_incomplete_registry_keeps_the_old_settings_file_for_the_next_start(t
     tunables.register("boot.test_key", 7, description="A key registered before boot.")
     legacy = tmp_path / "tunables.json"
     legacy.write_text(_json.dumps({"overrides": {"zz.only_another_module_knows": 5}}), encoding="utf-8")
-    monkeypatch.setattr(server_mod, "_SETTING_MODULES", ("brain.no_such_settings_module_zz", *server_mod._SETTING_MODULES))
+    real_modules = server_mod._SETTING_MODULES
+    monkeypatch.setattr(server_mod, "_SETTING_MODULES", ("brain.no_such_settings_module_zz", *real_modules))
 
     client, persona_dir = _make_client(tmp_path)
     with client:
         assert client.get("/health").status_code == 200
     assert legacy.exists(), "the fold ran with an incomplete registry and discarded a key"
 
-    monkeypatch.undo()  # the next start imports everything
-    monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
-    tunables.register("boot.test_key", 7, description="A key registered before boot.")
+    # The next start imports everything. Only this one patch is undone: ``monkeypatch.undo()`` would also lift the root
+    # conftest's inhibit of the bridge's background threads, and the second boot would start the real supervisor and the
+    # reranker floor bootstrap (a real model load).
+    monkeypatch.setattr(server_mod, "_SETTING_MODULES", real_modules)
     from brain.bridge import shutdown_progress
 
     shutdown_progress.reset_for_tests()  # the next start is a new bridge process in production (the first stop sealed the registry)
@@ -111,7 +113,9 @@ def test_a_fresh_process_boot_writes_every_registered_key_with_its_default(tmp_p
     """A real bridge boot in a fresh interpreter that imports only the server: the file holds EVERY key that a fresh
     interpreter importing every registering module registers, each at its default (C56, generalising the seven model keys).
     A subprocess, not this process: the registry here is cleared by other tests, and the point is that the boot itself (not
-    a test's earlier import) registers the keys."""
+    a test's earlier import) registers the keys. The background threads are off (``background_threads=False``, as the root
+    conftest does for every in-process app): a fresh interpreter would otherwise start the real supervisor, the backlog
+    migration and the reranker floor bootstrap, which loads a real model (the boot pass under test runs before them)."""
     import subprocess
     import sys
 
@@ -122,7 +126,7 @@ def test_a_fresh_process_boot_writes_every_registered_key_with_its_default(tmp_p
     code = (
         "import sys; from pathlib import Path; from fastapi.testclient import TestClient; "
         "from brain.bridge.server import build_app; "
-        "app = build_app(persona_dir=Path(sys.argv[1]), client_origin='tests', auth_token=None); "
+        "app = build_app(persona_dir=Path(sys.argv[1]), client_origin='tests', auth_token=None, background_threads=False); "
         "c = TestClient(app); c.__enter__(); assert c.get('/health').status_code == 200; c.__exit__(None, None, None)"
     )
     env = {**__import__("os").environ, "KINDLED_HOME": str(tmp_path)}
