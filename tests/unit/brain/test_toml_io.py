@@ -71,10 +71,10 @@ def test_error_position_on_a_python_312_style_message() -> None:
 
 
 def test_error_position_from_an_exception_without_attributes(monkeypatch: pytest.MonkeyPatch) -> None:
-    class Old(Exception):
+    class OldParserError(Exception):
         pass
 
-    exc = Old("Expected '=' after a key in a key/value pair (at line 4, column 9)")
+    exc = OldParserError("Expected '=' after a key in a key/value pair (at line 4, column 9)")
     assert toml_io._position_of(exc, "a = 1\n" * 5) == (4, 9, "Expected '=' after a key in a key/value pair")
 
 

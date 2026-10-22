@@ -88,3 +88,51 @@ def test_get_segments_on_list_with_non_string_element_raises(prompt_strings, mon
     monkeypatch.setattr(prompt_strings, "_file_path", lambda: toml_path)
     with pytest.raises(prompt_strings.PromptStringError):
         prompt_strings.get_segments("bad.segments")
+
+
+# --- reading goes through brain.utils.toml_io (#529): behaviour pins -------------------------------------------------
+
+
+def _point_at(prompt_strings, monkeypatch, path):
+    monkeypatch.setattr(prompt_strings, "_file_path", lambda: path)
+
+
+def test_a_malformed_file_raises_prompt_string_error_naming_the_path_and_the_line(prompt_strings, monkeypatch, tmp_path):
+    toml_path = tmp_path / "prompt_strings.toml"
+    toml_path.write_text('ok = "x"\nbroken = \n', encoding="utf-8")
+    _point_at(prompt_strings, monkeypatch, toml_path)
+    with pytest.raises(prompt_strings.PromptStringError) as err:
+        prompt_strings.get("ok")
+    assert str(toml_path) in str(err.value) and "line 2" in str(err.value)
+
+
+def test_a_missing_file_raises_prompt_string_error_naming_the_path(prompt_strings, monkeypatch, tmp_path):
+    gone = tmp_path / "gone.toml"
+    _point_at(prompt_strings, monkeypatch, gone)
+    with pytest.raises(prompt_strings.PromptStringError) as err:
+        prompt_strings.get("anything")
+    assert str(gone) in str(err.value)
+
+
+def test_a_file_with_a_bom_loads(prompt_strings, monkeypatch, tmp_path):
+    toml_path = tmp_path / "prompt_strings.toml"
+    toml_path.write_bytes(b'\xef\xbb\xbfk = "v"\r\n')
+    _point_at(prompt_strings, monkeypatch, toml_path)
+    assert prompt_strings.get("k") == "v"
+
+
+def test_a_changed_file_is_read_again_and_an_unchanged_one_is_not_reparsed(prompt_strings, monkeypatch, tmp_path):
+    from brain.utils import toml_io
+
+    toml_path = tmp_path / "prompt_strings.toml"
+    toml_path.write_text('k = "one"\n', encoding="utf-8")
+    _point_at(prompt_strings, monkeypatch, toml_path)
+    toml_io._reset_cache_for_tests()
+    parsed: list[int] = []
+    real = toml_io._parse_text
+    monkeypatch.setattr(toml_io, "_parse_text", lambda text: (parsed.append(1), real(text))[1])
+    assert prompt_strings.get("k") == "one"
+    assert prompt_strings.get("k") == "one"
+    assert len(parsed) == 1
+    toml_path.write_text('k = "second"\n', encoding="utf-8")
+    assert prompt_strings.get("k") == "second"
