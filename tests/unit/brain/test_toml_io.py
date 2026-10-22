@@ -604,7 +604,7 @@ def test_insert_at_the_end_of_a_file_with_no_table() -> None:
 
 
 def test_insert_into_an_empty_document() -> None:
-    doc = TomlDocument.empty()
+    doc = TomlDocument.from_bytes(b"")
     doc.insert("a.b", "x", ["# first"])
     assert doc.text() == '# first\n"a.b" = "x"\n'
     assert doc.values() == {"a.b": "x"}

@@ -527,10 +527,6 @@ class TomlDocument:
                 lines.append(_Line(piece, "\n"))
         return cls(lines, raw.startswith(_BOM), eol, path)
 
-    @classmethod
-    def empty(cls, *, eol: str = "\n") -> TomlDocument:
-        return cls([], False, eol)
-
     # -- output -------------------------------------------------------------------------------------------
     def text(self) -> str:
         return "".join(ln.content + ln.term for ln in self._lines)
