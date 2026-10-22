@@ -211,9 +211,11 @@ def test_mut_tunables_boot_pass_keeps_a_hand_edited_nan_and_makes_the_write_dura
 
     from brain import tunables
 
-    synced: list[int] = []
+    events: list[str] = []
     real_fsync = os.fsync
-    monkeypatch.setattr(os, "fsync", lambda fd: (synced.append(fd), real_fsync(fd))[1])
+    real_replace = os.replace
+    monkeypatch.setattr(os, "fsync", lambda fd: (events.append("fsync"), real_fsync(fd))[1])
+    monkeypatch.setattr(os, "replace", lambda a, b: (events.append("replace"), real_replace(a, b))[1])
 
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
     tunables._reset_for_tests()
@@ -224,7 +226,9 @@ def test_mut_tunables_boot_pass_keeps_a_hand_edited_nan_and_makes_the_write_dura
     text = p.read_text()
     assert text.startswith('"z.k" = nan\n"a.k" = 1\n')  # the user's lines are byte for byte, in their order
     assert '"new.key" = 1' in text
-    assert len(synced) == 1  # the pass writes once and fsyncs before the replace (a power loss must not leave a zero-byte file)
+    # The pass writes once through the shared atomic writer: the file's data is fsynced BEFORE the one replace (a power
+    # loss must not leave a zero-byte file), then the directory is fsynced so the rename itself is durable.
+    assert events == ["fsync", "replace", "fsync"]
 
 
 # ---------------------------------------------------------------------------------------------

@@ -59,7 +59,7 @@ def test_a_call_in_flight_at_the_stop_completes_and_is_persisted(tmp_path, monke
 
         try:
             outcome["reports"] = snapshot_stale_sessions(
-                pd, silence_minutes=0.0, store=store, hebbian=hebbian, provider=ClaudeCliProvider(model="m")
+                pd, silence_minutes=0.0, store=store, hebbian=hebbian, provider=ClaudeCliProvider(probe_model="m")
             )
         except Exception as exc:  # noqa: BLE001 - the second session's refusal ends the sweep
             outcome["exc"] = exc
