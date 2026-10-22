@@ -244,6 +244,17 @@ metrics:                  # standing regression metrics (source: the JSONL logs)
   (`ephemeral_1h_input_tokens` vs `ephemeral_5m_input_tokens`) in a result frame before relying on it for
   another CLI version or auth type. Gate on the means without each arm's first row, or space the arms
   more than an hour apart.
+- **Per-turn replay signal (#525).** The replay's metrics JSON now carries `per_turn`: for each
+  turn, its `chat_rows` (cost, `num_turns`, cache fields, duration) and the `tool_rows` the scratch
+  persona logged inside that turn's window (`per_turn_error` says why it is absent: a log shrank,
+  a line was skipped, a row is stamped after its turn ended). Tool rows come from the scratch
+  persona only, so the time-window join is exact within one replay; it does not lift the
+  production join gap above. `--prompt-set {default,reach,recall}` picks prompts that evoke
+  deferred tools (`reach` seeds a `desk/` folder) or memory recall; `--model` selects the
+  provider model; `--render-only` prints each prompt's volatile context with no CLI call.
+  `scripts/replay_tool_oracles.py --old … --new …` scores per-turn share gates (one-sided Fisher,
+  OLD ≥ 5 qualifying turns or UNMEASURED) and the cost/turn bars; `--self-test` shows each gate
+  can fail.
 - **These metrics exist because the v0.0.38 file-tool token-cost regression was only catchable
   via `tool_invocations.log.jsonl`.** Any change touching an un-instrumented area must add
   logging in stage 2 ("instrument before you build").

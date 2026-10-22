@@ -64,7 +64,7 @@ def test_apply_lean_flags_adds_disallowed_and_strict():
 # ---------------------------------------------------------------------------
 
 _RESULT_JSON = '{"type": "result", "subtype": "success", "is_error": false, "result": "ok"}'
-_CHAT_TOOLS = "--tools=WebSearch,WebFetch"
+_CHAT_TOOLS = "--tools=WebSearch,WebFetch,ToolSearch"
 
 
 def _fake_popen(stdout_lines: list[str], exit_code: int = 0):
@@ -456,3 +456,24 @@ def test_unexpected_confirmation_is_indeterminate(monkeypatch, confirm):
     provider._reset_tools_flag_cache()
     assert provider._cli_supports_tools_flag() is False
     assert provider._TOOLS_FLAG_SUPPORTED is None
+
+
+def test_toolsearch_not_disallowed():
+    """ToolSearch must stay off the disallow list (#525).
+
+    On claude CLI 2.1.303 the CLI defers tool schemas behind ToolSearch only when
+    ToolSearch is in the request's tool set; without it every chat request carries
+    all ~32 schemas up front. Chat names it in the --tools allowlist, but a CLI
+    without --tools falls back to the disallow list alone, and a ToolSearch entry
+    there would silently switch deferral off again.
+    """
+    assert "ToolSearch" not in _BUILTIN_TOOLS_DISALLOWED, (
+        "ToolSearch is disallowed — tool deferral is off again (#525)"
+    )
+
+
+def test_chat_allowlist_names_toolsearch():
+    """The chat allowlist carries ToolSearch, so the CLI keeps deferral on (#525)."""
+    from brain.bridge.provider import _CHAT_BUILTIN_TOOLS
+
+    assert _CHAT_BUILTIN_TOOLS == ("WebSearch", "WebFetch", "ToolSearch")

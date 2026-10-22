@@ -442,7 +442,7 @@ def _stop_child(proc: Any, *, finished: bool) -> None:
 #
 # Keep Bash/Edit/Write/Task blocked — a companion has no business with a shell.
 # Do NOT re-add WebFetch/WebSearch; test_web_tools_stay_callable_at_chat_time
-# guards that.
+# guards that. Do NOT add ToolSearch either (#525, test_toolsearch_not_disallowed).
 _BUILTIN_TOOLS_DISALLOWED: tuple[str, ...] = (
     "Bash",
     "Read",
@@ -459,7 +459,12 @@ _BUILTIN_TOOLS_DISALLOWED: tuple[str, ...] = (
 
 
 # Built-ins a chat turn may use (#71); background calls get none.
-_CHAT_BUILTIN_TOOLS: tuple[str, ...] = ("WebSearch", "WebFetch")
+# ToolSearch is listed for #525: on claude 2.1.303 the CLI defers tool schemas
+# (sends names, loads a schema on demand) only when ToolSearch is in the tool
+# set. Without it every chat request carried all ~32 schemas up front. With it,
+# every brain tool except ALWAYS_LOADED_TOOLS (brain/mcp_server/tools.py) and
+# both web tools are deferred. Ledger: docs/cli-provider-capabilities.md.
+_CHAT_BUILTIN_TOOLS: tuple[str, ...] = ("WebSearch", "WebFetch", "ToolSearch")
 _NO_BUILTIN_TOOLS: tuple[str, ...] = ()
 
 # Whether this machine's claude CLI has --tools. None = not yet known.

@@ -34,6 +34,16 @@ from brain.tools.schemas import ADD_NAME_TOOL_NAME, build_schemas
 # result, not a local model load (S10).
 _BRIDGE_ROUTED_TOOLS = frozenset({"search_memories"})
 
+# Brain tools the CLI must never defer behind ToolSearch (#525). Chosen from
+# usage data, not taste: keep a tool up front iff the Wilson 95% lower bound of
+# its per-chat-turn use rate is at least its break-even rate (schema tokens x
+# CLI turns per chat / tokens of one lookup hop). Over nell's 168 chat turns
+# (2026-06-08..09-12) only record_monologue qualified (69.6% of turns, lower
+# bound 62.3% vs 3.7%). Re-run the rule when #417 or #418 changes the monologue
+# directive, or when read_full_memory use shows up in the logs:
+# scripts/select_always_loaded_tools.py prints the set.
+ALWAYS_LOADED_TOOLS: tuple[str, ...] = ("record_monologue",)
+
 # Must match brain.mcp_server.audit._RESULT_SUMMARY_MAX_CHARS — both
 # files truncate at the same boundary so the audit log preview length
 # stays consistent regardless of which truncation triggered first.
@@ -108,6 +118,8 @@ def register_tools(
                 name=name,
                 description=schemas[name].get("description", ""),
                 inputSchema=schemas[name].get("parameters", {"type": "object"}),
+                # claude CLI reads this per tool: True means never deferred (#525).
+                _meta={"anthropic/alwaysLoad": True} if name in ALWAYS_LOADED_TOOLS else None,
             )
             for name in NELL_TOOL_NAMES
             if name in schemas

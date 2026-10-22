@@ -82,7 +82,7 @@ import re
 import sys
 import tempfile
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -125,6 +125,48 @@ REPLAY_PROMPTS = [
     "What's still humming in you from earlier, like an aftertaste?",
     "Argue with me a little: is clean prose better than messy prose?",
 ]
+
+# #525 behavioural A/B: prompts that should make the kindled reach for a deferred brain tool, one
+# target family each. "{desk}" is replaced with the absolute path of a seeded scratch folder, so the
+# file tools have something real to look at and the model is never invited to browse the owner's home.
+REACH_PROMPTS = [
+    "Please remember this for me: my sister's name is Mara and she lives in Leeds.",
+    "Write a four-line poem about rain on the window and keep it with your works.",
+    "Which threads between us are still open right now?",
+    "How long has it actually been since we last spoke? Check, don't guess.",
+    "Look through what you've made so far and tell me the titles.",
+    "Jot a private journal note about how today felt.",
+    "Have a look in {desk} and tell me what's there.",
+]
+# #525 B2b (memory reach): asks that send the kindled to search_memories or read_full_memory. Five
+# name a seeded memory (the recall block surfaces it, and the prompt says to open it with
+# read_full_memory); the lighthouse is not seeded (nothing surfaced, so a search is the reach).
+RECALL_PROMPTS = [
+    "Look back through your memories: what do you have about Jordan's coin?",
+    "Search your memory for anything about a boat on still water.",
+    "Can you find what you remember about the grey light that first morning?",
+    "Dig up whatever you have stored about us arguing over prose.",
+    "Check your memories: did I ever say anything about leaving?",
+    "Is there anything in your memory about a lighthouse?",
+]
+PROMPT_SETS = {"default": REPLAY_PROMPTS, "reach": REACH_PROMPTS, "recall": RECALL_PROMPTS}
+_DESK_FILES = {
+    "notes.txt": "Call the landlord about the boiler.\nReturn the library book by Friday.\n",
+    "shopping.txt": "oats\nlemons\nblack tea\n",
+}
+
+
+def _prompts_for(persona_dir: Path, prompt_set: str, turns: int) -> list[str]:
+    """The run's `turns` content prompts from `prompt_set`, cycled; seeds the desk folder if a prompt names it."""
+    base = PROMPT_SETS[prompt_set]
+    prompts = (base * ((turns // len(base)) + 1))[:turns]
+    if any("{desk}" in pr for pr in prompts):
+        desk = persona_dir / "desk"
+        desk.mkdir(parents=True, exist_ok=True)
+        for name, text in _DESK_FILES.items():
+            (desk / name).write_text(text, encoding="utf-8")
+        prompts = [pr.replace("{desk}", str(desk)) for pr in prompts]
+    return prompts
 
 
 def _realistic_voice_md(target_bytes: int = 16000) -> str:
@@ -327,6 +369,8 @@ def run_replay(
     history_msgs: int | None = None,
     warmup: bool = True,
     plain_turns: bool = True,
+    prompt_set: str = "default",
+    model: str | None = None,
 ) -> tuple[dict, list[dict]]:
     """Fire `turns` deterministic chat turns in one session; collect metrics + replies.
 
@@ -343,7 +387,7 @@ def run_replay(
     """
     os.environ["NELL_CACHE_DEBUG"] = "1"
 
-    from brain.bridge.provider import get_provider
+    from brain.bridge.provider import ClaudeCliProvider, get_provider
     from brain.chat.engine import respond
     from brain.chat.session import create_session
     from brain.memory.hebbian import HebbianMatrix
@@ -352,10 +396,17 @@ def run_replay(
     usage_path = persona_dir / "chat_usage.jsonl"
     debug_path = persona_dir / "cache_debug.jsonl"
     # Byte sizes before the run (no parsing): only the bytes appended during the run are ever parsed.
+    tool_path = persona_dir / "tool_invocations.log.jsonl"
     usage_offset = _file_size(usage_path)
     debug_offset = _file_size(debug_path)
+    tool_offset = _file_size(tool_path)
 
-    provider = get_provider(provider_name)
+    if model is None:
+        provider = get_provider(provider_name)  # the chat model of tunables.toml
+    elif provider_name == "claude-cli":
+        provider = ClaudeCliProvider(probe_model=model)  # one explicit id for the whole run
+    else:
+        raise ValueError(f"--model applies to the claude-cli provider only, not {provider_name!r}")
     if force_text_path:
         provider = _TextPathProvider(provider)  # route every turn through the logging text path
     store = MemoryStore(persona_dir / "memories.db")
@@ -370,7 +421,7 @@ def run_replay(
         n = _seed_history_buffer(persona_dir, session.session_id, history_file, history_msgs)
         print(f"# seeded {n} history msgs from {history_file.name} (window caps replay to 80)", file=sys.stderr)
 
-    prompts = (REPLAY_PROMPTS * ((turns // len(REPLAY_PROMPTS)) + 1))[:turns]
+    prompts = _prompts_for(persona_dir, prompt_set, turns)
     sequence = (
         ([(0, WARMUP_PROMPT)] if warmup else [])
         + ([("p1", PLAIN_LEAD_PROMPT)] if plain_turns else [])
@@ -379,6 +430,9 @@ def run_replay(
     )
     replies: list[dict] = []
     boundaries: list[int] = []  # usage-file size after each turn: attributes the appended rows to their turns
+    tool_boundaries: list[int] = []  # the same for the tool log (#525 per-turn attribution)
+    turn_starts: list[datetime] = []
+    turn_ends: list[datetime] = []
     print(
         f"# cache replay — {turns} turns{' + warm-up' if warmup else ''}{' + 2 plain turns' if plain_turns else ''}, "
         f"session={session.session_id}",
@@ -387,6 +441,7 @@ def run_replay(
     try:
         for pos, (i, prompt) in enumerate(sequence):
             t0 = time.monotonic()
+            turn_starts.append(datetime.now(UTC))
             result = respond(
                 persona_dir,
                 prompt,
@@ -397,6 +452,8 @@ def run_replay(
             )
             dt = time.monotonic() - t0
             boundaries.append(_file_size(usage_path))
+            tool_boundaries.append(_file_size(tool_path))
+            turn_ends.append(datetime.now(UTC))
             replies.append({"turn": i, "prompt": prompt, "reply": result.content})
             label = "warm-up" if i == 0 else (f"plain {i}" if isinstance(i, str) else f"{i}/{turns}")
             print(
@@ -413,8 +470,10 @@ def run_replay(
     usage_all: list[dict] = []
     row_turns: list | None = None
     skipped = 0
+    usage_parse = None  # parsed once; _per_turn reuses it (a second parse would warn twice on a bad line)
     try:
         usage_all, skipped, counts, consistent = _read_run_slice(usage_path, usage_offset, boundaries)
+        usage_parse = (usage_all, skipped, counts, consistent)
         if skipped:
             rows_error = (
                 f"the shared jsonl reader skipped {skipped} corrupt or non-object line(s) among the "
@@ -449,10 +508,112 @@ def run_replay(
         debug_error=debug_error,
     )
     summary["with_tools"] = not force_text_path
+    summary["prompt_set"] = prompt_set
+    summary["model"] = model
+    summary["per_turn"], summary["per_turn_error"] = _per_turn(
+        [i for i, _ in sequence], [pr for _, pr in sequence], usage_parse, rows_error,
+        tool_path, tool_offset, tool_boundaries, turn_ends, turn_starts=turn_starts,
+    )
     summary["warmup_turn"] = warmup
     summary["plain_turns"] = plain_turns
     print(format_cache_break_line(summary["cache_break_check"]), file=sys.stderr)
     return summary, replies
+
+
+def _per_turn(ids, prompts, usage_parse, usage_error, tool_path, tool_offset, tool_boundaries, turn_ends, turn_starts=None):
+    """Per-turn usage and tool rows for the #525 behaviour oracles (scripts/replay_tool_oracles.py).
+
+    Returns (per_turn, None), or (None, reason) when the rows cannot be mapped 1:1 to turns: a log shrank or
+    was rotated, a line was skipped, or a tool row's timestamp falls outside its turn: stamped before the turn
+    began or after it ended. Rows are stamped when written, so this catches a late write from an earlier turn
+    only when it lands in the pause between turns; one that lands while the next turn is running is stamped
+    inside that turn and counted there without a signal (none of today's writers outlive their turn). Only
+    names, origins and outcomes are kept, never tool arguments.
+    """
+    if usage_parse is None:
+        return None, usage_error or "the usage rows could not be read"
+    usage, u_skip, u_counts, u_ok = usage_parse
+    try:
+        tools, t_skip, t_counts, t_ok = _read_run_slice(tool_path, tool_offset, tool_boundaries)
+    except (ValueError, OSError) as exc:
+        return None, str(exc)
+    if u_skip or t_skip or not u_ok or (tools and not t_ok):
+        return None, f"rows do not map 1:1 to turns (usage skipped {u_skip}, tool skipped {t_skip})"
+    out, u_at, t_at = [], 0, 0
+    for k, tid in enumerate(ids):
+        u_rows = usage[u_at : u_at + u_counts[k]]
+        t_rows = tools[t_at : t_at + t_counts[k]] if tools else []
+        u_at += u_counts[k]
+        t_at += t_counts[k] if tools else 0
+        for r in t_rows:
+            ts = _parse_ts(r.get("timestamp"))
+            if ts is not None and turn_starts is not None and ts < turn_starts[k]:
+                return None, f"a tool row ({r.get('name')}) in turn {tid!r}'s window is stamped before it began: a late write"
+            if ts is not None and ts > turn_ends[k]:
+                return None, f"a tool row ({r.get('name')}) is stamped after turn {tid!r} ended: a late write"
+        out.append(
+            {
+                "turn": tid,
+                "prompt": prompts[k],
+                "chat_rows": [
+                    {
+                        "cost_usd": r.get("total_cost_usd"),
+                        "num_turns": r.get("num_turns"),
+                        "cache_creation": r.get("cache_creation_input_tokens"),
+                        "cache_read": r.get("cache_read_input_tokens"),
+                        "duration_ms": r.get("duration_ms"),
+                    }
+                    for r in u_rows
+                    if r.get("call_type") == "chat"
+                ],
+                "tool_rows": [
+                    {"name": r.get("name"), "origin": r.get("origin"), "outcome": r.get("outcome"), "error": r.get("error")}
+                    for r in t_rows
+                ],
+            }
+        )
+    return out, None
+
+
+def _parse_ts(value):
+    try:
+        ts = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return ts if ts.tzinfo else ts.replace(tzinfo=UTC)
+
+
+def render_prompts(persona_dir: Path, *, prompt_set: str, seed: bool = True) -> list[dict]:
+    """Zero-token: the volatile context the brain would send with each prompt of `prompt_set` (#525 pre-A/B render).
+
+    Builds the same inputs respond() builds (voice, daemon state, soul store, memory store) and calls
+    build_volatile_context, with no provider and no model call. Each prompt is rendered on a persona with no
+    earlier turns, so a real replay's later turns can differ (recall counts move as turns go by).
+    """
+    from brain.chat.prompt import build_volatile_context
+    from brain.chat.voice import load_voice
+    from brain.engines.daemon_state import load_daemon_state
+    from brain.memory.store import MemoryStore
+    from brain.soul.store import SoulStore
+
+    store = MemoryStore(persona_dir / "memories.db")
+    soul = SoulStore(str(persona_dir / "crystallizations.db"))
+    try:
+        if seed:
+            _seed_persona_memories(store)
+        voice_md, _ = load_voice(persona_dir)
+        daemon_state, _ = load_daemon_state(persona_dir)
+        out = []
+        for prompt in _prompts_for(persona_dir, prompt_set, len(PROMPT_SETS[prompt_set])):
+            volatile = build_volatile_context(
+                persona_dir, voice_md=voice_md, daemon_state=daemon_state, soul_store=soul,
+                store=store, user_input=prompt, reply_to_audit_id=None,
+            )
+            out.append({"prompt": prompt, "volatile": volatile or ""})
+        return out
+    finally:
+        soul.close()
+        store.close()
 
 
 def _is_int(v) -> bool:
@@ -1017,6 +1178,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "omit to replay the full file where the sliding window defeats A+)",
     )
     p.add_argument(
+        "--prompt-set",
+        choices=sorted(PROMPT_SETS),
+        default="default",
+        help="content prompts: default (the cache workload), reach (#525: deferred brain tools) or recall (#525: memory reach)",
+    )
+    p.add_argument("--model", help="one explicit model id for the whole run, claude-cli provider only (default: the chat model in tunables.toml), e.g. haiku")
+    p.add_argument(
+        "--render-only",
+        action="store_true",
+        help="zero-token: print the volatile context each prompt of --prompt-set would carry; no provider, no model call",
+    )
+    p.add_argument(
         "--compare",
         nargs=2,
         type=Path,
@@ -1046,6 +1219,13 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    if args.render_only:
+        rendered = render_prompts(persona_dir, prompt_set=args.prompt_set, seed=not args.no_seed)
+        text = json.dumps(rendered, indent=2)
+        if args.out:
+            args.out.write_text(text, encoding="utf-8")
+        print(text)
+        return 0
     if args.turns < 1:
         print("ERROR: --turns must be ≥ 1", file=sys.stderr)
         return 1
@@ -1064,6 +1244,8 @@ def main(argv: list[str] | None = None) -> int:
         history_msgs=args.history_msgs,
         warmup=not args.no_warmup,
         plain_turns=not args.no_plain_turns,
+        prompt_set=args.prompt_set,
+        model=args.model,
     )
     text = json.dumps(summary, indent=2)
     if args.out:
