@@ -160,6 +160,52 @@ def test_a_blank_line_between_comment_and_entry_inserts_an_extra_comment_and_los
     assert out == '# default: 60.0\n\n# default: 90.0\n"k" = 60.0\n'
 
 
+# Rev-4 review S8: a description corrected in a later release reaches an existing file (the line directly above the
+# "# default:" line belongs to the pass, like the default line itself).
+
+
+def test_a_changed_description_replaces_the_description_line_and_keeps_the_value(t, tmp_path) -> None:
+    out = _run(t, tmp_path, _entry("75.0", "60.0"), 60.0, desc="Seconds to wait before it gives up.")
+    assert out == '# Seconds to wait before it gives up.\n# default: 60.0\n"k" = 75.0\n'
+
+
+def test_a_changed_description_and_a_bumped_default_both_land_in_one_pass(t, tmp_path) -> None:
+    out = _run(t, tmp_path, _entry("60.0", "60.0"), 90.0, desc="Seconds to wait before it gives up.")
+    assert out == '# Seconds to wait before it gives up.\n# default: 90.0\n"k" = 90.0\n'
+
+
+def test_a_user_comment_above_the_description_is_kept_when_the_description_changes(t, tmp_path) -> None:
+    text = '# my own note\n# What it does.\n# default: 60.0\n"k" = 61.0\n'
+    out = _run(t, tmp_path, text, 60.0, desc="New wording.")
+    assert out == '# my own note\n# New wording.\n# default: 60.0\n"k" = 61.0\n'
+
+
+def test_an_entry_written_without_a_description_gets_one(t, tmp_path) -> None:
+    out = _run(t, tmp_path, '# default: 60.0\n"k" = 61.0\n', 60.0, desc="Now described.")
+    assert out == '# Now described.\n# default: 60.0\n"k" = 61.0\n'
+
+
+def test_a_second_pass_after_a_description_refresh_writes_nothing(t, tmp_path) -> None:
+    _run(t, tmp_path, _entry("75.0", "60.0"), 60.0, desc="Changed.")
+    before = (_file(tmp_path).read_bytes(), _age(_file(tmp_path)))
+    t.sync_file()
+    assert (_file(tmp_path).read_bytes(), _file(tmp_path).stat().st_mtime_ns) == before
+
+
+def test_a_key_registered_without_a_description_leaves_the_comment_run_alone(t, tmp_path) -> None:
+    write_text(tmp_path, '# my note\n# default: 60.0\n"k" = 61.0\n')
+    t.register("k", 60.0)
+    t.sync_file()
+    assert _text(tmp_path) == '# my note\n# default: 60.0\n"k" = 61.0\n'
+
+
+def test_the_description_refresh_keeps_crlf_and_bom(t, tmp_path) -> None:
+    write_text(tmp_path, b'\xef\xbb\xbf# Old.\r\n# default: 60.0\r\n"k" = 61.0\r\n')
+    t.register("k", 60.0, description="New.")
+    t.sync_file()
+    assert _file(tmp_path).read_bytes() == b'\xef\xbb\xbf# New.\r\n# default: 60.0\r\n"k" = 61.0\r\n'
+
+
 def test_numerically_equal_int_and_float_count_as_equal(t, tmp_path) -> None:
     """A user who typed 600 for a float default 600.0 still follows bumps."""
     out = _run(t, tmp_path, _entry("600", "600.0"), 900.0)
@@ -253,6 +299,7 @@ def test_an_unregistered_key_and_every_user_comment_are_byte_identical_after_a_p
         "# my top note\n"
         '"stranger.key" = "keep me"  # stays\n'
         "\n"
+        "# What it does.\n"
         "# default: 60.0\n"
         '"k" = 60.0\n'
         "# trailing note\n"
@@ -386,6 +433,28 @@ def test_a_lock_timeout_skips_the_pass_and_writes_nothing(t, tmp_path, monkeypat
         t.sync_file()
     assert not _file(tmp_path).exists()
     assert any("not" in r.getMessage() for r in caplog.records)
+
+
+def test_sync_removes_the_temp_files_a_crashed_write_left_behind(t, tmp_path) -> None:
+    """Rev-4 review bycatch: a crash between the temp write and the replace leaves ``.tunables.toml.<pid>.<hex>.tmp``."""
+    t.register("a", 1, description="A.")
+    orphan = tmp_path / ".tunables.toml.4242.deadbeef.tmp"
+    orphan.write_bytes(b"half a write")
+    other = tmp_path / ".tunables.toml.notes.tmp"
+    other.write_bytes(b"not ours")
+    t.sync_file()
+    assert not orphan.exists() and other.exists()
+    assert read_values(tmp_path) == {"a": 1}
+
+
+def test_sync_removes_orphans_even_when_nothing_else_needs_writing(t, tmp_path) -> None:
+    t.register("a", 1, description="A.")
+    t.sync_file()
+    orphan = tmp_path / ".tunables.toml.1.0a0a0a0a.tmp"
+    orphan.write_bytes(b"x")
+    before = _file(tmp_path).stat().st_mtime_ns
+    t.sync_file()
+    assert not orphan.exists() and _file(tmp_path).stat().st_mtime_ns == before
 
 
 def test_sync_never_raises_into_startup(t, tmp_path, monkeypatch) -> None:

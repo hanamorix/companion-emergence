@@ -150,9 +150,27 @@ def test_an_io_unreadable_notice_stays_until_the_runtime_actually_reloads(tunabl
     notice = tunables.current_notice()
     assert notice is not None and notice["kind"] == "unreadable" and notice["line"] is None
     monkeypatch.setattr(toml_io, "_read_bytes", real)
-    assert tunables.current_notice() is not None  # the mtime did not change: still active
-    _touch_later(path, 5)
+    # Rev-4 review bycatch: a transient I/O failure says nothing about the content, so the notice ends as soon as a read
+    # succeeds, even though the file's mtime never changed (it used to stay until the mtime moved, saying "could not be read"
+    # while the settings were in effect).
+    assert tunables.current_notice() is None
     assert tunables.get_tunable("a.b", 60.0) == 1.0
+    assert tunables.current_notice() is None
+
+
+def test_a_content_failure_notice_still_waits_for_the_file_to_parse_even_when_the_mtime_is_equal(tunables, tmp_path):
+    path = tmp_path / _FILE
+    path.write_bytes(b"a = = 1\n")
+    tunables.sync_file()
+    assert tunables.current_notice() is not None
+    stamp = path.stat().st_mtime_ns
+    with open(path, "r+b") as fh:  # edited in place, still broken, the timestamp put back
+        fh.write(b"a = = 2\n")
+    os.utime(path, ns=(stamp, stamp))
+    assert tunables.current_notice() is not None
+    with open(path, "r+b") as fh:  # fixed in place with the timestamp put back: parses now, so the notice ends
+        fh.write(b"a = 22\n")
+    os.utime(path, ns=(stamp, stamp))
     assert tunables.current_notice() is None
 
 

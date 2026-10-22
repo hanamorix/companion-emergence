@@ -391,6 +391,43 @@ def test_a_content_failure_is_cached_once_and_leaves_the_notice(t, tmp_path, mon
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("bad", ["lone \ud800 surrogate", object(), {"a": 1}])
+def test_a_value_the_file_cannot_hold_raises_the_documented_tunables_write_error(t, tmp_path, bad) -> None:
+    """The docstring promises ``TunablesWriteError`` for every refusal; the pre-check used to leak ``TomlFileError`` (rev-4 S6)."""
+    from brain.utils import toml_io
+
+    write_text(tmp_path, 'a = 1\n')
+    with pytest.raises(t.TunablesWriteError) as err:
+        t.set_values({"a": bad})
+    assert not isinstance(err.value, toml_io.TomlFileError)
+    assert _bytes(tmp_path) == b"a = 1\n"
+
+
+def test_a_registered_key_reset_to_a_default_the_file_cannot_hold_also_raises_tunables_write_error(t, tmp_path) -> None:
+    t.register("odd", object())
+    with pytest.raises(t.TunablesWriteError):
+        t.set_values({"odd": None})
+    assert not _file(tmp_path).exists()
+
+
+def test_set_values_writes_through_a_symlinked_settings_file(t, tmp_path) -> None:
+    """A dotfile manager's link stays a link; the target holds the change (rev-4 review bycatch)."""
+    t.register("a", 1, description="A.")
+    target_dir = tmp_path / "dotfiles"
+    target_dir.mkdir()
+    target = target_dir / "tunables.toml"
+    target.write_bytes(b'# default: 1\n"a" = 1\n')
+    try:
+        _file(tmp_path).symlink_to(target)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are not available here")
+    assert t.set_values({"a": 5}) == {"a": 5}
+    assert _file(tmp_path).is_symlink()
+    assert target.read_bytes() == b'# default: 1\n"a" = 5\n'
+    t.sync_file()
+    assert _file(tmp_path).is_symlink() and read_values(tmp_path) == {"a": 5}
+
+
 def test_set_values_does_not_reacquire_a_lock_its_caller_holds(t, tmp_path, monkeypatch) -> None:
     """A nested acquire of the same sidecar is NOT granted (the lock is not re-entrant): a caller holding the tunables
     lock gets a TunablesWriteError from the bounded wait instead of hanging. Nothing in the product nests."""

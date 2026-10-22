@@ -292,6 +292,64 @@ def test_write_toml_text_removes_the_temp_file_when_the_replace_fails(tmp_path: 
     assert [c.name for c in tmp_path.iterdir()] == ["a.toml"]
 
 
+def test_write_toml_text_writes_through_a_symlink_and_keeps_the_link(tmp_path: Path) -> None:
+    """A dotfile manager may link the settings file to a file elsewhere: the write lands in the target and the link stays
+    (rev-4 review bycatch; an atomic replace onto the link used to turn it into a regular file)."""
+    target_dir = tmp_path / "dotfiles"
+    target_dir.mkdir()
+    target = target_dir / "real.toml"
+    target.write_bytes(b"old = 1\n")
+    link = tmp_path / "a.toml"
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are not available here")
+    toml_io.write_toml_text(link, b"new = 2\n")
+    assert link.is_symlink() and link.resolve() == target.resolve()
+    assert target.read_bytes() == b"new = 2\n"
+    assert toml_io.read_toml(link) == {"new": 2}
+    assert sorted(c.name for c in tmp_path.iterdir()) == ["a.toml", "dotfiles"]
+    assert [c.name for c in target_dir.iterdir()] == ["real.toml"]  # no temp file left beside the target
+
+
+def test_write_toml_text_replaces_a_dangling_link_as_before(tmp_path: Path) -> None:
+    link = tmp_path / "a.toml"
+    try:
+        link.symlink_to(tmp_path / "nowhere" / "x.toml")
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are not available here")
+    toml_io.write_toml_text(link, b"new = 2\n")
+    assert not link.is_symlink() and link.read_bytes() == b"new = 2\n"
+    assert not (tmp_path / "nowhere").exists()
+
+
+def test_remove_orphan_temp_files_removes_only_the_writers_leftovers(tmp_path: Path) -> None:
+    """A crash between the temp write and the replace leaves ``.<name>.<pid>.<hex>.tmp`` behind; only that shape goes."""
+    p = tmp_path / "tunables.toml"
+    p.write_bytes(b"a = 1\n")
+    orphans = [tmp_path / ".tunables.toml.4242.deadbeef.tmp", tmp_path / ".tunables.toml.7.0a1b2c3d.tmp"]
+    keep = [
+        tmp_path / ".tunables.toml.notes.tmp",  # not the writer's shape
+        tmp_path / ".other.toml.4242.deadbeef.tmp",  # another file's temp
+        tmp_path / "tunables.toml.bak",
+        tmp_path / ".tunables.toml.4242.deadbeef.tmp.keep",
+    ]
+    for f in [*orphans, *keep]:
+        f.write_bytes(b"x")
+    assert toml_io.remove_orphan_temp_files(p) == 2
+    assert not any(f.exists() for f in orphans)
+    assert all(f.exists() for f in keep) and p.read_bytes() == b"a = 1\n"
+    assert toml_io.remove_orphan_temp_files(p) == 0
+
+
+def test_remove_orphan_temp_files_is_quiet_when_the_folder_is_missing(tmp_path: Path) -> None:
+    assert toml_io.remove_orphan_temp_files(tmp_path / "nope" / "tunables.toml") == 0
+
+
+def test_a_read_result_carries_no_unused_text_field() -> None:
+    assert "text" not in {f.name for f in __import__("dataclasses").fields(toml_io.TomlRead)}
+
+
 def test_write_toml_text_is_atomic_for_a_polling_reader(tmp_path: Path) -> None:
     p = tmp_path / "a.toml"
     toml_io.write_toml_text(p, b'v = "0"\n')

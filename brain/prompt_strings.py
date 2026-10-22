@@ -145,3 +145,4 @@ def register_segments(key: str) -> list[str]:
 def _reset_for_tests() -> None:
     with _lock:
         _registry.clear()
+    toml_io._reset_cache_for_tests()  # the parse cache lives in toml_io now: forget it too

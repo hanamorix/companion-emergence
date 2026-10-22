@@ -8,6 +8,8 @@ plus every fail-closed branch the module implements.
 """
 from __future__ import annotations
 
+import os
+
 import pytest
 
 
@@ -136,3 +138,18 @@ def test_a_changed_file_is_read_again_and_an_unchanged_one_is_not_reparsed(promp
     assert len(parsed) == 1
     toml_path.write_text('k = "second"\n', encoding="utf-8")
     assert prompt_strings.get("k") == "second"
+
+
+def test_the_test_reset_also_forgets_the_parse_cache(prompt_strings, monkeypatch, tmp_path):
+    """``_reset_for_tests`` must clear the parse cache (it lives in ``toml_io`` now): a file rewritten in place with the same size
+    and the same timestamp reads as the old text otherwise (rev-4 review S3)."""
+    toml_path = tmp_path / "prompt_strings.toml"
+    toml_path.write_text('k = "one"\n', encoding="utf-8")
+    _point_at(prompt_strings, monkeypatch, toml_path)
+    assert prompt_strings.get("k") == "one"
+    stamp = toml_path.stat().st_mtime_ns
+    with open(toml_path, "r+b") as fh:  # same inode, same size, same timestamp: the cache's signature cannot tell
+        fh.write(b'k = "two"\n')
+    os.utime(toml_path, ns=(stamp, stamp))
+    prompt_strings._reset_for_tests()
+    assert prompt_strings.get("k") == "two"

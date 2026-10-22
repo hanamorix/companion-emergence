@@ -77,11 +77,11 @@ def test_a_second_start_does_nothing_no_lock_no_write(t, tmp_path, wedged_lock, 
 
 
 def test_the_toml_keeps_the_users_comments_and_unknown_keys_when_the_fold_writes(t, tmp_path) -> None:
-    write_text(tmp_path, '# mine\n"stranger" = "keep"  # note\n# default: 1.0\n"a.one" = 1.0\n')
+    write_text(tmp_path, '# mine\n"stranger" = "keep"  # note\n# One.\n# default: 1.0\n"a.one" = 1.0\n')
     _write_legacy(tmp_path, {"a.one": 4.0})
     migrate_legacy_json(tmp_path, complete_registry=True)
     text = (tmp_path / FILE_NAME).read_text(encoding="utf-8")
-    assert text.startswith('# mine\n"stranger" = "keep"  # note\n# default: 1.0\n"a.one" = 4.0\n')
+    assert text.startswith('# mine\n"stranger" = "keep"  # note\n# One.\n# default: 1.0\n"a.one" = 4.0\n')
 
 
 # ---------------------------------------------------------------------------

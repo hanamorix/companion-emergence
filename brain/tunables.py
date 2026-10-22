@@ -306,19 +306,18 @@ def _read_marker() -> dict[str, Any] | None:
 def _marker_is_active(marker: dict[str, Any]) -> bool:
     """Is the user still unaware of / not done with what the marker says?
 
-    Only the ``unreadable`` kind is ever acted on. The runtime reloads the values only when the file changes (it caches a
-    content failure until then; a failed I/O read is retried on the next call), so the notice ends only when the mtime
-    changed AND the file now parses; a permissions fix alone does not reload. A marker written by an older version (kinds
-    ``reset`` and ``restored``, which described a JSON file the app no longer reads) is inactive and is removed at boot.
+    Only the ``unreadable`` kind is ever acted on. The notice ends as soon as the file reads and parses: a content failure
+    ends when the file is fixed, and a transient I/O failure (a Windows replace in flight, a momentary permission problem)
+    ends at the next successful read even though the file's mtime never changed, because it said nothing about the content.
+    A marker written by an older version (kinds ``reset`` and ``restored``, which described a JSON file the app no longer
+    reads) is inactive and is removed at boot.
     """
     if marker["kind"] != "unreadable":
         return False
     path = _file_path()
     try:
-        now = path.stat().st_mtime_ns
+        path.stat()
     except OSError:
-        return True
-    if marker.get("mtime_ns") == now:
         return True
     return toml_io.read_toml_result(path).outcome not in ("ok", "empty")
 
@@ -439,11 +438,24 @@ def _apply_sync(doc: toml_io.TomlDocument, registry: dict[str, Any], description
         if known and _equal(current, old_default) and not _equal(old_default, default):
             doc.set_value(key, default)
             intended[key] = default
+        new_run = list(run)
         if not known or not _equal(old_default, default):
             if index is None:
-                new_run = [*run, comment]
+                new_run.append(comment)
             else:
-                new_run = [*run[:index], comment, *run[index + 1 :]]
+                new_run[index] = comment
+        if index is not None:
+            # The line directly above the "# default:" line is the setting's description, owned by the pass like the default
+            # line itself: a description corrected in a later release reaches an existing file, and an entry written before
+            # the key had a description gets one. Comments the user put above it are never touched. A key with no description
+            # leaves the run alone.
+            wanted = _description_lines(key, descriptions)
+            if wanted:
+                if index == 0:
+                    new_run.insert(0, wanted[0])
+                elif run[index - 1].strip() != wanted[0]:
+                    new_run[index - 1] = wanted[0]
+        if new_run != run:
             doc.set_comment_above(key, new_run)
     return intended
 
@@ -467,6 +479,8 @@ def sync_file() -> None:
     unreadable: toml_io.TomlRead | None = None
     try:
         with locked_within(path, dev_constants.SETTINGS_FILE_LOCK_WAIT_S):
+            # Every writer of the file holds this lock, so a temp file of the writer's shape is a crashed write's leftover.
+            toml_io.remove_orphan_temp_files(path)
             res = toml_io.read_toml_result(path)
             if res.outcome in ("damaged", "io"):
                 unreadable = res
@@ -525,7 +539,10 @@ def set_values(updates: dict[str, Any], *, only_if_default: bool = False) -> dic
     for key, value in updates.items():
         if value is None and key not in registry:
             raise ValueError(f"{key} is not a registered setting, so there is no default to reset it to")
-        toml_io.dumps_value(registry[key] if value is None else value)  # a value the file cannot hold fails here, before any lock
+        try:
+            toml_io.dumps_value(registry[key] if value is None else value)  # a value the file cannot hold fails here, before any lock
+        except toml_io.TomlFileError as exc:
+            raise TunablesWriteError(f"{key}: the value cannot be written to the settings file ({exc.reason or exc}); nothing was written") from exc
     path = _file_path()
     try:
         with locked_within(path, dev_constants.SETTINGS_FILE_LOCK_WAIT_S):
