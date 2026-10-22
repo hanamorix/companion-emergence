@@ -20,7 +20,7 @@ def _persona(tmp_path: Path, model: str) -> Path:
     d = tmp_path / "persona"
     d.mkdir()
     (d / "persona_config.json").write_text(json.dumps({"provider": "claude-cli", "searcher": "noop"}))
-    tunables.set_overrides({"model.interactive_chat": model})
+    tunables.set_values({"model.interactive_chat": model})
     return d
 
 

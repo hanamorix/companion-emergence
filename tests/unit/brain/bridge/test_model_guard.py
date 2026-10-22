@@ -17,7 +17,7 @@ G3  no copy of an accessor result that outlives the call (module or class scope,
 G4  no constructor bypass (``model=`` on the CLI provider, ``probe_model=`` outside the one probe, the retired
     identifiers).
 G5  key ownership (no ``model.`` key literal outside ``model_tier.py``; only ``set_job_models`` calls
-    ``tunables.set_overrides``).
+    ``tunables.set_values``).
 """
 
 from __future__ import annotations
@@ -211,7 +211,7 @@ def _shape_of(p: Parsed, node: ast.Constant) -> str | None:
         return "label_keyword"
     # the picker vocabulary inside resolve_choice / choice_for
     fn = _enclosing_function(p, node)
-    if fn is not None and fn.name in ("resolve_choice", "choice_for"):
+    if fn is not None and fn.name in ("resolve_choice", "choice_for", "needs_probe"):
         return "choice_word"
     # def f(*, model_tier: str = "haiku")
     if isinstance(parent, ast.arguments):
@@ -470,10 +470,14 @@ def check_g5(source: str, relpath: str) -> list[str]:
             and id(node) not in docs
         ):
             out.append(f"G5 {relpath}:{node.lineno}: model. key literal {node.value!r} outside model_tier.py")
-        if isinstance(node, ast.Call) and _call_name(p, node) == "set_overrides" and relpath != "tunables.py":
+        if isinstance(node, ast.Call) and _call_name(p, node) == "set_values" and relpath != "tunables.py":
             fn = _enclosing_function(p, node)
+            # The legacy-file fold writes whatever keys an old tunables.json held, naming none of them: it is key-agnostic,
+            # so it cannot know a model key (nothing to leak). Every model-specific writer goes through set_job_models.
+            if relpath == "tunables_migration.py":
+                continue
             if not (owner and getattr(fn, "name", None) == "set_job_models"):
-                out.append(f"G5 {relpath}:{node.lineno}: set_overrides called outside set_job_models")
+                out.append(f"G5 {relpath}:{node.lineno}: set_values called outside set_job_models")
     return out
 
 
@@ -608,7 +612,7 @@ _VIOLATING = {
     "env_model": "def f(env):\n    env['ANTHROPIC_MODEL'] = 'x'\n",
     "env_default_model": "def f(env):\n    env['ANTHROPIC_DEFAULT_SONNET_MODEL'] = 'x'\n",
     "model_key_literal": "KEY = 'model.interactive_chat'\n",
-    "set_overrides_elsewhere": "from brain import tunables\ndef f():\n    tunables.set_overrides({'a': 1})\n",
+    "set_values_elsewhere": "from brain import tunables\ndef f():\n    tunables.set_values({'a': 1})\n",
     "constructor_model": "from brain.bridge.provider import ClaudeCliProvider\np = ClaudeCliProvider(model='x')\n",
     "probe_model_elsewhere": "from brain.bridge.provider import ClaudeCliProvider\ndef f(x):\n    return ClaudeCliProvider(probe_model=x)\n",
     "retired_identifier": "from x import TIER_MODEL\n",

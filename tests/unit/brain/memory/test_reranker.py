@@ -14,7 +14,6 @@ integration" — requires_network alone is not part of that expression).
 from __future__ import annotations
 
 import ast as _ast
-import json
 import sys
 from unittest.mock import mock_open
 
@@ -200,7 +199,7 @@ def test_ac3_reranker_precision_override_loads_fp32_instead(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
     """AC3: with `reranker.precision` explicitly overridden to fp32 (the
-    SAME tunables.json override mechanism `test_manual_override_wins_over_
+    SAME tunables.toml setting mechanism `test_manual_override_wins_over_
     avx2_auto_detected_default` above exercises for the latency budget),
     the fp32 export loads instead of fp16 — proving the pin is a DEFAULT,
     not a hard removal of operator choice. fp16 registration must never
@@ -209,10 +208,7 @@ def test_ac3_reranker_precision_override_loads_fp32_instead(
 
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
     tunables_mod._reset_for_tests()
-    (tmp_path / "tunables.json").write_text(
-        json.dumps({"defaults": {}, "overrides": {"reranker.precision": "fp32"}}),
-        encoding="utf-8",
-    )
+    (tmp_path / "tunables.toml").write_text('"reranker.precision" = "fp32"\n', encoding="utf-8")
 
     _reset_reranker_provider_cache()
     constructed: list[str] = []
@@ -290,7 +286,7 @@ def test_default_latency_budget_is_4s_when_avx2_not_detected() -> None:
 def test_manual_override_wins_over_avx2_auto_detected_default(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
-    """A manual tunables.json override for reranker.latency_budget_seconds
+    """A manual tunables.toml value for reranker.latency_budget_seconds
     must win over the AVX2-auto-detected default — regardless of what that
     default resolved to — per #250 §3's "manual override takes precedence"
     requirement. Simulates an AVX2-detected host (default would be 2.0s,
@@ -301,10 +297,7 @@ def test_manual_override_wins_over_avx2_auto_detected_default(
 
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
     tunables_mod._reset_for_tests()
-    (tmp_path / "tunables.json").write_text(
-        json.dumps({"defaults": {}, "overrides": {"reranker.latency_budget_seconds": 0.25}}),
-        encoding="utf-8",
-    )
+    (tmp_path / "tunables.toml").write_text('"reranker.latency_budget_seconds" = 0.25\n', encoding="utf-8")
     # The auto-detected default this process would otherwise use (as if
     # AVX2 were detected) — the override must win over THIS, not just over
     # some arbitrary fallback.

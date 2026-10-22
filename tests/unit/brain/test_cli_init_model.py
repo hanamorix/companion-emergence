@@ -1,8 +1,9 @@
 """`nell init --model` writes the install-wide chat model setting (#441, #529: C12). No Claude CLI call at init.
 
-A WORD follows the one write rule (the word that means the chat default removes the line or writes nothing, opus
-writes the Opus id, haiku writes the alias); a FULL ID is always written exactly as given, even when it equals the
-default. Omitted, blank or EOF writes nothing. The persona file no longer holds a model.
+The pick is WRITTEN as the entry's value (sonnet is the chat default id, opus the Opus id, haiku the alias, a full id exactly
+as given); nothing is ever removed, and a value that already equals the pick writes nothing. A setting equal to the shipped
+default follows later default changes (owner decision). Omitted, blank or EOF writes nothing. The persona file no longer
+holds a model.
 """
 
 from __future__ import annotations
@@ -37,33 +38,42 @@ def _cfg(tmp_path: Path) -> dict:
     return json.loads((tmp_path / "personas" / "siren" / "persona_config.json").read_text())
 
 
-@pytest.mark.parametrize("model_id", ["claude-sonnet-5", "claude-opus-4-8", "claude-3-5-haiku-20241022"])
-def test_a_full_id_is_written_verbatim_even_when_it_equals_the_default(monkeypatch, tmp_path: Path, capsys, model_id):
+@pytest.mark.parametrize("model_id", ["claude-opus-4-8", "claude-3-5-haiku-20241022"])
+def test_a_full_id_is_written_verbatim(monkeypatch, tmp_path: Path, capsys, model_id):
     assert _init(monkeypatch, tmp_path, model_id) == 0
-    assert tunables.get_override(_KEY) == model_id
+    assert tunables.get_raw(_KEY) == model_id
     cfg = _cfg(tmp_path)
     assert "model" not in cfg and "tier_models" not in cfg and "derived_unavailable" not in cfg
     assert model_id in capsys.readouterr().out
 
 
-def test_the_word_for_the_default_writes_nothing(monkeypatch, tmp_path: Path):
+def test_the_word_for_the_default_writes_nothing_when_the_value_already_is_the_default(monkeypatch, tmp_path: Path):
     assert _init(monkeypatch, tmp_path, "sonnet") == 0
-    assert tunables.get_override(_KEY) is None
-    assert not (tmp_path / "tunables.json").exists()
+    assert tunables.get_raw(_KEY) is None  # no entry yet: the boot pass creates it with the default
+    assert not (tmp_path / "tunables.toml").exists()
 
 
-def test_the_word_for_the_default_removes_an_existing_line(monkeypatch, tmp_path: Path):
+def test_a_full_id_equal_to_the_default_writes_nothing_and_the_chat_runs_it(monkeypatch, tmp_path: Path, capsys):
+    from brain.bridge.model_tier import TIER_INTERACTIVE_CHAT, model_for_tier
+
+    assert _init(monkeypatch, tmp_path, "claude-sonnet-5") == 0
+    assert model_for_tier(TIER_INTERACTIVE_CHAT) == "claude-sonnet-5"
+    assert not (tmp_path / "tunables.toml").exists()  # equal to the default: nothing to write, it follows the default
+    assert "claude-sonnet-5" in capsys.readouterr().out
+
+
+def test_the_word_for_the_default_writes_the_default_id_over_another_value_and_keeps_the_entry(monkeypatch, tmp_path: Path):
     (tmp_path).mkdir(exist_ok=True)
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
-    tunables.set_overrides({_KEY: "claude-sonnet-4-6"})
+    tunables.set_values({_KEY: "claude-sonnet-4-6"})
     assert _init(monkeypatch, tmp_path, "sonnet") == 0
-    assert tunables.get_override(_KEY) is None
+    assert tunables.get_raw(_KEY) == "claude-sonnet-5"  # the entry stays and holds the id the word means
 
 
 @pytest.mark.parametrize(("word", "written"), [("opus", "claude-opus-5"), ("haiku", "haiku")])
 def test_opus_and_haiku_write_their_meaning(monkeypatch, tmp_path: Path, word, written):
     assert _init(monkeypatch, tmp_path, word) == 0
-    assert tunables.get_override(_KEY) == written
+    assert tunables.get_raw(_KEY) == written
 
 
 def test_the_persona_file_has_exactly_the_keys_it_had_without_a_model(monkeypatch, tmp_path: Path):
@@ -81,7 +91,7 @@ def test_invalid_model_is_refused_and_nothing_is_written(monkeypatch, tmp_path: 
     assert exc.value.code == 2
     assert "claude-" in capsys.readouterr().err
     assert not (tmp_path / "personas" / "siren").exists()
-    assert not (tmp_path / "tunables.json").exists()
+    assert not (tmp_path / "tunables.toml").exists()
 
 
 def test_omitted_blank_or_eof_writes_nothing(monkeypatch, tmp_path: Path):
@@ -91,12 +101,12 @@ def test_omitted_blank_or_eof_writes_nothing(monkeypatch, tmp_path: Path):
     it = iter(answers)
     monkeypatch.setattr("builtins.input", lambda *a, **kw: next(it))
     assert cli.main(["init"]) == 0
-    assert tunables.get_override(_KEY) is None and not (tmp_path / "tunables.json").exists()
+    assert tunables.get_raw(_KEY) is None and not (tmp_path / "tunables.toml").exists()
 
 
 def test_the_interactive_prompt_shows_the_current_effective_chat_id(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
-    tunables.set_overrides({_KEY: "claude-sonnet-4-6"})
+    tunables.set_values({_KEY: "claude-sonnet-4-6"})
     cli._build_parser()
     seen: list[str] = []
     answers = iter(["siren", "Ada", "n", "default", ""])
@@ -113,16 +123,17 @@ def test_the_interactive_prompt_shows_the_current_effective_chat_id(monkeypatch,
 def test_interactive_prompt_accepts_a_typed_full_id(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
     cli._build_parser()
-    answers = iter(["siren", "Ada", "n", "default", "bogus!", "claude-sonnet-5"])  # the first model answer is invalid
+    answers = iter(["siren", "Ada", "n", "default", "bogus!", "claude-opus-4-8"])  # the first model answer is invalid
     monkeypatch.setattr("builtins.input", lambda *a, **kw: next(answers))
     with patch("subprocess.run", side_effect=AssertionError), patch("subprocess.Popen", side_effect=AssertionError):
         assert cli.main(["init"]) == 0
-    assert tunables.get_override(_KEY) == "claude-sonnet-5"
+    assert tunables.get_raw(_KEY) == "claude-opus-4-8"
 
 
 def test_a_settings_file_that_cannot_be_changed_is_reported_and_exits_non_zero(monkeypatch, tmp_path: Path, capsys):
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
-    (tmp_path / "tunables.json").write_text("{not json")
+    (tmp_path / "tunables.toml").write_text("a = = 1\n")
     assert _init(monkeypatch, tmp_path, "opus") == 1
-    assert "could not be saved" in capsys.readouterr().err
-    assert (tmp_path / "tunables.json").read_text() == "{not json"
+    err = capsys.readouterr().err
+    assert "could not be saved" in err and "line 1" in err  # the reason names the failing line
+    assert (tmp_path / "tunables.toml").read_text() == "a = = 1\n"

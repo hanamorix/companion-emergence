@@ -402,7 +402,7 @@ def test_reworded_rejection_on_the_ndjson_path_is_recorded_warned_and_reported(t
     d = tmp_path / "p2"
     d.mkdir()
     (d / "persona_config.json").write_text(json.dumps({"provider": "claude-cli"}))
-    tunables.set_overrides({"model.interactive_chat": BAD})  # the chat job is configured with the rejected id
+    tunables.set_values({"model.interactive_chat": BAD})  # the chat job is configured with the rejected id
     assert [r["model"] for r in build_persona_state(d)["model_rejections"]] == [BAD]
 
 
@@ -582,7 +582,7 @@ def test_apply_refuses_a_reworded_rejection_because_the_check_reads_the_code(per
         ):
             r = c.post("/persona/config/model", json={"model": BAD})
     assert r.status_code == 400 and r.json() == {"ok": False, "error": "model_unavailable", "model": BAD}
-    assert tunables.get_override("model.interactive_chat") is None and BAD not in tunables._file_path().read_text()
+    assert tunables.get_raw("model.interactive_chat") == "claude-sonnet-5" and BAD not in tunables._file_path().read_text()
 
 
 def test_generate_json_argv_is_unaffected_by_the_probe():

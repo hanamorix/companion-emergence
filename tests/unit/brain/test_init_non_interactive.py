@@ -33,5 +33,5 @@ def test_init_handler_non_interactive_under_eof(tmp_path: Path, monkeypatch) -> 
     rc = cli._init_handler(args)
     assert rc == 0
 
-    assert tunables.get_override("model.interactive_chat") is None  # the prompt EOF'd to "keep the current setting"
-    assert not (tmp_path / "tunables.json").exists()  # and wrote nothing
+    assert tunables.get_raw("model.interactive_chat") is None  # the prompt EOF'd to "keep the current setting"
+    assert not (tmp_path / "tunables.toml").exists()  # and wrote nothing

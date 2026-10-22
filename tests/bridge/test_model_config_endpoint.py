@@ -1,8 +1,8 @@
 """POST /persona/config/model: set the install-wide chat model (#529: C11, C35, C42 e).
 
-The chat model is the `model.interactive_chat` line of the tunables file; the endpoint applies the one write rule to
-the raw body value, probes only a value it is about to write that is not an alias word, and answers with the id the
-chat job runs after the write. Nothing is hot-swapped: the next chat call reads the file.
+The chat model is the `model.interactive_chat` entry of tunables.toml; the endpoint writes the pick as the entry's value,
+probes `opus` and any typed id (not the words `sonnet` and `haiku`), and answers with the id the chat job runs after the
+write. Nothing is hot-swapped: the next chat call reads the file.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from brain import dev_constants, tunables
 from brain.bridge import model_error, server
 from brain.bridge.model_tier import TIER_INTERACTIVE_CHAT
 from brain.bridge.server import build_app
+from tests.tunables_file import differing_from_defaults
 
 _CHAT = "model.interactive_chat"
 _OPUS = "claude-opus-5"
@@ -33,30 +34,32 @@ def _make_client(tmp_path: Path, *, provider: str = "claude-cli", auth_token: st
 
 
 def _overrides() -> dict:
-    p = tunables._file_path()
-    return json.loads(p.read_text(encoding="utf-8")).get("overrides", {}) if p.exists() else {}
+    return differing_from_defaults()
 
 
 def _post(client, model):
     return client.post("/persona/config/model", json={"model": model})
 
 
-def test_sonnet_removes_an_existing_line_and_asks_no_claude(tmp_path, capture_claude_argv) -> None:
-    tunables.set_overrides({_CHAT: _OPUS})
+def test_sonnet_writes_the_chat_default_id_over_another_value_and_asks_no_claude(tmp_path, capture_claude_argv) -> None:
+    tunables.set_values({_CHAT: _OPUS})
     client, _ = _make_client(tmp_path)
     with client:
         r = _post(client, "sonnet")
     assert r.status_code == 200 and r.json() == {"ok": True, "model": "claude-sonnet-5"}
+    assert tunables.get_raw(_CHAT) == "claude-sonnet-5"  # the entry stays and holds the id (nothing is removed)
     assert _CHAT not in _overrides()
     assert capture_claude_argv.argvs == []
 
 
-def test_sonnet_with_no_line_writes_nothing(tmp_path) -> None:
+def test_sonnet_when_the_value_already_is_the_default_writes_nothing_and_does_not_touch_the_file(tmp_path) -> None:
     client, _ = _make_client(tmp_path)
     with client:
+        before = (tunables._file_path().read_bytes(), tunables._file_path().stat().st_mtime_ns)
         r = _post(client, "sonnet")
+        after = (tunables._file_path().read_bytes(), tunables._file_path().stat().st_mtime_ns)
     assert r.status_code == 200 and r.json()["model"] == "claude-sonnet-5"
-    assert not tunables._file_path().exists() or _CHAT not in _overrides()
+    assert after == before
 
 
 def test_opus_writes_the_opus_id_after_one_probe(tmp_path, capture_claude_argv) -> None:
@@ -97,12 +100,15 @@ def test_the_apps_check_free_words_are_exactly_the_words_the_bridge_never_probes
     assert probed == (word not in check_free), f"{word}: probed={probed}, listed check-free={check_free}"
 
 
-def test_a_full_id_is_written_verbatim_even_when_it_equals_the_default(tmp_path, capture_claude_argv) -> None:
+def test_a_typed_full_id_equal_to_the_default_is_probed_and_changes_nothing_in_the_file(tmp_path, capture_claude_argv) -> None:
+    """A typed id is checked even when it equals the default (a typo of the default would otherwise slip through); the
+    value already is that id, so nothing is written, and it follows later changes of the default (owner decision)."""
     client, _ = _make_client(tmp_path)
     with client:
+        before = tunables._file_path().read_bytes()
         r = _post(client, "claude-sonnet-5")
+        assert tunables._file_path().read_bytes() == before
     assert r.status_code == 200 and r.json()["model"] == "claude-sonnet-5" and r.json()["checked"] is True
-    assert _overrides()[_CHAT] == "claude-sonnet-5"
     assert capture_claude_argv.models == ["claude-sonnet-5"]
 
 
@@ -159,12 +165,13 @@ def test_a_non_claude_persona_is_refused_and_nothing_is_written(tmp_path, provid
 def test_a_damaged_settings_file_answers_500_and_is_not_touched(tmp_path) -> None:
     client, _ = _make_client(tmp_path)
     with client:
-        tunables._file_path().write_text("{not json")  # damaged while the bridge runs (a writer never heals it)
+        tunables._file_path().write_text('# mine\na = 1\nb = = 2\n')  # damaged while the bridge runs (a writer never repairs it)
         r = _post(client, "haiku")
     assert r.status_code == 500
     body = r.json()
-    assert body["ok"] is False and body["error"] == "tunables_unwritable" and "not usable" in body["detail"]
-    assert tunables._file_path().read_text() == "{not json"
+    assert body["ok"] is False and body["error"] == "tunables_unwritable"
+    assert "line 3" in body["detail"] and "tunables.toml" in body["detail"]  # the detail names the failing line
+    assert tunables._file_path().read_text() == '# mine\na = 1\nb = = 2\n'
 
 
 def test_a_wedged_lock_answers_500_and_writes_nothing(tmp_path, wedged_lock, monkeypatch) -> None:
@@ -193,7 +200,7 @@ def test_state_reports_the_effective_id_and_the_picker_choice_and_the_provider_n
         assert _post(client, "claude-sonnet-4-6").status_code == 200
         conn = client.get("/persona/state").json()["connection"]
         assert conn["model"] == "claude-sonnet-4-6" and conn["model_choice"] is None
-        assert _post(client, "sonnet").status_code == 200  # the removed line still highlights Sonnet
+        assert _post(client, "sonnet").status_code == 200  # a value equal to the chat default highlights Sonnet
         conn = client.get("/persona/state").json()["connection"]
         assert conn["model"] == "claude-sonnet-5" and conn["model_choice"] == "sonnet"
 

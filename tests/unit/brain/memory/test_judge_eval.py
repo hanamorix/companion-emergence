@@ -417,7 +417,7 @@ def test_run_champion_challenger_uses_tunable_defaults_when_alpha_min_n_omitted(
     from brain import tunables
 
     monkeypatch.setattr(
-        tunables, "_load_overrides_locked", lambda: {"judge_selftune.eval_min_test_n": 100}
+        tunables, "_load_values_locked", lambda: {"judge_selftune.eval_min_test_n": 100}
     )
     test_items = [(f"t{i}", "relevant") for i in range(5)]
     champion = _CountingLabelFn({f"t{i}": "irrelevant" for i in range(5)})

@@ -6,7 +6,6 @@ The oracle is the argv of the ``claude`` process the REAL provider code builds (
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import subprocess
@@ -114,12 +113,12 @@ def test_every_job_spawns_its_default_and_one_override_line_moves_only_that_job(
         _call(provider, path, persona_dir)
         assert capture_claude_argv.last_model == _DEFAULTS[tier] == model_for_tier(tier)
     # ONE override line, no restart, the SAME provider objects
-    tunables.set_overrides({_KEYS[TIER_BACKGROUND_GENERATIVE]: "claude-sonnet-6"})
+    tunables.set_values({_KEYS[TIER_BACKGROUND_GENERATIVE]: "claude-sonnet-6"})
     for tier, provider in providers.items():
         _call(provider, path, persona_dir)
         expected = "claude-sonnet-6" if tier == TIER_BACKGROUND_GENERATIVE else _DEFAULTS[tier]
         assert capture_claude_argv.last_model == expected
-    tunables.set_overrides({_KEYS[TIER_BACKGROUND_GENERATIVE]: None})  # deleting the line restores the default
+    tunables.set_values({_KEYS[TIER_BACKGROUND_GENERATIVE]: None})  # deleting the line restores the default
     _call(providers[TIER_BACKGROUND_GENERATIVE], path, persona_dir)
     assert capture_claude_argv.last_model == "claude-sonnet-5"
 
@@ -128,7 +127,7 @@ def test_a_provider_holds_a_job_name_not_a_model() -> None:
     provider = ClaudeCliProvider(TIER_COMPACTION)
     assert vars(provider)["_tier"] == TIER_COMPACTION
     assert provider.name() == "claude-cli:haiku"
-    tunables.set_overrides({_KEYS[TIER_COMPACTION]: "claude-haiku-4-5"})
+    tunables.set_values({_KEYS[TIER_COMPACTION]: "claude-haiku-4-5"})
     assert provider.name() == "claude-cli:claude-haiku-4-5"
 
 
@@ -167,7 +166,7 @@ def test_a_saved_sonnet_opus_or_full_id_keeps_running_that_model_after_the_move(
     model_override(TIER_INTERACTIVE_CHAT, "sonnet")
     ClaudeCliProvider(TIER_INTERACTIVE_CHAT).chat(_MSGS)
     assert capture_claude_argv.last_model == "claude-sonnet-5"
-    assert tunables.get_override(_KEYS[TIER_INTERACTIVE_CHAT]) is None
+    assert tunables.get_raw(_KEYS[TIER_INTERACTIVE_CHAT]) is None
     model_override(TIER_INTERACTIVE_CHAT, "opus")
     ClaudeCliProvider(TIER_INTERACTIVE_CHAT).chat(_MSGS)
     assert capture_claude_argv.last_model == OPUS_CHOICE
@@ -214,7 +213,7 @@ def test_a_malformed_override_runs_the_default_warns_once_per_value_and_leaves_t
     path = tunables._file_path()
     for bad in _BAD_VALUES:
         tunables._warned_keys.clear()  # the wrong-type warning is once per key per process
-        tunables.set_overrides({key: bad})
+        tunables.set_values({key: bad})
         before = path.read_bytes()
         log_throttle._last.clear()
         caplog.clear()
@@ -229,7 +228,7 @@ def test_a_malformed_override_runs_the_default_warns_once_per_value_and_leaves_t
 
 
 def test_a_bad_value_never_reaches_argv(persona_dir, capture_claude_argv) -> None:
-    tunables.set_overrides({_KEYS[TIER_INTERACTIVE_CHAT]: "banana"})
+    tunables.set_values({_KEYS[TIER_INTERACTIVE_CHAT]: "banana"})
     ClaudeCliProvider(TIER_INTERACTIVE_CHAT).generate("hi")
     assert capture_claude_argv.last_model == "claude-sonnet-5"
 
@@ -240,7 +239,7 @@ def test_an_unknown_id_fails_once_then_falls_back_and_keeps_the_notice(persona_d
     stays."""
     bad = "claude-sonet-5"
     capture_claude_argv.reject(bad)
-    tunables.set_overrides({_KEYS[TIER_INTERACTIVE_CHAT]: bad})
+    tunables.set_values({_KEYS[TIER_INTERACTIVE_CHAT]: bad})
     before = tunables._file_path().read_bytes()
     provider = ClaudeCliProvider(TIER_INTERACTIVE_CHAT)
     with pytest.raises(Exception):  # noqa: B017 - the CLI's rejection surfaces as the provider's failure
@@ -259,7 +258,7 @@ def test_every_job_falls_back_to_its_own_default_after_a_rejection(tier, persona
     (2) exactly one failing call per process per rejected id happens before the fallback engages."""
     bad = "claude-nonexistent-9"
     capture_claude_argv.reject(bad)
-    tunables.set_overrides({_KEYS[tier]: bad})
+    tunables.set_values({_KEYS[tier]: bad})
     provider = ClaudeCliProvider(tier)
     with pytest.raises(Exception):  # noqa: B017
         provider.generate("tick")
@@ -295,7 +294,7 @@ _X = "claude-sonnet-4-9"
 
 def _reject_x_and_fall_back(capture, tier=TIER_INTERACTIVE_CHAT) -> None:
     capture.reject(_X)
-    tunables.set_overrides({_KEYS[tier]: _X})
+    tunables.set_values({_KEYS[tier]: _X})
     p = ClaudeCliProvider(tier)
     with pytest.raises(Exception):  # noqa: B017
         p.generate("tick")
@@ -312,13 +311,21 @@ def test_set_job_models_clears_the_record_of_a_written_id(capture_claude_argv) -
     assert model_for_tier(TIER_INTERACTIVE_CHAT) == _X
 
 
-def test_removing_the_override_by_picking_the_default_word_clears_the_record_of_the_removed_id(
-    capture_claude_argv,
-) -> None:
-    """C30 (f): the word that means the job's default removes the line, and the removed id's record goes with it."""
+def test_picking_the_default_word_clears_the_record_of_the_id_it_replaces(capture_claude_argv) -> None:
+    """C30 (f): the word that means the job's default writes the default id over the rejected one, and the replaced id's
+    record goes with it."""
     _reject_x_and_fall_back(capture_claude_argv)
     set_job_models({TIER_INTERACTIVE_CHAT: "sonnet"})
-    assert tunables.get_override(_KEYS[TIER_INTERACTIVE_CHAT]) is None
+    assert tunables.get_raw(_KEYS[TIER_INTERACTIVE_CHAT]) == _DEFAULTS[TIER_INTERACTIVE_CHAT]
+    assert not model_error.is_rejected(_X)
+    assert model_error.state() == []
+
+
+def test_the_reset_path_clears_the_record_of_the_id_it_replaces(capture_claude_argv) -> None:
+    """C30 (f), rev4: `clear-tier` resets the job to its default (the entry stays) and forgets the replaced id."""
+    _reject_x_and_fall_back(capture_claude_argv)
+    set_job_models({TIER_INTERACTIVE_CHAT: None})
+    assert tunables.get_raw(_KEYS[TIER_INTERACTIVE_CHAT]) == _DEFAULTS[TIER_INTERACTIVE_CHAT]
     assert not model_error.is_rejected(_X)
     assert model_error.state() == []
 
@@ -373,11 +380,10 @@ def test_a_write_by_another_process_ends_the_fallback_and_a_still_bad_id_falls_b
             [sys.executable, "-c", code, "haiku"], check=True, env={**os.environ, "KINDLED_HOME": str(tunables._file_path().parent)}
         )
     elif edit == "hand_edit_of_any_key":
-        data = json.loads(tunables._file_path().read_text())
-        data["overrides"]["some.other.key"] = 1
-        tunables._file_path().write_text(json.dumps(data))
+        path = tunables._file_path()
+        path.write_text(path.read_text(encoding="utf-8") + '"some.other.key" = 1\n', encoding="utf-8")
     else:  # another persona's bridge boot rewrites the whole file
-        tunables.write_defaults_section()
+        tunables.sync_file()
     _bump_mtime_past_the_record()
     provider = ClaudeCliProvider(TIER_INTERACTIVE_CHAT)
     # no restart, no state reset: the id is tried again
@@ -414,7 +420,7 @@ def test_an_id_moved_away_from_and_configured_again_by_an_external_write_still_g
     the `activate` call in model_for_tier the failure is dropped silently (no record, no fallback, no notice)."""
     model_error.switch(_X, "claude-sonnet-5")  # the picker moved the chat model X -> Y: X is now ignored
     capture_claude_argv.reject(_X)
-    tunables.set_overrides({_KEYS[TIER_INTERACTIVE_CHAT]: _X})  # an external write (CLI / hand edit) sets X again
+    tunables.set_values({_KEYS[TIER_INTERACTIVE_CHAT]: _X})  # an external write (CLI / hand edit) sets X again
     provider = ClaudeCliProvider(TIER_INTERACTIVE_CHAT)
     with pytest.raises(Exception):  # noqa: B017
         provider.generate("tick")
@@ -432,7 +438,7 @@ def test_an_id_moved_away_from_and_configured_again_by_an_external_write_still_g
 
 def test_while_a_fallback_is_active_the_notice_names_the_configured_id(persona_dir, capture_claude_argv, caplog) -> None:
     capture_claude_argv.reject(_X)
-    tunables.set_overrides({_KEYS[TIER_INTERACTIVE_CHAT]: _X, _KEYS[TIER_COMPACTION]: _X})
+    tunables.set_values({_KEYS[TIER_INTERACTIVE_CHAT]: _X, _KEYS[TIER_COMPACTION]: _X})
     with caplog.at_level(logging.WARNING):
         with pytest.raises(Exception):  # noqa: B017
             ClaudeCliProvider(TIER_INTERACTIVE_CHAT).generate("tick")
@@ -460,7 +466,7 @@ def test_the_warning_for_a_rejected_shipped_default_says_the_job_keeps_failing(p
 
 def test_model_unconfirmed_is_keyed_on_the_chat_id_as_configured(persona_dir, capture_claude_argv) -> None:
     capture_claude_argv.reject(_X)
-    tunables.set_overrides({_KEYS[TIER_INTERACTIVE_CHAT]: _X})
+    tunables.set_values({_KEYS[TIER_INTERACTIVE_CHAT]: _X})
     model_error.note_unconfirmed(_X)
     with pytest.raises(Exception):  # noqa: B017
         ClaudeCliProvider(TIER_INTERACTIVE_CHAT).generate("tick")
@@ -468,7 +474,7 @@ def test_model_unconfirmed_is_keyed_on_the_chat_id_as_configured(persona_dir, ca
 
 
 def test_model_unsupported_reports_the_text_in_the_file(persona_dir) -> None:
-    tunables.set_overrides({_KEYS[TIER_INTERACTIVE_CHAT]: "banana\x07"})
+    tunables.set_values({_KEYS[TIER_INTERACTIVE_CHAT]: "banana\x07"})
     assert build_persona_state(persona_dir)["model_unsupported"] == "banana"
     assert model_for_tier(TIER_INTERACTIVE_CHAT) == "claude-sonnet-5"
 
@@ -479,7 +485,7 @@ def test_a_non_claude_persona_reports_no_model(tmp_path) -> None:
     d = tmp_path / "ollama_persona"
     d.mkdir()
     (d / "persona_config.json").write_text('{"provider": "ollama"}')
-    tunables.set_overrides({_KEYS[TIER_INTERACTIVE_CHAT]: "banana"})
+    tunables.set_values({_KEYS[TIER_INTERACTIVE_CHAT]: "banana"})
     state = build_persona_state(d)
     assert state["connection"]["provider"] == "ollama"
     assert state["connection"]["model"] is None and state["connection"]["model_choice"] is None
@@ -520,7 +526,7 @@ def test_every_import_order_succeeds_in_a_fresh_interpreter(first, tmp_path) -> 
 
 def test_configured_ids_ignore_the_rejection_state(capture_claude_argv) -> None:
     capture_claude_argv.reject(_X)
-    tunables.set_overrides({_KEYS[TIER_COMPACTION]: _X})
+    tunables.set_values({_KEYS[TIER_COMPACTION]: _X})
     with pytest.raises(Exception):  # noqa: B017
         ClaudeCliProvider(TIER_COMPACTION).generate("tick")
     assert configured_job_models()[TIER_COMPACTION] == _X

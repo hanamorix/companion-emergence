@@ -188,24 +188,25 @@ def test_mut_closure_sites_pass_recover_raise() -> None:
 
 
 # ---------------------------------------------------------------------------------------------
-# F1: tunables write_defaults_section must not wipe overrides it could not read
+# F1: tunables sync_file must not touch a settings file it could not read
 # ---------------------------------------------------------------------------------------------
 
 
-def test_mut_tunables_defaults_refresh_keeps_overrides_when_the_file_is_unreadable(tmp_path: Path, monkeypatch, deny) -> None:
+def test_mut_tunables_boot_pass_keeps_values_when_the_file_is_unreadable(tmp_path: Path, monkeypatch, deny) -> None:
     from brain import tunables
 
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
     tunables._reset_for_tests()
+    tunables.register("a.b", 1, description="A setting.")
     p = tunables._file_path()
-    p.write_text(json.dumps({"overrides": {"a.b": 3}}))
+    p.write_text('"a.b" = 3\n')
     before = p.read_bytes()
-    deny("tunables.json")
-    tunables.write_defaults_section()  # never breaks startup; the refresh is skipped
+    deny("tunables.toml")
+    tunables.sync_file()  # never breaks startup; the pass is skipped and the file is left as it is
     assert p.read_bytes() == before
 
 
-def test_mut_tunables_writes_sorted_keys_and_survives_a_hand_edited_nan(tmp_path: Path, monkeypatch) -> None:
+def test_mut_tunables_boot_pass_keeps_a_hand_edited_nan_and_makes_the_write_durable(tmp_path: Path, monkeypatch) -> None:
     import os
 
     from brain import tunables
@@ -216,14 +217,14 @@ def test_mut_tunables_writes_sorted_keys_and_survives_a_hand_edited_nan(tmp_path
 
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
     tunables._reset_for_tests()
+    tunables.register("new.key", 1, description="A setting.")
     p = tunables._file_path()
-    p.write_text('{"overrides": {"z.k": NaN, "a.k": 1}}')  # json.loads accepts NaN; a hand edit can contain it
-    tunables.write_defaults_section()
-    data = json.loads(p.read_text())
-    assert data["overrides"] == {"a.k": 1, "z.k": None}
+    p.write_text('"z.k" = nan\n"a.k" = 1\n')  # TOML reads nan; a hand edit can contain it
+    tunables.sync_file()
     text = p.read_text()
-    assert text == json.dumps(data, indent=2, sort_keys=True) + "\n"  # sorted keys, indent 2, trailing newline
-    assert synced == []  # the defaults refresh never synced
+    assert text.startswith('"z.k" = nan\n"a.k" = 1\n')  # the user's lines are byte for byte, in their order
+    assert '"new.key" = 1' in text
+    assert len(synced) == 1  # the pass writes once and fsyncs before the replace (a power loss must not leave a zero-byte file)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -392,8 +393,6 @@ def test_mut_float_bearing_logs_without_a_float_reader_write_nan_as_null(tmp_pat
     from brain.engines.reflex import ReflexArc
     from brain.growth.arc_storage import append_removed_arc, read_removed_arcs
     from brain.health.soul_candidate_repair import _save_candidates
-    from brain.tunables_migration import migrate_idle_keys
-
     arc = ReflexArc(name="a", description="d", trigger={"love": float("nan")}, days_since_human_min=1.0,
                     cooldown_hours=1.0, action="x", output_memory_type="reflex", prompt_template="p")
     append_removed_arc(tmp_path, arc=arc, removed_at=NOW, removed_by="user_edit", reasoning=None)
@@ -403,12 +402,6 @@ def test_mut_float_bearing_logs_without_a_float_reader_write_nan_as_null(tmp_pat
     _save_candidates(tmp_path / "c.jsonl", [{"memory_id": "m", "importance": float("nan")}])
     assert json.loads((tmp_path / "c.jsonl").read_text())["importance"] is None
 
-    (tmp_path / "tunables.json").write_text(
-        '{"defaults": {}, "overrides": {"throttle.background_min_idle_seconds": 120.0, "x.y": NaN}}'
-    )
-    migrate_idle_keys(tmp_path)
-    overrides = json.loads((tmp_path / "tunables.json").read_text())["overrides"]
-    assert overrides["x.y"] is None and overrides["chat.idle_lull_seconds"] == 120.0
 
 
 def test_mut_audit_and_queue_rewrites_survive_a_legacy_nan_row(tmp_path: Path) -> None:

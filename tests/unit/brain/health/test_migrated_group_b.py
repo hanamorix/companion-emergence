@@ -275,52 +275,56 @@ def test_group_b_write_source_manifest_keeps_three_backups(tmp_path: Path) -> No
     _no_temp_left(tmp_path)
 
 
-def test_group_b_tunables_write_defaults_preserves_overrides_and_survives_corruption(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_group_b_tunables_sync_preserves_values_and_leaves_a_corrupt_file_alone(tmp_path: Path, monkeypatch) -> None:
     from brain import tunables
 
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
     tunables._reset_for_tests()
+    tunables.register("a.b", 1, description="A setting.")
     p = tunables._file_path()
-    p.write_text(json.dumps({"overrides": {"a.b": 3}}))
-    tunables.write_defaults_section()
-    data = json.loads(p.read_text())
-    assert data["overrides"] == {"a.b": 3} and "defaults" in data
-    p.write_bytes(b"\xff{not json")  # corrupt: rebuilt, boot not broken
-    tunables.write_defaults_section()
-    assert json.loads(p.read_text())["overrides"] == {}
+    p.write_text('"a.b" = 3\n')
+    tunables.sync_file()
+    assert tunables.get_raw("a.b") == 3  # the user's value is kept
+    p.write_bytes(b"\xff{not toml")  # corrupt: left as it is (never rebuilt), boot not broken
+    tunables.sync_file()
+    assert p.read_bytes() == b"\xff{not toml"
     _no_temp_left(p.parent)
 
 
-def test_group_b_tunables_load_overrides_fail_open_and_cache_by_mtime(tmp_path: Path, monkeypatch) -> None:
+def test_group_b_tunables_load_values_fail_open_and_cache_by_stat_signature(tmp_path: Path, monkeypatch) -> None:
+    import os
+
     from brain import tunables
 
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
     tunables._reset_for_tests()
     p = tunables._file_path()
-    assert tunables._load_overrides_locked() == {}  # missing
-    p.write_text(json.dumps({"overrides": {"x": 1}}))
-    assert tunables._load_overrides_locked() == {"x": 1}
-    p.write_text(json.dumps({"overrides": [1]}))  # wrong type: ignored, code defaults
-    import os
-
+    assert tunables._load_values_locked() == {}  # missing
+    p.write_text('"x" = 1\n')
+    assert tunables._load_values_locked() == {"x": 1}
+    p.write_text("x = = 1\n")  # not TOML: ignored, code defaults
     os.utime(p, (p.stat().st_atime, p.stat().st_mtime + 5))
-    assert tunables._load_overrides_locked() == {}
+    assert tunables._load_values_locked() == {}
     p.write_bytes(b"\xff\xfe")
     os.utime(p, (p.stat().st_atime, p.stat().st_mtime + 10))
-    assert tunables._load_overrides_locked() == {}
+    assert tunables._load_values_locked() == {}
 
 
-def test_group_b_tunables_migration_rewrites_the_file_atomically(tmp_path: Path) -> None:
+def test_group_b_tunables_legacy_json_fold_renames_and_never_rewrites_the_json(tmp_path: Path, monkeypatch) -> None:
+    from brain import tunables
     from brain import tunables_migration as tm
 
-    (tmp_path / tm._FILE_NAME).write_text(
-        json.dumps({"overrides": {tm._OLD_THROTTLE_KEY: 5, "keep": 1}}, indent=1)
-    )
-    tm.migrate_idle_keys(tmp_path)
-    after = json.loads((tmp_path / tm._FILE_NAME).read_text())
-    assert tm._OLD_THROTTLE_KEY not in after["overrides"] and after["overrides"]["keep"] == 1
+    monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
+    tunables._reset_for_tests()
+    tunables.register("keep", 0, description="A setting.")
+    tunables.register("chat.idle_lull_seconds", 600.0, description="Seconds of quiet.")  # the registry was just cleared
+    legacy = tmp_path / tm._LEGACY_NAME
+    legacy.write_text(json.dumps({"overrides": {tm._OLD_THROTTLE_KEY: 5, "keep": 1}}, indent=1))
+    original = legacy.read_bytes()
+    tm.migrate_legacy_json(tmp_path, complete_registry=True)
+    (kept,) = tmp_path.glob(f"{tm._LEGACY_NAME}.migrated-*")
+    assert kept.read_bytes() == original  # the JSON was only renamed, never rewritten
+    assert tunables.get_raw("keep") == 1 and tunables.get_raw("chat.idle_lull_seconds") == 5.0
     _no_temp_left(tmp_path)
 
 

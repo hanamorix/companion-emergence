@@ -53,8 +53,14 @@ def test_prompt_choice_eof_returns_default(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def _chat_value(home: Path) -> str:
+    from brain.utils import toml_io
+
+    return toml_io.flatten_toml(toml_io.read_toml(home / "tunables.toml"))["model.interactive_chat"]
+
+
 def test_init_flag_model_opus_persists(monkeypatch, tmp_path: Path):
-    """--model opus writes the Opus id to the install-wide chat model line (the persona file has no model)."""
+    """--model opus writes the Opus id to the install-wide chat model setting (the persona file has no model)."""
     rc = _run_init(
         monkeypatch,
         tmp_path,
@@ -73,11 +79,11 @@ def test_init_flag_model_opus_persists(monkeypatch, tmp_path: Path):
     assert rc == 0
     cfg = json.loads((tmp_path / "personas" / "mira" / "persona_config.json").read_text())
     assert "model" not in cfg
-    assert json.loads((tmp_path / "tunables.json").read_text())["overrides"]["model.interactive_chat"] == "claude-opus-5"
+    assert _chat_value(tmp_path) == "claude-opus-5"
 
 
 def test_init_interactive_model_haiku(monkeypatch, tmp_path: Path):
-    """Interactive wizard: user picks haiku, which is written to the install-wide chat model line."""
+    """Interactive wizard: user picks haiku, which is written to the install-wide chat model setting."""
     inputs = [
         "mira",  # persona name
         "Hana",  # user name
@@ -89,7 +95,7 @@ def test_init_interactive_model_haiku(monkeypatch, tmp_path: Path):
     assert rc == 0
     cfg = json.loads((tmp_path / "personas" / "mira" / "persona_config.json").read_text())
     assert "model" not in cfg
-    assert json.loads((tmp_path / "tunables.json").read_text())["overrides"]["model.interactive_chat"] == "haiku"
+    assert _chat_value(tmp_path) == "haiku"
 
 
 def test_init_flag_model_unknown_rejected_by_argparse(monkeypatch, tmp_path: Path, capsys):

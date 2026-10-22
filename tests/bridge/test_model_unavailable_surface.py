@@ -154,10 +154,10 @@ def _post_model(c: TestClient, model: str):
 
 
 def _saved_model(persona_dir: Path) -> str | None:
-    """The chat model line the user saved in the install-wide tunables file (None: no line, the shipped default)."""
+    """The chat model entry in the install-wide settings file (it holds the shipped default until a pick changes it)."""
     from brain import tunables
 
-    return tunables.get_override("model.interactive_chat")
+    return tunables.get_raw("model.interactive_chat")
 
 
 def test_rejected_custom_id_is_refused_and_leaves_no_trace(persona_dir: Path, monkeypatch, caplog):
@@ -168,7 +168,7 @@ def test_rejected_custom_id_is_refused_and_leaves_no_trace(persona_dir: Path, mo
         state = c.get("/persona/state").json()
         assert r.status_code == 400, r.text
         assert r.json() == {"ok": False, "error": "model_unavailable", "model": BAD}
-        assert _saved_model(persona_dir) is None
+        assert _saved_model(persona_dir) == "claude-sonnet-5"  # untouched: still the shipped default
         # C14h: nothing recorded or logged for an id that was never saved
         assert state["model_rejections"] == []
         assert model_error.state() == []
@@ -280,7 +280,7 @@ def test_non_claude_provider_is_refused_and_nothing_is_saved_or_checked(persona_
     with TestClient(app) as c, patch("subprocess.run", run):
         r = _post_model(c, "claude-sonnet-5")
     assert r.status_code == 400 and r.json() == {"ok": False, "error": "model_not_applicable"}
-    assert run.calls_for("claude-sonnet-5") == 0 and _saved_model(persona_dir) is None
+    assert run.calls_for("claude-sonnet-5") == 0 and _saved_model(persona_dir) == "claude-sonnet-5"
 
 
 def test_concurrent_applies_run_their_checks_one_at_a_time(persona_dir: Path, monkeypatch):
@@ -308,7 +308,7 @@ def _persona_with_model(persona_dir: Path, model: str) -> None:
     """The chat job is configured with ``model`` (the install-wide tunables line)."""
     from brain import tunables
 
-    tunables.set_overrides({"model.interactive_chat": model})
+    tunables.set_values({"model.interactive_chat": model})
 
 
 def test_ambient_generate_failure_is_remembered_and_shown_in_persona_state(persona_dir: Path, monkeypatch):
