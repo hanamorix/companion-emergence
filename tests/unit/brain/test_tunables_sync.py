@@ -87,7 +87,9 @@ def test_the_generated_file_has_a_header_that_says_not_to_edit_the_default_lines
     t.sync_file()
     head = _text(tmp_path).split("\n\n", 1)[0]
     assert head.startswith("# ") and "default" in head and "Safe to edit by hand" in head
-    assert 'Do not edit the "# default:" lines' in head
+    flat = " ".join(head.replace("\n# ", " ").split())
+    assert 'Do not edit the description and "# default:" lines above each setting' in flat
+    assert "the app keeps them up to date" in flat and "put them above a setting's description" in flat
 
 
 def test_entries_are_sorted_by_key_on_creation(t, tmp_path) -> None:
@@ -157,7 +159,7 @@ def test_an_unparsable_default_comment_is_replaced_and_the_value_kept(t, tmp_pat
 def test_a_blank_line_between_comment_and_entry_inserts_an_extra_comment_and_loses_nothing(t, tmp_path) -> None:
     text = '# default: 60.0\n\n"k" = 60.0\n'
     out = _run(t, tmp_path, text, 90.0)
-    assert out == '# default: 60.0\n\n# default: 90.0\n"k" = 60.0\n'
+    assert out == '# default: 60.0\n\n# What it does.\n# default: 90.0\n"k" = 60.0\n'
 
 
 # Rev-4 review S8: a description corrected in a later release reaches an existing file (the line directly above the
@@ -190,6 +192,58 @@ def test_a_second_pass_after_a_description_refresh_writes_nothing(t, tmp_path) -
     before = (_file(tmp_path).read_bytes(), _age(_file(tmp_path)))
     t.sync_file()
     assert (_file(tmp_path).read_bytes(), _file(tmp_path).stat().st_mtime_ns) == before
+
+
+# Rev-4 re-check R1: a user's own comment is never the line the pass replaces. The first pass writes the description too, so
+# a note typed above an entry ends up ABOVE the description; a note between the description and the default survives.
+
+
+def test_a_note_above_a_hand_written_entry_survives_the_first_and_every_later_boot(t, tmp_path) -> None:
+    write_text(tmp_path, '# my own note about this\n"k" = 5.0\n')
+    t.register("k", 5.0, description="What it does.")
+    t.sync_file()
+    boot1 = _file(tmp_path).read_bytes()
+    assert boot1 == b'# my own note about this\n# What it does.\n# default: 5.0\n"k" = 5.0\n'
+    t.sync_file()
+    assert _file(tmp_path).read_bytes() == boot1  # boot 2 used to replace the note with the description
+    t.register("k", 5.0, description="Reworded.")
+    t.sync_file()
+    assert _file(tmp_path).read_bytes() == b'# my own note about this\n# Reworded.\n# default: 5.0\n"k" = 5.0\n'
+
+
+def test_a_note_between_the_description_and_the_default_survives_a_boot(t, tmp_path) -> None:
+    text = '# What it does.\n# my note\n# default: 5.0\n"k" = 5.0\n'
+    write_text(tmp_path, text)
+    t.register("k", 5.0, description="What it does.")
+    t.sync_file()
+    assert _file(tmp_path).read_bytes() == text.encode()
+
+
+def test_a_note_between_an_old_description_and_the_default_survives_a_description_change(t, tmp_path) -> None:
+    write_text(tmp_path, '# Old words.\n# my note\n# default: 5.0\n"k" = 5.0\n')
+    t.register("k", 5.0, description="New words.")
+    t.sync_file()
+    out = _text(tmp_path)
+    assert "# my note\n" in out and "# New words.\n# default: 5.0\n" in out
+    again = _file(tmp_path).read_bytes()
+    t.sync_file()
+    assert _file(tmp_path).read_bytes() == again
+
+
+def test_a_lowercase_note_directly_above_the_default_is_never_taken_for_the_description(t, tmp_path) -> None:
+    write_text(tmp_path, '# What it does.\n# keep this one\n# default: 5.0\n"k" = 5.0\n')
+    t.register("k", 5.0, description="Reworded.")
+    t.sync_file()
+    assert "# keep this one\n" in _text(tmp_path) and "# Reworded.\n# default: 5.0\n" in _text(tmp_path)
+
+
+def test_a_description_replaced_by_the_pass_is_logged(t, tmp_path, caplog) -> None:
+    write_text(tmp_path, '# Old words.\n# default: 5.0\n"k" = 5.0\n')
+    t.register("k", 5.0, description="New words.")
+    with caplog.at_level("INFO", logger="brain.tunables"):
+        t.sync_file()
+    assert _text(tmp_path) == '# New words.\n# default: 5.0\n"k" = 5.0\n'
+    assert any("Old words." in r.getMessage() for r in caplog.records)
 
 
 def test_a_key_registered_without_a_description_leaves_the_comment_run_alone(t, tmp_path) -> None:

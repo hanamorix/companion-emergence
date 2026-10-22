@@ -72,8 +72,10 @@ _HEADER = (
     '# The comments above each setting say what it does and show its shipped default ("# default: ...").'
     " Change the value to change the setting.\n"
     "# A setting you have not changed follows the shipped default when a new version changes it; a setting you have changed\n"
-    "# is left alone. Comments you add are kept. Keep one setting per line, outside any [section].\n"
-    '# Do not edit the "# default:" lines: they are how a setting you changed is told from one you did not.\n'
+    "# is left alone. Keep one setting per line, outside any [section]. Comments you add are kept: put them above a setting's\n"
+    "# description or after its value.\n"
+    '# Do not edit the description and "# default:" lines above each setting: the app keeps them up to date, and the\n'
+    '# "# default:" line is how a setting you changed is told from one you did not.\n'
 )
 _DEFAULT_PREFIX = "default:"
 
@@ -404,14 +406,47 @@ def _registry_snapshot() -> tuple[dict[str, Any], dict[str, str]]:
         return dict(_registry), dict(_descriptions)
 
 
+def _looks_like_description(line: str) -> bool:
+    """Could this comment line be a setting description the app wrote? One sentence: starts with a capital, ends with a period,
+    at most 100 characters (the rules every registered description follows)."""
+    body = line.lstrip()[1:].strip()
+    return 0 < len(body) <= 100 and body[0].isupper() and body.endswith(".")
+
+
+def _place_description(key: str, run: list[str], index: int | None, wanted: str) -> None:
+    """Make ``wanted`` (the full comment line, ``# <text>``) the description directly above the entry's ``# default:`` line, in ``run`` (the comment lines above the
+    entry, edited in place), without ever replacing a line the user wrote.
+
+    Every entry carries its description directly above the default line, so the line there is the app's. The app replaces it
+    only when it can tell it from a user's note: the line looks like a description and the line above it does not. In any
+    other case the new description is inserted just above the default line and the existing lines stay. Comments the user
+    typed above an entry, or between its description and its default, are therefore never the line that goes. An entry with
+    no default line gets the description and then the default, so a note typed above it ends up above the description.
+    """
+    if any(line.strip() == wanted for line in run):
+        return  # already there
+    text = wanted
+    if index is None:  # the default comment was just appended last: the description goes directly before it
+        run.insert(len(run) - 1, text)
+        return
+    slot = index - 1
+    if slot >= 0 and _looks_like_description(run[slot]) and not (slot >= 1 and _looks_like_description(run[slot - 1])):
+        logger.info("tunables: %s: the description %r is replaced by the registered one", key, run[slot].lstrip()[1:].strip())
+        run[slot] = text
+    else:
+        run.insert(index, text)
+
+
 def _apply_sync(doc: toml_io.TomlDocument, registry: dict[str, Any], descriptions: dict[str, str]) -> dict[str, Any]:
     """Apply the boot-pass rules to ``doc`` in memory; return the values the pass intends to have changed or added.
 
     For each registered key, with ``D_new`` the code default, ``V`` the file's value and ``D_old`` the default recorded in the
     comment above it: an absent key is inserted with ``V := D_new``; ``V`` equal to ``D_old`` while ``D_new`` differs takes
     ``D_new`` (the user never touched it); a ``V`` that differs from ``D_old`` is kept, even a bad-typed one; a missing or
-    unparsable ``D_old`` keeps ``V``. The recorded default is refreshed to ``D_new`` whenever it differs. Nothing else in the
-    document changes, and an entry the editor cannot place (several lines, two spellings) is skipped with a log.
+    unparsable ``D_old`` keeps ``V``. The recorded default is refreshed to ``D_new`` whenever it differs, and the registered
+    description is kept directly above it (``_place_description``: written on the first pass, refreshed when it changes, never
+    over a line the user wrote). Nothing else in the document changes, and an entry the editor cannot place (several lines,
+    two spellings) is skipped with a log.
     """
     intended: dict[str, Any] = {}
     for key in sorted(registry):
@@ -444,17 +479,9 @@ def _apply_sync(doc: toml_io.TomlDocument, registry: dict[str, Any], description
                 new_run.append(comment)
             else:
                 new_run[index] = comment
-        if index is not None:
-            # The line directly above the "# default:" line is the setting's description, owned by the pass like the default
-            # line itself: a description corrected in a later release reaches an existing file, and an entry written before
-            # the key had a description gets one. Comments the user put above it are never touched. A key with no description
-            # leaves the run alone.
-            wanted = _description_lines(key, descriptions)
-            if wanted:
-                if index == 0:
-                    new_run.insert(0, wanted[0])
-                elif run[index - 1].strip() != wanted[0]:
-                    new_run[index - 1] = wanted[0]
+        wanted = _description_lines(key, descriptions)
+        if wanted:
+            _place_description(key, new_run, index, wanted[0])
         if new_run != run:
             doc.set_comment_above(key, new_run)
     return intended
