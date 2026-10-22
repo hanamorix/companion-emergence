@@ -1857,3 +1857,106 @@ def test_k5_pyyaml_is_declared_and_locked_as_a_direct_dependency():
     pkg = next(p for p in lock["package"] if p["name"] == py["project"]["name"])
     assert {"name": "pyyaml"} in pkg["dependencies"]
     assert any(r["name"] == "pyyaml" and r["specifier"] == ">=6.0" for r in pkg["metadata"]["requires-dist"])
+
+
+# --------------------------------------------------------------------------------------
+# #525: prompt sets, --model, per-turn tool attribution, --render-only
+# --------------------------------------------------------------------------------------
+
+
+class _ToolScripted(_Scripted):
+    """_Scripted that also writes tool rows per call: one MCP-child row and one CLI built-in row."""
+
+    def chat(self, messages, *, tools=None, options=None):
+        from brain.mcp_server.audit import log_invocation
+
+        out = super().chat(messages, tools=tools, options=options)
+        log_invocation(self.persona_dir, name="record_monologue", arguments={}, result_summary="ok", outcome="ok")
+        log_invocation(self.persona_dir, name="ToolSearch", arguments={}, result_summary="", origin="cli_builtin")
+        return out
+
+
+def test_525_prompt_sets_are_named_and_sized():
+    assert crw.PROMPT_SETS["default"] is crw.REPLAY_PROMPTS
+    assert len(crw.PROMPT_SETS["reach"]) == 7
+    assert sum("{desk}" in p for p in crw.PROMPT_SETS["reach"]) == 1
+    assert len(crw.PROMPT_SETS["recall"]) == 6
+
+
+def test_525_reach_set_seeds_the_desk_and_substitutes_its_path(tmp_path, monkeypatch):
+    pd, _ = _patch_provider(monkeypatch, tmp_path, _HEALTHY_TOOLS)
+    _, replies = crw.run_replay(
+        pd, turns=7, gap_s=0, provider_name="claude-cli", seed=False, force_text_path=False,
+        warmup=False, plain_turns=False, prompt_set="reach",
+    )
+    desk = pd / "desk"
+    assert sorted(p.name for p in desk.iterdir()) == ["notes.txt", "shopping.txt"]
+    prompts = [r["prompt"] for r in replies]
+    assert not any("{desk}" in p for p in prompts)
+    assert sum(str(desk) in p for p in prompts) == 1
+
+
+def test_525_model_reaches_get_provider(tmp_path, monkeypatch):
+    import brain.bridge.provider as provider_mod
+
+    seen = {}
+
+    def fake(name, *, persona_dir=None, model_override=None):
+        seen["model"] = model_override
+        return _Scripted(persona_dir, _HEALTHY_TEXT)
+
+    pd = tmp_path / "personas" / "replay"
+    crw._seed_scratch_persona(pd)
+    monkeypatch.setenv("NELL_CACHE_DEBUG", "0")
+    monkeypatch.setattr(provider_mod, "get_provider", fake)
+    crw.run_replay(pd, turns=1, gap_s=0, provider_name="claude-cli", seed=False, model="haiku")
+    assert seen["model"] == "haiku"
+
+
+def test_525_per_turn_attribution_maps_tool_and_usage_rows_to_turns(tmp_path, monkeypatch):
+    summary, _, _ = _replay(tmp_path, monkeypatch, _HEALTHY_TOOLS, with_tools=True, turns=3, cls=_ToolScripted)
+    per_turn = summary["per_turn"]
+    assert summary["per_turn_error"] is None
+    assert [t["turn"] for t in per_turn] == [0, "p1", 1, 2, 3, "p2"]
+    for t in per_turn:
+        assert [(r["name"], r["origin"]) for r in t["tool_rows"]] == [
+            ("record_monologue", None),
+            ("ToolSearch", "cli_builtin"),
+        ]
+        assert t["tool_rows"][0]["outcome"] == "ok" and t["tool_rows"][0]["error"] is None
+        assert len(t["chat_rows"]) >= 1
+        assert {"cost_usd", "num_turns", "cache_creation", "cache_read", "duration_ms"} <= set(t["chat_rows"][0])
+    assert summary["prompt_set"] == "default"
+
+
+def test_525_tool_log_shrink_leaves_per_turn_unmeasured(tmp_path, monkeypatch):
+    class Shrinker(_ToolScripted):
+        def after_call(self, n):
+            if n == 3:
+                (self.persona_dir / "tool_invocations.log.jsonl").write_text("", encoding="utf-8")
+
+    summary, _, _ = _replay(tmp_path, monkeypatch, _HEALTHY_TOOLS, with_tools=True, turns=3, cls=Shrinker)
+    assert summary["per_turn"] is None
+    assert "shrank" in summary["per_turn_error"]
+
+
+def test_525_render_only_builds_no_provider(tmp_path, monkeypatch):
+    import brain.bridge.provider as provider_mod
+
+    def boom(*a, **k):
+        raise AssertionError("--render-only must not construct a provider")
+
+    monkeypatch.setattr(provider_mod, "get_provider", boom)
+    pd = tmp_path / "personas" / "replay"
+    crw._seed_scratch_persona(pd)
+    rendered = crw.render_prompts(pd, prompt_set="recall", seed=True)
+    assert [r["prompt"] for r in rendered] == crw.PROMPT_SETS["recall"]
+    jordan = next(r for r in rendered if "Jordan" in r["prompt"])
+    assert '"Jordan carried a wo' in jordan["volatile"]  # the recall block surfaces the seed as a snippet
+    assert "read_full_memory" in jordan["volatile"]
+
+
+def test_525_cli_parses_the_new_options():
+    a = crw.parse_args(["--scratch", "--model", "haiku", "--prompt-set", "recall", "--render-only"])
+    assert (a.model, a.prompt_set, a.render_only) == ("haiku", "recall", True)
+    assert crw.parse_args(["--scratch"]).prompt_set == "default"
