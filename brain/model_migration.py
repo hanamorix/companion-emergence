@@ -20,8 +20,10 @@ before ``touch_last_opened``, and (b) at the start of the CLI write commands. It
    ``sonnet`` follows the shipped default. "Most recently used" is not "model most recently changed"; the decision
    runs before the launching persona's ``last_opened_at`` is touched, so a more recently used OTHER persona can win.
    That is the stated rule.
-2. CLEARING (for the launching persona, on EVERY start until its legacy keys are gone, marker or not). A persona the
-   decision above did not consider (its config appeared after the decision, or it was skipped by the scan) has its valid
+2. CLEARING (for the launching persona, on EVERY start until its legacy keys are gone, marker or not). The marker records
+   every persona the decision considered (``personas_considered``), and a persona named there is only cleared, on every
+   later start too: never applied, so a model the user picks after the decision is never overwritten. A persona the
+   decision did not consider (its config appeared after the decision, or it was skipped by the scan) has its valid
    Claude values applied the same way: written with ``only_if_default=True``, so an install whose value for the job still
    equals the shipped default takes the persona's value, and an install that has changed it keeps it and the persona's value is discarded
    with a log line. If that write cannot be made nothing is cleared (the next start retries). Then the persona's own
@@ -151,14 +153,27 @@ def _marker_path(home: Path) -> Path:
     return home / MARKER_NAME
 
 
-def _decide(home: Path) -> tuple[bool, frozenset[str]]:
-    """The decision step: (a decision exists now, the personas THIS call's decision considered).
+def _marker_considered(marker: Path) -> frozenset[str]:
+    """The persona names a recorded decision considered (``personas_considered``); empty when the marker cannot be read or
+    carries no such list (then nobody counts as considered, so every persona is a late one)."""
+    try:
+        res = read_json_result(marker, default=dict, recover=Recovery.CONTENT, expect=dict)
+    except JsonFileError:
+        return frozenset()
+    names = res.data.get("personas_considered") if res.outcome == "ok" else None
+    return frozenset(n for n in names if isinstance(n, str)) if isinstance(names, list) else frozenset()
 
-    The second item is empty when the marker was already there (an earlier call decided) or nothing was decided.
+
+def _decide(home: Path) -> tuple[bool, frozenset[str]]:
+    """The decision step: (a decision exists now, the personas that decision considered).
+
+    The second item is the marker's ``personas_considered`` list, whether this call wrote the marker or an earlier call
+    (or another process) did: a persona the decision considered is never applied late, on this start or any later one
+    (``only_if_default`` cannot tell "the user never chose" from "the user chose the default").
     """
     marker = _marker_path(home)
     if marker.exists():
-        return True, frozenset()
+        return True, _marker_considered(marker)
     skipped: list[str] = []
     candidates = _scan_candidates(skipped)  # BEFORE the lock: the hold below stays short by construction
     if not candidates:
@@ -173,7 +188,7 @@ def _decide(home: Path) -> tuple[bool, frozenset[str]]:
     try:
         with locked_within(marker, dev_constants.SETTINGS_FILE_LOCK_WAIT_S):
             if marker.exists():
-                return True, frozenset()  # another process decided while this one was reading
+                return True, _marker_considered(marker)  # another process decided while this one was reading
             written = set_job_models(dict(updates), only_if_default=True) if updates else {}
             skipped_existing = sorted(set(updates) - set(written))
             if skipped_existing:
@@ -184,6 +199,7 @@ def _decide(home: Path) -> tuple[bool, frozenset[str]]:
                     "decided_at": datetime.now(UTC).isoformat(),
                     "source_persona": candidates[0].name,
                     "keys_written": sorted(written),
+                    "personas_considered": sorted(considered),
                     "personas_skipped": sorted(skipped),
                 },
                 indent=2,
@@ -223,7 +239,8 @@ def _apply_late(name: str, chat: str | None, tiers: dict[str, str]) -> bool:
 def _clear_persona(persona_dir: Path, decision_exists: bool, considered: frozenset[str]) -> None:
     """The clearing step for ONE persona's own file: its legacy keys come out, every other key stays exactly as it is
     (the file is edited as parsed JSON, not rebuilt from the dataclass, so nothing else is normalised). A Claude persona
-    the decision did not consider has its valid values applied first (``_apply_late``)."""
+    the decision did not consider (its name is not in the marker's ``personas_considered``) has its valid values applied
+    first (``_apply_late``); a considered one is cleared without applying, however many starts later."""
     from brain.health.adaptive import compute_treatment
 
     path = persona_dir / "persona_config.json"

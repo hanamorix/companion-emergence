@@ -25,6 +25,7 @@ from brain.model_migration import MARKER_NAME, migrate_persona_models, pending_l
 from brain.persona_config import PersonaConfig
 
 _CHAT = "model.interactive_chat"
+_CHAT_JOB = "interactive-chat"
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -287,6 +288,63 @@ def test_the_loser_of_the_first_decision_does_not_overwrite_the_winner_when_it_s
         migrate_persona_models(_home(), older)
     assert _CHAT not in _overrides()
     assert "model" not in _cfg("older") and _marker().exists()
+
+
+def test_a_pick_made_after_the_decision_survives_a_considered_persona_restarting() -> None:
+    """Maintainer review 530-1, scenario 1: alpha (`opus`, newest) and beta (`haiku`). The decision writes `claude-opus-5`;
+    the user then picks Sonnet (the shipped default id); alpha restarts. A persona the decision considered is cleared on its
+    next start, never applied: `only_if_default` cannot tell "never chose" from "chose the default"."""
+    alpha = _persona("alpha", model="opus", opened="2026-05-01T00:00:00Z")
+    _persona("beta", model="haiku", opened="2026-01-01T00:00:00Z")
+    migrate_persona_models(_home(), None)  # the decision (call 1)
+    assert _overrides()[_CHAT] == "claude-opus-5"
+    set_job_models({_CHAT_JOB: "sonnet"})  # the user's pick, `nell model set sonnet` (the default id)
+    assert _CHAT not in _overrides()
+    migrate_persona_models(_home(), alpha)  # alpha restarts (call 2)
+    assert _CHAT not in _overrides()  # the pick survives
+    assert "model" not in _cfg("alpha")
+
+
+def test_an_older_persona_cannot_win_over_the_decision_by_starting_later() -> None:
+    """Maintainer review 530-1, scenario 2: alpha (`sonnet`, newest, equal to the default so nothing is written) and beta
+    (`haiku`). Beta's own start must not write `haiku` over the decision: the newest persona won."""
+    _persona("alpha", model="sonnet", opened="2026-05-01T00:00:00Z")
+    beta = _persona("beta", model="haiku", opened="2026-01-01T00:00:00Z")
+    migrate_persona_models(_home(), None)  # call 1: the decision
+    assert _CHAT not in _overrides()
+    migrate_persona_models(_home(), beta)  # call 2: beta starts
+    assert _CHAT not in _overrides()
+    assert "model" not in _cfg("beta")
+
+
+def test_the_marker_records_every_persona_the_decision_considered() -> None:
+    _persona("alpha", model="opus", opened="2026-05-01T00:00:00Z")
+    _persona("beta", model="haiku", opened="2026-01-01T00:00:00Z")
+    _persona("plain")  # no saved model: not a candidate
+    _persona("local", model="opus", opened="2026-02-01T00:00:00Z", provider="ollama")  # another provider kind: not a candidate
+    migrate_persona_models(_home(), None)
+    marker = json.loads(_marker().read_text(encoding="utf-8"))
+    assert marker["personas_considered"] == ["alpha", "beta"]
+
+
+def test_a_persona_the_decision_did_not_consider_is_still_applied_where_the_install_is_at_its_default() -> None:
+    """The ruling-B path is unchanged for a persona that is NOT in the marker (imported after the decision)."""
+    _persona("first", model="sonnet", opened="2026-02-01T00:00:00Z")
+    migrate_persona_models(_home(), None)
+    assert json.loads(_marker().read_text(encoding="utf-8"))["personas_considered"] == ["first"]
+    late = _persona("late", model="opus", opened="2026-09-01T00:00:00Z")
+    migrate_persona_models(_home(), late)
+    assert _overrides()[_CHAT] == "claude-opus-5" and "model" not in _cfg("late")
+
+
+def test_a_marker_without_the_list_still_lets_a_late_persona_be_applied() -> None:
+    """A marker that carries no ``personas_considered`` (hand-made, or from a build that did not record it) names nobody:
+    every persona is a late one, which is the old behaviour."""
+    _home().mkdir(parents=True, exist_ok=True)
+    _marker().write_text(json.dumps({"decided_at": "2026-01-01T00:00:00+00:00"}), encoding="utf-8")
+    late = _persona("late", model="opus", opened="2026-09-01T00:00:00Z")
+    migrate_persona_models(_home(), late)
+    assert _overrides()[_CHAT] == "claude-opus-5"
 
 
 def test_a_late_persona_on_another_provider_kind_is_cleared_not_applied() -> None:
