@@ -206,16 +206,30 @@ def test_mut_tunables_boot_pass_keeps_values_when_the_file_is_unreadable(tmp_pat
     assert p.read_bytes() == before
 
 
-def test_mut_tunables_boot_pass_keeps_a_hand_edited_nan_and_makes_the_write_durable(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("os_name", [None, "nt"], ids=["this-os", "simulated-windows"])
+def test_mut_tunables_boot_pass_keeps_a_hand_edited_nan_and_makes_the_write_durable(
+    tmp_path: Path, monkeypatch, os_name: str | None
+) -> None:
     import os
 
     from brain import tunables
+    from brain.utils import atomic_write
 
     events: list[str] = []
     real_fsync = os.fsync
     real_replace = os.replace
     monkeypatch.setattr(os, "fsync", lambda fd: (events.append("fsync"), real_fsync(fd))[1])
     monkeypatch.setattr(os, "replace", lambda a, b: (events.append("replace"), real_replace(a, b))[1])
+    if os_name is not None:
+        # Give the writer alone a view of ``os`` that reports another platform name (patching ``os.name`` itself would
+        # break pathlib); every other attribute is the real one, including the instrumented fsync and replace above.
+        class _OsAs:
+            name = os_name
+
+            def __getattr__(self, attr: str):
+                return getattr(os, attr)
+
+        monkeypatch.setattr(atomic_write, "os", _OsAs())
 
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
     tunables._reset_for_tests()
@@ -227,8 +241,11 @@ def test_mut_tunables_boot_pass_keeps_a_hand_edited_nan_and_makes_the_write_dura
     assert text.startswith('"z.k" = nan\n"a.k" = 1\n')  # the user's lines are byte for byte, in their order
     assert '"new.key" = 1' in text
     # The pass writes once through the shared atomic writer: the file's data is fsynced BEFORE the one replace (a power
-    # loss must not leave a zero-byte file), then the directory is fsynced so the rename itself is durable.
-    assert events == ["fsync", "replace", "fsync"]
+    # loss must not leave a zero-byte file) on every OS. The writer then fsyncs the directory so the rename itself is
+    # durable, but only where it can: ``fsync_dir`` returns early unless ``os.name == "posix"`` (Windows has no directory
+    # handles), so the trailing fsync is expected exactly when the writer's own check says it runs.
+    expected = ["fsync", "replace"] + (["fsync"] if atomic_write.os.name == "posix" else [])
+    assert events == expected
 
 
 # ---------------------------------------------------------------------------------------------
