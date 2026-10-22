@@ -23,7 +23,8 @@ OLD has at least 5 qualifying turns (below that even NEW = 0 cannot reach p < 0.
 
 Every gate is always reported: a prompt set missing from either arm, or no replies to scan, makes that gate
 UNMEASURED, never a pass. Replies are read from each metrics file's `<name>.replies.json` sibling (written by
-`--dump-replies`): B8 scans every NEW reply, B9 compares the arms on default-set replies.
+`--dump-replies`, needed on EVERY run): B8 scans every NEW reply and is UNMEASURED if any NEW run has no
+sibling; B9 compares the arms on default-set replies. B3 needs 3 OLD default replays for its noise check.
 
 Exit 0 all gates PASS, 10 any FAIL, 11 any UNMEASURED or STOP_FOR_HUMAN (and none FAIL), 2 bad arguments.
 """
@@ -40,6 +41,7 @@ from pathlib import Path
 
 ALPHA = 0.05
 MIN_OLD = 5
+MIN_OLD_REPLAYS = 3  # B3's ±10% noise check compares replays; fewer cannot show the spread
 MEMORY_TOOLS = frozenset({"search_memories", "read_full_memory"})
 _LEAK = re.compile(r"toolsearch|tool_reference|tool search|deferred tool", re.IGNORECASE)
 
@@ -174,6 +176,8 @@ def b3(old_runs, new_runs) -> dict:
         new_v = [_b3_values(r) for r in new_runs]
     except (KeyError, TypeError) as exc:
         return {"verdict": "UNMEASURED", "reason": f"a chat row lacks a number: {exc!r}", "stop_for_human": False}
+    if any(x is None for v in old_v + new_v for xs in v.values() for x in xs):
+        return {"verdict": "UNMEASURED", "reason": "a chat row has a null number", "stop_for_human": False}
     metrics = {}
     for m in _PCT_METRICS + _ABS_METRICS:
         o = _mean([x for v in old_v for x in v[m]])
@@ -184,7 +188,10 @@ def b3(old_runs, new_runs) -> dict:
         elif m in _PCT_METRICS:
             per_replay = [_mean(v[m]) for v in old_v if v[m]]
             spread_ok = all(abs(x - o) <= 0.10 * o for x in per_replay) if o else False
-            if not spread_ok:
+            if len(per_replay) < MIN_OLD_REPLAYS:
+                entry["verdict"] = "UNMEASURED"
+                entry["reason"] = f"{len(per_replay)} OLD replays with chat rows: the ±10% noise check needs {MIN_OLD_REPLAYS}"
+            elif not spread_ok:
                 entry["verdict"] = "UNMEASURED"
                 entry["reason"] = "OLD replay means differ by more than ±10%: the bar cannot separate noise"
             else:
@@ -253,16 +260,18 @@ def _load(paths) -> list[dict]:
     return [json.loads(Path(p).read_text(encoding="utf-8")) for p in paths or []]
 
 
-def _load_replies(paths) -> list[dict]:
-    """The `<metrics>.replies.json` siblings, each reply tagged with its file's prompt set."""
-    out = []
+def _load_replies(paths) -> tuple[list[dict], list[str]]:
+    """The `<metrics>.replies.json` siblings, each reply tagged with its file's prompt set, and the metrics files
+    that have none (run without --dump-replies)."""
+    out, missing = [], []
     for p in paths or []:
         sib = Path(p).with_suffix(".replies.json")
         if not sib.exists():
+            missing.append(str(p))
             continue
         prompt_set = json.loads(Path(p).read_text(encoding="utf-8")).get("prompt_set", "default")
         out += [{**row, "prompt_set": prompt_set} for row in json.loads(sib.read_text(encoding="utf-8"))]
-    return out
+    return out, missing
 
 
 def _by_set(runs, name):
@@ -273,7 +282,7 @@ def _missing(name) -> dict:
     return {"verdict": "UNMEASURED", "reason": f"no {name} runs for one arm or both"}
 
 
-def evaluate(old_runs, new_runs, always_load, old_replies=(), new_replies=()) -> dict:
+def evaluate(old_runs, new_runs, always_load, old_replies=(), new_replies=(), new_missing_replies=()) -> dict:
     report = {"always_load": sorted(always_load), "gates": {}, "advisory": {}}
     old_d, new_d = _by_set(old_runs, "default"), _by_set(new_runs, "default")
     have = lambda s: bool(_by_set(old_runs, s) and _by_set(new_runs, s))  # noqa: E731
@@ -282,7 +291,11 @@ def evaluate(old_runs, new_runs, always_load, old_replies=(), new_replies=()) ->
     g["B2"] = b2(_by_set(old_runs, "reach"), _by_set(new_runs, "reach"), always_load) if have("reach") else _missing("reach")
     g["B2b"] = b2b(_by_set(old_runs, "recall"), _by_set(new_runs, "recall")) if have("recall") else _missing("recall")
     g["B3"] = b3(old_d, new_d) if have("default") else _missing("default")
-    g["B8"] = b8(list(new_replies))
+    if new_missing_replies:  # a set whose replies were not dumped was not scanned: B8 cannot pass on the others
+        g["B8"] = {"verdict": "UNMEASURED", "reason": "a NEW run has no .replies.json (run it with --dump-replies)",
+                   "missing_replies": list(new_missing_replies)}
+    else:
+        g["B8"] = b8(list(new_replies))
     report["advisory"]["B9"] = {
         arm: b9([r for r in reps if r.get("prompt_set", "default") == "default"])
         for arm, reps in (("old", old_replies), ("new", new_replies))
@@ -335,8 +348,13 @@ def main(argv: list[str] | None = None) -> int:
         return self_test()
     if not args.old or not args.new or not args.always_load:
         p.error("--old, --new and --always-load are required")
+    unknown = sorted(set(args.always_load) - NELL) if NELL else []
+    if unknown:  # a typo would make B2 count the tool as deferred again
+        p.error(f"--always-load names that are not brain tools: {unknown}")
+    old_replies, _ = _load_replies(args.old)
+    new_replies, new_missing = _load_replies(args.new)
     report = evaluate(
-        _load(args.old), _load(args.new), set(args.always_load), _load_replies(args.old), _load_replies(args.new)
+        _load(args.old), _load(args.new), set(args.always_load), old_replies, new_replies, new_missing
     )
     text = json.dumps(report, indent=2)
     if args.out:

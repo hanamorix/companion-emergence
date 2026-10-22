@@ -523,8 +523,10 @@ def _per_turn(ids, prompts, usage_parse, usage_error, tool_path, tool_offset, to
 
     Returns (per_turn, None), or (None, reason) when the rows cannot be mapped 1:1 to turns: a log shrank or
     was rotated, a line was skipped, or a tool row's timestamp falls outside its turn: stamped before the turn
-    began (a late write from an earlier turn, flushed into this window) or after it ended. Only names, origins
-    and outcomes are kept, never tool arguments.
+    began or after it ended. Rows are stamped when written, so this catches a late write from an earlier turn
+    only when it lands in the pause between turns; one that lands while the next turn is running is stamped
+    inside that turn and counted there without a signal (none of today's writers outlive their turn). Only
+    names, origins and outcomes are kept, never tool arguments.
     """
     if usage_parse is None:
         return None, usage_error or "the usage rows could not be read"

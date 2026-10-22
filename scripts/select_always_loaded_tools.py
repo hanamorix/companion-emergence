@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Pick the brain tools the CLI must never defer behind ToolSearch (#525) — read-only over a persona's logs.
 
-    uv run python scripts/select_always_loaded_tools.py <persona_dir> [--body captured.json]
-        [--from 2026-06-08] [--to 2026-09-12]
+    uv run python scripts/select_always_loaded_tools.py <persona_dir> --from YYYY-MM-DD --to YYYY-MM-DD
+        [--body captured.json]
 
 Rule (frozen in the #525 change record): keep a brain tool up front (MCP `_meta` anthropic/alwaysLoad) iff the
 Wilson 95% LOWER bound of its per-chat-turn use rate >= its break-even rate r*:
@@ -73,8 +73,9 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("persona", type=Path)
     ap.add_argument("--body", type=Path, help="captured /v1/messages request body (exact wire schema sizes)")
-    ap.add_argument("--from", dest="lo", default="2026-06-08", help="first day of the window (inclusive)")
-    ap.add_argument("--to", dest="hi", default="2026-09-12", help="last day of the window (exclusive)")
+    # Required, not defaulted: re-running on the original window would just reprint the original set.
+    ap.add_argument("--from", dest="lo", required=True, help="first day of the window, inclusive (#525: 2026-06-08)")
+    ap.add_argument("--to", dest="hi", required=True, help="last day of the window, exclusive (#525: 2026-09-12)")
     args = ap.parse_args(argv)
     lo, hi = args.lo, args.hi
     chars = _schema_chars(args.persona, args.body)

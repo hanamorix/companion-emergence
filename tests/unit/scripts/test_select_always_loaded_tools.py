@@ -7,6 +7,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[3]
 _spec = importlib.util.spec_from_file_location("select_always_loaded_under_test", REPO / "scripts" / "select_always_loaded_tools.py")
 sel = importlib.util.module_from_spec(_spec)
@@ -47,3 +49,11 @@ def test_a_rarely_used_tool_is_deferred(tmp_path, capsys):
     persona = _persona(tmp_path, monologue_turns=0)
     sel.main([str(persona), "--from", "2026-06-01", "--to", "2026-08-01"])
     assert "ALWAYS_LOAD = []" in capsys.readouterr().out
+
+
+def test_the_window_must_be_given(tmp_path):
+    # Round 2 N-4: a stale default window would reprint the old selection and look like a confirmation.
+    persona = _persona(tmp_path, monologue_turns=30)
+    with pytest.raises(SystemExit) as exc:
+        sel.main([str(persona)])
+    assert exc.value.code == 2

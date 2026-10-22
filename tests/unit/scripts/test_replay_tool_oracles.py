@@ -206,7 +206,7 @@ def _arm(tmp_path, arm, rm_hits, reply="fine"):
     replies = [{"turn": k, "prompt": "p", "reply": reply} for k in range(0, 25)]
     reach_turns = [[ls, ts] if arm == "new" else [ls] for _ in range(12)] + [[] for _ in range(9)]
     return [
-        _write(tmp_path, f"{arm}-default", run("default", hits(rm_hits, 24, rm)), replies),
+        *(_write(tmp_path, f"{arm}-default{i}", run("default", hits(rm_hits, 24, rm)), replies) for i in range(3)),
         _write(tmp_path, f"{arm}-reach", run("reach", reach_turns), replies[:22]),
         _write(tmp_path, f"{arm}-recall", run("recall", hits(10, 18, rf)), replies[:19]),
     ]
@@ -227,15 +227,16 @@ def test_cli_scores_every_gate_and_exits_by_the_worst(tmp_path):
 
 def test_cli_a_missing_prompt_set_is_unmeasured_not_a_pass(tmp_path):
     old = _arm(tmp_path, "old", 18)
-    report = rto.evaluate([json.loads(Path(old[0]).read_text())], [json.loads(Path(old[0]).read_text())], {"record_monologue"}, [], [])
+    defaults = [json.loads(Path(p).read_text()) for p in old[:3]]
+    report = rto.evaluate(defaults, defaults, {"record_monologue"}, [], [])
     assert {g: report["gates"][g]["verdict"] for g in ("B2", "B2b", "B8")} == dict.fromkeys(("B2", "B2b", "B8"), "UNMEASURED")
-    assert rto.main(["--old", old[0], "--new", old[0], "--always-load", "record_monologue"]) == 11
+    assert rto.main(["--old", *old[:3], "--new", *old[:3], "--always-load", "record_monologue"]) == 11
 
 
 def test_cli_scans_the_replies_of_every_new_file_for_leaks(tmp_path):
     old = _arm(tmp_path, "old", 18)
     new = _arm(tmp_path, "new", 18)
-    Path(new[2]).with_suffix(".replies.json").write_text(json.dumps([{"turn": 3, "reply": "via ToolSearch"}]), encoding="utf-8")
+    Path(new[-1]).with_suffix(".replies.json").write_text(json.dumps([{"turn": 3, "reply": "via ToolSearch"}]), encoding="utf-8")
     assert rto.main(["--old", *old, "--new", *new, "--always-load", "record_monologue"]) == 10
 
 
@@ -249,3 +250,37 @@ def test_cli_requires_the_always_load_set(tmp_path):
 
 def test_self_test_passes():
     assert rto.main(["--self-test"]) == 0
+
+
+def test_cli_a_new_file_without_its_replies_leaves_b8_unmeasured(tmp_path):
+    # Round 2 N-1: the reach set run without --dump-replies must not let B8 pass on the other sets' replies.
+    old = _arm(tmp_path, "old", 18)
+    new = _arm(tmp_path, "new", 18)
+    Path(new[3]).with_suffix(".replies.json").unlink()  # the reach file
+    out = tmp_path / "report.json"
+    assert rto.main(["--old", *old, "--new", *new, "--always-load", "record_monologue", "--out", str(out)]) == 11
+    b8 = json.loads(out.read_text(encoding="utf-8"))["gates"]["B8"]
+    assert b8["verdict"] == "UNMEASURED" and b8["missing_replies"] == [new[3]]
+
+
+@pytest.mark.parametrize("n_old", [1, 2])
+def test_b3_needs_three_old_replays_for_its_noise_check(n_old):
+    # Round 2 N-2: with one OLD replay the ±10% spread check would compare the replay with itself.
+    res = rto.b3([_cost_run(0.10) for _ in range(n_old)], [_cost_run(0.10) for _ in range(3)])
+    for m in ("cost_per_user_turn", "cost_per_chat_call", "cache_creation_per_chat_call"):
+        assert res["metrics"][m]["verdict"] == "UNMEASURED", m
+    assert res["verdict"] == "UNMEASURED"
+
+
+def test_b3_a_missing_number_is_unmeasured_not_a_crash():
+    new = [_cost_run(0.10) for _ in range(3)]
+    new[1]["per_turn"][2]["chat_rows"][0]["cache_creation"] = None
+    assert rto.b3([_cost_run(0.10) for _ in range(3)], new)["verdict"] == "UNMEASURED"
+
+
+def test_cli_rejects_an_always_load_name_that_is_not_a_brain_tool(tmp_path):
+    # Round 2 N-5: a typo would make B2 count record_monologue as deferred again.
+    old = _arm(tmp_path, "old", 18)
+    with pytest.raises(SystemExit) as exc:
+        rto.main(["--old", *old, "--new", *old, "--always-load", "record-monologue"])
+    assert exc.value.code == 2
