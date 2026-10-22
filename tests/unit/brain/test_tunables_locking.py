@@ -1,12 +1,12 @@
-"""The tunables lock (#529: C8 a-c, C42 e, C44): no lost update across the file's read-modify-write accessors.
+"""The tunables lock (#529: C8 a/c, C42 e): no lost update across the file's read-modify-write accessors.
 
 Real locks everywhere; the competing write is injected deterministically at the point just before the accessor's own
-write (the module-level window hook), from a thread that must WAIT for the lock to get in.
+write (the module-level window hook), from a thread that must WAIT for the lock to get in. The legacy-JSON fold's
+interleavings (C44) live in ``test_tunables_migration.py``.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
@@ -14,6 +14,8 @@ import threading
 from pathlib import Path
 
 import pytest
+
+from tests.tunables_file import FILE_NAME, read_values, write_text
 
 
 @pytest.fixture()
@@ -29,19 +31,14 @@ def t(tmp_path, monkeypatch):
 
 
 def _file(tmp_path: Path) -> Path:
-    return tmp_path / "tunables.json"
-
-
-def _read(tmp_path: Path) -> dict:
-    return json.loads(_file(tmp_path).read_text(encoding="utf-8"))
+    return tmp_path / FILE_NAME
 
 
 class _Competitor:
-    """A thread that performs ``set_overrides`` when started and reports whether it finished within a short join."""
+    """A thread that performs ``set_values`` when started and reports whether it finished within a short join."""
 
     def __init__(self, t, updates: dict) -> None:
-        self._t, self._updates = t, updates
-        self._thread = threading.Thread(target=lambda: t.set_overrides(updates))
+        self._thread = threading.Thread(target=lambda: t.set_values(updates))
 
     def start_and_wait_briefly(self) -> bool:
         self._thread.start()
@@ -53,112 +50,35 @@ class _Competitor:
         assert not self._thread.is_alive()
 
 
-def test_set_overrides_while_write_defaults_section_holds_its_window_both_survive(t, tmp_path) -> None:
-    """C8 (a): the competitor blocks on the lock, then lands after the defaults write; neither update is lost."""
-    t.register("demo.key", 1)
-    t.set_overrides({"seed": 1})
+def test_set_values_while_sync_file_holds_its_window_both_survive(t, tmp_path) -> None:
+    """C8 (a): the competitor blocks on the lock, then lands after the sync write; neither update is lost."""
+    t.register("demo.key", 1, description="A demo.")
+    write_text(tmp_path, '"seed" = 1\n')
     competitor = _Competitor(t, {"competitor": 2})
-    finished_inside = []
+    finished_inside: list[bool] = []
 
     def hook() -> None:
         finished_inside.append(competitor.start_and_wait_briefly())
 
     t._LOCKED_WINDOW_HOOK = hook
     try:
-        t.write_defaults_section()
+        t.sync_file()
     finally:
         t._LOCKED_WINDOW_HOOK = None
     competitor.finish()
     assert finished_inside == [False]  # it could not get in while the window was open
-    data = _read(tmp_path)
-    assert data["overrides"] == {"seed": 1, "competitor": 2}
-    assert data["defaults"].get("demo.key") == 1
+    assert read_values(tmp_path) == {"seed": 1, "competitor": 2, "demo.key": 1}
 
 
-def test_set_overrides_during_migrate_idle_keys_both_survive(t, tmp_path) -> None:
-    """C8 (b) and C44: an external set_overrides that lands inside the migration's read-to-write window survives."""
-    from brain import tunables_migration as tm
-
-    _file(tmp_path).write_text(
-        json.dumps({"overrides": {"chat.pass2_min_idle_seconds": 10, "keep": 1}}), encoding="utf-8"
-    )
-    competitor = _Competitor(t, {"model.interactive_chat": "claude-opus-5"})
-    finished_inside = []
-
-    def hook() -> None:
-        finished_inside.append(competitor.start_and_wait_briefly())
-
-    tm._LOCKED_WINDOW_HOOK = hook
+def test_the_lock_hook_is_called_inside_the_window_just_before_the_write_by_set_values(t, tmp_path) -> None:
+    write_text(tmp_path, '"a" = 1\n')
+    seen: list[bytes] = []
+    t._LOCKED_WINDOW_HOOK = lambda: seen.append(_file(tmp_path).read_bytes())
     try:
-        tm.migrate_idle_keys(tmp_path)
+        t.set_values({"a": 2})
     finally:
-        tm._LOCKED_WINDOW_HOOK = None
-    competitor.finish()
-    assert finished_inside == [False]
-    assert _read(tmp_path)["overrides"] == {"keep": 1, "model.interactive_chat": "claude-opus-5"}
-
-
-def test_a_failed_verify_restores_without_clobbering_a_concurrent_write(t, tmp_path, monkeypatch) -> None:
-    """C44: the lock covers read through verify AND restore, so a concurrent write waits for the restore."""
-    from brain import tunables_migration as tm
-
-    original = json.dumps({"overrides": {"chat.pass2_min_idle_seconds": 10, "keep": 1}}).encode()
-    _file(tmp_path).write_bytes(original)
-    competitor = _Competitor(t, {"late": 3})
-
-    def failing_reload(*args, **kwargs):
-        raise ValueError("forced verify failure")
-
-    def hook() -> None:
-        competitor.start_and_wait_briefly()
-
-    monkeypatch.setattr(tm, "read_json", failing_reload)
-    tm._LOCKED_WINDOW_HOOK = hook
-    try:
-        tm.migrate_idle_keys(tmp_path)
-    finally:
-        tm._LOCKED_WINDOW_HOOK = None
-    competitor.finish()
-    overrides = _read(tmp_path)["overrides"]
-    assert overrides["late"] == 3 and overrides["keep"] == 1
-    assert "chat.pass2_min_idle_seconds" in overrides  # restored: the failed migration left the file as it was
-
-
-def test_an_ordinary_boot_takes_no_lock_and_leaves_the_file_untouched(t, tmp_path, wedged_lock, monkeypatch) -> None:
-    """C44: no retired key means the cheap pre-check returns before any lock (a wedged holder does not matter)."""
-    from brain import dev_constants
-    from brain import tunables_migration as tm
-
-    monkeypatch.setattr(dev_constants, "SETTINGS_FILE_LOCK_WAIT_S", 0.2)
-    _file(tmp_path).write_text(json.dumps({"overrides": {"keep": 1}}), encoding="utf-8")
-    before = _file(tmp_path).stat().st_mtime_ns
-    with wedged_lock(_file(tmp_path)):
-        tm.migrate_idle_keys(tmp_path)
-    assert _file(tmp_path).stat().st_mtime_ns == before
-
-
-def test_the_bytes_written_back_come_from_the_reread_inside_the_lock(t, tmp_path) -> None:
-    """C44: a key added between the pre-check read and the lock is in the written file (never the pre-check read)."""
-    from brain import tunables_migration as tm
-
-    _file(tmp_path).write_text(json.dumps({"overrides": {"chat.pass2_min_idle_seconds": 10}}), encoding="utf-8")
-    real_read_bytes = Path.read_bytes
-    calls = {"n": 0}
-
-    def racing_read_bytes(self):
-        data = real_read_bytes(self)
-        calls["n"] += 1
-        if calls["n"] == 1 and self.name == "tunables.json":
-            # a writer lands right after the pre-check read, before the migration takes its lock
-            t.set_overrides({"landed_late": 9})
-        return data
-
-    Path.read_bytes = racing_read_bytes  # type: ignore[method-assign]
-    try:
-        tm.migrate_idle_keys(tmp_path)
-    finally:
-        Path.read_bytes = real_read_bytes  # type: ignore[method-assign]
-    assert _read(tmp_path)["overrides"] == {"landed_late": 9}
+        t._LOCKED_WINDOW_HOOK = None
+    assert seen == [b'"a" = 1\n']  # called before the replace, so the old file is still on disk
 
 
 _WORKER = """
@@ -168,7 +88,7 @@ from brain import tunables, dev_constants
 dev_constants.SETTINGS_FILE_LOCK_WAIT_S = 60.0
 tag = sys.argv[1]
 for i in range(50):
-    tunables.set_overrides({{f"{{tag}}{{i}}": i}})
+    tunables.set_values({{f"{{tag}}{{i}}": i}})
 """
 
 
@@ -179,8 +99,8 @@ def test_two_processes_writing_different_keys_lose_nothing(tmp_path, repo_root) 
     procs = [subprocess.Popen([sys.executable, "-c", code, tag], env=env) for tag in ("a", "b")]
     for p in procs:
         assert p.wait(timeout=120) == 0
-    overrides = _read(tmp_path)["overrides"]
-    assert {f"a{i}" for i in range(50)} | {f"b{i}" for i in range(50)} == set(overrides)
+    values = read_values(tmp_path)
+    assert {f"a{i}" for i in range(50)} | {f"b{i}" for i in range(50)} == set(values)
 
 
 # ---------------------------------------------------------------------------
@@ -188,33 +108,40 @@ def test_two_processes_writing_different_keys_lose_nothing(tmp_path, repo_root) 
 # ---------------------------------------------------------------------------
 
 
-def test_set_overrides_on_a_wedged_lock_raises_and_leaves_the_file(t, tmp_path, wedged_lock, monkeypatch) -> None:
+def test_set_values_on_a_wedged_lock_raises_and_leaves_the_file(t, tmp_path, wedged_lock, monkeypatch) -> None:
     from brain import dev_constants
 
     monkeypatch.setattr(dev_constants, "SETTINGS_FILE_LOCK_WAIT_S", 0.3)
-    _file(tmp_path).write_text(json.dumps({"overrides": {"a": 1}}), encoding="utf-8")
+    write_text(tmp_path, '"a" = 1\n')
     before = _file(tmp_path).read_bytes()
     with wedged_lock(_file(tmp_path)), pytest.raises(t.TunablesWriteError):
-        t.set_overrides({"a": 2})
+        t.set_values({"a": 2})
     assert _file(tmp_path).read_bytes() == before
 
 
-def test_write_defaults_and_idle_migration_on_a_wedged_lock_return_without_writing(
-    t, tmp_path, wedged_lock, monkeypatch, caplog
-) -> None:
+def test_sync_file_on_a_wedged_lock_returns_without_writing(t, tmp_path, wedged_lock, monkeypatch, caplog) -> None:
     from brain import dev_constants
-    from brain import tunables_migration as tm
 
     monkeypatch.setattr(dev_constants, "SETTINGS_FILE_LOCK_WAIT_S", 0.3)
-    _file(tmp_path).write_text(
-        json.dumps({"overrides": {"chat.pass2_min_idle_seconds": 10}}), encoding="utf-8"
-    )
+    t.register("new.key", 1, description="A new thing.")
+    write_text(tmp_path, '"a" = 1\n')
     before = _file(tmp_path).read_bytes()
     stamp = _file(tmp_path).stat().st_mtime_ns
-    with wedged_lock(_file(tmp_path)):
-        with caplog.at_level("WARNING"):
-            t.write_defaults_section()
-            tm.migrate_idle_keys(tmp_path)
+    with wedged_lock(_file(tmp_path)), caplog.at_level("WARNING"):
+        t.sync_file()
     assert _file(tmp_path).read_bytes() == before
     assert _file(tmp_path).stat().st_mtime_ns == stamp
-    assert sum("lock" in r.getMessage().lower() for r in caplog.records) >= 2
+    assert sum("lock" in r.getMessage().lower() for r in caplog.records) >= 1
+
+
+def test_sync_file_writes_nothing_else_while_holding_the_lock(t, tmp_path, monkeypatch) -> None:
+    """The longest hold is one read, one atomic write and its fsync (K = 0 other replaces): record every write in the window."""
+    from brain.utils import toml_io
+
+    t.register("a", 1, description="A.")
+    writes: list[str] = []
+    real = toml_io.write_toml_text
+    monkeypatch.setattr(toml_io, "write_toml_text", lambda p, d, **kw: (writes.append(Path(p).name), real(p, d, **kw))[1])
+    monkeypatch.setattr(t, "_write_marker", lambda record: writes.append("notice"))
+    t.sync_file()
+    assert writes == [FILE_NAME]

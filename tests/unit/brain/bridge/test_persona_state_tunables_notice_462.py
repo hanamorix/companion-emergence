@@ -1,12 +1,13 @@
-"""#462: `/persona/state` reports the persisted tunables notice for EVERY persona sharing the home (no bridge-local state).
+"""#462 reshaped (#529): `/persona/state` reports the persisted tunables notice for EVERY persona sharing the home (no bridge-local state).
 
-The notice is written next to tunables.json by whichever bridge healed the file; every other bridge, for every other persona,
-reads the same marker on each poll. Synthetic names only; `KINDLED_HOME` is a tmp dir.
+The notice is written next to tunables.toml by whichever process found the file unreadable; every other bridge, for every other
+persona, reads the same marker on each poll. It carries the failing line, column and reason (owner ruling E9). Synthetic names
+only; `KINDLED_HOME` is a tmp dir.
 """
 
 from __future__ import annotations
 
-import json
+import os
 
 import pytest
 
@@ -37,36 +38,35 @@ def _notice(persona_dir):
 
 
 def test_a_healthy_home_reports_no_notice_for_both_personas(home):
-    # C462-e
     import brain.tunables as t
 
     p1, p2 = _personas(home)
-    t.write_defaults_section()
+    t.sync_file()
 
     assert _notice(p1) is None and _notice(p2) is None
 
 
-def test_one_heal_is_reported_for_both_personas(home):
-    # C462-e: only `write_defaults_section` ran, once; both personas' state shows it.
+def test_one_unreadable_file_is_reported_for_both_personas_with_the_line(home):
+    # only `sync_file` ran, once; both personas' state shows it.
     import brain.tunables as t
 
     p1, p2 = _personas(home)
-    (home / "tunables.json").write_bytes(b"{corrupt")
-    t.write_defaults_section()
-    kept = sorted(home.glob("tunables.json.corrupt-*"))[0].name
+    (home / "tunables.toml").write_text("a = 1\n\nb = = 2\n", encoding="utf-8")
+    t.sync_file()
 
-    assert _notice(p1) == {"kind": "reset", "kept_as": kept}
-    assert _notice(p2) == {"kind": "reset", "kept_as": kept}
+    for p in (p1, p2):
+        n = _notice(p)
+        assert n["kind"] == "unreadable" and n["line"] == 3 and isinstance(n["column"], int) and n["reason"]
+        assert set(n) == {"kind", "line", "column", "reason"}  # no kept_as: nothing is ever set aside now
 
 
 def test_a_second_boot_does_not_clear_it_and_polling_never_writes(home):
-    # C462-f
     import brain.tunables as t
 
     p1, p2 = _personas(home)
-    (home / "tunables.json").write_bytes(b"{corrupt")
-    t.write_defaults_section()
-    t.write_defaults_section()
+    (home / "tunables.toml").write_text("b = = 2\n", encoding="utf-8")
+    t.sync_file()
+    t.sync_file()
     marker = home / "tunables.notice.json"
     before = (marker.read_bytes(), marker.stat().st_mtime_ns)
 
@@ -74,21 +74,22 @@ def test_a_second_boot_does_not_clear_it_and_polling_never_writes(home):
     assert (marker.read_bytes(), marker.stat().st_mtime_ns) == before
 
 
-def test_the_user_editing_the_overrides_clears_it_for_both_personas(home):
-    # C462-g
+def test_the_user_fixing_the_file_clears_it_for_both_personas(home):
     import brain.tunables as t
 
     p1, p2 = _personas(home)
-    (home / "tunables.json").write_bytes(b"{corrupt")
-    t.write_defaults_section()
+    path = home / "tunables.toml"
+    path.write_text("b = = 2\n", encoding="utf-8")
+    t.sync_file()
 
-    (home / "tunables.json").write_text(json.dumps({"overrides": {"x": 2}}), encoding="utf-8")
+    path.write_text('"x" = 2\n', encoding="utf-8")
+    st = path.stat()
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
 
     assert _notice(p1) is None and _notice(p2) is None
 
 
 def test_the_key_is_the_last_key_of_the_state(home):
-    # C462-i
     (p1,) = _personas(home)[:1]
 
     assert list(build_persona_state(p1))[-1] == "tunables_notice"

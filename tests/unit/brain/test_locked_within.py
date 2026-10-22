@@ -88,19 +88,20 @@ def test_the_real_nonblocking_lock_is_released_between_polls(tmp_path: Path) -> 
 
 
 def test_wait_constant_covers_the_live_retry_constants_and_stays_under_the_webview_cut() -> None:
-    """C42 (f): the constant is at least R_read + (K+1) * R_replace computed from the LIVE constants.
+    """C42 (f): the constant is at least R_read + (K+2) * R_replace computed from the LIVE constants.
 
-    K is the most replaces one ``write_defaults_section`` heal performs while it holds the tunables lock: the heal's own
-    install (1), the corrupt backups it quarantines (3 at most: ``.bak1`` to ``.bak3``) and the notice file it writes
-    (1); the payload write after it is the "+ 1". Changing a retry constant without re-deriving the wait fails here.
+    The longest hold of the tunables lock is one read, ONE atomic write (a replace) and the fsync before it, which is
+    modelled as one more R_replace (a stuck filesystem operation is worth what the code already tolerates for one
+    replace). K counts the replaces under the lock other than that write: 0, because nothing heals, quarantines or writes
+    a notice file while the lock is held. Changing a retry constant without re-deriving the wait fails here.
     """
     from brain.health import attempt_heal, json_io
 
-    k_heal_replaces = 1 + 3 + 1
+    k_other_replaces = 0
     step = attempt_heal._REPLACE_RETRY_SLEEP_S
     r_replace = step * sum(range(1, attempt_heal._REPLACE_RETRIES))
     r_read = step * sum(range(1, json_io._READ_ATTEMPTS))
-    needed = r_read + (k_heal_replaces + 1) * r_replace
+    needed = r_read + (k_other_replaces + 2) * r_replace
     assert dev_constants.SETTINGS_FILE_LOCK_WAIT_S >= needed
     # The picker request spends the 30 s probe budget first, then the write; the webview cuts a request at about 60 s.
     from brain.bridge import server

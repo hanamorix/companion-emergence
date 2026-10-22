@@ -224,7 +224,7 @@ def test_a_malformed_override_runs_the_default_warns_once_per_value_and_leaves_t
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert len(warnings) == 1, (bad, [r.getMessage() for r in warnings])
         assert path.read_bytes() == before  # the bad text stays in the file untouched (#446)
-        tunables._reset_overrides_cache()
+        tunables._reset_values_cache()
         tunables._warned_keys.clear()
 
 
