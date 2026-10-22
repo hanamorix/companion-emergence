@@ -402,11 +402,14 @@ def test_stream_emits_keepalive_during_silent_provider_stretch(persona_dir: Path
     import time as _time
 
     import brain.bridge.provider as provider_module
-    import brain.bridge.server as srv
+    from brain import paths
     from brain.bridge.chat import ChatResponse
 
-    # Tiny keepalive interval so the test doesn't sleep for the real 15s.
-    monkeypatch.setattr(srv, "_STREAM_KEEPALIVE_SECONDS", 0.05)
+    # Tiny keepalive interval so the test doesn't sleep for the real 15s. The settings file holds every setting, so the
+    # interval is set the way a user would set it (in the file), not by patching the code default.
+    from tests.tunables_file import write_values
+
+    write_values(paths.get_home(), {"bridge.stream_keepalive_seconds": 0.05})
     monkeypatch.setenv("NELL_STREAM_CHUNK_DELAY_MS", "0")
 
     class _SlowFake:

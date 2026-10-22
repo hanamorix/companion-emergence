@@ -318,11 +318,11 @@ def test_group_b_tunables_legacy_json_fold_renames_and_never_rewrites_the_json(t
     tunables._reset_for_tests()
     tunables.register("keep", 0, description="A setting.")
     tunables.register("chat.idle_lull_seconds", 600.0, description="Seconds of quiet.")  # the registry was just cleared
-    legacy = tmp_path / tm._LEGACY_NAME
+    legacy = tmp_path / tm.LEGACY_FILE_NAME
     legacy.write_text(json.dumps({"overrides": {tm._OLD_THROTTLE_KEY: 5, "keep": 1}}, indent=1))
     original = legacy.read_bytes()
     tm.migrate_legacy_json(tmp_path, complete_registry=True)
-    (kept,) = tmp_path.glob(f"{tm._LEGACY_NAME}.migrated-*")
+    (kept,) = tmp_path.glob(f"{tm.LEGACY_FILE_NAME}.migrated-*")
     assert kept.read_bytes() == original  # the JSON was only renamed, never rewritten
     assert tunables.get_raw("keep") == 1 and tunables.get_raw("chat.idle_lull_seconds") == 5.0
     _no_temp_left(tmp_path)
