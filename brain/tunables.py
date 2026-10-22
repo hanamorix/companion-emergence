@@ -524,6 +524,9 @@ def sync_file() -> None:
                 else:
                     if _LOCKED_WINDOW_HOOK is not None:
                         _LOCKED_WINDOW_HOOK()
+                    # Known and accepted: a hand edit saved in an editor at the same instant this write replaces the
+                    # file can lose that one edit (an editor does not take the settings lock). The file is never
+                    # corrupted. The same holds for the write in set_values.
                     toml_io.write_toml_text(path, doc.to_bytes())
                     _reset_values_cache()
     except LockTimeoutError:
@@ -607,6 +610,7 @@ def set_values(updates: dict[str, Any], *, only_if_default: bool = False) -> dic
                 _LOCKED_WINDOW_HOOK()
             if not doc.verify(expected):
                 raise TunablesWriteError(f"the change to {path} would not read back as intended; nothing was written")
+            # A hand edit saved in an editor at the same instant can be lost (see the note in sync_file); never corrupted.
             toml_io.write_toml_text(path, doc.to_bytes())
     except LockTimeoutError as exc:
         raise TunablesWriteError(
