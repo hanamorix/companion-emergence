@@ -1971,7 +1971,8 @@ def _turn_window_case(tmp_path, late_offset_s):
     first = json.dumps({"name": "record_monologue", "timestamp": (t0 + timedelta(seconds=2)).isoformat()}) + "\n"
     second = json.dumps({"name": "search_memories", "timestamp": (t0 + timedelta(seconds=late_offset_s)).isoformat()}) + "\n"
     log = tmp_path / "tool_invocations.log.jsonl"
-    log.write_text(first + second, encoding="utf-8")
+    # Bytes, not text: the boundaries are byte offsets, and text mode writes "\r\n" on Windows.
+    log.write_bytes((first + second).encode())
     bounds = [len(first.encode()), len((first + second).encode())]
     usage = ([{"call_type": "chat"}, {"call_type": "chat"}], 0, [1, 1], True)
     return crw._per_turn([1, 2], ["a", "b"], usage, None, log, 0, bounds, ends, turn_starts=starts)
